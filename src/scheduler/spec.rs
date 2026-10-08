@@ -1,0 +1,635 @@
+//! Speculative decoding. A [`Drafter`] proposes `k` tokens; the target verifies all `k + 1`
+//! positions in one forward ([`NativeLm::forward_all`]) and the sequence keeps the longest
+//! accepted prefix plus one token of the target's own. Greedy accepts exact argmax matches, so
+//! outputs are identical to plain decoding; sampling uses standard rejection sampling (accept a
+//! draft `x` with probability `min(1, p(x)/q(x))`, else draw from `max(0, p - q)`), so the output
+//! distribution is the target's. Rejected positions are rewound with [`NativeLm::truncate`].
+//!
+//! [`NativeLm::forward_all`]: crate::model::native::NativeLm::forward_all
+//! [`NativeLm::truncate`]: crate::model::native::NativeLm::truncate
+
+use super::{recent, ExecutableModel, SeqKvCache, WRONG_KV};
+use crate::model::sd::Rng;
+use crate::model::graph_lm::nucleus;
+use std::any::Any;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A drafter's per-sequence state.
+pub type DraftState = Box<dyn Any + Send + Sync>;
+
+/// Proposes draft tokens from the target's hidden states.
+pub trait Drafter: Send + Sync {
+    /// Short name for logs and the TUI, e.g. `MTP`.
+    fn label(&self) -> String;
+    /// Target decoder layers whose outputs the drafter reads (tap `i` = the residual stream after
+    /// layer `i`, HF `hidden_states[i + 1]`).
+    fn tap_layers(&self) -> Vec<usize>;
+    fn new_state(&self) -> DraftState;
+    /// Proposes up to `k` tokens after `tokens` (prompt + output; the target has run all but
+    /// the last). `hidden` holds the tap rows `[rows, taps * hidden]` of the target positions
+    /// committed since the previous call (the prompt's on the first), in order. `pick` chooses
+    /// each draft token from the draft logits: call it once per token, in order.
+    fn propose(
+        &self,
+        st: &mut DraftState,
+        tokens: &[u32],
+        hidden: &[f32],
+        k: usize,
+        pick: &mut dyn FnMut(&[f32]) -> u32,
+    ) -> Result<Vec<u32>, String>;
+    /// Most tokens one [`Self::propose`] call may draft; the scheduler tunes `k` in `0..=max_k`.
+    fn max_k(&self) -> usize {
+        4
+    }
+}
+
+/// Top-k the scheduler samples with (see `ExecutableModel::sample`).
+const TOP_K: usize = 50;
+
+/// One sequence's speculative state, tied to the drafter it started with.
+pub struct SpecSeq {
+    drafter: Arc<dyn Drafter>,
+    draft: DraftState,
+    /// Tap rows of committed target positions the drafter has not seen yet.
+    pending: Vec<f32>,
+    /// The last step drafted, so the drafter only has that step's rows to catch up on (the
+    /// prompt or a run of plain steps make the next step's time unrepresentative).
+    synced: bool,
+    rng: Rng,
+}
+
+impl SpecSeq {
+    /// Turns on the target's taps for a sequence that has not run yet.
+    pub(super) fn start(
+        m: &ExecutableModel,
+        drafter: Arc<dyn Drafter>,
+        kv: &mut Option<SeqKvCache>,
+        seed: u64,
+    ) -> Result<Self, String> {
+        m.set_taps(kv, &drafter.tap_layers())?;
+        Ok(Self {
+            draft: drafter.new_state(),
+            drafter,
+            pending: Vec::new(),
+            synced: false,
+            rng: Rng::new(seed),
+        })
+    }
+
+    pub(super) fn max_k(&self) -> usize {
+        self.drafter.max_k()
+    }
+}
+
+/// What one decode step produced.
+pub(super) struct Step {
+    /// Output tokens, in order (accepted drafts, then the target's token).
+    pub tokens: Vec<u32>,
+    pub drafted: usize,
+    pub accepted: usize,
+    /// The step's time is representative of its `k` (see [`KTuner::record`]): the drafter was in
+    /// sync, or the step did not draft.
+    pub synced: bool,
+}
+
+/// The target-side hooks, per backend (see the matching [`NativeLm`] methods).
+///
+/// [`NativeLm`]: crate::model::native::NativeLm
+impl ExecutableModel {
+    /// Logits after every token of `tokens` run at `start..`, `[n, vocab]`.
+    fn forward_all(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        kv: &mut Option<SeqKvCache>,
+    ) -> Result<Vec<f32>, String> {
+        match (self, kv) {
+            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.forward_all(tokens, start, st),
+            (Self::GraphLm(m), Some(SeqKvCache::Cpu(cache))) => {
+                let m = m.read();
+                let held = cache.first().map_or(0, |c| c.len);
+                if held != start {
+                    return Err(format!("KV cache holds {held} positions, verify starts at {start}"));
+                }
+                let mut out = Vec::with_capacity(tokens.len() * m.config.vocab_size);
+                for (i, &t) in tokens.iter().enumerate() {
+                    out.extend(m.forward_token_with_kv(t, start + i, cache));
+                }
+                Ok(out)
+            }
+            (Self::Native(_) | Self::GraphLm(_), _) => Err(WRONG_KV.into()),
+            _ => Err("speculative decoding runs on CPU models (native or GraphLm)".into()),
+        }
+    }
+
+    /// Rewinds the sequence to `len` positions.
+    fn truncate(&self, kv: &mut Option<SeqKvCache>, len: usize) -> Result<(), String> {
+        match (self, kv) {
+            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.truncate(st, len),
+            (Self::GraphLm(_), Some(SeqKvCache::Cpu(cache))) => {
+                for c in cache.iter_mut() {
+                    if len > c.len {
+                        return Err(format!("cannot rewind {} positions to {len}", c.len));
+                    }
+                    c.len = len;
+                }
+                Ok(())
+            }
+            (Self::Native(_) | Self::GraphLm(_), _) => Err(WRONG_KV.into()),
+            _ => Err("speculative decoding runs on CPU models (native or GraphLm)".into()),
+        }
+    }
+
+    fn set_taps(&self, kv: &mut Option<SeqKvCache>, layers: &[usize]) -> Result<(), String> {
+        match (self, kv) {
+            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.set_taps(st, layers),
+            (Self::GraphLm(m), kv) => {
+                let m = m.read();
+                let cache = match kv.get_or_insert_with(|| SeqKvCache::Cpu(super::new_cpu_kv(&m))) {
+                    SeqKvCache::Cpu(c) => c,
+                    _ => return Err(WRONG_KV.into()),
+                };
+                if let Some(&l) = layers.iter().find(|&&l| l >= cache.len()) {
+                    return Err(format!("tap layer {l}: the decoder has {} layers", cache.len()));
+                }
+                for c in cache.iter_mut() {
+                    c.tap = None;
+                }
+                for (slot, &l) in layers.iter().enumerate() {
+                    cache[l].tap = Some((slot, Vec::new()));
+                }
+                Ok(())
+            }
+            (Self::Native(_), _) => Err(WRONG_KV.into()),
+            _ => Err("speculative decoding runs on CPU models (native or GraphLm)".into()),
+        }
+    }
+
+    fn take_taps(&self, kv: &mut Option<SeqKvCache>) -> Vec<f32> {
+        match (self, kv) {
+            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.take_taps(st),
+            // Per-layer rows, interleaved into `[positions, taps * hidden]` in tap order.
+            (Self::GraphLm(m), Some(SeqKvCache::Cpu(cache))) => {
+                let h = m.read().config.hidden_dim;
+                let mut taps: Vec<(usize, Vec<f32>)> = cache
+                    .iter_mut()
+                    .filter_map(|c| c.tap.as_mut().map(|(s, r)| (*s, std::mem::take(r))))
+                    .collect();
+                taps.sort_by_key(|t| t.0);
+                let rows = taps.first().map_or(0, |t| t.1.len() / h);
+                let mut out = Vec::with_capacity(rows * taps.len() * h);
+                for r in 0..rows {
+                    for (_, t) in &taps {
+                        out.extend_from_slice(&t[r * h..][..h]);
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// One decode step of a sequence whose model has run all of `all` but the last token: drafts up
+/// to `k` tokens (none when `k == 0`), verifies them with one target forward, and returns the
+/// tokens to emit. `vocab` is the tokenizer's vocabulary size (0 = all logits).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decode(
+    m: &ExecutableModel,
+    spec: &mut SpecSeq,
+    all: &[u32],
+    kv: &mut Option<SeqKvCache>,
+    temp: f32,
+    top_p: f32,
+    vocab: usize,
+    k: usize,
+) -> Result<Step, String> {
+    let last = *all.last().ok_or("empty sequence")?;
+    let start = all.len() - 1;
+    spec.pending.extend(m.take_taps(kv));
+    let valid = |n: usize| if vocab > 0 { n.min(vocab) } else { n };
+    let greedy = temp <= 1e-4;
+    let mut qs = Vec::new();
+    let drafts = if k == 0 {
+        Vec::new()
+    } else {
+        let rng = &mut spec.rng;
+        let drafts = spec.drafter.propose(
+            &mut spec.draft,
+            all,
+            &spec.pending,
+            k,
+            &mut |logits: &[f32]| {
+                let l = &logits[..valid(logits.len())];
+                if greedy {
+                    return m.sample(l, &[], temp, top_p);
+                }
+                let q = dist(l, temp, top_p);
+                let t = draw(&q, rng.uniform());
+                qs.push(q);
+                t
+            },
+        )?;
+        spec.pending.clear();
+        if drafts.len() > k || (!greedy && qs.len() != drafts.len()) {
+            return Err(format!(
+                "drafter returned {} tokens for k = {k} after {} picks",
+                drafts.len(),
+                qs.len()
+            ));
+        }
+        drafts
+    };
+    if drafts.is_empty() {
+        // Plain decode (no checkpoints); the drafter catches up on these taps next time.
+        let t = m.step_token_with_kv(all, last, all.len(), temp, top_p, kv)?;
+        spec.pending.extend(m.take_taps(kv));
+        spec.synced = false;
+        return Ok(Step {
+            tokens: vec![t],
+            drafted: 0,
+            accepted: 0,
+            synced: true,
+        });
+    }
+    let synced = std::mem::replace(&mut spec.synced, true);
+    let mut input = Vec::with_capacity(drafts.len() + 1);
+    input.push(last);
+    input.extend_from_slice(&drafts);
+    let logits = m.forward_all(&input, start, kv)?;
+    if logits.is_empty() || logits.len() % input.len() != 0 {
+        return Err(format!(
+            "verify returned {} logits for {} positions",
+            logits.len(),
+            input.len()
+        ));
+    }
+    let width = logits.len() / input.len();
+    let mut out = Vec::with_capacity(input.len());
+    for (j, row) in logits.chunks_exact(width).enumerate() {
+        let l = &row[..valid(width)];
+        if greedy {
+            let t = m.sample(l, recent(all), temp, top_p);
+            out.push(t);
+            if drafts.get(j) != Some(&t) {
+                break;
+            }
+            continue;
+        }
+        let p = dist(l, temp, top_p);
+        let Some(&x) = drafts.get(j) else {
+            out.push(draw(&p, spec.rng.uniform()));
+            break;
+        };
+        let (px, qx) = (prob(&p, x), prob(&qs[j], x));
+        if spec.rng.uniform() * qx as f64 <= px as f64 {
+            out.push(x);
+            continue;
+        }
+        out.push(draw(&residual(&p, &qs[j]), spec.rng.uniform()));
+        break;
+    }
+    // The target keeps `last` and the accepted drafts; the final token has not run yet.
+    m.truncate(kv, start + out.len())?;
+    let taps = m.take_taps(kv);
+    let w = taps.len() / input.len();
+    spec.pending.extend_from_slice(&taps[..out.len() * w]);
+    Ok(Step {
+        accepted: out.len() - 1,
+        drafted: drafts.len(),
+        tokens: out,
+        synced,
+    })
+}
+
+/// The scheduler's sampling distribution over `logits` (sparse, normalized).
+fn dist(logits: &[f32], temp: f32, top_p: f32) -> Vec<(u32, f32)> {
+    let (cands, probs) = nucleus(logits, temp, TOP_K, top_p);
+    let sum: f32 = probs.iter().sum();
+    cands
+        .iter()
+        .zip(probs)
+        .map(|(&(t, _), p)| (t as u32, p / sum))
+        .collect()
+}
+
+fn prob(p: &[(u32, f32)], x: u32) -> f32 {
+    p.iter().find(|e| e.0 == x).map_or(0.0, |e| e.1)
+}
+
+/// `max(0, p - q)` (unnormalized; [`draw`] scales by its total).
+fn residual(p: &[(u32, f32)], q: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let r: Vec<(u32, f32)> = p
+        .iter()
+        .map(|&(t, pt)| (t, (pt - prob(q, t)).max(0.0)))
+        .collect();
+    // p == q up to rounding: a rejection is then (almost) impossible; p itself is the residual.
+    if r.iter().map(|e| e.1).sum::<f32>() <= 0.0 {
+        return p.to_vec();
+    }
+    r
+}
+
+/// Inverse-CDF draw from `p` (weights need not sum to 1) with `u` uniform in (0, 1].
+fn draw(p: &[(u32, f32)], u: f64) -> u32 {
+    let total: f64 = p.iter().map(|e| e.1 as f64).sum();
+    let mut acc = 0.0;
+    for &(t, w) in p {
+        acc += w as f64;
+        if acc >= u * total {
+            return t;
+        }
+    }
+    p.last().map_or(0, |e| e.0)
+}
+
+/// Picks `k` from measured throughput (output tokens per second of decode time; `k = 0` is plain
+/// decoding, which skips the drafter and the checkpointing verify). It measures every `k` until
+/// the sample is [`Acc::decisive`], runs the fastest, and then sticks with it: every so often it
+/// probes another `k` and switches only if the probe, measured decisively too, beat the current
+/// `k`'s recent rate (a probe that is losing after [`PLAIN_STEPS`] steps just ends). Rates are
+/// total tokens over total time, never a mean of per-step rates: a drafting step's tokens swing
+/// with how many drafts were accepted, and a few lucky steps must not flip the choice. Comparing
+/// two rates measured moments apart keeps host-load drift from flipping it either. Probes rotate
+/// over the neighbours of the current `k` and plain decoding (or, from plain decoding, the `k`
+/// that rated best so far), so a stale rate never keeps a losing `k` running. The probe interval
+/// doubles, up to [`MAX_EXPLORE`] steps, while probes lose and drops to [`MIN_EXPLORE`] when one
+/// wins, so a losing drafter settles at a small fraction of plain decoding's cost.
+#[derive(Default)]
+pub(super) struct KTuner {
+    /// Per `k`, EWMA (tokens, seconds) per step: current for the `k` being run, as of its last
+    /// probe for the others.
+    avg: Vec<(f64, f64)>,
+    /// Per `k`, the first measurement, until every `k` has a decisive one.
+    sweep: Vec<Acc>,
+    /// The `k` being run, once every `k` was measured.
+    cur: Option<usize>,
+    /// Steps since the last probe, the steps between probes, and the probe rotation.
+    since: usize,
+    every: usize,
+    turn: usize,
+    probe: Option<Probe>,
+}
+
+/// Steps, tokens and seconds summed over a measurement.
+#[derive(Clone, Copy, Default)]
+struct Acc {
+    steps: usize,
+    tokens: usize,
+    secs: f64,
+}
+
+impl Acc {
+    /// Enough to judge `k`: plain steps barely vary, drafting steps need a run of them.
+    fn decisive(&self, k: usize) -> bool {
+        if k == 0 {
+            self.steps >= PLAIN_STEPS
+        } else {
+            self.steps >= DRAFT_STEPS && self.tokens >= DRAFT_TOKENS
+        }
+    }
+
+    fn per_step(&self) -> (f64, f64) {
+        let n = self.steps.max(1) as f64;
+        (self.tokens as f64 / n, self.secs / n)
+    }
+}
+
+struct Probe {
+    k: usize,
+    /// Calls left to hand out `k`, and what was recorded so far.
+    calls: usize,
+    acc: Acc,
+}
+
+const MIN_EXPLORE: usize = 16;
+const MAX_EXPLORE: usize = 512;
+/// Recorded steps that make a measurement of plain decoding, and of a drafting `k`
+/// (which also needs [`DRAFT_TOKENS`] tokens).
+const PLAIN_STEPS: usize = 3;
+const DRAFT_STEPS: usize = 8;
+const DRAFT_TOKENS: usize = 16;
+/// Calls a probe stays on: its samples plus a catch-up step (unrecorded) for each of a few
+/// concurrent sequences.
+const PROBE_CALLS: usize = 48;
+/// How much faster a probe of a larger `k` must run to replace the current one.
+const DRAFT_MORE_MARGIN: f64 = 0.05;
+
+impl KTuner {
+    /// The `k` for the next step of a drafter that drafts at most `max_k`.
+    pub(super) fn choose(&mut self, max_k: usize) -> usize {
+        if self.avg.len() != max_k + 1 {
+            *self = Self {
+                avg: vec![(0.0, 0.0); max_k + 1],
+                sweep: vec![Acc::default(); max_k + 1],
+                every: MIN_EXPLORE,
+                ..Self::default()
+            };
+        }
+        let Some(cur) = self.cur else {
+            // Measure every k, plain decoding last.
+            return (1..=max_k)
+                .chain([0])
+                .find(|&k| !self.sweep[k].decisive(k))
+                .unwrap_or(0);
+        };
+        if let Some(p) = &mut self.probe {
+            if p.calls > 0 {
+                p.calls -= 1;
+                return p.k;
+            }
+            self.probe = None;
+        }
+        self.since += 1;
+        if self.since < self.every {
+            return cur;
+        }
+        self.since = 0;
+        self.turn += 1;
+        let best_drafting = (1..=max_k).max_by(|&a, &b| self.rate(a).total_cmp(&self.rate(b)));
+        let options = if cur == 0 {
+            [best_drafting, None, None]
+        } else {
+            [
+                (cur < max_k).then_some(cur + 1),
+                Some(cur - 1),
+                (cur > 1).then_some(0),
+            ]
+        };
+        let Some(k) = (0..3).find_map(|i| options[(self.turn + i) % 3]) else {
+            return cur;
+        };
+        self.probe = Some(Probe {
+            k,
+            calls: PROBE_CALLS - 1,
+            acc: Acc::default(),
+        });
+        k
+    }
+
+    /// Records a step of `k` that emitted `tokens` in `took`. Callers skip steps whose drafter
+    /// first caught up on rows it missed (`Step::synced` false). Returns a log line when plain
+    /// decoding starts or stops beating speculation.
+    pub(super) fn record(&mut self, k: usize, tokens: usize, took: Duration) -> Option<String> {
+        let secs = took.as_secs_f64().max(1e-9);
+        let before = self.cur;
+        match (self.cur, self.probe.as_mut()) {
+            (None, _) => {
+                let a = self.sweep.get_mut(k)?;
+                a.steps += 1;
+                a.tokens += tokens;
+                a.secs += secs;
+                self.avg[k] = a.per_step();
+                if self.sweep.iter().enumerate().all(|(k, a)| a.decisive(k)) {
+                    self.cur = self.fastest();
+                }
+            }
+            (Some(cur), Some(p)) if p.k == k && k != cur => {
+                p.acc.steps += 1;
+                p.acc.tokens += tokens;
+                p.acc.secs += secs;
+                let acc = p.acc;
+                // Drafting more also spends more CPU: it has to win clearly, not by noise.
+                let margin = if k > cur {
+                    1.0 + DRAFT_MORE_MARGIN
+                } else {
+                    1.0
+                };
+                let (t, s) = acc.per_step();
+                let won = t / s > self.rate(cur) * margin;
+                // A loss ends the probe early (that only backs off); a win needs a decisive run.
+                if acc.steps >= PLAIN_STEPS && (!won || acc.decisive(k)) {
+                    self.avg[k] = (t, s);
+                    self.probe = None;
+                    self.every = if won {
+                        self.cur = Some(k);
+                        MIN_EXPLORE
+                    } else {
+                        (self.every * 2).min(MAX_EXPLORE)
+                    };
+                }
+            }
+            _ => {
+                let (t, s) = self.avg.get_mut(k)?;
+                *t = 0.8 * *t + 0.2 * tokens as f64;
+                *s = 0.8 * *s + 0.2 * secs;
+            }
+        }
+        let rates = (0..self.avg.len())
+            .map(|k| format!("k {k}: {:.2}", self.rate(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match (before, self.cur) {
+            (b, Some(0)) if b != Some(0) => Some(format!(
+                "speculative decoding off: plain decoding is faster (tok/s {rates})"
+            )),
+            (Some(0), Some(a)) if a > 0 => Some(format!(
+                "speculative decoding back on at k {a} (tok/s {rates})"
+            )),
+            _ => None,
+        }
+    }
+
+    /// Tokens per second of `k`: EWMA tokens per step over EWMA seconds per step.
+    fn rate(&self, k: usize) -> f64 {
+        let (t, s) = self.avg[k];
+        if s > 0.0 {
+            t / s
+        } else {
+            0.0
+        }
+    }
+
+    fn fastest(&self) -> Option<usize> {
+        (0..self.avg.len()).max_by(|&a, &b| self.rate(a).total_cmp(&self.rate(b)))
+    }
+
+    /// The `k` being run; `None` until every `k` was measured.
+    pub(super) fn best(&self) -> Option<usize> {
+        self.cur
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rejection sampling over a mismatched draft keeps the target distribution.
+    #[test]
+    fn rejection_sampling_preserves_target_distribution() {
+        let p = vec![(0, 0.5), (1, 0.3), (2, 0.2)];
+        let q = vec![(1, 0.6), (2, 0.1), (3, 0.3)];
+        let mut rng = Rng::new(7);
+        let n = 200_000;
+        let mut counts = [0usize; 4];
+        for _ in 0..n {
+            let x = draw(&q, rng.uniform());
+            let t = if rng.uniform() * prob(&q, x) as f64 <= prob(&p, x) as f64 {
+                x
+            } else {
+                draw(&residual(&p, &q), rng.uniform())
+            };
+            counts[t as usize] += 1;
+        }
+        for &(t, pt) in &p {
+            let f = counts[t as usize] as f32 / n as f32;
+            assert!((f - pt).abs() < 0.005, "token {t}: {f} vs {pt}");
+        }
+        assert_eq!(
+            counts[3], 0,
+            "a token outside the target's support was emitted"
+        );
+    }
+
+    /// A drafter that loses settles on plain decoding (logged once) and is then probed rarely
+    /// enough to stay within 1% of plain, even when plain decoding was first measured during a
+    /// load spike or the drafter's accepted counts swing step to step; one that wins keeps
+    /// drafting.
+    #[test]
+    fn k_tuner_turns_off_a_losing_drafter_and_keeps_a_winning_one() {
+        // (tokens, ms) of step `i` at each k; one plain step = 1 token in 100 ms.
+        let run = |step: fn(usize, usize) -> (usize, f64)| {
+            let mut t = KTuner::default();
+            let (mut time, mut tokens, mut logs) = (0.0, 0, Vec::new());
+            for i in 0..3000 {
+                let k = t.choose(4);
+                let (n, ms) = step(k, i);
+                if i >= 1000 {
+                    time += ms;
+                    tokens += n;
+                }
+                logs.extend(t.record(k, n, Duration::from_secs_f64(ms / 1000.0)));
+            }
+            (tokens as f64 / time * 1000.0, t.best(), logs)
+        };
+        // Losing: each draft token costs 60 ms and few are accepted.
+        let (rate, best, logs) = run(|k, _| (1 + k / 3, 100.0 + 60.0 * k as f64));
+        assert_eq!(best, Some(0));
+        assert!(rate > 10.0 * 0.99, "settled at {rate} tok/s vs plain 10");
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        assert!(logs[0].starts_with("speculative decoding off"), "{logs:?}");
+        // Losing by a little (best drafting k is 2.4% slower than plain), while plain decoding
+        // ran 3x slower over its first measurement (a load spike): drafting is picked first and
+        // only a probe of plain decoding brings it back.
+        let (rate, best, _) = run(|k, i| {
+            let ms = 100.0 + 35.0 * k as f64;
+            (1 + k / 3, if k == 0 && i < 100 { 3.0 * ms } else { ms })
+        });
+        assert_eq!(best, Some(0));
+        assert!(rate > 10.0 * 0.99, "settled at {rate} tok/s vs plain 10");
+        // Losing by 4-7% on average, with 0..=k drafts accepted per step at random: lucky runs
+        // of a few steps beat plain decoding, a decisive measurement doesn't.
+        let (rate, best, logs) = run(|k, i| {
+            let u = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+            (1 + (u % (k as u64 + 1)) as usize, 100.0 + 56.0 * k as f64)
+        });
+        assert_eq!(best, Some(0));
+        assert!(rate > 10.0 * 0.98, "settled at {rate} tok/s vs plain 10");
+        assert!(logs.len() <= 3, "{logs:?}");
+        // Winning: each draft token costs 10 ms and most are accepted (best k = 3).
+        let (rate, best, _) = run(|k, _| (1 + k * 7 / 10, 100.0 + 10.0 * k as f64));
+        assert_eq!(best, Some(3));
+        assert!(rate > 20.0, "{rate}");
+    }
+}
