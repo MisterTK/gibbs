@@ -1,0 +1,739 @@
+//! Gibbs graph IR: one model description shared by every executor (CPU today; Metal and
+//! Core ML/ANE per PLAN.md).
+//!
+//! A [`Graph`] is pure structure in SSA form. Every value is a graph input, a named weight, or the
+//! output of a node, and nodes are appended in topological order (a node can only reference values
+//! that already exist). Weights are ordinary operands, never op fields, and their data lives
+//! outside the graph in [`Weights`], so one graph can be fingerprinted or run.
+
+#[cfg(target_os = "macos")]
+pub mod coreml;
+pub mod cpu;
+pub mod cuda;
+pub mod level_zero;
+#[cfg(target_os = "macos")]
+pub mod metal;
+pub mod passes;
+pub mod pattern;
+pub mod placement;
+pub mod program;
+pub mod rocm;
+use crate::hardware::{Device, QuantFormat};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ValueId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(pub u32);
+
+/// Element type of a value. Quantized weights carry their block format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DType {
+    F32,
+    F16,
+    BF16,
+    U32,
+    Quant(QuantFormat),
+}
+
+/// Physical layout of a tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    /// Row-major in `shape` order; CPU images `[c, h*w]` are NCHW.
+    #[default]
+    RowMajor,
+    /// Channels-last images (Metal `convolution2d`).
+    Nhwc,
+    /// `[1, C, 1, S]` (Core ML on the Neural Engine).
+    Ane,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueKind {
+    Input,
+    /// Bound by name to [`Weights`] at execution.
+    Weight,
+    /// Persistent per-sequence buffer (e.g. KV cache slots, Gated DeltaNet recurrent state, causal conv state).
+    State(String),
+    Node(NodeId),
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct Value {
+    pub name: String,
+    /// Empty when unknown (e.g. per-node ONNX lowering).
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+    pub layout: Layout,
+    pub kind: ValueKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeVariant {
+    /// Rotates adjacent pairs `(2i, 2i+1)`.
+    Interleaved,
+    /// Rotates `(i, i + rotary_dim/2)` (GPT-NeoX / Qwen layout).
+    HalfSplit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceKind {
+    Sum,
+    Mean,
+    Max,
+    Min,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnaryKind {
+    Exp,
+    Sigmoid,
+    Tanh,
+    Softplus,
+    Neg,
+    Sqrt,
+    Rsqrt,
+    Abs,
+    Relu,
+    Relu2,
+    Silu,
+    GeluErf,
+    GeluTanh,
+    Scale(f32),
+    Clamp(f32, f32),
+    SoftCap(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Max,
+    Min,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsampleMode {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+/// Operations. Operand order is the node's `inputs` order, documented per variant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Op {
+    /// `[table [rows, d], ids [n] (U32)]` → `[n, d]`.
+    Embedding,
+    /// `[x [n, in], w [out, in], bias? [out]]` → `[n, out]`.
+    Linear,
+    /// `[a, b]` → `op(a)·op(b)` for activation × activation products.
+    MatMul {
+        transpose_a: bool,
+        transpose_b: bool,
+    },
+    /// `[x [n, d], gamma [d], beta? [d]]`, over the last dim.
+    LayerNorm {
+        eps: f32,
+    },
+    /// `[x [n, d], gamma [d]]`.
+    RmsNorm {
+        eps: f32,
+    },
+    /// `[x [c, hw], gamma [c], beta [c]]`.
+    GroupNorm {
+        groups: usize,
+        eps: f32,
+    },
+    /// `[x, gamma, beta]`, per instance.
+    InstanceNorm {
+        eps: f32,
+    },
+    /// `[x [n, heads*head_dim], positions [n] (U32)]`; rotates the first `rotary_dim` of each head.
+    Rope {
+        head_dim: usize,
+        rotary_dim: usize,
+        base: f32,
+        variant: RopeVariant,
+    },
+    /// `[q [nq, heads*d], k [nk, kv_heads*d], v [nk, kv_heads*d]]` → `[nq, heads*d]`, with `d` taken
+    /// from `q`'s shape. Cross-attention is this op with `k`/`v` from another sequence.
+    Attention {
+        heads: usize,
+        kv_heads: usize,
+        causal: bool,
+        window: Option<usize>,
+        soft_cap: Option<f32>,
+    },
+    /// `[gate, up]` → `silu(gate) * up`.
+    SwiGlu,
+    /// `[gate, up]` → `gelu(gate) * up`.
+    GeGlu,
+    /// `[x]` element-wise unary transformation.
+    Unary {
+        kind: UnaryKind,
+    },
+    /// `[a, b]` element-wise binary transformation with broadcasting.
+    Binary {
+        kind: BinaryKind,
+    },
+    /// `[q, k_new, v_new, k_state, v_state, positions]` evaluating causal attention and appending to state.
+    CachedAttention {
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        scale: f32,
+        causal: bool,
+        window: Option<usize>,
+        soft_cap: Option<f32>,
+        write: bool,
+    },
+    /// `[x, weight, bias?, conv_state]` 1D causal convolution updating state.
+    CausalConv1dCached {
+        kernel: usize,
+        dilation: usize,
+    },
+    /// `[q, k, v, beta, log_decay, ssm_state]` Gated DeltaNet recurrence rule.
+    DeltaRule {
+        key_heads: usize,
+        val_heads: usize,
+        key_dim: usize,
+        val_dim: usize,
+    },
+    Gather {
+        axis: isize,
+    },
+    Scatter {
+        axis: isize,
+    },
+    Pad {
+        padding: Vec<usize>,
+        value: f32,
+    },
+    AvgPool2d {
+        kernel: [usize; 2],
+        stride: [usize; 2],
+    },
+    Upsample {
+        scale: usize,
+        mode: UpsampleMode,
+    },
+    Conv3d {
+        stride: [usize; 3],
+        padding: [usize; 6],
+        dilation: [usize; 3],
+        groups: usize,
+    },
+    /// Mixture-of-experts FFN `[x, router, experts...]`.
+    Moe {
+        experts: usize,
+        top_k: usize,
+    },
+    Silu,
+    /// Exact (erf) GELU, or the tanh approximation.
+    Gelu {
+        tanh: bool,
+    },
+    Relu,
+    Softmax {
+        axis: isize,
+    },
+    /// Softmax with Top-K mask: only top k logits receive non-zero softmax weight, renormalized.
+    TopKSoftmax {
+        axis: isize,
+        k: usize,
+    },
+    /// `[a, b]` element-wise.
+    Add,
+    /// `[a, b]` element-wise.
+    Mul,
+    /// `[x [c_in, h, w], w [c_out, c_in/groups, kh, kw], bias? [c_out]]`; padding is
+    /// `[top, left, bottom, right]`.
+    Conv2d {
+        stride: [usize; 2],
+        padding: [usize; 4],
+        dilation: [usize; 2],
+        groups: usize,
+    },
+    /// `[x [c_in, l], w [c_out, c_in/groups, k], bias? [c_out]]`; padding is `[begin, end]`.
+    Conv1d {
+        stride: usize,
+        padding: [usize; 2],
+        dilation: usize,
+        groups: usize,
+    },
+    /// `[x]` with a static target shape, or `[x, shape]` when the shape is a runtime tensor (ONNX).
+    Reshape {
+        shape: Option<Vec<usize>>,
+    },
+    Transpose {
+        perm: Vec<usize>,
+    },
+    Concat {
+        axis: isize,
+    },
+    Slice {
+        axis: isize,
+        start: i64,
+        end: i64,
+    },
+    Squeeze {
+        axes: Vec<isize>,
+    },
+    Unsqueeze {
+        axes: Vec<isize>,
+    },
+    Tile {
+        reps: Vec<usize>,
+    },
+    Reduce {
+        kind: ReduceKind,
+        axes: Vec<isize>,
+        keep_dims: bool,
+    },
+    /// `[x [n, d], mask [n] (U32)]` → mean of the rows whose mask is non-zero → `[d]`.
+    MeanPool,
+    /// `[x]` → `x / ‖x‖₂`.
+    L2Normalize,
+}
+
+impl Op {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Op::Embedding => "Embedding",
+            Op::Linear => "Linear",
+            Op::MatMul { .. } => "MatMul",
+            Op::LayerNorm { .. } => "LayerNorm",
+            Op::RmsNorm { .. } => "RmsNorm",
+            Op::GroupNorm { .. } => "GroupNorm",
+            Op::InstanceNorm { .. } => "InstanceNorm",
+            Op::Rope { .. } => "Rope",
+            Op::Attention { .. } => "Attention",
+            Op::SwiGlu => "SwiGlu",
+            Op::Moe { .. } => "Moe",
+            Op::Silu => "Silu",
+            Op::Gelu { .. } => "Gelu",
+            Op::Relu => "Relu",
+            Op::Softmax { .. } => "Softmax",
+            Op::TopKSoftmax { .. } => "TopKSoftmax",
+            Op::Add => "Add",
+            Op::Mul => "Mul",
+            Op::Conv2d { .. } => "Conv2d",
+            Op::Conv1d { .. } => "Conv1d",
+            Op::Reshape { .. } => "Reshape",
+            Op::Transpose { .. } => "Transpose",
+            Op::Concat { .. } => "Concat",
+            Op::Slice { .. } => "Slice",
+            Op::Squeeze { .. } => "Squeeze",
+            Op::Unsqueeze { .. } => "Unsqueeze",
+            Op::Tile { .. } => "Tile",
+            Op::Reduce { .. } => "Reduce",
+            Op::MeanPool => "MeanPool",
+            Op::L2Normalize => "L2Normalize",
+            Op::GeGlu => "GeGlu",
+            Op::Unary { .. } => "Unary",
+            Op::Binary { .. } => "Binary",
+            Op::CachedAttention { .. } => "CachedAttention",
+            Op::CausalConv1dCached { .. } => "CausalConv1dCached",
+            Op::DeltaRule { .. } => "DeltaRule",
+            Op::Gather { .. } => "Gather",
+            Op::Scatter { .. } => "Scatter",
+            Op::Pad { .. } => "Pad",
+            Op::AvgPool2d { .. } => "AvgPool2d",
+            Op::Upsample { .. } => "Upsample",
+            Op::Conv3d { .. } => "Conv3d",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Node {
+    pub name: String,
+    pub op: Op,
+    pub inputs: Vec<ValueId>,
+    pub outputs: Vec<ValueId>,
+    /// Placement chosen by the placement pass; builders leave it on the CPU.
+    pub device: Device,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Graph {
+    pub values: Vec<Value>,
+    pub nodes: Vec<Node>,
+    pub inputs: Vec<ValueId>,
+    pub outputs: Vec<ValueId>,
+}
+
+impl Graph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn push_value(
+        &mut self,
+        name: String,
+        shape: Vec<usize>,
+        dtype: DType,
+        kind: ValueKind,
+    ) -> ValueId {
+        let id = ValueId(self.values.len() as u32);
+        self.values.push(Value {
+            name,
+            shape,
+            dtype,
+            layout: Layout::RowMajor,
+            kind,
+        });
+        id
+    }
+
+    /// Declares a graph input; inputs are bound by declaration order at execution.
+    pub fn input(&mut self, name: impl Into<String>, shape: Vec<usize>, dtype: DType) -> ValueId {
+        let id = self.push_value(name.into(), shape, dtype, ValueKind::Input);
+        self.inputs.push(id);
+        id
+    }
+
+    /// Declares a weight, bound by `name` to [`Weights`] at execution.
+    pub fn weight(&mut self, name: impl Into<String>, shape: Vec<usize>, dtype: DType) -> ValueId {
+        self.push_value(name.into(), shape, dtype, ValueKind::Weight)
+    }
+
+    /// Declares a persistent state tensor, bound to [`StateStore`] at execution.
+    pub fn state(&mut self, name: impl Into<String>, shape: Vec<usize>, dtype: DType) -> ValueId {
+        let name = name.into();
+        self.push_value(name.clone(), shape, dtype, ValueKind::State(name))
+    }
+
+    /// Appends a single-output node on the CPU and returns its output value.
+    pub fn add(
+        &mut self,
+        name: impl Into<String>,
+        op: Op,
+        inputs: &[ValueId],
+        shape: Vec<usize>,
+        dtype: DType,
+    ) -> ValueId {
+        let n = self.values.len() as u32;
+        assert!(
+            inputs.iter().all(|v| v.0 < n),
+            "graph node references a value that does not exist yet"
+        );
+        let name = name.into();
+        let node = NodeId(self.nodes.len() as u32);
+        let out = self.push_value(name.clone(), shape, dtype, ValueKind::Node(node));
+        self.nodes.push(Node {
+            name,
+            op,
+            inputs: inputs.to_vec(),
+            outputs: vec![out],
+            device: Device::Cpu,
+        });
+        out
+    }
+
+    /// Marks `v` as a graph output; outputs are returned in marking order.
+    pub fn output(&mut self, v: ValueId) {
+        self.outputs.push(v);
+    }
+
+    pub fn value(&self, v: ValueId) -> &Value {
+        &self.values[v.0 as usize]
+    }
+
+    pub fn node(&self, n: NodeId) -> &Node {
+        &self.nodes[n.0 as usize]
+    }
+
+    /// The node that produces `v`, if `v` is a node output.
+    pub fn producer(&self, v: ValueId) -> Option<&Node> {
+        match &self.value(v).kind {
+            ValueKind::Node(n) => Some(self.node(*n)),
+            _ => None,
+        }
+    }
+
+    /// Nodes that read `v` (linear scan).
+    pub fn consumers(&self, v: ValueId) -> impl Iterator<Item = &Node> + '_ {
+        self.nodes.iter().filter(move |n| n.inputs.contains(&v))
+    }
+}
+
+/// Tensor data for weights, graph inputs, and graph outputs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tensor {
+    F32(Vec<f32>),
+    U32(Vec<u32>),
+    F16(Vec<u16>),
+    BF16(Vec<u16>),
+    Mat(crate::model::weights::Mat),
+    Quantized(std::sync::Arc<crate::model::layers::QuantizedWeight>),
+}
+
+impl Tensor {
+    pub fn len(&self) -> usize {
+        match self {
+            Tensor::F32(v) => v.len(),
+            Tensor::U32(v) => v.len(),
+            Tensor::F16(v) => v.len(),
+            Tensor::BF16(v) => v.len(),
+            Tensor::Mat(m) => m.rows * m.cols,
+            Tensor::Quantized(q) => q.num_elements(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_f32(&self) -> Result<&[f32], String> {
+        match self {
+            Tensor::F32(v) => Ok(v.as_slice()),
+            Tensor::U32(_) => Err("expected an f32 tensor, got u32".into()),
+            Tensor::F16(_) => Err("expected an f32 tensor, got f16".into()),
+            Tensor::BF16(_) => Err("expected an f32 tensor, got bf16".into()),
+            Tensor::Mat(_) => Err("expected an f32 tensor, got Mat".into()),
+            Tensor::Quantized(_) => Err("expected an f32 tensor, got Quantized".into()),
+        }
+    }
+
+    pub fn to_f32(&self) -> Vec<f32> {
+        match self {
+            Tensor::F32(v) => v.clone(),
+            Tensor::U32(v) => v.iter().map(|&x| x as f32).collect(),
+            Tensor::F16(v) => v.iter().map(|&x| crate::model::f16_to_f32(x)).collect(),
+            Tensor::BF16(v) => v.iter().map(|&x| crate::model::bf16_to_f32(x)).collect(),
+            Tensor::Mat(m) => m.to_f32(),
+            Tensor::Quantized(q) => q.to_f32(),
+        }
+    }
+
+    pub fn into_f32(self) -> Result<Vec<f32>, String> {
+        match self {
+            Tensor::F32(v) => Ok(v),
+            other => Ok(other.to_f32()),
+        }
+    }
+
+    pub fn as_u32(&self) -> Result<&[u32], String> {
+        match self {
+            Tensor::U32(v) => Ok(v.as_slice()),
+            _ => Err("expected a u32 tensor".into()),
+        }
+    }
+}
+
+/// Persistent state buffers mapped by name for sequential / autoregressive decoding.
+#[derive(Debug, Clone, Default)]
+pub struct StateStore {
+    pub buffers: HashMap<String, Tensor>,
+    #[cfg(target_os = "macos")]
+    pub metal_buffers: HashMap<String, (std::sync::Arc<::metal::Buffer>, usize)>,
+}
+
+impl StateStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Tensor> {
+        self.buffers.get(name)
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut Tensor> {
+        self.buffers.get_mut(name)
+    }
+
+    pub fn insert(&mut self, name: impl Into<String>, t: Tensor) {
+        self.buffers.insert(name.into(), t);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn sync_metal_to_cpu(&mut self) {
+        for (name, (buf, n)) in &self.metal_buffers {
+            let slice = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, *n) };
+            self.buffers
+                .insert(name.clone(), Tensor::F32(slice.to_vec()));
+        }
+    }
+}
+
+/// Weight data by name, owned outside the graph.
+#[derive(Debug, Clone, Default)]
+pub struct Weights(HashMap<String, Tensor>);
+
+impl Weights {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, name: impl Into<String>, data: Tensor) {
+        self.0.insert(name.into(), data);
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Tensor> {
+        self.0.get(name)
+    }
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    pub fn remove(&mut self, name: &str) -> Option<Tensor> {
+        self.0.remove(name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Tensor)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Total element count across all weights.
+    pub fn parameter_count(&self) -> usize {
+        self.0.values().map(Tensor::len).sum()
+    }
+}
+
+/// Lowers `Op::Moe` nodes into router linear, top-k softmax, expert linear, and weighted accumulation nodes.
+pub fn lower_moe_pass(graph: &mut Graph) -> Result<(), String> {
+    if !graph.nodes.iter().any(|n| matches!(n.op, Op::Moe { .. })) {
+        return Ok(());
+    }
+    let mut new_g = Graph::new();
+    let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+
+    for (i, val) in graph.values.iter().enumerate() {
+        let old_id = ValueId(i as u32);
+        match &val.kind {
+            ValueKind::Input => {
+                let new_id = new_g.input(val.name.clone(), val.shape.clone(), val.dtype);
+                val_map.insert(old_id, new_id);
+            }
+            ValueKind::Weight => {
+                let new_id = new_g.weight(val.name.clone(), val.shape.clone(), val.dtype);
+                val_map.insert(old_id, new_id);
+            }
+            ValueKind::State(sname) => {
+                let new_id = new_g.state(sname.clone(), val.shape.clone(), val.dtype);
+                val_map.insert(old_id, new_id);
+            }
+            ValueKind::Node(_) => {}
+        }
+    }
+
+    for node in &graph.nodes {
+        let mapped_inputs: Vec<ValueId> = node
+            .inputs
+            .iter()
+            .map(|id| *val_map.get(id).expect("mapped input"))
+            .collect();
+        let orig_out_id = node.outputs[0];
+        let orig_val = graph.value(orig_out_id);
+
+        match node.op {
+            Op::Moe { experts, top_k } => {
+                if mapped_inputs.len() < 3 {
+                    return Err(format!(
+                        "node '{}': Op::Moe requires at least [x, router_weight, expert_weight_0...], got {} inputs",
+                        node.name,
+                        mapped_inputs.len()
+                    ));
+                }
+                let x = mapped_inputs[0];
+                let router_w = mapped_inputs[1];
+                let num_expert_weights = mapped_inputs.len() - 2;
+                if num_expert_weights == 0 || experts == 0 {
+                    return Err(format!("node '{}': Op::Moe has 0 experts", node.name));
+                }
+
+                let m = orig_val.shape.first().copied().unwrap_or(1);
+                let d_out = orig_val.shape.last().copied().unwrap_or(1);
+
+                // 1. Router logits: router_logits = x * router_weight -> [m, experts]
+                let router_logits = new_g.add(
+                    format!("{}.router_logits", node.name),
+                    Op::Linear,
+                    &[x, router_w],
+                    vec![m, experts],
+                    DType::F32,
+                );
+
+                // 2. Top-k Softmax over router logits -> [m, experts]
+                let router_probs = new_g.add(
+                    format!("{}.router_probs", node.name),
+                    Op::TopKSoftmax {
+                        axis: -1,
+                        k: top_k.min(experts),
+                    },
+                    &[router_logits],
+                    vec![m, experts],
+                    DType::F32,
+                );
+
+                // 3. For each expert: expert_out = x * expert_w; weighted = expert_out * expert_prob (row-broadcast)
+                let actual_experts = num_expert_weights.min(experts);
+                let mut accum = None;
+
+                for exp_i in 0..actual_experts {
+                    let exp_w = mapped_inputs[2 + exp_i];
+                    let exp_out = new_g.add(
+                        format!("{}.expert_{exp_i}", node.name),
+                        Op::Linear,
+                        &[x, exp_w],
+                        vec![m, d_out],
+                        DType::F32,
+                    );
+                    let exp_prob = new_g.add(
+                        format!("{}.prob_{exp_i}", node.name),
+                        Op::Slice {
+                            axis: -1,
+                            start: exp_i as i64,
+                            end: (exp_i + 1) as i64,
+                        },
+                        &[router_probs],
+                        vec![m, 1],
+                        DType::F32,
+                    );
+                    let weighted = new_g.add(
+                        format!("{}.weighted_{exp_i}", node.name),
+                        Op::Mul,
+                        &[exp_out, exp_prob],
+                        vec![m, d_out],
+                        DType::F32,
+                    );
+                    accum = Some(match accum {
+                        None => weighted,
+                        Some(acc) => new_g.add(
+                            format!("{}.accum_{exp_i}", node.name),
+                            Op::Add,
+                            &[acc, weighted],
+                            vec![m, d_out],
+                            DType::F32,
+                        ),
+                    });
+                }
+
+                let final_out = accum.ok_or_else(|| {
+                    format!("node '{}': MoE produced no expert outputs", node.name)
+                })?;
+                val_map.insert(orig_out_id, final_out);
+            }
+            _ => {
+                let new_out = new_g.add(
+                    node.name.clone(),
+                    node.op.clone(),
+                    &mapped_inputs,
+                    orig_val.shape.clone(),
+                    orig_val.dtype,
+                );
+                val_map.insert(orig_out_id, new_out);
+            }
+        }
+    }
+
+    for &out_id in &graph.outputs {
+        new_g.output(*val_map.get(&out_id).expect("mapped output"));
+    }
+
+    *graph = new_g;
+    Ok(())
+}
