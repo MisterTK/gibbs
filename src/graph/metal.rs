@@ -230,6 +230,8 @@ pub enum Epi {
     Silu,
     SwiGlu,
     GeGlu,
+    UpSwiGlu,
+    UpGeGlu,
 }
 
 impl Epi {
@@ -242,6 +244,8 @@ impl Epi {
             Epi::Silu => 3,
             Epi::SwiGlu => 4,
             Epi::GeGlu => 5,
+            Epi::UpSwiGlu => 6,
+            Epi::UpGeGlu => 7,
         }
     }
 }
@@ -2875,22 +2879,34 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                                 Op::Gelu { tanh: false } => epi = Epi::Gelu,
                                 Op::Silu if format.is_some() => epi = Epi::Silu,
                                 Op::SwiGlu if format.is_some() && c.inputs.len() == 2 => {
-                                    // SwiGlu is non-commutative: silu(gate) * up.
-                                    // This linear MUST be gate (inputs[0]); `other` must be up (inputs[1]),
-                                    // which must already exist before this node.
                                     if c.inputs[0] == out {
                                         let up = c.inputs[1];
                                         if up != out && exists_before(up, i) && n_of(up)? == m * n {
                                             (epi, res) = (Epi::SwiGlu, Some(up));
                                         }
+                                    } else if c.inputs[1] == out {
+                                        let gate = c.inputs[0];
+                                        if gate != out
+                                            && exists_before(gate, i)
+                                            && n_of(gate)? == m * n
+                                        {
+                                            (epi, res) = (Epi::UpSwiGlu, Some(gate));
+                                        }
                                     }
                                 }
                                 Op::GeGlu if format.is_some() && c.inputs.len() == 2 => {
-                                    // GeGlu is non-commutative: gelu(gate) * up.
                                     if c.inputs[0] == out {
                                         let up = c.inputs[1];
                                         if up != out && exists_before(up, i) && n_of(up)? == m * n {
                                             (epi, res) = (Epi::GeGlu, Some(up));
+                                        }
+                                    } else if c.inputs[1] == out {
+                                        let gate = c.inputs[0];
+                                        if gate != out
+                                            && exists_before(gate, i)
+                                            && n_of(gate)? == m * n
+                                        {
+                                            (epi, res) = (Epi::UpGeGlu, Some(gate));
                                         }
                                     }
                                 }

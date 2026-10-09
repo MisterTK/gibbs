@@ -533,6 +533,11 @@ static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemv
         return silu * res[out_idx];
     } else if (p.epi == 5) {
         return gelu_erf(acc) * res[out_idx];
+    } else if (p.epi == 6) {
+        float gate = res[out_idx];
+        return acc * (gate / (1.0f + exp(-gate)));
+    } else if (p.epi == 7) {
+        return acc * gelu_erf(res[out_idx]);
     }
     return acc;
 }
