@@ -112,7 +112,18 @@ impl Mat {
                 crate::model::simd::vector_gemv_q4_0_f32_nobias(slice, k, n, x, out);
                 return;
             }
-            crate::model::nn::matmul_nt(x, &self.to_f32(), None, 1, k, n, out);
+            let per = n.div_ceil(crate::model::par::threads() * 4).max(16);
+            let o = OutPtr::new(out);
+            par_for(n.div_ceil(per), &|t| {
+                let (j0, j1) = (t * per, ((t + 1) * per).min(n));
+                let mut row_buf = vec![0.0f32; k];
+                // SAFETY: columns j0..j1 belong to task t.
+                let dst = unsafe { o.slice(j0, j1 - j0) };
+                for (d, j) in dst.iter_mut().zip(j0..j1) {
+                    self.decode_row_f32(j, &mut row_buf);
+                    *d = crate::model::simd::vector_dot_product(&row_buf, x);
+                }
+            });
             return;
         }
         for (j, o) in out.iter_mut().enumerate() {
@@ -425,6 +436,7 @@ impl Weights {
                         | crate::hardware::QuantFormat::GGUF_IQ4_XS
                         | crate::hardware::QuantFormat::GGUF_IQ2_S
                         | crate::hardware::QuantFormat::GGUF_Q4_K_M
+                        | crate::hardware::QuantFormat::GGUF_Q2_K
                         | crate::hardware::QuantFormat::GGUF_IQ3_S
                 )
                 && !should_transform(&hf);
