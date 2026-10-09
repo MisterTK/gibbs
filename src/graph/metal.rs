@@ -1634,10 +1634,7 @@ impl Session {
                 } else {
                     enc.set_buffer(5, Some(out.0), out.1 as u64);
                 }
-                let rows_per_tg = match format {
-                    WeightFormat::IQ4_XS => 8,
-                    _ => 16,
-                };
+                let rows_per_tg = 16;
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -1901,10 +1898,7 @@ impl Session {
                 } else {
                     bind(5, s.out);
                 }
-                let rows_per_tg = match format {
-                    WeightFormat::IQ4_XS => 8,
-                    _ => 16,
-                };
+                let rows_per_tg = 16;
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
                     MTLSize::new(256, 1, 1),
