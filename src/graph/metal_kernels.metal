@@ -1410,56 +1410,81 @@ kernel void gemv_iq3_s(device const block_iq3_s* w [[buffer(0)]],
                        uint2 tg [[threadgroup_position_in_grid]],
                        uint sg [[simdgroup_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tg.x * 8 + sg;
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
     uint batch = tg.y;
-    if (row >= p.rows || batch >= p.batch_size) return;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 256;
     uint n_sub_blocks = n_blocks * 8;
-    device const block_iq3_s* row_blocks = w + (ulong)row * n_blocks;
+    device const block_iq3_s* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_iq3_s* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     for (uint sb = lane; sb < n_sub_blocks; sb += 32) {
         uint b = sb >> 3;
         uint ib = sb & 7;
-        device const block_iq3_s& blk = row_blocks[b];
-        float d = float(blk.d);
-        uint sc = (blk.scales[ib / 2] >> (4 * (ib % 2))) & 0xF;
-        float db = d * float(1 + 2 * sc);
-        uint h = uint(blk.qh[ib]);
+        device const block_iq3_s& blk0 = r0_blocks[b];
+        device const block_iq3_s& blk1 = r1_blocks[b];
+        float d0 = float(blk0.d);
+        float d1 = float(blk1.d);
+        uint sc0 = (blk0.scales[ib / 2] >> (4 * (ib % 2))) & 0xF;
+        uint sc1 = (blk1.scales[ib / 2] >> (4 * (ib % 2))) & 0xF;
+        float db0 = d0 * float(1 + 2 * sc0);
+        float db1 = d1 * float(1 + 2 * sc1);
+        uint h0 = uint(blk0.qh[ib]);
+        uint h1 = uint(blk1.qh[ib]);
         device const float* xb_sub = xb_base + (ulong)sb * 32;
 
-        float sb_acc = 0.0f;
+        float sb_acc0 = 0.0f;
+        float sb_acc1 = 0.0f;
         for (uint l = 0; l < 4; ++l) {
-            uint g1 = iq3s_grid[uint(blk.qs[8 * ib + 2 * l]) | ((h << (8 - 2 * l)) & 256)];
-            uint g2 = iq3s_grid[uint(blk.qs[8 * ib + 2 * l + 1]) | ((h << (7 - 2 * l)) & 256)];
-            uint8_t s = blk.signs[4 * ib + l];
+            uint g1_0 = iq3s_grid[uint(blk0.qs[8 * ib + 2 * l]) | ((h0 << (8 - 2 * l)) & 256)];
+            uint g2_0 = iq3s_grid[uint(blk0.qs[8 * ib + 2 * l + 1]) | ((h0 << (7 - 2 * l)) & 256)];
+            uint8_t s_0 = blk0.signs[4 * ib + l];
+
+            uint g1_1 = iq3s_grid[uint(blk1.qs[8 * ib + 2 * l]) | ((h1 << (8 - 2 * l)) & 256)];
+            uint g2_1 = iq3s_grid[uint(blk1.qs[8 * ib + 2 * l + 1]) | ((h1 << (7 - 2 * l)) & 256)];
+            uint8_t s_1 = blk1.signs[4 * ib + l];
+
             device const float* x_el = xb_sub + l * 8;
 
             for (uint j = 0; j < 4; ++j) {
-                float s0 = (s & (1 << j)) ? -1.0f : 1.0f;
-                float val0 = db * float(char((g1 >> (8 * j)) & 0xFF)) * s0;
-                sb_acc += val0 * x_el[j];
+                float xj = x_el[j];
+                float xj4 = x_el[j + 4];
 
-                float s1 = (s & (1 << (j + 4))) ? -1.0f : 1.0f;
-                float val1 = db * float(char((g2 >> (8 * j)) & 0xFF)) * s1;
-                sb_acc += val1 * x_el[j + 4];
+                float sign0_0 = (s_0 & (1 << j)) ? -1.0f : 1.0f;
+                float sign1_0 = (s_0 & (1 << (j + 4))) ? -1.0f : 1.0f;
+                sb_acc0 += (db0 * float(char((g1_0 >> (8 * j)) & 0xFF)) * sign0_0) * xj;
+                sb_acc0 += (db0 * float(char((g2_0 >> (8 * j)) & 0xFF)) * sign1_0) * xj4;
+
+                float sign0_1 = (s_1 & (1 << j)) ? -1.0f : 1.0f;
+                float sign1_1 = (s_1 & (1 << (j + 4))) ? -1.0f : 1.0f;
+                sb_acc1 += (db1 * float(char((g1_1 >> (8 * j)) & 0xFF)) * sign0_1) * xj;
+                sb_acc1 += (db1 * float(char((g2_1 >> (8 * j)) & 0xFF)) * sign1_1) * xj4;
             }
         }
-        acc += sb_acc;
+        acc0 += sb_acc0;
+        acc1 += sb_acc1;
     }
 
-    acc = simd_sum(acc);
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
     if (lane == 0) {
-        if (p.has_bias != 0) acc += bias[row];
-        if (p.epi == 2) {
-            acc += res[(ulong)batch * p.rows + row];
-        } else if (p.epi == 1) {
-            acc = gelu_erf(acc);
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
         }
-        y[(ulong)batch * p.rows + row] = acc;
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
     }
 }
 

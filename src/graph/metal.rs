@@ -1635,7 +1635,7 @@ impl Session {
                     enc.set_buffer(5, Some(out.0), out.1 as u64);
                 }
                 let rows_per_tg = match format {
-                    WeightFormat::IQ4_XS | WeightFormat::IQ3_S => 8,
+                    WeightFormat::IQ4_XS => 8,
                     _ => 16,
                 };
                 enc.dispatch_thread_groups(
@@ -1902,7 +1902,7 @@ impl Session {
                     bind(5, s.out);
                 }
                 let rows_per_tg = match format {
-                    WeightFormat::IQ4_XS | WeightFormat::IQ3_S => 8,
+                    WeightFormat::IQ4_XS => 8,
                     _ => 16,
                 };
                 enc.dispatch_thread_groups(
