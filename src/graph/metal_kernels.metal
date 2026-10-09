@@ -2186,42 +2186,63 @@ kernel void gemv_nvfp4(device const uchar* wq [[buffer(0)]],
                        uint2 tg [[threadgroup_position_in_grid]],
                        uint sg [[simdgroup_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tg.x * 8 + sg;
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
     uint batch = tg.y;
-    if (row >= p.rows || batch >= p.batch_size) return;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 16;
     uint byte_stride = p.cols / 2;
-    device const uchar* row_bytes = wq + (ulong)row * byte_stride;
-    device const uchar* row_scales = scales_e4m3 + (ulong)row * n_blocks;
+    device const uchar* r0_bytes = wq + (ulong)row0 * byte_stride;
+    device const uchar* r1_bytes = has_row1 ? (wq + (ulong)row1 * byte_stride) : r0_bytes;
+    device const uchar* r0_scales = scales_e4m3 + (ulong)row0 * n_blocks;
+    device const uchar* r1_scales = has_row1 ? (scales_e4m3 + (ulong)row1 * n_blocks) : r0_scales;
     device const float* xb_base = x + (ulong)batch * p.cols;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     for (uint blk = lane; blk < n_blocks; blk += 32) {
-        float s = e4m3_to_float(row_scales[blk]) * global_scale;
-        device const uchar* blk_bytes = row_bytes + blk * 8;
+        float s0 = e4m3_to_float(r0_scales[blk]) * global_scale;
+        float s1 = e4m3_to_float(r1_scales[blk]) * global_scale;
+        device const uchar* b0_bytes = r0_bytes + blk * 8;
+        device const uchar* b1_bytes = r1_bytes + blk * 8;
         device const float* xb = xb_base + blk * 16;
 
-        float b_acc = 0.0f;
+        float b_acc0 = 0.0f;
+        float b_acc1 = 0.0f;
         for (uint i = 0; i < 8; ++i) {
-            uchar byte_val = blk_bytes[i];
-            float v0 = nvfp4_e2m1_lut[byte_val & 0x0F] * s;
-            float v1 = nvfp4_e2m1_lut[byte_val >> 4] * s;
-            b_acc += v0 * xb[2 * i] + v1 * xb[2 * i + 1];
+            uchar byte0 = b0_bytes[i];
+            uchar byte1 = b1_bytes[i];
+            float x0 = xb[2 * i];
+            float x1 = xb[2 * i + 1];
+
+            float v0_0 = nvfp4_e2m1_lut[byte0 & 0x0F] * s0;
+            float v1_0 = nvfp4_e2m1_lut[byte0 >> 4] * s0;
+            b_acc0 += v0_0 * x0 + v1_0 * x1;
+
+            float v0_1 = nvfp4_e2m1_lut[byte1 & 0x0F] * s1;
+            float v1_1 = nvfp4_e2m1_lut[byte1 >> 4] * s1;
+            b_acc1 += v0_1 * x0 + v1_1 * x1;
         }
-        acc += b_acc;
+        acc0 += b_acc0;
+        acc1 += b_acc1;
     }
 
-    acc = simd_sum(acc);
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
     if (lane == 0) {
-        if (p.has_bias != 0) acc += bias[row];
-        if (p.epi == 2) {
-            acc += res[(ulong)batch * p.rows + row];
-        } else if (p.epi == 1) {
-            acc = gelu_erf(acc);
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
         }
-        y[(ulong)batch * p.rows + row] = acc;
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
     }
 }
 
