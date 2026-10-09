@@ -1112,13 +1112,23 @@ kernel void gemv_iq2_m(device const block_iq2_s* w [[buffer(0)]],
             uint8_t s0 = blk0.signs[4 * ib + l];
             uint8_t s1 = blk1.signs[4 * ib + l];
             device const float* x_el = xb_sub + l * 8;
+            float4 x0 = *reinterpret_cast<device const float4*>(x_el);
+            float4 x1 = *reinterpret_cast<device const float4*>(x_el + 4);
+            char4 b0_lo = as_type<char4>((uint32_t)g0);
+            char4 b0_hi = as_type<char4>((uint32_t)(g0 >> 32));
+            char4 b1_lo = as_type<char4>((uint32_t)g1);
+            char4 b1_hi = as_type<char4>((uint32_t)(g1 >> 32));
 
-            for (uint j = 0; j < 8; ++j) {
-                float xj = x_el[j];
-                float val0 = db_0 * float((char)((g0 >> (8 * j)) & 0xFF)) * ((s0 & (1 << j)) ? -1.0f : 1.0f);
-                float val1 = db_1 * float((char)((g1 >> (8 * j)) & 0xFF)) * ((s1 & (1 << j)) ? -1.0f : 1.0f);
-                sb_acc0 += val0 * xj;
-                sb_acc1 += val1 * xj;
+            for (uint j = 0; j < 4; ++j) {
+                float sign0 = (s0 & (1 << j)) ? -1.0f : 1.0f;
+                float sign1 = (s1 & (1 << j)) ? -1.0f : 1.0f;
+                sb_acc0 += (db_0 * float(b0_lo[j]) * sign0) * x0[j];
+                sb_acc1 += (db_1 * float(b1_lo[j]) * sign1) * x0[j];
+
+                float sign0_hi = (s0 & (1 << (j + 4))) ? -1.0f : 1.0f;
+                float sign1_hi = (s1 & (1 << (j + 4))) ? -1.0f : 1.0f;
+                sb_acc0 += (db_0 * float(b0_hi[j]) * sign0_hi) * x1[j];
+                sb_acc1 += (db_1 * float(b1_hi[j]) * sign1_hi) * x1[j];
             }
         }
         acc0 += sb_acc0;
