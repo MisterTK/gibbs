@@ -3,8 +3,7 @@ set -euo pipefail
 
 # Canonical Autoresearch Benchmark Entrypoint for Gibbs Engine
 # Measures real end-to-end decode throughput (tok/s) and memory roofline saturation.
-
-OUTPUT=$(cargo test --release --test engine_tests -- --nocapture 2>&1)
+OUTPUT=$(cargo test --release --test engine_tests -- --nocapture --test-threads=1 2>&1)
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
