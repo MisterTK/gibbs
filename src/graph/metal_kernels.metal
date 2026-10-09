@@ -1533,25 +1533,50 @@ kernel void gemv_tq2_0(device const uint8_t* w [[buffer(0)]],
                        device const float* x [[buffer(1)]],
                        device float* y [[buffer(2)]],
                        constant PackedGemvParams& p [[buffer(3)]],
-                       uint tg [[threadgroup_position_in_grid]],
+                       device const float* bias [[buffer(4)]],
+                       device const float* res [[buffer(5)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
                        uint sg [[simdgroup_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tg * 8 + sg;
-    if (row >= p.rows) return;
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
     uint bytes = p.cols / 4;
-    device const uint8_t* row_w = w + (ulong)row * bytes;
-    float acc = 0.0f;
+    device const uint8_t* r0_w = w + (ulong)row0 * bytes;
+    device const uint8_t* r1_w = has_row1 ? (w + (ulong)row1 * bytes) : r0_w;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     for (uint b = lane; b < bytes; b += 32) {
-        uint8_t byte = row_w[b];
-        uint base = b * 4;
+        uint8_t byte0 = r0_w[b];
+        uint8_t byte1 = r1_w[b];
+        float4 xb = *reinterpret_cast<device const float4*>(xb_base + b * 4);
         for (uint j = 0; j < 4; ++j) {
-            int code = int((byte >> (j * 2)) & 0x03);
-            float val = float(code - 1);
-            acc += val * x[base + j];
+            int code0 = int((byte0 >> (j * 2)) & 0x03);
+            int code1 = int((byte1 >> (j * 2)) & 0x03);
+            float xj = xb[j];
+            acc0 += float(code0 - 1) * xj;
+            acc1 += float(code1 - 1) * xj;
         }
     }
-    acc = simd_sum(acc);
-    if (lane == 0) y[row] = acc;
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
 }
 
 enum : int {
