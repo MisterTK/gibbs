@@ -262,7 +262,9 @@ impl TuiApp {
         ])
         .areas(inner);
         let peak = self.spark.iter().copied().max().unwrap_or(0);
-        let b_peak = 273.0f32; // Apple M5 Pro unified memory bandwidth ceiling (GB/s)
+        let b_peak = crate::hardware::HardwareProfile::detect()
+            .memory_bandwidth_gbps
+            .max(50.0) as f32;
         let roofline_str = if s.effective_bandwidth_gbps > 0.0 {
             let eta = (s.effective_bandwidth_gbps / b_peak) * 100.0;
             let regime = if eta > 65.0 {
@@ -1007,12 +1009,15 @@ impl TuiApp {
                 Style::default().fg(Color::White),
             ),
         ]));
+        let b_peak = crate::hardware::HardwareProfile::detect()
+            .memory_bandwidth_gbps
+            .max(50.0) as f32;
         lines.push(Line::from(vec![
             Span::styled("Bandwidth Saturation: ", dim()),
             Span::styled(
                 format!(
-                    "{:.1} GB/s ({:.1}% of 273 GB/s roofline ceiling)",
-                    cur_bw, cur_eta
+                    "{:.1} GB/s ({:.1}% of {:.0} GB/s roofline ceiling)",
+                    cur_bw, cur_eta, b_peak
                 ),
                 if cur_eta > 60.0 {
                     Style::default()
