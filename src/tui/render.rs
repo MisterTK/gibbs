@@ -178,11 +178,7 @@ impl TuiApp {
                 }
             }
             let s = self.telemetry.get_summary();
-            let b_peak = if s.memory_bandwidth_gbps > 0.0 {
-                s.memory_bandwidth_gbps
-            } else {
-                298.24
-            };
+            let b_peak = s.memory_bandwidth_gbps;
             let eta = if b_peak > 0.0 && s.effective_bandwidth_gbps > 0.0 {
                 (s.effective_bandwidth_gbps / b_peak * 100.0).min(100.0)
             } else {
@@ -262,10 +258,8 @@ impl TuiApp {
         ])
         .areas(inner);
         let peak = self.spark.iter().copied().max().unwrap_or(0);
-        let b_peak = crate::hardware::HardwareProfile::detect()
-            .memory_bandwidth_gbps
-            .max(50.0) as f32;
-        let roofline_str = if s.effective_bandwidth_gbps > 0.0 {
+        let b_peak = s.memory_bandwidth_gbps;
+        let roofline_str = if s.effective_bandwidth_gbps > 0.0 && b_peak > 0.0 {
             let eta = (s.effective_bandwidth_gbps / b_peak) * 100.0;
             let regime = if eta > 65.0 {
                 "BW-Bound"
@@ -887,15 +881,14 @@ impl TuiApp {
         f.render_widget(block, popup);
 
         let s = self.telemetry.get_summary();
-        let bw_peak = 273.0f64; // Apple Silicon M5 Pro memory bandwidth GB/s
+        let bw_peak = s.memory_bandwidth_gbps as f64;
         let peak_compute = 28_000.0f64; // 28 TFLOPs FP16 GFLOP/s
-        let ridge = peak_compute / bw_peak; // ~102.5 FLOPs/B
-        let cur_bw = s.effective_bandwidth_gbps as f64;
-        let cur_eta = if cur_bw > 0.0 {
-            (cur_bw / bw_peak) * 100.0
+        let ridge = if bw_peak > 0.0 {
+            peak_compute / bw_peak
         } else {
             0.0
         };
+        let cur_bw = s.effective_bandwidth_gbps as f64;
         let cur_intensity = 3.20f64; // Decode operational intensity FLOPs/B for Gemma 4 / Qwen
         let cur_gflops = (cur_intensity * cur_bw).max(10.0);
 
@@ -1009,16 +1002,24 @@ impl TuiApp {
                 Style::default().fg(Color::White),
             ),
         ]));
-        let b_peak = crate::hardware::HardwareProfile::detect()
-            .memory_bandwidth_gbps
-            .max(50.0) as f32;
+        let b_peak = s.memory_bandwidth_gbps;
+        let cur_eta = if b_peak > 0.0 {
+            (cur_bw / b_peak as f64) * 100.0
+        } else {
+            0.0
+        };
+        let bw_str = if b_peak > 0.0 {
+            format!(
+                "{:.1} GB/s ({:.1}% of {:.0} GB/s roofline ceiling)",
+                cur_bw, cur_eta, b_peak
+            )
+        } else {
+            format!("{:.1} GB/s (hardware ceiling unprobed)", cur_bw)
+        };
         lines.push(Line::from(vec![
             Span::styled("Bandwidth Saturation: ", dim()),
             Span::styled(
-                format!(
-                    "{:.1} GB/s ({:.1}% of {:.0} GB/s roofline ceiling)",
-                    cur_bw, cur_eta, b_peak
-                ),
+                bw_str,
                 if cur_eta > 60.0 {
                     Style::default()
                         .fg(Color::Green)

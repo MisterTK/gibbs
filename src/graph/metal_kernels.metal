@@ -1286,8 +1286,8 @@ kernel void gemv_q2_k(device const block_q2_k* w [[buffer(0)]],
 
     // Each thread in SIMDgroup processes a subset of the 256-element block across all blocks in the row
     for (uint b = 0; b < n_blocks; ++b) {
-        block_q2_k blk0 = r0_blocks[b];
-        block_q2_k blk1 = has_row1 ? r1_blocks[b] : blk0;
+        device const block_q2_k& blk0 = r0_blocks[b];
+        device const block_q2_k& blk1 = has_row1 ? r1_blocks[b] : blk0;
         device const float* xb = xb_base + (ulong)b * 256;
 
         float d0 = float(blk0.d);
