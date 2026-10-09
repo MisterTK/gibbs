@@ -31,6 +31,11 @@ pub enum AvatarStyle {
     Tetrahedron,
     Partition,
     Yale,
+    Phenomenon,
+    Duhem,
+    Potential,
+    Helmholtz,
+    Copley,
 }
 
 impl AvatarStyle {
@@ -50,7 +55,12 @@ impl AvatarStyle {
             Self::Optics => Self::Tetrahedron,
             Self::Tetrahedron => Self::Partition,
             Self::Partition => Self::Yale,
-            Self::Yale => Self::Classic,
+            Self::Yale => Self::Phenomenon,
+            Self::Phenomenon => Self::Duhem,
+            Self::Duhem => Self::Potential,
+            Self::Potential => Self::Helmholtz,
+            Self::Helmholtz => Self::Copley,
+            Self::Copley => Self::Classic,
         }
     }
 
@@ -71,9 +81,13 @@ impl AvatarStyle {
             Self::Tetrahedron => "tetrahedron",
             Self::Partition => "partition",
             Self::Yale => "yale",
+            Self::Phenomenon => "phenomenon",
+            Self::Duhem => "duhem",
+            Self::Potential => "potential",
+            Self::Helmholtz => "helmholtz",
+            Self::Copley => "copley",
         }
     }
-
     pub fn from_str_style(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "classic" => Some(Self::Classic),
@@ -91,6 +105,11 @@ impl AvatarStyle {
             "tetrahedron" | "simplex" | "quaternary" => Some(Self::Tetrahedron),
             "partition" | "ladder" | "states" => Some(Self::Partition),
             "yale" | "sloane" | "tower" | "campus" => Some(Self::Yale),
+            "phenomenon" | "overshoot" | "fourier" => Some(Self::Phenomenon),
+            "duhem" | "gibbs_duhem" => Some(Self::Duhem),
+            "potential" | "chemical" | "chem_pot" => Some(Self::Potential),
+            "helmholtz" | "free_work" => Some(Self::Helmholtz),
+            "copley" | "medal" | "royal_society" => Some(Self::Copley),
             _ => None,
         }
     }
@@ -175,6 +194,11 @@ impl MascotEngine {
             AvatarStyle::Tetrahedron => self.render_scene_tetrahedron(),
             AvatarStyle::Partition => self.render_scene_partition(),
             AvatarStyle::Yale => self.render_scene_yale(),
+            AvatarStyle::Phenomenon => self.render_scene_phenomenon(),
+            AvatarStyle::Duhem => self.render_scene_duhem(),
+            AvatarStyle::Potential => self.render_scene_potential(),
+            AvatarStyle::Helmholtz => self.render_scene_helmholtz(),
+            AvatarStyle::Copley => self.render_scene_copley(),
         }
     }
 
@@ -825,6 +849,193 @@ impl MascotEngine {
         ]
     }
 
+    /// Scene 16: Gibbs Phenomenon (Fourier Overshoot 8.95%)
+    fn render_scene_phenomenon(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(255, 120, 80))
+            .add_modifier(Modifier::BOLD);
+        let c_wave = Style::default().fg(Color::Cyan);
+        let c_overshoot = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let c_math = Style::default().fg(Color::White);
+
+        let wave = match tick % 4 {
+            0 => "   ╭───▲──╮   _     ",
+            1 => "  ╭────▲───╮   _    ",
+            2 => " ╭─────▲────╮   _   ",
+            _ => "╭──────▲─────╮   _  ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" 〰 Gibbs Phenomenon", c_title)]),
+            Line::from(vec![Span::styled("  Overshoot: +8.949% ", c_overshoot)]),
+            Line::from(vec![Span::styled(wave, c_wave)]),
+            Line::from(vec![Span::styled("  │   |    ╰───▼──╯ ", c_wave)]),
+            Line::from(vec![Span::styled("  Fourier S_N(x) Jump", c_math)]),
+            Line::from(vec![Span::styled(
+                "  lim N→∞ ringing   ",
+                Style::default().fg(Color::Rgb(180, 180, 220)),
+            )]),
+            Line::from(vec![Span::styled(
+                "  Discontinuity 1899 ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 17: Gibbs-Duhem Equation (Intensive State Equilibrium)
+    fn render_scene_duhem(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(140, 220, 120))
+            .add_modifier(Modifier::BOLD);
+        let c_scale = Style::default().fg(Color::Yellow);
+        let c_math = Style::default().fg(Color::White);
+
+        let balance = match tick % 3 {
+            0 => "    ▲ [S·dT] ─── [V·dP] ▲",
+            1 => "   ▲─ [S·dT] ── [V·dP] ─▲",
+            _ => "  ▲── [S·dT] ─ [V·dP] ──▲",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" ⚖ Gibbs-Duhem Eq.   ", c_title)]),
+            Line::from(vec![Span::styled(
+                "  ∑ N_i dμ_i = 0     ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(balance, c_scale)]),
+            Line::from(vec![Span::styled("   ╰───────┬───────╯ ", c_scale)]),
+            Line::from(vec![Span::styled("   -S·dT + V·dP = 0  ", c_math)]),
+            Line::from(vec![Span::styled(
+                "  Chemical Coexistence",
+                Style::default().fg(Color::Rgb(200, 200, 160)),
+            )]),
+            Line::from(vec![Span::styled(
+                "  Intensive Balance  ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 18: Chemical Potential (Species Partial Molar Free Energy)
+    fn render_scene_potential(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(220, 140, 240))
+            .add_modifier(Modifier::BOLD);
+        let c_diff = Style::default().fg(Color::Rgb(120, 200, 255));
+        let c_math = Style::default().fg(Color::White);
+
+        let flux = match tick % 4 {
+            0 => "  (A) ●-●-●-► (B)    ",
+            1 => "  (A)  ●-●-●-►(B)    ",
+            2 => "  (A)   ●-●-●-►B)    ",
+            _ => "  (A)    ●-●-●► )    ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" 🧪 Chemical Potential", c_title)]),
+            Line::from(vec![Span::styled(
+                "  μ_i = (∂G/∂N_i)_T,P",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(flux, c_diff)]),
+            Line::from(vec![Span::styled(
+                "  [High μ] ──► [Low μ]",
+                Style::default().fg(Color::Cyan),
+            )]),
+            Line::from(vec![Span::styled("  dG = ∑ μ_i dN_i    ", c_math)]),
+            Line::from(vec![Span::styled(
+                "  Phase Diffusion    ",
+                Style::default().fg(Color::Rgb(180, 220, 180)),
+            )]),
+            Line::from(vec![Span::styled(
+                "  Equilibrium dμ = 0 ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 19: Helmholtz Free Energy & Isothermal Work
+    fn render_scene_helmholtz(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(255, 180, 60))
+            .add_modifier(Modifier::BOLD);
+        let c_piston = Style::default().fg(Color::Rgb(180, 180, 200));
+        let c_math = Style::default().fg(Color::White);
+
+        let piston = match tick % 4 {
+            0 => "  |===|  [Piston]     ",
+            1 => "  |====| [Piston]     ",
+            2 => "  |=====|[Piston]     ",
+            _ => "  |====| [Piston]     ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" ⚙ Helmholtz Energy  ", c_title)]),
+            Line::from(vec![Span::styled(
+                "  F = U - T·S        ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(vec![Span::styled(piston, c_piston)]),
+            Line::from(vec![Span::styled(
+                "  W_max = -ΔF_T      ",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from(vec![Span::styled("  dF = -S·dT - P·dV  ", c_math)]),
+            Line::from(vec![Span::styled(
+                "  Canonical Free Work",
+                Style::default().fg(Color::Rgb(220, 200, 140)),
+            )]),
+            Line::from(vec![Span::styled(
+                "  Isothermal Piston  ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 20: 1901 Copley Medal (Royal Society of London)
+    fn render_scene_copley(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(255, 215, 0))
+            .add_modifier(Modifier::BOLD);
+        let c_gold = Style::default().fg(Color::Rgb(255, 220, 80));
+        let c_laurel = Style::default().fg(Color::Rgb(100, 200, 120));
+
+        let shimmer = match tick % 3 {
+            0 => "    ╭─★ Copley ★─╮   ",
+            1 => "    ╭─✦ Copley ✦─╮   ",
+            _ => "    ╭─✧ Copley ✧─╮   ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" 🏅 Royal Society 1901", c_title)]),
+            Line::from(vec![Span::styled(shimmer, c_gold)]),
+            Line::from(vec![Span::styled("   (  J.W. GIBBS  )  ", c_gold)]),
+            Line::from(vec![Span::styled("    ╰─ /\\====/\\ ─╯   ", c_gold)]),
+            Line::from(vec![Span::styled("   🌿 Laurel Wreath 🌿", c_laurel)]),
+            Line::from(vec![Span::styled(
+                "  Highest World Honor",
+                Style::default().fg(Color::White),
+            )]),
+            Line::from(vec![Span::styled(
+                "  London, Nov 30 1901",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
     /// Renders a full 12-line vignette card for wide displays (>=120 cols).
     pub fn render_full_vignette(&self) -> Vec<Line<'static>> {
         let mut lines = self.render_lines();
@@ -1037,6 +1248,41 @@ mod tests {
         let l_yale = mascot.render_lines();
         assert_eq!(l_yale.len(), 7);
         assert!(l_yale[0].to_string().contains("Yale Sloane Physics"));
+
+        // 16. Phenomenon
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Phenomenon);
+        let l_phen = mascot.render_lines();
+        assert_eq!(l_phen.len(), 7);
+        assert!(l_phen[0].to_string().contains("Gibbs Phenomenon"));
+
+        // 17. Duhem
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Duhem);
+        let l_duh = mascot.render_lines();
+        assert_eq!(l_duh.len(), 7);
+        assert!(l_duh[0].to_string().contains("Gibbs-Duhem Eq."));
+
+        // 18. Potential
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Potential);
+        let l_pot = mascot.render_lines();
+        assert_eq!(l_pot.len(), 7);
+        assert!(l_pot[0].to_string().contains("Chemical Potential"));
+
+        // 19. Helmholtz
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Helmholtz);
+        let l_helm = mascot.render_lines();
+        assert_eq!(l_helm.len(), 7);
+        assert!(l_helm[0].to_string().contains("Helmholtz Energy"));
+
+        // 20. Copley
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Copley);
+        let l_cop = mascot.render_lines();
+        assert_eq!(l_cop.len(), 7);
+        assert!(l_cop[0].to_string().contains("Royal Society 1901"));
 
         // Cycle back to Classic
         mascot.avatar_style = mascot.avatar_style.cycle();
