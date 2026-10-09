@@ -12,11 +12,7 @@ mod text;
 mod unified;
 mod vision;
 
-#[cfg(target_os = "macos")]
-pub mod metal;
 pub use gguf::load_gguf;
-#[cfg(target_os = "macos")]
-pub use metal::MetalGemma4Decoder;
 
 use crate::hardware::Device;
 use crate::model::hub::ModelArtifacts;
@@ -70,8 +66,7 @@ impl Encoder for Audio {
 pub struct Gemma4 {
     tokenizer: Tokenizer,
     text: Arc<TextModel>,
-    #[cfg(target_os = "macos")]
-    pub metal_decoder: Option<Arc<MetalGemma4Decoder>>,
+    pub program: Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>,
     unified: bool,
     vision: Box<dyn Encoder>,
     audio: Box<dyn Encoder>,
@@ -87,8 +82,7 @@ pub struct Gemma4 {
 /// text width, for the placeholder positions `prepare` laid out.
 struct State {
     cache: TextCache,
-    #[cfg(target_os = "macos")]
-    metal_kv: Option<crate::backend::metal::MetalKvCache>,
+    program_state: crate::graph::StateStore,
     /// Positions of media soft tokens, ascending; row `i` of `media` fills `media_pos[i]`.
     media_pos: Vec<usize>,
     media: Vec<f32>,
@@ -158,33 +152,11 @@ pub fn load(
             .ok_or_else(|| format!("config.{k} missing"))
     };
     let mode = mode.into();
-    let want_metal = match mode {
-        crate::hardware::PlacementMode::Pin(Device::Metal) => true,
-        crate::hardware::PlacementMode::Auto => {
-            crate::hardware::available_devices().contains(&Device::Metal)
-        }
-        _ => false,
-    };
-    #[cfg(target_os = "macos")]
-    let metal_decoder = if want_metal {
-        match MetalGemma4Decoder::new(&text) {
-            Ok(dec) => Some(Arc::new(dec)),
-            Err(e) => {
-                if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Metal)) {
-                    return Err(format!("Metal decoder initialization failed: {e}"));
-                }
-                tracing::warn!("Metal initialization failed, falling back to CPU: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let program = compile_gemma4_program(&text, mode);
     Ok(Arc::new(Gemma4 {
         tokenizer,
         text,
-        #[cfg(target_os = "macos")]
-        metal_decoder,
+        program,
         unified,
         vision,
         audio,
@@ -246,17 +218,15 @@ impl Gemma4 {
 
 impl NativeLm for Gemma4 {
     fn backend_label(&self) -> String {
-        #[cfg(target_os = "macos")]
-        if let Some(dec) = &self.metal_decoder {
-            return format!("Metal ({})", dec.device_name());
+        if let Some(prog) = &self.program {
+            return prog.lock().backend_label();
         }
         format!("CPU (NEON bf16), {} threads", crate::model::par::threads())
     }
 
     fn device(&self) -> Device {
-        #[cfg(target_os = "macos")]
-        if self.metal_decoder.is_some() {
-            return Device::Metal;
+        if let Some(prog) = &self.program {
+            return prog.lock().primary_device();
         }
         Device::Cpu
     }
@@ -323,16 +293,9 @@ impl NativeLm for Gemma4 {
             out.push(close);
             rows.extend(soft);
         }
-        #[cfg(target_os = "macos")]
-        let metal_kv = if let Some(dec) = &self.metal_decoder {
-            dec.new_kv_cache().ok()
-        } else {
-            None
-        };
         let state = State {
             cache: self.text.new_cache(),
-            #[cfg(target_os = "macos")]
-            metal_kv,
+            program_state: crate::graph::StateStore::new(),
             media_pos,
             media: rows,
             blocks,
@@ -365,15 +328,52 @@ impl NativeLm for Gemma4 {
         if end <= st.done {
             return Ok(st.logits.clone()); // run ahead with an earlier chunk's image block
         }
-        #[cfg(target_os = "macos")]
-        if let Some(dec) = &self.metal_decoder {
+        if let Some(prog) = &self.program {
             if st.media_pos.is_empty() {
-                if let Some(kv) = &mut st.metal_kv {
-                    let logits = dec.forward_tokens(tokens, start_pos, kv)?;
-                    st.asked = end;
-                    st.done = end;
-                    return Ok(logits);
+                let mut prog_guard = prog.lock();
+                std::mem::swap(&mut prog_guard.state, &mut st.program_state);
+                let mut last_logits = Vec::new();
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let pos = start_pos + i;
+                    let mut inputs = vec![
+                        crate::graph::Tensor::U32(vec![tok]),
+                        crate::graph::Tensor::U32(vec![pos as u32]),
+                    ];
+                    if let Some(p) = &self.text.ple {
+                        let pd = p.dim;
+                        let nl = self.text.layers_n;
+                        let mut e = vec![0.0f32; nl * pd];
+                        let id = if (tok as usize) < p.embed.rows {
+                            tok
+                        } else {
+                            self.text.pad_id
+                        };
+                        p.embed.get_row(id as usize, &mut e);
+                        let ident_scale = (pd as f32).sqrt();
+                        for v in &mut e {
+                            *v *= ident_scale;
+                        }
+                        inputs.push(crate::graph::Tensor::F32(e));
+                    }
+                    let out = prog_guard.run(inputs);
+                    match out {
+                        Ok(res) => {
+                            if i + 1 == tokens.len() {
+                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
+                                    last_logits = v;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            std::mem::swap(&mut prog_guard.state, &mut st.program_state);
+                            return Err(e);
+                        }
+                    }
                 }
+                std::mem::swap(&mut prog_guard.state, &mut st.program_state);
+                st.asked = end;
+                st.done = end;
+                return Ok(last_logits);
             }
         }
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
@@ -412,5 +412,34 @@ impl NativeLm for Gemma4 {
             st.logits = logits.clone();
         }
         Ok(logits)
+    }
+}
+
+pub(crate) fn compile_gemma4_program(
+    text: &Arc<TextModel>,
+    mode: crate::hardware::PlacementMode,
+) -> Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>> {
+    if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
+        return None;
+    }
+    if text.ple.is_some() {
+        // Gemma 4 E-series models with PLE currently require RoPE inv_freq harmonization and native Q2_K/K-quant Metal kernels
+        // to avoid dense F32 dequantization (13.9 GB RSS) and repetitive decode output. Eager CPU forward remains the verified path.
+        return None;
+    }
+    match text.to_decode_graph() {
+        Ok((graph, weights)) => {
+            match crate::graph::program::GraphProgram::compile(graph, weights, mode) {
+                Ok(prog) => Some(Arc::new(parking_lot::Mutex::new(prog))),
+                Err(e) => {
+                    tracing::warn!("Gemma4 GraphProgram compile failed, falling back to CPU: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Gemma4 decode graph lowering failed, falling back to CPU: {e}");
+            None
+        }
     }
 }

@@ -372,6 +372,10 @@ pub fn validate_ssa(graph: &Graph) -> Result<(), String> {
 }
 
 /// Eliminates removed nodes and re-indexes the Graph to preserve strict topological order and SSA.
+pub fn compact_graph_public(graph: &mut Graph, eliminated: &HashSet<NodeId>) {
+    compact_graph(graph, eliminated);
+}
+
 fn compact_graph(graph: &mut Graph, eliminated: &HashSet<NodeId>) {
     // Filter out eliminated nodes
     let remaining: Vec<Node> = graph

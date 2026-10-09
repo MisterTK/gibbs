@@ -285,6 +285,156 @@ impl ExecutableModel {
         Ok(self.sample(&logits, recent(all_tokens), temp, top_p))
     }
 
+    pub fn step_token_with_kv_and_logprobs(
+        &self,
+        all_tokens: &[u32],
+        last_token: u32,
+        pos: usize,
+        temp: f32,
+        top_p: f32,
+        top_k: usize,
+        kv_cache: &mut Option<SeqKvCache>,
+    ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
+        let logits = match self {
+            Self::Nano(m) => {
+                let tok = m.read().forward_token(last_token, pos);
+                return Ok((tok, None));
+            }
+            Self::Native(m) => match kv_cache {
+                Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
+                _ => return Err(WRONG_KV.into()),
+            },
+            Self::GraphLm(m) => {
+                let model = m.read();
+                match kv_cache {
+                    Some(SeqKvCache::Cpu(cache)) => {
+                        let actual_pos = cache.first().map_or(0, |c| c.len);
+                        model.forward_token_with_kv(last_token, actual_pos, cache)
+                    }
+                    None => {
+                        let mut cache = new_cpu_kv(&model);
+                        let mut logits = vec![0.0f32; model.config.vocab_size];
+                        for (p, &tok) in all_tokens.iter().enumerate() {
+                            logits = model.forward_token_with_kv(tok, p, &mut cache);
+                        }
+                        *kv_cache = Some(SeqKvCache::Cpu(cache));
+                        logits
+                    }
+                    #[cfg(target_os = "macos")]
+                    Some(SeqKvCache::Metal(_)) => return Err(WRONG_KV.into()),
+                    Some(SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
+                        return Err(WRONG_KV.into())
+                    }
+                }
+            }
+            Self::Program(prog, m) => {
+                let mut p = prog.write();
+                let _model = m.read();
+                match kv_cache {
+                    Some(SeqKvCache::Program(state)) => {
+                        std::mem::swap(&mut p.state, state);
+                        let actual_pos = (pos - 1) as u32;
+                        let inputs = vec![
+                            crate::graph::Tensor::U32(vec![last_token]),
+                            crate::graph::Tensor::U32(vec![actual_pos]),
+                        ];
+                        let out = p.run(inputs);
+                        std::mem::swap(&mut p.state, state);
+                        let out = out?;
+                        match out.into_iter().next() {
+                            Some(crate::graph::Tensor::F32(v)) => v,
+                            _ => return Err("GraphProgram did not return F32 logits".into()),
+                        }
+                    }
+                    None => {
+                        p.state = crate::graph::StateStore::new();
+                        let mut last_logits = Vec::new();
+                        for (i, &tok) in all_tokens.iter().enumerate() {
+                            let inputs = vec![
+                                crate::graph::Tensor::U32(vec![tok]),
+                                crate::graph::Tensor::U32(vec![i as u32]),
+                            ];
+                            let out = p.run(inputs)?;
+                            match out.into_iter().next() {
+                                Some(crate::graph::Tensor::F32(v)) => last_logits = v,
+                                _ => return Err("GraphProgram did not return F32 logits".into()),
+                            }
+                        }
+                        *kv_cache = Some(SeqKvCache::Program(p.state.clone()));
+                        last_logits
+                    }
+                    _ => return Err(WRONG_KV.into()),
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Self::Metal(m) => match kv_cache {
+                Some(SeqKvCache::Metal(kv)) => m.forward_tokens(&[last_token], kv)?,
+                None => {
+                    let mut kv = m.new_kv_cache()?;
+                    let logits = m.forward_tokens(all_tokens, &mut kv)?;
+                    *kv_cache = Some(SeqKvCache::Metal(kv));
+                    logits
+                }
+                Some(SeqKvCache::Cpu(_) | SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
+                    return Err(WRONG_KV.into())
+                }
+            },
+        };
+
+        let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
+
+        let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+        let lse = max_l + sum_exp.ln();
+
+        // Exact Shannon entropy computed over full vocabulary in a single pass:
+        let entropy = -logits
+            .iter()
+            .map(|&l| {
+                let p = (l - lse).exp();
+                if p > 1e-12 {
+                    p * (l - lse)
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f32>();
+
+        // Top k selection using select_nth_unstable_by in O(V + k log k) time:
+        let mut indexed: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (i as u32, l))
+            .collect();
+        let k_take = top_k.min(indexed.len()).max(1);
+        if k_take < indexed.len() {
+            indexed.select_nth_unstable_by(k_take - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let top_slice = &mut indexed[..k_take];
+        top_slice
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let top_candidates: Vec<(u32, f32)> = top_slice
+            .iter()
+            .map(|&(tok, l)| (tok, (l - lse).exp()))
+            .collect();
+
+        let chosen_prob = (logits.get(chosen as usize).copied().unwrap_or(max_l) - lse)
+            .exp()
+            .min(1.0);
+
+        Ok((
+            chosen,
+            Some(TokenLogprobInfo {
+                chosen_id: chosen,
+                chosen_prob,
+                top_candidates,
+                entropy,
+            }),
+        ))
+    }
     /// Evaluates a chunk of prompt tokens. If this chunk completes the prompt,
     /// returns `Some(next_token)`. If more prompt tokens remain, returns `None`.
     pub fn step_prefill_chunk(
@@ -755,6 +905,15 @@ pub struct SamplingParams {
     /// `None` uses the model's generation_config default, else [`DEFAULT_TOP_P`].
     pub top_p: Option<f32>,
     pub max_new_tokens: usize,
+    pub top_logprobs: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprobInfo {
+    pub chosen_id: u32,
+    pub chosen_prob: f32,
+    pub top_candidates: Vec<(u32, f32)>,
+    pub entropy: f32,
 }
 
 impl Default for SamplingParams {
@@ -763,6 +922,7 @@ impl Default for SamplingParams {
             temperature: None,
             top_p: None,
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            top_logprobs: None,
         }
     }
 }
@@ -774,6 +934,7 @@ impl SamplingParams {
             temperature,
             top_p: None,
             max_new_tokens: max_tokens.unwrap_or(usize::MAX),
+            top_logprobs: None,
         }
     }
 }
@@ -918,6 +1079,7 @@ pub struct ContinuousBatchScheduler {
     /// Drafter for speculative decoding: the model's own (MTP heads) unless replaced.
     drafter: RwLock<Option<Arc<dyn Drafter>>>,
     k_tuner: Mutex<KTuner>,
+    pub logprob_tx: Arc<RwLock<Option<UnboundedSender<TokenLogprobInfo>>>>,
 }
 
 /// The drafter `model` ships, unless `GIBBS_SPEC=off`.
@@ -968,6 +1130,7 @@ impl ContinuousBatchScheduler {
             prefill_tuner: Mutex::new(PrefillTuner::default()),
             view: Mutex::new(SchedulerView::default()),
             k_tuner: Mutex::new(KTuner::default()),
+            logprob_tx: Arc::new(RwLock::new(None)),
         };
         if has_model {
             s.log_drafter();
@@ -1518,8 +1681,37 @@ impl ContinuousBatchScheduler {
                     }
                     _ => {
                         let last = all.last().copied().unwrap_or(1);
-                        m.step_token_with_kv(&all, last, all.len(), temp, top_p, &mut seq.kv_cache)
+                        if let Some(top_k) = seq.params.top_logprobs {
+                            match m.step_token_with_kv_and_logprobs(
+                                &all,
+                                last,
+                                all.len(),
+                                temp,
+                                top_p,
+                                top_k,
+                                &mut seq.kv_cache,
+                            ) {
+                                Ok((tok, info_opt)) => {
+                                    if let Some(info) = info_opt {
+                                        if let Some(tx) = self.logprob_tx.read().as_ref() {
+                                            let _ = tx.send(info);
+                                        }
+                                    }
+                                    Ok(vec![tok])
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            m.step_token_with_kv(
+                                &all,
+                                last,
+                                all.len(),
+                                temp,
+                                top_p,
+                                &mut seq.kv_cache,
+                            )
                             .map(|t| vec![t])
+                        }
                     }
                 };
                 let tokens = match result {
@@ -1642,6 +1834,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: n,
+            top_logprobs: None,
         };
         let (_, mut rx1, _, _, _) = s.submit_with_params(greedy(40), |_| vec![1, 2, 3, 4]);
         s.step();
@@ -1686,6 +1879,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 4,
+            top_logprobs: None,
         };
         let (_, _long, _, _, _) = s.submit_with_params(greedy, |_| vec![42; 3000]);
         let (_, mut short, _, _, _) = s.submit_with_params(greedy, |_| vec![1, 2, 3, 4]);
@@ -1708,6 +1902,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 1,
+            top_logprobs: None,
         };
         let (long, _long, _, _, _) = s.submit_with_params(greedy, |_| vec![42; 3000]);
         let (mut streams, mut prefilled) = (Vec::new(), 0);
@@ -1745,6 +1940,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 1000,
+            top_logprobs: None,
         };
         let (_, rx, _, _, _) = s.submit_with_params(params, |_| vec![1, 2, 3]);
         s.step();
@@ -1781,6 +1977,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 1000,
+            top_logprobs: None,
         };
         let (_, _rx, _, _, running) = s.submit_with_params(params, |_| vec![1, 2, 3]);
         s.step();
@@ -1848,6 +2045,7 @@ mod tests {
                 temperature: Some(0.0),
                 top_p: None,
                 max_new_tokens: n,
+                top_logprobs: None,
             };
             let (_, rx, _, _, finish) = scheduler.submit_with_params(params, |_| vec![1, 2, 3]);
             assert_eq!(
@@ -1911,6 +2109,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 1,
+            top_logprobs: None,
         };
         let (_, rx, _, _, _) = scheduler.submit_with_params(params, |_| prompt.to_vec());
         assert_eq!(run_to_completion(&scheduler, rx), vec![argmax]);
@@ -1967,6 +2166,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: 12,
+            top_logprobs: None,
         };
         let (_, rx, _, _, _) = scheduler.submit_with_params(params, |_| vec![5, 9, 13, 2, 77]);
         let out = run_to_completion(&scheduler, rx);

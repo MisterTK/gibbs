@@ -137,9 +137,11 @@ pub(crate) struct TextModel {
     /// Inverse frequency of each rotary pair (rotary dim / 2 of them) and the M-RoPE axis
     /// (0 = t, 1 = h, 2 = w) that drives it.
     pub(crate) inv_freq: Vec<f32>,
+    pub(crate) rope_theta: f32,
     axis: Vec<usize>,
     lin: Option<LinearCfg>,
     pub(crate) max_pos: usize,
+    pub(crate) decode_max_ctx: usize,
     /// Token embeddings `[vocab, hidden]`, also the LM head when tied.
     pub(crate) embed: Linear,
     pub(crate) lm_head: Option<Linear>,
@@ -438,9 +440,11 @@ impl TextModel {
             attn_gate,
             norm_after_rope: arch == Arch::HunYuan,
             inv_freq,
+            rope_theta: theta as f32,
             axis,
             lin,
             max_pos: get("max_position_embeddings").unwrap_or(32768),
+            decode_max_ctx: get("max_position_embeddings").unwrap_or(32768).min(4096),
             embed,
             lm_head,
             layers,
@@ -606,9 +610,7 @@ impl TextModel {
                 self.vocab
             ));
         }
-        for (o, &w) in out.iter_mut().zip(self.embed.parts[0].row(t)) {
-            *o = f32::from_bits((w as u32) << 16);
-        }
+        self.embed.parts[0].decode_row_f32(t, out);
         Ok(())
     }
 
@@ -1143,10 +1145,1369 @@ impl TextModel {
         }
         dn.out.forward(&core, n)
     }
+
+    /// Emits static-shape decode graph (n = 1) with stateful KV and DeltaNet caching and zero-copy weight bindings.
+    pub fn to_decode_graph(&self) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.to_decode_graph_with_max_ctx(self.decode_max_ctx)
+    }
+
+    /// Emits static-shape decode graph (n = 1) with stateful KV and DeltaNet caching sized to `max_ctx`.
+    pub fn to_decode_graph_with_max_ctx(
+        &self,
+        max_ctx: usize,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        let max_ctx = max_ctx.min(self.max_pos).max(1);
+        use crate::graph::{DType, Graph, Op, RopeVariant, Tensor, UnaryKind, ValueId};
+        use crate::model::weights::Mat;
+
+        if self.hc.is_some() {
+            return Err("Hyper-connections not supported in decode graph".into());
+        }
+
+        fn mat_dtype(m: &Mat) -> DType {
+            if let Some(p) = m.packed() {
+                match p.format {
+                    crate::hardware::QuantFormat::FP32 => DType::F32,
+                    crate::hardware::QuantFormat::FP16 => DType::F16,
+                    crate::hardware::QuantFormat::BF16 => DType::BF16,
+                    f => DType::Quant(f),
+                }
+            } else {
+                DType::BF16
+            }
+        }
+
+        fn add_linear_part(
+            g: &mut Graph,
+            w: &mut crate::graph::Weights,
+            name: &str,
+            x: ValueId,
+            part: &Mat,
+            bias: Option<&[f32]>,
+            n: usize,
+        ) -> ValueId {
+            let dtype = mat_dtype(part);
+            let w_name = format!("{name}.weight");
+            let w_node = g.weight(&w_name, vec![part.rows, part.cols], dtype);
+            w.insert(&w_name, part.to_graph_tensor());
+            let mut ins = vec![x, w_node];
+            if let Some(b) = bias {
+                let b_name = format!("{name}.bias");
+                let b_node = g.weight(&b_name, vec![b.len()], DType::F32);
+                w.insert(&b_name, Tensor::F32(b.to_vec()));
+                ins.push(b_node);
+            }
+            g.add(name, Op::Linear, &ins, vec![n, part.rows], DType::F32)
+        }
+
+        fn add_linear_part_shaped(
+            g: &mut Graph,
+            w: &mut crate::graph::Weights,
+            name: &str,
+            x: ValueId,
+            part: &Mat,
+            bias: Option<&[f32]>,
+            shape: Vec<usize>,
+        ) -> ValueId {
+            let dtype = mat_dtype(part);
+            let w_name = format!("{name}.weight");
+            let w_node = g.weight(&w_name, vec![part.rows, part.cols], dtype);
+            w.insert(&w_name, part.to_graph_tensor());
+            let mut ins = vec![x, w_node];
+            if let Some(b) = bias {
+                let b_name = format!("{name}.bias");
+                let b_node = g.weight(&b_name, vec![b.len()], DType::F32);
+                w.insert(&b_name, Tensor::F32(b.to_vec()));
+                ins.push(b_node);
+            }
+            g.add(name, Op::Linear, &ins, shape, DType::F32)
+        }
+
+        let mut g = Graph::new();
+        let mut w = crate::graph::Weights::new();
+
+        let n = 1;
+        let mut x = g.input("inputs_embeds", vec![n, self.hidden], DType::F32);
+        let positions = g.input("positions", vec![n], DType::U32);
+
+        // 2. Decoder layers
+        for (li, l) in self.layers.iter().enumerate() {
+            if l.hc.is_some() {
+                return Err(format!(
+                    "Layer {li}: Hyper-connections / PLE not supported in decode graph"
+                ));
+            }
+            let p = format!("layers.{li}");
+
+            // Input LayerNorm / RMSNorm
+            let in_norm_w = g.weight(
+                format!("{p}.input_layernorm.weight"),
+                vec![self.hidden],
+                DType::F32,
+            );
+            w.insert(
+                format!("{p}.input_layernorm.weight"),
+                Tensor::F32(l.in_norm.clone()),
+            );
+            let normed_x = g.add(
+                format!("{p}.input_layernorm"),
+                Op::RmsNorm { eps: self.eps },
+                &[x, in_norm_w],
+                vec![n, self.hidden],
+                DType::F32,
+            );
+
+            // Mixer
+            let mixer_out = match &l.mixer {
+                Mixer::Delta(dn) => {
+                    let c = self.lin.as_ref().expect("linear config for DeltaNet");
+                    let (cd, kk, vd, vh, kh, kd, dv) = (
+                        c.conv_dim(),
+                        c.k_heads * c.k_dim,
+                        c.v_heads * c.v_dim,
+                        c.v_heads,
+                        c.k_heads,
+                        c.k_dim,
+                        c.v_dim,
+                    );
+
+                    // Separate linear projections for conv_in (qkv), z, b, a
+                    let conv_in = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mixer.proj_qkv"),
+                        normed_x,
+                        &dn.proj.parts[0],
+                        None,
+                        n,
+                    );
+                    let z = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mixer.proj_z"),
+                        normed_x,
+                        &dn.proj.parts[1],
+                        None,
+                        n,
+                    );
+                    let b = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mixer.proj_b"),
+                        normed_x,
+                        &dn.proj.parts[2],
+                        None,
+                        n,
+                    );
+                    let a = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mixer.proj_a"),
+                        normed_x,
+                        &dn.proj.parts[3],
+                        None,
+                        n,
+                    );
+
+                    // Conv1d
+                    let conv_state = g.state(
+                        format!("{p}.conv_state"),
+                        vec![c.kernel - 1, cd],
+                        DType::F32,
+                    );
+                    let conv_w = g.weight(
+                        format!("{p}.mixer.conv.weight"),
+                        vec![cd, c.kernel],
+                        DType::F32,
+                    );
+                    w.insert(
+                        format!("{p}.mixer.conv.weight"),
+                        Tensor::F32(dn.conv.clone()),
+                    );
+                    let conv_out = g.add(
+                        format!("{p}.mixer.conv"),
+                        Op::CausalConv1dCached {
+                            kernel: c.kernel,
+                            dilation: 1,
+                        },
+                        &[conv_in, conv_w, conv_state],
+                        vec![n, cd],
+                        DType::F32,
+                    );
+                    let mixed = g.add(
+                        format!("{p}.mixer.silu"),
+                        Op::Silu,
+                        &[conv_out],
+                        vec![n, cd],
+                        DType::F32,
+                    );
+
+                    // Slices for q, k, v
+                    let q = g.add(
+                        format!("{p}.mixer.q"),
+                        Op::Slice {
+                            axis: -1,
+                            start: 0,
+                            end: kk as i64,
+                        },
+                        &[mixed],
+                        vec![n, kk],
+                        DType::F32,
+                    );
+                    let k = g.add(
+                        format!("{p}.mixer.k"),
+                        Op::Slice {
+                            axis: -1,
+                            start: kk as i64,
+                            end: (2 * kk) as i64,
+                        },
+                        &[mixed],
+                        vec![n, kk],
+                        DType::F32,
+                    );
+                    let v = g.add(
+                        format!("{p}.mixer.v"),
+                        Op::Slice {
+                            axis: -1,
+                            start: (2 * kk) as i64,
+                            end: cd as i64,
+                        },
+                        &[mixed],
+                        vec![n, vd],
+                        DType::F32,
+                    );
+
+                    // Beta & log_decay
+                    let beta = g.add(
+                        format!("{p}.mixer.beta"),
+                        Op::Unary {
+                            kind: UnaryKind::Sigmoid,
+                        },
+                        &[b],
+                        vec![n, vh],
+                        DType::F32,
+                    );
+                    let dt_bias_w = g.weight(format!("{p}.mixer.dt_bias"), vec![vh], DType::F32);
+                    w.insert(
+                        format!("{p}.mixer.dt_bias"),
+                        Tensor::F32(dn.dt_bias.clone()),
+                    );
+                    let a_biased = g.add(
+                        format!("{p}.mixer.a_biased"),
+                        Op::Add,
+                        &[a, dt_bias_w],
+                        vec![n, vh],
+                        DType::F32,
+                    );
+                    let a_softplus = g.add(
+                        format!("{p}.mixer.a_softplus"),
+                        Op::Unary {
+                            kind: UnaryKind::Softplus,
+                        },
+                        &[a_biased],
+                        vec![n, vh],
+                        DType::F32,
+                    );
+                    let neg_a_w = g.weight(format!("{p}.mixer.neg_a"), vec![vh], DType::F32);
+                    w.insert(format!("{p}.mixer.neg_a"), Tensor::F32(dn.neg_a.clone()));
+                    let log_decay = g.add(
+                        format!("{p}.mixer.log_decay"),
+                        Op::Mul,
+                        &[neg_a_w, a_softplus],
+                        vec![n, vh],
+                        DType::F32,
+                    );
+
+                    // DeltaRule
+                    let ssm_state =
+                        g.state(format!("{p}.ssm_state"), vec![vh * kd * dv], DType::F32);
+                    let core = g.add(
+                        format!("{p}.mixer.delta"),
+                        Op::DeltaRule {
+                            key_heads: kh,
+                            val_heads: vh,
+                            key_dim: kd,
+                            val_dim: dv,
+                        },
+                        &[q, k, v, beta, log_decay, ssm_state],
+                        vec![n, vd],
+                        DType::F32,
+                    );
+
+                    // Gated norm & Out
+                    let norm_w = g.weight(format!("{p}.mixer.norm.weight"), vec![dv], DType::F32);
+                    w.insert(
+                        format!("{p}.mixer.norm.weight"),
+                        Tensor::F32(dn.norm.clone()),
+                    );
+                    let normed_core = g.add(
+                        format!("{p}.mixer.norm"),
+                        Op::RmsNorm { eps: self.eps },
+                        &[core, norm_w],
+                        vec![n, vd],
+                        DType::F32,
+                    );
+                    let z_act = if c.sigmoid_gate {
+                        g.add(
+                            format!("{p}.mixer.z_act"),
+                            Op::Unary {
+                                kind: UnaryKind::Sigmoid,
+                            },
+                            &[z],
+                            vec![n, vd],
+                            DType::F32,
+                        )
+                    } else {
+                        g.add(
+                            format!("{p}.mixer.z_act"),
+                            Op::Silu,
+                            &[z],
+                            vec![n, vd],
+                            DType::F32,
+                        )
+                    };
+                    let gated = g.add(
+                        format!("{p}.mixer.gated"),
+                        Op::Mul,
+                        &[normed_core, z_act],
+                        vec![n, vd],
+                        DType::F32,
+                    );
+
+                    add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mixer.out"),
+                        gated,
+                        &dn.out.parts[0],
+                        dn.out.bias.as_deref(),
+                        n,
+                    )
+                }
+                Mixer::Full(attn) => {
+                    if attn.indexer.is_some() {
+                        return Err(format!(
+                            "Layer {li}: QSA indexer not supported in decode graph"
+                        ));
+                    }
+                    let (q_bias, k_bias, v_bias) = if let Some(b) = &attn.qkv.bias {
+                        let qr = attn.qkv.parts[0].rows;
+                        let kr = attn.qkv.parts[1].rows;
+                        let vr = attn.qkv.parts[2].rows;
+                        (
+                            Some(&b[0..qr]),
+                            Some(&b[qr..qr + kr]),
+                            Some(&b[qr + kr..qr + kr + vr]),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
+
+                    let (q, gate) = if self.attn_gate {
+                        let q_raw = add_linear_part_shaped(
+                            &mut g,
+                            &mut w,
+                            &format!("{p}.self_attn.q"),
+                            normed_x,
+                            &attn.qkv.parts[0],
+                            q_bias,
+                            vec![n * self.heads, 2 * self.head_dim],
+                        );
+                        let q = g.add(
+                            format!("{p}.self_attn.q_slice"),
+                            Op::Slice {
+                                axis: -1,
+                                start: 0,
+                                end: self.head_dim as i64,
+                            },
+                            &[q_raw],
+                            vec![n * self.heads, self.head_dim],
+                            DType::F32,
+                        );
+                        let gate = g.add(
+                            format!("{p}.self_attn.gate_slice"),
+                            Op::Slice {
+                                axis: -1,
+                                start: self.head_dim as i64,
+                                end: (2 * self.head_dim) as i64,
+                            },
+                            &[q_raw],
+                            vec![n * self.heads, self.head_dim],
+                            DType::F32,
+                        );
+                        (q, Some(gate))
+                    } else {
+                        let q_raw = add_linear_part(
+                            &mut g,
+                            &mut w,
+                            &format!("{p}.self_attn.q"),
+                            normed_x,
+                            &attn.qkv.parts[0],
+                            q_bias,
+                            n,
+                        );
+                        (q_raw, None)
+                    };
+                    let k_raw = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.self_attn.k"),
+                        normed_x,
+                        &attn.qkv.parts[1],
+                        k_bias,
+                        n,
+                    );
+                    let v = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.self_attn.v"),
+                        normed_x,
+                        &attn.qkv.parts[2],
+                        v_bias,
+                        n,
+                    );
+
+                    let (q_rope_in, k_rope_in) = if !self.norm_after_rope {
+                        let q_n = if !attn.q_norm.is_empty() {
+                            let q_norm_w = g.weight(
+                                format!("{p}.self_attn.q_norm.weight"),
+                                vec![self.head_dim],
+                                DType::F32,
+                            );
+                            w.insert(
+                                format!("{p}.self_attn.q_norm.weight"),
+                                Tensor::F32(attn.q_norm.clone()),
+                            );
+                            g.add(
+                                format!("{p}.self_attn.q_norm"),
+                                Op::RmsNorm { eps: self.eps },
+                                &[q, q_norm_w],
+                                vec![n, self.heads * self.head_dim],
+                                DType::F32,
+                            )
+                        } else {
+                            q
+                        };
+                        let k_n = if !attn.k_norm.is_empty() {
+                            let k_norm_w = g.weight(
+                                format!("{p}.self_attn.k_norm.weight"),
+                                vec![self.head_dim],
+                                DType::F32,
+                            );
+                            w.insert(
+                                format!("{p}.self_attn.k_norm.weight"),
+                                Tensor::F32(attn.k_norm.clone()),
+                            );
+                            g.add(
+                                format!("{p}.self_attn.k_norm"),
+                                Op::RmsNorm { eps: self.eps },
+                                &[k_raw, k_norm_w],
+                                vec![n, self.kv_heads * self.head_dim],
+                                DType::F32,
+                            )
+                        } else {
+                            k_raw
+                        };
+                        (q_n, k_n)
+                    } else {
+                        (q, k_raw)
+                    };
+
+                    let mut q_rope = g.add(
+                        format!("{p}.self_attn.q_rope"),
+                        Op::Rope {
+                            head_dim: self.head_dim,
+                            rotary_dim: 2 * self.inv_freq.len(),
+                            base: self.rope_theta,
+                            variant: RopeVariant::HalfSplit,
+                        },
+                        &[q_rope_in, positions],
+                        vec![n, self.heads * self.head_dim],
+                        DType::F32,
+                    );
+                    let mut k_rope = g.add(
+                        format!("{p}.self_attn.k_rope"),
+                        Op::Rope {
+                            head_dim: self.head_dim,
+                            rotary_dim: 2 * self.inv_freq.len(),
+                            base: self.rope_theta,
+                            variant: RopeVariant::HalfSplit,
+                        },
+                        &[k_rope_in, positions],
+                        vec![n, self.kv_heads * self.head_dim],
+                        DType::F32,
+                    );
+
+                    if self.norm_after_rope {
+                        if !attn.q_norm.is_empty() {
+                            let q_norm_w = g.weight(
+                                format!("{p}.self_attn.q_norm.weight"),
+                                vec![self.head_dim],
+                                DType::F32,
+                            );
+                            w.insert(
+                                format!("{p}.self_attn.q_norm.weight"),
+                                Tensor::F32(attn.q_norm.clone()),
+                            );
+                            q_rope = g.add(
+                                format!("{p}.self_attn.q_norm_post"),
+                                Op::RmsNorm { eps: self.eps },
+                                &[q_rope, q_norm_w],
+                                vec![n, self.heads * self.head_dim],
+                                DType::F32,
+                            );
+                        }
+                        if !attn.k_norm.is_empty() {
+                            let k_norm_w = g.weight(
+                                format!("{p}.self_attn.k_norm.weight"),
+                                vec![self.head_dim],
+                                DType::F32,
+                            );
+                            w.insert(
+                                format!("{p}.self_attn.k_norm.weight"),
+                                Tensor::F32(attn.k_norm.clone()),
+                            );
+                            k_rope = g.add(
+                                format!("{p}.self_attn.k_norm_post"),
+                                Op::RmsNorm { eps: self.eps },
+                                &[k_rope, k_norm_w],
+                                vec![n, self.kv_heads * self.head_dim],
+                                DType::F32,
+                            );
+                        }
+                    }
+
+                    let k_cache = g.state(
+                        format!("{p}.k_cache"),
+                        vec![max_ctx, self.kv_heads * self.head_dim],
+                        DType::F32,
+                    );
+                    let v_cache = g.state(
+                        format!("{p}.v_cache"),
+                        vec![max_ctx, self.kv_heads * self.head_dim],
+                        DType::F32,
+                    );
+                    let mut attn_core = g.add(
+                        format!("{p}.self_attn.core"),
+                        Op::CachedAttention {
+                            heads: self.heads,
+                            kv_heads: self.kv_heads,
+                            head_dim: self.head_dim,
+                            v_head_dim: self.head_dim,
+                            scale: 1.0 / (self.head_dim as f32).sqrt(),
+                            causal: true,
+                            window: None,
+                            soft_cap: None,
+                            write: true,
+                        },
+                        &[q_rope, k_rope, v, k_cache, v_cache, positions],
+                        vec![n, self.heads * self.head_dim],
+                        DType::F32,
+                    );
+
+                    if let Some(gate_val) = gate {
+                        let gate_act = g.add(
+                            format!("{p}.self_attn.gate_act"),
+                            Op::Unary {
+                                kind: UnaryKind::Sigmoid,
+                            },
+                            &[gate_val],
+                            vec![n, self.heads * self.head_dim],
+                            DType::F32,
+                        );
+                        attn_core = g.add(
+                            format!("{p}.self_attn.gated_core"),
+                            Op::Mul,
+                            &[attn_core, gate_act],
+                            vec![n, self.heads * self.head_dim],
+                            DType::F32,
+                        );
+                    }
+
+                    add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.self_attn.o"),
+                        attn_core,
+                        &attn.o.parts[0],
+                        attn.o.bias.as_deref(),
+                        n,
+                    )
+                }
+            };
+
+            x = g.add(
+                format!("{p}.add_mixer"),
+                Op::Add,
+                &[x, mixer_out],
+                vec![n, self.hidden],
+                DType::F32,
+            );
+
+            // Post LayerNorm / RMSNorm
+            let post_norm_w = g.weight(
+                format!("{p}.post_attention_layernorm.weight"),
+                vec![self.hidden],
+                DType::F32,
+            );
+            w.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                Tensor::F32(l.post_norm.clone()),
+            );
+            let normed_post = g.add(
+                format!("{p}.post_attention_layernorm"),
+                Op::RmsNorm { eps: self.eps },
+                &[x, post_norm_w],
+                vec![n, self.hidden],
+                DType::F32,
+            );
+
+            // FFN
+            let ffn_out = match &l.ffn {
+                Ffn::Dense { gate_up, down } => {
+                    let gate = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mlp.gate"),
+                        normed_post,
+                        &gate_up.parts[0],
+                        gate_up.bias.as_deref(),
+                        n,
+                    );
+                    let up = add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mlp.up"),
+                        normed_post,
+                        &gate_up.parts[1],
+                        None,
+                        n,
+                    );
+                    let swiglu = g.add(
+                        format!("{p}.mlp.swiglu"),
+                        Op::SwiGlu,
+                        &[gate, up],
+                        vec![n, gate_up.parts[0].rows],
+                        DType::F32,
+                    );
+                    add_linear_part(
+                        &mut g,
+                        &mut w,
+                        &format!("{p}.mlp.down"),
+                        swiglu,
+                        &down.parts[0],
+                        down.bias.as_deref(),
+                        n,
+                    )
+                }
+                Ffn::Moe(moe) => {
+                    let router_w = g.weight(
+                        format!("{p}.mlp.router.weight"),
+                        vec![moe.router.rows, moe.router.cols],
+                        mat_dtype(&moe.router.parts[0]),
+                    );
+                    w.insert(
+                        format!("{p}.mlp.router.weight"),
+                        moe.router.parts[0].to_graph_tensor(),
+                    );
+                    g.add(
+                        format!("{p}.mlp.moe"),
+                        Op::Moe {
+                            experts: moe.num_experts(),
+                            top_k: moe.top_k(),
+                        },
+                        &[normed_post, router_w],
+                        vec![n, self.hidden],
+                        DType::F32,
+                    )
+                }
+            };
+
+            x = g.add(
+                format!("{p}.add_ffn"),
+                Op::Add,
+                &[x, ffn_out],
+                vec![n, self.hidden],
+                DType::F32,
+            );
+        }
+
+        // 3. Final Norm & LM Head
+        let norm_w = g.weight("final_norm.weight", vec![self.hidden], DType::F32);
+        w.insert("final_norm.weight", Tensor::F32(self.norm.clone()));
+        let final_x = g.add(
+            "final_norm",
+            Op::RmsNorm { eps: self.eps },
+            &[x, norm_w],
+            vec![n, self.hidden],
+            DType::F32,
+        );
+
+        let (lm_w, lm_dim) = if let Some(lm) = &self.lm_head {
+            let w_node = g.weight(
+                "lm_head.weight",
+                vec![lm.rows, self.hidden],
+                mat_dtype(&lm.parts[0]),
+            );
+            w.insert("lm_head.weight", lm.parts[0].to_graph_tensor());
+            (w_node, lm.rows)
+        } else {
+            let w_node = g.weight(
+                "lm_head.weight",
+                vec![self.vocab, self.hidden],
+                mat_dtype(&self.embed.parts[0]),
+            );
+            w.insert("lm_head.weight", self.embed.parts[0].to_graph_tensor());
+            (w_node, self.vocab)
+        };
+        let logits = g.add(
+            "logits",
+            Op::Linear,
+            &[final_x, lm_w],
+            vec![n, lm_dim],
+            DType::F32,
+        );
+
+        g.output(logits);
+        Ok((g, w))
+    }
 }
 
 /// `x * scale / sqrt(sum x^2 + 1e-6)` (the FLA-aligned l2norm the reference uses).
 fn l2_normalize(x: &mut [f32], scale: f32) {
     let inv = scale / (vector_dot(x, x) + 1e-6).sqrt();
     x.iter_mut().for_each(|v| *v *= inv);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qwen3_5_to_decode_graph() {
+        let (hidden, vocab, layers, heads, kv_heads, hd) = (128, 128, 2, 4, 2, 32);
+        let inter = 128;
+        let c_kernel = 4;
+        let (lin_kh, lin_vh, lin_kd, lin_vd) = (1, 2, 16, 16);
+
+        let cfg = serde_json::json!({
+            "hidden_size": hidden,
+            "vocab_size": vocab,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv_heads,
+            "head_dim": hd,
+            "intermediate_size": inter,
+            "max_position_embeddings": 64,
+            "attn_output_gate": true,
+            "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_key_heads": lin_kh,
+            "linear_num_value_heads": lin_vh,
+            "linear_key_head_dim": lin_kd,
+            "linear_value_head_dim": lin_vd,
+            "linear_conv_kernel_dim": c_kernel,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": true,
+                "mrope_section": [1, 1, 2]
+            }
+        });
+
+        let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
+        specs.push(("model.embed_tokens.weight".into(), vec![vocab, hidden]));
+        specs.push(("model.norm.weight".into(), vec![hidden]));
+        specs.push(("lm_head.weight".into(), vec![vocab, hidden]));
+
+        // Layer 0: DeltaNet
+        let cd = 2 * lin_kh * lin_kd + lin_vh * lin_vd;
+        specs.push(("model.layers.0.input_layernorm.weight".into(), vec![hidden]));
+        specs.push((
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![hidden],
+        ));
+        specs.push((
+            "model.layers.0.linear_attn.in_proj_qkv.weight".into(),
+            vec![cd, hidden],
+        ));
+        specs.push((
+            "model.layers.0.linear_attn.in_proj_z.weight".into(),
+            vec![lin_vh * lin_vd, hidden],
+        ));
+        specs.push((
+            "model.layers.0.linear_attn.in_proj_b.weight".into(),
+            vec![lin_vh, hidden],
+        ));
+        specs.push((
+            "model.layers.0.linear_attn.in_proj_a.weight".into(),
+            vec![lin_vh, hidden],
+        ));
+        specs.push((
+            "model.layers.0.linear_attn.conv1d.weight".into(),
+            vec![cd, c_kernel],
+        ));
+        specs.push(("model.layers.0.linear_attn.neg_A".into(), vec![lin_vh]));
+        specs.push(("model.layers.0.linear_attn.dt_bias".into(), vec![lin_vh]));
+        specs.push((
+            "model.layers.0.linear_attn.norm.weight".into(),
+            vec![lin_vd],
+        ));
+        specs.push((
+            "model.layers.0.linear_attn.out_proj.weight".into(),
+            vec![hidden, lin_vh * lin_vd],
+        ));
+        specs.push((
+            "model.layers.0.mlp.gate_proj.weight".into(),
+            vec![inter, hidden],
+        ));
+        specs.push((
+            "model.layers.0.mlp.up_proj.weight".into(),
+            vec![inter, hidden],
+        ));
+        specs.push((
+            "model.layers.0.mlp.down_proj.weight".into(),
+            vec![hidden, inter],
+        ));
+
+        // Layer 1: Full Attention (with attn_output_gate)
+        specs.push(("model.layers.1.input_layernorm.weight".into(), vec![hidden]));
+        specs.push((
+            "model.layers.1.post_attention_layernorm.weight".into(),
+            vec![hidden],
+        ));
+        specs.push((
+            "model.layers.1.self_attn.q_proj.weight".into(),
+            vec![heads * 2 * hd, hidden],
+        ));
+        specs.push((
+            "model.layers.1.self_attn.k_proj.weight".into(),
+            vec![kv_heads * hd, hidden],
+        ));
+        specs.push((
+            "model.layers.1.self_attn.v_proj.weight".into(),
+            vec![kv_heads * hd, hidden],
+        ));
+        specs.push((
+            "model.layers.1.self_attn.o_proj.weight".into(),
+            vec![hidden, heads * hd],
+        ));
+        specs.push(("model.layers.1.self_attn.q_norm.weight".into(), vec![hd]));
+        specs.push(("model.layers.1.self_attn.k_norm.weight".into(), vec![hd]));
+        specs.push((
+            "model.layers.1.mlp.gate_proj.weight".into(),
+            vec![inter, hidden],
+        ));
+        specs.push((
+            "model.layers.1.mlp.up_proj.weight".into(),
+            vec![inter, hidden],
+        ));
+        specs.push((
+            "model.layers.1.mlp.down_proj.weight".into(),
+            vec![hidden, inter],
+        ));
+
+        let shapes: std::collections::HashMap<String, usize> = specs
+            .iter()
+            .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
+            .collect();
+
+        let weights = crate::model::weights::Weights::from_f32(specs, |name| {
+            let n: usize = name
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| (i + 1) * b as usize)
+                .sum();
+            let count = shapes[name];
+            Ok((0..count)
+                .map(|i| (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
+                .collect())
+        })
+        .unwrap();
+
+        let text_model = TextModel::load(&weights, &cfg, Arch::Qwen35).unwrap();
+        let (decode_g, w) = text_model.to_decode_graph().unwrap();
+
+        // Validate SSA
+        crate::graph::pattern::validate_ssa(&decode_g).expect("valid SSA graph");
+
+        // Verify key operators exist
+        assert!(decode_g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::graph::Op::DeltaRule { .. })));
+        assert!(decode_g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::graph::Op::CausalConv1dCached { .. })));
+        assert!(decode_g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::graph::Op::CachedAttention { .. })));
+        assert!(decode_g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::graph::Op::SwiGlu)));
+        assert!(decode_g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::graph::Op::RmsNorm { .. })));
+
+        // Run consecutive decode steps on CPU and compare against reference
+        let mut cpu_st = text_model.new_state();
+        let mut graph_st = crate::graph::StateStore::new();
+        let tokens = [7u32, 23, 55, 89];
+        for (pos, &tok) in tokens.iter().enumerate() {
+            // Reference forward
+            let mut h = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut h).unwrap();
+            let pos_arr = [[pos as u32; 3]];
+            let ref_hid = text_model.forward_rows(
+                h,
+                &pos_arr,
+                pos,
+                &mut cpu_st,
+                0,
+                usize::MAX,
+                &[],
+                &[],
+                false,
+                &[],
+                &mut Vec::new(),
+            );
+            let ref_logits = text_model.logits(&ref_hid, 1);
+
+            // Graph forward
+            let mut emb = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut emb).unwrap();
+            let inputs = vec![
+                crate::graph::Tensor::F32(emb),
+                crate::graph::Tensor::U32(vec![pos as u32]),
+            ];
+            let out = crate::graph::cpu::run(&decode_g, &w, &mut graph_st, inputs)
+                .expect("decode graph execution succeeded");
+            let graph_logits = out[0].as_f32().expect("f32 logits");
+
+            assert_eq!(graph_logits.len(), ref_logits.len());
+            let d = graph_logits
+                .iter()
+                .zip(&ref_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(d < 0.05, "step {pos}: max |Δlogit| = {d}");
+        }
+
+        #[cfg(target_os = "macos")]
+        if metal::Device::system_default().is_some() {
+            let (decode_g, w) = text_model.to_decode_graph().unwrap();
+            let mut prog = crate::graph::program::GraphProgram::compile(
+                decode_g,
+                w,
+                crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+            )
+            .expect("compile Metal Pin GraphProgram");
+            println!(
+                "Metal Pin op counts: {:?}",
+                prog.plan.report.device_op_counts
+            );
+            assert!(prog
+                .plan
+                .segments
+                .iter()
+                .any(|s| s.device == crate::hardware::Device::Metal));
+
+            let mut cpu_st2 = text_model.new_state();
+            for (pos, &tok) in tokens.iter().enumerate() {
+                let mut h = vec![0.0f32; hidden];
+                text_model.embed(tok, &mut h).unwrap();
+                let pos_arr = [[pos as u32; 3]];
+                let ref_hid = text_model.forward_rows(
+                    h,
+                    &pos_arr,
+                    pos,
+                    &mut cpu_st2,
+                    0,
+                    usize::MAX,
+                    &[],
+                    &[],
+                    false,
+                    &[],
+                    &mut Vec::new(),
+                );
+                let ref_logits = text_model.logits(&ref_hid, 1);
+
+                let mut emb = vec![0.0f32; hidden];
+                text_model.embed(tok, &mut emb).unwrap();
+                let inputs = vec![
+                    crate::graph::Tensor::F32(emb),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ];
+                let out = prog.run(inputs).expect("run Metal Auto GraphProgram");
+                let prog_logits = out[0].as_f32().expect("f32 logits");
+
+                assert_eq!(prog_logits.len(), ref_logits.len());
+                let d = prog_logits
+                    .iter()
+                    .zip(&ref_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(d < 0.05, "Metal Auto step {pos}: max |Δlogit| = {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_qwen3_to_decode_graph() {
+        let hidden = 64;
+        let vocab = 128;
+        let layers = 2;
+        let heads = 4;
+        let hd = 16;
+        let kv_heads = 2;
+        let inter = 128;
+
+        let cfg = serde_json::json!({
+            "hidden_size": hidden,
+            "vocab_size": vocab,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv_heads,
+            "head_dim": hd,
+            "intermediate_size": inter,
+            "max_position_embeddings": 64,
+            "rope_scaling": {
+                "rope_theta": 10000.0
+            }
+        });
+
+        let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
+        specs.push(("model.embed_tokens.weight".into(), vec![vocab, hidden]));
+        specs.push(("model.norm.weight".into(), vec![hidden]));
+        specs.push(("lm_head.weight".into(), vec![vocab, hidden]));
+        for i in 0..layers {
+            let p = format!("model.layers.{i}");
+            specs.push((format!("{p}.input_layernorm.weight"), vec![hidden]));
+            specs.push((format!("{p}.post_attention_layernorm.weight"), vec![hidden]));
+            specs.push((
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![heads * hd, hidden],
+            ));
+            specs.push((
+                format!("{p}.self_attn.k_proj.weight"),
+                vec![kv_heads * hd, hidden],
+            ));
+            specs.push((
+                format!("{p}.self_attn.v_proj.weight"),
+                vec![kv_heads * hd, hidden],
+            ));
+            specs.push((
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![hidden, heads * hd],
+            ));
+            specs.push((format!("{p}.self_attn.q_norm.weight"), vec![hd]));
+            specs.push((format!("{p}.self_attn.k_norm.weight"), vec![hd]));
+            specs.push((format!("{p}.mlp.gate_proj.weight"), vec![inter, hidden]));
+            specs.push((format!("{p}.mlp.up_proj.weight"), vec![inter, hidden]));
+            specs.push((format!("{p}.mlp.down_proj.weight"), vec![hidden, inter]));
+        }
+
+        let shapes: std::collections::HashMap<String, usize> = specs
+            .iter()
+            .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
+            .collect();
+
+        let weights = crate::model::weights::Weights::from_f32(specs, |name| {
+            let n: usize = name
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| (i + 1) * b as usize)
+                .sum();
+            let count = shapes[name];
+            Ok((0..count)
+                .map(|i| (((i * 17 + n * 11) % 37) as f32 - 18.0) / 25.0)
+                .collect())
+        })
+        .unwrap();
+
+        let text_model = TextModel::load(&weights, &cfg, Arch::Qwen3).unwrap();
+        let (decode_g, w) = text_model.to_decode_graph().unwrap();
+
+        let mut cpu_st = text_model.new_state();
+        let mut graph_st = crate::graph::StateStore::new();
+
+        let tokens = vec![7u32, 23, 55];
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let mut h = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut h).unwrap();
+            let pos_arr = [[pos as u32; 3]];
+            let cpu_hidden = text_model.forward_rows(
+                h,
+                &pos_arr,
+                pos,
+                &mut cpu_st,
+                0,
+                usize::MAX,
+                &[],
+                &[],
+                false,
+                &[],
+                &mut Vec::new(),
+            );
+            let cpu_logits = text_model.logits(&cpu_hidden, 1);
+
+            let mut emb = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut emb).unwrap();
+            let inputs = vec![
+                crate::graph::Tensor::F32(emb),
+                crate::graph::Tensor::U32(vec![pos as u32]),
+            ];
+            let out = crate::graph::cpu::run(&decode_g, &w, &mut graph_st, inputs).unwrap();
+            let graph_logits = out[0].as_f32().unwrap();
+
+            assert_eq!(cpu_logits.len(), graph_logits.len());
+            for (c, m) in cpu_logits.iter().zip(graph_logits) {
+                assert!(
+                    (c - m).abs() < 5e-2,
+                    "Qwen3 CPU {c} vs Graph {m} diverged at pos {pos}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hunyuan_to_decode_graph() {
+        let hidden = 64;
+        let vocab = 128;
+        let layers = 2;
+        let heads = 4;
+        let hd = 16;
+        let kv_heads = 2;
+        let inter = 128;
+
+        let cfg = serde_json::json!({
+            "hidden_size": hidden,
+            "vocab_size": vocab,
+            "num_hidden_layers": layers,
+            "num_attention_heads": heads,
+            "num_key_value_heads": kv_heads,
+            "head_dim": hd,
+            "intermediate_size": inter,
+            "max_position_embeddings": 64,
+            "model_type": "hunyuan_v1_dense",
+            "rope_scaling": {
+                "rope_theta": 10000.0
+            }
+        });
+
+        let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
+        specs.push(("model.embed_tokens.weight".into(), vec![vocab, hidden]));
+        specs.push(("model.norm.weight".into(), vec![hidden]));
+        specs.push(("lm_head.weight".into(), vec![vocab, hidden]));
+        for i in 0..layers {
+            let p = format!("model.layers.{i}");
+            specs.push((format!("{p}.input_layernorm.weight"), vec![hidden]));
+            specs.push((format!("{p}.post_attention_layernorm.weight"), vec![hidden]));
+            specs.push((
+                format!("{p}.self_attn.q_proj.weight"),
+                vec![heads * hd, hidden],
+            ));
+            specs.push((
+                format!("{p}.self_attn.k_proj.weight"),
+                vec![kv_heads * hd, hidden],
+            ));
+            specs.push((
+                format!("{p}.self_attn.v_proj.weight"),
+                vec![kv_heads * hd, hidden],
+            ));
+            specs.push((
+                format!("{p}.self_attn.o_proj.weight"),
+                vec![hidden, heads * hd],
+            ));
+            specs.push((format!("{p}.self_attn.query_layernorm.weight"), vec![hd]));
+            specs.push((format!("{p}.self_attn.key_layernorm.weight"), vec![hd]));
+            specs.push((format!("{p}.mlp.gate_proj.weight"), vec![inter, hidden]));
+            specs.push((format!("{p}.mlp.up_proj.weight"), vec![inter, hidden]));
+            specs.push((format!("{p}.mlp.down_proj.weight"), vec![hidden, inter]));
+        }
+
+        let shapes: std::collections::HashMap<String, usize> = specs
+            .iter()
+            .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
+            .collect();
+
+        let weights = crate::model::weights::Weights::from_f32(specs, |name| {
+            let n: usize = name
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| (i + 1) * b as usize)
+                .sum();
+            let count = shapes[name];
+            Ok((0..count)
+                .map(|i| (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
+                .collect())
+        })
+        .unwrap();
+
+        let text_model = TextModel::load(&weights, &cfg, Arch::HunYuan).unwrap();
+        let (decode_g, w) = text_model.to_decode_graph().unwrap();
+
+        let mut cpu_st = text_model.new_state();
+        let mut graph_st = crate::graph::StateStore::new();
+
+        let tokens = vec![9u32, 31, 67];
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let mut h = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut h).unwrap();
+            let pos_arr = [[pos as u32; 3]];
+            let cpu_hidden = text_model.forward_rows(
+                h,
+                &pos_arr,
+                pos,
+                &mut cpu_st,
+                0,
+                usize::MAX,
+                &[],
+                &[],
+                false,
+                &[],
+                &mut Vec::new(),
+            );
+            let cpu_logits = text_model.logits(&cpu_hidden, 1);
+
+            let mut emb = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut emb).unwrap();
+            let inputs = vec![
+                crate::graph::Tensor::F32(emb),
+                crate::graph::Tensor::U32(vec![pos as u32]),
+            ];
+            let out = crate::graph::cpu::run(&decode_g, &w, &mut graph_st, inputs).unwrap();
+            let graph_logits = out[0].as_f32().unwrap();
+
+            assert_eq!(cpu_logits.len(), graph_logits.len());
+            for (c, m) in cpu_logits.iter().zip(graph_logits) {
+                assert!(
+                    (c - m).abs() < 5e-2,
+                    "HunYuan CPU {c} vs Graph {m} diverged at pos {pos}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "perf smoke: cargo test --release --lib test_qwen35_metal_megakernel_smoke -- --ignored --test-threads=1"]
+    fn test_qwen35_metal_megakernel_smoke() {
+        use crate::hardware::Device;
+        use crate::model::hub::HuggingFaceHub;
+        use crate::model::native::load_native;
+
+        let repo =
+            "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF";
+        let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(repo);
+        if art.weights_path.is_none() {
+            println!("SKIP: {repo} not found in disk/");
+            return;
+        }
+
+        let lm = match load_native(&art, Device::Metal) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => panic!("Failed to load {repo}: {e}"),
+            None => panic!("load_native returned None for {repo}"),
+        };
+
+        println!("Loaded Qwen3.5 9B model successfully!");
+        println!("Backend label: {}", lm.backend_label());
+        println!("Device: {:?}", lm.device());
+
+        assert_eq!(lm.device(), Device::Metal, "Must select Metal device");
+        assert!(
+            lm.backend_label().contains("Metal"),
+            "Backend label must be Metal"
+        );
+        let rss_bytes = crate::hardware::current_resident_memory_bytes();
+        let rss_gb = rss_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!(
+            "Resident memory (RSS): {:.2} GB ({rss_bytes} bytes)",
+            rss_gb
+        );
+        assert!(
+            rss_gb < 6.0,
+            "Resident memory must drop below 6.0 GB for IQ2_M execution (was {rss_gb:.2} GB)"
+        );
+
+        // Run inference
+        let tok = lm.tokenizer();
+        let prompt = "The capital of France is";
+        let ids = tok.encode(prompt);
+        let (seq_ids, mut state) = lm.prepare(ids, &[]).expect("prepare sequence");
+
+        let mut generated = Vec::new();
+        let mut pos = 0;
+
+        // Prefill
+        let prefill_t0 = std::time::Instant::now();
+        let logits = lm
+            .forward(&seq_ids, pos, &mut state)
+            .expect("forward prompt");
+        let prefill_elapsed = prefill_t0.elapsed();
+        println!("Prefill ({} tokens): {:?}", seq_ids.len(), prefill_elapsed);
+        pos += seq_ids.len();
+
+        let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("Top 5 Metal prefill tokens:");
+        for &(id, score) in &indexed[..5] {
+            println!("  token {id} ('{}'): {score}", tok.decode(&[id as u32]));
+        }
+        let mut next_token = indexed[0].0 as u32;
+        let decode_t0 = std::time::Instant::now();
+        let max_new_tokens = 8;
+        for step in 0..max_new_tokens {
+            if tok.is_special(next_token) {
+                break;
+            }
+            generated.push(next_token);
+            let step_t0 = std::time::Instant::now();
+            let next_logits = lm
+                .forward(&[next_token], pos, &mut state)
+                .expect("decode step");
+            let step_elapsed = step_t0.elapsed();
+            println!(
+                "Decode step {step} (token {next_token}): {:?}",
+                step_elapsed
+            );
+            pos += 1;
+            let mut idx_step: Vec<(usize, f32)> = next_logits.iter().copied().enumerate().collect();
+            idx_step.sort_by(|a, b| b.1.total_cmp(&a.1));
+            println!(
+                "  step {step} top: token {} ('{}'): {}",
+                idx_step[0].0,
+                tok.decode(&[idx_step[0].0 as u32]),
+                idx_step[0].1
+            );
+            next_token = idx_step[0].0 as u32;
+        }
+        let decode_elapsed = decode_t0.elapsed();
+
+        let text = tok.decode(&generated);
+        println!("Generated text: {:?}", text);
+        let decode_tps = (generated.len() as f64) / decode_elapsed.as_secs_f64();
+        println!(
+            "Decode throughput: {:.2} tok/s (decode total: {:?})",
+            decode_tps, decode_elapsed
+        );
+        let post_decode_rss = crate::hardware::current_resident_memory_bytes() as f64 / 1e9;
+        println!(
+            "Post-decode resident memory (RSS): {:.2} GB",
+            post_decode_rss
+        );
+        assert!(
+            post_decode_rss < 4.0,
+            "Post-decode resident memory must remain below 4.0 GB (was {post_decode_rss:.2} GB)"
+        );
+        assert!(
+            decode_tps > 25.0,
+            "Decode throughput regression floor (was {decode_tps:.2} tok/s)"
+        );
+        assert!(!generated.is_empty(), "Must generate tokens");
+        assert!(!text.is_empty(), "Generated text must not be empty");
+    }
 }

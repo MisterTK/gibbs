@@ -30,6 +30,7 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Add
         | Op::Rope { .. }
         | Op::CachedAttention { .. }
+        | Op::PagedCachedAttention { .. }
         | Op::CausalConv1dCached { .. }
         | Op::DeltaRule { .. }
         | Op::Gather { .. }
@@ -40,7 +41,8 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::L2Normalize
         | Op::Softmax { .. }
         | Op::TopKSoftmax { .. }
-        | Op::Slice { .. } => true,
+        | Op::Slice { .. }
+        | Op::Megakernel(_) => true,
         Op::Upsample { mode, .. } => matches!(mode, crate::graph::UpsampleMode::Nearest),
         Op::Attention {
             kv_heads,
@@ -83,7 +85,18 @@ pub fn run(
         }
         slots[id.0 as usize] = Some(t);
     }
+    let mut used_indices = vec![false; nv];
+    for node in &graph.nodes {
+        for &inp in &node.inputs {
+            if (inp.0 as usize) < nv {
+                used_indices[inp.0 as usize] = true;
+            }
+        }
+    }
     for (i, v) in graph.values.iter().enumerate() {
+        if !used_indices[i] {
+            continue;
+        }
         match &v.kind {
             ValueKind::Weight => {
                 bound[i] = Some(
@@ -295,88 +308,85 @@ pub fn run(
                     return Err(format!("node '{name}': bias is not [{out_f}]"));
                 }
                 let rows = x.len() / in_f;
-                let out_vec = match w_slot {
-                    Tensor::F32(w) => {
-                        if w.len() != out_f * in_f {
-                            return Err(format!(
-                                "node '{name}': weight elements {} != {out_f} * {in_f}",
-                                w.len()
-                            ));
+                dispatch_linear(x, w_slot, bias, in_f, out_f, rows, name)?
+            }
+            Op::Megakernel(desc) => {
+                match &desc.kind {
+                    super::MegakernelKind::Mlp {
+                        hidden_dim,
+                        intermediate_dim,
+                        eps,
+                        is_geglu,
+                        has_post_norm,
+                    } => {
+                        let x = operand(&bound, &slots, ins, name, 0)?;
+                        let norm_w = operand(&bound, &slots, ins, name, 1)?;
+                        let gate_slot = slot(&bound, &slots, ins, name, 2)?;
+                        let up_slot = slot(&bound, &slots, ins, name, 3)?;
+                        let down_slot = slot(&bound, &slots, ins, name, 4)?;
+                        let post_norm_w = if *has_post_norm {
+                            Some(operand(&bound, &slots, ins, name, 5)?)
+                        } else {
+                            None
+                        };
+                        let d = *hidden_dim;
+                        let inter = *intermediate_dim;
+                        let rows = x.len() / d.max(1);
+
+                        // 1. RMSNorm
+                        let mut normed_x = vec![0.0f32; x.len()];
+                        for (x_chunk, out_chunk) in x.chunks(d).zip(normed_x.chunks_mut(d)) {
+                            crate::model::simd::vector_rmsnorm(x_chunk, norm_w, out_chunk, *eps);
                         }
-                        nn::linear(x, rows, w, bias, in_f, out_f)
-                    }
-                    Tensor::Quantized(q) => {
-                        if q.in_features() != in_f || q.out_features() != out_f {
-                            return Err(format!(
-                                "node '{name}': quantized weight [{}, {}] != declared [{out_f}, {in_f}]",
-                                q.out_features(),
-                                q.in_features()
-                            ));
-                        }
-                        match q.as_ref() {
-                            crate::model::layers::QuantizedWeight::Uncompressed {
-                                data, ..
-                            } => nn::linear(x, rows, data, bias, in_f, out_f),
-                            crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                                data,
-                                format,
-                                in_features,
-                                out_features,
-                            } => {
-                                let mut out = vec![0.0f32; rows * out_f];
-                                for (r, x_row) in x.chunks(in_f).enumerate() {
-                                    let out_row = &mut out[r * out_f..(r + 1) * out_f];
-                                    crate::model::layers::dispatch_fused_gemv(
-                                        data,
-                                        *format,
-                                        *in_features,
-                                        *out_features,
-                                        x_row,
-                                        out_row,
-                                        bias,
-                                    );
-                                }
-                                out
+
+                        // 2. Gate & Up projections
+                        let gate_act =
+                            dispatch_linear(&normed_x, gate_slot, None, d, inter, rows, name)?;
+                        let up_act =
+                            dispatch_linear(&normed_x, up_slot, None, d, inter, rows, name)?;
+
+                        // 3. SwiGLU / GeGLU
+                        let mut act = vec![0.0f32; gate_act.len()];
+                        if *is_geglu {
+                            act.copy_from_slice(&gate_act);
+                            nn::gelu(&mut act);
+                            for (o, &u) in act.iter_mut().zip(&up_act) {
+                                *o *= u;
                             }
-                            crate::model::layers::QuantizedWeight::GgufQuantized {
-                                raw_data,
-                                format,
-                                in_features,
-                                out_features,
-                            } => {
-                                let mut out = vec![0.0f32; rows * out_f];
-                                for (r, x_row) in x.chunks(in_f).enumerate() {
-                                    let out_row = &mut out[r * out_f..(r + 1) * out_f];
-                                    crate::model::layers::dispatch_fused_gemv(
-                                        raw_data,
-                                        *format,
-                                        *in_features,
-                                        *out_features,
-                                        x_row,
-                                        out_row,
-                                        bias,
-                                    );
-                                }
-                                out
-                            }
-                            _ => {
-                                let w_f32 = q.to_f32();
-                                nn::linear(x, rows, &w_f32, bias, in_f, out_f)
+                        } else {
+                            for (o, (&g, &u)) in act.iter_mut().zip(gate_act.iter().zip(&up_act)) {
+                                let sig = 1.0 / (1.0 + (-g).exp());
+                                *o = (g * sig) * u;
                             }
                         }
-                    }
-                    other => {
-                        let w_f32 = other.to_f32();
-                        if w_f32.len() != out_f * in_f {
-                            return Err(format!(
-                                "node '{name}': weight elements {} != {out_f} * {in_f}",
-                                w_f32.len()
-                            ));
+
+                        // 4. Down projection
+                        let mut down_act =
+                            dispatch_linear(&act, down_slot, None, inter, d, rows, name)?;
+
+                        if let Some(post_w) = post_norm_w {
+                            let mut normed_down = vec![0.0f32; down_act.len()];
+                            for (d_chunk, o_chunk) in
+                                down_act.chunks(d).zip(normed_down.chunks_mut(d))
+                            {
+                                crate::model::simd::vector_rmsnorm(d_chunk, post_w, o_chunk, *eps);
+                            }
+                            down_act = normed_down;
                         }
-                        nn::linear(x, rows, &w_f32, bias, in_f, out_f)
+
+                        // 5. In-place residual add
+                        let mut out = x.to_vec();
+                        for (o, &d_val) in out.iter_mut().zip(&down_act) {
+                            *o += d_val;
+                        }
+                        out
                     }
-                };
-                out_vec
+                    super::MegakernelKind::Attention { .. } => {
+                        return Err(format!(
+                            "node '{name}': CPU Megakernel Attention not implemented"
+                        ));
+                    }
+                }
             }
             Op::RmsNorm { eps } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
@@ -755,6 +765,103 @@ pub fn run(
                     }
                     if let ValueKind::State(sname) = &graph.value(ins[4]).kind {
                         state.insert(sname, Tensor::F32(v_buf.clone()));
+                    }
+                }
+                out
+            }
+            Op::PagedCachedAttention {
+                heads,
+                kv_heads,
+                head_dim,
+                v_head_dim,
+                scale,
+                causal,
+                window,
+                soft_cap,
+                tokens_per_block,
+                max_blocks_per_seq,
+            } => {
+                let q = operand(&bound, &slots, ins, name, 0)?;
+                let k_pool = operand(&bound, &slots, ins, name, 1)?;
+                let v_pool = operand(&bound, &slots, ins, name, 2)?;
+                let block_table = operand_u32(&bound, &slots, ins, name, 3)?;
+                let pos_offset = if ins.len() >= 5 {
+                    operand_u32(&bound, &slots, ins, name, 4)
+                        .map(|p| p.first().copied().unwrap_or(0) as usize)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let hd = *head_dim;
+                let vhd = *v_head_dim;
+                let h = *heads;
+                let kvh = *kv_heads;
+                let rep = h / kvh.max(1);
+                let nq = q.len() / (h * hd).max(1);
+                let tpb = *tokens_per_block;
+                let max_blk = *max_blocks_per_seq;
+                let kv_dim = kvh * hd;
+
+                let mut out = vec![0.0f32; nq * h * vhd];
+                for qi in 0..nq {
+                    let current_pos = pos_offset + qi;
+                    let nk = current_pos + 1;
+                    for head in 0..h {
+                        let kv_head = head / rep;
+                        let q_vec = &q[qi * h * hd + head * hd..][..hd];
+                        let mut scores = Vec::with_capacity(nk);
+                        for ki in 0..nk {
+                            if *causal && ki > current_pos {
+                                scores.push(f32::NEG_INFINITY);
+                                continue;
+                            }
+                            if let Some(w) = window {
+                                if current_pos >= *w && ki < current_pos - *w {
+                                    scores.push(f32::NEG_INFINITY);
+                                    continue;
+                                }
+                            }
+                            let blk_idx = block_table[qi * max_blk + ki / tpb] as usize;
+                            let blk_offset = ki % tpb;
+                            let phys_idx = blk_idx * tpb + blk_offset;
+                            let k_vec = &k_pool[phys_idx * kv_dim + kv_head * hd..][..hd];
+                            let dot: f32 = q_vec.iter().zip(k_vec).map(|(&a, &b)| a * b).sum();
+                            let mut s = dot * scale;
+                            if let Some(cap) = soft_cap {
+                                s = cap * (s / cap).tanh();
+                            }
+                            scores.push(s);
+                        }
+                        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum_exp = 0.0f32;
+                        let mut weights = Vec::with_capacity(nk);
+                        for &s in &scores {
+                            if s == f32::NEG_INFINITY {
+                                weights.push(0.0f32);
+                            } else {
+                                let exp_val = (s - max_score).exp();
+                                sum_exp += exp_val;
+                                weights.push(exp_val);
+                            }
+                        }
+                        if sum_exp > 0.0 {
+                            for w in &mut weights {
+                                *w /= sum_exp;
+                            }
+                        }
+                        let out_slice = &mut out[qi * h * vhd + head * vhd..][..vhd];
+                        for (ki, &w) in weights.iter().enumerate() {
+                            if w == 0.0 {
+                                continue;
+                            }
+                            let blk_idx = block_table[qi * max_blk + ki / tpb] as usize;
+                            let blk_offset = ki % tpb;
+                            let phys_idx = blk_idx * tpb + blk_offset;
+                            let v_vec = &v_pool[phys_idx * kv_dim + kv_head * vhd..][..vhd];
+                            for (o, &val) in out_slice.iter_mut().zip(v_vec) {
+                                *o += w * val;
+                            }
+                        }
                     }
                 }
                 out
@@ -1277,6 +1384,124 @@ fn operand_u32<'a>(
     match slot(bound, slots, ins, name, k)? {
         Tensor::U32(v) => Ok(v),
         _ => Err(format!("node '{name}': operand {k} must be u32")),
+    }
+}
+
+fn dispatch_linear(
+    x: &[f32],
+    w_slot: &Tensor,
+    bias: Option<&[f32]>,
+    in_f: usize,
+    out_f: usize,
+    rows: usize,
+    name: &str,
+) -> Result<Vec<f32>, String> {
+    match w_slot {
+        Tensor::F32(w) => {
+            if w.len() != out_f * in_f {
+                return Err(format!(
+                    "node '{name}': weight elements {} != {out_f} * {in_f}",
+                    w.len()
+                ));
+            }
+            Ok(nn::linear(x, rows, w, bias, in_f, out_f))
+        }
+        Tensor::Quantized(q) => {
+            if q.in_features() != in_f || q.out_features() != out_f {
+                return Err(format!(
+                    "node '{name}': quantized weight [{}, {}] != declared [{out_f}, {in_f}]",
+                    q.out_features(),
+                    q.in_features()
+                ));
+            }
+            match q.as_ref() {
+                crate::model::layers::QuantizedWeight::Uncompressed { data, .. } => {
+                    Ok(nn::linear(x, rows, data, bias, in_f, out_f))
+                }
+                crate::model::layers::QuantizedWeight::ZeroCopySlice {
+                    data,
+                    format,
+                    in_features,
+                    out_features,
+                } => {
+                    let mut out = vec![0.0f32; rows * out_f];
+                    for (r, x_row) in x.chunks(in_f).enumerate() {
+                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
+                        crate::model::layers::dispatch_fused_gemv(
+                            data,
+                            *format,
+                            *in_features,
+                            *out_features,
+                            x_row,
+                            out_row,
+                            bias,
+                        );
+                    }
+                    Ok(out)
+                }
+                crate::model::layers::QuantizedWeight::GgufQuantized {
+                    raw_data,
+                    format,
+                    in_features,
+                    out_features,
+                } => {
+                    let mut out = vec![0.0f32; rows * out_f];
+                    for (r, x_row) in x.chunks(in_f).enumerate() {
+                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
+                        crate::model::layers::dispatch_fused_gemv(
+                            raw_data,
+                            *format,
+                            *in_features,
+                            *out_features,
+                            x_row,
+                            out_row,
+                            bias,
+                        );
+                    }
+                    Ok(out)
+                }
+                crate::model::layers::QuantizedWeight::Nvfp4(tensor) => {
+                    let mut out = vec![0.0f32; rows * out_f];
+                    for (r, x_row) in x.chunks(in_f).enumerate() {
+                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
+                        crate::quant::nvfp4::gemv_nvfp4_f32(tensor, x_row, out_row);
+                        if let Some(b) = bias {
+                            for (o, &bi) in out_row.iter_mut().zip(b) {
+                                *o += bi;
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
+                crate::model::layers::QuantizedWeight::WeightlessJesse(layer) => {
+                    let mut out = vec![0.0f32; rows * out_f];
+                    for (r, x_row) in x.chunks(in_f).enumerate() {
+                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
+                        layer.forward(x_row, out_row);
+                        if let Some(b) = bias {
+                            for (o, &bi) in out_row.iter_mut().zip(b) {
+                                *o += bi;
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
+                _ => {
+                    let w_f32 = q.to_f32();
+                    Ok(nn::linear(x, rows, &w_f32, bias, in_f, out_f))
+                }
+            }
+        }
+        other => {
+            let w_f32 = other.to_f32();
+            if w_f32.len() != out_f * in_f {
+                return Err(format!(
+                    "node '{name}': weight elements {} != {out_f} * {in_f}",
+                    w_f32.len()
+                ));
+            }
+            Ok(nn::linear(x, rows, &w_f32, bias, in_f, out_f))
+        }
     }
 }
 

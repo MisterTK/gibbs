@@ -218,6 +218,36 @@ kernel void gelu_erf_f32(device const float* x [[buffer(0)]],
     if (i < n) out[i] = gelu_erf(x[i]);
 }
 
+kernel void silu_f32(device const float* x [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant uint& n [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < n) {
+        float val = x[i];
+        out[i] = val / (1.0f + exp(-val));
+    }
+}
+
+kernel void sigmoid_f32(device const float* x [[buffer(0)]],
+                        device float* out [[buffer(1)]],
+                        constant uint& n [[buffer(2)]],
+                        uint i [[thread_position_in_grid]]) {
+    if (i < n) {
+        float val = x[i];
+        out[i] = 1.0f / (1.0f + exp(-val));
+    }
+}
+
+kernel void softplus_f32(device const float* x [[buffer(0)]],
+                         device float* out [[buffer(1)]],
+                         constant uint& n [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+    if (i < n) {
+        float val = x[i];
+        out[i] = val > 20.0f ? val : log(1.0f + exp(val));
+    }
+}
+
 // LayerNorm of one row per threadgroup: mean, then biased variance, like `nn::layer_norm`.
 kernel void layer_norm_f32(device const float* x [[buffer(0)]],
                            device const float* g [[buffer(1)]],
@@ -401,6 +431,34 @@ kernel void rmsnorm_f32(device const float* x [[buffer(0)]],
         outr[i] = xr[i] * scale * g[i];
     }
 }
+kernel void rmsnorm_residual_f32(device const float* x [[buffer(0)]],
+                                 device const float* g [[buffer(1)]],
+                                 device const float* res [[buffer(2)]],
+                                 device float* out [[buffer(3)]],
+                                 constant RmsNormParams& p [[buffer(4)]],
+                                 uint tg [[threadgroup_position_in_grid]],
+                                 uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint nsg [[simdgroups_per_threadgroup]],
+                                 uint tid [[thread_position_in_threadgroup]],
+                                 uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    uint row = tg;
+    if (row >= p.rows) return;
+    device const float* xr = x + (ulong)row * p.d;
+    device const float* resr = res + (ulong)row * p.d;
+    device float* outr = out + (ulong)row * p.d;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.d; i += tpg) {
+        float v = xr[i];
+        sq += v * v;
+    }
+    float scale = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
+    for (uint i = tid; i < p.d; i += tpg) {
+        outr[i] = resr[i] + xr[i] * scale * g[i];
+    }
+}
+
 
 struct GraphRopeParams { uint n_heads; uint head_dim; uint pairs; uint pair_stride; uint pair_gap; };
 kernel void graph_rope_f32(device const float* x [[buffer(0)]],
@@ -460,8 +518,24 @@ struct PackedGemvParams {
     uint cols;
     uint batch_size;
     uint has_bias;
-    uint epi; // 0 = None, 1 = Gelu, 2 = Residual
+    uint epi; // 0 = None, 1 = Gelu, 2 = Residual, 3 = Silu, 4 = SwiGlu, 5 = GeGlu
 };
+
+static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemvParams& p, device const float* res) {
+    if (p.epi == 1) {
+        return gelu_erf(acc);
+    } else if (p.epi == 2) {
+        return acc + res[out_idx];
+    } else if (p.epi == 3) {
+        return acc / (1.0f + exp(-acc));
+    } else if (p.epi == 4) {
+        float silu = acc / (1.0f + exp(-acc));
+        return silu * res[out_idx];
+    } else if (p.epi == 5) {
+        return gelu_erf(acc) * res[out_idx];
+    }
+    return acc;
+}
 
 kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
                       device const float* x [[buffer(1)]],
@@ -527,13 +601,8 @@ kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
             acc0 += bias[row0];
             if (has_row1) acc1 += bias[row1];
         }
-        if (p.epi == 2) {
-            acc0 += res[(ulong)batch * p.rows + row0];
-            if (has_row1) acc1 += res[(ulong)batch * p.rows + row1];
-        } else if (p.epi == 1) {
-            acc0 = gelu_erf(acc0);
-            if (has_row1) acc1 = gelu_erf(acc1);
-        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
         y[(ulong)batch * p.rows + row0] = acc0;
         if (has_row1) {
             y[(ulong)batch * p.rows + row1] = acc1;
@@ -555,37 +624,59 @@ kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
                       uint2 tg [[threadgroup_position_in_grid]],
                       uint sg [[simdgroup_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tg.x * 8 + sg;
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
     uint batch = tg.y;
-    if (row >= p.rows || batch >= p.batch_size) return;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
     uint n_blocks = p.cols / 32;
-    device const block_q8_0* row_blocks = w + (ulong)row * n_blocks;
+    device const block_q8_0* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q8_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
-    float acc = 0.0f;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
     for (uint b = lane; b < n_blocks; b += 32) {
-        block_q8_0 blk = row_blocks[b];
-        float d = float(blk.d);
+        block_q8_0 blk0 = r0_blocks[b];
+        block_q8_0 blk1 = has_row1 ? r1_blocks[b] : blk0;
+        float d0 = float(blk0.d);
+        float d1 = float(blk1.d);
         device const float* xb = xb_base + b * 32;
-        float b_acc = 0.0f;
+
+        float b_acc0 = 0.0f;
+        float b_acc1 = 0.0f;
+
         #pragma unroll
         for (uint j = 0; j < 32; j += 4) {
-            uint32_t q_raw = *reinterpret_cast<thread const uint32_t*>(&blk.qs[j]);
-            char4 q = as_type<char4>(q_raw);
-            float4 v = float4(q);
+            uint32_t q_raw0 = *reinterpret_cast<thread const uint32_t*>(&blk0.qs[j]);
+            uint32_t q_raw1 = *reinterpret_cast<thread const uint32_t*>(&blk1.qs[j]);
+            float4 v0 = float4(as_type<char4>(q_raw0));
+            float4 v1 = float4(as_type<char4>(q_raw1));
             float4 x_vec = *reinterpret_cast<device const float4*>(xb + j);
-            b_acc += dot(v, x_vec);
+            b_acc0 += dot(v0, x_vec);
+            b_acc1 += dot(v1, x_vec);
         }
-        acc += d * b_acc;
+        acc0 += d0 * b_acc0;
+        if (has_row1) {
+            acc1 += d1 * b_acc1;
+        }
     }
-    acc = simd_sum(acc);
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
     if (lane == 0) {
-        if (p.has_bias != 0) acc += bias[row];
-        if (p.epi == 2) {
-            acc += res[(ulong)batch * p.rows + row];
-        } else if (p.epi == 1) {
-            acc = gelu_erf(acc);
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
         }
-        y[(ulong)batch * p.rows + row] = acc;
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
     }
 }
 
@@ -667,13 +758,8 @@ kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
             acc0 += bias[row0];
             if (has_row1) acc1 += bias[row1];
         }
-        if (p.epi == 2) {
-            acc0 += res[(ulong)batch * p.rows + row0];
-            if (has_row1) acc1 += res[(ulong)batch * p.rows + row1];
-        } else if (p.epi == 1) {
-            acc0 = gelu_erf(acc0);
-            if (has_row1) acc1 = gelu_erf(acc1);
-        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
         y[(ulong)batch * p.rows + row0] = acc0;
         if (has_row1) {
             y[(ulong)batch * p.rows + row1] = acc1;
@@ -745,6 +831,613 @@ kernel void gemv_f16(device const half* w [[buffer(0)]],
         if (has_row1) {
             y[(ulong)batch * p.rows + row1] = acc1;
         }
+    }
+}
+
+constant const float kvalues_iq4nl[16] = {
+    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
+    1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f
+};
+
+struct block_iq4_xs {
+    half d;
+    uint16_t scales_h;
+    uint8_t scales_l[4];
+    uint8_t qs[128];
+};
+
+kernel void gemv_iq4_xs(device const block_iq4_xs* w [[buffer(0)]],
+                        device const float* x [[buffer(1)]],
+                        device float* y [[buffer(2)]],
+                        constant PackedGemvParams& p [[buffer(3)]],
+                        device const float* bias [[buffer(4)]],
+                        device const float* res [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg.x * 8 + sg;
+    uint batch = tg.y;
+    if (row >= p.rows || batch >= p.batch_size) return;
+
+    uint n_blocks = p.cols / 256;
+    uint n_sub_blocks = n_blocks * 8;
+    device const block_iq4_xs* row_blocks = w + (ulong)row * n_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc = 0.0f;
+    for (uint sb = lane; sb < n_sub_blocks; sb += 32) {
+        uint b = sb >> 3;
+        uint ib = sb & 7;
+        device const block_iq4_xs& blk = row_blocks[b];
+        float d = float(blk.d);
+        int ls = int((blk.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+               | (int((blk.scales_h >> (2 * ib)) & 3) << 4);
+        float dl = d * float(ls - 32);
+        device const float* xb_sub = xb_base + (ulong)sb * 32;
+
+        float sb_acc = 0.0f;
+        for (uint j = 0; j < 16; ++j) {
+            uint8_t q = blk.qs[ib * 16 + j];
+            float v0 = dl * kvalues_iq4nl[q & 0x0F];
+            float v1 = dl * kvalues_iq4nl[q >> 4];
+            sb_acc += v0 * xb_sub[j] + v1 * xb_sub[j + 16];
+        }
+        acc += sb_acc;
+    }
+    acc = simd_sum(acc);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) acc += bias[row];
+        if (p.epi == 2) {
+            acc += res[(ulong)batch * p.rows + row];
+        } else if (p.epi == 1) {
+            acc = gelu_erf(acc);
+        }
+        y[(ulong)batch * p.rows + row] = acc;
+    }
+}
+
+constant const uint64_t iq2s_grid[1024] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08, 0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x080808080819192b,
+    0x0808080808192b19, 0x08080808082b0808, 0x08080808082b082b, 0x08080808082b1919, 0x08080808082b2b08, 0x0808080819080819, 0x0808080819081908, 0x080808081908192b,
+    0x0808080819082b19, 0x0808080819190808, 0x080808081919082b, 0x0808080819191919, 0x0808080819192b08, 0x08080808192b0819, 0x08080808192b1908, 0x08080808192b192b,
+    0x08080808192b2b19, 0x080808082b080808, 0x080808082b08082b, 0x080808082b081919, 0x080808082b082b08, 0x080808082b190819, 0x080808082b191908, 0x080808082b2b0808,
+    0x080808082b2b1919, 0x080808082b2b2b2b, 0x0808081908080819, 0x0808081908081908, 0x080808190808192b, 0x0808081908082b19, 0x0808081908190808, 0x080808190819082b,
+    0x0808081908191919, 0x0808081908192b08, 0x08080819082b0819, 0x08080819082b1908, 0x0808081919080808, 0x080808191908082b, 0x0808081919081919, 0x0808081919082b08,
+    0x0808081919190819, 0x0808081919191908, 0x080808191919192b, 0x0808081919192b19, 0x08080819192b0808, 0x08080819192b1919, 0x08080819192b2b08, 0x080808192b080819,
+    0x080808192b081908, 0x080808192b190808, 0x080808192b19082b, 0x080808192b191919, 0x080808192b2b0819, 0x080808192b2b1908, 0x0808082b08080808, 0x0808082b0808082b,
+    0x0808082b08081919, 0x0808082b08082b08, 0x0808082b08190819, 0x0808082b08191908, 0x0808082b082b0808, 0x0808082b082b2b2b, 0x0808082b19080819, 0x0808082b19081908,
+    0x0808082b1908192b, 0x0808082b19082b19, 0x0808082b19190808, 0x0808082b19191919, 0x0808082b2b080808, 0x0808082b2b081919, 0x0808082b2b082b2b, 0x0808082b2b191908,
+    0x0808082b2b2b082b, 0x0808190808080819, 0x0808190808081908, 0x080819080808192b, 0x0808190808082b19, 0x0808190808190808, 0x080819080819082b, 0x0808190808191919,
+    0x0808190808192b08, 0x08081908082b0819, 0x08081908082b1908, 0x08081908082b192b, 0x08081908082b2b19, 0x0808190819080808, 0x080819081908082b, 0x0808190819081919,
+    0x0808190819082b08, 0x0808190819082b2b, 0x0808190819190819, 0x0808190819191908, 0x080819081919192b, 0x0808190819192b19, 0x08081908192b0808, 0x08081908192b082b,
+    0x08081908192b1919, 0x080819082b080819, 0x080819082b081908, 0x080819082b08192b, 0x080819082b082b19, 0x080819082b190808, 0x080819082b191919, 0x080819082b192b08,
+    0x080819082b2b0819, 0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908081919, 0x0808191908082b08, 0x0808191908082b2b, 0x0808191908190819,
+    0x0808191908191908, 0x080819190819192b, 0x0808191908192b19, 0x08081919082b0808, 0x08081919082b1919, 0x08081919082b2b08, 0x0808191919080819, 0x0808191919081908,
+    0x080819191908192b, 0x0808191919082b19, 0x0808191919190808, 0x080819191919082b, 0x0808191919191919, 0x0808191919192b08, 0x08081919192b0819, 0x08081919192b1908,
+    0x080819192b080808, 0x080819192b08082b, 0x080819192b081919, 0x080819192b082b08, 0x080819192b190819, 0x080819192b191908, 0x080819192b2b0808, 0x0808192b08080819,
+    0x0808192b08081908, 0x0808192b0808192b, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b08191919, 0x0808192b19080808, 0x0808192b19081919, 0x0808192b19082b08,
+    0x0808192b19190819, 0x0808192b19191908, 0x0808192b192b0808, 0x0808192b2b080819, 0x0808192b2b081908, 0x0808192b2b190808, 0x08082b0808080808, 0x08082b080808082b,
+    0x08082b0808081919, 0x08082b0808082b08, 0x08082b0808190819, 0x08082b0808191908, 0x08082b080819192b, 0x08082b0808192b19, 0x08082b08082b0808, 0x08082b08082b1919,
+    0x08082b08082b2b2b, 0x08082b0819080819, 0x08082b0819081908, 0x08082b081908192b, 0x08082b0819082b19, 0x08082b0819190808, 0x08082b081919082b, 0x08082b0819191919,
+    0x08082b0819192b08, 0x08082b08192b0819, 0x08082b08192b1908, 0x08082b082b080808, 0x08082b082b081919, 0x08082b082b191908, 0x08082b082b2b2b2b, 0x08082b1908080819,
+    0x08082b1908081908, 0x08082b1908190808, 0x08082b190819082b, 0x08082b1908191919, 0x08082b1908192b08, 0x08082b19082b0819, 0x08082b1919080808, 0x08082b1919081919,
+    0x08082b1919082b08, 0x08082b1919190819, 0x08082b1919191908, 0x08082b19192b0808, 0x08082b192b080819, 0x08082b192b190808, 0x08082b2b08080808, 0x08082b2b08190819,
+    0x08082b2b08191908, 0x08082b2b082b082b, 0x08082b2b082b2b08, 0x08082b2b082b2b2b, 0x08082b2b19190808, 0x08082b2b2b192b19, 0x0819080808080819, 0x0819080808081908,
+    0x081908080808192b, 0x0819080808082b19, 0x0819080808190808, 0x081908080819082b, 0x0819080808191919, 0x0819080808192b08, 0x08190808082b0819, 0x08190808082b1908,
+    0x08190808082b192b, 0x0819080819080808, 0x081908081908082b, 0x0819080819081919, 0x0819080819082b08, 0x0819080819190819, 0x0819080819191908, 0x081908081919192b,
+    0x0819080819192b19, 0x08190808192b0808, 0x08190808192b082b, 0x08190808192b1919, 0x08190808192b2b08, 0x081908082b080819, 0x081908082b081908, 0x081908082b08192b,
+    0x081908082b190808, 0x081908082b191919, 0x081908082b192b08, 0x081908082b2b0819, 0x081908082b2b1908, 0x0819081908080808, 0x081908190808082b, 0x0819081908081919,
+    0x0819081908082b08, 0x0819081908082b2b, 0x0819081908190819, 0x0819081908191908, 0x081908190819192b, 0x0819081908192b19, 0x08190819082b0808, 0x08190819082b082b,
+    0x08190819082b1919, 0x08190819082b2b08, 0x0819081919080819, 0x0819081919081908, 0x081908191908192b, 0x0819081919082b19, 0x0819081919190808, 0x081908191919082b,
+    0x0819081919191919, 0x0819081919192b08, 0x08190819192b0819, 0x08190819192b1908, 0x081908192b080808, 0x081908192b08082b, 0x081908192b081919, 0x081908192b082b08,
+    0x081908192b190819, 0x081908192b191908, 0x0819082b08080819, 0x0819082b08081908, 0x0819082b08082b19, 0x0819082b08190808, 0x0819082b08191919, 0x0819082b082b0819,
+    0x0819082b082b1908, 0x0819082b19080808, 0x0819082b19081919, 0x0819082b19190819, 0x0819082b19191908, 0x0819082b2b080819, 0x0819082b2b081908, 0x0819082b2b190808,
+    0x0819190808080808, 0x081919080808082b, 0x0819190808081919, 0x0819190808082b08, 0x0819190808190819, 0x0819190808191908, 0x081919080819192b, 0x0819190808192b19,
+    0x08191908082b0808, 0x08191908082b1919, 0x08191908082b2b08, 0x0819190819080819, 0x0819190819081908, 0x081919081908192b, 0x0819190819082b19, 0x0819190819190808,
+    0x081919081919082b, 0x0819190819191919, 0x0819190819192b08, 0x08191908192b0819, 0x08191908192b1908, 0x081919082b080808, 0x081919082b08082b, 0x081919082b081919,
+    0x081919082b082b08, 0x081919082b190819, 0x081919082b191908, 0x081919082b2b0808, 0x0819191908080819, 0x0819191908081908, 0x081919190808192b, 0x0819191908082b19,
+    0x0819191908190808, 0x081919190819082b, 0x0819191908191919, 0x0819191908192b08, 0x08191919082b0819, 0x08191919082b1908, 0x0819191919080808, 0x081919191908082b,
+    0x0819191919081919, 0x0819191919082b08, 0x0819191919190819, 0x0819191919191908, 0x08191919192b0808, 0x081919192b080819, 0x081919192b081908, 0x081919192b190808,
+    0x0819192b08080808, 0x0819192b08081919, 0x0819192b08082b08, 0x0819192b08190819, 0x0819192b08191908, 0x0819192b082b0808, 0x0819192b19080819, 0x0819192b19081908,
+    0x0819192b19190808, 0x0819192b2b080808, 0x0819192b2b2b2b2b, 0x08192b0808080819, 0x08192b0808081908, 0x08192b080808192b, 0x08192b0808082b19, 0x08192b0808190808,
+    0x08192b0808191919, 0x08192b0808192b08, 0x08192b08082b0819, 0x08192b0819080808, 0x08192b081908082b, 0x08192b0819081919, 0x08192b0819082b08, 0x08192b0819190819,
+    0x08192b0819191908, 0x08192b08192b0808, 0x08192b082b080819, 0x08192b082b081908, 0x08192b1908080808, 0x08192b190808082b, 0x08192b1908081919, 0x08192b1908082b08,
+    0x08192b1908190819, 0x08192b1908191908, 0x08192b19082b0808, 0x08192b1919080819, 0x08192b1919081908, 0x08192b1919190808, 0x08192b19192b2b19, 0x08192b192b2b082b,
+    0x08192b2b08081908, 0x08192b2b08190808, 0x08192b2b19080808, 0x08192b2b1919192b, 0x082b080808080808, 0x082b08080808082b, 0x082b080808081919, 0x082b080808082b08,
+    0x082b080808190819, 0x082b080808191908, 0x082b08080819192b, 0x082b080808192b19, 0x082b0808082b0808, 0x082b0808082b1919, 0x082b0808082b2b2b, 0x082b080819080819,
+    0x082b080819081908, 0x082b080819190808, 0x082b08081919082b, 0x082b080819191919, 0x082b0808192b1908, 0x082b08082b080808, 0x082b08082b082b2b, 0x082b08082b191908,
+    0x082b08082b2b2b2b, 0x082b081908080819, 0x082b081908081908, 0x082b081908190808, 0x082b08190819082b, 0x082b081908191919, 0x082b0819082b0819, 0x082b081919080808,
+    0x082b08191908082b, 0x082b081919081919, 0x082b081919190819, 0x082b081919191908, 0x082b0819192b0808, 0x082b08192b080819, 0x082b08192b081908, 0x082b08192b190808,
+    0x082b082b08080808, 0x082b082b08082b2b, 0x082b082b082b082b, 0x082b082b082b2b08, 0x082b082b082b2b2b, 0x082b082b19081908, 0x082b082b19190808, 0x082b082b2b082b08,
+    0x082b082b2b082b2b, 0x082b082b2b2b2b08, 0x082b190808080819, 0x082b190808081908, 0x082b19080808192b, 0x082b190808082b19, 0x082b190808190808, 0x082b190808191919,
+    0x082b190808192b08, 0x082b1908082b0819, 0x082b1908082b1908, 0x082b190819080808, 0x082b19081908082b, 0x082b190819081919, 0x082b190819082b08, 0x082b190819190819,
+    0x082b190819191908, 0x082b1908192b0808, 0x082b19082b080819, 0x082b19082b081908, 0x082b19082b190808, 0x082b191908080808, 0x082b191908081919, 0x082b191908082b08,
+    0x082b191908190819, 0x082b191908191908, 0x082b1919082b0808, 0x082b191919080819, 0x082b191919081908, 0x082b191919190808, 0x082b1919192b192b, 0x082b19192b080808,
+    0x082b192b08080819, 0x082b192b08081908, 0x082b192b08190808, 0x082b192b19080808, 0x082b192b19192b19, 0x082b2b0808080808, 0x082b2b0808081919, 0x082b2b0808190819,
+    0x082b2b0808191908, 0x082b2b0819080819, 0x082b2b0819081908, 0x082b2b0819190808, 0x082b2b082b082b2b, 0x082b2b082b2b2b2b, 0x082b2b1908080819, 0x082b2b1908081908,
+    0x082b2b1908190808, 0x082b2b192b191919, 0x082b2b2b08082b2b, 0x082b2b2b082b082b, 0x082b2b2b192b1908, 0x082b2b2b2b082b08, 0x082b2b2b2b082b2b, 0x1908080808080819,
+    0x1908080808081908, 0x190808080808192b, 0x1908080808082b19, 0x1908080808190808, 0x190808080819082b, 0x1908080808191919, 0x1908080808192b08, 0x1908080808192b2b,
+    0x19080808082b0819, 0x19080808082b1908, 0x19080808082b192b, 0x1908080819080808, 0x190808081908082b, 0x1908080819081919, 0x1908080819082b08, 0x1908080819082b2b,
+    0x1908080819190819, 0x1908080819191908, 0x190808081919192b, 0x1908080819192b19, 0x19080808192b0808, 0x19080808192b082b, 0x19080808192b1919, 0x190808082b080819,
+    0x190808082b081908, 0x190808082b190808, 0x190808082b191919, 0x190808082b192b08, 0x190808082b2b0819, 0x190808082b2b1908, 0x1908081908080808, 0x190808190808082b,
+    0x1908081908081919, 0x1908081908082b08, 0x1908081908190819, 0x1908081908191908, 0x190808190819192b, 0x1908081908192b19, 0x19080819082b0808, 0x19080819082b082b,
+    0x19080819082b1919, 0x1908081919080819, 0x1908081919081908, 0x190808191908192b, 0x1908081919082b19, 0x1908081919190808, 0x190808191919082b, 0x1908081919191919,
+    0x1908081919192b08, 0x19080819192b0819, 0x19080819192b1908, 0x190808192b080808, 0x190808192b08082b, 0x190808192b081919, 0x190808192b082b08, 0x190808192b190819,
+    0x190808192b191908, 0x190808192b2b0808, 0x1908082b08080819, 0x1908082b08081908, 0x1908082b08190808, 0x1908082b0819082b, 0x1908082b08191919, 0x1908082b08192b08,
+    0x1908082b082b1908, 0x1908082b19080808, 0x1908082b19081919, 0x1908082b19082b08, 0x1908082b19190819, 0x1908082b19191908, 0x1908082b192b0808, 0x1908082b2b080819,
+    0x1908082b2b081908, 0x1908190808080808, 0x190819080808082b, 0x1908190808081919, 0x1908190808082b08, 0x1908190808082b2b, 0x1908190808190819, 0x1908190808191908,
+    0x190819080819192b, 0x1908190808192b19, 0x19081908082b0808, 0x19081908082b082b, 0x19081908082b1919, 0x19081908082b2b08, 0x1908190819080819, 0x1908190819081908,
+    0x190819081908192b, 0x1908190819082b19, 0x1908190819190808, 0x190819081919082b, 0x1908190819191919, 0x1908190819192b08, 0x19081908192b0819, 0x19081908192b1908,
+    0x190819082b080808, 0x190819082b08082b, 0x190819082b081919, 0x190819082b082b08, 0x190819082b190819, 0x190819082b191908, 0x190819082b2b0808, 0x1908191908080819,
+    0x1908191908081908, 0x190819190808192b, 0x1908191908082b19, 0x1908191908190808, 0x190819190819082b, 0x1908191908191919, 0x1908191908192b08, 0x19081919082b0819,
+    0x19081919082b1908, 0x1908191919080808, 0x190819191908082b, 0x1908191919081919, 0x1908191919082b08, 0x1908191919190819, 0x1908191919191908, 0x19081919192b0808,
+    0x19081919192b2b2b, 0x190819192b080819, 0x190819192b081908, 0x190819192b190808, 0x1908192b08080808, 0x1908192b0808082b, 0x1908192b08081919, 0x1908192b08082b08,
+    0x1908192b08190819, 0x1908192b08191908, 0x1908192b082b0808, 0x1908192b19080819, 0x1908192b19081908, 0x1908192b19190808, 0x1908192b2b080808, 0x1908192b2b2b1919,
+    0x19082b0808080819, 0x19082b0808081908, 0x19082b0808082b19, 0x19082b0808190808, 0x19082b080819082b, 0x19082b0808191919, 0x19082b0808192b08, 0x19082b08082b0819,
+    0x19082b08082b1908, 0x19082b0819080808, 0x19082b081908082b, 0x19082b0819081919, 0x19082b0819082b08, 0x19082b0819190819, 0x19082b0819191908, 0x19082b08192b0808,
+    0x19082b082b081908, 0x19082b082b190808, 0x19082b1908080808, 0x19082b190808082b, 0x19082b1908081919, 0x19082b1908082b08, 0x19082b1908190819, 0x19082b1908191908,
+    0x19082b19082b0808, 0x19082b1919080819, 0x19082b1919081908, 0x19082b1919190808, 0x19082b192b080808, 0x19082b192b19192b, 0x19082b2b08080819, 0x19082b2b08081908,
+    0x19082b2b08190808, 0x19082b2b19080808, 0x1919080808080808, 0x191908080808082b, 0x1919080808081919, 0x1919080808082b08, 0x1919080808190819, 0x1919080808191908,
+    0x191908080819192b, 0x1919080808192b19, 0x19190808082b0808, 0x19190808082b082b, 0x19190808082b1919, 0x19190808082b2b08, 0x1919080819080819, 0x1919080819081908,
+    0x191908081908192b, 0x1919080819082b19, 0x1919080819190808, 0x191908081919082b, 0x1919080819191919, 0x1919080819192b08, 0x19190808192b0819, 0x19190808192b1908,
+    0x191908082b080808, 0x191908082b08082b, 0x191908082b081919, 0x191908082b082b08, 0x191908082b190819, 0x191908082b191908, 0x1919081908080819, 0x1919081908081908,
+    0x191908190808192b, 0x1919081908082b19, 0x1919081908190808, 0x191908190819082b, 0x1919081908191919, 0x1919081908192b08, 0x19190819082b0819, 0x19190819082b1908,
+    0x1919081919080808, 0x191908191908082b, 0x1919081919081919, 0x1919081919082b08, 0x1919081919190819, 0x1919081919191908, 0x19190819192b0808, 0x191908192b080819,
+    0x191908192b081908, 0x191908192b190808, 0x1919082b08080808, 0x1919082b08081919, 0x1919082b08082b08, 0x1919082b08190819, 0x1919082b08191908, 0x1919082b082b0808,
+    0x1919082b19080819, 0x1919082b19081908, 0x1919082b19190808, 0x1919082b192b2b19, 0x1919082b2b080808, 0x1919190808080819, 0x1919190808081908, 0x191919080808192b,
+    0x1919190808082b19, 0x1919190808190808, 0x191919080819082b, 0x1919190808191919, 0x1919190808192b08, 0x19191908082b0819, 0x19191908082b1908, 0x1919190819080808,
+    0x191919081908082b, 0x1919190819081919, 0x1919190819082b08, 0x1919190819190819, 0x1919190819191908, 0x19191908192b0808, 0x191919082b080819, 0x191919082b081908,
+    0x191919082b190808, 0x1919191908080808, 0x191919190808082b, 0x1919191908081919, 0x1919191908082b08, 0x1919191908190819, 0x1919191908191908, 0x19191919082b0808,
+    0x1919191919080819, 0x1919191919081908, 0x1919191919190808, 0x191919192b080808, 0x1919192b08080819, 0x1919192b08081908, 0x1919192b08190808, 0x1919192b082b192b,
+    0x1919192b19080808, 0x19192b0808080808, 0x19192b080808082b, 0x19192b0808081919, 0x19192b0808082b08, 0x19192b0808190819, 0x19192b0808191908, 0x19192b08082b0808,
+    0x19192b0819080819, 0x19192b0819081908, 0x19192b0819190808, 0x19192b0819192b2b, 0x19192b082b080808, 0x19192b1908080819, 0x19192b1908081908, 0x19192b1908190808,
+    0x19192b1919080808, 0x19192b2b08080808, 0x19192b2b08192b19, 0x19192b2b2b081919, 0x19192b2b2b2b2b08, 0x192b080808080819, 0x192b080808081908, 0x192b08080808192b,
+    0x192b080808190808, 0x192b08080819082b, 0x192b080808191919, 0x192b080808192b08, 0x192b0808082b0819, 0x192b0808082b1908, 0x192b080819080808, 0x192b080819081919,
+    0x192b080819082b08, 0x192b080819190819, 0x192b080819191908, 0x192b0808192b0808, 0x192b08082b081908, 0x192b08082b190808, 0x192b081908080808, 0x192b08190808082b,
+    0x192b081908081919, 0x192b081908082b08, 0x192b081908190819, 0x192b081908191908, 0x192b0819082b0808, 0x192b081919080819, 0x192b081919081908, 0x192b081919190808,
+    0x192b08192b080808, 0x192b08192b192b19, 0x192b082b08081908, 0x192b082b08190808, 0x192b082b19080808, 0x192b082b1919192b, 0x192b082b2b2b0819, 0x192b190808080808,
+    0x192b190808081919, 0x192b190808082b08, 0x192b190808190819, 0x192b190808191908, 0x192b1908082b0808, 0x192b190819080819, 0x192b190819081908, 0x192b190819190808,
+    0x192b19082b080808, 0x192b191908080819, 0x192b191908081908, 0x192b191908190808, 0x192b191919080808, 0x192b191919082b2b, 0x192b1919192b2b08, 0x192b19192b19082b,
+    0x192b192b08080808, 0x192b192b2b191908, 0x192b2b0808080819, 0x192b2b0808081908, 0x192b2b0808190808, 0x192b2b08192b1919, 0x192b2b082b192b08, 0x192b2b1908080808,
+    0x192b2b19082b2b2b, 0x192b2b2b1908082b, 0x192b2b2b2b2b0819, 0x2b08080808080808, 0x2b0808080808082b, 0x2b08080808081919, 0x2b08080808082b08, 0x2b08080808190819,
+    0x2b08080808191908, 0x2b08080808192b19, 0x2b080808082b0808, 0x2b080808082b1919, 0x2b08080819080819, 0x2b08080819081908, 0x2b08080819190808, 0x2b0808081919082b,
+    0x2b08080819191919, 0x2b08080819192b08, 0x2b080808192b0819, 0x2b0808082b080808, 0x2b0808082b081919, 0x2b0808082b190819, 0x2b0808082b191908, 0x2b08081908080819,
+    0x2b08081908081908, 0x2b08081908082b19, 0x2b08081908190808, 0x2b0808190819082b, 0x2b08081908191919, 0x2b08081908192b08, 0x2b080819082b0819, 0x2b080819082b1908,
+    0x2b08081919080808, 0x2b0808191908082b, 0x2b08081919081919, 0x2b08081919082b08, 0x2b08081919190819, 0x2b08081919191908, 0x2b0808192b080819, 0x2b0808192b081908,
+    0x2b0808192b190808, 0x2b0808192b2b2b19, 0x2b08082b08080808, 0x2b08082b08081919, 0x2b08082b08082b2b, 0x2b08082b08190819, 0x2b08082b08191908, 0x2b08082b19080819,
+    0x2b08082b19081908, 0x2b08082b19190808, 0x2b08190808080819, 0x2b08190808081908, 0x2b0819080808192b, 0x2b08190808082b19, 0x2b08190808190808, 0x2b0819080819082b,
+    0x2b08190808191919, 0x2b08190808192b08, 0x2b081908082b0819, 0x2b08190819080808, 0x2b0819081908082b, 0x2b08190819081919, 0x2b08190819082b08, 0x2b08190819190819,
+    0x2b08190819191908, 0x2b081908192b0808, 0x2b0819082b080819, 0x2b0819082b081908, 0x2b0819082b190808, 0x2b08191908080808, 0x2b0819190808082b, 0x2b08191908081919,
+    0x2b08191908082b08, 0x2b08191908190819, 0x2b08191908191908, 0x2b081919082b0808, 0x2b08191919080819, 0x2b08191919081908, 0x2b08191919190808, 0x2b0819192b080808,
+    0x2b0819192b082b2b, 0x2b08192b08080819, 0x2b08192b08081908, 0x2b08192b08190808, 0x2b08192b082b2b19, 0x2b08192b19080808, 0x2b082b0808080808, 0x2b082b0808081919,
+    0x2b082b0808190819, 0x2b082b0808191908, 0x2b082b0819080819, 0x2b082b0819081908, 0x2b082b0819190808, 0x2b082b082b2b082b, 0x2b082b1908080819, 0x2b082b1908081908,
+    0x2b082b1919080808, 0x2b082b19192b1919, 0x2b082b2b082b082b, 0x2b082b2b19192b08, 0x2b082b2b19192b2b, 0x2b082b2b2b08082b, 0x2b082b2b2b2b082b, 0x2b19080808080819,
+    0x2b19080808081908, 0x2b19080808082b19, 0x2b19080808190808, 0x2b1908080819082b, 0x2b19080808191919, 0x2b19080808192b08, 0x2b190808082b1908, 0x2b19080819080808,
+    0x2b1908081908082b, 0x2b19080819081919, 0x2b19080819082b08, 0x2b19080819190819, 0x2b19080819191908, 0x2b190808192b0808, 0x2b1908082b080819, 0x2b1908082b081908,
+    0x2b1908082b190808, 0x2b19081908080808, 0x2b19081908081919, 0x2b19081908190819, 0x2b19081908191908, 0x2b19081919080819, 0x2b19081919081908, 0x2b19081919190808,
+    0x2b19081919192b2b, 0x2b19082b08080819, 0x2b19082b08081908, 0x2b19082b08190808, 0x2b19082b19080808, 0x2b19082b2b2b192b, 0x2b19190808080808, 0x2b1919080808082b,
+    0x2b19190808081919, 0x2b19190808082b08, 0x2b19190808190819, 0x2b19190808191908, 0x2b191908082b0808, 0x2b19190819080819, 0x2b19190819081908, 0x2b19190819190808,
+    0x2b1919082b080808, 0x2b1919082b19192b, 0x2b19191908080819, 0x2b19191908081908, 0x2b19191908190808, 0x2b19191919080808, 0x2b1919192b192b08, 0x2b1919192b2b0819,
+    0x2b19192b08080808, 0x2b19192b1908192b, 0x2b19192b192b1908, 0x2b192b0808080819, 0x2b192b0808081908, 0x2b192b0808190808, 0x2b192b08082b192b, 0x2b192b0819080808,
+    0x2b192b082b2b2b19, 0x2b192b1908080808, 0x2b192b1919082b19, 0x2b192b191919082b, 0x2b192b2b2b190808, 0x2b2b080808080808, 0x2b2b080808081919, 0x2b2b080808082b2b,
+    0x2b2b080808191908, 0x2b2b0808082b082b, 0x2b2b0808082b2b2b, 0x2b2b080819080819, 0x2b2b080819081908, 0x2b2b080819190808, 0x2b2b08082b2b082b, 0x2b2b08082b2b2b2b,
+    0x2b2b081919080808, 0x2b2b0819192b1919, 0x2b2b082b0808082b, 0x2b2b082b08082b2b, 0x2b2b082b082b082b, 0x2b2b082b082b2b08, 0x2b2b082b082b2b2b, 0x2b2b082b2b08082b,
+    0x2b2b082b2b082b08, 0x2b2b082b2b082b2b, 0x2b2b082b2b2b2b08, 0x2b2b190808080819, 0x2b2b190808081908, 0x2b2b190808190808, 0x2b2b190819080808, 0x2b2b19082b082b19,
+    0x2b2b19082b2b1908, 0x2b2b191908080808, 0x2b2b191908192b19, 0x2b2b192b19190819, 0x2b2b2b0808082b2b, 0x2b2b2b08082b2b08, 0x2b2b2b082b2b082b, 0x2b2b2b1919191908,
+    0x2b2b2b192b08192b, 0x2b2b2b2b08082b08, 0x2b2b2b2b08082b2b, 0x2b2b2b2b082b0808, 0x2b2b2b2b082b082b, 0x2b2b2b2b082b2b08, 0x2b2b2b2b2b082b08, 0x2b2b2b2b2b2b2b2b,
+};
+
+struct block_iq2_s {
+    half d;
+    uint8_t qs[32];
+    uint8_t signs[32];
+    uint8_t qh[8];
+    uint8_t scales[8];
+};
+
+kernel void gemv_iq2_m(device const block_iq2_s* w [[buffer(0)]],
+                       device const float* x [[buffer(1)]],
+                       device float* y [[buffer(2)]],
+                       constant PackedGemvParams& p [[buffer(3)]],
+                       device const float* bias [[buffer(4)]],
+                       device const float* res [[buffer(5)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg.x * 8 + sg;
+    uint batch = tg.y;
+    if (row >= p.rows || batch >= p.batch_size) return;
+
+    uint n_blocks = p.cols / 256;
+    uint n_sub_blocks = n_blocks * 8;
+    device const block_iq2_s* row_blocks = w + (ulong)row * n_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc = 0.0f;
+    for (uint sb = lane; sb < n_sub_blocks; sb += 32) {
+        uint b = sb >> 3;
+        uint ib = sb & 7;
+        device const block_iq2_s& blk = row_blocks[b];
+        float d = float(blk.d);
+        uint8_t sc = blk.scales[ib];
+        float db0 = d * (0.5f + float(sc & 0x0F)) * 0.25f;
+        float db1 = d * (0.5f + float(sc >> 4)) * 0.25f;
+        device const float* xb_sub = xb_base + (ulong)sb * 32;
+
+        float sb_acc = 0.0f;
+        for (uint l = 0; l < 4; ++l) {
+            float db = (l < 2) ? db0 : db1;
+            uint idx = (uint)blk.qs[4 * ib + l] | (((uint)blk.qh[ib] << (8 - 2 * l)) & 0x300);
+            uint64_t g = iq2s_grid[idx];
+            uint8_t s = blk.signs[4 * ib + l];
+            device const float* x_el = xb_sub + l * 8;
+
+            for (uint j = 0; j < 8; ++j) {
+                float val = db * float((char)((g >> (8 * j)) & 0xFF)) * ((s & (1 << j)) ? -1.0f : 1.0f);
+                sb_acc += val * x_el[j];
+            }
+        }
+        acc += sb_acc;
+    }
+
+    acc = simd_sum(acc);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) acc += bias[row];
+        if (p.epi == 2) {
+            acc += res[(ulong)batch * p.rows + row];
+        } else if (p.epi == 1) {
+            acc = gelu_erf(acc);
+        }
+        y[(ulong)batch * p.rows + row] = acc;
+    }
+}
+
+struct block_q4_k {
+    half d;
+    half dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+};
+
+inline float2 k4_scale_min(uint j, thread const uint8_t* s) {
+    if (j < 4) {
+        return float2(float(s[j] & 63), float(s[j + 4] & 63));
+    } else {
+        float sc = float((s[j + 4] & 0x0F) | ((s[j - 4] >> 6) << 4));
+        float m = float((s[j + 4] >> 4) | ((s[j] >> 6) << 4));
+        return float2(sc, m);
+    }
+}
+
+inline float2 k4_scale_min(uint j, device const uint8_t* s) {
+    if (j < 4) {
+        return float2(float(s[j] & 63), float(s[j + 4] & 63));
+    } else {
+        float sc = float((s[j + 4] & 0x0F) | ((s[j - 4] >> 6) << 4));
+        float m = float((s[j + 4] >> 4) | ((s[j] >> 6) << 4));
+        return float2(sc, m);
+    }
+}
+
+kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
+                      device const float* x [[buffer(1)]],
+                      device float* y [[buffer(2)]],
+                      constant PackedGemvParams& p [[buffer(3)]],
+                      device const float* bias [[buffer(4)]],
+                      device const float* res [[buffer(5)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 256;
+    uint n_groups = n_blocks * 4;
+    device const block_q4_k* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q4_k* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint grp = lane; grp < n_groups; grp += 32) {
+        uint b = grp >> 2;
+        uint g = grp & 3;
+        device const block_q4_k& blk0 = r0_blocks[b];
+        device const block_q4_k& blk1 = has_row1 ? r1_blocks[b] : blk0;
+
+        float d0 = float(blk0.d);
+        float dmin0 = float(blk0.dmin);
+        float2 sm0_0 = k4_scale_min(2 * g, blk0.scales);
+        float2 sm1_0 = k4_scale_min(2 * g + 1, blk0.scales);
+        float d0_0 = d0 * sm0_0.x;
+        float min0_0 = dmin0 * sm0_0.y;
+        float d1_0 = d0 * sm1_0.x;
+        float min1_0 = dmin0 * sm1_0.y;
+
+        float d1 = float(blk1.d);
+        float dmin1 = float(blk1.dmin);
+        float2 sm0_1 = k4_scale_min(2 * g, blk1.scales);
+        float2 sm1_1 = k4_scale_min(2 * g + 1, blk1.scales);
+        float d0_1 = d1 * sm0_1.x;
+        float min0_1 = dmin1 * sm0_1.y;
+        float d1_1 = d1 * sm1_1.x;
+        float min1_1 = dmin1 * sm1_1.y;
+
+        device const float* xb_g = xb_base + (ulong)grp * 64;
+
+        float grp_acc0 = 0.0f;
+        float grp_acc1 = 0.0f;
+        for (uint l = 0; l < 32; ++l) {
+            float x_lo = xb_g[l];
+            float x_hi = xb_g[32 + l];
+
+            uint8_t q0 = blk0.qs[g * 32 + l];
+            float v0_0 = d0_0 * float(q0 & 0x0F) - min0_0;
+            float v1_0 = d1_0 * float(q0 >> 4) - min1_0;
+            grp_acc0 += v0_0 * x_lo + v1_0 * x_hi;
+
+            uint8_t q1 = blk1.qs[g * 32 + l];
+            float v0_1 = d0_1 * float(q1 & 0x0F) - min0_1;
+            float v1_1 = d1_1 * float(q1 >> 4) - min1_1;
+            grp_acc1 += v0_1 * x_lo + v1_1 * x_hi;
+        }
+        acc0 += grp_acc0;
+        if (has_row1) acc1 += grp_acc1;
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+struct block_q2_k {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    half d;
+    half dmin;
+};
+
+kernel void gemv_q2_k(device const block_q2_k* w [[buffer(0)]],
+                      device const float* x [[buffer(1)]],
+                      device float* y [[buffer(2)]],
+                      constant PackedGemvParams& p [[buffer(3)]],
+                      device const float* bias [[buffer(4)]],
+                      device const float* res [[buffer(5)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 256;
+    device const block_q2_k* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q2_k* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // Each thread in SIMDgroup processes a subset of the 256-element block across all blocks in the row
+    for (uint b = 0; b < n_blocks; ++b) {
+        block_q2_k blk0 = r0_blocks[b];
+        block_q2_k blk1 = has_row1 ? r1_blocks[b] : blk0;
+        device const float* xb = xb_base + (ulong)b * 256;
+
+        float d0 = float(blk0.d);
+        float min0 = float(blk0.dmin);
+        float d1 = float(blk1.d);
+        float min1 = float(blk1.dmin);
+
+        // 16 sub-blocks of 16 values = 256 values total.
+        // lane (0..31) splits across the 16 sub-blocks: sub = lane / 2 (0..15), half = lane % 2 (8 values each).
+        uint is = lane >> 1; // 0..15
+        uint half_idx = lane & 1; // 0 or 1
+
+        uint sc0 = blk0.scales[is];
+        float dl0 = d0 * float(sc0 & 0x0F);
+        float ml0 = min0 * float(sc0 >> 4);
+
+        uint sc1 = blk1.scales[is];
+        float dl1 = d1 * float(sc1 & 0x0F);
+        float ml1 = min1 * float(sc1 >> 4);
+
+        // n in 0..2, shift in [0, 2, 4, 6], half in 0..2
+        // is = n * 8 + (shift / 2) * 2 + half
+        uint n_part = is >> 3; // 0 or 1
+        uint shift = (is & 6); // 0, 2, 4, or 6
+        uint half_sub = is & 1; // 0 or 1
+
+        uint q_off = n_part * 32 + half_sub * 16 + half_idx * 8;
+        device const float* x_sub = xb + is * 16 + half_idx * 8;
+
+        float b_acc0 = 0.0f;
+        float b_acc1 = 0.0f;
+
+        #pragma unroll
+        for (uint l = 0; l < 8; ++l) {
+            float x_val = x_sub[l];
+            uint q0 = (uint(blk0.qs[q_off + l]) >> shift) & 3;
+            uint q1 = (uint(blk1.qs[q_off + l]) >> shift) & 3;
+            b_acc0 += (dl0 * float(q0) - ml0) * x_val;
+            b_acc1 += (dl1 * float(q1) - ml1) * x_val;
+        }
+
+        acc0 += b_acc0;
+        if (has_row1) {
+            acc1 += b_acc1;
+        }
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+constant const uint32_t iq3s_grid[512] = {
+    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+    0x01050b07, 0x01050d01, 0x01050d05, 0x01050f03, 0x01050f09, 0x01070107, 0x01070303, 0x0107030b,
+    0x01070501, 0x01070509, 0x01070707, 0x0107070f, 0x01070903, 0x0107090b, 0x01070b05, 0x01070d01,
+    0x01070d07, 0x01070f03, 0x01070f0b, 0x01090101, 0x01090105, 0x0109010b, 0x0109010f, 0x01090309,
+    0x01090505, 0x0109050b, 0x0109050f, 0x01090703, 0x0109070b, 0x01090901, 0x01090909, 0x01090b03,
+    0x01090b07, 0x01090b0f, 0x01090d05, 0x01090d0b, 0x01090f01, 0x01090f07, 0x010b0103, 0x010b0107,
+    0x010b0305, 0x010b030d, 0x010b0503, 0x010b0507, 0x010b050f, 0x010b0705, 0x010b0709, 0x010b0903,
+    0x010b0907, 0x010b090f, 0x010b0b05, 0x010b0b0b, 0x010b0d03, 0x010b0d09, 0x010b0f05, 0x010d0101,
+    0x010d0105, 0x010d0303, 0x010d030b, 0x010d0501, 0x010d0509, 0x010d0707, 0x010d0905, 0x010d090d,
+    0x010d0b03, 0x010d0b09, 0x010d0d01, 0x010d0d07, 0x010d0f03, 0x010f0103, 0x010f0109, 0x010f010f,
+    0x010f0305, 0x010f0503, 0x010f0509, 0x010f0701, 0x010f0707, 0x010f0905, 0x010f090b, 0x010f0b03,
+    0x010f0b09, 0x010f0d07, 0x010f0f01, 0x010f0f05, 0x03010101, 0x03010103, 0x03010105, 0x03010109,
+    0x03010301, 0x03010303, 0x0301030b, 0x03010501, 0x03010507, 0x0301050f, 0x03010703, 0x0301070b,
+    0x03010909, 0x03010d03, 0x03010d0b, 0x03010f05, 0x03030101, 0x03030103, 0x0303010b, 0x03030305,
+    0x0303030d, 0x03030503, 0x03030507, 0x0303050f, 0x03030705, 0x03030709, 0x03030903, 0x03030907,
+    0x0303090f, 0x03030b05, 0x03030b0b, 0x03030d03, 0x03030d09, 0x03030f05, 0x03050101, 0x03050107,
+    0x0305010f, 0x03050303, 0x03050307, 0x0305030f, 0x03050505, 0x03050509, 0x03050703, 0x03050707,
+    0x0305070f, 0x03050905, 0x0305090b, 0x03050b01, 0x03050b07, 0x03050d05, 0x03050f03, 0x03070103,
+    0x0307010b, 0x03070305, 0x03070309, 0x03070503, 0x03070507, 0x0307050f, 0x03070705, 0x0307070b,
+    0x03070901, 0x03070907, 0x0307090f, 0x03070b05, 0x03070b09, 0x03070d03, 0x03070f05, 0x03090109,
+    0x03090303, 0x03090307, 0x0309030f, 0x03090505, 0x0309050b, 0x03090701, 0x03090707, 0x0309070f,
+    0x03090905, 0x0309090b, 0x03090b03, 0x03090b07, 0x03090d05, 0x03090f03, 0x03090f09, 0x030b0105,
+    0x030b010d, 0x030b0305, 0x030b030b, 0x030b0501, 0x030b0507, 0x030b0705, 0x030b0709, 0x030b0903,
+    0x030b0907, 0x030b0b05, 0x030b0d01, 0x030b0d07, 0x030b0f05, 0x030d0103, 0x030d010b, 0x030d0303,
+    0x030d0309, 0x030d0505, 0x030d0703, 0x030d0905, 0x030d0b01, 0x030d0d03, 0x030f0105, 0x030f0305,
+    0x030f0503, 0x030f0705, 0x030f0903, 0x030f0b05, 0x05010101, 0x05010103, 0x0501010b, 0x05010301,
+    0x05010307, 0x0501030f, 0x05010503, 0x0501050b, 0x05010701, 0x05010709, 0x05010905, 0x0501090b,
+    0x0501090f, 0x05010b03, 0x05010b07, 0x05010d01, 0x05010d05, 0x05010f03, 0x05010f09, 0x05030101,
+    0x05030107, 0x0503010f, 0x05030303, 0x05030307, 0x0503030f, 0x05030505, 0x05030509, 0x05030703,
+    0x05030707, 0x0503070f, 0x05030905, 0x0503090b, 0x05030b01, 0x05030b07, 0x05030d05, 0x05030f03,
+    0x05050103, 0x0505010b, 0x05050305, 0x05050309, 0x05050503, 0x05050507, 0x0505050f, 0x05050705,
+    0x0505070b, 0x05050901, 0x05050907, 0x0505090f, 0x05050b05, 0x05050b09, 0x05050d03, 0x05050f05,
+    0x05070101, 0x05070109, 0x05070303, 0x05070307, 0x0507030f, 0x05070505, 0x0507050b, 0x05070701,
+    0x05070707, 0x0507070f, 0x05070905, 0x0507090b, 0x05070b03, 0x05070b07, 0x05070d05, 0x05070f03,
+    0x05070f09, 0x05090105, 0x0509010b, 0x0509010f, 0x05090305, 0x0509030b, 0x05090501, 0x05090507,
+    0x0509050f, 0x05090705, 0x0509070b, 0x05090903, 0x05090907, 0x05090b01, 0x05090b07, 0x05090d05,
+    0x05090f03, 0x050b0103, 0x050b0107, 0x050b010f, 0x050b0301, 0x050b0307, 0x050b0505, 0x050b0509,
+    0x050b0703, 0x050b0707, 0x050b0901, 0x050b0907, 0x050b0b05, 0x050b0d03, 0x050d0101, 0x050d0105,
+    0x050d0305, 0x050d0503, 0x050d0705, 0x050d0901, 0x050d0905, 0x050d0b03, 0x050f0103, 0x050f0303,
+    0x050f0505, 0x050f0703, 0x050f0903, 0x07010107, 0x07010303, 0x0701030b, 0x07010501, 0x07010509,
+    0x07010707, 0x0701070f, 0x07010903, 0x0701090b, 0x07010b05, 0x07010d01, 0x07010d07, 0x07010f03,
+    0x07010f0b, 0x07030103, 0x0703010b, 0x07030305, 0x07030309, 0x07030503, 0x07030507, 0x0703050f,
+    0x07030705, 0x0703070b, 0x07030901, 0x07030907, 0x0703090f, 0x07030b05, 0x07030b09, 0x07030d03,
+    0x07030f05, 0x07050101, 0x07050109, 0x07050303, 0x07050307, 0x0705030f, 0x07050505, 0x0705050b,
+    0x07050701, 0x07050707, 0x0705070f, 0x07050905, 0x0705090b, 0x07050b03, 0x07050b07, 0x07050d05,
+    0x07050f03, 0x07050f09, 0x07070107, 0x0707010f, 0x07070305, 0x0707030b, 0x07070501, 0x07070507,
+    0x0707050f, 0x07070705, 0x07070709, 0x07070903, 0x07070907, 0x07070b01, 0x07070b07, 0x07070d03,
+    0x07070f03, 0x07090103, 0x0709010b, 0x07090301, 0x07090307, 0x0709030f, 0x07090505, 0x07090509,
+    0x07090703, 0x07090707, 0x07090901, 0x07090907, 0x07090b03, 0x07090d03, 0x070b0105, 0x070b0109,
+    0x070b0305, 0x070b0501, 0x070b0507, 0x070b0701, 0x070b0707, 0x070b0903, 0x070d0101, 0x070d0107,
+    0x070d0303, 0x070d0505, 0x070d0701, 0x070f0103, 0x070f010b, 0x070f0305, 0x070f0503, 0x070f0701,
+    0x09010101, 0x09010105, 0x0901010b, 0x0901010f, 0x09010309, 0x09010505, 0x0901050b, 0x0901050f,
+    0x09010703, 0x0901070b, 0x09010901, 0x09010909, 0x09010b03, 0x09010b07, 0x09010b0f, 0x09010d05,
+    0x09010d0b, 0x09010f01, 0x09010f07, 0x09030109, 0x09030303, 0x09030307, 0x0903030f, 0x09030505,
+    0x0903050b, 0x09030701, 0x09030707, 0x0903070f, 0x09030905, 0x0903090b, 0x09030b03, 0x09030b07,
+    0x09030d05, 0x09030f03, 0x09030f09, 0x09050105, 0x0905010b, 0x0905010f, 0x09050305, 0x0905030b,
+    0x09050501, 0x09050507, 0x0905050f, 0x09050705, 0x0905070b, 0x09050903, 0x09050907, 0x09050b01,
+    0x09050b07, 0x09050d05, 0x09050f03, 0x09070103, 0x0907010b, 0x09070301, 0x09070307, 0x0907030f,
+};
+
+struct block_iq3_s {
+    half d;
+    uint8_t qs[64];
+    uint8_t qh[8];
+    uint8_t signs[32];
+    uint8_t scales[4];
+};
+
+kernel void gemv_iq3_s(device const block_iq3_s* w [[buffer(0)]],
+                       device const float* x [[buffer(1)]],
+                       device float* y [[buffer(2)]],
+                       constant PackedGemvParams& p [[buffer(3)]],
+                       device const float* bias [[buffer(4)]],
+                       device const float* res [[buffer(5)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg.x * 8 + sg;
+    uint batch = tg.y;
+    if (row >= p.rows || batch >= p.batch_size) return;
+
+    uint n_blocks = p.cols / 256;
+    uint n_sub_blocks = n_blocks * 8;
+    device const block_iq3_s* row_blocks = w + (ulong)row * n_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc = 0.0f;
+    for (uint sb = lane; sb < n_sub_blocks; sb += 32) {
+        uint b = sb >> 3;
+        uint ib = sb & 7;
+        device const block_iq3_s& blk = row_blocks[b];
+        float d = float(blk.d);
+        uint sc = (blk.scales[ib / 2] >> (4 * (ib % 2))) & 0xF;
+        float db = d * float(1 + 2 * sc);
+        uint h = uint(blk.qh[ib]);
+        device const float* xb_sub = xb_base + (ulong)sb * 32;
+
+        float sb_acc = 0.0f;
+        for (uint l = 0; l < 4; ++l) {
+            uint g1 = iq3s_grid[uint(blk.qs[8 * ib + 2 * l]) | ((h << (8 - 2 * l)) & 256)];
+            uint g2 = iq3s_grid[uint(blk.qs[8 * ib + 2 * l + 1]) | ((h << (7 - 2 * l)) & 256)];
+            uint8_t s = blk.signs[4 * ib + l];
+            device const float* x_el = xb_sub + l * 8;
+
+            for (uint j = 0; j < 4; ++j) {
+                float s0 = (s & (1 << j)) ? -1.0f : 1.0f;
+                float val0 = db * float(char((g1 >> (8 * j)) & 0xFF)) * s0;
+                sb_acc += val0 * x_el[j];
+
+                float s1 = (s & (1 << (j + 4))) ? -1.0f : 1.0f;
+                float val1 = db * float(char((g2 >> (8 * j)) & 0xFF)) * s1;
+                sb_acc += val1 * x_el[j + 4];
+            }
+        }
+        acc += sb_acc;
+    }
+
+    acc = simd_sum(acc);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) acc += bias[row];
+        if (p.epi == 2) {
+            acc += res[(ulong)batch * p.rows + row];
+        } else if (p.epi == 1) {
+            acc = gelu_erf(acc);
+        }
+        y[(ulong)batch * p.rows + row] = acc;
     }
 }
 
@@ -964,6 +1657,82 @@ struct AttnCachedParams {
     uint m;
 };
 
+inline void attn_cached_f32_impl(device const float* q,
+                                 device const float* kc,
+                                 device const float* vc,
+                                 device float* out,
+                                 constant AttnCachedParams& p,
+                                 uint2 tg,
+                                 uint sg,
+                                 uint lane,
+                                 uint nsg,
+                                 threadgroup float* tg_m,
+                                 threadgroup float* tg_l,
+                                 threadgroup float* tg_acc) {
+    const uint hd = p.head_dim;
+    const uint row = ATTN_MAX_PER_LANE * 32;
+    const uint head = tg.x;
+    const uint q_tok = tg.y;
+    if (head >= p.n_heads || q_tok >= p.m) return;
+
+    device const float* qh = q + ((ulong)q_tok * p.n_heads + head) * hd;
+    const uint kv_off = (head / p.group) * hd;
+    const uint cur_pos = p.start_pos + q_tok;
+    const uint len = cur_pos + 1;
+
+    float qr[ATTN_MAX_PER_LANE];
+    float acc[ATTN_MAX_PER_LANE];
+    for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+        uint d = lane + 32 * j;
+        qr[j] = d < hd ? qh[d] : 0.0f;
+        acc[j] = 0.0f;
+    }
+    float m = -FLT_MAX;
+    float l = 0.0f;
+    uint lo = (p.window > 0 && cur_pos >= p.window) ? (cur_pos - p.window) : 0;
+    for (uint t = lo + sg; t < len; t += nsg) {
+        device const float* k = kc + (ulong)t * p.stride + kv_off;
+        device const float* v = vc + (ulong)t * p.stride + kv_off;
+        float s = 0.0f;
+        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+            uint d = lane + 32 * j;
+            if (d < hd) s += qr[j] * k[d];
+        }
+        s = simd_sum(s) * p.scale;
+        if (p.softcap > 0.0f) {
+            s = tanh(s / p.softcap) * p.softcap;
+        }
+        float m_new = max(m, s);
+        float corr = exp(m - m_new);
+        float e = exp(s - m_new);
+        l = l * corr + e;
+        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+            uint d = lane + 32 * j;
+            if (d < hd) acc[j] = acc[j] * corr + e * v[d];
+        }
+        m = m_new;
+    }
+    if (lane == 0) {
+        tg_m[sg] = m;
+        tg_l[sg] = l;
+    }
+    for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+        uint d = lane + 32 * j;
+        if (d < hd) tg_acc[sg * row + d] = acc[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gm = -FLT_MAX;
+    for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[i]);
+    float gl = 0.0f;
+    for (uint i = 0; i < nsg; ++i) gl += tg_l[i] * exp(tg_m[i] - gm);
+    for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
+        float o = 0.0f;
+        for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
+    }
+}
+
 kernel void attn_cached_f32(device const float* q [[buffer(0)]],
                             device const float* kc [[buffer(1)]],
                             device const float* vc [[buffer(2)]],
@@ -973,6 +1742,51 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]],
                             uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tg_m[ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_MAX_SG];
+    threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
+    attn_cached_f32_impl(q, kc, vc, out, p, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+}
+
+kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
+                                  device const float* kc [[buffer(1)]],
+                                  device const float* vc [[buffer(2)]],
+                                  device float* out [[buffer(3)]],
+                                  constant AttnCachedParams& p [[buffer(4)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tg_m[ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_MAX_SG];
+    threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
+    attn_cached_f32_impl(q, kc, vc, out, p, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+}
+
+struct PagedAttnCachedParams {
+    uint n_heads;
+    uint head_dim;
+    uint stride;
+    uint group;
+    float scale;
+    uint window;
+    float softcap;
+    uint start_pos;
+    uint m;
+    uint tokens_per_block;
+    uint max_blocks_per_seq;
+};
+
+kernel void paged_attn_cached_f32(device const float* q [[buffer(0)]],
+                                  device const float* kc_pool [[buffer(1)]],
+                                  device const float* vc_pool [[buffer(2)]],
+                                  device const uint* block_table [[buffer(3)]],
+                                  device float* out [[buffer(4)]],
+                                  constant PagedAttnCachedParams& p [[buffer(5)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
@@ -998,8 +1812,11 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     float l = 0.0f;
     uint lo = (p.window > 0 && cur_pos >= p.window) ? (cur_pos - p.window) : 0;
     for (uint t = lo + sg; t < len; t += nsg) {
-        device const float* k = kc + (ulong)t * p.stride + kv_off;
-        device const float* v = vc + (ulong)t * p.stride + kv_off;
+        uint blk_id = block_table[(ulong)q_tok * p.max_blocks_per_seq + (t / p.tokens_per_block)];
+        uint blk_offset = t % p.tokens_per_block;
+        ulong kv_idx = ((ulong)blk_id * p.tokens_per_block + blk_offset) * p.stride + kv_off;
+        device const float* k = kc_pool + kv_idx;
+        device const float* v = vc_pool + kv_idx;
         float s = 0.0f;
         for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
             uint d = lane + 32 * j;
@@ -1110,8 +1927,11 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
                            device float* state [[buffer(5)]],
                            device float* out [[buffer(6)]],
                            constant DeltaRuleParams& p [[buffer(7)]],
-                           uint h [[thread_position_in_grid]]) {
-    if (h >= p.val_heads) return;
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint j = tg.x * 32 + lane;
+    uint h = tg.y;
+    if (h >= p.val_heads || j >= p.val_dim) return;
     uint kh = p.key_heads;
     uint kd = p.key_dim;
     uint vd = p.val_dim;
@@ -1140,21 +1960,19 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
         float q_scale = (1.0f / sqrt(float(kd))) / q_norm;
         float k_scale = 1.0f / k_norm;
 
-        for (uint j = 0; j < vd; ++j) {
-            float kv_j = 0.0f;
-            for (uint i = 0; i < kd; ++i) {
-                kv_j += ssm_state[i * vd + j] * (k_in[i] * k_scale);
-            }
-            float delta_j = b * (v_t[j] - decay * kv_j);
-            for (uint i = 0; i < kd; ++i) {
-                ssm_state[i * vd + j] = decay * ssm_state[i * vd + j] + (k_in[i] * k_scale) * delta_j;
-            }
-            float out_j = 0.0f;
-            for (uint i = 0; i < kd; ++i) {
-                out_j += ssm_state[i * vd + j] * (q_in[i] * q_scale);
-            }
-            out[((ulong)t * vh + h) * vd + j] = out_j;
+        float kv_j = 0.0f;
+        for (uint i = 0; i < kd; ++i) {
+            kv_j += ssm_state[i * vd + j] * (k_in[i] * k_scale);
         }
+        float delta_j = b * (v_t[j] - decay * kv_j);
+        for (uint i = 0; i < kd; ++i) {
+            ssm_state[i * vd + j] = decay * ssm_state[i * vd + j] + (k_in[i] * k_scale) * delta_j;
+        }
+        float out_j = 0.0f;
+        for (uint i = 0; i < kd; ++i) {
+            out_j += ssm_state[i * vd + j] * (q_in[i] * q_scale);
+        }
+        out[((ulong)t * vh + h) * vd + j] = out_j;
     }
 }
 
@@ -1264,4 +2082,101 @@ kernel void softcap_f32(device const float* x [[buffer(0)]],
     if (gid >= n) return;
     float v = x[gid];
     out[gid] = tanh(v / cap) * cap;
+}
+
+constant const float nvfp4_e2m1_lut[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+inline float e4m3_to_float(uchar x) {
+    uchar m = x & 0x7F;
+    if (m == 0x7F) return NAN;
+    float mag;
+    if (m < 8) {
+        mag = float(m) / 512.0f;
+    } else {
+        uint bits = (((uint(m >> 3) + 120u) << 23) | ((uint(m & 7) << 20)));
+        mag = as_type<float>(bits);
+    }
+    return (x & 0x80) ? -mag : mag;
+}
+
+kernel void gemv_nvfp4(device const uchar* wq [[buffer(0)]],
+                       device const float* x [[buffer(1)]],
+                       device float* y [[buffer(2)]],
+                       constant PackedGemvParams& p [[buffer(3)]],
+                       device const float* bias [[buffer(4)]],
+                       device const float* res [[buffer(5)]],
+                       device const uchar* scales_e4m3 [[buffer(6)]],
+                       constant float& global_scale [[buffer(7)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg.x * 8 + sg;
+    uint batch = tg.y;
+    if (row >= p.rows || batch >= p.batch_size) return;
+
+    uint n_blocks = p.cols / 16;
+    uint byte_stride = p.cols / 2;
+    device const uchar* row_bytes = wq + (ulong)row * byte_stride;
+    device const uchar* row_scales = scales_e4m3 + (ulong)row * n_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc = 0.0f;
+    for (uint blk = lane; blk < n_blocks; blk += 32) {
+        float s = e4m3_to_float(row_scales[blk]) * global_scale;
+        device const uchar* blk_bytes = row_bytes + blk * 8;
+        device const float* xb = xb_base + blk * 16;
+
+        float b_acc = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            uchar byte_val = blk_bytes[i];
+            float v0 = nvfp4_e2m1_lut[byte_val & 0x0F] * s;
+            float v1 = nvfp4_e2m1_lut[byte_val >> 4] * s;
+            b_acc += v0 * xb[2 * i] + v1 * xb[2 * i + 1];
+        }
+        acc += b_acc;
+    }
+
+    acc = simd_sum(acc);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) acc += bias[row];
+        if (p.epi == 2) {
+            acc += res[(ulong)batch * p.rows + row];
+        } else if (p.epi == 1) {
+            acc = gelu_erf(acc);
+        }
+        y[(ulong)batch * p.rows + row] = acc;
+    }
+}
+
+kernel void gemv_jesse_lut(
+    device const char* lut_tables [[buffer(0)]],
+    device const float* hash_planes [[buffer(1)]],
+    device const float* x [[buffer(2)]],
+    device float* y [[buffer(3)]],
+    constant uint& in_features [[buffer(4)]],
+    constant uint& out_features [[buffer(5)]],
+    constant uint& address_bits [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= out_features) return;
+    uint num_luts = (in_features + address_bits - 1) / address_bits;
+    uint lut_size = 1u << address_bits;
+    ulong lut_out_offset = (ulong)gid * num_luts * lut_size;
+
+    int accum = 0;
+    for (uint lut_idx = 0; lut_idx < num_luts; ++lut_idx) {
+        uint addr = 0;
+        for (uint b = 0; b < address_bits; ++b) {
+            uint feat_idx = (lut_idx * address_bits + b) % in_features;
+            float thresh = hash_planes[lut_idx * address_bits + b];
+            if (x[feat_idx] > thresh) {
+                addr |= (1u << b);
+            }
+        }
+        accum += (int)lut_tables[lut_out_offset + (ulong)lut_idx * lut_size + addr];
+    }
+    y[gid] = float(accum);
 }

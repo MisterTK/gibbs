@@ -62,10 +62,8 @@ pub fn f32_to_f16(f: f32) -> u16 {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use gpu::{
-    commit_and_wait, dispatch_1d, new_shared_buffer, set_bytes, system_device, AttnParams, Gpu,
-    GpuLinear, GpuWeightFormat, Uploaded, SHARED, TG,
-};
+#[allow(unused_imports)]
+pub(crate) use gpu::{commit_and_wait, new_shared_buffer, set_bytes, system_device, SHARED, TG};
 #[cfg(target_os = "macos")]
 pub use gpu::{
     system_device_name, system_has_unified_memory, MetalBackend, MetalGraphLm, MetalKvCache,
@@ -330,6 +328,7 @@ mod gpu {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[allow(dead_code)]
     pub enum GpuWeightFormat {
         F32,
         BF16,
@@ -386,6 +385,7 @@ mod gpu {
     }
 
     /// Device, queue, and the compiled decode pipelines.
+    #[allow(dead_code)]
     pub struct Gpu {
         pub device: Device,
         pub queue: CommandQueue,
@@ -413,6 +413,7 @@ mod gpu {
         pub dummy: Buffer,
     }
 
+    #[allow(dead_code)]
     impl Gpu {
         pub fn new() -> Result<Self, String> {
             let device = system_device()?;

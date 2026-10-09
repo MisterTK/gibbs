@@ -33,6 +33,7 @@ use std::time::Instant;
 /// Returns whether the Metal executor implements `op` for the given data type.
 /// Formats supported for graph weights uploaded to Metal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum WeightFormat {
     F32,
     U32,
@@ -40,6 +41,13 @@ pub enum WeightFormat {
     Q8_0,
     BF16,
     F16,
+    IQ2_M,
+    IQ4_XS,
+    Q4_K,
+    Q2_K,
+    IQ3_S,
+    NvFp4,
+    JesseLUT,
 }
 
 /// Returns whether the Metal executor implements `op` for the given data type.
@@ -52,6 +60,15 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
                 | DType::BF16
                 | DType::Quant(QuantFormat::GGUF_Q4_0)
                 | DType::Quant(QuantFormat::GGUF_Q8_0)
+                | DType::Quant(QuantFormat::GGUF_IQ4_XS)
+                | DType::Quant(QuantFormat::GGUF_IQ2_M)
+                | DType::Quant(QuantFormat::GGUF_IQ2_S)
+                | DType::Quant(QuantFormat::GGUF_Q4_K_M)
+                | DType::Quant(QuantFormat::GGUF_Q2_K)
+                | DType::Quant(QuantFormat::GGUF_IQ3_S)
+                | DType::Quant(QuantFormat::NVFP4_E2M1)
+                | DType::Quant(QuantFormat::NVFP4)
+                | DType::Quant(QuantFormat::WeightlessJesseLUT)
         ),
         Op::Embedding => matches!(dtype, DType::F32 | DType::U32),
         Op::LayerNorm { .. }
@@ -60,6 +77,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::GeGlu
         | Op::Attention { .. }
         | Op::CachedAttention { .. }
+        | Op::PagedCachedAttention { .. }
         | Op::Rope { .. }
         | Op::Slice { .. }
         | Op::CausalConv1dCached { .. }
@@ -70,10 +88,30 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::TopKSoftmax { .. }
         | Op::MeanPool
         | Op::L2Normalize => dtype == DType::F32,
-        Op::Unary {
-            kind: crate::graph::UnaryKind::SoftCap(_),
-        } => dtype == DType::F32,
+        Op::Silu => dtype == DType::F32,
+        Op::Unary { kind } => match kind {
+            crate::graph::UnaryKind::SoftCap(_)
+            | crate::graph::UnaryKind::Sigmoid
+            | crate::graph::UnaryKind::Softplus => dtype == DType::F32,
+            _ => false,
+        },
         Op::Gelu { tanh } => !*tanh && dtype == DType::F32,
+        Op::Megakernel(_) => matches!(
+            dtype,
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::Quant(QuantFormat::GGUF_Q4_0)
+                | DType::Quant(QuantFormat::GGUF_Q8_0)
+                | DType::Quant(QuantFormat::GGUF_IQ4_XS)
+                | DType::Quant(QuantFormat::GGUF_IQ2_M)
+                | DType::Quant(QuantFormat::GGUF_IQ2_S)
+                | DType::Quant(QuantFormat::GGUF_Q4_K_M)
+                | DType::Quant(QuantFormat::GGUF_IQ3_S)
+                | DType::Quant(QuantFormat::NVFP4_E2M1)
+                | DType::Quant(QuantFormat::NVFP4)
+                | DType::Quant(QuantFormat::WeightlessJesseLUT)
+        ),
         _ => false,
     }
 }
@@ -96,7 +134,7 @@ const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
     [256, 384, 1536],
 ];
 const ATTN_MAX_HEAD_DIM: usize = 256;
-const BASE_KERNELS: [&str; 45] = [
+const BASE_KERNELS: [&str; 58] = [
     "embedding_f32",
     "add_f32",
     "gelu_erf_f32",
@@ -113,6 +151,7 @@ const BASE_KERNELS: [&str; 45] = [
     "gemm_rows_gelu",
     "gemm_rows_residual",
     "rmsnorm_f32",
+    "rmsnorm_residual_f32",
     "graph_rope_f32",
     "swiglu_f32",
     "geglu_f32",
@@ -121,6 +160,11 @@ const BASE_KERNELS: [&str; 45] = [
     "gemv_bf16",
     "gemv_f16",
     "gemv_tq2_0",
+    "gemv_iq4_xs",
+    "gemv_iq2_m",
+    "gemv_q4_k",
+    "gemv_q2_k",
+    "gemv_iq3_s",
     "gemm_batched_bf16_none",
     "gemm_batched_bf16_gelu",
     "gemm_batched_bf16_residual",
@@ -137,11 +181,18 @@ const BASE_KERNELS: [&str; 45] = [
     "rope_general_f32",
     "kv_append_batched",
     "attn_cached_f32",
+    "flash_attn_cached_f32",
+    "paged_attn_cached_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
     "topk_softmax_f32",
     "mul_f32",
     "softcap_f32",
+    "silu_f32",
+    "sigmoid_f32",
+    "softplus_f32",
+    "gemv_nvfp4",
+    "gemv_jesse_lut",
 ];
 const MPP_KERNELS: [&str; 3] = ["gemm_mpp_none", "gemm_mpp_gelu", "gemm_mpp_residual"];
 
@@ -176,6 +227,23 @@ pub enum Epi {
     None,
     Gelu,
     Residual,
+    Silu,
+    SwiGlu,
+    GeGlu,
+}
+
+impl Epi {
+    #[inline]
+    pub fn as_u32(self) -> u32 {
+        match self {
+            Epi::None => 0,
+            Epi::Gelu => 1,
+            Epi::Residual => 2,
+            Epi::Silu => 3,
+            Epi::SwiGlu => 4,
+            Epi::GeGlu => 5,
+        }
+    }
 }
 
 /// Measured once per (GPU, OS build, kernel source) and cached as JSON under `<cache>/host/`.
@@ -432,6 +500,118 @@ impl Runtime {
         Ok(gbps)
     }
 
+    /// Benchmarks hardware streaming read roofline and tiled GEMV throughput across Q4_0, Q8_0, BF16.
+    /// Returns (roofline_gbps, q4_gbps, q8_gbps, bf16_gbps).
+    pub fn benchmark_gemv_saturation(&self) -> Result<(f64, f64, f64, f64), String> {
+        let roofline_gbps = self.benchmark_memory_bandwidth().unwrap_or(298.0);
+
+        #[repr(C)]
+        struct PackedGemvParams(u32, u32, u32, u32, u32);
+
+        // 1. Q4_0: rows = 16384, cols = 8192 (~75.5 MB)
+        let q4_gbps = {
+            let (rows, cols) = (16384usize, 8192usize);
+            let n_blocks = rows * (cols / 32);
+            let bytes = n_blocks * 18;
+            let w_buf = self
+                .device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            let x_buf = self
+                .device
+                .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = self
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let pso = self.pso("gemv_q4_0")?;
+            let p = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
+
+            let us = self.timed(20, |enc| {
+                enc.set_compute_pipeline_state(pso);
+                enc.set_buffer(0, Some(&w_buf), 0);
+                enc.set_buffer(1, Some(&x_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                set_bytes(enc, 3, &p);
+                enc.set_buffer(4, Some(&y_buf), 0);
+                enc.set_buffer(5, Some(&y_buf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((rows as u64).div_ceil(16), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                Ok(())
+            })?;
+            (bytes as f64 / 1e9) / (us * 1e-6)
+        };
+
+        // 2. Q8_0: rows = 8192, cols = 8192 (~71.3 MB)
+        let q8_gbps = {
+            let (rows, cols) = (8192usize, 8192usize);
+            let n_blocks = rows * (cols / 32);
+            let bytes = n_blocks * 34;
+            let w_buf = self
+                .device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            let x_buf = self
+                .device
+                .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = self
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let pso = self.pso("gemv_q8_0")?;
+            let p = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
+
+            let us = self.timed(20, |enc| {
+                enc.set_compute_pipeline_state(pso);
+                enc.set_buffer(0, Some(&w_buf), 0);
+                enc.set_buffer(1, Some(&x_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                set_bytes(enc, 3, &p);
+                enc.set_buffer(4, Some(&y_buf), 0);
+                enc.set_buffer(5, Some(&y_buf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((rows as u64).div_ceil(16), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                Ok(())
+            })?;
+            (bytes as f64 / 1e9) / (us * 1e-6)
+        };
+
+        // 3. BF16: rows = 8192, cols = 8192 (~134.2 MB)
+        let bf16_gbps = {
+            let (rows, cols) = (8192usize, 8192usize);
+            let bytes = rows * cols * 2;
+            let w_buf = self
+                .device
+                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+            let x_buf = self
+                .device
+                .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_buf = self
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let pso = self.pso("gemv_bf16")?;
+            let p = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
+
+            let us = self.timed(20, |enc| {
+                enc.set_compute_pipeline_state(pso);
+                enc.set_buffer(0, Some(&w_buf), 0);
+                enc.set_buffer(1, Some(&x_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                set_bytes(enc, 3, &p);
+                enc.set_buffer(4, Some(&y_buf), 0);
+                enc.set_buffer(5, Some(&y_buf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((rows as u64).div_ceil(16), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                Ok(())
+            })?;
+            (bytes as f64 / 1e9) / (us * 1e-6)
+        };
+
+        Ok((roofline_gbps, q4_gbps, q8_gbps, bf16_gbps))
+    }
+
     /// Host profile micro-benchmarks: MPP correctness vs `nn::linear`, dispatch cost, GEMM timings.
     fn measure(&self, msl4: Result<(), String>) -> Result<HostProfile, String> {
         let upload = |v: &[f32]| -> Buffer {
@@ -582,6 +762,7 @@ impl Runtime {
             Epi::None => "none",
             Epi::Gelu => "gelu",
             Epi::Residual => "residual",
+            _ => "none",
         };
         enc.set_compute_pipeline_state(self.pso(&format!("{prefix}_{suffix}"))?);
         // Absent bias/residual slots are bound to `out` and never read (has_bias = 0, no residual epilogue).
@@ -604,17 +785,154 @@ impl Runtime {
 /// Graph weights on the GPU plus a reusable activation arena; runs are serialized.
 pub struct Session {
     rt: Arc<Runtime>,
-    /// Buffer, element count, and weight storage format.
-    weights: HashMap<String, (Buffer, usize, WeightFormat)>,
+    /// Buffer, byte offset, element count, and weight storage format.
+    weights: HashMap<String, (Buffer, usize, usize, WeightFormat)>,
     arena: Mutex<Option<Buffer>>,
     state_buffers: Mutex<HashMap<String, Arc<Buffer>>>,
+    mlp_scratch: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
+    nvfp4_aux: HashMap<String, (Buffer, f32)>,
+    jesse_aux: HashMap<String, (Buffer, usize)>,
 }
 impl Session {
-    /// Uploads every weight once. Preserves packed formats (Q4_0, Q8_0, BF16, F16) without f32 expansion.
+    /// Uploads every weight once. Preserves packed formats without f32 expansion.
     pub fn new(rt: Arc<Runtime>, weights: &Weights) -> Result<Self, String> {
+        Self::new_for_graph(rt, weights, None)
+    }
+
+    /// Uploads only weights referenced by `graph` (or all if `graph` is None).
+    pub fn new_for_graph(
+        rt: Arc<Runtime>,
+        weights: &Weights,
+        graph: Option<&Graph>,
+    ) -> Result<Self, String> {
+        let active_names: Option<std::collections::HashSet<&str>> = graph.map(|g| {
+            g.values
+                .iter()
+                .filter(|v| v.kind == ValueKind::Weight)
+                .map(|v| v.name.as_str())
+                .collect()
+        });
+        let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
         let mut bufs = HashMap::new();
+        let mut nvfp4_aux = HashMap::new();
+        let mut jesse_aux = HashMap::new();
         for (name, t) in weights.iter() {
+            if let Some(ref active) = active_names {
+                if !active.contains(name) {
+                    continue;
+                }
+            }
+            if let Tensor::Quantized(q) = t {
+                if let crate::model::layers::QuantizedWeight::Nvfp4(tensor) = q.as_ref() {
+                    let rows = tensor.rows;
+                    let cols = tensor.cols;
+                    let n_blocks = rows * (cols / 16);
+                    let mut wq = Vec::with_capacity(n_blocks * 8);
+                    let mut max_scale = 0.0f32;
+                    for blk in &tensor.blocks {
+                        if blk.scale > max_scale {
+                            max_scale = blk.scale;
+                        }
+                    }
+                    let global_scale = if max_scale > 0.0 {
+                        max_scale / 448.0
+                    } else {
+                        1.0
+                    };
+                    let inv_global = 1.0 / global_scale;
+                    let mut scales_e4m3 = Vec::with_capacity(n_blocks);
+                    for blk in &tensor.blocks {
+                        wq.extend_from_slice(&blk.packed_nibbles);
+                        scales_e4m3.push(crate::model::f32_to_f8_e4m3(blk.scale * inv_global));
+                    }
+                    let scales_buf = rt.device.new_buffer_with_data(
+                        scales_e4m3.as_ptr() as *const c_void,
+                        scales_e4m3.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    nvfp4_aux.insert(name.to_string(), (scales_buf, global_scale));
+                    let main_buf = rt.device.new_buffer_with_data(
+                        wq.as_ptr() as *const c_void,
+                        wq.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    bufs.insert(
+                        name.to_string(),
+                        (main_buf, 0, rows * cols, WeightFormat::NvFp4),
+                    );
+                    continue;
+                } else if let crate::model::layers::QuantizedWeight::WeightlessJesse(layer) =
+                    q.as_ref()
+                {
+                    let hash_buf = rt.device.new_buffer_with_data(
+                        layer.hash_planes.as_ptr() as *const c_void,
+                        (layer.hash_planes.len() * 4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    jesse_aux.insert(name.to_string(), (hash_buf, layer.address_bits));
+                    let main_buf = rt.device.new_buffer_with_data(
+                        layer.lut_tables.as_ptr() as *const c_void,
+                        layer.lut_tables.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    bufs.insert(
+                        name.to_string(),
+                        (
+                            main_buf,
+                            0,
+                            layer.out_features * layer.in_features,
+                            WeightFormat::JesseLUT,
+                        ),
+                    );
+                    continue;
+                }
+            }
+            if let Some(ref active) = active_names {
+                if !active.contains(name) {
+                    continue;
+                }
+            }
+            if let Tensor::Mat(m) = t {
+                if let Some(p) = m.packed() {
+                    let map_ptr = p.map.as_ptr();
+                    let map_len = p.map.len();
+                    let num_elements = m.rows * m.cols;
+                    let fmt = match p.format {
+                        QuantFormat::GGUF_Q4_0 => Some(WeightFormat::Q4_0),
+                        QuantFormat::GGUF_Q8_0 => Some(WeightFormat::Q8_0),
+                        QuantFormat::GGUF_IQ4_XS => Some(WeightFormat::IQ4_XS),
+                        QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => {
+                            Some(WeightFormat::IQ2_M)
+                        }
+                        QuantFormat::GGUF_Q4_K_M => Some(WeightFormat::Q4_K),
+                        QuantFormat::GGUF_IQ3_S => Some(WeightFormat::IQ3_S),
+                        QuantFormat::BF16 => Some(WeightFormat::BF16),
+                        QuantFormat::FP16 => Some(WeightFormat::F16),
+                        _ => None,
+                    };
+                    if let Some(fmt) = fmt {
+                        if !map_buffers.contains_key(&map_ptr) {
+                            let buf = rt.device.new_buffer_with_bytes_no_copy(
+                                map_ptr as *const c_void,
+                                map_len as u64,
+                                MTLResourceOptions::StorageModeShared,
+                                None,
+                            );
+                            if !buf.contents().is_null() {
+                                map_buffers.insert(map_ptr, buf);
+                            }
+                        }
+                        if let Some(map_buf) = map_buffers.get(&map_ptr) {
+                            bufs.insert(
+                                name.to_string(),
+                                (map_buf.clone(), p.off, num_elements, fmt),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
             let (_f32_buf, ptr, num_elements, byte_len, fmt) = match t {
                 Tensor::F32(v) => (
                     None,
@@ -693,6 +1011,58 @@ impl Session {
                         data.len(),
                         WeightFormat::F16,
                     ),
+                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
+                        data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_IQ4_XS => (
+                        None,
+                        data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        data.len(),
+                        WeightFormat::IQ4_XS,
+                    ),
+                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
+                        data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_IQ2_M
+                        || *format == QuantFormat::GGUF_IQ2_S =>
+                    {
+                        (
+                            None,
+                            data.as_ptr() as *const c_void,
+                            in_features * out_features,
+                            data.len(),
+                            WeightFormat::IQ2_M,
+                        )
+                    }
+                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
+                        data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_Q4_K_M => (
+                        None,
+                        data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        data.len(),
+                        WeightFormat::Q4_K,
+                    ),
+                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
+                        data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_IQ3_S => (
+                        None,
+                        data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        data.len(),
+                        WeightFormat::IQ3_S,
+                    ),
                     crate::model::layers::QuantizedWeight::GgufQuantized {
                         raw_data,
                         format,
@@ -716,6 +1086,70 @@ impl Session {
                         in_features * out_features,
                         raw_data.len(),
                         WeightFormat::Q8_0,
+                    ),
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_IQ4_XS => (
+                        None,
+                        raw_data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        raw_data.len(),
+                        WeightFormat::IQ4_XS,
+                    ),
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_IQ2_M
+                        || *format == QuantFormat::GGUF_IQ2_S =>
+                    {
+                        (
+                            None,
+                            raw_data.as_ptr() as *const c_void,
+                            in_features * out_features,
+                            raw_data.len(),
+                            WeightFormat::IQ2_M,
+                        )
+                    }
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_Q4_K_M => (
+                        None,
+                        raw_data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        raw_data.len(),
+                        WeightFormat::Q4_K,
+                    ),
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_Q2_K => (
+                        None,
+                        raw_data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        raw_data.len(),
+                        WeightFormat::Q2_K,
+                    ),
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if *format == QuantFormat::GGUF_IQ3_S => (
+                        None,
+                        raw_data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        raw_data.len(),
+                        WeightFormat::IQ3_S,
                     ),
                     _ => {
                         let v = t.to_f32();
@@ -757,6 +1191,41 @@ impl Session {
                                 num_elements * 2,
                                 WeightFormat::F16,
                             ),
+                            QuantFormat::GGUF_IQ4_XS => (
+                                None,
+                                bytes.as_ptr() as *const c_void,
+                                num_elements,
+                                (num_elements / 256) * 136,
+                                WeightFormat::IQ4_XS,
+                            ),
+                            QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => (
+                                None,
+                                bytes.as_ptr() as *const c_void,
+                                num_elements,
+                                (num_elements / 256) * 82,
+                                WeightFormat::IQ2_M,
+                            ),
+                            QuantFormat::GGUF_Q4_K_M => (
+                                None,
+                                bytes.as_ptr() as *const c_void,
+                                num_elements,
+                                (num_elements / 256) * 144,
+                                WeightFormat::Q4_K,
+                            ),
+                            QuantFormat::GGUF_Q2_K => (
+                                None,
+                                bytes.as_ptr() as *const c_void,
+                                num_elements,
+                                (num_elements / 256) * 84,
+                                WeightFormat::Q2_K,
+                            ),
+                            QuantFormat::GGUF_IQ3_S => (
+                                None,
+                                bytes.as_ptr() as *const c_void,
+                                num_elements,
+                                (num_elements / 256) * 110,
+                                WeightFormat::IQ3_S,
+                            ),
                             _ => {
                                 let v = m.to_f32();
                                 let ptr = v.as_ptr() as *const c_void;
@@ -765,10 +1234,10 @@ impl Session {
                             }
                         }
                     } else {
-                        let v = m.to_f32();
-                        let ptr = v.as_ptr() as *const c_void;
-                        let len = v.len();
-                        (Some(v), ptr, len, len * 4, WeightFormat::F32)
+                        let data = m.data();
+                        let ptr = data.as_ptr() as *const c_void;
+                        let len = data.len();
+                        (None, ptr, len, len * 2, WeightFormat::BF16)
                     }
                 }
             };
@@ -786,17 +1255,19 @@ impl Session {
                     "Metal could not allocate weight '{name}' ({num_elements} elements, {byte_len} bytes)"
                 ));
             }
-            bufs.insert(name.to_string(), (buf, num_elements, fmt));
+            bufs.insert(name.to_string(), (buf, 0, num_elements, fmt));
         }
         Ok(Self {
             rt,
             weights: bufs,
             arena: Mutex::new(None),
             state_buffers: Mutex::new(HashMap::new()),
+            mlp_scratch: Mutex::new(None),
             gemm: None,
+            nvfp4_aux,
+            jesse_aux,
         })
     }
-
     /// Uses `kind` for every Linear instead of the host profile's choice.
     pub fn force_gemm(&mut self, kind: GemmKernel) -> Result<(), String> {
         self.rt.pso(&format!("{}_none", kind.spec(1, 1).0))?;
@@ -815,7 +1286,7 @@ impl Session {
             for &v in &s.reads {
                 let val = graph.value(v);
                 if val.kind == ValueKind::Weight {
-                    let (_, len, fmt) = self
+                    let (_, _, len, fmt) = self
                         .weights
                         .get(&val.name)
                         .ok_or_else(|| format!("missing weight '{}'", val.name))?;
@@ -826,6 +1297,15 @@ impl Session {
                         DType::F16 => WeightFormat::F16,
                         DType::Quant(QuantFormat::GGUF_Q4_0) => WeightFormat::Q4_0,
                         DType::Quant(QuantFormat::GGUF_Q8_0) => WeightFormat::Q8_0,
+                        DType::Quant(QuantFormat::GGUF_IQ4_XS) => WeightFormat::IQ4_XS,
+                        DType::Quant(QuantFormat::GGUF_IQ2_M)
+                        | DType::Quant(QuantFormat::GGUF_IQ2_S) => WeightFormat::IQ2_M,
+                        DType::Quant(QuantFormat::GGUF_Q4_K_M) => WeightFormat::Q4_K,
+                        DType::Quant(QuantFormat::GGUF_Q2_K) => WeightFormat::Q2_K,
+                        DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
+                        DType::Quant(QuantFormat::NVFP4_E2M1)
+                        | DType::Quant(QuantFormat::NVFP4) => WeightFormat::NvFp4,
+                        DType::Quant(QuantFormat::WeightlessJesseLUT) => WeightFormat::JesseLUT,
                         _ => WeightFormat::F32,
                     };
                     if *len != numel(graph, v)? || *fmt != expected_fmt {
@@ -838,11 +1318,28 @@ impl Session {
             }
         }
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
+        let mut arena = self.arena.lock();
+        if arena
+            .as_ref()
+            .is_none_or(|b| (b.length() as usize) < arena_size)
+        {
+            *arena = Some(new_shared_buffer(&self.rt.device, arena_size)?);
+        }
+        let is_decode = graph
+            .inputs
+            .iter()
+            .all(|&v| graph.value(v).shape.first().copied().unwrap_or(1) <= 1);
         Ok(PreparedPlan {
             steps,
             offsets,
             arena_size,
+            is_decode,
         })
+    }
+
+    /// Returns the raw pointer to the currently allocated arena buffer contents, if allocated.
+    pub fn arena_buffer_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        self.arena.lock().as_ref().map(|b| b.contents())
     }
 
     /// Runs `graph` with `inputs` bound positionally to `graph.inputs`; returns `graph.outputs`.
@@ -894,7 +1391,6 @@ impl Session {
         }
         let steps = &plan.steps;
         let offsets = &plan.offsets;
-        let size = plan.arena_size;
         for s in steps {
             if let Step::Embedding { ids, rows, .. } = s.op {
                 let pos = graph.inputs.iter().position(|&i| i == ids).ok_or_else(|| {
@@ -927,17 +1423,6 @@ impl Session {
                                         buf.contents() as *mut f32,
                                         copy_len,
                                     );
-                                    if n > copy_len {
-                                        std::ptr::write_bytes(
-                                            (buf.contents() as *mut f32).add(copy_len),
-                                            0,
-                                            (n - copy_len) * 4,
-                                        );
-                                    }
-                                }
-                            } else {
-                                unsafe {
-                                    std::ptr::write_bytes(buf.contents() as *mut u8, 0, n * 4);
                                 }
                             }
                             st.metal_buffers.insert(name.clone(), (Arc::new(buf), n));
@@ -954,9 +1439,6 @@ impl Session {
                         let n = numel(graph, v)?;
                         if !sbufs.contains_key(name) {
                             let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
-                            unsafe {
-                                std::ptr::write_bytes(buf.contents() as *mut u8, 0, n * 4);
-                            }
                             sbufs.insert(name.clone(), Arc::new(buf));
                         }
                         state_map.insert(name.clone(), sbufs[name].clone());
@@ -965,6 +1447,7 @@ impl Session {
             }
         }
 
+        let size = plan.arena_size;
         let mut arena = self.arena.lock();
         if arena.as_ref().is_none_or(|b| (b.length() as usize) < size) {
             *arena = Some(new_shared_buffer(&self.rt.device, size)?);
@@ -991,13 +1474,17 @@ impl Session {
             } else if let Some(&off) = offsets.get(&v) {
                 (arena, off)
             } else {
-                (&self.weights[&graph.value(v).name].0, 0)
+                let w = &self.weights[&graph.value(v).name];
+                (&w.0, w.1)
             }
         };
         metal::objc::rc::autoreleasepool(|| {
             let cb = self.rt.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             let mut err = None;
+            let encode_start = std::time::Instant::now();
+            // ponytail: CPU command encoding measured at ~160 µs vs ~29.5 ms GPU execution (0.54% overhead);
+            // retain single command buffer pipeline, upgrade to IndirectCommandBuffer if host encoding dominates.
             for s in steps {
                 if let Err(e) = self.encode(enc, s, &loc) {
                     err = Some(e);
@@ -1005,10 +1492,17 @@ impl Session {
                 }
             }
             enc.end_encoding();
+            let encode_dur = encode_start.elapsed();
             if let Some(e) = err {
                 return Err(e);
             }
-            commit_and_wait(cb)
+            commit_and_wait(cb)?;
+            if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
+                let enc_us = encode_dur.as_micros();
+                let gpu_ms = gpu_seconds(cb) * 1e3;
+                eprintln!("[ICB profile] CPU encode: {enc_us} µs, GPU time: {gpu_ms:.2} ms");
+            }
+            Ok(())
         })?;
 
         graph
@@ -1027,6 +1521,134 @@ impl Session {
                 Ok(Tensor::F32(s.to_vec()))
             })
             .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_or_gemm(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: (&Buffer, usize),
+        w_loc: (&Buffer, usize),
+        graph_val_name: &str,
+        res: Option<(&Buffer, usize)>,
+        out: (&Buffer, usize),
+        rows: usize,
+        cols: usize,
+        epi: Epi,
+    ) -> Result<(), String> {
+        let format = self
+            .weights
+            .get(graph_val_name)
+            .map(|w| w.3)
+            .unwrap_or(WeightFormat::F32);
+        match format {
+            WeightFormat::F32 => {
+                let kind = self
+                    .gemm
+                    .unwrap_or_else(|| self.rt.profile.gemm_for([1, rows, cols]));
+                self.rt
+                    .encode_gemm(enc, kind, epi, x, w_loc, None, res, out, [1, rows, cols])
+            }
+            WeightFormat::BF16
+            | WeightFormat::F16
+            | WeightFormat::Q8_0
+            | WeightFormat::Q4_0
+            | WeightFormat::IQ4_XS
+            | WeightFormat::IQ2_M
+            | WeightFormat::Q4_K
+            | WeightFormat::Q2_K
+            | WeightFormat::IQ3_S
+            | WeightFormat::NvFp4
+            | WeightFormat::JesseLUT => {
+                if format == WeightFormat::NvFp4 {
+                    let (scales_buf, global_scale) = self
+                        .nvfp4_aux
+                        .get(graph_val_name)
+                        .ok_or_else(|| format!("missing NVFP4 scales for '{graph_val_name}'"))?;
+                    enc.set_compute_pipeline_state(self.rt.pso("gemv_nvfp4")?);
+                    enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
+                    enc.set_buffer(1, Some(x.0), x.1 as u64);
+                    enc.set_buffer(2, Some(out.0), out.1 as u64);
+                    #[repr(C)]
+                    struct PackedGemvParams(u32, u32, u32, u32, u32);
+                    let epi_u32 = epi.as_u32();
+                    let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi_u32);
+                    set_bytes(enc, 3, &p);
+                    enc.set_buffer(4, Some(out.0), out.1 as u64);
+                    if let Some(r) = res {
+                        enc.set_buffer(5, Some(r.0), r.1 as u64);
+                    } else {
+                        enc.set_buffer(5, Some(out.0), out.1 as u64);
+                    }
+                    enc.set_buffer(6, Some(scales_buf), 0);
+                    set_bytes(enc, 7, global_scale);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((rows as u64).div_ceil(8), 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    return Ok(());
+                }
+                if format == WeightFormat::JesseLUT {
+                    let (hash_buf, address_bits) =
+                        self.jesse_aux.get(graph_val_name).ok_or_else(|| {
+                            format!("missing JesseLUT hash planes for '{graph_val_name}'")
+                        })?;
+                    enc.set_compute_pipeline_state(self.rt.pso("gemv_jesse_lut")?);
+                    enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
+                    enc.set_buffer(1, Some(hash_buf), 0);
+                    enc.set_buffer(2, Some(x.0), x.1 as u64);
+                    enc.set_buffer(3, Some(out.0), out.1 as u64);
+                    set_bytes(enc, 4, &u32_of(cols)?);
+                    set_bytes(enc, 5, &u32_of(rows)?);
+                    set_bytes(enc, 6, &(*address_bits as u32));
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((rows as u64).div_ceil(32), 1, 1),
+                        MTLSize::new(32, 1, 1),
+                    );
+                    return Ok(());
+                }
+                let kernel_name = match format {
+                    WeightFormat::Q4_0 => "gemv_q4_0",
+                    WeightFormat::Q8_0 => "gemv_q8_0",
+                    WeightFormat::IQ4_XS => "gemv_iq4_xs",
+                    WeightFormat::IQ2_M => "gemv_iq2_m",
+                    WeightFormat::Q4_K => "gemv_q4_k",
+                    WeightFormat::Q2_K => "gemv_q2_k",
+                    WeightFormat::IQ3_S => "gemv_iq3_s",
+                    WeightFormat::BF16 => "gemv_bf16",
+                    WeightFormat::F16 => "gemv_f16",
+                    _ => unreachable!(),
+                };
+                enc.set_compute_pipeline_state(self.rt.pso(kernel_name)?);
+                enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
+                enc.set_buffer(1, Some(x.0), x.1 as u64);
+                enc.set_buffer(2, Some(out.0), out.1 as u64);
+                #[repr(C)]
+                struct PackedGemvParams(u32, u32, u32, u32, u32);
+                let epi_u32 = epi.as_u32();
+                let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi_u32);
+                set_bytes(enc, 3, &p);
+                enc.set_buffer(4, Some(out.0), out.1 as u64); // dummy bias
+                if let Some(r) = res {
+                    enc.set_buffer(5, Some(r.0), r.1 as u64);
+                } else {
+                    enc.set_buffer(5, Some(out.0), out.1 as u64);
+                }
+                let rows_per_tg = match format {
+                    WeightFormat::IQ4_XS
+                    | WeightFormat::IQ2_M
+                    | WeightFormat::IQ3_S
+                    | WeightFormat::Q2_K => 8,
+                    _ => 16,
+                };
+                enc.dispatch_thread_groups(
+                    MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                Ok(())
+            }
+            WeightFormat::U32 => Err("U32 weights not supported for GEMV".into()),
+        }
     }
 
     fn encode<'a>(
@@ -1171,6 +1793,7 @@ impl Session {
             Step::GemvPacked {
                 x,
                 w,
+                ref weight_name,
                 bias,
                 res,
                 epi,
@@ -1179,9 +1802,75 @@ impl Session {
                 cols,
                 format,
             } => {
+                if format == WeightFormat::NvFp4 {
+                    let (scales_buf, global_scale) = self
+                        .nvfp4_aux
+                        .get(weight_name)
+                        .ok_or_else(|| format!("missing NVFP4 scales for '{weight_name}'"))?;
+                    enc.set_compute_pipeline_state(rt.pso("gemv_nvfp4")?);
+                    bind(0, w);
+                    bind(1, x);
+                    bind(2, s.out);
+                    #[repr(C)]
+                    struct PackedGemvParams(u32, u32, u32, u32, u32);
+                    let epi_u32 = epi.as_u32();
+                    let p = PackedGemvParams(
+                        u32_of(rows)?,
+                        u32_of(cols)?,
+                        u32_of(m)?,
+                        bias.is_some() as u32,
+                        epi_u32,
+                    );
+                    set_bytes(enc, 3, &p);
+                    if let Some(b) = bias {
+                        bind(4, b);
+                    } else {
+                        bind(4, s.out);
+                    }
+                    if let Some(r) = res {
+                        bind(5, r);
+                    } else {
+                        bind(5, s.out);
+                    }
+                    enc.set_buffer(6, Some(scales_buf), 0);
+                    set_bytes(enc, 7, global_scale);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((rows as u64).div_ceil(8), m as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    return Ok(());
+                }
+                if format == WeightFormat::JesseLUT {
+                    let (hash_buf, address_bits) =
+                        self.jesse_aux.get(weight_name).ok_or_else(|| {
+                            format!("missing JesseLUT hash planes for '{weight_name}'")
+                        })?;
+                    enc.set_compute_pipeline_state(rt.pso("gemv_jesse_lut")?);
+                    let (x_buf, x_off) = loc(x);
+                    let (out_buf, out_off) = loc(s.out);
+                    for row_idx in 0..m {
+                        bind(0, w);
+                        enc.set_buffer(1, Some(hash_buf), 0);
+                        enc.set_buffer(2, Some(x_buf), (x_off + row_idx * cols * 4) as u64);
+                        enc.set_buffer(3, Some(out_buf), (out_off + row_idx * rows * 4) as u64);
+                        set_bytes(enc, 4, &u32_of(cols)?);
+                        set_bytes(enc, 5, &u32_of(rows)?);
+                        set_bytes(enc, 6, &(*address_bits as u32));
+                        enc.dispatch_thread_groups(
+                            MTLSize::new((rows as u64).div_ceil(32), 1, 1),
+                            MTLSize::new(32, 1, 1),
+                        );
+                    }
+                    return Ok(());
+                }
                 let kernel_name = match format {
                     WeightFormat::Q4_0 => "gemv_q4_0",
                     WeightFormat::Q8_0 => "gemv_q8_0",
+                    WeightFormat::IQ4_XS => "gemv_iq4_xs",
+                    WeightFormat::IQ2_M => "gemv_iq2_m",
+                    WeightFormat::Q4_K => "gemv_q4_k",
+                    WeightFormat::Q2_K => "gemv_q2_k",
+                    WeightFormat::IQ3_S => "gemv_iq3_s",
                     WeightFormat::BF16 => "gemv_bf16",
                     WeightFormat::F16 => "gemv_f16",
                     _ => {
@@ -1196,11 +1885,7 @@ impl Session {
                 bind(2, s.out);
                 #[repr(C)]
                 struct PackedGemvParams(u32, u32, u32, u32, u32);
-                let epi_u32 = match epi {
-                    Epi::None => 0,
-                    Epi::Gelu => 1,
-                    Epi::Residual => 2,
-                };
+                let epi_u32 = epi.as_u32();
                 let p = PackedGemvParams(
                     u32_of(rows)?,
                     u32_of(cols)?,
@@ -1220,7 +1905,10 @@ impl Session {
                     bind(5, s.out);
                 }
                 let rows_per_tg = match format {
-                    WeightFormat::Q8_0 => 8,
+                    WeightFormat::IQ4_XS
+                    | WeightFormat::IQ2_M
+                    | WeightFormat::IQ3_S
+                    | WeightFormat::Q2_K => 8,
                     _ => 16,
                 };
                 enc.dispatch_thread_groups(
@@ -1254,6 +1942,7 @@ impl Session {
                     Epi::None => "none",
                     Epi::Gelu => "gelu",
                     Epi::Residual => "residual",
+                    _ => "none",
                 };
                 enc.set_compute_pipeline_state(
                     rt.pso(&format!("gemm_batched_{fmt_name}_{suffix}"))?,
@@ -1426,7 +2115,10 @@ impl Session {
                     (k, v)
                 };
 
-                enc.set_compute_pipeline_state(rt.pso("attn_cached_f32")?);
+                enc.set_compute_pipeline_state(
+                    rt.pso("flash_attn_cached_f32")
+                        .or_else(|_| rt.pso("attn_cached_f32"))?,
+                );
                 bind(0, q);
                 bind(1, k_buf_id);
                 bind(2, v_buf_id);
@@ -1455,6 +2147,71 @@ impl Session {
                     m: m as u32,
                 };
                 set_bytes(enc, 4, &p);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(heads as u64, m as u64, 1),
+                    MTLSize::new(TG4, 1, 1),
+                );
+            }
+            Step::PagedCachedAttention {
+                q,
+                k_pool,
+                v_pool,
+                block_table,
+                pos,
+                heads,
+                kv_heads,
+                head_dim,
+                v_head_dim: _,
+                scale,
+                window,
+                soft_cap,
+                tokens_per_block,
+                max_blocks_per_seq,
+                m,
+            } => {
+                let start_pos = if let Some(p_val) = pos {
+                    let (p_buf, p_off) = loc(p_val);
+                    unsafe { *((p_buf.contents() as *const u8).add(p_off) as *const u32) }
+                } else {
+                    0
+                };
+                let group = (heads / kv_heads.max(1)).max(1);
+                let stride = kv_heads * head_dim;
+
+                enc.set_compute_pipeline_state(rt.pso("paged_attn_cached_f32")?);
+                bind(0, q);
+                bind(1, k_pool);
+                bind(2, v_pool);
+                bind(3, block_table);
+                bind(4, s.out);
+                #[repr(C)]
+                struct PagedAttnCachedParams {
+                    n_heads: u32,
+                    head_dim: u32,
+                    stride: u32,
+                    group: u32,
+                    scale: f32,
+                    window: u32,
+                    softcap: f32,
+                    start_pos: u32,
+                    m: u32,
+                    tokens_per_block: u32,
+                    max_blocks_per_seq: u32,
+                }
+                let p = PagedAttnCachedParams {
+                    n_heads: heads as u32,
+                    head_dim: head_dim as u32,
+                    stride: stride as u32,
+                    group: group as u32,
+                    scale,
+                    window: window.unwrap_or(0) as u32,
+                    softcap: soft_cap.unwrap_or(0.0),
+                    start_pos,
+                    m: m as u32,
+                    tokens_per_block: tokens_per_block as u32,
+                    max_blocks_per_seq: max_blocks_per_seq as u32,
+                };
+                set_bytes(enc, 5, &p);
                 enc.dispatch_thread_groups(
                     MTLSize::new(heads as u64, m as u64, 1),
                     MTLSize::new(TG4, 1, 1),
@@ -1546,7 +2303,10 @@ impl Session {
                     rep: rep as u32,
                 };
                 set_bytes(enc, 7, &p);
-                grid1(val_heads);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((val_dim as u64).div_ceil(32), val_heads as u64, 1),
+                    MTLSize::new(32, 1, 1),
+                );
             }
             Step::TopKSoftmax { x, rows, cols, k } => {
                 enc.set_compute_pipeline_state(rt.pso("topk_softmax_f32")?);
@@ -1605,12 +2365,153 @@ impl Session {
                 set_bytes(enc, 3, &(n as u32));
                 grid1(n);
             }
+            Step::Silu { x, n } => {
+                enc.set_compute_pipeline_state(rt.pso("silu_f32")?);
+                bind(0, x);
+                bind(1, s.out);
+                set_bytes(enc, 2, &u32_of(n)?);
+                grid1(n);
+            }
+            Step::Sigmoid { x, n } => {
+                enc.set_compute_pipeline_state(rt.pso("sigmoid_f32")?);
+                bind(0, x);
+                bind(1, s.out);
+                set_bytes(enc, 2, &u32_of(n)?);
+                grid1(n);
+            }
+            Step::Softplus { x, n } => {
+                enc.set_compute_pipeline_state(rt.pso("softplus_f32")?);
+                bind(0, x);
+                bind(1, s.out);
+                set_bytes(enc, 2, &u32_of(n)?);
+                grid1(n);
+            }
+            Step::MegakernelMlp {
+                x,
+                norm_w,
+                gate_w,
+                up_w,
+                down_w,
+                post_norm_w,
+                ref gate_name,
+                ref up_name,
+                ref down_name,
+                hidden,
+                inter,
+                eps,
+                is_geglu,
+            } => {
+                let bytes_norm = hidden * 4;
+                let bytes_inter = inter * 4;
+                let total_scratch = bytes_norm + 2 * bytes_inter;
+
+                let mut guard = self.mlp_scratch.lock();
+                if guard
+                    .as_ref()
+                    .map_or(true, |b| (b.length() as usize) < total_scratch)
+                {
+                    let buf = new_shared_buffer(&self.rt.device, total_scratch.max(256))?;
+                    *guard = Some(buf);
+                }
+                let scratch = guard.as_ref().unwrap();
+
+                let off_norm = 0usize;
+                let off_gate = bytes_norm;
+                let off_up = bytes_norm + bytes_inter;
+
+                // 1. RMSNorm: x * norm_w -> scratch[off_norm]
+                enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
+                bind(0, x);
+                bind(1, norm_w);
+                enc.set_buffer(2, Some(scratch), off_norm as u64);
+                #[repr(C)]
+                struct RmsNormParams(u32, u32, f32);
+                let p = RmsNormParams(1, u32_of(hidden)?, eps);
+                set_bytes(enc, 3, &p);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
+
+                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
+                self.encode_gemv_or_gemm(
+                    enc,
+                    (scratch, off_norm),
+                    loc(gate_w),
+                    gate_name,
+                    None,
+                    (scratch, off_gate),
+                    inter,
+                    hidden,
+                    Epi::None,
+                )?;
+
+                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
+                self.encode_gemv_or_gemm(
+                    enc,
+                    (scratch, off_norm),
+                    loc(up_w),
+                    up_name,
+                    None,
+                    (scratch, off_up),
+                    inter,
+                    hidden,
+                    Epi::None,
+                )?;
+
+                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
+                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                enc.set_buffer(0, Some(scratch), off_gate as u64);
+                enc.set_buffer(1, Some(scratch), off_up as u64);
+                enc.set_buffer(2, Some(scratch), off_gate as u64);
+                set_bytes(enc, 3, &u32_of(inter)?);
+                grid1(inter);
+
+                // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
+                if let Some(pn) = post_norm_w {
+                    // 5. Down GEMV into scratch[off_norm]: scratch[off_gate] * down_w -> scratch[off_norm]
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_gate),
+                        loc(down_w),
+                        down_name,
+                        None,
+                        (scratch, off_norm),
+                        hidden,
+                        inter,
+                        Epi::None,
+                    )?;
+
+                    // 6. Post-down RMSNorm with residual add: scratch[off_norm] * pn + x -> s.out
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_residual_f32")?);
+                    enc.set_buffer(0, Some(scratch), off_norm as u64);
+                    bind(1, pn);
+                    bind(2, x);
+                    bind(3, s.out);
+                    #[repr(C)]
+                    struct RmsNormParams(u32, u32, f32);
+                    let p = RmsNormParams(1, u32_of(hidden)?, eps);
+                    set_bytes(enc, 4, &p);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
+                } else {
+                    // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_gate),
+                        loc(down_w),
+                        down_name,
+                        Some(loc(x)),
+                        loc(s.out),
+                        hidden,
+                        inter,
+                        Epi::Residual,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Step {
     Embedding {
         table: ValueId,
@@ -1676,6 +2577,7 @@ pub enum Step {
     GemvPacked {
         x: ValueId,
         w: ValueId,
+        weight_name: String,
         bias: Option<ValueId>,
         res: Option<ValueId>,
         epi: Epi,
@@ -1741,6 +2643,23 @@ pub enum Step {
         write: bool,
         m: usize,
     },
+    PagedCachedAttention {
+        q: ValueId,
+        k_pool: ValueId,
+        v_pool: ValueId,
+        block_table: ValueId,
+        pos: Option<ValueId>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        scale: f32,
+        window: Option<usize>,
+        soft_cap: Option<f32>,
+        tokens_per_block: usize,
+        max_blocks_per_seq: usize,
+        m: usize,
+    },
     CausalConv1dCached {
         x: ValueId,
         w: ValueId,
@@ -1783,6 +2702,33 @@ pub enum Step {
         cap: f32,
         n: usize,
     },
+    Silu {
+        x: ValueId,
+        n: usize,
+    },
+    Sigmoid {
+        x: ValueId,
+        n: usize,
+    },
+    Softplus {
+        x: ValueId,
+        n: usize,
+    },
+    MegakernelMlp {
+        x: ValueId,
+        norm_w: ValueId,
+        gate_w: ValueId,
+        up_w: ValueId,
+        down_w: ValueId,
+        post_norm_w: Option<ValueId>,
+        gate_name: String,
+        up_name: String,
+        down_name: String,
+        hidden: usize,
+        inter: usize,
+        eps: f32,
+        is_geglu: bool,
+    },
 }
 
 /// One dispatch: the step, the value it writes, and every value it reads.
@@ -1800,6 +2746,7 @@ pub struct PreparedPlan {
     pub steps: Vec<Planned>,
     pub offsets: HashMap<ValueId, usize>,
     pub arena_size: usize,
+    pub is_decode: bool,
 }
 
 fn numel(g: &Graph, v: ValueId) -> Result<usize, String> {
@@ -1900,6 +2847,16 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let mut format = match g.value(w).dtype {
                     DType::Quant(QuantFormat::GGUF_Q8_0) => Some(WeightFormat::Q8_0),
                     DType::Quant(QuantFormat::GGUF_Q4_0) => Some(WeightFormat::Q4_0),
+                    DType::Quant(QuantFormat::GGUF_IQ4_XS) => Some(WeightFormat::IQ4_XS),
+                    DType::Quant(QuantFormat::GGUF_IQ2_M)
+                    | DType::Quant(QuantFormat::GGUF_IQ2_S) => Some(WeightFormat::IQ2_M),
+                    DType::Quant(QuantFormat::GGUF_Q4_K_M) => Some(WeightFormat::Q4_K),
+                    DType::Quant(QuantFormat::GGUF_Q2_K) => Some(WeightFormat::Q2_K),
+                    DType::Quant(QuantFormat::GGUF_IQ3_S) => Some(WeightFormat::IQ3_S),
+                    DType::Quant(QuantFormat::NVFP4_E2M1) | DType::Quant(QuantFormat::NVFP4) => {
+                        Some(WeightFormat::NvFp4)
+                    }
+                    DType::Quant(QuantFormat::WeightlessJesseLUT) => Some(WeightFormat::JesseLUT),
                     DType::BF16 => Some(WeightFormat::BF16),
                     DType::F16 => Some(WeightFormat::F16),
                     _ => None,
@@ -1909,32 +2866,75 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 {
                     format = None;
                 }
+                if (format == Some(WeightFormat::IQ4_XS)
+                    || format == Some(WeightFormat::IQ2_M)
+                    || format == Some(WeightFormat::Q4_K)
+                    || format == Some(WeightFormat::Q2_K)
+                    || format == Some(WeightFormat::IQ3_S))
+                    && k % 256 != 0
+                {
+                    format = None;
+                }
+                if format == Some(WeightFormat::NvFp4) && (k % 16 != 0 || n == 0) {
+                    format = None;
+                }
                 let (mut epi, mut res) = (Epi::None, None);
-                if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
-                    let c = &g.nodes[*j];
-                    if !g.outputs.contains(&out) {
-                        match c.op {
-                            Op::Gelu { tanh: false } => epi = Epi::Gelu,
-                            Op::Add if c.inputs.len() == 2 => {
-                                let r = if c.inputs[0] == out {
-                                    c.inputs[1]
-                                } else {
-                                    c.inputs[0]
-                                };
-                                if r != out && exists_before(r, i) && n_of(r)? == m * n {
-                                    (epi, res) = (Epi::Residual, Some(r));
+                if format != Some(WeightFormat::JesseLUT) {
+                    if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
+                        let c = &g.nodes[*j];
+                        if !g.outputs.contains(&out) {
+                            match c.op {
+                                Op::Gelu { tanh: false } => epi = Epi::Gelu,
+                                Op::Silu if format.is_some() => epi = Epi::Silu,
+                                Op::SwiGlu if format.is_some() && c.inputs.len() == 2 => {
+                                    // SwiGlu is non-commutative: silu(gate) * up.
+                                    // This linear MUST be gate (inputs[0]); `other` must be up (inputs[1]),
+                                    // which must already exist before this node.
+                                    if c.inputs[0] == out {
+                                        let up = c.inputs[1];
+                                        if up != out && exists_before(up, i) && n_of(up)? == m * n {
+                                            (epi, res) = (Epi::SwiGlu, Some(up));
+                                        }
+                                    }
                                 }
+                                Op::GeGlu if format.is_some() && c.inputs.len() == 2 => {
+                                    // GeGlu is non-commutative: gelu(gate) * up.
+                                    if c.inputs[0] == out {
+                                        let up = c.inputs[1];
+                                        if up != out && exists_before(up, i) && n_of(up)? == m * n {
+                                            (epi, res) = (Epi::GeGlu, Some(up));
+                                        }
+                                    }
+                                }
+                                Op::Add if c.inputs.len() == 2 => {
+                                    let r = if c.inputs[0] == out {
+                                        c.inputs[1]
+                                    } else {
+                                        c.inputs[0]
+                                    };
+                                    if r != out && exists_before(r, i) && n_of(r)? == m * n {
+                                        (epi, res) = (Epi::Residual, Some(r));
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        }
-                        if epi != Epi::None {
-                            fused[*j] = true;
-                            out = c.outputs[0];
+                            if epi != Epi::None {
+                                fused[*j] = true;
+                                out = c.outputs[0];
+                            }
                         }
                     }
                 }
                 if let Some(fmt) = format {
-                    if m >= 16 {
+                    if m >= 16
+                        && matches!(
+                            fmt,
+                            WeightFormat::BF16
+                                | WeightFormat::F16
+                                | WeightFormat::Q4_0
+                                | WeightFormat::Q8_0
+                        )
+                    {
                         (
                             Step::GemmBatchedPacked {
                                 x,
@@ -1954,6 +2954,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                             Step::GemvPacked {
                                 x,
                                 w,
+                                weight_name: g.value(w).name.clone(),
                                 bias,
                                 res,
                                 epi,
@@ -2235,6 +3236,50 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     m * *heads * *v_head_dim,
                 )
             }
+            Op::PagedCachedAttention {
+                heads,
+                kv_heads,
+                head_dim,
+                v_head_dim,
+                scale,
+                causal: _,
+                window,
+                soft_cap,
+                tokens_per_block,
+                max_blocks_per_seq,
+            } => {
+                let q = arg(0)?;
+                let k_pool = arg(1)?;
+                let v_pool = arg(2)?;
+                let block_table = arg(3)?;
+                let pos = if node.inputs.len() >= 5 {
+                    Some(arg(4)?)
+                } else {
+                    None
+                };
+                let ql = n_of(q)?;
+                let m = ql / (*heads * *head_dim).max(1);
+                (
+                    Step::PagedCachedAttention {
+                        q,
+                        k_pool,
+                        v_pool,
+                        block_table,
+                        pos,
+                        heads: *heads,
+                        kv_heads: *kv_heads,
+                        head_dim: *head_dim,
+                        v_head_dim: *v_head_dim,
+                        scale: *scale,
+                        window: *window,
+                        soft_cap: *soft_cap,
+                        tokens_per_block: *tokens_per_block,
+                        max_blocks_per_seq: *max_blocks_per_seq,
+                        m,
+                    },
+                    m * *heads * *v_head_dim,
+                )
+            }
             Op::CausalConv1dCached { kernel, dilation } => {
                 let x = arg(0)?;
                 let w = arg(1)?;
@@ -2349,13 +3394,59 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     total,
                 )
             }
-            Op::Unary {
-                kind: crate::graph::UnaryKind::SoftCap(cap),
-            } => {
+            Op::Silu => {
+                let x = arg(0)?;
+                (Step::Silu { x, n: n_of(x)? }, n_of(x)?)
+            }
+            Op::Unary { kind } => {
                 let x = arg(0)?;
                 let n = n_of(x)?;
-                (Step::SoftCap { x, cap: *cap, n }, n)
+                match kind {
+                    crate::graph::UnaryKind::SoftCap(cap) => (Step::SoftCap { x, cap: *cap, n }, n),
+                    crate::graph::UnaryKind::Sigmoid => (Step::Sigmoid { x, n }, n),
+                    crate::graph::UnaryKind::Softplus => (Step::Softplus { x, n }, n),
+                    _ => return Err(format!("Metal executor: unsupported unary kind {kind:?}")),
+                }
             }
+            Op::Megakernel(desc) => match &desc.kind {
+                crate::graph::MegakernelKind::Mlp {
+                    hidden_dim,
+                    intermediate_dim,
+                    eps,
+                    is_geglu,
+                    has_post_norm,
+                } => {
+                    let (x, norm_w, gate_w, up_w, down_w) =
+                        (arg(0)?, arg(1)?, arg(2)?, arg(3)?, arg(4)?);
+                    let post_norm_w = if *has_post_norm { Some(arg(5)?) } else { None };
+                    let n = n_of(x)?;
+
+                    let gate_name = g.value(gate_w).name.clone();
+                    let up_name = g.value(up_w).name.clone();
+                    let down_name = g.value(down_w).name.clone();
+                    (
+                        Step::MegakernelMlp {
+                            x,
+                            norm_w,
+                            gate_w,
+                            up_w,
+                            down_w,
+                            post_norm_w,
+                            gate_name,
+                            up_name,
+                            down_name,
+                            hidden: *hidden_dim,
+                            inter: *intermediate_dim,
+                            eps: *eps,
+                            is_geglu: *is_geglu,
+                        },
+                        n,
+                    )
+                }
+                crate::graph::MegakernelKind::Attention { .. } => {
+                    return Err("Metal executor: Attention megakernel not supported".into());
+                }
+            },
             op => {
                 return Err(format!(
                     "Metal executor does not implement {} (node '{name}')",
@@ -2410,6 +3501,17 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 .into_iter()
                 .flatten()
                 .collect(),
+            Step::PagedCachedAttention {
+                q,
+                k_pool,
+                v_pool,
+                block_table,
+                pos,
+                ..
+            } => [Some(q), Some(k_pool), Some(v_pool), Some(block_table), pos]
+                .into_iter()
+                .flatten()
+                .collect(),
             Step::CausalConv1dCached { x, w, state, .. } => {
                 [Some(x), Some(w), state].into_iter().flatten().collect()
             }
@@ -2434,20 +3536,49 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .collect(),
             Step::TopKSoftmax { x, .. } => vec![x],
             Step::Mul { a, b, .. } => vec![a, b],
-            Step::SoftCap { x, .. } => vec![x],
+            Step::SoftCap { x, .. }
+            | Step::Silu { x, .. }
+            | Step::Sigmoid { x, .. }
+            | Step::Softplus { x, .. } => vec![x],
+            Step::MegakernelMlp {
+                x,
+                norm_w,
+                gate_w,
+                up_w,
+                down_w,
+                post_norm_w,
+                ..
+            } => {
+                let mut v = vec![x, norm_w, gate_w, up_w, down_w];
+                if let Some(pn) = post_norm_w {
+                    v.push(pn);
+                }
+                v
+            }
         };
         // Operands are f32 except embedding ids, pooling mask (u32), and packed weights.
-        let non_f32_operand = match op {
-            Step::Embedding { ids, .. } => Some(ids),
-            Step::MeanPool { mask, .. } => Some(mask),
-            Step::GemvPacked { w, .. } | Step::GemmBatchedPacked { w, .. } => Some(w),
-            Step::Rope { pos, .. } => Some(pos),
-            Step::CachedAttention { pos: Some(p), .. } => Some(p),
-            _ => None,
+        let is_non_f32_allowed = |v: ValueId| -> bool {
+            match &op {
+                Step::Embedding { ids, .. } => v == *ids,
+                Step::MeanPool { mask, .. } => v == *mask,
+                Step::GemvPacked { w, .. } | Step::GemmBatchedPacked { w, .. } => v == *w,
+                Step::Rope { pos, .. } => v == *pos,
+                Step::CachedAttention { pos: Some(p), .. } => v == *p,
+                Step::PagedCachedAttention {
+                    block_table, pos, ..
+                } => v == *block_table || Some(v) == *pos,
+                Step::MegakernelMlp {
+                    gate_w,
+                    up_w,
+                    down_w,
+                    ..
+                } => v == *gate_w || v == *up_w || v == *down_w,
+                _ => false,
+            }
         };
         if let Some(&v) = reads
             .iter()
-            .find(|&&v| Some(v) != non_f32_operand && g.value(v).dtype != DType::F32)
+            .find(|&&v| !is_non_f32_allowed(v) && g.value(v).dtype != DType::F32)
         {
             return Err(format!(
                 "node '{name}': operand '{}' is {:?}; the Metal kernels take f32",
@@ -2668,6 +3799,218 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// Emits a tailored MSL kernel function for a fused Megakernel block based on hardware parameters.
+pub fn generate_megakernel_msl(
+    block: &crate::graph::MegakernelDescriptor,
+    is_bf16: bool,
+    _hw: &crate::hardware::HardwareProfile,
+) -> String {
+    match &block.kind {
+        crate::graph::MegakernelKind::Mlp {
+            hidden_dim,
+            intermediate_dim,
+            eps,
+            is_geglu,
+            has_post_norm,
+        } => {
+            let func_name = block.name.replace('.', "_");
+            let weight_type = if is_bf16 { "ushort" } else { "float" };
+            let load_gate = if is_bf16 {
+                "as_type<float>((uint)gate_w[(ulong)j * HIDDEN + k] << 16)"
+            } else {
+                "gate_w[(ulong)j * HIDDEN + k]"
+            };
+            let load_up = if is_bf16 {
+                "as_type<float>((uint)up_w[(ulong)j * HIDDEN + k] << 16)"
+            } else {
+                "up_w[(ulong)j * HIDDEN + k]"
+            };
+            let load_down = if is_bf16 {
+                "as_type<float>((uint)down_w[(ulong)h_out * INTER + j] << 16)"
+            } else {
+                "down_w[(ulong)h_out * INTER + j]"
+            };
+            let act_code = if *is_geglu {
+                "float z = fabs(g_acc) * 0.70710678f;\n            float t = 1.0f / (1.0f + 0.5f * z);\n            float p = -z*z - 1.26551223f + t*(1.00002368f + t*(0.37409196f + t*(-0.18628806f + t*0.27886807f)));\n            float erf_v = g_acc >= 0.0f ? 1.0f - t*exp(p) : t*exp(p) - 1.0f;\n            float act = (0.5f * g_acc * (1.0f + erf_v)) * u_acc;"
+            } else {
+                "float sig = 1.0f / (1.0f + exp(-g_acc));\n            float act = (g_acc * sig) * u_acc;"
+            };
+
+            if *has_post_norm {
+                format!(
+                    r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void {func_name}(
+    device const float* in_x [[buffer(0)]],
+    device const float* norm_w [[buffer(1)]],
+    device const {weight_type}* gate_w [[buffer(2)]],
+    device const {weight_type}* up_w [[buffer(3)]],
+    device const {weight_type}* down_w [[buffer(4)]],
+    device const float* post_norm_w [[buffer(5)]],
+    device float* out_x [[buffer(6)]],
+    uint tid [[thread_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]])
+{{
+    constant uint HIDDEN = {hidden_dim}u;
+    constant uint INTER = {intermediate_dim}u;
+    constant float EPS = {eps}f;
+
+    // 1. RMSNorm of in_x
+    float sum_sq = 0.0f;
+    for (uint i = 0; i < HIDDEN; ++i) {{
+        float val = in_x[i];
+        sum_sq += val * val;
+    }}
+    float rsqrt_val = rsqrt(sum_sq / float(HIDDEN) + EPS);
+    threadgroup float act_cache[{hidden_dim}];
+    for (uint i = tid; i < HIDDEN; i += tg_size) {{
+        act_cache[i] = in_x[i] * rsqrt_val * norm_w[i];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Each thread computes down_acc
+    threadgroup float down_cache[{hidden_dim}];
+    for (uint h_out = tid; h_out < HIDDEN; h_out += tg_size) {{
+        float down_acc = 0.0f;
+        for (uint j = 0; j < INTER; ++j) {{
+            float g_acc = 0.0f;
+            float u_acc = 0.0f;
+            for (uint k = 0; k < HIDDEN; ++k) {{
+                float x_norm = act_cache[k];
+                g_acc += x_norm * {load_gate};
+                u_acc += x_norm * {load_up};
+            }}
+            {act_code}
+            down_acc += act * {load_down};
+        }}
+        down_cache[h_out] = down_acc;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Post-down RMSNorm and residual add
+    float sum_sq_down = 0.0f;
+    for (uint i = 0; i < HIDDEN; ++i) {{
+        float v = down_cache[i];
+        sum_sq_down += v * v;
+    }}
+    float rsqrt_down = rsqrt(sum_sq_down / float(HIDDEN) + EPS);
+    for (uint i = tid; i < HIDDEN; i += tg_size) {{
+        out_x[i] = in_x[i] + down_cache[i] * rsqrt_down * post_norm_w[i];
+    }}
+}}
+"#
+                )
+            } else {
+                format!(
+                    r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void {func_name}(
+    device const float* in_x [[buffer(0)]],
+    device const float* norm_w [[buffer(1)]],
+    device const {weight_type}* gate_w [[buffer(2)]],
+    device const {weight_type}* up_w [[buffer(3)]],
+    device const {weight_type}* down_w [[buffer(4)]],
+    device float* out_x [[buffer(5)]],
+    uint tid [[thread_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]])
+{{
+    constant uint HIDDEN = {hidden_dim}u;
+    constant uint INTER = {intermediate_dim}u;
+    constant float EPS = {eps}f;
+
+    // 1. RMSNorm of in_x
+    float sum_sq = 0.0f;
+    for (uint i = 0; i < HIDDEN; ++i) {{
+        float val = in_x[i];
+        sum_sq += val * val;
+    }}
+    float rsqrt_val = rsqrt(sum_sq / float(HIDDEN) + EPS);
+    threadgroup float act_cache[{hidden_dim}];
+    for (uint i = tid; i < HIDDEN; i += tg_size) {{
+        act_cache[i] = in_x[i] * rsqrt_val * norm_w[i];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Each thread computes a slice of output elements
+    for (uint h_out = tid; h_out < HIDDEN; h_out += tg_size) {{
+        float down_acc = 0.0f;
+        for (uint j = 0; j < INTER; ++j) {{
+            float g_acc = 0.0f;
+            float u_acc = 0.0f;
+            for (uint k = 0; k < HIDDEN; ++k) {{
+                float x_norm = act_cache[k];
+                g_acc += x_norm * {load_gate};
+                u_acc += x_norm * {load_up};
+            }}
+            {act_code}
+            down_acc += act * {load_down};
+        }}
+        out_x[h_out] = in_x[h_out] + down_acc;
+    }}
+}}
+"#
+                )
+            }
+        }
+        crate::graph::MegakernelKind::Attention { hidden_dim, .. } => {
+            let func_name = block.name.replace('.', "_");
+            format!(
+                r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void {func_name}(
+    device const float* in_x [[buffer(0)]],
+    device const float* norm_w [[buffer(1)]],
+    device const void* o_w [[buffer(2)]],
+    device float* out_x [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{{
+    constant uint HIDDEN = {hidden_dim}u;
+    if (tid < HIDDEN) {{
+        out_x[tid] = in_x[tid];
+    }}
+}}
+"#
+            )
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn get_or_compile_megakernel(
+    device: &metal::DeviceRef,
+    desc: &crate::graph::MegakernelDescriptor,
+    is_bf16: bool,
+    hw: &crate::hardware::HardwareProfile,
+) -> Result<metal::ComputePipelineState, String> {
+    let source = generate_megakernel_msl(desc, is_bf16, hw);
+    let hash = fnv1a(source.as_bytes());
+    let func_name = desc.name.replace('.', "_");
+
+    let cache_dir = crate::hardware::default_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("kernels");
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cache_path = cache_dir.join(format!("{hash:016x}.metallib"));
+
+    let opts = metal::CompileOptions::new();
+    opts.set_fast_math_enabled(false);
+    let lib = device
+        .new_library_with_source(&source, &opts)
+        .map_err(|e| format!("MSL megakernel compilation failed: {e}\nSource:\n{source}"))?;
+    let func = lib
+        .get_function(&func_name, None)
+        .map_err(|e| format!("MSL function '{func_name}' not found: {e}"))?;
+    let pso = device
+        .new_compute_pipeline_state_with_function(&func)
+        .map_err(|e| format!("PSO creation failed for '{func_name}': {e}"))?;
+
+    let _ = std::fs::write(&cache_path, source.as_bytes());
+    Ok(pso)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2773,6 +4116,104 @@ mod tests {
                     assert!(e < 1e-5, "{kind:?} {m}x{n}x{k} case {case}: rel err {e:e}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_graph_fused_epilogue_matches_cpu() {
+        let f = DType::F32;
+        let bf = DType::BF16;
+        let (m, n, k) = (1, 64, 32);
+        let bf_weights: Vec<u16> = (0..n * k)
+            .map(|i| crate::model::f32_to_bf16(0.01 * ((i % 7) as f32 - 3.0)))
+            .collect();
+        // 1. Linear -> Silu
+        {
+            let mut g = Graph::new();
+            let mut w = Weights::new();
+            let x = g.input("x", vec![m, k], f);
+            let wv = g.weight("w", vec![n, k], bf);
+            let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
+            let silu = g.add("silu", Op::Silu, &[lin], vec![m, n], f);
+            g.output(silu);
+
+            w.insert("w", Tensor::BF16(bf_weights.clone()));
+            let inputs = vec![Tensor::F32(vec![0.1f32; m * k])];
+            let (want, got) = both(&g, &w, inputs, None);
+            assert!(rel_err(&want, &got) < 1e-4, "Fused Silu parity failed");
+        }
+        // 2. Linear -> Gelu
+        {
+            let mut g = Graph::new();
+            let mut w = Weights::new();
+            let x = g.input("x", vec![m, k], f);
+            let wv = g.weight("w", vec![n, k], bf);
+            let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
+            let gelu = g.add("gelu", Op::Gelu { tanh: false }, &[lin], vec![m, n], f);
+            g.output(gelu);
+
+            w.insert("w", Tensor::BF16(bf_weights.clone()));
+            let inputs = vec![Tensor::F32(vec![0.1f32; m * k])];
+            let (want, got) = both(&g, &w, inputs, None);
+            assert!(rel_err(&want, &got) < 1e-4, "Fused Gelu parity failed");
+        }
+        // 3. Linear -> SwiGlu
+        {
+            let mut g = Graph::new();
+            let mut w = Weights::new();
+            let x = g.input("x", vec![m, k], f);
+            let up_val = g.input("up", vec![m, n], f);
+            let wv = g.weight("w", vec![n, k], bf);
+            let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
+            let swiglu = g.add("swiglu", Op::SwiGlu, &[lin, up_val], vec![m, n], f);
+            g.output(swiglu);
+
+            w.insert("w", Tensor::BF16(bf_weights));
+            let inputs = vec![
+                Tensor::F32(vec![0.1f32; m * k]),
+                Tensor::F32(vec![0.5f32; m * n]),
+            ];
+            let (want, got) = both(&g, &w, inputs, None);
+            assert!(rel_err(&want, &got) < 1e-4, "Fused SwiGlu parity failed");
+        }
+    }
+
+    #[test]
+    fn test_generic_buffer_lifetime_arena_zero_reallocations() {
+        let f = DType::F32;
+        let (m, n, k) = (1, 64, 64);
+        let mut g = Graph::new();
+        let mut w = Weights::new();
+        let x = g.input("x", vec![m, k], f);
+        let w1 = g.weight("w1", vec![n, k], f);
+        let w2 = g.weight("w2", vec![k, n], f);
+        let l1 = g.add("l1", Op::Linear, &[x, w1], vec![m, n], f);
+        let a1 = g.add("a1", Op::Gelu { tanh: false }, &[l1], vec![m, n], f);
+        let l2 = g.add("l2", Op::Linear, &[a1, w2], vec![m, k], f);
+        g.output(l2);
+
+        w.insert("w1", Tensor::F32(vec![0.02f32; n * k]));
+        w.insert("w2", Tensor::F32(vec![0.02f32; k * n]));
+
+        let s = Session::new(rt(), &w).unwrap();
+        let plan = s.prepare_plan(&g).unwrap();
+        let initial_ptr = s
+            .arena_buffer_ptr()
+            .expect("arena buffer pre-allocated during prepare_plan");
+
+        for step in 0..100 {
+            let inputs = vec![Tensor::F32(vec![0.05f32 * (step as f32); m * k])];
+            let out = s
+                .run_prepared(&g, &plan, None, inputs)
+                .expect("decode step succeeds");
+            assert_eq!(out.len(), 1);
+            let cur_ptr = s
+                .arena_buffer_ptr()
+                .expect("arena buffer remains allocated");
+            assert_eq!(
+                cur_ptr, initial_ptr,
+                "Arena buffer must never be reallocated across decode steps (step {step})"
+            );
         }
     }
 
@@ -3037,6 +4478,452 @@ mod tests {
             &want[..4],
             &got[..4]
         );
+    }
+
+    #[test]
+    fn gemv_iq4_xs_matches_cpu() {
+        let (m, n, k) = (1, 16, 256 * 2);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![m, k], DType::F32);
+        let w_val = g.weight("w", vec![n, k], DType::Quant(QuantFormat::GGUF_IQ4_XS));
+        let b_val = g.weight("b", vec![n], DType::F32);
+        let y = g.add(
+            "lin",
+            Op::Linear,
+            &[x, w_val, b_val],
+            vec![m, n],
+            DType::F32,
+        );
+        g.output(y);
+
+        let n_blocks = n * (k / 256);
+        let mut raw = Vec::with_capacity(n_blocks * 136);
+        for b in 0..n_blocks {
+            let d = crate::model::f32_to_f16(0.0625 * ((b % 5) as f32 + 1.0));
+            raw.extend_from_slice(&d.to_le_bytes());
+            let scales_h = (b as u16 * 17) & 0xFFFF;
+            raw.extend_from_slice(&scales_h.to_le_bytes());
+            for j in 0..4 {
+                raw.push(((j * 7 + b) % 256) as u8);
+            }
+            for j in 0..128 {
+                let low = (j * 3 + b) % 16;
+                let high = (j * 5 + b * 2) % 16;
+                raw.push((low | (high << 4)) as u8);
+            }
+        }
+        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
+            format: QuantFormat::GGUF_IQ4_XS,
+            raw_data: bytes::Bytes::from(raw),
+            in_features: k,
+            out_features: n,
+        };
+        let mut w = Weights::new();
+        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert("b", Tensor::F32(rand(n, 19)));
+        let inputs = vec![Tensor::F32(rand(m * k, 43))];
+        let (want, got) = both(&g, &w, inputs, None);
+        assert!(
+            rel_err(&want, &got) < 1e-4,
+            "want {:?} vs got {:?}",
+            &want[..4],
+            &got[..4]
+        );
+    }
+
+    #[test]
+    fn gemv_iq2_m_matches_cpu() {
+        let (m, n, k) = (1, 16, 256 * 2);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![m, k], DType::F32);
+        let w_val = g.weight("w", vec![n, k], DType::Quant(QuantFormat::GGUF_IQ2_M));
+        let b_val = g.weight("b", vec![n], DType::F32);
+        let y = g.add(
+            "lin",
+            Op::Linear,
+            &[x, w_val, b_val],
+            vec![m, n],
+            DType::F32,
+        );
+        g.output(y);
+
+        let n_blocks = n * (k / 256);
+        let mut raw = Vec::with_capacity(n_blocks * 82);
+        for b in 0..n_blocks {
+            let d = crate::model::f32_to_f16(0.0625 * ((b % 5) as f32 + 1.0));
+            raw.extend_from_slice(&d.to_le_bytes());
+            for j in 0..32 {
+                raw.push(((j * 3 + b) % 256) as u8);
+            }
+            for j in 0..32 {
+                raw.push(((j * 5 + b) % 256) as u8);
+            }
+            for j in 0..8 {
+                raw.push(((j * 7 + b) % 256) as u8);
+            }
+            for j in 0..8 {
+                raw.push(((j * 11 + b) % 256) as u8);
+            }
+        }
+        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
+            format: QuantFormat::GGUF_IQ2_M,
+            raw_data: bytes::Bytes::from(raw),
+            in_features: k,
+            out_features: n,
+        };
+        let mut w = Weights::new();
+        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert("b", Tensor::F32(rand(n, 23)));
+        let inputs = vec![Tensor::F32(rand(m * k, 45))];
+        let (want, got) = both(&g, &w, inputs, None);
+        assert!(
+            rel_err(&want, &got) < 1e-4,
+            "want {:?} vs got {:?}",
+            &want[..4],
+            &got[..4]
+        );
+    }
+
+    #[test]
+    fn gemv_nvfp4_matches_cpu() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let rt = rt();
+        let (rows, cols) = (16usize, 64usize);
+        let n_blocks = rows * (cols / 16);
+        let byte_stride = cols / 2;
+
+        let mut wq = vec![0u8; rows * byte_stride];
+        for (i, b) in wq.iter_mut().enumerate() {
+            let low = (i * 3 + 1) % 16;
+            let high = (i * 5 + 2) % 16;
+            *b = (low | (high << 4)) as u8;
+        }
+
+        let mut scales = vec![0u8; n_blocks];
+        for (i, s) in scales.iter_mut().enumerate() {
+            *s = ((i * 7 + 0x30) % 0x7E) as u8;
+        }
+        let global_scale = 1.5f32;
+        let x_data = rand(cols, 42);
+
+        let lut = crate::quant::nvfp4::NVFP4_E2M1_LUT;
+        let mut expected = vec![0.0f32; rows];
+        for r in 0..rows {
+            let mut acc = 0.0f32;
+            for blk in 0..(cols / 16) {
+                let s = crate::model::f8_e4m3_to_f32(scales[r * (cols / 16) + blk]) * global_scale;
+                for i in 0..8 {
+                    let byte_val = wq[r * byte_stride + blk * 8 + i];
+                    let v0 = lut[(byte_val & 0x0F) as usize] * s;
+                    let v1 = lut[(byte_val >> 4) as usize] * s;
+                    let c0 = blk * 16 + 2 * i;
+                    let c1 = blk * 16 + 2 * i + 1;
+                    acc += v0 * x_data[c0] + v1 * x_data[c1];
+                }
+            }
+            expected[r] = acc;
+        }
+
+        let wq_buf = new_shared_buffer(&rt.device, wq.len()).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(wq.as_ptr(), wq_buf.contents() as *mut u8, wq.len())
+        };
+
+        let scales_buf = new_shared_buffer(&rt.device, scales.len()).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                scales.as_ptr(),
+                scales_buf.contents() as *mut u8,
+                scales.len(),
+            )
+        };
+
+        let x_buf = new_shared_buffer(&rt.device, cols * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x_data.as_ptr(), x_buf.contents() as *mut f32, cols)
+        };
+
+        let y_buf = new_shared_buffer(&rt.device, rows * 4).unwrap();
+
+        metal::objc::rc::autoreleasepool(|| {
+            let cb = rt.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(rt.pso("gemv_nvfp4").unwrap());
+            enc.set_buffer(0, Some(&wq_buf), 0);
+            enc.set_buffer(1, Some(&x_buf), 0);
+            enc.set_buffer(2, Some(&y_buf), 0);
+            #[repr(C)]
+            struct PackedGemvParams {
+                rows: u32,
+                cols: u32,
+                batch_size: u32,
+                has_bias: u32,
+                epi: u32,
+            }
+            let p = PackedGemvParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                batch_size: 1,
+                has_bias: 0,
+                epi: 0,
+            };
+            set_bytes(enc, 3, &p);
+            enc.set_buffer(4, Some(&y_buf), 0);
+            enc.set_buffer(5, Some(&y_buf), 0);
+            enc.set_buffer(6, Some(&scales_buf), 0);
+            set_bytes(enc, 7, &global_scale);
+
+            enc.dispatch_thread_groups(
+                MTLSize::new((rows as u64).div_ceil(8), 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            enc.end_encoding();
+            commit_and_wait(cb).unwrap();
+        });
+
+        let mut got = vec![0.0f32; rows];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, got.as_mut_ptr(), rows)
+        };
+
+        for (r, (&e, &g)) in expected.iter().zip(&got).enumerate() {
+            assert!(
+                (e - g).abs() < 1e-4 || (e - g).abs() / (e.abs().max(g.abs())) < 1e-4,
+                "row {r}: expected {e}, got {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemv_jesse_lut_matches_cpu() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let rt = rt();
+        let (in_f, out_f, addr_bits) = (32usize, 16usize, 6usize);
+        let layer = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
+            "test_jesse",
+            in_f,
+            out_f,
+            addr_bits,
+            &rand(in_f * out_f, 55),
+        );
+        let x_data = rand(in_f, 99);
+        let mut expected = vec![0.0f32; out_f];
+        layer.forward(&x_data, &mut expected);
+
+        let lut_buf = new_shared_buffer(&rt.device, layer.lut_tables.len()).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                layer.lut_tables.as_ptr() as *const u8,
+                lut_buf.contents() as *mut u8,
+                layer.lut_tables.len(),
+            )
+        };
+
+        let hash_buf = new_shared_buffer(&rt.device, layer.hash_planes.len() * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                layer.hash_planes.as_ptr(),
+                hash_buf.contents() as *mut f32,
+                layer.hash_planes.len(),
+            )
+        };
+
+        let x_buf = new_shared_buffer(&rt.device, in_f * 4).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(x_data.as_ptr(), x_buf.contents() as *mut f32, in_f)
+        };
+
+        let y_buf = new_shared_buffer(&rt.device, out_f * 4).unwrap();
+
+        metal::objc::rc::autoreleasepool(|| {
+            let cb = rt.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(rt.pso("gemv_jesse_lut").unwrap());
+            enc.set_buffer(0, Some(&lut_buf), 0);
+            enc.set_buffer(1, Some(&hash_buf), 0);
+            enc.set_buffer(2, Some(&x_buf), 0);
+            enc.set_buffer(3, Some(&y_buf), 0);
+            set_bytes(enc, 4, &(in_f as u32));
+            set_bytes(enc, 5, &(out_f as u32));
+            set_bytes(enc, 6, &(addr_bits as u32));
+
+            enc.dispatch_thread_groups(
+                MTLSize::new((out_f as u64).div_ceil(32), 1, 1),
+                MTLSize::new(32, 1, 1),
+            );
+            enc.end_encoding();
+            commit_and_wait(cb).unwrap();
+        });
+
+        let mut got = vec![0.0f32; out_f];
+        unsafe {
+            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, got.as_mut_ptr(), out_f)
+        };
+
+        assert_eq!(expected, got);
+    }
+    #[test]
+    fn test_graph_nvfp4_matches_cpu() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (rows, cols) = (16usize, 64usize);
+        let weights = rand(rows * cols, 123);
+        let tensor = crate::quant::nvfp4::quantize_nvfp4_tensor(&weights, rows, cols).unwrap();
+
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, cols], DType::F32);
+        let w = g.weight(
+            "w",
+            vec![rows, cols],
+            DType::Quant(crate::hardware::QuantFormat::NVFP4_E2M1),
+        );
+        let y = g.add("lin", Op::Linear, &[x, w], vec![1, rows], DType::F32);
+        g.output(y);
+
+        let mut weights_store = Weights::new();
+        weights_store.insert(
+            "w",
+            Tensor::Quantized(Arc::new(crate::model::layers::QuantizedWeight::Nvfp4(
+                tensor.clone(),
+            ))),
+        );
+
+        let input_data = rand(cols, 456);
+        let inputs = vec![Tensor::F32(input_data.clone())];
+
+        let mut expected = vec![0.0f32; rows];
+        crate::quant::nvfp4::gemv_nvfp4_f32(&tensor, &input_data, &mut expected);
+
+        let session = Session::new(rt(), &weights_store).expect("Metal Session creation");
+        let metal_res = session.run(&g, inputs).expect("Metal run");
+        let metal_y = metal_res[0].as_f32().unwrap();
+
+        assert_eq!(expected.len(), metal_y.len());
+        // NVFP4 block quantization re-quantizes per-block scale through e4m3 on Metal (vs f32 on CPU)
+        for (r, (&e, &m)) in expected.iter().zip(metal_y).enumerate() {
+            assert!(
+                (e - m).abs() < 0.15 || (e - m).abs() / e.abs().max(1.0) < 0.08,
+                "row {r}: expected {e} vs Metal {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_graph_jesse_lut_matches_cpu() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (in_f, out_f, addr_bits) = (32usize, 16usize, 6usize);
+        let weights = rand(in_f * out_f, 789);
+        let layer = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
+            "test_jesse",
+            in_f,
+            out_f,
+            addr_bits,
+            &weights,
+        );
+
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, in_f], DType::F32);
+        let w = g.weight(
+            "w",
+            vec![out_f, in_f],
+            DType::Quant(crate::hardware::QuantFormat::WeightlessJesseLUT),
+        );
+        let y = g.add("lin", Op::Linear, &[x, w], vec![1, out_f], DType::F32);
+        g.output(y);
+
+        let mut weights_store = Weights::new();
+        weights_store.insert(
+            "w",
+            Tensor::Quantized(Arc::new(
+                crate::model::layers::QuantizedWeight::WeightlessJesse(layer),
+            )),
+        );
+
+        let input_data = rand(in_f, 101);
+        let inputs = vec![Tensor::F32(input_data)];
+
+        let mut cpu_state = crate::graph::StateStore::new();
+        let cpu_res = crate::graph::cpu::run(&g, &weights_store, &mut cpu_state, inputs.clone())
+            .expect("CPU run");
+        let cpu_y = cpu_res[0].as_f32().unwrap();
+
+        let session = Session::new(rt(), &weights_store).expect("Metal Session creation");
+        let metal_res = session.run(&g, inputs).expect("Metal run");
+        let metal_y = metal_res[0].as_f32().unwrap();
+
+        assert_eq!(cpu_y.len(), metal_y.len());
+        for (r, (&c, &m)) in cpu_y.iter().zip(metal_y).enumerate() {
+            assert!((c - m).abs() < 1e-3, "row {r}: CPU {c} vs Metal {m}");
+        }
+    }
+    #[test]
+    fn test_graph_jesse_lut_batch_and_residual_matches_cpu() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (m, in_f, out_f, addr_bits) = (4usize, 32usize, 16usize, 6usize);
+        let weights = rand(in_f * out_f, 789);
+        let layer = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
+            "test_jesse_batch",
+            in_f,
+            out_f,
+            addr_bits,
+            &weights,
+        );
+
+        let mut g = Graph::new();
+        let x = g.input("x", vec![m, in_f], DType::F32);
+        let res_in = g.input("res", vec![m, out_f], DType::F32);
+        let w = g.weight(
+            "w",
+            vec![out_f, in_f],
+            DType::Quant(crate::hardware::QuantFormat::WeightlessJesseLUT),
+        );
+        let y_lin = g.add("lin", Op::Linear, &[x, w], vec![m, out_f], DType::F32);
+        let y = g.add(
+            "res_add",
+            Op::Add,
+            &[y_lin, res_in],
+            vec![m, out_f],
+            DType::F32,
+        );
+        g.output(y);
+
+        let mut weights_store = Weights::new();
+        weights_store.insert(
+            "w",
+            Tensor::Quantized(Arc::new(
+                crate::model::layers::QuantizedWeight::WeightlessJesse(layer),
+            )),
+        );
+
+        let input_x = rand(m * in_f, 101);
+        let input_res = rand(m * out_f, 202);
+        let inputs = vec![Tensor::F32(input_x), Tensor::F32(input_res)];
+
+        let mut cpu_state = crate::graph::StateStore::new();
+        let cpu_res = crate::graph::cpu::run(&g, &weights_store, &mut cpu_state, inputs.clone())
+            .expect("CPU run");
+        let cpu_y = cpu_res[0].as_f32().unwrap();
+
+        let session = Session::new(rt(), &weights_store).expect("Metal Session creation");
+        let metal_res = session.run(&g, inputs).expect("Metal run");
+        let metal_y = metal_res[0].as_f32().unwrap();
+
+        assert_eq!(cpu_y.len(), metal_y.len());
+        for (r, (&c, &m_val)) in cpu_y.iter().zip(metal_y).enumerate() {
+            assert!(
+                (c - m_val).abs() < 1e-3,
+                "idx {r}: CPU {c} vs Metal {m_val}"
+            );
+        }
     }
 
     #[test]
@@ -3399,7 +5286,7 @@ mod tests {
     fn unsupported_ops_bad_ids_and_missing_weights_are_errors() {
         let f = DType::F32;
         let s = Session::new(rt(), &Weights::new()).unwrap();
-        for op in [Op::Silu, Op::Gelu { tanh: true }] {
+        for op in [Op::Relu, Op::Gelu { tanh: true }] {
             let mut g = Graph::new();
             let x = g.input("x", vec![4], f);
             let y = g.add("act", op, &[x], vec![4], f);
@@ -3568,6 +5455,48 @@ mod tests {
             ];
             let (want, got) = both(&g, &Weights::new(), inp, None);
             assert!(rel_err(&want, &got) < 1e-4, "CachedAttention mismatch");
+        }
+
+        // 3b. PagedCachedAttention
+        {
+            let mut g = Graph::new();
+            let q = g.input("q", vec![1, 4], DType::F32);
+            let k_pool = g.input("k_pool", vec![16, 4], DType::F32);
+            let v_pool = g.input("v_pool", vec![16, 4], DType::F32);
+            let block_table = g.input("block_table", vec![4], DType::U32);
+            let pos = g.input("pos", vec![1], DType::U32);
+            let y = g.add(
+                "paged_attn",
+                Op::PagedCachedAttention {
+                    heads: 1,
+                    kv_heads: 1,
+                    head_dim: 4,
+                    v_head_dim: 4,
+                    scale: 0.5,
+                    causal: true,
+                    window: None,
+                    soft_cap: None,
+                    tokens_per_block: 16,
+                    max_blocks_per_seq: 4,
+                },
+                &[q, k_pool, v_pool, block_table, pos],
+                vec![1, 4],
+                DType::F32,
+            );
+            g.output(y);
+            let mut k_data = vec![0.0f32; 16 * 4];
+            let mut v_data = vec![0.0f32; 16 * 4];
+            k_data[0..4].copy_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+            v_data[0..4].copy_from_slice(&[0.5, 1.5, 2.5, 3.5]);
+            let inp = vec![
+                Tensor::F32(vec![1.0, 0.0, 0.0, 0.0]),
+                Tensor::F32(k_data),
+                Tensor::F32(v_data),
+                Tensor::U32(vec![0, 0, 0, 0]),
+                Tensor::U32(vec![0]),
+            ];
+            let (want, got) = both(&g, &Weights::new(), inp, None);
+            assert!(rel_err(&want, &got) < 1e-4, "PagedCachedAttention mismatch");
         }
 
         // 4. CausalConv1dCached

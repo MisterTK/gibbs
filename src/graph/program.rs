@@ -54,6 +54,21 @@ impl GraphProgram {
         let available = available_devices();
         let plan = place_graph_default(&mut graph, mode, &available, None);
         let primary_device = plan.primary_device();
+        eprintln!(
+            "Compiled GraphProgram: {} segments, primary device: {:?}",
+            plan.segments.len(),
+            primary_device
+        );
+        for (i, s) in plan.segments.iter().enumerate() {
+            if s.device == Device::Cpu {
+                let ops: Vec<_> = s
+                    .nodes
+                    .iter()
+                    .map(|&n| format!("{:?}", graph.node(n).op))
+                    .collect();
+                eprintln!("  Segment {i}: {:?}, nodes: {:?}", s.device, ops);
+            }
+        }
 
         #[cfg(target_os = "macos")]
         let metal_rt = if plan.segments.iter().any(|s| s.device == Device::Metal) {
@@ -85,7 +100,8 @@ impl GraphProgram {
                 #[cfg(target_os = "macos")]
                 Device::Metal => {
                     let rt = metal_rt.expect("Metal runtime initialized");
-                    let session = crate::graph::metal::Session::new(rt, &weights)?;
+                    let session =
+                        crate::graph::metal::Session::new_for_graph(rt, &weights, Some(&graph))?;
                     let prepared_plan = session.prepare_plan(&graph)?;
                     compiled_segments.push(CompiledSegment::Metal {
                         graph,

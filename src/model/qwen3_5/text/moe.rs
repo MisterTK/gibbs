@@ -232,7 +232,7 @@ struct Shared {
 }
 
 pub(crate) struct Moe {
-    router: Linear,
+    pub(crate) router: Linear,
     gate: Bank,
     up: Bank,
     down: Bank,

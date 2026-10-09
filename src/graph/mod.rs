@@ -120,6 +120,33 @@ pub enum UpsampleMode {
     Bilinear,
     Bicubic,
 }
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MegakernelKind {
+    /// Fused MLP: RmsNorm -> Linear(Gate) & Linear(Up) (or Linear(GateUp)) -> SwiGLU / GeGLU -> Linear(Down) -> Add
+    Mlp {
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        eps: f32,
+        is_geglu: bool,
+        has_post_norm: bool,
+    },
+    /// Fused Attention: RmsNorm -> Linear(Q, K, V) -> Attention / RoPE / DeltaRule -> Linear(Out) -> Add
+    Attention {
+        hidden_dim: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        is_delta: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MegakernelDescriptor {
+    pub kind: MegakernelKind,
+    pub name: String,
+}
+
 /// Operations. Operand order is the node's `inputs` order, documented per variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
@@ -188,6 +215,19 @@ pub enum Op {
         window: Option<usize>,
         soft_cap: Option<f32>,
         write: bool,
+    },
+    /// `[q, k_pool, v_pool, block_table, positions]` evaluating causal attention over paged KV memory.
+    PagedCachedAttention {
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        scale: f32,
+        causal: bool,
+        window: Option<usize>,
+        soft_cap: Option<f32>,
+        tokens_per_block: usize,
+        max_blocks_per_seq: usize,
     },
     /// `[x, weight, bias?, conv_state]` 1D causal convolution updating state.
     CausalConv1dCached {
@@ -296,6 +336,8 @@ pub enum Op {
     MeanPool,
     /// `[x]` → `x / ‖x‖₂`.
     L2Normalize,
+    /// Fused transformer block Megakernel single-dispatch operator.
+    Megakernel(MegakernelDescriptor),
 }
 
 impl Op {
@@ -336,6 +378,7 @@ impl Op {
             Op::Binary { .. } => "Binary",
             Op::CachedAttention { .. } => "CachedAttention",
             Op::CausalConv1dCached { .. } => "CausalConv1dCached",
+            Op::PagedCachedAttention { .. } => "PagedCachedAttention",
             Op::DeltaRule { .. } => "DeltaRule",
             Op::Gather { .. } => "Gather",
             Op::Scatter { .. } => "Scatter",
@@ -343,6 +386,7 @@ impl Op {
             Op::AvgPool2d { .. } => "AvgPool2d",
             Op::Upsample { .. } => "Upsample",
             Op::Conv3d { .. } => "Conv3d",
+            Op::Megakernel(_) => "Megakernel",
         }
     }
 }

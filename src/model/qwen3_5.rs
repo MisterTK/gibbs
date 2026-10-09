@@ -32,11 +32,6 @@ use std::sync::Arc;
 use text::{Arch, LayerState, MtpDrafter, TextModel};
 use vision::{Preprocessor, Vision};
 
-#[cfg(target_os = "macos")]
-mod metal;
-#[cfg(target_os = "macos")]
-use metal::MetalQwenDecoder;
-
 /// The mapped safetensors checkpoint of `artifacts` (pre-quantized schemes vetted) and its
 /// directory; Errs off the CPU.
 fn open_checkpoint(
@@ -71,6 +66,7 @@ pub fn load(
     cfg: &Value,
     mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
+    let mode = mode.into();
     let (ck, dir) = open_checkpoint(artifacts, cfg, mode)?;
     let arch = match cfg["model_type"].as_str() {
         Some("qwen3_vl") => Arch::Qwen3Vl,
@@ -94,11 +90,18 @@ pub fn load(
         .mtp
         .is_some()
         .then(|| Arc::new(MtpDrafter(text.clone())) as Arc<dyn Drafter>);
+    let program = if drafter.is_some() {
+        tracing::info!("MTP speculative decoding checkpointing requires CPU execution for now");
+        None
+    } else {
+        compile_qwen_program(&text, mode)
+    };
     Ok(Arc::new(Qwen35 {
         tok,
         text,
         vision,
         drafter,
+        program,
     }))
 }
 
@@ -151,34 +154,8 @@ pub fn load_dense(
     };
     let text = Arc::new(TextModel::load(&ck, cfg, arch)?);
     let tok = load_json_tokenizer(&dir.join("tokenizer.json"))?;
-    let want_metal = match mode {
-        crate::hardware::PlacementMode::Pin(Device::Metal) => true,
-        crate::hardware::PlacementMode::Auto => {
-            crate::hardware::available_devices().contains(&Device::Metal)
-        }
-        _ => false,
-    };
-    #[cfg(target_os = "macos")]
-    let metal_decoder = if want_metal {
-        match MetalQwenDecoder::new(&text) {
-            Ok(dec) => Some(Arc::new(dec)),
-            Err(e) => {
-                if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Metal)) {
-                    return Err(format!("Metal decoder initialization failed: {e}"));
-                }
-                tracing::warn!("Metal initialization failed, falling back to CPU: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    Ok(Arc::new(Dense {
-        tok,
-        text,
-        #[cfg(target_os = "macos")]
-        metal_decoder,
-    }))
+    let program = compile_qwen_program(&text, mode.into());
+    Ok(Arc::new(Dense { tok, text, program }))
 }
 
 /// The text decoder of a `Qwen3ForSequenceClassification` (`qwen3`) or
@@ -199,8 +176,7 @@ pub fn backbone(
     Ok(Box::new(Dense {
         tok,
         text: Arc::new(text),
-        #[cfg(target_os = "macos")]
-        metal_decoder: None,
+        program: None,
     }))
 }
 
@@ -338,28 +314,7 @@ fn gguf_model(
     let (ck, cfg, arch) = gguf_checkpoint(map, m)?;
     let text = Arc::new(TextModel::load(&ck, &cfg, arch)?);
     let tok = crate::model::UniversalModelLoader::extract_gguf_tokenizer(map)?;
-    let want_metal = match mode {
-        crate::hardware::PlacementMode::Pin(Device::Metal) => true,
-        crate::hardware::PlacementMode::Auto => {
-            crate::hardware::available_devices().contains(&Device::Metal)
-        }
-        _ => false,
-    };
-    #[cfg(target_os = "macos")]
-    let metal_decoder = if want_metal && !matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) {
-        match MetalQwenDecoder::new(&text) {
-            Ok(dec) => Some(Arc::new(dec)),
-            Err(e) => {
-                if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Metal)) {
-                    return Err(format!("Metal decoder initialization failed: {e}"));
-                }
-                tracing::warn!("Metal initialization failed, falling back to CPU: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let program = compile_qwen_program(&text, mode);
     Ok(if matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) {
         // llama.cpp ships the vision tower as a separate mmproj GGUF: images are refused.
         Arc::new(Qwen35 {
@@ -367,14 +322,10 @@ fn gguf_model(
             text,
             vision: None,
             drafter: None,
+            program,
         })
     } else {
-        Arc::new(Dense {
-            tok,
-            text,
-            #[cfg(target_os = "macos")]
-            metal_decoder,
-        })
+        Arc::new(Dense { tok, text, program })
     })
 }
 
@@ -408,6 +359,7 @@ pub fn load_ninfer(
             text: Arc::new(text),
             vision,
             drafter: None,
+            program: None,
         }))
     };
     Some(load().map_err(|e| format!("{}: {e}", path.display())))
@@ -566,6 +518,16 @@ fn gguf_checkpoint(
     let mut specs = Vec::with_capacity(m.tensors.len());
     // Expert banks: (HF name, byte offset, format, `[experts, rows, cols]`), left in the mapping.
     let mut packed = Vec::new();
+    let (kh, vh, vd, qk) = if matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) {
+        let k = cfg["linear_num_key_heads"].as_u64().unwrap_or(1) as usize;
+        let v = cfg["linear_num_value_heads"].as_u64().unwrap_or(1) as usize;
+        let d = cfg["linear_value_head_dim"].as_u64().unwrap_or(128) as usize;
+        let kd = cfg["linear_key_head_dim"].as_u64().unwrap_or(128) as usize;
+        (k, v, d, 2 * k * kd)
+    } else {
+        (1, 1, 128, 0)
+    };
+    let mut permuted_packed: Vec<(String, crate::model::weights::Packed)> = Vec::new();
     for (name, t) in &m.tensors {
         let block = name
             .strip_prefix("blk.")
@@ -591,7 +553,58 @@ fn gguf_checkpoint(
             .ok_or_else(|| format!("GGUF tensor '{name}' is not part of the {a} graph"))?;
         // GGUF lists dims fastest first.
         let mut shape: Vec<usize> = t.shape.iter().rev().copied().collect();
-        if hf.contains(".mlp.experts.") {
+        let is_permuted_linear = kh != vh
+            && shape.len() == 2
+            && (hf.ends_with(".linear_attn.in_proj_z.weight")
+                || hf.ends_with(".linear_attn.in_proj_qkv.weight"));
+
+        if is_permuted_linear {
+            let cols = shape[1];
+            let rows = shape[0];
+            let row_bytes = t.quant_format.tensor_bytes(cols);
+            let total_bytes = rows * row_bytes;
+            if t.byte_offset + total_bytes <= data.len() {
+                let slice = &data[t.byte_offset..t.byte_offset + total_bytes];
+                let prefix_rows = if hf.ends_with(".linear_attn.in_proj_qkv.weight") {
+                    qk.min(rows)
+                } else {
+                    0
+                };
+                let permuted = untile_packed_rows(slice, row_bytes, vd, kh, vh, prefix_rows);
+                permuted_packed.push((
+                    hf,
+                    crate::model::weights::Packed {
+                        map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(permuted)),
+                        off: 0,
+                        format: t.quant_format,
+                        shape,
+                    },
+                ));
+                continue;
+            }
+        }
+
+        let needs_transform = matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp)
+            && (hf.ends_with("norm.weight")
+                || hf.contains(".ple.norm_")
+                || hf.ends_with(".linear_attn.out_proj.weight")
+                || (hf.contains(".linear_attn.") && !is_permuted_linear));
+        let can_pack = (shape.len() == 2 || hf.contains(".mlp.experts."))
+            && matches!(
+                t.quant_format,
+                crate::hardware::QuantFormat::GGUF_Q4_0
+                    | crate::hardware::QuantFormat::GGUF_Q8_0
+                    | crate::hardware::QuantFormat::GGUF_IQ4_XS
+                    | crate::hardware::QuantFormat::GGUF_IQ2_M
+                    | crate::hardware::QuantFormat::GGUF_IQ2_S
+                    | crate::hardware::QuantFormat::GGUF_Q4_K_M
+                    | crate::hardware::QuantFormat::GGUF_IQ3_S
+                    | crate::hardware::QuantFormat::BF16
+                    | crate::hardware::QuantFormat::FP16
+            )
+            && !needs_transform;
+
+        if can_pack {
             packed.push((hf, t.byte_offset, t.quant_format, shape));
             continue;
         }
@@ -610,6 +623,10 @@ fn gguf_checkpoint(
         Ok(v)
     })?
     .with_gguf_packed(data, packed);
+    let mut ck = ck;
+    for (name, p) in permuted_packed {
+        ck.insert_packed(name, p);
+    }
     Ok((ck, cfg, arch))
 }
 
@@ -705,6 +722,35 @@ fn untile_heads(x: &mut [f32], k_heads: usize, block: usize) {
         }
     }
 }
+/// Untiles block-row slices directly in quantized packed byte buffer.
+fn untile_packed_rows(
+    data: &[u8],
+    row_bytes: usize,
+    rows_per_block: usize,
+    k_heads: usize,
+    v_heads: usize,
+    prefix_rows: usize,
+) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let per_k = v_heads / k_heads;
+    let block_bytes = rows_per_block * row_bytes;
+    let prefix_bytes = prefix_rows * row_bytes;
+    if prefix_bytes >= data.len() {
+        return out;
+    }
+    let tiled = &data[prefix_bytes..];
+    let dest = &mut out[prefix_bytes..];
+    for k in 0..k_heads {
+        for r in 0..per_k {
+            let src = (r * k_heads + k) * block_bytes;
+            let dst = (k * per_k + r) * block_bytes;
+            if src + block_bytes <= tiled.len() && dst + block_bytes <= dest.len() {
+                dest[dst..dst + block_bytes].copy_from_slice(&tiled[src..src + block_bytes]);
+            }
+        }
+    }
+    out
+}
 
 /// llama.cpp's `qwen3` / `hunyuan-dense` / `qwen35[moe]` / `qwen4exp` tensor names -> transformers'.
 fn gguf_to_hf(arch: Arch, name: &str) -> Option<String> {
@@ -783,17 +829,41 @@ fn gguf_to_hf(arch: Arch, name: &str) -> Option<String> {
 
 /// Text-only dense decoder (Qwen3, HunYuan dense v1); also the decoder body of the Qwen3 /
 /// Qwen3.5 sequence classifiers ([`backbone`]).
+fn compile_qwen_program(
+    text: &Arc<TextModel>,
+    mode: crate::hardware::PlacementMode,
+) -> Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>> {
+    if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
+        return None;
+    }
+    match text.to_decode_graph() {
+        Ok((graph, weights)) => {
+            match crate::graph::program::GraphProgram::compile(graph, weights, mode) {
+                Ok(prog) => Some(Arc::new(parking_lot::Mutex::new(prog))),
+                Err(e) => {
+                    tracing::warn!("GraphProgram compile failed, falling back to CPU: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Decode graph lowering failed, falling back to CPU: {e}");
+            None
+        }
+    }
+}
+
+/// Text-only dense decoder (Qwen3, HunYuan dense v1); also the decoder body of the Qwen3 /
+/// Qwen3.5 sequence classifiers ([`backbone`]).
 struct Dense {
     tok: Tokenizer,
     text: Arc<TextModel>,
-    #[cfg(target_os = "macos")]
-    metal_decoder: Option<Arc<MetalQwenDecoder>>,
+    program: Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>,
 }
 
 struct DenseSeq {
     layers: Vec<LayerState>,
-    #[cfg(target_os = "macos")]
-    metal_kv: Option<crate::backend::metal::MetalKvCache>,
+    program_state: crate::graph::StateStore,
     len: usize,
     /// Decoder layers whose outputs every forward records into `tapped` (see `set_taps`).
     taps: Vec<usize>,
@@ -802,17 +872,15 @@ struct DenseSeq {
 
 impl NativeLm for Dense {
     fn backend_label(&self) -> String {
-        #[cfg(target_os = "macos")]
-        if let Some(dec) = &self.metal_decoder {
-            return format!("Metal ({})", dec.device_name());
+        if let Some(prog) = &self.program {
+            return prog.lock().backend_label();
         }
         crate::scheduler::cpu_backend_label()
     }
 
     fn device(&self) -> Device {
-        #[cfg(target_os = "macos")]
-        if self.metal_decoder.is_some() {
-            return Device::Metal;
+        if let Some(prog) = &self.program {
+            return prog.lock().primary_device();
         }
         Device::Cpu
     }
@@ -826,23 +894,20 @@ impl NativeLm for Dense {
     }
 
     fn context_len(&self) -> usize {
-        self.text.context_len()
+        if self.program.is_some() {
+            self.text.decode_max_ctx
+        } else {
+            self.text.context_len()
+        }
     }
 
     fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
         if !media.is_empty() {
             return Err("this model takes text only".into());
         }
-        #[cfg(target_os = "macos")]
-        let metal_kv = if let Some(dec) = &self.metal_decoder {
-            dec.new_kv_cache().ok()
-        } else {
-            None
-        };
         let seq = DenseSeq {
             layers: self.text.new_state(),
-            #[cfg(target_os = "macos")]
-            metal_kv,
+            program_state: crate::graph::StateStore::new(),
             len: 0,
             taps: Vec::new(),
             tapped: Vec::new(),
@@ -873,10 +938,7 @@ impl NativeLm for Dense {
         if len > seq.len {
             return Err(format!("cannot truncate {} positions to {len}", seq.len));
         }
-        #[cfg(target_os = "macos")]
-        if let Some(kv) = &mut seq.metal_kv {
-            kv.len = len;
-        }
+
         self.text.truncate(&mut seq.layers, len)?;
         seq.len = len;
         Ok(())
@@ -922,23 +984,42 @@ impl Dense {
                 seq.len
             ));
         }
-        #[cfg(target_os = "macos")]
-        if let Some(dec) = &self.metal_decoder {
-            if !seq.taps.is_empty() {
-                return Err("hidden state tapping is not supported on Metal dense decoder".into());
-            }
-            if let Some(kv) = &mut seq.metal_kv {
-                kv.len = start_pos;
-                if all {
-                    let mut all_logits = Vec::with_capacity(tokens.len() * dec.vocab);
-                    for (i, &tok) in tokens.iter().enumerate() {
-                        let step_logits = dec.forward_tokens(&[tok], start_pos + i, kv)?;
-                        all_logits.extend_from_slice(&step_logits);
+        if let Some(prog) = &self.program {
+            if seq.taps.is_empty() {
+                let mut p = prog.lock();
+                std::mem::swap(&mut p.state, &mut seq.program_state);
+                let mut logits = Vec::new();
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let pos = start_pos + i;
+                    if pos >= self.text.decode_max_ctx {
+                        std::mem::swap(&mut p.state, &mut seq.program_state);
+                        return Err(format!(
+                            "position {pos} exceeds compiled decode context limit {}",
+                            self.text.decode_max_ctx
+                        ));
                     }
-                    seq.len = start_pos + tokens.len();
-                    return Ok(all_logits);
+                    let mut emb = vec![0.0f32; self.text.hidden()];
+                    self.text.embed(tok, &mut emb)?;
+                    let inputs = vec![
+                        crate::graph::Tensor::F32(emb),
+                        crate::graph::Tensor::U32(vec![pos as u32]),
+                    ];
+                    let step_out = p.run(inputs);
+                    match step_out {
+                        Ok(res) => {
+                            if all || i + 1 == tokens.len() {
+                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
+                                    logits.extend_from_slice(&v);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            std::mem::swap(&mut p.state, &mut seq.program_state);
+                            return Err(e);
+                        }
+                    }
                 }
-                let logits = dec.forward_tokens(tokens, start_pos, kv)?;
+                std::mem::swap(&mut p.state, &mut seq.program_state);
                 seq.len = start_pos + tokens.len();
                 return Ok(logits);
             }
@@ -979,6 +1060,7 @@ struct Qwen35 {
     /// checkpoints.
     vision: Option<(Vision, Preprocessor, u32)>,
     drafter: Option<Arc<dyn Drafter>>,
+    program: Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>,
 }
 
 /// No image feature at this prompt position.
@@ -987,6 +1069,7 @@ const TEXT_ROW: u32 = u32::MAX;
 /// One sequence: decoder state plus the prompt's image features and M-RoPE positions.
 struct Seq {
     layers: Vec<LayerState>,
+    program_state: crate::graph::StateStore,
     /// Positions already run.
     len: usize,
     /// (t, h, w) rotary positions of the prompt; empty for text-only prompts (all three = index).
@@ -1006,7 +1089,17 @@ struct Seq {
 
 impl NativeLm for Qwen35 {
     fn backend_label(&self) -> String {
+        if let Some(prog) = &self.program {
+            return prog.lock().backend_label();
+        }
         crate::scheduler::cpu_backend_label()
+    }
+
+    fn device(&self) -> Device {
+        if let Some(prog) = &self.program {
+            return prog.lock().primary_device();
+        }
+        Device::Cpu
     }
 
     fn summary(&self) -> String {
@@ -1026,7 +1119,11 @@ impl NativeLm for Qwen35 {
     }
 
     fn context_len(&self) -> usize {
-        self.text.context_len()
+        if self.program.is_some() {
+            self.text.decode_max_ctx
+        } else {
+            self.text.context_len()
+        }
     }
 
     fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
@@ -1034,6 +1131,7 @@ impl NativeLm for Qwen35 {
         let mut seq = Seq {
             layers: self.text.new_state(),
             len: 0,
+            program_state: crate::graph::StateStore::new(),
             pos3: Vec::new(),
             delta: 0,
             feat_row: Vec::new(),
@@ -1171,6 +1269,46 @@ impl Qwen35 {
                 seq.len
             ));
         }
+        if let Some(prog) = &self.program {
+            if seq.feats.is_empty() && seq.taps.is_empty() {
+                let mut p = prog.lock();
+                std::mem::swap(&mut p.state, &mut seq.program_state);
+                let mut logits = Vec::new();
+                for (i, &tok) in tokens.iter().enumerate() {
+                    let pos = start_pos + i;
+                    if pos >= self.text.decode_max_ctx {
+                        std::mem::swap(&mut p.state, &mut seq.program_state);
+                        return Err(format!(
+                            "position {pos} exceeds compiled decode context limit {}",
+                            self.text.decode_max_ctx
+                        ));
+                    }
+                    let mut emb = vec![0.0f32; self.text.hidden()];
+                    self.text.embed(tok, &mut emb)?;
+                    let inputs = vec![
+                        crate::graph::Tensor::F32(emb),
+                        crate::graph::Tensor::U32(vec![pos as u32]),
+                    ];
+                    let step_out = p.run(inputs);
+                    match step_out {
+                        Ok(res) => {
+                            if all || i + 1 == tokens.len() {
+                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
+                                    logits.extend_from_slice(&v);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            std::mem::swap(&mut p.state, &mut seq.program_state);
+                            return Err(e);
+                        }
+                    }
+                }
+                std::mem::swap(&mut p.state, &mut seq.program_state);
+                seq.len = start_pos + tokens.len();
+                return Ok(logits);
+            }
+        }
         if tokens.is_empty() {
             return Err("forward needs at least one token".into());
         }
@@ -1295,11 +1433,11 @@ fn linear(w: &Weights, prefixes: &[&str], bias: bool) -> Result<Linear, String> 
 // ---------------------------------------------------------------------------
 
 /// `y = x W^T (+ b)` with `W` the bf16 `parts` stacked along the output dim, `[rows, cols]`.
-struct Linear {
-    parts: Vec<Mat>,
-    rows: usize,
-    cols: usize,
-    bias: Option<Vec<f32>>,
+pub(crate) struct Linear {
+    pub(crate) parts: Vec<Mat>,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) bias: Option<Vec<f32>>,
 }
 
 impl Linear {
@@ -1344,6 +1482,19 @@ impl Linear {
         } else {
             let parts: Vec<&[u16]> = self.parts.iter().map(Mat::data).collect();
             linear_bf16(&parts, self.cols, self.bias.as_deref(), x, n)
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn to_graph_tensor(&self) -> crate::graph::Tensor {
+        if self.parts.len() == 1 {
+            self.parts[0].to_graph_tensor()
+        } else {
+            let mut all = Vec::with_capacity(self.rows * self.cols);
+            for p in &self.parts {
+                all.extend(p.to_f32());
+            }
+            crate::graph::Tensor::F32(all)
         }
     }
 }
@@ -1638,8 +1789,7 @@ mod tests {
         Dense {
             tok: load_json_tokenizer(&dir.join("tokenizer.json")).unwrap(),
             text: Arc::new(TextModel::load(&ck, &cfg, arch).unwrap()),
-            #[cfg(target_os = "macos")]
-            metal_decoder: None,
+            program: None,
         }
     }
 
@@ -2112,6 +2262,7 @@ mod tests {
             text: Arc::new(TextModel::load(&ck, text_config(&cfg), Arch::Qwen35).unwrap()),
             vision: None,
             drafter: None,
+            program: None,
         };
         for (path, min_cos) in files {
             let data = map_gguf(&path);
@@ -2213,6 +2364,7 @@ mod tests {
             text: Arc::new(TextModel::load(&qck, &cfg, Arch::Qwen35).unwrap()),
             vision: None,
             drafter: None,
+            program: None,
         };
         cfg["tie_word_embeddings"] = true.into();
         let source = Qwen35 {
@@ -2227,6 +2379,7 @@ mod tests {
             ),
             vision: None,
             drafter: None,
+            program: None,
         };
         let ids = quant
             .tok

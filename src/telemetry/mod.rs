@@ -180,6 +180,17 @@ impl EngineTelemetry {
         push_sample(&mut self.latencies.lock().itl_us, d);
     }
 
+    /// Returns the most recent `limit` token-to-token latency samples in milliseconds (oldest first).
+    pub fn recent_itl_ms(&self, limit: usize) -> Vec<f32> {
+        let l = self.latencies.lock();
+        let start = l.itl_us.len().saturating_sub(limit);
+        l.itl_us
+            .iter()
+            .skip(start)
+            .map(|&us| us as f32 / 1000.0)
+            .collect()
+    }
+
     /// One speculative step: `drafted` draft tokens, `accepted` of them kept, `emitted` output
     /// tokens from one target forward.
     pub fn record_spec(&self, drafted: usize, accepted: usize, emitted: usize) {
@@ -197,6 +208,9 @@ impl EngineTelemetry {
 
     pub fn set_model_size_bytes(&self, bytes: u64) {
         self.model_size_bytes.store(bytes, Ordering::Relaxed);
+    }
+    pub fn model_size_bytes(&self) -> u64 {
+        self.model_size_bytes.load(Ordering::Relaxed)
     }
 
     pub fn get_summary(&self) -> TelemetrySnapshot {

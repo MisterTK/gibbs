@@ -1,6 +1,7 @@
 //! Universal compiler optimization passes for Graph IR.
 
 pub mod fusion;
+pub mod megakernel;
 
 use crate::graph::pattern::validate_ssa;
 use crate::graph::{lower_moe_pass, Graph, Weights};
@@ -13,12 +14,14 @@ pub fn run_optimization_passes(
     // 1. Lower MoE nodes if present
     lower_moe_pass(graph)?;
 
-    // 2. Gate-Up MLP Fusion
+    // 2. Megakernel Fusion (fuses entire transformer blocks: RmsNorm -> Gate/Up -> SwiGlu -> Down -> Add)
+    megakernel::fuse_megakernel_blocks_pass(graph);
+
+    // 3. Gate-Up MLP Fusion (for any unfused MLP blocks)
     fusion::fuse_gate_up_pass(graph, weights.as_deref_mut());
 
-    // 3. QKV Projection Fusion
+    // 4. QKV Projection Fusion
     fusion::fuse_qkv_pass(graph, weights.as_deref_mut());
-
     // 4. Verify graph SSA integrity
     validate_ssa(graph)?;
 
@@ -138,6 +141,6 @@ mod tests {
         assert!(!node_names.contains(&"gate"));
         assert!(!node_names.contains(&"up"));
         assert!(node_names.iter().any(|n| n.ends_with(".fused_qkv")));
-        assert!(node_names.iter().any(|n| n.ends_with(".fused_gate_up")));
+        assert!(node_names.iter().any(|n| n.ends_with(".fused_mlp")));
     }
 }
