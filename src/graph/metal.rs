@@ -1587,7 +1587,7 @@ impl Session {
                     enc.set_buffer(6, Some(scales_buf), 0);
                     set_bytes(enc, 7, global_scale);
                     enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(8), 1, 1),
+                        MTLSize::new((rows as u64).div_ceil(16), 1, 1),
                         MTLSize::new(256, 1, 1),
                     );
                     return Ok(());
@@ -1833,7 +1833,7 @@ impl Session {
                     enc.set_buffer(6, Some(scales_buf), 0);
                     set_bytes(enc, 7, global_scale);
                     enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(8), m as u64, 1),
+                        MTLSize::new((rows as u64).div_ceil(16), m as u64, 1),
                         MTLSize::new(256, 1, 1),
                     );
                     return Ok(());
@@ -4680,7 +4680,7 @@ mod tests {
             set_bytes(enc, 7, &global_scale);
 
             enc.dispatch_thread_groups(
-                MTLSize::new((rows as u64).div_ceil(8), 1, 1),
+                MTLSize::new((rows as u64).div_ceil(16), 1, 1),
                 MTLSize::new(256, 1, 1),
             );
             enc.end_encoding();
