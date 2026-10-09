@@ -213,7 +213,7 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
         return 0;
     }
 
-    let mut weight_updates: Vec<(String, Tensor)> = Vec::new();
+    let mut weight_updates: Vec<(String, Tensor, Vec<String>)> = Vec::new();
 
     let rewrites = GraphRewriter::replace(graph, &matches, |g, m| {
         let q_id = m.get("q")?;
@@ -277,12 +277,22 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
             let q_t = w_store.get(&g.value(q_w_id).name)?;
             let k_t = w_store.get(&g.value(k_w_id).name)?;
             let v_t = w_store.get(&g.value(v_w_id).name)?;
-
+            if matches!(q_t, Tensor::Mat(_))
+                || matches!(k_t, Tensor::Mat(_))
+                || matches!(v_t, Tensor::Mat(_))
+            {
+                return None;
+            }
             let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t], in_features)?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
-            weight_updates.push((fused_w_name.clone(), fused_tensor));
+            let old_names = vec![
+                g.value(q_w_id).name.clone(),
+                g.value(k_w_id).name.clone(),
+                g.value(v_w_id).name.clone(),
+            ];
+            weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
         }
 
         let fused_w = g.weight(fused_w_name, vec![total_out, in_features], dtype);
@@ -340,8 +350,11 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
     });
 
     if let Some(ref mut w_store) = weights {
-        for (name, tensor) in weight_updates {
+        for (name, tensor, old_names) in weight_updates {
             w_store.insert(name, tensor);
+            for old in old_names {
+                w_store.remove(&old);
+            }
         }
     }
 
@@ -363,7 +376,7 @@ pub fn fuse_gate_up_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -
         return 0;
     }
 
-    let mut weight_updates: Vec<(String, Tensor)> = Vec::new();
+    let mut weight_updates: Vec<(String, Tensor, Vec<String>)> = Vec::new();
 
     let rewrites = GraphRewriter::replace(graph, &matches, |g, m| {
         let a_id = m.get("gate")?;
@@ -428,12 +441,18 @@ pub fn fuse_gate_up_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -
         if let Some(ref w_store) = weights {
             let gate_t = w_store.get(&g.value(gate_w_id).name)?;
             let up_t = w_store.get(&g.value(up_w_id).name)?;
-
+            if matches!(gate_t, Tensor::Mat(_)) || matches!(up_t, Tensor::Mat(_)) {
+                return None;
+            }
             let fused_tensor = concat_weight_tensors(&[gate_t, up_t], in_features)?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
-            weight_updates.push((fused_w_name.clone(), fused_tensor));
+            let old_names = vec![
+                g.value(gate_w_id).name.clone(),
+                g.value(up_w_id).name.clone(),
+            ];
+            weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
         }
 
         let fused_w = g.weight(fused_w_name, vec![total_out, in_features], dtype);
@@ -479,8 +498,11 @@ pub fn fuse_gate_up_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -
     });
 
     if let Some(ref mut w_store) = weights {
-        for (name, tensor) in weight_updates {
+        for (name, tensor, old_names) in weight_updates {
             w_store.insert(name, tensor);
+            for old in old_names {
+                w_store.remove(&old);
+            }
         }
     }
 

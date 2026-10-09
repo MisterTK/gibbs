@@ -302,8 +302,7 @@ mod tests {
         Gemma4 {
             tokenizer: Default::default(),
             text: std::sync::Arc::new(TextModel::load(&w, &tc).unwrap()),
-            #[cfg(target_os = "macos")]
-            metal_decoder: None,
+            program: None,
             unified: true,
             vision: Box::new(VisionEmbedder::load(&w, &vc, &processor).unwrap()),
             audio: Box::new(AudioEmbedder::load(&w, &Value::Null, &processor).unwrap()),

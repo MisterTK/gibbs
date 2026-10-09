@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -69,6 +69,18 @@ impl RadixPrefixCache {
                     drop(child);
                     current_node = child_arc;
                 } else {
+                    let mut common = 0;
+                    while token_idx + common < tokens.len()
+                        && common < prefix_len
+                        && tokens[token_idx + common] == child.token_prefix[common]
+                    {
+                        common += 1;
+                    }
+                    let common_blocks = (common / TOKENS_PER_BLOCK).min(child.block_ids.len());
+                    if common_blocks > 0 {
+                        matched_blocks.extend_from_slice(&child.block_ids[..common_blocks]);
+                        matched_tokens += common_blocks * TOKENS_PER_BLOCK;
+                    }
                     break;
                 }
             } else {
@@ -86,22 +98,84 @@ impl RadixPrefixCache {
     }
 
     pub fn insert_prefix(&self, tokens: &[u32], blocks: &[BlockId]) {
-        if tokens.is_empty() {
+        if tokens.is_empty() || blocks.is_empty() {
             return;
         }
 
-        let current_node = self.root.clone();
-        let first_token = tokens[0];
+        let mut current_node = self.root.clone();
+        let mut rem_tokens = tokens;
+        let mut rem_blocks = blocks;
 
-        let mut root_guard = current_node.write();
-        let child = root_guard
-            .children
-            .entry(first_token)
-            .or_insert_with(|| Arc::new(RwLock::new(RadixNode::default())));
+        while !rem_tokens.is_empty() {
+            let first_token = rem_tokens[0];
+            let next_node = {
+                let node = current_node.read();
+                node.children.get(&first_token).cloned()
+            };
 
-        let mut child_guard = child.write();
-        child_guard.token_prefix = tokens.to_vec();
-        child_guard.block_ids = blocks.to_vec();
+            match next_node {
+                None => {
+                    let mut node = current_node.write();
+                    if let Some(existing) = node.children.get(&first_token).cloned() {
+                        drop(node);
+                        current_node = existing;
+                        continue;
+                    }
+                    let child = Arc::new(RwLock::new(RadixNode {
+                        token_prefix: rem_tokens.to_vec(),
+                        block_ids: rem_blocks.to_vec(),
+                        children: HashMap::new(),
+                    }));
+                    node.children.insert(first_token, child);
+                    break;
+                }
+                Some(child_arc) => {
+                    let mut child = child_arc.write();
+                    let common_len = rem_tokens
+                        .iter()
+                        .zip(child.token_prefix.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+
+                    if common_len == child.token_prefix.len() {
+                        let consumed_blocks = child.block_ids.len().min(rem_blocks.len());
+                        rem_tokens = &rem_tokens[common_len..];
+                        rem_blocks = &rem_blocks[consumed_blocks..];
+                        drop(child);
+                        current_node = child_arc;
+                    } else {
+                        let split_blocks_count =
+                            (common_len / TOKENS_PER_BLOCK).min(child.block_ids.len());
+
+                        let old_suffix = RadixNode {
+                            token_prefix: child.token_prefix[common_len..].to_vec(),
+                            block_ids: child.block_ids[split_blocks_count..].to_vec(),
+                            children: std::mem::take(&mut child.children),
+                        };
+                        let old_suffix_first = old_suffix.token_prefix[0];
+
+                        child.token_prefix.truncate(common_len);
+                        child.block_ids.truncate(split_blocks_count);
+                        child
+                            .children
+                            .insert(old_suffix_first, Arc::new(RwLock::new(old_suffix)));
+
+                        if common_len < rem_tokens.len() {
+                            let new_suffix = RadixNode {
+                                token_prefix: rem_tokens[common_len..].to_vec(),
+                                block_ids: rem_blocks[split_blocks_count..].to_vec(),
+                                children: HashMap::new(),
+                            };
+                            let new_suffix_first = new_suffix.token_prefix[0];
+                            child
+                                .children
+                                .insert(new_suffix_first, Arc::new(RwLock::new(new_suffix)));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     pub fn metrics(&self) -> (usize, usize) {
@@ -112,10 +186,15 @@ impl RadixPrefixCache {
     }
 }
 
+#[derive(Debug)]
+pub struct KvBlockPool {
+    pub free_blocks: Vec<BlockId>,
+    pub active_blocks: HashMap<BlockId, PhysicalBlock>,
+}
+
 pub struct PagedKVPool {
     pub total_blocks: usize,
-    free_blocks: RwLock<Vec<BlockId>>,
-    active_blocks: RwLock<HashMap<BlockId, PhysicalBlock>>,
+    pub pool: Mutex<KvBlockPool>,
     pub radix_cache: Arc<RadixPrefixCache>,
 }
 
@@ -124,18 +203,18 @@ impl PagedKVPool {
         let free = (0..total_blocks).map(BlockId).collect();
         Self {
             total_blocks,
-            free_blocks: RwLock::new(free),
-            active_blocks: RwLock::new(HashMap::new()),
+            pool: Mutex::new(KvBlockPool {
+                free_blocks: free,
+                active_blocks: HashMap::new(),
+            }),
             radix_cache: Arc::new(RadixPrefixCache::new()),
         }
     }
 
     pub fn allocate_block(&self, current_step: usize) -> Option<BlockId> {
-        let mut free = self.free_blocks.write();
-        let block_id = free.pop()?;
-        
-        let mut active = self.active_blocks.write();
-        active.insert(
+        let mut pool = self.pool.lock();
+        let block_id = pool.free_blocks.pop()?;
+        pool.active_blocks.insert(
             block_id,
             PhysicalBlock {
                 id: block_id,
@@ -143,23 +222,183 @@ impl PagedKVPool {
                 last_accessed_step: current_step,
             },
         );
-
         Some(block_id)
     }
 
     pub fn release_block(&self, block_id: BlockId) {
-        let mut active = self.active_blocks.write();
-        if let Some(block) = active.get_mut(&block_id) {
+        let mut pool = self.pool.lock();
+        if let Some(block) = pool.active_blocks.get_mut(&block_id) {
             block.ref_count = block.ref_count.saturating_sub(1);
             if block.ref_count == 0 {
-                active.remove(&block_id);
-                self.free_blocks.write().push(block_id);
+                pool.active_blocks.remove(&block_id);
+                pool.free_blocks.push(block_id);
             }
         }
     }
 
     pub fn utilization(&self) -> f32 {
-        let free_count = self.free_blocks.read().len();
+        let free_count = self.pool.lock().free_blocks.len();
         (self.total_blocks - free_count) as f32 / self.total_blocks as f32
+    }
+}
+
+/// A sequence's logical-to-physical block mapping.
+#[derive(Debug, Clone, Default)]
+pub struct BlockTable {
+    pub block_ids: Vec<BlockId>,
+}
+
+impl BlockTable {
+    pub fn new() -> Self {
+        Self {
+            block_ids: Vec::new(),
+        }
+    }
+
+    /// Ensures sufficient physical blocks are allocated from `pool` to cover `seq_len` tokens.
+    pub fn ensure_capacity(
+        &mut self,
+        pool: &PagedKVPool,
+        seq_len: usize,
+        step: usize,
+    ) -> Result<(), String> {
+        let needed_blocks = seq_len.div_ceil(TOKENS_PER_BLOCK);
+        while self.block_ids.len() < needed_blocks {
+            let blk = pool
+                .allocate_block(step)
+                .ok_or_else(|| "KV pool out of free blocks".to_string())?;
+            self.block_ids.push(blk);
+        }
+        Ok(())
+    }
+
+    /// Releases all allocated blocks back to `pool`.
+    pub fn release_all(&mut self, pool: &PagedKVPool) {
+        for blk in self.block_ids.drain(..) {
+            pool.release_block(blk);
+        }
+    }
+
+    /// Exports block IDs as u32 indices for GPU / graph binding.
+    pub fn as_u32_indices(&self, max_blocks: usize) -> Vec<u32> {
+        let mut out = vec![0u32; max_blocks];
+        for (i, blk) in self.block_ids.iter().enumerate().take(max_blocks) {
+            out[i] = blk.0 as u32;
+        }
+        out
+    }
+}
+
+/// Unified physical KV memory arena hosting pre-allocated K and V pools.
+pub struct PagedKvArena {
+    pub pool: Arc<PagedKVPool>,
+    pub kv_dim: usize,
+    pub total_slots: usize,
+    pub k_pool: Vec<f32>,
+    pub v_pool: Vec<f32>,
+}
+
+impl PagedKvArena {
+    pub fn new(pool: Arc<PagedKVPool>, kv_dim: usize) -> Self {
+        let total_slots = pool.total_blocks * TOKENS_PER_BLOCK;
+        let buf_size = total_slots * kv_dim;
+        Self {
+            pool,
+            kv_dim,
+            total_slots,
+            k_pool: vec![0.0f32; buf_size],
+            v_pool: vec![0.0f32; buf_size],
+        }
+    }
+
+    /// Physical linear index for token `t` within a sequence mapped by `block_table`.
+    #[inline(always)]
+    pub fn physical_offset(&self, block_table: &BlockTable, t: usize) -> Option<usize> {
+        let blk_idx = t / TOKENS_PER_BLOCK;
+        let blk_off = t % TOKENS_PER_BLOCK;
+        let blk_id = block_table.block_ids.get(blk_idx)?;
+        Some((blk_id.0 * TOKENS_PER_BLOCK + blk_off) * self.kv_dim)
+    }
+
+    /// Writes key and value vectors into the arena at token index `t`.
+    pub fn write_kv(
+        &mut self,
+        block_table: &BlockTable,
+        t: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<(), String> {
+        let off = self
+            .physical_offset(block_table, t)
+            .ok_or_else(|| format!("Token position {t} exceeds mapped block table"))?;
+        if k.len() != self.kv_dim || v.len() != self.kv_dim {
+            return Err(format!(
+                "KV vector dim mismatch: expected {}, got {} / {}",
+                self.kv_dim,
+                k.len(),
+                v.len()
+            ));
+        }
+        self.k_pool[off..off + self.kv_dim].copy_from_slice(k);
+        self.v_pool[off..off + self.kv_dim].copy_from_slice(v);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kv_block_pool_lock_order_and_utilization() {
+        let pool = PagedKVPool::new(10);
+        assert_eq!(pool.utilization(), 0.0);
+
+        let b0 = pool.allocate_block(1).expect("alloc b0");
+        let b1 = pool.allocate_block(2).expect("alloc b1");
+        assert_eq!(pool.utilization(), 0.2);
+
+        pool.release_block(b0);
+        assert_eq!(pool.utilization(), 0.1);
+
+        pool.release_block(b1);
+        assert_eq!(pool.utilization(), 0.0);
+    }
+
+    #[test]
+    fn test_radix_prefix_cache_hierarchical_split_and_match() {
+        let cache = RadixPrefixCache::new();
+
+        // Prefix A: 32 tokens (2 blocks)
+        let mut tokens_a = vec![10u32; 16];
+        tokens_a.extend_from_slice(&[20u32; 16]);
+        let blocks_a = vec![BlockId(100), BlockId(101)];
+        cache.insert_prefix(&tokens_a, &blocks_a);
+
+        // Match prefix A exactly
+        let (matched_blocks, matched_tokens) = cache.match_prefix(&tokens_a);
+        assert_eq!(matched_tokens, 32);
+        assert_eq!(matched_blocks, blocks_a);
+
+        // Prefix B: shares first 16 tokens with A, has different second 16 tokens
+        let mut tokens_b = vec![10u32; 16];
+        tokens_b.extend_from_slice(&[30u32; 16]);
+        let blocks_b = vec![BlockId(100), BlockId(102)]; // Shares BlockId(100)
+        cache.insert_prefix(&tokens_b, &blocks_b);
+
+        // Query prefix B
+        let (matched_b, count_b) = cache.match_prefix(&tokens_b);
+        assert_eq!(count_b, 32);
+        assert_eq!(matched_b[0], BlockId(100));
+        assert_eq!(matched_b[1], BlockId(102));
+
+        // Query prefix A again to verify split didn't break prefix A
+        let (matched_a, count_a) = cache.match_prefix(&tokens_a);
+        assert_eq!(count_a, 32);
+        assert_eq!(matched_a, blocks_a);
+
+        let (hits, misses) = cache.metrics();
+        assert!(hits >= 64);
+        assert_eq!(misses, 0);
     }
 }

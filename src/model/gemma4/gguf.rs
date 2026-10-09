@@ -8,7 +8,6 @@ use super::audio::Audio;
 use super::text::{PleTable, TextModel};
 use super::vision::Vision;
 use super::{Encoder, Gemma4, NoEncoder};
-use crate::hardware::Device;
 use crate::model::hub::{local_mmproj, ModelArtifacts};
 use crate::model::native::NativeLm;
 use crate::model::weights::Weights;
@@ -107,33 +106,11 @@ fn model(
         }
     };
     let mode = mode.into();
-    let want_metal = match mode {
-        crate::hardware::PlacementMode::Pin(Device::Metal) => true,
-        crate::hardware::PlacementMode::Auto => {
-            crate::hardware::available_devices().contains(&Device::Metal)
-        }
-        _ => false,
-    };
-    #[cfg(target_os = "macos")]
-    let metal_decoder = if want_metal {
-        match super::metal::MetalGemma4Decoder::new(&text) {
-            Ok(dec) => Some(Arc::new(dec)),
-            Err(e) => {
-                if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Metal)) {
-                    return Err(format!("Metal decoder initialization failed: {e}"));
-                }
-                tracing::warn!("Metal initialization failed, falling back to CPU: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let program = super::compile_gemma4_program(&text, mode);
     Ok(Arc::new(Gemma4 {
         tokenizer,
         text,
-        #[cfg(target_os = "macos")]
-        metal_decoder,
+        program,
         unified: false,
         vision,
         audio,

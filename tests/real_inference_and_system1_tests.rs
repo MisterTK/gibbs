@@ -1835,6 +1835,7 @@ fn test_chat_template_and_scheduler_greedy_match_hf() {
             temperature: Some(0.0),
             top_p: None,
             max_new_tokens: DEFAULT_MAX_NEW_TOKENS,
+            top_logprobs: None,
         };
         let (_, mut rx, _, _, _) = sched.submit_with_params(greedy, |tok| {
             let ids =

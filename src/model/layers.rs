@@ -607,7 +607,7 @@ pub fn gguf_block_codec(format: QuantFormat) -> Option<(usize, usize, GgufBlockF
         QuantFormat::GGUF_IQ3_S => (256, 110, dequantize_iq3_s_block),
         QuantFormat::GGUF_IQ2_XXS => (256, 66, dequantize_iq2_xxs_block),
         QuantFormat::GGUF_IQ2_XS => (256, 74, dequantize_iq2_xs_block),
-        QuantFormat::GGUF_IQ2_S => (256, 82, dequantize_iq2_s_block),
+        QuantFormat::GGUF_IQ2_S | QuantFormat::GGUF_IQ2_M => (256, 82, dequantize_iq2_s_block),
         QuantFormat::GGUF_IQ1_S => (256, 50, dequantize_iq1_s_block),
         QuantFormat::GGUF_IQ1_M => (256, 56, dequantize_iq1_m_block),
         QuantFormat::GGUF_TQ1_0 => (256, 54, dequantize_tq1_0_block),

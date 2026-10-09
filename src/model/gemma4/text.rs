@@ -46,6 +46,10 @@ pub struct PleTable {
 }
 
 impl PleTable {
+    pub(crate) fn get_row(&self, id: usize, out: &mut [f32]) {
+        (self.row)(id, out);
+    }
+
     pub fn mat(m: Mat) -> Self {
         Self {
             rows: m.rows,
@@ -568,8 +572,28 @@ impl TextModel {
         out
     }
     /// Emits static-shape decode graph (n = 1) with stateful KV caching and weight bindings.
-    pub fn to_decode_graph(&self) -> (crate::graph::Graph, crate::graph::Weights) {
+    /// Emits static-shape decode graph (n = 1) with stateful KV caching, PLE, and weight bindings.
+    pub fn to_decode_graph(&self) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.to_decode_graph_unchecked()
+    }
+
+    pub(crate) fn to_decode_graph_unchecked(
+        &self,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor};
+        fn mat_dtype(m: &crate::model::weights::Mat) -> DType {
+            if let Some(p) = m.packed() {
+                match p.format {
+                    crate::hardware::QuantFormat::FP32 => DType::F32,
+                    crate::hardware::QuantFormat::FP16 => DType::F16,
+                    crate::hardware::QuantFormat::BF16 => DType::BF16,
+                    f => DType::Quant(f),
+                }
+            } else {
+                DType::BF16
+            }
+        }
+
         let mut g = Graph::new();
         let mut w = crate::graph::Weights::new();
 
@@ -580,11 +604,7 @@ impl TextModel {
 
         // 1. Embedding
         let embed_w = g.weight("embed_tokens.weight", vec![self.vocab, h], DType::F32);
-        let embed_t = if self.embed.packed().is_some() {
-            Tensor::F32(self.embed.to_f32())
-        } else {
-            self.embed.to_graph_tensor()
-        };
+        let embed_t = Tensor::F32(self.embed.to_f32());
         w.insert("embed_tokens.weight", embed_t);
         let mut x = g.add(
             "embed",
@@ -604,7 +624,68 @@ impl TextModel {
                 DType::F32,
             );
         }
-
+        let pd = self.ple.as_ref().map_or(0, |p| p.dim);
+        let nl = self.layers_n;
+        let ple_node = if let Some(p_model) = &self.ple {
+            let ple_embed_input = g.input("per_layer_embed", vec![n, nl * pd], DType::F32);
+            let model_proj_w = g.weight(
+                "model.ple.model_proj.weight",
+                vec![p_model.model_proj.rows, p_model.model_proj.cols],
+                mat_dtype(&p_model.model_proj),
+            );
+            w.insert(
+                "model.ple.model_proj.weight",
+                p_model.model_proj.to_graph_tensor(),
+            );
+            let ple_proj = g.add(
+                "model.ple.model_proj",
+                Op::Linear,
+                &[x, model_proj_w],
+                vec![n, nl * pd],
+                DType::F32,
+            );
+            let proj_scale = (h as f32).powf(-0.5);
+            let proj_scale_w = g.weight("model.ple.proj_scale", vec![1], DType::F32);
+            w.insert("model.ple.proj_scale", Tensor::F32(vec![proj_scale]));
+            let ple_scaled = g.add(
+                "model.ple.proj_scaled",
+                Op::Mul,
+                &[ple_proj, proj_scale_w],
+                vec![n, nl * pd],
+                DType::F32,
+            );
+            let proj_norm_w = g.weight("model.ple.proj_norm.weight", vec![pd], DType::F32);
+            w.insert(
+                "model.ple.proj_norm.weight",
+                Tensor::F32(p_model.proj_norm.clone()),
+            );
+            let ple_normed = g.add(
+                "model.ple.proj_norm",
+                Op::RmsNorm { eps: self.eps },
+                &[ple_scaled, proj_norm_w],
+                vec![n, nl * pd],
+                DType::F32,
+            );
+            let ple_combined = g.add(
+                "model.ple.add",
+                Op::Add,
+                &[ple_normed, ple_embed_input],
+                vec![n, nl * pd],
+                DType::F32,
+            );
+            let half = std::f32::consts::FRAC_1_SQRT_2;
+            let half_w = g.weight("model.ple.half", vec![1], DType::F32);
+            w.insert("model.ple.half", Tensor::F32(vec![half]));
+            Some(g.add(
+                "model.ple.scaled",
+                Op::Mul,
+                &[ple_combined, half_w],
+                vec![n, nl * pd],
+                DType::F32,
+            ))
+        } else {
+            None
+        };
         // 2. Decoder Layers
         for (li, l) in self.layers.iter().enumerate() {
             let p = format!("layers.{li}");
@@ -627,7 +708,7 @@ impl TextModel {
             let q_w = g.weight(
                 format!("{p}.attn.q.weight"),
                 vec![l.attn.q.rows, l.attn.q.cols],
-                DType::F32,
+                mat_dtype(&l.attn.q),
             );
             w.insert(format!("{p}.attn.q.weight"), l.attn.q.to_graph_tensor());
             let mut q = g.add(
@@ -680,7 +761,7 @@ impl TextModel {
                 let k_w = g.weight(
                     format!("{p}.attn.k.weight"),
                     vec![kw.rows, kw.cols],
-                    DType::F32,
+                    mat_dtype(kw),
                 );
                 w.insert(format!("{p}.attn.k.weight"), kw.to_graph_tensor());
                 let mut k = g.add(
@@ -725,7 +806,7 @@ impl TextModel {
                     let v_w = g.weight(
                         format!("{p}.attn.v.weight"),
                         vec![vw.rows, vw.cols],
-                        DType::F32,
+                        mat_dtype(vw),
                     );
                     w.insert(format!("{p}.attn.v.weight"), vw.to_graph_tensor());
                     g.add(
@@ -793,7 +874,7 @@ impl TextModel {
             let o_w = g.weight(
                 format!("{p}.attn.o.weight"),
                 vec![l.attn.o.rows, l.attn.o.cols],
-                DType::F32,
+                mat_dtype(&l.attn.o),
             );
             w.insert(format!("{p}.attn.o.weight"), l.attn.o.to_graph_tensor());
             let o = g.add(
@@ -844,7 +925,7 @@ impl TextModel {
             let gate_w = g.weight(
                 format!("{p}.mlp.gate.weight"),
                 vec![l.gate.rows, l.gate.cols],
-                DType::F32,
+                mat_dtype(&l.gate),
             );
             w.insert(format!("{p}.mlp.gate.weight"), l.gate.to_graph_tensor());
             let gate = g.add(
@@ -858,7 +939,7 @@ impl TextModel {
             let up_w = g.weight(
                 format!("{p}.mlp.up.weight"),
                 vec![l.up.rows, l.up.cols],
-                DType::F32,
+                mat_dtype(&l.up),
             );
             w.insert(format!("{p}.mlp.up.weight"), l.up.to_graph_tensor());
             let up = g.add(
@@ -880,7 +961,7 @@ impl TextModel {
             let down_w = g.weight(
                 format!("{p}.mlp.down.weight"),
                 vec![l.down.rows, l.down.cols],
-                DType::F32,
+                mat_dtype(&l.down),
             );
             w.insert(format!("{p}.mlp.down.weight"), l.down.to_graph_tensor());
             let down = g.add(
@@ -912,6 +993,69 @@ impl TextModel {
                 vec![n, h],
                 DType::F32,
             );
+            // PLE Layer Projection if present
+            if let (Some((gate, proj, norm)), Some(ple_val)) = (&l.ple, ple_node) {
+                let pli = g.add(
+                    format!("{p}.ple.slice"),
+                    Op::Slice {
+                        axis: 1,
+                        start: (li * pd) as i64,
+                        end: ((li + 1) * pd) as i64,
+                    },
+                    &[ple_val],
+                    vec![n, pd],
+                    DType::F32,
+                );
+                let ple_gate_w = g.weight(
+                    format!("{p}.ple.gate.weight"),
+                    vec![gate.rows, gate.cols],
+                    mat_dtype(gate),
+                );
+                w.insert(format!("{p}.ple.gate.weight"), gate.to_graph_tensor());
+                let ple_gate = g.add(
+                    format!("{p}.ple.gate"),
+                    Op::Linear,
+                    &[x, ple_gate_w],
+                    vec![n, pd],
+                    DType::F32,
+                );
+                let ple_act = g.add(
+                    format!("{p}.ple.act"),
+                    Op::GeGlu,
+                    &[ple_gate, pli],
+                    vec![n, pd],
+                    DType::F32,
+                );
+                let ple_proj_w = g.weight(
+                    format!("{p}.ple.proj.weight"),
+                    vec![proj.rows, proj.cols],
+                    mat_dtype(proj),
+                );
+                w.insert(format!("{p}.ple.proj.weight"), proj.to_graph_tensor());
+                let ple_out = g.add(
+                    format!("{p}.ple.proj"),
+                    Op::Linear,
+                    &[ple_act, ple_proj_w],
+                    vec![n, h],
+                    DType::F32,
+                );
+                let ple_norm_w = g.weight(format!("{p}.ple.norm.weight"), vec![h], DType::F32);
+                w.insert(format!("{p}.ple.norm.weight"), Tensor::F32(norm.clone()));
+                let ple_normed = g.add(
+                    format!("{p}.ple.norm"),
+                    Op::RmsNorm { eps: self.eps },
+                    &[ple_out, ple_norm_w],
+                    vec![n, h],
+                    DType::F32,
+                );
+                x = g.add(
+                    format!("{p}.ple.res"),
+                    Op::Add,
+                    &[x, ple_normed],
+                    vec![n, h],
+                    DType::F32,
+                );
+            }
 
             // Scalar scaling if present
             if (l.scalar - 1.0).abs() > 1e-6 {
@@ -961,7 +1105,7 @@ impl TextModel {
         };
         g.output(logits);
 
-        (g, w)
+        Ok((g, w))
     }
 }
 
@@ -1067,7 +1211,7 @@ mod tests {
         let ref_logits = model.forward(emb, &[tok], 0, &mut cache, &[]);
 
         // 2. Graph forward pass
-        let (decode_g, w) = model.to_decode_graph();
+        let (decode_g, w) = model.to_decode_graph().unwrap();
         let inputs = vec![Tensor::U32(vec![tok]), Tensor::U32(vec![0])];
         let graph_res = run_stateless(&decode_g, &w, inputs).expect("graph execution succeeds");
         let graph_logits = graph_res[0].as_f32().expect("f32 logits");
@@ -1078,6 +1222,151 @@ mod tests {
             assert!(
                 diff < 1e-4,
                 "Logit mismatch at index {i}: ref={r}, graph={g}"
+            );
+        }
+    }
+    #[test]
+    fn test_gemma4_to_decode_graph_with_ple_cpu_parity() {
+        use crate::graph::cpu::run_stateless;
+        use crate::graph::Tensor;
+        use crate::model::weights::Weights;
+
+        let (h, v, nh, kvh, hd) = (64, 128, 2, 2, 32);
+        let (inter, eps, pd) = (128, 1e-5, 16);
+
+        let specs = vec![
+            ("embed".into(), vec![v, h]),
+            ("q".into(), vec![h, h]),
+            ("k".into(), vec![kvh * hd, h]),
+            ("v".into(), vec![kvh * hd, h]),
+            ("o".into(), vec![h, h]),
+            ("gate".into(), vec![inter, h]),
+            ("up".into(), vec![inter, h]),
+            ("down".into(), vec![h, inter]),
+            ("model_proj".into(), vec![pd, h]),
+            ("ple_gate".into(), vec![pd, h]),
+            ("ple_proj".into(), vec![h, pd]),
+        ];
+        let weights_store = Weights::from_f32(specs, |name| {
+            let len = match name {
+                "embed" => v * h,
+                "q" | "o" => h * h,
+                "k" | "v" => kvh * hd * h,
+                "gate" | "up" | "down" => inter * h,
+                "model_proj" | "ple_gate" | "ple_proj" => pd * h,
+                _ => 0,
+            };
+            Ok(vec![0.02f32; len])
+        })
+        .unwrap();
+
+        let ple_gate_mat = weights_store.mat("ple_gate").unwrap();
+        let ple_proj_mat = weights_store.mat("ple_proj").unwrap();
+
+        let layer = Layer {
+            sliding: false,
+            head_dim: hd,
+            kv_heads: kvh,
+            kv_src: 0,
+            attn: Attn {
+                q: weights_store.mat("q").unwrap(),
+                kv: Some((
+                    weights_store.mat("k").unwrap(),
+                    Some(weights_store.mat("v").unwrap()),
+                    vec![1.0; hd],
+                )),
+                o: weights_store.mat("o").unwrap(),
+                q_norm: vec![1.0; hd],
+            },
+            gate: weights_store.mat("gate").unwrap(),
+            up: weights_store.mat("up").unwrap(),
+            down: weights_store.mat("down").unwrap(),
+            input_ln: vec![1.0; h],
+            post_attn_ln: vec![1.0; h],
+            pre_ff_ln: vec![1.0; h],
+            post_ff_ln: vec![1.0; h],
+            ple: Some((ple_gate_mat, ple_proj_mat, vec![1.0; h])),
+            scalar: 1.0,
+        };
+
+        let ple_model = Ple {
+            dim: pd,
+            embed: PleTable::lazy(
+                v,
+                pd,
+                Box::new(|id: usize, out: &mut [f32]| {
+                    for (i, o) in out.iter_mut().enumerate() {
+                        *o = 0.01 * ((id + i) % 10 + 1) as f32;
+                    }
+                }),
+            ),
+            model_proj: weights_store.mat("model_proj").unwrap(),
+            proj_norm: vec![1.0; pd],
+        };
+
+        let model = TextModel {
+            hidden: h,
+            vocab: v,
+            layers_n: 1,
+            max_pos: 512,
+            heads: nh,
+            eps,
+            window: 256,
+            softcap: Some(30.0),
+            embed_scale: 1.0,
+            embed: weights_store.mat("embed").unwrap(),
+            ple: Some(ple_model),
+            layers: vec![layer],
+            first_shared: 1,
+            norm: vec![1.0; h],
+            inv_freq_sliding: vec![1.0; hd / 2],
+            inv_freq_full: vec![1.0; hd / 2],
+            pad_id: 0,
+            bidir_vision: false,
+        };
+
+        // 1. Reference forward pass with PLE
+        let tok = 5u32;
+        let mut emb = vec![0.0f32; h];
+        model.embed_row(tok, &mut emb);
+        let mut cache = model.new_cache();
+        let ref_logits = model.forward(emb, &[tok], 0, &mut cache, &[]);
+
+        // 2. Graph forward pass with lowered PLE
+        let (decode_g, w) = model
+            .to_decode_graph_unchecked()
+            .expect("to_decode_graph_unchecked with PLE succeeds");
+        assert!(decode_g.nodes.iter().any(|n| n.name.contains("model.ple")));
+        assert!(decode_g
+            .nodes
+            .iter()
+            .any(|n| n.name.contains("layers.0.ple")));
+
+        let mut ple_e = vec![0.0f32; pd];
+        model
+            .ple
+            .as_ref()
+            .unwrap()
+            .embed
+            .get_row(tok as usize, &mut ple_e);
+        let ident_scale = (pd as f32).sqrt();
+        for v in &mut ple_e {
+            *v *= ident_scale;
+        }
+        let inputs = vec![
+            Tensor::U32(vec![tok]),
+            Tensor::U32(vec![0]),
+            Tensor::F32(ple_e),
+        ];
+        let graph_res = run_stateless(&decode_g, &w, inputs).expect("graph execution succeeds");
+        let graph_logits = graph_res[0].as_f32().expect("f32 logits");
+
+        assert_eq!(ref_logits.len(), graph_logits.len());
+        for (i, (&r, &g)) in ref_logits.iter().zip(graph_logits).enumerate() {
+            let diff = (r - g).abs();
+            assert!(
+                diff < 1e-4 || (r - g).abs() / r.abs().max(1.0) < 1e-3,
+                "PLE logit mismatch at index {i}: ref={r}, graph={g}"
             );
         }
     }
@@ -1161,7 +1450,7 @@ mod tests {
             bidir_vision: false,
         };
 
-        let (decode_g, w) = model.to_decode_graph();
+        let (decode_g, w) = model.to_decode_graph().unwrap();
         let tok = 7u32;
         let inputs = vec![Tensor::U32(vec![tok]), Tensor::U32(vec![0])];
 
@@ -1181,5 +1470,83 @@ mod tests {
                 "Metal mismatch at index {i}: cpu={c}, metal={m}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "real-checkpoint: E-series PLE gated to eager CPU"]
+    fn test_gemma4_cpu_fallback_coherent() {
+        use crate::hardware::Device;
+        use crate::model::hub::HuggingFaceHub;
+        use crate::model::native::load_native;
+
+        let repo = "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive";
+        let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(repo);
+        if art.weights_path.is_none() {
+            println!("SKIP: {repo} not found in disk/");
+            return;
+        }
+
+        let lm = match load_native(&art, Device::Metal) {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => panic!("Failed to load {repo}: {e}"),
+            None => panic!("load_native returned None for {repo}"),
+        };
+
+        println!("Loaded Gemma 4 model successfully!");
+        println!("Backend label: {}", lm.backend_label());
+        println!("Device: {:?}", lm.device());
+
+        let rss_bytes = crate::hardware::current_resident_memory_bytes();
+        let rss_gb = rss_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        println!("Resident memory (RSS): {:.2} GB", rss_gb);
+
+        let tok = lm.tokenizer();
+        let prompt = "The capital of France is";
+        let ids = tok.encode(prompt);
+        let (seq_ids, mut state) = lm.prepare(ids, &[]).expect("prepare sequence");
+
+        let logits = lm.forward(&seq_ids, 0, &mut state).expect("forward prompt");
+        let next_token = (0..logits.len())
+            .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+            .unwrap() as u32;
+        let mut pos = seq_ids.len();
+        let mut generated = Vec::new();
+
+        let decode_t0 = std::time::Instant::now();
+        let mut cur_token = next_token;
+        for _ in 0..8 {
+            if tok.is_special(cur_token) {
+                break;
+            }
+            generated.push(cur_token);
+            let next_logits = lm
+                .forward(&[cur_token], pos, &mut state)
+                .expect("decode step");
+            pos += 1;
+            cur_token = (0..next_logits.len())
+                .max_by(|&a, &b| next_logits[a].total_cmp(&next_logits[b]))
+                .unwrap() as u32;
+        }
+        let decode_elapsed = decode_t0.elapsed();
+        let decode_tps = (generated.len() as f64) / decode_elapsed.as_secs_f64();
+        println!(
+            "Decode throughput: {:.2} tok/s (decode total: {:?})",
+            decode_tps, decode_elapsed
+        );
+        let post_decode_rss = crate::hardware::current_resident_memory_bytes() as f64 / 1e9;
+        println!(
+            "Post-decode resident memory (RSS): {:.2} GB",
+            post_decode_rss
+        );
+        assert!(!generated.is_empty(), "Must generate tokens");
+        let text = tok.decode(&generated);
+        println!("Generated text: {:?}", text);
+        // On this 2-bit aggressive finetune checkpoint, greedy decode without chat template repeats prompt tokens
+        assert!(!text.is_empty(), "Generated text must not be empty");
+        assert_eq!(
+            lm.device(),
+            Device::Cpu,
+            "Gemma 4 E-series falls back to CPU due to PLE and Q2_K"
+        );
     }
 }

@@ -67,6 +67,7 @@ fn run(m: &Arc<dyn NativeLm>, spec: bool, prompts: &[&str], max: usize) -> (Vec<
         temperature: Some(0.0),
         top_p: None,
         max_new_tokens: max,
+        top_logprobs: None,
     };
     let mut rxs: Vec<_> = prompts
         .iter()
@@ -146,6 +147,7 @@ fn mtp_sampling_keeps_target_distribution() {
         temperature: Some(1.0),
         top_p: None,
         max_new_tokens: 3,
+        top_logprobs: None,
     };
     let n = 200;
     let mut first = None;

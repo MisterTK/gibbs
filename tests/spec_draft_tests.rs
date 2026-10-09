@@ -49,6 +49,7 @@ fn generate(
         temperature: Some(0.0),
         top_p: None,
         max_new_tokens: n,
+        top_logprobs: None,
     };
     let (_, mut rx, ..) = sched.submit_with_params(params, |t| {
         t.encode(&t.apply_chat_template(&[("user", prompt)]))

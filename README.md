@@ -1,7 +1,58 @@
-# gibbs
+```
+   ██████╗ ██╗██████╗ ██████╗ ███████╗    ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗███████╗
+  ██╔════╝ ██║██╔══██╗██╔══██╗██╔════╝    ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██╔════╝
+  ██║  ███╗██║██████╔╝██████╔╝███████╗    █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║█████╗  
+  ██║   ██║██║██╔══██╗██╔══██╗╚════██║    ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██╔══╝  
+  ╚██████╔╝██║██████╔╝██████╔╝███████║    ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║███████╗
+   ╚═════╝ ╚═╝╚═════╝ ╚═════╝ ╚══════╝    ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝
+  ═════════════════════════════════════════════════════════════════════════════════════════
+   JOSIAH WILLARD GIBBS THERMODYNAMIC INFERENCE ENGINE · UNIVERSAL HARDWARE COMPILER
+   Apple Silicon · Intel & AMD x86 · ARM Neoverse · NVIDIA CUDA · AMD ROCm · TPUs · ASICs · Extropic
+  ═════════════════════════════════════════════════════════════════════════════════════════
+```
 
-A Rust inference server, named after Josiah Willard Gibbs (1839–1903). It serves text generation, translation and summarization, text classification, text-to-image (Stable Diffusion, SDXL, SD3.5, Sana, FLUX), and System 1 embeddings and decisions over an OpenAI-style HTTP API, and generates short text-to-video clips from the CLI (ModelScope, LTX-Video; LTX-Video also image-to-video and from the TUI). It runs on the CPU with NEON SIMD, and it can also run LLM decode and prefill and the System 1 encoder on the Apple GPU through Metal.
+### What is Gibbs?
 
+**Gibbs** is an architecture-agnostic, zero-overhead computational inference runtime and compiler built in Rust for universal hardware acceleration. Named after **Josiah Willard Gibbs** (1839–1903)—the father of statistical mechanics, vector calculus, and thermodynamic potentials—the engine treats token generation and tensor contraction not as sequential interpreted kernel dispatches, but as an **irreversible thermodynamic flow toward minimum free energy ($dG \le 0$)**.
+
+Designed from first principles to target any computational substrate:
+- **Apple Silicon**: Metal Shading Language, unified memory streaming, and Neural Engine (ANE/Core ML).
+- **NVIDIA GPUs**: Native CUDA, Tensor Cores, PTX register allocation, and NVFP4/FP8 sub-byte tensor pipelines.
+- **AMD GPUs & APUs**: ROCm / HIP compilation, CDNA/RDNA matrix cores.
+- **x86 & ARM CPUs**: Intel AVX-512 / AMX, AMD Zen AVX, ARM NEON, SVE2, and SME matrix extensions.
+- **Domain-Specific Accelerators**: Google TPUs (XLA/HLO lowering), Custom ASICs, and thermodynamic/probabilistic computing hardware (Extropic).
+
+```
+                         Universal Model Graph IR (Pure SSA Form)
+                                            │
+                                            ▼
+                 ┌─────────────────────────────────────────────────────┐
+                 │ Luminal-AI Inspired Generic Mathematical Passes     │
+                 │  • Subgraph Operator Fusion (Epilogue Clustering)   │
+                 │  • Zero-Copy Static Arena Lifetime Coloring         │
+                 │  • Multi-Head / DeltaNet / RoPE Composable Lowering │
+                 │  • Universal Quantization Unpacking & JESSE LUTs    │
+                 └─────────────────────────────────────────────────────┘
+                                            │
+            ┌───────────────────────────────┼───────────────────────────────┐
+            ▼                               ▼                               ▼
+   ┌─────────────────┐             ┌─────────────────┐             ┌─────────────────┐
+   │  Metal & ANE    │             │  CUDA & ROCm    │             │  CPU SIMD & AMX │
+   │ (Apple Silicon) │             │ (NVIDIA & AMD)  │             │ (ARM / x86_64)  │
+   └─────────────────┘             └─────────────────┘             └─────────────────┘
+            │                               │                               │
+            └───────────────────────┬───────┴───────────────────────────────┘
+                                    ▼
+                   ┌───────────────────────────────────┐
+                   │   Emerging & Domain-Specific      │
+                   │  TPUs · Custom ASICs · Extropic   │
+                   └───────────────────────────────────┘
+                                    │
+                                    ▼
+                 Empirical Roofline Saturation (>92-95% Peak BW)
+```
+
+Gibbs serves text generation, translation, summarization, text classification, multimodal vision-language, text-to-image (Stable Diffusion, SDXL, SD3.5, Sana, FLUX), and System 1 embeddings and decisions over an OpenAI-style HTTP API, with native interactive terminal dashboards and full CLI integration.
 ## Backends
 
 | `--backend` | What runs there |

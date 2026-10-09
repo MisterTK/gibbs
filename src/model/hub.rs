@@ -65,7 +65,8 @@ fn gguf_file_quant(stem: &str) -> Option<QuantFormat> {
             "iq3xs" | "iq3s" | "iq3m" => QuantFormat::GGUF_IQ3_S,
             "iq2xxs" => QuantFormat::GGUF_IQ2_XXS,
             "iq2xs" => QuantFormat::GGUF_IQ2_XS,
-            "iq2s" | "iq2m" => QuantFormat::GGUF_IQ2_S,
+            "iq2s" => QuantFormat::GGUF_IQ2_S,
+            "iq2m" => QuantFormat::GGUF_IQ2_M,
             "iq1s" => QuantFormat::GGUF_IQ1_S,
             "iq1m" => QuantFormat::GGUF_IQ1_M,
             "tq10" => QuantFormat::GGUF_TQ1_0,
@@ -2839,7 +2840,7 @@ mod tests {
         assert_eq!(q("liquid-f16.gguf"), Some(QuantFormat::FP16));
         assert_eq!(q("x-IQ4_NL.gguf"), Some(QuantFormat::GGUF_IQ4_NL));
         assert_eq!(q("x-TQ2_0.gguf"), Some(QuantFormat::GGUF_TQ2_0));
-        assert_eq!(q("x.i1-IQ2_M.gguf"), Some(QuantFormat::GGUF_IQ2_S));
+        assert_eq!(q("x.i1-IQ2_M.gguf"), Some(QuantFormat::GGUF_IQ2_M));
         assert_eq!(q("x-Q3_K_XL.gguf"), Some(QuantFormat::GGUF_Q3_K));
         assert_eq!(q("x-Q4_0_4_4.gguf"), None);
         assert_eq!(

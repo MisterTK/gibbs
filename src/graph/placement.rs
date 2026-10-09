@@ -130,6 +130,27 @@ fn estimate_node_work(graph: &Graph, node_id: NodeId) -> (f64, f64) {
             let bytes = out_elements * 8.0;
             (flops, bytes)
         }
+        Op::Megakernel(desc) => match &desc.kind {
+            crate::graph::MegakernelKind::Mlp {
+                hidden_dim,
+                intermediate_dim,
+                ..
+            } => {
+                let flops = 2.0 * (*hidden_dim as f64) * (*intermediate_dim as f64) * 3.0;
+                let bytes = (*hidden_dim as f64) * (*intermediate_dim as f64) * 3.0 * 2.0;
+                (flops, bytes)
+            }
+            crate::graph::MegakernelKind::Attention {
+                hidden_dim,
+                heads,
+                head_dim,
+                ..
+            } => {
+                let flops = 2.0 * (*hidden_dim as f64) * ((*heads * *head_dim) as f64) * 2.0;
+                let bytes = (*hidden_dim as f64) * ((*heads * *head_dim) as f64) * 2.0 * 2.0;
+                (flops, bytes)
+            }
+        },
         _ => {
             let flops = out_elements;
             let bytes = out_elements * 8.0;
@@ -178,6 +199,11 @@ pub fn place_graph(
             Op::Embedding => node
                 .inputs
                 .get(0)
+                .map(|&v| graph.value(v).dtype)
+                .unwrap_or(DType::F32),
+            Op::Megakernel(_) => node
+                .inputs
+                .get(2)
                 .map(|&v| graph.value(v).dtype)
                 .unwrap_or(DType::F32),
             _ => node

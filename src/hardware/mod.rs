@@ -1,5 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
+pub mod profile;
+pub use profile::HardwareProfile;
 
 /// `$HOME/.cache/gibbs`: compiled kernels, host profiles, and per-model weight-format choices.
 pub fn default_cache_dir() -> Result<PathBuf, String> {
@@ -147,6 +149,47 @@ pub fn default_device() -> Device {
     Device::Cpu
 }
 
+/// Current resident memory (RSS) of this process in bytes.
+pub fn current_resident_memory_bytes() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(
+                target_task: u32,
+                flavor: u32,
+                task_info_out: *mut MachTaskBasicInfo,
+                task_info_out_cnt: *mut u32,
+            ) -> i32;
+        }
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        let mut info = std::mem::MaybeUninit::<MachTaskBasicInfo>::uninit();
+        let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
+        unsafe {
+            let kr = task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                info.as_mut_ptr(),
+                &mut count,
+            );
+            if kr == 0 {
+                return info.assume_init().resident_size as usize;
+            }
+        }
+    }
+    0
+}
+
 /// Performance profile of a compute device.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceProfile {
@@ -158,23 +201,23 @@ pub struct DeviceProfile {
 
 impl DeviceProfile {
     pub fn for_device(device: Device, host_bw: Option<f64>) -> Self {
+        let hw = HardwareProfile::for_device(device);
         match device {
             Device::Cpu => {
-                let num_cores = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(8) as f64;
+                let num_cores = hw.compute_units as f64;
+                let bw = host_bw.unwrap_or(hw.memory_bandwidth_gbps);
                 Self {
-                    mem_bandwidth_gbps: host_bw.unwrap_or(80.0) * 0.5,
+                    mem_bandwidth_gbps: bw * 0.5,
                     compute_gflops: num_cores * 64.0,
                     bus_bandwidth_gbps: 1000.0,
                     dispatch_us: 1.0,
                 }
             }
             Device::Metal => {
-                let bw = host_bw.unwrap_or(250.0);
+                let bw = host_bw.unwrap_or(hw.memory_bandwidth_gbps);
                 Self {
                     mem_bandwidth_gbps: bw,
-                    compute_gflops: 10_000.0,
+                    compute_gflops: (hw.compute_units as f64) * 300.0,
                     bus_bandwidth_gbps: bw,
                     dispatch_us: 5.0,
                 }
@@ -279,6 +322,7 @@ pub enum QuantFormat {
     GGUF_IQ2_XXS,
     GGUF_IQ2_XS,
     GGUF_IQ2_S,
+    GGUF_IQ2_M,
     GGUF_IQ1_S,
     GGUF_IQ1_M,
     GGUF_TQ1_0,
@@ -301,7 +345,7 @@ impl QuantFormat {
             Self::GGUF_IQ2_XXS | Self::GGUF_TQ2_0 => 2.0625,
             Self::NVFP4 | Self::NVFP4_E2M1 => 2.25,
             Self::GGUF_IQ2_XS => 2.3125,
-            Self::GGUF_IQ2_S => 2.5625,
+            Self::GGUF_IQ2_S | Self::GGUF_IQ2_M => 2.5625,
             Self::GGUF_Q2_K => 2.625,
             Self::GGUF_IQ3_XXS => 3.0625,
             Self::GGUF_Q3_K | Self::GGUF_IQ3_S => 3.4375,
@@ -333,6 +377,10 @@ impl QuantFormat {
         match self {
             Self::GGUF_Q4_0 => (num_elements / 32) * 18,
             Self::GGUF_Q8_0 => (num_elements / 32) * 34,
+            Self::GGUF_Q4_K_M => (num_elements / 256) * 144,
+            Self::GGUF_IQ4_XS => (num_elements / 256) * 136,
+            Self::GGUF_IQ3_S => (num_elements / 256) * 110,
+            Self::GGUF_IQ2_S | Self::GGUF_IQ2_M => (num_elements / 256) * 82,
             Self::BF16 | Self::FP16 => num_elements * 2,
             Self::FP32 => num_elements * 4,
             _ => (num_elements as f32 * self.bits_per_weight() / 8.0).ceil() as usize,
@@ -371,6 +419,7 @@ impl QuantFormat {
             Self::GGUF_IQ2_XXS => "IQ2_XXS",
             Self::GGUF_IQ2_XS => "IQ2_XS",
             Self::GGUF_IQ2_S => "IQ2_S",
+            Self::GGUF_IQ2_M => "IQ2_M",
             Self::GGUF_IQ1_S => "IQ1_S",
             Self::GGUF_IQ1_M => "IQ1_M",
             Self::GGUF_TQ1_0 => "TQ1_0",
@@ -399,6 +448,7 @@ impl QuantFormat {
                 | Self::GGUF_IQ2_XXS
                 | Self::GGUF_IQ2_XS
                 | Self::GGUF_IQ2_S
+                | Self::GGUF_IQ2_M
                 | Self::GGUF_IQ1_S
                 | Self::GGUF_IQ1_M
                 | Self::GGUF_TQ1_0
@@ -469,6 +519,7 @@ impl QuantFormat {
             "iq2_xxs" | "gguf_iq2_xxs" => Some(Self::GGUF_IQ2_XXS),
             "iq2_xs" | "gguf_iq2_xs" => Some(Self::GGUF_IQ2_XS),
             "iq2_s" | "gguf_iq2_s" => Some(Self::GGUF_IQ2_S),
+            "iq2_m" | "gguf_iq2_m" => Some(Self::GGUF_IQ2_M),
             "iq1_s" | "gguf_iq1_s" => Some(Self::GGUF_IQ1_S),
             "iq1_m" | "gguf_iq1_m" => Some(Self::GGUF_IQ1_M),
             "tq1_0" | "gguf_tq1_0" => Some(Self::GGUF_TQ1_0),

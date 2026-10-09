@@ -54,6 +54,7 @@ pub mod flow;
 pub mod flux;
 pub mod gemma3_text;
 pub mod gemma4;
+pub mod graph_lm;
 pub mod hf_loader;
 pub mod hub;
 pub mod idefics3;
@@ -90,7 +91,6 @@ pub mod spm;
 pub mod t2v;
 pub mod t5;
 pub mod text_to_image;
-pub mod graph_lm;
 pub mod tokenizer;
 pub mod unet;
 pub mod unet3d;
@@ -103,13 +103,13 @@ use crate::hardware::{QuantFormat, QuantizationFormat};
 use bytes::Bytes;
 pub use clip::*;
 pub use fingerprint::*;
+pub use graph_lm::*;
 pub use hub::*;
 pub use image::*;
 pub use jev::*;
 pub use layers::*;
 pub use simd::*;
 use std::collections::HashMap;
-pub use graph_lm::*;
 pub use tokenizer::*;
 pub use vae::*;
 /// Serialization container formats supported by the Universal Model Loader.
@@ -1650,6 +1650,34 @@ pub fn f8_e4m3_to_f32(x: u8) -> f32 {
     } else {
         mag
     }
+}
+/// Convert f32 to FP8 E4M3FN (OCP).
+pub fn f32_to_f8_e4m3(val: f32) -> u8 {
+    if val.is_nan() {
+        return 0x7F;
+    }
+    let sign = if val.is_sign_negative() { 0x80 } else { 0 };
+    let abs = val.abs();
+    if abs < 1.0 / 1024.0 {
+        return sign;
+    }
+    if abs >= 448.0 {
+        return sign | 0x7E;
+    }
+    let mut best_code = 0u8;
+    let mut best_diff = f32::INFINITY;
+    for code in 0..127u8 {
+        let candidate = f8_e4m3_to_f32(code);
+        let diff = (candidate - abs).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best_code = code;
+            if diff == 0.0 {
+                break;
+            }
+        }
+    }
+    sign | best_code
 }
 
 /// Convert bfloat16 (stored in u16) to f32.

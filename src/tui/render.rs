@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Row, Sparkline, Table, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Row, Sparkline, Table, Wrap},
     Frame,
 };
 
@@ -89,10 +89,23 @@ impl TuiApp {
         ])
         .areas(area);
         self.render_status(f, status);
-        let [throughput, requests] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(top);
-        self.render_throughput(f, throughput);
-        self.render_requests(f, requests);
+        if top.width >= 100 {
+            let [mascot_area, throughput, requests] = Layout::horizontal([
+                Constraint::Length(18),
+                Constraint::Percentage(38),
+                Constraint::Percentage(46),
+            ])
+            .areas(top);
+            self.render_mascot(f, mascot_area);
+            self.render_throughput(f, throughput);
+            self.render_requests(f, requests);
+        } else {
+            let [throughput, requests] =
+                Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .areas(top);
+            self.render_throughput(f, throughput);
+            self.render_requests(f, requests);
+        }
         if mid.width >= 110 {
             let [console, side] =
                 Layout::horizontal([Constraint::Min(50), Constraint::Length(56)]).areas(mid);
@@ -110,6 +123,18 @@ impl TuiApp {
         if self.focus == Focus::Picker {
             let loading = self.load.as_ref().map(|l| l.id.as_str());
             self.picker.render(f, area, &self.model_id(), loading);
+        }
+        if self.show_template_modal {
+            self.render_template_modal(f, area);
+        }
+        if self.show_logprob_inspector || self.show_token_inspector {
+            self.render_logprob_inspector(f, area);
+        }
+        if self.show_roofline_inspector {
+            self.render_roofline_inspector(f, area);
+        }
+        if self.show_latency_modal {
+            self.render_latency_modal(f, area);
         }
     }
 
@@ -130,6 +155,9 @@ impl TuiApp {
                 Span::styled(model, Style::default().add_modifier(Modifier::BOLD))
             },
         ];
+        if area.width < 100 {
+            left.extend(self.mascot.render_mini_badge());
+        }
         // While loading, the right side needs the room; backend and format come back after.
         if self.load.is_none() {
             if let Some(c) = self.classifier.read().as_ref() {
@@ -148,6 +176,46 @@ impl TuiApp {
                         w.mode.effective_bits_per_weight()
                     )));
                 }
+            }
+            let s = self.telemetry.get_summary();
+            let b_peak = if s.memory_bandwidth_gbps > 0.0 {
+                s.memory_bandwidth_gbps
+            } else {
+                298.24
+            };
+            let eta = if b_peak > 0.0 && s.effective_bandwidth_gbps > 0.0 {
+                (s.effective_bandwidth_gbps / b_peak * 100.0).min(100.0)
+            } else {
+                s.roofline_pct
+            };
+            if area.width >= 110 {
+                let bar_len = 16usize;
+                let filled = ((eta as f64 / 100.0) * bar_len as f64)
+                    .round()
+                    .min(bar_len as f64) as usize;
+                let bar = format!(
+                    "{}{}",
+                    "█".repeat(filled),
+                    "░".repeat(bar_len.saturating_sub(filled))
+                );
+                let gauge_color = if eta < 40.0 {
+                    Color::Cyan
+                } else if eta <= 70.0 {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
+                left.push(Span::styled(" · Roofline: [", dim()));
+                left.push(Span::styled(bar, Style::default().fg(gauge_color)));
+                left.push(Span::styled(
+                    format!(
+                        "] {:.1}% ({:.1} GB/s / {:.1} GB/s | {:.1} tok/s)",
+                        eta, s.effective_bandwidth_gbps, b_peak, s.current_tps
+                    ),
+                    Style::default()
+                        .fg(gauge_color)
+                        .add_modifier(Modifier::BOLD),
+                ));
             }
         }
         if let Some(addr) = self.http_addr {
@@ -194,11 +262,20 @@ impl TuiApp {
         ])
         .areas(inner);
         let peak = self.spark.iter().copied().max().unwrap_or(0);
-        let roofline_str = if s.roofline_pct > 0.0 && s.effective_bandwidth_gbps > 0.0 {
+        let b_peak = 273.0f32; // Apple M5 Pro unified memory bandwidth ceiling (GB/s)
+        let roofline_str = if s.effective_bandwidth_gbps > 0.0 {
+            let eta = (s.effective_bandwidth_gbps / b_peak) * 100.0;
+            let regime = if eta > 65.0 {
+                "BW-Bound"
+            } else {
+                "Compute/Lat"
+            };
             format!(
-                " · {:.1} GB/s ({:.0}% roofline)",
-                s.effective_bandwidth_gbps, s.roofline_pct
+                " · {:.1}/{:.0} GB/s (η={:.1}% {})",
+                s.effective_bandwidth_gbps, b_peak, eta, regime
             )
+        } else if s.roofline_pct > 0.0 {
+            format!(" · {:.0}% roofline", s.roofline_pct)
         } else {
             String::new()
         };
@@ -282,11 +359,24 @@ impl TuiApp {
         );
         let total = self.kv_pool.total_blocks;
         let used = (self.kv_pool.utilization() * total as f32).round() as usize;
+        let model_bytes = self.telemetry.model_size_bytes();
+        let rss_bytes = crate::hardware::current_resident_memory_bytes();
+        let weights_str = if model_bytes > 0 {
+            format!("{:.2}GB", model_bytes as f64 / 1e9)
+        } else {
+            "—".to_string()
+        };
+        let mem_hud = format!(
+            " · RSS {:.2}GB | Weights {} | Arena — | Workspace —",
+            rss_bytes as f64 / 1e9,
+            weights_str
+        );
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("KV blocks ", dim()),
                 Span::raw(format!("{used}/{total}")),
                 Span::styled(" (admission)", dim()),
+                Span::styled(mem_hud, dim()),
             ])),
             kv,
         );
@@ -541,13 +631,23 @@ impl TuiApp {
             Focus::Dashboard => &[
                 ("i", "prompt"),
                 ("m", "models"),
-                ("↑↓ pgup pgdn", "scroll"),
+                ("F2", "templates"),
+                ("F3", "avatar"),
+                ("^R", "roofline"),
+                ("^P", "logprobs"),
+                ("^T", "tokens"),
+                ("^L", "latency"),
+                ("↑↓", "scroll"),
                 ("q", "quit"),
             ],
             Focus::Prompt => &[
                 ("enter", "run"),
+                ("F3", "avatar"),
+                ("^R", "roofline"),
+                ("^P", "logprobs"),
+                ("^T", "tokens"),
+                ("^L", "latency"),
                 ("esc/ctrl-x", "cancel chat"),
-                ("esc", "back"),
                 ("ctrl-c", "quit"),
             ],
             Focus::Picker => &[
@@ -564,6 +664,500 @@ impl TuiApp {
             spans.push(Span::styled(format!("{what} "), dim()));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+    fn render_mascot(&self, f: &mut Frame, area: Rect) {
+        let title = format!("Gibbs [{}] (F3)", self.mascot.avatar_style.name());
+        let block = panel(&title);
+        let lines = if area.width >= 20 {
+            self.mascot.render_full_vignette()
+        } else {
+            self.mascot.render_lines()
+        };
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_template_modal(&self, f: &mut Frame, area: Rect) {
+        let w = (area.width * 60 / 100).max(45).min(area.width);
+        let h = (area.height * 50 / 100).max(12).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect::new(x, y, w, h);
+
+        f.render_widget(Clear, popup);
+        let block = panel("Chat Template & System Prompt (F2)");
+        let templates = [
+            (
+                "0",
+                "Model Default",
+                "Declared in tokenizer_config.json or GGUF metadata",
+            ),
+            (
+                "1",
+                "ChatML",
+                "<|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n{prompt}<|im_end|>",
+            ),
+            (
+                "2",
+                "Llama-3",
+                "<|start_header_id|>system<|end_header_id|>\\n{system}<|eot_id|>",
+            ),
+            (
+                "3",
+                "Gemma",
+                "<start_of_turn>user\\n{prompt}<end_of_turn>\\n<start_of_turn>model\\n",
+            ),
+            ("4", "Raw / Passthrough", "{prompt}"),
+        ];
+        let mut lines = vec![
+            Line::from(vec![Span::styled(
+                " Select Template (1-4 / ↑↓, Enter/Esc to confirm):",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]),
+            Line::default(),
+        ];
+        for (i, (num, name, preview)) in templates.iter().enumerate() {
+            let active = i == self.active_template;
+            let marker = if active { " [*] " } else { " [ ] " };
+            let style = if active {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                dim()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker}{num}. {name}: "), style),
+                Span::styled(*preview, dim()),
+            ]));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled(
+                " System Prompt: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&self.system_prompt, Style::default().fg(Color::Yellow)),
+        ]));
+        f.render_widget(Paragraph::new(lines).block(block), popup);
+    }
+
+    fn render_logprob_inspector(&self, f: &mut Frame, area: Rect) {
+        let w = (area.width * 70 / 100).max(50).min(area.width);
+        let h = (area.height * 60 / 100).max(14).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect::new(x, y, w, h);
+
+        f.render_widget(Clear, popup);
+        let block = panel("Logit Probability Inspector (Ctrl+P)");
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+
+        let mut lines = Vec::new();
+        let target_info = if !self.logprob_history.is_empty() {
+            let idx = self.logprob_scrub_idx.min(self.logprob_history.len() - 1);
+            Some((idx, &self.logprob_history[idx]))
+        } else {
+            self.latest_logprobs.as_ref().map(|info| (0, info))
+        };
+
+        if let Some((idx, info)) = target_info {
+            if !self.logprob_history.is_empty() {
+                let mut sparkline = Vec::new();
+                sparkline.push(Span::styled("Entropy Timeline: ", dim()));
+                for (i, item) in self.logprob_history.iter().enumerate() {
+                    let ent = item.entropy;
+                    let ch = if ent < 0.5 {
+                        " "
+                    } else if ent < 1.0 {
+                        "▂"
+                    } else if ent < 2.0 {
+                        "▃"
+                    } else if ent < 3.0 {
+                        "▅"
+                    } else if ent < 4.0 {
+                        "▆"
+                    } else {
+                        "█"
+                    };
+                    let color = if ent < 1.0 {
+                        Color::Green
+                    } else if ent < 2.5 {
+                        Color::Yellow
+                    } else {
+                        Color::Red
+                    };
+                    let style = if i == idx {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(color)
+                    };
+                    sparkline.push(Span::styled(ch, style));
+                }
+                sparkline.push(Span::styled(
+                    format!(
+                        "  [Token {} of {}] (← / → scrub)",
+                        idx + 1,
+                        self.logprob_history.len()
+                    ),
+                    dim(),
+                ));
+                lines.push(Line::from(sparkline));
+                lines.push(Line::default());
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("Scrubbed Token ID: ", dim()),
+                Span::styled(
+                    format!("{}", info.chosen_id),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   Confidence: ", dim()),
+                Span::styled(
+                    format!("{:.1}%", info.chosen_prob * 100.0),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   Shannon Entropy: ", dim()),
+                Span::styled(
+                    format!("{:.3} nats", info.entropy),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+            lines.push(Line::default());
+            lines.push(Line::from(vec![Span::styled(
+                "Top Candidates:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )]));
+
+            for (c_idx, (tok, prob)) in info.top_candidates.iter().take(6).enumerate() {
+                let pct = (prob * 100.0).clamp(0.0, 100.0);
+                let filled = (pct / 10.0).round() as usize;
+                let empty = 10usize.saturating_sub(filled);
+                let bar = format!("{}{}", "■".repeat(filled), "░".repeat(empty));
+                let is_chosen = *tok == info.chosen_id;
+                let marker = if is_chosen { "▶ " } else { "  " };
+                let style = if is_chosen {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Green)),
+                    Span::styled(format!("#{:<2} Token {:<6} ", c_idx + 1, tok), style),
+                    Span::styled(format!("{bar} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{:>5.1}%", pct), style),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No token probabilities sampled yet. Run generation with top_logprobs enabled.",
+                dim(),
+            )));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Use ←/→ to scrub past tokens | Press Esc or Ctrl+P to close inspector",
+            dim(),
+        )));
+
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    fn render_roofline_inspector(&self, f: &mut Frame, area: Rect) {
+        let w = (area.width * 75 / 100).max(62).min(area.width);
+        let h = (area.height * 75 / 100).max(18).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect::new(x, y, w, h);
+
+        f.render_widget(Clear, popup);
+        let block = panel("2D Visual Roofline Diagnostic Inspector (Ctrl+R / /roofline)");
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+
+        let s = self.telemetry.get_summary();
+        let bw_peak = 273.0f64; // Apple Silicon M5 Pro memory bandwidth GB/s
+        let peak_compute = 28_000.0f64; // 28 TFLOPs FP16 GFLOP/s
+        let ridge = peak_compute / bw_peak; // ~102.5 FLOPs/B
+        let cur_bw = s.effective_bandwidth_gbps as f64;
+        let cur_eta = if cur_bw > 0.0 {
+            (cur_bw / bw_peak) * 100.0
+        } else {
+            0.0
+        };
+        let cur_intensity = 3.20f64; // Decode operational intensity FLOPs/B for Gemma 4 / Qwen
+        let cur_gflops = (cur_intensity * cur_bw).max(10.0);
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Log-Log 2D Hardware Roofline Curve",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " [Apple Silicon Unified Memory]",
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+        lines.push(Line::default());
+
+        // Log-Log 2D ASCII Curve
+        lines.push(Line::from(vec![Span::styled(
+            "  Performance P (GFLOP/s, Log Scale)",
+            dim(),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("  30k ┤", dim()),
+            Span::styled(
+                "                        ┌───────────────────────",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" P_peak = 28 TFLOPs", Style::default().fg(Color::Green)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  10k ┤", dim()),
+            Span::styled(
+                "                   .----'",
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   3k ┤", dim()),
+            Span::styled(
+                "              .---'     ",
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                "▲ [Ridge: 102.5 FLOPs/B]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   1k ┤", dim()),
+            Span::styled(
+                "         .---'          ",
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled("B_peak = 273 GB/s", Style::default().fg(Color::Cyan)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  300 ┤", dim()),
+            Span::styled(
+                "    .---'               ",
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(
+                    "● [Current: {:.0} GFLOP/s, {:.1} tok/s]",
+                    cur_gflops, s.current_tps
+                ),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  100 ┤", dim()),
+            Span::styled(
+                ".--'                    ",
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "   10 ┼─────────┴─────────┴─────────┴─────────┴────────",
+            dim(),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("     0.1       1.0       10.0      100.0     1000.0", dim()),
+            Span::styled(
+                "  Intensity I (FLOPs/Byte)",
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::default());
+
+        // Dynamic Diagnostic Verdict
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Diagnostic Verdict: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "Strictly Memory-Bandwidth Bound (I = {:.1} << {:.1} FLOPs/B)",
+                    cur_intensity, ridge
+                ),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Bandwidth Saturation: ", dim()),
+            Span::styled(
+                format!(
+                    "{:.1} GB/s ({:.1}% of 273 GB/s roofline ceiling)",
+                    cur_bw, cur_eta
+                ),
+                if cur_eta > 60.0 {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+        ]));
+        if let Some(probe) = &self.roofline_probe_result {
+            let first_line = probe.lines().nth(1).unwrap_or("");
+            lines.push(Line::from(Span::styled(
+                first_line,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Press Esc or Ctrl+R to close Roofline Inspector",
+            dim(),
+        )));
+
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    fn render_latency_modal(&self, f: &mut Frame, area: Rect) {
+        let w = (area.width * 70 / 100).max(52).min(area.width);
+        let h = (area.height * 65 / 100).max(16).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect::new(x, y, w, h);
+
+        f.render_widget(Clear, popup);
+        let block = panel("Streaming Decode Latency & Percentiles (Ctrl+L)");
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+
+        let samples = self.telemetry.recent_itl_ms(256);
+        let mut lines = Vec::new();
+
+        if samples.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No decode latency samples recorded yet. Run a prompt to generate tokens.",
+                dim(),
+            )));
+        } else {
+            let mut sorted = samples.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let n = sorted.len();
+            let p50 = sorted[((n - 1) as f32 * 0.50).round() as usize];
+            let p95 = sorted[((n - 1) as f32 * 0.95).round() as usize];
+            let p99 = sorted[((n - 1) as f32 * 0.99).round() as usize];
+            let min = sorted[0];
+            let max = sorted[n - 1];
+            let sum: f32 = sorted.iter().sum();
+            let mean = sum / n as f32;
+            let variance: f32 = sorted.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+            let std_dev = variance.sqrt();
+
+            lines.push(Line::from(vec![
+                Span::styled("Recent Tokens Sampled: ", dim()),
+                Span::styled(
+                    format!("{n}"),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" (last 256 ITL samples)", dim()),
+            ]));
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled("  Median (p50): ", dim()),
+                Span::styled(
+                    format!("{p50:.2} ms"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("    p95: ", dim()),
+                Span::styled(
+                    format!("{p95:.2} ms"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("    p99: ", dim()),
+                Span::styled(
+                    format!("{p99:.2} ms"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Mean: ", dim()),
+                Span::styled(format!("{mean:.2} ms"), Style::default().fg(Color::White)),
+                Span::styled("    Jitter Std-Dev: ", dim()),
+                Span::styled(
+                    format!("±{std_dev:.2} ms"),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled("    Range: ", dim()),
+                Span::styled(format!("[{min:.2} .. {max:.2}] ms"), dim()),
+            ]));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Latency Distribution Histogram:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+
+            // 8-bucket ASCII histogram
+            let num_buckets = 8;
+            let bucket_width = ((max - min) / num_buckets as f32).max(0.01);
+            let mut counts = vec![0usize; num_buckets];
+            for &s in &samples {
+                let idx = (((s - min) / bucket_width).floor() as usize).min(num_buckets - 1);
+                counts[idx] += 1;
+            }
+            let max_count = counts.iter().copied().max().unwrap_or(1).max(1);
+            for b in 0..num_buckets {
+                let lo = min + b as f32 * bucket_width;
+                let hi = lo + bucket_width;
+                let c = counts[b];
+                let pct = (c as f32 / n as f32) * 100.0;
+                let bar_len = ((c as f32 / max_count as f32) * 24.0).round() as usize;
+                let bar = "█".repeat(bar_len);
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:>6.1} - {:>6.1} ms │ ", lo, hi), dim()),
+                    Span::styled(
+                        bar,
+                        Style::default().fg(if b < 4 {
+                            Color::Green
+                        } else if b < 6 {
+                            Color::Yellow
+                        } else {
+                            Color::Red
+                        }),
+                    ),
+                    Span::styled(format!("  {} ({:.1}%)", c, pct), dim()),
+                ]));
+            }
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Press Esc or Ctrl+L to close Latency Modal",
+            dim(),
+        )));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 }
 

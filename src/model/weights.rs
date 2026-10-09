@@ -36,26 +36,6 @@ impl Mat {
         }
     }
     pub fn to_graph_tensor(&self) -> crate::graph::Tensor {
-        if let Some(p) = self.packed() {
-            if matches!(
-                p.format,
-                crate::hardware::QuantFormat::GGUF_Q4_0
-                    | crate::hardware::QuantFormat::GGUF_Q8_0
-                    | crate::hardware::QuantFormat::BF16
-                    | crate::hardware::QuantFormat::FP16
-            ) {
-                let len = p.format.tensor_bytes(self.rows * self.cols);
-                let slice = &p.map[p.off..p.off + len];
-                return crate::graph::Tensor::Quantized(std::sync::Arc::new(
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data: bytes::Bytes::copy_from_slice(slice),
-                        in_features: self.cols,
-                        out_features: self.rows,
-                        format: p.format,
-                    },
-                ));
-            }
-        }
         crate::graph::Tensor::Mat(self.clone())
     }
     pub fn data(&self) -> &[u16] {
@@ -410,6 +390,9 @@ impl Weights {
         }
         self
     }
+    pub fn insert_packed(&mut self, name: String, p: Packed) {
+        self.gguf_packed.insert(name, p);
+    }
     /// Loads weights from a GGUF checkpoint, packing eligible Q4_0 and Q8_0 2D projection
     /// tensors into `gguf_packed` without dequantization, while dequantizing 1D vectors and
     /// transformed tensors into memory via `from_f32`.
@@ -439,6 +422,10 @@ impl Weights {
                     t.quant_format,
                     crate::hardware::QuantFormat::GGUF_Q4_0
                         | crate::hardware::QuantFormat::GGUF_Q8_0
+                        | crate::hardware::QuantFormat::GGUF_IQ4_XS
+                        | crate::hardware::QuantFormat::GGUF_IQ2_S
+                        | crate::hardware::QuantFormat::GGUF_Q4_K_M
+                        | crate::hardware::QuantFormat::GGUF_IQ3_S
                 )
                 && !should_transform(&hf);
 
