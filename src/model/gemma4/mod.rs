@@ -422,11 +422,6 @@ pub(crate) fn compile_gemma4_program(
     if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
         return None;
     }
-    if text.ple.is_some() {
-        // Gemma 4 E-series models with PLE currently require RoPE inv_freq harmonization and native Q2_K/K-quant Metal kernels
-        // to avoid dense F32 dequantization (13.9 GB RSS) and repetitive decode output. Eager CPU forward remains the verified path.
-        return None;
-    }
     match text.to_decode_graph() {
         Ok((graph, weights)) => {
             match crate::graph::program::GraphProgram::compile(graph, weights, mode) {

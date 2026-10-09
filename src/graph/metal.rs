@@ -107,8 +107,8 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
                 | DType::Quant(QuantFormat::GGUF_IQ2_M)
                 | DType::Quant(QuantFormat::GGUF_IQ2_S)
                 | DType::Quant(QuantFormat::GGUF_Q4_K_M)
+                | DType::Quant(QuantFormat::GGUF_Q2_K)
                 | DType::Quant(QuantFormat::GGUF_IQ3_S)
-                | DType::Quant(QuantFormat::NVFP4_E2M1)
                 | DType::Quant(QuantFormat::NVFP4)
                 | DType::Quant(QuantFormat::WeightlessJesseLUT)
         ),
