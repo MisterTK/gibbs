@@ -26,6 +26,11 @@ pub enum AvatarStyle {
     Surface,
     Triangle,
     Entropy,
+    Galvanic,
+    Optics,
+    Tetrahedron,
+    Partition,
+    Yale,
 }
 
 impl AvatarStyle {
@@ -40,7 +45,12 @@ impl AvatarStyle {
             Self::Vector => Self::Surface,
             Self::Surface => Self::Triangle,
             Self::Triangle => Self::Entropy,
-            Self::Entropy => Self::Classic,
+            Self::Entropy => Self::Galvanic,
+            Self::Galvanic => Self::Optics,
+            Self::Optics => Self::Tetrahedron,
+            Self::Tetrahedron => Self::Partition,
+            Self::Partition => Self::Yale,
+            Self::Yale => Self::Classic,
         }
     }
 
@@ -56,6 +66,11 @@ impl AvatarStyle {
             Self::Surface => "surface",
             Self::Triangle => "triangle",
             Self::Entropy => "entropy",
+            Self::Galvanic => "galvanic",
+            Self::Optics => "optics",
+            Self::Tetrahedron => "tetrahedron",
+            Self::Partition => "partition",
+            Self::Yale => "yale",
         }
     }
 
@@ -71,6 +86,11 @@ impl AvatarStyle {
             "surface" | "energy" | "free" => Some(Self::Surface),
             "triangle" | "phase_rule" | "ternary" => Some(Self::Triangle),
             "entropy" | "wave" | "flux" => Some(Self::Entropy),
+            "galvanic" | "emf" | "battery" | "electro" => Some(Self::Galvanic),
+            "optics" | "light" | "prism" | "dispersion" => Some(Self::Optics),
+            "tetrahedron" | "simplex" | "quaternary" => Some(Self::Tetrahedron),
+            "partition" | "ladder" | "states" => Some(Self::Partition),
+            "yale" | "sloane" | "tower" | "campus" => Some(Self::Yale),
             _ => None,
         }
     }
@@ -150,6 +170,11 @@ impl MascotEngine {
             AvatarStyle::Surface => self.render_scene_surface(),
             AvatarStyle::Triangle => self.render_scene_triangle(),
             AvatarStyle::Entropy => self.render_scene_entropy(),
+            AvatarStyle::Galvanic => self.render_scene_galvanic(),
+            AvatarStyle::Optics => self.render_scene_optics(),
+            AvatarStyle::Tetrahedron => self.render_scene_tetrahedron(),
+            AvatarStyle::Partition => self.render_scene_partition(),
+            AvatarStyle::Yale => self.render_scene_yale(),
         }
     }
 
@@ -633,6 +658,173 @@ impl MascotEngine {
         ]
     }
 
+    /// Scene 11: Electrochemical Cell & EMF (1878 Gibbs Free Energy of Galvanic Action)
+    fn render_scene_galvanic(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let c_cell = Style::default().fg(Color::Rgb(100, 200, 255));
+        let c_ion = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let c_math = Style::default().fg(Color::Green);
+
+        let ions = match tick % 4 {
+            0 => " [Zn] ──► e⁻ ──► [Cu] ",
+            1 => " [Zn] ───► e⁻ ── [Cu] ",
+            2 => " [Zn] ────► e⁻ ─ [Cu] ",
+            _ => " [Zn] ─────► e⁻  [Cu] ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" ⚡ Galvanic Cell EMF ⚡", c_title)]),
+            Line::from(vec![Span::styled(ions, c_ion)]),
+            Line::from(vec![Span::styled("  │░░░│ ~~~~~ │▓▓▓│  ", c_cell)]),
+            Line::from(vec![Span::styled("  ╰───╯ SaltB ╰───╯  ", c_cell)]),
+            Line::from(vec![Span::styled("  E = -ΔG / (n·F)    ", c_math)]),
+            Line::from(vec![Span::styled(
+                " Reversible Cell Work",
+                Style::default().fg(Color::White),
+            )]),
+            Line::from(vec![Span::styled(
+                " Gibbs Electrochemistry",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 12: Electromagnetic Theory of Light & Wave Dispersion (Gibbs 1888–1889)
+    fn render_scene_optics(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD);
+        let c_prism = Style::default().fg(Color::White);
+        let c_disp = Style::default().fg(Color::Rgb(255, 140, 60));
+        let c_math = Style::default().fg(Color::Cyan);
+
+        let rays = match tick % 3 {
+            0 => "  ══► /\\ ═══► (Red)  ",
+            1 => "  ══► /\\ ───► (Green)",
+            _ => "  ══► /\\ ┄┄┄► (Blue) ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" ◈ Wave Optics & Prism ◈", c_title)]),
+            Line::from(vec![Span::styled(rays, c_disp)]),
+            Line::from(vec![Span::styled("     /  \\ Dispersion ", c_prism)]),
+            Line::from(vec![Span::styled("    /____\\ Spectrum  ", c_prism)]),
+            Line::from(vec![Span::styled(" ∇×E = -∂B/∂t (EM)   ", c_math)]),
+            Line::from(vec![Span::styled(
+                " Double Refraction   ",
+                Style::default().fg(Color::Green),
+            )]),
+            Line::from(vec![Span::styled(
+                " Yale Optics (1889)  ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 13: Quaternary Phase Simplex (3D Composition Tetrahedron, Gibbs 1878)
+    fn render_scene_tetrahedron(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(120, 220, 160))
+            .add_modifier(Modifier::BOLD);
+        let c_tet = Style::default().fg(Color::Rgb(80, 200, 240));
+        let c_math = Style::default().fg(Color::Yellow);
+
+        let rot = match tick % 4 {
+            0 => "        ▲ (A)        ",
+            1 => "       /▲\\ (A)       ",
+            2 => "      //▲\\\\ (A)      ",
+            _ => "       \\▲/ (A)       ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" ❖ Phase Tetrahedron ❖", c_title)]),
+            Line::from(vec![Span::styled(rot, c_tet)]),
+            Line::from(vec![Span::styled("   (B) /_|_\\ (C)     ", c_tet)]),
+            Line::from(vec![Span::styled("     \\  |  /         ", c_tet)]),
+            Line::from(vec![Span::styled("       \\v/ (D)       ", c_tet)]),
+            Line::from(vec![Span::styled("   ∑ x_i = 1 (4-Phase)", c_math)]),
+            Line::from(vec![Span::styled(
+                " Spatial Equilibrium",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 14: Canonical Partition Function Ladder (Statistical Energy Microstates)
+    fn render_scene_partition(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(255, 180, 50))
+            .add_modifier(Modifier::BOLD);
+        let c_ladder = Style::default().fg(Color::Rgb(100, 180, 255));
+        let c_occ = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        let c_math = Style::default().fg(Color::Yellow);
+
+        let ladder = match tick % 3 {
+            0 => " ───●─── E3 (n=1)    ",
+            1 => " ────●── E3 (n=2)    ",
+            _ => " ──●──── E3 (n=0)    ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" ≡ Microstate Partition", c_title)]),
+            Line::from(vec![Span::styled(ladder, c_occ)]),
+            Line::from(vec![Span::styled(" ──●─●── E2 (n=2)    ", c_ladder)]),
+            Line::from(vec![Span::styled(" ─●─●─●─ E1 (Ground) ", c_ladder)]),
+            Line::from(vec![Span::styled(" Z = ∑ exp(-β·E_i)   ", c_math)]),
+            Line::from(vec![Span::styled(
+                " P_i = e^(-βE_i) / Z ",
+                Style::default().fg(Color::Cyan),
+            )]),
+            Line::from(vec![Span::styled(
+                " StatMech Canonical  ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
+    /// Scene 15: Sloane Physics Laboratory (Yale University 1871–1903)
+    fn render_scene_yale(&self) -> Vec<Line<'static>> {
+        let tick = self.frame_tick;
+        let c_title = Style::default()
+            .fg(Color::Rgb(80, 160, 255))
+            .add_modifier(Modifier::BOLD);
+        let c_tower = Style::default().fg(Color::Rgb(170, 160, 140));
+        let c_clock = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let c_lamp = Style::default().fg(Color::Rgb(255, 220, 100));
+
+        let chime = match tick % 4 {
+            0 => "     |  [12:00]  | ♫ ",
+            1 => "     |  [ 3:15]  | ♪ ",
+            2 => "     |  [ 6:30]  | ♬ ",
+            _ => "     |  [ 9:45]  | ♩ ",
+        };
+
+        vec![
+            Line::from(vec![Span::styled(" 🏛 Yale Sloane Physics", c_title)]),
+            Line::from(vec![Span::styled("         /\\          ", c_tower)]),
+            Line::from(vec![Span::styled(chime, c_clock)]),
+            Line::from(vec![Span::styled("     |  |====|   |   ", c_tower)]),
+            Line::from(vec![Span::styled("    /============\\   ", c_tower)]),
+            Line::from(vec![Span::styled("   Desk Lamp: 💡 On  ", c_lamp)]),
+            Line::from(vec![Span::styled(
+                " Prof. J.W. Gibbs    ",
+                Style::default().fg(Color::DarkGray),
+            )]),
+        ]
+    }
+
     /// Renders a full 12-line vignette card for wide displays (>=120 cols).
     pub fn render_full_vignette(&self) -> Vec<Line<'static>> {
         let mut lines = self.render_lines();
@@ -811,10 +1003,44 @@ mod tests {
         assert_eq!(l_ent.len(), 7);
         assert!(l_ent[0].to_string().contains("Entropy Flux"));
 
+        // 11. Galvanic
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Galvanic);
+        let l_galv = mascot.render_lines();
+        assert_eq!(l_galv.len(), 7);
+        assert!(l_galv[0].to_string().contains("Galvanic Cell"));
+
+        // 12. Optics
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Optics);
+        let l_opt = mascot.render_lines();
+        assert_eq!(l_opt.len(), 7);
+        assert!(l_opt[0].to_string().contains("Wave Optics"));
+
+        // 13. Tetrahedron
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Tetrahedron);
+        let l_tet = mascot.render_lines();
+        assert_eq!(l_tet.len(), 7);
+        assert!(l_tet[0].to_string().contains("Phase Tetrahedron"));
+
+        // 14. Partition
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Partition);
+        let l_part = mascot.render_lines();
+        assert_eq!(l_part.len(), 7);
+        assert!(l_part[0].to_string().contains("Microstate Partition"));
+
+        // 15. Yale
+        mascot.avatar_style = mascot.avatar_style.cycle();
+        assert_eq!(mascot.avatar_style, AvatarStyle::Yale);
+        let l_yale = mascot.render_lines();
+        assert_eq!(l_yale.len(), 7);
+        assert!(l_yale[0].to_string().contains("Yale Sloane Physics"));
+
         // Cycle back to Classic
         mascot.avatar_style = mascot.avatar_style.cycle();
         assert_eq!(mascot.avatar_style, AvatarStyle::Classic);
-
         // String parsing
         assert_eq!(
             AvatarStyle::from_str_style("classic"),
