@@ -942,13 +942,18 @@ impl TuiApp {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+        let b_peak_label = if bw_peak > 0.0 {
+            format!("B_peak = {:.0} GB/s", bw_peak)
+        } else {
+            "B_peak = unprobed".to_string()
+        };
         lines.push(Line::from(vec![
             Span::styled("   1k ┤", dim()),
             Span::styled(
                 "         .---'          ",
                 Style::default().fg(Color::Green),
             ),
-            Span::styled("B_peak = 273 GB/s", Style::default().fg(Color::Cyan)),
+            Span::styled(b_peak_label, Style::default().fg(Color::Cyan)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("  300 ┤", dim()),

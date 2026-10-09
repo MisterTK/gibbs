@@ -480,6 +480,11 @@ impl TuiApp {
             "/bench" => {
                 let s = self.telemetry.get_summary();
                 let rss_mb = crate::hardware::current_resident_memory_bytes() as f64 / (1024.0 * 1024.0);
+                let eta = if s.memory_bandwidth_gbps > 0.0 {
+                    (s.effective_bandwidth_gbps / s.memory_bandwidth_gbps) * 100.0
+                } else {
+                    0.0
+                };
                 Some(Ok(format!(
                     "BENCHMARK SUMMARY:\n\
                      · Current Throughput: {:.2} tok/s\n\
@@ -490,7 +495,7 @@ impl TuiApp {
                     s.current_tps,
                     s.total_tokens,
                     s.effective_bandwidth_gbps,
-                    (s.effective_bandwidth_gbps / 273.0) * 100.0,
+                    eta,
                     rss_mb
                 )))
             }
