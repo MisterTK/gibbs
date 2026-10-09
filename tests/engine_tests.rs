@@ -213,7 +213,8 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
     let mut raw_model = GraphLm::from_safetensors_data(cfg, &st_bytes).expect("loads safetensors");
     raw_model.set_tokenizer(tokenizer.clone());
 
-    let exec_model = ExecutableModel::load_graph_lm(raw_model, Device::Cpu).expect("loads Program");
+    let exec_model =
+        ExecutableModel::load_graph_lm(raw_model, Device::Metal).expect("loads Program");
     let prompt = "The capital of France is";
     let prompt_tokens = tokenizer.encode(prompt);
     let mut kv = None;
@@ -271,7 +272,7 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
         return;
     }
 
-    let lm = match load_native(&art, Device::Cpu) {
+    let lm = match load_native(&art, Device::Metal) {
         Some(Ok(m)) => m,
         Some(Err(e)) => panic!("Failed to load {repo}: {e}"),
         None => panic!("load_native returned None for {repo}"),
