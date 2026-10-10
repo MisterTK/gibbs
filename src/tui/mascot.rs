@@ -202,41 +202,47 @@ impl MascotEngine {
         }
     }
 
-    /// Scene 1: Classic Study & Briar Pipe (Default / Contemplative Idle)
+    /// Scene 1: Classic Study & Briar Pipe (High-Resolution Portrait)
     fn render_scene_classic(&self) -> Vec<Line<'static>> {
         let tick = self.frame_tick;
-        let c_hair = Style::default().fg(Color::Rgb(160, 140, 110));
-        let c_face = Style::default().fg(Color::Rgb(240, 210, 180));
+        let c_hair = Style::default().fg(Color::Rgb(170, 150, 120));
+        let c_face = Style::default().fg(Color::Rgb(245, 215, 185));
+        let c_beard = Style::default().fg(Color::Rgb(200, 180, 150));
         let c_spec = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let c_coat = Style::default().fg(Color::Rgb(60, 70, 90));
+        let c_coat = Style::default().fg(Color::Rgb(65, 75, 95));
+        let c_tie = Style::default().fg(Color::Rgb(180, 60, 60));
 
         let frame = tick % 4;
         let ember_color = if frame % 2 == 0 {
-            Color::Rgb(209, 154, 102) // Amber #D19A66
+            Color::Rgb(215, 160, 100)
         } else {
-            Color::Rgb(224, 108, 117) // Ruby #E06C75
+            Color::Rgb(230, 110, 120)
         };
         let smoke_str = match frame {
-            0 => "   ~ °",
-            1 => "  ° o ",
-            2 => " o  O ",
-            _ => "O   ~ ",
+            0 => "     ~ °  ",
+            1 => "    ° o ~ ",
+            2 => "   o  O   ",
+            _ => "  O   ~ ° ",
         };
         let blink = (tick % 16) == 0;
-        let eye_str = if blink { " -   - " } else { " ⚯   ⚯ " };
+        let eye_str = if blink {
+            "  -     -  "
+        } else {
+            "  ⚯     ⚯  "
+        };
 
         let thinking_eq = match tick % 6 {
-            0 => " dG = Vdp-SdT ",
-            1 => " dE ≤ TdS-PdV ",
-            2 => " F = C-P+2   ",
-            3 => " ln Z = -βF  ",
-            4 => "  ∇ · B = 0   ",
-            _ => " ΔS_univ ≥ 0  ",
+            0 => " dG = Vdp - SdT  ",
+            1 => " dE ≤ TdS - PdV  ",
+            2 => " F = C - P + 2   ",
+            3 => " ln Z = -β·F     ",
+            4 => "  ∇ × E = -∂B/∂t ",
+            _ => " ΔS_univ ≥ 0 (Eq)",
         };
         let (badge, c_stat, stream_tok) = match self.state {
-            MascotState::Idle => (" J.W. Gibbs ", Style::default().fg(Color::Green), " "),
+            MascotState::Idle => (" J. Willard Gibbs ", Style::default().fg(Color::Green), "●"),
             MascotState::Thinking => (
                 thinking_eq,
                 Style::default()
@@ -249,7 +255,7 @@ impl MascotEngine {
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-                "1",
+                "»",
             ),
             MascotState::Error => (
                 " ⚠️ dS/dt > 0 ",
@@ -267,35 +273,34 @@ impl MascotEngine {
 
         vec![
             Line::from(vec![
-                Span::styled("   ╭─────╮   ", c_hair),
+                Span::styled("     ╭───────────╮    ", c_hair),
                 Span::styled(smoke_str, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
-                Span::styled("  ╭┤", c_hair),
+                Span::styled("   ╭─┤", c_hair),
                 Span::styled(eye_str, c_spec),
-                Span::styled("├╮  ", c_hair),
+                Span::styled("├─╮  ", c_hair),
                 Span::styled(format!(" {stream_tok}"), Style::default().fg(Color::Green)),
             ]),
             Line::from(vec![
-                Span::styled("  ││", c_hair),
-                Span::styled("   ▾   ", c_face),
-                Span::styled("││  ", c_hair),
-                Span::styled(
-                    format!(" {stream_tok}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("   │ │", c_hair),
+                Span::styled("     ▾     ", c_face),
+                Span::styled("│ │   ", c_hair),
+                Span::styled("   ", Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
-                Span::styled("  ╰┴─", c_hair),
-                Span::styled("▞▀▀▀▚", c_face),
-                Span::styled("─┴╯  ", c_hair),
+                Span::styled("   ╰─┴──", c_hair),
+                Span::styled("▞▀▀▀▀▀▚", c_beard),
+                Span::styled("──┴─╯   ", c_hair),
             ]),
             Line::from(vec![
-                Span::styled("   ▞▀▀▀▀▀▚", c_coat),
-                Span::styled("═╤╝", Style::default().fg(ember_color)),
+                Span::styled("    ╭───▞", c_coat),
+                Span::styled(" bowtie ", c_tie),
+                Span::styled("▚───╮", c_coat),
+                Span::styled(" ═╤╝", Style::default().fg(ember_color)),
             ]),
-            Line::from(vec![Span::styled("  ▐       ▌  ", c_coat)]),
-            Line::from(vec![Span::styled(badge, c_stat)]),
+            Line::from(vec![Span::styled("   ▐     dG=Vdp     ▌   ", c_coat)]),
+            Line::from(vec![Span::styled(format!("  {badge}  "), c_stat)]),
         ]
     }
 

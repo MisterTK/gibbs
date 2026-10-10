@@ -599,31 +599,8 @@ impl TextModel {
 
         let n = 1;
         let h = self.hidden;
-        let tokens = g.input("token_ids", vec![n], DType::U32);
+        let mut x = g.input("inputs_embeds", vec![n, h], DType::F32);
         let positions = g.input("positions", vec![n], DType::U32);
-
-        // 1. Embedding
-        let embed_w = g.weight("embed_tokens.weight", vec![self.vocab, h], DType::F32);
-        let embed_t = Tensor::F32(self.embed.to_f32());
-        w.insert("embed_tokens.weight", embed_t);
-        let mut x = g.add(
-            "embed",
-            Op::Embedding,
-            &[embed_w, tokens],
-            vec![n, h],
-            DType::F32,
-        );
-        if (self.embed_scale - 1.0).abs() > 1e-6 {
-            let scale_w = g.weight("embed_scale", vec![1], DType::F32);
-            w.insert("embed_scale", Tensor::F32(vec![self.embed_scale]));
-            x = g.add(
-                "embed_scaled",
-                Op::Mul,
-                &[x, scale_w],
-                vec![n, h],
-                DType::F32,
-            );
-        }
         let pd = self.ple.as_ref().map_or(0, |p| p.dim);
         let nl = self.layers_n;
         let ple_node = if let Some(p_model) = &self.ple {
@@ -1218,7 +1195,9 @@ mod tests {
 
         // 2. Graph forward pass
         let (decode_g, w) = model.to_decode_graph().unwrap();
-        let inputs = vec![Tensor::U32(vec![tok]), Tensor::U32(vec![0])];
+        let mut emb_in = vec![0.0f32; h];
+        model.embed_row(tok, &mut emb_in);
+        let inputs = vec![Tensor::F32(emb_in), Tensor::U32(vec![0])];
         let graph_res = run_stateless(&decode_g, &w, inputs).expect("graph execution succeeds");
         let graph_logits = graph_res[0].as_f32().expect("f32 logits");
 
@@ -1359,8 +1338,10 @@ mod tests {
         for v in &mut ple_e {
             *v *= ident_scale;
         }
+        let mut emb_in = vec![0.0f32; h];
+        model.embed_row(tok, &mut emb_in);
         let inputs = vec![
-            Tensor::U32(vec![tok]),
+            Tensor::F32(emb_in),
             Tensor::U32(vec![0]),
             Tensor::F32(ple_e),
         ];
@@ -1458,7 +1439,9 @@ mod tests {
 
         let (decode_g, w) = model.to_decode_graph().unwrap();
         let tok = 7u32;
-        let inputs = vec![Tensor::U32(vec![tok]), Tensor::U32(vec![0])];
+        let mut emb_in = vec![0.0f32; h];
+        model.embed_row(tok, &mut emb_in);
+        let inputs = vec![Tensor::F32(emb_in), Tensor::U32(vec![0])];
 
         let cpu_res = run_stateless(&decode_g, &w, inputs.clone()).expect("cpu run succeeds");
         let cpu_logits = cpu_res[0].as_f32().expect("f32 cpu logits");

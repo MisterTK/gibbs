@@ -91,9 +91,9 @@ impl TuiApp {
         self.render_status(f, status);
         if top.width >= 100 {
             let [mascot_area, throughput, requests] = Layout::horizontal([
-                Constraint::Length(18),
-                Constraint::Percentage(38),
-                Constraint::Percentage(46),
+                Constraint::Length(26),
+                Constraint::Percentage(37),
+                Constraint::Percentage(43),
             ])
             .areas(top);
             self.render_mascot(f, mascot_area);
@@ -108,15 +108,32 @@ impl TuiApp {
         }
         if mid.width >= 110 {
             let [console, side] =
-                Layout::horizontal([Constraint::Min(50), Constraint::Length(56)]).areas(mid);
+                Layout::horizontal([Constraint::Min(50), Constraint::Length(58)]).areas(mid);
             self.render_console(f, console);
-            let host_h = self.host_lines.len() as u16 + 2 + u16::from(self.http_addr.is_some());
-            let [weights, host] =
-                Layout::vertical([Constraint::Min(5), Constraint::Length(host_h)]).areas(side);
-            self.render_weights(f, weights);
-            self.render_host(f, host);
+            if self.show_roofline_inspector {
+                self.render_roofline_inspector(f, side, true);
+            } else if self.show_latency_modal {
+                self.render_latency_modal(f, side, true);
+            } else if self.show_logprob_inspector || self.show_token_inspector {
+                self.render_logprob_inspector(f, side, true);
+            } else {
+                let host_h = self.host_lines.len() as u16 + 2 + u16::from(self.http_addr.is_some());
+                let [weights, host] =
+                    Layout::vertical([Constraint::Min(5), Constraint::Length(host_h)]).areas(side);
+                self.render_weights(f, weights);
+                self.render_host(f, host);
+            }
         } else {
             self.render_console(f, mid);
+            if self.show_logprob_inspector || self.show_token_inspector {
+                self.render_logprob_inspector(f, area, false);
+            }
+            if self.show_roofline_inspector {
+                self.render_roofline_inspector(f, area, false);
+            }
+            if self.show_latency_modal {
+                self.render_latency_modal(f, area, false);
+            }
         }
         self.render_log(f, log);
         self.render_keys(f, keys);
@@ -126,15 +143,6 @@ impl TuiApp {
         }
         if self.show_template_modal {
             self.render_template_modal(f, area);
-        }
-        if self.show_logprob_inspector || self.show_token_inspector {
-            self.render_logprob_inspector(f, area);
-        }
-        if self.show_roofline_inspector {
-            self.render_roofline_inspector(f, area);
-        }
-        if self.show_latency_modal {
-            self.render_latency_modal(f, area);
         }
     }
 
@@ -737,18 +745,25 @@ impl TuiApp {
         f.render_widget(Paragraph::new(lines).block(block), popup);
     }
 
-    fn render_logprob_inspector(&self, f: &mut Frame, area: Rect) {
-        let w = (area.width * 70 / 100).max(50).min(area.width);
-        let h = (area.height * 60 / 100).max(14).min(area.height);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let popup = Rect::new(x, y, w, h);
+    fn render_logprob_inspector(&self, f: &mut Frame, area: Rect, is_sidebar: bool) {
+        let inner = if is_sidebar {
+            let block = panel("Logit Probability Inspector (Ctrl+P)");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            inner
+        } else {
+            let w = (area.width * 70 / 100).max(50).min(area.width);
+            let h = (area.height * 60 / 100).max(14).min(area.height);
+            let x = area.x + (area.width.saturating_sub(w)) / 2;
+            let y = area.y + (area.height.saturating_sub(h)) / 2;
+            let popup = Rect::new(x, y, w, h);
 
-        f.render_widget(Clear, popup);
-        let block = panel("Logit Probability Inspector (Ctrl+P)");
-        let inner = block.inner(popup);
-        f.render_widget(block, popup);
-
+            f.render_widget(Clear, popup);
+            let block = panel("Logit Probability Inspector (Ctrl+P)");
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            inner
+        };
         let mut lines = Vec::new();
         let target_info = if !self.logprob_history.is_empty() {
             let idx = self.logprob_scrub_idx.min(self.logprob_history.len() - 1);
@@ -868,18 +883,25 @@ impl TuiApp {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    fn render_roofline_inspector(&self, f: &mut Frame, area: Rect) {
-        let w = (area.width * 75 / 100).max(62).min(area.width);
-        let h = (area.height * 75 / 100).max(18).min(area.height);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let popup = Rect::new(x, y, w, h);
+    fn render_roofline_inspector(&self, f: &mut Frame, area: Rect, is_sidebar: bool) {
+        let inner = if is_sidebar {
+            let block = panel("2D Visual Roofline Diagnostic (Ctrl+R)");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            inner
+        } else {
+            let w = (area.width * 75 / 100).max(62).min(area.width);
+            let h = (area.height * 75 / 100).max(18).min(area.height);
+            let x = area.x + (area.width.saturating_sub(w)) / 2;
+            let y = area.y + (area.height.saturating_sub(h)) / 2;
+            let popup = Rect::new(x, y, w, h);
 
-        f.render_widget(Clear, popup);
-        let block = panel("2D Visual Roofline Diagnostic Inspector (Ctrl+R / /roofline)");
-        let inner = block.inner(popup);
-        f.render_widget(block, popup);
-
+            f.render_widget(Clear, popup);
+            let block = panel("2D Visual Roofline Diagnostic Inspector (Ctrl+R / /roofline)");
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            inner
+        };
         let s = self.telemetry.get_summary();
         let bw_peak = s.memory_bandwidth_gbps as f64;
         let peak_compute = 28_000.0f64; // 28 TFLOPs FP16 GFLOP/s
@@ -1050,18 +1072,25 @@ impl TuiApp {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
-    fn render_latency_modal(&self, f: &mut Frame, area: Rect) {
-        let w = (area.width * 70 / 100).max(52).min(area.width);
-        let h = (area.height * 65 / 100).max(16).min(area.height);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let popup = Rect::new(x, y, w, h);
+    fn render_latency_modal(&self, f: &mut Frame, area: Rect, is_sidebar: bool) {
+        let inner = if is_sidebar {
+            let block = panel("Decode Latency & Percentiles (Ctrl+L)");
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            inner
+        } else {
+            let w = (area.width * 70 / 100).max(52).min(area.width);
+            let h = (area.height * 65 / 100).max(16).min(area.height);
+            let x = area.x + (area.width.saturating_sub(w)) / 2;
+            let y = area.y + (area.height.saturating_sub(h)) / 2;
+            let popup = Rect::new(x, y, w, h);
 
-        f.render_widget(Clear, popup);
-        let block = panel("Streaming Decode Latency & Percentiles (Ctrl+L)");
-        let inner = block.inner(popup);
-        f.render_widget(block, popup);
-
+            f.render_widget(Clear, popup);
+            let block = panel("Streaming Decode Latency & Percentiles (Ctrl+L)");
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            inner
+        };
         let samples = self.telemetry.recent_itl_ms(256);
         let mut lines = Vec::new();
 
