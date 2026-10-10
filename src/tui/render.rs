@@ -82,7 +82,7 @@ impl TuiApp {
         let area = f.area();
         let [status, top, mid, log, keys] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(9),
+            Constraint::Length(10),
             Constraint::Min(8),
             Constraint::Length(8),
             Constraint::Length(1),
@@ -91,9 +91,9 @@ impl TuiApp {
         self.render_status(f, status);
         if top.width >= 100 {
             let [mascot_area, throughput, requests] = Layout::horizontal([
-                Constraint::Length(26),
-                Constraint::Percentage(37),
-                Constraint::Percentage(43),
+                Constraint::Length(30),
+                Constraint::Percentage(35),
+                Constraint::Percentage(41),
             ])
             .areas(top);
             self.render_mascot(f, mascot_area);
