@@ -1082,11 +1082,17 @@ impl TextModel {
             DType::F32,
         );
 
-        // 4. LM Head (tied with embed)
+        // 4. LM Head (quantized native representation, avoiding dense F32 dequantization)
+        let lm_w = g.weight(
+            "lm_head.weight",
+            vec![self.vocab, h],
+            mat_dtype(&self.embed),
+        );
+        w.insert("lm_head.weight", self.embed.to_graph_tensor());
         let logits = g.add(
             "lm_head",
             Op::Linear,
-            &[final_norm, embed_w],
+            &[final_norm, lm_w],
             vec![n, self.vocab],
             DType::F32,
         );

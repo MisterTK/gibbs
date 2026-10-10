@@ -8,7 +8,7 @@ pub(crate) mod mascot;
 mod picker;
 mod render;
 
-use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
+use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
 use crate::kv::PagedKVPool;
 use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore, SequenceClassifier};
 use crate::model::hf_loader::ChatMessage;
@@ -969,8 +969,9 @@ impl TuiApp {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let backend = match placement {
                     PlacementMode::Pin(d) => d,
-                    PlacementMode::Auto => Device::Cpu,
+                    PlacementMode::Auto => crate::hardware::default_device(),
                 };
+                let effective_placement = PlacementMode::Pin(backend);
                 *stage.lock() = if hub.locate_model(&id).weights_path.is_some() {
                     "reading cached files"
                 } else {
@@ -1024,7 +1025,7 @@ impl TuiApp {
                     *slot.write() = None;
                     return Ok((None, shape));
                 }
-                if let Some(native) = load_native(&artifacts, placement) {
+                if let Some(native) = load_native(&artifacts, effective_placement) {
                     let m = native?;
                     let shape = format!("{}, on {}", m.summary(), m.backend_label());
                     sched.swap_model(&id, ExecutableModel::Native(m));
