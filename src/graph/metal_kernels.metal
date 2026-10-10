@@ -718,31 +718,13 @@ kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
         float4 xb0 = *reinterpret_cast<device const float4*>(xb + i);
         float4 xb1 = *reinterpret_cast<device const float4*>(xb + i + 4);
 
-        float4 val0_0, val0_1;
-        val0_0[0] = as_type<float>(uint(w0_0[0]) << 16);
-        val0_0[1] = as_type<float>(uint(w0_0[1]) << 16);
-        val0_0[2] = as_type<float>(uint(w0_0[2]) << 16);
-        val0_0[3] = as_type<float>(uint(w0_0[3]) << 16);
-
-        val0_1[0] = as_type<float>(uint(w0_1[0]) << 16);
-        val0_1[1] = as_type<float>(uint(w0_1[1]) << 16);
-        val0_1[2] = as_type<float>(uint(w0_1[2]) << 16);
-        val0_1[3] = as_type<float>(uint(w0_1[3]) << 16);
-
+        float4 val0_0 = as_type<float4>(uint4(w0_0) << 16);
+        float4 val0_1 = as_type<float4>(uint4(w0_1) << 16);
         acc0 += dot(val0_0, xb0) + dot(val0_1, xb1);
 
         if (has_row1) {
-            float4 val1_0, val1_1;
-            val1_0[0] = as_type<float>(uint(w1_0[0]) << 16);
-            val1_0[1] = as_type<float>(uint(w1_0[1]) << 16);
-            val1_0[2] = as_type<float>(uint(w1_0[2]) << 16);
-            val1_0[3] = as_type<float>(uint(w1_0[3]) << 16);
-
-            val1_1[0] = as_type<float>(uint(w1_1[0]) << 16);
-            val1_1[1] = as_type<float>(uint(w1_1[1]) << 16);
-            val1_1[2] = as_type<float>(uint(w1_1[2]) << 16);
-            val1_1[3] = as_type<float>(uint(w1_1[3]) << 16);
-
+            float4 val1_0 = as_type<float4>(uint4(w1_0) << 16);
+            float4 val1_1 = as_type<float4>(uint4(w1_1) << 16);
             acc1 += dot(val1_0, xb0) + dot(val1_1, xb1);
         }
     }
