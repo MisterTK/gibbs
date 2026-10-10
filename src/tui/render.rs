@@ -80,63 +80,87 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 impl TuiApp {
     pub(super) fn render(&self, f: &mut Frame) {
         let area = f.area();
-        let [status, top, mid, log, keys] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(10),
-            Constraint::Min(8),
-            Constraint::Length(8),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-        self.render_status(f, status);
-        if top.width >= 100 {
+        if area.width >= 105 {
+            // Right-hand side is 100% viewport height!
+            let [left_area, right_area] =
+                Layout::horizontal([Constraint::Min(50), Constraint::Length(54)]).areas(area);
+
+            // Left side: Single vertical layout
+            let [status, top, console, log, keys] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(10),
+                Constraint::Min(8),
+                Constraint::Length(7),
+                Constraint::Length(1),
+            ])
+            .areas(left_area);
+
+            self.render_status(f, status);
+
             let [mascot_area, throughput, requests] = Layout::horizontal([
                 Constraint::Length(30),
-                Constraint::Percentage(35),
-                Constraint::Percentage(41),
+                Constraint::Percentage(38),
+                Constraint::Percentage(40),
             ])
             .areas(top);
             self.render_mascot(f, mascot_area);
             self.render_throughput(f, throughput);
             self.render_requests(f, requests);
+
+            self.render_console(f, console);
+            self.render_log(f, log);
+            self.render_keys(f, keys);
+
+            // Right side: 100% viewport height with 6 always-shown boxes!
+            let host_h =
+                (self.host_lines.len() as u16 + 2 + u16::from(self.http_addr.is_some())).min(8);
+            let [roofline, weights, tokens, logprobs, latency, host] = Layout::vertical([
+                Constraint::Length(5),
+                Constraint::Min(5),
+                Constraint::Length(5),
+                Constraint::Length(6),
+                Constraint::Length(5),
+                Constraint::Length(host_h),
+            ])
+            .areas(right_area);
+
+            self.render_roofline_box(f, roofline);
+            self.render_weights(f, weights);
+            self.render_tokens_box(f, tokens);
+            self.render_logprobs_box(f, logprobs);
+            self.render_latency_box(f, latency);
+            self.render_host(f, host);
         } else {
+            // Narrow screen fallback: single vertical stack
+            let [status, top, console, log, keys] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(10),
+                Constraint::Min(8),
+                Constraint::Length(7),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+
+            self.render_status(f, status);
             let [throughput, requests] =
                 Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
                     .areas(top);
             self.render_throughput(f, throughput);
             self.render_requests(f, requests);
-        }
-        if mid.width >= 110 {
-            let [console, side] =
-                Layout::horizontal([Constraint::Min(50), Constraint::Length(58)]).areas(mid);
             self.render_console(f, console);
-            if self.show_roofline_inspector {
-                self.render_roofline_inspector(f, side, true);
-            } else if self.show_latency_modal {
-                self.render_latency_modal(f, side, true);
-            } else if self.show_logprob_inspector || self.show_token_inspector {
-                self.render_logprob_inspector(f, side, true);
-            } else {
-                let host_h = self.host_lines.len() as u16 + 2 + u16::from(self.http_addr.is_some());
-                let [weights, host] =
-                    Layout::vertical([Constraint::Min(5), Constraint::Length(host_h)]).areas(side);
-                self.render_weights(f, weights);
-                self.render_host(f, host);
-            }
-        } else {
-            self.render_console(f, mid);
-            if self.show_logprob_inspector || self.show_token_inspector {
-                self.render_logprob_inspector(f, area, false);
-            }
+            self.render_log(f, log);
+            self.render_keys(f, keys);
             if self.show_roofline_inspector {
                 self.render_roofline_inspector(f, area, false);
             }
             if self.show_latency_modal {
                 self.render_latency_modal(f, area, false);
             }
+            if self.show_logprob_inspector || self.show_token_inspector {
+                self.render_logprob_inspector(f, area, false);
+            }
         }
-        self.render_log(f, log);
-        self.render_keys(f, keys);
+
         if self.focus == Focus::Picker {
             let loading = self.load.as_ref().map(|l| l.id.as_str());
             self.picker.render(f, area, &self.model_id(), loading);
@@ -588,6 +612,221 @@ impl TuiApp {
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
+    fn render_roofline_box(&self, f: &mut Frame, area: Rect) {
+        let block = panel("Roofline");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let s = self.telemetry.get_summary();
+        let b_peak = s.memory_bandwidth_gbps;
+        let cur_bw = s.effective_bandwidth_gbps;
+        let eta = if b_peak > 0.0 && cur_bw > 0.0 {
+            (cur_bw / b_peak * 100.0).min(100.0)
+        } else {
+            s.roofline_pct
+        };
+        let bar_len = (inner.width as usize).saturating_sub(18).max(4).min(20);
+        let filled = ((eta as f64 / 100.0) * bar_len as f64)
+            .round()
+            .min(bar_len as f64) as usize;
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled),
+            "░".repeat(bar_len.saturating_sub(filled))
+        );
+        let color = if eta < 40.0 {
+            Color::Cyan
+        } else if eta <= 70.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{bar} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{eta:>5.1}% "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(if eta > 65.0 { "BW-Bound" } else { "Lat-Bound" }, dim()),
+        ]));
+        let bw_label = if b_peak > 0.0 {
+            format!("{:.1} / {:.0} GB/s", cur_bw, b_peak)
+        } else {
+            format!("{:.1} GB/s", cur_bw)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Streaming: ", dim()),
+            Span::styled(bw_label, Style::default().fg(Color::White)),
+        ]));
+        if inner.height >= 3 {
+            lines.push(Line::from(vec![
+                Span::styled("Intensity: ", dim()),
+                Span::styled("3.20 FLOPs/B (Decode)", Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_tokens_box(&self, f: &mut Frame, area: Rect) {
+        let block = panel("Tokens");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let s = self.telemetry.get_summary();
+        let peak = self.spark.iter().copied().max().unwrap_or(0);
+        let mut lines = Vec::new();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:.1} tok/s", s.current_tps),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" (peak {peak} tok/s)"), dim()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Total:     ", dim()),
+            Span::styled(
+                format!("{} tokens", thousands(s.total_tokens)),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!(" · {} reqs", thousands(s.completed_requests)),
+                dim(),
+            ),
+        ]));
+        if inner.height >= 3 {
+            let hist_len = self.logprob_history.len();
+            lines.push(Line::from(vec![
+                Span::styled("Timeline:  ", dim()),
+                Span::styled(
+                    format!("{hist_len} tokens in window"),
+                    Style::default().fg(ACCENT),
+                ),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_logprobs_box(&self, f: &mut Frame, area: Rect) {
+        let block = panel("Logprobs");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let target_info = if !self.logprob_history.is_empty() {
+            let idx = self.logprob_scrub_idx.min(self.logprob_history.len() - 1);
+            Some(&self.logprob_history[idx])
+        } else {
+            self.latest_logprobs.as_ref()
+        };
+        let mut lines = Vec::new();
+        if let Some(info) = target_info {
+            lines.push(Line::from(vec![
+                Span::styled("Token: ", dim()),
+                Span::styled(
+                    format!("{}", info.chosen_id),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  Conf: {:.1}%", info.chosen_prob * 100.0),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("  H: {:.2}", info.entropy),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+            let room = (inner.height as usize).saturating_sub(1);
+            for (c_idx, (tok, prob)) in info.top_candidates.iter().take(room.min(3)).enumerate() {
+                let pct = (prob * 100.0).clamp(0.0, 100.0);
+                let filled = (pct / 20.0).round() as usize;
+                let empty = 5usize.saturating_sub(filled);
+                let bar = format!("{}{}", "■".repeat(filled), "░".repeat(empty));
+                let is_chosen = *tok == info.chosen_id;
+                let marker = if is_chosen { "▶" } else { " " };
+                let style = if is_chosen {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Green)),
+                    Span::styled(format!(" #{:<1} {:<6} ", c_idx + 1, tok), style),
+                    Span::styled(format!("{bar} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("{:>4.0}%", pct), style),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled("No logprob data (idle)", dim())));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_latency_box(&self, f: &mut Frame, area: Rect) {
+        let block = panel("Latency");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let samples = self.telemetry.recent_itl_ms(256);
+        let mut lines = Vec::new();
+        if samples.is_empty() {
+            lines.push(Line::from(Span::styled("No latency samples (idle)", dim())));
+        } else {
+            let mut sorted = samples.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let n = sorted.len();
+            let p50 = sorted[((n - 1) as f32 * 0.50).round() as usize];
+            let p95 = sorted[((n - 1) as f32 * 0.95).round() as usize];
+            let p99 = sorted[((n - 1) as f32 * 0.99).round() as usize];
+            let sum: f32 = sorted.iter().sum();
+            let mean = sum / n as f32;
+            let variance: f32 = sorted.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+            let std_dev = variance.sqrt();
+
+            lines.push(Line::from(vec![
+                Span::styled("Median (p50): ", dim()),
+                Span::styled(
+                    format!("{p50:.1} ms"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  mean: {mean:.1} ms"), dim()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Tail p95/p99: ", dim()),
+                Span::styled(
+                    format!("{p95:.1} / {p99:.1} ms"),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(format!(" (±{std_dev:.1})"), dim()),
+            ]));
+            if inner.height >= 3 {
+                lines.push(Line::from(vec![
+                    Span::styled("Window:       ", dim()),
+                    Span::styled(
+                        format!("{n} tokens recorded"),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            }
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
     fn render_host(&self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = self
             .host_lines
