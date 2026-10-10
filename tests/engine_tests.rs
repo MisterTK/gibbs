@@ -265,12 +265,22 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
     use foundry_engine::model::native::load_native;
     use std::time::Instant;
 
-    let repo = "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive";
-    let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(repo);
-    if art.weights_path.is_none() {
-        println!("SKIP: {repo} not found in disk/");
-        return;
-    }
+    let repos = [
+        "unsloth/gemma-4-E2B-it-qat-GGUF",
+        "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive",
+    ];
+    let hub = HuggingFaceHub::with_cache_dir("disk".into());
+    let (repo, art) = match repos
+        .iter()
+        .map(|&r| (r, hub.locate_model(r)))
+        .find(|(_, a)| a.weights_path.is_some())
+    {
+        Some(pair) => pair,
+        None => {
+            println!("SKIP: No Gemma 4 checkpoint found in disk/");
+            return;
+        }
+    };
 
     let lm = match load_native(&art, Device::Metal) {
         Some(Ok(m)) => m,
@@ -307,7 +317,11 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
     }
     let elapsed = t0.elapsed();
     let tps = (generated.len() as f64) / elapsed.as_secs_f64();
-    let model_bytes = 2.87e9f64; // ~2.87 GB Q2_K_P weights
+    let model_bytes = art
+        .weights_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok().map(|m| m.len() as f64))
+        .unwrap_or(2.14e9f64);
     let eff_bw = (tps * model_bytes) / 1e9;
     println!("Gemma 4 E2B Real Disk Checkpoint: {tps:.2} tok/s ({eff_bw:.2} GB/s effective memory streaming)");
     assert!(
