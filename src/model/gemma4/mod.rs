@@ -335,8 +335,10 @@ impl NativeLm for Gemma4 {
                 let mut last_logits = Vec::new();
                 for (i, &tok) in tokens.iter().enumerate() {
                     let pos = start_pos + i;
+                    let mut emb = vec![0.0f32; self.text.hidden];
+                    self.text.embed_row(tok, &mut emb);
                     let mut inputs = vec![
-                        crate::graph::Tensor::U32(vec![tok]),
+                        crate::graph::Tensor::F32(emb),
                         crate::graph::Tensor::U32(vec![pos as u32]),
                     ];
                     if let Some(p) = &self.text.ple {
