@@ -807,15 +807,10 @@ kernel void gemv_f16(device const half* w [[buffer(0)]],
             acc0 += bias[row0];
             if (has_row1) acc1 += bias[row1];
         }
-        if (p.epi == 2) {
-            acc0 += res[(ulong)batch * p.rows + row0];
-            if (has_row1) acc1 += res[(ulong)batch * p.rows + row1];
-        } else if (p.epi == 1) {
-            acc0 = gelu_erf(acc0);
-            if (has_row1) acc1 = gelu_erf(acc1);
-        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
         y[(ulong)batch * p.rows + row0] = acc0;
         if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
             y[(ulong)batch * p.rows + row1] = acc1;
         }
     }
