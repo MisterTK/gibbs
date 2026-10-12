@@ -1563,6 +1563,9 @@ impl Session {
                         DType::Quant(QuantFormat::NVFP4_E2M1)
                         | DType::Quant(QuantFormat::NVFP4) => WeightFormat::NvFp4,
                         DType::Quant(QuantFormat::WeightlessJesseLUT) => WeightFormat::JesseLUT,
+                        DType::Quant(f) if crate::graph::codec::codec(f).is_some() => {
+                            WeightFormat::Gen(f)
+                        }
                         _ => WeightFormat::F32,
                     };
                     if *len != numel(graph, v)? || *fmt != expected_fmt {
@@ -4265,11 +4268,20 @@ fn generated_gemv_pipelines(
         return Ok(HashMap::new());
     }
     let params = crate::graph::codegen::GemvParams::default();
+    let codec_of = |f: QuantFormat| {
+        crate::graph::codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))
+    };
+    // Formats that share a block layout (IQ2_S / IQ2_M) share one kernel.
+    let mut names: Vec<String> = Vec::new();
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
     src.push_str(crate::graph::codegen::gemv_common(KERNELS_MSL));
     for &f in &wanted {
-        let c = crate::graph::codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        src.push_str(&crate::graph::codegen::gemv_packed(c, params));
+        let c = codec_of(f)?;
+        let name = crate::graph::codegen::gemv_packed_name(c, params);
+        if !names.contains(&name) {
+            src.push_str(&crate::graph::codegen::gemv_packed(c, params));
+            names.push(name);
+        }
     }
     let opts = CompileOptions::new();
     opts.set_fast_math_enabled(false);
@@ -4278,8 +4290,7 @@ fn generated_gemv_pipelines(
         .map_err(|e| format!("generated GEMV compilation failed: {e}"))?;
     let mut out = HashMap::new();
     for f in wanted {
-        let c = crate::graph::codec::codec(f).expect("checked above");
-        let name = crate::graph::codegen::gemv_packed_name(c, params);
+        let name = crate::graph::codegen::gemv_packed_name(codec_of(f)?, params);
         let func = lib
             .get_function(&name, None)
             .map_err(|e| format!("generated function '{name}': {e}"))?;
@@ -4956,6 +4967,78 @@ mod tests {
         ];
         let (want, got) = both(&g, &w, inputs, None);
         assert!(rel_err(&want, &got) < 1e-4);
+    }
+
+    /// Every codec format without a hand kernel: the generated GEMV equals the CPU executor
+    /// (which dequantizes through `dequantize_*_block`), with and without a bias epilogue.
+    #[test]
+    fn generated_gemv_matches_cpu_for_every_codec() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        let formats = [
+            QuantFormat::GGUF_Q4_1,
+            QuantFormat::GGUF_Q5_0,
+            QuantFormat::GGUF_Q5_1,
+            QuantFormat::GGUF_Q3_K,
+            QuantFormat::GGUF_Q5_K_M,
+            QuantFormat::GGUF_Q6_K,
+            QuantFormat::GGUF_IQ4_NL,
+            QuantFormat::GGUF_IQ3_XXS,
+            QuantFormat::GGUF_IQ2_XXS,
+            QuantFormat::GGUF_IQ2_XS,
+            QuantFormat::GGUF_IQ1_S,
+            QuantFormat::GGUF_TQ1_0,
+            QuantFormat::GGUF_TQ2_0,
+        ];
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        // Finite f16 scale (|x| in 2^-6..2^4) so the reference and the GPU never meet NaN/inf.
+        let mut f16 = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
+            let exp = 9 + (next() % 14) as u16;
+            (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
+        };
+        for f in formats {
+            let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+            let scale_at: &[usize] = match f {
+                QuantFormat::GGUF_Q4_1 | QuantFormat::GGUF_Q5_1 | QuantFormat::GGUF_Q5_K_M => &[0, 2],
+                QuantFormat::GGUF_Q6_K => &[208],
+                QuantFormat::GGUF_Q3_K => &[108],
+                QuantFormat::GGUF_TQ1_0 => &[52],
+                QuantFormat::GGUF_TQ2_0 => &[64],
+                _ => &[0],
+            };
+            let (m, n, k) = (3usize, 37usize, be * 3);
+            let mut raw: Vec<u8> = (0..n * (k / be) * bb).map(|_| (next() >> 4) as u8).collect();
+            for blk in raw.chunks_exact_mut(bb) {
+                for &o in scale_at {
+                    blk[o..o + 2].copy_from_slice(&f16(&mut next));
+                }
+            }
+            let mut g = Graph::new();
+            let x = g.input("x", vec![m, k], DType::F32);
+            let w_val = g.weight("w", vec![n, k], DType::Quant(f));
+            let b_val = g.weight("b", vec![n], DType::F32);
+            let y = g.add("lin", Op::Linear, &[x, w_val, b_val], vec![m, n], DType::F32);
+            g.output(y);
+            let mut w = Weights::new();
+            w.insert(
+                "w",
+                Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                    format: f,
+                    raw_data: raw.into(),
+                    in_features: k,
+                    out_features: n,
+                })),
+            );
+            w.insert("b", Tensor::F32((0..n).map(|i| i as f32 * 0.01 - 0.2).collect()));
+            let xs: Vec<f32> = (0..m * k).map(|_| (next() % 2001) as f32 / 1000.0 - 1.0).collect();
+            let (want, got) = both(&g, &w, vec![Tensor::F32(xs)], None);
+            let err = rel_err(&want, &got);
+            assert!(err < 1e-4, "{f:?}: generated GEMV differs from CPU by {err}");
+            println!("generated gemv {f:?}: rel err {err:.2e}");
+        }
     }
 
     #[test]
