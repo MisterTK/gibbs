@@ -79,9 +79,9 @@ use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     BinaryArchiveDescriptor, Buffer, CommandBufferRef, CommandQueue, CompileOptions,
     ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineDescriptorRef,
-    ComputePipelineState, Device, DeviceRef, IndirectCommandBuffer,
-    IndirectCommandBufferDescriptor, Library, MTLComputePipelineState, MTLIndirectCommandType,
-    MTLPipelineOption, MTLResourceOptions, MTLSize, NSRange, URL,
+    ComputePipelineState, Device, DeviceRef,
+    Library, MTLComputePipelineState,
+    MTLPipelineOption, MTLResourceOptions, MTLSize, URL,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -115,6 +115,9 @@ pub enum WeightFormat {
 
 /// Returns whether the Metal executor implements `op` for the given data type.
 pub fn supports_op(op: &Op, dtype: DType) -> bool {
+    if ext::supports(op, dtype) {
+        return true;
+    }
     match op {
         Op::Linear => match dtype {
             DType::F32 | DType::F16 | DType::BF16 => true,
@@ -178,7 +181,14 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
     }
 }
 
-const KERNELS_MSL: &str = include_str!("metal_kernels.metal");
+mod ext;
+#[cfg(test)]
+mod testutil;
+
+const BASE_MSL: &str = include_str!("metal_kernels.metal");
+/// Core kernels plus every lowering group's (`ext`).
+static KERNELS_MSL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{BASE_MSL}\n{}", ext::msl()));
 /// `MTLLanguageVersion4_0`; the metal crate's enum stops at 3.x.
 const MSL_4_0: u64 = 0x40000;
 const ARENA_ALIGN: usize = 256;
@@ -406,6 +416,7 @@ impl Runtime {
             })
             .collect();
         let mut names = BASE_KERNELS.to_vec();
+        names.extend(ext::kernel_names());
         if msl4.is_ok() {
             names.extend(MPP_KERNELS);
         }
@@ -2081,6 +2092,15 @@ impl Session {
             )
         };
         match s.op {
+            Step::Ext(ref st) => {
+                let e = ext::Enc {
+                    enc,
+                    loc: &loc,
+                    params: params_buf,
+                    step: step_idx,
+                };
+                ext::encode(self, &e, s, st)?;
+            }
             Step::Linear {
                 x,
                 w,
@@ -2958,6 +2978,8 @@ impl Session {
 
 #[derive(Debug, Clone)]
 pub enum Step {
+    /// A step owned by a lowering group in `ext`.
+    Ext(ext::ExtStep),
     Embedding {
         table: ValueId,
         ids: ValueId,
@@ -3269,7 +3291,15 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .outputs
             .first()
             .ok_or_else(|| format!("node '{name}' has no output"))?;
+        let ext_plan = ext::plan(g, node, &mut aliases);
         let (op, out_len) = match &node.op {
+            _ if ext_plan.is_some() => match ext_plan.expect("checked")? {
+                ext::PlanOut::Alias => {
+                    fused[i] = true;
+                    continue;
+                }
+                ext::PlanOut::Step(st, n) => (Step::Ext(st), n),
+            },
             Op::Embedding => {
                 let (table, ids) = (arg(0)?, arg(1)?);
                 let ts = &g.value(table).shape;
@@ -4020,6 +4050,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             ));
         }
         let reads = match op {
+            Step::Ext(ref st) => ext::reads(st),
             Step::Embedding { table, ids, .. } => vec![table, ids],
             Step::Add { a, b, .. } => vec![a, b],
             Step::Gelu { x, .. } | Step::L2Normalize { x, .. } => vec![x],
@@ -4123,6 +4154,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
         // Operands are f32 except embedding ids, pooling mask (u32), and packed weights.
         let is_non_f32_allowed = |v: ValueId| -> bool {
             match &op {
+                Step::Ext(st) => ext::allows_non_f32(st, v),
                 Step::Embedding { ids, .. } => v == *ids,
                 Step::MeanPool { mask, .. } => v == *mask,
                 Step::GemvPacked { w, .. } | Step::GemmBatchedPacked { w, .. } => v == *w,
@@ -4228,11 +4260,11 @@ fn compile(device: &Device) -> Result<(Library, Result<(), String>), String> {
     let o4 = opts();
     // SAFETY: `setLanguageVersion:` takes an NSUInteger enum; 0x40000 is MTLLanguageVersion4_0.
     let () = unsafe { msg_send![&*o4, setLanguageVersion: MSL_4_0] };
-    match device.new_library_with_source(&format!("#define GIBBS_MPP 1\n{KERNELS_MSL}"), &o4) {
+    match device.new_library_with_source(&format!("#define GIBBS_MPP 1\n{}", &*KERNELS_MSL), &o4) {
         Ok(lib) => Ok((lib, Ok(()))),
         Err(e4) => {
             let lib = device
-                .new_library_with_source(KERNELS_MSL, &opts())
+                .new_library_with_source(&KERNELS_MSL, &opts())
                 .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
             Ok((lib, Err(format!("MSL 4.0 compile failed: {e4}"))))
         }
@@ -4277,7 +4309,7 @@ fn generated_gemv_pipelines(
     // Formats that share a block layout (IQ2_S / IQ2_M) share one kernel.
     let mut names: Vec<String> = Vec::new();
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
-    src.push_str(crate::graph::codegen::gemv_common(KERNELS_MSL));
+    src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
     for &f in &wanted {
         let c = codec_of(f)?;
         let name = crate::graph::codegen::gemv_packed_name(c, params);
