@@ -318,3 +318,70 @@ fn gemma4_gguf_answers_text_image_and_speech() {
         println!("SKIP: macOS `say` unavailable to synthesise speech");
     }
 }
+
+/// A Gemma 4 GGUF with an `mmproj` beside it, loaded on `device` (`GIBBS_GEMMA4_MM_DIR`: a hub
+/// snapshot such as `unsloth/gemma-4-E2B-it-qat-GGUF` holding `*.gguf` + `mmproj-*.gguf`).
+fn load_mm_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
+    let dir = PathBuf::from(std::env::var("GIBBS_GEMMA4_MM_DIR").ok()?);
+    let gguf = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).find(|p| {
+        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        n.ends_with(".gguf") && !n.starts_with("mmproj")
+    })?;
+    let artifacts = ModelArtifacts {
+        model_id: "gemma4-mm-gguf".into(),
+        weights_path: Some(gguf),
+        local_dir: Some(dir),
+        is_cached: true,
+        ..Default::default()
+    };
+    Some(load_native(&artifacts, device).expect("gemma4 GGUF is native").expect("gemma4 GGUF loads"))
+}
+
+/// Image and speech prompts through the Metal vision / conformer programs and the GPU row scatter
+/// answer like the host forward on the same weights (set `GIBBS_GEMMA4_MM_DIR`; image is a red disc
+/// on white, speech is synthesised with `say`).
+#[test]
+fn gemma4_gguf_metal_text_image_and_speech() {
+    if !gibbs_engine::hardware::available_devices().contains(&Device::Metal) {
+        return;
+    }
+    let (Some(gpu), Some(cpu)) = (load_mm_gguf(Device::Metal), load_mm_gguf(Device::Cpu)) else {
+        println!("SKIP: set GIBBS_GEMMA4_MM_DIR to a gemma-4 GGUF snapshot with an mmproj");
+        return;
+    };
+    assert_eq!(gpu.device(), Device::Metal);
+    let mut img = gibbs_engine::model::image::ImageBuffer::new(224, 224);
+    for (i, px) in img.data.chunks_exact_mut(3).enumerate() {
+        let (x, y) = ((i % 224) as f32 - 112.0, (i / 224) as f32 - 112.0);
+        px.copy_from_slice(if x * x + y * y < 70.0 * 70.0 { &[220, 20, 20] } else { &[255, 255, 255] });
+    }
+    let parts = serde_json::json!([
+        {"type": "image"},
+        {"type": "text", "text": "What colour is the disc in this picture? Answer with one word."}
+    ]);
+    let media = [MediaInput::Image(img.to_png())];
+    let g = ask(&*gpu, parts.clone(), &media, 8);
+    let c = ask(&*cpu, parts, &media, 8);
+    println!("image: metal {g:?} cpu {c:?}");
+    assert_eq!(g, c);
+    assert!(g.trim().to_lowercase().starts_with("red"), "{g}");
+    let path = std::env::temp_dir().join("gibbs_gemma4_mm_speech.wav");
+    let said = std::process::Command::new("say")
+        .args(["-o", path.to_str().unwrap(), "--data-format=LEI16@22050"])
+        .arg("My favourite fruit is a banana, and I eat one every day.")
+        .status();
+    if matches!(said, Ok(s) if s.success()) {
+        let parts = serde_json::json!([
+            {"type": "audio"},
+            {"type": "text", "text": "Which fruit does the speaker mention? Answer with one word."}
+        ]);
+        let media = [MediaInput::Audio(std::fs::read(&path).unwrap())];
+        let g = ask(&*gpu, parts.clone(), &media, 8);
+        let c = ask(&*cpu, parts, &media, 8);
+        println!("speech: metal {g:?} cpu {c:?}");
+        assert_eq!(g, c);
+        assert!(g.trim().to_lowercase().starts_with("banana"), "{g}");
+    } else {
+        println!("SKIP: macOS `say` unavailable to synthesise speech");
+    }
+}

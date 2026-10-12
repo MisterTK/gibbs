@@ -11,6 +11,8 @@ pub(crate) mod ops;
 pub mod seqcls;
 mod text;
 pub use text::tiny_decode_graph;
+pub use audio::tiny::{graph as tiny_audio_graph, wav_graph as tiny_audio_wav_graph};
+pub use vision::tiny::graph as tiny_vision_graph;
 mod unified;
 mod vision;
 
@@ -130,7 +132,12 @@ pub fn load(
         .transpose()?
         .unwrap_or(Value::Null);
     let (vc, ac) = (&cfg["vision_config"], &cfg["audio_config"]);
-    let (vision, audio): (Box<dyn Encoder>, Box<dyn Encoder>) = if unified {
+    let mode = mode.into();
+    let gpu = crate::model::vision_graph::is_gpu(mode);
+    let (vision, audio): (Box<dyn Encoder>, Box<dyn Encoder>) = if unified && gpu {
+        let why = "gpu-only: the gemma4_unified vision/audio embedders have no Metal program yet; run with --backend cpu".to_string();
+        (Box::new(NoEncoder(why.clone())), Box::new(NoEncoder(why)))
+    } else if unified {
         (
             Box::new(
                 unified::VisionEmbedder::load(&w, vc, &processor)
@@ -142,10 +149,13 @@ pub fn load(
             ),
         )
     } else {
-        (
-            Box::new(Vision::load(&w, vc, &processor).map_err(|e| format!("gemma4 vision: {e}"))?),
-            Box::new(Audio::load(&w, ac, &processor).map_err(|e| format!("gemma4 audio: {e}"))?),
-        )
+        let v = Vision::load(&w, vc, &processor).map_err(|e| format!("gemma4 vision: {e}"))?;
+        let a = Audio::load(&w, ac, &processor).map_err(|e| format!("gemma4 audio: {e}"))?;
+        if gpu {
+            (Box::new(v.on_gpu(mode)), Box::new(a.on_gpu(mode)))
+        } else {
+            (Box::new(v), Box::new(a))
+        }
     };
     let id = |k: &str| {
         cfg[k]
@@ -153,7 +163,6 @@ pub fn load(
             .map(|v| v as u32)
             .ok_or_else(|| format!("config.{k} missing"))
     };
-    let mode = mode.into();
     let program = compile_gemma4_program(&text, mode)?;
     Ok(Arc::new(Gemma4 {
         tokenizer,
@@ -333,58 +342,74 @@ impl NativeLm for Gemma4 {
             return Ok(st.logits.clone()); // run ahead with an earlier chunk's image block
         }
         if let Some(prog) = &self.program {
-            if st.media_pos.is_empty() {
-                let mut prog_guard = prog.lock();
-                std::mem::swap(&mut prog_guard.state, &mut st.program_state);
-                let mut last_logits = Vec::new();
-                for (i, &tok) in tokens.iter().enumerate() {
-                    let pos = start_pos + i;
-                    let mut emb = vec![0.0f32; self.text.hidden];
-                    self.text.embed_row(tok, &mut emb);
-                    let mut inputs = vec![
-                        crate::graph::Tensor::F32(emb),
-                        crate::graph::Tensor::U32(vec![pos as u32]),
-                    ];
-                    if let Some(p) = &self.text.ple {
-                        let pd = p.dim;
-                        let nl = self.text.layers_n;
-                        let mut e = vec![0.0f32; nl * pd];
-                        let id = if (tok as usize) < p.embed.rows {
-                            tok
-                        } else {
-                            self.text.pad_id
-                        };
-                        p.embed.get_row(id as usize, &mut e);
-                        let ident_scale = (pd as f32).sqrt();
-                        for v in &mut e {
-                            *v *= ident_scale;
-                        }
-                        inputs.push(crate::graph::Tensor::F32(e));
+            if !st.blocks.is_empty() {
+                return Err(
+                    "gpu-only: this checkpoint attends image blocks bidirectionally and the Metal program is causal; rerun with --backend cpu"
+                        .into(),
+                );
+            }
+            let h = self.text.hidden;
+            // The chunk's token rows (host table lookups, as in text decoding) with the media soft
+            // tokens scattered over their placeholder rows on the GPU; media rows take the pad id's
+            // per-layer embedding, like the host forward.
+            let (mut base, mut at, mut rows) = (Vec::with_capacity(tokens.len() * h), Vec::new(), Vec::new());
+            let mut ple_ids = Vec::with_capacity(tokens.len());
+            for (i, &tok) in tokens.iter().enumerate() {
+                if tok as usize >= self.text.vocab {
+                    return Err(format!("gemma4: token id {tok} outside the vocabulary"));
+                }
+                let mut emb = vec![0.0f32; h];
+                self.text.embed_row(tok, &mut emb);
+                base.extend(emb);
+                match st.media_pos.binary_search(&(start_pos + i)) {
+                    Ok(r) => {
+                        at.push(i as u32);
+                        rows.extend_from_slice(&st.media[r * h..(r + 1) * h]);
+                        ple_ids.push(self.text.pad_id);
                     }
-                    let out = prog_guard.run(inputs);
-                    match out {
-                        Ok(res) => {
-                            if i + 1 == tokens.len() {
-                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
-                                    last_logits = v;
-                                }
+                    Err(_) => ple_ids.push(tok),
+                }
+            }
+            let mut prog_guard = prog.lock();
+            let mode = crate::hardware::PlacementMode::Pin(prog_guard.primary_device());
+            let x = crate::model::vision_graph::scatter_rows(base, tokens.len(), h, &at, rows, mode)?;
+            std::mem::swap(&mut prog_guard.state, &mut st.program_state);
+            let mut last_logits = Vec::new();
+            for (i, (emb, &id)) in x.chunks_exact(h).zip(&ple_ids).enumerate() {
+                let pos = start_pos + i;
+                let mut inputs = vec![
+                    crate::graph::Tensor::F32(emb.to_vec()),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ];
+                if let Some(p) = &self.text.ple {
+                    let (pd, nl) = (p.dim, self.text.layers_n);
+                    let mut e = vec![0.0f32; nl * pd];
+                    let id = if (id as usize) < p.embed.rows { id } else { self.text.pad_id };
+                    p.embed.get_row(id as usize, &mut e);
+                    let ident_scale = (pd as f32).sqrt();
+                    for v in &mut e {
+                        *v *= ident_scale;
+                    }
+                    inputs.push(crate::graph::Tensor::F32(e));
+                }
+                match prog_guard.run(inputs) {
+                    Ok(res) => {
+                        if i + 1 == tokens.len() {
+                            if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
+                                last_logits = v;
                             }
                         }
-                        Err(e) => {
-                            std::mem::swap(&mut prog_guard.state, &mut st.program_state);
-                            return Err(e);
-                        }
+                    }
+                    Err(e) => {
+                        std::mem::swap(&mut prog_guard.state, &mut st.program_state);
+                        return Err(e);
                     }
                 }
-                std::mem::swap(&mut prog_guard.state, &mut st.program_state);
-                st.asked = end;
-                st.done = end;
-                return Ok(last_logits);
             }
-            return Err(
-                "gpu-only: image/audio inputs need the vision/audio program; rerun with --backend cpu"
-                    .into(),
-            );
+            std::mem::swap(&mut prog_guard.state, &mut st.program_state);
+            st.asked = end;
+            st.done = end;
+            return Ok(last_logits);
         }
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
         let stop = match st.blocks.iter().find(|b| b.start < end && end < b.end) {

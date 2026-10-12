@@ -1,4 +1,4 @@
-use crate::graph::{Graph, Op, ValueId, ValueKind};
+use crate::graph::{Graph, NodeId, Op, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
 
 /// Canonicalization passes running before placement:
@@ -71,6 +71,12 @@ pub fn eliminate_dead_nodes(g: &mut Graph) {
     // Keep only live nodes
     g.nodes
         .retain(|node| node.outputs.iter().any(|out| live_values.contains(out)));
+    // Outputs record their producer's index: renumber after nodes were dropped.
+    for (i, node) in g.nodes.iter().enumerate() {
+        for &out in &node.outputs {
+            g.values[out.0 as usize].kind = ValueKind::Node(NodeId(i as u32));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,5 +108,7 @@ mod tests {
         // add2 is merged into add1, dead node is eliminated.
         // We should have only add1 and mul (2 nodes).
         assert_eq!(g.nodes.len(), 2);
+        // `mul` now sits at index 1 and its value says so (the SSA check reads this).
+        crate::graph::pattern::validate_ssa(&g).expect("producer indices follow the retained nodes");
     }
 }

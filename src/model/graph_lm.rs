@@ -944,10 +944,29 @@ impl GraphLm {
         self.build_graph_inner(n, false, weights, Some(score)).0
     }
 
+    /// Decode graph (n = 1) whose first input is `inputs_embeds [1, hidden]` instead of a token id:
+    /// the caller embeds each token (or substitutes a projected media row, as Idefics3 does).
+    pub fn to_decode_graph_embeds(&self) -> (crate::graph::Graph, crate::graph::Weights) {
+        let mut w_map = crate::graph::Weights::new();
+        let (g, _) = self.build_graph_x(1, true, true, Some(&mut w_map), None);
+        (g, w_map)
+    }
+
     fn build_graph_inner(
         &self,
         n: usize,
         cached: bool,
+        w_map: Option<&mut crate::graph::Weights>,
+        score: Option<&[f32]>,
+    ) -> (crate::graph::Graph, ()) {
+        self.build_graph_x(n, cached, false, w_map, score)
+    }
+
+    fn build_graph_x(
+        &self,
+        n: usize,
+        cached: bool,
+        embeds: bool,
         mut w_map: Option<&mut crate::graph::Weights>,
         score: Option<&[f32]>,
     ) -> (crate::graph::Graph, ()) {
@@ -1072,22 +1091,28 @@ impl GraphLm {
         };
 
         let mut g = Graph::new();
-        let ids = g.input("token_ids", vec![n], DType::U32);
-        let positions = g.input("positions", vec![n], DType::U32);
-        let table = g.weight("model.embed_tokens.weight", vec![v, h], DType::F32);
-        if let Some(map) = &mut w_map {
-            map.insert(
-                "model.embed_tokens.weight",
-                Tensor::F32(self.embedding.clone()),
+        let (mut x, positions) = if embeds {
+            let e = g.input("inputs_embeds", vec![n, h], DType::F32);
+            (e, g.input("positions", vec![n], DType::U32))
+        } else {
+            let ids = g.input("token_ids", vec![n], DType::U32);
+            let positions = g.input("positions", vec![n], DType::U32);
+            let table = g.weight("model.embed_tokens.weight", vec![v, h], DType::F32);
+            if let Some(map) = &mut w_map {
+                map.insert(
+                    "model.embed_tokens.weight",
+                    Tensor::F32(self.embedding.clone()),
+                );
+            }
+            let x = g.add(
+                "model.embed_tokens",
+                Op::Embedding,
+                &[table, ids],
+                vec![n, h],
+                DType::F32,
             );
-        }
-        let mut x = g.add(
-            "model.embed_tokens",
-            Op::Embedding,
-            &[table, ids],
-            vec![n, h],
-            DType::F32,
-        );
+            (x, positions)
+        };
         if let Some(pos) = &self.pos_embedding {
             let wpe = g.weight(
                 "model.embed_positions.weight",

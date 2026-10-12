@@ -249,20 +249,14 @@ pub enum Status {
 pub fn family_status(f: Family) -> Status {
     use Family::*;
     match f {
-        GraphLm | Gemma4 | Qwen35 | System1 | T5 | Seq2Seq | Qwen35Vision | DraftersMtp | Ninfer => {
-            Status::Gpu
-        }
-        Gemma4Media => Status::Gated(
-            "builder: vision/audio prefill bypasses the program (host Rust vision tower)",
-        ),
-        Idefics3Siglip => Status::Gated("builder: SigLIP forward is host Rust, no graph builder"),
-        ClassifierBert | ClassifierModern | ClassifierDecoder => Status::Gpu,
+        GraphLm | Gemma4 | Qwen35 | System1 | T5 | Seq2Seq | Qwen35Vision | DraftersMtp | Ninfer
+        | ClassifierBert | ClassifierModern | ClassifierDecoder | Gemma4Media | Idefics3Siglip
+        | Audio => Status::Gpu,
         DiffusionUnet => Status::Gated("builder: UNet forward is host Rust, no graph builder"),
         DiffusionDit => Status::Gated("builder: DiT forward is host Rust, no graph builder"),
         Vae => Status::Gated("builder: VAE decoders are host Rust, no graph builder"),
         VideoLtx => Status::Gated("builder: LTX forward is host Rust, no graph builder"),
         VideoModelScope => Status::Gated("builder: UNet3D forward is host Rust, no graph builder"),
-        Audio => Status::Gated("builder: conformer audio forward is host Rust; no Metal program yet"),
         DraftersBlock => Status::Gated(
             "builder: DFlash/DFlash2/DSpark block drafters are host Rust (per-layer KV projection of tapped target states, grouped dynamic conv, Markov rescoring) and need arbitrary-layer taps; the Metal target program taps only the final-normed output",
         ),
@@ -443,18 +437,23 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::L2Normalize, F32),
         ]),
         Family::Gemma4Media => ops.extend([
-            (conv2d(), F32),
-            (Op::Transpose { perm: vec![1, 0] }, F32),
+            // The vision tower (checkpoint matrices stay bf16), then the soft tokens scattered over
+            // the prompt rows; the text decoder is the `Gemma4` family's.
+            (Op::Linear, BF16),
+            (Op::Linear, F32),
+            (unary(UnaryKind::Clamp(-1.0, 1.0)), F32),
+            (rms(), F32),
+            (Op::Slice { axis: -1, start: 0, end: 1 }, F32),
+            (rope(RopeVariant::HalfSplit), F32),
+            (Op::Concat { axis: -1 }, F32),
             (reshape(), F32),
-            (ln(), F32),
-            (Op::Gelu { tanh: true }, F32),
-            (
-                Op::MatMul {
-                    transpose_a: false,
-                    transpose_b: true,
-                },
-                F32,
-            ),
+            (Op::Transpose { perm: vec![1, 0] }, F32),
+            (attn(), F32),
+            (Op::GeGlu, F32),
+            (Op::Add, F32),
+            (Op::AvgPool2d { kernel: [3, 3], stride: [3, 3] }, F32),
+            (unary(UnaryKind::Scale(2.0)), F32),
+            (Op::Scatter { axis: 0 }, F32),
         ]),
         // The tower: patch-embed Linear, position-embedding gather/blend, 2D rotary as a
         // non-interleaved MRope, bidirectional attention, LayerNorm, merger Reshape.
@@ -547,12 +546,22 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Add, F32),
         ]),
         Family::Idefics3Siglip => ops.extend([
+            // SigLIP tower + pixel-shuffle connector, the embeds-input Llama decoder, and the
+            // `<image>` row scatter.
             (conv2d(), F32),
-            (Op::Transpose { perm: vec![1, 0] }, F32),
-            (Op::Scatter { axis: 0 }, F32),
+            (reshape(), F32),
+            (Op::Transpose { perm: vec![0, 2, 1, 3, 4] }, F32),
+            (Op::Add, F32),
             (ln(), F32),
+            (attn(), F32),
             (Op::Gelu { tanh: true }, F32),
             (Op::Linear, F32),
+            (rms(), F32),
+            (slice(), F32),
+            (rope_hs(), F32),
+            (cached_attn(), F32),
+            (Op::SwiGlu, F32),
+            (Op::Scatter { axis: 0 }, F32),
         ]),
         // BERT/RoBERTa/DistilBERT/GGUF/SetFit on the System 1 encoder graph + the pooled head
         // (pooler tanh/relu, softmax or sigmoid scores, SetFit mean/max pooling, L2 normalise and the
@@ -705,20 +714,52 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             ),
         ]),
         Family::Audio => ops.extend([
+            // Spectrogram front end (DFT/mel Linears, magnitude), subsampling convs, conformer
+            // (local relative-position attention as MatMul + Gather + SoftCap + Softmax, depthwise
+            // causal conv, GLU) and the output projections.
+            (Op::Linear, F32),
+            (Op::Linear, BF16),
+            (Op::Slice { axis: -1, start: 0, end: 1 }, F32),
+            (Op::Mul, F32),
+            (Op::Add, F32),
+            (unary(UnaryKind::Sqrt), F32),
+            (conv2d(), F32),
             (
                 Op::Conv1d {
                     stride: 1,
-                    padding: [1, 1],
+                    padding: [4, 0],
                     dilation: 1,
-                    groups: 1,
+                    groups: 16,
                 },
                 F32,
             ),
             (ln(), F32),
-            (Op::Silu, F32),
-            (Op::Linear, F32),
-            (attn(), F32),
-            (Op::Mul, F32),
+            (rms(), F32),
+            (unary(UnaryKind::Relu), F32),
+            (unary(UnaryKind::Silu), F32),
+            (unary(UnaryKind::Sigmoid), F32),
+            (unary(UnaryKind::Scale(0.5)), F32),
+            (unary(UnaryKind::SoftCap(50.0)), F32),
+            (unary(UnaryKind::Clamp(-1.0, 1.0)), F32),
+            (reshape(), F32),
+            (Op::Transpose { perm: vec![1, 0, 2] }, F32),
+            (
+                Op::MatMul {
+                    transpose_a: false,
+                    transpose_b: true,
+                },
+                F32,
+            ),
+            (
+                Op::MatMul {
+                    transpose_a: false,
+                    transpose_b: false,
+                },
+                F32,
+            ),
+            (Op::Gather { axis: 0 }, F32),
+            (Op::Softmax { axis: -1 }, F32),
+            (Op::Scatter { axis: 0 }, F32),
         ]),
     }
     ops
