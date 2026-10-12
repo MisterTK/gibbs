@@ -20,16 +20,6 @@ pub struct GgufWeightReader {
     version: u32,
 }
 
-/// Internal tensor information for GGUF format.
-#[derive(Debug, Clone)]
-struct GgufTensorInfo {
-    #[allow(dead_code)]
-    name: String,
-    shape: Vec<usize>,
-    raw_type: u32,
-    byte_offset: usize,
-}
-
 impl GgufWeightReader {
     /// Create a new GGUF reader from raw bytes.
     pub fn new(data: Vec<u8>) -> Result<Self, String> {
@@ -39,22 +29,13 @@ impl GgufWeightReader {
         if &data[0..4] != b"GGUF" {
             return Err("Invalid GGUF magic bytes".into());
         }
-
-        let mut offset = 4;
-        let version = read_u32_le(&data, &mut offset)?;
-        if version != 1 && version != 2 && version != 3 {
-            return Err(format!("Unsupported GGUF version: {}", version));
-        }
-
-        let mut reader = GgufWeightReader {
+        let h = parse_gguf_header(&data).map_err(|e| e.to_string())?;
+        Ok(GgufWeightReader {
             data,
-            metadata: HashMap::new(),
-            tensors: HashMap::new(),
-            version,
-        };
-
-        reader.parse_header_internal()?;
-        Ok(reader)
+            metadata: h.metadata,
+            tensors: h.tensors.into_iter().map(|t| (t.name.clone(), t)).collect(),
+            version: h.version,
+        })
     }
 
     /// Reads the GGUF at `path`, or the whole split set it belongs to (`<stem>-00001-of-00003.gguf`):
@@ -90,186 +71,6 @@ impl GgufWeightReader {
     /// The file bytes (a split set's shards back to back) the tensor offsets index.
     pub fn bytes(&self) -> &[u8] {
         &self.data
-    }
-
-    /// Internal header parsing.
-    fn parse_header_internal(&mut self) -> Result<(), String> {
-        let mut offset = 4;
-        let version = read_u32_le(&self.data, &mut offset)?;
-
-        let (tensor_count, kv_count) = if version == 1 {
-            let tc = read_u32_le(&self.data, &mut offset)? as usize;
-            let kc = read_u32_le(&self.data, &mut offset)? as u64;
-            (tc, kc)
-        } else {
-            let tc = read_u64_le(&self.data, &mut offset)? as usize;
-            let kc = read_u64_le(&self.data, &mut offset)?;
-            (tc, kc)
-        };
-
-        // Parse KV metadata
-        for _ in 0..kv_count {
-            if offset >= self.data.len() {
-                break;
-            }
-            let key = match read_gguf_string_v(&self.data, &mut offset, version) {
-                Ok(k) => k,
-                Err(_) => break,
-            };
-            let val_type = match read_u32_le(&self.data, &mut offset) {
-                Ok(vt) => vt,
-                Err(_) => break,
-            };
-
-            match val_type {
-                0 | 1 | 7 => {
-                    if offset < self.data.len() {
-                        self.metadata.insert(key, format!("{}", self.data[offset]));
-                        offset += 1;
-                    }
-                }
-                2 | 3 => {
-                    if let Ok(v) = read_u16_le(&self.data, &mut offset) {
-                        self.metadata.insert(key, format!("{}", v));
-                    }
-                }
-                4 | 5 => {
-                    if let Ok(v) = read_u32_le(&self.data, &mut offset) {
-                        self.metadata.insert(key, format!("{}", v));
-                    }
-                }
-                6 => {
-                    if let Ok(v) = read_f32_le(&self.data, &mut offset) {
-                        self.metadata.insert(key, format!("{}", v));
-                    }
-                }
-                10 | 11 => {
-                    if let Ok(v) = read_u64_le(&self.data, &mut offset) {
-                        self.metadata.insert(key, format!("{}", v));
-                    }
-                }
-                12 => {
-                    offset += 8;
-                }
-                8 => {
-                    if let Ok(s) = read_gguf_string_v(&self.data, &mut offset, version) {
-                        self.metadata.insert(key, s);
-                    }
-                }
-                9 => {
-                    let elem_type = match read_u32_le(&self.data, &mut offset) {
-                        Ok(t) => t,
-                        Err(_) => break,
-                    };
-                    let elem_count = if version == 1 {
-                        match read_u32_le(&self.data, &mut offset) {
-                            Ok(c) => c as usize,
-                            Err(_) => break,
-                        }
-                    } else {
-                        match read_u64_le(&self.data, &mut offset) {
-                            Ok(c) => c as usize,
-                            Err(_) => break,
-                        }
-                    };
-                    // Skip array payload
-                    match elem_type {
-                        0 | 1 | 7 => offset += elem_count,
-                        2 | 3 => offset += elem_count * 2,
-                        4 | 5 | 6 => offset += elem_count * 4,
-                        10 | 11 | 12 => offset += elem_count * 8,
-                        8 => {
-                            for _ in 0..elem_count {
-                                if offset >= self.data.len() {
-                                    break;
-                                }
-                                let _ = read_gguf_string_v(&self.data, &mut offset, version);
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        // Parse tensor info blocks
-        for _ in 0..tensor_count {
-            if offset >= self.data.len() {
-                break;
-            }
-            let name = match read_gguf_string_v(&self.data, &mut offset, version) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            let n_dims = match read_u32_le(&self.data, &mut offset) {
-                Ok(d) => d as usize,
-                Err(_) => break,
-            };
-            let mut shape = Vec::with_capacity(n_dims);
-            let mut err = false;
-            for _ in 0..n_dims {
-                let dim_res = if version == 1 {
-                    read_u32_le(&self.data, &mut offset).map(|d| d as usize)
-                } else {
-                    read_u64_le(&self.data, &mut offset).map(|d| d as usize)
-                };
-                match dim_res {
-                    Ok(dim) => shape.push(dim),
-                    Err(_) => {
-                        err = true;
-                        break;
-                    }
-                }
-            }
-            if err {
-                break;
-            }
-            let raw_type = match read_u32_le(&self.data, &mut offset) {
-                Ok(t) => t,
-                Err(_) => break,
-            };
-            let t_offset = if version == 1 {
-                match read_u32_le(&self.data, &mut offset) {
-                    Ok(o) => o as usize,
-                    Err(_) => break,
-                }
-            } else {
-                match read_u64_le(&self.data, &mut offset) {
-                    Ok(o) => o as usize,
-                    Err(_) => break,
-                }
-            };
-
-            self.tensors.insert(
-                name.clone(),
-                GgufTensorInfo {
-                    name,
-                    shape,
-                    raw_type,
-                    byte_offset: t_offset,
-                },
-            );
-        }
-
-        // Compute data start with alignment
-        let alignment = self
-            .metadata
-            .get("general.alignment")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(32);
-        let data_start = if alignment > 0 {
-            (offset + alignment - 1) / alignment * alignment
-        } else {
-            offset
-        };
-
-        // Adjust tensor offsets to absolute positions
-        for tensor in self.tensors.values_mut() {
-            tensor.byte_offset = data_start.saturating_add(tensor.byte_offset);
-        }
-
-        Ok(())
     }
 
     /// Retrieve shape for a specific tensor.
@@ -516,82 +317,188 @@ pub fn open(path: &Path) -> Result<(ModelManifest, GgufData), String> {
 }
 
 // ============================================================================
-// GGUF PARSING UTILITIES (copied from crate::model)
+// HEADER PARSING (shared by the file reader and the remote range-request path)
 // ============================================================================
 
-#[inline]
-fn read_u16_le(data: &[u8], offset: &mut usize) -> Result<u16, String> {
-    if *offset + 2 > data.len() {
-        return Err("read_u16_le out of bounds".into());
-    }
-    let bytes = [data[*offset], data[*offset + 1]];
-    *offset += 2;
-    Ok(u16::from_le_bytes(bytes))
+/// One tensor-info entry; `byte_offset` is absolute within the file once the header is parsed.
+#[derive(Debug, Clone)]
+pub struct GgufTensorInfo {
+    pub name: String,
+    /// GGML order: fastest-varying dimension first.
+    pub shape: Vec<usize>,
+    pub raw_type: u32,
+    pub byte_offset: usize,
 }
 
-#[inline]
-fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, String> {
-    if *offset + 4 > data.len() {
-        return Err("read_u32_le out of bounds".into());
-    }
-    let bytes = [
-        data[*offset],
-        data[*offset + 1],
-        data[*offset + 2],
-        data[*offset + 3],
-    ];
-    *offset += 4;
-    Ok(u32::from_le_bytes(bytes))
+/// The KV scalars/strings and tensor infos at the start of a GGUF file (array payloads are skipped).
+#[derive(Debug, Clone)]
+pub struct GgufHeader {
+    pub version: u32,
+    pub metadata: HashMap<String, String>,
+    pub tensors: Vec<GgufTensorInfo>,
+    /// First tensor-data byte: the header end rounded up to `general.alignment`.
+    pub data_start: usize,
 }
 
-#[inline]
-fn read_f32_le(data: &[u8], offset: &mut usize) -> Result<f32, String> {
-    if *offset + 4 > data.len() {
-        return Err("read_f32_le out of bounds".into());
-    }
-    let bytes = [
-        data[*offset],
-        data[*offset + 1],
-        data[*offset + 2],
-        data[*offset + 3],
-    ];
-    *offset += 4;
-    Ok(f32::from_le_bytes(bytes))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderError {
+    /// The buffer ends inside the header; the header is at least this many bytes long.
+    NeedMore(usize),
+    Invalid(String),
 }
 
-#[inline]
-fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, String> {
-    if *offset + 8 > data.len() {
-        return Err("read_u64_le out of bounds".into());
+impl std::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NeedMore(n) => write!(f, "GGUF header needs at least {n} bytes"),
+            Self::Invalid(e) => f.write_str(e),
+        }
     }
-    let bytes = [
-        data[*offset],
-        data[*offset + 1],
-        data[*offset + 2],
-        data[*offset + 3],
-        data[*offset + 4],
-        data[*offset + 5],
-        data[*offset + 6],
-        data[*offset + 7],
-    ];
-    *offset += 8;
-    Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_gguf_string_v(data: &[u8], offset: &mut usize, version: u32) -> Result<String, String> {
-    let len = if version == 1 {
-        read_u32_le(data, offset)? as usize
-    } else {
-        read_u64_le(data, offset)? as usize
-    };
+struct Cur<'a> {
+    d: &'a [u8],
+    o: usize,
+}
 
-    if *offset + len > data.len() {
-        return Err("GGUF string out of bounds".into());
+impl<'a> Cur<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], HeaderError> {
+        let end = self
+            .o
+            .checked_add(n)
+            .ok_or_else(|| HeaderError::Invalid("GGUF length overflows".into()))?;
+        let s = self.d.get(self.o..end).ok_or(HeaderError::NeedMore(end))?;
+        self.o = end;
+        Ok(s)
     }
+    fn u16(&mut self) -> Result<u16, HeaderError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, HeaderError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, HeaderError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    /// A count, length or offset: u32 in GGUF v1, u64 after.
+    fn word(&mut self, version: u32) -> Result<usize, HeaderError> {
+        let v = if version == 1 {
+            u64::from(self.u32()?)
+        } else {
+            self.u64()?
+        };
+        usize::try_from(v).map_err(|_| HeaderError::Invalid("GGUF count overflows".into()))
+    }
+    fn string(&mut self, version: u32) -> Result<String, HeaderError> {
+        let n = self.word(version)?;
+        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+    }
+}
 
-    let s = String::from_utf8_lossy(&data[*offset..*offset + len]).to_string();
-    *offset += len;
-    Ok(s)
+/// Parses the header at the start of `bytes` (a prefix of the file is enough). `NeedMore(n)` says
+/// the header is at least `n` bytes long, so the caller can fetch more and retry.
+pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufHeader, HeaderError> {
+    let mut c = Cur { d: bytes, o: 0 };
+    if c.take(4)? != b"GGUF" {
+        return Err(HeaderError::Invalid("Invalid GGUF magic bytes".into()));
+    }
+    let version = c.u32()?;
+    if !(1..=3).contains(&version) {
+        return Err(HeaderError::Invalid(format!(
+            "Unsupported GGUF version: {version}"
+        )));
+    }
+    let (tensor_count, kv_count) = (c.word(version)?, c.word(version)?);
+    let mut metadata = HashMap::new();
+    for _ in 0..kv_count {
+        let key = c.string(version)?;
+        let ty = c.u32()?;
+        match ty {
+            0 | 1 | 7 => {
+                metadata.insert(key, c.take(1)?[0].to_string());
+            }
+            2 | 3 => {
+                metadata.insert(key, c.u16()?.to_string());
+            }
+            4 | 5 => {
+                metadata.insert(key, c.u32()?.to_string());
+            }
+            6 => {
+                metadata.insert(key, f32::from_bits(c.u32()?).to_string());
+            }
+            10 | 11 => {
+                metadata.insert(key, c.u64()?.to_string());
+            }
+            12 => {
+                c.take(8)?;
+            }
+            8 => {
+                metadata.insert(key, c.string(version)?);
+            }
+            9 => {
+                let elem = c.u32()?;
+                let n = c.word(version)?;
+                let width = match elem {
+                    0 | 1 | 7 => 1,
+                    2 | 3 => 2,
+                    4..=6 => 4,
+                    10..=12 => 8,
+                    8 => {
+                        for _ in 0..n {
+                            c.string(version)?;
+                        }
+                        continue;
+                    }
+                    t => {
+                        return Err(HeaderError::Invalid(format!(
+                            "GGUF array of type {t} in '{key}'"
+                        )))
+                    }
+                };
+                c.take(
+                    n.checked_mul(width)
+                        .ok_or_else(|| HeaderError::Invalid("GGUF array overflows".into()))?,
+                )?;
+            }
+            t => {
+                return Err(HeaderError::Invalid(format!(
+                    "GGUF value type {t} in '{key}'"
+                )))
+            }
+        }
+    }
+    let mut tensors = Vec::new();
+    for _ in 0..tensor_count {
+        let name = c.string(version)?;
+        let n_dims = c.u32()? as usize;
+        let mut shape = Vec::new();
+        for _ in 0..n_dims {
+            shape.push(c.word(version)?);
+        }
+        let raw_type = c.u32()?;
+        let byte_offset = c.word(version)?;
+        tensors.push(GgufTensorInfo {
+            name,
+            shape,
+            raw_type,
+            byte_offset,
+        });
+    }
+    let alignment = metadata
+        .get("general.alignment")
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&a| a > 0)
+        .unwrap_or(32);
+    let data_start = c.o.div_ceil(alignment) * alignment;
+    for t in &mut tensors {
+        t.byte_offset = data_start.saturating_add(t.byte_offset);
+    }
+    Ok(GgufHeader {
+        version,
+        metadata,
+        tensors,
+        data_start,
+    })
 }
 
 /// A GGUF v3 file of F32 tensors (`name`, GGML dims fastest first, values) with the given KVs
@@ -979,16 +886,37 @@ mod tests {
     fn assert_decodes(ty: u32, ne: &[u64], raw: &[u8], want: &[f32]) {
         let b = typed_gguf(ty, ne, raw);
         let loader = crate::model::UniversalModelLoader::from_bytes(&b).unwrap();
-        assert_eq!(loader.manifest.extract_tensor_f32(&b, "t").unwrap(), want, "type {ty}");
-        assert_eq!(GgufWeightReader::new(b.clone()).unwrap().load_tensor("t").unwrap(), want);
-        let q = loader.manifest.extract_tensor_as_quantized(&b, "t", QuantFormat::FP32).unwrap();
-        assert!(!matches!(q, crate::model::layers::QuantizedWeight::ZeroCopySlice { .. }), "type {ty}");
+        assert_eq!(
+            loader.manifest.extract_tensor_f32(&b, "t").unwrap(),
+            want,
+            "type {ty}"
+        );
+        assert_eq!(
+            GgufWeightReader::new(b.clone())
+                .unwrap()
+                .load_tensor("t")
+                .unwrap(),
+            want
+        );
+        let q = loader
+            .manifest
+            .extract_tensor_as_quantized(&b, "t", QuantFormat::FP32)
+            .unwrap();
+        assert!(
+            !matches!(
+                q,
+                crate::model::layers::QuantizedWeight::ZeroCopySlice { .. }
+            ),
+            "type {ty}"
+        );
     }
 
     #[test]
     fn gguf_integer_types_decode_to_f32() {
         let le = |v: &[i64], n: usize| -> Vec<u8> {
-            v.iter().flat_map(|x| x.to_le_bytes()[..n].to_vec()).collect()
+            v.iter()
+                .flat_map(|x| x.to_le_bytes()[..n].to_vec())
+                .collect()
         };
         let i8s = [-128i64, -1, 0, 127];
         assert_decodes(24, &[4], &le(&i8s, 1), &i8s.map(|x| x as f32));
@@ -1012,7 +940,9 @@ mod tests {
         for _ in 0..4 {
             blk.extend((0..8u8).map(|j| j | ((15 - j) << 4)));
         }
-        let fp4 = [0., 1., 2., 3., 4., 6., 8., 12., 0., -1., -2., -3., -4., -6., -8., -12.];
+        let fp4 = [
+            0., 1., 2., 3., 4., 6., 8., 12., 0., -1., -2., -3., -4., -6., -8., -12.,
+        ];
         let mut want = Vec::new();
         for d in [0.5f32, 2f32.powi(-10), 0.0, 224.0] {
             want.extend((0..8).map(|j| fp4[j] * d));
@@ -1020,6 +950,58 @@ mod tests {
         }
         assert_eq!(deq(QuantFormat::GGUF_NVFP4, &blk), want);
         // Two blocks (one row of 128) through the container path.
-        assert_decodes(40, &[128], &[blk.clone(), blk].concat(), &[want.clone(), want].concat());
+        assert_decodes(
+            40,
+            &[128],
+            &[blk.clone(), blk].concat(),
+            &[want.clone(), want].concat(),
+        );
+    }
+
+    #[test]
+    fn header_prefix_asks_for_more_until_complete() {
+        let s = |v: &str| {
+            let mut b = (v.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(v.as_bytes());
+            b
+        };
+        let mut arr = 8u32.to_le_bytes().to_vec();
+        arr.extend_from_slice(&2u64.to_le_bytes());
+        arr.extend(s("ab"));
+        arr.extend(s("cde"));
+        let file = test_gguf_file(
+            &[
+                ("general.architecture", 8, s("llama")),
+                ("tokenizer.ggml.tokens", 9, arr),
+            ],
+            &[("w", &[4, 2], &[0.0; 8])],
+        );
+        let full = parse_gguf_header(&file).unwrap();
+        assert_eq!(full.metadata["general.architecture"], "llama");
+        assert_eq!(
+            (full.tensors[0].shape.clone(), full.tensors[0].byte_offset),
+            (vec![4, 2], full.data_start)
+        );
+        let mut complete = false;
+        for cut in 0..full.data_start {
+            match parse_gguf_header(&file[..cut]) {
+                Err(HeaderError::NeedMore(n)) => {
+                    assert!(
+                        !complete && n > cut && n <= full.data_start,
+                        "cut {cut}: needs {n}"
+                    );
+                }
+                Ok(h) => {
+                    complete = true;
+                    assert_eq!(h.tensors.len(), 1);
+                }
+                Err(e) => panic!("cut {cut}: {e}"),
+            }
+        }
+        assert!(complete, "the header ends before its alignment padding");
+        assert!(matches!(
+            parse_gguf_header(b"GGUX\0\0\0\0"),
+            Err(HeaderError::Invalid(_))
+        ));
     }
 }
