@@ -22,6 +22,9 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::RmsNorm { .. }
         | Op::LayerNorm { .. }
         | Op::SwiGlu
+        | Op::GroupNorm { .. }
+        | Op::InstanceNorm { .. }
+        | Op::Reduce { .. }
         | Op::GeGlu
         | Op::Unary { .. }
         | Op::Binary { .. }
@@ -403,7 +406,14 @@ pub fn run(
             }
             Op::RmsNorm { eps } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
-                let g = operand(&bound, &slots, ins, name, 1)?;
+                // Without gamma the unit weight spans the last dim.
+                let ones;
+                let g = if ins.len() > 1 {
+                    operand(&bound, &slots, ins, name, 1)?
+                } else {
+                    ones = vec![1.0f32; last_dim(0)];
+                    &ones[..]
+                };
                 let d = g.len();
                 if d == 0 || x.len() % d != 0 {
                     return Err(format!("node '{name}': RmsNorm shapes mismatch"));
@@ -576,7 +586,40 @@ pub fn run(
                 }
                 out
             }
-            Op::Softmax { axis: _ } | Op::TopKSoftmax { axis: _, .. } => {
+            Op::Softmax { axis } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                let shape = &graph.value(ins[0]).shape;
+                let shape = if shape.is_empty() { vec![x.len()] } else { shape.clone() };
+                let ax = if *axis < 0 { *axis + shape.len() as isize } else { *axis };
+                if ax < 0 || ax >= shape.len() as isize {
+                    return Err(format!("node '{name}': bad Softmax axis {axis}"));
+                }
+                let ax = ax as usize;
+                let (outer, n, inner) = (
+                    shape[..ax].iter().product::<usize>(),
+                    shape[ax],
+                    shape[ax + 1..].iter().product::<usize>(),
+                );
+                let mut out = vec![0.0f32; x.len()];
+                for o in 0..outer {
+                    for i in 0..inner {
+                        let at = |k: usize| (o * n + k) * inner + i;
+                        let max_val = (0..n).map(|k| x[at(k)]).fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum_e = 0.0f32;
+                        for k in 0..n {
+                            let e = (x[at(k)] - max_val).exp();
+                            out[at(k)] = e;
+                            sum_e += e;
+                        }
+                        let inv = 1.0 / sum_e.max(1e-12);
+                        for k in 0..n {
+                            out[at(k)] *= inv;
+                        }
+                    }
+                }
+                out
+            }
+            Op::TopKSoftmax { axis: _, .. } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
                 let x_shape = &graph.value(ins[0]).shape;
                 let cols = x_shape.last().copied().unwrap_or(x.len()).max(1);
@@ -1343,16 +1386,20 @@ pub fn run(
                 ([1, 1, *stride], [0, 0, p[0]], [0, 0, p[1]], [1, 1, *dilation], *groups),
             )?,
             Op::LayerNorm { eps } => {
-                if ins.len() < 3 {
-                    return Err(format!(
-                        "node '{name}': LayerNorm without beta is not implemented"
-                    ));
+                if ins.len() < 2 {
+                    return Err(format!("node '{name}': LayerNorm needs x and gamma"));
                 }
-                let (x, g, b) = (
+                let (x, g) = (
                     operand(&bound, &slots, ins, name, 0)?,
                     operand(&bound, &slots, ins, name, 1)?,
-                    operand(&bound, &slots, ins, name, 2)?,
                 );
+                let zeros;
+                let b = if ins.len() > 2 {
+                    operand(&bound, &slots, ins, name, 2)?
+                } else {
+                    zeros = vec![0.0f32; g.len()];
+                    &zeros[..]
+                };
                 let d = g.len();
                 if d == 0 || b.len() != d || x.len() % d != 0 {
                     return Err(format!(
@@ -1363,6 +1410,88 @@ pub fn run(
                     ));
                 }
                 nn::layer_norm(x, x.len() / d, d, g, b, *eps)
+            }
+            Op::GroupNorm { .. } | Op::InstanceNorm { .. } => {
+                let (x, g, b) = (
+                    operand(&bound, &slots, ins, name, 0)?,
+                    operand(&bound, &slots, ins, name, 1)?,
+                    operand(&bound, &slots, ins, name, 2)?,
+                );
+                let c = g.len();
+                let (groups, eps) = match node.op {
+                    Op::GroupNorm { groups, eps } => (groups, eps),
+                    Op::InstanceNorm { eps } => (c, eps),
+                    _ => unreachable!(),
+                };
+                if c == 0 || b.len() != c || groups == 0 || c % groups != 0 {
+                    return Err(format!(
+                        "node '{name}': gamma/beta lengths {c}/{} do not fit {groups} groups",
+                        b.len()
+                    ));
+                }
+                let (n, hw) = channel_layout(&graph.value(ins[0]).shape, c)
+                    .map_err(|e| format!("node '{name}': {e}"))?;
+                if x.len() != n * c * hw {
+                    return Err(format!("node '{name}': x length {} is not {n}*{c}*{hw}", x.len()));
+                }
+                let mut out = x.to_vec();
+                for sample in out.chunks_mut(c * hw) {
+                    nn::group_norm(sample, c, hw, groups, eps, g, b);
+                }
+                out
+            }
+            Op::Reduce { kind, axes, .. } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                let shape = &graph.value(ins[0]).shape;
+                let rank = shape.len();
+                let mut red = vec![false; rank];
+                if axes.is_empty() {
+                    return Err(format!("node '{name}': Reduce with no axes is ambiguous"));
+                }
+                for &a in axes {
+                    let ax = if a < 0 { a + rank as isize } else { a };
+                    if ax < 0 || ax >= rank as isize || red[ax as usize] {
+                        return Err(format!("node '{name}': bad Reduce axis {a} for rank {rank}"));
+                    }
+                    red[ax as usize] = true;
+                }
+                // Row-major strides over the kept dims only.
+                let mut ostride = vec![0usize; rank];
+                let mut n_out = 1usize;
+                for i in (0..rank).rev() {
+                    if !red[i] {
+                        ostride[i] = n_out;
+                        n_out *= shape[i];
+                    }
+                }
+                let rcount = (x.len() / n_out.max(1)) as f64;
+                let init = match kind {
+                    super::ReduceKind::Max => f64::NEG_INFINITY,
+                    super::ReduceKind::Min => f64::INFINITY,
+                    _ => 0.0,
+                };
+                let mut acc = vec![init; n_out];
+                let mut coord = vec![0usize; rank];
+                for &v in x {
+                    let o: usize = coord.iter().zip(&ostride).map(|(c, s)| c * s).sum();
+                    let v = v as f64;
+                    acc[o] = match kind {
+                        super::ReduceKind::Max => acc[o].max(v),
+                        super::ReduceKind::Min => acc[o].min(v),
+                        _ => acc[o] + v,
+                    };
+                    for i in (0..rank).rev() {
+                        coord[i] += 1;
+                        if coord[i] < shape[i] {
+                            break;
+                        }
+                        coord[i] = 0;
+                    }
+                }
+                let mean = matches!(kind, super::ReduceKind::Mean);
+                acc.into_iter()
+                    .map(|a| (if mean { a / rcount } else { a }) as f32)
+                    .collect()
             }
             Op::Attention {
                 heads,
@@ -1531,6 +1660,23 @@ fn slot<'a>(
     bound[id]
         .or(slots[id].as_ref())
         .ok_or_else(|| format!("node '{name}': operand {k} has no value"))
+}
+
+/// `(batch, hw)` of a channel-first tensor with `c` channels. A single axis of size `c` (0 or 1)
+/// is the channel axis; when both are `c`, rank 2 is `[C, HW]` (axis 0) and rank >= 3 is
+/// `[N, C, ...]` (axis 1). `batch` is the product of the axes before the channel axis.
+/// Shared with the Metal lowering.
+// ponytail: an unbatched `[C, C, w]` tensor reads as batched `[N=C, C, w]`; add a batch attribute if that matters.
+pub(crate) fn channel_layout(shape: &[usize], c: usize) -> Result<(usize, usize), String> {
+    let at0 = shape.first() == Some(&c);
+    let at1 = shape.get(1) == Some(&c);
+    let ax = match (at0, at1) {
+        (true, true) if shape.len() >= 3 => 1,
+        (true, _) => 0,
+        (false, true) => 1,
+        _ => return Err(format!("shape {shape:?} has no channel axis of size {c} at axis 0 or 1")),
+    };
+    Ok((shape[..ax].iter().product(), shape[ax + 1..].iter().product()))
 }
 
 fn operand<'a>(
