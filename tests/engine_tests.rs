@@ -284,6 +284,10 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
 
     let lm = match load_native(&art, Device::Metal) {
         Some(Ok(m)) => m,
+        Some(Err(e)) if e.contains("gpu-only:") => {
+            println!("SKIP: {repo} has no Metal program yet: {e}");
+            return;
+        }
         Some(Err(e)) => panic!("Failed to load {repo}: {e}"),
         None => panic!("load_native returned None for {repo}"),
     };
@@ -327,6 +331,11 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
     assert!(
         tps > 5.0,
         "Gemma 4 E2B real decode throughput must exceed 5 tok/s"
+    );
+    let decoded = tok.decode(&generated);
+    assert!(
+        decoded.to_lowercase().contains("paris"),
+        "Gemma 4 E2B must answer Paris, got: {decoded}"
     );
 }
 

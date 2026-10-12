@@ -432,6 +432,10 @@ pub(crate) fn compile_gemma4_program(
     if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
         return Ok(None);
     }
+    crate::graph::avenues::family_gate(
+        crate::graph::avenues::Family::Gemma4,
+        crate::graph::avenues::resolved_backend(mode),
+    )?;
     let (graph, weights) = text.to_decode_graph().map_err(|e| format!("Gemma 4: {e}"))?;
     crate::graph::program::GraphProgram::compile(graph, weights, mode)
         .map(|prog| Some(Arc::new(parking_lot::Mutex::new(prog))))
