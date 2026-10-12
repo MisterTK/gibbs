@@ -49,6 +49,11 @@ impl<'a> Tensors<'a> {
     }
 
     pub fn safetensors(r: &'a SafetensorsWeightReader) -> Result<Self, String> {
+        Self::from_reader(r)
+    }
+
+    /// Any reader whose `list_tensors` reports PyTorch-order shapes and dtypes.
+    pub fn from_reader(r: &'a dyn WeightReader) -> Result<Self, String> {
         let (mut shapes, mut dtypes) = (HashMap::new(), HashMap::new());
         for m in r.list_tensors()? {
             dtypes.insert(m.name.clone(), m.dtype);
