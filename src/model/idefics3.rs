@@ -3,8 +3,13 @@
 //! Images are resized and split like transformers' `Idefics3ImageProcessor` (longest edge to
 //! `size`, then `max_image_size` tiles plus a global view) and each `<image>` placeholder expands
 //! like `Idefics3Processor` (`<fake_token_around_image>`, `<row_i_col_j>`, `<global-img>`,
-//! `image_seq_len` `<image>` tokens per tile). CPU only.
+//! `image_seq_len` `<image>` tokens per tile). On Metal the tower + connector is one graph program
+//! per tile and the text model a decode program fed `inputs_embeds` (the `<image>` rows scattered
+//! over the token embeddings by a GPU `Scatter`); `--backend cpu` runs the host forward.
 
+use crate::graph::program::GraphProgram;
+use crate::graph::{DType, Tensor};
+use crate::model::vision_graph::{compile, is_gpu, scatter_rows, Gb};
 use crate::hardware::QuantMode;
 use crate::model::graph_lm::{GraphLm, GraphLmConfig, LayerKVCache};
 use crate::model::hf_loader::{load_json_tokenizer, HfConfigJson};
@@ -200,11 +205,7 @@ pub fn placeholder(rows: usize, cols: usize, image_seq_len: usize) -> String {
 }
 
 pub struct Idefics3 {
-    vision: SiglipVision,
-    /// Connector projection `[text_hidden, vision_hidden * scale²]`, no bias.
-    proj: Vec<f32>,
-    scale: usize,
-    text: GraphLm,
+    engine: Engine,
     tokenizer: Tokenizer,
     image_token: u32,
     image_seq_len: usize,
@@ -212,20 +213,187 @@ pub struct Idefics3 {
     context_len: usize,
 }
 
+/// SigLIP + connector + Llama text, on the CPU (`--backend cpu`) or as two GPU programs.
+struct Engine {
+    cfg: GraphLmConfig,
+    image_size: usize,
+    image_token: u32,
+    kind: Kind,
+}
+
+enum Kind {
+    Cpu {
+        vision: SiglipVision,
+        /// Connector projection `[text_hidden, vision_hidden * scale²]`, no bias.
+        proj: Vec<f32>,
+        scale: usize,
+        text: GraphLm,
+    },
+    Gpu {
+        mode: crate::hardware::PlacementMode,
+        /// `pixels [3, S, S]` → connector rows `[image_seq_len, text_hidden]`.
+        vision: parking_lot::Mutex<GraphProgram>,
+        /// `inputs_embeds [1, hidden]` + position → logits; KV cache in the sequence's state.
+        text: parking_lot::Mutex<GraphProgram>,
+        /// Token embedding table (host row lookup, like every decode loop's token feed).
+        embedding: Vec<f32>,
+    },
+}
+
 /// One sequence: its KV cache and the projected image rows, one per `<image>` position.
 struct Seq {
+    /// CPU KV cache (empty on the GPU).
     kv: Vec<LayerKVCache>,
+    /// The text program's KV state (GPU).
+    state: crate::graph::StateStore,
     /// Ascending prompt positions of the `<image>` tokens; row `i` of `rows` belongs to the `i`th.
     image_pos: Vec<usize>,
     rows: Vec<f32>,
 }
 
+impl Engine {
+    fn new(
+        vision: SiglipVision,
+        proj: Vec<f32>,
+        scale: usize,
+        text: GraphLm,
+        image_token: u32,
+        mode: crate::hardware::PlacementMode,
+    ) -> Result<Self, String> {
+        let (cfg, image_size) = (text.config.clone(), vision.image_size);
+        if !is_gpu(mode) {
+            let kind = Kind::Cpu { vision, proj, scale, text };
+            return Ok(Self { cfg, image_size, image_token, kind });
+        }
+        let (d, g, th) = (vision.hidden, vision.image_size / vision.patch, cfg.hidden_dim);
+        let mut b = Gb::new();
+        let px = b.input("pixels", vec![3, image_size, image_size], DType::F32);
+        let feats = vision.add_to_graph(&mut b, px);
+        // Pixel shuffle: [g·g, d] → (block row, block col, in-block row, in-block col, d) rows.
+        let s = scale;
+        let x = b.reshape("connector.split", feats, vec![g / s, s, g / s, s, d]);
+        let x = b.transpose("connector.shuffle", x, &[g / s, s, g / s, s, d], &[0, 2, 1, 3, 4]);
+        let rows = g * g / (s * s);
+        let x = b.reshape("connector.rows", x, vec![rows, s * s * d]);
+        let pw = b.f32w("connector.proj.weight", vec![th, s * s * d], proj);
+        let out = b.linear("connector.proj", x, pw, None, rows, th);
+        let (vg, vw) = b.finish(&[out]);
+        let vision = compile(vg, vw, mode).map_err(|e| format!("Idefics3 vision: {e}"))?;
+        let (tg, tw) = text.to_decode_graph_embeds();
+        let text_prog = compile(tg, tw, mode).map_err(|e| format!("Idefics3 text: {e}"))?;
+        let embedding = text.embedding;
+        let kind = Kind::Gpu {
+            mode,
+            vision: parking_lot::Mutex::new(vision),
+            text: parking_lot::Mutex::new(text_prog),
+            embedding,
+        };
+        Ok(Self { cfg, image_size, image_token, kind })
+    }
+
+    /// One normalized `[3, S, S]` tile → `image_seq_len` rows in the text model's embedding space.
+    fn embed_tile(&self, pixels: &[f32]) -> Result<Vec<f32>, String> {
+        match &self.kind {
+            Kind::Cpu { vision, proj, scale, .. } => {
+                let feats = vision.forward(pixels);
+                // Pixel shuffle: each scale×scale patch block becomes one row, features ordered
+                // (block row, block col, channel) like `Idefics3Connector.pixel_shuffle`.
+                let (d, s) = (vision.hidden, *scale);
+                let g = vision.image_size / vision.patch;
+                let mut shuffled = Vec::with_capacity(feats.len());
+                for bi in 0..g / s {
+                    for bj in 0..g / s {
+                        for m in 0..s {
+                            for k in 0..s {
+                                let p = (bi * s + m) * g + bj * s + k;
+                                shuffled.extend_from_slice(&feats[p * d..(p + 1) * d]);
+                            }
+                        }
+                    }
+                }
+                let rows = g * g / (s * s);
+                Ok(nn::linear(&shuffled, rows, proj, None, d * s * s, self.cfg.hidden_dim))
+            }
+            Kind::Gpu { vision, .. } => {
+                let out = vision.lock().run(vec![Tensor::F32(pixels.to_vec())])?;
+                out.into_iter().next().ok_or("vision program returned nothing")?.into_f32()
+            }
+        }
+    }
+
+    fn new_seq(&self, prompt_len: usize, image_pos: Vec<usize>, rows: Vec<f32>) -> Seq {
+        let kv = match &self.kind {
+            Kind::Cpu { text, .. } => (0..text.layers.len())
+                .map(|_| LayerKVCache::new(prompt_len, self.cfg.hidden_dim))
+                .collect(),
+            Kind::Gpu { .. } => Vec::new(),
+        };
+        Seq { kv, state: crate::graph::StateStore::new(), image_pos, rows }
+    }
+
+    fn forward(&self, tokens: &[u32], start_pos: usize, seq: &mut Seq) -> Result<Vec<f32>, String> {
+        let d = self.cfg.hidden_dim;
+        match &self.kind {
+            Kind::Cpu { text, .. } => {
+                let mut logits = Vec::new();
+                for (i, &t) in tokens.iter().enumerate() {
+                    let pos = start_pos + i;
+                    logits = match seq.image_pos.binary_search(&pos) {
+                        Ok(r) if t == self.image_token => text.forward_embedding_with_kv(
+                            &seq.rows[r * d..(r + 1) * d],
+                            pos,
+                            &mut seq.kv,
+                        ),
+                        _ => text.forward_token_with_kv(t, pos, &mut seq.kv),
+                    };
+                }
+                Ok(logits)
+            }
+            Kind::Gpu { mode, text, embedding, .. } => {
+                // The chunk's text rows, then the `<image>` rows scattered over theirs on the GPU.
+                let (mut base, mut at, mut rows) = (Vec::with_capacity(tokens.len() * d), Vec::new(), Vec::new());
+                for (i, &t) in tokens.iter().enumerate() {
+                    let row = embedding
+                        .get(t as usize * d..(t as usize + 1) * d)
+                        .ok_or_else(|| format!("token id {t} outside the vocabulary"))?;
+                    base.extend_from_slice(row);
+                    if t == self.image_token {
+                        if let Ok(r) = seq.image_pos.binary_search(&(start_pos + i)) {
+                            at.push(i as u32);
+                            rows.extend_from_slice(&seq.rows[r * d..(r + 1) * d]);
+                        }
+                    }
+                }
+                let x = scatter_rows(base, tokens.len(), d, &at, rows, *mode)?;
+                let mut prog = text.lock();
+                std::mem::swap(&mut prog.state, &mut seq.state);
+                let mut logits = Ok(Vec::new());
+                for (i, row) in x.chunks_exact(d).enumerate() {
+                    let inputs = vec![Tensor::F32(row.to_vec()), Tensor::U32(vec![(start_pos + i) as u32])];
+                    logits = prog
+                        .run(inputs)
+                        .and_then(|o| o.into_iter().next().ok_or("text program returned nothing".to_string())?.into_f32());
+                    if logits.is_err() {
+                        break;
+                    }
+                }
+                std::mem::swap(&mut prog.state, &mut seq.state);
+                logits
+            }
+        }
+    }
+}
+
 pub fn load(
     artifacts: &ModelArtifacts,
     cfg: &Value,
-    _mode: impl Into<crate::hardware::PlacementMode>,
+    mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
-    crate::graph::avenues::gate(crate::graph::avenues::Family::Idefics3Siglip)?;
+    let mode = mode.into();
+    crate::graph::avenues::family_gate(
+        crate::graph::avenues::Family::Idefics3Siglip,
+        crate::graph::avenues::resolved_backend(mode),
+    )?;
     let weights = artifacts.weights_path.as_deref().ok_or("no weight file")?;
     if !matches!(
         weights.extension().and_then(|e| e.to_str()),
@@ -320,13 +488,12 @@ pub fn load(
         })
         .collect();
     let text = GraphLm::from_manifest(tcfg, &text_manifest, &data)?;
+    let (image_seq_len, context_len) = (grid * grid / (scale * scale), text.config.max_seq_len);
+    let engine = Engine::new(vision, proj, scale, text, image_token, mode)?;
     Ok(Arc::new(Idefics3 {
-        image_seq_len: grid * grid / (scale * scale),
-        context_len: text.config.max_seq_len,
-        vision,
-        proj,
-        scale,
-        text,
+        image_seq_len,
+        context_len,
+        engine,
         tokenizer,
         image_token,
         pre,
@@ -334,34 +501,6 @@ pub fn load(
 }
 
 impl Idefics3 {
-    /// One tile → `image_seq_len` rows in the text model's embedding space.
-    fn embed_tile(&self, tile: &ImageBuffer) -> Vec<f32> {
-        let feats = self.vision.forward(&self.pre.pixels(tile));
-        // Pixel shuffle: each scale×scale patch block becomes one row, features ordered
-        // (block row, block col, channel) like `Idefics3Connector.pixel_shuffle`.
-        let (d, s) = (self.vision.hidden, self.scale);
-        let g = self.vision.image_size / self.vision.patch;
-        let mut shuffled = Vec::with_capacity(feats.len());
-        for bi in 0..g / s {
-            for bj in 0..g / s {
-                for m in 0..s {
-                    for k in 0..s {
-                        let p = (bi * s + m) * g + bj * s + k;
-                        shuffled.extend_from_slice(&feats[p * d..(p + 1) * d]);
-                    }
-                }
-            }
-        }
-        let rows = self.image_seq_len;
-        nn::linear(
-            &shuffled,
-            rows,
-            &self.proj,
-            None,
-            d * s * s,
-            self.text.config.hidden_dim,
-        )
-    }
 
     /// The prompt's image bytes, each placeholder's expansion ids, and the expanded prompt length,
     /// from cheap decodes only (no SigLIP): a prompt that can't fit the context Errs here, not
@@ -415,14 +554,24 @@ impl Idefics3 {
 
 impl NativeLm for Idefics3 {
     fn backend_label(&self) -> String {
-        crate::scheduler::cpu_backend_label()
+        match &self.engine.kind {
+            Kind::Cpu { .. } => crate::scheduler::cpu_backend_label(),
+            Kind::Gpu { text, .. } => text.lock().backend_label(),
+        }
+    }
+
+    fn device(&self) -> crate::hardware::Device {
+        match &self.engine.kind {
+            Kind::Cpu { .. } => crate::hardware::Device::Cpu,
+            Kind::Gpu { text, .. } => text.lock().primary_device(),
+        }
     }
 
     fn summary(&self) -> String {
-        let c = &self.text.config;
+        let c = &self.engine.cfg;
         format!(
             "Idefics3: SigLIP {}px tiles ({} image tokens each) + Llama {} layers, hidden {}, f32 weights",
-            self.vision.image_size, self.image_seq_len, c.num_layers, c.hidden_dim
+            self.engine.image_size, self.image_seq_len, c.num_layers, c.hidden_dim
         )
     }
 
@@ -445,14 +594,14 @@ impl NativeLm for Idefics3 {
             }
             let img = ImageBuffer::decode(images.next().expect("one image per placeholder"))?;
             for tile in &self.pre.tiles(&img).2 {
-                rows.extend(self.embed_tile(tile));
+                rows.extend(self.engine.embed_tile(&self.pre.pixels(tile))?);
             }
             out.extend(expansions.next().expect("one expansion per image"));
         }
         let image_pos: Vec<usize> = (0..out.len())
             .filter(|&i| out[i] == self.image_token)
             .collect();
-        let d = self.text.config.hidden_dim;
+        let d = self.engine.cfg.hidden_dim;
         if image_pos.len() * d != rows.len() {
             return Err(format!(
                 "{} {IMAGE} tokens for {} image rows",
@@ -460,17 +609,8 @@ impl NativeLm for Idefics3 {
                 rows.len() / d
             ));
         }
-        let kv = (0..self.text.layers.len())
-            .map(|_| LayerKVCache::new(out.len(), d))
-            .collect();
-        Ok((
-            out,
-            Box::new(Seq {
-                kv,
-                image_pos,
-                rows,
-            }),
-        ))
+        let seq = self.engine.new_seq(out.len(), image_pos, rows);
+        Ok((out, Box::new(seq)))
     }
 
     fn prompt_len(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<usize, String> {
@@ -486,20 +626,7 @@ impl NativeLm for Idefics3 {
         let seq = state
             .downcast_mut::<Seq>()
             .ok_or("sequence state is not Idefics3's")?;
-        let d = self.text.config.hidden_dim;
-        let mut logits = Vec::new();
-        for (i, &t) in tokens.iter().enumerate() {
-            let pos = start_pos + i;
-            logits = match seq.image_pos.binary_search(&pos) {
-                Ok(r) if t == self.image_token => self.text.forward_embedding_with_kv(
-                    &seq.rows[r * d..(r + 1) * d],
-                    pos,
-                    &mut seq.kv,
-                ),
-                _ => self.text.forward_token_with_kv(t, pos, &mut seq.kv),
-            };
-        }
-        Ok(logits)
+        self.engine.forward(tokens, start_pos, seq)
     }
 }
 
@@ -556,6 +683,65 @@ mod tests {
             placeholder(1, 2, 1),
             "<fake_token_around_image><row_1_col_1><image><fake_token_around_image><row_1_col_2><image>\n\n<fake_token_around_image><global-img><image><fake_token_around_image>"
         );
+    }
+
+    fn rel_err(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let scale = b.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+    }
+
+    const IMG: u32 = 5;
+
+    fn tiny_engine(mode: crate::hardware::PlacementMode) -> Engine {
+        use crate::model::siglip::tiny;
+        let text = GraphLm::new(GraphLmConfig::smollm_1m());
+        let proj = tiny::values("connector", text.config.hidden_dim * tiny::HIDDEN * 4)
+            .into_iter()
+            .map(|v| v * 0.1)
+            .collect();
+        Engine::new(tiny::vision(), proj, 2, text, IMG, mode).expect("tiny Idefics3 engine")
+    }
+
+    /// The Metal tower + pixel-shuffle connector and the stateful text program (image rows scattered
+    /// over the token embeddings, a prefill chunk then two decode steps) match the host forward.
+    #[test]
+    fn metal_programs_match_the_host_forward() {
+        use crate::hardware::{available_devices, cpu_compute, PlacementMode};
+        if !available_devices().contains(&Device::Metal) {
+            println!("SKIP: no Metal device");
+            return;
+        }
+        let _allow = cpu_compute::allow();
+        let cpu = tiny_engine(PlacementMode::Pin(Device::Cpu));
+        let gpu = tiny_engine(PlacementMode::Pin(Device::Metal));
+        let Kind::Gpu { vision, text, .. } = &gpu.kind else { panic!("not a GPU engine") };
+        assert_eq!(vision.lock().cpu_node_count() + text.lock().cpu_node_count(), 0, "nodes run on the CPU");
+        let pixels = crate::model::siglip::tiny::values("pixels", 3 * 16 * 16);
+        let (rc, rg) = (cpu.embed_tile(&pixels).unwrap(), gpu.embed_tile(&pixels).unwrap());
+        assert_eq!(rc.len(), 4 * 128);
+        let e = rel_err(&rg, &rc);
+        println!("idefics3 tile rows: rel err {e:e}");
+        assert!(e < 1e-3, "tile rows differ: {e}");
+        let abs = rg.iter().zip(&rc).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(abs < 1e-3, "tile rows max |d| {abs}");
+
+        let image_pos = vec![2, 3, 4, 5];
+        let (mut sc, mut sg) = (
+            cpu.new_seq(9, image_pos.clone(), rc),
+            gpu.new_seq(9, image_pos, rg),
+        );
+        for (tokens, start) in [(vec![10, 11, IMG, IMG, IMG, IMG, 12], 0), (vec![13], 7), (vec![14], 8)] {
+            let lc = cpu.forward(&tokens, start, &mut sc).unwrap();
+            let lg = gpu.forward(&tokens, start, &mut sg).unwrap();
+            let e = rel_err(&lg, &lc);
+            println!("idefics3 text at {start}: rel err {e:e}");
+            assert!(e < 1e-3, "logits differ at {start}: {e}");
+            // Top-1 up to fp noise: a random tiny model has near-tied logits.
+            let best = lc.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            let gmax = lg.iter().fold(f32::MIN, |m, v| m.max(*v));
+            assert!(gmax - lg[best] < 1e-3, "top-1 at {start}");
+        }
     }
 
     /// Many images that can't fit the context Err from cheap decodes, before any SigLIP pass or

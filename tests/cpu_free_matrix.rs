@@ -67,6 +67,15 @@ fn run_on_gpu(name: &str, graph: Graph, weights: Weights) {
     }
 }
 
+/// Media soft tokens placed over prompt rows by the GPU `Scatter`.
+fn scatter_fixture(name: &str) {
+    let base: Vec<f32> = (0..4 * 8).map(|i| i as f32).collect();
+    let out = gibbs_engine::model::vision_graph::scatter_rows(base.clone(), 4, 8, &[1, 3], vec![-1.0; 16], PlacementMode::Auto)
+        .unwrap_or_else(|e| panic!("{name} scatter: {e}"));
+    assert_eq!(&out[..8], &base[..8], "{name}");
+    assert!(out[8..16].iter().chain(&out[24..]).all(|&v| v == -1.0), "{name}");
+}
+
 fn gpu_fixture(f: Family) {
     match f {
         Family::GraphLm => {
@@ -127,6 +136,22 @@ fn gpu_fixture(f: Family) {
         }
         Family::ClassifierDecoder => {
             gibbs_engine::model::classifier::gpu_fixture().expect("decoder seq-cls fixture")
+        Family::Idefics3Siglip => {
+            let (g, w) = gibbs_engine::model::siglip::tiny::graph();
+            run_on_gpu("Idefics3Siglip tower", g, w);
+            let (g, w) = GraphLm::new(GraphLmConfig::smollm_1m()).to_decode_graph_embeds();
+            run_on_gpu("Idefics3Siglip text", g, w);
+            scatter_fixture("Idefics3Siglip");
+        }
+        Family::Gemma4Media => {
+            let (g, w) = gibbs_engine::model::gemma4::tiny_vision_graph();
+            run_on_gpu("Gemma4Media vision", g, w);
+            scatter_fixture("Gemma4Media");
+        }
+        Family::Audio => {
+            let (g, w) = gibbs_engine::model::gemma4::tiny_audio_wav_graph();
+            run_on_gpu("Audio conformer", g, w);
+            scatter_fixture("Audio");
         }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }

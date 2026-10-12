@@ -98,6 +98,7 @@ pub mod tokenizer;
 pub mod unet;
 pub mod unet3d;
 pub mod vae;
+pub mod vision_graph;
 pub mod weight_format;
 pub mod weights;
 pub mod zimage;

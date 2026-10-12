@@ -101,8 +101,9 @@ fn model(
         tid("<|audio>")?,
         tid("<audio|>")?,
     );
+    let mode = mode.into();
     let (vision, audio) = match local_mmproj(path) {
-        Some(p) => projectors(&p)?,
+        Some(p) => projectors(&p, mode)?,
         None => {
             let msg = format!(
                 "{} has no mmproj*.gguf beside it, so it takes text only",
@@ -114,7 +115,6 @@ fn model(
             )
         }
     };
-    let mode = mode.into();
     let program = super::compile_gemma4_program(&text, mode)?;
     Ok(Arc::new(Gemma4 {
         tokenizer,
@@ -441,7 +441,11 @@ fn mm_from_gguf(name: &str, shape: &[usize], v: &mut [f32]) {
 /// The vision and audio encoders of the `mmproj` GGUF at `path`. A modality the file does not
 /// carry, or whose projector is not implemented, becomes an encoder that says so when a prompt
 /// attaches it.
-fn projectors(path: &Path) -> Result<(Box<dyn Encoder>, Box<dyn Encoder>), String> {
+fn projectors(
+    path: &Path,
+    mode: crate::hardware::PlacementMode,
+) -> Result<(Box<dyn Encoder>, Box<dyn Encoder>), String> {
+    let gpu = crate::model::vision_graph::is_gpu(mode);
     let at = |e: String| format!("{}: {e}", path.display());
     let file = std::fs::File::open(path).map_err(|e| at(e.to_string()))?;
     // SAFETY: as in [`load_gguf`].
@@ -510,7 +514,7 @@ fn projectors(path: &Path) -> Result<(Box<dyn Encoder>, Box<dyn Encoder>), Strin
         // preprocessing choice.
         let processor = json!({"image_processor": {"max_soft_tokens": 280}});
         let v = Vision::load(&w, &vc, &processor).map_err(|e| at(format!("gemma4 vision: {e}")))?;
-        Ok(Box::new(v))
+        Ok(Box::new(if gpu { v.on_gpu(mode) } else { v }))
     };
     let audio_tower = || -> Result<Box<dyn Encoder>, String> {
         let ac = json!({
@@ -531,7 +535,7 @@ fn projectors(path: &Path) -> Result<(Box<dyn Encoder>, Box<dyn Encoder>), Strin
             "feature_size": 128, "sampling_rate": 16000, "frame_length": 320, "hop_length": 160,
             "fft_length": 512, "min_frequency": 0.0, "max_frequency": 8000.0, "mel_floor": 0.001}});
         let a = Audio::load(&w, &ac, &processor).map_err(|e| at(format!("gemma4 audio: {e}")))?;
-        Ok(Box::new(a))
+        Ok(Box::new(if gpu { a.on_gpu(mode) } else { a }))
     };
     let encoder =
         |has: Result<(), String>, load: &dyn Fn() -> Result<Box<dyn Encoder>, String>| match has {
