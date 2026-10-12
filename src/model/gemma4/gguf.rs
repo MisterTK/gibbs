@@ -730,7 +730,7 @@ mod tests {
                 g.outputs.push(o);
             }
         }
-        let tokens = [2u32, 105, 2364];
+        let tokens = [2u32, 105, 2364, 3041, 563, 506, 5279, 1855, 529, 5946, 38102, 236764, 710, 2364];
         let build = |tok: u32, pos: usize| {
             let mut emb = vec![0.0f32; text.hidden];
             text.embed_row(tok, &mut emb);
@@ -758,6 +758,7 @@ mod tests {
         let mut metal_state = StateStore::new();
         for (pos, &tok) in tokens.iter().enumerate() {
             let cpu = crate::graph::cpu::run(&g, &w, &mut cpu_state, build(tok, pos)).unwrap();
+            let native_logits;
             {
                 // Native reference: the hand-written forward the CLI's CPU path uses.
                 let mut emb = vec![0.0f32; text.hidden];
@@ -768,10 +769,18 @@ mod tests {
                 let na: f32 = native.iter().map(|a| a * a).sum::<f32>().sqrt();
                 let nb: f32 = gl.iter().map(|a| a * a).sum::<f32>().sqrt();
                 println!("pos {pos}: native vs graph-cpu logits cos {:.5}", dot / (na * nb));
+                native_logits = native;
             }
             let met = session
                 .run_prepared(&mg, &plan, Some(&mut metal_state), build(tok, pos))
                 .unwrap();
+            {
+                let ml = met[0].as_f32().unwrap();
+                let dot: f32 = native_logits.iter().zip(ml).map(|(a, b)| a * b).sum();
+                let na: f32 = native_logits.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let nb: f32 = ml.iter().map(|a| a * a).sum::<f32>().sqrt();
+                println!("pos {pos}: native vs metal logits cos {:.5}", dot / (na * nb));
+            }
             let mut first_bad = None;
             for (i, (c, m)) in cpu.iter().zip(&met).enumerate() {
                 if i == 0 {
@@ -780,7 +789,7 @@ mod tests {
                 let (Ok(c), Ok(m)) = (c.as_f32(), m.as_f32()) else { continue };
                 let scale = c.iter().fold(0f32, |a, &x| a.max(x.abs())).max(1e-6);
                 let d = c.iter().zip(m).fold(0f32, |a, (&x, &y)| a.max((x - y).abs())) / scale;
-                if d > 2e-2 && first_bad.is_none() {
+                if d > 2e-3 && first_bad.is_none() {
                     first_bad = Some((i, d));
                 }
             }
@@ -793,7 +802,7 @@ mod tests {
                         println!("  {} of {} elements differ; first {:?}; e.g. cpu {:?} metal {:?}", bad.len(), c.len(), &bad[..bad.len().min(6)], bad.iter().take(3).map(|&j| c[j]).collect::<Vec<_>>(), bad.iter().take(3).map(|&j| m[j]).collect::<Vec<_>>());
                     }
                 }
-                None => println!("pos {pos}: all {} outputs within 2e-2", cpu.len()),
+                None => println!("pos {pos}: all {} outputs within 2e-3", cpu.len()),
             }
         }
     }

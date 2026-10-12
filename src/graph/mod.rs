@@ -210,7 +210,7 @@ pub enum Op {
     },
     /// `[gate, up]` → `silu(gate) * up`.
     SwiGlu,
-    /// `[gate, up]` → `gelu(gate) * up`.
+    /// `[gate, up]` → `gelu_pytorch_tanh(gate) * up`.
     GeGlu,
     /// `[x]` element-wise unary transformation.
     Unary {

@@ -4352,7 +4352,7 @@ pub fn generate_megakernel_msl(
                 "down_w[(ulong)h_out * INTER + j]"
             };
             let act_code = if *is_geglu {
-                "float z = fabs(g_acc) * 0.70710678f;\n            float t = 1.0f / (1.0f + 0.5f * z);\n            float p = -z*z - 1.26551223f + t*(1.00002368f + t*(0.37409196f + t*(-0.18628806f + t*0.27886807f)));\n            float erf_v = g_acc >= 0.0f ? 1.0f - t*exp(p) : t*exp(p) - 1.0f;\n            float act = (0.5f * g_acc * (1.0f + erf_v)) * u_acc;"
+                "float act = (0.5f * g_acc * (1.0f + tanh(0.7978845608f * (g_acc + 0.044715f * g_acc * g_acc * g_acc)))) * u_acc;"
             } else {
                 "float sig = 1.0f / (1.0f + exp(-g_acc));\n            float act = (g_acc * sig) * u_acc;"
             };

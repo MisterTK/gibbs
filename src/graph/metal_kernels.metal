@@ -18,6 +18,11 @@ struct NormParams { uint d; float eps; };
 struct AttnParams { uint nq; uint nk; uint heads; uint head_dim; uint causal; float scale; };
 struct PoolParams { uint n; uint d; };
 
+// Tanh-approximated GELU (`gelu_pytorch_tanh`), the activation of GeGlu.
+static inline float gelu_tanh(float x) {
+    return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+}
+
 // Exact GELU with the Numerical Recipes erfc fit used by `nn::gelu` (|erf error| < 1.2e-7), in f32.
 static inline float gelu_erf(float x) {
     float z = fabs(x) * M_SQRT1_2_F;
@@ -542,7 +547,7 @@ kernel void geglu_f32(device const float* gate [[buffer(0)]],
                       constant uint& n [[buffer(3)]],
                       uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
-    out[i] = gelu_erf(gate[i]) * up[i];
+    out[i] = gelu_tanh(gate[i]) * up[i];
 }
 
 struct block_q4_0 {
@@ -569,12 +574,12 @@ static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemv
         float silu = acc / (1.0f + exp(-acc));
         return silu * res[out_idx];
     } else if (p.epi == 5) {
-        return gelu_erf(acc) * res[out_idx];
+        return gelu_tanh(acc) * res[out_idx];
     } else if (p.epi == 6) {
         float gate = res[out_idx];
         return acc * (gate / (1.0f + exp(-gate)));
     } else if (p.epi == 7) {
-        return acc * gelu_erf(res[out_idx]);
+        return acc * gelu_tanh(res[out_idx]);
     }
     return acc;
 }
@@ -2328,10 +2333,6 @@ kernel void gemv_jesse_lut(
         accum += (int)lut_tables[lut_out_offset + (ulong)lut_idx * lut_size + addr];
     }
     y[gid] = float(accum);
-}
-
-static inline float gelu_tanh(float x) {
-    return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
 }
 
 kernel void gelu_tanh_f32(device const float* x [[buffer(0)]],
