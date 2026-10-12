@@ -29,6 +29,14 @@ pub struct Mat {
 }
 
 impl Mat {
+    /// A `[rows, cols]` view of packed GGUF blocks (no copy).
+    pub fn from_packed(p: Packed, rows: usize, cols: usize) -> Self {
+        Self {
+            buf: Buf::Packed(p),
+            rows,
+            cols,
+        }
+    }
     pub fn packed(&self) -> Option<&Packed> {
         match &self.buf {
             Buf::Packed(p) => Some(p),
