@@ -35,6 +35,7 @@ const CANDIDATES: &[Q] = &[
     Q::GGUF_TQ1_0,
     Q::GGUF_TQ2_0,
     Q::MXFP4,
+    Q::GGUF_NVFP4,
 ];
 
 struct Lcg(u64);
@@ -63,7 +64,7 @@ fn f16_offsets(f: Q) -> &'static [usize] {
         Q::GGUF_Q3_K => &[108],
         Q::GGUF_TQ1_0 => &[52],
         Q::GGUF_TQ2_0 => &[64],
-        Q::GGUF_IQ1_M | Q::MXFP4 => &[],
+        Q::GGUF_IQ1_M | Q::MXFP4 | Q::GGUF_NVFP4 => &[],
         _ => &[0],
     }
 }
