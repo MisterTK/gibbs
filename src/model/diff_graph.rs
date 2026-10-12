@@ -334,7 +334,9 @@ pub mod testutil {
     use crate::model::loaders::{TensorMetadata, WeightReader};
     use std::collections::HashMap;
 
-    pub struct MemReader(pub HashMap<String, (Vec<usize>, Vec<f32>)>);
+    /// `half`: tensors with >= 2 dims are served as F16 (values rounded through f16, packed bytes via
+    /// `load_tensor_quantized`) like a real fp16 checkpoint, so `Tensors::load_wt` yields `Wt::F16`.
+    pub struct MemReader(pub HashMap<String, (Vec<usize>, Vec<f32>)>, pub bool);
 
     impl WeightReader for MemReader {
         fn parse_header(&mut self) -> Result<HashMap<String, String>, String> {
@@ -347,17 +349,26 @@ pub mod testutil {
                 .map(|(n, (s, _))| TensorMetadata {
                     name: n.clone(),
                     shape: s.clone(),
-                    dtype: "F32".into(),
+                    dtype: if self.1 && s.len() >= 2 { "F16" } else { "F32" }.into(),
                     byte_offset: 0,
                     byte_len: 0,
                 })
                 .collect())
         }
         fn load_tensor(&self, name: &str) -> Result<Vec<f32>, String> {
-            self.0.get(name).map(|(_, v)| v.clone()).ok_or_else(|| format!("no tensor {name}"))
+            let (s, v) = self.0.get(name).ok_or_else(|| format!("no tensor {name}"))?;
+            Ok(if self.1 && s.len() >= 2 {
+                v.iter().map(|&x| crate::model::f16_to_f32(crate::model::f32_to_f16(x))).collect()
+            } else {
+                v.clone()
+            })
         }
         fn load_tensor_quantized(&self, name: &str) -> Result<Vec<u8>, String> {
-            Err(format!("no packed tensor {name}"))
+            let (s, v) = self.0.get(name).ok_or_else(|| format!("no tensor {name}"))?;
+            if !(self.1 && s.len() >= 2) {
+                return Err(format!("no packed tensor {name}"));
+            }
+            Ok(v.iter().flat_map(|&x| crate::model::f32_to_f16(x).to_le_bytes()).collect())
         }
     }
 
@@ -390,7 +401,7 @@ pub mod testutil {
             };
             m.insert(n.clone(), (s.clone(), v));
         }
-        MemReader(m)
+        MemReader(m, false)
     }
 
     /// max |a - b| / max(max |b|, 1e-3).
