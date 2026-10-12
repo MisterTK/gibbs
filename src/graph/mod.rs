@@ -875,3 +875,37 @@ pub fn lower_moe_pass(graph: &mut Graph) -> Result<(), String> {
     *graph = new_g;
     Ok(())
 }
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// Full KV rewinds by position; a recurrent state refuses and comes back from a snapshot; a
+    /// device-resident state is read from and written back into its buffer.
+    #[test]
+    fn truncate_snapshot_restore() {
+        let mut st = StateStore::new();
+        st.insert("layers.3.k_cache", Tensor::F32(vec![1.0; 8]));
+        assert!(st.truncate(2).is_ok());
+        st.insert("layers.0.ssm_state", Tensor::F32(vec![1.0, 2.0]));
+        assert!(st.truncate(2).unwrap_err().contains("ssm_state"));
+        let snap = st.snapshot(&["layers.0.ssm_state", "missing"]);
+        assert_eq!(snap.len(), 1);
+        st.insert("layers.0.ssm_state", Tensor::F32(vec![9.0, 9.0]));
+        st.restore(snap);
+        assert_eq!(st.get("layers.0.ssm_state").unwrap().as_f32().unwrap(), &[1.0, 2.0]);
+        #[cfg(target_os = "macos")]
+        if let Some(dev) = ::metal::Device::system_default() {
+            let buf = dev.new_buffer(8, ::metal::MTLResourceOptions::StorageModeShared);
+            // SAFETY: shared 8-byte buffer = 2 f32.
+            unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, 2) }.copy_from_slice(&[5.0, 6.0]);
+            st.metal_buffers.insert("layers.1.conv_state".into(), (std::sync::Arc::new(buf), 2));
+            let snap = st.snapshot(&["layers.1.conv_state"]);
+            let live = st.metal_buffers["layers.1.conv_state"].0.contents() as *mut f32;
+            // SAFETY: as above.
+            unsafe { live.write(0.0) };
+            st.restore(snap);
+            assert_eq!(unsafe { *live }, 5.0);
+        }
+    }
+}

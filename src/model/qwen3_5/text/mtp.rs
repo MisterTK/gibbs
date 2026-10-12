@@ -308,7 +308,7 @@ impl Drafter for MtpGpuDrafter {
         let mut p = self.program.lock();
         std::mem::swap(&mut p.state, &mut s.state);
         let out = (|| -> Result<Vec<u32>, String> {
-            let mut step = |p: &mut crate::graph::program::GraphProgram,
+            let step = |p: &mut crate::graph::program::GraphProgram,
                             tok: u32,
                             hid: &[f32],
                             pos: usize|

@@ -174,3 +174,40 @@ fn mtp_drafter_program_matches_host() {
     assert!(errs.iter().all(|&e| e < 1e-3), "{errs:?}");
     assert_eq!(oc2, og2);
 }
+
+/// Greedy output through the scheduler on the Metal program, with the MTP head drafting and
+/// without: token for token the same (verify runs the same n = 1 program as plain decoding and
+/// rejected drafts rewind the recurrent state from its snapshot).
+#[test]
+fn scheduler_mtp_speculation_on_metal_keeps_greedy_output() {
+    use crate::kv::PagedKVPool;
+    use crate::scheduler::{ContinuousBatchScheduler, ExecutableModel, SamplingParams};
+    let (_, gpu) = pair(false, true);
+    let run = |spec: bool| {
+        let sched = ContinuousBatchScheduler::new(
+            "tiny",
+            Arc::new(PagedKVPool::new(256)),
+            Some(ExecutableModel::Native(gpu.clone())),
+        );
+        if !spec {
+            sched.set_drafter(None);
+        }
+        let params = SamplingParams {
+            temperature: Some(0.0),
+            top_p: None,
+            max_new_tokens: 40,
+            top_logprobs: None,
+        };
+        let mut rx = sched.submit_with_params(params, |_| vec![4, 8, 15, 16, 23]).1;
+        while sched.step().active_sequences_count > 0 || !sched.waiting_queue.read().is_empty() {}
+        let out: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let s = sched.telemetry.get_summary();
+        assert_eq!(s.spec_forwards > 0, spec, "speculation on = {spec}");
+        (out, s.spec_accept_rate)
+    };
+    let (plain, _) = run(false);
+    let (spec, accept) = run(true);
+    println!("MTP on Metal: {} tokens, acceptance {accept:.2}", plain.len());
+    assert_eq!(plain.len(), 40);
+    assert_eq!(plain, spec);
+}
