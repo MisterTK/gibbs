@@ -11,13 +11,21 @@ use std::sync::Arc;
 
 const REPO: &str = "Qwen/Qwen3.5-0.8B";
 
+/// `GIBBS_TEST_BACKEND=metal` runs the whole file on the Metal program (needs the weights in disk/).
+fn backend() -> Device {
+    match std::env::var("GIBBS_TEST_BACKEND").as_deref() {
+        Ok("metal") => Device::Metal,
+        _ => Device::Cpu,
+    }
+}
+
 fn model() -> Option<Arc<dyn NativeLm>> {
     let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(REPO);
     if art.weights_path.is_none() {
         eprintln!("SKIP: {REPO} not in disk/ (gibbs --model {REPO} --storage disk)");
         return None;
     }
-    Some(load_native(&art, Device::Cpu)?.expect("Qwen3.5-0.8B loads"))
+    Some(load_native(&art, backend())?.expect("Qwen3.5-0.8B loads"))
 }
 
 /// Verifying four positions, rewinding to two, and continuing gives bit-identical logits to
