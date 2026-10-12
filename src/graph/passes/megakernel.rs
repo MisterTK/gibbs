@@ -184,6 +184,10 @@ fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
             }
             let swiglu_val = down_node.inputs[0];
             let down_w = down_node.inputs[1];
+            // The megakernel is a one-row GEMV chain; batched activations stay as separate GEMMs.
+            if graph.value(swiglu_val).shape.iter().rev().skip(1).product::<usize>() != 1 {
+                return None;
+            }
 
             let swiglu_nid = *val_producers.get(&swiglu_val)?;
             let swiglu_node = graph.node(swiglu_nid);
