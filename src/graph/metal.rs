@@ -3130,10 +3130,22 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
                         let c = &g.nodes[*j];
                         if !g.outputs.contains(&out) {
+                            // The batched GEMM kernels (m >= 16) only carry Gelu/Residual epilogues.
+                            let packed_epi = format.is_some()
+                                && !(m >= 16
+                                    && matches!(
+                                        format,
+                                        Some(
+                                            WeightFormat::BF16
+                                                | WeightFormat::F16
+                                                | WeightFormat::Q4_0
+                                                | WeightFormat::Q8_0
+                                        )
+                                    ));
                             match c.op {
                                 Op::Gelu { tanh: false } => epi = Epi::Gelu,
-                                Op::Silu if format.is_some() => epi = Epi::Silu,
-                                Op::SwiGlu if format.is_some() && c.inputs.len() == 2 => {
+                                Op::Silu if packed_epi => epi = Epi::Silu,
+                                Op::SwiGlu if packed_epi && c.inputs.len() == 2 => {
                                     if c.inputs[0] == out {
                                         let up = c.inputs[1];
                                         if up != out && exists_before(up, i) && n_of(up)? == m * n {
@@ -3149,7 +3161,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                                         }
                                     }
                                 }
-                                Op::GeGlu if format.is_some() && c.inputs.len() == 2 => {
+                                Op::GeGlu if packed_epi && c.inputs.len() == 2 => {
                                     if c.inputs[0] == out {
                                         let up = c.inputs[1];
                                         if up != out && exists_before(up, i) && n_of(up)? == m * n {
@@ -4644,6 +4656,37 @@ mod tests {
                     dt * 1e6,
                     bytes as f64 / dt / 1e9
                 );
+            }
+        }
+    }
+
+    /// Linear -> Silu/SwiGlu/GeGlu on a BF16 weight at m below and above the batched-GEMM cut (16):
+    /// the activation must never be dropped.
+    #[test]
+    fn packed_linear_activation_epilogues_match_cpu_at_every_m() {
+        let (n, k) = (40usize, 64usize);
+        let bf: Vec<u16> = (0..n * k)
+            .map(|i| crate::model::f32_to_bf16(0.05 * ((i % 11) as f32 - 5.0)))
+            .collect();
+        for m in [1usize, 15, 16, 64] {
+            for act in 0..3 {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, k], DType::F32);
+                let up = g.input("up", vec![m, n], DType::F32);
+                let wv = g.weight("w", vec![n, k], DType::BF16);
+                let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], DType::F32);
+                let y = match act {
+                    0 => g.add("a", Op::Silu, &[lin], vec![m, n], DType::F32),
+                    1 => g.add("a", Op::SwiGlu, &[lin, up], vec![m, n], DType::F32),
+                    _ => g.add("a", Op::GeGlu, &[lin, up], vec![m, n], DType::F32),
+                };
+                g.output(y);
+                let mut w = Weights::new();
+                w.insert("w", Tensor::BF16(bf.clone()));
+                let inputs = vec![Tensor::F32(rand(m * k, 7)), Tensor::F32(rand(m * n, 8))];
+                let (want, got) = both(&g, &w, inputs, None);
+                let err = rel_err(&want, &got);
+                assert!(err < 1e-3, "m={m} act={act}: rel err {err}");
             }
         }
     }
