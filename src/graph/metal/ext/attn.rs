@@ -7,7 +7,7 @@
 
 use super::super::{numel, set_bytes, u32_of, Planned, Session};
 use super::{Enc, PlanOut};
-use crate::graph::{DType, Graph, Node, Op, ValueId};
+use crate::graph::{DType, Graph, Node, Op, PairLayout, RopeVariant, ValueId};
 use metal::MTLSize;
 use std::collections::HashMap;
 
@@ -21,6 +21,7 @@ pub(super) const KERNELS: &[&str] = &[
     "attn_flash_nj16",
     "rel_pos_bias_f32",
     "state_reorder_f32",
+    "rope_mrope_f32",
 ];
 
 /// Query rows (= simdgroups) per threadgroup; `ATTNF_NSG` in `attn.metal`.
@@ -64,6 +65,22 @@ pub struct ReorderParams {
     row: u32,
 }
 
+/// `MRopeParams` in `attn.metal`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MRopeParams {
+    n_seq: u32,
+    n_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    adjacent: u32,
+    interleaved: u32,
+    s0: u32,
+    s1: u32,
+    s2: u32,
+    mscale: f32,
+}
+
 /// Steps this group adds to the executor.
 #[derive(Debug, Clone)]
 pub enum Step {
@@ -85,6 +102,12 @@ pub enum Step {
         state: ValueId,
         parent: ValueId,
         params: ReorderParams,
+    },
+    MRope {
+        x: ValueId,
+        pos: ValueId,
+        inv_freq: ValueId,
+        params: MRopeParams,
     },
 }
 
@@ -119,6 +142,10 @@ pub(super) fn supports(op: &Op, dtype: DType) -> bool {
             heads,
         } => heads > 0 && rel_pos_buckets(buckets, max_distance, bidirectional).is_some(),
         Op::StateReorder => true,
+        Op::Rope {
+            variant: RopeVariant::MRope { .. },
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -134,6 +161,10 @@ pub(super) fn plan(
         Op::Attention { .. } => Some(plan_attention(g, node)),
         Op::RelPosBias { .. } => Some(plan_rel_pos_bias(g, node)),
         Op::StateReorder => Some(plan_state_reorder(g, node)),
+        Op::Rope {
+            variant: RopeVariant::MRope { .. },
+            ..
+        } => Some(plan_mrope(g, node)),
         _ => None,
     }
 }
@@ -315,6 +346,65 @@ fn plan_state_reorder(g: &Graph, node: &Node) -> Result<PlanOut<Step>, String> {
     ))
 }
 
+/// `Rope` with `RopeVariant::MRope`: positions `[n_seq, 3]` (t, h, w), one `inv_freq` per pair.
+fn plan_mrope(g: &Graph, node: &Node) -> Result<PlanOut<Step>, String> {
+    let name = &node.name;
+    let Op::Rope {
+        head_dim,
+        rotary_dim,
+        variant:
+            RopeVariant::MRope {
+                sections,
+                interleaved,
+                pairs,
+            },
+        mscale,
+    } = node.op
+    else {
+        unreachable!("plan_mrope is called for MRope only")
+    };
+    let (x, pos, inv_freq) = (operand(node, 0)?, operand(node, 1)?, operand(node, 2)?);
+    let (xl, pl) = (numel(g, x)?, numel(g, pos)?);
+    if g.value(pos).dtype != DType::U32 || pl == 0 || pl % 3 != 0 {
+        return Err(format!(
+            "node '{name}': MRope positions must be u32 [n, 3], got {pl} elements"
+        ));
+    }
+    if head_dim == 0 || rotary_dim > head_dim || rotary_dim % 2 != 0 {
+        return Err(format!(
+            "node '{name}': MRope rotary_dim {rotary_dim} must be even and within head_dim {head_dim}"
+        ));
+    }
+    let n_seq = pl / 3;
+    if xl % (n_seq * head_dim) != 0 || numel(g, inv_freq)? != rotary_dim / 2 {
+        return Err(format!(
+            "node '{name}': MRope needs x of n*heads*{head_dim} elements and {} inv_freq entries",
+            rotary_dim / 2
+        ));
+    }
+    let params = MRopeParams {
+        n_seq: u32_of(n_seq)?,
+        n_heads: u32_of(xl / (n_seq * head_dim))?,
+        head_dim: u32_of(head_dim)?,
+        rotary_dim: u32_of(rotary_dim)?,
+        adjacent: (pairs == PairLayout::Adjacent) as u32,
+        interleaved: interleaved as u32,
+        s0: sections[0],
+        s1: sections[1],
+        s2: sections[2],
+        mscale,
+    };
+    Ok(PlanOut::Step(
+        Step::MRope {
+            x,
+            pos,
+            inv_freq,
+            params,
+        },
+        xl,
+    ))
+}
+
 /// Every value the step reads (drives arena liveness and barriers).
 pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match *st {
@@ -329,6 +419,9 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
             ..
         } => vec![table, q_pos, k_pos],
         Step::StateReorder { state, parent, .. } => vec![state, parent],
+        Step::MRope {
+            x, pos, inv_freq, ..
+        } => vec![x, pos, inv_freq],
     }
 }
 
@@ -338,6 +431,7 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
         Step::Attention { .. } => false,
         Step::RelPosBias { q_pos, k_pos, .. } => v == q_pos || v == k_pos,
         Step::StateReorder { parent, .. } => v == parent,
+        Step::MRope { pos, .. } => v == pos,
     }
 }
 
@@ -396,6 +490,20 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             e.bind(2, s.out);
             set_bytes(e.enc, 3, params);
             e.grid1(params.batch as usize * params.row as usize);
+        }
+        Step::MRope {
+            x,
+            pos,
+            inv_freq,
+            ref params,
+        } => {
+            e.enc.set_compute_pipeline_state(rt.pso("rope_mrope_f32")?);
+            e.bind(0, x);
+            e.bind(1, pos);
+            e.bind(2, inv_freq);
+            e.bind(3, s.out);
+            set_bytes(e.enc, 4, params);
+            e.grid1(params.n_seq as usize * params.n_heads as usize * params.head_dim as usize);
         }
     }
     Ok(())
@@ -1006,6 +1114,57 @@ mod tests {
                 let (want, got) = both(&g, &Weights::new(), data);
                 assert_eq!(want, got, "batch {batch} row {row} parent {parent:?}");
             }
+        }
+    }
+
+    /// Every MRope form against the CPU arm: contiguous and interleaved sections, both pair
+    /// layouts, partial rotary_dim, a head count above one, mscale.
+    #[test]
+    fn mrope_matches_cpu() {
+        let cases = [
+            // (head_dim, rotary_dim, sections, interleaved, pairs, mscale)
+            (16usize, 16usize, [3u32, 3, 2], false, PairLayout::Half, 1.0f32),
+            (16, 16, [3, 3, 2], false, PairLayout::Adjacent, 1.0),
+            (16, 8, [2, 1, 1], false, PairLayout::Half, 1.0),
+            (16, 8, [2, 1, 1], true, PairLayout::Half, 1.0),
+            (16, 16, [3, 3, 2], true, PairLayout::Adjacent, 0.5),
+            (128, 128, [8, 28, 28], false, PairLayout::Adjacent, 1.0),
+        ];
+        for (hd, rot, sections, interleaved, pairs, mscale) in cases {
+            let (n, heads) = (5usize, 3usize);
+            let mut g = Graph::new();
+            let x = g.input("x", vec![n, heads * hd], F);
+            let pos = g.input("pos", vec![n * 3], DType::U32);
+            let f = g.input("inv_freq", vec![rot / 2], F);
+            let y = g.add(
+                "rope",
+                Op::Rope {
+                    head_dim: hd,
+                    rotary_dim: rot,
+                    variant: RopeVariant::MRope {
+                        sections,
+                        interleaved,
+                        pairs,
+                    },
+                    mscale,
+                },
+                &[x, pos, f],
+                vec![n, heads * hd],
+                F,
+            );
+            g.output(y);
+            let positions: Vec<u32> = (0..n as u32 * 3).map(|i| (i * 7 + i / 3) % 23).collect();
+            let inv: Vec<f32> = (0..rot / 2)
+                .map(|i| 100f32.powf(-(i as f32) / (rot / 2) as f32))
+                .collect();
+            let data = vec![
+                Tensor::F32(rand(n * heads * hd, 4)),
+                Tensor::U32(positions),
+                Tensor::F32(inv),
+            ];
+            let (want, got) = both(&g, &Weights::new(), data);
+            let e = rel_err(&want, &got);
+            assert!(e < 1e-4, "hd {hd} rot {rot} {sections:?} il {interleaved} {pairs:?}: {e}");
         }
     }
 

@@ -226,3 +226,63 @@ kernel void state_reorder_f32(device const float* state [[buffer(0)]],
     const uint src = parent[b];
     out[i] = src < p.batch ? state[(ulong)src * p.row + c] : 0.0f;
 }
+
+// ---- MRope --------------------------------------------------------------------------------------
+// One thread per element of `[n_seq, n_heads * head_dim]`; positions are `[n_seq, 3]` (t, h, w).
+// Pair `j` takes its position from the t/h/w section (contiguous `s0, s1, s2` pairs, or the
+// interleaved `j % 3` pattern), as the CPU executor. Adjacent pairs `(2j, 2j+1)` or half-split
+// `(j, j + rotary/2)`.
+struct MRopeParams {
+    uint n_seq;
+    uint n_heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint adjacent;
+    uint interleaved;
+    uint s0;
+    uint s1;
+    uint s2;
+    float mscale;
+};
+
+kernel void rope_mrope_f32(device const float* in [[buffer(0)]],
+                           device const uint* pos [[buffer(1)]],
+                           device const float* inv_freq [[buffer(2)]],
+                           device float* out [[buffer(3)]],
+                           constant MRopeParams& p [[buffer(4)]],
+                           uint gid [[thread_position_in_grid]]) {
+    const ulong total = (ulong)p.n_seq * p.n_heads * p.head_dim;
+    if ((ulong)gid >= total) return;
+    const uint d = gid % p.head_dim;
+    const ulong rem = gid / p.head_dim;
+    const uint seq = uint(rem / p.n_heads);
+    const ulong base = gid - d;
+    if (d >= p.rotary_dim) {
+        out[gid] = in[gid];
+        return;
+    }
+    const uint half_dim = p.rotary_dim / 2;
+    uint j, partner;
+    bool first;
+    if (p.adjacent != 0) {
+        j = d / 2;
+        first = (d % 2) == 0;
+        partner = d ^ 1;
+    } else {
+        first = d < half_dim;
+        j = first ? d : d - half_dim;
+        partner = first ? d + half_dim : d - half_dim;
+    }
+    uint axis;
+    if (p.interleaved != 0) {
+        axis = (j % 3 == 1 && j < 3 * p.s1) ? 1u : ((j % 3 == 2 && j < 3 * p.s2) ? 2u : 0u);
+    } else {
+        axis = j < p.s0 ? 0u : (j < p.s0 + p.s1 ? 1u : 2u);
+    }
+    const float theta = float(pos[seq * 3 + axis]) * inv_freq[j];
+    const float c = cos(theta) * p.mscale;
+    const float s = sin(theta) * p.mscale;
+    const float a = in[gid];
+    const float b = in[base + partner];
+    out[gid] = first ? a * c - b * s : b * s + a * c;
+}
