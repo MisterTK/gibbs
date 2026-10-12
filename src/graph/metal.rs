@@ -1875,12 +1875,16 @@ impl Session {
             if profile_kernels {
                 let mut timings = Vec::new();
                 for (s_idx, s) in steps.iter().enumerate() {
-                    let cb = self.rt.queue.new_command_buffer();
-                    let enc = cb.new_compute_command_encoder();
-                    self.encode(enc, s, s_idx, &params_buf, &loc)?;
-                    enc.end_encoding();
-                    commit_and_wait(cb)?;
-                    let gpu_s = gpu_seconds(cb);
+                    // Pass 0 faults in memory-mapped weight pages and warms caches; pass 1 is timed.
+                    let mut gpu_s = 0.0;
+                    for _ in 0..2 {
+                        let cb = self.rt.queue.new_command_buffer();
+                        let enc = cb.new_compute_command_encoder();
+                        self.encode(enc, s, s_idx, &params_buf, &loc)?;
+                        enc.end_encoding();
+                        commit_and_wait(cb)?;
+                        gpu_s = gpu_seconds(cb);
+                    }
                     let bytes: u64 = s
                         .reads
                         .iter()
@@ -1896,6 +1900,25 @@ impl Session {
                     "{:<20} | {:<25} | {:>8} | {:>8} | {:>8} | {:>8}",
                     "step", "kernel", "µs", "bytes", "GB/s", "% ceiling"
                 );
+                let mut by_kind: HashMap<String, (usize, f64, u64)> = HashMap::new();
+                for (_, op_desc, s, bytes) in &timings {
+                    let kind = op_desc.split([' ', '{']).next().unwrap_or("?").to_string();
+                    let e = by_kind.entry(kind).or_default();
+                    e.0 += 1;
+                    e.1 += s;
+                    e.2 += bytes;
+                }
+                let mut kinds: Vec<_> = by_kind.into_iter().collect();
+                kinds.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+                eprintln!("by kernel kind: kind | steps | total µs | GB/s | % ceiling");
+                for (kind, (n, s, bytes)) in kinds.iter().take(8) {
+                    let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
+                    eprintln!(
+                        "  {kind:<22} {n:>4} {:>9.0} {gbps:>7.1} {:>6.1}%",
+                        s * 1e6,
+                        gbps / ceiling * 100.0
+                    );
+                }
                 for (name, op_desc, s, bytes) in timings.iter().take(10) {
                     let us = s * 1e6;
                     let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
@@ -5073,6 +5096,48 @@ mod tests {
             let err = rel_err(&want, &got);
             assert!(err < 1e-4, "{f:?}: generated GEMV differs from CPU by {err}");
             println!("generated gemv {f:?}: rel err {err:.2e}");
+        }
+    }
+
+    /// Generated-GEMV bandwidth at lm_head-like shapes (`cargo test --release -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn generated_gemv_bandwidth() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        for f in [QuantFormat::GGUF_TQ2_0, QuantFormat::GGUF_Q6_K, QuantFormat::GGUF_Q5_K_M] {
+            let (be, bb, _) = gguf_block_codec(f).unwrap();
+            for (n, k) in [(262144usize, 1536usize), (262144, 2560), (14336, 4096)] {
+                let raw = vec![0u8; n * (k / be) * bb];
+                let bytes = raw.len();
+                let mut g = Graph::new();
+                let x = g.input("x", vec![1, k], DType::F32);
+                let wv = g.weight("w", vec![n, k], DType::Quant(f));
+                let y = g.add("lin", Op::Linear, &[x, wv], vec![1, n], DType::F32);
+                g.output(y);
+                let mut w = Weights::new();
+                w.insert(
+                    "w",
+                    Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                        format: f,
+                        raw_data: raw.into(),
+                        in_features: k,
+                        out_features: n,
+                    })),
+                );
+                let s = Session::new(rt(), &w).unwrap();
+                let xs = Tensor::F32(vec![0.5; k]);
+                s.run(&g, vec![xs.clone()]).unwrap();
+                let t = Instant::now();
+                for _ in 0..20 {
+                    s.run(&g, vec![xs.clone()]).unwrap();
+                }
+                let dt = t.elapsed().as_secs_f64() / 20.0;
+                println!(
+                    "{f:?} {n}x{k}: {:.0} us, {:.1} GB/s",
+                    dt * 1e6,
+                    bytes as f64 / dt / 1e9
+                );
+            }
         }
     }
 
