@@ -206,8 +206,14 @@ impl EngineTelemetry {
         *self.hardware_bandwidth_gbps.write() = bandwidth_gbps;
     }
 
+    pub fn set_bytes_per_token(&self, bytes: u64) {
+        self.model_size_bytes.store(bytes, Ordering::Relaxed);
+    }
     pub fn set_model_size_bytes(&self, bytes: u64) {
         self.model_size_bytes.store(bytes, Ordering::Relaxed);
+    }
+    pub fn bytes_per_token(&self) -> u64 {
+        self.model_size_bytes.load(Ordering::Relaxed)
     }
     pub fn model_size_bytes(&self) -> u64 {
         self.model_size_bytes.load(Ordering::Relaxed)
@@ -228,7 +234,17 @@ impl EngineTelemetry {
             0.0
         };
         let roofline_pct = if bw > 0.0 && effective_bandwidth_gbps > 0.0 {
-            (effective_bandwidth_gbps / bw * 100.0).min(100.0)
+            let pct = effective_bandwidth_gbps / bw * 100.0;
+            if pct > 100.5 {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "roofline > 100%: ceiling {bw:.1} GB/s is below the achieved {effective_bandwidth_gbps:.1} GB/s; re-run the host profile"
+                    );
+                }
+            }
+            pct
         } else {
             0.0
         };

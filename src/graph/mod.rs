@@ -7,6 +7,8 @@
 //! outside the graph in [`Weights`], so one graph can be fingerprinted or run.
 
 #[cfg(target_os = "macos")]
+pub mod codec;
+pub mod codegen;
 pub mod coreml;
 pub mod cpu;
 pub mod cuda;
@@ -69,11 +71,23 @@ pub struct Value {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairLayout {
+    Adjacent,
+    Half,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RopeVariant {
     /// Rotates adjacent pairs `(2i, 2i+1)`.
     Interleaved,
     /// Rotates `(i, i + rotary_dim/2)` (GPT-NeoX / Qwen layout).
     HalfSplit,
+    /// Multimodal RoPE with temporal, height, width sections.
+    MRope {
+        sections: [u32; 3],
+        interleaved: bool,
+        pairs: PairLayout,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,11 +191,12 @@ pub enum Op {
         eps: f32,
     },
     /// `[x [n, heads*head_dim], positions [n] (U32)]`; rotates the first `rotary_dim` of each head.
+    /// `[x [n, heads*head_dim], positions, inv_freq [rotary_dim/2] F32 weight]`.
     Rope {
         head_dim: usize,
         rotary_dim: usize,
-        base: f32,
         variant: RopeVariant,
+        mscale: f32,
     },
     /// `[q [nq, heads*d], k [nk, kv_heads*d], v [nk, kv_heads*d]]` → `[nq, heads*d]`, with `d` taken
     /// from `q`'s shape. Cross-attention is this op with `k`/`v` from another sequence.
@@ -284,6 +299,15 @@ pub enum Op {
         axis: isize,
         k: usize,
     },
+    /// `[table [buckets, heads], q_pos [n] U32, k_pos [m] U32]` → `[heads, n, m]`.
+    RelPosBias {
+        buckets: usize,
+        max_distance: usize,
+        bidirectional: bool,
+        heads: usize,
+    },
+    /// `[state, parent [batch] U32]` permuting batch rows in-place.
+    StateReorder,
     /// `[a, b]` element-wise.
     Add,
     /// `[a, b]` element-wise.
@@ -359,6 +383,8 @@ impl Op {
             Op::Relu => "Relu",
             Op::Softmax { .. } => "Softmax",
             Op::TopKSoftmax { .. } => "TopKSoftmax",
+            Op::RelPosBias { .. } => "RelPosBias",
+            Op::StateReorder => "StateReorder",
             Op::Add => "Add",
             Op::Mul => "Mul",
             Op::Conv2d { .. } => "Conv2d",
@@ -591,6 +617,27 @@ impl StateStore {
 
     pub fn insert(&mut self, name: impl Into<String>, t: Tensor) {
         self.buffers.insert(name.into(), t);
+    }
+
+    pub fn truncate(&mut self, _pos: usize) -> Result<(), String> {
+        // No-op for full KV
+        Ok(())
+    }
+
+    pub fn snapshot(&self, names: &[&str]) -> HashMap<String, Tensor> {
+        let mut snap = HashMap::new();
+        for &name in names {
+            if let Some(t) = self.buffers.get(name) {
+                snap.insert(name.to_string(), t.clone());
+            }
+        }
+        snap
+    }
+
+    pub fn restore(&mut self, snapshot: HashMap<String, Tensor>) {
+        for (name, t) in snapshot {
+            self.buffers.insert(name, t);
+        }
     }
 
     #[cfg(target_os = "macos")]

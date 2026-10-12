@@ -77,6 +77,7 @@ pub fn fingerprint_graph(graph: &Graph) -> ArchitectureFingerprint {
                 rope_variant = match variant {
                     RopeVariant::Interleaved => "interleaved",
                     RopeVariant::HalfSplit => "half_split",
+                    RopeVariant::MRope { .. } => "mrope",
                 }
                 .to_string();
                 decoupled_rope |= rotary_dim < head_dim;
@@ -347,8 +348,8 @@ mod tests {
         Op::Rope {
             head_dim,
             rotary_dim,
-            base: 10000.0,
             variant,
+            mscale: 1.0,
         }
     }
 

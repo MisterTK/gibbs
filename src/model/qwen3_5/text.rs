@@ -1613,15 +1613,18 @@ impl TextModel {
                         (q, k_raw)
                     };
 
+                    let inv_freq_name = "rope.inv_freq.default";
+                    let inv_freq_val = g.weight(inv_freq_name, vec![self.inv_freq.len()], DType::F32);
+                    w.insert(inv_freq_name.to_string(), Tensor::F32(self.inv_freq.clone()));
                     let mut q_rope = g.add(
                         format!("{p}.self_attn.q_rope"),
                         Op::Rope {
                             head_dim: self.head_dim,
                             rotary_dim: 2 * self.inv_freq.len(),
-                            base: self.rope_theta,
                             variant: RopeVariant::HalfSplit,
+                            mscale: 1.0,
                         },
-                        &[q_rope_in, positions],
+                        &[q_rope_in, positions, inv_freq_val],
                         vec![n, self.heads * self.head_dim],
                         DType::F32,
                     );
@@ -1630,10 +1633,10 @@ impl TextModel {
                         Op::Rope {
                             head_dim: self.head_dim,
                             rotary_dim: 2 * self.inv_freq.len(),
-                            base: self.rope_theta,
                             variant: RopeVariant::HalfSplit,
+                            mscale: 1.0,
                         },
-                        &[k_rope_in, positions],
+                        &[k_rope_in, positions, inv_freq_val],
                         vec![n, self.kv_heads * self.head_dim],
                         DType::F32,
                     );

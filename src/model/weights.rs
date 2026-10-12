@@ -429,16 +429,18 @@ impl Weights {
             };
             let shape: Vec<usize> = t.shape.iter().rev().copied().collect();
             let can_pack = (shape.len() == 2 || hf.contains(".mlp.experts."))
-                && matches!(
-                    t.quant_format,
-                    crate::hardware::QuantFormat::GGUF_Q4_0
-                        | crate::hardware::QuantFormat::GGUF_Q8_0
-                        | crate::hardware::QuantFormat::GGUF_IQ4_XS
-                        | crate::hardware::QuantFormat::GGUF_IQ2_S
-                        | crate::hardware::QuantFormat::GGUF_Q4_K_M
-                        | crate::hardware::QuantFormat::GGUF_Q2_K
-                        | crate::hardware::QuantFormat::GGUF_IQ3_S
-                )
+                && (crate::graph::codec::codec(t.quant_format).is_some()
+                    || matches!(
+                        t.quant_format,
+                        crate::hardware::QuantFormat::GGUF_Q4_0
+                            | crate::hardware::QuantFormat::GGUF_Q8_0
+                            | crate::hardware::QuantFormat::GGUF_IQ4_XS
+                            | crate::hardware::QuantFormat::GGUF_IQ2_S
+                            | crate::hardware::QuantFormat::GGUF_Q4_K_M
+                            | crate::hardware::QuantFormat::GGUF_Q2_K
+                            | crate::hardware::QuantFormat::GGUF_IQ3_S
+                            | crate::hardware::QuantFormat::GGUF_TQ2_0
+                    ))
                 && !should_transform(&hf);
 
             if can_pack {

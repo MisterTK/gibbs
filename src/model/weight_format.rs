@@ -19,6 +19,56 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Quality floor: largest mean KL divergence (nats) of a format's next-token distribution from
 /// the f32 one over the probe. Roughly where 6-bit block formats land; 4-bit ones exceed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReencodePolicy {
+    MaxSpeed,
+    LowBitNative,
+    BitExact,
+}
+
+impl Default for ReencodePolicy {
+    fn default() -> Self {
+        Self::MaxSpeed
+    }
+}
+
+impl std::str::FromStr for ReencodePolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "max-speed" | "maxspeed" | "speed" => Ok(Self::MaxSpeed),
+            "low-bit-native" | "lowbitnative" | "lowbit" => Ok(Self::LowBitNative),
+            "bit-exact" | "bitexact" | "exact" => Ok(Self::BitExact),
+            _ => Err(format!("unknown reencode policy '{s}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VariantPolicy {
+    Fastest,
+    Fastest4Bit,
+    BestQuality,
+}
+
+impl Default for VariantPolicy {
+    fn default() -> Self {
+        Self::Fastest
+    }
+}
+
+impl std::str::FromStr for VariantPolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fastest" | "fast" => Ok(Self::Fastest),
+            "fastest-4bit" | "fastest4bit" => Ok(Self::Fastest4Bit),
+            "best-quality" | "bestquality" | "quality" => Ok(Self::BestQuality),
+            _ => Err(format!("unknown variant policy '{s}'")),
+        }
+    }
+}
+
 pub const MAX_MEAN_KL: f64 = 0.01;
 /// A format replaces the current pick only if it is this much faster; near-ties keep the more
 /// exact format.
@@ -536,6 +586,24 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+#[test]
+fn test_metal_load_path_no_host_weights_cache() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_host = temp_dir.path().join("host");
+    std::fs::create_dir_all(&cache_host).unwrap();
+
+    // Check that no weights-*.json files are created under cache/host for Metal
+    let entries: Vec<_> = std::fs::read_dir(&cache_host)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("weights-"))
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "Metal path should not emit weights-*.json cache files"
+    );
+}
+
     use crate::model::graph_lm::GraphLmConfig;
 
     /// The quality floor on real weights: f16 and Q8_0 pass it, 4-bit NVFP4 and the LUT do not.

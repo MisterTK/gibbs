@@ -668,3 +668,83 @@ mod tests {
         }
     }
 }
+
+/// Fuses QKV slices and RoPE directly into CachedAttention, eliminating intermediate Slice and RoPE nodes.
+pub fn fuse_qkv_slices_and_attn_pass(graph: &mut Graph) -> usize {
+    let mut rewrites = 0;
+    let mut eliminated_nodes: std::collections::HashSet<crate::graph::NodeId> =
+        std::collections::HashSet::new();
+
+    let mut val_producers: std::collections::HashMap<crate::graph::ValueId, crate::graph::NodeId> =
+        std::collections::HashMap::new();
+    for (idx, node) in graph.nodes.iter().enumerate() {
+        for &out in &node.outputs {
+            val_producers.insert(out, crate::graph::NodeId(idx as u32));
+        }
+    }
+
+    let n_nodes = graph.nodes.len();
+    for i in 0..n_nodes {
+        let nid = crate::graph::NodeId(i as u32);
+        let node = graph.node(nid);
+        if let crate::graph::Op::CachedAttention { .. } = &node.op {
+            if node.inputs.len() >= 3 {
+                let q_val = node.inputs[0];
+                let k_val = node.inputs[1];
+                let v_val = node.inputs[2];
+
+                let q_rope_nid = val_producers.get(&q_val).copied();
+                let k_rope_nid = val_producers.get(&k_val).copied();
+
+                if let (Some(q_rnid), Some(k_rnid)) = (q_rope_nid, k_rope_nid) {
+                    let q_rnode = graph.node(q_rnid);
+                    let k_rnode = graph.node(k_rnid);
+                    if matches!(q_rnode.op, crate::graph::Op::Rope { .. })
+                        && matches!(k_rnode.op, crate::graph::Op::Rope { .. })
+                    {
+                        let q_unrot = q_rnode.inputs[0];
+                        let k_unrot = k_rnode.inputs[0];
+
+                        let q_slice_nid = val_producers.get(&q_unrot).copied();
+                        let k_slice_nid = val_producers.get(&k_unrot).copied();
+                        let v_slice_nid = val_producers.get(&v_val).copied();
+
+                        if let (Some(q_snid), Some(k_snid), Some(v_snid)) =
+                            (q_slice_nid, k_slice_nid, v_slice_nid)
+                        {
+                            let q_snode = graph.node(q_snid);
+                            let k_snode = graph.node(k_snid);
+                            let v_snode = graph.node(v_snid);
+
+                            if matches!(q_snode.op, crate::graph::Op::Slice { .. })
+                                && matches!(k_snode.op, crate::graph::Op::Slice { .. })
+                                && matches!(v_snode.op, crate::graph::Op::Slice { .. })
+                                && q_snode.inputs[0] == k_snode.inputs[0]
+                                && k_snode.inputs[0] == v_snode.inputs[0]
+                            {
+                                let fused_qkv_val = q_snode.inputs[0];
+
+                                let att_node = &mut graph.nodes[i];
+                                att_node.inputs[0] = fused_qkv_val;
+                                att_node.inputs[1] = fused_qkv_val;
+                                att_node.inputs[2] = fused_qkv_val;
+
+                                eliminated_nodes.insert(q_rnid);
+                                eliminated_nodes.insert(k_rnid);
+                                eliminated_nodes.insert(q_snid);
+                                eliminated_nodes.insert(k_snid);
+                                eliminated_nodes.insert(v_snid);
+                                rewrites += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if rewrites > 0 {
+        crate::graph::pattern::compact_graph_public(graph, &eliminated_nodes);
+    }
+    rewrites
+}

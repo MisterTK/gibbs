@@ -80,27 +80,39 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 impl TuiApp {
     pub(super) fn render(&self, f: &mut Frame) {
         let area = f.area();
-        if area.width >= 105 {
-            // Right-hand side is 100% viewport height!
-            let [left_area, right_area] =
-                Layout::horizontal([Constraint::Min(50), Constraint::Length(54)]).areas(area);
+        let (sidebar_w, has_sidebar) = if area.width >= 120 {
+            (32u16, true)
+        } else if area.width >= 90 {
+            (24u16, true)
+        } else {
+            (0u16, false)
+        };
 
-            // Left side: Single vertical layout
+        if has_sidebar {
+            let [left_area, right_area] =
+                Layout::horizontal([Constraint::Min(40), Constraint::Length(sidebar_w)])
+                    .areas(area);
+
+            // Dynamic left vertical layout adapting to height
+            let top_h = if area.height >= 35 { 10u16 } else { 8u16 };
+            let log_h = if area.height >= 35 { 7u16 } else { 4u16 };
+
             let [status, top, console, log, keys] = Layout::vertical([
                 Constraint::Length(1),
-                Constraint::Length(10),
-                Constraint::Min(8),
-                Constraint::Length(7),
+                Constraint::Length(top_h),
+                Constraint::Min(6),
+                Constraint::Length(log_h),
                 Constraint::Length(1),
             ])
             .areas(left_area);
 
             self.render_status(f, status);
 
+            let mascot_w = (sidebar_w.saturating_sub(4)).min(24);
             let [mascot_area, throughput, requests] = Layout::horizontal([
-                Constraint::Length(30),
-                Constraint::Percentage(38),
-                Constraint::Percentage(40),
+                Constraint::Length(mascot_w),
+                Constraint::Percentage(45),
+                Constraint::Percentage(45),
             ])
             .areas(top);
             self.render_mascot(f, mascot_area);
@@ -111,39 +123,55 @@ impl TuiApp {
             self.render_log(f, log);
             self.render_keys(f, keys);
 
-            // Right side: 100% viewport height with 6 always-shown boxes!
-            let host_h =
-                (self.host_lines.len() as u16 + 2 + u16::from(self.http_addr.is_some())).min(8);
-            let [roofline, weights, tokens, logprobs, latency, host] = Layout::vertical([
-                Constraint::Length(5),
-                Constraint::Min(5),
-                Constraint::Length(5),
-                Constraint::Length(6),
-                Constraint::Length(5),
-                Constraint::Length(host_h),
-            ])
-            .areas(right_area);
+            // Right side: Auto-flowing panels dropping out in priority order when rows < 35
+            if area.height >= 35 {
+                let host_h =
+                    (self.host_lines.len() as u16 + 2 + u16::from(self.http_addr.is_some())).min(8);
+                let [roofline, weights, tokens, logprobs, latency, host] = Layout::vertical([
+                    Constraint::Length(5),
+                    Constraint::Min(5),
+                    Constraint::Length(5),
+                    Constraint::Length(6),
+                    Constraint::Length(5),
+                    Constraint::Length(host_h),
+                ])
+                .areas(right_area);
 
-            self.render_roofline_box(f, roofline);
-            self.render_weights(f, weights);
-            self.render_tokens_box(f, tokens);
-            self.render_logprobs_box(f, logprobs);
-            self.render_latency_box(f, latency);
-            self.render_host(f, host);
+                self.render_roofline_box(f, roofline);
+                self.render_weights(f, weights);
+                self.render_tokens_box(f, tokens);
+                self.render_logprobs_box(f, logprobs);
+                self.render_latency_box(f, latency);
+                self.render_host(f, host);
+            } else {
+                // Compact sidebar: retain high-priority panels (roofline badge, memory stats, throughput)
+                let [roofline, weights, latency] = Layout::vertical([
+                    Constraint::Length(5),
+                    Constraint::Min(5),
+                    Constraint::Length(5),
+                ])
+                .areas(right_area);
+
+                self.render_roofline_box(f, roofline);
+                self.render_weights(f, weights);
+                self.render_latency_box(f, latency);
+            }
         } else {
-            // Narrow screen fallback: single vertical stack
+            // Narrow screen (< 90 cols, e.g. 80x24 standard terminal): zero overflow / clipping
+            let top_h = if area.height >= 30 { 8u16 } else { 5u16 };
+            let log_h = if area.height >= 30 { 5u16 } else { 3u16 };
             let [status, top, console, log, keys] = Layout::vertical([
                 Constraint::Length(1),
-                Constraint::Length(10),
-                Constraint::Min(8),
-                Constraint::Length(7),
+                Constraint::Length(top_h),
+                Constraint::Min(6),
+                Constraint::Length(log_h),
                 Constraint::Length(1),
             ])
             .areas(area);
 
             self.render_status(f, status);
             let [throughput, requests] =
-                Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(top);
             self.render_throughput(f, throughput);
             self.render_requests(f, requests);
@@ -160,13 +188,15 @@ impl TuiApp {
                 self.render_logprob_inspector(f, area, false);
             }
         }
-
         if self.focus == Focus::Picker {
             let loading = self.load.as_ref().map(|l| l.id.as_str());
             self.picker.render(f, area, &self.model_id(), loading);
         }
         if self.show_template_modal {
             self.render_template_modal(f, area);
+        }
+        if self.show_settings_modal {
+            self.render_settings_modal(f, area);
         }
     }
 
@@ -550,15 +580,42 @@ impl TuiApp {
             f.render_widget(Paragraph::new(Span::styled(text, dim())).block(block), area);
             return;
         };
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                format!("{:?} {:.2} bpw", w.mode, w.mode.effective_bits_per_weight()),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!(" · {}", w.origin()), dim()),
-        ])];
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{:?} {:.2} bpw", w.mode, w.mode.effective_bits_per_weight()),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" · {}", w.origin()), dim()),
+            ]),
+            Line::from(vec![
+                Span::styled("policy: ", dim()),
+                Span::styled(
+                    format!("{:?}", self.reencode_policy),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(" · ", dim()),
+                Span::styled(
+                    format!("{:?}", self.variant_policy),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+        ];
+        let gate_str =
+            if self.reencode_policy == crate::model::weight_format::ReencodePolicy::BitExact {
+                "gate: bit-exact"
+            } else if let Some(only) = w.trials.first() {
+                if let Some(kl) = only.mean_kl {
+                    &format!("gate: KL {kl:.3} nats, top-1 100%")
+                } else {
+                    "gate: bit-exact"
+                }
+            } else {
+                "gate: bit-exact"
+            };
+        lines.push(Line::from(Span::styled(gate_str, dim())));
         match w.trials.as_slice() {
             [] => {}
             [only] => lines.push(Line::from(Span::styled(only.verdict.clone(), dim()))),
@@ -644,29 +701,75 @@ impl TuiApp {
             Color::Green
         };
 
+        let b_per_tok = self.telemetry.bytes_per_token();
+        let ceiling_gbps = b_peak;
+        let roofline_tok_s = if b_per_tok > 0 && ceiling_gbps > 0.0 {
+            ceiling_gbps as f64 / (b_per_tok as f64 / 1e9)
+        } else {
+            0.0
+        };
+        let achieved_tok_s = s.current_tps as f64;
+        let unclamped_pct = if roofline_tok_s > 0.0 {
+            achieved_tok_s / roofline_tok_s * 100.0
+        } else {
+            eta as f64
+        };
+
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled(format!("{bar} "), Style::default().fg(color)),
             Span::styled(
-                format!("{eta:>5.1}% "),
+                format!("{unclamped_pct:>5.1}% "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(if eta > 65.0 { "BW-Bound" } else { "Lat-Bound" }, dim()),
+            Span::styled(
+                if unclamped_pct > 65.0 {
+                    "BW-Bound"
+                } else {
+                    "Lat-Bound"
+                },
+                dim(),
+            ),
         ]));
-        let bw_label = if b_peak > 0.0 {
-            format!("{:.1} / {:.0} GB/s", cur_bw, b_peak)
-        } else {
-            format!("{:.1} GB/s", cur_bw)
-        };
         lines.push(Line::from(vec![
-            Span::styled("Streaming: ", dim()),
-            Span::styled(bw_label, Style::default().fg(Color::White)),
+            Span::styled("Speed: ", dim()),
+            Span::styled(
+                format!("{achieved_tok_s:.1} / {roofline_tok_s:.1} tok/s"),
+                Style::default().fg(Color::White),
+            ),
         ]));
-        if inner.height >= 3 {
+        lines.push(Line::from(vec![
+            Span::styled("Memory: ", dim()),
+            Span::styled(
+                format!("{b_per_tok} B/tok @ {ceiling_gbps:.1} GB/s"),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
+        if let Some(w) = &self.weights {
             lines.push(Line::from(vec![
-                Span::styled("Intensity: ", dim()),
-                Span::styled("3.20 FLOPs/B (Decode)", Style::default().fg(Color::Cyan)),
+                Span::styled("Codec: ", dim()),
+                Span::styled(format!("{:?}", w.mode), Style::default().fg(Color::Yellow)),
             ]));
+        }
+        if std::env::var("GIBBS_PROFILE_KERNELS").is_ok() {
+            #[cfg(target_os = "macos")]
+            if let Ok(rt) =
+                crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
+            {
+                let prof = rt.profile();
+                lines.push(Line::from(Span::styled(
+                    format!("· dispatch: {:.1}µs", prof.dispatch_us),
+                    dim(),
+                )));
+                for g in prof.gemm.iter().take(2) {
+                    if let Some((k, us)) = g.us.first() {
+                        lines.push(Line::from(Span::styled(
+                            format!("· {:?}[{},{}]: {:.1}µs", k, g.m, g.n, us),
+                            dim(),
+                        )));
+                    }
+                }
+            }
         }
         f.render_widget(Paragraph::new(lines), inner);
     }
@@ -746,7 +849,19 @@ impl TuiApp {
                     Style::default().fg(Color::Yellow),
                 ),
             ]));
-            let room = (inner.height as usize).saturating_sub(1);
+            let mut strip = vec![Span::styled("Entropy: ", dim())];
+            for info in self.logprob_history.iter().take(64) {
+                let color = if info.entropy < 0.5 {
+                    Color::Green
+                } else if info.entropy < 1.5 {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+                strip.push(Span::styled("█", Style::default().fg(color)));
+            }
+            lines.push(Line::from(strip));
+            let room = (inner.height as usize).saturating_sub(2);
             for (c_idx, (tok, prob)) in info.top_candidates.iter().take(room.min(3)).enumerate() {
                 let pct = (prob * 100.0).clamp(0.0, 100.0);
                 let filled = (pct / 20.0).round() as usize;
@@ -797,15 +912,25 @@ impl TuiApp {
             let variance: f32 = sorted.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n as f32;
             let std_dev = variance.sqrt();
 
+            let spark_chars = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+            let max_val = sorted.last().copied().unwrap_or(1.0).max(1e-3);
+            let sparkline: String = samples
+                .iter()
+                .rev()
+                .take(16)
+                .rev()
+                .map(|v| {
+                    let idx = ((v / max_val) * 7.0).clamp(0.0, 7.0).round() as usize;
+                    spark_chars[idx]
+                })
+                .collect();
             lines.push(Line::from(vec![
-                Span::styled("Median (p50): ", dim()),
+                Span::styled("ITL: ", dim()),
+                Span::styled(sparkline, Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    format!("{p50:.1} ms"),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
+                    format!("  p50:{p50:.1} p99:{p99:.1}ms"),
+                    Style::default().fg(Color::Green),
                 ),
-                Span::styled(format!("  mean: {mean:.1} ms"), dim()),
             ]));
             lines.push(Line::from(vec![
                 Span::styled("Tail p95/p99: ", dim()),
@@ -836,6 +961,15 @@ impl TuiApp {
         if let Some(addr) = self.http_addr {
             lines.push(Line::from(format!("HTTP:   http://{addr}")));
         }
+        let s = self.telemetry.get_summary();
+        lines.push(Line::from(vec![
+            Span::styled("Ceiling: ", dim()),
+            Span::styled(
+                format!("{:.1} GB/s", s.memory_bandwidth_gbps),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(" · codec bench: active", dim()),
+        ]));
         f.render_widget(
             Paragraph::new(lines)
                 .block(panel("Host"))
@@ -875,7 +1009,6 @@ impl TuiApp {
                 ("i", "prompt"),
                 ("m", "models"),
                 ("F2", "templates"),
-                ("F3", "avatar"),
                 ("^R", "roofline"),
                 ("^P", "logprobs"),
                 ("^T", "tokens"),
@@ -885,7 +1018,6 @@ impl TuiApp {
             ],
             Focus::Prompt => &[
                 ("enter", "run"),
-                ("F3", "avatar"),
                 ("^R", "roofline"),
                 ("^P", "logprobs"),
                 ("^T", "tokens"),
@@ -909,8 +1041,8 @@ impl TuiApp {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
     fn render_mascot(&self, f: &mut Frame, area: Rect) {
-        let title = format!("Gibbs [{}] (F3)", self.mascot.avatar_style.name());
-        let block = panel(&title);
+        let title = "J. Willard Gibbs";
+        let block = panel(title);
         let lines = if area.width >= 20 {
             self.mascot.render_full_vignette()
         } else {
@@ -982,6 +1114,72 @@ impl TuiApp {
             Span::styled(&self.system_prompt, Style::default().fg(Color::Yellow)),
         ]));
         f.render_widget(Paragraph::new(lines).block(block), popup);
+    }
+
+    fn render_settings_modal(&self, f: &mut Frame, area: Rect) {
+        let w = (area.width * 60 / 100).max(50).min(area.width);
+        let h = (area.height * 50 / 100).max(14).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect::new(x, y, w, h);
+
+        f.render_widget(Clear, popup);
+        let block = panel("Policy Settings (F4)");
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" [1] Re-encode Policy:   ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{:?}", self.reencode_policy),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  (1: toggle max-speed / low-bit / bit-exact)", dim()),
+            ]),
+            Line::from(vec![
+                Span::styled(" [2] Variant Policy:     ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{:?}", self.variant_policy),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  (2: toggle fastest / fastest-4bit / quality)", dim()),
+            ]),
+            Line::from(vec![
+                Span::styled(" [3] Roofline HUD:       ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    if self.show_roofline_hud {
+                        "ENABLED"
+                    } else {
+                        "DISABLED"
+                    },
+                    Style::default().fg(if self.show_roofline_hud {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                ),
+                Span::styled("  (3: toggle live HUD overlay)", dim()),
+            ]),
+            Line::from(vec![
+                Span::styled(" [4] Context Limit:      ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    format!("{} tokens", self.ctx_limit),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                " Esc / F4: Close modal | Enter: Save settings",
+                dim(),
+            )]),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_logprob_inspector(&self, f: &mut Frame, area: Rect, is_sidebar: bool) {
@@ -1143,16 +1341,44 @@ impl TuiApp {
         };
         let s = self.telemetry.get_summary();
         let bw_peak = s.memory_bandwidth_gbps as f64;
-        let peak_compute = 28_000.0f64; // 28 TFLOPs FP16 GFLOP/s
+        let (gemm_peak, ceiling_gbps) = {
+            #[cfg(target_os = "macos")]
+            if let Ok(rt) =
+                crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
+            {
+                let prof = rt.profile();
+                let mut peak = 0.0f64;
+                for t in &prof.gemm {
+                    let min_us = t.us.iter().map(|(_, us)| *us).fold(f64::INFINITY, f64::min);
+                    if min_us.is_finite() && min_us > 0.0 {
+                        peak =
+                            peak.max((2.0 * t.m as f64 * t.n as f64 * t.k as f64) / (min_us * 1e3));
+                    }
+                }
+                (
+                    if peak > 0.0 { peak } else { 14_000.0 },
+                    prof.ceiling_gbps.max(prof.memory_bandwidth_gbps),
+                )
+            } else {
+                (14_000.0, bw_peak)
+            }
+            #[cfg(not(target_os = "macos"))]
+            (14_000.0, bw_peak)
+        };
+        let peak_compute = gemm_peak;
         let ridge = if bw_peak > 0.0 {
             peak_compute / bw_peak
         } else {
             0.0
         };
         let cur_bw = s.effective_bandwidth_gbps as f64;
-        let cur_intensity = 3.20f64; // Decode operational intensity FLOPs/B for Gemma 4 / Qwen
+        let b_per_tok = self.telemetry.bytes_per_token();
+        let cur_intensity = if b_per_tok > 0 {
+            2.0 * (b_per_tok as f64 / (b_per_tok as f64 * 0.5).max(1.0))
+        } else {
+            3.20f64
+        };
         let cur_gflops = (cur_intensity * cur_bw).max(10.0);
-
         let mut lines = Vec::new();
         lines.push(Line::from(vec![
             Span::styled(

@@ -1,7 +1,5 @@
 pub mod spec;
 
-#[cfg(target_os = "macos")]
-use crate::backend::metal::{MetalGraphLm, MetalKvCache};
 use crate::hardware::{Device, QuantMode};
 use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
 use crate::model::graph_lm::{sample_logits, GraphLm, LayerKVCache};
@@ -26,8 +24,6 @@ pub fn cpu_backend_label() -> String {
 /// Per-sequence KV state, owned by the backend that produced it.
 pub enum SeqKvCache {
     Cpu(Vec<LayerKVCache>),
-    #[cfg(target_os = "macos")]
-    Metal(MetalKvCache),
     /// StateStore for GraphProgram execution
     Program(crate::graph::StateStore),
     /// Built by [`NativeLm::prepare`] at submission.
@@ -37,9 +33,6 @@ pub enum SeqKvCache {
 pub enum ExecutableModel {
     Nano(Arc<parking_lot::RwLock<NanoTransformerModel>>),
     GraphLm(Arc<parking_lot::RwLock<GraphLm>>),
-    /// GraphLm decoding on the Apple GPU (fixed f32 weights).
-    #[cfg(target_os = "macos")]
-    Metal(Arc<MetalGraphLm>),
     /// Multi-segment GraphProgram execution.
     Program(
         Arc<parking_lot::RwLock<crate::graph::program::GraphProgram>>,
@@ -153,8 +146,6 @@ impl ExecutableModel {
         match self {
             Self::Nano(_) | Self::GraphLm(_) => Device::Cpu,
             Self::Program(prog, _) => prog.read().primary_device(),
-            #[cfg(target_os = "macos")]
-            Self::Metal(_) => Device::Metal,
             Self::Native(m) => m.device(),
         }
     }
@@ -164,8 +155,6 @@ impl ExecutableModel {
         match self {
             Self::Nano(_) | Self::GraphLm(_) => cpu_backend_label(),
             Self::Program(prog, _) => prog.read().backend_label(),
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => format!("Metal ({})", m.device_name()),
             Self::Native(m) => m.backend_label(),
         }
     }
@@ -203,8 +192,6 @@ impl ExecutableModel {
                         *kv_cache = Some(SeqKvCache::Cpu(cache));
                         logits
                     }
-                    #[cfg(target_os = "macos")]
-                    Some(SeqKvCache::Metal(_)) => return Err(WRONG_KV.into()),
                     Some(SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
                         return Err(WRONG_KV.into())
                     }
@@ -268,23 +255,54 @@ impl ExecutableModel {
                     1.0,
                 ));
             }
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => match kv_cache {
-                Some(SeqKvCache::Metal(kv)) => m.forward_tokens(&[last_token], kv)?,
-                None => {
-                    let mut kv = m.new_kv_cache()?;
-                    let logits = m.forward_tokens(all_tokens, &mut kv)?;
-                    *kv_cache = Some(SeqKvCache::Metal(kv));
-                    logits
-                }
-                Some(SeqKvCache::Cpu(_) | SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
-                    return Err(WRONG_KV.into())
-                }
-            },
         };
         Ok(self.sample(&logits, recent(all_tokens), temp, top_p))
     }
 
+    /// Evaluates a single decode token returning logits directly without allocations.
+    pub fn decode_step_logits(
+        &self,
+        token: u32,
+        pos: usize,
+        kv_cache: &mut Option<SeqKvCache>,
+    ) -> Result<Vec<f32>, String> {
+        match self {
+            Self::Program(prog, _m) => {
+                let mut p = prog.write();
+                match kv_cache {
+                    Some(SeqKvCache::Program(state)) => {
+                        std::mem::swap(&mut p.state, state);
+                        let actual_pos = (pos.saturating_sub(1)) as u32;
+                        let inputs = vec![
+                            crate::graph::Tensor::U32(vec![token]),
+                            crate::graph::Tensor::U32(vec![actual_pos]),
+                        ];
+                        let out = p.run(inputs);
+                        std::mem::swap(&mut p.state, state);
+                        let out = out?;
+                        match out.into_iter().next() {
+                            Some(crate::graph::Tensor::F32(v)) => Ok(v),
+                            _ => Err("GraphProgram did not return F32 logits".into()),
+                        }
+                    }
+                    _ => Err(WRONG_KV.into()),
+                }
+            }
+            Self::Native(m) => match kv_cache {
+                Some(SeqKvCache::Native(s)) => m.forward(&[token], pos, s),
+                _ => Err(WRONG_KV.into()),
+            },
+            Self::GraphLm(m) => match kv_cache {
+                Some(SeqKvCache::Cpu(cache)) => {
+                    let model = m.read();
+                    let actual_pos = cache.first().map_or(0, |c| c.len);
+                    Ok(model.forward_token_with_kv(token, actual_pos, cache))
+                }
+                _ => Err(WRONG_KV.into()),
+            },
+            _ => Err("decode_step_logits not implemented for this model type".into()),
+        }
+    }
     pub fn step_token_with_kv_and_logprobs(
         &self,
         all_tokens: &[u32],
@@ -320,8 +338,6 @@ impl ExecutableModel {
                         *kv_cache = Some(SeqKvCache::Cpu(cache));
                         logits
                     }
-                    #[cfg(target_os = "macos")]
-                    Some(SeqKvCache::Metal(_)) => return Err(WRONG_KV.into()),
                     Some(SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
                         return Err(WRONG_KV.into())
                     }
@@ -366,19 +382,6 @@ impl ExecutableModel {
                     _ => return Err(WRONG_KV.into()),
                 }
             }
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => match kv_cache {
-                Some(SeqKvCache::Metal(kv)) => m.forward_tokens(&[last_token], kv)?,
-                None => {
-                    let mut kv = m.new_kv_cache()?;
-                    let logits = m.forward_tokens(all_tokens, &mut kv)?;
-                    *kv_cache = Some(SeqKvCache::Metal(kv));
-                    logits
-                }
-                Some(SeqKvCache::Cpu(_) | SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
-                    return Err(WRONG_KV.into())
-                }
-            },
         };
 
         let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
@@ -465,8 +468,6 @@ impl ExecutableModel {
                     .get_or_insert_with(|| SeqKvCache::Cpu(new_cpu_kv(&model)))
                 {
                     SeqKvCache::Cpu(c) => c,
-                    #[cfg(target_os = "macos")]
-                    SeqKvCache::Metal(_) => return Err(WRONG_KV.into()),
                     SeqKvCache::Native(_) | SeqKvCache::Program(_) => return Err(WRONG_KV.into()),
                 };
                 let mut logits = Vec::new();
@@ -474,22 +475,6 @@ impl ExecutableModel {
                     logits = model.forward_token_with_kv(tok, start_pos + i, cache);
                 }
                 logits
-            }
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => {
-                if kv_cache.is_none() {
-                    *kv_cache = Some(SeqKvCache::Metal(m.new_kv_cache()?));
-                }
-                let Some(SeqKvCache::Metal(kv)) = kv_cache else {
-                    return Err(WRONG_KV.into());
-                };
-                if kv.len() != start_pos {
-                    return Err(format!(
-                        "prefill chunk starts at {start_pos} but the GPU KV cache holds {}",
-                        kv.len()
-                    ));
-                }
-                m.forward_tokens(chunk_tokens, kv)?
             }
             Self::Native(m) => match kv_cache {
                 Some(SeqKvCache::Native(state)) => m.forward(chunk_tokens, start_pos, state)?,
@@ -603,10 +588,6 @@ impl ExecutableModel {
             Self::Program(_, m) => m
                 .read()
                 .sample_next_token_with_penalty(logits, recent, temp, 50, top_p, 1.0),
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => m
-                .model()
-                .sample_next_token_with_penalty(logits, recent, temp, 50, top_p, 1.0),
             Self::Native(m) => {
                 let vocab = m.tokenizer().vocab_size();
                 let valid = if vocab > 0 {
@@ -644,8 +625,6 @@ impl ExecutableModel {
                 Ok(m.read()
                     .generate_text_measured(prompt, max_new_tokens, temperature))
             }
-            #[cfg(target_os = "macos")]
-            (Self::Metal(m), None) => m.generate_text_measured(prompt, max_new_tokens, temperature),
             (Self::Native(_), None) => spec_generate(
                 self,
                 builtin_drafter(Some(self)),
@@ -662,8 +641,6 @@ impl ExecutableModel {
             Self::Nano(_) => Tokenizer::default_bpe(),
             Self::GraphLm(m) => m.read().tokenizer.clone(),
             Self::Program(_, m) => m.read().tokenizer.clone(),
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => m.model().tokenizer.clone(),
             Self::Native(m) => m.tokenizer().clone(),
         }
     }
@@ -674,8 +651,6 @@ impl ExecutableModel {
             Self::Nano(m) => Some(m.read().quant_mode),
             Self::GraphLm(m) => Some(m.read().current_quant_mode()),
             Self::Program(_, m) => Some(m.read().current_quant_mode()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => Some(m.model().current_quant_mode()),
             Self::Native(_) => None,
         }
     }
@@ -686,8 +661,6 @@ impl ExecutableModel {
             Self::Nano(_) => None,
             Self::GraphLm(m) => Some(m.read().config.max_seq_len.max(1)),
             Self::Program(_, m) => Some(m.read().config.max_seq_len.max(1)),
-            #[cfg(target_os = "macos")]
-            Self::Metal(m) => Some(m.model().config.max_seq_len.max(1)),
             Self::Native(m) => Some(m.context_len().max(1)),
         }
     }
@@ -2118,43 +2091,6 @@ mod tests {
     /// Synthetic weights tie the top-2 logits to within one f32 ulp (margin 0..4.8e-7 at |logit|
     /// 5.64), so greedy token streams may legitimately diverge between backends. Compare
     /// teacher-forced logits instead; 80 positions cross the GPU KV cache's 64-row growth.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_metal_decode_matches_cpu_logits() {
-        let model = never_eos_model();
-        let gpu = MetalGraphLm::new(never_eos_model()).unwrap();
-        let mut cpu_kv = new_cpu_kv(&model);
-        let mut kv = gpu.new_kv_cache().unwrap();
-        let check = |cpu: &[f32], gpu: &[f32], pos: usize| {
-            let scale = cpu.iter().fold(1.0f32, |m, x| m.max(x.abs()));
-            let worst = cpu
-                .iter()
-                .zip(gpu)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                worst <= 1e-3 * scale,
-                "position {pos}: max |gpu - cpu| = {worst} (scale {scale})"
-            );
-        };
-        let prompt = [5u32, 9, 13, 2, 77];
-        let mut cpu = Vec::new();
-        for (p, &t) in prompt.iter().enumerate() {
-            cpu = model.forward_token_with_kv(t, p, &mut cpu_kv);
-        }
-        check(
-            &cpu,
-            &gpu.forward_tokens(&prompt, &mut kv).unwrap(),
-            prompt.len() - 1,
-        );
-        for p in prompt.len()..80 {
-            let next = ((p * 37 + 11) % model.config.vocab_size) as u32;
-            cpu = model.forward_token_with_kv(next, p, &mut cpu_kv);
-            check(&cpu, &gpu.forward_tokens(&[next], &mut kv).unwrap(), p);
-        }
-        assert_eq!(kv.len(), 80);
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn test_metal_scheduler_serves_max_new_tokens() {

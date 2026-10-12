@@ -6,6 +6,7 @@
 
 mod audio;
 mod gguf;
+pub mod graph;
 pub(crate) mod ops;
 pub mod seqcls;
 mod text;

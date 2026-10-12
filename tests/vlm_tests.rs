@@ -145,3 +145,61 @@ fn smolvlm_describes_photos() {
         }
     }
 }
+
+#[test]
+fn test_vlm_metal_lowering_zero_cpu_segments() {
+    use gibbs_engine::graph::program::GraphProgram;
+    use gibbs_engine::graph::{DType, Graph, Op, Weights};
+    use gibbs_engine::hardware::{available_devices, Device, PlacementMode};
+
+    if !available_devices().contains(&Device::Metal) {
+        println!("SKIP: Metal not available");
+        return;
+    }
+
+    let mut g = Graph::new();
+    let mut w = Weights::new();
+
+    let pixels = g.input("pixels", vec![3, 14, 14], DType::F32);
+    let patch_w = g.weight("patch.weight", vec![16, 3, 14, 14], DType::F32);
+    let patch_b = g.weight("patch.bias", vec![16], DType::F32);
+    w.insert(
+        "patch.weight",
+        gibbs_engine::graph::Tensor::F32(vec![0.1; 16 * 3 * 14 * 14]),
+    );
+    w.insert(
+        "patch.bias",
+        gibbs_engine::graph::Tensor::F32(vec![0.0; 16]),
+    );
+
+    let conv = g.add(
+        "conv",
+        Op::Conv2d {
+            stride: [14, 14],
+            padding: [0, 0, 0, 0],
+            dilation: [1, 1],
+            groups: 1,
+        },
+        &[pixels, patch_w, patch_b],
+        vec![16, 1, 1],
+        DType::F32,
+    );
+
+    let gelu = g.add(
+        "act",
+        Op::Gelu { tanh: true },
+        &[conv],
+        vec![16, 1, 1],
+        DType::F32,
+    );
+    g.output(gelu);
+
+    let prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).expect("compile");
+    assert_eq!(
+        prog.segments.len(),
+        1,
+        "Expected single Metal segment, got {}",
+        prog.segments.len()
+    );
+    assert_eq!(prog.primary_device(), Device::Metal);
+}

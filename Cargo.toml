@@ -49,6 +49,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.12"
+libc = "0.2"
 
 # Apple GPU: MTLDevice, runtime MSL compilation, shared buffers (--backend metal)
 [target.'cfg(target_os = "macos")'.dependencies]

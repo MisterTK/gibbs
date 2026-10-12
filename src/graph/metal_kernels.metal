@@ -405,6 +405,43 @@ kernel void memory_sweep(device const ulong2* in [[buffer(0)]],
     }
 }
 
+// 2x ulong4 variant
+kernel void memory_sweep_ulong4(device const ulong4* in [[buffer(0)]],
+                                device atomic_uint* out [[buffer(1)]],
+                                constant uint& count [[buffer(2)]],
+                                uint tid [[thread_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    ulong4 s = 0;
+    uint idx = tid * 2;
+    if (idx + 1 < count) {
+        s += in[idx];
+        s += in[idx + 1];
+    }
+    uint acc = uint(s.x ^ s.y ^ s.z ^ s.w);
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        atomic_fetch_add_explicit(out, acc, memory_order_relaxed);
+    }
+}
+
+// Grid-stride 16 B/thread variant with 4 iterations per thread
+kernel void memory_sweep_grid_stride(device const ulong2* in [[buffer(0)]],
+                                     device atomic_uint* out [[buffer(1)]],
+                                     constant uint& count [[buffer(2)]],
+                                     uint tid [[thread_position_in_grid]],
+                                     uint grid_size [[threads_per_grid]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    ulong2 s = 0;
+    for (uint idx = tid; idx < count; idx += grid_size) {
+        s += in[idx];
+    }
+    uint acc = uint(s.x ^ s.y);
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        atomic_fetch_add_explicit(out, acc, memory_order_relaxed);
+    }
+}
+
 struct RmsNormParams { uint rows; uint d; float eps; };
 kernel void rmsnorm_f32(device const float* x [[buffer(0)]],
                         device const float* g [[buffer(1)]],
@@ -1666,14 +1703,15 @@ struct GraphRopeParams2 {
     uint pair_stride;
     uint pair_gap;
     uint rotary_dim;
-    float base;
+    float mscale;
     uint n_seq;
 };
 
 kernel void rope_general_f32(device const float* in [[buffer(0)]],
                              device float* out [[buffer(1)]],
                              device const uint* pos [[buffer(2)]],
-                             constant GraphRopeParams2& p [[buffer(3)]],
+                             device const float* inv_freq [[buffer(3)]],
+                             constant GraphRopeParams2& p [[buffer(4)]],
                              uint gid [[thread_position_in_grid]]) {
     uint total = p.n_seq * p.n_heads * p.head_dim;
     if (gid >= total) return;
@@ -1688,20 +1726,20 @@ kernel void rope_general_f32(device const float* in [[buffer(0)]],
     if (d < p.rotary_dim) {
         if (p.pair_stride == 2) {
             uint pair_idx = d / 2;
-            float freq = 1.0f / pow(p.base, float(2 * pair_idx) / float(p.rotary_dim));
+            float freq = inv_freq[pair_idx];
             float theta = float(pos[seq]) * freq;
-            float cos_th = cos(theta);
-            float sin_th = sin(theta);
+            float cos_th = cos(theta) * p.mscale;
+            float sin_th = sin(theta) * p.mscale;
             float a = in_h[pair_idx * 2];
             float b = in_h[pair_idx * 2 + 1];
             out_h[d] = (d % 2 == 0) ? (a * cos_th - b * sin_th) : (b * cos_th + a * sin_th);
         } else {
             uint half_dim = p.rotary_dim / 2;
             if (d < half_dim) {
-                float freq = 1.0f / pow(p.base, float(2 * d) / float(p.rotary_dim));
+                float freq = inv_freq[d];
                 float theta = float(pos[seq]) * freq;
-                float cos_th = cos(theta);
-                float sin_th = sin(theta);
+                float cos_th = cos(theta) * p.mscale;
+                float sin_th = sin(theta) * p.mscale;
                 float a = in_h[d];
                 float b = in_h[d + half_dim];
                 out_h[d] = a * cos_th - b * sin_th;
@@ -1779,7 +1817,7 @@ inline void attn_cached_f32_impl(device const float* q,
     }
     float m = -FLT_MAX;
     float l = 0.0f;
-    uint lo = (p.window > 0 && cur_pos >= p.window) ? (cur_pos - p.window) : 0;
+    uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
     for (uint t = lo + sg; t < len; t += nsg) {
         device const float* k = kc + (ulong)t * p.stride + kv_off;
         device const float* v = vc + (ulong)t * p.stride + kv_off;
@@ -1900,7 +1938,7 @@ kernel void paged_attn_cached_f32(device const float* q [[buffer(0)]],
     }
     float m = -FLT_MAX;
     float l = 0.0f;
-    uint lo = (p.window > 0 && cur_pos >= p.window) ? (cur_pos - p.window) : 0;
+    uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
     for (uint t = lo + sg; t < len; t += nsg) {
         uint blk_id = block_table[(ulong)q_tok * p.max_blocks_per_seq + (t / p.tokens_per_block)];
         uint blk_offset = t % p.tokens_per_block;
@@ -2290,4 +2328,61 @@ kernel void gemv_jesse_lut(
         accum += (int)lut_tables[lut_out_offset + (ulong)lut_idx * lut_size + addr];
     }
     y[gid] = float(accum);
+}
+
+static inline float gelu_tanh(float x) {
+    return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+}
+
+kernel void gelu_tanh_f32(device const float* x [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant uint& n [[buffer(2)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i < n) out[i] = gelu_tanh(x[i]);
+}
+
+struct Conv2dParams {
+    uint in_channels;
+    uint in_h;
+    uint in_w;
+    uint out_channels;
+    uint kernel_size;
+    uint stride;
+    uint out_h;
+    uint out_w;
+    uint has_bias;
+};
+
+kernel void conv2d_f32(device const float* in [[buffer(0)]],
+                       device const float* weights [[buffer(1)]],
+                       device const float* bias [[buffer(2)]],
+                       device float* out [[buffer(3)]],
+                       constant Conv2dParams& p [[buffer(4)]],
+                       uint gid [[thread_position_in_grid]]) {
+    uint total = p.out_channels * p.out_h * p.out_w;
+    if (gid >= total) return;
+
+    uint ow = gid % p.out_w;
+    uint rem = gid / p.out_w;
+    uint oh = rem % p.out_h;
+    uint oc = rem / p.out_h;
+
+    float sum = p.has_bias ? bias[oc] : 0.0f;
+    uint ih_base = oh * p.stride;
+    uint iw_base = ow * p.stride;
+
+    for (uint ic = 0; ic < p.in_channels; ic++) {
+        for (uint kh = 0; kh < p.kernel_size; kh++) {
+            for (uint kw = 0; kw < p.kernel_size; kw++) {
+                uint ih = ih_base + kh;
+                uint iw = iw_base + kw;
+                if (ih < p.in_h && iw < p.in_w) {
+                    float val = in[(ic * p.in_h + ih) * p.in_w + iw];
+                    float w_val = weights[((oc * p.in_channels + ic) * p.kernel_size + kh) * p.kernel_size + kw];
+                    sum += val * w_val;
+                }
+            }
+        }
+    }
+    out[gid] = sum;
 }

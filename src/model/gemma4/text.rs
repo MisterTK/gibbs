@@ -715,20 +715,22 @@ impl TextModel {
             );
 
             // Q RoPE
-            let rotary_dim = if l.sliding {
-                self.inv_freq_sliding.iter().filter(|&&v| v > 0.0).count() * 2
+            let (rotary_dim, inv_freq_slice, inv_freq_name) = if l.sliding {
+                (self.inv_freq_sliding.iter().filter(|&&v| v > 0.0).count() * 2, &self.inv_freq_sliding, "rope.inv_freq.sliding")
             } else {
-                self.inv_freq_full.iter().filter(|&&v| v > 0.0).count() * 2
+                (self.inv_freq_full.iter().filter(|&&v| v > 0.0).count() * 2, &self.inv_freq_full, "rope.inv_freq.full")
             };
+            let inv_freq_val = g.weight(inv_freq_name, vec![rotary_dim / 2], DType::F32);
+            w.insert(inv_freq_name.to_string(), Tensor::F32(inv_freq_slice[..rotary_dim / 2].to_vec()));
             q = g.add(
                 format!("{p}.attn.q_rope"),
                 Op::Rope {
                     head_dim: l.head_dim,
                     rotary_dim,
-                    base: 10000.0,
                     variant: RopeVariant::HalfSplit,
+                    mscale: 1.0,
                 },
-                &[q, positions],
+                &[q, positions, inv_freq_val],
                 vec![n, l.attn.q.rows],
                 DType::F32,
             );
@@ -771,10 +773,10 @@ impl TextModel {
                     Op::Rope {
                         head_dim: l.head_dim,
                         rotary_dim,
-                        base: 10000.0,
                         variant: RopeVariant::HalfSplit,
+                        mscale: 1.0,
                     },
-                    &[k, positions],
+                    &[k, positions, inv_freq_val],
                     vec![n, kw.rows],
                     DType::F32,
                 );
