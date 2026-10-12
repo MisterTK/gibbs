@@ -3,6 +3,8 @@
 
 use crate::model::clip::Tensors;
 use crate::model::image::ImageBuffer;
+use crate::graph::{Op, UnaryKind};
+use crate::model::diff_graph::{ByShape, Gb, V};
 use crate::model::nn;
 
 const SCALE: f32 = 0.18215;
@@ -242,6 +244,68 @@ impl Tail {
     }
 }
 
+// Graph emission (Metal program). Each `emit` mirrors the `fwd` above on `[c, h, w]` values.
+impl Conv {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        b.conv2d(x, &self.w, Some(&self.b), self.c_out, self.k, 1, self.k / 2)
+    }
+}
+
+impl Norm {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        b.group_norm(x, &self.g, &self.b, GN_GROUPS, GN_EPS)
+    }
+}
+
+impl Resnet {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let t = self.norm1.emit(b, x);
+        let t = b.silu(t);
+        let t = self.conv1.emit(b, t);
+        let t = self.norm2.emit(b, t);
+        let t = b.silu(t);
+        let t = self.conv2.emit(b, t);
+        let skip = match &self.nin {
+            Some(c) => c.emit(b, x),
+            None => x,
+        };
+        b.add(t, skip)
+    }
+}
+
+impl Attn {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let s = b.shape(x).to_vec();
+        let (c, hw) = (s[0], s[1] * s[2]);
+        let hn = self.norm.emit(b, x);
+        let flat = b.reshape(hn, &[c, hw]);
+        let tok = b.transpose(flat, &[1, 0]);
+        let mut lin = |cv: &Conv, t: V| b.linear_f32(t, &cv.w, Some(&cv.b), cv.c_in, cv.c_out);
+        let (q, k, v) = (lin(&self.q, tok), lin(&self.k, tok), lin(&self.v, tok));
+        let a = b.attention(q, k, v, 1);
+        let o = b.linear_f32(a, &self.proj.w, Some(&self.proj.b), self.proj.c_in, self.proj.c_out);
+        let o = b.transpose(o, &[1, 0]);
+        let o = b.reshape(o, &s);
+        b.add(x, o)
+    }
+}
+
+impl Mid {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let x = self.b1.emit(b, x);
+        let x = self.attn.emit(b, x);
+        self.b2.emit(b, x)
+    }
+}
+
+impl Tail {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let t = self.norm_out.emit(b, x);
+        let t = b.silu(t);
+        self.conv_out.emit(b, t)
+    }
+}
+
 pub struct SdVae {
     /// Absent in SD3/FLUX VAEs (`use_quant_conv: false`).
     post_quant_conv: Option<Conv>,
@@ -257,6 +321,8 @@ pub struct SdVae {
     /// Model latents are `(z - shift) * scale`.
     scale: f32,
     shift: f32,
+    gpu_dec: ByShape,
+    gpu_enc: ByShape,
 }
 
 impl SdVae {
@@ -303,6 +369,8 @@ impl SdVae {
             },
             scale: SCALE,
             shift: 0.0,
+            gpu_dec: ByShape::default(),
+            gpu_enc: ByShape::default(),
         })
     }
 
@@ -319,12 +387,29 @@ impl SdVae {
         self.dec_in.c_in
     }
 
-    /// Scaled latents [C,h,w] -> RGB image of 8h x 8w.
+    /// Scaled latents [C,h,w] -> RGB image of 8h x 8w. On a GPU-only process (`--backend metal`) the
+    /// whole decoder runs as a Metal graph program built once per latent size.
     pub fn decode(&self, latents: &[f32], h: usize, w: usize) -> Result<ImageBuffer, String> {
+        let (x, oh, ow) = if crate::model::diff_graph::gpu_mode() {
+            self.decode_gpu(latents, h, w)?
+        } else {
+            self.decode_cpu(latents, h, w)?
+        };
+        Ok(to_image(&x, oh, ow))
+    }
+
+    fn check_latents(&self, latents: &[f32], h: usize, w: usize) -> Result<(), String> {
         let c = self.latent_channels();
         if latents.len() != c * h * w {
             return Err(format!("VAE decode: latents len {} != {c}x{h}x{w}", latents.len()));
         }
+        Ok(())
+    }
+
+    /// Native CPU decoder: pixels `[3, oh, ow]` (model range -1..1) and the output size.
+    pub fn decode_cpu(&self, latents: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize), String> {
+        crate::hardware::cpu_compute::enter("vae::decode");
+        self.check_latents(latents, h, w)?;
         let z: Vec<f32> = latents.iter().map(|v| v / self.scale + self.shift).collect();
         let x = match &self.post_quant_conv {
             Some(p) => p.fwd(&z, h, w),
@@ -345,13 +430,55 @@ impl SdVae {
             }
         }
         let x = self.dec_tail.fwd(&x, h, w);
-        Ok(to_image(&x, h, w))
+        Ok((x, h, w))
+    }
+
+    /// Metal decoder (same outputs as [`Self::decode_cpu`]).
+    pub fn decode_gpu(&self, latents: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize), String> {
+        self.check_latents(latents, h, w)?;
+        let net = self.gpu_dec.get(&[h, w], || {
+            let mut b = Gb::new();
+            let z = b.input("z", &[self.latent_channels(), h, w]);
+            let z = b.op("unscale", Op::Unary { kind: UnaryKind::Scale(1.0 / self.scale) }, &[z], &[self.latent_channels(), h, w]);
+            let z = if self.shift != 0.0 { b.add_scalar(z, self.shift) } else { z };
+            let x = match &self.post_quant_conv {
+                Some(p) => p.emit(&mut b, z),
+                None => z,
+            };
+            let mut x = self.dec_in.emit(&mut b, x);
+            x = self.dec_mid.emit(&mut b, x);
+            for level in self.dec_up.iter().rev() {
+                for r in &level.blocks {
+                    x = r.emit(&mut b, x);
+                }
+                if let Some(up) = &level.resample {
+                    x = b.upsample(x, 2, 2);
+                    x = up.emit(&mut b, x);
+                }
+            }
+            x = self.dec_tail.emit(&mut b, x);
+            b.output(x);
+            b.compile()
+        })?;
+        let ups = self.dec_up.iter().filter(|l| l.resample.is_some()).count();
+        let out = net.run(vec![latents.to_vec()])?.remove(0);
+        Ok((out, h << ups, w << ups))
     }
 
     /// RGB image -> (scaled latents [C,H/8,W/8] of the posterior mean, H/8, W/8).
     pub fn encode(&self, image: &ImageBuffer) -> Result<(Vec<f32>, usize, usize), String> {
-        let mut x = from_image(image)?;
-        let (mut h, mut w) = (image.height, image.width);
+        let x = from_image(image)?;
+        let (h, w) = (image.height, image.width);
+        if crate::model::diff_graph::gpu_mode() {
+            self.encode_gpu(x, h, w)
+        } else {
+            self.encode_cpu(x, h, w)
+        }
+    }
+
+    /// Native CPU encoder over pixels `[3, h, w]` in -1..1.
+    pub fn encode_cpu(&self, mut x: Vec<f32>, mut h: usize, mut w: usize) -> Result<(Vec<f32>, usize, usize), String> {
+        crate::hardware::cpu_compute::enter("vae::encode");
         x = self.enc_in.fwd(&x, h, w);
         for level in &self.enc_down {
             for b in &level.blocks {
@@ -374,6 +501,38 @@ impl SdVae {
         let c = self.latent_channels();
         let mean = moments[..c * h * w].iter().map(|v| (v - self.shift) * self.scale).collect();
         Ok((mean, h, w))
+    }
+
+    /// Metal encoder (same outputs as [`Self::encode_cpu`]).
+    pub fn encode_gpu(&self, x: Vec<f32>, h: usize, w: usize) -> Result<(Vec<f32>, usize, usize), String> {
+        let net = self.gpu_enc.get(&[h, w], || {
+            let mut b = Gb::new();
+            let x = b.input("img", &[3, h, w]);
+            let mut x = self.enc_in.emit(&mut b, x);
+            for level in &self.enc_down {
+                for r in &level.blocks {
+                    x = r.emit(&mut b, x);
+                }
+                if let Some(down) = &level.resample {
+                    // diffusers pads (0, 1, 0, 1) = right/bottom before the stride-2 valid conv.
+                    x = b.conv2d_pad(x, &down.w, Some(&down.b), down.c_out, 3, 2, [0, 0, 1, 1]);
+                }
+            }
+            x = self.enc_mid.emit(&mut b, x);
+            x = self.enc_tail.emit(&mut b, x);
+            if let Some(q) = &self.quant_conv {
+                x = q.emit(&mut b, x);
+            }
+            let s = b.shape(x).to_vec();
+            let m = b.slice(x, 0, 0, self.latent_channels());
+            let m = b.op("scale", Op::Unary { kind: UnaryKind::Scale(self.scale) }, &[m], &[self.latent_channels(), s[1], s[2]]);
+            let m = if self.shift != 0.0 { b.add_scalar(m, -self.shift * self.scale) } else { m };
+            b.output(m);
+            b.compile()
+        })?;
+        let d = 1usize << self.enc_down.iter().filter(|l| l.resample.is_some()).count();
+        let mean = net.run(vec![x])?.remove(0);
+        Ok((mean, h / d, w / d))
     }
 }
 
@@ -466,5 +625,27 @@ mod tests {
         assert_eq!(d("encoder.down.1.downsample.conv.bias").unwrap(), "encoder.down_blocks.1.downsamplers.0.conv.bias");
         assert_eq!(d("post_quant_conv.weight").unwrap(), "post_quant_conv.weight");
         assert_eq!(d("decoder.up.4.block.0.conv1.weight"), None);
+    }
+
+    /// CPU decoder/encoder vs the Metal graph programs on a tiny 2-level VAE (f32 vs f32: 1e-3).
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
+        let r = synth(&crate::model::diff_fixtures::vae_specs(4), 7);
+        let t = Tensors::from_reader(&r).unwrap();
+        let vae = SdVae::from_ldm(&t).unwrap().with_scaling(0.5, 0.1);
+        let z = Lcg(3).vec(4 * 6 * 5, 1.0);
+        let (cpu, ch, cw) = vae.decode_cpu(&z, 6, 5).unwrap();
+        let (gpu, gh, gw) = vae.decode_gpu(&z, 6, 5).unwrap();
+        assert_eq!((ch, cw), (gh, gw));
+        let e = rel_err(&gpu, &cpu);
+        assert!(e < 1e-3, "decode rel err {e}");
+
+        let img = Lcg(5).vec(3 * 16 * 24, 1.0);
+        let (cpu, ch, cw) = vae.encode_cpu(img.clone(), 16, 24).unwrap();
+        let (gpu, gh, gw) = vae.encode_gpu(img, 16, 24).unwrap();
+        assert_eq!((ch, cw), (gh, gw));
+        let e = rel_err(&gpu, &cpu);
+        assert!(e < 1e-3, "encode rel err {e}");
     }
 }

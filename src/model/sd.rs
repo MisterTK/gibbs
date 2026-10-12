@@ -88,7 +88,6 @@ impl SdPipeline {
 
     /// SD 2.1 turbo GGUF (gpustack/stable-diffusion-v2-1-turbo-GGUF): Euler trailing, no CFG.
     pub fn load(gguf_path: &Path, hub: &HuggingFaceHub) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionUnet)?;
         let reader = GgufWeightReader::open(gguf_path)?;
         if !Self::is_sd_checkpoint(&reader) {
             return Err(format!(
@@ -133,7 +132,6 @@ impl SdPipeline {
         id: &str,
         lora: Option<&Lora>,
     ) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionUnet)?;
         let index = read_json(&dir.join("model_index.json"))?;
         let class = index["_class_name"].as_str().unwrap_or("").to_string();
         let xl = class == "StableDiffusionXLPipeline";
@@ -249,7 +247,6 @@ impl SdPipeline {
         id: &str,
         lora: Option<&Lora>,
     ) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionUnet)?;
         let r =
             SafetensorsWeightReader::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut t = Tensors::safetensors(&r)?;
@@ -729,6 +726,34 @@ pub(crate) fn alphas_cumprod() -> Vec<f64> {
         .collect()
 }
 
+/// A tiny SD 1.x-style pipeline (CLIP + 2-level UNet + 2-level VAE, synthetic weights, Euler, CFG) for
+/// the parity test and the GPU-only matrix fixture.
+pub fn tiny_pipeline() -> Result<SdPipeline, String> {
+    use crate::model::diff_fixtures::{tiny_clip, unet_specs, vae_specs};
+    use crate::model::diff_graph::testutil::synth;
+    let unet_r = synth(&unet_specs(128, 0, 0), 11);
+    let unet = SdUnet::load(&Tensors::from_reader(&unet_r)?, "", Heads::Dim(16))?;
+    let vae_r = synth(&vae_specs(4), 7);
+    let vae = SdVae::from_ldm(&Tensors::from_reader(&vae_r)?)?;
+    let sched = SchedulerConfig::from_json(&json!({
+        "_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear",
+        "beta_start": 0.00085, "beta_end": 0.012, "timestep_spacing": "trailing"
+    }))?;
+    let d = ImageDefaults { width: 32, height: 32, steps: 3, guidance: 5.0, multiple: 16 };
+    SdPipeline::new(
+        vec![tiny_clip(Act::QuickGelu, false)],
+        unet,
+        vae,
+        VAE_SCALE,
+        sched,
+        false,
+        false,
+        d,
+        "tiny".into(),
+        "",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,5 +778,26 @@ mod tests {
         let f = |i: f32| (-(10000f32.ln()) * i / 127.0).exp();
         assert!((e[0] - 7500f32.sin()).abs() < 1e-3 && (e[128] - 7500f32.cos()).abs() < 1e-3);
         assert!((e[127] - (7500.0 * f(127.0)).sin()).abs() < 1e-5);
+    }
+
+    /// The whole pipeline (CLIP, CFG UNet x3 Euler steps, VAE decode) on Metal vs the native CPU run.
+    /// u8 pixels: allow a 2-level difference from f32 rounding.
+    #[test]
+    fn generate_gpu_matches_cpu() {
+        use crate::model::diff_graph::with_gpu;
+        let pipe = tiny_pipeline().unwrap();
+        let req = ImageRequest { prompt: "a lighthouse".into(), seed: 5, ..Default::default() };
+        let cpu = pipe.generate(&req, None).unwrap();
+        let gpu = with_gpu(|| pipe.generate(&req, None)).unwrap();
+        assert_eq!((cpu.width, cpu.height), (gpu.width, gpu.height));
+        let mut worst = 0i32;
+        for y in 0..cpu.height {
+            for x in 0..cpu.width {
+                let (a, b) = (cpu.get_pixel(x, y), gpu.get_pixel(x, y));
+                worst = worst.max((a.0 as i32 - b.0 as i32).abs()).max((a.1 as i32 - b.1 as i32).abs()).max((a.2 as i32 - b.2 as i32).abs());
+            }
+        }
+        eprintln!("sd pipeline gpu-vs-cpu max pixel diff {worst}");
+        assert!(worst <= 2, "max pixel diff {worst}");
     }
 }

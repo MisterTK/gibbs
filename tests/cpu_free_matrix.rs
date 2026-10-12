@@ -162,6 +162,18 @@ fn gpu_fixture(f: Family) {
             let (g, w) = gibbs_engine::model::ltx::tiny_dit_graph().expect("tiny LTX DiT graph");
             run_on_gpu("VideoLtx", g, w);
         }
+        Family::DiffusionUnet => {
+            // CLIP -> UNet2D (SDXL/LCM conditioning) x2 steps -> VAE decode, all Metal programs.
+            let size = gibbs_engine::model::diff_fixtures::tiny_sd_on_gpu().expect("tiny SD runs on Metal");
+            assert_eq!(size, (8, 8));
+        }
+        Family::VideoModelScope => {
+            gibbs_engine::model::unet3d::fixture::tiny_on_gpu().expect("tiny UNet3D runs on Metal");
+        }
+        Family::Vae => {
+            // SD, Qwen-Image (x2), LTX and DC-AE VAEs decode (and LTX encodes) as Metal programs.
+            gibbs_engine::model::diff_fixtures::tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
+        }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }

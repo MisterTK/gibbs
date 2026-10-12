@@ -7,6 +7,8 @@ use crate::model::hub::HuggingFaceHub;
 use crate::model::loaders::gguf::GgufWeightReader;
 use crate::model::loaders::safetensors::SafetensorsWeightReader;
 use crate::model::loaders::WeightReader;
+use crate::graph::{Op, Tensor, UnaryKind};
+use crate::model::diff_graph::{gpu_mode, ByShape, Gb, GpuNet, V};
 use crate::model::nn;
 use std::collections::HashMap;
 use std::path::Path;
@@ -49,6 +51,11 @@ impl<'a> Tensors<'a> {
     }
 
     pub fn safetensors(r: &'a SafetensorsWeightReader) -> Result<Self, String> {
+        Self::from_reader(r)
+    }
+
+    /// Any reader whose `list_tensors` reports PyTorch-order shapes and dtypes.
+    pub fn from_reader(r: &'a dyn WeightReader) -> Result<Self, String> {
         let (mut shapes, mut dtypes) = (HashMap::new(), HashMap::new());
         for m in r.list_tensors()? {
             dtypes.insert(m.name.clone(), m.dtype);
@@ -231,6 +238,8 @@ pub struct ClipTextTransformer {
     act: Act,
     pad_id: u32,
     text_projection: Option<Linear>,
+    /// The Metal program (one shape: always 77 tokens).
+    gpu: ByShape,
 }
 
 impl ClipTextTransformer {
@@ -248,6 +257,39 @@ impl ClipTextTransformer {
         act: Act,
         pad_id: u32,
         projection: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::from_parts(t, prefix, act, pad_id, projection, Self::fetch_tokenizer(hub)?)
+    }
+
+    fn fetch_tokenizer(hub: &HuggingFaceHub) -> Result<Tokenizer, String> {
+        let tok_path = hub.fetch_file(TOKENIZER_REPO, "tokenizer.json")?;
+        let mut tokenizer = Tokenizer::from_file(&tok_path)
+            .map_err(|e| format!("Failed to load CLIP tokenizer {}: {e}", tok_path.display()))?;
+        // Framing (BOS/EOS/pad to 77) is done by `frame_ids`; the file's own post-processor
+        // (RobertaProcessing adding BOS/EOS) is bypassed via add_special_tokens=false.
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| format!("CLIP tokenizer: {e}"))?;
+        tokenizer.with_padding(None);
+        for (token, id) in [("<|startoftext|>", BOS_ID), ("<|endoftext|>", EOS_ID)] {
+            if tokenizer.token_to_id(token) != Some(id) {
+                return Err(format!(
+                    "CLIP tokenizer {} maps '{token}' to {:?}, expected {id}",
+                    tok_path.display(),
+                    tokenizer.token_to_id(token)
+                ));
+            }
+        }
+        Ok(tokenizer)
+    }
+
+    pub(crate) fn from_parts(
+        t: &Tensors,
+        prefix: &str,
+        act: Act,
+        pad_id: u32,
+        projection: Option<&str>,
+        tokenizer: Tokenizer,
     ) -> Result<Self, String> {
         let tok_name = format!("{prefix}.embeddings.token_embedding.weight");
         let (vocab, d_model) = pt_dims2(t, &tok_name)?;
@@ -299,24 +341,6 @@ impl ClipTextTransformer {
             None => None,
         };
 
-        let tok_path = hub.fetch_file(TOKENIZER_REPO, "tokenizer.json")?;
-        let mut tokenizer = Tokenizer::from_file(&tok_path)
-            .map_err(|e| format!("Failed to load CLIP tokenizer {}: {e}", tok_path.display()))?;
-        // Framing (BOS/EOS/pad to 77) is done by `frame_ids`; the file's own post-processor
-        // (RobertaProcessing adding BOS/EOS) is bypassed via add_special_tokens=false.
-        tokenizer
-            .with_truncation(None)
-            .map_err(|e| format!("CLIP tokenizer: {e}"))?;
-        tokenizer.with_padding(None);
-        for (token, id) in [("<|startoftext|>", BOS_ID), ("<|endoftext|>", EOS_ID)] {
-            if tokenizer.token_to_id(token) != Some(id) {
-                return Err(format!(
-                    "CLIP tokenizer {} maps '{token}' to {:?}, expected {id}",
-                    tok_path.display(),
-                    tokenizer.token_to_id(token)
-                ));
-            }
-        }
         let tok_vocab = tokenizer.get_vocab_size(true);
         if tok_vocab > vocab {
             return Err(format!(
@@ -335,6 +359,7 @@ impl ClipTextTransformer {
             act,
             pad_id,
             text_projection,
+            gpu: ByShape::default(),
         })
     }
 
@@ -385,20 +410,31 @@ impl ClipTextTransformer {
         self.encode(prompt, false).map(|o| o.hidden)
     }
 
+    /// Tokenizes and encodes `prompt` (on Metal when the process is GPU-only, else the native CPU tower).
     pub fn encode(&self, prompt: &str, penultimate: bool) -> Result<ClipOut, String> {
         let encoding = self
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| format!("CLIP tokenization failed: {e}"))?;
         let ids = frame_ids(encoding.get_ids(), self.pad_id);
+        if let Some(&id) = ids.iter().find(|&&id| id as usize >= self.vocab) {
+            return Err(format!("CLIP token id {id} out of vocab {}", self.vocab));
+        }
+        if gpu_mode() {
+            self.encode_ids_gpu(&ids, penultimate)
+        } else {
+            self.encode_ids_cpu(&ids, penultimate)
+        }
+    }
+
+    /// Native CPU tower over framed token ids.
+    pub fn encode_ids_cpu(&self, ids: &[u32; SEQ_LEN], penultimate: bool) -> Result<ClipOut, String> {
+        crate::hardware::cpu_compute::enter("clip::encode");
         let d = self.d_model;
 
         let mut h = vec![0.0f32; SEQ_LEN * d];
         for (pos, &id) in ids.iter().enumerate() {
             let id = id as usize;
-            if id >= self.vocab {
-                return Err(format!("CLIP token id {id} out of vocab {}", self.vocab));
-            }
             let tok = &self.token_embedding[id * d..(id + 1) * d];
             let pe = &self.position_embedding[pos * d..(pos + 1) * d];
             for ((o, t), p) in h[pos * d..(pos + 1) * d].iter_mut().zip(tok).zip(pe) {
@@ -436,6 +472,70 @@ impl ClipTextTransformer {
             None => pooled,
         };
         Ok(ClipOut { hidden: penult.unwrap_or(last), pooled })
+    }
+
+    /// The tower as a Metal program: inputs `ids [77]` and `eos [1]` (U32); outputs the penultimate
+    /// hidden state, the final-normed hidden state and the pooled (projected) EOS row.
+    fn build_gpu(&self) -> Result<GpuNet, String> {
+        let d = self.d_model;
+        let mut b = Gb::new();
+        let ids = b.input_u32("ids", &[SEQ_LEN]);
+        let eos = b.input_u32("eos", &[1]);
+        let table = b.wf32("tok_emb", &[self.vocab, d], self.token_embedding.clone());
+        let pos = b.wf32("pos_emb", &[SEQ_LEN, d], self.position_embedding.clone());
+        let tok = b.op("embed", Op::Embedding, &[table, ids], &[SEQ_LEN, d]);
+        let mut h = b.add(tok, pos);
+        let mut penult = h;
+        let lin = |b: &mut Gb, x: V, l: &Linear| b.linear(x, &l.weight, l.bias.as_deref(), l.in_f, l.out_f);
+        for (i, l) in self.layers.iter().enumerate() {
+            if i + 1 == self.layers.len() {
+                penult = h;
+            }
+            let x = b.layer_norm(h, &l.layer_norm1.gamma, &l.layer_norm1.beta, LN_EPS);
+            let (q, k, v) = (lin(&mut b, x, &l.q_proj), lin(&mut b, x, &l.k_proj), lin(&mut b, x, &l.v_proj));
+            let a = b.op(
+                "attn",
+                Op::Attention { heads: d / HEAD_DIM, kv_heads: d / HEAD_DIM, causal: true, window: None, soft_cap: None },
+                &[q, k, v],
+                &[SEQ_LEN, d],
+            );
+            let o = lin(&mut b, a, &l.out_proj);
+            h = b.add(h, o);
+
+            let x = b.layer_norm(h, &l.layer_norm2.gamma, &l.layer_norm2.beta, LN_EPS);
+            let m = lin(&mut b, x, &l.fc1);
+            let m = match self.act {
+                Act::Gelu => b.gelu(m, false),
+                Act::QuickGelu => {
+                    // x * sigmoid(1.702 x) == x / (1 + exp(-1.702 x))
+                    let s = b.shape(m).to_vec();
+                    let z = b.op("qg.scale", Op::Unary { kind: UnaryKind::Scale(1.702) }, &[m], &s);
+                    let z = b.op("qg.sigmoid", Op::Unary { kind: UnaryKind::Sigmoid }, &[z], &s);
+                    b.mul(m, z)
+                }
+            };
+            let f = lin(&mut b, m, &l.fc2);
+            h = b.add(h, f);
+        }
+        let last = b.layer_norm(h, &self.final_layer_norm.gamma, &self.final_layer_norm.beta, LN_EPS);
+        let row = b.op("eos_row", Op::Gather { axis: 0 }, &[last, eos], &[1, d]);
+        let pooled = match &self.text_projection {
+            Some(p) => lin(&mut b, row, p),
+            None => row,
+        };
+        for v in [penult, last, pooled] {
+            b.output(v);
+        }
+        b.compile()
+    }
+
+    /// [`Self::encode_ids_cpu`] on Metal.
+    pub fn encode_ids_gpu(&self, ids: &[u32; SEQ_LEN], penultimate: bool) -> Result<ClipOut, String> {
+        let net = self.gpu.get(&[0], || self.build_gpu())?;
+        let eos = ids.iter().position(|&t| t == EOS_ID).unwrap_or(SEQ_LEN - 1) as u32;
+        let mut out = net.run_t(vec![Tensor::U32(ids.to_vec()), Tensor::U32(vec![eos])])?.into_iter();
+        let (penult, last, pooled) = (out.next().unwrap(), out.next().unwrap(), out.next().unwrap());
+        Ok(ClipOut { hidden: if penultimate { penult } else { last }, pooled })
     }
 }
 
@@ -535,5 +635,22 @@ mod tests {
         assert_eq!(f[0], BOS_ID);
         assert_eq!(&f[1..76], &ids[..75]);
         assert_eq!(f[76], EOS_ID);
+    }
+
+    /// CPU tower vs Metal program, both activations, with and without a projection (f32: 1e-3).
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::rel_err;
+        for (act, proj) in [(Act::QuickGelu, false), (Act::Gelu, true)] {
+            let clip = crate::model::diff_fixtures::tiny_clip(act, proj);
+            let ids = frame_ids(&[5, 17, 300, 999, 20000], PAD_ID);
+            for penult in [true, false] {
+                let (c, g) = (clip.encode_ids_cpu(&ids, penult).unwrap(), clip.encode_ids_gpu(&ids, penult).unwrap());
+                let (eh, ep) = (rel_err(&g.hidden, &c.hidden), rel_err(&g.pooled, &c.pooled));
+                eprintln!("clip {act:?} proj={proj} penult={penult}: hidden {eh:.2e} pooled {ep:.2e}");
+                assert!(eh < 1e-3 && ep < 1e-3, "hidden {eh} pooled {ep}");
+                assert_eq!(g.pooled.len(), clip.pooled_dim());
+            }
+        }
     }
 }

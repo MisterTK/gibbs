@@ -5,6 +5,7 @@
 //!
 //! Reads the original/ComfyUI names (`decoder.upsamples.N.residual.K`) or diffusers' (`decoder.up_blocks.…`).
 
+use crate::model::diff_graph::{ByShape, Gb, V};
 use crate::model::image::ImageBuffer;
 use crate::model::nn;
 use crate::model::weights::Weights;
@@ -155,6 +156,62 @@ impl Res {
     }
 }
 
+// Graph emission (Metal program). Each `emit` mirrors the `fwd` above on `[c, h, w]` values.
+impl Gb {
+    /// [`rms`] over the channels of `x [c, ...]`: a per-pixel RmsNorm after moving channels last
+    /// (`x / sqrt(mean_c x² + eps) * gamma` equals `x / ‖x‖ * sqrt(c) * gamma`).
+    pub(crate) fn rms_channels(&mut self, x: V, gamma: &[f32]) -> V {
+        let s = self.shape(x).to_vec();
+        let (c, hw) = (s[0], s[1..].iter().product::<usize>());
+        let flat = if s.len() == 2 { x } else { self.reshape(x, &[c, hw]) };
+        let t = self.transpose(flat, &[1, 0]);
+        let g = self.wf32("rms.g", &[c], gamma.to_vec());
+        let n = self.op("rmsnorm", crate::graph::Op::RmsNorm { eps: 1e-12 }, &[t, g], &[hw, c]);
+        let y = self.transpose(n, &[1, 0]);
+        if s.len() == 2 { y } else { self.reshape(y, &s) }
+    }
+}
+
+impl Conv {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        b.conv2d(x, &self.w, Some(&self.b), self.c_out, self.k, 1, self.k / 2)
+    }
+}
+
+impl Res {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let skip = match &self.short {
+            Some(s) => s.emit(b, x),
+            None => x,
+        };
+        let y = b.rms_channels(x, &self.n1);
+        let y = b.silu(y);
+        let y = self.c1.emit(b, y);
+        let y = b.rms_channels(y, &self.n2);
+        let y = b.silu(y);
+        let y = self.c2.emit(b, y);
+        b.add(y, skip)
+    }
+}
+
+impl Attn {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let s = b.shape(x).to_vec();
+        let (c, hw) = (self.proj.c_in, s[1] * s[2]);
+        let y = b.rms_channels(x, &self.norm);
+        let flat = b.reshape(y, &[c, hw]);
+        let tok = b.transpose(flat, &[1, 0]);
+        let [q, k, v] = [0, 1, 2].map(|i| {
+            b.linear_f32(tok, &self.qkv.w[i * c * c..(i + 1) * c * c], Some(&self.qkv.b[i * c..(i + 1) * c]), c, c)
+        });
+        let a = b.attention(q, k, v, 1);
+        let o = b.linear_f32(a, &self.proj.w, Some(&self.proj.b), c, c);
+        let o = b.transpose(o, &[1, 0]);
+        let o = b.reshape(o, &s);
+        b.add(x, o)
+    }
+}
+
 /// Single-head spatial self-attention over all pixels.
 struct Attn {
     norm: Vec<f32>,
@@ -260,14 +317,14 @@ pub struct QwenVae {
     mean: Vec<f32>,
     std: Vec<f32>,
     #[cfg(test)]
-    enc: Enc,
+    enc: Result<Enc, String>,
+    gpu: ByShape,
 }
 
 impl QwenVae {
     /// A diffusers `vae/` directory, or the ComfyUI `qwen_image_vae.safetensors` alone (no config:
     /// the Wan 2.1 statistics apply).
     pub fn load(dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::Vae)?;
         let cfg = crate::model::dit::read_config(dir).unwrap_or(Value::Null);
         if !cfg.is_null() {
             let ok = cfg["base_dim"].as_u64().unwrap_or(BASE as u64) == BASE as u64
@@ -298,10 +355,11 @@ impl QwenVae {
             &Weights::open(&crate::model::hub::component_weights(dir)?)?,
             stats("latents_mean", &MEAN),
             stats("latents_std", &STD),
+            BASE,
         )
     }
 
-    fn open(w: &Weights, mean: Vec<f32>, std: Vec<f32>) -> Result<Self, String> {
+    fn open(w: &Weights, mean: Vec<f32>, std: Vec<f32>, base: usize) -> Result<Self, String> {
         let net = Net {
             w,
             diffusers: !w.has("decoder.conv1.weight"),
@@ -309,7 +367,7 @@ impl QwenVae {
         let dims: Vec<usize> = [MULT[3]]
             .iter()
             .chain(MULT.iter().rev())
-            .map(|m| BASE * m)
+            .map(|m| base * m)
             .collect();
         let top = dims[0];
         let mut ups = Vec::new();
@@ -351,11 +409,13 @@ impl QwenVae {
             mean,
             std,
             #[cfg(test)]
-            enc: Enc::open(&net)?,
+            enc: Enc::open(&net),
+            gpu: ByShape::default(),
         })
     }
 
     /// Normalized latents `[16, h, w]` (what the transformer produces) -> RGB image of 8h x 8w.
+    /// A GPU-only process runs the decoder as a Metal graph program built once per latent size.
     pub fn decode(&self, lat: &[f32], h: usize, w: usize) -> Result<ImageBuffer, String> {
         if lat.len() != Z * h * w || h == 0 || w == 0 {
             return Err(format!(
@@ -368,7 +428,25 @@ impl QwenVae {
             .zip(self.mean.iter().zip(&self.std))
             .flat_map(|(c, (m, s))| c.iter().map(move |v| v * s + m))
             .collect();
-        let mut x = self.conv_in.fwd(&self.post.fwd(&z, h, w), h, w);
+        let x = if crate::model::diff_graph::gpu_mode() {
+            self.decode_gpu(&z, h, w)?
+        } else {
+            self.decode_cpu(&z, h, w)
+        };
+        let (h, w) = (8 * h, 8 * w);
+        let mut img = ImageBuffer::new(w, h);
+        let hw = h * w;
+        let px = |v: f32| ((v.clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8;
+        for i in 0..hw {
+            img.set_pixel(i % w, i / w, px(x[i]), px(x[hw + i]), px(x[2 * hw + i]));
+        }
+        Ok(img)
+    }
+
+    /// Native CPU decoder over de-normalized latents `z [16, h, w]` -> `[3, 8h, 8w]`.
+    fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("qwen_vae::decode");
+        let mut x = self.conv_in.fwd(&self.post.fwd(z, h, w), h, w);
         let (mut h, mut w) = (h, w);
         let (r0, a, r1) = &self.mid;
         x = r1.fwd(&a.fwd(&r0.fwd(&x, h, w), h, w), h, w);
@@ -384,14 +462,36 @@ impl QwenVae {
         }
         rms(&mut x, self.conv_out.c_in, &self.norm_out);
         nn::silu(&mut x);
-        let x = self.conv_out.fwd(&x, h, w);
-        let mut img = ImageBuffer::new(w, h);
-        let hw = h * w;
-        let px = |v: f32| ((v.clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8;
-        for i in 0..hw {
-            img.set_pixel(i % w, i / w, px(x[i]), px(x[hw + i]), px(x[2 * hw + i]));
-        }
-        Ok(img)
+        self.conv_out.fwd(&x, h, w)
+    }
+
+    /// Metal decoder (same outputs as [`Self::decode_cpu`]).
+    fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
+        let net = self.gpu.get(&[h, w], || {
+            let mut b = Gb::new();
+            let x = b.input("z", &[Z, h, w]);
+            let x = self.post.emit(&mut b, x);
+            let mut x = self.conv_in.emit(&mut b, x);
+            let (r0, a, r1) = &self.mid;
+            x = r0.emit(&mut b, x);
+            x = a.emit(&mut b, x);
+            x = r1.emit(&mut b, x);
+            for level in &self.ups {
+                for r in &level.res {
+                    x = r.emit(&mut b, x);
+                }
+                if let Some(up) = &level.up {
+                    x = b.upsample(x, 2, 2);
+                    x = up.emit(&mut b, x);
+                }
+            }
+            x = b.rms_channels(x, &self.norm_out);
+            x = b.silu(x);
+            x = self.conv_out.emit(&mut b, x);
+            b.output(x);
+            b.compile()
+        })?;
+        Ok(net.run(vec![z.to_vec()])?.remove(0))
     }
 }
 
@@ -452,7 +552,7 @@ impl QwenVae {
                 .enumerate()
                 .for_each(|(c, &v)| x[c * h * w + i] = v as f32 / 127.5 - 1.0);
         }
-        let e = &self.enc;
+        let e = self.enc.as_ref().expect("encoder weights");
         x = e.conv_in.fwd(&x, h, w);
         for (res, down) in &e.levels {
             for r in res {
@@ -481,6 +581,89 @@ impl QwenVae {
             .chunks_exact(h * w)
             .zip(self.mean.iter().zip(&self.std))
             .flat_map(|(c, (m, s))| c.iter().map(move |v| (v - m) / s))
+            .collect()
+    }
+}
+
+/// Tiny synthetic decoder for the CPU-free fixtures and parity tests (shared with `tests/cpu_free_matrix.rs`).
+pub mod fixture {
+    use super::*;
+    use crate::model::diff_graph::testutil::{synth, Lcg};
+
+    /// A tiny (base 4) decoder in the original names: one 4D conv of every kind, a real middle attention.
+    pub fn tiny_specs(base: usize) -> Vec<(String, Vec<usize>)> {
+        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
+        let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
+            s.push((format!("{p}.weight"), vec![o, i, k, k]));
+            s.push((format!("{p}.bias"), vec![o]));
+        };
+        let res = |s: &mut Vec<_>, p: &str, i: usize, o: usize| {
+            s.push((format!("{p}.residual.0.gamma"), vec![i]));
+            conv(s, &format!("{p}.residual.2"), i, o, 3);
+            s.push((format!("{p}.residual.3.gamma"), vec![o]));
+            conv(s, &format!("{p}.residual.6"), o, o, 3);
+            if i != o {
+                conv(s, &format!("{p}.shortcut"), i, o, 1);
+            }
+        };
+        let dims: Vec<usize> = [MULT[3]].iter().chain(MULT.iter().rev()).map(|m| base * m).collect();
+        conv(&mut s, "conv2", Z, Z, 1);
+        conv(&mut s, "decoder.conv1", Z, dims[0], 3);
+        res(&mut s, "decoder.middle.0", dims[0], dims[0]);
+        let c = dims[0];
+        s.push(("decoder.middle.1.norm.gamma".into(), vec![c]));
+        conv(&mut s, "decoder.middle.1.to_qkv", c, 3 * c, 1);
+        conv(&mut s, "decoder.middle.1.proj", c, c, 1);
+        res(&mut s, "decoder.middle.2", c, c);
+        for i in 0..4 {
+            let (cin, cout) = (if i > 0 { dims[i] / 2 } else { dims[i] }, dims[i + 1]);
+            for j in 0..3 {
+                res(&mut s, &format!("decoder.upsamples.{}", i * 4 + j), if j == 0 { cin } else { cout }, cout);
+            }
+            if i < 3 {
+                conv(&mut s, &format!("decoder.upsamples.{}.resample.1", i * 4 + 3), cout, cout / 2, 3);
+            }
+        }
+        s.push(("decoder.head.0.gamma".into(), vec![dims[4]]));
+        conv(&mut s, "decoder.head.2", dims[4], 3, 3);
+        s
+    }
+
+    /// A base-4 decoder with gains near 1.
+    pub fn tiny() -> QwenVae {
+        let specs = tiny_specs(4);
+        let mut r = synth(&specs, 11);
+        let mut g = Lcg(5);
+        for (n, (_, v)) in r.0.iter_mut() {
+            if n.ends_with(".gamma") {
+                v.iter_mut().for_each(|x| *x = 1.0 + 0.2 * g.next());
+            }
+        }
+        let w = Weights::from_f32(specs, |n| Ok(r.0[n].1.clone())).unwrap();
+        QwenVae::open(&w, MEAN.to_vec(), STD.to_vec(), 4).unwrap()
+    }
+
+    /// Public `decode` of the tiny net (Metal when the CPU tripwire is armed) plus a finiteness check of the
+    /// raw Metal output.
+    pub fn tiny_on_gpu() -> Result<(), String> {
+        let vae = tiny();
+        let (h, w) = (3, 2);
+        let z = Lcg(3).vec(Z * h * w, 1.0);
+        let img = vae.decode(&z, h, w)?;
+        if (img.width, img.height) != (8 * w, 8 * h) {
+            return Err(format!("qwen_vae: {}x{} image", img.width, img.height));
+        }
+        let raw = vae.decode_gpu(&vae_denorm(&vae, &z, h * w), h, w)?;
+        if raw.iter().any(|v| !v.is_finite()) {
+            return Err("qwen_vae: non-finite Metal output".into());
+        }
+        Ok(())
+    }
+
+    fn vae_denorm(vae: &QwenVae, lat: &[f32], hw: usize) -> Vec<f32> {
+        lat.chunks_exact(hw)
+            .zip(vae.mean.iter().zip(&vae.std))
+            .flat_map(|(c, (m, s))| c.iter().map(move |v| v * s + m))
             .collect()
     }
 }
@@ -525,7 +708,7 @@ mod tests {
             return;
         };
         let w = Weights::open(&path).unwrap();
-        let vae = QwenVae::open(&w, MEAN.to_vec(), STD.to_vec()).unwrap();
+        let vae = QwenVae::open(&w, MEAN.to_vec(), STD.to_vec(), BASE).unwrap();
         let (n, mut img) = (128usize, ImageBuffer::new(128, 128));
         for y in 0..n {
             for x in 0..n {
@@ -552,5 +735,21 @@ mod tests {
         let psnr = 10.0 * (255.0f32 * 255.0 / mse.max(1e-9)).log10();
         println!("VAE round trip PSNR {psnr:.2} dB");
         assert!(psnr > 24.0, "PSNR {psnr}");
+    }
+
+    /// CPU decoder vs the Metal graph program on a tiny synthetic checkpoint (f32 vs f32: 1e-3).
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::{rel_err, Lcg};
+        let vae = fixture::tiny();
+        let (h, wd) = (3, 2);
+        let z = Lcg(3).vec(Z * h * wd, 1.0);
+        let cpu = vae.decode_cpu(&z, h, wd);
+        let gpu = vae.decode_gpu(&z, h, wd).unwrap();
+        let e = rel_err(&gpu, &cpu);
+        assert!(e < 1e-3, "decode rel err {e}");
+        println!("qwen_vae decode rel err {e:e}");
+        let net = vae.gpu.get(&[h, wd], || Err("cached".into())).unwrap();
+        assert_eq!(net.cpu_node_count(), 0);
     }
 }

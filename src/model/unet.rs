@@ -9,6 +9,7 @@
 
 use crate::model::clip::Tensors;
 use crate::model::loaders::GgufWeightReader;
+use crate::model::diff_graph::{gpu_mode, ByShape, Gb, GpuNet, V};
 use crate::model::nn::{self, Wt};
 use std::collections::HashSet;
 
@@ -296,6 +297,115 @@ impl Layer {
                 let up = nn::upsample_nearest2x(&x.data, x.c, x.h, x.w);
                 let (data, h, w) = conv.run(&up, 2 * x.h, 2 * x.w, 1)?;
                 Ok(Act { data, c: conv.c_out, h, w })
+            }
+        }
+    }
+}
+
+// Graph emission (Metal program). Images are `[c, h, w]`, token streams `[rows, c]`; each `emit`
+// mirrors the host `forward` of the same struct.
+impl Linear {
+    pub(super) fn emit(&self, b: &mut Gb, x: V) -> V {
+        b.linear(x, &self.w, self.b.as_deref(), self.in_f, self.out_f)
+    }
+}
+
+impl Conv {
+    pub(super) fn emit(&self, b: &mut Gb, x: V, stride: usize) -> V {
+        b.conv2d(x, &self.w.f32(), Some(&self.b), self.c_out, self.k, stride, self.k / 2)
+    }
+}
+
+impl Norm {
+    pub(super) fn emit_group(&self, b: &mut Gb, x: V, eps: f32) -> V {
+        b.group_norm(x, &self.gamma, &self.beta, GN_GROUPS, eps)
+    }
+    pub(super) fn emit_layer(&self, b: &mut Gb, x: V) -> V {
+        b.layer_norm(x, &self.gamma, &self.beta, 1e-5)
+    }
+}
+
+impl ResBlock {
+    /// `x [c_in, h, w]`; `emb_act` is `[1, emb_dim]` (SiLU of the time embedding). Returns `[c_out, h, w]`.
+    pub(super) fn emit(&self, b: &mut Gb, x: V, emb_act: V) -> V {
+        let t = self.in_norm.emit_group(b, x, 1e-5);
+        let t = b.silu(t);
+        let t = self.in_conv.emit(b, t, 1);
+        let e = self.emb.emit(b, emb_act);
+        let e = b.reshape(e, &[self.emb.out_f, 1, 1]);
+        let t = b.add_bcast(t, e);
+        let t = self.out_norm.emit_group(b, t, 1e-5);
+        let t = b.silu(t);
+        let t = self.out_conv.emit(b, t, 1);
+        let skip = match &self.skip {
+            Some(c) => c.emit(b, x, 1),
+            None => x,
+        };
+        b.add(t, skip)
+    }
+}
+
+impl Attention {
+    /// `x [nx, d]` attends to `ctx [nctx, dctx]` (self-attention when `ctx == x`).
+    pub(super) fn emit(&self, b: &mut Gb, x: V, ctx: V) -> V {
+        let q = self.q.emit(b, x);
+        let k = self.k.emit(b, ctx);
+        let v = self.v.emit(b, ctx);
+        let o = b.attention(q, k, v, self.heads());
+        self.out.emit(b, o)
+    }
+}
+
+impl SpatialTransformer {
+    /// BasicTransformerBlocks over tokens `tok [n, c]` of one frame: self-attention, cross-attention
+    /// over `ctx [len, dim]`, GEGLU feed-forward.
+    pub(super) fn emit_blocks(&self, b: &mut Gb, mut tok: V, ctx: V) -> V {
+        for blk in &self.blocks {
+            let x = blk.norm1.emit_layer(b, tok);
+            let a = blk.attn1.emit(b, x, x);
+            tok = b.add(tok, a);
+            let x = blk.norm2.emit_layer(b, tok);
+            let a = blk.attn2.emit(b, x, ctx);
+            tok = b.add(tok, a);
+            let x = blk.norm3.emit_layer(b, tok);
+            let g = blk.ff_in.emit(b, x);
+            let inner = blk.ff_in.out_f / 2;
+            // GEGLU: value is the first half, the second half goes through the exact GELU.
+            let (a, gate) = (b.slice(g, 1, 0, inner), b.slice(g, 1, inner, 2 * inner));
+            let gate = b.gelu(gate, false);
+            let g = b.mul(a, gate);
+            let f = blk.ff_out.emit(b, g);
+            tok = b.add(tok, f);
+        }
+        tok
+    }
+
+    /// `x [c, h, w]` -> `[c, h, w]`.
+    pub(super) fn emit(&self, b: &mut Gb, x: V, ctx: V) -> V {
+        let s = b.shape(x).to_vec();
+        let (c, hw) = (s[0], s[1] * s[2]);
+        let t = self.norm.emit_group(b, x, 1e-6);
+        let t = b.reshape(t, &[c, hw]);
+        let t = b.transpose(t, &[1, 0]);
+        let tok = self.proj_in.emit(b, t);
+        let tok = self.emit_blocks(b, tok, ctx);
+        let o = self.proj_out.emit(b, tok);
+        let o = b.transpose(o, &[1, 0]);
+        let o = b.reshape(o, &s);
+        b.add(o, x)
+    }
+}
+
+impl Layer {
+    fn emit(&self, b: &mut Gb, x: V, emb_act: V, ctx: V) -> V {
+        match self {
+            Layer::ConvIn(conv) => conv.emit(b, x, 1),
+            Layer::Res(r) => r.emit(b, x, emb_act),
+            Layer::Transformer(t) => t.emit(b, x, ctx),
+            Layer::Down(conv) => conv.emit(b, x, 2),
+            Layer::Up(conv) => {
+                let up = b.upsample(x, 2, 2);
+                conv.emit(b, up, 1)
             }
         }
     }
@@ -660,6 +770,8 @@ pub struct SdUnet {
     output_blocks: Vec<Vec<Layer>>,
     out_norm: Norm,
     out_conv: Conv,
+    /// Metal program per `(h, w, context_len)`.
+    gpu: ByShape,
 }
 
 impl SdUnet {
@@ -740,6 +852,7 @@ impl SdUnet {
             input_blocks,
             middle,
             output_blocks,
+            gpu: ByShape::default(),
         })
     }
 
@@ -762,11 +875,9 @@ impl SdUnet {
         self.downscale
     }
 
-    /// Predicts the model output `[4, h, w]` (eps or v) for latents `x [4, h, w]` at `timestep`,
-    /// conditioned on `context [context_len, context_dim]`, SDXL `add` (`[pooled, time-id embeddings]`)
-    /// and LCM `t_cond` (guidance embedding).
+    /// Native CPU forward (see [`Self::forward`]).
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(
+    pub fn forward_cpu(
         &self,
         x: &[f32],
         h: usize,
@@ -778,20 +889,7 @@ impl SdUnet {
         t_cond: Option<&[f32]>,
     ) -> Result<Vec<f32>, String> {
         crate::hardware::cpu_compute::enter("unet::forward");
-        let d = self.downscale;
-        if h == 0 || w == 0 || h % d != 0 || w % d != 0 {
-            return Err(format!("UNet latent size {h}x{w} must be non-zero multiples of {d}"));
-        }
-        if x.len() != self.in_channels * h * w {
-            return Err(format!("UNet input has {} values, expected {}x{h}x{w}", x.len(), self.in_channels));
-        }
-        if context_len == 0 || context.len() != context_len * self.context_dim {
-            return Err(format!(
-                "UNet context has {} values, expected {context_len}x{}",
-                context.len(),
-                self.context_dim
-            ));
-        }
+        self.check(x, h, w, context, context_len)?;
 
         let mut t_emb = timestep_embedding(timestep, self.model_channels);
         match (&self.cond_proj, t_cond) {
@@ -844,6 +942,124 @@ impl SdUnet {
         nn::silu(&mut act.data);
         let (eps, _, _) = self.out_conv.run(&act.data, h, w, 1)?;
         Ok(eps)
+    }
+
+    fn check(&self, x: &[f32], h: usize, w: usize, context: &[f32], context_len: usize) -> Result<(), String> {
+        let d = self.downscale;
+        if h == 0 || w == 0 || h % d != 0 || w % d != 0 {
+            return Err(format!("UNet latent size {h}x{w} must be non-zero multiples of {d}"));
+        }
+        if x.len() != self.in_channels * h * w {
+            return Err(format!("UNet input has {} values, expected {}x{h}x{w}", x.len(), self.in_channels));
+        }
+        if context_len == 0 || context.len() != context_len * self.context_dim {
+            return Err(format!(
+                "UNet context has {} values, expected {context_len}x{}",
+                context.len(),
+                self.context_dim
+            ));
+        }
+        Ok(())
+    }
+
+    /// The Metal program for latents `h x w` and `ctx_len` context tokens. Inputs, in order: `x [4,h,w]`,
+    /// `t_emb [1, model_channels]` (host sinusoid), `context`, then `add` (SDXL) and `t_cond` (LCM) when
+    /// the checkpoint has them. The host arithmetic is the O(model_channels) sinusoid only.
+    pub fn build_gpu(&self, h: usize, w: usize, ctx_len: usize) -> Result<GpuNet, String> {
+        let mut b = Gb::new();
+        let x = b.input("x", &[self.in_channels, h, w]);
+        let t = b.input("t_emb", &[1, self.model_channels]);
+        let ctx = b.input("context", &[ctx_len, self.context_dim]);
+        let add = self.label_emb.as_ref().map(|(l0, _)| b.input("add", &[1, l0.in_f]));
+        let t_cond = self.cond_proj.as_ref().map(|p| b.input("t_cond", &[1, p.in_f]));
+        let mut t = t;
+        if let (Some(p), Some(c)) = (&self.cond_proj, t_cond) {
+            let pc = p.emit(&mut b, c);
+            t = b.add(t, pc);
+        }
+        let e = self.time0.emit(&mut b, t);
+        let e = b.silu(e);
+        let mut e = self.time2.emit(&mut b, e);
+        if let (Some((l0, l2)), Some(a)) = (&self.label_emb, add) {
+            let l = l0.emit(&mut b, a);
+            let l = b.silu(l);
+            let l = l2.emit(&mut b, l);
+            e = b.add(e, l);
+        }
+        let emb = b.silu(e);
+
+        let mut act = x;
+        let mut skips = Vec::new();
+        for block in &self.input_blocks {
+            for layer in block {
+                act = layer.emit(&mut b, act, emb, ctx);
+            }
+            skips.push(act);
+        }
+        for layer in &self.middle {
+            act = layer.emit(&mut b, act, emb, ctx);
+        }
+        for block in &self.output_blocks {
+            let skip = skips.pop().ok_or("UNet skip stack underflow")?;
+            act = b.concat(&[act, skip], 0);
+            for layer in block {
+                act = layer.emit(&mut b, act, emb, ctx);
+            }
+        }
+        let t = self.out_norm.emit_group(&mut b, act, 1e-5);
+        let t = b.silu(t);
+        let eps = self.out_conv.emit(&mut b, t, 1);
+        b.output(eps);
+        b.compile()
+    }
+
+    /// [`Self::forward_cpu`] on Metal; one program per `(h, w, context_len)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_gpu(
+        &self,
+        x: &[f32],
+        h: usize,
+        w: usize,
+        timestep: f32,
+        context: &[f32],
+        context_len: usize,
+        add: Option<&[f32]>,
+        t_cond: Option<&[f32]>,
+    ) -> Result<Vec<f32>, String> {
+        self.check(x, h, w, context, context_len)?;
+        if add.map(<[f32]>::len) != self.add_embed_dim() {
+            return Err("UNet added conditioning (SDXL text_time) missing or mis-sized".into());
+        }
+        if t_cond.map(<[f32]>::len) != self.cond_dim() {
+            return Err("UNet guidance embedding (time_cond_proj) missing or mis-sized".into());
+        }
+        let net = self.gpu.get(&[h, w, context_len], || self.build_gpu(h, w, context_len))?;
+        let mut inputs = vec![x.to_vec(), timestep_embedding(timestep, self.model_channels), context.to_vec()];
+        inputs.extend(add.map(<[f32]>::to_vec));
+        inputs.extend(t_cond.map(<[f32]>::to_vec));
+        Ok(net.run(inputs)?.remove(0))
+    }
+
+    /// Predicts the model output `[4, h, w]` (eps or v) for latents `x [4, h, w]` at `timestep`,
+    /// conditioned on `context [context_len, context_dim]`, SDXL `add` (`[pooled, time-id embeddings]`)
+    /// and LCM `t_cond` (guidance embedding). A Metal program when the process is GPU-only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        x: &[f32],
+        h: usize,
+        w: usize,
+        timestep: f32,
+        context: &[f32],
+        context_len: usize,
+        add: Option<&[f32]>,
+        t_cond: Option<&[f32]>,
+    ) -> Result<Vec<f32>, String> {
+        if gpu_mode() {
+            self.forward_gpu(x, h, w, timestep, context, context_len, add, t_cond)
+        } else {
+            self.forward_cpu(x, h, w, timestep, context, context_len, add, t_cond)
+        }
     }
 }
 
@@ -918,5 +1134,34 @@ mod tests {
         let sdxl = serde_json::json!({"attention_head_dim": [5, 10, 20], "block_out_channels": [320, 640, 1280]});
         assert_eq!(Heads::from_diffusers(&sdxl).unwrap(), Heads::Dim(64));
         assert_eq!(Heads::Count(8).head_dim(640).unwrap(), 80);
+    }
+
+    /// CPU UNet vs the Metal program: f32 vs f32, 1e-3.
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
+        use crate::model::diff_fixtures::unet_specs;
+        let (ctx, add, cond, h, w, ctx_len) = (48, 24, 16, 8, 12, 5);
+        // f32 checkpoint, then the same weights as a real fp16 checkpoint (linears stay `Wt::F16` on Metal).
+        for half in [false, true] {
+        let mut r = synth(&unet_specs(ctx, add, cond), 11);
+        r.1 = half;
+        let t = Tensors::from_reader(&r).unwrap();
+        let unet = SdUnet::load(&t, "", Heads::Dim(16)).unwrap();
+        assert_eq!(matches!(unet.time0.w, Wt::F16(_)), half);
+        let mut rng = Lcg(2);
+        let (x, c) = (rng.vec(4 * h * w, 1.0), rng.vec(ctx_len * ctx, 1.0));
+        let (a, tc) = (rng.vec(add, 1.0), rng.vec(cond, 1.0));
+        let cpu = unet.forward_cpu(&x, h, w, 301.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
+        let gpu = unet.forward_gpu(&x, h, w, 301.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
+        let e = rel_err(&gpu, &cpu);
+        eprintln!("unet gpu-vs-cpu (f16 weights: {half}) rel err {e:.2e}");
+        assert!(e < 1e-3, "rel err {e}");
+        // A second call at the same size reuses the program; another timestep changes the output.
+        let gpu2 = unet.forward_gpu(&x, h, w, 5.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
+        let cpu2 = unet.forward_cpu(&x, h, w, 5.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
+        assert!(rel_err(&gpu2, &cpu2) < 1e-3 && rel_err(&gpu2, &gpu) > 1e-3);
+        assert_eq!(unet.gpu.get(&[h, w, ctx_len], || Err("rebuilt".into())).unwrap().cpu_node_count(), 0);
+        }
     }
 }
