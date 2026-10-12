@@ -302,7 +302,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let prof = rt.profile();
         telemetry.set_hardware_profile(&prof.device, prof.memory_bandwidth_gbps as f32);
         // S3.6: measured codec efficiencies for the variant predictor; background, never blocks the load.
-        rt.spawn_codec_bench();
+        // Only in the long-lived TUI: a one-shot `--prompt` run would share the GPU with it and exit
+        // before it finishes (the result is saved only on completion).
+        if cli.prompt.is_none() {
+            rt.spawn_codec_bench();
+        }
     }
 
     // 1. Probe Hardware
