@@ -218,6 +218,10 @@ fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
                             if let Op::RmsNorm { eps } = norm_node.op {
                                 if norm_node.inputs.len() >= 2 && norm_node.inputs[0] == res_val {
                                     let norm_w = norm_node.inputs[1];
+                                    // The fused kernel normalises and multiplies one row.
+                                    if graph.value(res_val).shape.iter().rev().skip(1).product::<usize>() != 1 {
+                                        return None;
+                                    }
                                     let hidden_dim =
                                         graph.value(res_val).shape.last().copied().unwrap_or(0);
                                     let intermediate_dim =

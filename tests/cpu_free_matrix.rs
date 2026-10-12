@@ -80,6 +80,8 @@ fn gpu_fixture(f: Family) {
                 assert_eq!(out.len(), 16);
             }
         }
+        Family::T5 => gibbs_engine::model::t5::run_tiny_gpu_fixture(),
+        Family::Seq2Seq => gibbs_engine::model::seq2seq::run_tiny_gpu_fixture(),
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }

@@ -18,6 +18,10 @@ fn snapshot(repo: &str) -> PathBuf {
 }
 
 fn load(repo: &str, weights: &str) -> Option<Arc<dyn NativeLm>> {
+    load_on(repo, weights, Device::Cpu)
+}
+
+fn load_on(repo: &str, weights: &str, device: Device) -> Option<Arc<dyn NativeLm>> {
     let dir = snapshot(repo);
     if !dir.join(weights).exists() {
         eprintln!("SKIP: no {repo} checkpoint in {}", dir.display());
@@ -32,7 +36,7 @@ fn load(repo: &str, weights: &str) -> Option<Arc<dyn NativeLm>> {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, Device::Cpu)
+        load_native(&artifacts, device)
             .expect("T5 types are native")
             .expect("T5 checkpoint loads"),
     )
@@ -75,6 +79,59 @@ fn t5_small_translates_english_to_german() {
         ),
         "Das Haus ist wunderbar."
     );
+}
+
+/// t5-small on the Metal programs vs the native CPU forward: per-step logits agree (f32 vs f32)
+/// through the translation, and the Metal reply is the reference translation.
+#[test]
+fn t5_small_metal_matches_cpu_and_translates() {
+    let (Some(cpu), Some(gpu)) = (
+        load("google-t5/t5-small", "model.safetensors"),
+        load_on("google-t5/t5-small", "model.safetensors", Device::Metal),
+    ) else {
+        return;
+    };
+    assert_eq!(gpu.device(), Device::Metal);
+    let text = "translate English to German: The house is wonderful.";
+    let tok = cpu.tokenizer();
+    let (ids, mut sc) = cpu.prepare(tok.encode(text), &[]).expect("cpu prepare");
+    let (_, mut sg) = gpu.prepare(tok.encode(text), &[]).expect("metal prepare");
+    let mut next = ids[0];
+    let mut worst = 0.0f32;
+    for pos in 0..12 {
+        let a = cpu.forward(&[next], pos, &mut sc).expect("cpu step");
+        let b = gpu.forward(&[next], pos, &mut sg).expect("metal step");
+        let num: f32 = a.iter().zip(&b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let den: f32 = a.iter().map(|x| x * x).sum();
+        let e = (num / den).sqrt();
+        worst = worst.max(e);
+        assert!(e < 1e-3, "step {pos}: rel err {e}");
+        next = (0..a.len()).max_by(|&i, &j| a[i].total_cmp(&a[j])).unwrap() as u32;
+        if tok.ends_generation(next) {
+            break;
+        }
+    }
+    eprintln!("t5-small Metal vs CPU: worst step rel err {worst:e}");
+    assert_eq!(reply(gpu.as_ref(), text, 32), "Das Haus ist wunderbar.");
+}
+
+/// The CLI's generation loop (`--prompt`: builtin drafter lookup, chunked prefill, sampler) on
+/// the Metal model gives the same translation as on the CPU. Greedy: the sampler's PRNG hashes
+/// the candidates' probability bits, so a sampled draw is not comparable across backends.
+#[test]
+fn t5_small_cli_generation_loop_on_metal() {
+    use gibbs_engine::scheduler::ExecutableModel;
+    for device in [Device::Cpu, Device::Metal] {
+        let Some(m) = load_on("google-t5/t5-small", "model.safetensors", device) else {
+            return;
+        };
+        let exec = ExecutableModel::Native(m);
+        let (out, _, _) = exec
+            .generate_text_measured("translate English to German: The house is wonderful.", 32, 0.0, None)
+            .expect("generation");
+        eprintln!("{device:?}: {out:?}");
+        assert_eq!(out.trim(), "Das Haus ist wunderbar.", "{device:?}");
+    }
 }
 
 #[test]

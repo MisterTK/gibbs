@@ -12,6 +12,8 @@
 //! `bad_words_ids`, forced BOS/EOS), as transformers' `generate` does; `forward` then replays the
 //! chosen hypothesis as one-hot logits, so every sampler setting yields the model's translation.
 
+use crate::graph::{DType, Graph, Op, Tensor, ValueId};
+use crate::model::encdec_gpu::{self as eg, Bag, Dims, EncDec, Sig};
 use crate::model::hub::ModelArtifacts;
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::nn;
@@ -209,6 +211,19 @@ pub struct Seq2Seq {
     marian_targets: Vec<String>,
     tgt_lang: String,
     summary: String,
+    act_kind: ActKind,
+    /// The Metal encoder/decoder programs; `Some` on a GPU backend, whose weights moved into it
+    /// (`enc`, `dec`, `lm_head` are then hollow). `None` runs the native CPU forward.
+    gpu: Option<EncDec>,
+}
+
+/// The FFN activation, by name for the Metal graphs (`Seq2Seq::act` is its CPU function).
+#[derive(Clone, Copy)]
+enum ActKind {
+    Relu,
+    Gelu,
+    GeluTanh,
+    Silu,
 }
 
 /// Beam search (`num_beams` > 1): the chosen output, replayed by `forward`.
@@ -217,12 +232,21 @@ struct Replay {
     out: Vec<u32>,
 }
 
+/// The decoder side of one request: the encoder output as cross K/V plus one self-attention
+/// cache per beam, on the CPU or in Metal state buffers.
+enum Run {
+    Cpu {
+        cross: Vec<(Vec<f32>, Vec<f32>)>,
+        n_src: usize,
+        caches: Vec<Cache>,
+    },
+    Gpu(Vec<eg::Seq>),
+}
+
 /// Greedy configs: the decoder runs step by step in `forward`, so sampling, streaming and
 /// cancellation work as for any model.
 struct Live {
-    cross: Vec<(Vec<f32>, Vec<f32>)>,
-    n_src: usize,
-    cache: Cache,
+    run: Run,
     /// Decoder ids so far (prompt included).
     seq: Vec<u32>,
     prompt: usize,
@@ -516,6 +540,7 @@ impl Seq2Seq {
     }
 
     fn encode(&self, ids: &[u32]) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("seq2seq::encode");
         let n = ids.len();
         let s = &self.enc;
         let hd = self.d / s.heads;
@@ -543,6 +568,7 @@ impl Seq2Seq {
         cross: &[(Vec<f32>, Vec<f32>)],
         n_src: usize,
     ) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("seq2seq::decode_step");
         let (b, d, s) = (toks.len(), self.d, &self.dec);
         let mut x: Vec<f32> = toks
             .iter()
@@ -640,15 +666,58 @@ impl Seq2Seq {
         }
     }
 
+    /// Encodes `src` into a request's decoder state with one empty beam.
+    fn begin(&self, src: &[u32]) -> Result<Run, String> {
+        match &self.gpu {
+            Some(gpu) => Ok(Run::Gpu(vec![gpu.start(src)?])),
+            None => Ok(Run::Cpu {
+                cross: self.cross(src),
+                n_src: src.len(),
+                caches: vec![self.empty_cache()],
+            }),
+        }
+    }
+
+    /// One decoder position for every beam (`toks[b]` at `pos`): `[beams, vocab]` logits.
+    fn advance(&self, run: &mut Run, toks: &[u32], pos: usize) -> Result<Vec<f32>, String> {
+        match (run, &self.gpu) {
+            (Run::Cpu { cross, n_src, caches }, _) => {
+                Ok(self.decode_step(toks, pos, caches, cross, *n_src))
+            }
+            (Run::Gpu(beams), Some(gpu)) => {
+                // One program run per beam: each beam owns its self-attention state.
+                let mut logits = Vec::with_capacity(toks.len() * self.vocab);
+                for (seq, &t) in beams.iter_mut().zip(toks) {
+                    debug_assert_eq!(seq.len, pos);
+                    logits.extend(gpu.step(seq, t)?);
+                }
+                Ok(logits)
+            }
+            (Run::Gpu(_), None) => Err("GPU decoder state without a GPU program".into()),
+        }
+    }
+
+    /// Beam `i` continues from beam `parents[i]` (transformers' `reorder_cache`).
+    fn reorder(&self, run: &mut Run, parents: Vec<usize>) -> Result<(), String> {
+        match (run, &self.gpu) {
+            (Run::Cpu { caches, .. }, _) => {
+                *caches = parents.iter().map(|&bi| caches[bi].clone()).collect();
+            }
+            (Run::Gpu(beams), Some(gpu)) => {
+                let next = parents.iter().map(|&bi| gpu.fork(&beams[bi])).collect::<Result<Vec<_>, _>>()?;
+                *beams = next;
+            }
+            (Run::Gpu(_), None) => return Err("GPU decoder state without a GPU program".into()),
+        }
+        Ok(())
+    }
     /// transformers' beam search: the best hypothesis after `prompt`, ending in EOS unless
     /// `max_length` or the request's `max_new_tokens` cut it; Err once `cancel` is set.
     fn search(&self, src: &[u32], prompt: &[u32], ctx: &PrepareCtx) -> Result<Vec<u32>, String> {
-        let n = src.len();
-        let cross = self.cross(src);
-        let mut caches = vec![self.empty_cache()];
+        let mut run = self.begin(src)?;
         let mut logits = Vec::new();
         for (p, &t) in prompt.iter().enumerate() {
-            logits = self.decode_step(&[t], p, &mut caches, &cross, n);
+            logits = self.advance(&mut run, &[t], p)?;
         }
         let (k, v, g) = (self.gen.beams.max(1), self.vocab, &self.gen);
         let cap = g
@@ -719,7 +788,7 @@ impl Seq2Seq {
             if finished || next.is_empty() {
                 break;
             }
-            caches = next.iter().map(|&(bi, _, _)| caches[bi].clone()).collect();
+            self.reorder(&mut run, next.iter().map(|&(bi, _, _)| bi).collect())?;
             beams = next
                 .iter()
                 .map(|&(bi, t, c)| {
@@ -736,7 +805,7 @@ impl Seq2Seq {
                 break;
             }
             let toks: Vec<u32> = beams.iter().map(|b| *b.0.last().unwrap()).collect();
-            logits = self.decode_step(&toks, cur, &mut caches, &cross, n);
+            logits = self.advance(&mut run, &toks, cur)?;
         }
         let (_, seq, eos) = done
             .into_iter()
@@ -987,7 +1056,16 @@ impl Seq2Seq {
 
 impl NativeLm for Seq2Seq {
     fn backend_label(&self) -> String {
-        crate::scheduler::cpu_backend_label()
+        match &self.gpu {
+            Some(gpu) => gpu.backend_label(),
+            None => crate::scheduler::cpu_backend_label(),
+        }
+    }
+    fn device(&self) -> crate::hardware::Device {
+        match self.gpu {
+            Some(_) => crate::hardware::Device::Metal,
+            None => crate::hardware::Device::Cpu,
+        }
     }
     fn summary(&self) -> String {
         self.summary.clone()
@@ -1022,9 +1100,7 @@ impl NativeLm for Seq2Seq {
         // FSMT's Moses spacing needs the whole output, so it always takes the replay path.
         if self.gen.beams <= 1 && self.pieces != Pieces::Fsmt {
             let live = Live {
-                cross: self.cross(&src),
-                n_src: src.len(),
-                cache: self.empty_cache(),
+                run: self.begin(&src)?,
                 seq: Vec::new(),
                 prompt: n,
             };
@@ -1069,13 +1145,7 @@ impl NativeLm for Seq2Seq {
             // The first output token is sampled as its display alias.
             let t = if t >= self.alias { t - self.alias } else { t };
             let pos = live.seq.len();
-            lp = self.decode_step(
-                &[t],
-                pos,
-                std::slice::from_mut(&mut live.cache),
-                &live.cross,
-                live.n_src,
-            );
+            lp = self.advance(&mut live.run, &[t], pos)?;
             live.seq.push(t);
         }
         if live.seq.len() < live.prompt {
@@ -1248,9 +1318,12 @@ fn tokenizer_json_vocab(path: &Path) -> Result<HashMap<String, u32>, String> {
 pub fn load(
     artifacts: &ModelArtifacts,
     cfg: &Value,
-    _mode: impl Into<crate::hardware::PlacementMode>,
+    mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
-    crate::graph::avenues::gate(crate::graph::avenues::Family::Seq2Seq)?;
+    let backend = crate::graph::avenues::resolved_backend(mode.into());
+    if !matches!(backend, crate::hardware::Device::Cpu | crate::hardware::Device::Metal) {
+        return Err(format!("seq2seq has no {backend} program; use metal or --backend cpu"));
+    }
     let arch = cfg["architectures"][0].as_str().unwrap_or("");
     let family = match arch {
         "MarianMTModel" => Family::Marian,
@@ -1458,13 +1531,14 @@ pub fn load(
         data,
         loaded: HashMap::new(),
     };
-    let act: fn(&mut [f32]) = match cfg["activation_function"].as_str().unwrap_or("gelu") {
-        "relu" => |x: &mut [f32]| x.iter_mut().for_each(|v| *v = v.max(0.0)),
-        "gelu" => nn::gelu,
-        "gelu_new" | "gelu_pytorch_tanh" => nn::gelu_tanh,
-        "swish" | "silu" => nn::silu,
-        a => return Err(format!("activation '{a}' is not supported")),
-    };
+    let (act, act_kind): (fn(&mut [f32]), ActKind) =
+        match cfg["activation_function"].as_str().unwrap_or("gelu") {
+            "relu" => (|x: &mut [f32]| x.iter_mut().for_each(|v| *v = v.max(0.0)), ActKind::Relu),
+            "gelu" => (nn::gelu, ActKind::Gelu),
+            "gelu_new" | "gelu_pytorch_tanh" => (nn::gelu_tanh, ActKind::GeluTanh),
+            "swish" | "silu" => (nn::silu, ActKind::Silu),
+            a => return Err(format!("activation '{a}' is not supported")),
+        };
     // Checkpoints drop tied copies (wmt19-en-de keeps only the encoder table, bart-large-cnn's
     // safetensors only the decoder's): take the first table present.
     let (shared, enc, dec) = (
@@ -1618,7 +1692,7 @@ pub fn load(
             )
         },
     );
-    Ok(Arc::new(Seq2Seq {
+    let mut model = Seq2Seq {
         family,
         d,
         enc,
@@ -1651,7 +1725,433 @@ pub fn load(
         marian_targets,
         tgt_lang: cfg["langs"][1].as_str().unwrap_or("").to_string(),
         summary: summary.trim_end().to_string(),
-    }))
+        act_kind,
+        gpu: None,
+    };
+    if backend == crate::hardware::Device::Metal {
+        model.gpu = Some(model.build_gpu().map_err(|e| format!("seq2seq: {e}"))?);
+    }
+    Ok(Arc::new(model))
+}
+
+// ---------------------------------------------------------------------------
+// Metal programs (see `model::encdec_gpu`)
+// ---------------------------------------------------------------------------
+
+/// What the Metal graphs need besides the weights.
+#[derive(Clone)]
+struct Plan {
+    d: usize,
+    enc_heads: usize,
+    dec_heads: usize,
+    pre_ln: bool,
+    ln_emb: bool,
+    embed_scale: f32,
+    act: ActKind,
+    enc_layers: usize,
+    dec_layers: usize,
+    enc_embed: String,
+    dec_embed: String,
+    head: String,
+    logits_bias: bool,
+}
+
+impl Seq2Seq {
+    /// Moves the weights into the Metal encoder/decoder programs, leaving the CPU copies hollow.
+    fn build_gpu(&mut self) -> Result<EncDec, String> {
+        let d = self.d;
+        let mut bag = Bag::default();
+        let table = |bag: &mut Bag, name: &str, t: &Arc<Vec<f32>>| {
+            bag.add(name, vec![t.len() / d, d], DType::F32, Tensor::F32((**t).clone()))
+        };
+        let (ee, de, lh) = (self.enc.embed.clone(), self.dec.embed.clone(), self.lm_head.clone());
+        let enc_embed = if Arc::ptr_eq(&ee, &de) { "embed" } else { "enc.embed" };
+        let dec_embed = if Arc::ptr_eq(&ee, &de) { "embed" } else { "dec.embed" };
+        table(&mut bag, enc_embed, &ee);
+        if dec_embed != enc_embed {
+            table(&mut bag, dec_embed, &de);
+        }
+        let head = if Arc::ptr_eq(&lh, &de) {
+            dec_embed
+        } else if Arc::ptr_eq(&lh, &ee) {
+            enc_embed
+        } else {
+            table(&mut bag, "lm_head", &lh);
+            "lm_head"
+        };
+        let plan = Plan {
+            d,
+            enc_heads: self.enc.heads,
+            dec_heads: self.dec.heads,
+            pre_ln: self.pre_ln,
+            ln_emb: self.enc.ln_emb.is_some(),
+            embed_scale: self.embed_scale,
+            act: self.act_kind,
+            enc_layers: self.enc.layers.len(),
+            dec_layers: self.dec.layers.len(),
+            enc_embed: enc_embed.into(),
+            dec_embed: dec_embed.into(),
+            head: head.into(),
+            logits_bias: self.logits_bias.is_some(),
+        };
+        drop((ee, de, lh));
+        let empty = || Arc::new(Vec::new());
+        (self.enc.embed, self.dec.embed, self.lm_head) = (empty(), empty(), empty());
+        put_stack(&mut bag, "enc", &mut self.enc, d);
+        put_stack(&mut bag, "dec", &mut self.dec, d);
+        if let Some(b) = &mut self.logits_bias {
+            let n = b.len();
+            bag.add("logits_bias", vec![n], DType::F32, Tensor::F32(std::mem::take(b)));
+        }
+        let dims = Dims {
+            layers: plan.dec_layers,
+            inner: d,
+            enc_cap: self.max_pos,
+            self_cap: self.gen.max_len.max(2),
+            row_offset: Some(self.dec.pos_offset),
+            self_mask: false,
+        };
+        let sig = bag.sig();
+        let dec = decoder_graph(&plan, &sig, &dims);
+        let build_enc = Box::new(move |n| encoder_graph(&plan, &sig, n));
+        EncDec::new(dims, bag, build_enc, dec)
+    }
+}
+
+fn put_lin(bag: &mut Bag, name: &str, l: &mut Lin) {
+    let out = l.b.len();
+    let inp = l.w.len() / out.max(1);
+    bag.add(&format!("{name}.w"), vec![out, inp], DType::F32, Tensor::F32(std::mem::take(&mut l.w)));
+    bag.add(&format!("{name}.b"), vec![out], DType::F32, Tensor::F32(std::mem::take(&mut l.b)));
+}
+
+fn put_ln(bag: &mut Bag, name: &str, l: &mut Ln) {
+    let n = l.g.len();
+    bag.add(&format!("{name}.g"), vec![n], DType::F32, Tensor::F32(std::mem::take(&mut l.g)));
+    bag.add(&format!("{name}.b"), vec![n], DType::F32, Tensor::F32(std::mem::take(&mut l.b)));
+}
+
+fn put_attn(bag: &mut Bag, p: &str, a: &mut Attn) {
+    for (n, l) in [("q", &mut a.q), ("k", &mut a.k), ("v", &mut a.v), ("o", &mut a.o)] {
+        put_lin(bag, &format!("{p}.{n}"), l);
+    }
+    put_ln(bag, &format!("{p}.ln"), &mut a.ln);
+}
+
+/// `{side}.pos`, `.lnemb`, `.final_ln`, and per layer `.{i}.sa/ca.{q,k,v,o,ln}`, `.fc1`, `.fc2`, `.ffln`.
+fn put_stack(bag: &mut Bag, side: &str, s: &mut Stack, d: usize) {
+    let pos = std::mem::take(&mut s.pos);
+    bag.add(&format!("{side}.pos"), vec![pos.len() / d, d], DType::F32, Tensor::F32(pos));
+    if let Some(l) = &mut s.ln_emb {
+        put_ln(bag, &format!("{side}.lnemb"), l);
+    }
+    if let Some(l) = &mut s.final_ln {
+        put_ln(bag, &format!("{side}.final_ln"), l);
+    }
+    for (i, l) in s.layers.iter_mut().enumerate() {
+        let p = format!("{side}.{i}");
+        put_attn(bag, &format!("{p}.sa"), &mut l.sa);
+        if let Some(ca) = &mut l.ca {
+            put_attn(bag, &format!("{p}.ca"), ca);
+        }
+        put_lin(bag, &format!("{p}.fc1"), &mut l.fc1);
+        put_lin(bag, &format!("{p}.fc2"), &mut l.fc2);
+        put_ln(bag, &format!("{p}.ffln"), &mut l.ff_ln);
+    }
+}
+
+fn g_lin(g: &mut Graph, sig: &Sig, name: &str, x: ValueId, n: usize) -> ValueId {
+    let (w, b) = (sig.w(g, &format!("{name}.w")), sig.w(g, &format!("{name}.b")));
+    let rows = g.value(w).shape[0];
+    eg::node(g, name.to_string(), Op::Linear, &[x, w, b], &[n, rows])
+}
+
+fn g_ln(g: &mut Graph, sig: &Sig, name: &str, x: ValueId, shape: &[usize]) -> ValueId {
+    let (gamma, beta) = (sig.w(g, &format!("{name}.g")), sig.w(g, &format!("{name}.b")));
+    eg::node(g, format!("{name}.out"), Op::LayerNorm { eps: 1e-5 }, &[x, gamma, beta], shape)
+}
+
+/// `x += f(norm(x))` (pre-LN) or `x = norm(x + f(x))` (post-LN).
+fn g_residual(
+    g: &mut Graph,
+    sig: &Sig,
+    p: &Plan,
+    n: usize,
+    ln: &str,
+    x: ValueId,
+    f: impl FnOnce(&mut Graph, ValueId) -> ValueId,
+) -> ValueId {
+    let shape = [n, p.d];
+    let h = if p.pre_ln { g_ln(g, sig, ln, x, &shape) } else { x };
+    let y = f(g, h);
+    let s = eg::node(g, format!("{ln}.res"), Op::Add, &[x, y], &shape);
+    if p.pre_ln {
+        s
+    } else {
+        g_ln(g, sig, ln, s, &shape)
+    }
+}
+
+fn g_ffn(g: &mut Graph, sig: &Sig, p: &Plan, pre: &str, h: ValueId, n: usize) -> ValueId {
+    let a = g_lin(g, sig, &format!("{pre}.fc1"), h, n);
+    let shape = g.value(a).shape.clone();
+    let op = match p.act {
+        ActKind::Relu => Op::Relu,
+        ActKind::Gelu => Op::Gelu { tanh: false },
+        ActKind::GeluTanh => Op::Gelu { tanh: true },
+        ActKind::Silu => Op::Silu,
+    };
+    let a = eg::node(g, format!("{pre}.act"), op, &[a], &shape);
+    g_lin(g, sig, &format!("{pre}.fc2"), a, n)
+}
+
+/// Scaled token embedding + position row (+ `layernorm_embedding`) of `n` ids.
+#[allow(clippy::too_many_arguments)]
+fn g_embed(
+    g: &mut Graph,
+    sig: &Sig,
+    p: &Plan,
+    side: &str,
+    table: &str,
+    ids: ValueId,
+    rows: ValueId,
+    n: usize,
+) -> ValueId {
+    let shape = [n, p.d];
+    let t = sig.w(g, table);
+    let mut e = eg::node(g, format!("{side}.tok"), Op::Embedding, &[t, ids], &shape);
+    if p.embed_scale != 1.0 {
+        e = eg::scale(g, format!("{side}.tok_scaled"), e, p.embed_scale, &shape);
+    }
+    let pt = sig.w(g, &format!("{side}.pos"));
+    let pe = eg::node(g, format!("{side}.posrow"), Op::Embedding, &[pt, rows], &shape);
+    let x = eg::node(g, format!("{side}.embed"), Op::Add, &[e, pe], &shape);
+    if p.ln_emb {
+        g_ln(g, sig, &format!("{side}.lnemb"), x, &shape)
+    } else {
+        x
+    }
+}
+
+fn mha(heads: usize) -> Op {
+    Op::Attention { heads, kv_heads: heads, causal: false, window: None, soft_cap: None }
+}
+
+/// Encoder over `n` (padded) source rows: ids, position rows and a `[n]` key mask in; every
+/// decoder layer's cross K/V projection (`xk`, `xv`, ...) out.
+fn encoder_graph(p: &Plan, sig: &Sig, n: usize) -> Graph {
+    let mut g = Graph::new();
+    let ids = g.input("ids", vec![n], DType::U32);
+    let rows = g.input("pos", vec![n], DType::U32);
+    let mask = g.input("mask", vec![n], DType::F32);
+    let mut x = g_embed(&mut g, sig, p, "enc", &p.enc_embed, ids, rows, n);
+    for i in 0..p.enc_layers {
+        let pre = format!("enc.{i}");
+        x = g_residual(&mut g, sig, p, n, &format!("{pre}.sa.ln"), x, |g, h| {
+            let q = g_lin(g, sig, &format!("{pre}.sa.q"), h, n);
+            let k = g_lin(g, sig, &format!("{pre}.sa.k"), h, n);
+            let v = g_lin(g, sig, &format!("{pre}.sa.v"), h, n);
+            let a = eg::node(g, format!("{pre}.sa.attn"), mha(p.enc_heads), &[q, k, v, mask], &[n, p.d]);
+            g_lin(g, sig, &format!("{pre}.sa.o"), a, n)
+        });
+        x = g_residual(&mut g, sig, p, n, &format!("{pre}.ffln"), x, |g, h| g_ffn(g, sig, p, &pre, h, n));
+    }
+    if p.pre_ln {
+        x = g_ln(&mut g, sig, "enc.final_ln", x, &[n, p.d]);
+    }
+    for l in 0..p.dec_layers {
+        for kv in ["k", "v"] {
+            let out = g_lin(&mut g, sig, &format!("dec.{l}.ca.{kv}"), x, n);
+            g.output(out);
+        }
+    }
+    g
+}
+
+/// One decoder position: ids `[1]`, position `[1]`, position row `[1]` and the `[enc_cap]` cross
+/// mask in, logits `[1, vocab]` out. Self-attention is a `CachedAttention` over `sk/sv.{l}`,
+/// cross-attention an `Attention` over the `xk/xv.{l}` state.
+fn decoder_graph(p: &Plan, sig: &Sig, dims: &Dims) -> Graph {
+    let mut g = Graph::new();
+    let ids = g.input("ids", vec![1], DType::U32);
+    let pos = g.input("pos", vec![1], DType::U32);
+    let rows = g.input("row", vec![1], DType::U32);
+    let cross_mask = g.input("cross_mask", vec![dims.enc_cap], DType::F32);
+    let mut x = g_embed(&mut g, sig, p, "dec", &p.dec_embed, ids, rows, 1);
+    let hd = p.d / p.dec_heads;
+    for i in 0..p.dec_layers {
+        let pre = format!("dec.{i}");
+        let (sk, sv) = eg::self_states(&mut g, i, dims);
+        x = g_residual(&mut g, sig, p, 1, &format!("{pre}.sa.ln"), x, |g, h| {
+            let q = g_lin(g, sig, &format!("{pre}.sa.q"), h, 1);
+            let k = g_lin(g, sig, &format!("{pre}.sa.k"), h, 1);
+            let v = g_lin(g, sig, &format!("{pre}.sa.v"), h, 1);
+            let op = Op::CachedAttention {
+                heads: p.dec_heads,
+                kv_heads: p.dec_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 1.0 / (hd as f32).sqrt(),
+                causal: true,
+                window: None,
+                soft_cap: None,
+                write: true,
+            };
+            let a = eg::node(g, format!("{pre}.sa.attn"), op, &[q, k, v, sk, sv, pos], &[1, p.d]);
+            g_lin(g, sig, &format!("{pre}.sa.o"), a, 1)
+        });
+        let (xk, xv) = eg::cross_states(&mut g, i, dims);
+        x = g_residual(&mut g, sig, p, 1, &format!("{pre}.ca.ln"), x, |g, h| {
+            let q = g_lin(g, sig, &format!("{pre}.ca.q"), h, 1);
+            let a = eg::node(g, format!("{pre}.ca.attn"), mha(p.dec_heads), &[q, xk, xv, cross_mask], &[1, p.d]);
+            g_lin(g, sig, &format!("{pre}.ca.o"), a, 1)
+        });
+        x = g_residual(&mut g, sig, p, 1, &format!("{pre}.ffln"), x, |g, h| g_ffn(g, sig, p, &pre, h, 1));
+    }
+    if p.pre_ln {
+        x = g_ln(&mut g, sig, "dec.final_ln", x, &[1, p.d]);
+    }
+    let head = sig.w(&mut g, &p.head);
+    let vocab = g.value(head).shape[0];
+    let mut ins = vec![x, head];
+    if p.logits_bias {
+        ins.push(sig.w(&mut g, "logits_bias"));
+    }
+    let logits = eg::node(&mut g, "logits", Op::Linear, &ins, &[1, vocab]);
+    g.output(logits);
+    g
+}
+
+/// The fixed LCG of the other tiny fixtures.
+struct Lcg(u64);
+
+impl Lcg {
+    fn vec(&mut self, n: usize, amp: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    }
+    fn lin(&mut self, rows: usize, cols: usize) -> Lin {
+        Lin { w: self.vec(rows * cols, 0.3), b: self.vec(rows, 0.1) }
+    }
+    fn ln(&mut self, n: usize) -> Ln {
+        Ln { g: self.vec(n, 0.2).iter().map(|x| 1.0 + x).collect(), b: self.vec(n, 0.1) }
+    }
+}
+
+/// A random encoder-decoder (2+2 layers, d_model 32, 4 heads, vocab 40, 80 positions) of
+/// `family`'s layout for tests and the GPU fixture.
+fn tiny(seed: u64, family: Family, beams: usize) -> Seq2Seq {
+    let (d, vocab, max_pos, ffn) = (32usize, 40usize, 80usize, 64usize);
+    let mut r = Lcg(seed);
+    let pre_ln = matches!(family, Family::M2m100 | Family::MBart);
+    let has_ln_emb = matches!(family, Family::MBart | Family::Bart);
+    let embed = Arc::new(r.vec(vocab * d, 0.5));
+    let stack = |r: &mut Lcg, decoder: bool| {
+        let (pos, pos_offset) = match family {
+            Family::Marian => (sinusoidal_marian(max_pos, d), 0),
+            Family::M2m100 | Family::Fsmt => (sinusoidal_fairseq(max_pos + 2, d), 2),
+            Family::MBart | Family::Bart => (r.vec((max_pos + 2) * d, 0.5), 2),
+        };
+        let attn = |r: &mut Lcg| Attn {
+            q: r.lin(d, d),
+            k: r.lin(d, d),
+            v: r.lin(d, d),
+            o: r.lin(d, d),
+            ln: r.ln(d),
+        };
+        let layers = (0..2)
+            .map(|_| Layer {
+                sa: attn(r),
+                ca: decoder.then(|| attn(r)),
+                fc1: r.lin(ffn, d),
+                fc2: r.lin(d, ffn),
+                ff_ln: r.ln(d),
+            })
+            .collect();
+        Stack {
+            embed: embed.clone(),
+            pos,
+            pos_offset,
+            ln_emb: has_ln_emb.then(|| r.ln(d)),
+            layers,
+            final_ln: pre_ln.then(|| r.ln(d)),
+            heads: 4,
+        }
+    };
+    let (enc, dec) = (stack(&mut r, false), stack(&mut r, true));
+    let tied = family != Family::M2m100;
+    let lm_head = if tied { embed.clone() } else { Arc::new(r.vec(vocab * d, 0.5)) };
+    let logits_bias = matches!(family, Family::Marian | Family::Bart).then(|| r.vec(vocab, 0.2));
+    let (act, act_kind): (fn(&mut [f32]), ActKind) = match family {
+        Family::Marian => (|x: &mut [f32]| x.iter_mut().for_each(|v| *v = v.max(0.0)), ActKind::Relu),
+        Family::M2m100 => (nn::silu, ActKind::Silu),
+        _ => (nn::gelu, ActKind::Gelu),
+    };
+    Seq2Seq {
+        family,
+        d,
+        enc,
+        dec,
+        lm_head,
+        logits_bias,
+        vocab,
+        act,
+        pre_ln,
+        embed_scale: if matches!(family, Family::Marian | Family::M2m100) { (d as f32).sqrt() } else { 1.0 },
+        max_pos,
+        gen: Gen {
+            beams,
+            max_len: 30,
+            min_len: 0,
+            length_penalty: 1.0,
+            no_repeat: 0,
+            early_stopping: false,
+            renormalize: false,
+            forced_eos: None,
+            bad: Vec::new(),
+        },
+        eos: 2,
+        bos: 0,
+        decoder_start: 2,
+        forced_bos: None,
+        source: Source::Hf(byte_passthrough().expect("byte tokenizer")),
+        tok: Tokenizer::from_tokens((0..2 * vocab).map(|i| format!("t{i}")).collect()),
+        alias: vocab as u32,
+        pieces: Pieces::Spm,
+        raw: HashMap::new(),
+        langs: Vec::new(),
+        src_default: None,
+        tgt_default: None,
+        legacy_mbart: false,
+        marian_targets: Vec::new(),
+        tgt_lang: String::new(),
+        summary: "tiny seq2seq".into(),
+        act_kind,
+        gpu: None,
+    }
+}
+
+/// Tiny random BART on Metal: encoder, a 3-beam search (forks beam state on the GPU) and greedy
+/// steps; panics unless every node of every program ran on the GPU. The matrix test's fixture.
+pub fn run_tiny_gpu_fixture() {
+    let mut m = tiny(3, Family::Bart, 3);
+    m.gpu = Some(m.build_gpu().expect("tiny seq2seq compiles on Metal"));
+    let src = [5u32, 9, 12, 7, 20];
+    let ctx = PrepareCtx { max_new_tokens: 8, cancel: None };
+    let out = m.search(&src, &[m.decoder_start], &ctx).expect("beam search runs on Metal");
+    assert!(!out.is_empty());
+    let mut run = m.begin(&src).expect("encoder runs on Metal");
+    let mut tok = m.decoder_start;
+    for pos in 0..3 {
+        let logits = m.advance(&mut run, &[tok], pos).expect("decoder runs on Metal");
+        assert!(logits.iter().all(|v| v.is_finite()));
+        tok = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
+    }
+    assert_eq!(m.gpu.as_ref().expect("built above").cpu_node_count(), 0);
 }
 
 #[cfg(test)]
@@ -1669,5 +2169,81 @@ mod tests {
             moses_tokenize("Mr. Smith's e-mail costs $5,300.", "en"),
             "Mr. Smith &apos;s e @-@ mail costs $ 5,300 ."
         );
+    }
+
+    fn rel_err(a: &[f32], b: &[f32]) -> f32 {
+        let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let den: f32 = a.iter().map(|x| x * x).sum();
+        (num / den).sqrt()
+    }
+
+    /// Per-step logits of the CPU forward vs the Metal programs, teacher-forced on the CPU's
+    /// greedy tokens, for sources of a 64-bucket and a full-length-bucket size.
+    fn step_parity(family: Family) {
+        for src_len in [9usize, 70] {
+            let cpu = tiny(5, family, 1);
+            let mut gpu = tiny(5, family, 1);
+            gpu.gpu = Some(gpu.build_gpu().expect("tiny seq2seq compiles on Metal"));
+            let src: Vec<u32> = (0..src_len as u32).map(|i| 3 + (i * 7) % 30).collect();
+            let _cpu_ok = crate::hardware::cpu_compute::allow();
+            let (mut rc, mut rg) = (cpu.begin(&src).unwrap(), gpu.begin(&src).unwrap());
+            let mut tok = cpu.decoder_start;
+            let mut worst = 0.0f32;
+            for pos in 0..12 {
+                let a = cpu.advance(&mut rc, &[tok], pos).unwrap();
+                let b = gpu.advance(&mut rg, &[tok], pos).unwrap();
+                let e = rel_err(&a, &b);
+                worst = worst.max(e);
+                assert!(e < 1e-3, "{src_len}-token source, step {pos}: rel err {e}");
+                tok = (0..a.len()).max_by(|&i, &j| a[i].total_cmp(&a[j])).unwrap() as u32;
+            }
+            eprintln!("seq2seq {src_len}-token source: worst step rel err {worst:e}");
+            assert_eq!(gpu.gpu.as_ref().unwrap().cpu_node_count(), 0);
+        }
+    }
+
+    #[test]
+    fn metal_matches_cpu_marian() {
+        step_parity(Family::Marian);
+    }
+
+    #[test]
+    fn metal_matches_cpu_bart() {
+        step_parity(Family::Bart);
+    }
+
+    #[test]
+    fn metal_matches_cpu_m2m100_prenorm() {
+        step_parity(Family::M2m100);
+    }
+
+    #[test]
+    fn metal_matches_cpu_mbart_prenorm_layernorm_embedding() {
+        step_parity(Family::MBart);
+    }
+
+    /// Beam search (4 beams, host bookkeeping over GPU logits, beam state forked on the GPU) picks
+    /// the same hypothesis as the CPU search, and the greedy `forward` path agrees.
+    #[test]
+    fn beam_search_matches_cpu() {
+        for family in [Family::Marian, Family::Bart, Family::M2m100] {
+            let cpu = tiny(11, family, 4);
+            let mut gpu = tiny(11, family, 4);
+            gpu.gpu = Some(gpu.build_gpu().expect("tiny seq2seq compiles on Metal"));
+            let _cpu_ok = crate::hardware::cpu_compute::allow();
+            let ctx = PrepareCtx { max_new_tokens: 12, cancel: None };
+            let src: Vec<u32> = (0..11u32).map(|i| 3 + (i * 5) % 30).collect();
+            let prompt = [cpu.decoder_start];
+            let want = cpu.search(&src, &prompt, &ctx).unwrap();
+            let got = gpu.search(&src, &prompt, &ctx).unwrap();
+            assert_eq!(want, got, "{family:?}: beam hypotheses differ");
+            assert!(!want.is_empty());
+            assert_eq!(gpu.gpu.as_ref().unwrap().cpu_node_count(), 0);
+        }
+    }
+
+    #[test]
+    fn tiny_fixture_runs_on_metal() {
+        run_tiny_gpu_fixture();
     }
 }
