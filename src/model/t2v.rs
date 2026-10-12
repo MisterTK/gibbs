@@ -1,5 +1,5 @@
-//! ModelScope text-to-video (`ali-vilab/text-to-video-ms-1.7b`, diffusers TextToVideoSDPipeline) on the CPU:
-//! CLIP text encoder + UNet3D + AutoencoderKL from the repo's fp16 safetensors, DDIM ("leading" spacing,
+//! ModelScope text-to-video (`ali-vilab/text-to-video-ms-1.7b`, diffusers TextToVideoSDPipeline): CLIP text
+//! encoder + UNet3D + AutoencoderKL (Metal programs when GPU-only) from the repo's fp16 safetensors, DDIM ("leading" spacing,
 //! steps_offset 1, eta 0, set_alpha_to_one false) with classifier-free guidance against the "" prompt.
 
 use crate::model::clip::{ClipTextTransformer, Tensors};
@@ -68,7 +68,6 @@ impl TextToVideoPipeline {
     }
 
     pub fn load(hub: &HuggingFaceHub, repo_id: &str) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoModelScope)?;
         let fetch = |file: &str| -> Result<PathBuf, String> {
             println!("Fetching {repo_id}/{file} (reused if cached)");
             let path = hub

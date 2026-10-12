@@ -10,11 +10,13 @@
 use super::{Enc, PlanOut};
 use super::super::{Planned, Session};
 use crate::graph::{DType, Graph, Node, Op, ValueId};
+use metal::MTLSize;
 use std::collections::HashMap;
 
 pub(super) const MSL: &str = include_str!("conv.metal");
 /// Compute functions in `conv.metal`.
-pub(super) const KERNELS: &[&str] = &["conv2d_gen_f32", "conv3d_gen_f32", "avgpool2d_f32"];
+pub(super) const KERNELS: &[&str] =
+    &["conv2d_gen_f32", "conv3d_gen_f32", "avgpool2d_f32", "conv_igemm_q2", "conv_igemm_q4"];
 
 /// Steps this group adds to the executor.
 #[derive(Debug, Clone)]
@@ -32,6 +34,16 @@ pub enum Step {
         x: ValueId,
         p: [u32; 9],
         total: usize,
+    },
+    /// Implicit-GEMM convolution (groups == 1): `p` is `ConvGemmParams`, `tiles` the (pixel, channel,
+    /// batch) threadgroup grid.
+    ConvGemm {
+        x: ValueId,
+        w: ValueId,
+        bias: Option<ValueId>,
+        kernel: &'static str,
+        p: [u32; 24],
+        tiles: [u64; 3],
     },
 }
 
@@ -117,6 +129,19 @@ fn plan_conv(
     }
     let u = |v: usize| v as u32;
     let has_bias = u(bias.is_some() as usize);
+    if groups == 1 {
+        let (kk, ss) = (c_in * k.iter().product::<usize>(), out.iter().product::<usize>());
+        let p = [
+            u(n), u(c_in), u(inp[0]), u(inp[1]), u(inp[2]), u(c_out), u(k[0]), u(k[1]), u(k[2]),
+            u(stride[0]), u(stride[1]), u(stride[2]), u(pb[0]), u(pb[1]), u(pb[2]), u(dil[0]), u(dil[1]),
+            u(dil[2]), u(out[0]), u(out[1]), u(out[2]), has_bias, u(kk), u(ss),
+        ];
+        // Same tile choice as the MatMul kernels: small tiles when the big ones would leave the GPU idle.
+        let tiles = |t: usize| [ss.div_ceil(t) as u64, c_out.div_ceil(t) as u64, n as u64];
+        let big = tiles(64).iter().product::<u64>() >= 32;
+        let (kernel, grid) = if big { ("conv_igemm_q4", tiles(64)) } else { ("conv_igemm_q2", tiles(32)) };
+        return Ok((Step::ConvGemm { x, w, bias, kernel, p, tiles: grid }, total));
+    }
     let (kernel, p) = if nd == 3 {
         (
             "conv3d_gen_f32",
@@ -195,6 +220,7 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match st {
         Step::Conv { x, w, bias, .. } => [Some(*x), Some(*w), *bias].into_iter().flatten().collect(),
         Step::AvgPool { x, .. } => vec![*x],
+        Step::ConvGemm { x, w, bias, .. } => [Some(*x), Some(*w), *bias].into_iter().flatten().collect(),
     }
 }
 
@@ -213,6 +239,15 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             e.bind(3, s.out);
             e.enc.set_bytes(4, (p.len() * 4) as u64, p.as_ptr() as *const std::ffi::c_void);
             e.grid1(*total);
+        }
+        Step::ConvGemm { x, w, bias, kernel, p, tiles } => {
+            e.enc.set_compute_pipeline_state(sess.rt.pso(kernel)?);
+            e.bind(0, *x);
+            e.bind(1, *w);
+            e.bind(2, bias.unwrap_or(*x));
+            e.bind(3, s.out);
+            super::super::set_bytes(e.enc, 4, p);
+            e.enc.dispatch_thread_groups(MTLSize::new(tiles[0], tiles[1], tiles[2]), MTLSize::new(128, 1, 1));
         }
         Step::AvgPool { x, p, total } => {
             e.enc.set_compute_pipeline_state(sess.rt.pso("avgpool2d_f32")?);
@@ -297,6 +332,10 @@ mod tests {
         conv2d("single pixel", [3, 1, 1], 2, [1, 1], [1, 1], [0, 0, 0, 0], [1, 1], 1, true);
         conv2d("kernel = padded input", [2, 3, 3], 2, [5, 5], [1, 1], [1, 1, 1, 1], [1, 1], 1, true);
         conv2d("big channels", [37, 5, 5], 33, [3, 3], [1, 1], [1, 1, 1, 1], [1, 1], 1, true);
+        // Enough tiles for the 64-wide GEMM kernel, with partial edge tiles in both dims.
+        conv2d("igemm q4", [8, 40, 41], 70, [3, 3], [1, 1], [1, 1, 1, 1], [1, 1], 1, true);
+        conv2d("igemm q4 stride 2 asym pad", [5, 67, 66], 65, [3, 3], [2, 2], [0, 1, 1, 0], [1, 1], 1, false);
+        conv2d("igemm k tail (K = 3*25 + 1 channel)", [3, 33, 33], 130, [5, 5], [1, 1], [2, 2, 2, 2], [1, 1], 1, true);
     }
 
     #[test]
@@ -304,6 +343,17 @@ mod tests {
         let (xs, ws) = ([2, 4, 7, 7], [6, 2, 3, 3]);
         let op = Op::Conv2d { stride: [2, 2], padding: [1, 1, 1, 1], dilation: [1, 1], groups: 2 };
         check("batch 2 groups 2", op, &xs, &ws, true, &[2, 6, 4, 4]);
+    }
+
+    /// groups = 1 through the implicit-GEMM kernel: batch on the grid z axis, several K steps with a tail
+    /// (c_in 37 x 9 = 333), full 64-wide tiles on both axes, and a UNet-like 160-channel layer.
+    #[test]
+    fn conv2d_igemm_batched_and_wide_matches_cpu() {
+        let op = Op::Conv2d { stride: [1, 1], padding: [1; 4], dilation: [1, 1], groups: 1 };
+        check("batch 3 k tail", op.clone(), &[3, 37, 20, 22], &[70, 37, 3, 3], true, &[3, 70, 20, 22]);
+        check("unet-like 160ch", op.clone(), &[160, 24, 24], &[160, 160, 3, 3], true, &[160, 24, 24]);
+        check("1x1 batch 2 no bias", Op::Conv2d { stride: [1, 1], padding: [0; 4], dilation: [1, 1], groups: 1 },
+            &[2, 96, 17, 19], &[130, 96, 1, 1], false, &[2, 130, 17, 19]);
     }
 
     /// The old CPU conv (`nn::conv2d`) agrees with the generalized reference on its own domain.
@@ -401,6 +451,43 @@ mod tests {
         conv3d("1x1x1x1", &[3, 1, 1, 1], 2, [1, 1, 1], [1; 3], [0; 6], [1; 3], 1, true);
         conv3d("batch 2", &[2, 3, 4, 5, 5], 4, [3, 3, 3], [1; 3], [1; 6], [1; 3], 1, true);
         conv3d("wide 129", &[1, 2, 2, 129], 2, [1, 1, 3], [1; 3], [0, 0, 1, 0, 0, 1], [1; 3], 1, false);
+        conv3d("igemm q4", &[6, 5, 20, 20], 70, [3, 3, 3], [1; 3], [2, 1, 1, 0, 1, 1], [1; 3], 1, true);
+    }
+
+    /// Direct (groups = 2) vs implicit-GEMM (groups = 1) throughput on a 128-channel 3x3 conv at
+    /// 256x256: `cargo test --release --lib conv_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn conv_throughput() {
+        for (groups, c, k) in [(2usize, 128usize, 3usize), (1, 128, 3), (1, 320, 3), (1, 128, 1)] {
+            let (h, w) = (256usize, 256usize);
+            let ws = [c, c / groups, k, k];
+            let mut g = Graph::new();
+            let x = g.input("x", vec![c, h, w], DType::F32);
+            let wi = g.weight("w", ws.to_vec(), DType::F32);
+            let y = g.add(
+                "conv",
+                Op::Conv2d { stride: [1, 1], padding: [k / 2; 4], dilation: [1, 1], groups },
+                &[x, wi],
+                vec![c, h, w],
+                DType::F32,
+            );
+            g.output(y);
+            let mut wt = Weights::new();
+            wt.insert("w", Tensor::F32(rand(ws.iter().product(), 7)));
+            let sess = Session::new(rt(), &wt).unwrap();
+            let plan = sess.prepare_plan(&g).unwrap();
+            let data = rand(c * h * w, 3);
+            let inp = || vec![Tensor::F32(data.clone())];
+            sess.run_prepared(&g, &plan, None, inp()).unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..5 {
+                sess.run_prepared(&g, &plan, None, inp()).unwrap();
+            }
+            let dt = t.elapsed().as_secs_f64() / 5.0;
+            let flops = 2.0 * (c * c / groups * k * k * h * w) as f64;
+            eprintln!("conv c={c} k={k} groups={groups}: {:.1} ms, {:.0} GFLOP/s", dt * 1e3, flops / dt / 1e9);
+        }
     }
 
     fn pool(label: &str, xs: &[usize], kernel: [usize; 2], stride: [usize; 2]) {
