@@ -353,6 +353,9 @@ pub enum QuantFormat {
     INT4_G32,
     INT4_G64,
     INT4_G128,
+    /// ggml type 40 `block_nvfp4`: per 64 elements, 4 UE4M3 scale bytes (one per 16) + 32 nibble bytes.
+    /// Not the `NVFP4`/`NVFP4_E2M1` layout (`Nvfp4Tensor`: f32 scale per 16 elements).
+    GGUF_NVFP4,
 }
 impl QuantFormat {
     pub fn bits_per_weight(&self) -> f32 {
@@ -371,6 +374,7 @@ impl QuantFormat {
             Self::GGUF_IQ3_XXS => 3.0625,
             Self::GGUF_Q3_K | Self::GGUF_IQ3_S => 3.4375,
             Self::MXFP4 | Self::GGUF_IQ4_XS => 4.25,
+            Self::GGUF_NVFP4 => 4.5,
             Self::EXL3_3Bit => 3.0,
             Self::TurboQuant => 3.5,
             Self::EXL3_4Bit => 4.0,
@@ -476,6 +480,7 @@ impl QuantFormat {
             Self::INT4_G32 => "INT4_G32",
             Self::INT4_G64 => "INT4_G64",
             Self::INT4_G128 => "INT4_G128",
+            Self::GGUF_NVFP4 => "GGUF_NVFP4",
         }
     }
 
@@ -503,6 +508,7 @@ impl QuantFormat {
                 | Self::NVFP4
                 | Self::NVFP4_E2M1
                 | Self::MXFP4
+                | Self::GGUF_NVFP4
                 | Self::EXL3_3Bit
                 | Self::EXL3_4Bit
                 | Self::AWQ_W4A16
@@ -586,6 +592,7 @@ impl QuantFormat {
             "tq1_0" | "gguf_tq1_0" => Some(Self::GGUF_TQ1_0),
             "tq2_0" | "gguf_tq2_0" => Some(Self::GGUF_TQ2_0),
             "mxfp4" => Some(Self::MXFP4),
+            "gguf_nvfp4" => Some(Self::GGUF_NVFP4),
             "kivi" | "kivi_2bit" => Some(Self::KIVI_2Bit),
             "turbo" | "turboquant" => Some(Self::TurboQuant),
             "jesse" | "weightless" | "lut" => Some(Self::WeightlessJesseLUT),

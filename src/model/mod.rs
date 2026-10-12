@@ -647,13 +647,13 @@ impl UniversalModelLoader {
             34 => (QuantFormat::GGUF_TQ1_0, "TQ1_0", 256, 54),
             35 => (QuantFormat::GGUF_TQ2_0, "TQ2_0", 256, 66),
             39 => (QuantFormat::MXFP4, "MXFP4", 32, 17),
+            40 => (QuantFormat::GGUF_NVFP4, "NVFP4", 64, 36),
             t => {
                 let name = match t {
                     9 => "Q8_1",
                     15 => "Q8_K",
                     31..=33 => "Q4_0_x_y (repacked)",
                     36..=38 => "IQ4_NL_x_y (repacked)",
-                    40 => "NVFP4",
                     41 => "Q1_0",
                     42 => "Q2_0",
                     _ => "unknown",
