@@ -91,7 +91,7 @@ pub fn unet_specs(ctx: usize, add: usize, cond: usize) -> Specs {
 
 pub fn vae_specs(latent: usize) -> Vec<(String, Vec<usize>)> {
     let mut s: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
+    let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
         s.push((format!("first_stage_model.{p}.weight"), vec![o, i, k, k]));
         s.push((format!("first_stage_model.{p}.bias"), vec![o]));
     };
