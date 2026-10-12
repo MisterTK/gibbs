@@ -325,6 +325,7 @@ pub fn ldm_vae_specs(ch: usize, mult: &[usize]) -> Specs {
 #[cfg(test)]
 mod scale_tests {
     use super::*;
+    use crate::model::unet::{Heads, SdUnet};
     use crate::model::diff_graph::testutil::rel_err;
 
     /// SD 1.5-sized UNet + VAE with random weights: CPU-vs-Metal parity at a small latent, then Metal
