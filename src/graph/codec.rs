@@ -23,7 +23,8 @@ pub struct Codec {
     pub msl: &'static str,
 }
 
-pub const CODEC_VERSION: u32 = 2;
+/// Bumped whenever an encoder or codec layout changes: it keys the re-encode cache.
+pub const CODEC_VERSION: u32 = 3;
 
 pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
     match format {
@@ -66,25 +67,31 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
 "#,
 };
 
-struct Spec {
-    format: QuantFormat,
-    block_elems: u32,
-    block_bytes: u32,
-    tables: &'static [&'static str],
-    body: &'static str,
+/// One registry entry. `tables` name entries of [`msl_prelude`]; `body` defines `decode8` (helpers from
+/// `HELPERS` are in scope) and may declare its own `#ifndef`-guarded constants.
+pub struct Spec {
+    pub format: QuantFormat,
+    pub block_elems: u32,
+    pub block_bytes: u32,
+    pub tables: &'static [&'static str],
+    pub body: &'static str,
 }
 
-/// Full MSL (helpers + tables + body) per entry of [`SPECS`], owned by a static so the codecs can borrow it.
+/// Every spec: the GGUF ones below plus the repacked source encodings of `model::repack`.
+fn all_specs() -> impl Iterator<Item = &'static Spec> {
+    use crate::model::repack::{affine, bnb, fp8};
+    SPECS.iter().chain(bnb::SPECS).chain(fp8::SPECS).chain(affine::SPECS)
+}
+
+/// Full MSL (helpers + tables + body) per entry of [`all_specs`], owned by a static so the codecs can borrow it.
 static MSL: LazyLock<Vec<String>> = LazyLock::new(|| {
-    SPECS
-        .iter()
+    all_specs()
         .map(|s| format!("{HELPERS}{}{}", tables_msl(s.tables), s.body))
         .collect()
 });
 
 static REGISTRY: LazyLock<Vec<Codec>> = LazyLock::new(|| {
-    SPECS
-        .iter()
+    all_specs()
         .zip(MSL.iter())
         .map(|(s, msl)| Codec {
             format: s.format,
@@ -573,6 +580,25 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
             uint bits = n < 0x800000u ? n : (as_type<uint>(float(n)) - (149u << 23));
             out8[i] = as_type<float>(bits | (k < 0 ? 0x80000000u : 0u));
         }
+    }
+}
+"#,
+    },
+    Spec {
+        format: QuantFormat::GGUF_NVFP4,
+        block_elems: 64,
+        block_bytes: 36,
+        tables: &["fp4"],
+        // d = UE4M3(scale byte) * 0.5 (0 and 0x7F give 0), assembled from bits like the CPU reference.
+        body: r#"
+inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
+    uint x = blk[sub >> 1];
+    uint e = (x >> 3) & 0xFu, m = x & 7u;
+    float d = (x == 0u || x == 0x7Fu) ? 0.0f : (e == 0u ? float(m) / 1024.0f : as_type<float>(((e + 119u) << 23) | (m << 20)));
+    device const uchar* q = blk + 4 + (sub >> 1) * 8;
+    uint sh = (sub & 1) * 4;
+    for (uint i = 0; i < 8; i++) {
+        out8[i] = float(KVALUES_FP4[(q[i] >> sh) & 0x0Fu]) * d;
     }
 }
 "#,

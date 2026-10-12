@@ -633,6 +633,64 @@ pub fn projection_formats(mode: QuantMode) -> (QuantFormat, QuantFormat, QuantFo
     }
 }
 
+/// Which kind of projection an encoder is looking at (the re-encode policy's FFN-only fallback
+/// treats `Attn` and `LmHead` as untouchable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjRole {
+    Attn,
+    Ffn,
+    LmHead,
+}
+
+/// One projection handed to a [`ProjectionEncoder`]: the f32 layer plus where it came from.
+pub struct Projection<'a> {
+    pub role: ProjRole,
+    /// The projection as f32 (bias attached); its `name` is `layer_{l}_{qkv|out|gate_up|down}` / `lm_head`.
+    pub layer: QuantizedLinearLayer,
+    /// 2-D checkpoint tensors its rows were gathered from, in row order (a GQA k/v projection is
+    /// replicated to full heads, so its row count exceeds the tensor's). Empty when the rows no
+    /// longer equal the checkpoint's (reordered, ternarized, or no checkpoint).
+    pub sources: Vec<String>,
+    pub head_dim: usize,
+    pub checkpoint: Option<(&'a ModelManifest, &'a [u8])>,
+}
+
+/// Chooses each projection's stored format while a [`GraphLm`] loads.
+pub trait ProjectionEncoder: Sync {
+    fn encode(&self, p: Projection<'_>) -> QuantizedLinearLayer;
+}
+
+impl GraphLm {
+    /// Runs `enc` over every projection of an already built (f32) model, for sources without a
+    /// checkpoint manifest (synthetic and ONNX models).
+    pub fn encode_projections(&mut self, enc: &dyn ProjectionEncoder) {
+        let take = |layer: &mut QuantizedLinearLayer| {
+            let name = layer.name.clone();
+            std::mem::replace(
+                layer,
+                QuantizedLinearLayer::from_quantized_weight(
+                    &name,
+                    0,
+                    0,
+                    crate::model::layers::QuantizedWeight::Uncompressed { data: Vec::new(), in_features: 0, out_features: 0 },
+                ),
+            )
+        };
+        let head_dim = self.config.head_dim;
+        let mut run = |layer: &mut QuantizedLinearLayer, role| {
+            let l = take(layer);
+            *layer = enc.encode(Projection { role, layer: l, sources: Vec::new(), head_dim, checkpoint: None });
+        };
+        for l in &mut self.layers {
+            run(&mut l.qkv_proj, ProjRole::Attn);
+            run(&mut l.out_proj, ProjRole::Attn);
+            run(&mut l.gate_up_proj, ProjRole::Ffn);
+            run(&mut l.down_proj, ProjRole::Ffn);
+        }
+        run(&mut self.lm_head, ProjRole::LmHead);
+    }
+}
+
 /// Parameterized Tiny LLM (strictly <= 10M parameters).
 #[derive(Debug, Clone)]
 pub struct GraphLm {
@@ -1249,6 +1307,18 @@ impl GraphLm {
         manifest: &ModelManifest,
         data: &[u8],
     ) -> Result<Self, String> {
+        Self::from_manifest_with(config, manifest, data, None)
+    }
+
+    /// [`Self::from_manifest`] with every projection (q/k/v, out, gate/up, down, LM head) passed to
+    /// `encoder` as it loads, so the f32 model never exists at once; `None` encodes by
+    /// `config.quant_mode`.
+    pub fn from_manifest_with(
+        config: GraphLmConfig,
+        manifest: &ModelManifest,
+        data: &[u8],
+        encoder: Option<&dyn ProjectionEncoder>,
+    ) -> Result<Self, String> {
         let v = config.vocab_size;
         let h = config.hidden_dim;
         let inter = config.intermediate_dim;
@@ -1274,10 +1344,12 @@ impl GraphLm {
             "lm_head.weight",
         ];
         let mut embedding: Option<Vec<f32>> = None;
+        let mut embed_name = "";
         for &name in &embed_candidates {
             if manifest.tensors.contains_key(name) {
                 if let Ok(vec) = manifest.extract_tensor_f32(data, name) {
                     embedding = Some(vec);
+                    embed_name = name;
                     break;
                 }
             }
@@ -1300,8 +1372,26 @@ impl GraphLm {
 
         // BitNet online weight quant: every BitLinear projection (`*_proj.weight`) is ternarized
         // with its own scale, then cast back to the checkpoint dtype as the reference does.
+        // Tensors read for the projection being assembled, so an encoder can carry the checkpoint's
+        // own blocks instead of re-encoding the f32 copy.
+        let used = std::cell::RefCell::new(Vec::<String>::new());
+        let ext = |name: &str| -> Result<Vec<f32>, String> {
+            let r = manifest.extract_tensor_f32(data, name);
+            if r.is_ok() {
+                used.borrow_mut().push(name.to_string());
+            }
+            r
+        };
+        let take_src = || -> Vec<String> {
+            let mut u = used.borrow_mut();
+            let two_d = u
+                .drain(..)
+                .filter(|n| manifest.tensors.get(n).is_some_and(|t| t.shape.len() == 2))
+                .collect();
+            two_d
+        };
         let proj = |name: &str| -> Result<Vec<f32>, String> {
-            let mut w = manifest.extract_tensor_f32(data, name)?;
+            let mut w = ext(name)?;
             if config.ternarize_weights && name.ends_with("_proj.weight") {
                 match manifest.tensors[name].dtype.as_str() {
                     "BF16" => ternarize(&mut w, |x| {
@@ -1318,8 +1408,18 @@ impl GraphLm {
         // Each projection is encoded in the target format as it loads, so the whole model is
         // never held in f32 at once.
         let (attn_fmt, ffn_fmt, lm_fmt) = projection_formats(config.quant_mode);
-        let encode = |layer: QuantizedLinearLayer, format| {
-            if config.quant_mode == QuantMode::Uncompressed {
+        let encode = |layer: QuantizedLinearLayer, role: ProjRole, format, sources: Vec<String>| {
+            if let Some(enc) = encoder {
+                // Ternarized (BitNet) weights no longer equal the checkpoint's tensors.
+                let sources = if config.ternarize_weights { Vec::new() } else { sources };
+                enc.encode(Projection {
+                    role,
+                    layer,
+                    sources,
+                    head_dim: config.head_dim,
+                    checkpoint: Some((manifest, data)),
+                })
+            } else if config.quant_mode == QuantMode::Uncompressed {
                 layer
             } else {
                 requantized(&layer, format)
@@ -1337,7 +1437,7 @@ impl GraphLm {
             let mut norm1: Option<Vec<f32>> = None;
             for name in &norm1_candidates {
                 if manifest.tensors.contains_key(name) {
-                    if let Ok(vec) = manifest.extract_tensor_f32(data, name) {
+                    if let Ok(vec) = ext(name) {
                         norm1 = Some(vec);
                         break;
                     }
@@ -1355,7 +1455,7 @@ impl GraphLm {
 
             let gguf_qkv = format!("blk.{}.attn_qkv.weight", l);
             if manifest.tensors.contains_key(&gguf_qkv) {
-                if let Ok(vec) = manifest.extract_tensor_f32(data, &gguf_qkv) {
+                if let Ok(vec) = ext(&gguf_qkv) {
                     raw_qkv = Some(vec);
                 }
             }
@@ -1369,9 +1469,9 @@ impl GraphLm {
             let gguf_v = format!("blk.{}.attn_v.weight", l);
             if raw_qkv.is_none() && manifest.tensors.contains_key(&gguf_q) {
                 if let (Ok(q), Ok(k), Ok(v_vec)) = (
-                    manifest.extract_tensor_f32(data, &gguf_q),
-                    manifest.extract_tensor_f32(data, &gguf_k),
-                    manifest.extract_tensor_f32(data, &gguf_v),
+                    ext(&gguf_q),
+                    ext(&gguf_k),
+                    ext(&gguf_v),
                 ) {
                     let head_dim = config.head_dim;
                     let k_expanded = expand_gqa_kv(k, q.len(), config.num_heads, head_dim, h);
@@ -1392,7 +1492,7 @@ impl GraphLm {
                 )];
                 for name in &qkv_candidates {
                     if manifest.tensors.contains_key(name) {
-                        if let Ok(vec) = manifest.extract_tensor_f32(data, name) {
+                        if let Ok(vec) = ext(name) {
                             raw_qkv = Some(vec);
                             is_neox_qkv = true;
                             break;
@@ -1423,9 +1523,9 @@ impl GraphLm {
                     fused.extend(v_expanded);
                     raw_qkv = Some(fused);
                 } else if let (Ok(q), Ok(k), Ok(v_vec)) = (
-                    manifest.extract_tensor_f32(data, &neo_q),
-                    manifest.extract_tensor_f32(data, &neo_k),
-                    manifest.extract_tensor_f32(data, &neo_v),
+                    ext(&neo_q),
+                    ext(&neo_k),
+                    ext(&neo_v),
                 ) {
                     let head_dim = config.head_dim;
                     let k_expanded = expand_gqa_kv(k, q.len(), config.num_heads, head_dim, h);
@@ -1473,6 +1573,7 @@ impl GraphLm {
                 })?
             };
 
+            let qkv_src = take_src();
             // out_proj
             let out_candidates = [
                 format!("blk.{}.attn_output.weight", l),
@@ -1496,6 +1597,7 @@ impl GraphLm {
                 )
             })?;
 
+            let out_src = take_src();
             // norm2
             let norm2_candidates = [
                 format!("blk.{}.ffn_norm.weight", l),
@@ -1506,7 +1608,7 @@ impl GraphLm {
             let mut norm2: Option<Vec<f32>> = None;
             for name in &norm2_candidates {
                 if manifest.tensors.contains_key(name) {
-                    if let Ok(vec) = manifest.extract_tensor_f32(data, name) {
+                    if let Ok(vec) = ext(name) {
                         norm2 = Some(vec);
                         break;
                     }
@@ -1525,15 +1627,15 @@ impl GraphLm {
             let up_name = format!("model.layers.{}.mlp.up_proj.weight", l);
             let neo_fc = format!("transformer.h.{}.mlp.c_fc.weight", l);
             if manifest.tensors.contains_key(&gguf_gate_up) {
-                if let Ok(vec) = manifest.extract_tensor_f32(data, &gguf_gate_up) {
+                if let Ok(vec) = ext(&gguf_gate_up) {
                     raw_gate_up = Some(vec);
                 }
             } else if manifest.tensors.contains_key(&gguf_gate)
                 && manifest.tensors.contains_key(&gguf_up)
             {
                 if let (Ok(g), Ok(u)) = (
-                    manifest.extract_tensor_f32(data, &gguf_gate),
-                    manifest.extract_tensor_f32(data, &gguf_up),
+                    ext(&gguf_gate),
+                    ext(&gguf_up),
                 ) {
                     let mut fused = Vec::with_capacity(g.len() + u.len());
                     fused.extend(g);
@@ -1541,7 +1643,7 @@ impl GraphLm {
                     raw_gate_up = Some(fused);
                 }
             } else if manifest.tensors.contains_key(&gguf_up) {
-                if let Ok(u) = manifest.extract_tensor_f32(data, &gguf_up) {
+                if let Ok(u) = ext(&gguf_up) {
                     if config.use_gelu_mlp {
                         raw_gate_up = Some(u);
                     } else {
@@ -1551,8 +1653,7 @@ impl GraphLm {
                         raw_gate_up = Some(duplicated);
                     }
                 }
-            } else if let Ok(vec) = manifest
-                .extract_tensor_f32(data, &format!("model.layers.{}.mlp.gate_up_proj.weight", l))
+            } else if let Ok(vec) = ext(&format!("model.layers.{}.mlp.gate_up_proj.weight", l))
             {
                 // HF fused [gate; up] rows (GLM, Phi-3): already our gate-first layout.
                 raw_gate_up = Some(vec);
@@ -1561,7 +1662,7 @@ impl GraphLm {
                 fused.extend(g);
                 fused.extend(u);
                 raw_gate_up = Some(fused);
-            } else if let Ok(vec) = manifest.extract_tensor_f32(data, &neo_fc) {
+            } else if let Ok(vec) = ext(&neo_fc) {
                 if config.use_gelu_mlp {
                     raw_gate_up = Some(vec);
                 } else {
@@ -1572,7 +1673,7 @@ impl GraphLm {
                 }
             } else {
                 let neox_up = format!("gpt_neox.layers.{}.mlp.dense_h_to_4h.weight", l);
-                if let Ok(vec) = manifest.extract_tensor_f32(data, &neox_up) {
+                if let Ok(vec) = ext(&neox_up) {
                     if config.use_gelu_mlp {
                         raw_gate_up = Some(vec);
                     } else {
@@ -1587,6 +1688,7 @@ impl GraphLm {
                 format!("missing or unreadable layer {l} MLP up/gate projection (expected e.g. {gate_name}, model.layers.{l}.mlp.gate_up_proj.weight or {gguf_up})")
             })?;
 
+            let gate_src = take_src();
             // down_proj
             let down_candidates = [
                 format!("blk.{}.ffn_down.weight", l),
@@ -1607,6 +1709,7 @@ impl GraphLm {
                 format!("missing or unreadable layer {l} MLP down projection (tried {down_candidates:?})")
             })?;
 
+            let down_src = take_src();
             let norm1_bias_candidates = [
                 format!("transformer.h.{}.ln_1.bias", l),
                 format!("gpt_neox.layers.{}.input_layernorm.bias", l),
@@ -1863,13 +1966,13 @@ impl GraphLm {
             layers.push(GraphLayer {
                 norm1,
                 norm1_bias,
-                qkv_proj: encode(qkv_proj, attn_fmt),
-                out_proj: encode(out_proj, attn_fmt),
+                qkv_proj: encode(qkv_proj, ProjRole::Attn, attn_fmt, qkv_src),
+                out_proj: encode(out_proj, ProjRole::Attn, attn_fmt, out_src),
                 post_attention_norm,
                 norm2,
                 norm2_bias,
-                gate_up_proj: encode(gate_up_proj, ffn_fmt),
-                down_proj: encode(down_proj, ffn_fmt),
+                gate_up_proj: encode(gate_up_proj, ProjRole::Ffn, ffn_fmt, gate_src),
+                down_proj: encode(down_proj, ProjRole::Ffn, ffn_fmt, down_src),
                 post_ffw_norm,
                 attn_sub_norm,
                 ffn_sub_norm,
@@ -1913,20 +2016,25 @@ impl GraphLm {
             "embed_out.weight",
         ];
         let mut raw_lm_head: Option<Vec<f32>> = None;
+        let mut lm_src = embed_name;
         for &name in &lm_head_candidates {
             if manifest.tensors.contains_key(name) {
                 if let Ok(vec) = manifest.extract_tensor_f32(data, name) {
                     raw_lm_head = Some(vec);
+                    lm_src = name;
                     break;
                 }
             }
         }
+        // Tied head: the embedding table is the head's checkpoint tensor.
         let raw_lm_head = raw_lm_head.unwrap_or_else(|| embedding.clone());
 
         let lm_head = encode(
             QuantizedLinearLayer::from_f32("lm_head", h, v, &raw_lm_head, QuantFormat::FP32)
                 .map_err(|e| e.to_string())?,
+            ProjRole::LmHead,
             lm_fmt,
+            vec![lm_src.to_string()],
         );
         drop(raw_lm_head);
 

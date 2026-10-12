@@ -131,9 +131,18 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
             None => {
                 let hw = crate::hardware::HardwareCapability::probe_system();
                 let backend = crate::hardware::Device::Metal;
-                match crate::model::weight_format::load_causal_lm_for(
-                    &artifacts, backend, None, &hw,
-                ) {
+                let reencode = model_cfg.reencode.as_ref().unwrap_or(&defaults.reencode);
+                let cfg = reencode.parse().map(|policy| {
+                    crate::model::weight_format::ReencodeConfig {
+                        policy,
+                        ..Default::default()
+                    }
+                });
+                match cfg.and_then(|cfg| {
+                    crate::model::weight_format::load_causal_lm_with(
+                        &artifacts, backend, None, &hw, &cfg,
+                    )
+                }) {
                     Ok((graph_lm, _)) => {
                         match crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)
                         {
