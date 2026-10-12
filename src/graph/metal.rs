@@ -4988,6 +4988,7 @@ mod tests {
             QuantFormat::GGUF_IQ1_S,
             QuantFormat::GGUF_TQ1_0,
             QuantFormat::GGUF_TQ2_0,
+            QuantFormat::GGUF_NVFP4,
         ];
         let mut seed = 0x9E3779B97F4A7C15u64;
         let mut next = move || {
