@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod graph_program;
+
 const PATCH: usize = 2;
 const EPS: f32 = 1e-5;
 /// Qwen3-VL decoder outputs fed to the DiT: transformers' `hidden_states[k]`.
@@ -336,6 +338,8 @@ struct Dit {
     last_norm: Vec<f32>,
     last_mod: Vec<f32>,
     last: Lin,
+    gpu: graph_program::FwdCache,
+    gpu_fuse: graph_program::FuseCache,
 }
 
 impl Dit {
@@ -407,6 +411,8 @@ impl Dit {
             last_norm: s.norm("last.norm.scale", dim)?,
             last_mod: s.vec("last.modulation.lin", 2 * dim)?,
             last: s.lin("last.linear")?,
+            gpu: Default::default(),
+            gpu_fuse: Default::default(),
             first,
         };
         if n_blocks == 0
@@ -487,25 +493,11 @@ impl Dit {
 
     /// Velocity for latents `[C, h, w]` at noise level `sigma`; `ctx` is [`Self::fuse`]'s `[n_txt, dim]`.
     fn forward(&self, lat: &[f32], h: usize, w: usize, sigma: f32, ctx: &[f32]) -> Vec<f32> {
-        let (d, c, p) = (self.dim, self.chan, PATCH);
+        let (d, p) = (self.dim, PATCH);
         let (gh, gw) = (h / p, w / p);
         let n_img = gh * gw;
         let n_txt = ctx.len() / d;
-        // Patch features in (c, py, px) order.
-        let mut patches = vec![0.0f32; n_img * c * p * p];
-        for i in 0..gh {
-            for j in 0..gw {
-                let row = &mut patches[(i * gw + j) * c * p * p..][..c * p * p];
-                for ch in 0..c {
-                    for py in 0..p {
-                        for px in 0..p {
-                            row[(ch * p + py) * p + px] =
-                                lat[(ch * h + i * p + py) * w + j * p + px];
-                        }
-                    }
-                }
-            }
-        }
+        let patches = self.patchify(lat, h, w);
         let mut t = self
             .tmlp0
             .fwd(&timestep_features(flow::timestep(sigma), self.tdim), 1);
@@ -543,6 +535,33 @@ impl Dit {
             .collect();
         modulate(&mut y, d, &scale, &shift);
         let y = self.last.fwd(&y, n_img);
+        self.unpatchify(&y, h, w)
+    }
+
+    /// Latents `[C, h, w]` -> patch features `[n_img, C*p*p]` in (c, py, px) order.
+    fn patchify(&self, lat: &[f32], h: usize, w: usize) -> Vec<f32> {
+        let (c, p) = (self.chan, PATCH);
+        let (gh, gw) = (h / p, w / p);
+        let mut patches = vec![0.0f32; gh * gw * c * p * p];
+        for i in 0..gh {
+            for j in 0..gw {
+                let row = &mut patches[(i * gw + j) * c * p * p..][..c * p * p];
+                for ch in 0..c {
+                    for py in 0..p {
+                        for px in 0..p {
+                            row[(ch * p + py) * p + px] = lat[(ch * h + i * p + py) * w + j * p + px];
+                        }
+                    }
+                }
+            }
+        }
+        patches
+    }
+
+    /// Inverse of [`Self::patchify`].
+    fn unpatchify(&self, y: &[f32], h: usize, w: usize) -> Vec<f32> {
+        let (c, p) = (self.chan, PATCH);
+        let (gh, gw) = (h / p, w / p);
         let mut out = vec![0.0f32; c * h * w];
         for i in 0..gh {
             for j in 0..gw {
@@ -550,8 +569,7 @@ impl Dit {
                 for ch in 0..c {
                     for py in 0..p {
                         for px in 0..p {
-                            out[(ch * h + i * p + py) * w + j * p + px] =
-                                row[(ch * p + py) * p + px];
+                            out[(ch * h + i * p + py) * w + j * p + px] = row[(ch * p + py) * p + px];
                         }
                     }
                 }
@@ -671,6 +689,15 @@ impl Krea2Pipeline {
         })
     }
 
+    /// One velocity prediction: the Metal program under `use_metal()`, the host forward otherwise.
+    fn velocity(&self, x: &[f32], h: usize, w: usize, sigma: f32, ctx: &[f32]) -> Result<Vec<f32>, String> {
+        if crate::model::dit_graph::use_metal() {
+            self.dit.forward_gpu(&self.dit.gpu, x, h, w, sigma, ctx)
+        } else {
+            Ok(self.dit.forward(x, h, w, sigma, ctx))
+        }
+    }
+
     /// Prompt -> fused text features `[n, dim]` and `n`.
     fn encode(&self, prompt: &str) -> Result<(Vec<f32>, usize), String> {
         let ids = |s: &str| -> Result<Vec<u32>, String> {
@@ -691,6 +718,9 @@ impl Krea2Pipeline {
         let n = all.len() - PREFIX_TOKENS;
         let d = hs[0].len() / all.len();
         let taps: Vec<Vec<f32>> = hs.iter().map(|h| h[PREFIX_TOKENS * d..].to_vec()).collect();
+        if crate::model::dit_graph::use_metal() {
+            return Ok((self.dit.fuse_gpu(&self.dit.gpu_fuse, &taps, n)?, n));
+        }
         Ok((self.dit.fuse(&taps, n), n))
     }
 }
@@ -760,9 +790,9 @@ impl ImageGenerator for Krea2Pipeline {
         let mut x: Vec<f32> = (0..self.dit.chan * h * w).map(|_| rng.gaussian()).collect();
         for i in 0..steps {
             let t = Instant::now();
-            let mut v = self.dit.forward(&x, h, w, sigmas[i], &cond);
+            let mut v = self.velocity(&x, h, w, sigmas[i], &cond)?;
             if let Some(u) = &uncond {
-                let vu = self.dit.forward(&x, h, w, sigmas[i], u);
+                let vu = self.velocity(&x, h, w, sigmas[i], u)?;
                 v.iter_mut()
                     .zip(&vu)
                     .for_each(|(v, u)| *v += guidance * (*v - u));
@@ -949,7 +979,7 @@ mod tests {
     use super::*;
 
     /// Writes `tensors` as an F32 safetensors file.
-    fn write_st(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
+    pub(super) fn write_st(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
         let (mut header, mut data) = (serde_json::Map::new(), Vec::<u8>::new());
         for (name, shape, v) in tensors {
             let start = data.len();
@@ -967,7 +997,7 @@ mod tests {
     }
 
     /// A 2-block Krea 2 transformer with tiny dims and deterministic weights, original names.
-    fn tiny_dit() -> Vec<(String, Vec<usize>, Vec<f32>)> {
+    pub(super) fn tiny_dit() -> Vec<(String, Vec<usize>, Vec<f32>)> {
         let mut seed = 12345u64;
         let mut t = |name: &str, shape: &[usize]| {
             let n: usize = shape.iter().product();
