@@ -92,6 +92,20 @@ Designed from first principles to target any computational substrate:
 
 Gibbs serves text generation, translation, summarization, text classification, multimodal vision-language, text-to-image (Stable Diffusion, SDXL, SD3.5, Sana, FLUX), and System 1 embeddings and decisions over an OpenAI-style HTTP API, with native interactive terminal dashboards and full CLI integration.
 
+## How does Gibbs compare to vLLM and SGLang?
+
+Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter NVIDIA throughput, and Gibbs targets any machine latency.
+
+|  | Gibbs | vLLM / SGLang |
+| --- | --- | --- |
+| Language and stack | Rust. One graph IR (`GraphLm`, `GraphProgram`) lowers to Metal kernels, with a CPU executor as an explicit opt-in. | Python on top of CUDA/Triton kernels. ROCm and others are secondary. |
+| Primary hardware | Apple Silicon, unified memory. CUDA, ROCm and Level Zero are compilation targets. Also: extropic, TPUs, ASICs. | NVIDIA GPUs, multi-GPU with tensor and pipeline parallelism. |
+| Optimization goal | Single-stream decode against a measured memory-bandwidth roofline (`--bench`, `geomean_roofline_pct`). Tuning is mostly GEMV kernels and dispatch overhead. | Aggregate throughput under many concurrent requests: continuous batching, paged KV cache (vLLM PagedAttention), prefix sharing (SGLang RadixAttention). |
+| Quantization | Reads numeours formats directly (Q4_0, Q8_0, K-quants, IQ, TQ2_0 and others) through a codec layer, with per-model re-encode policy. | Mostly GPTQ, AWQ, FP8 and similar server formats. GGUF support is limited. |
+| Model breadth | Text LLMs, plus T5, classifiers, diffusion, video and audio families. | Mainly LLMs and VLMs. Diffusion and video are largely outside scope. |
+| Scheduler | Has a scheduler, KV blocks and an HTTP API. Concurrency is also at its design centre. | Core feature, and where most of their engineering goes. |
+| UX | Built-in TUI with roofline telemetry, a CLI, and a local model picker. | Server-first, with an OpenAI-compatible API and no TUI. |
+
 ## Backends
 
 | `--backend` | What runs there |
