@@ -4,10 +4,12 @@
 //! `upsample3d` skips `time_conv`, and the residual shortcut keeps the last of the two frames
 //! `DupUp3D` emits (`first_chunk`). Weights stay f32; activations are channel-first `[c, h*w]`.
 
+use crate::model::diff_graph::{ByShape, Gb, V};
 use crate::model::dit::{component_weights, read_config};
 use crate::model::image::ImageBuffer;
 use crate::model::nn;
 use crate::model::par::par_rows;
+use crate::graph::{Op, Tensor};
 use crate::model::weights::Weights;
 use std::path::Path;
 
@@ -188,6 +190,79 @@ fn dup_up(
     out
 }
 
+// Graph emission (Metal program). Each `emit` mirrors the `fwd` above on `[c, h, w]` values.
+impl Conv {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        b.conv2d(x, &self.w, Some(&self.b), self.c_out, self.k, 1, self.k / 2)
+    }
+}
+
+impl Resnet {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let skip = self.shortcut.as_ref().map_or(x, |c| c.emit(b, x));
+        let t = b.rms_channels(x, &self.norm1);
+        let t = b.silu(t);
+        let t = self.conv1.emit(b, t);
+        let t = b.rms_channels(t, &self.norm2);
+        let t = b.silu(t);
+        let t = self.conv2.emit(b, t);
+        b.add(t, skip)
+    }
+}
+
+impl Attn {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let s = b.shape(x).to_vec();
+        let (c, hw) = (self.norm.len(), s[1] * s[2]);
+        let t = b.rms_channels(x, &self.norm);
+        let flat = b.reshape(t, &[c, hw]);
+        let tok = b.transpose(flat, &[1, 0]);
+        let [q, k, v] = [0, 1, 2].map(|i| {
+            b.linear_f32(tok, &self.qkv.w[i * c * c..(i + 1) * c * c], Some(&self.qkv.b[i * c..(i + 1) * c]), c, c)
+        });
+        let a = b.attention(q, k, v, 1);
+        let o = b.linear_f32(a, &self.proj.w, Some(&self.proj.b), c, c);
+        let o = b.transpose(o, &[1, 0]);
+        let o = b.reshape(o, &s);
+        b.add(x, o)
+    }
+}
+
+impl Up {
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let mut t = self.resnets[0].emit(b, x);
+        for r in &self.resnets[1..] {
+            t = r.emit(b, t);
+        }
+        let Some(conv) = &self.up else {
+            return t;
+        };
+        let u = b.upsample(t, 2, 2);
+        let y = conv.emit(b, u);
+        let (repeats, ft) = self.dup.expect("upsampling blocks carry a shortcut");
+        let s = b.shape(x).to_vec();
+        let (h, w, c_out) = (s[1], s[2], conv.c_out);
+        let idx = {
+            let n = b.uniq("dup_idx");
+            b.input_u32(&n, &[c_out * 4])
+        };
+        // `dup_up` as Gather + regroup: [c_out*4, h, w] -> [c_out, fy, fx, h, w] -> [c_out, h, fy, w, fx].
+        let g = b.op("dup_gather", Op::Gather { axis: 0 }, &[x, idx], &[c_out * 4, h, w]);
+        let g = b.reshape(g, &[c_out, 2, 2, h, w]);
+        let g = b.transpose(g, &[0, 3, 1, 4, 2]);
+        let g = b.reshape(g, &[c_out, 2 * h, 2 * w]);
+        b.add(y, g)
+    }
+}
+
+/// Gather indices of [`dup_up`]: output channel `co*4 + fy*2 + fx` reads input channel
+/// `(((co*ft + ft-1)*2 + fy)*2 + fx) / repeats`.
+fn dup_idx(c_out: usize, repeats: usize, ft: usize) -> Vec<u32> {
+    (0..c_out * 4)
+        .map(|i| (((i / 4 * ft + ft - 1) * 4 + i % 4) / repeats) as u32)
+        .collect()
+}
+
 pub struct QwenVae21 {
     post_quant: Conv,
     conv_in: Conv,
@@ -197,12 +272,12 @@ pub struct QwenVae21 {
     conv_out: Conv,
     mean: Vec<f32>,
     std: Vec<f32>,
+    gpu: ByShape,
 }
 
 impl QwenVae21 {
     /// Reads a diffusers `vae/` directory (decoder and `post_quant_conv`; the encoder is not read).
     pub fn load(dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::Vae)?;
         let cfg = read_config(dir)?;
         if cfg["is_residual"].as_bool() != Some(true) || !cfg["patch_size"].is_null() {
             return Err(
@@ -252,12 +327,31 @@ impl QwenVae21 {
         if temporal.len() + 1 != mult.len() {
             return Err("vae config: temperal_downsample does not match dim_mult".into());
         }
-        let w = component_weights(dir)?;
+        Self::open(
+            &component_weights(dir)?,
+            &mult,
+            base,
+            blocks,
+            &temporal,
+            floats("latents_mean", z)?,
+            floats("latents_std", z)?,
+        )
+    }
+
+    fn open(
+        w: &Weights,
+        mult: &[usize],
+        base: usize,
+        blocks: usize,
+        temporal: &[bool],
+        mean: Vec<f32>,
+        std: Vec<f32>,
+    ) -> Result<Self, String> {
         let dims: Vec<usize> = std::iter::once(mult[mult.len() - 1])
             .chain(mult.iter().rev().copied())
             .map(|m| m * base)
             .collect();
-        let mid = |p: &str| Resnet::load(&w, &format!("decoder.mid_block.resnets.{p}"));
+        let mid = |p: &str| Resnet::load(w, &format!("decoder.mid_block.resnets.{p}"));
         let attn = "decoder.mid_block.attentions.0";
         let mut ups = Vec::new();
         for (i, io) in dims.windows(2).enumerate() {
@@ -265,10 +359,10 @@ impl QwenVae21 {
             let up = i + 1 != mult.len();
             ups.push(Up {
                 resnets: (0..=blocks)
-                    .map(|j| Resnet::load(&w, &format!("{p}.resnets.{j}")))
+                    .map(|j| Resnet::load(w, &format!("{p}.resnets.{j}")))
                     .collect::<Result<_, _>>()?,
                 up: up
-                    .then(|| Conv::load(&w, &format!("{p}.upsampler.resample.1"), 3))
+                    .then(|| Conv::load(w, &format!("{p}.upsampler.resample.1"), 3))
                     .transpose()?,
                 dup: up.then(|| {
                     let ft = if temporal[i] { 2 } else { 1 };
@@ -278,27 +372,71 @@ impl QwenVae21 {
         }
         let last = dims[dims.len() - 1];
         Ok(Self {
-            post_quant: Conv::load(&w, "post_quant_conv", 1)?,
-            conv_in: Conv::load(&w, "decoder.conv_in", 3)?,
+            post_quant: Conv::load(w, "post_quant_conv", 1)?,
+            conv_in: Conv::load(w, "decoder.conv_in", 3)?,
             mid: (
                 mid("0")?,
                 Attn {
                     norm: w.vec_n(&format!("{attn}.norm.gamma"), dims[0])?,
-                    qkv: Conv::load(&w, &format!("{attn}.to_qkv"), 1)?,
-                    proj: Conv::load(&w, &format!("{attn}.proj"), 1)?,
+                    qkv: Conv::load(w, &format!("{attn}.to_qkv"), 1)?,
+                    proj: Conv::load(w, &format!("{attn}.proj"), 1)?,
                 },
                 mid("1")?,
             ),
             ups,
             norm_out: w.vec_n("decoder.norm_out.gamma", last)?,
-            conv_out: Conv::load(&w, "decoder.conv_out", 3)?,
-            mean: floats("latents_mean", z)?,
-            std: floats("latents_std", z)?,
+            conv_out: Conv::load(w, "decoder.conv_out", 3)?,
+            mean,
+            std,
+            gpu: ByShape::default(),
         })
     }
 
     pub fn latent_channels(&self) -> usize {
         self.mean.len()
+    }
+
+    /// Native CPU decoder over de-normalised latents `z [z, h, w]` -> `[4, 16h, 16w]` (RGBA planes).
+    fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+        crate::hardware::cpu_compute::enter("qwen_vae21::decode");
+        let x = self.post_quant.fwd(z, h, w);
+        let mut x = self.conv_in.fwd(&x, h, w);
+        x = self.mid.0.fwd(&x, h, w);
+        x = self.mid.1.fwd(&x, h, w);
+        x = self.mid.2.fwd(&x, h, w);
+        let (mut h, mut w) = (h, w);
+        for up in &self.ups {
+            (x, h, w) = up.fwd(x, h, w);
+        }
+        rms_norm(&mut x, h * w, &self.norm_out, true);
+        (self.conv_out.fwd(&x, h, w), h, w)
+    }
+
+    /// Metal decoder (same outputs as [`Self::decode_cpu`]); one program per latent size. The
+    /// `DupUp3D` channel regrouping is a Gather whose U32 indices are extra program inputs.
+    fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize), String> {
+        let net = self.gpu.get(&[h, w], || {
+            let mut b = Gb::new();
+            let x = b.input("z", &[self.latent_channels(), h, w]);
+            let x = self.post_quant.emit(&mut b, x);
+            let mut x = self.conv_in.emit(&mut b, x);
+            x = self.mid.0.emit(&mut b, x);
+            x = self.mid.1.emit(&mut b, x);
+            x = self.mid.2.emit(&mut b, x);
+            for up in &self.ups {
+                x = up.emit(&mut b, x);
+            }
+            x = b.rms_channels(x, &self.norm_out);
+            x = b.silu(x);
+            x = self.conv_out.emit(&mut b, x);
+            b.output(x);
+            b.compile()
+        })?;
+        let mut ins = vec![Tensor::F32(z.to_vec())];
+        ins.extend(self.ups.iter().filter_map(|u| u.up.as_ref().zip(u.dup)).map(|(c, (r, ft))| Tensor::U32(dup_idx(c.c_out, r, ft))));
+        let out = net.run_t(ins)?.remove(0);
+        let ups = self.ups.iter().filter(|u| u.up.is_some()).count();
+        Ok((out, h << ups, w << ups))
     }
 
     /// Normalised latents `[z, h, w]` (the transformer's output space) -> an image of 16h x 16w:
@@ -312,21 +450,15 @@ impl QwenVae21 {
                 latents.len()
             ));
         }
-        let mut x = Vec::with_capacity(latents.len());
+        let mut z = Vec::with_capacity(latents.len());
         for (c, plane) in latents.chunks_exact(h * w).enumerate() {
-            x.extend(plane.iter().map(|v| v * self.std[c] + self.mean[c]));
+            z.extend(plane.iter().map(|v| v * self.std[c] + self.mean[c]));
         }
-        let x = self.post_quant.fwd(&x, h, w);
-        let mut x = self.conv_in.fwd(&x, h, w);
-        x = self.mid.0.fwd(&x, h, w);
-        x = self.mid.1.fwd(&x, h, w);
-        x = self.mid.2.fwd(&x, h, w);
-        let (mut h, mut w) = (h, w);
-        for up in &self.ups {
-            (x, h, w) = up.fwd(x, h, w);
-        }
-        rms_norm(&mut x, h * w, &self.norm_out, true);
-        let x = self.conv_out.fwd(&x, h, w);
+        let (x, h, w) = if crate::model::diff_graph::gpu_mode() {
+            self.decode_gpu(&z, h, w)?
+        } else {
+            self.decode_cpu(&z, h, w)
+        };
         let px =
             |c: usize, i: usize| (x[c * h * w + i].clamp(-1.0, 1.0) / 2.0 + 0.5).clamp(0.0, 1.0);
         let mut data = Vec::with_capacity(3 * h * w);
@@ -426,5 +558,67 @@ mod tests {
             (img.width, img.height, img.data.len()),
             (16 * w, 16 * h, 3 * 256 * h * w)
         );
+    }
+
+    /// Tiny synthetic decoder (mult [1,2,2,4], base 4, mixed temporal flags): CPU vs the Metal
+    /// graph program (f32 vs f32: 1e-3), with every node on the GPU.
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
+        let (mult, base, zc, temporal) = ([1usize, 2, 2, 4], 4usize, 6usize, [true, false, true]);
+        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
+        let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
+            s.push((format!("{p}.weight"), vec![o, i, k, k]));
+            s.push((format!("{p}.bias"), vec![o]));
+        };
+        let res = |s: &mut Vec<_>, p: &str, i: usize, o: usize| {
+            s.push((format!("{p}.norm1.gamma"), vec![i]));
+            conv(s, &format!("{p}.conv1"), i, o, 3);
+            s.push((format!("{p}.norm2.gamma"), vec![o]));
+            conv(s, &format!("{p}.conv2"), o, o, 3);
+            if i != o {
+                conv(s, &format!("{p}.conv_shortcut"), i, o, 1);
+            }
+        };
+        let dims: Vec<usize> = std::iter::once(mult[3]).chain(mult.iter().rev().copied()).map(|m| m * base).collect();
+        conv(&mut s, "post_quant_conv", zc, zc, 1);
+        conv(&mut s, "decoder.conv_in", zc, dims[0], 3);
+        res(&mut s, "decoder.mid_block.resnets.0", dims[0], dims[0]);
+        res(&mut s, "decoder.mid_block.resnets.1", dims[0], dims[0]);
+        let a = "decoder.mid_block.attentions.0";
+        s.push((format!("{a}.norm.gamma"), vec![dims[0]]));
+        conv(&mut s, &format!("{a}.to_qkv"), dims[0], 3 * dims[0], 1);
+        conv(&mut s, &format!("{a}.proj"), dims[0], dims[0], 1);
+        for (i, io) in dims.windows(2).enumerate() {
+            let p = format!("decoder.up_blocks.{i}");
+            for j in 0..3 {
+                res(&mut s, &format!("{p}.resnets.{j}"), if j == 0 { io[0] } else { io[1] }, io[1]);
+            }
+            if i + 1 != mult.len() {
+                conv(&mut s, &format!("{p}.upsampler.resample.1"), io[1], io[1], 3);
+            }
+        }
+        s.push(("decoder.norm_out.gamma".into(), vec![dims[4]]));
+        conv(&mut s, "decoder.conv_out", dims[4], 4, 3);
+        let mut r = synth(&s, 21);
+        let mut g = Lcg(9);
+        for (n, (_, v)) in r.0.iter_mut() {
+            if n.ends_with(".gamma") {
+                v.iter_mut().for_each(|x| *x = 1.0 + 0.2 * g.next());
+            }
+        }
+        let w = Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap();
+        let (mean, std) = (Lcg(1).vec(zc, 0.5), Lcg(2).vec(zc, 0.5).iter().map(|v| 1.0 + v.abs()).collect());
+        let vae = QwenVae21::open(&w, &mult, base, 2, &temporal, mean, std).unwrap();
+        let (h, wd) = (3, 2);
+        let z = Lcg(3).vec(zc * h * wd, 1.0);
+        let (cpu, ch, cw) = vae.decode_cpu(&z, h, wd);
+        let (gpu, gh, gw) = vae.decode_gpu(&z, h, wd).unwrap();
+        assert_eq!((ch, cw), (gh, gw));
+        let e = rel_err(&gpu, &cpu);
+        println!("qwen_vae21 decode rel err {e:e}");
+        assert!(e < 1e-3, "decode rel err {e}");
+        let net = vae.gpu.get(&[h, wd], || Err("cached".into())).unwrap();
+        assert_eq!(net.cpu_node_count(), 0);
     }
 }
