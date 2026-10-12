@@ -375,6 +375,7 @@ impl TextModel {
         cache: &mut TextCache,
         blocks: &[std::ops::Range<usize>],
     ) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("gemma4::text::forward");
         let last = self.last_hidden(x, ple_ids, start, cache, blocks);
         let mut logits = linear(&last, 1, &self.embed);
         if let Some(cap) = self.softcap {
@@ -1094,6 +1095,92 @@ impl TextModel {
     }
 }
 
+/// Tiny synthetic Gemma 4 text model (one full-attention layer, constant weights). Fixture for
+/// `tests/cpu_free_matrix.rs` and this module's tests.
+pub fn tiny_model() -> TextModel {
+    use crate::model::weights::Weights;
+    let (h, v, nh, kvh, hd) = (64, 128, 2, 2, 32);
+    let (inter, eps) = (128, 1e-5);
+
+    let specs = vec![
+        ("embed".into(), vec![v, h]),
+        ("q".into(), vec![h, h]),
+        ("k".into(), vec![kvh * hd, h]),
+        ("v".into(), vec![kvh * hd, h]),
+        ("o".into(), vec![h, h]),
+        ("gate".into(), vec![inter, h]),
+        ("up".into(), vec![inter, h]),
+        ("down".into(), vec![h, inter]),
+    ];
+    let weights_store = Weights::from_f32(specs, |name| {
+        let len = match name {
+            "embed" => v * h,
+            "q" | "o" => h * h,
+            "k" | "v" => kvh * hd * h,
+            "gate" | "up" | "down" => inter * h,
+            _ => 0,
+        };
+        Ok(vec![0.05f32; len])
+    })
+    .unwrap();
+    let embed_mat = weights_store.mat("embed").unwrap();
+    let q_mat = weights_store.mat("q").unwrap();
+    let k_mat = weights_store.mat("k").unwrap();
+    let v_mat = weights_store.mat("v").unwrap();
+    let o_mat = weights_store.mat("o").unwrap();
+    let gate_mat = weights_store.mat("gate").unwrap();
+    let up_mat = weights_store.mat("up").unwrap();
+    let down_mat = weights_store.mat("down").unwrap();
+    let layer = Layer {
+        sliding: false,
+        head_dim: hd,
+        kv_heads: kvh,
+        kv_src: 0,
+        attn: Attn {
+            q: q_mat,
+            kv: Some((k_mat, Some(v_mat), vec![1.0; hd])),
+            o: o_mat,
+            q_norm: vec![1.0; hd],
+        },
+        gate: gate_mat,
+        up: up_mat,
+        down: down_mat,
+        input_ln: vec![1.0; h],
+        post_attn_ln: vec![1.0; h],
+        pre_ff_ln: vec![1.0; h],
+        post_ff_ln: vec![1.0; h],
+        ple: None,
+        scalar: 1.0,
+    };
+
+    let model = TextModel {
+        hidden: h,
+        vocab: v,
+        layers_n: 1,
+        max_pos: 512,
+        heads: nh,
+        eps,
+        window: 256,
+        softcap: Some(30.0),
+        embed_scale: 1.0,
+        embed: embed_mat,
+        ple: None,
+        layers: vec![layer],
+        first_shared: 1,
+        norm: vec![1.0; h],
+        inv_freq_sliding: vec![1.0; hd / 2],
+        inv_freq_full: vec![1.0; hd / 2],
+        pad_id: 0,
+        bidir_vision: false,
+    };
+    model
+}
+
+/// Decode graph of [`tiny_model`].
+pub fn tiny_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    tiny_model().to_decode_graph()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,80 +1200,8 @@ mod tests {
         use crate::graph::Tensor;
         use crate::model::weights::Weights;
 
-        let (h, v, nh, kvh, hd) = (64, 128, 2, 2, 32);
-        let (inter, eps) = (128, 1e-5);
-
-        let specs = vec![
-            ("embed".into(), vec![v, h]),
-            ("q".into(), vec![h, h]),
-            ("k".into(), vec![kvh * hd, h]),
-            ("v".into(), vec![kvh * hd, h]),
-            ("o".into(), vec![h, h]),
-            ("gate".into(), vec![inter, h]),
-            ("up".into(), vec![inter, h]),
-            ("down".into(), vec![h, inter]),
-        ];
-        let weights_store = Weights::from_f32(specs, |name| {
-            let len = match name {
-                "embed" => v * h,
-                "q" | "o" => h * h,
-                "k" | "v" => kvh * hd * h,
-                "gate" | "up" | "down" => inter * h,
-                _ => 0,
-            };
-            Ok(vec![0.05f32; len])
-        })
-        .unwrap();
-        let embed_mat = weights_store.mat("embed").unwrap();
-        let q_mat = weights_store.mat("q").unwrap();
-        let k_mat = weights_store.mat("k").unwrap();
-        let v_mat = weights_store.mat("v").unwrap();
-        let o_mat = weights_store.mat("o").unwrap();
-        let gate_mat = weights_store.mat("gate").unwrap();
-        let up_mat = weights_store.mat("up").unwrap();
-        let down_mat = weights_store.mat("down").unwrap();
-        let layer = Layer {
-            sliding: false,
-            head_dim: hd,
-            kv_heads: kvh,
-            kv_src: 0,
-            attn: Attn {
-                q: q_mat,
-                kv: Some((k_mat, Some(v_mat), vec![1.0; hd])),
-                o: o_mat,
-                q_norm: vec![1.0; hd],
-            },
-            gate: gate_mat,
-            up: up_mat,
-            down: down_mat,
-            input_ln: vec![1.0; h],
-            post_attn_ln: vec![1.0; h],
-            pre_ff_ln: vec![1.0; h],
-            post_ff_ln: vec![1.0; h],
-            ple: None,
-            scalar: 1.0,
-        };
-
-        let model = TextModel {
-            hidden: h,
-            vocab: v,
-            layers_n: 1,
-            max_pos: 512,
-            heads: nh,
-            eps,
-            window: 256,
-            softcap: Some(30.0),
-            embed_scale: 1.0,
-            embed: embed_mat,
-            ple: None,
-            layers: vec![layer],
-            first_shared: 1,
-            norm: vec![1.0; h],
-            inv_freq_sliding: vec![1.0; hd / 2],
-            inv_freq_full: vec![1.0; hd / 2],
-            pad_id: 0,
-            bidir_vision: false,
-        };
+        let model = tiny_model();
+        let (h, v) = (model.hidden, model.vocab);
 
         // 1. Reference forward pass
         let tok = 5u32;

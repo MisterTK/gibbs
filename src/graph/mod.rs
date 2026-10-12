@@ -6,6 +6,7 @@
 //! that already exist). Weights are ordinary operands, never op fields, and their data lives
 //! outside the graph in [`Weights`], so one graph can be fingerprinted or run.
 
+pub mod avenues;
 #[cfg(target_os = "macos")]
 pub mod codec;
 pub mod codegen;

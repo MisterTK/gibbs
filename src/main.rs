@@ -52,8 +52,9 @@ struct Cli {
     #[arg(long)]
     quant: Option<String>,
 
-    /// Compute backend: cpu, metal (Apple GPU; LLM and System 1), ane (System 1), cuda, rocm, or
-    /// level-zero. cuda, rocm and level-zero are stubs that fail at startup.
+    /// Compute backend: auto (Metal on Apple Silicon, CPU only where no GPU exists), metal, ane
+    /// (System 1), cuda, rocm, level-zero, or cpu. `cpu` is the explicit opt-in to the CPU executor;
+    /// cuda, rocm and level-zero are stubs that fail at startup.
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -173,11 +174,7 @@ fn run_ltx(
     backend: Device,
 ) -> Result<(), String> {
     let model = &cli.model;
-    if backend != Device::Cpu {
-        return Err(format!(
-            "'{model}' is a text-to-video model; it runs on the CPU only (use --backend cpu)"
-        ));
-    }
+    gibbs_engine::graph::avenues::family_gate(gibbs_engine::graph::avenues::Family::VideoLtx, backend)?;
     let Some(prompt) = cli.prompt.as_deref() else {
         return Err(format!(
             "'{model}' is a text-to-video model; the HTTP server, daemon and TUI have no video endpoint. \
@@ -237,14 +234,10 @@ fn run_ltx(
 /// One CLI text-to-video generation (ModelScope TextToVideoSDPipeline checkpoints), CPU only.
 fn run_text_to_video(cli: &Cli, hub: &HuggingFaceHub, backend: Device) -> Result<(), String> {
     let model = &cli.model;
-    match backend {
-        Device::Cpu => {}
-        _ => {
-            return Err(format!(
-                "'{model}' is a text-to-video model; it runs on the CPU only (use --backend cpu)"
-            ))
-        }
-    }
+    gibbs_engine::graph::avenues::family_gate(
+        gibbs_engine::graph::avenues::Family::VideoModelScope,
+        backend,
+    )?;
     let Some(prompt) = cli.prompt.as_deref() else {
         return Err(format!(
             "'{model}' is a text-to-video model; the HTTP server, daemon and TUI have no video endpoint. \
@@ -316,7 +309,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Probe Hardware
     let hw = HardwareCapability::probe_system();
-    let placement: gibbs_engine::hardware::PlacementMode = cli.backend.parse()?;
+    let mut placement: gibbs_engine::hardware::PlacementMode = cli.backend.parse()?;
+    // GPU-only by default: `auto` resolves to Metal wherever it exists; the CPU is an explicit `--backend cpu`.
+    if placement == gibbs_engine::hardware::PlacementMode::Auto
+        && gibbs_engine::hardware::default_device() == Device::Metal
+    {
+        placement = gibbs_engine::hardware::PlacementMode::Pin(Device::Metal);
+    }
     let backend = match placement {
         gibbs_engine::hardware::PlacementMode::Pin(d) => d,
         gibbs_engine::hardware::PlacementMode::Auto => Device::Cpu,
@@ -344,6 +343,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     };
+    // GPU-only tripwire: from here on, any CPU compute outside `--backend cpu` panics.
+    if matches!(backend, Device::Metal | Device::Ane) {
+        gibbs_engine::hardware::cpu_compute::ban(true);
+    }
     if backend == Device::Ane && !cli.system1 {
         return Err("--backend ane runs System 1 only (add --system1)".into());
     }
@@ -459,9 +462,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 system_mem as f64 / 1e9
             ));
         }
-    }
-    if backend == Device::Metal && is_image {
-        return Err("--backend metal runs text-generation models and System 1; image models run on CPU (use --backend cpu)".into());
     }
     if cli.image.is_some() && !is_image {
         return Err(format!(

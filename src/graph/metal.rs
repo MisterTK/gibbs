@@ -1313,7 +1313,23 @@ impl Session {
                         raw_data.len(),
                         WeightFormat::IQ3_S,
                     ),
-                    _ => {
+                    other => {
+                        use crate::model::layers::QuantizedWeight as Q;
+                        let fmt_name = match other {
+                            Q::ZeroCopySlice { format, .. } | Q::GgufQuantized { format, .. } => {
+                                Some(format!("{format:?}"))
+                            }
+                            Q::Nvfp4(_) => Some("NVFP4".to_string()),
+                            Q::Exl3(_) => Some("EXL3".to_string()),
+                            Q::WeightlessJesse(_) => Some("Jesse".to_string()),
+                            Q::Uncompressed { .. } => None,
+                        };
+                        if let Some(fmt_name) = fmt_name {
+                            tracing::info!(
+                                "weight {name}: {fmt_name} has no GPU codec; dequantized to f32 at load (streams f32, not {:.2} bpw)",
+                                other.bits_per_weight()
+                            );
+                        }
                         let v = t.to_f32();
                         let ptr = v.as_ptr() as *const c_void;
                         let len = v.len();
@@ -1388,7 +1404,11 @@ impl Session {
                                 (num_elements / 256) * 110,
                                 WeightFormat::IQ3_S,
                             ),
-                            _ => {
+                            fmt => {
+                                tracing::info!(
+                                    "weight {name}: {fmt:?} has no GPU codec; dequantized to f32 at load (streams f32, not {:.2} bpw)",
+                                    fmt.bits_per_weight()
+                                );
                                 let v = m.to_f32();
                                 let ptr = v.as_ptr() as *const c_void;
                                 let len = v.len();

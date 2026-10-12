@@ -9,6 +9,7 @@ pub fn run_stateless(
     weights: &Weights,
     inputs: Vec<Tensor>,
 ) -> Result<Vec<Tensor>, String> {
+    crate::hardware::cpu_compute::enter("graph::cpu::run_stateless");
     let mut state = StateStore::new();
     run(graph, weights, &mut state, inputs)
 }
@@ -66,6 +67,7 @@ pub fn run(
     state: &mut StateStore,
     inputs: Vec<Tensor>,
 ) -> Result<Vec<Tensor>, String> {
+    crate::hardware::cpu_compute::enter("graph::cpu::run");
     if inputs.len() != graph.inputs.len() {
         return Err(format!(
             "graph has {} inputs, got {}",

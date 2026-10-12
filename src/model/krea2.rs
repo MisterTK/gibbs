@@ -599,6 +599,7 @@ pub struct Krea2Pipeline {
 impl Krea2Pipeline {
     /// A diffusers `Krea2Pipeline` snapshot (`krea/Krea-2-Raw`, `krea/Krea-2-Turbo`, ...).
     pub fn load(dir: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         Self::from_diffusers(dir, None, Vec::new())
     }
 

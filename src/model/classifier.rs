@@ -445,6 +445,7 @@ impl SequenceClassifier {
         let resolved = resolve_config(hub, repo_id);
         // SetFit: a sentence-transformers body (`BertModel`) + a scikit-learn head.
         if resolved.is_err() && hub.fetch_file(repo_id, "config_setfit.json").is_ok() {
+            crate::graph::avenues::family_gate(crate::graph::avenues::Family::ClassifierBert, device)?;
             return Self::from_setfit(hub, repo_id, device);
         }
         if resolved.is_err() && gguf::hub_gguf_arch(hub, repo_id).as_deref() == Some("bert") {
@@ -493,14 +494,8 @@ impl SequenceClassifier {
             }
             None => (repo_id, repo_id),
         };
-        let cpu_only = |what: &str| -> Result<(), String> {
-            if device == Device::Cpu {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{what} classifiers run on the CPU only; relaunch with --backend cpu"
-                ))
-            }
+        let cpu_only = |family: crate::graph::avenues::Family| {
+            crate::graph::avenues::family_gate(family, device)
         };
         let usize_of = |k: &str| {
             cfg[k]
@@ -511,7 +506,7 @@ impl SequenceClassifier {
         let pad_id = cfg["pad_token_id"].as_u64().map(|v| v as u32);
 
         let body = if is_decoder(&arch) {
-            cpu_only("decoder")?;
+            cpu_only(crate::graph::avenues::Family::ClassifierDecoder)?;
             if peft.is_some() {
                 // ponytail: LoRA merges into the f32 encoder checkpoints only; decoder bodies load
                 // through their own readers (merge there when a decoder SEQ_CLS adapter matters).
@@ -594,11 +589,11 @@ impl SequenceClassifier {
             let tok = load_tokenizer(hub, tok_repo, &arch, &tok_cfg, capacity)?;
             let eps = cfg["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32;
             if arch == "ModernBertForSequenceClassification" {
-                cpu_only("ModernBERT")?;
+                cpu_only(crate::graph::avenues::Family::ClassifierModern)?;
                 let model = modernbert::ModernBert::load(&cfg, &ckpt)?;
                 Body::ModernBert { model, tok }
             } else if arch.starts_with("Electra") || arch.starts_with("Albert") {
-                cpu_only("ELECTRA/ALBERT")?;
+                cpu_only(crate::graph::avenues::Family::ClassifierModern)?;
                 let albert = arch.starts_with("Albert");
                 let model = factorized::Factorized::load(&cfg, &ckpt, albert)
                     .map_err(|e| format!("{repo_id}: {e}"))?;
@@ -620,7 +615,7 @@ impl SequenceClassifier {
                 };
                 Body::Factorized { model, tok, head }
             } else if arch.starts_with("Deberta") {
-                cpu_only("DeBERTa")?;
+                cpu_only(crate::graph::avenues::Family::ClassifierModern)?;
                 let model = Deberta::load(&cfg, &ckpt, !arch.starts_with("DebertaV2"))?;
                 let act = match cfg["pooler_hidden_act"].as_str().unwrap_or("gelu") {
                     "gelu" => Act::Gelu,
@@ -708,6 +703,7 @@ impl SequenceClassifier {
                     }
                 };
                 let h = dims.hidden_size;
+                cpu_only(crate::graph::avenues::Family::ClassifierBert)?;
                 let enc = BertEncoder::load(dims, device, |name, shape| {
                     // DistilBERT has no segment embeddings: one all-zero row keeps the BERT graph.
                     if prefix == "distilbert" && name == "embeddings.token_type_embeddings.weight" {
@@ -765,6 +761,7 @@ impl SequenceClassifier {
     /// A fastText `.bin`/`.ftz` classifier, or (when `path` is a directory) a fastText
     /// hierarchical-softmax re-export (`config.json` + `vocab.json` + `weights.pt`).
     pub fn from_fasttext(repo_id: &str, path: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::ClassifierModern)?;
         let ft = if path.is_dir() {
             crate::model::fasttext::FastText::load_export(path)?
         } else {
@@ -782,6 +779,7 @@ impl SequenceClassifier {
     /// A llama.cpp BERT/XLM-R classifier or reranker GGUF at `path`: labels from
     /// `<arch>.classifier.output_labels`; one logit is a raw score, more are softmaxed.
     pub fn from_gguf(repo_id: &str, path: &Path, device: Device) -> Result<Self, String> {
+        crate::graph::avenues::family_gate(crate::graph::avenues::Family::ClassifierBert, device)?;
         let g = GgufClassifier::load(path, device)?;
         Ok(Self {
             repo_id: repo_id.to_string(),

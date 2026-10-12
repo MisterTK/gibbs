@@ -81,6 +81,7 @@ pub struct SiglipVision {
 impl SiglipVision {
     /// `cfg` is the HF `vision_config`; tensors live under `prefix` (e.g. `model.vision_model`).
     pub fn load(cfg: &Value, prefix: &str, load: Loader) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::Idefics3Siglip)?;
         let num = |k: &str| {
             cfg[k]
                 .as_u64()
@@ -145,6 +146,7 @@ impl SiglipVision {
     // ponytail: full fixed-size images only (all Idefics3 tiles are); NaViT-style partial-patch
     // masks and bucketed positions when a VLM feeds variable-size images.
     pub fn forward(&self, pixels: &[f32]) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("siglip::forward");
         let (s, d) = (self.image_size, self.hidden);
         assert_eq!(pixels.len(), 3 * s * s, "SigLIP input is not [3, {s}, {s}]");
         let (emb, gh, gw) = nn::conv2d(

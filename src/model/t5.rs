@@ -590,6 +590,7 @@ pub fn load(
     cfg: &Value,
     _mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::T5)?;
     let path = artifacts
         .weights_path
         .as_deref()

@@ -1636,3 +1636,10 @@ mod tests {
         assert!(err.contains("missing weight"), "{err}");
     }
 }
+
+/// Whether the Core ML lowering can run a graph node. The module emits one fixed System 1 BERT
+/// encoder program (`mul`/`matmul`/`add`/`softmax`/`layer_norm`/`gelu` MIL ops, see `Session`); it
+/// does not lower arbitrary graph nodes, so no node qualifies.
+pub fn supports_node(_op: &crate::graph::Op) -> bool {
+    false
+}

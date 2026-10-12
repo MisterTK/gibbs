@@ -88,6 +88,7 @@ impl SdPipeline {
 
     /// SD 2.1 turbo GGUF (gpustack/stable-diffusion-v2-1-turbo-GGUF): Euler trailing, no CFG.
     pub fn load(gguf_path: &Path, hub: &HuggingFaceHub) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionUnet)?;
         let reader = GgufWeightReader::open(gguf_path)?;
         if !Self::is_sd_checkpoint(&reader) {
             return Err(format!(
@@ -132,6 +133,7 @@ impl SdPipeline {
         id: &str,
         lora: Option<&Lora>,
     ) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionUnet)?;
         let index = read_json(&dir.join("model_index.json"))?;
         let class = index["_class_name"].as_str().unwrap_or("").to_string();
         let xl = class == "StableDiffusionXLPipeline";
@@ -247,6 +249,7 @@ impl SdPipeline {
         id: &str,
         lora: Option<&Lora>,
     ) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionUnet)?;
         let r =
             SafetensorsWeightReader::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut t = Tensors::safetensors(&r)?;

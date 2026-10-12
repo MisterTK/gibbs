@@ -2016,6 +2016,7 @@ impl GraphLm {
 
     /// Executes forward pass over prompt tokens, returning logits for the final position (length vocab_size).
     pub fn forward(&self, tokens: &[u32]) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("graph_lm::forward");
         let mut logits = vec![0.0f32; self.config.vocab_size];
         if !tokens.is_empty() {
             self.lm_head
@@ -2866,6 +2867,7 @@ impl GraphLm {
         temperature: f32,
         repetition_penalty: f32,
     ) -> u32 {
+        crate::hardware::cpu_compute::enter("graph_lm::generate_step_with_penalty");
         let logits = self.forward(tokens);
         let recent = if tokens.len() > 64 {
             &tokens[tokens.len() - 64..]

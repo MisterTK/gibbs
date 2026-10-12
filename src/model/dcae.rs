@@ -180,6 +180,7 @@ pub struct DcAeDecoder {
 impl DcAeDecoder {
     /// `<snapshot>/vae` of a diffusers `AutoencoderDC`.
     pub fn load(dir: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::Vae)?;
         let cfg = read_config(dir)?;
         let usizes = |k: &str| -> Vec<usize> {
             cfg[k]

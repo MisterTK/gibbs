@@ -361,6 +361,7 @@ pub struct Sd3Pipeline {
 impl Sd3Pipeline {
     /// Loads a diffusers `StableDiffusion3Pipeline` snapshot directory.
     pub fn load(dir: &Path, hub: &HuggingFaceHub) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         let sched = crate::model::dit::read_scheduler(dir)?;
         if sched["use_dynamic_shifting"].as_bool() == Some(true) {
             return Err("SD3 scheduler with use_dynamic_shifting is not supported".into());

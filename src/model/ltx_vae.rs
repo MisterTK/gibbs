@@ -514,6 +514,7 @@ pub struct LtxVae {
 
 impl LtxVae {
     pub fn load(path: &Path, encoder: bool) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::Vae)?;
         let w = Weights::open(path)?;
         let diffusers = w.has("decoder.mid_block.resnets.0.conv1.conv.weight");
         if !diffusers && !w.has("decoder.up_blocks.0.res_blocks.0.conv1.conv.weight") {
