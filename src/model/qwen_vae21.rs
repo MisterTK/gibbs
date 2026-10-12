@@ -239,7 +239,7 @@ impl Up {
         };
         let u = b.upsample(t, 2, 2);
         let y = conv.emit(b, u);
-        let (repeats, ft) = self.dup.expect("upsampling blocks carry a shortcut");
+        assert!(self.dup.is_some(), "upsampling blocks carry a shortcut");
         let s = b.shape(x).to_vec();
         let (h, w, c_out) = (s[1], s[2], conv.c_out);
         let idx = {
