@@ -627,14 +627,42 @@ impl StateStore {
         self.buffers.insert(name.into(), t);
     }
 
-    pub fn truncate(&mut self, _pos: usize) -> Result<(), String> {
-        // No-op for full KV
-        Ok(())
+    /// Rewinds to `pos` positions. Full KV states need nothing (attention reads only the rows
+    /// below the position it is given, and later writes overwrite the rest); a recurrent state
+    /// (Gated DeltaNet `ssm_state`, causal-conv `conv_state`) cannot rewind and errs: `restore`
+    /// a [`Self::snapshot`] taken at `pos` instead.
+    pub fn truncate(&mut self, pos: usize) -> Result<(), String> {
+        let recurrent = |n: &String| n.contains("conv_state") || n.contains("ssm_state");
+        let names = self.buffers.keys().chain(self.metal_names());
+        match names.into_iter().find(|n| recurrent(n)) {
+            Some(n) => Err(format!(
+                "cannot rewind recurrent state {n} to position {pos}: restore a snapshot"
+            )),
+            None => Ok(()),
+        }
     }
 
+    #[cfg(target_os = "macos")]
+    fn metal_names(&self) -> impl Iterator<Item = &String> {
+        self.metal_buffers.keys()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn metal_names(&self) -> impl Iterator<Item = &String> {
+        std::iter::empty()
+    }
+
+    /// Copies of the named states (device-resident ones are read back from their buffers).
     pub fn snapshot(&self, names: &[&str]) -> HashMap<String, Tensor> {
         let mut snap = HashMap::new();
         for &name in names {
+            #[cfg(target_os = "macos")]
+            if let Some((buf, n)) = self.metal_buffers.get(name) {
+                // SAFETY: shared-storage buffer of `n` f32; programs run synchronously, so the GPU is idle.
+                let s = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, *n) };
+                snap.insert(name.to_string(), Tensor::F32(s.to_vec()));
+                continue;
+            }
             if let Some(t) = self.buffers.get(name) {
                 snap.insert(name.to_string(), t.clone());
             }
@@ -642,8 +670,19 @@ impl StateStore {
         snap
     }
 
+    /// Writes `snapshot` back: into the device buffer of a device-resident state.
     pub fn restore(&mut self, snapshot: HashMap<String, Tensor>) {
         for (name, t) in snapshot {
+            #[cfg(target_os = "macos")]
+            if let Some((buf, n)) = self.metal_buffers.get(&name) {
+                if let Tensor::F32(v) = &t {
+                    assert_eq!(v.len(), *n, "snapshot of state {name} has the wrong size");
+                    // SAFETY: as in `snapshot`; `v` has exactly `n` f32.
+                    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), buf.contents() as *mut f32, *n) };
+                    self.buffers.remove(&name);
+                    continue;
+                }
+            }
             self.buffers.insert(name, t);
         }
     }
@@ -835,4 +874,38 @@ pub fn lower_moe_pass(graph: &mut Graph) -> Result<(), String> {
 
     *graph = new_g;
     Ok(())
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    /// Full KV rewinds by position; a recurrent state refuses and comes back from a snapshot; a
+    /// device-resident state is read from and written back into its buffer.
+    #[test]
+    fn truncate_snapshot_restore() {
+        let mut st = StateStore::new();
+        st.insert("layers.3.k_cache", Tensor::F32(vec![1.0; 8]));
+        assert!(st.truncate(2).is_ok());
+        st.insert("layers.0.ssm_state", Tensor::F32(vec![1.0, 2.0]));
+        assert!(st.truncate(2).unwrap_err().contains("ssm_state"));
+        let snap = st.snapshot(&["layers.0.ssm_state", "missing"]);
+        assert_eq!(snap.len(), 1);
+        st.insert("layers.0.ssm_state", Tensor::F32(vec![9.0, 9.0]));
+        st.restore(snap);
+        assert_eq!(st.get("layers.0.ssm_state").unwrap().as_f32().unwrap(), &[1.0, 2.0]);
+        #[cfg(target_os = "macos")]
+        if let Some(dev) = ::metal::Device::system_default() {
+            let buf = dev.new_buffer(8, ::metal::MTLResourceOptions::StorageModeShared);
+            // SAFETY: shared 8-byte buffer = 2 f32.
+            unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, 2) }.copy_from_slice(&[5.0, 6.0]);
+            st.metal_buffers.insert("layers.1.conv_state".into(), (std::sync::Arc::new(buf), 2));
+            let snap = st.snapshot(&["layers.1.conv_state"]);
+            let live = st.metal_buffers["layers.1.conv_state"].0.contents() as *mut f32;
+            // SAFETY: as above.
+            unsafe { live.write(0.0) };
+            st.restore(snap);
+            assert_eq!(unsafe { *live }, 5.0);
+        }
+    }
 }

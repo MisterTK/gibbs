@@ -118,8 +118,28 @@ impl ExecutableModel {
                 }
                 Ok(out)
             }
-            (Self::Native(_) | Self::GraphLm(_), _) => Err(WRONG_KV.into()),
-            _ => Err("speculative decoding runs on CPU models (native or GraphLm)".into()),
+            (Self::Program(prog, _), Some(SeqKvCache::Program(state))) => {
+                use crate::graph::Tensor;
+                let mut p = prog.write();
+                std::mem::swap(&mut p.state, state);
+                let mut out = Vec::new();
+                let mut res = Ok(());
+                for (i, &t) in tokens.iter().enumerate() {
+                    let step = p.run(vec![Tensor::U32(vec![t]), Tensor::U32(vec![(start + i) as u32])]);
+                    match step.map(|o| o.into_iter().next()) {
+                        Ok(Some(Tensor::F32(v))) => out.extend(v),
+                        Ok(_) => res = Err("GraphProgram did not return F32 logits".to_string()),
+                        Err(e) => res = Err(e),
+                    }
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                std::mem::swap(&mut p.state, state);
+                res.map(|()| out)
+            }
+            (Self::Native(_) | Self::GraphLm(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
+            _ => Err("speculative decoding is not supported by this model".into()),
         }
     }
 
@@ -136,8 +156,10 @@ impl ExecutableModel {
                 }
                 Ok(())
             }
-            (Self::Native(_) | Self::GraphLm(_), _) => Err(WRONG_KV.into()),
-            _ => Err("speculative decoding runs on CPU models (native or GraphLm)".into()),
+            // The decode graph's KV rows are indexed by position: rewinding is writing from `len`.
+            (Self::Program(..), Some(SeqKvCache::Program(_))) => Ok(()),
+            (Self::Native(_) | Self::GraphLm(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
+            _ => Err("speculative decoding is not supported by this model".into()),
         }
     }
 
@@ -161,8 +183,13 @@ impl ExecutableModel {
                 }
                 Ok(())
             }
+            (Self::Program(..), _) if layers.is_empty() => Ok(()),
+            (Self::Program(..), _) => Err(
+                "hidden-state drafters read tapped layers, which the GraphLm Metal program does not expose"
+                    .into(),
+            ),
             (Self::Native(_), _) => Err(WRONG_KV.into()),
-            _ => Err("speculative decoding runs on CPU models (native or GraphLm)".into()),
+            _ => Err("speculative decoding is not supported by this model".into()),
         }
     }
 

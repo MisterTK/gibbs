@@ -195,6 +195,7 @@ pub enum Family {
     Gemma4Media,
     Qwen35Vision,
     DraftersMtp,
+    DraftersBlock,
     Ninfer,
     T5,
     Seq2Seq,
@@ -212,13 +213,14 @@ pub enum Family {
 }
 
 impl Family {
-    pub const ALL: [Family; 20] = [
+    pub const ALL: [Family; 21] = [
         Family::GraphLm,
         Family::Gemma4,
         Family::Qwen35,
         Family::Gemma4Media,
         Family::Qwen35Vision,
         Family::DraftersMtp,
+        Family::DraftersBlock,
         Family::Ninfer,
         Family::T5,
         Family::Seq2Seq,
@@ -247,18 +249,11 @@ pub enum Status {
 pub fn family_status(f: Family) -> Status {
     use Family::*;
     match f {
-        GraphLm | Gemma4 | Qwen35 | System1 | T5 | Seq2Seq => Status::Gpu,
+        GraphLm | Gemma4 | Qwen35 | System1 | T5 | Seq2Seq | Qwen35Vision | DraftersMtp | Ninfer => {
+            Status::Gpu
+        }
         Gemma4Media => Status::Gated(
             "builder: vision/audio prefill bypasses the program (host Rust vision tower)",
-        ),
-        Qwen35Vision => {
-            Status::Gated("builder: vision tower and MRope prefill are host Rust, no Metal program")
-        }
-        DraftersMtp => Status::Gated(
-            "builder: drafter/MTP forward is host Rust; no state snapshot/restore on the Metal program",
-        ),
-        Ninfer => Status::Gated(
-            "builder: .ninfer catalog emits Moe with host-side experts; no Metal expert operands",
         ),
         Idefics3Siglip => Status::Gated("builder: SigLIP forward is host Rust, no graph builder"),
         ClassifierBert | ClassifierModern | ClassifierDecoder => Status::Gpu,
@@ -268,6 +263,9 @@ pub fn family_status(f: Family) -> Status {
         VideoLtx => Status::Gated("builder: LTX forward is host Rust, no graph builder"),
         VideoModelScope => Status::Gated("builder: UNet3D forward is host Rust, no graph builder"),
         Audio => Status::Gated("builder: conformer audio forward is host Rust; no Metal program yet"),
+        DraftersBlock => Status::Gated(
+            "builder: DFlash/DFlash2/DSpark block drafters are host Rust (per-layer KV projection of tapped target states, grouped dynamic conv, Markov rescoring) and need arbitrary-layer taps; the Metal target program taps only the final-normed output",
+        ),
     }
 }
 
@@ -407,7 +405,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 (unary(UnaryKind::SoftCap(30.0)), F32),
             ]);
         }
-        Family::Qwen35 => {
+        Family::Qwen35 | Family::Ninfer => {
             decoder(&mut ops);
             ops.extend([
                 (
@@ -458,10 +456,24 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 F32,
             ),
         ]),
+        // The tower: patch-embed Linear, position-embedding gather/blend, 2D rotary as a
+        // non-interleaved MRope, bidirectional attention, LayerNorm, merger Reshape.
         Family::Qwen35Vision => ops.extend([
-            (conv3d(), F32),
+            (Op::Linear, F32),
+            (Op::Linear, BF16),
+            (Op::Embedding, F32),
+            (Op::Mul, F32),
+            (Op::Add, F32),
             (reshape(), F32),
-            (Op::Transpose { perm: vec![1, 0] }, F32),
+            (slice(), F32),
+            (
+                rope(RopeVariant::MRope {
+                    sections: [4, 4, 0],
+                    interleaved: false,
+                    pairs: PairLayout::Half,
+                }),
+                F32,
+            ),
             (
                 rope(RopeVariant::MRope {
                     sections: [8, 4, 4],
@@ -472,32 +484,22 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             ),
             (attn(), F32),
             (ln(), F32),
+            (Op::Gelu { tanh: true }, F32),
+            (Op::Gelu { tanh: false }, F32),
         ]),
-        Family::DraftersMtp => ops.extend([
-            (Op::Embedding, F32),
-            (Op::Concat { axis: -1 }, F32),
+        // The MTP head (embed-norm, hidden-norm, concat, fc, one gated attention layer) and the
+        // plain draft models' decode graphs.
+        Family::DraftersMtp => {
+            decoder(&mut ops);
+            ops.extend([(Op::Concat { axis: -1 }, F32), (Op::Mul, F32), (Op::Silu, F32)]);
+        }
+        Family::DraftersBlock => ops.extend([
             (Op::Linear, F32),
             (rms(), F32),
-            (cached_attn(), F32),
-        ]),
-        Family::Ninfer => ops.extend([
-            (Op::Linear, F32),
-            (
-                Op::Moe {
-                    experts: 4,
-                    top_k: 2,
-                },
-                F32,
-            ),
-            (
-                Op::DeltaRule {
-                    key_heads: 2,
-                    val_heads: 2,
-                    key_dim: 16,
-                    val_dim: 16,
-                },
-                F32,
-            ),
+            (attn(), F32),
+            (rope_hs(), F32),
+            (Op::SwiGlu, F32),
+            (Op::Add, F32),
         ]),
         Family::T5 => ops.extend([
             (Op::Embedding, F32),
