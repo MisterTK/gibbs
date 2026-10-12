@@ -1157,6 +1157,23 @@ impl TextModel {
         &self,
         max_ctx: usize,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.decode_graph(max_ctx, None)
+    }
+
+    /// The decode graph with a bias-free `score` head `[labels, hidden]` (sequence classification)
+    /// in place of the LM head: each step's output is the `[labels]` logits of the token it ran.
+    pub(crate) fn to_seqcls_graph(
+        &self,
+        score: &[f32],
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.decode_graph(self.decode_max_ctx, Some(score))
+    }
+
+    fn decode_graph(
+        &self,
+        max_ctx: usize,
+        score: Option<&[f32]>,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         let max_ctx = max_ctx.min(self.max_pos).max(1);
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor, UnaryKind, ValueId};
         use crate::model::weights::Mat;
@@ -1847,7 +1864,13 @@ impl TextModel {
             DType::F32,
         );
 
-        let (lm_w, lm_dim) = if let Some(lm) = &self.lm_head {
+        // Sequence classification: the bias-free `[labels, hidden]` score head replaces the LM head.
+        let (head_w, head_dim) = if let Some(s) = score {
+            let labels = s.len() / self.hidden;
+            let w_node = g.weight("score.weight", vec![labels, self.hidden], DType::F32);
+            w.insert("score.weight", Tensor::F32(s.to_vec()));
+            (w_node, labels)
+        } else if let Some(lm) = &self.lm_head {
             let w_node = g.weight(
                 "lm_head.weight",
                 vec![lm.rows, self.hidden],
@@ -1867,8 +1890,8 @@ impl TextModel {
         let logits = g.add(
             "logits",
             Op::Linear,
-            &[final_x, lm_w],
-            vec![n, lm_dim],
+            &[final_x, head_w],
+            vec![n, head_dim],
             DType::F32,
         );
 
