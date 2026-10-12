@@ -1136,88 +1136,13 @@ mod tests {
         assert_eq!(Heads::Count(8).head_dim(640).unwrap(), 80);
     }
 
-    type Specs = Vec<(String, Vec<usize>)>;
-
-    fn lin(s: &mut Specs, p: &str, i: usize, o: usize, bias: bool) {
-        s.push((format!("{p}.weight"), vec![o, i]));
-        if bias {
-            s.push((format!("{p}.bias"), vec![o]));
-        }
-    }
-    fn conv(s: &mut Specs, p: &str, i: usize, o: usize, k: usize) {
-        s.push((format!("{p}.weight"), vec![o, i, k, k]));
-        s.push((format!("{p}.bias"), vec![o]));
-    }
-    fn nrm(s: &mut Specs, p: &str, c: usize) {
-        s.push((format!("{p}.weight"), vec![c]));
-        s.push((format!("{p}.bias"), vec![c]));
-    }
-    pub(crate) fn res(s: &mut Specs, p: &str, i: usize, o: usize, emb: usize) {
-        nrm(s, &format!("{p}.in_layers.0"), i);
-        conv(s, &format!("{p}.in_layers.2"), i, o, 3);
-        lin(s, &format!("{p}.emb_layers.1"), emb, o, true);
-        nrm(s, &format!("{p}.out_layers.0"), o);
-        conv(s, &format!("{p}.out_layers.3"), o, o, 3);
-        if i != o {
-            conv(s, &format!("{p}.skip_connection"), i, o, 1);
-        }
-    }
-    pub(crate) fn trans(s: &mut Specs, p: &str, c: usize, ctx: usize) {
-        nrm(s, &format!("{p}.norm"), c);
-        lin(s, &format!("{p}.proj_in"), c, c, true);
-        let b = format!("{p}.transformer_blocks.0");
-        for n in ["norm1", "norm2", "norm3"] {
-            nrm(s, &format!("{b}.{n}"), c);
-        }
-        for (a, kv) in [("attn1", c), ("attn2", ctx)] {
-            lin(s, &format!("{b}.{a}.to_q"), c, c, false);
-            lin(s, &format!("{b}.{a}.to_k"), kv, c, false);
-            lin(s, &format!("{b}.{a}.to_v"), kv, c, false);
-            lin(s, &format!("{b}.{a}.to_out.0"), c, c, true);
-        }
-        lin(s, &format!("{b}.ff.net.0.proj"), c, 2 * 2 * c, true);
-        lin(s, &format!("{b}.ff.net.2"), 2 * c, c, true);
-        lin(s, &format!("{p}.proj_out"), c, c, true);
-    }
-
-    /// A 2-level LDM UNet (SD layout, 1 ResBlock per level) with SDXL `label_emb` and LCM `cond_proj`.
-    fn tiny_specs(ctx: usize, add: usize, cond: usize) -> Specs {
-        let (mc, emb) = (32, 128);
-        let mut s = Specs::new();
-        conv(&mut s, "input_blocks.0.0", 4, mc, 3);
-        res(&mut s, "input_blocks.1.0", mc, mc, emb);
-        trans(&mut s, "input_blocks.1.1", mc, ctx);
-        conv(&mut s, "input_blocks.2.0.op", mc, mc, 3);
-        res(&mut s, "input_blocks.3.0", mc, 64, emb);
-        trans(&mut s, "input_blocks.3.1", 64, ctx);
-        res(&mut s, "middle_block.0", 64, 64, emb);
-        trans(&mut s, "middle_block.1", 64, ctx);
-        res(&mut s, "middle_block.2", 64, 64, emb);
-        // (skip channels popped, res in, res out, transformer width, upsample)
-        let outs = [(64, 128, 64, 64, false), (32, 96, 64, 64, true), (32, 96, 32, 32, false), (32, 64, 32, 32, false)];
-        for (i, (_, cin, cout, tc, up)) in outs.into_iter().enumerate() {
-            res(&mut s, &format!("output_blocks.{i}.0"), cin, cout, emb);
-            trans(&mut s, &format!("output_blocks.{i}.1"), tc, ctx);
-            if up {
-                conv(&mut s, &format!("output_blocks.{i}.2.conv"), cout, cout, 3);
-            }
-        }
-        nrm(&mut s, "out.0", 32);
-        conv(&mut s, "out.2", 32, 4, 3);
-        lin(&mut s, "time_embed.0", mc, emb, true);
-        lin(&mut s, "time_embed.2", emb, emb, true);
-        lin(&mut s, "time_embed.cond_proj", cond, mc, false);
-        lin(&mut s, "label_emb.0.0", add, emb, true);
-        lin(&mut s, "label_emb.0.2", emb, emb, true);
-        s
-    }
-
     /// CPU UNet vs the Metal program: f32 vs f32, 1e-3.
     #[test]
     fn gpu_matches_cpu() {
         use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
+        use crate::model::diff_fixtures::unet_specs;
         let (ctx, add, cond, h, w, ctx_len) = (48, 24, 16, 8, 12, 5);
-        let r = synth(&tiny_specs(ctx, add, cond), 11);
+        let r = synth(&unet_specs(ctx, add, cond), 11);
         let t = Tensors::from_reader(&r).unwrap();
         let unet = SdUnet::load(&t, "", Heads::Dim(16)).unwrap();
         let mut rng = Lcg(2);

@@ -46,6 +46,7 @@
 pub mod classifier;
 pub mod clip;
 pub mod dcae;
+pub mod diff_fixtures;
 pub mod diff_graph;
 pub mod dit;
 pub mod draft;

@@ -80,6 +80,11 @@ fn gpu_fixture(f: Family) {
                 assert_eq!(out.len(), 16);
             }
         }
+        Family::DiffusionUnet => {
+            // CLIP -> UNet2D (SDXL/LCM conditioning) x2 steps -> VAE decode, all Metal programs.
+            let size = gibbs_engine::model::diff_fixtures::tiny_sd_on_gpu().expect("tiny SD runs on Metal");
+            assert_eq!(size, (8, 8));
+        }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }
