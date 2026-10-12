@@ -390,6 +390,10 @@ pub fn load(
     mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
     let mode = mode.into();
+    crate::graph::avenues::family_gate(
+        crate::graph::avenues::Family::Idefics3Siglip,
+        crate::graph::avenues::resolved_backend(mode),
+    )?;
     let weights = artifacts.weights_path.as_deref().ok_or("no weight file")?;
     if !matches!(
         weights.extension().and_then(|e| e.to_str()),
@@ -711,13 +715,16 @@ mod tests {
         let _allow = cpu_compute::allow();
         let cpu = tiny_engine(PlacementMode::Pin(Device::Cpu));
         let gpu = tiny_engine(PlacementMode::Pin(Device::Metal));
-        assert!(matches!(gpu.kind, Kind::Gpu { .. }));
+        let Kind::Gpu { vision, text, .. } = &gpu.kind else { panic!("not a GPU engine") };
+        assert_eq!(vision.lock().cpu_node_count() + text.lock().cpu_node_count(), 0, "nodes run on the CPU");
         let pixels = crate::model::siglip::tiny::values("pixels", 3 * 16 * 16);
         let (rc, rg) = (cpu.embed_tile(&pixels).unwrap(), gpu.embed_tile(&pixels).unwrap());
         assert_eq!(rc.len(), 4 * 128);
         let e = rel_err(&rg, &rc);
         println!("idefics3 tile rows: rel err {e:e}");
         assert!(e < 1e-3, "tile rows differ: {e}");
+        let abs = rg.iter().zip(&rc).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(abs < 1e-3, "tile rows max |d| {abs}");
 
         let image_pos = vec![2, 3, 4, 5];
         let (mut sc, mut sg) = (
@@ -730,6 +737,10 @@ mod tests {
             let e = rel_err(&lg, &lc);
             println!("idefics3 text at {start}: rel err {e:e}");
             assert!(e < 1e-3, "logits differ at {start}: {e}");
+            // Top-1 up to fp noise: a random tiny model has near-tied logits.
+            let best = lc.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            let gmax = lg.iter().fold(f32::MIN, |m, v| m.max(*v));
+            assert!(gmax - lg[best] < 1e-3, "top-1 at {start}");
         }
     }
 

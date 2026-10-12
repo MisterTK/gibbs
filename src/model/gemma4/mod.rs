@@ -282,10 +282,12 @@ impl NativeLm for Gemma4 {
             let (item, want) = items.next().ok_or("media/placeholder mismatch")?;
             let (soft, n, open, close) = match item {
                 MediaInput::Image(b) => {
+                    crate::graph::avenues::gate(crate::graph::avenues::Family::Gemma4Media)?;
                     let (soft, n) = self.vision.encode(b).map_err(|e| format!("image: {e}"))?;
                     (soft, n, self.boi, self.eoi)
                 }
                 MediaInput::Audio(b) => {
+                    crate::graph::avenues::gate(crate::graph::avenues::Family::Audio)?;
                     let (soft, n) = self.audio.encode(b).map_err(|e| format!("audio: {e}"))?;
                     (soft, n, self.boa, self.eoa)
                 }

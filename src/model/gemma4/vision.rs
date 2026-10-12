@@ -540,7 +540,12 @@ mod tests {
         for (ph, pw) in [(4, 4), (2, 6)] {
             let pix = super::tiny::patches(ph, pw);
             let want = cpu.forward_cpu(&pix, ph, pw);
-            let got = gpu.forward_gpu(gpu.gpu.as_ref().unwrap(), &pix, ph, pw).unwrap();
+            let cache = gpu.gpu.as_ref().unwrap();
+            let got = gpu.forward_gpu(cache, &pix, ph, pw).unwrap();
+            let prog = cache.get(&[ph, pw], || unreachable!("compiled by forward_gpu")).unwrap();
+            assert_eq!(prog.lock().cpu_node_count(), 0, "nodes run on the CPU");
+            let abs = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            assert!(abs < 1e-3, "max |d| {abs}");
             assert_eq!(got.len(), (ph / 2) * (pw / 2) * super::tiny::TEXT);
             let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
             let err = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
