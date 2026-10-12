@@ -191,7 +191,12 @@ impl DecoderBackbone for Dense {
     }
 
     fn context_len(&self) -> usize {
-        self.text.context_len()
+        // The compiled seq-cls program's KV state holds `decode_max_ctx` positions.
+        if self.program.is_some() {
+            self.text.decode_max_ctx
+        } else {
+            self.text.context_len()
+        }
     }
 
     fn hidden(&self) -> usize {
@@ -1784,7 +1789,7 @@ mod tests {
     /// accumulate in f32, so the bound is the 1e-3 f32 one.
     #[test]
     fn seqcls_gpu_matches_host_qwen3_5() {
-        let (text, h) = text::tiny_model();
+        let (text, h) = text::tiny_model_scaled(0.3);
         let mut llm = Dense {
             tok: crate::model::tokenizer::Tokenizer::default_bpe(),
             text: Arc::new(text),

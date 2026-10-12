@@ -49,12 +49,20 @@ impl Gemma4Seq {
     }
 }
 
+impl Gemma4Seq {
+    /// Positions a request may hold: `encode` caps inputs at [`MAX_LEN`], which also sizes the
+    /// Metal program's KV state (max_position_embeddings is 128k+).
+    fn ctx(&self) -> usize {
+        self.text.max_pos.min(MAX_LEN)
+    }
+}
+
 impl DecoderBackbone for Gemma4Seq {
     fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
     }
     fn context_len(&self) -> usize {
-        self.text.max_pos
+        self.ctx()
     }
     fn hidden(&self) -> usize {
         self.text.hidden
@@ -83,7 +91,7 @@ impl DecoderBackbone for Gemma4Seq {
         let gpu_only = |e: String| format!("gpu-only: Gemma 4 seq-cls: {e}");
         let (graph, weights) = self
             .text
-            .to_seqcls_graph(&self.norm, self.eps, score)
+            .to_seqcls_graph(self.ctx(), &self.norm, self.eps, score)
             .map_err(gpu_only)?;
         let mode = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
         let program = crate::graph::program::GraphProgram::compile(graph, weights, mode)
@@ -97,8 +105,8 @@ impl DecoderBackbone for Gemma4Seq {
         use crate::graph::Tensor;
         let prog = self.program.as_ref().ok_or("no GPU score program attached")?;
         let t = &self.text;
-        if ids.is_empty() || ids.len() > t.max_pos {
-            return Err(format!("{} tokens: the context holds 1..={}", ids.len(), t.max_pos));
+        if ids.is_empty() || ids.len() > self.ctx() {
+            return Err(format!("{} tokens: the context holds 1..={}", ids.len(), self.ctx()));
         }
         if let Some(&id) = ids.iter().find(|&&id| id as usize >= t.vocab) {
             return Err(format!("token id {id} is outside the vocabulary"));
@@ -193,17 +201,17 @@ mod tests {
     use super::*;
     use crate::model::classifier::decoder_gpu::{fill, tests::parity};
 
-    /// Two layers (sliding window 3 with GQA 4/2 heads, then global), per-layer embeddings,
-    /// scalar, logit softcap off the head path: the cross-encoder head on Metal vs the host forward.
+    /// Three layers (sliding window 3 with GQA 4/2 heads, global, then a sliding layer sharing
+    /// layer 0's KV), per-layer embeddings, layer scalars: the cross-encoder head on Metal vs the host forward.
     #[test]
     fn seqcls_gpu_matches_host() {
         let (h, v, nh, kvh, hd, inter, pd) = (64, 96, 4, 2, 16, 96, 8);
         let mut specs: Vec<(String, Vec<usize>)> = vec![
             ("embed".into(), vec![v, h]),
-            ("ple_embed".into(), vec![v, 2 * pd]),
-            ("ple_proj".into(), vec![2 * pd, h]),
+            ("ple_embed".into(), vec![v, 3 * pd]),
+            ("ple_proj".into(), vec![3 * pd, h]),
         ];
-        for l in 0..2 {
+        for l in 0..3 {
             for (n, r, c) in [
                 ("q", nh * hd, h),
                 ("k", kvh * hd, h),
@@ -226,15 +234,16 @@ mod tests {
         .unwrap();
         let m = |n: &str| weights.mat(n).unwrap();
         let gain = |seed| -> Vec<f32> { fill(h, seed, 0.3).iter().map(|v| v + 1.0).collect() };
-        let layers = (0..2)
+        let layers = (0..3)
             .map(|l| Layer {
-                sliding: l == 0,
+                // Layer 2 shares layer 0's KV (both sliding), as E2B/E4B's trailing layers do.
+                sliding: l != 1,
                 head_dim: hd,
                 kv_heads: kvh,
-                kv_src: l,
+                kv_src: if l == 2 { 0 } else { l },
                 attn: Attn {
                     q: m(&format!("q{l}")),
-                    kv: Some((m(&format!("k{l}")), Some(m(&format!("v{l}"))), vec![1.0; hd])),
+                    kv: (l < 2).then(|| (m(&format!("k{l}")), Some(m(&format!("v{l}"))), vec![1.0; hd])),
                     o: m(&format!("o{l}")),
                     q_norm: fill(hd, 3 + l, 0.3).iter().map(|v| v + 1.0).collect(),
                 },
@@ -252,7 +261,7 @@ mod tests {
         let text = TextModel {
             hidden: h,
             vocab: v,
-            layers_n: 2,
+            layers_n: 3,
             max_pos: 64,
             heads: nh,
             eps: 1e-6,

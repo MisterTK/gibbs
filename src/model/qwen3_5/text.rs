@@ -1909,6 +1909,12 @@ fn l2_normalize(x: &mut [f32], scale: f32) {
 /// Tiny synthetic Qwen 3.5 text model (one DeltaNet and one gated full-attention layer) with
 /// deterministic weights. Fixture for `tests/cpu_free_matrix.rs` and this module's tests.
 pub fn tiny_model() -> (TextModel, usize) {
+    tiny_model_scaled(1.0)
+}
+
+/// [`tiny_model`] with every weight multiplied by `scale` (the unit-scale weights overflow over
+/// longer prompts, which parity tests need to avoid).
+pub fn tiny_model_scaled(scale: f32) -> (TextModel, usize) {
     let (hidden, vocab, layers, heads, kv_heads, hd) = (128, 128, 2, 4, 2, 32);
     let inter = 128;
     let c_kernel = 4;
@@ -2043,7 +2049,7 @@ pub fn tiny_model() -> (TextModel, usize) {
             .sum();
         let count = shapes[name];
         Ok((0..count)
-            .map(|i| (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
+            .map(|i| scale * (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
             .collect())
     })
     .unwrap();
