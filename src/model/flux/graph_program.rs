@@ -39,7 +39,7 @@ fn wt_mat(w: &Wt) -> Mat {
 impl Lin {
     /// `x [m, k] -> [m, n]`: one linear per stored part (concatenated along the output), then the
     /// LoRAs `out[:, off..off+len] += scale * up(down(x))`.
-    fn emit(&self, b: &mut Gb, name: &str, x: ValueId) -> ValueId {
+    pub(crate) fn emit(&self, b: &mut Gb, name: &str, x: ValueId) -> ValueId {
         let outs: Vec<ValueId> = self
             .parts
             .iter()
