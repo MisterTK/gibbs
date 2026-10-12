@@ -47,6 +47,7 @@ pub mod classifier;
 pub mod clip;
 pub mod dcae;
 pub mod dit;
+pub mod dit_graph;
 pub mod draft;
 pub mod encdec_gpu;
 pub mod fasttext;

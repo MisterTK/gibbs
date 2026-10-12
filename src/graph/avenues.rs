@@ -253,9 +253,9 @@ pub fn family_status(f: Family) -> Status {
         | ClassifierBert | ClassifierModern | ClassifierDecoder | Gemma4Media | Idefics3Siglip
         | Audio => Status::Gpu,
         DiffusionUnet => Status::Gated("builder: UNet forward is host Rust, no graph builder"),
-        DiffusionDit => Status::Gated("builder: DiT forward is host Rust, no graph builder"),
+        DiffusionDit => Status::Gpu,
         Vae => Status::Gated("builder: VAE decoders are host Rust, no graph builder"),
-        VideoLtx => Status::Gated("builder: LTX forward is host Rust, no graph builder"),
+        VideoLtx => Status::Gpu,
         VideoModelScope => Status::Gated("builder: UNet3D forward is host Rust, no graph builder"),
         DraftersBlock => Status::Gated(
             "builder: DFlash/DFlash2/DSpark block drafters are host Rust (per-layer KV projection of tapped target states, grouped dynamic conv, Markov rescoring) and need arbitrary-layer taps; the Metal target program taps only the final-normed output",
@@ -661,24 +661,77 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Linear, F32),
             (Op::Add, F32),
         ]),
-        Family::DiffusionDit => ops.extend([
-            (Op::Linear, F32),
-            (attn(), F32),
-            (ln(), F32),
-            (Op::Mul, F32),
-            (Op::Add, F32),
-            (reshape(), F32),
-            (Op::Transpose { perm: vec![1, 0] }, F32),
-            (Op::Gelu { tanh: true }, F32),
-            (
-                rope(RopeVariant::MRope {
-                    sections: [8, 4, 4],
-                    interleaved: false,
-                    pairs: PairLayout::Half,
-                }),
-                F32,
-            ),
-        ]),
+        Family::DiffusionDit => {
+            for dt in [F32, BF16, q4, q8] {
+                ops.push((Op::Linear, dt));
+            }
+            ops.extend([
+                (attn(), F32),
+                (ln(), F32),
+                (rms(), F32),
+                (Op::Mul, F32),
+                (Op::Add, F32),
+                (
+                    Op::Binary {
+                        kind: BinaryKind::Div,
+                    },
+                    F32,
+                ),
+                (unary(UnaryKind::Scale(0.5)), F32),
+                (reshape(), F32),
+                (Op::Transpose { perm: vec![1, 0] }, F32),
+                (slice(), F32),
+                (Op::Concat { axis: 0 }, F32),
+                (
+                    Op::Pad {
+                        padding: vec![0, 1],
+                        value: 0.0,
+                    },
+                    F32,
+                ),
+                (Op::Gelu { tanh: true }, F32),
+                (Op::Gelu { tanh: false }, F32),
+                (Op::Silu, F32),
+                (Op::SwiGlu, F32),
+                (Op::GeGlu, F32),
+                (
+                    Op::MatMul {
+                        transpose_a: false,
+                        transpose_b: true,
+                    },
+                    F32,
+                ),
+                (Op::Softmax { axis: -1 }, F32),
+                (
+                    Op::Reduce {
+                        kind: ReduceKind::Sum,
+                        axes: vec![0],
+                        keep_dims: true,
+                    },
+                    F32,
+                ),
+                // Sana's depthwise GLUMBConv.
+                (
+                    Op::Conv2d {
+                        stride: [1, 1],
+                        padding: [1, 1, 1, 1],
+                        dilation: [1, 1],
+                        groups: 4,
+                    },
+                    F32,
+                ),
+            ]);
+            for pairs in [PairLayout::Adjacent, PairLayout::Half] {
+                ops.push((
+                    rope(RopeVariant::MRope {
+                        sections: [2, 3, 3],
+                        interleaved: false,
+                        pairs,
+                    }),
+                    F32,
+                ));
+            }
+        }
         Family::Vae => ops.extend([
             (conv2d(), F32),
             (conv3d(), F32),
@@ -693,12 +746,20 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             ),
             (attn(), F32),
         ]),
+        // The LTX DiT (its VAE is the `Vae` family): per-token cos/sin RoPE is elementwise ops.
         Family::VideoLtx => ops.extend([
             (Op::Linear, F32),
+            (Op::Linear, BF16),
             (attn(), F32),
-            (conv3d(), F32),
-            (rope_hs(), F32),
+            (ln(), F32),
+            (rms(), F32),
+            (Op::Mul, F32),
+            (Op::Add, F32),
+            (Op::Silu, F32),
+            (Op::Gelu { tanh: true }, F32),
             (reshape(), F32),
+            (slice(), F32),
+            (Op::Concat { axis: 0 }, F32),
         ]),
         Family::VideoModelScope => ops.extend([
             (conv3d(), F32),

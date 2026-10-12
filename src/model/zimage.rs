@@ -30,6 +30,62 @@ const ADALN: usize = 256;
 const MAX_TOKENS: usize = 512;
 const PATCH: usize = 2;
 
+mod graph_program;
+
+/// `n` rounded up to a multiple of [`SEQ_MULTI`].
+fn pad_to(n: usize) -> usize {
+    n + (SEQ_MULTI - n % SEQ_MULTI) % SEQ_MULTI
+}
+
+/// Latents [c, h, w] -> `[hp*wp, PATCH*PATCH*c]` patch rows in (py, px, c) order.
+fn patchify(lat: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
+    let (p, hp, wp) = (PATCH, h / PATCH, w / PATCH);
+    let pc = p * p * c;
+    let mut out = vec![0.0f32; hp * wp * pc];
+    for i in 0..hp {
+        for j in 0..wp {
+            let row = &mut out[(i * wp + j) * pc..][..pc];
+            for py in 0..p {
+                for px in 0..p {
+                    for ch in 0..c {
+                        row[(py * p + px) * c + ch] = lat[(ch * h + i * p + py) * w + j * p + px];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`patchify`]: patch rows -> latents [c, h, w].
+fn unpatchify(y: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
+    let (p, hp, wp) = (PATCH, h / PATCH, w / PATCH);
+    let pc = p * p * c;
+    let mut out = vec![0.0f32; c * h * w];
+    for i in 0..hp {
+        for j in 0..wp {
+            let row = &y[(i * wp + j) * pc..][..pc];
+            for py in 0..p {
+                for px in 0..p {
+                    for ch in 0..c {
+                        out[(ch * h + i * p + py) * w + j * p + px] = row[(py * p + px) * c + ch];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (frame, row, col) RoPE positions of the padded image tokens (pads at the origin) and of the
+/// padded caption tokens (1, 2, ...).
+fn token_pos(wp: usize, n_img: usize, img_total: usize, cap_total: usize) -> (Vec<[usize; 3]>, Vec<[usize; 3]>) {
+    let img = (0..img_total)
+        .map(|t| if t < n_img { [cap_total + 1, t / wp, t % wp] } else { [0, 0, 0] })
+        .collect();
+    (img, (0..cap_total).map(|t| [1 + t, 0, 0]).collect())
+}
+
 struct Block {
     /// `None` in the context refiner.
     ada: Option<Lin>,
@@ -102,6 +158,7 @@ struct ZDit {
     layers: Vec<Block>,
     final_ada: Lin,
     final_lin: Lin,
+    gpu: graph_program::Cache,
 }
 
 impl ZDit {
@@ -177,6 +234,7 @@ impl ZDit {
             layers: blocks("layers", get("n_layers")?, true)?,
             final_ada: Lin::load(&w, "all_final_layer.2-1.adaLN_modulation.1")?,
             final_lin: Lin::load(&w, "all_final_layer.2-1.linear")?,
+            gpu: Default::default(),
         };
         if dit.x_embedder.in_dim() != PATCH * PATCH * in_ch
             || dit.t_mlp2.out_dim() != ADALN.min(dim)
@@ -287,7 +345,6 @@ impl ZDit {
         n_cap: usize,
     ) -> Vec<f32> {
         let (d, c, p) = (self.dim, self.in_ch, PATCH);
-        let pp = p * p;
         let adaln = self.t_mlp2.fwd(
             &silu_of(
                 &self
@@ -297,40 +354,17 @@ impl ZDit {
             1,
         );
 
-        let pad_to = |n: usize| n + (SEQ_MULTI - n % SEQ_MULTI) % SEQ_MULTI;
         let (cap_total, cap_pad) = (pad_to(n_cap), self.cap_pad.as_slice());
         let (hp, wp) = (h / p, w / p);
         let n_img = hp * wp;
         let img_total = pad_to(n_img);
 
         // Image tokens: patch features in (py, px, c) order; pads are the learned x pad token at position 0.
-        let mut patches = vec![0.0f32; n_img * pp * c];
-        for i in 0..hp {
-            for j in 0..wp {
-                let row = &mut patches[(i * wp + j) * pp * c..][..pp * c];
-                for py in 0..p {
-                    for px in 0..p {
-                        for ch in 0..c {
-                            row[(py * p + px) * c + ch] =
-                                lat[(ch * h + i * p + py) * w + j * p + px];
-                        }
-                    }
-                }
-            }
-        }
-        let mut x = self.x_embedder.fwd(&patches, n_img);
+        let mut x = self.x_embedder.fwd(&patchify(lat, c, h, w), n_img);
         for _ in n_img..img_total {
             x.extend_from_slice(&self.x_pad);
         }
-        let img_pos: Vec<[usize; 3]> = (0..img_total)
-            .map(|t| {
-                if t < n_img {
-                    [cap_total + 1, t / wp, t % wp]
-                } else {
-                    [0, 0, 0]
-                }
-            })
-            .collect();
+        let (img_pos, cap_pos) = token_pos(wp, n_img, img_total, cap_total);
         let img_rope = self.rope(&img_pos);
         for b in &self.noise_refiner {
             self.block(b, &mut x, img_total, &img_rope, &adaln);
@@ -342,7 +376,6 @@ impl ZDit {
         for _ in n_cap..cap_total {
             cx.extend_from_slice(cap_pad);
         }
-        let cap_pos: Vec<[usize; 3]> = (0..cap_total).map(|t| [1 + t, 0, 0]).collect();
         let cap_rope = self.rope(&cap_pos);
         for b in &self.context_refiner {
             self.block(b, &mut cx, cap_total, &cap_rope, &adaln);
@@ -359,21 +392,7 @@ impl ZDit {
         let scale = self.final_ada.fwd(&silu_of(&adaln), 1);
         let y = norm_modulate(&u[..n_img * d], d, 1e-6, &scale, &[]);
         let y = self.final_lin.fwd(&y, n_img);
-        let mut out = vec![0.0f32; c * h * w];
-        for i in 0..hp {
-            for j in 0..wp {
-                let row = &y[(i * wp + j) * pp * c..][..pp * c];
-                for py in 0..p {
-                    for px in 0..p {
-                        for ch in 0..c {
-                            out[(ch * h + i * p + py) * w + j * p + px] =
-                                row[(py * p + px) * c + ch];
-                        }
-                    }
-                }
-            }
-        }
-        out
+        unpatchify(&y, c, h, w)
     }
 }
 
@@ -390,7 +409,6 @@ pub struct ZImagePipeline {
 impl ZImagePipeline {
     /// Loads a diffusers `ZImagePipeline` snapshot directory.
     pub fn load(dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         let scfg = crate::model::dit::read_scheduler(dir)?;
         if scfg["use_dynamic_shifting"].as_bool() == Some(true) {
             return Err("Z-Image scheduler with use_dynamic_shifting is not supported".into());
@@ -506,11 +524,19 @@ impl ImageGenerator for ZImagePipeline {
         let mut x: Vec<f32> = (0..self.dit.in_ch * h * w)
             .map(|_| rng.gaussian())
             .collect();
+        let gpu = crate::model::dit_graph::use_metal();
         for (i, s) in sigmas.windows(2).enumerate() {
             let start = Instant::now();
-            let mut v = self.dit.forward(&x, h, w, s[0], &cap, n_cap);
+            let fwd = |cap: &[f32], n: usize| {
+                if gpu {
+                    self.dit.forward_gpu(&x, h, w, s[0], cap, n)
+                } else {
+                    Ok(self.dit.forward(&x, h, w, s[0], cap, n))
+                }
+            };
+            let mut v = fwd(&cap, n_cap)?;
             if let Some((nc, nn)) = &neg {
-                let vn = self.dit.forward(&x, h, w, s[0], nc, *nn);
+                let vn = fwd(nc, *nn)?;
                 v.iter_mut()
                     .zip(&vn)
                     .for_each(|(p, n)| *p += guidance * (*p - n));

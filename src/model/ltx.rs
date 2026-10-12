@@ -26,6 +26,13 @@ use crate::model::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+mod graph_program;
+
+/// A tiny random-weight LTX transformer forward as a graph (the GPU-only matrix fixture).
+pub fn tiny_dit_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    graph_program::fixture::tiny_graph()
+}
+
 const HEADS: usize = 32;
 const LATENT: usize = 128;
 const TIME_DIM: usize = 256;
@@ -75,6 +82,7 @@ pub struct LtxTransformer {
     sst: Vec<f32>,
     proj_out: Lin,
     d: usize,
+    gpu: graph_program::Cache,
 }
 
 /// `x * rsqrt(mean(x^2) + eps) * w` per `w.len()`-wide row.
@@ -227,6 +235,7 @@ impl LtxTransformer {
             sst,
             proj_out: lin("proj_out")?,
             d,
+            gpu: Default::default(),
         };
         if t.blocks.is_empty() || t.sst.len() != 2 * d || t.ada.dims() != (6 * d, d) {
             return Err(format!(
@@ -442,7 +451,6 @@ pub struct LtxText {
 impl LtxText {
     /// `text_encoder/` shards + `tokenizer/` of a diffusers repo snapshot.
     pub fn from_dir(base: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoLtx)?;
         Ok(Self {
             t5: crate::model::flux::t5_load(&base.join("text_encoder"))?,
             tok: t5_tokenizer(&base.join("tokenizer"))?,
@@ -451,7 +459,6 @@ impl LtxText {
 
     /// A `t5encoder` GGUF with the base repo's `text_encoder/config.json` and `tokenizer/`.
     pub fn from_gguf(gguf: &Path, config: &Path, tokenizer_dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoLtx)?;
         Ok(Self {
             t5: T5Encoder::load_gguf(&Store::open(gguf)?, &read_json(config)?)?,
             tok: t5_tokenizer(tokenizer_dir)?,
@@ -556,7 +563,15 @@ impl LtxPipeline {
         let n = f * h * w;
         let sigmas = self.sched.sigmas(c.steps, n);
         let rope = Rope::new(f, h, w, FPS as f64, self.tr.d);
-        let ctx = |p: &Prompt| self.tr.project_text(&p.emb, p.n);
+        // The GPU program runs the caption projection itself and takes the raw T5 tokens.
+        let gpu = crate::model::dit_graph::use_metal();
+        let ctx = |p: &Prompt| {
+            if gpu {
+                p.emb.clone()
+            } else {
+                self.tr.project_text(&p.emb, p.n)
+            }
+        };
         let (cc, uc) = (ctx(cond), uncond.map(ctx));
         let mut rng = Rng::new(c.seed);
         let mut x: Vec<f32> = (0..n * LATENT).map(|_| rng.gaussian()).collect();
@@ -577,9 +592,16 @@ impl LtxPipeline {
         for i in 0..c.steps {
             let start = Instant::now();
             let t = flow::timestep(sigmas[i]);
-            let mut v = self.tr.forward(&x, n, &cc, cond.n, t, clean, &rope);
+            let vel = |ctx: &[f32], nt: usize| {
+                if gpu {
+                    self.tr.forward_gpu(&x, n, ctx, nt, t, clean, &rope)
+                } else {
+                    Ok(self.tr.forward(&x, n, ctx, nt, t, clean, &rope))
+                }
+            };
+            let mut v = vel(&cc, cond.n)?;
             if let (Some(u), Some(un)) = (&uc, uncond) {
-                let vu = self.tr.forward(&x, n, u, un.n, t, clean, &rope);
+                let vu = vel(u, un.n)?;
                 for (c_, u_) in v.iter_mut().zip(&vu) {
                     *c_ = u_ + c.guidance * (*c_ - u_);
                 }
