@@ -247,7 +247,7 @@ pub enum Status {
 pub fn family_status(f: Family) -> Status {
     use Family::*;
     match f {
-        GraphLm | Gemma4 | Qwen35 | System1 => Status::Gpu,
+        GraphLm | Gemma4 | Qwen35 | System1 | T5 | Seq2Seq => Status::Gpu,
         Gemma4Media => Status::Gated(
             "builder: vision/audio prefill bypasses the program (host Rust vision tower)",
         ),
@@ -260,10 +260,6 @@ pub fn family_status(f: Family) -> Status {
         Ninfer => Status::Gated(
             "builder: .ninfer catalog emits Moe with host-side experts; no Metal expert operands",
         ),
-        T5 => Status::Gated(
-            "builder: no T5 graph builder (encoder-decoder with cross-attention state)",
-        ),
-        Seq2Seq => Status::Gated("builder: no seq2seq graph builder (beam search, positions)"),
         Idefics3Siglip => Status::Gated("builder: SigLIP forward is host Rust, no graph builder"),
         ClassifierBert => {
             Status::Gated("builder: Head::apply and the BERT classifier forward are host Rust")
@@ -515,6 +511,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Embedding, F32),
             (rms(), F32),
             (Op::Linear, F32),
+            (Op::Linear, BF16),
             (
                 Op::RelPosBias {
                     buckets: 32,
@@ -524,18 +521,35 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 },
                 F32,
             ),
+            (
+                Op::RelPosBias {
+                    buckets: 32,
+                    max_distance: 128,
+                    bidirectional: false,
+                    heads: 2,
+                },
+                F32,
+            ),
             (attn(), F32),
+            (cached_attn(), F32),
+            (unary(UnaryKind::Scale(2.0)), F32),
             (Op::Relu, F32),
+            (Op::GeGlu, F32),
             (Op::Add, F32),
         ]),
+        // Positions are `Embedding` over the position table; beams are separate states forked
+        // on the GPU (`StateReorder` cannot write state in place, so it is not used).
         Family::Seq2Seq => ops.extend([
             (Op::Embedding, F32),
             (ln(), F32),
             (Op::Linear, F32),
             (attn(), F32),
-            (Op::StateReorder, F32),
-            (Op::Gather { axis: 0 }, F32),
+            (cached_attn(), F32),
+            (unary(UnaryKind::Scale(2.0)), F32),
             (Op::Relu, F32),
+            (Op::Gelu { tanh: false }, F32),
+            (Op::Gelu { tanh: true }, F32),
+            (Op::Silu, F32),
             (Op::Add, F32),
         ]),
         Family::Idefics3Siglip => ops.extend([
