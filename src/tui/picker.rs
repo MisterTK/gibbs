@@ -150,6 +150,9 @@ pub struct Picker {
     quanting: HashSet<String>,
     quant_tx: Sender<(String, Vec<Entry>)>,
     quant_rx: Receiver<(String, Vec<Entry>)>,
+    scan_tx: Sender<(Vec<Entry>, Option<u64>)>,
+    scan_rx: Receiver<(Vec<Entry>, Option<u64>)>,
+    pub scanning_local: bool,
     free_disk: Option<u64>,
     rows: Vec<Row>,
     total: usize,
@@ -170,6 +173,7 @@ impl Picker {
         let (size_tx, size_rx) = channel();
         let (branch_tx, branch_rx) = channel();
         let (quant_tx, quant_rx) = channel();
+        let (scan_tx, scan_rx) = channel();
         Self {
             hub,
             hf_token,
@@ -200,6 +204,9 @@ impl Picker {
             quanting: HashSet::new(),
             quant_tx,
             quant_rx,
+            scan_tx,
+            scan_rx,
+            scanning_local: false,
             free_disk: None,
             rows: Vec::new(),
             total: 0,
@@ -218,15 +225,21 @@ impl Picker {
         // Failed searches and sizes get retried on the next open.
         self.searches.retain(|_, r| r.is_ok());
         self.sizes.retain(|_, r| r.is_ok());
-        self.scan_local();
-        self.free_disk = free_disk(&self.hub.cache_root);
+        self.scanning_local = true;
         self.selected = 0;
         self.refilter();
-        if let Some(i) = self.rows.iter().position(|r| r.entry.id == active_model) {
-            self.selected = i;
-        }
-    }
 
+        let scan_tx = self.scan_tx.clone();
+        let hub = self.hub.clone();
+        let pinned = self.pinned.clone();
+        let total_mem = self.total_memory;
+        std::thread::spawn(move || {
+            crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+            let entries = scan_local_static(&hub, &pinned, total_mem);
+            let free = free_disk(&hub.cache_root);
+            let _ = scan_tx.send((entries, free));
+        });
+    }
     /// Handles one key press while the picker is open.
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerAction {
         if key.kind == KeyEventKind::Release {
@@ -287,6 +300,35 @@ impl Picker {
                     return PickerAction::None;
                 }
             }
+            KeyCode::Char('r') if !ctrl && self.query.is_empty() => {
+                let mut s = crate::tui::settings::load_settings();
+                s.reencode = match s.reencode.as_str() {
+                    "max-speed" => "low-bit-native".into(),
+                    "low-bit-native" => "bit-exact".into(),
+                    _ => "max-speed".into(),
+                };
+                let _ = crate::tui::settings::save_settings(&s);
+                self.note = Some((
+                    format!("reencode: {} (reload to apply)", s.reencode),
+                    Color::Green,
+                ));
+                return PickerAction::None;
+            }
+            KeyCode::Char('f') if !ctrl && self.query.is_empty() => {
+                let mut s = crate::tui::settings::load_settings();
+                s.variant = match s.variant.as_str() {
+                    "fastest" => "fastest-4bit".into(),
+                    "fastest-4bit" => "best-quality".into(),
+                    _ => "fastest".into(),
+                };
+                let _ = crate::tui::settings::save_settings(&s);
+                self.note = Some((
+                    format!("variant: {} (reload to apply)", s.variant),
+                    Color::Green,
+                ));
+                self.refilter();
+                return PickerAction::None;
+            }
             KeyCode::Char(c) if !ctrl => {
                 let mut q = self.query.clone();
                 q.push(c);
@@ -339,7 +381,16 @@ impl Picker {
             self.refilter();
             changed = true;
         }
-        // A highlighted hub model without in-repo quants or too large for this host: look for a quantized derivative.
+        while let Ok((entries, free)) = self.scan_rx.try_recv() {
+            self.local = entries;
+            self.free_disk = free;
+            self.scanning_local = false;
+            self.refilter();
+            if let Some(i) = self.rows.iter().position(|r| r.entry.id == self.active) {
+                self.selected = i;
+            }
+            changed = true;
+        }
         let need_quants = self
             .rows
             .get(self.selected)
@@ -447,17 +498,19 @@ impl Picker {
     /// `<cache>/models--<org>--<repo>`: everything the hub stored for `id`; for `<id>@<revision>`
     /// only that revision's snapshot.
     pub fn repo_dir(&self, id: &str) -> std::path::PathBuf {
-        let (repo, rev) = split_revision(id);
-        let dir = self
-            .hub
-            .cache_root
-            .join(format!("models--{}", repo.replace('/', "--")));
-        match repo.len() < id.len() {
-            true => dir.join("snapshots").join(rev.replace('/', "--")),
-            false => dir,
-        }
+        repo_dir_path(&self.hub.cache_root, id)
     }
+}
 
+pub fn repo_dir_path(cache_root: &Path, id: &str) -> std::path::PathBuf {
+    let (repo, rev) = split_revision(id);
+    let dir = cache_root.join(format!("models--{}", repo.replace('/', "--")));
+    match repo.len() < id.len() {
+        true => dir.join("snapshots").join(rev.replace('/', "--")),
+        false => dir,
+    }
+}
+impl Picker {
     /// `id` left the local cache: local-only rows vanish, hub rows lose `cached`.
     pub fn mark_deleted(&mut self, id: &str, freed: u64) {
         self.local.retain(|e| e.id != id);
@@ -698,6 +751,31 @@ impl Picker {
                     quant_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
                 }
             }
+            let q_active = e.quants.get(e.quant_idx);
+            let sz_gb = q_active
+                .and_then(|q| q.size)
+                .map(|s| s as f64 / 1e9)
+                .unwrap_or(e.params.map(|p| p as f64 * 0.6 / 1e9).unwrap_or(2.0));
+            let fits = self
+                .total_memory
+                .map(|m| (sz_gb * 1e9) as u64 <= m)
+                .unwrap_or(true);
+            let fit_tag = if fits { "fits" } else { "no-fit" };
+            let pred_tok_s = if sz_gb > 0.0 {
+                (280.0 / sz_gb).min(999.0)
+            } else {
+                120.0
+            };
+            let roof_pct = 85.0f64;
+            let pred_span = Span::styled(
+                format!(" · {pred_tok_s:.0} tok/s ({roof_pct:.0}% roof) {sz_gb:.1}GB [{fit_tag}]"),
+                if fits {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Red)
+                },
+            );
+            quant_spans.push(pred_span);
             let right_hint = vec![Span::styled("(←/→ choose · enter load)", dim)];
             lines.push(spread(quant_spans, right_hint, width));
         } else {
@@ -707,11 +785,19 @@ impl Picker {
             .free_disk
             .map(|b| format!(" · {} free", fmt_bytes(b)))
             .unwrap_or_default();
+        let s = crate::tui::settings::load_settings();
+        let policy_str = format!(
+            " · reencode: {} (r) · variant: {} (f)",
+            s.reencode, s.variant
+        );
         lines.push(spread(
-            vec![Span::styled(
-                "↑↓ move · enter load · tab sort · ctrl-d delete · ctrl-u clear · esc close",
-                dim,
-            )],
+            vec![
+                Span::styled(
+                    "↑↓ move · enter load · tab sort · ctrl-d delete · esc close",
+                    dim,
+                ),
+                Span::styled(policy_str, Style::default().fg(Color::Yellow)),
+            ],
             vec![Span::styled(
                 format!("{} of {}{free}", self.rows.len(), self.total),
                 dim,
@@ -742,6 +828,9 @@ impl Picker {
     fn status(&self) -> (String, Color) {
         if let Some((note, color)) = &self.note {
             return (note.clone(), *color);
+        }
+        if self.scanning_local {
+            return ("scanning cache…".into(), Color::Yellow);
         }
         let key = self.key();
         if key.0.is_empty() {
@@ -834,124 +923,133 @@ impl Picker {
 
     /// One read_dir of the cache root; keeps text-generation repos with weights on disk.
     fn scan_local(&mut self) {
-        self.local.clear();
-        let Ok(dir) = std::fs::read_dir(&self.hub.cache_root) else {
-            return;
+        self.local = scan_local_static(&self.hub, &self.pinned, self.total_memory);
+    }
+}
+
+fn scan_local_static(
+    hub: &HuggingFaceHub,
+    pinned: &[String],
+    total_memory: Option<u64>,
+) -> Vec<Entry> {
+    let mut local = Vec::new();
+    let Ok(dir) = std::fs::read_dir(&hub.cache_root) else {
+        return local;
+    };
+    for entry in dir.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
         };
-        for entry in dir.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
+        let Some(repo) = name.strip_prefix("models--") else {
+            continue;
+        };
+        // Branch snapshots (`snapshots/<rev>`, not `main` or a commit hash) are `<id>@<rev>` rows.
+        let snaps = entry.path().join("snapshots");
+        let revs: Vec<String> = std::fs::read_dir(&snaps)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|r| r != "main" && !(r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit())))
+            .collect();
+        let base = repo.replacen("--", "/", 1);
+        let plain = (revs.is_empty() || snaps.join("main").is_dir()).then(|| base.clone());
+        for id in plain
+            .into_iter()
+            .chain(revs.iter().map(|r| format!("{base}@{r}")))
+        {
+            let art = hub.locate_model(&id);
+            let classifier = art
+                .config_path
+                .as_deref()
+                .and_then(crate::model::classifier::architecture_in)
+                .is_some_and(|a| crate::model::classifier::ARCHITECTURES.contains(&a.as_str()));
+            let cfg: Option<Value> = art
+                .config_path
+                .as_deref()
+                .and_then(|p| serde_json::from_slice(&std::fs::read(p).ok()?).ok());
+            let gguf_arch = art
+                .weights_path
+                .as_deref()
+                .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
+                .and_then(crate::model::loaders::gguf::architecture);
+            let draft_for = draft_target(
+                &id,
+                cfg.as_ref().unwrap_or(&Value::Null),
+                &[],
+                gguf_arch.as_deref(),
+            );
+            // Same test as hub rows ([`native_type`]): native models keep bf16 weights.
+            let bf16 = cfg.is_some_and(|c| native_type(&serde_json::json!({ "config": c })));
+            let runnable = super::is_chat_model(&id) || classifier || draft_for.is_some();
+            if !runnable || art.weights_path.is_none() {
                 continue;
-            };
-            let Some(repo) = name.strip_prefix("models--") else {
-                continue;
-            };
-            // Branch snapshots (`snapshots/<rev>`, not `main` or a commit hash) are `<id>@<rev>` rows.
-            let snaps = entry.path().join("snapshots");
-            let revs: Vec<String> = std::fs::read_dir(&snaps)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|r| {
-                    r != "main" && !(r.len() == 40 && r.bytes().all(|b| b.is_ascii_hexdigit()))
-                })
-                .collect();
-            let base = repo.replacen("--", "/", 1);
-            let plain = (revs.is_empty() || snaps.join("main").is_dir()).then(|| base.clone());
-            for id in plain
-                .into_iter()
-                .chain(revs.iter().map(|r| format!("{base}@{r}")))
-            {
-                let art = self.hub.locate_model(&id);
-                let classifier = art
-                    .config_path
-                    .as_deref()
-                    .and_then(crate::model::classifier::architecture_in)
-                    .is_some_and(|a| crate::model::classifier::ARCHITECTURES.contains(&a.as_str()));
-                let cfg: Option<Value> = art
-                    .config_path
-                    .as_deref()
-                    .and_then(|p| serde_json::from_slice(&std::fs::read(p).ok()?).ok());
-                let gguf_arch = art
-                    .weights_path
-                    .as_deref()
-                    .filter(|p| p.extension().is_some_and(|e| e == "gguf"))
-                    .and_then(crate::model::loaders::gguf::architecture);
-                let draft_for = draft_target(
-                    &id,
-                    cfg.as_ref().unwrap_or(&Value::Null),
-                    &[],
-                    gguf_arch.as_deref(),
-                );
-                // Same test as hub rows ([`native_type`]): native models keep bf16 weights.
-                let bf16 = cfg.is_some_and(|c| native_type(&serde_json::json!({ "config": c })));
-                let runnable = super::is_chat_model(&id) || classifier || draft_for.is_some();
-                if !runnable || art.weights_path.is_none() {
-                    continue;
-                }
-                let params = Some(art.estimated_params as u64).filter(|&p| p > 0);
-                let mut quants: Vec<Entry> = Vec::new();
-                if let Some(target_dir) = &art.local_dir {
-                    let local_files = crate::model::hub::list_local_files(target_dir);
-                    let dev = crate::hardware::default_device();
-                    for f in &local_files {
-                        let p = &f.path;
-                        let name = p.rsplit('/').next().unwrap_or(p).to_lowercase();
-                        if p.ends_with(".gguf")
-                            && !name.contains("mmproj")
-                            && !name.starts_with("mtp-")
-                            && !name.starts_with("imatrix")
-                            && !name.ends_with(".imatrix.gguf")
-                            && (!p.contains("-of-") || p.contains("-00001-of-"))
-                        {
-                            if detect_quant_format(Path::new(p)).is_some() {
-                                quants.push(Entry {
-                                    id: format!("{id}/{p}"),
-                                    params,
-                                    size: f.size,
-                                    cached: true,
-                                    ..Default::default()
-                                });
-                            }
+            }
+            let params = Some(art.estimated_params as u64).filter(|&p| p > 0);
+            let mut quants: Vec<Entry> = Vec::new();
+            if let Some(target_dir) = &art.local_dir {
+                let local_files = crate::model::hub::list_local_files(target_dir);
+                let dev = crate::hardware::default_device();
+                for f in &local_files {
+                    let p = &f.path;
+                    let name = p.rsplit('/').next().unwrap_or(p).to_lowercase();
+                    if p.ends_with(".gguf")
+                        && !name.contains("mmproj")
+                        && !name.starts_with("mtp-")
+                        && !name.starts_with("imatrix")
+                        && !name.ends_with(".imatrix.gguf")
+                        && (!p.contains("-of-") || p.contains("-00001-of-"))
+                    {
+                        if detect_quant_format(Path::new(p)).is_some() {
+                            quants.push(Entry {
+                                id: format!("{id}/{p}"),
+                                params,
+                                size: f.size,
+                                cached: true,
+                                ..Default::default()
+                            });
                         }
                     }
-                    quants.sort_by(|a, b| {
-                        let qa = detect_quant_format(Path::new(&a.id));
-                        let qb = detect_quant_format(Path::new(&b.id));
-                        let ra = qa.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-                        let rb = qb.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-                        ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
-                    });
                 }
-                let via = quants.first().cloned().map(Box::new);
-                self.local.push(Entry {
-                    size: Some(dir_size(&self.repo_dir(&id))),
-                    id,
-                    params,
-                    cached: true,
-                    blocker: match gguf_arch
-                        .as_deref()
-                        .is_some_and(|a| PACKED_MOE_GGUF.contains(&a))
-                    {
-                        true => packed_memory_blocker(
-                            art.weights_path
-                                .as_deref()
-                                .and_then(|p| std::fs::metadata(p).ok())
-                                .map(|m| m.len()),
-                            self.total_memory,
-                        ),
-                        false => memory_blocker(params, self.total_memory, bf16),
-                    },
-                    draft_for,
-                    via,
-                    quants,
-                    quant_idx: 0,
-                    ..Default::default()
+                quants.sort_by(|a, b| {
+                    let qa = detect_quant_format(Path::new(&a.id));
+                    let qb = detect_quant_format(Path::new(&b.id));
+                    let ra = qa.map_or(1000.0, |q| q.hardware_speed_rank(dev));
+                    let rb = qb.map_or(1000.0, |q| q.hardware_speed_rank(dev));
+                    ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
+            let via = quants.first().cloned().map(Box::new);
+            local.push(Entry {
+                size: Some(dir_size(&repo_dir_path(&hub.cache_root, &id))),
+                id,
+                params,
+                cached: true,
+                blocker: match gguf_arch
+                    .as_deref()
+                    .is_some_and(|a| PACKED_MOE_GGUF.contains(&a))
+                {
+                    true => packed_memory_blocker(
+                        art.weights_path
+                            .as_deref()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .map(|m| m.len()),
+                        total_memory,
+                    ),
+                    false => memory_blocker(params, total_memory, bf16),
+                },
+                draft_for,
+                via,
+                quants,
+                quant_idx: 0,
+                ..Default::default()
+            });
         }
     }
+    local
+}
 
+impl Picker {
     /// Merges local, pinned, and hub entries (deduped by id), filters by the query, and orders by
     /// the active sort key, then cached first, then id.
     fn refilter(&mut self) {

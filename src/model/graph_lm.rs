@@ -972,15 +972,24 @@ impl GraphLm {
             c.use_standard_layernorm,
         );
         let rotary_dim = (c.head_dim as f32 * c.rotary_pct) as usize;
+        let inv_freq_vec: Vec<f32> = if rotary_dim > 0 {
+            let half = rotary_dim / 2;
+            (0..half)
+                .map(|j| 1.0 / c.rope_theta.powf((2 * j) as f32 / rotary_dim as f32))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let rope = Op::Rope {
             head_dim: c.head_dim,
             rotary_dim,
-            base: c.rope_theta,
             variant: if c.rope_interleaved {
                 RopeVariant::Interleaved
             } else {
                 RopeVariant::HalfSplit
             },
+            mscale: 1.0,
         };
         let attention = Op::Attention {
             heads: c.num_heads,
@@ -1051,17 +1060,21 @@ impl GraphLm {
             let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, h, 2 * h, n);
             let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * h, 3 * h, n);
             if rotary_dim > 0 {
+                let inv_freq_val = g.weight("rope.inv_freq.default", vec![inv_freq_vec.len()], DType::F32);
+                if let Some(map) = &mut w_map {
+                    map.insert("rope.inv_freq.default", Tensor::F32(inv_freq_vec.clone()));
+                }
                 q = g.add(
                     format!("{p}.self_attn.rope_q"),
                     rope.clone(),
-                    &[q, positions],
+                    &[q, positions, inv_freq_val],
                     vec![n, h],
                     DType::F32,
                 );
                 k = g.add(
                     format!("{p}.self_attn.rope_k"),
                     rope.clone(),
-                    &[k, positions],
+                    &[k, positions, inv_freq_val],
                     vec![n, h],
                     DType::F32,
                 );

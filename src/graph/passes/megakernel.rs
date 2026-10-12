@@ -613,15 +613,16 @@ mod tests {
             DType::F32,
         );
 
+        let inv_freq = g.weight("inv_freq", vec![hd / 2], DType::F32);
         let q_rope = g.add(
             "q_rope",
             Op::Rope {
                 head_dim: hd,
                 rotary_dim: hd,
-                base: 10000.0,
                 variant: crate::graph::RopeVariant::HalfSplit,
+                mscale: 1.0,
             },
-            &[q_lin, pos],
+            &[q_lin, pos, inv_freq],
             vec![1, heads * hd],
             DType::F32,
         );
@@ -630,10 +631,10 @@ mod tests {
             Op::Rope {
                 head_dim: hd,
                 rotary_dim: hd,
-                base: 10000.0,
                 variant: crate::graph::RopeVariant::HalfSplit,
+                mscale: 1.0,
             },
-            &[k_lin, pos],
+            &[k_lin, pos, inv_freq],
             vec![1, kv_heads * hd],
             DType::F32,
         );

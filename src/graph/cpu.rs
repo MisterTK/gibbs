@@ -42,6 +42,9 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Softmax { .. }
         | Op::TopKSoftmax { .. }
         | Op::Slice { .. }
+        | Op::Conv2d { .. }
+        | Op::RelPosBias { .. }
+        | Op::StateReorder
         | Op::Megakernel(_) => true,
         Op::Upsample { mode, .. } => matches!(mode, crate::graph::UpsampleMode::Nearest),
         Op::Attention {
@@ -613,26 +616,75 @@ pub fn run(
             Op::Rope {
                 head_dim,
                 rotary_dim,
-                base,
                 variant,
+                mscale,
             } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
                 let pos = operand_u32(&bound, &slots, ins, name, 1)?;
+                let inv_freq = operand(&bound, &slots, ins, name, 2)?;
+                let half = rotary_dim / 2;
+                if inv_freq.len() != half {
+                    return Err(format!(
+                        "node '{name}': inv_freq has {} entries, expected {half}",
+                        inv_freq.len()
+                    ));
+                }
+
                 let mut out = x.to_vec();
-                let n = pos.len().max(1);
-                let total_dim = x.len() / n;
+                let n = if !pos.is_empty() {
+                    match variant {
+                        super::RopeVariant::MRope { .. } => pos.len() / 3,
+                        _ => pos.len(),
+                    }
+                } else {
+                    1
+                };
+                let total_dim = x.len() / n.max(1);
                 let hd = *head_dim;
                 let heads = if hd > 0 { total_dim / hd } else { 1 };
-                let half = rotary_dim / 2;
-                for (seq_idx, &p) in pos.iter().enumerate() {
+
+                for seq_idx in 0..n {
                     let row_offset = seq_idx * total_dim;
                     for h in 0..heads {
                         let head_offset = row_offset + h * hd;
                         for j in 0..half {
-                            let freq = 1.0 / base.powf((2 * j) as f32 / *rotary_dim as f32);
-                            let theta = p as f32 * freq;
-                            let cos = theta.cos();
-                            let sin = theta.sin();
+                            let freq = inv_freq[j];
+                            let p = match variant {
+                                super::RopeVariant::MRope {
+                                    sections,
+                                    interleaved,
+                                    ..
+                                } => {
+                                    let p_t = pos.get(seq_idx * 3).copied().unwrap_or(0);
+                                    let p_h = pos.get(seq_idx * 3 + 1).copied().unwrap_or(0);
+                                    let p_w = pos.get(seq_idx * 3 + 2).copied().unwrap_or(0);
+                                    if *interleaved {
+                                        if j % 3 == 1 && (j as u32) < 3 * sections[1] {
+                                            p_h
+                                        } else if j % 3 == 2 && (j as u32) < 3 * sections[2] {
+                                            p_w
+                                        } else {
+                                            p_t
+                                        }
+                                    } else {
+                                        let s0 = sections[0] as usize;
+                                        let s1 = sections[1] as usize;
+                                        if j < s0 {
+                                            p_t
+                                        } else if j < s0 + s1 {
+                                            p_h
+                                        } else {
+                                            p_w
+                                        }
+                                    }
+                                }
+                                _ => pos.get(seq_idx).copied().unwrap_or(0),
+                            };
+
+                            let theta = (p as f32) * freq;
+                            let cos = theta.cos() * *mscale;
+                            let sin = theta.sin() * *mscale;
+
                             match variant {
                                 super::RopeVariant::Interleaved => {
                                     let i0 = head_offset + 2 * j;
@@ -654,8 +706,88 @@ pub fn run(
                                         out[i1] = x0 * sin + x1 * cos;
                                     }
                                 }
+                                super::RopeVariant::MRope { pairs, .. } => {
+                                    let (i0, i1) = match pairs {
+                                        super::PairLayout::Adjacent => {
+                                            (head_offset + 2 * j, head_offset + 2 * j + 1)
+                                        }
+                                        super::PairLayout::Half => {
+                                            (head_offset + j, head_offset + j + half)
+                                        }
+                                    };
+                                    if i1 < out.len() {
+                                        let x0 = out[i0];
+                                        let x1 = out[i1];
+                                        out[i0] = x0 * cos - x1 * sin;
+                                        out[i1] = x0 * sin + x1 * cos;
+                                    }
+                                }
                             }
                         }
+                    }
+                }
+                out
+            }
+            Op::RelPosBias {
+                buckets,
+                max_distance,
+                bidirectional,
+                heads,
+            } => {
+                let table = operand(&bound, &slots, ins, name, 0)?;
+                let q_pos = operand_u32(&bound, &slots, ins, name, 1)?;
+                let k_pos = operand_u32(&bound, &slots, ins, name, 2)?;
+                let n = q_pos.len();
+                let m = k_pos.len();
+                let h = *heads;
+                let mut out = vec![0.0f32; h * n * m];
+
+                for qi in 0..n {
+                    for ki in 0..m {
+                        let diff = k_pos[ki] as i64 - q_pos[qi] as i64;
+                        let mut bucket = 0usize;
+                        let mut n_dist = diff;
+                        let num_buckets = *buckets;
+                        let max_exact = num_buckets / 2;
+
+                        if *bidirectional {
+                            if n_dist < 0 {
+                                bucket += max_exact;
+                                n_dist = -n_dist;
+                            }
+                        } else {
+                            n_dist = (-n_dist).max(0);
+                        }
+
+                        if (n_dist as usize) < max_exact {
+                            bucket += n_dist as usize;
+                        } else {
+                            let max_dist = *max_distance as f32;
+                            let log_val = ((n_dist as f32 / max_exact as f32).ln()
+                                / (max_dist / max_exact as f32).ln())
+                                * (num_buckets - max_exact) as f32;
+                            bucket +=
+                                max_exact + (log_val as usize).min(num_buckets - max_exact - 1);
+                        }
+                        let b_idx = bucket.min(num_buckets - 1);
+                        for head in 0..h {
+                            out[head * n * m + qi * m + ki] = table[b_idx * h + head];
+                        }
+                    }
+                }
+                out
+            }
+            Op::StateReorder => {
+                let state_tensor = operand(&bound, &slots, ins, name, 0)?;
+                let parent = operand_u32(&bound, &slots, ins, name, 1)?;
+                let batch = parent.len();
+                let row_len = state_tensor.len() / batch.max(1);
+                let mut out = vec![0.0f32; state_tensor.len()];
+                for (b, &p) in parent.iter().enumerate() {
+                    let p_idx = p as usize;
+                    if p_idx < batch {
+                        out[b * row_len..(b + 1) * row_len]
+                            .copy_from_slice(&state_tensor[p_idx * row_len..(p_idx + 1) * row_len]);
                     }
                 }
                 out
@@ -719,7 +851,7 @@ pub fn run(
                                 continue;
                             }
                             if let Some(w) = window {
-                                if current_pos >= *w && ki < current_pos - *w {
+                                if ki + *w <= current_pos {
                                     scores.push(f32::NEG_INFINITY);
                                     continue;
                                 }
@@ -816,7 +948,7 @@ pub fn run(
                                 continue;
                             }
                             if let Some(w) = window {
-                                if current_pos >= *w && ki < current_pos - *w {
+                                if ki + *w <= current_pos {
                                     scores.push(f32::NEG_INFINITY);
                                     continue;
                                 }
@@ -1315,6 +1447,27 @@ pub fn run(
                 nn::l2_normalize(&mut x);
                 x
             }
+            Op::Conv2d {
+                stride, padding, ..
+            } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                let w = operand(&bound, &slots, ins, name, 1)?;
+                let bias = if ins.len() > 2 {
+                    Some(operand(&bound, &slots, ins, name, 2)?)
+                } else {
+                    None
+                };
+                let x_shape = &graph.value(ins[0]).shape;
+                let w_shape = &graph.value(ins[1]).shape;
+                let in_c = x_shape.first().copied().unwrap_or(1);
+                let in_h = x_shape.get(1).copied().unwrap_or(1);
+                let in_w = x_shape.get(2).copied().unwrap_or(1);
+                let out_c = w_shape.first().copied().unwrap_or(1);
+                let (res, _, _) = nn::conv2d(
+                    x, in_c, in_h, in_w, w, bias, out_c, stride[0], stride[1], padding[0],
+                );
+                res
+            }
             op => {
                 return Err(format!(
                     "CPU executor does not implement {} (node '{}')",
@@ -1529,6 +1682,33 @@ fn take0(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn test_rel_pos_bias_and_state_reorder() {
+        let mut g = Graph::new();
+        let table = g.weight("table", vec![32, 4], DType::F32);
+        let q_pos = g.input("q_pos", vec![2], DType::U32);
+        let k_pos = g.input("k_pos", vec![4], DType::U32);
+        let rpb = g.add(
+            "rpb",
+            Op::RelPosBias {
+                buckets: 32,
+                max_distance: 128,
+                bidirectional: true,
+                heads: 4,
+            },
+            &[table, q_pos, k_pos],
+            vec![4, 2, 4],
+            DType::F32,
+        );
+        g.output(rpb);
+
+        let mut w = Weights::new();
+        w.insert("table", Tensor::F32(vec![0.5; 32 * 4]));
+        let inputs = vec![Tensor::U32(vec![0, 1]), Tensor::U32(vec![0, 1, 2, 3])];
+        let out = run_stateless(&g, &w, inputs).unwrap();
+        assert_eq!(out[0].len(), 4 * 2 * 4);
+    }
+
     use crate::graph::{BinaryKind, DType, Op, RopeVariant, UnaryKind, UpsampleMode};
 
     #[test]
@@ -1643,17 +1823,24 @@ mod tests {
     #[test]
     fn test_cpu_rope() {
         let mut g = Graph::new();
+        let mut w = Weights::new();
         let x = g.input("x", vec![1, 4], DType::F32);
         let pos = g.input("pos", vec![1], DType::U32);
+        let inv_freq = g.weight("rope.inv_freq.default", vec![2], DType::F32);
+        w.insert(
+            "rope.inv_freq.default".to_string(),
+            Tensor::F32(vec![1.0, 0.01]),
+        );
+
         let r_inter = g.add(
             "rope_inter",
             Op::Rope {
                 head_dim: 4,
                 rotary_dim: 4,
-                base: 10000.0,
                 variant: RopeVariant::Interleaved,
+                mscale: 1.0,
             },
-            &[x, pos],
+            &[x, pos, inv_freq],
             vec![1, 4],
             DType::F32,
         );
@@ -1662,10 +1849,10 @@ mod tests {
             Op::Rope {
                 head_dim: 4,
                 rotary_dim: 4,
-                base: 10000.0,
                 variant: RopeVariant::HalfSplit,
+                mscale: 1.0,
             },
-            &[x, pos],
+            &[x, pos, inv_freq],
             vec![1, 4],
             DType::F32,
         );
@@ -1673,9 +1860,24 @@ mod tests {
         g.output(r_half);
 
         let inputs = vec![Tensor::F32(vec![1.0, 0.0, 0.0, 1.0]), Tensor::U32(vec![0])];
-        let res = run_stateless(&g, &Weights::new(), inputs).unwrap();
+        let res = run_stateless(&g, &w, inputs).unwrap();
         assert_eq!(res[0].as_f32().unwrap(), &[1.0, 0.0, 0.0, 1.0]);
         assert_eq!(res[1].as_f32().unwrap(), &[1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_attention_window_exact_w_keys() {
+        // window = 4, query at pos 10 over keys 0..=10.
+        // Exactly keys 7..=10 have non-zero weight (4 keys).
+        let w = 4usize;
+        let pos = 10usize;
+        let mut visible = Vec::new();
+        for ki in 0..=pos {
+            if !(ki + w <= pos) {
+                visible.push(ki);
+            }
+        }
+        assert_eq!(visible, vec![7, 8, 9, 10]);
     }
 
     #[test]

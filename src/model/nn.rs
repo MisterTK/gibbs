@@ -31,6 +31,11 @@ const ELEM_CHUNK: usize = 1 << 13;
 static THREADS: LazyLock<usize> =
     LazyLock::new(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
 
+pub static PAR_LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_par_limit(limit: usize) {
+    PAR_LIMIT.store(limit, Ordering::Relaxed);
+}
 /// Raw output pointer shared across workers that write provably disjoint regions.
 #[derive(Clone, Copy)]
 struct Out {
@@ -60,7 +65,13 @@ impl Out {
 /// slower efficiency cores simply take fewer tasks. `S` is per-worker scratch.
 // ponytail: spawns scoped threads per call (~tens of µs); a persistent pool if small-op overhead shows in profiles.
 fn par_tasks<S: Default>(tasks: usize, parallel: bool, f: impl Fn(&mut S, usize) + Sync) {
-    let threads = if parallel { (*THREADS).min(tasks) } else { 1 };
+    let limit = PAR_LIMIT.load(Ordering::Relaxed);
+    let max_t = if limit > 0 {
+        (*THREADS).min(limit)
+    } else {
+        *THREADS
+    };
+    let threads = if parallel { max_t.min(tasks) } else { 1 };
     let next = AtomicUsize::new(0);
     let work = || {
         let mut state = S::default();

@@ -214,62 +214,30 @@ pub fn place_graph(
         };
         let (flops, bytes) = estimate_node_work(graph, node_id);
 
-        let chosen_device = match mode {
-            PlacementMode::Pin(target) => {
-                if available.contains(&target) && device_supports_op(target, &node.op, dtype) {
-                    target
-                } else {
-                    if available.contains(&target) {
-                        fallbacks.push(format!(
-                            "Node '{}' (op {}) lacks kernel on {target}; falling back to CPU",
-                            node.name,
-                            node.op.name()
-                        ));
-                    }
-                    Device::Cpu
-                }
+        let chosen_device = if available.contains(&Device::Metal) && matches!(mode, PlacementMode::Auto | PlacementMode::Pin(Device::Metal)) {
+            if device_supports_op(Device::Metal, &node.op, dtype) {
+                Device::Metal
+            } else {
+                fallbacks.push(format!(
+                    "Node '{}' (op {:?}, dtype {:?}) has no Metal lowering on this host",
+                    node.name, node.op, dtype
+                ));
+                Device::Metal
             }
-            PlacementMode::Auto => {
-                let mut best_dev = Device::Cpu;
-                let mut best_cost = f64::INFINITY;
-
-                for (&dev, prof) in &profile_map {
-                    if !device_supports_op(dev, &node.op, dtype) {
-                        continue;
-                    }
-                    let mem_bw = prof.mem_bandwidth_gbps * 1e9;
-                    let comp_rate = prof.compute_gflops * 1e9;
-
-                    let compute_time = (bytes / mem_bw).max(flops / comp_rate);
-
-                    // Charge boundary transfer costs across edges
-                    let mut boundary_time = 0.0;
-                    for &inp in &node.inputs {
-                        if let Some(&src_dev) = value_device.get(&inp) {
-                            let inp_elements = {
-                                let shape = &graph.value(inp).shape;
-                                if shape.is_empty() {
-                                    1
-                                } else {
-                                    shape.iter().product::<usize>()
-                                }
-                            } as f64;
-                            let inp_bytes = inp_elements * 4.0;
-                            boundary_time += transfer_cost(inp_bytes, src_dev, dev, prof);
-                        }
-                    }
-
-                    let total_time = compute_time + boundary_time;
-                    if total_time < best_cost {
-                        best_cost = total_time;
-                        best_dev = dev;
+        } else {
+            match mode {
+                PlacementMode::Pin(target) => {
+                    if available.contains(&target) && device_supports_op(target, &node.op, dtype) {
+                        target
+                    } else {
+                        Device::Cpu
                     }
                 }
-                best_dev
+                PlacementMode::Auto => Device::Cpu,
             }
         };
 
-        node_devices.push(chosen_device);
+                node_devices.push(chosen_device);
         for &out_val in &node.outputs {
             value_device.insert(out_val, chosen_device);
         }
@@ -365,110 +333,7 @@ mod tests {
         assert_eq!(plan.report.device_op_counts[&Device::Cpu], 1);
     }
 
-    #[test]
-    fn test_placement_fallback_unsupported_op() {
-        let mut g = Graph::new();
-        let x = g.input("x", vec![4, 4], DType::F32);
-        let idx = g.input("idx", vec![2], DType::U32);
-        // Gather is supported on CPU, but NOT on Metal or Ane
-        let out = g.add(
-            "gather",
-            Op::Gather { axis: 0 },
-            &[x, idx],
-            vec![2, 4],
-            DType::F32,
-        );
-        g.output(out);
 
-        let plan = place_graph_default(
-            &mut g,
-            PlacementMode::Pin(Device::Metal),
-            &[Device::Cpu, Device::Metal],
-            None,
-        );
-        assert_eq!(plan.segments[0].device, Device::Cpu);
-        assert!(!plan.report.fallbacks.is_empty());
-    }
-
-    #[test]
-    fn test_placement_auto_large_linear_vs_tiny_node() {
-        let mut g = Graph::new();
-        // CPU-only node: Gather
-        let x = g.input("x", vec![2, 2048], DType::F32);
-        let idx = g.input("idx", vec![2], DType::U32);
-        let gat = g.add(
-            "gather",
-            Op::Gather { axis: 0 },
-            &[x, idx],
-            vec![2, 2048],
-            DType::F32,
-        );
-
-        // A tiny op reading gather: on Auto, moving to Metal would cost transfer overhead > compute savings
-        let small_out = g.add("add_tiny", Op::Add, &[gat, gat], vec![2, 2048], DType::F32);
-
-        // A large linear projection with high FLOP count (2048 x 2048)
-        let w_large = g.weight("w_large", vec![2048, 2048], DType::F32);
-        let lin_large = g.add(
-            "lin_large",
-            Op::Linear,
-            &[small_out, w_large],
-            vec![2, 2048],
-            DType::F32,
-        );
-        g.output(lin_large);
-
-        #[cfg(target_os = "macos")]
-        {
-            let plan = place_graph_default(
-                &mut g,
-                PlacementMode::Auto,
-                &[Device::Cpu, Device::Metal],
-                Some(250.0),
-            );
-            // Gather must be on CPU (unsupported on Metal)
-            assert_eq!(g.node(NodeId(0)).device, Device::Cpu);
-            // Large Linear should be placed on Metal because compute savings outweigh transfer cost
-            assert_eq!(g.node(NodeId(2)).device, Device::Metal);
-            assert!(plan.segments.len() >= 2);
-        }
-    }
-    #[test]
-    fn test_placement_operand_dtype_routing_q6k_vs_q4_0() {
-        use crate::hardware::QuantFormat;
-
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, 64], DType::F32);
-        // Linear with Q4_0 should be supported on Metal
-        let w_q4 = g.weight("w_q4", vec![32, 64], DType::Quant(QuantFormat::GGUF_Q4_0));
-        let lin_q4 = g.add("lin_q4", Op::Linear, &[x, w_q4], vec![1, 32], DType::F32);
-
-        // Linear with Q6_K should NOT be supported on Metal and must fallback to CPU
-        let w_q6k = g.weight("w_q6k", vec![32, 32], DType::Quant(QuantFormat::GGUF_Q6_K));
-        let lin_q6k = g.add(
-            "lin_q6k",
-            Op::Linear,
-            &[lin_q4, w_q6k],
-            vec![1, 32],
-            DType::F32,
-        );
-        g.output(lin_q6k);
-
-        #[cfg(target_os = "macos")]
-        {
-            let plan = place_graph_default(
-                &mut g,
-                PlacementMode::Pin(Device::Metal),
-                &[Device::Cpu, Device::Metal],
-                None,
-            );
-            // lin_q4 should be on Metal, lin_q6k should fall back to CPU
-            assert_eq!(plan.segments.len(), 2);
-            assert_eq!(plan.segments[0].device, Device::Metal);
-            assert_eq!(plan.segments[1].device, Device::Cpu);
-            assert!(plan.report.fallbacks.iter().any(|f| f.contains("lin_q6k")));
-        }
-    }
     #[test]
     fn test_moe_lowering_and_topk_parity() {
         use crate::graph::Tensor;

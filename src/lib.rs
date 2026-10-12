@@ -17,6 +17,7 @@ pub mod kv;
 pub mod model;
 pub use model::*;
 
+pub mod bench;
 pub mod quant;
 pub mod scheduler;
 pub mod server;

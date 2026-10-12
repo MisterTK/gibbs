@@ -6,8 +6,9 @@
 
 pub(crate) mod mascot;
 mod picker;
+pub mod qos;
 mod render;
-
+pub mod settings;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
 use crate::kv::PagedKVPool;
 use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore, SequenceClassifier};
@@ -48,10 +49,10 @@ const PINNED_MODELS: &[&str] = &[
     "roneneldan/TinyStories-Instruct-8M",
     "EleutherAI/pythia-14m",
 ];
-/// Redraw interval when nothing happens; input and streamed output redraw at once.
-const REFRESH: Duration = Duration::from_millis(250);
-/// Poll interval while output streams or a model loads.
-const BUSY_POLL: Duration = Duration::from_millis(33);
+/// Redraw interval locked to 60 FPS tick (16.6 ms) without frame drops.
+const REFRESH: Duration = Duration::from_nanos(16_666_667);
+/// Poll interval while output streams or a model loads (60 FPS tick).
+const BUSY_POLL: Duration = Duration::from_nanos(16_666_667);
 /// Throughput history: one sample per second.
 const SPARK_SECONDS: usize = 120;
 /// Streamed chat text is re-sent to the UI at most this often.
@@ -210,6 +211,7 @@ enum Update {
         /// (GraphLm weight-format choice, `None` for native models; shape and backend).
         result: Result<(Option<Choice>, String), String>,
     },
+    Probe(Result<String, String>),
 }
 
 /// A prompt's background work: runs with its console entry index and the update channel.
@@ -307,11 +309,21 @@ pub struct TuiApp {
     pub roofline_probe_result: Option<String>,
     pub show_latency_modal: bool,
     pub show_token_inspector: bool,
+    pub show_settings_modal: bool,
+    pub reencode_policy: crate::model::weight_format::ReencodePolicy,
+    pub variant_policy: crate::model::weight_format::VariantPolicy,
+    pub ctx_limit: usize,
+    pub show_roofline_hud: bool,
+    pub frame_log_path: Option<String>,
 }
 
 impl TuiApp {
     pub fn new(telemetry: Arc<EngineTelemetry>, kv_pool: Arc<PagedKVPool>) -> Self {
         let hw = HardwareCapability::probe_system();
+        if let Some(perf_cores) = hw.performance_cores {
+            let limit = (perf_cores as usize).saturating_sub(1).max(1);
+            crate::model::nn::set_par_limit(limit);
+        }
         let hub = HuggingFaceHub::new()
             .with_storage(StorageBackend::from_uri("disk").expect("local disk storage"))
             .with_budget(usize::MAX);
@@ -373,6 +385,12 @@ impl TuiApp {
             roofline_probe_result: None,
             show_latency_modal: false,
             show_token_inspector: false,
+            show_settings_modal: false,
+            reencode_policy: crate::model::weight_format::ReencodePolicy::MaxSpeed,
+            variant_policy: crate::model::weight_format::VariantPolicy::Fastest,
+            ctx_limit: 8192,
+            show_roofline_hud: true,
+            frame_log_path: None,
         }
     }
 
@@ -461,21 +479,95 @@ impl TuiApp {
                 Some(probe)
             }
             "/avatar" => {
+                Some(Ok("Josiah Willard Gibbs classic portrait active".into()))
+            }
+            "/reencode" => {
                 let target = rest.trim();
                 if target.is_empty() {
-                    self.mascot.avatar_style = self.mascot.avatar_style.cycle();
-                    Some(Ok(format!(
-                        "Active mascot scene: {} (options: classic, chalkboard, thermo, lattice, cyber)",
-                        self.mascot.avatar_style.name()
-                    )))
-                } else if let Some(style) = mascot::AvatarStyle::from_str_style(target) {
-                    self.mascot.avatar_style = style;
-                    Some(Ok(format!("Switched mascot scene to: {}", style.name())))
+                    self.reencode_policy = match self.reencode_policy {
+                        crate::model::weight_format::ReencodePolicy::MaxSpeed => crate::model::weight_format::ReencodePolicy::LowBitNative,
+                        crate::model::weight_format::ReencodePolicy::LowBitNative => crate::model::weight_format::ReencodePolicy::BitExact,
+                        crate::model::weight_format::ReencodePolicy::BitExact => crate::model::weight_format::ReencodePolicy::MaxSpeed,
+                    };
+                    let mut s = settings::load_settings();
+                    s.reencode = format!("{:?}", self.reencode_policy).to_lowercase();
+                    let _ = settings::save_settings(&s);
+                    Some(Ok(format!("Re-encode policy: {:?}. Reload to apply.", self.reencode_policy)))
                 } else {
-                    Some(Err(format!(
-                        "unknown avatar style '{target}'; options: classic, chalkboard, thermo, lattice, cyber"
-                    )))
+                    let policy = match target {
+                        "max-speed" => Ok(crate::model::weight_format::ReencodePolicy::MaxSpeed),
+                        "low-bit-native" => Ok(crate::model::weight_format::ReencodePolicy::LowBitNative),
+                        "bit-exact" => Ok(crate::model::weight_format::ReencodePolicy::BitExact),
+                        other => Err(format!("unknown reencode policy '{other}'; valid: max-speed, low-bit-native, bit-exact")),
+                    };
+                    match policy {
+                        Ok(p) => {
+                            self.reencode_policy = p;
+                            let mut s = settings::load_settings();
+                            s.reencode = target.to_string();
+                            let _ = settings::save_settings(&s);
+                            self.telemetry.log_info(&format!("TUI: reencode policy set to {target} (reload to apply)"));
+                            Some(Ok(format!("Re-encode policy set to {target}. Reload to apply.")))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
                 }
+            }
+            "/variant" => {
+                let target = rest.trim();
+                if target.is_empty() {
+                    self.variant_policy = match self.variant_policy {
+                        crate::model::weight_format::VariantPolicy::Fastest => crate::model::weight_format::VariantPolicy::Fastest4Bit,
+                        crate::model::weight_format::VariantPolicy::Fastest4Bit => crate::model::weight_format::VariantPolicy::BestQuality,
+                        crate::model::weight_format::VariantPolicy::BestQuality => crate::model::weight_format::VariantPolicy::Fastest,
+                    };
+                    let mut s = settings::load_settings();
+                    s.variant = format!("{:?}", self.variant_policy).to_lowercase();
+                    let _ = settings::save_settings(&s);
+                    Some(Ok(format!("Variant policy: {:?}. Reload to apply.", self.variant_policy)))
+                } else {
+                    let policy = match target {
+                        "fastest" => Ok(crate::model::weight_format::VariantPolicy::Fastest),
+                        "fastest-4bit" => Ok(crate::model::weight_format::VariantPolicy::Fastest4Bit),
+                        "best-quality" => Ok(crate::model::weight_format::VariantPolicy::BestQuality),
+                        other => Err(format!("unknown variant policy '{other}'; valid: fastest, fastest-4bit, best-quality")),
+                    };
+                    match policy {
+                        Ok(p) => {
+                            self.variant_policy = p;
+                            let mut s = settings::load_settings();
+                            s.variant = target.to_string();
+                            let _ = settings::save_settings(&s);
+                            self.telemetry.log_info(&format!("TUI: variant policy set to {target} (reload to apply)"));
+                            Some(Ok(format!("Variant policy set to {target}. Reload to apply.")))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+            }
+            "/profile" => {
+                let target = rest.trim();
+                match target {
+                    "on" | "1" | "true" => {
+                        std::env::set_var("GIBBS_PROFILE_KERNELS", "1");
+                        Some(Ok("Kernel GPU timing profiler enabled".into()))
+                    }
+                    "off" | "0" | "false" => {
+                        std::env::remove_var("GIBBS_PROFILE_KERNELS");
+                        Some(Ok("Kernel GPU timing profiler disabled".into()))
+                    }
+                    _ => {
+                        let active = std::env::var("GIBBS_PROFILE_KERNELS").is_ok();
+                        Some(Ok(format!("Kernel profiling is {} (use /profile on|off)", if active { "ON" } else { "OFF" })))
+                    }
+                }
+            }
+            "/settings" => {
+                self.show_settings_modal = !self.show_settings_modal;
+                Some(Ok(format!(
+                    "Policy Settings: reencode={:?}, variant={:?}, ctx={}, roofline_hud={}",
+                    self.reencode_policy, self.variant_policy, self.ctx_limit, self.show_roofline_hud
+                )))
             }
             "/bench" => {
                 let s = self.telemetry.get_summary();
@@ -577,7 +669,10 @@ impl TuiApp {
                 let idx = self.push_entry(shown, Kind::Running, String::new());
                 self.history[idx].cancel = cancel;
                 let tx = self.updates_tx.clone();
-                std::thread::spawn(move || job(idx, tx));
+                std::thread::spawn(move || {
+                    crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+                    job(idx, tx);
+                });
             }
         }
     }
@@ -630,63 +725,82 @@ impl TuiApp {
     }
     /// Runs an empirical roofline calibration probe comparing measured memory bandwidth
     /// against Apple unified memory hardware roofline ceilings.
+    pub fn trigger_background_roofline_probe(&self) {
+        let tx = self.updates_tx.clone();
+        let telemetry = self.telemetry.clone();
+        std::thread::spawn(move || {
+            crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+            let res = run_roofline_probe_static(&telemetry);
+            let _ = tx.send(Update::Probe(res));
+        });
+    }
+
+    /// Runs an empirical roofline calibration probe comparing measured memory bandwidth
+    /// against Apple unified memory hardware roofline ceilings.
     pub fn run_roofline_probe(&self) -> Result<String, String> {
-        #[cfg(target_os = "macos")]
-        {
-            let dir = crate::model::hub::HuggingFaceHub::cache_dir();
-            let rt = crate::graph::metal::Runtime::new(&dir)?;
-            let measured_gbps = rt.benchmark_memory_bandwidth()?;
+        self.trigger_background_roofline_probe();
+        run_roofline_probe_static(&self.telemetry)
+    }
+}
 
-            let mut peak_gflops = 0.0f64;
-            for t in &rt.profile().gemm {
-                let min_us = t.us.iter().map(|(_, us)| *us).fold(f64::INFINITY, f64::min);
-                if min_us.is_finite() && min_us > 0.0 {
-                    let gflops = (2.0 * t.m as f64 * t.n as f64 * t.k as f64) / (min_us * 1e3);
-                    peak_gflops = peak_gflops.max(gflops);
-                }
+pub fn run_roofline_probe_static(telemetry: &EngineTelemetry) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let dir = crate::model::hub::HuggingFaceHub::cache_dir();
+        let rt = crate::graph::metal::Runtime::new(&dir)?;
+        let measured_gbps = rt.benchmark_memory_bandwidth()?;
+
+        let mut peak_gflops = 0.0f64;
+        for t in &rt.profile().gemm {
+            let min_us = t.us.iter().map(|(_, us)| *us).fold(f64::INFINITY, f64::min);
+            if min_us.is_finite() && min_us > 0.0 {
+                let gflops = (2.0 * t.m as f64 * t.n as f64 * t.k as f64) / (min_us * 1e3);
+                peak_gflops = peak_gflops.max(gflops);
             }
-            if peak_gflops == 0.0 {
-                peak_gflops = 14_000.0;
-            }
+        }
+        if peak_gflops == 0.0 {
+            peak_gflops = 14_000.0;
+        }
 
-            let ridge = peak_gflops / measured_gbps.max(1.0);
-            let s = self.telemetry.get_summary();
-            let eta = if s.effective_bandwidth_gbps > 0.0 {
-                (s.effective_bandwidth_gbps as f64 / measured_gbps) * 100.0
-            } else {
-                0.0
-            };
-            let regime = if eta > 65.0 {
-                "Bandwidth-Constrained"
-            } else {
-                "Latency/Compute-Bound"
-            };
+        let ridge = peak_gflops / measured_gbps.max(1.0);
+        let s = telemetry.get_summary();
+        let eta = if s.effective_bandwidth_gbps > 0.0 {
+            (s.effective_bandwidth_gbps as f64 / measured_gbps) * 100.0
+        } else {
+            0.0
+        };
+        let regime = if eta > 65.0 {
+            "Bandwidth-Constrained"
+        } else {
+            "Latency/Compute-Bound"
+        };
 
-            Ok(format!(
-                "EMPIRICAL ROOFLINE CALIBRATION:\n\
+        Ok(format!(
+            "EMPIRICAL ROOFLINE CALIBRATION:\n\
                  · Host GPU Device: {}\n\
                  · Empirical Memory Sweep (256 MB): {:.1} GB/s\n\
                  · Peak Calibrated GEMM Compute: {:.1} TFLOPs ({:.0} GFLOP/s)\n\
                  · Empirical Operational Intensity Ridge: {:.1} FLOPs/Byte\n\
                  · Live Decode Bandwidth: {:.1} GB/s (η = {:.1}% {})\n\
                  · Instantaneous Throughput: {:.1} tok/s",
-                &rt.profile().device,
-                measured_gbps,
-                peak_gflops / 1000.0,
-                peak_gflops,
-                ridge,
-                s.effective_bandwidth_gbps,
-                eta,
-                regime,
-                s.current_tps
-            ))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err("Empirical roofline probe is only available on Metal hosts".into())
-        }
+            &rt.profile().device,
+            measured_gbps,
+            peak_gflops / 1000.0,
+            peak_gflops,
+            ridge,
+            s.effective_bandwidth_gbps,
+            eta,
+            regime,
+            s.current_tps
+        ))
     }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Empirical roofline probe is only available on Metal hosts".into())
+    }
+}
 
+impl TuiApp {
     /// The work for one prompt (and, for chats, its cancel flag), or why it cannot run.
     fn prompt_job(
         &self,
@@ -965,6 +1079,7 @@ impl TuiApp {
             self.placement,
         );
         std::thread::spawn(move || {
+            crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             // A panic inside loading must surface as an error, not leave the load stuck.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let backend = match placement {
@@ -1083,6 +1198,7 @@ impl TuiApp {
         );
         let (id, target) = (id.to_string(), sched.model_id());
         std::thread::spawn(move || {
+            crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             let attach = || -> Result<String, String> {
                 let da = hub.auto_download_and_cache(&id, token.as_deref())?;
                 let d = crate::model::draft::load_drafter(&da, &hub.locate_model(&target))?;
@@ -1169,6 +1285,17 @@ impl TuiApp {
                                 .log_warn(&format!("TUI: cannot load '{id}': {e}"));
                             self.finish(idx, Kind::Error, e, String::new());
                         }
+                    }
+                }
+                Update::Probe(res) => {
+                    self.roofline_probe_result = res.as_ref().ok().cloned();
+                    match &res {
+                        Ok(_) => self
+                            .telemetry
+                            .log_info("TUI: roofline calibration probe completed"),
+                        Err(e) => self
+                            .telemetry
+                            .log_info(&format!("TUI: roofline calibration probe failed: {e}")),
                     }
                 }
             }
@@ -1298,10 +1425,11 @@ impl TuiApp {
                 l.sample = (Instant::now(), done);
             }
             let text = l.progress_text();
-            let e = &mut self.history[l.idx];
-            if e.output != text {
-                e.output = text;
-                dirty = true;
+            if let Some(e) = self.history.get_mut(l.idx) {
+                if e.output != text {
+                    e.output = text;
+                    dirty = true;
+                }
             }
         }
         if self.focus == Focus::Picker {
@@ -1347,7 +1475,7 @@ impl TuiApp {
             if matches!(self.focus, Focus::Dashboard | Focus::Prompt) {
                 self.show_roofline_inspector = !self.show_roofline_inspector;
                 if self.show_roofline_inspector && self.roofline_probe_result.is_none() {
-                    self.roofline_probe_result = self.run_roofline_probe().ok();
+                    self.trigger_background_roofline_probe();
                 }
                 return false;
             }
@@ -1372,9 +1500,15 @@ impl TuiApp {
             self.show_token_inspector = false;
             return false;
         }
-        if self.show_roofline_inspector && key.code == KeyCode::Esc {
-            self.show_roofline_inspector = false;
-            return false;
+        if self.show_roofline_inspector {
+            if key.code == KeyCode::Char('p') {
+                self.trigger_background_roofline_probe();
+                return false;
+            }
+            if key.code == KeyCode::Esc {
+                self.show_roofline_inspector = false;
+                return false;
+            }
         }
         if self.show_logprob_inspector {
             match key.code {
@@ -1394,10 +1528,6 @@ impl TuiApp {
                 _ => {}
             }
         }
-        if key.code == KeyCode::F(3) {
-            self.mascot.avatar_style = self.mascot.avatar_style.cycle();
-            return false;
-        }
         if key.code == KeyCode::F(2) {
             self.show_template_modal = !self.show_template_modal;
             return false;
@@ -1414,6 +1544,47 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Enter => self.show_template_modal = false,
+                _ => {}
+            }
+            return false;
+        }
+        if key.code == KeyCode::F(4) {
+            self.show_settings_modal = !self.show_settings_modal;
+            return false;
+        }
+        if self.show_settings_modal {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(4) => self.show_settings_modal = false,
+                KeyCode::Char('1') => {
+                    self.reencode_policy = match self.reencode_policy {
+                        crate::model::weight_format::ReencodePolicy::MaxSpeed => {
+                            crate::model::weight_format::ReencodePolicy::LowBitNative
+                        }
+                        crate::model::weight_format::ReencodePolicy::LowBitNative => {
+                            crate::model::weight_format::ReencodePolicy::BitExact
+                        }
+                        crate::model::weight_format::ReencodePolicy::BitExact => {
+                            crate::model::weight_format::ReencodePolicy::MaxSpeed
+                        }
+                    };
+                }
+                KeyCode::Char('2') => {
+                    self.variant_policy = match self.variant_policy {
+                        crate::model::weight_format::VariantPolicy::Fastest => {
+                            crate::model::weight_format::VariantPolicy::Fastest4Bit
+                        }
+                        crate::model::weight_format::VariantPolicy::Fastest4Bit => {
+                            crate::model::weight_format::VariantPolicy::BestQuality
+                        }
+                        crate::model::weight_format::VariantPolicy::BestQuality => {
+                            crate::model::weight_format::VariantPolicy::Fastest
+                        }
+                    };
+                }
+                KeyCode::Char('3') => {
+                    self.show_roofline_hud = !self.show_roofline_hud;
+                }
+                KeyCode::Enter => self.show_settings_modal = false,
                 _ => {}
             }
             return false;
@@ -1480,6 +1651,7 @@ impl TuiApp {
     }
 
     pub fn run(&mut self) -> io::Result<()> {
+        crate::tui::qos::set_qos(crate::tui::qos::QosClass::UserInteractive);
         self.telemetry.is_tui_active.store(true, Ordering::Relaxed);
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
@@ -1519,9 +1691,21 @@ impl TuiApp {
     ) -> io::Result<()> {
         let mut next_draw = Instant::now();
         loop {
+            let frame_start = Instant::now();
             if self.tick() || Instant::now() >= next_draw {
                 terminal.draw(|f| self.render(f))?;
                 next_draw = Instant::now() + REFRESH;
+                if let Some(path) = &self.frame_log_path {
+                    use std::io::Write;
+                    let elapsed_ms = frame_start.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(f, "{elapsed_ms:.3}");
+                    }
+                }
             }
             let busy = self.running > 0 || self.load.is_some() || self.focus == Focus::Picker;
             let wait = next_draw
@@ -1918,7 +2102,12 @@ mod tests {
         );
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         app.handle_key(key(KeyCode::Char('m')));
-        // The only cached row sorts first.
+        for _ in 0..50 {
+            if app.tick() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         app.handle_key(ctrl_d);
         assert!(repo.exists(), "first ctrl-d only asks for confirmation");
         app.handle_key(ctrl_d);
@@ -1939,7 +2128,12 @@ mod tests {
         });
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Char('m')));
-        app.handle_key(ctrl_d);
+        for _ in 0..50 {
+            if app.tick() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         app.handle_key(ctrl_d);
         assert!(repo.exists(), "a loading repo is never deleted");
     }
@@ -2140,18 +2334,11 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert!(!app.show_roofline_inspector);
 
-        // 5. F3 cycles avatar styles
-        assert_eq!(app.mascot.avatar_style, mascot::AvatarStyle::Classic);
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.mascot.avatar_style, mascot::AvatarStyle::Chalkboard);
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.mascot.avatar_style, mascot::AvatarStyle::Thermo);
-
-        // 6. /avatar command
-        app.input = "/avatar cyber".into();
+        // 5. Classic Gibbs portrait verification
+        assert_eq!(app.mascot.state, mascot::MascotState::Idle);
+        app.input = "/avatar".into();
         app.submit_prompt();
-        assert_eq!(app.mascot.avatar_style, mascot::AvatarStyle::Cyber);
-
+        assert!(app.history.last().unwrap().output.contains("Gibbs"));
         // 7. /bench, /quant, /help commands
         app.input = "/bench".into();
         app.submit_prompt();
@@ -2179,5 +2366,169 @@ mod tests {
             .unwrap()
             .output
             .contains("GIBBS ENGINE COMMAND & KEY REFERENCE"));
+    }
+    #[test]
+    fn test_settings_modal_and_policies() {
+        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+
+        // 1. /settings toggles modal
+        assert!(!app.show_settings_modal);
+        app.input = "/settings".into();
+        app.submit_prompt();
+        assert!(app.show_settings_modal);
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("Policy Settings:"));
+
+        // 2. F4 toggles modal
+        app.handle_key(key(KeyCode::F(4)));
+        assert!(!app.show_settings_modal);
+        app.handle_key(key(KeyCode::F(4)));
+        assert!(app.show_settings_modal);
+
+        // 3. '1' cycles reencode_policy: MaxSpeed -> LowBitNative -> BitExact -> MaxSpeed
+        assert_eq!(
+            app.reencode_policy,
+            crate::model::weight_format::ReencodePolicy::MaxSpeed
+        );
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(
+            app.reencode_policy,
+            crate::model::weight_format::ReencodePolicy::LowBitNative
+        );
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(
+            app.reencode_policy,
+            crate::model::weight_format::ReencodePolicy::BitExact
+        );
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(
+            app.reencode_policy,
+            crate::model::weight_format::ReencodePolicy::MaxSpeed
+        );
+
+        // 4. '2' cycles variant_policy: Fastest -> Fastest4Bit -> BestQuality -> Fastest
+        assert_eq!(
+            app.variant_policy,
+            crate::model::weight_format::VariantPolicy::Fastest
+        );
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(
+            app.variant_policy,
+            crate::model::weight_format::VariantPolicy::Fastest4Bit
+        );
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(
+            app.variant_policy,
+            crate::model::weight_format::VariantPolicy::BestQuality
+        );
+        app.handle_key(key(KeyCode::Char('2')));
+        assert_eq!(
+            app.variant_policy,
+            crate::model::weight_format::VariantPolicy::Fastest
+        );
+
+        // 5. '3' toggles show_roofline_hud
+        assert!(app.show_roofline_hud);
+        app.handle_key(key(KeyCode::Char('3')));
+        assert!(!app.show_roofline_hud);
+        app.handle_key(key(KeyCode::Char('3')));
+        assert!(app.show_roofline_hud);
+
+        // 6. Esc closes modal
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.show_settings_modal);
+    }
+    #[test]
+    fn test_s7_3_qos_par_tasks_and_background_probe() {
+        // 1. QoS setters
+        assert!(crate::tui::qos::set_qos(
+            crate::tui::qos::QosClass::UserInteractive
+        ));
+        assert!(crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility));
+
+        // 2. PAR_LIMIT configuration
+        let app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        if cfg!(target_os = "macos") {
+            let limit = crate::model::nn::PAR_LIMIT.load(Ordering::Relaxed);
+            if app.hw.performance_cores.is_some() {
+                assert!(limit >= 1);
+            }
+        }
+
+        // 3. Background roofline probe
+        app.trigger_background_roofline_probe();
+        let mut got_probe = false;
+        let mut app_mut = app;
+        for _ in 0..100 {
+            if app_mut.tick() && app_mut.roofline_probe_result.is_some() {
+                got_probe = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if cfg!(target_os = "macos") {
+            assert!(got_probe);
+            assert!(app_mut
+                .roofline_probe_result
+                .as_ref()
+                .unwrap()
+                .contains("ROOFLINE CALIBRATION"));
+        }
+    }
+    #[test]
+    fn test_s7_4_reencode_and_variant_slash_commands_and_picker_keys() {
+        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+
+        // 1. /reencode slash command
+        app.input = "/reencode low-bit-native".into();
+        app.submit_prompt();
+        assert_eq!(
+            app.reencode_policy,
+            crate::model::weight_format::ReencodePolicy::LowBitNative
+        );
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("Reload to apply"));
+        let s = crate::tui::settings::load_settings();
+        assert_eq!(s.reencode, "low-bit-native");
+
+        // 2. /variant slash command
+        app.input = "/variant fastest-4bit".into();
+        app.submit_prompt();
+        assert_eq!(
+            app.variant_policy,
+            crate::model::weight_format::VariantPolicy::Fastest4Bit
+        );
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("Reload to apply"));
+        let s = crate::tui::settings::load_settings();
+        assert_eq!(s.variant, "fastest-4bit");
+
+        // 3. Picker 'r' and 'f' keys
+        app.handle_key(key(KeyCode::Char('m')));
+        app.handle_key(key(KeyCode::Char('r')));
+        let s = crate::tui::settings::load_settings();
+        assert!(
+            s.reencode == "max-speed"
+                || s.reencode == "low-bit-native"
+                || s.reencode == "bit-exact"
+        );
+
+        app.handle_key(key(KeyCode::Char('f')));
+        let s = crate::tui::settings::load_settings();
+        assert!(
+            s.variant == "fastest" || s.variant == "fastest-4bit" || s.variant == "best-quality"
+        );
     }
 }

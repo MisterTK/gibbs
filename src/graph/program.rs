@@ -191,6 +191,36 @@ impl GraphProgram {
         }
     }
 
+    /// Computes the exact device memory bytes read per token at absolute context position `pos`.
+    pub fn bytes_per_token(&self, pos: usize) -> u64 {
+        let mut total = 0u64;
+        for seg in &self.segments {
+            match seg {
+                #[cfg(target_os = "macos")]
+                CompiledSegment::Metal { plan, .. } => {
+                    total += plan.weight_bytes;
+                    for sr in &plan.state_reads {
+                        let visible = (pos + 1).min(sr.window.unwrap_or(usize::MAX)) as u64;
+                        total += visible * sr.bytes_per_pos + sr.fixed_bytes;
+                    }
+                }
+                CompiledSegment::Cpu { .. } => {}
+            }
+        }
+        total
+    }
+
+    /// Calculates roofline metrics at context position `pos` given the host ceiling bandwidth in GB/s.
+    pub fn roofline(&self, pos: usize, ceiling_gbps: f64) -> (u64, f64, f64) {
+        let bytes = self.bytes_per_token(pos);
+        let roofline_tok_s = if bytes > 0 && ceiling_gbps > 0.0 {
+            ceiling_gbps / (bytes as f64 / 1e9)
+        } else {
+            0.0
+        };
+        (bytes, ceiling_gbps, roofline_tok_s)
+    }
+
     /// Executes the graph program with given inputs.
     pub fn run(&mut self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         if inputs.len() != self.graph_inputs.len() {

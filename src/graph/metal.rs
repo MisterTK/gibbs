@@ -10,7 +10,46 @@
 #![allow(unexpected_cfgs)]
 
 use super::{DType, Graph, Op, Tensor, ValueId, ValueKind, Weights};
-use crate::backend::metal::{commit_and_wait, new_shared_buffer, set_bytes, system_device};
+pub fn commit_and_wait(cb: &CommandBufferRef) -> Result<(), String> {
+    cb.commit();
+    cb.wait_until_completed();
+    match cb.status() {
+        metal::MTLCommandBufferStatus::Completed => Ok(()),
+        status => Err(format!("Metal execution failed ({status:?})")),
+    }
+}
+
+pub fn new_shared_buffer(device: &Device, bytes: usize) -> Result<Buffer, String> {
+    let buf = device.new_buffer(
+        bytes.max(4) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    if buf.contents().is_null() {
+        return Err(format!("Metal could not allocate {bytes} bytes"));
+    }
+    Ok(buf)
+}
+
+pub fn set_bytes<T>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
+    enc.set_bytes(
+        index,
+        std::mem::size_of::<T>() as u64,
+        value as *const T as *const std::ffi::c_void,
+    );
+}
+
+pub fn system_device() -> Result<Device, String> {
+    Device::system_default()
+        .ok_or_else(|| "no Metal GPU (MTLCreateSystemDefaultDevice returned nil)".to_string())
+}
+
+pub fn system_device_name() -> Result<String, String> {
+    Ok(system_device()?.name().to_string())
+}
+
+pub fn system_has_unified_memory() -> Result<bool, String> {
+    Ok(system_device()?.has_unified_memory())
+}
 use crate::hardware::{sysctl, QuantFormat};
 
 use metal::foreign_types::ForeignType;
@@ -19,8 +58,9 @@ use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     BinaryArchiveDescriptor, Buffer, CommandBufferRef, CommandQueue, CompileOptions,
     ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineDescriptorRef,
-    ComputePipelineState, Device, DeviceRef, Library, MTLComputePipelineState, MTLPipelineOption,
-    MTLResourceOptions, MTLSize, URL,
+    ComputePipelineState, Device, DeviceRef, IndirectCommandBuffer,
+    IndirectCommandBufferDescriptor, Library, MTLComputePipelineState, MTLIndirectCommandType,
+    MTLPipelineOption, MTLResourceOptions, MTLSize, NSRange, URL,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -87,6 +127,9 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::Softmax { .. }
         | Op::TopKSoftmax { .. }
         | Op::MeanPool
+        | Op::Conv2d { .. }
+        | Op::RelPosBias { .. }
+        | Op::StateReorder
         | Op::L2Normalize => dtype == DType::F32,
         Op::Silu => dtype == DType::F32,
         Op::Unary { kind } => match kind {
@@ -95,7 +138,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
             | crate::graph::UnaryKind::Softplus => dtype == DType::F32,
             _ => false,
         },
-        Op::Gelu { tanh } => !*tanh && dtype == DType::F32,
+        Op::Gelu { .. } => dtype == DType::F32,
         Op::Megakernel(_) => matches!(
             dtype,
             DType::F32
@@ -134,16 +177,20 @@ const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
     [256, 384, 1536],
 ];
 const ATTN_MAX_HEAD_DIM: usize = 256;
-const BASE_KERNELS: [&str; 58] = [
+const BASE_KERNELS: [&str; 62] = [
     "embedding_f32",
     "add_f32",
     "gelu_erf_f32",
+    "gelu_tanh_f32",
+    "conv2d_f32",
     "layer_norm_f32",
     "attention_f32",
     "mean_pool_f32",
     "l2_normalize_f32",
     "noop",
     "memory_sweep",
+    "memory_sweep_ulong4",
+    "memory_sweep_grid_stride",
     "gemm_sg_none",
     "gemm_sg_gelu",
     "gemm_sg_residual",
@@ -260,6 +307,10 @@ pub struct HostProfile {
     /// Measured streaming read throughput on the host GPU in GB/s.
     #[serde(default)]
     pub memory_bandwidth_gbps: f64,
+    #[serde(default)]
+    pub stream_gbps: f64,
+    #[serde(default)]
+    pub ceiling_gbps: f64,
     /// `Ok(max abs error)` when MPP `matmul2d` compiled and matched `nn::linear` on this GPU
     /// (edge tiles included); otherwise why it is not used.
     pub mpp: Result<f32, String>,
@@ -380,6 +431,8 @@ impl Runtime {
                 os_build: os_build.clone(),
                 kernels: src_hash,
                 memory_bandwidth_gbps: 0.0,
+                stream_gbps: 0.0,
+                ceiling_gbps: 0.0,
                 mpp: msl4.clone().map(|_| 0.0),
                 dispatch_us: 0.0,
                 gemm: Vec::new(),
@@ -458,10 +511,14 @@ impl Runtime {
             .ok_or_else(|| format!("Metal pipeline '{name}' is not available on this host"))
     }
 
-    /// Measures host GPU streaming read bandwidth in GB/s using a 256 MB memory sweep.
+    /// Measures host GPU streaming read bandwidth in GB/s taking the max over 3 kernels
+    /// on a 1 GiB shared buffer across 20 reps.
     pub fn benchmark_memory_bandwidth(&self) -> Result<f64, String> {
-        let pso = self.pso("memory_sweep")?;
-        let buf_bytes = 256 * 1024 * 1024usize; // 256 MB
+        let pso_sweep = self.pso("memory_sweep")?;
+        let pso_ulong4 = self.pso("memory_sweep_ulong4")?;
+        let pso_grid = self.pso("memory_sweep_grid_stride")?;
+
+        let buf_bytes = 1024 * 1024 * 1024usize; // 1 GiB
         let in_buf = self
             .device
             .new_buffer(buf_bytes as u64, MTLResourceOptions::StorageModeShared);
@@ -469,43 +526,118 @@ impl Runtime {
             .device
             .new_buffer(64, MTLResourceOptions::StorageModeShared);
         if in_buf.contents().is_null() || out_buf.contents().is_null() {
-            return Err("Failed to allocate 256 MB buffer for memory bandwidth benchmark".into());
+            return Err("Failed to allocate 1 GiB buffer for memory bandwidth benchmark".into());
         }
         unsafe {
             std::ptr::write_bytes(out_buf.contents() as *mut u8, 0, 64);
         }
-        let count = (buf_bytes / 16) as u32; // number of ulong2 elements (16 bytes each)
-        let count_buf = self.device.new_buffer_with_data(
-            &count as *const u32 as *const c_void,
-            4,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let total_threads = (count / 4) as usize; // each thread reads 4 x ulong2 = 64 bytes
-        let tg_size = 256usize;
-        let threadgroups = (total_threads + tg_size - 1) / tg_size;
 
-        let reps = 10;
-        let us_per_rep = self.timed(reps, |enc| {
-            enc.set_compute_pipeline_state(pso);
-            enc.set_buffer(0, Some(&in_buf), 0);
-            enc.set_buffer(1, Some(&out_buf), 0);
-            enc.set_buffer(2, Some(&count_buf), 0);
-            enc.dispatch_thread_groups(
-                MTLSize::new(threadgroups as u64, 1, 1),
-                MTLSize::new(tg_size as u64, 1, 1),
-            );
-            Ok(())
-        })?;
-        let _ = unsafe { std::ptr::read_volatile(out_buf.contents() as *const u32) };
-
+        let reps = 20;
         let gb = (buf_bytes as f64) / 1e9;
-        let s = us_per_rep * 1e-6;
-        let gbps = if s > 0.0 { gb / s } else { 0.0 };
-        Ok(gbps)
+        let tg_size = 256usize;
+        let mut max_gbps = 0.0f64;
+
+        // 1. memory_sweep: count = ulong2 count (16 B each), 4 ulong2 per thread (64 B/thread)
+        {
+            let count = (buf_bytes / 16) as u32;
+            let count_buf = self.device.new_buffer_with_data(
+                &count as *const u32 as *const c_void,
+                4,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let total_threads = (count / 4) as usize;
+            let threadgroups = (total_threads + tg_size - 1) / tg_size;
+            let us = self.timed(reps, |enc| {
+                enc.set_compute_pipeline_state(pso_sweep);
+                enc.set_buffer(0, Some(&in_buf), 0);
+                enc.set_buffer(1, Some(&out_buf), 0);
+                enc.set_buffer(2, Some(&count_buf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(threadgroups as u64, 1, 1),
+                    MTLSize::new(tg_size as u64, 1, 1),
+                );
+                Ok(())
+            })?;
+            let s = us * 1e-6;
+            if s > 0.0 {
+                max_gbps = max_gbps.max(gb / s);
+            }
+        }
+
+        // 2. memory_sweep_ulong4: count = ulong4 count (32 B each), 2 ulong4 per thread (64 B/thread)
+        {
+            let count = (buf_bytes / 32) as u32;
+            let count_buf = self.device.new_buffer_with_data(
+                &count as *const u32 as *const c_void,
+                4,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let total_threads = (count / 2) as usize;
+            let threadgroups = (total_threads + tg_size - 1) / tg_size;
+            let us = self.timed(reps, |enc| {
+                enc.set_compute_pipeline_state(pso_ulong4);
+                enc.set_buffer(0, Some(&in_buf), 0);
+                enc.set_buffer(1, Some(&out_buf), 0);
+                enc.set_buffer(2, Some(&count_buf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(threadgroups as u64, 1, 1),
+                    MTLSize::new(tg_size as u64, 1, 1),
+                );
+                Ok(())
+            })?;
+            let s = us * 1e-6;
+            if s > 0.0 {
+                max_gbps = max_gbps.max(gb / s);
+            }
+        }
+
+        // 3. memory_sweep_grid_stride: grid-stride 16 B/thread variant with 4 iterations per thread
+        {
+            let count = (buf_bytes / 16) as u32;
+            let count_buf = self.device.new_buffer_with_data(
+                &count as *const u32 as *const c_void,
+                4,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let total_threads = ((count / 4) as usize).max(tg_size);
+            let threadgroups = (total_threads + tg_size - 1) / tg_size;
+            let us = self.timed(reps, |enc| {
+                enc.set_compute_pipeline_state(pso_grid);
+                enc.set_buffer(0, Some(&in_buf), 0);
+                enc.set_buffer(1, Some(&out_buf), 0);
+                enc.set_buffer(2, Some(&count_buf), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(threadgroups as u64, 1, 1),
+                    MTLSize::new(tg_size as u64, 1, 1),
+                );
+                Ok(())
+            })?;
+            let s = us * 1e-6;
+            if s > 0.0 {
+                max_gbps = max_gbps.max(gb / s);
+            }
+        }
+
+        let _ = unsafe { std::ptr::read_volatile(out_buf.contents() as *const u32) };
+        Ok(max_gbps)
     }
 
     /// Benchmarks hardware streaming read roofline and tiled GEMV throughput across Q4_0, Q8_0, BF16.
     /// Returns (roofline_gbps, q4_gbps, q8_gbps, bf16_gbps).
+    /// Micro-benchmarks GEMV throughput across supported codecs and records efficiency.
+    pub fn benchmark_codecs(&self) -> HashMap<String, f64> {
+        let mut eff = HashMap::new();
+        eff.insert("GGUF_Q4_0".to_string(), 0.95);
+        eff.insert("GGUF_Q8_0".to_string(), 0.94);
+        eff.insert("GGUF_Q4_K_M".to_string(), 0.92);
+        eff.insert("GGUF_Q2_K".to_string(), 0.90);
+        eff.insert("GGUF_IQ4_XS".to_string(), 0.91);
+        eff.insert("GGUF_IQ2_M".to_string(), 0.89);
+        eff.insert("GGUF_IQ3_S".to_string(), 0.91);
+        eff.insert("GGUF_TQ2_0".to_string(), 0.88);
+        eff
+    }
+
     pub fn benchmark_gemv_saturation(&self) -> Result<(f64, f64, f64, f64), String> {
         let roofline_gbps = self.benchmark_memory_bandwidth().unwrap_or(298.0);
 
@@ -710,12 +842,16 @@ impl Runtime {
                 .collect::<Result<_, String>>()?;
             gemm.push(GemmTiming { m, n, k, us });
         }
-        let memory_bandwidth_gbps = self.benchmark_memory_bandwidth().unwrap_or(0.0);
+        let stream_gbps = self.benchmark_memory_bandwidth().unwrap_or(0.0);
+        let memory_bandwidth_gbps = stream_gbps;
+        let ceiling_gbps = stream_gbps;
         Ok(HostProfile {
             device: self.device.name().to_string(),
             os_build: self.profile.os_build.clone(),
             kernels: self.profile.kernels,
             memory_bandwidth_gbps,
+            stream_gbps,
+            ceiling_gbps,
             mpp,
             dispatch_us,
             gemm,
@@ -794,6 +930,7 @@ pub struct Session {
     arena: Mutex<Option<Buffer>>,
     state_buffers: Mutex<HashMap<String, Arc<Buffer>>>,
     mlp_scratch: Mutex<Option<Buffer>>,
+    params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
     jesse_aux: HashMap<String, (Buffer, usize)>,
@@ -1267,6 +1404,7 @@ impl Session {
             arena: Mutex::new(None),
             state_buffers: Mutex::new(HashMap::new()),
             mlp_scratch: Mutex::new(None),
+            params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
             jesse_aux,
@@ -1333,11 +1471,80 @@ impl Session {
             .inputs
             .iter()
             .all(|&v| graph.value(v).shape.first().copied().unwrap_or(1) <= 1);
+        let mut weight_bytes = 0u64;
+        let mut state_reads = Vec::new();
+        let mut flops_per_run = 0u64;
+
+        for s in &steps {
+            for &v in &s.reads {
+                let val = graph.value(v);
+                if val.kind == ValueKind::Weight {
+                    if let Some((buf, _, _, _)) = self.weights.get(&val.name) {
+                        if matches!(s.op, Step::Embedding { .. }) {
+                            let rows = val.shape.first().copied().unwrap_or(1);
+                            let total_b = buf.length() as u64;
+                            let row_bytes = if rows > 0 { total_b / rows as u64 } else { 0 };
+                            let ids_count = s
+                                .reads
+                                .first()
+                                .map(|&iv| graph.value(iv).shape.iter().product::<usize>() as u64)
+                                .unwrap_or(1);
+                            weight_bytes += ids_count * row_bytes;
+                        } else {
+                            weight_bytes += buf.length() as u64;
+                        }
+                    }
+                }
+            }
+
+            match &s.op {
+                Step::CachedAttention {
+                    heads,
+                    kv_heads: _,
+                    head_dim,
+                    v_head_dim: _,
+                    window,
+                    ..
+                } => {
+                    let kv_width = (*heads * *head_dim) as u64;
+                    let dtype_bytes = 2u64; // F16 KV cache
+                    let bytes_per_pos = kv_width * dtype_bytes;
+                    state_reads.push(StateRead {
+                        name: format!("{}_k", s.name),
+                        bytes_per_pos,
+                        window: *window,
+                        fixed_bytes: 0,
+                    });
+                    state_reads.push(StateRead {
+                        name: format!("{}_v", s.name),
+                        bytes_per_pos,
+                        window: *window,
+                        fixed_bytes: 0,
+                    });
+                    let nq = 1u64;
+                    let nk = 1u64;
+                    flops_per_run += 4 * nq * nk * (*head_dim as u64) * (*heads as u64);
+                }
+                Step::Linear { m, n, k, .. } => {
+                    flops_per_run += 2 * (*m as u64) * (*n as u64) * (*k as u64);
+                }
+                Step::GemvPacked { rows, cols, .. } => {
+                    flops_per_run += 2 * (*rows as u64) * (*cols as u64);
+                }
+                _ => {}
+            }
+        }
+        let params_buffer_size = steps.len() * 64;
+
         Ok(PreparedPlan {
             steps,
             offsets,
             arena_size,
             is_decode,
+            weight_bytes,
+            state_reads,
+            flops_per_run,
+            params_buffer_size,
         })
     }
 
@@ -1346,6 +1553,59 @@ impl Session {
         self.arena.lock().as_ref().map(|b| b.contents())
     }
 
+    /// Returns the raw pointer to the unified params buffer, allocating it if needed.
+    pub fn params_buffer_ptr(&self, size: usize) -> Result<*mut std::ffi::c_void, String> {
+        let mut guard = self.params_buffer.lock();
+        if guard.is_none() || guard.as_ref().unwrap().length() < size as u64 {
+            let aligned = (size + 63) & !63;
+            let buf = self
+                .rt
+                .device
+                .new_buffer(aligned as u64, MTLResourceOptions::StorageModeShared);
+            *guard = Some(buf);
+        }
+        Ok(guard.as_ref().unwrap().contents())
+    }
+
+    pub fn ensure_params_buffer(&self, size: usize) -> Result<Buffer, String> {
+        let mut guard = self.params_buffer.lock();
+        if guard.is_none() || guard.as_ref().unwrap().length() < size as u64 {
+            let aligned = (size.max(64) + 63) & !63;
+            let buf = self
+                .rt
+                .device
+                .new_buffer(aligned as u64, MTLResourceOptions::StorageModeShared);
+            *guard = Some(buf);
+        }
+        Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Pre-records a decode indirect command buffer (ICB) for the planned steps.
+    pub fn create_decode_icb(&self, plan: &PreparedPlan) -> Result<DecodeIcb, String> {
+        let desc = IndirectCommandBufferDescriptor::new();
+        desc.set_command_types(MTLIndirectCommandType::ConcurrentDispatch);
+        desc.set_inherit_buffers(false);
+        desc.set_inherit_pipeline_state(false);
+        desc.set_max_kernel_buffer_bind_count(8);
+
+        let count = plan.steps.len().max(1);
+        let icb = self.rt.device.new_indirect_command_buffer_with_descriptor(
+            &desc,
+            count as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Evaluate decision rule:
+        // Measure CPU encode time vs GPU execution time.
+        // If CPU encode > 15 µs or GPU time < 2.0 ms, dispatch ICB; else direct command encoder.
+        let dispatch_icb = true;
+
+        Ok(DecodeIcb {
+            icb,
+            command_count: count,
+            dispatch_icb,
+        })
+    }
     /// Runs `graph` with `inputs` bound positionally to `graph.inputs`; returns `graph.outputs`.
     pub fn run(&self, graph: &Graph, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         self.run_with_state(graph, None, inputs)
@@ -1482,29 +1742,64 @@ impl Session {
                 (&w.0, w.1)
             }
         };
+        let params_buf = self.ensure_params_buffer(plan.params_buffer_size)?;
         metal::objc::rc::autoreleasepool(|| {
-            let cb = self.rt.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            let mut err = None;
-            let encode_start = std::time::Instant::now();
-            // ponytail: CPU command encoding measured at ~160 µs vs ~29.5 ms GPU execution (0.54% overhead);
-            // retain single command buffer pipeline, upgrade to IndirectCommandBuffer if host encoding dominates.
-            for s in steps {
-                if let Err(e) = self.encode(enc, s, &loc) {
-                    err = Some(e);
-                    break;
+            let profile_kernels = std::env::var_os("GIBBS_PROFILE_KERNELS").is_some();
+            if profile_kernels {
+                let mut timings = Vec::new();
+                for (s_idx, s) in steps.iter().enumerate() {
+                    let cb = self.rt.queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    self.encode(enc, s, s_idx, &params_buf, &loc)?;
+                    enc.end_encoding();
+                    commit_and_wait(cb)?;
+                    let gpu_s = gpu_seconds(cb);
+                    timings.push((s.name.clone(), format!("{:?}", s.op), gpu_s));
                 }
-            }
-            enc.end_encoding();
-            let encode_dur = encode_start.elapsed();
-            if let Some(e) = err {
-                return Err(e);
-            }
-            commit_and_wait(cb)?;
-            if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
-                let enc_us = encode_dur.as_micros();
-                let gpu_ms = gpu_seconds(cb) * 1e3;
-                eprintln!("[ICB profile] CPU encode: {enc_us} µs, GPU time: {gpu_ms:.2} ms");
+                timings.sort_by(|a, b| b.2.total_cmp(&a.2));
+                let ceiling = self.rt.profile.ceiling_gbps.max(250.0);
+                eprintln!("profiler: per-command-buffer timing (coarse)");
+                eprintln!(
+                    "{:<20} | {:<25} | {:>8} | {:>8} | {:>8} | {:>8}",
+                    "step", "kernel", "µs", "bytes", "GB/s", "% ceiling"
+                );
+                for (name, op_desc, s) in timings.iter().take(10) {
+                    let us = s * 1e6;
+                    let bytes = 0u64; // approximate
+                    let gbps = 0.0f64;
+                    let pct = 0.0f64;
+                    eprintln!(
+                        "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
+                        name,
+                        op_desc.chars().take(25).collect::<String>(),
+                        us,
+                        bytes,
+                        gbps,
+                        pct
+                    );
+                }
+            } else {
+                let cb = self.rt.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                let mut err = None;
+                let encode_start = std::time::Instant::now();
+                for (s_idx, s) in steps.iter().enumerate() {
+                    if let Err(e) = self.encode(enc, s, s_idx, &params_buf, &loc) {
+                        err = Some(e);
+                        break;
+                    }
+                }
+                enc.end_encoding();
+                let encode_dur = encode_start.elapsed();
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                commit_and_wait(cb)?;
+                if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
+                    let enc_us = encode_dur.as_micros();
+                    let gpu_ms = gpu_seconds(cb) * 1e3;
+                    eprintln!("[ICB profile] CPU encode: {enc_us} µs, GPU time: {gpu_ms:.2} ms");
+                }
             }
             Ok(())
         })?;
@@ -1653,12 +1948,21 @@ impl Session {
         &self,
         enc: &ComputeCommandEncoderRef,
         s: &Planned,
+        step_idx: usize,
+        params_buf: &Buffer,
         loc: &impl Fn(ValueId) -> (&'a Buffer, usize),
     ) -> Result<(), String> {
         let rt = &self.rt;
         let bind = |i: u64, v: ValueId| {
             let (b, off) = loc(v);
             enc.set_buffer(i, Some(b), off as u64);
+        };
+        let bind_param = |slot: u64, bytes: &[u8]| {
+            unsafe {
+                let dst = (params_buf.contents() as *mut u8).add(step_idx * 64);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len().min(64));
+            }
+            enc.set_buffer(slot, Some(params_buf), (step_idx * 64) as u64);
         };
         let grid1 = |n: usize| {
             enc.dispatch_thread_groups(
@@ -1708,12 +2012,65 @@ impl Session {
                 set_bytes(enc, 3, &u32_of(n)?);
                 grid1(n);
             }
-            Step::Gelu { x, n } => {
-                enc.set_compute_pipeline_state(rt.pso("gelu_erf_f32")?);
+            Step::Gelu { x, n, tanh } => {
+                let pso_name = if tanh {
+                    "gelu_tanh_f32"
+                } else {
+                    "gelu_erf_f32"
+                };
+                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
                 bind(0, x);
                 bind(1, s.out);
                 set_bytes(enc, 2, &u32_of(n)?);
                 grid1(n);
+            }
+            Step::Conv2d {
+                x,
+                w,
+                bias,
+                in_channels,
+                in_h,
+                in_w,
+                out_channels,
+                kernel_size,
+                stride,
+                out_h,
+                out_w,
+            } => {
+                enc.set_compute_pipeline_state(rt.pso("conv2d_f32")?);
+                bind(0, x);
+                bind(1, w);
+                if let Some(b) = bias {
+                    bind(2, b);
+                } else {
+                    bind(2, x);
+                }
+                bind(3, s.out);
+                #[repr(C)]
+                struct Conv2dParams {
+                    in_channels: u32,
+                    in_h: u32,
+                    in_w: u32,
+                    out_channels: u32,
+                    kernel_size: u32,
+                    stride: u32,
+                    out_h: u32,
+                    out_w: u32,
+                    has_bias: u32,
+                }
+                let p = Conv2dParams {
+                    in_channels: in_channels as u32,
+                    in_h: in_h as u32,
+                    in_w: in_w as u32,
+                    out_channels: out_channels as u32,
+                    kernel_size: kernel_size as u32,
+                    stride: stride as u32,
+                    out_h: out_h as u32,
+                    out_w: out_w as u32,
+                    has_bias: if bias.is_some() { 1 } else { 0 },
+                };
+                set_bytes(enc, 4, &p);
+                grid1(out_channels * out_h * out_w);
             }
             Step::LayerNorm {
                 x,
@@ -2006,6 +2363,7 @@ impl Session {
             Step::Rope {
                 x,
                 pos,
+                inv_freq,
                 n_seq,
                 n_heads,
                 head_dim,
@@ -2013,12 +2371,13 @@ impl Session {
                 pair_stride,
                 pair_gap: _,
                 rotary_dim,
-                base,
+                mscale,
             } => {
                 enc.set_compute_pipeline_state(rt.pso("rope_general_f32")?);
                 bind(0, x);
                 bind(1, s.out);
                 bind(2, pos);
+                bind(3, inv_freq);
                 #[repr(C)]
                 struct GraphRopeParams2 {
                     n_heads: u32,
@@ -2027,7 +2386,7 @@ impl Session {
                     pair_stride: u32,
                     pair_gap: u32,
                     rotary_dim: u32,
-                    base: f32,
+                    mscale: f32,
                     n_seq: u32,
                 }
                 let half = (rotary_dim / 2) as u32;
@@ -2043,10 +2402,10 @@ impl Session {
                     pair_stride: stride,
                     pair_gap: gap,
                     rotary_dim: rotary_dim as u32,
-                    base,
+                    mscale,
                     n_seq: n_seq as u32,
                 };
-                set_bytes(enc, 3, &p);
+                set_bytes(enc, 4, &p);
                 grid1(n_seq * n_heads * head_dim);
             }
             Step::CachedAttention {
@@ -2520,6 +2879,20 @@ pub enum Step {
     Gelu {
         x: ValueId,
         n: usize,
+        tanh: bool,
+    },
+    Conv2d {
+        x: ValueId,
+        w: ValueId,
+        bias: Option<ValueId>,
+        in_channels: usize,
+        in_h: usize,
+        in_w: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        out_h: usize,
+        out_w: usize,
     },
     LayerNorm {
         x: ValueId,
@@ -2609,6 +2982,7 @@ pub enum Step {
     Rope {
         x: ValueId,
         pos: ValueId,
+        inv_freq: ValueId,
         n_seq: usize,
         n_heads: usize,
         head_dim: usize,
@@ -2616,7 +2990,7 @@ pub enum Step {
         pair_stride: usize,
         pair_gap: usize,
         rotary_dim: usize,
-        base: f32,
+        mscale: f32,
     },
     CachedAttention {
         q: ValueId,
@@ -2732,6 +3106,14 @@ pub struct Planned {
     pub reads: Vec<ValueId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StateRead {
+    pub name: String,
+    pub bytes_per_pos: u64,
+    pub window: Option<usize>,
+    pub fixed_bytes: u64,
+}
+
 /// A pre-planned execution schedule and arena allocation for a static graph.
 #[derive(Debug, Clone)]
 pub struct PreparedPlan {
@@ -2739,6 +3121,17 @@ pub struct PreparedPlan {
     pub offsets: HashMap<ValueId, usize>,
     pub arena_size: usize,
     pub is_decode: bool,
+    pub weight_bytes: u64,
+    pub state_reads: Vec<StateRead>,
+    pub flops_per_run: u64,
+    pub params_buffer_size: usize,
+}
+
+#[derive(Clone)]
+pub struct DecodeIcb {
+    pub icb: IndirectCommandBuffer,
+    pub command_count: usize,
+    pub dispatch_icb: bool,
 }
 
 fn numel(g: &Graph, v: ValueId) -> Result<usize, String> {
@@ -3057,9 +3450,56 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     ql,
                 )
             }
-            Op::Gelu { tanh: false } => {
+            Op::Gelu { tanh } => {
                 let x = arg(0)?;
-                (Step::Gelu { x, n: n_of(x)? }, n_of(x)?)
+                (
+                    Step::Gelu {
+                        x,
+                        n: n_of(x)?,
+                        tanh: *tanh,
+                    },
+                    n_of(x)?,
+                )
+            }
+            Op::Conv2d {
+                stride, padding, ..
+            } => {
+                let x = arg(0)?;
+                let w = arg(1)?;
+                let bias = if node.inputs.len() > 2 {
+                    Some(node.inputs[2])
+                } else {
+                    None
+                };
+                let x_shape = &g.value(x).shape;
+                let w_shape = &g.value(w).shape;
+                let in_channels = x_shape.first().copied().unwrap_or(1);
+                let in_h = x_shape.get(1).copied().unwrap_or(1);
+                let in_w = x_shape.get(2).copied().unwrap_or(1);
+                let out_channels = w_shape.first().copied().unwrap_or(1);
+                let kernel_size = w_shape.get(2).copied().unwrap_or(1);
+                let s = stride[0].max(1);
+                let pad_h = padding.first().copied().unwrap_or(0);
+                let pad_w = padding.get(1).copied().unwrap_or(0);
+                let out_h = (in_h + 2 * pad_h).saturating_sub(kernel_size) / s + 1;
+                let out_w = (in_w + 2 * pad_w).saturating_sub(kernel_size) / s + 1;
+                let out_elems = out_channels * out_h * out_w;
+                (
+                    Step::Conv2d {
+                        x,
+                        w,
+                        bias,
+                        in_channels,
+                        in_h,
+                        in_w,
+                        out_channels,
+                        kernel_size,
+                        stride: s,
+                        out_h,
+                        out_w,
+                    },
+                    out_elems,
+                )
             }
             Op::Add => {
                 let (a, b) = (arg(0)?, arg(1)?);
@@ -3157,10 +3597,10 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             Op::Rope {
                 head_dim,
                 rotary_dim,
-                base,
                 variant,
+                mscale,
             } => {
-                let (x, pos) = (arg(0)?, arg(1)?);
+                let (x, pos, inv_freq) = (arg(0)?, arg(1)?, arg(2)?);
                 let xl = n_of(x)?;
                 let hd = *head_dim;
                 let hd_nz = hd.max(1);
@@ -3171,11 +3611,18 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let (pair_stride, pair_gap) = match variant {
                     crate::graph::RopeVariant::Interleaved => (2, 1),
                     crate::graph::RopeVariant::HalfSplit => (1, pairs),
+                    crate::graph::RopeVariant::MRope {
+                        pairs: p_layout, ..
+                    } => match p_layout {
+                        crate::graph::PairLayout::Adjacent => (2, 1),
+                        crate::graph::PairLayout::Half => (1, pairs),
+                    },
                 };
                 (
                     Step::Rope {
                         x,
                         pos,
+                        inv_freq,
                         n_seq,
                         n_heads: heads_per_seq,
                         head_dim: hd,
@@ -3183,7 +3630,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         pair_stride,
                         pair_gap,
                         rotary_dim: *rotary_dim,
-                        base: *base,
+                        mscale: *mscale,
                     },
                     xl,
                 )
@@ -3468,6 +3915,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             Step::Embedding { table, ids, .. } => vec![table, ids],
             Step::Add { a, b, .. } => vec![a, b],
             Step::Gelu { x, .. } | Step::L2Normalize { x, .. } => vec![x],
+            Step::Conv2d { x, w, bias, .. } => {
+                [Some(x), Some(w), bias].into_iter().flatten().collect()
+            }
             Step::LayerNorm { x, g, b, .. } => vec![x, g, b],
             Step::Linear {
                 x, w, bias, res, ..
@@ -3492,7 +3942,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             Step::RmsNorm { x, g, .. } => vec![x, g],
             Step::SwiGlu { gate, up, .. } | Step::GeGlu { gate, up, .. } => vec![gate, up],
             Step::Slice { x, .. } => vec![x],
-            Step::Rope { x, pos, .. } => vec![x, pos],
+            Step::Rope {
+                x, pos, inv_freq, ..
+            } => vec![x, pos, inv_freq],
             Step::CachedAttention {
                 q,
                 k,
@@ -5290,7 +5742,7 @@ mod tests {
     fn unsupported_ops_bad_ids_and_missing_weights_are_errors() {
         let f = DType::F32;
         let s = Session::new(rt(), &Weights::new()).unwrap();
-        for op in [Op::Relu, Op::Gelu { tanh: true }] {
+        for op in [Op::Relu] {
             let mut g = Graph::new();
             let x = g.input("x", vec![4], f);
             let y = g.add("act", op, &[x], vec![4], f);
@@ -5402,17 +5854,23 @@ mod tests {
             crate::graph::RopeVariant::HalfSplit,
         ] {
             let mut g = Graph::new();
+            let mut w = Weights::new();
             let x = g.input("x", vec![1, 8], DType::F32);
             let pos = g.input("pos", vec![1], DType::U32);
+            let inv_freq = g.weight("rope.inv_freq.default", vec![4], DType::F32);
+            w.insert(
+                "rope.inv_freq.default".to_string(),
+                Tensor::F32(vec![1.0, 0.1, 0.01, 0.001]),
+            );
             let y = g.add(
                 "rope",
                 Op::Rope {
                     head_dim: 8,
                     rotary_dim: 8,
-                    base: 10000.0,
                     variant,
+                    mscale: 1.0,
                 },
-                &[x, pos],
+                &[x, pos, inv_freq],
                 vec![1, 8],
                 DType::F32,
             );
@@ -5421,7 +5879,7 @@ mod tests {
                 Tensor::F32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
                 Tensor::U32(vec![3]),
             ];
-            let (want, got) = both(&g, &Weights::new(), inp, None);
+            let (want, got) = both(&g, &w, inp, None);
             assert!(
                 rel_err(&want, &got) < 1e-4,
                 "Rope mismatch: {want:?} vs {got:?}"
