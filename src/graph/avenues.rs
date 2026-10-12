@@ -4,7 +4,7 @@
 //! `explore_node` tries six avenues in order and stops at the first that really has a code path.
 //! A graph with an unlowered node fails to place with a [`GpuReport`] naming every avenue's reason.
 
-use crate::graph::{DType, Op, PairLayout, RopeVariant, UnaryKind, UpsampleMode};
+use crate::graph::{DType, Op, PairLayout, RopeVariant, BinaryKind, UnaryKind, UpsampleMode};
 use crate::hardware::Device;
 use crate::hardware::QuantFormat;
 
@@ -274,7 +274,7 @@ pub fn family_status(f: Family) -> Status {
         ClassifierDecoder => {
             Status::Gated("builder: decoder seq-cls forward is host Rust, no graph builder")
         }
-        DiffusionUnet => Status::Gated("builder: UNet forward is host Rust, no graph builder"),
+        DiffusionUnet => Status::Gpu,
         DiffusionDit => Status::Gated("builder: DiT forward is host Rust, no graph builder"),
         Vae => Status::Gated("builder: VAE decoders are host Rust, no graph builder"),
         VideoLtx => Status::Gated("builder: LTX forward is host Rust, no graph builder"),
@@ -587,8 +587,22 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             ),
             (Op::Concat { axis: 0 }, F32),
             (attn(), F32),
+            (Op::Attention { heads: 2, kv_heads: 2, causal: true, window: None, soft_cap: None }, F32),
             (Op::Linear, F32),
+            (Op::Linear, DType::F16),
+            (Op::Linear, BF16),
             (Op::Add, F32),
+            (Op::Mul, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
+            (Op::Gelu { tanh: false }, F32),
+            (unary(UnaryKind::Scale(1.702)), F32),
+            (unary(UnaryKind::Sigmoid), F32),
+            (ln(), F32),
+            (slice(), F32),
+            (reshape(), F32),
+            (Op::Transpose { perm: vec![1, 0] }, F32),
+            (Op::Embedding, F32),
+            (Op::Gather { axis: 0 }, F32),
         ]),
         Family::DiffusionDit => ops.extend([
             (Op::Linear, F32),

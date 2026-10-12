@@ -258,7 +258,7 @@ impl ClipTextTransformer {
         pad_id: u32,
         projection: Option<&str>,
     ) -> Result<Self, String> {
-        Self::build(t, prefix, act, pad_id, projection, Self::fetch_tokenizer(hub)?)
+        Self::from_parts(t, prefix, act, pad_id, projection, Self::fetch_tokenizer(hub)?)
     }
 
     fn fetch_tokenizer(hub: &HuggingFaceHub) -> Result<Tokenizer, String> {
@@ -283,7 +283,7 @@ impl ClipTextTransformer {
         Ok(tokenizer)
     }
 
-    fn build(
+    pub(crate) fn from_parts(
         t: &Tensors,
         prefix: &str,
         act: Act,
@@ -637,45 +637,12 @@ mod tests {
         assert_eq!(f[76], EOS_ID);
     }
 
-    fn tiny(act: Act, proj: bool) -> ClipTextTransformer {
-        use crate::model::diff_graph::testutil::synth;
-        let (d, inter, vocab) = (128, 256, EOS_ID as usize + 1);
-        let mut s: Vec<(String, Vec<usize>)> = vec![
-            ("text_model.embeddings.token_embedding.weight".into(), vec![vocab, d]),
-            ("text_model.embeddings.position_embedding.weight".into(), vec![SEQ_LEN, d]),
-        ];
-        let mut lin = |p: String, i: usize, o: usize| {
-            s.push((format!("{p}.weight"), vec![o, i]));
-            s.push((format!("{p}.bias"), vec![o]));
-        };
-        for l in 0..2 {
-            let p = format!("text_model.encoder.layers.{l}");
-            for n in ["q_proj", "k_proj", "v_proj", "out_proj"] {
-                lin(format!("{p}.self_attn.{n}"), d, d);
-            }
-            lin(format!("{p}.mlp.fc1"), d, inter);
-            lin(format!("{p}.mlp.fc2"), inter, d);
-        }
-        for n in ["text_model.encoder.layers.0.layer_norm1", "text_model.encoder.layers.0.layer_norm2",
-            "text_model.encoder.layers.1.layer_norm1", "text_model.encoder.layers.1.layer_norm2", "text_model.final_layer_norm"] {
-            s.push((format!("{n}.weight"), vec![d]));
-            s.push((format!("{n}.bias"), vec![d]));
-        }
-        if proj {
-            s.push(("text_projection.weight".into(), vec![96, d]));
-        }
-        let r = synth(&s, 21);
-        let t = Tensors::from_reader(&r).unwrap();
-        let tk = Tokenizer::new(tokenizers::models::bpe::BPE::default());
-        ClipTextTransformer::build(&t, "text_model", act, PAD_ID, proj.then_some("text_projection.weight"), tk).unwrap()
-    }
-
     /// CPU tower vs Metal program, both activations, with and without a projection (f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
         use crate::model::diff_graph::testutil::rel_err;
         for (act, proj) in [(Act::QuickGelu, false), (Act::Gelu, true)] {
-            let clip = tiny(act, proj);
+            let clip = crate::model::diff_fixtures::tiny_clip(act, proj);
             let ids = frame_ids(&[5, 17, 300, 999, 20000], PAD_ID);
             for penult in [true, false] {
                 let (c, g) = (clip.encode_ids_cpu(&ids, penult).unwrap(), clip.encode_ids_gpu(&ids, penult).unwrap());

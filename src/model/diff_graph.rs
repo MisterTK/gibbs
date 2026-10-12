@@ -270,7 +270,20 @@ impl GpuNet {
 /// Whether networks run as Metal programs: the process resolved to a GPU backend (`main` armed the
 /// CPU tripwire). Library use and `--backend cpu` keep the native CPU forward.
 pub fn gpu_mode() -> bool {
-    crate::hardware::cpu_compute::banned()
+    crate::hardware::cpu_compute::banned() || FORCE_GPU.with(|f| f.get())
+}
+
+thread_local! {
+    static FORCE_GPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with Metal dispatch on this thread without arming the process-wide tripwire (pipeline
+/// parity tests that compare against a CPU run in the same process).
+pub fn with_gpu<T>(f: impl FnOnce() -> T) -> T {
+    let prev = FORCE_GPU.with(|c| c.replace(true));
+    let out = f();
+    FORCE_GPU.with(|c| c.set(prev));
+    out
 }
 
 /// The program compiled for the last-seen input shape (one program per resolution; a new
@@ -317,8 +330,7 @@ impl Gb {
 }
 
 /// Synthetic in-memory checkpoints and comparison helpers for CPU-vs-Metal parity tests.
-#[cfg(test)]
-pub(crate) mod testutil {
+pub mod testutil {
     use crate::model::loaders::{TensorMetadata, WeightReader};
     use std::collections::HashMap;
 

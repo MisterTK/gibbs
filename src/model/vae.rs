@@ -627,67 +627,11 @@ mod tests {
         assert_eq!(d("decoder.up.4.block.0.conv1.weight"), None);
     }
 
-    pub(crate) fn tiny_specs(latent: usize) -> Vec<(String, Vec<usize>)> {
-        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
-        let mut conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
-            s.push((format!("first_stage_model.{p}.weight"), vec![o, i, k, k]));
-            s.push((format!("first_stage_model.{p}.bias"), vec![o]));
-        };
-        let norm = |s: &mut Vec<_>, p: &str, c: usize| {
-            s.push((format!("first_stage_model.{p}.weight"), vec![c]));
-            s.push((format!("first_stage_model.{p}.bias"), vec![c]));
-        };
-        fn resnet(s: &mut Vec<(String, Vec<usize>)>, p: &str, i: usize, o: usize) {
-            for (n, c) in [("norm1", i), ("norm2", o)] {
-                s.push((format!("first_stage_model.{p}.{n}.weight"), vec![c]));
-                s.push((format!("first_stage_model.{p}.{n}.bias"), vec![c]));
-            }
-            for (n, ci, co, k) in [("conv1", i, o, 3), ("conv2", o, o, 3)] {
-                s.push((format!("first_stage_model.{p}.{n}.weight"), vec![co, ci, k, k]));
-                s.push((format!("first_stage_model.{p}.{n}.bias"), vec![co]));
-            }
-            if i != o {
-                s.push((format!("first_stage_model.{p}.nin_shortcut.weight"), vec![o, i, 1, 1]));
-                s.push((format!("first_stage_model.{p}.nin_shortcut.bias"), vec![o]));
-            }
-        }
-        let mid = |s: &mut Vec<(String, Vec<usize>)>, p: &str, c: usize| {
-            resnet(s, &format!("{p}.mid.block_1"), c, c);
-            resnet(s, &format!("{p}.mid.block_2"), c, c);
-            s.push((format!("first_stage_model.{p}.mid.attn_1.norm.weight"), vec![c]));
-            s.push((format!("first_stage_model.{p}.mid.attn_1.norm.bias"), vec![c]));
-            for n in ["q", "k", "v", "proj_out"] {
-                s.push((format!("first_stage_model.{p}.mid.attn_1.{n}.weight"), vec![c, c, 1, 1]));
-                s.push((format!("first_stage_model.{p}.mid.attn_1.{n}.bias"), vec![c]));
-            }
-        };
-        // encoder: 32 -> (down) 64; decoder mirrors it with 2 resnets per level.
-        conv(&mut s, "encoder.conv_in", 3, 32, 3);
-        resnet(&mut s, "encoder.down.0.block.0", 32, 32);
-        conv(&mut s, "encoder.down.0.downsample.conv", 32, 32, 3);
-        resnet(&mut s, "encoder.down.1.block.0", 32, 64);
-        mid(&mut s, "encoder", 64);
-        norm(&mut s, "encoder.norm_out", 64);
-        conv(&mut s, "encoder.conv_out", 64, 2 * latent, 3);
-        conv(&mut s, "quant_conv", 2 * latent, 2 * latent, 1);
-        conv(&mut s, "post_quant_conv", latent, latent, 1);
-        conv(&mut s, "decoder.conv_in", latent, 64, 3);
-        mid(&mut s, "decoder", 64);
-        resnet(&mut s, "decoder.up.1.block.0", 64, 64);
-        resnet(&mut s, "decoder.up.1.block.1", 64, 64);
-        conv(&mut s, "decoder.up.1.upsample.conv", 64, 64, 3);
-        resnet(&mut s, "decoder.up.0.block.0", 64, 32);
-        resnet(&mut s, "decoder.up.0.block.1", 32, 32);
-        norm(&mut s, "decoder.norm_out", 32);
-        conv(&mut s, "decoder.conv_out", 32, 3, 3);
-        s
-    }
-
     /// CPU decoder/encoder vs the Metal graph programs on a tiny 2-level VAE (f32 vs f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
         use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
-        let r = synth(&tiny_specs(4), 7);
+        let r = synth(&crate::model::diff_fixtures::vae_specs(4), 7);
         let t = Tensors::from_reader(&r).unwrap();
         let vae = SdVae::from_ldm(&t).unwrap().with_scaling(0.5, 0.1);
         let z = Lcg(3).vec(4 * 6 * 5, 1.0);
