@@ -204,6 +204,24 @@ impl QuantizedLinearLayer {
                     out_features,
                 }
             }
+            QuantFormat::GGUF_Q4_K_M | QuantFormat::GGUF_Q5_K_M | QuantFormat::GGUF_Q6_K => {
+                if in_features % 256 != 0 {
+                    return Err(format!(
+                        "{format:?} needs in_features % 256 == 0, layer '{name}' has {in_features}"
+                    ));
+                }
+                let (bytes, row): (usize, fn(&[f32], &mut [u8])) = match format {
+                    QuantFormat::GGUF_Q4_K_M => (144, quantize_row_q4_k_ref),
+                    QuantFormat::GGUF_Q5_K_M => (176, quantize_row_q5_k_ref),
+                    _ => (210, quantize_row_q6_k_ref),
+                };
+                QuantizedWeight::GgufQuantized {
+                    format,
+                    raw_data: Bytes::from(quantize_k_rows(weights, bytes, row)),
+                    in_features,
+                    out_features,
+                }
+            }
             QuantFormat::FP16 | QuantFormat::BF16 => {
                 let encode = if format == QuantFormat::FP16 {
                     f32_to_f16
@@ -702,234 +720,287 @@ fn k4_scale_min(j: usize, s: &[u8]) -> (f32, f32) {
     }
 }
 
-/// Dequantizes one 144-byte GGUF Q4_K block into 256 values (ggml `dequantize_row_q4_K` order).
-/// Quantizes a row of 256 f32 values into a 144-byte Q4_K block.
-pub fn quantize_row_q4_k_ref(x: &[f32], out: &mut [u8]) {
-    assert_eq!(x.len(), 256);
-    assert_eq!(out.len(), 144);
-
-    let mut mins = [0.0f32; 8];
-    let mut maxs = [0.0f32; 8];
-    for g in 0..8 {
-        let chunk = &x[g * 32..(g + 1) * 32];
-        let mut min_val = chunk[0];
-        let mut max_val = chunk[0];
-        for &v in &chunk[1..] {
-            if v < min_val {
-                min_val = v;
-            }
-            if v > max_val {
-                max_val = v;
-            }
-        }
-        mins[g] = min_val;
-        maxs[g] = max_val;
-    }
-
-    let mut max_scale = 0.0f32;
-    let mut max_min = 0.0f32;
-    for g in 0..8 {
-        let range_step = ((maxs[g] - mins[g]).max(0.0)) / 15.0;
-        if range_step > max_scale {
-            max_scale = range_step;
-        }
-        let abs_min = (-mins[g]).max(0.0);
-        if abs_min > max_min {
-            max_min = abs_min;
-        }
-    }
-
-    let d = max_scale / 63.0;
-    let dmin = max_min / 63.0;
-
-    let d_f16 = f32_to_f16(d);
-    let dmin_f16 = f32_to_f16(dmin);
-    out[0..2].copy_from_slice(&d_f16.to_le_bytes());
-    out[2..4].copy_from_slice(&dmin_f16.to_le_bytes());
-
-    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-    let idmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
-
-    let mut sc = [0u8; 8];
-    let mut m = [0u8; 8];
-    for g in 0..8 {
-        let range_step = ((maxs[g] - mins[g]).max(0.0)) / 15.0;
-        sc[g] = ((range_step * id).round() as u32).min(63) as u8;
-        m[g] = (((-mins[g]).max(0.0) * idmin).round() as u32).min(63) as u8;
-    }
-
-    let (header, qs) = out.split_at_mut(16);
-    let scales = &mut header[4..16];
-    scales.fill(0);
-    for j in 0..4 {
-        scales[j] = (sc[j] & 63) | (((sc[j + 4] >> 4) & 3) << 6);
-        scales[j + 4] = (m[j] & 63) | (((m[j + 4] >> 4) & 3) << 6);
-        scales[j + 8] = (sc[j + 4] & 0x0F) | ((m[j + 4] & 0x0F) << 4);
-    }
-
-    for g in 0..4 {
-        let (sc0, m0) = k4_scale_min(2 * g, scales);
-        let (sc1, m1) = k4_scale_min(2 * g + 1, scales);
-        let d0 = d * sc0;
-        let min0 = dmin * m0;
-        let d1 = d * sc1;
-        let min1 = dmin * m1;
-
-        let id0 = if d0 > 0.0 { 1.0 / d0 } else { 0.0 };
-        let id1 = if d1 > 0.0 { 1.0 / d1 } else { 0.0 };
-
-        for l in 0..32 {
-            let x0 = x[g * 64 + l];
-            let q0 = (((x0 + min0) * id0).round() as i32).clamp(0, 15) as u8;
-            let x1 = x[g * 64 + 32 + l];
-            let q1 = (((x1 + min1) * id1).round() as i32).clamp(0, 15) as u8;
-            qs[g * 32 + l] = q0 | (q1 << 4);
-        }
-    }
+/// ggml `nearest_int`: round to nearest, ties to even, via the 1.5·2²³ magic number.
+#[inline]
+fn nearest_int(x: f32) -> i32 {
+    (((x + 12582912.0).to_bits() as i32) & 0x007f_ffff) - 0x0040_0000
 }
 
-
-/// Quantizes a row of 256 f32 values into a 176-byte Q5_K block.
-pub fn quantize_row_q5_k_ref(x: &[f32], out: &mut [u8]) {
-    assert_eq!(x.len(), 256);
-    assert_eq!(out.len(), 176);
-
-    let mut mins = [0.0f32; 8];
-    let mut maxs = [0.0f32; 8];
-    for g in 0..8 {
-        let chunk = &x[g * 32..(g + 1) * 32];
-        let mut min_val = chunk[0];
-        let mut max_val = chunk[0];
-        for &v in &chunk[1..] {
-            if v < min_val {
-                min_val = v;
+/// ggml `make_qkx2_quants` (n = x.len() ≤ 32): scale and min of the best affine grid `scale·L - min`
+/// with `L ∈ 0..=nmax`, searched over `nstep + 1` candidate inverse scales by weighted squared error.
+fn make_qkx2_quants(
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l: &mut [u8],
+    laux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+) -> (f32, f32) {
+    let n = x.len();
+    let (mut min, mut max) = (x[0], x[0]);
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        min = min.min(x[i]);
+        max = max.max(x[i]);
+        sum_w += weights[i];
+        sum_x += weights[i] * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        l[..n].fill(0);
+        return (0.0, -min);
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+        l[i] = q as u8;
+        let diff = scale * l[i] as f32 + min - x[i];
+        best_error += weights[i] * (diff * diff);
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+            laux[i] = q as u8;
+            let (w, qf) = (weights[i], q as f32);
+            sum_l += w * qf;
+            sum_l2 += w * qf * qf;
+            sum_xl += w * qf * x[i];
+        }
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
             }
-            if v > max_val {
-                max_val = v;
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale * laux[i] as f32 + this_min - x[i];
+                cur_error += weights[i] * (diff * diff);
+            }
+            if cur_error < best_error {
+                l[..n].copy_from_slice(&laux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
             }
         }
-        mins[g] = min_val;
-        maxs[g] = max_val;
     }
-
-    let mut max_scale = 0.0f32;
-    let mut max_min = 0.0f32;
-    for g in 0..8 {
-        let range_step = ((maxs[g] - mins[g]).max(0.0)) / 31.0;
-        if range_step > max_scale {
-            max_scale = range_step;
-        }
-        let abs_min = (-mins[g]).max(0.0);
-        if abs_min > max_min {
-            max_min = abs_min;
-        }
-    }
-
-    let d = max_scale / 63.0;
-    let dmin = max_min / 63.0;
-
-    let d_f16 = f32_to_f16(d);
-    let dmin_f16 = f32_to_f16(dmin);
-    out[0..2].copy_from_slice(&d_f16.to_le_bytes());
-    out[2..4].copy_from_slice(&dmin_f16.to_le_bytes());
-
-    let id = if d > 0.0 { 1.0 / d } else { 0.0 };
-    let idmin = if dmin > 0.0 { 1.0 / dmin } else { 0.0 };
-
-    let mut sc = [0u8; 8];
-    let mut m = [0u8; 8];
-    for g in 0..8 {
-        let range_step = ((maxs[g] - mins[g]).max(0.0)) / 31.0;
-        sc[g] = ((range_step * id).round() as u32).min(63) as u8;
-        m[g] = (((-mins[g]).max(0.0) * idmin).round() as u32).min(63) as u8;
-    }
-
-    let (header, rest) = out.split_at_mut(16);
-    let (qh, qs) = rest.split_at_mut(32);
-    let scales = &mut header[4..16];
-    scales.fill(0);
-    for j in 0..4 {
-        scales[j] = (sc[j] & 63) | (((sc[j + 4] >> 4) & 3) << 6);
-        scales[j + 4] = (m[j] & 63) | (((m[j + 4] >> 4) & 3) << 6);
-        scales[j + 8] = (sc[j + 4] & 0x0F) | ((m[j + 4] & 0x0F) << 4);
-    }
-    qh.fill(0);
-
-    for g in 0..4 {
-        let (sc0, m0) = k4_scale_min(2 * g, scales);
-        let (sc1, m1) = k4_scale_min(2 * g + 1, scales);
-        let d0 = d * sc0;
-        let min0 = dmin * m0;
-        let d1 = d * sc1;
-        let min1 = dmin * m1;
-
-        let id0 = if d0 > 0.0 { 1.0 / d0 } else { 0.0 };
-        let id1 = if d1 > 0.0 { 1.0 / d1 } else { 0.0 };
-
-        for l in 0..32 {
-            let x0 = x[g * 64 + l];
-            let q0 = (((x0 + min0) * id0).round() as i32).clamp(0, 31) as u8;
-            let x1 = x[g * 64 + 32 + l];
-            let q1 = (((x1 + min1) * id1).round() as i32).clamp(0, 31) as u8;
-
-            qs[g * 32 + l] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
-            let h0 = (q0 >> 4) & 1;
-            let h1 = (q1 >> 4) & 1;
-            qh[l] |= (h0 << (2 * g)) | (h1 << (2 * g + 1));
-        }
-    }
+    (scale, -min)
 }
 
-
-/// Quantizes a row of 256 f32 values into a 210-byte Q6_K block.
-pub fn quantize_row_q6_k_ref(x: &[f32], out: &mut [u8]) {
-    assert_eq!(x.len(), 256);
-    assert_eq!(out.len(), 210);
-
-    let mut max_val = 0.0f32;
+/// ggml `make_qx_quants` with `rmse_type = 1` (weights x²) and no importance weights, as Q6_K calls it.
+fn make_qx_quants(nmax: i32, x: &[f32], l: &mut [i8]) -> f32 {
+    let n = x.len();
+    let (mut max, mut amax) = (0.0f32, 0.0f32);
     for &v in x {
-        let a = v.abs();
-        if a > max_val {
-            max_val = a;
+        if v.abs() > amax {
+            amax = v.abs();
+            max = v;
         }
     }
+    if amax < 1e-15 {
+        l[..n].fill(0);
+        return 0.0;
+    }
+    let mut iscale = -(nmax as f32) / max;
+    let (mut sumlx, mut suml2) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+        l[i] = (q + nmax) as i8;
+        let w = x[i] * x[i];
+        sumlx += w * x[i] * q as f32;
+        suml2 += w * q as f32 * q as f32;
+    }
+    let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
+    let mut best = scale * sumlx;
+    for is in -9..=9 {
+        if is == 0 {
+            continue;
+        }
+        iscale = -(nmax as f32 + 0.1 * is as f32) / max;
+        sumlx = 0.0;
+        suml2 = 0.0;
+        for i in 0..n {
+            let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+            let w = x[i] * x[i];
+            sumlx += w * x[i] * q as f32;
+            suml2 += w * q as f32 * q as f32;
+        }
+        if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
+            for i in 0..n {
+                l[i] = (nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1) + nmax) as i8;
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    scale
+}
 
-    let d = max_val / (31.0 * 127.0);
-    out[208..210].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+/// The affine K-quant search shared by Q4_K (`nmax` 15) and Q5_K (31): per 32-element sub-block a
+/// weighted least-squares (scale, min), then 6-bit packing of the eight scales and mins and the
+/// final levels `L`. Returns the packed 12 scale bytes, `d`, `dmin` as f16 bits and the levels.
+fn k_quant_affine(x: &[f32], nmax: i32, rmin: f32, nstep: i32, l: &mut [u8; 256]) -> ([u8; 12], u16, u16) {
+    let (mut scales, mut mins) = ([0.0f32; 8], [0.0f32; 8]);
+    let (mut laux, mut weights) = ([0u8; 32], [0.0f32; 32]);
+    let (mut max_scale, mut max_min) = (0.0f32, 0.0f32);
+    for j in 0..8 {
+        let xs = &x[32 * j..32 * j + 32];
+        let sum_x2: f32 = xs.iter().fold(0.0, |a, &v| a + v * v);
+        let av_x = (sum_x2 / 32.0).sqrt();
+        for (w, &v) in weights.iter_mut().zip(xs) {
+            *w = av_x + v.abs();
+        }
+        let (s, m) = make_qkx2_quants(nmax, xs, &weights, &mut l[32 * j..32 * j + 32], &mut laux, rmin, 0.1, nstep);
+        (scales[j], mins[j]) = (s, m);
+        max_scale = max_scale.max(s);
+        max_min = max_min.max(m);
+    }
+    let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+    let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+    let mut packed = [0u8; 12];
+    for j in 0..8 {
+        let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
+        let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
+        if j < 4 {
+            packed[j] = ls;
+            packed[j + 4] = lm;
+        } else {
+            packed[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+            packed[j - 4] |= (ls >> 4) << 6;
+            packed[j] |= (lm >> 4) << 6;
+        }
+    }
+    let (d16, dmin16) = (f32_to_f16(max_scale / 63.0), f32_to_f16(max_min / 63.0));
+    let (d_f, dmin_f) = (f16_to_f32(d16), f16_to_f32(dmin16));
+    for j in 0..8 {
+        let (sc, m) = k4_scale_min(j, &packed);
+        let d = d_f * sc;
+        if d == 0.0 {
+            continue;
+        }
+        let dm = dmin_f * m;
+        for ii in 0..32 {
+            l[32 * j + ii] = nearest_int((x[32 * j + ii] + dm) / d).clamp(0, nmax) as u8;
+        }
+    }
+    (packed, d16, dmin16)
+}
 
-    let id = if d > 0.0 { 1.0 / (d * 127.0) } else { 0.0 };
-
-    let (ql_all, rest) = out.split_at_mut(128);
-    let (qh_all, rest2) = rest.split_at_mut(64);
-    let (sc_all, _) = rest2.split_at_mut(16);
-    sc_all.fill(127);
-    qh_all.fill(0);
-
-    for n in 0..2 {
-        let x_half = &x[n * 128..(n + 1) * 128];
-        let ql = &mut ql_all[n * 64..(n + 1) * 64];
-        let qh = &mut qh_all[n * 32..(n + 1) * 32];
-
-        for l in 0..32 {
-            let q0 = (((x_half[l] * id).round() as i32) + 32).clamp(0, 63) as u8;
-            let q1 = (((x_half[l + 32] * id).round() as i32) + 32).clamp(0, 63) as u8;
-            let q2 = (((x_half[l + 64] * id).round() as i32) + 32).clamp(0, 63) as u8;
-            let q3 = (((x_half[l + 96] * id).round() as i32) + 32).clamp(0, 63) as u8;
-
-            ql[l] = (q0 & 0x0F) | ((q2 & 0x0F) << 4);
-            ql[l + 32] = (q1 & 0x0F) | ((q3 & 0x0F) << 4);
-
-            let h0 = (q0 >> 4) & 3;
-            let h1 = (q1 >> 4) & 3;
-            let h2 = (q2 >> 4) & 3;
-            let h3 = (q3 >> 4) & 3;
-
-            qh[l] = h0 | (h1 << 2) | (h2 << 4) | (h3 << 6);
+/// ggml `quantize_row_q4_K_ref` for one 256-element row: 144-byte block `d, dmin, scales[12], qs[128]`.
+pub fn quantize_row_q4_k_ref(x: &[f32], out: &mut [u8]) {
+    assert_eq!((x.len(), out.len()), (256, 144));
+    let mut l = [0u8; 256];
+    let (packed, d, dmin) = k_quant_affine(x, 15, -1.0, 20, &mut l);
+    out[0..2].copy_from_slice(&d.to_le_bytes());
+    out[2..4].copy_from_slice(&dmin.to_le_bytes());
+    out[4..16].copy_from_slice(&packed);
+    for (j, q) in out[16..].chunks_exact_mut(32).enumerate() {
+        for i in 0..32 {
+            q[i] = l[64 * j + i] | (l[64 * j + i + 32] << 4);
         }
     }
 }
 
+/// ggml `quantize_row_q5_K_ref` for one 256-element row: 176-byte block `d, dmin, scales[12], qh[32], qs[128]`.
+pub fn quantize_row_q5_k_ref(x: &[f32], out: &mut [u8]) {
+    assert_eq!((x.len(), out.len()), (256, 176));
+    let mut l = [0u8; 256];
+    let (packed, d, dmin) = k_quant_affine(x, 31, -0.5, 15, &mut l);
+    out[0..2].copy_from_slice(&d.to_le_bytes());
+    out[2..4].copy_from_slice(&dmin.to_le_bytes());
+    out[4..16].copy_from_slice(&packed);
+    let (qh, qs) = out[16..].split_at_mut(32);
+    qh.fill(0);
+    let (mut m1, mut m2) = (1u8, 2u8);
+    for (n, ql) in qs.chunks_exact_mut(32).enumerate() {
+        for j in 0..32 {
+            let (mut l1, mut l2) = (l[64 * n + j], l[64 * n + j + 32]);
+            if l1 > 15 {
+                l1 -= 16;
+                qh[j] |= m1;
+            }
+            if l2 > 15 {
+                l2 -= 16;
+                qh[j] |= m2;
+            }
+            ql[j] = l1 | (l2 << 4);
+        }
+        m1 <<= 2;
+        m2 <<= 2;
+    }
+}
 
+/// ggml `quantize_row_q6_K_ref` for one 256-element row: 210-byte block `ql[128], qh[64], scales[16] (i8), d`.
+pub fn quantize_row_q6_k_ref(x: &[f32], out: &mut [u8]) {
+    assert_eq!((x.len(), out.len()), (256, 210));
+    let mut l = [0i8; 256];
+    let mut scales = [0.0f32; 16];
+    let (mut max_scale, mut max_abs_scale) = (0.0f32, 0.0f32);
+    for ib in 0..16 {
+        let s = make_qx_quants(32, &x[16 * ib..16 * ib + 16], &mut l[16 * ib..16 * ib + 16]);
+        scales[ib] = s;
+        if s.abs() > max_abs_scale {
+            max_abs_scale = s.abs();
+            max_scale = s;
+        }
+    }
+    out.fill(0);
+    if max_abs_scale < 1e-15 {
+        return;
+    }
+    let iscale = -128.0 / max_scale;
+    let d16 = f32_to_f16(1.0 / iscale);
+    out[208..210].copy_from_slice(&d16.to_le_bytes());
+    let d_f = f16_to_f32(d16);
+    let mut sc = [0i8; 16];
+    for ib in 0..16 {
+        sc[ib] = nearest_int(iscale * scales[ib]).min(127) as i8;
+        out[192 + ib] = sc[ib] as u8;
+    }
+    for j in 0..16 {
+        let d = d_f * sc[j] as f32;
+        if d == 0.0 {
+            continue;
+        }
+        for ii in 0..16 {
+            l[16 * j + ii] = (nearest_int(x[16 * j + ii] / d).clamp(-32, 31) + 32) as i8;
+        }
+    }
+    let (ql, rest) = out.split_at_mut(128);
+    let qh = &mut rest[..64];
+    for half in 0..2 {
+        let j = 128 * half;
+        for i in 0..32 {
+            let q = |o: usize| l[j + i + o] as u8;
+            ql[64 * half + i] = (q(0) & 0xF) | ((q(64) & 0xF) << 4);
+            ql[64 * half + 32 + i] = (q(32) & 0xF) | ((q(96) & 0xF) << 4);
+            qh[32 * half + i] = (q(0) >> 4) | ((q(32) >> 4) << 2) | ((q(64) >> 4) << 4) | ((q(96) >> 4) << 6);
+        }
+    }
+}
+
+/// Encodes `weights` (row-major, `cols` a multiple of 256) with one of the row encoders above.
+pub fn quantize_k_rows(weights: &[f32], block_bytes: usize, row: fn(&[f32], &mut [u8])) -> Vec<u8> {
+    let mut out = vec![0u8; weights.len() / 256 * block_bytes];
+    for (x, y) in weights.chunks_exact(256).zip(out.chunks_exact_mut(block_bytes)) {
+        row(x, y);
+    }
+    out
+}
+
+/// Dequantizes one 144-byte GGUF Q4_K block into 256 values (ggml `dequantize_row_q4_K` order).
 pub fn dequantize_q4_k_block(b: &[u8], y: &mut [f32]) {
     let (d, dmin) = (f16_at(b, 0), f16_at(b, 2));
     let (scales, qs) = (&b[4..16], &b[16..144]);
@@ -1318,20 +1389,22 @@ fn fused_gemv_gguf_blocks(
     }
 }
 
-/// Quantize an f32 weight slice into GGUF Q4_0 format (18 bytes per 32 elements).
+/// Quantize an f32 weight slice into GGUF Q4_0 format (18 bytes per 32 elements), as ggml's
+/// `quantize_row_q4_0_ref`: `d = max/-8` for the signed element of largest magnitude, so
+/// re-encoding a dequantized Q4_0 block reproduces it.
 pub fn quantize_f32_to_q4_0(weights: &[f32]) -> Vec<u8> {
     let num_blocks = (weights.len() + 31) / 32;
     let mut out = Vec::with_capacity(num_blocks * 18);
     for chunk in weights.chunks(32) {
-        let mut max_abs = 0.0f32;
+        let (mut amax, mut max) = (0.0f32, 0.0f32);
         for &w in chunk {
-            let a = w.abs();
-            if a > max_abs {
-                max_abs = a;
+            if amax < w.abs() {
+                amax = w.abs();
+                max = w;
             }
         }
-        let d = max_abs / 7.0;
-        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let d = max / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         let d_f16 = crate::model::f32_to_f16(d);
         out.extend_from_slice(&d_f16.to_le_bytes());
 
@@ -1343,8 +1416,8 @@ pub fn quantize_f32_to_q4_0(weights: &[f32]) -> Vec<u8> {
             } else {
                 0.0
             };
-            let q0 = ((w0 * id).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
-            let q1 = ((w1 * id).round().clamp(-8.0, 7.0) as i8 + 8) as u8;
+            let q0 = ((w0 * id + 8.5) as i8).min(15) as u8;
+            let q1 = ((w1 * id + 8.5) as i8).min(15) as u8;
             nibbles[i] = (q0 & 0x0F) | ((q1 & 0x0F) << 4);
         }
         out.extend_from_slice(&nibbles);
@@ -2092,71 +2165,82 @@ pub fn dot_product_4rows_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
-#[test]
-fn test_q4_k_quantize_dequantize_roundtrip() {
-    let mut x = [0.0f32; 256];
-    for (i, v) in x.iter_mut().enumerate() {
-        *v = (i as f32 * 0.1).sin() * 2.5;
-    }
-    let mut block = [0u8; 144];
-    quantize_row_q4_k_ref(&x, &mut block);
-
-    let mut y = [0.0f32; 256];
-    dequantize_q4_k_block(&block, &mut y);
-
-    let mut rmse = 0.0f32;
-    for i in 0..256 {
-        let diff = x[i] - y[i];
-        rmse += diff * diff;
-    }
-    rmse = (rmse / 256.0).sqrt();
-    assert!(rmse < 0.2, "Q4_K roundtrip RMSE too high: {rmse}");
-}
-
-#[test]
-fn test_q6_k_quantize_dequantize_roundtrip() {
-    let mut x = [0.0f32; 256];
-    for (i, v) in x.iter_mut().enumerate() {
-        *v = (i as f32 * 0.1).sin() * 2.5;
-    }
-    let mut block = [0u8; 210];
-    quantize_row_q6_k_ref(&x, &mut block);
-
-    let mut y = [0.0f32; 256];
-    dequantize_q6_k_block(&block, &mut y);
-
-    let mut rmse = 0.0f32;
-    for i in 0..256 {
-        let diff = x[i] - y[i];
-        rmse += diff * diff;
-    }
-    rmse = (rmse / 256.0).sqrt();
-    assert!(rmse < 0.1, "Q6_K roundtrip RMSE too high: {rmse}");
-}
-
-#[test]
-fn test_q5_k_quantize_dequantize_roundtrip() {
-    let mut x = [0.0f32; 256];
-    for (i, v) in x.iter_mut().enumerate() {
-        *v = (i as f32 * 0.1).sin() * 2.5;
-    }
-    let mut block = [0u8; 176];
-    quantize_row_q5_k_ref(&x, &mut block);
-
-    let mut y = [0.0f32; 256];
-    dequantize_q5_k_block(&block, &mut y);
-
-    let mut rmse = 0.0f32;
-    for i in 0..256 {
-        let diff = x[i] - y[i];
-        rmse += diff * diff;
-    }
-    rmse = (rmse / 256.0).sqrt();
-    assert!(rmse < 0.15, "Q5_K roundtrip RMSE too high: {rmse}");
-}
-
     use crate::hardware::QuantFormat;
 
+    /// Deterministic bell-shaped weights with per-block scale and an outlier every fourth block;
+    /// the same generator (and f32 operation order) as `/tmp/ggml_ref/gold.c`, which ran ggml's own
+    /// `quantize_row_*_ref` / `dequantize_row_*` (llama.cpp master, `-ffp-contract=off`).
+    fn golden_input(seed: u64) -> Vec<f32> {
+        let mut st = seed;
+        let mut u = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as u32) as f32 / 2147483648.0
+        };
+        let mut x = vec![0.0f32; 16384];
+        for (i, v) in x.iter_mut().enumerate() {
+            let (a, b, c, d) = (u(), u(), u(), u());
+            *v = (a + b + c + d - 2.0) * (0.05 * (1 + (i / 256) % 5) as f32);
+        }
+        for b in (0..x.len() / 256).step_by(4) {
+            x[b * 256 + 7] *= 9.0;
+        }
+        x
+    }
+
+    fn fnv1a64(b: &[u8]) -> u64 {
+        b.iter()
+            .fold(0xcbf29ce484222325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100000001b3))
+    }
+
+    /// Encoders reproduce ggml byte-for-byte (hash of all blocks) and so have ggml's exact RMSE.
+    #[test]
+    fn encoders_match_ggml_reference() {
+        // (seed, format, ggml hash, ggml RMSE vs the f32 input)
+        let golden: [(u64, QuantFormat, u64, f64); 10] = [
+            (1, QuantFormat::GGUF_Q4_K_M, 0x7c024b97d3740200, 0.006986602),
+            (1, QuantFormat::GGUF_Q5_K_M, 0x4a8d702cff5d76af, 0.003506242),
+            (1, QuantFormat::GGUF_Q6_K, 0xd15767a0257f0055, 0.001763364),
+            (1, QuantFormat::GGUF_Q8_0, 0x5794e6f1110df100, 0.000538608),
+            (1, QuantFormat::GGUF_Q4_0, 0xbfd1f7415032602d, 0.008640246),
+            (2, QuantFormat::GGUF_Q4_K_M, 0x8e7b0735b1b75668, 0.007383891),
+            (2, QuantFormat::GGUF_Q5_K_M, 0x633fa05533db0eee, 0.003749277),
+            (2, QuantFormat::GGUF_Q6_K, 0x7467d429f40c107c, 0.001980719),
+            (2, QuantFormat::GGUF_Q8_0, 0x727585e87d113474, 0.000621894),
+            (2, QuantFormat::GGUF_Q4_0, 0x1cdb4f9057e69f39, 0.009815987),
+        ];
+        for (seed, format, hash, rmse_ref) in golden {
+            let x = golden_input(seed);
+            let layer = QuantizedLinearLayer::from_f32("t", 256, x.len() / 256, &x, format).unwrap();
+            let QuantizedWeight::GgufQuantized { raw_data, .. } = &layer.weight else {
+                panic!("{format:?} did not encode");
+            };
+            assert_eq!(fnv1a64(raw_data), hash, "{format:?} seed {seed}: bytes differ from ggml");
+            let y = dequantize_gguf_blocks(format, raw_data).unwrap();
+            let sq: f64 = x.iter().zip(&y).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum();
+            let rmse = (sq / x.len() as f64).sqrt();
+            assert!(
+                (rmse - rmse_ref).abs() < 1e-8,
+                "{format:?} seed {seed}: RMSE {rmse:.9} vs ggml {rmse_ref:.9}"
+            );
+        }
+    }
+
+    /// A Q4_0 block's own dequantized values re-encode to the same bytes (what makes "native" Q4_0
+    /// lossless when a loader has to dequantize first).
+    #[test]
+    fn q4_0_and_q8_0_requantize_is_idempotent() {
+        let x = golden_input(3);
+        for (format, enc) in [
+            (QuantFormat::GGUF_Q4_0, quantize_f32_to_q4_0 as fn(&[f32]) -> Vec<u8>),
+            (QuantFormat::GGUF_Q8_0, quantize_f32_to_q8_0),
+        ] {
+            let once = enc(&x);
+            let twice = enc(&dequantize_gguf_blocks(format, &once).unwrap());
+            assert_eq!(once, twice, "{format:?}");
+        }
+    }
     #[test]
     fn test_uncompressed_forward_with_bias() {
         // 2 out_features x 3 in_features

@@ -258,6 +258,66 @@ fn apply_generation_json(tok: &mut Tokenizer, json: &[u8]) {
     };
 }
 
+/// A checkpoint opened once so several [`GraphLm`]s (the source format and re-encoded variants) can
+/// be built from the same bytes.
+pub struct LmSource {
+    cfg: GraphLmConfig,
+    tokenizer: Tokenizer,
+    label: String,
+    body: LmBody,
+}
+
+enum LmBody {
+    Checkpoint {
+        manifest: crate::model::ModelManifest,
+        data: crate::model::loaders::gguf::GgufData,
+        gguf: bool,
+    },
+    /// Synthetic and ONNX models arrive built; there are no checkpoint tensors to carry.
+    Built(GraphLm),
+}
+
+impl LmSource {
+    /// The checkpoint's tensor index, `None` for synthetic and ONNX models.
+    pub fn manifest(&self) -> Option<&crate::model::ModelManifest> {
+        match &self.body {
+            LmBody::Checkpoint { manifest, .. } => Some(manifest),
+            LmBody::Built(_) => None,
+        }
+    }
+
+    /// Builds a model, passing every projection through `enc` when given.
+    pub fn build(
+        &self,
+        enc: Option<&dyn crate::model::graph_lm::ProjectionEncoder>,
+    ) -> Result<GraphLm, String> {
+        let mut llm = match &self.body {
+            LmBody::Checkpoint { manifest, data, gguf } => {
+                let cfg = if *gguf {
+                    GraphLmConfig::from_gguf(manifest, self.cfg.clone())
+                } else {
+                    self.cfg.clone()
+                };
+                GraphLm::from_manifest_with(cfg, manifest, data, enc)
+                    .map_err(|e| format!("Failed to load {}: {e}", self.label))?
+            }
+            LmBody::Built(m) => {
+                let mut m = m.clone();
+                if let Some(e) = enc {
+                    m.encode_projections(e);
+                }
+                m
+            }
+        };
+        llm.set_tokenizer(self.tokenizer.clone());
+        // Constructors already encode the weights in `cfg.quant_mode`; re-encoding would compound error.
+        if llm.current_quant_mode() != self.cfg.quant_mode {
+            llm.quantize(self.cfg.quant_mode);
+        }
+        Ok(llm)
+    }
+}
+
 /// Loads an autoregressive LM from resolved artifacts, with the tokenizer that belongs to its weights.
 /// Real repositories must provide weights and a tokenizer; only synthetic ids
 /// (see [`crate::model::hub::is_synthetic_model_id`]) may run random-initialized weights.
@@ -265,6 +325,14 @@ pub fn load_causal_lm(
     artifacts: &crate::model::hub::ModelArtifacts,
     quant_mode: crate::hardware::QuantMode,
 ) -> Result<GraphLm, String> {
+    open_causal_lm(artifacts, quant_mode)?.build(None)
+}
+
+/// Opens the checkpoint of `artifacts` without building a model.
+pub fn open_causal_lm(
+    artifacts: &crate::model::hub::ModelArtifacts,
+    quant_mode: crate::hardware::QuantMode,
+) -> Result<LmSource, String> {
     let id = artifacts.model_id.as_str();
     let preset = ["gibbs/", "foundry/"]
         .iter()
@@ -294,10 +362,10 @@ pub fn load_causal_lm(
         .map(load_json_tokenizer)
         .transpose()?;
 
-    let (mut llm, tokenizer) = match artifacts.weights_path.as_deref() {
+    use crate::model::loaders::gguf::GgufData;
+    let (body, tokenizer, label) = match artifacts.weights_path.as_deref() {
         Some(p) => {
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let mut gguf_bytes = None;
 
             // Sniff magic bytes before extension matching (legacy GGML models are often *.bin).
             let mut magic = [0u8; 8];
@@ -322,67 +390,61 @@ pub fn load_causal_lm(
                 false
             };
             let is_gguf = magic.starts_with(b"GGUF");
+            let fail = |e: String| format!("Failed to load {}: {e}", p.display());
 
-            let loaded = if is_gguf || ext == "gguf" {
-                crate::model::loaders::gguf::open(p).and_then(|(manifest, data)| {
-                    let llm = GraphLm::from_manifest(
-                        GraphLmConfig::from_gguf(&manifest, cfg),
-                        &manifest,
-                        &data,
-                    );
-                    gguf_bytes = Some(data);
-                    llm
-                })
+            // (checkpoint body, bytes the GGUF tokenizer lives in)
+            let (body, gguf_tok) = if is_gguf || ext == "gguf" {
+                let (manifest, data) = crate::model::loaders::gguf::open(p).map_err(fail)?;
+                (LmBody::Checkpoint { manifest, data, gguf: true }, true)
             } else if is_ggml || matches!(ext, "ggml" | "ggmf" | "ggjt") {
-                crate::model::loaders::ggml::open(p).and_then(|(manifest, data)| {
-                    let llm = GraphLm::from_manifest(
-                        GraphLmConfig::from_gguf(&manifest, cfg),
-                        &manifest,
-                        &data,
-                    );
-                    gguf_bytes = Some(crate::model::loaders::gguf::GgufData::Buf(data));
-                    llm
-                })
+                let (manifest, data) = crate::model::loaders::ggml::open(p).map_err(fail)?;
+                (LmBody::Checkpoint { manifest, data: GgufData::Buf(data), gguf: true }, true)
             } else {
                 match ext {
                     // safetensors / PyTorch / Flax / NumPy file or a sharded `<file>.index.json`; quant scheme vetted first.
                     "safetensors" | "json" | "bin" | "pt" | "pth" | "ckpt" | "msgpack" | "npz"
-                    | "npy" => crate::model::prequant::check(
-                        artifacts.config_path.as_deref(),
-                        p.parent().unwrap_or(Path::new(".")),
-                    )
-                    .and_then(|()| crate::model::loaders::read_checkpoint(p))
-                    .and_then(|(mut manifest, data)| {
+                    | "npy" => {
+                        crate::model::prequant::check(
+                            artifacts.config_path.as_deref(),
+                            p.parent().unwrap_or(Path::new(".")),
+                        )
+                        .map_err(fail)?;
+                        let (mut manifest, data) =
+                            crate::model::loaders::read_checkpoint(p).map_err(fail)?;
                         crate::model::prequant::annotate(
                             &mut manifest,
                             artifacts.config_path.as_deref(),
-                        )?;
-                        GraphLm::from_manifest(cfg, &manifest, &data)
-                    }),
-                    "onnx" => crate::model::loaders::onnx::load_causal_lm(cfg, p),
-                    other => Err(format!("unsupported weight format '.{other}'")),
+                        )
+                        .map_err(fail)?;
+                        (LmBody::Checkpoint { manifest, data: GgufData::Buf(data), gguf: false }, false)
+                    }
+                    "onnx" => (
+                        LmBody::Built(
+                            crate::model::loaders::onnx::load_causal_lm(cfg.clone(), p).map_err(fail)?,
+                        ),
+                        false,
+                    ),
+                    other => return Err(fail(format!("unsupported weight format '.{other}'"))),
                 }
-            }
-            .map_err(|e| format!("Failed to load {}: {e}", p.display()))?;
-            let tok = match (json_tokenizer, gguf_bytes) {
+            };
+            let tok = match (json_tokenizer, &body) {
                 (Some(t), _) => t,
-                (None, Some(bytes)) => UniversalModelLoader::extract_gguf_tokenizer(&bytes)
-                    .map_err(|e| {
+                (None, LmBody::Checkpoint { data, .. }) if gguf_tok => {
+                    UniversalModelLoader::extract_gguf_tokenizer(data).map_err(|e| {
                         format!(
                             "{}: no tokenizer.json and GGUF tokenizer unreadable: {e}",
                             p.display()
                         )
-                    })?,
-                (None, None) => {
-                    return Err(format!("Model '{id}': weights found but no tokenizer.json"))
+                    })?
                 }
+                (None, _) => return Err(format!("Model '{id}': weights found but no tokenizer.json")),
             };
-            (loaded, tok)
+            (body, tok, p.display().to_string())
         }
         None if crate::model::hub::is_synthetic_model_id(id) => {
-            let llm = GraphLm::new(cfg);
+            let llm = GraphLm::new(cfg.clone());
             let tok = json_tokenizer.unwrap_or_else(|| llm.tokenizer.clone());
-            (llm, tok)
+            (LmBody::Built(llm), tok, id.to_string())
         }
         None => {
             return Err(format!(
@@ -390,12 +452,7 @@ pub fn load_causal_lm(
             ))
         }
     };
-    llm.set_tokenizer(tokenizer);
-    // Constructors already encode the weights in `cfg.quant_mode`; re-encoding would compound error.
-    if llm.current_quant_mode() != quant_mode {
-        llm.quantize(quant_mode);
-    }
-    Ok(llm)
+    Ok(LmSource { cfg, tokenizer, label, body })
 }
 
 fn default_hidden() -> usize {
