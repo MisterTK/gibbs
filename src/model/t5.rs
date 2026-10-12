@@ -9,6 +9,8 @@
 //!
 //! Reference: transformers `models/t5/modeling_t5.py` and `models/umt5/modeling_umt5.py`.
 
+use crate::graph::{DType, Graph, Op, Tensor, ValueId};
+use crate::model::encdec_gpu::{self as eg, Bag, Dims, EncDec, Sig};
 use crate::model::flux::{Store, Wt};
 use crate::model::hub::ModelArtifacts;
 use crate::model::native::{MediaInput, NativeLm, SeqState};
@@ -223,7 +225,7 @@ enum Act {
     GeluTanh,
     Silu,
 }
-
+#[derive(Clone, Copy)]
 struct Cfg {
     vocab: usize,
     d_model: usize,
@@ -573,9 +575,12 @@ struct T5 {
     eos: u32,
     ctx: usize,
     summary: String,
+    /// The Metal encoder/decoder programs; `Some` on a GPU backend, whose weights moved into it
+    /// (the CPU fields above are then hollow). `None` runs the native CPU forward.
+    gpu: Option<EncDec>,
 }
 
-/// One sequence: the encoder output projected to every decoder layer's cross K/V, and the
+/// One CPU sequence: the encoder output projected to every decoder layer's cross K/V, and the
 /// decoder self-attention cache.
 struct Seq {
     n_enc: usize,
@@ -584,13 +589,17 @@ struct Seq {
     len: usize,
 }
 
-/// Loads a `t5` / `mt5` / `umt5` checkpoint (`config.json` already parsed as `cfg`).
+/// Loads a `t5` / `mt5` / `umt5` checkpoint (`config.json` already parsed as `cfg`): the Metal
+/// programs unless the backend is the explicit CPU opt-in.
 pub fn load(
     artifacts: &ModelArtifacts,
     cfg: &Value,
-    _mode: impl Into<crate::hardware::PlacementMode>,
+    mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::T5)?;
+    let backend = crate::graph::avenues::resolved_backend(mode.into());
+    if !matches!(backend, crate::hardware::Device::Cpu | crate::hardware::Device::Metal) {
+        return Err(format!("T5 has no {backend} program; use metal or --backend cpu"));
+    }
     let path = artifacts
         .weights_path
         .as_deref()
@@ -598,7 +607,7 @@ pub fn load(
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.to_string_lossy();
     let c = Cfg::parse(cfg)?;
-    let m = if name.ends_with(".safetensors") || name.ends_with(".safetensors.index.json") {
+    let mut m = if name.ends_with(".safetensors") || name.ends_with(".safetensors.index.json") {
         crate::model::prequant::check(artifacts.config_path.as_deref(), dir)?;
         let w = Weights::open(path)?;
         T5::from_src(&Src::Map(&w, false), c, cfg, dir)?
@@ -612,6 +621,9 @@ pub fn load(
         };
         T5::from_src(&Src::Mem(&m, &data[..]), c, cfg, dir)?
     };
+    if backend == crate::hardware::Device::Metal {
+        m.gpu = Some(m.build_gpu().map_err(|e| format!("T5: {e}"))?);
+    }
     Ok(Arc::new(m))
 }
 
@@ -672,13 +684,307 @@ impl T5 {
             ctx: cfg["n_positions"].as_u64().unwrap_or(512) as usize,
             summary,
             enc,
+            gpu: None,
         })
     }
+
+    /// Moves the weights into the Metal encoder/decoder programs (the CPU fields are left
+    /// hollow: the native forward must not run afterwards).
+    fn build_gpu(&mut self) -> Result<EncDec, String> {
+        let c = self.enc.c;
+        let tied = self.head.is_none();
+        let mut bag = Bag::default();
+        // Embedding takes an f32 table; a bf16 one is widened here, and a tied bf16 head keeps the
+        // bf16 matrix as its own weight.
+        let head = match (&mut self.head, &mut self.enc.embed) {
+            (Some(h), _) => {
+                put_lin(&mut bag, "lm_head", h)?;
+                "lm_head"
+            }
+            (None, Lin::F32 { .. }) => "embed",
+            (None, Lin::Bf16(m)) => {
+                bag.add("lm_head", vec![m.rows, m.cols], DType::BF16, Tensor::Mat(m.clone()));
+                "lm_head"
+            }
+            (None, Lin::Gguf(_)) => return Err("GGUF matrices have no Metal program".into()),
+        };
+        match &mut self.enc.embed {
+            Lin::F32 { w, rows, cols } => {
+                bag.add("embed", vec![*rows, *cols], DType::F32, Tensor::F32(std::mem::take(w)))
+            }
+            Lin::Bf16(m) => bag.add("embed", vec![m.rows, m.cols], DType::F32, Tensor::F32(m.to_f32())),
+            Lin::Gguf(_) => return Err("GGUF matrices have no Metal program".into()),
+        }
+        for (i, b) in self.enc.stack.blocks.iter_mut().enumerate() {
+            put_block(&mut bag, &format!("enc.{i}"), b)?;
+        }
+        put_vec(&mut bag, "enc.final_ln", &mut self.enc.stack.final_norm);
+        for (i, b) in self.dec.blocks.iter_mut().enumerate() {
+            put_block(&mut bag, &format!("dec.{i}"), b)?;
+        }
+        put_vec(&mut bag, "dec.final_ln", &mut self.dec.final_norm);
+        let dims = Dims {
+            layers: c.dec_layers,
+            inner: c.inner(),
+            enc_cap: self.ctx,
+            self_cap: self.ctx,
+            row_offset: None,
+            self_mask: true,
+        };
+        bag.add("kpos", vec![dims.self_cap], DType::U32, Tensor::U32((0..dims.self_cap as u32).collect()));
+        let sig = bag.sig();
+        let enc_rel: Vec<bool> = self.enc.stack.blocks.iter().map(|b| b.rel.is_some()).collect();
+        let dec_rel: Vec<bool> = self.dec.blocks.iter().map(|b| b.rel.is_some()).collect();
+        let dec = decoder_graph(&c, &sig, &dec_rel, &dims, head, tied);
+        let build_enc = Box::new(move |n| encoder_graph(&c, &sig, &enc_rel, n));
+        EncDec::new(dims, bag, build_enc, dec)
+    }
+}
+
+fn put_lin(bag: &mut Bag, name: &str, l: &mut Lin) -> Result<(), String> {
+    match l {
+        Lin::Bf16(m) => bag.add(name, vec![m.rows, m.cols], DType::BF16, Tensor::Mat(m.clone())),
+        Lin::F32 { w, rows, cols } => {
+            bag.add(name, vec![*rows, *cols], DType::F32, Tensor::F32(std::mem::take(w)))
+        }
+        Lin::Gguf(_) => return Err("GGUF matrices have no Metal program".into()),
+    }
+    Ok(())
+}
+
+fn put_vec(bag: &mut Bag, name: &str, v: &mut Vec<f32>) {
+    let n = v.len();
+    bag.add(name, vec![n], DType::F32, Tensor::F32(std::mem::take(v)));
+}
+
+/// `{p}.ln1/q/k/v/o`, `.rel` (own bias table), `.xln/xq/xk/xv/xo` (decoder), `.ln2/wi/wi1/wo`.
+fn put_block(bag: &mut Bag, p: &str, b: &mut Block) -> Result<(), String> {
+    let attn = |bag: &mut Bag, a: &mut Attn, ln: &str, q: &str, k: &str, v: &str, o: &str| {
+        put_vec(bag, &format!("{p}.{ln}"), &mut a.norm);
+        for (n, l) in [(q, &mut a.q), (k, &mut a.k), (v, &mut a.v), (o, &mut a.o)] {
+            put_lin(bag, &format!("{p}.{n}"), l)?;
+        }
+        Ok::<(), String>(())
+    };
+    attn(bag, &mut b.attn, "ln1", "q", "k", "v", "o")?;
+    if let Some(x) = &mut b.cross {
+        attn(bag, x, "xln", "xq", "xk", "xv", "xo")?;
+    }
+    if let Some(rel) = &mut b.rel {
+        let n = rel.len();
+        bag.add(&format!("{p}.rel"), vec![n], DType::F32, Tensor::F32(std::mem::take(rel)));
+    }
+    put_vec(bag, &format!("{p}.ln2"), &mut b.ff_norm);
+    put_lin(bag, &format!("{p}.wi"), &mut b.wi)?;
+    if let Some(w) = &mut b.wi1 {
+        put_lin(bag, &format!("{p}.wi1"), w)?;
+    }
+    put_lin(bag, &format!("{p}.wo"), &mut b.wo)
+}
+
+fn rms(g: &mut Graph, sig: &Sig, c: &Cfg, name: String, x: ValueId, ln: &str, n: usize) -> ValueId {
+    let w = sig.w(g, ln);
+    eg::node(g, name, Op::RmsNorm { eps: c.eps }, &[x, w], &[n, c.d_model])
+}
+
+fn lin(g: &mut Graph, sig: &Sig, name: &str, x: ValueId, n: usize) -> ValueId {
+    let w = sig.w(g, name);
+    let rows = g.value(w).shape[0];
+    eg::node(g, name.to_string(), Op::Linear, &[x, w], &[n, rows])
+}
+
+/// `x + wo(act(wi(norm(x))) [* wi1(norm(x))])` over `n` rows.
+fn ffn(g: &mut Graph, sig: &Sig, c: &Cfg, p: &str, x: ValueId, n: usize) -> ValueId {
+    let h = rms(g, sig, c, format!("{p}.ffn_norm"), x, &format!("{p}.ln2"), n);
+    let a = lin(g, sig, &format!("{p}.wi"), h, n);
+    let shape = [n, c.d_ff];
+    let act = |g: &mut Graph, a| match c.act {
+        Act::Relu => eg::node(g, format!("{p}.act"), Op::Relu, &[a], &shape),
+        Act::Gelu => eg::node(g, format!("{p}.act"), Op::Gelu { tanh: false }, &[a], &shape),
+        Act::GeluTanh => eg::node(g, format!("{p}.act"), Op::Gelu { tanh: true }, &[a], &shape),
+        Act::Silu => eg::node(g, format!("{p}.act"), Op::Silu, &[a], &shape),
+    };
+    let a = if c.gated {
+        let gate = lin(g, sig, &format!("{p}.wi1"), h, n);
+        match c.act {
+            Act::GeluTanh => eg::node(g, format!("{p}.glu"), Op::GeGlu, &[a, gate], &shape),
+            Act::Silu => eg::node(g, format!("{p}.glu"), Op::SwiGlu, &[a, gate], &shape),
+            Act::Relu | Act::Gelu => {
+                let a = act(g, a);
+                eg::node(g, format!("{p}.glu"), Op::Mul, &[a, gate], &shape)
+            }
+        }
+    } else {
+        act(g, a)
+    };
+    let o = lin(g, sig, &format!("{p}.wo"), a, n);
+    eg::node(g, format!("{p}.ffn_res"), Op::Add, &[x, o], &[n, c.d_model])
+}
+
+/// Unscaled attention (T5 folds 1/sqrt(d_kv) into its weights) as `Attention` (which divides by
+/// sqrt(head_dim)) over `q` pre-multiplied by sqrt(head_dim).
+#[allow(clippy::too_many_arguments)]
+fn attention(
+    g: &mut Graph,
+    c: &Cfg,
+    p: &str,
+    q: ValueId,
+    k: ValueId,
+    v: ValueId,
+    bias: ValueId,
+    nq: usize,
+) -> ValueId {
+    let shape = [nq, c.inner()];
+    let qs = eg::scale(g, format!("{p}.qs"), q, (c.d_kv as f32).sqrt(), &shape);
+    let op = Op::Attention {
+        heads: c.heads,
+        kv_heads: c.heads,
+        causal: false,
+        window: None,
+        soft_cap: None,
+    };
+    eg::node(g, format!("{p}.attn"), op, &[qs, k, v, bias], &shape)
+}
+
+/// `[heads, nq, nk]` relative-position bias of block table `table`, plus the `[nk]` key mask.
+#[allow(clippy::too_many_arguments)]
+fn rel_bias(
+    g: &mut Graph,
+    sig: &Sig,
+    c: &Cfg,
+    p: &str,
+    bidirectional: bool,
+    q_pos: ValueId,
+    k_pos: ValueId,
+    mask: ValueId,
+    (nq, nk): (usize, usize),
+) -> ValueId {
+    let table = sig.w(g, &format!("{p}.rel"));
+    let op = Op::RelPosBias {
+        buckets: c.buckets,
+        max_distance: c.max_distance,
+        bidirectional,
+        heads: c.heads,
+    };
+    let shape = [c.heads, nq, nk];
+    let b = eg::node(g, format!("{p}.relbias"), op, &[table, q_pos, k_pos], &shape);
+    eg::node(g, format!("{p}.relmask"), Op::Add, &[b, mask], &shape)
+}
+
+/// Encoder over `n` (padded) source rows: ids, positions `0..n` and a `[n]` key mask in; the
+/// cross K/V projection of every decoder layer (`xk`, `xv`, ...) out.
+fn encoder_graph(c: &Cfg, sig: &Sig, rel: &[bool], n: usize) -> Graph {
+    let d = c.d_model;
+    let mut g = Graph::new();
+    let ids = g.input("ids", vec![n], DType::U32);
+    let pos = g.input("pos", vec![n], DType::U32);
+    let mask = g.input("mask", vec![n], DType::F32);
+    let table = sig.w(&mut g, "embed");
+    let mut x = eg::node(&mut g, "embed", Op::Embedding, &[table, ids], &[n, d]);
+    let mut bias = None;
+    for i in 0..c.layers {
+        let p = format!("enc.{i}");
+        let h = rms(&mut g, sig, c, format!("{p}.attn_norm"), x, &format!("{p}.ln1"), n);
+        let (q, k, v) = (
+            lin(&mut g, sig, &format!("{p}.q"), h, n),
+            lin(&mut g, sig, &format!("{p}.k"), h, n),
+            lin(&mut g, sig, &format!("{p}.v"), h, n),
+        );
+        // Block 0's table serves every block that has none of its own.
+        if rel[i] {
+            bias = Some(rel_bias(&mut g, sig, c, &p, true, pos, pos, mask, (n, n)));
+        }
+        let a = attention(&mut g, c, &p, q, k, v, bias.expect("set above"), n);
+        let o = lin(&mut g, sig, &format!("{p}.o"), a, n);
+        x = eg::node(&mut g, format!("{p}.attn_res"), Op::Add, &[x, o], &[n, d]);
+        x = ffn(&mut g, sig, c, &p, x, n);
+    }
+    let h = rms(&mut g, sig, c, "enc.final_norm".into(), x, "enc.final_ln", n);
+    for l in 0..c.dec_layers {
+        for kv in ["xk", "xv"] {
+            let out = lin(&mut g, sig, &format!("dec.{l}.{kv}"), h, n);
+            g.output(out);
+        }
+    }
+    g
+}
+
+/// One decoder position: ids `[1]`, position `[1]`, the `[self_cap]` self mask and `[enc_cap]`
+/// cross mask in, logits `[1, vocab]` out. Self-attention writes its K/V into `sk/sv.{l}` with a
+/// `CachedAttention` and scores them (with the relative-position bias, which `CachedAttention`
+/// has no operand for) with an `Attention` over the whole state: the cached op's own output is
+/// dead weight kept alive for its state write.
+// ponytail: the second attention runs over all `self_cap` rows; compile per cap bucket if that
+// bandwidth ever rivals the weights'.
+fn decoder_graph(c: &Cfg, sig: &Sig, rel: &[bool], dims: &Dims, head: &str, tied: bool) -> Graph {
+    let (d, inner, cap) = (c.d_model, c.inner(), dims.self_cap);
+    let mut g = Graph::new();
+    let ids = g.input("ids", vec![1], DType::U32);
+    let pos = g.input("pos", vec![1], DType::U32);
+    let self_mask = g.input("self_mask", vec![cap], DType::F32);
+    let cross_mask = g.input("cross_mask", vec![dims.enc_cap], DType::F32);
+    let kpos = sig.w(&mut g, "kpos");
+    let table = sig.w(&mut g, "embed");
+    let mut x = eg::node(&mut g, "embed", Op::Embedding, &[table, ids], &[1, d]);
+    let mut bias = None;
+    for i in 0..c.dec_layers {
+        let p = format!("dec.{i}");
+        let h = rms(&mut g, sig, c, format!("{p}.attn_norm"), x, &format!("{p}.ln1"), 1);
+        let (q, k, v) = (
+            lin(&mut g, sig, &format!("{p}.q"), h, 1),
+            lin(&mut g, sig, &format!("{p}.k"), h, 1),
+            lin(&mut g, sig, &format!("{p}.v"), h, 1),
+        );
+        let (sk, sv) = eg::self_states(&mut g, i, dims);
+        let write = Op::CachedAttention {
+            heads: c.heads,
+            kv_heads: c.heads,
+            head_dim: c.d_kv,
+            v_head_dim: c.d_kv,
+            scale: 1.0,
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write: true,
+        };
+        eg::node(&mut g, format!("{p}.kv_write"), write, &[q, k, v, sk, sv, pos], &[1, inner]);
+        if rel[i] {
+            bias = Some(rel_bias(&mut g, sig, c, &p, false, pos, kpos, self_mask, (1, cap)));
+        }
+        let a = attention(&mut g, c, &format!("{p}.self"), q, sk, sv, bias.expect("set above"), 1);
+        let o = lin(&mut g, sig, &format!("{p}.o"), a, 1);
+        x = eg::node(&mut g, format!("{p}.attn_res"), Op::Add, &[x, o], &[1, d]);
+
+        let h = rms(&mut g, sig, c, format!("{p}.cross_norm"), x, &format!("{p}.xln"), 1);
+        let q = lin(&mut g, sig, &format!("{p}.xq"), h, 1);
+        let (xk, xv) = eg::cross_states(&mut g, i, dims);
+        let a = attention(&mut g, c, &format!("{p}.cross"), q, xk, xv, cross_mask, 1);
+        let o = lin(&mut g, sig, &format!("{p}.xo"), a, 1);
+        x = eg::node(&mut g, format!("{p}.cross_res"), Op::Add, &[x, o], &[1, d]);
+        x = ffn(&mut g, sig, c, &p, x, 1);
+    }
+    let mut h = rms(&mut g, sig, c, "dec.final_norm".into(), x, "dec.final_ln", 1);
+    if tied {
+        h = eg::scale(&mut g, "tied_scale", h, (d as f32).powf(-0.5), &[1, d]);
+    }
+    let head = lin(&mut g, sig, head, h, 1);
+    g.output(head);
+    g
 }
 
 impl NativeLm for T5 {
     fn backend_label(&self) -> String {
-        crate::scheduler::cpu_backend_label()
+        match &self.gpu {
+            Some(gpu) => gpu.backend_label(),
+            None => crate::scheduler::cpu_backend_label(),
+        }
+    }
+
+    fn device(&self) -> crate::hardware::Device {
+        match self.gpu {
+            Some(_) => crate::hardware::Device::Metal,
+            None => crate::hardware::Device::Cpu,
+        }
     }
 
     fn summary(&self) -> String {
@@ -711,6 +1017,10 @@ impl NativeLm for T5 {
                 "token id {t} is outside the {vocab}-entry vocabulary"
             ));
         }
+        if let Some(gpu) = &self.gpu {
+            return Ok((vec![self.start], Box::new(gpu.start(&ids)?)));
+        }
+        crate::hardware::cpu_compute::enter("t5::prepare");
         let h = self.enc.encode(&ids);
         let n = ids.len();
         let cross = self
@@ -747,6 +1057,29 @@ impl NativeLm for T5 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
+        if let Some(gpu) = &self.gpu {
+            let s = state
+                .downcast_mut::<eg::Seq>()
+                .ok_or("sequence state is not a T5 state")?;
+            if start_pos > s.len {
+                return Err(format!(
+                    "decoder position {start_pos} is past the {} cached",
+                    s.len
+                ));
+            }
+            // Rewinding is a length reset: later rows are masked and overwritten.
+            s.len = start_pos;
+            let vocab = self.enc.embed.rows();
+            if let Some(t) = tokens.iter().find(|&&t| t as usize >= vocab) {
+                return Err(format!("token id {t} is outside the vocabulary"));
+            }
+            let mut logits = Vec::new();
+            for &t in tokens {
+                logits = gpu.step(s, t)?;
+            }
+            return Ok(logits);
+        }
+        crate::hardware::cpu_compute::enter("t5::forward");
         let s = state
             .downcast_mut::<Seq>()
             .ok_or("sequence state is not a T5 state")?;
@@ -801,6 +1134,101 @@ impl NativeLm for T5 {
     }
 }
 
+/// A random T5 (2+2 layers, d_model 32, 4 heads of 8, 8 buckets, 80 positions) for tests and the
+/// GPU fixture; `per_block_rel` gives every block its own bias table (UMT5), `tied` the shared
+/// embedding as head.
+fn tiny(seed: u64, gated: bool, per_block_rel: bool, tied: bool) -> T5 {
+    let c = Cfg {
+        vocab: 40,
+        d_model: 32,
+        d_kv: 8,
+        heads: 4,
+        d_ff: 48,
+        layers: 2,
+        dec_layers: 2,
+        buckets: 8,
+        max_distance: 16,
+        eps: 1e-6,
+        gated,
+        act: if gated { Act::GeluTanh } else { Act::Relu },
+    };
+    let mut r = Rng(seed);
+    let (d, inner) = (c.d_model, c.inner());
+    let attn = |r: &mut Rng| Attn {
+        norm: r.norm(d),
+        q: r.mat(inner, d),
+        k: r.mat(inner, d),
+        v: r.mat(inner, d),
+        o: r.mat(d, inner),
+    };
+    let stack = |r: &mut Rng, decoder: bool, n: usize| {
+        let mut blocks = Vec::new();
+        for i in 0..n {
+            blocks.push(Block {
+                attn: attn(r),
+                rel: (i == 0 || per_block_rel).then(|| r.vec(c.buckets * c.heads, 1.0)),
+                cross: decoder.then(|| attn(r)),
+                ff_norm: r.norm(d),
+                wi: r.mat(c.d_ff, d),
+                wi1: gated.then(|| r.mat(c.d_ff, d)),
+                wo: r.mat(d, c.d_ff),
+            });
+        }
+        Stack { blocks, final_norm: r.norm(d) }
+    };
+    let enc_stack = stack(&mut r, false, c.layers);
+    let dec = stack(&mut r, true, c.dec_layers);
+    let embed = r.mat(c.vocab, d);
+    let head = (!tied).then(|| r.mat(c.vocab, d));
+    T5 {
+        tok: Tokenizer::from_tokens((0..c.vocab).map(|i| format!("t{i}")).collect()),
+        enc: T5Encoder { c, embed, stack: enc_stack },
+        dec,
+        head,
+        start: 0,
+        eos: 1,
+        ctx: 80,
+        summary: "tiny t5".into(),
+        gpu: None,
+    }
+}
+
+/// The fixed LCG of the other tiny fixtures.
+struct Rng(u64);
+
+impl Rng {
+    fn vec(&mut self, n: usize, amp: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((self.0 >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    }
+    fn mat(&mut self, rows: usize, cols: usize) -> Lin {
+        Lin::F32 { w: self.vec(rows * cols, 0.4), rows, cols }
+    }
+    fn norm(&mut self, n: usize) -> Vec<f32> {
+        self.vec(n, 0.3).iter().map(|x| 1.0 + x).collect()
+    }
+}
+
+/// Tiny random T5 on Metal: encoder + prefill + two decode steps; panics unless every node of
+/// every program ran on the GPU (`cpu_node_count() == 0`). The matrix test's `T5` fixture.
+pub fn run_tiny_gpu_fixture() {
+    let mut m = tiny(3, true, false, true);
+    m.gpu = Some(m.build_gpu().expect("tiny T5 compiles on Metal"));
+    let (ids, mut state) = m.prepare(vec![5, 9, 12, 7], &[]).expect("encoder runs on Metal");
+    let mut tok = ids[0];
+    for step in 0..3 {
+        let logits = m.forward(&[tok], step, &mut state).expect("decoder runs on Metal");
+        assert_eq!(logits.len(), 40);
+        assert!(logits.iter().all(|v| v.is_finite()));
+        tok = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
+    }
+    assert_eq!(m.gpu.as_ref().expect("built above").cpu_node_count(), 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +1271,109 @@ mod tests {
             let cos = dot(ra, rb) / (dot(ra, ra) * dot(rb, rb)).sqrt();
             assert!(cos > 0.99, "row cosine {cos}");
         }
+    }
+
+    fn argmax(l: &[f32]) -> u32 {
+        (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32
+    }
+
+    fn rel_err(a: &[f32], b: &[f32]) -> f32 {
+        let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let den: f32 = a.iter().map(|x| x * x).sum();
+        (num / den).sqrt()
+    }
+
+    /// Native CPU forward vs the Metal programs on a tiny random T5, teacher-forced on the CPU's
+    /// greedy tokens: logits agree to f32 rounding at every step, including a rewind.
+    fn parity(gated: bool, per_block_rel: bool, tied: bool, src_len: usize) {
+        parity_with(gated, per_block_rel, tied, src_len, false);
+    }
+
+    /// Rounds every matrix of `m` to bf16 (`Lin::Bf16`), as a bf16 safetensors checkpoint loads.
+    fn to_bf16(m: &mut T5) {
+        fn cv(l: &mut Lin) {
+            if let Lin::F32 { w, rows, cols } = l {
+                let spec = vec![("w".to_string(), vec![*rows, *cols])];
+                let ws = Weights::from_f32(spec, |_| Ok(w.clone())).unwrap();
+                *l = Lin::Bf16(ws.mat("w").unwrap());
+            }
+        }
+        cv(&mut m.enc.embed);
+        if let Some(h) = &mut m.head {
+            cv(h);
+        }
+        let blocks = m.enc.stack.blocks.iter_mut().chain(m.dec.blocks.iter_mut());
+        for b in blocks {
+            for l in [&mut b.attn.q, &mut b.attn.k, &mut b.attn.v, &mut b.attn.o, &mut b.wi, &mut b.wo] {
+                cv(l);
+            }
+            if let Some(x) = &mut b.cross {
+                for l in [&mut x.q, &mut x.k, &mut x.v, &mut x.o] {
+                    cv(l);
+                }
+            }
+            if let Some(l) = &mut b.wi1 {
+                cv(l);
+            }
+        }
+    }
+
+    fn parity_with(gated: bool, per_block_rel: bool, tied: bool, src_len: usize, bf16: bool) {
+        let mut cpu = tiny(7, gated, per_block_rel, tied);
+        let mut gpu = tiny(7, gated, per_block_rel, tied);
+        if bf16 {
+            to_bf16(&mut cpu);
+            to_bf16(&mut gpu);
+        }
+        gpu.gpu = Some(gpu.build_gpu().expect("tiny T5 compiles on Metal"));
+        let src: Vec<u32> = (0..src_len as u32).map(|i| 2 + (i * 7) % 30).collect();
+        let _cpu_ok = crate::hardware::cpu_compute::allow();
+        let (_, mut sc) = cpu.prepare(src.clone(), &[]).unwrap();
+        let (_, mut sg) = gpu.prepare(src, &[]).unwrap();
+        let mut tok = cpu.start;
+        let mut toks = vec![tok];
+        for step in 0..12 {
+            let a = cpu.forward(&[tok], step, &mut sc).unwrap();
+            let b = gpu.forward(&[tok], step, &mut sg).unwrap();
+            let e = rel_err(&a, &b);
+            assert!(e < 1e-3, "step {step}: rel err {e}");
+            eprintln!("t5 tiny (gated {gated}, src {src_len}) step {step}: rel err {e:e}");
+            tok = argmax(&a);
+            toks.push(tok);
+        }
+        // Rewind to position 5 and replay two tokens.
+        let a = cpu.forward(&toks[5..7], 5, &mut sc).unwrap();
+        let b = gpu.forward(&toks[5..7], 5, &mut sg).unwrap();
+        assert!(rel_err(&a, &b) < 1e-3, "rewind: {}", rel_err(&a, &b));
+        assert_eq!(gpu.gpu.as_ref().unwrap().cpu_node_count(), 0);
+    }
+
+    #[test]
+    fn metal_matches_cpu_relu_tied() {
+        parity(false, false, true, 10);
+    }
+
+    #[test]
+    fn metal_matches_cpu_gated_untied_per_block_bias() {
+        parity(true, true, false, 10);
+    }
+
+    /// A source past the 64-row bucket runs the encoder at the model's full length.
+    #[test]
+    fn metal_matches_cpu_long_source() {
+        parity(true, false, true, 70);
+    }
+
+    /// bf16 checkpoints (flan-t5, mT5, MADLAD) run bf16 Linear -> GeGlu and a tied bf16 head; the
+    /// f32 cases above cannot reach those kernels.
+    #[test]
+    fn metal_matches_cpu_bf16_gated() {
+        parity_with(true, false, true, 20, true);
+        parity_with(true, true, false, 20, true);
+    }
+
+    #[test]
+    fn tiny_fixture_runs_on_metal() {
+        run_tiny_gpu_fixture();
     }
 }
