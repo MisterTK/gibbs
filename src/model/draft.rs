@@ -365,3 +365,56 @@ fn run_program(
         _ => Err("the draft program did not return f32 logits".into()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::graph_lm::GraphLmConfig;
+
+    /// A plain draft model on its Metal decode program proposes from the same logits as the host
+    /// forward, through a catch-up after a partial accept (KV rewinds by position).
+    #[test]
+    fn plain_drafter_program_matches_host() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let m = GraphLm::new(GraphLmConfig::smollm_1m());
+        let (g, w) = m.to_decode_graph();
+        let prog = crate::graph::program::GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal))
+            .expect("compile on Metal");
+        let (vocab, ctx) = (m.config.vocab_size, m.config.max_seq_len);
+        let gpu = Plain {
+            label: "gpu".into(),
+            lm: Lm::Program { prog: Arc::new(parking_lot::Mutex::new(prog)), vocab, ctx },
+        };
+        let cpu = Plain { label: "cpu".into(), lm: Lm::GraphLm(m) };
+        let (mut sc, mut sg) = (cpu.new_state(), gpu.new_state());
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        // Random weights give near-flat logits, so the GPU run is fed the host's picks rather than
+        // its own argmax (ties flip under 1e-6 noise); the logits are what is compared.
+        let propose = |d: &Plain, st: &mut DraftState, toks: &[u32], forced: Option<&[u32]>| {
+            let mut seen: Vec<Vec<f32>> = Vec::new();
+            let out = d
+                .propose(st, toks, &[], 3, &mut |l: &[f32]| {
+                    seen.push(l.to_vec());
+                    forced.map_or_else(|| argmax(l), |f| f[seen.len() - 1])
+                })
+                .unwrap();
+            (out, seen)
+        };
+        let mut toks = vec![5u32, 9, 14, 3, 27];
+        let mut worst = 0f32;
+        for _ in 0..3 {
+            let (oc, lc) = propose(&cpu, &mut sc, &toks, None);
+            let (og, lg) = propose(&gpu, &mut sg, &toks, Some(&oc));
+            assert_eq!(oc, og);
+            for (a, b) in lc.iter().zip(&lg) {
+                let scale = a.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+                worst = worst.max(a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs())) / scale);
+            }
+            // Accept the first draft, then a different token than the second.
+            toks.push(oc[0]);
+            toks.push((oc[1] + 1) % vocab as u32);
+        }
+        println!("plain drafter: worst logits rel err {worst:e}");
+        assert!(worst < 1e-3, "{worst}");
+    }
+}
