@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GibbsSettings {
     #[serde(default = "default_reencode")]
     pub reencode: String,
     #[serde(default = "default_variant")]
     pub variant: String,
+    /// Mean-KL limit of the GPU re-encode gate (nats); `None` keeps the policy's own.
+    #[serde(default)]
+    pub reencode_max_kl: Option<f32>,
 }
 
 fn default_reencode() -> String {
@@ -22,6 +25,7 @@ impl Default for GibbsSettings {
         Self {
             reencode: default_reencode(),
             variant: default_variant(),
+            reencode_max_kl: None,
         }
     }
 }
@@ -64,6 +68,7 @@ mod tests {
         let s = GibbsSettings {
             reencode: "low-bit-native".into(),
             variant: "fastest-4bit".into(),
+            reencode_max_kl: Some(0.05),
         };
         let data = serde_json::to_string(&s).unwrap();
         std::fs::write(&path, data).unwrap();

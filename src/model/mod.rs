@@ -81,6 +81,8 @@ pub mod qwen_image21;
 pub mod qwen_image_v1;
 pub mod qwen_vae;
 pub mod qwen_vae21;
+pub mod reencode;
+pub mod repack;
 pub mod sana;
 pub mod sd;
 pub mod sd3;
@@ -647,13 +649,13 @@ impl UniversalModelLoader {
             34 => (QuantFormat::GGUF_TQ1_0, "TQ1_0", 256, 54),
             35 => (QuantFormat::GGUF_TQ2_0, "TQ2_0", 256, 66),
             39 => (QuantFormat::MXFP4, "MXFP4", 32, 17),
+            40 => (QuantFormat::GGUF_NVFP4, "NVFP4", 64, 36),
             t => {
                 let name = match t {
                     9 => "Q8_1",
                     15 => "Q8_K",
                     31..=33 => "Q4_0_x_y (repacked)",
                     36..=38 => "IQ4_NL_x_y (repacked)",
-                    40 => "NVFP4",
                     41 => "Q1_0",
                     42 => "Q2_0",
                     _ => "unknown",
@@ -1563,28 +1565,31 @@ fn read_gguf_string_v(data: &[u8], offset: &mut usize, version: u32) -> Result<S
     Ok(s)
 }
 
-/// Convert f32 to IEEE 754 binary16 (f16 stored in u16).
+/// Convert f32 to IEEE 754 binary16 (f16 stored in u16), rounding to nearest even like ggml's
+/// `GGML_FP32_TO_FP16` (a mantissa carry propagates into the exponent, overflow gives infinity).
 #[inline]
 pub fn f32_to_f16(val: f32) -> u16 {
     let bits = val.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
-    let mant = (bits & 0x007F_FFFF) as u32;
-
-    if exp <= 0 {
+    let abs = bits & 0x7FFF_FFFF;
+    if abs > 0x7F80_0000 {
+        return sign | 0x7E00;
+    }
+    let exp = (abs >> 23) as i32 - 127 + 15;
+    let mant = abs & 0x007F_FFFF;
+    if exp >= 31 {
+        sign | 0x7C00
+    } else if exp <= 0 {
         if exp < -10 {
             return sign;
         }
-        let mant = (mant | 0x0080_0000) >> (1 - exp);
-        sign | ((mant + 0x0000_1000) >> 13) as u16
-    } else if exp >= 31 {
-        if (bits & 0x7FFF_FFFF) > 0x7F80_0000 {
-            sign | 0x7E00
-        } else {
-            sign | 0x7C00
-        }
+        let (mant, shift) = (mant | 0x0080_0000, (14 - exp) as u32);
+        let (r, rem, half) = (mant >> shift, mant & ((1 << shift) - 1), 1u32 << (shift - 1));
+        sign | (r + (rem > half || (rem == half && r & 1 == 1)) as u32) as u16
     } else {
-        sign | ((exp as u16) << 10) | (((mant + 0x0000_1000) >> 13) as u16 & 0x03FF)
+        let r = ((exp as u32) << 10) | (mant >> 13);
+        let rem = mant & 0x1FFF;
+        sign | (r + (rem > 0x1000 || (rem == 0x1000 && r & 1 == 1)) as u32) as u16
     }
 }
 
@@ -1733,6 +1738,24 @@ pub fn f16_to_f32(h: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every finite f16 round-trips, and the exact midpoint between two neighbours rounds to the
+    /// even one (also across an exponent boundary, which used to drop the carry).
+    #[test]
+    fn f32_to_f16_rounds_to_nearest_even() {
+        for h in 0u16..0x7C00 {
+            let v = f16_to_f32(h);
+            assert_eq!(f32_to_f16(v), h, "round trip {h:#06x}");
+            assert_eq!(f32_to_f16(-v), h | 0x8000);
+            if h < 0x7BFF {
+                let mid = (v + f16_to_f32(h + 1)) / 2.0;
+                assert_eq!(f32_to_f16(mid), if h & 1 == 0 { h } else { h + 1 }, "midpoint above {h:#06x}");
+            }
+        }
+        assert_eq!(f32_to_f16(1.99999), 0x4000);
+        assert_eq!(f32_to_f16(65520.0), 0x7C00);
+        assert_eq!(f32_to_f16(f32::NAN) & 0x7C00, 0x7C00);
+    }
 
     fn create_test_safetensors_buffer() -> Vec<u8> {
         // Tensor 1: "weight_f32" -> [1.0, -2.5, 3.25] (3 x f32 = 12 bytes)

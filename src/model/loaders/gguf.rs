@@ -953,4 +953,73 @@ mod tests {
             vec![123456789.0, -987654321.0]
         );
     }
+
+    /// One-tensor GGUF v3 file `t` of ggml type `ty`, dims `ne` (fastest first), payload `raw`.
+    fn typed_gguf(ty: u32, ne: &[u64], raw: &[u8]) -> Vec<u8> {
+        let mut b = b"GGUF".to_vec();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.push(b't');
+        b.extend_from_slice(&(ne.len() as u32).to_le_bytes());
+        for d in ne {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        b.extend_from_slice(raw);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        b
+    }
+
+    /// Both GGUF readers decode `raw` of ggml type `ty` to `want`, and the f32 matrix path does not
+    /// hand the bytes out as a zero-copy slice.
+    fn assert_decodes(ty: u32, ne: &[u64], raw: &[u8], want: &[f32]) {
+        let b = typed_gguf(ty, ne, raw);
+        let loader = crate::model::UniversalModelLoader::from_bytes(&b).unwrap();
+        assert_eq!(loader.manifest.extract_tensor_f32(&b, "t").unwrap(), want, "type {ty}");
+        assert_eq!(GgufWeightReader::new(b.clone()).unwrap().load_tensor("t").unwrap(), want);
+        let q = loader.manifest.extract_tensor_as_quantized(&b, "t", QuantFormat::FP32).unwrap();
+        assert!(!matches!(q, crate::model::layers::QuantizedWeight::ZeroCopySlice { .. }), "type {ty}");
+    }
+
+    #[test]
+    fn gguf_integer_types_decode_to_f32() {
+        let le = |v: &[i64], n: usize| -> Vec<u8> {
+            v.iter().flat_map(|x| x.to_le_bytes()[..n].to_vec()).collect()
+        };
+        let i8s = [-128i64, -1, 0, 127];
+        assert_decodes(24, &[4], &le(&i8s, 1), &i8s.map(|x| x as f32));
+        let i16s = [-32768i64, -2, 300, 32767];
+        assert_decodes(25, &[4], &le(&i16s, 2), &i16s.map(|x| x as f32));
+        let i32s = [i32::MIN as i64, -7, 100_000, i32::MAX as i64];
+        assert_decodes(26, &[2, 2], &le(&i32s, 4), &i32s.map(|x| x as f32));
+        let i64s = [i64::MIN, -(1 << 40), 1 << 40, i64::MAX];
+        assert_decodes(27, &[4], &le(&i64s, 8), &i64s.map(|x| x as f32));
+        let f64s = [-1e300f64, -0.5, 1.0 / 3.0, 1e-300];
+        let raw: Vec<u8> = f64s.iter().flat_map(|x| x.to_le_bytes()).collect();
+        assert_decodes(28, &[4], &raw, &f64s.map(|x| x as f32));
+    }
+
+    /// ggml `dequantize_row_nvfp4`: 4 UE4M3 scale bytes (value * 0.5), nibbles low = 0..8, high = 8..16
+    /// of each 16-element sub-block, doubled E2M1 table.
+    #[test]
+    fn gguf_nvfp4_block_matches_ggml_reference() {
+        // Scales: 0x38 = 1.0 (d 0.5), 0x01 = 2^-9 subnormal (d 2^-10), 0x7F = NaN code (d 0), 0x7E = 448 (d 224).
+        let mut blk = vec![0x38, 0x01, 0x7F, 0x7E];
+        for _ in 0..4 {
+            blk.extend((0..8u8).map(|j| j | ((15 - j) << 4)));
+        }
+        let fp4 = [0., 1., 2., 3., 4., 6., 8., 12., 0., -1., -2., -3., -4., -6., -8., -12.];
+        let mut want = Vec::new();
+        for d in [0.5f32, 2f32.powi(-10), 0.0, 224.0] {
+            want.extend((0..8).map(|j| fp4[j] * d));
+            want.extend((0..8).map(|j| fp4[15 - j] * d));
+        }
+        assert_eq!(deq(QuantFormat::GGUF_NVFP4, &blk), want);
+        // Two blocks (one row of 128) through the container path.
+        assert_decodes(40, &[128], &[blk.clone(), blk].concat(), &[want.clone(), want].concat());
+    }
 }

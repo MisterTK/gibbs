@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::path::Path;
 
 /// Manifest metadata key holding the `quantization` block (JSON) once [`attach`] has run.
-const META: &str = "mlx.quantization";
+pub(crate) const META: &str = "mlx.quantization";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Mode {
@@ -287,13 +287,13 @@ pub(crate) fn attach(m: &mut ModelManifest, weights: &Path) -> Result<(), String
     Ok(())
 }
 
-/// Expands MLX-packed `name` to f32 `[.., in]`; `None` when the manifest isn't MLX or `name`
-/// isn't packed.
-pub(crate) fn dequantize(
-    m: &ModelManifest,
-    data: &[u8],
+/// The MLX-packed matrix `name` (spec, logical shape and tensor bytes); `None` when the manifest
+/// isn't MLX or `name` isn't packed.
+pub(crate) fn packed_tensor<'a>(
+    m: &'a ModelManifest,
+    data: &'a [u8],
     name: &str,
-) -> Result<Option<Vec<f32>>, String> {
+) -> Result<Option<Packed<'a>>, String> {
     let Some(q) = m.metadata.get(META) else {
         return Ok(None);
     };
@@ -302,28 +302,37 @@ pub(crate) fn dequantize(
         return Ok(None);
     };
     let stem = &name[..name.len() - ".weight".len()];
-    let bytes = |t: &VirtualTensor| {
+    let bytes = |t: &'a VirtualTensor| {
         data.get(t.byte_offset..t.byte_offset + t.byte_len)
             .ok_or_else(|| format!("tensor '{}' lies outside the weight buffer", t.name))
     };
-    let part = |s: &str| -> Result<Option<(&[u8], &str)>, String> {
+    let part = |s: &str| -> Result<Option<(&'a [u8], &'a str)>, String> {
         m.tensors
             .get(&format!("{stem}.{s}"))
             .map(|t| Ok((bytes(t)?, t.dtype.as_str())))
             .transpose()
     };
     let cols = *shape.last().unwrap();
-    Packed {
+    Ok(Some(Packed {
         spec,
         rows: shape.iter().product::<usize>() / cols,
         cols,
         w: bytes(&m.tensors[name])?,
         scales: part("scales")?.unwrap(),
         biases: part("biases")?,
-    }
-    .decode()
-    .map(Some)
-    .map_err(|e| format!("{name}: {e}"))
+    }))
+}
+
+/// Expands MLX-packed `name` to f32 `[.., in]`; `None` when the manifest isn't MLX or `name`
+/// isn't packed.
+pub(crate) fn dequantize(
+    m: &ModelManifest,
+    data: &[u8],
+    name: &str,
+) -> Result<Option<Vec<f32>>, String> {
+    packed_tensor(m, data, name)?
+        .map(|p| p.decode().map_err(|e| format!("{name}: {e}")))
+        .transpose()
 }
 
 /// mlx-vlm's name for HF tensor `name` (`model.language_model.*` -> `language_model.model.*`,

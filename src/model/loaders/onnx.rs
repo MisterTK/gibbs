@@ -893,7 +893,7 @@ fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 }
 
 /// bitsandbytes NF4 / FP4 code books (as in onnxruntime's MatMulBnb4).
-const NF4_LUT: [f32; 16] = [
+pub(crate) const NF4_LUT: [f32; 16] = [
     -1.0,
     -0.696_192_8,
     -0.525_073_05,
@@ -911,7 +911,7 @@ const NF4_LUT: [f32; 16] = [
     0.722_956_84,
     1.0,
 ];
-const FP4_LUT: [f32; 16] = [
+pub(crate) const FP4_LUT: [f32; 16] = [
     0.0,
     0.005_208_333,
     0.666_666_7,
