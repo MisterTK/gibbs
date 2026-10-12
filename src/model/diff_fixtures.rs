@@ -190,6 +190,23 @@ pub fn tiny_sd_on_gpu() -> Result<(usize, usize), String> {
     Ok((img.width, img.height))
 }
 
+/// Every non-SD VAE (Qwen-Image, Qwen-Image 2.1, LTX-Video, DC-AE) plus the SD VAE decoded as Metal
+/// programs from tiny synthetic checkpoints; the caller arms the CPU tripwire, so any CPU compute panics.
+pub fn tiny_vae_on_gpu() -> Result<(), String> {
+    crate::model::qwen_vae::fixture::tiny_on_gpu()?;
+    crate::model::qwen_vae21::fixture::tiny_on_gpu()?;
+    crate::model::ltx_vae::fixture::tiny_on_gpu()?;
+    crate::model::dcae::fixture::tiny_on_gpu()?;
+    let r = synth(&vae_specs(4), 7);
+    let vae = SdVae::from_ldm(&Tensors::from_reader(&r)?)?;
+    let (h, w) = (6, 5);
+    let img = vae.decode(&Lcg(3).vec(4 * h * w, 1.0), h, w)?;
+    if img.width != 2 * w || img.height != 2 * h {
+        return Err(format!("sd vae: {}x{} image", img.width, img.height));
+    }
+    Ok(())
+}
+
 /// LDM UNet specs from a config: `mc` model channels, per-level multipliers, `nres` ResBlocks per level,
 /// attention on the levels flagged in `attn`, cross-attention width `ctx`, feed-forward `ff_mult * c`.
 /// (SD 1.5: `mc` 320, mult [1,2,4,4], nres 2, attn [t,t,t,f], ctx 768, ff_mult 4.)
@@ -357,5 +374,15 @@ mod scale_tests {
         let t0 = Instant::now();
         vae.decode_gpu(&z, 64, 64).unwrap();
         eprintln!("VAE decode 512x512 steady {:?}", t0.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod vae_fixture_tests {
+    /// The VAE fixtures run (CPU decode here: the tripwire is not armed in the lib tests; the Metal output
+    /// of each is still checked for finiteness). The armed run lives in `tests/cpu_free_matrix.rs`.
+    #[test]
+    fn tiny_vae_fixtures_run() {
+        super::tiny_vae_on_gpu().unwrap();
     }
 }

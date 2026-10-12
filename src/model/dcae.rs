@@ -604,39 +604,13 @@ impl DcAeDecoder {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// Tiny synthetic f32c8-style decoder (ResBlock + 2 EfficientViT levels, 2 upsamples) for the CPU-free
+/// fixtures and parity tests (shared with `tests/cpu_free_matrix.rs`).
+pub mod fixture {
     use super::*;
+    use crate::model::diff_graph::testutil::{synth, Lcg};
 
-    #[test]
-    fn pixel_shuffle_interleaves_subpixels() {
-        // 4 channels of 1x1 -> one 2x2 channel in (i, j) order.
-        assert_eq!(
-            pixel_shuffle(&[1.0, 2.0, 3.0, 4.0], 1, 1, 1),
-            vec![1.0, 2.0, 3.0, 4.0]
-        );
-        // 4 channels of 1x2: channel (i*2+j) fills rows 2y+i, cols 2x+j.
-        let x = [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0];
-        assert_eq!(
-            pixel_shuffle(&x, 1, 1, 2),
-            vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]
-        );
-    }
-
-    #[test]
-    fn depthwise_matches_dense_conv_on_one_channel() {
-        let x: Vec<f32> = (0..20).map(|i| i as f32 * 0.1).collect();
-        let wt: Vec<f32> = (0..9).map(|i| (i as f32 - 4.0) * 0.3).collect();
-        let want = nn::conv2d(&x, 1, 4, 5, &wt, Some(&[0.5]), 1, 3, 1, 1).0;
-        let got = depthwise(&x, 1, 4, 5, &wt, Some(&[0.5]), 3);
-        assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-5));
-    }
-
-    /// Tiny f32c8-style decoder (ResBlock + 2 EfficientViT levels, 2 upsamples): CPU vs the Metal
-    /// graph program (f32 vs f32: 1e-3), every node on the GPU.
-    #[test]
-    fn gpu_matches_cpu() {
-        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
+    pub fn tiny() -> DcAeDecoder {
         let (chans, hd, latent, ms_k) = ([8usize, 16, 32], 4usize, 8usize, 5usize);
         let cfg = serde_json::json!({
             "decoder_block_out_channels": chans, "decoder_layers_per_block": [1, 1, 1],
@@ -693,7 +667,63 @@ mod tests {
         conv(&mut s, "decoder.conv_out", chans[0], 3, 3, true);
         let r = synth(&s, 41);
         let w = Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap();
-        let dec = DcAeDecoder::open(&w, &cfg).unwrap();
+        DcAeDecoder::open(&w, &cfg).unwrap()
+    }
+
+    /// Public `decode` of the tiny net (Metal when the CPU tripwire is armed) plus a finiteness check of the
+    /// raw Metal output.
+    pub fn tiny_on_gpu() -> Result<(), String> {
+        let dec = tiny();
+        let (h, w) = (2, 3);
+        let z = Lcg(3).vec(dec.latent_channels() * h * w, 1.0);
+        let img = dec.decode(&z, h, w)?;
+        let f = dec.factor();
+        if (img.width, img.height) != (f * w, f * h) {
+            return Err(format!("dcae: {}x{} image", img.width, img.height));
+        }
+        let zs: Vec<f32> = z.iter().map(|v| v / dec.scaling_factor).collect();
+        if dec.decode_gpu(&zs, h, w)?.iter().any(|v| !v.is_finite()) {
+            return Err("dcae: non-finite Metal output".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pixel_shuffle_interleaves_subpixels() {
+        // 4 channels of 1x1 -> one 2x2 channel in (i, j) order.
+        assert_eq!(
+            pixel_shuffle(&[1.0, 2.0, 3.0, 4.0], 1, 1, 1),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        // 4 channels of 1x2: channel (i*2+j) fills rows 2y+i, cols 2x+j.
+        let x = [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0];
+        assert_eq!(
+            pixel_shuffle(&x, 1, 1, 2),
+            vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn depthwise_matches_dense_conv_on_one_channel() {
+        let x: Vec<f32> = (0..20).map(|i| i as f32 * 0.1).collect();
+        let wt: Vec<f32> = (0..9).map(|i| (i as f32 - 4.0) * 0.3).collect();
+        let want = nn::conv2d(&x, 1, 4, 5, &wt, Some(&[0.5]), 1, 3, 1, 1).0;
+        let got = depthwise(&x, 1, 4, 5, &wt, Some(&[0.5]), 3);
+        assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-5));
+    }
+
+    /// Tiny f32c8-style decoder (ResBlock + 2 EfficientViT levels, 2 upsamples): CPU vs the Metal
+    /// graph program (f32 vs f32: 1e-3), every node on the GPU.
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::{rel_err, Lcg};
+        let dec = fixture::tiny();
+        let latent = dec.latent_channels();
         let (h, wd) = (2, 3);
         let z = Lcg(3).vec(latent * h * wd, 1.0);
         let cpu = dec.decode_cpu(&z, h, wd);
