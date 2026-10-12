@@ -890,6 +890,113 @@ impl LtxVae {
     }
 }
 
+/// Tiny synthetic v0.9.0-layout net for the CPU-free fixtures and parity tests (shared with
+/// `tests/cpu_free_matrix.rs`).
+pub mod fixture {
+    use super::*;
+    use crate::model::diff_graph::testutil::Lcg;
+
+    /// Tiny v0.9.0-layout checkpoint (diffusers names): every module kind of the real net, small widths.
+    fn tiny() -> (Cfg, Weights) {
+        use crate::model::diff_graph::testutil::synth;
+        let cfg = Cfg { ch: [4, 8, 16, 16], layers: [2, 1, 1, 1, 2], up: [true, true, true, false], patch: 2, latent: 8 };
+        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
+        let conv = |s: &mut Vec<_>, p: &str, ci: usize, co: usize, k: usize| {
+            s.push((format!("{p}.conv.weight"), vec![co, ci, k, k, k]));
+            s.push((format!("{p}.conv.bias"), vec![co]));
+        };
+        let res = |s: &mut Vec<_>, p: &str, ci: usize, co: usize| {
+            conv(s, &format!("{p}.conv1"), ci, co, 3);
+            conv(s, &format!("{p}.conv2"), co, co, 3);
+            if ci != co {
+                s.push((format!("{p}.norm3.weight"), vec![ci]));
+                s.push((format!("{p}.norm3.bias"), vec![ci]));
+                conv(s, &format!("{p}.conv_shortcut"), ci, co, 1);
+            }
+        };
+        let rev: Vec<usize> = cfg.ch.iter().rev().copied().collect();
+        let l: Vec<usize> = cfg.layers.iter().rev().copied().collect();
+        conv(&mut s, "decoder.conv_in", cfg.latent, rev[0], 3);
+        for j in 0..l[0] {
+            res(&mut s, &format!("decoder.mid_block.resnets.{j}"), rev[0], rev[0]);
+        }
+        let mut cin = rev[0];
+        for i in 0..4 {
+            let cout = rev[i];
+            let b = format!("decoder.up_blocks.{i}");
+            if cin != cout {
+                res(&mut s, &format!("{b}.conv_in"), cin, cout);
+            }
+            if cfg.up[3 - i] {
+                conv(&mut s, &format!("{b}.upsamplers.0.conv"), cout, cout * 8, 3);
+            }
+            for j in 0..l[i + 1] {
+                res(&mut s, &format!("{b}.resnets.{j}"), cout, cout);
+            }
+            cin = cout;
+        }
+        conv(&mut s, "decoder.conv_out", cfg.ch[0], 3 * cfg.patch * cfg.patch, 3);
+        conv(&mut s, "encoder.conv_in", 3 * cfg.patch * cfg.patch, cfg.ch[0], 3);
+        let mut cin = cfg.ch[0];
+        for i in 0..4 {
+            let cout = cfg.ch[(i + 1).min(3)];
+            let b = format!("encoder.down_blocks.{i}");
+            for j in 0..cfg.layers[i] {
+                res(&mut s, &format!("{b}.resnets.{j}"), cin, cin);
+            }
+            if cfg.up[i] {
+                // `Encoder::load` reads the downsampler as `{b}.conv.weight` (one `.conv` less than `Names::conv`).
+                s.push((format!("{b}.downsamplers.0.conv.weight"), vec![cin, cin, 3, 3, 3]));
+                s.push((format!("{b}.downsamplers.0.conv.bias"), vec![cin]));
+            }
+            if cin != cout {
+                res(&mut s, &format!("{b}.conv_out"), cin, cout);
+            }
+            cin = cout;
+        }
+        for j in 0..cfg.layers[4] {
+            res(&mut s, &format!("encoder.mid_block.resnets.{j}"), cin, cin);
+        }
+        conv(&mut s, "encoder.conv_out", cin, cfg.latent + 1, 3);
+        s.push(("latents_mean".into(), vec![cfg.latent]));
+        s.push(("latents_std".into(), vec![cfg.latent]));
+        let r = synth(&s, 31);
+        (cfg, Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap())
+    }
+
+    /// The tiny decoder + encoder.
+    pub fn tiny_vae() -> LtxVae {
+        let (cfg, w) = tiny();
+        LtxVae::open(&w, Names { diffusers: true }, true, cfg).unwrap()
+    }
+
+    /// Public `encode_image` / `decode_tokens` of the tiny net (Metal when the CPU tripwire is armed), with
+    /// finiteness checks of the encoder tokens and the raw Metal decoder output.
+    pub fn tiny_on_gpu() -> Result<(), String> {
+        let vae = tiny_vae();
+        let (p, lat) = (vae.cfg.patch, vae.cfg.latent);
+        // Three stride-2 stages: a 16 x 32 image is one 1 x 2 latent frame.
+        let (ih, iw) = (8 * p, 16 * p);
+        let mut img = ImageBuffer::new(iw, ih);
+        let mut g = Lcg(4);
+        img.data.iter_mut().for_each(|v| *v = ((g.next() + 1.0) * 127.5) as u8);
+        let tokens = vae.encode_image(&img)?;
+        if tokens.len() != 2 * lat || tokens.iter().any(|v| !v.is_finite()) {
+            return Err(format!("ltx_vae: bad encoder tokens ({} values)", tokens.len()));
+        }
+        let (f, h, w) = (2, 2, 3);
+        let frames = vae.decode_tokens(&Lcg(1).vec(f * h * w * lat, 1.0), f, h, w)?;
+        if frames.len() != 9 || frames[0].width != 8 * p * w || frames[0].height != 8 * p * h {
+            return Err(format!("ltx_vae: {} frames", frames.len()));
+        }
+        let z = Vid { d: Lcg(2).vec(f * lat * h * w, 1.0), c: lat, f, h, w };
+        if vae.decode_gpu(z)?.d.iter().any(|v| !v.is_finite()) {
+            return Err("ltx_vae: non-finite Metal output".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,81 +1170,13 @@ mod tests {
         assert!(psnr > 20.0, "PSNR {psnr}");
     }
 
-    /// Tiny v0.9.0-layout checkpoint (diffusers names): every module kind of the real net, small widths.
-    fn tiny() -> (Cfg, Weights) {
-        use crate::model::diff_graph::testutil::synth;
-        let cfg = Cfg { ch: [4, 8, 16, 16], layers: [2, 1, 1, 1, 2], up: [true, true, true, false], patch: 2, latent: 8 };
-        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
-        let conv = |s: &mut Vec<_>, p: &str, ci: usize, co: usize, k: usize| {
-            s.push((format!("{p}.conv.weight"), vec![co, ci, k, k, k]));
-            s.push((format!("{p}.conv.bias"), vec![co]));
-        };
-        let res = |s: &mut Vec<_>, p: &str, ci: usize, co: usize| {
-            conv(s, &format!("{p}.conv1"), ci, co, 3);
-            conv(s, &format!("{p}.conv2"), co, co, 3);
-            if ci != co {
-                s.push((format!("{p}.norm3.weight"), vec![ci]));
-                s.push((format!("{p}.norm3.bias"), vec![ci]));
-                conv(s, &format!("{p}.conv_shortcut"), ci, co, 1);
-            }
-        };
-        let rev: Vec<usize> = cfg.ch.iter().rev().copied().collect();
-        let l: Vec<usize> = cfg.layers.iter().rev().copied().collect();
-        conv(&mut s, "decoder.conv_in", cfg.latent, rev[0], 3);
-        for j in 0..l[0] {
-            res(&mut s, &format!("decoder.mid_block.resnets.{j}"), rev[0], rev[0]);
-        }
-        let mut cin = rev[0];
-        for i in 0..4 {
-            let cout = rev[i];
-            let b = format!("decoder.up_blocks.{i}");
-            if cin != cout {
-                res(&mut s, &format!("{b}.conv_in"), cin, cout);
-            }
-            if cfg.up[3 - i] {
-                conv(&mut s, &format!("{b}.upsamplers.0.conv"), cout, cout * 8, 3);
-            }
-            for j in 0..l[i + 1] {
-                res(&mut s, &format!("{b}.resnets.{j}"), cout, cout);
-            }
-            cin = cout;
-        }
-        conv(&mut s, "decoder.conv_out", cfg.ch[0], 3 * cfg.patch * cfg.patch, 3);
-        conv(&mut s, "encoder.conv_in", 3 * cfg.patch * cfg.patch, cfg.ch[0], 3);
-        let mut cin = cfg.ch[0];
-        for i in 0..4 {
-            let cout = cfg.ch[(i + 1).min(3)];
-            let b = format!("encoder.down_blocks.{i}");
-            for j in 0..cfg.layers[i] {
-                res(&mut s, &format!("{b}.resnets.{j}"), cin, cin);
-            }
-            if cfg.up[i] {
-                // `Encoder::load` reads the downsampler as `{b}.conv.weight` (one `.conv` less than `Names::conv`).
-                s.push((format!("{b}.downsamplers.0.conv.weight"), vec![cin, cin, 3, 3, 3]));
-                s.push((format!("{b}.downsamplers.0.conv.bias"), vec![cin]));
-            }
-            if cin != cout {
-                res(&mut s, &format!("{b}.conv_out"), cin, cout);
-            }
-            cin = cout;
-        }
-        for j in 0..cfg.layers[4] {
-            res(&mut s, &format!("encoder.mid_block.resnets.{j}"), cin, cin);
-        }
-        conv(&mut s, "encoder.conv_out", cin, cfg.latent + 1, 3);
-        s.push(("latents_mean".into(), vec![cfg.latent]));
-        s.push(("latents_std".into(), vec![cfg.latent]));
-        let r = synth(&s, 31);
-        (cfg, Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap())
-    }
-
     /// CPU vs Metal graph programs of the decoder (3 temporal 2x upsamplers) and the causal
     /// encoder (3 stride-2 downsamplers) on a tiny synthetic net (f32 vs f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
         use crate::model::diff_graph::testutil::{rel_err, Lcg};
-        let (cfg, w) = tiny();
-        let vae = LtxVae::open(&w, Names { diffusers: true }, true, cfg).unwrap();
+        let vae = fixture::tiny_vae();
+        let cfg = vae.cfg;
         let mk = |n: usize, c: usize, f: usize, h: usize, wd: usize, seed: u64| Vid {
             d: Lcg(seed).vec(n, 1.0),
             c,
