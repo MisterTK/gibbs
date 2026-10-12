@@ -1,40 +1,46 @@
-<p align="center">
-  <img src="assets/maxwell-surface-banner.svg" alt="The Maxwell-Gibbs 1873 Thermodynamic Surface Banner" width="100%">
-</p>
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="assets/gibbs-hero-static.png">
+  <img src="assets/gibbs-hero.svg" alt="Gibbs: thermodynamic inference engine; dithered 1895 portrait of J. Willard Gibbs with pipe smoke" width="100%">
+</picture>
 
-<p align="center">
-  <img src="assets/gibbs-1873-animated.svg" alt="Josiah Willard Gibbs 1873" width="130">
-  <br>
-  <em><strong>The Maxwell-Gibbs 1873 Geometric Design System</strong></em>
-  <br>
-  <a href="DESIGN.md"><strong>Read DESIGN.md Specification »</strong></a>
-</p>
+[→ Quickstart](#quickstart) · [→ Backends](#backends) · [→ Verified models](#verified-models) · [→ TUI](#tui---tui-or-make-tui) · [→ HTTP API](#http-api) · [→ DESIGN.md](DESIGN.md)
 
+<!-- gibbs-ascii:begin -->
 ```
-╔═══════════════════════════════════════════════════════════════════════════════════════════╗
-║   ██████╗ ██╗██████╗ ██████╗ ███████╗    ███████╗███╗   ██╗ ██████╗ ██╗███╗   ██╗███████╗   ║
-║  ██╔════╝ ██║██╔══██╗██╔══██╗██╔════╝    ██╔════╝████╗  ██║██╔════╝ ██║████╗  ██║██╔════╝   ║
-║  ██║  ███╗██║██████╔╝██████╔╝███████╗    █████╗  ██╔██╗ ██║██║  ███╗██║██╔██╗ ██║█████╗     ║
-║  ██║   ██║██║██╔══██╗██╔══██╗╚════██║    ██╔══╝  ██║╚██╗██║██║   ██║██║██║╚██╗██║██╔══╝     ║
-║  ╚██████╔╝██║██████╔╝██████╔╝███████║    ███████╗██║ ╚████║╚██████╔╝██║██║ ╚████║███████╗   ║
-║   ╚═════╝ ╚═╝╚═════╝ ╚═════╝ ╚══════╝    ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝   ║
-╠═══════════════════════════════════════════════════════════════════════════════════════════╣
-║  JOSIAH WILLARD GIBBS THERMODYNAMIC INFERENCE ENGINE · 1873 GEOMETRIC COMPILER            ║
-║  Apple Silicon · Intel & AMD x86 · ARM Neoverse · NVIDIA CUDA · AMD ROCm · TPUs · Extropic ║
-╠═══════════════════════════════════════════════════════════════════════════════════════════╣
-║                                                                                           ║
-║       ▄▄████████▄▄       ~ °       "The whole is simpler than the sum of its parts."      ║
-║      ██████████████      ° o ~              — J. Willard Gibbs (1839–1903)                ║
-║     ███ ⚯     ⚯ ███     o  O                                                              ║
-║     ███    ▾    ███     O  ~ °     Thermodynamic Fundamental Form:                        ║
-║      ██  ▀▀█▀▀  ██                   dU = T dS − P dV + Σ μᵢ dnᵢ                          ║
-║       █ ███████ █  ═╤╝ (ember)                                                            ║
-║      ▄██ ───◇─── ██▄               Vector Analysis & Dyadic Contraction:                  ║
-║     ████  watch  ████                u × v = −v × u  ·  ∇ · (∇ × A) = 0  ·  u ⊗ v         ║
-║    [ J. Willard Gibbs 1873 ]         Trajectory: Irreversible Free-Energy Relaxation      ║
-║                                                                                           ║
-╚═══════════════════════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════╗
+║        ▄████████████████████████████████▀        ║
+║      ▄███████████████████████████████████▄       ║
+║     ███████████████████████████████████████▄     ║
+║    ▄████████████████████████████████████████▀    ║
+║   ▀███████████████████████▀██▀ ▀▀▀▀██████████▄   ║
+║   ▀█████████████████████▀ ▀█▀  ▄▄▄  ▀████████▄   ║
+║  ▄▀███████████████████▀   ▀   ▀▀█▀▀  █████████▀  ║
+║  █████████████████▀▀█          ██     █████████▄ ║
+║ ▀██████████ ██▀               ▀  █    █████████▄ ║
+║ ▀█████████████  ▄▄▄▄                  ██████████ ║
+║ █████████████   ██████                ██████████ ║
+║ █████████████   ▀███▀ ▀              ▄██████████ ║
+║ ████████████     ██                 ████████████ ║
+║ █████████████▄ ▄██▄               ▄█████████████ ║
+║ ██████████████▀                  ▄██████████████ ║
+║ ▀█████████████▀  ▄▀             ████████████████ ║
+║ ▀█████████████████ ▄            ████████████████ ║
+║ ▀█████████████████▀              ▀█████████████  ║
+║ ▀████████████████             ▀    ███████████▀  ║
+║   ▀███████████▀ ██       ▄█▀        ▀█████████▀  ║
+║   ▀███████████ ████▄▄▄██▀              ▀████▀    ║
+║   ▀██████████ ▀█▀  ▀██▀                 ▀▀██▀    ║
+║     ▀███████▀ ▄█▀                                ║
+║       ▀█████    ▄▄▀                              ║
+║       ▀████▀ ███▀                                ║
+║         ▀██▄███ ▀▀▀ ▄▄▄▄ ▄█▄                     ║
+║           ▀    ▄▄▄██████████▀▄█▄█▄▀ ▀            ║
+║               ▀▀▀█▀█▀█████████▀▀▀ ▀              ║
+║                 ▀ ▀ ▀█▀█▀█▀▀▀                    ║
+║                                                  ║
+╚══════════════════════════════════════════════════╝
 ```
+<!-- gibbs-ascii:end -->
 
 > *"The whole is simpler than the sum of its parts."*
 > — **J. Willard Gibbs** (1839–1903), Professor of Mathematical Physics at Yale University
@@ -51,7 +57,11 @@ In 1873, Gibbs published his seminal treatises *"Graphical Methods in the Thermo
 In the Gibbs runtime:
 - **Autoregressive Generation**: Trajectory across the ruled geometric surface toward free-energy equilibrium ($dG \le 0$).
 - **Tensor Contraction**: Evaluated through Gibbs' vector mechanics and dyadics ($\mathbf{u} \otimes \mathbf{v}$) compiled directly to native SIMD / GPU matrix instructions.
-- **Instrument Aesthetics**: Designed per the canonical [**DESIGN.md**](DESIGN.md) specification featuring double-line brass borders (`╔══╗║╚══╝`), Sloane obsidian backdrops, and Maxwell ivory typography.
+- **Instrument Aesthetics**: Designed per the canonical [**DESIGN.md**](DESIGN.md) specification: warm brass on obsidian with a cold cyanotype data channel, double-line hairline borders (`╔══╗║╚══╝`) and an engraved, dithered 1895 portrait of Gibbs.
+
+### GPU coverage
+
+<!-- gpu-coverage -->
 
 Designed from first principles to target any computational substrate:
 - **Apple Silicon**: Metal Shading Language, unified memory streaming, and Neural Engine (ANE/Core ML).
