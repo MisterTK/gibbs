@@ -11,6 +11,28 @@
 use crate::graph::{DType, Graph, MegakernelDescriptor, MegakernelKind, NodeId, Op, ValueId};
 use std::collections::{HashMap, HashSet};
 
+/// Quantized formats the Metal megakernel decodes inline; MLPs with any other quantized weight stay
+/// unfused so their Linears read the weights through a codec GEMV instead.
+const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
+    crate::hardware::QuantFormat::GGUF_Q4_0,
+    crate::hardware::QuantFormat::GGUF_Q8_0,
+    crate::hardware::QuantFormat::GGUF_IQ4_XS,
+    crate::hardware::QuantFormat::GGUF_IQ2_M,
+    crate::hardware::QuantFormat::GGUF_IQ2_S,
+    crate::hardware::QuantFormat::GGUF_Q4_K_M,
+    crate::hardware::QuantFormat::GGUF_Q2_K,
+    crate::hardware::QuantFormat::GGUF_IQ3_S,
+    crate::hardware::QuantFormat::NVFP4,
+    crate::hardware::QuantFormat::WeightlessJesseLUT,
+];
+
+fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
+    match graph.value(w).dtype {
+        crate::graph::DType::Quant(f) => MEGAKERNEL_QUANT.contains(&f),
+        _ => true,
+    }
+}
+
 /// Detects and fuses transformer decoder blocks into unified Megakernel nodes.
 pub fn fuse_megakernel_blocks_pass(graph: &mut Graph) -> usize {
     let mlp = fuse_mlp_blocks(graph);
@@ -187,6 +209,9 @@ fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
                         let norm_val = gate_node.inputs[0];
                         let gate_w = gate_node.inputs[1];
                         let up_w = up_node.inputs[1];
+                        if ![gate_w, up_w, down_w].iter().all(|&w| fusible_weight(graph, w)) {
+                            return None;
+                        }
 
                         if let Some(&norm_nid) = val_producers.get(&norm_val) {
                             let norm_node = graph.node(norm_nid);

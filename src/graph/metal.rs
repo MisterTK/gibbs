@@ -109,28 +109,26 @@ pub enum WeightFormat {
     IQ3_S,
     NvFp4,
     JesseLUT,
+    /// A format with no hand kernel: read through its [`codec::Codec`] by a generated GEMV.
+    Gen(QuantFormat),
 }
 
 /// Returns whether the Metal executor implements `op` for the given data type.
 pub fn supports_op(op: &Op, dtype: DType) -> bool {
     match op {
-        Op::Linear => matches!(
-            dtype,
-            DType::F32
-                | DType::F16
-                | DType::BF16
-                | DType::Quant(QuantFormat::GGUF_Q4_0)
-                | DType::Quant(QuantFormat::GGUF_Q8_0)
-                | DType::Quant(QuantFormat::GGUF_IQ4_XS)
-                | DType::Quant(QuantFormat::GGUF_IQ2_M)
-                | DType::Quant(QuantFormat::GGUF_IQ2_S)
-                | DType::Quant(QuantFormat::GGUF_Q4_K_M)
-                | DType::Quant(QuantFormat::GGUF_Q2_K)
-                | DType::Quant(QuantFormat::GGUF_IQ3_S)
-                | DType::Quant(QuantFormat::NVFP4_E2M1)
-                | DType::Quant(QuantFormat::NVFP4)
-                | DType::Quant(QuantFormat::WeightlessJesseLUT)
-        ),
+        Op::Linear => match dtype {
+            DType::F32 | DType::F16 | DType::BF16 => true,
+            DType::Quant(f) => {
+                crate::graph::codec::codec(f).is_some()
+                    || matches!(
+                        f,
+                        QuantFormat::NVFP4_E2M1
+                            | QuantFormat::NVFP4
+                            | QuantFormat::WeightlessJesseLUT
+                    )
+            }
+            DType::U32 => false,
+        },
         Op::Embedding => matches!(dtype, DType::F32 | DType::U32),
         Op::LayerNorm { .. }
         | Op::RmsNorm { .. }
@@ -955,6 +953,8 @@ pub struct Session {
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
     jesse_aux: HashMap<String, (Buffer, usize)>,
+    /// Generated GEMV pipelines for the [`WeightFormat::Gen`] formats this session uploaded.
+    gen_psos: HashMap<QuantFormat, ComputePipelineState>,
 }
 impl Session {
     /// Uploads every weight once. Preserves packed formats without f32 expansion.
@@ -1071,6 +1071,11 @@ impl Session {
                         QuantFormat::GGUF_IQ3_S => Some(WeightFormat::IQ3_S),
                         QuantFormat::BF16 => Some(WeightFormat::BF16),
                         QuantFormat::FP16 => Some(WeightFormat::F16),
+                        f if crate::graph::codec::codec(f).is_some()
+                            && f != QuantFormat::GGUF_Q2_K =>
+                        {
+                            Some(WeightFormat::Gen(f))
+                        }
                         _ => None,
                     };
                     if let Some(fmt) = fmt {
@@ -1313,6 +1318,30 @@ impl Session {
                         raw_data.len(),
                         WeightFormat::IQ3_S,
                     ),
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if crate::graph::codec::codec(*format).is_some() => (
+                        None,
+                        raw_data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        raw_data.len(),
+                        WeightFormat::Gen(*format),
+                    ),
+                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
+                        data,
+                        format,
+                        in_features,
+                        out_features,
+                    } if crate::graph::codec::codec(*format).is_some() => (
+                        None,
+                        data.as_ptr() as *const c_void,
+                        in_features * out_features,
+                        data.len(),
+                        WeightFormat::Gen(*format),
+                    ),
                     other => {
                         use crate::model::layers::QuantizedWeight as Q;
                         let fmt_name = match other {
@@ -1404,6 +1433,16 @@ impl Session {
                                 (num_elements / 256) * 110,
                                 WeightFormat::IQ3_S,
                             ),
+                            f if crate::graph::codec::codec(f).is_some() => {
+                                let c = crate::graph::codec::codec(f).expect("checked");
+                                (
+                                    None,
+                                    bytes.as_ptr() as *const c_void,
+                                    num_elements,
+                                    num_elements / c.block_elems as usize * c.block_bytes as usize,
+                                    WeightFormat::Gen(f),
+                                )
+                            }
                             fmt => {
                                 tracing::info!(
                                     "weight {name}: {fmt:?} has no GPU codec; dequantized to f32 at load (streams f32, not {:.2} bpw)",
@@ -1439,6 +1478,13 @@ impl Session {
             }
             bufs.insert(name.to_string(), (buf, 0, num_elements, fmt));
         }
+        let gen_psos = generated_gemv_pipelines(
+            &rt.device,
+            bufs.values().filter_map(|(_, _, _, f)| match f {
+                WeightFormat::Gen(q) => Some(*q),
+                _ => None,
+            }),
+        )?;
         Ok(Self {
             rt,
             weights: bufs,
@@ -1449,6 +1495,7 @@ impl Session {
             gemm: None,
             nvfp4_aux,
             jesse_aux,
+            gen_psos,
         })
     }
     /// Uses `kind` for every Linear instead of the host profile's choice.
@@ -1460,6 +1507,33 @@ impl Session {
 
     pub fn runtime(&self) -> &Runtime {
         &self.rt
+    }
+
+    /// The packed-weight GEMV pipeline for `format`: a hand kernel, or the generated one.
+    fn gemv_pso(&self, format: WeightFormat) -> Result<&ComputePipelineState, String> {
+        let name = match format {
+            WeightFormat::Gen(f) => {
+                return self
+                    .gen_psos
+                    .get(&f)
+                    .ok_or_else(|| format!("no generated GEMV pipeline for {f:?}"))
+            }
+            WeightFormat::Q4_0 => "gemv_q4_0",
+            WeightFormat::Q8_0 => "gemv_q8_0",
+            WeightFormat::IQ4_XS => "gemv_iq4_xs",
+            WeightFormat::IQ2_M => "gemv_iq2_m",
+            WeightFormat::Q4_K => "gemv_q4_k",
+            WeightFormat::Q2_K => "gemv_q2_k",
+            WeightFormat::IQ3_S => "gemv_iq3_s",
+            WeightFormat::BF16 => "gemv_bf16",
+            WeightFormat::F16 => "gemv_f16",
+            other => {
+                return Err(format!(
+                    "Metal executor: unsupported packed GEMV format {other:?}"
+                ))
+            }
+        };
+        self.rt.pso(name)
     }
 
     /// Prepares the planned steps and activation arena allocation for `graph` once.
@@ -1911,7 +1985,8 @@ impl Session {
             | WeightFormat::Q2_K
             | WeightFormat::IQ3_S
             | WeightFormat::NvFp4
-            | WeightFormat::JesseLUT => {
+            | WeightFormat::JesseLUT
+            | WeightFormat::Gen(_) => {
                 if format == WeightFormat::NvFp4 {
                     let (scales_buf, global_scale) = self
                         .nvfp4_aux
@@ -1959,19 +2034,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let kernel_name = match format {
-                    WeightFormat::Q4_0 => "gemv_q4_0",
-                    WeightFormat::Q8_0 => "gemv_q8_0",
-                    WeightFormat::IQ4_XS => "gemv_iq4_xs",
-                    WeightFormat::IQ2_M => "gemv_iq2_m",
-                    WeightFormat::Q4_K => "gemv_q4_k",
-                    WeightFormat::Q2_K => "gemv_q2_k",
-                    WeightFormat::IQ3_S => "gemv_iq3_s",
-                    WeightFormat::BF16 => "gemv_bf16",
-                    WeightFormat::F16 => "gemv_f16",
-                    _ => unreachable!(),
-                };
-                enc.set_compute_pipeline_state(self.rt.pso(kernel_name)?);
+                enc.set_compute_pipeline_state(self.gemv_pso(format)?);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
                 enc.set_buffer(2, Some(out.0), out.1 as u64);
@@ -2271,23 +2334,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let kernel_name = match format {
-                    WeightFormat::Q4_0 => "gemv_q4_0",
-                    WeightFormat::Q8_0 => "gemv_q8_0",
-                    WeightFormat::IQ4_XS => "gemv_iq4_xs",
-                    WeightFormat::IQ2_M => "gemv_iq2_m",
-                    WeightFormat::Q4_K => "gemv_q4_k",
-                    WeightFormat::Q2_K => "gemv_q2_k",
-                    WeightFormat::IQ3_S => "gemv_iq3_s",
-                    WeightFormat::BF16 => "gemv_bf16",
-                    WeightFormat::F16 => "gemv_f16",
-                    _ => {
-                        return Err(format!(
-                            "Metal executor: unsupported packed GEMV format {format:?}"
-                        ))
-                    }
-                };
-                enc.set_compute_pipeline_state(rt.pso(kernel_name)?);
+                enc.set_compute_pipeline_state(self.gemv_pso(format)?);
                 bind(0, w);
                 bind(1, x);
                 bind(2, s.out);
@@ -3295,10 +3342,19 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         Some(WeightFormat::NvFp4)
                     }
                     DType::Quant(QuantFormat::WeightlessJesseLUT) => Some(WeightFormat::JesseLUT),
+                    DType::Quant(f) if crate::graph::codec::codec(f).is_some() => {
+                        Some(WeightFormat::Gen(f))
+                    }
                     DType::BF16 => Some(WeightFormat::BF16),
                     DType::F16 => Some(WeightFormat::F16),
                     _ => None,
                 };
+                if let Some(WeightFormat::Gen(f)) = format {
+                    let c = crate::graph::codec::codec(f).expect("checked");
+                    if k % c.block_elems as usize != 0 {
+                        format = None;
+                    }
+                }
                 if (format == Some(WeightFormat::Q4_0) || format == Some(WeightFormat::Q8_0))
                     && k % 32 != 0
                 {
@@ -4194,6 +4250,45 @@ fn compile(device: &Device) -> Result<(Library, Result<(), String>), String> {
             Ok((lib, Err(format!("MSL 4.0 compile failed: {e4}"))))
         }
     }
+}
+
+/// Compiles one library of generated GEMV kernels (one per format in `formats`) and returns their
+/// pipelines. Nothing is compiled when no weight needs a generated kernel.
+fn generated_gemv_pipelines(
+    device: &Device,
+    formats: impl Iterator<Item = QuantFormat>,
+) -> Result<HashMap<QuantFormat, ComputePipelineState>, String> {
+    let mut wanted: Vec<QuantFormat> = formats.collect();
+    wanted.sort_by_key(|f| format!("{f:?}"));
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let params = crate::graph::codegen::GemvParams::default();
+    let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+    src.push_str(crate::graph::codegen::gemv_common(KERNELS_MSL));
+    for &f in &wanted {
+        let c = crate::graph::codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+        src.push_str(&crate::graph::codegen::gemv_packed(c, params));
+    }
+    let opts = CompileOptions::new();
+    opts.set_fast_math_enabled(false);
+    let lib = device
+        .new_library_with_source(&src, &opts)
+        .map_err(|e| format!("generated GEMV compilation failed: {e}"))?;
+    let mut out = HashMap::new();
+    for f in wanted {
+        let c = crate::graph::codec::codec(f).expect("checked above");
+        let name = crate::graph::codegen::gemv_packed_name(c, params);
+        let func = lib
+            .get_function(&name, None)
+            .map_err(|e| format!("generated function '{name}': {e}"))?;
+        let pso = device
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| format!("generated pipeline '{name}': {e}"))?;
+        out.insert(f, pso);
+    }
+    Ok(out)
 }
 
 /// Pipelines for `names`, built only from the binary archive at `archive` when it holds them all
