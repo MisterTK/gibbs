@@ -199,8 +199,14 @@ pub enum Op {
         variant: RopeVariant,
         mscale: f32,
     },
-    /// `[q [nq, heads*d], k [nk, kv_heads*d], v [nk, kv_heads*d]]` → `[nq, heads*d]`, with `d` taken
-    /// from `q`'s shape. Cross-attention is this op with `k`/`v` from another sequence.
+    /// `[q [nq, heads*head_dim], k [nk, kv_heads*head_dim], v [nk, kv_heads*head_dim], bias?]` →
+    /// `[nq, heads*head_dim]`, with `head_dim` taken from `q`'s shape; query head `h` reads kv head
+    /// `h / (heads / kv_heads)`. Cross-attention is this op with `k`/`v` from another sequence.
+    /// Scores are `q·k / sqrt(head_dim)`, then `soft_cap * tanh(s / soft_cap)`, then the optional
+    /// additive `bias` (`[heads, nq, nk]`, `[nq, nk]` or `[nk]`; `-inf` masks, e.g. padding).
+    /// `causal`: query `p` sees keys `k <= p` (top-left aligned when `nq != nk`). With `window = Some(w)`:
+    /// causal sees `p - w < k <= p` (w keys), non-causal sees `|p - k| <= w / 2`. A query with no
+    /// visible key outputs zeros.
     Attention {
         heads: usize,
         kv_heads: usize,
@@ -300,7 +306,8 @@ pub enum Op {
         axis: isize,
         k: usize,
     },
-    /// `[table [buckets, heads], q_pos [n] U32, k_pos [m] U32]` → `[heads, n, m]`.
+    /// `[table [buckets, heads], q_pos [n] U32, k_pos [m] U32]` → `[heads, n, m]`, the T5 bias added
+    /// to attention scores: `table[bucket(k_pos - q_pos)]` with HF `_relative_position_bucket`.
     RelPosBias {
         buckets: usize,
         max_distance: usize,
