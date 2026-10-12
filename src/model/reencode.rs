@@ -93,6 +93,10 @@ pub fn bump(f: Q) -> Option<Q> {
 
 /// `f`, or the next larger format whose blocks tile `cols` (a float dtype when none does).
 pub fn fit(mut f: Q, cols: usize, float: Q) -> Q {
+    // llama.cpp's convention for rows that hold no whole 256-element block: 4-bit K -> block-32 Q4_0.
+    if f == Q::GGUF_Q4_K_M && cols % 256 != 0 && cols % 32 == 0 {
+        return Q::GGUF_Q4_0;
+    }
     while cols % block_elems(f) != 0 {
         f = bump(f).unwrap_or(float);
     }
@@ -434,7 +438,21 @@ fn carry(p: &Projection<'_>) -> Option<(Q, Vec<u8>)> {
             }
         }
     }
-    (out.len() == out_f * row_bytes).then_some((f, out))
+    if out.len() != out_f * row_bytes {
+        return None;
+    }
+    // The blocks must decode to exactly the f32 rows the loader built: this rejects any layout the
+    // loader changed after reading (reordered heads, transposes, ternarized rows) without special cases.
+    let QuantizedWeight::Uncompressed { data: want, .. } = &p.layer.weight else { return None };
+    let decode = gguf_block_codec(f)?.2;
+    let mut y = vec![0.0f32; elems];
+    for (b, w) in out.chunks_exact(block_bytes).zip(want.chunks_exact(elems)) {
+        decode(b, &mut y);
+        if y.iter().zip(w).any(|(a, b)| a.to_bits() != b.to_bits()) {
+            return None;
+        }
+    }
+    Some((f, out))
 }
 
 // ---- cache ----------------------------------------------------------------------------------
@@ -651,7 +669,10 @@ mod tests {
     #[test]
     fn fit_bumps_until_blocks_tile() {
         assert_eq!(fit(Q::GGUF_Q4_K_M, 512, Q::FP32), Q::GGUF_Q4_K_M);
-        assert_eq!(fit(Q::GGUF_Q4_K_M, 64, Q::FP32), Q::GGUF_Q8_0);
+        // 576 = 2.25 x 256 (SmolLM2 hidden): block-32 Q4_0, not an 8.5 bpw Q8_0
+        assert_eq!(fit(Q::GGUF_Q4_K_M, 576, Q::FP32), Q::GGUF_Q4_0);
+        assert_eq!(fit(Q::GGUF_Q5_K_M, 576, Q::FP32), Q::GGUF_Q8_0);
+        assert_eq!(fit(Q::GGUF_Q4_K_M, 64, Q::FP32), Q::GGUF_Q4_0);
         assert_eq!(fit(Q::GGUF_Q4_K_M, 48, Q::FP32), Q::FP32);
         assert_eq!(bump(Q::GGUF_Q8_0), None);
     }
@@ -683,9 +704,9 @@ mod tests {
         // the same matrix in attention under FFN-only stays f32 (source unknown = FP32, native)
         let (q, rec) = encode_with(pol(true), layer("a", 512, 24, 1), ProjRole::Attn);
         assert_eq!((q.quant_format(), rec.lossy), (Q::FP32, false));
-        // 64 columns cannot hold Q4_K blocks: the next format that tiles is Q8_0
+        // 64 columns cannot hold Q4_K blocks: block-32 Q4_0 keeps the bit width
         let (q, _) = encode_with(pol(false), layer("b", 64, 8, 2), ProjRole::Ffn);
-        assert_eq!(q.quant_format(), Q::GGUF_Q8_0);
+        assert_eq!(q.quant_format(), Q::GGUF_Q4_0);
     }
 
     #[test]
@@ -710,7 +731,7 @@ mod tests {
         let blocks = |rows: usize, seed: u32| {
             let l = layer("t", in_f, rows, seed);
             let QuantizedWeight::Uncompressed { data, .. } = l.weight else { unreachable!() };
-            quantize_k_rows(&data, 144, quantize_row_q4_k_ref)
+            quantize_k_rows(&data, in_f, 144, quantize_row_q4_k_ref)
         };
         let (q, k, v) = (blocks(q_rows, 1), blocks(kv_rows, 2), blocks(kv_rows, 3));
         let mut manifest = ModelManifest::default();
@@ -762,6 +783,28 @@ mod tests {
         let mut mixed = manifest.clone();
         mixed.tensors.get_mut("v").unwrap().quant_format = Q::GGUF_Q5_K_M;
         assert!(carry(&proj(&mixed, &data, &want, in_f, head_dim)).is_none());
+    }
+
+    /// The hand-off from `carry` to `repack`: a bitsandbytes NF4 projection stays NF4 blocks (carried,
+    /// bit-equal to its f32 dequant) instead of falling through to a lossy Q4_K re-encode.
+    #[test]
+    fn carry_hands_bnb_weights_to_repack() {
+        use crate::model::layers::dequantize_gguf_blocks;
+        let (f, want) = crate::model::repack::bnb::tests::build(false, 64, false, 3, 512, 9);
+        let layer = QuantizedLinearLayer::from_f32("layer_0_out", 512, 3, &want, Q::FP32).unwrap();
+        let e = Encoder::new(Mode::Policy { policy: BitExact, ffn_only: false, rmse_limit: None }, 1, None);
+        let out = e.encode(Projection {
+            role: ProjRole::Attn,
+            layer,
+            sources: vec!["w.weight".into()],
+            head_dim: 8,
+            checkpoint: Some((&f.m, &f.data[..])),
+        });
+        let rec = e.records().remove(0);
+        assert_eq!((out.quant_format(), rec.carried, rec.lossy), (Q::BNB_NF4_B64, true, false));
+        let QuantizedWeight::GgufQuantized { raw_data, .. } = &out.weight else { panic!() };
+        let got = dequantize_gguf_blocks(Q::BNB_NF4_B64, raw_data).unwrap();
+        assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     #[test]

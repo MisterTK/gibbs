@@ -286,6 +286,14 @@ impl LmSource {
         }
     }
 
+    /// The manifest and the bytes its offsets index, `None` for synthetic and ONNX models.
+    pub fn checkpoint(&self) -> Option<(&crate::model::ModelManifest, &[u8])> {
+        match &self.body {
+            LmBody::Checkpoint { manifest, data, .. } => Some((manifest, data)),
+            LmBody::Built(_) => None,
+        }
+    }
+
     /// How many projections (4 per layer plus the LM head) a build passes to its encoder.
     pub fn projection_count(&self) -> usize {
         let layers = match &self.body {
