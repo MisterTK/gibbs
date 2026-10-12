@@ -239,51 +239,6 @@ kernel void embedding_f32(device const float* table [[buffer(0)]],
     out[i] = table[(ulong)ids[i / p.d] * p.d + i % p.d];
 }
 
-kernel void add_f32(device const float* a [[buffer(0)]],
-                    device const float* b [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant uint& n [[buffer(3)]],
-                    uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = a[i] + b[i];
-}
-
-kernel void gelu_erf_f32(device const float* x [[buffer(0)]],
-                         device float* out [[buffer(1)]],
-                         constant uint& n [[buffer(2)]],
-                         uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = gelu_erf(x[i]);
-}
-
-kernel void silu_f32(device const float* x [[buffer(0)]],
-                     device float* out [[buffer(1)]],
-                     constant uint& n [[buffer(2)]],
-                     uint i [[thread_position_in_grid]]) {
-    if (i < n) {
-        float val = x[i];
-        out[i] = val / (1.0f + exp(-val));
-    }
-}
-
-kernel void sigmoid_f32(device const float* x [[buffer(0)]],
-                        device float* out [[buffer(1)]],
-                        constant uint& n [[buffer(2)]],
-                        uint i [[thread_position_in_grid]]) {
-    if (i < n) {
-        float val = x[i];
-        out[i] = 1.0f / (1.0f + exp(-val));
-    }
-}
-
-kernel void softplus_f32(device const float* x [[buffer(0)]],
-                         device float* out [[buffer(1)]],
-                         constant uint& n [[buffer(2)]],
-                         uint i [[thread_position_in_grid]]) {
-    if (i < n) {
-        float val = x[i];
-        out[i] = val > 20.0f ? val : log(1.0f + exp(val));
-    }
-}
-
 // LayerNorm of one row per threadgroup: mean, then biased variance, like `nn::layer_norm`.
 kernel void layer_norm_f32(device const float* x [[buffer(0)]],
                            device const float* g [[buffer(1)]],
@@ -309,76 +264,6 @@ kernel void layer_norm_f32(device const float* x [[buffer(0)]],
     }
     float inv = 1.0f / sqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
     for (uint i = tid; i < p.d; i += tpg) o[i] = (xr[i] - mean) * inv * g[i] + b[i];
-}
-
-// Scaled dot-product attention without a score matrix: one threadgroup per (head, query row). Its
-// simdgroups split the keys, each keeping an online softmax; the partials merge at the end.
-// Rows of q/k/v/out are heads*head_dim floats. Causal: query i sees keys 0..=i (as `nn::attention`).
-kernel void attention_f32(device const float* q [[buffer(0)]],
-                          device const float* k [[buffer(1)]],
-                          device const float* v [[buffer(2)]],
-                          device float* out [[buffer(3)]],
-                          constant AttnParams& p [[buffer(4)]],
-                          uint2 tg [[threadgroup_position_in_grid]],
-                          uint sg [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]],
-                          uint nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float tg_m[ATTN_MAX_SG];
-    threadgroup float tg_l[ATTN_MAX_SG];
-    threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    const uint head = tg.x, qi = tg.y;
-    const uint hd = p.head_dim, stride = p.heads * hd, row = ATTN_MAX_PER_LANE * 32;
-    device const float* qh = q + (ulong)qi * stride + head * hd;
-    const uint len = p.causal ? min(p.nk, qi + 1) : p.nk;
-
-    float qr[ATTN_MAX_PER_LANE];
-    float acc[ATTN_MAX_PER_LANE];
-    for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-        uint d = lane + 32 * j;
-        qr[j] = d < hd ? qh[d] : 0.0f;
-        acc[j] = 0.0f;
-    }
-    float m = -FLT_MAX;
-    float l = 0.0f;
-    for (uint t = sg; t < len; t += nsg) {
-        device const float* kt = k + (ulong)t * stride + head * hd;
-        device const float* vt = v + (ulong)t * stride + head * hd;
-        float s = 0.0f;
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-            uint d = lane + 32 * j;
-            if (d < hd) s += qr[j] * kt[d];
-        }
-        s = simd_sum(s) * p.scale;
-        float m_new = max(m, s);
-        float corr = exp(m - m_new);
-        float e = exp(s - m_new);
-        l = l * corr + e;
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-            uint d = lane + 32 * j;
-            if (d < hd) acc[j] = acc[j] * corr + e * vt[d];
-        }
-        m = m_new;
-    }
-    if (lane == 0) {
-        tg_m[sg] = m;
-        tg_l[sg] = l;
-    }
-    for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-        uint d = lane + 32 * j;
-        if (d < hd) tg_acc[sg * row + d] = acc[j];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float gm = -FLT_MAX;
-    for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[i]);
-    float gl = 0.0f;
-    for (uint i = 0; i < nsg; ++i) gl += tg_l[i] * exp(tg_m[i] - gm);
-    device float* o = out + (ulong)qi * stride + head * hd;
-    for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
-        float a = 0.0f;
-        for (uint i = 0; i < nsg; ++i) a += tg_acc[i * row + d] * exp(tg_m[i] - gm);
-        o[d] = a / gl;
-    }
 }
 
 // Mean of the rows whose mask entry is non-zero (count clamped to 1), one thread per column.
@@ -1392,63 +1277,63 @@ constant const uint32_t iq3s_grid[512] = {
     0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
     0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
     0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
-    0x01050b07, 0x01050d01, 0x01050d05, 0x01050f03, 0x01050f09, 0x01070107, 0x01070303, 0x0107030b,
-    0x01070501, 0x01070509, 0x01070707, 0x0107070f, 0x01070903, 0x0107090b, 0x01070b05, 0x01070d01,
-    0x01070d07, 0x01070f03, 0x01070f0b, 0x01090101, 0x01090105, 0x0109010b, 0x0109010f, 0x01090309,
-    0x01090505, 0x0109050b, 0x0109050f, 0x01090703, 0x0109070b, 0x01090901, 0x01090909, 0x01090b03,
-    0x01090b07, 0x01090b0f, 0x01090d05, 0x01090d0b, 0x01090f01, 0x01090f07, 0x010b0103, 0x010b0107,
-    0x010b0305, 0x010b030d, 0x010b0503, 0x010b0507, 0x010b050f, 0x010b0705, 0x010b0709, 0x010b0903,
-    0x010b0907, 0x010b090f, 0x010b0b05, 0x010b0b0b, 0x010b0d03, 0x010b0d09, 0x010b0f05, 0x010d0101,
-    0x010d0105, 0x010d0303, 0x010d030b, 0x010d0501, 0x010d0509, 0x010d0707, 0x010d0905, 0x010d090d,
-    0x010d0b03, 0x010d0b09, 0x010d0d01, 0x010d0d07, 0x010d0f03, 0x010f0103, 0x010f0109, 0x010f010f,
-    0x010f0305, 0x010f0503, 0x010f0509, 0x010f0701, 0x010f0707, 0x010f0905, 0x010f090b, 0x010f0b03,
-    0x010f0b09, 0x010f0d07, 0x010f0f01, 0x010f0f05, 0x03010101, 0x03010103, 0x03010105, 0x03010109,
-    0x03010301, 0x03010303, 0x0301030b, 0x03010501, 0x03010507, 0x0301050f, 0x03010703, 0x0301070b,
-    0x03010909, 0x03010d03, 0x03010d0b, 0x03010f05, 0x03030101, 0x03030103, 0x0303010b, 0x03030305,
-    0x0303030d, 0x03030503, 0x03030507, 0x0303050f, 0x03030705, 0x03030709, 0x03030903, 0x03030907,
-    0x0303090f, 0x03030b05, 0x03030b0b, 0x03030d03, 0x03030d09, 0x03030f05, 0x03050101, 0x03050107,
-    0x0305010f, 0x03050303, 0x03050307, 0x0305030f, 0x03050505, 0x03050509, 0x03050703, 0x03050707,
-    0x0305070f, 0x03050905, 0x0305090b, 0x03050b01, 0x03050b07, 0x03050d05, 0x03050f03, 0x03070103,
-    0x0307010b, 0x03070305, 0x03070309, 0x03070503, 0x03070507, 0x0307050f, 0x03070705, 0x0307070b,
-    0x03070901, 0x03070907, 0x0307090f, 0x03070b05, 0x03070b09, 0x03070d03, 0x03070f05, 0x03090109,
-    0x03090303, 0x03090307, 0x0309030f, 0x03090505, 0x0309050b, 0x03090701, 0x03090707, 0x0309070f,
-    0x03090905, 0x0309090b, 0x03090b03, 0x03090b07, 0x03090d05, 0x03090f03, 0x03090f09, 0x030b0105,
-    0x030b010d, 0x030b0305, 0x030b030b, 0x030b0501, 0x030b0507, 0x030b0705, 0x030b0709, 0x030b0903,
-    0x030b0907, 0x030b0b05, 0x030b0d01, 0x030b0d07, 0x030b0f05, 0x030d0103, 0x030d010b, 0x030d0303,
-    0x030d0309, 0x030d0505, 0x030d0703, 0x030d0905, 0x030d0b01, 0x030d0d03, 0x030f0105, 0x030f0305,
-    0x030f0503, 0x030f0705, 0x030f0903, 0x030f0b05, 0x05010101, 0x05010103, 0x0501010b, 0x05010301,
-    0x05010307, 0x0501030f, 0x05010503, 0x0501050b, 0x05010701, 0x05010709, 0x05010905, 0x0501090b,
-    0x0501090f, 0x05010b03, 0x05010b07, 0x05010d01, 0x05010d05, 0x05010f03, 0x05010f09, 0x05030101,
-    0x05030107, 0x0503010f, 0x05030303, 0x05030307, 0x0503030f, 0x05030505, 0x05030509, 0x05030703,
-    0x05030707, 0x0503070f, 0x05030905, 0x0503090b, 0x05030b01, 0x05030b07, 0x05030d05, 0x05030f03,
-    0x05050103, 0x0505010b, 0x05050305, 0x05050309, 0x05050503, 0x05050507, 0x0505050f, 0x05050705,
-    0x0505070b, 0x05050901, 0x05050907, 0x0505090f, 0x05050b05, 0x05050b09, 0x05050d03, 0x05050f05,
-    0x05070101, 0x05070109, 0x05070303, 0x05070307, 0x0507030f, 0x05070505, 0x0507050b, 0x05070701,
-    0x05070707, 0x0507070f, 0x05070905, 0x0507090b, 0x05070b03, 0x05070b07, 0x05070d05, 0x05070f03,
-    0x05070f09, 0x05090105, 0x0509010b, 0x0509010f, 0x05090305, 0x0509030b, 0x05090501, 0x05090507,
-    0x0509050f, 0x05090705, 0x0509070b, 0x05090903, 0x05090907, 0x05090b01, 0x05090b07, 0x05090d05,
-    0x05090f03, 0x050b0103, 0x050b0107, 0x050b010f, 0x050b0301, 0x050b0307, 0x050b0505, 0x050b0509,
-    0x050b0703, 0x050b0707, 0x050b0901, 0x050b0907, 0x050b0b05, 0x050b0d03, 0x050d0101, 0x050d0105,
-    0x050d0305, 0x050d0503, 0x050d0705, 0x050d0901, 0x050d0905, 0x050d0b03, 0x050f0103, 0x050f0303,
-    0x050f0505, 0x050f0703, 0x050f0903, 0x07010107, 0x07010303, 0x0701030b, 0x07010501, 0x07010509,
-    0x07010707, 0x0701070f, 0x07010903, 0x0701090b, 0x07010b05, 0x07010d01, 0x07010d07, 0x07010f03,
-    0x07010f0b, 0x07030103, 0x0703010b, 0x07030305, 0x07030309, 0x07030503, 0x07030507, 0x0703050f,
-    0x07030705, 0x0703070b, 0x07030901, 0x07030907, 0x0703090f, 0x07030b05, 0x07030b09, 0x07030d03,
-    0x07030f05, 0x07050101, 0x07050109, 0x07050303, 0x07050307, 0x0705030f, 0x07050505, 0x0705050b,
-    0x07050701, 0x07050707, 0x0705070f, 0x07050905, 0x0705090b, 0x07050b03, 0x07050b07, 0x07050d05,
-    0x07050f03, 0x07050f09, 0x07070107, 0x0707010f, 0x07070305, 0x0707030b, 0x07070501, 0x07070507,
-    0x0707050f, 0x07070705, 0x07070709, 0x07070903, 0x07070907, 0x07070b01, 0x07070b07, 0x07070d03,
-    0x07070f03, 0x07090103, 0x0709010b, 0x07090301, 0x07090307, 0x0709030f, 0x07090505, 0x07090509,
-    0x07090703, 0x07090707, 0x07090901, 0x07090907, 0x07090b03, 0x07090d03, 0x070b0105, 0x070b0109,
-    0x070b0305, 0x070b0501, 0x070b0507, 0x070b0701, 0x070b0707, 0x070b0903, 0x070d0101, 0x070d0107,
-    0x070d0303, 0x070d0505, 0x070d0701, 0x070f0103, 0x070f010b, 0x070f0305, 0x070f0503, 0x070f0701,
-    0x09010101, 0x09010105, 0x0901010b, 0x0901010f, 0x09010309, 0x09010505, 0x0901050b, 0x0901050f,
-    0x09010703, 0x0901070b, 0x09010901, 0x09010909, 0x09010b03, 0x09010b07, 0x09010b0f, 0x09010d05,
-    0x09010d0b, 0x09010f01, 0x09010f07, 0x09030109, 0x09030303, 0x09030307, 0x0903030f, 0x09030505,
-    0x0903050b, 0x09030701, 0x09030707, 0x0903070f, 0x09030905, 0x0903090b, 0x09030b03, 0x09030b07,
-    0x09030d05, 0x09030f03, 0x09030f09, 0x09050105, 0x0905010b, 0x0905010f, 0x09050305, 0x0905030b,
-    0x09050501, 0x09050507, 0x0905050f, 0x09050705, 0x0905070b, 0x09050903, 0x09050907, 0x09050b01,
-    0x09050b07, 0x09050d05, 0x09050f03, 0x09070103, 0x0907010b, 0x09070301, 0x09070307, 0x0907030f,
+    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
 };
 
 struct block_iq3_s {
@@ -1692,17 +1577,6 @@ struct SliceParams {
     uint start;
     uint out_cols;
 };
-
-kernel void slice_f32(device const float* x [[buffer(0)]],
-                      device float* out [[buffer(1)]],
-                      constant SliceParams& p [[buffer(2)]],
-                      uint gid [[thread_position_in_grid]]) {
-    uint total = p.rows * p.out_cols;
-    if (gid >= total) return;
-    uint r = gid / p.out_cols;
-    uint c = gid % p.out_cols;
-    out[gid] = x[(ulong)r * p.in_cols + (p.start + c)];
-}
 
 struct GraphRopeParams2 {
     uint n_heads;
@@ -2118,71 +1992,6 @@ struct TopKSoftmaxParams {
     uint k;
 };
 
-kernel void topk_softmax_f32(device const float* x [[buffer(0)]],
-                             device float* out [[buffer(1)]],
-                             constant TopKSoftmaxParams& p [[buffer(2)]],
-                             uint row [[thread_position_in_grid]]) {
-    if (row >= p.rows) return;
-    device const float* xr = x + (ulong)row * p.cols;
-    device float* yr = out + (ulong)row * p.cols;
-    uint n = p.cols;
-    uint k = min(p.k, n);
-
-    for (uint i = 0; i < n; ++i) yr[i] = 0.0f;
-
-    float max_val = -1e38f;
-    for (uint i = 0; i < n; ++i) {
-        if (xr[i] > max_val) max_val = xr[i];
-    }
-
-    if (k >= n) {
-        float sum_e = 0.0f;
-        for (uint i = 0; i < n; ++i) {
-            float e = exp(xr[i] - max_val);
-            yr[i] = e;
-            sum_e += e;
-        }
-        float inv = 1.0f / max(sum_e, 1e-12f);
-        for (uint i = 0; i < n; ++i) yr[i] *= inv;
-        return;
-    }
-
-    uint top_indices[32];
-    float top_values[32];
-    uint cap_k = min(k, 32u);
-    for (uint ki = 0; ki < cap_k; ++ki) {
-        top_values[ki] = -1e38f;
-        top_indices[ki] = 0;
-    }
-
-    for (uint i = 0; i < n; ++i) {
-        float v = xr[i];
-        if (v > top_values[cap_k - 1]) {
-            uint pos = cap_k - 1;
-            while (pos > 0 && v > top_values[pos - 1]) {
-                top_values[pos] = top_values[pos - 1];
-                top_indices[pos] = top_indices[pos - 1];
-                pos--;
-            }
-            top_values[pos] = v;
-            top_indices[pos] = i;
-        }
-    }
-
-    float top_max = top_values[0];
-    float sum_e = 0.0f;
-    float top_exp[32];
-    for (uint ki = 0; ki < cap_k; ++ki) {
-        float e = exp(top_values[ki] - top_max);
-        top_exp[ki] = e;
-        sum_e += e;
-    }
-    float inv = 1.0f / max(sum_e, 1e-12f);
-    for (uint ki = 0; ki < cap_k; ++ki) {
-        yr[top_indices[ki]] = top_exp[ki] * inv;
-    }
-}
-
 struct MulParams {
     uint total;
     uint a_len;
@@ -2190,35 +1999,6 @@ struct MulParams {
     uint row_broadcast;
     uint d;
 };
-
-kernel void mul_f32(device const float* a [[buffer(0)]],
-                    device const float* b [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MulParams& p [[buffer(3)]],
-                    uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.total) return;
-    if (p.a_len == p.b_len) {
-        out[gid] = a[gid] * b[gid];
-    } else if (p.b_len == 1) {
-        out[gid] = a[gid] * b[0];
-    } else if (p.row_broadcast != 0) {
-        uint r = gid / p.d;
-        out[gid] = a[gid] * b[r];
-    } else {
-        uint c = gid % p.b_len;
-        out[gid] = a[gid] * b[c];
-    }
-}
-
-kernel void softcap_f32(device const float* x [[buffer(0)]],
-                        device float* out [[buffer(1)]],
-                        constant float& cap [[buffer(2)]],
-                        constant uint& n [[buffer(3)]],
-                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
-    float v = x[gid];
-    out[gid] = tanh(v / cap) * cap;
-}
 
 constant const float nvfp4_e2m1_lut[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -2338,13 +2118,6 @@ kernel void gemv_jesse_lut(
     y[gid] = float(accum);
 }
 
-kernel void gelu_tanh_f32(device const float* x [[buffer(0)]],
-                          device float* out [[buffer(1)]],
-                          constant uint& n [[buffer(2)]],
-                          uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = gelu_tanh(x[i]);
-}
-
 struct Conv2dParams {
     uint in_channels;
     uint in_h;
@@ -2357,36 +2130,3 @@ struct Conv2dParams {
     uint has_bias;
 };
 
-kernel void conv2d_f32(device const float* in [[buffer(0)]],
-                       device const float* weights [[buffer(1)]],
-                       device const float* bias [[buffer(2)]],
-                       device float* out [[buffer(3)]],
-                       constant Conv2dParams& p [[buffer(4)]],
-                       uint gid [[thread_position_in_grid]]) {
-    uint total = p.out_channels * p.out_h * p.out_w;
-    if (gid >= total) return;
-
-    uint ow = gid % p.out_w;
-    uint rem = gid / p.out_w;
-    uint oh = rem % p.out_h;
-    uint oc = rem / p.out_h;
-
-    float sum = p.has_bias ? bias[oc] : 0.0f;
-    uint ih_base = oh * p.stride;
-    uint iw_base = ow * p.stride;
-
-    for (uint ic = 0; ic < p.in_channels; ic++) {
-        for (uint kh = 0; kh < p.kernel_size; kh++) {
-            for (uint kw = 0; kw < p.kernel_size; kw++) {
-                uint ih = ih_base + kh;
-                uint iw = iw_base + kw;
-                if (ih < p.in_h && iw < p.in_w) {
-                    float val = in[(ic * p.in_h + ih) * p.in_w + iw];
-                    float w_val = weights[((oc * p.in_channels + ic) * p.kernel_size + kh) * p.kernel_size + kw];
-                    sum += val * w_val;
-                }
-            }
-        }
-    }
-    out[gid] = sum;
-}

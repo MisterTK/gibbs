@@ -111,6 +111,9 @@ fn gpu_fixture(f: Family) {
             classifier_on_gpu("deberta-v2", synth::deberta_v2());
             classifier_on_gpu("deberta-v1", synth::deberta_v1());
         }
+        Family::ClassifierDecoder => {
+            gibbs_engine::model::classifier::gpu_fixture().expect("decoder seq-cls fixture")
+        }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }

@@ -265,10 +265,7 @@ pub fn family_status(f: Family) -> Status {
         ),
         Seq2Seq => Status::Gated("builder: no seq2seq graph builder (beam search, positions)"),
         Idefics3Siglip => Status::Gated("builder: SigLIP forward is host Rust, no graph builder"),
-        ClassifierBert | ClassifierModern => Status::Gpu,
-        ClassifierDecoder => {
-            Status::Gated("builder: decoder seq-cls forward is host Rust, no graph builder")
-        }
+        ClassifierBert | ClassifierModern | ClassifierDecoder => Status::Gpu,
         DiffusionUnet => Status::Gated("builder: UNet forward is host Rust, no graph builder"),
         DiffusionDit => Status::Gated("builder: DiT forward is host Rust, no graph builder"),
         Vae => Status::Gated("builder: VAE decoders are host Rust, no graph builder"),
@@ -597,13 +594,31 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (unary(UnaryKind::Scale(0.5)), F32),
             (unary(UnaryKind::Tanh), F32),
         ]),
+        // Uncached causal prefill of the whole prompt, last row sliced, then the bias-free score
+        // Linear (GraphLm / GPT-2 / OPT / Qwen3 / Gemma 3 / Gemma 4 seq-cls programs).
         Family::ClassifierDecoder => ops.extend([
             (Op::Embedding, F32),
             (rms(), F32),
+            (ln(), F32),
             (Op::Linear, F32),
-            (cached_attn(), F32),
+            (
+                Op::Attention {
+                    heads: 2,
+                    kv_heads: 1,
+                    causal: true,
+                    window: Some(4),
+                    soft_cap: None,
+                },
+                F32,
+            ),
+            (rope_hs(), F32),
             (Op::SwiGlu, F32),
-            (Op::Gather { axis: 0 }, F32),
+            (Op::GeGlu, F32),
+            (Op::Gelu { tanh: true }, F32),
+            (Op::Relu, F32),
+            (Op::Mul, F32),
+            (Op::Add, F32),
+            (slice(), F32),
         ]),
         Family::DiffusionUnet => ops.extend([
             (conv2d(), F32),
