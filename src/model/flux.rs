@@ -32,6 +32,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod graph_program;
+
+/// A tiny random-weight FLUX forward as a graph (the GPU-only matrix fixture).
+pub fn tiny_dit_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    graph_program::fixture::tiny_graph()
+}
+
 const HEAD_DIM: usize = 128;
 /// FLUX.1/Chroma RoPE: (unused, row, col) axes; FLUX.2 uses `config.axes_dims_rope` (t, h, w, l).
 const AXES: [usize; 3] = [16, 56, 56];
@@ -710,6 +717,8 @@ pub struct FluxTransformer {
     /// FLUX.2 feed-forwards are SwiGLU; FLUX.1/Chroma use tanh-GELU.
     swiglu: bool,
     label: String,
+    /// Metal programs per (image tokens, text tokens, guided) (GPU-only runs).
+    gpu: graph_program::Cache,
 }
 
 impl FluxTransformer {
@@ -916,6 +925,7 @@ impl FluxTransformer {
             theta: if flux2 { 2000.0 } else { THETA },
             swiglu: flux2,
             label,
+            gpu: Default::default(),
         })
     }
 
@@ -1042,8 +1052,13 @@ impl FluxTransformer {
             let mlp = if self.swiglu { mlp_in / 2 } else { mlp_in };
             let (mut q, mut k, mut vv) = (vec![0.0; s * d], vec![0.0; s * d], vec![0.0; s * d]);
             let mut cat = vec![0.0; s * (d + mlp)];
+            // FLUX.2 SwiGLU acts on the MLP part of each row only (diffusers splits qkv | mlp first).
             let act = if self.swiglu {
-                swiglu_rows(&h, w1)
+                let tail: Vec<f32> = h
+                    .chunks_exact(w1)
+                    .flat_map(|r| r[3 * d..].iter().copied())
+                    .collect();
+                swiglu_rows(&tail, mlp_in)
             } else {
                 Vec::new()
             };
@@ -1366,7 +1381,6 @@ pub(crate) fn t5_load(dir: &Path) -> Result<T5Encoder, String> {
 impl FluxPipeline {
     /// A diffusers FluxPipeline, ChromaPipeline or Flux2KleinPipeline snapshot.
     pub fn load(dir: &Path, hub: &HuggingFaceHub) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         Self::load_with(dir, hub, None, &[])
     }
 
@@ -1521,7 +1535,8 @@ impl FluxPipeline {
     }
 
     /// Projected text tokens `[nt, d]` and `nt`.
-    fn text(&self, prompt: &str) -> Result<(Vec<f32>, usize), String> {
+    /// The text-encoder context `[nt, txt_in.k]` before `txt_in` (the GPU program applies it).
+    fn text_ctx(&self, prompt: &str) -> Result<(Vec<f32>, usize), String> {
         let ctx = match &self.text {
             TextEnc::ClipT5 {
                 t5, tok, max_seq, ..
@@ -1570,6 +1585,11 @@ impl FluxPipeline {
             }
         };
         let nt = ctx.len() / self.tr.txt_in.k;
+        Ok((ctx, nt))
+    }
+
+    fn text(&self, prompt: &str) -> Result<(Vec<f32>, usize), String> {
+        let (ctx, nt) = self.text_ctx(prompt)?;
         Ok((self.tr.txt_in.fwd(&ctx, nt), nt))
     }
 
@@ -1746,15 +1766,23 @@ impl ImageGenerator for FluxPipeline {
         }
         let guidance = req.guidance.unwrap_or(d.guidance);
         let t0 = Instant::now();
+        let gpu = crate::model::dit_graph::use_metal();
         let y = match &self.text {
             TextEnc::ClipT5 { clip, .. } => {
-                self.tr.pooled(&clip.encode(&req.prompt, false)?.pooled)
+                let pooled = clip.encode(&req.prompt, false)?.pooled;
+                // The GPU program applies `vector_in` itself.
+                if gpu {
+                    pooled
+                } else {
+                    self.tr.pooled(&pooled)
+                }
             }
             _ => Vec::new(),
         };
-        let (txt, nt) = self.text(&req.prompt)?;
+        let text = |p: &str| if gpu { self.text_ctx(p) } else { self.text(p) };
+        let (txt, nt) = text(&req.prompt)?;
         let neg = match self.uses_cfg(guidance) {
-            true => Some(self.text(req.negative_prompt.as_deref().unwrap_or(""))?),
+            true => Some(text(req.negative_prompt.as_deref().unwrap_or(""))?),
             false => None,
         };
         tracing::info!("FLUX text encoders: {:.1}s", t0.elapsed().as_secs_f32());
@@ -1777,11 +1805,18 @@ impl ImageGenerator for FluxPipeline {
         let g_in = self.tr.guidance_embeds().then_some(guidance);
         for i in 0..steps {
             let t = Instant::now();
-            let mut v = self
-                .tr
-                .forward(&x, ni, &txt, nt, &y, sigmas[i], g_in, &rope);
+            let vel = |x: &[f32], txt: &[f32], n: usize, g: Option<f32>, rope: &Rope| {
+                if gpu {
+                    let ids = position_ids(n, h / 2, w / 2, self.tr.swiglu);
+                    self.tr
+                        .forward_gpu(&self.tr.gpu, x, ni, txt, n, &y, sigmas[i], g, &ids)
+                } else {
+                    Ok(self.tr.forward(x, ni, txt, n, &y, sigmas[i], g, rope))
+                }
+            };
+            let mut v = vel(&x, &txt, nt, g_in, &rope)?;
             if let (Some((ntxt, n)), Some(nr)) = (&neg, &neg_rope) {
-                let vn = self.tr.forward(&x, ni, ntxt, *n, &y, sigmas[i], None, nr);
+                let vn = vel(&x, ntxt, *n, None, nr)?;
                 v.iter_mut()
                     .zip(&vn)
                     .for_each(|(v, n)| *v = n + guidance * (*v - n));

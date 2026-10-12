@@ -154,6 +154,14 @@ fn gpu_fixture(f: Family) {
             run_on_gpu("Audio conformer", g, w);
             scatter_fixture("Audio");
         }
+        Family::DiffusionDit => {
+            let (g, w) = gibbs_engine::model::flux::tiny_dit_graph().expect("tiny FLUX DiT graph");
+            run_on_gpu("DiffusionDit", g, w);
+        }
+        Family::VideoLtx => {
+            let (g, w) = gibbs_engine::model::ltx::tiny_dit_graph().expect("tiny LTX DiT graph");
+            run_on_gpu("VideoLtx", g, w);
+        }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }
