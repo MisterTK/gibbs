@@ -15,7 +15,28 @@ pub fn commit_and_wait(cb: &CommandBufferRef) -> Result<(), String> {
     cb.wait_until_completed();
     match cb.status() {
         metal::MTLCommandBufferStatus::Completed => Ok(()),
-        status => Err(format!("Metal execution failed ({status:?})")),
+        status => {
+            let desc = unsafe {
+                let err: *mut metal::objc::runtime::Object = metal::objc::msg_send![cb, error];
+                if !err.is_null() {
+                    let d: *mut metal::objc::runtime::Object =
+                        metal::objc::msg_send![err, localizedDescription];
+                    if !d.is_null() {
+                        let s: *const std::ffi::c_char = metal::objc::msg_send![d, UTF8String];
+                        if !s.is_null() {
+                            std::ffi::CStr::from_ptr(s).to_string_lossy().to_string()
+                        } else {
+                            "no utf8".into()
+                        }
+                    } else {
+                        "no description".into()
+                    }
+                } else {
+                    "no error object".into()
+                }
+            };
+            Err(format!("Metal execution failed ({status:?}): {desc}"))
+        }
     }
 }
 
@@ -1676,7 +1697,13 @@ impl Session {
             for s in steps {
                 for &v in &s.reads {
                     if let ValueKind::State(name) = &graph.value(v).kind {
-                        let n = numel(graph, v)?;
+                        let val = graph.value(v);
+                        let max_pos = 4096usize;
+                        let n = if val.shape.len() == 2 && val.shape[0] > max_pos {
+                            max_pos * val.shape[1]
+                        } else {
+                            numel(graph, v)?
+                        };
                         if !st.metal_buffers.contains_key(name) {
                             let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
                             if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
@@ -1700,7 +1727,13 @@ impl Session {
             for s in steps {
                 for &v in &s.reads {
                     if let ValueKind::State(name) = &graph.value(v).kind {
-                        let n = numel(graph, v)?;
+                        let val = graph.value(v);
+                        let max_pos = 4096usize;
+                        let n = if val.shape.len() == 2 && val.shape[0] > max_pos {
+                            max_pos * val.shape[1]
+                        } else {
+                            numel(graph, v)?
+                        };
                         if !sbufs.contains_key(name) {
                             let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
                             sbufs.insert(name.clone(), Arc::new(buf));
