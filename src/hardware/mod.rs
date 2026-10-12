@@ -1,5 +1,6 @@
 use std::fmt;
 use std::path::PathBuf;
+pub mod cpu_compute;
 pub mod profile;
 pub use profile::HardwareProfile;
 

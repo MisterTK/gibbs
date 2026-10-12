@@ -777,6 +777,7 @@ impl SdUnet {
         add: Option<&[f32]>,
         t_cond: Option<&[f32]>,
     ) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("unet::forward");
         let d = self.downscale;
         if h == 0 || w == 0 || h % d != 0 || w % d != 0 {
             return Err(format!("UNet latent size {h}x{w} must be non-zero multiples of {d}"));

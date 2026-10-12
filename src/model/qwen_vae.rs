@@ -267,6 +267,7 @@ impl QwenVae {
     /// A diffusers `vae/` directory, or the ComfyUI `qwen_image_vae.safetensors` alone (no config:
     /// the Wan 2.1 statistics apply).
     pub fn load(dir: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::Vae)?;
         let cfg = crate::model::dit::read_config(dir).unwrap_or(Value::Null);
         if !cfg.is_null() {
             let ok = cfg["base_dim"].as_u64().unwrap_or(BASE as u64) == BASE as u64

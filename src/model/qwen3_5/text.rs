@@ -718,6 +718,7 @@ impl TextModel {
         taps: &[usize],
         tapped: &mut Vec<f32>,
     ) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("qwen3_5::text::forward_rows");
         let (n, d) = (pos.len(), self.hidden);
         if let Some(hc) = &self.hc {
             assert_eq!(first, 0, "hyper-connected decoders run from the embeddings");
@@ -1882,152 +1883,164 @@ fn l2_normalize(x: &mut [f32], scale: f32) {
     x.iter_mut().for_each(|v| *v *= inv);
 }
 
+/// Tiny synthetic Qwen 3.5 text model (one DeltaNet and one gated full-attention layer) with
+/// deterministic weights. Fixture for `tests/cpu_free_matrix.rs` and this module's tests.
+pub fn tiny_model() -> (TextModel, usize) {
+    let (hidden, vocab, layers, heads, kv_heads, hd) = (128, 128, 2, 4, 2, 32);
+    let inter = 128;
+    let c_kernel = 4;
+    let (lin_kh, lin_vh, lin_kd, lin_vd) = (1, 2, 16, 16);
+
+    let cfg = serde_json::json!({
+        "hidden_size": hidden,
+        "vocab_size": vocab,
+        "num_hidden_layers": layers,
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv_heads,
+        "head_dim": hd,
+        "intermediate_size": inter,
+        "max_position_embeddings": 64,
+        "attn_output_gate": true,
+        "layer_types": ["linear_attention", "full_attention"],
+        "linear_num_key_heads": lin_kh,
+        "linear_num_value_heads": lin_vh,
+        "linear_key_head_dim": lin_kd,
+        "linear_value_head_dim": lin_vd,
+        "linear_conv_kernel_dim": c_kernel,
+        "rope_parameters": {
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": true,
+            "mrope_section": [1, 1, 2]
+        }
+    });
+
+    let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
+    specs.push(("model.embed_tokens.weight".into(), vec![vocab, hidden]));
+    specs.push(("model.norm.weight".into(), vec![hidden]));
+    specs.push(("lm_head.weight".into(), vec![vocab, hidden]));
+
+    // Layer 0: DeltaNet
+    let cd = 2 * lin_kh * lin_kd + lin_vh * lin_vd;
+    specs.push(("model.layers.0.input_layernorm.weight".into(), vec![hidden]));
+    specs.push((
+        "model.layers.0.post_attention_layernorm.weight".into(),
+        vec![hidden],
+    ));
+    specs.push((
+        "model.layers.0.linear_attn.in_proj_qkv.weight".into(),
+        vec![cd, hidden],
+    ));
+    specs.push((
+        "model.layers.0.linear_attn.in_proj_z.weight".into(),
+        vec![lin_vh * lin_vd, hidden],
+    ));
+    specs.push((
+        "model.layers.0.linear_attn.in_proj_b.weight".into(),
+        vec![lin_vh, hidden],
+    ));
+    specs.push((
+        "model.layers.0.linear_attn.in_proj_a.weight".into(),
+        vec![lin_vh, hidden],
+    ));
+    specs.push((
+        "model.layers.0.linear_attn.conv1d.weight".into(),
+        vec![cd, c_kernel],
+    ));
+    specs.push(("model.layers.0.linear_attn.neg_A".into(), vec![lin_vh]));
+    specs.push(("model.layers.0.linear_attn.dt_bias".into(), vec![lin_vh]));
+    specs.push((
+        "model.layers.0.linear_attn.norm.weight".into(),
+        vec![lin_vd],
+    ));
+    specs.push((
+        "model.layers.0.linear_attn.out_proj.weight".into(),
+        vec![hidden, lin_vh * lin_vd],
+    ));
+    specs.push((
+        "model.layers.0.mlp.gate_proj.weight".into(),
+        vec![inter, hidden],
+    ));
+    specs.push((
+        "model.layers.0.mlp.up_proj.weight".into(),
+        vec![inter, hidden],
+    ));
+    specs.push((
+        "model.layers.0.mlp.down_proj.weight".into(),
+        vec![hidden, inter],
+    ));
+
+    // Layer 1: Full Attention (with attn_output_gate)
+    specs.push(("model.layers.1.input_layernorm.weight".into(), vec![hidden]));
+    specs.push((
+        "model.layers.1.post_attention_layernorm.weight".into(),
+        vec![hidden],
+    ));
+    specs.push((
+        "model.layers.1.self_attn.q_proj.weight".into(),
+        vec![heads * 2 * hd, hidden],
+    ));
+    specs.push((
+        "model.layers.1.self_attn.k_proj.weight".into(),
+        vec![kv_heads * hd, hidden],
+    ));
+    specs.push((
+        "model.layers.1.self_attn.v_proj.weight".into(),
+        vec![kv_heads * hd, hidden],
+    ));
+    specs.push((
+        "model.layers.1.self_attn.o_proj.weight".into(),
+        vec![hidden, heads * hd],
+    ));
+    specs.push(("model.layers.1.self_attn.q_norm.weight".into(), vec![hd]));
+    specs.push(("model.layers.1.self_attn.k_norm.weight".into(), vec![hd]));
+    specs.push((
+        "model.layers.1.mlp.gate_proj.weight".into(),
+        vec![inter, hidden],
+    ));
+    specs.push((
+        "model.layers.1.mlp.up_proj.weight".into(),
+        vec![inter, hidden],
+    ));
+    specs.push((
+        "model.layers.1.mlp.down_proj.weight".into(),
+        vec![hidden, inter],
+    ));
+
+    let shapes: std::collections::HashMap<String, usize> = specs
+        .iter()
+        .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
+        .collect();
+
+    let weights = crate::model::weights::Weights::from_f32(specs, |name| {
+        let n: usize = name
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| (i + 1) * b as usize)
+            .sum();
+        let count = shapes[name];
+        Ok((0..count)
+            .map(|i| (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
+            .collect())
+    })
+    .unwrap();
+
+    let text_model = TextModel::load(&weights, &cfg, Arch::Qwen35).unwrap();
+    (text_model, hidden)
+}
+
+/// Decode graph of [`tiny_model`].
+pub fn tiny_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    tiny_model().0.to_decode_graph()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_qwen3_5_to_decode_graph() {
-        let (hidden, vocab, layers, heads, kv_heads, hd) = (128, 128, 2, 4, 2, 32);
-        let inter = 128;
-        let c_kernel = 4;
-        let (lin_kh, lin_vh, lin_kd, lin_vd) = (1, 2, 16, 16);
-
-        let cfg = serde_json::json!({
-            "hidden_size": hidden,
-            "vocab_size": vocab,
-            "num_hidden_layers": layers,
-            "num_attention_heads": heads,
-            "num_key_value_heads": kv_heads,
-            "head_dim": hd,
-            "intermediate_size": inter,
-            "max_position_embeddings": 64,
-            "attn_output_gate": true,
-            "layer_types": ["linear_attention", "full_attention"],
-            "linear_num_key_heads": lin_kh,
-            "linear_num_value_heads": lin_vh,
-            "linear_key_head_dim": lin_kd,
-            "linear_value_head_dim": lin_vd,
-            "linear_conv_kernel_dim": c_kernel,
-            "rope_parameters": {
-                "rope_theta": 10000.0,
-                "partial_rotary_factor": 0.25,
-                "mrope_interleaved": true,
-                "mrope_section": [1, 1, 2]
-            }
-        });
-
-        let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
-        specs.push(("model.embed_tokens.weight".into(), vec![vocab, hidden]));
-        specs.push(("model.norm.weight".into(), vec![hidden]));
-        specs.push(("lm_head.weight".into(), vec![vocab, hidden]));
-
-        // Layer 0: DeltaNet
-        let cd = 2 * lin_kh * lin_kd + lin_vh * lin_vd;
-        specs.push(("model.layers.0.input_layernorm.weight".into(), vec![hidden]));
-        specs.push((
-            "model.layers.0.post_attention_layernorm.weight".into(),
-            vec![hidden],
-        ));
-        specs.push((
-            "model.layers.0.linear_attn.in_proj_qkv.weight".into(),
-            vec![cd, hidden],
-        ));
-        specs.push((
-            "model.layers.0.linear_attn.in_proj_z.weight".into(),
-            vec![lin_vh * lin_vd, hidden],
-        ));
-        specs.push((
-            "model.layers.0.linear_attn.in_proj_b.weight".into(),
-            vec![lin_vh, hidden],
-        ));
-        specs.push((
-            "model.layers.0.linear_attn.in_proj_a.weight".into(),
-            vec![lin_vh, hidden],
-        ));
-        specs.push((
-            "model.layers.0.linear_attn.conv1d.weight".into(),
-            vec![cd, c_kernel],
-        ));
-        specs.push(("model.layers.0.linear_attn.neg_A".into(), vec![lin_vh]));
-        specs.push(("model.layers.0.linear_attn.dt_bias".into(), vec![lin_vh]));
-        specs.push((
-            "model.layers.0.linear_attn.norm.weight".into(),
-            vec![lin_vd],
-        ));
-        specs.push((
-            "model.layers.0.linear_attn.out_proj.weight".into(),
-            vec![hidden, lin_vh * lin_vd],
-        ));
-        specs.push((
-            "model.layers.0.mlp.gate_proj.weight".into(),
-            vec![inter, hidden],
-        ));
-        specs.push((
-            "model.layers.0.mlp.up_proj.weight".into(),
-            vec![inter, hidden],
-        ));
-        specs.push((
-            "model.layers.0.mlp.down_proj.weight".into(),
-            vec![hidden, inter],
-        ));
-
-        // Layer 1: Full Attention (with attn_output_gate)
-        specs.push(("model.layers.1.input_layernorm.weight".into(), vec![hidden]));
-        specs.push((
-            "model.layers.1.post_attention_layernorm.weight".into(),
-            vec![hidden],
-        ));
-        specs.push((
-            "model.layers.1.self_attn.q_proj.weight".into(),
-            vec![heads * 2 * hd, hidden],
-        ));
-        specs.push((
-            "model.layers.1.self_attn.k_proj.weight".into(),
-            vec![kv_heads * hd, hidden],
-        ));
-        specs.push((
-            "model.layers.1.self_attn.v_proj.weight".into(),
-            vec![kv_heads * hd, hidden],
-        ));
-        specs.push((
-            "model.layers.1.self_attn.o_proj.weight".into(),
-            vec![hidden, heads * hd],
-        ));
-        specs.push(("model.layers.1.self_attn.q_norm.weight".into(), vec![hd]));
-        specs.push(("model.layers.1.self_attn.k_norm.weight".into(), vec![hd]));
-        specs.push((
-            "model.layers.1.mlp.gate_proj.weight".into(),
-            vec![inter, hidden],
-        ));
-        specs.push((
-            "model.layers.1.mlp.up_proj.weight".into(),
-            vec![inter, hidden],
-        ));
-        specs.push((
-            "model.layers.1.mlp.down_proj.weight".into(),
-            vec![hidden, inter],
-        ));
-
-        let shapes: std::collections::HashMap<String, usize> = specs
-            .iter()
-            .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
-            .collect();
-
-        let weights = crate::model::weights::Weights::from_f32(specs, |name| {
-            let n: usize = name
-                .bytes()
-                .enumerate()
-                .map(|(i, b)| (i + 1) * b as usize)
-                .sum();
-            let count = shapes[name];
-            Ok((0..count)
-                .map(|i| (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
-                .collect())
-        })
-        .unwrap();
-
-        let text_model = TextModel::load(&weights, &cfg, Arch::Qwen35).unwrap();
+        let (text_model, hidden) = tiny_model();
         let (decode_g, w) = text_model.to_decode_graph().unwrap();
 
         // Validate SSA

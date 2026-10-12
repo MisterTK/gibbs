@@ -10,6 +10,7 @@ pub mod graph;
 pub(crate) mod ops;
 pub mod seqcls;
 mod text;
+pub use text::tiny_decode_graph;
 mod unified;
 mod vision;
 
@@ -153,7 +154,7 @@ pub fn load(
             .ok_or_else(|| format!("config.{k} missing"))
     };
     let mode = mode.into();
-    let program = compile_gemma4_program(&text, mode);
+    let program = compile_gemma4_program(&text, mode)?;
     Ok(Arc::new(Gemma4 {
         tokenizer,
         text,
@@ -272,10 +273,12 @@ impl NativeLm for Gemma4 {
             let (item, want) = items.next().ok_or("media/placeholder mismatch")?;
             let (soft, n, open, close) = match item {
                 MediaInput::Image(b) => {
+                    crate::graph::avenues::gate(crate::graph::avenues::Family::Gemma4Media)?;
                     let (soft, n) = self.vision.encode(b).map_err(|e| format!("image: {e}"))?;
                     (soft, n, self.boi, self.eoi)
                 }
                 MediaInput::Audio(b) => {
+                    crate::graph::avenues::gate(crate::graph::avenues::Family::Audio)?;
                     let (soft, n) = self.audio.encode(b).map_err(|e| format!("audio: {e}"))?;
                     (soft, n, self.boa, self.eoa)
                 }
@@ -378,6 +381,10 @@ impl NativeLm for Gemma4 {
                 st.done = end;
                 return Ok(last_logits);
             }
+            return Err(
+                "gpu-only: image/audio inputs need the vision/audio program; rerun with --backend cpu"
+                    .into(),
+            );
         }
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
         let stop = match st.blocks.iter().find(|b| b.start < end && end < b.end) {
@@ -421,23 +428,12 @@ impl NativeLm for Gemma4 {
 pub(crate) fn compile_gemma4_program(
     text: &Arc<TextModel>,
     mode: crate::hardware::PlacementMode,
-) -> Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>> {
+) -> Result<Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>, String> {
     if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
-        return None;
+        return Ok(None);
     }
-    match text.to_decode_graph() {
-        Ok((graph, weights)) => {
-            match crate::graph::program::GraphProgram::compile(graph, weights, mode) {
-                Ok(prog) => Some(Arc::new(parking_lot::Mutex::new(prog))),
-                Err(e) => {
-                    tracing::warn!("Gemma4 GraphProgram compile failed, falling back to CPU: {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Gemma4 decode graph lowering failed, falling back to CPU: {e}");
-            None
-        }
-    }
+    let (graph, weights) = text.to_decode_graph().map_err(|e| format!("Gemma 4: {e}"))?;
+    crate::graph::program::GraphProgram::compile(graph, weights, mode)
+        .map(|prog| Some(Arc::new(parking_lot::Mutex::new(prog))))
+        .map_err(|e| format!("Gemma 4: {e}"))
 }

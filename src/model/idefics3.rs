@@ -225,6 +225,7 @@ pub fn load(
     cfg: &Value,
     _mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
+    crate::graph::avenues::gate(crate::graph::avenues::Family::Idefics3Siglip)?;
     let weights = artifacts.weights_path.as_deref().ok_or("no weight file")?;
     if !matches!(
         weights.extension().and_then(|e| e.to_str()),

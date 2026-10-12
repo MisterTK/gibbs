@@ -1,6 +1,8 @@
 //! Universal compiler optimization passes for Graph IR.
 
 pub mod canonical;
+pub mod decompose;
+pub mod dtype_adapt;
 pub mod fusion;
 pub mod megakernel;
 
@@ -13,6 +15,8 @@ pub fn run_optimization_passes(
     mut weights: Option<&mut Weights>,
 ) -> Result<(), String> {
     canonical::run(graph);
+    decompose::run(graph);
+    dtype_adapt::run(graph);
     // 1. Lower MoE nodes if present
     lower_moe_pass(graph)?;
 

@@ -501,6 +501,7 @@ pub struct SanaPipeline {
 impl SanaPipeline {
     /// Loads a diffusers `SanaPipeline` snapshot directory.
     pub fn load(dir: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         let s = crate::model::dit::read_scheduler(dir)?;
         if s["_class_name"] != "DPMSolverMultistepScheduler"
             || s["algorithm_type"] != "dpmsolver++"

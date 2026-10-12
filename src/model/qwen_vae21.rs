@@ -202,6 +202,7 @@ pub struct QwenVae21 {
 impl QwenVae21 {
     /// Reads a diffusers `vae/` directory (decoder and `post_quant_conv`; the encoder is not read).
     pub fn load(dir: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::Vae)?;
         let cfg = read_config(dir)?;
         if cfg["is_residual"].as_bool() != Some(true) || !cfg["patch_size"].is_null() {
             return Err(

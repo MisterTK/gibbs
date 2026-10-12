@@ -106,7 +106,7 @@ fn model(
         }
     };
     let mode = mode.into();
-    let program = super::compile_gemma4_program(&text, mode);
+    let program = super::compile_gemma4_program(&text, mode)?;
     Ok(Arc::new(Gemma4 {
         tokenizer,
         text,

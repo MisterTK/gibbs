@@ -84,6 +84,7 @@ pub fn load_drafter(
     draft: &ModelArtifacts,
     target: &ModelArtifacts,
 ) -> Result<Arc<dyn Drafter>, String> {
+    crate::graph::avenues::gate(crate::graph::avenues::Family::DraftersMtp)?;
     let dw = draft
         .weights_path
         .as_deref()

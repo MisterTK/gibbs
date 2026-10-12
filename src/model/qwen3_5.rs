@@ -10,6 +10,7 @@
 
 mod draft;
 mod text;
+pub use text::tiny_decode_graph;
 mod vision;
 
 pub use draft::{
@@ -91,10 +92,14 @@ pub fn load(
         .is_some()
         .then(|| Arc::new(MtpDrafter(text.clone())) as Arc<dyn Drafter>);
     let program = if drafter.is_some() {
-        tracing::info!("MTP speculative decoding checkpointing requires CPU execution for now");
+        // MTP checkpointing needs state snapshot/restore, which only the CPU executor has.
+        crate::graph::avenues::family_gate(
+            crate::graph::avenues::Family::DraftersMtp,
+            crate::graph::avenues::resolved_backend(mode),
+        )?;
         None
     } else {
-        compile_qwen_program(&text, mode)
+        compile_qwen_program(&text, mode)?
     };
     Ok(Arc::new(Qwen35 {
         tok,
@@ -154,7 +159,7 @@ pub fn load_dense(
     };
     let text = Arc::new(TextModel::load(&ck, cfg, arch)?);
     let tok = load_json_tokenizer(&dir.join("tokenizer.json"))?;
-    let program = compile_qwen_program(&text, mode.into());
+    let program = compile_qwen_program(&text, mode.into())?;
     Ok(Arc::new(Dense { tok, text, program }))
 }
 
@@ -314,7 +319,7 @@ fn gguf_model(
     let (ck, cfg, arch) = gguf_checkpoint(map, m)?;
     let text = Arc::new(TextModel::load(&ck, &cfg, arch)?);
     let tok = crate::model::UniversalModelLoader::extract_gguf_tokenizer(map)?;
-    let program = compile_qwen_program(&text, mode);
+    let program = compile_qwen_program(&text, mode)?;
     Ok(if matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) {
         // llama.cpp ships the vision tower as a separate mmproj GGUF: images are refused.
         Arc::new(Qwen35 {
@@ -341,6 +346,10 @@ pub fn load_ninfer(
         .as_deref()
         .filter(|p| p.to_string_lossy().ends_with(crate::model::ninfer::EXT))?;
     let load = || -> Result<Arc<dyn NativeLm>, String> {
+        crate::graph::avenues::family_gate(
+            crate::graph::avenues::Family::Ninfer,
+            crate::graph::avenues::resolved_backend(_mode.into()),
+        )?;
         let art = crate::model::ninfer::Artifact::open(path)?;
         let (ck, cfg) = art.checkpoint()?;
         let text = TextModel::load(&ck, &cfg, Arch::Qwen35)?;
@@ -832,25 +841,14 @@ fn gguf_to_hf(arch: Arch, name: &str) -> Option<String> {
 fn compile_qwen_program(
     text: &Arc<TextModel>,
     mode: crate::hardware::PlacementMode,
-) -> Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>> {
+) -> Result<Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>, String> {
     if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
-        return None;
+        return Ok(None);
     }
-    match text.to_decode_graph() {
-        Ok((graph, weights)) => {
-            match crate::graph::program::GraphProgram::compile(graph, weights, mode) {
-                Ok(prog) => Some(Arc::new(parking_lot::Mutex::new(prog))),
-                Err(e) => {
-                    tracing::warn!("GraphProgram compile failed, falling back to CPU: {e}");
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Decode graph lowering failed, falling back to CPU: {e}");
-            None
-        }
-    }
+    let (graph, weights) = text.to_decode_graph().map_err(|e| format!("Qwen3.5: {e}"))?;
+    crate::graph::program::GraphProgram::compile(graph, weights, mode)
+        .map(|prog| Some(Arc::new(parking_lot::Mutex::new(prog))))
+        .map_err(|e| format!("Qwen3.5: {e}"))
 }
 
 /// Text-only dense decoder (Qwen3, HunYuan dense v1); also the decoder body of the Qwen3 /
@@ -1143,6 +1141,9 @@ impl NativeLm for Qwen35 {
         if images.is_empty() {
             return Ok((ids, Box::new(seq)));
         }
+        if self.program.is_some() {
+            crate::graph::avenues::gate(crate::graph::avenues::Family::Qwen35Vision)?;
+        }
         let (vision, pre, image_token) = self
             .vision
             .as_ref()
@@ -1308,6 +1309,10 @@ impl Qwen35 {
                 seq.len = start_pos + tokens.len();
                 return Ok(logits);
             }
+            return Err(
+                "gpu-only: image/audio inputs need the vision/audio program; rerun with --backend cpu"
+                    .into(),
+            );
         }
         if tokens.is_empty() {
             return Err("forward needs at least one token".into());

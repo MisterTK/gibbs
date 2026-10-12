@@ -320,6 +320,7 @@ impl Unet3d {
     /// diffusers UNet3DConditionModel from a safetensors file (F16 or F32, PyTorch shapes).
     /// Missing/mis-shaped tensor = Err naming it.
     pub fn load(path: &Path) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoModelScope)?;
         let st = St::open(path)?;
         let c0 = BLOCK_OUT[0];
         let top = BLOCK_OUT.len() - 1;
@@ -394,6 +395,7 @@ impl Unet3d {
         ctx: &[f32],
         ctx_len: usize,
     ) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("unet3d::forward");
         if frames == 0 || h == 0 || w == 0 || h % DOWNSCALE != 0 || w % DOWNSCALE != 0 {
             return Err(format!("UNet3D needs frames > 0 and {h}x{w} non-zero multiples of {DOWNSCALE}"));
         }

@@ -68,6 +68,7 @@ impl TextToVideoPipeline {
     }
 
     pub fn load(hub: &HuggingFaceHub, repo_id: &str) -> Result<Self, String> {
+        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoModelScope)?;
         let fetch = |file: &str| -> Result<PathBuf, String> {
             println!("Fetching {repo_id}/{file} (reused if cached)");
             let path = hub

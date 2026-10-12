@@ -1250,6 +1250,7 @@ pub fn load(
     cfg: &Value,
     _mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Result<Arc<dyn NativeLm>, String> {
+    crate::graph::avenues::gate(crate::graph::avenues::Family::Seq2Seq)?;
     let arch = cfg["architectures"][0].as_str().unwrap_or("");
     let family = match arch {
         "MarianMTModel" => Family::Marian,

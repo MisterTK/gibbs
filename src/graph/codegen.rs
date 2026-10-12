@@ -177,3 +177,10 @@ mod tests {
         assert!(code.contains("out[row] = sum[0] * sum[1];"));
     }
 }
+
+/// Whether the generated-kernel templates cover `op` at `dtype`. Nothing is covered until the
+/// generated GEMV is wired into `GraphProgram::compile` (G3.2) and the movement/elementwise/reduction
+/// templates exist (G4.1).
+pub fn can_generate(_op: &crate::graph::Op, _dtype: crate::graph::DType) -> bool {
+    false
+}

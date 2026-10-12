@@ -80,30 +80,15 @@ impl ExecutableModel {
         mode: impl Into<crate::hardware::PlacementMode>,
     ) -> Result<Self, String> {
         let mode = mode.into();
-        let (mut graph, _) = model.to_graph_with_weights();
-        let available = crate::hardware::available_devices();
-        let plan = crate::graph::placement::place_graph_default(&mut graph, mode, &available, None);
-        let counts: Vec<String> = plan
-            .report
-            .device_op_counts
-            .iter()
-            .map(|(d, count)| format!("{d}: {count} ops"))
-            .collect();
-        tracing::info!(
-            "Model 'GraphLm ({} layers, {} hidden)' placed: {}",
-            model.config.num_layers,
-            model.config.hidden_dim,
-            counts.join(", ")
-        );
-        if !plan.report.fallbacks.is_empty() {
-            for fb in &plan.report.fallbacks {
-                tracing::info!("Placement fallback: {fb}");
-            }
-        }
         let target_device = match mode {
             crate::hardware::PlacementMode::Pin(d) => d,
-            crate::hardware::PlacementMode::Auto => plan.primary_device(),
+            crate::hardware::PlacementMode::Auto => crate::hardware::default_device(),
         };
+        tracing::info!(
+            "Model 'GraphLm ({} layers, {} hidden)' placed on {target_device}",
+            model.config.num_layers,
+            model.config.hidden_dim,
+        );
 
         match target_device {
             Device::Cpu => {
