@@ -583,6 +583,25 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
 }
 "#,
     },
+    Spec {
+        format: QuantFormat::GGUF_NVFP4,
+        block_elems: 64,
+        block_bytes: 36,
+        tables: &["fp4"],
+        // d = UE4M3(scale byte) * 0.5 (0 and 0x7F give 0), assembled from bits like the CPU reference.
+        body: r#"
+inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
+    uint x = blk[sub >> 1];
+    uint e = (x >> 3) & 0xFu, m = x & 7u;
+    float d = (x == 0u || x == 0x7Fu) ? 0.0f : (e == 0u ? float(m) / 1024.0f : as_type<float>(((e + 119u) << 23) | (m << 20)));
+    device const uchar* q = blk + 4 + (sub >> 1) * 8;
+    uint sh = (sub & 1) * 4;
+    for (uint i = 0; i < 8; i++) {
+        out8[i] = float(KVALUES_FP4[(q[i] >> sh) & 0x0Fu]) * d;
+    }
+}
+"#,
+    },
 ];
 
 use crate::model::weight_format::ReencodePolicy;
