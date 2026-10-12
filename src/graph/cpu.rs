@@ -1020,7 +1020,8 @@ pub fn run(
                 let d = *dilation;
                 let channels = w.len() / k.max(1);
                 let n = x.len() / channels.max(1);
-                let hist = k - 1;
+                // a dilated causal conv reaches (k-1)*d samples back
+                let hist = (k - 1) * d;
                 let mut window = if ins.len() >= 3 {
                     operand(&bound, &slots, ins, name, 2)
                         .map(<[f32]>::to_vec)
