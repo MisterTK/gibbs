@@ -2,7 +2,9 @@
 //! f32: pre-LN encoder with RoPE, alternating global / sliding-window attention and a GeGLU MLP;
 //! the head pools (CLS or mean), then dense → activation → LayerNorm → classifier.
 
+use super::head::{self, Gb, HeadGraph, HeadLin, HeadPool, HeadPost};
 use super::{Checkpoint, Lin};
+use crate::graph::{DType, Op, RopeVariant, Tensor};
 use crate::model::nn;
 use crate::model::par::{par_for, OutPtr};
 use serde_json::Value;
@@ -32,6 +34,15 @@ impl Act {
             Act::GeluTanh => nn::gelu_tanh(x),
             Act::Silu => nn::silu(x),
             Act::Relu => x.iter_mut().for_each(|v| *v = v.max(0.0)),
+        }
+    }
+
+    fn graph(self) -> head::Act {
+        match self {
+            Act::Gelu => head::Act::Gelu,
+            Act::GeluTanh => head::Act::GeluTanh,
+            Act::Silu => head::Act::Silu,
+            Act::Relu => head::Act::Relu,
         }
     }
 }
@@ -270,6 +281,7 @@ impl ModernBert {
 
     /// Logits `[num_labels]` of one unpadded sequence.
     pub(super) fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("classifier::modernbert::forward");
         let (n, h, heads) = (ids.len(), self.hidden, self.heads);
         let d = h / heads;
         let rows = self.tok_emb.len() / h;
@@ -359,5 +371,79 @@ impl ModernBert {
         self.head_act.apply(&mut y);
         let y = self.ln(&y, 1, &self.head_norm);
         Ok(self.classifier.apply(&y, 1))
+    }
+
+    /// The pool → dense → act → LayerNorm → classifier head as graph nodes.
+    pub(super) fn head_graph(&self, post: HeadPost) -> HeadGraph {
+        HeadGraph {
+            pool: if self.mean_pool { HeadPool::Mean } else { HeadPool::First },
+            normalize: false,
+            dense: Some((HeadLin::from(&self.head_dense), self.head_act.graph())),
+            norm: Some((self.head_norm.0.clone(), self.head_norm.1.clone(), self.eps)),
+            out: HeadLin::from(&self.classifier),
+            post,
+        }
+    }
+
+    /// The Metal program for `ids`: embeddings, pre-LN layers (RoPE, global / windowed attention,
+    /// GeGLU) and `head`, as graph nodes on `gb`; returns the graph inputs.
+    pub(super) fn graph(&self, gb: &mut Gb, ids: &[u32], head: &HeadGraph) -> Result<Vec<Tensor>, String> {
+        let (n, h, heads) = (ids.len(), self.hidden, self.heads);
+        let d = h / heads;
+        let id_v = gb.g.input("input_ids", vec![n], DType::U32);
+        let pos_v = gb.g.input("position_ids", vec![n], DType::U32);
+        let mask_v = gb.g.input("attention_mask", vec![n], DType::U32);
+        let table = gb.weight("embeddings.tok", vec![self.tok_emb.len() / h, h], || self.tok_emb.clone());
+        let e = gb.add("emb.tok", Op::Embedding, &[table, id_v], vec![n, h]);
+        let mut x = gb.ln(e, "embeddings.norm", &self.emb_norm, self.eps);
+        for (l, layer) in self.layers.iter().enumerate() {
+            let p = format!("layer.{l}");
+            let a = match &layer.attn_norm {
+                Some(norm) => gb.ln(x, &format!("{p}.attn_norm"), norm, self.eps),
+                None => x,
+            };
+            let qkv = gb.lin(a, &format!("{p}.Wqkv"), &layer.wqkv);
+            let inv = gb.weight(&format!("{p}.inv_freq"), vec![d / 2], || layer.rope.0.clone());
+            // rotate_half pairs (i, i + d/2) = HalfSplit; the YaRN attention factor scales cos/sin.
+            let rope = Op::Rope {
+                head_dim: d,
+                rotary_dim: d,
+                variant: RopeVariant::HalfSplit,
+                mscale: layer.rope.1,
+            };
+            let q = gb.slice(&format!("{p}.q"), qkv, -1, 0, h);
+            let q = gb.add(&format!("{p}.rope_q"), rope.clone(), &[q, pos_v, inv], vec![n, h]);
+            let k = gb.slice(&format!("{p}.k"), qkv, -1, h, 2 * h);
+            let k = gb.add(&format!("{p}.rope_k"), rope, &[k, pos_v, inv], vec![n, h]);
+            let v = gb.slice(&format!("{p}.v"), qkv, -1, 2 * h, 3 * h);
+            // Keys `|i - j| <= half` = the op's non-causal window `w / 2`.
+            let attn = Op::Attention {
+                heads,
+                kv_heads: heads,
+                causal: false,
+                window: layer.window.map(|half| 2 * half),
+                soft_cap: None,
+            };
+            let c = gb.add(&format!("{p}.attn"), attn, &[q, k, v], vec![n, h]);
+            let o = gb.lin(c, &format!("{p}.Wo"), &layer.wo);
+            x = gb.add(&format!("{p}.res1"), Op::Add, &[x, o], vec![n, h]);
+            let m = gb.ln(x, &format!("{p}.mlp_norm"), &layer.mlp_norm, self.eps);
+            let wi = gb.lin(m, &format!("{p}.Wi"), &layer.wi);
+            let inter = layer.mlp_wo.in_f;
+            let gate = gb.slice(&format!("{p}.gate"), wi, -1, 0, inter);
+            let up = gb.slice(&format!("{p}.up"), wi, -1, inter, 2 * inter);
+            let gate = gb.act(&format!("{p}.act"), self.act.graph(), gate);
+            let gu = gb.add(&format!("{p}.glu"), Op::Mul, &[gate, up], vec![n, inter]);
+            let mo = gb.lin(gu, &format!("{p}.mlp_Wo"), &layer.mlp_wo);
+            x = gb.add(&format!("{p}.res2"), Op::Add, &[x, mo], vec![n, h]);
+        }
+        let x = gb.ln(x, "final_norm", &self.final_norm, self.eps);
+        let out = head.nodes(gb, x, Some(mask_v))?;
+        gb.g.output(out);
+        Ok(vec![
+            Tensor::U32(ids.to_vec()),
+            Tensor::U32((0..n as u32).collect()),
+            Tensor::U32(vec![1; n]),
+        ])
     }
 }

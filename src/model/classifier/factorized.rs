@@ -2,7 +2,9 @@
 //! embeddings, then `embeddings_project` to the hidden size when they differ) and ALBERT
 //! (`embedding_hidden_mapping_in`, layer groups shared across `num_hidden_layers`).
 
+use super::head::{Act, Gb, HeadGraph};
 use super::{Checkpoint, Lin};
+use crate::graph::{DType, Op, Tensor};
 use crate::model::nn;
 use serde_json::Value;
 
@@ -152,6 +154,7 @@ impl Factorized {
 
     /// Last hidden states `[n, hidden]` of one unpadded sequence.
     pub(super) fn forward(&self, ids: &[u32], types: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("classifier::factorized::forward");
         let (n, e, h) = (ids.len(), self.emb, self.hidden);
         fn row<'a>(table: &'a [f32], e: usize, i: usize, what: &str) -> Result<&'a [f32], String> {
             table
@@ -194,5 +197,69 @@ impl Factorized {
             x = nn::layer_norm(&o, n, h, &layer.ln2.0, &layer.ln2.1, self.eps);
         }
         Ok(x)
+    }
+
+    /// The Metal program for `ids`: factorized embeddings, post-LN layers per `schedule` (shared
+    /// ALBERT weights are declared once) and `head`, as graph nodes on `gb`; returns the inputs.
+    pub(super) fn graph(
+        &self,
+        gb: &mut Gb,
+        ids: &[u32],
+        types: &[u32],
+        head: &HeadGraph,
+    ) -> Result<Vec<Tensor>, String> {
+        let (n, e, h) = (ids.len(), self.emb, self.hidden);
+        let id_v = gb.g.input("input_ids", vec![n], DType::U32);
+        let pos_v = gb.g.input("position_ids", vec![n], DType::U32);
+        let ty_v = gb.g.input("token_type_ids", vec![n], DType::U32);
+        let mask_v = gb.g.input("attention_mask", vec![n], DType::U32);
+        let table = |gb: &mut Gb, name: &str, t: &[f32], idx| {
+            let w = gb.weight(&format!("emb.{name}"), vec![t.len() / e, e], || t.to_vec());
+            gb.add(&format!("emb.{name}"), Op::Embedding, &[w, idx], vec![n, e])
+        };
+        let (w, p, t) = (
+            table(gb, "word", &self.word, id_v),
+            table(gb, "position", &self.pos, pos_v),
+            table(gb, "type", &self.types, ty_v),
+        );
+        let wp = gb.add("emb.add_position", Op::Add, &[w, p], vec![n, e]);
+        let wpt = gb.add("emb.add_type", Op::Add, &[wp, t], vec![n, e]);
+        let mut x = gb.ln(wpt, "emb.ln", &self.emb_ln, self.eps);
+        if let Some(proj) = &self.proj {
+            x = gb.lin(x, "emb.proj", proj);
+        }
+        let attn = Op::Attention {
+            heads: self.heads,
+            kv_heads: self.heads,
+            causal: false,
+            window: None,
+            soft_cap: None,
+        };
+        for (step, &l) in self.schedule.iter().enumerate() {
+            gb.scope = format!("s{step}.");
+            let (p, layer) = (format!("layer.{l}"), &self.layers[l]);
+            let q = gb.lin(x, &format!("{p}.q"), &layer.q);
+            let k = gb.lin(x, &format!("{p}.k"), &layer.k);
+            let v = gb.lin(x, &format!("{p}.v"), &layer.v);
+            let c = gb.add(&format!("{p}.attn"), attn.clone(), &[q, k, v], vec![n, h]);
+            let o = gb.lin(c, &format!("{p}.o"), &layer.o);
+            let r = gb.add(&format!("{p}.res1"), Op::Add, &[o, x], vec![n, h]);
+            let a = gb.ln(r, &format!("{p}.ln1"), &layer.ln1, self.eps);
+            let i = gb.lin(a, &format!("{p}.inter"), &layer.inter);
+            let act = if self.gelu_tanh { Act::GeluTanh } else { Act::Gelu };
+            let i = gb.act(&format!("{p}.act"), act, i);
+            let o2 = gb.lin(i, &format!("{p}.out"), &layer.out);
+            let r2 = gb.add(&format!("{p}.res2"), Op::Add, &[o2, a], vec![n, h]);
+            x = gb.ln(r2, &format!("{p}.ln2"), &layer.ln2, self.eps);
+        }
+        gb.scope.clear();
+        let out = head.nodes(gb, x, Some(mask_v))?;
+        gb.g.output(out);
+        Ok(vec![
+            Tensor::U32(ids.to_vec()),
+            Tensor::U32((0..n as u32).collect()),
+            Tensor::U32(types.to_vec()),
+            Tensor::U32(vec![1; n]),
+        ])
     }
 }

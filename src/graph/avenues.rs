@@ -4,7 +4,7 @@
 //! `explore_node` tries six avenues in order and stops at the first that really has a code path.
 //! A graph with an unlowered node fails to place with a [`GpuReport`] naming every avenue's reason.
 
-use crate::graph::{DType, Op, PairLayout, RopeVariant, UnaryKind, UpsampleMode};
+use crate::graph::{BinaryKind, DType, Op, PairLayout, ReduceKind, RopeVariant, UnaryKind, UpsampleMode};
 use crate::hardware::Device;
 use crate::hardware::QuantFormat;
 
@@ -265,12 +265,7 @@ pub fn family_status(f: Family) -> Status {
         ),
         Seq2Seq => Status::Gated("builder: no seq2seq graph builder (beam search, positions)"),
         Idefics3Siglip => Status::Gated("builder: SigLIP forward is host Rust, no graph builder"),
-        ClassifierBert => {
-            Status::Gated("builder: Head::apply and the BERT classifier forward are host Rust")
-        }
-        ClassifierModern => {
-            Status::Gated("builder: DeBERTa/ModernBERT forward is host Rust, no graph builder")
-        }
+        ClassifierBert | ClassifierModern => Status::Gpu,
         ClassifierDecoder => {
             Status::Gated("builder: decoder seq-cls forward is host Rust, no graph builder")
         }
@@ -546,24 +541,60 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Gelu { tanh: true }, F32),
             (Op::Linear, F32),
         ]),
+        // BERT/RoBERTa/DistilBERT/GGUF/SetFit on the System 1 encoder graph + the pooled head
+        // (pooler tanh/relu, softmax or sigmoid scores, SetFit mean/max pooling, L2 normalise and the
+        // sklearn predict_proba forms).
         Family::ClassifierBert => ops.extend([
             (Op::Embedding, F32),
             (ln(), F32),
             (Op::Linear, F32),
             (attn(), F32),
             (Op::Gelu { tanh: false }, F32),
+            (Op::Relu, F32),
             (Op::Add, F32),
             (unary(UnaryKind::Tanh), F32),
+            (unary(UnaryKind::Sigmoid), F32),
+            (unary(UnaryKind::Neg), F32),
             (slice(), F32),
+            (Op::Softmax { axis: -1 }, F32),
+            (Op::MeanPool, F32),
+            (Op::L2Normalize, F32),
+            (Op::Reduce { kind: ReduceKind::Max, axes: vec![0], keep_dims: true }, F32),
+            (Op::Reduce { kind: ReduceKind::Sum, axes: vec![-1], keep_dims: true }, F32),
+            (Op::Binary { kind: BinaryKind::Div }, F32),
+            (Op::Concat { axis: -1 }, F32),
+            (reshape(), F32),
         ]),
+        // ModernBERT (RoPE, windowed attention, GeGLU as slice/gelu/mul), ELECTRA/ALBERT (tanh GELU,
+        // factorized embeddings) and DeBERTa (the c2p/p2c bias: batched GEMM, flat Gather, scaled q).
         Family::ClassifierModern => ops.extend([
             (Op::Embedding, F32),
             (ln(), F32),
             (Op::Linear, F32),
             (attn(), F32),
-            (Op::GeGlu, F32),
+            (
+                Op::Attention {
+                    heads: 2,
+                    kv_heads: 2,
+                    causal: false,
+                    window: Some(4),
+                    soft_cap: None,
+                },
+                F32,
+            ),
             (rope_hs(), F32),
+            (Op::Gelu { tanh: false }, F32),
+            (Op::Gelu { tanh: true }, F32),
+            (Op::Silu, F32),
+            (Op::Mul, F32),
+            (Op::Add, F32),
+            (slice(), F32),
+            (Op::MeanPool, F32),
+            (Op::MatMul { transpose_a: false, transpose_b: true }, F32),
+            (Op::Transpose { perm: vec![1, 0, 2] }, F32),
             (Op::Gather { axis: 0 }, F32),
+            (reshape(), F32),
+            (unary(UnaryKind::Scale(0.5)), F32),
             (unary(UnaryKind::Tanh), F32),
         ]),
         Family::ClassifierDecoder => ops.extend([
