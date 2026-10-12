@@ -4,6 +4,8 @@
 //! GLU MBConv feed-forward, adaLN-single) on bf16 weights, DPM-Solver++ 2M with flow sigmas, and
 //! the 32x DC-AE decoder.
 
+mod graph_program;
+
 use crate::model::dcae::DcAeDecoder;
 use crate::model::dit::{
     add_gated, component_weights, norm_modulate, read_config, rms_norm, silu_of, timestep_features,
@@ -261,6 +263,7 @@ struct SanaDit {
     sst_out: Vec<f32>,
     proj_out: Lin,
     timestep_scale: f32,
+    gpu: graph_program::Cache,
     sample_size: usize,
 }
 
@@ -397,6 +400,7 @@ impl SanaDit {
             sst_out: w.vec_n("scale_shift_table", 2 * d)?,
             proj_out: Lin::load(&w, "proj_out")?,
             timestep_scale: c["timestep_scale"].as_f64().unwrap_or(1.0) as f32,
+            gpu: Default::default(),
             sample_size: get("sample_size")?,
         })
     }
@@ -543,10 +547,11 @@ impl SanaPipeline {
             .to_vec())
     }
 
-    /// Projected caption [n, d] for `prompt` (lower-cased, stripped). With the instruction prefix the
-    /// pipeline keeps BOS plus the last 299 of `chi + 298` positions, i.e. the instruction's last
-    /// token onwards; padding is masked out of cross-attention, so only real tokens are kept.
-    fn encode(&self, prompt: &str, instruct: bool) -> Result<(Vec<f32>, usize), String> {
+    /// Gemma states for `prompt` before the caption projection (lower-cased, stripped): BOS plus
+    /// the real tokens; with the instruction prefix the pipeline keeps BOS plus the last 299 of
+    /// `chi + 298` positions, i.e. the instruction's last token onwards. Padding is masked out of
+    /// cross-attention, so only real tokens are kept.
+    fn encode_raw(&self, prompt: &str, instruct: bool) -> Result<(Vec<f32>, usize), String> {
         let prompt = prompt.to_lowercase();
         let prompt = prompt.trim();
         let chi = CHI.join("\n");
@@ -563,7 +568,18 @@ impl SanaPipeline {
         let mut sel = hs[..dm].to_vec();
         sel.extend_from_slice(&hs[keep_from.min(ids.len()) * dm..]);
         let n = sel.len() / dm;
-        Ok((self.dit.caption(&sel, n), n))
+        Ok((sel, n))
+    }
+
+    /// Caption states for the transformer: the projected, normed caption on the host, or on the
+    /// GPU path the raw encoder states (the Metal program applies the projection).
+    fn encode(&self, prompt: &str, instruct: bool) -> Result<(Vec<f32>, usize), String> {
+        let (sel, n) = self.encode_raw(prompt, instruct)?;
+        if crate::model::dit_graph::use_metal() {
+            Ok((sel, n))
+        } else {
+            Ok((self.dit.caption(&sel, n), n))
+        }
     }
 }
 
@@ -617,6 +633,7 @@ impl ImageGenerator for SanaPipeline {
         }
         let (h, w) = (height / f, width / f);
         let start = Instant::now();
+        let gpu = crate::model::dit_graph::use_metal();
         let (cap, n_cap) = self.encode(&req.prompt, true)?;
         let neg = if guidance > 1.0 {
             Some(self.encode(req.negative_prompt.as_deref().unwrap_or(""), false)?)
@@ -636,9 +653,16 @@ impl ImageGenerator for SanaPipeline {
         for i in 0..steps {
             let start = Instant::now();
             let t = flow::timestep(sigmas[i]).floor();
-            let mut v = self.dit.forward(&x, h, w, t, &cap, n_cap);
+            let fwd = |x: &[f32], cap: &[f32], n: usize| {
+                if gpu {
+                    self.dit.forward_gpu(&self.dit.gpu, x, h, w, t, cap, n)
+                } else {
+                    Ok(self.dit.forward(x, h, w, t, cap, n))
+                }
+            };
+            let mut v = fwd(&x, &cap, n_cap)?;
             if let Some((nc, nn)) = &neg {
-                let vu = self.dit.forward(&x, h, w, t, nc, *nn);
+                let vu = fwd(&x, nc, *nn)?;
                 v.iter_mut()
                     .zip(&vu)
                     .for_each(|(c, u)| *c = u + guidance * (*c - u));
