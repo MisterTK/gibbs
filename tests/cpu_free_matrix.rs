@@ -136,6 +136,7 @@ fn gpu_fixture(f: Family) {
         }
         Family::ClassifierDecoder => {
             gibbs_engine::model::classifier::gpu_fixture().expect("decoder seq-cls fixture")
+        }
         Family::Idefics3Siglip => {
             let (g, w) = gibbs_engine::model::siglip::tiny::graph();
             run_on_gpu("Idefics3Siglip tower", g, w);
