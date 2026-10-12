@@ -1,26 +1,37 @@
-//! ModelScope text-to-video UNet (diffusers `UNet3DConditionModel`) on real safetensors weights, f32 on CPU.
+//! ModelScope text-to-video UNet (diffusers `UNet3DConditionModel`) on real safetensors weights, f32: a Metal
+//! graph program when the process is GPU-only (`gpu_mode`), else the native CPU forward.
 //!
 //! Reuses the SD UNet blocks (`ResnetBlock2D` == LDM ResBlock, `Transformer2DModel` == SpatialTransformer)
 //! and adds the two temporal pieces: `TemporalConvLayer` and `TransformerTemporalModel`. Activations are
 //! frame-major `[frames, c, h*w]`; per-frame 2-D ops see one `[c, h*w]` frame at a time, temporal ops
 //! regroup the whole clip.
 
+use crate::graph::Op;
+use crate::model::diff_graph::{gpu_mode, ByShape, Gb, GpuNet, V};
 use crate::model::loaders::{SafetensorsWeightReader, WeightReader};
 use crate::model::nn;
 use crate::model::unet::{
-    add_into, frames_transpose, timestep_embedding, Conv, Linear, Norm, ResBlock, SpatialTransformer, Weights,
+    add_into, frames_transpose, timestep_embedding, Attention, Conv, Linear, Norm, ResBlock, SpatialTransformer,
+    Weights,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Network dimensions the loader and forward depend on (head width is 64 everywhere, 32 GroupNorm groups).
+#[derive(Clone, Copy)]
+struct Cfg {
+    in_ch: usize,
+    block_out: [usize; 4],
+    ctx_dim: usize,
+    /// `transformer_in` is `TransformerTemporalModel(num_attention_heads=8, attention_head_dim=64)`.
+    tin_width: usize,
+}
+
 // ponytail: the ali-vilab/text-to-video-ms-1.7b unet/config.json is fixed in code; read it if other checkpoints matter.
-const IN_CH: usize = 4;
-const BLOCK_OUT: [usize; 4] = [320, 640, 1280, 1280];
+const REAL: Cfg = Cfg { in_ch: 4, block_out: [320, 640, 1280, 1280], ctx_dim: 1024, tin_width: 8 * 64 };
 const LAYERS: usize = 2;
-const CTX_DIM: usize = 1024;
-/// `transformer_in` is `TransformerTemporalModel(num_attention_heads=8, attention_head_dim=64)`.
-const TRANSFORMER_IN_WIDTH: usize = 8 * 64;
+const GROUPS: usize = 32;
 /// Three stride-2 downsamplers.
 const DOWNSCALE: usize = 8;
 
@@ -189,20 +200,26 @@ pub struct Unet3d {
     up: Vec<Stage>,
     norm_out: Norm,
     conv_out: Conv,
+    cfg: Cfg,
+    gpu: ByShape,
 }
 
 /// Strict safetensors loader: PyTorch shapes, F16/F32 -> f32, and a record of consumed tensors.
 struct St {
-    reader: SafetensorsWeightReader,
+    reader: Box<dyn WeightReader>,
+    cfg: Cfg,
     shapes: HashMap<String, Vec<usize>>,
     used: RefCell<HashSet<String>>,
 }
 
 impl St {
-    fn open(path: &Path) -> Result<Self, String> {
-        let reader = SafetensorsWeightReader::new(path)?;
+    fn open(path: &Path, cfg: Cfg) -> Result<Self, String> {
+        Self::from_reader(Box::new(SafetensorsWeightReader::new(path)?), cfg)
+    }
+
+    fn from_reader(reader: Box<dyn WeightReader>, cfg: Cfg) -> Result<Self, String> {
         let shapes = reader.list_tensors()?.into_iter().map(|m| (m.name, m.shape)).collect();
-        Ok(Self { reader, shapes, used: RefCell::default() })
+        Ok(Self { reader, cfg, shapes, used: RefCell::default() })
     }
 
     fn shape(&self, name: &str) -> Result<&[usize], String> {
@@ -235,7 +252,7 @@ impl St {
         Ok(ResBlock {
             in_norm: self.norm(&format!("{base}.norm1"), c_in)?,
             in_conv: self.conv(&format!("{base}.conv1"), c_in, c_out, 3)?,
-            emb: self.lin(&format!("{base}.time_emb_proj"), 4 * BLOCK_OUT[0], c_out)?,
+            emb: self.lin(&format!("{base}.time_emb_proj"), 4 * self.cfg.block_out[0], c_out)?,
             out_norm: self.norm(&format!("{base}.norm2"), c_out)?,
             out_conv: self.conv(&format!("{base}.conv2"), c_out, c_out, 3)?,
             skip,
@@ -270,7 +287,7 @@ impl St {
 
     fn attn(&self, base: &str, j: usize, c: usize) -> Result<Attn, String> {
         Ok(Attn {
-            spatial: self.transformer_dims(&format!("{base}.attentions.{j}"), c, c, CTX_DIM)?,
+            spatial: self.transformer_dims(&format!("{base}.attentions.{j}"), c, c, self.cfg.ctx_dim)?,
             temporal: self.temporal(&format!("{base}.temp_attentions.{j}"), c, c)?,
         })
     }
@@ -320,15 +337,19 @@ impl Unet3d {
     /// diffusers UNet3DConditionModel from a safetensors file (F16 or F32, PyTorch shapes).
     /// Missing/mis-shaped tensor = Err naming it.
     pub fn load(path: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoModelScope)?;
-        let st = St::open(path)?;
-        let c0 = BLOCK_OUT[0];
-        let top = BLOCK_OUT.len() - 1;
+        Self::from_st(St::open(path, REAL)?)
+    }
+
+    fn from_st(st: St) -> Result<Self, String> {
+        let cfg = st.cfg;
+        let bo = cfg.block_out;
+        let c0 = bo[0];
+        let top = bo.len() - 1;
 
         // CrossAttnDownBlock3D x3, DownBlock3D; every block but the last downsamples.
-        let mut down = Vec::with_capacity(BLOCK_OUT.len());
+        let mut down = Vec::with_capacity(bo.len());
         let mut ch = c0;
-        for (i, &out) in BLOCK_OUT.iter().enumerate() {
+        for (i, &out) in bo.iter().enumerate() {
             let base = format!("down_blocks.{i}");
             let layers = (0..LAYERS)
                 .map(|j| st.layer(&base, j, if j == 0 { ch } else { out }, out, i < top))
@@ -339,7 +360,7 @@ impl Unet3d {
             ch = out;
         }
 
-        let c = BLOCK_OUT[top];
+        let c = bo[top];
         let mid = (
             st.layer("mid_block", 0, c, c, false)?,
             st.attn("mid_block", 0, c)?,
@@ -348,12 +369,12 @@ impl Unet3d {
 
         // UpBlock3D, CrossAttnUpBlock3D x3; every block but the last upsamples. Resnet j consumes the
         // skip of matching width (diffusers' res_skip_channels / resnet_in_channels).
-        let mut up = Vec::with_capacity(BLOCK_OUT.len());
+        let mut up = Vec::with_capacity(bo.len());
         let mut prev = c;
-        for i in 0..BLOCK_OUT.len() {
+        for i in 0..bo.len() {
             let base = format!("up_blocks.{i}");
-            let out = BLOCK_OUT[top - i];
-            let input = BLOCK_OUT[top - (i + 1).min(top)];
+            let out = bo[top - i];
+            let input = bo[top - (i + 1).min(top)];
             let layers = (0..=LAYERS)
                 .map(|j| {
                     let skip = if j == LAYERS { input } else { out };
@@ -368,22 +389,25 @@ impl Unet3d {
         }
 
         let model = Self {
+            cfg,
+            gpu: ByShape::default(),
             time1: st.lin("time_embedding.linear_1", c0, 4 * c0)?,
             time2: st.lin("time_embedding.linear_2", 4 * c0, 4 * c0)?,
-            conv_in: st.conv("conv_in", IN_CH, c0, 3)?,
-            transformer_in: st.temporal("transformer_in", c0, TRANSFORMER_IN_WIDTH)?,
+            conv_in: st.conv("conv_in", cfg.in_ch, c0, 3)?,
+            transformer_in: st.temporal("transformer_in", c0, cfg.tin_width)?,
             down,
             mid,
             up,
             norm_out: st.norm("conv_norm_out", c0)?,
-            conv_out: st.conv("conv_out", c0, IN_CH, 3)?,
+            conv_out: st.conv("conv_out", c0, cfg.in_ch, 3)?,
         };
         st.finish()?;
         Ok(model)
     }
 
     /// x: [frames, 4, h, w] frame-major; t: DDPM timestep (0..=999); ctx: [ctx_len, 1024], shared by every frame.
-    /// Returns eps in x's layout. h, w must be multiples of 8 (3 downsamples).
+    /// Returns eps in x's layout. h, w must be multiples of 8 (3 downsamples). A Metal program when the
+    /// process is GPU-only.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -395,16 +419,109 @@ impl Unet3d {
         ctx: &[f32],
         ctx_len: usize,
     ) -> Result<Vec<f32>, String> {
-        crate::hardware::cpu_compute::enter("unet3d::forward");
         if frames == 0 || h == 0 || w == 0 || h % DOWNSCALE != 0 || w % DOWNSCALE != 0 {
             return Err(format!("UNet3D needs frames > 0 and {h}x{w} non-zero multiples of {DOWNSCALE}"));
         }
-        if x.len() != frames * IN_CH * h * w {
-            return Err(format!("UNet3D input has {} values, expected {frames}x{IN_CH}x{h}x{w}", x.len()));
+        let (in_ch, ctx_dim) = (self.cfg.in_ch, self.cfg.ctx_dim);
+        if x.len() != frames * in_ch * h * w {
+            return Err(format!("UNet3D input has {} values, expected {frames}x{in_ch}x{h}x{w}", x.len()));
         }
-        if ctx_len == 0 || ctx.len() != ctx_len * CTX_DIM {
-            return Err(format!("UNet3D context has {} values, expected {ctx_len}x{CTX_DIM}", ctx.len()));
+        if ctx_len == 0 || ctx.len() != ctx_len * ctx_dim {
+            return Err(format!("UNet3D context has {} values, expected {ctx_len}x{ctx_dim}", ctx.len()));
         }
+        if gpu_mode() {
+            self.forward_gpu(x, frames, h, w, t, ctx, ctx_len)
+        } else {
+            self.forward_cpu(x, frames, h, w, t, ctx, ctx_len)
+        }
+    }
+
+    /// [`Self::forward`] on Metal; one program per `(frames, h, w, ctx_len)`. Host work is the timestep sinusoid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_gpu(
+        &self,
+        x: &[f32],
+        frames: usize,
+        h: usize,
+        w: usize,
+        t: f32,
+        ctx: &[f32],
+        ctx_len: usize,
+    ) -> Result<Vec<f32>, String> {
+        let net = self.gpu.get(&[frames, h, w, ctx_len], || self.build_gpu(frames, h, w, ctx_len))?;
+        let t_emb = timestep_embedding(t, self.time1.in_f);
+        Ok(net.run(vec![x.to_vec(), t_emb, ctx.to_vec()])?.remove(0))
+    }
+
+    /// The Metal program. Inputs, in order: `x [frames, in_ch, h, w]`, `t_emb [1, c0]` (host sinusoid),
+    /// `context [ctx_len, ctx_dim]`; output eps in x's layout. Clip activations are `[frames, c, h, w]`:
+    /// Conv2d / GroupNorm take `frames` as the batch dim, temporal ops re-view the clip as `[c, frames, ..]`.
+    pub fn build_gpu(&self, frames: usize, h: usize, w: usize, ctx_len: usize) -> Result<GpuNet, String> {
+        let mut b = Gb::new();
+        let x = b.input("x", &[frames, self.cfg.in_ch, h, w]);
+        let t = b.input("t_emb", &[1, self.time1.in_f]);
+        let ctx = b.input("context", &[ctx_len, self.cfg.ctx_dim]);
+        let e = self.time1.emit(&mut b, t);
+        let e = b.silu(e);
+        let e = self.time2.emit(&mut b, e);
+        let emb = b.silu(e);
+        let k = (emb, ctx);
+
+        let mut v = conv_emit(&mut b, &self.conv_in, x, 1);
+        v = self.transformer_in.emit(&mut b, v);
+        let mut skips = vec![v];
+        for stage in &self.down {
+            for layer in &stage.layers {
+                v = layer.emit(&mut b, v, k);
+                skips.push(v);
+            }
+            if let Some(conv) = &stage.resample {
+                v = conv_emit(&mut b, conv, v, 2);
+                skips.push(v);
+            }
+        }
+
+        let (first, attn, second) = &self.mid;
+        v = first.emit(&mut b, v, k);
+        v = attn.emit(&mut b, v, k);
+        v = second.emit(&mut b, v, k);
+
+        for stage in &self.up {
+            for layer in &stage.layers {
+                let s = skips.pop().ok_or("UNet3D skip stack underflow")?;
+                if b.shape(s)[2..] != b.shape(v)[2..] {
+                    return Err(format!("UNet3D skip {:?} != activation {:?}", b.shape(s), b.shape(v)));
+                }
+                // torch.cat([hidden, skip], dim=1) per frame.
+                v = b.concat(&[v, s], 1);
+                v = layer.emit(&mut b, v, k);
+            }
+            if let Some(conv) = &stage.resample {
+                let up = b.upsample(v, 2, 2);
+                v = conv_emit(&mut b, conv, up, 1);
+            }
+        }
+
+        let v = gn_frames(&mut b, &self.norm_out, v, 1e-5);
+        let v = b.silu(v);
+        let eps = conv_emit(&mut b, &self.conv_out, v, 1);
+        b.output(eps);
+        b.compile()
+    }
+
+    /// Native CPU forward (the reference for the Metal program); inputs already validated by [`Self::forward`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cpu(
+        &self,
+        x: &[f32],
+        frames: usize,
+        h: usize,
+        w: usize,
+        t: f32,
+        ctx: &[f32],
+        ctx_len: usize,
+    ) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("unet3d::forward");
 
         // Timesteps(320, flip_sin_to_cos=True, 0) -> linear_1, SiLU, linear_2. Every resnet starts its
         // time_emb_proj with SiLU, so apply it once; the embedding is shared by all frames.
@@ -462,6 +579,200 @@ impl Unet3d {
         }
         nn::silu(&mut v.data);
         Ok(conv_frames(&self.conv_out, &v.data, h, w, frames, 1)?.data)
+    }
+}
+
+// Graph emission (Metal program), mirroring the host forwards above. Clip activations are `[frames, c, h, w]`.
+
+/// Conv2d with `frames` as the batch dim (pad `k/2`).
+fn conv_emit(b: &mut Gb, c: &Conv, x: V, stride: usize) -> V {
+    let s = b.shape(x).to_vec();
+    let pad = c.k / 2;
+    let (oh, ow) = ((s[2] + 2 * pad - c.k) / stride + 1, (s[3] + 2 * pad - c.k) / stride + 1);
+    let w = b.wf32("conv.w", &[c.c_out, c.c_in, c.k, c.k], c.w.f32().into_owned());
+    let bias = b.wf32("conv.b", &[c.c_out], c.b.clone());
+    let op = Op::Conv2d { stride: [stride; 2], padding: [pad; 4], dilation: [1; 2], groups: 1 };
+    b.op("conv2d", op, &[x, w, bias], &[s[0], c.c_out, oh, ow])
+}
+
+/// GroupNorm with per-frame statistics over `x [frames, c, ..]`.
+fn gn_frames(b: &mut Gb, n: &Norm, x: V, eps: f32) -> V {
+    let s = b.shape(x).to_vec();
+    let c = s[1];
+    let flat = [s[0], c, s[2..].iter().product()];
+    let x = b.reshape(x, &flat);
+    let (g, be) = (b.wf32("gn.g", &[c], n.gamma.clone()), b.wf32("gn.b", &[c], n.beta.clone()));
+    let y = b.op("group_norm", Op::GroupNorm { groups: GROUPS, eps }, &[x, g, be], &flat);
+    b.reshape(y, &s)
+}
+
+/// `x [frames, c_in, h, w]`, `emb` = `[1, emb_dim]` (SiLU of the time embedding).
+fn res_emit(b: &mut Gb, r: &ResBlock, x: V, emb: V) -> V {
+    let t = gn_frames(b, &r.in_norm, x, 1e-5);
+    let t = b.silu(t);
+    let t = conv_emit(b, &r.in_conv, t, 1);
+    let e = r.emb.emit(b, emb);
+    let e = b.reshape(e, &[1, r.emb.out_f, 1, 1]);
+    let t = b.add_bcast(t, e);
+    let t = gn_frames(b, &r.out_norm, t, 1e-5);
+    let t = b.silu(t);
+    let t = conv_emit(b, &r.out_conv, t, 1);
+    let skip = match &r.skip {
+        Some(c) => conv_emit(b, c, x, 1),
+        None => x,
+    };
+    b.add(t, skip)
+}
+
+/// Self-attention within each frame of `x [frames*n, width]`: frames become extra heads of one sequence.
+fn attn_per_frame(b: &mut Gb, a: &Attention, x: V, frames: usize, n: usize) -> V {
+    let wd = a.q.out_f;
+    let (q, k, v) = (a.q.emit(b, x), a.k.emit(b, x), a.v.emit(b, x));
+    let mut pack = |t: V| {
+        let t = b.reshape(t, &[frames, n, wd]);
+        let t = b.transpose(t, &[1, 0, 2]);
+        b.reshape(t, &[n, frames * wd])
+    };
+    let (q, k, v) = (pack(q), pack(k), pack(v));
+    let o = b.attention(q, k, v, frames * a.heads());
+    let o = b.reshape(o, &[n, frames, wd]);
+    let o = b.transpose(o, &[1, 0, 2]);
+    let o = b.reshape(o, &[frames * n, wd]);
+    a.out.emit(b, o)
+}
+
+/// Self-attention along the frame axis of `x [frames*n, width]`: every (position, head) is a head over `frames` tokens.
+// ponytail: n*heads heads in one dispatch (20480 at 64x64 latents); chunk positions if a device caps threadgroup rows.
+fn attn_across_frames(b: &mut Gb, a: &Attention, x: V, frames: usize, n: usize) -> V {
+    let wd = a.q.out_f;
+    let (q, k, v) = (a.q.emit(b, x), a.k.emit(b, x), a.v.emit(b, x));
+    let (q, k, v) = (b.reshape(q, &[frames, n * wd]), b.reshape(k, &[frames, n * wd]), b.reshape(v, &[frames, n * wd]));
+    let o = b.attention(q, k, v, n * a.heads());
+    let o = b.reshape(o, &[frames * n, wd]);
+    a.out.emit(b, o)
+}
+
+/// BasicTransformerBlocks over `tok [frames*n, width]`; `ctx: Some` = spatial (attn2 cross-attends the
+/// shared context), `None` = temporal (attn1 and attn2 self-attend across frames).
+fn blocks_emit(b: &mut Gb, t: &SpatialTransformer, mut tok: V, frames: usize, n: usize, ctx: Option<V>) -> V {
+    let self_attn = |b: &mut Gb, a: &Attention, x: V| match ctx {
+        Some(_) => attn_per_frame(b, a, x, frames, n),
+        None => attn_across_frames(b, a, x, frames, n),
+    };
+    for blk in &t.blocks {
+        let x = blk.norm1.emit_layer(b, tok);
+        let a = self_attn(b, &blk.attn1, x);
+        tok = b.add(tok, a);
+        let x = blk.norm2.emit_layer(b, tok);
+        let a = match ctx {
+            Some(c) => blk.attn2.emit(b, x, c),
+            None => self_attn(b, &blk.attn2, x),
+        };
+        tok = b.add(tok, a);
+        let x = blk.norm3.emit_layer(b, tok);
+        let g = blk.ff_in.emit(b, x);
+        let inner = blk.ff_in.out_f / 2;
+        // GEGLU: value is the first half, the second half goes through the exact GELU.
+        let (a, gate) = (b.slice(g, 1, 0, inner), b.slice(g, 1, inner, 2 * inner));
+        let gate = b.gelu(gate, false);
+        let g = b.mul(a, gate);
+        let f = blk.ff_out.emit(b, g);
+        tok = b.add(tok, f);
+    }
+    tok
+}
+
+/// Spatial transformer over `x [frames, c, h, w]` (per-frame GroupNorm, shared `ctx [len, dim]`).
+fn spatial_emit(b: &mut Gb, t: &SpatialTransformer, x: V, ctx: V) -> V {
+    let s = b.shape(x).to_vec();
+    let (frames, c, hw) = (s[0], s[1], s[2] * s[3]);
+    let n = gn_frames(b, &t.norm, x, 1e-6);
+    let n = b.reshape(n, &[frames, c, hw]);
+    let n = b.transpose(n, &[0, 2, 1]);
+    let n = b.reshape(n, &[frames * hw, c]);
+    let tok = t.proj_in.emit(b, n);
+    let tok = blocks_emit(b, t, tok, frames, hw, Some(ctx));
+    let o = t.proj_out.emit(b, tok);
+    let o = b.reshape(o, &[frames, hw, c]);
+    let o = b.transpose(o, &[0, 2, 1]);
+    let o = b.reshape(o, &s);
+    b.add(o, x)
+}
+
+/// `TempConv` taps back from the stacked `[3c, c]` linear: Conv3d weight `[c, c, 3, 1, 1]` and bias.
+fn unstack_taps(l: &Linear, c: usize) -> (Vec<f32>, Vec<f32>) {
+    let z = l.w.f32();
+    let mut w = vec![0.0; 3 * c * c];
+    for co in 0..c {
+        for ci in 0..c {
+            for k in 0..3 {
+                w[(co * c + ci) * 3 + k] = z[(k * c + co) * c + ci];
+            }
+        }
+    }
+    (w, l.b.as_ref().expect("stacked taps carry the bias")[c..2 * c].to_vec())
+}
+
+impl TempConv {
+    /// `x [frames, c, h, w]`; real Conv3d (3,1,1) ops over `[c, frames, 1, h*w]`, clip-wide GroupNorm.
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let s = b.shape(x).to_vec();
+        let (frames, c, hw) = (s[0], s[1], s[2] * s[3]);
+        let x = b.reshape(x, &[frames, c, hw]);
+        let id = b.transpose(x, &[1, 0, 2]);
+        let mut h = id;
+        for (norm, conv) in &self.0 {
+            let t = norm.emit_group(b, h, 1e-5);
+            let t = b.silu(t);
+            let t = b.reshape(t, &[c, frames, 1, hw]);
+            let (w, bias) = unstack_taps(conv, c);
+            let (w, bias) = (b.wf32("tconv.w", &[c, c, 3, 1, 1], w), b.wf32("tconv.b", &[c], bias));
+            let op = Op::Conv3d { stride: [1; 3], padding: [1, 0, 0, 1, 0, 0], dilation: [1; 3], groups: 1 };
+            let y = b.op("conv3d", op, &[t, w, bias], &[c, frames, 1, hw]);
+            h = b.reshape(y, &[c, frames, hw]);
+        }
+        let h = b.add(h, id);
+        let h = b.transpose(h, &[1, 0, 2]);
+        b.reshape(h, &s)
+    }
+}
+
+impl Temporal {
+    /// `x [frames, c, h, w]`; GroupNorm statistics span every frame, attention runs along frames.
+    fn emit(&self, b: &mut Gb, x: V) -> V {
+        let t = &self.0;
+        let s = b.shape(x).to_vec();
+        let (frames, c, hw) = (s[0], s[1], s[2] * s[3]);
+        let x3 = b.reshape(x, &[frames, c, hw]);
+        let cf = b.transpose(x3, &[1, 0, 2]);
+        let n = t.norm.emit_group(b, cf, 1e-6);
+        let n = b.transpose(n, &[1, 2, 0]);
+        let n = b.reshape(n, &[frames * hw, c]);
+        let tok = t.proj_in.emit(b, n);
+        let tok = blocks_emit(b, t, tok, frames, hw, None);
+        let o = t.proj_out.emit(b, tok);
+        let o = b.reshape(o, &[frames, hw, c]);
+        let o = b.transpose(o, &[0, 2, 1]);
+        let o = b.add(o, x3);
+        b.reshape(o, &s)
+    }
+}
+
+impl Attn {
+    fn emit(&self, b: &mut Gb, x: V, (_, ctx): (V, V)) -> V {
+        let s = spatial_emit(b, &self.spatial, x, ctx);
+        self.temporal.emit(b, s)
+    }
+}
+
+impl Layer3 {
+    fn emit(&self, b: &mut Gb, x: V, k: (V, V)) -> V {
+        let x = res_emit(b, &self.res, x, k.0);
+        let x = self.temp_conv.emit(b, x);
+        match &self.attn {
+            Some(a) => a.emit(b, x, k),
+            None => x,
+        }
     }
 }
 
@@ -771,7 +1082,7 @@ mod tests {
 
     #[test]
     fn transformers_at_320_have_five_heads_of_64() {
-        let spatial = Zeros { kv: CTX_DIM }.transformer("s").unwrap();
+        let spatial = Zeros { kv: REAL.ctx_dim }.transformer("s").unwrap();
         let temporal = Temporal(Zeros { kv: 320 }.transformer("t").unwrap());
         let (s0, t0) = (&spatial.blocks[0], &temporal.0.blocks[0]);
         for a in [&s0.attn1, &s0.attn2, &t0.attn1, &t0.attn2] {
@@ -780,8 +1091,134 @@ mod tests {
         // Zero projections leave only the residual; exercises both attention layouts end to end.
         let (frames, hw) = (3, 2);
         let x: Vec<f32> = (0..frames * 320 * hw).map(|i| i as f32 * 0.01).collect();
-        let ctx = vec![0.1; 2 * CTX_DIM];
+        let ctx = vec![0.1; 2 * REAL.ctx_dim];
         assert_eq!(spatial.forward(&x, frames, 320, hw, &ctx, 2).unwrap(), x);
         assert_eq!(temporal.forward(&x, frames, 320, hw), x);
+    }
+
+    type Specs = Vec<(String, Vec<usize>)>;
+
+    fn spec(s: &mut Specs, name: String, shape: &[usize]) {
+        s.push((name, shape.to_vec()));
+    }
+    fn s_lin(s: &mut Specs, base: &str, i: usize, o: usize, bias: bool) {
+        spec(s, format!("{base}.weight"), &[o, i]);
+        if bias {
+            spec(s, format!("{base}.bias"), &[o]);
+        }
+    }
+    fn s_norm(s: &mut Specs, base: &str, c: usize) {
+        spec(s, format!("{base}.weight"), &[c]);
+        spec(s, format!("{base}.bias"), &[c]);
+    }
+    fn s_conv(s: &mut Specs, base: &str, i: usize, o: usize, k: usize) {
+        spec(s, format!("{base}.weight"), &[o, i, k, k]);
+        spec(s, format!("{base}.bias"), &[o]);
+    }
+    /// `Transformer2DModel` / `TransformerTemporalModel` weights: channels `c`, width `inner`, attn2 kv width `kv`.
+    fn s_trans(s: &mut Specs, p: &str, c: usize, inner: usize, kv: usize) {
+        s_norm(s, &format!("{p}.norm"), c);
+        s_lin(s, &format!("{p}.proj_in"), c, inner, true);
+        s_lin(s, &format!("{p}.proj_out"), inner, c, true);
+        let t = format!("{p}.transformer_blocks.0");
+        for n in ["norm1", "norm2", "norm3"] {
+            s_norm(s, &format!("{t}.{n}"), inner);
+        }
+        for (a, kv) in [("attn1", inner), ("attn2", kv)] {
+            s_lin(s, &format!("{t}.{a}.to_q"), inner, inner, false);
+            s_lin(s, &format!("{t}.{a}.to_k"), kv, inner, false);
+            s_lin(s, &format!("{t}.{a}.to_v"), kv, inner, false);
+            s_lin(s, &format!("{t}.{a}.to_out.0"), inner, inner, true);
+        }
+        s_lin(s, &format!("{t}.ff.net.0.proj"), inner, 4 * inner, true);
+        s_lin(s, &format!("{t}.ff.net.2"), 2 * inner, inner, true);
+    }
+    fn s_layer(s: &mut Specs, cfg: Cfg, base: &str, j: usize, ci: usize, co: usize, attn: bool) {
+        let r = format!("{base}.resnets.{j}");
+        s_norm(s, &format!("{r}.norm1"), ci);
+        s_conv(s, &format!("{r}.conv1"), ci, co, 3);
+        s_lin(s, &format!("{r}.time_emb_proj"), 4 * cfg.block_out[0], co, true);
+        s_norm(s, &format!("{r}.norm2"), co);
+        s_conv(s, &format!("{r}.conv2"), co, co, 3);
+        if ci != co {
+            s_conv(s, &format!("{r}.conv_shortcut"), ci, co, 1);
+        }
+        let tc = format!("{base}.temp_convs.{j}");
+        for i in 1..=4 {
+            s_norm(s, &format!("{tc}.conv{i}.0"), co);
+            let conv = format!("{tc}.conv{i}.{}", if i == 1 { 2 } else { 3 });
+            spec(s, format!("{conv}.weight"), &[co, co, 3, 1, 1]);
+            spec(s, format!("{conv}.bias"), &[co]);
+        }
+        if attn {
+            s_trans(s, &format!("{base}.attentions.{j}"), co, co, cfg.ctx_dim);
+            s_trans(s, &format!("{base}.temp_attentions.{j}"), co, co, co);
+        }
+    }
+
+    /// Every tensor of a UNet3D with `cfg` (the layout `Unet3d::from_st` consumes).
+    fn specs(cfg: Cfg) -> Specs {
+        let mut s = Specs::new();
+        let (bo, c0, top) = (cfg.block_out, cfg.block_out[0], cfg.block_out.len() - 1);
+        s_lin(&mut s, "time_embedding.linear_1", c0, 4 * c0, true);
+        s_lin(&mut s, "time_embedding.linear_2", 4 * c0, 4 * c0, true);
+        s_conv(&mut s, "conv_in", cfg.in_ch, c0, 3);
+        s_trans(&mut s, "transformer_in", c0, cfg.tin_width, cfg.tin_width);
+        let mut ch = c0;
+        for (i, &out) in bo.iter().enumerate() {
+            let base = format!("down_blocks.{i}");
+            for j in 0..LAYERS {
+                s_layer(&mut s, cfg, &base, j, if j == 0 { ch } else { out }, out, i < top);
+            }
+            if i < top {
+                s_conv(&mut s, &format!("{base}.downsamplers.0.conv"), out, out, 3);
+            }
+            ch = out;
+        }
+        let c = bo[top];
+        s_layer(&mut s, cfg, "mid_block", 0, c, c, false);
+        s_trans(&mut s, "mid_block.attentions.0", c, c, cfg.ctx_dim);
+        s_trans(&mut s, "mid_block.temp_attentions.0", c, c, c);
+        s_layer(&mut s, cfg, "mid_block", 1, c, c, false);
+        let mut prev = c;
+        for i in 0..=top {
+            let base = format!("up_blocks.{i}");
+            let out = bo[top - i];
+            let input = bo[top - (i + 1).min(top)];
+            for j in 0..=LAYERS {
+                let skip = if j == LAYERS { input } else { out };
+                s_layer(&mut s, cfg, &base, j, (if j == 0 { prev } else { out }) + skip, out, i > 0);
+            }
+            if i < top {
+                s_conv(&mut s, &format!("{base}.upsamplers.0.conv"), out, out, 3);
+            }
+            prev = out;
+        }
+        s_norm(&mut s, "conv_norm_out", c0);
+        s_conv(&mut s, "conv_out", c0, cfg.in_ch, 3);
+        s
+    }
+
+    #[test]
+    fn gpu_matches_cpu() {
+        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
+        // Mixed widths exercise the 1x1 shortcuts and 1- and 2-head (64 wide) attention.
+        let cfg = Cfg { in_ch: 4, block_out: [64, 128, 128, 128], ctx_dim: 96, tin_width: 128 };
+        let st = St::from_reader(Box::new(synth(&specs(cfg), 7)), cfg).unwrap();
+        let m = Unet3d::from_st(st).unwrap();
+        let (frames, h, w, ctx_len) = (3, 8, 16, 5);
+        let mut r = Lcg(21);
+        let x = r.vec(frames * cfg.in_ch * h * w, 1.0);
+        let ctx = r.vec(ctx_len * cfg.ctx_dim, 1.0);
+
+        let net = m.build_gpu(frames, h, w, ctx_len).unwrap();
+        assert_eq!(net.cpu_node_count(), 0, "every node must place on Metal");
+        for t in [961.0, 41.0] {
+            let want = m.forward_cpu(&x, frames, h, w, t, &ctx, ctx_len).unwrap();
+            let got = m.forward_gpu(&x, frames, h, w, t, &ctx, ctx_len).unwrap();
+            let e = rel_err(&got, &want);
+            println!("unet3d gpu vs cpu t={t}: rel_err {e:e}");
+            assert!(want.iter().any(|v| v.abs() > 1e-3) && e < 1e-3, "t={t}: rel_err {e}");
+        }
     }
 }
