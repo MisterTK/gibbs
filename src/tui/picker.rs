@@ -1,5 +1,7 @@
 //! Model picker overlay: fuzzy type-to-search over locally cached models, pinned ids, and Hugging Face Hub results.
 
+use super::theme::{theme, Token};
+use super::widgets::instrument;
 use crate::model::draft::{draft_target, is_draft_for};
 use crate::model::hub::{
     branch_models, detect_quant_format, is_metadata_file, list_repo_files, select_weight_files,
@@ -8,9 +10,9 @@ use crate::model::hub::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 use serde_json::Value;
@@ -21,7 +23,6 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
-const SELECTED_BG: Color = Color::Indexed(236);
 /// Hub results per request; also the pool the fuzzy filter narrows.
 const SEARCH_LIMIT: usize = 100;
 /// Fewer hits than this widens the search with shortened terms (the server matches substrings).
@@ -122,7 +123,9 @@ pub struct Picker {
     selected: usize,
     selection_changed: Instant,
     /// One-shot status override (e.g. the blocker of a row the user tried to load).
-    note: Option<(String, Color)>,
+    note: Option<(String, Token)>,
+    /// Host memory-bandwidth ceiling (GB/s) behind the predicted tok/s; 0 = unmeasured.
+    ceiling_gbps: f32,
     /// Id and time of the first ctrl-d press.
     pending_delete: Option<(String, Instant)>,
     local: Vec<Entry>,
@@ -185,6 +188,7 @@ impl Picker {
             selected: 0,
             selection_changed: Instant::now(),
             note: None,
+            ceiling_gbps: 0.0,
             pending_delete: None,
             local: Vec::new(),
             hub_results: Vec::new(),
@@ -310,7 +314,7 @@ impl Picker {
                 let _ = crate::tui::settings::save_settings(&s);
                 self.note = Some((
                     format!("reencode: {} (reload to apply)", s.reencode),
-                    Color::Green,
+                    Token::Jade,
                 ));
                 return PickerAction::None;
             }
@@ -324,7 +328,7 @@ impl Picker {
                 let _ = crate::tui::settings::save_settings(&s);
                 self.note = Some((
                     format!("variant: {} (reload to apply)", s.variant),
-                    Color::Green,
+                    Token::Jade,
                 ));
                 self.refilter();
                 return PickerAction::None;
@@ -516,15 +520,20 @@ impl Picker {
         self.local.retain(|e| e.id != id);
         self.note = Some((
             format!("deleted {id} (freed {})", fmt_bytes(freed)),
-            Color::Green,
+            Token::Jade,
         ));
         self.free_disk = free_disk(&self.hub.cache_root);
         self.refilter();
     }
 
     /// Shows `text` in the picker status until the next key press.
-    pub fn set_note(&mut self, text: String, color: Color) {
-        self.note = Some((text, color));
+    pub fn set_note(&mut self, text: String, tok: Token) {
+        self.note = Some((text, tok));
+    }
+
+    /// Sets the memory-bandwidth ceiling (GB/s) the predicted tok/s derives from.
+    pub fn set_ceiling_gbps(&mut self, gbps: f32) {
+        self.ceiling_gbps = gbps;
     }
 
     /// Draws the picker as a centered overlay over `area`.
@@ -541,36 +550,33 @@ impl Picker {
             h,
         );
         f.render_widget(Clear, popup);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                format!(" Load model · sort: {} (tab) ", self.sort.label()),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let th = theme();
+        let block = instrument(
+            &format!("Load model · sort: {} (tab)", self.sort.label()),
+            None,
+            true,
+            &th,
+        );
         let inner = block.inner(popup);
         f.render_widget(block, popup);
 
         let width = inner.width as usize;
         let list_h = inner.height.saturating_sub(3) as usize;
-        let dim = Style::default().fg(Color::DarkGray);
-        let cyan = Style::default().fg(Color::Cyan);
+        let dim = th.fg(Token::Dim);
+        let accent = th.fg(Token::Brass);
         let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
 
-        let (status, color) = match (&self.note, loading) {
-            (None, Some(id)) => (format!("loading {id}…"), Color::Yellow),
+        let (status, tok) = match (&self.note, loading) {
+            (None, Some(id)) => (format!("loading {id}…"), Token::Gold),
             _ => self.status(),
         };
         lines.push(spread(
             vec![
-                Span::styled("› ", cyan),
+                Span::styled("› ", accent),
                 Span::raw(self.query.clone()),
-                Span::styled("▏", cyan),
+                Span::styled("▏", accent),
             ],
-            vec![Span::styled(status, Style::default().fg(color))],
+            vec![Span::styled(status, th.fg(tok))],
             width,
         ));
 
@@ -648,14 +654,14 @@ impl Picker {
 
         let head: Vec<String> = HEADS.iter().map(|h| h.0.to_string()).collect();
         let mut header = vec![Span::styled(format!("  {:<id_w$}", "model"), dim)];
-        let hot = cyan.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        let hot = accent.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
         header.extend(columns(&head, &|c| if c == sorted { hot } else { dim }));
         lines.push(Line::from(header));
 
         for (i, (row, cells)) in visible.iter().zip(&cells).enumerate() {
             let e = &row.entry;
             let mut spans = vec![if e.id == active_model {
-                Span::styled("● ", Style::default().fg(Color::Green))
+                Span::styled("● ", th.fg(Token::Jade))
             } else {
                 Span::raw("  ")
             }];
@@ -663,7 +669,7 @@ impl Picker {
             let keep = if id_len > id_w { id_w - 1 } else { id_len };
             for (ci, c) in e.id.chars().take(keep).enumerate() {
                 let style = if row.hits.binary_search(&ci).is_ok() {
-                    cyan.add_modifier(Modifier::BOLD)
+                    accent.add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -676,16 +682,16 @@ impl Picker {
             }
             let status_color = tail(e).1;
             spans.extend(columns(cells, &|c| match c {
-                5 => Style::default().fg(status_color),
+                5 => th.fg(status_color),
                 1 if !e.cached && !self.sizes.get(&e.id).is_some_and(|s| s.is_ok()) => dim,
                 0 | 1 => Style::default(),
-                c if c == sorted => cyan,
+                c if c == sorted => accent,
                 _ => dim,
             }));
 
             let mut line = spread(spans, Vec::new(), width);
             if offset + i == self.selected {
-                line = line.style(Style::default().bg(SELECTED_BG));
+                line = line.style(th.selected());
             }
             lines.push(line);
         }
@@ -706,9 +712,7 @@ impl Picker {
             let mut quant_spans: Vec<Span> = Vec::new();
             quant_spans.push(Span::styled(
                 "Quant: ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                th.fg(Token::Gold).add_modifier(Modifier::BOLD),
             ));
             for (i, q_entry) in e.quants.iter().enumerate() {
                 let q_fmt = detect_quant_format(Path::new(&q_entry.id));
@@ -738,9 +742,7 @@ impl Picker {
                     };
                     quant_spans.push(Span::styled(
                         label,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        th.fg(Token::Brass).add_modifier(Modifier::BOLD),
                     ));
                 } else {
                     let label = if is_fastest {
@@ -748,7 +750,7 @@ impl Picker {
                     } else {
                         tag
                     };
-                    quant_spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+                    quant_spans.push(Span::styled(label, dim));
                 }
             }
             let q_active = e.quants.get(e.quant_idx);
@@ -761,19 +763,15 @@ impl Picker {
                 .map(|m| (sz_gb * 1e9) as u64 <= m)
                 .unwrap_or(true);
             let fit_tag = if fits { "fits" } else { "no-fit" };
-            let pred_tok_s = if sz_gb > 0.0 {
-                (280.0 / sz_gb).min(999.0)
+            // Roofline upper bound: every decoded token streams the whole file once.
+            let pred_tok_s = if self.ceiling_gbps > 0.0 && sz_gb > 0.0 {
+                format!("{:.0}", (self.ceiling_gbps as f64 / sz_gb).min(999.0))
             } else {
-                120.0
+                "?".to_string()
             };
-            let roof_pct = 85.0f64;
             let pred_span = Span::styled(
-                format!(" · {pred_tok_s:.0} tok/s ({roof_pct:.0}% roof) {sz_gb:.1}GB [{fit_tag}]"),
-                if fits {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Red)
-                },
+                format!(" · ≤{pred_tok_s} tok/s {sz_gb:.1}GB [{fit_tag}]"),
+                th.fg(if fits { Token::Gold } else { Token::Crimson }),
             );
             quant_spans.push(pred_span);
             let right_hint = vec![Span::styled("(←/→ choose · enter load)", dim)];
@@ -796,7 +794,7 @@ impl Picker {
                     "↑↓ move · enter load · tab sort · ctrl-d delete · esc close",
                     dim,
                 ),
-                Span::styled(policy_str, Style::default().fg(Color::Yellow)),
+                Span::styled(policy_str, th.fg(Token::Gold)),
             ],
             vec![Span::styled(
                 format!("{} of {}{free}", self.rows.len(), self.total),
@@ -804,7 +802,7 @@ impl Picker {
             )],
             width,
         ));
-        f.render_widget(Paragraph::new(lines), inner);
+        f.render_widget(Paragraph::new(lines).style(th.fg(Token::Parchment)), inner);
     }
 
     /// Size column: on-disk bytes for cached rows, the exact download once looked up, else `~estimate`.
@@ -825,21 +823,21 @@ impl Picker {
         (self.query.trim().to_string(), self.sort)
     }
 
-    fn status(&self) -> (String, Color) {
-        if let Some((note, color)) = &self.note {
-            return (note.clone(), *color);
+    fn status(&self) -> (String, Token) {
+        if let Some((note, tok)) = &self.note {
+            return (note.clone(), *tok);
         }
         if self.scanning_local {
-            return ("scanning cache…".into(), Color::Yellow);
+            return ("scanning cache…".into(), Token::Gold);
         }
         let key = self.key();
         if key.0.is_empty() {
-            return ("type to search huggingface.co".into(), Color::DarkGray);
+            return ("type to search huggingface.co".into(), Token::Dim);
         }
         match self.searches.get(&key) {
-            Some(Ok(v)) => (format!("hub: {} results", v.len()), Color::DarkGray),
-            Some(Err(e)) => (format!("hub error: {e}"), Color::Red),
-            None => ("searching hub…".into(), Color::Yellow),
+            Some(Ok(v)) => (format!("hub: {} results", v.len()), Token::Dim),
+            Some(Err(e)) => (format!("hub error: {e}"), Token::Crimson),
+            None => ("searching hub…".into(), Token::Gold),
         }
     }
 
@@ -847,7 +845,7 @@ impl Picker {
         match self.rows.get(self.selected) {
             Some(row) => match &row.entry.blocker {
                 Some(b) => {
-                    self.note = Some((b.clone(), Color::Red));
+                    self.note = Some((b.clone(), Token::Crimson));
                     PickerAction::None
                 }
                 None if row.entry.draft_for.is_some() => {
@@ -878,7 +876,7 @@ impl Picker {
             return PickerAction::None;
         };
         if !e.cached {
-            self.note = Some((format!("{} is not in the local cache", e.id), Color::Red));
+            self.note = Some((format!("{} is not in the local cache", e.id), Token::Crimson));
             return PickerAction::None;
         }
         if pending.is_some_and(|(id, at)| id == e.id && at.elapsed() < DELETE_CONFIRM) {
@@ -887,7 +885,7 @@ impl Picker {
         let size = e.size.map(fmt_bytes).unwrap_or_else(|| "?".into());
         self.note = Some((
             format!("press ctrl-d again to delete {} ({size})", e.id),
-            Color::Yellow,
+            Token::Gold,
         ));
         self.pending_delete = Some((e.id.clone(), Instant::now()));
         PickerAction::None
@@ -1178,9 +1176,9 @@ impl Picker {
 
 /// Status column: the blocker (red), a drafter's target (green), `cached` (green), `gated`
 /// (yellow), or nothing.
-fn tail(e: &Entry) -> (String, Color) {
+fn tail(e: &Entry) -> (String, Token) {
     match (&e.blocker, &e.draft_for) {
-        (Some(b), _) => (b.clone(), Color::Red),
+        (Some(b), _) => (b.clone(), Token::Crimson),
         (None, _) if e.via.is_some() || !e.quants.is_empty() => {
             let v = e.via.as_deref().unwrap_or(e);
             let size = v
@@ -1208,12 +1206,12 @@ fn tail(e: &Entry) -> (String, Color) {
             } else {
                 format!("too large; loads quantized {}{q_tag}{cycle_note}", v.id)
             };
-            (msg, Color::Green)
+            (msg, Token::Jade)
         }
-        (None, Some(t)) => (format!("draft model for {t}"), Color::Green),
-        _ if e.cached => ("cached".into(), Color::Green),
-        _ if e.gated => ("gated".into(), Color::Yellow),
-        _ => (String::new(), Color::DarkGray),
+        (None, Some(t)) => (format!("draft model for {t}"), Token::Jade),
+        _ if e.cached => ("cached".into(), Token::Jade),
+        _ if e.gated => ("gated".into(), Token::Gold),
+        _ => (String::new(), Token::Dim),
     }
 }
 
@@ -2420,7 +2418,7 @@ mod tests {
         let row = |id: &str| &p.rows.iter().find(|r| r.entry.id == id).unwrap().entry;
         assert_eq!(
             tail(row("r/Qwen3.5-2B-DSpark")),
-            ("draft model for Qwen/Qwen3.5-2B".to_string(), Color::Green)
+            ("draft model for Qwen/Qwen3.5-2B".to_string(), Token::Jade)
         );
         assert_eq!(
             row("z-lab/Qwen3-4B-DFlash-b16").blocker.as_deref(),
@@ -2739,6 +2737,10 @@ mod tests {
     #[test]
     fn sorted_column_header_is_highlighted() {
         use ratatui::{backend::TestBackend, style::Modifier, Terminal};
+        let _theme = crate::tui::theme::test_guard(crate::tui::theme::Theme {
+            truecolor: true,
+            mono: false,
+        });
         let cache = tempfile::tempdir().unwrap();
         let mut p = Picker::new(
             HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
@@ -2766,7 +2768,7 @@ mod tests {
                 .style()
         };
         let hot = |s: ratatui::style::Style| {
-            s.fg == Some(Color::Cyan) && s.add_modifier.contains(Modifier::UNDERLINED)
+            s.fg == Some(theme().color(Token::Brass)) && s.add_modifier.contains(Modifier::UNDERLINED)
         };
         assert!(hot(header(&p, "♥")) && !hot(header(&p, "↓")));
         p.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
