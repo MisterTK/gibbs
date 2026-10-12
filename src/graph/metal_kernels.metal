@@ -18,6 +18,7 @@ struct NormParams { uint d; float eps; };
 struct AttnParams { uint nq; uint nk; uint heads; uint head_dim; uint causal; float scale; };
 struct PoolParams { uint n; uint d; };
 
+// GEMV-COMMON-BEGIN (also prepended to generated GEMV kernels by `codegen::gemv_packed`)
 // Tanh-approximated GELU (`gelu_pytorch_tanh`), the activation of GeGlu.
 static inline float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
@@ -34,6 +35,36 @@ static inline float gelu_erf(float x) {
     float erf_v = x >= 0.0f ? 1.0f - erfc_v : erfc_v - 1.0f;
     return 0.5f * x * (1.0f + erf_v);
 }
+
+struct PackedGemvParams {
+    uint rows;
+    uint cols;
+    uint batch_size;
+    uint has_bias;
+    uint epi; // 0 = None, 1 = Gelu, 2 = Residual, 3 = Silu, 4 = SwiGlu, 5 = GeGlu
+};
+
+static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemvParams& p, device const float* res) {
+    if (p.epi == 1) {
+        return gelu_erf(acc);
+    } else if (p.epi == 2) {
+        return acc + res[out_idx];
+    } else if (p.epi == 3) {
+        return acc / (1.0f + exp(-acc));
+    } else if (p.epi == 4) {
+        float silu = acc / (1.0f + exp(-acc));
+        return silu * res[out_idx];
+    } else if (p.epi == 5) {
+        return gelu_tanh(acc) * res[out_idx];
+    } else if (p.epi == 6) {
+        float gate = res[out_idx];
+        return acc * (gate / (1.0f + exp(-gate)));
+    } else if (p.epi == 7) {
+        return acc * gelu_tanh(res[out_idx]);
+    }
+    return acc;
+}
+// GEMV-COMMON-END
 
 // Sum across the whole threadgroup; every thread gets the total. Safe to call repeatedly.
 static inline float block_sum(float v, threadgroup float* scratch, uint sg, uint lane, uint nsg) {
@@ -555,34 +586,6 @@ struct block_q4_0 {
     uint8_t qs[16];
 };
 
-struct PackedGemvParams {
-    uint rows;
-    uint cols;
-    uint batch_size;
-    uint has_bias;
-    uint epi; // 0 = None, 1 = Gelu, 2 = Residual, 3 = Silu, 4 = SwiGlu, 5 = GeGlu
-};
-
-static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemvParams& p, device const float* res) {
-    if (p.epi == 1) {
-        return gelu_erf(acc);
-    } else if (p.epi == 2) {
-        return acc + res[out_idx];
-    } else if (p.epi == 3) {
-        return acc / (1.0f + exp(-acc));
-    } else if (p.epi == 4) {
-        float silu = acc / (1.0f + exp(-acc));
-        return silu * res[out_idx];
-    } else if (p.epi == 5) {
-        return gelu_tanh(acc) * res[out_idx];
-    } else if (p.epi == 6) {
-        float gate = res[out_idx];
-        return acc * (gate / (1.0f + exp(-gate)));
-    } else if (p.epi == 7) {
-        return acc * gelu_tanh(res[out_idx]);
-    }
-    return acc;
-}
 
 kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
                       device const float* x [[buffer(1)]],
