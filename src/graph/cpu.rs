@@ -44,6 +44,8 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::TopKSoftmax { .. }
         | Op::Slice { .. }
         | Op::Conv2d { .. }
+        | Op::Conv1d { .. }
+        | Op::Conv3d { .. }
         | Op::RelPosBias { .. }
         | Op::StateReorder
         | Op::Megakernel(_) => true,
@@ -1297,9 +1299,10 @@ pub fn run(
             Op::AvgPool2d { kernel, stride } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
                 let shape = &graph.value(ins[0]).shape;
+                // Leading dims are independent planes (batch × channels).
                 let (c, h, w) = if shape.len() >= 3 {
                     (
-                        shape[shape.len() - 3],
+                        shape[..shape.len() - 2].iter().product(),
                         shape[shape.len() - 2],
                         shape[shape.len() - 1],
                     )
@@ -1362,9 +1365,40 @@ pub fn run(
                     ))
                 }
             },
-            Op::Conv3d { .. } => {
-                return Err(format!("node '{name}': CPU Conv3d is not implemented"));
-            }
+            Op::Conv3d {
+                stride,
+                padding: p,
+                dilation,
+                groups,
+            } => conv_nd(
+                name,
+                operand(&bound, &slots, ins, name, 0)?,
+                operand(&bound, &slots, ins, name, 1)?,
+                if ins.len() > 2 {
+                    Some(operand(&bound, &slots, ins, name, 2)?)
+                } else {
+                    None
+                },
+                (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape, 3),
+                (*stride, [p[0], p[1], p[2]], [p[3], p[4], p[5]], *dilation, *groups),
+            )?,
+            Op::Conv1d {
+                stride,
+                padding: p,
+                dilation,
+                groups,
+            } => conv_nd(
+                name,
+                operand(&bound, &slots, ins, name, 0)?,
+                operand(&bound, &slots, ins, name, 1)?,
+                if ins.len() > 2 {
+                    Some(operand(&bound, &slots, ins, name, 2)?)
+                } else {
+                    None
+                },
+                (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape, 1),
+                ([1, 1, *stride], [0, 0, p[0]], [0, 0, p[1]], [1, 1, *dilation], *groups),
+            )?,
             Op::LayerNorm { eps } => {
                 if ins.len() < 3 {
                     return Err(format!(
@@ -1463,26 +1497,28 @@ pub fn run(
                 x
             }
             Op::Conv2d {
-                stride, padding, ..
-            } => {
-                let x = operand(&bound, &slots, ins, name, 0)?;
-                let w = operand(&bound, &slots, ins, name, 1)?;
-                let bias = if ins.len() > 2 {
+                stride,
+                padding: p,
+                dilation,
+                groups,
+            } => conv_nd(
+                name,
+                operand(&bound, &slots, ins, name, 0)?,
+                operand(&bound, &slots, ins, name, 1)?,
+                if ins.len() > 2 {
                     Some(operand(&bound, &slots, ins, name, 2)?)
                 } else {
                     None
-                };
-                let x_shape = &graph.value(ins[0]).shape;
-                let w_shape = &graph.value(ins[1]).shape;
-                let in_c = x_shape.first().copied().unwrap_or(1);
-                let in_h = x_shape.get(1).copied().unwrap_or(1);
-                let in_w = x_shape.get(2).copied().unwrap_or(1);
-                let out_c = w_shape.first().copied().unwrap_or(1);
-                let (res, _, _) = nn::conv2d(
-                    x, in_c, in_h, in_w, w, bias, out_c, stride[0], stride[1], padding[0],
-                );
-                res
-            }
+                },
+                (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape, 2),
+                (
+                    [1, stride[0], stride[1]],
+                    [0, p[0], p[1]],
+                    [0, p[2], p[3]],
+                    [1, dilation[0], dilation[1]],
+                    *groups,
+                ),
+            )?,
             op => {
                 return Err(format!(
                     "CPU executor does not implement {} (node '{}')",
@@ -1540,6 +1576,86 @@ fn operand<'a>(
         Tensor::F32(v) => Ok(v),
         _ => Err(format!("node '{name}': operand {k} must be f32")),
     }
+}
+
+/// Direct reference convolution. `x [.., c_in, spatial..]`, `w [c_out, c_in/groups, k..]` with
+/// `nd` spatial dims (leading dims of `x` are batch); `geom` = (stride, pad begin, pad end,
+/// dilation, groups) right-aligned into 3 spatial dims (unused dims neutral: 1/0/0/1).
+#[allow(clippy::type_complexity)]
+fn conv_nd(
+    name: &str,
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    (xs, ws, nd): (&[usize], &[usize], usize),
+    (stride, pb, pe, dil, groups): ([usize; 3], [usize; 3], [usize; 3], [usize; 3], usize),
+) -> Result<Vec<f32>, String> {
+    if xs.len() < nd + 1 || ws.len() != nd + 2 {
+        return Err(format!("node '{name}': conv shapes {xs:?} / {ws:?} do not fit {nd}-d conv"));
+    }
+    let (mut inp, mut k) = ([1usize; 3], [1usize; 3]);
+    inp[3 - nd..].copy_from_slice(&xs[xs.len() - nd..]);
+    k[3 - nd..].copy_from_slice(&ws[2..]);
+    let c_in = xs[xs.len() - nd - 1];
+    let batch: usize = xs[..xs.len() - nd - 1].iter().product();
+    let (c_out, cpg) = (ws[0], ws[1]);
+    if groups == 0 || c_in != cpg * groups || c_out % groups != 0 || stride.contains(&0) || dil.contains(&0) {
+        return Err(format!("node '{name}': conv c_in {c_in}, weight {ws:?}, groups {groups} are inconsistent"));
+    }
+    if x.len() != batch * c_in * inp.iter().product::<usize>() || w.len() != ws.iter().product::<usize>() {
+        return Err(format!("node '{name}': conv operand lengths do not match shapes"));
+    }
+    if bias.is_some_and(|b| b.len() != c_out) {
+        return Err(format!("node '{name}': conv bias is not c_out"));
+    }
+    let mut out_d = [1usize; 3];
+    for a in 0..3 {
+        let span = dil[a] * (k[a] - 1) + 1;
+        if inp[a] + pb[a] + pe[a] < span {
+            return Err(format!("node '{name}': conv kernel larger than padded input"));
+        }
+        out_d[a] = (inp[a] + pb[a] + pe[a] - span) / stride[a] + 1;
+    }
+    let mut out = Vec::with_capacity(batch * c_out * out_d.iter().product::<usize>());
+    let ocg = c_out / groups;
+    for b in 0..batch {
+        for oc in 0..c_out {
+            let g = oc / ocg;
+            for od in 0..out_d[0] {
+                for oh in 0..out_d[1] {
+                    for ow in 0..out_d[2] {
+                        let mut sum = bias.map_or(0.0, |bb| bb[oc]);
+                        for ic in 0..cpg {
+                            let xc = (b * c_in + g * cpg + ic) * inp.iter().product::<usize>();
+                            let wc = (oc * cpg + ic) * k.iter().product::<usize>();
+                            for kd in 0..k[0] {
+                                let id = (od * stride[0] + kd * dil[0]) as isize - pb[0] as isize;
+                                if id < 0 || id >= inp[0] as isize {
+                                    continue;
+                                }
+                                for kh in 0..k[1] {
+                                    let ih = (oh * stride[1] + kh * dil[1]) as isize - pb[1] as isize;
+                                    if ih < 0 || ih >= inp[1] as isize {
+                                        continue;
+                                    }
+                                    for kw in 0..k[2] {
+                                        let iw = (ow * stride[2] + kw * dil[2]) as isize - pb[2] as isize;
+                                        if iw < 0 || iw >= inp[2] as isize {
+                                            continue;
+                                        }
+                                        let xi = xc + (id as usize * inp[1] + ih as usize) * inp[2] + iw as usize;
+                                        sum += x[xi] * w[wc + (kd * k[1] + kh) * k[2] + kw];
+                                    }
+                                }
+                            }
+                        }
+                        out.push(sum);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn operand_u32<'a>(
