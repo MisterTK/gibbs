@@ -851,3 +851,50 @@ Run from `/Users/keas/code/rust-inference-server` with network access for model 
 - **If ggml's `block_nvfp4` (GGUF type 40) layout cannot be confirmed** from `ggml-common.h`, type 40 stays unsupported with an explicit load error, and `WhiskyAKM/Gemma-4-E2B-it-qat-NVFP4-GGUF` is listed as failing in the report.
 - **If a source program cannot load for the KL gate** (larger than 50% of RAM), the per-tensor gate applies (S3.5).
 - **If Metal stage-boundary counter sampling is unavailable**, the coarse per-command-buffer profiler applies (S1.6).
+
+## Audit addendum (2026-10-12)
+
+### Ground truth (rows 1–6)
+
+| Claim in the earlier sprint-2 report | Reality |
+|:---|:---|
+| "496 tests pass, 0 failures" | `cargo test --lib -q` on the reported tree: 494 pass, 2 fail: `scheduler::tests::test_program_scheduler_metal_parity` (max logits diff 0.0052 > 1e-3) and `…prefill_and_decode_parity` (`fused_mlp: weight elements 65536 != 256 * 128`). Cause confirmed: iteration 1 (`bb32ce2`); reverting it gives 496 pass, 0 fail. Its guard ran only `graph::` tests. |
+| "100% Metal lowering without gaps" | `tests/metal_coverage.rs` only `println!`ed a hardcoded table of `"yes"`. `src/main.rs` mapped `PlacementMode::Auto => Device::Cpu`. `src/graph/placement.rs` recorded an unsupported node as a "fallback" string but still assigned Metal; non-Metal modes assigned CPU. |
+| "Strict Metal lowering and packed codec support" | `src/graph/codec.rs`: Q4_0 and Q8_0 are real; Q4_K, Q2_K, IQ4_XS, IQ2_M, IQ3_S, TQ2_0 are stubs (`out8[i] = float(d)`). `src/graph/codegen.rs` is never called by `GraphProgram::compile`. |
+| Families on Metal | CPU by default: T5/mT5/uMT5 (`t5.rs`), Seq2Seq, Idefics3/SmolVLM + SigLIP, all classifiers, SD/SDXL/DiT/FLUX/Sana/VAEs, LTX and ModelScope video, speculative drafters, MTP/.ninfer, Qwen3.5 vision, Gemma 4 vision/audio prefill, Gemma 4 conformer audio. |
+| Silent CPU fallbacks | `qwen3_5.rs` and `gemma4/mod.rs` `warn!("falling back to CPU")` then `None`; `scheduler/mod.rs` logs and continues with CPU segments. |
+| Op coverage | `metal::supports_op` returns false for MatMul, GroupNorm, InstanceNorm, Relu, Gather, Scatter, Pad, AvgPool2d, Upsample, Conv1d, Conv3d, Moe, Reshape, Transpose, Concat, Squeeze, Unsqueeze, Tile, Reduce, most `Unary`/`Binary` kinds; most others are F32-only. |
+
+### Status (scout-derived from `path:symbol`; re-verify a row before relying on it)
+
+| Steps | Status |
+|:---|:---|
+| S1.1–S1.5, S1.7, S6.1, S6.3, S7.3, S7.4 | done |
+| S1.6 profiler | partial: per-command-buffer only; bytes/GB/s/% are 0 |
+| S1.8 E4B baseline | missing |
+| S2.1, S2.2 | done |
+| S2.3 | partial: `StateStore::truncate` stub, CPU state still cloned (`cpu.rs:829`) |
+| S3.1, S3.2, S3.3 | partial: 6 stub codecs, codegen unwired, `supports_op` hardcodes formats |
+| S3.4 | done |
+| S3.5, S3.6 | partial: f32 materialization remains (`weight_format.rs:200`), no reencode cache, `hardware_speed_rank` still used |
+| S3.7 | missing (bnb rejected `prequant.rs:173`) |
+| S4.1, S4.2 | partial/fake (see above) |
+| S4.3–S4.5 | partial: Gemma graph needs bf16 `TextModel`; Qwen graph dense-only; no MoE/DeltaNet/MTP programs |
+| S4.6, S4.7 | missing |
+| S4.8 | done |
+| S4.9 | partial: toy graph test only |
+| S5.1 | partial: `Op::Megakernel`, `passes/megakernel.rs`, `fuse_qkv_pass` still present |
+| S5.2 | missing |
+| S5.3 | done (step-count test) |
+| S6.2 ICB | partial: descriptor allocated, no commands recorded, never executed |
+| S7.1 | partial: sprite 10 rows (plan said 48×48) |
+| S7.2, S7.5, S7.6 | partial/superseded by G2 |
+| S8 | stopped after 1 kept iteration (iteration 1 later reverted) |
+| S9 | report was false |
+
+### Amendments
+- **S4.1** is superseded by G1.2–G1.4: the placement error carries the avenue report; `--backend cpu` is the only CPU opt-in; no multi-segment programs.
+- **S4.2** is superseded by G1.6: `tests/op_coverage.rs`, `tests/cpu_free_matrix.rs`.
+- **S3.1** adds: a codec whose `decode8` does not reproduce the CPU dequantizer bit-for-bit may not be registered (test per codec).
+- **S7.1/S7.2/S7.5/S7.6** are replaced by G2.5–G2.9 (theme/widgets/layout, components, sprite engine, tests).
+- **S8.1 Guard** is `scripts/loop_guard.sh`.
