@@ -5,7 +5,8 @@
 //! both checkpoints already store), then little-endian f16 scale and f16 bias / zero point.
 //! Scales and biases are f16 on the GPU, so a tensor whose values do not all convert to f16 exactly
 //! (bf16 MLX checkpoints routinely) is not repacked: [`repack`] returns `Ok(None)` and the exact f32
-//! path applies. Never rounded.
+//! path applies. Never rounded. An unsupported MLX group size never reaches `repack`: `mlx::parse` makes it
+//! a load-time `Err` shared with the f32 path.
 
 use super::Repacked;
 use crate::graph::codec::Spec;
@@ -109,7 +110,7 @@ fn blocks(w: &[u8], g: usize, scale: &[u16], bias: &[u16]) -> Vec<u8> {
 ///   (bf16 values that need more than 10 mantissa bits or leave the f16 range, non-finite);
 /// * compressed-tensors: not an int4 `pack-quantized` I32 weight, per-channel / per-tensor scales
 ///   (a scale grid other than `[out, in / group]` with `group` of 32, 64 or 128), activation order
-///   (`weight_g_idx`), fractional zero points, or any scale / zero point not exactly an f16.
+///   (`weight_g_idx`), a global scale (`weight_global_scale` / `weight_scale_2`), fractional zero points, or any scale / zero point not exactly an f16.
 pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Repacked>, String> {
     use QuantFormat as Q;
     if let Some(p) = mlx::packed_tensor(m, data, weight)? {
@@ -389,6 +390,12 @@ mod tests {
         let (mut fx, ..) = ct_fx(4, 128, 64, "F32", false, 5);
         fx.add_f("x.weight_zero_point", "F32", &[4, 2], &[0.5; 8]);
         assert!(none(&fx), "fractional zero");
+        // A global scale the f32 path multiplies in.
+        for g in ["x.weight_global_scale", "x.weight_scale_2"] {
+            let (mut fx, ..) = ct_fx(4, 128, 64, "F16", false, 7);
+            fx.add_f(g, "F32", &[1], &[2.0]);
+            assert!(none(&fx), "{g}");
+        }
         // Not a pack-quantized weight / unknown name.
         let (fx, ..) = ct_fx(4, 128, 64, "F16", false, 6);
         assert!(repack(&fx.m, &fx.data, "y.weight").unwrap().is_none());
