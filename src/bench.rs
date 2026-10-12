@@ -125,13 +125,30 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 continue;
             }
             None => {
-                let err = format!("model '{}' is not supported on strict Metal", model_cfg.id);
-                println!(
-                    "{}",
-                    serde_json::json!({"model": model_cfg.id, "error": err})
-                );
-                had_error = true;
-                continue;
+                let hw = crate::hardware::HardwareCapability::probe_system();
+                let backend = crate::hardware::Device::Metal;
+                match crate::model::weight_format::load_causal_lm_for(artifacts, backend, None, &hw)
+                {
+                    Ok((graph_lm, _)) => {
+                        match crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)
+                        {
+                            Ok(exec) => exec,
+                            Err(e) => {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({"model": model_cfg.id, "error": e})
+                                );
+                                had_error = true;
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
+                        had_error = true;
+                        continue;
+                    }
+                }
             }
         };
 
