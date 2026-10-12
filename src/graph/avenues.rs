@@ -247,11 +247,7 @@ pub enum Status {
 pub fn family_status(f: Family) -> Status {
     use Family::*;
     match f {
-        GraphLm | Qwen35 | System1 => Status::Gpu,
-        // Every op lowers and the tiny fixture matches the CPU, but real checkpoints do not:
-        // `--bench-parity` on E2B QAT gives step-0 logits cos 0.856 and wrong text. Before the
-        // silent CPU fallback was removed this was masked (the "Metal" run was the CPU).
-        Gemma4 => Status::Gated("numerics: Metal decode diverges from the CPU forward on real Gemma 4 checkpoints (E2B QAT step-0 logits cos 0.856); sliding-window, KV-share, PLE and proportional-RoPE paths are unverified"),
+        GraphLm | Gemma4 | Qwen35 | System1 => Status::Gpu,
         Gemma4Media => Status::Gated(
             "vision/audio prefill bypasses the program; Conv2d/Transpose/Reshape unlowered",
         ),

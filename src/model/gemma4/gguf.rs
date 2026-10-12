@@ -47,12 +47,11 @@ fn num(md: &HashMap<String, String>, key: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("GGUF metadata {key} missing"))
 }
 
-fn model(
+/// The text decoder of a `gemma4` GGUF.
+pub(super) fn load_text(
     map: &Arc<crate::model::loaders::gguf::GgufData>,
     m: &ModelManifest,
-    path: &Path,
-    mode: impl Into<crate::hardware::PlacementMode>,
-) -> Result<Arc<dyn NativeLm>, String> {
+) -> Result<Arc<TextModel>, String> {
     let (cfg, first_shared) = text_config(m, map)?;
     let ple = m
         .tensors
@@ -67,8 +66,18 @@ fn model(
         |_| false,
         |_, _| {},
     )?;
-    let text =
-        Arc::new(TextModel::load_with_ple(&w, &cfg, ple).map_err(|e| format!("gemma4 text: {e}"))?);
+    Ok(Arc::new(
+        TextModel::load_with_ple(&w, &cfg, ple).map_err(|e| format!("gemma4 text: {e}"))?,
+    ))
+}
+
+fn model(
+    map: &Arc<crate::model::loaders::gguf::GgufData>,
+    m: &ModelManifest,
+    path: &Path,
+    mode: impl Into<crate::hardware::PlacementMode>,
+) -> Result<Arc<dyn NativeLm>, String> {
+    let text = load_text(map, m)?;
     let mut tokenizer = UniversalModelLoader::extract_gguf_tokenizer(map)?;
     // llama.cpp ends generation on `<eos>` and `<turn|>` whichever one the file declares.
     let eos = num(&m.metadata, "tokenizer.ggml.eos_token_id")? as u32;
@@ -694,6 +703,99 @@ mod tests {
             v.iter().zip(raw).all(|(a, b)| (a - b).abs() < 1e-5),
             "{v:?}"
         );
+    }
+
+    /// Finds the first node where the Metal session departs from the CPU executor on the real Gemma 4
+    /// checkpoint (`GIBBS_GEMMA_GGUF`, default E2B QAT) (every node output is exposed as a graph output). Run with `--ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs the real E2B QAT checkpoint under disk/"]
+    fn gemma4_real_metal_cpu_bisect() {
+        use crate::graph::{StateStore, Tensor};
+        let default = "disk/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf".to_string();
+        let path = std::env::var("GIBBS_GEMMA_GGUF").unwrap_or(default);
+        let path = std::path::Path::new(&path);
+        if !path.exists() {
+            eprintln!("SKIP: {path:?} not found");
+            return;
+        }
+        let (manifest, data) = crate::model::loaders::gguf::open(path).unwrap();
+        let data = Arc::new(data);
+        let text = load_text(&data, &manifest).unwrap();
+        let (mut g, w) = text.to_decode_graph().unwrap();
+        crate::graph::passes::canonical::run(&mut g);
+        for n in 0..g.nodes.len() {
+            let o = g.nodes[n].outputs[0];
+            if !g.outputs.contains(&o) {
+                g.outputs.push(o);
+            }
+        }
+        let tokens = [2u32, 105, 2364];
+        let build = |tok: u32, pos: usize| {
+            let mut emb = vec![0.0f32; text.hidden];
+            text.embed_row(tok, &mut emb);
+            let mut inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos as u32])];
+            if let Some(p) = &text.ple {
+                let mut e = vec![0.0f32; text.layers_n * p.dim];
+                let id = if (tok as usize) < p.embed.rows { tok } else { text.pad_id };
+                p.embed.get_row(id as usize, &mut e);
+                let sc = (p.dim as f32).sqrt();
+                e.iter_mut().for_each(|v| *v *= sc);
+                inputs.push(Tensor::F32(e));
+            }
+            inputs
+        };
+        let mut cpu_state = StateStore::new();
+        let mut native_cache = text.new_cache();
+        let mut mg = g.clone();
+        crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut mg, &|f| {
+            crate::graph::metal::supports_op(&crate::graph::Op::Linear, crate::graph::DType::Quant(f))
+        })
+        .unwrap();
+        let rt = crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
+        let session = crate::graph::metal::Session::new_for_graph(rt, &w, Some(&mg)).unwrap();
+        let plan = session.prepare_plan(&mg).unwrap();
+        let mut metal_state = StateStore::new();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let cpu = crate::graph::cpu::run(&g, &w, &mut cpu_state, build(tok, pos)).unwrap();
+            {
+                // Native reference: the hand-written forward the CLI's CPU path uses.
+                let mut emb = vec![0.0f32; text.hidden];
+                text.embed_row(tok, &mut emb);
+                let native = text.forward(emb, &[tok], pos, &mut native_cache, &[]);
+                let gl = cpu[0].as_f32().unwrap();
+                let dot: f32 = native.iter().zip(gl).map(|(a, b)| a * b).sum();
+                let na: f32 = native.iter().map(|a| a * a).sum::<f32>().sqrt();
+                let nb: f32 = gl.iter().map(|a| a * a).sum::<f32>().sqrt();
+                println!("pos {pos}: native vs graph-cpu logits cos {:.5}", dot / (na * nb));
+            }
+            let met = session
+                .run_prepared(&mg, &plan, Some(&mut metal_state), build(tok, pos))
+                .unwrap();
+            let mut first_bad = None;
+            for (i, (c, m)) in cpu.iter().zip(&met).enumerate() {
+                if i == 0 {
+                    continue; // the logits, compared via the node list below
+                }
+                let (Ok(c), Ok(m)) = (c.as_f32(), m.as_f32()) else { continue };
+                let scale = c.iter().fold(0f32, |a, &x| a.max(x.abs())).max(1e-6);
+                let d = c.iter().zip(m).fold(0f32, |a, (&x, &y)| a.max((x - y).abs())) / scale;
+                if d > 2e-2 && first_bad.is_none() {
+                    first_bad = Some((i, d));
+                }
+            }
+            match first_bad {
+                Some((i, d)) => {
+                    let n = &g.nodes[(i - 1).min(g.nodes.len() - 1)];
+                    println!("pos {pos}: first divergence output #{i} (node '{}' {:?}) rel diff {d:.4}", n.name, n.op);
+                    if let (Ok(c), Ok(m)) = (cpu[i].as_f32(), met[i].as_f32()) {
+                        let bad: Vec<usize> = (0..c.len()).filter(|&j| !((c[j] - m[j]).abs() <= 1e-2 * (1.0 + c[j].abs()))).collect();
+                        println!("  {} of {} elements differ; first {:?}; e.g. cpu {:?} metal {:?}", bad.len(), c.len(), &bad[..bad.len().min(6)], bad.iter().take(3).map(|&j| c[j]).collect::<Vec<_>>(), bad.iter().take(3).map(|&j| m[j]).collect::<Vec<_>>());
+                    }
+                }
+                None => println!("pos {pos}: all {} outputs within 2e-2", cpu.len()),
+            }
+        }
     }
 
     #[test]

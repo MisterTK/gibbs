@@ -9,7 +9,7 @@
 using namespace metal;
 
 // Attention: head_dim <= 32 * ATTN_MAX_PER_LANE; simdgroups per threadgroup <= ATTN_MAX_SG.
-constant uint ATTN_MAX_PER_LANE = 8;
+constant uint ATTN_MAX_PER_LANE = 16;
 constant uint ATTN_MAX_SG = 8;
 
 struct GemmParams { uint m; uint n; uint k; uint has_bias; };

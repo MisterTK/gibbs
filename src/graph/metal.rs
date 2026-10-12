@@ -197,7 +197,7 @@ const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
     [256, 1536, 384],
     [256, 384, 1536],
 ];
-const ATTN_MAX_HEAD_DIM: usize = 256;
+const ATTN_MAX_HEAD_DIM: usize = 512;
 const BASE_KERNELS: [&str; 62] = [
     "embedding_f32",
     "add_f32",
@@ -3717,6 +3717,12 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 } else {
                     None
                 };
+                if (*head_dim).max(*v_head_dim) > ATTN_MAX_HEAD_DIM {
+                    return Err(format!(
+                        "node '{name}': head_dim {} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}",
+                        (*head_dim).max(*v_head_dim)
+                    ));
+                }
                 let ql = n_of(q)?;
                 let m = ql / (*heads * *head_dim).max(1);
                 (
@@ -3761,6 +3767,12 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 } else {
                     None
                 };
+                if (*head_dim).max(*v_head_dim) > ATTN_MAX_HEAD_DIM {
+                    return Err(format!(
+                        "node '{name}': head_dim {} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}",
+                        (*head_dim).max(*v_head_dim)
+                    ));
+                }
                 let ql = n_of(q)?;
                 let m = ql / (*heads * *head_dim).max(1);
                 (
