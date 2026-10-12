@@ -286,26 +286,23 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
             }
         };
 
-        // Load Metal model
-        let metal_exec = match crate::model::native::load_native(
-            &artifacts,
-            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+        // Load Native Metal and CPU models for bit-parity verification
+        let (metal_exec, cpu_exec) = match (
+            crate::model::native::load_native(
+                &artifacts,
+                crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+            ),
+            crate::model::native::load_native(
+                &artifacts,
+                crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
+            ),
         ) {
-            Some(Ok(m)) => m,
-            _ => {
-                eprintln!("parity: cannot load metal model for {}", model_cfg.id);
-                return Ok(4);
+            (Some(Ok(m)), Some(Ok(c))) => (m, c),
+            (None, _) | (_, None) => {
+                continue;
             }
-        };
-
-        // Load CPU model
-        let cpu_exec = match crate::model::native::load_native(
-            &artifacts,
-            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
-        ) {
-            Some(Ok(m)) => m,
-            _ => {
-                eprintln!("parity: cannot load cpu model for {}", model_cfg.id);
+            (Some(Err(e)), _) | (_, Some(Err(e))) => {
+                eprintln!("parity: load error for {}: {e}", model_cfg.id);
                 return Ok(4);
             }
         };
