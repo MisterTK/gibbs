@@ -455,7 +455,7 @@ pub(crate) struct Int4Groups<'a> {
 
 /// [`Int4Groups`] of `name`; `None` when it is not such a weight: not int4, no group grid (per-tensor
 /// scale, a group size outside 32 / 64 / 128, a scale row count other than `out`), activation-ordered
-/// (`weight_g_idx`), or zero points that are not whole numbers.
+/// (`weight_g_idx`), a global scale (`weight_global_scale` / `weight_scale_2`), or zero points that are not whole numbers.
 pub(crate) fn int4_groups<'a>(
     m: &ModelManifest,
     data: &'a [u8],
@@ -476,7 +476,10 @@ pub(crate) fn int4_groups<'a>(
         return Ok(None);
     };
     // 4 bits: half a byte per element (8-bit packs are `rows * cols`, 2-bit a quarter).
-    if w.dtype != "I32" || get("weight_g_idx").is_some() || w.byte_len * 2 != rows * cols {
+    if w.dtype != "I32" || get("weight_g_idx").is_some()
+        || get("weight_global_scale").is_some()
+        || get("weight_scale_2").is_some()
+        || w.byte_len * 2 != rows * cols {
         return Ok(None);
     }
     if sr != rows || sc == 0 || cols % sc != 0 || ![32, 64, 128].contains(&(cols / sc)) {
