@@ -9,9 +9,6 @@ use gibbs_engine::graph::{
 
 /// `(op key, dtype, reason)`; the reason is the avenue verdict text of the first rejected avenue.
 const KNOWN_UNLOWERED: &[(&str, &str, &str)] = &[
-    ("Moe", "F32", "no Metal kernel for Moe at F32"),
-    ("Moe", "F16", "no Metal kernel for Moe at F16"),
-    ("Moe", "BF16", "no Metal kernel for Moe at BF16"),
     ("Relu", "F32", "no Metal kernel for Relu at F32"),
     ("Relu", "F16", "no Metal kernel for Relu at F16"),
     ("Relu", "BF16", "no Metal kernel for Relu at BF16"),
