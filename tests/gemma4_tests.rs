@@ -198,7 +198,7 @@ fn gemma4_speech_is_understood() {
 /// The llama.cpp `gemma4` GGUF of google/gemma-4-E2B-it with its `mmproj` (ggml-org/gemma-4-E2B-it-GGUF:
 /// `gemma-4-E2B-it-Q4_0.gguf` + `mmproj-gemma-4-E2B-it-Q8_0.gguf`), from `GIBBS_GEMMA4_GGUF_DIR`
 /// (default: that repo's snapshot under `disk/` or `GIBBS_TEST_STORAGE`).
-static GGUF_MODEL: LazyLock<Option<Arc<dyn NativeLm>>> = LazyLock::new(|| {
+fn load_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
     let snapshot = |root: String| {
         PathBuf::from(root).join("models--ggml-org--gemma-4-E2B-it-GGUF/snapshots/main")
     };
@@ -221,17 +221,17 @@ static GGUF_MODEL: LazyLock<Option<Arc<dyn NativeLm>>> = LazyLock::new(|| {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, Device::Cpu)
+        load_native(&artifacts, device)
             .expect("gemma4 GGUF is native")
             .expect("gemma4 GGUF loads"),
     )
-});
+}
+
+static GGUF_MODEL: LazyLock<Option<Arc<dyn NativeLm>>> = LazyLock::new(|| load_gguf(Device::Cpu));
 
 /// Next-token logits after "The capital of France is" against llama.cpp (build 11304,
 /// `llama-debug --save-logits` on the same GGUF): same ids, same top tokens, close logits.
-#[test]
-fn gemma4_gguf_matches_llama_cpp() {
-    let Some(m) = GGUF_MODEL.clone() else { return };
+fn check_against_llama_cpp(m: &dyn NativeLm) {
     let ids = m.tokenizer().encode("The capital of France is");
     assert_eq!(
         ids,
@@ -259,6 +259,22 @@ fn gemma4_gguf_matches_llama_cpp() {
             logits[i]
         );
     }
+}
+
+#[test]
+fn gemma4_gguf_matches_llama_cpp() {
+    let Some(m) = GGUF_MODEL.clone() else { return };
+    check_against_llama_cpp(&*m);
+}
+
+/// The Metal program (generated/hand GEMV, ext attention) against the same llama.cpp reference.
+#[test]
+fn gemma4_gguf_metal_matches_llama_cpp() {
+    if !gibbs_engine::hardware::available_devices().contains(&Device::Metal) {
+        return;
+    }
+    let Some(m) = load_gguf(Device::Metal) else { return };
+    check_against_llama_cpp(&*m);
 }
 
 #[test]
