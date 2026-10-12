@@ -470,6 +470,79 @@ impl QwenVae21 {
     }
 }
 
+/// Tiny synthetic decoder (mult [1,2,2,4], base 4, mixed temporal flags) for the CPU-free fixtures and parity
+/// tests (shared with `tests/cpu_free_matrix.rs`).
+pub mod fixture {
+    use super::*;
+    use crate::model::diff_graph::testutil::{synth, Lcg};
+
+    /// The decoder and its latent channel count.
+    pub fn tiny() -> (QwenVae21, usize) {
+        let (mult, base, zc, temporal) = ([1usize, 2, 2, 4], 4usize, 6usize, [true, false, true]);
+        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
+        let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
+            s.push((format!("{p}.weight"), vec![o, i, k, k]));
+            s.push((format!("{p}.bias"), vec![o]));
+        };
+        let res = |s: &mut Vec<_>, p: &str, i: usize, o: usize| {
+            s.push((format!("{p}.norm1.gamma"), vec![i]));
+            conv(s, &format!("{p}.conv1"), i, o, 3);
+            s.push((format!("{p}.norm2.gamma"), vec![o]));
+            conv(s, &format!("{p}.conv2"), o, o, 3);
+            if i != o {
+                conv(s, &format!("{p}.conv_shortcut"), i, o, 1);
+            }
+        };
+        let dims: Vec<usize> = std::iter::once(mult[3]).chain(mult.iter().rev().copied()).map(|m| m * base).collect();
+        conv(&mut s, "post_quant_conv", zc, zc, 1);
+        conv(&mut s, "decoder.conv_in", zc, dims[0], 3);
+        res(&mut s, "decoder.mid_block.resnets.0", dims[0], dims[0]);
+        res(&mut s, "decoder.mid_block.resnets.1", dims[0], dims[0]);
+        let a = "decoder.mid_block.attentions.0";
+        s.push((format!("{a}.norm.gamma"), vec![dims[0]]));
+        conv(&mut s, &format!("{a}.to_qkv"), dims[0], 3 * dims[0], 1);
+        conv(&mut s, &format!("{a}.proj"), dims[0], dims[0], 1);
+        for (i, io) in dims.windows(2).enumerate() {
+            let p = format!("decoder.up_blocks.{i}");
+            for j in 0..3 {
+                res(&mut s, &format!("{p}.resnets.{j}"), if j == 0 { io[0] } else { io[1] }, io[1]);
+            }
+            if i + 1 != mult.len() {
+                conv(&mut s, &format!("{p}.upsampler.resample.1"), io[1], io[1], 3);
+            }
+        }
+        s.push(("decoder.norm_out.gamma".into(), vec![dims[4]]));
+        conv(&mut s, "decoder.conv_out", dims[4], 4, 3);
+        let mut r = synth(&s, 21);
+        let mut g = Lcg(9);
+        for (n, (_, v)) in r.0.iter_mut() {
+            if n.ends_with(".gamma") {
+                v.iter_mut().for_each(|x| *x = 1.0 + 0.2 * g.next());
+            }
+        }
+        let w = Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap();
+        let (mean, std) = (Lcg(1).vec(zc, 0.5), Lcg(2).vec(zc, 0.5).iter().map(|v| 1.0 + v.abs()).collect());
+        (QwenVae21::open(&w, &mult, base, 2, &temporal, mean, std).unwrap(), zc)
+    }
+
+    /// Public `decode` of the tiny net (Metal when the CPU tripwire is armed) plus a finiteness check of the
+    /// raw Metal output.
+    pub fn tiny_on_gpu() -> Result<(), String> {
+        let (vae, zc) = tiny();
+        let (h, w) = (3, 2);
+        let z = Lcg(3).vec(zc * h * w, 1.0);
+        let img = vae.decode(&z, h, w)?;
+        let f = 1 << vae.ups.iter().filter(|u| u.up.is_some()).count();
+        if (img.width, img.height) != (f * w, f * h) {
+            return Err(format!("qwen_vae21: {}x{} image", img.width, img.height));
+        }
+        if vae.decode_gpu(&z, h, w)?.0.iter().any(|v| !v.is_finite()) {
+            return Err("qwen_vae21: non-finite Metal output".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,52 +637,8 @@ mod tests {
     /// graph program (f32 vs f32: 1e-3), with every node on the GPU.
     #[test]
     fn gpu_matches_cpu() {
-        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
-        let (mult, base, zc, temporal) = ([1usize, 2, 2, 4], 4usize, 6usize, [true, false, true]);
-        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
-        let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
-            s.push((format!("{p}.weight"), vec![o, i, k, k]));
-            s.push((format!("{p}.bias"), vec![o]));
-        };
-        let res = |s: &mut Vec<_>, p: &str, i: usize, o: usize| {
-            s.push((format!("{p}.norm1.gamma"), vec![i]));
-            conv(s, &format!("{p}.conv1"), i, o, 3);
-            s.push((format!("{p}.norm2.gamma"), vec![o]));
-            conv(s, &format!("{p}.conv2"), o, o, 3);
-            if i != o {
-                conv(s, &format!("{p}.conv_shortcut"), i, o, 1);
-            }
-        };
-        let dims: Vec<usize> = std::iter::once(mult[3]).chain(mult.iter().rev().copied()).map(|m| m * base).collect();
-        conv(&mut s, "post_quant_conv", zc, zc, 1);
-        conv(&mut s, "decoder.conv_in", zc, dims[0], 3);
-        res(&mut s, "decoder.mid_block.resnets.0", dims[0], dims[0]);
-        res(&mut s, "decoder.mid_block.resnets.1", dims[0], dims[0]);
-        let a = "decoder.mid_block.attentions.0";
-        s.push((format!("{a}.norm.gamma"), vec![dims[0]]));
-        conv(&mut s, &format!("{a}.to_qkv"), dims[0], 3 * dims[0], 1);
-        conv(&mut s, &format!("{a}.proj"), dims[0], dims[0], 1);
-        for (i, io) in dims.windows(2).enumerate() {
-            let p = format!("decoder.up_blocks.{i}");
-            for j in 0..3 {
-                res(&mut s, &format!("{p}.resnets.{j}"), if j == 0 { io[0] } else { io[1] }, io[1]);
-            }
-            if i + 1 != mult.len() {
-                conv(&mut s, &format!("{p}.upsampler.resample.1"), io[1], io[1], 3);
-            }
-        }
-        s.push(("decoder.norm_out.gamma".into(), vec![dims[4]]));
-        conv(&mut s, "decoder.conv_out", dims[4], 4, 3);
-        let mut r = synth(&s, 21);
-        let mut g = Lcg(9);
-        for (n, (_, v)) in r.0.iter_mut() {
-            if n.ends_with(".gamma") {
-                v.iter_mut().for_each(|x| *x = 1.0 + 0.2 * g.next());
-            }
-        }
-        let w = Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap();
-        let (mean, std) = (Lcg(1).vec(zc, 0.5), Lcg(2).vec(zc, 0.5).iter().map(|v| 1.0 + v.abs()).collect());
-        let vae = QwenVae21::open(&w, &mult, base, 2, &temporal, mean, std).unwrap();
+        use crate::model::diff_graph::testutil::{rel_err, Lcg};
+        let (vae, zc) = fixture::tiny();
         let (h, wd) = (3, 2);
         let z = Lcg(3).vec(zc * h * wd, 1.0);
         let (cpu, ch, cw) = vae.decode_cpu(&z, h, wd);
