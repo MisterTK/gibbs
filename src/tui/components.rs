@@ -1,0 +1,1190 @@
+//! Instrument components: STATUS row, sidebar panels and the compact dock. Every value shown is a
+//! telemetry reading or a derivation of one; colours come from the theme only.
+
+use super::layout::Comp;
+use super::mascot::MascotState;
+use super::theme::{Theme, Token};
+use super::widgets::{gauge, instrument, orbit, spark, stacked_bar, text_width, trunc};
+use super::{Load, TuiApp};
+use crate::model::weight_format::MAX_MEAN_KL;
+use crate::scheduler::SequenceState;
+use crate::telemetry::TelemetrySnapshot;
+use ratatui::{
+    layout::Rect,
+    style::{Modifier, Style},
+    symbols::Marker,
+    text::{Line, Span},
+    widgets::{
+        canvas::{Canvas, Line as CLine},
+        Paragraph,
+    },
+    Frame,
+};
+
+const LN2: f32 = std::f32::consts::LN_2;
+
+/// One frame's readings, computed once and shared by every component.
+pub(super) struct Vitals {
+    pub s: TelemetrySnapshot,
+    /// Achieved / roof tok/s in percent (unclamped).
+    pub pct: f32,
+    pub roof_tok_s: f64,
+    pub bytes_per_tok: u64,
+    pub ceiling: f32,
+    pub kv_pct: f32,
+    /// Inter-token latencies, newest last.
+    pub itl: Vec<f32>,
+}
+
+impl Vitals {
+    /// (p50, p95, p99, σ) of the ITL window.
+    pub fn itl_stats(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.itl.is_empty() {
+            return None;
+        }
+        let mut v = self.itl.clone();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let n = v.len();
+        let q = |p: f32| v[((n - 1) as f32 * p).round() as usize];
+        let mean = v.iter().sum::<f32>() / n as f32;
+        let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n as f32;
+        Some((q(0.5), q(0.95), q(0.99), var.sqrt()))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum State {
+    Equilibrium,
+    Decode,
+    Prefill,
+    Loading(f32),
+    Error,
+}
+
+/// Download/map/compile progress of a load: (stage index 0..4, done, total, percent).
+pub(super) fn load_stage(l: &Load) -> (usize, u64, u64, f32) {
+    let stage = *l.stage.lock();
+    let done = l.progress.done.load(std::sync::atomic::Ordering::Relaxed);
+    let total = l.progress.total.load(std::sync::atomic::Ordering::Relaxed);
+    let idx = if stage == "downloading" {
+        1
+    } else if stage.contains("reading") || stage.contains("format") {
+        2
+    } else if stage.contains("placing") || stage.contains("compil") {
+        3
+    } else {
+        0
+    };
+    let pct = if total > 0 {
+        (done as f64 / total as f64 * 100.0).clamp(0.0, 100.0) as f32
+    } else if idx >= 2 {
+        100.0
+    } else {
+        0.0
+    };
+    (idx, done, total, pct)
+}
+
+fn codec_token(name: &str) -> Token {
+    const T: [Token; 5] = [
+        Token::Brass,
+        Token::Cyanotype,
+        Token::Jade,
+        Token::Ember,
+        Token::Gold,
+    ];
+    T[name.bytes().map(usize::from).sum::<usize>() % T.len()]
+}
+
+/// Parts joined by `sep`, left to right while they fit; the rest are dropped.
+fn fit(parts: Vec<Vec<Span<'static>>>, width: usize, sep: &str, sep_style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for p in parts {
+        let w: usize = p.iter().map(|s| s.width()).sum();
+        let sw = if spans.is_empty() { 0 } else { text_width(sep) };
+        if used + sw + w > width {
+            break;
+        }
+        if sw > 0 {
+            spans.push(Span::styled(sep.to_string(), sep_style));
+        }
+        used += sw + w;
+        spans.extend(p);
+    }
+    Line::from(spans)
+}
+
+fn pill(th: &Theme, tok: Token, text: &str) -> Span<'static> {
+    let style = if th.mono {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        th.fg(Token::Void)
+            .patch(th.bg(tok))
+            .add_modifier(Modifier::BOLD)
+    };
+    Span::styled(text.to_string(), style)
+}
+
+fn seg(text: impl Into<String>, style: Style) -> Vec<Span<'static>> {
+    vec![Span::styled(text.into(), style)]
+}
+
+impl TuiApp {
+    pub(super) fn vitals(&self) -> Vitals {
+        let s = self.telemetry.get_summary();
+        let bytes_per_tok = self.telemetry.bytes_per_token();
+        let ceiling = s.memory_bandwidth_gbps;
+        let roof_tok_s = if bytes_per_tok > 0 && ceiling > 0.0 {
+            ceiling as f64 / (bytes_per_tok as f64 / 1e9)
+        } else {
+            0.0
+        };
+        let pct = if roof_tok_s > 0.0 {
+            (s.current_tps as f64 / roof_tok_s * 100.0) as f32
+        } else {
+            s.roofline_pct
+        };
+        Vitals {
+            pct,
+            roof_tok_s,
+            bytes_per_tok,
+            ceiling,
+            kv_pct: self.kv_pool.utilization() * 100.0,
+            itl: self.telemetry.recent_itl_ms(512),
+            s,
+        }
+    }
+
+    pub(super) fn state(&self) -> State {
+        if let Some(l) = &self.load {
+            return State::Loading(load_stage(l).3);
+        }
+        if self.mascot.state == MascotState::Error {
+            return State::Error;
+        }
+        if self.running > 0 {
+            let prefilling = self.scheduler.as_ref().is_some_and(|s| {
+                s.view()
+                    .seqs
+                    .iter()
+                    .any(|q| q.state == SequenceState::Prefilling)
+            });
+            return if prefilling {
+                State::Prefill
+            } else {
+                State::Decode
+            };
+        }
+        State::Equilibrium
+    }
+
+    fn weights_bpw(&self) -> Option<f32> {
+        self.weights
+            .as_ref()
+            .map(|w| w.mode.effective_bits_per_weight())
+    }
+
+    fn focused(&self, c: Comp) -> bool {
+        self.detail == Some(c)
+    }
+
+    fn token_str(&self, id: u32) -> String {
+        let s = self
+            .scheduler
+            .as_ref()
+            .map(|s| s.tokenizer().decode_token(id))
+            .unwrap_or_else(|| format!("#{id}"));
+        s.replace('\n', "⏎").replace('\t', "⇥")
+    }
+
+    // ---- STATUS ---------------------------------------------------------------------------
+
+    pub(super) fn render_status(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let dim = th.fg(Token::Dim);
+        let (state_text, state_tok) = match self.state() {
+            State::Equilibrium => ("● EQUILIBRIUM".to_string(), Token::Jade),
+            State::Decode => ("⚡ DECODE".to_string(), Token::Ember),
+            State::Prefill => ("◇ PREFILL".to_string(), Token::Gold),
+            State::Loading(p) => (
+                format!("{} LOADING {p:.0}%", orbit(self.mascot.frame_tick / 2)),
+                Token::Cyanotype,
+            ),
+            State::Error => ("▲ SPINODAL".to_string(), Token::Crimson),
+        };
+        let state_span = Span::styled(
+            format!(" {state_text}"),
+            th.fg(state_tok).add_modifier(Modifier::BOLD),
+        );
+        let w = area.width as usize;
+        let avail = w.saturating_sub(state_span.width());
+
+        let model = self.model_id();
+        let model_max = (w * 40 / 100).max(8);
+        let model_seg = if model.is_empty() {
+            seg("no model", dim)
+        } else {
+            seg(
+                trunc(&model, model_max),
+                th.fg(Token::Parchment).add_modifier(Modifier::BOLD),
+            )
+        };
+        let classifier = self.classifier.read().as_ref().map(|c| c.summary());
+        let backend = self.scheduler.as_ref().map(|s| s.backend_label());
+        let device = match (&classifier, backend) {
+            (Some(c), _) => Some(format!("text classifier: {c}")),
+            (None, Some(b)) => Some(
+                match b.strip_prefix("Metal (").and_then(|r| r.strip_suffix(')')) {
+                    Some(name) => format!("{name} · Metal"),
+                    None => b,
+                },
+            ),
+            (None, None) => None,
+        };
+        let loading = self.load.is_some();
+        let sched = self.scheduler.as_ref().map(|s| s.view());
+        // (name, spans, joined to the previous segment by a space instead of ` · `)
+        let mut segs: Vec<(&str, Vec<Span<'static>>, bool)> =
+            vec![("pill", vec![pill(th, Token::Brass, " GIBBS ")], false)];
+        if w < 100 {
+            segs.push(("badge", self.mascot.render_mini_badge(), true));
+        }
+        segs.push(("model", model_seg, true));
+        if !loading {
+            if let Some(d) = device {
+                segs.push(("device", seg(d, th.fg(Token::Parchment)), false));
+            }
+            if classifier.is_none() {
+                if let (Some(w), Some(bpw)) = (&self.weights, self.weights_bpw()) {
+                    segs.push((
+                        "format",
+                        seg(
+                            format!("{:?} {bpw:.1} bpw", w.mode),
+                            th.fg(Token::Parchment),
+                        ),
+                        false,
+                    ));
+                }
+                segs.push((
+                    "tps",
+                    seg(
+                        format!("{:.1} tok/s", v.s.current_tps),
+                        th.fg(Token::Brass).add_modifier(Modifier::BOLD),
+                    ),
+                    false,
+                ));
+                let tier = Theme::tier(v.pct);
+                segs.push((
+                    "roof",
+                    seg(
+                        format!("ROOF {:.0}%", v.pct),
+                        th.fg(tier).add_modifier(Modifier::BOLD),
+                    ),
+                    false,
+                ));
+                segs.push(("gauge", seg(gauge(v.pct / 100.0, 8), th.fg(tier)), true));
+                segs.push((
+                    "kv",
+                    seg(format!("KV {:.0}%", v.kv_pct), th.fg(Token::Parchment)),
+                    false,
+                ));
+                if let Some(sv) = &sched {
+                    let active = sv
+                        .seqs
+                        .iter()
+                        .filter(|q| {
+                            matches!(q.state, SequenceState::Prefilling | SequenceState::Decoding)
+                        })
+                        .count();
+                    segs.push((
+                        "seq",
+                        seg(
+                            format!("SEQ {active}/{}", active + sv.waiting),
+                            th.fg(Token::Parchment),
+                        ),
+                        false,
+                    ));
+                }
+            }
+            if let Some(a) = self.http_addr {
+                segs.push(("port", seg(format!(":{}", a.port()), dim), false));
+            }
+        }
+        let build = |segs: &[(&str, Vec<Span<'static>>, bool)]| -> Vec<Span<'static>> {
+            let mut out = Vec::new();
+            for (i, (_, spans, tight)) in segs.iter().enumerate() {
+                if i > 0 {
+                    out.push(Span::styled(if *tight { " " } else { " · " }, dim));
+                }
+                out.extend(spans.iter().cloned());
+            }
+            out
+        };
+        let width = |s: &[Span<'static>]| s.iter().map(|x| x.width()).sum::<usize>();
+        for drop in [
+            "badge", "port", "seq", "kv", "gauge", "format", "device", "roof", "tps",
+        ] {
+            if width(&build(&segs)) <= avail {
+                break;
+            }
+            segs.retain(|(n, _, _)| *n != drop);
+        }
+        let mut left = build(&segs);
+        while width(&left) > avail && left.len() > 1 {
+            left.pop();
+        }
+        let pad = w.saturating_sub(width(&left) + state_span.width());
+        left.push(Span::raw(" ".repeat(pad)));
+        left.push(state_span);
+        f.render_widget(Paragraph::new(Line::from(left)), area);
+    }
+
+    // ---- ROOFLINE -------------------------------------------------------------------------
+
+    pub(super) fn render_roofline(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let tier = Theme::tier(v.pct);
+        let metric = Line::from(Span::styled(
+            format!("{:.1}%", v.pct),
+            th.fg(tier).add_modifier(Modifier::BOLD),
+        ));
+        let block = instrument("Roofline", Some(metric), self.focused(Comp::Roofline), th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let w = inner.width as usize;
+        let dim = th.fg(Token::Dim);
+        let bw = th.fg(Token::Cyanotype);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        let speed = format!("{:.1}/{:.1} tok/s", v.s.current_tps, v.roof_tok_s);
+        let mut row1 = vec![Span::styled(speed.clone(), th.fg(Token::Parchment))];
+        if w >= 28 {
+            let cells = (w - 24)
+                .max(4)
+                .min(w.saturating_sub(text_width(&speed) + 1));
+            if cells >= 4 {
+                row1.push(Span::raw(" "));
+                row1.push(Span::styled(gauge(v.pct / 100.0, cells), th.fg(tier)));
+            }
+        }
+        lines.push(Line::from(row1));
+
+        lines.push(fit(
+            vec![
+                seg(
+                    format!(
+                        "BW {:.1}/{:.1} GB/s",
+                        v.s.effective_bandwidth_gbps, v.ceiling
+                    ),
+                    bw,
+                ),
+                seg(format!("{:.3} GB/tok", v.bytes_per_tok as f64 / 1e9), bw),
+            ],
+            w,
+            "  ",
+            dim,
+        ));
+
+        // Decode streams every weight once and spends 2 flops on it: AI = 2 / (bpw / 8) F/B.
+        // ponytail: estimate from the weight format; exact value needs PreparedPlan::flops_per_run
+        // plumbed into telemetry (graph/scheduler are outside the TUI).
+        let ai = self
+            .weights_bpw()
+            .filter(|b| *b > 0.0)
+            .map(|b| 16.0 / b as f64);
+        let peak = self.gemm_peak_gflops;
+        let ridge = (peak > 0.0 && v.ceiling > 0.0).then(|| peak / v.ceiling as f64);
+        let mut row3 = vec![
+            seg(
+                ai.map_or("AI —".to_string(), |a| format!("AI {a:.1} F/B")),
+                th.fg(Token::Parchment),
+            ),
+            seg(
+                ridge.map_or("ridge —".to_string(), |r| format!("ridge {r:.1}")),
+                dim,
+            ),
+        ];
+        if let (Some(a), Some(r)) = (ai, ridge) {
+            row3.push(seg(
+                format!("▸ {}-BOUND", if a < r { "BANDWIDTH" } else { "COMPUTE" }),
+                if a < r { bw } else { th.fg(Token::Brass) },
+            ));
+        }
+        lines.push(fit(row3, w, "  ", dim));
+
+        let detail = self.focused(Comp::Roofline);
+        if detail {
+            if let Some(p) = &self.roofline_probe_result {
+                if let Some(l) = p.lines().nth(1) {
+                    lines.push(Line::from(Span::styled(trunc(l, w), dim)));
+                }
+            }
+        }
+        // The last row is the profiler line when there is room for canvas plus it.
+        let rest = (inner.height as usize).saturating_sub(lines.len());
+        let profile_row = rest >= 3;
+        let canvas_h = rest.saturating_sub(profile_row as usize);
+        let top = lines.len();
+        f.render_widget(
+            Paragraph::new(lines),
+            Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                top.min(inner.height as usize) as u16,
+            ),
+        );
+        if canvas_h > 0 && peak > 0.0 && v.ceiling > 0.0 {
+            let c = Rect::new(inner.x, inner.y + top as u16, inner.width, canvas_h as u16);
+            self.roofline_canvas(f, c, v, th, ai, peak, tier);
+        }
+        if profile_row {
+            let text = if std::env::var_os("GIBBS_PROFILE_KERNELS").is_none() {
+                "profile off · /profile on".to_string()
+            } else if self.gemm_top.is_empty() {
+                "profile on · no host GEMM timings".to_string()
+            } else {
+                format!("GEMM {}", self.gemm_top.join(" · "))
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(trunc(&text, w), dim)),
+                Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn roofline_canvas(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        v: &Vitals,
+        th: &Theme,
+        ai: Option<f64>,
+        peak: f64,
+        tier: Token,
+    ) {
+        let bw = v.ceiling as f64;
+        let (x0, x1) = (-1.0f64, 3.0f64);
+        let (y0, y1) = (1.0f64, (peak * 1.5).log10());
+        let ridge = peak / bw;
+        // GFLOP/s = AI [F/B] × BW [GB/s]; the slope starts where it enters the plot.
+        let a0 = (10f64.powf(y0) / bw).max(10f64.powf(x0));
+        let bg = if th.truecolor {
+            th.color(Token::Plinth)
+        } else {
+            ratatui::style::Color::Reset
+        };
+        let (c_roof, c_bw, c_pt) = (
+            th.color(Token::Brass),
+            th.color(Token::Cyanotype),
+            th.color(tier),
+        );
+        let point = ai.zip(
+            (v.s.effective_bandwidth_gbps > 0.0).then_some(v.s.effective_bandwidth_gbps as f64),
+        );
+        f.render_widget(
+            Canvas::default()
+                .marker(Marker::Braille)
+                .background_color(bg)
+                .x_bounds([x0, x1])
+                .y_bounds([y0, y1])
+                .paint(move |ctx| {
+                    if ridge > 10f64.powf(x0) {
+                        ctx.draw(&CLine {
+                            x1: a0.log10(),
+                            y1: (a0 * bw).log10(),
+                            x2: ridge.log10().min(x1),
+                            y2: peak.log10(),
+                            color: c_bw,
+                        });
+                    }
+                    ctx.draw(&CLine {
+                        x1: ridge.log10().clamp(x0, x1),
+                        y1: peak.log10(),
+                        x2: x1,
+                        y2: peak.log10(),
+                        color: c_roof,
+                    });
+                    if let Some((a, eff)) = point {
+                        let (px, py) = (a.log10().clamp(x0, x1), (a * eff).log10().clamp(y0, y1));
+                        ctx.print(px, py, Span::styled("●", Style::default().fg(c_pt)));
+                    }
+                }),
+            area,
+        );
+    }
+
+    // ---- TOKENS ---------------------------------------------------------------------------
+
+    pub(super) fn render_tokens(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let s = &v.s;
+        let block = instrument(
+            "Tokens",
+            Some(Line::from(format!("{:.1}/s", s.current_tps))),
+            self.focused(Comp::Tokens),
+            th,
+        );
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let w = inner.width as usize;
+        let (dim, ink) = (th.fg(Token::Dim), th.fg(Token::Parchment));
+        let active: Vec<u64> = self.spark.iter().copied().filter(|&x| x > 0).collect();
+        let avg = if active.is_empty() {
+            0.0
+        } else {
+            active.iter().sum::<u64>() as f64 / active.len() as f64
+        };
+        let peak = self.spark.iter().copied().max().unwrap_or(0);
+        let mut lines = vec![
+            fit(
+                vec![
+                    seg(format!("NOW {:.1}", s.current_tps), th.fg(Token::Brass)),
+                    seg(format!("AVG {avg:.1}"), ink),
+                    seg(format!("PEAK {peak:.1} tok/s"), ink),
+                ],
+                w,
+                "  ",
+                dim,
+            ),
+            Line::from(Span::styled(
+                spark(&self.spark.iter().map(|&x| x as f32).collect::<Vec<_>>(), w),
+                th.fg(Token::Brass),
+            )),
+            fit(
+                vec![
+                    seg(
+                        format!("Σ {} tok", super::render::thousands(s.total_tokens)),
+                        ink,
+                    ),
+                    seg(format!("{} req", s.completed_requests), ink),
+                    seg(
+                        format!("TTFT {:.0}/{:.0} ms", s.ttft_p50_ms, s.ttft_p90_ms),
+                        ink,
+                    ),
+                ],
+                w,
+                " · ",
+                dim,
+            ),
+        ];
+        if let Some(sv) = self.scheduler.as_ref().and_then(|sc| sc.view().spec) {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!(
+                        "SPEC {:.0}% · {:.2} tok/fwd · {}",
+                        s.spec_accept_rate * 100.0,
+                        s.spec_tokens_per_forward,
+                        sv.label
+                    ),
+                    w,
+                ),
+                th.fg(Token::Gold),
+            )));
+        }
+        if self.focused(Comp::Tokens) {
+            let last: Vec<String> = self
+                .spark
+                .iter()
+                .rev()
+                .take(10)
+                .rev()
+                .map(|x| x.to_string())
+                .collect();
+            lines.push(Line::from(Span::styled(
+                trunc(&format!("last {} s: {}", last.len(), last.join(" ")), w),
+                dim,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- LATENCY --------------------------------------------------------------------------
+
+    pub(super) fn render_latency(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let stats = v.itl_stats();
+        let metric = Line::from(stats.map_or("p99 —".to_string(), |(_, _, p99, _)| {
+            format!("p99 {p99:.1} ms")
+        }));
+        let block = instrument("Latency", Some(metric), self.focused(Comp::Latency), th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let w = inner.width as usize;
+        let (dim, ink) = (th.fg(Token::Dim), th.fg(Token::Parchment));
+        let Some((p50, p95, p99, sd)) = stats else {
+            f.render_widget(
+                Paragraph::new(Span::styled("no latency samples (idle)", dim)),
+                inner,
+            );
+            return;
+        };
+        let (min, max) = v
+            .itl
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(a, b), &x| (a.min(x), b.max(x)));
+        let hist = |buckets: usize| -> Vec<f32> {
+            let width = ((max - min) / buckets as f32).max(1e-3);
+            let mut c = vec![0f32; buckets];
+            for &x in &v.itl {
+                c[(((x - min) / width) as usize).min(buckets - 1)] += 1.0;
+            }
+            c
+        };
+        let mut lines = vec![
+            fit(
+                vec![
+                    seg(format!("ITL p50 {p50:.1}"), ink),
+                    seg(format!("p95 {p95:.1}"), ink),
+                    seg(format!("p99 {p99:.1} ms"), ink),
+                ],
+                w,
+                "  ",
+                dim,
+            ),
+            Line::from(Span::styled(
+                spark(&hist(w.min(16)), w.min(16)),
+                th.fg(Token::Cyanotype),
+            )),
+            Line::from(Span::styled(
+                trunc(&format!("σ {sd:.2} ms · n={}", v.itl.len()), w),
+                dim,
+            )),
+        ];
+        if self.focused(Comp::Latency) {
+            let buckets = 8;
+            let c = hist(buckets);
+            let top = c.iter().copied().fold(1.0f32, f32::max);
+            let bw = ((max - min) / buckets as f32).max(1e-3);
+            for (i, n) in c.iter().enumerate() {
+                let lo = min + i as f32 * bw;
+                let head = format!("{lo:>6.1} ms │ ");
+                let cells = w.saturating_sub(text_width(&head) + 6);
+                let bar = "█".repeat((n / top * cells as f32).round() as usize);
+                let tok = if i < 4 {
+                    Token::Jade
+                } else if i < 6 {
+                    Token::Gold
+                } else {
+                    Token::Crimson
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(head, dim),
+                    Span::styled(bar, th.fg(tok)),
+                    Span::styled(format!(" {}", *n as usize), dim),
+                ]));
+            }
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- LOGPROBS -------------------------------------------------------------------------
+
+    pub(super) fn render_logprobs(&self, f: &mut Frame, area: Rect, th: &Theme) {
+        let detail = self.focused(Comp::Logprobs);
+        let scrub = self
+            .logprob_scrub_idx
+            .min(self.logprob_history.len().saturating_sub(1));
+        let target = if !self.logprob_history.is_empty() {
+            Some(&self.logprob_history[scrub])
+        } else {
+            self.latest_logprobs.as_ref()
+        };
+        let metric = Line::from(target.map_or("H —".to_string(), |t| {
+            format!("H {:.2} bits", t.entropy / LN2)
+        }));
+        let block = instrument("Logprobs", Some(metric), detail, th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let w = inner.width as usize;
+        let dim = th.fg(Token::Dim);
+        let Some(info) = target else {
+            f.render_widget(
+                Paragraph::new(Span::styled("no logprob data (idle)", dim)),
+                inner,
+            );
+            return;
+        };
+        let ent_tok = |nats: f32| {
+            let bits = nats / LN2;
+            if bits < 1.0 {
+                Token::Jade
+            } else if bits < 3.0 {
+                Token::Gold
+            } else if bits < 5.0 {
+                Token::Ember
+            } else {
+                Token::Crimson
+            }
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                trunc(
+                    &format!("'{}'", self.token_str(info.chosen_id)),
+                    w.saturating_sub(8),
+                ),
+                th.fg(Token::Parchment).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  p {:.2}", info.chosen_prob), th.fg(Token::Brass)),
+        ])];
+        // Entropy strip, newest on the right; the scrubbed token is reversed when focused.
+        let n = self.logprob_history.len();
+        let start = n.saturating_sub(w.min(64));
+        let strip: Vec<Span<'static>> = self
+            .logprob_history
+            .iter()
+            .enumerate()
+            .skip(start)
+            .map(|(i, h)| {
+                let level = ((h.entropy / LN2 / 6.0) * 7.0).clamp(0.0, 7.0).round() as usize;
+                let mut st = th.fg(ent_tok(h.entropy));
+                if detail && i == scrub {
+                    st = st.add_modifier(Modifier::REVERSED);
+                }
+                Span::styled(
+                    ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"][level].to_string(),
+                    st,
+                )
+            })
+            .collect();
+        lines.push(Line::from(strip));
+        let want = if detail { 6 } else { 3 };
+        for (tok, p) in info.top_candidates.iter().take(want) {
+            let chosen = *tok == info.chosen_id;
+            let st = if chosen {
+                th.fg(Token::Brass)
+            } else {
+                th.fg(Token::Parchment)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(gauge(*p, 10), th.fg(Token::Cyanotype)),
+                Span::styled(format!("  {p:.2}  "), st),
+                Span::styled(
+                    trunc(&format!("'{}'", self.token_str(*tok)), w.saturating_sub(18)),
+                    st,
+                ),
+            ]));
+        }
+        if detail && n > 0 {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!("[token {} of {n}]  ← → scrub · Esc close", scrub + 1),
+                    w,
+                ),
+                dim,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- WEIGHTS --------------------------------------------------------------------------
+
+    pub(super) fn render_weights(&self, f: &mut Frame, area: Rect, th: &Theme) {
+        let dim = th.fg(Token::Dim);
+        let Some(w) = &self.weights else {
+            let block = instrument("Weights", None, false, th);
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            // Native models and classifiers keep their stored weights; only GraphLm loads choose.
+            let serving = self.classifier.read().is_some()
+                || self.scheduler.as_ref().is_some_and(|s| s.has_model());
+            let text = if serving {
+                "weights run as stored (no format pick)"
+            } else {
+                "no LLM loaded"
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(trunc(text, inner.width as usize), dim)),
+                inner,
+            );
+            return;
+        };
+        let name = format!("{:?}", w.mode);
+        let bpw = w.mode.effective_bits_per_weight();
+        let block = instrument(
+            "Weights",
+            Some(Line::from(format!("{name} {bpw:.2} bpw"))),
+            false,
+            th,
+        );
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let iw = inner.width as usize;
+        let tok = codec_token(&name);
+        // The engine serves one weight format per model, so the bar is a single codec.
+        let mut lines = vec![
+            Line::from(stacked_bar(&[(tok, 1.0)], iw, th)),
+            Line::from(vec![
+                Span::styled("■ ", th.fg(tok)),
+                Span::styled(
+                    trunc(&format!("{name} 100%"), iw.saturating_sub(2)),
+                    th.fg(Token::Parchment),
+                ),
+            ]),
+            Line::from(Span::styled(
+                trunc(
+                    &format!(
+                        "reencode {:?} · variant {:?}",
+                        self.reencode_policy, self.variant_policy
+                    ),
+                    iw,
+                ),
+                dim,
+            )),
+        ];
+        let chosen = w.trials.iter().find(|t| t.mode == w.mode);
+        let gate = match (chosen.and_then(|t| t.mean_kl), chosen.and_then(|t| t.top1)) {
+            (Some(kl), top1) => format!(
+                "KL {kl:.3} nats · top-1 {}",
+                top1.map_or("—".to_string(), |t| format!("{:.0}%", t * 100.0))
+            ),
+            _ => "bit-exact".to_string(),
+        };
+        lines.push(Line::from(Span::styled(trunc(&gate, iw), dim)));
+        if self.focused(Comp::Weights) || inner.height as usize > lines.len() + 1 {
+            if w.trials.len() > 1 {
+                let base = w.trials[0].layer_gemv_us.max(1e-9);
+                lines.push(Line::from(Span::styled(
+                    trunc(
+                        &format!("{:<13}{:>8}{:>8}{:>9}", "format", "GEMV µs", "vs f32", "KL"),
+                        iw,
+                    ),
+                    dim,
+                )));
+                for t in &w.trials {
+                    let on = t.mode == w.mode;
+                    let kl = t.mean_kl.map_or("-".to_string(), |k| format!("{k:.4}"));
+                    let st = match t.mean_kl {
+                        Some(k) if !(k <= MAX_MEAN_KL) => th.fg(Token::Crimson),
+                        _ if on => th.fg(Token::Jade),
+                        _ => th.fg(Token::Parchment),
+                    };
+                    lines.push(Line::from(Span::styled(
+                        trunc(
+                            &format!(
+                                "{}{:<12}{:>8.0}{:>7.2}x{:>9}",
+                                if on { "●" } else { " " },
+                                format!("{:?}", t.mode),
+                                t.layer_gemv_us,
+                                t.layer_gemv_us / base,
+                                kl
+                            ),
+                            iw,
+                        ),
+                        st,
+                    )));
+                }
+            }
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- MEMORY ---------------------------------------------------------------------------
+
+    pub(super) fn render_memory(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let block = instrument(
+            "Memory",
+            Some(Line::from(format!("KV {:.0}%", v.kv_pct))),
+            false,
+            th,
+        );
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let iw = inner.width as usize;
+        let total = self.kv_pool.total_blocks;
+        let used = (self.kv_pool.utilization() * total as f32).round() as usize;
+        let rss = crate::hardware::current_resident_memory_bytes() as f64 / 1e9;
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("KV ", th.fg(Token::Dim)),
+                Span::styled(
+                    gauge(v.kv_pct / 100.0, iw.saturating_sub(10)),
+                    th.fg(Token::Cyanotype),
+                ),
+                Span::styled(format!(" {:>3.0}%", v.kv_pct), th.fg(Token::Parchment)),
+            ]),
+            Line::from(Span::styled(
+                trunc(&format!("RSS {rss:.1} GB · blocks {used}/{total}"), iw),
+                th.fg(Token::Dim),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- DEVICE ---------------------------------------------------------------------------
+
+    pub(super) fn render_device(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let block = instrument(
+            "Device",
+            Some(Line::from(Span::styled(
+                format!("{:.0} GB/s", v.ceiling),
+                th.fg(Token::Cyanotype),
+            ))),
+            false,
+            th,
+        );
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let iw = inner.width as usize;
+        let name = if v.s.device_name.is_empty() {
+            self.host_lines
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "CPU".into())
+        } else {
+            v.s.device_name.clone()
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(trunc(&name, iw), th.fg(Token::Parchment))),
+            Line::from(vec![
+                Span::styled(
+                    format!("ceiling {:.1} GB/s", v.ceiling),
+                    th.fg(Token::Cyanotype),
+                ),
+                // ponytail: the codec micro-benchmark (S3.6/G3.7) does not exist yet.
+                Span::styled(" · codec-bench n/a", th.fg(Token::Dim)),
+            ]),
+        ];
+        if let Some(a) = self.http_addr {
+            lines.push(Line::from(Span::styled(
+                trunc(&format!("http {a}"), iw),
+                th.fg(Token::Dim),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- LOAD -----------------------------------------------------------------------------
+
+    pub(super) fn render_load(&self, f: &mut Frame, area: Rect, l: &Load, th: &Theme) {
+        let (idx, done, total, pct) = load_stage(l);
+        let block = instrument(
+            "Load",
+            Some(Line::from(Span::styled(
+                format!("{pct:.0}%"),
+                th.fg(Token::Cyanotype).add_modifier(Modifier::BOLD),
+            ))),
+            false,
+            th,
+        );
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let iw = inner.width as usize;
+        let dim = th.fg(Token::Dim);
+        let rate = if l.rate > 0.0 {
+            format!("{:.1} MB/s", l.rate / 1e6)
+        } else {
+            "measuring".to_string()
+        };
+        let eta = if l.rate > 0.0 && total > done {
+            format!("{:.0}s", (total - done) as f64 / l.rate)
+        } else {
+            "—".to_string()
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                trunc(&l.id, iw.saturating_sub(rate.len() + eta.len() + 9)),
+                th.fg(Token::Parchment).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {rate} · ETA {eta}"), dim),
+        ])];
+        let mut track = Vec::new();
+        for (i, name) in ["RESOLVE", "DOWNLOAD", "MAP", "COMPILE"].iter().enumerate() {
+            if i > 0 {
+                track.push(Span::styled(" ▸ ", dim));
+            }
+            track.push(if i < idx {
+                Span::styled(format!("✓{name}"), th.fg(Token::Jade))
+            } else if i == idx {
+                Span::styled(
+                    format!("[{name}]"),
+                    th.fg(Token::Brass).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(name.to_string(), dim)
+            });
+        }
+        lines.push(Line::from(track));
+        lines.push(Line::from(vec![
+            Span::styled(
+                gauge(pct / 100.0, iw.saturating_sub(14).max(4)),
+                th.fg(Token::Cyanotype),
+            ),
+            Span::styled(
+                format!(" {:.0}/{:.0} MB", done as f64 / 1e6, total as f64 / 1e6),
+                th.fg(Token::Parchment),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            trunc(
+                &format!(
+                    "reencode {:?} · elapsed {}",
+                    self.reencode_policy,
+                    super::render::secs(l.started.elapsed())
+                ),
+                iw,
+            ),
+            dim,
+        )));
+        lines.push(Line::from(Span::styled(trunc(&l.progress_text(), iw), dim)));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- AVATAR ---------------------------------------------------------------------------
+
+    pub(super) fn render_avatar(&self, f: &mut Frame, area: Rect, th: &Theme) {
+        let name = self.mascot.state_name();
+        let block = instrument(name, None, false, th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let ticker = self.mascot.ticker();
+        let [art, tick] = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Min(0),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .areas(inner);
+        match self.mascot.render_sprite(art) {
+            Some(lines) => f.render_widget(Paragraph::new(lines), art),
+            None => f.render_widget(
+                Paragraph::new(Line::from(self.mascot.render_mini_badge())),
+                art,
+            ),
+        }
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                trunc(&ticker, tick.width as usize),
+                th.fg(Token::Dim),
+            )),
+            tick,
+        );
+    }
+
+    // ---- DOCK (Compact tier) --------------------------------------------------------------
+
+    /// One-line form of each component; each stays on a single dock row.
+    pub(super) fn dock_atoms(&self, v: &Vitals, th: &Theme) -> Vec<Vec<Span<'static>>> {
+        let tier = Theme::tier(v.pct);
+        let mut a = vec![
+            vec![
+                Span::styled(format!("ROOF {:.0}% ", v.pct), th.fg(tier)),
+                Span::styled("▕", th.fg(Token::Hairline)),
+                Span::styled(gauge(v.pct / 100.0, 8), th.fg(tier)),
+                Span::styled("▏", th.fg(Token::Hairline)),
+            ],
+            seg(format!("TOK {:.0}", v.s.current_tps), th.fg(Token::Brass)),
+            seg(
+                v.itl_stats()
+                    .map_or("p99 —".to_string(), |s| format!("p99 {:.1} ms", s.2)),
+                th.fg(Token::Cyanotype),
+            ),
+            seg(format!("KV {:.0}%", v.kv_pct), th.fg(Token::Parchment)),
+        ];
+        if let Some(t) = self
+            .logprob_history
+            .back()
+            .or(self.latest_logprobs.as_ref())
+        {
+            a.push(seg(
+                format!("H {:.1} bits", t.entropy / LN2),
+                th.fg(Token::Parchment),
+            ));
+        }
+        if let (Some(w), Some(bpw)) = (&self.weights, self.weights_bpw()) {
+            a.push(seg(
+                format!("{:?} {bpw:.1} bpw", w.mode),
+                th.fg(Token::Parchment),
+            ));
+        }
+        if v.ceiling > 0.0 {
+            a.push(seg(
+                format!("{:.0} GB/s", v.ceiling),
+                th.fg(Token::Cyanotype),
+            ));
+        }
+        a
+    }
+
+    /// Atoms wrapped greedily into rows of at most `width` cells, never splitting an atom.
+    pub(super) fn dock_lines(&self, v: &Vitals, th: &Theme, width: usize) -> Vec<Line<'static>> {
+        let sep = " · ";
+        let mut lines: Vec<Vec<Span<'static>>> = vec![vec![]];
+        let mut used = 0;
+        for atom in self.dock_atoms(v, th) {
+            let w: usize = atom.iter().map(|s| s.width()).sum();
+            let row = lines.last_mut().expect("one row exists");
+            if !row.is_empty() && used + text_width(sep) + w > width {
+                lines.push(atom);
+                used = w;
+                continue;
+            }
+            if !row.is_empty() {
+                row.push(Span::styled(sep, th.fg(Token::Hairline)));
+                used += text_width(sep);
+            }
+            row.extend(atom);
+            used += w;
+        }
+        lines.into_iter().map(Line::from).collect()
+    }
+
+    pub(super) fn render_dock(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let metric = Line::from(Span::styled(
+            format!("{:.1}%", v.pct),
+            th.fg(Theme::tier(v.pct)).add_modifier(Modifier::BOLD),
+        ));
+        let block = instrument("Telemetry", Some(metric), false, th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new(self.dock_lines(v, th, inner.width as usize)),
+            inner,
+        );
+    }
+
+    /// Renders one sidebar component into `rect`.
+    pub(super) fn render_comp(&self, f: &mut Frame, c: Comp, rect: Rect, v: &Vitals, th: &Theme) {
+        match c {
+            Comp::Avatar => self.render_avatar(f, rect, th),
+            Comp::Roofline => self.render_roofline(f, rect, v, th),
+            Comp::Tokens => self.render_tokens(f, rect, v, th),
+            Comp::Latency => self.render_latency(f, rect, v, th),
+            Comp::Logprobs => self.render_logprobs(f, rect, th),
+            Comp::Weights => self.render_weights(f, rect, th),
+            Comp::Memory => self.render_memory(f, rect, v, th),
+            Comp::Device => self.render_device(f, rect, v, th),
+            Comp::Load => {
+                if let Some(l) = &self.load {
+                    self.render_load(f, rect, l, th);
+                }
+            }
+        }
+    }
+}
