@@ -249,44 +249,36 @@ pub fn family_status(f: Family) -> Status {
     match f {
         GraphLm | Gemma4 | Qwen35 | System1 => Status::Gpu,
         Gemma4Media => Status::Gated(
-            "vision/audio prefill bypasses the program; Conv2d/Transpose/Reshape unlowered",
+            "builder: vision/audio prefill bypasses the program (host Rust vision tower)",
         ),
         Qwen35Vision => {
-            Status::Gated("vision tower and MRope prefill run on the CPU; Conv3d unlowered")
+            Status::Gated("builder: vision tower and MRope prefill are host Rust, no Metal program")
         }
         DraftersMtp => Status::Gated(
-            "drafter/MTP forward is CPU-only; no state snapshot/restore; Concat unlowered",
+            "builder: drafter/MTP forward is host Rust; no state snapshot/restore on the Metal program",
         ),
-        Ninfer => Status::Gated(".ninfer catalog runs on the CPU; MoE routed experts unlowered"),
+        Ninfer => Status::Gated(
+            "builder: .ninfer catalog emits Moe with host-side experts; no Metal expert operands",
+        ),
         T5 => Status::Gated(
-            "no Metal builder; ReLU, attention bias and cross-attention state unlowered",
+            "builder: no T5 graph builder (encoder-decoder with cross-attention state)",
         ),
-        Seq2Seq => Status::Gated(
-            "no Metal builder; Gather positions, ReLU and StateReorder beams unlowered",
-        ),
-        Idefics3Siglip => {
-            Status::Gated("SigLIP runs on the CPU; Conv2d, Transpose, Scatter unlowered")
-        }
+        Seq2Seq => Status::Gated("builder: no seq2seq graph builder (beam search, positions)"),
+        Idefics3Siglip => Status::Gated("builder: SigLIP forward is host Rust, no graph builder"),
         ClassifierBert => {
-            Status::Gated("Head::apply and the BERT forward run on the CPU; Tanh pooler unlowered")
+            Status::Gated("builder: Head::apply and the BERT classifier forward are host Rust")
         }
         ClassifierModern => {
-            Status::Gated("DeBERTa/ModernBERT forward runs on the CPU; Gather and Tanh unlowered")
+            Status::Gated("builder: DeBERTa/ModernBERT forward is host Rust, no graph builder")
         }
         ClassifierDecoder => {
-            Status::Gated("decoder seq-cls forward runs on the CPU; last-token Gather unlowered")
+            Status::Gated("builder: decoder seq-cls forward is host Rust, no graph builder")
         }
-        DiffusionUnet => {
-            Status::Gated("UNet runs on the CPU; Conv2d/GroupNorm/Upsample/Concat unlowered")
-        }
-        DiffusionDit => {
-            Status::Gated("DiT runs on the CPU; MRope pairs and broadcast ops unlowered")
-        }
-        Vae => Status::Gated("VAE decoders run on the CPU; Conv3d, GroupNorm, Upsample unlowered"),
-        VideoLtx => Status::Gated("LTX runs on the CPU; Conv3d and Reshape unlowered"),
-        VideoModelScope => {
-            Status::Gated("UNet3D runs on the CPU; Conv3d, Concat, Upsample unlowered")
-        }
+        DiffusionUnet => Status::Gated("builder: UNet forward is host Rust, no graph builder"),
+        DiffusionDit => Status::Gated("builder: DiT forward is host Rust, no graph builder"),
+        Vae => Status::Gated("builder: VAE decoders are host Rust, no graph builder"),
+        VideoLtx => Status::Gated("builder: LTX forward is host Rust, no graph builder"),
+        VideoModelScope => Status::Gated("builder: UNet3D forward is host Rust, no graph builder"),
         Audio => Status::Gated("builder: conformer audio forward is host Rust; no Metal program yet"),
     }
 }
