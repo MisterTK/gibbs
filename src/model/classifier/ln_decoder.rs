@@ -490,7 +490,7 @@ mod tests {
 
     /// A 2-block, 2-head, hidden-32 body with deterministic weights.
     fn tiny(pre_ln: bool, act: Act, pos_offset: usize, proj: bool) -> LnDecoder {
-        let (h, ffn, vocab, ctx) = (32, 64, 64, 16);
+        let (h, ffn, vocab, ctx) = (32, 64, 64, 32);
         let e = if proj { 16 } else { h };
         let lin = |i: usize, o: usize, seed: usize| Lin {
             w: fill(i * o, seed, 0.3),
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn gpt2_style_matches_host() {
         let mut m = tiny(true, Act::GeluTanh, 0, false);
-        let seqs: [&[u32]; 3] = [&[1, 2, 3], &[5, 9, 9, 31, 7, 0, 63, 12], &[4]];
+        let seqs: [&[u32]; 3] = [&[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], &[4]];
         let e = parity(&mut m, &fill(3 * 32, 30, 0.5), 3, &seqs);
         eprintln!("gpt2-style max rel err {e:?}");
     }
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn opt_post_ln_with_projections_matches_host() {
         let mut m = tiny(false, Act::Relu, 2, true);
-        let seqs: [&[u32]; 3] = [&[1, 2, 3], &[5, 9, 9, 31, 7, 0, 63, 12, 8, 8, 8], &[4]];
+        let seqs: [&[u32]; 3] = [&[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 8], &[4]];
         let e = parity(&mut m, &fill(2 * 16, 31, 0.5), 2, &seqs);
         eprintln!("opt post-LN max rel err {e:?}");
     }

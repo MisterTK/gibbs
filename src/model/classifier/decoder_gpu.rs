@@ -232,7 +232,7 @@ pub(crate) mod tests {
     fn graph_lm_llama_style_matches_host() {
         let score = fill(3 * 32, 20, 0.5);
         let mut llm = GraphLmSeq::new(tiny_graph_lm(false));
-        let seqs: [&[u32]; 3] = [&[1, 5, 9], &[3, 3, 7, 11, 2, 40, 8], &[63]];
+        let seqs: [&[u32]; 3] = [&[1, 5, 9], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], &[63]];
         if let Some(e) = parity(&mut llm, &score, 3, &seqs) {
             eprintln!("graph_lm llama-style max rel err {e:e}");
         }
@@ -242,7 +242,7 @@ pub(crate) mod tests {
     fn graph_lm_gpt_style_matches_host() {
         let score = fill(2 * 32, 21, 0.5);
         let mut llm = GraphLmSeq::new(tiny_graph_lm(true));
-        let seqs: [&[u32]; 3] = [&[2, 4], &[9, 8, 7, 6, 5, 4, 3, 2, 1, 0], &[17]];
+        let seqs: [&[u32]; 3] = [&[2, 4], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22], &[17]];
         if let Some(e) = parity(&mut llm, &score, 2, &seqs) {
             eprintln!("graph_lm gpt-style max rel err {e:e}");
         }
