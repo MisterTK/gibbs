@@ -10,8 +10,10 @@
 
 mod draft;
 mod text;
+mod fixture;
 #[cfg(test)]
 mod gpu_tests;
+pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
 pub use text::tiny_decode_graph;
 mod vision;
 
@@ -121,6 +123,20 @@ fn assemble(
         drafter,
         program,
     }))
+}
+
+/// Test hook: the model [`load_ninfer`] / [`load`] assemble from an in-memory checkpoint `ck` with
+/// config `cfg` (no tokenizer file: ids map to `t{id}`).
+#[cfg(test)]
+pub(crate) fn from_checkpoint(
+    ck: &Weights,
+    cfg: &Value,
+    mode: crate::hardware::PlacementMode,
+) -> Result<Arc<dyn NativeLm>, String> {
+    let text = Arc::new(TextModel::load(ck, text_config(cfg), Arch::Qwen35)?);
+    let vision = load_vision(ck, cfg, &text, || Err("test checkpoint has no preprocessor".into()))?;
+    let tok = Tokenizer::from_tokens((0..text.vocab).map(|i| format!("t{i}")).collect());
+    assemble(tok, text, vision, mode)
 }
 
 /// The MTP drafter of `text`: its head as a Metal program next to the target's `program`, or the
@@ -1159,7 +1175,8 @@ impl NativeLm for Qwen35 {
     fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
         let (images, _) = self.size_images(&ids, media)?;
         let mut seq = Seq {
-            layers: self.text.new_state(),
+            // The program path keeps its state in `program_state`.
+            layers: if self.program.is_some() { Vec::new() } else { self.text.new_state() },
             len: 0,
             program_state: crate::graph::StateStore::new(),
             pos3: Vec::new(),

@@ -1919,26 +1919,13 @@ impl TextModel {
                         n,
                     )
                 }
-                Ffn::Moe(moe) => {
-                    let router_w = g.weight(
-                        format!("{p}.mlp.router.weight"),
-                        vec![moe.router.rows, moe.router.cols],
-                        mat_dtype(&moe.router.parts[0]),
-                    );
-                    w.insert(
-                        format!("{p}.mlp.router.weight"),
-                        moe.router.parts[0].to_graph_tensor(),
-                    );
-                    g.add(
-                        format!("{p}.mlp.moe"),
-                        Op::Moe {
-                            experts: moe.num_experts(),
-                            top_k: moe.top_k(),
-                        },
-                        &[normed_post, router_w],
-                        vec![n, self.hidden],
-                        DType::F32,
-                    )
+                Ffn::Moe(_) => {
+                    // `Op::Moe` is one Linear per expert; this FFN is SwiGLU per routed expert over
+                    // packed `[E, out, in]` banks plus a gated shared expert (S4.5 `MoeLinear` /
+                    // `MoeCombine`), which no Metal kernel reads yet.
+                    return Err(format!(
+                        "layer {li}: the mixture-of-experts FFN has no Metal program (needs bank-indexed expert GEMV); run with --backend cpu"
+                    ));
                 }
             };
 

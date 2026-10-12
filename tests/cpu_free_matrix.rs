@@ -58,6 +58,18 @@ fn gpu_fixture(f: Family) {
             let (g, w) = gibbs_engine::model::qwen3_5::tiny_decode_graph().expect("tiny qwen graph");
             run_on_gpu("Qwen35", g, w);
         }
+        Family::Qwen35Vision => {
+            let (g, w) = gibbs_engine::model::qwen3_5::tiny_vision_tower_graph().expect("tiny vision tower graph");
+            run_on_gpu("Qwen35Vision", g, w);
+        }
+        Family::DraftersMtp => {
+            let (g, w) = gibbs_engine::model::qwen3_5::tiny_mtp_graph().expect("tiny MTP head graph");
+            run_on_gpu("DraftersMtp", g, w);
+        }
+        Family::Ninfer => {
+            let (g, w) = gibbs_engine::model::qwen3_5::tiny_ninfer_decode_graph().expect("tiny .ninfer decode graph");
+            run_on_gpu("Ninfer", g, w);
+        }
         Family::System1 => {
             use gibbs_engine::model::jev::{BertDims, BertEncoder};
             let dims = BertDims {
