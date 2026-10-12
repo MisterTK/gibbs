@@ -1509,6 +1509,18 @@ impl Session {
         &self.rt
     }
 
+    /// Bytes a step moves for `v`: a weight in its stored format, anything else as f32 elements.
+    fn value_bytes(&self, graph: &Graph, v: ValueId) -> u64 {
+        let val = graph.value(v);
+        let n: usize = val.shape.iter().product();
+        if val.kind == ValueKind::Weight {
+            if let Some((_, _, len, fmt)) = self.weights.get(&val.name) {
+                return weight_format_bytes(*fmt, *len) as u64;
+            }
+        }
+        (n * 4) as u64
+    }
+
     /// The packed-weight GEMV pipeline for `format`: a hand kernel, or the generated one.
     fn gemv_pso(&self, format: WeightFormat) -> Result<&ComputePipelineState, String> {
         let name = match format {
@@ -1858,20 +1870,25 @@ impl Session {
                     enc.end_encoding();
                     commit_and_wait(cb)?;
                     let gpu_s = gpu_seconds(cb);
-                    timings.push((s.name.clone(), format!("{:?}", s.op), gpu_s));
+                    let bytes: u64 = s
+                        .reads
+                        .iter()
+                        .chain(std::iter::once(&s.out))
+                        .map(|&v| self.value_bytes(graph, v))
+                        .sum();
+                    timings.push((s.name.clone(), format!("{:?}", s.op), gpu_s, bytes));
                 }
                 timings.sort_by(|a, b| b.2.total_cmp(&a.2));
-                let ceiling = self.rt.profile.ceiling_gbps.max(250.0);
-                eprintln!("profiler: per-command-buffer timing (coarse)");
+                let ceiling = self.rt.profile.ceiling_gbps.max(1.0);
+                eprintln!("profiler: per-command-buffer timing (bytes = operands read + output written)");
                 eprintln!(
                     "{:<20} | {:<25} | {:>8} | {:>8} | {:>8} | {:>8}",
                     "step", "kernel", "µs", "bytes", "GB/s", "% ceiling"
                 );
-                for (name, op_desc, s) in timings.iter().take(10) {
+                for (name, op_desc, s, bytes) in timings.iter().take(10) {
                     let us = s * 1e6;
-                    let bytes = 0u64; // approximate
-                    let gbps = 0.0f64;
-                    let pct = 0.0f64;
+                    let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
+                    let pct = gbps / ceiling * 100.0;
                     eprintln!(
                         "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
                         name,
@@ -4219,6 +4236,25 @@ fn compile(device: &Device) -> Result<(Library, Result<(), String>), String> {
                 .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
             Ok((lib, Err(format!("MSL 4.0 compile failed: {e4}"))))
         }
+    }
+}
+
+/// Stored size of `n` weight elements in `fmt`.
+fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
+    match fmt {
+        WeightFormat::F32 | WeightFormat::U32 => n * 4,
+        WeightFormat::BF16 | WeightFormat::F16 => n * 2,
+        WeightFormat::Q4_0 => n / 32 * 18,
+        WeightFormat::Q8_0 => n / 32 * 34,
+        WeightFormat::IQ4_XS => n / 256 * 136,
+        WeightFormat::IQ2_M => n / 256 * 82,
+        WeightFormat::Q4_K => n / 256 * 144,
+        WeightFormat::Q2_K => n / 256 * 84,
+        WeightFormat::IQ3_S => n / 256 * 110,
+        WeightFormat::NvFp4 => n / 2 + n / 16,
+        WeightFormat::JesseLUT => n,
+        WeightFormat::Gen(f) => crate::graph::codec::codec(f)
+            .map_or(n * 4, |c| n / c.block_elems as usize * c.block_bytes as usize),
     }
 }
 

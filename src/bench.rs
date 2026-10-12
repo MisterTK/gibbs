@@ -56,15 +56,19 @@ pub struct BenchSuite {
 pub struct ModelBenchResult {
     pub model: String,
     pub file: String,
-    pub codec_mix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_mix: Option<String>,
     pub bytes_per_token: u64,
     pub ceiling_gbps: f64,
     pub decode_tok_s: f64,
     pub roofline_tok_s: f64,
     pub roofline_pct: f64,
     pub gpu_ms: f64,
-    pub encode_us: f64,
-    pub prefill_tok_s: f64,
+    /// Not measured by this harness (no per-step hook through `NativeLm`): omitted, never faked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encode_us: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_tok_s: Option<f64>,
     pub rss_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_kernels: Option<Vec<String>>,
@@ -210,11 +214,13 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         } else {
             0.0
         };
-        let roofline_pct = if roofline_tok_s > 0.0 {
-            (median_speed / roofline_tok_s) * 100.0
-        } else {
-            90.0
-        };
+        if roofline_tok_s <= 0.0 {
+            return Err(format!(
+                "{}: no weight bytes found, cannot compute a roofline",
+                model_cfg.id
+            ));
+        }
+        let roofline_pct = (median_speed / roofline_tok_s) * 100.0;
 
         roofline_pcts.push(roofline_pct);
 
@@ -241,15 +247,15 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         let res = ModelBenchResult {
             model: model_cfg.id.clone(),
             file: file_str,
-            codec_mix: "native".into(),
+            codec_mix: None,
             bytes_per_token,
             ceiling_gbps,
             decode_tok_s: median_speed,
             roofline_tok_s,
             roofline_pct,
             gpu_ms: median_gpu_ms,
-            encode_us: 10.0,
-            prefill_tok_s: 0.0,
+            encode_us: None,
+            prefill_tok_s: None,
             rss_gb: get_peak_rss_gb(),
             top_kernels: None,
         };
