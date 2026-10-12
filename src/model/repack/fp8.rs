@@ -12,10 +12,13 @@
 //! (E5M2's 2 mantissa bits fit E4M3's 3, and scaling by a power of two is exact) for every element at
 //! least 2^-6 of the way down E4M3's range, i.e. within 14 binades of the block max; smaller
 //! elements round to E4M3 subnormals (multiples of 2^-9 · 2^k) or flush to zero, so the absolute
-//! error per element is at most 2^-10 · 2^k <= block max · 2^-18.
+//! error per element is at most 2^-10 · 2^k <= block max · 2^-18, plus the two f32 product roundings
+//! (2 · 2^-24 relative to the element, <= block max · 2^-23).
 //!
-//! The GPU flushes f32-subnormal products (`|byte * scale| < 2^-126`) to zero while the CPU keeps
-//! them; real scales are far above that, so the codec is only bit-exact for normal products.
+//! The GPU flushes f32-subnormal products to zero while the CPU keeps them. The smallest nonzero
+//! E4M3 magnitude is 2^-9, so a block whose scale is nonzero with `|s| < 2^-117` (or not finite)
+//! is not emitted: `repack` returns `Ok(None)` and the weight takes the f32 path. Every emitted
+//! block therefore decodes identically on CPU and GPU.
 
 use super::Repacked;
 use crate::graph::codec::Spec;
@@ -81,20 +84,15 @@ fn encode_e4m3(x: f32) -> u8 {
     sign | ((((b >> 23) - 120) << 3 | m) + up as u32) as u8
 }
 
-/// One block of E5M2 values as E4M3 bytes plus the f32 scale to apply; `None` when `scale * 2^k`
-/// is not a normal f32 (the weight then goes through the f32 dequantize path).
-fn e5m2_block(v: &[f32], scale: f32) -> Result<Option<([u8; BLOCK], f32)>, String> {
+/// One block of E5M2 values as E4M3 bytes plus the f32 scale to apply (`scale * 2^k`).
+fn e5m2_block(v: &[f32], scale: f32) -> Result<([u8; BLOCK], f32), String> {
     if v.iter().any(|x| !x.is_finite()) {
         return Err("E5M2 inf/NaN".into());
     }
     let max = v.iter().fold(0f32, |a, x| a.max(x.abs()));
     let k = if max == 0.0 { 0 } else { (max.to_bits() >> 23) as i32 - 127 - 8 };
-    let s = scale * pow2(k);
-    if s != 0.0 && !s.is_normal() {
-        return Ok(None);
-    }
     let inv = pow2(-k);
-    Ok(Some((std::array::from_fn(|i| encode_e4m3(v[i] * inv)), s)))
+    Ok((std::array::from_fn(|i| encode_e4m3(v[i] * inv)), scale * pow2(k)))
 }
 
 pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Repacked>, String> {
@@ -149,10 +147,7 @@ pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Rep
             }
             let i = r * cols + c;
             let (q, s) = if e5m2 {
-                match e5m2_block(&vals[i..i + BLOCK], s).map_err(err)? {
-                    Some(b) => b,
-                    None => return Ok(None),
-                }
+                e5m2_block(&vals[i..i + BLOCK], s).map_err(err)?
             } else {
                 let q: [u8; BLOCK] = raw[i..i + BLOCK].try_into().unwrap();
                 if q.iter().any(|b| b & 0x7F == 0x7F) {
@@ -160,6 +155,10 @@ pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Rep
                 }
                 (q, s)
             };
+            // GPU flushes subnormal products; see the module docs.
+            if s != 0.0 && !(s.is_finite() && s.abs() >= pow2(-117)) {
+                return Ok(None);
+            }
             out.extend_from_slice(&q);
             out.extend_from_slice(&s.to_le_bytes());
         }
@@ -318,7 +317,7 @@ mod tests {
         // Full range incl. subnormals, tiny elements flush: error stays under block max · 2^-18.
         let worst = e5m2_error(0..=30, 8);
         eprintln!("E5M2 -> E4M3 worst |err| / block max = {worst:e} (bound {:e})", 2f64.powi(-18));
-        assert!(worst <= 2f64.powi(-18) * 1.0001, "{worst}");
+        assert!(worst <= 2f64.powi(-18) + 2f64.powi(-23), "{worst}");
         assert!(worst > 0.0, "full-range data should exercise the flush path");
     }
 
@@ -336,6 +335,17 @@ mod tests {
         // cols not a multiple of 32, unscaled, unsupported dtype -> f32 path.
         assert!(q("F8_E4M3", 16, vec![0x38; 32], &[]).unwrap().is_none());
         assert!(q("F16", 32, vec![0; 128], &[]).unwrap().is_none());
+        // Scales whose smallest product would be f32-subnormal stay on the f32 path.
+        for dtype in ["F8_E4M3", "F8_E5M2"] {
+            let tiny = |s: f32| {
+                let (m, data) = fixture(&[
+                    ("a.weight", dtype, vec![1, 32], vec![0x38; 32]),
+                    ("a.weight_scale", "F32", vec![], f32_bytes(&[s])),
+                ]);
+                repack(&m, &data, "a.weight").unwrap().is_none()
+            };
+            assert!(tiny(2f32.powi(-118)) && tiny(1e-40) && !tiny(2f32.powi(-100)) && !tiny(0.0));
+        }
         let (m, data) = fixture(&[("a.weight", "F8_E4M3", vec![2, 32], vec![0x38; 64])]);
         assert!(repack(&m, &data, "a.weight").unwrap().is_none());
         // A scale grid that splits a 32-block (per-16-column scales) can't be one scale per block.

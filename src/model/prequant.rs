@@ -146,8 +146,14 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
         }
         Some("quark") => quark::blocker(qc.unwrap_or(&Value::Null)),
         // vLLM `fp8` serialization (amd/Llama-3.2-1B-Instruct-FP8-KV): F8 weights, one `weight_scale` each.
-        // `weight_block_size` (DeepSeek / Qwen3-FP8): 2-D `weight_scale_inv` grid, read by [`dequantize`].
-        Some("fp8") => None,
+        // `weight_block_size` (DeepSeek / Qwen3-FP8): 2-D `weight_scale_inv` grid, read by [`dequantize`],
+        // whose grid inference ([`block`]) only knows 128-blocks.
+        Some("fp8") => qc.and_then(|q| {
+            let b = &q["weight_block_size"];
+            (!b.is_null() && *b != serde_json::json!([128, 128])).then(|| {
+                format!("fp8 weight_block_size {b} is not supported ([128, 128] is)")
+            })
+        }),
         // Every linear decodes at load (`exl3`); quantized embedding tables are refused there.
         Some("exl3") => None,
         Some("glq") => {
