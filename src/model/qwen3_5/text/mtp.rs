@@ -15,11 +15,11 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub(in crate::model::qwen3_5) struct Mtp {
-    fc: Linear,
-    pre_emb: Vec<f32>,
-    pre_hid: Vec<f32>,
+    pub(super) fc: Linear,
+    pub(super) pre_emb: Vec<f32>,
+    pub(super) pre_hid: Vec<f32>,
     pub(super) layers: Vec<Layer>,
-    norm: Vec<f32>,
+    pub(super) norm: Vec<f32>,
 }
 
 impl Mtp {
@@ -233,5 +233,117 @@ impl Drafter for MtpDrafter {
         // Draft rows leave the cache: the next call reruns them on the target's hidden states.
         t.truncate(std::slice::from_mut(&mut s.kv), s.len)?;
         Ok(drafts)
+    }
+}
+
+/// [`Drafter`] running the MTP head as a program (Metal): the steps of [`MtpDrafter`] with the
+/// head's logits over the whole vocabulary (no frequency-prefix draft vocabulary: the head is a
+/// GPU matvec). It reads the target program's tap, which is already final-normed.
+pub(in crate::model::qwen3_5) struct MtpGpuDrafter {
+    text: Arc<TextModel>,
+    program: Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>,
+}
+
+impl MtpGpuDrafter {
+    pub(in crate::model::qwen3_5) fn new(
+        text: Arc<TextModel>,
+        program: Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>,
+    ) -> Self {
+        Self { text, program }
+    }
+}
+
+/// The head's KV/state buffers and the target positions it holds (all committed).
+struct MtpGpuState {
+    state: crate::graph::StateStore,
+    len: usize,
+}
+
+impl Drafter for MtpGpuDrafter {
+    fn label(&self) -> String {
+        "MTP".into()
+    }
+
+    fn tap_layers(&self) -> Vec<usize> {
+        vec![self.text.layers.len() - 1]
+    }
+
+    fn new_state(&self) -> DraftState {
+        Box::new(MtpGpuState {
+            state: crate::graph::StateStore::new(),
+            len: 0,
+        })
+    }
+
+    fn propose(
+        &self,
+        st: &mut DraftState,
+        tokens: &[u32],
+        hidden: &[f32],
+        k: usize,
+        pick: &mut dyn FnMut(&[f32]) -> u32,
+    ) -> Result<Vec<u32>, String> {
+        use crate::graph::Tensor;
+        let t = &*self.text;
+        let s = st
+            .downcast_mut::<MtpGpuState>()
+            .ok_or("draft state was not built by the MTP drafter")?;
+        let d = t.hidden;
+        let rows = hidden.len() / d;
+        if rows == 0 || hidden.len() % d != 0 || s.len + rows + 1 != tokens.len() {
+            return Err(format!(
+                "MTP drafter holds {} positions and got {} hidden values for a {}-token sequence",
+                s.len,
+                hidden.len(),
+                tokens.len()
+            ));
+        }
+        if s.len + rows + k > t.decode_max_ctx {
+            return Err(format!(
+                "MTP position {} exceeds the compiled context limit {}",
+                s.len + rows + k,
+                t.decode_max_ctx
+            ));
+        }
+        let mut p = self.program.lock();
+        std::mem::swap(&mut p.state, &mut s.state);
+        let out = (|| -> Result<Vec<u32>, String> {
+            let mut step = |p: &mut crate::graph::program::GraphProgram,
+                            tok: u32,
+                            hid: &[f32],
+                            pos: usize|
+             -> Result<(Vec<f32>, Vec<f32>), String> {
+                let mut emb = vec![0.0f32; d];
+                t.embed(tok, &mut emb)?;
+                let res = p.run(vec![
+                    Tensor::F32(emb),
+                    Tensor::F32(hid.to_vec()),
+                    Tensor::U32(vec![pos as u32]),
+                ])?;
+                match <[Tensor; 2]>::try_from(res) {
+                    Ok([Tensor::F32(logits), Tensor::F32(normed)]) => Ok((logits, normed)),
+                    _ => Err("the MTP program returned unexpected outputs".into()),
+                }
+            };
+            // Row i is target position s.len + i; it pairs with the token after it.
+            let mut last = (Vec::new(), Vec::new());
+            for i in 0..rows {
+                last = step(&mut p, tokens[s.len + 1 + i], &hidden[i * d..][..d], s.len + i)?;
+            }
+            s.len += rows;
+            let (mut logits, mut normed) = last;
+            let mut drafts = Vec::with_capacity(k);
+            while drafts.len() < k {
+                let tok = pick(&logits);
+                drafts.push(tok);
+                if drafts.len() < k {
+                    (logits, normed) = step(&mut p, tok, &normed, s.len + drafts.len() - 1)?;
+                }
+            }
+            // Draft rows stay in the KV buffers; the next call overwrites them with the target's.
+            Ok(drafts)
+        })();
+        std::mem::swap(&mut p.state, &mut s.state);
+        out
     }
 }

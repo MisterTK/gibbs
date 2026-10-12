@@ -7,6 +7,13 @@ use crate::model::par::par_rows;
 use crate::model::weights::Weights;
 use serde_json::Value;
 use std::path::Path;
+use crate::graph::program::GraphProgram;
+use crate::graph::{
+    DType, Graph, Op, PairLayout, RopeVariant, Tensor, ValueId, Weights as GraphWeights,
+};
+use crate::hardware::{Device, PlacementMode};
+use parking_lot::Mutex;
+use std::collections::HashMap;
 
 /// `preprocessor_config.json`: pixel budget and normalization.
 pub(super) struct Preprocessor {
@@ -135,6 +142,70 @@ pub(super) struct Vision {
     merger: Merger,
     /// (block index, merger) for Qwen3-VL deepstack features.
     deepstack: Vec<(usize, Merger)>,
+    /// Metal programs per image grid; `None` runs the tower on the host.
+    gpu: Option<Gpu>,
+}
+
+
+/// An image's patches as [`Vision::prepare`] leaves them.
+struct Prepared {
+    /// `[gh * gw, 3 * temporal * patch * patch]`.
+    patches: Vec<f32>,
+    coords: Vec<(usize, usize)>,
+    gh: usize,
+    gw: usize,
+}
+
+/// Placement and the compiled tower programs by patch grid.
+struct Gpu {
+    mode: PlacementMode,
+    progs: Mutex<HashMap<(usize, usize), GraphProgram>>,
+}
+
+/// `Op::LayerNorm` (eps 1e-6) over rows of `width` of `x` `[rows, width]`.
+fn layer_norm_node(
+    g: &mut Graph,
+    w: &mut GraphWeights,
+    name: &str,
+    x: ValueId,
+    (gamma, beta): &(Vec<f32>, Vec<f32>),
+    rows: usize,
+    width: usize,
+) -> ValueId {
+    let gn = g.weight(format!("{name}.weight"), vec![width], DType::F32);
+    let bn = g.weight(format!("{name}.bias"), vec![width], DType::F32);
+    w.insert(format!("{name}.weight"), Tensor::F32(gamma.clone()));
+    w.insert(format!("{name}.bias"), Tensor::F32(beta.clone()));
+    g.add(name, Op::LayerNorm { eps: 1e-6 }, &[x, gn, bn], vec![rows, width], DType::F32)
+}
+
+/// [`Merger::forward`] as nodes: `x` `[n, d]` in merge-block order -> `[n / unit, out]`.
+#[allow(clippy::too_many_arguments)]
+fn merger_node(
+    g: &mut Graph,
+    w: &mut GraphWeights,
+    name: &str,
+    mg: &Merger,
+    x: ValueId,
+    n: usize,
+    d: usize,
+    unit: usize,
+) -> ValueId {
+    let f32s = DType::F32;
+    let (rows, wide) = (n / unit, d * unit);
+    let regroup = |g: &mut Graph, x: ValueId| {
+        g.add(format!("{name}.regroup"), Op::Reshape { shape: Some(vec![rows, wide]) }, &[x], vec![rows, wide], f32s)
+    };
+    let y = if mg.postshuffle {
+        let r = regroup(g, x);
+        layer_norm_node(g, w, &format!("{name}.norm"), r, &mg.norm, rows, wide)
+    } else {
+        let y = layer_norm_node(g, w, &format!("{name}.norm"), x, &mg.norm, n, d);
+        regroup(g, y)
+    };
+    let h = mg.fc1.graph_node(g, w, &format!("{name}.fc1"), y, rows);
+    let h = g.add(format!("{name}.gelu"), Op::Gelu { tanh: false }, &[h], vec![rows, mg.fc1.rows], f32s);
+    mg.fc2.graph_node(g, w, &format!("{name}.fc2"), h, rows)
 }
 
 /// One image through the tower.
@@ -224,6 +295,7 @@ impl Vision {
             blocks,
             merger: Merger::load(ck, &format!("{p}.merger"), false)?,
             deepstack,
+            gpu: None,
         };
         if v.patch_embed.cols != 3 * v.temporal * v.patch * v.patch
             || v.pos_embed.len() != positions * hidden
@@ -260,8 +332,9 @@ impl Vision {
         Ok((rh / f, rw / f))
     }
 
-    pub(super) fn encode(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Encoded, String> {
-        let (p, m, d) = (self.patch, self.merge, self.hidden);
+    /// The resized, normalized patches in merge-block order and their (row, col) grid cells.
+    fn prepare(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Prepared, String> {
+        let (p, m) = (self.patch, self.merge);
         // ponytail: pixel budget comes from preprocessor_config.json (Qwen ships 16M px max), so a large photo costs O(patches^2) attention; cap max_pixels if latency matters.
         let (rh, rw) = smart_resize(img.height, img.width, p * m, pre.min_pixels, pre.max_pixels)?;
         let resized;
@@ -303,15 +376,29 @@ impl Vision {
                 }
             }
         });
+        Ok(Prepared {
+            patches,
+            coords,
+            gh,
+            gw,
+        })
+    }
+
+    /// The tower on the host (`--backend cpu`).
+    fn encode_cpu(&self, pr: Prepared) -> Result<Encoded, String> {
+        crate::hardware::cpu_compute::enter("qwen3_5::vision::encode");
+        let (m, d) = (self.merge, self.hidden);
+        let Prepared {
+            patches,
+            coords,
+            gh,
+            gw,
+        } = pr;
+        let n = gh * gw;
         let mut x = self.patch_embed.forward(&patches, n);
         drop(patches);
         // Learned positions, bilinearly resampled (align_corners) from the side x side grid.
-        let taps = |i: usize, size: usize| {
-            let src = i as f32 * (self.side - 1) as f32 / size.saturating_sub(1).max(1) as f32;
-            let f = src.floor();
-            let lo = (f as usize).min(self.side - 1);
-            (lo, (lo + 1).min(self.side - 1), src - f)
-        };
+        let taps = |i: usize, size: usize| self.pos_taps(i, size);
         par_rows(&mut x, d, &|i, row| {
             let (r, c) = coords[i];
             let ((r0, r1, fr), (c0, c1, fc)) = (taps(r, gh), taps(c, gw));
@@ -386,6 +473,182 @@ impl Vision {
             embeds: self.merger.forward(&x, d, m * m),
             deepstack,
         })
+    }
+
+    pub(super) fn encode(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Encoded, String> {
+        let pr = self.prepare(img, pre)?;
+        match &self.gpu {
+            Some(gpu) => self.encode_gpu(gpu, pr),
+            None => self.encode_cpu(pr),
+        }
+    }
+
+    /// Runs the tower on the GPU (`mode` not `--backend cpu`): one program per merged-patch grid,
+    /// compiled on first use. The host only does image preprocessing and the index/weight
+    /// arithmetic of the position-embedding interpolation; the gather, blend and the whole
+    /// network are the program.
+    pub(super) fn on_gpu(mut self, mode: PlacementMode) -> Result<Self, String> {
+        if !matches!(mode, PlacementMode::Pin(Device::Cpu)) {
+            self.gpu = Some(Gpu {
+                mode,
+                progs: Mutex::new(HashMap::new()),
+            });
+        }
+        Ok(self)
+    }
+
+    /// Source rows and blend weight of output coordinate `i` of `size` on the learned position
+    /// grid (bilinear, align_corners).
+    fn pos_taps(&self, i: usize, size: usize) -> (usize, usize, f32) {
+        let src = i as f32 * (self.side - 1) as f32 / size.saturating_sub(1).max(1) as f32;
+        let f = src.floor();
+        let lo = (f as usize).min(self.side - 1);
+        (lo, (lo + 1).min(self.side - 1), src - f)
+    }
+
+    fn encode_gpu(&self, gpu: &Gpu, pr: Prepared) -> Result<Encoded, String> {
+        let Prepared {
+            patches,
+            coords,
+            gh,
+            gw,
+        } = pr;
+        let n = gh * gw;
+        let (mut idx, mut wts) = (vec![Vec::with_capacity(n); 4], vec![Vec::with_capacity(n); 4]);
+        let mut rpos = Vec::with_capacity(3 * n);
+        for &(r, c) in &coords {
+            let ((r0, r1, fr), (c0, c1, fc)) = (self.pos_taps(r, gh), self.pos_taps(c, gw));
+            let corners = [
+                (r0 * self.side + c0, (1.0 - fr) * (1.0 - fc)),
+                (r0 * self.side + c1, (1.0 - fr) * fc),
+                (r1 * self.side + c0, fr * (1.0 - fc)),
+                (r1 * self.side + c1, fr * fc),
+            ];
+            for (j, (i, wt)) in corners.into_iter().enumerate() {
+                idx[j].push(i as u32);
+                wts[j].push(wt);
+            }
+            rpos.extend([r as u32, c as u32, 0]);
+        }
+        let mut inputs = vec![Tensor::F32(patches)];
+        inputs.extend(idx.into_iter().map(Tensor::U32));
+        inputs.extend(wts.into_iter().map(Tensor::F32));
+        inputs.push(Tensor::U32(rpos));
+        let mut progs = gpu.progs.lock();
+        if !progs.contains_key(&(gh, gw)) {
+            // ponytail: at most 4 grids stay compiled (each holds its own Metal session).
+            if progs.len() >= 4 {
+                progs.clear();
+            }
+            let (g, w) = self.tower_graph(gh, gw);
+            let prog = GraphProgram::compile(g, w, gpu.mode)
+                .map_err(|e| format!("Qwen3.5 vision: {e}"))?;
+            progs.insert((gh, gw), prog);
+        }
+        let mut outs = progs
+            .get_mut(&(gh, gw))
+            .expect("compiled above")
+            .run(inputs)?
+            .into_iter()
+            .map(|t| match t {
+                Tensor::F32(v) => Ok(v),
+                _ => Err("the vision program returned a non-f32 output".to_string()),
+            });
+        let embeds = outs.next().ok_or("the vision program has no output")??;
+        Ok(Encoded {
+            rows: gh / self.merge,
+            cols: gw / self.merge,
+            embeds,
+            deepstack: outs.collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// The tower for a `gh x gw` patch grid: inputs `patches`, `pos_idx_{0..4}`, `pos_w_{0..4}`,
+    /// `rope_positions`; outputs the merged features, then each deepstack feature.
+    fn tower_graph(&self, gh: usize, gw: usize) -> (Graph, GraphWeights) {
+        let (d, n, unit) = (self.hidden, gh * gw, self.merge * self.merge);
+        let (hd, q4) = (d / self.heads, self.inv_freq.len());
+        let f32s = DType::F32;
+        let mut g = Graph::new();
+        let mut w = GraphWeights::new();
+        let patches = g.input("patches", vec![n, self.patch_embed.cols], f32s);
+        let idx: Vec<ValueId> = (0..4)
+            .map(|c| g.input(format!("pos_idx_{c}"), vec![n], DType::U32))
+            .collect();
+        let wts: Vec<ValueId> = (0..4)
+            .map(|c| g.input(format!("pos_w_{c}"), vec![n, 1], f32s))
+            .collect();
+        let rpos = g.input("rope_positions", vec![3 * n], DType::U32);
+        let table = g.weight("pos_embed", vec![self.side * self.side, d], f32s);
+        w.insert("pos_embed", Tensor::F32(self.pos_embed.clone()));
+        // Rows rotate by their grid row (first quarter of each head's pairs) and column (second).
+        let inv = g.weight("rope.inv_freq", vec![2 * q4], f32s);
+        w.insert(
+            "rope.inv_freq",
+            Tensor::F32(self.inv_freq.iter().chain(&self.inv_freq).copied().collect()),
+        );
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: RopeVariant::MRope {
+                sections: [q4 as u32, q4 as u32, 0],
+                interleaved: false,
+                pairs: PairLayout::Half,
+            },
+            mscale: 1.0,
+        };
+
+        let mut x = self
+            .patch_embed
+            .graph_node(&mut g, &mut w, "patch_embed", patches, n);
+        for c in 0..4 {
+            let e = g.add(format!("pos_embed_{c}"), Op::Embedding, &[table, idx[c]], vec![n, d], f32s);
+            let s = g.add(format!("pos_scaled_{c}"), Op::Mul, &[e, wts[c]], vec![n, d], f32s);
+            x = g.add(format!("pos_add_{c}"), Op::Add, &[x, s], vec![n, d], f32s);
+        }
+
+        let mut deepstack = Vec::new();
+        for (bi, b) in self.blocks.iter().enumerate() {
+            let p = format!("blocks.{bi}");
+            let y = layer_norm_node(&mut g, &mut w, &format!("{p}.norm1"), x, &b.norm1, n, d);
+            let qkv = b.qkv.graph_node(&mut g, &mut w, &format!("{p}.qkv"), y, n);
+            let mut part = |name: &str, i: usize| {
+                let s = Op::Slice {
+                    axis: -1,
+                    start: (i * d) as i64,
+                    end: ((i + 1) * d) as i64,
+                };
+                g.add(format!("{p}.{name}"), s, &[qkv], vec![n, d], f32s)
+            };
+            let (q, k, v) = (part("q", 0), part("k", 1), part("v", 2));
+            let q = g.add(format!("{p}.q_rope"), rope.clone(), &[q, rpos, inv], vec![n, d], f32s);
+            let k = g.add(format!("{p}.k_rope"), rope.clone(), &[k, rpos, inv], vec![n, d], f32s);
+            let att = Op::Attention {
+                heads: self.heads,
+                kv_heads: self.heads,
+                causal: false,
+                window: None,
+                soft_cap: None,
+            };
+            let a = g.add(format!("{p}.attn"), att, &[q, k, v], vec![n, d], f32s);
+            let o = b.proj.graph_node(&mut g, &mut w, &format!("{p}.proj"), a, n);
+            x = g.add(format!("{p}.add_attn"), Op::Add, &[x, o], vec![n, d], f32s);
+            let y = layer_norm_node(&mut g, &mut w, &format!("{p}.norm2"), x, &b.norm2, n, d);
+            let h = b.fc1.graph_node(&mut g, &mut w, &format!("{p}.fc1"), y, n);
+            let h = g.add(format!("{p}.gelu"), Op::Gelu { tanh: true }, &[h], vec![n, b.fc1.rows], f32s);
+            let h = b.fc2.graph_node(&mut g, &mut w, &format!("{p}.fc2"), h, n);
+            x = g.add(format!("{p}.add_mlp"), Op::Add, &[x, h], vec![n, d], f32s);
+            for (k, (_, mg)) in self.deepstack.iter().enumerate().filter(|(_, (i, _))| *i == bi) {
+                let name = format!("deepstack_merger.{k}");
+                deepstack.push(merger_node(&mut g, &mut w, &name, mg, x, n, d, unit));
+            }
+        }
+        let merged = merger_node(&mut g, &mut w, "merger", &self.merger, x, n, d, unit);
+        g.output(merged);
+        for ds in deepstack {
+            g.output(ds);
+        }
+        (g, w)
     }
 }
 
