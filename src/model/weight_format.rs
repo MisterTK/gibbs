@@ -297,8 +297,7 @@ pub fn load_causal_lm_with(
         return load_without_f32(artifacts, backend, params, total);
     }
     let mut llm = load_causal_lm(artifacts, QuantMode::Uncompressed)?;
-    let cache = default_cache_dir().ok();
-    let choice = choose(&llm, &model_key(artifacts), backend, hw, cache.as_deref());
+    let choice = choose(&llm, &model_key(artifacts), backend, hw, reencode.cache_dir.as_deref());
     if choice.mode != QuantMode::Uncompressed {
         llm.quantize(choice.mode);
     }
@@ -390,9 +389,16 @@ fn load_metal(
         .as_deref()
         .and_then(|p| p.metadata().ok())
         .map_or(0, |m| m.len());
-    let codec_less = src.manifest().is_some_and(|m| {
+    // Only tensors a projection can read: `*.weight` matrices (companions such as `.absmax`,
+    // `.scales`, `_packed`, `_zero_point` are not weights), counted codec-less unless the GPU reads
+    // their format or they repack into a codec.
+    let codec_less = src.checkpoint().is_some_and(|(m, data)| {
         m.tensors.values().any(|t| {
-            t.shape.len() == 2 && !gathered(&t.name) && !reencode::has_gpu_codec(reencode::declared_format(t))
+            t.shape.len() == 2
+                && t.name.ends_with(".weight")
+                && !gathered(&t.name)
+                && !reencode::has_gpu_codec(reencode::declared_format(t))
+                && !matches!(crate::model::repack::repack(m, data, &t.name), Ok(Some(_)))
         })
     });
     let too_big = hw.total_memory_bytes.is_some_and(|ram| file_bytes > ram / 2);
@@ -968,6 +974,44 @@ mod tests {
         }
     }
 
+    /// The GPU kernels for the formats `max-speed` picks (Q4_K, block-32 Q4_0) agree with the CPU
+    /// dequantizing GEMV on the same encoded weights, so a high KL in the gate is quantization error,
+    /// not a kernel fault.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_matches_cpu_on_max_speed_weights() {
+        let Some(artifacts) = smollm_artifacts() else {
+            eprintln!("SKIP: SmolLM2-135M-Instruct not cached in disk/");
+            return;
+        };
+        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal) {
+            return;
+        }
+        let src = open_causal_lm(&artifacts, QuantMode::Uncompressed).unwrap();
+        let enc = Encoder::new(Mode::Policy { policy: ReencodePolicy::MaxSpeed, ffn_only: false, rmse_limit: None }, 4, None);
+        let cand = src.build(Some(&enc)).unwrap();
+        let formats: std::collections::BTreeSet<_> = enc.records().iter().map(|r| r.stored.name()).collect();
+        eprintln!("stored formats: {formats:?}");
+        let tokens = probe_tokens(&cand);
+        let (cpu, _) = reference_probe(&cand, &tokens);
+        let gpu = gpu_logprobs(&cand, &tokens).unwrap();
+        let kl = cpu.iter().zip(&gpu).map(|(p, q)| kl_divergence(p, q)).sum::<f64>() / tokens.len() as f64;
+        eprintln!("CPU vs GPU on the re-encoded model: mean KL {kl:.6}");
+        assert!(kl < 1e-3, "GPU and CPU disagree on identical weights: KL {kl}");
+    }
+
+    /// Control for the test above: a CPU load does measure formats and writes the probe cache into the
+    /// configured directory, so the Metal assertion has teeth.
+    #[test]
+    fn cpu_load_writes_the_format_probe_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = ReencodeConfig { cache_dir: Some(tmp.path().to_path_buf()), ..Default::default() };
+        let artifacts = ModelArtifacts { model_id: "gibbs/smollm-1m".into(), ..Default::default() };
+        let hw = HardwareCapability::probe_system();
+        load_causal_lm_with(&artifacts, Device::Cpu, None, &hw, &cfg).unwrap();
+        assert_eq!(host_weight_caches(tmp.path()).len(), 1);
+    }
+
     /// Real weights: the first Metal load encodes, gates and caches; the second is a cache hit that
     /// reproduces the same GPU log-probabilities, and neither touches the CPU probe cache.
     #[cfg(target_os = "macos")]
@@ -1136,5 +1180,11 @@ mod tests {
         assert!(r.gate.starts_with("per-tensor RMSE"), "{r:?}");
         assert_ne!(m.lm_head.quant_format(), crate::hardware::QuantFormat::FP32);
         assert!(r.lossy > 0 && r.tensors == 4 * m.layers.len() + 1, "{r:?}");
+        // and it still predicts what the f32 model predicts (on the GPU: no CPU forward)
+        #[cfg(target_os = "macos")]
+        if crate::hardware::available_devices().contains(&Device::Metal) {
+            let last = |lp: Vec<Vec<f32>>| argmax(lp.last().unwrap());
+            assert_eq!(last(gpu_logprobs(&m, &ids).unwrap()), last(gpu_logprobs(&f, &ids).unwrap()));
+        }
     }
 }

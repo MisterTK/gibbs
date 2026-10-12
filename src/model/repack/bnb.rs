@@ -258,7 +258,7 @@ pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Rep
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::layers::dequantize_gguf_blocks;
     use crate::model::UniversalModelLoader;
@@ -275,9 +275,9 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Fixture {
-        m: ModelManifest,
-        data: Vec<u8>,
+    pub(crate) struct Fixture {
+        pub(crate) m: ModelManifest,
+        pub(crate) data: Vec<u8>,
     }
     impl Fixture {
         fn add(&mut self, name: &str, dtype: &str, shape: &[usize], bytes: &[u8]) {
@@ -303,7 +303,7 @@ mod tests {
 
     /// Builds a `[rows, cols]` bnb weight `w.weight` and returns the independent reference dequant
     /// computed straight from the original layout (separate from [`dequantize`]).
-    fn build(fp4: bool, bs: usize, nested: bool, rows: usize, cols: usize, seed: u64) -> (Fixture, Vec<f32>) {
+    pub(crate) fn build(fp4: bool, bs: usize, nested: bool, rows: usize, cols: usize, seed: u64) -> (Fixture, Vec<f32>) {
         let mut r = Lcg(seed);
         let (numel, blocks) = (rows * cols, rows * cols / bs);
         let nibbles: Vec<u8> = (0..numel / 2).map(|_| (r.next() >> 3) as u8).collect();

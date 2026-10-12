@@ -217,7 +217,7 @@ impl QuantizedLinearLayer {
                 };
                 QuantizedWeight::GgufQuantized {
                     format,
-                    raw_data: Bytes::from(quantize_k_rows(weights, bytes, row)),
+                    raw_data: Bytes::from(quantize_k_rows(weights, in_features, bytes, row)),
                     in_features,
                     out_features,
                 }
@@ -993,7 +993,8 @@ pub fn quantize_row_q6_k_ref(x: &[f32], out: &mut [u8]) {
 }
 
 /// Encodes `weights` (row-major, `cols` a multiple of 256) with one of the row encoders above.
-pub fn quantize_k_rows(weights: &[f32], block_bytes: usize, row: fn(&[f32], &mut [u8])) -> Vec<u8> {
+pub fn quantize_k_rows(weights: &[f32], cols: usize, block_bytes: usize, row: fn(&[f32], &mut [u8])) -> Vec<u8> {
+    assert!(cols % 256 == 0 && weights.len() % cols == 0, "K-quant rows need cols % 256 == 0, got {cols}");
     let mut out = vec![0u8; weights.len() / 256 * block_bytes];
     for (x, y) in weights.chunks_exact(256).zip(out.chunks_exact_mut(block_bytes)) {
         row(x, y);
@@ -1412,7 +1413,8 @@ fn fused_gemv_gguf_blocks(
 
 /// Quantize an f32 weight slice into GGUF Q4_0 format (18 bytes per 32 elements), as ggml's
 /// `quantize_row_q4_0_ref`: `d = max/-8` for the signed element of largest magnitude, so
-/// re-encoding a dequantized Q4_0 block reproduces it.
+/// re-encoding a dequantized block made by that reference quantizer reproduces it (imatrix-tuned
+/// blocks may differ; loaders carry raw blocks where they can).
 pub fn quantize_f32_to_q4_0(weights: &[f32]) -> Vec<u8> {
     let num_blocks = (weights.len() + 31) / 32;
     let mut out = Vec::with_capacity(num_blocks * 18);
