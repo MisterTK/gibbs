@@ -417,8 +417,8 @@ impl<K: std::hash::Hash + Eq + Clone> ProgramCache<K> {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod testutil {
+/// Random-weight fixtures and error metrics for parity tests and the GPU-only matrix.
+pub mod fixture {
     use crate::model::weights::{Mat, Weights};
 
     /// Deterministic values in `[-scale, scale)`.
@@ -466,7 +466,7 @@ pub(crate) mod testutil {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::testutil::{mat, rand, rel_err};
+    use super::fixture::{mat, rand, rel_err};
     use super::*;
 
     /// Linear -> {Silu, SwiGlu, GeGlu} on bf16 weights at row counts either side of the batched
@@ -512,3 +512,5 @@ mod tests {
         }
     }
 }
+
+pub use fixture as testutil;

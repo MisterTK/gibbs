@@ -361,19 +361,27 @@ impl Approx {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::dit_graph::testutil::{cosine, mat, rand, rel_err};
+/// Tiny random-weight transformers: the parity tests' and the GPU-only matrix's fixtures.
+pub(super) mod fixture {
+    use super::super::*;
+    use crate::model::dit_graph::fixture::{mat, rand};
+
+    /// The tiny FLUX.1 forward (36 image + 28 text tokens, guided) as a graph.
+    pub(in crate::model::flux) fn tiny_graph(
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        let (mut b, outs) = tiny(Kind::Flux1, 1).build(36, 28, true)?;
+        b.g.output(outs[0]);
+        Ok((b.g, b.w))
+    }
 
     #[derive(Clone, Copy, Debug)]
-    enum Kind {
+    pub(in crate::model::flux) enum Kind {
         Flux1,
         Chroma,
         Flux2,
     }
 
-    struct Rng(u64);
+    pub(in crate::model::flux) struct Rng(u64);
     impl Rng {
         fn seed(&mut self) -> u64 {
             self.0 += 1;
@@ -422,10 +430,10 @@ mod tests {
         }
     }
 
-    const D: usize = 256;
-    const POOLED: usize = 32;
+    pub(in crate::model::flux) const D: usize = 256;
+    pub(in crate::model::flux) const POOLED: usize = 32;
 
-    fn tiny(kind: Kind, seed: u64) -> FluxTransformer {
+    pub(in crate::model::flux) fn tiny(kind: Kind, seed: u64) -> FluxTransformer {
         let r = &mut Rng(seed * 1000);
         let flux2 = matches!(kind, Kind::Flux2);
         let chroma = matches!(kind, Kind::Chroma);
@@ -498,6 +506,13 @@ mod tests {
             gpu: Default::default(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::*;
+    use super::*;
+    use crate::model::dit_graph::fixture::{cosine, mat, rand, rel_err};
 
     /// Metal program == native CPU forward, per FLUX variant, at f32 (bf16 weights shared).
     #[test]
@@ -540,7 +555,7 @@ mod tests {
 #[cfg(test)]
 mod approx_tests {
     use super::*;
-    use crate::model::dit_graph::testutil::{mat, rand, rel_err};
+    use crate::model::dit_graph::fixture::{mat, rand, rel_err};
 
     #[test]
     fn approx_table_matches_cpu() {

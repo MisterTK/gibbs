@@ -34,6 +34,11 @@ use std::time::Instant;
 
 mod graph_program;
 
+/// A tiny random-weight FLUX forward as a graph (the GPU-only matrix fixture).
+pub fn tiny_dit_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    graph_program::fixture::tiny_graph()
+}
+
 const HEAD_DIM: usize = 128;
 /// FLUX.1/Chroma RoPE: (unused, row, col) axes; FLUX.2 uses `config.axes_dims_rope` (t, h, w, l).
 const AXES: [usize; 3] = [16, 56, 56];
