@@ -9,7 +9,7 @@ pub struct GemvParams {
 impl Default for GemvParams {
     fn default() -> Self {
         Self {
-            rows_per_sg: 4,
+            rows_per_sg: 2,
             k_unroll: 1,
         }
     }
