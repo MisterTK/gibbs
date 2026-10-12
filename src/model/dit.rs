@@ -34,6 +34,16 @@ impl Lin {
         self.w.cols
     }
 
+    /// `x [m, in] -> [m, out]` as a graph node, the weight bound by name in its stored encoding.
+    pub fn emit(
+        &self,
+        b: &mut crate::model::dit_graph::Gb,
+        name: &str,
+        x: crate::graph::ValueId,
+    ) -> crate::graph::ValueId {
+        b.lin_mat(name, x, &self.w, self.b.as_deref())
+    }
+
     /// x [rows, in] -> [rows, out].
     pub fn fwd(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let mut out = vec![0.0; rows * self.w.rows];
