@@ -101,9 +101,12 @@ fn gguf_quant_decoders_match_float_reference() {
 #[test]
 fn undecodable_ggml_types_are_named_errors() {
     use gibbs_engine::model::UniversalModelLoader;
-    for (id, name) in [(15, "Q8_K"), (31, "Q4_0_x_y"), (40, "NVFP4")] {
+    for (id, name) in [(15, "Q8_K"), (31, "Q4_0_x_y")] {
         let err = UniversalModelLoader::ggml_type_info(id).unwrap_err();
         assert!(err.contains(name), "{err}");
     }
     assert!(UniversalModelLoader::ggml_type_info(19).is_ok()); // IQ1_S decodes
+    // NVFP4 (type 40): 64 elements per 36-byte block, layout confirmed from ggml-common.h
+    let (_, _, elems, bytes) = UniversalModelLoader::ggml_type_info(40).unwrap();
+    assert_eq!((elems, bytes), (64, 36));
 }

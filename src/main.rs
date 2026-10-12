@@ -12,7 +12,7 @@ use gibbs_engine::model::t2v::{write_mp4, TextToVideoPipeline};
 use gibbs_engine::model::text_to_image::{
     load_image_model, ImageGenerator, ImageRequest, ImageSlot,
 };
-use gibbs_engine::model::weight_format::load_causal_lm_for;
+use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig};
 use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler, ExecutableModel};
 use gibbs_engine::server::{create_router, AppState};
 use gibbs_engine::telemetry::EngineTelemetry;
@@ -120,9 +120,11 @@ struct Cli {
     #[arg(long, default_value_t = 8192)]
     ctx: usize,
 
-    #[arg(long, default_value = "max-speed")]
-    reencode: String,
+    /// GPU weight re-encode policy: max-speed | low-bit-native | bit-exact (default: settings.json, else max-speed).
+    #[arg(long)]
+    reencode: Option<String>,
 
+    /// Mean-KL limit (nats) of the GPU re-encode gate; overrides the policy's own.
     #[arg(long)]
     reencode_max_kl: Option<f32>,
 
@@ -608,7 +610,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 let (graph_lm, choice) =
-                    load_causal_lm_for(artifacts, backend, quant_override, &hw).map_err(|e| {
+                    load_causal_lm_with(
+                        artifacts,
+                        backend,
+                        quant_override,
+                        &hw,
+                        &{
+                            let mut cfg =
+                                ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
+                            let t = telemetry.clone();
+                            cfg.log = Some(Arc::new(move |m: &str| t.log_info(m)));
+                            cfg
+                        },
+                    )
+                    .map_err(|e| {
                         format!(
                             "Cannot load '{}': {}",
                             cli.model,
