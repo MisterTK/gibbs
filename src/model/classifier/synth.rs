@@ -64,6 +64,8 @@ pub fn write_repo(name: &str, mut cfg: Value, ts: &Ts) -> PathBuf {
     cfg["id2label"] = json!({"0": "A", "1": "B", "2": "C"});
     cfg["vocab_size"] = json!(VOCAB);
     std::fs::write(snap.join("config.json"), cfg.to_string()).unwrap();
+    // Probed (`.ok()`) by the loader: present, so the hub never falls through to a network fetch.
+    std::fs::write(snap.join("tokenizer_config.json"), "{}").unwrap();
     std::fs::write(snap.join("model.safetensors"), ts.bytes()).unwrap();
     let vocab: serde_json::Map<String, Value> = (0..VOCAB).map(|i| (format!("w{i}"), json!(i))).collect();
     let tok = json!({"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],

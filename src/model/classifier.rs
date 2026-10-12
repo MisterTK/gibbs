@@ -229,6 +229,7 @@ impl DecoderBackbone for GraphLm {
         self.config.hidden_dim
     }
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("decoder::last_hidden");
         Ok(self.final_hidden(ids))
     }
 }
