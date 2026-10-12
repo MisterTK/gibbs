@@ -67,7 +67,7 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
             soft_cap,
             ..
         } => kv_heads == heads && window.is_none() && soft_cap.is_none(),
-        Op::Gelu { tanh } => !*tanh,
+        Op::Gelu { .. } => true,
         _ => false,
     }
 }
@@ -509,31 +509,16 @@ pub fn run(
                     super::BinaryKind::Max => |x, y| x.max(y),
                     super::BinaryKind::Min => |x, y| x.min(y),
                 };
-                let mut out = Vec::with_capacity(a.len().max(b.len()));
-                if a.len() == b.len() {
-                    out.extend(a.iter().zip(b).map(|(&x, &y)| op_fn(x, y)));
-                } else if b.len() > 0 && a.len() % b.len() == 0 {
-                    for chunk in a.chunks(b.len()) {
-                        out.extend(chunk.iter().zip(b).map(|(&x, &y)| op_fn(x, y)));
-                    }
-                } else if a.len() > 0 && b.len() % a.len() == 0 {
-                    for chunk in b.chunks(a.len()) {
-                        out.extend(a.iter().zip(chunk).map(|(&x, &y)| op_fn(x, y)));
-                    }
-                } else if a.len() == 1 {
-                    let x = a[0];
-                    out.extend(b.iter().map(|&y| op_fn(x, y)));
-                } else if b.len() == 1 {
-                    let y = b[0];
-                    out.extend(a.iter().map(|&x| op_fn(x, y)));
-                } else {
-                    return Err(format!(
-                        "node '{name}': Binary shape mismatch {} vs {}",
-                        a.len(),
-                        b.len()
-                    ));
-                }
-                out
+                let (a_shape, b_shape) = (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape);
+                broadcast_np(a, a_shape, b, b_shape, declared_len(graph, node), op_fn)
+                    .or_else(|| tile_binary(a, b, op_fn))
+                    .ok_or_else(|| {
+                        format!(
+                            "node '{name}': Binary shape mismatch {} vs {}",
+                            a.len(),
+                            b.len()
+                        )
+                    })?
             }
             Op::Silu => {
                 let mut x = take0(&bound, &mut slots, ins, name, &last_use, i)?;
@@ -551,7 +536,13 @@ pub fn run(
                 let a_shape = &graph.value(ins[0]).shape;
                 let b_shape = &graph.value(ins[1]).shape;
                 let mut out = Vec::with_capacity(a.len().max(b.len()));
-                if a.len() == b.len() {
+                if let Some(o) =
+                    broadcast_np(a, a_shape, b, b_shape, declared_len(graph, node), |x, y| {
+                        x * y
+                    })
+                {
+                    out = o;
+                } else if a.len() == b.len() {
                     out.extend(a.iter().zip(b).map(|(&x, &y)| x * y));
                 } else if b.len() == 1 {
                     let y = b[0];
@@ -581,11 +572,9 @@ pub fn run(
                         let row = &b[r * d..(r + 1) * d];
                         out.extend(row.iter().map(|&x| scale * x));
                     }
-                } else if b.len() > 0 && a.len() % b.len() == 0 {
+                } else if let Some(o) = tile_binary(a, b, |x, y| x * y) {
                     // Column broadcasting: [m, d] * [d]
-                    for chunk in a.chunks(b.len()) {
-                        out.extend(chunk.iter().zip(b).map(|(&x, &y)| x * y));
-                    }
+                    out = o;
                 } else {
                     return Err(format!("node '{name}': Mul shape mismatch"));
                 }
@@ -1539,22 +1528,42 @@ pub fn run(
                     *causal,
                 )
             }
-            Op::Gelu { tanh: false } => {
+            Op::Gelu { tanh } => {
                 let mut x = take0(&bound, &mut slots, ins, name, &last_use, i)?;
-                nn::gelu(&mut x);
+                if *tanh {
+                    nn::gelu_tanh(&mut x);
+                } else {
+                    nn::gelu(&mut x);
+                }
                 x
             }
             Op::Add => {
-                let b_len = operand(&bound, &slots, ins, name, 1)?.len();
-                let mut a = take0(&bound, &mut slots, ins, name, &last_use, i)?;
-                if a.len() != b_len {
-                    return Err(format!(
-                        "node '{name}': Add of {} and {b_len} elements",
-                        a.len()
-                    ));
+                let (a_shape, b_shape) = (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape);
+                let np = broadcast_np(
+                    operand(&bound, &slots, ins, name, 0)?,
+                    a_shape,
+                    operand(&bound, &slots, ins, name, 1)?,
+                    b_shape,
+                    declared_len(graph, node),
+                    |x, y| x + y,
+                );
+                if let Some(o) = np {
+                    o
+                } else if operand(&bound, &slots, ins, name, 0)?.len()
+                    == operand(&bound, &slots, ins, name, 1)?.len()
+                {
+                    let mut a = take0(&bound, &mut slots, ins, name, &last_use, i)?;
+                    nn::add_in_place(&mut a, operand(&bound, &slots, ins, name, 1)?);
+                    a
+                } else {
+                    let (a, b) = (
+                        operand(&bound, &slots, ins, name, 0)?,
+                        operand(&bound, &slots, ins, name, 1)?,
+                    );
+                    tile_binary(a, b, |x, y| x + y).ok_or_else(|| {
+                        format!("node '{name}': Add of {} and {} elements", a.len(), b.len())
+                    })?
                 }
-                nn::add_in_place(&mut a, operand(&bound, &slots, ins, name, 1)?);
-                a
             }
             Op::MeanPool => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
@@ -2047,6 +2056,107 @@ fn upsample_cpu(x: &[f32], shape: &[usize], scale: usize, mode: super::UpsampleM
         }
     }
     out
+}
+
+/// Element count of a node's declared output; 0 when it has no static shape.
+fn declared_len(graph: &Graph, node: &super::Node) -> usize {
+    node.outputs
+        .first()
+        .map_or(0, |&o| match graph.value(o).shape.as_slice() {
+            [] => 0,
+            s => s.iter().product(),
+        })
+}
+
+/// numpy-style broadcast of two f32 operands over their declared shapes. `None` when a shape is
+/// unknown or disagrees with its data, the shapes are identical (callers zip flat), are not
+/// right-aligned compatible, or broadcast to other than `out_len` elements (callers tile by length).
+fn broadcast_np(
+    a: &[f32],
+    a_shape: &[usize],
+    b: &[f32],
+    b_shape: &[usize],
+    out_len: usize,
+    f: impl Fn(f32, f32) -> f32,
+) -> Option<Vec<f32>> {
+    let numel = |s: &[usize]| s.iter().product::<usize>();
+    if a_shape == b_shape
+        || a_shape.is_empty()
+        || b_shape.is_empty()
+        || numel(a_shape) != a.len()
+        || numel(b_shape) != b.len()
+    {
+        return None;
+    }
+    let r = a_shape.len().max(b_shape.len());
+    let dim = |s: &[usize], i: usize| {
+        if i + s.len() >= r {
+            s[i + s.len() - r]
+        } else {
+            1
+        }
+    };
+    let mut shape = Vec::with_capacity(r);
+    for i in 0..r {
+        let (x, y) = (dim(a_shape, i), dim(b_shape, i));
+        if x != y && x != 1 && y != 1 {
+            return None;
+        }
+        shape.push(if x == 1 { y } else { x });
+    }
+    if numel(&shape) != out_len {
+        return None;
+    }
+    // Element stride per output dim, 0 where the operand is broadcast.
+    let strides = |s: &[usize]| {
+        let mut st = vec![0usize; r];
+        let mut acc = 1;
+        for i in (0..r).rev() {
+            let d = dim(s, i);
+            st[i] = if d == 1 { 0 } else { acc };
+            acc *= d;
+        }
+        st
+    };
+    let (sa, sb) = (strides(a_shape), strides(b_shape));
+    let (inner, la, lb) = (shape[r - 1], sa[r - 1], sb[r - 1]);
+    let mut out = Vec::with_capacity(out_len);
+    let mut idx = vec![0usize; r - 1];
+    let (mut ia, mut ib) = (0usize, 0usize);
+    for _ in 0..out_len / inner.max(1) {
+        out.extend((0..inner).map(|j| f(a[ia + j * la], b[ib + j * lb])));
+        for i in (0..r - 1).rev() {
+            idx[i] += 1;
+            ia += sa[i];
+            ib += sb[i];
+            if idx[i] < shape[i] {
+                break;
+            }
+            ia -= sa[i] * shape[i];
+            ib -= sb[i] * shape[i];
+            idx[i] = 0;
+        }
+    }
+    Some(out)
+}
+
+/// `f` over equal-length operands, or with the shorter operand tiled over the longer one.
+fn tile_binary(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) -> Option<Vec<f32>> {
+    let mut out = Vec::with_capacity(a.len().max(b.len()));
+    if a.len() == b.len() {
+        out.extend(a.iter().zip(b).map(|(&x, &y)| f(x, y)));
+    } else if !b.is_empty() && a.len() % b.len() == 0 {
+        for chunk in a.chunks(b.len()) {
+            out.extend(chunk.iter().zip(b).map(|(&x, &y)| f(x, y)));
+        }
+    } else if !a.is_empty() && b.len() % a.len() == 0 {
+        for chunk in b.chunks(a.len()) {
+            out.extend(a.iter().zip(chunk).map(|(&x, &y)| f(x, y)));
+        }
+    } else {
+        return None;
+    }
+    Some(out)
 }
 
 fn dispatch_linear(
