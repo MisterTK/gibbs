@@ -752,6 +752,7 @@ impl TextModel {
                     DType::F32,
                 );
 
+                let k_raw = k;
                 let k_norm_w = g.weight(
                     format!("{p}.attn.k_norm.weight"),
                     vec![l.head_dim],
@@ -797,8 +798,20 @@ impl TextModel {
                         DType::F32,
                     )
                 } else {
-                    k
+                    // attention_k_eq_v: the value is the raw key projection, before k_norm and RoPE.
+                    k_raw
                 };
+                // The value is RMS-normalised per head without a learned gain (all-ones gamma).
+                let ones_name = format!("ones.{}", l.head_dim);
+                let ones = g.weight(ones_name.clone(), vec![l.head_dim], DType::F32);
+                w.insert(ones_name, Tensor::F32(vec![1.0; l.head_dim]));
+                let v = g.add(
+                    format!("{p}.attn.v_norm"),
+                    Op::RmsNorm { eps: self.eps },
+                    &[v, ones],
+                    vec![n, kw.rows],
+                    DType::F32,
+                );
                 (k, v)
             } else {
                 (q, q)

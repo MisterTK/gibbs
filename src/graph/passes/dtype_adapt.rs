@@ -15,8 +15,8 @@ pub fn can_cast(_op: &Op, _dtype: DType) -> bool {
 /// Retypes weights whose quant format has no GPU kernel to F32. The Metal weight upload dequantizes
 /// such tensors at load (`metal.rs`, logged per tensor), so the graph must declare what the GPU holds.
 ///
-/// Fails when a dequantized tensor would exceed 32-bit element indexing (the kernels index with
-/// `uint`): that is a gap, not an adaptation.
+/// Fails when the dequantized tensor would exceed 2 GiB: the f32 kernels read garbage (NaN logits on
+/// E4B's 2.7 GB `lm_head`) past that offset, so that is a gap, not an adaptation.
 pub fn retype_uncoded_weights(
     g: &mut Graph,
     has_kernel: &dyn Fn(crate::hardware::QuantFormat) -> bool,
@@ -27,9 +27,9 @@ pub fn retype_uncoded_weights(
                 continue;
             }
             let n: usize = v.shape.iter().product();
-            if n > i32::MAX as usize {
+            if n * 4 > i32::MAX as usize {
                 return Err(format!(
-                    "gpu-only: weight '{}' ({f:?}, {n} elements) has no GPU kernel and its f32 dequantization exceeds 32-bit indexing; run with --backend cpu to accept the CPU executor",
+                    "gpu-only: weight '{}' ({f:?}, {n} elements) has no GPU kernel and its f32 dequantization exceeds 2 GiB; run with --backend cpu to accept the CPU executor",
                     v.name
                 ));
             }

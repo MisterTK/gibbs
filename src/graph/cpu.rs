@@ -822,18 +822,22 @@ pub fn run(
                     let k_state = operand(&bound, &slots, ins, name, 3)?;
                     let v_state = operand(&bound, &slots, ins, name, 4)?;
                     let mut k_all = k_state.to_vec();
-                    let start_k = pos * kvh * hd;
-                    if start_k + k_in.len() <= k_all.len() {
-                        k_all[start_k..start_k + k_in.len()].copy_from_slice(k_in);
-                    } else {
-                        k_all.extend_from_slice(k_in);
-                    }
                     let mut v_all = v_state.to_vec();
-                    let start_v = pos * kvh * vhd;
-                    if start_v + v_in.len() <= v_all.len() {
-                        v_all[start_v..start_v + v_in.len()].copy_from_slice(v_in);
-                    } else {
-                        v_all.extend_from_slice(v_in);
+                    // A `write: false` layer reads another layer's cache, which already holds this
+                    // position; its `k`/`v` operands are placeholders and must not overwrite it.
+                    if *write {
+                        let start_k = pos * kvh * hd;
+                        if start_k + k_in.len() <= k_all.len() {
+                            k_all[start_k..start_k + k_in.len()].copy_from_slice(k_in);
+                        } else {
+                            k_all.extend_from_slice(k_in);
+                        }
+                        let start_v = pos * kvh * vhd;
+                        if start_v + v_in.len() <= v_all.len() {
+                            v_all[start_v..start_v + v_in.len()].copy_from_slice(v_in);
+                        } else {
+                            v_all.extend_from_slice(v_in);
+                        }
                     }
                     (k_all, v_all, pos)
                 } else {
@@ -894,11 +898,20 @@ pub fn run(
                     }
                 }
                 if *write && ins.len() >= 6 {
-                    if let ValueKind::State(sname) = &graph.value(ins[3]).kind {
-                        state.insert(sname, Tensor::F32(k_buf.clone()));
-                    }
-                    if let ValueKind::State(sname) = &graph.value(ins[4]).kind {
-                        state.insert(sname, Tensor::F32(v_buf.clone()));
+                    for (slot_id, buf) in [(ins[3], &k_buf), (ins[4], &v_buf)] {
+                        if let ValueKind::State(sname) = &graph.value(slot_id).kind {
+                            state.insert(sname, Tensor::F32(buf.clone()));
+                            // Layers sharing this cache (`write: false`) hold their own value ids
+                            // for the same state; they must see this step's write.
+                            for (j, v) in graph.values.iter().enumerate() {
+                                if matches!(&v.kind, ValueKind::State(n) if n == sname)
+                                    && slots[j].is_some()
+                                    && j != slot_id.0 as usize
+                                {
+                                    slots[j] = Some(Tensor::F32(buf.clone()));
+                                }
+                            }
+                        }
                     }
                 }
                 out
