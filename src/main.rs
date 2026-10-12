@@ -166,15 +166,9 @@ fn parse_quant(s: &str) -> Result<QuantMode, String> {
     })
 }
 
-/// One CLI text-to-video generation with an LTX-Video pipeline (diffusers repo or `ltxv` GGUF), CPU only.
-fn run_ltx(
-    cli: &Cli,
-    hub: &HuggingFaceHub,
-    plan: &ltx::Plan,
-    backend: Device,
-) -> Result<(), String> {
+/// One CLI text-to-video generation with an LTX-Video pipeline (diffusers repo or `ltxv` GGUF).
+fn run_ltx(cli: &Cli, hub: &HuggingFaceHub, plan: &ltx::Plan) -> Result<(), String> {
     let model = &cli.model;
-    gibbs_engine::graph::avenues::family_gate(gibbs_engine::graph::avenues::Family::VideoLtx, backend)?;
     let Some(prompt) = cli.prompt.as_deref() else {
         return Err(format!(
             "'{model}' is a text-to-video model; the HTTP server, daemon and TUI have no video endpoint. \
@@ -372,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Text-to-video is chosen by the checkpoint's model_index.json / hub GGUF architecture, never by the model id.
     if !cli.system1 {
         if let Some(plan) = ltx::resolve(&hub, &cli.model, cli.quant.as_deref()) {
-            return run_ltx(&cli, &hub, &plan?, backend).map_err(Into::into);
+            return run_ltx(&cli, &hub, &plan?).map_err(Into::into);
         }
     }
     if !cli.system1 && TextToVideoPipeline::is_t2v_repo(&hub, &cli.model) {
