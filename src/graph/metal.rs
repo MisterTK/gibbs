@@ -206,14 +206,9 @@ const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
     [256, 384, 1536],
 ];
 const ATTN_MAX_HEAD_DIM: usize = 512;
-const BASE_KERNELS: [&str; 62] = [
+const BASE_KERNELS: [&str; 50] = [
     "embedding_f32",
-    "add_f32",
-    "gelu_erf_f32",
-    "gelu_tanh_f32",
-    "conv2d_f32",
     "layer_norm_f32",
-    "attention_f32",
     "mean_pool_f32",
     "l2_normalize_f32",
     "noop",
@@ -253,7 +248,6 @@ const BASE_KERNELS: [&str; 62] = [
     "gemm_batched_q8_0_none",
     "gemm_batched_q8_0_gelu",
     "gemm_batched_q8_0_residual",
-    "slice_f32",
     "rope_general_f32",
     "kv_append_batched",
     "attn_cached_f32",
@@ -261,12 +255,6 @@ const BASE_KERNELS: [&str; 62] = [
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
-    "topk_softmax_f32",
-    "mul_f32",
-    "softcap_f32",
-    "silu_f32",
-    "sigmoid_f32",
-    "softplus_f32",
     "gemv_nvfp4",
     "gemv_jesse_lut",
 ];
@@ -2157,74 +2145,6 @@ impl Session {
                 set_bytes(enc, 3, &[u32_of(n)?, u32_of(d)?]);
                 grid1(n * d);
             }
-            Step::Add { a, b, n } => {
-                enc.set_compute_pipeline_state(rt.pso("add_f32")?);
-                bind(0, a);
-                bind(1, b);
-                bind(2, s.out);
-                set_bytes(enc, 3, &u32_of(n)?);
-                grid1(n);
-            }
-            Step::Gelu { x, n, tanh } => {
-                let pso_name = if tanh {
-                    "gelu_tanh_f32"
-                } else {
-                    "gelu_erf_f32"
-                };
-                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                bind(0, x);
-                bind(1, s.out);
-                set_bytes(enc, 2, &u32_of(n)?);
-                grid1(n);
-            }
-            Step::Conv2d {
-                x,
-                w,
-                bias,
-                in_channels,
-                in_h,
-                in_w,
-                out_channels,
-                kernel_size,
-                stride,
-                out_h,
-                out_w,
-            } => {
-                enc.set_compute_pipeline_state(rt.pso("conv2d_f32")?);
-                bind(0, x);
-                bind(1, w);
-                if let Some(b) = bias {
-                    bind(2, b);
-                } else {
-                    bind(2, x);
-                }
-                bind(3, s.out);
-                #[repr(C)]
-                struct Conv2dParams {
-                    in_channels: u32,
-                    in_h: u32,
-                    in_w: u32,
-                    out_channels: u32,
-                    kernel_size: u32,
-                    stride: u32,
-                    out_h: u32,
-                    out_w: u32,
-                    has_bias: u32,
-                }
-                let p = Conv2dParams {
-                    in_channels: in_channels as u32,
-                    in_h: in_h as u32,
-                    in_w: in_w as u32,
-                    out_channels: out_channels as u32,
-                    kernel_size: kernel_size as u32,
-                    stride: stride as u32,
-                    out_h: out_h as u32,
-                    out_w: out_w as u32,
-                    has_bias: if bias.is_some() { 1 } else { 0 },
-                };
-                set_bytes(enc, 4, &p);
-                grid1(out_channels * out_h * out_w);
-            }
             Step::LayerNorm {
                 x,
                 g,
@@ -2240,37 +2160,6 @@ impl Session {
                 bind(3, s.out);
                 set_bytes(enc, 4, &[u32_of(d)?, eps.to_bits()]);
                 enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(TG, 1, 1));
-            }
-            Step::Attention {
-                q,
-                k,
-                v,
-                nq,
-                nk,
-                heads,
-                head_dim,
-                causal,
-            } => {
-                enc.set_compute_pipeline_state(rt.pso("attention_f32")?);
-                bind(0, q);
-                bind(1, k);
-                bind(2, v);
-                bind(3, s.out);
-                #[repr(C)]
-                struct AttnParams(u32, u32, u32, u32, u32, f32);
-                let p = AttnParams(
-                    u32_of(nq)?,
-                    u32_of(nk)?,
-                    u32_of(heads)?,
-                    u32_of(head_dim)?,
-                    causal as u32,
-                    1.0 / (head_dim as f32).sqrt(),
-                );
-                set_bytes(enc, 4, &p);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(heads as u64, nq as u64, 1),
-                    MTLSize::new(TG4, 1, 1),
-                );
             }
             Step::MeanPool { x, mask, n, d } => {
                 enc.set_compute_pipeline_state(rt.pso("mean_pool_f32")?);
@@ -2470,32 +2359,6 @@ impl Session {
                 bind(2, s.out);
                 set_bytes(enc, 3, &u32_of(n)?);
                 grid1(n);
-            }
-            Step::Slice {
-                x,
-                rows,
-                in_cols,
-                start,
-                out_cols,
-            } => {
-                enc.set_compute_pipeline_state(rt.pso("slice_f32")?);
-                bind(0, x);
-                bind(1, s.out);
-                #[repr(C)]
-                struct SliceParams {
-                    rows: u32,
-                    in_cols: u32,
-                    start: u32,
-                    out_cols: u32,
-                }
-                let p = SliceParams {
-                    rows: rows as u32,
-                    in_cols: in_cols as u32,
-                    start: start as u32,
-                    out_cols: out_cols as u32,
-                };
-                set_bytes(enc, 2, &p);
-                grid1(rows * out_cols);
             }
             Step::Rope {
                 x,
@@ -2796,84 +2659,6 @@ impl Session {
                     MTLSize::new(32, 1, 1),
                 );
             }
-            Step::TopKSoftmax { x, rows, cols, k } => {
-                enc.set_compute_pipeline_state(rt.pso("topk_softmax_f32")?);
-                bind(0, x);
-                bind(1, s.out);
-                #[repr(C)]
-                struct TopKSoftmaxParams {
-                    rows: u32,
-                    cols: u32,
-                    k: u32,
-                }
-                let p = TopKSoftmaxParams {
-                    rows: rows as u32,
-                    cols: cols as u32,
-                    k: k as u32,
-                };
-                set_bytes(enc, 2, &p);
-                grid1(rows);
-            }
-            Step::Mul {
-                a,
-                b,
-                total,
-                a_len,
-                b_len,
-                row_broadcast,
-                d,
-            } => {
-                enc.set_compute_pipeline_state(rt.pso("mul_f32")?);
-                bind(0, a);
-                bind(1, b);
-                bind(2, s.out);
-                #[repr(C)]
-                struct MulParams {
-                    total: u32,
-                    a_len: u32,
-                    b_len: u32,
-                    row_broadcast: u32,
-                    d: u32,
-                }
-                let p = MulParams {
-                    total: total as u32,
-                    a_len: a_len as u32,
-                    b_len: b_len as u32,
-                    row_broadcast: row_broadcast as u32,
-                    d: d as u32,
-                };
-                set_bytes(enc, 3, &p);
-                grid1(total);
-            }
-            Step::SoftCap { x, cap, n } => {
-                enc.set_compute_pipeline_state(rt.pso("softcap_f32")?);
-                bind(0, x);
-                bind(1, s.out);
-                set_bytes(enc, 2, &cap);
-                set_bytes(enc, 3, &(n as u32));
-                grid1(n);
-            }
-            Step::Silu { x, n } => {
-                enc.set_compute_pipeline_state(rt.pso("silu_f32")?);
-                bind(0, x);
-                bind(1, s.out);
-                set_bytes(enc, 2, &u32_of(n)?);
-                grid1(n);
-            }
-            Step::Sigmoid { x, n } => {
-                enc.set_compute_pipeline_state(rt.pso("sigmoid_f32")?);
-                bind(0, x);
-                bind(1, s.out);
-                set_bytes(enc, 2, &u32_of(n)?);
-                grid1(n);
-            }
-            Step::Softplus { x, n } => {
-                enc.set_compute_pipeline_state(rt.pso("softplus_f32")?);
-                bind(0, x);
-                bind(1, s.out);
-                set_bytes(enc, 2, &u32_of(n)?);
-                grid1(n);
-            }
             Step::MegakernelMlp {
                 x,
                 norm_w,
@@ -3010,29 +2795,6 @@ pub enum Step {
         d: usize,
         rows: usize,
     },
-    Add {
-        a: ValueId,
-        b: ValueId,
-        n: usize,
-    },
-    Gelu {
-        x: ValueId,
-        n: usize,
-        tanh: bool,
-    },
-    Conv2d {
-        x: ValueId,
-        w: ValueId,
-        bias: Option<ValueId>,
-        in_channels: usize,
-        in_h: usize,
-        in_w: usize,
-        out_channels: usize,
-        kernel_size: usize,
-        stride: usize,
-        out_h: usize,
-        out_w: usize,
-    },
     LayerNorm {
         x: ValueId,
         g: ValueId,
@@ -3050,16 +2812,6 @@ pub enum Step {
         m: usize,
         n: usize,
         k: usize,
-    },
-    Attention {
-        q: ValueId,
-        k: ValueId,
-        v: ValueId,
-        nq: usize,
-        nk: usize,
-        heads: usize,
-        head_dim: usize,
-        causal: bool,
     },
     MeanPool {
         x: ValueId,
@@ -3110,13 +2862,6 @@ pub enum Step {
         gate: ValueId,
         up: ValueId,
         n: usize,
-    },
-    Slice {
-        x: ValueId,
-        rows: usize,
-        in_cols: usize,
-        start: usize,
-        out_cols: usize,
     },
     Rope {
         x: ValueId,
@@ -3186,38 +2931,6 @@ pub enum Step {
         val_heads: usize,
         key_dim: usize,
         val_dim: usize,
-    },
-    TopKSoftmax {
-        x: ValueId,
-        rows: usize,
-        cols: usize,
-        k: usize,
-    },
-    Mul {
-        a: ValueId,
-        b: ValueId,
-        total: usize,
-        a_len: usize,
-        b_len: usize,
-        row_broadcast: bool,
-        d: usize,
-    },
-    SoftCap {
-        x: ValueId,
-        cap: f32,
-        n: usize,
-    },
-    Silu {
-        x: ValueId,
-        n: usize,
-    },
-    Sigmoid {
-        x: ValueId,
-        n: usize,
-    },
-    Softplus {
-        x: ValueId,
-        n: usize,
     },
     MegakernelMlp {
         x: ValueId,
@@ -3554,110 +3267,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     xl,
                 )
             }
-            Op::Attention {
-                heads,
-                kv_heads,
-                causal,
-                window,
-                soft_cap,
-            } => {
-                if kv_heads != heads || window.is_some() || soft_cap.is_some() {
-                    return Err(format!(
-                        "node '{name}': Attention with kv_heads != heads, window, or soft_cap is not implemented"
-                    ));
-                }
-                let (q, k, v) = (arg(0)?, arg(1)?, arg(2)?);
-                let width = g.value(q).shape.last().copied().unwrap_or(0);
-                let (ql, kl) = (n_of(q)?, n_of(k)?);
-                if *heads == 0
-                    || width == 0
-                    || width % heads != 0
-                    || ql % width != 0
-                    || kl % width != 0
-                    || kl == 0
-                    || n_of(v)? != kl
-                {
-                    return Err(format!(
-                        "node '{name}': q/k/v shapes do not fit {heads} heads"
-                    ));
-                }
-                let head_dim = width / heads;
-                if head_dim > ATTN_MAX_HEAD_DIM {
-                    return Err(format!("node '{name}': head_dim {head_dim} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}"));
-                }
-                (
-                    Step::Attention {
-                        q,
-                        k,
-                        v,
-                        nq: ql / width,
-                        nk: kl / width,
-                        heads: *heads,
-                        head_dim,
-                        causal: *causal,
-                    },
-                    ql,
-                )
-            }
-            Op::Gelu { tanh } => {
-                let x = arg(0)?;
-                (
-                    Step::Gelu {
-                        x,
-                        n: n_of(x)?,
-                        tanh: *tanh,
-                    },
-                    n_of(x)?,
-                )
-            }
-            Op::Conv2d {
-                stride, padding, ..
-            } => {
-                let x = arg(0)?;
-                let w = arg(1)?;
-                let bias = if node.inputs.len() > 2 {
-                    Some(node.inputs[2])
-                } else {
-                    None
-                };
-                let x_shape = &g.value(x).shape;
-                let w_shape = &g.value(w).shape;
-                let in_channels = x_shape.first().copied().unwrap_or(1);
-                let in_h = x_shape.get(1).copied().unwrap_or(1);
-                let in_w = x_shape.get(2).copied().unwrap_or(1);
-                let out_channels = w_shape.first().copied().unwrap_or(1);
-                let kernel_size = w_shape.get(2).copied().unwrap_or(1);
-                let s = stride[0].max(1);
-                let pad_h = padding.first().copied().unwrap_or(0);
-                let pad_w = padding.get(1).copied().unwrap_or(0);
-                let out_h = (in_h + 2 * pad_h).saturating_sub(kernel_size) / s + 1;
-                let out_w = (in_w + 2 * pad_w).saturating_sub(kernel_size) / s + 1;
-                let out_elems = out_channels * out_h * out_w;
-                (
-                    Step::Conv2d {
-                        x,
-                        w,
-                        bias,
-                        in_channels,
-                        in_h,
-                        in_w,
-                        out_channels,
-                        kernel_size,
-                        stride: s,
-                        out_h,
-                        out_w,
-                    },
-                    out_elems,
-                )
-            }
-            Op::Add => {
-                let (a, b) = (arg(0)?, arg(1)?);
-                let (al, bl) = (n_of(a)?, n_of(b)?);
-                if al != bl {
-                    return Err(format!("node '{name}': Add of {al} and {bl} elements"));
-                }
-                (Step::Add { a, b, n: al }, al)
-            }
             Op::MeanPool => {
                 let (x, mask) = (arg(0)?, arg(1)?);
                 let d = g.value(x).shape.last().copied().unwrap_or(0);
@@ -3701,47 +3310,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let (gate, up) = (arg(0)?, arg(1)?);
                 let n = n_of(gate)?;
                 (Step::GeGlu { gate, up, n }, n)
-            }
-            Op::Slice {
-                axis: _,
-                start,
-                end,
-            } => {
-                let x = arg(0)?;
-                let x_shape = &g.value(x).shape;
-                let (rows, in_cols) = if x_shape.len() >= 2 {
-                    let cols = *x_shape.last().unwrap();
-                    (n_of(x)? / cols, cols)
-                } else {
-                    (1, n_of(x)?)
-                };
-                let st = if *start < 0 {
-                    (in_cols as i64 + *start).max(0) as usize
-                } else {
-                    *start as usize
-                };
-                let en = if *end < 0 {
-                    (in_cols as i64 + *end).max(0) as usize
-                } else {
-                    (*end as usize).min(in_cols)
-                };
-                let out_cols = en.saturating_sub(st);
-                if rows == 1 {
-                    let (root_src, base_off) = aliases.get(&x).copied().unwrap_or((x, 0));
-                    aliases.insert(out, (root_src, base_off + st * 4));
-                    fused[i] = true;
-                    continue;
-                }
-                (
-                    Step::Slice {
-                        x,
-                        rows,
-                        in_cols,
-                        start: st,
-                        out_cols,
-                    },
-                    rows * out_cols,
-                )
             }
             Op::Rope {
                 head_dim,
@@ -3958,68 +3526,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     n * vh * vd,
                 )
             }
-            Op::Softmax { axis: _ } | Op::TopKSoftmax { axis: _, .. } => {
-                let x = arg(0)?;
-                let x_shape = &g.value(x).shape;
-                let cols = x_shape.last().copied().unwrap_or(1);
-                let xl = n_of(x)?;
-                let rows = xl / cols.max(1);
-                let k_val = match node.op {
-                    Op::TopKSoftmax { k, .. } => k,
-                    _ => cols,
-                };
-                (
-                    Step::TopKSoftmax {
-                        x,
-                        rows,
-                        cols,
-                        k: k_val,
-                    },
-                    xl,
-                )
-            }
-            Op::Mul => {
-                let (a, b) = (arg(0)?, arg(1)?);
-                let (al, bl) = (n_of(a)?, n_of(b)?);
-                let a_shape = &g.value(a).shape;
-                let b_shape = &g.value(b).shape;
-                let (row_broadcast, d) = if a_shape.len() >= 2
-                    && b_shape.len() >= 2
-                    && b_shape.last() == Some(&1)
-                    && a_shape[0] == b_shape[0]
-                {
-                    (true, al / bl.max(1))
-                } else {
-                    (false, 1)
-                };
-                let total = al.max(bl);
-                (
-                    Step::Mul {
-                        a,
-                        b,
-                        total,
-                        a_len: al,
-                        b_len: bl,
-                        row_broadcast,
-                        d,
-                    },
-                    total,
-                )
-            }
-            Op::Silu => {
-                let x = arg(0)?;
-                (Step::Silu { x, n: n_of(x)? }, n_of(x)?)
-            }
-            Op::Unary { kind } => {
-                let x = arg(0)?;
-                let n = n_of(x)?;
-                match kind {
-                    crate::graph::UnaryKind::SoftCap(cap) => (Step::SoftCap { x, cap: *cap, n }, n),
-                    crate::graph::UnaryKind::Sigmoid => (Step::Sigmoid { x, n }, n),
-                    crate::graph::UnaryKind::Softplus => (Step::Softplus { x, n }, n),
-                    _ => return Err(format!("Metal executor: unsupported unary kind {kind:?}")),
-                }
-            }
             Op::Megakernel(desc) => match &desc.kind {
                 crate::graph::MegakernelKind::Mlp {
                     hidden_dim,
@@ -4075,11 +3581,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
         let reads = match op {
             Step::Ext(ref st) => ext::reads(st),
             Step::Embedding { table, ids, .. } => vec![table, ids],
-            Step::Add { a, b, .. } => vec![a, b],
-            Step::Gelu { x, .. } | Step::L2Normalize { x, .. } => vec![x],
-            Step::Conv2d { x, w, bias, .. } => {
-                [Some(x), Some(w), bias].into_iter().flatten().collect()
-            }
+            Step::L2Normalize { x, .. } => vec![x],
             Step::LayerNorm { x, g, b, .. } => vec![x, g, b],
             Step::Linear {
                 x, w, bias, res, ..
@@ -4099,11 +3601,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 .into_iter()
                 .flatten()
                 .collect(),
-            Step::Attention { q, k, v, .. } => vec![q, k, v],
             Step::MeanPool { x, mask, .. } => vec![x, mask],
             Step::RmsNorm { x, g, .. } => vec![x, g],
             Step::SwiGlu { gate, up, .. } | Step::GeGlu { gate, up, .. } => vec![gate, up],
-            Step::Slice { x, .. } => vec![x],
             Step::Rope {
                 x, pos, inv_freq, ..
             } => vec![x, pos, inv_freq],
@@ -4152,12 +3652,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .into_iter()
             .flatten()
             .collect(),
-            Step::TopKSoftmax { x, .. } => vec![x],
-            Step::Mul { a, b, .. } => vec![a, b],
-            Step::SoftCap { x, .. }
-            | Step::Silu { x, .. }
-            | Step::Sigmoid { x, .. }
-            | Step::Softplus { x, .. } => vec![x],
             Step::MegakernelMlp {
                 x,
                 norm_w,

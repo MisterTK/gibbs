@@ -239,51 +239,6 @@ kernel void embedding_f32(device const float* table [[buffer(0)]],
     out[i] = table[(ulong)ids[i / p.d] * p.d + i % p.d];
 }
 
-kernel void add_f32(device const float* a [[buffer(0)]],
-                    device const float* b [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant uint& n [[buffer(3)]],
-                    uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = a[i] + b[i];
-}
-
-kernel void gelu_erf_f32(device const float* x [[buffer(0)]],
-                         device float* out [[buffer(1)]],
-                         constant uint& n [[buffer(2)]],
-                         uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = gelu_erf(x[i]);
-}
-
-kernel void silu_f32(device const float* x [[buffer(0)]],
-                     device float* out [[buffer(1)]],
-                     constant uint& n [[buffer(2)]],
-                     uint i [[thread_position_in_grid]]) {
-    if (i < n) {
-        float val = x[i];
-        out[i] = val / (1.0f + exp(-val));
-    }
-}
-
-kernel void sigmoid_f32(device const float* x [[buffer(0)]],
-                        device float* out [[buffer(1)]],
-                        constant uint& n [[buffer(2)]],
-                        uint i [[thread_position_in_grid]]) {
-    if (i < n) {
-        float val = x[i];
-        out[i] = 1.0f / (1.0f + exp(-val));
-    }
-}
-
-kernel void softplus_f32(device const float* x [[buffer(0)]],
-                         device float* out [[buffer(1)]],
-                         constant uint& n [[buffer(2)]],
-                         uint i [[thread_position_in_grid]]) {
-    if (i < n) {
-        float val = x[i];
-        out[i] = val > 20.0f ? val : log(1.0f + exp(val));
-    }
-}
-
 // LayerNorm of one row per threadgroup: mean, then biased variance, like `nn::layer_norm`.
 kernel void layer_norm_f32(device const float* x [[buffer(0)]],
                            device const float* g [[buffer(1)]],
@@ -309,76 +264,6 @@ kernel void layer_norm_f32(device const float* x [[buffer(0)]],
     }
     float inv = 1.0f / sqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
     for (uint i = tid; i < p.d; i += tpg) o[i] = (xr[i] - mean) * inv * g[i] + b[i];
-}
-
-// Scaled dot-product attention without a score matrix: one threadgroup per (head, query row). Its
-// simdgroups split the keys, each keeping an online softmax; the partials merge at the end.
-// Rows of q/k/v/out are heads*head_dim floats. Causal: query i sees keys 0..=i (as `nn::attention`).
-kernel void attention_f32(device const float* q [[buffer(0)]],
-                          device const float* k [[buffer(1)]],
-                          device const float* v [[buffer(2)]],
-                          device float* out [[buffer(3)]],
-                          constant AttnParams& p [[buffer(4)]],
-                          uint2 tg [[threadgroup_position_in_grid]],
-                          uint sg [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]],
-                          uint nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float tg_m[ATTN_MAX_SG];
-    threadgroup float tg_l[ATTN_MAX_SG];
-    threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    const uint head = tg.x, qi = tg.y;
-    const uint hd = p.head_dim, stride = p.heads * hd, row = ATTN_MAX_PER_LANE * 32;
-    device const float* qh = q + (ulong)qi * stride + head * hd;
-    const uint len = p.causal ? min(p.nk, qi + 1) : p.nk;
-
-    float qr[ATTN_MAX_PER_LANE];
-    float acc[ATTN_MAX_PER_LANE];
-    for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-        uint d = lane + 32 * j;
-        qr[j] = d < hd ? qh[d] : 0.0f;
-        acc[j] = 0.0f;
-    }
-    float m = -FLT_MAX;
-    float l = 0.0f;
-    for (uint t = sg; t < len; t += nsg) {
-        device const float* kt = k + (ulong)t * stride + head * hd;
-        device const float* vt = v + (ulong)t * stride + head * hd;
-        float s = 0.0f;
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-            uint d = lane + 32 * j;
-            if (d < hd) s += qr[j] * kt[d];
-        }
-        s = simd_sum(s) * p.scale;
-        float m_new = max(m, s);
-        float corr = exp(m - m_new);
-        float e = exp(s - m_new);
-        l = l * corr + e;
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-            uint d = lane + 32 * j;
-            if (d < hd) acc[j] = acc[j] * corr + e * vt[d];
-        }
-        m = m_new;
-    }
-    if (lane == 0) {
-        tg_m[sg] = m;
-        tg_l[sg] = l;
-    }
-    for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
-        uint d = lane + 32 * j;
-        if (d < hd) tg_acc[sg * row + d] = acc[j];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float gm = -FLT_MAX;
-    for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[i]);
-    float gl = 0.0f;
-    for (uint i = 0; i < nsg; ++i) gl += tg_l[i] * exp(tg_m[i] - gm);
-    device float* o = out + (ulong)qi * stride + head * hd;
-    for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
-        float a = 0.0f;
-        for (uint i = 0; i < nsg; ++i) a += tg_acc[i * row + d] * exp(tg_m[i] - gm);
-        o[d] = a / gl;
-    }
 }
 
 // Mean of the rows whose mask entry is non-zero (count clamped to 1), one thread per column.
@@ -1693,17 +1578,6 @@ struct SliceParams {
     uint out_cols;
 };
 
-kernel void slice_f32(device const float* x [[buffer(0)]],
-                      device float* out [[buffer(1)]],
-                      constant SliceParams& p [[buffer(2)]],
-                      uint gid [[thread_position_in_grid]]) {
-    uint total = p.rows * p.out_cols;
-    if (gid >= total) return;
-    uint r = gid / p.out_cols;
-    uint c = gid % p.out_cols;
-    out[gid] = x[(ulong)r * p.in_cols + (p.start + c)];
-}
-
 struct GraphRopeParams2 {
     uint n_heads;
     uint head_dim;
@@ -2118,71 +1992,6 @@ struct TopKSoftmaxParams {
     uint k;
 };
 
-kernel void topk_softmax_f32(device const float* x [[buffer(0)]],
-                             device float* out [[buffer(1)]],
-                             constant TopKSoftmaxParams& p [[buffer(2)]],
-                             uint row [[thread_position_in_grid]]) {
-    if (row >= p.rows) return;
-    device const float* xr = x + (ulong)row * p.cols;
-    device float* yr = out + (ulong)row * p.cols;
-    uint n = p.cols;
-    uint k = min(p.k, n);
-
-    for (uint i = 0; i < n; ++i) yr[i] = 0.0f;
-
-    float max_val = -1e38f;
-    for (uint i = 0; i < n; ++i) {
-        if (xr[i] > max_val) max_val = xr[i];
-    }
-
-    if (k >= n) {
-        float sum_e = 0.0f;
-        for (uint i = 0; i < n; ++i) {
-            float e = exp(xr[i] - max_val);
-            yr[i] = e;
-            sum_e += e;
-        }
-        float inv = 1.0f / max(sum_e, 1e-12f);
-        for (uint i = 0; i < n; ++i) yr[i] *= inv;
-        return;
-    }
-
-    uint top_indices[32];
-    float top_values[32];
-    uint cap_k = min(k, 32u);
-    for (uint ki = 0; ki < cap_k; ++ki) {
-        top_values[ki] = -1e38f;
-        top_indices[ki] = 0;
-    }
-
-    for (uint i = 0; i < n; ++i) {
-        float v = xr[i];
-        if (v > top_values[cap_k - 1]) {
-            uint pos = cap_k - 1;
-            while (pos > 0 && v > top_values[pos - 1]) {
-                top_values[pos] = top_values[pos - 1];
-                top_indices[pos] = top_indices[pos - 1];
-                pos--;
-            }
-            top_values[pos] = v;
-            top_indices[pos] = i;
-        }
-    }
-
-    float top_max = top_values[0];
-    float sum_e = 0.0f;
-    float top_exp[32];
-    for (uint ki = 0; ki < cap_k; ++ki) {
-        float e = exp(top_values[ki] - top_max);
-        top_exp[ki] = e;
-        sum_e += e;
-    }
-    float inv = 1.0f / max(sum_e, 1e-12f);
-    for (uint ki = 0; ki < cap_k; ++ki) {
-        yr[top_indices[ki]] = top_exp[ki] * inv;
-    }
-}
-
 struct MulParams {
     uint total;
     uint a_len;
@@ -2190,35 +1999,6 @@ struct MulParams {
     uint row_broadcast;
     uint d;
 };
-
-kernel void mul_f32(device const float* a [[buffer(0)]],
-                    device const float* b [[buffer(1)]],
-                    device float* out [[buffer(2)]],
-                    constant MulParams& p [[buffer(3)]],
-                    uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.total) return;
-    if (p.a_len == p.b_len) {
-        out[gid] = a[gid] * b[gid];
-    } else if (p.b_len == 1) {
-        out[gid] = a[gid] * b[0];
-    } else if (p.row_broadcast != 0) {
-        uint r = gid / p.d;
-        out[gid] = a[gid] * b[r];
-    } else {
-        uint c = gid % p.b_len;
-        out[gid] = a[gid] * b[c];
-    }
-}
-
-kernel void softcap_f32(device const float* x [[buffer(0)]],
-                        device float* out [[buffer(1)]],
-                        constant float& cap [[buffer(2)]],
-                        constant uint& n [[buffer(3)]],
-                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
-    float v = x[gid];
-    out[gid] = tanh(v / cap) * cap;
-}
 
 constant const float nvfp4_e2m1_lut[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -2338,13 +2118,6 @@ kernel void gemv_jesse_lut(
     y[gid] = float(accum);
 }
 
-kernel void gelu_tanh_f32(device const float* x [[buffer(0)]],
-                          device float* out [[buffer(1)]],
-                          constant uint& n [[buffer(2)]],
-                          uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = gelu_tanh(x[i]);
-}
-
 struct Conv2dParams {
     uint in_channels;
     uint in_h;
@@ -2357,36 +2130,3 @@ struct Conv2dParams {
     uint has_bias;
 };
 
-kernel void conv2d_f32(device const float* in [[buffer(0)]],
-                       device const float* weights [[buffer(1)]],
-                       device const float* bias [[buffer(2)]],
-                       device float* out [[buffer(3)]],
-                       constant Conv2dParams& p [[buffer(4)]],
-                       uint gid [[thread_position_in_grid]]) {
-    uint total = p.out_channels * p.out_h * p.out_w;
-    if (gid >= total) return;
-
-    uint ow = gid % p.out_w;
-    uint rem = gid / p.out_w;
-    uint oh = rem % p.out_h;
-    uint oc = rem / p.out_h;
-
-    float sum = p.has_bias ? bias[oc] : 0.0f;
-    uint ih_base = oh * p.stride;
-    uint iw_base = ow * p.stride;
-
-    for (uint ic = 0; ic < p.in_channels; ic++) {
-        for (uint kh = 0; kh < p.kernel_size; kh++) {
-            for (uint kw = 0; kw < p.kernel_size; kw++) {
-                uint ih = ih_base + kh;
-                uint iw = iw_base + kw;
-                if (ih < p.in_h && iw < p.in_w) {
-                    float val = in[(ic * p.in_h + ih) * p.in_w + iw];
-                    float w_val = weights[((oc * p.in_channels + ic) * p.kernel_size + kh) * p.kernel_size + kw];
-                    sum += val * w_val;
-                }
-            }
-        }
-    }
-    out[gid] = sum;
-}
