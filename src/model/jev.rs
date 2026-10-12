@@ -4,6 +4,7 @@
 
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
 use crate::hardware::Device;
+use crate::model::classifier::head::{Gb, HeadGraph};
 use crate::model::hub::HuggingFaceHub;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -126,9 +127,12 @@ pub struct BertDims {
 /// sentence embeddings; the sequence classifiers read its last hidden states.
 pub struct BertEncoder {
     pub dims: BertDims,
-    /// Every encoder tensor under its BERT name (`embeddings.*`, `encoder.layer.N.*`).
+    /// Every encoder tensor under its BERT name (`embeddings.*`, `encoder.layer.N.*`), plus the
+    /// `head.*` tensors of a classification head.
     weights: Weights,
     executor: Executor,
+    /// A classification head compiled into the graph ([`BertEncoder::run_head`]).
+    head: Option<HeadGraph>,
 }
 
 /// Where the encoder graph runs.
@@ -146,7 +150,17 @@ impl BertEncoder {
     pub fn load(
         dims: BertDims,
         device: Device,
+        tensor: impl FnMut(&str, &[usize]) -> Result<Vec<f32>, String>,
+    ) -> Result<Self, String> {
+        Self::load_with_head(dims, device, tensor, None)
+    }
+
+    /// [`BertEncoder::load`] with a classification head built into the graph.
+    pub fn load_with_head(
+        dims: BertDims,
+        device: Device,
         mut tensor: impl FnMut(&str, &[usize]) -> Result<Vec<f32>, String>,
+        head: Option<HeadGraph>,
     ) -> Result<Self, String> {
         if dims.num_heads == 0 || dims.hidden_size % dims.num_heads != 0 {
             return Err(format!(
@@ -205,6 +219,11 @@ impl BertEncoder {
             }
             weights.insert(name, Tensor::F32(v));
         }
+        if let Some(hd) = &head {
+            for (name, t) in hd.weights(h).iter() {
+                weights.insert(name, t.clone());
+            }
+        }
 
         let executor = match device {
             Device::Cpu => Executor::Cpu,
@@ -231,6 +250,7 @@ impl BertEncoder {
             dims,
             weights,
             executor,
+            head,
         })
     }
 
@@ -263,7 +283,7 @@ impl BertEncoder {
 
     /// The encoder graph for `n` tokens: embeddings, BERT layers, then mean pooling and L2
     /// normalisation when `pooled` (else the last hidden states `[n, h]`).
-    fn graph(&self, n: usize, pooled: bool) -> Graph {
+    fn graph(&self, n: usize, pooled: bool, head: bool) -> Graph {
         let d = &self.dims;
         let (h, inter, eps) = (d.hidden_size, d.intermediate_size, d.layer_norm_eps);
         let mut g = Graph::new();
@@ -376,12 +396,25 @@ impl BertEncoder {
             );
         }
 
-        if pooled {
+        if head {
+            let hd = self.head.as_ref().expect("a head graph needs a head");
+            let mut gb = Gb::from_graph(g, false);
+            x = hd.nodes(&mut gb, x, Some(mask)).expect("mask supplied");
+            g = gb.g;
+        } else if pooled {
             let pooled = g.add("mean_pool", Op::MeanPool, &[x, mask], vec![h], f);
             x = g.add("l2_normalize", Op::L2Normalize, &[pooled], vec![h], f);
         }
         g.output(x);
         g
+    }
+
+    /// Scores `[labels]` of one unpadded sequence: the encoder, then the head built at load.
+    pub fn run_head(&self, ids: &[u32], positions: &[u32], types: &[u32]) -> Result<Vec<f32>, String> {
+        if self.head.is_none() {
+            return Err("this encoder was loaded without a classification head".into());
+        }
+        self.exec(ids, positions, types, false, true)
     }
 
     /// Runs one unpadded sequence: the mean-pooled, L2-normalised embedding `[h]` when `pooled`,
@@ -392,6 +425,17 @@ impl BertEncoder {
         positions: &[u32],
         types: &[u32],
         pooled: bool,
+    ) -> Result<Vec<f32>, String> {
+        self.exec(ids, positions, types, pooled, false)
+    }
+
+    fn exec(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        types: &[u32],
+        pooled: bool,
+        head: bool,
     ) -> Result<Vec<f32>, String> {
         let n = ids.len();
         if n == 0 {
@@ -409,7 +453,7 @@ impl BertEncoder {
             Tensor::U32(types.to_vec()),
             Tensor::U32(vec![1; n]),
         ];
-        let graph = self.graph(n, pooled);
+        let graph = self.graph(n, pooled, head);
         match &self.executor {
             Executor::Cpu => {
                 let mut out = crate::graph::cpu::run_stateless(&graph, &self.weights, inputs)?;
@@ -426,6 +470,9 @@ impl BertEncoder {
             }
             #[cfg(target_os = "macos")]
             Executor::CoreMl(s) => {
+                if head {
+                    return Err("the Core ML encoder has no classification head".into());
+                }
                 let emb = Self::initial_embeddings(
                     &self.weights,
                     ids,

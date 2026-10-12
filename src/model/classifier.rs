@@ -7,8 +7,16 @@
 //! `id2label`).
 
 mod factorized;
+pub mod head;
+#[cfg(test)]
+mod gpu_tests;
+#[cfg(test)]
+mod synth;
 pub mod ln_decoder;
 mod spm;
+
+use crate::graph::{DType, Graph, Op, Tensor, UnaryKind};
+use head::{Act, Gb, GpuRun, HeadGraph, HeadLin, HeadPool, HeadPost};
 
 use crate::hardware::{Device, QuantFormat, QuantMode};
 use crate::model::hf_loader::ChatMessage;
@@ -109,6 +117,14 @@ enum Body {
         model: Deberta,
         tok: tokenizers::Tokenizer,
         head: Head,
+    },
+    /// DeBERTa / ModernBERT / ELECTRA / ALBERT on Metal: the whole classifier (head and score
+    /// activation included) is one graph per sequence length, rebuilt from `ids` and token types.
+    Gpu {
+        tok: tokenizers::Tokenizer,
+        labels: usize,
+        run: GpuRun,
+        build: Box<dyn Fn(&[u32], &[u32]) -> Result<(Graph, Vec<Tensor>), String> + Send + Sync>,
     },
     ModernBert {
         model: modernbert::ModernBert,
@@ -442,10 +458,13 @@ impl SequenceClassifier {
     /// classifier on `device`. BERT-family encoders run on the CPU or Metal; DeBERTa and decoder
     /// classifiers on the CPU only.
     pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
+        // ponytail: Core ML (--backend ane) has no classification head program.
+        if device == Device::Ane {
+            return Err("gpu-only: classifiers run on Metal or the CPU; Core ML has no head program".into());
+        }
         let resolved = resolve_config(hub, repo_id);
         // SetFit: a sentence-transformers body (`BertModel`) + a scikit-learn head.
         if resolved.is_err() && hub.fetch_file(repo_id, "config_setfit.json").is_ok() {
-            crate::graph::avenues::family_gate(crate::graph::avenues::Family::ClassifierBert, device)?;
             return Self::from_setfit(hub, repo_id, device);
         }
         if resolved.is_err() && gguf::hub_gguf_arch(hub, repo_id).as_deref() == Some("bert") {
@@ -589,11 +608,15 @@ impl SequenceClassifier {
             let tok = load_tokenizer(hub, tok_repo, &arch, &tok_cfg, capacity)?;
             let eps = cfg["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32;
             if arch == "ModernBertForSequenceClassification" {
-                cpu_only(crate::graph::avenues::Family::ClassifierModern)?;
                 let model = modernbert::ModernBert::load(&cfg, &ckpt)?;
-                Body::ModernBert { model, tok }
+                if device == Device::Cpu {
+                    Body::ModernBert { model, tok }
+                } else {
+                    let labels = model.classifier.out_f;
+                    let hg = model.head_graph(HeadPost::of(activation_of(&cfg, labels)));
+                    gpu_body(tok, labels, model, move |m, gb, ids, _| m.graph(gb, ids, &hg))?
+                }
             } else if arch.starts_with("Electra") || arch.starts_with("Albert") {
-                cpu_only(crate::graph::avenues::Family::ClassifierModern)?;
                 let albert = arch.starts_with("Albert");
                 let model = factorized::Factorized::load(&cfg, &ckpt, albert)
                     .map_err(|e| format!("{repo_id}: {e}"))?;
@@ -613,9 +636,14 @@ impl SequenceClassifier {
                         model.hidden,
                     )?
                 };
-                Body::Factorized { model, tok, head }
+                if device == Device::Cpu {
+                    Body::Factorized { model, tok, head }
+                } else {
+                    let labels = head.out.out_f;
+                    let hg = head.graph(HeadPool::First, HeadPost::of(activation_of(&cfg, labels)));
+                    gpu_body(tok, labels, model, move |m, gb, ids, types| m.graph(gb, ids, types, &hg))?
+                }
             } else if arch.starts_with("Deberta") {
-                cpu_only(crate::graph::avenues::Family::ClassifierModern)?;
                 let model = Deberta::load(&cfg, &ckpt, !arch.starts_with("DebertaV2"))?;
                 let act = match cfg["pooler_hidden_act"].as_str().unwrap_or("gelu") {
                     "gelu" => Act::Gelu,
@@ -631,7 +659,13 @@ impl SequenceClassifier {
                     "classifier",
                     model.hidden,
                 )?;
-                Body::Deberta { model, tok, head }
+                if device == Device::Cpu {
+                    Body::Deberta { model, tok, head }
+                } else {
+                    let labels = head.out.out_f;
+                    let hg = head.graph(HeadPool::First, HeadPost::of(activation_of(&cfg, labels)));
+                    gpu_body(tok, labels, model, move |m, gb, ids, _| m.graph(gb, ids, &hg))?
+                }
             } else {
                 let (prefix, head) = match arch.as_str() {
                     "BertForSequenceClassification" => (
@@ -703,19 +737,28 @@ impl SequenceClassifier {
                     }
                 };
                 let h = dims.hidden_size;
-                cpu_only(crate::graph::avenues::Family::ClassifierBert)?;
-                let enc = BertEncoder::load(dims, device, |name, shape| {
-                    // DistilBERT has no segment embeddings: one all-zero row keeps the BERT graph.
-                    if prefix == "distilbert" && name == "embeddings.token_type_embeddings.weight" {
-                        return Ok(vec![0.0; h]);
-                    }
-                    let src = if prefix == "distilbert" {
-                        distilbert_name(name)
-                    } else {
-                        name.to_string()
-                    };
-                    ckpt.get(&format!("{prefix}.{src}"), shape)
-                })?;
+                // On Metal the head (pool → dense → act → output → score activation) is built into
+                // the encoder graph; the host `Head` serves the CPU backend.
+                let graph_head = (device != Device::Cpu).then(|| {
+                    head.graph(HeadPool::First, HeadPost::of(activation_of(&cfg, head.out.out_f)))
+                });
+                let enc = BertEncoder::load_with_head(
+                    dims,
+                    device,
+                    |name, shape| {
+                        // DistilBERT has no segment embeddings: one all-zero row keeps the BERT graph.
+                        if prefix == "distilbert" && name == "embeddings.token_type_embeddings.weight" {
+                            return Ok(vec![0.0; h]);
+                        }
+                        let src = if prefix == "distilbert" {
+                            distilbert_name(name)
+                        } else {
+                            name.to_string()
+                        };
+                        ckpt.get(&format!("{prefix}.{src}"), shape)
+                    },
+                    graph_head,
+                )?;
                 Body::Encoder {
                     enc,
                     tok,
@@ -730,6 +773,7 @@ impl SequenceClassifier {
             | Body::Deberta { head, .. }
             | Body::Factorized { head, .. } => head.out.out_f,
             Body::Decoder { score, .. } => score.out_f,
+            Body::Gpu { labels, .. } => *labels,
             Body::ModernBert { model, .. } => model.classifier.out_f,
             Body::SetFit(_) | Body::Gguf(_) | Body::FastText(_) => {
                 unreachable!("SetFit, GGUF and fastText repos load through their constructors")
@@ -742,13 +786,7 @@ impl SequenceClassifier {
                     .map_or_else(|| format!("LABEL_{i}"), str::to_string)
             })
             .collect();
-        let activation = match cfg["problem_type"].as_str() {
-            Some("multi_label_classification") => Activation::Sigmoid,
-            Some("regression") => Activation::Identity,
-            Some("single_label_classification") => Activation::Softmax,
-            _ if n == 1 => Activation::Identity,
-            _ => Activation::Softmax,
-        };
+        let activation = activation_of(&cfg, n);
         Ok(Self {
             repo_id: repo_id.to_string(),
             architecture: arch,
@@ -761,7 +799,10 @@ impl SequenceClassifier {
     /// A fastText `.bin`/`.ftz` classifier, or (when `path` is a directory) a fastText
     /// hierarchical-softmax re-export (`config.json` + `vocab.json` + `weights.pt`).
     pub fn from_fasttext(repo_id: &str, path: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::ClassifierModern)?;
+        // fastText is host-only (hashed n-gram bag + tree softmax): refuse once the GPU-only tripwire is armed.
+        if crate::hardware::cpu_compute::banned() {
+            return Err("gpu-only: fastText classifiers have no Metal program; run with --backend cpu".into());
+        }
         let ft = if path.is_dir() {
             crate::model::fasttext::FastText::load_export(path)?
         } else {
@@ -779,7 +820,6 @@ impl SequenceClassifier {
     /// A llama.cpp BERT/XLM-R classifier or reranker GGUF at `path`: labels from
     /// `<arch>.classifier.output_labels`; one logit is a raw score, more are softmaxed.
     pub fn from_gguf(repo_id: &str, path: &Path, device: Device) -> Result<Self, String> {
-        crate::graph::avenues::family_gate(crate::graph::avenues::Family::ClassifierBert, device)?;
         let g = GgufClassifier::load(path, device)?;
         Ok(Self {
             repo_id: repo_id.to_string(),
@@ -800,7 +840,18 @@ impl SequenceClassifier {
             Body::Encoder { enc, .. } => enc.device(),
             Body::SetFit(s) => s.device(),
             Body::Gguf(g) => g.device(),
+            Body::Gpu { .. } => Device::Metal,
             _ => Device::Cpu,
+        }
+    }
+
+    /// Whether the body's graph already applied the score activation (the Metal encoder bodies).
+    fn scored_on_gpu(&self) -> bool {
+        match &self.body {
+            Body::Gpu { .. } => true,
+            Body::Encoder { enc, .. } => enc.device() != Device::Cpu,
+            Body::Gguf(g) => g.device() != Device::Cpu,
+            _ => false,
         }
     }
 
@@ -858,13 +909,22 @@ impl SequenceClassifier {
                 } else {
                     e.get_type_ids().to_vec()
                 };
-                let hidden = enc.run(ids, &positions, &types, false)?;
-                (head.apply(&hidden[..enc.dims.hidden_size]), ids.len())
+                if enc.device() == Device::Cpu {
+                    let hidden = enc.run(ids, &positions, &types, false)?;
+                    (head.apply(&hidden[..enc.dims.hidden_size]), ids.len())
+                } else {
+                    (enc.run_head(ids, &positions, &types)?, ids.len())
+                }
             }
             Body::Deberta { model, tok, head } => {
                 let e = encode(tok, text, pair)?;
                 let hidden = model.forward(e.get_ids())?;
                 (head.apply(&hidden[..model.hidden]), e.get_ids().len())
+            }
+            Body::Gpu { tok, run, build, .. } => {
+                let e = encode(tok, text, pair)?;
+                let (graph, inputs) = build(e.get_ids(), e.get_type_ids())?;
+                (run.run(&graph, inputs)?, e.get_ids().len())
             }
             Body::Gguf(g) => g.logits(text, pair)?,
             Body::FastText(_) if pair.is_some() => {
@@ -914,7 +974,9 @@ impl SequenceClassifier {
             }
             Body::SetFit(s) => s.proba(text)?,
         };
+        // Metal bodies apply the score activation inside their graph.
         let scores = match self.activation {
+            _ if self.scored_on_gpu() => logits,
             Activation::Softmax => {
                 let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let e: Vec<f32> = logits.iter().map(|v| (v - m).exp()).collect();
@@ -1424,11 +1486,47 @@ impl Lin {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Act {
-    Tanh,
-    Relu,
-    Gelu,
+/// A Metal classifier program: `make` builds the model's graph for a sequence on a [`Gb`] and
+/// returns its inputs. The weights are registered once (a 1-token build), uploaded to the GPU, and
+/// every classification rebuilds the static-shape graph for its own length.
+// ponytail: the host copy of the weights stays resident next to the GPU copy (2x); split the model
+// structs into metadata + tensors to drop it.
+fn gpu_body<M: Send + Sync + 'static>(
+    tok: tokenizers::Tokenizer,
+    labels: usize,
+    model: M,
+    make: impl Fn(&M, &mut Gb, &[u32], &[u32]) -> Result<Vec<Tensor>, String> + Send + Sync + 'static,
+) -> Result<Body, String> {
+    let mut reg = Gb::new(true);
+    make(&model, &mut reg, &[0], &[0])?;
+    let run = GpuRun::new(&reg.w.take().expect("registering build"))?;
+    let build = Box::new(move |ids: &[u32], types: &[u32]| {
+        let mut gb = Gb::new(false);
+        let inputs = make(&model, &mut gb, ids, types)?;
+        Ok((gb.g, inputs))
+    });
+    Ok(Body::Gpu { tok, labels, run, build })
+}
+
+/// How `config.json` (`problem_type`, label count) turns logits into scores.
+fn activation_of(cfg: &Value, n: usize) -> Activation {
+    match cfg["problem_type"].as_str() {
+        Some("multi_label_classification") => Activation::Sigmoid,
+        Some("regression") => Activation::Identity,
+        Some("single_label_classification") => Activation::Softmax,
+        _ if n == 1 => Activation::Identity,
+        _ => Activation::Softmax,
+    }
+}
+
+fn head_act(a: Act, x: &mut [f32]) {
+    match a {
+        Act::Tanh => x.iter_mut().for_each(|v| *v = v.tanh()),
+        Act::Relu => x.iter_mut().for_each(|v| *v = v.max(0.0)),
+        Act::Gelu => nn::gelu(x),
+        Act::GeluTanh => nn::gelu_tanh(x),
+        Act::Silu => nn::silu(x),
+    }
 }
 
 /// Classification head on the first token's hidden state: optional dense + activation, then
@@ -1453,15 +1551,24 @@ impl Head {
         })
     }
 
+    /// The same head as graph nodes (Metal): `pool`, dense + activation, output, `post`.
+    fn graph(&self, pool: HeadPool, post: HeadPost) -> HeadGraph {
+        HeadGraph {
+            pool,
+            normalize: false,
+            dense: self.dense.as_ref().map(|(l, a)| (HeadLin::from(l), *a)),
+            norm: None,
+            out: HeadLin::from(&self.out),
+            post,
+        }
+    }
+
     fn apply(&self, first: &[f32]) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("classifier::head");
         let x = match &self.dense {
             Some((lin, act)) => {
                 let mut y = lin.apply(first, 1);
-                match act {
-                    Act::Tanh => y.iter_mut().for_each(|v| *v = v.tanh()),
-                    Act::Relu => y.iter_mut().for_each(|v| *v = v.max(0.0)),
-                    Act::Gelu => nn::gelu(&mut y),
-                }
+                head_act(*act, &mut y);
                 y
             }
             None => first.to_vec(),
@@ -1681,6 +1788,7 @@ impl Deberta {
 
     /// Last hidden states `[n, hidden]` of one unpadded sequence.
     fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("classifier::deberta::forward");
         let (n, h, heads) = (ids.len(), self.hidden, self.heads);
         let d = h / heads;
         let rows = self.word.len() / h;
@@ -1755,5 +1863,95 @@ impl Deberta {
             x = nn::layer_norm(&o, n, h, &layer.ln2.0, &layer.ln2.1, self.eps);
         }
         Ok(x)
+    }
+
+    /// The Metal program for `ids`: embeddings, post-LN layers whose attention gets the c2p + p2c
+    /// relative-position terms as an additive `[heads, n, n]` bias (a batched GEMM against the
+    /// per-layer `[heads, 2·span, d]` projected relative embeddings, then a flat Gather by the
+    /// host-computed bucket indices), and `head`, as graph nodes on `gb`; returns the inputs.
+    ///
+    /// `Attention` scores are `q·k/√d + bias`, DeBERTa's are `(q·k + c2p + p2c)/√(3d)`: q is scaled
+    /// by `1/√3` and the position projections by `1/√(3d)` (at registration).
+    fn graph(&self, gb: &mut Gb, ids: &[u32], head: &HeadGraph) -> Result<Vec<Tensor>, String> {
+        let (n, h, heads) = (ids.len(), self.hidden, self.heads);
+        let (d, span2) = (h / heads, 2 * self.span);
+        let s = 1.0 / ((d * 3) as f32).sqrt();
+        let id_v = gb.g.input("input_ids", vec![n], DType::U32);
+        let pos_v = self.pos.as_ref().map(|_| gb.g.input("position_ids", vec![n], DType::U32));
+        let c2p_v = gb.g.input("c2p_index", vec![heads * n * n], DType::U32);
+        let p2c_v = gb.g.input("p2c_index", vec![heads * n * n], DType::U32);
+        let mask_v = gb.g.input("attention_mask", vec![n], DType::U32);
+        let word = gb.weight("emb.word", vec![self.word.len() / h, h], || self.word.clone());
+        let mut x = gb.add("emb.word", Op::Embedding, &[word, id_v], vec![n, h]);
+        if let (Some(pos), Some(pv)) = (&self.pos, pos_v) {
+            let t = gb.weight("emb.position", vec![pos.len() / h, h], || pos.clone());
+            let p = gb.add("emb.position", Op::Embedding, &[t, pv], vec![n, h]);
+            x = gb.add("emb.add_position", Op::Add, &[x, p], vec![n, h]);
+        }
+        x = gb.ln(x, "emb.ln", &self.emb_ln, self.eps);
+        let attn = Op::Attention {
+            heads,
+            kv_heads: heads,
+            causal: false,
+            window: None,
+            soft_cap: None,
+        };
+        for (l, layer) in self.layers.iter().enumerate() {
+            let p = format!("layer.{l}");
+            let (q, k, v) = (
+                gb.lin(x, &format!("{p}.q"), &layer.q),
+                gb.lin(x, &format!("{p}.k"), &layer.k),
+                gb.lin(x, &format!("{p}.v"), &layer.v),
+            );
+            let split = |gb: &mut Gb, name: String, t| {
+                let r = gb.reshape(&format!("{name}.rows"), t, vec![n, heads, d]);
+                gb.add(&name, Op::Transpose { perm: vec![1, 0, 2] }, &[r], vec![heads, n, d])
+            };
+            let (qh, kh) = (split(gb, format!("{p}.qh"), q), split(gb, format!("{p}.kh"), k));
+            let nt = Op::MatMul { transpose_a: false, transpose_b: true };
+            let mut bias = None;
+            // c2p: q_i · pos_k[r(i, j)]; p2c: k_j · pos_q[r(i, j)].
+            for (tag, side, pos, idx) in [("c2p", qh, &layer.pos_k, c2p_v), ("p2c", kh, &layer.pos_q, p2c_v)] {
+                let w = gb.weight(&format!("{p}.pos_{tag}"), vec![heads, span2, d], || {
+                    pos.iter().flatten().map(|v| v * s).collect()
+                });
+                let full = gb.add(&format!("{p}.{tag}"), nt.clone(), &[side, w], vec![heads, n, span2]);
+                let flat = gb.reshape(&format!("{p}.{tag}.flat"), full, vec![heads * n * span2]);
+                let g = gb.add(&format!("{p}.{tag}.gather"), Op::Gather { axis: 0 }, &[flat, idx], vec![heads * n * n]);
+                let g = gb.reshape(&format!("{p}.{tag}.bias"), g, vec![heads, n, n]);
+                bias = Some(match bias {
+                    None => g,
+                    Some(b) => gb.add(&format!("{p}.bias"), Op::Add, &[b, g], vec![heads, n, n]),
+                });
+            }
+            let qs = gb.unary(&format!("{p}.q_scaled"), UnaryKind::Scale(1.0 / 3f32.sqrt()), q);
+            let c = gb.add(&format!("{p}.attn"), attn.clone(), &[qs, k, v, bias.expect("two terms")], vec![n, h]);
+            let o = gb.lin(c, &format!("{p}.o"), &layer.o);
+            let r = gb.add(&format!("{p}.res1"), Op::Add, &[o, x], vec![n, h]);
+            let a = gb.ln(r, &format!("{p}.ln1"), &layer.ln1, self.eps);
+            let i = gb.lin(a, &format!("{p}.inter"), &layer.inter);
+            let i = gb.act(&format!("{p}.act"), Act::Gelu, i);
+            let o2 = gb.lin(i, &format!("{p}.out"), &layer.out);
+            let r2 = gb.add(&format!("{p}.res2"), Op::Add, &[o2, a], vec![n, h]);
+            x = gb.ln(r2, &format!("{p}.ln2"), &layer.ln2, self.eps);
+        }
+        let out = head.nodes(gb, x, Some(mask_v))?;
+        gb.g.output(out);
+        let mut inputs = vec![Tensor::U32(ids.to_vec())];
+        if self.pos.is_some() {
+            inputs.push(Tensor::U32((0..n as u32).collect()));
+        }
+        let (mut c2p, mut p2c) = (Vec::with_capacity(heads * n * n), Vec::with_capacity(heads * n * n));
+        for hd in 0..heads {
+            for i in 0..n {
+                for j in 0..n {
+                    let r = self.rel_index(i, j);
+                    c2p.push(((hd * n + i) * span2 + r) as u32);
+                    p2c.push(((hd * n + j) * span2 + r) as u32);
+                }
+            }
+        }
+        inputs.extend([Tensor::U32(c2p), Tensor::U32(p2c), Tensor::U32(vec![1; n])]);
+        Ok(inputs)
     }
 }

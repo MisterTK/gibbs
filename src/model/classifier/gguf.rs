@@ -2,6 +2,7 @@
 //! (`convert_hf_to_gguf.py` BertModel / XLMRobertaModel): the encoder under llama.cpp tensor
 //! names, the head as `cls.*` / `cls.output.*`, and the tokenizer as `tokenizer.ggml.*`.
 
+use super::head::{HeadPool, HeadPost};
 use super::{encode, Act, Head, Lin};
 use crate::hardware::Device;
 use crate::model::hub::HuggingFaceHub;
@@ -151,7 +152,6 @@ impl GgufClassifier {
             layer_norm_eps: meta("attention.layer_norm_epsilon")? as f32,
         };
         let get = |n: &str| reader.load_tensor(n);
-        let enc = BertEncoder::load(dims, device, |name, _| get(&gguf_name(name)?))?;
         let lin = |n: &str, in_f: usize| -> Result<Lin, String> {
             let w = get(&format!("{n}.weight"))?;
             Ok(Lin {
@@ -178,6 +178,10 @@ impl GgufClassifier {
             out: lin("cls.output", in_out)?,
         };
         let n = head.out.out_f;
+        // Metal runs the head (and the softmax over more than one logit) inside the encoder graph.
+        let graph_head = (device != Device::Cpu)
+            .then(|| head.graph(HeadPool::First, if n == 1 { HeadPost::Logits } else { HeadPost::Softmax }));
+        let enc = BertEncoder::load_with_head(dims, device, |name, _| get(&gguf_name(name)?), graph_head)?;
         let labels = match kv
             .get(&format!("{arch}.classifier.output_labels"))
             .and_then(Kv::arr)
@@ -197,7 +201,8 @@ impl GgufClassifier {
         })
     }
 
-    /// Raw head logits for `text` (and `pair` as the second segment), plus the token count.
+    /// Head logits for `text` (and `pair` as the second segment), plus the token count; on Metal
+    /// they are already softmaxed (a single logit stays raw).
     pub fn logits(&self, text: &str, pair: Option<&str>) -> Result<(Vec<f32>, usize), String> {
         let e = encode(&self.tok, text, pair)?;
         let ids = e.get_ids();
@@ -208,6 +213,9 @@ impl GgufClassifier {
         } else {
             e.get_type_ids().to_vec()
         };
+        if self.enc.device() != Device::Cpu {
+            return Ok((self.enc.run_head(ids, &positions, &types)?, ids.len()));
+        }
         let hidden = self.enc.run(ids, &positions, &types, false)?;
         Ok((
             self.head.apply(&hidden[..self.enc.dims.hidden_size]),
