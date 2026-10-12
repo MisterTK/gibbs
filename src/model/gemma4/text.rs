@@ -716,10 +716,12 @@ impl TextModel {
             );
 
             // Q RoPE
+            // Pairs are (i, i + head_dim/2) over the whole head; proportional (partial) rope is the
+            // tail of `inv_freq` being zero, i.e. identity rotations, not a shorter rotary_dim.
             let (rotary_dim, inv_freq_slice, inv_freq_name) = if l.sliding {
-                (self.inv_freq_sliding.iter().filter(|&&v| v > 0.0).count() * 2, &self.inv_freq_sliding, "rope.inv_freq.sliding")
+                (l.head_dim, &self.inv_freq_sliding, "rope.inv_freq.sliding")
             } else {
-                (self.inv_freq_full.iter().filter(|&&v| v > 0.0).count() * 2, &self.inv_freq_full, "rope.inv_freq.full")
+                (l.head_dim, &self.inv_freq_full, "rope.inv_freq.full")
             };
             let inv_freq_val = g.weight(inv_freq_name, vec![rotary_dim / 2], DType::F32);
             w.insert(inv_freq_name.to_string(), Tensor::F32(inv_freq_slice[..rotary_dim / 2].to_vec()));
