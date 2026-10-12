@@ -1,4 +1,5 @@
 use crate::hardware::QuantFormat;
+use crate::model::variant::hub_rank;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fs;
@@ -216,7 +217,7 @@ pub fn split_revision(repo_id: &str) -> (&str, &str) {
 }
 
 /// A revision as one URL path segment / snapshot directory name.
-fn rev_segment(rev: &str) -> String {
+pub(crate) fn rev_segment(rev: &str) -> String {
     rev.replace('/', "%2F")
 }
 fn rev_dir(rev: &str) -> String {
@@ -744,8 +745,8 @@ fn comfy_krea2_files(files: &[RepoFile], quant: Option<&str>) -> Result<Vec<Stri
 /// Err(reason) when nothing the loader decodes exists. Single source of truth for download,
 /// cached-locate and picker loadability.
 ///
-/// Default ranking: smallest bpw first among `*.gguf` / single or sharded `*.safetensors`
-/// (Q4_K_M / Q4_0 4.5 … Q8_0 < BF16 / FP16 < FP32), then ONNX variants (smallest download first),
+/// Default ranking: highest predicted decode speed first (`model::variant::hub_rank`, 5% steps,
+/// then smaller bytes) among `*.gguf` / single or sharded `*.safetensors`, then ONNX variants (smallest download first),
 /// then PyTorch / Flax / NumPy files (single or `.index.json`-sharded; smallest download first),
 /// then sub-4.5-bpw GGUFs. An explicit quant only ever yields a matching set.
 pub fn select_weight_files(
@@ -764,6 +765,7 @@ pub fn select_weight_files(
     let mut sets: Vec<WeightSet> = Vec::new();
     let mut problem = None;
     let size_of = |p: &str| files.iter().find(|f| f.path == p).and_then(|f| f.size);
+    let policy = crate::model::variant::reencode_policy();
     // ponytail: ComfyUI packaging (`comfyui/` workflows or `text_encoders/` beside root GGUFs) ships
     // the same diffusion transformer again as root fp8 / int8 / NVFP4 / MLX / LoRA safetensors, in
     // forms no loader reads; those never compete with the GGUFs. Upgrade: read the Hub's GGUF arch.
@@ -803,8 +805,8 @@ pub fn select_weight_files(
             let Some(q) = detect_quant_format(Path::new(p)) else {
                 continue;
             };
-            let dev = crate::hardware::default_device();
-            let rank = q.hardware_speed_rank(dev);
+            let bytes: Option<u64> = members.iter().map(|m| size_of(m)).sum();
+            let rank = hub_rank(q, bytes, policy);
             sets.push(WeightSet {
                 files: members,
                 tier: 0,
@@ -839,17 +841,12 @@ pub fn select_weight_files(
             let Some(q) = detect_quant_format(Path::new(p)) else {
                 continue;
             };
-            let dev = crate::hardware::default_device();
+            let bytes = size_of(p);
             sets.push(WeightSet {
                 files: vec![p],
                 tier: 0,
                 // SD repos ship `*-inpainting.safetensors` beside the text-to-image checkpoint.
-                rank: q.hardware_speed_rank(dev)
-                    + if lower.contains("inpaint") {
-                        100.0
-                    } else {
-                        0.0
-                    },
+                rank: hub_rank(q, bytes, policy) + if lower.contains("inpaint") { 1e6 } else { 0.0 },
                 matches: Box::new(move |eq| quant_matches(eq, q, p)),
             });
         } else if let Some((prefix, ext)) =
@@ -891,7 +888,7 @@ pub fn select_weight_files(
                 files: members,
                 tier,
                 rank: if tier == 0 {
-                    q.hardware_speed_rank(crate::hardware::default_device())
+                    hub_rank(q, bytes, policy)
                 } else {
                     bytes.unwrap_or(0) as f64
                 },

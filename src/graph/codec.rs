@@ -605,55 +605,22 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
     },
 ];
 
-use crate::model::weight_format::ReencodePolicy;
-use std::collections::HashMap;
-
-/// Result of codec micro-benchmarking on host GPU.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CodecBenchProfile {
-    pub device: String,
-    pub src_hash: u64,
-    pub eff: HashMap<String, f64>,
+/// Every format [`codec`] resolves directly (IQ2_S is IQ2_M's alias and not repeated).
+pub fn formats() -> Vec<QuantFormat> {
+    [QuantFormat::GGUF_Q4_0, QuantFormat::GGUF_Q8_0]
+        .into_iter()
+        .chain(all_specs().map(|s| s.format))
+        .collect()
 }
 
-/// Predicts decode tokens per second given streamed tensor weights and re-encode policy.
-pub fn predict_decode_tok_s(
-    tensor_bytes: &[(QuantFormat, u64)],
-    policy: ReencodePolicy,
-    ceiling_gbps: f64,
-    eff_map: Option<&HashMap<String, f64>>,
-) -> f64 {
-    if ceiling_gbps <= 0.0 || tensor_bytes.is_empty() {
-        return 0.0;
+/// Hash of [`CODEC_VERSION`] and every codec's MSL: the key of the measured codec efficiencies.
+pub fn source_hash() -> u64 {
+    let mut h = 0xcbf29ce484222325u64 ^ u64::from(CODEC_VERSION);
+    for f in formats() {
+        let c = codec(f).expect("listed formats are registered");
+        for b in format!("{f:?}").bytes().chain(c.msl.bytes()) {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
     }
-
-    let mut total_s = 0.0f64;
-    for &(fmt, bytes) in tensor_bytes {
-        let active_fmt = match policy {
-            ReencodePolicy::MaxSpeed => {
-                let bpw = fmt.bits_per_weight();
-                if bpw > 4.5 {
-                    QuantFormat::GGUF_Q4_K_M
-                } else {
-                    fmt
-                }
-            }
-            ReencodePolicy::LowBitNative => fmt,
-            ReencodePolicy::BitExact => fmt,
-        };
-
-        let fmt_key = format!("{active_fmt:?}");
-        let eff = eff_map
-            .and_then(|m| m.get(&fmt_key).copied())
-            .unwrap_or(0.9);
-
-        let eff_bw = (eff * ceiling_gbps * 1e9).max(1e6);
-        total_s += bytes as f64 / eff_bw;
-    }
-
-    if total_s > 0.0 {
-        1.0 / total_s
-    } else {
-        0.0
-    }
+    h
 }
