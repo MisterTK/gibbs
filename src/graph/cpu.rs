@@ -46,15 +46,9 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Conv2d { .. }
         | Op::RelPosBias { .. }
         | Op::StateReorder
+        | Op::Attention { .. }
         | Op::Megakernel(_) => true,
         Op::Upsample { mode, .. } => matches!(mode, crate::graph::UpsampleMode::Nearest),
-        Op::Attention {
-            kv_heads,
-            heads,
-            window,
-            soft_cap,
-            ..
-        } => kv_heads == heads && window.is_none() && soft_cap.is_none(),
         Op::Gelu { tanh } => !*tanh,
         _ => false,
     }
@@ -739,41 +733,31 @@ pub fn run(
                 let table = operand(&bound, &slots, ins, name, 0)?;
                 let q_pos = operand_u32(&bound, &slots, ins, name, 1)?;
                 let k_pos = operand_u32(&bound, &slots, ins, name, 2)?;
-                let n = q_pos.len();
-                let m = k_pos.len();
-                let h = *heads;
+                let (n, m, h) = (q_pos.len(), k_pos.len(), *heads);
+                let nb = if *bidirectional {
+                    buckets / 2
+                } else {
+                    *buckets
+                };
+                if nb < 2 || *max_distance <= nb / 2 || table.len() != buckets * h {
+                    return Err(format!(
+                        "node '{name}': RelPosBias needs table [{buckets}, {h}] ({} elements), \
+                         at least 2 buckets per direction and max_distance > {}",
+                        table.len(),
+                        nb / 2
+                    ));
+                }
                 let mut out = vec![0.0f32; h * n * m];
-
-                for qi in 0..n {
-                    for ki in 0..m {
-                        let diff = k_pos[ki] as i64 - q_pos[qi] as i64;
-                        let mut bucket = 0usize;
-                        let mut n_dist = diff;
-                        let num_buckets = *buckets;
-                        let max_exact = num_buckets / 2;
-
-                        if *bidirectional {
-                            if n_dist < 0 {
-                                bucket += max_exact;
-                                n_dist = -n_dist;
-                            }
-                        } else {
-                            n_dist = (-n_dist).max(0);
-                        }
-
-                        if (n_dist as usize) < max_exact {
-                            bucket += n_dist as usize;
-                        } else {
-                            let max_dist = *max_distance as f32;
-                            let log_val = ((n_dist as f32 / max_exact as f32).ln()
-                                / (max_dist / max_exact as f32).ln())
-                                * (num_buckets - max_exact) as f32;
-                            bucket +=
-                                max_exact + (log_val as usize).min(num_buckets - max_exact - 1);
-                        }
-                        let b_idx = bucket.min(num_buckets - 1);
+                for (qi, &qp) in q_pos.iter().enumerate() {
+                    for (ki, &kp) in k_pos.iter().enumerate() {
+                        let b = rel_pos_bucket(
+                            kp as i64 - qp as i64,
+                            *bidirectional,
+                            *buckets,
+                            *max_distance,
+                        );
                         for head in 0..h {
-                            out[head * n * m + qi * m + ki] = table[b_idx * h + head];
+                            out[head * n * m + qi * m + ki] = table[b * h + head];
                         }
                     }
                 }
@@ -1394,38 +1378,48 @@ pub fn run(
                 window,
                 soft_cap,
             } => {
-                if kv_heads != heads || window.is_some() || soft_cap.is_some() {
-                    return Err(format!(
-                        "node '{name}': Attention with kv_heads != heads, window, or soft_cap is not implemented"
-                    ));
-                }
                 let (q, k, v) = (
                     operand(&bound, &slots, ins, name, 0)?,
                     operand(&bound, &slots, ins, name, 1)?,
                     operand(&bound, &slots, ins, name, 2)?,
                 );
+                let bias = if ins.len() > 3 {
+                    Some(operand(&bound, &slots, ins, name, 3)?)
+                } else {
+                    None
+                };
                 let hd = last_dim(0);
                 if *heads == 0
+                    || *kv_heads == 0
+                    || heads % kv_heads != 0
                     || hd == 0
                     || hd % heads != 0
                     || q.len() % hd != 0
-                    || k.len() % hd != 0
+                    || k.is_empty()
+                    || k.len() % (kv_heads * (hd / heads)) != 0
                     || k.len() != v.len()
                 {
                     return Err(format!(
-                        "node '{name}': q/k/v shapes do not fit {heads} heads"
+                        "node '{name}': q/k/v shapes do not fit {heads} heads over {kv_heads} kv heads"
                     ));
                 }
-                nn::attention(
-                    q,
-                    k,
-                    v,
-                    q.len() / hd,
-                    k.len() / hd,
-                    *heads,
-                    hd / heads,
-                    *causal,
-                )
+                let d = hd / heads;
+                let (nq, nk) = (q.len() / hd, k.len() / (kv_heads * d));
+                if let Some(b) = bias {
+                    if ![nk, nq * nk, heads * nq * nk].contains(&b.len()) {
+                        return Err(format!(
+                            "node '{name}': bias of {} elements is not [{heads}, {nq}, {nk}], [{nq}, {nk}] or [{nk}]",
+                            b.len()
+                        ));
+                    }
+                }
+                if kv_heads == heads && window.is_none() && soft_cap.is_none() && bias.is_none() {
+                    nn::attention(q, k, v, nq, nk, *heads, d, *causal)
+                } else {
+                    attention_general(
+                        q, k, v, bias, nq, nk, *heads, *kv_heads, d, *causal, *window, *soft_cap,
+                    )
+                }
             }
             Op::Gelu { tanh: false } => {
                 let mut x = take0(&bound, &mut slots, ins, name, &last_use, i)?;
@@ -1671,6 +1665,120 @@ fn dispatch_linear(
             Ok(nn::linear(x, rows, &w_f32, bias, in_f, out_f))
         }
     }
+}
+
+/// Keys `[lo, hi)` visible to the query at `pos` in `Op::Attention` (`lo >= hi`: none). Causal is
+/// top-left aligned like `nn::attention`; windows follow sprint-2 S2.2: causal sees `w` keys
+/// `pos - w < k <= pos`, non-causal sees `|pos - k| <= w / 2`.
+pub(crate) fn attention_key_range(
+    pos: usize,
+    nk: usize,
+    causal: bool,
+    window: Option<usize>,
+) -> (usize, usize) {
+    match (causal, window) {
+        (true, None) => (0, nk.min(pos + 1)),
+        (true, Some(w)) => ((pos + 1).saturating_sub(w), nk.min(pos + 1)),
+        (false, None) => (0, nk),
+        (false, Some(w)) => (
+            pos.saturating_sub(w / 2),
+            nk.min(pos.saturating_add(w / 2 + 1)),
+        ),
+    }
+}
+
+/// `Op::Attention` with grouped kv heads, window, soft cap and/or an additive `bias`
+/// (`[heads, nq, nk]`, `[nq, nk]` or `[nk]`, added after scaling and the soft cap; `-inf` masks).
+/// A query with no visible key yields zeros. Scalar reference; the plain form keeps the GEMM-based
+/// `nn::attention`.
+// ponytail: O(nq*nk*d) without blocking; block it if a CPU-pinned model needs windowed attention.
+#[allow(clippy::too_many_arguments)]
+fn attention_general(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    bias: Option<&[f32]>,
+    nq: usize,
+    nk: usize,
+    heads: usize,
+    kv_heads: usize,
+    d: usize,
+    causal: bool,
+    window: Option<usize>,
+    soft_cap: Option<f32>,
+) -> Vec<f32> {
+    let (qw, kw, rep) = (heads * d, kv_heads * d, heads / kv_heads);
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut out = vec![0.0f32; nq * qw];
+    let mut s = vec![0.0f32; nk];
+    for qi in 0..nq {
+        let (lo, hi) = attention_key_range(qi, nk, causal, window);
+        for head in 0..heads {
+            let kvh = head / rep;
+            let qv = &q[qi * qw + head * d..][..d];
+            let mut mx = f32::NEG_INFINITY;
+            for ki in lo..hi {
+                let kv = &k[ki * kw + kvh * d..][..d];
+                let mut x = qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>() * scale;
+                if let Some(cap) = soft_cap {
+                    x = cap * (x / cap).tanh();
+                }
+                if let Some(b) = bias {
+                    x += match b.len() {
+                        l if l == nk => b[ki],
+                        l if l == nq * nk => b[qi * nk + ki],
+                        _ => b[(head * nq + qi) * nk + ki],
+                    };
+                }
+                s[ki] = x;
+                mx = mx.max(x);
+            }
+            let o = &mut out[qi * qw + head * d..][..d];
+            let mut sum = 0.0f32;
+            for ki in lo..hi {
+                if s[ki] == f32::NEG_INFINITY {
+                    continue;
+                }
+                let e = (s[ki] - mx).exp();
+                sum += e;
+                for (o, v) in o.iter_mut().zip(&v[ki * kw + kvh * d..][..d]) {
+                    *o += e * v;
+                }
+            }
+            if sum > 0.0 {
+                o.iter_mut().for_each(|x| *x /= sum);
+            }
+        }
+    }
+    out
+}
+
+/// HF `_relative_position_bucket` of `rel = key_pos - query_pos` (f32 log with an f64 scale,
+/// truncated), identical to `model::t5::bucket`. Needs `buckets / 2 >= 2` per direction and
+/// `max_distance > exact` (checked by the caller).
+pub(crate) fn rel_pos_bucket(
+    rel: i64,
+    bidirectional: bool,
+    buckets: usize,
+    max_distance: usize,
+) -> usize {
+    let (mut nb, mut ret) = (buckets as i64, 0i64);
+    let n = if bidirectional {
+        nb /= 2;
+        if rel > 0 {
+            ret += nb;
+        }
+        rel.abs()
+    } else {
+        (-rel).max(0)
+    };
+    let exact = nb / 2;
+    if n < exact {
+        return (ret + n) as usize;
+    }
+    let scale = (max_distance as f64 / exact as f64).ln() as f32;
+    let large = exact + ((n as f32 / exact as f32).ln() / scale * (nb - exact) as f32) as i64;
+    (ret + large.min(nb - 1)) as usize
 }
 
 /// Owns operand 0, moving it out when node `i` is its last (and only-once) reader.
