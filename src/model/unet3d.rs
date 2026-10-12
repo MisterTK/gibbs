@@ -776,8 +776,136 @@ impl Layer3 {
     }
 }
 
+/// Tiny synthetic ModelScope UNet3D (parity tests and the GPU-only matrix fixture).
+pub mod fixture {
+    use super::*;
+
+    type Specs = Vec<(String, Vec<usize>)>;
+
+    fn spec(s: &mut Specs, name: String, shape: &[usize]) {
+        s.push((name, shape.to_vec()));
+    }
+    fn s_lin(s: &mut Specs, base: &str, i: usize, o: usize, bias: bool) {
+        spec(s, format!("{base}.weight"), &[o, i]);
+        if bias {
+            spec(s, format!("{base}.bias"), &[o]);
+        }
+    }
+    fn s_norm(s: &mut Specs, base: &str, c: usize) {
+        spec(s, format!("{base}.weight"), &[c]);
+        spec(s, format!("{base}.bias"), &[c]);
+    }
+    fn s_conv(s: &mut Specs, base: &str, i: usize, o: usize, k: usize) {
+        spec(s, format!("{base}.weight"), &[o, i, k, k]);
+        spec(s, format!("{base}.bias"), &[o]);
+    }
+    /// `Transformer2DModel` / `TransformerTemporalModel` weights: channels `c`, width `inner`, attn2 kv width `kv`.
+    fn s_trans(s: &mut Specs, p: &str, c: usize, inner: usize, kv: usize) {
+        s_norm(s, &format!("{p}.norm"), c);
+        s_lin(s, &format!("{p}.proj_in"), c, inner, true);
+        s_lin(s, &format!("{p}.proj_out"), inner, c, true);
+        let t = format!("{p}.transformer_blocks.0");
+        for n in ["norm1", "norm2", "norm3"] {
+            s_norm(s, &format!("{t}.{n}"), inner);
+        }
+        for (a, kv) in [("attn1", inner), ("attn2", kv)] {
+            s_lin(s, &format!("{t}.{a}.to_q"), inner, inner, false);
+            s_lin(s, &format!("{t}.{a}.to_k"), kv, inner, false);
+            s_lin(s, &format!("{t}.{a}.to_v"), kv, inner, false);
+            s_lin(s, &format!("{t}.{a}.to_out.0"), inner, inner, true);
+        }
+        s_lin(s, &format!("{t}.ff.net.0.proj"), inner, 4 * inner, true);
+        s_lin(s, &format!("{t}.ff.net.2"), 2 * inner, inner, true);
+    }
+    fn s_layer(s: &mut Specs, cfg: Cfg, base: &str, j: usize, ci: usize, co: usize, attn: bool) {
+        let r = format!("{base}.resnets.{j}");
+        s_norm(s, &format!("{r}.norm1"), ci);
+        s_conv(s, &format!("{r}.conv1"), ci, co, 3);
+        s_lin(s, &format!("{r}.time_emb_proj"), 4 * cfg.block_out[0], co, true);
+        s_norm(s, &format!("{r}.norm2"), co);
+        s_conv(s, &format!("{r}.conv2"), co, co, 3);
+        if ci != co {
+            s_conv(s, &format!("{r}.conv_shortcut"), ci, co, 1);
+        }
+        let tc = format!("{base}.temp_convs.{j}");
+        for i in 1..=4 {
+            s_norm(s, &format!("{tc}.conv{i}.0"), co);
+            let conv = format!("{tc}.conv{i}.{}", if i == 1 { 2 } else { 3 });
+            spec(s, format!("{conv}.weight"), &[co, co, 3, 1, 1]);
+            spec(s, format!("{conv}.bias"), &[co]);
+        }
+        if attn {
+            s_trans(s, &format!("{base}.attentions.{j}"), co, co, cfg.ctx_dim);
+            s_trans(s, &format!("{base}.temp_attentions.{j}"), co, co, co);
+        }
+    }
+
+    /// Every tensor of a UNet3D with `cfg` (the layout `Unet3d::from_st` consumes).
+    pub(super) fn specs(cfg: Cfg) -> Specs {
+        let mut s = Specs::new();
+        let (bo, c0, top) = (cfg.block_out, cfg.block_out[0], cfg.block_out.len() - 1);
+        s_lin(&mut s, "time_embedding.linear_1", c0, 4 * c0, true);
+        s_lin(&mut s, "time_embedding.linear_2", 4 * c0, 4 * c0, true);
+        s_conv(&mut s, "conv_in", cfg.in_ch, c0, 3);
+        s_trans(&mut s, "transformer_in", c0, cfg.tin_width, cfg.tin_width);
+        let mut ch = c0;
+        for (i, &out) in bo.iter().enumerate() {
+            let base = format!("down_blocks.{i}");
+            for j in 0..LAYERS {
+                s_layer(&mut s, cfg, &base, j, if j == 0 { ch } else { out }, out, i < top);
+            }
+            if i < top {
+                s_conv(&mut s, &format!("{base}.downsamplers.0.conv"), out, out, 3);
+            }
+            ch = out;
+        }
+        let c = bo[top];
+        s_layer(&mut s, cfg, "mid_block", 0, c, c, false);
+        s_trans(&mut s, "mid_block.attentions.0", c, c, cfg.ctx_dim);
+        s_trans(&mut s, "mid_block.temp_attentions.0", c, c, c);
+        s_layer(&mut s, cfg, "mid_block", 1, c, c, false);
+        let mut prev = c;
+        for i in 0..=top {
+            let base = format!("up_blocks.{i}");
+            let out = bo[top - i];
+            let input = bo[top - (i + 1).min(top)];
+            for j in 0..=LAYERS {
+                let skip = if j == LAYERS { input } else { out };
+                s_layer(&mut s, cfg, &base, j, (if j == 0 { prev } else { out }) + skip, out, i > 0);
+            }
+            if i < top {
+                s_conv(&mut s, &format!("{base}.upsamplers.0.conv"), out, out, 3);
+            }
+            prev = out;
+        }
+        s_norm(&mut s, "conv_norm_out", c0);
+        s_conv(&mut s, "conv_out", c0, cfg.in_ch, 3);
+        s
+    }
+
+    /// Two denoise evals of a tiny UNet3D as Metal programs (the caller arms the CPU tripwire).
+    pub fn tiny_on_gpu() -> Result<(), String> {
+        use crate::model::diff_graph::testutil::{synth, Lcg};
+        let cfg = Cfg { in_ch: 4, block_out: [64, 128, 128, 128], ctx_dim: 96, tin_width: 128 };
+        let st = St::from_reader(Box::new(synth(&specs(cfg), 7)), cfg)?;
+        let m = Unet3d::from_st(st)?;
+        let (frames, h, w, ctx_len) = (2, 8, 8, 3);
+        let mut r = Lcg(4);
+        let (x, ctx) = (r.vec(frames * cfg.in_ch * h * w, 1.0), r.vec(ctx_len * cfg.ctx_dim, 1.0));
+        for t in [900.0, 400.0] {
+            let out = m.forward(&x, frames, h, w, t, &ctx, ctx_len)?;
+            if out.iter().any(|v| !v.is_finite()) {
+                return Err("non-finite UNet3D output".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::specs;
     use super::*;
 
     fn silu(v: f32) -> f32 {
@@ -1096,108 +1224,6 @@ mod tests {
         assert_eq!(temporal.forward(&x, frames, 320, hw), x);
     }
 
-    type Specs = Vec<(String, Vec<usize>)>;
-
-    fn spec(s: &mut Specs, name: String, shape: &[usize]) {
-        s.push((name, shape.to_vec()));
-    }
-    fn s_lin(s: &mut Specs, base: &str, i: usize, o: usize, bias: bool) {
-        spec(s, format!("{base}.weight"), &[o, i]);
-        if bias {
-            spec(s, format!("{base}.bias"), &[o]);
-        }
-    }
-    fn s_norm(s: &mut Specs, base: &str, c: usize) {
-        spec(s, format!("{base}.weight"), &[c]);
-        spec(s, format!("{base}.bias"), &[c]);
-    }
-    fn s_conv(s: &mut Specs, base: &str, i: usize, o: usize, k: usize) {
-        spec(s, format!("{base}.weight"), &[o, i, k, k]);
-        spec(s, format!("{base}.bias"), &[o]);
-    }
-    /// `Transformer2DModel` / `TransformerTemporalModel` weights: channels `c`, width `inner`, attn2 kv width `kv`.
-    fn s_trans(s: &mut Specs, p: &str, c: usize, inner: usize, kv: usize) {
-        s_norm(s, &format!("{p}.norm"), c);
-        s_lin(s, &format!("{p}.proj_in"), c, inner, true);
-        s_lin(s, &format!("{p}.proj_out"), inner, c, true);
-        let t = format!("{p}.transformer_blocks.0");
-        for n in ["norm1", "norm2", "norm3"] {
-            s_norm(s, &format!("{t}.{n}"), inner);
-        }
-        for (a, kv) in [("attn1", inner), ("attn2", kv)] {
-            s_lin(s, &format!("{t}.{a}.to_q"), inner, inner, false);
-            s_lin(s, &format!("{t}.{a}.to_k"), kv, inner, false);
-            s_lin(s, &format!("{t}.{a}.to_v"), kv, inner, false);
-            s_lin(s, &format!("{t}.{a}.to_out.0"), inner, inner, true);
-        }
-        s_lin(s, &format!("{t}.ff.net.0.proj"), inner, 4 * inner, true);
-        s_lin(s, &format!("{t}.ff.net.2"), 2 * inner, inner, true);
-    }
-    fn s_layer(s: &mut Specs, cfg: Cfg, base: &str, j: usize, ci: usize, co: usize, attn: bool) {
-        let r = format!("{base}.resnets.{j}");
-        s_norm(s, &format!("{r}.norm1"), ci);
-        s_conv(s, &format!("{r}.conv1"), ci, co, 3);
-        s_lin(s, &format!("{r}.time_emb_proj"), 4 * cfg.block_out[0], co, true);
-        s_norm(s, &format!("{r}.norm2"), co);
-        s_conv(s, &format!("{r}.conv2"), co, co, 3);
-        if ci != co {
-            s_conv(s, &format!("{r}.conv_shortcut"), ci, co, 1);
-        }
-        let tc = format!("{base}.temp_convs.{j}");
-        for i in 1..=4 {
-            s_norm(s, &format!("{tc}.conv{i}.0"), co);
-            let conv = format!("{tc}.conv{i}.{}", if i == 1 { 2 } else { 3 });
-            spec(s, format!("{conv}.weight"), &[co, co, 3, 1, 1]);
-            spec(s, format!("{conv}.bias"), &[co]);
-        }
-        if attn {
-            s_trans(s, &format!("{base}.attentions.{j}"), co, co, cfg.ctx_dim);
-            s_trans(s, &format!("{base}.temp_attentions.{j}"), co, co, co);
-        }
-    }
-
-    /// Every tensor of a UNet3D with `cfg` (the layout `Unet3d::from_st` consumes).
-    fn specs(cfg: Cfg) -> Specs {
-        let mut s = Specs::new();
-        let (bo, c0, top) = (cfg.block_out, cfg.block_out[0], cfg.block_out.len() - 1);
-        s_lin(&mut s, "time_embedding.linear_1", c0, 4 * c0, true);
-        s_lin(&mut s, "time_embedding.linear_2", 4 * c0, 4 * c0, true);
-        s_conv(&mut s, "conv_in", cfg.in_ch, c0, 3);
-        s_trans(&mut s, "transformer_in", c0, cfg.tin_width, cfg.tin_width);
-        let mut ch = c0;
-        for (i, &out) in bo.iter().enumerate() {
-            let base = format!("down_blocks.{i}");
-            for j in 0..LAYERS {
-                s_layer(&mut s, cfg, &base, j, if j == 0 { ch } else { out }, out, i < top);
-            }
-            if i < top {
-                s_conv(&mut s, &format!("{base}.downsamplers.0.conv"), out, out, 3);
-            }
-            ch = out;
-        }
-        let c = bo[top];
-        s_layer(&mut s, cfg, "mid_block", 0, c, c, false);
-        s_trans(&mut s, "mid_block.attentions.0", c, c, cfg.ctx_dim);
-        s_trans(&mut s, "mid_block.temp_attentions.0", c, c, c);
-        s_layer(&mut s, cfg, "mid_block", 1, c, c, false);
-        let mut prev = c;
-        for i in 0..=top {
-            let base = format!("up_blocks.{i}");
-            let out = bo[top - i];
-            let input = bo[top - (i + 1).min(top)];
-            for j in 0..=LAYERS {
-                let skip = if j == LAYERS { input } else { out };
-                s_layer(&mut s, cfg, &base, j, (if j == 0 { prev } else { out }) + skip, out, i > 0);
-            }
-            if i < top {
-                s_conv(&mut s, &format!("{base}.upsamplers.0.conv"), out, out, 3);
-            }
-            prev = out;
-        }
-        s_norm(&mut s, "conv_norm_out", c0);
-        s_conv(&mut s, "conv_out", c0, cfg.in_ch, 3);
-        s
-    }
 
     #[test]
     fn gpu_matches_cpu() {
