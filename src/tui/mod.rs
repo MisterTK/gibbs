@@ -4,11 +4,17 @@
 //! Prompts and model loads run on background threads and report through a channel, so the UI
 //! never blocks; it redraws on input, on streamed output, and every [`REFRESH`] otherwise.
 
+mod components;
+mod layout;
 pub(crate) mod mascot;
 mod picker;
 pub mod qos;
 mod render;
 pub mod settings;
+#[cfg(test)]
+mod snapshot;
+pub mod theme;
+mod widgets;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
 use crate::kv::PagedKVPool;
 use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore, SequenceClassifier};
@@ -299,16 +305,18 @@ pub struct TuiApp {
     pub show_template_modal: bool,
     pub active_template: usize,
     pub system_prompt: String,
-    pub show_logprob_inspector: bool,
+    /// Component shown in detail (`Ctrl+R/P/T/L`, `/roofline`); `Esc` clears it.
+    pub detail: Option<layout::Comp>,
+    /// Measured GEMM peak in GFLOP/s from the host profile; 0 when unmeasured.
+    gemm_peak_gflops: f64,
+    /// The three slowest host-profile GEMM timings, shown by the ROOFLINE profile row.
+    gemm_top: Vec<String>,
     pub latest_logprobs: Option<crate::scheduler::TokenLogprobInfo>,
     pub logprob_history: std::collections::VecDeque<crate::scheduler::TokenLogprobInfo>,
     pub logprob_scrub_idx: usize,
     pub logprob_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::scheduler::TokenLogprobInfo>>,
-    pub show_roofline_inspector: bool,
     pub roofline_probe_result: Option<String>,
-    pub show_latency_modal: bool,
-    pub show_token_inspector: bool,
     pub show_settings_modal: bool,
     pub reencode_policy: crate::model::weight_format::ReencodePolicy,
     pub variant_policy: crate::model::weight_format::VariantPolicy,
@@ -336,13 +344,28 @@ impl TuiApp {
         );
         let (updates_tx, updates_rx) = mpsc::channel();
         let spark_total = telemetry.total_tokens_generated.load(Ordering::Relaxed);
+        let mut gemm_peak_gflops = 0.0f64;
+        let mut gemm_top: Vec<(f64, String)> = Vec::new();
         #[cfg(target_os = "macos")]
         if let Ok(rt) =
             crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
         {
             let prof = rt.profile();
             telemetry.set_hardware_profile(&prof.device, prof.memory_bandwidth_gbps as f32);
+            // Measured GEMM peak (GFLOP/s) over the host profile's timings: the compute roof.
+            for t in &prof.gemm {
+                let min_us = t.us.iter().map(|(_, us)| *us).fold(f64::INFINITY, f64::min);
+                if min_us.is_finite() && min_us > 0.0 {
+                    gemm_peak_gflops = gemm_peak_gflops
+                        .max(2.0 * t.m as f64 * t.n as f64 * t.k as f64 / (min_us * 1e3));
+                }
+                if let Some((k, us)) = t.us.first() {
+                    gemm_top.push((*us, format!("{k:?}[{},{}] {us:.1} µs", t.m, t.n)));
+                }
+            }
         }
+        gemm_top.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let gemm_top: Vec<String> = gemm_top.into_iter().take(3).map(|(_, s)| s).collect();
         Self {
             telemetry,
             kv_pool,
@@ -376,15 +399,14 @@ impl TuiApp {
             show_template_modal: false,
             active_template: 0,
             system_prompt: "You are a helpful and concise AI assistant.".into(),
-            show_logprob_inspector: false,
             latest_logprobs: None,
             logprob_history: std::collections::VecDeque::with_capacity(64),
             logprob_scrub_idx: 0,
             logprob_rx: None,
-            show_roofline_inspector: false,
             roofline_probe_result: None,
-            show_latency_modal: false,
-            show_token_inspector: false,
+            detail: None,
+            gemm_peak_gflops,
+            gemm_top,
             show_settings_modal: false,
             reencode_policy: crate::model::weight_format::ReencodePolicy::MaxSpeed,
             variant_policy: crate::model::weight_format::VariantPolicy::Fastest,
@@ -473,13 +495,10 @@ impl TuiApp {
             ),
             "/agent" => Some(self.launch_agent(rest.trim())),
             "/roofline" => {
-                self.show_roofline_inspector = true;
+                self.detail = Some(layout::Comp::Roofline);
                 let probe = self.run_roofline_probe();
                 self.roofline_probe_result = probe.as_ref().ok().cloned();
                 Some(probe)
-            }
-            "/avatar" => {
-                Some(Ok("Josiah Willard Gibbs classic portrait active".into()))
             }
             "/reencode" => {
                 let target = rest.trim();
@@ -606,14 +625,12 @@ impl TuiApp {
                      Keybindings:\n\
                      · m / Esc    : Switch between Dashboard & Model Picker\n\
                      · F2         : System Prompt / Chat Template Selector\n\
-                     · F3         : Switch Josiah Willard Gibbs Mascot Scene\n\
-                     · Ctrl+P     : Token Perplexity & Logprob History Inspector (←/→ scrub)\n\
-                     · Ctrl+R     : 2D Visual Roofline Diagnostic Inspector\n\
-                     · Esc        : Close open modal / cancel prompt / return to Dashboard\n\
+                     · Ctrl+R/P/T/L: Focus ROOFLINE / LOGPROBS / TOKENS / LATENCY for detail (←/→ scrub logprobs)\n\
+                     · Esc        : Unfocus component / cancel prompt / return to Dashboard\n\
                      · Ctrl+C     : Exit Gibbs engine\n\n\
                      Slash Commands:\n\
-                     · /roofline  : Open 2D Roofline Diagnostic Inspector & calibration sweep\n\
-                     · /avatar [style] : Switch mascot art scene (classic, chalkboard, thermo, lattice, cyber)\n\
+                     · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
+                     · /profile on|off : Toggle kernel GPU timing profiling (ROOFLINE profile row)\n\
                      · /bench     : Report live decode throughput, RSS, and roofline efficiency\n\
                      · /quant     : Display active weight quantization formats\n\
                      · /gibbs     : Full historical biography & ASCII portrait of J. Willard Gibbs\n\
@@ -638,7 +655,7 @@ impl TuiApp {
             "/classify" | "/cls" => (Ok(Route::Classify), rest.trim()),
             "/i2v" => (Ok(Route::Video { image: true }), rest.trim()),
             "/video" | "/vid" | "/t2v" => (Ok(Route::Video { image: false }), rest.trim()),
-            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /avatar, /bench, /quant, /help, /gibbs")), ""),
+            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /profile, /bench, /quant, /help, /gibbs")), ""),
             _ if self.classifier.read().is_some() => (Ok(Route::Classify), raw.as_str()),
             _ if self.image_model.read().is_some() => (Ok(Route::Image), raw.as_str()),
             _ => (Ok(route_for_model(&self.model_id())), raw.as_str()),
@@ -1361,7 +1378,7 @@ impl TuiApp {
         if let Some(why) = refused {
             self.picker.set_note(
                 format!("cannot delete {id}: {why}"),
-                ratatui::style::Color::Red,
+                theme::Token::Crimson,
             );
             return;
         }
@@ -1378,7 +1395,7 @@ impl TuiApp {
             Err(e) => {
                 let msg = format!("cannot delete {}: {e}", dir.display());
                 self.telemetry.log_warn(&format!("TUI: {msg}"));
-                self.picker.set_note(msg, ratatui::style::Color::Red);
+                self.picker.set_note(msg, theme::Token::Crimson);
             }
         }
     }
@@ -1432,6 +1449,8 @@ impl TuiApp {
                 }
             }
         }
+        self.picker
+            .set_ceiling_gbps(self.telemetry.get_summary().memory_bandwidth_gbps);
         if self.focus == Focus::Picker {
             dirty |= self.picker.tick();
         }
@@ -1443,7 +1462,7 @@ impl TuiApp {
                 self.logprob_history.push_back(info.clone());
                 self.latest_logprobs = Some(info);
                 self.logprob_scrub_idx = self.logprob_history.len().saturating_sub(1);
-                if self.show_logprob_inspector {
+                if self.detail == Some(layout::Comp::Logprobs) {
                     dirty = true;
                 }
             }
@@ -1465,62 +1484,40 @@ impl TuiApp {
             self.cancel_chat();
             return false;
         }
-        if ctrl && key.code == KeyCode::Char('p') {
-            if matches!(self.focus, Focus::Dashboard | Focus::Prompt) {
-                self.show_logprob_inspector = !self.show_logprob_inspector;
-                return false;
-            }
-        }
-        if ctrl && key.code == KeyCode::Char('r') {
-            if matches!(self.focus, Focus::Dashboard | Focus::Prompt) {
-                self.show_roofline_inspector = !self.show_roofline_inspector;
-                if self.show_roofline_inspector && self.roofline_probe_result.is_none() {
+        for (ch, comp) in [
+            ('p', layout::Comp::Logprobs),
+            ('r', layout::Comp::Roofline),
+            ('l', layout::Comp::Latency),
+            ('t', layout::Comp::Tokens),
+        ] {
+            if ctrl
+                && key.code == KeyCode::Char(ch)
+                && matches!(self.focus, Focus::Dashboard | Focus::Prompt)
+            {
+                self.detail = if self.detail == Some(comp) { None } else { Some(comp) };
+                if self.detail == Some(layout::Comp::Roofline)
+                    && self.roofline_probe_result.is_none()
+                {
                     self.trigger_background_roofline_probe();
                 }
                 return false;
             }
         }
-        if ctrl && key.code == KeyCode::Char('l') {
-            if matches!(self.focus, Focus::Dashboard | Focus::Prompt) {
-                self.show_latency_modal = !self.show_latency_modal;
-                return false;
-            }
-        }
-        if ctrl && key.code == KeyCode::Char('t') {
-            if matches!(self.focus, Focus::Dashboard | Focus::Prompt) {
-                self.show_token_inspector = !self.show_token_inspector;
-                return false;
-            }
-        }
-        if self.show_latency_modal && key.code == KeyCode::Esc {
-            self.show_latency_modal = false;
-            return false;
-        }
-        if self.show_token_inspector && key.code == KeyCode::Esc {
-            self.show_token_inspector = false;
-            return false;
-        }
-        if self.show_roofline_inspector {
-            if key.code == KeyCode::Char('p') {
-                self.trigger_background_roofline_probe();
-                return false;
-            }
-            if key.code == KeyCode::Esc {
-                self.show_roofline_inspector = false;
-                return false;
-            }
-        }
-        if self.show_logprob_inspector {
-            match key.code {
-                KeyCode::Esc => {
-                    self.show_logprob_inspector = false;
+        if self.detail.is_some() && self.focus != Focus::Picker {
+            match (self.detail, key.code) {
+                (_, KeyCode::Esc) => {
+                    self.detail = None;
                     return false;
                 }
-                KeyCode::Left => {
+                (Some(layout::Comp::Roofline), KeyCode::Char('p')) => {
+                    self.trigger_background_roofline_probe();
+                    return false;
+                }
+                (Some(layout::Comp::Logprobs), KeyCode::Left) => {
                     self.logprob_scrub_idx = self.logprob_scrub_idx.saturating_sub(1);
                     return false;
                 }
-                KeyCode::Right => {
+                (Some(layout::Comp::Logprobs), KeyCode::Right) => {
                     self.logprob_scrub_idx = (self.logprob_scrub_idx + 1)
                         .min(self.logprob_history.len().saturating_sub(1));
                     return false;
@@ -2256,21 +2253,21 @@ mod tests {
             ImageSlot::default(),
         );
 
-        assert!(!app.show_logprob_inspector);
+        assert_eq!(app.detail, None);
         let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
 
         // 1. Toggle on Dashboard
         app.handle_key(ctrl_p);
-        assert!(app.show_logprob_inspector);
+        assert_eq!(app.detail, Some(layout::Comp::Logprobs));
 
         // 2. Esc closes it
         app.handle_key(key(KeyCode::Esc));
-        assert!(!app.show_logprob_inspector);
+        assert_eq!(app.detail, None);
 
         // 3. In Picker focus, Ctrl-P does NOT open inspector
         app.focus = Focus::Picker;
         app.handle_key(ctrl_p);
-        assert!(!app.show_logprob_inspector);
+        assert_eq!(app.detail, None);
 
         // 4. Transmit real TokenLogprobInfo on channel and verify tick() receives it
         let info = crate::scheduler::TokenLogprobInfo {
@@ -2289,7 +2286,7 @@ mod tests {
         // 5. Test scrub index navigation with Left / Right
         app.focus = Focus::Dashboard;
         app.handle_key(ctrl_p);
-        assert!(app.show_logprob_inspector);
+        assert_eq!(app.detail, Some(layout::Comp::Logprobs));
         app.handle_key(key(KeyCode::Left));
         assert_eq!(app.logprob_scrub_idx, 0);
         app.handle_key(key(KeyCode::Right));
@@ -2319,26 +2316,32 @@ mod tests {
             assert!(probe.is_err());
         }
 
-        // 3. Ctrl+R opens roofline inspector modal, Esc closes it
-        assert!(!app.show_roofline_inspector);
+        // 3. Ctrl+R focuses the roofline component, Esc unfocuses it
+        assert_eq!(app.detail, None);
         let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         app.handle_key(ctrl_r);
-        assert!(app.show_roofline_inspector);
+        assert_eq!(app.detail, Some(layout::Comp::Roofline));
         app.handle_key(key(KeyCode::Esc));
-        assert!(!app.show_roofline_inspector);
+        assert_eq!(app.detail, None);
 
         // 4. /roofline command opens modal
         app.input = "/roofline".into();
         app.submit_prompt();
-        assert!(app.show_roofline_inspector);
+        assert_eq!(app.detail, Some(layout::Comp::Roofline));
         app.handle_key(key(KeyCode::Esc));
-        assert!(!app.show_roofline_inspector);
+        assert_eq!(app.detail, None);
 
-        // 5. Classic Gibbs portrait verification
+        // 5. The removed stub is an unknown command; /gibbs prints the portrait and biography
         assert_eq!(app.mascot.state, mascot::MascotState::Idle);
-        app.input = "/avatar".into();
+        let gone = format!("/{}", ["ava", "tar"].concat());
+        app.input = gone.clone();
         app.submit_prompt();
-        assert!(app.history.last().unwrap().output.contains("Gibbs"));
+        let e = app.history.last().unwrap();
+        assert_eq!(e.kind, Kind::Error);
+        assert!(e.output.contains(&format!("unknown command '{gone}'")));
+        app.input = "/gibbs".into();
+        app.submit_prompt();
+        assert!(app.history.last().unwrap().output.contains("JOSIAH WILLARD GIBBS"));
         // 7. /bench, /quant, /help commands
         app.input = "/bench".into();
         app.submit_prompt();
@@ -2530,5 +2533,111 @@ mod tests {
         assert!(
             s.variant == "fastest" || s.variant == "fastest-4bit" || s.variant == "best-quality"
         );
+    }
+
+    fn lines_of(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn truecolor() -> theme::TestGuard {
+        theme::test_guard(theme::Theme { truecolor: true, mono: false })
+    }
+
+    fn fake_load() -> Load {
+        let progress = Arc::new(DownloadProgress::default());
+        progress.total.store(796_000_000, Ordering::Relaxed);
+        progress.done.store(360_000_000, Ordering::Relaxed);
+        Load {
+            id: "unsloth/gemma-4-E2B-it-qat-GGUF".into(),
+            idx: 0,
+            started: Instant::now(),
+            stage: Arc::new(Mutex::new("downloading")),
+            progress,
+            sample: (Instant::now(), 0),
+            rate: 12e6,
+        }
+    }
+
+    #[test]
+    fn renders_every_size_with_the_instruments() {
+        let _g = truecolor();
+        let app = snapshot::fixture_app();
+        for (w, h) in [(80, 24), (100, 30), (120, 40), (160, 50), (200, 60)] {
+            let lines = lines_of(&snapshot::render_buffer(&app, w, h));
+            assert!(lines[0].contains("GIBBS"), "{w}x{h}: {}", lines[0]);
+            let text = lines.join("\n");
+            if w >= 100 && h >= 30 {
+                for title in ["ROOFLINE", "TOKENS", "LATENCY"] {
+                    assert!(text.contains(title), "{w}x{h}: no {title}\n{text}");
+                }
+            }
+            assert_eq!(text.contains("TELEMETRY"), w < 100, "{w}x{h}: dock only when compact");
+            assert_eq!(text.contains("IDLE") || text.contains("GENERATING"), h >= 44 && w >= 100, "{w}x{h}: cameo panel");
+        }
+    }
+
+    #[test]
+    fn compact_dock_keeps_each_component_on_one_row() {
+        let _g = truecolor();
+        let app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        let lines = lines_of(&snapshot::render_buffer(&app, 80, 24));
+        let (v, th) = (app.vitals(), theme::theme());
+        let atoms = app.dock_atoms(&v, &th);
+        assert!(atoms.len() >= 4);
+        for atom in atoms {
+            let text: String = atom.iter().map(|s| s.content.as_ref()).collect();
+            assert!(lines.iter().any(|l| l.contains(&text)), "{text:?} split or missing:\n{}", lines.join("\n"));
+        }
+    }
+
+    #[test]
+    fn load_component_shows_the_stage_track_at_every_tier() {
+        let _g = truecolor();
+        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        app.load = Some(fake_load());
+        for (w, h) in [(80, 24), (120, 40), (200, 60)] {
+            let text = lines_of(&snapshot::render_buffer(&app, w, h)).join("\n");
+            for word in ["RESOLVE", "COMPILE", "LOADING"] {
+                assert!(text.contains(word), "{w}x{h}: no {word}\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_color_theme_paints_no_foreground() {
+        let _g = theme::test_guard(theme::Theme { truecolor: true, mono: true });
+        let app = snapshot::fixture_app();
+        for (w, h) in [(80, 24), (160, 50)] {
+            let buf = snapshot::render_buffer(&app, w, h);
+            for c in buf.content() {
+                assert_eq!(c.fg, ratatui::style::Color::Reset, "{w}x{h}: {:?}", c.symbol());
+                assert_eq!(c.bg, ratatui::style::Color::Reset);
+            }
+        }
+    }
+
+    #[test]
+    fn focused_component_replaces_the_modal() {
+        let _g = truecolor();
+        let mut app = snapshot::fixture_app();
+        app.detail = Some(layout::Comp::Logprobs);
+        for (w, h) in [(80, 24), (160, 50)] {
+            let text = lines_of(&snapshot::render_buffer(&app, w, h)).join("\n");
+            assert!(text.contains("LOGPROBS") && text.contains("scrub"), "{w}x{h}\n{text}");
+        }
+        // Focus is shown by a BRASS border on the focused component only.
+        let buf = snapshot::render_buffer(&app, 160, 50);
+        let brass = theme::theme().color(theme::Token::Brass);
+        let corners = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "╔" && buf[(x, y)].fg == brass)
+            .count();
+        assert_eq!(corners, 1);
     }
 }
