@@ -581,6 +581,25 @@ impl TextModel {
     pub(crate) fn to_decode_graph_unchecked(
         &self,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.decode_graph(None)
+    }
+
+    /// The decode graph with the gevva cross-encoder head (`head_norm` RMSNorm at `eps`, then the
+    /// bias-free `score` `[labels, hidden]`) in place of the LM head: each step's output is the
+    /// `[labels]` logits of the token it ran.
+    pub(crate) fn to_seqcls_graph(
+        &self,
+        head_norm: &[f32],
+        eps: f32,
+        score: &[f32],
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.decode_graph(Some((head_norm, eps, score)))
+    }
+
+    fn decode_graph(
+        &self,
+        head: Option<(&[f32], f32, &[f32])>,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor};
         fn mat_dtype(m: &crate::model::weights::Mat) -> DType {
             if let Some(p) = m.packed() {
@@ -1077,32 +1096,56 @@ impl TextModel {
             DType::F32,
         );
 
-        // 4. LM Head (quantized native representation, avoiding dense F32 dequantization)
-        let lm_w = g.weight(
-            "lm_head.weight",
-            vec![self.vocab, h],
-            mat_dtype(&self.embed),
-        );
-        w.insert("lm_head.weight", self.embed.to_graph_tensor());
-        let logits = g.add(
-            "lm_head",
-            Op::Linear,
-            &[final_norm, lm_w],
-            vec![n, self.vocab],
-            DType::F32,
-        );
-        let logits = if let Some(cap) = self.softcap {
+        let logits = if let Some((head_norm, eps, score)) = head {
+            // Sequence classification (gevva): the head's own RMSNorm, then the bias-free
+            // `[labels, hidden]` score instead of the LM head.
+            let norm_w = g.weight("seqcls.norm.weight", vec![h], DType::F32);
+            w.insert("seqcls.norm.weight", Tensor::F32(head_norm.to_vec()));
+            let normed = g.add(
+                "seqcls.norm",
+                Op::RmsNorm { eps },
+                &[final_norm, norm_w],
+                vec![n, h],
+                DType::F32,
+            );
+            let labels = score.len() / h;
+            let score_w = g.weight("score.weight", vec![labels, h], DType::F32);
+            w.insert("score.weight", Tensor::F32(score.to_vec()));
             g.add(
-                "logits_softcap",
-                Op::Unary {
-                    kind: crate::graph::UnaryKind::SoftCap(cap),
-                },
-                &[logits],
-                vec![n, self.vocab],
+                "score",
+                Op::Linear,
+                &[normed, score_w],
+                vec![n, labels],
                 DType::F32,
             )
         } else {
-            logits
+            // 4. LM Head (quantized native representation, avoiding dense F32 dequantization)
+            let lm_w = g.weight(
+                "lm_head.weight",
+                vec![self.vocab, h],
+                mat_dtype(&self.embed),
+            );
+            w.insert("lm_head.weight", self.embed.to_graph_tensor());
+            let logits = g.add(
+                "lm_head",
+                Op::Linear,
+                &[final_norm, lm_w],
+                vec![n, self.vocab],
+                DType::F32,
+            );
+            if let Some(cap) = self.softcap {
+                g.add(
+                    "logits_softcap",
+                    Op::Unary {
+                        kind: crate::graph::UnaryKind::SoftCap(cap),
+                    },
+                    &[logits],
+                    vec![n, self.vocab],
+                    DType::F32,
+                )
+            } else {
+                logits
+            }
         };
         g.output(logits);
 
