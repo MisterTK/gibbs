@@ -1084,5 +1084,13 @@ mod tests {
         let err = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
         println!("gemma4 audio {n} tokens: rel err {err:e}");
         assert!(err < 1e-3, "{err}");
+        let abs = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(abs < 1e-3, "max |d| {abs}");
+        let (_, mask) = gpu.features.frames(&wav).unwrap();
+        let cache = gpu.gpu.as_ref().unwrap();
+        for key in [[0, mask.len()], [1, mask.len()]] {
+            let p = cache.get(&key, || unreachable!("compiled by encode")).unwrap();
+            assert_eq!(p.lock().cpu_node_count(), 0, "nodes run on the CPU");
+        }
     }
 }
