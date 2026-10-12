@@ -1056,7 +1056,7 @@ mod tests {
         for i in 0..2 {
             block(format!("blocks.{i}"), dim, dim, kv, mlp, true);
             for kind in ["layerwise_blocks", "refiner_blocks"] {
-                block(format!("txtfusion.{kind}.{i}"), td, td, td, tmlp, false);
+                block(format!("txtfusion.{kind}.{i}"), td, td, td / 2, tmlp, false);
             }
         }
         out
