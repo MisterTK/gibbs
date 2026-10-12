@@ -539,7 +539,7 @@ impl DcAeDecoder {
         let all = b.concat(&[qkv, ms2], 0);
         let heads = 6 * inner / (3 * hd);
         let all = b.reshape(all, &[heads, 3, hd, hw]);
-        let mut part = |b: &mut Gb, i: usize| {
+        let part = |b: &mut Gb, i: usize| {
             let p = b.slice(all, 1, i, i + 1);
             b.reshape(p, &[heads, hd, hw])
         };
