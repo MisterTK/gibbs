@@ -59,6 +59,7 @@ impl GraphProgram {
         assert!(plan.segments.len() <= 1, "placement yields at most one segment");
         let primary_device = plan.primary_device();
         if primary_device == Device::Metal {
+            crate::graph::passes::dtype_adapt::run(&mut graph);
             crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut graph, &|f| {
                 device_supports_op(Device::Metal, &crate::graph::Op::Linear, crate::graph::DType::Quant(f))
             })?;

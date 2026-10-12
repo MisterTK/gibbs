@@ -1,15 +1,24 @@
-//! GPU-side activation dtype adaptation: inserts `Cast` around F32-only kernels for F16/BF16 values.
-//!
-//! No `Cast` op or kernel exists yet (G4.1 step 9), so nothing is adapted and `can_cast` is false.
+//! GPU-side activation dtype adaptation: the Metal kernels compute in f32, so F16/BF16 activations
+//! (graph inputs and node outputs) are retyped to F32. Weights keep their stored dtype.
 
-use crate::graph::{DType, Graph, Op};
+use crate::graph::{DType, Graph, Op, ValueKind};
+use crate::hardware::Device;
 
-/// Inserts casts so F16/BF16 operands reach F32-only kernels.
-pub fn run(_g: &mut Graph) {}
+/// Retypes F16/BF16 activations to F32 (the executor already widens inputs and returns f32).
+pub fn run(g: &mut Graph) {
+    for v in &mut g.values {
+        if matches!(v.kind, ValueKind::Input | ValueKind::Node(_))
+            && matches!(v.dtype, DType::F16 | DType::BF16)
+        {
+            v.dtype = DType::F32;
+        }
+    }
+}
 
-/// Whether `op` at the reduced-precision `dtype` can run on the GPU through an inserted cast.
-pub fn can_cast(_op: &Op, _dtype: DType) -> bool {
-    false
+/// Whether `op` at the reduced-precision `dtype` runs on the GPU after [`run`]: its F32 form lowers.
+pub fn can_cast(op: &Op, dtype: DType) -> bool {
+    matches!(dtype, DType::F16 | DType::BF16)
+        && crate::graph::placement::device_supports_op(Device::Metal, op, DType::F32)
 }
 
 /// Retypes weights whose quant format has no GPU kernel to F32. The Metal weight upload dequantizes
@@ -37,4 +46,23 @@ pub fn retype_uncoded_weights(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_retypes_activations_and_keeps_weights() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 4], DType::BF16);
+        let w = g.weight("w", vec![4], DType::BF16);
+        let y = g.add("n", Op::RmsNorm { eps: 1e-6 }, &[x, w], vec![1, 4], DType::F16);
+        g.output(y);
+        run(&mut g);
+        assert_eq!(g.value(x).dtype, DType::F32);
+        assert_eq!(g.value(y).dtype, DType::F32);
+        assert_eq!(g.value(w).dtype, DType::BF16);
+        assert!(can_cast(&Op::RmsNorm { eps: 1e-6 }, DType::F16));
+    }
 }
