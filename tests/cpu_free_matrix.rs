@@ -85,6 +85,9 @@ fn gpu_fixture(f: Family) {
             let size = gibbs_engine::model::diff_fixtures::tiny_sd_on_gpu().expect("tiny SD runs on Metal");
             assert_eq!(size, (8, 8));
         }
+        Family::VideoModelScope => {
+            gibbs_engine::model::unet3d::fixture::tiny_on_gpu().expect("tiny UNet3D runs on Metal");
+        }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }

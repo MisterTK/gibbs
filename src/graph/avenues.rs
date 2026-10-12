@@ -278,7 +278,7 @@ pub fn family_status(f: Family) -> Status {
         DiffusionDit => Status::Gated("builder: DiT forward is host Rust, no graph builder"),
         Vae => Status::Gated("builder: VAE decoders are host Rust, no graph builder"),
         VideoLtx => Status::Gated("builder: LTX forward is host Rust, no graph builder"),
-        VideoModelScope => Status::Gated("builder: UNet3D forward is host Rust, no graph builder"),
+        VideoModelScope => Status::Gpu,
         Audio => Status::Gated("builder: conformer audio forward is host Rust; no Metal program yet"),
     }
 }
@@ -648,6 +648,18 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (group_norm(), F32),
             (attn(), F32),
             (Op::Concat { axis: 0 }, F32),
+            (conv2d(), F32),
+            (Op::Silu, F32),
+            (Op::Linear, F32),
+            (Op::Linear, DType::F16),
+            (Op::Add, F32),
+            (Op::Mul, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
+            (Op::Gelu { tanh: false }, F32),
+            (ln(), F32),
+            (slice(), F32),
+            (reshape(), F32),
+            (Op::Transpose { perm: vec![1, 0] }, F32),
             (
                 Op::Upsample {
                     scale: 2,

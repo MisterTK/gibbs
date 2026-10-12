@@ -231,7 +231,7 @@ fn run_ltx(
     Ok(())
 }
 
-/// One CLI text-to-video generation (ModelScope TextToVideoSDPipeline checkpoints), CPU only.
+/// One CLI text-to-video generation (ModelScope TextToVideoSDPipeline checkpoints).
 fn run_text_to_video(cli: &Cli, hub: &HuggingFaceHub, backend: Device) -> Result<(), String> {
     let model = &cli.model;
     gibbs_engine::graph::avenues::family_gate(
