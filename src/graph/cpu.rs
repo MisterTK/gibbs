@@ -48,6 +48,7 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::StateReorder
         | Op::Megakernel(_) => true,
         Op::Upsample { mode, .. } => matches!(mode, crate::graph::UpsampleMode::Nearest),
+        Op::MatMul { .. } => true,
         Op::Attention {
             kv_heads,
             heads,
@@ -314,6 +315,10 @@ pub fn run(
                 }
                 let rows = x.len() / in_f;
                 dispatch_linear(x, w_slot, bias, in_f, out_f, rows, name)?
+            }
+            Op::MatMul { transpose_a, transpose_b } => {
+                let (a, b) = (operand(&bound, &slots, ins, name, 0)?, operand(&bound, &slots, ins, name, 1)?);
+                matmul_ref(graph, ins, a, b, *transpose_a, *transpose_b, name)?
             }
             Op::Megakernel(desc) => {
                 match &desc.kind {
@@ -1511,6 +1516,68 @@ pub fn run(
                 .ok_or_else(|| format!("output '{}' was never computed", graph.value(*v).name))
         })
         .collect()
+}
+
+/// `op(a)·op(b)` over the last two dims; leading batch dims broadcast numpy-style (right-aligned).
+fn matmul_ref(
+    graph: &Graph,
+    ins: &[ValueId],
+    a: &[f32],
+    b: &[f32],
+    ta: bool,
+    tb: bool,
+    name: &str,
+) -> Result<Vec<f32>, String> {
+    let (sa, sb) = (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape);
+    if sa.len() < 2 || sb.len() < 2 || a.len() != sa.iter().product::<usize>() || b.len() != sb.iter().product::<usize>() {
+        return Err(format!("node '{name}': MatMul operands {sa:?} x {sb:?} must be rank >= 2 and match their data"));
+    }
+    let (ar, ac, br, bc) = (sa[sa.len() - 2], sa[sa.len() - 1], sb[sb.len() - 2], sb[sb.len() - 1]);
+    let (m, k) = if ta { (ac, ar) } else { (ar, ac) };
+    let (k2, n) = if tb { (bc, br) } else { (br, bc) };
+    if k != k2 {
+        return Err(format!("node '{name}': MatMul inner dims {k} != {k2} ({sa:?} x {sb:?})"));
+    }
+    let nd = (sa.len() - 2).max(sb.len() - 2);
+    let pad = |d: &[usize]| [vec![1; nd - d.len()], d.to_vec()].concat();
+    let (pa, pb) = (pad(&sa[..sa.len() - 2]), pad(&sb[..sb.len() - 2]));
+    let mut ob = Vec::with_capacity(nd);
+    for i in 0..nd {
+        match (pa[i], pb[i]) {
+            (x, y) if x == y || y == 1 => ob.push(x),
+            (1, y) => ob.push(y),
+            _ => return Err(format!("node '{name}': MatMul batch dims {sa:?} and {sb:?} do not broadcast")),
+        }
+    }
+    // Element offset of batch index `flat` in an operand with padded batch dims `p` and matrix size `sz`.
+    let off = |p: &[usize], mut flat: usize, sz: usize| {
+        let (mut o, mut stride) = (0, sz);
+        for i in (0..nd).rev() {
+            let idx = flat % ob[i];
+            flat /= ob[i];
+            if p[i] != 1 {
+                o += idx * stride;
+            }
+            stride *= p[i];
+        }
+        o
+    };
+    let mut out = vec![0.0f32; ob.iter().product::<usize>() * m * n];
+    for bi in 0..out.len() / (m * n).max(1) {
+        let (oa, obb) = (off(&pa, bi, ar * ac), off(&pb, bi, br * bc));
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f64;
+                for kk in 0..k {
+                    let av = if ta { a[oa + kk * m + i] } else { a[oa + i * k + kk] };
+                    let bv = if tb { b[obb + j * k + kk] } else { b[obb + kk * n + j] };
+                    acc += av as f64 * bv as f64;
+                }
+                out[bi * m * n + i * n + j] = acc as f32;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn slot<'a>(

@@ -11,7 +11,6 @@ use gibbs_engine::graph::{
 const KNOWN_UNLOWERED: &[(&str, &str, &str)] = &[
     ("Embedding", "F16", "no Metal kernel for Embedding at F16"),
     ("Embedding", "BF16", "no Metal kernel for Embedding at BF16"),
-    ("MatMul", "F32", "no Metal kernel for MatMul at F32"),
     ("MatMul", "F16", "no Metal kernel for MatMul at F16"),
     ("MatMul", "BF16", "no Metal kernel for MatMul at BF16"),
     ("LayerNorm", "F16", "no Metal kernel for LayerNorm at F16"),
