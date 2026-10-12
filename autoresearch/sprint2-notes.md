@@ -5,12 +5,13 @@
 - **Commit**: `f96b199`
 - **Metric (`geomean_roofline_pct`)**: 19.29%
 - **Status**: KEEP (Baseline)
-- **Guard**: PASS (`cargo test --lib -q graph:: && gibbs --bench-parity bench/loop.json && scripts/generic_guard.sh`)
+- **Guard**: PASS
 
-### Model Performance & Roofline Saturation:
-- `gemma-4-E2B-it-Q4_K_M`: 60.3 tok/s (roofline: 38.3%)
-- `Qwen3.5-2B-UD-Q4_K_XL`: 56.3 tok/s (roofline: 42.1%)
-- `DavidAU/Qwen3.5-9B-The-Defiant-Fable`: 25.7 tok/s (roofline: 49.3%)
-- `HuggingFaceTB/SmolLM2-135M`: 151.0 tok/s (roofline: 15.7%)
-- `unsloth/Llama-3.2-1B-Instruct-Q4_0`: 22.1 tok/s (roofline: 6.6%)
-- `gemma-4-E2B-it-qat-UD-Q2_K_XL`: 5.6 tok/s (roofline: 4.7%)
+## Iteration 1 (Fused MLP with Sliced Gate-Up Linear)
+- **Timestamp**: 2026-10-12T18:55:30Z
+- **Commit**: `bb32ce2`
+- **Metric (`geomean_roofline_pct`)**: 19.58% (+0.29 pp)
+- **Status**: KEEP (Delta >= +0.20 pp threshold)
+- **Luminal Reference**: `matmul.rs:79-103` (fused linear gate-up projections)
+- **Guard**: PASS (`cargo test --lib -q graph:: && gibbs --bench-parity bench/loop.json && scripts/generic_guard.sh`)
+- **Hypothesis**: Fusing transformer MLP blocks where Gate and Up projections originate from a shared sliced Linear into `Op::Megakernel` removes intermediate round-trips to the activation buffer and coalesces dispatches.
