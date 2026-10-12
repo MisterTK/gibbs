@@ -81,6 +81,29 @@ fn linear_attn(b: &mut Gb, p: &str, q: ValueId, k: ValueId, v: ValueId, n: usize
     b.reshape(&format!("{p}.flat"), o, &[n, heads * hd])
 }
 
+/// Depthwise 3x3 (pad 1) over token rows `x [h*w, c]` (weight `[c, 9]`) as a Conv2d on `[c, h, w]`.
+fn depthwise(b: &mut Gb, p: &str, x: ValueId, h: usize, w: usize, wt: &[f32], bias: &[f32]) -> ValueId {
+    let c = b.shape(x)[1];
+    let img = b.transpose(&format!("{p}.dw.in"), x, &[1, 0]);
+    let img = b.reshape(&format!("{p}.dw.img"), img, &[c, h, w]);
+    let dw_w = b.konst(&format!("{p}.dw.weight"), &[c, 1, 3, 3], wt.to_vec());
+    let dw_b = b.konst(&format!("{p}.dw.bias"), &[c], bias.to_vec());
+    let img = b.g.add(
+        &format!("{p}.dw"),
+        Op::Conv2d {
+            stride: [1, 1],
+            padding: [1, 1, 1, 1],
+            dilation: [1, 1],
+            groups: c,
+        },
+        &[img, dw_w, dw_b],
+        vec![c, h, w],
+        DType::F32,
+    );
+    let flat = b.reshape(&format!("{p}.dw.flat"), img, &[c, h * w]);
+    b.transpose(&format!("{p}.dw.out"), flat, &[1, 0])
+}
+
 impl SanaDit {
     /// Flow prediction for latents `lat [C, h, w]` at integer `timestep` given the raw encoder
     /// states `enc [n_cap, caption_channels]` (the program applies the caption projection).
@@ -155,24 +178,7 @@ impl SanaDit {
             let t = blk.inverted.emit(&mut b, &format!("{p}.inv"), nx);
             let t = b.silu(&format!("{p}.inv.act"), t);
             let c2 = blk.inverted.out_dim();
-            let img = b.transpose(&format!("{p}.dw.in"), t, &[1, 0]);
-            let img = b.reshape(&format!("{p}.dw.img"), img, &[c2, h, w]);
-            let dw_w = b.konst(&format!("{p}.dw.weight"), &[c2, 1, 3, 3], blk.depth_w.clone());
-            let dw_b = b.konst(&format!("{p}.dw.bias"), &[c2], blk.depth_b.clone());
-            let img = b.g.add(
-                &format!("{p}.dw"),
-                Op::Conv2d {
-                    stride: [1, 1],
-                    padding: [1, 1, 1, 1],
-                    dilation: [1, 1],
-                    groups: c2,
-                },
-                &[img, dw_w, dw_b],
-                vec![c2, h, w],
-                DType::F32,
-            );
-            let flat = b.reshape(&format!("{p}.dw.flat"), img, &[c2, n]);
-            let t = b.transpose(&format!("{p}.dw.out"), flat, &[1, 0]);
+            let t = depthwise(&mut b, &p, t, h, w, &blk.depth_w, &blk.depth_b);
             let half = c2 / 2;
             let a = b.slice(&format!("{p}.glu.a"), t, 1, 0, half);
             let gate = b.slice(&format!("{p}.glu.g"), t, 1, half, c2);
@@ -263,6 +269,88 @@ mod tests {
             timestep_scale: 1.0,
             sample_size: 8,
             gpu: Default::default(),
+        }
+    }
+
+    fn run1(b: Gb, out: ValueId, inputs: Vec<Tensor>) -> Vec<f32> {
+        crate::model::dit_graph::Program::compile(b, &[out])
+            .expect("compile")
+            .run(inputs)
+            .expect("run")
+            .remove(0)
+    }
+
+    /// Linear attention at Sana-600M size (36 heads x 32, 256 tokens) against the host
+    /// `linear_attention`: head 0's first queries are all <= 0 (denominator exactly the 1e-15 eps,
+    /// output must be 0), head 1's q/k are ~1e-9 so the eps shifts the denominator.
+    #[test]
+    fn linear_attention_matches_cpu_at_real_size_and_eps() {
+        let (heads, hd, n) = (36usize, 32usize, 256usize);
+        let d = heads * hd;
+        let (mut q, mut k, v) = (rand(n * d, 1, 1.0), rand(n * d, 2, 1.0), rand(n * d, 3, 1.0));
+        for i in 0..n {
+            for j in 0..hd {
+                if i < 4 {
+                    q[i * d + j] = -q[i * d + j].abs();
+                }
+                q[i * d + hd + j] *= 1e-9;
+                k[i * d + hd + j] *= 1e-9;
+            }
+        }
+        let want = {
+            let _cpu = crate::hardware::cpu_compute::allow();
+            linear_attention(&q, &k, &v, n, heads, hd)
+        };
+        let mut b = Gb::new();
+        let (qi, ki, vi) = (b.input("q", &[n, d]), b.input("k", &[n, d]), b.input("v", &[n, d]));
+        let o = linear_attn(&mut b, "la", qi, ki, vi, n, heads, hd);
+        let got = run1(b, o, vec![Tensor::F32(q), Tensor::F32(k), Tensor::F32(v)]);
+        assert!(got.iter().all(|v| v.is_finite()), "non-finite output");
+        assert!(got[..hd].iter().all(|&v| v == 0.0), "eps rows must be exactly 0");
+        let (e, c) = (rel_err(&want, &got), cosine(&want, &got));
+        eprintln!("linear attention 36x32 n=256: rel {e:.2e} cos {c:.7}");
+        assert!(e < 1e-3 && c > 0.99999, "rel {e} cos {c}");
+    }
+
+    /// Cross-attention at Sana-600M size (16 heads x 72, 300 caption keys) against `nn::attention`.
+    #[test]
+    fn cross_attention_matches_cpu_at_real_size() {
+        let (heads, hd) = (16usize, 72usize);
+        let d = heads * hd;
+        for (nq, nk) in [(256usize, 300usize), (1024, 300), (64, 2100)] {
+            let (q, k, v) = (rand(nq * d, 7, 1.0), rand(nk * d, 8, 1.0), rand(nk * d, 9, 1.0));
+            let want = {
+                let _cpu = crate::hardware::cpu_compute::allow();
+                nn::attention(&q, &k, &v, nq, nk, heads, hd, false)
+            };
+            let mut b = Gb::new();
+            let (qi, ki, vi) = (b.input("q", &[nq, d]), b.input("k", &[nk, d]), b.input("v", &[nk, d]));
+            let o = b.attention("xa", qi, ki, vi, heads);
+            let got = run1(b, o, vec![Tensor::F32(q), Tensor::F32(k), Tensor::F32(v)]);
+            let (e, c) = (rel_err(&want, &got), cosine(&want, &got));
+            eprintln!("cross attention 16x72 nq={nq} nk={nk}: rel {e:.2e} cos {c:.7}");
+            assert!(e < 1e-3 && c > 0.99999, "nq={nq} nk={nk}: rel {e} cos {c}");
+        }
+    }
+
+    /// Depthwise 3x3 Conv2d at Sana-600M width (5760 channels) on 16x16 and an odd 5x7 grid.
+    #[test]
+    fn depthwise_matches_cpu_at_real_width() {
+        let c = 5760usize;
+        for (h, w) in [(16usize, 16usize), (5, 7)] {
+            let n = h * w;
+            let (x, wt, bias) = (rand(n * c, 4, 1.0), rand(c * 9, 5, 0.4), rand(c, 6, 0.1));
+            let want = {
+                let _cpu = crate::hardware::cpu_compute::allow();
+                depthwise_tokens(&x, c, h, w, &wt, &bias)
+            };
+            let mut b = Gb::new();
+            let xi = b.input("x", &[n, c]);
+            let o = depthwise(&mut b, "t", xi, h, w, &wt, &bias);
+            let got = run1(b, o, vec![Tensor::F32(x)]);
+            let (e, cs) = (rel_err(&want, &got), cosine(&want, &got));
+            eprintln!("depthwise c={c} {h}x{w}: rel {e:.2e} cos {cs:.7}");
+            assert!(e < 1e-4 && cs > 0.99999, "{h}x{w}: rel {e} cos {cs}");
         }
     }
 
