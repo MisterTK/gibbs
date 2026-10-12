@@ -1,0 +1,211 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="gibbs-portrait-title gibbs-portrait-desc">
+  <title id="gibbs-portrait-title">Josiah Willard Gibbs 1873</title>
+  <desc id="gibbs-portrait-desc">Animated pixel art portrait of Josiah Willard Gibbs with smoking briar pipe and brass thermodynamic formula plate.</desc>
+  <defs>
+    <style>
+      :root {
+        --bg-plate: #14100D;
+        --brass-rim: #D4AF37;
+        --brass-dark: #8C6D46;
+        --ivory: #F5EEDB;
+        --gold: #E5C158;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg-plate: #211914;
+        }
+      }
+      @keyframes ember-pulse {
+        0%, 100% {
+          fill: #FF8C00;
+          filter: drop-shadow(0 0 2px #FF8C00);
+        }
+        50% {
+          fill: #FF3700;
+          filter: drop-shadow(0 0 5px #FF5500);
+        }
+      }
+      @keyframes smoke-drift-1 {
+        0% {
+          opacity: 0;
+          transform: translate(0, 0) scale(0.8);
+        }
+        25% {
+          opacity: 0.7;
+          transform: translate(-3px, -8px) scale(1);
+        }
+        70% {
+          opacity: 0.4;
+          transform: translate(4px, -20px) scale(1.3);
+        }
+        100% {
+          opacity: 0;
+          transform: translate(8px, -32px) scale(1.7);
+        }
+      }
+      @keyframes smoke-drift-2 {
+        0% {
+          opacity: 0;
+          transform: translate(0, 0) scale(0.7);
+        }
+        30% {
+          opacity: 0.65;
+          transform: translate(3px, -10px) scale(1.1);
+        }
+        75% {
+          opacity: 0.35;
+          transform: translate(-4px, -24px) scale(1.4);
+        }
+        100% {
+          opacity: 0;
+          transform: translate(2px, -36px) scale(1.8);
+        }
+      }
+      @keyframes spectacle-glint {
+        0%, 75%, 100% {
+          opacity: 0.3;
+          fill: #E5C158;
+        }
+        82% {
+          opacity: 1;
+          fill: #FFFDE0;
+          filter: drop-shadow(0 0 4px #FFEBA0);
+        }
+        90% {
+          opacity: 0.3;
+          fill: #E5C158;
+        }
+      }
+      @keyframes plate-glow {
+        0%, 100% {
+          stroke: #8C6D46;
+        }
+        50% {
+          stroke: #D4AF37;
+        }
+      }
+      .ember {
+        animation: ember-pulse 2s ease-in-out infinite;
+      }
+      .smoke-puff-1 {
+        animation: smoke-drift-1 3.2s ease-out infinite;
+        transform-origin: 196px 148px;
+      }
+      .smoke-puff-2 {
+        animation: smoke-drift-2 3.8s ease-out 1.6s infinite;
+        transform-origin: 196px 148px;
+      }
+      .glint {
+        animation: spectacle-glint 4s ease-in-out infinite;
+      }
+      .brass-frame {
+        animation: plate-glow 6s ease-in-out infinite;
+      }
+    </style>
+  </defs>
+
+  <!-- Instrument Background Base -->
+  <rect width="256" height="256" rx="8" fill="var(--bg-plate)" />
+
+  <!-- Victorian Double Brass Bezel Outer Frame -->
+  <rect x="8" y="8" width="240" height="240" rx="6" fill="none" stroke="#D4AF37" stroke-width="2.5" />
+  <rect x="13" y="13" width="230" height="230" rx="4" fill="none" stroke="#8C6D46" stroke-width="1" class="brass-frame" />
+
+  <!-- Corner Cornerpiece Studs -->
+  <circle cx="16" cy="16" r="2.5" fill="#D4AF37" />
+  <circle cx="240" cy="16" r="2.5" fill="#D4AF37" />
+  <circle cx="16" cy="240" r="2.5" fill="#D4AF37" />
+  <circle cx="240" cy="240" r="2.5" fill="#D4AF37" />
+
+  <!-- 32x32 Grid Pixel Art Content Scaled by 7x (Origin offset: x=16, y=20) -->
+  <g transform="translate(16, 16)">
+    <!-- Hair Background / Volume (Aged Sandstone #A58C6E) -->
+    <rect x="64" y="24" width="96" height="48" rx="4" fill="#A58C6E" />
+    <rect x="56" y="40" width="112" height="40" rx="4" fill="#A58C6E" />
+    <rect x="48" y="56" width="32" height="64" fill="#A58C6E" />
+    <rect x="144" y="56" width="32" height="64" fill="#A58C6E" />
+
+    <!-- Forehead & Facial Canvas (Ivory Flesh #F0D2B4) -->
+    <rect x="72" y="44" width="80" height="44" fill="#F0D2B4" />
+    <rect x="80" y="36" width="64" height="12" fill="#F0D2B4" />
+
+    <!-- Eyebrows (Aged Sandstone Dark #8C6D46) -->
+    <rect x="76" y="54" width="28" height="5" fill="#8C6D46" />
+    <rect x="120" y="54" width="28" height="5" fill="#8C6D46" />
+
+    <!-- Eyes (Deep Sloane Obsidian #14100D) -->
+    <rect x="82" y="62" width="16" height="8" fill="#14100D" />
+    <rect x="126" y="62" width="16" height="8" fill="#14100D" />
+
+    <!-- Polished Brass Spectacles Frames (#E5C158) -->
+    <rect x="78" y="58" width="24" height="16" rx="2" fill="none" stroke="#E5C158" stroke-width="2.5" />
+    <rect x="122" y="58" width="24" height="16" rx="2" fill="none" stroke="#E5C158" stroke-width="2.5" />
+    <!-- Spectacle Bridge -->
+    <line x1="102" y1="64" x2="122" y2="64" stroke="#E5C158" stroke-width="2.5" />
+    <!-- Animated Spectacle Glint -->
+    <polygon points="80,70 88,60 92,60 84,70" class="glint" />
+    <polygon points="124,70 132,60 136,60 128,70" class="glint" />
+
+    <!-- Nose Profile (#E2BF9E) -->
+    <rect x="108" y="66" width="8" height="20" fill="#E2BF9E" />
+    <rect x="104" y="82" width="16" height="6" fill="#D4AF88" />
+
+    <!-- Mustache & Full Beard (Silver Umber #C3AF91 with #8C6D46 shadows) -->
+    <rect x="80" y="88" width="64" height="16" fill="#C3AF91" />
+    <rect x="72" y="98" width="80" height="36" rx="4" fill="#C3AF91" />
+    <rect x="84" y="132" width="56" height="16" rx="6" fill="#C3AF91" />
+    <!-- Beard Shadowing Lines -->
+    <line x1="88" y1="104" x2="88" y2="136" stroke="#9E876A" stroke-width="2" />
+    <line x1="104" y1="106" x2="104" y2="140" stroke="#9E876A" stroke-width="2" />
+    <line x1="120" y1="106" x2="120" y2="140" stroke="#9E876A" stroke-width="2" />
+    <line x1="136" y1="104" x2="136" y2="136" stroke="#9E876A" stroke-width="2" />
+
+    <!-- Collar & Shirtfront (Maxwell Ivory #F5EEDB) -->
+    <polygon points="98,142 126,142 118,158 106,158" fill="#F5EEDB" />
+    <!-- Silk Cravat / Tie (Deep Umber #4A281E) -->
+    <polygon points="108,144 116,144 120,166 112,172 104,166" fill="#4A281E" />
+
+    <!-- Mahogany Frock Coat (#32241C) -->
+    <path d="M 40 156 Q 72 144 98 144 L 102 188 L 30 188 Z" fill="#32241C" />
+    <path d="M 184 156 Q 152 144 126 144 L 122 188 L 194 188 Z" fill="#32241C" />
+    <!-- Coat Lapel Trim -->
+    <line x1="40" y1="156" x2="98" y2="144" stroke="#4A3728" stroke-width="2" />
+    <line x1="184" y1="156" x2="126" y2="144" stroke="#4A3728" stroke-width="2" />
+
+    <!-- Vest & Gold Pocket Watch Chain (#D4AF37) -->
+    <path d="M 106 172 Q 112 180 118 174 Q 124 180 130 174" fill="none" stroke="#D4AF37" stroke-width="2" stroke-dasharray="2,2" />
+    <circle cx="106" cy="172" r="2" fill="#D4AF37" />
+
+    <!-- Briar Pipe Stem & Bowl (#5C2C16) -->
+    <!-- Stem held in mouth -->
+    <path d="M 124 94 Q 146 102 164 124 L 176 136" fill="none" stroke="#1A1512" stroke-width="3" stroke-linecap="round" />
+    <!-- Carved Bowl -->
+    <rect x="172" y="132" width="16" height="18" rx="3" fill="#5C2C16" stroke="#3D1D0E" stroke-width="1.5" />
+    <ellipse cx="180" cy="132" rx="7" ry="3" fill="#3D1D0E" />
+
+    <!-- Glowing Briar Pipe Ember -->
+    <circle cx="180" cy="132" r="3.5" class="ember" />
+
+    <!-- Logarithmic Spiral Vector Pipe Smoke Eddies -->
+    <g class="smoke-puff-1">
+      <circle cx="180" cy="120" r="4" fill="#C3AF91" />
+      <path d="M 178 116 Q 172 108 182 100 Q 192 92 184 82" fill="none" stroke="#C3AF91" stroke-width="2" stroke-linecap="round" />
+    </g>
+    <g class="smoke-puff-2">
+      <circle cx="182" cy="114" r="5" fill="#8C6D46" />
+      <path d="M 180 110 Q 190 98 178 88 Q 168 78 180 66" fill="none" stroke="#8C6D46" stroke-width="2" stroke-linecap="round" />
+    </g>
+  </g>
+
+  <!-- Engraved Brass Instrument Plaque at Bottom -->
+  <g transform="translate(24, 212)">
+    <rect x="0" y="0" width="208" height="28" rx="3" fill="#241B15" stroke="#D4AF37" stroke-width="1.2" />
+    <line x1="2" y1="2" x2="206" y2="2" stroke="#8C6D46" stroke-width="0.8" />
+    <text x="104" y="14" fill="#D4AF37" font-family="'Times New Roman', Georgia, serif" font-size="10" font-weight="bold" text-anchor="middle" letter-spacing="0.1em">
+      J. WILLARD GIBBS · 1873
+    </text>
+    <text x="104" y="24" fill="#E5C158" font-family="'Courier New', monospace" font-size="8.5" text-anchor="middle" letter-spacing="0.05em">
+      dU = T dS − P dV
+    </text>
+  </g>
+</svg>

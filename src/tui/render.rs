@@ -1,6 +1,6 @@
 //! Drawing. Every panel shows measured or configured values only.
 
-use super::{Entry, Focus, Kind, TuiApp};
+use super::{Entry, Focus, Kind, Load, TuiApp};
 use crate::model::weight_format::MAX_MEAN_KL;
 use crate::scheduler::SequenceState;
 use crate::telemetry::LogLevel;
@@ -12,8 +12,18 @@ use ratatui::{
     Frame,
 };
 
-const ACCENT: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
+/// Maxwell-Gibbs 1873 Geometric Design System palette tokens
+pub const POLISHED_BRASS: Color = Color::Rgb(212, 175, 55);
+pub const ANTIQUE_GOLD: Color = Color::Rgb(229, 193, 88);
+pub const PARCHMENT: Color = Color::Rgb(245, 238, 219);
+pub const MAHOGANY_DIM: Color = Color::Rgb(140, 109, 70);
+pub const EQUILIBRIUM_JADE: Color = Color::Rgb(107, 158, 120);
+pub const BRIAR_AMBER: Color = Color::Rgb(255, 140, 0);
+pub const SPINODAL_CRIMSON: Color = Color::Rgb(200, 70, 70);
+pub const SLOANE_OBSIDIAN: Color = Color::Rgb(20, 16, 13);
+
+const ACCENT: Color = POLISHED_BRASS;
+const DIM: Color = MAHOGANY_DIM;
 /// Console text indent under the `HH:MM:SS ` timestamp.
 const INDENT: &str = "         ";
 
@@ -24,11 +34,13 @@ fn dim() -> Style {
 fn panel(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(dim())
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(MAHOGANY_DIM))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(POLISHED_BRASS)
+                .add_modifier(Modifier::BOLD),
         ))
 }
 
@@ -174,7 +186,11 @@ impl TuiApp {
                 Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .areas(top);
             self.render_throughput(f, throughput);
-            self.render_requests(f, requests);
+            if let Some(l) = &self.load {
+                self.render_load_progress_widget(f, requests, l);
+            } else {
+                self.render_requests(f, requests);
+            }
             self.render_console(f, console);
             self.render_log(f, log);
             self.render_keys(f, keys);
@@ -206,15 +222,25 @@ impl TuiApp {
             Span::styled(
                 " gibbs ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
+                    .fg(SLOANE_OBSIDIAN)
+                    .bg(POLISHED_BRASS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "[Maxwell-Gibbs 1873 Surface]",
+                Style::default()
+                    .fg(ANTIQUE_GOLD)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             if model.is_empty() {
                 Span::styled("no model", dim())
             } else {
-                Span::styled(model, Style::default().add_modifier(Modifier::BOLD))
+                Span::styled(
+                    model,
+                    Style::default().fg(PARCHMENT).add_modifier(Modifier::BOLD),
+                )
             },
         ];
         if area.width < 100 {
@@ -257,11 +283,11 @@ impl TuiApp {
                     "░".repeat(bar_len.saturating_sub(filled))
                 );
                 let gauge_color = if eta < 40.0 {
-                    Color::Cyan
+                    SPINODAL_CRIMSON
                 } else if eta <= 70.0 {
-                    Color::Yellow
+                    ANTIQUE_GOLD
                 } else {
-                    Color::Green
+                    EQUILIBRIUM_JADE
                 };
                 left.push(Span::styled(" · Roofline: [", dim()));
                 left.push(Span::styled(bar, Style::default().fg(gauge_color)));
@@ -291,11 +317,11 @@ impl TuiApp {
                     l.progress_text(),
                     secs(l.started.elapsed())
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(ANTIQUE_GOLD),
             ),
             None if self.running > 0 => Span::styled(
                 format!(" · {} running ", self.running),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(ANTIQUE_GOLD),
             ),
             None => Span::raw(""),
         };
@@ -566,7 +592,151 @@ impl TuiApp {
         f.render_widget(Paragraph::new(line), input);
     }
 
+    fn render_load_progress_widget(&self, f: &mut Frame, area: Rect, l: &Load) {
+        let block = panel("Model Ingestion Instrument");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let stage_str = *l.stage.lock();
+        let (done, total) = (
+            l.progress.done.load(std::sync::atomic::Ordering::Relaxed),
+            l.progress.total.load(std::sync::atomic::Ordering::Relaxed),
+        );
+
+        // Stages: Resolving -> Downloading -> Mapping -> Compiling
+        let stage_idx = if stage_str == "downloading" {
+            1
+        } else if stage_str.contains("reading") || stage_str.contains("format") {
+            2
+        } else if stage_str.contains("placing") || stage_str.contains("compil") {
+            3
+        } else {
+            0 // resolving / locating / cached
+        };
+
+        let stage_names = ["Resolving", "Downloading", "Mapping", "Compiling"];
+        let mut stage_spans = Vec::new();
+        stage_spans.push(Span::styled(" Stage: ", dim()));
+        for (i, name) in stage_names.iter().enumerate() {
+            if i > 0 {
+                stage_spans.push(Span::styled(" → ", dim()));
+            }
+            if i == stage_idx {
+                stage_spans.push(Span::styled(
+                    format!("[{name}]"),
+                    Style::default()
+                        .fg(POLISHED_BRASS)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else if i < stage_idx {
+                stage_spans.push(Span::styled(
+                    format!("✓ {name}"),
+                    Style::default().fg(EQUILIBRIUM_JADE),
+                ));
+            } else {
+                stage_spans.push(Span::styled(name.to_string(), dim()));
+            }
+        }
+
+        let mut lines = Vec::new();
+        // Line 1: Target model name & tensor layout
+        let dest_layout = match self.quant_override {
+            Some(q) => format!("{q:?} (Forced)"),
+            None => "Auto (Empirical Roofline Selection)".to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" Target: ", dim()),
+            Span::styled(
+                &l.id,
+                Style::default().fg(PARCHMENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · Layout: {dest_layout}"), dim()),
+        ]));
+
+        // Line 2: Stages indicator
+        lines.push(Line::from(stage_spans));
+
+        // Line 3: Progress gauge (■ / ░)
+        let bar_width = (inner.width as usize).saturating_sub(28).max(10).min(32);
+        let pct = if total > 0 {
+            ((done as f64 / total as f64) * 100.0).clamp(0.0, 100.0)
+        } else if stage_idx >= 2 {
+            100.0
+        } else {
+            0.0
+        };
+        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+        let bar = format!(
+            "{}{}",
+            "■".repeat(filled.min(bar_width)),
+            "░".repeat(bar_width.saturating_sub(filled))
+        );
+
+        let progress_color = if pct >= 100.0 {
+            EQUILIBRIUM_JADE
+        } else {
+            ANTIQUE_GOLD
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(" Ingest: [", dim()),
+            Span::styled(bar, Style::default().fg(progress_color)),
+            Span::styled(
+                format!("] {pct:5.1}%"),
+                Style::default()
+                    .fg(POLISHED_BRASS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({:.1}/{:.1} MB)", done as f64 / 1e6, total as f64 / 1e6),
+                dim(),
+            ),
+        ]));
+
+        // Line 4: Policy & Throughput ETA
+        let rate_str = if l.rate > 0.0 {
+            format!("{:.1} MB/s", l.rate / 1e6)
+        } else {
+            "measuring".to_string()
+        };
+        let eta_str = if l.rate > 0.0 && total > done {
+            let remain = (total - done) as f64 / l.rate;
+            format!("{remain:.1}s ETA")
+        } else if stage_idx >= 2 {
+            "compiling kernels".to_string()
+        } else {
+            "active".to_string()
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(" Policy: ", dim()),
+            Span::styled(
+                format!("{:?}", self.reencode_policy),
+                Style::default().fg(ANTIQUE_GOLD),
+            ),
+            Span::styled(" · Rate: ", dim()),
+            Span::styled(rate_str, Style::default().fg(PARCHMENT)),
+            Span::styled(" · ", dim()),
+            Span::styled(
+                eta_str,
+                Style::default()
+                    .fg(BRIAR_AMBER)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · Elapsed: {}", secs(l.started.elapsed())), dim()),
+        ]));
+
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn render_weights(&self, f: &mut Frame, area: Rect) {
+        if let Some(l) = &self.load {
+            self.render_load_progress_widget(f, area, l);
+            return;
+        }
         let block = panel("Weights");
         let Some(w) = &self.weights else {
             // Native models and classifiers keep their stored weights; only GraphLm loads choose.
@@ -1035,8 +1205,16 @@ impl TuiApp {
         };
         let mut spans = Vec::new();
         for (k, what) in keys {
-            spans.push(Span::styled(format!(" {k} "), Style::default().fg(ACCENT)));
-            spans.push(Span::styled(format!("{what} "), dim()));
+            spans.push(Span::styled(
+                format!(" {k} "),
+                Style::default()
+                    .fg(POLISHED_BRASS)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!("{what} "),
+                Style::default().fg(PARCHMENT),
+            ));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -1341,7 +1519,7 @@ impl TuiApp {
         };
         let s = self.telemetry.get_summary();
         let bw_peak = s.memory_bandwidth_gbps as f64;
-        let (gemm_peak, ceiling_gbps) = {
+        let (gemm_peak, _ceiling_gbps) = {
             #[cfg(target_os = "macos")]
             if let Ok(rt) =
                 crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
@@ -1407,7 +1585,10 @@ impl TuiApp {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" P_peak = 28 TFLOPs", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!(" P_peak = {:.0} TFLOPs", peak_compute / 1000.0),
+                Style::default().fg(Color::Green),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::styled("  10k ┤", dim()),
@@ -1423,7 +1604,7 @@ impl TuiApp {
                 Style::default().fg(Color::Green),
             ),
             Span::styled(
-                "▲ [Ridge: 102.5 FLOPs/B]",
+                format!("▲ [Ridge: {:.1} FLOPs/B]", ridge),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
