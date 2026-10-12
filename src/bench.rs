@@ -187,7 +187,24 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         let median_gpu_ms = gpu_times[gpu_times.len() / 2];
 
         let ceiling_gbps = crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps;
-        let bytes_per_token = 0u64;
+        let bytes_per_token = artifacts
+            .weights_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .or_else(|| {
+                artifacts.local_dir.as_ref().map(|d| {
+                    std::fs::read_dir(d)
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| e.metadata().ok())
+                        .map(|m| m.len())
+                        .sum::<u64>()
+                })
+            })
+            .unwrap_or(0);
         let roofline_tok_s = if bytes_per_token > 0 {
             ceiling_gbps / (bytes_per_token as f64 / 1e9)
         } else {
