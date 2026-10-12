@@ -5027,10 +5027,10 @@ mod tests {
         assert!(rel_err(&want, &got) < 1e-4);
     }
 
-    /// Every codec format without a hand kernel: the generated GEMV equals the CPU executor
+    /// Every packed format (generated and hand kernels): the GPU GEMV equals the CPU executor
     /// (which dequantizes through `dequantize_*_block`), with and without a bias epilogue.
     #[test]
-    fn generated_gemv_matches_cpu_for_every_codec() {
+    fn gemv_matches_cpu_for_every_packed_format() {
         use crate::model::layers::{gguf_block_codec, QuantizedWeight};
         let formats = [
             QuantFormat::GGUF_Q4_1,
@@ -5046,6 +5046,15 @@ mod tests {
             QuantFormat::GGUF_IQ1_S,
             QuantFormat::GGUF_TQ1_0,
             QuantFormat::GGUF_TQ2_0,
+            // hand kernels
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q8_0,
+            QuantFormat::GGUF_IQ4_XS,
+            QuantFormat::GGUF_IQ2_M,
+            QuantFormat::GGUF_IQ2_S,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q2_K,
+            QuantFormat::GGUF_IQ3_S,
         ];
         let mut seed = 0x9E3779B97F4A7C15u64;
         let mut next = move || {
@@ -5060,7 +5069,11 @@ mod tests {
         for f in formats {
             let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
             let scale_at: &[usize] = match f {
-                QuantFormat::GGUF_Q4_1 | QuantFormat::GGUF_Q5_1 | QuantFormat::GGUF_Q5_K_M => &[0, 2],
+                QuantFormat::GGUF_Q4_1
+                | QuantFormat::GGUF_Q5_1
+                | QuantFormat::GGUF_Q5_K_M
+                | QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                QuantFormat::GGUF_Q2_K => &[80, 82],
                 QuantFormat::GGUF_Q6_K => &[208],
                 QuantFormat::GGUF_Q3_K => &[108],
                 QuantFormat::GGUF_TQ1_0 => &[52],
