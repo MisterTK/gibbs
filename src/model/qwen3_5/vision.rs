@@ -565,7 +565,7 @@ impl Vision {
 
     /// The tower for a `gh x gw` patch grid: inputs `patches`, `pos_idx_{0..4}`, `pos_w_{0..4}`,
     /// `rope_positions`; outputs the merged features, then each deepstack feature.
-    fn tower_graph(&self, gh: usize, gw: usize) -> (Graph, GraphWeights) {
+    pub(super) fn tower_graph(&self, gh: usize, gw: usize) -> (Graph, GraphWeights) {
         let (d, n, unit) = (self.hidden, gh * gw, self.merge * self.merge);
         let (hd, q4) = (d / self.heads, self.inv_freq.len());
         let f32s = DType::F32;

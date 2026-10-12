@@ -1213,12 +1213,12 @@ impl TuiApp {
             self.hf_token.clone(),
             self.updates_tx.clone(),
         );
-        let (id, target) = (id.to_string(), sched.model_id());
+        let (id, target, placement) = (id.to_string(), sched.model_id(), self.placement);
         std::thread::spawn(move || {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             let attach = || -> Result<String, String> {
                 let da = hub.auto_download_and_cache(&id, token.as_deref())?;
-                let d = crate::model::draft::load_drafter(&da, &hub.locate_model(&target))?;
+                let d = crate::model::draft::load_drafter(&da, &hub.locate_model(&target), placement)?;
                 // ponytail: check-then-set; a model swap landing in between keeps this drafter
                 // until the swap resets it. Add a guarded set if loads race in practice.
                 if sched.model_id() != target {

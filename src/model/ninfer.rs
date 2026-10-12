@@ -1123,6 +1123,85 @@ pub fn hub_size(m: &Value) -> Option<u64> {
     hub_catalog(m)?.ok().map(|c| c.stored_bytes())
 }
 
+    /// One dense gated-delta-net layer (hidden 64) as a v3 catalog: every parameter its own bf16
+    /// object, `mlp/down` stored as `down_format`.
+    fn tiny_catalog(down_format: &str) -> Value {
+        let params: [(&str, &[usize]); 18] = [
+            ("text/token_embedding", &[32, 64]),
+            ("text/final_norm", &[64]),
+            ("text/layers/0/input_norm", &[64]),
+            ("text/layers/0/post_attention_norm", &[64]),
+            ("text/layers/0/mlp/gate", &[128, 64]),
+            ("text/layers/0/mlp/up", &[128, 64]),
+            ("text/layers/0/mlp/down", &[64, 128]),
+            ("text/layers/0/gdn/query", &[8, 64]),
+            ("text/layers/0/gdn/key", &[8, 64]),
+            ("text/layers/0/gdn/value", &[16, 64]),
+            ("text/layers/0/gdn/z", &[16, 64]),
+            ("text/layers/0/gdn/b_projection", &[2, 64]),
+            ("text/layers/0/gdn/a_projection", &[2, 64]),
+            ("text/layers/0/gdn/a_log", &[2]),
+            ("text/layers/0/gdn/dt_bias", &[2]),
+            ("text/layers/0/gdn/norm", &[8]),
+            ("text/layers/0/gdn/output", &[64, 16]),
+            ("text/layers/0/gdn/convolution", &[4, 32]),
+        ];
+        let (mut objects, mut bindings, mut offset) = (Vec::new(), serde_json::Map::new(), 0);
+        for (name, shape) in params {
+            let bytes = shape.iter().product::<usize>() * 2;
+            let format = if name.ends_with("mlp/down") {
+                down_format
+            } else {
+                "bf16"
+            };
+            objects.push(json!({"id": format!("w/{name}"), "kind": "tensor", "shape": shape, "format": format, "layout": "contiguous_le_v1", "offset": offset, "bytes": bytes}));
+            bindings.insert(name.into(), json!({"object": format!("w/{name}")}));
+            offset += align(bytes, 256);
+        }
+        json!({
+            "components": {"text": {"config": {
+                "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text", "hidden_size": 64,
+                "vocab_size": 32, "num_hidden_layers": 1, "intermediate_size": 128, "rms_norm_eps": 1e-6,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 256,
+                "layer_types": ["linear_attention"], "linear_num_key_heads": 1, "linear_key_head_dim": 8,
+                "linear_num_value_heads": 2, "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4,
+                "rope_parameters": {"rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10]},
+            }}},
+            "objects": objects, "bindings": bindings,
+        })
+    }
+
+/// Writes the [`tiny_catalog`] artifact (bf16 objects of known values) to `path`; returns each
+/// object's payload offset. Fixture of `tests/cpu_free_matrix.rs` and this module's tests.
+pub fn write_tiny_artifact(path: &Path) -> Result<HashMap<String, usize>, String> {
+    let mut root = tiny_catalog("bf16");
+    let mut payload = Vec::new();
+    let mut off = HashMap::new();
+    for o in root["objects"].as_array().ok_or("no objects")? {
+        let at = o["offset"].as_u64().ok_or("no offset")? as usize;
+        let n = o["shape"]
+            .as_array()
+            .ok_or("no shape")?
+            .iter()
+            .map(|d| d.as_u64().unwrap_or(0) as usize)
+            .product::<usize>();
+        payload.resize(at, 0);
+        off.insert(o["id"].as_str().unwrap_or_default().to_string(), at);
+        payload.extend(
+            (0..n).flat_map(|i| crate::model::f32_to_bf16(((i * 5 + at) % 11) as f32 / 4.0).to_le_bytes()),
+        );
+    }
+    root["files"] = json!([{"path": null, "payload_bytes": payload.len()}]);
+    let catalog = serde_json::to_vec(&root).map_err(|e| e.to_string())?;
+    let mut file = b"NINFER\0\x03".to_vec();
+    file.extend((catalog.len() as u64).to_le_bytes());
+    file.extend([7u8; 16]);
+    file.extend(&catalog);
+    file.resize(align(file.len(), 4096), 0);
+    file.extend(&payload);
+    std::fs::write(path, file).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(off)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,52 +1436,6 @@ mod tests {
         );
     }
 
-    /// One dense gated-delta-net layer (hidden 64) as a v3 catalog: every parameter its own bf16
-    /// object, `mlp/down` stored as `down_format`.
-    fn tiny_catalog(down_format: &str) -> Value {
-        let params: [(&str, &[usize]); 18] = [
-            ("text/token_embedding", &[32, 64]),
-            ("text/final_norm", &[64]),
-            ("text/layers/0/input_norm", &[64]),
-            ("text/layers/0/post_attention_norm", &[64]),
-            ("text/layers/0/mlp/gate", &[128, 64]),
-            ("text/layers/0/mlp/up", &[128, 64]),
-            ("text/layers/0/mlp/down", &[64, 128]),
-            ("text/layers/0/gdn/query", &[8, 64]),
-            ("text/layers/0/gdn/key", &[8, 64]),
-            ("text/layers/0/gdn/value", &[16, 64]),
-            ("text/layers/0/gdn/z", &[16, 64]),
-            ("text/layers/0/gdn/b_projection", &[2, 64]),
-            ("text/layers/0/gdn/a_projection", &[2, 64]),
-            ("text/layers/0/gdn/a_log", &[2]),
-            ("text/layers/0/gdn/dt_bias", &[2]),
-            ("text/layers/0/gdn/norm", &[8]),
-            ("text/layers/0/gdn/output", &[64, 16]),
-            ("text/layers/0/gdn/convolution", &[4, 32]),
-        ];
-        let (mut objects, mut bindings, mut offset) = (Vec::new(), serde_json::Map::new(), 0);
-        for (name, shape) in params {
-            let bytes = shape.iter().product::<usize>() * 2;
-            let format = if name.ends_with("mlp/down") {
-                down_format
-            } else {
-                "bf16"
-            };
-            objects.push(json!({"id": format!("w/{name}"), "kind": "tensor", "shape": shape, "format": format, "layout": "contiguous_le_v1", "offset": offset, "bytes": bytes}));
-            bindings.insert(name.into(), json!({"object": format!("w/{name}")}));
-            offset += align(bytes, 256);
-        }
-        json!({
-            "components": {"text": {"config": {
-                "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text", "hidden_size": 64,
-                "vocab_size": 32, "num_hidden_layers": 1, "intermediate_size": 128, "rms_norm_eps": 1e-6,
-                "layer_types": ["linear_attention"], "linear_num_key_heads": 1, "linear_key_head_dim": 8,
-                "linear_num_value_heads": 2, "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4,
-                "rope_parameters": {"rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10]},
-            }}},
-            "objects": objects, "bindings": bindings,
-        })
-    }
 
     /// The picker's verdict and the loader's plan read one catalog: a codec outside the supported set
     /// refuses the artifact with the codec named, in both.
@@ -1427,40 +1460,50 @@ mod tests {
         );
     }
 
+    /// A v3 file of [`tiny_catalog`] (bf16 objects of known values): the temp dir holding it, its
+    /// path, and each object's payload offset.
+    fn write_tiny() -> (tempfile::TempDir, std::path::PathBuf, HashMap<String, usize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.ninfer");
+        let off = write_tiny_artifact(&path).unwrap();
+        (dir, path, off)
+    }
+
+    /// The artifact's checkpoint runs through the Qwen3.5 Metal program like the host forward:
+    /// prefill 5 tokens and decode 3 (the `.ninfer` loader's `assemble`, minus its tokenizer
+    /// resource).
+    #[test]
+    fn v3_artifact_metal_program_matches_host() {
+        use crate::hardware::{cpu_compute, Device, PlacementMode};
+        let _g = cpu_compute::allow();
+        let (_dir, path, _) = write_tiny();
+        let (ck, cfg) = Artifact::open(&path).unwrap().checkpoint().unwrap();
+        let m = |d| crate::model::qwen3_5::from_checkpoint(&ck, &cfg, PlacementMode::Pin(d)).unwrap();
+        let (cpu, gpu) = (m(Device::Cpu), m(Device::Metal));
+        assert_eq!(gpu.device(), Device::Metal);
+        let prompt = vec![1u32, 5, 9, 13, 2];
+        let (_, mut sc) = cpu.prepare(prompt.clone(), &[]).unwrap();
+        let (_, mut sg) = gpu.prepare(prompt.clone(), &[]).unwrap();
+        let (mut a, mut b) = (
+            cpu.forward(&prompt, 0, &mut sc).unwrap(),
+            gpu.forward(&prompt, 0, &mut sg).unwrap(),
+        );
+        for step in 0..4 {
+            let scale = a.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
+            let err = a.iter().zip(&b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs())) / scale;
+            println!("ninfer step {step}: rel err {err:e}");
+            assert!(err < 1e-3, "step {step}: {err}");
+            let tok = a.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
+            a = cpu.forward(&[tok], prompt.len() + step, &mut sc).unwrap();
+            b = gpu.forward(&[tok], prompt.len() + step, &mut sg).unwrap();
+        }
+    }
+
     /// A v3 file written here (bf16 objects of known values) reads back as transformers tensors:
     /// fused projection rows in order, the convolution transposed.
     #[test]
     fn v3_file_reads_back_as_transformers_tensors() {
-        let mut root = tiny_catalog("bf16");
-        let mut payload = Vec::new();
-        let mut off = HashMap::new();
-        for o in root["objects"].as_array().unwrap() {
-            let (at, n) = (
-                o["offset"].as_u64().unwrap() as usize,
-                o["shape"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|d| d.as_u64().unwrap() as usize)
-                    .product::<usize>(),
-            );
-            payload.resize(at, 0);
-            off.insert(o["id"].as_str().unwrap().to_string(), at);
-            payload.extend((0..n).flat_map(|i| {
-                crate::model::f32_to_bf16(((i * 5 + at) % 11) as f32 / 4.0).to_le_bytes()
-            }));
-        }
-        root["files"] = json!([{"path": null, "payload_bytes": payload.len()}]);
-        let catalog = serde_json::to_vec(&root).unwrap();
-        let mut file = b"NINFER\0\x03".to_vec();
-        file.extend((catalog.len() as u64).to_le_bytes());
-        file.extend([7u8; 16]);
-        file.extend(&catalog);
-        file.resize(align(file.len(), 4096), 0);
-        file.extend(&payload);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tiny.ninfer");
-        std::fs::write(&path, file).unwrap();
+        let (_dir, path, off) = write_tiny();
 
         let (ck, cfg) = Artifact::open(&path).unwrap().checkpoint().unwrap();
         assert_eq!(cfg["tie_word_embeddings"], true, "no output_head object");

@@ -2,7 +2,7 @@
 //! drafters conditioned on target hidden states (DFlash, DFlash2, DSpark; see
 //! `qwen3_5/draft.rs`) and plain causal LMs sharing the target's tokenizer.
 
-use crate::hardware::{Device, QuantMode};
+use crate::hardware::{Device, PlacementMode, QuantMode};
 use crate::model::graph_lm::{GraphLm, LayerKVCache};
 use crate::model::hf_loader::{load_causal_lm, load_json_tokenizer};
 use crate::model::hub::ModelArtifacts;
@@ -79,12 +79,13 @@ pub fn is_draft_for(target: &str, active: &str) -> bool {
     name(target) == name(active)
 }
 
-/// Loads `draft` as a drafter for the loaded target `target` (same artifacts it was loaded from).
+/// Loads `draft` as a drafter for the loaded target `target` (same artifacts it was loaded from),
+/// computing on the target's backend `mode`.
 pub fn load_drafter(
     draft: &ModelArtifacts,
     target: &ModelArtifacts,
+    mode: PlacementMode,
 ) -> Result<Arc<dyn Drafter>, String> {
-    crate::graph::avenues::gate(crate::graph::avenues::Family::DraftersMtp)?;
     let dw = draft
         .weights_path
         .as_deref()
@@ -124,6 +125,10 @@ pub fn load_drafter(
         &tcfg
     };
     if block {
+        crate::graph::avenues::family_gate(
+            crate::graph::avenues::Family::DraftersBlock,
+            crate::graph::avenues::resolved_backend(mode),
+        )?;
         // Native models with taps: the qwen3_5 decoder family; GraphLm targets always have them.
         let mt = tcfg["model_type"].as_str().unwrap_or("");
         if crate::model::native::NATIVE_MODEL_TYPES.contains(&mt)
@@ -147,7 +152,7 @@ pub fn load_drafter(
         };
         return crate::model::qwen3_5::load_drafter(&draft.model_id, &dck, &dcfg, &tck, &tcfg);
     }
-    let (lm, tok) = match load_native(draft, Device::Cpu) {
+    let (lm, tok) = match load_native(draft, mode) {
         Some(m) => {
             let m = m?;
             let tok = m.tokenizer().clone();
@@ -156,7 +161,16 @@ pub fn load_drafter(
         None => {
             let m = load_causal_lm(draft, QuantMode::Uncompressed)?;
             let tok = m.tokenizer.clone();
-            (Lm::GraphLm(m), tok)
+            if matches!(mode, PlacementMode::Pin(Device::Cpu)) {
+                (Lm::GraphLm(m), tok)
+            } else {
+                let (g, w) = m.to_decode_graph();
+                let prog = crate::graph::program::GraphProgram::compile(g, w, mode)
+                    .map_err(|e| format!("drafter {}: {e}", draft.model_id))?;
+                let (vocab, ctx) = (m.config.vocab_size, m.config.max_seq_len);
+                let prog = Arc::new(parking_lot::Mutex::new(prog));
+                (Lm::Program { prog, vocab, ctx }, tok)
+            }
         }
     };
     let ttok = load_json_tokenizer(
@@ -174,6 +188,7 @@ pub fn load_drafter(
     }
     let d_vocab = match &lm {
         Lm::GraphLm(m) => m.config.vocab_size,
+        Lm::Program { vocab, .. } => *vocab,
         Lm::Native(_) => {
             let dc = if dcfg["text_config"].is_object() {
                 &dcfg["text_config"]
@@ -194,7 +209,14 @@ pub fn load_drafter(
 }
 
 enum Lm {
+    /// Host forward (`--backend cpu`).
     GraphLm(GraphLm),
+    /// The decode graph of a `GraphLm` compiled for the backend.
+    Program {
+        prog: Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>,
+        vocab: usize,
+        ctx: usize,
+    },
     Native(Arc<dyn NativeLm>),
 }
 
@@ -206,6 +228,8 @@ struct Plain {
 
 enum Kv {
     GraphLm(Vec<LayerKVCache>),
+    /// The draft program's KV buffers.
+    Program(crate::graph::StateStore),
     /// Built at the first propose.
     Native(Option<SeqState>),
 }
@@ -232,6 +256,7 @@ impl Drafter for Plain {
                     .map(|_| LayerKVCache::new(m.config.max_seq_len.max(1), m.config.hidden_dim))
                     .collect(),
             ),
+            Lm::Program { .. } => Kv::Program(crate::graph::StateStore::new()),
             Lm::Native(_) => Kv::Native(None),
         };
         Box::new(PlainState {
@@ -254,6 +279,7 @@ impl Drafter for Plain {
         let n = tokens.len();
         let ctx = match &self.lm {
             Lm::GraphLm(m) => m.config.max_seq_len,
+            Lm::Program { ctx, .. } => *ctx,
             Lm::Native(m) => m.context_len(),
         };
         let k = k.min(ctx.saturating_sub(n));
@@ -279,6 +305,12 @@ impl Drafter for Plain {
                     m.forward_token_with_kv(t, keep + i, cache);
                 }
             }
+            (Lm::Program { prog, .. }, Kv::Program(state)) => {
+                // Positions index the KV rows, so rewinding to `keep` is just writing from there.
+                for (i, &t) in caught_up.iter().enumerate() {
+                    run_program(prog, state, t, keep + i)?;
+                }
+            }
             (Lm::Native(m), Kv::Native(s)) => {
                 if s.is_none() {
                     *s = Some(m.prepare(Vec::new(), &[])?.1);
@@ -302,6 +334,9 @@ impl Drafter for Plain {
                 (Lm::GraphLm(m), Kv::GraphLm(cache)) => {
                     m.forward_token_with_kv(last, n - 1 + i, cache)
                 }
+                (Lm::Program { prog, .. }, Kv::Program(state)) => {
+                    run_program(prog, state, last, n - 1 + i)?
+                }
                 (Lm::Native(m), Kv::Native(Some(s))) => m.forward_all(&[last], n - 1 + i, s)?,
                 _ => return Err("draft state does not match the draft model".into()),
             };
@@ -310,5 +345,23 @@ impl Drafter for Plain {
             out.push(last);
         }
         Ok(out)
+    }
+}
+
+/// One token at `pos` through a draft program whose KV buffers are `state`; its logits.
+fn run_program(
+    prog: &parking_lot::Mutex<crate::graph::program::GraphProgram>,
+    state: &mut crate::graph::StateStore,
+    token: u32,
+    pos: usize,
+) -> Result<Vec<f32>, String> {
+    use crate::graph::Tensor;
+    let mut p = prog.lock();
+    std::mem::swap(&mut p.state, state);
+    let out = p.run(vec![Tensor::U32(vec![token]), Tensor::U32(vec![pos as u32])]);
+    std::mem::swap(&mut p.state, state);
+    match out?.into_iter().next() {
+        Some(Tensor::F32(v)) => Ok(v),
+        _ => Err("the draft program did not return f32 logits".into()),
     }
 }
