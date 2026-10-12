@@ -4,7 +4,6 @@
 use crate::model::clip::{Act, ClipTextTransformer};
 use crate::model::clip::Tensors;
 use crate::model::diff_graph::testutil::{synth, Lcg};
-use crate::model::unet::{Heads, SdUnet};
 use crate::model::vae::SdVae;
 
 type Specs = Vec<(String, Vec<usize>)>;
