@@ -565,6 +565,7 @@ impl FastText {
     /// `fasttext.predict(text, k=-1)` reports them: `p + 1e-5` (its `exp(log(p + 1e-5))`); labels
     /// below its implicit threshold (hierarchical-softmax paths under 1e-5) are 0.
     pub fn predict(&self, text: &str) -> Result<(Vec<f32>, usize), String> {
+        crate::hardware::cpu_compute::enter("fasttext::predict");
         if text.contains('\n') {
             return Err("fastText predicts one line at a time (remove '\\n')".into());
         }

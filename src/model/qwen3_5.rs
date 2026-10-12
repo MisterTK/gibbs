@@ -191,7 +191,12 @@ impl DecoderBackbone for Dense {
     }
 
     fn context_len(&self) -> usize {
-        self.text.context_len()
+        // The compiled seq-cls program's KV state holds `decode_max_ctx` positions.
+        if self.program.is_some() {
+            self.text.decode_max_ctx
+        } else {
+            self.text.context_len()
+        }
     }
 
     fn hidden(&self) -> usize {
@@ -199,6 +204,7 @@ impl DecoderBackbone for Dense {
     }
 
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("decoder::last_hidden");
         let d = self.text.hidden();
         let mut h = vec![0.0f32; ids.len() * d];
         for (&t, row) in ids.iter().zip(h.chunks_exact_mut(d)) {
@@ -208,6 +214,58 @@ impl DecoderBackbone for Dense {
         let pos: Vec<[u32; 3]> = (0..ids.len() as u32).map(|i| [i; 3]).collect();
         let mut state = self.text.new_state();
         Ok(self.text.last_hidden(h, &pos, 0, &mut state, &[], &[]))
+    }
+
+    /// Compiles the decode graph with the score head for Metal. Dense's `program` (never a
+    /// `NativeLm` here: `backbone` hands out a `DecoderBackbone`) then runs one token per step
+    /// with KV / DeltaNet state, so the hybrid DeltaNet layers need no separate prefill graph.
+    fn attach_score_gpu(&mut self, score: &[f32], labels: usize) -> Result<(), String> {
+        if score.len() != labels * self.text.hidden() {
+            return Err(format!("score head is not [{labels}, {}]", self.text.hidden()));
+        }
+        let gpu_only = |e: String| format!("gpu-only: Qwen3.5 seq-cls: {e}");
+        let (graph, weights) = self.text.to_seqcls_graph(score).map_err(gpu_only)?;
+        let mode = crate::hardware::PlacementMode::Pin(Device::Metal);
+        let program = crate::graph::program::GraphProgram::compile(graph, weights, mode)
+            .map_err(gpu_only)?;
+        self.program = Some(Arc::new(parking_lot::Mutex::new(program)));
+        Ok(())
+    }
+
+    // ponytail: n sequential decode steps (one GPU dispatch each) over a fresh KV state sized to
+    // `decode_max_ctx`; a batched prefill graph (DeltaRule over n rows) would cut the launches.
+    fn score_gpu(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let prog = self.program.as_ref().ok_or("no GPU score program attached")?;
+        if ids.is_empty() || ids.len() > self.text.decode_max_ctx {
+            return Err(format!(
+                "{} tokens: the Metal program holds 1..={}",
+                ids.len(),
+                self.text.decode_max_ctx
+            ));
+        }
+        let mut p = prog.lock();
+        let saved = std::mem::replace(&mut p.state, crate::graph::StateStore::new());
+        let run = |p: &mut crate::graph::program::GraphProgram| -> Result<Vec<f32>, String> {
+            let mut logits = Vec::new();
+            for (pos, &tok) in ids.iter().enumerate() {
+                let mut emb = vec![0.0f32; self.text.hidden()];
+                self.text.embed(tok, &mut emb)?;
+                let inputs = vec![
+                    crate::graph::Tensor::F32(emb),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ];
+                logits = p
+                    .run(inputs)?
+                    .into_iter()
+                    .next()
+                    .ok_or("seq-cls program produced no output")?
+                    .into_f32()?;
+            }
+            Ok(logits)
+        };
+        let logits = run(&mut p);
+        p.state = saved;
+        logits
     }
 }
 
@@ -1726,6 +1784,79 @@ fn sigmoid(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hybrid Qwen3.5 stack (DeltaNet + gated GQA full attention, qk-norm, partial rotary): the
+    /// Metal seq-cls program against the host forward. The text weights are bf16 on both sides and
+    /// accumulate in f32, so the bound is the 1e-3 f32 one.
+    #[test]
+    fn seqcls_gpu_matches_host_qwen3_5() {
+        let (text, h) = text::tiny_model_scaled(0.3);
+        let mut llm = Dense {
+            tok: crate::model::tokenizer::Tokenizer::default_bpe(),
+            text: Arc::new(text),
+            program: None,
+        };
+        let score = crate::model::classifier::decoder_gpu::fill(3 * h, 60, 0.5);
+        let seqs: [&[u32]; 3] = [&[3, 17, 5], &[9, 8, 7, 6, 5, 4, 3, 2, 1, 100], &[42]];
+        let e = crate::model::classifier::decoder_gpu::tests::parity(&mut llm, &score, 3, &seqs);
+        eprintln!("qwen3.5 hybrid max rel err {e:?}");
+    }
+
+    /// Plain Qwen3 (all full-attention layers, GQA, qk-norm, full rotary, tied embeddings).
+    #[test]
+    fn seqcls_gpu_matches_host_qwen3() {
+        let (h, vocab, heads, kv, hd, inter) = (64, 80, 4, 2, 16, 96);
+        let cfg = serde_json::json!({
+            "model_type": "qwen3", "hidden_size": h, "vocab_size": vocab,
+            "num_hidden_layers": 2, "num_attention_heads": heads, "num_key_value_heads": kv,
+            "head_dim": hd, "intermediate_size": inter, "max_position_embeddings": 64,
+            "rope_theta": 10000.0, "tie_word_embeddings": true
+        });
+        let mut specs = vec![
+            ("model.embed_tokens.weight".to_string(), vec![vocab, h]),
+            ("model.norm.weight".to_string(), vec![h]),
+        ];
+        for l in 0..2 {
+            let p = format!("model.layers.{l}");
+            for (n, s) in [
+                ("input_layernorm.weight", vec![h]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("self_attn.q_proj.weight", vec![heads * hd, h]),
+                ("self_attn.k_proj.weight", vec![kv * hd, h]),
+                ("self_attn.v_proj.weight", vec![kv * hd, h]),
+                ("self_attn.o_proj.weight", vec![h, heads * hd]),
+                ("self_attn.q_norm.weight", vec![hd]),
+                ("self_attn.k_norm.weight", vec![hd]),
+                ("mlp.gate_proj.weight", vec![inter, h]),
+                ("mlp.up_proj.weight", vec![inter, h]),
+                ("mlp.down_proj.weight", vec![h, inter]),
+            ] {
+                specs.push((format!("{p}.{n}"), s));
+            }
+        }
+        let sizes: std::collections::HashMap<_, usize> = specs
+            .iter()
+            .map(|(n, s)| (n.clone(), s.iter().product()))
+            .collect();
+        let ck = Weights::from_f32(specs, |name| {
+            let seed = name.bytes().map(|b| b as usize).sum::<usize>();
+            let norm = name.contains("norm");
+            Ok(crate::model::classifier::decoder_gpu::fill(sizes[name], seed, if norm { 0.2 } else { 0.3 })
+                .into_iter()
+                .map(|v| if norm { v + 1.0 } else { v })
+                .collect())
+        })
+        .unwrap();
+        let mut llm = Dense {
+            tok: crate::model::tokenizer::Tokenizer::default_bpe(),
+            text: Arc::new(TextModel::load(&ck, &cfg, Arch::Qwen3).unwrap()),
+            program: None,
+        };
+        let score = crate::model::classifier::decoder_gpu::fill(2 * h, 61, 0.5);
+        let seqs: [&[u32]; 3] = [&[3, 17, 5], &[9, 8, 7, 6, 5, 4, 3, 2, 1, 70, 11, 12], &[42]];
+        let e = crate::model::classifier::decoder_gpu::tests::parity(&mut llm, &score, 2, &seqs);
+        eprintln!("qwen3 dense max rel err {e:?}");
+    }
 
     #[test]
     fn linear_matches_reference_for_gemv_and_tiled_gemm() {

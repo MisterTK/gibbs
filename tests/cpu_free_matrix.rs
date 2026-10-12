@@ -11,6 +11,29 @@ use std::sync::Once;
 
 static INIT: Once = Once::new();
 
+#[allow(dead_code)]
+#[path = "../src/model/classifier/synth.rs"]
+mod synth;
+
+/// Loads a tiny synthetic classifier repo on Metal through the real loader and classifies a text and
+/// a pair twice each; the tripwire is armed, so any host forward would panic.
+fn classifier_on_gpu(name: &str, (cfg, ts): (serde_json::Value, synth::Ts)) {
+    use gibbs_engine::model::classifier::SequenceClassifier;
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    let hub = HuggingFaceHub::with_cache_dir(synth::write_repo(name, cfg, &ts));
+    let c = SequenceClassifier::load(&hub, &format!("t/{name}"), Device::Metal)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(c.device(), Device::Metal, "{name}");
+    for pair in [None, Some(synth::PAIR)] {
+        for _ in 0..2 {
+            let (scores, _) = c.classify(synth::TEXT, pair).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(scores.iter().all(|s| s.score.is_finite()), "{name}: non-finite scores");
+            let sum: f32 = scores.iter().map(|s| s.score).sum();
+            assert!((sum - 1.0).abs() < 1e-4, "{name}: softmax scores sum to {sum}");
+        }
+    }
+}
+
 fn metal_present() -> bool {
     available_devices().contains(&Device::Metal)
 }
@@ -82,6 +105,17 @@ fn gpu_fixture(f: Family) {
         }
         Family::T5 => gibbs_engine::model::t5::run_tiny_gpu_fixture(),
         Family::Seq2Seq => gibbs_engine::model::seq2seq::run_tiny_gpu_fixture(),
+        Family::ClassifierBert => classifier_on_gpu("bert", synth::bert(None)),
+        Family::ClassifierModern => {
+            classifier_on_gpu("modernbert", synth::modernbert("mean", true));
+            classifier_on_gpu("electra", synth::electra());
+            classifier_on_gpu("albert", synth::albert());
+            classifier_on_gpu("deberta-v2", synth::deberta_v2());
+            classifier_on_gpu("deberta-v1", synth::deberta_v1());
+        }
+        Family::ClassifierDecoder => {
+            gibbs_engine::model::classifier::gpu_fixture().expect("decoder seq-cls fixture")
+        }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }
