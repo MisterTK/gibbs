@@ -1142,21 +1142,26 @@ mod tests {
         use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
         use crate::model::diff_fixtures::unet_specs;
         let (ctx, add, cond, h, w, ctx_len) = (48, 24, 16, 8, 12, 5);
-        let r = synth(&unet_specs(ctx, add, cond), 11);
+        // f32 checkpoint, then the same weights as a real fp16 checkpoint (linears stay `Wt::F16` on Metal).
+        for half in [false, true] {
+        let mut r = synth(&unet_specs(ctx, add, cond), 11);
+        r.1 = half;
         let t = Tensors::from_reader(&r).unwrap();
         let unet = SdUnet::load(&t, "", Heads::Dim(16)).unwrap();
+        assert_eq!(matches!(unet.time0.w, Wt::F16(_)), half);
         let mut rng = Lcg(2);
         let (x, c) = (rng.vec(4 * h * w, 1.0), rng.vec(ctx_len * ctx, 1.0));
         let (a, tc) = (rng.vec(add, 1.0), rng.vec(cond, 1.0));
         let cpu = unet.forward_cpu(&x, h, w, 301.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
         let gpu = unet.forward_gpu(&x, h, w, 301.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
         let e = rel_err(&gpu, &cpu);
-        eprintln!("unet gpu-vs-cpu rel err {e:.2e}");
+        eprintln!("unet gpu-vs-cpu (f16 weights: {half}) rel err {e:.2e}");
         assert!(e < 1e-3, "rel err {e}");
         // A second call at the same size reuses the program; another timestep changes the output.
         let gpu2 = unet.forward_gpu(&x, h, w, 5.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
         let cpu2 = unet.forward_cpu(&x, h, w, 5.0, &c, ctx_len, Some(&a), Some(&tc)).unwrap();
         assert!(rel_err(&gpu2, &cpu2) < 1e-3 && rel_err(&gpu2, &gpu) > 1e-3);
         assert_eq!(unet.gpu.get(&[h, w, ctx_len], || Err("rebuilt".into())).unwrap().cpu_node_count(), 0);
+        }
     }
 }

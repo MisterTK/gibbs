@@ -345,6 +345,17 @@ mod tests {
         check("batch 2 groups 2", op, &xs, &ws, true, &[2, 6, 4, 4]);
     }
 
+    /// groups = 1 through the implicit-GEMM kernel: batch on the grid z axis, several K steps with a tail
+    /// (c_in 37 x 9 = 333), full 64-wide tiles on both axes, and a UNet-like 160-channel layer.
+    #[test]
+    fn conv2d_igemm_batched_and_wide_matches_cpu() {
+        let op = Op::Conv2d { stride: [1, 1], padding: [1; 4], dilation: [1, 1], groups: 1 };
+        check("batch 3 k tail", op.clone(), &[3, 37, 20, 22], &[70, 37, 3, 3], true, &[3, 70, 20, 22]);
+        check("unet-like 160ch", op.clone(), &[160, 24, 24], &[160, 160, 3, 3], true, &[160, 24, 24]);
+        check("1x1 batch 2 no bias", Op::Conv2d { stride: [1, 1], padding: [0; 4], dilation: [1, 1], groups: 1 },
+            &[2, 96, 17, 19], &[130, 96, 1, 1], false, &[2, 130, 17, 19]);
+    }
+
     /// The old CPU conv (`nn::conv2d`) agrees with the generalized reference on its own domain.
     #[test]
     fn cpu_reference_matches_nn_conv2d() {
