@@ -6,6 +6,8 @@
 //! an exponential dynamic shift, and the 64-channel 16x VAE ([`crate::model::qwen_vae21`]).
 //! Text-to-image only: condition images and the KV prefix cache are not implemented.
 
+mod graph_program;
+
 use crate::model::dit::{
     add_gated, norm_modulate, read_config, read_scheduler, rms_norm, silu_of, timestep_features,
 };
@@ -187,6 +189,8 @@ pub(crate) struct Dit21 {
     blocks: Vec<Block>,
     norm_out: QLin,
     proj_out: QLin,
+    /// Metal programs per (text tokens, h, w) (GPU-only runs).
+    gpu: graph_program::Cache,
 }
 
 impl Dit21 {
@@ -272,6 +276,7 @@ impl Dit21 {
             blocks,
             norm_out: QLin::load(s, "norm_out.linear.weight")?,
             proj_out: QLin::load(s, "proj_out.weight")?,
+            gpu: Default::default(),
         };
         if dit.modulation.n != 4 * dim
             || dit.t_lin2.n != dim
@@ -424,12 +429,22 @@ impl Core {
         let start = Instant::now();
         let (h, w) = (height / TOKEN_PX, width / TOKEN_PX);
         let (n_img, ch) = (h * w, self.dit.in_ch);
-        // Text features -> (projected context, rotary tables of the joint sequence).
+        // Text features -> (projected context, rotary tables of the joint sequence); on the GPU
+        // the raw features go to the program, which projects them itself.
+        let gpu = crate::model::dit_graph::use_metal();
         let prepare = |(txt, n): Features| {
-            (
-                self.dit.project_text(&txt, n),
-                Rope::new(&t2i_positions(n, h, w), &self.dit.axes),
-            )
+            if gpu {
+                (txt, None)
+            } else {
+                (
+                    self.dit.project_text(&txt, n),
+                    Some(Rope::new(&t2i_positions(n, h, w), &self.dit.axes)),
+                )
+            }
+        };
+        let velocity = |(ctx, rope): &(Vec<f32>, Option<Rope>), x: &[f32], sigma: f32| match rope {
+            Some(rope) => Ok(self.dit.forward(x, ctx, rope, sigma)),
+            None => self.dit.forward_gpu(&self.dit.gpu, x, ctx, h, w, sigma),
         };
         let pos = prepare(encode(&req.prompt)?);
         let neg = (guidance > 1.0)
@@ -448,9 +463,9 @@ impl Core {
         let mut x = nn::transpose(&noise, ch, n_img);
         for (i, s) in sigmas.windows(2).enumerate() {
             let t = Instant::now();
-            let mut v = self.dit.forward(&x, &pos.0, &pos.1, s[0]);
+            let mut v = velocity(&pos, &x, s[0])?;
             if let Some(neg) = &neg {
-                let vn = self.dit.forward(&x, &neg.0, &neg.1, s[0]);
+                let vn = velocity(neg, &x, s[0])?;
                 v.iter_mut()
                     .zip(&vn)
                     .for_each(|(v, n)| *v = n + guidance * (*v - n));
