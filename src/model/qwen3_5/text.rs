@@ -14,7 +14,7 @@ use crate::model::par::{par_for, par_rows, OutPtr};
 use crate::model::simd::{vector_fused_scale_add, vector_softmax, vector_swiglu};
 use crate::model::weights::Weights;
 use moe::Moe;
-pub(super) use mtp::MtpDrafter;
+pub(super) use mtp::{MtpDrafter, MtpGpuDrafter};
 use qwen4::{Hc, IndexState, Indexer, LayerHc, Mix, Ple, PleState};
 use serde_json::Value;
 
@@ -123,6 +123,17 @@ pub(super) enum LayerState {
     },
 }
 
+/// Optional inputs/outputs of the decode program (see [`TextModel::to_decode_graph_with`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DecodeOpts {
+    /// Rotate by a separate `[t, h, w]` position row (image prompts) instead of the cache index.
+    pub mrope: bool,
+    /// Qwen3-VL deepstack: one `deepstack_{i}` row input added after decoder layer `i`.
+    pub deepstack: usize,
+    /// Also output the final-normed hidden row (the MTP drafter's input).
+    pub tap: bool,
+}
+
 pub(crate) struct TextModel {
     pub(crate) hidden: usize,
     pub(crate) inter: usize,
@@ -139,6 +150,8 @@ pub(crate) struct TextModel {
     pub(crate) inv_freq: Vec<f32>,
     pub(crate) rope_theta: f32,
     axis: Vec<usize>,
+    /// M-RoPE sections (t, h, w) of the qwen3_5 / qwen3_vl decoders.
+    mrope: Option<[u32; 3]>,
     lin: Option<LinearCfg>,
     pub(crate) max_pos: usize,
     pub(crate) decode_max_ctx: usize,
@@ -245,6 +258,11 @@ impl TextModel {
             }
             vec![0; half]
         };
+        // Interleaved M-RoPE section sizes (validated above), for the Metal programs' `Rope`.
+        let mrope = matches!(arch, Arch::Qwen35 | Arch::Qwen3Vl | Arch::Qwen4Exp).then(|| {
+            let s = |i: usize| rope["mrope_section"][i].as_u64().unwrap_or(0) as u32;
+            [s(0), s(1), s(2)]
+        });
         let inv_freq = (0..half)
             .map(|i| (1.0 / theta.powf(2.0 * i as f64 / rot as f64)) as f32)
             .collect();
@@ -442,6 +460,7 @@ impl TextModel {
             inv_freq,
             rope_theta: theta as f32,
             axis,
+            mrope,
             lin,
             max_pos: get("max_position_embeddings").unwrap_or(32768),
             decode_max_ctx: get("max_position_embeddings").unwrap_or(32768).min(4096),
@@ -912,6 +931,15 @@ impl TextModel {
         Ok(())
     }
 
+    /// Names of the decode program's recurrent states (Gated DeltaNet conv window and delta-rule
+    /// state, one pair per linear-attention layer).
+    pub(super) fn recurrent_state_names(&self) -> Vec<String> {
+        let delta = self.layers.iter().enumerate().filter(|(_, l)| matches!(l.mixer, Mixer::Delta(_)));
+        delta
+            .flat_map(|(i, _)| [format!("layers.{i}.conv_state"), format!("layers.{i}.ssm_state")])
+            .collect()
+    }
+
     /// Forgets the recurrent checkpoints (the sequence keeps every position it ran).
     pub(super) fn drop_checkpoints(&self, state: &mut [LayerState]) {
         for st in state {
@@ -1149,13 +1177,42 @@ impl TextModel {
 
     /// Emits static-shape decode graph (n = 1) with stateful KV and DeltaNet caching and zero-copy weight bindings.
     pub fn to_decode_graph(&self) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.to_decode_graph_with_max_ctx(self.decode_max_ctx)
+        self.to_decode_graph_with(self.decode_max_ctx, DecodeOpts::default())
     }
 
     /// Emits static-shape decode graph (n = 1) with stateful KV and DeltaNet caching sized to `max_ctx`.
     pub fn to_decode_graph_with_max_ctx(
         &self,
         max_ctx: usize,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.to_decode_graph_with(max_ctx, DecodeOpts::default())
+    }
+
+    /// [`Self::to_decode_graph`] with the inputs/outputs of `opts` (input order: `inputs_embeds`,
+    /// `positions`, `rope_positions`?, `deepstack_i`...; outputs: logits, normed hidden?).
+    pub fn to_decode_graph_with(
+        &self,
+        max_ctx: usize,
+        opts: DecodeOpts,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.decode_graph_impl(max_ctx, opts, false)
+    }
+
+    /// The MTP head's decode step as a program: inputs `inputs_embeds` (the next token's
+    /// embedding), `hidden` (the target's final-normed row), `positions`; outputs the head's
+    /// logits and its normed row (the next step's `hidden`). Own KV state `layers.0.{k,v}_cache`.
+    pub fn mtp_decode_graph(
+        &self,
+        max_ctx: usize,
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        self.decode_graph_impl(max_ctx, DecodeOpts::default(), true)
+    }
+
+    fn decode_graph_impl(
+        &self,
+        max_ctx: usize,
+        opts: DecodeOpts,
+        mtp: bool,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         let max_ctx = max_ctx.min(self.max_pos).max(1);
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor, UnaryKind, ValueId};
@@ -1228,11 +1285,58 @@ impl TextModel {
         let mut w = crate::graph::Weights::new();
 
         let n = 1;
-        let mut x = g.input("inputs_embeds", vec![n, self.hidden], DType::F32);
-        let positions = g.input("positions", vec![n], DType::U32);
+        let mtp_head = if mtp {
+            Some(self.mtp.as_ref().ok_or("this model has no MTP head")?)
+        } else {
+            None
+        };
+        let (mut x, positions, rope_pos, deepstack) = match mtp_head {
+            None => {
+                let x = g.input("inputs_embeds", vec![n, self.hidden], DType::F32);
+                let positions = g.input("positions", vec![n], DType::U32);
+                // Vision-capable programs rotate by per-row (t, h, w) positions apart from the
+                // cache index, and add each deepstack feature row (zeros for text rows) after
+                // its decoder layer.
+                let rope_pos = (opts.mrope && self.mrope.is_some())
+                    .then(|| g.input("rope_positions", vec![3 * n], DType::U32));
+                let deepstack: Vec<ValueId> = (0..opts.deepstack)
+                    .map(|i| g.input(format!("deepstack_{i}"), vec![n, self.hidden], DType::F32))
+                    .collect();
+                (x, positions, rope_pos, deepstack)
+            }
+            Some(m) => {
+                // MTP step: `fc(concat(norm_e(embed(next token)), norm_h(final-normed hidden)))`.
+                let emb = g.input("inputs_embeds", vec![n, self.hidden], DType::F32);
+                let hid = g.input("hidden", vec![n, self.hidden], DType::F32);
+                let positions = g.input("positions", vec![n], DType::U32);
+                let mut rms = |name: &str, x: ValueId, v: &[f32]| {
+                    let wn = g.weight(format!("mtp.{name}.weight"), vec![self.hidden], DType::F32);
+                    w.insert(format!("mtp.{name}.weight"), Tensor::F32(v.to_vec()));
+                    g.add(
+                        format!("mtp.{name}"),
+                        Op::RmsNorm { eps: self.eps },
+                        &[x, wn],
+                        vec![n, self.hidden],
+                        DType::F32,
+                    )
+                };
+                let e = rms("pre_fc_norm_embedding", emb, &m.pre_emb);
+                let h = rms("pre_fc_norm_hidden", hid, &m.pre_hid);
+                let cat = g.add(
+                    "mtp.concat",
+                    Op::Concat { axis: -1 },
+                    &[e, h],
+                    vec![n, 2 * self.hidden],
+                    DType::F32,
+                );
+                let x = add_linear_part(&mut g, &mut w, "mtp.fc", cat, &m.fc.parts[0], None, n);
+                (x, positions, None, Vec::new())
+            }
+        };
 
         // 2. Decoder layers
-        for (li, l) in self.layers.iter().enumerate() {
+        let layers: &[Layer] = mtp_head.map_or(&self.layers, |m| &m.layers);
+        for (li, l) in layers.iter().enumerate() {
             if l.hc.is_some() {
                 return Err(format!(
                     "Layer {li}: Hyper-connections / PLE not supported in decode graph"
@@ -1617,15 +1721,26 @@ impl TextModel {
                     let inv_freq_name = "rope.inv_freq.default";
                     let inv_freq_val = g.weight(inv_freq_name, vec![self.inv_freq.len()], DType::F32);
                     w.insert(inv_freq_name.to_string(), Tensor::F32(self.inv_freq.clone()));
+                    let (rope_variant, rope_pos) = match (&rope_pos, self.mrope) {
+                        (Some(rp), Some(sections)) => (
+                            RopeVariant::MRope {
+                                sections,
+                                interleaved: true,
+                                pairs: crate::graph::PairLayout::Half,
+                            },
+                            *rp,
+                        ),
+                        _ => (RopeVariant::HalfSplit, positions),
+                    };
                     let mut q_rope = g.add(
                         format!("{p}.self_attn.q_rope"),
                         Op::Rope {
                             head_dim: self.head_dim,
                             rotary_dim: 2 * self.inv_freq.len(),
-                            variant: RopeVariant::HalfSplit,
+                            variant: rope_variant,
                             mscale: 1.0,
                         },
-                        &[q_rope_in, positions, inv_freq_val],
+                        &[q_rope_in, rope_pos, inv_freq_val],
                         vec![n, self.heads * self.head_dim],
                         DType::F32,
                     );
@@ -1634,10 +1749,10 @@ impl TextModel {
                         Op::Rope {
                             head_dim: self.head_dim,
                             rotary_dim: 2 * self.inv_freq.len(),
-                            variant: RopeVariant::HalfSplit,
+                            variant: rope_variant,
                             mscale: 1.0,
                         },
-                        &[k_rope_in, positions, inv_freq_val],
+                        &[k_rope_in, rope_pos, inv_freq_val],
                         vec![n, self.kv_heads * self.head_dim],
                         DType::F32,
                     );
@@ -1834,11 +1949,21 @@ impl TextModel {
                 vec![n, self.hidden],
                 DType::F32,
             );
+            if let Some(&ds) = deepstack.get(li) {
+                x = g.add(
+                    format!("{p}.deepstack"),
+                    Op::Add,
+                    &[x, ds],
+                    vec![n, self.hidden],
+                    DType::F32,
+                );
+            }
         }
 
         // 3. Final Norm & LM Head
+        let final_norm = mtp_head.map_or(&self.norm, |m| &m.norm);
         let norm_w = g.weight("final_norm.weight", vec![self.hidden], DType::F32);
-        w.insert("final_norm.weight", Tensor::F32(self.norm.clone()));
+        w.insert("final_norm.weight", Tensor::F32(final_norm.clone()));
         let final_x = g.add(
             "final_norm",
             Op::RmsNorm { eps: self.eps },
@@ -1873,6 +1998,10 @@ impl TextModel {
         );
 
         g.output(logits);
+        if opts.tap || mtp {
+            // The final-normed hidden row: MTP's input (transformers' `hidden_states[-1]`).
+            g.output(final_x);
+        }
         Ok((g, w))
     }
 }
