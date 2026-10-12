@@ -759,7 +759,7 @@ Plus the head GEMV with SoftCap. Asserted in a test over the tiny Gemma 4 config
   sed -n 's/^METRIC geomean_roofline_pct=//p' target/loop-bench.out
   ```
   A non-number or another exit code is `metric-error`: never scored as zero, never kept.
-- Guard: `cargo test --lib -q graph:: && target/release/gibbs --bench-parity bench/loop.json && scripts/generic_guard.sh`.
+- Guard: `scripts/loop_guard.sh` (frozen; full `cargo test --lib -q`, then `cpu_free_matrix`/`op_coverage` once they exist, then `--bench-parity`, then `generic_guard.sh`).
   - `scripts/generic_guard.sh` (new) exits 1 if `git diff HEAD~1 -U0 -- src/graph` adds a line matching `(?i)gemma|qwen|llama|mistral|phi|smollm|\bt5\b|bert|flux|sana|ltx` outside a `#[cfg(test)]` module.
 - Direction: higher. Budget: 40 iterations, with a checkpoint every 13 (`floor(40/3)`).
 - Stop early when both hold:
