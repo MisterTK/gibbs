@@ -181,24 +181,12 @@ pub fn tiny_clip(act: Act, proj: bool) -> ClipTextTransformer {
 
 
 
-/// A tiny SD pipeline (CLIP -> UNet -> VAE) run end to end as Metal programs; the caller arms the CPU
-/// tripwire, so any CPU compute panics. Returns the decoded image size.
+/// The tiny SD pipeline (`sd::tiny_pipeline`) generating an image: CLIP, CFG UNet and VAE as Metal
+/// programs; the caller arms the CPU tripwire, so any CPU compute panics. Returns the image size.
 pub fn tiny_sd_on_gpu() -> Result<(usize, usize), String> {
-    let clip = tiny_clip(Act::QuickGelu, false);
-    let ctx_dim = 128;
-    let r = synth(&unet_specs(ctx_dim, 24, 16), 11);
-    let unet = SdUnet::load(&Tensors::from_reader(&r)?, "", Heads::Dim(16))?;
-    let r = synth(&vae_specs(4), 7);
-    let vae = SdVae::from_ldm(&Tensors::from_reader(&r)?)?;
-    let ctx = clip.encode("a lighthouse", false)?.hidden;
-    let (h, w) = (4, 4);
-    let (add, tc) = (Lcg(1).vec(24, 1.0), Lcg(2).vec(16, 1.0));
-    let mut x = Lcg(3).vec(4 * h * w, 1.0);
-    for t in [500.0, 250.0] {
-        let eps = unet.forward(&x, h, w, t, &ctx, 77, Some(&add), Some(&tc))?;
-        x.iter_mut().zip(&eps).for_each(|(x, e)| *x -= 0.1 * e);
-    }
-    let img = vae.decode(&x, h, w)?;
+    let pipe = crate::model::sd::tiny_pipeline()?;
+    let req = crate::model::text_to_image::ImageRequest { prompt: "a lighthouse".into(), seed: 5, ..Default::default() };
+    let img = pipe.generate(&req, None)?;
     Ok((img.width, img.height))
 }
 

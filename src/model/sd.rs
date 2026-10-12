@@ -726,6 +726,34 @@ pub(crate) fn alphas_cumprod() -> Vec<f64> {
         .collect()
 }
 
+/// A tiny SD 1.x-style pipeline (CLIP + 2-level UNet + 2-level VAE, synthetic weights, Euler, CFG) for
+/// the parity test and the GPU-only matrix fixture.
+pub fn tiny_pipeline() -> Result<SdPipeline, String> {
+    use crate::model::diff_fixtures::{tiny_clip, unet_specs, vae_specs};
+    use crate::model::diff_graph::testutil::synth;
+    let unet_r = synth(&unet_specs(128, 0, 0), 11);
+    let unet = SdUnet::load(&Tensors::from_reader(&unet_r)?, "", Heads::Dim(16))?;
+    let vae_r = synth(&vae_specs(4), 7);
+    let vae = SdVae::from_ldm(&Tensors::from_reader(&vae_r)?)?;
+    let sched = SchedulerConfig::from_json(&json!({
+        "_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear",
+        "beta_start": 0.00085, "beta_end": 0.012, "timestep_spacing": "trailing"
+    }))?;
+    let d = ImageDefaults { width: 32, height: 32, steps: 3, guidance: 5.0, multiple: 16 };
+    SdPipeline::new(
+        vec![tiny_clip(Act::QuickGelu, false)],
+        unet,
+        vae,
+        VAE_SCALE,
+        sched,
+        false,
+        false,
+        d,
+        "tiny".into(),
+        "",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -756,31 +784,8 @@ mod tests {
     /// u8 pixels: allow a 2-level difference from f32 rounding.
     #[test]
     fn generate_gpu_matches_cpu() {
-        use crate::model::diff_fixtures::{tiny_clip, unet_specs, vae_specs};
-        use crate::model::diff_graph::{testutil::synth, with_gpu};
-        let unet_r = synth(&unet_specs(128, 0, 0), 11);
-        let unet = SdUnet::load(&Tensors::from_reader(&unet_r).unwrap(), "", crate::model::unet::Heads::Dim(16)).unwrap();
-        let vae_r = synth(&vae_specs(4), 7);
-        let vae = SdVae::from_ldm(&Tensors::from_reader(&vae_r).unwrap()).unwrap();
-        let sched = SchedulerConfig::from_json(&json!({
-            "_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear",
-            "beta_start": 0.00085, "beta_end": 0.012, "timestep_spacing": "trailing"
-        }))
-        .unwrap();
-        let d = ImageDefaults { width: 32, height: 32, steps: 3, guidance: 5.0, multiple: 16 };
-        let pipe = SdPipeline::new(
-            vec![tiny_clip(Act::QuickGelu, false)],
-            unet,
-            vae,
-            VAE_SCALE,
-            sched,
-            false,
-            false,
-            d,
-            "tiny".into(),
-            "",
-        )
-        .unwrap();
+        use crate::model::diff_graph::with_gpu;
+        let pipe = tiny_pipeline().unwrap();
         let req = ImageRequest { prompt: "a lighthouse".into(), seed: 5, ..Default::default() };
         let cpu = pipe.generate(&req, None).unwrap();
         let gpu = with_gpu(|| pipe.generate(&req, None)).unwrap();
