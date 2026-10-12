@@ -10,6 +10,10 @@
 
 mod draft;
 mod text;
+mod fixture;
+#[cfg(test)]
+mod gpu_tests;
+pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
 pub use text::tiny_decode_graph;
 mod vision;
 
@@ -30,7 +34,7 @@ use crate::scheduler::spec::Drafter;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
-use text::{Arch, LayerState, MtpDrafter, TextModel};
+use text::{Arch, LayerState, MtpDrafter, MtpGpuDrafter, TextModel};
 use vision::{Preprocessor, Vision};
 
 /// The mapped safetensors checkpoint of `artifacts` (pre-quantized schemes vetted) and its
@@ -87,20 +91,31 @@ pub fn load(
     // The matrices keep the mapping alive; the index itself is no longer needed.
     drop(ck);
     let tok = load_json_tokenizer(&dir.join("tokenizer.json"))?;
+    assemble(tok, text, vision, mode)
+}
+
+/// A [`Qwen35`] over `text` with its Metal programs (decoder; vision tower per image grid; the
+/// MTP head when the checkpoint has one), or the host forward under `--backend cpu`.
+fn assemble(
+    tok: Tokenizer,
+    text: Arc<TextModel>,
+    vision: Option<(Vision, Preprocessor, u32)>,
+    mode: crate::hardware::PlacementMode,
+) -> Result<Arc<dyn NativeLm>, String> {
+    let opts = text::DecodeOpts {
+        mrope: vision.is_some(),
+        deepstack: vision.as_ref().map_or(0, |(v, ..)| v.deepstack_layers()),
+        tap: text.mtp.is_some(),
+    };
+    let program = compile_qwen_program(&text, mode, opts)?;
+    let vision = vision
+        .map(|(v, p, id)| Ok::<_, String>((v.on_gpu(mode)?, p, id)))
+        .transpose()?;
     let drafter = text
         .mtp
         .is_some()
-        .then(|| Arc::new(MtpDrafter(text.clone())) as Arc<dyn Drafter>);
-    let program = if drafter.is_some() {
-        // MTP checkpointing needs state snapshot/restore, which only the CPU executor has.
-        crate::graph::avenues::family_gate(
-            crate::graph::avenues::Family::DraftersMtp,
-            crate::graph::avenues::resolved_backend(mode),
-        )?;
-        None
-    } else {
-        compile_qwen_program(&text, mode)?
-    };
+        .then(|| mtp_drafter(&text, &program, mode))
+        .transpose()?;
     Ok(Arc::new(Qwen35 {
         tok,
         text,
@@ -108,6 +123,41 @@ pub fn load(
         drafter,
         program,
     }))
+}
+
+/// Test hook: the model [`load_ninfer`] / [`load`] assemble from an in-memory checkpoint `ck` with
+/// config `cfg` (no tokenizer file: ids map to `t{id}`).
+#[cfg(test)]
+pub(crate) fn from_checkpoint(
+    ck: &Weights,
+    cfg: &Value,
+    mode: crate::hardware::PlacementMode,
+) -> Result<Arc<dyn NativeLm>, String> {
+    let text = Arc::new(TextModel::load(ck, text_config(cfg), Arch::Qwen35)?);
+    let vision = load_vision(ck, cfg, &text, || Err("test checkpoint has no preprocessor".into()))?;
+    let tok = Tokenizer::from_tokens((0..text.vocab).map(|i| format!("t{i}")).collect());
+    assemble(tok, text, vision, mode)
+}
+
+/// The MTP drafter of `text`: its head as a Metal program next to the target's `program`, or the
+/// host forward under `--backend cpu`.
+fn mtp_drafter(
+    text: &Arc<TextModel>,
+    program: &Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>,
+    mode: crate::hardware::PlacementMode,
+) -> Result<Arc<dyn Drafter>, String> {
+    if program.is_none() {
+        return Ok(Arc::new(MtpDrafter(text.clone())));
+    }
+    let (graph, weights) = text
+        .mtp_decode_graph(text.decode_max_ctx)
+        .map_err(|e| format!("Qwen3.5 MTP: {e}"))?;
+    let head = crate::graph::program::GraphProgram::compile(graph, weights, mode)
+        .map_err(|e| format!("Qwen3.5 MTP: {e}"))?;
+    Ok(Arc::new(MtpGpuDrafter::new(
+        text.clone(),
+        Arc::new(parking_lot::Mutex::new(head)),
+    )))
 }
 
 /// The vision tower, its preprocessor and the image placeholder id of a checkpoint that has
@@ -159,7 +209,7 @@ pub fn load_dense(
     };
     let text = Arc::new(TextModel::load(&ck, cfg, arch)?);
     let tok = load_json_tokenizer(&dir.join("tokenizer.json"))?;
-    let program = compile_qwen_program(&text, mode.into())?;
+    let program = compile_qwen_program(&text, mode.into(), text::DecodeOpts::default())?;
     Ok(Arc::new(Dense { tok, text, program }))
 }
 
@@ -377,7 +427,7 @@ fn gguf_model(
     let (ck, cfg, arch) = gguf_checkpoint(map, m)?;
     let text = Arc::new(TextModel::load(&ck, &cfg, arch)?);
     let tok = crate::model::UniversalModelLoader::extract_gguf_tokenizer(map)?;
-    let program = compile_qwen_program(&text, mode)?;
+    let program = compile_qwen_program(&text, mode, text::DecodeOpts::default())?;
     Ok(if matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) {
         // llama.cpp ships the vision tower as a separate mmproj GGUF: images are refused.
         Arc::new(Qwen35 {
@@ -397,17 +447,14 @@ fn gguf_model(
 /// weights file.
 pub fn load_ninfer(
     artifacts: &ModelArtifacts,
-    _mode: impl Into<crate::hardware::PlacementMode>,
+    mode: impl Into<crate::hardware::PlacementMode>,
 ) -> Option<Result<Arc<dyn NativeLm>, String>> {
     let path = artifacts
         .weights_path
         .as_deref()
         .filter(|p| p.to_string_lossy().ends_with(crate::model::ninfer::EXT))?;
+    let mode = mode.into();
     let load = || -> Result<Arc<dyn NativeLm>, String> {
-        crate::graph::avenues::family_gate(
-            crate::graph::avenues::Family::Ninfer,
-            crate::graph::avenues::resolved_backend(_mode.into()),
-        )?;
         let art = crate::model::ninfer::Artifact::open(path)?;
         let (ck, cfg) = art.checkpoint()?;
         let text = TextModel::load(&ck, &cfg, Arch::Qwen35)?;
@@ -421,13 +468,7 @@ pub fn load_ninfer(
             .resource("tokenizer.json")
             .ok_or("no tokenizer.json resource")?;
         let tok = tokenizer_from_files(&String::from_utf8_lossy(&json), &|n| art.resource(n))?;
-        Ok(Arc::new(Qwen35 {
-            tok,
-            text: Arc::new(text),
-            vision,
-            drafter: None,
-            program: None,
-        }))
+        assemble(tok, Arc::new(text), vision, mode)
     };
     Some(load().map_err(|e| format!("{}: {e}", path.display())))
 }
@@ -899,11 +940,14 @@ fn gguf_to_hf(arch: Arch, name: &str) -> Option<String> {
 fn compile_qwen_program(
     text: &Arc<TextModel>,
     mode: crate::hardware::PlacementMode,
+    opts: text::DecodeOpts,
 ) -> Result<Option<Arc<parking_lot::Mutex<crate::graph::program::GraphProgram>>>, String> {
     if matches!(mode, crate::hardware::PlacementMode::Pin(Device::Cpu)) {
         return Ok(None);
     }
-    let (graph, weights) = text.to_decode_graph().map_err(|e| format!("Qwen3.5: {e}"))?;
+    let (graph, weights) = text
+        .to_decode_graph_with(text.decode_max_ctx, opts)
+        .map_err(|e| format!("Qwen3.5: {e}"))?;
     crate::graph::program::GraphProgram::compile(graph, weights, mode)
         .map(|prog| Some(Arc::new(parking_lot::Mutex::new(prog))))
         .map_err(|e| format!("Qwen3.5: {e}"))
@@ -1141,6 +1185,10 @@ struct Seq {
     /// Decoder layers whose outputs every forward records into `tapped` (see `set_taps`).
     taps: Vec<usize>,
     tapped: Vec<f32>,
+    /// Program path: recurrent states after each position of the last checkpointing forward
+    /// (`ckpt[i]` follows position `ckpt_from + i`), for `truncate`.
+    ckpt: Vec<std::collections::HashMap<String, crate::graph::Tensor>>,
+    ckpt_from: usize,
 }
 
 impl NativeLm for Qwen35 {
@@ -1185,7 +1233,8 @@ impl NativeLm for Qwen35 {
     fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
         let (images, _) = self.size_images(&ids, media)?;
         let mut seq = Seq {
-            layers: self.text.new_state(),
+            // The program path keeps its state in `program_state`.
+            layers: if self.program.is_some() { Vec::new() } else { self.text.new_state() },
             len: 0,
             program_state: crate::graph::StateStore::new(),
             pos3: Vec::new(),
@@ -1195,12 +1244,11 @@ impl NativeLm for Qwen35 {
             deepstack: Vec::new(),
             taps: Vec::new(),
             tapped: Vec::new(),
+            ckpt: Vec::new(),
+            ckpt_from: 0,
         };
         if images.is_empty() {
             return Ok((ids, Box::new(seq)));
-        }
-        if self.program.is_some() {
-            crate::graph::avenues::gate(crate::graph::avenues::Family::Qwen35Vision)?;
         }
         let (vision, pre, image_token) = self
             .vision
@@ -1275,6 +1323,24 @@ impl NativeLm for Qwen35 {
         }
         if len == seq.len {
             self.text.drop_checkpoints(&mut seq.layers);
+            seq.ckpt.clear();
+        } else if self.program.is_some() && self.text.recurrent_state_names().is_empty() {
+            seq.len = len; // attention-only: KV rows past `len` are overwritten
+        } else if self.program.is_some() {
+            // Full KV needs nothing (attention reads only the rows below the position it is
+            // given); the recurrent states come back from the snapshot taken after position len-1.
+            let held = seq.ckpt.len();
+            if len <= seq.ckpt_from || len > seq.ckpt_from + held {
+                return Err(format!(
+                    "recurrent state rewinds only into its last verified span {}..={}, not to {len}",
+                    seq.ckpt_from + 1,
+                    seq.ckpt_from + held
+                ));
+            }
+            let snap = seq.ckpt.swap_remove(len - seq.ckpt_from - 1);
+            seq.program_state.restore(snap);
+            seq.ckpt.clear();
+            seq.len = len;
         } else {
             self.text.truncate(&mut seq.layers, len)?;
             seq.len = len;
@@ -1290,6 +1356,13 @@ impl NativeLm for Qwen35 {
             return Err(format!(
                 "tap layer {l}: the decoder has {} layers",
                 self.text.layers()
+            ));
+        }
+        // The decode program outputs one tap: the final-normed hidden row, which is what the MTP
+        // head reads (its host twin taps the last layer and norms it itself).
+        if self.program.is_some() && layers != [self.text.layers() - 1] {
+            return Err(format!(
+                "the Metal program taps only the last decoder layer's final-normed output, not {layers:?}"
             ));
         }
         Self::seq(state)?.taps = layers.to_vec();
@@ -1312,6 +1385,74 @@ impl Qwen35 {
             .ok_or_else(|| "sequence state was not built by this model".into())
     }
 
+    /// The program path of [`Self::run`]: `p.state` is the sequence's state. Image positions feed
+    /// their feature row for the token embedding, the `[t, h, w]` rope positions and, per deepstack
+    /// layer, the row added after it. `all` snapshots the recurrent states `refs` after every
+    /// position for [`NativeLm::truncate`].
+    fn program_steps(
+        &self,
+        p: &mut crate::graph::program::GraphProgram,
+        seq: &mut Seq,
+        tokens: &[u32],
+        start_pos: usize,
+        all: bool,
+        refs: &[&str],
+    ) -> Result<Vec<f32>, String> {
+        use crate::graph::Tensor;
+        let d = self.text.hidden();
+        let ds_layers = self.vision.as_ref().map_or(0, |(v, ..)| v.deepstack_layers());
+        let mut logits = Vec::new();
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i;
+            if pos >= self.text.decode_max_ctx {
+                return Err(format!(
+                    "position {pos} exceeds compiled decode context limit {}",
+                    self.text.decode_max_ctx
+                ));
+            }
+            let feat = seq.feat_row.get(pos).copied().filter(|&r| r != TEXT_ROW);
+            let mut emb = vec![0.0f32; d];
+            match feat {
+                Some(r) => emb.copy_from_slice(&seq.feats[r as usize * d..][..d]),
+                None => self.text.embed(tok, &mut emb)?,
+            }
+            let mut inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos as u32])];
+            if self.vision.is_some() {
+                let p3 = seq
+                    .pos3
+                    .get(pos)
+                    .copied()
+                    .unwrap_or([(pos as i64 + seq.delta) as u32; 3]);
+                inputs.push(Tensor::U32(p3.to_vec()));
+                for k in 0..ds_layers {
+                    let mut row = vec![0.0f32; d];
+                    if let (Some(r), Some(f)) = (feat, seq.deepstack.get(k)) {
+                        row.copy_from_slice(&f[r as usize * d..][..d]);
+                    }
+                    inputs.push(Tensor::F32(row));
+                }
+            }
+            let mut res = p.run(inputs)?.into_iter();
+            if all || i + 1 == tokens.len() {
+                if let Some(Tensor::F32(v)) = res.next() {
+                    logits.extend_from_slice(&v);
+                }
+            } else {
+                res.next();
+            }
+            if !seq.taps.is_empty() {
+                match res.next() {
+                    Some(Tensor::F32(h)) => seq.tapped.extend_from_slice(&h),
+                    _ => return Err("the decode program has no hidden-state output".into()),
+                }
+            }
+            if all {
+                seq.ckpt.push(p.state.snapshot(refs));
+            }
+        }
+        Ok(logits)
+    }
+
     /// Runs `tokens` from `start_pos`; logits after the last token, or after every token (with
     /// recurrent checkpoints for `truncate`) when `all`.
     fn run(
@@ -1329,48 +1470,22 @@ impl Qwen35 {
             ));
         }
         if let Some(prog) = &self.program {
-            if seq.feats.is_empty() && seq.taps.is_empty() {
-                let mut p = prog.lock();
-                std::mem::swap(&mut p.state, &mut seq.program_state);
-                let mut logits = Vec::new();
-                for (i, &tok) in tokens.iter().enumerate() {
-                    let pos = start_pos + i;
-                    if pos >= self.text.decode_max_ctx {
-                        std::mem::swap(&mut p.state, &mut seq.program_state);
-                        return Err(format!(
-                            "position {pos} exceeds compiled decode context limit {}",
-                            self.text.decode_max_ctx
-                        ));
-                    }
-                    let mut emb = vec![0.0f32; self.text.hidden()];
-                    self.text.embed(tok, &mut emb)?;
-                    let inputs = vec![
-                        crate::graph::Tensor::F32(emb),
-                        crate::graph::Tensor::U32(vec![pos as u32]),
-                    ];
-                    let step_out = p.run(inputs);
-                    match step_out {
-                        Ok(res) => {
-                            if all || i + 1 == tokens.len() {
-                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
-                                    logits.extend_from_slice(&v);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            std::mem::swap(&mut p.state, &mut seq.program_state);
-                            return Err(e);
-                        }
-                    }
-                }
-                std::mem::swap(&mut p.state, &mut seq.program_state);
-                seq.len = start_pos + tokens.len();
-                return Ok(logits);
+            // ponytail: one token per program step (prefill included); an n-row prefill graph is the upgrade.
+            let names = self.text.recurrent_state_names();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            // Consecutive checkpointing forwards extend one span; anything else starts over.
+            if !all || seq.ckpt.is_empty() || seq.ckpt_from + seq.ckpt.len() != start_pos {
+                seq.ckpt.clear();
+                seq.ckpt_from = start_pos;
             }
-            return Err(
-                "gpu-only: image/audio inputs need the vision/audio program; rerun with --backend cpu"
-                    .into(),
-            );
+            let mut p = prog.lock();
+            std::mem::swap(&mut p.state, &mut seq.program_state);
+            let out = self.program_steps(&mut p, seq, tokens, start_pos, all, &refs);
+            std::mem::swap(&mut p.state, &mut seq.program_state);
+            if out.is_ok() {
+                seq.len = start_pos + tokens.len();
+            }
+            return out;
         }
         if tokens.is_empty() {
             return Err("forward needs at least one token".into());
@@ -1559,6 +1674,37 @@ impl Linear {
             }
             crate::graph::Tensor::F32(all)
         }
+    }
+
+    /// `Op::Linear` of `x` `[n, cols]` through this single-matrix weight (and bias) as graph
+    /// weights `{name}.weight` / `{name}.bias`.
+    pub(crate) fn graph_node(
+        &self,
+        g: &mut crate::graph::Graph,
+        w: &mut crate::graph::Weights,
+        name: &str,
+        x: crate::graph::ValueId,
+        n: usize,
+    ) -> crate::graph::ValueId {
+        use crate::graph::{DType, Op, Tensor};
+        use crate::hardware::QuantFormat as Q;
+        let [m] = &self.parts[..] else {
+            panic!("{name}: graph_node needs a single-matrix linear");
+        };
+        let dtype = match m.packed().map(|p| p.format) {
+            Some(Q::FP32) => DType::F32,
+            Some(Q::FP16) => DType::F16,
+            Some(Q::BF16) | None => DType::BF16,
+            Some(f) => DType::Quant(f),
+        };
+        let wn = g.weight(format!("{name}.weight"), vec![self.rows, self.cols], dtype);
+        w.insert(format!("{name}.weight"), m.to_graph_tensor());
+        let mut ins = vec![x, wn];
+        if let Some(b) = &self.bias {
+            ins.push(g.weight(format!("{name}.bias"), vec![b.len()], DType::F32));
+            w.insert(format!("{name}.bias"), Tensor::F32(b.clone()));
+        }
+        g.add(name, Op::Linear, &ins, vec![n, self.rows], DType::F32)
     }
 }
 
