@@ -24,3 +24,7 @@ Removing the silent `Pin(Metal)` → CPU fallback (`compile_gemma4_program` used
 - The tiny synthetic fixture (`gemma4::tiny_decode_graph`) matches the CPU, so the divergence lives in real-checkpoint features: sliding window ring, KV sharing, PLE, proportional RoPE, 12288-wide MLPs, f32-materialized TQ2_0 weights.
 - Qwen3.5-2B Q4_K_XL, SmolLM2-135M pass parity on Metal.
 `family_status(Gemma4)` is therefore `Gated("numerics: …")`; `--backend cpu` runs it. The loop's Gemma floors (150 tok/s) cannot be met until Gemma 4 is correct on Metal (G3/S4.3).
+
+## S6.2 / G3.4 decode ICB: not adopted (2026-10-12)
+`GIBBS_TRACE_ENCODE=1` on this tree (Apple M5 Pro): Gemma 4 E2B QAT direct encode 0.20–0.27 ms CPU vs 8.8–9.1 ms GPU per token (2.3–3.0%); SmolLM2-135M 0.09–0.10 ms vs 4.8 ms (2.1%). The ceiling for any ICB saving is therefore the encode time itself (≤ 3% per token, before ICB's own `use_resources` + `execute_commands_in_buffer` cost), which cannot reliably clear S6.2's "≥ 2% lower" bar, while ICB needs every `encode` arm rewritten for `IndirectComputeCommand`. Decision rule applied: keep direct encode. The old `create_decode_icb` only allocated a descriptor and hard-coded `dispatch_icb = true`; it and `tests/decode_icb_test.rs` (which asserted that constant) are deleted. `bench.rs` `encode_us` is a hard-coded `10.0`; G3.6 replaces it with the measured value.
+Per-token wall time at the CLI (E2B 12 ms vs 8.8 ms GPU) shows the larger lever is host work outside the command buffer (256K-vocab logits readback and sampling), not encode.
