@@ -777,9 +777,13 @@ mod tests {
             "quark pack_method 'pack' is not supported (reorder, order are)"
         );
         assert_eq!(
-            blocker(serde_json::json!({"quant_method": "fp8", "weight_block_size": [128, 128]}))
+            blocker(serde_json::json!({"quant_method": "fp8", "weight_block_size": [128, 128]})),
+            None
+        );
+        assert_eq!(
+            blocker(serde_json::json!({"quant_method": "fp8", "weight_block_size": [64, 64]}))
                 .unwrap(),
-            "fp8 block-quantized checkpoints (`weight_block_size`) are not supported"
+            "fp8 weight_block_size [64,64] is not supported ([128, 128] is)"
         );
     }
 

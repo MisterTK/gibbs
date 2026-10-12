@@ -146,10 +146,14 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
         }
         Some("quark") => quark::blocker(qc.unwrap_or(&Value::Null)),
         // vLLM `fp8` serialization (amd/Llama-3.2-1B-Instruct-FP8-KV): F8 weights, one `weight_scale` each.
-        Some("fp8") if qc.is_some_and(|q| !q["weight_block_size"].is_null()) => Some(
-            "fp8 block-quantized checkpoints (`weight_block_size`) are not supported".into(),
-        ),
-        Some("fp8") => None,
+        // `weight_block_size` (DeepSeek / Qwen3-FP8): 2-D `weight_scale_inv` grid, read by [`dequantize`],
+        // whose grid inference ([`block`]) only knows 128-blocks.
+        Some("fp8") => qc.and_then(|q| {
+            let b = &q["weight_block_size"];
+            (!b.is_null() && *b != serde_json::json!([128, 128])).then(|| {
+                format!("fp8 weight_block_size {b} is not supported ([128, 128] is)")
+            })
+        }),
         // Every linear decodes at load (`exl3`); quantized embedding tables are refused there.
         Some("exl3") => None,
         Some("glq") => {
@@ -302,7 +306,11 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
         return exl3::dequantize(&get, stem).map(Some);
     }
     let get = |s: &str| m.tensors.get(&format!("{stem}.{s}"));
-    let (Some(w), Some(scale_t)) = (m.tensors.get(name), get("weight_scale")) else {
+    // fp8 block scales (`weight_scale_inv`) multiply like `weight_scale`: w = w_fp8 · scale_inv per block.
+    let (Some(w), Some(scale_t)) = (
+        m.tensors.get(name),
+        get("weight_scale").or_else(|| get("weight_scale_inv")),
+    ) else {
         return Ok(None);
     };
     // Float weights beside calibration scales (frozen / fake-quant exports) are already real values.
@@ -523,7 +531,7 @@ pub(crate) fn int4_groups<'a>(
 /// Elements of `n` covered by each of `s` scale entries.
 // ponytail: inferred from the scale grid (128-blocks preferred, else exact division); ragged non-128
 // blocks would need the config's `block_structure`.
-fn block(n: usize, s: usize) -> Result<usize, String> {
+pub(crate) fn block(n: usize, s: usize) -> Result<usize, String> {
     if s == n {
         Ok(1)
     } else if n.div_ceil(128) == s {
@@ -573,7 +581,7 @@ fn unpack_int(
         .collect())
 }
 
-fn bytes<'a>(data: &'a [u8], t: &VirtualTensor) -> Result<&'a [u8], String> {
+pub(crate) fn bytes<'a>(data: &'a [u8], t: &VirtualTensor) -> Result<&'a [u8], String> {
     data.get(t.byte_offset..t.byte_offset + t.byte_len)
         .ok_or_else(|| format!("tensor '{}' lies outside the weight buffer", t.name))
 }
