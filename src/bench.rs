@@ -317,19 +317,10 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
 
         let mut metal_tokens = prompt_tokens.clone();
         let mut cpu_tokens = prompt_tokens;
+        let mut m_logits = metal_exec.forward(&prompt_tokens, 0, &mut m_state)?;
+        let mut c_logits = cpu_exec.forward(&prompt_tokens, 0, &mut c_state)?;
 
         for i in 0..8 {
-            let m_logits = metal_exec.forward(
-                &[metal_tokens.last().copied().unwrap_or(0)],
-                metal_tokens.len() - 1,
-                &mut m_state,
-            )?;
-            let c_logits = cpu_exec.forward(
-                &[cpu_tokens.last().copied().unwrap_or(0)],
-                cpu_tokens.len() - 1,
-                &mut c_state,
-            )?;
-
             let dot: f32 = m_logits
                 .iter()
                 .zip(c_logits.iter())
@@ -360,6 +351,9 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
 
             metal_tokens.push(m_top as u32);
             cpu_tokens.push(c_top as u32);
+
+            m_logits = metal_exec.forward(&[m_top as u32], metal_tokens.len() - 1, &mut m_state)?;
+            c_logits = cpu_exec.forward(&[c_top as u32], cpu_tokens.len() - 1, &mut c_state)?;
         }
     }
 
