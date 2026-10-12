@@ -355,7 +355,10 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .unwrap();
 
-            if m_top != c_top || cos < 0.999 {
+            // The native CPU reference rounds activations to bf16 (BFDOT), so it sits 1e-3..1e-2 from
+            // the f32 Metal kernels (Gemma 4 E2B QAT: cos 0.995..1.0; Metal vs the f32 graph executor
+            // agree within 2e-3 per node). Top-1 must match exactly.
+            if m_top != c_top || cos < 0.99 {
                 eprintln!(
                     "parity: {} step {i}: metal {m_top} != cpu {c_top} (cos {cos:.5})",
                     model_cfg.id

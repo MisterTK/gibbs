@@ -426,7 +426,7 @@ pub fn run(
                     return Err(format!("node '{name}': GeGlu lengths mismatch"));
                 }
                 let mut out = gate.to_vec();
-                nn::gelu(&mut out);
+                nn::gelu_tanh(&mut out);
                 for (o, &u) in out.iter_mut().zip(up) {
                     *o *= u;
                 }
