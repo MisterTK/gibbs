@@ -235,8 +235,10 @@ pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Rep
         return Err(format!("bnb blocksize {bs} unsupported"));
     }
     let table = if b.fp4 { &FP4_LUT } else { &NF4_LUT };
-    // Rows must hold whole blocks, and the codec tables are the standard maps only.
-    if b.cols % bs != 0 || b.quant_map.iter().zip(table).any(|(a, c)| a.to_bits() != c.to_bits()) {
+    // Rows must hold whole blocks, the codec tables are the standard maps only, and no absmax may be
+    // so small that GPU products go subnormal (Apple GPUs flush those; the CPU path keeps them).
+    let tiny = |a: &f32| *a != 0.0 && a.abs() < f32::MIN_POSITIVE * 256.0;
+    if b.cols % bs != 0 || b.absmax.iter().any(tiny) || b.quant_map.iter().zip(table).any(|(a, c)| a.to_bits() != c.to_bits()) {
         return Ok(None);
     }
     let format = match (b.fp4, bs) {
@@ -383,6 +385,11 @@ mod tests {
         let (mut f, _) = build(false, 64, false, 2, 128, 4);
         let t = f.m.tensors["w.weight.quant_map"].clone();
         f.data[t.byte_offset] ^= 1;
+        assert!(repack(&f.m, &f.data, "w.weight").unwrap().is_none());
+        // Tiny absmax (GPU would flush subnormal products).
+        let (mut f, _) = build(false, 64, false, 2, 128, 5);
+        let t = f.m.tensors["w.weight.absmax"].clone();
+        f.data[t.byte_offset..t.byte_offset + 4].copy_from_slice(&1e-37f32.to_le_bytes());
         assert!(repack(&f.m, &f.data, "w.weight").unwrap().is_none());
         // Ordinary tensors are not bnb.
         assert!(repack(&f.m, &f.data, "other.weight").unwrap().is_none());
