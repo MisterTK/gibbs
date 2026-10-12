@@ -573,9 +573,9 @@ impl SanaPipeline {
 
     /// Caption states for the transformer: the projected, normed caption on the host, or on the
     /// GPU path the raw encoder states (the Metal program applies the projection).
-    fn encode(&self, prompt: &str, instruct: bool) -> Result<(Vec<f32>, usize), String> {
+    fn encode(&self, prompt: &str, instruct: bool, gpu: bool) -> Result<(Vec<f32>, usize), String> {
         let (sel, n) = self.encode_raw(prompt, instruct)?;
-        if crate::model::dit_graph::use_metal() {
+        if gpu {
             Ok((sel, n))
         } else {
             Ok((self.dit.caption(&sel, n), n))
@@ -634,9 +634,9 @@ impl ImageGenerator for SanaPipeline {
         let (h, w) = (height / f, width / f);
         let start = Instant::now();
         let gpu = crate::model::dit_graph::use_metal();
-        let (cap, n_cap) = self.encode(&req.prompt, true)?;
+        let (cap, n_cap) = self.encode(&req.prompt, true, gpu)?;
         let neg = if guidance > 1.0 {
-            Some(self.encode(req.negative_prompt.as_deref().unwrap_or(""), false)?)
+            Some(self.encode(req.negative_prompt.as_deref().unwrap_or(""), false, gpu)?)
         } else {
             None
         };
