@@ -80,6 +80,7 @@ pub mod qwen_image21;
 pub mod qwen_image_v1;
 pub mod qwen_vae;
 pub mod qwen_vae21;
+pub mod repack;
 pub mod sana;
 pub mod sd;
 pub mod sd3;

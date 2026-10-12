@@ -66,25 +66,31 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
 "#,
 };
 
-struct Spec {
-    format: QuantFormat,
-    block_elems: u32,
-    block_bytes: u32,
-    tables: &'static [&'static str],
-    body: &'static str,
+/// One registry entry. `tables` name entries of [`msl_prelude`]; `body` defines `decode8` (helpers from
+/// `HELPERS` are in scope) and may declare its own `#ifndef`-guarded constants.
+pub struct Spec {
+    pub format: QuantFormat,
+    pub block_elems: u32,
+    pub block_bytes: u32,
+    pub tables: &'static [&'static str],
+    pub body: &'static str,
 }
 
-/// Full MSL (helpers + tables + body) per entry of [`SPECS`], owned by a static so the codecs can borrow it.
+/// Every spec: the GGUF ones below plus the repacked source encodings of `model::repack`.
+fn all_specs() -> impl Iterator<Item = &'static Spec> {
+    use crate::model::repack::{affine, bnb, fp8};
+    SPECS.iter().chain(bnb::SPECS).chain(fp8::SPECS).chain(affine::SPECS)
+}
+
+/// Full MSL (helpers + tables + body) per entry of [`all_specs`], owned by a static so the codecs can borrow it.
 static MSL: LazyLock<Vec<String>> = LazyLock::new(|| {
-    SPECS
-        .iter()
+    all_specs()
         .map(|s| format!("{HELPERS}{}{}", tables_msl(s.tables), s.body))
         .collect()
 });
 
 static REGISTRY: LazyLock<Vec<Codec>> = LazyLock::new(|| {
-    SPECS
-        .iter()
+    all_specs()
         .zip(MSL.iter())
         .map(|(s, msl)| Codec {
             format: s.format,

@@ -613,7 +613,7 @@ pub fn gguf_block_codec(format: QuantFormat) -> Option<(usize, usize, GgufBlockF
         QuantFormat::GGUF_TQ1_0 => (256, 54, dequantize_tq1_0_block),
         QuantFormat::GGUF_TQ2_0 => (256, 66, dequantize_tq2_0_block),
         QuantFormat::MXFP4 => (32, 17, dequantize_mxfp4_block),
-        _ => return None,
+        _ => return crate::model::repack::block_codec(format),
     })
 }
 

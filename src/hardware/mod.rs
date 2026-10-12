@@ -333,6 +333,26 @@ pub enum QuantFormat {
     TurboQuant,
     WeightlessJesseLUT,
     HadamardNeedle,
+    /// bitsandbytes NF4/FP4 source tags; the GPU codecs are the blocksize-qualified `BNB_*_B*`.
+    BNB_NF4,
+    BNB_FP4,
+    /// Repacked bitsandbytes 4-bit: per block of 64/128/256 elements, nibbles + f32 absmax.
+    BNB_NF4_B64,
+    BNB_NF4_B128,
+    BNB_NF4_B256,
+    BNB_FP4_B64,
+    BNB_FP4_B128,
+    BNB_FP4_B256,
+    /// Repacked FP8: per block of 32 elements, 32 E4M3 bytes + f32 scale.
+    FP8_E4M3_B32,
+    /// Repacked MLX affine 4-bit: per group, nibbles + f16 scale + f16 bias.
+    MLX_AFFINE4_G32,
+    MLX_AFFINE4_G64,
+    MLX_AFFINE4_G128,
+    /// Repacked compressed-tensors int4: per group, nibbles + f16 scale + f16 zero point.
+    INT4_G32,
+    INT4_G64,
+    INT4_G128,
 }
 impl QuantFormat {
     pub fn bits_per_weight(&self) -> f32 {
@@ -368,6 +388,13 @@ impl QuantFormat {
             Self::GGUF_Q8_0 => 8.5,
             Self::FP16 | Self::BF16 => 16.0,
             Self::FP32 => 32.0,
+            Self::BNB_NF4 | Self::BNB_FP4 | Self::BNB_NF4_B64 | Self::BNB_FP4_B64 => 4.5,
+            Self::BNB_NF4_B128 | Self::BNB_FP4_B128 => 4.25,
+            Self::BNB_NF4_B256 | Self::BNB_FP4_B256 => 4.125,
+            Self::FP8_E4M3_B32 => 9.0,
+            Self::MLX_AFFINE4_G32 | Self::INT4_G32 => 5.0,
+            Self::MLX_AFFINE4_G64 | Self::INT4_G64 => 4.5,
+            Self::MLX_AFFINE4_G128 | Self::INT4_G128 => 4.25,
         }
     }
 
@@ -434,6 +461,21 @@ impl QuantFormat {
             Self::TurboQuant => "TurboQuant",
             Self::WeightlessJesseLUT => "JesseLUT",
             Self::HadamardNeedle => "Needle",
+            Self::BNB_NF4 => "BNB_NF4",
+            Self::BNB_FP4 => "BNB_FP4",
+            Self::BNB_NF4_B64 => "BNB_NF4_B64",
+            Self::BNB_NF4_B128 => "BNB_NF4_B128",
+            Self::BNB_NF4_B256 => "BNB_NF4_B256",
+            Self::BNB_FP4_B64 => "BNB_FP4_B64",
+            Self::BNB_FP4_B128 => "BNB_FP4_B128",
+            Self::BNB_FP4_B256 => "BNB_FP4_B256",
+            Self::FP8_E4M3_B32 => "FP8_E4M3_B32",
+            Self::MLX_AFFINE4_G32 => "MLX_AFFINE4_G32",
+            Self::MLX_AFFINE4_G64 => "MLX_AFFINE4_G64",
+            Self::MLX_AFFINE4_G128 => "MLX_AFFINE4_G128",
+            Self::INT4_G32 => "INT4_G32",
+            Self::INT4_G64 => "INT4_G64",
+            Self::INT4_G128 => "INT4_G128",
         }
     }
 
@@ -469,7 +511,21 @@ impl QuantFormat {
                 | Self::KIVI_2Bit
                 | Self::TurboQuant
                 | Self::WeightlessJesseLUT
-                | Self::HadamardNeedle => 2.0 + self.bits_per_weight() as f64,
+                | Self::HadamardNeedle
+                | Self::BNB_NF4
+                | Self::BNB_FP4
+                | Self::BNB_NF4_B64
+                | Self::BNB_NF4_B128
+                | Self::BNB_NF4_B256
+                | Self::BNB_FP4_B64
+                | Self::BNB_FP4_B128
+                | Self::BNB_FP4_B256
+                | Self::MLX_AFFINE4_G32
+                | Self::MLX_AFFINE4_G64
+                | Self::MLX_AFFINE4_G128
+                | Self::INT4_G32
+                | Self::INT4_G64
+                | Self::INT4_G128 => 2.0 + self.bits_per_weight() as f64,
 
                 Self::GGUF_Q4_1
                 | Self::GGUF_Q5_0
@@ -480,7 +536,7 @@ impl QuantFormat {
                 | Self::EXL3_5Bit => 10.0 + self.bits_per_weight() as f64,
 
                 Self::GGUF_Q8_0 => 20.0,
-                Self::FP8_E4M3 | Self::FP8_E5M2 => 22.0,
+                Self::FP8_E4M3 | Self::FP8_E5M2 | Self::FP8_E4M3_B32 => 22.0,
 
                 Self::BF16 | Self::FP16 => 35.0,
                 Self::FP32 => 70.0,
