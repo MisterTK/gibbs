@@ -32,7 +32,18 @@ pub fn allow() -> AllowGuard {
 
 /// Called at the top of every CPU compute entry point.
 pub fn enter(site: &'static str) {
+    ENTERED.with(|c| c.set(c.get() + 1));
     if BAN.load(Ordering::Relaxed) && ALLOW.load(Ordering::SeqCst) == 0 {
         panic!("gpu-only violation: CPU compute entered at {site}; a code path bypassed the family gate");
     }
+}
+
+thread_local! {
+    static ENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many CPU compute entry points this thread has entered (armed or not): lets a test assert a
+/// GPU leg stayed off the CPU without arming the process-wide ban.
+pub fn entered() -> usize {
+    ENTERED.with(std::cell::Cell::get)
 }

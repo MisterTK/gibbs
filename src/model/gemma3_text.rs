@@ -5,6 +5,7 @@
 //! (default / linear / yarn), final norm. One uncached causal pass over bf16 (memory-mapped) or
 //! f32 weights; the classifier scores the last token's final-norm hidden state.
 
+use crate::model::classifier::decoder_gpu::GpuScore;
 use crate::model::classifier::{encode_pair, DecoderBackbone};
 use crate::model::gemma4::ops::{gelu_mul, linear, rms_norm, rope, rope_table};
 use crate::model::hub::ModelArtifacts;
@@ -114,6 +115,8 @@ pub struct Gemma3Text {
     /// (inverse frequencies, cos/sin scale) per layer type.
     rope_full: (Vec<f32>, f32),
     rope_sliding: (Vec<f32>, f32),
+    /// Metal session and `[labels, hidden]` score head once `attach_score_gpu` ran.
+    gpu: Option<(GpuScore, Vec<f32>)>,
 }
 
 /// `rope_parameters[ty]` with transformers' legacy fill-ins: `rope_scaling` merges into the
@@ -329,6 +332,7 @@ impl Gemma3Text {
             norm: gain("model.norm.weight", hidden)?,
             rope_full: rope("full_attention")?,
             rope_sliding: rope("sliding_attention")?,
+            gpu: None,
         })
     }
 
@@ -380,6 +384,133 @@ impl Gemma3Text {
     }
 }
 
+impl Gemma3Text {
+    /// The Metal program for `n` tokens (positions `0..n`): [`DecoderBackbone::last_hidden`] as
+    /// graph ops, then the bias-free `score` `[labels, hidden]` on the last row (output
+    /// `[1, labels]`). Weights are cloned into `weights` when given. The attention scale
+    /// `query_pre_attn_scalar^-0.5` is folded into the q-norm gain (the op fixes 1/sqrt(head_dim)).
+    fn seqcls_graph(
+        &self,
+        n: usize,
+        score: &[f32],
+        weights: Option<&mut crate::graph::Weights>,
+    ) -> crate::graph::Graph {
+        use crate::graph::{DType, Op, RopeVariant, ValueId};
+        let (h, hd, nh, kvh, eps) = (self.hidden, self.head_dim, self.heads, self.kv_heads, self.eps);
+        let f = DType::F32;
+        let mut b = GraphBuilder {
+            g: crate::graph::Graph::new(),
+            weights,
+        };
+        let ids = b.g.input("token_ids", vec![n], DType::U32);
+        let positions = b.g.input("positions", vec![n], DType::U32);
+        let table = b.f32("embed_tokens", vec![self.vocab, h], || {
+            let mut t = vec![0.0f32; self.vocab * h];
+            t.chunks_exact_mut(h)
+                .enumerate()
+                .for_each(|(r, row)| self.embed.row(r, self.embed_scale, row));
+            t
+        });
+        let mut x = b.g.add("embed", Op::Embedding, &[table, ids], vec![n, h], f);
+        let norm = |b: &mut GraphBuilder, name: String, x: ValueId, gain: &[f32], shape: Vec<usize>| {
+            let gw = b.f32(&format!("{name}.weight"), vec![gain.len()], || gain.to_vec());
+            b.g.add(name, Op::RmsNorm { eps }, &[x, gw], shape, f)
+        };
+        let lin = |b: &mut GraphBuilder, name: &str, x: ValueId, w: &W| {
+            let wv = b.w(&format!("{name}.weight"), w);
+            b.g.add(name, Op::Linear, &[x, wv], vec![n, w.dims().0], f)
+        };
+        let rope_full = b.f32("rope.full", vec![hd / 2], || self.rope_full.0.clone());
+        let rope_sliding = b.f32("rope.sliding", vec![hd / 2], || self.rope_sliding.0.clone());
+        let q_scale = self.scale * (hd as f32).sqrt();
+        for (i, l) in self.layers.iter().enumerate() {
+            let p = format!("layers.{i}");
+            let a = norm(&mut b, format!("{p}.input_ln"), x, &l.input_ln, vec![n, h]);
+            let q = lin(&mut b, &format!("{p}.q"), a, &l.q);
+            let k = lin(&mut b, &format!("{p}.k"), a, &l.k);
+            let v = lin(&mut b, &format!("{p}.v"), a, &l.v);
+            let q_gain: Vec<f32> = l.q_norm.iter().map(|g| g * q_scale).collect();
+            let q = norm(&mut b, format!("{p}.q_norm"), q, &q_gain, vec![n, nh * hd]);
+            let k = norm(&mut b, format!("{p}.k_norm"), k, &l.k_norm, vec![n, kvh * hd]);
+            let (inv, mscale) = if l.sliding {
+                (rope_sliding, self.rope_sliding.1)
+            } else {
+                (rope_full, self.rope_full.1)
+            };
+            let rope = Op::Rope {
+                head_dim: hd,
+                rotary_dim: hd,
+                variant: RopeVariant::HalfSplit,
+                mscale,
+            };
+            let q = b.g.add(format!("{p}.q_rope"), rope.clone(), &[q, positions, inv], vec![n, nh * hd], f);
+            let k = b.g.add(format!("{p}.k_rope"), rope, &[k, positions, inv], vec![n, kvh * hd], f);
+            let attn = Op::Attention {
+                heads: nh,
+                kv_heads: kvh,
+                causal: true,
+                window: l.sliding.then_some(self.window),
+                soft_cap: self.attn_softcap,
+            };
+            let a = b.g.add(format!("{p}.attn"), attn, &[q, k, v], vec![n, nh * hd], f);
+            let o = lin(&mut b, &format!("{p}.o"), a, &l.o);
+            let o = norm(&mut b, format!("{p}.post_attn_ln"), o, &l.post_attn_ln, vec![n, h]);
+            x = b.g.add(format!("{p}.res1"), Op::Add, &[x, o], vec![n, h], f);
+            let a = norm(&mut b, format!("{p}.pre_ff_ln"), x, &l.pre_ff_ln, vec![n, h]);
+            let gate = lin(&mut b, &format!("{p}.gate"), a, &l.gate);
+            let up = lin(&mut b, &format!("{p}.up"), a, &l.up);
+            let inter = l.gate.dims().0;
+            let gu = b.g.add(format!("{p}.mlp"), Op::GeGlu, &[gate, up], vec![n, inter], f);
+            let d = lin(&mut b, &format!("{p}.down"), gu, &l.down);
+            let d = norm(&mut b, format!("{p}.post_ff_ln"), d, &l.post_ff_ln, vec![n, h]);
+            x = b.g.add(format!("{p}.res2"), Op::Add, &[x, d], vec![n, h], f);
+        }
+        let slice = Op::Slice { axis: 0, start: n as i64 - 1, end: n as i64 };
+        let last = b.g.add("last_row", slice, &[x], vec![1, h], f);
+        let last = norm(&mut b, "final_norm".into(), last, &self.norm, vec![1, h]);
+        let labels = score.len() / h;
+        let sw = b.f32("score.weight", vec![labels, h], || score.to_vec());
+        let logits = b.g.add("score", Op::Linear, &[last, sw], vec![1, labels], f);
+        b.g.output(logits);
+        b.g
+    }
+}
+
+/// A [`crate::graph::Graph`] under construction plus the optional sink its weights are cloned into.
+struct GraphBuilder<'a> {
+    g: crate::graph::Graph,
+    weights: Option<&'a mut crate::graph::Weights>,
+}
+
+impl GraphBuilder<'_> {
+    /// An f32 weight; `data` runs only when weights are collected.
+    fn f32(&mut self, name: &str, shape: Vec<usize>, data: impl FnOnce() -> Vec<f32>) -> crate::graph::ValueId {
+        if let Some(w) = self.weights.as_deref_mut() {
+            w.insert(name, crate::graph::Tensor::F32(data()));
+        }
+        self.g.weight(name, shape, crate::graph::DType::F32)
+    }
+
+    /// A projection weight in its stored precision (bf16 stays bf16).
+    fn w(&mut self, name: &str, w: &W) -> crate::graph::ValueId {
+        let (rows, cols) = w.dims();
+        let dtype = match w {
+            W::Bf16(_) => crate::graph::DType::BF16,
+            W::F32 { .. } => crate::graph::DType::F32,
+        };
+        if let Some(sink) = self.weights.as_deref_mut() {
+            sink.insert(
+                name,
+                match w {
+                    W::Bf16(m) => m.to_graph_tensor(),
+                    W::F32 { w, .. } => crate::graph::Tensor::F32(w.clone()),
+                },
+            );
+        }
+        self.g.weight(name, vec![rows, cols], dtype)
+    }
+}
+
 impl DecoderBackbone for Gemma3Text {
     fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
@@ -405,6 +536,7 @@ impl DecoderBackbone for Gemma3Text {
         }
     }
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("decoder::last_hidden");
         let (h, n) = (self.hidden, ids.len());
         let mut x = vec![0.0f32; n * h];
         for (row, &id) in x.chunks_exact_mut(h).zip(ids) {
@@ -443,11 +575,106 @@ impl DecoderBackbone for Gemma3Text {
         rms_norm(&mut last, h, Some(&self.norm), self.eps);
         Ok(last)
     }
+    fn attach_score_gpu(&mut self, score: &[f32], labels: usize) -> Result<(), String> {
+        if score.len() != labels * self.hidden {
+            return Err(format!("score head is not [{labels}, {}]", self.hidden));
+        }
+        // ponytail: the session holds its own copy of every weight, and the embedding table as
+        // f32 (scaled once here): 2x resident, 4x for the bf16 table.
+        let mut weights = crate::graph::Weights::new();
+        self.seqcls_graph(1, score, Some(&mut weights));
+        self.gpu = Some((GpuScore::new(&weights)?, score.to_vec()));
+        Ok(())
+    }
+    fn score_gpu(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let (gpu, score) = self.gpu.as_ref().ok_or("no GPU score program attached")?;
+        let n = ids.len();
+        if n == 0 || n > self.max_pos {
+            return Err(format!("{n} tokens: the context holds 1..={}", self.max_pos));
+        }
+        if let Some(&id) = ids.iter().find(|&&id| id as usize >= self.vocab) {
+            return Err(format!("token id {id} is outside the vocabulary"));
+        }
+        let graph = self.seqcls_graph(n, score, None);
+        gpu.run(&graph, ids, (0..n as u32).collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 3 layers (two sliding with window 3, one global), GQA 4/2, `query_pre_attn_scalar` 24 (not
+    /// head_dim, so the folded q scale is exercised), attention softcap, a yarn-style cos/sin
+    /// scale on the global rope, bf16 projections and an f32 embedding: Metal vs the host forward.
+    #[test]
+    fn seqcls_gpu_matches_host() {
+        use crate::model::classifier::decoder_gpu::{fill, tests::parity};
+        let (h, v, nh, kvh, hd, inter) = (64, 96, 4, 2, 16, 96);
+        let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
+        for l in 0..3 {
+            for (n, r, c) in [
+                ("q", nh * hd, h),
+                ("k", kvh * hd, h),
+                ("v", kvh * hd, h),
+                ("o", h, nh * hd),
+                ("gate", inter, h),
+                ("up", inter, h),
+                ("down", h, inter),
+            ] {
+                specs.push((format!("{n}{l}"), vec![r, c]));
+            }
+        }
+        let weights = Weights::from_f32(specs.clone(), |name| {
+            let len = specs.iter().find(|(n, _)| n == name).unwrap().1.iter().product();
+            Ok(fill(len, name.bytes().map(|b| b as usize).sum(), 0.3))
+        })
+        .unwrap();
+        let w = |n: String| W::Bf16(weights.mat(&n).unwrap());
+        let gain = |seed| -> Vec<f32> { fill(h, seed, 0.3).iter().map(|v| v + 1.0).collect() };
+        let head_gain = |seed| -> Vec<f32> { fill(hd, seed, 0.3).iter().map(|v| v + 1.0).collect() };
+        let layers = (0..3)
+            .map(|l| Layer {
+                sliding: l != 2,
+                q: w(format!("q{l}")),
+                k: w(format!("k{l}")),
+                v: w(format!("v{l}")),
+                o: w(format!("o{l}")),
+                gate: w(format!("gate{l}")),
+                up: w(format!("up{l}")),
+                down: w(format!("down{l}")),
+                q_norm: head_gain(1 + l),
+                k_norm: head_gain(5 + l),
+                input_ln: gain(10 + l),
+                post_attn_ln: gain(20 + l),
+                pre_ff_ln: gain(30 + l),
+                post_ff_ln: gain(40 + l),
+            })
+            .collect();
+        let mut llm = Gemma3Text {
+            tokenizer: Tokenizer::default_bpe(),
+            hidden: h,
+            heads: nh,
+            kv_heads: kvh,
+            head_dim: hd,
+            eps: 1e-6,
+            scale: 24f32.powf(-0.5),
+            attn_softcap: Some(50.0),
+            window: 3,
+            max_pos: 64,
+            embed: W::F32 { w: fill(v * h, 9, 0.5), rows: v, cols: h },
+            vocab: v,
+            embed_scale: 8.0,
+            layers,
+            norm: gain(50),
+            rope_full: ((0..hd / 2).map(|i| 0.5 / 1.4f32.powi(i as i32)).collect(), 1.2),
+            rope_sliding: ((0..hd / 2).map(|i| 1.0 / 1.7f32.powi(i as i32)).collect(), 1.0),
+            gpu: None,
+        };
+        let seqs: [&[u32]; 3] = [&[3, 17, 5], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 70], &[42]];
+        let e = parity(&mut llm, &fill(3 * h, 62, 0.5), 3, &seqs);
+        eprintln!("gemma3 seq-cls max rel err {e:?}");
+    }
 
     /// transformers `_compute_yarn_parameters` for OTel-LLM-8.3B's global layers (factor 4,
     /// 8192 original positions, beta 64/1, base 1e4, dim 128): the scale is 0.1 ln 4 + 1; the

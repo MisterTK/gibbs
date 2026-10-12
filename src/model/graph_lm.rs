@@ -913,7 +913,7 @@ impl GraphLm {
 
     /// Emits only the [`Graph`] structure for prefill sequence bucket n without cloning weights.
     pub fn to_prefill_graph_structure(&self, n: usize) -> crate::graph::Graph {
-        self.build_graph_inner(n, true, None).0
+        self.build_graph_inner(n, true, None, None).0
     }
 
     /// Emits both the [`Graph`] and the [`Weights`] ready for execution on any backend.
@@ -927,8 +927,21 @@ impl GraphLm {
         cached: bool,
     ) -> (crate::graph::Graph, crate::graph::Weights) {
         let mut w_map = crate::graph::Weights::new();
-        let (g, _) = self.build_graph_inner(n, cached, Some(&mut w_map));
+        let (g, _) = self.build_graph_inner(n, cached, Some(&mut w_map), None);
         (g, w_map)
+    }
+
+    /// Uncached causal graph over `n` tokens ending in a bias-free `score` head `[labels, hidden]`
+    /// (instead of the LM head) on the last row: output `[1, labels]`, the sequence-classification
+    /// logits. Weights (named as in [`Self::build_graph`], plus `score.weight`) are cloned into
+    /// `weights` when given.
+    pub fn build_seqcls_graph(
+        &self,
+        n: usize,
+        score: &[f32],
+        weights: Option<&mut crate::graph::Weights>,
+    ) -> crate::graph::Graph {
+        self.build_graph_inner(n, false, weights, Some(score)).0
     }
 
     fn build_graph_inner(
@@ -936,6 +949,7 @@ impl GraphLm {
         n: usize,
         cached: bool,
         mut w_map: Option<&mut crate::graph::Weights>,
+        score: Option<&[f32]>,
     ) -> (crate::graph::Graph, ()) {
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor, ValueId};
 
@@ -1283,7 +1297,23 @@ impl GraphLm {
             eps,
             n,
         );
-        let logits = linear(&mut g, &mut w_map, "lm_head", n_norm, &self.lm_head, n);
+        let logits = match score {
+            None => linear(&mut g, &mut w_map, "lm_head", n_norm, &self.lm_head, n),
+            Some(s) => {
+                let labels = s.len() / h;
+                let w = g.weight("score.weight", vec![labels, h], DType::F32);
+                if let Some(map) = &mut w_map {
+                    map.insert("score.weight", Tensor::F32(s.to_vec()));
+                }
+                let slice = Op::Slice {
+                    axis: 0,
+                    start: n as i64 - 1,
+                    end: n as i64,
+                };
+                let last = g.add("last_row", slice, &[n_norm], vec![1, h], DType::F32);
+                g.add("score", Op::Linear, &[last, w], vec![1, labels], DType::F32)
+            }
+        };
         g.output(logits);
         (g, ())
     }

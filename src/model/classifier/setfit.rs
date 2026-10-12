@@ -2,6 +2,7 @@
 //! `1_Pooling/config.json` → optional `Normalize`) feeding the scikit-learn `LogisticRegression`
 //! head pickled by joblib in `model_head.pkl`. Scores are sklearn `predict_proba`.
 
+use super::head::{HeadGraph, HeadLin, HeadPool, HeadPost};
 use super::{load_tokenizer, read_json, Activation, Body, Checkpoint, SequenceClassifier};
 use crate::hardware::Device;
 use crate::model::hub::HuggingFaceHub;
@@ -19,24 +20,48 @@ pub(super) struct SetFit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Pool {
+pub(super) enum Pool {
     Mean,
     Cls,
     Max,
 }
 
 /// sklearn `LogisticRegression` as `predict_proba` evaluates it.
-struct Logistic {
+pub(super) struct Logistic {
     /// `coef_` `[rows, features]` row-major; rows = 1 for a binary model.
-    coef: Vec<f64>,
-    intercept: Vec<f64>,
-    features: usize,
+    pub(super) coef: Vec<f64>,
+    pub(super) intercept: Vec<f64>,
+    pub(super) features: usize,
     /// OvR (sigmoid per class, normalised) instead of multinomial softmax.
-    ovr: bool,
+    pub(super) ovr: bool,
 }
 
+
 impl Logistic {
-    fn proba(&self, x: &[f32]) -> Vec<f32> {
+    /// The pooling, normalisation and `predict_proba` as graph nodes (Metal; f64 coefficients
+    /// become f32).
+    pub(super) fn graph(&self, pool: Pool, normalize: bool) -> HeadGraph {
+        HeadGraph {
+            pool: match pool {
+                Pool::Mean => HeadPool::Mean,
+                Pool::Cls => HeadPool::First,
+                Pool::Max => HeadPool::Max,
+            },
+            normalize,
+            dense: None,
+            norm: None,
+            out: HeadLin {
+                w: self.coef.iter().map(|&v| v as f32).collect(),
+                b: Some(self.intercept.iter().map(|&v| v as f32).collect()),
+                in_f: self.features,
+                out_f: self.intercept.len(),
+            },
+            post: HeadPost::Logistic { ovr: self.ovr },
+        }
+    }
+}
+impl Logistic {
+    pub(super) fn proba(&self, x: &[f32]) -> Vec<f32> {
         let d: Vec<f64> = self
             .intercept
             .iter()
@@ -204,13 +229,19 @@ impl SequenceClassifier {
             .collect::<Result<Vec<_>, _>>()?;
 
         let ckpt = Checkpoint::open(hub, repo_id)?;
-        let enc = BertEncoder::load(dims, device, |name, shape| {
-            let bare = ckpt.get(name, shape);
-            if bare.is_ok() || ckpt.has(name) {
-                return bare;
-            }
-            ckpt.get(&format!("bert.{name}"), shape)
-        })?;
+        let graph_head = (device != Device::Cpu).then(|| head.graph(pool, normalize));
+        let enc = BertEncoder::load_with_head(
+            dims,
+            device,
+            |name, shape| {
+                let bare = ckpt.get(name, shape);
+                if bare.is_ok() || ckpt.has(name) {
+                    return bare;
+                }
+                ckpt.get(&format!("bert.{name}"), shape)
+            },
+            graph_head,
+        )?;
         Ok(Self {
             repo_id: repo_id.to_string(),
             architecture: format!("SetFit ({arch} + LogisticRegression)"),
@@ -237,6 +268,9 @@ impl SetFit {
         let e = super::encode(&self.tok, text, None)?;
         let ids = e.get_ids();
         let positions: Vec<u32> = (0..ids.len() as u32).collect();
+        if self.enc.device() != Device::Cpu {
+            return Ok((self.enc.run_head(ids, &positions, e.get_type_ids())?, ids.len()));
+        }
         let hidden = self.enc.run(ids, &positions, e.get_type_ids(), false)?;
         let emb = pool(
             &hidden,
@@ -249,7 +283,7 @@ impl SetFit {
 }
 
 /// Pools last hidden states `[n, h]` (no padding: every token is attended) into `[h]`.
-fn pool(hidden: &[f32], h: usize, mode: Pool, normalize: bool) -> Vec<f32> {
+pub(super) fn pool(hidden: &[f32], h: usize, mode: Pool, normalize: bool) -> Vec<f32> {
     let rows = hidden.chunks_exact(h);
     let n = rows.len() as f32;
     let mut v = match mode {
