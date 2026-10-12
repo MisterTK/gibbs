@@ -127,12 +127,13 @@ pub(crate) fn fill(len: usize, seed: usize, amp: f32) -> Vec<f32> {
 }
 
 /// A tiny (hidden 32, 2 layers, 2 heads) [`GraphLm`] with weights large enough that attention and
-/// the MLP matter; `ln` selects the GPT-style variant (LayerNorm with biases, learned positions,
-/// GELU MLP) over the Llama-style one (RMSNorm, RoPE, SwiGLU).
-pub(crate) fn tiny_graph_lm(ln: bool) -> GraphLm {
-    use crate::hardware::QuantFormat;
+/// the MLP matter. `variant` 0: Llama-style (RMSNorm, full RoPE, SwiGLU); 1: GPT-NeoX-style
+/// (LayerNorm with biases, GELU, parallel residual, 25% rotary, no learned positions); 2:
+/// GPT-Neo-style (LayerNorm, GELU, learned positions, no RoPE). `fmt` stores the projections.
+pub(crate) fn tiny_graph_lm(variant: u8, fmt: crate::hardware::QuantFormat) -> GraphLm {
     use crate::model::layers::QuantizedLinearLayer;
-    let (h, inter) = (32, 64);
+    let (h, inter, ctx) = (32, 64, 48);
+    let ln = variant > 0;
     let cfg = GraphLmConfig {
         vocab_size: 64,
         hidden_dim: h,
@@ -140,15 +141,20 @@ pub(crate) fn tiny_graph_lm(ln: bool) -> GraphLm {
         num_layers: 2,
         num_heads: 2,
         head_dim: 16,
-        max_seq_len: 32,
+        max_seq_len: ctx,
         use_standard_layernorm: ln,
         use_gelu_mlp: ln,
+        use_parallel_residual: variant == 1,
+        rotary_pct: match variant {
+            0 => 1.0,
+            1 => 0.25,
+            _ => 0.0,
+        },
         ..GraphLmConfig::smollm_1m()
     };
     let mut lm = GraphLm::new(cfg);
     let lin = |name: &str, i: usize, o: usize, seed: usize, amp: f32| {
-        QuantizedLinearLayer::from_f32(name, i, o, &fill(i * o, seed, amp), QuantFormat::FP32)
-            .unwrap()
+        QuantizedLinearLayer::from_f32(name, i, o, &fill(i * o, seed, amp), fmt).unwrap()
     };
     for (l, layer) in lm.layers.iter_mut().enumerate() {
         layer.qkv_proj = lin("qkv", h, 3 * h, 1 + l, 0.3);
@@ -164,8 +170,10 @@ pub(crate) fn tiny_graph_lm(ln: bool) -> GraphLm {
     }
     lm.embedding = fill(64 * h, 9, 0.5);
     if ln {
-        lm.pos_embedding = Some(fill(32 * h, 10, 0.3));
         lm.final_norm_bias = Some(fill(h, 11, 0.2));
+    }
+    if variant == 2 {
+        lm.pos_embedding = Some(fill(ctx * h, 10, 0.3));
     }
     lm.final_norm = fill(h, 12, 0.5).iter().map(|v| v + 1.0).collect();
     lm
@@ -178,7 +186,7 @@ pub fn gpu_fixture() -> Result<(), String> {
         return Err("no Metal device".into());
     }
     let (labels, h) = (3, 32);
-    let mut llm = GraphLmSeq::new(tiny_graph_lm(false));
+    let mut llm = GraphLmSeq::new(tiny_graph_lm(0, crate::hardware::QuantFormat::FP32));
     llm.attach_score_gpu(&fill(labels * h, 20, 0.5), labels)?;
     for ids in [&[1u32, 5, 9][..], &[3, 3, 7, 11, 2, 40], &[63]] {
         let logits = llm.score_gpu(ids)?;
@@ -195,9 +203,9 @@ pub(crate) mod tests {
     use crate::hardware::{available_devices, Device};
 
     /// Compares `score · last_hidden` (host forward, the parity reference) with `score_gpu` on
-    /// each of `seqs`; returns the worst error relative to the largest reference logit, or `None`
-    /// without a Metal device. Same f32 math on both sides, so the bound callers assert is 1e-3
-    /// (GPU transcendentals and summation order only).
+    /// each of `seqs`; returns the worst absolute logit difference (asserted <= 1e-3, the
+    /// contract's bar: same f32 math on both sides, only GPU transcendentals and summation order
+    /// differ), or `None` (loudly) without a Metal device. Reference logits must be non-trivial.
     pub(crate) fn parity(
         llm: &mut dyn DecoderBackbone,
         score: &[f32],
@@ -205,6 +213,7 @@ pub(crate) mod tests {
         seqs: &[&[u32]],
     ) -> Option<f32> {
         if !available_devices().contains(&Device::Metal) {
+            eprintln!("SKIPPED: no Metal device, seq-cls GPU parity not run");
             return None;
         }
         let h = llm.hidden();
@@ -220,32 +229,47 @@ pub(crate) mod tests {
             };
             let got = llm.score_gpu(ids).unwrap();
             assert_eq!(got.len(), labels);
-            let scale = want.iter().fold(1e-3f32, |m, v| m.max(v.abs()));
-            let err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max) / scale;
-            assert!(err <= 1e-3, "{ids:?}: want {want:?} got {got:?} (rel {err})");
+            assert!(want.iter().any(|v| v.abs() > 1e-2), "{ids:?}: trivial reference {want:?}");
+            let err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(err <= 1e-3, "{ids:?}: want {want:?} got {got:?} (abs {err})");
             worst = worst.max(err);
         }
         Some(worst)
     }
 
-    #[test]
-    fn graph_lm_llama_style_matches_host() {
-        let score = fill(3 * 32, 20, 0.5);
-        let mut llm = GraphLmSeq::new(tiny_graph_lm(false));
-        let seqs: [&[u32]; 3] = [&[1, 5, 9], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], &[63]];
-        if let Some(e) = parity(&mut llm, &score, 3, &seqs) {
-            eprintln!("graph_lm llama-style max rel err {e:e}");
+    /// 40 and 45 tokens cross the GEMM tile boundary (and m >= 16 batched-GEMM selection).
+    fn long(n: u32) -> Vec<u32> {
+        (0..n).map(|i| (i * 7 + 3) % 64).collect()
+    }
+
+    fn run(variant: u8, fmt: crate::hardware::QuantFormat, labels: usize, name: &str) {
+        let score = fill(labels * 32, 20 + variant as usize, 0.5);
+        let mut llm = GraphLmSeq::new(tiny_graph_lm(variant, fmt));
+        let (l40, l45) = (long(40), long(45));
+        let seqs: [&[u32]; 5] = [&[1, 5, 9], &[2], &[63, 0, 63], &l40, &l45];
+        if let Some(e) = parity(&mut llm, &score, labels, &seqs) {
+            eprintln!("graph_lm {name} max abs err {e:e}");
         }
     }
 
     #[test]
-    fn graph_lm_gpt_style_matches_host() {
-        let score = fill(2 * 32, 21, 0.5);
-        let mut llm = GraphLmSeq::new(tiny_graph_lm(true));
-        let seqs: [&[u32]; 3] = [&[2, 4], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22], &[17]];
-        if let Some(e) = parity(&mut llm, &score, 2, &seqs) {
-            eprintln!("graph_lm gpt-style max rel err {e:e}");
-        }
+    fn graph_lm_llama_style_matches_host() {
+        run(0, crate::hardware::QuantFormat::FP32, 3, "llama-style");
+    }
+
+    #[test]
+    fn graph_lm_llama_style_bf16_matches_host() {
+        run(0, crate::hardware::QuantFormat::BF16, 3, "llama-style bf16");
+    }
+
+    #[test]
+    fn graph_lm_neox_style_matches_host() {
+        run(1, crate::hardware::QuantFormat::FP32, 2, "neox-style");
+    }
+
+    #[test]
+    fn graph_lm_learned_positions_match_host() {
+        run(2, crate::hardware::QuantFormat::FP32, 2, "learned-positions");
     }
 
     #[test]

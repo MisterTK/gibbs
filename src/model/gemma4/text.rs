@@ -581,23 +581,25 @@ impl TextModel {
     pub(crate) fn to_decode_graph_unchecked(
         &self,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph(None)
+        self.decode_graph(self.max_pos, None)
     }
 
     /// The decode graph with the gevva cross-encoder head (`head_norm` RMSNorm at `eps`, then the
     /// bias-free `score` `[labels, hidden]`) in place of the LM head: each step's output is the
-    /// `[labels]` logits of the token it ran.
+    /// `[labels]` logits of the token it ran. KV state holds `max_ctx` positions.
     pub(crate) fn to_seqcls_graph(
         &self,
+        max_ctx: usize,
         head_norm: &[f32],
         eps: f32,
         score: &[f32],
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph(Some((head_norm, eps, score)))
+        self.decode_graph(max_ctx, Some((head_norm, eps, score)))
     }
 
     fn decode_graph(
         &self,
+        max_ctx: usize,
         head: Option<(&[f32], f32, &[f32])>,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor};
@@ -843,24 +845,24 @@ impl TextModel {
             let (k_state, v_state, write) = if li < self.first_shared {
                 let ks = g.state(
                     format!("kv.{li}.k"),
-                    vec![self.max_pos, kv_width],
+                    vec![max_ctx, kv_width],
                     DType::F32,
                 );
                 let vs = g.state(
                     format!("kv.{li}.v"),
-                    vec![self.max_pos, kv_width],
+                    vec![max_ctx, kv_width],
                     DType::F32,
                 );
                 (ks, vs, true)
             } else {
                 let ks = g.state(
                     format!("kv.{}.k", l.kv_src),
-                    vec![self.max_pos, kv_width],
+                    vec![max_ctx, kv_width],
                     DType::F32,
                 );
                 let vs = g.state(
                     format!("kv.{}.v", l.kv_src),
-                    vec![self.max_pos, kv_width],
+                    vec![max_ctx, kv_width],
                     DType::F32,
                 );
                 (ks, vs, false)
