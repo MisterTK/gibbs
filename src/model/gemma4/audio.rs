@@ -4,7 +4,9 @@
 //! `embed_audio` into the text width.
 
 use super::ops::{linear, rms_norm, Clipped};
+use crate::graph::{DType, Graph, Op, Tensor, UnaryKind, ValueId, Weights as GWeights};
 use crate::model::nn;
+use crate::model::vision_graph::{Gb, ProgramCache};
 use crate::model::par::{par_for, OutPtr};
 use crate::model::weights::{Mat, Weights};
 use serde_json::Value;
@@ -220,8 +222,9 @@ impl Features {
         Ok((0..t).map(|i| valid(i * self.hop + span - 1)).collect())
     }
 
-    /// Log-mel frames `[t, mel]` (invalid frames zeroed) and each frame's validity.
-    pub fn extract(&self, wav: &[u8]) -> Result<(Vec<f32>, Vec<bool>), String> {
+    /// The windowing input `[t, frame]` (semicausal framing of the resampled clip) and each frame's
+    /// validity.
+    fn frames(&self, wav: &[u8]) -> Result<(Vec<f32>, Vec<bool>), String> {
         let (pcm, rate) = read_wav(wav)?;
         let mask = self.mask(pcm.len(), rate)?;
         let t = mask.len();
@@ -233,6 +236,22 @@ impl Features {
             .flat_map(|i| &padded[i * self.hop..i * self.hop + self.frame])
             .copied()
             .collect();
+        Ok((frames, mask))
+    }
+
+    /// `ln(energy + floor)` over the mel energies `[t, mel]`, invalid frames zeroed.
+    fn log_mel(&self, mel: &mut [f32], mask: &[bool]) {
+        for (row, &ok) in mel.chunks_exact_mut(self.mel).zip(mask) {
+            row.iter_mut()
+                .for_each(|v| *v = if ok { (*v + self.floor).ln() } else { 0.0 });
+        }
+    }
+
+    /// Log-mel frames `[t, mel]` (invalid frames zeroed) and each frame's validity (host DFT).
+    pub fn extract(&self, wav: &[u8]) -> Result<(Vec<f32>, Vec<bool>), String> {
+        crate::hardware::cpu_compute::enter("gemma4::audio::features");
+        let (frames, mask) = self.frames(wav)?;
+        let t = mask.len();
         let (b, f) = (self.bins, self.frame);
         let mut spec = vec![0.0f32; t * 2 * b];
         nn::matmul_nt(&frames, &self.dft, None, t, f, 2 * b, &mut spec);
@@ -242,11 +261,31 @@ impl Features {
             .collect();
         let mut mel = vec![0.0f32; t * self.mel];
         nn::matmul_nt(&mag, &self.filters, None, t, b, self.mel, &mut mel);
-        for (row, &ok) in mel.chunks_exact_mut(self.mel).zip(&mask) {
-            row.iter_mut()
-                .for_each(|v| *v = if ok { (*v + self.floor).ln() } else { 0.0 });
-        }
+        self.log_mel(&mut mel, &mask);
         Ok((mel, mask))
+    }
+
+    /// The spectrogram front end as a graph: `frames [t, frame]` → mel energies `[t, mel]`
+    /// (windowed DFT as one Linear, magnitude, triangular mel filters). The `ln` and the validity
+    /// zeroing are elementwise host steps over the `[t, mel]` result ([`Self::log_mel`]).
+    fn front_graph(&self, t: usize) -> (Graph, GWeights) {
+        let (b, f, mel) = (self.bins, self.frame, self.mel);
+        let mut g = Gb::new();
+        let x = g.input("frames", vec![t, f], DType::F32);
+        let dft = g.f32w("audio.dft.weight", vec![2 * b, f], self.dft.clone());
+        let spec = g.linear("audio.dft", x, dft, None, t, 2 * b);
+        let slice = |g: &mut Gb, name: &str, lo: usize| {
+            let op = Op::Slice { axis: -1, start: lo as i64, end: (lo + b) as i64 };
+            g.op(name, op, &[spec], vec![t, b])
+        };
+        let (re, im) = (slice(&mut g, "audio.dft.re", 0), slice(&mut g, "audio.dft.im", b));
+        let re2 = g.op("audio.dft.re2", Op::Mul, &[re, re], vec![t, b]);
+        let im2 = g.op("audio.dft.im2", Op::Mul, &[im, im], vec![t, b]);
+        let sum = g.add("audio.dft.pow", re2, im2, vec![t, b]);
+        let mag = g.unary("audio.dft.mag", UnaryKind::Sqrt, sum, vec![t, b]);
+        let fw = g.f32w("audio.mel.weight", vec![mel, b], self.filters.clone());
+        let out = g.linear("audio.mel", mag, fw, None, t, mel);
+        g.finish(&[out])
     }
 }
 
@@ -299,6 +338,8 @@ pub struct Audio {
     out_proj: Mat,
     out_bias: Vec<f32>,
     embed: Mat,
+    /// Metal programs (set by [`Self::on_gpu`]); `None` = the host forward.
+    gpu: Option<ProgramCache>,
 }
 
 /// Biased-variance LayerNorm with weight only (`bias=False`).
@@ -420,7 +461,14 @@ impl Audio {
             out_bias: w.vec_n(&format!("{p}.output_proj.bias"), out_proj.rows)?,
             out_proj,
             embed: w.mat("model.embed_audio.embedding_projection.weight")?,
+            gpu: None,
         })
+    }
+
+    /// Runs the front end and conformer as Metal graph programs on `mode`.
+    pub fn on_gpu(mut self, mode: crate::hardware::PlacementMode) -> Self {
+        self.gpu = Some(ProgramCache::new(mode));
+        self
     }
 
     /// One 3x3 stride-2 conv block: masked input `[c, t, f]` -> conv -> channel LayerNorm -> ReLU.
@@ -558,8 +606,196 @@ impl Audio {
     }
 
     /// Encodes one WAV clip to `[n, text_hidden]` soft tokens; returns `(rows, n)`.
-    // ponytail: the conformer's 1e10 gradient-clipping clamps are omitted (no-ops on finite f32 activations).
     pub fn encode(&self, wav: &[u8]) -> Result<(Vec<f32>, usize), String> {
+        match &self.gpu {
+            Some(g) => self.encode_gpu(g, wav),
+            None => self.encode_cpu(wav),
+        }
+    }
+
+    /// Output frames of a stride-2, 3x3, pad-1 convolution over `n` rows.
+    fn sub(n: usize) -> usize {
+        (n - 1) / 2 + 1
+    }
+
+    /// The Metal path: log-mel front end program, then the conformer program (compiled once per
+    /// clip length).
+    fn encode_gpu(&self, gpu: &ProgramCache, wav: &[u8]) -> Result<(Vec<f32>, usize), String> {
+        let (frames, mask) = self.features.frames(wav)?;
+        let (t0, f) = (mask.len(), self.features.mel);
+        let front = gpu.get(&[0, t0], || Ok(self.features.front_graph(t0)))?;
+        let energies = front.lock().run(vec![Tensor::F32(frames)])?;
+        let mut mel = energies.into_iter().next().ok_or("audio front end returned nothing")?.into_f32()?;
+        self.features.log_mel(&mut mel, &mask);
+        let (t1, f1) = (Self::sub(t0), Self::sub(f));
+        let t = Self::sub(t1);
+        let mask1: Vec<bool> = mask.iter().step_by(2).copied().take(t1).collect();
+        let valid: Vec<bool> = mask1.iter().step_by(2).copied().take(t).collect();
+        let n = valid.iter().filter(|&&v| v).count();
+        if n == 0 {
+            return Err("audio clip is too short".into());
+        }
+        if !valid[..n].iter().all(|&v| v) {
+            return Err("audio frame mask is not a prefix".into());
+        }
+        let (nh, left) = (self.heads, self.left);
+        let mask_plane: Vec<f32> = mask1.iter().flat_map(|&ok| std::iter::repeat_n(ok as u8 as f32, f1)).collect();
+        // Query `i` sees keys `i-left < j <= i` that are valid; the relative-position score of the
+        // pair sits at column `left - (i - j)` of the `[t, left + 1]` table `q · rel`.
+        let mut bias = vec![-1e30f32; t * t];
+        let mut idx = vec![0u32; nh * t * t];
+        for i in 0..t {
+            for j in (i + 1).saturating_sub(left)..=i {
+                if valid[j] {
+                    bias[i * t + j] = 0.0;
+                    for h in 0..nh {
+                        idx[(h * t + i) * t + j] = ((h * t + i) * (left + 1) + left - (i - j)) as u32;
+                    }
+                }
+            }
+        }
+        let prog = gpu.get(&[1, t0], || self.conformer_graph(t0))?;
+        let out = prog.lock().run(vec![
+            Tensor::F32(mel),
+            Tensor::F32(mask_plane),
+            Tensor::F32(bias),
+            Tensor::U32(idx),
+        ])?;
+        let mut rows = out.into_iter().next().ok_or("audio program returned nothing")?.into_f32()?;
+        rows.truncate(n * self.embed.rows);
+        Ok((rows, n))
+    }
+
+    /// One subsampling block as nodes: `x [c_in, t, f]` → conv (3x3, stride 2, pad 1) → channel
+    /// LayerNorm → ReLU; returns the rows `[t', f' * c_out]`-ordered `[t' * f', c_out]` and `(t', f')`.
+    fn sscp_graph(&self, b: &mut Gb, name: &str, x: ValueId, c_in: usize, tf: (usize, usize), layer: &(Vec<f32>, Vec<f32>, usize)) -> (ValueId, usize, usize) {
+        let (w, norm, c_out) = layer;
+        let (t, f) = (Self::sub(tf.0), Self::sub(tf.1));
+        let cw = b.f32w(&format!("{name}.weight"), vec![*c_out, c_in, 3, 3], w.clone());
+        let conv = Op::Conv2d { stride: [2, 2], padding: [1; 4], dilation: [1, 1], groups: 1 };
+        let y = b.op(name, conv, &[x, cw], vec![*c_out, t, f]);
+        let y = b.reshape(&format!("{name}.flat"), y, vec![*c_out, t * f]);
+        let y = b.transpose(&format!("{name}.rows"), y, &[*c_out, t * f], &[1, 0]);
+        let gm = b.f32w(&format!("{name}.norm.weight"), vec![*c_out], norm.clone());
+        let bt = b.f32w(&format!("{name}.norm.bias"), vec![*c_out], vec![0.0; *c_out]);
+        let y = b.op(&format!("{name}.norm"), Op::LayerNorm { eps: self.eps }, &[y, gm, bt], vec![t * f, *c_out]);
+        let y = b.unary(&format!("{name}.relu"), UnaryKind::Relu, y, vec![t * f, *c_out]);
+        (y, t, f)
+    }
+
+    /// The conformer + output projection as a graph for a clip of `t0` mel frames. Inputs: `mel
+    /// [1, t0, mel]` (log-mel, invalid frames zeroed), `mask1 [1, t1 * f1]` (layer-0 output
+    /// validity), `attn_bias [t, t]` (0 / -1e30 local-window and padding mask) and `rel_idx
+    /// [heads * t * t]` (U32: where each (query, key) pair reads its relative-position score).
+    /// Output: `[t, text_hidden]` (rows past the valid prefix are padding).
+    fn conformer_graph(&self, t0: usize) -> Result<(Graph, GWeights), String> {
+        let (d, nh, eps, left) = (self.hidden, self.heads, self.eps, self.left);
+        let hd = d / nh;
+        let f = self.features.mel;
+        let (t1, f1) = (Self::sub(t0), Self::sub(f));
+        let t = Self::sub(t1);
+        let mut b = Gb::new();
+        let mel = b.input("mel", vec![1, t0, f], DType::F32);
+        let m1 = b.input("mask1", vec![1, t1 * f1], DType::F32);
+        let bias = b.input("attn_bias", vec![t, t], DType::F32);
+        let idx = b.input("rel_idx", vec![nh * t * t], DType::U32);
+        let (y0, t1_, f1_) = self.sscp_graph(&mut b, "audio.sscp0", mel, 1, (t0, f), &self.conv0);
+        debug_assert_eq!((t1_, f1_), (t1, f1));
+        let c0 = self.conv0.2;
+        let y0 = b.transpose("audio.sscp0.t", y0, &[t1 * f1, c0], &[1, 0]);
+        let y0 = b.binary("audio.sscp0.mask", crate::graph::BinaryKind::Mul, y0, m1, vec![c0, t1 * f1]);
+        let y0 = b.reshape("audio.sscp0.grid", y0, vec![c0, t1, f1]);
+        let (y1, t2, f2) = self.sscp_graph(&mut b, "audio.sscp1", y0, c0, (t1, f1), &self.conv1);
+        debug_assert_eq!(t2, t);
+        let c1 = self.conv1.2;
+        let flat = b.reshape("audio.sscp.flat", y1, vec![t, f2 * c1]);
+        let w = b.mat("audio.in_proj.weight", &self.in_proj);
+        let mut h = b.linear("audio.in_proj", flat, w, None, t, d);
+        let rel_pos = b.f32w("audio.rel_pos", vec![left + 1, d], self.rel_pos.clone());
+        let rw = self.residual_weight;
+        let k_scale = (1.0 + std::f32::consts::E).ln() / std::f32::consts::LN_2;
+        let ff = |b: &mut Gb, p: &str, h: ValueId, ff: &FeedForward| {
+            let a = b.rms(&format!("{p}.pre"), h, ff.pre.clone(), eps, vec![t, d]);
+            let a = ff.w1.add_to(b, &format!("{p}.w1"), a, t);
+            let inner = ff.w1.w.rows;
+            let a = b.unary(&format!("{p}.silu"), UnaryKind::Silu, a, vec![t, inner]);
+            let a = ff.w2.add_to(b, &format!("{p}.w2"), a, t);
+            let a = b.rms(&format!("{p}.post"), a, ff.post.clone(), eps, vec![t, d]);
+            let a = b.unary(&format!("{p}.res_scale"), UnaryKind::Scale(rw), a, vec![t, d]);
+            b.add(&format!("{p}.res"), h, a, vec![t, d])
+        };
+        for (i, l) in self.layers.iter().enumerate() {
+            let p = format!("audio.layers.{i}");
+            h = ff(&mut b, &format!("{p}.ff1"), h, &l.ff1);
+            // Chunked local attention with relative positions: scores = softcap(q·k + q·rel[dist]).
+            let a = b.rms(&format!("{p}.attn_pre"), h, l.norm_pre_attn.clone(), eps, vec![t, d]);
+            let q = l.q.add_to(&mut b, &format!("{p}.q"), a, t);
+            let k = l.k.add_to(&mut b, &format!("{p}.k"), a, t);
+            let v = l.v.add_to(&mut b, &format!("{p}.v"), a, t);
+            let qs = b.f32w(&format!("{p}.q_scale"), vec![d], l.q_dim_scale.repeat(nh));
+            let q = b.binary(&format!("{p}.q_scaled"), crate::graph::BinaryKind::Mul, q, qs, vec![t, d]);
+            let k = b.unary(&format!("{p}.k_scaled"), UnaryKind::Scale(k_scale), k, vec![t, d]);
+            let rw_ = b.mat(&format!("{p}.rel_k.weight"), &l.rel_k);
+            let rel = b.linear(&format!("{p}.rel"), rel_pos, rw_, None, left + 1, d);
+            let heads = |b: &mut Gb, name: &str, x: ValueId, rows: usize| {
+                let x = b.reshape(&format!("{name}.split"), x, vec![rows, nh, hd]);
+                b.transpose(&format!("{name}.heads"), x, &[rows, nh, hd], &[1, 0, 2])
+            };
+            let (qh, kh, vh) = (heads(&mut b, &format!("{p}.qh"), q, t), heads(&mut b, &format!("{p}.kh"), k, t), heads(&mut b, &format!("{p}.vh"), v, t));
+            let rh = heads(&mut b, &format!("{p}.rh"), rel, left + 1);
+            let mm = |tb: bool| Op::MatMul { transpose_a: false, transpose_b: tb };
+            let s1 = b.op(&format!("{p}.qk"), mm(true), &[qh, kh], vec![nh, t, t]);
+            let s2 = b.op(&format!("{p}.qr"), mm(true), &[qh, rh], vec![nh, t, left + 1]);
+            let s2 = b.reshape(&format!("{p}.qr.flat"), s2, vec![nh * t * (left + 1)]);
+            let s2 = b.op(&format!("{p}.qr.pick"), Op::Gather { axis: 0 }, &[s2, idx], vec![nh * t * t]);
+            let s2 = b.reshape(&format!("{p}.qr.grid"), s2, vec![nh, t, t]);
+            let s = b.add(&format!("{p}.scores"), s1, s2, vec![nh, t, t]);
+            let s = b.unary(&format!("{p}.softcap"), UnaryKind::SoftCap(self.softcap), s, vec![nh, t, t]);
+            let s = b.add(&format!("{p}.masked"), s, bias, vec![nh, t, t]);
+            let pr = b.op(&format!("{p}.softmax"), Op::Softmax { axis: -1 }, &[s], vec![nh, t, t]);
+            let o = b.op(&format!("{p}.pv"), mm(false), &[pr, vh], vec![nh, t, hd]);
+            let o = b.transpose(&format!("{p}.o_t"), o, &[nh, t, hd], &[1, 0, 2]);
+            let o = b.reshape(&format!("{p}.o_flat"), o, vec![t, d]);
+            let o = l.post.add_to(&mut b, &format!("{p}.post"), o, t);
+            let o = b.rms(&format!("{p}.attn_post"), o, l.norm_post_attn.clone(), eps, vec![t, d]);
+            h = b.add(&format!("{p}.attn_res"), h, o, vec![t, d]);
+            // Light conv: GLU, causal depthwise conv over time, norm, SiLU, projection.
+            let a = b.rms(&format!("{p}.lc_pre"), h, l.lc_pre.clone(), eps, vec![t, d]);
+            let g = l.lc_start.add_to(&mut b, &format!("{p}.lc_start"), a, t);
+            let half = |b: &mut Gb, tag: &str, lo: usize| {
+                let op = Op::Slice { axis: -1, start: lo as i64, end: (lo + d) as i64 };
+                b.op(&format!("{p}.lc_{tag}"), op, &[g], vec![t, d])
+            };
+            let (ga, gb) = (half(&mut b, "a", 0), half(&mut b, "b", d));
+            let gb = b.unary(&format!("{p}.lc_gate"), UnaryKind::Sigmoid, gb, vec![t, d]);
+            let glu = b.op(&format!("{p}.lc_glu"), Op::Mul, &[ga, gb], vec![t, d]);
+            let gt = b.transpose(&format!("{p}.lc_glu.t"), glu, &[t, d], &[1, 0]);
+            let kz = self.kernel;
+            let dw = b.f32w(&format!("{p}.lc_dw.weight"), vec![d, 1, kz], l.lc_dw.clone());
+            let conv = Op::Conv1d { stride: 1, padding: [kz - 1, 0], dilation: 1, groups: d };
+            let y = b.op(&format!("{p}.lc_dw"), conv, &[gt, dw], vec![d, t]);
+            let y = b.transpose(&format!("{p}.lc_dw.t"), y, &[d, t], &[1, 0]);
+            let y = b.rms(&format!("{p}.lc_norm"), y, l.lc_norm.clone(), eps, vec![t, d]);
+            let y = b.unary(&format!("{p}.lc_silu"), UnaryKind::Silu, y, vec![t, d]);
+            let e = l.lc_end.add_to(&mut b, &format!("{p}.lc_end"), y, t);
+            h = b.add(&format!("{p}.lc_res"), h, e, vec![t, d]);
+            h = ff(&mut b, &format!("{p}.ff2"), h, &l.ff2);
+            h = b.rms(&format!("{p}.out_norm"), h, l.norm_out.clone(), eps, vec![t, d]);
+        }
+        let od = self.out_proj.rows;
+        let ow = b.mat("audio.out_proj.weight", &self.out_proj);
+        let ob = b.f32w("audio.out_proj.bias", vec![od], self.out_bias.clone());
+        let o = b.linear("audio.out_proj", h, ow, Some(ob), t, od);
+        let o = b.rms("audio.out_norm", o, vec![1.0; od], eps, vec![t, od]);
+        let ew = b.mat("audio.embed.weight", &self.embed);
+        let out = b.linear("audio.embed", o, ew, None, t, self.embed.rows);
+        Ok(b.finish(&[out]))
+    }
+
+    /// The host forward (`--backend cpu`).
+    // ponytail: the conformer's 1e10 gradient-clipping clamps are omitted (no-ops on finite f32 activations).
+    fn encode_cpu(&self, wav: &[u8]) -> Result<(Vec<f32>, usize), String> {
+        crate::hardware::cpu_compute::enter("gemma4::audio::forward");
         let (mel, mask) = self.features.extract(wav)?;
         let f = self.features.mel;
         let t0 = mask.len();
@@ -610,6 +846,125 @@ impl Audio {
         }
         rms_norm(&mut o, od, None, self.eps);
         Ok((linear(&o, n, &self.embed), n))
+    }
+}
+
+/// Deterministic synthetic tiny conformer (hidden 16, 2 layers, 16 mel bins, text width 24): the
+/// fixture of `tests/cpu_free_matrix.rs` and the CPU-vs-Metal parity tests.
+pub mod tiny {
+    use super::*;
+    use crate::model::siglip::tiny::values;
+
+    pub const TEXT: usize = 24;
+    const D: usize = 16;
+    const MEL: usize = 16;
+
+    fn specs() -> Vec<(String, Vec<usize>)> {
+        let p = "model.audio_tower";
+        let mut s: Vec<(String, Vec<usize>)> = vec![
+            (format!("{p}.subsample_conv_projection.layer0.conv.weight"), vec![4, 1, 3, 3]),
+            (format!("{p}.subsample_conv_projection.layer0.norm.weight"), vec![4]),
+            (format!("{p}.subsample_conv_projection.layer1.conv.weight"), vec![8, 4, 3, 3]),
+            (format!("{p}.subsample_conv_projection.layer1.norm.weight"), vec![8]),
+            (format!("{p}.subsample_conv_projection.input_proj_linear.weight"), vec![D, 32]),
+            (format!("{p}.output_proj.weight"), vec![12, D]),
+            (format!("{p}.output_proj.bias"), vec![12]),
+            ("model.embed_audio.embedding_projection.weight".into(), vec![TEXT, 12]),
+        ];
+        for i in 0..2 {
+            let l = format!("{p}.layers.{i}");
+            for ff in ["feed_forward1", "feed_forward2"] {
+                s.push((format!("{l}.{ff}.pre_layer_norm.weight"), vec![D]));
+                s.push((format!("{l}.{ff}.post_layer_norm.weight"), vec![D]));
+                s.push((format!("{l}.{ff}.ffw_layer_1.linear.weight"), vec![32, D]));
+                s.push((format!("{l}.{ff}.ffw_layer_2.linear.weight"), vec![D, 32]));
+            }
+            for n in ["norm_pre_attn", "norm_post_attn", "norm_out", "lconv1d.pre_layer_norm", "lconv1d.conv_norm"] {
+                s.push((format!("{l}.{n}.weight"), vec![D]));
+            }
+            for n in ["q_proj", "k_proj", "v_proj", "post"] {
+                s.push((format!("{l}.self_attn.{n}.linear.weight"), vec![D, D]));
+            }
+            s.push((format!("{l}.self_attn.relative_k_proj.weight"), vec![D, D]));
+            s.push((format!("{l}.self_attn.per_dim_scale"), vec![D / 2]));
+            s.push((format!("{l}.lconv1d.linear_start.linear.weight"), vec![2 * D, D]));
+            s.push((format!("{l}.lconv1d.depthwise_conv1d.weight"), vec![D, 1, 5]));
+            s.push((format!("{l}.lconv1d.linear_end.linear.weight"), vec![D, D]));
+            // `ClippableLinear` bounds on the first feed-forward's first layer.
+            for b in ["input_min", "input_max", "output_min", "output_max"] {
+                s.push((format!("{l}.feed_forward1.ffw_layer_1.{b}"), vec![1]));
+            }
+        }
+        s
+    }
+
+    pub fn weights() -> Weights {
+        let specs = specs();
+        let shapes: std::collections::HashMap<_, _> = specs.iter().cloned().collect();
+        Weights::from_f32(specs, |name| {
+            let n: usize = shapes[name].iter().product();
+            Ok(match name {
+                s if s.ends_with("input_min") => vec![-2.0],
+                s if s.ends_with("input_max") => vec![2.0],
+                s if s.ends_with("output_min") => vec![-3.0],
+                s if s.ends_with("output_max") => vec![3.0],
+                s if shapes[s].len() == 1 && s.ends_with("weight") => {
+                    values(s, n).into_iter().map(|v| 1.0 + 0.1 * v).collect()
+                }
+                s => values(s, n).into_iter().map(|v| 0.2 * v).collect(),
+            })
+        })
+        .expect("tiny audio weights")
+    }
+
+    pub fn audio() -> Audio {
+        let ac = serde_json::json!({
+            "hidden_size": D, "num_attention_heads": 2, "num_hidden_layers": 2,
+            "attention_context_left": 5, "attention_context_right": 0, "conv_kernel_size": 5,
+            "rms_norm_eps": 1e-6, "attention_logit_cap": 50.0, "residual_weight": 0.5,
+        });
+        let processor = serde_json::json!({"feature_extractor": {
+            "sampling_rate": 16000, "frame_length": 32, "fft_length": 64, "feature_size": MEL,
+            "hop_length": 16, "mel_floor": 1e-3,
+        }});
+        Audio::load(&weights(), &ac, &processor).expect("tiny audio loads")
+    }
+
+    /// A 0.25 s 16 kHz mono 16-bit WAV: two tones.
+    pub fn wav() -> Vec<u8> {
+        let pcm: Vec<u8> = (0..4000)
+            .flat_map(|i| {
+                let x = i as f32 / 16000.0;
+                let v = 0.4 * (2.0 * std::f32::consts::PI * 440.0 * x).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 1750.0 * x).sin();
+                ((v * 32767.0) as i16).to_le_bytes()
+            })
+            .collect();
+        let mut b = Vec::new();
+        b.extend(b"RIFF");
+        b.extend((36 + pcm.len() as u32).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend([1, 0, 1, 0]);
+        b.extend(16000u32.to_le_bytes());
+        b.extend(32000u32.to_le_bytes());
+        b.extend([2, 0, 16, 0]);
+        b.extend(b"data");
+        b.extend((pcm.len() as u32).to_le_bytes());
+        b.extend(pcm);
+        b
+    }
+
+    /// The conformer graph for a clip of `t0` mel frames.
+    pub fn graph(t0: usize) -> (Graph, GWeights) {
+        audio().conformer_graph(t0).expect("tiny audio graph")
+    }
+
+    /// The conformer's `(mel frames, graph)` for [`wav`] (the fixture's real shape).
+    pub fn wav_graph() -> (Graph, GWeights) {
+        let a = audio();
+        let (_, mask) = a.features.frames(&wav()).expect("tiny wav frames");
+        a.conformer_graph(mask.len()).expect("tiny audio graph")
     }
 }
 
@@ -707,5 +1062,27 @@ mod tests {
             (peak_hz - 1000.0).abs() < 60.0,
             "peak filter centre {peak_hz} Hz"
         );
+    }
+
+    /// The Metal front end + conformer match the host forward on a real clip end to end.
+    #[test]
+    fn metal_conformer_matches_the_host_forward() {
+        use crate::hardware::{available_devices, cpu_compute, Device, PlacementMode};
+        if !available_devices().contains(&Device::Metal) {
+            println!("SKIP: no Metal device");
+            return;
+        }
+        let _allow = cpu_compute::allow();
+        let cpu = super::tiny::audio();
+        let gpu = super::tiny::audio().on_gpu(PlacementMode::Pin(Device::Metal));
+        let wav = super::tiny::wav();
+        let (want, n) = cpu.encode(&wav).unwrap();
+        let (got, m) = gpu.encode(&wav).unwrap();
+        assert_eq!((n, got.len()), (m, want.len()));
+        assert!(n > 4, "clip too short to exercise the window: {n}");
+        let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let err = got.iter().zip(&want).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
+        println!("gemma4 audio {n} tokens: rel err {err:e}");
+        assert!(err < 1e-3, "{err}");
     }
 }
