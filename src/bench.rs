@@ -127,8 +127,9 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
             None => {
                 let hw = crate::hardware::HardwareCapability::probe_system();
                 let backend = crate::hardware::Device::Metal;
-                match crate::model::weight_format::load_causal_lm_for(artifacts, backend, None, &hw)
-                {
+                match crate::model::weight_format::load_causal_lm_for(
+                    &artifacts, backend, None, &hw,
+                ) {
                     Ok((graph_lm, _)) => {
                         match crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)
                         {
