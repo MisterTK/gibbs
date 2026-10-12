@@ -363,7 +363,7 @@ impl QuantFormat {
             Self::EXL3_5Bit | Self::GGUF_Q4_1 => 5.0,
             Self::GGUF_Q5_0 | Self::GGUF_Q5_K_M => 5.5,
             Self::MXFP6 | Self::GGUF_Q5_1 => 6.0,
-            Self::GGUF_Q6_K => 6.5,
+            Self::GGUF_Q6_K => 6.5625,
             Self::FP8_E4M3 | Self::FP8_E5M2 => 8.0,
             Self::GGUF_Q8_0 => 8.5,
             Self::FP16 | Self::BF16 => 16.0,
@@ -384,7 +384,11 @@ impl QuantFormat {
             Self::GGUF_IQ2_S | Self::GGUF_IQ2_M => (num_elements / 256) * 82,
             Self::BF16 | Self::FP16 => num_elements * 2,
             Self::FP32 => num_elements * 4,
-            _ => (num_elements as f32 * self.bits_per_weight() / 8.0).ceil() as usize,
+            // Every other GGUF block format: whole blocks of the exact size.
+            f => match crate::model::layers::gguf_block_codec(*f) {
+                Some((elems, bytes, _)) => num_elements / elems * bytes,
+                None => (num_elements as f32 * self.bits_per_weight() / 8.0).ceil() as usize,
+            },
         }
     }
 

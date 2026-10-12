@@ -213,13 +213,16 @@ pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
 /// `decode8`, and the simdgroup sums the row. Bias and the fused epilogue are applied by lane 0.
 pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let name = gemv_packed_name(codec, p);
+    // Every codec defines `decode8`; one library holds several codecs, so each gets its own name.
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = codec.msl.replace("decode8", &dec);
     let r = p.rows_per_sg;
     let (be, bb) = (codec.block_elems, codec.block_bytes);
     let acc_decl = (0..r).map(|i| format!("float acc{i} = 0.0f;")).collect::<Vec<_>>().join(" ");
     let rows_loop: String = (0..r)
         .map(|i| {
             format!(
-                "        if (row0 + {i} < p.rows) {{\n            device const uchar* b = w + ((ulong)(row0 + {i}) * blocks_per_row + blk) * {bb};\n            float v[8];\n            decode8(b, sub, v);\n            acc{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n        }}\n"
+                "        if (row0 + {i} < p.rows) {{\n            device const uchar* b = w + ((ulong)(row0 + {i}) * blocks_per_row + blk) * {bb};\n            float v[8];\n            {dec}(b, sub, v);\n            acc{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n        }}\n"
             )
         })
         .collect();
@@ -265,7 +268,6 @@ kernel void {name}(
 {store}    }}
 }}
 "#,
-        codec_msl = codec.msl,
         rows_per_tg = gemv_rows_per_tg(p),
     )
 }
