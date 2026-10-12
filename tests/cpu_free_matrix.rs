@@ -99,10 +99,11 @@ fn cpu_free_matrix() {
             })
             .collect();
         let status = family_status(f);
-        // (a) a family is `Gpu` exactly when none of its required ops lacks a lowering.
-        assert_eq!(
-            gaps.is_empty(),
-            matches!(status, Status::Gpu),
+        // (a) a family is `Gpu` exactly when none of its required ops lacks a lowering; a gate whose
+        // reason starts with `numerics:` may hold a family back although every op lowers.
+        let numerics_gate = matches!(status, Status::Gated(r) if r.starts_with("numerics:"));
+        assert!(
+            gaps.is_empty() == matches!(status, Status::Gpu) || (gaps.is_empty() && numerics_gate),
             "{f:?}: status {status:?} disagrees with unlowered ops {gaps:?}"
         );
         match status {
@@ -113,6 +114,9 @@ fn cpu_free_matrix() {
                 }
             }
             Status::Gated(reason) => {
+                if numerics_gate && metal_present() {
+                    gpu_fixture(f); // the tiny fixture lowers and runs; real checkpoints are what diverge
+                }
                 // (c)
                 let err = family_gate(f, Device::Metal).expect_err("gated family must refuse Metal");
                 assert!(err.starts_with("gpu-only:") && err.contains(reason), "{err}");

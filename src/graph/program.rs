@@ -61,7 +61,7 @@ impl GraphProgram {
         if primary_device == Device::Metal {
             crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut graph, &|f| {
                 device_supports_op(Device::Metal, &crate::graph::Op::Linear, crate::graph::DType::Quant(f))
-            });
+            })?;
         }
         eprintln!(
             "Compiled GraphProgram: {} segments, primary device: {:?}",
