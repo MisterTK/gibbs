@@ -3,7 +3,7 @@
 //! token-identical to plain decoding and get their drafts accepted, on a native target
 //! (Qwen3.5-2B) and a GraphLm one (Llama-3.2-1B-Instruct); mismatched pairs are refused at attach.
 
-use gibbs_engine::hardware::{Device, QuantMode};
+use gibbs_engine::hardware::{Device, PlacementMode, QuantMode};
 use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::draft::load_drafter;
 use gibbs_engine::model::hf_loader::load_causal_lm;
@@ -44,7 +44,7 @@ fn generate(
         telemetry.clone(),
     );
     // The checkpoint's own MTP head stays off: the baseline is plain decoding.
-    sched.set_drafter(draft.map(|d| load_drafter(d, target).unwrap()));
+    sched.set_drafter(draft.map(|d| load_drafter(d, target, PlacementMode::Pin(Device::Cpu)).unwrap()));
     let params = SamplingParams {
         temperature: Some(0.0),
         top_p: None,
@@ -123,7 +123,7 @@ fn drafter_for_another_target_is_refused() {
     ) else {
         return;
     };
-    let err = load_drafter(&dspark, &small)
+    let err = load_drafter(&dspark, &small, PlacementMode::Pin(Device::Cpu))
         .err()
         .expect("2B drafter on the 0.8B target");
     assert!(
@@ -133,7 +133,7 @@ fn drafter_for_another_target_is_refused() {
     let Some(tiny) = located("HuggingFaceTB/SmolLM2-135M-Instruct") else {
         return;
     };
-    let err = load_drafter(&tiny, &small)
+    let err = load_drafter(&tiny, &small, PlacementMode::Pin(Device::Cpu))
         .err()
         .expect("different tokenizer");
     assert!(err.contains("tokenizes differently"), "{err}");
