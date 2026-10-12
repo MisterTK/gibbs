@@ -9,6 +9,7 @@
 // objc 0.2's `msg_send!` expands a `cfg(feature = "cargo-clippy")` check.
 #![allow(unexpected_cfgs)]
 
+use super::codec;
 use super::{DType, Graph, Op, Tensor, ValueId, ValueKind, Weights};
 pub fn commit_and_wait(cb: &CommandBufferRef) -> Result<(), String> {
     cb.commit();
@@ -336,7 +337,14 @@ pub struct HostProfile {
     /// GPU time per Linear at representative shapes; the executor picks the fastest kernel for
     /// the nearest shape.
     pub gemm: Vec<GemmTiming>,
+    /// Per-codec GEMV efficiency (`GB/s / ceiling`) keyed by the codec source hash; filled by the
+    /// background [`Runtime::benchmark_codecs`] run, absent until it finishes.
+    #[serde(default)]
+    pub codec: Option<crate::model::variant::CodecEff>,
 }
+
+/// `(rows, cols)` of the GEMVs [`Runtime::benchmark_codecs`] times (sprint-2 S3.2).
+const CODEC_BENCH_SHAPES: [(usize, usize); 4] = [(4096, 4096), (14336, 4096), (4096, 14336), (262144, 1536)];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GemmTiming {
@@ -382,6 +390,8 @@ pub struct Runtime {
     pub archive_hit: bool,
     /// One-line load summary for logs.
     pub report: String,
+    /// Where `profile` is persisted.
+    profile_path: std::path::PathBuf,
 }
 
 impl Runtime {
@@ -454,9 +464,11 @@ impl Runtime {
                 mpp: msl4.clone().map(|_| 0.0),
                 dispatch_us: 0.0,
                 gemm: Vec::new(),
+                codec: None,
             },
             archive_hit,
             report: String::new(),
+            profile_path: std::path::PathBuf::new(),
         };
         let profile_path = cache.join("host").join(format!("{tag}.json"));
         let cached = std::fs::read(&profile_path)
@@ -491,6 +503,12 @@ impl Runtime {
                 }
             }
         };
+        let codec_eff = rt.profile.codec.clone().filter(|c| c.codec_hash == codec::source_hash());
+        if codec_eff.is_some() || crate::model::variant::host_ceiling_gbps() == 0.0 {
+            let p = &rt.profile;
+            crate::model::variant::set_host_rates(p.ceiling_gbps.max(p.stream_gbps), codec_eff);
+        }
+        rt.profile_path = profile_path;
         let p = &rt.profile;
         let gemm: Vec<String> = p
             .gemm
@@ -640,130 +658,141 @@ impl Runtime {
         Ok(max_gbps)
     }
 
-    /// Benchmarks hardware streaming read roofline and tiled GEMV throughput across Q4_0, Q8_0, BF16.
-    /// Returns (roofline_gbps, q4_gbps, q8_gbps, bf16_gbps).
-    /// Micro-benchmarks GEMV throughput across supported codecs and records efficiency.
-    pub fn benchmark_codecs(&self) -> HashMap<String, f64> {
-        let mut eff = HashMap::new();
-        eff.insert("GGUF_Q4_0".to_string(), 0.95);
-        eff.insert("GGUF_Q8_0".to_string(), 0.94);
-        eff.insert("GGUF_Q4_K_M".to_string(), 0.92);
-        eff.insert("GGUF_Q2_K".to_string(), 0.90);
-        eff.insert("GGUF_IQ4_XS".to_string(), 0.91);
-        eff.insert("GGUF_IQ2_M".to_string(), 0.89);
-        eff.insert("GGUF_IQ3_S".to_string(), 0.91);
-        eff.insert("GGUF_TQ2_0".to_string(), 0.88);
-        eff
+    /// Micro-benchmarks the M=1 GEMV of every format that has one (each registered codec, BF16,
+    /// FP16) at the [`CODEC_BENCH_SHAPES`], in GPU time, and returns `eff = GB/s / ceiling` per
+    /// format with `ceiling = max(stream bandwidth, best GEMV GB/s)`. A format that fails to
+    /// build or run is logged and left out (its efficiency stays the default).
+    pub fn benchmark_codecs(self: &Arc<Self>) -> Result<crate::model::variant::CodecEff, String> {
+        use crate::model::variant::CodecEff;
+        let mut gbps = std::collections::BTreeMap::new();
+        let floats = [QuantFormat::BF16, QuantFormat::FP16];
+        for f in codec::formats().into_iter().chain(floats) {
+            match self.bench_gemv(f) {
+                Ok(g) => {
+                    gbps.insert(CodecEff::key(f), g);
+                }
+                Err(e) => tracing::warn!("codec bench {f:?}: {e}"),
+            }
+        }
+        let best = gbps.values().fold(0.0f64, |a, &b| a.max(b));
+        if best <= 0.0 {
+            return Err("no GEMV format could be measured".into());
+        }
+        let ceiling_gbps = self.profile.stream_gbps.max(best);
+        let eff = gbps.iter().map(|(k, g)| (k.clone(), g / ceiling_gbps)).collect();
+        Ok(CodecEff { codec_hash: codec::source_hash(), ceiling_gbps, gbps, eff })
     }
 
-    pub fn benchmark_gemv_saturation(&self) -> Result<(f64, f64, f64, f64), String> {
-        let roofline_gbps = self.benchmark_memory_bandwidth().unwrap_or(298.0);
-
-        #[repr(C)]
-        struct PackedGemvParams(u32, u32, u32, u32, u32);
-
-        // 1. Q4_0: rows = 16384, cols = 8192 (~75.5 MB)
-        let q4_gbps = {
-            let (rows, cols) = (16384usize, 8192usize);
-            let n_blocks = rows * (cols / 32);
-            let bytes = n_blocks * 18;
-            let w_buf = self
-                .device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-            let x_buf = self
-                .device
-                .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
-            let y_buf = self
-                .device
-                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
-            let pso = self.pso("gemv_q4_0")?;
-            let p = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
-
-            let us = self.timed(20, |enc| {
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&w_buf), 0);
-                enc.set_buffer(1, Some(&x_buf), 0);
-                enc.set_buffer(2, Some(&y_buf), 0);
-                set_bytes(enc, 3, &p);
-                enc.set_buffer(4, Some(&y_buf), 0);
-                enc.set_buffer(5, Some(&y_buf), 0);
-                enc.dispatch_thread_groups(
-                    MTLSize::new((rows as u64).div_ceil(16), 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                Ok(())
-            })?;
-            (bytes as f64 / 1e9) / (us * 1e-6)
+    /// GB/s of the M=1 GEMV in `f`: weight bytes over GPU time summed across the benchmark shapes.
+    /// Each shape runs on enough distinct copies of the weights (one command buffer) to overflow
+    /// the system cache, so the number is DRAM streaming, not cache hits.
+    fn bench_gemv(self: &Arc<Self>, f: QuantFormat) -> Result<f64, String> {
+        use crate::model::layers::QuantizedWeight;
+        let float = matches!(f, QuantFormat::BF16 | QuantFormat::FP16);
+        let (elems, block_bytes) = if float {
+            (1, 2)
+        } else {
+            let c = codec::codec(f).ok_or("no codec")?;
+            (c.block_elems as usize, c.block_bytes as usize)
         };
+        let mut pattern = vec![0u8; 1 << 20];
+        let mut s = 0x9E3779B97F4A7C15u64;
+        for b in &mut pattern {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (s >> 56) as u8;
+        }
+        let mut weights = Weights::new();
+        let mut runs = Vec::new();
+        for (si, (n, k)) in CODEC_BENCH_SHAPES.into_iter().enumerate() {
+            if k % elems != 0 {
+                continue;
+            }
+            let bytes = n * (k / elems) * block_bytes;
+            let mut raw = Vec::with_capacity(bytes);
+            while raw.len() < bytes {
+                raw.extend_from_slice(&pattern[..(bytes - raw.len()).min(pattern.len())]);
+            }
+            let raw = bytes::Bytes::from(raw);
+            let halves: Vec<u16> = if float {
+                raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            } else {
+                Vec::new()
+            };
+            let copies = ((192usize << 20) / bytes).max(1);
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, k], DType::F32);
+            for c in 0..copies {
+                let name = format!("w{si}_{c}");
+                let (dtype, t) = match f {
+                    QuantFormat::BF16 => (DType::BF16, Tensor::BF16(halves.clone())),
+                    QuantFormat::FP16 => (DType::F16, Tensor::F16(halves.clone())),
+                    _ => (
+                        DType::Quant(f),
+                        Tensor::Quantized(Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.clone(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    ),
+                };
+                let w = g.weight(&name, vec![n, k], dtype);
+                let y = g.add(&format!("lin{c}"), Op::Linear, &[x, w], vec![1, n], DType::F32);
+                g.output(y);
+                weights.insert(name, t);
+            }
+            runs.push((g, k, copies * bytes));
+        }
+        if runs.is_empty() {
+            return Err("no benchmark shape tiles this format's blocks".into());
+        }
+        let session = Session::new(self.clone(), &weights)?;
+        let (mut total_bytes, mut total_s) = (0.0f64, 0.0f64);
+        for (g, k, bytes) in &runs {
+            let plan = session.prepare_plan(g)?;
+            let x = Tensor::F32(vec![0.5; *k]);
+            let mut best = f64::INFINITY;
+            for rep in 0..9 {
+                session.run_prepared(g, &plan, None, vec![x.clone()])?;
+                if rep > 0 {
+                    best = best.min(session.last_gpu_seconds());
+                }
+            }
+            total_bytes += *bytes as f64;
+            total_s += best;
+        }
+        Ok(total_bytes / 1e9 / total_s)
+    }
 
-        // 2. Q8_0: rows = 8192, cols = 8192 (~71.3 MB)
-        let q8_gbps = {
-            let (rows, cols) = (8192usize, 8192usize);
-            let n_blocks = rows * (cols / 32);
-            let bytes = n_blocks * 34;
-            let w_buf = self
-                .device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-            let x_buf = self
-                .device
-                .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
-            let y_buf = self
-                .device
-                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
-            let pso = self.pso("gemv_q8_0")?;
-            let p = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
-
-            let us = self.timed(20, |enc| {
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&w_buf), 0);
-                enc.set_buffer(1, Some(&x_buf), 0);
-                enc.set_buffer(2, Some(&y_buf), 0);
-                set_bytes(enc, 3, &p);
-                enc.set_buffer(4, Some(&y_buf), 0);
-                enc.set_buffer(5, Some(&y_buf), 0);
-                enc.dispatch_thread_groups(
-                    MTLSize::new((rows as u64).div_ceil(16), 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                Ok(())
-            })?;
-            (bytes as f64 / 1e9) / (us * 1e-6)
-        };
-
-        // 3. BF16: rows = 8192, cols = 8192 (~134.2 MB)
-        let bf16_gbps = {
-            let (rows, cols) = (8192usize, 8192usize);
-            let bytes = rows * cols * 2;
-            let w_buf = self
-                .device
-                .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
-            let x_buf = self
-                .device
-                .new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
-            let y_buf = self
-                .device
-                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
-            let pso = self.pso("gemv_bf16")?;
-            let p = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
-
-            let us = self.timed(20, |enc| {
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&w_buf), 0);
-                enc.set_buffer(1, Some(&x_buf), 0);
-                enc.set_buffer(2, Some(&y_buf), 0);
-                set_bytes(enc, 3, &p);
-                enc.set_buffer(4, Some(&y_buf), 0);
-                enc.set_buffer(5, Some(&y_buf), 0);
-                enc.dispatch_thread_groups(
-                    MTLSize::new((rows as u64).div_ceil(16), 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                Ok(())
-            })?;
-            (bytes as f64 / 1e9) / (us * 1e-6)
-        };
-
-        Ok((roofline_gbps, q4_gbps, q8_gbps, bf16_gbps))
+    /// Starts [`Self::benchmark_codecs`] on a background thread unless this host profile already
+    /// holds results for the current codec sources, then stores them in the profile JSON and
+    /// publishes them to the variant predictor. Never blocks the caller; once per process.
+    pub fn spawn_codec_bench(self: &Arc<Self>) {
+        static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let current = self.profile.codec.as_ref().is_some_and(|c| c.codec_hash == codec::source_hash());
+        if current || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let rt = self.clone();
+        let spawned = std::thread::Builder::new().name("codec-bench".into()).spawn(move || {
+            crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+            match rt.benchmark_codecs() {
+                Ok(e) => {
+                    let mut p = rt.profile.clone();
+                    p.ceiling_gbps = e.ceiling_gbps;
+                    p.codec = Some(e.clone());
+                    let saved = std::fs::write(&rt.profile_path, serde_json::to_vec_pretty(&p).unwrap_or_default());
+                    if let Err(err) = saved {
+                        tracing::warn!("codec bench: saving {}: {err}", rt.profile_path.display());
+                    }
+                    crate::model::variant::set_host_rates(e.ceiling_gbps, Some(e));
+                }
+                Err(e) => tracing::warn!("codec bench: {e}"),
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("codec bench: cannot start thread: {e}");
+        }
     }
 
     /// Host profile micro-benchmarks: MPP correctness vs `nn::linear`, dispatch cost, GEMM timings.
@@ -873,6 +902,7 @@ impl Runtime {
             mpp,
             dispatch_us,
             gemm,
+            codec: None,
         })
     }
 
@@ -954,6 +984,7 @@ pub struct Session {
     jesse_aux: HashMap<String, (Buffer, usize)>,
     /// Generated GEMV pipelines for the [`WeightFormat::Gen`] formats this session uploaded.
     gen_psos: HashMap<QuantFormat, ComputePipelineState>,
+    last_gpu_s: std::sync::atomic::AtomicU64,
 }
 impl Session {
     /// Uploads every weight once. Preserves packed formats without f32 expansion.
@@ -1495,7 +1526,12 @@ impl Session {
             nvfp4_aux,
             jesse_aux,
             gen_psos,
+            last_gpu_s: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+    /// GPU seconds of the last completed (non-profiled) [`Self::run`] command buffer.
+    pub fn last_gpu_seconds(&self) -> f64 {
+        f64::from_bits(self.last_gpu_s.load(std::sync::atomic::Ordering::Relaxed))
     }
     /// Uses `kind` for every Linear instead of the host profile's choice.
     pub fn force_gemm(&mut self, kind: GemmKernel) -> Result<(), String> {
@@ -1938,6 +1974,7 @@ impl Session {
                     return Err(e);
                 }
                 commit_and_wait(cb)?;
+                self.last_gpu_s.store(gpu_seconds(cb).to_bits(), std::sync::atomic::Ordering::Relaxed);
                 if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
                     let enc_us = encode_dur.as_micros();
                     let gpu_ms = gpu_seconds(cb) * 1e3;
