@@ -201,3 +201,173 @@ pub fn tiny_sd_on_gpu() -> Result<(usize, usize), String> {
     let img = vae.decode(&x, h, w)?;
     Ok((img.width, img.height))
 }
+
+/// LDM UNet specs from a config: `mc` model channels, per-level multipliers, `nres` ResBlocks per level,
+/// attention on the levels flagged in `attn`, cross-attention width `ctx`, feed-forward `ff_mult * c`.
+/// (SD 1.5: `mc` 320, mult [1,2,4,4], nres 2, attn [t,t,t,f], ctx 768, ff_mult 4.)
+pub fn ldm_unet_specs(mc: usize, mult: &[usize], nres: usize, attn: &[bool], ctx: usize, ff_mult: usize) -> Specs {
+    let emb = 4 * mc;
+    let mut s = Specs::new();
+    let trans = |s: &mut Specs, p: &str, c: usize| {
+        trans(s, p, c, ctx);
+        // `trans` builds a 2c inner width; widen to ff_mult * c.
+        let b = format!("{p}.transformer_blocks.0.ff.net");
+        s.retain(|(n, _)| !n.starts_with(&b));
+        lin(s, &format!("{b}.0.proj"), c, 2 * ff_mult * c, true);
+        lin(s, &format!("{b}.2"), ff_mult * c, c, true);
+    };
+    conv(&mut s, "input_blocks.0.0", 4, mc, 3);
+    let (mut ib, mut ch, mut skips) = (1, mc, vec![mc]);
+    for (l, &m) in mult.iter().enumerate() {
+        for _ in 0..nres {
+            res(&mut s, &format!("input_blocks.{ib}.0"), ch, mc * m, emb);
+            ch = mc * m;
+            if attn[l] {
+                trans(&mut s, &format!("input_blocks.{ib}.1"), ch);
+            }
+            skips.push(ch);
+            ib += 1;
+        }
+        if l + 1 < mult.len() {
+            conv(&mut s, &format!("input_blocks.{ib}.0.op"), ch, ch, 3);
+            skips.push(ch);
+            ib += 1;
+        }
+    }
+    res(&mut s, "middle_block.0", ch, ch, emb);
+    trans(&mut s, "middle_block.1", ch);
+    res(&mut s, "middle_block.2", ch, ch, emb);
+    let mut ob = 0;
+    for (l, &m) in mult.iter().enumerate().rev() {
+        for i in 0..=nres {
+            let skip = skips.pop().unwrap();
+            res(&mut s, &format!("output_blocks.{ob}.0"), ch + skip, mc * m, emb);
+            ch = mc * m;
+            let mut j = 1;
+            if attn[l] {
+                trans(&mut s, &format!("output_blocks.{ob}.1"), ch);
+                j = 2;
+            }
+            if l > 0 && i == nres {
+                conv(&mut s, &format!("output_blocks.{ob}.{j}.conv"), ch, ch, 3);
+            }
+            ob += 1;
+        }
+    }
+    nrm(&mut s, "out.0", mc);
+    conv(&mut s, "out.2", mc, 4, 3);
+    lin(&mut s, "time_embed.0", mc, emb, true);
+    lin(&mut s, "time_embed.2", emb, emb, true);
+    s
+}
+
+/// SD AutoencoderKL (LDM names): `ch` base channels, per-level multipliers, 2 encoder / 3 decoder
+/// ResBlocks per level, 4 latent channels.
+pub fn ldm_vae_specs(ch: usize, mult: &[usize]) -> Specs {
+    let p = |n: &str| format!("first_stage_model.{n}");
+    let mut s = Specs::new();
+    let mut resnet = |s: &mut Specs, n: &str, i: usize, o: usize| {
+        for (k, c) in [("norm1", i), ("norm2", o)] {
+            nrm(s, &p(&format!("{n}.{k}")), c);
+        }
+        conv(s, &p(&format!("{n}.conv1")), i, o, 3);
+        conv(s, &p(&format!("{n}.conv2")), o, o, 3);
+        if i != o {
+            conv(s, &p(&format!("{n}.nin_shortcut")), i, o, 1);
+        }
+    };
+    let top = ch * mult[mult.len() - 1];
+    let mid = |s: &mut Specs, resnet: &mut dyn FnMut(&mut Specs, &str, usize, usize), side: &str| {
+        resnet(s, &format!("{side}.mid.block_1"), top, top);
+        resnet(s, &format!("{side}.mid.block_2"), top, top);
+        nrm(s, &p(&format!("{side}.mid.attn_1.norm")), top);
+        for n in ["q", "k", "v", "proj_out"] {
+            conv(s, &p(&format!("{side}.mid.attn_1.{n}")), top, top, 1);
+        }
+    };
+    conv(&mut s, &p("encoder.conv_in"), 3, ch, 3);
+    let mut c = ch;
+    for (l, &m) in mult.iter().enumerate() {
+        for b in 0..2 {
+            resnet(&mut s, &format!("encoder.down.{l}.block.{b}"), c, ch * m);
+            c = ch * m;
+        }
+        if l + 1 < mult.len() {
+            conv(&mut s, &p(&format!("encoder.down.{l}.downsample.conv")), c, c, 3);
+        }
+    }
+    mid(&mut s, &mut resnet, "encoder");
+    nrm(&mut s, &p("encoder.norm_out"), top);
+    conv(&mut s, &p("encoder.conv_out"), top, 8, 3);
+    conv(&mut s, &p("quant_conv"), 8, 8, 1);
+    conv(&mut s, &p("post_quant_conv"), 4, 4, 1);
+    conv(&mut s, &p("decoder.conv_in"), 4, top, 3);
+    mid(&mut s, &mut resnet, "decoder");
+    let mut c = top;
+    for (l, &m) in mult.iter().enumerate().rev() {
+        for b in 0..3 {
+            resnet(&mut s, &format!("decoder.up.{l}.block.{b}"), c, ch * m);
+            c = ch * m;
+        }
+        if l > 0 {
+            conv(&mut s, &p(&format!("decoder.up.{l}.upsample.conv")), c, c, 3);
+        }
+    }
+    nrm(&mut s, &p("decoder.norm_out"), c);
+    conv(&mut s, &p("decoder.conv_out"), c, 3, 3);
+    s
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use crate::model::diff_graph::testutil::rel_err;
+
+    /// SD 1.5-sized UNet + VAE with random weights: CPU-vs-Metal parity at a small latent, then Metal
+    /// timings at 512x512 (64x64 latent). `cargo test --release --lib sd15_scale -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sd15_scale_gpu_vs_cpu_and_speed() {
+        use std::time::Instant;
+        let ctx = 768;
+        let ur = synth(&ldm_unet_specs(320, &[1, 2, 4, 4], 2, &[true, true, true, false], ctx, 4), 5);
+        let unet = SdUnet::load(&Tensors::from_reader(&ur).unwrap(), "", Heads::Count(8)).unwrap();
+        drop(ur);
+        let vr = synth(&ldm_vae_specs(128, &[1, 2, 4, 4]), 6);
+        let vae = SdVae::from_ldm(&Tensors::from_reader(&vr).unwrap()).unwrap();
+        drop(vr);
+        let mut rng = Lcg(9);
+        let c = rng.vec(77 * ctx, 1.0);
+        let (h, w) = (16, 16);
+        let x = rng.vec(4 * h * w, 1.0);
+        let t0 = Instant::now();
+        let cpu = unet.forward_cpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
+        let t_cpu = t0.elapsed();
+        let gpu = unet.forward_gpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
+        eprintln!("UNet 16x16: cpu {t_cpu:?}, rel err {:.2e}", rel_err(&gpu, &cpu));
+        assert!(rel_err(&gpu, &cpu) < 1e-3);
+        let z = rng.vec(4 * 16 * 16, 1.0);
+        let (cpu, ..) = vae.decode_cpu(&z, 16, 16).unwrap();
+        let (gpu, ..) = vae.decode_gpu(&z, 16, 16).unwrap();
+        eprintln!("VAE 16x16 -> 128x128: rel err {:.2e}", rel_err(&gpu, &cpu));
+        assert!(rel_err(&gpu, &cpu) < 1e-3);
+
+        let (h, w) = (64, 64);
+        let x = rng.vec(4 * h * w, 1.0);
+        let t0 = Instant::now();
+        unet.forward_gpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
+        eprintln!("UNet 64x64 first call (compile + run) {:?}", t0.elapsed());
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            unet.forward_gpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
+        }
+        eprintln!("UNet 64x64 steady: {:?} / eval", t0.elapsed() / 3);
+        let z = rng.vec(4 * 64 * 64, 1.0);
+        let t0 = Instant::now();
+        vae.decode_gpu(&z, 64, 64).unwrap();
+        eprintln!("VAE decode 512x512 first call {:?}", t0.elapsed());
+        let t0 = Instant::now();
+        vae.decode_gpu(&z, 64, 64).unwrap();
+        eprintln!("VAE decode 512x512 steady {:?}", t0.elapsed());
+    }
+}
