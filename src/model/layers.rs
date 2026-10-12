@@ -613,6 +613,7 @@ pub fn gguf_block_codec(format: QuantFormat) -> Option<(usize, usize, GgufBlockF
         QuantFormat::GGUF_TQ1_0 => (256, 54, dequantize_tq1_0_block),
         QuantFormat::GGUF_TQ2_0 => (256, 66, dequantize_tq2_0_block),
         QuantFormat::MXFP4 => (32, 17, dequantize_mxfp4_block),
+        QuantFormat::GGUF_NVFP4 => (64, 36, dequantize_nvfp4_block),
         _ => return crate::model::repack::block_codec(format),
     })
 }
@@ -1280,6 +1281,26 @@ pub fn dequantize_mxfp4_block(b: &[u8], y: &mut [f32]) {
     for (i, &q) in b[1..17].iter().enumerate() {
         y[i] = KVALUES_FP4[(q & 0xF) as usize] as f32 * d;
         y[i + 16] = KVALUES_FP4[(q >> 4) as usize] as f32 * d;
+    }
+}
+
+/// ggml NVFP4 (36 B / 64; `block_nvfp4`, `dequantize_row_nvfp4`): four UE4M3 scale bytes, one per
+/// 16-element sub-block, then 32 nibble bytes; within a sub-block's 8 bytes the low nibbles are
+/// elements 0..8 and the high nibbles 8..16. `d = ue4m3 * 0.5` (0 and 0x7F give 0) against the
+/// doubled E2M1 table.
+pub fn dequantize_nvfp4_block(b: &[u8], y: &mut [f32]) {
+    for s in 0..4 {
+        let x = b[s] as u32;
+        let (e, m) = ((x >> 3) & 0xF, x & 7);
+        let d = match x {
+            0 | 0x7F => 0.0,
+            _ if e == 0 => m as f32 / 1024.0,
+            _ => f32::from_bits(((e + 119) << 23) | (m << 20)),
+        };
+        for (j, &q) in b[4 + 8 * s..12 + 8 * s].iter().enumerate() {
+            y[16 * s + j] = KVALUES_FP4[(q & 0xF) as usize] as f32 * d;
+            y[16 * s + j + 8] = KVALUES_FP4[(q >> 4) as usize] as f32 * d;
+        }
     }
 }
 
