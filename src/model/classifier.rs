@@ -13,6 +13,8 @@ mod gpu_tests;
 #[cfg(test)]
 mod synth;
 pub mod ln_decoder;
+pub(crate) mod decoder_gpu;
+pub use decoder_gpu::gpu_fixture;
 mod spm;
 
 use crate::graph::{DType, Graph, Op, Tensor, UnaryKind};
@@ -144,6 +146,8 @@ enum Body {
         /// sentence-transformers CrossEncoder: a pair is `tokenizer(text, pair)` (the two id
         /// sequences concatenated), not a chat.
         concat_pair: bool,
+        /// Metal: `llm` scores on the GPU (`score_gpu`); `score` stays for the label count.
+        gpu: bool,
     },
     /// SetFit: sentence embedding → sklearn LogisticRegression (`predict_proba` scores).
     SetFit(setfit::SetFit),
@@ -161,6 +165,19 @@ pub trait DecoderBackbone: Send + Sync {
     fn hidden(&self) -> usize;
     /// Final-norm hidden state `[hidden]` of the last of `ids` (non-empty; one uncached pass).
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String>;
+    /// Metal: compile the score head into a GPU program (called once at load when the backend is
+    /// Metal). `score` is `[labels, hidden]` row-major, bias-free.
+    fn attach_score_gpu(&mut self, _score: &[f32], _labels: usize) -> Result<(), String> {
+        Err(format!(
+            "gpu-only: {} has no Metal seq-cls program; run with --backend cpu",
+            std::any::type_name_of_val(self)
+        ))
+    }
+    /// Logits `[labels]` of `ids` (non-empty, last non-pad token last) computed entirely on the
+    /// GPU. Only valid after a successful `attach_score_gpu`.
+    fn score_gpu(&self, _ids: &[u32]) -> Result<Vec<f32>, String> {
+        Err("no GPU score program attached".into())
+    }
     /// Token ids of `text` (with `pair`, the second segment): `Tokenizer::encode`, and
     /// [`encode_pair`] for a pair.
     fn encode(&self, text: &str, pair: Option<&str>) -> Result<Vec<u32>, String> {
@@ -513,9 +530,6 @@ impl SequenceClassifier {
             }
             None => (repo_id, repo_id),
         };
-        let cpu_only = |family: crate::graph::avenues::Family| {
-            crate::graph::avenues::family_gate(family, device)
-        };
         let usize_of = |k: &str| {
             cfg[k]
                 .as_u64()
@@ -525,7 +539,7 @@ impl SequenceClassifier {
         let pad_id = cfg["pad_token_id"].as_u64().map(|v| v as u32);
 
         let body = if is_decoder(&arch) {
-            cpu_only(crate::graph::avenues::Family::ClassifierDecoder)?;
+            // No `cpu_only` gate: Metal gets the GPU seq-cls program (`decoder_gpu`).
             if peft.is_some() {
                 // ponytail: LoRA merges into the f32 encoder checkpoints only; decoder bodies load
                 // through their own readers (merge there when a decoder SEQ_CLS adapter matters).
@@ -563,7 +577,7 @@ impl SequenceClassifier {
                     // The causal LM head is never used: free it.
                     llm.lm_head =
                         QuantizedLinearLayer::from_f32("unused", 1, 1, &[0.0], QuantFormat::FP32)?;
-                    Box::new(llm)
+                    Box::new(decoder_gpu::GraphLmSeq::new(llm))
                 }
             };
             let h = llm.hidden();
@@ -580,11 +594,19 @@ impl SequenceClassifier {
                 b: None,
                 in_f: h,
             };
+            // Metal: the score head and backbone become a GPU program; a backbone without one
+            // fails the load (`gpu-only:`) instead of running on the CPU.
+            let mut llm = llm;
+            let gpu = device != Device::Cpu;
+            if gpu {
+                llm.attach_score_gpu(&score.w, score.out_f)?;
+            }
             Body::Decoder {
                 llm,
                 score,
                 pad: pad_id,
                 concat_pair: cfg["sentence_transformers"].is_object(),
+                gpu,
             }
         } else {
             let tok_cfg = hub
@@ -841,6 +863,7 @@ impl SequenceClassifier {
             Body::SetFit(s) => s.device(),
             Body::Gguf(g) => g.device(),
             Body::Gpu { .. } => Device::Metal,
+            Body::Decoder { gpu: true, .. } => Device::Metal,
             _ => Device::Cpu,
         }
     }
@@ -945,6 +968,7 @@ impl SequenceClassifier {
                 score,
                 pad,
                 concat_pair,
+                gpu,
             } => {
                 let ids = match pair {
                     Some(b) if *concat_pair => {
@@ -967,7 +991,12 @@ impl SequenceClassifier {
                     .iter()
                     .rposition(|&t| Some(t) != *pad)
                     .ok_or("the input has no non-pad token")?;
-                (score.apply(&llm.last_hidden(&ids[..=last])?, 1), ids.len())
+                let logits = if *gpu {
+                    llm.score_gpu(&ids[..=last])?
+                } else {
+                    score.apply(&llm.last_hidden(&ids[..=last])?, 1)
+                };
+                (logits, ids.len())
             }
             Body::SetFit(_) if pair.is_some() => {
                 return Err("SetFit classifiers take a single text, not a pair".into())

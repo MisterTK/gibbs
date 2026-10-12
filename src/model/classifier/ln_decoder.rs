@@ -4,6 +4,8 @@
 //! (`do_layer_norm_before`) with optional `project_in`/`project_out` around the blocks and
 //! positions offset by 2. f32 on the CPU, one uncached causal pass per input.
 
+use super::decoder_gpu::GpuScore;
+use crate::graph::{DType, Graph, Op, Tensor, ValueId, Weights};
 use super::{read_json, Checkpoint, DecoderBackbone, Lin};
 use crate::model::hf_loader::load_json_tokenizer;
 use crate::model::hub::HuggingFaceHub;
@@ -49,6 +51,8 @@ pub struct LnDecoder {
     heads: usize,
     h: usize,
     eps: f32,
+    /// Metal session and `[labels, hidden]` score head once `attach_score_gpu` ran.
+    gpu: Option<(GpuScore, Vec<f32>)>,
 }
 
 impl LnDecoder {
@@ -129,6 +133,86 @@ impl LnDecoder {
         }
         Ok(x)
     }
+
+    /// The Metal program for `n` tokens: [`Self::blocks`] and `last_hidden` as graph ops, then the
+    /// bias-free `score` head `[labels, hidden]` on the last row (output `[1, labels]`). Weights
+    /// are cloned into `weights` when given.
+    fn seqcls_graph(&self, n: usize, score: &[f32], mut weights: Option<&mut Weights>) -> Graph {
+        let (h, e, eps) = (self.h, self.e, self.eps);
+        let f = DType::F32;
+        let mut g = Graph::new();
+        let ids = g.input("token_ids", vec![n], DType::U32);
+        let positions = g.input("positions", vec![n], DType::U32);
+        let mut w = |g: &mut Graph, name: String, shape: Vec<usize>, data: &[f32]| {
+            if let Some(m) = weights.as_deref_mut() {
+                m.insert(name.clone(), Tensor::F32(data.to_vec()));
+            }
+            g.weight(name, shape, f)
+        };
+        let lin = |g: &mut Graph, w: &mut dyn FnMut(&mut Graph, String, Vec<usize>, &[f32]) -> ValueId, name: &str, x: ValueId, l: &Lin| {
+            let mut ins = vec![x, w(g, format!("{name}.weight"), vec![l.out_f, l.in_f], &l.w)];
+            if let Some(b) = &l.b {
+                ins.push(w(g, format!("{name}.bias"), vec![l.out_f], b));
+            }
+            g.add(name, Op::Linear, &ins, vec![n, l.out_f], f)
+        };
+        let norm = |g: &mut Graph, w: &mut dyn FnMut(&mut Graph, String, Vec<usize>, &[f32]) -> ValueId, name: &str, x: ValueId, (gamma, beta): &Norm, rows: usize| {
+            let ins = [x, w(g, format!("{name}.weight"), vec![h], gamma), w(g, format!("{name}.bias"), vec![h], beta)];
+            g.add(name, Op::LayerNorm { eps }, &ins, vec![rows, h], f)
+        };
+
+        let table = w(&mut g, "embed_tokens".into(), vec![self.embed.len() / e, e], &self.embed);
+        let mut x = g.add("embed", Op::Embedding, &[table, ids], vec![n, e], f);
+        if let Some(p) = &self.project_in {
+            x = lin(&mut g, &mut w, "project_in", x, p);
+        }
+        let pos = w(&mut g, "embed_positions".into(), vec![self.pos.len() / h, h], &self.pos);
+        let pe = g.add("embed_pos", Op::Embedding, &[pos, positions], vec![n, h], f);
+        x = g.add("embed_sum", Op::Add, &[x, pe], vec![n, h], f);
+        for (i, b) in self.blocks.iter().enumerate() {
+            let p = format!("blocks.{i}");
+            let a_in = if self.pre_ln { norm(&mut g, &mut w, &format!("{p}.ln1"), x, &b.ln1, n) } else { x };
+            let q = lin(&mut g, &mut w, &format!("{p}.q"), a_in, &b.q);
+            let k = lin(&mut g, &mut w, &format!("{p}.k"), a_in, &b.k);
+            let v = lin(&mut g, &mut w, &format!("{p}.v"), a_in, &b.v);
+            let attn = Op::Attention { heads: self.heads, kv_heads: self.heads, causal: true, window: None, soft_cap: None };
+            let a = g.add(format!("{p}.attn"), attn, &[q, k, v], vec![n, h], f);
+            let o = lin(&mut g, &mut w, &format!("{p}.out"), a, &b.out);
+            let y = g.add(format!("{p}.res1"), Op::Add, &[o, x], vec![n, h], f);
+            x = if self.pre_ln { y } else { norm(&mut g, &mut w, &format!("{p}.ln1"), y, &b.ln1, n) };
+            let m_in = if self.pre_ln { norm(&mut g, &mut w, &format!("{p}.ln2"), x, &b.ln2, n) } else { x };
+            let up = lin(&mut g, &mut w, &format!("{p}.fc1"), m_in, &b.fc1);
+            let act = match self.act {
+                Act::Gelu => Op::Gelu { tanh: false },
+                Act::GeluTanh => Op::Gelu { tanh: true },
+                Act::Relu => Op::Relu,
+            };
+            let act = g.add(format!("{p}.act"), act, &[up], vec![n, b.fc1.out_f], f);
+            let d = lin(&mut g, &mut w, &format!("{p}.fc2"), act, &b.fc2);
+            let y = g.add(format!("{p}.res2"), Op::Add, &[d, x], vec![n, h], f);
+            x = if self.pre_ln { y } else { norm(&mut g, &mut w, &format!("{p}.ln2"), y, &b.ln2, n) };
+        }
+        let slice = Op::Slice { axis: 0, start: n as i64 - 1, end: n as i64 };
+        let mut last = g.add("last_row", slice, &[x], vec![1, h], f);
+        if let Some(ln) = &self.final_ln {
+            last = norm(&mut g, &mut w, "final_ln", last, ln, 1);
+        }
+        let mut out_dim = h;
+        if let Some(p) = &self.project_out {
+            // `lin` shapes its output `[n, ..]`; this one is a single row.
+            let wt = w(&mut g, "project_out.weight".into(), vec![p.out_f, p.in_f], &p.w);
+            let mut ins = vec![last, wt];
+            if let Some(b) = &p.b {
+                ins.push(w(&mut g, "project_out.bias".into(), vec![p.out_f], b));
+            }
+            last = g.add("project_out", Op::Linear, &ins, vec![1, p.out_f], f);
+            out_dim = p.out_f;
+        }
+        let sw = w(&mut g, "score.weight".into(), vec![score.len() / out_dim, out_dim], score);
+        let logits = g.add("score", Op::Linear, &[last, sw], vec![1, score.len() / out_dim], f);
+        g.output(logits);
+        g
+    }
 }
 
 impl DecoderBackbone for LnDecoder {
@@ -151,6 +235,30 @@ impl DecoderBackbone for LnDecoder {
             Some(p) => p.apply(&last, 1),
             None => last,
         })
+    }
+    fn attach_score_gpu(&mut self, score: &[f32], labels: usize) -> Result<(), String> {
+        let out = self.hidden();
+        if score.len() != labels * out {
+            return Err(format!("score head is not [{labels}, {out}]"));
+        }
+        // ponytail: the session holds its own copy of every weight (2x resident with the host copy).
+        let mut weights = Weights::new();
+        self.seqcls_graph(1, score, Some(&mut weights));
+        self.gpu = Some((GpuScore::new(&weights)?, score.to_vec()));
+        Ok(())
+    }
+    fn score_gpu(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let (gpu, score) = self.gpu.as_ref().ok_or("no GPU score program attached")?;
+        let n = ids.len();
+        if n == 0 || n > self.ctx {
+            return Err(format!("{n} tokens: the context holds 1..={}", self.ctx));
+        }
+        let vocab = self.embed.len() / self.e;
+        if let Some(&t) = ids.iter().find(|&&t| t as usize >= vocab) {
+            return Err(format!("token id {t} is outside the {vocab}-row embedding"));
+        }
+        let graph = self.seqcls_graph(n, score, None);
+        gpu.run(&graph, ids, (0..n as u32).map(|p| p + self.pos_offset as u32).collect())
     }
 }
 
@@ -248,6 +356,7 @@ fn gpt2(ckpt: &Checkpoint, cfg: &Value, tok: Tokenizer) -> Result<LnDecoder, Str
         act: act(cfg, "gelu_new")?,
         heads: usize_of(cfg, "n_head")?,
         h,
+        gpu: None,
         eps: cfg["layer_norm_epsilon"].as_f64().unwrap_or(1e-5) as f32,
     })
 }
@@ -315,6 +424,7 @@ fn opt(ckpt: &Checkpoint, cfg: &Value, tok: Tokenizer) -> Result<LnDecoder, Stri
         pre_ln,
         act: act(cfg, "relu")?,
         heads: usize_of(cfg, "num_attention_heads")?,
+        gpu: None,
         h,
         eps: 1e-5,
     })
@@ -371,4 +481,82 @@ fn tokenizer(hub: &HuggingFaceHub, repo_id: &str) -> Result<Tokenizer, String> {
         );
     }
     Ok(tok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::classifier::decoder_gpu::{fill, tests::parity};
+
+    /// A 2-block, 2-head, hidden-32 body with deterministic weights.
+    fn tiny(pre_ln: bool, act: Act, pos_offset: usize, proj: bool) -> LnDecoder {
+        let (h, ffn, vocab, ctx) = (32, 64, 64, 32);
+        let e = if proj { 16 } else { h };
+        let lin = |i: usize, o: usize, seed: usize| Lin {
+            w: fill(i * o, seed, 0.3),
+            b: Some(fill(o, seed + 50, 0.1)),
+            in_f: i,
+            out_f: o,
+        };
+        let norm = |seed: usize| -> Norm {
+            (
+                fill(h, seed, 0.5).iter().map(|v| v + 1.0).collect(),
+                fill(h, seed + 1, 0.2),
+            )
+        };
+        let blocks = (0..2)
+            .map(|l| Block {
+                ln1: norm(10 * l + 1),
+                q: lin(h, h, 10 * l + 2),
+                k: lin(h, h, 10 * l + 3),
+                v: lin(h, h, 10 * l + 4),
+                out: lin(h, h, 10 * l + 5),
+                ln2: norm(10 * l + 6),
+                fc1: lin(h, ffn, 10 * l + 7),
+                fc2: lin(ffn, h, 10 * l + 8),
+            })
+            .collect();
+        LnDecoder {
+            tok: Tokenizer::default_bpe(),
+            embed: fill(vocab * e, 40, 0.5),
+            e,
+            pos: fill((ctx + pos_offset) * h, 41, 0.3),
+            pos_offset,
+            ctx,
+            project_in: proj.then(|| lin(e, h, 42)),
+            project_out: proj.then(|| lin(h, e, 43)),
+            blocks,
+            final_ln: pre_ln.then(|| norm(44)),
+            pre_ln,
+            act,
+            heads: 2,
+            h,
+            eps: 1e-5,
+            gpu: None,
+        }
+    }
+
+    #[test]
+    fn gpt2_style_matches_host() {
+        let mut m = tiny(true, Act::GeluTanh, 0, false);
+        let seqs: [&[u32]; 3] = [&[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], &[4]];
+        let e = parity(&mut m, &fill(3 * 32, 30, 0.5), 3, &seqs);
+        eprintln!("gpt2-style max rel err {e:?}");
+    }
+
+    #[test]
+    fn opt_post_ln_with_projections_matches_host() {
+        let mut m = tiny(false, Act::Relu, 2, true);
+        let seqs: [&[u32]; 3] = [&[1, 2, 3], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 8], &[4]];
+        let e = parity(&mut m, &fill(2 * 16, 31, 0.5), 2, &seqs);
+        eprintln!("opt post-LN max rel err {e:?}");
+    }
+
+    #[test]
+    fn opt_pre_ln_erf_gelu_matches_host() {
+        let mut m = tiny(true, Act::Gelu, 2, true);
+        let seqs: [&[u32]; 2] = [&[7, 6, 5, 4], &[2]];
+        let e = parity(&mut m, &fill(2 * 16, 32, 0.5), 2, &seqs);
+        eprintln!("opt pre-LN erf-gelu max rel err {e:?}");
+    }
 }
