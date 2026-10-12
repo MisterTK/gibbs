@@ -45,11 +45,11 @@ impl Lcg {
     }
 }
 
-/// A random finite f16 with magnitude in roughly 2^-6..2^4 (no NaN/inf/subnormal: those leave the
-/// GPU free to differ from the CPU in payload/flush behaviour, which no kernel relies on).
+/// A random finite f16 (no NaN/inf), including subnormals (1 in 8) and tiny/large exponents, so a
+/// GPU that flushes or mis-converts them shows up as a mismatch.
 fn rand_f16(r: &mut Lcg) -> u16 {
     let sign = (r.next() & 1) as u16;
-    let exp = 9 + (r.next() % 14) as u16;
+    let exp = if r.next() % 8 == 0 { 0 } else { 1 + (r.next() % 25) as u16 };
     let mant = (r.next() & 0x3FF) as u16;
     (sign << 15) | (exp << 10) | mant
 }
@@ -133,19 +133,15 @@ fn run_decode_all(device: &Device, msl: &str, block_elems: usize, block_bytes: u
 #[test]
 fn codec_decode_matches_cpu() {
     let device = Device::system_default().expect("no Metal device");
-    let mut registered = 0;
     let mut failures = Vec::new();
     for (i, &f) in CANDIDATES.iter().enumerate() {
-        let Some(c) = codec(f) else {
-            println!("codec {f:?}: NOT REGISTERED");
-            continue;
-        };
-        registered += 1;
+        let c = codec(f).unwrap_or_else(|| panic!("codec {f:?} is not registered"));
         let (n, bytes, cpu) = gguf_block_codec(f).expect("CPU reference");
         assert_eq!((c.block_elems as usize, c.block_bytes as usize), (n, bytes), "{f:?} geometry");
         // Aliases (IQ2_S -> IQ2_M) share the codec; the CPU dequantizer is the same function.
         let raw = random_blocks(c.format, bytes, 0x9E37_79B9 + i as u64);
-        let gpu = run_decode_all(&device, c.msl, n, bytes, &raw);
+        let msl = format!("{}{}", msl_prelude(), c.msl); // guards make prelude + codec idempotent
+        let gpu = run_decode_all(&device, &msl, n, bytes, &raw);
         let mut want = vec![0.0f32; BLOCKS * n];
         for (b, y) in raw.chunks_exact(bytes).zip(want.chunks_exact_mut(n)) {
             cpu(b, y);
@@ -166,7 +162,6 @@ fn codec_decode_matches_cpu() {
         println!("codec {f:?}: {BLOCKS} blocks bit-exact");
     }
     assert!(failures.is_empty(), "unregister these codecs:\n{}", failures.join("\n"));
-    assert!(registered >= 1);
 }
 
 /// All tables in `msl_prelude()` compile together with the helpers.
@@ -174,5 +169,9 @@ fn codec_decode_matches_cpu() {
 fn msl_prelude_compiles() {
     let device = Device::system_default().expect("no Metal device");
     let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{}\nkernel void k() {{}}\n", msl_prelude());
-    device.new_library_with_source(&src, &CompileOptions::new()).unwrap_or_else(|e| panic!("prelude: {e}"));
+    {
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        device.new_library_with_source(&src, &opts)
+    }.unwrap_or_else(|e| panic!("prelude: {e}"));
 }
