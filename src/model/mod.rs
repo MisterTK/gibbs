@@ -48,6 +48,7 @@ pub mod clip;
 pub mod dcae;
 pub mod dit;
 pub mod draft;
+pub mod encdec_gpu;
 pub mod fasttext;
 pub mod fingerprint;
 pub mod flow;

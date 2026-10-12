@@ -644,8 +644,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => None,
             };
             let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
+            // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
+            let temperature = match model_exec.tokenizer().sampling_defaults {
+                Some((t, _)) if t <= 1e-4 => 0.0,
+                _ => 0.7,
+            };
             let (output, passes, decode) =
-                model_exec.generate_text_measured(prompt, max_toks, 0.7, drafter.clone())?;
+                model_exec.generate_text_measured(prompt, max_toks, temperature, drafter.clone())?;
             println!("✨ Output:\n{}", output);
             let tok_s = passes as f64 / decode.as_secs_f64().max(1e-9);
             println!(
