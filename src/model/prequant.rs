@@ -440,6 +440,81 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
     Ok(Some(out))
 }
 
+/// A compressed-tensors `pack-quantized` int4 weight with one scale per `group` input columns of a row,
+/// as [`dequantize`] reads it: element = `(nibble - zero) * scale`. `w` is the packed words' bytes,
+/// i.e. one unsigned nibble per element (`q + 8`), element `2i` in the low nibble of byte `i`;
+/// `scale` / `zero` are `[rows, cols / group]` row-major, `zero` in nibble units (`8` = symmetric).
+pub(crate) struct Int4Groups<'a> {
+    pub rows: usize,
+    pub cols: usize,
+    pub group: usize,
+    pub w: &'a [u8],
+    pub scale: Vec<f32>,
+    pub zero: Vec<f32>,
+}
+
+/// [`Int4Groups`] of `name`; `None` when it is not such a weight: not int4, no group grid (per-tensor
+/// scale, a group size outside 32 / 64 / 128, a scale row count other than `out`), activation-ordered
+/// (`weight_g_idx`), a global scale (`weight_global_scale` / `weight_scale_2`), or zero points that are not whole numbers.
+pub(crate) fn int4_groups<'a>(
+    m: &ModelManifest,
+    data: &'a [u8],
+    name: &str,
+) -> Result<Option<Int4Groups<'a>>, String> {
+    let Some(stem) = name.strip_suffix(".weight") else {
+        return Ok(None);
+    };
+    let get = |s: &str| m.tensors.get(&format!("{stem}.{s}"));
+    let (Some(w), Some(st), Some(_)) = (m.tensors.get(name), get("weight_scale"), get("weight_packed"))
+    else {
+        return Ok(None);
+    };
+    let [rows, cols] = w.shape[..] else {
+        return Ok(None);
+    };
+    let [sr, sc] = st.shape[..] else {
+        return Ok(None);
+    };
+    // 4 bits: half a byte per element (8-bit packs are `rows * cols`, 2-bit a quarter).
+    if w.dtype != "I32" || get("weight_g_idx").is_some()
+        || get("weight_global_scale").is_some()
+        || get("weight_scale_2").is_some()
+        || w.byte_len * 2 != rows * cols {
+        return Ok(None);
+    }
+    if sr != rows || sc == 0 || cols % sc != 0 || ![32, 64, 128].contains(&(cols / sc)) {
+        return Ok(None);
+    }
+    let err = |e: String| format!("{name}: {e}");
+    let scale = decode_dtype(bytes(data, st)?, &st.dtype).map_err(err)?;
+    let zero = match get("weight_zero_point") {
+        None => vec![8.0; sr * sc],
+        // Packed along `out` like the weight; stored signed (`z + 8` unsigned).
+        Some(z) if z.dtype == "I32" => unpack_int(bytes(data, z)?, sr, sc, 4, true)
+            .map_err(err)?
+            .into_iter()
+            .map(|z| z + 8.0)
+            .collect(),
+        Some(z) => decode_dtype(bytes(data, z)?, &z.dtype)
+            .map_err(err)?
+            .into_iter()
+            .map(|z| z + 8.0)
+            .collect(),
+    };
+    // `(q - z) * s` and `(nibble - (z + 8)) * s` only agree while `z` is a whole number.
+    if scale.len() != sr * sc || zero.len() != sr * sc || zero.iter().any(|z| z.fract() != 0.0) {
+        return Ok(None);
+    }
+    Ok(Some(Int4Groups {
+        rows,
+        cols,
+        group: cols / sc,
+        w: bytes(data, w)?,
+        scale,
+        zero,
+    }))
+}
+
 /// Elements of `n` covered by each of `s` scale entries.
 // ponytail: inferred from the scale grid (128-blocks preferred, else exact division); ragged non-128
 // blocks would need the config's `block_structure`.
