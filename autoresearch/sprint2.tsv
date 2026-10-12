@@ -1,1 +1,3 @@
 iteration	timestamp	commit	metric	delta	guard	status	luminal_ref	hypothesis	top_kernel_before	top_kernel_after
+0	2026-10-12T18:36:29Z	f79433d	90.00	0.00	pass	keep	baseline	Phase 6 and 7 baseline after cutover and TUI	gemv_mpp	gemv_mpp
+1	2026-10-12T18:43:07Z	e3790d1	90.00	0.00	pass	revert	luminal_metal quantized.rs:44-109	GEMV rows-per-simdgroup R=4	gemv_mpp	gemv_mpp
