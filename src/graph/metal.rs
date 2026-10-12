@@ -1698,32 +1698,6 @@ impl Session {
         Ok(guard.as_ref().unwrap().clone())
     }
 
-    /// Pre-records a decode indirect command buffer (ICB) for the planned steps.
-    pub fn create_decode_icb(&self, plan: &PreparedPlan) -> Result<DecodeIcb, String> {
-        let desc = IndirectCommandBufferDescriptor::new();
-        desc.set_command_types(MTLIndirectCommandType::ConcurrentDispatch);
-        desc.set_inherit_buffers(false);
-        desc.set_inherit_pipeline_state(false);
-        desc.set_max_kernel_buffer_bind_count(8);
-
-        let count = plan.steps.len().max(1);
-        let icb = self.rt.device.new_indirect_command_buffer_with_descriptor(
-            &desc,
-            count as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        // Evaluate decision rule:
-        // Measure CPU encode time vs GPU execution time.
-        // If CPU encode > 15 µs or GPU time < 2.0 ms, dispatch ICB; else direct command encoder.
-        let dispatch_icb = true;
-
-        Ok(DecodeIcb {
-            icb,
-            command_count: count,
-            dispatch_icb,
-        })
-    }
     /// Runs `graph` with `inputs` bound positionally to `graph.inputs`; returns `graph.outputs`.
     pub fn run(&self, graph: &Graph, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         self.run_with_state(graph, None, inputs)
@@ -3228,13 +3202,6 @@ pub struct PreparedPlan {
     pub state_reads: Vec<StateRead>,
     pub flops_per_run: u64,
     pub params_buffer_size: usize,
-}
-
-#[derive(Clone)]
-pub struct DecodeIcb {
-    pub icb: IndirectCommandBuffer,
-    pub command_count: usize,
-    pub dispatch_icb: bool,
 }
 
 fn numel(g: &Graph, v: ValueId) -> Result<usize, String> {
