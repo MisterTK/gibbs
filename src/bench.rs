@@ -316,7 +316,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         let (_, mut c_state) = cpu_exec.prepare(prompt_tokens.clone(), &[])?;
 
         let mut metal_tokens = prompt_tokens.clone();
-        let mut cpu_tokens = prompt_tokens;
+        let mut cpu_tokens = prompt_tokens.clone();
         let mut m_logits = metal_exec.forward(&prompt_tokens, 0, &mut m_state)?;
         let mut c_logits = cpu_exec.forward(&prompt_tokens, 0, &mut c_state)?;
 
