@@ -585,6 +585,89 @@ impl QwenVae {
     }
 }
 
+/// Tiny synthetic decoder for the CPU-free fixtures and parity tests (shared with `tests/cpu_free_matrix.rs`).
+pub mod fixture {
+    use super::*;
+    use crate::model::diff_graph::testutil::{synth, Lcg};
+
+    /// A tiny (base 4) decoder in the original names: one 4D conv of every kind, a real middle attention.
+    pub fn tiny_specs(base: usize) -> Vec<(String, Vec<usize>)> {
+        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
+        let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
+            s.push((format!("{p}.weight"), vec![o, i, k, k]));
+            s.push((format!("{p}.bias"), vec![o]));
+        };
+        let res = |s: &mut Vec<_>, p: &str, i: usize, o: usize| {
+            s.push((format!("{p}.residual.0.gamma"), vec![i]));
+            conv(s, &format!("{p}.residual.2"), i, o, 3);
+            s.push((format!("{p}.residual.3.gamma"), vec![o]));
+            conv(s, &format!("{p}.residual.6"), o, o, 3);
+            if i != o {
+                conv(s, &format!("{p}.shortcut"), i, o, 1);
+            }
+        };
+        let dims: Vec<usize> = [MULT[3]].iter().chain(MULT.iter().rev()).map(|m| base * m).collect();
+        conv(&mut s, "conv2", Z, Z, 1);
+        conv(&mut s, "decoder.conv1", Z, dims[0], 3);
+        res(&mut s, "decoder.middle.0", dims[0], dims[0]);
+        let c = dims[0];
+        s.push(("decoder.middle.1.norm.gamma".into(), vec![c]));
+        conv(&mut s, "decoder.middle.1.to_qkv", c, 3 * c, 1);
+        conv(&mut s, "decoder.middle.1.proj", c, c, 1);
+        res(&mut s, "decoder.middle.2", c, c);
+        for i in 0..4 {
+            let (cin, cout) = (if i > 0 { dims[i] / 2 } else { dims[i] }, dims[i + 1]);
+            for j in 0..3 {
+                res(&mut s, &format!("decoder.upsamples.{}", i * 4 + j), if j == 0 { cin } else { cout }, cout);
+            }
+            if i < 3 {
+                conv(&mut s, &format!("decoder.upsamples.{}.resample.1", i * 4 + 3), cout, cout / 2, 3);
+            }
+        }
+        s.push(("decoder.head.0.gamma".into(), vec![dims[4]]));
+        conv(&mut s, "decoder.head.2", dims[4], 3, 3);
+        s
+    }
+
+    /// A base-4 decoder with gains near 1.
+    pub fn tiny() -> QwenVae {
+        let specs = tiny_specs(4);
+        let mut r = synth(&specs, 11);
+        let mut g = Lcg(5);
+        for (n, (_, v)) in r.0.iter_mut() {
+            if n.ends_with(".gamma") {
+                v.iter_mut().for_each(|x| *x = 1.0 + 0.2 * g.next());
+            }
+        }
+        let w = Weights::from_f32(specs, |n| Ok(r.0[n].1.clone())).unwrap();
+        QwenVae::open(&w, MEAN.to_vec(), STD.to_vec(), 4).unwrap()
+    }
+
+    /// Public `decode` of the tiny net (Metal when the CPU tripwire is armed) plus a finiteness check of the
+    /// raw Metal output.
+    pub fn tiny_on_gpu() -> Result<(), String> {
+        let vae = tiny();
+        let (h, w) = (3, 2);
+        let z = Lcg(3).vec(Z * h * w, 1.0);
+        let img = vae.decode(&z, h, w)?;
+        if (img.width, img.height) != (8 * w, 8 * h) {
+            return Err(format!("qwen_vae: {}x{} image", img.width, img.height));
+        }
+        let raw = vae.decode_gpu(&vae_denorm(&vae, &z, h * w), h, w)?;
+        if raw.iter().any(|v| !v.is_finite()) {
+            return Err("qwen_vae: non-finite Metal output".into());
+        }
+        Ok(())
+    }
+
+    fn vae_denorm(vae: &QwenVae, lat: &[f32], hw: usize) -> Vec<f32> {
+        lat.chunks_exact(hw)
+            .zip(vae.mean.iter().zip(&vae.std))
+            .flat_map(|(c, (m, s))| c.iter().map(move |v| v * s + m))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,59 +737,11 @@ mod tests {
         assert!(psnr > 24.0, "PSNR {psnr}");
     }
 
-    /// A tiny (base 4) decoder in the original names: one 4D conv of every kind, a real middle attention.
-    fn tiny_specs(base: usize) -> Vec<(String, Vec<usize>)> {
-        let mut s: Vec<(String, Vec<usize>)> = Vec::new();
-        let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
-            s.push((format!("{p}.weight"), vec![o, i, k, k]));
-            s.push((format!("{p}.bias"), vec![o]));
-        };
-        let res = |s: &mut Vec<_>, p: &str, i: usize, o: usize| {
-            s.push((format!("{p}.residual.0.gamma"), vec![i]));
-            conv(s, &format!("{p}.residual.2"), i, o, 3);
-            s.push((format!("{p}.residual.3.gamma"), vec![o]));
-            conv(s, &format!("{p}.residual.6"), o, o, 3);
-            if i != o {
-                conv(s, &format!("{p}.shortcut"), i, o, 1);
-            }
-        };
-        let dims: Vec<usize> = [MULT[3]].iter().chain(MULT.iter().rev()).map(|m| base * m).collect();
-        conv(&mut s, "conv2", Z, Z, 1);
-        conv(&mut s, "decoder.conv1", Z, dims[0], 3);
-        res(&mut s, "decoder.middle.0", dims[0], dims[0]);
-        let c = dims[0];
-        s.push(("decoder.middle.1.norm.gamma".into(), vec![c]));
-        conv(&mut s, "decoder.middle.1.to_qkv", c, 3 * c, 1);
-        conv(&mut s, "decoder.middle.1.proj", c, c, 1);
-        res(&mut s, "decoder.middle.2", c, c);
-        for i in 0..4 {
-            let (cin, cout) = (if i > 0 { dims[i] / 2 } else { dims[i] }, dims[i + 1]);
-            for j in 0..3 {
-                res(&mut s, &format!("decoder.upsamples.{}", i * 4 + j), if j == 0 { cin } else { cout }, cout);
-            }
-            if i < 3 {
-                conv(&mut s, &format!("decoder.upsamples.{}.resample.1", i * 4 + 3), cout, cout / 2, 3);
-            }
-        }
-        s.push(("decoder.head.0.gamma".into(), vec![dims[4]]));
-        conv(&mut s, "decoder.head.2", dims[4], 3, 3);
-        s
-    }
-
     /// CPU decoder vs the Metal graph program on a tiny synthetic checkpoint (f32 vs f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
-        use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
-        let specs = tiny_specs(4);
-        let mut r = synth(&specs, 11);
-        let mut g = Lcg(5);
-        for (n, (_, v)) in r.0.iter_mut() {
-            if n.ends_with(".gamma") {
-                v.iter_mut().for_each(|x| *x = 1.0 + 0.2 * g.next());
-            }
-        }
-        let w = Weights::from_f32(specs, |n| Ok(r.0[n].1.clone())).unwrap();
-        let vae = QwenVae::open(&w, MEAN.to_vec(), STD.to_vec(), 4).unwrap();
+        use crate::model::diff_graph::testutil::{rel_err, Lcg};
+        let vae = fixture::tiny();
         let (h, wd) = (3, 2);
         let z = Lcg(3).vec(Z * h * wd, 1.0);
         let cpu = vae.decode_cpu(&z, h, wd);
