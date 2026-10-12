@@ -386,10 +386,7 @@ impl Vision {
             let g = l.gate.add_to(&mut b, &format!("{p}.gate"), a, np);
             let u = l.up.add_to(&mut b, &format!("{p}.up"), a, np);
             let inter = l.gate.w.rows;
-            // gelu(gate) * up as Unary + Mul: a `GeGlu` straight after the Linears is fused into their
-            // epilogue, which the batched (rows >= 16) bf16 GEMM does not implement.
-            let g = b.unary(&format!("{p}.gelu"), UnaryKind::GeluTanh, g, vec![np, inter]);
-            let m = b.op(&format!("{p}.glu"), Op::Mul, &[g, u], vec![np, inter]);
+            let m = b.op(&format!("{p}.geglu"), Op::GeGlu, &[g, u], vec![np, inter]);
             let m = l.down.add_to(&mut b, &format!("{p}.down"), m, np);
             let m = b.rms(&format!("{p}.post_ff_ln"), m, l.post_ff_ln.clone(), eps, vec![np, d]);
             h = b.add(&format!("{p}.res2"), h, m, vec![np, d]);
@@ -499,6 +496,7 @@ pub mod tiny {
     }
 
     /// `[np, p·p·3]` pseudo-random patches for a `ph × pw` grid.
+    #[cfg(test)]
     pub fn patches(ph: usize, pw: usize) -> Vec<f32> {
         values("patches", ph * pw * PATCH * PATCH * 3)
     }
