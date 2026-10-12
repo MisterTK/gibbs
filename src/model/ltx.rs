@@ -28,6 +28,11 @@ use std::time::Instant;
 
 mod graph_program;
 
+/// A tiny random-weight LTX transformer forward as a graph (the GPU-only matrix fixture).
+pub fn tiny_dit_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    graph_program::fixture::tiny_graph()
+}
+
 const HEADS: usize = 32;
 const LATENT: usize = 128;
 const TIME_DIM: usize = 256;
@@ -446,7 +451,6 @@ pub struct LtxText {
 impl LtxText {
     /// `text_encoder/` shards + `tokenizer/` of a diffusers repo snapshot.
     pub fn from_dir(base: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoLtx)?;
         Ok(Self {
             t5: crate::model::flux::t5_load(&base.join("text_encoder"))?,
             tok: t5_tokenizer(&base.join("tokenizer"))?,
@@ -455,7 +459,6 @@ impl LtxText {
 
     /// A `t5encoder` GGUF with the base repo's `text_encoder/config.json` and `tokenizer/`.
     pub fn from_gguf(gguf: &Path, config: &Path, tokenizer_dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::VideoLtx)?;
         Ok(Self {
             t5: T5Encoder::load_gguf(&Store::open(gguf)?, &read_json(config)?)?,
             tok: t5_tokenizer(tokenizer_dir)?,

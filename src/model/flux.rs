@@ -1381,7 +1381,6 @@ pub(crate) fn t5_load(dir: &Path) -> Result<T5Encoder, String> {
 impl FluxPipeline {
     /// A diffusers FluxPipeline, ChromaPipeline or Flux2KleinPipeline snapshot.
     pub fn load(dir: &Path, hub: &HuggingFaceHub) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         Self::load_with(dir, hub, None, &[])
     }
 

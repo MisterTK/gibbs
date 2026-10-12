@@ -409,7 +409,6 @@ pub struct ZImagePipeline {
 impl ZImagePipeline {
     /// Loads a diffusers `ZImagePipeline` snapshot directory.
     pub fn load(dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         let scfg = crate::model::dit::read_scheduler(dir)?;
         if scfg["use_dynamic_shifting"].as_bool() == Some(true) {
             return Err("Z-Image scheduler with use_dynamic_shifting is not supported".into());

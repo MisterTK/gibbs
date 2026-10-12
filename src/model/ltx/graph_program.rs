@@ -205,11 +205,19 @@ impl LtxTransformer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::dit_graph::testutil::{cosine, mat, rand, rel_err};
+/// Tiny random-weight transformer: the parity test's and the GPU-only matrix's fixture.
+pub(super) mod fixture {
+    use super::super::*;
+    use crate::model::dit_graph::fixture::{mat, rand};
     use crate::model::flux::Wt;
+
+    /// The tiny LTX forward (36 tokens, 24 text tokens, 5 clean) as a graph.
+    pub(in crate::model::ltx) fn tiny_graph(
+    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+        let (mut b, outs) = tiny(1).build(36, 24, 5)?;
+        b.g.output(outs[0]);
+        Ok((b.g, b.w))
+    }
 
     struct Seed(u64);
     impl Seed {
@@ -228,10 +236,10 @@ mod tests {
         rand(n, s.next(), 1.0).iter().map(|v| 1.0 + 0.3 * v).collect()
     }
 
-    const D: usize = 512;
-    const TEXT_IN: usize = 96;
+    pub(super) const D: usize = 512;
+    pub(super) const TEXT_IN: usize = 96;
 
-    fn tiny(seed: u64) -> LtxTransformer {
+    pub(super) fn tiny(seed: u64) -> LtxTransformer {
         let s = &mut Seed(seed * 1000);
         let mut attn = |s: &mut Seed| Attn {
             q: lin(s, D, D),
@@ -264,6 +272,13 @@ mod tests {
             gpu: Default::default(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::*;
+    use super::*;
+    use crate::model::dit_graph::fixture::{cosine, rand, rel_err};
 
     /// Metal program == native CPU forward: plain, a partial image-conditioned split and the
     /// all-clean split, over a 3x3x4 latent grid (36 tokens).

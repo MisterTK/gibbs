@@ -496,7 +496,6 @@ pub struct QwenImage21Pipeline {
 impl QwenImage21Pipeline {
     /// Loads a diffusers `QwenImage21Pipeline` snapshot directory.
     pub fn load(dir: &Path) -> Result<Self, String> {
-        crate::graph::avenues::gate(crate::graph::avenues::Family::DiffusionDit)?;
         Self::load_with(dir, None, None, None)
     }
 
