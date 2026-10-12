@@ -286,6 +286,18 @@ impl LmSource {
         }
     }
 
+    /// How many projections (4 per layer plus the LM head) a build passes to its encoder.
+    pub fn projection_count(&self) -> usize {
+        let layers = match &self.body {
+            LmBody::Checkpoint { manifest, gguf: true, .. } => {
+                GraphLmConfig::from_gguf(manifest, self.cfg.clone()).num_layers
+            }
+            LmBody::Checkpoint { .. } => self.cfg.num_layers,
+            LmBody::Built(m) => m.layers.len(),
+        };
+        4 * layers + 1
+    }
+
     /// Builds a model, passing every projection through `enc` when given.
     pub fn build(
         &self,
