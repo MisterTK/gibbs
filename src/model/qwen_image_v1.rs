@@ -7,6 +7,8 @@
 //! Text-to-image only: condition images, guidance-distilled variants and padding masks (one prompt
 //! per pass, so no padding) are not implemented.
 
+mod graph_program;
+
 use crate::model::dit::{
     add_gated, norm_modulate, read_config, read_scheduler, rms_norm, silu_of, timestep_features,
 };
@@ -191,6 +193,8 @@ struct Dit {
     blocks: Vec<Block>,
     norm_out: BLin,
     proj_out: BLin,
+    /// Metal programs per (text tokens, ph, pw) (GPU-only runs).
+    gpu: graph_program::Cache,
 }
 
 impl Dit {
@@ -310,6 +314,7 @@ impl Dit {
             blocks,
             norm_out: BLin::load(s, "norm_out.linear")?,
             proj_out: BLin::load(s, "proj_out")?,
+            gpu: Default::default(),
         };
         let streams_ok = dit.blocks.iter().all(|b| {
             [&b.img, &b.txt].iter().all(|s| {
@@ -531,7 +536,9 @@ impl Core {
         let (h, w) = (height / VAE_PX, width / VAE_PX);
         let (ph, pw) = (h / 2, w / 2);
         let (n_img, ch) = (ph * pw, self.dit.in_ch);
-        // Text features -> (projected context, rotary tables of the joint sequence).
+        // Text features -> (projected context, rotary tables of the joint sequence); on the GPU
+        // the raw features go to the program, which projects them itself.
+        let gpu = crate::model::dit_graph::use_metal();
         let prepare = |(txt, n): Features| {
             if n == 0 || txt.len() != n * self.dit.text_width() {
                 return Err(format!(
@@ -540,10 +547,18 @@ impl Core {
                     self.dit.text_width()
                 ));
             }
-            Ok((
-                self.dit.project_text(&txt, n),
-                Rope::new(&positions(n, ph, pw), &self.dit.axes),
-            ))
+            Ok(if gpu {
+                (txt, None)
+            } else {
+                (
+                    self.dit.project_text(&txt, n),
+                    Some(Rope::new(&positions(n, ph, pw), &self.dit.axes)),
+                )
+            })
+        };
+        let velocity = |(ctx, rope): &(Vec<f32>, Option<Rope>), x: &[f32], sigma: f32| match rope {
+            Some(rope) => Ok(self.dit.forward(x, ctx, rope, sigma)),
+            None => self.dit.forward_gpu(&self.dit.gpu, x, ctx, ph, pw, sigma),
         };
         let pos = prepare(encode(&req.prompt)?)?;
         let neg = (guidance > 1.0)
@@ -557,9 +572,9 @@ impl Core {
         let mut x = pack(&noise, Z, h, w);
         for (i, s) in sigmas.windows(2).enumerate() {
             let t = Instant::now();
-            let mut v = self.dit.forward(&x, &pos.0, &pos.1, s[0]);
+            let mut v = velocity(&pos, &x, s[0])?;
             if let Some(neg) = &neg {
-                let vn = self.dit.forward(&x, &neg.0, &neg.1, s[0]);
+                let vn = velocity(neg, &x, s[0])?;
                 v = cfg_rescale(&v, &vn, guidance, ch);
             }
             flow::euler_step(&mut x, &v, s[0], s[1]);

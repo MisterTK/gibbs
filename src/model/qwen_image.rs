@@ -5,6 +5,9 @@
 //! schedule with `shift_terminal`, and the repos that build on a diffusers base (transformer-only
 //! GGUFs and single-file finetunes, as FLUX's `load_derived`).
 
+use crate::graph::ValueId;
+use crate::model::dit_graph::Gb;
+use crate::model::weights::{Mat, Packed};
 use crate::model::flow;
 use crate::model::flux::{Store, Wt};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
@@ -66,6 +69,91 @@ impl QLin {
         });
         out
     }
+
+    /// The whole stored matrix as a graph weight, still in its stored encoding (bf16 or packed
+    /// GGUF blocks). ponytail: same conversion as `flux::graph_program::wt_mat`; dedupe when a
+    /// third family needs it.
+    fn stored(&self) -> Mat {
+        match &*self.w {
+            Wt::Bf16(m) => m.clone(),
+            Wt::Gguf {
+                map,
+                off,
+                rows,
+                cols,
+                fmt,
+                ..
+            } => Mat::from_packed(
+                Packed {
+                    map: map.clone(),
+                    off: *off,
+                    format: *fmt,
+                    shape: vec![*rows, *cols],
+                },
+                *rows,
+                *cols,
+            ),
+        }
+    }
+
+    /// Binds this (whole-matrix) weight as `{name}.weight`; calls with one name share it.
+    pub(crate) fn bind(&self, b: &mut Gb, name: &str) -> ValueId {
+        let m = self.stored();
+        assert!(
+            self.off == 0 && self.n == m.rows,
+            "{name}: bind of a row range"
+        );
+        b.mat(&format!("{name}.weight"), &m)
+    }
+
+    /// Graph form of [`Self::fwd`]: `x [m, k] -> [m, n]` (+ `bias`), named `name`.
+    pub(crate) fn emit(&self, b: &mut Gb, name: &str, x: ValueId, bias: Option<&[f32]>) -> ValueId {
+        let w = self.bind(b, name);
+        let bias = bias.map(|v| b.konst(&format!("{name}.bias"), &[v.len()], v.to_vec()));
+        b.linear(name, x, w, bias)
+    }
+
+    /// `self` and `other` (row ranges of one stored matrix, as a fused `gate_up` split in two)
+    /// from a single GEMM over the whole matrix, then column slices; separate GEMMs otherwise.
+    pub(crate) fn emit_pair(
+        &self,
+        other: &Self,
+        b: &mut Gb,
+        name: &str,
+        x: ValueId,
+    ) -> (ValueId, ValueId) {
+        if !Arc::ptr_eq(&self.w, &other.w) {
+            return (
+                self.emit(b, &format!("{name}.a"), x, None),
+                other.emit(b, &format!("{name}.b"), x, None),
+            );
+        }
+        let full = b.lin_mat(&format!("{name}.fused"), x, &self.stored(), None);
+        let mut part = |tag: &str, l: &Self| b.slice(&format!("{name}.{tag}"), full, 1, l.off, l.off + l.n);
+        (part("a", self), part("b", other))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_mat(m: Mat) -> Self {
+        let (n, k) = (m.rows, m.cols);
+        Self {
+            w: Arc::new(Wt::Bf16(m)),
+            off: 0,
+            n,
+            k,
+        }
+    }
+}
+
+/// `MRope` positions (U32 `[n * 3]`) of per-token `(frame, height, width)` ids that may be
+/// negative (the image grid is centred on zero). Each axis is shifted by a constant so its
+/// minimum is 0: attention logits depend only on position differences, so a shift common to all
+/// tokens (q and k alike) leaves them unchanged.
+pub(crate) fn rope_positions(pos: &[[i32; 3]]) -> Vec<u32> {
+    let lo = [0, 1, 2].map(|a| pos.iter().map(|p| p[a]).min().unwrap_or(0).min(0));
+    pos.iter()
+        .flat_map(|p| [0, 1, 2].map(|a| (p[a] - lo[a]) as u32))
+        .collect()
 }
 
 /// diffusers `FlowMatchEulerDiscreteScheduler` as Qwen-Image configures it: resolution-dependent
