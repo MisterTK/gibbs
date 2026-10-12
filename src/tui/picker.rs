@@ -18,6 +18,7 @@ use ratatui::{
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -161,7 +162,11 @@ pub struct Picker {
     total: usize,
     /// The model the scheduler runs (drafters for it are loadable).
     active: String,
+    /// Weight headers by variant id: `None` while being read, `Some(Err)` when unreadable.
+    headers: Headers,
 }
+
+type Headers = Arc<parking_lot::Mutex<HashMap<String, Option<Result<Arc<crate::model::variant::WeightHeader>, String>>>>>;
 
 impl Picker {
     /// `hub`: where models are cached/downloaded (`hub.cache_root`). `pinned`: ids always offered.
@@ -215,6 +220,7 @@ impl Picker {
             rows: Vec::new(),
             total: 0,
             active: String::new(),
+            headers: Headers::default(),
         }
     }
 
@@ -504,6 +510,50 @@ impl Picker {
     pub fn repo_dir(&self, id: &str) -> std::path::PathBuf {
         repo_dir_path(&self.hub.cache_root, id)
     }
+
+    /// Predicted decode tok/s of variant `q` and whether it comes from its weight header: the
+    /// header is read in the background (local file, else Hub range request) the first time it is
+    /// asked for; until then, and when it cannot be read, the estimate is size × bpw (the failure
+    /// shows as `None`, like an unmeasured ceiling).
+    fn predict(&self, q: &Entry) -> Option<(f64, bool)> {
+        use crate::model::variant::{host_eff, predict_with, reencode_policy, Variant};
+        let ceiling = f64::from(self.ceiling_gbps);
+        if ceiling <= 0.0 {
+            return None;
+        }
+        let state = {
+            let mut m = self.headers.lock();
+            let known = m.get(&q.id).cloned();
+            if known.is_none() {
+                m.insert(q.id.clone(), None);
+                let (headers, hub, token, id, cached) =
+                    (self.headers.clone(), self.hub.clone(), self.hf_token.clone(), q.id.clone(), q.cached);
+                std::thread::spawn(move || {
+                    crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+                    let got = (|| {
+                        let (repo, file) = crate::model::hub::split_weight_file(&id);
+                        let file = file.ok_or("not a weights file")?;
+                        let local = cached.then(|| hub.locate_model(repo).local_dir).flatten();
+                        match local {
+                            Some(dir) => crate::model::variant::read_local_header(&dir.join(file)),
+                            None => crate::model::variant::fetch_remote_header(repo, file, token.as_deref()),
+                        }
+                    })();
+                    headers.lock().insert(id, Some(got.map(Arc::new)));
+                });
+            }
+            known.flatten()
+        };
+        let policy = reencode_policy();
+        match state {
+            Some(Ok(h)) => Some((predict_with(&h, policy, ceiling, &host_eff), true)),
+            Some(Err(_)) => None,
+            None => {
+                let fmt = detect_quant_format(Path::new(&q.id))?;
+                Some((Variant::from_size(&q.id, fmt, q.size, policy, ceiling).tok_s, false))
+            }
+        }
+    }
 }
 
 pub fn repo_dir_path(cache_root: &Path, id: &str) -> std::path::PathBuf {
@@ -513,6 +563,29 @@ pub fn repo_dir_path(cache_root: &Path, id: &str) -> std::path::PathBuf {
         true => dir.join("snapshots").join(rev.replace('/', "--")),
         false => dir,
     }
+}
+
+/// Orders variant entries best first under the persisted variant policy (S3.6). Only file size and
+/// format are known for a listing, so this predicts from size × bpw; headers are read lazily for
+/// the variant on screen ([`Picker::predict`]).
+fn sort_variants(v: &mut [Entry], total_memory: Option<u64>) {
+    use crate::model::variant::{rank_variants, reencode_policy, variant_policy, Variant};
+    let policy = reencode_policy();
+    let mut ranked: Vec<Variant> = v
+        .iter()
+        .map(|e| match detect_quant_format(Path::new(&e.id)) {
+            Some(f) => Variant::from_size(&e.id, f, e.size, policy, 1.0),
+            None => Variant {
+                name: e.id.clone(),
+                download_bytes: e.size.unwrap_or(u64::MAX),
+                resident_bytes: e.size.unwrap_or(u64::MAX),
+                tok_s: 0.0,
+                bpw: 0.0,
+            },
+        })
+        .collect();
+    rank_variants(variant_policy(), total_memory.unwrap_or(u64::MAX), &mut ranked);
+    v.sort_by_key(|e| ranked.iter().position(|r| r.name == e.id));
 }
 impl Picker {
     /// `id` left the local cache: local-only rows vanish, hub rows lose `cached`.
@@ -763,14 +836,15 @@ impl Picker {
                 .map(|m| (sz_gb * 1e9) as u64 <= m)
                 .unwrap_or(true);
             let fit_tag = if fits { "fits" } else { "no-fit" };
-            // Roofline upper bound: every decoded token streams the whole file once.
-            let pred_tok_s = if self.ceiling_gbps > 0.0 && sz_gb > 0.0 {
-                format!("{:.0}", (self.ceiling_gbps as f64 / sz_gb).min(999.0))
-            } else {
-                "?".to_string()
+            // Predicted decode speed (S3.6): from the weight header once read, `~` while it is
+            // being read (size × bpw), `?` when it cannot be read or the ceiling is unmeasured.
+            let pred_tok_s = match q_active.and_then(|q| self.predict(q)) {
+                Some((t, true)) => format!("{:.0}", t.min(999.0)),
+                Some((t, false)) => format!("~{:.0}", t.min(999.0)),
+                None => "?".to_string(),
             };
             let pred_span = Span::styled(
-                format!(" · ≤{pred_tok_s} tok/s {sz_gb:.1}GB [{fit_tag}]"),
+                format!(" · {pred_tok_s} tok/s {sz_gb:.1}GB [{fit_tag}]"),
                 th.fg(if fits { Token::Gold } else { Token::Crimson }),
             );
             quant_spans.push(pred_span);
@@ -987,7 +1061,6 @@ fn scan_local_static(
             let mut quants: Vec<Entry> = Vec::new();
             if let Some(target_dir) = &art.local_dir {
                 let local_files = crate::model::hub::list_local_files(target_dir);
-                let dev = crate::hardware::default_device();
                 for f in &local_files {
                     let p = &f.path;
                     let name = p.rsplit('/').next().unwrap_or(p).to_lowercase();
@@ -1009,13 +1082,7 @@ fn scan_local_static(
                         }
                     }
                 }
-                quants.sort_by(|a, b| {
-                    let qa = detect_quant_format(Path::new(&a.id));
-                    let qb = detect_quant_format(Path::new(&b.id));
-                    let ra = qa.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-                    let rb = qb.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-                    ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sort_variants(&mut quants, total_memory);
             }
             let via = quants.first().cloned().map(Box::new);
             local.push(Entry {
@@ -1415,16 +1482,7 @@ fn quantized_variants(
                 && e.size.zip(free_disk).map_or(true, |(s, f)| s <= f)
         })
         .collect();
-    let dev = crate::hardware::default_device();
-    candidates.sort_by(|a, b| {
-        let qa = detect_quant_format(Path::new(&a.id));
-        let qb = detect_quant_format(Path::new(&b.id));
-        let ra = qa.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-        let rb = qb.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-        ra.partial_cmp(&rb)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.size.cmp(&b.size))
-    });
+    sort_variants(&mut candidates, total);
     candidates
 }
 
@@ -1631,14 +1689,7 @@ fn parse_hub_rows(
                     })
                 })
                 .collect();
-            let dev = crate::hardware::default_device();
-            variants.sort_by(|a, b| {
-                let qa = detect_quant_format(Path::new(&a.id));
-                let qb = detect_quant_format(Path::new(&b.id));
-                let ra = qa.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-                let rb = qb.map_or(1000.0, |q| q.hardware_speed_rank(dev));
-                ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            sort_variants(&mut variants, total_memory);
             let via = variants.first().cloned().map(Box::new);
             Some(Entry {
                 id,

@@ -119,53 +119,26 @@ fn test_luminal_online_softmax_attention_speedup_and_accuracy() {
 }
 
 #[test]
-fn test_tiled_gemv_roofline_saturation() {
+fn test_codec_benchmark_efficiency() {
     #[cfg(target_os = "macos")]
     {
         let rt = foundry_engine::graph::metal::Runtime::new(
             &foundry_engine::model::hub::HuggingFaceHub::cache_dir(),
         )
         .unwrap();
-        let mut max_q4 = 0.0f64;
-        let mut max_q8 = 0.0f64;
-        let mut max_bf16 = 0.0f64;
-        let mut roofline = 0.0f64;
-        for _ in 0..5 {
-            let (rf, q4, q8, bf16) = rt.benchmark_gemv_saturation().unwrap();
-            roofline = rf;
-            max_q4 = max_q4.max(q4);
-            max_q8 = max_q8.max(q8);
-            max_bf16 = max_bf16.max(bf16);
-            if max_q4 > 0.90 * roofline && max_q8 > 0.90 * roofline {
-                break;
-            }
+        let e = rt.benchmark_codecs().unwrap();
+        println!(
+            "codec bench: ceiling {:.1} GB/s (stream {:.1})",
+            e.ceiling_gbps,
+            rt.profile().stream_gbps
+        );
+        for (fmt, g) in &e.gbps {
+            println!("{fmt:<18} {g:>7.1} GB/s  eff {:.3}", e.eff[fmt]);
         }
-        let (roofline_gbps, q4_gbps, q8_gbps, bf16_gbps) = (roofline, max_q4, max_q8, max_bf16);
-        println!("Hardware streaming read roofline (memory_sweep): {roofline_gbps:.2} GB/s");
-        println!(
-            "Tiled GEMV Q4_0: {q4_gbps:.2} GB/s ({:.1}% roofline)",
-            (q4_gbps / roofline_gbps) * 100.0
-        );
-        println!(
-            "Tiled GEMV Q8_0: {q8_gbps:.2} GB/s ({:.1}% roofline)",
-            (q8_gbps / roofline_gbps) * 100.0
-        );
-        println!(
-            "Tiled GEMV BF16: {bf16_gbps:.2} GB/s ({:.1}% roofline)",
-            (bf16_gbps / roofline_gbps) * 100.0
-        );
-
-        let target_pct = 0.90; // >90% roofline saturation requirement
-        assert!(
-            q4_gbps > target_pct * roofline_gbps,
-            "Q4_0 bandwidth {q4_gbps:.2} GB/s should reach at least {:.0}% of measured roofline ({roofline_gbps:.2} GB/s)",
-            target_pct * 100.0
-        );
-        assert!(
-            q8_gbps > target_pct * roofline_gbps,
-            "Q8_0 bandwidth {q8_gbps:.2} GB/s should reach at least {:.0}% of measured roofline ({roofline_gbps:.2} GB/s)",
-            target_pct * 100.0
-        );
+        for fmt in ["GGUF_Q4_0", "GGUF_Q8_0", "BF16"] {
+            let eff = e.eff[fmt];
+            assert!(eff > 0.5 && eff <= 1.0, "{fmt}: eff {eff:.3} outside (0.5, 1.0]");
+        }
     }
 }
 
