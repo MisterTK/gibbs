@@ -6085,13 +6085,14 @@ mod tests {
     fn unsupported_ops_bad_ids_and_missing_weights_are_errors() {
         let f = DType::F32;
         let s = Session::new(rt(), &Weights::new()).unwrap();
+        // Relu lowers at F32 only; a u32 value has no kernel.
         for op in [Op::Relu] {
             let mut g = Graph::new();
-            let x = g.input("x", vec![4], f);
-            let y = g.add("act", op, &[x], vec![4], f);
+            let x = g.input("x", vec![4], DType::U32);
+            let y = g.add("act", op, &[x], vec![4], DType::U32);
             g.output(y);
             let e = s.run(&g, vec![Tensor::F32(vec![0.0; 4])]).unwrap_err();
-            assert!(e.contains("Metal executor does not implement"), "{e}");
+            assert!(e.contains("the Metal kernels take f32"), "{e}");
         }
         let mut g = Graph::new();
         let x = g.input("x", vec![1, 2], f);

@@ -180,7 +180,8 @@ mod tests {
         let x = g.input("x", vec![2, 4], DType::F32);
         let w = g.weight("w", vec![4, 4], DType::F32);
         let lin = g.add("lin", Op::Linear, &[x, w], vec![2, 4], DType::F32);
-        let out = g.add("act", Op::Relu, &[lin], vec![2, 4], DType::F32);
+        // U32 output: Relu has no lowering at that dtype on any avenue.
+        let out = g.add("act", Op::Relu, &[lin], vec![2, 4], DType::U32);
         g.output(out);
         g
     }
