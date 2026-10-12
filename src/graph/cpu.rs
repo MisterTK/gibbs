@@ -354,7 +354,7 @@ pub fn run(
                         let mut act = vec![0.0f32; gate_act.len()];
                         if *is_geglu {
                             act.copy_from_slice(&gate_act);
-                            nn::gelu(&mut act);
+                            nn::gelu_tanh(&mut act);
                             for (o, &u) in act.iter_mut().zip(&up_act) {
                                 *o *= u;
                             }
