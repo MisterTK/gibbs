@@ -1,6 +1,6 @@
 //! Pre-quantized safetensors checkpoints: compressed-tensors (llm-compressor), NVIDIA modelopt,
 //! transformers BitNet (`quant_method: "bitnet"`), AMD Quark and vLLM `fp8` ([`quark`]), MLX
-//! ([`mlx`]) and EXL3 ([`exl3`]).
+//! ([`mlx`]), EXL3 ([`exl3`]) and bitsandbytes 4-bit ([`crate::model::repack::bnb`]).
 //!
 //! [`check`] rejects schemes we can't decode before any weight is read, [`alias_packed`] exposes packed
 //! weights under the `X.weight` names `GraphLm::from_manifest` reads, and [`dequantize`] expands one such
@@ -170,9 +170,9 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
                 )),
             }
         }
-        Some("bitsandbytes") => Some("quantization method 'bitsandbytes' is not supported".into()),
+        Some("bitsandbytes") => crate::model::repack::bnb::blocker(qc.unwrap_or(&Value::Null)),
         Some(m) => Some(format!(
-            "quantization method '{m}' is not supported (compressed-tensors, modelopt FP8/NVFP4, bitnet, quark, fp8, exl3 and glq are)"
+            "quantization method '{m}' is not supported (compressed-tensors, modelopt FP8/NVFP4, bitnet, quark, fp8, exl3, glq and bitsandbytes 4-bit are)"
         )),
     }
 }
@@ -198,6 +198,7 @@ pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weight
     let specs = m
         .tensors
         .iter()
+        .filter(|(n, _)| !crate::model::repack::bnb::is_companion(n))
         .map(|(n, t)| (n.clone(), t.shape.clone()))
         .collect();
     Weights::from_f32(specs, |n| m.extract_tensor_f32(&data, n))
@@ -208,6 +209,7 @@ pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weight
 /// one-element float `weight_scale`) their unpacked shapes. Run once on a complete manifest.
 pub fn alias_packed(m: &mut ModelManifest, data: &[u8]) -> Result<(), String> {
     glq::alias(m);
+    crate::model::repack::bnb::alias(m, data)?;
     let mut add = Vec::new();
     let mut fp4 = Vec::new();
     let mut ternary = Vec::new();
@@ -279,6 +281,9 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
         return Ok(Some(w));
     }
     if let Some(w) = mlx::dequantize(m, data, name)? {
+        return Ok(Some(w));
+    }
+    if let Some(w) = crate::model::repack::bnb::dequantize(m, data, name)? {
         return Ok(Some(w));
     }
     let Some(stem) = name.strip_suffix(".weight") else {
