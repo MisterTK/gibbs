@@ -7,7 +7,6 @@
 use crate::model::clip::{ClipTextTransformer, Tensors};
 use crate::model::dit::{
     add_gated, component_weights, norm_modulate, read_config, rms_norm, silu_of, timestep_features,
-    Lin,
 };
 use crate::model::flow;
 use crate::model::hub::HuggingFaceHub;
@@ -28,6 +27,51 @@ const EPS: f32 = 1e-6;
 const T5_LEN: usize = 256;
 const T5_EOS: u32 = 1;
 const T5_PAD: u32 = 0;
+
+mod graph_program;
+
+/// `nn.Linear` over a bf16 `[out, in]` matrix (kept here, not `dit::Lin`, so the graph program can bind
+/// the matrix and bias by name).
+struct Lin {
+    w: Mat,
+    b: Option<Vec<f32>>,
+}
+
+impl Lin {
+    fn load(w: &Weights, p: &str) -> Result<Self, String> {
+        let wt = w.mat(&format!("{p}.weight"))?;
+        let bias = format!("{p}.bias");
+        let b = if w.has(&bias) {
+            Some(w.vec_n(&bias, wt.rows)?)
+        } else {
+            None
+        };
+        Ok(Self { w: wt, b })
+    }
+
+    fn out_dim(&self) -> usize {
+        self.w.rows
+    }
+
+    fn in_dim(&self) -> usize {
+        self.w.cols
+    }
+
+    /// x [rows, in] -> [rows, out].
+    fn fwd(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let mut out = vec![0.0; rows * self.w.rows];
+        nn::matmul_bf16(
+            x,
+            self.w.data(),
+            self.b.as_deref(),
+            rows,
+            self.w.cols,
+            self.w.rows,
+            &mut out,
+        );
+        out
+    }
+}
 
 /// q/k/v (+ output) projections of one attention stream, with optional per-head QK RMSNorm.
 struct Proj {
@@ -137,6 +181,45 @@ struct Mmdit {
     blocks: Vec<Block>,
     norm_out: Lin,
     proj_out: Lin,
+    gpu: graph_program::Cache,
+}
+
+/// Latents `[C, h, w]` as `[hp*wp, C*p*p]` patch rows in conv-weight order (c, ky, kx).
+fn patchify(lat: &[f32], c: usize, h: usize, w: usize, p: usize) -> Vec<f32> {
+    let (hp, wp, pp) = (h / p, w / p, p * p);
+    let mut patches = vec![0.0f32; hp * wp * c * pp];
+    for i in 0..hp {
+        for j in 0..wp {
+            let row = &mut patches[(i * wp + j) * c * pp..][..c * pp];
+            for ch in 0..c {
+                for ky in 0..p {
+                    for kx in 0..p {
+                        row[ch * pp + ky * p + kx] = lat[(ch * h + i * p + ky) * w + j * p + kx];
+                    }
+                }
+            }
+        }
+    }
+    patches
+}
+
+/// Inverse layout of [`patchify`] for the projected rows `[hp*wp, p*p*C]` (features are (py, px, c)).
+fn unpatchify(y: &[f32], c: usize, h: usize, w: usize, p: usize) -> Vec<f32> {
+    let (hp, wp, pp) = (h / p, w / p, p * p);
+    let mut out = vec![0.0f32; c * h * w];
+    for i in 0..hp {
+        for j in 0..wp {
+            let row = &y[(i * wp + j) * c * pp..][..c * pp];
+            for py in 0..p {
+                for px in 0..p {
+                    for ch in 0..c {
+                        out[(ch * h + i * p + py) * w + j * p + px] = row[(py * p + px) * c + ch];
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Mmdit {
@@ -185,10 +268,12 @@ impl Mmdit {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let pos_embed = w.mat("pos_embed.pos_embed")?;
+        let mut pos_embed = w.mat("pos_embed.pos_embed")?;
         if pos_embed.rows * pos_embed.cols != pos_max * pos_max * d {
             return Err(format!("SD3 pos_embed is not [{pos_max}^2, {d}]"));
         }
+        // Stored `[1, pos_max^2, d]`: view it as the `[pos_max^2, d]` table the graph gathers from.
+        (pos_embed.rows, pos_embed.cols) = (pos_max * pos_max, d);
         let m = Self {
             d,
             heads,
@@ -205,6 +290,7 @@ impl Mmdit {
             blocks,
             norm_out: Lin::load(&w, "norm_out.linear")?,
             proj_out: Lin::load(&w, "proj_out")?,
+            gpu: Default::default(),
         };
         if m.patch_proj.in_dim() != in_ch * patch * patch
             || m.proj_out.out_dim() != in_ch * patch * patch
@@ -228,22 +314,7 @@ impl Mmdit {
         let (d, p, c) = (self.d, self.patch, self.in_ch);
         let (hp, wp) = (h / p, w / p);
         let n = hp * wp;
-        let pp = p * p;
-        // Patchify in conv-weight order (c, ky, kx).
-        let mut patches = vec![0.0f32; n * c * pp];
-        for i in 0..hp {
-            for j in 0..wp {
-                let row = &mut patches[(i * wp + j) * c * pp..][..c * pp];
-                for ch in 0..c {
-                    for ky in 0..p {
-                        for kx in 0..p {
-                            row[ch * pp + ky * p + kx] =
-                                lat[(ch * h + i * p + ky) * w + j * p + kx];
-                        }
-                    }
-                }
-            }
-        }
+        let patches = patchify(lat, c, h, w, p);
         let mut x = self.patch_proj.fwd(&patches, n);
         let (top, left) = ((self.pos_max - hp) / 2, (self.pos_max - wp) / 2);
         let pe = self.pos_embed.data();
@@ -321,22 +392,7 @@ impl Mmdit {
         let e = self.norm_out.fwd(&st, 1);
         let x = norm_modulate(&x, d, EPS, &e[..d], &e[d..]);
         let y = self.proj_out.fwd(&x, n);
-        // Unpatchify: features are (py, px, c).
-        let mut out = vec![0.0f32; c * h * w];
-        for i in 0..hp {
-            for j in 0..wp {
-                let row = &y[(i * wp + j) * c * pp..][..c * pp];
-                for py in 0..p {
-                    for px in 0..p {
-                        for ch in 0..c {
-                            out[(ch * h + i * p + py) * w + j * p + px] =
-                                row[(py * p + px) * c + ch];
-                        }
-                    }
-                }
-            }
-        }
-        out
+        unpatchify(&y, c, h, w, p)
     }
 }
 
@@ -532,10 +588,17 @@ impl ImageGenerator for Sd3Pipeline {
         for (i, s) in sigmas.windows(2).enumerate() {
             let start = Instant::now();
             let t = flow::timestep(s[0]);
-            let run = |c: &Cond| self.mmdit.forward(&x, h, w, t, &c.ctx, c.n_ctx, &c.pooled);
-            let mut v = run(&cond);
+            let run = |c: &Cond| -> Result<Vec<f32>, String> {
+                if crate::model::dit_graph::use_metal() {
+                    self.mmdit
+                        .forward_gpu(&x, h, w, t, &c.ctx, c.n_ctx, &c.pooled)
+                } else {
+                    Ok(self.mmdit.forward(&x, h, w, t, &c.ctx, c.n_ctx, &c.pooled))
+                }
+            };
+            let mut v = run(&cond)?;
             if let Some(u) = &uncond {
-                let vu = run(u);
+                let vu = run(u)?;
                 v.iter_mut()
                     .zip(&vu)
                     .for_each(|(c, u)| *c = u + guidance * (*c - u));
