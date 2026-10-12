@@ -23,7 +23,8 @@ pub struct Codec {
     pub msl: &'static str,
 }
 
-pub const CODEC_VERSION: u32 = 2;
+/// Bumped whenever an encoder or codec layout changes: it keys the re-encode cache.
+pub const CODEC_VERSION: u32 = 3;
 
 pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
     match format {
