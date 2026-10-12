@@ -225,16 +225,16 @@ enum Focus {
 }
 
 /// A model load running on a background thread.
-struct Load {
-    id: String,
+pub(crate) struct Load {
+    pub(crate) id: String,
     /// Console entry of this load.
-    idx: usize,
-    started: Instant,
-    stage: Arc<Mutex<&'static str>>,
-    progress: Arc<DownloadProgress>,
+    pub(crate) idx: usize,
+    pub(crate) started: Instant,
+    pub(crate) stage: Arc<Mutex<&'static str>>,
+    pub(crate) progress: Arc<DownloadProgress>,
     /// (when, bytes done) of the last rate sample, and the bytes/s since the one before.
-    sample: (Instant, u64),
-    rate: f64,
+    pub(crate) sample: (Instant, u64),
+    pub(crate) rate: f64,
 }
 
 impl Load {
