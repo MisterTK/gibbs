@@ -136,3 +136,22 @@ kernel void norm_group_f32(device const float* x [[buffer(0)]],
         for (uint j = tid; j < p.hw; j += tpg) out[cb + j] = (x[cb + j] - mean) * ga + be;
     }
 }
+
+// RmsNorm over the last dim without gamma (the gamma form is `rmsnorm_f32`).
+kernel void norm_rmsnorm_nogamma_f32(device const float* x [[buffer(0)]],
+                                     device float* out [[buffer(1)]],
+                                     constant NormParams& p [[buffer(2)]],
+                                     uint row [[threadgroup_position_in_grid]],
+                                     uint sg [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]],
+                                     uint nsg [[simdgroups_per_threadgroup]],
+                                     uint tid [[thread_position_in_threadgroup]],
+                                     uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    device const float* xr = x + (ulong)row * p.d;
+    device float* o = out + (ulong)row * p.d;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.d; i += tpg) sq += xr[i] * xr[i];
+    float scale = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
+    for (uint i = tid; i < p.d; i += tpg) o[i] = xr[i] * scale;
+}

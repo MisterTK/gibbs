@@ -398,7 +398,14 @@ pub fn run(
             }
             Op::RmsNorm { eps } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
-                let g = operand(&bound, &slots, ins, name, 1)?;
+                // Without gamma the unit weight spans the last dim.
+                let ones;
+                let g = if ins.len() > 1 {
+                    operand(&bound, &slots, ins, name, 1)?
+                } else {
+                    ones = vec![1.0f32; last_dim(0)];
+                    &ones[..]
+                };
                 let d = g.len();
                 if d == 0 || x.len() % d != 0 {
                     return Err(format!("node '{name}': RmsNorm shapes mismatch"));
@@ -1651,15 +1658,19 @@ fn slot<'a>(
         .ok_or_else(|| format!("node '{name}': operand {k} has no value"))
 }
 
-/// `(batch, hw)` of a channel-first tensor with `c` channels: channels are axis 0, else axis 1
-/// (`[N, C, ...]`); `batch` is the product of the axes before them. Shared with the Metal lowering.
+/// `(batch, hw)` of a channel-first tensor with `c` channels. A single axis of size `c` (0 or 1)
+/// is the channel axis; when both are `c`, rank 2 is `[C, HW]` (axis 0) and rank >= 3 is
+/// `[N, C, ...]` (axis 1). `batch` is the product of the axes before the channel axis.
+/// Shared with the Metal lowering.
+// ponytail: an unbatched `[C, C, w]` tensor reads as batched `[N=C, C, w]`; add a batch attribute if that matters.
 pub(crate) fn channel_layout(shape: &[usize], c: usize) -> Result<(usize, usize), String> {
-    let ax = if shape.first() == Some(&c) {
-        0
-    } else if shape.get(1) == Some(&c) {
-        1
-    } else {
-        return Err(format!("shape {shape:?} has no channel axis of size {c} at axis 0 or 1"));
+    let at0 = shape.first() == Some(&c);
+    let at1 = shape.get(1) == Some(&c);
+    let ax = match (at0, at1) {
+        (true, true) if shape.len() >= 3 => 1,
+        (true, _) => 0,
+        (false, true) => 1,
+        _ => return Err(format!("shape {shape:?} has no channel axis of size {c} at axis 0 or 1")),
     };
     Ok((shape[..ax].iter().product(), shape[ax + 1..].iter().product()))
 }

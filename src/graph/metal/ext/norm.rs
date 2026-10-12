@@ -3,10 +3,10 @@
 //! Hooks called from `ext.rs`; every function returns "not mine" for ops it does not claim.
 //!
 //! Owned: `Reduce` (every kind, any axes, keep_dims either way), `Softmax` (any axis),
-//! `GroupNorm`, `InstanceNorm` ([N, C, ...] with channels at axis 0, else axis 1), and `LayerNorm`
-//! without beta. `LayerNorm` with beta, `RmsNorm` and `L2Normalize` stay on the core arms (their
-//! ops have no further variants: `RmsNorm` is `[x, gamma]`, `L2Normalize` normalizes the whole
-//! tensor and has no axis attribute).
+//! `GroupNorm`, `InstanceNorm` (`[N, C, ...]`, see `cpu::channel_layout`), `LayerNorm` without
+//! beta and `RmsNorm` without gamma. `LayerNorm` with beta, `RmsNorm` with gamma (a `[group]`
+//! gamma already normalizes x in chunks of its length) and `L2Normalize` (whole tensor, no axis
+//! attribute) stay on the core arms.
 
 use super::{Enc, PlanOut};
 use super::super::{set_bytes, u32_of, Planned, Session, TG};
@@ -22,6 +22,7 @@ pub(super) const KERNELS: &[&str] = &[
     "norm_softmax_f32",
     "norm_layernorm_nobeta_f32",
     "norm_group_f32",
+    "norm_rmsnorm_nogamma_f32",
 ];
 
 /// Mirrors `NormReduceParams` in `norm.metal`.
@@ -44,6 +45,7 @@ pub enum Step {
     Reduce { x: ValueId, p: ReduceParams, n_out: usize },
     Softmax { x: ValueId, outer: usize, n: usize, inner: usize },
     LayerNormNoBeta { x: ValueId, g: ValueId, rows: usize, d: usize, eps: f32 },
+    RmsNormNoGamma { x: ValueId, rows: usize, d: usize, eps: f32 },
     Group { x: ValueId, g: ValueId, b: ValueId, tgs: usize, groups: usize, cg: usize, hw: usize, eps: f32 },
 }
 
@@ -57,6 +59,7 @@ pub(super) fn supports(op: &Op, dtype: DType) -> bool {
                 | Op::GroupNorm { .. }
                 | Op::InstanceNorm { .. }
                 | Op::LayerNorm { .. }
+                | Op::RmsNorm { .. }
         )
 }
 
@@ -189,6 +192,14 @@ pub(super) fn plan(
             u32_of(d)?;
             Ok((Step::LayerNormNoBeta { x, g: gm, rows: xl / d, d, eps: *eps }, xl))
         }
+        // The gamma form stays on the core arm (gamma `[group]` already normalizes x in chunks).
+        Op::RmsNorm { eps } if node.inputs.len() == 1 => {
+            let x = arg(0)?;
+            let xl = n_of(x)?;
+            let d = g.value(x).shape.last().copied().unwrap_or(0);
+            u32_of(d)?;
+            Ok((Step::RmsNormNoGamma { x, rows: xl / d.max(1), d, eps: *eps }, xl))
+        }
         Op::GroupNorm { .. } | Op::InstanceNorm { .. } => {
             let (x, gm, b) = (arg(0)?, arg(1)?, arg(2)?);
             let (xl, c) = (n_of(x)?, n_of(gm)?);
@@ -223,7 +234,7 @@ pub(super) fn plan(
 /// Every value the step reads (drives arena liveness and barriers).
 pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match *st {
-        Step::Reduce { x, .. } | Step::Softmax { x, .. } => vec![x],
+        Step::Reduce { x, .. } | Step::Softmax { x, .. } | Step::RmsNormNoGamma { x, .. } => vec![x],
         Step::LayerNormNoBeta { x, g, .. } => vec![x, g],
         Step::Group { x, g, b, .. } => vec![x, g, b],
     }
@@ -258,6 +269,13 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             e.bind(1, g);
             e.bind(2, s.out);
             set_bytes(e.enc, 3, &[u32_of(d)?, eps.to_bits()]);
+            e.enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), tg);
+        }
+        Step::RmsNormNoGamma { x, rows, d, eps } => {
+            e.enc.set_compute_pipeline_state(sess.rt.pso("norm_rmsnorm_nogamma_f32")?);
+            e.bind(0, x);
+            e.bind(1, s.out);
+            set_bytes(e.enc, 2, &[u32_of(d)?, eps.to_bits()]);
             e.enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), tg);
         }
         Step::Group { x, g, b, tgs, groups, cg, hw, eps } => {
@@ -426,6 +444,65 @@ mod tests {
                 let e = rel_err(&want, &got);
                 assert!(e < 1e-4, "{shape:?} c {c} groups {groups} instance {instance}: {e}");
             }
+        }
+    }
+
+    /// `[N, C, H, W]` with N == C: expected values from a naive loop written here, not from the CPU executor.
+    #[test]
+    fn group_norm_n_equals_c_matches_naive_nchw() {
+        let (n, c, hw) = (4usize, 4usize, 64usize);
+        let xs: Vec<f32> = rand(n * c * hw, 21).iter().map(|v| v * 2.0 + 0.3).collect();
+        let (ga, be) = (rand(c, 22), rand(c, 23));
+        for groups in [1usize, 2, 4] {
+            let cg = c / groups;
+            let mut want = vec![0.0f32; xs.len()];
+            for ni in 0..n {
+                for gi in 0..groups {
+                    let idx = |ci: usize, j: usize| ((ni * c) + gi * cg + ci) * hw + j;
+                    let vals: Vec<f64> = (0..cg).flat_map(|ci| (0..hw).map(move |j| (ci, j))).map(|(ci, j)| xs[idx(ci, j)] as f64).collect();
+                    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+                    let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
+                    for ci in 0..cg {
+                        for j in 0..hw {
+                            let ch = gi * cg + ci;
+                            want[idx(ci, j)] = ((xs[idx(ci, j)] as f64 - mean) / (var + 1e-5).sqrt() * ga[ch] as f64 + be[ch] as f64) as f32;
+                        }
+                    }
+                }
+            }
+            let mut g = Graph::new();
+            let x = g.input("x", vec![n, c, 8, 8], F);
+            let gm = g.weight("g", vec![c], F);
+            let b = g.weight("b", vec![c], F);
+            let y = g.add("n", Op::GroupNorm { groups, eps: 1e-5 }, &[x, gm, b], vec![n, c, 8, 8], F);
+            g.output(y);
+            let mut w = Weights::new();
+            w.insert("g", Tensor::F32(ga.clone()));
+            w.insert("b", Tensor::F32(be.clone()));
+            let (cpu, got) = run1(&g, &w, &xs);
+            assert!(rel_err(&want, &got) < 1e-4, "metal groups {groups}");
+            assert!(rel_err(&want, &cpu) < 1e-4, "cpu groups {groups}");
+        }
+    }
+
+    #[test]
+    fn rmsnorm_without_gamma_and_group_gamma_match_cpu() {
+        // (x shape, gamma len or 0 for none)
+        for (shape, glen) in [(vec![3usize, 37], 0usize), (vec![5, 129], 0), (vec![1, 1], 0), (vec![2, 3, 8], 0), (vec![5, 4 * 16], 16), (vec![3, 6 * 7], 7), (vec![2, 37], 37)] {
+            let mut g = Graph::new();
+            let x = g.input("x", shape.clone(), F);
+            let mut ins = vec![x];
+            let mut w = Weights::new();
+            if glen > 0 {
+                ins.push(g.weight("g", vec![glen], F));
+                w.insert("g", Tensor::F32(rand(glen, 8).iter().map(|v| v + 1.3).collect()));
+            }
+            let y = g.add("rms", Op::RmsNorm { eps: 1e-6 }, &ins, shape.clone(), F);
+            g.output(y);
+            let n: usize = shape.iter().product();
+            let (want, got) = run1(&g, &w, &rand(n, 12));
+            let e = rel_err(&want, &got);
+            assert!(e < 1e-4, "{shape:?} gamma {glen}: {e}");
         }
     }
 }
