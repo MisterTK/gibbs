@@ -68,6 +68,7 @@ impl DecoderBackbone for Gemma4Seq {
         self.text.hidden
     }
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("decoder::last_hidden");
         let h = self.text.hidden;
         let mut x = vec![0.0f32; ids.len() * h];
         for (row, &id) in x.chunks_exact_mut(h).zip(ids) {

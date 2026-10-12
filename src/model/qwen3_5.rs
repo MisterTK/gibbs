@@ -204,6 +204,7 @@ impl DecoderBackbone for Dense {
     }
 
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("decoder::last_hidden");
         let d = self.text.hidden();
         let mut h = vec![0.0f32; ids.len() * d];
         for (&t, row) in ids.iter().zip(h.chunks_exact_mut(d)) {

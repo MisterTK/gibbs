@@ -227,7 +227,13 @@ pub(crate) mod tests {
                     .map(|l| score[l * h..(l + 1) * h].iter().zip(&hid).map(|(a, b)| a * b).sum())
                     .collect()
             };
+            let before = crate::hardware::cpu_compute::entered();
             let got = llm.score_gpu(ids).unwrap();
+            assert_eq!(
+                crate::hardware::cpu_compute::entered(),
+                before,
+                "{ids:?}: the GPU score program entered a CPU compute site"
+            );
             assert_eq!(got.len(), labels);
             assert!(want.iter().any(|v| v.abs() > 1e-2), "{ids:?}: trivial reference {want:?}");
             let err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);

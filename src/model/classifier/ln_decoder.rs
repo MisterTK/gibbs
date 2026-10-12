@@ -226,6 +226,7 @@ impl DecoderBackbone for LnDecoder {
         self.project_out.as_ref().map_or(self.h, |p| p.out_f)
     }
     fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        crate::hardware::cpu_compute::enter("decoder::last_hidden");
         let x = self.blocks(ids)?;
         let mut last = x[x.len() - self.h..].to_vec();
         if let Some((g, b)) = &self.final_ln {
