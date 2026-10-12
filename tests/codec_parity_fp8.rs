@@ -17,11 +17,11 @@ impl Lcg {
     }
 }
 
-/// A random finite f32 scale with exponent field 20..=254, so every `byte * scale` is a normal f32
-/// or overflows to inf (identically on both sides). Apple GPUs flush f32-subnormal results to zero
-/// (observed: -6.35e-40 on the CPU, -0.0 on the GPU); real FP8 scales are many orders above that.
+/// A random finite f32 scale in `repack`'s domain: exponent field 10..=254 (|s| >= 2^-117), so every
+/// `byte * scale` is a normal f32 or overflows to inf (identically on both sides). Smaller scales are
+/// never emitted because Apple GPUs flush f32-subnormal results (CPU -6.35e-40 vs GPU -0.0).
 fn rand_f32(r: &mut Lcg) -> f32 {
-    let exp = 20 + (r.next() % 235) as u32;
+    let exp = 10 + (r.next() % 245) as u32;
     f32::from_bits(((r.next() as u32 & 1) << 31) | (exp << 23) | (r.next() as u32 & 0x7F_FFFF))
 }
 
