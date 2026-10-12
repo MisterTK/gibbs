@@ -100,10 +100,13 @@ fn cpu_free_matrix() {
             .collect();
         let status = family_status(f);
         // (a) a family is `Gpu` exactly when none of its required ops lacks a lowering; a gate whose
-        // reason starts with `numerics:` may hold a family back although every op lowers.
+        // reason starts with `numerics:` (parity unresolved) or `builder:` (every op lowers but the
+        // Metal program is not written yet) may hold a family back although every op lowers.
         let numerics_gate = matches!(status, Status::Gated(r) if r.starts_with("numerics:"));
+        let builder_gate = matches!(status, Status::Gated(r) if r.starts_with("builder:"));
         assert!(
-            gaps.is_empty() == matches!(status, Status::Gpu) || (gaps.is_empty() && numerics_gate),
+            gaps.is_empty() == matches!(status, Status::Gpu)
+                || (gaps.is_empty() && (numerics_gate || builder_gate)),
             "{f:?}: status {status:?} disagrees with unlowered ops {gaps:?}"
         );
         match status {

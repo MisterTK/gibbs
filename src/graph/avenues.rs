@@ -287,7 +287,7 @@ pub fn family_status(f: Family) -> Status {
         VideoModelScope => {
             Status::Gated("UNet3D runs on the CPU; Conv3d, Concat, Upsample unlowered")
         }
-        Audio => Status::Gated("conformer audio runs on the CPU; Conv1d unlowered"),
+        Audio => Status::Gated("builder: conformer audio forward is host Rust; no Metal program yet"),
     }
 }
 
