@@ -2884,15 +2884,14 @@ mod tests {
             Some("text-to-video model, architecture 'wan' (not supported)")
         );
 
-        // 5. BitsAndBytes refusal
-        let bnb_cfg = serde_json::json!({
-            "quantization_config": {
-                "quant_method": "bitsandbytes"
-            }
-        });
-        assert_eq!(
-            crate::model::prequant::scheme_blocker(&bnb_cfg, None),
-            Some("quantization method 'bitsandbytes' is not supported".into())
-        );
+        // 5. bitsandbytes: 4-bit decodes, LLM.int8 is refused
+        let bnb = |q: serde_json::Value| {
+            crate::model::prequant::scheme_blocker(
+                &serde_json::json!({ "quantization_config": q }),
+                None,
+            )
+        };
+        assert_eq!(bnb(serde_json::json!({ "quant_method": "bitsandbytes" })), None);
+        assert!(bnb(serde_json::json!({ "quant_method": "bitsandbytes", "load_in_8bit": true })).is_some());
     }
 }
