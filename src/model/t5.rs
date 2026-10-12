@@ -1286,8 +1286,45 @@ mod tests {
     /// Native CPU forward vs the Metal programs on a tiny random T5, teacher-forced on the CPU's
     /// greedy tokens: logits agree to f32 rounding at every step, including a rewind.
     fn parity(gated: bool, per_block_rel: bool, tied: bool, src_len: usize) {
-        let cpu = tiny(7, gated, per_block_rel, tied);
+        parity_with(gated, per_block_rel, tied, src_len, false);
+    }
+
+    /// Rounds every matrix of `m` to bf16 (`Lin::Bf16`), as a bf16 safetensors checkpoint loads.
+    fn to_bf16(m: &mut T5) {
+        fn cv(l: &mut Lin) {
+            if let Lin::F32 { w, rows, cols } = l {
+                let spec = vec![("w".to_string(), vec![*rows, *cols])];
+                let ws = Weights::from_f32(spec, |_| Ok(w.clone())).unwrap();
+                *l = Lin::Bf16(ws.mat("w").unwrap());
+            }
+        }
+        cv(&mut m.enc.embed);
+        if let Some(h) = &mut m.head {
+            cv(h);
+        }
+        let blocks = m.enc.stack.blocks.iter_mut().chain(m.dec.blocks.iter_mut());
+        for b in blocks {
+            for l in [&mut b.attn.q, &mut b.attn.k, &mut b.attn.v, &mut b.attn.o, &mut b.wi, &mut b.wo] {
+                cv(l);
+            }
+            if let Some(x) = &mut b.cross {
+                for l in [&mut x.q, &mut x.k, &mut x.v, &mut x.o] {
+                    cv(l);
+                }
+            }
+            if let Some(l) = &mut b.wi1 {
+                cv(l);
+            }
+        }
+    }
+
+    fn parity_with(gated: bool, per_block_rel: bool, tied: bool, src_len: usize, bf16: bool) {
+        let mut cpu = tiny(7, gated, per_block_rel, tied);
         let mut gpu = tiny(7, gated, per_block_rel, tied);
+        if bf16 {
+            to_bf16(&mut cpu);
+            to_bf16(&mut gpu);
+        }
         gpu.gpu = Some(gpu.build_gpu().expect("tiny T5 compiles on Metal"));
         let src: Vec<u32> = (0..src_len as u32).map(|i| 2 + (i * 7) % 30).collect();
         let _cpu_ok = crate::hardware::cpu_compute::allow();
@@ -1325,6 +1362,14 @@ mod tests {
     #[test]
     fn metal_matches_cpu_long_source() {
         parity(true, false, true, 70);
+    }
+
+    /// bf16 checkpoints (flan-t5, mT5, MADLAD) run bf16 Linear -> GeGlu and a tied bf16 head; the
+    /// f32 cases above cannot reach those kernels.
+    #[test]
+    fn metal_matches_cpu_bf16_gated() {
+        parity_with(true, false, true, 20, true);
+        parity_with(true, true, false, 20, true);
     }
 
     #[test]
