@@ -76,6 +76,24 @@ impl Clipped {
         })
     }
 
+    /// The layer as graph nodes: input clamp, matmul, output clamp (each only when the checkpoint
+    /// set it). `x` is `[rows, cols]`.
+    pub fn add_to(&self, b: &mut crate::model::vision_graph::Gb, name: &str, x: crate::graph::ValueId, rows: usize) -> crate::graph::ValueId {
+        use crate::graph::UnaryKind;
+        let clamp = |b: &mut crate::model::vision_graph::Gb, tag: &str, v: crate::graph::ValueId, lo: f32, hi: f32, width: usize| {
+            if lo == f32::NEG_INFINITY && hi == f32::INFINITY {
+                return v;
+            }
+            let kind = UnaryKind::Clamp(lo.max(f32::MIN), hi.min(f32::MAX));
+            b.unary(&format!("{name}.{tag}"), kind, v, vec![rows, width])
+        };
+        let [imin, imax, omin, omax] = self.bounds;
+        let x = clamp(b, "in_clamp", x, imin, imax, self.w.cols);
+        let w = b.mat(&format!("{name}.weight"), &self.w);
+        let y = b.linear(name, x, w, None, rows, self.w.rows);
+        clamp(b, "out_clamp", y, omin, omax, self.w.rows)
+    }
+
     pub fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let [imin, imax, omin, omax] = self.bounds;
         let clamped: Vec<f32>;
