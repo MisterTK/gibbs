@@ -49,7 +49,13 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::RelPosBias { .. }
         | Op::StateReorder
         | Op::Megakernel(_) => true,
-        Op::Upsample { mode, .. } => matches!(mode, crate::graph::UpsampleMode::Nearest),
+        Op::Reshape { .. }
+        | Op::Squeeze { .. }
+        | Op::Unsqueeze { .. }
+        | Op::Transpose { .. }
+        | Op::Concat { .. }
+        | Op::Tile { .. }
+        | Op::Upsample { .. } => true,
         Op::Attention {
             kv_heads,
             heads,
@@ -1242,16 +1248,15 @@ pub fn run(
                 } else {
                     1
                 };
-                let mut up_idx = 0;
                 for o in 0..outer.max(1) {
-                    for &idx in indices {
+                    for (j, &idx) in indices.iter().enumerate() {
                         let i = idx as usize;
+                        let up_idx = (o * indices.len() + j) * inner;
                         if i < dim_size && up_idx + inner <= updates.len() {
                             let start = o * dim_size * inner + i * inner;
                             if start + inner <= base.len() {
                                 base[start..start + inner]
                                     .copy_from_slice(&updates[up_idx..up_idx + inner]);
-                                up_idx += inner;
                             }
                         }
                     }
@@ -1260,41 +1265,7 @@ pub fn run(
             }
             Op::Pad { padding, value } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
-                let shape = &graph.value(ins[0]).shape;
-                if shape.len() >= 2 && padding.len() == 4 {
-                    let (h, w) = (shape[shape.len() - 2], shape[shape.len() - 1]);
-                    let (top, bottom, left, right) =
-                        (padding[0], padding[1], padding[2], padding[3]);
-                    let (out_h, out_w) = (h + top + bottom, w + left + right);
-                    let c = x.len() / (h * w).max(1);
-                    let mut out = vec![*value; c * out_h * out_w];
-                    for ch in 0..c {
-                        for r in 0..h {
-                            for col in 0..w {
-                                out[ch * out_h * out_w + (r + top) * out_w + (col + left)] =
-                                    x[ch * h * w + r * w + col];
-                            }
-                        }
-                    }
-                    out
-                } else if padding.len() == 2 && !shape.is_empty() {
-                    let (left, right) = (padding[0], padding[1]);
-                    let l = shape[shape.len() - 1];
-                    let c = x.len() / l.max(1);
-                    let out_l = l + left + right;
-                    let mut out = vec![*value; c * out_l];
-                    for ch in 0..c {
-                        for j in 0..l {
-                            out[ch * out_l + j + left] = x[ch * l + j];
-                        }
-                    }
-                    out
-                } else {
-                    return Err(format!(
-                        "node '{name}': Pad with shape {shape:?} and padding {:?} not supported",
-                        padding
-                    ));
-                }
+                pad_cpu(x, &graph.value(ins[0]).shape, padding, *value, name)?
             }
             Op::AvgPool2d { kernel, stride } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
@@ -1331,40 +1302,12 @@ pub fn run(
                 }
                 out
             }
-            Op::Upsample { scale, mode } => match mode {
-                super::UpsampleMode::Nearest => {
-                    let x = operand(&bound, &slots, ins, name, 0)?;
-                    let shape = &graph.value(ins[0]).shape;
-                    let (c, h, w) = if shape.len() >= 3 {
-                        (
-                            shape[shape.len() - 3],
-                            shape[shape.len() - 2],
-                            shape[shape.len() - 1],
-                        )
-                    } else {
-                        (1, 1, x.len())
-                    };
-                    let s = *scale;
-                    let (out_h, out_w) = (h * s, w * s);
-                    let mut out = vec![0.0f32; c * out_h * out_w];
-                    for ch in 0..c {
-                        for oh in 0..out_h {
-                            for ow in 0..out_w {
-                                let ih = (oh / s).min(h.saturating_sub(1));
-                                let iw = (ow / s).min(w.saturating_sub(1));
-                                out[ch * out_h * out_w + oh * out_w + ow] =
-                                    x[ch * h * w + ih * w + iw];
-                            }
-                        }
-                    }
-                    out
-                }
-                other => {
-                    return Err(format!(
-                        "node '{name}': CPU Upsample mode {other:?} is not implemented yet"
-                    ))
-                }
-            },
+            Op::Upsample { scale, mode } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                let (inp, outp) = (&graph.value(ins[0]).shape, &graph.value(node.outputs[0]).shape);
+                let nsp = upsample_nsp(inp, outp, *scale).map_err(|e| format!("node '{name}': {e}"))?;
+                upsample_cpu(x, inp, *scale, *mode, nsp)
+            }
             Op::Conv3d {
                 stride,
                 padding: p,
@@ -1519,6 +1462,31 @@ pub fn run(
                     *groups,
                 ),
             )?,
+            Op::Reshape { .. } | Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                if x.len() != graph.value(node.outputs[0]).shape.iter().product::<usize>() {
+                    return Err(format!("node '{name}': {} changes the element count", node.op.name()));
+                }
+                x.to_vec()
+            }
+            Op::Transpose { perm } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                transpose_cpu(x, &graph.value(ins[0]).shape, perm, name)?
+            }
+            Op::Tile { reps } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                tile_cpu(x, &graph.value(ins[0]).shape, reps)
+            }
+            Op::Concat { axis } => {
+                let mut parts = Vec::with_capacity(ins.len());
+                for k in 0..ins.len() {
+                    parts.push((
+                        operand(&bound, &slots, ins, name, k)?,
+                        graph.value(ins[k]).shape.as_slice(),
+                    ));
+                }
+                concat_cpu(&parts, *axis, name)?
+            }
             op => {
                 return Err(format!(
                     "CPU executor does not implement {} (node '{}')",
@@ -1669,6 +1637,202 @@ fn operand_u32<'a>(
         Tensor::U32(v) => Ok(v),
         _ => Err(format!("node '{name}': operand {k} must be u32")),
     }
+}
+
+// ---- data-movement references (Transpose, Concat, Tile, Pad, Upsample) ----
+
+fn dense_strides(shape: &[usize]) -> Vec<usize> {
+    let mut st = vec![1; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        st[d] = st[d + 1] * shape[d + 1];
+    }
+    st
+}
+
+fn norm_axis(axis: isize, rank: usize, name: &str) -> Result<usize, String> {
+    let a = if axis < 0 { axis + rank as isize } else { axis };
+    if a < 0 || a as usize >= rank {
+        return Err(format!("node '{name}': axis {axis} out of range for rank {rank}"));
+    }
+    Ok(a as usize)
+}
+
+/// Visits every multi-index of `dims` in row-major order.
+fn for_each_index(dims: &[usize], mut f: impl FnMut(&[usize])) {
+    if dims.iter().any(|&d| d == 0) {
+        return;
+    }
+    let mut idx = vec![0usize; dims.len()];
+    loop {
+        f(&idx);
+        let mut d = dims.len();
+        loop {
+            if d == 0 {
+                return;
+            }
+            d -= 1;
+            idx[d] += 1;
+            if idx[d] < dims[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
+fn transpose_cpu(x: &[f32], shape: &[usize], perm: &[usize], name: &str) -> Result<Vec<f32>, String> {
+    let r = shape.len();
+    let mut seen = vec![false; r];
+    for &p in perm {
+        if p >= r || seen[p] {
+            return Err(format!("node '{name}': {perm:?} is not a permutation of rank {r}"));
+        }
+        seen[p] = true;
+    }
+    if perm.len() != r {
+        return Err(format!("node '{name}': {perm:?} is not a permutation of rank {r}"));
+    }
+    let in_st = dense_strides(shape);
+    let odims: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
+    let mut out = Vec::with_capacity(x.len());
+    for_each_index(&odims, |idx| {
+        out.push(x[idx.iter().zip(perm).map(|(&i, &p)| i * in_st[p]).sum::<usize>()]);
+    });
+    Ok(out)
+}
+
+fn tile_cpu(x: &[f32], shape: &[usize], reps: &[usize]) -> Vec<f32> {
+    let r = shape.len().max(reps.len());
+    let pad = |v: &[usize]| -> Vec<usize> {
+        std::iter::repeat_n(1, r - v.len()).chain(v.iter().copied()).collect()
+    };
+    let (ish, rp) = (pad(shape), pad(reps));
+    let odims: Vec<usize> = ish.iter().zip(&rp).map(|(a, b)| a * b).collect();
+    let in_st = dense_strides(&ish);
+    let mut out = Vec::with_capacity(odims.iter().product());
+    for_each_index(&odims, |idx| {
+        out.push(x[(0..r).map(|d| (idx[d] % ish[d]) * in_st[d]).sum::<usize>()]);
+    });
+    out
+}
+
+fn concat_cpu(parts: &[(&[f32], &[usize])], axis: isize, name: &str) -> Result<Vec<f32>, String> {
+    let rank = parts.first().map_or(0, |p| p.1.len());
+    let ax = norm_axis(axis, rank, name)?;
+    for (_, sh) in parts {
+        if sh.len() != rank || (0..rank).any(|d| d != ax && sh[d] != parts[0].1[d]) {
+            return Err(format!("node '{name}': concat operands disagree off axis {ax}"));
+        }
+    }
+    let outer: usize = parts[0].1[..ax].iter().product();
+    let inner: usize = parts[0].1[ax + 1..].iter().product();
+    let mut out = Vec::new();
+    for o in 0..outer {
+        for (x, sh) in parts {
+            let chunk = sh[ax] * inner;
+            out.extend_from_slice(&x[o * chunk..(o + 1) * chunk]);
+        }
+    }
+    Ok(out)
+}
+
+/// `padding` holds `(before, after)` pairs for the last `padding.len() / 2` dims, outermost first.
+fn pad_cpu(x: &[f32], shape: &[usize], padding: &[usize], value: f32, name: &str) -> Result<Vec<f32>, String> {
+    let (r, k) = (shape.len(), padding.len() / 2);
+    if padding.len() % 2 != 0 || k > r {
+        return Err(format!("node '{name}': Pad {padding:?} does not fit shape {shape:?}"));
+    }
+    let before = |d: usize| if d + k >= r { padding[2 * (d + k - r)] } else { 0 };
+    let after = |d: usize| if d + k >= r { padding[2 * (d + k - r) + 1] } else { 0 };
+    let odims: Vec<usize> = (0..r).map(|d| shape[d] + before(d) + after(d)).collect();
+    let out_st = dense_strides(&odims);
+    let mut out = vec![value; odims.iter().product()];
+    let mut i = 0;
+    for_each_index(shape, |idx| {
+        out[(0..r).map(|d| (idx[d] + before(d)) * out_st[d]).sum::<usize>()] = x[i];
+        i += 1;
+    });
+    Ok(out)
+}
+
+/// Number of trailing spatial dims (2 or 3) an `Upsample` scales, from the declared shapes:
+/// 3 only when the third-from-last dim also grows by `scale`.
+pub(crate) fn upsample_nsp(inp: &[usize], out: &[usize], scale: usize) -> Result<usize, String> {
+    let r = inp.len();
+    if r < 2 || out.len() != r || scale == 0 {
+        return Err(format!("Upsample {inp:?} -> {out:?} by {scale} is not a spatial resize"));
+    }
+    let nsp = if r >= 3 && scale > 1 && out[r - 3] == inp[r - 3] * scale { 3 } else { 2 };
+    for d in 0..r {
+        let want = if d + nsp >= r { inp[d] * scale } else { inp[d] };
+        if out[d] != want {
+            return Err(format!("Upsample {inp:?} -> {out:?} by {scale}: dim {d} should be {want}"));
+        }
+    }
+    Ok(nsp)
+}
+
+/// Source taps `(index, weight)` of output coordinate `o` along one axis of size `n`
+/// (half-pixel centres, `align_corners = false`, border clamp).
+fn upsample_taps(o: usize, n: usize, scale: usize, mode: super::UpsampleMode) -> Vec<(usize, f32)> {
+    use super::UpsampleMode::*;
+    let src = (o as f32 + 0.5) / scale as f32 - 0.5;
+    match mode {
+        Nearest => vec![((o / scale).min(n - 1), 1.0)],
+        Bilinear => {
+            let src = src.max(0.0);
+            let i0 = src.floor();
+            let l = src - i0;
+            let i0 = (i0 as usize).min(n - 1);
+            vec![(i0, 1.0 - l), ((i0 + 1).min(n - 1), l)]
+        }
+        Bicubic => {
+            const A: f32 = -0.75;
+            let near = |x: f32| ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
+            let far = |x: f32| ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A;
+            let i0 = src.floor();
+            let t = src - i0;
+            let w = [far(t + 1.0), near(t), near(1.0 - t), far(2.0 - t)];
+            (0..4)
+                .map(|k| ((i0 as i64 + k as i64 - 1).clamp(0, n as i64 - 1) as usize, w[k]))
+                .collect()
+        }
+    }
+}
+
+fn upsample_cpu(x: &[f32], shape: &[usize], scale: usize, mode: super::UpsampleMode, nsp: usize) -> Vec<f32> {
+    let r = shape.len();
+    let lead: usize = shape[..r - nsp].iter().product();
+    let (d, h, w) = if nsp == 3 {
+        (shape[r - 3], shape[r - 2], shape[r - 1])
+    } else {
+        (1, shape[r - 2], shape[r - 1])
+    };
+    let sd = if nsp == 3 { scale } else { 1 };
+    let (od, oh, ow) = (d * sd, h * scale, w * scale);
+    let mut out = Vec::with_capacity(lead * od * oh * ow);
+    for l in 0..lead {
+        let plane = &x[l * d * h * w..];
+        for z in 0..od {
+            let tz = upsample_taps(z, d, sd, mode);
+            for y in 0..oh {
+                let ty = upsample_taps(y, h, scale, mode);
+                for xx in 0..ow {
+                    let tx = upsample_taps(xx, w, scale, mode);
+                    let mut acc = 0.0f32;
+                    for &(iz, wz) in &tz {
+                        for &(iy, wy) in &ty {
+                            for &(ix, wx) in &tx {
+                                acc += wz * wy * wx * plane[(iz * h + iy) * w + ix];
+                            }
+                        }
+                    }
+                    out.push(acc);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn dispatch_linear(
