@@ -3095,9 +3095,15 @@ impl Session {
                 } else {
                     1
                 };
+                // Every simdgroup of a split threadgroup writes its own partial for the merge.
+                let n_parts = if n_splits > 1 {
+                    n_splits * (TG4 as usize / 32)
+                } else {
+                    1
+                };
                 let mut scratch_guard = self.attn_scratch.lock();
                 if n_splits > 1 {
-                    let bytes = heads * n_splits * (head_dim + 2) * 4;
+                    let bytes = heads * n_parts * (head_dim + 2) * 4;
                     if scratch_guard
                         .as_ref()
                         .map_or(true, |b| (b.length() as usize) < bytes)
@@ -3152,7 +3158,7 @@ impl Session {
                     start_pos,
                     m: m as u32,
                     has_vis: vis.is_some() as u32,
-                    n_splits: n_splits as u32,
+                    n_splits: n_parts as u32,
                     chunk: n_keys.div_ceil(n_splits) as u32,
                 };
                 set_bytes(enc, 4, &p);
