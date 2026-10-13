@@ -1020,6 +1020,28 @@ mod tests {
         assert!(e.contains("routes to expert 2"), "{e}");
     }
 
+    /// A routed id past the bank writes zeros on Metal, never stale arena bytes.
+    #[test]
+    fn moe_linear_metal_zeroes_out_of_range_slots() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 8], DType::F32);
+        let b = g.weight("bank", vec![8, 8], DType::F32);
+        let ids = g.input("ids", vec![1, 2], DType::U32);
+        let y = g.add("moe", Op::MoeLinear { experts: 2, top_k: 2 }, &[x, b, ids], vec![2, 4], DType::F32);
+        g.output(y);
+        let mut w = Weights::new();
+        w.insert("bank", Tensor::F32(rand(64, 1)));
+        let got = Session::new(rt(), &w)
+            .unwrap()
+            .run(&g, vec![Tensor::F32(rand(8, 2)), Tensor::U32(vec![1, 7])])
+            .unwrap()
+            .remove(0)
+            .into_f32()
+            .unwrap();
+        assert!(got[..4].iter().any(|v| *v != 0.0));
+        assert_eq!(&got[4..], &[0.0; 4]);
+    }
+
     // ---- guards on core kernels ----
 
     /// Two chained steps through persistent state, CPU vs Metal; returns the second step's outputs.
