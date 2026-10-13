@@ -56,3 +56,8 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
   removed one at a time, TQ2_0 262144x1536 gen r2): base 114 GB/s, no x loads 120, no decode 194, neither 212; Q8_0 is 288 in all four.
   Conclusion: the low-bit generated GEMVs are bound by per-weight decode work (byte loads + shift/mask/convert per weight), not by x
   traffic or bytes in flight. The remaining lever is a cheaper decode (planar repack + 16-byte aligned loads + SWAR; L5), not tiling.
+
+## Iteration 2 (keep): L14 split-K decode attention
+- Arithmetic: decode attention at m=1 launched `heads` (8) threadgroups on a 20-core GPU, each scanning all keys serially (~2.5 ms per layer at 2k keys, 90 ms of the 102 ms token). Slicing the keys across up to 32 threadgroups per head (64 keys/slice) plus a merge kernel puts 100-250 threadgroups in flight. Expected ctx4k 102 -> ~20 ms; log-geomean +0.28*(1 - 20/102 ratio...) ~ +7 pp. Actual +8.83 pp (noise 0.14).
+- Design: generic op-level change in `CachedAttention` lowering (m == 1, no `visible_end`, >= 128 visible keys after the sliding window). Fallback: the unsplit kernel. Numerics: partial (max, sum-exp, weighted V) per slice, merged with the usual online-softmax rescale; Metal vs CPU executor test over full / window 300 / window 90 with soft cap and GQA (`split_decode_attention_matches_cpu`).
+- Guard: lib tests, cpu_free_matrix/op_coverage/codec_parity/gemma4_tests, bench-parity 5 compared (min cos 1.00000), generic_guard: pass.
