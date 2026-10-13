@@ -403,7 +403,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 56] = [
+const BASE_KERNELS: [&str; 58] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -421,6 +421,8 @@ const BASE_KERNELS: [&str; 56] = [
     "rmsnorm_f32",
     "rmsnorm_residual_f32",
     "graph_rope_f32",
+    "rmsnorm_batch_f32",
+    "rope_batch_f32",
     "swiglu_f32",
     "geglu_f32",
     "gemv_q4_0",
@@ -2069,7 +2071,8 @@ impl Session {
 
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
-        let (mut steps, aliases) = plan(graph)?;
+        let (steps, aliases) = plan(graph)?;
+        let mut steps = batch_horizontal(steps, &aliases);
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
                 eprintln!(
@@ -3010,6 +3013,85 @@ impl Session {
                 set_bytes(enc, 4, &p);
                 grid1(n_seq * n_heads * head_dim);
             }
+            Step::RmsNormBatch { ref segs } => {
+                enc.set_compute_pipeline_state(rt.pso("rmsnorm_batch_f32")?);
+                #[repr(C)]
+                #[derive(Default)]
+                struct RmsNormBatchParams {
+                    rows: [u32; 4],
+                    d: [u32; 4],
+                    eps: [f32; 4],
+                    nseg: u32,
+                }
+                let mut p = RmsNormBatchParams {
+                    nseg: segs.len() as u32,
+                    ..Default::default()
+                };
+                let mut total = 0usize;
+                for i in 0..4 {
+                    // Unused slots rebind segment 0 (never read: `nseg` bounds the row search).
+                    let sg = segs.get(i).unwrap_or(&segs[0]);
+                    bind(i as u64 * 3, sg.x);
+                    bind(i as u64 * 3 + 1, sg.g);
+                    bind(i as u64 * 3 + 2, sg.out);
+                    if let Some(sg) = segs.get(i) {
+                        p.rows[i] = u32_of(sg.rows)?;
+                        p.d[i] = u32_of(sg.d)?;
+                        p.eps[i] = sg.eps;
+                        total += sg.rows;
+                    }
+                }
+                set_bytes(enc, 12, &p);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(total as u64, 1, 1),
+                    MTLSize::new(TG, 1, 1),
+                );
+            }
+            Step::RopeBatch {
+                pos,
+                inv_freq,
+                n_seq,
+                head_dim,
+                rotary_dim,
+                pair_stride,
+                mscale,
+                ref segs,
+            } => {
+                enc.set_compute_pipeline_state(rt.pso("rope_batch_f32")?);
+                #[repr(C)]
+                struct RopeBatchParams {
+                    n_heads: [u32; 4],
+                    nseg: u32,
+                    head_dim: u32,
+                    rotary_dim: u32,
+                    pair_stride: u32,
+                    mscale: f32,
+                    n_seq: u32,
+                }
+                let mut p = RopeBatchParams {
+                    n_heads: [0; 4],
+                    nseg: segs.len() as u32,
+                    head_dim: u32_of(head_dim)?,
+                    rotary_dim: u32_of(rotary_dim)?,
+                    pair_stride: if pair_stride == 2 { 2 } else { 1 },
+                    mscale,
+                    n_seq: u32_of(n_seq)?,
+                };
+                let mut total = 0usize;
+                for i in 0..4 {
+                    let (x, out, _) = *segs.get(i).unwrap_or(&segs[0]);
+                    bind(i as u64 * 2, x);
+                    bind(i as u64 * 2 + 1, out);
+                    if let Some(&(_, _, heads)) = segs.get(i) {
+                        p.n_heads[i] = u32_of(heads)?;
+                        total += n_seq * heads * head_dim;
+                    }
+                }
+                bind(8, pos);
+                bind(9, inv_freq);
+                set_bytes(enc, 10, &p);
+                grid1(total);
+            }
             Step::CachedAttention {
                 q,
                 k,
@@ -3559,6 +3641,21 @@ pub enum Step {
         rotary_dim: usize,
         mscale: f32,
     },
+    /// Horizontal batch of up to 4 independent RmsNorm segments (`batch_horizontal`).
+    RmsNormBatch {
+        segs: Vec<NormSeg>,
+    },
+    /// Horizontal batch of up to 4 Rope segments `(x, out, n_heads)` sharing pos, inv_freq and geometry.
+    RopeBatch {
+        pos: ValueId,
+        inv_freq: ValueId,
+        n_seq: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        pair_stride: usize,
+        mscale: f32,
+        segs: Vec<(ValueId, ValueId, usize)>,
+    },
     CachedAttention {
         q: ValueId,
         k: ValueId,
@@ -3711,6 +3808,9 @@ pub(crate) enum FusionClass {
     CrossCodecSiblings,
     EpilogueScatter,
     AttentionSingleDispatch,
+    /// Several independent steps of one kind with different shapes in one dispatch. XLA's GPU
+    /// pipeline in the catalogued revision has no horizontal-fusion pass, so this is Full-only.
+    HorizontalBatch,
 }
 
 impl FusionPolicy {
@@ -3730,6 +3830,154 @@ pub(crate) fn fusion_policy() -> FusionPolicy {
         Ok("xla") => FusionPolicy::XlaClass,
         _ => FusionPolicy::Full,
     })
+}
+
+/// One segment of [`Step::RmsNormBatch`].
+#[derive(Debug, Clone)]
+pub struct NormSeg {
+    pub x: ValueId,
+    pub g: ValueId,
+    pub out: ValueId,
+    pub rows: usize,
+    pub d: usize,
+    pub eps: f32,
+}
+
+/// Merges runs (<= 4) of adjacent steps that are independent of each other into one dispatch:
+/// RmsNorm without a residual (any rows/d/eps) and Rope with identical geometry (any head count).
+/// A step joins a run only if it reads none of the run's outputs, so order is preserved and the
+/// members could already execute in any order. Anything else is left untouched.
+fn batch_horizontal(
+    steps: Vec<Planned>,
+    aliases: &HashMap<ValueId, (ValueId, usize)>,
+) -> Vec<Planned> {
+    if !fusion_policy().allows(FusionClass::HorizontalBatch) {
+        return steps;
+    }
+    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
+    let joins = |run: &[Planned], next: &Planned| {
+        let same_kind = match (&run[0].op, &next.op) {
+            (Step::RmsNorm { res: None, .. }, Step::RmsNorm { res: None, .. }) => true,
+            (
+                Step::Rope {
+                    pos: p0,
+                    inv_freq: f0,
+                    n_seq: s0,
+                    head_dim: h0,
+                    rotary_dim: r0,
+                    pair_stride: t0,
+                    mscale: m0,
+                    ..
+                },
+                Step::Rope {
+                    pos,
+                    inv_freq,
+                    n_seq,
+                    head_dim,
+                    rotary_dim,
+                    pair_stride,
+                    mscale,
+                    ..
+                },
+            ) => {
+                (p0, f0, s0, h0, r0, t0, m0)
+                    == (
+                        pos,
+                        inv_freq,
+                        n_seq,
+                        head_dim,
+                        rotary_dim,
+                        pair_stride,
+                        mscale,
+                    )
+            }
+            _ => false,
+        };
+        same_kind
+            && next.extra_outs.is_empty()
+            && !next
+                .reads
+                .iter()
+                .any(|&r| run.iter().any(|s| root(s.out) == root(r)))
+    };
+    let mut out: Vec<Planned> = Vec::with_capacity(steps.len());
+    let mut it = steps.into_iter().peekable();
+    while let Some(first) = it.next() {
+        let mut run = vec![first];
+        while run.len() < 4 && it.peek().is_some_and(|n| joins(&run, n)) {
+            run.push(it.next().expect("peeked"));
+        }
+        if run.len() == 1 {
+            out.extend(run);
+            continue;
+        }
+        let name = run
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        let outs: Vec<ValueId> = run.iter().map(|s| s.out).collect();
+        let mut reads: Vec<ValueId> = Vec::new();
+        for &r in run.iter().flat_map(|s| &s.reads) {
+            if !reads.contains(&r) {
+                reads.push(r);
+            }
+        }
+        let op = match &run[0].op {
+            Step::RmsNorm { .. } => Step::RmsNormBatch {
+                segs: run
+                    .iter()
+                    .map(|s| match s.op {
+                        Step::RmsNorm {
+                            x, g, rows, d, eps, ..
+                        } => NormSeg {
+                            x,
+                            g,
+                            out: s.out,
+                            rows,
+                            d,
+                            eps,
+                        },
+                        _ => unreachable!("run members share a kind"),
+                    })
+                    .collect(),
+            },
+            Step::Rope {
+                pos,
+                inv_freq,
+                n_seq,
+                head_dim,
+                rotary_dim,
+                pair_stride,
+                mscale,
+                ..
+            } => Step::RopeBatch {
+                pos: *pos,
+                inv_freq: *inv_freq,
+                n_seq: *n_seq,
+                head_dim: *head_dim,
+                rotary_dim: *rotary_dim,
+                pair_stride: *pair_stride,
+                mscale: *mscale,
+                segs: run
+                    .iter()
+                    .map(|s| match s.op {
+                        Step::Rope { x, n_heads, .. } => (x, s.out, n_heads),
+                        _ => unreachable!("run members share a kind"),
+                    })
+                    .collect(),
+            },
+            _ => unreachable!("only RmsNorm and Rope runs are built"),
+        };
+        out.push(Planned {
+            name,
+            op,
+            out: outs[0],
+            extra_outs: outs[1..].to_vec(),
+            reads,
+        });
+    }
+    out
 }
 
 /// Lowers nodes to dispatches, validating ops and shapes. A Linear whose output has exactly one
@@ -4419,6 +4667,10 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .into_iter()
             .flatten()
             .collect(),
+            // Built only by `batch_horizontal`, after `plan` has returned.
+            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } => {
+                unreachable!("batch steps are created after plan()")
+            }
             Step::MegakernelMlp {
                 x,
                 norm_w,
@@ -5483,6 +5735,69 @@ mod tests {
                 range(p),
                 range(q)
             );
+        }
+    }
+
+    /// Adjacent independent RmsNorms (different rows and eps) and Ropes (different head counts) become
+    /// one batch step each; a norm reading a batch member's output stays outside it. All outputs match
+    /// the CPU executor.
+    #[test]
+    fn horizontal_batches_match_cpu() {
+        let f = DType::F32;
+        let mut g = Graph::new();
+        let xs = [(3usize, 1e-5f32), (1, 1e-6), (2, 1e-3)]
+            .map(|(rows, eps)| (g.input("x", vec![rows, 4], f), rows, eps));
+        let gv = g.weight("g", vec![4], f);
+        let mut outs: Vec<ValueId> = xs
+            .iter()
+            .map(|&(x, rows, eps)| g.add("n", Op::RmsNorm { eps }, &[x, gv], vec![rows, 4], f))
+            .collect();
+        // Depends on the first member: cannot join the run.
+        outs.push(g.add(
+            "dep",
+            Op::RmsNorm { eps: 1e-5 },
+            &[outs[0], gv],
+            vec![3, 4],
+            f,
+        ));
+        let pos = g.input("pos", vec![1], DType::U32);
+        let inv = g.weight("inv", vec![2], f);
+        let rope = Op::Rope {
+            head_dim: 4,
+            rotary_dim: 4,
+            variant: crate::graph::RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        let (xa, xb) = (g.input("xa", vec![1, 8], f), g.input("xb", vec![1, 4], f));
+        outs.push(g.add("ra", rope.clone(), &[xa, pos, inv], vec![1, 8], f));
+        outs.push(g.add("rb", rope, &[xb, pos, inv], vec![1, 4], f));
+        for &o in &outs {
+            g.output(o);
+        }
+        let (steps, aliases) = plan(&g).unwrap();
+        let steps = batch_horizontal(steps, &aliases);
+        let kinds: Vec<_> = steps
+            .iter()
+            .map(|s| kernel_kind(&format!("{:?}", s.op)).to_string())
+            .collect();
+        assert_eq!(kinds, ["RmsNormBatch", "RmsNorm", "RopeBatch"]);
+
+        let mut w = Weights::new();
+        w.insert("g", Tensor::F32(vec![0.5, 1.2, -0.8, 2.1]));
+        w.insert("inv", Tensor::F32(vec![1.0, 0.1]));
+        let inputs = vec![
+            Tensor::F32(rand(12, 1)),
+            Tensor::F32(rand(4, 2)),
+            Tensor::F32(rand(8, 3)),
+            Tensor::U32(vec![5]),
+            Tensor::F32(rand(8, 4)),
+            Tensor::F32(rand(4, 5)),
+        ];
+        let want = cpu::run_stateless(&g, &w, inputs.clone()).unwrap();
+        let got = Session::new(rt(), &w).unwrap().run(&g, inputs).unwrap();
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            let e = rel_err(a.as_f32().unwrap(), b.as_f32().unwrap());
+            assert!(e < 1e-5, "output {i}: {e}");
         }
     }
 
