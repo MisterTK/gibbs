@@ -5204,6 +5204,38 @@ mod tests {
         }
     }
 
+    /// Best GEMV rate per format at the projection shapes of a ~2B model, DRAM-streaming conditions
+    /// (`cargo test --release --lib shape_rates -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn shape_rates() {
+        for f in [
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q6_K,
+            QuantFormat::GGUF_Q8_0,
+            QuantFormat::GGUF_IQ4_XS,
+        ] {
+            let fmt = WeightFormat::of_quant(f);
+            for shape in [
+                (6144usize, 1536usize),
+                (1536, 6144),
+                (2048, 1536),
+                (1536, 2048),
+            ] {
+                let t = rt().bench_gemv(f, &[shape], &fmt.gemv_variants()).unwrap();
+                let best = t.iter().map(|x| x.1).fold(0.0, f64::max);
+                println!(
+                    "{f:?} {shape:?}: best {best:.0} GB/s, {} variants {:?}",
+                    t.len(),
+                    t.iter()
+                        .map(|x| (x.0.label(), x.1 as u32))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
     /// Linear -> Silu/SwiGlu/GeGlu on a BF16 weight at m below and above the batched-GEMM cut (16):
     /// the activation must never be dropped.
     #[test]

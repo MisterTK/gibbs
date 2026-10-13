@@ -621,10 +621,19 @@ fn is_gather_table(name: &str) -> bool {
         .any(|s| name.contains(s))
 }
 
+/// Whether `f` still reads faster than the stored `src` by the rule's margin under `rate`; without
+/// measured rates, whether it at least holds fewer bits.
+fn beats_source(f: Q, src: Q, rate: &dyn Fn(Q) -> Option<f64>) -> bool {
+    let time = |q: Q| rate(q).map(|g| q.bits_per_weight() as f64 / g);
+    match (time(f), time(src)) {
+        (Some(a), Some(b)) => a < b * TIME_MARGIN,
+        _ => f.bits_per_weight() < src.bits_per_weight(),
+    }
+}
+
 /// A native loader's `rows x cols` projection `name`, stored as `src` blocks in `raw`, under the
 /// effective policy `cfg`: `Some((format, blocks))` when the policy re-stores it in a faster format
-/// (the per-tensor RMSE gate bumps the format up the ladder until it passes), `None` to keep the
-/// source blocks.
+/// (every such re-encode is lossy and counted in [`native_stats`]), `None` to keep the stored blocks.
 pub fn reencode_native(
     cfg: &crate::model::weight_format::ReencodeConfig,
     name: &str,
@@ -671,6 +680,11 @@ pub fn reencode_native(
         (f, w) = (next, encode_weight(&data, cols, rows, next, threads));
         rmse = relative_rmse(&data, &w.to_f32());
     }
+    // The RMSE bump may have walked past the source's own cost (Q4_K -> Q4_0 failing the gate lands on
+    // Q5_K, bigger and slower than what was stored): then the stored blocks stay.
+    if !beats_source(f, src, &crate::model::variant::host_gbps) {
+        return None;
+    }
     let QuantizedWeight::GgufQuantized { raw_data, .. } = w else {
         return None;
     };
@@ -680,6 +694,7 @@ pub fn reencode_native(
         stats.bytes_before + raw.len() as u64,
         stats.bytes_after + raw_data.len() as u64,
     );
+    tracing::debug!("reencode {name} {rows}x{cols}: {src:?} -> {f:?} (rmse {rmse:.4})");
     Some((f, raw_data.to_vec()))
 }
 
@@ -952,6 +967,24 @@ mod tests {
         assert_eq!(rule_with(MaxSpeed, Q::GGUF_Q4_0, &rates), Target::Native);
     }
 
+    /// Measured on this host (E2B Q4_K_M, GB/s): a Q4_K tensor the RMSE gate bumps to Q5_K must stay Q4_K.
+    #[test]
+    fn a_bumped_encode_keeps_the_source_unless_it_is_still_faster() {
+        let measured = |f: Q| match f {
+            Q::GGUF_Q4_K_M => Some(230.0),
+            Q::GGUF_Q5_K_M => Some(171.0),
+            Q::GGUF_Q6_K => Some(151.0),
+            Q::GGUF_Q4_0 => Some(255.0),
+            _ => None,
+        };
+        assert!(!beats_source(Q::GGUF_Q5_K_M, Q::GGUF_Q4_K_M, &measured));
+        assert!(beats_source(Q::GGUF_Q5_K_M, Q::GGUF_Q6_K, &measured));
+        assert!(beats_source(Q::GGUF_Q4_0, Q::GGUF_Q6_K, &measured));
+        // Unmeasured: only fewer bits count.
+        assert!(!beats_source(Q::GGUF_Q5_K_M, Q::GGUF_Q4_K_M, &|_| None));
+        assert!(beats_source(Q::GGUF_Q4_0, Q::GGUF_Q6_K, &|_| None));
+    }
+
     #[test]
     fn max_speed_ignores_unmeasured_targets_and_keeps_precision() {
         let only_q8 = |f: Q| match f {
@@ -1026,56 +1059,56 @@ mod tests {
     #[test]
     fn rules_follow_the_policy_table() {
         crate::model::variant::with_unmeasured_host(|| {
-        // MaxSpeed: > 4.5 bpw or codec-less -> Q4_K, else native.
-        for src in [
-            Q::BF16,
-            Q::FP16,
-            Q::FP32,
-            Q::GGUF_Q8_0,
-            Q::GGUF_Q6_K,
-            Q::GGUF_Q5_K_M,
-            Q::GGUF_Q4_1,
-        ] {
+            // MaxSpeed: > 4.5 bpw or codec-less -> Q4_K, else native.
+            for src in [
+                Q::BF16,
+                Q::FP16,
+                Q::FP32,
+                Q::GGUF_Q8_0,
+                Q::GGUF_Q6_K,
+                Q::GGUF_Q5_K_M,
+                Q::GGUF_Q4_1,
+            ] {
+                assert_eq!(
+                    rule(MaxSpeed, src),
+                    Target::Encode(Q::GGUF_Q4_K_M),
+                    "{src:?}"
+                );
+            }
+            for src in [
+                Q::GGUF_Q4_0,
+                Q::GGUF_Q4_K_M,
+                Q::GGUF_IQ4_XS,
+                Q::GGUF_Q2_K,
+                Q::GGUF_IQ2_M,
+                Q::GGUF_TQ2_0,
+            ] {
+                assert_eq!(rule(MaxSpeed, src), Target::Native, "{src:?}");
+            }
+            assert_eq!(rule(MaxSpeed, Q::EXL3_3Bit), Target::Encode(Q::GGUF_Q4_K_M));
+            // LowBitNative: float -> Q8_0; codec-less -> smallest ladder format >= source bpw.
+            for src in [Q::BF16, Q::FP16, Q::FP32] {
+                assert_eq!(rule(LowBitNative, src), Target::Encode(Q::GGUF_Q8_0));
+            }
+            assert_eq!(rule(LowBitNative, Q::GGUF_Q4_K_M), Target::Native);
             assert_eq!(
-                rule(MaxSpeed, src),
-                Target::Encode(Q::GGUF_Q4_K_M),
-                "{src:?}"
+                rule(LowBitNative, Q::EXL3_3Bit),
+                Target::Encode(Q::GGUF_Q4_K_M)
             );
-        }
-        for src in [
-            Q::GGUF_Q4_0,
-            Q::GGUF_Q4_K_M,
-            Q::GGUF_IQ4_XS,
-            Q::GGUF_Q2_K,
-            Q::GGUF_IQ2_M,
-            Q::GGUF_TQ2_0,
-        ] {
-            assert_eq!(rule(MaxSpeed, src), Target::Native, "{src:?}");
-        }
-        assert_eq!(rule(MaxSpeed, Q::EXL3_3Bit), Target::Encode(Q::GGUF_Q4_K_M));
-        // LowBitNative: float -> Q8_0; codec-less -> smallest ladder format >= source bpw.
-        for src in [Q::BF16, Q::FP16, Q::FP32] {
-            assert_eq!(rule(LowBitNative, src), Target::Encode(Q::GGUF_Q8_0));
-        }
-        assert_eq!(rule(LowBitNative, Q::GGUF_Q4_K_M), Target::Native);
-        assert_eq!(
-            rule(LowBitNative, Q::EXL3_3Bit),
-            Target::Encode(Q::GGUF_Q4_K_M)
-        );
-        assert_eq!(
-            rule(LowBitNative, Q::EXL3_5Bit),
-            Target::Encode(Q::GGUF_Q5_K_M)
-        );
-        assert_eq!(
-            rule(LowBitNative, Q::TurboQuant),
-            Target::Encode(Q::GGUF_Q4_K_M)
-        );
-        // BitExact: native whenever a codec exists.
-        for src in [Q::BF16, Q::FP32, Q::GGUF_Q8_0, Q::GGUF_Q4_0] {
-            assert_eq!(rule(BitExact, src), Target::Native);
-        }
-        assert_eq!(rule(BitExact, Q::EXL3_4Bit), Target::Encode(Q::GGUF_Q4_K_M));
-        assert_eq!(rule(BitExact, Q::EXL3_5Bit), Target::Encode(Q::GGUF_Q5_K_M));
+            assert_eq!(
+                rule(LowBitNative, Q::EXL3_5Bit),
+                Target::Encode(Q::GGUF_Q5_K_M)
+            );
+            assert_eq!(
+                rule(LowBitNative, Q::TurboQuant),
+                Target::Encode(Q::GGUF_Q4_K_M)
+            );
+            // BitExact: native whenever a codec exists.
+            for src in [Q::BF16, Q::FP32, Q::GGUF_Q8_0, Q::GGUF_Q4_0] {
+                assert_eq!(rule(BitExact, src), Target::Native);
+            }
+            assert_eq!(rule(BitExact, Q::EXL3_4Bit), Target::Encode(Q::GGUF_Q4_K_M));
+            assert_eq!(rule(BitExact, Q::EXL3_5Bit), Target::Encode(Q::GGUF_Q5_K_M));
         });
     }
 
