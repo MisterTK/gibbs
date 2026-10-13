@@ -337,7 +337,6 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::Add
         | Op::Mul
         | Op::Softmax { .. }
-        | Op::TopKSoftmax { .. }
         | Op::MeanPool
         | Op::Conv2d { .. }
         | Op::RelPosBias { .. }

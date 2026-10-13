@@ -48,7 +48,7 @@ Rather than matching against model IDs (e.g. `meta-llama/Llama-3-8B`), Gibbs ana
 2. **Mixture of Experts (MoE)**:
    - *Signature*: Presence of router gating networks scoring top-$k$ experts:
      $$G(\mathbf{x}) = \text{Softmax}\left(\text{TopK}\left(\mathbf{x} \mathbf{W}_g, k\right)\right)$$
-   - *Detection*: an `Op::Moe` node with more than one expert. Discovered in Qwen1.5-MoE, DeepSeek-V3, Mixtral, and Gemma MoE.
+   - *Detection*: an `Op::MoeLinear` node with more than one expert. Discovered in Qwen1.5-MoE, DeepSeek-V3, Mixtral, and Gemma MoE.
 
 3. **RoPE Layouts (Rotary Position Embeddings)**:
    - *Interleaved (GGUF / NeoX style)*: Adjacent pairs rotated together:

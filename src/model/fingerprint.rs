@@ -97,7 +97,7 @@ pub fn fingerprint_graph(graph: &Graph) -> ArchitectureFingerprint {
                             .is_some_and(|norm| linear(norm.inputs[0]).is_some());
                 }
             }
-            Op::Moe { experts, .. } if *experts > 1 => {
+            Op::MoeLinear { experts, .. } if *experts > 1 => {
                 has_moe = true;
                 expert_count = expert_count.max(*experts);
             }
@@ -422,7 +422,7 @@ mod tests {
         let a = g.add("attn_mla", attn(64, None, None), &[q, kv, kv], vec![], F);
         // DeepSeek MoE FFN (64 experts, top 8)
         let router = g.weight("router", vec![], F);
-        g.add("moe_ffn", Op::Moe { experts: 64, top_k: 8 }, &[a, router], vec![], F);
+        g.add("moe_ffn", Op::MoeLinear { experts: 64, top_k: 8 }, &[a, router], vec![], F);
 
         let fp = fingerprint_graph(&g);
         assert_eq!(fp.family, "deepseek_v3");
@@ -446,7 +446,7 @@ mod tests {
         );
         // MoE routing with 8 experts (e.g. Mixtral 8x7B), then a SwiGLU expert block
         let router = g.weight("router", vec![], F);
-        let m = g.add("moe", Op::Moe { experts: 8, top_k: 2 }, &[a, router], vec![], F);
+        let m = g.add("moe", Op::MoeLinear { experts: 8, top_k: 2 }, &[a, router], vec![], F);
         swiglu(&mut g, m);
 
         let fp = fingerprint_graph(&g);

@@ -56,7 +56,7 @@ pub enum ExtStep {
     Matmul(matmul::Step),
     Conv(conv::Step),
     Attn(attn::Step),
-    Moe(moe::Step),
+    Experts(moe::Step),
 }
 
 pub(super) fn supports(op: &Op, dtype: DType) -> bool {
@@ -114,7 +114,7 @@ pub(super) fn plan(
     }
     if let Some(r) = moe::plan(g, node, aliases) {
         return Some(r.map(|p| match p {
-            PlanOut::Step(s, n) => PlanOut::Step(ExtStep::Moe(s), n),
+            PlanOut::Step(s, n) => PlanOut::Step(ExtStep::Experts(s), n),
             PlanOut::Alias => PlanOut::Alias,
         }));
     }
@@ -129,7 +129,7 @@ pub(super) fn reads(st: &ExtStep) -> Vec<ValueId> {
         ExtStep::Matmul(e) => matmul::reads(e),
         ExtStep::Conv(e) => conv::reads(e),
         ExtStep::Attn(e) => attn::reads(e),
-        ExtStep::Moe(e) => moe::reads(e),
+        ExtStep::Experts(e) => moe::reads(e),
     }
 }
 
@@ -141,7 +141,7 @@ pub(super) fn allows_non_f32(st: &ExtStep, v: ValueId) -> bool {
         ExtStep::Matmul(e) => matmul::allows_non_f32(e, v),
         ExtStep::Conv(e) => conv::allows_non_f32(e, v),
         ExtStep::Attn(e) => attn::allows_non_f32(e, v),
-        ExtStep::Moe(e) => moe::allows_non_f32(e, v),
+        ExtStep::Experts(e) => moe::allows_non_f32(e, v),
     }
 }
 
@@ -153,7 +153,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &ExtStep) -> Resu
         ExtStep::Matmul(e_) => matmul::encode(sess, e, s, e_),
         ExtStep::Conv(e_) => conv::encode(sess, e, s, e_),
         ExtStep::Attn(e_) => attn::encode(sess, e, s, e_),
-        ExtStep::Moe(e_) => moe::encode(sess, e, s, e_),
+        ExtStep::Experts(e_) => moe::encode(sess, e, s, e_),
     }
 }
 

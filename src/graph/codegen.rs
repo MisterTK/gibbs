@@ -310,3 +310,87 @@ kernel void {name}(
         rows_per_tg = gemv_rows_per_tg(p),
     )
 }
+
+/// Name of the kernel [`gemv_indexed`] emits for `codec` with `p`.
+pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
+    format!("gemvgen_{:?}_r{}_ix", codec.format, p.rows_per_sg)
+}
+
+/// [`gemv_packed`] over an expert bank: the weight is `experts` stacked `[rows, cols]` matrices and
+/// slot `s` (grid y) multiplies row `s` of `x` (`x_per_slot != 0`) or row `s / top_k` by the matrix
+/// `ids[s]`, writing row `s` of `y` (`[slots, rows]`). Buffers `w, x, y, MoeGemvParams {rows, cols,
+/// slots, top_k, experts, x_per_slot}, ids`; grid `(ceil(rows / gemv_rows_per_tg), slots)` of 256
+/// threads. A slot whose id is not below `experts` writes zeros.
+pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
+    let name = gemv_indexed_name(codec, p);
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = codec.msl.replace("decode8", &dec);
+    let r = p.rows_per_sg;
+    let (be, bb) = (codec.block_elems, codec.block_bytes);
+    let acc_decl = (0..r).map(|i| format!("float acc{i} = 0.0f;")).collect::<Vec<_>>().join(" ");
+    let rows_loop: String = (0..r)
+        .map(|i| {
+            format!(
+                "        if (row0 + {i} < p.rows) {{\n            device const uchar* b = w + ((bank_row + row0 + {i}) * blocks_per_row + blk) * {bb};\n            float v[8];\n            {dec}(b, sub, v);\n            acc{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n        }}\n"
+            )
+        })
+        .collect();
+    let sums: String = (0..r)
+        .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
+        .collect();
+    let store: String = (0..r)
+        .map(|i| {
+            format!("        if (row0 + {i} < p.rows) y[(ulong)slot * p.rows + row0 + {i}] = simd_sum_{i};\n")
+        })
+        .collect();
+    format!(
+        r#"
+{codec_msl}
+
+struct MoeGemvParams {{
+    uint rows;
+    uint cols;
+    uint slots;
+    uint top_k;
+    uint experts;
+    uint x_per_slot;
+}};
+
+kernel void {name}(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant MoeGemvParams& p [[buffer(3)]],
+    device const uint* ids [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    const uint slot = tg.y;
+    if (row0 >= p.rows || slot >= p.slots) return;
+    const uint expert = ids[slot];
+    if (expert >= p.experts) {{
+        if (lane == 0) {{
+            for (uint i = 0; i < {r}; i++) if (row0 + i < p.rows) y[(ulong)slot * p.rows + row0 + i] = 0.0f;
+        }}
+        return;
+    }}
+    const ulong bank_row = (ulong)expert * p.rows;
+    const uint subs = p.cols / 8;
+    const uint blocks_per_row = p.cols / {be};
+    device const float* xb = x + (ulong)(p.x_per_slot != 0 ? slot : slot / p.top_k) * p.cols;
+    {acc_decl}
+    for (uint s = lane; s < subs; s += 32) {{
+        float4 x0 = *(device const float4*)(xb + s * 8);
+        float4 x1 = *(device const float4*)(xb + s * 8 + 4);
+        const uint blk = (s * 8) / {be};
+        const uint sub = ((s * 8) % {be}) / 8;
+{rows_loop}    }}
+{sums}    if (lane == 0) {{
+{store}    }}
+}}
+"#,
+        rows_per_tg = gemv_rows_per_tg(p),
+    )
+}

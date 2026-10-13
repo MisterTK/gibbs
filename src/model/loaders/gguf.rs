@@ -501,6 +501,46 @@ pub fn parse_gguf_header(bytes: &[u8]) -> Result<GgufHeader, HeaderError> {
     })
 }
 
+/// A GGUF v3 file of tensors given as raw bytes (`name`, GGML dims fastest first, GGML type id,
+/// bytes: F32 = 0, Q4_0 = 2, ...) with the given KVs (`name`, GGUF value type, payload); tensor
+/// data 32-byte aligned.
+#[cfg(test)]
+pub(crate) fn test_gguf_blocks(
+    kv: &[(String, u32, Vec<u8>)],
+    tensors: &[(String, Vec<usize>, u32, Vec<u8>)],
+) -> Vec<u8> {
+    let s = |b: &mut Vec<u8>, v: &str| {
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+    };
+    let mut b = b"GGUF".to_vec();
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    b.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+    for (k, t, payload) in kv {
+        s(&mut b, k);
+        b.extend_from_slice(&t.to_le_bytes());
+        b.extend_from_slice(payload);
+    }
+    let mut off = 0u64;
+    for (n, dims, ty, bytes) in tensors {
+        s(&mut b, n);
+        b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for d in dims {
+            b.extend_from_slice(&(*d as u64).to_le_bytes());
+        }
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&off.to_le_bytes());
+        off += (bytes.len() as u64).div_ceil(32) * 32;
+    }
+    b.resize(b.len().div_ceil(32) * 32, 0);
+    for (_, _, _, bytes) in tensors {
+        b.extend_from_slice(bytes);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+    }
+    b
+}
+
 /// A GGUF v3 file of F32 tensors (`name`, GGML dims fastest first, values) with the given KVs
 /// (`name`, GGUF value type, payload); tensor data 32-byte aligned.
 #[cfg(test)]

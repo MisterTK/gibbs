@@ -244,7 +244,7 @@ fn test_architecture_fingerprinting_suite() {
     let q = g.add("rope_q", rope(128, 64, RopeVariant::Interleaved), &[q, pos], vec![], F);
     let a = g.add("attn", attn(64, None, None), &[q, kv, kv], vec![], F);
     let router = g.weight("router", vec![], F);
-    g.add("moe", Op::Moe { experts: 64, top_k: 8 }, &[a, router], vec![], F);
+    g.add("moe", Op::MoeLinear { experts: 64, top_k: 8 }, &[a, router], vec![], F);
     let fp_ds = fingerprint_graph(&g);
     assert_eq!(fp_ds.family, "deepseek_v3");
     assert!(fp_ds.has_mla);
@@ -256,7 +256,7 @@ fn test_architecture_fingerprinting_suite() {
     let x = g.input("x", vec![], F);
     let n = norm(&mut g, x, Op::RmsNorm { eps: 1e-5 });
     let router = g.weight("router", vec![], F);
-    let m = g.add("moe", Op::Moe { experts: 8, top_k: 2 }, &[n, router], vec![], F);
+    let m = g.add("moe", Op::MoeLinear { experts: 8, top_k: 2 }, &[n, router], vec![], F);
     swiglu(&mut g, m);
     let fp_moe = fingerprint_graph(&g);
     assert!(fp_moe.has_moe);
