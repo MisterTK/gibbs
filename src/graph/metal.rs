@@ -60,6 +60,63 @@ pub fn set_bytes<T>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
     );
 }
 
+/// Compute encoder that counts `dispatch_thread_groups` calls (the only dispatch form used).
+/// Everything else goes through `Deref` to the raw encoder.
+pub(crate) struct Counted<'a> {
+    inner: &'a ComputeCommandEncoderRef,
+    dispatches: std::cell::Cell<u32>,
+}
+
+impl<'a> Counted<'a> {
+    pub(crate) fn new(inner: &'a ComputeCommandEncoderRef) -> Self {
+        Self {
+            inner,
+            dispatches: std::cell::Cell::new(0),
+        }
+    }
+    pub(crate) fn dispatches(&self) -> u32 {
+        self.dispatches.get()
+    }
+    pub(crate) fn dispatch_thread_groups(&self, groups: MTLSize, threads: MTLSize) {
+        self.dispatches.set(self.dispatches.get() + 1);
+        self.inner.dispatch_thread_groups(groups, threads);
+    }
+}
+
+impl std::ops::Deref for Counted<'_> {
+    type Target = ComputeCommandEncoderRef;
+    fn deref(&self) -> &ComputeCommandEncoderRef {
+        self.inner
+    }
+}
+
+/// One `run_prepared` call (non-profiler path), for honest per-token bench rows.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RunSample {
+    pub gpu_ns: u64,
+    pub run_ns: u64,
+    pub encode_ns: u64,
+    pub dispatches: u32,
+}
+
+const RUN_SAMPLE_CAP: usize = 8192;
+// ponytail: process-global ring; per-session if two sessions decode concurrently.
+static RUN_SAMPLES: Mutex<std::collections::VecDeque<RunSample>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+fn push_run_sample(s: RunSample) {
+    let mut q = RUN_SAMPLES.lock();
+    if q.len() >= RUN_SAMPLE_CAP {
+        q.pop_front();
+    }
+    q.push_back(s);
+}
+
+/// Drains the run-sample ring (oldest first).
+pub fn take_run_samples() -> Vec<RunSample> {
+    RUN_SAMPLES.lock().drain(..).collect()
+}
+
 pub fn system_device() -> Result<Device, String> {
     Device::system_default()
         .ok_or_else(|| "no Metal GPU (MTLCreateSystemDefaultDevice returned nil)".to_string())
@@ -80,9 +137,8 @@ use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     BinaryArchiveDescriptor, Buffer, CommandBufferRef, CommandQueue, CompileOptions,
     ComputeCommandEncoderRef, ComputePipelineDescriptor, ComputePipelineDescriptorRef,
-    ComputePipelineState, Device, DeviceRef,
-    Library, MTLComputePipelineState,
-    MTLPipelineOption, MTLResourceOptions, MTLSize, URL,
+    ComputePipelineState, Device, DeviceRef, Library, MTLComputePipelineState, MTLPipelineOption,
+    MTLResourceOptions, MTLSize, URL,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -344,7 +400,8 @@ pub struct HostProfile {
 }
 
 /// `(rows, cols)` of the GEMVs [`Runtime::benchmark_codecs`] times (sprint-2 S3.2).
-const CODEC_BENCH_SHAPES: [(usize, usize); 4] = [(4096, 4096), (14336, 4096), (4096, 14336), (262144, 1536)];
+const CODEC_BENCH_SHAPES: [(usize, usize); 4] =
+    [(4096, 4096), (14336, 4096), (4096, 14336), (262144, 1536)];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GemmTiming {
@@ -426,19 +483,9 @@ impl Runtime {
         let t1 = Instant::now();
         let (psos, archive_hit, archive_note) = pipelines(&device, &lib, &names, &archive)?;
         if !archive_hit {
-            // Archives of earlier kernel sources for this GPU and OS can never hit again.
-            let stale = std::fs::read_dir(cache.join("metal"))
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path());
-            for p in stale.filter(|p| {
-                *p != archive
-                    && p.file_name()
-                        .is_some_and(|f| f.to_string_lossy().starts_with(&tag))
-            }) {
-                let _ = std::fs::remove_file(p);
-            }
+            // Archives and profiles of other kernel sources: ABBA runs alternate two binaries, so
+            // keep the newest few instead of deleting what the other binary will need.
+            prune_cache(&cache.join("metal"), &tag, &archive, 3);
         }
         let pso_ms = t1.elapsed().as_secs_f64() * 1e3;
         for (name, pso) in &psos {
@@ -470,7 +517,10 @@ impl Runtime {
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
         };
-        let profile_path = cache.join("host").join(format!("{tag}.json"));
+        let profile_path = cache
+            .join("host")
+            .join(format!("{tag}-{src_hash:016x}.json"));
+        prune_cache(&cache.join("host"), &tag, &profile_path, 3);
         let cached = std::fs::read(&profile_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
@@ -503,7 +553,11 @@ impl Runtime {
                 }
             }
         };
-        let codec_eff = rt.profile.codec.clone().filter(|c| c.codec_hash == codec::source_hash());
+        let codec_eff = rt
+            .profile
+            .codec
+            .clone()
+            .filter(|c| c.codec_hash == codec::source_hash());
         if codec_eff.is_some() || crate::model::variant::host_ceiling_gbps() == 0.0 {
             let p = &rt.profile;
             crate::model::variant::set_host_rates(p.ceiling_gbps.max(p.stream_gbps), codec_eff);
@@ -679,8 +733,16 @@ impl Runtime {
             return Err("no GEMV format could be measured".into());
         }
         let ceiling_gbps = self.profile.stream_gbps.max(best);
-        let eff = gbps.iter().map(|(k, g)| (k.clone(), g / ceiling_gbps)).collect();
-        Ok(CodecEff { codec_hash: codec::source_hash(), ceiling_gbps, gbps, eff })
+        let eff = gbps
+            .iter()
+            .map(|(k, g)| (k.clone(), g / ceiling_gbps))
+            .collect();
+        Ok(CodecEff {
+            codec_hash: codec::source_hash(),
+            ceiling_gbps,
+            gbps,
+            eff,
+        })
     }
 
     /// GB/s of the M=1 GEMV in `f`: weight bytes over GPU time summed across the benchmark shapes.
@@ -698,7 +760,9 @@ impl Runtime {
         let mut pattern = vec![0u8; 1 << 20];
         let mut s = 0x9E3779B97F4A7C15u64;
         for b in &mut pattern {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (s >> 56) as u8;
         }
         let mut weights = Weights::new();
@@ -714,7 +778,9 @@ impl Runtime {
             }
             let raw = bytes::Bytes::from(raw);
             let halves: Vec<u16> = if float {
-                raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+                raw.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -737,7 +803,13 @@ impl Runtime {
                     ),
                 };
                 let w = g.weight(&name, vec![n, k], dtype);
-                let y = g.add(&format!("lin{c}"), Op::Linear, &[x, w], vec![1, n], DType::F32);
+                let y = g.add(
+                    &format!("lin{c}"),
+                    Op::Linear,
+                    &[x, w],
+                    vec![1, n],
+                    DType::F32,
+                );
                 g.output(y);
                 weights.insert(name, t);
             }
@@ -769,30 +841,51 @@ impl Runtime {
     /// publishes them to the variant predictor. Never blocks the caller; once per process.
     pub fn spawn_codec_bench(self: &Arc<Self>) {
         static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let current = self.profile.codec.as_ref().is_some_and(|c| c.codec_hash == codec::source_hash());
+        let current = self
+            .profile
+            .codec
+            .as_ref()
+            .is_some_and(|c| c.codec_hash == codec::source_hash());
         if current || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         let rt = self.clone();
-        let spawned = std::thread::Builder::new().name("codec-bench".into()).spawn(move || {
-            crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
-            match rt.benchmark_codecs() {
-                Ok(e) => {
-                    let mut p = rt.profile.clone();
-                    p.ceiling_gbps = e.ceiling_gbps;
-                    p.codec = Some(e.clone());
-                    let saved = std::fs::write(&rt.profile_path, serde_json::to_vec_pretty(&p).unwrap_or_default());
-                    if let Err(err) = saved {
-                        tracing::warn!("codec bench: saving {}: {err}", rt.profile_path.display());
-                    }
-                    crate::model::variant::set_host_rates(e.ceiling_gbps, Some(e));
+        let spawned = std::thread::Builder::new()
+            .name("codec-bench".into())
+            .spawn(move || {
+                crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+                if let Err(e) = rt.run_codec_bench() {
+                    tracing::warn!("codec bench: {e}");
                 }
-                Err(e) => tracing::warn!("codec bench: {e}"),
-            }
-        });
+            });
         if let Err(e) = spawned {
             tracing::warn!("codec bench: cannot start thread: {e}");
         }
+    }
+    /// True when the cached host profile has codec rates measured with the current codec sources.
+    pub fn codec_rates_current(&self) -> bool {
+        self.profile
+            .codec
+            .as_ref()
+            .is_some_and(|c| c.codec_hash == codec::source_hash())
+    }
+
+    /// Runs [`Self::benchmark_codecs`], saves the profile and publishes the rates; returns the
+    /// number of formats measured.
+    pub fn run_codec_bench(self: &Arc<Self>) -> Result<usize, String> {
+        let e = self.benchmark_codecs()?;
+        let n = e.gbps.len();
+        let mut p = self.profile.clone();
+        p.ceiling_gbps = e.ceiling_gbps;
+        p.codec = Some(e.clone());
+        if let Err(err) = std::fs::write(
+            &self.profile_path,
+            serde_json::to_vec_pretty(&p).unwrap_or_default(),
+        ) {
+            tracing::warn!("codec bench: saving {}: {err}", self.profile_path.display());
+        }
+        crate::model::variant::set_host_rates(e.ceiling_gbps, Some(e));
+        Ok(n)
     }
 
     /// Host profile micro-benchmarks: MPP correctness vs `nn::linear`, dispatch cost, GEMM timings.
@@ -911,7 +1004,7 @@ impl Runtime {
     fn timed(
         &self,
         reps: usize,
-        encode: impl Fn(&ComputeCommandEncoderRef) -> Result<(), String>,
+        encode: impl Fn(&Counted) -> Result<(), String>,
     ) -> Result<f64, String> {
         let mut best = f64::INFINITY;
         for n in [1, reps, reps, reps] {
@@ -919,7 +1012,7 @@ impl Runtime {
                 let cb = self.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 for _ in 0..n {
-                    encode(enc)?;
+                    encode(&Counted::new(enc))?;
                 }
                 enc.end_encoding();
                 commit_and_wait(cb)?;
@@ -935,7 +1028,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     fn encode_gemm(
         &self,
-        enc: &ComputeCommandEncoderRef,
+        enc: &Counted,
         kind: GemmKernel,
         epi: Epi,
         x: (&Buffer, usize),
@@ -1771,6 +1864,8 @@ impl Session {
         mut state: Option<&mut crate::graph::StateStore>,
         inputs: Vec<Tensor>,
     ) -> Result<Vec<Tensor>, String> {
+        let run_start = Instant::now();
+        let mut sample: Option<RunSample> = None;
         if inputs.len() != graph.inputs.len() {
             return Err(format!(
                 "graph has {} inputs, got {}",
@@ -1906,7 +2001,7 @@ impl Session {
                     for _ in 0..2 {
                         let cb = self.rt.queue.new_command_buffer();
                         let enc = cb.new_compute_command_encoder();
-                        self.encode(enc, s, s_idx, &params_buf, &loc)?;
+                        self.encode(&Counted::new(enc), s, s_idx, &params_buf, &loc)?;
                         enc.end_encoding();
                         commit_and_wait(cb)?;
                         gpu_s = gpu_seconds(cb);
@@ -1921,7 +2016,9 @@ impl Session {
                 }
                 timings.sort_by(|a, b| b.2.total_cmp(&a.2));
                 let ceiling = self.rt.profile.ceiling_gbps.max(1.0);
-                eprintln!("profiler: per-command-buffer timing (bytes = operands read + output written)");
+                eprintln!(
+                    "profiler: per-command-buffer timing (bytes = operands read + output written)"
+                );
                 eprintln!(
                     "{:<20} | {:<25} | {:>8} | {:>8} | {:>8} | {:>8}",
                     "step", "kernel", "µs", "bytes", "GB/s", "% ceiling"
@@ -1938,7 +2035,11 @@ impl Session {
                 kinds.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
                 eprintln!("by kernel kind: kind | steps | total µs | GB/s | % ceiling");
                 for (kind, (n, s, bytes)) in kinds.iter().take(8) {
-                    let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
+                    let gbps = if *s > 0.0 {
+                        *bytes as f64 / s / 1e9
+                    } else {
+                        0.0
+                    };
                     eprintln!(
                         "  {kind:<22} {n:>4} {:>9.0} {gbps:>7.1} {:>6.1}%",
                         s * 1e6,
@@ -1947,7 +2048,11 @@ impl Session {
                 }
                 for (name, op_desc, s, bytes) in timings.iter().take(10) {
                     let us = s * 1e6;
-                    let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
+                    let gbps = if *s > 0.0 {
+                        *bytes as f64 / s / 1e9
+                    } else {
+                        0.0
+                    };
                     let pct = gbps / ceiling * 100.0;
                     eprintln!(
                         "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
@@ -1962,10 +2067,11 @@ impl Session {
             } else {
                 let cb = self.rt.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
+                let counted = Counted::new(enc);
                 let mut err = None;
                 let encode_start = std::time::Instant::now();
                 for (s_idx, s) in steps.iter().enumerate() {
-                    if let Err(e) = self.encode(enc, s, s_idx, &params_buf, &loc) {
+                    if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
                         err = Some(e);
                         break;
                     }
@@ -1976,7 +2082,16 @@ impl Session {
                     return Err(e);
                 }
                 commit_and_wait(cb)?;
-                self.last_gpu_s.store(gpu_seconds(cb).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                sample = Some(RunSample {
+                    gpu_ns: (gpu_seconds(cb) * 1e9) as u64,
+                    run_ns: 0,
+                    encode_ns: encode_dur.as_nanos() as u64,
+                    dispatches: counted.dispatches(),
+                });
+                self.last_gpu_s.store(
+                    gpu_seconds(cb).to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
                     let enc_us = encode_dur.as_micros();
                     let gpu_ms = gpu_seconds(cb) * 1e3;
@@ -1985,8 +2100,7 @@ impl Session {
             }
             Ok(())
         })?;
-
-        graph
+        let outs = graph
             .outputs
             .iter()
             .map(|&v| {
@@ -2001,13 +2115,18 @@ impl Session {
                 };
                 Ok(Tensor::F32(s.to_vec()))
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()?;
+        if let Some(mut s) = sample {
+            s.run_ns = run_start.elapsed().as_nanos() as u64;
+            push_run_sample(s);
+        }
+        Ok(outs)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn encode_gemv_or_gemm(
         &self,
-        enc: &ComputeCommandEncoderRef,
+        enc: &Counted,
         x: (&Buffer, usize),
         w_loc: (&Buffer, usize),
         graph_val_name: &str,
@@ -2105,7 +2224,9 @@ impl Session {
                     enc.set_buffer(5, Some(out.0), out.1 as u64);
                 }
                 let rows_per_tg = match format {
-                    WeightFormat::Gen(_) => crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64,
+                    WeightFormat::Gen(_) => {
+                        crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64
+                    }
                     _ => 16,
                 };
                 enc.dispatch_thread_groups(
@@ -2120,7 +2241,7 @@ impl Session {
 
     fn encode<'a>(
         &self,
-        enc: &ComputeCommandEncoderRef,
+        enc: &Counted,
         s: &Planned,
         step_idx: usize,
         params_buf: &Buffer,
@@ -2328,7 +2449,9 @@ impl Session {
                     bind(5, s.out);
                 }
                 let rows_per_tg = match format {
-                    WeightFormat::Gen(_) => crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64,
+                    WeightFormat::Gen(_) => {
+                        crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64
+                    }
                     _ => 16,
                 };
                 enc.dispatch_thread_groups(
@@ -3859,8 +3982,9 @@ fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
         WeightFormat::IQ3_S => n / 256 * 110,
         WeightFormat::NvFp4 => n / 2 + n / 16,
         WeightFormat::JesseLUT => n,
-        WeightFormat::Gen(f) => crate::graph::codec::codec(f)
-            .map_or(n * 4, |c| n / c.block_elems as usize * c.block_bytes as usize),
+        WeightFormat::Gen(f) => crate::graph::codec::codec(f).map_or(n * 4, |c| {
+            n / c.block_elems as usize * c.block_bytes as usize
+        }),
     }
 }
 
@@ -3877,9 +4001,8 @@ fn generated_gemv_pipelines(
         return Ok(HashMap::new());
     }
     let params = crate::graph::codegen::GemvParams::default();
-    let codec_of = |f: QuantFormat| {
-        crate::graph::codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))
-    };
+    let codec_of =
+        |f: QuantFormat| crate::graph::codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"));
     // Formats that share a block layout (IQ2_S / IQ2_M) share one kernel.
     let mut names: Vec<String> = Vec::new();
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
@@ -4027,6 +4150,26 @@ pub(crate) fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, |m, d| if d > m || d.is_nan() { d } else { m })
+}
+
+/// Removes all but the `keep` most recently modified files in `dir` named `tag*`, never `keep_path`.
+fn prune_cache(dir: &Path, tag: &str, keep_path: &Path, keep: usize) {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p != keep_path
+                && p.file_name()
+                    .is_some_and(|f| f.to_string_lossy().starts_with(tag))
+        })
+        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .collect();
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -4610,7 +4753,9 @@ mod tests {
         ];
         let mut seed = 0x9E3779B97F4A7C15u64;
         let mut next = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
         // Finite f16 scale (|x| in 2^-6..2^4) so the reference and the GPU never meet NaN/inf.
@@ -4633,7 +4778,9 @@ mod tests {
                 _ => &[0],
             };
             let (m, n, k) = (3usize, 37usize, be * 3);
-            let mut raw: Vec<u8> = (0..n * (k / be) * bb).map(|_| (next() >> 4) as u8).collect();
+            let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                .map(|_| (next() >> 4) as u8)
+                .collect();
             for blk in raw.chunks_exact_mut(bb) {
                 for &o in scale_at {
                     blk[o..o + 2].copy_from_slice(&f16(&mut next));
@@ -4643,7 +4790,13 @@ mod tests {
             let x = g.input("x", vec![m, k], DType::F32);
             let w_val = g.weight("w", vec![n, k], DType::Quant(f));
             let b_val = g.weight("b", vec![n], DType::F32);
-            let y = g.add("lin", Op::Linear, &[x, w_val, b_val], vec![m, n], DType::F32);
+            let y = g.add(
+                "lin",
+                Op::Linear,
+                &[x, w_val, b_val],
+                vec![m, n],
+                DType::F32,
+            );
             g.output(y);
             let mut w = Weights::new();
             w.insert(
@@ -4655,11 +4808,19 @@ mod tests {
                     out_features: n,
                 })),
             );
-            w.insert("b", Tensor::F32((0..n).map(|i| i as f32 * 0.01 - 0.2).collect()));
-            let xs: Vec<f32> = (0..m * k).map(|_| (next() % 2001) as f32 / 1000.0 - 1.0).collect();
+            w.insert(
+                "b",
+                Tensor::F32((0..n).map(|i| i as f32 * 0.01 - 0.2).collect()),
+            );
+            let xs: Vec<f32> = (0..m * k)
+                .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
             let (want, got) = both(&g, &w, vec![Tensor::F32(xs)], None);
             let err = rel_err(&want, &got);
-            assert!(err < 1e-4, "{f:?}: generated GEMV differs from CPU by {err}");
+            assert!(
+                err < 1e-4,
+                "{f:?}: generated GEMV differs from CPU by {err}"
+            );
             println!("generated gemv {f:?}: rel err {err:.2e}");
         }
     }
@@ -4677,7 +4838,12 @@ mod tests {
             QuantFormat::GGUF_Q5_K_M,
         ] {
             let (be, bb, _) = gguf_block_codec(f).unwrap();
-            for (n, k) in [(262144usize, 1536usize), (6144, 1536), (1536, 6144), (14336, 4096)] {
+            for (n, k) in [
+                (262144usize, 1536usize),
+                (6144, 1536),
+                (1536, 6144),
+                (14336, 4096),
+            ] {
                 let raw = vec![0u8; n * (k / be) * bb];
                 let bytes = raw.len();
                 let mut g = Graph::new();

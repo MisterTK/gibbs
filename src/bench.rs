@@ -42,6 +42,12 @@ pub struct BenchModel {
     pub runs: Option<usize>,
     #[serde(default)]
     pub reencode: Option<String>,
+    /// METRIC slug override (default: the file stem of `id`).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Prompt text file, relative to the suite file's directory; overrides `prompt`.
+    #[serde(default)]
+    pub prompt_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,15 +71,134 @@ pub struct ModelBenchResult {
     pub decode_tok_s: f64,
     pub roofline_tok_s: f64,
     pub roofline_pct: f64,
-    pub gpu_ms: f64,
-    /// Not measured by this harness (no per-step hook through `NativeLm`): omitted, never faked.
+    /// Median wall time per decode token (1000 / tok/s).
+    pub wall_ms: f64,
+    /// Median GPU time of the token's command buffer (absent when the model has no Metal run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_ms: Option<f64>,
+    /// Median time inside `run_prepared` (inputs, encode, GPU wait, output readback).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_ms: Option<f64>,
+    /// `wall_ms - gpu_ms`: everything that is not the GPU executing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encode_us: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatches: Option<f64>,
+    /// Time the streamed bytes take at the measured ceiling: the floor of a token.
+    pub weights_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_tok_s: Option<f64>,
     pub rss_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_kernels: Option<Vec<String>>,
+}
+
+fn median(v: &mut [f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    Some(v[v.len() / 2])
+}
+
+/// Loads `artifacts` on Metal under the `reencode` policy name. Returns the model and the policy
+/// the KL fallback chain actually applied (`None` for native loaders, which ignore it).
+pub fn load_for_bench(
+    artifacts: &crate::model::hub::ModelArtifacts,
+    reencode: &str,
+) -> Result<
+    (
+        crate::scheduler::ExecutableModel,
+        Option<crate::model::weight_format::ReencodePolicy>,
+    ),
+    String,
+> {
+    use crate::model::weight_format::{load_causal_lm_with, ReencodeConfig, ReencodePolicy};
+    let placement = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
+    match crate::model::native::load_native(artifacts, placement) {
+        Some(Ok(m)) => return Ok((crate::scheduler::ExecutableModel::Native(m), None)),
+        Some(Err(e)) => return Err(e),
+        None => {}
+    }
+    let hw = crate::hardware::HardwareCapability::probe_system();
+    let cfg = ReencodeConfig {
+        policy: reencode.parse()?,
+        ..Default::default()
+    };
+    let (graph_lm, choice) =
+        load_causal_lm_with(artifacts, crate::hardware::Device::Metal, None, &hw, &cfg)?;
+    // `applied` reads `max-speed`, `max-speed (FFN only)`, `low-bit-native` or `bit-exact`.
+    // ponytail: the FFN-only attempt is costed as full max-speed; exact bytes need per-tensor records.
+    let applied = choice
+        .reencode
+        .as_ref()
+        .and_then(|r| r.applied.split(" (").next()?.parse::<ReencodePolicy>().ok());
+    let exec = crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)?;
+    Ok((exec, applied))
+}
+
+/// Warm-up plus `runs` timed generations of `decode_tokens` tokens with drafters off; medians of
+/// the per-token wall, GPU and host times against the roofline given by `bytes_per_token`.
+/// `model` and `file` are left for the caller to fill.
+pub fn measure_loaded(
+    exec: &crate::scheduler::ExecutableModel,
+    prompt: &str,
+    decode_tokens: usize,
+    runs: usize,
+    bytes_per_token: u64,
+    ceiling_gbps: f64,
+) -> Result<ModelBenchResult, String> {
+    if bytes_per_token == 0 || ceiling_gbps <= 0.0 {
+        return Err("no weight bytes found, cannot compute a roofline".into());
+    }
+    exec.generate_text_measured_plain(prompt, 16, 0.0)?;
+    let (mut speeds, mut walls) = (Vec::new(), Vec::new());
+    let (mut gpu, mut run, mut enc, mut disp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..runs {
+        crate::graph::metal::take_run_samples();
+        let (_, passes, dur) = exec.generate_text_measured_plain(prompt, decode_tokens, 0.0)?;
+        let s = dur.as_secs_f64();
+        if s > 0.0 && passes > 0 {
+            speeds.push(passes as f64 / s);
+            walls.push(s * 1000.0 / passes as f64);
+        }
+        // Prefill samples come first; the last `passes` are the decode steps.
+        let samples = crate::graph::metal::take_run_samples();
+        for r in samples.iter().rev().take(passes) {
+            gpu.push(r.gpu_ns as f64 / 1e6);
+            run.push(r.run_ns as f64 / 1e6);
+            enc.push(r.encode_ns as f64 / 1e3);
+            disp.push(r.dispatches as f64);
+        }
+    }
+    let tok_s = median(&mut speeds).ok_or("no decode pass completed")?;
+    let wall_ms = median(&mut walls).unwrap_or(0.0);
+    let gpu_ms = median(&mut gpu);
+    let roofline_tok_s = ceiling_gbps / (bytes_per_token as f64 / 1e9);
+    Ok(ModelBenchResult {
+        model: String::new(),
+        file: String::new(),
+        codec_mix: None,
+        bytes_per_token,
+        bytes_basis: "streamed",
+        ceiling_gbps,
+        decode_tok_s: tok_s,
+        roofline_tok_s,
+        roofline_pct: tok_s / roofline_tok_s * 100.0,
+        wall_ms,
+        gpu_ms,
+        run_ms: median(&mut run),
+        // GPU and wall are separate medians; at tiny token times GPU can exceed wall by noise.
+        host_ms: gpu_ms.map(|g| (wall_ms - g).max(0.0)),
+        encode_us: median(&mut enc),
+        dispatches: median(&mut disp),
+        weights_ms: bytes_per_token as f64 / 1e9 / ceiling_gbps * 1e3,
+        prefill_tok_s: None,
+        rss_gb: get_peak_rss_gb(),
+        top_kernels: None,
+    })
 }
 
 fn get_peak_rss_gb() -> f64 {
@@ -85,6 +210,28 @@ fn get_peak_rss_gb() -> f64 {
     }
     #[cfg(not(target_os = "macos"))]
     0.0
+}
+
+/// Bytes of the weights file (or checkpoint directory): the roofline numerator of last resort.
+fn bench_file_bytes(artifacts: &crate::model::hub::ModelArtifacts) -> u64 {
+    artifacts
+        .weights_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .or_else(|| {
+            artifacts.local_dir.as_ref().map(|d| {
+                std::fs::read_dir(d)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum::<u64>()
+            })
+        })
+        .unwrap_or(0)
 }
 
 /// Runs a bench suite file and prints JSON lines plus METRIC lines.
@@ -105,134 +252,70 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
     let mut missed_floor = false;
     let mut roofline_pcts = Vec::new();
     let mut slug_speeds = Vec::new();
+    let suite_dir = std::path::Path::new(path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
 
     let hub = crate::model::hub::HuggingFaceHub::new();
+    let cache = crate::model::hub::HuggingFaceHub::cache_dir();
+    let mut rt = crate::graph::metal::Runtime::new(&cache).ok();
+    if let Some(r) = rt.as_ref().filter(|r| !r.codec_rates_current()) {
+        // The roofline ceiling and the re-encode rule both read measured codec rates.
+        let _lock = crate::hardware::gpu_lock()?;
+        let n = r.run_codec_bench()?;
+        println!("codec-bench: measured {n} formats");
+        rt = crate::graph::metal::Runtime::new(&cache).ok();
+    }
+    // Measured streaming ceiling of this GPU (host profile), not the spec-sheet figure.
+    let ceiling_gbps = rt
+        .as_ref()
+        .map(|rt| rt.profile().ceiling_gbps)
+        .unwrap_or_else(|| crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps);
 
     for model_cfg in &suite.models {
-        let prompt = model_cfg.prompt.as_ref().unwrap_or(&defaults.prompt);
         let decode_tokens = model_cfg.decode_tokens.unwrap_or(defaults.decode_tokens);
         let runs = model_cfg.runs.unwrap_or(defaults.runs);
+        let reencode = model_cfg.reencode.as_ref().unwrap_or(&defaults.reencode);
+        let fail = |e: &str| println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
+        let prompt = match &model_cfg.prompt_file {
+            Some(f) => match std::fs::read_to_string(suite_dir.join(f)) {
+                Ok(p) => p,
+                Err(e) => {
+                    fail(&format!("prompt_file '{f}': {e}"));
+                    had_error = true;
+                    continue;
+                }
+            },
+            None => model_cfg
+                .prompt
+                .clone()
+                .unwrap_or_else(|| defaults.prompt.clone()),
+        };
 
         let artifacts = match hub.auto_download_and_cache(&model_cfg.id, None) {
             Ok(a) => a,
             Err(e) => {
-                println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
+                fail(&e);
                 had_error = true;
                 continue;
             }
         };
 
-        let placement = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
-        let model_exec = match crate::model::native::load_native(&artifacts, placement) {
-            Some(Ok(m)) => crate::scheduler::ExecutableModel::Native(m),
-            Some(Err(e)) => {
-                println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
+        // Held until this model's row is printed: concurrent benchmarks would corrupt each other.
+        let _lock = crate::hardware::gpu_lock()?;
+        let (model_exec, applied) = match load_for_bench(&artifacts, reencode) {
+            Ok(x) => x,
+            Err(e) => {
+                fail(&e);
                 had_error = true;
                 continue;
             }
-            None => {
-                let hw = crate::hardware::HardwareCapability::probe_system();
-                let backend = crate::hardware::Device::Metal;
-                let reencode = model_cfg.reencode.as_ref().unwrap_or(&defaults.reencode);
-                let cfg = reencode.parse().map(|policy| {
-                    crate::model::weight_format::ReencodeConfig {
-                        policy,
-                        ..Default::default()
-                    }
-                });
-                match cfg.and_then(|cfg| {
-                    crate::model::weight_format::load_causal_lm_with(
-                        &artifacts, backend, None, &hw, &cfg,
-                    )
-                }) {
-                    Ok((graph_lm, _)) => {
-                        match crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)
-                        {
-                            Ok(exec) => exec,
-                            Err(e) => {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({"model": model_cfg.id, "error": e})
-                                );
-                                had_error = true;
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
-                        had_error = true;
-                        continue;
-                    }
-                }
-            }
         };
-
-        // Warm up: prefill prompt + decode 16 tokens and discard
-        let _ = model_exec.generate_text_measured(prompt, 16, 0.0, None);
-
-        // Run passes
-        let mut speeds = Vec::new();
-        let mut gpu_times = Vec::new();
-
-        for _ in 0..runs {
-            let (_, passes, dur) =
-                match model_exec.generate_text_measured(prompt, decode_tokens, 0.0, None) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        println!("{}", serde_json::json!({"model": model_cfg.id, "error": e}));
-                        had_error = true;
-                        break;
-                    }
-                };
-            let s = dur.as_secs_f64();
-            if s > 0.0 {
-                speeds.push(passes as f64 / s);
-                gpu_times.push(s * 1000.0 / passes.max(1) as f64);
-            }
-        }
-
-        if speeds.is_empty() {
-            continue;
-        }
-
-        speeds.sort_by(|a, b| a.total_cmp(b));
-        gpu_times.sort_by(|a, b| a.total_cmp(b));
-        let median_speed = speeds[speeds.len() / 2];
-        let median_gpu_ms = gpu_times[gpu_times.len() / 2];
-
-        // Measured streaming ceiling of this GPU (host profile), not the spec-sheet figure.
-        let ceiling_gbps = crate::graph::metal::Runtime::new(
-            &crate::model::hub::HuggingFaceHub::cache_dir(),
-        )
-        .map(|rt| rt.profile().ceiling_gbps)
-        .unwrap_or_else(|_| crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps);
-        let file_bytes = artifacts
-            .weights_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .or_else(|| {
-                artifacts.local_dir.as_ref().map(|d| {
-                    std::fs::read_dir(d)
-                        .ok()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|e| e.ok())
-                        .filter_map(|e| e.metadata().ok())
-                        .map(|m| m.len())
-                        .sum::<u64>()
-                })
-            })
-            .unwrap_or(0);
-        // Roofline numerator: bytes a decode step streams (matrices after the re-encode policy;
-        // embedding/PLE gather tables excluded). File size only when no header can be read.
-        let policy = model_cfg
-            .reencode
-            .as_ref()
-            .unwrap_or(&defaults.reencode)
-            .parse()
-            .unwrap_or_default();
+        // Roofline numerator: bytes a decode step streams (matrices after the re-encode policy
+        // that was actually applied; embedding/PLE gather tables excluded). File size only when
+        // no header can be read.
+        let policy = applied.unwrap_or_else(|| reencode.parse().unwrap_or_default());
         let streamed = artifacts
             .weights_path
             .as_ref()
@@ -241,60 +324,46 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
             .filter(|&b| b > 0);
         let (bytes_per_token, bytes_basis) = match streamed {
             Some(b) => (b, "streamed"),
-            None => (file_bytes, "file"),
+            None => (bench_file_bytes(&artifacts), "file"),
         };
-        let roofline_tok_s = if bytes_per_token > 0 {
-            ceiling_gbps / (bytes_per_token as f64 / 1e9)
-        } else {
-            0.0
-        };
-        if roofline_tok_s <= 0.0 {
-            return Err(format!(
-                "{}: no weight bytes found, cannot compute a roofline",
-                model_cfg.id
-            ));
-        }
-        let roofline_pct = (median_speed / roofline_tok_s) * 100.0;
-
-        roofline_pcts.push(roofline_pct);
-
-        let slug = model_cfg
-            .id
-            .split('/')
-            .last()
-            .unwrap_or(&model_cfg.id)
-            .replace(".gguf", "");
-        slug_speeds.push((slug.clone(), median_speed));
-
-        if let Some(floor) = model_cfg.min_tok_s {
-            if median_speed < floor {
-                missed_floor = true;
+        let mut res = match measure_loaded(
+            &model_exec,
+            &prompt,
+            decode_tokens,
+            runs,
+            bytes_per_token,
+            ceiling_gbps,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                fail(&e);
+                had_error = true;
+                continue;
             }
-        }
-
-        let file_str = artifacts
+        };
+        res.bytes_basis = bytes_basis;
+        res.model = model_cfg.id.clone();
+        res.file = artifacts
             .config_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| model_cfg.id.clone());
-
-        let res = ModelBenchResult {
-            model: model_cfg.id.clone(),
-            file: file_str,
-            codec_mix: None,
-            bytes_per_token,
-            bytes_basis,
-            ceiling_gbps,
-            decode_tok_s: median_speed,
-            roofline_tok_s,
-            roofline_pct,
-            gpu_ms: median_gpu_ms,
-            encode_us: None,
-            prefill_tok_s: None,
-            rss_gb: get_peak_rss_gb(),
-            top_kernels: None,
-        };
-
+        roofline_pcts.push(res.roofline_pct);
+        let slug = model_cfg.name.clone().unwrap_or_else(|| {
+            model_cfg
+                .id
+                .split('/')
+                .next_back()
+                .unwrap_or(&model_cfg.id)
+                .replace(".gguf", "")
+        });
+        slug_speeds.push((slug, res.decode_tok_s));
+        if model_cfg
+            .min_tok_s
+            .is_some_and(|floor| res.decode_tok_s < floor)
+        {
+            missed_floor = true;
+        }
         if let Ok(line) = serde_json::to_string(&res) {
             println!("{line}");
         }
@@ -344,6 +413,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 return Ok(4);
             }
         };
+        let _lock = crate::hardware::gpu_lock()?;
 
         // Load Native Metal and CPU models for bit-parity verification
         let (metal_exec, cpu_exec) = match (
@@ -428,7 +498,10 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
             m_logits = metal_exec.forward(&[m_top as u32], metal_tokens.len() - 1, &mut m_state)?;
             c_logits = cpu_exec.forward(&[c_top as u32], cpu_tokens.len() - 1, &mut c_state)?;
         }
-        eprintln!("parity: {} ok (8 steps, min cos {min_cos:.5})", model_cfg.id);
+        eprintln!(
+            "parity: {} ok (8 steps, min cos {min_cos:.5})",
+            model_cfg.id
+        );
         compared += 1;
     }
 
@@ -449,13 +522,19 @@ fn graph_lm_parity(
 ) -> Result<f32, String> {
     use crate::graph::{program::GraphProgram, Tensor};
     let hw = crate::hardware::HardwareCapability::probe_system();
-    let default_reencode = suite.defaults.as_ref().map_or_else(default_reencode, |d| d.reencode.clone());
+    let default_reencode = suite
+        .defaults
+        .as_ref()
+        .map_or_else(default_reencode, |d| d.reencode.clone());
     let cfg = model_cfg
         .reencode
         .as_ref()
         .unwrap_or(&default_reencode)
         .parse()
-        .map(|policy| crate::model::weight_format::ReencodeConfig { policy, ..Default::default() })?;
+        .map(|policy| crate::model::weight_format::ReencodeConfig {
+            policy,
+            ..Default::default()
+        })?;
     let (lm, _) = crate::model::weight_format::load_causal_lm_with(
         artifacts,
         crate::hardware::Device::Metal,
@@ -470,9 +549,17 @@ fn graph_lm_parity(
         crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
     )?;
     let _allow = crate::hardware::cpu_compute::allow();
-    let mut cpu = GraphProgram::compile(g, w, crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu))?;
+    let mut cpu = GraphProgram::compile(
+        g,
+        w,
+        crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
+    )?;
     let logits = |p: &mut GraphProgram, tok: u32, pos: usize| -> Result<Vec<f32>, String> {
-        match p.run(vec![Tensor::U32(vec![tok]), Tensor::U32(vec![pos as u32])])?.into_iter().next() {
+        match p
+            .run(vec![Tensor::U32(vec![tok]), Tensor::U32(vec![pos as u32])])?
+            .into_iter()
+            .next()
+        {
             Some(Tensor::F32(v)) => Ok(v),
             _ => Err("program did not return f32 logits".into()),
         }
@@ -490,12 +577,46 @@ fn graph_lm_parity(
         let nm = m.iter().map(|a| a * a).sum::<f32>().sqrt();
         let nc = c.iter().map(|a| a * a).sum::<f32>().sqrt();
         let cos = dot / (nm * nc).max(1e-9);
-        let top = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+        let top = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i)
+        };
         min_cos = min_cos.min(cos);
         if cos < 0.999 {
-            return Err(format!("step {pos}: cos {cos:.5} (metal top {}, cpu top {})", top(&m), top(&c)));
+            return Err(format!(
+                "step {pos}: cos {cos:.5} (metal top {}, cpu top {})",
+                top(&m),
+                top(&c)
+            ));
         }
         tok = top(&c) as u32;
     }
     Ok(min_cos)
+}
+
+/// `--probe-top5`: raw (no chat template) prompt logits of `model_id` on Metal, as one JSON line
+/// `{"model", "ids", "top5": [[id, logit], ...]}`; the llama.cpp oracle compares against it.
+pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
+    let artifacts =
+        crate::model::hub::HuggingFaceHub::new().auto_download_and_cache(model_id, None)?;
+    let _lock = crate::hardware::gpu_lock()?;
+    let (exec, _) = load_for_bench(&artifacts, "max-speed")?;
+    let ids = exec.tokenizer().encode(prompt);
+    let logits = exec.prompt_logits(ids.clone())?;
+    let vocab = exec.tokenizer().vocab_size();
+    let valid = if vocab > 0 {
+        logits.len().min(vocab)
+    } else {
+        logits.len()
+    };
+    let mut top: Vec<(usize, f32)> = logits[..valid].iter().copied().enumerate().collect();
+    top.sort_by(|a, b| b.1.total_cmp(&a.1));
+    top.truncate(5);
+    println!(
+        "{}",
+        serde_json::json!({"model": model_id, "ids": ids, "top5": top})
+    );
+    Ok(())
 }

@@ -438,15 +438,27 @@ impl ExecutableModel {
         if chunk_tokens.is_empty() {
             return Ok(None);
         }
-        let logits = match self {
-            Self::Nano(m) => {
-                let model = m.read();
-                let mut last_tok = 0;
-                for (i, &tok) in chunk_tokens.iter().enumerate() {
-                    last_tok = model.forward_token(tok, start_pos + i);
-                }
-                return Ok(is_last_chunk.then_some(last_tok));
+        if let Self::Nano(m) = self {
+            let model = m.read();
+            let mut last_tok = 0;
+            for (i, &tok) in chunk_tokens.iter().enumerate() {
+                last_tok = model.forward_token(tok, start_pos + i);
             }
+            return Ok(is_last_chunk.then_some(last_tok));
+        }
+        let logits = self.prefill_logits(chunk_tokens, start_pos, kv_cache)?;
+        Ok(is_last_chunk.then(|| self.sample(&logits, recent(all_prompt_tokens), temp, top_p)))
+    }
+
+    /// Logits at the last position of `chunk_tokens` (non-empty), advancing `kv_cache`.
+    pub(crate) fn prefill_logits(
+        &self,
+        chunk_tokens: &[u32],
+        start_pos: usize,
+        kv_cache: &mut Option<SeqKvCache>,
+    ) -> Result<Vec<f32>, String> {
+        Ok(match self {
+            Self::Nano(_) => return Err("Nano models have no logits".into()),
             Self::GraphLm(m) => {
                 let model = m.read();
                 let cache = match kv_cache
@@ -559,8 +571,16 @@ impl ExecutableModel {
                 std::mem::swap(&mut p.state, seq_state);
                 last_logits
             }
-        };
-        Ok(is_last_chunk.then(|| self.sample(&logits, recent(all_prompt_tokens), temp, top_p)))
+        })
+    }
+
+    /// Last-position logits for a text prompt (already tokenized, template applied by the caller).
+    pub fn prompt_logits(&self, ids: Vec<u32>) -> Result<Vec<f32>, String> {
+        let (ids, mut kv) = self.prepare(ids, &[], &PrepareCtx::default())?;
+        if ids.is_empty() {
+            return Err("the prompt encodes to no tokens".into());
+        }
+        self.prefill_logits(&ids, 0, &mut kv)
     }
 
     /// Top-k 50 / top-p sampling without repetition penalty; `temp <= 0` is greedy argmax.
@@ -618,6 +638,24 @@ impl ExecutableModel {
                 temperature,
             ),
             (_, d) => spec_generate(self, d, prompt, max_new_tokens, temperature),
+        }
+    }
+
+    /// [`Self::generate_text_measured`] with drafters off: one forward pass per generated token,
+    /// the quantity the bench's roofline is defined over.
+    pub fn generate_text_measured_plain(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        temperature: f32,
+    ) -> Result<(String, usize, std::time::Duration), String> {
+        match self {
+            Self::Nano(_) => Err("Nano models have no text generation loop".into()),
+            Self::GraphLm(m) => {
+                Ok(m.read()
+                    .generate_text_measured(prompt, max_new_tokens, temperature))
+            }
+            _ => spec_generate(self, None, prompt, max_new_tokens, temperature),
         }
     }
 
