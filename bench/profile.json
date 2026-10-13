@@ -1,0 +1,7 @@
+{
+  "defaults": { "decode_tokens": 16, "runs": 1, "reencode": "max-speed" },
+  "models": [
+    { "id": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf" },
+    { "id": "HuggingFaceTB/SmolLM2-135M-Instruct" }
+  ]
+}

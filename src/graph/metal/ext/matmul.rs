@@ -6,21 +6,32 @@
 //! (transposes swap the last two dims of that operand). An operand's leading dims must equal the
 //! output's or be all 1 (stride-0 broadcast).
 
-use super::{Enc, PlanOut};
+use super::super::Counted;
 use super::super::{u32_of, Planned, Runtime, Session};
+use super::{Enc, PlanOut};
 use crate::graph::{DType, Graph, Node, Op, ValueId};
-use metal::{ComputeCommandEncoderRef, MTLSize};
+use metal::MTLSize;
 use std::collections::HashMap;
 
 pub(super) const MSL: &str = include_str!("matmul.metal");
 /// Compute functions in `matmul.metal`.
-pub(super) const KERNELS: &[&str] = &["matmul_sg32", "matmul_sg64", "matmul_small_n", "matmul_small_k"];
+pub(super) const KERNELS: &[&str] = &[
+    "matmul_sg32",
+    "matmul_sg64",
+    "matmul_small_n",
+    "matmul_small_k",
+];
 
 /// Steps this group adds to the executor.
 #[derive(Debug, Clone)]
 pub enum Step {
     /// `p` = `MatmulParams` (m, n, k, a_row, a_col, b_row, b_col, a_bs, b_bs); `batch` on grid z.
-    MatMul { a: ValueId, b: ValueId, p: [u32; 9], batch: u32 },
+    MatMul {
+        a: ValueId,
+        b: ValueId,
+        p: [u32; 9],
+        batch: u32,
+    },
 }
 
 /// Whether the Metal executor lowers `op` for `dtype` (the weight/output dtype the placer passes).
@@ -35,7 +46,11 @@ pub(super) fn plan(
     node: &Node,
     _aliases: &mut HashMap<ValueId, (ValueId, usize)>,
 ) -> Option<Result<PlanOut<Step>, String>> {
-    let Op::MatMul { transpose_a: ta, transpose_b: tb } = node.op else {
+    let Op::MatMul {
+        transpose_a: ta,
+        transpose_b: tb,
+    } = node.op
+    else {
         return None;
     };
     Some(plan_matmul(g, node, ta, tb))
@@ -46,24 +61,43 @@ fn plan_matmul(g: &Graph, node: &Node, ta: bool, tb: bool) -> Result<PlanOut<Ste
     let &[a, b] = &node.inputs[..] else {
         return Err(format!("node '{name}': MatMul needs operands [a, b]"));
     };
-    let out = *node.outputs.first().ok_or_else(|| format!("node '{name}' has no output"))?;
+    let out = *node
+        .outputs
+        .first()
+        .ok_or_else(|| format!("node '{name}' has no output"))?;
     if [a, b, out].iter().any(|&v| g.value(v).dtype != DType::F32) {
-        return Err(format!("node '{name}': Metal MatMul needs f32 operands and output"));
+        return Err(format!(
+            "node '{name}': Metal MatMul needs f32 operands and output"
+        ));
     }
     let (sa, sb) = (&g.value(a).shape, &g.value(b).shape);
     if sa.len() < 2 || sb.len() < 2 {
-        return Err(format!("node '{name}': MatMul operands {sa:?} x {sb:?} must be rank >= 2"));
+        return Err(format!(
+            "node '{name}': MatMul operands {sa:?} x {sb:?} must be rank >= 2"
+        ));
     }
     let (ba, bb) = (&sa[..sa.len() - 2], &sb[..sb.len() - 2]);
-    let (ar, ac, br, bc) = (sa[sa.len() - 2], sa[sa.len() - 1], sb[sb.len() - 2], sb[sb.len() - 1]);
+    let (ar, ac, br, bc) = (
+        sa[sa.len() - 2],
+        sa[sa.len() - 1],
+        sb[sb.len() - 2],
+        sb[sb.len() - 1],
+    );
     let (m, k) = if ta { (ac, ar) } else { (ar, ac) };
     let (k2, n) = if tb { (bc, br) } else { (br, bc) };
     if k != k2 {
-        return Err(format!("node '{name}': MatMul inner dims {k} != {k2} ({sa:?} x {sb:?})"));
+        return Err(format!(
+            "node '{name}': MatMul inner dims {k} != {k2} ({sa:?} x {sb:?})"
+        ));
     }
     // Output batch = the larger operand batch; the other must match it (modulo leading 1s) or be all 1s.
     let prod = |d: &[usize]| d.iter().product::<usize>();
-    let trim = |d: &[usize]| d.iter().copied().skip_while(|&x| x == 1).collect::<Vec<_>>();
+    let trim = |d: &[usize]| {
+        d.iter()
+            .copied()
+            .skip_while(|&x| x == 1)
+            .collect::<Vec<_>>()
+    };
     let batch = prod(ba).max(prod(bb));
     let full = trim(if prod(ba) >= prod(bb) { ba } else { bb });
     let stride = |d: &[usize], size: usize| -> Result<u32, String> {
@@ -84,8 +118,23 @@ fn plan_matmul(g: &Graph, node: &Node, ta: bool, tb: bool) -> Result<PlanOut<Ste
     let (ac32, bc32) = (u32_of(ac)?, u32_of(bc)?);
     let (a_row, a_col) = if ta { (1, ac32) } else { (ac32, 1) };
     let (b_row, b_col) = if tb { (1, bc32) } else { (bc32, 1) };
-    let p = [u32_of(m)?, u32_of(n)?, u32_of(k)?, a_row, a_col, b_row, b_col, a_bs, b_bs];
-    let step = Step::MatMul { a, b, p, batch: u32_of(batch)? };
+    let p = [
+        u32_of(m)?,
+        u32_of(n)?,
+        u32_of(k)?,
+        a_row,
+        a_col,
+        b_row,
+        b_col,
+        a_bs,
+        b_bs,
+    ];
+    let step = Step::MatMul {
+        a,
+        b,
+        p,
+        batch: u32_of(batch)?,
+    };
     Ok(PlanOut::Step(step, batch * m * n))
 }
 
@@ -120,7 +169,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
 }
 
 /// Picks the kernel for the shape, sets the pipeline and dispatches (buffers 0..=3 already bound).
-fn launch(rt: &Runtime, enc: &ComputeCommandEncoderRef, p: [u32; 9], batch: u32) -> Result<(), String> {
+fn launch(rt: &Runtime, enc: &Counted, p: [u32; 9], batch: u32) -> Result<(), String> {
     let [m, n, _, _, _, _, b_col, _, _] = p;
     let (kernel, grid, tg) = if m <= 8 {
         if b_col == 1 {
@@ -131,7 +180,11 @@ fn launch(rt: &Runtime, enc: &ComputeCommandEncoderRef, p: [u32; 9], batch: u32)
     } else {
         // ponytail: tile choice by threadgroup count only; tune per shape if a model needs it.
         let big = (n.div_ceil(64) as u64) * (m.div_ceil(64) as u64) * batch as u64 >= 32;
-        let (name, t) = if big { ("matmul_sg64", 64) } else { ("matmul_sg32", 32) };
+        let (name, t) = if big {
+            ("matmul_sg64", 64)
+        } else {
+            ("matmul_sg32", 32)
+        };
         (name, (n.div_ceil(t), m.div_ceil(t)), 128)
     };
     enc.set_compute_pipeline_state(rt.pso(kernel)?);
@@ -145,23 +198,45 @@ fn launch(rt: &Runtime, enc: &ComputeCommandEncoderRef, p: [u32; 9], batch: u32)
 #[cfg(test)]
 mod tests {
     use super::super::super::testutil::{both, rand, rel_err, rt};
-        use crate::graph::{DType, Graph, Op, Tensor, Weights};
+    use crate::graph::{DType, Graph, Op, Tensor, Weights};
 
     /// `[..ba, ar, ac] x [..bb, br, bc]` through Metal vs the CPU executor.
-    fn check(ba: &[usize], bb: &[usize], m: usize, n: usize, k: usize, ta: bool, tb: bool, seed: u64) {
+    fn check(
+        ba: &[usize],
+        bb: &[usize],
+        m: usize,
+        n: usize,
+        k: usize,
+        ta: bool,
+        tb: bool,
+        seed: u64,
+    ) {
         let dims = |batch: &[usize], r: usize, c: usize, t: bool| {
             let mut s = batch.to_vec();
             s.extend(if t { [c, r] } else { [r, c] });
             s
         };
         let (sa, sb) = (dims(ba, m, k, ta), dims(bb, k, n, tb));
-        let full = if ba.iter().product::<usize>() >= bb.iter().product::<usize>() { ba } else { bb };
+        let full = if ba.iter().product::<usize>() >= bb.iter().product::<usize>() {
+            ba
+        } else {
+            bb
+        };
         let mut so = full.to_vec();
         so.extend([m, n]);
         let mut g = Graph::new();
         let a = g.input("a", sa.clone(), DType::F32);
         let b = g.input("b", sb.clone(), DType::F32);
-        let o = g.add("mm", Op::MatMul { transpose_a: ta, transpose_b: tb }, &[a, b], so, DType::F32);
+        let o = g.add(
+            "mm",
+            Op::MatMul {
+                transpose_a: ta,
+                transpose_b: tb,
+            },
+            &[a, b],
+            so,
+            DType::F32,
+        );
         g.output(o);
         let inputs = vec![
             Tensor::F32(rand(sa.iter().product(), seed)),
@@ -169,7 +244,10 @@ mod tests {
         ];
         let (want, got) = both(&g, &Weights::new(), inputs);
         let e = rel_err(&want, &got);
-        assert!(e < 1e-4, "{ba:?}x{bb:?} m{m} n{n} k{k} ta={ta} tb={tb}: rel err {e:e}");
+        assert!(
+            e < 1e-4,
+            "{ba:?}x{bb:?} m{m} n{n} k{k} ta={ta} tb={tb}: rel err {e:e}"
+        );
     }
 
     #[test]
@@ -177,9 +255,23 @@ mod tests {
         let mut n_cases = 0;
         // m <= 8 hits the small kernels, m > 8 the simdgroup ones; odd sizes straddle tile edges.
         for &(m, n, k) in &[
-            (1, 1, 1), (1, 3, 5), (1, 37, 129), (1, 130, 64), (3, 33, 7), (8, 64, 40), (9, 9, 9),
-            (7, 31, 8), (16, 16, 16), (33, 65, 17), (37, 37, 37), (64, 64, 64), (65, 63, 129),
-            (129, 129, 129), (100, 1, 50), (1, 200, 1), (130, 70, 3),
+            (1, 1, 1),
+            (1, 3, 5),
+            (1, 37, 129),
+            (1, 130, 64),
+            (3, 33, 7),
+            (8, 64, 40),
+            (9, 9, 9),
+            (7, 31, 8),
+            (16, 16, 16),
+            (33, 65, 17),
+            (37, 37, 37),
+            (64, 64, 64),
+            (65, 63, 129),
+            (129, 129, 129),
+            (100, 1, 50),
+            (1, 200, 1),
+            (130, 70, 3),
         ] {
             for ta in [false, true] {
                 for tb in [false, true] {
@@ -221,9 +313,20 @@ mod tests {
             let mut g = Graph::new();
             let a = g.input("a", sa, DType::F32);
             let b = g.input("b", sb, DType::F32);
-            let o = g.add("mm", Op::MatMul { transpose_a: false, transpose_b: false }, &[a, b], vec![1], DType::F32);
+            let o = g.add(
+                "mm",
+                Op::MatMul {
+                    transpose_a: false,
+                    transpose_b: false,
+                },
+                &[a, b],
+                vec![1],
+                DType::F32,
+            );
             g.output(o);
-            let Err(e) = super::plan_matmul(&g, &g.nodes[0], false, false) else { panic!("accepted") };
+            let Err(e) = super::plan_matmul(&g, &g.nodes[0], false, false) else {
+                panic!("accepted")
+            };
             assert!(e.contains(want) && e.contains("'mm'"), "{e}");
         }
     }
@@ -233,7 +336,14 @@ mod tests {
     fn linear_f32_epilogue_forms() {
         for m in [1, 5, 37] {
             let (k, n) = (21, 19);
-            for (bias, gelu, resid) in [(false, false, false), (true, false, false), (false, true, false), (true, true, false), (true, false, true), (false, false, true)] {
+            for (bias, gelu, resid) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (true, false, true),
+                (false, false, true),
+            ] {
                 let mut g = Graph::new();
                 let x = g.input("x", vec![m, k], DType::F32);
                 let w = g.weight("w", vec![n, k], DType::F32);
@@ -244,7 +354,13 @@ mod tests {
                 let mut y = g.add("lin", Op::Linear, &ins, vec![m, n], DType::F32);
                 let mut inputs = vec![Tensor::F32(rand(m * k, 1))];
                 if gelu {
-                    y = g.add("gelu", Op::Gelu { tanh: false }, &[y], vec![m, n], DType::F32);
+                    y = g.add(
+                        "gelu",
+                        Op::Gelu { tanh: false },
+                        &[y],
+                        vec![m, n],
+                        DType::F32,
+                    );
                 }
                 if resid {
                     let r = g.input("r", vec![m, n], DType::F32);
@@ -269,8 +385,26 @@ mod tests {
         let mut g = Graph::new();
         let x = g.input("x", vec![m, k], DType::F32);
         let w = g.weight("w", vec![n, k], DType::F32);
-        let y = g.add("y", Op::MatMul { transpose_a: false, transpose_b: true }, &[x, w], vec![m, n], DType::F32);
-        let z = g.add("z", Op::MatMul { transpose_a: true, transpose_b: false }, &[y, y], vec![n, n], DType::F32);
+        let y = g.add(
+            "y",
+            Op::MatMul {
+                transpose_a: false,
+                transpose_b: true,
+            },
+            &[x, w],
+            vec![m, n],
+            DType::F32,
+        );
+        let z = g.add(
+            "z",
+            Op::MatMul {
+                transpose_a: true,
+                transpose_b: false,
+            },
+            &[y, y],
+            vec![n, n],
+            DType::F32,
+        );
         g.output(z);
         let mut ws = Weights::new();
         ws.insert("w", Tensor::F32(rand(n * k, 5)));
@@ -281,8 +415,21 @@ mod tests {
     /// GPU time (µs) of one `[m, k] x [k, n]` dispatch: `Runtime::timed`, best of 3 command buffers.
     fn gpu_us(m: usize, n: usize, k: usize, tb: bool) -> f64 {
         let rt = rt();
-        let buf = |len: usize| rt.device.new_buffer_with_data(rand(len, len as u64).as_ptr().cast(), (len * 4) as u64, metal::MTLResourceOptions::StorageModeShared);
-        let (a, b, c) = (buf(m * k), buf(k * n), rt.device.new_buffer((m * n * 4) as u64, metal::MTLResourceOptions::StorageModeShared));
+        let buf = |len: usize| {
+            rt.device.new_buffer_with_data(
+                rand(len, len as u64).as_ptr().cast(),
+                (len * 4) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let (a, b, c) = (
+            buf(m * k),
+            buf(k * n),
+            rt.device.new_buffer(
+                (m * n * 4) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            ),
+        );
         let p: [u32; 9] = if tb {
             [m as u32, n as u32, k as u32, k as u32, 1, 1, k as u32, 0, 0]
         } else {
@@ -301,10 +448,19 @@ mod tests {
     #[test]
     #[ignore = "perf report: cargo test --release --lib matmul_perf -- --ignored --nocapture"]
     fn matmul_perf() {
-        for (m, n, k, tb) in [(512, 512, 512, false), (512, 512, 512, true), (2048, 2048, 2048, false), (1, 4096, 4096, false), (1, 4096, 4096, true)] {
+        for (m, n, k, tb) in [
+            (512, 512, 512, false),
+            (512, 512, 512, true),
+            (2048, 2048, 2048, false),
+            (1, 4096, 4096, false),
+            (1, 4096, 4096, true),
+        ] {
             let us = gpu_us(m, n, k, tb);
             let gb = ((k * n + m * k + m * n) * 4) as f64 / us / 1e3;
-            println!("matmul {m}x{n}x{k} tb={tb}: {:.0} GFLOP/s, {gb:.0} GB/s, {us:.0} us", 2.0 * (m * n * k) as f64 / us / 1e3);
+            println!(
+                "matmul {m}x{n}x{k} tb={tb}: {:.0} GFLOP/s, {gb:.0} GB/s, {us:.0} us",
+                2.0 * (m * n * k) as f64 / us / 1e3
+            );
         }
     }
 }

@@ -137,6 +137,10 @@ struct Cli {
     #[arg(long)]
     bench_parity: Option<String>,
 
+    /// Print the top-5 next-token logits (JSON) of --model for this raw prompt on Metal, then exit.
+    #[arg(long)]
+    probe_top5: Option<String>,
+
     #[arg(long)]
     tui_frame_log: Option<String>,
 }
@@ -293,6 +297,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parity_path) = &cli.bench_parity {
         let code = gibbs_engine::bench::run_bench_parity(parity_path)?;
         std::process::exit(code);
+    }
+    if let Some(prompt) = &cli.probe_top5 {
+        gibbs_engine::bench::probe_top5(&cli.model, prompt)?;
+        std::process::exit(0);
     }
     let telemetry = EngineTelemetry::new();
     #[cfg(target_os = "macos")]
@@ -610,19 +618,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 let (graph_lm, choice) =
-                    load_causal_lm_with(
-                        artifacts,
-                        backend,
-                        quant_override,
-                        &hw,
-                        &{
-                            let mut cfg =
-                                ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
-                            let t = telemetry.clone();
-                            cfg.log = Some(Arc::new(move |m: &str| t.log_info(m)));
-                            cfg
-                        },
-                    )
+                    load_causal_lm_with(artifacts, backend, quant_override, &hw, &{
+                        let mut cfg =
+                            ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
+                        let t = telemetry.clone();
+                        cfg.log = Some(Arc::new(move |m: &str| t.log_info(m)));
+                        cfg
+                    })
                     .map_err(|e| {
                         format!(
                             "Cannot load '{}': {}",
@@ -664,8 +666,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some((t, _)) if t <= 1e-4 => 0.0,
                 _ => 0.7,
             };
-            let (output, passes, decode) =
-                model_exec.generate_text_measured(prompt, max_toks, temperature, drafter.clone())?;
+            let (output, passes, decode) = model_exec.generate_text_measured(
+                prompt,
+                max_toks,
+                temperature,
+                drafter.clone(),
+            )?;
             println!("✨ Output:\n{}", output);
             let tok_s = passes as f64 / decode.as_secs_f64().max(1e-9);
             println!(

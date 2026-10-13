@@ -2,18 +2,19 @@
 //! owns a disjoint set of ops (planning, steps, kernels, encode, tests) and is reached through
 //! the dispatch functions here.
 
+use super::Counted;
 use super::{Planned, Session, TG};
 use crate::graph::{DType, Graph, Node, Op, ValueId};
-use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
+use metal::{Buffer, MTLSize};
 use std::collections::HashMap;
 
-pub(super) mod movement;
-pub(super) mod elementwise;
-pub(super) mod norm;
-pub(super) mod matmul;
-pub(super) mod conv;
 pub(super) mod attn;
+pub(super) mod conv;
+pub(super) mod elementwise;
+pub(super) mod matmul;
 pub(super) mod moe;
+pub(super) mod movement;
+pub(super) mod norm;
 
 /// All group kernel sources, appended to `metal_kernels.metal`.
 pub(super) fn msl() -> String {
@@ -158,7 +159,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &ExtStep) -> Resu
 
 /// Encoding context handed to group `encode` functions.
 pub(super) struct Enc<'a, 'b> {
-    pub enc: &'b ComputeCommandEncoderRef,
+    pub enc: &'b Counted<'b>,
     pub loc: &'b dyn Fn(ValueId) -> (&'a Buffer, usize),
     /// Per-step scratch parameter buffer; slot `step * 64`.
     pub params: &'b Buffer,
@@ -178,7 +179,8 @@ impl Enc<'_, '_> {
             let dst = (self.params.contents() as *mut u8).add(self.step * 64);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len().min(64));
         }
-        self.enc.set_buffer(slot, Some(self.params), (self.step * 64) as u64);
+        self.enc
+            .set_buffer(slot, Some(self.params), (self.step * 64) as u64);
     }
     /// One thread per element, `TG` threads per group.
     pub fn grid1(&self, n: usize) {

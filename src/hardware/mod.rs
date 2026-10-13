@@ -10,6 +10,29 @@ pub fn default_cache_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".cache").join("gibbs"))
 }
 
+/// Exclusive advisory lock (`<cache>/gpu.lock`, flock) serializing benchmarks on the GPU.
+/// Blocks (after saying so) while another benchmark holds it; released when the `File` drops.
+pub fn gpu_lock() -> Result<std::fs::File, String> {
+    let dir = default_cache_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("gpu.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("gpu lock: waiting for another benchmark");
+            f.lock().map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),
+    }
+    Ok(f)
+}
+
 /// Compute device for a pipeline or graph node, selected with `--backend`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Device {

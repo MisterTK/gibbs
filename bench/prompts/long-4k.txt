@@ -1,0 +1,212 @@
+# Research Sprint 2: run every model on Metal at roofline with a generic megakernel compiler, an autoresearch loop, and a TUI redesign
+
+## Context
+
+**Goals**
+- Every supported model runs on the Apple GPU (Metal) of this M5 Pro (48 GB unified memory, 16 GPU cores, Metal 4). No model compute runs on the CPU.
+- Batch-1 decode reaches ≥90% of the measured memory-bandwidth roofline. This holds for every major unsloth variant and every source encoding: GGUF and legacy GGML block types, safetensors BF16/F16/FP8, NVFP4, MXFP4, bitsandbytes, EXL3 and MLX.
+- Weights are re-encoded automatically for this GPU. The policy defaults to `max-speed` and can be changed in the TUI and on the CLI.
+- The fastest variant is picked by default; this default can also be changed in the TUI and on the CLI.
+- Gemma 4 E2B decodes at ≥150 tok/s.
+
+**Constraints**
+- Compiler work is generic: no model-specific kernels.
+- The work is driven by a bounded autoresearch (Karpathy) loop that checks the local luminal sources on every iteration.
+
+**TUI**
+- Only the Classic Gibbs avatar remains, drawn at higher resolution and larger.
+- Roofline, logprobs, tokens and latency become auto-flowing sidebar components instead of popups.
+- Rendering does not stall while weights load.
+
+**Plan file:** the first step copies this plan to `plans/research-sprint-2.md`.
+
+### Ground truth this plan relies on (measured or read this session)
+- **Gemma 4 E2B QAT `UD-Q2_K_XL`** (header parsed locally):
+  - Q4_0: 146 tensors, 1716.7 MB, including the 1.321 GB PLE table `per_layer_token_embd`.
+  - TQ2_0: 61 tensors, 395.8 MB. These are the 20 shared-layer double-wide FFNs [1536×12288] plus the tied `token_embd` (0.104 GB).
+  - Q8_0: 70 tensors, 29.2 MB. F16: 1 tensor, 27.5 MB. F32: 1.1 MB.
+  - Streamed per decode token: **0.849 GB**, which gives a **329 tok/s** roofline at 279 GB/s.
+- **Gemma 4 E4B QAT `UD-Q2_K_XL`**: Q4_0 2188 MB; TQ2_0 899.7 MB (token_embd 0.173 + PLE 0.727); Q8_0 58.5; F16 55.1. Streamed: **2.477 GB/token**, a 113 tok/s roofline.
+- **Qwen3.5-9B IQ2_M** (DavidAU, cached): IQ2_S, IQ3_S and Q4_K, plus a **2.03 GB BF16 `output.weight`**. Streamed: 4.49 GB/token.
+- **Measured start**:
+  - Gemma 4 E2B: 65.2 tok/s (commit fa4b217).
+  - Qwen3.5-9B IQ2_M: 31.3 tok/s.
+  - SmolLM2-135M BF16: 194.5 tok/s, with 0.27 GB streamed.
+  - Gemma 4 E4B: 0.01 tok/s (user report).
+  - The best streaming rate seen on this host is 278.78 GB/s, from a BF16 GEMV (`autoresearch_compiler_log.tsv` row 10). That exceeds the `memory_sweep` ceiling, so the sweep under-measures.
+- **Previous log is not a baseline.** Rows 0–6 of `autoresearch_compiler_log.tsv` (dated 2025-05-18) have no reproducible source. Use them for nothing.
+- **Weight packing**:
+  - `Weights::from_gguf` packs only Q4_0, Q8_0, IQ4_XS, IQ2_S, Q4_K, Q2_K and IQ3_S (`src/model/weights.rs:431-441`). Every other type, TQ2_0 included, is dequantized to a bf16 `Mat`.
+  - For E2B QAT this turns 0.29 GB of TQ2_0 FFN weight into 2.26 GB of bf16 read every token. It is the main reason E2B sits at 65 tok/s.
+- **Per-token Metal path**: `metal::Session::run_prepared` (`src/graph/metal.rs:1366-1528`) does all of the following each token:
+  - creates one command buffer with one serial encoder and calls `commit_and_wait`;
+  - rebuilds the state `HashMap<String, Arc<Buffer>>`;
+  - copies every output with `to_vec()`;
+  - passes params with `set_bytes`.
+  - It does not use an ICB.
+- **Placement**:
+  - `place_graph` with `Pin(target)` silently falls back to CPU for each unsupported node (`src/graph/placement.rs:227-240`).
+  - `GraphProgram::compile` (`src/graph/program.rs:48-174`) runs passes before placement and builds one `Session` per Metal segment.
+  - The in-flight `src/model/native.rs:181-190` rewrites `Pin(Cpu)` to `Pin(Metal)`.
+- **Existing fusion passes**:
+  - `Step::MegakernelMlp` (`src/graph/metal.rs:2381-2500`) is 5–6 ordinary dispatches under one name.
+  - `fuse_qkv_pass` and `fuse_gate_up_pass` concatenate weight copies (`src/graph/passes/fusion.rs:8-30`).
+  - `MegakernelKind::Ple` (in-flight) is a Gemma-specific pattern.
+  - `fuse_attn_prep_pass` only counts matches (`src/graph/passes/megakernel.rs:24-96`).
+- **CPU attention bugs**:
+  - The `CachedAttention` window test `current_pos >= w && ki < current_pos - w` (`src/graph/cpu.rs:760`) exposes w+1 keys. Gemma native (`src/model/gemma4/text.rs:550`) exposes w keys.
+  - CPU state writes clone the whole K/V buffer every token (`src/graph/cpu.rs:799-806`).
+- **RoPE**: `Op::Rope { head_dim, rotary_dim, base, variant }` computes `1/base^(2j/rotary_dim)` (`src/graph/cpu.rs:684-689`). It cannot express any of:
+  - Gemma proportional RoPE (`inv_freq_sliding`/`inv_freq_full` in `gemma4/text.rs`);
+  - M-RoPE;
+  - llama3, YaRN or LongRoPE scaling.
+- **No persistent megakernel.** Persistent grid-barrier kernels were measured on this host (`PLAN.md:17`). They are correct only up to 192 TGs × 256 threads, and the barrier costs 0.8–3.3 µs against 1.6–2.7 µs for a dispatch boundary. So this plan builds no persistent single-dispatch kernel. Here **"megakernel" means: fused kernels in one generated MSL library per program, replayed by one ICB per decode variant.**
+- **First-load TUI freeze** has three causes:
+  - `load_causal_lm_for` materializes f32 weights (`src/model/weight_format.rs:150`), then `choose()`/`measure()` (`:279-370`) runs CPU GEMV and whole-model probes. These go through `par_tasks`, which spawns `available_parallelism−1` threads per call (`src/model/nn.rs:62-84`).
+  - The picker's `scan_local()` and `dir_size()` run on the UI thread (`src/tui/picker.rs:211-228, 836-952`).
+  - So does `run_roofline_probe()` (`src/tui/mod.rs:630-685`).
+- **TUI rendering**:
+  - The modals render only when width is under 105 columns (`src/tui/render.rs:153-162`).
+  - There are 20 avatar styles (`src/tui/mascot.rs:16-39`); `Classic` is the one to keep.
+- **Default variant**: picked by bpw (`QuantFormat::hardware_speed_rank`, `src/hardware/mod.rs:439-482`). That chose `UD-Q2_K_XL` for the E2B QAT repo.
+- **Roofline formula**: `effective_bandwidth = tps × model file size` (`src/telemetry/mod.rs:225-234`), clamped with `.min(100.0)`.
+- **metal-rs 0.33 API**:
+  - ICB: `new_indirect_command_buffer_with_descriptor`, `indirect_compute_command_at_index`, `IndirectComputeCommandRef::{set_kernel_buffer, set_barrier, concurrent_dispatch_threadgroups}`, `execute_commands_in_buffer`, `use_resources`, `ComputePipelineDescriptor::set_support_indirect_command_buffers`.
+  - Encoders: `compute_command_encoder_with_dispatch_type`.
+  - Counters: `compute_command_encoder_with_descriptor`, `ComputePassDescriptor::sample_buffer_attachments`, `new_counter_sample_buffer_with_descriptor`, `resolve_counter_range`.
+- **Dependencies**: `bytes` is 1.12.1 in `Cargo.lock`, so `Bytes::from_owner` exists. The luminal sources are at `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/luminal-0.2.0` and `.../luminal_metal-0.2.0`. Disk has 626 GB free.
+
+### Target pipeline
+
+```mermaid
+flowchart LR
+  F[GGUF / GGML / safetensors / NVFP4 / FP8 / bnb / EXL3 / MLX] --> L[loader: packed tensors, zero-copy mmap]
+  L --> R[re-encode policy + KL gate + disk cache]
+  R --> B[family graph builder, n = 1/8/32/128/512]
+  B --> C[canonicalize: DCE, CSE, arithmetic]
+  C --> P[placement: strict Metal]
+  P --> FU[fusion: horizontal, prologue, epilogue, attention-prologue]
+  FU --> G[codegen: one MSL library per program]
+  G --> PL[plan: arena, params buffer, roofline bytes]
+  PL --> X[decode: ICB replay per token; prefill: bucket encode]
+```
+
+## Approach
+
+Phases are ordered. Each step leaves `cargo build --release` and `cargo test --lib` green. Phase 7 (TUI) touches only `src/tui/**`, `src/telemetry/**` and `src/model/nn.rs` (S7.3), so it can proceed in parallel with Phases 3–6, except S7.5, which needs S1.2 and S3.6. The loop (Phase 8) starts after Phases 1–6.
+
+### Phase 0: Bootstrap
+
+**S0.1 Store the plan.** Write this file verbatim to `plans/research-sprint-2.md`, next to the existing `plans/research-sprint-1.md`.
+
+**S0.2 Snapshot the in-flight work.** These 13 modified files are uncommitted:
+- `src/graph/{cpu,metal,mod,placement}.rs`, `src/graph/passes/megakernel.rs`
+- `src/main.rs`
+- `src/model/gemma4/{gguf,mod,text}.rs`, `src/model/native.rs`
+- `src/scheduler/mod.rs`
+- `src/tui/{mascot,mod}.rs`
+
+Steps:
+1. Run `cargo build --release && cargo test --lib -q`.
+2. If it passes: `git add src && git commit -m "wip: pre-sprint-2 in-flight gemma4/megakernel/tui changes"`.
+3. If it fails: `git stash push -m pre-sprint-2-inflight src`, and name the stash in the sprint report.
+4. Then `git switch -c research-sprint-2`.
+
+**S0.3 Refresh the code graph.** Run `~/.cargo/bin/graphify-rs build --no-llm --update` (the existing graph at `~/.graphify-rs/rust-inference-server-25835ed9d907aeb7` dates from 2026-09-26). Loop iterations use `graphify-rs affected` and `graphify-rs query` from it (S8.3).
+
+### Phase 1: Honest measurement (everything else is judged by it)
+
+**S1.1 Bandwidth ceiling.**
+- Rewrite `Runtime::benchmark_memory_bandwidth` (`src/graph/metal.rs:462-505`) to take the max GB/s over:
+  - 3 kernels: the existing `memory_sweep` (4×ulong2 per thread); a 2×ulong4 variant; and a grid-stride 16 B/thread variant with 4 iterations per thread;
+  - a 1 GiB shared buffer (larger than the SLC);
+  - 20 reps, with GPU timestamps as today.
+- Store `stream_gbps` and `ceiling_gbps = max(stream_gbps, best codec GEMV GB/s from S3.6)` in the cached host profile, at the existing path `~/.cache/gibbs/host/<slug>-<msl_tag>-<src_hash>.json`.
+- In `EngineTelemetry::get_summary` (`src/telemetry/mod.rs:225-234`), delete the `.min(100.0)` clamp.
+- When a percentage exceeds 100.5, log once: `roofline > 100%: ceiling {c:.1} GB/s is below the achieved {a:.1} GB/s; re-run the host profile`.
+
+**S1.2 Exact bytes per token from the compiled program.**
+- Add fields to `PreparedPlan` (`src/graph/metal.rs:2830`):
+  - `weight_bytes: u64`: the device byte length of every weight buffer read by a step, counted once per reading step. `Embedding` steps count `ids × row_bytes`.
+  - `state_reads: Vec<StateRead>`, with `pub struct StateRead { pub name: String, pub bytes_per_pos: u64, pub window: Option<usize>, pub fixed_bytes: u64 }`:
+    - `CachedAttention` contributes K and V entries with `bytes_per_pos = kv_width × dtype_bytes`. KV-shared readers add their own entry.
+    - `DeltaRule` and `CausalConv1dCached` contribute `fixed_bytes = 2 × state_bytes` (read plus write).
+  - `flops_per_run: u64`: GEMM `2·m·n·k`, conv `2·Cout·(Cin/g)·kh·kw·Hout·Wout`, attention `4·nq·nk·head_dim·heads`.
+- Add to `GraphProgram`:
+  - `pub fn bytes_per_token(&self, pos: usize) -> u64 { weight_bytes + Σ (visible(pos, window) × bytes_per_pos) + Σ fixed_bytes }`, where `visible = min(pos+1, window.unwrap_or(usize::MAX))`.
+  - `pub fn roofline(&self, pos: usize) -> Roofline { bytes_per_token, ceiling_gbps, roofline_tok_s }`.
+- Telemetry:
+  - Replace `set_model_size_bytes(file size)` (`src/tui/mod.rs:1006-1012` and the `src/main.rs` load path) with `set_bytes_per_token(u64)`. The scheduler calls it after every decode step with the program's value at that position.
+  - `effective_bandwidth_gbps = current_tps × bytes_per_token / 1e9`.
+- The headless decode line in `src/main.rs:619-636` gains a second line: `📈 Roofline: {pct:.1}% of {roofline_tok_s:.1} tok/s ({bytes_per_token} B/token at {ceiling:.1} GB/s)`.
+
+**S1.3 CLI flags.** Add these to the flat clap `Cli` (`src/main.rs:25-115`):
+- `--max-tokens <N>`: replaces the hardcoded 64 at `:620-626`.
+- `--ctx <N>` (default 8192): KV capacity, see S2.3.
+- `--reencode <max-speed|low-bit-native|bit-exact>`, `--reencode-max-kl <f32>`, `--variant <fastest|fastest-4bit|best-quality>`: see S3.5 and S3.6.
+- `--bench <suite.json>` and `--bench-parity <suite.json>`.
+
+**S1.4 Bench harness** in `src/bench.rs` (new; no in-process harness exists, and `autoresearch.sh` only scrapes test output). Delete `autoresearch.sh`.
+
+Suite schema, parsed with the existing `serde_json` dependency (no new crate). Unknown keys are an error: `#[serde(deny_unknown_fields)]`.
+
+```json
+{
+  "defaults": {
+    "prompt": "Explain the second law of thermodynamics to a curious student.",
+    "decode_tokens": 128,
+    "runs": 3,
+    "reencode": "max-speed"
+  },
+  "models": [
+    {
+      "id": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
+      "min_tok_s": 150.0,
+      "reference": true
+    }
+  ]
+}
+```
+
+Per-model `reencode`, `prompt`, `decode_tokens` and `runs` override `defaults`. `min_tok_s` is an optional hard floor. `reference` includes the model in `--bench-parity`.
+
+Per model:
+1. Load as a strict Metal program (S4.1).
+2. Warm up: prefill the prompt, then decode 16 tokens and discard them.
+3. Run `runs` passes. Each pass decodes `decode_tokens` greedy tokens from a fresh sequence.
+4. Report the median decode tok/s. Also report the GPU ms/token (median of the command-buffer `GPUEndTime − GPUStartTime`), the CPU encode µs, `bytes_per_token(prompt_len + decode_tokens/2)`, `roofline_pct = tok_s × bytes / ceiling`, prefill tok/s and peak RSS (`getrusage`).
+
+Output:
+- One JSON line per model, with keys `model, file, codec_mix, bytes_per_token, ceiling_gbps, decode_tok_s, roofline_tok_s, roofline_pct, gpu_ms, encode_us, prefill_tok_s, rss_gb`.
+- Then `METRIC geomean_roofline_pct=X`, `METRIC min_roofline_pct=Y`, and `METRIC <slug>_tok_s=Z` for every entry with `min_tok_s`.
+- A load or run error prints `{"model":…,"error":"…"}` and the process exits with code 2 after finishing the suite. A miss on `min_tok_s` exits with code 3.
+
+**S1.5 Parity guard.** `--bench-parity` runs each `reference = true` model:
+- Generate 8 greedy tokens through the Metal program and through the same graph and weights on `cpu::run` (explicit CPU reference).
+- Require top-1 equality and a logits cosine ≥ 0.999 at every step.
+- On failure, exit 4 with `parity: {model} step {i}: metal {a} != cpu {b} (cos {c:.5})`.
+- `reference = true` is set only for models with ≤4B streamed parameters.
+
+**S1.6 Per-kernel GPU profiler** (`GIBBS_PROFILE_KERNELS=1`).
+- `run_prepared` gives each step its own compute encoder from `compute_command_encoder_with_descriptor`. Each encoder carries timestamp sample-buffer attachments at encoder start and end, from a `new_counter_sample_buffer_with_descriptor` on the device's timestamp counter set.
+- After completion, read the timestamps with `resolve_counter_range`. Print `step | kernel | µs | bytes | GB/s | % ceiling`, sorted by time.
+- `--bench` adds `"top_kernels"` (10 entries) to each JSON line.
+- If stage-boundary counter sampling is unsupported (`supportsCounterSampling:` via `msg_send!`), use one command buffer per step with `GPUStartTime`/`GPUEndTime` instead, and print `profiler: per-command-buffer timing (coarse)`.
+
+**S1.7 Suites.**
+- `bench/loop.json` (fast; used by every loop iteration):
+  - E2B QAT `UD-Q2_K_XL` (floor 150, reference)
+  - `unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf`
+  - `unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf` (reference)
+  - DavidAU Qwen3.5-9B IQ2_M (local path)
+  - `unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf` (reference)
+  - `HuggingFaceTB/SmolLM2-135M-Instruct` (BF16, reference)
+- `bench/sprint2.json` (full, held-out for loop generalization) lists every row in the table below. Each `id` is a verified HF path; `bit-exact` rows exercise native codecs.
+
+| id | family / format coverage | reencode |
+| :--- | :--- | :--- |
+| unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf | gemma4; Q4_0+TQ2_0+Q8_0+F16; floor 150 | max-speed |
+| unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf | gemma4 UD K-quants; floor 150 | max-speed |
+| unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_0.gguf | gemma4 Q4_0; floor 150 | max-speed |
+| unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-UD-IQ2_M.gguf | IQ2/IQ3 codecs | bit-exact |
+| unsl
