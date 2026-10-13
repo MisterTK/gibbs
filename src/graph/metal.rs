@@ -263,30 +263,13 @@ impl WeightFormat {
             WeightFormat::IQ3_S => "gemv_iq3_s",
             WeightFormat::BF16 => "gemv_bf16",
             WeightFormat::F16 => "gemv_f16",
-            WeightFormat::Gen(QuantFormat::GGUF_TQ2_0) => "gemv_tq2_0",
             _ => return None,
         })
     }
 
-    /// Rows one threadgroup of the hand GEMV covers, and its thread count.
-    fn hand_rows_per_tg(self) -> u64 {
-        match self {
-            WeightFormat::Gen(QuantFormat::GGUF_TQ2_0) => 8,
-            _ => 16,
-        }
-    }
-
-    fn hand_threads(self) -> u64 {
-        match self {
-            WeightFormat::Gen(QuantFormat::GGUF_TQ2_0) => 64,
-            _ => 256,
-        }
-    }
-
-    /// Today's kernel for this format: the hand one where it exists (not for generated-storage formats,
-    /// whose hand kernel is a tuner variant only), else generated at 2 rows.
+    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if self.hand_kernel().is_some() && !matches!(self, WeightFormat::Gen(_)) {
+        if self.hand_kernel().is_some() {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)
@@ -2024,7 +2007,7 @@ impl Session {
             ))
         };
         match (format, variant.kernel) {
-            (WeightFormat::Gen(q), k) if k != GemvKernel::Hand => generated(
+            (WeightFormat::Gen(q), _) => generated(
                 q,
                 if variant.kernel == GemvKernel::Gen {
                     variant.rows_per_sg
@@ -2037,7 +2020,7 @@ impl Session {
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
             (_, GemvKernel::Hand) => match format.hand_kernel() {
-                Some(name) => Ok((self.rt.pso(name)?.clone(), format.hand_rows_per_tg())),
+                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
                 None => Err(format!(
                     "Metal executor: unsupported packed GEMV format {format:?}"
                 )),
@@ -2875,15 +2858,7 @@ impl Session {
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
-                    MTLSize::new(
-                        if variant.kernel == GemvKernel::Hand {
-                            format.hand_threads()
-                        } else {
-                            256
-                        },
-                        1,
-                        1,
-                    ),
+                    MTLSize::new(256, 1, 1),
                 );
             }
             Step::GemmBatchedPacked {
@@ -7478,165 +7453,6 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 "persistent {tgs:>3} TGs: {:.1} us/step = {:.0} GB/s, max |diff| {err:e}",
                 t / steps as f64 * 1e6,
                 bytes * steps as f64 / t / 1e9
-            );
-        }
-    }
-
-    /// ggml's `kernel_mul_mv_tq2_0_f32_impl` (4 rows per simdgroup, 2 simdgroups, hoisted telescoped y
-    /// coefficients shared by the rows, floor() instead of masks) ported to our buffer contract, timed next
-    /// to the generated TQ2_0 GEMV on the same data (`cargo test --release --lib tq2_ggml_rate -- --ignored --nocapture`).
-    #[test]
-    #[ignore = "bandwidth measurement"]
-    fn tq2_ggml_rate() {
-        const SRC: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-constant short NR0 = 4;
-kernel void tq2_ggml(device const uchar* src0 [[buffer(0)]], device const float* y [[buffer(1)]],
-                     device float* dst [[buffer(2)]], constant uint2& p [[buffer(3)]],
-                     uint tg [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]],
-                     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const int nb = p.y / 256;
-    const int first_row = (tg * 2 + sgitg) * NR0;
-    const ulong row_bytes = (ulong)nb * 66;
-    float sumf[NR0] = {0.f};
-    constexpr short NBLOCK = 4;
-    constexpr short NB = 32 / NBLOCK;
-    const short blk = tiisg / NB;
-    const short htg = tiisg % NB;
-    device const float4* yb4 = (device const float4*)(y + 4 * htg + blk * 256);
-    float4 coef[4];
-    for (int ib = blk; ib < nb; ib += NBLOCK) {
-        FOR_UNROLL (short h0 = 0; h0 < 2; ++h0) {
-            const float4 y0 = yb4[0 + 32 * h0];
-            const float4 y1 = yb4[8 + 32 * h0];
-            const float4 y2 = yb4[16 + 32 * h0];
-            const float4 y3 = yb4[24 + 32 * h0];
-            float sumy = 0.f;
-            FOR_UNROLL (short j = 0; j < 4; ++j) {
-                coef[j] = float4(y0[j], y1[j] - 4.0f * y0[j], y2[j] - 4.0f * y1[j], y3[j] - 4.0f * y2[j]);
-                sumy += (y0[j] + y1[j]) + (y2[j] + y3[j]);
-            }
-            FOR_UNROLL (short row = 0; row < NR0; ++row) {
-                if (first_row + row >= (int)p.x) break;
-                device const uchar* xb = src0 + (ulong)(first_row + row) * row_bytes + (ulong)ib * 66;
-                device const uchar* qs = xb + 4 * htg + 32 * h0;
-                const float d = float(*(device const half*)(xb + 64));
-                float sum = -sumy;
-                FOR_UNROLL (short j = 0; j < 4; ++j) {
-                    const float v = (float)qs[j];
-                    sum += coef[j][0] * v + coef[j][1] * floor(v * 0.25f) + coef[j][2] * floor(v * 0.0625f) + coef[j][3] * floor(v * 0.015625f);
-                }
-                sumf[row] += d * sum;
-            }
-        }
-        yb4 += 256 * NBLOCK / 4;
-    }
-    for (int row = 0; row < NR0; ++row) {
-        const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0 && first_row + row < (int)p.x) dst[first_row + row] = tot;
-    }
-}
-"#;
-        let rt = rt();
-        let dev = rt.device.clone();
-        let lib = dev
-            .new_library_with_source(SRC, &metal::CompileOptions::new())
-            .unwrap();
-        let pso = dev
-            .new_compute_pipeline_state_with_function(&lib.get_function("tq2_ggml", None).unwrap())
-            .unwrap();
-        let q = dev.new_command_queue();
-        for (rows, cols) in [
-            (6144usize, 1536usize),
-            (1536, 6144),
-            (2048, 1536),
-            (1536, 2048),
-            (262144, 1536),
-        ] {
-            let bytes = rows * (cols / 256) * 66;
-            let copies = ((192usize << 20) / bytes).max(1);
-            let mut s = 0x9E3779B97F4A7C15u64;
-            let ws: Vec<Buffer> = (0..copies)
-                .map(|_| {
-                    let b = new_shared_buffer(&dev, bytes).unwrap();
-                    let p = b.contents() as *mut u8;
-                    for i in 0..bytes {
-                        s = s
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
-                        unsafe { *p.add(i) = (s >> 56) as u8 };
-                    }
-                    b
-                })
-                .collect();
-            let x = new_shared_buffer(&dev, cols * 4).unwrap();
-            unsafe {
-                for i in 0..cols {
-                    *(x.contents() as *mut f32).add(i) = 0.5
-                }
-            };
-            let y = new_shared_buffer(&dev, rows * 4).unwrap();
-            let mut best = f64::INFINITY;
-            for rep in 0..9 {
-                let cb = q.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&pso);
-                for w in &ws {
-                    enc.set_buffer(0, Some(w), 0);
-                    enc.set_buffer(1, Some(&x), 0);
-                    enc.set_buffer(2, Some(&y), 0);
-                    set_bytes(enc, 3, &[rows as u32, cols as u32]);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(8), 1, 1),
-                        MTLSize::new(64, 1, 1),
-                    );
-                }
-                enc.end_encoding();
-                commit_and_wait(cb).unwrap();
-                if rep > 0 {
-                    best = best.min(gpu_seconds(cb));
-                }
-            }
-            let ggml = (copies * bytes) as f64 / 1e9 / best;
-            let ours = rt
-                .bench_gemv(
-                    QuantFormat::GGUF_TQ2_0,
-                    &[(rows, cols)],
-                    &WeightFormat::of_quant(QuantFormat::GGUF_TQ2_0).gemv_variants(),
-                )
-                .unwrap();
-            let hand = rt.pso("gemv_tq2_0").unwrap().clone();
-            let mut best_h = f64::INFINITY;
-            for rep in 0..9 {
-                let cb = q.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&hand);
-                for w in &ws {
-                    enc.set_buffer(0, Some(w), 0);
-                    enc.set_buffer(1, Some(&x), 0);
-                    enc.set_buffer(2, Some(&y), 0);
-                    set_bytes(enc, 3, &[rows as u32, cols as u32, 1u32, 0u32, 0u32]);
-                    enc.set_buffer(4, Some(&y), 0);
-                    enc.set_buffer(5, Some(&y), 0);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(8), 1, 1),
-                        MTLSize::new(64, 1, 1),
-                    );
-                }
-                enc.end_encoding();
-                commit_and_wait(cb).unwrap();
-                if rep > 0 {
-                    best_h = best_h.min(gpu_seconds(cb));
-                }
-            }
-            let hand_rate = (copies * bytes) as f64 / 1e9 / best_h;
-            println!(
-                "TQ2_0 {rows}x{cols}: standalone port {ggml:.0} GB/s, integrated hand kernel {hand_rate:.0} GB/s (same harness); engine harness {:?}",
-                ours.iter()
-                    .map(|t| (t.0.label(), t.1 as u32))
-                    .collect::<Vec<_>>()
             );
         }
     }
