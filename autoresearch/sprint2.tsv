@@ -2,3 +2,4 @@ iteration	timestamp	commit	metric	delta	guard	status	luminal_ref	hypothesis	top_
 0	2026-10-12T18:50:00Z	f96b199	19.29	0.00	pass	keep	baseline	Dynamic roofline metric baseline with physical weights bytes	gemv_mpp	gemv_mpp
 1	2026-10-12T18:55:30Z	bb32ce2	19.58	+0.29	pass	keep	luminal_metal matmul.rs:79-103	fuse MLP blocks with sliced gate_up into megakernel	gemv_mpp	gemv_mpp
 2	2026-10-12T20:54:14Z	268dc28	23.27	+3.98	fail(full-lib)	discard	-	iteration 1 broke scheduler parity tests the old guard never ran	-	-
+3	2026-10-12T19:50:00Z	941e384	28.99	0.00	pass	metric-reset	-	metric redefined (streamed bytes, measured ceiling, GPU-only; not comparable with rows 0-2); bench/local.json geomean after G1-G4	-	-
