@@ -5447,6 +5447,9 @@ mod tests {
             QuantFormat::GGUF_Q6_K,
             QuantFormat::GGUF_Q8_0,
             QuantFormat::GGUF_IQ4_XS,
+            QuantFormat::GGUF_Q5_K_M,
+            QuantFormat::GGUF_Q3_K,
+            QuantFormat::GGUF_IQ4_NL,
         ] {
             let fmt = WeightFormat::of_quant(f);
             for shape in [
