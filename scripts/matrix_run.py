@@ -244,7 +244,8 @@ def main():
     while not stop:
         items = load(MATRIX, {"items": []})["items"]
         state, cur = load(STATE, {}), commit()
-        fresh = [i for i in items if i["id"] not in state]
+        # Small files first: the link is slow (~0.5-2 MB/s), so this maximizes rows per day.
+        fresh = sorted((i for i in items if i["id"] not in state), key=lambda i: i["bytes"])
         stale = [i for i in items if i["id"] in state and state[i["id"]].get("last_commit") != cur]
         queue = fresh + stale
         if not queue:

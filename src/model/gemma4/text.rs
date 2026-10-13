@@ -1008,7 +1008,9 @@ impl TextModel {
             );
 
             let down = match &l.moe {
-                Some(m) => m.add_to_graph(&mut g, &mut w, &format!("{p}.moe"), x, down, self.eps, n),
+                Some(m) => {
+                    m.add_to_graph(&mut g, &mut w, &format!("{p}.moe"), x, down, self.eps, n)
+                }
                 None => down,
             };
             let post_ff_w = g.weight(format!("{p}.post_ff_ln.weight"), vec![h], DType::F32);
@@ -1305,9 +1307,14 @@ pub fn tiny_moe_model() -> TextModel {
     for l in 0..2 {
         let mut s = |n: &str, shape: Vec<usize>| specs.push((format!("{p}.layers.{l}.{n}"), shape));
         for n in [
-            "input_layernorm.weight", "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight",
-            "post_feedforward_layernorm.weight", "router.scale", "pre_feedforward_layernorm_2.weight",
-            "post_feedforward_layernorm_1.weight", "post_feedforward_layernorm_2.weight",
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+            "router.scale",
+            "pre_feedforward_layernorm_2.weight",
+            "post_feedforward_layernorm_1.weight",
+            "post_feedforward_layernorm_2.weight",
         ] {
             s(n, vec![h]);
         }
@@ -1327,17 +1334,28 @@ pub fn tiny_moe_model() -> TextModel {
         s("mlp.experts.up_proj", vec![experts, ff, h]);
         s("mlp.experts.down_proj", vec![experts, h, ff]);
     }
-    let sizes: std::collections::HashMap<String, usize> =
-        specs.iter().map(|(n, s)| (n.clone(), s.iter().product())).collect();
+    let sizes: std::collections::HashMap<String, usize> = specs
+        .iter()
+        .map(|(n, s)| (n.clone(), s.iter().product()))
+        .collect();
     let weights = crate::model::weights::Weights::from_f32(specs, |name| {
-        let n: u64 = name.bytes().enumerate().map(|(i, b)| (i as u64 + 1) * b as u64).sum();
+        let n: u64 = name
+            .bytes()
+            .enumerate()
+            .map(|(i, b)| (i as u64 + 1) * b as u64)
+            .sum();
         let one = name.ends_with("layer_scalar") || name.ends_with("_norm.weight");
         Ok((0..sizes[name])
             .map(|i| {
-                let hash = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15) ^ n.wrapping_mul(0xD1B54A32D192ED03))
-                    .wrapping_mul(0x2545F4914F6CDD1D);
+                let hash = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)
+                    ^ n.wrapping_mul(0xD1B54A32D192ED03))
+                .wrapping_mul(0x2545F4914F6CDD1D);
                 let r = (hash >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
-                if one { 1.0 + 0.2 * r } else { 0.8 * r }
+                if one {
+                    1.0 + 0.2 * r
+                } else {
+                    0.8 * r
+                }
             })
             .collect())
     })
@@ -1370,7 +1388,10 @@ mod tests {
         let model = tiny_moe_model();
         assert!(model.has_moe());
         let (g, w) = model.to_decode_graph().unwrap();
-        assert!(g.nodes.iter().any(|n| matches!(n.op, crate::graph::Op::MoeLinear { .. })));
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, crate::graph::Op::MoeLinear { .. })));
         #[cfg(target_os = "macos")]
         let mut prog = crate::graph::program::GraphProgram::compile(
             g.clone(),
@@ -1385,7 +1406,12 @@ mod tests {
         for pos in 0..6usize {
             let mut emb = vec![0.0f32; model.hidden];
             model.embed_row(tok, &mut emb);
-            let inputs = || vec![crate::graph::Tensor::F32(emb.clone()), crate::graph::Tensor::U32(vec![pos as u32])];
+            let inputs = || {
+                vec![
+                    crate::graph::Tensor::F32(emb.clone()),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ]
+            };
             let want = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
             let want = want[0].as_f32().unwrap();
             assert!(want.iter().all(|v| v.is_finite()));
@@ -1393,12 +1419,21 @@ mod tests {
             {
                 let got = prog.run(inputs()).unwrap();
                 let got = got[0].as_f32().unwrap();
-                let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+                let dot: f64 = want
+                    .iter()
+                    .zip(got)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum();
                 let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
                 let cos = dot / (n(want) * n(got));
                 assert!(cos >= 0.999, "step {pos}: cosine {cos}");
             }
-            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            tok = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32;
         }
     }
 
@@ -1748,6 +1783,7 @@ mod tests {
             pre_ff_ln: vec![1.0; h],
             post_ff_ln: vec![1.0; h],
             ple: None,
+            moe: None,
             scalar: 1.0,
         };
         let model = TextModel {
