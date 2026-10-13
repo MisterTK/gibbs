@@ -113,7 +113,7 @@ impl GraphProgram {
                 let rt = crate::graph::metal::Runtime::shared()?;
                 let session =
                     crate::graph::metal::Session::new_for_graph(rt, &weights, Some(&graph))?;
-                let prepared_plan = session.prepare_plan(&graph)?;
+                let prepared_plan = session.prepare_plan_searched(&graph)?;
                 CompiledSegment::Metal {
                     graph,
                     session,
@@ -355,7 +355,11 @@ mod tests {
                 })
                 .sum();
             assert!(nodes > 0);
-            assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), nodes, "{rows:?}");
+            assert_eq!(
+                rows.iter().map(|r| r.count).sum::<usize>(),
+                nodes,
+                "{rows:?}"
+            );
             assert!(rows.iter().all(|r| r.device == device), "{rows:?}");
             assert!(rows.iter().any(|r| r.op == "Linear"), "{rows:?}");
             assert!(rows.iter().all(|r| r.avenue == "kernel"), "{rows:?}");
