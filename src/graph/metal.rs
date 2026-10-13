@@ -1429,6 +1429,8 @@ pub struct Session {
     attn_scratch: Mutex<Option<Buffer>>,
     /// Decode fusion switches chosen by the on-device search ([`FusionFlags`]).
     fusion_flags: std::sync::atomic::AtomicU8,
+    /// Test hook of [`Session::fusion_cost`]: when positive, the dispatch cost the model uses.
+    dispatch_us_override: std::sync::atomic::AtomicU64,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -1987,6 +1989,7 @@ impl Session {
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
             fusion_flags: std::sync::atomic::AtomicU8::new(FusionFlags::ALL.bits()),
+            dispatch_us_override: std::sync::atomic::AtomicU64::new(0),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
@@ -2107,14 +2110,27 @@ impl Session {
     /// iteration 5 measured, before the host profile has one) and streaming ceiling.
     fn fusion_cost(&self) -> super::fusion_cost::FusionCost {
         let p = &self.rt.profile;
+        let forced = f64::from_bits(
+            self.dispatch_us_override
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         super::fusion_cost::FusionCost {
-            dispatch_us: if p.dispatch_us > 0.0 {
+            dispatch_us: if forced > 0.0 {
+                forced
+            } else if p.dispatch_us > 0.0 {
                 p.dispatch_us
             } else {
                 1.2
             },
             ceiling_gbps: p.ceiling_gbps.max(p.stream_gbps).max(1.0),
         }
+    }
+
+    /// Pins the cost model's dispatch cost (tests: a large value makes every fusion profitable).
+    #[cfg(test)]
+    fn force_dispatch_us(&self, us: f64) {
+        self.dispatch_us_override
+            .store(us.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Prepares the planned steps and activation arena allocation for `graph` once.
@@ -5941,9 +5957,7 @@ mod tests {
     /// head_dim 256, intermediate 6144, 128-key cache): the fixture `scripts/fusion_vs_xla.py` compares
     /// with XLA. Prints `FUSION_BLOCK {"us": <median GPU us>, "dispatches": <n>}`; run once per
     /// `GIBBS_FUSION` value (`cargo test --release --lib fusion_block_bench -- --ignored --nocapture`).
-    #[test]
-    #[ignore = "measurement"]
-    fn fusion_block_bench() {
+    fn decode_block() -> (Graph, Weights) {
         let (h, nh, hd, ff, t) = (1536usize, 8usize, 256usize, 6144usize, 128usize);
         let f = DType::F32;
         let (mut g, mut w) = (Graph::new(), Weights::new());
@@ -6022,7 +6036,15 @@ mod tests {
         let d = g.add("down", Op::Linear, &[act, wd], vec![1, h], f);
         let out = g.add("res2", Op::Add, &[x1, d], vec![1, h], f);
         g.output(out);
+        (g, w)
+    }
 
+    /// `scripts/fusion_vs_xla.py` side: median GPU time and dispatch count of `decode_block`.
+    #[test]
+    #[ignore = "measurement"]
+    fn fusion_block_bench() {
+        let (g, w) = decode_block();
+        let h = 1536;
         let s = Session::new(rt(), &w).unwrap();
         let plan = s.prepare_plan(&g).unwrap();
         let mut state = StateStore::new();
@@ -6045,6 +6067,41 @@ mod tests {
             samples[100].gpu_ns as f64 / 1e3,
             samples[100].dispatches
         );
+    }
+
+    /// Every combination of the decode fusion switches (horizontal batching, attention append, attention
+    /// merge) gives the CPU executor's answer on a realistic block at a position past the split threshold.
+    #[test]
+    fn fusion_switches_match_cpu_on_a_decode_block() {
+        let (g, w) = decode_block();
+        let inputs = vec![Tensor::F32(rand(1536, 9)), Tensor::U32(vec![100])];
+        let want = cpu::run(&g, &w, &mut StateStore::new(), inputs.clone())
+            .unwrap()
+            .remove(0)
+            .into_f32()
+            .unwrap();
+        let s = Session::new(rt(), &w).unwrap();
+        // The cost model would decline some fusions at the measured dispatch cost: make all profitable.
+        s.force_dispatch_us(1000.0);
+        let mut dispatches = Vec::new();
+        for bits in 0..8u8 {
+            s.set_fusion_flags(FusionFlags::from_bits(bits));
+            let plan = s.prepare_plan(&g).unwrap();
+            take_run_samples();
+            let got = s
+                .run_prepared(&g, &plan, Some(&mut StateStore::new()), inputs.clone())
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            let e = rel_err(&want, &got);
+            assert!(e < 2e-3, "switches {bits:03b}: {e}");
+            dispatches.push(take_run_samples()[0].dispatches);
+        }
+        // Each switch removes dispatches (index = switch bits: batch 1, append 2, merge 4).
+        for off in [0b110, 0b101, 0b011] {
+            assert!(dispatches[7] < dispatches[off], "{dispatches:?}");
+        }
     }
 
     /// A two-output step's outputs are both live until their own last reader: later steps never
