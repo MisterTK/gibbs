@@ -1788,17 +1788,14 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
                                   uint2 ntg [[threads_per_threadgroup]]) {
     const uint hd = p.head_dim, head = tg.x, q_tok = tg.y;
     if (head >= p.n_heads || q_tok >= p.m) return;
-    threadgroup float w[256];  // n_splits <= 256 (the host caps it at ATTN_MAX_SPLITS * simdgroups)
     device const float* base = part + ((ulong)q_tok * p.n_heads + head) * p.n_splits * (hd + 2);
     float gm = -FLT_MAX;
     for (uint s = 0; s < p.n_splits; ++s) gm = max(gm, base[s * (hd + 2)]);
     float gl = 0.0f;
     for (uint s = 0; s < p.n_splits; ++s) gl += base[s * (hd + 2) + 1] * exp(base[s * (hd + 2)] - gm);
-    for (uint s = tid; s < p.n_splits; s += ntg.x) w[s] = exp(base[s * (hd + 2)] - gm);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint d = tid; d < hd; d += ntg.x) {
         float o = 0.0f;
-        for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * w[s];
+        for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
         out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
     }
 }
@@ -1819,6 +1816,9 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
                                       uint lane [[thread_index_in_simdgroup]],
                                       uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float tq[ATTN_HPT * NJ * 32];
+    threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_red[ATTN_MAX_SG * NJ * 32];
     const uint hd = p.head_dim;
     const uint row = NJ * 32;
     const uint hgroups = (p.group + ATTN_HPT - 1) / ATTN_HPT;
@@ -1875,20 +1875,32 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
             m[h] = m_new;
         }
     }
-    // Each simdgroup is its own slice of the split: its partial (running max, sum, unnormalised accumulator)
-    // goes straight to `part` and `attn_cached_merge_f32` combines all `n_splits * nsg` of them, so the
-    // kernel needs no cross-simdgroup reduction and no threadgroup barrier after the key loop.
     for (uint h = 0; h < ATTN_HPT; ++h) {
         if (h >= nh) break;
-        device float* out = part + (((ulong)q_tok * p.n_heads + head0 + h) * p.n_splits + split * nsg + sg) * (hd + 2);
         if (lane == 0) {
-            out[0] = m[h];
-            out[1] = l[h];
+            tg_m[h * ATTN_MAX_SG + sg] = m[h];
+            tg_l[h * ATTN_MAX_SG + sg] = l[h];
         }
         for (uint j = 0; j < NJ; ++j) {
             const uint d = lane + 32 * j;
-            if (d < hd) out[2 + d] = acc[h][j];
+            if (d < hd) tg_red[sg * row + d] = acc[h][j];
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float gm = -FLT_MAX;
+        for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[h * ATTN_MAX_SG + i]);
+        device float* out = part + (((ulong)q_tok * p.n_heads + head0 + h) * p.n_splits + split) * (hd + 2);
+        if (tid == 0) {
+            float gl = 0.0f;
+            for (uint i = 0; i < nsg; ++i) gl += tg_l[h * ATTN_MAX_SG + i] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
+            out[0] = gm;
+            out[1] = gl;
+        }
+        for (uint d = tid; d < hd; d += nsg * 32) {
+            float o = 0.0f;
+            for (uint i = 0; i < nsg; ++i) o += tg_red[i * row + d] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
+            out[2 + d] = o;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
