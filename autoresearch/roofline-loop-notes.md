@@ -244,3 +244,6 @@ The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture'
 ## Iteration 23 (F6 append-only): DISCARD
 - Quiet-gate verify: +0.12 pp, noise 0.01, min ratio 0.993: correct but below the 0.30 pp floor, so the 15-dispatch saving is not worth the kernel complexity. Both F6 commits reverted (iteration 22's revert had silently failed and was redone here with `git revert d5daac3 3a0183a`). The fused merge and the append stay on `experiment/bundle-21` / `4f7a303`.
 - Next: F5 GLU epilogue (needs per-weight tuned variants in MegakernelMlp first), then the host-gap work.
+
+## Iteration 24 (F5 GLU epilogue in MegakernelMlp): DISCARD
+- Quiet gate: +0.04 pp, noise 0.26, min ratio 0.996. The 15 fewer E2B dispatches are invisible: with iterations 22-23 this is the third dispatch-count reduction (-15..-30 per token) that moves nothing, so per-dispatch cost on this plan is not the lever. Remaining levers: the host gap (0.3 ms of 7.7 ms E2B after chunking) and GEMV bandwidth efficiency on the dominant weight classes.
