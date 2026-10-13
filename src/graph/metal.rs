@@ -7212,6 +7212,9 @@ mod tests {
             (3, 3, 32),
             (6, 1, 32),
             (6, 2, 128),
+            // E2B's sliding (hd 256) and global (hd 512) layers: the 8- and 16-value kernel variants.
+            (8, 1, 256),
+            (8, 1, 512),
         ] {
             // Short caches for every shape; for the two widest, a cache past the 4096-row minimum of the
             // physical state buffers: allocated large at prefill (4200), and grown with a copy mid-decode
@@ -7320,7 +7323,7 @@ kernel void sep(device const half* w [[buffer(0)]], device const float* x [[buff
     uint row = tg * 8 + sg;
     if (row >= p.x) return;
     float s = row_dot(w + (ulong)row * p.y, x, p.y, lane);
-    if (lane == 0) y[row] = s * 0.01f;
+    if (lane == 0) y[row] = s;
 }
 kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffer(1)]],
                     device float* xb [[buffer(2)]], device atomic_uint* ctr [[buffer(3)]],
@@ -7333,13 +7336,14 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         device float* y = (s & 1) ? xa : xb;
         for (uint row = tg * 8 + sg; row < p.x; row += p.w * 8) {
             float v = row_dot(ws + (ulong)row * p.y, x, p.y, lane);
-            if (lane == 0) y[row] = v * 0.01f;
+            if (lane == 0) y[row] = v;
         }
         threadgroup_barrier(mem_flags::mem_device);
         if (tid == 0) {
             atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
             atomic_fetch_add_explicit(ctr, 1u, memory_order_relaxed);
-            while (atomic_load_explicit(ctr, memory_order_relaxed) < (s + 1) * p.w) {}
+            // Spin cap: a co-residency mistake ends the kernel (wrong results) instead of hanging the GPU.
+            for (uint spin = 0; spin < 20000000u && atomic_load_explicit(ctr, memory_order_relaxed) < (s + 1) * p.w; spin++) {}
             atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         }
         threadgroup_barrier(mem_flags::mem_device);
@@ -7364,15 +7368,15 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let w = new_shared_buffer(&dev, steps * n * n * 2).unwrap();
         unsafe {
             let p = w.contents() as *mut u16;
+            // Random f16 weights, variance 1/n: the chain keeps O(1) magnitudes and every row differs.
+            let mut s = 0x9E3779B97F4A7C15u64;
+            let amp = 3f32.sqrt() / (n as f32).sqrt();
             for i in 0..steps * n * n {
-                // f16 values in roughly [-0.05, 0.05]
-                *p.add(i) = if i % 3 == 0 {
-                    0x2A66
-                } else if i % 3 == 1 {
-                    0xAA66
-                } else {
-                    0x2800
-                };
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let u = ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0;
+                *p.add(i) = crate::model::f32_to_f16(u * amp);
             }
         }
         let xa = new_shared_buffer(&dev, n * 4).unwrap();
@@ -7429,8 +7433,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         run_sep();
         let t_sep = (0..5).map(|_| run_sep()).fold(f64::MAX, f64::min);
         let want = read(if steps % 2 == 0 { &xa } else { &xb });
+        let mag = want.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        assert!(mag > 1e-2, "degenerate chain: max |y| {mag}");
         println!(
-            "separate: {:.1} us/step = {:.0} GB/s",
+            "n {n}: separate {:.1} us/step = {:.0} GB/s (max |y| {mag:.2})",
             t_sep / steps as f64 * 1e6,
             bytes * steps as f64 / t_sep / 1e9
         );
