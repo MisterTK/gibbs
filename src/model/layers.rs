@@ -852,7 +852,13 @@ fn make_qx_quants(nmax: i32, x: &[f32], l: &mut [i8]) -> f32 {
 /// The affine K-quant search shared by Q4_K (`nmax` 15) and Q5_K (31): per 32-element sub-block a
 /// weighted least-squares (scale, min), then 6-bit packing of the eight scales and mins and the
 /// final levels `L`. Returns the packed 12 scale bytes, `d`, `dmin` as f16 bits and the levels.
-fn k_quant_affine(x: &[f32], nmax: i32, rmin: f32, nstep: i32, l: &mut [u8; 256]) -> ([u8; 12], u16, u16) {
+fn k_quant_affine(
+    x: &[f32],
+    nmax: i32,
+    rmin: f32,
+    nstep: i32,
+    l: &mut [u8; 256],
+) -> ([u8; 12], u16, u16) {
     let (mut scales, mut mins) = ([0.0f32; 8], [0.0f32; 8]);
     let (mut laux, mut weights) = ([0u8; 32], [0.0f32; 32]);
     let (mut max_scale, mut max_min) = (0.0f32, 0.0f32);
@@ -863,12 +869,25 @@ fn k_quant_affine(x: &[f32], nmax: i32, rmin: f32, nstep: i32, l: &mut [u8; 256]
         for (w, &v) in weights.iter_mut().zip(xs) {
             *w = av_x + v.abs();
         }
-        let (s, m) = make_qkx2_quants(nmax, xs, &weights, &mut l[32 * j..32 * j + 32], &mut laux, rmin, 0.1, nstep);
+        let (s, m) = make_qkx2_quants(
+            nmax,
+            xs,
+            &weights,
+            &mut l[32 * j..32 * j + 32],
+            &mut laux,
+            rmin,
+            0.1,
+            nstep,
+        );
         (scales[j], mins[j]) = (s, m);
         max_scale = max_scale.max(s);
         max_min = max_min.max(m);
     }
-    let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+    let inv_scale = if max_scale > 0.0 {
+        63.0 / max_scale
+    } else {
+        0.0
+    };
     let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
     let mut packed = [0u8; 12];
     for j in 0..8 {
@@ -987,16 +1006,28 @@ pub fn quantize_row_q6_k_ref(x: &[f32], out: &mut [u8]) {
             let q = |o: usize| l[j + i + o] as u8;
             ql[64 * half + i] = (q(0) & 0xF) | ((q(64) & 0xF) << 4);
             ql[64 * half + 32 + i] = (q(32) & 0xF) | ((q(96) & 0xF) << 4);
-            qh[32 * half + i] = (q(0) >> 4) | ((q(32) >> 4) << 2) | ((q(64) >> 4) << 4) | ((q(96) >> 4) << 6);
+            qh[32 * half + i] =
+                (q(0) >> 4) | ((q(32) >> 4) << 2) | ((q(64) >> 4) << 4) | ((q(96) >> 4) << 6);
         }
     }
 }
 
 /// Encodes `weights` (row-major, `cols` a multiple of 256) with one of the row encoders above.
-pub fn quantize_k_rows(weights: &[f32], cols: usize, block_bytes: usize, row: fn(&[f32], &mut [u8])) -> Vec<u8> {
-    assert!(cols % 256 == 0 && weights.len() % cols == 0, "K-quant rows need cols % 256 == 0, got {cols}");
+pub fn quantize_k_rows(
+    weights: &[f32],
+    cols: usize,
+    block_bytes: usize,
+    row: fn(&[f32], &mut [u8]),
+) -> Vec<u8> {
+    assert!(
+        cols % 256 == 0 && weights.len() % cols == 0,
+        "K-quant rows need cols % 256 == 0, got {cols}"
+    );
     let mut out = vec![0u8; weights.len() / 256 * block_bytes];
-    for (x, y) in weights.chunks_exact(256).zip(out.chunks_exact_mut(block_bytes)) {
+    for (x, y) in weights
+        .chunks_exact(256)
+        .zip(out.chunks_exact_mut(block_bytes))
+    {
         row(x, y);
     }
     out
@@ -1426,7 +1457,12 @@ pub fn quantize_f32_to_q4_0(weights: &[f32]) -> Vec<u8> {
                 max = w;
             }
         }
-        let d = max / -8.0;
+        // A block of {-m, 0, m} (ternary sources such as TQ2_0) with both signs present is not
+        // representable with d = max/-8 (the opposite sign clips to 7/8 m); d = m is exact (q = 8 ± 1).
+        let ternary = amax > 0.0
+            && chunk.iter().all(|&w| w == 0.0 || w.abs() == amax)
+            && chunk.contains(&-max);
+        let d = if ternary { amax } else { max / -8.0 };
         let id = if d != 0.0 { 1.0 / d } else { 0.0 };
         let d_f16 = crate::model::f32_to_f16(d);
         out.extend_from_slice(&d_f16.to_le_bytes());
@@ -2213,8 +2249,9 @@ mod tests {
     }
 
     fn fnv1a64(b: &[u8]) -> u64 {
-        b.iter()
-            .fold(0xcbf29ce484222325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100000001b3))
+        b.iter().fold(0xcbf29ce484222325u64, |h, &c| {
+            (h ^ c as u64).wrapping_mul(0x100000001b3)
+        })
     }
 
     /// Encoders reproduce ggml byte-for-byte (hash of all blocks) and so have ggml's exact RMSE.
@@ -2235,13 +2272,22 @@ mod tests {
         ];
         for (seed, format, hash, rmse_ref) in golden {
             let x = golden_input(seed);
-            let layer = QuantizedLinearLayer::from_f32("t", 256, x.len() / 256, &x, format).unwrap();
+            let layer =
+                QuantizedLinearLayer::from_f32("t", 256, x.len() / 256, &x, format).unwrap();
             let QuantizedWeight::GgufQuantized { raw_data, .. } = &layer.weight else {
                 panic!("{format:?} did not encode");
             };
-            assert_eq!(fnv1a64(raw_data), hash, "{format:?} seed {seed}: bytes differ from ggml");
+            assert_eq!(
+                fnv1a64(raw_data),
+                hash,
+                "{format:?} seed {seed}: bytes differ from ggml"
+            );
             let y = dequantize_gguf_blocks(format, raw_data).unwrap();
-            let sq: f64 = x.iter().zip(&y).map(|(a, b)| (*a as f64 - *b as f64).powi(2)).sum();
+            let sq: f64 = x
+                .iter()
+                .zip(&y)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum();
             let rmse = (sq / x.len() as f64).sqrt();
             assert!(
                 (rmse - rmse_ref).abs() < 1e-8,
@@ -2256,7 +2302,10 @@ mod tests {
     fn q4_0_and_q8_0_requantize_is_idempotent() {
         let x = golden_input(3);
         for (format, enc) in [
-            (QuantFormat::GGUF_Q4_0, quantize_f32_to_q4_0 as fn(&[f32]) -> Vec<u8>),
+            (
+                QuantFormat::GGUF_Q4_0,
+                quantize_f32_to_q4_0 as fn(&[f32]) -> Vec<u8>,
+            ),
             (QuantFormat::GGUF_Q8_0, quantize_f32_to_q8_0),
         ] {
             let once = enc(&x);

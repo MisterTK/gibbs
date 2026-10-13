@@ -63,6 +63,14 @@ pub fn host_eff(f: Q) -> f64 {
         .unwrap_or(DEFAULT_EFF)
 }
 
+/// Measured GEMV GB/s of `f` on this host; `None` until the codec benchmark has measured it.
+pub fn host_gbps(f: Q) -> Option<f64> {
+    HOST.read()
+        .1
+        .as_ref()
+        .and_then(|e| e.gbps.get(&key(f)).copied())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeaderTensor {
     pub name: String,

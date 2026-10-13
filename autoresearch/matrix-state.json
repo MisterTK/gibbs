@@ -1,0 +1,9 @@
+{
+ "ibm-granite/granite-4.2-8b-GGUF/granite-4.2-8b-Q2_K.gguf": {
+  "last_commit": "977074f116ee28ca1dae4d99e71928c087847489",
+  "last_status": "ok",
+  "roofline_pct": 28.488150057009843,
+  "attempts": 1,
+  "error": ""
+ }
+}
