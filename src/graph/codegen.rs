@@ -281,7 +281,7 @@ pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
 /// slot `s` (grid y) multiplies row `s` of `x` (`x_per_slot != 0`) or row `s / top_k` by the matrix
 /// `ids[s]`, writing row `s` of `y` (`[slots, rows]`). Buffers `w, x, y, MoeGemvParams {rows, cols,
 /// slots, top_k, experts, x_per_slot}, ids`; grid `(ceil(rows / gemv_rows_per_tg), slots)` of 256
-/// threads. A slot whose id is not below `experts` writes nothing.
+/// threads. A slot whose id is not below `experts` writes zeros.
 pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
     let name = gemv_indexed_name(codec, p);
     let dec = format!("decode8_{:?}", codec.format);
@@ -331,7 +331,12 @@ kernel void {name}(
     const uint slot = tg.y;
     if (row0 >= p.rows || slot >= p.slots) return;
     const uint expert = ids[slot];
-    if (expert >= p.experts) return;
+    if (expert >= p.experts) {{
+        if (lane == 0) {{
+            for (uint i = 0; i < {r}; i++) if (row0 + i < p.rows) y[(ulong)slot * p.rows + row0 + i] = 0.0f;
+        }}
+        return;
+    }}
     const ulong bank_row = (ulong)expert * p.rows;
     const uint subs = p.cols / 8;
     const uint blocks_per_row = p.cols / {be};
