@@ -194,3 +194,8 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 
 ## Scope directive (user, 2026-10-13)
 - Priority is generic compiler / megakernel / JIT passes (tuner, F1-F8 fusion, megakernel coverage, E1-E4). Load errors from modified or fine-tuned architectures (e.g. `ggml-org/Kev-0.8B-GGUF`: `GGUF tensor 'cls.output.weight' is not part of the qwen35 graph`) are NOT burned down: the matrix classifies them `unsupported-variant`, and they do not block stop rule A or 1.6.
+
+## Iteration 17 (keep): vectorised greedy argmax
+- ABBA Verify: +0.84 pp (base 41.06 -> cand 41.90), noise 0.57, min per-model ratio 0.984 (all >= 0.97); Guard pass (lib tests, cpu_free_matrix/op_coverage/codec_parity/gemma4_tests, 5 parity models, generic_guard). Base promoted to 089ba2d. Machine in its slow state (E2B 104 tok/s, gpu_ms 8.9), so absolute numbers are not comparable with iteration 13.
+- Expected 0.2 pp from 124 us of host sampling, measured 0.84 pp: more than 50 % above expectation and only 1.5x the noise floor; treat as a small real gain plus noise.
+- Revert target for later discards is the experiment commit hash, not HEAD (the scope-directive docs commit sits on top of it).
