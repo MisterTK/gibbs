@@ -18,4 +18,7 @@
 All "goes beyond" claims marked [INFERENCE] stay so until a counter-example is found; the acceptance check is the measured table of 4.9, not this catalog.
 
 ## XLA runtime comparator
-See "XLA comparator" below once `scripts/xla_block_bench.py` has been run (4.0 step 3).
+Venv `/tmp/xla-venv` (python3.12, jax 0.4.35, jaxlib 0.4.35, jax-metal 0.1.1) installed; `scripts/xla_block_bench.py` ran and the plugin's
+`jax.jit(f).lower(...).compile().as_text()` returns `None` (`as_text: expected string or bytes-like object, got 'NoneType'`), so no HLO fusion
+list and no kernel count exist. Per the 4.0 contingency decided in the plan: `xla_us_per_block` and `xla_kernels` are `null`, the comparator for 4.9 is
+the in-repo `GIBBS_FUSION=xla` policy, and no other XLA backend is tried.
