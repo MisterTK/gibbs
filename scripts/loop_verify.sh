@@ -25,13 +25,14 @@ for i, m in enumerate(s["models"]):
 print(len(s["models"]))
 PY
 )
-quiet() {  # wait (<= 120 s) until no other process is using the GPU; log when it never gets idle
-  for _ in $(seq 1 40); do
+quiet() {  # wait (<= 15 s) for an idle GPU, always log the utilization seen (other apps hold the GPU
+  # at 40-99 % for long stretches here, so a hard gate would never pass; the ABBA noise term carries it)
+  for _ in 1 2 3 4 5; do
     u=$(ioreg -r -d 1 -c IOAccelerator | grep -o '"Device Utilization %"=[0-9]*' | head -1 | cut -d= -f2)
-    [ "${u:-0}" -lt 5 ] && return 0
+    [ "${u:-0}" -lt 5 ] && break
     sleep 3
   done
-  echo "gpu busy before $1 (device utilization ${u}%)" >> target/loop/contention.log
+  echo "before $1: device utilization ${u:-?}%" >> target/loop/contention.log
 }
 run() {  # tag binary suite
   quiet "$1 $3"
