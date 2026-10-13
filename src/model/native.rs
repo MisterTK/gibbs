@@ -39,6 +39,10 @@ pub trait NativeLm: Send + Sync {
     }
     /// Weights and shape, for logs and the TUI (e.g. `bf16 weights, 24 layers, hidden 1024`).
     fn summary(&self) -> String;
+    /// The model's graph nodes by op kind, device and avenue; `None` when it runs no graph program.
+    fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
+        None
+    }
     fn tokenizer(&self) -> &Tokenizer;
     /// Positions one sequence may hold (prompt + output).
     fn context_len(&self) -> usize;
@@ -219,6 +223,11 @@ pub fn load_native(
     };
     let previous = reencode_override();
     let load_as = |policy: ReencodePolicy, ffn_only: bool| {
+        if let Some(p) = &user.progress {
+            // Every attempt counts its own tensors.
+            p.done.store(0, std::sync::atomic::Ordering::Relaxed);
+            p.total.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         set_reencode_override(Some(ReencodeConfig {
             policy,
             ffn_only,

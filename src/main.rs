@@ -143,6 +143,10 @@ struct Cli {
     #[arg(long)]
     probe_top5: Option<String>,
 
+    /// Print where the graph nodes of --model run (op kind, device, avenue) on Metal, then exit.
+    #[arg(long, default_value_t = false)]
+    explain_placement: bool,
+
     #[arg(long)]
     tui_frame_log: Option<String>,
 }
@@ -311,6 +315,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(prompt) = &cli.probe_top5 {
         gibbs_engine::bench::probe_top5(&cli.model, prompt)?;
+        std::process::exit(0);
+    }
+    if cli.explain_placement {
+        gibbs_engine::bench::explain_placement(&cli.model)?;
         std::process::exit(0);
     }
     let telemetry = EngineTelemetry::new();
@@ -654,6 +662,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 model_exec
             }
         };
+        // The roofline basis follows the policy the load applied (the gate may have fallen back).
+        let (applied, saved) = gibbs_engine::bench::applied_policy(
+            weights.as_ref(),
+            ReencodeConfig::effective().policy,
+        );
+        if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, applied, saved) {
+            telemetry.set_model_size_bytes(b);
+        }
         telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
         if let Some(d) = &cli.draft {
             let da = hub.auto_download_and_cache(d, token.as_deref())?;
