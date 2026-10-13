@@ -199,3 +199,16 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 - ABBA Verify: +0.84 pp (base 41.06 -> cand 41.90), noise 0.57, min per-model ratio 0.984 (all >= 0.97); Guard pass (lib tests, cpu_free_matrix/op_coverage/codec_parity/gemma4_tests, 5 parity models, generic_guard). Base promoted to 089ba2d. Machine in its slow state (E2B 104 tok/s, gpu_ms 8.9), so absolute numbers are not comparable with iteration 13.
 - Expected 0.2 pp from 124 us of host sampling, measured 0.84 pp: more than 50 % above expectation and only 1.5x the noise floor; treat as a small real gain plus noise.
 - Revert target for later discards is the experiment commit hash, not HEAD (the scope-directive docs commit sits on top of it).
+
+## Phase 4 vs XLA (baseline, before any F item)
+- 4.1: `GIBBS_FUSION=xla` and the default both give 672 dispatches on E2B QAT (the plan's 707 predates iterations 5-13); 110.4 tok/s both.
+- 4.2: `allocate_gives_extra_outs_distinct_live_ranges` passes.
+- `scripts/fusion_vs_xla.py`: XLA numbers null (jax-metal `as_text()` is None), comparator = XlaClass.
+
+| variant | kernels | us / block | ratio vs XlaClass |
+|:---|---:|---:|---:|
+| gibbs Full | 16 | 345.1 | 1.07 |
+| gibbs XlaClass | 16 | 322.6 | 1.00 |
+| XLA jax-metal | n/a | n/a | n/a |
+
+The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture's run-to-run noise (7 %). Weights in the block: 35.3 M f16 params = 70.6 MB = 226 us at the 313 GB/s ceiling.
