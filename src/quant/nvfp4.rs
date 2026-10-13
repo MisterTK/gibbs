@@ -34,6 +34,10 @@ pub struct Nvfp4Tensor {
     pub rows: usize,
     /// Number of matrix columns.
     pub cols: usize,
+    /// The checkpoint's own block scales, when this tensor was read from one rather than quantized from
+    /// f32: `(raw E4M3 bytes, one per block in block order, global scale)`. Each block's `scale` is
+    /// then `e4m3(byte) * global`; the Metal upload binds the bytes and global scale verbatim.
+    pub source_scales: Option<(Vec<u8>, f32)>,
 }
 
 /// Quantize a 16-element slice into a single microscaled NVFP4 block.
@@ -145,10 +149,13 @@ pub fn quantize_nvfp4_tensor(
         blocks.push(quantize_nvfp4_block(block_data));
     }
 
-    Ok(Nvfp4Tensor { blocks, rows, cols })
+    Ok(Nvfp4Tensor { blocks, rows, cols, source_scales: None })
 }
 
 /// Dequantize an entire NVFP4 tensor into a contiguous f32 slice.
+///
+/// A tensor with `source_scales` is expanded as `(lut * e4m3) * global` (the checkpoint dequantizer's
+/// order), which can differ in the last bit from `lut * block.scale` when `e4m3 * global` rounds.
 pub fn dequantize_nvfp4_tensor(tensor: &Nvfp4Tensor, out: &mut [f32]) {
     let total_elements = tensor.rows * tensor.cols;
     assert_eq!(
@@ -169,7 +176,16 @@ pub fn dequantize_nvfp4_tensor(tensor: &Nvfp4Tensor, out: &mut [f32]) {
         let target: &mut [f32; NVFP4_BLOCK_SIZE] = (&mut out[offset..offset + NVFP4_BLOCK_SIZE])
             .try_into()
             .unwrap();
-        dequantize_nvfp4_block(block, target);
+        match &tensor.source_scales {
+            None => dequantize_nvfp4_block(block, target),
+            Some((bytes, global)) => {
+                let s = crate::model::f8_e4m3_to_f32(bytes[b_idx]);
+                for (byte_idx, &byte) in block.packed_nibbles.iter().enumerate() {
+                    target[byte_idx * 2] = (NVFP4_E2M1_LUT[(byte & 0x0F) as usize] * s) * global;
+                    target[byte_idx * 2 + 1] = (NVFP4_E2M1_LUT[(byte >> 4) as usize] * s) * global;
+                }
+            }
+        }
     }
 }
 

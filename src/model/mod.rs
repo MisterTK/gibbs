@@ -1258,6 +1258,15 @@ impl UniversalModelLoader {
             }
         }
 
+        // 1b. A checkpoint that already is NVFP4 keeps its own blocks, scales and global scale.
+        if matches!(target_format, QuantFormat::NVFP4 | QuantFormat::NVFP4_E2M1)
+            && manifest.format == SourceFormat::Safetensors
+        {
+            if let Some(nv) = prequant::nvfp4_source(manifest, data, name)? {
+                return Ok(QuantizedWeight::Nvfp4(nv));
+            }
+        }
+
         // 2. Otherwise dequantize to f32 and re-quantize to target_format on the fly
         let f32_weights = Self::extract_tensor_from_manifest(manifest, data, name)?;
 

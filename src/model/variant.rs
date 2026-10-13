@@ -44,31 +44,48 @@ impl CodecEff {
 
 static HOST: RwLock<(f64, Option<CodecEff>)> = RwLock::new((0.0, None));
 
+#[cfg(test)]
+thread_local! {
+    /// Rates the calling test thread sees instead of [`HOST`], which any Metal `Runtime` built by
+    /// another test overwrites ([`with_unmeasured_host`]).
+    static TEST_HOST: std::cell::RefCell<Option<(f64, Option<CodecEff>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with this thread seeing a host whose codec benchmark has not run (default efficiencies,
+/// no measured GB/s), whatever other tests publish through [`set_host_rates`].
+#[cfg(test)]
+pub(crate) fn with_unmeasured_host<R>(f: impl FnOnce() -> R) -> R {
+    let prev = TEST_HOST.with(|t| t.replace(Some((0.0, None))));
+    let r = f();
+    TEST_HOST.with(|t| *t.borrow_mut() = prev);
+    r
+}
+
+fn host<R>(f: impl Fn(&(f64, Option<CodecEff>)) -> R) -> R {
+    #[cfg(test)]
+    if let Some(r) = TEST_HOST.with(|t| t.borrow().as_ref().map(&f)) {
+        return r;
+    }
+    f(&HOST.read())
+}
+
 /// Publishes this host's streaming ceiling and (once measured) codec efficiencies.
 pub fn set_host_rates(ceiling_gbps: f64, eff: Option<CodecEff>) {
     *HOST.write() = (ceiling_gbps, eff);
 }
 
 pub fn host_ceiling_gbps() -> f64 {
-    let h = HOST.read();
-    h.1.as_ref().map_or(h.0, |e| e.ceiling_gbps.max(h.0))
+    host(|h| h.1.as_ref().map_or(h.0, |e| e.ceiling_gbps.max(h.0)))
 }
 
 /// Measured efficiency of `f`; [`DEFAULT_EFF`] until the codec benchmark has finished.
 pub fn host_eff(f: Q) -> f64 {
-    HOST.read()
-        .1
-        .as_ref()
-        .and_then(|e| e.eff.get(&key(f)).copied())
-        .unwrap_or(DEFAULT_EFF)
+    host(|h| h.1.as_ref().and_then(|e| e.eff.get(&key(f)).copied())).unwrap_or(DEFAULT_EFF)
 }
 
 /// Measured GEMV GB/s of `f` on this host; `None` until the codec benchmark has measured it.
 pub fn host_gbps(f: Q) -> Option<f64> {
-    HOST.read()
-        .1
-        .as_ref()
-        .and_then(|e| e.gbps.get(&key(f)).copied())
+    host(|h| h.1.as_ref().and_then(|e| e.gbps.get(&key(f)).copied()))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

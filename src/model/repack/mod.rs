@@ -1,5 +1,6 @@
 //! Source-checkpoint encodings repacked into GPU codec layouts (sprint-2 S3.7): bitsandbytes NF4/FP4
-//! ([`bnb`]), FP8 ([`fp8`]) and the 4-bit affine formats MLX and compressed-tensors int4 ([`affine`]).
+//! ([`bnb`]), FP8 ([`fp8`]), the 4-bit affine formats MLX, compressed-tensors int4, GPTQ and AWQ
+//! ([`affine`], [`gptq`]) and OCP MXFP4 ([`mxfp4`]).
 //!
 //! Each family owns three things, one set per [`QuantFormat`] it produces:
 //! * a CPU block dequantizer (`block_codec`), the reference the GPU codec must equal bit-for-bit
@@ -18,6 +19,8 @@ use crate::model::ModelManifest;
 pub mod affine;
 pub mod bnb;
 pub mod fp8;
+pub mod gptq;
+pub mod mxfp4;
 
 /// A weight repacked into a GPU codec format.
 pub struct Repacked {
@@ -41,6 +44,12 @@ pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Rep
         return Ok(Some(r));
     }
     if let Some(r) = fp8::repack(m, data, weight)? {
+        return Ok(Some(r));
+    }
+    if let Some(r) = mxfp4::repack(m, data, weight)? {
+        return Ok(Some(r));
+    }
+    if let Some(r) = gptq::repack(m, data, weight)? {
         return Ok(Some(r));
     }
     affine::repack(m, data, weight)
