@@ -28,9 +28,12 @@ use crate::model::ltx;
 use crate::model::native::{load_native, MediaInput};
 use crate::model::text_to_image::{load_image_model, ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
-use crate::model::weight_format::{load_causal_lm_for, Choice};
+use crate::model::reencode::ReencodeProgress;
+use crate::model::weight_format::{
+    load_causal_lm_for, reencode_override, set_reencode_override, Choice, ReencodeConfig,
+};
 use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, ExecutableModel, SamplingParams};
-use crate::telemetry::EngineTelemetry;
+use crate::telemetry::{EngineTelemetry, KernelRow};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -63,6 +66,8 @@ const BUSY_POLL: Duration = Duration::from_nanos(16_666_667);
 const SPARK_SECONDS: usize = 120;
 /// Streamed chat text is re-sent to the UI at most this often.
 const STREAM_UPDATE: Duration = Duration::from_millis(30);
+/// A sampled kernel profile is at least this old before the TUI asks for the next.
+const PROFILE_EVERY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
@@ -218,6 +223,8 @@ enum Update {
         result: Result<(Option<Choice>, String), String>,
     },
     Probe(Result<String, String>),
+    /// A `/bench` run on the loaded model.
+    Bench(Result<crate::bench::ModelBenchResult, String>),
 }
 
 /// A prompt's background work: runs with its console entry index and the update channel.
@@ -241,6 +248,10 @@ pub(crate) struct Load {
     /// (when, bytes done) of the last rate sample, and the bytes/s since the one before.
     pub(crate) sample: (Instant, u64),
     pub(crate) rate: f64,
+    /// Tensors re-encoded so far and in total (GraphLm and native loaders alike).
+    pub(crate) reencode: Arc<ReencodeProgress>,
+    /// (when, tensors done) the first time the re-encode counter moved: the ETA's baseline.
+    reencode_seen: Option<(Instant, usize)>,
 }
 
 impl Load {
@@ -263,6 +274,41 @@ impl Load {
             self.rate / 1e6
         )
     }
+
+    /// `reencode max-speed · 12/197 tensors · ETA 9s` once tensors are counted, else the time so far.
+    fn reencode_text(&self, policy: crate::model::weight_format::ReencodePolicy) -> String {
+        let (done, total) = (
+            self.reencode.done.load(Ordering::Relaxed),
+            self.reencode.total.load(Ordering::Relaxed),
+        );
+        if total == 0 {
+            return format!(
+                "reencode {} · elapsed {}",
+                policy.name(),
+                render::secs(self.started.elapsed())
+            );
+        }
+        let eta = self
+            .reencode_seen
+            .filter(|&(_, first)| done > first)
+            .map_or("—".to_string(), |(since, first)| {
+                let rate = (done - first) as f64 / since.elapsed().as_secs_f64().max(1e-9);
+                format!("{:.0}s", total.saturating_sub(done) as f64 / rate)
+            });
+        format!(
+            "reencode {} · {done}/{total} tensors · ETA {eta}",
+            policy.name()
+        )
+    }
+}
+
+/// Codec micro-benchmark and tuner progress, as the Device panel shows it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeviceStatus {
+    /// `(state, done, total)`: 0 idle, 1 running, 2 done, 3 failed.
+    pub(crate) codec: (u8, usize, usize),
+    /// `(cache hits, shapes)` of the GEMV tuner.
+    pub(crate) tune: (usize, usize),
 }
 
 pub struct TuiApp {
@@ -323,6 +369,17 @@ pub struct TuiApp {
     pub ctx_limit: usize,
     pub show_roofline_hud: bool,
     pub frame_log_path: Option<String>,
+    /// `/profile on`: time one decode token every 5 s into the Kernels panel.
+    profile_sampling: bool,
+    /// The last per-kind kernel profile and when it was taken.
+    kernel_profile: Option<(Instant, Vec<KernelRow>)>,
+    /// When this app last asked the engine for a profile sample.
+    profile_asked: Option<Instant>,
+    /// Set by every frame that draws the Kernels panel.
+    kernels_visible: std::cell::Cell<bool>,
+    pub(crate) device_status: DeviceStatus,
+    /// A `/bench` thread is measuring the loaded model.
+    benchmarking: bool,
 }
 
 impl TuiApp {
@@ -411,6 +468,12 @@ impl TuiApp {
             ctx_limit: 8192,
             show_roofline_hud: true,
             frame_log_path: None,
+            profile_sampling: false,
+            kernel_profile: None,
+            profile_asked: None,
+            kernels_visible: std::cell::Cell::new(false),
+            device_status: DeviceStatus::default(),
+            benchmarking: false,
         }
     }
 
@@ -498,86 +561,17 @@ impl TuiApp {
                 self.roofline_probe_result = probe.as_ref().ok().cloned();
                 Some(probe)
             }
-            "/reencode" => {
-                let target = rest.trim();
-                if target.is_empty() {
-                    self.reencode_policy = match self.reencode_policy {
-                        crate::model::weight_format::ReencodePolicy::MaxSpeed => crate::model::weight_format::ReencodePolicy::LowBitNative,
-                        crate::model::weight_format::ReencodePolicy::LowBitNative => crate::model::weight_format::ReencodePolicy::BitExact,
-                        crate::model::weight_format::ReencodePolicy::BitExact => crate::model::weight_format::ReencodePolicy::MaxSpeed,
-                    };
-                    let mut s = settings::load_settings();
-                    s.reencode = format!("{:?}", self.reencode_policy).to_lowercase();
-                    let _ = settings::save_settings(&s);
-                    Some(Ok(format!("Re-encode policy: {:?}. Reload to apply.", self.reencode_policy)))
-                } else {
-                    let policy = match target {
-                        "max-speed" => Ok(crate::model::weight_format::ReencodePolicy::MaxSpeed),
-                        "low-bit-native" => Ok(crate::model::weight_format::ReencodePolicy::LowBitNative),
-                        "bit-exact" => Ok(crate::model::weight_format::ReencodePolicy::BitExact),
-                        other => Err(format!("unknown reencode policy '{other}'; valid: max-speed, low-bit-native, bit-exact")),
-                    };
-                    match policy {
-                        Ok(p) => {
-                            self.reencode_policy = p;
-                            let mut s = settings::load_settings();
-                            s.reencode = target.to_string();
-                            let _ = settings::save_settings(&s);
-                            self.telemetry.log_info(&format!("TUI: reencode policy set to {target} (reload to apply)"));
-                            Some(Ok(format!("Re-encode policy set to {target}. Reload to apply.")))
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
-                }
-            }
-            "/variant" => {
-                let target = rest.trim();
-                if target.is_empty() {
-                    self.variant_policy = match self.variant_policy {
-                        crate::model::weight_format::VariantPolicy::Fastest => crate::model::weight_format::VariantPolicy::Fastest4Bit,
-                        crate::model::weight_format::VariantPolicy::Fastest4Bit => crate::model::weight_format::VariantPolicy::BestQuality,
-                        crate::model::weight_format::VariantPolicy::BestQuality => crate::model::weight_format::VariantPolicy::Fastest,
-                    };
-                    let mut s = settings::load_settings();
-                    s.variant = format!("{:?}", self.variant_policy).to_lowercase();
-                    let _ = settings::save_settings(&s);
-                    Some(Ok(format!("Variant policy: {:?}. Reload to apply.", self.variant_policy)))
-                } else {
-                    let policy = match target {
-                        "fastest" => Ok(crate::model::weight_format::VariantPolicy::Fastest),
-                        "fastest-4bit" => Ok(crate::model::weight_format::VariantPolicy::Fastest4Bit),
-                        "best-quality" => Ok(crate::model::weight_format::VariantPolicy::BestQuality),
-                        other => Err(format!("unknown variant policy '{other}'; valid: fastest, fastest-4bit, best-quality")),
-                    };
-                    match policy {
-                        Ok(p) => {
-                            self.variant_policy = p;
-                            let mut s = settings::load_settings();
-                            s.variant = target.to_string();
-                            let _ = settings::save_settings(&s);
-                            self.telemetry.log_info(&format!("TUI: variant policy set to {target} (reload to apply)"));
-                            Some(Ok(format!("Variant policy set to {target}. Reload to apply.")))
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
-                }
-            }
+            "/reencode" | "/variant" => Some(self.change_policy(cmd, rest.trim())),
             "/profile" => {
-                let target = rest.trim();
-                match target {
-                    "on" | "1" | "true" => {
-                        std::env::set_var("GIBBS_PROFILE_KERNELS", "1");
-                        Some(Ok("Kernel GPU timing profiler enabled".into()))
-                    }
-                    "off" | "0" | "false" => {
-                        std::env::remove_var("GIBBS_PROFILE_KERNELS");
-                        Some(Ok("Kernel GPU timing profiler disabled".into()))
-                    }
-                    _ => {
-                        let active = std::env::var("GIBBS_PROFILE_KERNELS").is_ok();
-                        Some(Ok(format!("Kernel profiling is {} (use /profile on|off)", if active { "ON" } else { "OFF" })))
-                    }
+                match rest.trim() {
+                    "on" | "1" | "true" => self.profile_sampling = true,
+                    "off" | "0" | "false" => self.profile_sampling = false,
+                    _ => {}
                 }
+                Some(Ok(format!(
+                    "Kernel profiling is {} (use /profile on|off): while the KERNELS panel shows, one decode token every 5 s is timed step by step into it",
+                    if self.profile_sampling { "ON" } else { "OFF" }
+                )))
             }
             "/settings" => {
                 self.show_settings_modal = !self.show_settings_modal;
@@ -586,28 +580,8 @@ impl TuiApp {
                     self.reencode_policy, self.variant_policy, self.ctx_limit, self.show_roofline_hud
                 )))
             }
-            "/bench" => {
-                let s = self.telemetry.get_summary();
-                let rss_mb = crate::hardware::current_resident_memory_bytes() as f64 / (1024.0 * 1024.0);
-                let eta = if s.memory_bandwidth_gbps > 0.0 {
-                    (s.effective_bandwidth_gbps / s.memory_bandwidth_gbps) * 100.0
-                } else {
-                    0.0
-                };
-                Some(Ok(format!(
-                    "BENCHMARK SUMMARY:\n\
-                     · Current Throughput: {:.2} tok/s\n\
-                     · Total Tokens Generated: {}\n\
-                     · Peak Bandwidth Achieved: {:.1} GB/s\n\
-                     · Roofline Saturation (η): {:.1}%\n\
-                     · Host Process RSS: {:.1} MB",
-                    s.current_tps,
-                    s.total_tokens,
-                    s.effective_bandwidth_gbps,
-                    eta,
-                    rss_mb
-                )))
-            }
+            "/bench" => Some(self.start_bench()),
+            "/placement" => Some(self.placement_report(&raw)),
             "/quant" => {
                 Some(Ok(format!(
                     "MODEL QUANTIZATION:\n\
@@ -621,19 +595,25 @@ impl TuiApp {
                 Some(Ok(
                     "GIBBS ENGINE COMMAND & KEY REFERENCE:\n\
                      Keybindings:\n\
-                     · m / Esc    : Switch between Dashboard & Model Picker\n\
+                     · m / Esc    : Switch between Dashboard & Model Picker (there r / f cycle the re-encode / variant policy and reload the model)\n\
                      · F2         : System Prompt / Chat Template Selector\n\
-                     · Ctrl+R/P/T/L: Focus ROOFLINE / LOGPROBS / TOKENS / LATENCY for detail (←/→ scrub logprobs)\n\
+                     · F4         : Policy settings modal (changes apply to the next load)\n\
+                     · Ctrl+R/P/T/L/K: Focus ROOFLINE / LOGPROBS / TOKENS / LATENCY / KERNELS for detail (←/→ scrub logprobs)\n\
                      · Esc        : Unfocus component / cancel prompt / return to Dashboard\n\
                      · Ctrl+C     : Exit Gibbs engine\n\n\
                      Slash Commands:\n\
+                     · /reencode [max-speed|low-bit-native|bit-exact] : Set the weight re-encode policy (no argument cycles) and reload the active model under it\n\
+                     · /variant [fastest|fastest-4bit|best-quality] : Set the variant policy of the picker and downloads (no argument cycles) and reload the active model\n\
+                     · /settings  : Show the policy settings modal (F4) and the current policies\n\
+                     · /profile on|off : Sample one decode token every 5 s, step by step, into the KERNELS panel\n\
+                     · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
+                     · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% Metal, or the CPU ops\n\
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
-                     · /profile on|off : Toggle kernel GPU timing profiling (ROOFLINE profile row)\n\
-                     · /bench     : Report live decode throughput, RSS, and roofline efficiency\n\
                      · /quant     : Display active weight quantization formats\n\
                      · /gibbs     : Full historical biography & ASCII portrait of J. Willard Gibbs\n\
                      · /chat <msg>: Send chat message to active model\n\
-                     · /connect   : Print curl/OpenAI API connection commands"
+                     · /connect   : Print curl/OpenAI API connection commands\n\
+                     · /help      : This reference"
                         .to_string(),
                 ))
             }
@@ -645,6 +625,10 @@ impl TuiApp {
             self.push_entry(raw, kind, text);
             return;
         }
+        if self.benchmarking {
+            self.push_entry(raw, Kind::Error, "benchmark running".into());
+            return;
+        }
         let (route, body) = match cmd {
             "/chat" => (Ok(Route::Chat), rest.trim()),
             "/image" | "/img" => (Ok(Route::Image), rest.trim()),
@@ -653,7 +637,7 @@ impl TuiApp {
             "/classify" | "/cls" => (Ok(Route::Classify), rest.trim()),
             "/i2v" => (Ok(Route::Video { image: true }), rest.trim()),
             "/video" | "/vid" | "/t2v" => (Ok(Route::Video { image: false }), rest.trim()),
-            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /profile, /bench, /quant, /help, /gibbs")), ""),
+            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /reencode, /variant, /settings, /profile, /bench, /placement, /quant, /help, /gibbs")), ""),
             _ if self.classifier.read().is_some() => (Ok(Route::Classify), raw.as_str()),
             _ if self.image_model.read().is_some() => (Ok(Route::Image), raw.as_str()),
             _ => (Ok(route_for_model(&self.model_id())), raw.as_str()),
@@ -688,6 +672,149 @@ impl TuiApp {
                     crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
                     job(idx, tx);
                 });
+            }
+        }
+    }
+
+    /// `/reencode [policy]` and `/variant [policy]`: the named policy, else the next one in the
+    /// cycle. It is saved to the settings file and the loaded model is reloaded under it.
+    fn change_policy(&mut self, cmd: &str, arg: &str) -> Result<String, String> {
+        use crate::model::weight_format::{ReencodePolicy as R, VariantPolicy as V};
+        let mut s = settings::load_settings();
+        let value = if cmd == "/reencode" {
+            let next = match arg {
+                "" => match self.reencode_policy {
+                    R::MaxSpeed => R::LowBitNative,
+                    R::LowBitNative => R::BitExact,
+                    R::BitExact => R::MaxSpeed,
+                },
+                a => a.parse().map_err(|_| {
+                    format!("unknown reencode policy '{a}'; valid: max-speed, low-bit-native, bit-exact")
+                })?,
+            };
+            self.reencode_policy = next;
+            s.reencode = next.name().to_string();
+            next.name()
+        } else {
+            let next = match arg {
+                "" => match self.variant_policy {
+                    V::Fastest => V::Fastest4Bit,
+                    V::Fastest4Bit => V::BestQuality,
+                    V::BestQuality => V::Fastest,
+                },
+                a => a.parse().map_err(|_| {
+                    format!("unknown variant policy '{a}'; valid: fastest, fastest-4bit, best-quality")
+                })?,
+            };
+            self.variant_policy = next;
+            s.variant = next.name().to_string();
+            next.name()
+        };
+        settings::save_settings(&s)?;
+        Ok(self.reload_for(cmd.trim_start_matches('/'), value))
+    }
+
+    /// The reply to a changed setting. A loaded model is reloaded so the setting takes effect now;
+    /// otherwise it applies to the next load.
+    fn reload_for(&mut self, what: &str, value: &str) -> String {
+        if self.benchmarking {
+            return format!("{what} -> {value}; a benchmark is running, so it applies to the next load");
+        }
+        let loaded = self
+            .scheduler
+            .as_ref()
+            .filter(|s| s.has_model())
+            .map(|s| s.model_id());
+        match (loaded, self.load.is_some()) {
+            (Some(id), false) => {
+                self.telemetry
+                    .log_info(&format!("TUI: {what} -> {value}; reloading '{id}'"));
+                self.load_model(&id);
+                format!("{what} -> {value}; reloading {id}")
+            }
+            (Some(_), true) => {
+                format!("{what} -> {value}; a load is in flight, so it applies to the next load")
+            }
+            (None, _) => format!("{what} -> {value}; applies to the next load"),
+        }
+    }
+
+    /// `/bench`: measures the loaded model (128 decode tokens, 3 runs, drafters off) on a
+    /// background thread; the result arrives as [`Update::Bench`].
+    fn start_bench(&mut self) -> Result<String, String> {
+        const TOKENS: usize = 128;
+        const RUNS: usize = 3;
+        if self.benchmarking {
+            return Err("benchmark running".into());
+        }
+        if self.load.is_some() {
+            return Err("busy: a model load is in flight".into());
+        }
+        let sched = self
+            .scheduler
+            .clone()
+            .filter(|s| s.has_model())
+            .ok_or("no text model loaded; press m to load one")?;
+        let view = sched.view();
+        if !view.seqs.is_empty() || view.waiting > 0 || self.running > 0 {
+            return Err("busy: finish or cancel generation first".into());
+        }
+        let exec = sched.model().ok_or("no text model loaded; press m to load one")?;
+        let id = sched.model_id();
+        let (policy, saved) =
+            crate::bench::applied_policy(self.weights.as_ref(), self.reencode_policy);
+        let (bytes, basis) =
+            crate::bench::roofline_bytes(&self.hub.locate_model(&id), policy, saved);
+        let ceiling = match crate::model::variant::host_ceiling_gbps() {
+            c if c > 0.0 => c,
+            _ => f64::from(self.telemetry.get_summary().memory_bandwidth_gbps),
+        };
+        if ceiling <= 0.0 {
+            return Err("bandwidth ceiling unmeasured: wait for the codec bench (Device panel) or run /roofline".into());
+        }
+        self.benchmarking = true;
+        let (tx, name) = (self.updates_tx.clone(), id.clone());
+        std::thread::spawn(move || {
+            // Benchmarks on this machine take turns on the GPU (the lock is held for the run);
+            // unit tests do not wait behind a benchmark running elsewhere.
+            let _gpu = (!cfg!(test)).then(crate::hardware::gpu_lock);
+            let r = crate::bench::measure_loaded(
+                &exec,
+                &crate::bench::default_prompt(),
+                TOKENS,
+                RUNS,
+                bytes,
+                ceiling,
+            )
+            .map(|mut r| {
+                r.model = name;
+                r.bytes_basis = basis;
+                r
+            });
+            let _ = tx.send(Update::Bench(r));
+        });
+        Ok(format!(
+            "benchmarking {id}: {TOKENS} decode tokens x {RUNS} runs, drafters off"
+        ))
+    }
+
+    /// `/placement`: where every graph node of the loaded model runs. All on one GPU is one text
+    /// entry ending in `100% Metal`; CPU ops follow the table as an error entry.
+    fn placement_report(&mut self, prompt: &str) -> Result<String, String> {
+        use crate::graph::placement::{placement_table, placement_verdict};
+        let rows = self
+            .scheduler
+            .as_ref()
+            .and_then(|s| s.model())
+            .ok_or("no text model loaded; press m to load one")?
+            .placement_summary()
+            .ok_or("the loaded model runs no graph program, so it has no placement to explain")?;
+        let table = placement_table(&rows);
+        match placement_verdict(&rows) {
+            Ok(all_gpu) => Ok(format!("{table}\n{all_gpu}")),
+            Err(cpu_ops) => {
+                self.push_entry(prompt.to_string(), Kind::Text, table);
+                Err(cpu_ops)
             }
         }
     }
@@ -1061,6 +1188,7 @@ impl TuiApp {
         let refused = match (&self.scheduler, &self.load) {
             (None, _) => Some("no engine scheduler attached".to_string()),
             (_, Some(l)) => Some(format!("{} is still loading", l.id)),
+            (_, None) if self.benchmarking => Some("benchmark running".to_string()),
             (Some(_), None) => None,
         };
         if let Some(e) = refused {
@@ -1071,6 +1199,7 @@ impl TuiApp {
         let idx = self.push_entry(format!("load {id}"), Kind::Running, String::new());
         let stage = Arc::new(Mutex::new("resolving"));
         let progress = Arc::new(DownloadProgress::default());
+        let reencode = Arc::new(ReencodeProgress::default());
         self.load = Some(Load {
             id: id.to_string(),
             idx,
@@ -1079,6 +1208,8 @@ impl TuiApp {
             progress: progress.clone(),
             sample: (Instant::now(), 0),
             rate: 0.0,
+            reencode: reencode.clone(),
+            reencode_seen: None,
         });
         self.telemetry.log_info(&format!("TUI: loading '{id}'"));
         let mut hub = self.hub.clone();
@@ -1093,8 +1224,20 @@ impl TuiApp {
             id.to_string(),
             self.placement,
         );
+        // Both GraphLm and native loaders read this through `ReencodeConfig::effective()`: the
+        // saved policy, with the load panel's tensor counter and the telemetry log attached.
+        let reencode_cfg = ReencodeConfig {
+            progress: Some(reencode),
+            log: Some({
+                let telemetry = self.telemetry.clone();
+                Arc::new(move |m: &str| telemetry.log_info(m))
+            }),
+            ..ReencodeConfig::from_settings()
+        };
         std::thread::spawn(move || {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+            let previous = reencode_override();
+            set_reencode_override(Some(reencode_cfg.clone()));
             // A panic inside loading must surface as an error, not leave the load stuck.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let backend = match placement {
@@ -1133,12 +1276,16 @@ impl TuiApp {
                 }
                 let artifacts = hub.auto_download_and_cache(&id, token.as_deref())?;
                 let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
-                    crate::model::variant::decode_bytes_per_token(
-                        p,
-                        crate::model::variant::reencode_policy(),
-                    )
+                    crate::model::variant::decode_bytes_per_token(p, reencode_cfg.policy)
                 });
                 sched.telemetry.set_model_size_bytes(model_size);
+                // What the load applied (its gate may fall back) sets the roofline's bytes per token.
+                let refine = |choice: Option<&Choice>| {
+                    let (applied, saved) = crate::bench::applied_policy(choice, reencode_cfg.policy);
+                    if let (b, "streamed") = crate::bench::roofline_bytes(&artifacts, applied, saved) {
+                        sched.telemetry.set_model_size_bytes(b);
+                    }
+                };
                 *stage.lock() = "reading weights, choosing weight format";
                 if let Some(img) = load_image_model(&artifacts, &hub) {
                     let g = img?;
@@ -1159,6 +1306,7 @@ impl TuiApp {
                     let m = native?;
                     let shape = format!("{}, on {}", m.summary(), m.backend_label());
                     sched.swap_model(&id, ExecutableModel::Native(m));
+                    refine(None);
                     *slot.write() = None;
                     *images.write() = None;
                     return Ok((None, shape));
@@ -1168,8 +1316,9 @@ impl TuiApp {
                     "{} layers, hidden {}, vocab {}",
                     llm.config.num_layers, llm.config.hidden_dim, llm.config.vocab_size
                 );
-                *stage.lock() = "placing weights on the backend";
+                *stage.lock() = "compiling + tuning kernels";
                 sched.swap_model(&id, ExecutableModel::load_graph_lm(llm, placement)?);
+                refine(Some(&choice));
                 *slot.write() = None;
                 *images.write() = None;
                 Ok((
@@ -1186,6 +1335,7 @@ impl TuiApp {
                 Err(format!("loader panicked: {msg}"))
             });
             // Failures leave a record (error, stage, snapshot contents) in the load-failure log.
+            set_reencode_override(previous);
             let result = result.map_err(|e| {
                 let stage = *stage.lock();
                 crate::model::load_log::record(&hub, &id, stage, &e)
@@ -1302,6 +1452,24 @@ impl TuiApp {
                             self.finish(idx, Kind::Error, e, String::new());
                         }
                     }
+                }
+                Update::Bench(res) => {
+                    self.benchmarking = false;
+                    let (kind, text) = match res {
+                        Ok(r) => {
+                            self.telemetry.log_info(&format!(
+                                "TUI: benchmark {}: {:.1} tok/s, {:.1}% of the roofline",
+                                r.model, r.decode_tok_s, r.roofline_pct
+                            ));
+                            (Kind::Text, bench_report(&r))
+                        }
+                        Err(e) => {
+                            self.telemetry
+                                .log_warn(&format!("TUI: benchmark failed: {e}"));
+                            (Kind::Error, e)
+                        }
+                    };
+                    self.push_entry("/bench".into(), kind, text);
                 }
                 Update::Probe(res) => {
                     self.roofline_probe_result = res.as_ref().ok().cloned();
@@ -1445,9 +1613,47 @@ impl TuiApp {
                     dirty = true;
                 }
             }
+            // A program being compiled (also inside a native loader) is the COMPILE stage.
+            if crate::graph::program::compiling() {
+                *l.stage.lock() = "compiling + tuning kernels";
+            }
+            let reencoded = l.reencode.done.load(Ordering::Relaxed);
+            l.reencode_seen = match l.reencode_seen {
+                Some((_, first)) if reencoded >= first => l.reencode_seen,
+                _ if reencoded > 0 => Some((Instant::now(), reencoded)),
+                _ => None,
+            };
         }
-        self.picker
-            .set_ceiling_gbps(self.telemetry.get_summary().memory_bandwidth_gbps);
+        #[cfg(target_os = "macos")]
+        {
+            use crate::graph::metal;
+            self.device_status = DeviceStatus {
+                codec: metal::codec_bench_status(),
+                tune: metal::tune_status(),
+            };
+            self.kernel_profile = metal::last_kernel_profile();
+            // One decode token at a time is profiled, while the KERNELS panel is on screen and
+            // sampling is on (`/profile on`) or the panel is focused (Ctrl+K).
+            let wanted = (self.profile_sampling || self.detail == Some(layout::Comp::Kernels))
+                && self.kernels_visible.get()
+                && !self.benchmarking
+                && self.running > 0;
+            let old = |at: Option<Instant>| at.is_none_or(|t| t.elapsed() >= PROFILE_EVERY);
+            if wanted
+                && old(self.profile_asked)
+                && old(self.kernel_profile.as_ref().map(|p| p.0))
+            {
+                metal::request_kernel_profile();
+                self.profile_asked = Some(Instant::now());
+            }
+        }
+        // The host ceiling is what `/bench` and the gap panel measure against.
+        let host_ceiling = crate::model::variant::host_ceiling_gbps() as f32;
+        self.picker.set_ceiling_gbps(if host_ceiling > 0.0 {
+            host_ceiling
+        } else {
+            self.telemetry.get_summary().memory_bandwidth_gbps
+        });
         if self.focus == Focus::Picker {
             dirty |= self.picker.tick();
         }
@@ -1486,6 +1692,7 @@ impl TuiApp {
             ('r', layout::Comp::Roofline),
             ('l', layout::Comp::Latency),
             ('t', layout::Comp::Tokens),
+            ('k', layout::Comp::Kernels),
         ] {
             if ctrl
                 && key.code == KeyCode::Char(ch)
@@ -1596,6 +1803,19 @@ impl TuiApp {
                     self.load_model(&id);
                 }
                 PickerAction::Delete(id) => self.delete_cached(&id),
+                PickerAction::Reload(what) => {
+                    // The picker saved the setting; follow it and reload the loaded model under it.
+                    let s = settings::load_settings();
+                    if let Ok(p) = s.reencode.parse() {
+                        self.reencode_policy = p;
+                    }
+                    if let Ok(p) = s.variant.parse() {
+                        self.variant_policy = p;
+                    }
+                    let value = if what == "reencode" { s.reencode } else { s.variant };
+                    let note = self.reload_for(what, &value);
+                    self.picker.set_note(note, theme::Token::Jade);
+                }
                 PickerAction::AttachDraft(id) => {
                     self.focus = Focus::Dashboard;
                     self.attach_draft(&id);
@@ -1651,6 +1871,7 @@ impl TuiApp {
     pub fn run(&mut self) -> io::Result<()> {
         crate::tui::qos::set_qos(crate::tui::qos::QosClass::UserInteractive);
         self.telemetry.is_tui_active.store(true, Ordering::Relaxed);
+        crate::telemetry::TUI_OWNS_TERMINAL.store(true, Ordering::Relaxed);
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
         // A panic on this thread must not leave the terminal in raw mode; other threads' panics
@@ -1680,6 +1901,7 @@ impl TuiApp {
         };
         std::panic::set_hook(Box::new(move |info| previous(info)));
         self.telemetry.is_tui_active.store(false, Ordering::Relaxed);
+        crate::telemetry::TUI_OWNS_TERMINAL.store(false, Ordering::Relaxed);
         result
     }
 
@@ -1817,6 +2039,44 @@ fn embed(jev: &JevSystem1Model, text: &str) -> Result<String, String> {
         "head": &v[..v.len().min(8)],
     });
     Ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+}
+
+/// `/bench` output: throughput against the roofline and where a token's time goes.
+fn bench_report(r: &crate::bench::ModelBenchResult) -> String {
+    let mut s = format!(
+        "BENCHMARK {}:\n\
+         · decode {:.1} tok/s of a {:.1} tok/s roofline = {:.1}% ({:.0} MB/token, {} bytes, at {:.0} GB/s)",
+        r.model,
+        r.decode_tok_s,
+        r.roofline_tok_s,
+        r.roofline_pct,
+        r.bytes_per_token as f64 / 1e6,
+        r.bytes_basis,
+        r.ceiling_gbps
+    );
+    let (Some(gpu), Some(run)) = (r.gpu_ms, r.run_ms) else {
+        return s + "\n· no GPU run samples: this model does not run on Metal";
+    };
+    let gap = crate::telemetry::GapStats {
+        wall_ms: r.wall_ms as f32,
+        run_ms: run as f32,
+        gpu_ms: gpu as f32,
+        weights_ms: r.weights_ms as f32,
+        samples: 1,
+        ..Default::default()
+    };
+    let [weights, gpu_excess, run_host, outside] = gap.segments();
+    s += &format!(
+        "\n· token {:.2} ms = weights {weights:.2} + gpu excess {gpu_excess:.2} + run host {run_host:.2} + outside {outside:.2} ms",
+        r.wall_ms
+    );
+    if let Some(d) = r.dispatches {
+        s += &format!(
+            "\n· {d:.0} dispatches per token, encode {:.0} µs",
+            r.encode_us.unwrap_or(0.0)
+        );
+    }
+    s
 }
 
 /// Classifier output: one line per label (the top [`SHOWN`]), with a bar for probabilities.
@@ -2123,6 +2383,8 @@ mod tests {
             progress: Arc::default(),
             sample: (Instant::now(), 0),
             rate: 0.0,
+            reencode: Arc::default(),
+            reencode_seen: None,
         });
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Char('m')));
@@ -2348,15 +2610,12 @@ mod tests {
             .unwrap()
             .output
             .contains("JOSIAH WILLARD GIBBS"));
-        // 7. /bench, /quant, /help commands
+        // 7. /bench (no model loaded: refused), /quant, /help commands
         app.input = "/bench".into();
         app.submit_prompt();
-        assert!(app
-            .history
-            .last()
-            .unwrap()
-            .output
-            .contains("BENCHMARK SUMMARY"));
+        let e = app.history.last().unwrap();
+        assert_eq!(e.kind, Kind::Error);
+        assert!(e.output.contains("no text model loaded"), "{}", e.output);
 
         app.input = "/quant".into();
         app.submit_prompt();
@@ -2490,6 +2749,7 @@ mod tests {
     }
     #[test]
     fn test_s7_4_reencode_and_variant_slash_commands_and_picker_keys() {
+        let _settings = settings_guard();
         let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
 
         // 1. /reencode slash command
@@ -2504,7 +2764,7 @@ mod tests {
             .last()
             .unwrap()
             .output
-            .contains("Reload to apply"));
+            .contains("reencode -> low-bit-native; applies to the next load"));
         let s = crate::tui::settings::load_settings();
         assert_eq!(s.reencode, "low-bit-native");
 
@@ -2520,7 +2780,7 @@ mod tests {
             .last()
             .unwrap()
             .output
-            .contains("Reload to apply"));
+            .contains("variant -> fastest-4bit; applies to the next load"));
         let s = crate::tui::settings::load_settings();
         assert_eq!(s.variant, "fastest-4bit");
 
@@ -2528,17 +2788,236 @@ mod tests {
         app.handle_key(key(KeyCode::Char('m')));
         app.handle_key(key(KeyCode::Char('r')));
         let s = crate::tui::settings::load_settings();
-        assert!(
-            s.reencode == "max-speed"
-                || s.reencode == "low-bit-native"
-                || s.reencode == "bit-exact"
-        );
+        // From the low-bit-native set above: one step on is bit-exact, saved and followed by the app.
+        assert_eq!(s.reencode, "bit-exact");
+        assert_eq!(app.reencode_policy.name(), s.reencode);
 
         app.handle_key(key(KeyCode::Char('f')));
         let s = crate::tui::settings::load_settings();
-        assert!(
-            s.variant == "fastest" || s.variant == "fastest-4bit" || s.variant == "best-quality"
+        assert_eq!(s.variant, "best-quality");
+        assert_eq!(app.variant_policy.name(), s.variant);
+    }
+
+    /// A tiny synthetic model loaded offline into a fresh app.
+    fn app_with_tiny_model() -> (TuiApp, Arc<ContinuousBatchScheduler>, tempfile::TempDir) {
+        let cache = tempfile::tempdir().unwrap();
+        let kv = Arc::new(PagedKVPool::new(1024));
+        let sched = Arc::new(ContinuousBatchScheduler::new("", kv.clone(), None));
+        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+            sched.clone(),
+            HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
+            None,
+            None,
+            ImageSlot::default(),
         );
+        app.load_model("gibbs/tiny-5m");
+        settle(&mut app);
+        let e = &app.history[0];
+        assert_eq!(e.kind, Kind::Text, "{}", e.output);
+        (app, sched, cache)
+    }
+
+    /// `/variant` and the picker's `f` reload the loaded model; a load in flight defers the change.
+    #[test]
+    fn policy_changes_reload_the_loaded_model() {
+        let _settings = settings_guard();
+        let (mut app, sched, _cache) = app_with_tiny_model();
+        type_and_run(&mut app, "/variant best-quality");
+        assert!(app.load.is_some(), "a loaded model is reloaded");
+        let e = app.history.last().unwrap();
+        assert!(
+            e.output.contains("variant -> best-quality; reloading gibbs/tiny-5m"),
+            "{}",
+            e.output
+        );
+        assert!(!e.output.contains("Reload to apply"));
+        type_and_run(&mut app, "/reencode bit-exact");
+        let e = app.history.last().unwrap();
+        assert!(e.output.contains("a load is in flight"), "{}", e.output);
+        settle(&mut app);
+        assert_eq!(sched.model_id(), "gibbs/tiny-5m");
+
+        app.handle_key(key(KeyCode::Char('m')));
+        app.handle_key(key(KeyCode::Char('f')));
+        assert!(app.load.is_some(), "picker f reloads");
+        settle(&mut app);
+    }
+
+    /// `/bench` refuses while generating or while another runs; a model without weight bytes
+    /// reports why instead of a made-up roofline.
+    #[test]
+    fn bench_refuses_when_busy_and_reports_through_an_update() {
+        let (mut app, _sched, _cache) = app_with_tiny_model();
+        type_and_run(&mut app, "/bench");
+        assert!(app.benchmarking);
+        let e = app.history.last().unwrap();
+        assert!(e.output.contains("benchmarking gibbs/tiny-5m"), "{}", e.output);
+        type_and_run(&mut app, "/chat hi");
+        let e = app.history.last().unwrap();
+        assert_eq!((e.kind, e.output.as_str()), (Kind::Error, "benchmark running"));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.benchmarking {
+            app.drain_updates();
+            assert!(Instant::now() < deadline, "bench did not report");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The tiny model runs on Metal here: the report carries tok/s, the roofline and the gap.
+        let e = app.history.last().unwrap();
+        assert_eq!(e.kind, Kind::Text, "{}", e.output);
+        for want in ["BENCHMARK gibbs/tiny-5m", "tok/s of a", "roofline"] {
+            assert!(e.output.contains(want), "{want}: {}", e.output);
+        }
+
+        // A chat in flight: busy, and no benchmark starts.
+        type_and_run(&mut app, "/chat Tell me a long story");
+        type_and_run(&mut app, "/bench");
+        let e = app.history.last().unwrap();
+        assert_eq!(
+            (e.kind, e.output.as_str()),
+            (Kind::Error, "busy: finish or cancel generation first")
+        );
+        assert!(!app.benchmarking);
+        app.focus = Focus::Prompt;
+        app.handle_key(key(KeyCode::Esc));
+        settle(&mut app);
+    }
+
+    #[test]
+    fn bench_report_splits_the_token_into_the_gap_segments() {
+        let r = crate::bench::ModelBenchResult {
+            model: "org/m".into(),
+            file: "m.gguf".into(),
+            codec_mix: None,
+            bytes_per_token: 1_000_000_000,
+            bytes_basis: "streamed",
+            ceiling_gbps: 200.0,
+            decode_tok_s: 180.0,
+            roofline_tok_s: 200.0,
+            roofline_pct: 90.0,
+            wall_ms: 5.5,
+            gpu_ms: Some(5.2),
+            run_ms: Some(5.3),
+            host_ms: Some(0.3),
+            encode_us: Some(210.0),
+            dispatches: Some(612.0),
+            weights_ms: 5.0,
+            prefill_tok_s: None,
+            rss_gb: 1.0,
+            top_kernels: None,
+        };
+        let text = bench_report(&r);
+        for want in ["180.0 tok/s", "= 90.0%", "weights 5.00", "gpu excess 0.20", "run host 0.10", "outside 0.20", "612 dispatches"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+    }
+
+    /// A reload would swap the model under the benchmark's decode: every path refuses meanwhile.
+    #[test]
+    fn no_reload_starts_while_a_benchmark_runs() {
+        let _settings = settings_guard();
+        let (mut app, _sched, _cache) = app_with_tiny_model();
+        app.benchmarking = true;
+        type_and_run(&mut app, "/reencode max-speed");
+        let e = app.history.last().unwrap();
+        assert!(e.output.contains("a benchmark is running"), "{}", e.output);
+        assert!(app.load.is_none());
+        app.load_model("gibbs/tiny-5m");
+        assert!(app.load.is_none());
+        assert_eq!(app.history.last().unwrap().output, "benchmark running");
+    }
+
+    /// `/placement` prints the table and ends in `100% Metal`, or lists the CPU ops as an error.
+    #[test]
+    fn placement_command_explains_the_loaded_program() {
+        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        type_and_run(&mut app, "/placement");
+        assert_eq!(app.history.last().unwrap().kind, Kind::Error);
+
+        let (mut app, sched, _cache) = app_with_tiny_model();
+        type_and_run(&mut app, "/placement");
+        let last = app.history.last().unwrap();
+        if sched.model().unwrap().llm_backend() == crate::hardware::Device::Metal {
+            assert_eq!(last.kind, Kind::Text);
+            assert!(last.output.ends_with("100% Metal"), "{}", last.output);
+        } else {
+            assert_eq!(last.kind, Kind::Error);
+            assert!(last.output.starts_with("CPU ops"), "{}", last.output);
+        }
+    }
+
+    #[test]
+    fn device_panel_shows_the_codec_bench_states() {
+        let _g = truecolor();
+        let mut app = snapshot::fixture_app();
+        for (codec, want) in [
+            ((1, 3, 14), "codec-bench 3/14 · tune 31/31"),
+            ((2, 14, 14), "codec-bench ✓ · tune 31/31"),
+            ((0, 0, 0), "codec-bench — · tune 31/31"),
+            ((3, 0, 14), "codec-bench — · tune 31/31"),
+        ] {
+            app.device_status.codec = codec;
+            let text = lines_of(&snapshot::render_buffer(&app, 160, 50)).join("\n");
+            assert!(text.contains(want), "{codec:?}: {text}");
+        }
+    }
+
+    /// The gap panel never draws a negative segment, even when the sample's run exceeds its wall.
+    #[test]
+    fn gap_panel_clamps_negative_segments() {
+        let _g = truecolor();
+        let telemetry = EngineTelemetry::new();
+        telemetry.record_gap(crate::telemetry::GapSample {
+            wall_ms: 5.0,
+            run_ms: 5.4,
+            gpu_ms: 4.5,
+            weights_ms: 3.9,
+            dispatches: 10,
+        });
+        let app = TuiApp::new(telemetry, Arc::new(PagedKVPool::new(64)));
+        let text = lines_of(&snapshot::render_buffer(&app, 120, 40)).join("\n");
+        assert!(text.contains("■0.00 ms"), "{text}");
+        assert!(!text.contains("■-"), "{text}");
+    }
+
+    /// `/help` and the unknown-command text list every command.
+    #[test]
+    fn help_lists_every_command() {
+        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        type_and_run(&mut app, "/help");
+        let help = app.history.last().unwrap().output.clone();
+        type_and_run(&mut app, "/nope");
+        let unknown = app.history.last().unwrap().output.clone();
+        for c in ["/reencode", "/variant", "/settings", "/profile", "/bench", "/placement", "/help"] {
+            assert!(help.contains(c), "help lacks {c}");
+            assert!(unknown.contains(c), "unknown-command text lacks {c}");
+        }
+    }
+
+    /// Serialises the tests that write the real settings file, and puts the file back afterwards.
+    struct SettingsGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+        saved: Option<String>,
+    }
+
+    fn settings_guard() -> SettingsGuard {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _lock = LOCK.lock();
+        let saved = std::fs::read_to_string(settings::settings_path()).ok();
+        SettingsGuard { _lock, saved }
+    }
+
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            let path = settings::settings_path();
+            match &self.saved {
+                Some(s) => {
+                    let _ = std::fs::write(path, s);
+                }
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 
     fn lines_of(buf: &ratatui::buffer::Buffer) -> Vec<String> {
@@ -2570,6 +3049,8 @@ mod tests {
             progress,
             sample: (Instant::now(), 0),
             rate: 12e6,
+            reencode: Arc::default(),
+            reencode_seen: None,
         }
     }
 
@@ -2582,9 +3063,18 @@ mod tests {
             assert!(lines[0].contains("GIBBS"), "{w}x{h}: {}", lines[0]);
             let text = lines.join("\n");
             if w >= 100 && h >= 30 {
-                for title in ["ROOFLINE", "TOKENS", "LATENCY"] {
+                for title in ["ROOFLINE", "GAP", "TOKENS", "LATENCY"] {
                     assert!(text.contains(title), "{w}x{h}: no {title}\n{text}");
                 }
+                assert!(text.contains("to 90%: -1.07 ms"), "{w}x{h}: gap line\n{text}");
+            }
+            if w >= 160 && h >= 50 {
+                for want in ["KERNELS", "GemvPacked", "codec-bench ✓ · tune 31/31"] {
+                    assert!(text.contains(want), "{w}x{h}: no {want}\n{text}");
+                }
+            }
+            if w < 100 {
+                assert!(text.contains("gap 72%"), "{w}x{h}: dock gap atom\n{text}");
             }
             assert_eq!(
                 text.contains("TELEMETRY"),
