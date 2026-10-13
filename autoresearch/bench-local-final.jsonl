@@ -1,0 +1,37 @@
+⚡ Prefill: 20 tokens in 493.63ms (40.5 tok/s)
+⚡ Prefill: 20 tokens in 176.75ms (113.2 tok/s)
+⚡ Prefill: 20 tokens in 176.94ms (113.0 tok/s)
+{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/code/rust-inference-server/disk/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":814473216,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":96.75377201647767,"roofline_tok_s":368.0106200559592,"roofline_pct":26.291027145294183,"gpu_ms":10.37351359375,"rss_gb":2.719563776}
+⚡ Prefill: 20 tokens in 908.58ms (22.0 tok/s)
+⚡ Prefill: 20 tokens in 295.68ms (67.6 tok/s)
+⚡ Prefill: 20 tokens in 295.20ms (67.8 tok/s)
+{"model":"unsloth/gemma-4-E4B-it-qat-GGUF/gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/code/rust-inference-server/disk/models--unsloth--gemma-4-E4B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":2407710720,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":61.29216563050489,"roofline_tok_s":124.48953719786205,"roofline_pct":49.23479274654859,"gpu_ms":16.335089890625003,"rss_gb":3.071901696}
+⚡ Prefill: 23 tokens in 1260.93ms (18.2 tok/s)
+⚡ Prefill: 23 tokens in 641.65ms (35.8 tok/s)
+⚡ Prefill: 23 tokens in 620.91ms (37.0 tok/s)
+{"model":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","file":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","bytes_per_token":3029647360,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":37.413665314715885,"roofline_tok_s":98.93388821302662,"roofline_pct":37.81683505065116,"gpu_ms":27.12161725,"rss_gb":3.9841792}
+⚡ Prefill: 64 tokens in 216.48ms (295.6 tok/s)
+⚡ Prefill: 64 tokens in 160.47ms (398.8 tok/s)
+⚡ Prefill: 64 tokens in 159.43ms (401.4 tok/s)
+{"model":"unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf","file":"/Users/keas/code/rust-inference-server/disk/models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/main/config.json","bytes_per_token":695107584,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":197.4523464187883,"roofline_tok_s":431.20633429764337,"roofline_pct":45.790687824751515,"gpu_ms":5.068603484375,"rss_gb":7.735590912}
+⚡ Prefill: 41 tokens in 42.50ms (964.6 tok/s)
+⚡ Prefill: 41 tokens in 19.43ms (2110.4 tok/s)
+⚡ Prefill: 41 tokens in 19.66ms (2085.4 tok/s)
+{"model":"HuggingFaceTB/SmolLM2-135M-Instruct","file":"/Users/keas/code/rust-inference-server/disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/config.json","bytes_per_token":75644928,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":325.9849516891066,"roofline_tok_s":3962.3911498617754,"roofline_pct":8.226975565006455,"gpu_ms":3.075134703125,"rss_gb":7.735590912}
+⚡ Prefill: 20 tokens in 632.83ms (31.6 tok/s)
+⚡ Prefill: 20 tokens in 236.85ms (84.4 tok/s)
+⚡ Prefill: 20 tokens in 235.17ms (85.0 tok/s)
+{"model":"HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf","file":"HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf","bytes_per_token":942114816,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":75.20387653422371,"roofline_tok_s":318.15102379106537,"roofline_pct":23.63779177514489,"gpu_ms":13.3040449375,"rss_gb":7.735590912}
+⚡ Prefill: 20 tokens in 469.62ms (42.6 tok/s)
+⚡ Prefill: 20 tokens in 185.39ms (107.9 tok/s)
+⚡ Prefill: 20 tokens in 185.16ms (108.0 tok/s)
+{"model":"ggml-org/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_0.gguf","file":"ggml-org/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_0.gguf","bytes_per_token":1282203648,"bytes_basis":"streamed","ceiling_gbps":299.7347932391312,"decode_tok_s":92.22173885382595,"roofline_tok_s":233.76535677983907,"roofline_pct":39.45055851054982,"gpu_ms":10.8693333125,"rss_gb":7.735590912}
+METRIC geomean_roofline_pct=28.99
+METRIC min_roofline_pct=8.23
+METRIC gemma-4-E2B-it-qat-UD-Q2_K_XL_tok_s=96.8
+METRIC gemma-4-E4B-it-qat-UD-Q2_K_XL_tok_s=61.3
+METRIC Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M_tok_s=37.4
+METRIC Llama-3.2-1B-Instruct-Q4_0_tok_s=197.5
+METRIC SmolLM2-135M-Instruct_tok_s=326.0
+METRIC Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P_tok_s=75.2
+METRIC gemma-4-E2B-it-Q4_0_tok_s=92.2
