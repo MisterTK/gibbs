@@ -763,6 +763,7 @@ fn spec_generate(
     );
     let (mut pending, mut out) = (first.into_iter().collect::<Vec<_>>(), Vec::new());
     let (mut all, mut decode, mut tuner) = (ids, Duration::ZERO, KTuner::default());
+    let mut decoded = 0usize;
     'gen: loop {
         for t in pending.drain(..) {
             if tok.ends_generation(t) {
@@ -810,8 +811,10 @@ fn spec_generate(
             }
         };
         decode += t0.elapsed();
+        // The first token came from prefill: only decode-step tokens belong to `decode`.
+        decoded += pending.len();
     }
-    Ok((tok.decode(&out), out.len(), decode))
+    Ok((tok.decode(&out), decoded, decode))
 }
 
 fn new_cpu_kv(model: &GraphLm) -> Vec<LayerKVCache> {
