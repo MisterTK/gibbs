@@ -7147,8 +7147,15 @@ mod tests {
     #[test]
     fn split_decode_attention_matches_cpu() {
         let (max_seq, prefill) = (1024, 700);
-        // Query heads per KV head: 2 (a partial head tile), 8 (two tiles), 1.
-        for (heads, kv_heads, hd) in [(4usize, 2usize, 32usize), (8, 1, 64), (3, 3, 32)] {
+        // Query heads per KV head: 2 (a partial head tile), 8 (two full tiles), 1, 6 (tiles of 4 and 2),
+        // 3 (a single tile of 3); head dims below 512 exercise the q-tile zero fill.
+        for (heads, kv_heads, hd) in [
+            (4usize, 2usize, 32usize),
+            (8, 1, 64),
+            (3, 3, 32),
+            (6, 1, 32),
+            (6, 2, 128),
+        ] {
             let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
             for window in [None, Some(300), Some(90)] {
                 let make = |m: usize| {
