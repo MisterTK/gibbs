@@ -26,5 +26,12 @@
   "roofline_pct": null,
   "attempts": 1,
   "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-UD-IQ2_M.gguf: tensor 'blk.12.attn_k_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
+ },
+ "unsloth/SmolLM-135M-Instruct-bnb-4bit": {
+  "last_commit": "a42c2c3",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "exit -15"
  }
 }

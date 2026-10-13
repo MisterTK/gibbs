@@ -1392,6 +1392,34 @@ impl GraphLm {
         Self::from_manifest(GraphLmConfig::from_gguf(&manifest, config), &manifest, data)
     }
 
+    /// Granite GGUFs: the embedding / residual / logit multipliers and Mamba (`granitehybrid`) layers are not
+    /// implemented, so a file that needs them is an error instead of a plausible-looking wrong model.
+    /// (`attention.scale` is honoured through [`GraphLmConfig::attn_scale`].)
+    fn check_granite(manifest: &ModelManifest) -> Result<(), String> {
+        let md = &manifest.metadata;
+        let Some(arch) = md
+            .get("general.architecture")
+            .filter(|a| a.starts_with("granite"))
+        else {
+            return Ok(());
+        };
+        if arch == "granitehybrid" || arch == "granitemoe" {
+            return Err(format!("architecture '{arch}' (Mamba / expert layers) is not implemented on the dense path"));
+        }
+        for k in ["embedding_scale", "residual_scale", "logit_scale"] {
+            let v = md
+                .get(&format!("{arch}.{k}"))
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            if v != 1.0 {
+                return Err(format!(
+                    "{arch}.{k} = {v}: the Granite multipliers are not implemented"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Ingests real pretrained weights from a parsed [`ModelManifest`] and binary buffer.
     pub fn from_manifest(
         config: GraphLmConfig,
@@ -1410,6 +1438,7 @@ impl GraphLm {
         data: &[u8],
         encoder: Option<&dyn ProjectionEncoder>,
     ) -> Result<Self, String> {
+        Self::check_granite(manifest)?;
         let v = config.vocab_size;
         let h = config.hidden_dim;
         let inter = config.intermediate_dim;
@@ -3246,6 +3275,32 @@ mod tests {
         assert_eq!(with.attn_scale(), 0.0078125);
         let without = GraphLmConfig::from_gguf(&manifest(None), base);
         assert_eq!(without.attn_scale(), 1.0 / (128f32).sqrt());
+    }
+
+    /// Granite multipliers other than 1.0, and hybrid (Mamba) Granites, are rejected instead of loaded wrong.
+    #[test]
+    fn granite_gguf_with_unimplemented_scales_is_rejected() {
+        let manifest = |arch: &str, extra: &[(&str, &str)]| {
+            let mut md = std::collections::HashMap::new();
+            md.insert("general.architecture".to_string(), arch.to_string());
+            for (k, v) in extra {
+                md.insert(format!("{arch}.{k}"), v.to_string());
+            }
+            ModelManifest {
+                format: crate::model::SourceFormat::Gguf,
+                tensors: Default::default(),
+                metadata: md,
+                shard_count: 1,
+                detected_architecture: String::new(),
+            }
+        };
+        assert!(GraphLm::check_granite(&manifest("granite", &[("residual_scale", "1.0")])).is_ok());
+        assert!(
+            GraphLm::check_granite(&manifest("granite", &[("residual_scale", "0.22")])).is_err()
+        );
+        assert!(GraphLm::check_granite(&manifest("granite", &[("logit_scale", "16")])).is_err());
+        assert!(GraphLm::check_granite(&manifest("granitehybrid", &[])).is_err());
+        assert!(GraphLm::check_granite(&manifest("llama", &[("residual_scale", "0.22")])).is_ok());
     }
 
     #[test]
