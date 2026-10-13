@@ -27,13 +27,6 @@
   "attempts": 1,
   "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-UD-IQ2_M.gguf: tensor 'blk.12.attn_k_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
  },
- "unsloth/SmolLM-135M-Instruct-bnb-4bit": {
-  "last_commit": "a42c2c3",
-  "last_status": "error",
-  "roofline_pct": null,
-  "attempts": 1,
-  "error": "exit -15"
- },
  "unsloth/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q4_K_M.gguf": {
   "last_commit": "a42c2c3",
   "last_status": "ok",
@@ -47,13 +40,6 @@
   "roofline_pct": 18.12803713212499,
   "attempts": 1,
   "error": ""
- },
- "unsloth/SmolLM2-135M-bnb-4bit": {
-  "last_commit": "089ba2d",
-  "last_status": "error",
-  "roofline_pct": null,
-  "attempts": 1,
-  "error": "curl download failed for https://huggingface.co/unsloth/SmolLM2-135M-bnb-4bit/resolve/main/model.safetensors (exit code None):  (check the repo id exists on huggingface.co and HF_TOKEN for gated repos)"
  },
  "unsloth/SmolLM2-135M-Instruct-bnb-4bit": {
   "last_commit": "089ba2d",
@@ -82,19 +68,5 @@
   "roofline_pct": null,
   "attempts": 1,
   "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-UD-Q2_K_XL.gguf: tensor 'blk.6.attn_k_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
- },
- "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-Q3_K_S.gguf": {
-  "last_commit": "d2e38cd",
-  "last_status": "error",
-  "roofline_pct": null,
-  "attempts": 1,
-  "error": "curl download failed for https://huggingface.co/unsloth/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q3_K_S.gguf (exit code None):  (check the repo id exists on huggingface.co and HF_TOKEN for gated repos)"
- },
- "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-Q3_K_M.gguf": {
-  "last_commit": "d2e38cd",
-  "last_status": "error",
-  "roofline_pct": null,
-  "attempts": 1,
-  "error": "exit -15"
  }
 }
