@@ -1436,52 +1436,60 @@ kernel void gemv_iq3_s(device const block_iq3_s* w [[buffer(0)]],
     }
 }
 
-kernel void gemv_tq2_0(device const uint8_t* w [[buffer(0)]],
+// GGUF TQ2_0 GEMV after ggml-metal `kernel_mul_mv_tq2_0_f32_impl`: 4 rows per simdgroup (32 rows per 256-thread
+// threadgroup), 8 lanes per block and 4 blocks per pass; the y-side coefficients are built once per
+// 32 elements and shared by the 4 rows, and the 2-bit fields come from floor(v * 2^-2k) instead of masks.
+kernel void gemv_tq2_0(device const uchar* w [[buffer(0)]],
                        device const float* x [[buffer(1)]],
                        device float* y [[buffer(2)]],
                        constant PackedGemvParams& p [[buffer(3)]],
                        device const float* bias [[buffer(4)]],
                        device const float* res [[buffer(5)]],
                        uint2 tg [[threadgroup_position_in_grid]],
-                       uint sg [[simdgroup_index_in_threadgroup]],
-                       uint lane [[thread_index_in_simdgroup]]) {
-    uint row0 = tg.x * 16 + sg * 2;
-    uint row1 = row0 + 1;
-    uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    bool has_row1 = (row1 < p.rows);
-
-    uint bytes = p.cols / 4;
-    device const uint8_t* r0_w = w + (ulong)row0 * bytes;
-    device const uint8_t* r1_w = has_row1 ? (w + (ulong)row1 * bytes) : r0_w;
-    device const float* xb_base = x + (ulong)batch * p.cols;
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (uint b = lane; b < bytes; b += 32) {
-        uint8_t byte0 = r0_w[b];
-        uint8_t byte1 = r1_w[b];
-        float4 xb = *reinterpret_cast<device const float4*>(xb_base + b * 4);
-        for (uint j = 0; j < 4; ++j) {
-            int code0 = int((byte0 >> (j * 2)) & 0x03);
-            int code1 = int((byte1 >> (j * 2)) & 0x03);
-            float xj = xb[j];
-            acc0 += float(code0 - 1) * xj;
-            acc1 += float(code1 - 1) * xj;
+                       ushort sg [[simdgroup_index_in_threadgroup]],
+                       ushort lane [[thread_index_in_simdgroup]]) {
+    const uint first_row = tg.x * 8 + sg * 4;
+    const uint batch = tg.y;
+    if (first_row >= p.rows || batch >= p.batch_size) return;
+    const uint nb = p.cols / 256;
+    const ulong row_bytes = (ulong)nb * 66;
+    const short blk = lane / 8, htg = lane % 8;
+    device const float4* yb4 = (device const float4*)(x + (ulong)batch * p.cols + 4 * htg + blk * 256);
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int ib = blk; ib < (int)nb; ib += 4) {
+        _Pragma("clang loop unroll(full)") for (short h0 = 0; h0 < 2; ++h0) {
+            const float4 y0 = yb4[0 + 32 * h0];
+            const float4 y1 = yb4[8 + 32 * h0];
+            const float4 y2 = yb4[16 + 32 * h0];
+            const float4 y3 = yb4[24 + 32 * h0];
+            float4 coef[4];
+            float sumy = 0.0f;
+            _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                coef[j] = float4(y0[j], y1[j] - 4.0f * y0[j], y2[j] - 4.0f * y1[j], y3[j] - 4.0f * y2[j]);
+                sumy += (y0[j] + y1[j]) + (y2[j] + y3[j]);
+            }
+            _Pragma("clang loop unroll(full)") for (short r = 0; r < 4; ++r) {
+                if (first_row + r >= p.rows) break;
+                device const uchar* xb = w + (ulong)(first_row + r) * row_bytes + (ulong)ib * 66;
+                device const uchar* qs = xb + 4 * htg + 32 * h0;
+                float sum = -sumy;
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const float v = (float)qs[j];
+                    sum += coef[j][0] * v + coef[j][1] * floor(v * 0.25f) + coef[j][2] * floor(v * 0.0625f) +
+                           coef[j][3] * floor(v * 0.015625f);
+                }
+                sumf[r] += float(*(device const half*)(xb + 64)) * sum;
+            }
         }
+        yb4 += 256;
     }
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
-    if (lane == 0) {
-        if (p.has_bias != 0) {
-            acc0 += bias[row0];
-            if (has_row1) acc1 += bias[row1];
-        }
-        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
-        y[(ulong)batch * p.rows + row0] = acc0;
-        if (has_row1) {
-            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
-            y[(ulong)batch * p.rows + row1] = acc1;
+    for (uint r = 0; r < 4; ++r) {
+        float a = simd_sum(sumf[r]);
+        const uint row = first_row + r;
+        if (lane == 0 && row < p.rows) {
+            if (p.has_bias != 0) a += bias[row];
+            const ulong o = (ulong)batch * p.rows + row;
+            y[o] = apply_gemv_epi(a, o, p, res);
         }
     }
 }
