@@ -686,10 +686,18 @@ impl StateStore {
             #[cfg(target_os = "macos")]
             if let Some((buf, n)) = self.metal_buffers.get(&name) {
                 if let Tensor::F32(v) = &t {
-                    assert_eq!(v.len(), *n, "snapshot of state {name} has the wrong size");
-                    // SAFETY: as in `snapshot`; `v` has exactly `n` f32.
+                    // The device buffer may have grown past the snapshot (states grow with the context).
+                    assert!(
+                        v.len() <= *n,
+                        "snapshot of state {name} is larger than its buffer"
+                    );
+                    // SAFETY: as in `snapshot`; `v` has v.len() <= n f32.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(v.as_ptr(), buf.contents() as *mut f32, *n)
+                        std::ptr::copy_nonoverlapping(
+                            v.as_ptr(),
+                            buf.contents() as *mut f32,
+                            v.len(),
+                        )
                     };
                     self.buffers.remove(&name);
                     continue;

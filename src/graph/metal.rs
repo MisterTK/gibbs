@@ -7204,8 +7204,9 @@ mod tests {
             (6, 2, 128),
         ] {
             // Short caches for every shape; for the two widest, a cache past the 4096-row minimum of the
-            // physical state buffers (they must grow; 4200 keys also hit the 32-slice cap).
-            for (max_seq, prefill) in [(1024usize, 700usize), (4400, 4200)] {
+            // physical state buffers: allocated large at prefill (4200), and grown with a copy mid-decode
+            // (4060 prefill, the decode at +40 crosses 4096).
+            for (max_seq, prefill) in [(1024usize, 700usize), (4400, 4200), (4400, 4060)] {
                 if prefill > 1000 && !matches!(hd, 64 | 128) {
                     continue;
                 }
