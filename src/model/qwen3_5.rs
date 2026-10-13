@@ -711,18 +711,21 @@ fn gguf_checkpoint(
                 || hf.ends_with(".linear_attn.out_proj.weight")
                 || (hf.contains(".linear_attn.") && !is_permuted_linear));
         // Matrices stay packed in BF16/FP16 and in any block format the GPU codec registry decodes (a
-        // dequantized copy streams 2-3x the bytes per token, and for expert banks would not fit in memory).
+        // dequantized copy streams 2-3x the bytes per token). Expert banks keep the wider block-codec
+        // predicate: dequantized they would not fit in memory.
+        let block_ok = |cols: usize| {
+            crate::model::layers::gguf_block_codec(t.quant_format)
+                .is_some_and(|(elems, _, _)| cols % elems == 0)
+        };
         let packable = |cols: usize| {
             matches!(
                 t.quant_format,
                 crate::hardware::QuantFormat::BF16 | crate::hardware::QuantFormat::FP16
-            ) || (crate::graph::codec::codec(t.quant_format).is_some()
-                && crate::model::layers::gguf_block_codec(t.quant_format)
-                    .is_some_and(|(elems, _, _)| cols % elems == 0))
+            ) || (crate::graph::codec::codec(t.quant_format).is_some() && block_ok(cols))
         };
         let bank = hf.contains(".mlp.experts.");
         let can_pack = ((shape.len() == 2 && packable(shape[1]))
-            || (bank && packable(shape[shape.len() - 1])))
+            || (bank && (packable(shape[shape.len() - 1]) || block_ok(shape[shape.len() - 1]))))
             && !needs_transform;
 
         if can_pack {
