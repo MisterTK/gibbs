@@ -1,3 +1,4 @@
 iteration	timestamp	commit	base_pct	cand_pct	delta_pp	noise_pp	e2b_tok_s	guard	status	luminal_ref	hypothesis	expected_pp	breakdown_before	breakdown_after
 0n	2026-10-13T02:43:46Z	977074f	29.42	29.05	-0.37	1.48	74.6	n/a	infra	n/a	noise floor: base vs itself (ABBA)	0	-	-
 0n2	2026-10-13T03:27:00Z	7b3a277	31.75	31.92	0.18	5.60	75.9	n/a	infra	n/a	noise floor after metric fixes (decode-token count, native byte basis, shared cache dir)	0	-	-
+0n3	2026-10-13T03:34:53Z	09a3005	31.68	31.60	-0.07	0.22	78.0	n/a	infra	n/a	noise floor, per-model ABBA verify (base binary vs itself)	0	-	-
