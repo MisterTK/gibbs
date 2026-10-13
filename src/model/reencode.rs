@@ -1025,6 +1025,7 @@ mod tests {
 
     #[test]
     fn rules_follow_the_policy_table() {
+        crate::model::variant::with_unmeasured_host(|| {
         // MaxSpeed: > 4.5 bpw or codec-less -> Q4_K, else native.
         for src in [
             Q::BF16,
@@ -1075,6 +1076,7 @@ mod tests {
         }
         assert_eq!(rule(BitExact, Q::EXL3_4Bit), Target::Encode(Q::GGUF_Q4_K_M));
         assert_eq!(rule(BitExact, Q::EXL3_5Bit), Target::Encode(Q::GGUF_Q5_K_M));
+        });
     }
 
     #[test]
