@@ -2530,7 +2530,13 @@ impl Session {
                 // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
                 // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
                 // `GIBBS_CB_CHUNK=0` keeps a single buffer.
-                let (first, chunk) = cb_chunking();
+                // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
+                // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
+                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
+                    cb_chunking()
+                } else {
+                    (usize::MAX, usize::MAX)
+                };
                 let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
                 let mut err = None;
                 let mut dispatches = 0u32;
@@ -5427,6 +5433,8 @@ fn print_kernel_profile(
         );
     }
 }
+
+const CB_CHUNK_MIN_STEPS: usize = 400;
 
 /// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
 fn cb_chunking() -> (usize, usize) {
