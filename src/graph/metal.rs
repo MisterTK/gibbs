@@ -3232,7 +3232,9 @@ impl Session {
                 };
                 let mut scratch_guard = self.attn_scratch.lock();
                 let head_tiles = kv_heads * group.div_ceil(ATTN_HPT);
-                let fuse_merge = n_splits > 1
+                // The in-kernel ticket merge serialises the merge into one threadgroup per head tile: it
+                // lost 12% on E2B at 4k context (iteration 22), so only the append is fused.
+                let fuse_merge = false && n_splits > 1
                     && head_tiles * 4 <= ATTN_CTR_BYTES
                     && fusion_policy().allows(FusionClass::AttentionSingleDispatch);
                 if n_splits > 1 {
