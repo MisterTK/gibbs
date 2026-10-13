@@ -38,7 +38,14 @@ pub fn load_gguf(
 #[allow(clippy::type_complexity)]
 pub fn gguf_decode_fixture(
     path: &Path,
-) -> Result<(crate::graph::Graph, crate::graph::Weights, Box<dyn Fn(u32) -> Vec<f32>>), String> {
+) -> Result<
+    (
+        crate::graph::Graph,
+        crate::graph::Weights,
+        Box<dyn Fn(u32) -> Vec<f32>>,
+    ),
+    String,
+> {
     let (manifest, data) = crate::model::loaders::gguf::open(path)?;
     let text = load_text(&Arc::new(data), &manifest)?;
     let (g, w) = text.to_decode_graph()?;
@@ -240,7 +247,12 @@ fn text_config(m: &ModelManifest, data: &[u8]) -> Result<(Value, usize), String>
         },
     });
     // Sparse layers (26B-A4B): the routed experts beside the dense MLP, in every layer that has a router.
-    let sparse = (0..layers).filter(|i| m.tensors.contains_key(&format!("blk.{i}.ffn_gate_inp.weight"))).count();
+    let sparse = (0..layers)
+        .filter(|i| {
+            m.tensors
+                .contains_key(&format!("blk.{i}.ffn_gate_inp.weight"))
+        })
+        .count();
     if sparse != 0 {
         if sparse != layers {
             return Err(format!("{sparse} of {layers} layers have a router: mixed dense and sparse layers are not supported"));
@@ -500,18 +512,26 @@ fn projectors(
             _ => Err(at(format!("no {modality} encoder"))),
         }
     };
-    let (vision, audio) = (kind("vision", "gemma4v"), kind("audio", "gemma4a"));
+    let (mut vision, mut audio) = (kind("vision", "gemma4v"), kind("audio", "gemma4a"));
+    // A tensor this loader has no graph for (e.g. the 26B-A4B tower's `v.std_bias`) disables its
+    // modality, with the reason shown when a prompt attaches it; it never blocks the text model.
+    for name in m.tensors.keys().filter(|n| mm_hf_name(n).is_none()) {
+        let why = at(format!(
+            "tensor '{name}' is not part of the gemma4v / gemma4a graph"
+        ));
+        if name.starts_with("v.") || name.starts_with("mm.input") {
+            vision = vision.and(Err(why));
+        } else {
+            audio = audio.and(Err(why));
+        }
+    }
     let (mut specs, mut names) = (Vec::new(), HashMap::new());
     for (name, t) in &m.tensors {
         let is_vision = name.starts_with("v.") || name.starts_with("mm.input");
         if (is_vision && vision.is_err()) || (!is_vision && audio.is_err()) {
             continue;
         }
-        let hf = mm_hf_name(name).ok_or_else(|| {
-            at(format!(
-                "tensor '{name}' is not part of the gemma4v / gemma4a graph"
-            ))
-        })?;
+        let hf = mm_hf_name(name).expect("unmapped tensors disabled their modality above");
         let mut shape: Vec<usize> = t.shape.iter().rev().copied().collect();
         if name == "v.patch_embd.weight" {
             shape = vec![shape[0], shape[1] * shape[2] * shape[3]];
@@ -658,16 +678,40 @@ mod tests {
         };
         let f32s = |v: Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
         let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
-        let mut put = |n: String, dims: &[usize], ty: u32, bytes: Vec<u8>| tensors.push((n, dims.to_vec(), ty, bytes));
-        put("token_embd.weight".into(), &[h, vocab], 0, f32s(rnd(h * vocab, 0.8)));
-        put("output_norm.weight".into(), &[h], 0, f32s(rnd(h, 0.2).iter().map(|v| v + 1.0).collect()));
-        put("rope_freqs.weight".into(), &[hd / 2], 0, f32s(vec![1.0; hd / 2]));
+        let mut put = |n: String, dims: &[usize], ty: u32, bytes: Vec<u8>| {
+            tensors.push((n, dims.to_vec(), ty, bytes))
+        };
+        put(
+            "token_embd.weight".into(),
+            &[h, vocab],
+            0,
+            f32s(rnd(h * vocab, 0.8)),
+        );
+        put(
+            "output_norm.weight".into(),
+            &[h],
+            0,
+            f32s(rnd(h, 0.2).iter().map(|v| v + 1.0).collect()),
+        );
+        put(
+            "rope_freqs.weight".into(),
+            &[hd / 2],
+            0,
+            f32s(vec![1.0; hd / 2]),
+        );
         for l in 0..2 {
             let p = format!("blk.{l}");
-            let gain = |n: usize, r: &mut dyn FnMut(usize, f32) -> Vec<f32>| f32s(r(n, 0.2).iter().map(|v| v + 1.0).collect());
+            let gain = |n: usize, r: &mut dyn FnMut(usize, f32) -> Vec<f32>| {
+                f32s(r(n, 0.2).iter().map(|v| v + 1.0).collect())
+            };
             for n in [
-                "attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm", "pre_ffw_norm_2",
-                "post_ffw_norm_1", "post_ffw_norm_2",
+                "attn_norm",
+                "post_attention_norm",
+                "ffn_norm",
+                "post_ffw_norm",
+                "pre_ffw_norm_2",
+                "post_ffw_norm_1",
+                "post_ffw_norm_2",
             ] {
                 put(format!("{p}.{n}.weight"), &[h], 0, gain(h, &mut rnd));
             }
@@ -683,12 +727,37 @@ mod tests {
                 ("ffn_up", [h, inter]),
                 ("ffn_down", [inter, h]),
             ] {
-                put(format!("{p}.{n}.weight"), &dims, 0, f32s(rnd(dims[0] * dims[1], 0.8)));
+                put(
+                    format!("{p}.{n}.weight"),
+                    &dims,
+                    0,
+                    f32s(rnd(dims[0] * dims[1], 0.8)),
+                );
             }
-            put(format!("{p}.layer_output_scale.weight"), &[1], 0, f32s(vec![0.9]));
-            put(format!("{p}.ffn_gate_inp.weight"), &[h, experts], 0, f32s(rnd(h * experts, 1.6)));
-            put(format!("{p}.ffn_gate_inp.scale"), &[h], 0, gain(h, &mut rnd));
-            put(format!("{p}.ffn_down_exps.scale"), &[experts], 0, gain(experts, &mut rnd));
+            put(
+                format!("{p}.layer_output_scale.weight"),
+                &[1],
+                0,
+                f32s(vec![0.9]),
+            );
+            put(
+                format!("{p}.ffn_gate_inp.weight"),
+                &[h, experts],
+                0,
+                f32s(rnd(h * experts, 1.6)),
+            );
+            put(
+                format!("{p}.ffn_gate_inp.scale"),
+                &[h],
+                0,
+                gain(h, &mut rnd),
+            );
+            put(
+                format!("{p}.ffn_down_exps.scale"),
+                &[experts],
+                0,
+                gain(experts, &mut rnd),
+            );
             put(
                 format!("{p}.ffn_gate_up_exps.weight"),
                 &[h, 2 * ff, experts],
@@ -718,7 +787,11 @@ mod tests {
             u32_kv("attention.head_count_kv", nh as u32),
             u32_kv("attention.key_length", hd as u32),
             u32_kv("attention.sliding_window", 8),
-            ("gemma4.attention.sliding_window_pattern".to_string(), 9u32, pattern),
+            (
+                "gemma4.attention.sliding_window_pattern".to_string(),
+                9u32,
+                pattern,
+            ),
             u32_kv("context_length", 64),
             f32_kv("attention.layer_norm_rms_epsilon", 1e-6),
             f32_kv("rope.freq_base", 10000.0),
@@ -735,7 +808,9 @@ mod tests {
 
         let (g, w, embed) = gguf_decode_fixture(&path).unwrap();
         assert!(
-            g.values.iter().any(|v| v.name.ends_with("experts.gate_up_proj.weight")),
+            g.values
+                .iter()
+                .any(|v| v.name.ends_with("experts.gate_up_proj.weight")),
             "the fused gate/up bank is one MoeLinear weight"
         );
         let mut prog = crate::graph::program::GraphProgram::compile(
@@ -749,16 +824,30 @@ mod tests {
         let mut tok = 5u32;
         for pos in 0..6usize {
             let emb = embed(tok);
-            let inputs = || vec![crate::graph::Tensor::F32(emb.clone()), crate::graph::Tensor::U32(vec![pos as u32])];
+            let inputs = || {
+                vec![
+                    crate::graph::Tensor::F32(emb.clone()),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ]
+            };
             let want = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
             let want = want[0].as_f32().unwrap();
             let got = prog.run(inputs()).unwrap();
             let got = got[0].as_f32().unwrap();
-            let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let dot: f64 = want
+                .iter()
+                .zip(got)
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum();
             let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
             let cos = dot / (n(want) * n(got));
             assert!(cos >= 0.999, "step {pos}: Metal vs CPU graph cosine {cos}");
-            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            tok = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32;
         }
     }
 
@@ -803,17 +892,29 @@ mod tests {
             .unwrap_err()
             .contains("mixed dense and sparse"));
         for l in 1..4 {
-            m.tensors
-                .extend([tensor(&format!("blk.{l}.ffn_gate_inp.weight"), &[4, 64], 0, 0)]);
+            m.tensors.extend([tensor(
+                &format!("blk.{l}.ffn_gate_inp.weight"),
+                &[4, 64],
+                0,
+                0,
+            )]);
         }
         m.metadata.extend(
-            [("expert_count", "128"), ("expert_used_count", "8"), ("expert_feed_forward_length", "704")]
-                .map(|(k, v)| (format!("gemma4.{k}"), v.to_string())),
+            [
+                ("expert_count", "128"),
+                ("expert_used_count", "8"),
+                ("expert_feed_forward_length", "704"),
+            ]
+            .map(|(k, v)| (format!("gemma4.{k}"), v.to_string())),
         );
         let c = text_config(&m, &data).unwrap().0;
         assert_eq!(c["enable_moe_block"], true);
         assert_eq!(
-            (c["num_experts"].as_u64(), c["top_k_experts"].as_u64(), c["moe_intermediate_size"].as_u64()),
+            (
+                c["num_experts"].as_u64(),
+                c["top_k_experts"].as_u64(),
+                c["moe_intermediate_size"].as_u64()
+            ),
             (Some(128), Some(8), Some(704))
         );
     }
@@ -843,8 +944,14 @@ mod tests {
             ("ffn_gate_inp.weight", "router.proj.weight"),
             ("ffn_gate_inp.scale", "router.scale"),
             ("ffn_down_exps.scale", "router.per_expert_scale"),
-            ("pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
-            ("post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight"),
+            (
+                "pre_ffw_norm_2.weight",
+                "pre_feedforward_layernorm_2.weight",
+            ),
+            (
+                "post_ffw_norm_1.weight",
+                "post_feedforward_layernorm_1.weight",
+            ),
             ("ffn_gate_exps.weight", "mlp.experts.gate_proj"),
             ("ffn_gate_up_exps.weight", "mlp.experts.gate_up_proj"),
             ("ffn_down_exps.weight", "mlp.experts.down_proj"),
@@ -923,14 +1030,20 @@ mod tests {
                 g.outputs.push(o);
             }
         }
-        let tokens = [2u32, 105, 2364, 3041, 563, 506, 5279, 1855, 529, 5946, 38102, 236764, 710, 2364];
+        let tokens = [
+            2u32, 105, 2364, 3041, 563, 506, 5279, 1855, 529, 5946, 38102, 236764, 710, 2364,
+        ];
         let build = |tok: u32, pos: usize| {
             let mut emb = vec![0.0f32; text.hidden];
             text.embed_row(tok, &mut emb);
             let mut inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos as u32])];
             if let Some(p) = &text.ple {
                 let mut e = vec![0.0f32; text.layers_n * p.dim];
-                let id = if (tok as usize) < p.embed.rows { tok } else { text.pad_id };
+                let id = if (tok as usize) < p.embed.rows {
+                    tok
+                } else {
+                    text.pad_id
+                };
                 p.embed.get_row(id as usize, &mut e);
                 let sc = (p.dim as f32).sqrt();
                 e.iter_mut().for_each(|v| *v *= sc);
@@ -942,10 +1055,14 @@ mod tests {
         let mut native_cache = text.new_cache();
         let mut mg = g.clone();
         crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut mg, &|f| {
-            crate::graph::metal::supports_op(&crate::graph::Op::Linear, crate::graph::DType::Quant(f))
+            crate::graph::metal::supports_op(
+                &crate::graph::Op::Linear,
+                crate::graph::DType::Quant(f),
+            )
         })
         .unwrap();
-        let rt = crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
+        let rt = crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
+            .unwrap();
         let session = crate::graph::metal::Session::new_for_graph(rt, &w, Some(&mg)).unwrap();
         let plan = session.prepare_plan(&mg).unwrap();
         let mut metal_state = StateStore::new();
@@ -961,7 +1078,10 @@ mod tests {
                 let dot: f32 = native.iter().zip(gl).map(|(a, b)| a * b).sum();
                 let na: f32 = native.iter().map(|a| a * a).sum::<f32>().sqrt();
                 let nb: f32 = gl.iter().map(|a| a * a).sum::<f32>().sqrt();
-                println!("pos {pos}: native vs graph-cpu logits cos {:.5}", dot / (na * nb));
+                println!(
+                    "pos {pos}: native vs graph-cpu logits cos {:.5}",
+                    dot / (na * nb)
+                );
                 native_logits = native;
             }
             let met = session
@@ -972,16 +1092,25 @@ mod tests {
                 let dot: f32 = native_logits.iter().zip(ml).map(|(a, b)| a * b).sum();
                 let na: f32 = native_logits.iter().map(|a| a * a).sum::<f32>().sqrt();
                 let nb: f32 = ml.iter().map(|a| a * a).sum::<f32>().sqrt();
-                println!("pos {pos}: native vs metal logits cos {:.5}", dot / (na * nb));
+                println!(
+                    "pos {pos}: native vs metal logits cos {:.5}",
+                    dot / (na * nb)
+                );
             }
             let mut first_bad = None;
             for (i, (c, m)) in cpu.iter().zip(&met).enumerate() {
                 if i == 0 {
                     continue; // the logits, compared via the node list below
                 }
-                let (Ok(c), Ok(m)) = (c.as_f32(), m.as_f32()) else { continue };
+                let (Ok(c), Ok(m)) = (c.as_f32(), m.as_f32()) else {
+                    continue;
+                };
                 let scale = c.iter().fold(0f32, |a, &x| a.max(x.abs())).max(1e-6);
-                let d = c.iter().zip(m).fold(0f32, |a, (&x, &y)| a.max((x - y).abs())) / scale;
+                let d = c
+                    .iter()
+                    .zip(m)
+                    .fold(0f32, |a, (&x, &y)| a.max((x - y).abs()))
+                    / scale;
                 if d > 2e-3 && first_bad.is_none() {
                     first_bad = Some((i, d));
                 }
@@ -989,10 +1118,22 @@ mod tests {
             match first_bad {
                 Some((i, d)) => {
                     let n = &g.nodes[(i - 1).min(g.nodes.len() - 1)];
-                    println!("pos {pos}: first divergence output #{i} (node '{}' {:?}) rel diff {d:.4}", n.name, n.op);
+                    println!(
+                        "pos {pos}: first divergence output #{i} (node '{}' {:?}) rel diff {d:.4}",
+                        n.name, n.op
+                    );
                     if let (Ok(c), Ok(m)) = (cpu[i].as_f32(), met[i].as_f32()) {
-                        let bad: Vec<usize> = (0..c.len()).filter(|&j| !((c[j] - m[j]).abs() <= 1e-2 * (1.0 + c[j].abs()))).collect();
-                        println!("  {} of {} elements differ; first {:?}; e.g. cpu {:?} metal {:?}", bad.len(), c.len(), &bad[..bad.len().min(6)], bad.iter().take(3).map(|&j| c[j]).collect::<Vec<_>>(), bad.iter().take(3).map(|&j| m[j]).collect::<Vec<_>>());
+                        let bad: Vec<usize> = (0..c.len())
+                            .filter(|&j| !((c[j] - m[j]).abs() <= 1e-2 * (1.0 + c[j].abs())))
+                            .collect();
+                        println!(
+                            "  {} of {} elements differ; first {:?}; e.g. cpu {:?} metal {:?}",
+                            bad.len(),
+                            c.len(),
+                            &bad[..bad.len().min(6)],
+                            bad.iter().take(3).map(|&j| c[j]).collect::<Vec<_>>(),
+                            bad.iter().take(3).map(|&j| m[j]).collect::<Vec<_>>()
+                        );
                     }
                 }
                 None => println!("pos {pos}: all {} outputs within 2e-3", cpu.len()),
