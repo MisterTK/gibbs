@@ -44,14 +44,20 @@ models = []
 for i in range(n):
     b, c = mean_tok(("base1", "base2"), i), mean_tok(("cand1", "cand2"), i)
     r = runs["cand1"][i]
+    # Separate processes of one binary differ by several % on small models (buffer placement), so a
+    # model's allowed regression is 3% or twice its own base1/base2 spread, whichever is larger.
+    spread = abs(runs["base1"][i]["decode_tok_s"] - runs["base2"][i]["decode_tok_s"]) / b
+    allowed = max(0.03, 2 * spread)
     models.append({
         "model": r["model"], "base_tok_s": b, "cand_tok_s": c, "ratio": c / b,
+        "base_spread": spread, "ratio_ok": c / b >= 1 - allowed,
         "cand_pct": sum(pct(t, i) for t in ("cand1", "cand2")) / 2,
         "wall_ms": r["wall_ms"], "gpu_ms": r.get("gpu_ms"), "run_ms": r.get("run_ms"),
         "host_ms": r.get("host_ms"), "weights_ms": r["weights_ms"], "dispatches": r.get("dispatches"),
     })
 e2b = next((m["cand_tok_s"] for m in models if "gemma-4-E2B-it-qat" in m["model"]), None)
 v = {"base_pct": base, "cand_pct": cand, "delta_pp": cand - base, "noise_pp": abs(g["base1"] - g["base2"]),
-     "e2b_tok_s": e2b, "min_ratio": min(m["ratio"] for m in models), "models": models}
+     "e2b_tok_s": e2b, "min_ratio": min(m["ratio"] for m in models),
+     "ratios_ok": all(m["ratio_ok"] for m in models), "models": models}
 json.dump(v, open(os.path.join(d, "verify.json"), "w"), indent=1)
 print(f"{v['delta_pp']:.2f}")
