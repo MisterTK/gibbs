@@ -347,9 +347,7 @@ impl TuiApp {
         let mut gemm_peak_gflops = 0.0f64;
         let mut gemm_top: Vec<(f64, String)> = Vec::new();
         #[cfg(target_os = "macos")]
-        if let Ok(rt) =
-            crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
-        {
+        if let Ok(rt) = crate::graph::metal::Runtime::shared() {
             let prof = rt.profile();
             telemetry.set_hardware_profile(&prof.device, prof.memory_bandwidth_gbps as f32);
             // Measured GEMM peak (GFLOP/s) over the host profile's timings: the compute roof.
@@ -1218,7 +1216,8 @@ impl TuiApp {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
             let attach = || -> Result<String, String> {
                 let da = hub.auto_download_and_cache(&id, token.as_deref())?;
-                let d = crate::model::draft::load_drafter(&da, &hub.locate_model(&target), placement)?;
+                let d =
+                    crate::model::draft::load_drafter(&da, &hub.locate_model(&target), placement)?;
                 // ponytail: check-then-set; a model swap landing in between keeps this drafter
                 // until the swap resets it. Add a guarded set if loads race in practice.
                 if sched.model_id() != target {
@@ -1376,10 +1375,8 @@ impl TuiApp {
             None
         };
         if let Some(why) = refused {
-            self.picker.set_note(
-                format!("cannot delete {id}: {why}"),
-                theme::Token::Crimson,
-            );
+            self.picker
+                .set_note(format!("cannot delete {id}: {why}"), theme::Token::Crimson);
             return;
         }
         let dir = self.picker.repo_dir(id);
@@ -1494,7 +1491,11 @@ impl TuiApp {
                 && key.code == KeyCode::Char(ch)
                 && matches!(self.focus, Focus::Dashboard | Focus::Prompt)
             {
-                self.detail = if self.detail == Some(comp) { None } else { Some(comp) };
+                self.detail = if self.detail == Some(comp) {
+                    None
+                } else {
+                    Some(comp)
+                };
                 if self.detail == Some(layout::Comp::Roofline)
                     && self.roofline_probe_result.is_none()
                 {
@@ -2341,7 +2342,12 @@ mod tests {
         assert!(e.output.contains(&format!("unknown command '{gone}'")));
         app.input = "/gibbs".into();
         app.submit_prompt();
-        assert!(app.history.last().unwrap().output.contains("JOSIAH WILLARD GIBBS"));
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("JOSIAH WILLARD GIBBS"));
         // 7. /bench, /quant, /help commands
         app.input = "/bench".into();
         app.submit_prompt();
@@ -2546,7 +2552,10 @@ mod tests {
     }
 
     fn truecolor() -> theme::TestGuard {
-        theme::test_guard(theme::Theme { truecolor: true, mono: false })
+        theme::test_guard(theme::Theme {
+            truecolor: true,
+            mono: false,
+        })
     }
 
     fn fake_load() -> Load {
@@ -2577,8 +2586,16 @@ mod tests {
                     assert!(text.contains(title), "{w}x{h}: no {title}\n{text}");
                 }
             }
-            assert_eq!(text.contains("TELEMETRY"), w < 100, "{w}x{h}: dock only when compact");
-            assert_eq!(text.contains("IDLE") || text.contains("GENERATING"), h >= 44 && w >= 100, "{w}x{h}: cameo panel");
+            assert_eq!(
+                text.contains("TELEMETRY"),
+                w < 100,
+                "{w}x{h}: dock only when compact"
+            );
+            assert_eq!(
+                text.contains("IDLE") || text.contains("GENERATING"),
+                h >= 44 && w >= 100,
+                "{w}x{h}: cameo panel"
+            );
         }
     }
 
@@ -2592,7 +2609,11 @@ mod tests {
         assert!(atoms.len() >= 4);
         for atom in atoms {
             let text: String = atom.iter().map(|s| s.content.as_ref()).collect();
-            assert!(lines.iter().any(|l| l.contains(&text)), "{text:?} split or missing:\n{}", lines.join("\n"));
+            assert!(
+                lines.iter().any(|l| l.contains(&text)),
+                "{text:?} split or missing:\n{}",
+                lines.join("\n")
+            );
         }
     }
 
@@ -2611,12 +2632,20 @@ mod tests {
 
     #[test]
     fn no_color_theme_paints_no_foreground() {
-        let _g = theme::test_guard(theme::Theme { truecolor: true, mono: true });
+        let _g = theme::test_guard(theme::Theme {
+            truecolor: true,
+            mono: true,
+        });
         let app = snapshot::fixture_app();
         for (w, h) in [(80, 24), (160, 50)] {
             let buf = snapshot::render_buffer(&app, w, h);
             for c in buf.content() {
-                assert_eq!(c.fg, ratatui::style::Color::Reset, "{w}x{h}: {:?}", c.symbol());
+                assert_eq!(
+                    c.fg,
+                    ratatui::style::Color::Reset,
+                    "{w}x{h}: {:?}",
+                    c.symbol()
+                );
                 assert_eq!(c.bg, ratatui::style::Color::Reset);
             }
         }
@@ -2629,7 +2658,10 @@ mod tests {
         app.detail = Some(layout::Comp::Logprobs);
         for (w, h) in [(80, 24), (160, 50)] {
             let text = lines_of(&snapshot::render_buffer(&app, w, h)).join("\n");
-            assert!(text.contains("LOGPROBS") && text.contains("scrub"), "{w}x{h}\n{text}");
+            assert!(
+                text.contains("LOGPROBS") && text.contains("scrub"),
+                "{w}x{h}\n{text}"
+            );
         }
         // Focus is shown by a BRASS border on the focused component only.
         let buf = snapshot::render_buffer(&app, 160, 50);

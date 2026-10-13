@@ -80,7 +80,11 @@ pub struct Spec {
 /// Every spec: the GGUF ones below plus the repacked source encodings of `model::repack`.
 fn all_specs() -> impl Iterator<Item = &'static Spec> {
     use crate::model::repack::{affine, bnb, fp8};
-    SPECS.iter().chain(bnb::SPECS).chain(fp8::SPECS).chain(affine::SPECS)
+    SPECS
+        .iter()
+        .chain(bnb::SPECS)
+        .chain(fp8::SPECS)
+        .chain(affine::SPECS)
 }
 
 /// Full MSL (helpers + tables + body) per entry of [`all_specs`], owned by a static so the codecs can borrow it.
@@ -613,12 +617,27 @@ pub fn formats() -> Vec<QuantFormat> {
         .collect()
 }
 
-/// Hash of [`CODEC_VERSION`] and every codec's MSL: the key of the measured codec efficiencies.
+/// Hash of [`CODEC_VERSION`], every codec's MSL and every generated GEMV variant built from it:
+/// the key of the measured codec efficiencies.
 pub fn source_hash() -> u64 {
+    use crate::graph::codegen::{gemv_packed, GemvParams};
     let mut h = 0xcbf29ce484222325u64 ^ u64::from(CODEC_VERSION);
     for f in formats() {
         let c = codec(f).expect("listed formats are registered");
-        for b in format!("{f:?}").bytes().chain(c.msl.bytes()) {
+        let generated = crate::graph::tune::GEN_ROWS.map(|r| {
+            gemv_packed(
+                c,
+                GemvParams {
+                    rows_per_sg: r as usize,
+                    ..Default::default()
+                },
+            )
+        });
+        for b in format!("{f:?}")
+            .bytes()
+            .chain(c.msl.bytes())
+            .chain(generated.iter().flat_map(|s| s.bytes()))
+        {
             h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
         }
     }

@@ -360,7 +360,8 @@ fn matvec(
         }
         set_bytes(enc, 5, &[u32_of(m)?, u32_of(rows)?, u32_of(cols)?, 0u32]);
     } else {
-        enc.set_compute_pipeline_state(sess.gemv_pso(fmt)?);
+        let pso = sess.gemv_pso(fmt)?;
+        enc.set_compute_pipeline_state(&pso);
         for (i, (b, off)) in [w, x, out].into_iter().enumerate() {
             enc.set_buffer(i as u64, Some(b), off as u64);
         }

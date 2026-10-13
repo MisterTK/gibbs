@@ -262,20 +262,18 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         .unwrap_or_default();
 
     let hub = crate::model::hub::HuggingFaceHub::new();
-    let cache = crate::hardware::default_cache_dir()?;
-    let mut rt = crate::graph::metal::Runtime::new(&cache).ok();
+    let rt = crate::graph::metal::Runtime::shared().ok();
     if let Some(r) = rt.as_ref().filter(|r| !r.codec_rates_current()) {
         // The roofline ceiling and the re-encode rule both read measured codec rates.
         let _lock = crate::hardware::gpu_lock()?;
         let n = r.run_codec_bench()?;
         println!("codec-bench: measured {n} formats");
-        rt = crate::graph::metal::Runtime::new(&cache).ok();
     }
-    // Measured streaming ceiling of this GPU (host profile), not the spec-sheet figure.
-    let ceiling_gbps = rt
-        .as_ref()
-        .map(|rt| rt.profile().ceiling_gbps)
-        .unwrap_or_else(|| crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps);
+    // Measured streaming ceiling of this GPU (host profile / codec bench), not the spec-sheet figure.
+    let ceiling_gbps = match crate::model::variant::host_ceiling_gbps() {
+        c if c > 0.0 => c,
+        _ => crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps,
+    };
 
     for model_cfg in &suite.models {
         let decode_tokens = model_cfg.decode_tokens.unwrap_or(defaults.decode_tokens);
