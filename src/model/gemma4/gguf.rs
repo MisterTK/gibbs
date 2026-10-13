@@ -300,9 +300,9 @@ fn text_hf_name(name: &str, first_shared: usize) -> Result<Option<String>, Strin
         "ffn_gate_inp.weight" => "router.proj.weight",
         "ffn_gate_inp.scale" => "router.scale",
         "ffn_down_exps.scale" => "router.per_expert_scale",
-        "ffn_pre_norm_2.weight" => "pre_feedforward_layernorm_2.weight",
-        "ffn_post_norm_1.weight" => "post_feedforward_layernorm_1.weight",
-        "ffn_post_norm_2.weight" => "post_feedforward_layernorm_2.weight",
+        "pre_ffw_norm_2.weight" => "pre_feedforward_layernorm_2.weight",
+        "post_ffw_norm_1.weight" => "post_feedforward_layernorm_1.weight",
+        "post_ffw_norm_2.weight" => "post_feedforward_layernorm_2.weight",
         // Expert banks take no `.weight`: `Weights::from_gguf` keeps `.mlp.experts.*` mapped.
         "ffn_gate_exps.weight" => "mlp.experts.gate_proj",
         "ffn_up_exps.weight" => "mlp.experts.up_proj",
@@ -666,8 +666,8 @@ mod tests {
             let p = format!("blk.{l}");
             let gain = |n: usize, r: &mut dyn FnMut(usize, f32) -> Vec<f32>| f32s(r(n, 0.2).iter().map(|v| v + 1.0).collect());
             for n in [
-                "attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm", "ffn_pre_norm_2",
-                "ffn_post_norm_1", "ffn_post_norm_2",
+                "attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm", "pre_ffw_norm_2",
+                "post_ffw_norm_1", "post_ffw_norm_2",
             ] {
                 put(format!("{p}.{n}.weight"), &[h], 0, gain(h, &mut rnd));
             }
@@ -843,8 +843,8 @@ mod tests {
             ("ffn_gate_inp.weight", "router.proj.weight"),
             ("ffn_gate_inp.scale", "router.scale"),
             ("ffn_down_exps.scale", "router.per_expert_scale"),
-            ("ffn_pre_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
-            ("ffn_post_norm_1.weight", "post_feedforward_layernorm_1.weight"),
+            ("pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
+            ("post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight"),
             ("ffn_gate_exps.weight", "mlp.experts.gate_proj"),
             ("ffn_gate_up_exps.weight", "mlp.experts.gate_up_proj"),
             ("ffn_down_exps.weight", "mlp.experts.down_proj"),
