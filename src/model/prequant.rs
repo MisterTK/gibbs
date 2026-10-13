@@ -8,6 +8,7 @@
 
 use crate::hardware::QuantFormat;
 use crate::model::weights::Weights;
+use crate::model::repack::mxfp4;
 use crate::model::{decode_dtype, ModelManifest, VirtualTensor};
 use crate::quant::nvfp4::NVFP4_E2M1_LUT;
 use serde_json::Value;
@@ -22,17 +23,19 @@ mod quark;
 /// ([`quark::annotate`]) and GLQ's true shapes and shipped codebook ([`glq::prepare`]).
 pub fn annotate(m: &mut ModelManifest, config_path: Option<&Path>) -> Result<(), String> {
     quark::annotate(m, config_path)?;
+    crate::model::repack::gptq::annotate(m, config_path);
     glq::prepare(m, config_path)
 }
 
 /// compressed-tensors storage formats [`dequantize`] expands.
-const CT_FORMATS: [&str; 6] = [
+const CT_FORMATS: [&str; 7] = [
     "dense",
     "naive-quantized",
     "int-quantized",
     "float-quantized",
     "pack-quantized",
     "nvfp4-pack-quantized",
+    "mxfp4-pack-quantized",
 ];
 
 /// Errs when `config.json` (`quantization_config`) or `hf_quant_config.json` beside the weights names a
@@ -175,8 +178,9 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
             }
         }
         Some("bitsandbytes") => crate::model::repack::bnb::blocker(qc.unwrap_or(&Value::Null)),
+        Some(m @ ("gptq" | "awq")) => crate::model::repack::gptq::blocker(m, qc.unwrap_or(&Value::Null)),
         Some(m) => Some(format!(
-            "quantization method '{m}' is not supported (compressed-tensors, modelopt FP8/NVFP4, bitnet, quark, fp8, exl3, glq and bitsandbytes 4-bit are)"
+            "quantization method '{m}' is not supported (compressed-tensors, modelopt FP8/NVFP4, gptq and awq 4-bit, bitnet, quark, fp8, exl3, glq and bitsandbytes 4-bit are)"
         )),
     }
 }
@@ -202,7 +206,7 @@ pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weight
     let specs = m
         .tensors
         .iter()
-        .filter(|(n, _)| !crate::model::repack::bnb::is_companion(n))
+        .filter(|(n, _)| !crate::model::repack::bnb::is_companion(n) && !crate::model::repack::gptq::is_companion(&m, n))
         .map(|(n, t)| (n.clone(), t.shape.clone()))
         .collect();
     Weights::from_f32(specs, |n| m.extract_tensor_f32(&data, n))
@@ -214,6 +218,8 @@ pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weight
 pub fn alias_packed(m: &mut ModelManifest, data: &[u8]) -> Result<(), String> {
     glq::alias(m);
     crate::model::repack::bnb::alias(m, data)?;
+    crate::model::repack::gptq::alias(m);
+    crate::model::repack::mxfp4::alias(m);
     let mut add = Vec::new();
     let mut fp4 = Vec::new();
     let mut ternary = Vec::new();
@@ -228,10 +234,12 @@ pub fn alias_packed(m: &mut ModelManifest, data: &[u8]) -> Result<(), String> {
                 None => return Err(format!("{name} has no `weight_shape` companion")),
             };
             // ponytail: int4/int8 packs share the GPTQ_W4A16 tag; QuantFormat has no plain INT8 variant.
-            let quant_format = if t.dtype == "U8" {
-                QuantFormat::NVFP4
-            } else {
+            let quant_format = if t.dtype != "U8" {
                 QuantFormat::GPTQ_W4A16
+            } else if matches!(shape[..], [r, c] if mxfp4::is_mx(m, stem, r, c)) {
+                QuantFormat::MXFP4
+            } else {
+                QuantFormat::NVFP4
             };
             add.push(VirtualTensor {
                 name: format!("{stem}.weight"),
@@ -251,25 +259,26 @@ pub fn alias_packed(m: &mut ModelManifest, data: &[u8]) -> Result<(), String> {
                 shape: vec![nt * 16, kt * 16],
                 ..t.clone()
             });
-        } else if let Some(scale) = name
+        } else if let Some((stem, scale)) = name
             .strip_suffix(".weight")
-            .and_then(|s| m.tensors.get(&format!("{s}.weight_scale")))
+            .and_then(|s| Some((s, m.tensors.get(&format!("{s}.weight_scale"))?)))
             .filter(|_| t.dtype == "U8" && t.shape.len() == 2)
         {
             if scale.dtype != "U8" && scale.shape.iter().product::<usize>() == 1 {
                 ternary.push(name.clone());
             } else {
-                fp4.push(name.clone());
+                let mx = mxfp4::is_mx(m, stem, t.shape[0], t.shape[1] * 2);
+                fp4.push((name.clone(), if mx { QuantFormat::MXFP4 } else { QuantFormat::NVFP4 }));
             }
         }
     }
     for t in add {
         m.tensors.insert(t.name.clone(), t);
     }
-    for name in fp4 {
+    for (name, quant_format) in fp4 {
         let t = m.tensors.get_mut(&name).unwrap();
         t.shape[1] *= 2;
-        t.quant_format = QuantFormat::NVFP4;
+        t.quant_format = quant_format;
     }
     for name in ternary {
         let t = m.tensors.get_mut(&name).unwrap();
@@ -290,10 +299,17 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
     if let Some(w) = crate::model::repack::bnb::dequantize(m, data, name)? {
         return Ok(Some(w));
     }
+    if let Some(w) = crate::model::repack::gptq::dequantize(m, data, name)? {
+        return Ok(Some(w));
+    }
     let Some(stem) = name.strip_suffix(".weight") else {
-        return Ok(None);
+        // gpt-oss `X_blocks` / `X_scales` are exposed as a bare `X`.
+        return mxfp4::dequantize(m, data, name);
     };
     if let Some(w) = quark::dequantize(m, data, name)? {
+        return Ok(Some(w));
+    }
+    if let Some(w) = mxfp4::dequantize(m, data, name)? {
         return Ok(Some(w));
     }
     if m.tensors.contains_key(&format!("{stem}.trellis"))
@@ -418,7 +434,7 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
         (None, Some(g)) => scalar(g)?,    // modelopt nvfp4: fp4 * scale * scale_2
         (None, None) if w.dtype == "U8" => {
             return Err(err(
-                "fp4 weight without a global scale (e.g. MXFP4) is not supported".into(),
+                "fp4 weight without a global scale or an MXFP4 scale grid is not supported".into(),
             ))
         }
         (None, None) => 1.0,
@@ -526,6 +542,60 @@ pub(crate) fn int4_groups<'a>(
         scale,
         zero,
     }))
+}
+
+/// The checkpoint's own NVFP4 blocks of `name` (modelopt `weight` / `weight_scale` / `weight_scale_2`,
+/// compressed-tensors `weight_packed` / `weight_scale` / `weight_global_scale`): the nibble bytes as
+/// stored, the E4M3 scale bytes verbatim and the global scale [`dequantize`] multiplies by. `None`
+/// when `name` is not a 16-grouped NVFP4 weight with a global scale (the f32 path applies).
+pub(crate) fn nvfp4_source(
+    m: &ModelManifest,
+    data: &[u8],
+    name: &str,
+) -> Result<Option<crate::quant::nvfp4::Nvfp4Tensor>, String> {
+    use crate::quant::nvfp4::{Nvfp4Block, Nvfp4Tensor, NVFP4_BLOCK_SIZE as B};
+    let Some(stem) = name.strip_suffix(".weight") else {
+        return Ok(None);
+    };
+    let get = |s: &str| m.tensors.get(&format!("{stem}.{s}"));
+    let (Some(w), Some(st)) = (m.tensors.get(name), get("weight_scale")) else {
+        return Ok(None);
+    };
+    let &[rows, cols] = &w.shape[..] else {
+        return Ok(None);
+    };
+    if w.quant_format != QuantFormat::NVFP4
+        || w.dtype != "U8"
+        || !matches!(st.dtype.as_str(), "U8" | "F8_E4M3")
+        || cols % B != 0
+        || w.byte_len != rows * cols / 2
+        || st.byte_len != rows * cols / B
+        || get("weight_zero_point").is_some()
+        || get("weight_g_idx").is_some()
+    {
+        return Ok(None);
+    }
+    let scalar = |t: &VirtualTensor| -> Result<f32, String> {
+        decode_dtype(bytes(data, t)?, &t.dtype)?
+            .first()
+            .copied()
+            .ok_or_else(|| format!("{name}: {} is empty", t.name))
+    };
+    let global = match (get("weight_global_scale"), get("weight_scale_2")) {
+        (Some(g), _) => 1.0 / scalar(g)?,
+        (None, Some(g)) => scalar(g)?,
+        (None, None) => return Ok(None),
+    };
+    let scales = bytes(data, st)?.to_vec();
+    let blocks = bytes(data, w)?
+        .chunks_exact(B / 2)
+        .zip(&scales)
+        .map(|(nibbles, &s)| Nvfp4Block {
+            packed_nibbles: nibbles.try_into().unwrap(),
+            scale: crate::model::f8_e4m3_to_f32(s) * global,
+        })
+        .collect();
+    Ok(Some(Nvfp4Tensor { blocks, rows, cols, source_scales: Some((scales, global)) }))
 }
 
 /// Elements of `n` covered by each of `s` scale entries.
@@ -833,11 +903,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.json");
         for (qc, ok) in [
+            (r#"{"quantization_config":{"quant_method":"gptq","bits":4}}"#, true),
+            (r#"{"quantization_config":{"quant_method":"gptq","bits":8}}"#, false),
+            (r#"{"quantization_config":{"quant_method":"awq"}}"#, true),
+            (r#"{"quantization_config":{"quant_method":"awq","version":"gemv"}}"#, false),
+            (r#"{"quantization_config":{"quant_method":"bitsandbytes","bnb_4bit_quant_type":"nf4"}}"#, true),
             (
-                r#"{"quantization_config":{"quant_method":"gptq","bits":4}}"#,
-                false,
+                r#"{"quantization_config":{"quant_method":"compressed-tensors","format":"mxfp4-pack-quantized"}}"#,
+                true,
             ),
-            (r#"{"quantization_config":{"quant_method":"awq"}}"#, false),
             (r#"{"quantization":{"bits":4,"group_size":64}}"#, true),
             (
                 r#"{"quantization_config":{"quant_method":"compressed-tensors","format":"marlin-24"}}"#,
@@ -919,5 +993,72 @@ mod tests {
         let hub = |t: &str| serde_json::json!({"model_type": t, "quantization_config": {"quant_method": "bitnet"}});
         assert_eq!(super::scheme_blocker(&hub("bitnet"), None), None);
         assert!(super::scheme_blocker(&hub("llama"), None).is_some());
+    }
+
+    /// modelopt and compressed-tensors NVFP4 become `Nvfp4Tensor`s that keep the checkpoint's E4M3
+    /// scale bytes and global scale, and expand to exactly what the f32 path does.
+    #[test]
+    fn nvfp4_source_keeps_scales_and_matches_the_f32_path() {
+        use crate::model::{ModelManifest, UniversalModelLoader, VirtualTensor};
+        use crate::quant::nvfp4::dequantize_nvfp4_tensor;
+        let (rows, cols) = (6, 64);
+        let mut s = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u8
+        };
+        let nibbles: Vec<u8> = (0..rows * cols / 2).map(|_| next()).collect();
+        // Finite E4M3 bytes over a few binades, either sign.
+        let scales: Vec<u8> = (0..rows * cols / 16).map(|_| (next() & 0x80) | (0x20 + next() % 0x30)).collect();
+        for (global_name, dtype_scale, weight, global) in [
+            ("weight_scale_2", "U8", "x.weight", 0.0123f32),
+            ("weight_global_scale", "F8_E4M3", "x.weight_packed", 7.31f32),
+        ] {
+            let mut m = ModelManifest::default();
+            let mut data = Vec::new();
+            let mut add = |name: &str, dtype: &str, shape: &[usize], b: &[u8]| {
+                m.tensors.insert(
+                    name.into(),
+                    VirtualTensor {
+                        name: name.into(),
+                        shape: shape.to_vec(),
+                        quant_format: crate::hardware::QuantFormat::FP32,
+                        byte_offset: data.len(),
+                        byte_len: b.len(),
+                        dtype: dtype.into(),
+                        shard_index: 0,
+                    },
+                );
+                data.extend_from_slice(b);
+            };
+            add(weight, "U8", &[rows, cols / 2], &nibbles);
+            add("x.weight_scale", dtype_scale, &[rows, cols / 16], &scales);
+            add(&format!("x.{global_name}"), "F32", &[1], &global.to_le_bytes());
+            super::alias_packed(&mut m, &data).unwrap();
+            assert_eq!(m.tensors["x.weight"].quant_format, crate::hardware::QuantFormat::NVFP4, "{global_name}");
+
+            let nv = super::nvfp4_source(&m, &data, "x.weight").unwrap().expect(global_name);
+            let want_global = if global_name == "weight_scale_2" { global } else { 1.0 / global };
+            assert_eq!(nv.source_scales, Some((scales.clone(), want_global)), "{global_name}");
+            assert_eq!((nv.rows, nv.cols, nv.blocks.len()), (rows, cols, rows * cols / 16));
+            let mut got = vec![0.0f32; rows * cols];
+            dequantize_nvfp4_tensor(&nv, &mut got);
+            let want = super::dequantize(&m, &data, "x.weight").unwrap().unwrap();
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "{global_name}");
+
+            // The universal loader hands the Metal upload that same tensor.
+            let q = UniversalModelLoader::extract_tensor_as_quantized_from_data(
+                &m,
+                &data,
+                "x.weight",
+                crate::hardware::QuantFormat::NVFP4,
+            )
+            .unwrap();
+            assert!(matches!(&q, crate::model::layers::QuantizedWeight::Nvfp4(t) if *t == nv), "{global_name}");
+
+            // Without a global scale the f32 path applies.
+            m.tensors.remove(&format!("x.{global_name}"));
+            assert!(super::nvfp4_source(&m, &data, "x.weight").unwrap().is_none());
+        }
     }
 }

@@ -1114,23 +1114,25 @@ impl Session {
                     let cols = tensor.cols;
                     let n_blocks = rows * (cols / 16);
                     let mut wq = Vec::with_capacity(n_blocks * 8);
-                    let mut max_scale = 0.0f32;
-                    for blk in &tensor.blocks {
-                        if blk.scale > max_scale {
-                            max_scale = blk.scale;
-                        }
-                    }
-                    let global_scale = if max_scale > 0.0 {
-                        max_scale / 448.0
-                    } else {
-                        1.0
-                    };
-                    let inv_global = 1.0 / global_scale;
-                    let mut scales_e4m3 = Vec::with_capacity(n_blocks);
                     for blk in &tensor.blocks {
                         wq.extend_from_slice(&blk.packed_nibbles);
-                        scales_e4m3.push(crate::model::f32_to_f8_e4m3(blk.scale * inv_global));
                     }
+                    // A checkpoint's own E4M3 block scales and global scale go up verbatim; only a
+                    // tensor quantized from f32 re-derives them (global = max scale / 448).
+                    let (scales_e4m3, global_scale) = match &tensor.source_scales {
+                        Some((bytes, global)) => (bytes.clone(), *global),
+                        None => {
+                            let max_scale = tensor.blocks.iter().fold(0.0f32, |m, b| m.max(b.scale));
+                            let global = if max_scale > 0.0 { max_scale / 448.0 } else { 1.0 };
+                            let inv = 1.0 / global;
+                            let bytes = tensor
+                                .blocks
+                                .iter()
+                                .map(|b| crate::model::f32_to_f8_e4m3(b.scale * inv))
+                                .collect();
+                            (bytes, global)
+                        }
+                    };
                     let scales_buf = rt.device.new_buffer_with_data(
                         scales_e4m3.as_ptr() as *const c_void,
                         scales_e4m3.len() as u64,
@@ -5378,6 +5380,53 @@ mod tests {
                 (e - m).abs() < 0.15 || (e - m).abs() / e.abs().max(1.0) < 0.08,
                 "row {r}: expected {e} vs Metal {m}"
             );
+        }
+    }
+
+    /// A checkpoint's E4M3 block scales and global scale reach the GPU as stored, and the GEMV on them
+    /// agrees with the CPU one.
+    #[test]
+    fn nvfp4_source_scales_upload_verbatim() {
+        use crate::quant::nvfp4::{Nvfp4Block, Nvfp4Tensor};
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (rows, cols, global) = (16usize, 64usize, 0.37f32);
+        let scales: Vec<u8> = (0..rows * cols / 16).map(|i| 0x30 + (i % 24) as u8).collect();
+        let blocks = scales
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| Nvfp4Block {
+                packed_nibbles: std::array::from_fn(|j| ((i * 8 + j) * 37 % 256) as u8),
+                scale: crate::model::f8_e4m3_to_f32(s) * global,
+            })
+            .collect();
+        let tensor = Nvfp4Tensor { blocks, rows, cols, source_scales: Some((scales.clone(), global)) };
+
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, cols], DType::F32);
+        let w = g.weight("w", vec![rows, cols], DType::Quant(crate::hardware::QuantFormat::NVFP4_E2M1));
+        let y = g.add("lin", Op::Linear, &[x, w], vec![1, rows], DType::F32);
+        g.output(y);
+        let mut store = Weights::new();
+        store.insert(
+            "w",
+            Tensor::Quantized(Arc::new(crate::model::layers::QuantizedWeight::Nvfp4(tensor.clone()))),
+        );
+        let session = Session::new(rt(), &store).expect("Metal Session creation");
+
+        let (buf, up_global) = &session.nvfp4_aux["w"];
+        // SAFETY: a shared-storage buffer of `length()` bytes, not written while read.
+        let up = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, buf.length() as usize) };
+        assert_eq!(up, &scales[..]);
+        assert_eq!(*up_global, global);
+
+        let input = rand(cols, 456);
+        let mut expected = vec![0.0f32; rows];
+        crate::quant::nvfp4::gemv_nvfp4_f32(&tensor, &input, &mut expected);
+        let got = session.run(&g, vec![Tensor::F32(input)]).expect("Metal run");
+        for (r, (&e, &m)) in expected.iter().zip(got[0].as_f32().unwrap()).enumerate() {
+            assert!((e - m).abs() <= 1e-4 * e.abs().max(1.0), "row {r}: CPU {e} vs Metal {m}");
         }
     }
 
