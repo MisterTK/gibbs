@@ -25,7 +25,9 @@ pub fn gpu_lock() -> Result<std::fs::File, String> {
     match f.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            eprintln!("gpu lock: waiting for another benchmark");
+            if !crate::telemetry::TUI_OWNS_TERMINAL.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("gpu lock: waiting for another benchmark");
+            }
             f.lock().map_err(|e| format!("{}: {e}", path.display()))?;
         }
         Err(std::fs::TryLockError::Error(e)) => return Err(format!("{}: {e}", path.display())),

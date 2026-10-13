@@ -717,6 +717,9 @@ impl TuiApp {
     /// The reply to a changed setting. A loaded model is reloaded so the setting takes effect now;
     /// otherwise it applies to the next load.
     fn reload_for(&mut self, what: &str, value: &str) -> String {
+        if self.benchmarking {
+            return format!("{what} -> {value}; a benchmark is running, so it applies to the next load");
+        }
         let loaded = self
             .scheduler
             .as_ref()
@@ -766,9 +769,15 @@ impl TuiApp {
             c if c > 0.0 => c,
             _ => f64::from(self.telemetry.get_summary().memory_bandwidth_gbps),
         };
+        if ceiling <= 0.0 {
+            return Err("bandwidth ceiling unmeasured: wait for the codec bench (Device panel) or run /roofline".into());
+        }
         self.benchmarking = true;
         let (tx, name) = (self.updates_tx.clone(), id.clone());
         std::thread::spawn(move || {
+            // Benchmarks on this machine take turns on the GPU (the lock is held for the run);
+            // unit tests do not wait behind a benchmark running elsewhere.
+            let _gpu = (!cfg!(test)).then(crate::hardware::gpu_lock);
             let r = crate::bench::measure_loaded(
                 &exec,
                 &crate::bench::default_prompt(),
@@ -1179,6 +1188,7 @@ impl TuiApp {
         let refused = match (&self.scheduler, &self.load) {
             (None, _) => Some("no engine scheduler attached".to_string()),
             (_, Some(l)) => Some(format!("{} is still loading", l.id)),
+            (_, None) if self.benchmarking => Some("benchmark running".to_string()),
             (Some(_), None) => None,
         };
         if let Some(e) = refused {
@@ -1626,6 +1636,7 @@ impl TuiApp {
             // sampling is on (`/profile on`) or the panel is focused (Ctrl+K).
             let wanted = (self.profile_sampling || self.detail == Some(layout::Comp::Kernels))
                 && self.kernels_visible.get()
+                && !self.benchmarking
                 && self.running > 0;
             let old = |at: Option<Instant>| at.is_none_or(|t| t.elapsed() >= PROFILE_EVERY);
             if wanted
@@ -2777,17 +2788,14 @@ mod tests {
         app.handle_key(key(KeyCode::Char('m')));
         app.handle_key(key(KeyCode::Char('r')));
         let s = crate::tui::settings::load_settings();
-        assert!(
-            s.reencode == "max-speed"
-                || s.reencode == "low-bit-native"
-                || s.reencode == "bit-exact"
-        );
+        // From the low-bit-native set above: one step on is bit-exact, saved and followed by the app.
+        assert_eq!(s.reencode, "bit-exact");
+        assert_eq!(app.reencode_policy.name(), s.reencode);
 
         app.handle_key(key(KeyCode::Char('f')));
         let s = crate::tui::settings::load_settings();
-        assert!(
-            s.variant == "fastest" || s.variant == "fastest-4bit" || s.variant == "best-quality"
-        );
+        assert_eq!(s.variant, "best-quality");
+        assert_eq!(app.variant_policy.name(), s.variant);
     }
 
     /// A tiny synthetic model loaded offline into a fresh app.
@@ -2901,6 +2909,21 @@ mod tests {
         for want in ["180.0 tok/s", "= 90.0%", "weights 5.00", "gpu excess 0.20", "run host 0.10", "outside 0.20", "612 dispatches"] {
             assert!(text.contains(want), "{want}: {text}");
         }
+    }
+
+    /// A reload would swap the model under the benchmark's decode: every path refuses meanwhile.
+    #[test]
+    fn no_reload_starts_while_a_benchmark_runs() {
+        let _settings = settings_guard();
+        let (mut app, _sched, _cache) = app_with_tiny_model();
+        app.benchmarking = true;
+        type_and_run(&mut app, "/reencode max-speed");
+        let e = app.history.last().unwrap();
+        assert!(e.output.contains("a benchmark is running"), "{}", e.output);
+        assert!(app.load.is_none());
+        app.load_model("gibbs/tiny-5m");
+        assert!(app.load.is_none());
+        assert_eq!(app.history.last().unwrap().output, "benchmark running");
     }
 
     /// `/placement` prints the table and ends in `100% Metal`, or lists the CPU ops as an error.

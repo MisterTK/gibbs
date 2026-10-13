@@ -2853,11 +2853,19 @@ mod tests {
         p.refilter();
         p.selected = 0;
         p.set_ceiling_gbps(300.0);
-        let fmt = detect_quant_format(Path::new("org/model/m-Q4_0.gguf")).unwrap();
-        let header = Arc::new(size_header(fmt, Some(1_000_000_000)));
-        p.headers
-            .lock()
-            .insert("org/model/m-Q4_0.gguf".into(), Some(Ok(header)));
+        // The saved variant policy orders the quants; the pick is whichever comes first.
+        for q in &p.rows[0].entry.quants {
+            let fmt = detect_quant_format(Path::new(&q.id)).unwrap();
+            p.headers
+                .lock()
+                .insert(q.id.clone(), Some(Ok(Arc::new(size_header(fmt, q.size)))));
+        }
+        let tag = |i: usize| {
+            detect_quant_format(Path::new(&p.rows[0].entry.quants[i].id))
+                .unwrap()
+                .name()
+                .to_string()
+        };
         // Every codec at the default efficiency (0.9): the prediction is 90% of the roofline.
         let text = with_unmeasured_host(|| {
             let mut t = Terminal::new(TestBackend::new(140, 20)).unwrap();
@@ -2868,8 +2876,8 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         });
-        assert!(text.contains("[★Q4_0]"), "{text}");
-        assert!(text.contains("Q8_0") && !text.contains("★Q8_0"), "{text}");
+        assert!(text.contains(&format!("[★{}]", tag(0))), "{text}");
+        assert!(text.contains(&tag(1)) && !text.contains(&format!("★{}", tag(1))), "{text}");
         assert!(text.contains("tok/s 90%"), "{text}");
     }
 

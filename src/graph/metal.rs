@@ -4395,11 +4395,18 @@ fn pipeline_from_archive(
 /// The kernel kind of a step's `Debug` text: its innermost variant (`Ext(Norm(RmsNorm { .. }))` is
 /// `RmsNorm`, `GemvPacked { .. }` is `GemvPacked`).
 fn kernel_kind(desc: &str) -> &str {
-    desc.split('(')
-        .rev()
-        .find(|p| p.starts_with(|c: char| c.is_ascii_uppercase()))
-        .and_then(|p| p.split([' ', '{', ')', ',']).next())
-        .unwrap_or("?")
+    let mut rest = desc;
+    loop {
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (ident, tail) = rest.split_at(end);
+        match tail.strip_prefix('(') {
+            // A wrapper variant (`Ext(`, `Norm(`): the kind is the variant inside it.
+            Some(inner) if inner.starts_with(|c: char| c.is_ascii_uppercase()) => rest = inner,
+            _ => return if ident.is_empty() { "?" } else { ident },
+        }
+    }
 }
 
 /// Per-step GPU timings `(step, op description, seconds, bytes)` grouped by kernel kind, slowest
@@ -6859,6 +6866,13 @@ mod tests {
         assert_eq!(kernel_kind("Ext(Norm(RmsNorm { eps: 1e-6 }))"), "RmsNorm");
         assert_eq!(kernel_kind("GemvPacked { rows: 8 }"), "GemvPacked");
         assert_eq!(kernel_kind("?"), "?");
+        // Field values never name the kind: `ValueId(..)`, `Some(ValueId(..))` and `Gen(..)` follow it.
+        assert_eq!(
+            kernel_kind("GemmBatchedPacked { x: ValueId(1), res: Some(ValueId(4)), format: Gen(GGUF_Q4_K_M) }"),
+            "GemmBatchedPacked"
+        );
+        assert_eq!(kernel_kind("Ext(Moe(Embed))"), "Embed");
+        assert_eq!(kernel_kind("Softmax(3)"), "Softmax");
         let t = |name: &str, desc: &str, s: f64, bytes: u64| {
             (name.to_string(), desc.to_string(), s, bytes)
         };
