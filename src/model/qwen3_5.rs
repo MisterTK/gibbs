@@ -9,10 +9,10 @@
 //! and the `Qwen2VLImageProcessor` the VL models share.
 
 mod draft;
-mod text;
 mod fixture;
 #[cfg(test)]
 mod gpu_tests;
+mod text;
 pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
 pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 mod vision;
@@ -134,7 +134,9 @@ pub(crate) fn from_checkpoint(
     mode: crate::hardware::PlacementMode,
 ) -> Result<Arc<dyn NativeLm>, String> {
     let text = Arc::new(TextModel::load(ck, text_config(cfg), Arch::Qwen35)?);
-    let vision = load_vision(ck, cfg, &text, || Err("test checkpoint has no preprocessor".into()))?;
+    let vision = load_vision(ck, cfg, &text, || {
+        Err("test checkpoint has no preprocessor".into())
+    })?;
     let tok = Tokenizer::from_tokens((0..text.vocab).map(|i| format!("t{i}")).collect());
     assemble(tok, text, vision, mode)
 }
@@ -271,13 +273,16 @@ impl DecoderBackbone for Dense {
     /// with KV / DeltaNet state, so the hybrid DeltaNet layers need no separate prefill graph.
     fn attach_score_gpu(&mut self, score: &[f32], labels: usize) -> Result<(), String> {
         if score.len() != labels * self.text.hidden() {
-            return Err(format!("score head is not [{labels}, {}]", self.text.hidden()));
+            return Err(format!(
+                "score head is not [{labels}, {}]",
+                self.text.hidden()
+            ));
         }
         let gpu_only = |e: String| format!("gpu-only: Qwen3.5 seq-cls: {e}");
         let (graph, weights) = self.text.to_seqcls_graph(score).map_err(gpu_only)?;
         let mode = crate::hardware::PlacementMode::Pin(Device::Metal);
-        let program = crate::graph::program::GraphProgram::compile(graph, weights, mode)
-            .map_err(gpu_only)?;
+        let program =
+            crate::graph::program::GraphProgram::compile(graph, weights, mode).map_err(gpu_only)?;
         self.program = Some(Arc::new(parking_lot::Mutex::new(program)));
         Ok(())
     }
@@ -285,7 +290,10 @@ impl DecoderBackbone for Dense {
     // ponytail: n sequential decode steps (one GPU dispatch each) over a fresh KV state sized to
     // `decode_max_ctx`; a batched prefill graph (DeltaRule over n rows) would cut the launches.
     fn score_gpu(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
-        let prog = self.program.as_ref().ok_or("no GPU score program attached")?;
+        let prog = self
+            .program
+            .as_ref()
+            .ok_or("no GPU score program attached")?;
         if ids.is_empty() || ids.len() > self.text.decode_max_ctx {
             return Err(format!(
                 "{} tokens: the Metal program holds 1..={}",
@@ -702,27 +710,18 @@ fn gguf_checkpoint(
                 || hf.contains(".ple.norm_")
                 || hf.ends_with(".linear_attn.out_proj.weight")
                 || (hf.contains(".linear_attn.") && !is_permuted_linear));
-        // Expert banks stay packed in any block format (their dequantized size would not fit in
-        // memory); other matrices only in the formats the Metal hand kernels read.
-        let bank = hf.contains(".mlp.experts.");
-        let can_pack = ((shape.len() == 2
-            && matches!(
+        // Matrices stay packed in BF16/FP16 and in any block format the GPU codec registry decodes (a
+        // dequantized copy streams 2-3x the bytes per token, and for expert banks would not fit in memory).
+        let packable = |cols: usize| {
+            matches!(
                 t.quant_format,
-                crate::hardware::QuantFormat::GGUF_Q4_0
-                    | crate::hardware::QuantFormat::GGUF_Q8_0
-                    | crate::hardware::QuantFormat::GGUF_IQ4_XS
-                    | crate::hardware::QuantFormat::GGUF_IQ2_M
-                    | crate::hardware::QuantFormat::GGUF_IQ2_S
-                    | crate::hardware::QuantFormat::GGUF_Q4_K_M
-                    | crate::hardware::QuantFormat::GGUF_IQ3_S
-                    | crate::hardware::QuantFormat::BF16
-                    | crate::hardware::QuantFormat::FP16
-            ))
-            || (bank
-                && (matches!(
-                    t.quant_format,
-                    crate::hardware::QuantFormat::BF16 | crate::hardware::QuantFormat::FP16
-                ) || crate::model::layers::gguf_block_codec(t.quant_format).is_some())))
+                crate::hardware::QuantFormat::BF16 | crate::hardware::QuantFormat::FP16
+            ) || crate::model::layers::gguf_block_codec(t.quant_format)
+                .is_some_and(|(elems, _, _)| cols % elems == 0)
+        };
+        let bank = hf.contains(".mlp.experts.");
+        let can_pack = ((shape.len() == 2 && packable(shape[1]))
+            || (bank && packable(shape[shape.len() - 1])))
             && !needs_transform;
 
         if can_pack {
@@ -1255,7 +1254,11 @@ impl NativeLm for Qwen35 {
         let (images, _) = self.size_images(&ids, media)?;
         let mut seq = Seq {
             // The program path keeps its state in `program_state`.
-            layers: if self.program.is_some() { Vec::new() } else { self.text.new_state() },
+            layers: if self.program.is_some() {
+                Vec::new()
+            } else {
+                self.text.new_state()
+            },
             len: 0,
             program_state: crate::graph::StateStore::new(),
             pos3: Vec::new(),
@@ -1421,7 +1424,10 @@ impl Qwen35 {
     ) -> Result<Vec<f32>, String> {
         use crate::graph::Tensor;
         let d = self.text.hidden();
-        let ds_layers = self.vision.as_ref().map_or(0, |(v, ..)| v.deepstack_layers());
+        let ds_layers = self
+            .vision
+            .as_ref()
+            .map_or(0, |(v, ..)| v.deepstack_layers());
         let mut logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = start_pos + i;
@@ -1973,11 +1979,20 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let m = crate::model::ModelManifest { metadata: md, ..Default::default() };
+        let m = crate::model::ModelManifest {
+            metadata: md,
+            ..Default::default()
+        };
         let (cfg, arch, layers) = gguf_config(&m).unwrap();
         assert!(arch == Arch::Qwen3 && layers == 48);
         assert_eq!(cfg["intermediate_size"], 0);
-        assert_eq!((cfg["num_experts"].as_u64(), cfg["num_experts_per_tok"].as_u64()), (Some(128), Some(8)));
+        assert_eq!(
+            (
+                cfg["num_experts"].as_u64(),
+                cfg["num_experts_per_tok"].as_u64()
+            ),
+            (Some(128), Some(8))
+        );
         assert_eq!(cfg["head_dim"], 128);
         for (gguf, hf) in [
             ("ffn_gate_inp.weight", "mlp.gate.weight"),
@@ -2015,30 +2030,82 @@ mod tests {
         // (name, GGML dims fastest first, type, bytes): F32 = 0, Q4_0 = 2.
         let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
         let f32s = |v: Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        let mut add_f32 = |n: &str, dims: &[usize], v: Vec<f32>| tensors.push((n.into(), dims.to_vec(), 0, f32s(v)));
-        add_f32("token_embd.weight", &[hidden, vocab], rnd(hidden * vocab, 0.8));
-        add_f32("output_norm.weight", &[hidden], rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect());
+        let mut add_f32 = |n: &str, dims: &[usize], v: Vec<f32>| {
+            tensors.push((n.into(), dims.to_vec(), 0, f32s(v)))
+        };
+        add_f32(
+            "token_embd.weight",
+            &[hidden, vocab],
+            rnd(hidden * vocab, 0.8),
+        );
+        add_f32(
+            "output_norm.weight",
+            &[hidden],
+            rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect(),
+        );
         add_f32("output.weight", &[hidden, vocab], rnd(hidden * vocab, 0.8));
         for l in 0..layers {
             let p = format!("blk.{l}");
             for n in ["attn_norm", "ffn_norm"] {
-                add_f32(&format!("{p}.{n}.weight"), &[hidden], rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect());
+                add_f32(
+                    &format!("{p}.{n}.weight"),
+                    &[hidden],
+                    rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect(),
+                );
             }
-            add_f32(&format!("{p}.attn_q.weight"), &[hidden, heads * hd], rnd(hidden * heads * hd, 0.8));
-            add_f32(&format!("{p}.attn_k.weight"), &[hidden, kv_heads * hd], rnd(hidden * kv_heads * hd, 0.8));
-            add_f32(&format!("{p}.attn_v.weight"), &[hidden, kv_heads * hd], rnd(hidden * kv_heads * hd, 0.8));
-            add_f32(&format!("{p}.attn_output.weight"), &[heads * hd, hidden], rnd(hidden * heads * hd, 0.8));
+            add_f32(
+                &format!("{p}.attn_q.weight"),
+                &[hidden, heads * hd],
+                rnd(hidden * heads * hd, 0.8),
+            );
+            add_f32(
+                &format!("{p}.attn_k.weight"),
+                &[hidden, kv_heads * hd],
+                rnd(hidden * kv_heads * hd, 0.8),
+            );
+            add_f32(
+                &format!("{p}.attn_v.weight"),
+                &[hidden, kv_heads * hd],
+                rnd(hidden * kv_heads * hd, 0.8),
+            );
+            add_f32(
+                &format!("{p}.attn_output.weight"),
+                &[heads * hd, hidden],
+                rnd(hidden * heads * hd, 0.8),
+            );
             for n in ["attn_q_norm", "attn_k_norm"] {
-                add_f32(&format!("{p}.{n}.weight"), &[hd], rnd(hd, 0.2).iter().map(|v| v + 1.0).collect());
+                add_f32(
+                    &format!("{p}.{n}.weight"),
+                    &[hd],
+                    rnd(hd, 0.2).iter().map(|v| v + 1.0).collect(),
+                );
             }
-            add_f32(&format!("{p}.ffn_gate_inp.weight"), &[hidden, experts], rnd(hidden * experts, 1.6));
+            add_f32(
+                &format!("{p}.ffn_gate_inp.weight"),
+                &[hidden, experts],
+                rnd(hidden * experts, 1.6),
+            );
         }
-        let mut bank = |n: String, dims: &[usize], v: Vec<f32>| tensors.push((n, dims.to_vec(), 2, quantize_f32_to_q4_0(&v)));
+        let mut bank = |n: String, dims: &[usize], v: Vec<f32>| {
+            tensors.push((n, dims.to_vec(), 2, quantize_f32_to_q4_0(&v)))
+        };
         for l in 0..layers {
             let p = format!("blk.{l}");
-            bank(format!("{p}.ffn_gate_exps.weight"), &[hidden, ff, experts], rnd(experts * ff * hidden, 0.8));
-            bank(format!("{p}.ffn_up_exps.weight"), &[hidden, ff, experts], rnd(experts * ff * hidden, 0.8));
-            bank(format!("{p}.ffn_down_exps.weight"), &[ff, hidden, experts], rnd(experts * hidden * ff, 0.8));
+            bank(
+                format!("{p}.ffn_gate_exps.weight"),
+                &[hidden, ff, experts],
+                rnd(experts * ff * hidden, 0.8),
+            );
+            bank(
+                format!("{p}.ffn_up_exps.weight"),
+                &[hidden, ff, experts],
+                rnd(experts * ff * hidden, 0.8),
+            );
+            bank(
+                format!("{p}.ffn_down_exps.weight"),
+                &[ff, hidden, experts],
+                rnd(experts * hidden * ff, 0.8),
+            );
         }
         let u32_kv = |k: &str, v: u32| (format!("qwen3moe.{k}"), 4u32, v.to_le_bytes().to_vec());
         let f32_kv = |k: &str, v: f32| (format!("qwen3moe.{k}"), 6u32, v.to_le_bytes().to_vec());
@@ -2067,7 +2134,8 @@ mod tests {
         let (ck, cfg, arch) = gguf_checkpoint(&Arc::new(data), &manifest).unwrap();
         for part in ["gate_proj", "up_proj", "down_proj"] {
             assert!(
-                ck.packed_gguf(&format!("model.layers.1.mlp.experts.{part}")).is_some(),
+                ck.packed_gguf(&format!("model.layers.1.mlp.experts.{part}"))
+                    .is_some(),
                 "{part} bank stays packed in the file mapping"
             );
         }
@@ -2087,19 +2155,40 @@ mod tests {
             let mut emb = vec![0.0f32; hidden];
             text.embed(tok, &mut emb).unwrap();
             let hid = text.forward_rows(
-                emb.clone(), &[[pos as u32; 3]], pos, &mut host_state, 0, usize::MAX,
-                &[], &[], false, &[], &mut Vec::new(),
+                emb.clone(),
+                &[[pos as u32; 3]],
+                pos,
+                &mut host_state,
+                0,
+                usize::MAX,
+                &[],
+                &[],
+                false,
+                &[],
+                &mut Vec::new(),
             );
             let want = text.logits(&hid, 1);
             let got = prog
-                .run(vec![crate::graph::Tensor::F32(emb), crate::graph::Tensor::U32(vec![pos as u32])])
+                .run(vec![
+                    crate::graph::Tensor::F32(emb),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ])
                 .unwrap();
             let got = got[0].as_f32().unwrap();
-            let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let dot: f64 = want
+                .iter()
+                .zip(got)
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum();
             let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
             let cos = dot / (n(&want) * n(got));
             assert!(cos >= 0.999, "step {pos}: Metal vs host cosine {cos}");
-            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            tok = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32;
         }
     }
 
@@ -2159,10 +2248,14 @@ mod tests {
         let ck = Weights::from_f32(specs, |name| {
             let seed = name.bytes().map(|b| b as usize).sum::<usize>();
             let norm = name.contains("norm");
-            Ok(crate::model::classifier::decoder_gpu::fill(sizes[name], seed, if norm { 0.2 } else { 0.3 })
-                .into_iter()
-                .map(|v| if norm { v + 1.0 } else { v })
-                .collect())
+            Ok(crate::model::classifier::decoder_gpu::fill(
+                sizes[name],
+                seed,
+                if norm { 0.2 } else { 0.3 },
+            )
+            .into_iter()
+            .map(|v| if norm { v + 1.0 } else { v })
+            .collect())
         })
         .unwrap();
         let mut llm = Dense {

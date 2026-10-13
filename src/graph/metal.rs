@@ -2399,7 +2399,8 @@ impl Session {
                     // weight pages and warms caches, pass 1 is timed. A requested sample runs each
                     // step once, so the token it profiles is still computed exactly once.
                     let mut gpu_s = 0.0;
-                    for _ in 0..if print_profile { 2 } else { 1 } {
+                    let cold = std::env::var_os("GIBBS_PROFILE_COLD").is_some();
+                    for _ in 0..if print_profile && !cold { 2 } else { 1 } {
                         let cb = self.rt.queue.new_command_buffer();
                         let enc = cb.new_compute_command_encoder();
                         self.encode(&Counted::new(enc), s, s_idx, &params_buf, &loc)?;
