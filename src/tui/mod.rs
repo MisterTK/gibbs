@@ -1860,6 +1860,7 @@ impl TuiApp {
     pub fn run(&mut self) -> io::Result<()> {
         crate::tui::qos::set_qos(crate::tui::qos::QosClass::UserInteractive);
         self.telemetry.is_tui_active.store(true, Ordering::Relaxed);
+        crate::telemetry::TUI_OWNS_TERMINAL.store(true, Ordering::Relaxed);
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
         // A panic on this thread must not leave the terminal in raw mode; other threads' panics
@@ -1889,6 +1890,7 @@ impl TuiApp {
         };
         std::panic::set_hook(Box::new(move |info| previous(info)));
         self.telemetry.is_tui_active.store(false, Ordering::Relaxed);
+        crate::telemetry::TUI_OWNS_TERMINAL.store(false, Ordering::Relaxed);
         result
     }
 
