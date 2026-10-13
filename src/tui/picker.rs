@@ -40,6 +40,9 @@ pub enum PickerAction {
     Delete(String),
     /// Attach this drafter to the active model (speculative decoding).
     AttachDraft(String),
+    /// The re-encode (`"reencode"`) or variant (`"variant"`) policy was cycled and saved: the
+    /// caller reloads the loaded model under it.
+    Reload(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -318,11 +321,7 @@ impl Picker {
                     _ => "max-speed".into(),
                 };
                 let _ = crate::tui::settings::save_settings(&s);
-                self.note = Some((
-                    format!("reencode: {} (reload to apply)", s.reencode),
-                    Token::Jade,
-                ));
-                return PickerAction::None;
+                return PickerAction::Reload("reencode");
             }
             KeyCode::Char('f') if !ctrl && self.query.is_empty() => {
                 let mut s = crate::tui::settings::load_settings();
@@ -332,12 +331,8 @@ impl Picker {
                     _ => "fastest".into(),
                 };
                 let _ = crate::tui::settings::save_settings(&s);
-                self.note = Some((
-                    format!("variant: {} (reload to apply)", s.variant),
-                    Token::Jade,
-                ));
                 self.refilter();
-                return PickerAction::None;
+                return PickerAction::Reload("variant");
             }
             KeyCode::Char(c) if !ctrl => {
                 let mut q = self.query.clone();
@@ -511,12 +506,13 @@ impl Picker {
         repo_dir_path(&self.hub.cache_root, id)
     }
 
-    /// Predicted decode tok/s of variant `q` and whether it comes from its weight header: the
-    /// header is read in the background (local file, else Hub range request) the first time it is
-    /// asked for; until then, and when it cannot be read, the estimate is size × bpw (the failure
-    /// shows as `None`, like an unmeasured ceiling).
-    fn predict(&self, q: &Entry) -> Option<(f64, bool)> {
-        use crate::model::variant::{host_eff, predict_with, reencode_policy, Variant};
+    /// Predicted decode tok/s of variant `q`, whether it comes from its weight header, and the
+    /// share of the roofline that is (tok/s over the ceiling's tokens per second at the bytes
+    /// streamed per token): the header is read in the background (local file, else Hub range
+    /// request) the first time it is asked for; until then, and when it cannot be read, the
+    /// estimate is size × bpw (the failure shows as `None`, like an unmeasured ceiling).
+    fn predict(&self, q: &Entry) -> Option<(f64, bool, f64)> {
+        use crate::model::variant::{host_eff, predict_with, reencode_policy, size_header};
         let ceiling = f64::from(self.ceiling_gbps);
         if ceiling <= 0.0 {
             return None;
@@ -545,14 +541,17 @@ impl Picker {
             known.flatten()
         };
         let policy = reencode_policy();
-        match state {
-            Some(Ok(h)) => Some((predict_with(&h, policy, ceiling, &host_eff), true)),
-            Some(Err(_)) => None,
+        let (h, exact) = match state {
+            Some(Ok(h)) => (h, true),
+            Some(Err(_)) => return None,
             None => {
                 let fmt = detect_quant_format(Path::new(&q.id))?;
-                Some((Variant::from_size(&q.id, fmt, q.size, policy, ceiling).tok_s, false))
+                (Arc::new(size_header(fmt, q.size)), false)
             }
-        }
+        };
+        let tok_s = predict_with(&h, policy, ceiling, &host_eff);
+        let pct = tok_s * h.streamed_bytes_per_token(policy) as f64 / (ceiling * 1e9) * 100.0;
+        Some((tok_s, exact, pct))
     }
 }
 
@@ -780,6 +779,7 @@ impl Picker {
         while lines.len() < 1 + list_h {
             lines.push(Line::default());
         }
+        let settings = crate::tui::settings::load_settings();
         let selected_entry = self.rows.get(self.selected).map(|r| &r.entry);
         if let Some(e) = selected_entry.filter(|e| !e.quants.is_empty()) {
             let mut quant_spans: Vec<Span> = Vec::new();
@@ -800,30 +800,22 @@ impl Picker {
                     },
                     |q| q.name().to_string(),
                 );
-                let is_fastest = i == 0;
+                let is_best = i == 0;
                 let is_active = i == e.quant_idx;
 
                 if i > 0 {
                     quant_spans.push(Span::raw("  "));
                 }
 
+                // The list is ranked under the variant policy, so its first entry is the pick.
+                let tag = if is_best { format!("★{tag}") } else { tag };
                 if is_active {
-                    let label = if is_fastest {
-                        format!("[{tag}] (fastest)")
-                    } else {
-                        format!("[{tag}]")
-                    };
                     quant_spans.push(Span::styled(
-                        label,
+                        format!("[{tag}]"),
                         th.fg(Token::Brass).add_modifier(Modifier::BOLD),
                     ));
                 } else {
-                    let label = if is_fastest {
-                        format!("{tag} (fastest)")
-                    } else {
-                        tag
-                    };
-                    quant_spans.push(Span::styled(label, dim));
+                    quant_spans.push(Span::styled(tag, dim));
                 }
             }
             let q_active = e.quants.get(e.quant_idx);
@@ -836,19 +828,23 @@ impl Picker {
                 .map(|m| (sz_gb * 1e9) as u64 <= m)
                 .unwrap_or(true);
             let fit_tag = if fits { "fits" } else { "no-fit" };
-            // Predicted decode speed (S3.6): from the weight header once read, `~` while it is
-            // being read (size × bpw), `?` when it cannot be read or the ceiling is unmeasured.
+            // Predicted decode speed (S3.6) and its share of the roofline: from the weight header
+            // once read, `~` while it is being read (size × bpw), `?` when it cannot be read or
+            // the ceiling is unmeasured.
             let pred_tok_s = match q_active.and_then(|q| self.predict(q)) {
-                Some((t, true)) => format!("{:.0}", t.min(999.0)),
-                Some((t, false)) => format!("~{:.0}", t.min(999.0)),
-                None => "?".to_string(),
+                Some((t, true, pct)) => format!("{:.0} tok/s {pct:.0}%", t.min(999.0)),
+                Some((t, false, pct)) => format!("~{:.0} tok/s ~{pct:.0}%", t.min(999.0)),
+                None => "? tok/s".to_string(),
             };
             let pred_span = Span::styled(
-                format!(" · {pred_tok_s} tok/s {sz_gb:.1}GB [{fit_tag}]"),
+                format!(" · {pred_tok_s} {sz_gb:.1}GB [{fit_tag}]"),
                 th.fg(if fits { Token::Gold } else { Token::Crimson }),
             );
             quant_spans.push(pred_span);
-            let right_hint = vec![Span::styled("(←/→ choose · enter load)", dim)];
+            let right_hint = vec![Span::styled(
+                format!("(★ best for {} · ←/→ choose · enter load)", settings.variant),
+                dim,
+            )];
             lines.push(spread(quant_spans, right_hint, width));
         } else {
             lines.push(Line::default());
@@ -857,7 +853,7 @@ impl Picker {
             .free_disk
             .map(|b| format!(" · {} free", fmt_bytes(b)))
             .unwrap_or_default();
-        let s = crate::tui::settings::load_settings();
+        let s = &settings;
         let policy_str = format!(
             " · reencode: {} (r) · variant: {} (f)",
             s.reencode, s.variant
@@ -2826,6 +2822,63 @@ mod tests {
         assert!(hot(header(&p, "♥")) && !hot(header(&p, "↓")));
         p.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(hot(header(&p, "↓")) && !hot(header(&p, "♥")));
+    }
+
+    /// The active quant shows its predicted share of the roofline, and the row ranked first
+    /// carries `★` (the pick under the variant policy).
+    #[test]
+    fn quant_row_shows_roofline_percent_and_star() {
+        use crate::model::variant::{size_header, with_unmeasured_host};
+        use ratatui::{backend::TestBackend, Terminal};
+        let cache = tempfile::tempdir().unwrap();
+        let mut p = Picker::new(
+            HuggingFaceHub::with_cache_dir(cache.path().to_path_buf()),
+            None,
+            &[],
+            None,
+        );
+        let quant = |id: &str, size| Entry {
+            id: id.into(),
+            size: Some(size),
+            ..Default::default()
+        };
+        p.hub_results = vec![Entry {
+            id: "org/model".into(),
+            quants: vec![
+                quant("org/model/m-Q4_0.gguf", 1_000_000_000),
+                quant("org/model/m-Q8_0.gguf", 2_000_000_000),
+            ],
+            ..Default::default()
+        }];
+        p.refilter();
+        p.selected = 0;
+        p.set_ceiling_gbps(300.0);
+        // The saved variant policy orders the quants; the pick is whichever comes first.
+        for q in &p.rows[0].entry.quants {
+            let fmt = detect_quant_format(Path::new(&q.id)).unwrap();
+            p.headers
+                .lock()
+                .insert(q.id.clone(), Some(Ok(Arc::new(size_header(fmt, q.size)))));
+        }
+        let tag = |i: usize| {
+            detect_quant_format(Path::new(&p.rows[0].entry.quants[i].id))
+                .unwrap()
+                .name()
+                .to_string()
+        };
+        // Every codec at the default efficiency (0.9): the prediction is 90% of the roofline.
+        let text = with_unmeasured_host(|| {
+            let mut t = Terminal::new(TestBackend::new(140, 20)).unwrap();
+            t.draw(|f| p.render(f, f.area(), "", None)).unwrap();
+            let buf = t.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        assert!(text.contains(&format!("[★{}]", tag(0))), "{text}");
+        assert!(text.contains(&tag(1)) && !text.contains(&format!("★{}", tag(1))), "{text}");
+        assert!(text.contains("tok/s 90%"), "{text}");
     }
 
     /// LTX-Video rows follow the loader's file rule: v0.9.0 GGUFs and `LTXPipeline` repos load; later

@@ -59,6 +59,89 @@ fn percentiles(q: &VecDeque<u32>) -> (f32, f32) {
     (at(0.5), at(0.9))
 }
 
+/// One kernel kind of a profiled token (`Linear`, `RmsNorm`, ...): its steps, their summed GPU
+/// time, operand bytes over that time, and that rate as a share of the host ceiling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelRow {
+    pub kind: String,
+    pub steps: usize,
+    pub us: f64,
+    pub gbps: f64,
+    pub pct: f64,
+}
+
+/// EWMA weight of the newest token in [`GapStats`].
+const GAP_ALPHA: f32 = 0.1;
+
+/// One decode token's timing as the scheduler measured it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GapSample {
+    /// Inter-token latency of the stream.
+    pub wall_ms: f32,
+    /// Time inside the GPU run: inputs, encode, GPU wait, readback.
+    pub run_ms: f32,
+    /// GPU execution time of the token's command buffer.
+    pub gpu_ms: f32,
+    /// Streamed weight bytes over the host ceiling: the floor of a token (0 = ceiling unmeasured).
+    pub weights_ms: f32,
+    pub dispatches: u32,
+}
+
+/// Where a decode token's wall time goes: an EWMA ([`GAP_ALPHA`]) of recent [`GapSample`]s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GapStats {
+    pub wall_ms: f32,
+    pub run_ms: f32,
+    pub gpu_ms: f32,
+    pub weights_ms: f32,
+    pub dispatches: f32,
+    /// Tokens folded in so far; 0 = nothing measured.
+    pub samples: u64,
+}
+
+impl GapStats {
+    fn push(&mut self, s: GapSample) {
+        let mix = |old: f32, new: f32| {
+            if self.samples == 0 {
+                new
+            } else {
+                old + GAP_ALPHA * (new - old)
+            }
+        };
+        *self = Self {
+            wall_ms: mix(self.wall_ms, s.wall_ms),
+            run_ms: mix(self.run_ms, s.run_ms),
+            gpu_ms: mix(self.gpu_ms, s.gpu_ms),
+            weights_ms: mix(self.weights_ms, s.weights_ms),
+            dispatches: mix(self.dispatches, s.dispatches as f32),
+            samples: self.samples + 1,
+        };
+    }
+
+    /// The token split into weights at the ceiling, GPU time beyond that, host time inside the run
+    /// and time outside it, in ms; each is at least 0 (the averages need not nest exactly).
+    pub fn segments(&self) -> [f32; 4] {
+        [
+            self.weights_ms.max(0.0),
+            (self.gpu_ms - self.weights_ms).max(0.0),
+            (self.run_ms - self.gpu_ms).max(0.0),
+            (self.wall_ms - self.run_ms).max(0.0),
+        ]
+    }
+
+    /// Share of the token that streaming the weights at the ceiling would take, in percent: the
+    /// roofline fraction of this token. `None` without samples or a measured ceiling.
+    pub fn roofline_pct(&self) -> Option<f32> {
+        (self.samples > 0 && self.wall_ms > 0.0 && self.weights_ms > 0.0)
+            .then(|| self.weights_ms / self.wall_ms * 100.0)
+    }
+
+    /// ms the token must lose to reach `frac` of the roofline (`0.9` = 90%); negative once past it.
+    pub fn ms_to(&self, frac: f32) -> f32 {
+        self.wall_ms - self.weights_ms / frac
+    }
+}
+
 pub struct EngineTelemetry {
     pub total_tokens_generated: AtomicU64,
     pub total_requests_completed: AtomicU64,
@@ -68,6 +151,7 @@ pub struct EngineTelemetry {
     latencies: Mutex<Latencies>,
     /// Speculative decoding: (draft tokens proposed, accepted, verify forwards, tokens they emitted).
     spec: Mutex<[u64; 4]>,
+    gap: Mutex<GapStats>,
     model_size_bytes: AtomicU64,
     hardware_bandwidth_gbps: RwLock<f32>,
     active_device: RwLock<String>,
@@ -83,6 +167,7 @@ impl Default for EngineTelemetry {
             token_events: Mutex::new(VecDeque::with_capacity(1024)),
             latencies: Mutex::new(Latencies::default()),
             spec: Mutex::new([0; 4]),
+            gap: Mutex::new(GapStats::default()),
             model_size_bytes: AtomicU64::new(0),
             hardware_bandwidth_gbps: RwLock::new(0.0),
             active_device: RwLock::new(String::new()),
@@ -201,6 +286,11 @@ impl EngineTelemetry {
         s[3] += emitted as u64;
     }
 
+    /// One decode token's timing, folded into the [`GapStats`] average.
+    pub fn record_gap(&self, s: GapSample) {
+        self.gap.lock().push(s);
+    }
+
     pub fn set_hardware_profile(&self, device: &str, bandwidth_gbps: f32) {
         *self.active_device.write() = device.to_string();
         *self.hardware_bandwidth_gbps.write() = bandwidth_gbps;
@@ -265,6 +355,7 @@ impl EngineTelemetry {
             memory_bandwidth_gbps: bw,
             effective_bandwidth_gbps,
             roofline_pct,
+            gap: *self.gap.lock(),
             device_name,
         }
     }
@@ -295,4 +386,61 @@ pub struct TelemetrySnapshot {
     pub roofline_pct: f32,
     #[serde(default)]
     pub device_name: String,
+    #[serde(default)]
+    pub gap: GapStats,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(wall: f32, run: f32, gpu: f32, weights: f32) -> GapSample {
+        GapSample {
+            wall_ms: wall,
+            run_ms: run,
+            gpu_ms: gpu,
+            weights_ms: weights,
+            dispatches: 700,
+        }
+    }
+
+    #[test]
+    fn gap_averages_with_alpha_a_tenth_and_seeds_on_the_first_token() {
+        let t = EngineTelemetry::new();
+        assert_eq!(t.get_summary().gap.samples, 0);
+        t.record_gap(sample(10.0, 9.0, 8.0, 3.0));
+        assert_eq!(t.get_summary().gap.wall_ms, 10.0);
+        t.record_gap(sample(20.0, 9.0, 8.0, 3.0));
+        let g = t.get_summary().gap;
+        assert!((g.wall_ms - 11.0).abs() < 1e-5, "{g:?}");
+        assert_eq!((g.samples, g.dispatches), (2, 700.0));
+    }
+
+    #[test]
+    fn gap_segments_partition_the_token_and_clamp_at_zero() {
+        let mut g = GapStats::default();
+        g.push(sample(11.0, 10.0, 8.0, 3.0));
+        assert_eq!(g.segments(), [3.0, 5.0, 2.0, 1.0]);
+        // The averages need not nest: wall below run, gpu below weights.
+        let mut g = GapStats::default();
+        g.push(sample(9.0, 10.0, 2.0, 3.0));
+        assert_eq!(g.segments(), [3.0, 0.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn gap_roofline_share_and_distance_to_ninety_percent() {
+        let mut g = GapStats::default();
+        assert_eq!(g.roofline_pct(), None);
+        g.push(sample(10.0, 9.0, 8.0, 4.5));
+        assert!((g.roofline_pct().unwrap() - 45.0).abs() < 1e-4);
+        assert!((g.ms_to(0.9) - 5.0).abs() < 1e-5);
+        // No measured ceiling: no share.
+        let mut g = GapStats::default();
+        g.push(sample(10.0, 9.0, 8.0, 0.0));
+        assert_eq!(g.roofline_pct(), None);
+    }
+}
+
+/// True while the TUI owns the terminal: text printed to stdout from engine code would corrupt its
+/// screen (the per-instance `is_tui_active` serves the telemetry log only).
+pub static TUI_OWNS_TERMINAL: AtomicBool = AtomicBool::new(false);

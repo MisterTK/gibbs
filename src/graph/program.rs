@@ -1,6 +1,8 @@
 //! Execution of placed computational graphs: one device per program.
 
-use crate::graph::placement::{device_supports_op, place_graph_default, PlacementPlan};
+use crate::graph::placement::{
+    device_supports_op, place_graph_default, placement_rows, PlacementPlan, PlacementRow,
+};
 use crate::graph::{cpu, Graph, StateStore, Tensor, ValueId, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
 use std::collections::HashMap;
@@ -43,6 +45,29 @@ pub struct GraphProgram {
     pub graph_outputs: Vec<ValueId>,
 }
 
+/// Programs being compiled right now: placement, weight upload, kernel build and tuning.
+static COMPILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether any [`GraphProgram::compile`] is running (a model load shows it as its compile stage).
+pub fn compiling() -> bool {
+    COMPILING.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+struct CompileGuard;
+
+impl CompileGuard {
+    fn enter() -> Self {
+        COMPILING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for CompileGuard {
+    fn drop(&mut self) {
+        COMPILING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl GraphProgram {
     /// Compiles a Graph and Weights into a single-device GraphProgram under `mode`.
     ///
@@ -52,6 +77,7 @@ impl GraphProgram {
         mut weights: Weights,
         mode: PlacementMode,
     ) -> Result<Self, String> {
+        let _compiling = CompileGuard::enter();
         crate::graph::passes::run_optimization_passes(&mut graph, Some(&mut weights))?;
         let available = available_devices();
         let plan = place_graph_default(&mut graph, mode, &available, None, &device_supports_op)
@@ -124,6 +150,29 @@ impl GraphProgram {
                 CompiledSegment::Metal { .. } => 0,
             })
             .sum()
+    }
+
+    /// The program's graph nodes grouped by op kind, device and avenue, most numerous first.
+    pub fn placement_summary(&self) -> Vec<PlacementRow> {
+        let mut rows: Vec<PlacementRow> = Vec::new();
+        for seg in &self.segments {
+            let graph = match seg {
+                CompiledSegment::Cpu { graph, .. } => graph,
+                #[cfg(target_os = "macos")]
+                CompiledSegment::Metal { graph, .. } => graph,
+            };
+            for r in placement_rows(graph) {
+                match rows
+                    .iter_mut()
+                    .find(|x| (&x.op, x.device, &x.avenue) == (&r.op, r.device, &r.avenue))
+                {
+                    Some(x) => x.count += r.count,
+                    None => rows.push(r),
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.op.cmp(&b.op)));
+        rows
     }
 
     /// Primary device running this program.
@@ -266,5 +315,52 @@ impl GraphProgram {
                     .ok_or_else(|| format!("missing graph output {id:?}"))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{DType, Op};
+
+    fn two_linears() -> (Graph, Weights) {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 4], DType::F32);
+        let w = g.weight("w", vec![4, 4], DType::F32);
+        let a = g.add("lin0", Op::Linear, &[x, w], vec![1, 4], DType::F32);
+        let b = g.add("lin1", Op::Linear, &[a, w], vec![1, 4], DType::F32);
+        g.output(b);
+        let mut weights = Weights::new();
+        weights.insert("w", Tensor::F32(vec![0.1; 16]));
+        (g, weights)
+    }
+
+    #[test]
+    fn placement_summary_counts_every_node_once_on_the_pinned_device() {
+        let mut devices = vec![Device::Cpu];
+        if available_devices().contains(&Device::Metal) {
+            devices.push(Device::Metal);
+        }
+        for device in devices {
+            let (g, w) = two_linears();
+            let prog = GraphProgram::compile(g, w, PlacementMode::Pin(device)).unwrap();
+            let rows = prog.placement_summary();
+            let nodes: usize = prog
+                .segments
+                .iter()
+                .map(|s| match s {
+                    CompiledSegment::Cpu { graph, .. } => graph.nodes.len(),
+                    #[cfg(target_os = "macos")]
+                    CompiledSegment::Metal { graph, .. } => graph.nodes.len(),
+                })
+                .sum();
+            assert!(nodes > 0);
+            assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), nodes, "{rows:?}");
+            assert!(rows.iter().all(|r| r.device == device), "{rows:?}");
+            assert!(rows.iter().any(|r| r.op == "Linear"), "{rows:?}");
+            assert!(rows.iter().all(|r| r.avenue == "kernel"), "{rows:?}");
+            // Counts never increase down the table.
+            assert!(rows.windows(2).all(|p| p[0].count >= p[1].count));
+        }
     }
 }

@@ -344,22 +344,28 @@ impl Variant {
         policy: ReencodePolicy,
         ceiling_gbps: f64,
     ) -> Self {
-        let numel = bytes.map_or(NOMINAL_PARAMS, |b| {
-            (b as f64 * 8.0 / fmt.bits_per_weight() as f64) as u64
-        });
-        let h = WeightHeader {
-            tensors: vec![HeaderTensor {
-                name: "blk.0.ffn_up.weight".into(),
-                ndim: 2,
-                numel,
-                cols: 4096,
-                fmt: Some(fmt),
-                bytes: bytes.unwrap_or_else(|| fmt.tensor_bytes(numel as usize) as u64),
-            }],
-            file_bytes: bytes.unwrap_or(0),
-            expert_frac: 1.0,
-        };
+        let h = size_header(fmt, bytes);
         Self::from_header(name, h.file_bytes, &h, policy, ceiling_gbps)
+    }
+}
+
+/// A header of one `fmt` matrix of `bytes` (sized at [`NOMINAL_PARAMS`] when unknown): what
+/// [`Variant::from_size`] predicts from.
+pub fn size_header(fmt: Q, bytes: Option<u64>) -> WeightHeader {
+    let numel = bytes.map_or(NOMINAL_PARAMS, |b| {
+        (b as f64 * 8.0 / fmt.bits_per_weight() as f64) as u64
+    });
+    WeightHeader {
+        tensors: vec![HeaderTensor {
+            name: "blk.0.ffn_up.weight".into(),
+            ndim: 2,
+            numel,
+            cols: 4096,
+            fmt: Some(fmt),
+            bytes: bytes.unwrap_or_else(|| fmt.tensor_bytes(numel as usize) as u64),
+        }],
+        file_bytes: bytes.unwrap_or(0),
+        expert_frac: 1.0,
     }
 }
 

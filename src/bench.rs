@@ -13,7 +13,8 @@ pub struct BenchDefaults {
     pub reencode: String,
 }
 
-fn default_prompt() -> String {
+/// The prompt a benchmark decodes from unless the suite names one.
+pub fn default_prompt() -> String {
     "Explain the second law of thermodynamics to a curious student.".into()
 }
 fn default_decode_tokens() -> usize {
@@ -114,15 +115,44 @@ pub struct BenchLoad {
     pub saved_bytes: u64,
 }
 
+/// `(policy, saved bytes per token)` a finished load applied: the roofline basis of
+/// [`roofline_bytes`]. `choice` is a GraphLm load's weight-format choice (`requested` when it
+/// names no policy); `None` reads the native loader's record, where tensors keep their source
+/// formats (bit-exact) unless it saved bytes.
+pub fn applied_policy(
+    choice: Option<&crate::model::weight_format::Choice>,
+    requested: crate::model::weight_format::ReencodePolicy,
+) -> (crate::model::weight_format::ReencodePolicy, u64) {
+    use crate::model::weight_format::ReencodePolicy;
+    let Some(choice) = choice else {
+        let (policy, saved) =
+            crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0));
+        return (
+            if saved > 0 {
+                ReencodePolicy::BitExact
+            } else {
+                policy
+            },
+            saved,
+        );
+    };
+    // `applied` reads `max-speed`, `max-speed (FFN only)`, `low-bit-native` or `bit-exact`.
+    // ponytail: the FFN-only attempt is costed as full max-speed; exact bytes need per-tensor records.
+    let policy = choice
+        .reencode
+        .as_ref()
+        .and_then(|r| r.applied.split(" (").next()?.parse::<ReencodePolicy>().ok())
+        .unwrap_or(requested);
+    (policy, 0)
+}
+
 /// Loads `artifacts` on Metal under the `reencode` policy name (set as the effective policy so
 /// native loaders honor it too).
 pub fn load_for_bench(
     artifacts: &crate::model::hub::ModelArtifacts,
     reencode: &str,
 ) -> Result<BenchLoad, String> {
-    use crate::model::weight_format::{
-        load_causal_lm_with, set_reencode_override, ReencodeConfig, ReencodePolicy,
-    };
+    use crate::model::weight_format::{load_causal_lm_with, set_reencode_override, ReencodeConfig};
     let cfg = ReencodeConfig {
         policy: reencode.parse()?,
         ..Default::default()
@@ -133,14 +163,7 @@ pub fn load_for_bench(
     set_reencode_override(None);
     match native {
         Some(Ok(m)) => {
-            let (policy, saved_bytes) =
-                crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0));
-            // Native tensors keep their source formats unless `saved_bytes` says otherwise.
-            let policy = if saved_bytes > 0 {
-                ReencodePolicy::BitExact
-            } else {
-                policy
-            };
+            let (policy, saved_bytes) = applied_policy(None, cfg.policy);
             return Ok(BenchLoad {
                 exec: crate::scheduler::ExecutableModel::Native(m),
                 policy,
@@ -153,13 +176,7 @@ pub fn load_for_bench(
     let hw = crate::hardware::HardwareCapability::probe_system();
     let (graph_lm, choice) =
         load_causal_lm_with(artifacts, crate::hardware::Device::Metal, None, &hw, &cfg)?;
-    // `applied` reads `max-speed`, `max-speed (FFN only)`, `low-bit-native` or `bit-exact`.
-    // ponytail: the FFN-only attempt is costed as full max-speed; exact bytes need per-tensor records.
-    let policy = choice
-        .reencode
-        .as_ref()
-        .and_then(|r| r.applied.split(" (").next()?.parse::<ReencodePolicy>().ok())
-        .unwrap_or(cfg.policy);
+    let policy = applied_policy(Some(&choice), cfg.policy).0;
     let exec = crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)?;
     Ok(BenchLoad {
         exec,
@@ -668,5 +685,24 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
         "{}",
         serde_json::json!({"model": model_id, "ids": ids, "top5": top})
     );
+    Ok(())
+}
+
+/// `--explain-placement`: loads `model_id` on Metal under the effective re-encode policy and
+/// prints where its graph nodes run (op kind, device, avenue) and whether that is 100% on the GPU.
+pub fn explain_placement(
+    hub: &crate::model::hub::HuggingFaceHub,
+    model_id: &str,
+) -> Result<(), String> {
+    use crate::graph::placement::{placement_table, placement_verdict};
+    let artifacts = hub.auto_download_and_cache(model_id, None)?;
+    let _lock = crate::hardware::gpu_lock()?;
+    let policy = crate::model::weight_format::ReencodeConfig::effective().policy;
+    let exec = load_for_bench(&artifacts, policy.name())?.exec;
+    let rows = exec
+        .placement_summary()
+        .ok_or("this model runs no graph program: there is no placement to explain")?;
+    println!("{}", placement_table(&rows));
+    println!("{}", placement_verdict(&rows).unwrap_or_else(|cpu| cpu));
     Ok(())
 }

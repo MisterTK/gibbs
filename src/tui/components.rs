@@ -96,6 +96,16 @@ fn codec_token(name: &str) -> Token {
     T[name.bytes().map(usize::from).sum::<usize>() % T.len()]
 }
 
+/// The codec micro-benchmark as the Device panel shows it: `(state, done, total)` with state 1
+/// running, 2 done, anything else (idle, failed) not available.
+pub(super) fn codec_bench_text(codec: (u8, usize, usize)) -> String {
+    match codec {
+        (1, done, total) => format!("codec-bench {done}/{total}"),
+        (2, _, _) => "codec-bench ✓".to_string(),
+        _ => "codec-bench —".to_string(),
+    }
+}
+
 /// Parts joined by `sep`, left to right while they fit; the rest are dropped.
 fn fit(parts: Vec<Vec<Span<'static>>>, width: usize, sep: &str, sep_style: Style) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -444,7 +454,7 @@ impl TuiApp {
             self.roofline_canvas(f, c, v, th, ai, peak, tier);
         }
         if profile_row {
-            let text = if std::env::var_os("GIBBS_PROFILE_KERNELS").is_none() {
+            let text = if !self.profile_sampling {
                 "profile off · /profile on".to_string()
             } else if self.gemm_top.is_empty() {
                 "profile on · no host GEMM timings".to_string()
@@ -956,16 +966,27 @@ impl TuiApp {
         } else {
             v.s.device_name.clone()
         };
+        let ds = self.device_status;
         let mut lines = vec![
             Line::from(Span::styled(trunc(&name, iw), th.fg(Token::Parchment))),
             Line::from(vec![
                 Span::styled(
-                    format!("ceiling {:.1} GB/s", v.ceiling),
-                    th.fg(Token::Cyanotype),
+                    codec_bench_text(ds.codec),
+                    th.fg(if ds.codec.0 == 2 {
+                        Token::Jade
+                    } else {
+                        Token::Dim
+                    }),
                 ),
-                // ponytail: the codec micro-benchmark (S3.6/G3.7) does not exist yet.
-                Span::styled(" · codec-bench n/a", th.fg(Token::Dim)),
+                Span::styled(
+                    format!(" · tune {}/{}", ds.tune.0, ds.tune.1),
+                    th.fg(Token::Dim),
+                ),
             ]),
+            Line::from(Span::styled(
+                format!("ceiling {:.1} GB/s", v.ceiling),
+                th.fg(Token::Cyanotype),
+            )),
         ];
         if let Some(a) = self.http_addr {
             lines.push(Line::from(Span::styled(
@@ -973,6 +994,153 @@ impl TuiApp {
                 th.fg(Token::Dim),
             )));
         }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- GAP ------------------------------------------------------------------------------
+
+    /// Where a decode token's wall time goes against the floor of streaming its weights at the
+    /// measured ceiling: weights, GPU time beyond that, host time inside the run, time outside it.
+    pub(super) fn render_gap(&self, f: &mut Frame, area: Rect, v: &Vitals, th: &Theme) {
+        let g = v.s.gap;
+        let metric = Line::from(match g.roofline_pct() {
+            Some(p) => Span::styled(
+                format!("{p:.0}%"),
+                th.fg(Theme::tier(p)).add_modifier(Modifier::BOLD),
+            ),
+            None => Span::styled("—", th.fg(Token::Dim)),
+        });
+        let block = instrument("Gap", Some(metric), self.focused(Comp::Gap), th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let (w, h, dim) = (inner.width as usize, inner.height as usize, th.fg(Token::Dim));
+        if g.samples == 0 {
+            f.render_widget(
+                Paragraph::new(Span::styled(trunc("no Metal decode samples yet", w), dim)),
+                inner,
+            );
+            return;
+        }
+        let ms = g.segments();
+        let parts = [
+            ("weights", Token::Jade),
+            ("gpu excess", Token::Ember),
+            ("run host", Token::Gold),
+            ("outside", Token::Crimson),
+        ];
+        let bar: Vec<(Token, f32)> = parts.iter().zip(ms).map(|(p, m)| (p.1, m)).collect();
+        let ink = th.fg(Token::Parchment);
+        let item = |i: usize| -> Vec<Span<'static>> {
+            vec![
+                Span::styled("■ ", th.fg(parts[i].1)),
+                Span::styled(format!("{} {:.2}", parts[i].0, ms[i]), ink),
+            ]
+        };
+        let mut lines = vec![Line::from(stacked_bar(&bar, w, th))];
+        if h >= 4 {
+            lines.push(fit(vec![item(0), item(1)], w, "  ", dim));
+            lines.push(fit(vec![item(2), item(3)], w, "  ", dim));
+        } else if h == 3 {
+            let mut spans = Vec::new();
+            for (i, m) in ms.iter().enumerate() {
+                spans.push(Span::styled("■", th.fg(parts[i].1)));
+                spans.push(Span::styled(format!("{m:.2} "), ink));
+            }
+            spans.push(Span::styled("ms", dim));
+            lines.push(Line::from(spans));
+        }
+        let to_90 = g.ms_to(0.9);
+        lines.push(Line::from(if g.weights_ms <= 0.0 {
+            Span::styled("to 90%: ceiling unmeasured", dim)
+        } else if to_90 > 0.0 {
+            Span::styled(format!("to 90%: -{to_90:.2} ms"), th.fg(Token::Ember))
+        } else {
+            Span::styled(
+                format!("90% reached ({:.2} ms to spare)", -to_90),
+                th.fg(Token::Jade),
+            )
+        }));
+        if h >= 5 {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!(
+                        "wall {:.2} · run {:.2} · gpu {:.2} ms · {:.0} disp",
+                        g.wall_ms, g.run_ms, g.gpu_ms, g.dispatches
+                    ),
+                    w,
+                ),
+                dim,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    // ---- KERNELS --------------------------------------------------------------------------
+
+    /// The last per-kind kernel profile (`/profile on`, or Ctrl-K, samples one decode token).
+    pub(super) fn render_kernels(&self, f: &mut Frame, area: Rect, th: &Theme) {
+        self.kernels_visible.set(true);
+        let total_us = self
+            .kernel_profile
+            .as_ref()
+            .map(|(_, rows)| rows.iter().map(|r| r.us).sum::<f64>());
+        let metric = Line::from(Span::styled(
+            total_us.map_or("—".to_string(), |u| format!("{u:.0} µs")),
+            th.fg(Token::Cyanotype),
+        ));
+        let block = instrument("Kernels", Some(metric), self.focused(Comp::Kernels), th);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let (w, dim) = (inner.width as usize, th.fg(Token::Dim));
+        let Some((at, rows)) = &self.kernel_profile else {
+            let text = if self.profile_sampling || self.focused(Comp::Kernels) {
+                "sampling: one decode token every 5 s"
+            } else {
+                "profile off · /profile on"
+            };
+            f.render_widget(Paragraph::new(Span::styled(trunc(text, w), dim)), inner);
+            return;
+        };
+        let mut lines = vec![Line::from(Span::styled(
+            trunc(
+                &format!("{:<12}{:>5}{:>7}{:>7}{:>5}", "kind", "steps", "µs", "GB/s", "%"),
+                w,
+            ),
+            dim,
+        ))];
+        for r in rows.iter().take((inner.height as usize).saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(
+                trunc(
+                    &format!(
+                        "{:<12}{:>5}{:>7.0}{:>7.1}{:>4.0}%",
+                        trunc(&r.kind, 11),
+                        r.steps,
+                        r.us,
+                        r.gbps,
+                        r.pct
+                    ),
+                    w,
+                ),
+                th.fg(Theme::tier(r.pct as f32)),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            trunc(
+                &format!(
+                    "{} steps · sampled {} ago",
+                    rows.iter().map(|r| r.steps).sum::<usize>(),
+                    super::render::secs(at.elapsed())
+                ),
+                w,
+            ),
+            dim,
+        )));
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1041,14 +1209,7 @@ impl TuiApp {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            trunc(
-                &format!(
-                    "reencode {:?} · elapsed {}",
-                    self.reencode_policy,
-                    super::render::secs(l.started.elapsed())
-                ),
-                iw,
-            ),
+            trunc(&l.reencode_text(self.reencode_policy), iw),
             dim,
         )));
         lines.push(Line::from(Span::styled(trunc(&l.progress_text(), iw), dim)));
@@ -1107,6 +1268,9 @@ impl TuiApp {
             ),
             seg(format!("KV {:.0}%", v.kv_pct), th.fg(Token::Parchment)),
         ];
+        if let Some(p) = v.s.gap.roofline_pct() {
+            a.push(seg(format!("gap {p:.0}%"), th.fg(Theme::tier(p))));
+        }
         if let Some(t) = self
             .logprob_history
             .back()
@@ -1174,12 +1338,14 @@ impl TuiApp {
         match c {
             Comp::Avatar => self.render_avatar(f, rect, th),
             Comp::Roofline => self.render_roofline(f, rect, v, th),
+            Comp::Gap => self.render_gap(f, rect, v, th),
             Comp::Tokens => self.render_tokens(f, rect, v, th),
             Comp::Latency => self.render_latency(f, rect, v, th),
             Comp::Logprobs => self.render_logprobs(f, rect, th),
             Comp::Weights => self.render_weights(f, rect, th),
             Comp::Memory => self.render_memory(f, rect, v, th),
             Comp::Device => self.render_device(f, rect, v, th),
+            Comp::Kernels => self.render_kernels(f, rect, th),
             Comp::Load => {
                 if let Some(l) = &self.load {
                     self.render_load(f, rect, l, th);

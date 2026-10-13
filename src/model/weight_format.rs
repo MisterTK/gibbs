@@ -64,6 +64,17 @@ pub enum VariantPolicy {
     BestQuality,
 }
 
+impl VariantPolicy {
+    /// The settings / `--variant` spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fastest => "fastest",
+            Self::Fastest4Bit => "fastest-4bit",
+            Self::BestQuality => "best-quality",
+        }
+    }
+}
+
 impl Default for VariantPolicy {
     fn default() -> Self {
         Self::Fastest

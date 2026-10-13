@@ -127,6 +127,40 @@ pub fn tune_status() -> (usize, usize) {
     (TUNE_HITS.load(Relaxed), TUNE_SHAPES.load(Relaxed))
 }
 
+pub use crate::telemetry::KernelRow;
+
+/// The last per-kind kernel profile (slowest kind first) and when it was taken.
+static LAST_PROFILE: Mutex<Option<(Instant, Vec<KernelRow>)>> = Mutex::new(None);
+/// Set by [`request_kernel_profile`]; the next decode run consumes it.
+static PROFILE_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The last kernel profile, from `GIBBS_PROFILE_KERNELS=1` or a [`request_kernel_profile`] token.
+pub fn last_kernel_profile() -> Option<(Instant, Vec<KernelRow>)> {
+    LAST_PROFILE.lock().clone()
+}
+
+/// Profiles the next decode token (each step in its own command buffer, so that token is slow):
+/// the result lands in [`last_kernel_profile`] and nothing is printed.
+pub fn request_kernel_profile() {
+    PROFILE_NEXT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Codec micro-benchmark progress: 0 idle, 1 running, 2 done, 3 failed.
+static CODEC_BENCH_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static CODEC_BENCH_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CODEC_BENCH_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(state, formats measured, formats to measure)` of the codec micro-benchmark; state is 0 idle,
+/// 1 running, 2 done (this process ran it, or the host profile already held current rates), 3 failed.
+pub fn codec_bench_status() -> (u8, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        CODEC_BENCH_STATE.load(Relaxed),
+        CODEC_BENCH_DONE.load(Relaxed),
+        CODEC_BENCH_TOTAL.load(Relaxed),
+    )
+}
+
 pub fn system_device() -> Result<Device, String> {
     Device::system_default()
         .ok_or_else(|| "no Metal GPU (MTLCreateSystemDefaultDevice returned nil)".to_string())
@@ -838,7 +872,10 @@ impl Runtime {
         use crate::model::variant::CodecEff;
         let mut gbps = std::collections::BTreeMap::new();
         let floats = [QuantFormat::BF16, QuantFormat::FP16];
-        for f in codec::formats().into_iter().chain(floats) {
+        let formats: Vec<QuantFormat> = codec::formats().into_iter().chain(floats).collect();
+        CODEC_BENCH_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+        CODEC_BENCH_TOTAL.store(formats.len(), std::sync::atomic::Ordering::Relaxed);
+        for f in formats {
             // Each codec's rate is its best variant's: that is the kernel a load would run.
             let variants = WeightFormat::of_quant(f).gemv_variants();
             match self.bench_gemv(f, &CODEC_BENCH_SHAPES, &variants) {
@@ -848,6 +885,7 @@ impl Runtime {
                 }
                 Err(e) => tracing::warn!("codec bench {f:?}: {e}"),
             }
+            CODEC_BENCH_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let best = gbps.values().fold(0.0f64, |a, &b| a.max(b));
         if best <= 0.0 {
@@ -1097,9 +1135,18 @@ impl Runtime {
             .codec
             .as_ref()
             .is_some_and(|c| c.codec_hash == codec::source_hash());
-        if current || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if current {
+            let n = self.profile.codec.as_ref().map_or(0, |c| c.gbps.len());
+            CODEC_BENCH_DONE.store(n, Relaxed);
+            CODEC_BENCH_TOTAL.store(n, Relaxed);
+            CODEC_BENCH_STATE.store(2, Relaxed);
             return;
         }
+        if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        CODEC_BENCH_STATE.store(1, Relaxed);
         let rt = self.clone();
         let spawned = std::thread::Builder::new()
             .name("codec-bench".into())
@@ -1110,6 +1157,7 @@ impl Runtime {
                 }
             });
         if let Err(e) = spawned {
+            CODEC_BENCH_STATE.store(3, Relaxed);
             tracing::warn!("codec bench: cannot start thread: {e}");
         }
     }
@@ -1124,19 +1172,26 @@ impl Runtime {
     /// Runs [`Self::benchmark_codecs`], saves the profile and publishes the rates; returns the
     /// number of formats measured.
     pub fn run_codec_bench(self: &Arc<Self>) -> Result<usize, String> {
-        let e = self.benchmark_codecs()?;
-        let n = e.gbps.len();
-        let mut p = self.profile.clone();
-        p.ceiling_gbps = e.ceiling_gbps;
-        p.codec = Some(e.clone());
-        if let Err(err) = std::fs::write(
-            &self.profile_path,
-            serde_json::to_vec_pretty(&p).unwrap_or_default(),
-        ) {
-            tracing::warn!("codec bench: saving {}: {err}", self.profile_path.display());
-        }
-        crate::model::variant::set_host_rates(e.ceiling_gbps, Some(e));
-        Ok(n)
+        use std::sync::atomic::Ordering::Relaxed;
+        CODEC_BENCH_STATE.store(1, Relaxed);
+        let run = || -> Result<usize, String> {
+            let e = self.benchmark_codecs()?;
+            let n = e.gbps.len();
+            let mut p = self.profile.clone();
+            p.ceiling_gbps = e.ceiling_gbps;
+            p.codec = Some(e.clone());
+            if let Err(err) = std::fs::write(
+                &self.profile_path,
+                serde_json::to_vec_pretty(&p).unwrap_or_default(),
+            ) {
+                tracing::warn!("codec bench: saving {}: {err}", self.profile_path.display());
+            }
+            crate::model::variant::set_host_rates(e.ceiling_gbps, Some(e));
+            Ok(n)
+        };
+        let result = run();
+        CODEC_BENCH_STATE.store(if result.is_ok() { 2 } else { 3 }, Relaxed);
+        result
     }
 
     /// Host profile micro-benchmarks: MPP correctness vs `nn::linear`, dispatch cost, GEMM timings.
@@ -2313,13 +2368,20 @@ impl Session {
         };
         let params_buf = self.ensure_params_buffer(plan.params_buffer_size)?;
         metal::objc::rc::autoreleasepool(|| {
-            let profile_kernels = std::env::var_os("GIBBS_PROFILE_KERNELS").is_some();
-            if profile_kernels {
+            let print_profile = std::env::var_os("GIBBS_PROFILE_KERNELS").is_some();
+            // A requested sample is one real decode token; the printing profiler profiles every run.
+            let one_shot = !print_profile
+                && plan.is_decode
+                && !plan.state_reads.is_empty()
+                && PROFILE_NEXT.swap(false, std::sync::atomic::Ordering::Relaxed);
+            if print_profile || one_shot {
                 let mut timings = Vec::new();
                 for (s_idx, s) in steps.iter().enumerate() {
-                    // Pass 0 faults in memory-mapped weight pages and warms caches; pass 1 is timed.
+                    // The printing profiler runs each step twice: pass 0 faults in memory-mapped
+                    // weight pages and warms caches, pass 1 is timed. A requested sample runs each
+                    // step once, so the token it profiles is still computed exactly once.
                     let mut gpu_s = 0.0;
-                    for _ in 0..2 {
+                    for _ in 0..if print_profile { 2 } else { 1 } {
                         let cb = self.rt.queue.new_command_buffer();
                         let enc = cb.new_compute_command_encoder();
                         self.encode(&Counted::new(enc), s, s_idx, &params_buf, &loc)?;
@@ -2335,56 +2397,12 @@ impl Session {
                         .sum();
                     timings.push((s.name.clone(), format!("{:?}", s.op), gpu_s, bytes));
                 }
-                timings.sort_by(|a, b| b.2.total_cmp(&a.2));
                 let ceiling = self.rt.profile.ceiling_gbps.max(1.0);
-                eprintln!(
-                    "profiler: per-command-buffer timing (bytes = operands read + output written)"
-                );
-                eprintln!(
-                    "{:<20} | {:<25} | {:>8} | {:>8} | {:>8} | {:>8}",
-                    "step", "kernel", "µs", "bytes", "GB/s", "% ceiling"
-                );
-                let mut by_kind: HashMap<String, (usize, f64, u64)> = HashMap::new();
-                for (_, op_desc, s, bytes) in &timings {
-                    let kind = op_desc.split([' ', '{']).next().unwrap_or("?").to_string();
-                    let e = by_kind.entry(kind).or_default();
-                    e.0 += 1;
-                    e.1 += s;
-                    e.2 += bytes;
+                let rows = kernel_rows(&timings, ceiling);
+                if print_profile {
+                    print_kernel_profile(&timings, &rows, ceiling);
                 }
-                let mut kinds: Vec<_> = by_kind.into_iter().collect();
-                kinds.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
-                eprintln!("by kernel kind: kind | steps | total µs | GB/s | % ceiling");
-                for (kind, (n, s, bytes)) in kinds.iter().take(8) {
-                    let gbps = if *s > 0.0 {
-                        *bytes as f64 / s / 1e9
-                    } else {
-                        0.0
-                    };
-                    eprintln!(
-                        "  {kind:<22} {n:>4} {:>9.0} {gbps:>7.1} {:>6.1}%",
-                        s * 1e6,
-                        gbps / ceiling * 100.0
-                    );
-                }
-                for (name, op_desc, s, bytes) in timings.iter().take(10) {
-                    let us = s * 1e6;
-                    let gbps = if *s > 0.0 {
-                        *bytes as f64 / s / 1e9
-                    } else {
-                        0.0
-                    };
-                    let pct = gbps / ceiling * 100.0;
-                    eprintln!(
-                        "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
-                        name,
-                        op_desc.chars().take(25).collect::<String>(),
-                        us,
-                        bytes,
-                        gbps,
-                        pct
-                    );
-                }
+                *LAST_PROFILE.lock() = Some((Instant::now(), rows));
             } else {
                 let cb = self.rt.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
@@ -4438,6 +4456,84 @@ fn pipeline_from_archive(
     }
     // SAFETY: a +1 retained pipeline state returned by a `new...` method.
     Ok(unsafe { ComputePipelineState::from_ptr(pso) })
+}
+
+/// The kernel kind of a step's `Debug` text: its innermost variant (`Ext(Norm(RmsNorm { .. }))` is
+/// `RmsNorm`, `GemvPacked { .. }` is `GemvPacked`).
+fn kernel_kind(desc: &str) -> &str {
+    let mut rest = desc;
+    loop {
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (ident, tail) = rest.split_at(end);
+        match tail.strip_prefix('(') {
+            // A wrapper variant (`Ext(`, `Norm(`): the kind is the variant inside it.
+            Some(inner) if inner.starts_with(|c: char| c.is_ascii_uppercase()) => rest = inner,
+            _ => return if ident.is_empty() { "?" } else { ident },
+        }
+    }
+}
+
+/// Per-step GPU timings `(step, op description, seconds, bytes)` grouped by kernel kind, slowest
+/// first, with each kind's rate against `ceiling_gbps`.
+fn kernel_rows(timings: &[(String, String, f64, u64)], ceiling_gbps: f64) -> Vec<KernelRow> {
+    let mut by_kind: HashMap<&str, (usize, f64, u64)> = HashMap::new();
+    for (_, desc, s, bytes) in timings {
+        let e = by_kind.entry(kernel_kind(desc)).or_default();
+        e.0 += 1;
+        e.1 += s;
+        e.2 += bytes;
+    }
+    let mut rows: Vec<KernelRow> = by_kind
+        .into_iter()
+        .map(|(kind, (steps, s, bytes))| {
+            let gbps = if s > 0.0 { bytes as f64 / s / 1e9 } else { 0.0 };
+            KernelRow {
+                kind: kind.to_string(),
+                steps,
+                us: s * 1e6,
+                gbps,
+                pct: gbps / ceiling_gbps * 100.0,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| b.us.total_cmp(&a.us).then_with(|| a.kind.cmp(&b.kind)));
+    rows
+}
+
+/// `GIBBS_PROFILE_KERNELS=1`: the per-kind table and the ten slowest steps, on stderr.
+fn print_kernel_profile(
+    timings: &[(String, String, f64, u64)],
+    rows: &[KernelRow],
+    ceiling_gbps: f64,
+) {
+    eprintln!("profiler: per-command-buffer timing (bytes = operands read + output written)");
+    eprintln!(
+        "{:<20} | {:<25} | {:>8} | {:>8} | {:>8} | {:>8}",
+        "step", "kernel", "µs", "bytes", "GB/s", "% ceiling"
+    );
+    eprintln!("by kernel kind: kind | steps | total µs | GB/s | % ceiling");
+    for r in rows.iter().take(8) {
+        eprintln!(
+            "  {:<22} {:>4} {:>9.0} {:>7.1} {:>6.1}%",
+            r.kind, r.steps, r.us, r.gbps, r.pct
+        );
+    }
+    let mut slowest: Vec<_> = timings.iter().collect();
+    slowest.sort_by(|a, b| b.2.total_cmp(&a.2));
+    for (name, op_desc, s, bytes) in slowest.into_iter().take(10) {
+        let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
+        eprintln!(
+            "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
+            name,
+            op_desc.chars().take(25).collect::<String>(),
+            s * 1e6,
+            bytes,
+            gbps,
+            gbps / ceiling_gbps * 100.0
+        );
+    }
 }
 
 /// GPU execution time of a completed command buffer, in seconds.
@@ -6933,5 +7029,98 @@ mod tests {
             .unwrap();
         let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
         assert!(err < 1e-4, "visible_end mismatch: {err}");
+    }
+
+    #[test]
+    fn kernel_rows_group_steps_by_innermost_kind_slowest_first() {
+        assert_eq!(kernel_kind("Ext(Norm(RmsNorm { eps: 1e-6 }))"), "RmsNorm");
+        assert_eq!(kernel_kind("GemvPacked { rows: 8 }"), "GemvPacked");
+        assert_eq!(kernel_kind("?"), "?");
+        // Field values never name the kind: `ValueId(..)`, `Some(ValueId(..))` and `Gen(..)` follow it.
+        assert_eq!(
+            kernel_kind("GemmBatchedPacked { x: ValueId(1), res: Some(ValueId(4)), format: Gen(GGUF_Q4_K_M) }"),
+            "GemmBatchedPacked"
+        );
+        assert_eq!(kernel_kind("Ext(Moe(Embed))"), "Embed");
+        assert_eq!(kernel_kind("Softmax(3)"), "Softmax");
+        let t = |name: &str, desc: &str, s: f64, bytes: u64| {
+            (name.to_string(), desc.to_string(), s, bytes)
+        };
+        let rows = kernel_rows(
+            &[
+                t("a", "Ext(Norm(RmsNorm { eps: 1e-6 }))", 1e-6, 1_000),
+                t("b", "GemvPacked { rows: 8 }", 8e-6, 2_000_000),
+                t("c", "Ext(Norm(RmsNorm { eps: 1e-6 }))", 1e-6, 1_000),
+            ],
+            100.0,
+        );
+        let kinds: Vec<_> = rows.iter().map(|r| (r.kind.as_str(), r.steps)).collect();
+        assert_eq!(kinds, [("GemvPacked", 1), ("RmsNorm", 2)]);
+        assert!((rows[0].us - 8.0).abs() < 1e-9);
+        // 2 MB in 8 µs = 250 GB/s = 250% of a 100 GB/s ceiling.
+        assert!((rows[0].gbps - 250.0).abs() < 1e-6 && (rows[0].pct - 250.0).abs() < 1e-6);
+    }
+
+    /// A requested profile times one real decode token step by step: the token's output is the
+    /// one an unprofiled run gives, and the per-kind rows land in `last_kernel_profile`.
+    #[test]
+    fn requested_kernel_profile_samples_a_decode_token_and_keeps_its_output() {
+        let (heads, kv_heads, hd) = (4, 2, 8);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let mut g = Graph::new();
+        let q = g.input("q", vec![1, q_dim], DType::F32);
+        let k = g.input("k", vec![1, kv_dim], DType::F32);
+        let v = g.input("v", vec![1, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![16, kv_dim], DType::F32);
+        let vs = g.state("v_state", vec![16, kv_dim], DType::F32);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let out = g.add(
+            "cached_attn",
+            Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 1.0 / (hd as f32).sqrt(),
+                causal: true,
+                window: None,
+                soft_cap: None,
+                write: true,
+            },
+            &[q, k, v, ks, vs, pos],
+            vec![1, q_dim],
+            DType::F32,
+        );
+        g.output(out);
+        let inputs = || {
+            vec![
+                Tensor::F32(rand(q_dim, 1)),
+                Tensor::F32(rand(kv_dim, 2)),
+                Tensor::F32(rand(kv_dim, 3)),
+                Tensor::U32(vec![0]),
+            ]
+        };
+        let session = Session::new(rt(), &Weights::new()).unwrap();
+        let want = session
+            .run_with_state(&g, Some(&mut StateStore::new()), inputs())
+            .unwrap();
+        // Another test's decode run may take the one-shot request: ask again until ours is sampled.
+        let start = Instant::now();
+        let mut got = None;
+        for _ in 0..100 {
+            request_kernel_profile();
+            let out = session
+                .run_with_state(&g, Some(&mut StateStore::new()), inputs())
+                .unwrap();
+            if last_kernel_profile().is_some_and(|(at, _)| at >= start) {
+                got = Some(out);
+                break;
+            }
+        }
+        let got = got.expect("a requested decode token is profiled");
+        assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-6);
+        let (_, rows) = last_kernel_profile().unwrap();
+        assert!(rows.iter().map(|r| r.steps).sum::<usize>() >= 1, "{rows:?}");
+        assert!(rows.iter().all(|r| r.us >= 0.0 && r.gbps >= 0.0), "{rows:?}");
     }
 }

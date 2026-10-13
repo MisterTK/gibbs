@@ -6,7 +6,7 @@ use crate::model::graph_lm::{sample_logits, GraphLm, LayerKVCache};
 use crate::model::nano::NanoTransformerModel;
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
-use crate::telemetry::EngineTelemetry;
+use crate::telemetry::{EngineTelemetry, GapSample};
 use parking_lot::{Mutex, RwLock};
 use spec::{Drafter, KTuner, SpecSeq};
 use std::collections::VecDeque;
@@ -141,6 +141,15 @@ impl ExecutableModel {
             Self::Nano(_) | Self::GraphLm(_) => cpu_backend_label(),
             Self::Program(prog, _) => prog.read().backend_label(),
             Self::Native(m) => m.backend_label(),
+        }
+    }
+    /// Graph nodes by op kind, device and avenue; `None` for models that do not run a graph
+    /// program (CPU executors, seq2seq, vision models).
+    pub fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
+        match self {
+            Self::Nano(_) | Self::GraphLm(_) => None,
+            Self::Program(prog, _) => Some(prog.read().placement_summary()),
+            Self::Native(m) => m.placement_summary(),
         }
     }
     /// Decodes `last_token` against the sequence's KV cache (prefilling `all_tokens` first when the
@@ -755,12 +764,14 @@ fn spec_generate(
         exec.step_prefill_chunk(&ids, 0, true, &ids, temperature, DEFAULT_TOP_P, &mut kv)?;
     let prefill_dur = t_prefill.elapsed();
     let prefill_tok_s = ids.len() as f64 / prefill_dur.as_secs_f64().max(1e-9);
-    println!(
-        "⚡ Prefill: {} tokens in {:.2}ms ({:.1} tok/s)",
-        ids.len(),
-        prefill_dur.as_secs_f64() * 1000.0,
-        prefill_tok_s
-    );
+    if !crate::telemetry::TUI_OWNS_TERMINAL.load(std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "⚡ Prefill: {} tokens in {:.2}ms ({:.1} tok/s)",
+            ids.len(),
+            prefill_dur.as_secs_f64() * 1000.0,
+            prefill_tok_s
+        );
+    }
     let (mut pending, mut out) = (first.into_iter().collect::<Vec<_>>(), Vec::new());
     let (mut all, mut decode, mut tuner) = (ids, Duration::ZERO, KTuner::default());
     let mut decoded = 0usize;
@@ -1003,8 +1014,9 @@ impl Sequence {
     }
 
     /// Appends `toks` (one decode step's output), streams them, and records their latency: time
-    /// to first token, else the gap since the previous step shared evenly by the step's tokens.
-    fn emit(&mut self, toks: &[u32], telemetry: &EngineTelemetry) {
+    /// to first token, else the gap since the previous step shared evenly by the step's tokens
+    /// (returned).
+    fn emit(&mut self, toks: &[u32], telemetry: &EngineTelemetry) -> Option<Duration> {
         self.output_tokens.extend_from_slice(toks);
         if let Some(sender) = &self.token_sender {
             for &t in toks {
@@ -1013,11 +1025,16 @@ impl Sequence {
         }
         let now = Instant::now();
         match self.last_emit.replace(now) {
-            None => telemetry.record_ttft(now - self.submitted),
+            None => {
+                telemetry.record_ttft(now - self.submitted);
+                None
+            }
             Some(prev) => {
+                let itl = (now - prev) / toks.len().max(1) as u32;
                 for _ in toks {
-                    telemetry.record_itl((now - prev) / toks.len() as u32);
+                    telemetry.record_itl(itl);
                 }
+                (!toks.is_empty()).then_some(itl)
             }
         }
     }
@@ -1160,6 +1177,36 @@ impl ContinuousBatchScheduler {
     pub fn has_model(&self) -> bool {
         self.model.read().is_some()
     }
+
+    /// The executing model (a cheap clone: every variant shares its weights); `None` without an LLM.
+    pub fn model(&self) -> Option<ExecutableModel> {
+        self.model.read().clone()
+    }
+
+    /// Folds one plain decode token into the telemetry gap: its inter-token latency `itl` against
+    /// the newest GPU run sample. Nothing is recorded without one (CPU, or a profiled token).
+    #[cfg(target_os = "macos")]
+    fn record_gap(&self, itl: Duration) {
+        let Some(run) = crate::graph::metal::take_run_samples().last().copied() else {
+            return;
+        };
+        let ceiling = crate::model::variant::host_ceiling_gbps();
+        let weights_ms = if ceiling > 0.0 {
+            self.telemetry.bytes_per_token() as f64 / 1e9 / ceiling * 1e3
+        } else {
+            0.0
+        };
+        self.telemetry.record_gap(GapSample {
+            wall_ms: itl.as_secs_f32() * 1e3,
+            run_ms: run.run_ns as f32 / 1e6,
+            gpu_ms: run.gpu_ns as f32 / 1e6,
+            weights_ms: weights_ms as f32,
+            dispatches: run.dispatches,
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn record_gap(&self, _itl: Duration) {}
 
     /// Backend the current model executes on (CPU when no LLM is loaded).
     pub fn llm_backend(&self) -> Device {
@@ -1737,8 +1784,12 @@ impl ContinuousBatchScheduler {
                 let eos = tokens.iter().position(|&t| tokenizer.ends_generation(t));
                 let n = eos.unwrap_or(tokens.len()).min(room);
                 if n > 0 {
-                    seq.emit(&tokens[..n], &self.telemetry);
+                    let itl = seq.emit(&tokens[..n], &self.telemetry);
                     tokens_gen += n;
+                    // A plain decode token (no drafter, one forward) against the run behind it.
+                    if let (Some(itl), None, 1) = (itl, spec_k, n) {
+                        self.record_gap(itl);
+                    }
                 }
                 if seq.total_tokens() >= context_len
                     || seq.output_tokens.len() >= seq.params.max_new_tokens
