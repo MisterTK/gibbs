@@ -105,3 +105,7 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 
 ## Iteration 10 (discard): GQA split attention for every decode row
 - Below 48 keys the per-head kernel is only ever used by the first ~28 tokens of a bench run; always splitting gave +0.19 pp (< 0.30 floor, noise 0.24). Reverted.
+
+## Iteration 11 (keep): delta rule kernel
+- One 32-lane threadgroup per (32 columns, head) with serial 128-row loops became 128 threads (4 key-row groups) sharing q/k normalisation through threadgroup memory. Qwen3.5-2B +6.8 %, 9B +3.2 %.
+- Verification record (decision rule fixed before looking at the third run): run 1 +0.95 pp / noise 1.10 (one ctx4k base spread 0.144, not decisive); run 2 invalid (the machine was ~40 % slower and noisy: E2B base 74 vs 122 tok/s; the matrix runner had a bench in flight); run 3 on a quiet machine with the runner stopped +0.54 pp / noise 0.10 = the recorded row. Future re-runs: the second complete run on a quiet machine is final.
