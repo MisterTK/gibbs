@@ -68,5 +68,33 @@
   "roofline_pct": 19.42343807936725,
   "attempts": 1,
   "error": ""
+ },
+ "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-UD-IQ3_XXS.gguf": {
+  "last_commit": "d2e38cd",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-UD-IQ3_XXS.gguf: tensor 'blk.12.attn_q_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
+ },
+ "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-UD-Q2_K_XL.gguf": {
+  "last_commit": "d2e38cd",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-UD-Q2_K_XL.gguf: tensor 'blk.6.attn_k_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
+ },
+ "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-Q3_K_S.gguf": {
+  "last_commit": "d2e38cd",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "curl download failed for https://huggingface.co/unsloth/LFM2.5-230M-GGUF/resolve/main/LFM2.5-230M-Q3_K_S.gguf (exit code None):  (check the repo id exists on huggingface.co and HF_TOKEN for gated repos)"
+ },
+ "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-Q3_K_M.gguf": {
+  "last_commit": "d2e38cd",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "exit -15"
  }
 }

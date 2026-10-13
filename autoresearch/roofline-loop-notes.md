@@ -235,3 +235,8 @@ The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture'
 
 - Verify on a quiet GPU (new `scripts/verify_when_quiet.sh` waits for <15% device utilization for 50 s; ambient browser/video load had made verify22a invalid: noise 4.4 pp): +0.62 pp (46.51 -> 47.13), noise 0.07, min ratio 0.999, guard pass. `target/loop-base` = `0f7f5c1`.
 - Lesson: the earlier bundle discard (+0.81 pp then -0.00 pp) was ambient noise, not a real regression of every part. Sub-changes of `experiment/bundle-21` are re-verified one at a time behind the quiet gate: F6 fused append, F6 merge, GLU epilogue (with per-weight tuned variants first), F7/F8.
+
+## Iteration 22 (F6 fused append + ticket merge, on the quiet gate): DISCARD
+
+- -0.63 pp, noise 0.02: E2B ctx4k ratio 0.877 (long context pays the serial tail merge in one threadgroup), E2B QAT 0.989, Q4_K_M 0.987; Llama/SmolLM2 +0.2..3.5%. Dispatches 627 -> 612 (E2B). Reverted.
+- Retry candidates: append-only (no ticket merge), or merge gated on short context by the F7 cost model with a hoisted split-weight tail (both on `experiment/bundle-21`).
