@@ -56,10 +56,7 @@ for n, k, g, w in [("gibbs Full", full["dispatches"], full["us"], full["run_us"]
     f = lambda v: "n/a" if v is None else f"{v:.1f}"
     print(f"{n} | {k if k is not None else 'n/a'} | {f(g)} | {f(w)} | {'n/a' if w is None else f'{w / ref_us:.2f}'}")
 print(f"fixture noise (Full vs XlaClass wall, medians of 3 alternated runs): {noise:.1f}%")
-if xla_wall is not None:
-    ok = full["dispatches"] <= ref_k and full["run_us"] <= 0.8 * ref_us
-else:
-    ok = full["run_us"] <= 0.8 * ref_us and full["dispatches"] <= 0.6 * ref_k
+ok = full["run_us"] <= 0.8 * ref_us and full["dispatches"] <= 0.6 * ref_k
 print(f"4.9 verdict vs {ref_name} (kernels vs {k_name}, time = host wall): {'PASS' if ok else 'NOT ACHIEVED'}")
 if "error" in x:
     print("xla error:", x["error"])

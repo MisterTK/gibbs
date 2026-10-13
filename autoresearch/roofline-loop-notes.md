@@ -247,3 +247,14 @@ The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture'
 
 ## Iteration 24 (F5 GLU epilogue in MegakernelMlp): DISCARD
 - Quiet gate: +0.04 pp, noise 0.26, min ratio 0.996. The 15 fewer E2B dispatches are invisible: with iterations 22-23 this is the third dispatch-count reduction (-15..-30 per token) that moves nothing, so per-dispatch cost on this plan is not the lever. Remaining levers: the host gap (0.3 ms of 7.7 ms E2B after chunking) and GEMV bandwidth efficiency on the dominant weight classes.
+
+## Phase 4 vs XLA (4.9), measured after iteration 24
+
+| variant | kernels | gpu us | host-wall us | wall ratio vs XLA |
+|---|---|---|---|---|
+| gibbs Full | 14 | 314.6 | 482.5 | 0.69 |
+| gibbs XlaClass (in-repo policy) | 16 | 318.3 | 485.0 | 0.69 |
+| XLA jax-metal 0.1.1 | n/a (as_text() is None) | n/a | 700.0 | 1.00 |
+
+Fixture noise (Full vs XlaClass, medians of 3 alternated runs): 0.5%. Basis: host wall per call for both sides (XLA includes JAX dispatch overhead, gibbs includes one command-buffer round trip).
+Verdict: time 0.69x XLA (<= 0.8 required): met against jax-metal. Kernels 14 vs 16 = 0.875x of the XlaClass policy (<= 0.6 required): NOT met. The only F item landed is F1 (2 dispatches/block); F5/F6 were discarded (iterations 22-24) because dispatch reductions of this size do not move end-to-end results. 4.9 is therefore not fully achieved; the plan's "beats XLA" claim holds only for time on this fixture, and the 0.69 cannot be separated from the host-overhead difference between the two runtimes.
