@@ -3537,40 +3537,66 @@ impl Session {
                 set_bytes(enc, 3, &p);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
 
-                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(gate_w),
-                    gate_name,
-                    None,
-                    (scratch, off_gate),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
-
-                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(up_w),
-                    up_name,
-                    None,
-                    (scratch, off_up),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
-
-                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
-                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                enc.set_buffer(0, Some(scratch), off_gate as u64);
-                enc.set_buffer(1, Some(scratch), off_up as u64);
-                enc.set_buffer(2, Some(scratch), off_gate as u64);
-                set_bytes(enc, 3, &u32_of(inter)?);
-                grid1(inter);
+                // 2-4. Gate and up GEMVs, then the GLU. Packed weights run the gate GEMV last with the GLU
+                // as its epilogue reading the up result (one dispatch fewer, no second pass over `inter`).
+                let packed = self
+                    .weights
+                    .get(gate_name)
+                    .is_some_and(|w| !matches!(w.3, WeightFormat::F32 | WeightFormat::U32 | WeightFormat::JesseLUT));
+                if packed {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        up_name,
+                        None,
+                        (scratch, off_up),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(gate_w),
+                        gate_name,
+                        Some((scratch, off_up)),
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        if is_geglu { Epi::GeGlu } else { Epi::SwiGlu },
+                    )?;
+                } else {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(gate_w),
+                        gate_name,
+                        None,
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        up_name,
+                        None,
+                        (scratch, off_up),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                    enc.set_buffer(0, Some(scratch), off_gate as u64);
+                    enc.set_buffer(1, Some(scratch), off_up as u64);
+                    enc.set_buffer(2, Some(scratch), off_gate as u64);
+                    set_bytes(enc, 3, &u32_of(inter)?);
+                    grid1(inter);
+                }
 
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
