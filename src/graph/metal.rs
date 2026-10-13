@@ -2457,37 +2457,80 @@ impl Session {
                 }
                 *LAST_PROFILE.lock() = Some((Instant::now(), rows));
             } else {
-                let cb = self.rt.queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                let counted = Counted::new(enc);
+                // The command buffer is cut into chunks, each committed as soon as it is encoded: the GPU
+                // runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
+                // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
+                // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
+                // `GIBBS_CB_CHUNK=0` keeps a single buffer.
+                // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
+                // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
+                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
+                    cb_chunking()
+                } else {
+                    (usize::MAX, usize::MAX)
+                };
+                let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
                 let mut err = None;
+                let mut dispatches = 0u32;
                 let encode_start = std::time::Instant::now();
-                for (s_idx, s) in steps.iter().enumerate() {
-                    if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
-                        err = Some(e);
-                        break;
+                let mut at = 0;
+                while at < steps.len() && err.is_none() {
+                    let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
+                    let cb = self.rt.queue.new_command_buffer().to_owned();
+                    let enc = cb.new_compute_command_encoder();
+                    let counted = Counted::new(enc);
+                    for (s_idx, s) in steps.iter().enumerate().take(end).skip(at) {
+                        if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
+                            err = Some(e);
+                            break;
+                        }
                     }
+                    enc.end_encoding();
+                    dispatches += counted.dispatches();
+                    if end < steps.len() && err.is_none() {
+                        cb.commit();
+                    }
+                    cbs.push(cb);
+                    at = end;
                 }
-                enc.end_encoding();
                 let encode_dur = encode_start.elapsed();
                 if let Some(e) = err {
+                    // Earlier chunks are already on the GPU: let them finish before reporting.
+                    if cbs.len() > 1 {
+                        cbs[cbs.len() - 2].wait_until_completed();
+                    }
                     return Err(e);
                 }
-                commit_and_wait(cb)?;
+                if cbs.is_empty() {
+                    let cb = self.rt.queue.new_command_buffer().to_owned();
+                    cb.new_compute_command_encoder().end_encoding();
+                    cbs.push(cb);
+                }
+                let last = cbs.last().expect("a plan has at least one step");
+                commit_and_wait(last)?;
+                for cb in &cbs[..cbs.len() - 1] {
+                    if cb.status() != metal::MTLCommandBufferStatus::Completed {
+                        return Err(format!(
+                            "Metal command buffer ended with status {:?}",
+                            cb.status()
+                        ));
+                    }
+                }
+                let span = gpu_span_seconds(&cbs[0], last);
                 sample = Some(RunSample {
-                    gpu_ns: (gpu_seconds(cb) * 1e9) as u64,
+                    gpu_ns: (span * 1e9) as u64,
                     run_ns: 0,
                     encode_ns: encode_dur.as_nanos() as u64,
-                    dispatches: counted.dispatches(),
+                    dispatches,
                 });
-                self.last_gpu_s.store(
-                    gpu_seconds(cb).to_bits(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.last_gpu_s
+                    .store(span.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
                     let enc_us = encode_dur.as_micros();
-                    let gpu_ms = gpu_seconds(cb) * 1e3;
-                    eprintln!("[ICB profile] CPU encode: {enc_us} µs, GPU time: {gpu_ms:.2} ms");
+                    eprintln!(
+                        "[ICB profile] CPU encode: {enc_us} µs, GPU time: {:.2} ms",
+                        span * 1e3
+                    );
                 }
             }
             Ok(())
@@ -5018,6 +5061,35 @@ fn print_kernel_profile(
             gbps / ceiling_gbps * 100.0
         );
     }
+}
+
+const CB_CHUNK_MIN_STEPS: usize = 400;
+
+/// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
+fn cb_chunking() -> (usize, usize) {
+    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let v = std::env::var("GIBBS_CB_CHUNK").ok();
+        match v.as_deref() {
+            Some("0") => (usize::MAX, usize::MAX),
+            Some(s) => {
+                let mut it = s.split(',').filter_map(|p| p.trim().parse::<usize>().ok());
+                match (it.next(), it.next()) {
+                    (Some(a), Some(b)) if a > 0 && b > 0 => (a, b),
+                    _ => (24, 160),
+                }
+            }
+            None => (24, 160),
+        }
+    })
+}
+
+/// GPU time from the start of the first to the end of the last of consecutive command buffers.
+fn gpu_span_seconds(first: &CommandBufferRef, last: &CommandBufferRef) -> f64 {
+    // SAFETY: GPUStartTime/GPUEndTime are CFTimeInterval (f64) properties of completed buffers.
+    let (t0, t1): (f64, f64) =
+        unsafe { (msg_send![first, GPUStartTime], msg_send![last, GPUEndTime]) };
+    t1 - t0
 }
 
 /// GPU execution time of a completed command buffer, in seconds.
