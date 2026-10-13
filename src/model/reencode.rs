@@ -1153,151 +1153,157 @@ mod tests {
 
     #[test]
     fn policy_encodes_and_ffn_only_keeps_attention() {
-        let pol = |ffn_only| Mode::Policy {
-            policy: MaxSpeed,
-            ffn_only,
-            rmse_limit: Some(TENSOR_RMSE_LIMIT),
-        };
-        let (q, rec) = encode_with(pol(false), layer("a", 512, 24, 1), ProjRole::Ffn);
-        assert_eq!((q.quant_format(), rec.lossy), (Q::GGUF_Q4_K_M, true));
-        assert!(rec.rmse.unwrap() <= TENSOR_RMSE_LIMIT);
-        // the same matrix in attention under FFN-only stays f32 (source unknown = FP32, native)
-        let (q, rec) = encode_with(pol(true), layer("a", 512, 24, 1), ProjRole::Attn);
-        assert_eq!((q.quant_format(), rec.lossy), (Q::FP32, false));
-        // 64 columns cannot hold Q4_K blocks: block-32 Q4_0 keeps the bit width
-        let (q, _) = encode_with(pol(false), layer("b", 64, 8, 2), ProjRole::Ffn);
-        assert_eq!(q.quant_format(), Q::GGUF_Q4_0);
+        crate::model::variant::with_unmeasured_host(|| {
+            let pol = |ffn_only| Mode::Policy {
+                policy: MaxSpeed,
+                ffn_only,
+                rmse_limit: Some(TENSOR_RMSE_LIMIT),
+            };
+            let (q, rec) = encode_with(pol(false), layer("a", 512, 24, 1), ProjRole::Ffn);
+            assert_eq!((q.quant_format(), rec.lossy), (Q::GGUF_Q4_K_M, true));
+            assert!(rec.rmse.unwrap() <= TENSOR_RMSE_LIMIT);
+            // the same matrix in attention under FFN-only stays f32 (source unknown = FP32, native)
+            let (q, rec) = encode_with(pol(true), layer("a", 512, 24, 1), ProjRole::Attn);
+            assert_eq!((q.quant_format(), rec.lossy), (Q::FP32, false));
+            // 64 columns cannot hold Q4_K blocks: block-32 Q4_0 keeps the bit width
+            let (q, _) = encode_with(pol(false), layer("b", 64, 8, 2), ProjRole::Ffn);
+            assert_eq!(q.quant_format(), Q::GGUF_Q4_0);
+        })
     }
 
     #[test]
     fn per_tensor_gate_bumps_a_format_that_misses_the_limit() {
-        let gate = |limit| Mode::Policy {
-            policy: MaxSpeed,
-            ffn_only: false,
-            rmse_limit: Some(limit),
-        };
-        let (q4, r4) = encode_with(
-            gate(TENSOR_RMSE_LIMIT),
-            layer("c", 256, 16, 3),
-            ProjRole::Ffn,
-        );
-        assert_eq!(q4.quant_format(), Q::GGUF_Q4_K_M);
-        assert!(
-            r4.rmse.unwrap() > 0.01,
-            "uniform weights quantize to ~6% at 4 bits: {:?}",
-            r4.rmse
-        );
-        // a limit Q4_K misses sends the tensor up the ladder until it passes
-        let (q, r) = encode_with(gate(0.02), layer("c", 256, 16, 3), ProjRole::Ffn);
-        assert!(
-            q.quant_format().bits_per_weight() > Q::GGUF_Q4_K_M.bits_per_weight(),
-            "{:?}",
-            q.quant_format()
-        );
-        assert!(r.rmse.unwrap() <= 0.02, "{:?}", r.rmse);
+        crate::model::variant::with_unmeasured_host(|| {
+            let gate = |limit| Mode::Policy {
+                policy: MaxSpeed,
+                ffn_only: false,
+                rmse_limit: Some(limit),
+            };
+            let (q4, r4) = encode_with(
+                gate(TENSOR_RMSE_LIMIT),
+                layer("c", 256, 16, 3),
+                ProjRole::Ffn,
+            );
+            assert_eq!(q4.quant_format(), Q::GGUF_Q4_K_M);
+            assert!(
+                r4.rmse.unwrap() > 0.01,
+                "uniform weights quantize to ~6% at 4 bits: {:?}",
+                r4.rmse
+            );
+            // a limit Q4_K misses sends the tensor up the ladder until it passes
+            let (q, r) = encode_with(gate(0.02), layer("c", 256, 16, 3), ProjRole::Ffn);
+            assert!(
+                q.quant_format().bits_per_weight() > Q::GGUF_Q4_K_M.bits_per_weight(),
+                "{:?}",
+                q.quant_format()
+            );
+            assert!(r.rmse.unwrap() <= 0.02, "{:?}", r.rmse);
+        })
     }
 
     /// Fused GQA q/k/v built from GGUF blocks: the carried bytes dequantize to exactly the f32 rows
     /// the loader would have built (k and v repeated per head), and BitExact keeps them unchanged.
     #[test]
     fn carry_copies_grouped_query_blocks() {
-        use crate::model::layers::{
-            dequantize_gguf_blocks, quantize_k_rows, quantize_row_q4_k_ref,
-        };
-        use crate::model::{ModelManifest, VirtualTensor};
-        let (in_f, head_dim, q_rows, kv_rows) = (256usize, 8usize, 32usize, 16usize);
-        let blocks = |rows: usize, seed: u32| {
-            let l = layer("t", in_f, rows, seed);
-            let QuantizedWeight::Uncompressed { data, .. } = l.weight else {
-                unreachable!()
+        crate::model::variant::with_unmeasured_host(|| {
+            use crate::model::layers::{
+                dequantize_gguf_blocks, quantize_k_rows, quantize_row_q4_k_ref,
             };
-            quantize_k_rows(&data, in_f, 144, quantize_row_q4_k_ref)
-        };
-        let (q, k, v) = (blocks(q_rows, 1), blocks(kv_rows, 2), blocks(kv_rows, 3));
-        let mut manifest = ModelManifest::default();
-        let mut data = Vec::new();
-        for (name, bytes, rows) in [("q", &q, q_rows), ("k", &k, kv_rows), ("v", &v, kv_rows)] {
-            manifest.tensors.insert(
-                name.into(),
-                VirtualTensor {
-                    name: name.into(),
-                    shape: vec![rows, in_f],
-                    quant_format: Q::GGUF_Q4_K_M,
-                    byte_offset: data.len(),
-                    byte_len: bytes.len(),
-                    dtype: "Q4_K".into(),
-                    shard_index: 0,
-                },
-            );
-            data.extend_from_slice(bytes);
-        }
-        let f32s = |b: &[u8]| dequantize_gguf_blocks(Q::GGUF_Q4_K_M, b).unwrap();
-        let expand = |b: &[u8]| -> Vec<f32> {
-            f32s(b)
-                .chunks(head_dim * in_f)
-                .flat_map(|h| h.iter().chain(h).copied().collect::<Vec<_>>())
-                .collect()
-        };
-        let want: Vec<f32> = [f32s(&q), expand(&k), expand(&v)].concat();
-        fn proj<'a>(
-            m: &'a ModelManifest,
-            data: &'a [u8],
-            want: &[f32],
-            in_f: usize,
-            head_dim: usize,
-        ) -> Projection<'a> {
-            let l = QuantizedLinearLayer::from_f32(
-                "layer_0_qkv",
-                in_f,
-                want.len() / in_f,
-                want,
-                Q::FP32,
-            )
-            .unwrap();
-            Projection {
-                role: ProjRole::Attn,
-                layer: l,
-                sources: vec!["q".into(), "k".into(), "v".into()],
-                head_dim,
-                checkpoint: Some((m, data)),
+            use crate::model::{ModelManifest, VirtualTensor};
+            let (in_f, head_dim, q_rows, kv_rows) = (256usize, 8usize, 32usize, 16usize);
+            let blocks = |rows: usize, seed: u32| {
+                let l = layer("t", in_f, rows, seed);
+                let QuantizedWeight::Uncompressed { data, .. } = l.weight else {
+                    unreachable!()
+                };
+                quantize_k_rows(&data, in_f, 144, quantize_row_q4_k_ref)
+            };
+            let (q, k, v) = (blocks(q_rows, 1), blocks(kv_rows, 2), blocks(kv_rows, 3));
+            let mut manifest = ModelManifest::default();
+            let mut data = Vec::new();
+            for (name, bytes, rows) in [("q", &q, q_rows), ("k", &k, kv_rows), ("v", &v, kv_rows)] {
+                manifest.tensors.insert(
+                    name.into(),
+                    VirtualTensor {
+                        name: name.into(),
+                        shape: vec![rows, in_f],
+                        quant_format: Q::GGUF_Q4_K_M,
+                        byte_offset: data.len(),
+                        byte_len: bytes.len(),
+                        dtype: "Q4_K".into(),
+                        shard_index: 0,
+                    },
+                );
+                data.extend_from_slice(bytes);
             }
-        }
-        let mk = || proj(&manifest, &data, &want, in_f, head_dim);
-        let (f, bytes) = carry(&mk()).expect("same-format blocks carry");
-        assert_eq!(f, Q::GGUF_Q4_K_M);
-        assert_eq!(f32s(&bytes), want);
+            let f32s = |b: &[u8]| dequantize_gguf_blocks(Q::GGUF_Q4_K_M, b).unwrap();
+            let expand = |b: &[u8]| -> Vec<f32> {
+                f32s(b)
+                    .chunks(head_dim * in_f)
+                    .flat_map(|h| h.iter().chain(h).copied().collect::<Vec<_>>())
+                    .collect()
+            };
+            let want: Vec<f32> = [f32s(&q), expand(&k), expand(&v)].concat();
+            fn proj<'a>(
+                m: &'a ModelManifest,
+                data: &'a [u8],
+                want: &[f32],
+                in_f: usize,
+                head_dim: usize,
+            ) -> Projection<'a> {
+                let l = QuantizedLinearLayer::from_f32(
+                    "layer_0_qkv",
+                    in_f,
+                    want.len() / in_f,
+                    want,
+                    Q::FP32,
+                )
+                .unwrap();
+                Projection {
+                    role: ProjRole::Attn,
+                    layer: l,
+                    sources: vec!["q".into(), "k".into(), "v".into()],
+                    head_dim,
+                    checkpoint: Some((m, data)),
+                }
+            }
+            let mk = || proj(&manifest, &data, &want, in_f, head_dim);
+            let (f, bytes) = carry(&mk()).expect("same-format blocks carry");
+            assert_eq!(f, Q::GGUF_Q4_K_M);
+            assert_eq!(f32s(&bytes), want);
 
-        let e = Encoder::new(
-            Mode::Policy {
-                policy: BitExact,
-                ffn_only: false,
-                rmse_limit: None,
-            },
-            1,
-            None,
-        );
-        let out = e.encode(mk());
-        let rec = e.records().remove(0);
-        assert_eq!(
-            (out.quant_format(), rec.carried, rec.lossy),
-            (Q::GGUF_Q4_K_M, true, false)
-        );
-        // MaxSpeed leaves a 4.5 bpw Q4_K source alone too
-        let e = Encoder::new(
-            Mode::Policy {
-                policy: MaxSpeed,
-                ffn_only: false,
-                rmse_limit: None,
-            },
-            1,
-            None,
-        );
-        let _ = e.encode(mk());
-        assert!(e.records()[0].carried);
-        // mixed formats inside one projection cannot be carried
-        let mut mixed = manifest.clone();
-        mixed.tensors.get_mut("v").unwrap().quant_format = Q::GGUF_Q5_K_M;
-        assert!(carry(&proj(&mixed, &data, &want, in_f, head_dim)).is_none());
+            let e = Encoder::new(
+                Mode::Policy {
+                    policy: BitExact,
+                    ffn_only: false,
+                    rmse_limit: None,
+                },
+                1,
+                None,
+            );
+            let out = e.encode(mk());
+            let rec = e.records().remove(0);
+            assert_eq!(
+                (out.quant_format(), rec.carried, rec.lossy),
+                (Q::GGUF_Q4_K_M, true, false)
+            );
+            // MaxSpeed leaves a 4.5 bpw Q4_K source alone too
+            let e = Encoder::new(
+                Mode::Policy {
+                    policy: MaxSpeed,
+                    ffn_only: false,
+                    rmse_limit: None,
+                },
+                1,
+                None,
+            );
+            let _ = e.encode(mk());
+            assert!(e.records()[0].carried);
+            // mixed formats inside one projection cannot be carried
+            let mut mixed = manifest.clone();
+            mixed.tensors.get_mut("v").unwrap().quant_format = Q::GGUF_Q5_K_M;
+            assert!(carry(&proj(&mixed, &data, &want, in_f, head_dim)).is_none());
+        })
     }
 
     /// The hand-off from `carry` to `repack`: a bitsandbytes NF4 projection stays NF4 blocks (carried,

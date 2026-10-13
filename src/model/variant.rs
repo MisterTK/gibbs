@@ -713,16 +713,18 @@ mod tests {
 
     #[test]
     fn size_fallback_orders_by_format_and_bytes() {
-        let p = ReencodePolicy::MaxSpeed;
-        let rank = |f, b| hub_rank(f, b, p);
-        assert!(rank(Q::GGUF_Q2_K, None) < rank(Q::GGUF_Q4_K_M, None));
-        // Q8_0 re-encodes to Q4_K under max-speed: a tie broken by download size.
-        // 8e9 params: Q4_K_M 4.5e9 B, Q8_0 8.5e9 B (4.5e9 B once re-encoded).
-        assert!(
-            rank(Q::GGUF_Q4_K_M, Some(4_500_000_000)) < rank(Q::GGUF_Q8_0, Some(8_500_000_000))
-        );
-        let a = Variant::from_size("a", Q::GGUF_Q4_0, Some(1 << 30), p, 300.0);
-        assert!(a.tok_s > 0.0 && a.resident_bytes <= 1 << 30);
+        with_unmeasured_host(|| {
+            let p = ReencodePolicy::MaxSpeed;
+            let rank = |f, b| hub_rank(f, b, p);
+            assert!(rank(Q::GGUF_Q2_K, None) < rank(Q::GGUF_Q4_K_M, None));
+            // Q8_0 re-encodes to Q4_K under max-speed: a tie broken by download size.
+            // 8e9 params: Q4_K_M 4.5e9 B, Q8_0 8.5e9 B (4.5e9 B once re-encoded).
+            assert!(
+                rank(Q::GGUF_Q4_K_M, Some(4_500_000_000)) < rank(Q::GGUF_Q8_0, Some(8_500_000_000))
+            );
+            let a = Variant::from_size("a", Q::GGUF_Q4_0, Some(1 << 30), p, 300.0);
+            assert!(a.tok_s > 0.0 && a.resident_bytes <= 1 << 30);
+        })
     }
 
     #[test]
