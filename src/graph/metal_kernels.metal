@@ -1805,7 +1805,8 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
 // once for all of them (the per-head kernel above re-reads them `group` times). Partials have the layout of
 // `attn_cached_split_f32`; `attn_cached_merge_f32` combines them.
 constant uint ATTN_HPT = 4;
-kernel void attn_cached_gqa_split_f32(device const float* q [[buffer(0)]],
+template <uint NJ>
+kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
                                       device const float* kc [[buffer(1)]],
                                       device const float* vc [[buffer(2)]],
                                       device float* part [[buffer(3)]],
@@ -1814,12 +1815,12 @@ kernel void attn_cached_gqa_split_f32(device const float* q [[buffer(0)]],
                                       uint sg [[simdgroup_index_in_threadgroup]],
                                       uint lane [[thread_index_in_simdgroup]],
                                       uint nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float tq[ATTN_HPT * ATTN_MAX_PER_LANE * 32];
+    threadgroup float tq[ATTN_HPT * NJ * 32];
     threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
-    threadgroup float tg_red[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
+    threadgroup float tg_red[ATTN_MAX_SG * NJ * 32];
     const uint hd = p.head_dim;
-    const uint row = ATTN_MAX_PER_LANE * 32;
+    const uint row = NJ * 32;
     const uint hgroups = (p.group + ATTN_HPT - 1) / ATTN_HPT;
     const uint kvh = tg3.x / hgroups;
     const uint head0 = kvh * p.group + (tg3.x % hgroups) * ATTN_HPT;
@@ -1840,37 +1841,37 @@ kernel void attn_cached_gqa_split_f32(device const float* q [[buffer(0)]],
     lo += split * p.chunk;
     const uint hi = min(len, lo + p.chunk);
 
-    float acc[ATTN_HPT][ATTN_MAX_PER_LANE];
+    float acc[ATTN_HPT][NJ];
     float m[ATTN_HPT], l[ATTN_HPT];
     for (uint h = 0; h < ATTN_HPT; ++h) {
         m[h] = -FLT_MAX;
         l[h] = 0.0f;
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) acc[h][j] = 0.0f;
+        for (uint j = 0; j < NJ; ++j) acc[h][j] = 0.0f;
     }
     for (uint t = lo + sg; t < hi; t += nsg) {
         device const float* k = kc + (ulong)t * p.stride + kv_off;
         device const float* v = vc + (ulong)t * p.stride + kv_off;
-        float kr[ATTN_MAX_PER_LANE];
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+        float kr[NJ];
+        for (uint j = 0; j < NJ; ++j) {
             const uint d = lane + 32 * j;
             kr[j] = d < hd ? k[d] : 0.0f;
         }
-        float vr[ATTN_MAX_PER_LANE];
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+        float vr[NJ];
+        for (uint j = 0; j < NJ; ++j) {
             const uint d = lane + 32 * j;
             vr[j] = d < hd ? v[d] : 0.0f;
         }
         for (uint h = 0; h < ATTN_HPT; ++h) {
             if (h >= nh) break;
             float s = 0.0f;
-            for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) s += tq[h * row + lane + 32 * j] * kr[j];
+            for (uint j = 0; j < NJ; ++j) s += tq[h * row + lane + 32 * j] * kr[j];
             s = simd_sum(s) * p.scale;
             if (p.softcap > 0.0f) s = tanh(s / p.softcap) * p.softcap;
             const float m_new = max(m[h], s);
             const float corr = exp(m[h] - m_new);
             const float e = exp(s - m_new);
             l[h] = l[h] * corr + e;
-            for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) acc[h][j] = acc[h][j] * corr + e * vr[j];
+            for (uint j = 0; j < NJ; ++j) acc[h][j] = acc[h][j] * corr + e * vr[j];
             m[h] = m_new;
         }
     }
@@ -1880,7 +1881,7 @@ kernel void attn_cached_gqa_split_f32(device const float* q [[buffer(0)]],
             tg_m[h * ATTN_MAX_SG + sg] = m[h];
             tg_l[h * ATTN_MAX_SG + sg] = l[h];
         }
-        for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
+        for (uint j = 0; j < NJ; ++j) {
             const uint d = lane + 32 * j;
             if (d < hd) tg_red[sg * row + d] = acc[h][j];
         }
@@ -1902,6 +1903,13 @@ kernel void attn_cached_gqa_split_f32(device const float* q [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+typedef decltype(attn_cached_gqa_split_t<1>) attn_cached_gqa_split_k;
+template [[host_name("attn_cached_gqa_split_f32_1")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<1>;
+template [[host_name("attn_cached_gqa_split_f32_2")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<2>;
+template [[host_name("attn_cached_gqa_split_f32_4")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<4>;
+template [[host_name("attn_cached_gqa_split_f32_8")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<8>;
+template [[host_name("attn_cached_gqa_split_f32_16")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<16>;
 
 struct PagedAttnCachedParams {
     uint n_heads;
