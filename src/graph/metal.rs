@@ -2304,21 +2304,41 @@ impl Session {
                 }
             }
         }
+        // Positions this call touches: 2-D states keep at least 4096 rows and grow in 4096-row steps.
+        let need_rows = steps
+            .iter()
+            .filter_map(|s| match s.op {
+                Step::CachedAttention {
+                    pos: Some(p), m, ..
+                } => {
+                    let i = graph.inputs.iter().position(|&x| x == p)?;
+                    match &inputs[i] {
+                        Tensor::U32(v) => v.first().map(|&x| x as usize + m),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
         let mut state_map: HashMap<String, Arc<Buffer>> = HashMap::new();
         if let Some(st) = &mut state {
             for s in steps {
                 for &v in &s.reads {
                     if let ValueKind::State(name) = &graph.value(v).kind {
-                        let val = graph.value(v);
-                        let max_pos = 4096usize;
-                        let n = if val.shape.len() == 2 && val.shape[0] > max_pos {
-                            max_pos * val.shape[1]
-                        } else {
-                            numel(graph, v)?
-                        };
-                        if !st.metal_buffers.contains_key(name) {
+                        let n = state_len(graph, v, need_rows)?;
+                        let grown = st.metal_buffers.get(name).is_some_and(|(_, old)| *old < n);
+                        if grown || !st.metal_buffers.contains_key(name) {
                             let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
-                            if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
+                            if let Some((old, old_n)) = st.metal_buffers.get(name) {
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        old.contents() as *const f32,
+                                        buf.contents() as *mut f32,
+                                        *old_n,
+                                    );
+                                }
+                            } else if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
                                 let copy_len = cur_data.len().min(n);
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -2339,15 +2359,19 @@ impl Session {
             for s in steps {
                 for &v in &s.reads {
                     if let ValueKind::State(name) = &graph.value(v).kind {
-                        let val = graph.value(v);
-                        let max_pos = 4096usize;
-                        let n = if val.shape.len() == 2 && val.shape[0] > max_pos {
-                            max_pos * val.shape[1]
-                        } else {
-                            numel(graph, v)?
-                        };
-                        if !sbufs.contains_key(name) {
+                        let n = state_len(graph, v, need_rows)?;
+                        let have = sbufs.get(name).map_or(0, |b| b.length() as usize);
+                        if have < (n * 4).max(ARENA_ALIGN) {
                             let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                            if let Some(old) = sbufs.get(name) {
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        old.contents() as *const u8,
+                                        buf.contents() as *mut u8,
+                                        have.min(n * 4),
+                                    );
+                                }
+                            }
                             sbufs.insert(name.clone(), Arc::new(buf));
                         }
                         state_map.insert(name.clone(), sbufs[name].clone());
@@ -3010,6 +3034,17 @@ impl Session {
                 let kv_dim = kv_heads * head_dim;
                 let stride = kv_dim;
 
+                // State buffers are physically capped (4096 rows); never write or read past them.
+                if let Some(ks) = k_state {
+                    let (kb, ko) = loc(ks);
+                    let rows = (kb.length() as usize - ko) / (stride * 4).max(1);
+                    if start_pos as usize + m > rows {
+                        return Err(format!(
+                            "KV cache holds {rows} positions on this backend; need {}",
+                            start_pos as usize + m
+                        ));
+                    }
+                }
                 if write && k_state.is_some() && v_state.is_some() {
                     let ks = k_state.unwrap();
                     let vs = v_state.unwrap();
@@ -3616,6 +3651,18 @@ pub struct PreparedPlan {
     pub state_reads: Vec<StateRead>,
     pub flops_per_run: u64,
     pub params_buffer_size: usize,
+}
+
+/// Element count of the physical buffer for a state value: 2-D states with more than 4096 declared rows
+/// keep at least 4096 rows (a declared 64k-row cache would waste GBs) and grow in 4096-row steps to
+/// cover `need_rows` positions, never beyond the declared rows.
+fn state_len(g: &Graph, v: ValueId, need_rows: usize) -> Result<usize, String> {
+    let val = g.value(v);
+    if val.shape.len() == 2 && val.shape[0] > 4096 {
+        let rows = (need_rows.div_ceil(4096) * 4096).max(4096);
+        return Ok(rows.min(val.shape[0]) * val.shape[1]);
+    }
+    numel(g, v)
 }
 
 fn numel(g: &Graph, v: ValueId) -> Result<usize, String> {
@@ -7146,7 +7193,7 @@ mod tests {
     /// grouped KV heads): the split + merge path equals the CPU executor.
     #[test]
     fn split_decode_attention_matches_cpu() {
-        let (max_seq, prefill) = (1024, 700);
+        // (cache size, prefill length) pairs are looped below.
         // Query heads per KV head: 2 (a partial head tile), 8 (two full tiles), 1, 6 (tiles of 4 and 2),
         // 3 (a single tile of 3); head dims below 512 exercise the q-tile zero fill.
         for (heads, kv_heads, hd) in [
@@ -7156,75 +7203,83 @@ mod tests {
             (6, 1, 32),
             (6, 2, 128),
         ] {
-            let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-            for window in [None, Some(300), Some(90)] {
-                let make = |m: usize| {
-                    let mut g = Graph::new();
-                    let q = g.input("q", vec![m, q_dim], DType::F32);
-                    let k = g.input("k", vec![m, kv_dim], DType::F32);
-                    let v = g.input("v", vec![m, kv_dim], DType::F32);
-                    let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
-                    let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
-                    let pos = g.input("pos", vec![m], DType::U32);
-                    let out = g.add(
-                        "attn",
-                        Op::CachedAttention {
-                            heads,
-                            kv_heads,
-                            head_dim: hd,
-                            v_head_dim: hd,
-                            scale: 1.0 / (hd as f32).sqrt(),
-                            causal: true,
-                            window,
-                            soft_cap: Some(30.0),
-                            write: true,
-                        },
-                        &[q, k, v, ks, vs, pos],
-                        vec![m, q_dim],
-                        DType::F32,
-                    );
-                    g.output(out);
-                    g
-                };
-                let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
-                let session = Session::new(rt(), &Weights::new()).unwrap();
-                let step = |g: &Graph,
-                            m: usize,
-                            at: usize,
-                            seed: u64,
-                            cs: &mut StateStore,
-                            ms: &mut StateStore| {
-                    let inputs = vec![
-                        Tensor::F32(rand(m * q_dim, seed)),
-                        Tensor::F32(rand(m * kv_dim, seed + 1)),
-                        Tensor::F32(rand(m * kv_dim, seed + 2)),
-                        Tensor::U32((at..at + m).map(|p| p as u32).collect()),
-                    ];
-                    let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
-                    let got = session.run_with_state(g, Some(ms), inputs).unwrap();
-                    rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
-                };
-                let e = step(
-                    &make(prefill),
-                    prefill,
-                    0,
-                    1,
-                    &mut cpu_state,
-                    &mut metal_state,
-                );
-                assert!(e < 1e-4, "prefill {window:?}: {e}");
-                let decode = make(1);
-                // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
-                for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
+            // Short caches for every shape; for the two widest, a cache past the 4096-row minimum of the
+            // physical state buffers (they must grow; 4200 keys also hit the 32-slice cap).
+            for (max_seq, prefill) in [(1024usize, 700usize), (4400, 4200)] {
+                if prefill > 1000 && !matches!(hd, 64 | 128) {
+                    continue;
+                }
+                let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+                let tol = 1e-4;
+                for window in [None, Some(300), Some(90)] {
+                    let make = |m: usize| {
+                        let mut g = Graph::new();
+                        let q = g.input("q", vec![m, q_dim], DType::F32);
+                        let k = g.input("k", vec![m, kv_dim], DType::F32);
+                        let v = g.input("v", vec![m, kv_dim], DType::F32);
+                        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
+                        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+                        let pos = g.input("pos", vec![m], DType::U32);
+                        let out = g.add(
+                            "attn",
+                            Op::CachedAttention {
+                                heads,
+                                kv_heads,
+                                head_dim: hd,
+                                v_head_dim: hd,
+                                scale: 1.0 / (hd as f32).sqrt(),
+                                causal: true,
+                                window,
+                                soft_cap: Some(30.0),
+                                write: true,
+                            },
+                            &[q, k, v, ks, vs, pos],
+                            vec![m, q_dim],
+                            DType::F32,
+                        );
+                        g.output(out);
+                        g
+                    };
+                    let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
+                    let session = Session::new(rt(), &Weights::new()).unwrap();
+                    let step = |g: &Graph,
+                                m: usize,
+                                at: usize,
+                                seed: u64,
+                                cs: &mut StateStore,
+                                ms: &mut StateStore| {
+                        let inputs = vec![
+                            Tensor::F32(rand(m * q_dim, seed)),
+                            Tensor::F32(rand(m * kv_dim, seed + 1)),
+                            Tensor::F32(rand(m * kv_dim, seed + 2)),
+                            Tensor::U32((at..at + m).map(|p| p as u32).collect()),
+                        ];
+                        let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
+                        let got = session.run_with_state(g, Some(ms), inputs).unwrap();
+                        rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
+                    };
                     let e = step(
-                        &decode,
+                        &make(prefill),
+                        prefill,
+                        0,
                         1,
-                        at,
-                        10 + 3 * i as u64,
                         &mut cpu_state,
                         &mut metal_state,
                     );
-                    assert!(e < 1e-4, "decode at {at} {window:?}: {e}");
+                    assert!(e < tol, "prefill {window:?}: {e}");
+                    let decode = make(1);
+                    // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
+                    for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
+                        let e = step(
+                            &decode,
+                            1,
+                            at,
+                            10 + 3 * i as u64,
+                            &mut cpu_state,
+                            &mut metal_state,
+                        );
+                        assert!(e < tol, "decode at {at} {window:?}: {e}");
+                    }
                 }
             }
         }
