@@ -3282,9 +3282,15 @@ impl Session {
                     rep: rep as u32,
                 };
                 set_bytes(enc, 7, &p);
+                if key_dim > 512 {
+                    return Err(format!(
+                        "node '{}': delta rule key_dim {key_dim} exceeds 512",
+                        s.name
+                    ));
+                }
                 enc.dispatch_thread_groups(
                     MTLSize::new((val_dim as u64).div_ceil(32), val_heads as u64, 1),
-                    MTLSize::new(32, 1, 1),
+                    MTLSize::new(128, 1, 1),
                 );
             }
             Step::MegakernelMlp {
