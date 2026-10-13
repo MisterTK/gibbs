@@ -240,3 +240,7 @@ The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture'
 
 - -0.63 pp, noise 0.02: E2B ctx4k ratio 0.877 (long context pays the serial tail merge in one threadgroup), E2B QAT 0.989, Q4_K_M 0.987; Llama/SmolLM2 +0.2..3.5%. Dispatches 627 -> 612 (E2B). Reverted.
 - Retry candidates: append-only (no ticket merge), or merge gated on short context by the F7 cost model with a hoisted split-weight tail (both on `experiment/bundle-21`).
+
+## Iteration 23 (F6 append-only): DISCARD
+- Quiet-gate verify: +0.12 pp, noise 0.01, min ratio 0.993: correct but below the 0.30 pp floor, so the 15-dispatch saving is not worth the kernel complexity. Both F6 commits reverted (iteration 22's revert had silently failed and was redone here with `git revert d5daac3 3a0183a`). The fused merge and the append stay on `experiment/bundle-21` / `4f7a303`.
+- Next: F5 GLU epilogue (needs per-weight tuned variants in MegakernelMlp first), then the host-gap work.

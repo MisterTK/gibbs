@@ -5755,10 +5755,14 @@ mod tests {
         }
         let mut samples = take_run_samples();
         assert_eq!(samples.len(), 200);
+        let mut run: Vec<u64> = samples.iter().map(|s| s.run_ns).collect();
+        run.sort_unstable();
         samples.sort_by_key(|s| s.gpu_ns);
+        // `run_us` (host wall per call, dispatch and sync included) is the basis comparable with XLA's timing.
         println!(
-            "FUSION_BLOCK {{\"us\": {:.1}, \"dispatches\": {}}}",
+            "FUSION_BLOCK {{\"us\": {:.1}, \"run_us\": {:.1}, \"dispatches\": {}}}",
             samples[100].gpu_ns as f64 / 1e3,
+            run[100] as f64 / 1e3,
             samples[100].dispatches
         );
     }
