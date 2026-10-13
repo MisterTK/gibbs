@@ -22,57 +22,27 @@ pub struct GemvVariant {
     /// Rows one simdgroup computes (generated kernels); `0` for the hand kernels, whose row
     /// mapping is fixed.
     pub rows_per_sg: u8,
-    /// Independent 32-sub-block steps per loop iteration of a generated kernel (`GemvParams::k_unroll`).
-    #[serde(default = "one")]
-    pub unroll: u8,
 }
 
-fn one() -> u8 {
-    1
-}
-
-/// Rows per simdgroup and unroll factors the generated kernel is tried with.
+/// Rows per simdgroup the generated kernel is tried with.
 pub const GEN_ROWS: [u8; 3] = [1, 2, 4];
-pub const GEN_UNROLL: [u8; 3] = [1, 2, 4];
-
-/// Every generated variant: `GEN_ROWS` x `GEN_UNROLL`.
-pub fn gen_variants() -> impl Iterator<Item = GemvVariant> {
-    GEN_ROWS.into_iter().flat_map(|r| {
-        GEN_UNROLL
-            .into_iter()
-            .map(move |u| GemvVariant::unrolled(r, u))
-    })
-}
 
 impl GemvVariant {
     pub const HAND: Self = Self {
         kernel: GemvKernel::Hand,
         rows_per_sg: 0,
-        unroll: 1,
     };
     pub const fn generated(rows_per_sg: u8) -> Self {
-        Self::unrolled(rows_per_sg, 1)
-    }
-    pub const fn unrolled(rows_per_sg: u8, unroll: u8) -> Self {
         Self {
             kernel: GemvKernel::Gen,
             rows_per_sg,
-            unroll,
         }
     }
-    /// The code generator's parameters for a generated variant.
-    pub fn params(&self) -> crate::graph::codegen::GemvParams {
-        crate::graph::codegen::GemvParams {
-            rows_per_sg: self.rows_per_sg as usize,
-            k_unroll: self.unroll as usize,
-        }
-    }
-    /// `hand`, `gen/r4` or `gen/r2u4`.
+    /// `hand` or `gen/r4`.
     pub fn label(&self) -> String {
-        match (self.kernel, self.unroll) {
-            (GemvKernel::Hand, _) => "hand".into(),
-            (GemvKernel::Gen, 1) => format!("gen/r{}", self.rows_per_sg),
-            (GemvKernel::Gen, u) => format!("gen/r{}u{u}", self.rows_per_sg),
+        match self.kernel {
+            GemvKernel::Hand => "hand".into(),
+            GemvKernel::Gen => format!("gen/r{}", self.rows_per_sg),
         }
     }
 }
@@ -81,7 +51,7 @@ impl GemvVariant {
 const TIE: f64 = 0.01;
 
 /// The fastest variant of `timings` (`GB/s`, higher is better). Variants within 1% of the best tie;
-/// ties go to fewer rows per simdgroup, then less unroll, then to the hand kernel.
+/// ties go to fewer rows per simdgroup, then to the hand kernel.
 pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
     let best = timings
         .iter()
@@ -94,7 +64,7 @@ pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
         .iter()
         .filter(|t| t.1 >= best * (1.0 - TIE))
         .map(|t| t.0)
-        .min_by_key(|v| (v.rows_per_sg, v.unroll, v.kernel == GemvKernel::Gen))
+        .min_by_key(|v| (v.rows_per_sg, v.kernel == GemvKernel::Gen))
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

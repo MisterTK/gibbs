@@ -204,12 +204,7 @@ pub fn gemv_common(kernels_msl: &str) -> &str {
 
 /// Name of the kernel [`gemv_packed`] emits for `codec` with `p`.
 pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
-    format!(
-        "gemvgen_{:?}_r{}u{}",
-        codec.format,
-        p.rows_per_sg,
-        p.k_unroll.max(1)
-    )
+    format!("gemvgen_{:?}_r{}", codec.format, p.rows_per_sg)
 }
 
 /// Name of the kernel [`dequant_packed`] emits for `codec`.
@@ -280,17 +275,6 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let sums: String = (0..r)
         .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
         .collect();
-    let u = p.k_unroll.max(1);
-    // `u` independent 32-sub steps per iteration (same per-lane order as a plain loop, so the sums are
-    // bit-identical): more bytes in flight per row for codecs with large blocks (TQ2_0: 66 B per step).
-    let steps: String = (0..u)
-        .map(|j| {
-            format!(
-                "        if (s0 + {off} < subs) {{\n            const uint s = s0 + {off};\n            float4 x0 = *(device const float4*)(xb + s * 8);\n            float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n            const uint blk = (s * 8) / {be};\n            const uint sub = ((s * 8) % {be}) / 8;\n{rows_loop}        }}\n",
-                off = 32 * j
-            )
-        })
-        .collect();
     format!(
         r#"
 {codec_msl}
@@ -313,14 +297,17 @@ kernel void {name}(
     const uint blocks_per_row = p.cols / {be};
     device const float* xb = x + (ulong)batch * p.cols;
     {acc_decl}
-    for (uint s0 = lane; s0 < subs; s0 += {stride}) {{
-{steps}    }}
+    for (uint s = lane; s < subs; s += 32) {{
+        float4 x0 = *(device const float4*)(xb + s * 8);
+        float4 x1 = *(device const float4*)(xb + s * 8 + 4);
+        const uint blk = (s * 8) / {be};
+        const uint sub = ((s * 8) % {be}) / 8;
+{rows_loop}    }}
 {sums}    if (lane == 0) {{
 {store}    }}
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
-        stride = 32 * u,
     )
 }
 
@@ -340,10 +327,7 @@ pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
     let codec_msl = codec.msl.replace("decode8", &dec);
     let r = p.rows_per_sg;
     let (be, bb) = (codec.block_elems, codec.block_bytes);
-    let acc_decl = (0..r)
-        .map(|i| format!("float acc{i} = 0.0f;"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let acc_decl = (0..r).map(|i| format!("float acc{i} = 0.0f;")).collect::<Vec<_>>().join(" ");
     let rows_loop: String = (0..r)
         .map(|i| {
             format!(

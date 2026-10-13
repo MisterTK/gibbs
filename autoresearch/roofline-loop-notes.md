@@ -41,3 +41,18 @@ oracle != fail. (B) three consecutive checkpoints each improve the kept geomean 
 
 Verify is per-model ABBA (base, cand, cand, base for each suite entry); the first whole-suite ABBA drifted 25% over four
 minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0.2 (rows 0n2, 0n3 in the TSV).
+
+## Iteration 0 (provisional baseline) and iteration 1
+
+- **Deviation from plan 3.1:** `bench/loop.json` has 8 models, not the planned 9: the Gemma 4 26B-A4B entry is missing because the
+  10 GB file is still downloading (link ~0.5-2 MB/s) and the MoE real-weight acceptance is pending. Iteration 0 is therefore
+  provisional; when the file lands the entry is added and the A/A baseline re-run (a new iteration 0). Within-verify comparisons
+  (base vs cand) stay valid because every verify runs both binaries on the same suite.
+- Baseline geomean 26.34 % (A/A noise 0.24 pp). Per-model: E2B QAT 24 %, E2B Q4_K_M 37 %, Qwen3.5-2B 26 %, Qwen3.5-9B IQ2_M 55 %, Llama-1B Q4_0 49 %,
+  SmolLM2 26 %, Llama-bnb 50 %, **E2B QAT at 2k-token context 2.8 % (102 ms/token)**.
+- The ctx4k entry costs `ln(26.34/2.8)/8` = 0.28 in log-geomean: raising it to ~20 % lifts the geomean by about +7 pp, more than any
+  GEMV change. Candidate order is therefore by expected pp, not the plan's L1..L18 listing: **L14 (split-K flash-decode) first.**
+- Iteration 1 (discard): GEMV k-unroll. Microbenchmark showed no format moves >3 %. A limiter probe (x loads, weight decode, access pattern
+  removed one at a time, TQ2_0 262144x1536 gen r2): base 114 GB/s, no x loads 120, no decode 194, neither 212; Q8_0 is 288 in all four.
+  Conclusion: the low-bit generated GEMVs are bound by per-weight decode work (byte loads + shift/mask/convert per weight), not by x
+  traffic or bytes in flight. The remaining lever is a cheaper decode (planar repack + 16-byte aligned loads + SWAR; L5), not tiling.
