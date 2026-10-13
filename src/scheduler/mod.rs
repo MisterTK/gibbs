@@ -240,17 +240,23 @@ impl ExecutableModel {
                     }
                     _ => return Err(WRONG_KV.into()),
                 };
-                return Ok(model.sample_next_token_with_penalty(
+                let t = model.sample_next_token_with_penalty(
                     &logits,
                     recent(all_tokens),
                     temp,
                     50,
                     top_p,
                     1.0,
-                ));
+                );
+                #[cfg(target_os = "macos")]
+                crate::graph::metal::recycle_f32(logits);
+                return Ok(t);
             }
         };
-        Ok(self.sample(&logits, recent(all_tokens), temp, top_p))
+        let t = self.sample(&logits, recent(all_tokens), temp, top_p);
+        #[cfg(target_os = "macos")]
+        crate::graph::metal::recycle_f32(logits);
+        Ok(t)
     }
 
     /// Evaluates a single decode token returning logits directly without allocations.

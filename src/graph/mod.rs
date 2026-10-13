@@ -13,6 +13,7 @@ pub mod codegen;
 pub mod coreml;
 pub mod cpu;
 pub mod cuda;
+pub mod fusion_cost;
 pub mod level_zero;
 #[cfg(target_os = "macos")]
 pub mod metal;
