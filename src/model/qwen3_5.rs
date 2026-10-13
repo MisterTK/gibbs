@@ -716,8 +716,9 @@ fn gguf_checkpoint(
             matches!(
                 t.quant_format,
                 crate::hardware::QuantFormat::BF16 | crate::hardware::QuantFormat::FP16
-            ) || crate::model::layers::gguf_block_codec(t.quant_format)
-                .is_some_and(|(elems, _, _)| cols % elems == 0)
+            ) || (crate::graph::codec::codec(t.quant_format).is_some()
+                && crate::model::layers::gguf_block_codec(t.quant_format)
+                    .is_some_and(|(elems, _, _)| cols % elems == 0))
         };
         let bank = hf.contains(".mlp.experts.");
         let can_pack = ((shape.len() == 2 && packable(shape[1]))
