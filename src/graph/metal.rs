@@ -395,7 +395,12 @@ const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
     [256, 384, 1536],
 ];
 const ATTN_MAX_HEAD_DIM: usize = 512;
-const BASE_KERNELS: [&str; 50] = [
+/// Decode attention splits its keys across threadgroups from this many visible keys, about
+/// `ATTN_SPLIT_KEYS` per slice and at most `ATTN_MAX_SPLITS` slices.
+const ATTN_SPLIT_MIN_KEYS: usize = 128;
+const ATTN_SPLIT_KEYS: usize = 64;
+const ATTN_MAX_SPLITS: usize = 32;
+const BASE_KERNELS: [&str; 52] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -441,6 +446,8 @@ const BASE_KERNELS: [&str; 50] = [
     "kv_append_batched",
     "attn_cached_f32",
     "flash_attn_cached_f32",
+    "attn_cached_split_f32",
+    "attn_cached_merge_f32",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
@@ -1378,6 +1385,8 @@ pub struct Session {
     mlp_scratch: Mutex<Option<Buffer>>,
     /// f32 expansion of the packed weight a batched GEMM step is reading (grown to the largest).
     dequant_scratch: Mutex<Option<Buffer>>,
+    /// Per-slice partials of the split decode attention (grown to the largest).
+    attn_scratch: Mutex<Option<Buffer>>,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -1934,6 +1943,7 @@ impl Session {
             state_buffers: Mutex::new(HashMap::new()),
             mlp_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
+            attn_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
@@ -3002,14 +3012,39 @@ impl Session {
                     (k, v)
                 };
 
-                enc.set_compute_pipeline_state(
+                // Long decode cache: one threadgroup per (head, key slice) plus a merge, instead of one per
+                // head scanning every key (8 threadgroups on a 20-core GPU).
+                let len = start_pos as usize + 1;
+                let lo = window.map_or(0, |w| len.saturating_sub(w));
+                let n_keys = len - lo;
+                let n_splits = if m == 1 && vis.is_none() && n_keys >= ATTN_SPLIT_MIN_KEYS {
+                    (n_keys / ATTN_SPLIT_KEYS).clamp(2, ATTN_MAX_SPLITS)
+                } else {
+                    1
+                };
+                let mut scratch_guard = self.attn_scratch.lock();
+                if n_splits > 1 {
+                    let bytes = heads * n_splits * (head_dim + 2) * 4;
+                    if scratch_guard
+                        .as_ref()
+                        .map_or(true, |b| (b.length() as usize) < bytes)
+                    {
+                        *scratch_guard = Some(new_shared_buffer(&rt.device, bytes)?);
+                    }
+                }
+                enc.set_compute_pipeline_state(if n_splits > 1 {
+                    rt.pso("attn_cached_split_f32")?
+                } else {
                     rt.pso("flash_attn_cached_f32")
-                        .or_else(|_| rt.pso("attn_cached_f32"))?,
-                );
+                        .or_else(|_| rt.pso("attn_cached_f32"))?
+                });
                 bind(0, q);
                 bind(1, k_buf_id);
                 bind(2, v_buf_id);
-                bind(3, s.out);
+                match scratch_guard.as_ref().filter(|_| n_splits > 1) {
+                    Some(part) => enc.set_buffer(3, Some(part), 0),
+                    None => bind(3, s.out),
+                }
                 // Rows see keys `< vis[row]` when the operand is present (default `pos + row + 1`).
                 bind(5, vis.unwrap_or(q));
                 #[repr(C)]
@@ -3024,6 +3059,8 @@ impl Session {
                     start_pos: u32,
                     m: u32,
                     has_vis: u32,
+                    n_splits: u32,
+                    chunk: u32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -3036,12 +3073,24 @@ impl Session {
                     start_pos,
                     m: m as u32,
                     has_vis: vis.is_some() as u32,
+                    n_splits: n_splits as u32,
+                    chunk: n_keys.div_ceil(n_splits) as u32,
                 };
                 set_bytes(enc, 4, &p);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(heads as u64, m as u64, 1),
+                    MTLSize::new(heads as u64, m as u64, n_splits as u64),
                     MTLSize::new(TG4, 1, 1),
                 );
+                if let Some(part) = scratch_guard.as_ref().filter(|_| n_splits > 1) {
+                    enc.set_compute_pipeline_state(rt.pso("attn_cached_merge_f32")?);
+                    enc.set_buffer(0, Some(part), 0);
+                    bind(1, s.out);
+                    set_bytes(enc, 2, &p);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(heads as u64, m as u64, 1),
+                        MTLSize::new(TG4, 1, 1),
+                    );
+                }
             }
             Step::PagedCachedAttention {
                 q,
@@ -4522,7 +4571,11 @@ fn print_kernel_profile(
     let mut slowest: Vec<_> = timings.iter().collect();
     slowest.sort_by(|a, b| b.2.total_cmp(&a.2));
     for (name, op_desc, s, bytes) in slowest.into_iter().take(10) {
-        let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
+        let gbps = if *s > 0.0 {
+            *bytes as f64 / s / 1e9
+        } else {
+            0.0
+        };
         eprintln!(
             "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
             name,
@@ -6982,6 +7035,84 @@ mod tests {
         }
     }
 
+    /// Decode over a cache long enough to split across threadgroups (full and sliding window, soft cap,
+    /// grouped KV heads): the split + merge path equals the CPU executor.
+    #[test]
+    fn split_decode_attention_matches_cpu() {
+        let (heads, kv_heads, hd, max_seq, prefill) = (4, 2, 32, 1024, 700);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        for window in [None, Some(300), Some(90)] {
+            let make = |m: usize| {
+                let mut g = Graph::new();
+                let q = g.input("q", vec![m, q_dim], DType::F32);
+                let k = g.input("k", vec![m, kv_dim], DType::F32);
+                let v = g.input("v", vec![m, kv_dim], DType::F32);
+                let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
+                let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+                let pos = g.input("pos", vec![m], DType::U32);
+                let out = g.add(
+                    "attn",
+                    Op::CachedAttention {
+                        heads,
+                        kv_heads,
+                        head_dim: hd,
+                        v_head_dim: hd,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        causal: true,
+                        window,
+                        soft_cap: Some(30.0),
+                        write: true,
+                    },
+                    &[q, k, v, ks, vs, pos],
+                    vec![m, q_dim],
+                    DType::F32,
+                );
+                g.output(out);
+                g
+            };
+            let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
+            let session = Session::new(rt(), &Weights::new()).unwrap();
+            let step = |g: &Graph,
+                        m: usize,
+                        at: usize,
+                        seed: u64,
+                        cs: &mut StateStore,
+                        ms: &mut StateStore| {
+                let inputs = vec![
+                    Tensor::F32(rand(m * q_dim, seed)),
+                    Tensor::F32(rand(m * kv_dim, seed + 1)),
+                    Tensor::F32(rand(m * kv_dim, seed + 2)),
+                    Tensor::U32((at..at + m).map(|p| p as u32).collect()),
+                ];
+                let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
+                let got = session.run_with_state(g, Some(ms), inputs).unwrap();
+                rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
+            };
+            let e = step(
+                &make(prefill),
+                prefill,
+                0,
+                1,
+                &mut cpu_state,
+                &mut metal_state,
+            );
+            assert!(e < 1e-4, "prefill {window:?}: {e}");
+            let decode = make(1);
+            // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
+            for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
+                let e = step(
+                    &decode,
+                    1,
+                    at,
+                    10 + 3 * i as u64,
+                    &mut cpu_state,
+                    &mut metal_state,
+                );
+                assert!(e < 1e-4, "decode at {at} {window:?}: {e}");
+            }
+        }
+    }
+
     /// A bidirectional block: rows inside it see keys up to the block's end (`visible_end`), the sliding
     /// window still starting at the row's own position. Metal against the CPU executor.
     #[test]
@@ -7120,6 +7251,9 @@ mod tests {
         assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-6);
         let (_, rows) = last_kernel_profile().unwrap();
         assert!(rows.iter().map(|r| r.steps).sum::<usize>() >= 1, "{rows:?}");
-        assert!(rows.iter().all(|r| r.us >= 0.0 && r.gbps >= 0.0), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| r.us >= 0.0 && r.gbps >= 0.0),
+            "{rows:?}"
+        );
     }
 }
