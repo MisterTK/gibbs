@@ -5358,6 +5358,7 @@ mod tests {
     #[ignore = "bandwidth measurement"]
     fn shape_rates() {
         for f in [
+            QuantFormat::GGUF_TQ2_0,
             QuantFormat::GGUF_Q4_0,
             QuantFormat::GGUF_Q4_K_M,
             QuantFormat::GGUF_Q6_K,
@@ -5370,6 +5371,7 @@ mod tests {
                 (1536, 6144),
                 (2048, 1536),
                 (1536, 2048),
+                (262144, 1536),
             ] {
                 let t = rt().bench_gemv(f, &[shape], &fmt.gemv_variants()).unwrap();
                 let best = t.iter().map(|x| x.1).fold(0.0, f64::max);

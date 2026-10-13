@@ -554,11 +554,16 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
 inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
     float d = cd_f16(blk + 64);
     uint e0 = sub * 8;
-    device const uchar* q = blk + (e0 >> 7) * 32 + (e0 & 31);
+    // Eight consecutive elements are eight consecutive bytes that share one shift. Blocks are 66 bytes,
+    // so only 2-byte loads are aligned: four of them, shifted and masked four bytes at a time.
+    device const ushort* q = (device const ushort*)(blk + (e0 >> 7) * 32 + (e0 & 31));
     uint sh = ((e0 >> 5) & 3) * 2;
-    for (uint i = 0; i < 8; i++) {
-        out8[i] = (float((q[i] >> sh) & 3u) - 1.0f) * d;
-    }
+    uint a = ((uint(q[0]) | (uint(q[1]) << 16)) >> sh) & 0x03030303u;
+    uint b = ((uint(q[2]) | (uint(q[3]) << 16)) >> sh) & 0x03030303u;
+    float4 lo = fma(float4(as_type<uchar4>(a)), d, -d);
+    float4 hi = fma(float4(as_type<uchar4>(b)), d, -d);
+    out8[0] = lo.x; out8[1] = lo.y; out8[2] = lo.z; out8[3] = lo.w;
+    out8[4] = hi.x; out8[5] = hi.y; out8[6] = hi.z; out8[7] = hi.w;
 }
 "#,
     },
