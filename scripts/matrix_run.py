@@ -211,11 +211,17 @@ def summary():
             if key in r:
                 c[r[key]] = c.get(r[key], 0) + 1
         print(f"{key}: {c}")
-    classes = {}
+    classes, oos = {}, []
     for r in rows:
         for e in (r.get("error"), r.get("parity_error") if r.get("parity") == "fail" else None):
-            if e:
+            if not e:
+                continue
+            # modified/fine-tuned architectures (extra or renamed tensors) are out of scope: no burn-down, not a stop-rule blocker
+            if re.search(r"is not part of the \w+ graph|unsupported tensor", str(e)):
+                oos.append(r["id"])
+            else:
                 classes.setdefault(norm_error(e), []).append(r["id"])
+    print(f"unsupported-variant (out of scope): {len(oos)}" + (f"   e.g. {oos[0]}" if oos else ""))
     print("error classes (items):")
     for k, ids in sorted(classes.items(), key=lambda kv: -len(kv[1])):
         print(f"  {len(ids):4d}  {k}   e.g. {ids[0]}")

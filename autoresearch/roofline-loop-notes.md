@@ -191,3 +191,6 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 
 ## Iteration 16 (discard): split attention without the cross-simdgroup epilogue
 - Each simdgroup of a split threadgroup wrote its own partial (n_splits x 4 per head) so the kernel had no tg_red/tg_m/tg_l and no barrier after the key loop; the merge kernel computed its split weights once. `split_decode_attention_matches_cpu` passed (all variants, 4200-key caches). E2B QAT in-situ gpu_ms 7.72 / 7.67 vs base 7.38 / 7.64: no gain, so the epilogue is not the ~12 us per call; the long-context microbench got worse (hd512 4097 keys 108 -> 159 us, hd256 sliding 28 -> 42, hd128/kv4 56 -> 66) because the merge now reads 4x more partials. Judged on the E2B A/B only (not a full verify, nothing to promote). The remaining suspects for the 12 us are the per-key dependent chain (K load -> simd_sum -> exp -> V FMAs) and kernel launch/tail on a tiny grid; neither is parallelism.
+
+## Scope directive (user, 2026-10-13)
+- Priority is generic compiler / megakernel / JIT passes (tuner, F1-F8 fusion, megakernel coverage, E1-E4). Load errors from modified or fine-tuned architectures (e.g. `ggml-org/Kev-0.8B-GGUF`: `GGUF tensor 'cls.output.weight' is not part of the qwen35 graph`) are NOT burned down: the matrix classifies them `unsupported-variant`, and they do not block stop rule A or 1.6.
