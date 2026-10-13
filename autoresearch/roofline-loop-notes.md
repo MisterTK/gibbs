@@ -99,3 +99,6 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 
 ### Scope / metric notes (iteration 6)
 - `src/model/qwen3_5.rs gguf_checkpoint` is outside the loop's `src/graph/**` edit scope; the change is Phase 1.2 loader work (pack every codec-decodable matrix instead of dequantizing to BF16) and is recorded as such. The bytes-per-token estimate (bench.rs) was not touched: Qwen3.5-2B's denominator moved 1.059 -> 1.269 GB/token only because the applied weight policy now streams the packed Q5_K/Q6_K tensors (the BF16 copies were previously counted at their source size), so iteration 6's +12 pp mixes a real +23 % tok/s with that denominator change; tok/s is the number to trust.
+
+## Iteration 9 (keep): GQA split attention from 48 keys
+- The 128-key threshold of iteration 2/8 left bench-length contexts (prompt ~20 + 128 decoded tokens) mostly on the per-head kernel, which launches `heads` (8) threadgroups. Dropping it to 48 keys: E2B QAT 100.0 -> 122.4 tok/s, E2B Q4_K_M 83.8 -> 101.0, SmolLM2 332.9 -> 399.2 (this was worth +3.8 pp, bigger than the long-context work). Below 48 keys the old kernel still runs; next: always split at decode.
