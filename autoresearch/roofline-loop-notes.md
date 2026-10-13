@@ -230,3 +230,8 @@ The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture'
 - Review fixes made on the branch before the verify: JesseLUT excluded from the GLU epilogue (its GEMV ignores epilogues); fusion search confirms every candidate against a re-timed baseline and is never persisted when utilization > 60%; 68-step fused decode stress test vs CPU passes; zero-step plan guard.
 - Open items from review not done: MegakernelMlp uses untuned default GEMV variants; `coherent(device)` on the ticket-merge partials (stress test passes without); the fused merge is cost-model-negative on E2B.
 - Next: re-verify the branch's sub-changes one at a time (cherry-pick) when the GPU is quiet; the first candidate is chunking (E2B +1.4% wall) and F6 append+merge.
+
+## Iteration 21 (chunked command buffers, cherry-picked from the discarded bundle): KEEP
+
+- Verify on a quiet GPU (new `scripts/verify_when_quiet.sh` waits for <15% device utilization for 50 s; ambient browser/video load had made verify22a invalid: noise 4.4 pp): +0.62 pp (46.51 -> 47.13), noise 0.07, min ratio 0.999, guard pass. `target/loop-base` = `0f7f5c1`.
+- Lesson: the earlier bundle discard (+0.81 pp then -0.00 pp) was ambient noise, not a real regression of every part. Sub-changes of `experiment/bundle-21` are re-verified one at a time behind the quiet gate: F6 fused append, F6 merge, GLU epilogue (with per-weight tuned variants first), F7/F8.
