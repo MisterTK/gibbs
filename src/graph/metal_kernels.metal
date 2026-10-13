@@ -1665,6 +1665,7 @@ struct AttnCachedParams {
     float softcap;
     uint start_pos;
     uint m;
+    uint has_vis;
 };
 
 inline void attn_cached_f32_impl(device const float* q,
@@ -1672,6 +1673,7 @@ inline void attn_cached_f32_impl(device const float* q,
                                  device const float* vc,
                                  device float* out,
                                  constant AttnCachedParams& p,
+                                 device const uint* vis,
                                  uint2 tg,
                                  uint sg,
                                  uint lane,
@@ -1688,7 +1690,7 @@ inline void attn_cached_f32_impl(device const float* q,
     device const float* qh = q + ((ulong)q_tok * p.n_heads + head) * hd;
     const uint kv_off = (head / p.group) * hd;
     const uint cur_pos = p.start_pos + q_tok;
-    const uint len = cur_pos + 1;
+    const uint len = p.has_vis ? vis[q_tok] : cur_pos + 1;
 
     float qr[ATTN_MAX_PER_LANE];
     float acc[ATTN_MAX_PER_LANE];
@@ -1748,6 +1750,7 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
                             device const float* vc [[buffer(2)]],
                             device float* out [[buffer(3)]],
                             constant AttnCachedParams& p [[buffer(4)]],
+                            device const uint* vis [[buffer(5)]],
                             uint2 tg [[threadgroup_position_in_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]],
@@ -1755,7 +1758,7 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl(q, kc, vc, out, p, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
@@ -1763,6 +1766,7 @@ kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
                                   device const float* vc [[buffer(2)]],
                                   device float* out [[buffer(3)]],
                                   constant AttnCachedParams& p [[buffer(4)]],
+                                  device const uint* vis [[buffer(5)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
                                   uint sg [[simdgroup_index_in_threadgroup]],
                                   uint lane [[thread_index_in_simdgroup]],
@@ -1770,7 +1774,7 @@ kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl(q, kc, vc, out, p, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 struct PagedAttnCachedParams {

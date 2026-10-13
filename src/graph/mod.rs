@@ -227,7 +227,9 @@ pub enum Op {
     Binary {
         kind: BinaryKind,
     },
-    /// `[q, k_new, v_new, k_state, v_state, positions]` evaluating causal attention and appending to state.
+    /// `[q, k_new, v_new, k_state, v_state, positions, visible_end?]` evaluating causal attention and appending
+    /// to state. The optional `visible_end` (`[m]` U32, each >= its row's position + 1) lets row `i` see keys
+    /// `< visible_end[i]`; the sliding window still starts at the row's own position.
     CachedAttention {
         heads: usize,
         kv_heads: usize,

@@ -321,8 +321,14 @@ pub fn run(
                 let rows = x.len() / in_f;
                 dispatch_linear(x, w_slot, bias, in_f, out_f, rows, name)?
             }
-            Op::MatMul { transpose_a, transpose_b } => {
-                let (a, b) = (operand(&bound, &slots, ins, name, 0)?, operand(&bound, &slots, ins, name, 1)?);
+            Op::MatMul {
+                transpose_a,
+                transpose_b,
+            } => {
+                let (a, b) = (
+                    operand(&bound, &slots, ins, name, 0)?,
+                    operand(&bound, &slots, ins, name, 1)?,
+                );
                 matmul_ref(graph, ins, a, b, *transpose_a, *transpose_b, name)?
             }
             Op::Megakernel(desc) => {
@@ -577,8 +583,16 @@ pub fn run(
             Op::Softmax { axis } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
                 let shape = &graph.value(ins[0]).shape;
-                let shape = if shape.is_empty() { vec![x.len()] } else { shape.clone() };
-                let ax = if *axis < 0 { *axis + shape.len() as isize } else { *axis };
+                let shape = if shape.is_empty() {
+                    vec![x.len()]
+                } else {
+                    shape.clone()
+                };
+                let ax = if *axis < 0 {
+                    *axis + shape.len() as isize
+                } else {
+                    *axis
+                };
                 if ax < 0 || ax >= shape.len() as isize {
                     return Err(format!("node '{name}': bad Softmax axis {axis}"));
                 }
@@ -872,7 +886,14 @@ pub fn run(
                 } else {
                     (k_in.to_vec(), v_in.to_vec(), 0)
                 };
-                let nk = (pos_offset + nq).min(k_buf.len() / (kvh * hd).max(1));
+                let vis = if ins.len() >= 7 {
+                    Some(operand_u32(&bound, &slots, ins, name, 6)?)
+                } else {
+                    None
+                };
+                let nk = (pos_offset + nq)
+                    .max(vis.map_or(0, |v| v.iter().copied().max().unwrap_or(0) as usize))
+                    .min(k_buf.len() / (kvh * hd).max(1));
                 let mut out = vec![0.0f32; nq * h * vhd];
                 for qi in 0..nq {
                     let current_pos = pos_offset + qi;
@@ -881,7 +902,7 @@ pub fn run(
                         let q_vec = &q[qi * h * hd + head * hd..][..hd];
                         let mut scores = Vec::with_capacity(nk);
                         for ki in 0..nk {
-                            if *causal && ki > current_pos {
+                            if *causal && ki >= vis.map_or(current_pos + 1, |v| v[qi] as usize) {
                                 scores.push(f32::NEG_INFINITY);
                                 continue;
                             }
@@ -1326,8 +1347,12 @@ pub fn run(
             }
             Op::Upsample { scale, mode } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
-                let (inp, outp) = (&graph.value(ins[0]).shape, &graph.value(node.outputs[0]).shape);
-                let nsp = upsample_nsp(inp, outp, *scale).map_err(|e| format!("node '{name}': {e}"))?;
+                let (inp, outp) = (
+                    &graph.value(ins[0]).shape,
+                    &graph.value(node.outputs[0]).shape,
+                );
+                let nsp =
+                    upsample_nsp(inp, outp, *scale).map_err(|e| format!("node '{name}': {e}"))?;
                 upsample_cpu(x, inp, *scale, *mode, nsp)
             }
             Op::Conv3d {
@@ -1345,7 +1370,13 @@ pub fn run(
                     None
                 },
                 (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape, 3),
-                (*stride, [p[0], p[1], p[2]], [p[3], p[4], p[5]], *dilation, *groups),
+                (
+                    *stride,
+                    [p[0], p[1], p[2]],
+                    [p[3], p[4], p[5]],
+                    *dilation,
+                    *groups,
+                ),
             )?,
             Op::Conv1d {
                 stride,
@@ -1362,7 +1393,13 @@ pub fn run(
                     None
                 },
                 (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape, 1),
-                ([1, 1, *stride], [0, 0, p[0]], [0, 0, p[1]], [1, 1, *dilation], *groups),
+                (
+                    [1, 1, *stride],
+                    [0, 0, p[0]],
+                    [0, 0, p[1]],
+                    [1, 1, *dilation],
+                    *groups,
+                ),
             )?,
             Op::LayerNorm { eps } => {
                 if ins.len() < 2 {
@@ -1411,7 +1448,10 @@ pub fn run(
                 let (n, hw) = channel_layout(&graph.value(ins[0]).shape, c)
                     .map_err(|e| format!("node '{name}': {e}"))?;
                 if x.len() != n * c * hw {
-                    return Err(format!("node '{name}': x length {} is not {n}*{c}*{hw}", x.len()));
+                    return Err(format!(
+                        "node '{name}': x length {} is not {n}*{c}*{hw}",
+                        x.len()
+                    ));
                 }
                 let mut out = x.to_vec();
                 for sample in out.chunks_mut(c * hw) {
@@ -1430,7 +1470,9 @@ pub fn run(
                 for &a in axes {
                     let ax = if a < 0 { a + rank as isize } else { a };
                     if ax < 0 || ax >= rank as isize || red[ax as usize] {
-                        return Err(format!("node '{name}': bad Reduce axis {a} for rank {rank}"));
+                        return Err(format!(
+                            "node '{name}': bad Reduce axis {a} for rank {rank}"
+                        ));
                     }
                     red[ax as usize] = true;
                 }
@@ -1603,7 +1645,10 @@ pub fn run(
             Op::Reshape { .. } | Op::Squeeze { .. } | Op::Unsqueeze { .. } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
                 if x.len() != graph.value(node.outputs[0]).shape.iter().product::<usize>() {
-                    return Err(format!("node '{name}': {} changes the element count", node.op.name()));
+                    return Err(format!(
+                        "node '{name}': {} changes the element count",
+                        node.op.name()
+                    ));
                 }
                 x.to_vec()
             }
@@ -1666,14 +1711,27 @@ fn matmul_ref(
     name: &str,
 ) -> Result<Vec<f32>, String> {
     let (sa, sb) = (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape);
-    if sa.len() < 2 || sb.len() < 2 || a.len() != sa.iter().product::<usize>() || b.len() != sb.iter().product::<usize>() {
-        return Err(format!("node '{name}': MatMul operands {sa:?} x {sb:?} must be rank >= 2 and match their data"));
+    if sa.len() < 2
+        || sb.len() < 2
+        || a.len() != sa.iter().product::<usize>()
+        || b.len() != sb.iter().product::<usize>()
+    {
+        return Err(format!(
+            "node '{name}': MatMul operands {sa:?} x {sb:?} must be rank >= 2 and match their data"
+        ));
     }
-    let (ar, ac, br, bc) = (sa[sa.len() - 2], sa[sa.len() - 1], sb[sb.len() - 2], sb[sb.len() - 1]);
+    let (ar, ac, br, bc) = (
+        sa[sa.len() - 2],
+        sa[sa.len() - 1],
+        sb[sb.len() - 2],
+        sb[sb.len() - 1],
+    );
     let (m, k) = if ta { (ac, ar) } else { (ar, ac) };
     let (k2, n) = if tb { (bc, br) } else { (br, bc) };
     if k != k2 {
-        return Err(format!("node '{name}': MatMul inner dims {k} != {k2} ({sa:?} x {sb:?})"));
+        return Err(format!(
+            "node '{name}': MatMul inner dims {k} != {k2} ({sa:?} x {sb:?})"
+        ));
     }
     let nd = (sa.len() - 2).max(sb.len() - 2);
     let pad = |d: &[usize]| [vec![1; nd - d.len()], d.to_vec()].concat();
@@ -1683,7 +1741,11 @@ fn matmul_ref(
         match (pa[i], pb[i]) {
             (x, y) if x == y || y == 1 => ob.push(x),
             (1, y) => ob.push(y),
-            _ => return Err(format!("node '{name}': MatMul batch dims {sa:?} and {sb:?} do not broadcast")),
+            _ => {
+                return Err(format!(
+                    "node '{name}': MatMul batch dims {sa:?} and {sb:?} do not broadcast"
+                ))
+            }
         }
     }
     // Element offset of batch index `flat` in an operand with padded batch dims `p` and matrix size `sz`.
@@ -1706,8 +1768,16 @@ fn matmul_ref(
             for j in 0..n {
                 let mut acc = 0.0f64;
                 for kk in 0..k {
-                    let av = if ta { a[oa + kk * m + i] } else { a[oa + i * k + kk] };
-                    let bv = if tb { b[obb + j * k + kk] } else { b[obb + kk * n + j] };
+                    let av = if ta {
+                        a[oa + kk * m + i]
+                    } else {
+                        a[oa + i * k + kk]
+                    };
+                    let bv = if tb {
+                        b[obb + j * k + kk]
+                    } else {
+                        b[obb + kk * n + j]
+                    };
                     acc += av as f64 * bv as f64;
                 }
                 out[bi * m * n + i * n + j] = acc as f32;
@@ -1745,9 +1815,16 @@ pub(crate) fn channel_layout(shape: &[usize], c: usize) -> Result<(usize, usize)
         (true, true) if shape.len() >= 3 => 1,
         (true, _) => 0,
         (false, true) => 1,
-        _ => return Err(format!("shape {shape:?} has no channel axis of size {c} at axis 0 or 1")),
+        _ => {
+            return Err(format!(
+                "shape {shape:?} has no channel axis of size {c} at axis 0 or 1"
+            ))
+        }
     };
-    Ok((shape[..ax].iter().product(), shape[ax + 1..].iter().product()))
+    Ok((
+        shape[..ax].iter().product(),
+        shape[ax + 1..].iter().product(),
+    ))
 }
 
 fn operand<'a>(
@@ -1776,7 +1853,9 @@ fn conv_nd(
     (stride, pb, pe, dil, groups): ([usize; 3], [usize; 3], [usize; 3], [usize; 3], usize),
 ) -> Result<Vec<f32>, String> {
     if xs.len() < nd + 1 || ws.len() != nd + 2 {
-        return Err(format!("node '{name}': conv shapes {xs:?} / {ws:?} do not fit {nd}-d conv"));
+        return Err(format!(
+            "node '{name}': conv shapes {xs:?} / {ws:?} do not fit {nd}-d conv"
+        ));
     }
     let (mut inp, mut k) = ([1usize; 3], [1usize; 3]);
     inp[3 - nd..].copy_from_slice(&xs[xs.len() - nd..]);
@@ -1784,11 +1863,22 @@ fn conv_nd(
     let c_in = xs[xs.len() - nd - 1];
     let batch: usize = xs[..xs.len() - nd - 1].iter().product();
     let (c_out, cpg) = (ws[0], ws[1]);
-    if groups == 0 || c_in != cpg * groups || c_out % groups != 0 || stride.contains(&0) || dil.contains(&0) {
-        return Err(format!("node '{name}': conv c_in {c_in}, weight {ws:?}, groups {groups} are inconsistent"));
+    if groups == 0
+        || c_in != cpg * groups
+        || c_out % groups != 0
+        || stride.contains(&0)
+        || dil.contains(&0)
+    {
+        return Err(format!(
+            "node '{name}': conv c_in {c_in}, weight {ws:?}, groups {groups} are inconsistent"
+        ));
     }
-    if x.len() != batch * c_in * inp.iter().product::<usize>() || w.len() != ws.iter().product::<usize>() {
-        return Err(format!("node '{name}': conv operand lengths do not match shapes"));
+    if x.len() != batch * c_in * inp.iter().product::<usize>()
+        || w.len() != ws.iter().product::<usize>()
+    {
+        return Err(format!(
+            "node '{name}': conv operand lengths do not match shapes"
+        ));
     }
     if bias.is_some_and(|b| b.len() != c_out) {
         return Err(format!("node '{name}': conv bias is not c_out"));
@@ -1797,7 +1887,9 @@ fn conv_nd(
     for a in 0..3 {
         let span = dil[a] * (k[a] - 1) + 1;
         if inp[a] + pb[a] + pe[a] < span {
-            return Err(format!("node '{name}': conv kernel larger than padded input"));
+            return Err(format!(
+                "node '{name}': conv kernel larger than padded input"
+            ));
         }
         out_d[a] = (inp[a] + pb[a] + pe[a] - span) / stride[a] + 1;
     }
@@ -1819,16 +1911,20 @@ fn conv_nd(
                                     continue;
                                 }
                                 for kh in 0..k[1] {
-                                    let ih = (oh * stride[1] + kh * dil[1]) as isize - pb[1] as isize;
+                                    let ih =
+                                        (oh * stride[1] + kh * dil[1]) as isize - pb[1] as isize;
                                     if ih < 0 || ih >= inp[1] as isize {
                                         continue;
                                     }
                                     for kw in 0..k[2] {
-                                        let iw = (ow * stride[2] + kw * dil[2]) as isize - pb[2] as isize;
+                                        let iw = (ow * stride[2] + kw * dil[2]) as isize
+                                            - pb[2] as isize;
                                         if iw < 0 || iw >= inp[2] as isize {
                                             continue;
                                         }
-                                        let xi = xc + (id as usize * inp[1] + ih as usize) * inp[2] + iw as usize;
+                                        let xi = xc
+                                            + (id as usize * inp[1] + ih as usize) * inp[2]
+                                            + iw as usize;
                                         sum += x[xi] * w[wc + (kd * k[1] + kh) * k[2] + kw];
                                     }
                                 }
@@ -1869,7 +1965,9 @@ fn dense_strides(shape: &[usize]) -> Vec<usize> {
 fn norm_axis(axis: isize, rank: usize, name: &str) -> Result<usize, String> {
     let a = if axis < 0 { axis + rank as isize } else { axis };
     if a < 0 || a as usize >= rank {
-        return Err(format!("node '{name}': axis {axis} out of range for rank {rank}"));
+        return Err(format!(
+            "node '{name}': axis {axis} out of range for rank {rank}"
+        ));
     }
     Ok(a as usize)
 }
@@ -1897,23 +1995,38 @@ fn for_each_index(dims: &[usize], mut f: impl FnMut(&[usize])) {
     }
 }
 
-fn transpose_cpu(x: &[f32], shape: &[usize], perm: &[usize], name: &str) -> Result<Vec<f32>, String> {
+fn transpose_cpu(
+    x: &[f32],
+    shape: &[usize],
+    perm: &[usize],
+    name: &str,
+) -> Result<Vec<f32>, String> {
     let r = shape.len();
     let mut seen = vec![false; r];
     for &p in perm {
         if p >= r || seen[p] {
-            return Err(format!("node '{name}': {perm:?} is not a permutation of rank {r}"));
+            return Err(format!(
+                "node '{name}': {perm:?} is not a permutation of rank {r}"
+            ));
         }
         seen[p] = true;
     }
     if perm.len() != r {
-        return Err(format!("node '{name}': {perm:?} is not a permutation of rank {r}"));
+        return Err(format!(
+            "node '{name}': {perm:?} is not a permutation of rank {r}"
+        ));
     }
     let in_st = dense_strides(shape);
     let odims: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
     let mut out = Vec::with_capacity(x.len());
     for_each_index(&odims, |idx| {
-        out.push(x[idx.iter().zip(perm).map(|(&i, &p)| i * in_st[p]).sum::<usize>()]);
+        out.push(
+            x[idx
+                .iter()
+                .zip(perm)
+                .map(|(&i, &p)| i * in_st[p])
+                .sum::<usize>()],
+        );
     });
     Ok(out)
 }
@@ -1921,7 +2034,9 @@ fn transpose_cpu(x: &[f32], shape: &[usize], perm: &[usize], name: &str) -> Resu
 fn tile_cpu(x: &[f32], shape: &[usize], reps: &[usize]) -> Vec<f32> {
     let r = shape.len().max(reps.len());
     let pad = |v: &[usize]| -> Vec<usize> {
-        std::iter::repeat_n(1, r - v.len()).chain(v.iter().copied()).collect()
+        std::iter::repeat_n(1, r - v.len())
+            .chain(v.iter().copied())
+            .collect()
     };
     let (ish, rp) = (pad(shape), pad(reps));
     let odims: Vec<usize> = ish.iter().zip(&rp).map(|(a, b)| a * b).collect();
@@ -1938,7 +2053,9 @@ fn concat_cpu(parts: &[(&[f32], &[usize])], axis: isize, name: &str) -> Result<V
     let ax = norm_axis(axis, rank, name)?;
     for (_, sh) in parts {
         if sh.len() != rank || (0..rank).any(|d| d != ax && sh[d] != parts[0].1[d]) {
-            return Err(format!("node '{name}': concat operands disagree off axis {ax}"));
+            return Err(format!(
+                "node '{name}': concat operands disagree off axis {ax}"
+            ));
         }
     }
     let outer: usize = parts[0].1[..ax].iter().product();
@@ -1954,19 +2071,41 @@ fn concat_cpu(parts: &[(&[f32], &[usize])], axis: isize, name: &str) -> Result<V
 }
 
 /// `padding` holds `(before, after)` pairs for the last `padding.len() / 2` dims, outermost first.
-fn pad_cpu(x: &[f32], shape: &[usize], padding: &[usize], value: f32, name: &str) -> Result<Vec<f32>, String> {
+fn pad_cpu(
+    x: &[f32],
+    shape: &[usize],
+    padding: &[usize],
+    value: f32,
+    name: &str,
+) -> Result<Vec<f32>, String> {
     let (r, k) = (shape.len(), padding.len() / 2);
     if padding.len() % 2 != 0 || k > r {
-        return Err(format!("node '{name}': Pad {padding:?} does not fit shape {shape:?}"));
+        return Err(format!(
+            "node '{name}': Pad {padding:?} does not fit shape {shape:?}"
+        ));
     }
-    let before = |d: usize| if d + k >= r { padding[2 * (d + k - r)] } else { 0 };
-    let after = |d: usize| if d + k >= r { padding[2 * (d + k - r) + 1] } else { 0 };
+    let before = |d: usize| {
+        if d + k >= r {
+            padding[2 * (d + k - r)]
+        } else {
+            0
+        }
+    };
+    let after = |d: usize| {
+        if d + k >= r {
+            padding[2 * (d + k - r) + 1]
+        } else {
+            0
+        }
+    };
     let odims: Vec<usize> = (0..r).map(|d| shape[d] + before(d) + after(d)).collect();
     let out_st = dense_strides(&odims);
     let mut out = vec![value; odims.iter().product()];
     let mut i = 0;
     for_each_index(shape, |idx| {
-        out[(0..r).map(|d| (idx[d] + before(d)) * out_st[d]).sum::<usize>()] = x[i];
+        out[(0..r)
+            .map(|d| (idx[d] + before(d)) * out_st[d])
+            .sum::<usize>()] = x[i];
         i += 1;
     });
     Ok(out)
@@ -1977,13 +2116,21 @@ fn pad_cpu(x: &[f32], shape: &[usize], padding: &[usize], value: f32, name: &str
 pub(crate) fn upsample_nsp(inp: &[usize], out: &[usize], scale: usize) -> Result<usize, String> {
     let r = inp.len();
     if r < 2 || out.len() != r || scale == 0 {
-        return Err(format!("Upsample {inp:?} -> {out:?} by {scale} is not a spatial resize"));
+        return Err(format!(
+            "Upsample {inp:?} -> {out:?} by {scale} is not a spatial resize"
+        ));
     }
-    let nsp = if r >= 3 && scale > 1 && out[r - 3] == inp[r - 3] * scale { 3 } else { 2 };
+    let nsp = if r >= 3 && scale > 1 && out[r - 3] == inp[r - 3] * scale {
+        3
+    } else {
+        2
+    };
     for d in 0..r {
         let want = if d + nsp >= r { inp[d] * scale } else { inp[d] };
         if out[d] != want {
-            return Err(format!("Upsample {inp:?} -> {out:?} by {scale}: dim {d} should be {want}"));
+            return Err(format!(
+                "Upsample {inp:?} -> {out:?} by {scale}: dim {d} should be {want}"
+            ));
         }
     }
     Ok(nsp)
@@ -2011,13 +2158,24 @@ fn upsample_taps(o: usize, n: usize, scale: usize, mode: super::UpsampleMode) ->
             let t = src - i0;
             let w = [far(t + 1.0), near(t), near(1.0 - t), far(2.0 - t)];
             (0..4)
-                .map(|k| ((i0 as i64 + k as i64 - 1).clamp(0, n as i64 - 1) as usize, w[k]))
+                .map(|k| {
+                    (
+                        (i0 as i64 + k as i64 - 1).clamp(0, n as i64 - 1) as usize,
+                        w[k],
+                    )
+                })
                 .collect()
         }
     }
 }
 
-fn upsample_cpu(x: &[f32], shape: &[usize], scale: usize, mode: super::UpsampleMode, nsp: usize) -> Vec<f32> {
+fn upsample_cpu(
+    x: &[f32],
+    shape: &[usize],
+    scale: usize,
+    mode: super::UpsampleMode,
+    nsp: usize,
+) -> Vec<f32> {
     let r = shape.len();
     let lead: usize = shape[..r - nsp].iter().product();
     let (d, h, w) = if nsp == 3 {

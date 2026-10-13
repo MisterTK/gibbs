@@ -10,8 +10,8 @@ pub mod graph;
 pub(crate) mod ops;
 pub mod seqcls;
 mod text;
-pub use text::tiny_decode_graph;
 pub use audio::tiny::{graph as tiny_audio_graph, wav_graph as tiny_audio_wav_graph};
+pub use text::tiny_decode_graph;
 pub use vision::tiny::graph as tiny_vision_graph;
 mod unified;
 mod vision;
@@ -341,76 +341,6 @@ impl NativeLm for Gemma4 {
         if end <= st.done {
             return Ok(st.logits.clone()); // run ahead with an earlier chunk's image block
         }
-        if let Some(prog) = &self.program {
-            if !st.blocks.is_empty() {
-                return Err(
-                    "gpu-only: this checkpoint attends image blocks bidirectionally and the Metal program is causal; rerun with --backend cpu"
-                        .into(),
-                );
-            }
-            let h = self.text.hidden;
-            // The chunk's token rows (host table lookups, as in text decoding) with the media soft
-            // tokens scattered over their placeholder rows on the GPU; media rows take the pad id's
-            // per-layer embedding, like the host forward.
-            let (mut base, mut at, mut rows) = (Vec::with_capacity(tokens.len() * h), Vec::new(), Vec::new());
-            let mut ple_ids = Vec::with_capacity(tokens.len());
-            for (i, &tok) in tokens.iter().enumerate() {
-                if tok as usize >= self.text.vocab {
-                    return Err(format!("gemma4: token id {tok} outside the vocabulary"));
-                }
-                let mut emb = vec![0.0f32; h];
-                self.text.embed_row(tok, &mut emb);
-                base.extend(emb);
-                match st.media_pos.binary_search(&(start_pos + i)) {
-                    Ok(r) => {
-                        at.push(i as u32);
-                        rows.extend_from_slice(&st.media[r * h..(r + 1) * h]);
-                        ple_ids.push(self.text.pad_id);
-                    }
-                    Err(_) => ple_ids.push(tok),
-                }
-            }
-            let mut prog_guard = prog.lock();
-            let mode = crate::hardware::PlacementMode::Pin(prog_guard.primary_device());
-            let x = crate::model::vision_graph::scatter_rows(base, tokens.len(), h, &at, rows, mode)?;
-            std::mem::swap(&mut prog_guard.state, &mut st.program_state);
-            let mut last_logits = Vec::new();
-            for (i, (emb, &id)) in x.chunks_exact(h).zip(&ple_ids).enumerate() {
-                let pos = start_pos + i;
-                let mut inputs = vec![
-                    crate::graph::Tensor::F32(emb.to_vec()),
-                    crate::graph::Tensor::U32(vec![pos as u32]),
-                ];
-                if let Some(p) = &self.text.ple {
-                    let (pd, nl) = (p.dim, self.text.layers_n);
-                    let mut e = vec![0.0f32; nl * pd];
-                    let id = if (id as usize) < p.embed.rows { id } else { self.text.pad_id };
-                    p.embed.get_row(id as usize, &mut e);
-                    let ident_scale = (pd as f32).sqrt();
-                    for v in &mut e {
-                        *v *= ident_scale;
-                    }
-                    inputs.push(crate::graph::Tensor::F32(e));
-                }
-                match prog_guard.run(inputs) {
-                    Ok(res) => {
-                        if i + 1 == tokens.len() {
-                            if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
-                                last_logits = v;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        std::mem::swap(&mut prog_guard.state, &mut st.program_state);
-                        return Err(e);
-                    }
-                }
-            }
-            std::mem::swap(&mut prog_guard.state, &mut st.program_state);
-            st.asked = end;
-            st.done = end;
-            return Ok(last_logits);
-        }
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
         let stop = match st.blocks.iter().find(|b| b.start < end && end < b.end) {
             Some(b) => b.end,
@@ -439,14 +369,134 @@ impl NativeLm for Gemma4 {
                 Err(_) => return Err(format!("gemma4: token id {t} outside the vocabulary")),
             }
         }
-        let logits = self
-            .text
-            .forward(x, &ple_ids, from, &mut st.cache, &st.blocks);
+        let logits = match &self.program {
+            Some(prog) => self.run_program(prog, st, &x, &ple_ids, from)?,
+            None => self
+                .text
+                .forward(x, &ple_ids, from, &mut st.cache, &st.blocks),
+        };
         st.done = stop;
         if stop > end {
             st.logits = logits.clone();
         }
         Ok(logits)
+    }
+}
+
+/// Rows per batched prefill pass on the Metal program, and the most a pass may grow to when an image
+/// block (attended bidirectionally, so whole in one pass) straddles the boundary.
+const PREFILL_ROWS: usize = 64;
+const PREFILL_MAX_ROWS: usize = 512;
+
+impl Gemma4 {
+    /// Runs rows `[from, from + ids.len())` (`x` = their embeddings, `ids` = per-layer-embedding ids,
+    /// `u32::MAX` for media rows) through the graph program inside the sequence's state; the last row's logits.
+    fn run_program(
+        &self,
+        prog: &parking_lot::Mutex<crate::graph::program::GraphProgram>,
+        st: &mut State,
+        x: &[f32],
+        ids: &[u32],
+        from: usize,
+    ) -> Result<Vec<f32>, String> {
+        let h = self.text.hidden;
+        let mut p = prog.lock();
+        std::mem::swap(&mut p.state, &mut st.program_state);
+        let mut last = Ok(Vec::new());
+        let mut at = 0;
+        while at < ids.len() && last.is_ok() {
+            let mut end = (at + PREFILL_ROWS).min(ids.len());
+            if let Some(b) = st
+                .blocks
+                .iter()
+                .find(|b| b.start < from + end && from + end < b.end)
+            {
+                end = b.end - from;
+            }
+            last = if end - at > PREFILL_MAX_ROWS {
+                Err(format!(
+                    "image block of {} rows exceeds the {PREFILL_MAX_ROWS}-row prefill chunk",
+                    end - at
+                ))
+            } else {
+                self.run_chunk(
+                    &mut p,
+                    &st.blocks,
+                    &x[at * h..end * h],
+                    &ids[at..end],
+                    from + at,
+                )
+            };
+            at = end;
+        }
+        std::mem::swap(&mut p.state, &mut st.program_state);
+        last
+    }
+
+    /// One pass over `ids.len()` consecutive rows from position `pos0`: the single-row decode program for
+    /// one row (or when the program is not one Metal segment), else the batched prefill graph.
+    fn run_chunk(
+        &self,
+        p: &mut crate::graph::program::GraphProgram,
+        blocks: &[std::ops::Range<usize>],
+        x: &[f32],
+        ids: &[u32],
+        pos0: usize,
+    ) -> Result<Vec<f32>, String> {
+        use crate::graph::Tensor;
+        let (h, m) = (self.text.hidden, ids.len());
+        let mut ple = Vec::new();
+        if let Some(pl) = &self.text.ple {
+            let (pd, nl) = (pl.dim, self.text.layers_n);
+            for &id in ids {
+                let mut e = vec![0.0f32; nl * pd];
+                let id = if (id as usize) < pl.embed.rows {
+                    id
+                } else {
+                    self.text.pad_id
+                };
+                pl.embed.get_row(id as usize, &mut e);
+                let scale = (pd as f32).sqrt();
+                e.iter_mut().for_each(|v| *v *= scale);
+                ple.extend(e);
+            }
+        }
+        let ple_row = ple.len() / m;
+        let logits = |res: Vec<Tensor>| match res.into_iter().next() {
+            Some(Tensor::F32(v)) => Ok(v),
+            _ => Err("gemma4: program did not return F32 logits".to_string()),
+        };
+        if m > 1 && p.is_single_metal() {
+            let g = self.text.to_prefill_graph(m)?;
+            let end = |pos: usize| match blocks.iter().find(|b| b.contains(&pos)) {
+                Some(b) => b.end as u32,
+                None => pos as u32 + 1,
+            };
+            let mut inputs = vec![
+                Tensor::F32(x.to_vec()),
+                Tensor::U32((pos0..pos0 + m).map(|q| q as u32).collect()),
+            ];
+            if self.text.ple.is_some() {
+                inputs.push(Tensor::F32(ple));
+            }
+            inputs.push(Tensor::U32((pos0..pos0 + m).map(end).collect()));
+            return logits(p.run_reshaped(&g, inputs)?);
+        }
+        if m > 1 && blocks.iter().any(|b| b.start < pos0 + m && pos0 < b.end) {
+            return Err("gpu-only: image blocks are attended bidirectionally, which needs the Metal program; rerun with --backend cpu".into());
+        }
+        let mut last = Vec::new();
+        for (i, emb) in x.chunks_exact(h).enumerate() {
+            let mut inputs = vec![
+                Tensor::F32(emb.to_vec()),
+                Tensor::U32(vec![(pos0 + i) as u32]),
+            ];
+            if self.text.ple.is_some() {
+                inputs.push(Tensor::F32(ple[i * ple_row..(i + 1) * ple_row].to_vec()));
+            }
+            last = logits(p.run(inputs)?)?;
+        }
+        Ok(last)
     }
 }
 
@@ -461,7 +511,9 @@ pub(crate) fn compile_gemma4_program(
         crate::graph::avenues::Family::Gemma4,
         crate::graph::avenues::resolved_backend(mode),
     )?;
-    let (graph, weights) = text.to_decode_graph().map_err(|e| format!("Gemma 4: {e}"))?;
+    let (graph, weights) = text
+        .to_decode_graph()
+        .map_err(|e| format!("Gemma 4: {e}"))?;
     crate::graph::program::GraphProgram::compile(graph, weights, mode)
         .map(|prog| Some(Arc::new(parking_lot::Mutex::new(prog))))
         .map_err(|e| format!("Gemma 4: {e}"))
