@@ -7,16 +7,17 @@
 mod audio;
 mod gguf;
 pub mod graph;
+mod moe;
 pub(crate) mod ops;
 pub mod seqcls;
 mod text;
 pub use audio::tiny::{graph as tiny_audio_graph, wav_graph as tiny_audio_wav_graph};
-pub use text::tiny_decode_graph;
+pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 pub use vision::tiny::graph as tiny_vision_graph;
 mod unified;
 mod vision;
 
-pub use gguf::load_gguf;
+pub use gguf::{gguf_decode_fixture, load_gguf};
 
 use crate::hardware::Device;
 use crate::model::hub::ModelArtifacts;
@@ -345,6 +346,7 @@ impl NativeLm for Gemma4 {
         if end <= st.done {
             return Ok(st.logits.clone()); // run ahead with an earlier chunk's image block
         }
+
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
         let stop = match st.blocks.iter().find(|b| b.start < end && end < b.end) {
             Some(b) => b.end,
@@ -375,6 +377,9 @@ impl NativeLm for Gemma4 {
         }
         let logits = match &self.program {
             Some(prog) => self.run_program(prog, st, &x, &ple_ids, from)?,
+            None if self.text.has_moe() => {
+                return Err("gemma4 MoE: host forward not implemented; the graph program runs on Metal and the CPU graph executor".into())
+            }
             None => self
                 .text
                 .forward(x, &ple_ids, from, &mut st.cache, &st.blocks),

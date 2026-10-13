@@ -2,18 +2,18 @@
 //! Kernels live in `moe.metal` (appended to the shared library, names listed in `KERNELS`).
 //! Hooks called from `ext.rs`; every function returns "not mine" for ops it does not claim.
 //!
-//! Owns: `Moe` (router → top-k softmax → expert GEMVs → weighted sum, experts any Linear weight
-//! format, unselected experts skipped by indirect dispatch), `TopKSoftmax` for any `k`, `Embedding`
-//! over F16/BF16/codec-quantized tables, and shape guards for `CausalConv1dCached` / `DeltaRule`
-//! forms the core kernels would read out of bounds.
+//! Owns: `TopK` (row top-k indices), `GatherCols`, `MoeLinear` (expert-indexed GEMV over a stacked
+//! weight bank, generated per codec by `codegen::gemv_indexed`, f32/f16/bf16 banks through
+//! pseudo-codecs), `Embedding` over F16/BF16/codec-quantized tables, and shape guards for
+//! `CausalConv1dCached` / `DeltaRule` forms the core kernels would read out of bounds.
 
-use super::super::Counted;
-use super::super::{numel, set_bytes, u32_of, GemmKernel, Planned, Session, WeightFormat, TG};
+use super::super::{numel, set_bytes, u32_of, Planned, Session, TG};
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
+use crate::graph::codegen::{gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams};
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
-use metal::{Buffer, CompileOptions, ComputePipelineState, MTLSize};
+use metal::{CompileOptions, ComputePipelineState, MTLSize};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -21,10 +21,8 @@ use std::sync::LazyLock;
 pub(super) const MSL: &str = include_str!("moe.metal");
 /// Compute functions in `moe.metal`.
 pub(super) const KERNELS: &[&str] = &[
-    "moe_topk_softmax_f32",
-    "moe_zero_f32",
-    "moe_args",
-    "moe_accum_f32",
+    "moe_topk_f32",
+    "moe_gather_cols_f32",
     "moe_embed_f16",
     "moe_embed_bf16",
 ];
@@ -40,23 +38,34 @@ pub enum Table {
 /// Steps this group adds to the executor.
 #[derive(Debug, Clone)]
 pub enum Step {
-    Moe {
-        x: ValueId,
-        router: ValueId,
-        experts: Vec<ValueId>,
-        router_fmt: WeightFormat,
-        expert_fmts: Vec<WeightFormat>,
-        m: usize,
-        d_in: usize,
-        d_out: usize,
-        n_experts: usize,
-        top_k: usize,
-    },
     TopK {
         x: ValueId,
         rows: usize,
         cols: usize,
         k: usize,
+    },
+    GatherCols {
+        x: ValueId,
+        idx: ValueId,
+        total: usize,
+        cols: usize,
+        k: usize,
+        /// `x` is one row shared by every row of `idx`.
+        shared: bool,
+    },
+    ExpertLinear {
+        x: ValueId,
+        bank: ValueId,
+        ids: ValueId,
+        /// Storage dtype of the bank (`bank_codec` reads it).
+        dtype: DType,
+        /// Rows of one expert's `[rows, cols]` matrix.
+        rows: usize,
+        cols: usize,
+        slots: usize,
+        top_k: usize,
+        experts: usize,
+        x_per_slot: bool,
     },
     Embed {
         table: ValueId,
@@ -68,11 +77,43 @@ pub enum Step {
     },
 }
 
-/// Whether the Metal executor lowers `op` for `dtype`: the output dtype for `Moe`/`TopKSoftmax`
-/// (activations are f32), the table dtype for `Embedding`.
+/// Float banks read through the same `decode8` contract as the quantized codecs: one 8-element block.
+static CODEC_F32: Codec = Codec {
+    format: QuantFormat::FP32,
+    block_elems: 8,
+    block_bytes: 32,
+    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const float* f = (device const float*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = f[i];\n}\n",
+};
+static CODEC_F16: Codec = Codec {
+    format: QuantFormat::FP16,
+    block_elems: 8,
+    block_bytes: 16,
+    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const half* h = (device const half*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = float(h[i]);\n}\n",
+};
+static CODEC_BF16: Codec = Codec {
+    format: QuantFormat::BF16,
+    block_elems: 8,
+    block_bytes: 16,
+    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const ushort* h = (device const ushort*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = as_type<float>(uint(h[i]) << 16);\n}\n",
+};
+
+/// How the expert GEMV reads a bank stored as `dtype`: every codec format, plus f32/f16/bf16.
+fn bank_codec(dtype: DType) -> Option<&'static Codec> {
+    match dtype {
+        DType::F32 => Some(&CODEC_F32),
+        DType::F16 => Some(&CODEC_F16),
+        DType::BF16 => Some(&CODEC_BF16),
+        DType::Quant(f) => codec(f),
+        DType::U32 => None,
+    }
+}
+
+/// Whether the Metal executor lowers `op` for `dtype`: the activation dtype for `TopK`/`GatherCols`,
+/// the bank dtype for `MoeLinear`, the table dtype for `Embedding`.
 pub(super) fn supports(op: &Op, dtype: DType) -> bool {
     match op {
-        Op::Moe { .. } | Op::TopKSoftmax { .. } => dtype == DType::F32,
+        Op::TopK { .. } | Op::GatherCols => dtype == DType::F32,
+        Op::MoeLinear { .. } => bank_codec(dtype).is_some(),
         Op::Embedding => match dtype {
             DType::F16 | DType::BF16 => true,
             DType::Quant(f) => codec(f).is_some(),
@@ -80,31 +121,6 @@ pub(super) fn supports(op: &Op, dtype: DType) -> bool {
         },
         _ => false,
     }
-}
-
-/// How the executor reads a Linear-style weight of `dtype` with `k` columns; mirrors `Op::Linear`'s
-/// planner (NVFP4/Jesse need per-weight aux buffers and are not claimed).
-fn weight_format(dtype: DType, k: usize) -> Option<WeightFormat> {
-    use QuantFormat as Q;
-    let (fmt, align) = match dtype {
-        DType::F32 => return Some(WeightFormat::F32),
-        DType::BF16 => return Some(WeightFormat::BF16),
-        DType::F16 => return Some(WeightFormat::F16),
-        DType::Quant(Q::GGUF_Q8_0) => (WeightFormat::Q8_0, 32),
-        DType::Quant(Q::GGUF_Q4_0) => (WeightFormat::Q4_0, 32),
-        DType::Quant(Q::GGUF_IQ4_XS) => (WeightFormat::IQ4_XS, 256),
-        DType::Quant(Q::GGUF_IQ2_M | Q::GGUF_IQ2_S) => (WeightFormat::IQ2_M, 256),
-        DType::Quant(Q::GGUF_Q4_K_M) => (WeightFormat::Q4_K, 256),
-        DType::Quant(Q::GGUF_Q2_K) => (WeightFormat::Q2_K, 256),
-        // `gemv_iq3_s` disagrees with the CPU dequantizer (rel err ~0.5 on random blocks, plain Linear too): not claimed.
-        DType::Quant(Q::GGUF_IQ3_S) => return None,
-        DType::Quant(f) => {
-            let c = codec(f)?;
-            (WeightFormat::Gen(f), c.block_elems as usize)
-        }
-        DType::U32 => return None,
-    };
-    (k % align == 0).then_some(fmt)
 }
 
 fn shape2(g: &Graph, v: ValueId) -> Option<[usize; 2]> {
@@ -129,15 +145,89 @@ pub(super) fn plan(
             .ok_or_else(|| format!("node '{name}': {} needs operand {k}", node.op.name()))
     };
     match &node.op {
-        Op::Moe { experts, top_k } => Some(plan_moe(g, node, *experts, *top_k)),
-        Op::TopKSoftmax { k, .. } => Some((|| {
+        Op::TopK { k } => Some((|| {
             let x = arg(0)?;
             let cols = g.value(x).shape.last().copied().unwrap_or(0);
-            if *k == 0 || cols == 0 {
-                return Err(format!("node '{name}': TopKSoftmax needs k >= 1 and a static row width"));
+            if *k == 0 || *k > cols {
+                return Err(format!("node '{name}': TopK needs 1 <= k <= the row width {cols}, got k={k}"));
             }
             let n = numel(g, x)?;
-            Ok(PlanOut::Step(Step::TopK { x, rows: n / cols, cols, k: *k }, n))
+            u32_of(*k)?;
+            Ok(PlanOut::Step(Step::TopK { x, rows: n / cols, cols, k: *k }, n / cols * k))
+        })()),
+        Op::GatherCols => Some((|| {
+            let (x, idx) = (arg(0)?, arg(1)?);
+            let (cols, k) = (
+                g.value(x).shape.last().copied().unwrap_or(0),
+                g.value(idx).shape.last().copied().unwrap_or(0),
+            );
+            let total = numel(g, idx)?;
+            let x_rows = numel(g, x)?.checked_div(cols).unwrap_or(0);
+            if cols == 0 || k == 0 || (x_rows != total / k && x_rows != 1) || g.value(idx).dtype != DType::U32 {
+                return Err(format!(
+                    "node '{name}': GatherCols needs x [rows, n] (or one shared row) and u32 idx [rows, k]"
+                ));
+            }
+            u32_of(total)?;
+            Ok(PlanOut::Step(Step::GatherCols { x, idx, total, cols, k, shared: x_rows == 1 }, total))
+        })()),
+        Op::MoeLinear { experts, top_k } => Some((|| {
+            if node.inputs.len() != 3 {
+                return Err(format!("node '{name}': MoeLinear needs [x, bank, ids], got {} operands", node.inputs.len()));
+            }
+            let (x, bank, ids) = (arg(0)?, arg(1)?, arg(2)?);
+            if *experts == 0 || *top_k == 0 {
+                return Err(format!("node '{name}': MoeLinear needs experts >= 1 and top_k >= 1"));
+            }
+            let (Some([x_rows, cols]), Some([bank_rows, bank_cols])) = (shape2(g, x), shape2(g, bank)) else {
+                return Err(format!("node '{name}': MoeLinear needs x [m, in] and a bank [experts * out, in]"));
+            };
+            if bank_cols != cols || bank_rows % experts != 0 || bank_rows == 0 {
+                return Err(format!(
+                    "node '{name}': bank [{bank_rows}, {bank_cols}] is not {experts} stacked [out, {cols}] matrices"
+                ));
+            }
+            let slots = numel(g, ids)?;
+            if g.value(ids).dtype != DType::U32 || slots % top_k != 0 {
+                return Err(format!("node '{name}': ids must be u32 [m, {top_k}]"));
+            }
+            if x_rows != slots && x_rows * top_k != slots {
+                return Err(format!(
+                    "node '{name}': x has {x_rows} rows, neither m nor m * {top_k} for {slots} slots"
+                ));
+            }
+            let rows = bank_rows / experts;
+            if numel(g, node.outputs[0])? != slots * rows {
+                return Err(format!("node '{name}': output must be [{slots}, {rows}]"));
+            }
+            let dtype = g.value(bank).dtype;
+            let c = bank_codec(dtype).ok_or_else(|| {
+                format!("node '{name}': bank '{}' ({dtype:?}) has no GEMV codec", g.value(bank).name)
+            })?;
+            if cols % c.block_elems as usize != 0 {
+                return Err(format!(
+                    "node '{name}': {cols} columns are not a multiple of the {:?} block ({})",
+                    c.format, c.block_elems
+                ));
+            }
+            for n in [rows, cols, slots, *top_k, *experts] {
+                u32_of(n)?;
+            }
+            Ok(PlanOut::Step(
+                Step::ExpertLinear {
+                    x,
+                    bank,
+                    ids,
+                    dtype,
+                    rows,
+                    cols,
+                    slots,
+                    top_k: *top_k,
+                    experts: *experts,
+                    x_per_slot: x_rows == slots,
+                },
+                slots * rows,
+            ))
         })()),
         Op::Embedding => {
             let table = node.inputs.first().copied()?;
@@ -212,92 +302,12 @@ pub(super) fn plan(
     }
 }
 
-fn plan_moe(g: &Graph, node: &Node, experts: usize, top_k: usize) -> Result<PlanOut<Step>, String> {
-    let name = &node.name;
-    if node.inputs.len() < 3 {
-        return Err(format!(
-            "node '{name}': Moe needs [x, router, expert...], got {} operands",
-            node.inputs.len()
-        ));
-    }
-    if experts == 0 || top_k == 0 {
-        return Err(format!(
-            "node '{name}': Moe needs experts >= 1 and top_k >= 1"
-        ));
-    }
-    let out = node.outputs[0];
-    let Some([m, d_out]) = shape2(g, out) else {
-        return Err(format!("node '{name}': Moe output must be [m, d_out]"));
-    };
-    let (x, router) = (node.inputs[0], node.inputs[1]);
-    let expert_ids: Vec<ValueId> = node.inputs[2..].iter().copied().take(experts).collect();
-    let Some([r_rows, d_in]) = shape2(g, router) else {
-        return Err(format!(
-            "node '{name}': router weight is not [experts, d_in]"
-        ));
-    };
-    if r_rows != experts || numel(g, x)? != m * d_in {
-        return Err(format!(
-            "node '{name}': x of {} elements and router [{r_rows}, {d_in}] do not match {m} rows x {experts} experts",
-            numel(g, x)?
-        ));
-    }
-    let fmt = |w: ValueId, rows: usize| -> Result<WeightFormat, String> {
-        let val = g.value(w);
-        if val.shape[..] != [rows, d_in] {
-            return Err(format!(
-                "node '{name}': weight '{}' is {:?}, expected [{rows}, {d_in}]",
-                val.name, val.shape
-            ));
-        }
-        weight_format(val.dtype, d_in).ok_or_else(|| {
-            format!(
-                "node '{name}': weight '{}' ({:?}) has no packed GEMV for {d_in} columns",
-                val.name, val.dtype
-            )
-        })
-    };
-    let router_fmt = fmt(router, experts)?;
-    let expert_fmts = expert_ids
-        .iter()
-        .map(|&w| fmt(w, d_out))
-        .collect::<Result<Vec<_>, _>>()?;
-    // One indirect-argument geometry serves every expert: F32 uses the GEMM tiles, the rest the packed GEMV grid.
-    if expert_fmts
-        .iter()
-        .any(|f| (*f == WeightFormat::F32) != (expert_fmts[0] == WeightFormat::F32))
-    {
-        return Err(format!(
-            "node '{name}': experts mix f32 and packed weight formats"
-        ));
-    }
-    Ok(PlanOut::Step(
-        Step::Moe {
-            x,
-            router,
-            experts: expert_ids,
-            router_fmt,
-            expert_fmts,
-            m,
-            d_in,
-            d_out,
-            n_experts: experts,
-            top_k,
-        },
-        m * d_out,
-    ))
-}
-
 /// Every value the step reads (drives arena liveness and barriers).
 pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match st {
-        Step::Moe {
-            x, router, experts, ..
-        } => [*x, *router]
-            .into_iter()
-            .chain(experts.iter().copied())
-            .collect(),
         Step::TopK { x, .. } => vec![*x],
+        Step::GatherCols { x, idx, .. } => vec![*x, *idx],
+        Step::ExpertLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
         Step::Embed { table, ids, .. } => vec![*table, *ids],
     }
 }
@@ -305,84 +315,11 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
 /// Operands allowed to be non-f32 (u32 ids, packed weights).
 pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
     match st {
-        Step::Moe { x, .. } => v != *x,
         Step::TopK { .. } => false,
+        Step::GatherCols { idx, .. } => v == *idx,
+        Step::ExpertLinear { x, .. } => v != *x,
         Step::Embed { .. } => true,
     }
-}
-
-/// Threadgroups and size for one `[m, rows] = x[m, cols] · wᵀ` dispatch plus the F32 GEMM kernel it uses.
-struct Geometry {
-    groups: MTLSize,
-    threads: u64,
-    kind: Option<GemmKernel>,
-}
-
-fn geometry(sess: &Session, fmt: WeightFormat, m: usize, rows: usize, cols: usize) -> Geometry {
-    if fmt == WeightFormat::F32 {
-        let kind = sess
-            .gemm
-            .unwrap_or_else(|| sess.rt.profile.gemm_for([m, rows, cols]));
-        let (_, groups, threads) = kind.spec(m, rows);
-        Geometry {
-            groups,
-            threads,
-            kind: Some(kind),
-        }
-    } else {
-        Geometry {
-            groups: MTLSize::new((rows as u64).div_ceil(16), m as u64, 1),
-            threads: 256,
-            kind: None,
-        }
-    }
-}
-
-/// `out[m, rows] = x[m, cols] · w[rows, cols]ᵀ` through the existing GEMM / packed-GEMV kernels;
-/// `indirect` takes the threadgroup counts from a GPU-written argument triple instead.
-#[allow(clippy::too_many_arguments)]
-fn matvec(
-    sess: &Session,
-    enc: &Counted,
-    geo: &Geometry,
-    fmt: WeightFormat,
-    x: (&Buffer, usize),
-    w: (&Buffer, usize),
-    out: (&Buffer, usize),
-    [m, rows, cols]: [usize; 3],
-    indirect: Option<(&Buffer, usize)>,
-) -> Result<(), String> {
-    if let Some(kind) = geo.kind {
-        let (prefix, ..) = kind.spec(m, rows);
-        enc.set_compute_pipeline_state(sess.rt.pso(&format!("{prefix}_none"))?);
-        for (i, (b, off)) in [x, w, out, out, out].into_iter().enumerate() {
-            enc.set_buffer(i as u64, Some(b), off as u64);
-        }
-        set_bytes(enc, 5, &[u32_of(m)?, u32_of(rows)?, u32_of(cols)?, 0u32]);
-    } else {
-        let pso = sess.gemv_pso(fmt)?;
-        enc.set_compute_pipeline_state(&pso);
-        for (i, (b, off)) in [w, x, out].into_iter().enumerate() {
-            enc.set_buffer(i as u64, Some(b), off as u64);
-        }
-        set_bytes(
-            enc,
-            3,
-            &[u32_of(rows)?, u32_of(cols)?, u32_of(m)?, 0u32, 0u32],
-        );
-        enc.set_buffer(4, Some(out.0), out.1 as u64);
-        enc.set_buffer(5, Some(out.0), out.1 as u64);
-    }
-    let tg = MTLSize::new(geo.threads, 1, 1);
-    match indirect {
-        None => enc.dispatch_thread_groups(geo.groups, tg),
-        Some((b, off)) => enc.dispatch_thread_groups_indirect(b, off as u64, tg),
-    }
-    Ok(())
-}
-
-fn align(n: usize) -> usize {
-    n.div_ceil(256) * 256
 }
 
 /// Generated gather for one codec: one thread per 8-element sub-block of one token's row.
@@ -433,15 +370,76 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
     Ok(pso)
 }
 
+/// Rows per simdgroup of the expert GEMV.
+const ROWS_PER_SG: usize = 2;
+
+/// Per (device, codec) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat), ComputePipelineState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, String> {
+    let device = &sess.rt.device;
+    let key = (device.registry_id(), c.format);
+    if let Some(p) = MOE_GEMV.lock().get(&key) {
+        return Ok(p.clone());
+    }
+    let params = GemvParams { rows_per_sg: ROWS_PER_SG, ..Default::default() };
+    let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{}", gemv_indexed(c, params));
+    let opts = CompileOptions::new();
+    opts.set_fast_math_enabled(false);
+    let lib = device
+        .new_library_with_source(&src, &opts)
+        .map_err(|e| format!("generated {:?} expert GEMV failed to compile: {e}", c.format))?;
+    let func = lib.get_function(&gemv_indexed_name(c, params), None)?;
+    let pso = device.new_compute_pipeline_state_with_function(&func)?;
+    MOE_GEMV.lock().insert(key, pso.clone());
+    Ok(pso)
+}
+
+
 pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<(), String> {
     let (enc, rt) = (e.enc, &sess.rt);
     match st {
         Step::TopK { x, rows, cols, k } => {
-            enc.set_compute_pipeline_state(rt.pso("moe_topk_softmax_f32")?);
+            enc.set_compute_pipeline_state(rt.pso("moe_topk_f32")?);
             e.bind(0, *x);
             e.bind(1, s.out);
             set_bytes(enc, 2, &[u32_of(*rows)?, u32_of(*cols)?, u32_of(*k)?]);
-            e.grid1(*rows);
+            enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        Step::GatherCols { x, idx, total, cols, k, shared } => {
+            enc.set_compute_pipeline_state(rt.pso("moe_gather_cols_f32")?);
+            e.bind(0, *x);
+            e.bind(1, *idx);
+            e.bind(2, s.out);
+            set_bytes(enc, 3, &[u32_of(*total)?, u32_of(*cols)?, u32_of(*k)?, *shared as u32]);
+            e.grid1(*total);
+        }
+        Step::ExpertLinear { x, bank, ids, dtype, rows, cols, slots, top_k, experts, x_per_slot } => {
+            let c = bank_codec(*dtype).ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
+            let pso = moe_gemv_pso(sess, c)?;
+            enc.set_compute_pipeline_state(&pso);
+            e.bind(0, *bank);
+            e.bind(1, *x);
+            e.bind(2, s.out);
+            set_bytes(
+                enc,
+                3,
+                &[
+                    u32_of(*rows)?,
+                    u32_of(*cols)?,
+                    u32_of(*slots)?,
+                    u32_of(*top_k)?,
+                    u32_of(*experts)?,
+                    *x_per_slot as u32,
+                ],
+            );
+            e.bind(4, *ids);
+            let rows_per_tg = gemv_rows_per_tg(GemvParams { rows_per_sg: ROWS_PER_SG, ..Default::default() });
+            enc.dispatch_thread_groups(
+                MTLSize::new((*rows as u64).div_ceil(rows_per_tg as u64), *slots as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
         }
         Step::Embed {
             table,
@@ -481,108 +479,6 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 MTLSize::new(((*d / cols_per_thread) as u64).div_ceil(TG), *n as u64, 1),
                 MTLSize::new(TG, 1, 1),
             );
-        }
-        Step::Moe {
-            x,
-            router,
-            experts,
-            router_fmt,
-            expert_fmts,
-            m,
-            d_in,
-            d_out,
-            n_experts,
-            top_k,
-        } => {
-            let (m, d_in, d_out, ne) = (*m, *d_in, *d_out, *n_experts);
-            let actual = experts.len();
-            let (off_logits, off_probs) = (0, align(m * ne * 4));
-            let off_tmp = off_probs * 2;
-            let off_args = off_tmp + align(m * d_out * 4);
-            let total = off_args + align(actual * 24);
-            // ponytail: shares the megakernel's scratch buffer; steps run in order on one serial encoder.
-            let mut guard = sess.mlp_scratch.lock();
-            if guard.as_ref().is_none_or(|b| (b.length() as usize) < total) {
-                *guard = Some(super::super::new_shared_buffer(&rt.device, total.max(256))?);
-            }
-            let scratch = guard.as_ref().ok_or("moe scratch missing")?;
-            let (xl, out) = ((e.loc)(*x), (e.loc)(s.out));
-
-            // 1. router logits, 2. top-k softmax -> probs
-            let geo_r = geometry(sess, *router_fmt, m, ne, d_in);
-            matvec(
-                sess,
-                enc,
-                &geo_r,
-                *router_fmt,
-                xl,
-                (e.loc)(*router),
-                (scratch, off_logits),
-                [m, ne, d_in],
-                None,
-            )?;
-            enc.set_compute_pipeline_state(rt.pso("moe_topk_softmax_f32")?);
-            enc.set_buffer(0, Some(scratch), off_logits as u64);
-            enc.set_buffer(1, Some(scratch), off_probs as u64);
-            set_bytes(enc, 2, &[u32_of(m)?, u32_of(ne)?, u32_of(*top_k)?]);
-            e.grid1(m);
-            // 3. out = 0
-            enc.set_compute_pipeline_state(rt.pso("moe_zero_f32")?);
-            enc.set_buffer(0, Some(out.0), out.1 as u64);
-            set_bytes(enc, 1, &u32_of(m * d_out)?);
-            e.grid1(m * d_out);
-            // 4. per-expert indirect arguments
-            let geo = geometry(sess, expert_fmts[0], m, d_out, d_in);
-            let acc_x = (d_out as u64).div_ceil(TG) as u32;
-            enc.set_compute_pipeline_state(rt.pso("moe_args")?);
-            enc.set_buffer(0, Some(scratch), off_probs as u64);
-            enc.set_buffer(1, Some(scratch), off_args as u64);
-            set_bytes(
-                enc,
-                2,
-                &[
-                    u32_of(m)?,
-                    u32_of(ne)?,
-                    u32_of(actual)?,
-                    geo.groups.width as u32,
-                    geo.groups.height as u32,
-                    geo.groups.depth as u32,
-                    acc_x,
-                    u32_of(m)?,
-                    1,
-                ],
-            );
-            e.grid1(actual);
-            // 5. selected experts: tmp = x · Wᵀ, out += p · tmp
-            // ponytail: prefill (m > 1) reads each selected expert once per row; a batched expert GEMM is the upgrade.
-            for (ei, (&w, &fmt)) in experts.iter().zip(expert_fmts).enumerate() {
-                let args = off_args + ei * 24;
-                matvec(
-                    sess,
-                    enc,
-                    &geo,
-                    fmt,
-                    xl,
-                    (e.loc)(w),
-                    (scratch, off_tmp),
-                    [m, d_out, d_in],
-                    Some((scratch, args)),
-                )?;
-                enc.set_compute_pipeline_state(rt.pso("moe_accum_f32")?);
-                enc.set_buffer(0, Some(out.0), out.1 as u64);
-                enc.set_buffer(1, Some(scratch), off_tmp as u64);
-                enc.set_buffer(2, Some(scratch), off_probs as u64);
-                set_bytes(
-                    enc,
-                    3,
-                    &[u32_of(m)?, u32_of(d_out)?, u32_of(ne)?, u32_of(ei)?],
-                );
-                enc.dispatch_thread_groups_indirect(
-                    scratch,
-                    (args + 12) as u64,
-                    MTLSize::new(TG, 1, 1),
-                );
-            }
         }
     }
     Ok(())
@@ -668,6 +564,27 @@ mod tests {
         raw
     }
 
+    /// Random blocks of `f` that decode to finite, moderate values on the CPU (formats with unknown
+    /// scale fields, like the repacked ones, get bad blocks redrawn).
+    fn sane_blocks(f: Q, n_blocks: usize, seed: u64) -> Vec<u8> {
+        let (_, _, dequant) = crate::model::layers::gguf_block_codec(f).expect("CPU dequantizer");
+        let be = crate::graph::codec::codec(f).expect("codec").block_elems as usize;
+        let mut out = Vec::new();
+        for b in 0..n_blocks {
+            for attempt in 0..1000u64 {
+                let blk = random_blocks(f, 1, true, seed * 1_000_003 + b as u64 * 1009 + attempt);
+                let mut y = vec![0.0f32; be];
+                dequant(&blk, &mut y);
+                if y.iter().all(|v| v.is_finite() && v.abs() < 4096.0) {
+                    out.extend(blk);
+                    break;
+                }
+                assert!(attempt < 999, "{f:?}: no sane random block found");
+            }
+        }
+        out
+    }
+
     /// A `[rows, cols]` weight in `fmt` with its graph dtype.
     fn weight(fmt: Fmt, rows: usize, cols: usize, seed: u64) -> (DType, Tensor) {
         let vals = rand(rows * cols, seed);
@@ -684,7 +601,7 @@ mod tests {
             Fmt::Q(f) => {
                 let be = crate::graph::codec::codec(f).expect("codec").block_elems as usize;
                 assert_eq!(cols % be, 0);
-                let raw = random_blocks(f, rows * cols / be, true, seed);
+                let raw = sane_blocks(f, rows * cols / be, seed);
                 let q = QuantizedWeight::GgufQuantized {
                     format: f,
                     raw_data: raw.into(),
@@ -696,62 +613,122 @@ mod tests {
         }
     }
 
-    // ---- TopKSoftmax ----
+    // ---- TopK / GatherCols ----
 
-    fn topk_graph(rows: usize, cols: usize, k: usize) -> Graph {
+    /// (CPU reference, Metal) indices; the Metal output carries u32 bits in its f32 slots.
+    fn topk_both(x: Vec<f32>, rows: usize, cols: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
         let mut g = Graph::new();
-        let x = g.input("x", vec![rows, cols], DType::F32);
-        let y = g.add(
-            "tk",
-            Op::TopKSoftmax { axis: -1, k },
-            &[x],
-            vec![rows, cols],
-            DType::F32,
-        );
+        let xv = g.input("x", vec![rows, cols], DType::F32);
+        let y = g.add("tk", Op::TopK { k }, &[xv], vec![rows, k], DType::U32);
         g.output(y);
-        g
+        let inputs = vec![Tensor::F32(x)];
+        let want = match cpu::run_stateless(&g, &Weights::new(), inputs.clone())
+            .unwrap()
+            .remove(0)
+        {
+            Tensor::U32(v) => v,
+            t => panic!("TopK must produce u32 indices, got {t:?}"),
+        };
+        let got = Session::new(rt(), &Weights::new())
+            .unwrap()
+            .run(&g, inputs)
+            .unwrap()
+            .remove(0)
+            .into_f32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        (want, got)
     }
 
     #[test]
-    fn topk_softmax_matches_cpu_for_any_k() {
-        // k beyond 32 is where the core kernel's fixed top-32 buffer truncates; k >= cols is a plain softmax.
+    fn topk_orders_by_value_then_lower_index() {
+        let (want, got) = topk_both(vec![1.0, 3.0, 3.0, 2.0, -0.0, 0.0, f32::NAN, 5.0], 2, 4, 3);
+        assert_eq!(want, vec![1, 2, 3, 3, 0, 1], "ties and signed zeros keep the lower index first");
+        assert_eq!(got, want);
+        // NaN ranks below every number: it is picked last even when k covers the whole row.
+        let (want, got) = topk_both(vec![f32::NAN, 1.0, f32::NAN, 2.0], 1, 4, 4);
+        assert_eq!(want, vec![3, 1, 0, 2]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn topk_matches_cpu_across_shapes_and_ties() {
         for (rows, cols, k) in [
             (1, 1, 1),
-            (1, 2, 1),
-            (3, 4, 2),
-            (5, 37, 8),
-            (4, 129, 33),
-            (2, 64, 40),
-            (3, 10, 10),
-            (3, 10, 17),
-            (7, 300, 64),
-            (1, 256, 1),
+            (1, 2, 2),
+            (3, 8, 3),
+            (4, 128, 8),
+            (2, 129, 129),
+            (1, 1000, 64),
+            (5, 300, 1),
+            (2, 2048, 8),
+            (7, 37, 37),
         ] {
-            let x: Vec<f32> = rand(rows * cols, (rows * 31 + cols) as u64)
-                .iter()
-                .map(|v| v * 4.0)
-                .collect();
-            let (want, got) = both(
-                &topk_graph(rows, cols, k),
-                &Weights::new(),
-                vec![Tensor::F32(x)],
-            );
-            let nz = want
-                .chunks(cols)
-                .all(|r| r.iter().filter(|&&v| v != 0.0).count() == k.min(cols));
-            assert!(nz, "reference keeps k entries");
-            let err = rel_err(&want, &got);
-            assert!(err < 1e-5, "topk {rows}x{cols} k={k}: {err}");
+            let seed = (rows * 31 + cols) as u64;
+            let distinct = rand(rows * cols, seed);
+            // A handful of levels: most values tie.
+            let tied: Vec<f32> = distinct.iter().map(|v| (v * 3.0).round()).collect();
+            let constant = vec![0.5f32; rows * cols];
+            for (name, x) in [("distinct", distinct), ("tied", tied), ("constant", constant)] {
+                let (want, got) = topk_both(x, rows, cols, k);
+                assert_eq!(got, want, "topk {name} {rows}x{cols} k={k}");
+            }
         }
     }
 
     #[test]
-    fn topk_softmax_rejects_zero_k() {
-        let e = Session::new(rt(), &Weights::new())
-            .unwrap()
-            .run(&topk_graph(2, 4, 0), vec![Tensor::F32(vec![0.0; 8])])
-            .unwrap_err();
-        assert!(e.contains("tk"), "{e}");
+    fn topk_rejects_bad_k() {
+        for k in [0, 5] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![2, 4], DType::F32);
+            let y = g.add("tk", Op::TopK { k }, &[x], vec![2, k.max(1)], DType::U32);
+            g.output(y);
+            let inputs = vec![Tensor::F32(vec![0.0; 8])];
+            let e = Session::new(rt(), &Weights::new())
+                .unwrap()
+                .run(&g, inputs.clone())
+                .unwrap_err();
+            assert!(e.contains("tk"), "{e}");
+            assert!(cpu::run_stateless(&g, &Weights::new(), inputs).unwrap_err().contains("tk"));
+        }
+    }
+
+    #[test]
+    fn gather_cols_follows_topk_indices() {
+        for (rows, cols, k) in [(1, 8, 3), (4, 100, 8), (3, 37, 37)] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![rows, cols], DType::F32);
+            let ids = g.add("ids", Op::TopK { k }, &[x], vec![rows, k], DType::U32);
+            let y = g.add("top", Op::GatherCols, &[x, ids], vec![rows, k], DType::F32);
+            g.output(y);
+            let xs = rand(rows * cols, 99 + cols as u64);
+            let (want, got) = both(&g, &Weights::new(), vec![Tensor::F32(xs.clone())]);
+            assert_eq!(want, got);
+            for (r, row) in want.chunks(k).enumerate() {
+                let mut sorted = xs[r * cols..(r + 1) * cols].to_vec();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                assert_eq!(row, &sorted[..k], "row {r} holds the k largest values, descending");
+            }
+        }
+    }
+
+    #[test]
+    fn gather_cols_shares_a_single_row() {
+        // One row of per-expert scales indexed by the ids of three tokens.
+        let (n, e, k) = (3, 8, 2);
+        let mut g = Graph::new();
+        let table = g.input("table", vec![1, e], DType::F32);
+        let ids = g.input("ids", vec![n, k], DType::U32);
+        let y = g.add("scale", Op::GatherCols, &[table, ids], vec![n, k], DType::F32);
+        g.output(y);
+        let table = rand(e, 5);
+        let ids = vec![0u32, 7, 3, 3, 6, 1];
+        let inputs = vec![Tensor::F32(table.clone()), Tensor::U32(ids.clone())];
+        let (want, got) = both(&g, &Weights::new(), inputs);
+        assert_eq!(want, ids.iter().map(|&i| table[i as usize]).collect::<Vec<_>>());
+        assert_eq!(got, want);
     }
 
     // ---- Embedding ----
@@ -875,290 +852,194 @@ mod tests {
         assert!(e.contains("block"), "{e}");
     }
 
-    // ---- Moe ----
+    // ---- MoeLinear ----
 
-    struct MoeCase {
-        m: usize,
-        d_in: usize,
-        d_out: usize,
+    /// `(CPU executor, Metal)` outputs of one `MoeLinear` over a random `[experts * rows, cols]` bank;
+    /// `x_rows` is `ids.len() / top_k` (broadcast) or `ids.len()` (one row per slot).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_both(
+        fmt: Fmt,
+        x_rows: usize,
+        cols: usize,
+        rows: usize,
         experts: usize,
         top_k: usize,
-        given: usize,
-        router: Fmt,
-        fmts: Vec<Fmt>,
-    }
-
-    fn moe_graph(c: &MoeCase, seed: u64) -> (Graph, Weights, Vec<Tensor>) {
+        ids: Vec<u32>,
+        seed: u64,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let slots = ids.len();
+        let (dt, bank) = weight(fmt, experts * rows, cols, seed);
         let mut g = Graph::new();
-        let mut w = Weights::new();
-        let x = g.input("x", vec![c.m, c.d_in], DType::F32);
-        let (dt, t) = weight(c.router, c.experts, c.d_in, seed);
-        let r = g.weight("router", vec![c.experts, c.d_in], dt);
-        w.insert("router", t);
-        let mut ins = vec![x, r];
-        for e in 0..c.given {
-            let (dt, t) = weight(
-                c.fmts[e % c.fmts.len()],
-                c.d_out,
-                c.d_in,
-                seed + 100 + e as u64,
-            );
-            ins.push(g.weight(format!("e{e}"), vec![c.d_out, c.d_in], dt));
-            w.insert(format!("e{e}"), t);
-        }
+        let x = g.input("x", vec![x_rows, cols], DType::F32);
+        let b = g.weight("bank", vec![experts * rows, cols], dt);
+        let idv = g.input("ids", vec![slots / top_k, top_k], DType::U32);
         let y = g.add(
             "moe",
-            Op::Moe {
-                experts: c.experts,
-                top_k: c.top_k,
-            },
-            &ins,
-            vec![c.m, c.d_out],
+            Op::MoeLinear { experts, top_k },
+            &[x, b, idv],
+            vec![slots, rows],
             DType::F32,
         );
         g.output(y);
-        (g, w, vec![Tensor::F32(rand(c.m * c.d_in, seed + 7))])
-    }
-
-    /// (CPU executor on the lowered graph, Metal on the `Moe` node itself).
-    fn moe_both(c: &MoeCase, seed: u64) -> (Vec<f32>, Vec<f32>) {
-        let (g, w, inputs) = moe_graph(c, seed);
-        let mut lowered = g.clone();
-        crate::graph::lower_moe_pass(&mut lowered).unwrap();
-        let want = cpu::run_stateless(&lowered, &w, inputs.clone())
-            .unwrap()
-            .remove(0)
-            .into_f32()
-            .unwrap();
-        let got = Session::new(rt(), &w)
-            .unwrap()
-            .run(&g, inputs)
-            .unwrap()
-            .remove(0)
-            .into_f32()
-            .unwrap();
-        assert_eq!(got.len(), want.len());
-        (want, got)
-    }
-
-    fn check(c: &MoeCase, seed: u64) {
-        let (want, got) = moe_both(c, seed);
-        let err = rel_err(&want, &got);
-        assert!(
-            err < 1e-4,
-            "moe m={} {}->{} E={} k={} router {:?} experts {:?}: {err}",
-            c.m,
-            c.d_in,
-            c.d_out,
-            c.experts,
-            c.top_k,
-            c.router,
-            c.fmts
-        );
+        let mut w = Weights::new();
+        w.insert("bank", bank);
+        both(&g, &w, vec![Tensor::F32(rand(x_rows * cols, seed + 7)), Tensor::U32(ids)])
     }
 
     #[test]
-    fn moe_f32_shapes_match_cpu() {
-        for (i, (m, d_in, d_out, experts, top_k, given)) in [
-            (1, 16, 8, 4, 2, 4),
-            (3, 37, 29, 8, 3, 8),
-            (17, 64, 33, 6, 6, 6), // top_k == experts: every expert runs for every row
-            (1, 129, 1, 5, 1, 5),
-            (4, 32, 16, 8, 20, 8),   // top_k > experts clamps
-            (2, 24, 40, 4, 2, 3),    // fewer expert weights than router columns
-            (37, 8, 129, 12, 4, 12), // prefill-sized, d_out not a tile multiple
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            check(
-                &MoeCase {
-                    m,
-                    d_in,
-                    d_out,
-                    experts,
-                    top_k,
-                    given,
-                    router: Fmt::F32,
-                    fmts: vec![Fmt::F32],
-                },
-                i as u64 + 1,
-            );
-        }
-    }
-
-    #[test]
-    fn moe_half_and_mixed_packed_experts_match_cpu() {
-        for (i, fmts) in [
-            vec![Fmt::F16],
-            vec![Fmt::BF16],
-            vec![
-                Fmt::F16,
-                Fmt::BF16,
-                Fmt::Q(Q::GGUF_Q4_0),
-                Fmt::Q(Q::GGUF_Q8_0),
-            ],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for m in [1, 3, 20] {
-                check(
-                    &MoeCase {
-                        m,
-                        d_in: 64,
-                        d_out: 19,
-                        experts: 6,
-                        top_k: 2,
-                        given: 6,
-                        router: Fmt::F32,
-                        fmts: fmts.clone(),
-                    },
-                    50 + i as u64,
-                );
-            }
-        }
-        check(
-            &MoeCase {
-                m: 2,
-                d_in: 32,
-                d_out: 8,
-                experts: 4,
-                top_k: 2,
-                given: 4,
-                router: Fmt::F16,
-                fmts: vec![Fmt::BF16],
-            },
-            60,
-        );
-    }
-
-    #[test]
-    fn moe_quantized_experts_match_cpu() {
-        for (i, f) in [
-            Q::GGUF_Q4_0,
-            Q::GGUF_Q8_0,
-            Q::GGUF_Q4_K_M,
-            Q::GGUF_Q2_K,
-            Q::GGUF_IQ4_XS,
-            Q::GGUF_IQ2_M,
-            Q::GGUF_TQ2_0,
-            Q::GGUF_Q6_K,
-            Q::GGUF_Q5_0,
-            Q::GGUF_IQ4_NL,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let d_in = if matches!(
-                f,
-                Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_Q5_0 | Q::GGUF_IQ4_NL
-            ) {
-                96
-            } else {
-                512
+    fn moe_linear_matches_cpu_for_every_format() {
+        let mut fmts = vec![Fmt::F32, Fmt::F16, Fmt::BF16];
+        fmts.extend(crate::graph::codec::formats().into_iter().map(Fmt::Q));
+        let (experts, top_k, rows) = (6, 3, 19);
+        let ids = vec![4, 0, 5, 2, 2, 1];
+        for (i, fmt) in fmts.iter().enumerate() {
+            let cols = match fmt {
+                Fmt::Q(f) => {
+                    let be = crate::graph::codec::codec(*f).expect("codec").block_elems as usize;
+                    (512 / be).max(1) * be
+                }
+                _ => 64,
             };
-            for m in [1, 3] {
-                check(
-                    &MoeCase {
-                        m,
-                        d_in,
-                        d_out: 19,
-                        experts: 5,
-                        top_k: 2,
-                        given: 5,
-                        router: Fmt::F32,
-                        fmts: vec![Fmt::Q(f)],
-                    },
-                    80 + i as u64,
-                );
+            // Broadcast x (2 rows x 3 slots) and one x row per slot.
+            for x_rows in [2, 6] {
+                let (want, got) = moe_both(*fmt, x_rows, cols, rows, experts, top_k, ids.clone(), 10 + i as u64);
+                let err = rel_err(&want, &got);
+                assert!(err < 1e-4, "{fmt:?} x_rows={x_rows}: {err}");
             }
         }
-        // quantized router too
-        check(
-            &MoeCase {
-                m: 2,
-                d_in: 256,
-                d_out: 8,
-                experts: 4,
-                top_k: 2,
-                given: 4,
-                router: Fmt::Q(Q::GGUF_Q4_K_M),
-                fmts: vec![Fmt::Q(Q::GGUF_Q4_K_M)],
-            },
-            99,
-        );
     }
 
-    /// An expert no row routes to must not run: NaN weights in it leave the output untouched.
     #[test]
-    fn moe_skips_unselected_experts() {
-        let c = MoeCase {
-            m: 1,
-            d_in: 32,
-            d_out: 16,
-            experts: 4,
-            top_k: 2,
-            given: 4,
-            router: Fmt::F32,
-            fmts: vec![Fmt::F32],
+    fn moe_linear_shapes_and_routing_match_cpu() {
+        let mut s = 7u64;
+        let mut route = |n: usize, experts: usize| -> Vec<u32> {
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 33) % experts as u64) as u32
+                })
+                .collect()
         };
-        let (g, mut w, _) = moe_graph(&c, 5);
-        // x > 0 and an all -10 router row 3 put expert 3's logit far below the others.
-        let inputs = vec![Tensor::F32(rand(32, 1).iter().map(|v| v + 1.5).collect())];
-        let mut router = rand(4 * 32, 9);
-        router[3 * 32..].iter_mut().for_each(|v| *v = -10.0);
-        w.insert("router", Tensor::F32(router));
-        let run = |w: &Weights| {
-            Session::new(rt(), w)
+        for (i, (m, top_k, experts, rows, cols)) in [
+            (1, 1, 1, 8, 8),
+            (1, 8, 128, 17, 64),   // a decode token: 8 of 128 experts
+            (37, 2, 12, 33, 40),   // prefill-sized, rows not a tile multiple
+            (3, 4, 4, 129, 24),    // every expert routed several times
+            (2, 1, 5, 1, 16),      // one output row per expert
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ids = route(m * top_k, experts);
+            for x_rows in [m, m * top_k] {
+                let (want, got) = moe_both(Fmt::F32, x_rows, cols, rows, experts, top_k, ids.clone(), 40 + i as u64);
+                assert!(rel_err(&want, &got) < 1e-4, "m={m} top_k={top_k} E={experts} {rows}x{cols} x_rows={x_rows}");
+            }
+        }
+    }
+
+    /// An expert no slot routes to is never read: NaN weights in it leave the output untouched.
+    #[test]
+    fn moe_linear_reads_only_routed_experts() {
+        let (experts, rows, cols) = (4, 16, 32);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, cols], DType::F32);
+        let b = g.weight("bank", vec![experts * rows, cols], DType::F32);
+        let ids = g.input("ids", vec![1, 2], DType::U32);
+        let y = g.add("moe", Op::MoeLinear { experts, top_k: 2 }, &[x, b, ids], vec![2, rows], DType::F32);
+        g.output(y);
+        let mut bank = rand(experts * rows * cols, 5);
+        let run = |bank: &[f32]| {
+            let mut w = Weights::new();
+            w.insert("bank", Tensor::F32(bank.to_vec()));
+            Session::new(rt(), &w)
                 .unwrap()
-                .run(&g, inputs.clone())
+                .run(&g, vec![Tensor::F32(rand(cols, 1)), Tensor::U32(vec![2, 0])])
                 .unwrap()
                 .remove(0)
                 .into_f32()
                 .unwrap()
         };
-        let clean = run(&w);
-        w.insert("e3", Tensor::F32(vec![f32::NAN; 16 * 32]));
-        let poisoned = run(&w);
+        let clean = run(&bank);
+        bank[3 * rows * cols..].iter_mut().for_each(|v| *v = f32::NAN);
+        let poisoned = run(&bank);
         assert!(clean.iter().all(|v| v.is_finite()));
         assert_eq!(clean, poisoned);
     }
 
     #[test]
-    fn moe_rejects_malformed_nodes() {
-        let run = |c: &MoeCase| {
-            let (g, w, inputs) = moe_graph(c, 3);
-            Session::new(rt(), &w).unwrap().run(&g, inputs).map(|_| ())
+    fn moe_linear_rejects_malformed_nodes() {
+        // (experts, top_k, bank rows, cols, x rows, ids, bank format) -> error must name the node.
+        let run = |experts: usize, top_k: usize, bank_rows: usize, cols: usize, x_rows: usize, fmt: Fmt| {
+            let (dt, bank) = weight(fmt, bank_rows, cols, 3);
+            let mut g = Graph::new();
+            let x = g.input("x", vec![x_rows, cols], DType::F32);
+            let b = g.weight("bank", vec![bank_rows, cols], dt);
+            let ids = g.input("ids", vec![1, 2], DType::U32);
+            let y = g.add("moe", Op::MoeLinear { experts, top_k }, &[x, b, ids], vec![2, 4], DType::F32);
+            g.output(y);
+            let mut w = Weights::new();
+            w.insert("bank", bank);
+            Session::new(rt(), &w)
+                .unwrap()
+                .run(&g, vec![Tensor::F32(vec![0.5; x_rows * cols]), Tensor::U32(vec![0, 1])])
+                .map(|_| ())
         };
-        let base = || MoeCase {
-            m: 1,
-            d_in: 16,
-            d_out: 8,
-            experts: 4,
-            top_k: 2,
-            given: 4,
-            router: Fmt::F32,
-            fmts: vec![Fmt::F32],
-        };
-        run(&base()).unwrap();
-        let e = run(&MoeCase { top_k: 0, ..base() }).unwrap_err();
+        run(4, 2, 16, 8, 1, Fmt::F32).unwrap();
+        let e = run(4, 0, 16, 8, 1, Fmt::F32).unwrap_err();
         assert!(e.contains("moe") && e.contains("top_k"), "{e}");
-        let e = run(&MoeCase { given: 0, ..base() }).unwrap_err();
-        assert!(e.contains("moe"), "{e}");
-        let e = run(&MoeCase {
-            fmts: vec![Fmt::F32, Fmt::F16],
-            ..base()
-        })
-        .unwrap_err();
-        assert!(e.contains("mix"), "{e}");
-        let e = run(&MoeCase {
-            d_in: 256,
-            fmts: vec![Fmt::Q(Q::GGUF_IQ3_S)],
-            ..base()
-        })
-        .unwrap_err();
-        assert!(e.contains("no packed GEMV"), "{e}");
+        let e = run(5, 2, 16, 8, 1, Fmt::F32).unwrap_err();
+        assert!(e.contains("moe") && e.contains("stacked"), "{e}");
+        let e = run(4, 2, 16, 8, 3, Fmt::F32).unwrap_err();
+        assert!(e.contains("moe") && e.contains("rows"), "{e}");
+        // 16 columns are not a whole Q4_K block; planning fails before any weight is read.
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 16], DType::F32);
+        let b = g.weight("bank", vec![16, 16], DType::Quant(Q::GGUF_Q4_K_M));
+        let ids = g.input("ids", vec![1, 2], DType::U32);
+        let y = g.add("moe", Op::MoeLinear { experts: 4, top_k: 2 }, &[x, b, ids], vec![2, 4], DType::F32);
+        g.output(y);
+        let e = Session::new(rt(), &Weights::new())
+            .unwrap()
+            .run(&g, vec![Tensor::F32(vec![0.5; 16]), Tensor::U32(vec![0, 1])])
+            .unwrap_err();
+        assert!(e.contains("moe") && e.contains("block"), "{e}");
+    }
+
+    #[test]
+    fn moe_linear_cpu_reference_rejects_out_of_range_experts() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 8], DType::F32);
+        let b = g.weight("bank", vec![8, 8], DType::F32);
+        let ids = g.input("ids", vec![1, 1], DType::U32);
+        let y = g.add("moe", Op::MoeLinear { experts: 2, top_k: 1 }, &[x, b, ids], vec![1, 4], DType::F32);
+        g.output(y);
+        let mut w = Weights::new();
+        w.insert("bank", Tensor::F32(rand(64, 1)));
+        let e = cpu::run_stateless(&g, &w, vec![Tensor::F32(rand(8, 2)), Tensor::U32(vec![2])]).unwrap_err();
+        assert!(e.contains("routes to expert 2"), "{e}");
+    }
+
+    /// A routed id past the bank writes zeros on Metal, never stale arena bytes.
+    #[test]
+    fn moe_linear_metal_zeroes_out_of_range_slots() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 8], DType::F32);
+        let b = g.weight("bank", vec![8, 8], DType::F32);
+        let ids = g.input("ids", vec![1, 2], DType::U32);
+        let y = g.add("moe", Op::MoeLinear { experts: 2, top_k: 2 }, &[x, b, ids], vec![2, 4], DType::F32);
+        g.output(y);
+        let mut w = Weights::new();
+        w.insert("bank", Tensor::F32(rand(64, 1)));
+        let got = Session::new(rt(), &w)
+            .unwrap()
+            .run(&g, vec![Tensor::F32(rand(8, 2)), Tensor::U32(vec![1, 7])])
+            .unwrap()
+            .remove(0)
+            .into_f32()
+            .unwrap();
+        assert!(got[..4].iter().any(|v| *v != 0.0));
+        assert_eq!(&got[4..], &[0.0; 4]);
     }
 
     // ---- guards on core kernels ----
@@ -1318,3 +1199,4 @@ mod tests {
         assert!(e.contains("multiple"), "{e}");
     }
 }
+

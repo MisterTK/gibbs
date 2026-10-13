@@ -1990,12 +1990,6 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
     }
 }
 
-struct TopKSoftmaxParams {
-    uint rows;
-    uint cols;
-    uint k;
-};
-
 struct MulParams {
     uint total;
     uint a_len;

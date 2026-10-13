@@ -40,12 +40,13 @@ fn ordinal(op: &Op) -> usize {
         Op::AvgPool2d { .. } => 20,
         Op::Upsample { .. } => 21,
         Op::Conv3d { .. } => 22,
-        Op::Moe { .. } => 23,
+        Op::MoeLinear { .. } => 23,
         Op::Silu => 24,
         Op::Gelu { .. } => 25,
         Op::Relu => 26,
         Op::Softmax { .. } => 27,
-        Op::TopKSoftmax { .. } => 28,
+        Op::TopK { .. } => 28,
+        Op::GatherCols => 46,
         Op::RelPosBias { .. } => 29,
         Op::StateReorder => 30,
         Op::Add => 31,
@@ -65,7 +66,7 @@ fn ordinal(op: &Op) -> usize {
         Op::Megakernel(_) => 45,
     }
 }
-const VARIANTS: usize = 46;
+const VARIANTS: usize = 47;
 
 /// Key used in `KNOWN_UNLOWERED`: the op name, plus the kind for ops whose support varies by kind.
 fn key(op: &Op) -> String {
@@ -114,13 +115,14 @@ fn all_ops() -> Vec<Op> {
         Op::AvgPool2d { kernel: [2, 2], stride: [2, 2] },
         Op::Upsample { scale: 2, mode: UpsampleMode::Nearest },
         Op::Conv3d { stride: [1, 1, 1], padding: [0, 0, 1, 1, 1, 1], dilation: [1, 1, 1], groups: 1 },
-        Op::Moe { experts: 4, top_k: 2 },
+        Op::MoeLinear { experts: 4, top_k: 2 },
+        Op::GatherCols,
         Op::Silu,
         Op::Gelu { tanh: true },
         Op::Gelu { tanh: false },
         Op::Relu,
         Op::Softmax { axis: -1 },
-        Op::TopKSoftmax { axis: -1, k: 2 },
+        Op::TopK { k: 2 },
         Op::RelPosBias { buckets: 32, max_distance: 128, bidirectional: true, heads: 2 },
         Op::StateReorder,
         Op::Add,

@@ -14,7 +14,7 @@ mod fixture;
 #[cfg(test)]
 mod gpu_tests;
 pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
-pub use text::tiny_decode_graph;
+pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 mod vision;
 
 pub use draft::{
@@ -391,7 +391,7 @@ impl Qwen3Encoder {
     }
 }
 
-/// A llama.cpp `qwen3`, `hunyuan-dense`, `qwen35`, `qwen35moe` or `qwen4exp` GGUF file as a
+/// A llama.cpp `qwen3`, `qwen3moe`, `hunyuan-dense`, `qwen35`, `qwen35moe` or `qwen4exp` GGUF file as a
 /// [`NativeLm`]: tensors renamed to their transformers names (llama.cpp's conversion transforms
 /// undone) and dequantized to bf16, config from the `<arch>.*` metadata; MoE expert banks stay
 /// packed in the file data (mapped for a single file). `None` for anything else (the GraphLm path
@@ -408,7 +408,7 @@ pub fn load_gguf(
     let arch = crate::model::loaders::gguf::architecture(path)?;
     matches!(
         arch.as_str(),
-        "qwen3" | "hunyuan-dense" | "qwen35" | "qwen35moe" | "qwen4exp"
+        "qwen3" | "qwen3moe" | "hunyuan-dense" | "qwen35" | "qwen35moe" | "qwen4exp"
     )
     .then(|| {
         let (manifest, data) = crate::model::loaders::gguf::open(path)?;
@@ -480,7 +480,7 @@ fn gguf_config(m: &crate::model::ModelManifest) -> Result<(Value, Arch, usize), 
         .get("general.architecture")
         .map_or("", String::as_str);
     let arch = match a {
-        "qwen3" => Arch::Qwen3,
+        "qwen3" | "qwen3moe" => Arch::Qwen3,
         "hunyuan-dense" => Arch::HunYuan,
         "qwen35" | "qwen35moe" => Arch::Qwen35,
         "qwen3vl" => Arch::Qwen3Vl,
@@ -512,7 +512,7 @@ fn gguf_config(m: &crate::model::ModelManifest) -> Result<(Value, Arch, usize), 
     let layers = int("block_count")?.saturating_sub(int("nextn_predict_layers").unwrap_or(0));
     let mut cfg = serde_json::json!({
         "hidden_size": hidden,
-        "intermediate_size": if matches!(a, "qwen35moe" | "qwen4exp") { 0 } else { int("feed_forward_length")? },
+        "intermediate_size": if matches!(a, "qwen3moe" | "qwen35moe" | "qwen4exp") { 0 } else { int("feed_forward_length")? },
         "num_hidden_layers": layers,
         "num_attention_heads": heads,
         "num_key_value_heads": int("attention.head_count_kv")?,
@@ -601,7 +601,12 @@ fn gguf_config(m: &crate::model::ModelManifest) -> Result<(Value, Arch, usize), 
                 cfg[k] = v.clone();
             }
         }
-        Arch::Qwen3 | Arch::Qwen2 => {}
+        Arch::Qwen3 | Arch::Qwen2 => {
+            if a == "qwen3moe" {
+                cfg["num_experts"] = int("expert_count")?.into();
+                cfg["num_experts_per_tok"] = int("expert_used_count")?.into();
+            }
+        }
         // Text tower of a Qwen3-VL GGUF (the vision tower is a separate mmproj file): text-only
         // positions put every M-RoPE axis at the sequence index, so the section split is moot.
         Arch::Qwen3Vl => {
@@ -697,7 +702,10 @@ fn gguf_checkpoint(
                 || hf.contains(".ple.norm_")
                 || hf.ends_with(".linear_attn.out_proj.weight")
                 || (hf.contains(".linear_attn.") && !is_permuted_linear));
-        let can_pack = (shape.len() == 2 || hf.contains(".mlp.experts."))
+        // Expert banks stay packed in any block format (their dequantized size would not fit in
+        // memory); other matrices only in the formats the Metal hand kernels read.
+        let bank = hf.contains(".mlp.experts.");
+        let can_pack = ((shape.len() == 2
             && matches!(
                 t.quant_format,
                 crate::hardware::QuantFormat::GGUF_Q4_0
@@ -709,7 +717,12 @@ fn gguf_checkpoint(
                     | crate::hardware::QuantFormat::GGUF_IQ3_S
                     | crate::hardware::QuantFormat::BF16
                     | crate::hardware::QuantFormat::FP16
-            )
+            ))
+            || (bank
+                && (matches!(
+                    t.quant_format,
+                    crate::hardware::QuantFormat::BF16 | crate::hardware::QuantFormat::FP16
+                ) || crate::model::layers::gguf_block_codec(t.quant_format).is_some())))
             && !needs_transform;
 
         if can_pack {
@@ -893,16 +906,16 @@ fn gguf_to_hf(arch: Arch, name: &str) -> Option<String> {
         "ffn_gate.weight" => "mlp.gate_proj.weight",
         "ffn_up.weight" => "mlp.up_proj.weight",
         "ffn_down.weight" => "mlp.down_proj.weight",
-        "ffn_gate_inp.weight" if q35 => "mlp.gate.weight",
+        "ffn_gate_inp.weight" => "mlp.gate.weight",
         "ffn_gate_inp_shexp.weight" if q35 => "mlp.shared_expert_gate.weight",
         "ffn_gate_shexp.weight" if q35 => "mlp.shared_expert.gate_proj.weight",
         "ffn_up_shexp.weight" if q35 => "mlp.shared_expert.up_proj.weight",
         "ffn_down_shexp.weight" if q35 => "mlp.shared_expert.down_proj.weight",
         // Expert banks have no `.weight` in HF's fused layout (`experts.gate_up_proj`).
-        "ffn_gate_exps.weight" if q35 => "mlp.experts.gate_proj",
-        "ffn_up_exps.weight" if q35 => "mlp.experts.up_proj",
-        "ffn_down_exps.weight" if q35 => "mlp.experts.down_proj",
-        "ffn_gate_up_exps.weight" if q35 => "mlp.experts.gate_up_proj",
+        "ffn_gate_exps.weight" => "mlp.experts.gate_proj",
+        "ffn_up_exps.weight" => "mlp.experts.up_proj",
+        "ffn_down_exps.weight" => "mlp.experts.down_proj",
+        "ffn_gate_up_exps.weight" => "mlp.experts.gate_up_proj",
         "attn_qkv.weight" if q35 => "linear_attn.in_proj_qkv.weight",
         "attn_gate.weight" if q35 => "linear_attn.in_proj_z.weight",
         "ssm_beta.weight" if q35 => "linear_attn.in_proj_b.weight",
@@ -1938,6 +1951,157 @@ fn sigmoid(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `qwen3moe` metadata becomes a Qwen3 decoder with routed experts (no dense FFN width), and its
+    /// router / expert tensors map to the names `Moe::load` reads.
+    #[test]
+    fn qwen3moe_gguf_config_and_tensor_names() {
+        let md: std::collections::HashMap<String, String> = [
+            ("general.architecture", "qwen3moe"),
+            ("qwen3moe.embedding_length", "2048"),
+            ("qwen3moe.attention.head_count", "32"),
+            ("qwen3moe.attention.head_count_kv", "4"),
+            ("qwen3moe.attention.key_length", "128"),
+            ("qwen3moe.attention.layer_norm_rms_epsilon", "0.000001"),
+            ("qwen3moe.rope.freq_base", "10000000"),
+            ("qwen3moe.context_length", "262144"),
+            ("qwen3moe.block_count", "48"),
+            ("qwen3moe.feed_forward_length", "6144"),
+            ("qwen3moe.expert_count", "128"),
+            ("qwen3moe.expert_used_count", "8"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let m = crate::model::ModelManifest { metadata: md, ..Default::default() };
+        let (cfg, arch, layers) = gguf_config(&m).unwrap();
+        assert!(arch == Arch::Qwen3 && layers == 48);
+        assert_eq!(cfg["intermediate_size"], 0);
+        assert_eq!((cfg["num_experts"].as_u64(), cfg["num_experts_per_tok"].as_u64()), (Some(128), Some(8)));
+        assert_eq!(cfg["head_dim"], 128);
+        for (gguf, hf) in [
+            ("ffn_gate_inp.weight", "mlp.gate.weight"),
+            ("ffn_gate_exps.weight", "mlp.experts.gate_proj"),
+            ("ffn_up_exps.weight", "mlp.experts.up_proj"),
+            ("ffn_down_exps.weight", "mlp.experts.down_proj"),
+            ("ffn_norm.weight", "post_attention_layernorm.weight"),
+        ] {
+            assert_eq!(
+                gguf_to_hf(Arch::Qwen3, &format!("blk.5.{gguf}")).unwrap(),
+                format!("model.layers.5.{hf}")
+            );
+        }
+    }
+
+    /// A tiny `qwen3moe` GGUF with Q4_0 expert banks, through the real GGUF path: the banks stay
+    /// packed in the mapping, and the Metal program (banks read in place by `MoeLinear`) matches the
+    /// host forward (rows decoded from the same mapping).
+    #[test]
+    fn qwen3moe_gguf_banks_stay_packed_and_match_host() {
+        use crate::model::layers::quantize_f32_to_q4_0;
+        let (hidden, vocab, heads, kv_heads, hd) = (64usize, 128usize, 4usize, 2usize, 16usize);
+        let (experts, top_k, ff, layers) = (8usize, 2usize, 32usize, 2usize);
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        // (name, GGML dims fastest first, type, bytes): F32 = 0, Q4_0 = 2.
+        let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
+        let f32s = |v: Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let mut add_f32 = |n: &str, dims: &[usize], v: Vec<f32>| tensors.push((n.into(), dims.to_vec(), 0, f32s(v)));
+        add_f32("token_embd.weight", &[hidden, vocab], rnd(hidden * vocab, 0.8));
+        add_f32("output_norm.weight", &[hidden], rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect());
+        add_f32("output.weight", &[hidden, vocab], rnd(hidden * vocab, 0.8));
+        for l in 0..layers {
+            let p = format!("blk.{l}");
+            for n in ["attn_norm", "ffn_norm"] {
+                add_f32(&format!("{p}.{n}.weight"), &[hidden], rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect());
+            }
+            add_f32(&format!("{p}.attn_q.weight"), &[hidden, heads * hd], rnd(hidden * heads * hd, 0.8));
+            add_f32(&format!("{p}.attn_k.weight"), &[hidden, kv_heads * hd], rnd(hidden * kv_heads * hd, 0.8));
+            add_f32(&format!("{p}.attn_v.weight"), &[hidden, kv_heads * hd], rnd(hidden * kv_heads * hd, 0.8));
+            add_f32(&format!("{p}.attn_output.weight"), &[heads * hd, hidden], rnd(hidden * heads * hd, 0.8));
+            for n in ["attn_q_norm", "attn_k_norm"] {
+                add_f32(&format!("{p}.{n}.weight"), &[hd], rnd(hd, 0.2).iter().map(|v| v + 1.0).collect());
+            }
+            add_f32(&format!("{p}.ffn_gate_inp.weight"), &[hidden, experts], rnd(hidden * experts, 1.6));
+        }
+        let mut bank = |n: String, dims: &[usize], v: Vec<f32>| tensors.push((n, dims.to_vec(), 2, quantize_f32_to_q4_0(&v)));
+        for l in 0..layers {
+            let p = format!("blk.{l}");
+            bank(format!("{p}.ffn_gate_exps.weight"), &[hidden, ff, experts], rnd(experts * ff * hidden, 0.8));
+            bank(format!("{p}.ffn_up_exps.weight"), &[hidden, ff, experts], rnd(experts * ff * hidden, 0.8));
+            bank(format!("{p}.ffn_down_exps.weight"), &[ff, hidden, experts], rnd(experts * hidden * ff, 0.8));
+        }
+        let u32_kv = |k: &str, v: u32| (format!("qwen3moe.{k}"), 4u32, v.to_le_bytes().to_vec());
+        let f32_kv = |k: &str, v: f32| (format!("qwen3moe.{k}"), 6u32, v.to_le_bytes().to_vec());
+        let mut arch_name = (8u64).to_le_bytes().to_vec();
+        arch_name.extend_from_slice(b"qwen3moe");
+        let kvs = vec![
+            ("general.architecture".to_string(), 8u32, arch_name),
+            u32_kv("embedding_length", hidden as u32),
+            u32_kv("attention.head_count", heads as u32),
+            u32_kv("attention.head_count_kv", kv_heads as u32),
+            u32_kv("attention.key_length", hd as u32),
+            f32_kv("attention.layer_norm_rms_epsilon", 1e-6),
+            f32_kv("rope.freq_base", 10000.0),
+            u32_kv("context_length", 64),
+            u32_kv("block_count", layers as u32),
+            u32_kv("feed_forward_length", 96),
+            u32_kv("expert_count", experts as u32),
+            u32_kv("expert_used_count", top_k as u32),
+        ];
+        let file = crate::model::loaders::gguf::test_gguf_blocks(&kvs, &tensors);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny-qwen3moe.gguf");
+        std::fs::write(&path, &file).unwrap();
+
+        let (manifest, data) = crate::model::loaders::gguf::open(&path).unwrap();
+        let (ck, cfg, arch) = gguf_checkpoint(&Arc::new(data), &manifest).unwrap();
+        for part in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(
+                ck.packed_gguf(&format!("model.layers.1.mlp.experts.{part}")).is_some(),
+                "{part} bank stays packed in the file mapping"
+            );
+        }
+        let text = Arc::new(TextModel::load(&ck, &cfg, arch).unwrap());
+        let program = compile_qwen_program(
+            &text,
+            crate::hardware::PlacementMode::Pin(Device::Metal),
+            text::DecodeOpts::default(),
+        )
+        .unwrap()
+        .expect("a Metal program");
+        let mut prog = program.lock();
+        assert_eq!(prog.cpu_node_count(), 0);
+        let mut host_state = text.new_state();
+        let mut tok = 11u32;
+        for pos in 0..6usize {
+            let mut emb = vec![0.0f32; hidden];
+            text.embed(tok, &mut emb).unwrap();
+            let hid = text.forward_rows(
+                emb.clone(), &[[pos as u32; 3]], pos, &mut host_state, 0, usize::MAX,
+                &[], &[], false, &[], &mut Vec::new(),
+            );
+            let want = text.logits(&hid, 1);
+            let got = prog
+                .run(vec![crate::graph::Tensor::F32(emb), crate::graph::Tensor::U32(vec![pos as u32])])
+                .unwrap();
+            let got = got[0].as_f32().unwrap();
+            let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (n(&want) * n(got));
+            assert!(cos >= 0.999, "step {pos}: Metal vs host cosine {cos}");
+            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        }
+    }
 
     /// Hybrid Qwen3.5 stack (DeltaNet + gated GQA full attention, qk-norm, partial rotary): the
     /// Metal seq-cls program against the host forward. The text weights are bf16 on both sides and

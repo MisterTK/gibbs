@@ -6,6 +6,7 @@
 //! layers use the key projection as values), and bidirectional attention inside image blocks on
 //! sliding layers (`use_bidirectional_attention: "vision"`).
 
+use super::moe::MoeBlock;
 use super::ops::{gelu_mul, linear, rms_norm, rope, rope_table};
 use crate::model::bf16_to_f32;
 use crate::model::par::{par_for, OutPtr};
@@ -35,6 +36,8 @@ pub(crate) struct Layer {
     pub(crate) post_ff_ln: Vec<f32>,
     pub(crate) ple: Option<(Mat, Mat, Vec<f32>)>,
     pub(crate) scalar: f32,
+    /// The routed expert block of a sparse layer, beside the dense MLP above.
+    pub(crate) moe: Option<MoeBlock>,
 }
 
 /// Per-layer embedding table rows (`[vocab, layers * dim]`): a mapped bf16 matrix, or rows decoded
@@ -159,10 +162,6 @@ impl TextModel {
     /// [`Self::load`] with the per-layer embedding table supplied by the caller (`None`: the
     /// checkpoint's `embed_tokens_per_layer.weight`).
     pub fn load_with_ple(w: &Weights, c: &Value, ple: Option<PleTable>) -> Result<Self, String> {
-        if c["enable_moe_block"].as_bool().unwrap_or(false) {
-            // ponytail: dense Gemma 4 only (E2B/E4B/31B); the MoE block (26B-A4B) needs router + experts.
-            return Err("Gemma 4 MoE checkpoints (enable_moe_block) are not supported".into());
-        }
         let k_eq_v = c["attention_k_eq_v"].as_bool().unwrap_or(false);
         let bidir_vision = match c["use_bidirectional_attention"].as_str() {
             None => false,
@@ -275,6 +274,10 @@ impl TextModel {
                     None
                 },
                 scalar: w.scalar(&format!("{lp}.layer_scalar"))?,
+                moe: MoeBlock::enabled(c)
+                    .then(|| MoeBlock::load(w, &lp, c, hidden))
+                    .transpose()
+                    .map_err(|e| format!("layer {i}: {e}"))?,
             };
             if layer.attn.q.rows != heads * hd
                 || layer.attn.o.cols != heads * hd
@@ -344,6 +347,11 @@ impl TextModel {
             pad_id: c["pad_token_id"].as_u64().unwrap_or(0) as u32,
             bidir_vision,
         })
+    }
+
+    /// Whether any layer has a routed expert block (decode graph only, no host forward).
+    pub(crate) fn has_moe(&self) -> bool {
+        self.layers.iter().any(|l| l.moe.is_some())
     }
 
     pub fn new_cache(&self) -> TextCache {
@@ -999,6 +1007,10 @@ impl TextModel {
                 DType::F32,
             );
 
+            let down = match &l.moe {
+                Some(m) => m.add_to_graph(&mut g, &mut w, &format!("{p}.moe"), x, down, self.eps, n),
+                None => down,
+            };
             let post_ff_w = g.weight(format!("{p}.post_ff_ln.weight"), vec![h], DType::F32);
             w.insert(
                 format!("{p}.post_ff_ln.weight"),
@@ -1238,6 +1250,7 @@ pub fn tiny_model() -> TextModel {
         post_ff_ln: vec![1.0; h],
         ple: None,
         scalar: 1.0,
+        moe: None,
     };
 
     let model = TextModel {
@@ -1268,6 +1281,75 @@ pub fn tiny_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights
     tiny_model().to_decode_graph()
 }
 
+/// Tiny synthetic 26B-A4B-style model: a sliding and a full-attention layer, each with the dense MLP
+/// beside 8 routed experts (top 2), a per-expert scale, and pseudo-random weights (distinct router
+/// logits). It has a decode graph only: the sparse block has no host forward.
+pub fn tiny_moe_model() -> TextModel {
+    let (h, v, nh, hd, inter) = (64usize, 128usize, 2usize, 32usize, 48usize);
+    let (experts, top_k, ff) = (8usize, 2usize, 32usize);
+    let cfg = serde_json::json!({
+        "hidden_size": h, "num_hidden_layers": 2, "num_attention_heads": nh, "num_key_value_heads": nh,
+        "head_dim": hd, "layer_types": ["sliding_attention", "full_attention"], "sliding_window": 8,
+        "max_position_embeddings": 64, "rms_norm_eps": 1e-6, "final_logit_softcapping": 30.0,
+        "rope_parameters": {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+            "full_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        },
+        "enable_moe_block": true, "num_experts": experts, "top_k_experts": top_k, "moe_intermediate_size": ff,
+    });
+    let p = "model.language_model";
+    let mut specs: Vec<(String, Vec<usize>)> = vec![
+        (format!("{p}.embed_tokens.weight"), vec![v, h]),
+        (format!("{p}.norm.weight"), vec![h]),
+    ];
+    for l in 0..2 {
+        let mut s = |n: &str, shape: Vec<usize>| specs.push((format!("{p}.layers.{l}.{n}"), shape));
+        for n in [
+            "input_layernorm.weight", "post_attention_layernorm.weight", "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight", "router.scale", "pre_feedforward_layernorm_2.weight",
+            "post_feedforward_layernorm_1.weight", "post_feedforward_layernorm_2.weight",
+        ] {
+            s(n, vec![h]);
+        }
+        s("self_attn.q_proj.weight", vec![nh * hd, h]);
+        s("self_attn.k_proj.weight", vec![nh * hd, h]);
+        s("self_attn.v_proj.weight", vec![nh * hd, h]);
+        s("self_attn.o_proj.weight", vec![h, nh * hd]);
+        s("self_attn.q_norm.weight", vec![hd]);
+        s("self_attn.k_norm.weight", vec![hd]);
+        s("mlp.gate_proj.weight", vec![inter, h]);
+        s("mlp.up_proj.weight", vec![inter, h]);
+        s("mlp.down_proj.weight", vec![h, inter]);
+        s("layer_scalar", vec![1]);
+        s("router.proj.weight", vec![experts, h]);
+        s("router.per_expert_scale", vec![experts]);
+        s("mlp.experts.gate_proj", vec![experts, ff, h]);
+        s("mlp.experts.up_proj", vec![experts, ff, h]);
+        s("mlp.experts.down_proj", vec![experts, h, ff]);
+    }
+    let sizes: std::collections::HashMap<String, usize> =
+        specs.iter().map(|(n, s)| (n.clone(), s.iter().product())).collect();
+    let weights = crate::model::weights::Weights::from_f32(specs, |name| {
+        let n: u64 = name.bytes().enumerate().map(|(i, b)| (i as u64 + 1) * b as u64).sum();
+        let one = name.ends_with("layer_scalar") || name.ends_with("_norm.weight");
+        Ok((0..sizes[name])
+            .map(|i| {
+                let hash = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15) ^ n.wrapping_mul(0xD1B54A32D192ED03))
+                    .wrapping_mul(0x2545F4914F6CDD1D);
+                let r = (hash >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                if one { 1.0 + 0.2 * r } else { 0.8 * r }
+            })
+            .collect())
+    })
+    .unwrap();
+    TextModel::load(&weights, &cfg).unwrap()
+}
+
+/// Decode graph of [`tiny_moe_model`].
+pub fn tiny_moe_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    tiny_moe_model().to_decode_graph()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,6 +1363,45 @@ mod tests {
         // Exponent uses the full head_dim, not the rotated width.
         assert!((f[1] - 1e6f64.powf(-2.0 / 512.0) as f32).abs() < 1e-9);
     }
+    /// The sparse block (router, top-k, banked experts, per-expert scale, both norms) on the Metal
+    /// program against the CPU graph executor: the host forward has no sparse block.
+    #[test]
+    fn gemma4_moe_decode_graph_metal_matches_cpu_graph() {
+        let model = tiny_moe_model();
+        assert!(model.has_moe());
+        let (g, w) = model.to_decode_graph().unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n.op, crate::graph::Op::MoeLinear { .. })));
+        #[cfg(target_os = "macos")]
+        let mut prog = crate::graph::program::GraphProgram::compile(
+            g.clone(),
+            w.clone(),
+            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+        )
+        .expect("compile the Gemma 4 MoE decode graph on Metal");
+        #[cfg(target_os = "macos")]
+        assert_eq!(prog.cpu_node_count(), 0);
+        let mut cpu_state = crate::graph::StateStore::new();
+        let mut tok = 5u32;
+        for pos in 0..6usize {
+            let mut emb = vec![0.0f32; model.hidden];
+            model.embed_row(tok, &mut emb);
+            let inputs = || vec![crate::graph::Tensor::F32(emb.clone()), crate::graph::Tensor::U32(vec![pos as u32])];
+            let want = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
+            let want = want[0].as_f32().unwrap();
+            assert!(want.iter().all(|v| v.is_finite()));
+            #[cfg(target_os = "macos")]
+            {
+                let got = prog.run(inputs()).unwrap();
+                let got = got[0].as_f32().unwrap();
+                let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+                let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+                let cos = dot / (n(want) * n(got));
+                assert!(cos >= 0.999, "step {pos}: cosine {cos}");
+            }
+            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        }
+    }
+
     #[test]
     fn test_gemma4_to_decode_graph_cpu_parity() {
         use crate::graph::cpu::run_stateless;
@@ -1376,6 +1497,7 @@ mod tests {
             post_ff_ln: vec![1.0; h],
             ple: Some((ple_gate_mat, ple_proj_mat, vec![1.0; h])),
             scalar: 1.0,
+            moe: None,
         };
 
         let ple_model = Ple {
@@ -1518,6 +1640,7 @@ mod tests {
             post_ff_ln: vec![1.0; h],
             ple: None,
             scalar: 1.0,
+            moe: None,
         };
 
         let model = TextModel {
