@@ -2697,15 +2697,31 @@ impl Session {
                 set_bytes(enc, 2, &u32_of(n)?);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
             }
-            Step::RmsNorm { x, g, rows, d, eps } => {
-                enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
+            Step::RmsNorm {
+                x,
+                g,
+                res,
+                rows,
+                d,
+                eps,
+            } => {
+                enc.set_compute_pipeline_state(rt.pso(if res.is_some() {
+                    "rmsnorm_residual_f32"
+                } else {
+                    "rmsnorm_f32"
+                })?);
                 bind(0, x);
                 bind(1, g);
-                bind(2, s.out);
+                let mut slot = 2;
+                if let Some(r) = res {
+                    bind(slot, r);
+                    slot += 1;
+                }
+                bind(slot, s.out);
                 #[repr(C)]
                 struct RmsNormParams(u32, u32, f32);
                 let p = RmsNormParams(u32_of(rows)?, u32_of(d)?, eps);
-                set_bytes(enc, 3, &p);
+                set_bytes(enc, slot + 1, &p);
                 enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(TG, 1, 1));
             }
             Step::GemvPacked {
@@ -3424,6 +3440,8 @@ pub enum Step {
     RmsNorm {
         x: ValueId,
         g: ValueId,
+        /// Added to the normalised output (`res + norm(x) * g`) when the norm's only reader was an Add.
+        res: Option<ValueId>,
         rows: usize,
         d: usize,
         eps: f32,
@@ -3887,10 +3905,28 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 if d == 0 || xl % d != 0 {
                     return Err(format!("node '{name}': RmsNorm shapes mismatch"));
                 }
+                // `norm(x) + r` with a single reader: one dispatch (`rmsnorm_residual_f32`).
+                let mut res = None;
+                if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
+                    let c = &g.nodes[*j];
+                    if c.op == Op::Add && c.inputs.len() == 2 && !g.outputs.contains(&out) {
+                        let r = if c.inputs[0] == out {
+                            c.inputs[1]
+                        } else {
+                            c.inputs[0]
+                        };
+                        if r != out && exists_before(r, i) && n_of(r)? == xl {
+                            res = Some(r);
+                            fused[*j] = true;
+                            out = c.outputs[0];
+                        }
+                    }
+                }
                 (
                     Step::RmsNorm {
                         x,
                         g: g_val,
+                        res,
                         rows: xl / d,
                         d,
                         eps: *eps,
@@ -4205,7 +4241,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 .flatten()
                 .collect(),
             Step::MeanPool { x, mask, .. } => vec![x, mask],
-            Step::RmsNorm { x, g, .. } => vec![x, g],
+            Step::RmsNorm { x, g, res, .. } => {
+                [Some(x), Some(g), res].into_iter().flatten().collect()
+            }
             Step::SwiGlu { gate, up, .. } | Step::GeGlu { gate, up, .. } => vec![gate, up],
             Step::Rope {
                 x, pos, inv_freq, ..
@@ -5179,6 +5217,37 @@ mod tests {
         ];
         let (want, got) = both(&g, &w, inputs, None);
         assert!(rel_err(&want, &got) < 1e-4);
+    }
+
+    /// `norm(x) * g + r` with the Add as the norm's only reader is one fused step; a norm that
+    /// is also read elsewhere stays a plain norm. Both match the CPU executor.
+    #[test]
+    fn rmsnorm_residual_fuses_and_matches_cpu() {
+        let f = DType::F32;
+        let mut g = Graph::new();
+        let x = g.input("x", vec![3, 4], f);
+        let r = g.input("r", vec![3, 4], f);
+        let gv = g.weight("g", vec![4], f);
+        let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![3, 4], f);
+        let s1 = g.add("s1", Op::Add, &[r, n1], vec![3, 4], f);
+        let n2 = g.add("n2", Op::RmsNorm { eps: 1e-5 }, &[s1, gv], vec![3, 4], f);
+        let s2 = g.add("s2", Op::Add, &[n2, s1], vec![3, 4], f);
+        let o = g.add("o", Op::Mul, &[n2, s2], vec![3, 4], f);
+        g.output(o);
+        let (steps, _) = plan(&g).unwrap();
+        // n1+s1 fuse; n2 has two readers (s2 and o), so it and s2 stay separate: norm, norm, add, mul.
+        assert_eq!(steps.len(), 4, "norm+add, norm, add, mul");
+        assert!(matches!(steps[0].op, Step::RmsNorm { res: Some(_), .. }));
+        assert!(matches!(steps[1].op, Step::RmsNorm { res: None, .. }));
+
+        let mut w = Weights::new();
+        w.insert("g", Tensor::F32(vec![0.5, 1.2, -0.8, 2.1]));
+        let inputs = vec![
+            Tensor::F32((0..12).map(|i| (i as f32 * 0.7).sin() * 2.0).collect()),
+            Tensor::F32((0..12).map(|i| (i as f32 * 1.3).cos()).collect()),
+        ];
+        let (want, got) = both(&g, &w, inputs, None);
+        assert!(rel_err(&want, &got) < 1e-5);
     }
 
     /// Every packed format (generated and hand kernels): the GPU GEMV equals the CPU executor
