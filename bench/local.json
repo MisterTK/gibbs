@@ -1,0 +1,37 @@
+{
+  "defaults": {
+    "prompt": "Explain the second law of thermodynamics to a curious student.",
+    "decode_tokens": 64,
+    "runs": 2,
+    "reencode": "max-speed"
+  },
+  "models": [
+    {
+      "id": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
+      "min_tok_s": 150.0,
+      "reencode": "max-speed"
+    },
+    {
+      "id": "unsloth/gemma-4-E4B-it-qat-GGUF/gemma-4-E4B-it-qat-UD-Q2_K_XL.gguf",
+      "reencode": "max-speed"
+    },
+    {
+      "id": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf",
+      "reencode": "max-speed"
+    },
+    {
+      "id": "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf",
+      "reencode": "max-speed"
+    },
+    {
+      "id": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "reencode": "max-speed"
+    },
+    {
+      "id": "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf"
+    },
+    {
+      "id": "ggml-org/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_0.gguf"
+    }
+  ]
+}
