@@ -7286,6 +7286,161 @@ mod tests {
         }
     }
 
+    /// E1 probe: a chain of dependent f16 GEMVs (each reads 1536x1536 weights, feeding the next) as
+    /// separate dispatches versus one persistent kernel with an atomic grid barrier between steps.
+    /// Prints per-step time for both and checks the results agree
+    /// (`cargo test --release --lib persistent_chain_probe -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement"]
+    fn persistent_chain_probe() {
+        const SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+inline float row_dot(device const half* w, device const float* x, uint cols, uint lane) {
+    float acc = 0.0f;
+    for (uint c = lane * 4; c < cols; c += 128) {
+        acc += dot(float4(*(device const half4*)(w + c)), *(device const float4*)(x + c));
+    }
+    return simd_sum(acc);
+}
+kernel void sep(device const half* w [[buffer(0)]], device const float* x [[buffer(1)]],
+                device float* y [[buffer(2)]], constant uint2& p [[buffer(3)]],
+                uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg * 8 + sg;
+    if (row >= p.x) return;
+    float s = row_dot(w + (ulong)row * p.y, x, p.y, lane);
+    if (lane == 0) y[row] = s * 0.01f;
+}
+kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffer(1)]],
+                    device float* xb [[buffer(2)]], device atomic_uint* ctr [[buffer(3)]],
+                    constant uint4& p [[buffer(4)]],
+                    uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]) {
+    for (uint s = 0; s < p.z; s++) {
+        device const half* ws = w + (ulong)s * p.x * p.y;
+        device float* x = (s & 1) ? xb : xa;
+        device float* y = (s & 1) ? xa : xb;
+        for (uint row = tg * 8 + sg; row < p.x; row += p.w * 8) {
+            float v = row_dot(ws + (ulong)row * p.y, x, p.y, lane);
+            if (lane == 0) y[row] = v * 0.01f;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (tid == 0) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            atomic_fetch_add_explicit(ctr, 1u, memory_order_relaxed);
+            while (atomic_load_explicit(ctr, memory_order_relaxed) < (s + 1) * p.w) {}
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+"#;
+        let rt = rt();
+        let dev = rt.device.clone();
+        let lib = dev
+            .new_library_with_source(SRC, &metal::CompileOptions::new())
+            .unwrap();
+        let pso = |n: &str| {
+            dev.new_compute_pipeline_state_with_function(&lib.get_function(n, None).unwrap())
+                .unwrap()
+        };
+        let (sep, persist) = (pso("sep"), pso("persist"));
+        let n = std::env::var("PROBE_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1536usize);
+        let steps = 64usize;
+        let w = new_shared_buffer(&dev, steps * n * n * 2).unwrap();
+        unsafe {
+            let p = w.contents() as *mut u16;
+            for i in 0..steps * n * n {
+                // f16 values in roughly [-0.05, 0.05]
+                *p.add(i) = if i % 3 == 0 {
+                    0x2A66
+                } else if i % 3 == 1 {
+                    0xAA66
+                } else {
+                    0x2800
+                };
+            }
+        }
+        let xa = new_shared_buffer(&dev, n * 4).unwrap();
+        let xb = new_shared_buffer(&dev, n * 4).unwrap();
+        let ctr = new_shared_buffer(&dev, 256).unwrap();
+        let init = |b: &Buffer| unsafe {
+            for i in 0..n {
+                *(b.contents() as *mut f32).add(i) = ((i % 7) as f32 - 3.0) * 0.1;
+            }
+        };
+        let q = dev.new_command_queue();
+        let read = |b: &Buffer| -> Vec<f32> {
+            unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec() }
+        };
+        let run_sep = || -> f64 {
+            init(&xa);
+            let cb = q.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&sep);
+            for s in 0..steps {
+                let (x, y) = if s % 2 == 0 { (&xa, &xb) } else { (&xb, &xa) };
+                enc.set_buffer(0, Some(&w), (s * n * n * 2) as u64);
+                enc.set_buffer(1, Some(x), 0);
+                enc.set_buffer(2, Some(y), 0);
+                set_bytes(enc, 3, &[n as u32, n as u32]);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((n as u64).div_ceil(8), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
+            enc.end_encoding();
+            let t = Instant::now();
+            commit_and_wait(cb).unwrap();
+            t.elapsed().as_secs_f64()
+        };
+        let run_persist = |tgs: u64| -> f64 {
+            init(&xa);
+            unsafe { *(ctr.contents() as *mut u32) = 0 };
+            let cb = q.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&persist);
+            enc.set_buffer(0, Some(&w), 0);
+            enc.set_buffer(1, Some(&xa), 0);
+            enc.set_buffer(2, Some(&xb), 0);
+            enc.set_buffer(3, Some(&ctr), 0);
+            set_bytes(enc, 4, &[n as u32, n as u32, steps as u32, tgs as u32]);
+            enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+            let t = Instant::now();
+            commit_and_wait(cb).unwrap();
+            t.elapsed().as_secs_f64()
+        };
+        let bytes = (n * n * 2) as f64;
+        run_sep();
+        let t_sep = (0..5).map(|_| run_sep()).fold(f64::MAX, f64::min);
+        let want = read(if steps % 2 == 0 { &xa } else { &xb });
+        println!(
+            "separate: {:.1} us/step = {:.0} GB/s",
+            t_sep / steps as f64 * 1e6,
+            bytes * steps as f64 / t_sep / 1e9
+        );
+        for tgs in [20u64, 40, 80, 120] {
+            run_persist(tgs);
+            let t = (0..5).map(|_| run_persist(tgs)).fold(f64::MAX, f64::min);
+            let got = read(if steps % 2 == 0 { &xa } else { &xb });
+            let err = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "persistent {tgs:>3} TGs: {:.1} us/step = {:.0} GB/s, max |diff| {err:e}",
+                t / steps as f64 * 1e6,
+                bytes * steps as f64 / t / 1e9
+            );
+        }
+    }
+
     /// Decode attention GPU time over a long cache for the Gemma-4 layer shapes (8 query heads on one KV
     /// head: full attention hd 512, sliding hd 256 with a 512 window)
     /// (`cargo test --release --lib attention_decode_rates -- --ignored --nocapture`).
