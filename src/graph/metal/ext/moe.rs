@@ -880,8 +880,7 @@ mod tests {
                 let bad = want
                     .iter()
                     .zip(&got)
-                    // Values, not bits: a zero code times a negative scale is -0.0 on the CPU, +0.0 from fma.
-                    .position(|(a, b)| a != b && !(a.is_nan() && b.is_nan()));
+                    .position(|(a, b)| a.to_bits() != b.to_bits());
                 assert!(
                     bad.is_none(),
                     "{f:?} {rows} rows x {} cols: element {bad:?} differs",

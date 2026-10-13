@@ -2063,6 +2063,15 @@ impl Session {
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (mut steps, aliases) = plan(graph)?;
+        if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
+            for (i, s) in steps.iter().enumerate() {
+                eprintln!(
+                    "plan {i:4} {:<46} {}",
+                    s.name,
+                    kernel_kind(&format!("{:?}", s.op))
+                );
+            }
+        }
         for s in &steps {
             for &v in &s.reads {
                 let val = graph.value(v);
