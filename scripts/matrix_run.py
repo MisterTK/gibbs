@@ -219,6 +219,7 @@ def main():
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     done = 0
+    print(f"matrix_run: start (binary {binary()}, commit {commit()[:8]})", flush=True)
     while not stop:
         items = load(MATRIX, {"items": []})["items"]
         state, cur = load(STATE, {}), commit()

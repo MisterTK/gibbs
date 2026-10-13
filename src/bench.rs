@@ -104,7 +104,8 @@ fn median(v: &mut [f64]) -> Option<f64> {
 }
 
 /// Loads `artifacts` on Metal under the `reencode` policy name. Returns the model and the policy
-/// the KL fallback chain actually applied (`None` for native loaders, which ignore it).
+/// whose bytes it streams: the one the KL fallback chain applied for GraphLm loads, `BitExact` for
+/// native loaders (they carry the checkpoint's blocks unchanged until the policy reaches them).
 pub fn load_for_bench(
     artifacts: &crate::model::hub::ModelArtifacts,
     reencode: &str,
@@ -118,7 +119,10 @@ pub fn load_for_bench(
     use crate::model::weight_format::{load_causal_lm_with, ReencodeConfig, ReencodePolicy};
     let placement = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
     match crate::model::native::load_native(artifacts, placement) {
-        Some(Ok(m)) => return Ok((crate::scheduler::ExecutableModel::Native(m), None)),
+        Some(Ok(m)) => {
+            let exec = crate::scheduler::ExecutableModel::Native(m);
+            return Ok((exec, Some(ReencodePolicy::BitExact)));
+        }
         Some(Err(e)) => return Err(e),
         None => {}
     }
@@ -258,7 +262,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         .unwrap_or_default();
 
     let hub = crate::model::hub::HuggingFaceHub::new();
-    let cache = crate::model::hub::HuggingFaceHub::cache_dir();
+    let cache = crate::hardware::default_cache_dir()?;
     let mut rt = crate::graph::metal::Runtime::new(&cache).ok();
     if let Some(r) = rt.as_ref().filter(|r| !r.codec_rates_current()) {
         // The roofline ceiling and the re-encode rule both read measured codec rates.
