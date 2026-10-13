@@ -318,7 +318,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(0);
     }
     if cli.explain_placement {
-        gibbs_engine::bench::explain_placement(&cli.model)?;
+        let hub = HuggingFaceHub::new().with_storage(StorageBackend::from_uri(&cli.storage)?);
+        gibbs_engine::bench::explain_placement(&hub, &cli.model)?;
         std::process::exit(0);
     }
     let telemetry = EngineTelemetry::new();

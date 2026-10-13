@@ -690,10 +690,12 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
 
 /// `--explain-placement`: loads `model_id` on Metal under the effective re-encode policy and
 /// prints where its graph nodes run (op kind, device, avenue) and whether that is 100% on the GPU.
-pub fn explain_placement(model_id: &str) -> Result<(), String> {
+pub fn explain_placement(
+    hub: &crate::model::hub::HuggingFaceHub,
+    model_id: &str,
+) -> Result<(), String> {
     use crate::graph::placement::{placement_table, placement_verdict};
-    let artifacts =
-        crate::model::hub::HuggingFaceHub::new().auto_download_and_cache(model_id, None)?;
+    let artifacts = hub.auto_download_and_cache(model_id, None)?;
     let _lock = crate::hardware::gpu_lock()?;
     let policy = crate::model::weight_format::ReencodeConfig::effective().policy;
     let exec = load_for_bench(&artifacts, policy.name())?.exec;

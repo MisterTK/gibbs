@@ -764,12 +764,14 @@ fn spec_generate(
         exec.step_prefill_chunk(&ids, 0, true, &ids, temperature, DEFAULT_TOP_P, &mut kv)?;
     let prefill_dur = t_prefill.elapsed();
     let prefill_tok_s = ids.len() as f64 / prefill_dur.as_secs_f64().max(1e-9);
-    println!(
-        "⚡ Prefill: {} tokens in {:.2}ms ({:.1} tok/s)",
-        ids.len(),
-        prefill_dur.as_secs_f64() * 1000.0,
-        prefill_tok_s
-    );
+    if !crate::telemetry::TUI_OWNS_TERMINAL.load(std::sync::atomic::Ordering::Relaxed) {
+        println!(
+            "⚡ Prefill: {} tokens in {:.2}ms ({:.1} tok/s)",
+            ids.len(),
+            prefill_dur.as_secs_f64() * 1000.0,
+            prefill_tok_s
+        );
+    }
     let (mut pending, mut out) = (first.into_iter().collect::<Vec<_>>(), Vec::new());
     let (mut all, mut decode, mut tuner) = (ids, Duration::ZERO, KTuner::default());
     let mut decoded = 0usize;

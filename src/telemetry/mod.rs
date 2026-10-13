@@ -440,3 +440,7 @@ mod tests {
         assert_eq!(g.roofline_pct(), None);
     }
 }
+
+/// True while the TUI owns the terminal: text printed to stdout from engine code would corrupt its
+/// screen (the per-instance `is_tui_active` serves the telemetry log only).
+pub static TUI_OWNS_TERMINAL: AtomicBool = AtomicBool::new(false);
