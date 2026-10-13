@@ -399,6 +399,11 @@ impl Weights {
         tensors: impl IntoIterator<Item = (String, usize, crate::hardware::QuantFormat, Vec<usize>)>,
     ) -> Self {
         let cfg = crate::model::weight_format::ReencodeConfig::effective();
+        let tensors: Vec<_> = tensors.into_iter().collect();
+        if let Some(p) = &cfg.progress {
+            p.total
+                .fetch_add(tensors.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         for (name, off, format, shape) in tensors {
             let mut p = Packed {
                 map: map.clone(),
@@ -424,6 +429,9 @@ impl Weights {
                 }
             }
             self.gguf_packed.insert(name, p);
+            if let Some(pr) = &cfg.progress {
+                pr.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         self
     }
