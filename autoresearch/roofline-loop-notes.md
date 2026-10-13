@@ -102,3 +102,6 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 
 ## Iteration 9 (keep): GQA split attention from 48 keys
 - The 128-key threshold of iteration 2/8 left bench-length contexts (prompt ~20 + 128 decoded tokens) mostly on the per-head kernel, which launches `heads` (8) threadgroups. Dropping it to 48 keys: E2B QAT 100.0 -> 122.4 tok/s, E2B Q4_K_M 83.8 -> 101.0, SmolLM2 332.9 -> 399.2 (this was worth +3.8 pp, bigger than the long-context work). Below 48 keys the old kernel still runs; next: always split at decode.
+
+## Iteration 10 (discard): GQA split attention for every decode row
+- Below 48 keys the per-head kernel is only ever used by the first ~28 tokens of a bench run; always splitting gave +0.19 pp (< 0.30 floor, noise 0.24). Reverted.
