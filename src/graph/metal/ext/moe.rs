@@ -53,7 +53,7 @@ pub enum Step {
         /// `x` is one row shared by every row of `idx`.
         shared: bool,
     },
-    MoeLinear {
+    ExpertLinear {
         x: ValueId,
         bank: ValueId,
         ids: ValueId,
@@ -214,7 +214,7 @@ pub(super) fn plan(
                 u32_of(n)?;
             }
             Ok(PlanOut::Step(
-                Step::MoeLinear {
+                Step::ExpertLinear {
                     x,
                     bank,
                     ids,
@@ -307,7 +307,7 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match st {
         Step::TopK { x, .. } => vec![*x],
         Step::GatherCols { x, idx, .. } => vec![*x, *idx],
-        Step::MoeLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
+        Step::ExpertLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
         Step::Embed { table, ids, .. } => vec![*table, *ids],
     }
 }
@@ -317,7 +317,7 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
     match st {
         Step::TopK { .. } => false,
         Step::GatherCols { idx, .. } => v == *idx,
-        Step::MoeLinear { x, .. } => v != *x,
+        Step::ExpertLinear { x, .. } => v != *x,
         Step::Embed { .. } => true,
     }
 }
@@ -415,7 +415,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             set_bytes(enc, 3, &[u32_of(*total)?, u32_of(*cols)?, u32_of(*k)?, *shared as u32]);
             e.grid1(*total);
         }
-        Step::MoeLinear { x, bank, ids, dtype, rows, cols, slots, top_k, experts, x_per_slot } => {
+        Step::ExpertLinear { x, bank, ids, dtype, rows, cols, slots, top_k, experts, x_per_slot } => {
             let c = bank_codec(*dtype).ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
             let pso = moe_gemv_pso(sess, c)?;
             enc.set_compute_pipeline_state(&pso);
