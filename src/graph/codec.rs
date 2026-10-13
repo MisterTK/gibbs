@@ -36,6 +36,53 @@ pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
     }
 }
 
+/// Optional wide decode for formats whose 8-element sub-blocks share bytes (2-bit planes: four sub-blocks
+/// are the four shifts of the same 8 bytes) and whose elements are `(code - offset) * scale`. `decode8`
+/// re-reads those bytes once per sub-block and applies the affine map per element; a wide codec decodes a
+/// whole group once, as raw codes, and the GEMV applies `scale * (sum(code * x) - offset * sum(x))` per
+/// group (a different rounding than `decode8`, so GEMV parity is tolerance-based). A block has `groups`
+/// groups of `segs` segments of 8 elements.
+pub struct Wide {
+    pub groups: u32,
+    pub segs: u32,
+    pub offset: f32,
+    /// MSL defining `inline uint group_seg(uint g, uint k)` (block offset of segment `k` of group `g`) and
+    /// `inline void decode_group(device const uchar* blk, uint g, thread float* out)`, which writes the
+    /// `8 * segs` raw codes of the group in segment order, then the block scale at `out[8 * segs]`.
+    pub msl: &'static str,
+}
+
+pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
+    match format {
+        QuantFormat::GGUF_TQ2_0 => Some(&WIDE_TQ2_0),
+        _ => None,
+    }
+}
+
+static WIDE_TQ2_0: Wide = Wide {
+    groups: 8,
+    segs: 4,
+    offset: 1.0,
+    // Byte j of a 32-byte plane holds elements j, j+32, j+64, j+96 of its 128-element half, so group g
+    // (8 bytes of half g/4) is segment k at element (g/4)*128 + k*32 + (g%4)*8.
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return (g >> 2) * 128 + k * 32 + (g & 3) * 8; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    float d = cd_f16(blk + 64);
+    device const ushort* q = (device const ushort*)(blk + (g >> 2) * 32 + (g & 3) * 8);
+    uint a = uint(q[0]) | (uint(q[1]) << 16);
+    uint b = uint(q[2]) | (uint(q[3]) << 16);
+    for (uint k = 0; k < 4; k++) {
+        float4 lo = float4(as_type<uchar4>((a >> (2 * k)) & 0x03030303u));
+        float4 hi = float4(as_type<uchar4>((b >> (2 * k)) & 0x03030303u));
+        out[8 * k + 0] = lo.x; out[8 * k + 1] = lo.y; out[8 * k + 2] = lo.z; out[8 * k + 3] = lo.w;
+        out[8 * k + 4] = hi.x; out[8 * k + 5] = hi.y; out[8 * k + 6] = hi.z; out[8 * k + 7] = hi.w;
+    }
+    out[32] = d;
+}
+"#,
+};
+
 pub const CODEC_Q4_0: Codec = Codec {
     format: QuantFormat::GGUF_Q4_0,
     block_elems: 32,
