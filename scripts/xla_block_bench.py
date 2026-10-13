@@ -60,12 +60,13 @@ x = jnp.asarray(rng.standard_normal(H), dt)
 kc = jnp.asarray(rng.standard_normal((NKV, T, HD)), dt)
 vc = jnp.asarray(rng.standard_normal((NKV, T, HD)), dt)
 pos = jnp.int32(100)
+kernels = None  # the jax-metal plugin's compiled.as_text() is None: no HLO fusion list, time is still measured
 try:
     txt = f.lower(x, kc, vc, pos, P).compile().as_text()
-    kernels = len(re.findall(r"^\s*(?:ROOT )?%?\S+ = .*\b(?:fusion|custom-call)\(", txt, re.M))
-except Exception as e:  # compiled text unavailable on the plugin
-    print(json.dumps({"xla_us_per_block": None, "xla_kernels": None, "error": f"as_text: {e}"}))
-    sys.exit(0)
+    if txt:
+        kernels = len(re.findall(r"^\s*(?:ROOT )?%?\S+ = .*\b(?:fusion|custom-call)\(", txt, re.M))
+except Exception as e:
+    print("as_text unavailable:", e, file=sys.stderr)
 for _ in range(20):
     jax.block_until_ready(f(x, kc, vc, pos, P))
 ts = []

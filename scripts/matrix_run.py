@@ -212,12 +212,17 @@ def summary():
                 c[r[key]] = c.get(r[key], 0) + 1
         print(f"{key}: {c}")
     classes, oos = {}, []
+    first_party = {"unsloth", "google", "Qwen", "meta-llama", "mistralai", "microsoft", "deepseek-ai", "openai",
+                   "nvidia", "ibm-granite", "LiquidAI", "zai-org", "HuggingFaceTB", "allenai", "moonshotai",
+                   "MiniMaxAI", "XiaomiMiMo", "tencent", "stepfun-ai", "CohereLabs", "inclusionAI", "arcee-ai",
+                   "baidu", "ByteDance-Seed"}
     for r in rows:
         for e in (r.get("error"), r.get("parity_error") if r.get("parity") == "fail" else None):
             if not e:
                 continue
-            # modified/fine-tuned architectures (extra or renamed tensors) are out of scope: no burn-down, not a stop-rule blocker
-            if re.search(r"is not part of the \w+ graph|unsupported tensor", str(e)):
+            # Modified / fine-tuned third-party repos with extra or renamed tensors are out of scope (no burn-down,
+            # not a stop-rule blocker). The message alone is not enough: stock loaders emit it for real gaps too.
+            if re.search(r"is not part of the \w+ graph|unsupported tensor", str(e)) and r["id"].split("/")[0] not in first_party:
                 oos.append(r["id"])
             else:
                 classes.setdefault(norm_error(e), []).append(r["id"])

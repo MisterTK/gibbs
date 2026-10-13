@@ -3608,7 +3608,7 @@ impl Session {
                 let packed = self
                     .weights
                     .get(gate_name)
-                    .is_some_and(|w| !matches!(w.3, WeightFormat::F32 | WeightFormat::U32));
+                    .is_some_and(|w| !matches!(w.3, WeightFormat::F32 | WeightFormat::U32 | WeightFormat::JesseLUT));
                 if packed {
                     self.encode_gemv_or_gemm(
                         enc,
@@ -4020,6 +4020,21 @@ const FUSION_SEARCH_TIE: f64 = 0.03;
 /// Wall-time budget of one search; later candidates are skipped once it is spent.
 const FUSION_SEARCH_BUDGET_MS: u128 = 600;
 
+/// Whether another client keeps the GPU busy (`ioreg` "Device Utilization %" above 20): timings taken now
+/// are not persisted. An unreadable value counts as idle.
+fn device_busy() -> bool {
+    std::process::Command::new("ioreg")
+        .args(["-r", "-d", "1", "-c", "IOAccelerator"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let t = String::from_utf8_lossy(&o.stdout).into_owned();
+            let rest = t.split("\"Device Utilization %\"=").nth(1)?;
+            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
+        })
+        .is_some_and(|u| u > 20)
+}
+
 fn fusion_key(graph: &Graph) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -4084,7 +4099,7 @@ impl Session {
                     }
                 };
                 // A search cut short by its budget (a busy device) is not persisted.
-                if complete {
+                if complete && !device_busy() {
                     cache.insert(key, f.bits());
                     if let Some(dir) = path.parent() {
                         let _ = std::fs::create_dir_all(dir);
@@ -6096,10 +6111,14 @@ mod tests {
         }
         let mut samples = take_run_samples();
         assert_eq!(samples.len(), 200);
+        let mut run: Vec<u64> = samples.iter().map(|s| s.run_ns).collect();
+        run.sort_unstable();
         samples.sort_by_key(|s| s.gpu_ns);
+        // `run_us` (host wall per call, dispatch and sync included) is the basis comparable with XLA's timing.
         println!(
-            "FUSION_BLOCK {{\"us\": {:.1}, \"dispatches\": {}}}",
+            "FUSION_BLOCK {{\"us\": {:.1}, \"run_us\": {:.1}, \"dispatches\": {}}}",
             samples[100].gpu_ns as f64 / 1e3,
+            run[100] as f64 / 1e3,
             samples[100].dispatches
         );
     }
@@ -6136,6 +6155,35 @@ mod tests {
         // Each switch removes dispatches (index = switch bits: batch 1, append 2, merge 4).
         for off in [0b110, 0b101, 0b011] {
             assert!(dispatches[7] < dispatches[off], "{dispatches:?}");
+        }
+    }
+
+    /// Consecutive decode steps (positions 60..128, fresh random activations each, the cache filling as it
+    /// goes) with every fusion forced on, against the CPU executor on the same state sequence: the fused append
+    /// and the ticket merge reuse one partials scratch and counters across steps, so a stale read or an
+    /// unreset ticket shows up as a drift after the first step.
+    #[test]
+    fn fused_decode_steps_stay_equal_to_cpu_over_many_positions() {
+        let (g, w) = decode_block();
+        let s = Session::new(rt(), &w).unwrap();
+        s.force_dispatch_us(1000.0);
+        let plan = s.prepare_plan(&g).unwrap();
+        let (mut cpu_state, mut gpu_state) = (StateStore::new(), StateStore::new());
+        for (i, pos) in (60u32..128).enumerate() {
+            let inputs = vec![Tensor::F32(rand(1536, 100 + i as u64)), Tensor::U32(vec![pos])];
+            let want = cpu::run(&g, &w, &mut cpu_state, inputs.clone())
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            let got = s
+                .run_prepared(&g, &plan, Some(&mut gpu_state), inputs)
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            let e = rel_err(&want, &got);
+            assert!(e < 2e-3, "position {pos}: {e}");
         }
     }
 
