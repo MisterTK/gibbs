@@ -81,6 +81,7 @@ impl TuiApp {
         }
         let r = layout::regions(area);
         let v = self.vitals();
+        self.kernels_visible.set(false);
         self.render_status(f, r.status, &v, &th);
 
         let compact = r.tier == Tier::Compact;
@@ -329,6 +330,7 @@ impl TuiApp {
                 ("^P", "logprobs"),
                 ("^T", "tokens"),
                 ("^L", "latency"),
+                ("^K", "kernels"),
                 ("↑↓", "scroll"),
                 ("q", "quit"),
             ],
@@ -338,6 +340,7 @@ impl TuiApp {
                 ("^P", "logprobs"),
                 ("^T", "tokens"),
                 ("^L", "latency"),
+                ("^K", "kernels"),
                 ("esc/ctrl-x", "cancel chat"),
                 ("ctrl-c", "quit"),
             ],

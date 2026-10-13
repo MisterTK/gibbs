@@ -2,16 +2,16 @@
 //! `GIBBS_TUI_SNAPSHOT=1 cargo test --lib -q tui::snapshot -- --ignored` writes
 //! `target/tui-snapshot.html`.
 
-use super::{mascot::MascotState, theme, Kind, TuiApp};
+use super::{mascot::MascotState, theme, DeviceStatus, Kind, TuiApp};
 use crate::kv::PagedKVPool;
-use crate::telemetry::EngineTelemetry;
+use crate::telemetry::{EngineTelemetry, GapSample, KernelRow};
 use ratatui::{
     backend::TestBackend,
     buffer::Buffer,
     style::{Color, Modifier},
     Terminal,
 };
-use std::{fmt::Write as _, sync::Arc, time::Duration};
+use std::{fmt::Write as _, sync::Arc, time::{Duration, Instant}};
 
 const DEFAULT_FG: (u8, u8, u8) = (0xF5, 0xEE, 0xDB);
 const DEFAULT_BG: (u8, u8, u8) = (0x14, 0x10, 0x0D);
@@ -189,8 +189,39 @@ pub(super) fn fixture_app() -> TuiApp {
         .fetch_add(9_412, std::sync::atomic::Ordering::Relaxed);
     telemetry.log_info("model gemma-4-E2B-it-qat ready");
     telemetry.log_info("compiled graph program: 1 segment, Metal");
-    telemetry.log_warn("codec-bench not run; using hand kernels");
+    telemetry.log_info("codec-bench: measured 14 formats");
     app.gemm_peak_gflops = 14_000.0;
+    // The runtime-fed instruments: where a 5.4 ms token goes, the last kernel profile, and a
+    // finished codec bench with its tuned shapes.
+    telemetry.record_gap(GapSample {
+        wall_ms: 5.4,
+        run_ms: 5.2,
+        gpu_ms: 4.5,
+        weights_ms: 3.9,
+        dispatches: 612,
+    });
+    app.profile_sampling = true;
+    app.device_status = DeviceStatus {
+        codec: (2, 14, 14),
+        tune: (31, 31),
+    };
+    let row = |kind: &str, steps, us, gbps, pct| KernelRow {
+        kind: kind.into(),
+        steps,
+        us,
+        gbps,
+        pct,
+    };
+    app.kernel_profile = Some((
+        Instant::now(),
+        vec![
+            row("GemvPacked", 232, 3_650.0, 231.0, 84.0),
+            row("RmsNorm", 212, 410.0, 38.0, 14.0),
+            row("CachedAttention", 35, 260.0, 52.0, 19.0),
+            row("Elementwise", 128, 150.0, 21.0, 8.0),
+            row("Rope", 50, 40.0, 9.0, 3.0),
+        ],
+    ));
     app.running = 1;
     for (i, v) in app.spark.iter_mut().enumerate().skip(80) {
         *v = 150 + ((i * 37) % 60) as u64;

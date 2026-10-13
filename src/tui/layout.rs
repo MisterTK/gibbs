@@ -7,12 +7,14 @@ use ratatui::layout::Rect;
 pub enum Comp {
     Avatar,
     Roofline,
+    Gap,
     Tokens,
     Latency,
     Logprobs,
     Weights,
     Memory,
     Device,
+    Kernels,
     Load,
 }
 
@@ -54,18 +56,20 @@ const fn spec(comp: Comp, min_h: u16, pref_h: u16, max_h: u16, priority: u8) -> 
 pub fn default_specs(col_w: u16, area_h: u16, loading: bool, focused: Option<Comp>) -> Vec<Spec> {
     let mut v = vec![
         spec(Comp::Roofline, 6, 8, 12, 1),
-        spec(Comp::Tokens, 5, 6, 8, 2),
-        spec(Comp::Latency, 5, 6, 8, 3),
-        spec(Comp::Logprobs, 6, 8, 12, 4),
-        spec(Comp::Weights, 5, 7, 12, 5),
-        spec(Comp::Memory, 4, 4, 6, 7),
-        spec(Comp::Device, 3, 3, 4, 8),
+        spec(Comp::Gap, 4, 6, 7, 2),
+        spec(Comp::Tokens, 5, 6, 8, 3),
+        spec(Comp::Latency, 5, 6, 8, 4),
+        spec(Comp::Logprobs, 6, 8, 12, 5),
+        spec(Comp::Weights, 5, 7, 12, 6),
+        spec(Comp::Memory, 4, 4, 6, 8),
+        spec(Comp::Device, 4, 4, 6, 9),
+        spec(Comp::Kernels, 6, 10, 14, 10),
     ];
     if loading {
         v.push(spec(Comp::Load, 7, 7, 7, 0));
     }
     if col_w >= 24 && area_h >= 44 {
-        v.push(spec(Comp::Avatar, 12, 16, 30, 6));
+        v.push(spec(Comp::Avatar, 12, 16, 30, 7));
     }
     if let Some(f) = focused {
         for s in v.iter_mut().filter(|s| s.comp == f) {
@@ -249,7 +253,7 @@ mod tests {
                 if h < 20 {
                     assert!(r.sidebar.is_empty(), "{w}x{h}");
                 }
-                for focused in [None, Some(Comp::Logprobs)] {
+                for focused in [None, Some(Comp::Logprobs), Some(Comp::Kernels)] {
                     for loading in [false, true] {
                         let cw = r.sidebar.first().map_or(0, |c| c.width);
                         let specs = default_specs(cw, h, loading, focused);
@@ -282,14 +286,20 @@ mod tests {
     fn short_terminal_has_no_sidebar_and_priority_order_wins() {
         let r = regions(Rect::new(0, 0, 200, 19));
         assert!(r.sidebar.is_empty());
-        // 17 rows: Roofline (6), Tokens (5), Latency (5) fit at min; nothing else fits.
+        // 17 rows: Roofline (6), Gap (4), Tokens (5) fit at min; nothing else fits.
         let specs = default_specs(40, 30, false, None);
         let plan = flow(&specs, Rect::new(0, 0, 40, 17), 1);
-        assert!(plan.rect(Comp::Latency).is_some());
-        assert!(plan.rect(Comp::Logprobs).is_none());
-        // The spare row goes to Roofline first (min 6 → 7).
-        assert_eq!(plan.rect(Comp::Roofline).unwrap().height, 7);
+        assert!(plan.rect(Comp::Gap).is_some() && plan.rect(Comp::Tokens).is_some());
+        assert!(plan.rect(Comp::Latency).is_none());
+        // The two spare rows go to Roofline first (min 6 → 8).
+        assert_eq!(plan.rect(Comp::Roofline).unwrap().height, 8);
+        assert_eq!(plan.rect(Comp::Gap).unwrap().height, 4);
         assert_eq!(plan.rect(Comp::Tokens).unwrap().height, 5);
+        // Kernels ranks last: it only appears once everything else has its minimum.
+        let tall = flow(&specs, Rect::new(0, 0, 40, 60), 1);
+        assert!(tall.rect(Comp::Kernels).is_some());
+        let tight = flow(&specs, Rect::new(0, 0, 40, 39), 1);
+        assert!(tight.rect(Comp::Kernels).is_none() && tight.rect(Comp::Device).is_some());
     }
 
     #[test]
