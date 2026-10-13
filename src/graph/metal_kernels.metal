@@ -1666,6 +1666,8 @@ struct AttnCachedParams {
     uint start_pos;
     uint m;
     uint has_vis;
+    uint n_splits; // > 1: this launch covers one `chunk`-key slice of the row's keys (grid z = slice)
+    uint chunk;
 };
 
 inline void attn_cached_f32_impl(device const float* q,
@@ -1675,6 +1677,7 @@ inline void attn_cached_f32_impl(device const float* q,
                                  constant AttnCachedParams& p,
                                  device const uint* vis,
                                  uint2 tg,
+                                 uint split,
                                  uint sg,
                                  uint lane,
                                  uint nsg,
@@ -1702,7 +1705,12 @@ inline void attn_cached_f32_impl(device const float* q,
     float m = -FLT_MAX;
     float l = 0.0f;
     uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
-    for (uint t = lo + sg; t < len; t += nsg) {
+    uint hi = len;
+    if (p.n_splits > 1) {
+        lo += split * p.chunk;
+        hi = min(len, lo + p.chunk);
+    }
+    for (uint t = lo + sg; t < hi; t += nsg) {
         device const float* k = kc + (ulong)t * p.stride + kv_off;
         device const float* v = vc + (ulong)t * p.stride + kv_off;
         float s = 0.0f;
@@ -1738,6 +1746,20 @@ inline void attn_cached_f32_impl(device const float* q,
     for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[i]);
     float gl = 0.0f;
     for (uint i = 0; i < nsg; ++i) gl += tg_l[i] * exp(tg_m[i] - gm);
+    if (p.n_splits > 1) {
+        // Partial of this key range for `attn_cached_merge_f32`: [max, sum of exp, hd weighted values].
+        device float* part = out + (((ulong)q_tok * p.n_heads + head) * p.n_splits + split) * (hd + 2);
+        if (sg == 0 && lane == 0) {
+            part[0] = gm;
+            part[1] = gl;
+        }
+        for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
+            float o = 0.0f;
+            for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
+            part[2 + d] = o;
+        }
+        return;
+    }
     for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
         float o = 0.0f;
         for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
@@ -1758,7 +1780,7 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, 0u, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
@@ -1774,7 +1796,45 @@ kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, 0u, sg, lane, nsg, tg_m, tg_l, tg_acc);
+}
+
+// Decode attention over a long cache: grid (heads, rows, slices), each threadgroup scans one `p.chunk`-key
+// slice and writes its partial; `attn_cached_merge_f32` combines the slices.
+kernel void attn_cached_split_f32(device const float* q [[buffer(0)]],
+                                  device const float* kc [[buffer(1)]],
+                                  device const float* vc [[buffer(2)]],
+                                  device float* part [[buffer(3)]],
+                                  constant AttnCachedParams& p [[buffer(4)]],
+                                  device const uint* vis [[buffer(5)]],
+                                  uint3 tg3 [[threadgroup_position_in_grid]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]],
+                                  uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tg_m[ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_MAX_SG];
+    threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
+    attn_cached_f32_impl(q, kc, vc, part, p, vis, tg3.xy, tg3.z, sg, lane, nsg, tg_m, tg_l, tg_acc);
+}
+
+kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
+                                  device float* out [[buffer(1)]],
+                                  constant AttnCachedParams& p [[buffer(2)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint2 ntg [[threads_per_threadgroup]]) {
+    const uint hd = p.head_dim, head = tg.x, q_tok = tg.y;
+    if (head >= p.n_heads || q_tok >= p.m) return;
+    device const float* base = part + ((ulong)q_tok * p.n_heads + head) * p.n_splits * (hd + 2);
+    float gm = -FLT_MAX;
+    for (uint s = 0; s < p.n_splits; ++s) gm = max(gm, base[s * (hd + 2)]);
+    float gl = 0.0f;
+    for (uint s = 0; s < p.n_splits; ++s) gl += base[s * (hd + 2) + 1] * exp(base[s * (hd + 2)] - gm);
+    for (uint d = tid; d < hd; d += ntg.x) {
+        float o = 0.0f;
+        for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
+    }
 }
 
 struct PagedAttnCachedParams {
