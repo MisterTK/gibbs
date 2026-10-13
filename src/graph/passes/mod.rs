@@ -7,7 +7,7 @@ pub mod fusion;
 pub mod megakernel;
 
 use crate::graph::pattern::validate_ssa;
-use crate::graph::{lower_moe_pass, Graph, Weights};
+use crate::graph::{Graph, Weights};
 
 /// Runs all canonical graph optimization passes on `graph` and its `weights`.
 pub fn run_optimization_passes(
@@ -17,18 +17,15 @@ pub fn run_optimization_passes(
     canonical::run(graph);
     decompose::run(graph);
     dtype_adapt::run(graph);
-    // 1. Lower MoE nodes if present
-    lower_moe_pass(graph)?;
-
-    // 2. Megakernel Fusion (fuses entire transformer blocks: RmsNorm -> Gate/Up -> SwiGlu -> Down -> Add)
+    // 1. Megakernel Fusion (fuses entire transformer blocks: RmsNorm -> Gate/Up -> SwiGlu -> Down -> Add)
     megakernel::fuse_megakernel_blocks_pass(graph);
 
-    // 3. Gate-Up MLP Fusion (for any unfused MLP blocks)
+    // 2. Gate-Up MLP Fusion (for any unfused MLP blocks)
     fusion::fuse_gate_up_pass(graph, weights.as_deref_mut());
 
-    // 4. QKV Projection Fusion
+    // 3. QKV Projection Fusion
     fusion::fuse_qkv_pass(graph, weights.as_deref_mut());
-    // 5. Verify graph SSA integrity
+    // 4. Verify graph SSA integrity
     validate_ssa(graph)?;
 
     Ok(())

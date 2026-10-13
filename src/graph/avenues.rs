@@ -392,10 +392,22 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 (Op::GeGlu, F32),
                 (Op::Mul, F32),
                 (unary(UnaryKind::SoftCap(30.0)), F32),
+                // The sparse (routed expert) layers.
+                (Op::TopK { k: 8 }, F32),
+                (Op::GatherCols, F32),
+                (Op::Softmax { axis: -1 }, F32),
+                (Op::MoeLinear { experts: 128, top_k: 8 }, q4),
             ]);
         }
         Family::Qwen35 | Family::Ninfer => {
             decoder(&mut ops);
+            // Routed experts of the MoE checkpoints.
+            ops.extend([
+                (Op::TopK { k: 8 }, F32),
+                (Op::GatherCols, F32),
+                (Op::Softmax { axis: -1 }, F32),
+                (Op::MoeLinear { experts: 128, top_k: 8 }, q4),
+            ]);
             ops.extend([
                 (
                     Op::DeltaRule {

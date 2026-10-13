@@ -1,81 +1,73 @@
-// Group `moe`: top-k softmax for any k, MoE combine helpers, F16/BF16 embedding gathers.
+// Group `moe`: row top-k, column gather, and F16/BF16 embedding gathers (the expert GEMV is generated).
 
-// Softmax over the k largest logits of each row (others 0); k >= cols is a plain softmax.
-// One thread per row; selection is k passes over the row (routers are narrow), `out` marks picks with -1.
+// Indices of the k largest values of each row, value descending, equal values lower index first, NaN
+// below every number (`graph::cpu::topk_row` orders the same way). One threadgroup of 256 threads per
+// row; round j picks the best element that sorts strictly after round j-1's pick, so no mask is needed.
 struct MoeTopKParams { uint rows; uint cols; uint k; };
 
-kernel void moe_topk_softmax_f32(device const float* x [[buffer(0)]],
-                                 device float* out [[buffer(1)]],
-                                 constant MoeTopKParams& p [[buffer(2)]],
-                                 uint row [[thread_position_in_grid]]) {
-    if (row >= p.rows) return;
+inline float moe_key(float v) { return isnan(v) ? -INFINITY : v; }
+
+// (v1, i1) is the better candidate unless (v2, i2) is a real element that sorts before it.
+inline void moe_pick(thread float& v1, thread uint& i1, float v2, uint i2) {
+    if (i2 == 0xFFFFFFFFu) return;
+    if (i1 == 0xFFFFFFFFu || v2 > v1 || (v2 == v1 && i2 < i1)) { v1 = v2; i1 = i2; }
+}
+
+kernel void moe_topk_f32(device const float* x [[buffer(0)]],
+                         device uint* out [[buffer(1)]],
+                         constant MoeTopKParams& p [[buffer(2)]],
+                         uint row [[threadgroup_position_in_grid]],
+                         uint t [[thread_position_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sv[8];
+    threadgroup uint si[8];
+    threadgroup float prev_v;
+    threadgroup uint prev_i;
     device const float* xr = x + (ulong)row * p.cols;
-    device float* yr = out + (ulong)row * p.cols;
-    uint n = p.cols;
-    uint k = min(p.k, n);
-    if (k >= n) {
-        float mx = xr[0];
-        for (uint i = 1; i < n; ++i) mx = max(mx, xr[i]);
-        float sum = 0.0f;
-        for (uint i = 0; i < n; ++i) {
-            float e = exp(xr[i] - mx);
-            yr[i] = e;
-            sum += e;
+    if (t == 0) { prev_v = INFINITY; prev_i = 0xFFFFFFFFu; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint round = 0; round < p.k; ++round) {
+        const float pv = prev_v;
+        const uint pi = prev_i;
+        float bv = -INFINITY;
+        uint bi = 0xFFFFFFFFu;
+        for (uint i = t; i < p.cols; i += 256) {
+            const float v = moe_key(xr[i]);
+            // Eligible: sorts after the previous pick (round 0: pv = +inf, pi = none, everything).
+            if (pi == 0xFFFFFFFFu || v < pv || (v == pv && i > pi)) moe_pick(bv, bi, v, i);
         }
-        float inv = 1.0f / max(sum, 1e-12f);
-        for (uint i = 0; i < n; ++i) yr[i] *= inv;
-        return;
-    }
-    for (uint i = 0; i < n; ++i) yr[i] = 0.0f;
-    float top = 0.0f;
-    float sum = 0.0f;
-    for (uint s = 0; s < k; ++s) {
-        uint bi = n;
-        float best = 0.0f;
-        for (uint i = 0; i < n; ++i) {
-            if (yr[i] == 0.0f && (bi == n || xr[i] > best)) { best = xr[i]; bi = i; }
+        for (uint off = 16; off > 0; off >>= 1) {
+            float ov = simd_shuffle_down(bv, off);
+            uint oi = simd_shuffle_down(bi, off);
+            moe_pick(bv, bi, ov, oi);
         }
-        if (s == 0) top = best;
-        sum += exp(best - top);
-        yr[bi] = -1.0f;
+        if (lane == 0) { sv[sg] = bv; si[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t == 0) {
+            float fv = sv[0];
+            uint fi = si[0];
+            for (uint g = 1; g < 8; ++g) moe_pick(fv, fi, sv[g], si[g]);
+            out[(ulong)row * p.k + round] = fi;
+            prev_v = fv;
+            prev_i = fi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float inv = 1.0f / max(sum, 1e-12f);
-    for (uint i = 0; i < n; ++i) yr[i] = yr[i] < 0.0f ? exp(xr[i] - top) * inv : 0.0f;
 }
 
-kernel void moe_zero_f32(device float* out [[buffer(0)]],
-                         constant uint& n [[buffer(1)]],
-                         uint i [[thread_position_in_grid]]) {
-    if (i < n) out[i] = 0.0f;
-}
+// out[r, j] = x[r, idx[r, j]] (one shared x row when `shared`); one thread per output element. An
+// index past the row writes NaN.
+struct MoeGatherParams { uint total; uint cols; uint k; uint shared; };
 
-// Per expert, indirect dispatch arguments `[gemv xyz, accumulate xyz]` (6 u32): the full grids when any
-// row routes to the expert, else zero threadgroups, so unselected experts read no weights.
-struct MoeArgsParams { uint m; uint experts; uint actual; uint g0; uint g1; uint g2; uint a0; uint a1; uint a2; };
-
-kernel void moe_args(device const float* probs [[buffer(0)]],
-                     device uint* args [[buffer(1)]],
-                     constant MoeArgsParams& p [[buffer(2)]],
-                     uint e [[thread_position_in_grid]]) {
-    if (e >= p.actual) return;
-    bool any = false;
-    for (uint r = 0; r < p.m && !any; ++r) any = probs[(ulong)r * p.experts + e] != 0.0f;
-    device uint* a = args + e * 6;
-    a[0] = any ? p.g0 : 0u; a[1] = any ? p.g1 : 0u; a[2] = any ? p.g2 : 0u;
-    a[3] = any ? p.a0 : 0u; a[4] = any ? p.a1 : 0u; a[5] = any ? p.a2 : 0u;
-}
-
-// out[r, :] += probs[r, e] * tmp[r, :]; grid (ceil(d / TG), m).
-struct MoeAccumParams { uint m; uint d; uint experts; uint e; };
-
-kernel void moe_accum_f32(device float* out [[buffer(0)]],
-                          device const float* tmp [[buffer(1)]],
-                          device const float* probs [[buffer(2)]],
-                          constant MoeAccumParams& p [[buffer(3)]],
-                          uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.d || gid.y >= p.m) return;
-    ulong i = (ulong)gid.y * p.d + gid.x;
-    out[i] += probs[(ulong)gid.y * p.experts + p.e] * tmp[i];
+kernel void moe_gather_cols_f32(device const float* x [[buffer(0)]],
+                                device const uint* idx [[buffer(1)]],
+                                device float* out [[buffer(2)]],
+                                constant MoeGatherParams& p [[buffer(3)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= p.total) return;
+    uint c = idx[i];
+    out[i] = c < p.cols ? x[(p.shared != 0 ? 0 : (ulong)(i / p.k) * p.cols) + c] : NAN;
 }
 
 // out[t, :] = table[ids[t], :]; grid (ceil(d / TG), n). ids are range-checked on the host.

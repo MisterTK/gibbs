@@ -44,7 +44,9 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::MeanPool
         | Op::L2Normalize
         | Op::Softmax { .. }
-        | Op::TopKSoftmax { .. }
+        | Op::TopK { .. }
+        | Op::GatherCols
+        | Op::MoeLinear { .. }
         | Op::Slice { .. }
         | Op::Conv2d { .. }
         | Op::Conv1d { .. }
@@ -147,6 +149,7 @@ pub fn run(
         let ins = &node.inputs;
         let last_dim = |k: usize| graph.value(ins[k]).shape.last().copied().unwrap_or(0);
 
+        let mut out_u32: Option<Vec<u32>> = None;
         let out = match &node.op {
             Op::Embedding => {
                 let table_slot = slot(&bound, &slots, ins, name, 0)?;
@@ -607,52 +610,68 @@ pub fn run(
                 }
                 out
             }
-            Op::TopKSoftmax { axis: _, .. } => {
+            Op::TopK { k } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
-                let x_shape = &graph.value(ins[0]).shape;
-                let cols = x_shape.last().copied().unwrap_or(x.len()).max(1);
-                let rows = x.len() / cols;
-                let k_opt = match node.op {
-                    Op::TopKSoftmax { k, .. } => Some(k),
-                    _ => None,
-                };
-                let mut out = vec![0.0f32; x.len()];
-                for r in 0..rows {
-                    let row = &x[r * cols..(r + 1) * cols];
-                    let out_row = &mut out[r * cols..(r + 1) * cols];
-                    let k = k_opt.unwrap_or(cols).min(cols);
-                    if k >= cols {
-                        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut sum_e = 0.0f32;
-                        for (&v, o) in row.iter().zip(out_row.iter_mut()) {
-                            let e = (v - max_val).exp();
-                            *o = e;
-                            sum_e += e;
-                        }
-                        let inv = 1.0 / sum_e.max(1e-12);
-                        out_row.iter_mut().for_each(|o| *o *= inv);
-                    } else {
-                        let mut indexed: Vec<(usize, f32)> =
-                            row.iter().copied().enumerate().collect();
-                        indexed.sort_unstable_by(|a, b| {
-                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        let top = &indexed[..k];
-                        let max_val = top[0].1;
-                        let mut sum_e = 0.0f32;
-                        let mut exps = Vec::with_capacity(k);
-                        for &(_, val) in top {
-                            let e = (val - max_val).exp();
-                            exps.push(e);
-                            sum_e += e;
-                        }
-                        let inv = 1.0 / sum_e.max(1e-12);
-                        for (&(idx, _), e) in top.iter().zip(exps) {
-                            out_row[idx] = e * inv;
-                        }
+                let cols = last_dim(0);
+                if *k == 0 || *k > cols || x.len() % cols != 0 {
+                    return Err(format!(
+                        "node '{name}': TopK needs 1 <= k <= row width, got k={k} over {cols} columns of {} values",
+                        x.len()
+                    ));
+                }
+                out_u32 = Some(
+                    x.chunks_exact(cols)
+                        .flat_map(|row| topk_row(row, *k))
+                        .collect(),
+                );
+                Vec::new()
+            }
+            Op::GatherCols => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                let idx = operand_u32(&bound, &slots, ins, name, 1)?;
+                let (cols, k) = (last_dim(0), last_dim(1));
+                if cols == 0 || k == 0 || x.len() % cols != 0 || idx.len() % k != 0 {
+                    return Err(format!("node '{name}': GatherCols needs x [rows, n] and idx [rows, k]"));
+                }
+                // One x row serves every idx row (a shared table such as per-expert scales).
+                let shared = x.len() == cols;
+                if !shared && x.len() / cols != idx.len() / k {
+                    return Err(format!(
+                        "node '{name}': GatherCols needs x and idx over the same rows, or a single x row"
+                    ));
+                }
+                let mut out = Vec::with_capacity(idx.len());
+                for (r, row) in idx.chunks_exact(k).enumerate() {
+                    for &c in row {
+                        let v = x[if shared { 0 } else { r * cols }..][..cols].get(c as usize).ok_or_else(|| {
+                            format!("node '{name}': column {c} out of range for {cols} columns")
+                        })?;
+                        out.push(*v);
                     }
                 }
                 out
+            }
+            Op::MoeLinear { experts, top_k } => {
+                let x = operand(&bound, &slots, ins, name, 0)?;
+                let bank = slot(&bound, &slots, ins, name, 1)?;
+                let ids = operand_u32(&bound, &slots, ins, name, 2)?;
+                let [bank_rows, in_f] = graph.value(ins[1]).shape[..] else {
+                    return Err(format!("node '{name}': the expert bank is not [experts * out, in]"));
+                };
+                if *experts == 0 || *top_k == 0 || in_f == 0 || bank_rows % experts != 0 || ids.len() % top_k != 0 {
+                    return Err(format!(
+                        "node '{name}': MoeLinear needs experts, top_k >= 1 and a [experts * out, in] bank with [m, top_k] ids"
+                    ));
+                }
+                let (out_f, slots_n) = (bank_rows / experts, ids.len());
+                let x_rows = x.len() / in_f;
+                if x.len() % in_f != 0 || (x_rows != slots_n && x_rows * top_k != slots_n) {
+                    return Err(format!(
+                        "node '{name}': x of {} values is neither [m, {in_f}] nor [m * {top_k}, {in_f}] for {slots_n} slots",
+                        x.len()
+                    ));
+                }
+                moe_linear_cpu(x, bank, ids, [*experts, *top_k, in_f, out_f], name)?
             }
             Op::Rope {
                 head_dim,
@@ -1639,7 +1658,10 @@ pub fn run(
                 slots[v.0 as usize] = None;
             }
         }
-        slots[node.outputs[0].0 as usize] = Some(Tensor::F32(out));
+        slots[node.outputs[0].0 as usize] = Some(match out_u32 {
+            Some(idx) => Tensor::U32(idx),
+            None => Tensor::F32(out),
+        });
     }
 
     graph
@@ -2151,6 +2173,93 @@ fn tile_binary(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) -> Option<Vec<
         return None;
     }
     Some(out)
+}
+
+/// Indices of the `k` largest values of `row`: value descending, equal values lower index first, NaN
+/// ranking below every number (the Metal kernel orders the same way).
+pub(crate) fn topk_row(row: &[f32], k: usize) -> Vec<u32> {
+    let key = |i: u32| match row[i as usize] {
+        v if v.is_nan() => f32::NEG_INFINITY,
+        v => v,
+    };
+    let before = |a: &u32, b: &u32| key(*b).partial_cmp(&key(*a)).expect("NaN mapped away").then(a.cmp(b));
+    let mut order: Vec<u32> = (0..row.len() as u32).collect();
+    order.select_nth_unstable_by(k - 1, before);
+    order.truncate(k);
+    order.sort_unstable_by(before);
+    order
+}
+
+/// Row `row` (of `out.len()` weights) of the expert bank `bank` as f32.
+fn bank_row(bank: &Tensor, row: usize, out: &mut [f32]) -> Result<(), String> {
+    let cols = out.len();
+    let short = || format!("expert bank has no row {row}");
+    match bank {
+        Tensor::F32(v) => out.copy_from_slice(v.get(row * cols..(row + 1) * cols).ok_or_else(short)?),
+        Tensor::BF16(v) => {
+            let r = v.get(row * cols..(row + 1) * cols).ok_or_else(short)?;
+            out.iter_mut().zip(r).for_each(|(o, &b)| *o = crate::model::bf16_to_f32(b));
+        }
+        Tensor::F16(v) => {
+            let r = v.get(row * cols..(row + 1) * cols).ok_or_else(short)?;
+            out.iter_mut().zip(r).for_each(|(o, &b)| *o = crate::model::f16_to_f32(b));
+        }
+        Tensor::Mat(m) if row < m.rows && m.cols == cols => m.decode_row_f32(row, out),
+        Tensor::Quantized(q) => match q.as_ref() {
+            crate::model::layers::QuantizedWeight::GgufQuantized { raw_data: data, format, .. }
+            | crate::model::layers::QuantizedWeight::ZeroCopySlice { data, format, .. } => {
+                let (be, bb, _) = crate::model::layers::gguf_block_codec(*format)
+                    .ok_or_else(|| format!("no dequantizer for {format:?}"))?;
+                let len = cols / be * bb;
+                let raw = data.get(row * len..(row + 1) * len).ok_or_else(short)?;
+                let v = crate::model::layers::dequantize_gguf_blocks(*format, raw)
+                    .ok_or_else(|| format!("no dequantizer for {format:?}"))?;
+                out.copy_from_slice(&v);
+            }
+            crate::model::layers::QuantizedWeight::Uncompressed { data, .. } => {
+                out.copy_from_slice(data.get(row * cols..(row + 1) * cols).ok_or_else(short)?)
+            }
+            _ => return Err("expert banks must be f32/f16/bf16 or GGUF blocks".into()),
+        },
+        _ => return Err("expert banks must be f32/f16/bf16 or GGUF blocks".into()),
+    }
+    Ok(())
+}
+
+/// `Op::MoeLinear` reference: slot `s` of `ids` multiplies its x row by expert `ids[s]`'s weight.
+fn moe_linear_cpu(
+    x: &[f32],
+    bank: &Tensor,
+    ids: &[u32],
+    [experts, top_k, in_f, out_f]: [usize; 4],
+    name: &str,
+) -> Result<Vec<f32>, String> {
+    if let Some((s, e)) = ids.iter().enumerate().find(|&(_, &e)| e as usize >= experts) {
+        return Err(format!("node '{name}': slot {s} routes to expert {e} of {experts}"));
+    }
+    const ROW_BLOCK: usize = 16;
+    let per_slot = x.len() / in_f == ids.len();
+    let blocks = out_f.div_ceil(ROW_BLOCK);
+    let mut out = vec![0.0f32; ids.len() * out_f];
+    let dst = crate::model::par::OutPtr::new(&mut out);
+    let failure = parking_lot::Mutex::new(None::<String>);
+    crate::model::par::par_for(ids.len() * blocks, &|t| {
+        let (s, b) = (t / blocks, t % blocks);
+        let xr = &x[(if per_slot { s } else { s / top_k }) * in_f..][..in_f];
+        let mut w = vec![0.0f32; in_f];
+        for r in b * ROW_BLOCK..((b + 1) * ROW_BLOCK).min(out_f) {
+            if let Err(e) = bank_row(bank, ids[s] as usize * out_f + r, &mut w) {
+                *failure.lock() = Some(e);
+                return;
+            }
+            // SAFETY: cell (s, r) belongs to this task alone.
+            unsafe { dst.slice(s * out_f + r, 1)[0] = w.iter().zip(xr).map(|(a, b)| a * b).sum() };
+        }
+    });
+    match failure.into_inner() {
+        Some(e) => Err(format!("node '{name}': {e}")),
+        None => Ok(out),
+    }
 }
 
 fn dispatch_linear(
