@@ -78,7 +78,7 @@ v1 values changed where AA failed as text: `MAHOGANY_DIM #8C6D46` (3.96:1) was s
 
 | Tier | Width | Layout |
 |:---|:---|:---|
-| Compact | < 100 | no sidebar; a bottom dock (`min(8, h/3)` rows) shows each component's one-line form |
+| Compact | < 100, or height < 20 | no sidebar; a bottom dock (`min(8, h/3)` rows) shows each component's one-line form |
 | Standard | 100–159 | one sidebar flow column, width `clamp(w·36/100, 40, 64)` |
 | Wide | ≥ 160 | two flow columns, total `clamp(w·40/100, 84, 120)`, each `(total−1)/2` |
 
