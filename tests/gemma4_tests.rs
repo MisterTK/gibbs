@@ -273,10 +273,91 @@ fn gemma4_gguf_metal_matches_llama_cpp() {
     if !gibbs_engine::hardware::available_devices().contains(&Device::Metal) {
         return;
     }
-    let Some(m) = load_gguf(Device::Metal) else { return };
+    let Some(m) = load_gguf(Device::Metal) else {
+        return;
+    };
     check_against_llama_cpp(&*m);
 }
 
+/// `unsloth/gemma-4-26B-A4B-it-GGUF` UD-IQ2_XXS (a sparse MoE: 128 experts, top-8) from the hub snapshot under
+/// `disk/` (or `GIBBS_GEMMA4_MOE_DIR`); the tests skip when the 9.9 GB file is not there.
+fn load_moe_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
+    let dir = std::env::var("GIBBS_GEMMA4_MOE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from("disk/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/main")
+        });
+    let file = dir.join("gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf");
+    if !file.exists() {
+        println!(
+            "SKIP: no gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf in {}",
+            dir.display()
+        );
+        return None;
+    }
+    let artifacts = ModelArtifacts {
+        model_id: "unsloth/gemma-4-26B-A4B-it-GGUF".into(),
+        weights_path: Some(file),
+        local_dir: Some(dir),
+        is_cached: true,
+        ..Default::default()
+    };
+    Some(
+        load_native(&artifacts, device)
+            .expect("gemma4 MoE GGUF is native")
+            .expect("gemma4 MoE GGUF loads"),
+    )
+}
+
+/// Next-token top-5 after "The capital of France is" on `m`.
+fn moe_top5(m: &dyn NativeLm) -> Vec<(usize, f32)> {
+    let ids = m.tokenizer().encode("The capital of France is");
+    assert_eq!(
+        ids,
+        [2, 818, 5279, 529, 7001, 563],
+        "tokenization differs from llama.cpp"
+    );
+    let (ids, mut state) = m.prepare(ids, &[]).unwrap();
+    let logits = m.forward(&ids, 0, &mut state).unwrap();
+    let mut top: Vec<usize> = (0..logits.len()).collect();
+    top.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    top[..5].iter().map(|&i| (i, logits[i])).collect()
+}
+
+/// The Metal MoE program (indexed expert GEMVs on IQ2_XXS banks) against llama.cpp build 11304
+/// (`llama-debug --save-logits` on the same file): same top token and ranking, close logits.
+#[test]
+fn gemma4_moe_gguf_metal_matches_llama_cpp() {
+    if !gibbs_engine::hardware::available_devices().contains(&Device::Metal) {
+        return;
+    }
+    let Some(m) = load_moe_gguf(Device::Metal) else {
+        return;
+    };
+    let reference = [
+        (789usize, 5.443f32),
+        (3003, 5.001),
+        (10463, 4.041),
+        (1847, 3.789),
+        (2395, 3.778),
+    ];
+    let got = moe_top5(&*m);
+    println!("ours {got:?}\nllama.cpp {reference:?}");
+    // The top three agree in order; ranks 4 and 5 are a 0.011 tie in llama.cpp, so only their set is pinned.
+    assert_eq!(
+        got[..3].iter().map(|g| g.0).collect::<Vec<_>>(),
+        reference[..3].iter().map(|r| r.0).collect::<Vec<_>>()
+    );
+    let mut ids: Vec<usize> = got.iter().map(|g| g.0).collect();
+    ids.sort();
+    let mut want_ids: Vec<usize> = reference.iter().map(|r| r.0).collect();
+    want_ids.sort();
+    assert_eq!(ids, want_ids);
+    for (i, want) in reference {
+        let g = got.iter().find(|x| x.0 == i).unwrap().1;
+        assert!((g - want).abs() < 0.1, "token {i}: {g} vs llama.cpp {want}");
+    }
+}
 #[test]
 fn gemma4_gguf_answers_text_image_and_speech() {
     let Some(m) = GGUF_MODEL.clone() else { return };
@@ -323,10 +404,14 @@ fn gemma4_gguf_answers_text_image_and_speech() {
 /// snapshot such as `unsloth/gemma-4-E2B-it-qat-GGUF` holding `*.gguf` + `mmproj-*.gguf`).
 fn load_mm_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
     let dir = PathBuf::from(std::env::var("GIBBS_GEMMA4_MM_DIR").ok()?);
-    let gguf = std::fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).find(|p| {
-        let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        n.ends_with(".gguf") && !n.starts_with("mmproj")
-    })?;
+    let gguf = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            n.ends_with(".gguf") && !n.starts_with("mmproj")
+        })?;
     let artifacts = ModelArtifacts {
         model_id: "gemma4-mm-gguf".into(),
         weights_path: Some(gguf),
@@ -334,7 +419,11 @@ fn load_mm_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
         is_cached: true,
         ..Default::default()
     };
-    Some(load_native(&artifacts, device).expect("gemma4 GGUF is native").expect("gemma4 GGUF loads"))
+    Some(
+        load_native(&artifacts, device)
+            .expect("gemma4 GGUF is native")
+            .expect("gemma4 GGUF loads"),
+    )
 }
 
 /// Image and speech prompts through the Metal vision / conformer programs and the GPU row scatter
@@ -353,7 +442,11 @@ fn gemma4_gguf_metal_text_image_and_speech() {
     let mut img = gibbs_engine::model::image::ImageBuffer::new(224, 224);
     for (i, px) in img.data.chunks_exact_mut(3).enumerate() {
         let (x, y) = ((i % 224) as f32 - 112.0, (i / 224) as f32 - 112.0);
-        px.copy_from_slice(if x * x + y * y < 70.0 * 70.0 { &[220, 20, 20] } else { &[255, 255, 255] });
+        px.copy_from_slice(if x * x + y * y < 70.0 * 70.0 {
+            &[220, 20, 20]
+        } else {
+            &[255, 255, 255]
+        });
     }
     let parts = serde_json::json!([
         {"type": "image"},
