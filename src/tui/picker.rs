@@ -2358,8 +2358,10 @@ mod tests {
         }
         assert!(blocker("q/qwen-edit-gguf").contains("conditions on reference images"));
         assert!(blocker("q/qwen-lora").contains("not LoRA adapters"));
-        assert!(blocker("f/awq").starts_with("quantization method 'awq' is not supported"));
-        assert!(blocker("g/gptq").starts_with("quantization method 'gptq' is not supported"));
+        // GPTQ / AWQ int4 load (repacked to int4 group blocks or expanded to f32).
+        for loadable in ["f/awq", "g/gptq"] {
+            assert_eq!(by_id(loadable).blocker, None, "{loadable}");
+        }
         // Same rule as the loader's `prequant::check`: not every compressed-tensors format loads.
         assert!(blocker("m/marlin").starts_with("compressed-tensors format 'marlin-24'"));
         assert!(

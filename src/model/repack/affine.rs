@@ -83,7 +83,7 @@ pub fn block_codec(format: QuantFormat) -> Option<(usize, usize, GgufBlockFn)> {
 }
 
 /// Every value as f16 bits, `None` unless each converts back to the identical f32.
-fn exact_f16(v: &[f32]) -> Option<Vec<u16>> {
+pub(super) fn exact_f16(v: &[f32]) -> Option<Vec<u16>> {
     v.iter()
         .map(|&x| {
             let h = f32_to_f16(x);
@@ -94,7 +94,7 @@ fn exact_f16(v: &[f32]) -> Option<Vec<u16>> {
 
 /// Blocks of `w` (`rows * cols / 2` nibble bytes, so group `i` is the `i`-th run of `g / 2` bytes) with
 /// the per-group f16 `scale` and `bias`.
-fn blocks(w: &[u8], g: usize, scale: &[u16], bias: &[u16]) -> Vec<u8> {
+pub(super) fn blocks(w: &[u8], g: usize, scale: &[u16], bias: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(scale.len() * (g / 2 + 4));
     for ((q, s), z) in w.chunks_exact(g / 2).zip(scale).zip(bias) {
         out.extend_from_slice(q);
