@@ -4018,9 +4018,9 @@ impl FusionFlags {
 /// Relative speed-up a switch must show before the search drops a fusion.
 const FUSION_SEARCH_TIE: f64 = 0.03;
 /// Wall-time budget of one search; later candidates are skipped once it is spent.
-const FUSION_SEARCH_BUDGET_MS: u128 = 600;
+const FUSION_SEARCH_BUDGET_MS: u128 = 1500;
 
-/// Whether another client keeps the GPU busy (`ioreg` "Device Utilization %" above 20): timings taken now
+/// Whether another client keeps the GPU busy (`ioreg` "Device Utilization %" above 60): timings taken now
 /// are not persisted. An unreadable value counts as idle.
 fn device_busy() -> bool {
     std::process::Command::new("ioreg")
@@ -4032,7 +4032,7 @@ fn device_busy() -> bool {
             let rest = t.split("\"Device Utilization %\"=").nth(1)?;
             rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
         })
-        .is_some_and(|u| u > 20)
+        .is_some_and(|u| u > 60)
 }
 
 fn fusion_key(graph: &Graph) -> String {
@@ -4145,6 +4145,7 @@ impl Session {
         ];
         let (mut best, mut best_us, mut report) = (all, f64::INFINITY, Vec::new());
         let mut complete = true;
+        let mut all_us = f64::INFINITY;
         for (i, f) in candidates.into_iter().enumerate() {
             if i > 0 && t0.elapsed().as_millis() > FUSION_SEARCH_BUDGET_MS {
                 complete = false;
@@ -4156,9 +4157,21 @@ impl Session {
             } else {
                 self.prepare_plan(graph)?
             };
-            let us = self.time_decode(graph, &plan)?;
+            // Each candidate is timed twice, interleaved with a re-timing of "all on" (best of both): a
+            // switch is dropped only when it wins against a contemporaneous baseline, not against noise.
+            let mut us = self.time_decode(graph, &plan)?;
+            if i > 0 {
+                self.set_fusion_flags(all);
+                let a1 = self.time_decode(graph, all_plan)?;
+                self.set_fusion_flags(f);
+                us = us.min(self.time_decode(graph, &plan)?);
+                self.set_fusion_flags(all);
+                all_us = all_us.min(a1).min(self.time_decode(graph, all_plan)?);
+            }
             report.push(format!("{:03b} {us:.0}us", f.bits()));
-            if i == 0 || us < best_us * (1.0 - FUSION_SEARCH_TIE) {
+            if i == 0 {
+                (all_us, best_us) = (us, us);
+            } else if us < all_us * (1.0 - FUSION_SEARCH_TIE) && us < best_us {
                 (best, best_us) = (f, us);
             }
         }
