@@ -257,6 +257,7 @@ mod tests {
                 post_ff_ln: gain(40 + l),
                 ple: Some((m(&format!("ple_gate{l}")), m(&format!("ple_out{l}")), gain(50 + l))),
                 scalar: 0.8 + 0.1 * l as f32,
+                moe: None,
             })
             .collect();
         let text = TextModel {

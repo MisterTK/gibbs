@@ -10,6 +10,7 @@
 //! llama.cpp `build_moe_ffn` (softmax gating, `norm_w`).
 
 use super::{sigmoid, silu, vector_dot};
+use crate::graph::{DType, Graph, Op, ReduceKind, Tensor, UnaryKind, ValueId};
 use crate::hardware::QuantFormat;
 use crate::model::layers::gguf_block_codec;
 use crate::model::par::{dot_bf16, par_for, par_rows, OutPtr};
@@ -149,6 +150,56 @@ impl Bank {
                 }
             }
             Src::Packed(p) => decode_row(p, e * self.stride + self.row0 + r, out),
+        }
+    }
+
+    /// The bank as the `[experts * rows, cols]` weight of an `Op::MoeLinear`. A whole GGUF tensor is
+    /// shared with the file mapping; a view of one (the halves of a fused gate/up tensor) or a bf16
+    /// checkpoint is gathered into an owned copy.
+    // ponytail: bf16 and fused-view banks are copied once at graph build; only GGUF banks stay mapped.
+    fn graph_weight(&self) -> (DType, Tensor) {
+        let total = self.experts * self.rows;
+        match &self.src {
+            Src::Packed(p) => {
+                let dtype = match p.format {
+                    QuantFormat::FP32 => DType::F32,
+                    QuantFormat::FP16 => DType::F16,
+                    QuantFormat::BF16 => DType::BF16,
+                    f => DType::Quant(f),
+                };
+                let whole = self.row0 == 0 && self.stride == self.rows;
+                let p = if whole {
+                    p.clone()
+                } else {
+                    let row_bytes = p.format.tensor_bytes(self.cols);
+                    let mut buf = Vec::with_capacity(total * row_bytes);
+                    for e in 0..self.experts {
+                        let at = p.off + (e * self.stride + self.row0) * row_bytes;
+                        buf.extend_from_slice(&p.map[at..at + self.rows * row_bytes]);
+                    }
+                    Packed {
+                        map: std::sync::Arc::new(crate::model::loaders::gguf::GgufData::Buf(buf)),
+                        off: 0,
+                        format: p.format,
+                        shape: vec![self.experts, self.rows, self.cols],
+                    }
+                };
+                (dtype, Tensor::Mat(Mat::from_packed(p, total, self.cols)))
+            }
+            Src::Bf16(..) => {
+                let mut v = vec![0u16; total * self.cols];
+                let mut row = vec![0.0f32; self.cols];
+                for e in 0..self.experts {
+                    for r in 0..self.rows {
+                        self.row(e, r, &mut row);
+                        let at = (e * self.rows + r) * self.cols;
+                        for (o, &x) in v[at..at + self.cols].iter_mut().zip(&row) {
+                            *o = crate::model::f32_to_bf16(x);
+                        }
+                    }
+                }
+                (DType::BF16, Tensor::BF16(v))
+            }
         }
     }
 
@@ -325,6 +376,113 @@ impl Moe {
             return Err(format!("{p}: expert shapes disagree with config.json"));
         }
         Ok(m)
+    }
+
+    /// Appends this block to the decode graph: `x` `[n, hidden]` (already normed) -> `[n, hidden]`.
+    /// Router, top-k, expert GEMVs and the routing-weighted sum mirror [`Self::forward`]:
+    /// softmax over the top-k logits when the picked weights are renormalized, else the picks of the
+    /// softmax over all experts; the shared expert's output is scaled by a sigmoid of its own gate.
+    pub(super) fn add_to_graph(
+        &self,
+        g: &mut Graph,
+        w: &mut crate::graph::Weights,
+        p: &str,
+        x: ValueId,
+        n: usize,
+    ) -> Result<ValueId, String> {
+        let f = DType::F32;
+        let (e, k, ff, d) = (self.router.rows, self.top_k, self.gate.rows, self.router.cols);
+        let part = |g: &mut Graph, w: &mut crate::graph::Weights, name: String, m: &Mat| -> ValueId {
+            let dtype = match m.packed().map(|p| p.format) {
+                None => DType::BF16,
+                Some(QuantFormat::FP32) => DType::F32,
+                Some(QuantFormat::FP16) => DType::F16,
+                Some(QuantFormat::BF16) => DType::BF16,
+                Some(f) => DType::Quant(f),
+            };
+            w.insert(&name, m.to_graph_tensor());
+            g.weight(name, vec![m.rows, m.cols], dtype)
+        };
+        let router = part(g, w, format!("{p}.gate.weight"), &self.router.parts[0]);
+        let logits = g.add(format!("{p}.router"), Op::Linear, &[x, router], vec![n, e], f);
+        let ids = g.add(format!("{p}.topk"), Op::TopK { k }, &[logits], vec![n, k], DType::U32);
+        let weights = if self.norm {
+            let picked = g.add(format!("{p}.picked"), Op::GatherCols, &[logits, ids], vec![n, k], f);
+            g.add(format!("{p}.route_w"), Op::Softmax { axis: -1 }, &[picked], vec![n, k], f)
+        } else {
+            let probs = g.add(format!("{p}.router_probs"), Op::Softmax { axis: -1 }, &[logits], vec![n, e], f);
+            g.add(format!("{p}.route_w"), Op::GatherCols, &[probs, ids], vec![n, k], f)
+        };
+        let bank = |g: &mut Graph, w: &mut crate::graph::Weights, name: &str, b: &Bank| -> ValueId {
+            let (dtype, t) = b.graph_weight();
+            let name = format!("{p}.experts.{name}.weight");
+            w.insert(&name, t);
+            g.weight(name, vec![b.experts * b.rows, b.cols], dtype)
+        };
+        let (gate_w, up_w, down_w) = (
+            bank(g, w, "gate_proj", &self.gate),
+            bank(g, w, "up_proj", &self.up),
+            bank(g, w, "down_proj", &self.down),
+        );
+        let moe = |g: &mut Graph, name: &str, input: ValueId, bank: ValueId, out: usize| {
+            g.add(
+                format!("{p}.{name}"),
+                Op::MoeLinear { experts: e, top_k: k },
+                &[input, bank, ids],
+                vec![n * k, out],
+                f,
+            )
+        };
+        let gate = moe(g, "expert_gate", x, gate_w, ff);
+        let up = moe(g, "expert_up", x, up_w, ff);
+        let act = g.add(format!("{p}.expert_swiglu"), Op::SwiGlu, &[gate, up], vec![n * k, ff], f);
+        let down = moe(g, "expert_down", act, down_w, d);
+        let w_col = g.add(
+            format!("{p}.route_w_col"),
+            Op::Reshape { shape: Some(vec![n * k, 1]) },
+            &[weights],
+            vec![n * k, 1],
+            f,
+        );
+        let weighted = g.add(format!("{p}.expert_weighted"), Op::Mul, &[down, w_col], vec![n * k, d], f);
+        let grouped = g.add(
+            format!("{p}.expert_slots"),
+            Op::Reshape { shape: Some(vec![n, k, d]) },
+            &[weighted],
+            vec![n, k, d],
+            f,
+        );
+        let routed = g.add(
+            format!("{p}.routed"),
+            Op::Reduce { kind: ReduceKind::Sum, axes: vec![1], keep_dims: false },
+            &[grouped],
+            vec![n, d],
+            f,
+        );
+        let Some(sh) = &self.shared else {
+            return Ok(routed);
+        };
+        let si = sh.down.cols;
+        let gate_p = part(g, w, format!("{p}.shared_expert.gate_proj.weight"), &sh.gate_up.parts[0]);
+        let up_p = part(g, w, format!("{p}.shared_expert.up_proj.weight"), &sh.gate_up.parts[1]);
+        let down_p = part(g, w, format!("{p}.shared_expert.down_proj.weight"), &sh.down.parts[0]);
+        let gate_g = part(g, w, format!("{p}.shared_expert_gate.weight"), &sh.gate.parts[0]);
+        let lin = |g: &mut Graph, name: &str, a: ValueId, b: ValueId, out: usize| {
+            g.add(format!("{p}.{name}"), Op::Linear, &[a, b], vec![n, out], f)
+        };
+        let (sg, su) = (lin(g, "shared_gate", x, gate_p, si), lin(g, "shared_up", x, up_p, si));
+        let sact = g.add(format!("{p}.shared_swiglu"), Op::SwiGlu, &[sg, su], vec![n, si], f);
+        let sdown = lin(g, "shared_down", sact, down_p, d);
+        let gate_logit = lin(g, "shared_gate_logit", x, gate_g, 1);
+        let gate_act = g.add(
+            format!("{p}.shared_gate_act"),
+            Op::Unary { kind: UnaryKind::Sigmoid },
+            &[gate_logit],
+            vec![n, 1],
+            f,
+        );
+        let shared = g.add(format!("{p}.shared_out"), Op::Mul, &[sdown, gate_act], vec![n, d], f);
+        Ok(g.add(format!("{p}.moe_out"), Op::Add, &[routed, shared], vec![n, d], f))
     }
 
     pub(super) fn summary(&self) -> String {

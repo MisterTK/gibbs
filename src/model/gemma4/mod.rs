@@ -7,10 +7,11 @@
 mod audio;
 mod gguf;
 pub mod graph;
+mod moe;
 pub(crate) mod ops;
 pub mod seqcls;
 mod text;
-pub use text::tiny_decode_graph;
+pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 pub use audio::tiny::{graph as tiny_audio_graph, wav_graph as tiny_audio_wav_graph};
 pub use vision::tiny::graph as tiny_vision_graph;
 mod unified;
@@ -410,6 +411,9 @@ impl NativeLm for Gemma4 {
             st.asked = end;
             st.done = end;
             return Ok(last_logits);
+        }
+        if self.text.has_moe() {
+            return Err("gemma4 MoE: host forward not implemented; the graph program runs on Metal and the CPU graph executor".into());
         }
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
         let stop = match st.blocks.iter().find(|b| b.start < end && end < b.end) {

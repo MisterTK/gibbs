@@ -142,15 +142,6 @@ fn text_config(m: &ModelManifest, data: &[u8]) -> Result<(Value, usize), String>
         .into_iter()
         .map(|v| v != 0.0)
         .collect();
-    if let Some(name) = m
-        .tensors
-        .keys()
-        .find(|n| n.contains(".ffn_gate_inp") || n.contains("_exps"))
-    {
-        return Err(format!(
-            "Gemma 4 MoE GGUF (router/expert tensor '{name}', 26B-A4B): the sparse expert block is not implemented"
-        ));
-    }
     let heads = nums(md, "gemma4.attention.head_count")
         .ok_or("GGUF metadata gemma4.attention.head_count missing")?;
     if heads.iter().any(|&h| h != heads[0]) {
@@ -230,6 +221,17 @@ fn text_config(m: &ModelManifest, data: &[u8]) -> Result<(Value, usize), String>
                                "rope_theta": num(md, "gemma4.rope.freq_base")?},
         },
     });
+    // Sparse layers (26B-A4B): the routed experts beside the dense MLP, in every layer that has a router.
+    let sparse = (0..layers).filter(|i| m.tensors.contains_key(&format!("blk.{i}.ffn_gate_inp.weight"))).count();
+    if sparse != 0 {
+        if sparse != layers {
+            return Err(format!("{sparse} of {layers} layers have a router: mixed dense and sparse layers are not supported"));
+        }
+        c["enable_moe_block"] = true.into();
+        c["num_experts"] = u("expert_count")?.into();
+        c["top_k_experts"] = u("expert_used_count")?.into();
+        c["moe_intermediate_size"] = u("expert_feed_forward_length")?.into();
+    }
     if let Ok(cap) = num(md, "gemma4.final_logit_softcapping") {
         c["final_logit_softcapping"] = cap.into();
     }
@@ -277,6 +279,17 @@ fn text_hf_name(name: &str, first_shared: usize) -> Result<Option<String>, Strin
         "ffn_up.weight" => "mlp.up_proj.weight",
         "ffn_down.weight" => "mlp.down_proj.weight",
         "post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
+        "ffn_gate_inp.weight" => "router.proj.weight",
+        "ffn_gate_inp.scale" => "router.scale",
+        "ffn_down_exps.scale" => "router.per_expert_scale",
+        "ffn_pre_norm_2.weight" => "pre_feedforward_layernorm_2.weight",
+        "ffn_post_norm_1.weight" => "post_feedforward_layernorm_1.weight",
+        "ffn_post_norm_2.weight" => "post_feedforward_layernorm_2.weight",
+        // Expert banks take no `.weight`: `Weights::from_gguf` keeps `.mlp.experts.*` mapped.
+        "ffn_gate_exps.weight" => "mlp.experts.gate_proj",
+        "ffn_up_exps.weight" => "mlp.experts.up_proj",
+        "ffn_gate_up_exps.weight" => "mlp.experts.gate_up_proj",
+        "ffn_down_exps.weight" => "mlp.experts.down_proj",
         "inp_gate.weight" => "per_layer_input_gate.weight",
         "proj.weight" => "per_layer_projection.weight",
         "post_norm.weight" => "post_per_layer_input_norm.weight",
@@ -640,9 +653,26 @@ mod tests {
         m.tensors
             .extend([tensor("blk.1.attn_v.weight", &[32, 64], 0, 0)]);
         assert_eq!(text_config(&m, &data).unwrap().0["attention_k_eq_v"], false);
+        // A router in some layers only is refused; in every layer it makes the block sparse.
         m.tensors
             .extend([tensor("blk.0.ffn_gate_inp.weight", &[4, 64], 0, 0)]);
-        assert!(text_config(&m, &data).unwrap_err().contains("MoE"));
+        assert!(text_config(&m, &data)
+            .unwrap_err()
+            .contains("mixed dense and sparse"));
+        for l in 1..4 {
+            m.tensors
+                .extend([tensor(&format!("blk.{l}.ffn_gate_inp.weight"), &[4, 64], 0, 0)]);
+        }
+        m.metadata.extend(
+            [("expert_count", "128"), ("expert_used_count", "8"), ("expert_feed_forward_length", "704")]
+                .map(|(k, v)| (format!("gemma4.{k}"), v.to_string())),
+        );
+        let c = text_config(&m, &data).unwrap().0;
+        assert_eq!(c["enable_moe_block"], true);
+        assert_eq!(
+            (c["num_experts"].as_u64(), c["top_k_experts"].as_u64(), c["moe_intermediate_size"].as_u64()),
+            (Some(128), Some(8), Some(704))
+        );
     }
 
     #[test]
@@ -665,6 +695,22 @@ mod tests {
             ),
             (None, None, None)
         );
+        // Sparse layers: router, norms, per-expert scale; banks carry no `.weight` so they stay mapped.
+        for (gguf, hf) in [
+            ("ffn_gate_inp.weight", "router.proj.weight"),
+            ("ffn_gate_inp.scale", "router.scale"),
+            ("ffn_down_exps.scale", "router.per_expert_scale"),
+            ("ffn_pre_norm_2.weight", "pre_feedforward_layernorm_2.weight"),
+            ("ffn_post_norm_1.weight", "post_feedforward_layernorm_1.weight"),
+            ("ffn_gate_exps.weight", "mlp.experts.gate_proj"),
+            ("ffn_gate_up_exps.weight", "mlp.experts.gate_up_proj"),
+            ("ffn_down_exps.weight", "mlp.experts.down_proj"),
+        ] {
+            assert_eq!(
+                t(&format!("blk.1.{gguf}")).unwrap(),
+                format!("model.language_model.layers.1.{hf}")
+            );
+        }
         assert!(text_hf_name("blk.0.ssm_a", 2).is_err());
         let m = |n: &str| mm_hf_name(n).unwrap_or_default();
         assert_eq!(
