@@ -3603,40 +3603,66 @@ impl Session {
                 set_bytes(enc, 3, &p);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
 
-                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(gate_w),
-                    gate_name,
-                    None,
-                    (scratch, off_gate),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
-
-                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(up_w),
-                    up_name,
-                    None,
-                    (scratch, off_up),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
-
-                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
-                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                enc.set_buffer(0, Some(scratch), off_gate as u64);
-                enc.set_buffer(1, Some(scratch), off_up as u64);
-                enc.set_buffer(2, Some(scratch), off_gate as u64);
-                set_bytes(enc, 3, &u32_of(inter)?);
-                grid1(inter);
+                // 2-4. Gate and up GEMVs, then the GLU. Packed weights run the gate GEMV last with the GLU
+                // as its epilogue reading the up result (one dispatch fewer, no second pass over `inter`).
+                let packed = self
+                    .weights
+                    .get(gate_name)
+                    .is_some_and(|w| !matches!(w.3, WeightFormat::F32 | WeightFormat::U32));
+                if packed {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        up_name,
+                        None,
+                        (scratch, off_up),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(gate_w),
+                        gate_name,
+                        Some((scratch, off_up)),
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        if is_geglu { Epi::GeGlu } else { Epi::SwiGlu },
+                    )?;
+                } else {
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(gate_w),
+                        gate_name,
+                        None,
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        up_name,
+                        None,
+                        (scratch, off_up),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
+                    let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                    enc.set_buffer(0, Some(scratch), off_gate as u64);
+                    enc.set_buffer(1, Some(scratch), off_up as u64);
+                    enc.set_buffer(2, Some(scratch), off_gate as u64);
+                    set_bytes(enc, 3, &u32_of(inter)?);
+                    grid1(inter);
+                }
 
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
@@ -3990,7 +4016,7 @@ impl FusionFlags {
 }
 
 /// Relative speed-up a switch must show before the search drops a fusion.
-const FUSION_SEARCH_TIE: f64 = 0.01;
+const FUSION_SEARCH_TIE: f64 = 0.03;
 /// Wall-time budget of one search; later candidates are skipped once it is spent.
 const FUSION_SEARCH_BUDGET_MS: u128 = 600;
 
@@ -4048,8 +4074,8 @@ impl Session {
         let chosen = match cache.get(&key) {
             Some(&b) => FusionFlags::from_bits(b),
             None => {
-                let f = match self.search_fusion(graph, &plan) {
-                    Ok(f) => f,
+                let (f, complete) = match self.search_fusion(graph, &plan) {
+                    Ok(r) => r,
                     Err(e) => {
                         // A graph the probe inputs cannot drive (tiny test caches, odd inputs) keeps every fusion.
                         eprintln!("fusion search skipped: {e}");
@@ -4057,12 +4083,15 @@ impl Session {
                         return Ok(plan);
                     }
                 };
-                cache.insert(key, f.bits());
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if let Ok(s) = serde_json::to_string(&cache) {
-                    let _ = std::fs::write(&path, s);
+                // A search cut short by its budget (a busy device) is not persisted.
+                if complete {
+                    cache.insert(key, f.bits());
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if let Ok(s) = serde_json::to_string(&cache) {
+                        let _ = std::fs::write(&path, s);
+                    }
                 }
                 f
             }
@@ -4077,7 +4106,11 @@ impl Session {
 
     // ponytail: one switch off at a time (4 candidates); combinations of two switches that are each
     // faster off are not explored. Candidate runs use position 100 and zero activations.
-    fn search_fusion(&self, graph: &Graph, all_plan: &PreparedPlan) -> Result<FusionFlags, String> {
+    fn search_fusion(
+        &self,
+        graph: &Graph,
+        all_plan: &PreparedPlan,
+    ) -> Result<(FusionFlags, bool), String> {
         let t0 = Instant::now();
         let all = FusionFlags::ALL;
         let candidates = [
@@ -4096,8 +4129,10 @@ impl Session {
             },
         ];
         let (mut best, mut best_us, mut report) = (all, f64::INFINITY, Vec::new());
+        let mut complete = true;
         for (i, f) in candidates.into_iter().enumerate() {
             if i > 0 && t0.elapsed().as_millis() > FUSION_SEARCH_BUDGET_MS {
+                complete = false;
                 break;
             }
             self.set_fusion_flags(f);
@@ -4120,7 +4155,7 @@ impl Session {
         );
         // The runs above are not decode tokens: keep them out of the run-sample ring.
         take_run_samples();
-        Ok(best)
+        Ok((best, complete))
     }
 
     /// Best GPU time in us of 5 runs of `plan` at position 100 (after 2 warm-up runs).
