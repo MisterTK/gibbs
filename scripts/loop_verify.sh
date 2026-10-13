@@ -6,6 +6,8 @@ set -u
 cd "$(dirname "$0")/.."
 BASE=target/loop-base/gibbs
 if [ ! -x "$BASE" ]; then echo "metric-error: $BASE missing" >&2; exit 1; fi
+# Quiet machine: the matrix runner abandons its in-flight item while this file exists.
+mkdir -p target/matrix && touch target/matrix/PAUSE && trap 'rm -f target/matrix/PAUSE' EXIT && sleep 5
 if ! git diff --quiet HEAD -- src scripts bench; then echo "metric-error: uncommitted changes in src/scripts/bench" >&2; exit 1; fi
 cargo build --release -q || exit 1
 mkdir -p target/loop

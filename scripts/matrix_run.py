@@ -9,7 +9,7 @@ Usage: matrix_run.py [--once] [--limit N] [--summary] [--reset REGEX]
   --reset RE  forget state of items whose last error matches RE (they run again)
 Rows go to autoresearch/matrix-results.jsonl, per-item state to autoresearch/matrix-state.json.
 """
-import argparse, fcntl, glob, json, os, re, shutil, signal, subprocess, sys, time, urllib.request
+import argparse, fcntl, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
@@ -46,13 +46,32 @@ def load(path, default):
         return default
 
 
+PAUSE = "target/matrix/PAUSE"  # created by scripts/loop_verify.sh / loop_guard.sh while they measure
+
+
+class Paused(BaseException):
+    """The loop asked for a quiet machine: the in-flight item is abandoned and retried afterwards."""
+
+
 def run(cmd, timeout, env_extra=None):
     env = dict(os.environ, HF_HUB_CACHE=os.path.abspath(CACHE), **(env_extra or {}))
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired as e:
-        return 124, (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""), f"timeout after {timeout}s"
+    with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+        p = subprocess.Popen(cmd, stdout=out, stderr=err, text=True, env=env)
+        deadline = time.time() + timeout
+        code = None
+        while code is None:
+            try:
+                code = p.wait(2)
+            except subprocess.TimeoutExpired:
+                if os.path.exists(PAUSE):
+                    p.kill(); p.wait()
+                    raise Paused()
+                if time.time() > deadline:
+                    p.kill(); p.wait()
+                    code = 124
+        out.seek(0); err.seek(0)
+        stderr = err.read()
+        return code, out.read(), stderr + (f"\ntimeout after {timeout}s" if code == 124 else "")
 
 
 def snapshot_path(item):
@@ -77,6 +96,8 @@ def oracle(item, b):
         try:
             base = f"http://127.0.0.1:{PORT}"
             for _ in range(300):
+                if os.path.exists(PAUSE):
+                    raise Paused()
                 if srv.poll() is not None:
                     return "skip", f"llama-server exited {srv.returncode} (unsupported model?)"
                 try:
@@ -232,10 +253,17 @@ def main():
             time.sleep(600)  # everything is current; matrix_gen.py or a new base commit adds work
             continue
         for k, item in enumerate(queue):
-            if stop or (a.limit and done >= a.limit):
+            if stop or (a.limit is not None and done >= a.limit):
                 break
             nxt = queue[k + 1] if k + 1 < len(queue) else None
-            row = process(item, nxt)
+            while True:
+                while os.path.exists(PAUSE) and not stop:
+                    time.sleep(15)
+                try:
+                    row = process(item, nxt)
+                    break
+                except Paused:
+                    print(f"matrix_run: paused during {item['id']}", flush=True)
             with open(RESULTS, "a") as f:
                 f.write(json.dumps(row) + "\n")
             state = load(STATE, {})
@@ -248,7 +276,7 @@ def main():
             print(f"{row['timestamp']} {item['id']}: {row['status']} "
                   f"{row.get('decode_tok_s', 0):.1f} tok/s {row.get('roofline_pct', 0):.1f}% "
                   f"parity={row.get('parity')} oracle={row.get('oracle')} {row.get('error', '')}", flush=True)
-        if a.once or (a.limit and done >= a.limit):
+        if a.once or (a.limit is not None and done >= a.limit):
             break
 
 

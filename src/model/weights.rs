@@ -398,13 +398,31 @@ impl Weights {
         map: &Arc<crate::model::loaders::gguf::GgufData>,
         tensors: impl IntoIterator<Item = (String, usize, crate::hardware::QuantFormat, Vec<usize>)>,
     ) -> Self {
+        let cfg = crate::model::weight_format::ReencodeConfig::effective();
         for (name, off, format, shape) in tensors {
-            let p = Packed {
+            let mut p = Packed {
                 map: map.clone(),
                 off,
                 format,
                 shape,
             };
+            // A 2-D projection under a non-bit-exact policy may be re-stored in a faster format;
+            // the result lives in memory instead of the file mapping.
+            if let [rows, cols] = p.shape[..] {
+                let len = rows * format.tensor_bytes(cols);
+                if let Some(raw) = map.get(off..off + len) {
+                    if let Some((f, blocks)) = crate::model::reencode::reencode_native(
+                        &cfg, &name, format, rows, cols, raw,
+                    ) {
+                        p = Packed {
+                            map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(blocks)),
+                            off: 0,
+                            format: f,
+                            shape: p.shape,
+                        };
+                    }
+                }
+            }
             self.gguf_packed.insert(name, p);
         }
         self

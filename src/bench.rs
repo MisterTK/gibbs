@@ -103,44 +103,92 @@ fn median(v: &mut [f64]) -> Option<f64> {
     Some(v[v.len() / 2])
 }
 
-/// Loads `artifacts` on Metal under the `reencode` policy name. Returns the model and the policy
-/// whose bytes it streams: the one the KL fallback chain applied for GraphLm loads, `BitExact` for
-/// native loaders (they carry the checkpoint's blocks unchanged until the policy reaches them).
+/// A model loaded for measurement and what its decode step streams.
+pub struct BenchLoad {
+    pub exec: crate::scheduler::ExecutableModel,
+    /// The re-encode policy whose formats the model's projections ended up in: what the KL
+    /// fallback chain applied (GraphLm loads and, via the same chain, native loads).
+    pub policy: crate::model::weight_format::ReencodePolicy,
+    /// Bytes per token that native loaders saved against the source blocks under `policy`
+    /// (those are counted from the header with [`ReencodePolicy::BitExact`]); 0 for GraphLm loads.
+    pub saved_bytes: u64,
+}
+
+/// Loads `artifacts` on Metal under the `reencode` policy name (set as the effective policy so
+/// native loaders honor it too).
 pub fn load_for_bench(
     artifacts: &crate::model::hub::ModelArtifacts,
     reencode: &str,
-) -> Result<
-    (
-        crate::scheduler::ExecutableModel,
-        Option<crate::model::weight_format::ReencodePolicy>,
-    ),
-    String,
-> {
-    use crate::model::weight_format::{load_causal_lm_with, ReencodeConfig, ReencodePolicy};
+) -> Result<BenchLoad, String> {
+    use crate::model::weight_format::{
+        load_causal_lm_with, set_reencode_override, ReencodeConfig, ReencodePolicy,
+    };
+    let cfg = ReencodeConfig {
+        policy: reencode.parse()?,
+        ..Default::default()
+    };
     let placement = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
-    match crate::model::native::load_native(artifacts, placement) {
+    set_reencode_override(Some(cfg.clone()));
+    let native = crate::model::native::load_native(artifacts, placement);
+    set_reencode_override(None);
+    match native {
         Some(Ok(m)) => {
-            let exec = crate::scheduler::ExecutableModel::Native(m);
-            return Ok((exec, Some(ReencodePolicy::BitExact)));
+            let (policy, saved_bytes) =
+                crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0));
+            // Native tensors keep their source formats unless `saved_bytes` says otherwise.
+            let policy = if saved_bytes > 0 {
+                ReencodePolicy::BitExact
+            } else {
+                policy
+            };
+            return Ok(BenchLoad {
+                exec: crate::scheduler::ExecutableModel::Native(m),
+                policy,
+                saved_bytes,
+            });
         }
         Some(Err(e)) => return Err(e),
         None => {}
     }
     let hw = crate::hardware::HardwareCapability::probe_system();
-    let cfg = ReencodeConfig {
-        policy: reencode.parse()?,
-        ..Default::default()
-    };
     let (graph_lm, choice) =
         load_causal_lm_with(artifacts, crate::hardware::Device::Metal, None, &hw, &cfg)?;
     // `applied` reads `max-speed`, `max-speed (FFN only)`, `low-bit-native` or `bit-exact`.
     // ponytail: the FFN-only attempt is costed as full max-speed; exact bytes need per-tensor records.
-    let applied = choice
+    let policy = choice
         .reencode
         .as_ref()
-        .and_then(|r| r.applied.split(" (").next()?.parse::<ReencodePolicy>().ok());
+        .and_then(|r| r.applied.split(" (").next()?.parse::<ReencodePolicy>().ok())
+        .unwrap_or(cfg.policy);
     let exec = crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)?;
-    Ok((exec, applied))
+    Ok(BenchLoad {
+        exec,
+        policy,
+        saved_bytes: 0,
+    })
+}
+
+/// The roofline numerator for `artifacts` loaded as `load` describes: matrices a decode step
+/// streams after the applied policy (gathered tables excluded) and `"streamed"`, or the file size
+/// and `"file"` when no header can be read.
+pub fn roofline_bytes(
+    artifacts: &crate::model::hub::ModelArtifacts,
+    policy: crate::model::weight_format::ReencodePolicy,
+    saved_bytes: u64,
+) -> (u64, &'static str) {
+    let streamed = artifacts
+        .weights_path
+        .as_ref()
+        .and_then(|p| crate::model::variant::read_local_header(p).ok())
+        .map(|h| {
+            h.streamed_bytes_per_token(policy)
+                .saturating_sub(saved_bytes)
+        })
+        .filter(|&b| b > 0);
+    match streamed {
+        Some(b) => (b, "streamed"),
+        None => (bench_file_bytes(artifacts), "file"),
+    }
 }
 
 /// Warm-up plus `runs` timed generations of `decode_tokens` tokens with drafters off; medians of
@@ -238,8 +286,19 @@ fn bench_file_bytes(artifacts: &crate::model::hub::ModelArtifacts) -> u64 {
         .unwrap_or(0)
 }
 
+/// Routes `tracing` events (`tune:`, `reencode:` lines) to stderr when `RUST_LOG` is set.
+fn init_logging() {
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+}
+
 /// Runs a bench suite file and prints JSON lines plus METRIC lines.
 pub fn run_bench_suite(path: &str) -> Result<i32, String> {
+    init_logging();
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read bench suite '{path}': {e}"))?;
     let suite: BenchSuite = serde_json::from_str(&content)
@@ -306,7 +365,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
 
         // Held until this model's row is printed: concurrent benchmarks would corrupt each other.
         let _lock = crate::hardware::gpu_lock()?;
-        let (model_exec, applied) = match load_for_bench(&artifacts, reencode) {
+        let load = match load_for_bench(&artifacts, reencode) {
             Ok(x) => x,
             Err(e) => {
                 fail(&e);
@@ -314,20 +373,9 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 continue;
             }
         };
-        // Roofline numerator: bytes a decode step streams (matrices after the re-encode policy
-        // that was actually applied; embedding/PLE gather tables excluded). File size only when
-        // no header can be read.
-        let policy = applied.unwrap_or_else(|| reencode.parse().unwrap_or_default());
-        let streamed = artifacts
-            .weights_path
-            .as_ref()
-            .and_then(|p| crate::model::variant::read_local_header(p).ok())
-            .map(|h| h.streamed_bytes_per_token(policy))
-            .filter(|&b| b > 0);
-        let (bytes_per_token, bytes_basis) = match streamed {
-            Some(b) => (b, "streamed"),
-            None => (bench_file_bytes(&artifacts), "file"),
-        };
+        let model_exec = load.exec;
+        let (bytes_per_token, bytes_basis) =
+            roofline_bytes(&artifacts, load.policy, load.saved_bytes);
         let mut res = match measure_loaded(
             &model_exec,
             &prompt,
@@ -604,7 +652,7 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
     let artifacts =
         crate::model::hub::HuggingFaceHub::new().auto_download_and_cache(model_id, None)?;
     let _lock = crate::hardware::gpu_lock()?;
-    let (exec, _) = load_for_bench(&artifacts, "max-speed")?;
+    let exec = load_for_bench(&artifacts, "max-speed")?.exec;
     let ids = exec.tokenizer().encode(prompt);
     let logits = exec.prompt_logits(ids.clone())?;
     let vocab = exec.tokenizer().vocab_size();

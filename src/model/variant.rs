@@ -382,8 +382,18 @@ pub fn hub_rank(fmt: Q, bytes: Option<u64>, policy: ReencodePolicy) -> f64 {
     -step + bytes.unwrap_or_else(|| fmt.tensor_bytes(NOMINAL_PARAMS as usize) as u64) as f64 / 1e13
 }
 
-/// `variant` of `~/.cache/gibbs/settings.json`.
+static POLICY_OVERRIDE: RwLock<Option<VariantPolicy>> = RwLock::new(None);
+
+/// Pins the variant policy (`--variant`) over the settings file; `None` returns to it.
+pub fn set_policy_override(p: Option<VariantPolicy>) {
+    *POLICY_OVERRIDE.write() = p;
+}
+
+/// The `--variant` override, else `variant` of `~/.cache/gibbs/settings.json`.
 pub fn variant_policy() -> VariantPolicy {
+    if let Some(p) = *POLICY_OVERRIDE.read() {
+        return p;
+    }
     crate::tui::settings::load_settings()
         .variant
         .parse()

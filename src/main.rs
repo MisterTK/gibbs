@@ -128,8 +128,10 @@ struct Cli {
     #[arg(long)]
     reencode_max_kl: Option<f32>,
 
-    #[arg(long, default_value = "fastest")]
-    variant: String,
+    /// Variant policy of the model picker and downloads: fastest | fastest-4bit | best-quality
+    /// (default: settings.json, else fastest).
+    #[arg(long)]
+    variant: Option<String>,
 
     #[arg(long)]
     bench: Option<String>,
@@ -290,6 +292,15 @@ fn run_text_to_video(cli: &Cli, hub: &HuggingFaceHub, backend: Device) -> Result
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Some(v) = &cli.variant {
+        gibbs_engine::model::variant::set_policy_override(Some(v.parse()?));
+    }
+    if cli.reencode.is_some() || cli.reencode_max_kl.is_some() {
+        gibbs_engine::model::weight_format::set_reencode_override(Some(ReencodeConfig::resolve(
+            cli.reencode.as_deref(),
+            cli.reencode_max_kl,
+        )?));
+    }
     if let Some(bench_path) = &cli.bench {
         let code = gibbs_engine::bench::run_bench_suite(bench_path)?;
         std::process::exit(code);
