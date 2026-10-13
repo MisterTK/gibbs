@@ -572,7 +572,6 @@ impl TextModel {
         });
         out
     }
-    /// Emits static-shape decode graph (n = 1) with stateful KV caching and weight bindings.
     /// Emits static-shape decode graph (n = 1) with stateful KV caching, PLE, and weight bindings.
     pub fn to_decode_graph(&self) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         self.to_decode_graph_unchecked()
@@ -581,7 +580,15 @@ impl TextModel {
     pub(crate) fn to_decode_graph_unchecked(
         &self,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph(self.max_pos, None)
+        self.decode_graph(1, false, self.max_pos, None)
+    }
+
+    /// The same network over `rows` consecutive tokens (inputs `inputs_embeds [rows, h]`, `positions`,
+    /// `per_layer_embed`, `visible_end [rows]`): output is the last row's logits `[1, vocab]`. Its weights
+    /// are those of [`Self::to_decode_graph`], which is the program that owns them.
+    pub(crate) fn to_prefill_graph(&self, rows: usize) -> Result<crate::graph::Graph, String> {
+        self.decode_graph(rows, true, self.max_pos, None)
+            .map(|(g, _)| g)
     }
 
     /// The decode graph with the gevva cross-encoder head (`head_norm` RMSNorm at `eps`, then the
@@ -594,11 +601,15 @@ impl TextModel {
         eps: f32,
         score: &[f32],
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph(max_ctx, Some((head_norm, eps, score)))
+        self.decode_graph(1, false, max_ctx, Some((head_norm, eps, score)))
     }
 
+    /// Builds the graph for `rows` token rows. `prefill` adds the `visible_end` input (sliding layers),
+    /// slices the last row before the head and leaves the per-token decode shape (`rows == 1`) alone.
     fn decode_graph(
         &self,
+        rows: usize,
+        prefill: bool,
         max_ctx: usize,
         head: Option<(&[f32], f32, &[f32])>,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
@@ -619,7 +630,7 @@ impl TextModel {
         let mut g = Graph::new();
         let mut w = crate::graph::Weights::new();
 
-        let n = 1;
+        let n = rows;
         let h = self.hidden;
         let mut x = g.input("inputs_embeds", vec![n, h], DType::F32);
         let positions = g.input("positions", vec![n], DType::U32);
@@ -685,6 +696,7 @@ impl TextModel {
         } else {
             None
         };
+        let visible_end = prefill.then(|| g.input("visible_end", vec![n], DType::U32));
         // 2. Decoder Layers
         for (li, l) in self.layers.iter().enumerate() {
             let p = format!("layers.{li}");
@@ -745,7 +757,10 @@ impl TextModel {
                 (l.head_dim, &self.inv_freq_full, "rope.inv_freq.full")
             };
             let inv_freq_val = g.weight(inv_freq_name, vec![rotary_dim / 2], DType::F32);
-            w.insert(inv_freq_name.to_string(), Tensor::F32(inv_freq_slice[..rotary_dim / 2].to_vec()));
+            w.insert(
+                inv_freq_name.to_string(),
+                Tensor::F32(inv_freq_slice[..rotary_dim / 2].to_vec()),
+            );
             q = g.add(
                 format!("{p}.attn.q_rope"),
                 Op::Rope {
@@ -843,16 +858,8 @@ impl TextModel {
             // KV Cache States
             let kv_width = l.kv_heads * l.head_dim;
             let (k_state, v_state, write) = if li < self.first_shared {
-                let ks = g.state(
-                    format!("kv.{li}.k"),
-                    vec![max_ctx, kv_width],
-                    DType::F32,
-                );
-                let vs = g.state(
-                    format!("kv.{li}.v"),
-                    vec![max_ctx, kv_width],
-                    DType::F32,
-                );
+                let ks = g.state(format!("kv.{li}.k"), vec![max_ctx, kv_width], DType::F32);
+                let vs = g.state(format!("kv.{li}.v"), vec![max_ctx, kv_width], DType::F32);
                 (ks, vs, true)
             } else {
                 let ks = g.state(
@@ -867,7 +874,11 @@ impl TextModel {
                 );
                 (ks, vs, false)
             };
-
+            // Sliding layers also see the rest of their image block (`visible_end`) in a prefill pass.
+            let mut attn_ins = vec![q, k_val, v_val, k_state, v_state, positions];
+            if l.sliding {
+                attn_ins.extend(visible_end);
+            }
             let attn_out = g.add(
                 format!("{p}.attn"),
                 Op::CachedAttention {
@@ -881,7 +892,7 @@ impl TextModel {
                     soft_cap: None,
                     write,
                 },
-                &[q, k_val, v_val, k_state, v_state, positions],
+                &attn_ins,
                 vec![n, self.heads * l.head_dim],
                 DType::F32,
             );
@@ -1087,7 +1098,23 @@ impl TextModel {
             }
         }
 
-        // 3. Final RMSNorm
+        // 3. Final RMSNorm. A prefill pass only needs the last row's logits: slice before the head.
+        let n = if prefill && n > 1 {
+            x = g.add(
+                "last_row",
+                Op::Slice {
+                    axis: 0,
+                    start: n as i64 - 1,
+                    end: n as i64,
+                },
+                &[x],
+                vec![1, h],
+                DType::F32,
+            );
+            1
+        } else {
+            n
+        };
         let final_norm_w = g.weight("final_norm.weight", vec![h], DType::F32);
         w.insert("final_norm.weight", Tensor::F32(self.norm.clone()));
         let final_norm = g.add(
@@ -1534,6 +1561,132 @@ mod tests {
             assert!(
                 diff < 1e-4,
                 "Metal mismatch at index {i}: cpu={c}, metal={m}"
+            );
+        }
+    }
+
+    /// The batched prefill graph (last-row logits; `visible_end` widening sliding layers over an image
+    /// block) against the host forward, on random weights with one sliding and one full layer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefill_graph_matches_host_with_image_block() {
+        use crate::graph::metal::{Runtime, Session};
+        use crate::graph::{StateStore, Tensor};
+        use crate::model::weights::Weights;
+
+        let (h, v, nh, kvh, hd, inter) = (64, 128, 2, 2, 32, 128);
+        let specs = vec![
+            ("embed".into(), vec![v, h]),
+            ("q".into(), vec![nh * hd, h]),
+            ("k".into(), vec![kvh * hd, h]),
+            ("v".into(), vec![kvh * hd, h]),
+            ("o".into(), vec![h, nh * hd]),
+            ("gate".into(), vec![inter, h]),
+            ("up".into(), vec![inter, h]),
+            ("down".into(), vec![h, inter]),
+        ];
+        let store = Weights::from_f32(specs, |name| {
+            let len = match name {
+                "embed" => v * h,
+                "q" => nh * hd * h,
+                "o" => h * nh * hd,
+                "k" | "v" => kvh * hd * h,
+                _ => inter * h,
+            };
+            let mut s = 0x9E37_79B9u32 ^ (name.len() as u32 * 7919);
+            Ok((0..len)
+                .map(|_| {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((s >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 0.4
+                })
+                .collect())
+        })
+        .unwrap();
+        let layer = |sliding: bool, li: usize| Layer {
+            sliding,
+            head_dim: hd,
+            kv_heads: kvh,
+            kv_src: li,
+            attn: Attn {
+                q: store.mat("q").unwrap(),
+                kv: Some((
+                    store.mat("k").unwrap(),
+                    Some(store.mat("v").unwrap()),
+                    vec![1.0; hd],
+                )),
+                o: store.mat("o").unwrap(),
+                q_norm: vec![1.0; hd],
+            },
+            gate: store.mat("gate").unwrap(),
+            up: store.mat("up").unwrap(),
+            down: store.mat("down").unwrap(),
+            input_ln: vec![1.0; h],
+            post_attn_ln: vec![1.0; h],
+            pre_ff_ln: vec![1.0; h],
+            post_ff_ln: vec![1.0; h],
+            ple: None,
+            scalar: 1.0,
+        };
+        let model = TextModel {
+            hidden: h,
+            vocab: v,
+            layers_n: 2,
+            max_pos: 64,
+            heads: nh,
+            eps: 1e-5,
+            window: 4,
+            softcap: Some(30.0),
+            embed_scale: 1.0,
+            embed: store.mat("embed").unwrap(),
+            ple: None,
+            layers: vec![layer(true, 0), layer(false, 1)],
+            first_shared: 2,
+            norm: vec![1.0; h],
+            inv_freq_sliding: (0..hd / 2)
+                .map(|i| 1.0 / 10f32.powi(i as i32 % 4))
+                .collect(),
+            inv_freq_full: (0..hd / 2)
+                .map(|i| 1.0 / 100f32.powi(i as i32 % 3))
+                .collect(),
+            pad_id: 0,
+            bidir_vision: true,
+        };
+        let ids: Vec<u32> = (0..10).map(|i| 3 + 5 * i).collect();
+        let mut x = vec![0.0f32; ids.len() * h];
+        for (row, &t) in x.chunks_exact_mut(h).zip(&ids) {
+            model.embed_row(t, row);
+        }
+        let graph = model.to_prefill_graph(ids.len()).unwrap();
+        let weights = model.to_decode_graph().unwrap().1;
+        let session = Session::new(Runtime::shared().unwrap(), &weights).unwrap();
+        for blocks in [vec![], vec![3..7]] {
+            let want = model.forward(x.clone(), &ids, 0, &mut model.new_cache(), &blocks);
+            let visible_end = (0..ids.len())
+                .map(|p| {
+                    blocks
+                        .iter()
+                        .find(|b| b.contains(&p))
+                        .map_or(p + 1, |b| b.end) as u32
+                })
+                .collect();
+            let inputs = vec![
+                Tensor::F32(x.clone()),
+                Tensor::U32((0..ids.len() as u32).collect()),
+                Tensor::U32(visible_end),
+            ];
+            let got = session
+                .run_with_state(&graph, Some(&mut StateStore::new()), inputs)
+                .unwrap();
+            let got = got[0].as_f32().unwrap();
+            assert_eq!(got.len(), want.len());
+            let worst = want
+                .iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst < 2e-3,
+                "blocks {blocks:?}: max |host - metal| = {worst}"
             );
         }
     }

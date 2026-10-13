@@ -174,6 +174,30 @@ impl GraphProgram {
         (bytes, ceiling_gbps, roofline_tok_s)
     }
 
+    /// Whether the program is exactly one Metal segment (the shape [`Self::run_reshaped`] needs).
+    pub fn is_single_metal(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return matches!(self.segments.as_slice(), [CompiledSegment::Metal { .. }]);
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    /// Runs `graph` on the program's Metal segment inside the program's state: another row count of the
+    /// compiled network (same weight and state names), e.g. a batched prefill pass. The plan is built per call.
+    pub fn run_reshaped(
+        &mut self,
+        graph: &Graph,
+        inputs: Vec<Tensor>,
+    ) -> Result<Vec<Tensor>, String> {
+        #[cfg(target_os = "macos")]
+        if let [CompiledSegment::Metal { session, .. }] = self.segments.as_slice() {
+            let plan = session.prepare_plan(graph)?;
+            return session.run_prepared(graph, &plan, Some(&mut self.state), inputs);
+        }
+        let _ = (graph, inputs);
+        Err("run_reshaped: the program is not a single Metal segment".into())
+    }
+
     /// Executes the graph program with given inputs.
     pub fn run(&mut self, inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         if inputs.len() != self.graph_inputs.len() {

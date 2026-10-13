@@ -256,6 +256,17 @@ impl WeightFormat {
         }
         v
     }
+
+    /// Whether `m >= 16` packed linears of this storage run as a batched GEMM (the hand kernels, or the
+    /// codec expansion plus the f32 GEMM) instead of one GEMV per row.
+    fn batched_gemm(self) -> bool {
+        matches!(
+            self,
+            WeightFormat::BF16 | WeightFormat::F16 | WeightFormat::Q4_0 | WeightFormat::Q8_0
+        ) || self
+            .codec_format()
+            .is_some_and(|f| crate::graph::codec::codec(f).is_some())
+    }
 }
 
 /// Returns whether the Metal executor implements `op` for the given data type.
@@ -970,20 +981,39 @@ impl Runtime {
         let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
         src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
         src.push_str(&crate::graph::codegen::gemv_packed(c, params));
+        let name = crate::graph::codegen::gemv_packed_name(c, params);
+        let pso = self.compile_generated(&src, &name)?;
+        self.gen_psos.lock().insert(key, pso.clone());
+        Ok(pso)
+    }
+
+    /// Compiles one generated kernel `name` from `src` (fast-math off, as for the hand kernels).
+    fn compile_generated(&self, src: &str, name: &str) -> Result<ComputePipelineState, String> {
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = self
             .device
-            .new_library_with_source(&src, &opts)
-            .map_err(|e| format!("generated GEMV compilation failed: {e}"))?;
-        let name = crate::graph::codegen::gemv_packed_name(c, params);
+            .new_library_with_source(src, &opts)
+            .map_err(|e| format!("generated kernel compilation failed: {e}"))?;
         let func = lib
-            .get_function(&name, None)
+            .get_function(name, None)
             .map_err(|e| format!("generated function '{name}': {e}"))?;
-        let pso = self
-            .device
+        self.device
             .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| format!("generated pipeline '{name}': {e}"))?;
+            .map_err(|e| format!("generated pipeline '{name}': {e}"))
+    }
+
+    /// The generated dequantize-to-f32 pipeline for `f`, compiled on first use (cached under the
+    /// otherwise unused `rows_per_sg == 0` slot).
+    fn dequant_pso(&self, f: QuantFormat) -> Result<ComputePipelineState, String> {
+        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+        let key = (c.format, 0);
+        if let Some(p) = self.gen_psos.lock().get(&key) {
+            return Ok(p.clone());
+        }
+        let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+        src.push_str(&crate::graph::codegen::dequant_packed(c));
+        let pso = self.compile_generated(&src, &crate::graph::codegen::dequant_packed_name(c))?;
         self.gen_psos.lock().insert(key, pso.clone());
         Ok(pso)
     }
@@ -1292,6 +1322,8 @@ pub struct Session {
     arena: Mutex<Option<Buffer>>,
     state_buffers: Mutex<HashMap<String, Arc<Buffer>>>,
     mlp_scratch: Mutex<Option<Buffer>>,
+    /// f32 expansion of the packed weight a batched GEMM step is reading (grown to the largest).
+    dequant_scratch: Mutex<Option<Buffer>>,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -1343,8 +1375,13 @@ impl Session {
                     let (scales_e4m3, global_scale) = match &tensor.source_scales {
                         Some((bytes, global)) => (bytes.clone(), *global),
                         None => {
-                            let max_scale = tensor.blocks.iter().fold(0.0f32, |m, b| m.max(b.scale));
-                            let global = if max_scale > 0.0 { max_scale / 448.0 } else { 1.0 };
+                            let max_scale =
+                                tensor.blocks.iter().fold(0.0f32, |m, b| m.max(b.scale));
+                            let global = if max_scale > 0.0 {
+                                max_scale / 448.0
+                            } else {
+                                1.0
+                            };
                             let inv = 1.0 / global;
                             let bytes = tensor
                                 .blocks
@@ -1842,6 +1879,7 @@ impl Session {
             arena: Mutex::new(None),
             state_buffers: Mutex::new(HashMap::new()),
             mlp_scratch: Mutex::new(None),
+            dequant_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
@@ -2750,47 +2788,79 @@ impl Session {
                 k,
                 format,
             } => {
-                let fmt_name = match format {
-                    WeightFormat::BF16 => "bf16",
-                    WeightFormat::F16 => "f16",
-                    WeightFormat::Q4_0 => "q4_0",
-                    WeightFormat::Q8_0 => "q8_0",
-                    _ => {
-                        return Err(format!(
-                            "Metal executor: unsupported batched packed format {format:?}"
-                        ))
+                let hand = match format {
+                    WeightFormat::BF16 => Some("bf16"),
+                    WeightFormat::F16 => Some("f16"),
+                    WeightFormat::Q4_0 => Some("q4_0"),
+                    WeightFormat::Q8_0 => Some("q8_0"),
+                    _ => None,
+                };
+                if let Some(fmt_name) = hand {
+                    let suffix = match epi {
+                        Epi::None => "none",
+                        Epi::Gelu => "gelu",
+                        Epi::Residual => "residual",
+                        _ => "none",
+                    };
+                    enc.set_compute_pipeline_state(
+                        rt.pso(&format!("gemm_batched_{fmt_name}_{suffix}"))?,
+                    );
+                    bind(0, x);
+                    bind(1, w);
+                    if let Some(b) = bias {
+                        bind(2, b);
+                    } else {
+                        bind(2, s.out);
                     }
-                };
-                let suffix = match epi {
-                    Epi::None => "none",
-                    Epi::Gelu => "gelu",
-                    Epi::Residual => "residual",
-                    _ => "none",
-                };
-                enc.set_compute_pipeline_state(
-                    rt.pso(&format!("gemm_batched_{fmt_name}_{suffix}"))?,
-                );
-                bind(0, x);
-                bind(1, w);
-                if let Some(b) = bias {
-                    bind(2, b);
+                    if let Some(r) = res {
+                        bind(3, r);
+                    } else {
+                        bind(3, s.out);
+                    }
+                    bind(4, s.out);
+                    #[repr(C)]
+                    struct GemmParams(u32, u32, u32, u32);
+                    let p = GemmParams(u32_of(m)?, u32_of(n)?, u32_of(k)?, bias.is_some() as u32);
+                    set_bytes(enc, 5, &p);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
+                        MTLSize::new(TG4, 1, 1),
+                    );
                 } else {
-                    bind(2, s.out);
+                    // Any other codec format: expand the weight to f32 in a session scratch buffer (one
+                    // pass over the packed blocks through the codec's `decode8`), then run the f32 GEMM.
+                    // luminal: crates/luminal_metal (dequantize-then-matmul for prefill shapes).
+                    let f = format.codec_format().ok_or_else(|| {
+                        format!("Metal executor: unsupported batched packed format {format:?}")
+                    })?;
+                    let bytes = n * k * 4;
+                    let mut guard = self.dequant_scratch.lock();
+                    if guard
+                        .as_ref()
+                        .map_or(true, |b| (b.length() as usize) < bytes)
+                    {
+                        *guard = Some(new_shared_buffer(&rt.device, bytes)?);
+                    }
+                    let scratch = guard.as_ref().unwrap();
+                    let pso = rt.dequant_pso(f)?;
+                    enc.set_compute_pipeline_state(&pso);
+                    bind(0, w);
+                    enc.set_buffer(1, Some(scratch), 0);
+                    set_bytes(enc, 2, &[u32_of(n)?, u32_of(k)?]);
+                    grid1(n * (k / 8));
+                    let kind = self.gemm.unwrap_or_else(|| rt.profile.gemm_for([m, n, k]));
+                    rt.encode_gemm(
+                        enc,
+                        kind,
+                        epi,
+                        loc(x),
+                        (scratch, 0),
+                        bias.map(loc),
+                        res.map(loc),
+                        loc(s.out),
+                        [m, n, k],
+                    )?;
                 }
-                if let Some(r) = res {
-                    bind(3, r);
-                } else {
-                    bind(3, s.out);
-                }
-                bind(4, s.out);
-                #[repr(C)]
-                struct GemmParams(u32, u32, u32, u32);
-                let p = GemmParams(u32_of(m)?, u32_of(n)?, u32_of(k)?, bias.is_some() as u32);
-                set_bytes(enc, 5, &p);
-                enc.dispatch_thread_groups(
-                    MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(32), 1),
-                    MTLSize::new(TG4, 1, 1),
-                );
             }
             Step::SwiGlu { gate, up, n } => {
                 enc.set_compute_pipeline_state(rt.pso("swiglu_f32")?);
@@ -2863,6 +2933,7 @@ impl Session {
                 k_state,
                 v_state,
                 pos,
+                vis,
                 heads,
                 head_dim,
                 kv_heads,
@@ -2922,6 +2993,8 @@ impl Session {
                 bind(1, k_buf_id);
                 bind(2, v_buf_id);
                 bind(3, s.out);
+                // Rows see keys `< vis[row]` when the operand is present (default `pos + row + 1`).
+                bind(5, vis.unwrap_or(q));
                 #[repr(C)]
                 struct AttnCachedParams {
                     n_heads: u32,
@@ -2933,6 +3006,7 @@ impl Session {
                     softcap: f32,
                     start_pos: u32,
                     m: u32,
+                    has_vis: u32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -2944,6 +3018,7 @@ impl Session {
                     softcap: soft_cap.unwrap_or(0.0),
                     start_pos,
                     m: m as u32,
+                    has_vis: vis.is_some() as u32,
                 };
                 set_bytes(enc, 4, &p);
                 enc.dispatch_thread_groups(
@@ -3333,6 +3408,7 @@ pub enum Step {
         k_state: Option<ValueId>,
         v_state: Option<ValueId>,
         pos: Option<ValueId>,
+        vis: Option<ValueId>,
         heads: usize,
         head_dim: usize,
         kv_heads: usize,
@@ -3582,16 +3658,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         if !g.outputs.contains(&out) {
                             // The batched GEMM kernels (m >= 16) only carry Gelu/Residual epilogues.
                             let packed_epi = format.is_some()
-                                && !(m >= 16
-                                    && matches!(
-                                        format,
-                                        Some(
-                                            WeightFormat::BF16
-                                                | WeightFormat::F16
-                                                | WeightFormat::Q4_0
-                                                | WeightFormat::Q8_0
-                                        )
-                                    ));
+                                && !(m >= 16 && format.is_some_and(WeightFormat::batched_gemm));
                             match c.op {
                                 Op::Gelu { tanh: false } => epi = Epi::Gelu,
                                 Op::Silu if packed_epi => epi = Epi::Silu,
@@ -3647,15 +3714,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     }
                 }
                 if let Some(fmt) = format {
-                    if m >= 16
-                        && matches!(
-                            fmt,
-                            WeightFormat::BF16
-                                | WeightFormat::F16
-                                | WeightFormat::Q4_0
-                                | WeightFormat::Q8_0
-                        )
-                    {
+                    if m >= 16 && fmt.batched_gemm() {
                         (
                             Step::GemmBatchedPacked {
                                 x,
@@ -3844,6 +3903,11 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 } else {
                     None
                 };
+                let vis = if node.inputs.len() >= 7 {
+                    Some(arg(6)?)
+                } else {
+                    None
+                };
                 if (*head_dim).max(*v_head_dim) > ATTN_MAX_HEAD_DIM {
                     return Err(format!(
                         "node '{name}': head_dim {} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}",
@@ -3860,6 +3924,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         k_state,
                         v_state,
                         pos,
+                        vis,
                         heads: *heads,
                         head_dim: *head_dim,
                         kv_heads: *kv_heads,
@@ -4077,8 +4142,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 k_state,
                 v_state,
                 pos,
+                vis,
                 ..
-            } => [Some(q), Some(k), Some(v), k_state, v_state, pos]
+            } => [Some(q), Some(k), Some(v), k_state, v_state, pos, vis]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -4139,7 +4205,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Step::MeanPool { mask, .. } => v == *mask,
                 Step::GemvPacked { w, .. } | Step::GemmBatchedPacked { w, .. } => v == *w,
                 Step::Rope { pos, .. } => v == *pos,
-                Step::CachedAttention { pos: Some(p), .. } => v == *p,
+                Step::CachedAttention { pos, vis, .. } => Some(v) == *pos || Some(v) == *vis,
                 Step::PagedCachedAttention {
                     block_table, pos, ..
                 } => v == *block_table || Some(v) == *pos,
@@ -5000,7 +5066,8 @@ mod tests {
             let exp = 9 + (next() % 14) as u16;
             (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
         };
-        for f in formats {
+        // m = 3 runs the GEMV kernels; m = 20 (>= 16) the batched GEMM (hand kernels, or codec expansion + f32 GEMM).
+        for (f, m) in formats.into_iter().flat_map(|f| [(f, 3usize), (f, 20)]) {
             let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
             let scale_at: &[usize] = match f {
                 QuantFormat::GGUF_Q4_1
@@ -5014,7 +5081,7 @@ mod tests {
                 QuantFormat::GGUF_TQ2_0 => &[64],
                 _ => &[0],
             };
-            let (m, n, k) = (3usize, 37usize, be * 3);
+            let (n, k) = (37usize, be * 3);
             let mut raw: Vec<u8> = (0..n * (k / be) * bb)
                 .map(|_| (next() >> 4) as u8)
                 .collect();
@@ -5075,7 +5142,10 @@ mod tests {
                     .into_f32()
                     .unwrap();
                 let err = rel_err(&want, &got);
-                assert!(err < 1e-4, "{f:?} {v:?}: GEMV differs from CPU by {err}");
+                assert!(
+                    err < 1e-4,
+                    "{f:?} m={m} {v:?}: packed linear differs from CPU by {err}"
+                );
             }
         }
     }
@@ -5645,7 +5715,9 @@ mod tests {
             return;
         }
         let (rows, cols, global) = (16usize, 64usize, 0.37f32);
-        let scales: Vec<u8> = (0..rows * cols / 16).map(|i| 0x30 + (i % 24) as u8).collect();
+        let scales: Vec<u8> = (0..rows * cols / 16)
+            .map(|i| 0x30 + (i % 24) as u8)
+            .collect();
         let blocks = scales
             .iter()
             .enumerate()
@@ -5654,32 +5726,50 @@ mod tests {
                 scale: crate::model::f8_e4m3_to_f32(s) * global,
             })
             .collect();
-        let tensor = Nvfp4Tensor { blocks, rows, cols, source_scales: Some((scales.clone(), global)) };
+        let tensor = Nvfp4Tensor {
+            blocks,
+            rows,
+            cols,
+            source_scales: Some((scales.clone(), global)),
+        };
 
         let mut g = Graph::new();
         let x = g.input("x", vec![1, cols], DType::F32);
-        let w = g.weight("w", vec![rows, cols], DType::Quant(crate::hardware::QuantFormat::NVFP4_E2M1));
+        let w = g.weight(
+            "w",
+            vec![rows, cols],
+            DType::Quant(crate::hardware::QuantFormat::NVFP4_E2M1),
+        );
         let y = g.add("lin", Op::Linear, &[x, w], vec![1, rows], DType::F32);
         g.output(y);
         let mut store = Weights::new();
         store.insert(
             "w",
-            Tensor::Quantized(Arc::new(crate::model::layers::QuantizedWeight::Nvfp4(tensor.clone()))),
+            Tensor::Quantized(Arc::new(crate::model::layers::QuantizedWeight::Nvfp4(
+                tensor.clone(),
+            ))),
         );
         let session = Session::new(rt(), &store).expect("Metal Session creation");
 
         let (buf, up_global) = &session.nvfp4_aux["w"];
         // SAFETY: a shared-storage buffer of `length()` bytes, not written while read.
-        let up = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, buf.length() as usize) };
+        let up = unsafe {
+            std::slice::from_raw_parts(buf.contents() as *const u8, buf.length() as usize)
+        };
         assert_eq!(up, &scales[..]);
         assert_eq!(*up_global, global);
 
         let input = rand(cols, 456);
         let mut expected = vec![0.0f32; rows];
         crate::quant::nvfp4::gemv_nvfp4_f32(&tensor, &input, &mut expected);
-        let got = session.run(&g, vec![Tensor::F32(input)]).expect("Metal run");
+        let got = session
+            .run(&g, vec![Tensor::F32(input)])
+            .expect("Metal run");
         for (r, (&e, &m)) in expected.iter().zip(got[0].as_f32().unwrap()).enumerate() {
-            assert!((e - m).abs() <= 1e-4 * e.abs().max(1.0), "row {r}: CPU {e} vs Metal {m}");
+            assert!(
+                (e - m).abs() <= 1e-4 * e.abs().max(1.0),
+                "row {r}: CPU {e} vs Metal {m}"
+            );
         }
     }
 
@@ -6763,5 +6853,53 @@ mod tests {
                 rel_err(cpu_v, metal_v)
             );
         }
+    }
+
+    /// A bidirectional block: rows inside it see keys up to the block's end (`visible_end`), the sliding
+    /// window still starting at the row's own position. Metal against the CPU executor.
+    #[test]
+    fn cached_attention_visible_end_matches_cpu() {
+        let (heads, kv_heads, hd, m) = (4, 2, 8, 6);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let mut g = Graph::new();
+        let q = g.input("q", vec![m, q_dim], DType::F32);
+        let k = g.input("k", vec![m, kv_dim], DType::F32);
+        let v = g.input("v", vec![m, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![16, kv_dim], DType::F32);
+        let vs = g.state("v_state", vec![16, kv_dim], DType::F32);
+        let pos = g.input("pos", vec![m], DType::U32);
+        let vis = g.input("vis", vec![m], DType::U32);
+        let out = g.add(
+            "attn",
+            Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 1.0 / (hd as f32).sqrt(),
+                causal: true,
+                window: Some(4),
+                soft_cap: None,
+                write: true,
+            },
+            &[q, k, v, ks, vs, pos, vis],
+            vec![m, q_dim],
+            DType::F32,
+        );
+        g.output(out);
+        let inputs = vec![
+            Tensor::F32(rand(m * q_dim, 11)),
+            Tensor::F32(rand(m * kv_dim, 22)),
+            Tensor::F32(rand(m * kv_dim, 33)),
+            Tensor::U32((0..m as u32).collect()),
+            Tensor::U32(vec![1, 2, 3, 6, 6, 6]),
+        ];
+        let want = cpu::run(&g, &Weights::new(), &mut StateStore::new(), inputs.clone()).unwrap();
+        let session = Session::new(rt(), &Weights::new()).unwrap();
+        let got = session
+            .run_with_state(&g, Some(&mut StateStore::new()), inputs)
+            .unwrap();
+        let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+        assert!(err < 1e-4, "visible_end mismatch: {err}");
     }
 }

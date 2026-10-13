@@ -207,6 +207,42 @@ pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
     format!("gemvgen_{:?}_r{}", codec.format, p.rows_per_sg)
 }
 
+/// Name of the kernel [`dequant_packed`] emits for `codec`.
+pub fn dequant_packed_name(codec: &Codec) -> String {
+    format!("dequantgen_{:?}", codec.format)
+}
+
+/// Expands a packed `[rows, cols]` weight to f32: buffers `w, out`, bytes `(rows, cols)`, one thread
+/// per 8-element sub-block (`ceil(rows * cols / 8)` threads). Prefill GEMMs read the result.
+pub fn dequant_packed(codec: &Codec) -> String {
+    let name = dequant_packed_name(codec);
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = codec.msl.replace("decode8", &dec);
+    let (be, bb) = (codec.block_elems, codec.block_bytes);
+    let subs = be / 8;
+    format!(
+        r#"
+{codec_msl}
+
+kernel void {name}(
+    device const uchar* w [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    const uint per_row = dims.y / 8;
+    if (gid >= dims.x * per_row) return;
+    const uint row = gid / per_row, s = gid % per_row;
+    device const uchar* b = w + ((ulong)row * (dims.y / {be}) + s / {subs}) * {bb};
+    float v[8];
+    {dec}(b, s % {subs}, v);
+    device float* o = out + (ulong)row * dims.y + s * 8;
+    for (uint i = 0; i < 8; ++i) o[i] = v[i];
+}}
+"#
+    )
+}
+
 /// A packed-weight GEMV with the `Step::GemvPacked` contract: buffers `w, x, y, PackedGemvParams,
 /// bias, res`; grid `(ceil(rows / gemv_rows_per_tg), batch)` of 256 threads. Lane `l` of a
 /// simdgroup walks each row's 8-element sub-blocks `l, l+32, …`, decodes them with the codec's
@@ -218,7 +254,10 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let codec_msl = codec.msl.replace("decode8", &dec);
     let r = p.rows_per_sg;
     let (be, bb) = (codec.block_elems, codec.block_bytes);
-    let acc_decl = (0..r).map(|i| format!("float acc{i} = 0.0f;")).collect::<Vec<_>>().join(" ");
+    let acc_decl = (0..r)
+        .map(|i| format!("float acc{i} = 0.0f;"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let rows_loop: String = (0..r)
         .map(|i| {
             format!(
