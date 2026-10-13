@@ -560,8 +560,8 @@ inline void decode8(device const uchar* blk, uint sub, thread float* out8) {
     uint sh = ((e0 >> 5) & 3) * 2;
     uint a = ((uint(q[0]) | (uint(q[1]) << 16)) >> sh) & 0x03030303u;
     uint b = ((uint(q[2]) | (uint(q[3]) << 16)) >> sh) & 0x03030303u;
-    float4 lo = fma(float4(as_type<uchar4>(a)), d, -d);
-    float4 hi = fma(float4(as_type<uchar4>(b)), d, -d);
+    float4 lo = (float4(as_type<uchar4>(a)) - 1.0f) * d;
+    float4 hi = (float4(as_type<uchar4>(b)) - 1.0f) * d;
     out8[0] = lo.x; out8[1] = lo.y; out8[2] = lo.z; out8[3] = lo.w;
     out8[4] = hi.x; out8[5] = hi.y; out8[6] = hi.z; out8[7] = hi.w;
 }
