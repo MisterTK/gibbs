@@ -330,6 +330,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         .map_err(|e| format!("failed to parse bench suite '{path}': {e}"))?;
 
     let hub = crate::model::hub::HuggingFaceHub::new();
+    let (mut compared, mut skipped) = (0usize, 0usize);
 
     for model_cfg in &suite.models {
         if !model_cfg.reference {
@@ -357,6 +358,9 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         ) {
             (Some(Ok(m)), Some(Ok(c))) => (m, c),
             (None, _) | (_, None) => {
+                // GraphLm checkpoints have no separate native forward to compare against.
+                eprintln!("parity: {} SKIPPED (no native forward)", model_cfg.id);
+                skipped += 1;
                 continue;
             }
             (Some(Err(e)), _) | (_, Some(Err(e))) => {
@@ -374,6 +378,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         let mut cpu_tokens = prompt_tokens.clone();
         let mut m_logits = metal_exec.forward(&prompt_tokens, 0, &mut m_state)?;
         let mut c_logits = cpu_exec.forward(&prompt_tokens, 0, &mut c_state)?;
+        let mut min_cos = 1.0f32;
 
         for i in 0..8 {
             let dot: f32 = m_logits
@@ -396,6 +401,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .unwrap();
 
+            min_cos = min_cos.min(cos);
             if m_top != c_top || cos < 0.999 {
                 eprintln!(
                     "parity: {} step {i}: metal {m_top} != cpu {c_top} (cos {cos:.5})",
@@ -410,7 +416,14 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
             m_logits = metal_exec.forward(&[m_top as u32], metal_tokens.len() - 1, &mut m_state)?;
             c_logits = cpu_exec.forward(&[c_top as u32], cpu_tokens.len() - 1, &mut c_state)?;
         }
+        eprintln!("parity: {} ok (8 steps, min cos {min_cos:.5})", model_cfg.id);
+        compared += 1;
     }
 
+    eprintln!("parity: {compared} compared, {skipped} skipped");
+    if compared == 0 {
+        eprintln!("parity: nothing was compared");
+        return Ok(4);
+    }
     Ok(0)
 }
