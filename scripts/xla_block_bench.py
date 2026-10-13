@@ -74,5 +74,13 @@ for _ in range(200):
     t = time.perf_counter()
     jax.block_until_ready(f(x, kc, vc, pos, P))
     ts.append((time.perf_counter() - t) * 1e6)
-print(json.dumps({"xla_us_per_block": round(statistics.median(ts), 1), "xla_kernels": kernels,
+# Pipelined: 200 back-to-back calls, one sync: amortises the Python dispatch + sync, so it approaches XLA's device time.
+piped = []
+for _ in range(5):
+    t = time.perf_counter()
+    outs = [f(x, kc, vc, pos, P) for _ in range(200)]
+    jax.block_until_ready(outs)
+    piped.append((time.perf_counter() - t) * 1e6 / 200)
+print(json.dumps({"xla_us_per_block": round(statistics.median(ts), 1), "xla_us_pipelined": round(min(piped), 1),
+                  "xla_kernels": kernels,
                   "backend": jax.default_backend(), "note": "wall time incl. dispatch, block_until_ready"}))

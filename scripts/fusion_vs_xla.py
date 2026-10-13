@@ -57,6 +57,9 @@ for n, k, g, w in [("gibbs Full", full["dispatches"], full["us"], full["run_us"]
     print(f"{n} | {k if k is not None else 'n/a'} | {f(g)} | {f(w)} | {'n/a' if w is None else f'{w / ref_us:.2f}'}")
 print(f"fixture noise (Full vs XlaClass wall, medians of 3 alternated runs): {noise:.1f}%")
 ok = full["run_us"] <= 0.8 * ref_us and full["dispatches"] <= 0.6 * ref_k
+if x.get("xla_us_pipelined") is not None:
+    print(f"device-side basis: gibbs gpu us {full['us']:.1f} (Full) / {xc['us']:.1f} (XlaClass) vs XLA pipelined "
+          f"{x['xla_us_pipelined']:.1f} us/call -> {full['us'] / x['xla_us_pipelined']:.2f}x")
 print(f"4.9 verdict vs {ref_name} (kernels vs {k_name}, time = host wall): {'PASS' if ok else 'NOT ACHIEVED'}")
 if "error" in x:
     print("xla error:", x["error"])
