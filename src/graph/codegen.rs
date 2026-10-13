@@ -341,23 +341,32 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
             )
         })
         .collect();
+    let nseg = wd.segs as usize;
     let rows: String = (0..r)
         .map(|i| {
-            let mut dots: String = "            float t = 0.0f;\n".into();
-            for k in 0..wd.segs {
+            let mut dots = String::new();
+            for k in 0..nseg {
                 let o = 8 * k;
-                dots += &format!("            t += dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs[{}]);\n", o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1);
+                dots += &format!(
+                    "            acc{i} += v[{}] * (dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs[{}])) + v[{}] * sx{k};\n",
+                    8 * nseg + k, o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1, 9 * nseg + k
+                );
             }
-            dots += &format!("            acc{i} += v[{}] * (t - {:?}f * sx);\n", 8 * wd.segs, wd.offset);
-            row(i, &format!("{gdec}(b, g, v);"), &dots, 8 * wd.segs + 1)
+            row(i, &format!("{gdec}(b, g, v);"), &dots, 10 * wd.segs)
         })
         .collect();
     let groups = wd.groups;
-    let sx: String = (0..2 * wd.segs)
-        .map(|j| format!(" + xs[{j}].x + xs[{j}].y + xs[{j}].z + xs[{j}].w"))
+    let sx: String = (0..nseg)
+        .map(|k| {
+            format!(
+                "        const float sx{k} = dot(xs[{}], float4(1.0f)) + dot(xs[{}], float4(1.0f));\n",
+                2 * k,
+                2 * k + 1
+            )
+        })
         .collect();
     format!(
-        "    const uint groups = blocks_per_row * {groups};\n    for (uint s = lane; s < groups; s += 32) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        float4 xs[{}];\n{xs}        const float sx = 0.0f{sx};\n{rows}    }}\n",
+        "    const uint groups = blocks_per_row * {groups};\n    for (uint s = lane; s < groups; s += 32) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        float4 xs[{}];\n{xs}{sx}{rows}    }}\n",
         2 * wd.segs
     )
 }
