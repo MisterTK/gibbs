@@ -164,8 +164,9 @@ def process(item, nxt):
         row["parity"] = "ok" if pcode == 0 else "fail"
         row["parity_min_cos"] = float(cos.group(1)) if cos else None
         if pcode != 0:
-            lines = [l for l in perr.strip().splitlines() if l.startswith("parity:")] or perr.strip().splitlines() or ["?"]
-            row["parity_error"] = lines[-1]
+            lines = [l for l in perr.strip().splitlines() if l.startswith("parity:")]
+            tail = " | ".join(perr.strip().splitlines()[-3:]) or "?"
+            row["parity_error"] = f"exit {pcode}: " + (lines[-1] if lines else tail)
         v, d = oracle(item, b)
         row["oracle"], row["oracle_detail"] = v, d
     else:

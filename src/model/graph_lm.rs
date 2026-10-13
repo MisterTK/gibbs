@@ -62,6 +62,20 @@ pub struct GraphLmConfig {
     /// Gated MLP activation relu(gate)² (BitNet `relu2`) instead of SiLU.
     #[serde(default)]
     pub use_relu2_mlp: bool,
+    /// Attention logit scale; 0 means 1/sqrt(head_dim).
+    #[serde(default)]
+    pub attention_scale: f32,
+}
+
+impl GraphLmConfig {
+    /// The attention score scale: the model's own, else 1/sqrt(head_dim).
+    pub fn attn_scale(&self) -> f32 {
+        if self.attention_scale > 0.0 {
+            self.attention_scale
+        } else {
+            1.0 / (self.head_dim as f32).sqrt()
+        }
+    }
 }
 
 impl GraphLmConfig {
@@ -88,6 +102,7 @@ impl GraphLmConfig {
             act_quant_bits: 0,
             ternarize_weights: false,
             use_relu2_mlp: false,
+            attention_scale: 0.0,
         }
     }
 
@@ -114,6 +129,7 @@ impl GraphLmConfig {
             act_quant_bits: 0,
             ternarize_weights: false,
             use_relu2_mlp: false,
+            attention_scale: 0.0,
         }
     }
 
@@ -140,6 +156,7 @@ impl GraphLmConfig {
             act_quant_bits: 0,
             ternarize_weights: false,
             use_relu2_mlp: false,
+            attention_scale: 0.0,
         }
     }
 
@@ -172,6 +189,7 @@ impl GraphLmConfig {
             act_quant_bits: 0,
             ternarize_weights: false,
             use_relu2_mlp: false,
+            attention_scale: 0.0,
         }
     }
 
@@ -246,6 +264,10 @@ impl GraphLmConfig {
                 base.act_quant_bits
             },
             use_relu2_mlp: arch == "bitnet-b1.58" || base.use_relu2_mlp,
+            // Granite's `attention.scale` replaces 1/sqrt(head_dim) (llama.cpp `f_attention_scale`).
+            attention_scale: get("attention.scale")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base.attention_scale),
             // llama.cpp's LLAMA_ROPE_TYPE_NORM archs rotate adjacent (2i, 2i+1) pairs; for llama,
             // convert_hf_to_gguf permutes q/k rows into exactly that layout.
             rope_interleaved: matches!(
@@ -672,14 +694,24 @@ impl GraphLm {
                     &name,
                     0,
                     0,
-                    crate::model::layers::QuantizedWeight::Uncompressed { data: Vec::new(), in_features: 0, out_features: 0 },
+                    crate::model::layers::QuantizedWeight::Uncompressed {
+                        data: Vec::new(),
+                        in_features: 0,
+                        out_features: 0,
+                    },
                 ),
             )
         };
         let head_dim = self.config.head_dim;
         let mut run = |layer: &mut QuantizedLinearLayer, role| {
             let l = take(layer);
-            *layer = enc.encode(Projection { role, layer: l, sources: Vec::new(), head_dim, checkpoint: None });
+            *layer = enc.encode(Projection {
+                role,
+                layer: l,
+                sources: Vec::new(),
+                head_dim,
+                checkpoint: None,
+            });
         };
         for l in &mut self.layers {
             run(&mut l.qkv_proj, ProjRole::Attn);
@@ -1157,7 +1189,11 @@ impl GraphLm {
             let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, h, 2 * h, n);
             let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * h, 3 * h, n);
             if rotary_dim > 0 {
-                let inv_freq_val = g.weight("rope.inv_freq.default", vec![inv_freq_vec.len()], DType::F32);
+                let inv_freq_val = g.weight(
+                    "rope.inv_freq.default",
+                    vec![inv_freq_vec.len()],
+                    DType::F32,
+                );
                 if let Some(map) = &mut w_map {
                     map.insert("rope.inv_freq.default", Tensor::F32(inv_freq_vec.clone()));
                 }
@@ -1194,7 +1230,7 @@ impl GraphLm {
                         kv_heads: c.num_heads,
                         head_dim: c.head_dim,
                         v_head_dim: c.head_dim,
-                        scale: 1.0 / (c.head_dim as f32).sqrt(),
+                        scale: c.attn_scale(),
                         causal: true,
                         window: None,
                         soft_cap: None,
@@ -1466,7 +1502,11 @@ impl GraphLm {
         let encode = |layer: QuantizedLinearLayer, role: ProjRole, format, sources: Vec<String>| {
             if let Some(enc) = encoder {
                 // Ternarized (BitNet) weights no longer equal the checkpoint's tensors.
-                let sources = if config.ternarize_weights { Vec::new() } else { sources };
+                let sources = if config.ternarize_weights {
+                    Vec::new()
+                } else {
+                    sources
+                };
                 enc.encode(Projection {
                     role,
                     layer,
@@ -1523,11 +1563,7 @@ impl GraphLm {
             let gguf_k = format!("blk.{}.attn_k.weight", l);
             let gguf_v = format!("blk.{}.attn_v.weight", l);
             if raw_qkv.is_none() && manifest.tensors.contains_key(&gguf_q) {
-                if let (Ok(q), Ok(k), Ok(v_vec)) = (
-                    ext(&gguf_q),
-                    ext(&gguf_k),
-                    ext(&gguf_v),
-                ) {
+                if let (Ok(q), Ok(k), Ok(v_vec)) = (ext(&gguf_q), ext(&gguf_k), ext(&gguf_v)) {
                     let head_dim = config.head_dim;
                     let k_expanded = expand_gqa_kv(k, q.len(), config.num_heads, head_dim, h);
                     let v_expanded = expand_gqa_kv(v_vec, q.len(), config.num_heads, head_dim, h);
@@ -1577,11 +1613,7 @@ impl GraphLm {
                     fused.extend(k_expanded);
                     fused.extend(v_expanded);
                     raw_qkv = Some(fused);
-                } else if let (Ok(q), Ok(k), Ok(v_vec)) = (
-                    ext(&neo_q),
-                    ext(&neo_k),
-                    ext(&neo_v),
-                ) {
+                } else if let (Ok(q), Ok(k), Ok(v_vec)) = (ext(&neo_q), ext(&neo_k), ext(&neo_v)) {
                     let head_dim = config.head_dim;
                     let k_expanded = expand_gqa_kv(k, q.len(), config.num_heads, head_dim, h);
                     let v_expanded = expand_gqa_kv(v_vec, q.len(), config.num_heads, head_dim, h);
@@ -1688,10 +1720,7 @@ impl GraphLm {
             } else if manifest.tensors.contains_key(&gguf_gate)
                 && manifest.tensors.contains_key(&gguf_up)
             {
-                if let (Ok(g), Ok(u)) = (
-                    ext(&gguf_gate),
-                    ext(&gguf_up),
-                ) {
+                if let (Ok(g), Ok(u)) = (ext(&gguf_gate), ext(&gguf_up)) {
                     let mut fused = Vec::with_capacity(g.len() + u.len());
                     fused.extend(g);
                     fused.extend(u);
@@ -1708,8 +1737,7 @@ impl GraphLm {
                         raw_gate_up = Some(duplicated);
                     }
                 }
-            } else if let Ok(vec) = ext(&format!("model.layers.{}.mlp.gate_up_proj.weight", l))
-            {
+            } else if let Ok(vec) = ext(&format!("model.layers.{}.mlp.gate_up_proj.weight", l)) {
                 // HF fused [gate; up] rows (GLM, Phi-3): already our gate-first layout.
                 raw_gate_up = Some(vec);
             } else if let (Ok(g), Ok(u)) = (proj(&gate_name), proj(&up_name)) {
@@ -2307,7 +2335,7 @@ impl GraphLm {
             }
 
             // Multi-head causal attention execution
-            let scale_attn = 1.0 / (head_dim as f32).sqrt();
+            let scale_attn = self.config.attn_scale();
             for t in 0..seq_len {
                 let mut attn_out = vec![0.0f32; h];
 
@@ -2652,7 +2680,7 @@ impl GraphLm {
             let current_len = cache.len;
 
             // 5. Causal attention for this token against cached 0..=pos in O(pos) time
-            let scale_attn = 1.0 / (head_dim as f32).sqrt();
+            let scale_attn = self.config.attn_scale();
 
             for head in 0..num_heads {
                 let head_offset = head * head_dim;
@@ -3192,6 +3220,32 @@ mod tests {
         let params_10m = model_10m.parameter_count();
         assert!(params_10m <= 10_000_000);
         assert!(params_10m > 9_000_000 && params_10m <= 10_000_000);
+    }
+
+    /// Granite's `attention.scale` (1/head_dim for granite-4.x) replaces 1/sqrt(head_dim); other archs keep it.
+    #[test]
+    fn gguf_attention_scale_overrides_the_default() {
+        let manifest = |scale: Option<&str>| {
+            let mut md = std::collections::HashMap::new();
+            md.insert("general.architecture".to_string(), "granite".to_string());
+            md.insert("granite.embedding_length".to_string(), "256".to_string());
+            md.insert("granite.attention.head_count".to_string(), "2".to_string());
+            if let Some(s) = scale {
+                md.insert("granite.attention.scale".to_string(), s.to_string());
+            }
+            ModelManifest {
+                format: crate::model::SourceFormat::Gguf,
+                tensors: Default::default(),
+                metadata: md,
+                shard_count: 1,
+                detected_architecture: String::new(),
+            }
+        };
+        let base = GraphLmConfig::smollm_1m();
+        let with = GraphLmConfig::from_gguf(&manifest(Some("0.0078125")), base.clone());
+        assert_eq!(with.attn_scale(), 0.0078125);
+        let without = GraphLmConfig::from_gguf(&manifest(None), base);
+        assert_eq!(without.attn_scale(), 1.0 / (128f32).sqrt());
     }
 
     #[test]
