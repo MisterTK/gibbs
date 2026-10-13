@@ -1985,6 +1985,116 @@ mod tests {
         }
     }
 
+    /// A tiny `qwen3moe` GGUF with Q4_0 expert banks, through the real GGUF path: the banks stay
+    /// packed in the mapping, and the Metal program (banks read in place by `MoeLinear`) matches the
+    /// host forward (rows decoded from the same mapping).
+    #[test]
+    fn qwen3moe_gguf_banks_stay_packed_and_match_host() {
+        use crate::model::layers::quantize_f32_to_q4_0;
+        let (hidden, vocab, heads, kv_heads, hd) = (64usize, 128usize, 4usize, 2usize, 16usize);
+        let (experts, top_k, ff, layers) = (8usize, 2usize, 32usize, 2usize);
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        // (name, GGML dims fastest first, type, bytes): F32 = 0, Q4_0 = 2.
+        let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
+        let f32s = |v: Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let mut add_f32 = |n: &str, dims: &[usize], v: Vec<f32>| tensors.push((n.into(), dims.to_vec(), 0, f32s(v)));
+        add_f32("token_embd.weight", &[hidden, vocab], rnd(hidden * vocab, 0.8));
+        add_f32("output_norm.weight", &[hidden], rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect());
+        add_f32("output.weight", &[hidden, vocab], rnd(hidden * vocab, 0.8));
+        for l in 0..layers {
+            let p = format!("blk.{l}");
+            for n in ["attn_norm", "ffn_norm"] {
+                add_f32(&format!("{p}.{n}.weight"), &[hidden], rnd(hidden, 0.2).iter().map(|v| v + 1.0).collect());
+            }
+            add_f32(&format!("{p}.attn_q.weight"), &[hidden, heads * hd], rnd(hidden * heads * hd, 0.8));
+            add_f32(&format!("{p}.attn_k.weight"), &[hidden, kv_heads * hd], rnd(hidden * kv_heads * hd, 0.8));
+            add_f32(&format!("{p}.attn_v.weight"), &[hidden, kv_heads * hd], rnd(hidden * kv_heads * hd, 0.8));
+            add_f32(&format!("{p}.attn_output.weight"), &[heads * hd, hidden], rnd(hidden * heads * hd, 0.8));
+            for n in ["attn_q_norm", "attn_k_norm"] {
+                add_f32(&format!("{p}.{n}.weight"), &[hd], rnd(hd, 0.2).iter().map(|v| v + 1.0).collect());
+            }
+            add_f32(&format!("{p}.ffn_gate_inp.weight"), &[hidden, experts], rnd(hidden * experts, 1.6));
+        }
+        let mut bank = |n: String, dims: &[usize], v: Vec<f32>| tensors.push((n, dims.to_vec(), 2, quantize_f32_to_q4_0(&v)));
+        for l in 0..layers {
+            let p = format!("blk.{l}");
+            bank(format!("{p}.ffn_gate_exps.weight"), &[hidden, ff, experts], rnd(experts * ff * hidden, 0.8));
+            bank(format!("{p}.ffn_up_exps.weight"), &[hidden, ff, experts], rnd(experts * ff * hidden, 0.8));
+            bank(format!("{p}.ffn_down_exps.weight"), &[ff, hidden, experts], rnd(experts * hidden * ff, 0.8));
+        }
+        let u32_kv = |k: &str, v: u32| (format!("qwen3moe.{k}"), 4u32, v.to_le_bytes().to_vec());
+        let f32_kv = |k: &str, v: f32| (format!("qwen3moe.{k}"), 6u32, v.to_le_bytes().to_vec());
+        let mut arch_name = (8u64).to_le_bytes().to_vec();
+        arch_name.extend_from_slice(b"qwen3moe");
+        let kvs = vec![
+            ("general.architecture".to_string(), 8u32, arch_name),
+            u32_kv("embedding_length", hidden as u32),
+            u32_kv("attention.head_count", heads as u32),
+            u32_kv("attention.head_count_kv", kv_heads as u32),
+            u32_kv("attention.key_length", hd as u32),
+            f32_kv("attention.layer_norm_rms_epsilon", 1e-6),
+            f32_kv("rope.freq_base", 10000.0),
+            u32_kv("context_length", 64),
+            u32_kv("block_count", layers as u32),
+            u32_kv("feed_forward_length", 96),
+            u32_kv("expert_count", experts as u32),
+            u32_kv("expert_used_count", top_k as u32),
+        ];
+        let file = crate::model::loaders::gguf::test_gguf_blocks(&kvs, &tensors);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny-qwen3moe.gguf");
+        std::fs::write(&path, &file).unwrap();
+
+        let (manifest, data) = crate::model::loaders::gguf::open(&path).unwrap();
+        let (ck, cfg, arch) = gguf_checkpoint(&Arc::new(data), &manifest).unwrap();
+        for part in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(
+                ck.packed_gguf(&format!("model.layers.1.mlp.experts.{part}")).is_some(),
+                "{part} bank stays packed in the file mapping"
+            );
+        }
+        let text = Arc::new(TextModel::load(&ck, &cfg, arch).unwrap());
+        let program = compile_qwen_program(
+            &text,
+            crate::hardware::PlacementMode::Pin(Device::Metal),
+            text::DecodeOpts::default(),
+        )
+        .unwrap()
+        .expect("a Metal program");
+        let mut prog = program.lock();
+        assert_eq!(prog.cpu_node_count(), 0);
+        let mut host_state = text.new_state();
+        let mut tok = 11u32;
+        for pos in 0..6usize {
+            let mut emb = vec![0.0f32; hidden];
+            text.embed(tok, &mut emb).unwrap();
+            let hid = text.forward_rows(
+                emb.clone(), &[[pos as u32; 3]], pos, &mut host_state, 0, usize::MAX,
+                &[], &[], false, &[], &mut Vec::new(),
+            );
+            let want = text.logits(&hid, 1);
+            let got = prog
+                .run(vec![crate::graph::Tensor::F32(emb), crate::graph::Tensor::U32(vec![pos as u32])])
+                .unwrap();
+            let got = got[0].as_f32().unwrap();
+            let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (n(&want) * n(got));
+            assert!(cos >= 0.999, "step {pos}: Metal vs host cosine {cos}");
+            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        }
+    }
+
     /// Hybrid Qwen3.5 stack (DeltaNet + gated GQA full attention, qk-norm, partial rotary): the
     /// Metal seq-cls program against the host forward. The text weights are bf16 on both sides and
     /// accumulate in f32, so the bound is the 1e-3 f32 one.

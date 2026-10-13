@@ -17,7 +17,7 @@ pub use vision::tiny::graph as tiny_vision_graph;
 mod unified;
 mod vision;
 
-pub use gguf::load_gguf;
+pub use gguf::{gguf_decode_fixture, load_gguf};
 
 use crate::hardware::Device;
 use crate::model::hub::ModelArtifacts;
