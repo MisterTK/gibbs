@@ -2514,7 +2514,7 @@ mod tests {
                     size: None,
                 })
                 .collect();
-            select_weight_files(&files, None).unwrap()
+            crate::model::variant::with_unmeasured_host(|| select_weight_files(&files, None).unwrap())
         };
         let uc = pick(&[
             "README.md",
