@@ -1134,12 +1134,12 @@ impl TuiApp {
                     ));
                 }
                 let artifacts = hub.auto_download_and_cache(&id, token.as_deref())?;
-                let model_size = artifacts
-                    .weights_path
-                    .as_ref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
+                    crate::model::variant::decode_bytes_per_token(
+                        p,
+                        crate::model::variant::reencode_policy(),
+                    )
+                });
                 sched.telemetry.set_model_size_bytes(model_size);
                 *stage.lock() = "reading weights, choosing weight format";
                 if let Some(img) = load_image_model(&artifacts, &hub) {

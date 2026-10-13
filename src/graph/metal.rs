@@ -1644,10 +1644,12 @@ impl Session {
             for &v in &s.reads {
                 let val = graph.value(v);
                 if val.kind == ValueKind::Weight {
-                    if let Some((buf, _, _, _)) = self.weights.get(&val.name) {
+                    if let Some(&(_, _, len, fmt)) = self.weights.get(&val.name) {
+                        // Stored bytes of this tensor (not its backing buffer, which may be the
+                        // whole mmap'd checkpoint).
+                        let total_b = weight_format_bytes(fmt, len) as u64;
                         if matches!(s.op, Step::Embedding { .. }) {
                             let rows = val.shape.first().copied().unwrap_or(1);
-                            let total_b = buf.length() as u64;
                             let row_bytes = if rows > 0 { total_b / rows as u64 } else { 0 };
                             let ids_count = s
                                 .reads
@@ -1656,7 +1658,7 @@ impl Session {
                                 .unwrap_or(1);
                             weight_bytes += ids_count * row_bytes;
                         } else {
-                            weight_bytes += buf.length() as u64;
+                            weight_bytes += total_b;
                         }
                     }
                 }
