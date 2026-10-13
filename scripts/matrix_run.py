@@ -56,7 +56,7 @@ class Paused(BaseException):
 def run(cmd, timeout, env_extra=None):
     env = dict(os.environ, HF_HUB_CACHE=os.path.abspath(CACHE), **(env_extra or {}))
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
-        p = subprocess.Popen(cmd, stdout=out, stderr=err, text=True, env=env)
+        p = subprocess.Popen(cmd, stdout=out, stderr=err, text=True, env=env, start_new_session=True)
         deadline = time.time() + timeout
         code = None
         while code is None:
@@ -64,10 +64,10 @@ def run(cmd, timeout, env_extra=None):
                 code = p.wait(2)
             except subprocess.TimeoutExpired:
                 if os.path.exists(PAUSE):
-                    p.kill(); p.wait()
+                    os.killpg(p.pid, signal.SIGKILL); p.wait()
                     raise Paused()
                 if time.time() > deadline:
-                    p.kill(); p.wait()
+                    os.killpg(p.pid, signal.SIGKILL); p.wait()
                     code = 124
         out.seek(0); err.seek(0)
         stderr = err.read()
