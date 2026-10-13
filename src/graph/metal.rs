@@ -403,6 +403,8 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
+/// Ticket counters at the start of the split-attention scratch (one u32 per head tile, <= 256 tiles).
+const ATTN_CTR_BYTES: usize = 1024;
 const BASE_KERNELS: [&str; 58] = [
     "embedding_f32",
     "layer_norm_f32",
@@ -3174,7 +3176,15 @@ impl Session {
                         ));
                     }
                 }
-                if write && k_state.is_some() && v_state.is_some() {
+                // Decode append fused into the attention launch: the kernel reads the new K/V row from the
+                // inputs and stores it (`AttentionSingleDispatch`; XlaClass keeps the separate dispatch).
+                let fuse_append = write
+                    && m == 1
+                    && vis.is_none()
+                    && k_state.is_some()
+                    && v_state.is_some()
+                    && fusion_policy().allows(FusionClass::AttentionSingleDispatch);
+                if write && k_state.is_some() && v_state.is_some() && !fuse_append {
                     let ks = k_state.unwrap();
                     let vs = v_state.unwrap();
                     enc.set_compute_pipeline_state(rt.pso("kv_append_batched")?);
@@ -3221,8 +3231,12 @@ impl Session {
                     1
                 };
                 let mut scratch_guard = self.attn_scratch.lock();
+                let head_tiles = kv_heads * group.div_ceil(ATTN_HPT);
+                let fuse_merge = n_splits > 1
+                    && head_tiles * 4 <= ATTN_CTR_BYTES
+                    && fusion_policy().allows(FusionClass::AttentionSingleDispatch);
                 if n_splits > 1 {
-                    let bytes = heads * n_splits * (head_dim + 2) * 4;
+                    let bytes = ATTN_CTR_BYTES + heads * n_splits * (head_dim + 2) * 4;
                     if scratch_guard
                         .as_ref()
                         .map_or(true, |b| (b.length() as usize) < bytes)
@@ -3246,11 +3260,18 @@ impl Session {
                 bind(1, k_buf_id);
                 bind(2, v_buf_id);
                 match scratch_guard.as_ref().filter(|_| n_splits > 1) {
-                    Some(part) => enc.set_buffer(3, Some(part), 0),
+                    Some(part) => enc.set_buffer(3, Some(part), ATTN_CTR_BYTES as u64),
                     None => bind(3, s.out),
                 }
                 // Rows see keys `< vis[row]` when the operand is present (default `pos + row + 1`).
                 bind(5, vis.unwrap_or(q));
+                bind(6, k);
+                bind(7, v);
+                bind(8, s.out);
+                match scratch_guard.as_ref().filter(|_| n_splits > 1) {
+                    Some(ctr) => enc.set_buffer(9, Some(ctr), 0),
+                    None => bind(9, s.out),
+                }
                 #[repr(C)]
                 struct AttnCachedParams {
                     n_heads: u32,
@@ -3265,6 +3286,8 @@ impl Session {
                     has_vis: u32,
                     n_splits: u32,
                     chunk: u32,
+                    fuse_append: u32,
+                    fuse_merge: u32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -3279,6 +3302,8 @@ impl Session {
                     has_vis: vis.is_some() as u32,
                     n_splits: n_splits as u32,
                     chunk: n_keys.div_ceil(n_splits) as u32,
+                    fuse_append: fuse_append as u32,
+                    fuse_merge: fuse_merge as u32,
                 };
                 set_bytes(enc, 4, &p);
                 let tgs_x = if n_splits > 1 {
@@ -3290,9 +3315,12 @@ impl Session {
                     MTLSize::new(tgs_x as u64, m as u64, n_splits as u64),
                     MTLSize::new(TG4, 1, 1),
                 );
-                if let Some(part) = scratch_guard.as_ref().filter(|_| n_splits > 1) {
+                if let Some(part) = scratch_guard
+                    .as_ref()
+                    .filter(|_| n_splits > 1 && !fuse_merge)
+                {
                     enc.set_compute_pipeline_state(rt.pso("attn_cached_merge_f32")?);
-                    enc.set_buffer(0, Some(part), 0);
+                    enc.set_buffer(0, Some(part), ATTN_CTR_BYTES as u64);
                     bind(1, s.out);
                     set_bytes(enc, 2, &p);
                     enc.dispatch_thread_groups(
