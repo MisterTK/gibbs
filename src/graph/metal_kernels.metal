@@ -44,7 +44,7 @@ struct PackedGemvParams {
     uint epi; // 0 = None, 1 = Gelu, 2 = Residual, 3 = Silu, 4 = SwiGlu, 5 = GeGlu
 };
 
-static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemvParams& p, device const float* res) {
+static inline float apply_gemv_epi(float acc, ulong out_idx, PackedGemvParams p, device const float* res) {
     if (p.epi == 1) {
         return gelu_erf(acc);
     } else if (p.epi == 2) {

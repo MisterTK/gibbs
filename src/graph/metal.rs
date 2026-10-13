@@ -597,6 +597,8 @@ pub struct Runtime {
     profile_path: std::path::PathBuf,
     /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
     gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
+    /// Persistent chain kernels by the sorted codec formats they run.
+    chain_psos: Mutex<HashMap<Vec<QuantFormat>, ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
@@ -668,6 +670,7 @@ impl Runtime {
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
             gen_psos: Mutex::new(HashMap::new()),
+            chain_psos: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
@@ -1038,6 +1041,24 @@ impl Runtime {
         Ok(pso)
     }
 
+    /// The persistent chain kernel ([`crate::graph::codegen::chain_kernel`]) over `formats`' generated
+    /// GEMVs, compiled on first use.
+    fn chain_pso(&self, formats: &[QuantFormat]) -> Result<ComputePipelineState, String> {
+        if let Some(p) = self.chain_psos.lock().get(formats) {
+            return Ok(p.clone());
+        }
+        let codecs = formats
+            .iter()
+            .map(|f| codec::codec(*f).ok_or_else(|| format!("no codec for {f:?}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+        src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
+        src.push_str(&crate::graph::codegen::chain_kernel(&codecs));
+        let pso = self.compile_generated(&src, "chain_exec")?;
+        self.chain_psos.lock().insert(formats.to_vec(), pso.clone());
+        Ok(pso)
+    }
+
     /// Compiles one generated kernel `name` from `src` (fast-math off, as for the hand kernels).
     fn compile_generated(&self, src: &str, name: &str) -> Result<ComputePipelineState, String> {
         let opts = CompileOptions::new();
@@ -1390,6 +1411,8 @@ pub struct Session {
     arena: Mutex<Option<Buffer>>,
     state_buffers: Mutex<HashMap<String, Arc<Buffer>>>,
     mlp_scratch: Mutex<Option<Buffer>>,
+    /// Tape and barrier counters of the persistent chain kernel ([`ChainRun`]).
+    chain_scratch: Mutex<Option<Arc<Buffer>>>,
     /// f32 expansion of the packed weight a batched GEMM step is reading (grown to the largest).
     dequant_scratch: Mutex<Option<Buffer>>,
     /// Per-slice partials of the split decode attention (grown to the largest).
@@ -1949,6 +1972,7 @@ impl Session {
             arena: Mutex::new(None),
             state_buffers: Mutex::new(HashMap::new()),
             mlp_scratch: Mutex::new(None),
+            chain_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
@@ -1989,6 +2013,176 @@ impl Session {
             }
         }
         (n * 4) as u64
+    }
+
+    /// Prepares the persistent chain kernel for this plan: the codec formats of its chainable GEMVs, their
+    /// pipeline, and the tape/counter scratch (counters zeroed). `None` when nothing can be chained.
+    fn chain_begin(&self, steps: &[Planned]) -> Result<Option<ChainRun>, String> {
+        let mut formats: Vec<QuantFormat> = Vec::new();
+        for s in steps {
+            if let Some(q) = chain_gemv_format(&s.op) {
+                if !formats.contains(&q) {
+                    formats.push(q);
+                }
+            }
+        }
+        if formats.is_empty() {
+            return Ok(None);
+        }
+        formats.sort_by_key(|f| format!("{f:?}"));
+        let pso = self.rt.chain_pso(&formats)?;
+        if pso.max_total_threads_per_threadgroup() < 256 {
+            return Ok(None);
+        }
+        let mut guard = self.chain_scratch.lock();
+        if guard.is_none() {
+            *guard = Some(Arc::new(new_shared_buffer(
+                &self.rt.device,
+                CHAIN_COUNTERS_BYTES + CHAIN_TAPE_BYTES,
+            )?));
+        }
+        let scratch = guard.as_ref().unwrap().clone();
+        // SAFETY: the previous run completed (runs are serialized by the arena lock); the counter
+        // region is CHAIN_COUNTERS_BYTES long.
+        unsafe { std::ptr::write_bytes(scratch.contents() as *mut u8, 0, CHAIN_COUNTERS_BYTES) };
+        let k = std::env::var("GIBBS_CHAIN_TGS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48u32);
+        Ok(Some(ChainRun {
+            scratch,
+            pso,
+            formats,
+            k,
+            chains: 0,
+            tape_off: 0,
+            seen: std::collections::HashSet::new(),
+        }))
+    }
+
+    /// Encodes `steps` (all chainable, see [`chain_run`]) as one persistent dispatch.
+    fn encode_chain<'a>(
+        &self,
+        enc: &Counted,
+        c: &mut ChainRun,
+        steps: &[Planned],
+        loc: &impl Fn(ValueId) -> (&'a Buffer, usize),
+    ) -> Result<(), String> {
+        use crate::graph::codegen::{gemv_rows_per_tg, CHAIN_OP_BYTES, CHAIN_RMS, CHAIN_RMS_RES};
+        let base = CHAIN_COUNTERS_BYTES + c.tape_off;
+        if c.tape_off + steps.len() * CHAIN_OP_BYTES > CHAIN_TAPE_BYTES
+            || (c.chains as usize + 1) * 16 > CHAIN_COUNTERS_BYTES
+        {
+            return Err("persistent chain tape capacity exceeded".into());
+        }
+        let mut tape: Vec<u8> = Vec::with_capacity(steps.len() * CHAIN_OP_BYTES);
+        for s in steps {
+            let mut addr = |v: ValueId| -> u64 {
+                let (b, off) = loc(v);
+                if c.seen.insert(b as *const Buffer as usize) {
+                    enc.use_resource(
+                        b,
+                        metal::MTLResourceUsage::Read | metal::MTLResourceUsage::Write,
+                    );
+                }
+                let r: &metal::BufferRef = b;
+                let a: u64 = unsafe { msg_send![r, gpuAddress] };
+                a + off as u64
+            };
+            let out = addr(s.out);
+            let (words, a): ([u32; 8], [u64; 6]) = match &s.op {
+                Step::GemvPacked {
+                    x,
+                    w,
+                    bias,
+                    res,
+                    epi,
+                    m,
+                    rows,
+                    cols,
+                    format,
+                    ..
+                } => {
+                    let q = format.codec_format().expect("chainable GEMV has a codec");
+                    let idx = c
+                        .formats
+                        .iter()
+                        .position(|f| *f == q)
+                        .expect("format listed");
+                    let grid = rows.div_ceil(gemv_rows_per_tg(Default::default()));
+                    (
+                        [
+                            1 + idx as u32,
+                            u32_of(grid)?,
+                            u32_of(*rows)?,
+                            u32_of(*cols)?,
+                            u32_of(*m)?,
+                            bias.is_some() as u32,
+                            epi.as_u32(),
+                            0,
+                        ],
+                        [
+                            addr(*w),
+                            addr(*x),
+                            out,
+                            bias.map_or(out, &mut addr),
+                            res.map_or(out, &mut addr),
+                            0,
+                        ],
+                    )
+                }
+                Step::RmsNorm {
+                    x,
+                    g,
+                    res,
+                    rows,
+                    d,
+                    eps,
+                } => {
+                    let xa = addr(*x);
+                    (
+                        [
+                            if res.is_some() {
+                                CHAIN_RMS_RES
+                            } else {
+                                CHAIN_RMS
+                            },
+                            u32_of(*rows)?,
+                            u32_of(*rows)?,
+                            u32_of(*d)?,
+                            eps.to_bits(),
+                            res.is_some() as u32,
+                            0,
+                            0,
+                        ],
+                        [xa, addr(*g), res.map_or(xa, &mut addr), out, 0, 0],
+                    )
+                }
+                _ => unreachable!("chain_run admits only GEMV and RmsNorm steps"),
+            };
+            for w in words {
+                tape.extend_from_slice(&w.to_le_bytes());
+            }
+            for v in a {
+                tape.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        // SAFETY: capacity checked above; the region belongs to this chain until the run completes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                tape.as_ptr(),
+                (c.scratch.contents() as *mut u8).add(base),
+                tape.len(),
+            )
+        };
+        enc.set_compute_pipeline_state(&c.pso);
+        enc.set_buffer(0, Some(&c.scratch), base as u64);
+        set_bytes(enc, 1, &[steps.len() as u32, c.k, c.chains * 4, 0]);
+        enc.set_buffer(2, Some(&c.scratch), 0);
+        enc.dispatch_thread_groups(MTLSize::new(c.k as u64, 1, 1), MTLSize::new(256, 1, 1));
+        c.chains += 1;
+        c.tape_off += tape.len();
+        Ok(())
     }
 
     /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`.
@@ -2459,11 +2653,33 @@ impl Session {
                 let counted = Counted::new(enc);
                 let mut err = None;
                 let encode_start = std::time::Instant::now();
-                for (s_idx, s) in steps.iter().enumerate() {
-                    if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
+                let chain_on =
+                    plan.is_decode && std::env::var("GIBBS_CHAIN").map_or(true, |v| v != "0");
+                let mut chain = if chain_on {
+                    self.chain_begin(steps)?
+                } else {
+                    None
+                };
+                let mut s_idx = 0;
+                while s_idx < steps.len() {
+                    if let Some(c) = chain.as_mut() {
+                        let n = chain_run(steps, s_idx);
+                        if n >= 2 {
+                            if let Err(e) =
+                                self.encode_chain(&counted, c, &steps[s_idx..s_idx + n], &loc)
+                            {
+                                err = Some(e);
+                                break;
+                            }
+                            s_idx += n;
+                            continue;
+                        }
+                    }
+                    if let Err(e) = self.encode(&counted, &steps[s_idx], s_idx, &params_buf, &loc) {
                         err = Some(e);
                         break;
                     }
+                    s_idx += 1;
                 }
                 enc.end_encoding();
                 let encode_dur = encode_start.elapsed();
@@ -2471,6 +2687,9 @@ impl Session {
                     return Err(e);
                 }
                 commit_and_wait(cb)?;
+                if let Some(c) = &chain {
+                    c.check()?;
+                }
                 sample = Some(RunSample {
                     gpu_ns: (gpu_seconds(cb) * 1e9) as u64,
                     run_ns: 0,
@@ -3661,6 +3880,60 @@ pub struct PreparedPlan {
     pub state_reads: Vec<StateRead>,
     pub flops_per_run: u64,
     pub params_buffer_size: usize,
+}
+
+/// Bytes of barrier counters (16 per chain: count, timeout flag) and of tape in a session's chain scratch.
+const CHAIN_COUNTERS_BYTES: usize = 4096;
+const CHAIN_TAPE_BYTES: usize = 1 << 20;
+
+/// One run's persistent-chain state: the kernel over the plan's GEMV codecs, the shared scratch, and the
+/// next free tape offset / counter slot.
+struct ChainRun {
+    scratch: Arc<Buffer>,
+    pso: ComputePipelineState,
+    formats: Vec<QuantFormat>,
+    k: u32,
+    chains: u32,
+    tape_off: usize,
+    seen: std::collections::HashSet<usize>,
+}
+
+impl ChainRun {
+    /// Errors when a chain's grid barrier timed out (its threadgroups were not all resident).
+    fn check(&self) -> Result<(), String> {
+        for i in 0..self.chains as usize {
+            // SAFETY: the command buffer has completed; counters are u32 at 16 bytes per chain.
+            let flag = unsafe { *((self.scratch.contents() as *const u32).add(i * 4 + 1)) };
+            if flag != 0 {
+                return Err(format!("persistent chain {i}: grid barrier timed out"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The codec format of a step the persistent chain can run as a GEMV (m = 1, generated kernel).
+thread_local! {
+    static CHAIN_GEN_ONLY: bool = std::env::var_os("GIBBS_CHAIN_GEN_ONLY").is_some();
+}
+fn chain_gemv_format(op: &Step) -> Option<QuantFormat> {
+    match op {
+        Step::GemvPacked { m: 1, format, .. }
+            if !matches!(format, WeightFormat::NvFp4 | WeightFormat::JesseLUT)
+                && !(CHAIN_GEN_ONLY.with(|b| *b) && !matches!(format, WeightFormat::Gen(_))) =>
+        {
+            format.codec_format()
+        }
+        _ => None,
+    }
+}
+
+/// Length of the run of consecutive chainable steps (m = 1 GEMVs, RMSNorms) starting at `at`.
+fn chain_run(steps: &[Planned], at: usize) -> usize {
+    steps[at..]
+        .iter()
+        .take_while(|s| chain_gemv_format(&s.op).is_some() || matches!(s.op, Step::RmsNorm { .. }))
+        .count()
 }
 
 /// Element count of the physical buffer for a state value: 2-D states with more than 4096 declared rows

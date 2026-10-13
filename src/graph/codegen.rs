@@ -273,6 +273,27 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
         r#"
 {codec_msl}
 {wide_msl}
+// The body is a plain function so the persistent chain kernel can run it on a logical threadgroup.
+inline void {name}_body(
+    device const uchar* w,
+    device const float* x,
+    device float* y,
+    PackedGemvParams p,
+    device const float* bias,
+    device const float* res,
+    uint2 tg,
+    uint sg,
+    uint lane
+) {{
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    const uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    const uint blocks_per_row = p.cols / {be};
+    device const float* xb = x + (ulong)batch * p.cols;
+    {acc_decl}
+{loop_src}{sums}    if (lane == 0) {{
+{store}    }}
+}}
 kernel void {name}(
     device const uchar* w [[buffer(0)]],
     device const float* x [[buffer(1)]],
@@ -284,14 +305,7 @@ kernel void {name}(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {{
-    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
-    const uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    const uint blocks_per_row = p.cols / {be};
-    device const float* xb = x + (ulong)batch * p.cols;
-    {acc_decl}
-{loop_src}{sums}    if (lane == 0) {{
-{store}    }}
+    {name}_body(w, x, y, p, bias, res, tg, sg, lane);
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
@@ -301,6 +315,106 @@ kernel void {name}(
                 .replace("decode_group", &dec.replace("decode8", "decode_group"))
                 .replace("group_seg", &dec.replace("decode8", "group_seg")))
             .unwrap_or_default(),
+    )
+}
+
+/// Op kinds of the chain tape: `1 + i` runs the generated GEMV of `codecs[i]`, the rest are norms.
+pub const CHAIN_RMS: u32 = 100;
+pub const CHAIN_RMS_RES: u32 = 101;
+/// Bytes of one tape op (`ChainOp` in [`chain_kernel`]): `kind, grid, p[5], pad` then `a[6]` addresses.
+pub const CHAIN_OP_BYTES: usize = 80;
+
+/// A persistent kernel `chain_exec` that runs a tape of dependent decode steps in one dispatch: `K`
+/// resident threadgroups of 256 threads walk each op's logical threadgroup grid (grid-stride), with a
+/// spin-capped atomic grid barrier between ops (the barrier measured by `persistent_chain_probe`). Ops
+/// are the generated `r1` GEMV bodies of `codecs` and RMSNorm (with an optional residual), the same code
+/// as the separate kernels, so results are bit-identical. Buffers: `ChainOp` tape, `uint4 {n_ops, K,
+/// counter slot, 0}`, `atomic_uint` counters (slot: barrier count, slot + 1: set when a barrier timed out).
+pub fn chain_kernel(codecs: &[&Codec]) -> String {
+    let p = GemvParams::default();
+    let mut src = String::new();
+    let mut cases = String::new();
+    for (i, c) in codecs.iter().enumerate() {
+        src += &gemv_packed(c, p);
+        cases += &format!(
+            "            case {}: {}_body(reinterpret_cast<device const uchar*>(op.a[0]), reinterpret_cast<device const float*>(op.a[1]), reinterpret_cast<device float*>(op.a[2]), gp, reinterpret_cast<device const float*>(op.a[3]), reinterpret_cast<device const float*>(op.a[4]), uint2(lt, 0), sg, lane); break;\n",
+            1 + i,
+            gemv_packed_name(c, p)
+        );
+    }
+    format!(
+        r#"
+{src}
+struct ChainOp {{ uint kind; uint grid; uint p[5]; uint pad; ulong a[6]; }};
+static inline float chain_block_sum(float v, threadgroup float* scratch, uint sg, uint lane, uint nsg) {{
+    v = simd_sum(v);
+    if (lane == 0) scratch[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint i = 0; i < nsg; ++i) total += scratch[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}}
+kernel void chain_exec(
+    device const ChainOp* ops [[buffer(0)]],
+    constant uint4& meta [[buffer(1)]],
+    device atomic_uint* ctr [[buffer(2)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tid [[thread_index_in_threadgroup]]
+) {{
+    threadgroup float scratch[32];
+    const uint n = meta.x, K = meta.y, cbase = meta.z;
+    for (uint i = 0; i < n; i++) {{
+        const ChainOp op = ops[i];
+        PackedGemvParams gp;
+        gp.rows = op.p[0]; gp.cols = op.p[1]; gp.batch_size = op.p[2]; gp.has_bias = op.p[3]; gp.epi = op.p[4];
+        for (uint lt = tg; lt < op.grid; lt += K) {{
+            switch (op.kind) {{
+{cases}            case {rms}:
+            case {rms_res}: {{
+                const uint d = op.p[1];
+                device const float* xr = reinterpret_cast<device const float*>(op.a[0]) + (ulong)lt * d;
+                device const float* g = reinterpret_cast<device const float*>(op.a[1]);
+                device const float* resr = reinterpret_cast<device const float*>(op.a[2]) + (ulong)lt * d;
+                device float* outr = reinterpret_cast<device float*>(op.a[3]) + (ulong)lt * d;
+                float sq = 0.0f;
+                for (uint k = tid; k < d; k += 256) {{
+                    float v = xr[k];
+                    sq += v * v;
+                }}
+                float scale = rsqrt(chain_block_sum(sq, scratch, sg, lane, 8) / float(d) + as_type<float>(op.p[2]));
+                if (op.kind == {rms_res}) {{
+                    for (uint k = tid; k < d; k += 256) outr[k] = resr[k] + xr[k] * scale * g[k];
+                }} else {{
+                    for (uint k = tid; k < d; k += 256) outr[k] = xr[k] * scale * g[k];
+                }}
+                break;
+            }}
+            }}
+        }}
+        if (i + 1 < n) {{
+            threadgroup_barrier(mem_flags::mem_device);
+            if (tid == 0) {{
+                atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+                atomic_fetch_add_explicit(&ctr[cbase], 1u, memory_order_relaxed);
+                uint spin = 0;
+                while (atomic_load_explicit(&ctr[cbase], memory_order_relaxed) < (i + 1) * K) {{
+                    if (++spin > 20000000u) {{
+                        atomic_store_explicit(&ctr[cbase + 1], 1u, memory_order_relaxed);
+                        break;
+                    }}
+                }}
+                atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            }}
+            threadgroup_barrier(mem_flags::mem_device);
+        }}
+    }}
+}}
+"#,
+        rms = CHAIN_RMS,
+        rms_res = CHAIN_RMS_RES,
     )
 }
 
