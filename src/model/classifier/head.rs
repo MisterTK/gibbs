@@ -49,7 +49,8 @@ impl Gb {
     }
 
     pub fn add(&mut self, name: &str, op: Op, ins: &[ValueId], shape: Vec<usize>) -> ValueId {
-        self.g.add(format!("{}{name}", self.scope), op, ins, shape, DType::F32)
+        self.g
+            .add(format!("{}{name}", self.scope), op, ins, shape, DType::F32)
     }
 
     fn shape(&self, v: ValueId) -> Vec<usize> {
@@ -67,7 +68,10 @@ impl Gb {
         out_f: usize,
     ) -> ValueId {
         let rows = self.shape(x)[0];
-        let mut ins = vec![x, self.weight(&format!("{name}.weight"), vec![out_f, in_f], || w.to_vec())];
+        let mut ins = vec![
+            x,
+            self.weight(&format!("{name}.weight"), vec![out_f, in_f], || w.to_vec()),
+        ];
         if let Some(b) = b {
             ins.push(self.weight(&format!("{name}.bias"), vec![out_f], || b.to_vec()));
         }
@@ -78,7 +82,13 @@ impl Gb {
         self.linear(x, name, &l.w, l.b.as_deref(), l.in_f, l.out_f)
     }
 
-    pub fn ln(&mut self, x: ValueId, name: &str, (g, b): &(Vec<f32>, Vec<f32>), eps: f32) -> ValueId {
+    pub fn ln(
+        &mut self,
+        x: ValueId,
+        name: &str,
+        (g, b): &(Vec<f32>, Vec<f32>),
+        eps: f32,
+    ) -> ValueId {
         let shape = self.shape(x);
         let d = g.len();
         let gv = self.weight(&format!("{name}.weight"), vec![d], || g.clone());
@@ -103,16 +113,38 @@ impl Gb {
         self.add(name, op, &[x], shape)
     }
 
-    pub fn slice(&mut self, name: &str, x: ValueId, axis: isize, start: usize, end: usize) -> ValueId {
+    pub fn slice(
+        &mut self,
+        name: &str,
+        x: ValueId,
+        axis: isize,
+        start: usize,
+        end: usize,
+    ) -> ValueId {
         let mut shape = self.shape(x);
-        let ax = if axis < 0 { shape.len() as isize + axis } else { axis } as usize;
+        let ax = if axis < 0 {
+            shape.len() as isize + axis
+        } else {
+            axis
+        } as usize;
         shape[ax] = end - start;
-        let op = Op::Slice { axis, start: start as i64, end: end as i64 };
+        let op = Op::Slice {
+            axis,
+            start: start as i64,
+            end: end as i64,
+        };
         self.add(name, op, &[x], shape)
     }
 
     pub fn reshape(&mut self, name: &str, x: ValueId, shape: Vec<usize>) -> ValueId {
-        self.add(name, Op::Reshape { shape: Some(shape.clone()) }, &[x], shape)
+        self.add(
+            name,
+            Op::Reshape {
+                shape: Some(shape.clone()),
+            },
+            &[x],
+            shape,
+        )
     }
 }
 
@@ -125,7 +157,6 @@ pub enum Act {
     GeluTanh,
     Silu,
 }
-
 
 impl HeadPost {
     pub fn of(a: super::Activation) -> Self {
@@ -153,7 +184,9 @@ pub enum HeadPost {
     Sigmoid,
     /// sklearn `LogisticRegression.predict_proba`: OvR (normalised sigmoids) or multinomial; a
     /// single decision value is expanded to the two class probabilities.
-    Logistic { ovr: bool },
+    Logistic {
+        ovr: bool,
+    },
 }
 
 pub struct HeadLin {
@@ -165,7 +198,12 @@ pub struct HeadLin {
 
 impl From<&Lin> for HeadLin {
     fn from(l: &Lin) -> Self {
-        Self { w: l.w.clone(), b: l.b.clone(), in_f: l.in_f, out_f: l.out_f }
+        Self {
+            w: l.w.clone(),
+            b: l.b.clone(),
+            in_f: l.in_f,
+            out_f: l.out_f,
+        }
     }
 }
 
@@ -193,7 +231,11 @@ impl HeadGraph {
                 gb.reshape("head.mean.row", m, vec![1, h])
             }
             HeadPool::Max => {
-                let op = Op::Reduce { kind: ReduceKind::Max, axes: vec![0], keep_dims: true };
+                let op = Op::Reduce {
+                    kind: ReduceKind::Max,
+                    axes: vec![0],
+                    keep_dims: true,
+                };
                 gb.add("head.max", op, &[x], vec![1, h])
             }
         };
@@ -212,26 +254,55 @@ impl HeadGraph {
         let l = o.out_f;
         Ok(match self.post {
             HeadPost::Logits => logits,
-            HeadPost::Softmax => gb.add("head.softmax", Op::Softmax { axis: -1 }, &[logits], vec![1, l]),
+            HeadPost::Softmax => gb.add(
+                "head.softmax",
+                Op::Softmax { axis: -1 },
+                &[logits],
+                vec![1, l],
+            ),
             HeadPost::Sigmoid => gb.unary("head.sigmoid", UnaryKind::Sigmoid, logits),
             HeadPost::Logistic { ovr } if l == 1 => {
                 // [1 - sigmoid(d), sigmoid(d)] = sigmoid([-d, d]); multinomial: softmax([-d, d]).
                 let neg = gb.unary("head.neg", UnaryKind::Neg, logits);
-                let both = gb.add("head.both", Op::Concat { axis: -1 }, &[neg, logits], vec![1, 2]);
+                let both = gb.add(
+                    "head.both",
+                    Op::Concat { axis: -1 },
+                    &[neg, logits],
+                    vec![1, 2],
+                );
                 if ovr {
                     gb.unary("head.sigmoid", UnaryKind::Sigmoid, both)
                 } else {
-                    gb.add("head.softmax", Op::Softmax { axis: -1 }, &[both], vec![1, 2])
+                    gb.add(
+                        "head.softmax",
+                        Op::Softmax { axis: -1 },
+                        &[both],
+                        vec![1, 2],
+                    )
                 }
             }
-            HeadPost::Logistic { ovr: false } => {
-                gb.add("head.softmax", Op::Softmax { axis: -1 }, &[logits], vec![1, l])
-            }
+            HeadPost::Logistic { ovr: false } => gb.add(
+                "head.softmax",
+                Op::Softmax { axis: -1 },
+                &[logits],
+                vec![1, l],
+            ),
             HeadPost::Logistic { ovr: true } => {
                 let s = gb.unary("head.sigmoid", UnaryKind::Sigmoid, logits);
-                let op = Op::Reduce { kind: ReduceKind::Sum, axes: vec![-1], keep_dims: true };
+                let op = Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    axes: vec![-1],
+                    keep_dims: true,
+                };
                 let sum = gb.add("head.sum", op, &[s], vec![1, 1]);
-                gb.add("head.norm_ovr", Op::Binary { kind: BinaryKind::Div }, &[s, sum], vec![1, l])
+                gb.add(
+                    "head.norm_ovr",
+                    Op::Binary {
+                        kind: BinaryKind::Div,
+                    },
+                    &[s, sum],
+                    vec![1, l],
+                )
             }
         })
     }
@@ -255,8 +326,10 @@ pub struct GpuRun {
 impl GpuRun {
     #[cfg(target_os = "macos")]
     pub fn new(weights: &Weights) -> Result<Self, String> {
-        let rt = crate::graph::metal::Runtime::new(&crate::hardware::default_cache_dir()?)?;
-        Ok(Self { session: crate::graph::metal::Session::new(rt, weights)? })
+        let rt = crate::graph::metal::Runtime::shared()?;
+        Ok(Self {
+            session: crate::graph::metal::Session::new(rt, weights)?,
+        })
     }
 
     #[cfg(not(target_os = "macos"))]

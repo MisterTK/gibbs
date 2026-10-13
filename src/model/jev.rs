@@ -229,7 +229,7 @@ impl BertEncoder {
             Device::Cpu => Executor::Cpu,
             #[cfg(target_os = "macos")]
             Device::Metal => {
-                let rt = crate::graph::metal::Runtime::new(&crate::hardware::default_cache_dir()?)?;
+                let rt = crate::graph::metal::Runtime::shared()?;
                 Executor::Metal(crate::graph::metal::Session::new(rt, &weights)?)
             }
             #[cfg(target_os = "macos")]
@@ -410,7 +410,12 @@ impl BertEncoder {
     }
 
     /// Scores `[labels]` of one unpadded sequence: the encoder, then the head built at load.
-    pub fn run_head(&self, ids: &[u32], positions: &[u32], types: &[u32]) -> Result<Vec<f32>, String> {
+    pub fn run_head(
+        &self,
+        ids: &[u32],
+        positions: &[u32],
+        types: &[u32],
+    ) -> Result<Vec<f32>, String> {
         if self.head.is_none() {
             return Err("this encoder was loaded without a classification head".into());
         }

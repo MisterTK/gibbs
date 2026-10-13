@@ -117,6 +117,16 @@ pub fn take_run_samples() -> Vec<RunSample> {
     RUN_SAMPLES.lock().drain(..).collect()
 }
 
+/// GEMV shapes resolved by the tuner this process, and how many came from the persisted cache.
+static TUNE_SHAPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TUNE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(cache hits, shapes)` of the GEMV tuner so far.
+pub fn tune_status() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (TUNE_HITS.load(Relaxed), TUNE_SHAPES.load(Relaxed))
+}
+
 pub fn system_device() -> Result<Device, String> {
     Device::system_default()
         .ok_or_else(|| "no Metal GPU (MTLCreateSystemDefaultDevice returned nil)".to_string())
@@ -131,6 +141,7 @@ pub fn system_has_unified_memory() -> Result<bool, String> {
 }
 use crate::hardware::{sysctl, QuantFormat};
 
+use super::tune::{self, GemvKernel, GemvVariant};
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::Object;
 use metal::objc::{msg_send, sel, sel_impl};
@@ -150,7 +161,7 @@ use std::time::Instant;
 
 /// Returns whether the Metal executor implements `op` for the given data type.
 /// Formats supported for graph weights uploaded to Metal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 pub enum WeightFormat {
     F32,
@@ -168,6 +179,83 @@ pub enum WeightFormat {
     JesseLUT,
     /// A format with no hand kernel: read through its [`codec::Codec`] by a generated GEMV.
     Gen(QuantFormat),
+}
+
+impl WeightFormat {
+    /// The storage format a weight of codec/float format `f` is uploaded in.
+    fn of_quant(f: QuantFormat) -> WeightFormat {
+        match f {
+            QuantFormat::GGUF_Q4_0 => WeightFormat::Q4_0,
+            QuantFormat::GGUF_Q8_0 => WeightFormat::Q8_0,
+            QuantFormat::GGUF_IQ4_XS => WeightFormat::IQ4_XS,
+            QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => WeightFormat::IQ2_M,
+            QuantFormat::GGUF_Q4_K_M => WeightFormat::Q4_K,
+            QuantFormat::GGUF_Q2_K => WeightFormat::Q2_K,
+            QuantFormat::GGUF_IQ3_S => WeightFormat::IQ3_S,
+            QuantFormat::NVFP4_E2M1 | QuantFormat::NVFP4 => WeightFormat::NvFp4,
+            QuantFormat::WeightlessJesseLUT => WeightFormat::JesseLUT,
+            QuantFormat::BF16 => WeightFormat::BF16,
+            QuantFormat::FP16 => WeightFormat::F16,
+            f if codec::codec(f).is_some() => WeightFormat::Gen(f),
+            _ => WeightFormat::F32,
+        }
+    }
+
+    /// The codec format a generated GEMV reads this storage with (hand-kernel formats included:
+    /// both read the checkpoint's blocks as stored). `None` for floats and the auxiliary-plane formats.
+    fn codec_format(self) -> Option<QuantFormat> {
+        Some(match self {
+            WeightFormat::Q4_0 => QuantFormat::GGUF_Q4_0,
+            WeightFormat::Q8_0 => QuantFormat::GGUF_Q8_0,
+            WeightFormat::IQ4_XS => QuantFormat::GGUF_IQ4_XS,
+            WeightFormat::IQ2_M => QuantFormat::GGUF_IQ2_M,
+            WeightFormat::Q4_K => QuantFormat::GGUF_Q4_K_M,
+            WeightFormat::Q2_K => QuantFormat::GGUF_Q2_K,
+            WeightFormat::IQ3_S => QuantFormat::GGUF_IQ3_S,
+            WeightFormat::Gen(f) => f,
+            _ => return None,
+        })
+    }
+
+    /// Name of the hand-written GEMV kernel, when this format has one.
+    fn hand_kernel(self) -> Option<&'static str> {
+        Some(match self {
+            WeightFormat::Q4_0 => "gemv_q4_0",
+            WeightFormat::Q8_0 => "gemv_q8_0",
+            WeightFormat::IQ4_XS => "gemv_iq4_xs",
+            WeightFormat::IQ2_M => "gemv_iq2_m",
+            WeightFormat::Q4_K => "gemv_q4_k",
+            WeightFormat::Q2_K => "gemv_q2_k",
+            WeightFormat::IQ3_S => "gemv_iq3_s",
+            WeightFormat::BF16 => "gemv_bf16",
+            WeightFormat::F16 => "gemv_f16",
+            _ => return None,
+        })
+    }
+
+    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
+    fn default_variant(self) -> GemvVariant {
+        if self.hand_kernel().is_some() {
+            GemvVariant::HAND
+        } else {
+            GemvVariant::generated(2)
+        }
+    }
+
+    /// Every kernel variant that can read this storage format.
+    fn gemv_variants(self) -> Vec<GemvVariant> {
+        let generated = self
+            .codec_format()
+            .is_some_and(|f| crate::graph::codec::codec(f).is_some());
+        let mut v = Vec::new();
+        if self.hand_kernel().is_some() {
+            v.push(GemvVariant::HAND);
+        }
+        if generated {
+            v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
+        }
+        v
+    }
 }
 
 /// Returns whether the Metal executor implements `op` for the given data type.
@@ -449,6 +537,11 @@ pub struct Runtime {
     pub report: String,
     /// Where `profile` is persisted.
     profile_path: std::path::PathBuf,
+    /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
+    gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
+    /// Measured GEMV variant winners ([`tune`]) and where they persist.
+    tune: Mutex<tune::TuneCache>,
+    tune_path: std::path::PathBuf,
 }
 
 impl Runtime {
@@ -516,6 +609,9 @@ impl Runtime {
             archive_hit,
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
+            gen_psos: Mutex::new(HashMap::new()),
+            tune: Mutex::new(tune::TuneCache::default()),
+            tune_path: std::path::PathBuf::new(),
         };
         let profile_path = cache
             .join("host")
@@ -563,6 +659,8 @@ impl Runtime {
             crate::model::variant::set_host_rates(p.ceiling_gbps.max(p.stream_gbps), codec_eff);
         }
         rt.profile_path = profile_path;
+        rt.tune_path = cache.join("host").join(format!("tune-{tag}.json"));
+        rt.tune = Mutex::new(tune::TuneCache::load(&rt.tune_path));
         let p = &rt.profile;
         let gemm: Vec<String> = p
             .gemm
@@ -589,6 +687,15 @@ impl Runtime {
             gemm.join("; "),
         );
         Ok(Arc::new(rt))
+    }
+
+    /// The process-wide runtime under [`crate::hardware::default_cache_dir`]: one pipeline set, host
+    /// profile and tune cache for every session (separate runtimes would each re-measure the host
+    /// and could disagree about its ceiling).
+    pub fn shared() -> Result<Arc<Self>, String> {
+        static SHARED: std::sync::LazyLock<Result<Arc<Runtime>, String>> =
+            std::sync::LazyLock::new(|| Runtime::new(&crate::hardware::default_cache_dir()?));
+        SHARED.clone()
     }
 
     pub fn profile(&self) -> &HostProfile {
@@ -721,9 +828,12 @@ impl Runtime {
         let mut gbps = std::collections::BTreeMap::new();
         let floats = [QuantFormat::BF16, QuantFormat::FP16];
         for f in codec::formats().into_iter().chain(floats) {
-            match self.bench_gemv(f) {
-                Ok(g) => {
-                    gbps.insert(CodecEff::key(f), g);
+            // Each codec's rate is its best variant's: that is the kernel a load would run.
+            let variants = WeightFormat::of_quant(f).gemv_variants();
+            match self.bench_gemv(f, &CODEC_BENCH_SHAPES, &variants) {
+                Ok(t) => {
+                    let best = t.iter().map(|x| x.1).fold(0.0f64, f64::max);
+                    gbps.insert(CodecEff::key(f), best);
                 }
                 Err(e) => tracing::warn!("codec bench {f:?}: {e}"),
             }
@@ -745,10 +855,15 @@ impl Runtime {
         })
     }
 
-    /// GB/s of the M=1 GEMV in `f`: weight bytes over GPU time summed across the benchmark shapes.
-    /// Each shape runs on enough distinct copies of the weights (one command buffer) to overflow
-    /// the system cache, so the number is DRAM streaming, not cache hits.
-    fn bench_gemv(self: &Arc<Self>, f: QuantFormat) -> Result<f64, String> {
+    /// GB/s of the M=1 GEMV in `f` for each of `variants`: weight bytes over GPU time summed across
+    /// `shapes` (`(rows, cols)`). Each shape runs on enough distinct copies of the weights (one
+    /// command buffer) to overflow the system cache, so the number is DRAM streaming, not cache hits.
+    fn bench_gemv(
+        self: &Arc<Self>,
+        f: QuantFormat,
+        shapes: &[(usize, usize)],
+        variants: &[GemvVariant],
+    ) -> Result<Vec<(GemvVariant, f64)>, String> {
         use crate::model::layers::QuantizedWeight;
         let float = matches!(f, QuantFormat::BF16 | QuantFormat::FP16);
         let (elems, block_bytes) = if float {
@@ -767,7 +882,7 @@ impl Runtime {
         }
         let mut weights = Weights::new();
         let mut runs = Vec::new();
-        for (si, (n, k)) in CODEC_BENCH_SHAPES.into_iter().enumerate() {
+        for (si, (n, k)) in shapes.iter().copied().enumerate() {
             if k % elems != 0 {
                 continue;
             }
@@ -818,22 +933,128 @@ impl Runtime {
         if runs.is_empty() {
             return Err("no benchmark shape tiles this format's blocks".into());
         }
-        let session = Session::new(self.clone(), &weights)?;
-        let (mut total_bytes, mut total_s) = (0.0f64, 0.0f64);
-        for (g, k, bytes) in &runs {
-            let plan = session.prepare_plan(g)?;
-            let x = Tensor::F32(vec![0.5; *k]);
-            let mut best = f64::INFINITY;
-            for rep in 0..9 {
-                session.run_prepared(g, &plan, None, vec![x.clone()])?;
-                if rep > 0 {
-                    best = best.min(session.last_gpu_seconds());
+        let mut session = Session::new(self.clone(), &weights)?;
+        let mut out = Vec::new();
+        for &v in variants {
+            session.set_variant_override(Some(v));
+            let (mut total_bytes, mut total_s) = (0.0f64, 0.0f64);
+            for (g, k, bytes) in &runs {
+                let plan = session.prepare_plan(g)?;
+                let x = Tensor::F32(vec![0.5; *k]);
+                let mut best = f64::INFINITY;
+                for rep in 0..9 {
+                    session.run_prepared(g, &plan, None, vec![x.clone()])?;
+                    if rep > 0 {
+                        best = best.min(session.last_gpu_seconds());
+                    }
                 }
+                total_bytes += *bytes as f64;
+                total_s += best;
             }
-            total_bytes += *bytes as f64;
-            total_s += best;
+            out.push((v, total_bytes / 1e9 / total_s));
         }
-        Ok(total_bytes / 1e9 / total_s)
+        Ok(out)
+    }
+
+    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
+    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
+        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+        let key = (c.format, rows_per_sg);
+        if let Some(p) = self.gen_psos.lock().get(&key) {
+            return Ok(p.clone());
+        }
+        let params = crate::graph::codegen::GemvParams {
+            rows_per_sg: rows_per_sg as usize,
+            ..Default::default()
+        };
+        let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
+        src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
+        src.push_str(&crate::graph::codegen::gemv_packed(c, params));
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = self
+            .device
+            .new_library_with_source(&src, &opts)
+            .map_err(|e| format!("generated GEMV compilation failed: {e}"))?;
+        let name = crate::graph::codegen::gemv_packed_name(c, params);
+        let func = lib
+            .get_function(&name, None)
+            .map_err(|e| format!("generated function '{name}': {e}"))?;
+        let pso = self
+            .device
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| format!("generated pipeline '{name}': {e}"))?;
+        self.gen_psos.lock().insert(key, pso.clone());
+        Ok(pso)
+    }
+
+    /// Hash of the kernel sources behind every variant of `fmt`: an edit invalidates only the
+    /// tune entries of the formats whose kernels it changed.
+    fn variants_hash(&self, fmt: WeightFormat) -> u64 {
+        use crate::graph::codegen::{gemv_common, gemv_packed, GemvParams};
+        let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
+        let mut mix =
+            |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
+        if let Some(name) = fmt.hand_kernel() {
+            mix(tune::kernel_source(&KERNELS_MSL, name));
+        }
+        if let Some(c) = fmt.codec_format().and_then(codec::codec) {
+            for r in tune::GEN_ROWS {
+                mix(&gemv_packed(
+                    c,
+                    GemvParams {
+                        rows_per_sg: r as usize,
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+        h
+    }
+
+    /// The fastest GEMV variant of `fmt` at `rows x cols`: the persisted winner, else every variant
+    /// timed on this device (the winner is persisted for the next process).
+    fn tuned_variant(self: &Arc<Self>, fmt: WeightFormat, rows: usize, cols: usize) -> GemvVariant {
+        let variants = fmt.gemv_variants();
+        let default = fmt.default_variant();
+        let Some(q) = fmt.codec_format().filter(|_| variants.len() > 1) else {
+            return default;
+        };
+        TUNE_SHAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = tune::TuneCache::key(&format!("{q:?}"), rows, cols, self.variants_hash(fmt));
+        let cached = self.tune.lock().get(&key);
+        if let Some(t) = cached {
+            TUNE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return t.variant;
+        }
+        let timings = match self.bench_gemv(q, &[(rows, cols)], &variants) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("tune {q:?} {rows}x{cols}: {e}");
+                return default;
+            }
+        };
+        let Some(best) = tune::choose(&timings) else {
+            return default;
+        };
+        let gbps = timings.iter().find(|t| t.0 == best).map_or(0.0, |t| t.1);
+        let bytes = weight_format_bytes(fmt, rows * cols) as f64;
+        tracing::info!(
+            "tune: {q:?} {rows}x{cols}: {} {gbps:.0} GB/s ({} variants)",
+            best.label(),
+            variants.len()
+        );
+        let mut cache = self.tune.lock();
+        cache.insert(
+            key,
+            tune::Tuned {
+                variant: best,
+                us: bytes / (gbps * 1e9) * 1e6,
+                gbps,
+            },
+        );
+        cache.save(&self.tune_path);
+        best
     }
 
     /// Starts [`Self::benchmark_codecs`] on a background thread unless this host profile already
@@ -1075,8 +1296,8 @@ pub struct Session {
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
     jesse_aux: HashMap<String, (Buffer, usize)>,
-    /// Generated GEMV pipelines for the [`WeightFormat::Gen`] formats this session uploaded.
-    gen_psos: HashMap<QuantFormat, ComputePipelineState>,
+    /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
+    variant_override: Option<GemvVariant>,
     last_gpu_s: std::sync::atomic::AtomicU64,
 }
 impl Session {
@@ -1601,13 +1822,18 @@ impl Session {
             }
             bufs.insert(name.to_string(), (buf, 0, num_elements, fmt));
         }
-        let gen_psos = generated_gemv_pipelines(
-            &rt.device,
-            bufs.values().filter_map(|(_, _, _, f)| match f {
+        // The default (2 rows/simdgroup) kernel of every generated format, compiled up front so the
+        // first token never waits on a compiler.
+        let gen_formats: std::collections::HashSet<QuantFormat> = bufs
+            .values()
+            .filter_map(|(_, _, _, f)| match f {
                 WeightFormat::Gen(q) => Some(*q),
                 _ => None,
-            }),
-        )?;
+            })
+            .collect();
+        for q in gen_formats {
+            rt.gen_pso(q, 2)?;
+        }
         Ok(Self {
             rt,
             weights: bufs,
@@ -1618,7 +1844,7 @@ impl Session {
             gemm: None,
             nvfp4_aux,
             jesse_aux,
-            gen_psos,
+            variant_override: None,
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1631,6 +1857,11 @@ impl Session {
         self.rt.pso(&format!("{}_none", kind.spec(1, 1).0))?;
         self.gemm = Some(kind);
         Ok(())
+    }
+
+    /// Forces every packed GEMV onto `v` where the format can run it (`None`: tuned/default).
+    pub(crate) fn set_variant_override(&mut self, v: Option<GemvVariant>) {
+        self.variant_override = v;
     }
 
     pub fn runtime(&self) -> &Runtime {
@@ -1649,36 +1880,85 @@ impl Session {
         (n * 4) as u64
     }
 
-    /// The packed-weight GEMV pipeline for `format`: a hand kernel, or the generated one.
-    fn gemv_pso(&self, format: WeightFormat) -> Result<&ComputePipelineState, String> {
-        let name = match format {
-            WeightFormat::Gen(f) => {
-                return self
-                    .gen_psos
-                    .get(&f)
-                    .ok_or_else(|| format!("no generated GEMV pipeline for {f:?}"))
-            }
-            WeightFormat::Q4_0 => "gemv_q4_0",
-            WeightFormat::Q8_0 => "gemv_q8_0",
-            WeightFormat::IQ4_XS => "gemv_iq4_xs",
-            WeightFormat::IQ2_M => "gemv_iq2_m",
-            WeightFormat::Q4_K => "gemv_q4_k",
-            WeightFormat::Q2_K => "gemv_q2_k",
-            WeightFormat::IQ3_S => "gemv_iq3_s",
-            WeightFormat::BF16 => "gemv_bf16",
-            WeightFormat::F16 => "gemv_f16",
-            other => {
-                return Err(format!(
-                    "Metal executor: unsupported packed GEMV format {other:?}"
-                ))
-            }
+    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`.
+    fn gemv_pipeline(
+        &self,
+        format: WeightFormat,
+        variant: GemvVariant,
+    ) -> Result<(ComputePipelineState, u64), String> {
+        let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
+            Ok((
+                self.rt.gen_pso(q, r)?,
+                crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
+                    rows_per_sg: r as usize,
+                    ..Default::default()
+                }) as u64,
+            ))
         };
-        self.rt.pso(name)
+        match (format, variant.kernel) {
+            (WeightFormat::Gen(q), _) => generated(
+                q,
+                if variant.kernel == GemvKernel::Gen {
+                    variant.rows_per_sg
+                } else {
+                    2
+                },
+            ),
+            (_, GemvKernel::Gen) => match format.codec_format() {
+                Some(q) => generated(q, variant.rows_per_sg),
+                None => Err(format!("no generated GEMV for {format:?}")),
+            },
+            (_, GemvKernel::Hand) => match format.hand_kernel() {
+                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                None => Err(format!(
+                    "Metal executor: unsupported packed GEMV format {format:?}"
+                )),
+            },
+        }
+    }
+
+    /// `format`'s default-variant GEMV pipeline (steps that are not tuned).
+    fn gemv_pso(&self, format: WeightFormat) -> Result<ComputePipelineState, String> {
+        self.gemv_pipeline(format, format.default_variant())
+            .map(|p| p.0)
+    }
+
+    /// Picks each m = 1 packed GEMV's kernel variant: the session override, else the tuner's
+    /// winner for its `(format, rows, cols)` (`GIBBS_TUNE=off`: the format's default).
+    fn assign_variants(&self, steps: &mut [Planned]) {
+        let mut chosen: HashMap<(WeightFormat, usize, usize), GemvVariant> = HashMap::new();
+        for s in steps.iter_mut() {
+            let Step::GemvPacked {
+                m,
+                rows,
+                cols,
+                format,
+                variant,
+                ..
+            } = &mut s.op
+            else {
+                continue;
+            };
+            let allowed = format.gemv_variants();
+            *variant = if let Some(o) = self.variant_override {
+                if allowed.contains(&o) {
+                    o
+                } else {
+                    format.default_variant()
+                }
+            } else if *m == 1 && tune::enabled() && allowed.len() > 1 {
+                *chosen
+                    .entry((*format, *rows, *cols))
+                    .or_insert_with(|| self.rt.tuned_variant(*format, *rows, *cols))
+            } else {
+                format.default_variant()
+            };
+        }
     }
 
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
-        let (steps, aliases) = plan(graph)?;
+        let (mut steps, aliases) = plan(graph)?;
         for s in &steps {
             for &v in &s.reads {
                 let val = graph.value(v);
@@ -1717,6 +1997,7 @@ impl Session {
                 }
             }
         }
+        self.assign_variants(&mut steps);
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
         let mut arena = self.arena.lock();
         if arena
@@ -2208,7 +2489,8 @@ impl Session {
                     );
                     return Ok(());
                 }
-                enc.set_compute_pipeline_state(self.gemv_pso(format)?);
+                let pso = self.gemv_pso(format)?;
+                enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
                 enc.set_buffer(2, Some(out.0), out.1 as u64);
@@ -2361,6 +2643,7 @@ impl Session {
                 rows,
                 cols,
                 format,
+                variant,
             } => {
                 if format == WeightFormat::NvFp4 {
                     let (scales_buf, global_scale) = self
@@ -2423,7 +2706,8 @@ impl Session {
                     }
                     return Ok(());
                 }
-                enc.set_compute_pipeline_state(self.gemv_pso(format)?);
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
+                enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
                 bind(2, s.out);
@@ -2448,12 +2732,6 @@ impl Session {
                 } else {
                     bind(5, s.out);
                 }
-                let rows_per_tg = match format {
-                    WeightFormat::Gen(_) => {
-                        crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64
-                    }
-                    _ => 16,
-                };
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
                     MTLSize::new(256, 1, 1),
@@ -3009,6 +3287,8 @@ pub enum Step {
         rows: usize,
         cols: usize,
         format: WeightFormat,
+        /// Kernel variant, set by [`Session::prepare_plan`] from the tuner (or the format default).
+        variant: GemvVariant,
     },
     GemmBatchedPacked {
         x: ValueId,
@@ -3401,6 +3681,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                                 rows: n,
                                 cols: k,
                                 format: fmt,
+                                variant: fmt.default_variant(),
                             },
                             m * n,
                         )
@@ -3986,52 +4267,6 @@ fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
             n / c.block_elems as usize * c.block_bytes as usize
         }),
     }
-}
-
-/// Compiles one library of generated GEMV kernels (one per format in `formats`) and returns their
-/// pipelines. Nothing is compiled when no weight needs a generated kernel.
-fn generated_gemv_pipelines(
-    device: &Device,
-    formats: impl Iterator<Item = QuantFormat>,
-) -> Result<HashMap<QuantFormat, ComputePipelineState>, String> {
-    let mut wanted: Vec<QuantFormat> = formats.collect();
-    wanted.sort_by_key(|f| format!("{f:?}"));
-    wanted.dedup();
-    if wanted.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let params = crate::graph::codegen::GemvParams::default();
-    let codec_of =
-        |f: QuantFormat| crate::graph::codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"));
-    // Formats that share a block layout (IQ2_S / IQ2_M) share one kernel.
-    let mut names: Vec<String> = Vec::new();
-    let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
-    src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
-    for &f in &wanted {
-        let c = codec_of(f)?;
-        let name = crate::graph::codegen::gemv_packed_name(c, params);
-        if !names.contains(&name) {
-            src.push_str(&crate::graph::codegen::gemv_packed(c, params));
-            names.push(name);
-        }
-    }
-    let opts = CompileOptions::new();
-    opts.set_fast_math_enabled(false);
-    let lib = device
-        .new_library_with_source(&src, &opts)
-        .map_err(|e| format!("generated GEMV compilation failed: {e}"))?;
-    let mut out = HashMap::new();
-    for f in wanted {
-        let name = crate::graph::codegen::gemv_packed_name(codec_of(f)?, params);
-        let func = lib
-            .get_function(&name, None)
-            .map_err(|e| format!("generated function '{name}': {e}"))?;
-        let pso = device
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| format!("generated pipeline '{name}': {e}"))?;
-        out.insert(f, pso);
-    }
-    Ok(out)
 }
 
 /// Pipelines for `names`, built only from the binary archive at `archive` when it holds them all
@@ -4815,13 +5050,31 @@ mod tests {
             let xs: Vec<f32> = (0..m * k)
                 .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
                 .collect();
-            let (want, got) = both(&g, &w, vec![Tensor::F32(xs)], None);
-            let err = rel_err(&want, &got);
-            assert!(
-                err < 1e-4,
-                "{f:?}: generated GEMV differs from CPU by {err}"
-            );
-            println!("generated gemv {f:?}: rel err {err:.2e}");
+            let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())])
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            // Every variant of the format (hand and generated at each rows/simdgroup); formats with
+            // no variant choice (NVFP4) run their one kernel.
+            let variants = WeightFormat::of_quant(f).gemv_variants();
+            let variants: Vec<Option<GemvVariant>> = if variants.is_empty() {
+                vec![None]
+            } else {
+                variants.into_iter().map(Some).collect()
+            };
+            for v in variants {
+                let mut s = Session::new(rt(), &w).unwrap();
+                s.set_variant_override(v);
+                let got = s
+                    .run(&g, vec![Tensor::F32(xs.clone())])
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let err = rel_err(&want, &got);
+                assert!(err < 1e-4, "{f:?} {v:?}: GEMV differs from CPU by {err}");
+            }
         }
     }
 

@@ -56,12 +56,19 @@ impl GraphProgram {
         let available = available_devices();
         let plan = place_graph_default(&mut graph, mode, &available, None, &device_supports_op)
             .map_err(|report| report.error())?;
-        assert!(plan.segments.len() <= 1, "placement yields at most one segment");
+        assert!(
+            plan.segments.len() <= 1,
+            "placement yields at most one segment"
+        );
         let primary_device = plan.primary_device();
         if primary_device == Device::Metal {
             crate::graph::passes::dtype_adapt::run(&mut graph);
             crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut graph, &|f| {
-                device_supports_op(Device::Metal, &crate::graph::Op::Linear, crate::graph::DType::Quant(f))
+                device_supports_op(
+                    Device::Metal,
+                    &crate::graph::Op::Linear,
+                    crate::graph::DType::Quant(f),
+                )
             })?;
         }
         eprintln!(
@@ -77,9 +84,7 @@ impl GraphProgram {
         let segment = match primary_device {
             #[cfg(target_os = "macos")]
             Device::Metal if !plan.segments.is_empty() => {
-                let rt = crate::graph::metal::Runtime::new(
-                    &crate::model::hub::HuggingFaceHub::cache_dir(),
-                )?;
+                let rt = crate::graph::metal::Runtime::shared()?;
                 let session =
                     crate::graph::metal::Session::new_for_graph(rt, &weights, Some(&graph))?;
                 let prepared_plan = session.prepare_plan(&graph)?;
@@ -120,7 +125,6 @@ impl GraphProgram {
             })
             .sum()
     }
-
 
     /// Primary device running this program.
     pub fn primary_device(&self) -> Device {

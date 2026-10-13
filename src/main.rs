@@ -304,9 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let telemetry = EngineTelemetry::new();
     #[cfg(target_os = "macos")]
-    if let Ok(rt) = gibbs_engine::graph::metal::Runtime::new(
-        &gibbs_engine::model::hub::HuggingFaceHub::cache_dir(),
-    ) {
+    if let Ok(rt) = gibbs_engine::graph::metal::Runtime::shared() {
         let prof = rt.profile();
         telemetry.set_hardware_profile(&prof.device, prof.memory_bandwidth_gbps as f32);
         // S3.6: measured codec efficiencies for the variant predictor; background, never blocks the load.

@@ -21,6 +21,7 @@ pub mod pattern;
 pub mod placement;
 pub mod program;
 pub mod rocm;
+pub mod tune;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
 
@@ -678,7 +679,9 @@ impl StateStore {
                 if let Tensor::F32(v) = &t {
                     assert_eq!(v.len(), *n, "snapshot of state {name} has the wrong size");
                     // SAFETY: as in `snapshot`; `v` has exactly `n` f32.
-                    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), buf.contents() as *mut f32, *n) };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(v.as_ptr(), buf.contents() as *mut f32, *n)
+                    };
                     self.buffers.remove(&name);
                     continue;
                 }
@@ -893,13 +896,18 @@ mod state_tests {
         assert_eq!(snap.len(), 1);
         st.insert("layers.0.ssm_state", Tensor::F32(vec![9.0, 9.0]));
         st.restore(snap);
-        assert_eq!(st.get("layers.0.ssm_state").unwrap().as_f32().unwrap(), &[1.0, 2.0]);
+        assert_eq!(
+            st.get("layers.0.ssm_state").unwrap().as_f32().unwrap(),
+            &[1.0, 2.0]
+        );
         #[cfg(target_os = "macos")]
         if let Some(dev) = ::metal::Device::system_default() {
             let buf = dev.new_buffer(8, ::metal::MTLResourceOptions::StorageModeShared);
             // SAFETY: shared 8-byte buffer = 2 f32.
-            unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, 2) }.copy_from_slice(&[5.0, 6.0]);
-            st.metal_buffers.insert("layers.1.conv_state".into(), (std::sync::Arc::new(buf), 2));
+            unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, 2) }
+                .copy_from_slice(&[5.0, 6.0]);
+            st.metal_buffers
+                .insert("layers.1.conv_state".into(), (std::sync::Arc::new(buf), 2));
             let snap = st.snapshot(&["layers.1.conv_state"]);
             let live = st.metal_buffers["layers.1.conv_state"].0.contents() as *mut f32;
             // SAFETY: as above.

@@ -17,7 +17,7 @@ impl GpuScore {
     pub(crate) fn new(weights: &Weights) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
         {
-            let rt = crate::graph::metal::Runtime::new(&crate::hardware::default_cache_dir()?)?;
+            let rt = crate::graph::metal::Runtime::shared()?;
             Ok(Self {
                 session: crate::graph::metal::Session::new(rt, weights)?,
             })
@@ -110,10 +110,16 @@ impl DecoderBackbone for GraphLmSeq {
         let c = &self.lm.config;
         let n = ids.len();
         if n == 0 || n > c.max_seq_len {
-            return Err(format!("{n} tokens: the context holds 1..={}", c.max_seq_len));
+            return Err(format!(
+                "{n} tokens: the context holds 1..={}",
+                c.max_seq_len
+            ));
         }
         // The host forward clamps out-of-vocabulary ids to the last row.
-        let ids: Vec<u32> = ids.iter().map(|&t| t.min(c.vocab_size as u32 - 1)).collect();
+        let ids: Vec<u32> = ids
+            .iter()
+            .map(|&t| t.min(c.vocab_size as u32 - 1))
+            .collect();
         let graph = self.lm.build_seqcls_graph(n, score, None);
         gpu.run(&graph, &ids, (0..n as u32).collect())
     }
@@ -224,7 +230,13 @@ pub(crate) mod tests {
                 let _g = crate::hardware::cpu_compute::allow();
                 let hid = llm.last_hidden(ids).unwrap();
                 (0..labels)
-                    .map(|l| score[l * h..(l + 1) * h].iter().zip(&hid).map(|(a, b)| a * b).sum())
+                    .map(|l| {
+                        score[l * h..(l + 1) * h]
+                            .iter()
+                            .zip(&hid)
+                            .map(|(a, b)| a * b)
+                            .sum()
+                    })
                     .collect()
             };
             let before = crate::hardware::cpu_compute::entered();
@@ -235,9 +247,19 @@ pub(crate) mod tests {
                 "{ids:?}: the GPU score program entered a CPU compute site"
             );
             assert_eq!(got.len(), labels);
-            assert!(want.iter().any(|v| v.abs() > 1e-2), "{ids:?}: trivial reference {want:?}");
-            let err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-            assert!(err <= 1e-3, "{ids:?}: want {want:?} got {got:?} (abs {err})");
+            assert!(
+                want.iter().any(|v| v.abs() > 1e-2),
+                "{ids:?}: trivial reference {want:?}"
+            );
+            let err = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(
+                err <= 1e-3,
+                "{ids:?}: want {want:?} got {got:?} (abs {err})"
+            );
             worst = worst.max(err);
         }
         Some(worst)
@@ -275,7 +297,12 @@ pub(crate) mod tests {
 
     #[test]
     fn graph_lm_learned_positions_match_host() {
-        run(2, crate::hardware::QuantFormat::FP32, 2, "learned-positions");
+        run(
+            2,
+            crate::hardware::QuantFormat::FP32,
+            2,
+            "learned-positions",
+        );
     }
 
     #[test]
