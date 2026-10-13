@@ -33,6 +33,24 @@ pub fn load_gguf(
     })
 }
 
+/// Decode graph and weights of the text decoder of the `gemma4` GGUF at `path`, with its scaled token
+/// embedding lookup: what a parity test needs to run the same graph on the CPU executor and Metal.
+#[allow(clippy::type_complexity)]
+pub fn gguf_decode_fixture(
+    path: &Path,
+) -> Result<(crate::graph::Graph, crate::graph::Weights, Box<dyn Fn(u32) -> Vec<f32>>), String> {
+    let (manifest, data) = crate::model::loaders::gguf::open(path)?;
+    let text = load_text(&Arc::new(data), &manifest)?;
+    let (g, w) = text.to_decode_graph()?;
+    let hidden = text.hidden;
+    let embed = move |id: u32| {
+        let mut row = vec![0.0f32; hidden];
+        text.embed_row(id, &mut row);
+        row
+    };
+    Ok((g, w, Box::new(embed)))
+}
+
 /// Metadata value(s) of `key`: one number, or a comma-joined array ([`UniversalModelLoader::parse_gguf`]).
 fn nums(md: &HashMap<String, String>, key: &str) -> Option<Vec<f64>> {
     md.get(key)?
@@ -617,6 +635,131 @@ mod tests {
             ..Default::default()
         };
         (m, mask)
+    }
+
+    /// A 2-layer 26B-A4B-style GGUF (sliding + full layer, dense MLP beside 8 experts, fused Q4_0
+    /// gate/up bank, Q4_0 down bank, F32 router and per-expert scale): the sparse layers through the
+    /// real GGUF path, Metal program against the CPU graph executor.
+    #[test]
+    fn sparse_gguf_fused_banks_stay_packed_and_match_cpu_graph() {
+        use crate::model::layers::quantize_f32_to_q4_0;
+        let (h, vocab, nh, hd, inter) = (64usize, 128usize, 2usize, 32usize, 48usize);
+        let (experts, top_k, ff) = (8usize, 2usize, 32usize);
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * scale
+                })
+                .collect()
+        };
+        let f32s = |v: Vec<f32>| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let mut tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
+        let mut put = |n: String, dims: &[usize], ty: u32, bytes: Vec<u8>| tensors.push((n, dims.to_vec(), ty, bytes));
+        put("token_embd.weight".into(), &[h, vocab], 0, f32s(rnd(h * vocab, 0.8)));
+        put("output_norm.weight".into(), &[h], 0, f32s(rnd(h, 0.2).iter().map(|v| v + 1.0).collect()));
+        put("rope_freqs.weight".into(), &[hd / 2], 0, f32s(vec![1.0; hd / 2]));
+        for l in 0..2 {
+            let p = format!("blk.{l}");
+            let gain = |n: usize, r: &mut dyn FnMut(usize, f32) -> Vec<f32>| f32s(r(n, 0.2).iter().map(|v| v + 1.0).collect());
+            for n in [
+                "attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm", "ffn_pre_norm_2",
+                "ffn_post_norm_1", "ffn_post_norm_2",
+            ] {
+                put(format!("{p}.{n}.weight"), &[h], 0, gain(h, &mut rnd));
+            }
+            for n in ["attn_q_norm", "attn_k_norm"] {
+                put(format!("{p}.{n}.weight"), &[hd], 0, gain(hd, &mut rnd));
+            }
+            for (n, dims) in [
+                ("attn_q", [h, nh * hd]),
+                ("attn_k", [h, nh * hd]),
+                ("attn_v", [h, nh * hd]),
+                ("attn_output", [nh * hd, h]),
+                ("ffn_gate", [h, inter]),
+                ("ffn_up", [h, inter]),
+                ("ffn_down", [inter, h]),
+            ] {
+                put(format!("{p}.{n}.weight"), &dims, 0, f32s(rnd(dims[0] * dims[1], 0.8)));
+            }
+            put(format!("{p}.layer_output_scale.weight"), &[1], 0, f32s(vec![0.9]));
+            put(format!("{p}.ffn_gate_inp.weight"), &[h, experts], 0, f32s(rnd(h * experts, 1.6)));
+            put(format!("{p}.ffn_gate_inp.scale"), &[h], 0, gain(h, &mut rnd));
+            put(format!("{p}.ffn_down_exps.scale"), &[experts], 0, gain(experts, &mut rnd));
+            put(
+                format!("{p}.ffn_gate_up_exps.weight"),
+                &[h, 2 * ff, experts],
+                2,
+                quantize_f32_to_q4_0(&rnd(experts * 2 * ff * h, 0.8)),
+            );
+            put(
+                format!("{p}.ffn_down_exps.weight"),
+                &[ff, h, experts],
+                2,
+                quantize_f32_to_q4_0(&rnd(experts * h * ff, 0.8)),
+            );
+        }
+        let u32_kv = |k: &str, v: u32| (format!("gemma4.{k}"), 4u32, v.to_le_bytes().to_vec());
+        let f32_kv = |k: &str, v: f32| (format!("gemma4.{k}"), 6u32, v.to_le_bytes().to_vec());
+        let mut arch = (6u64).to_le_bytes().to_vec();
+        arch.extend_from_slice(b"gemma4");
+        // `attention.sliding_window_pattern`: an int32 array, layer 0 sliding and layer 1 full.
+        let mut pattern = 5u32.to_le_bytes().to_vec();
+        pattern.extend_from_slice(&2u64.to_le_bytes());
+        pattern.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        let kvs = vec![
+            ("general.architecture".to_string(), 8u32, arch),
+            u32_kv("block_count", 2),
+            u32_kv("embedding_length", h as u32),
+            u32_kv("attention.head_count", nh as u32),
+            u32_kv("attention.head_count_kv", nh as u32),
+            u32_kv("attention.key_length", hd as u32),
+            u32_kv("attention.sliding_window", 8),
+            ("gemma4.attention.sliding_window_pattern".to_string(), 9u32, pattern),
+            u32_kv("context_length", 64),
+            f32_kv("attention.layer_norm_rms_epsilon", 1e-6),
+            f32_kv("rope.freq_base", 10000.0),
+            f32_kv("rope.freq_base_swa", 10000.0),
+            f32_kv("final_logit_softcapping", 30.0),
+            u32_kv("expert_count", experts as u32),
+            u32_kv("expert_used_count", top_k as u32),
+            u32_kv("expert_feed_forward_length", ff as u32),
+        ];
+        let file = crate::model::loaders::gguf::test_gguf_blocks(&kvs, &tensors);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny-gemma4-moe.gguf");
+        std::fs::write(&path, &file).unwrap();
+
+        let (g, w, embed) = gguf_decode_fixture(&path).unwrap();
+        assert!(
+            g.values.iter().any(|v| v.name.ends_with("experts.gate_up_proj.weight")),
+            "the fused gate/up bank is one MoeLinear weight"
+        );
+        let mut prog = crate::graph::program::GraphProgram::compile(
+            g.clone(),
+            w.clone(),
+            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+        )
+        .expect("Metal program of the sparse GGUF");
+        assert_eq!(prog.cpu_node_count(), 0);
+        let mut cpu_state = crate::graph::StateStore::new();
+        let mut tok = 5u32;
+        for pos in 0..6usize {
+            let emb = embed(tok);
+            let inputs = || vec![crate::graph::Tensor::F32(emb.clone()), crate::graph::Tensor::U32(vec![pos as u32])];
+            let want = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
+            let want = want[0].as_f32().unwrap();
+            let got = prog.run(inputs()).unwrap();
+            let got = got[0].as_f32().unwrap();
+            let dot: f64 = want.iter().zip(got).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let n = |v: &[f32]| v.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().sqrt();
+            let cos = dot / (n(want) * n(got));
+            assert!(cos >= 0.999, "step {pos}: Metal vs CPU graph cosine {cos}");
+            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        }
     }
 
     #[test]
