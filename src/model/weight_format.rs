@@ -1112,6 +1112,7 @@ mod tests {
             cache_dir: Some(tmp.path().to_path_buf()),
             progress: Some(progress.clone()),
             log: None,
+            ffn_only: false,
         };
         let artifacts = ModelArtifacts {
             model_id: "gibbs/smollm-1m".into(),
@@ -1233,6 +1234,7 @@ mod tests {
             cache_dir: Some(tmp.path().to_path_buf()),
             progress: None,
             log: None,
+            ffn_only: false,
         };
         let hw = HardwareCapability::probe_system();
         let (first, c1) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
@@ -1281,6 +1283,7 @@ mod tests {
             cache_dir: None,
             progress: None,
             log: None,
+            ffn_only: false,
         };
         let hw = HardwareCapability::probe_system();
         let (_, c) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
