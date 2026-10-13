@@ -71,8 +71,60 @@ pub fn smallest_ladder_ge(bpw: f32) -> Q {
         .unwrap_or(Q::GGUF_Q8_0)
 }
 
-/// The policy's decision for a projection stored in `src`.
+/// The policy's decision for a projection stored in `src`; `MaxSpeed` reads this host's measured
+/// codec rates (falling back to the static rule where none are measured yet).
 pub fn rule(policy: ReencodePolicy, src: Q) -> Target {
+    rule_with(policy, src, &crate::model::variant::host_gbps)
+}
+
+/// A candidate must need under this fraction of the incumbent's time per weight to replace it:
+/// run-to-run noise in the measured rates must not flip a tensor's format (and the re-encode cache).
+const TIME_MARGIN: f64 = 0.9;
+
+/// [`rule`] with explicit rates (`GB/s` of a format's GEMV; `None` = not measured).
+///
+/// `MaxSpeed` picks the target minimizing `bpw / GB/s` (time to stream one weight) among the
+/// source format (when a GPU codec reads it), the ladder and Q4_0, restricted to formats the
+/// encoder can produce. A source above 4.5 bpw never drops below 4 bpw; a source at or below
+/// 4.5 bpw only moves to equal-or-higher precision, so a lossy re-encode never loses bits.
+pub fn rule_with(policy: ReencodePolicy, src: Q, rate: &dyn Fn(Q) -> Option<f64>) -> Target {
+    let base = static_rule(policy, src);
+    if policy != ReencodePolicy::MaxSpeed {
+        return base;
+    }
+    let bpw = src.bits_per_weight();
+    let floor = if bpw > 4.5 { 4.0 } else { bpw - 0.01 };
+    let time = |f: Q| {
+        rate(f)
+            .map(|g| f.bits_per_weight() as f64 / g)
+            .filter(|t| t.is_finite() && *t > 0.0)
+    };
+    let incumbent = match base {
+        Target::Native => src,
+        Target::Encode(f) => f,
+    };
+    let (mut best, mut best_t) = (incumbent, time(incumbent));
+    let readable = has_gpu_codec(src);
+    for f in std::iter::once(src).chain(LADDER).chain([Q::GGUF_Q4_0]) {
+        let allowed = (f == src && readable) || encodable(f);
+        if f == incumbent || !allowed || f.bits_per_weight() < floor {
+            continue;
+        }
+        if let Some(t) = time(f) {
+            if best_t.is_none_or(|bt| t < bt * TIME_MARGIN) {
+                (best, best_t) = (f, Some(t));
+            }
+        }
+    }
+    if best == src && readable {
+        Target::Native
+    } else {
+        Target::Encode(best)
+    }
+}
+
+/// The rate-independent rule (what runs before the codec benchmark has measured this host).
+fn static_rule(policy: ReencodePolicy, src: Q) -> Target {
     let codec_less = !has_gpu_codec(src);
     match policy {
         ReencodePolicy::MaxSpeed if src.bits_per_weight() > 4.5 || codec_less => {
@@ -88,7 +140,9 @@ pub fn rule(policy: ReencodePolicy, src: Q) -> Target {
 
 /// The next ladder format above `f`.
 pub fn bump(f: Q) -> Option<Q> {
-    LADDER.into_iter().find(|g| g.bits_per_weight() > f.bits_per_weight())
+    LADDER
+        .into_iter()
+        .find(|g| g.bits_per_weight() > f.bits_per_weight())
 }
 
 /// `f`, or the next larger format whose blocks tile `cols` (a float dtype when none does).
@@ -246,8 +300,14 @@ impl ProjectionEncoder for Encoder {
     fn encode(&self, p: Projection<'_>) -> QuantizedLinearLayer {
         let (in_f, out_f) = (p.layer.in_features, p.layer.out_features);
         // The carried blocks' own format when there are any, else what the checkpoint declares.
-        let carried = if matches!(self.mode, Mode::Cache(_)) { None } else { carry(&p) };
-        let src = carried.as_ref().map_or_else(|| declared_source(&p), |c| c.0);
+        let carried = if matches!(self.mode, Mode::Cache(_)) {
+            None
+        } else {
+            carry(&p)
+        };
+        let src = carried
+            .as_ref()
+            .map_or_else(|| declared_source(&p), |c| c.0);
         let mut rec = Record {
             name: p.layer.name.clone(),
             source: src,
@@ -263,7 +323,11 @@ impl ProjectionEncoder for Encoder {
                 p.layer.weight.clone()
             }),
             Mode::Source => self.native(&p, src, carried, true, &mut rec),
-            Mode::Policy { policy, ffn_only, rmse_limit } => {
+            Mode::Policy {
+                policy,
+                ffn_only,
+                rmse_limit,
+            } => {
                 let target = if *ffn_only && p.role != ProjRole::Ffn {
                     Target::Native
                 } else {
@@ -275,8 +339,7 @@ impl ProjectionEncoder for Encoder {
                         let (mut f, mut w) = self.encode_f32(&p, f);
                         rec.lossy = true;
                         if let Some(limit) = *rmse_limit {
-                            let QuantizedWeight::Uncompressed { data, .. } = &p.layer.weight
-                            else {
+                            let QuantizedWeight::Uncompressed { data, .. } = &p.layer.weight else {
                                 unreachable!()
                             };
                             let mut rmse = relative_rmse(data, &w.to_f32());
@@ -298,7 +361,8 @@ impl ProjectionEncoder for Encoder {
             pr.done.fetch_add(1, Ordering::Relaxed);
         }
         self.records.lock().push(rec);
-        let mut layer = QuantizedLinearLayer::from_quantized_weight(&p.layer.name, in_f, out_f, weight);
+        let mut layer =
+            QuantizedLinearLayer::from_quantized_weight(&p.layer.name, in_f, out_f, weight);
         layer.bias = p.layer.bias;
         layer
     }
@@ -320,7 +384,9 @@ pub fn relative_rmse(x: &[f32], y: &[f32]) -> f64 {
 
 /// The largest-bpw format among the checkpoint tensors a projection came from (FP32 when unknown).
 fn declared_source(p: &Projection<'_>) -> Q {
-    let Some((m, _)) = p.checkpoint else { return Q::FP32 };
+    let Some((m, _)) = p.checkpoint else {
+        return Q::FP32;
+    };
     p.sources
         .iter()
         .filter_map(|n| m.tensors.get(n))
@@ -331,9 +397,19 @@ fn declared_source(p: &Projection<'_>) -> Q {
 
 fn gguf_weight(f: Q, bytes: Bytes, in_f: usize, out_f: usize) -> QuantizedWeight {
     if matches!(f, Q::FP16 | Q::BF16) {
-        QuantizedWeight::ZeroCopySlice { data: bytes, in_features: in_f, out_features: out_f, format: f }
+        QuantizedWeight::ZeroCopySlice {
+            data: bytes,
+            in_features: in_f,
+            out_features: out_f,
+            format: f,
+        }
     } else {
-        QuantizedWeight::GgufQuantized { format: f, raw_data: bytes, in_features: in_f, out_features: out_f }
+        QuantizedWeight::GgufQuantized {
+            format: f,
+            raw_data: bytes,
+            in_features: in_f,
+            out_features: out_f,
+        }
     }
 }
 
@@ -350,9 +426,17 @@ pub fn weight_bytes(w: &QuantizedWeight) -> usize {
 /// splitting rows over `threads` workers at utility QoS; row chunks concatenate exactly.
 fn encode_weight(w: &[f32], in_f: usize, out_f: usize, f: Q, threads: usize) -> QuantizedWeight {
     if f == Q::FP32 {
-        return QuantizedWeight::Uncompressed { data: w.to_vec(), in_features: in_f, out_features: out_f };
+        return QuantizedWeight::Uncompressed {
+            data: w.to_vec(),
+            in_features: in_f,
+            out_features: out_f,
+        };
     }
-    let workers = if w.len() < 1 << 16 { 1 } else { threads.min(out_f) };
+    let workers = if w.len() < 1 << 16 {
+        1
+    } else {
+        threads.min(out_f)
+    };
     let rows = out_f.div_ceil(workers);
     let raw = |c: &[f32]| -> Bytes {
         let l = QuantizedLinearLayer::from_f32("", in_f, c.len() / in_f, c, f)
@@ -376,14 +460,31 @@ fn encode_weight(w: &[f32], in_f: usize, out_f: usize, f: Q, threads: usize) -> 
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("encoder thread panicked")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("encoder thread panicked"))
+                .collect()
         })
     };
-    let bytes = if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Bytes::from(parts.concat()) };
-    if matches!(f, Q::FP16 | Q::BF16) {
-        QuantizedWeight::ZeroCopySlice { data: bytes, in_features: in_f, out_features: out_f, format: f }
+    let bytes = if parts.len() == 1 {
+        parts.into_iter().next().unwrap()
     } else {
-        QuantizedWeight::GgufQuantized { format: f, raw_data: bytes, in_features: in_f, out_features: out_f }
+        Bytes::from(parts.concat())
+    };
+    if matches!(f, Q::FP16 | Q::BF16) {
+        QuantizedWeight::ZeroCopySlice {
+            data: bytes,
+            in_features: in_f,
+            out_features: out_f,
+            format: f,
+        }
+    } else {
+        QuantizedWeight::GgufQuantized {
+            format: f,
+            raw_data: bytes,
+            in_features: in_f,
+            out_features: out_f,
+        }
     }
 }
 
@@ -408,7 +509,11 @@ fn carry(p: &Projection<'_>) -> Option<(Q, Vec<u8>)> {
                     return None;
                 }
                 let bytes = data.get(t.byte_offset..t.byte_offset + t.byte_len)?;
-                (t.quant_format, std::borrow::Cow::Borrowed(bytes), t.byte_len / (in_f / elems * block_bytes))
+                (
+                    t.quant_format,
+                    std::borrow::Cow::Borrowed(bytes),
+                    t.byte_len / (in_f / elems * block_bytes),
+                )
             }
             Err(_) => return None,
         };
@@ -424,7 +529,11 @@ fn carry(p: &Projection<'_>) -> Option<(Q, Vec<u8>)> {
     let q_rows = parts[0].2;
     let mut out = Vec::with_capacity(out_f * row_bytes);
     for (i, (_, bytes, rows)) in parts.iter().enumerate() {
-        let rep = if parts.len() == 3 && i > 0 && *rows < q_rows { q_rows / rows } else { 1 };
+        let rep = if parts.len() == 3 && i > 0 && *rows < q_rows {
+            q_rows / rows
+        } else {
+            1
+        };
         if rep > 1 && (q_rows % rows != 0 || rows % p.head_dim.max(1) != 0) {
             return None;
         }
@@ -443,7 +552,9 @@ fn carry(p: &Projection<'_>) -> Option<(Q, Vec<u8>)> {
     }
     // The blocks must decode to exactly the f32 rows the loader built: this rejects any layout the
     // loader changed after reading (reordered heads, transposes, ternarized rows) without special cases.
-    let QuantizedWeight::Uncompressed { data: want, .. } = &p.layer.weight else { return None };
+    let QuantizedWeight::Uncompressed { data: want, .. } = &p.layer.weight else {
+        return None;
+    };
     let decode = gguf_block_codec(f)?.2;
     let mut y = vec![0.0f32; elems];
     for (b, w) in out.chunks_exact(block_bytes).zip(want.chunks_exact(elems)) {
@@ -506,17 +617,27 @@ const PAGE: u64 = 16384;
 
 pub fn cache_paths(dir: &Path, key: u64) -> (PathBuf, PathBuf) {
     let d = dir.join("reencoded");
-    (d.join(format!("{key:016x}.bin")), d.join(format!("{key:016x}.json")))
+    (
+        d.join(format!("{key:016x}.bin")),
+        d.join(format!("{key:016x}.json")),
+    )
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    bytes.iter().fold(0xcbf29ce484222325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 /// `fnv1a(path, size, mtime, policy, CODEC_VERSION)` (plus the KL override, which changes the outcome).
 pub fn cache_key(weights: &Path, policy: ReencodePolicy, max_kl: Option<f64>) -> Option<u64> {
     let m = weights.metadata().ok()?;
-    let mtime = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     let s = format!(
         "{}|{}|{mtime}|{}|{CODEC_VERSION}|{max_kl:?}",
         weights.display(),
@@ -559,7 +680,10 @@ impl CacheReader {
             let file = std::fs::File::open(&bin).ok()?;
             // SAFETY: read-only mapping of a file this module only ever replaces by rename.
             let map = Arc::new(unsafe { memmap2::Mmap::map(&file) }.ok()?);
-            let ok = index.tensors.values().all(|t| (t.offset + t.bytes) as usize <= map.len());
+            let ok = index
+                .tensors
+                .values()
+                .all(|t| (t.offset + t.bytes) as usize <= map.len());
             ok.then_some(Self { map, index })
         };
         let r = read();
@@ -571,7 +695,10 @@ impl CacheReader {
     }
 
     pub fn report(&self) -> ReencodeReport {
-        ReencodeReport { cache_hit: true, ..self.index.report.clone() }
+        ReencodeReport {
+            cache_hit: true,
+            ..self.index.report.clone()
+        }
     }
 
     /// The stored weight of `name`, zero-copy out of the mapping (f32 tensors are copied).
@@ -583,21 +710,37 @@ impl CacheReader {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                 .collect::<Vec<_>>();
-            return (data.len() == in_f * out_f)
-                .then_some(QuantizedWeight::Uncompressed { data, in_features: in_f, out_features: out_f });
+            return (data.len() == in_f * out_f).then_some(QuantizedWeight::Uncompressed {
+                data,
+                in_features: in_f,
+                out_features: out_f,
+            });
         }
-        let bytes = Bytes::from_owner(MapSlice { map: self.map.clone(), off, len });
-        (t.format.tensor_bytes(in_f * out_f) == len).then(|| gguf_weight(t.format, bytes, in_f, out_f))
+        let bytes = Bytes::from_owner(MapSlice {
+            map: self.map.clone(),
+            off,
+            len,
+        });
+        (t.format.tensor_bytes(in_f * out_f) == len)
+            .then(|| gguf_weight(t.format, bytes, in_f, out_f))
     }
 }
 
 /// Writes the weights of `model` and `report` as cache entry `key` under `dir`: page-aligned blobs in
 /// `<key>.bin`, an index in `<key>.json`, each written to a `.tmp` file and renamed (index last).
-pub fn write_cache(dir: &Path, key: u64, model: &GraphLm, report: &ReencodeReport) -> Result<(), String> {
+pub fn write_cache(
+    dir: &Path,
+    key: u64,
+    model: &GraphLm,
+    report: &ReencodeReport,
+) -> Result<(), String> {
     let (bin, json) = cache_paths(dir, key);
     let d = bin.parent().expect("cache file has a parent");
     std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
-    let (bin_tmp, json_tmp) = (bin.with_extension("bin.tmp"), json.with_extension("json.tmp"));
+    let (bin_tmp, json_tmp) = (
+        bin.with_extension("bin.tmp"),
+        json.with_extension("json.tmp"),
+    );
     let mut layers: Vec<&QuantizedLinearLayer> = Vec::new();
     for l in &model.layers {
         layers.extend([&l.qkv_proj, &l.out_proj, &l.gate_up_proj, &l.down_proj]);
@@ -611,17 +754,30 @@ pub fn write_cache(dir: &Path, key: u64, model: &GraphLm, report: &ReencodeRepor
         let f32_bytes;
         let (format, bytes): (Q, &[u8]) = match &l.weight {
             QuantizedWeight::Uncompressed { data, .. } => {
-                f32_bytes = data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+                f32_bytes = data
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>();
                 (Q::FP32, &f32_bytes)
             }
             QuantizedWeight::ZeroCopySlice { data, format, .. } => (*format, data),
-            QuantizedWeight::GgufQuantized { raw_data, format, .. } => (*format, raw_data),
+            QuantizedWeight::GgufQuantized {
+                raw_data, format, ..
+            } => (*format, raw_data),
             _ => return Err(format!("{}: format is not cacheable", l.name)),
         };
         file.write_all(bytes).map_err(io)?;
-        tensors.insert(l.name.clone(), TensorIndex { format, offset: at, bytes: bytes.len() as u64 });
+        tensors.insert(
+            l.name.clone(),
+            TensorIndex {
+                format,
+                offset: at,
+                bytes: bytes.len() as u64,
+            },
+        );
         let padded = (bytes.len() as u64).div_ceil(PAGE) * PAGE;
-        file.write_all(&vec![0u8; (padded - bytes.len() as u64) as usize]).map_err(io)?;
+        file.write_all(&vec![0u8; (padded - bytes.len() as u64) as usize])
+            .map_err(io)?;
         at += padded;
     }
     {
@@ -629,8 +785,17 @@ pub fn write_cache(dir: &Path, key: u64, model: &GraphLm, report: &ReencodeRepor
         file.flush().map_err(io)?;
     }
     drop(file);
-    let index = Index { codec_version: CODEC_VERSION, key: format!("{key:016x}"), report: report.clone(), tensors };
-    std::fs::write(&json_tmp, serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?).map_err(io)?;
+    let index = Index {
+        codec_version: CODEC_VERSION,
+        key: format!("{key:016x}"),
+        report: report.clone(),
+        tensors,
+    };
+    std::fs::write(
+        &json_tmp,
+        serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?,
+    )
+    .map_err(io)?;
     std::fs::rename(&bin_tmp, &bin).map_err(io)?;
     std::fs::rename(&json_tmp, &json).map_err(io)
 }
@@ -640,13 +805,133 @@ mod tests {
     use super::*;
     use ReencodePolicy::*;
 
+    /// Rates in GB/s as the codec benchmark measured them on the dev machine (TQ2_0 is the slow one).
+    fn rates(f: Q) -> Option<f64> {
+        Some(match f {
+            Q::GGUF_TQ2_0 => 110.0,
+            Q::GGUF_Q4_0 => 300.0,
+            Q::GGUF_Q4_K_M => 250.0,
+            Q::GGUF_Q5_K_M => 240.0,
+            Q::GGUF_Q6_K => 230.0,
+            Q::GGUF_Q8_0 => 380.0,
+            Q::BF16 | Q::FP16 => 200.0,
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn max_speed_moves_a_slow_low_bit_source_to_the_faster_target() {
+        // 2.06 bpw / 110 GB/s is slower per weight than 4.5 bpw / 300 GB/s.
+        assert_eq!(
+            rule_with(MaxSpeed, Q::GGUF_TQ2_0, &rates),
+            Target::Encode(Q::GGUF_Q4_0)
+        );
+        // Q8_0 (8.5 bpw / 380) takes longer per weight than Q4_0 (4.5 / 300): never "faster by bits".
+        assert_eq!(
+            rule_with(MaxSpeed, Q::GGUF_Q8_0, &rates),
+            Target::Encode(Q::GGUF_Q4_0)
+        );
+        // The source stays when nothing beats it by the margin (ties keep the source).
+        assert_eq!(rule_with(MaxSpeed, Q::GGUF_Q4_0, &rates), Target::Native);
+    }
+
+    #[test]
+    fn max_speed_ignores_unmeasured_targets_and_keeps_precision() {
+        let only_q8 = |f: Q| match f {
+            Q::GGUF_TQ2_0 => Some(20.0),
+            Q::GGUF_Q8_0 => Some(380.0),
+            _ => None,
+        };
+        assert_eq!(
+            rule_with(MaxSpeed, Q::GGUF_TQ2_0, &only_q8),
+            Target::Encode(Q::GGUF_Q8_0)
+        );
+        for src in [
+            Q::GGUF_TQ2_0,
+            Q::GGUF_IQ2_M,
+            Q::GGUF_Q4_K_M,
+            Q::GGUF_IQ4_XS,
+            Q::GGUF_Q6_K,
+            Q::BF16,
+        ] {
+            let stored = match rule_with(MaxSpeed, src, &rates) {
+                Target::Native => src,
+                Target::Encode(f) => f,
+            };
+            let floor = if src.bits_per_weight() > 4.5 {
+                4.0
+            } else {
+                src.bits_per_weight() - 0.01
+            };
+            assert!(stored.bits_per_weight() >= floor, "{src:?} -> {stored:?}");
+        }
+        // No rates at all: the static rule.
+        assert_eq!(
+            rule_with(MaxSpeed, Q::GGUF_TQ2_0, &|_| None),
+            Target::Native
+        );
+        assert_eq!(
+            rule_with(MaxSpeed, Q::BF16, &|_| None),
+            Target::Encode(Q::GGUF_Q4_K_M)
+        );
+    }
+
+    #[test]
+    fn tq2_0_to_q4_0_is_bit_exact() {
+        use crate::model::layers::{gguf_block_codec, quantize_f32_to_q4_0};
+        let (elems, bytes, tq) = gguf_block_codec(Q::GGUF_TQ2_0).unwrap();
+        let (_, _, q4) = gguf_block_codec(Q::GGUF_Q4_0).unwrap();
+        let mut s = 0x9E3779B97F4A7C15u64;
+        for _ in 0..64 {
+            let mut blk = vec![0u8; bytes];
+            for b in &mut blk[..bytes - 2] {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (s >> 33) as u8;
+            }
+            blk[bytes - 2..].copy_from_slice(
+                &crate::model::f32_to_f16(0.0371 + (s >> 60) as f32 * 0.01).to_le_bytes(),
+            );
+            let mut want = vec![0.0f32; elems];
+            tq(&blk, &mut want);
+            let enc = quantize_f32_to_q4_0(&want);
+            let mut got = vec![0.0f32; 32];
+            for (i, b) in enc.chunks_exact(18).enumerate() {
+                q4(b, &mut got);
+                for (a, w) in got.iter().zip(&want[i * 32..]) {
+                    assert_eq!(a, w, "block {i}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn rules_follow_the_policy_table() {
         // MaxSpeed: > 4.5 bpw or codec-less -> Q4_K, else native.
-        for src in [Q::BF16, Q::FP16, Q::FP32, Q::GGUF_Q8_0, Q::GGUF_Q6_K, Q::GGUF_Q5_K_M, Q::GGUF_Q4_1] {
-            assert_eq!(rule(MaxSpeed, src), Target::Encode(Q::GGUF_Q4_K_M), "{src:?}");
+        for src in [
+            Q::BF16,
+            Q::FP16,
+            Q::FP32,
+            Q::GGUF_Q8_0,
+            Q::GGUF_Q6_K,
+            Q::GGUF_Q5_K_M,
+            Q::GGUF_Q4_1,
+        ] {
+            assert_eq!(
+                rule(MaxSpeed, src),
+                Target::Encode(Q::GGUF_Q4_K_M),
+                "{src:?}"
+            );
         }
-        for src in [Q::GGUF_Q4_0, Q::GGUF_Q4_K_M, Q::GGUF_IQ4_XS, Q::GGUF_Q2_K, Q::GGUF_IQ2_M, Q::GGUF_TQ2_0] {
+        for src in [
+            Q::GGUF_Q4_0,
+            Q::GGUF_Q4_K_M,
+            Q::GGUF_IQ4_XS,
+            Q::GGUF_Q2_K,
+            Q::GGUF_IQ2_M,
+            Q::GGUF_TQ2_0,
+        ] {
             assert_eq!(rule(MaxSpeed, src), Target::Native, "{src:?}");
         }
         assert_eq!(rule(MaxSpeed, Q::EXL3_3Bit), Target::Encode(Q::GGUF_Q4_K_M));
@@ -655,9 +940,18 @@ mod tests {
             assert_eq!(rule(LowBitNative, src), Target::Encode(Q::GGUF_Q8_0));
         }
         assert_eq!(rule(LowBitNative, Q::GGUF_Q4_K_M), Target::Native);
-        assert_eq!(rule(LowBitNative, Q::EXL3_3Bit), Target::Encode(Q::GGUF_Q4_K_M));
-        assert_eq!(rule(LowBitNative, Q::EXL3_5Bit), Target::Encode(Q::GGUF_Q5_K_M));
-        assert_eq!(rule(LowBitNative, Q::TurboQuant), Target::Encode(Q::GGUF_Q4_K_M));
+        assert_eq!(
+            rule(LowBitNative, Q::EXL3_3Bit),
+            Target::Encode(Q::GGUF_Q4_K_M)
+        );
+        assert_eq!(
+            rule(LowBitNative, Q::EXL3_5Bit),
+            Target::Encode(Q::GGUF_Q5_K_M)
+        );
+        assert_eq!(
+            rule(LowBitNative, Q::TurboQuant),
+            Target::Encode(Q::GGUF_Q4_K_M)
+        );
         // BitExact: native whenever a codec exists.
         for src in [Q::BF16, Q::FP32, Q::GGUF_Q8_0, Q::GGUF_Q4_0] {
             assert_eq!(rule(BitExact, src), Target::Native);
@@ -688,16 +982,30 @@ mod tests {
         QuantizedLinearLayer::from_f32(name, in_f, out_f, &w, Q::FP32).unwrap()
     }
 
-    fn encode_with(mode: Mode, l: QuantizedLinearLayer, role: ProjRole) -> (QuantizedLinearLayer, Record) {
+    fn encode_with(
+        mode: Mode,
+        l: QuantizedLinearLayer,
+        role: ProjRole,
+    ) -> (QuantizedLinearLayer, Record) {
         let e = Encoder::new(mode, 3, None);
-        let out = e.encode(Projection { role, layer: l, sources: vec![], head_dim: 8, checkpoint: None });
+        let out = e.encode(Projection {
+            role,
+            layer: l,
+            sources: vec![],
+            head_dim: 8,
+            checkpoint: None,
+        });
         let rec = e.records().remove(0);
         (out, rec)
     }
 
     #[test]
     fn policy_encodes_and_ffn_only_keeps_attention() {
-        let pol = |ffn_only| Mode::Policy { policy: MaxSpeed, ffn_only, rmse_limit: Some(TENSOR_RMSE_LIMIT) };
+        let pol = |ffn_only| Mode::Policy {
+            policy: MaxSpeed,
+            ffn_only,
+            rmse_limit: Some(TENSOR_RMSE_LIMIT),
+        };
         let (q, rec) = encode_with(pol(false), layer("a", 512, 24, 1), ProjRole::Ffn);
         assert_eq!((q.quant_format(), rec.lossy), (Q::GGUF_Q4_K_M, true));
         assert!(rec.rmse.unwrap() <= TENSOR_RMSE_LIMIT);
@@ -711,13 +1019,29 @@ mod tests {
 
     #[test]
     fn per_tensor_gate_bumps_a_format_that_misses_the_limit() {
-        let gate = |limit| Mode::Policy { policy: MaxSpeed, ffn_only: false, rmse_limit: Some(limit) };
-        let (q4, r4) = encode_with(gate(TENSOR_RMSE_LIMIT), layer("c", 256, 16, 3), ProjRole::Ffn);
+        let gate = |limit| Mode::Policy {
+            policy: MaxSpeed,
+            ffn_only: false,
+            rmse_limit: Some(limit),
+        };
+        let (q4, r4) = encode_with(
+            gate(TENSOR_RMSE_LIMIT),
+            layer("c", 256, 16, 3),
+            ProjRole::Ffn,
+        );
         assert_eq!(q4.quant_format(), Q::GGUF_Q4_K_M);
-        assert!(r4.rmse.unwrap() > 0.01, "uniform weights quantize to ~6% at 4 bits: {:?}", r4.rmse);
+        assert!(
+            r4.rmse.unwrap() > 0.01,
+            "uniform weights quantize to ~6% at 4 bits: {:?}",
+            r4.rmse
+        );
         // a limit Q4_K misses sends the tensor up the ladder until it passes
         let (q, r) = encode_with(gate(0.02), layer("c", 256, 16, 3), ProjRole::Ffn);
-        assert!(q.quant_format().bits_per_weight() > Q::GGUF_Q4_K_M.bits_per_weight(), "{:?}", q.quant_format());
+        assert!(
+            q.quant_format().bits_per_weight() > Q::GGUF_Q4_K_M.bits_per_weight(),
+            "{:?}",
+            q.quant_format()
+        );
         assert!(r.rmse.unwrap() <= 0.02, "{:?}", r.rmse);
     }
 
@@ -725,12 +1049,16 @@ mod tests {
     /// the loader would have built (k and v repeated per head), and BitExact keeps them unchanged.
     #[test]
     fn carry_copies_grouped_query_blocks() {
-        use crate::model::layers::{dequantize_gguf_blocks, quantize_k_rows, quantize_row_q4_k_ref};
+        use crate::model::layers::{
+            dequantize_gguf_blocks, quantize_k_rows, quantize_row_q4_k_ref,
+        };
         use crate::model::{ModelManifest, VirtualTensor};
         let (in_f, head_dim, q_rows, kv_rows) = (256usize, 8usize, 32usize, 16usize);
         let blocks = |rows: usize, seed: u32| {
             let l = layer("t", in_f, rows, seed);
-            let QuantizedWeight::Uncompressed { data, .. } = l.weight else { unreachable!() };
+            let QuantizedWeight::Uncompressed { data, .. } = l.weight else {
+                unreachable!()
+            };
             quantize_k_rows(&data, in_f, 144, quantize_row_q4_k_ref)
         };
         let (q, k, v) = (blocks(q_rows, 1), blocks(kv_rows, 2), blocks(kv_rows, 3));
@@ -753,11 +1081,27 @@ mod tests {
         }
         let f32s = |b: &[u8]| dequantize_gguf_blocks(Q::GGUF_Q4_K_M, b).unwrap();
         let expand = |b: &[u8]| -> Vec<f32> {
-            f32s(b).chunks(head_dim * in_f).flat_map(|h| h.iter().chain(h).copied().collect::<Vec<_>>()).collect()
+            f32s(b)
+                .chunks(head_dim * in_f)
+                .flat_map(|h| h.iter().chain(h).copied().collect::<Vec<_>>())
+                .collect()
         };
         let want: Vec<f32> = [f32s(&q), expand(&k), expand(&v)].concat();
-        fn proj<'a>(m: &'a ModelManifest, data: &'a [u8], want: &[f32], in_f: usize, head_dim: usize) -> Projection<'a> {
-            let l = QuantizedLinearLayer::from_f32("layer_0_qkv", in_f, want.len() / in_f, want, Q::FP32).unwrap();
+        fn proj<'a>(
+            m: &'a ModelManifest,
+            data: &'a [u8],
+            want: &[f32],
+            in_f: usize,
+            head_dim: usize,
+        ) -> Projection<'a> {
+            let l = QuantizedLinearLayer::from_f32(
+                "layer_0_qkv",
+                in_f,
+                want.len() / in_f,
+                want,
+                Q::FP32,
+            )
+            .unwrap();
             Projection {
                 role: ProjRole::Attn,
                 layer: l,
@@ -771,12 +1115,31 @@ mod tests {
         assert_eq!(f, Q::GGUF_Q4_K_M);
         assert_eq!(f32s(&bytes), want);
 
-        let e = Encoder::new(Mode::Policy { policy: BitExact, ffn_only: false, rmse_limit: None }, 1, None);
+        let e = Encoder::new(
+            Mode::Policy {
+                policy: BitExact,
+                ffn_only: false,
+                rmse_limit: None,
+            },
+            1,
+            None,
+        );
         let out = e.encode(mk());
         let rec = e.records().remove(0);
-        assert_eq!((out.quant_format(), rec.carried, rec.lossy), (Q::GGUF_Q4_K_M, true, false));
+        assert_eq!(
+            (out.quant_format(), rec.carried, rec.lossy),
+            (Q::GGUF_Q4_K_M, true, false)
+        );
         // MaxSpeed leaves a 4.5 bpw Q4_K source alone too
-        let e = Encoder::new(Mode::Policy { policy: MaxSpeed, ffn_only: false, rmse_limit: None }, 1, None);
+        let e = Encoder::new(
+            Mode::Policy {
+                policy: MaxSpeed,
+                ffn_only: false,
+                rmse_limit: None,
+            },
+            1,
+            None,
+        );
         let _ = e.encode(mk());
         assert!(e.records()[0].carried);
         // mixed formats inside one projection cannot be carried
@@ -792,7 +1155,15 @@ mod tests {
         use crate::model::layers::dequantize_gguf_blocks;
         let (f, want) = crate::model::repack::bnb::tests::build(false, 64, false, 3, 512, 9);
         let layer = QuantizedLinearLayer::from_f32("layer_0_out", 512, 3, &want, Q::FP32).unwrap();
-        let e = Encoder::new(Mode::Policy { policy: BitExact, ffn_only: false, rmse_limit: None }, 1, None);
+        let e = Encoder::new(
+            Mode::Policy {
+                policy: BitExact,
+                ffn_only: false,
+                rmse_limit: None,
+            },
+            1,
+            None,
+        );
         let out = e.encode(Projection {
             role: ProjRole::Attn,
             layer,
@@ -801,19 +1172,33 @@ mod tests {
             checkpoint: Some((&f.m, &f.data[..])),
         });
         let rec = e.records().remove(0);
-        assert_eq!((out.quant_format(), rec.carried, rec.lossy), (Q::BNB_NF4_B64, true, false));
-        let QuantizedWeight::GgufQuantized { raw_data, .. } = &out.weight else { panic!() };
+        assert_eq!(
+            (out.quant_format(), rec.carried, rec.lossy),
+            (Q::BNB_NF4_B64, true, false)
+        );
+        let QuantizedWeight::GgufQuantized { raw_data, .. } = &out.weight else {
+            panic!()
+        };
         let got = dequantize_gguf_blocks(Q::BNB_NF4_B64, raw_data).unwrap();
-        assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(got
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     #[test]
     fn threaded_encode_equals_single_thread() {
-        let w: Vec<f32> = (0..512 * 160).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.003).collect();
+        let w: Vec<f32> = (0..512 * 160)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.003)
+            .collect();
         let one = encode_weight(&w, 512, 160, Q::GGUF_Q5_K_M, 1);
         let many = encode_weight(&w, 512, 160, Q::GGUF_Q5_K_M, 7);
         assert_eq!(one.to_f32(), many.to_f32());
-        let (QuantizedWeight::GgufQuantized { raw_data: a, .. }, QuantizedWeight::GgufQuantized { raw_data: b, .. }) = (&one, &many) else {
+        let (
+            QuantizedWeight::GgufQuantized { raw_data: a, .. },
+            QuantizedWeight::GgufQuantized { raw_data: b, .. },
+        ) = (&one, &many)
+        else {
             panic!()
         };
         assert_eq!(a, b);
@@ -823,9 +1208,20 @@ mod tests {
     fn cache_round_trips_and_rejects_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let mut model = GraphLm::new(crate::model::graph_lm::GraphLmConfig::smollm_1m());
-        let enc = Encoder::new(Mode::Policy { policy: LowBitNative, ffn_only: false, rmse_limit: None }, 2, None);
+        let enc = Encoder::new(
+            Mode::Policy {
+                policy: LowBitNative,
+                ffn_only: false,
+                rmse_limit: None,
+            },
+            2,
+            None,
+        );
         model.encode_projections(&enc);
-        let mut report = ReencodeReport { requested: "low-bit-native".into(), ..Default::default() };
+        let mut report = ReencodeReport {
+            requested: "low-bit-native".into(),
+            ..Default::default()
+        };
         report.from_records(&enc.records());
         write_cache(dir.path(), 7, &model, &report).unwrap();
         let (bin, json) = cache_paths(dir.path(), 7);
@@ -837,7 +1233,10 @@ mod tests {
         let cached = Encoder::new(Mode::Cache(reader), 1, None);
         again.encode_projections(&cached);
         assert!(!cached.cache_miss.load(Ordering::Relaxed));
-        assert_eq!(again.layers[0].qkv_proj.weight.to_f32(), model.layers[0].qkv_proj.weight.to_f32());
+        assert_eq!(
+            again.layers[0].qkv_proj.weight.to_f32(),
+            model.layers[0].qkv_proj.weight.to_f32()
+        );
         assert_eq!(again.lm_head.weight.to_f32(), model.lm_head.weight.to_f32());
 
         // a truncated .bin deletes both files
