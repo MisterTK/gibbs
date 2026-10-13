@@ -143,7 +143,8 @@ def process(item, nxt):
         row["parity"] = "ok" if pcode == 0 else "fail"
         row["parity_min_cos"] = float(cos.group(1)) if cos else None
         if pcode != 0:
-            row["parity_error"] = (perr.strip().splitlines() or ["?"])[-1]
+            lines = [l for l in perr.strip().splitlines() if l.startswith("parity:")] or perr.strip().splitlines() or ["?"]
+            row["parity_error"] = lines[-1]
         v, d = oracle(item, b)
         row["oracle"], row["oracle_detail"] = v, d
     else:
