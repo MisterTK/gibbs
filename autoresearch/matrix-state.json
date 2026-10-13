@@ -5,5 +5,12 @@
   "roofline_pct": 28.488150057009843,
   "attempts": 1,
   "error": ""
+ },
+ "unsloth/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q2_K.gguf": {
+  "last_commit": "fc4ec85",
+  "last_status": "ok",
+  "roofline_pct": 10.660039884864368,
+  "attempts": 1,
+  "error": ""
  }
 }

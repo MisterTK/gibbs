@@ -403,7 +403,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 52] = [
+const BASE_KERNELS: [&str; 56] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -449,7 +449,11 @@ const BASE_KERNELS: [&str; 52] = [
     "kv_append_batched",
     "attn_cached_f32",
     "flash_attn_cached_f32",
-    "attn_cached_gqa_split_f32",
+    "attn_cached_gqa_split_f32_1",
+    "attn_cached_gqa_split_f32_2",
+    "attn_cached_gqa_split_f32_4",
+    "attn_cached_gqa_split_f32_8",
+    "attn_cached_gqa_split_f32_16",
     "attn_cached_merge_f32",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
@@ -3102,7 +3106,13 @@ impl Session {
                     }
                 }
                 enc.set_compute_pipeline_state(if n_splits > 1 {
-                    rt.pso("attn_cached_gqa_split_f32")?
+                    rt.pso(match head_dim.div_ceil(32) {
+                        0..=1 => "attn_cached_gqa_split_f32_1",
+                        2 => "attn_cached_gqa_split_f32_2",
+                        3..=4 => "attn_cached_gqa_split_f32_4",
+                        5..=8 => "attn_cached_gqa_split_f32_8",
+                        _ => "attn_cached_gqa_split_f32_16",
+                    })?
                 } else {
                     rt.pso("flash_attn_cached_f32")
                         .or_else(|_| rt.pso("attn_cached_f32"))?

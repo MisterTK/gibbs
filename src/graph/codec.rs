@@ -46,6 +46,9 @@ pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
 pub struct Wide {
     pub groups: u32,
     pub segs: u32,
+    /// Every segment of a group shares one scale (`out[8 * segs]`) and has bias `-scale`: the GEMV sums
+    /// the group's dots and x once and multiplies by the scale a single time.
+    pub uniform: bool,
     /// MSL defining `inline uint group_seg(uint g, uint k)` (block offset of segment `k` of group `g`) and
     /// `inline void decode_group(device const uchar* blk, uint g, thread float* out)`, which writes the
     /// `8 * segs` raw codes of the group in segment order, then `segs` scales, then `segs` biases.
@@ -66,6 +69,7 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
 }
 
 static WIDE_TQ2_0: Wide = Wide {
+    uniform: true,
     groups: 8,
     segs: 4,
     // Byte j of a 32-byte plane holds elements j, j+32, j+64, j+96 of its 128-element half, so group g
@@ -90,6 +94,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 };
 
 static WIDE_Q6_K: Wide = Wide {
+    uniform: false,
     groups: 8,
     segs: 4,
     // Group g = (half n = g/4, 8 bytes at l0 = (g%4)*8): ql[l] and ql[l+32] hold the low / high nibbles of
@@ -132,6 +137,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // nibbles are group 2p and the high nibbles group 2p+1 (Q5_K adds bit j of the 32 high-bit bytes as the
 // fifth bit); value = d * sv_j * code - dmin * mv_j.
 static WIDE_Q4_K: Wide = Wide {
+    uniform: false,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -157,6 +163,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 };
 
 static WIDE_Q5_K: Wide = Wide {
+    uniform: false,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -186,6 +193,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // Q3_K: group g = (half n = g/4, 8 bytes at l0 = (g%4)*8): segment k is the 2-bit plane k of the 32 quant bytes
 // plus bit n*4+k of the high-mask byte as bit 2; value = d * (scale - 32) * (code - 4).
 static WIDE_Q3_K: Wide = Wide {
+    uniform: false,
     groups: 8,
     segs: 4,
     msl: r#"
@@ -223,6 +231,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // IQ4_XS: group g = (32-element group ib = g/2, 8 bytes at (g%2)*8): low nibbles are elements 0..15 of the
 // group's half, high nibbles 16..31; value = d * (ls - 32) * KVALUES[nibble] (a table, so no bias).
 static WIDE_IQ4_XS: Wide = Wide {
+    uniform: false,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -244,6 +253,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 };
 
 static WIDE_IQ4_NL: Wide = Wide {
+    uniform: false,
     groups: 2,
     segs: 2,
     msl: r#"
