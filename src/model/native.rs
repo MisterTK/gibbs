@@ -177,11 +177,151 @@ pub fn unsupported_architecture(model_type: &str) -> Option<&'static str> {
 
 /// Loads `artifacts` as a [`NativeLm`] when its `config.json` names an architecture implemented
 /// here; `None` sends it down the GraphLm path.
+///
+/// On Metal the effective re-encode policy (`ReencodeConfig::effective`) applies to the model's
+/// GGUF projections, behind the same whole-model gate as GraphLm loads: a candidate that re-encoded
+/// anything is compared with the bit-exact load on the probe text, and a rejected one falls back
+/// max-speed -> max-speed (FFN only) -> low-bit-native -> bit-exact.
 pub fn load_native(
     artifacts: &ModelArtifacts,
     mode: impl Into<PlacementMode>,
 ) -> Option<Result<Arc<dyn NativeLm>, String>> {
-    let mode = mode.into();
+    use crate::model::reencode::{native_stats, reset_native_stats, set_native_applied};
+    use crate::model::weight_format::{
+        gate_passes, native_kl_gate, reencode_override, set_reencode_override, ReencodeConfig,
+        ReencodePolicy::{self, BitExact, LowBitNative, MaxSpeed},
+    };
+    let mode: PlacementMode = mode.into();
+    let user = ReencodeConfig::effective();
+    let on_metal = match mode {
+        PlacementMode::Pin(d) => d == Device::Metal,
+        PlacementMode::Auto => crate::hardware::default_device() == Device::Metal,
+    };
+    let attempts: &[(&str, ReencodePolicy, bool)] = match user.policy {
+        _ if !on_metal => &[("bit-exact", BitExact, false)],
+        MaxSpeed => &[
+            ("max-speed", MaxSpeed, false),
+            ("max-speed (FFN only)", MaxSpeed, true),
+            ("low-bit-native", LowBitNative, false),
+            ("bit-exact", BitExact, false),
+        ],
+        LowBitNative => &[
+            ("low-bit-native", LowBitNative, false),
+            ("bit-exact", BitExact, false),
+        ],
+        BitExact => &[("bit-exact", BitExact, false)],
+    };
+    let log = |m: String| {
+        tracing::info!("{m}");
+        if let Some(f) = &user.log {
+            f(&m);
+        }
+    };
+    let previous = reencode_override();
+    let load_as = |policy: ReencodePolicy, ffn_only: bool| {
+        set_reencode_override(Some(ReencodeConfig {
+            policy,
+            ffn_only,
+            ..user.clone()
+        }));
+        reset_native_stats();
+        load_native_once(artifacts, mode)
+    };
+    let mut reference: Option<Arc<dyn NativeLm>> = None;
+    let mut result = None;
+    for &(label, policy, ffn_only) in attempts {
+        let Some(loaded) = load_as(policy, ffn_only) else {
+            result = None; // not a native architecture: the GraphLm path applies its own policy
+            break;
+        };
+        let cand = match loaded {
+            Ok(c) => c,
+            Err(e) => {
+                result = Some(Err(e));
+                break;
+            }
+        };
+        let stats = native_stats();
+        let saved = stats.bytes_before.saturating_sub(stats.bytes_after);
+        if policy == BitExact || stats.reencoded == 0 {
+            set_native_applied(
+                if stats.reencoded == 0 {
+                    BitExact
+                } else {
+                    policy
+                },
+                saved,
+            );
+            if stats.reencoded > 0 || user.policy != BitExact {
+                log(format!(
+                    "reencode: {label} applied ({} of {} tensors re-encoded)",
+                    stats.reencoded, stats.tensors
+                ));
+            }
+            result = Some(Ok(cand));
+            break;
+        }
+        if reference.is_none() {
+            match load_as(BitExact, false) {
+                Some(Ok(r)) => reference = Some(r),
+                other => {
+                    log(format!(
+                        "reencode: no bit-exact reference to gate against ({}); using bit-exact",
+                        other.and_then(Result::err).unwrap_or_default()
+                    ));
+                    result = other_exact(&load_as);
+                    break;
+                }
+            }
+        }
+        // `load_as(BitExact)` above reset the stats: the candidate's own were read first.
+        let gate = native_kl_gate(reference.as_deref().expect("loaded above"), &*cand);
+        match gate {
+            Ok(r) if gate_passes(policy, user.max_kl, &r) => {
+                log(format!(
+                    "reencode: {label} accepted (mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
+                    r.mean_kl, r.top1 * 100.0, stats.reencoded, saved as f64 / 1e6
+                ));
+                set_native_applied(policy, saved);
+                result = Some(Ok(cand));
+                break;
+            }
+            Ok(r) => log(format!(
+                "reencode: {label} rejected (mean KL {:.4} nats, top-1 {:.1}%)",
+                r.mean_kl,
+                r.top1 * 100.0
+            )),
+            Err(e) => {
+                log(format!("reencode: gate unavailable ({e}); using bit-exact"));
+                result = other_exact(&load_as);
+                break;
+            }
+        }
+    }
+    set_reencode_override(previous);
+    result
+}
+
+/// The bit-exact load, as the last resort when the gate cannot run.
+fn other_exact(
+    load_as: &dyn Fn(
+        crate::model::weight_format::ReencodePolicy,
+        bool,
+    ) -> Option<Result<Arc<dyn NativeLm>, String>>,
+) -> Option<Result<Arc<dyn NativeLm>, String>> {
+    let r = load_as(crate::model::weight_format::ReencodePolicy::BitExact, false);
+    crate::model::reencode::set_native_applied(
+        crate::model::weight_format::ReencodePolicy::BitExact,
+        0,
+    );
+    r
+}
+
+/// One load of a native model under whatever re-encode configuration is currently in effect.
+fn load_native_once(
+    artifacts: &ModelArtifacts,
+    mode: PlacementMode,
+) -> Option<Result<Arc<dyn NativeLm>, String>> {
     if let Some(r) = crate::model::qwen3_5::load_gguf(artifacts, mode)
         .or_else(|| crate::model::qwen3_5::load_ninfer(artifacts, mode))
     {

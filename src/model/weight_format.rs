@@ -11,9 +11,9 @@
 use crate::hardware::{default_cache_dir, Device, HardwareCapability, QuantMode};
 use crate::model::graph_lm::{projection_formats, requantized, GraphLm, LayerKVCache};
 use crate::model::hf_loader::{load_causal_lm, open_causal_lm};
-use crate::model::reencode::{self, Encoder, Mode, ReencodeProgress, ReencodeReport};
 use crate::model::hub::ModelArtifacts;
 use crate::model::layers::QuantizedLinearLayer;
+use crate::model::reencode::{self, Encoder, Mode, ReencodeProgress, ReencodeReport};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -209,6 +209,8 @@ pub struct ReencodeConfig {
     pub progress: Option<Arc<ReencodeProgress>>,
     /// Receives every `reencode: ...` log line (the CLI routes it to its telemetry log).
     pub log: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Native loaders: only feed-forward projections are re-encoded (the second gate attempt).
+    pub ffn_only: bool,
 }
 
 impl Default for ReencodeConfig {
@@ -219,8 +221,23 @@ impl Default for ReencodeConfig {
             cache_dir: default_cache_dir().ok(),
             progress: None,
             log: None,
+            ffn_only: false,
         }
     }
+}
+
+/// The configuration loaders use instead of the settings file when set ([`set_reencode_override`]).
+static OVERRIDE: parking_lot::RwLock<Option<ReencodeConfig>> = parking_lot::RwLock::new(None);
+
+/// Pins the re-encode configuration every loader (GraphLm and native) reads through
+/// [`ReencodeConfig::effective`]; `None` returns to the settings file.
+pub fn set_reencode_override(c: Option<ReencodeConfig>) {
+    *OVERRIDE.write() = c;
+}
+
+/// The pinned configuration, if any (to restore after a temporary override).
+pub fn reencode_override() -> Option<ReencodeConfig> {
+    OVERRIDE.read().clone()
 }
 
 impl ReencodeConfig {
@@ -232,6 +249,11 @@ impl ReencodeConfig {
             max_kl: s.reencode_max_kl.map(f64::from),
             ..Self::default()
         }
+    }
+
+    /// The override ([`set_reencode_override`]) when set, else the settings file.
+    pub fn effective() -> Self {
+        OVERRIDE.read().clone().unwrap_or_else(Self::from_settings)
     }
 
     /// CLI flags (`--reencode`, `--reencode-max-kl`) over the settings file.
@@ -255,7 +277,13 @@ pub fn load_causal_lm_for(
     quant_override: Option<QuantMode>,
     hw: &HardwareCapability,
 ) -> Result<(GraphLm, Choice), String> {
-    load_causal_lm_with(artifacts, backend, quant_override, hw, &ReencodeConfig::from_settings())
+    load_causal_lm_with(
+        artifacts,
+        backend,
+        quant_override,
+        hw,
+        &ReencodeConfig::effective(),
+    )
 }
 
 /// [`load_causal_lm_for`] with an explicit re-encode configuration.
@@ -297,7 +325,13 @@ pub fn load_causal_lm_with(
         return load_without_f32(artifacts, backend, params, total);
     }
     let mut llm = load_causal_lm(artifacts, QuantMode::Uncompressed)?;
-    let choice = choose(&llm, &model_key(artifacts), backend, hw, reencode.cache_dir.as_deref());
+    let choice = choose(
+        &llm,
+        &model_key(artifacts),
+        backend,
+        hw,
+        reencode.cache_dir.as_deref(),
+    );
     if choice.mode != QuantMode::Uncompressed {
         llm.quantize(choice.mode);
     }
@@ -315,7 +349,9 @@ fn gate_limits(policy: ReencodePolicy, max_kl: Option<f64>) -> (f64, f64) {
 
 /// Whether a checkpoint tensor is a gather table (never streamed as a matrix).
 fn gathered(name: &str) -> bool {
-    ["embd", "embed", "wte", "wpe"].iter().any(|s| name.contains(s))
+    ["embd", "embed", "wte", "wpe"]
+        .iter()
+        .any(|s| name.contains(s))
 }
 
 fn load_metal(
@@ -326,7 +362,10 @@ fn load_metal(
     let src = open_causal_lm(artifacts, QuantMode::Uncompressed)?;
     let threads = hw
         .performance_cores
-        .map_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()), |c| c as usize)
+        .map_or_else(
+            || std::thread::available_parallelism().map_or(2, |n| n.get()),
+            |c| c as usize,
+        )
         .saturating_sub(1)
         .max(1);
     let log = |m: String| {
@@ -336,7 +375,9 @@ fn load_metal(
         }
     };
     let progress = cfg.progress.clone().unwrap_or_default();
-    progress.total.store(src.projection_count(), std::sync::atomic::Ordering::Relaxed);
+    progress
+        .total
+        .store(src.projection_count(), std::sync::atomic::Ordering::Relaxed);
     let key = artifacts
         .weights_path
         .as_deref()
@@ -369,8 +410,15 @@ fn load_metal(
             let enc = Encoder::new(Mode::Cache(Arc::new(reader)), threads, None);
             let llm = src.build(Some(&enc))?;
             if !enc.cache_miss.load(std::sync::atomic::Ordering::Relaxed) {
-                log(format!("reencode: cache hit ({}), gate: {}", report.applied, report.gate));
-                let t = trial(format!("cached: {}", report.gate), report.mean_kl, report.top1);
+                log(format!(
+                    "reencode: cache hit ({}), gate: {}",
+                    report.applied, report.gate
+                ));
+                let t = trial(
+                    format!("cached: {}", report.gate),
+                    report.mean_kl,
+                    report.top1,
+                );
                 return Ok(done(llm, report, vec![t]));
             }
             let (bin, json) = reencode::cache_paths(dir, k);
@@ -379,10 +427,21 @@ fn load_metal(
         }
     }
 
-    let mut report = ReencodeReport { requested: cfg.policy.name().into(), ..Default::default() };
+    let mut report = ReencodeReport {
+        requested: cfg.policy.name().into(),
+        ..Default::default()
+    };
     let policy_encoder = |policy, ffn_only, rmse_limit| {
         progress.done.store(0, std::sync::atomic::Ordering::Relaxed);
-        Encoder::new(Mode::Policy { policy, ffn_only, rmse_limit }, threads, Some(progress.clone()))
+        Encoder::new(
+            Mode::Policy {
+                policy,
+                ffn_only,
+                rmse_limit,
+            },
+            threads,
+            Some(progress.clone()),
+        )
     };
     let file_bytes = artifacts
         .weights_path
@@ -401,11 +460,21 @@ fn load_metal(
                 && !matches!(crate::model::repack::repack(m, data, &t.name), Ok(Some(_)))
         })
     });
-    let too_big = hw.total_memory_bytes.is_some_and(|ram| file_bytes > ram / 2);
+    let too_big = hw
+        .total_memory_bytes
+        .is_some_and(|ram| file_bytes > ram / 2);
 
     // Per-tensor gate: no source program to compare against.
     if codec_less || too_big {
-        let why = if codec_less { "a source tensor has no GPU codec" } else { "source exceeds 50% RAM" };
+        let why = if codec_less {
+            "a source tensor has no GPU codec".to_string()
+        } else {
+            format!(
+                "source {:.1} GB > 50% of {:.1} GB RAM",
+                file_bytes as f64 / 1e9,
+                hw.total_memory_bytes.unwrap_or(0) as f64 / 1e9
+            )
+        };
         log(format!("reencode gate: per-tensor ({why})"));
         log(format!(
             "re-encoding for this GPU ({}): {} tensors",
@@ -450,20 +519,25 @@ fn load_metal(
         let enc = policy_encoder(policy, ffn_only, None);
         let llm = src.build(Some(&enc))?;
         let records = enc.records();
-        let finish = |mut report: ReencodeReport, gate: String, kl, top1, mut trials: Vec<Trial>| {
-            report.applied = label.into();
-            report.gate = gate.clone();
-            (report.mean_kl, report.top1) = (kl, top1);
-            report.from_records(&records);
-            trials.push(trial(format!("{label}: {gate}"), kl, top1));
-            write_cache_entry(cfg, key, &llm, &report);
-            (report, trials)
-        };
+        let finish =
+            |mut report: ReencodeReport, gate: String, kl, top1, mut trials: Vec<Trial>| {
+                report.applied = label.into();
+                report.gate = gate.clone();
+                (report.mean_kl, report.top1) = (kl, top1);
+                report.from_records(&records);
+                trials.push(trial(format!("{label}: {gate}"), kl, top1));
+                write_cache_entry(cfg, key, &llm, &report);
+                (report, trials)
+            };
         // Native storage everywhere (or the last resort) needs no gate.
         let lossy = records.iter().any(|r| r.lossy);
         if policy == ReencodePolicy::BitExact || !lossy {
             report.attempts.push(format!("{label}: nothing re-encoded"));
-            let gate = if lossy { "bit-exact (fallback)" } else { "bit-exact" };
+            let gate = if lossy {
+                "bit-exact (fallback)"
+            } else {
+                "bit-exact"
+            };
             let (r, t) = finish(report, gate.into(), None, None, trials);
             log(format!("reencode: {label} applied ({gate})"));
             return Ok(done(llm, r, t));
@@ -477,8 +551,18 @@ fn load_metal(
         let (tokens, ref_logp) = reference.as_ref().expect("set above");
         let cand = gpu_logprobs(&llm, tokens)?;
         let n = tokens.len() as f64;
-        let kl = ref_logp.iter().zip(&cand).map(|(p, q)| kl_divergence(p, q)).sum::<f64>() / n;
-        let top1 = ref_logp.iter().zip(&cand).filter(|(p, q)| argmax(p) == argmax(q)).count() as f64 / n;
+        let kl = ref_logp
+            .iter()
+            .zip(&cand)
+            .map(|(p, q)| kl_divergence(p, q))
+            .sum::<f64>()
+            / n;
+        let top1 = ref_logp
+            .iter()
+            .zip(&cand)
+            .filter(|(p, q)| argmax(p) == argmax(q))
+            .count() as f64
+            / n;
         let (kl_limit, top1_floor) = gate_limits(policy, cfg.max_kl);
         let gate = format!("mean KL {kl:.4} nats, top-1 {:.1}%", top1 * 100.0);
         // Negated so a NaN KL (non-finite logits) is rejected too.
@@ -494,12 +578,21 @@ fn load_metal(
             top1 * 100.0
         ));
         report.attempts.push(format!("{label}: {gate}, rejected"));
-        trials.push(trial(format!("{label}: {gate}, rejected (limits KL {kl_limit}, top-1 {top1_floor})"), Some(kl), Some(top1)));
+        trials.push(trial(
+            format!("{label}: {gate}, rejected (limits KL {kl_limit}, top-1 {top1_floor})"),
+            Some(kl),
+            Some(top1),
+        ));
     }
     unreachable!("the last attempt (bit-exact) always returns")
 }
 
-fn write_cache_entry(cfg: &ReencodeConfig, key: Option<u64>, llm: &GraphLm, report: &ReencodeReport) {
+fn write_cache_entry(
+    cfg: &ReencodeConfig,
+    key: Option<u64>,
+    llm: &GraphLm,
+    report: &ReencodeReport,
+) {
     if let (Some(dir), Some(k)) = (&cfg.cache_dir, key) {
         if let Err(e) = reencode::write_cache(dir, k, llm, report) {
             tracing::warn!("reencode: cache not written: {e}");
@@ -892,6 +985,69 @@ fn argmax(v: &[f32]) -> usize {
         .0
 }
 
+/// Result of comparing a candidate model's next-token distributions with the source model's.
+#[derive(Debug, Clone, Copy)]
+pub struct GateReport {
+    pub mean_kl: f64,
+    pub top1: f64,
+    pub tokens: usize,
+}
+
+/// Teacher-forces [`PROBE_TEXT`] one token at a time through `source` and `candidate` (both on
+/// Metal) and compares the next-token distributions: mean KL(source ‖ candidate) in nats and top-1
+/// agreement, over the same positions the GraphLm gate uses.
+pub fn native_kl_gate(
+    source: &dyn crate::model::native::NativeLm,
+    candidate: &dyn crate::model::native::NativeLm,
+) -> Result<GateReport, String> {
+    let tok = source.tokenizer();
+    let vocab = tok.vocab_size().max(1) as u32;
+    let mut ids = tok.encode(PROBE_TEXT);
+    if ids.is_empty() {
+        ids = (1..=PROBE_TOKENS as u32).collect();
+    }
+    let n = PROBE_TOKENS
+        .min(source.context_len().min(candidate.context_len()))
+        .max(2);
+    let tokens: Vec<u32> = ids.iter().cycle().take(n).map(|t| t % vocab).collect();
+    let run = |m: &dyn crate::model::native::NativeLm| -> Result<Vec<Vec<f32>>, String> {
+        let (_, mut state) = m.prepare(vec![tokens[0]], &[])?;
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, &t)| {
+                let logits = m.forward(&[t], pos, &mut state)?;
+                Ok(log_softmax(&logits[..logits.len().min(vocab as usize)]))
+            })
+            .collect()
+    };
+    let (want, got) = (run(source)?, run(candidate)?);
+    let nf = n as f64;
+    let mean_kl = want
+        .iter()
+        .zip(&got)
+        .map(|(p, q)| kl_divergence(p, q))
+        .sum::<f64>()
+        / nf;
+    let top1 = want
+        .iter()
+        .zip(&got)
+        .filter(|(p, q)| argmax(p) == argmax(q))
+        .count() as f64
+        / nf;
+    Ok(GateReport {
+        mean_kl,
+        top1,
+        tokens: n,
+    })
+}
+
+/// Whether a gate result passes the policy's limits (a NaN KL never does).
+pub fn gate_passes(policy: ReencodePolicy, max_kl: Option<f64>, r: &GateReport) -> bool {
+    let (kl_limit, top1_floor) = gate_limits(policy, max_kl);
+    r.mean_kl <= kl_limit && r.top1 >= top1_floor
+}
+
 fn file_stamp(m: &std::fs::Metadata) -> String {
     let mtime = m
         .modified()
@@ -929,13 +1085,15 @@ mod tests {
 
     fn smollm_artifacts() -> Option<ModelArtifacts> {
         let dir = Path::new("disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main");
-        dir.join("model.safetensors").exists().then(|| ModelArtifacts {
-            model_id: "HuggingFaceTB/SmolLM2-135M-Instruct".into(),
-            config_path: Some(dir.join("config.json")),
-            tokenizer_path: Some(dir.join("tokenizer.json")),
-            weights_path: Some(dir.join("model.safetensors")),
-            ..Default::default()
-        })
+        dir.join("model.safetensors")
+            .exists()
+            .then(|| ModelArtifacts {
+                model_id: "HuggingFaceTB/SmolLM2-135M-Instruct".into(),
+                config_path: Some(dir.join("config.json")),
+                tokenizer_path: Some(dir.join("tokenizer.json")),
+                weights_path: Some(dir.join("model.safetensors")),
+                ..Default::default()
+            })
     }
 
     /// A Metal-placed load applies the re-encode policy (gated on Metal) and never runs the CPU
@@ -955,22 +1113,41 @@ mod tests {
             progress: Some(progress.clone()),
             log: None,
         };
-        let artifacts = ModelArtifacts { model_id: "gibbs/smollm-1m".into(), ..Default::default() };
+        let artifacts = ModelArtifacts {
+            model_id: "gibbs/smollm-1m".into(),
+            ..Default::default()
+        };
         let hw = HardwareCapability::probe_system();
-        let (llm, choice) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
+        let (llm, choice) =
+            load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
 
-        assert!(host_weight_caches(tmp.path()).is_empty(), "Metal load wrote a CPU format-probe cache");
-        assert!(!tmp.path().join("host").exists(), "Metal load touched the CPU probe cache dir");
-        let r = choice.reencode.clone().expect("a Metal load reports its re-encode");
+        assert!(
+            host_weight_caches(tmp.path()).is_empty(),
+            "Metal load wrote a CPU format-probe cache"
+        );
+        assert!(
+            !tmp.path().join("host").exists(),
+            "Metal load touched the CPU probe cache dir"
+        );
+        let r = choice
+            .reencode
+            .clone()
+            .expect("a Metal load reports its re-encode");
         assert!(!r.attempts.is_empty() && !r.applied.is_empty(), "{r:?}");
         assert!(choice.summary().starts_with(&r.applied));
         // 4 layers x 4 projections + LM head, every one counted
-        assert_eq!(progress.total.load(std::sync::atomic::Ordering::Relaxed), 17);
+        assert_eq!(
+            progress.total.load(std::sync::atomic::Ordering::Relaxed),
+            17
+        );
         assert_eq!(progress.done.load(std::sync::atomic::Ordering::Relaxed), 17);
         assert_eq!(r.tensors, 17);
         // whatever the gate kept, the model is an f32-free GPU model unless it fell back to bit-exact
         if r.applied != "bit-exact" {
-            assert_ne!(llm.lm_head.quant_format(), crate::hardware::QuantFormat::FP32);
+            assert_ne!(
+                llm.lm_head.quant_format(),
+                crate::hardware::QuantFormat::FP32
+            );
         }
     }
 
@@ -984,20 +1161,38 @@ mod tests {
             eprintln!("SKIP: SmolLM2-135M-Instruct not cached in disk/");
             return;
         };
-        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal) {
+        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal)
+        {
             return;
         }
         let src = open_causal_lm(&artifacts, QuantMode::Uncompressed).unwrap();
-        let enc = Encoder::new(Mode::Policy { policy: ReencodePolicy::MaxSpeed, ffn_only: false, rmse_limit: None }, 4, None);
+        let enc = Encoder::new(
+            Mode::Policy {
+                policy: ReencodePolicy::MaxSpeed,
+                ffn_only: false,
+                rmse_limit: None,
+            },
+            4,
+            None,
+        );
         let cand = src.build(Some(&enc)).unwrap();
-        let formats: std::collections::BTreeSet<_> = enc.records().iter().map(|r| r.stored.name()).collect();
+        let formats: std::collections::BTreeSet<_> =
+            enc.records().iter().map(|r| r.stored.name()).collect();
         eprintln!("stored formats: {formats:?}");
         let tokens = probe_tokens(&cand);
         let (cpu, _) = reference_probe(&cand, &tokens);
         let gpu = gpu_logprobs(&cand, &tokens).unwrap();
-        let kl = cpu.iter().zip(&gpu).map(|(p, q)| kl_divergence(p, q)).sum::<f64>() / tokens.len() as f64;
+        let kl = cpu
+            .iter()
+            .zip(&gpu)
+            .map(|(p, q)| kl_divergence(p, q))
+            .sum::<f64>()
+            / tokens.len() as f64;
         eprintln!("CPU vs GPU on the re-encoded model: mean KL {kl:.6}");
-        assert!(kl < 1e-3, "GPU and CPU disagree on identical weights: KL {kl}");
+        assert!(
+            kl < 1e-3,
+            "GPU and CPU disagree on identical weights: KL {kl}"
+        );
     }
 
     /// Control for the test above: a CPU load does measure formats and writes the probe cache into the
@@ -1005,8 +1200,14 @@ mod tests {
     #[test]
     fn cpu_load_writes_the_format_probe_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let cfg = ReencodeConfig { cache_dir: Some(tmp.path().to_path_buf()), ..Default::default() };
-        let artifacts = ModelArtifacts { model_id: "gibbs/smollm-1m".into(), ..Default::default() };
+        let cfg = ReencodeConfig {
+            cache_dir: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        };
+        let artifacts = ModelArtifacts {
+            model_id: "gibbs/smollm-1m".into(),
+            ..Default::default()
+        };
         let hw = HardwareCapability::probe_system();
         load_causal_lm_with(&artifacts, Device::Cpu, None, &hw, &cfg).unwrap();
         assert_eq!(host_weight_caches(tmp.path()).len(), 1);
@@ -1021,7 +1222,8 @@ mod tests {
             eprintln!("SKIP: SmolLM2-135M-Instruct not cached in disk/");
             return;
         };
-        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal) {
+        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal)
+        {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -1042,7 +1244,11 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(entries.iter().any(|n| n.ends_with(".bin")) && entries.iter().any(|n| n.ends_with(".json")), "{entries:?}");
+        assert!(
+            entries.iter().any(|n| n.ends_with(".bin"))
+                && entries.iter().any(|n| n.ends_with(".json")),
+            "{entries:?}"
+        );
         assert!(!entries.iter().any(|n| n.ends_with(".tmp")), "{entries:?}");
 
         let (second, c2) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
@@ -1050,7 +1256,10 @@ mod tests {
         assert!(c2.reencode.as_ref().unwrap().cache_hit);
         assert_eq!(c2.reencode.as_ref().unwrap().applied, r1.applied);
         let tokens = probe_tokens(&first);
-        assert_eq!(gpu_logprobs(&first, &tokens).unwrap(), gpu_logprobs(&second, &tokens).unwrap());
+        assert_eq!(
+            gpu_logprobs(&first, &tokens).unwrap(),
+            gpu_logprobs(&second, &tokens).unwrap()
+        );
         assert!(host_weight_caches(tmp.path()).is_empty());
     }
 
@@ -1062,7 +1271,8 @@ mod tests {
             eprintln!("SKIP: SmolLM2-135M-Instruct not cached in disk/");
             return;
         };
-        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal) {
+        if cfg!(debug_assertions) || !crate::hardware::available_devices().contains(&Device::Metal)
+        {
             return;
         }
         let cfg = ReencodeConfig {
@@ -1077,7 +1287,11 @@ mod tests {
         let r = c.reencode.clone().unwrap();
         eprintln!("{}", c.summary());
         assert_eq!(r.applied, "bit-exact", "{r:?}");
-        assert_eq!(r.attempts.iter().filter(|a| a.contains("rejected")).count(), 3, "{r:?}");
+        assert_eq!(
+            r.attempts.iter().filter(|a| a.contains("rejected")).count(),
+            3,
+            "{r:?}"
+        );
     }
 
     use crate::model::graph_lm::GraphLmConfig;
@@ -1174,7 +1388,10 @@ mod tests {
         assert_eq!(argmax(&q.forward(&ids)), argmax(&f.forward(&ids)));
         // On Metal the same model loads through the policy with the per-tensor gate (its source
         // program would not fit), never as f32.
-        let cfg = ReencodeConfig { cache_dir: None, ..Default::default() };
+        let cfg = ReencodeConfig {
+            cache_dir: None,
+            ..Default::default()
+        };
         let (m, choice) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
         let r = choice.reencode.unwrap();
         assert!(r.gate.starts_with("per-tensor RMSE"), "{r:?}");
@@ -1184,7 +1401,10 @@ mod tests {
         #[cfg(target_os = "macos")]
         if crate::hardware::available_devices().contains(&Device::Metal) {
             let last = |lp: Vec<Vec<f32>>| argmax(lp.last().unwrap());
-            assert_eq!(last(gpu_logprobs(&m, &ids).unwrap()), last(gpu_logprobs(&f, &ids).unwrap()));
+            assert_eq!(
+                last(gpu_logprobs(&m, &ids).unwrap()),
+                last(gpu_logprobs(&f, &ids).unwrap())
+            );
         }
     }
 }

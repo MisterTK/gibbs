@@ -566,6 +566,123 @@ fn carry(p: &Projection<'_>) -> Option<(Q, Vec<u8>)> {
     Some((f, out))
 }
 
+// ---- native loaders -------------------------------------------------------------------------
+
+/// What the native loaders did to their tensors since [`reset_native_stats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NativeStats {
+    /// Projection matrices considered.
+    pub tensors: usize,
+    /// Matrices re-encoded to another format (all lossy: the source blocks differ from the stored ones).
+    pub reencoded: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+static NATIVE_STATS: Mutex<NativeStats> = Mutex::new(NativeStats {
+    tensors: 0,
+    reencoded: 0,
+    bytes_before: 0,
+    bytes_after: 0,
+});
+
+pub fn reset_native_stats() {
+    *NATIVE_STATS.lock() = NativeStats::default();
+}
+
+pub fn native_stats() -> NativeStats {
+    *NATIVE_STATS.lock()
+}
+
+static NATIVE_APPLIED: Mutex<Option<(ReencodePolicy, u64)>> = Mutex::new(None);
+
+/// Records the policy the last native load ended up with and the bytes per token it saved.
+pub fn set_native_applied(policy: ReencodePolicy, saved_bytes: u64) {
+    *NATIVE_APPLIED.lock() = Some((policy, saved_bytes));
+}
+
+/// `(policy, bytes saved over the source blocks)` of the last native load that reached the gate.
+pub fn native_applied() -> Option<(ReencodePolicy, u64)> {
+    *NATIVE_APPLIED.lock()
+}
+
+/// Whether `name` (an HF-style tensor name) is a feed-forward projection.
+fn is_ffn_name(name: &str) -> bool {
+    ["mlp", "ffn", "feed_forward"]
+        .iter()
+        .any(|s| name.contains(s))
+}
+
+/// Gather tables (token / per-layer embeddings, which a tied head shares) keep their source blocks:
+/// a gathered row's precision is not a streaming cost.
+fn is_gather_table(name: &str) -> bool {
+    ["embed", "token_embd", "ple"]
+        .iter()
+        .any(|s| name.contains(s))
+}
+
+/// A native loader's `rows x cols` projection `name`, stored as `src` blocks in `raw`, under the
+/// effective policy `cfg`: `Some((format, blocks))` when the policy re-stores it in a faster format
+/// (the per-tensor RMSE gate bumps the format up the ladder until it passes), `None` to keep the
+/// source blocks.
+pub fn reencode_native(
+    cfg: &crate::model::weight_format::ReencodeConfig,
+    name: &str,
+    src: Q,
+    rows: usize,
+    cols: usize,
+    raw: &[u8],
+) -> Option<(Q, Vec<u8>)> {
+    if is_gather_table(name) || (cfg.ffn_only && !is_ffn_name(name)) {
+        return None;
+    }
+    let mut stats = NATIVE_STATS.lock();
+    stats.tensors += 1;
+    drop(stats);
+    let Target::Encode(f) = rule(cfg.policy, src) else {
+        return None;
+    };
+    let f = fit(f, cols, Q::FP32);
+    if f == src || !encodable(f) {
+        return None;
+    }
+    // The source's own decoder, so the values are exactly what the GPU would have read.
+    let (elems, block_bytes, decode) = gguf_block_codec(src)?;
+    if cols % elems != 0 || raw.len() != rows * cols / elems * block_bytes {
+        return None;
+    }
+    let mut data = vec![0.0f32; rows * cols];
+    for (b, out) in raw
+        .chunks_exact(block_bytes)
+        .zip(data.chunks_exact_mut(elems))
+    {
+        decode(b, out);
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .saturating_sub(1)
+        .max(1);
+    let (mut f, mut w) = (f, encode_weight(&data, cols, rows, f, threads));
+    let mut rmse = relative_rmse(&data, &w.to_f32());
+    while rmse > TENSOR_RMSE_LIMIT {
+        let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
+            break;
+        };
+        (f, w) = (next, encode_weight(&data, cols, rows, next, threads));
+        rmse = relative_rmse(&data, &w.to_f32());
+    }
+    let QuantizedWeight::GgufQuantized { raw_data, .. } = w else {
+        return None;
+    };
+    let mut stats = NATIVE_STATS.lock();
+    stats.reencoded += 1;
+    (stats.bytes_before, stats.bytes_after) = (
+        stats.bytes_before + raw.len() as u64,
+        stats.bytes_after + raw_data.len() as u64,
+    );
+    Some((f, raw_data.to_vec()))
+}
+
 // ---- cache ----------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
