@@ -397,7 +397,7 @@ const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
 const ATTN_MAX_HEAD_DIM: usize = 512;
 /// Decode attention splits its keys across threadgroups from this many visible keys, about
 /// `ATTN_SPLIT_KEYS` per slice and at most `ATTN_MAX_SPLITS` slices.
-const ATTN_SPLIT_MIN_KEYS: usize = 128;
+const ATTN_SPLIT_MIN_KEYS: usize = 48;
 const ATTN_SPLIT_KEYS: usize = 32;
 const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
