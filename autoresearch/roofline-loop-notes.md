@@ -212,3 +212,9 @@ minutes (thermal), giving noise_pp 5.6; per-model interleaving gives noise_pp ~0
 | XLA jax-metal | n/a | n/a | n/a |
 
 The two gibbs rows run the same plan (no F item landed), so 1.07 is the fixture's run-to-run noise (7 %). Weights in the block: 35.3 M f16 params = 70.6 MB = 226 us at the 313 GB/s ceiling.
+
+## Iteration 18 = F1 (keep): horizontal RmsNorm / Rope batching
+- `batch_horizontal` (metal.rs, run in `prepare_plan` after `plan()`): runs of <= 4 adjacent steps that read none of each other's outputs, RmsNorm without residual (any rows/d/eps) and Rope with identical pos/inv_freq/n_seq/head_dim/rotary_dim/pair_stride/mscale (any head count), become `RmsNormBatch` / `RopeBatch`: one kernel each (`rmsnorm_batch_f32`, `rope_batch_f32`), outputs 2.. in `Planned.extra_outs` (4.2). New class `FusionClass::HorizontalBatch`, Full only: the catalogued XLA revision has no horizontal-fusion pass (`xla-catalog.md`), `SiblingSameKind` stays reserved for identical-shape siblings.
+- E2B decode plan had q/k/v norms and q/k ropes already adjacent (no reordering needed): 3 + 2 dispatches -> 2 on the 15 layers with their own K/V, 672 -> 627 dispatches (-45), gpu_ms 7.83 -> 7.65 on the profile run (GIBBS_FUSION=xla vs full, same binary).
+- Verify: +0.33 pp (base 49.83 -> 50.16; machine in the fast state), noise 0.04, min ratio 0.998 (every model within +/-2.3 %); Guard pass. Expected 0.4 pp, got 0.33 (82 %). `horizontal_batches_match_cpu` covers three norms of different rows/eps, a dependent norm that must stay out, and two ropes of different head counts.
+- Plan deviation: the plan's F1 check expected >= 4 dispatches fewer per layer; E2B's 20 KV-shared layers have only q norm/rope, and the fixture has no v_norm, so the real saving is 3 per own-KV layer (fixture: 2 per block).
