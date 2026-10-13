@@ -4669,9 +4669,15 @@ mod tests {
     #[ignore = "bandwidth measurement"]
     fn generated_gemv_bandwidth() {
         use crate::model::layers::{gguf_block_codec, QuantizedWeight};
-        for f in [QuantFormat::GGUF_TQ2_0, QuantFormat::GGUF_Q6_K, QuantFormat::GGUF_Q5_K_M] {
+        for f in [
+            QuantFormat::GGUF_TQ2_0,
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q8_0,
+            QuantFormat::GGUF_Q6_K,
+            QuantFormat::GGUF_Q5_K_M,
+        ] {
             let (be, bb, _) = gguf_block_codec(f).unwrap();
-            for (n, k) in [(262144usize, 1536usize), (262144, 2560), (14336, 4096)] {
+            for (n, k) in [(262144usize, 1536usize), (6144, 1536), (1536, 6144), (14336, 4096)] {
                 let raw = vec![0u8; n * (k / be) * bb];
                 let bytes = raw.len();
                 let mut g = Graph::new();
@@ -4692,11 +4698,12 @@ mod tests {
                 let s = Session::new(rt(), &w).unwrap();
                 let xs = Tensor::F32(vec![0.5; k]);
                 s.run(&g, vec![xs.clone()]).unwrap();
-                let t = Instant::now();
+                // GPU-side time of the command buffer (host copy-in/out excluded).
+                let mut dt = 0.0;
                 for _ in 0..20 {
                     s.run(&g, vec![xs.clone()]).unwrap();
+                    dt += s.last_gpu_seconds() / 20.0;
                 }
-                let dt = t.elapsed().as_secs_f64() / 20.0;
                 println!(
                     "{f:?} {n}x{k}: {:.0} us, {:.1} GB/s",
                     dt * 1e6,
