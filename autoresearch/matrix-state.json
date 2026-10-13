@@ -54,5 +54,19 @@
   "roofline_pct": null,
   "attempts": 1,
   "error": "curl download failed for https://huggingface.co/unsloth/SmolLM2-135M-bnb-4bit/resolve/main/model.safetensors (exit code None):  (check the repo id exists on huggingface.co and HF_TOKEN for gated repos)"
+ },
+ "unsloth/SmolLM2-135M-Instruct-bnb-4bit": {
+  "last_commit": "089ba2d",
+  "last_status": "ok",
+  "roofline_pct": 18.299789598264095,
+  "attempts": 1,
+  "error": ""
+ },
+ "unsloth/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q5_K_M.gguf": {
+  "last_commit": "d2e38cd",
+  "last_status": "ok",
+  "roofline_pct": 19.42343807936725,
+  "attempts": 1,
+  "error": ""
  }
 }
