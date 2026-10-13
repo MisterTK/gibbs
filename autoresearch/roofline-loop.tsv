@@ -3,3 +3,4 @@ iteration	timestamp	commit	base_pct	cand_pct	delta_pp	noise_pp	e2b_tok_s	guard	s
 0n2	2026-10-13T03:27:00Z	7b3a277	31.75	31.92	0.18	5.60	75.9	n/a	infra	n/a	noise floor after metric fixes (decode-token count, native byte basis, shared cache dir)	0	-	-
 0n3	2026-10-13T03:34:53Z	09a3005	31.68	31.60	-0.07	0.22	78.0	n/a	infra	n/a	noise floor, per-model ABBA verify (base binary vs itself)	0	-	-
 1.1-1.5	2026-10-13T04:58:23Z	a1690f5	35.60	37.54	1.94	2.24	82.95	n/a	infra	n/a	1.1 tuner + shared Runtime + 1.2 native re-encode (fixed Q4_K->Q5_K bump) + 1.3 repacks + 1.5 batched prefill (decode path unchanged)	0	-	-
+p2-1.4	2026-10-13T06:05:53Z	dc50b7b	30.50	27.01	-3.49	0.60	83.38	n/a	infra	n/a	TUI pass + MoE ops + batched prefill merge. tok/s ratios 0.98-1.05 on all models; delta_pp is a metric correction (bench bytes now use the applied policy: E2B QAT 1.28 GB -> 0.84 GB per token), not a speed change	0	-	-
