@@ -589,12 +589,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let artifacts = artifacts
             .as_ref()
             .expect("artifacts are resolved unless --system1 or a classifier");
-        let model_size = artifacts
-            .weights_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
+            gibbs_engine::model::variant::decode_bytes_per_token(
+                p,
+                gibbs_engine::model::variant::reencode_policy(),
+            )
+        });
         telemetry.set_model_size_bytes(model_size);
         let model_exec = match load_native(artifacts, placement) {
             Some(native) => {

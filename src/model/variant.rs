@@ -216,6 +216,14 @@ impl WeightHeader {
         }
     }
 
+    /// Bytes one decode step streams from memory under `policy`: the streamed matrices after
+    /// re-encoding (MoE expert banks scaled by the used fraction); gathered tables are excluded.
+    pub fn streamed_bytes_per_token(&self, policy: ReencodePolicy) -> u64 {
+        self.streamed()
+            .map(|t| (Self::after(policy, t).1 as f64 * self.scale(t)) as u64)
+            .sum()
+    }
+
     /// Bytes in memory once loaded under `policy` (gathered tables keep their source format).
     pub fn resident_bytes(&self, policy: ReencodePolicy) -> u64 {
         let streamed: std::collections::HashSet<*const HeaderTensor> =
@@ -414,6 +422,17 @@ pub fn read_header(
         }
     }
     Err(format!("GGUF header exceeds {} MiB", SECOND_FETCH >> 20))
+}
+
+/// Bytes one decode step streams for the checkpoint at `path` (matrices after `policy`; gathered
+/// tables excluded), the roofline numerator. The file size when its header cannot be read.
+pub fn decode_bytes_per_token(path: &Path, policy: ReencodePolicy) -> u64 {
+    read_local_header(path)
+        .ok()
+        .map(|h| h.streamed_bytes_per_token(policy))
+        .filter(|&b| b > 0)
+        .or_else(|| std::fs::metadata(path).ok().map(|m| m.len()))
+        .unwrap_or(0)
 }
 
 /// The header of a local weights file.

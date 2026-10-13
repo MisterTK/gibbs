@@ -59,6 +59,8 @@ pub struct ModelBenchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec_mix: Option<String>,
     pub bytes_per_token: u64,
+    /// `streamed` (matrices a decode step reads) or `file` (whole checkpoint; overstates).
+    pub bytes_basis: &'static str,
     pub ceiling_gbps: f64,
     pub decode_tok_s: f64,
     pub roofline_tok_s: f64,
@@ -199,8 +201,13 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         let median_speed = speeds[speeds.len() / 2];
         let median_gpu_ms = gpu_times[gpu_times.len() / 2];
 
-        let ceiling_gbps = crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps;
-        let bytes_per_token = artifacts
+        // Measured streaming ceiling of this GPU (host profile), not the spec-sheet figure.
+        let ceiling_gbps = crate::graph::metal::Runtime::new(
+            &crate::model::hub::HuggingFaceHub::cache_dir(),
+        )
+        .map(|rt| rt.profile().ceiling_gbps)
+        .unwrap_or_else(|_| crate::hardware::HardwareProfile::detect().memory_bandwidth_gbps);
+        let file_bytes = artifacts
             .weights_path
             .as_ref()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -218,6 +225,24 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 })
             })
             .unwrap_or(0);
+        // Roofline numerator: bytes a decode step streams (matrices after the re-encode policy;
+        // embedding/PLE gather tables excluded). File size only when no header can be read.
+        let policy = model_cfg
+            .reencode
+            .as_ref()
+            .unwrap_or(&defaults.reencode)
+            .parse()
+            .unwrap_or_default();
+        let streamed = artifacts
+            .weights_path
+            .as_ref()
+            .and_then(|p| crate::model::variant::read_local_header(p).ok())
+            .map(|h| h.streamed_bytes_per_token(policy))
+            .filter(|&b| b > 0);
+        let (bytes_per_token, bytes_basis) = match streamed {
+            Some(b) => (b, "streamed"),
+            None => (file_bytes, "file"),
+        };
         let roofline_tok_s = if bytes_per_token > 0 {
             ceiling_gbps / (bytes_per_token as f64 / 1e9)
         } else {
@@ -258,6 +283,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
             file: file_str,
             codec_mix: None,
             bytes_per_token,
+            bytes_basis,
             ceiling_gbps,
             decode_tok_s: median_speed,
             roofline_tok_s,
