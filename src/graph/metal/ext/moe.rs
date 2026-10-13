@@ -383,19 +383,27 @@ fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, Strin
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
-    let params = GemvParams { rows_per_sg: ROWS_PER_SG, ..Default::default() };
-    let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{}", gemv_indexed(c, params));
+    let params = GemvParams {
+        rows_per_sg: ROWS_PER_SG,
+        ..Default::default()
+    };
+    let src = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n{}",
+        gemv_indexed(c, params)
+    );
     let opts = CompileOptions::new();
     opts.set_fast_math_enabled(false);
-    let lib = device
-        .new_library_with_source(&src, &opts)
-        .map_err(|e| format!("generated {:?} expert GEMV failed to compile: {e}", c.format))?;
+    let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
+        format!(
+            "generated {:?} expert GEMV failed to compile: {e}",
+            c.format
+        )
+    })?;
     let func = lib.get_function(&gemv_indexed_name(c, params), None)?;
     let pso = device.new_compute_pipeline_state_with_function(&func)?;
     MOE_GEMV.lock().insert(key, pso.clone());
     Ok(pso)
 }
-
 
 pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<(), String> {
     let (enc, rt) = (e.enc, &sess.rt);
@@ -407,16 +415,39 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             set_bytes(enc, 2, &[u32_of(*rows)?, u32_of(*cols)?, u32_of(*k)?]);
             enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
         }
-        Step::GatherCols { x, idx, total, cols, k, shared } => {
+        Step::GatherCols {
+            x,
+            idx,
+            total,
+            cols,
+            k,
+            shared,
+        } => {
             enc.set_compute_pipeline_state(rt.pso("moe_gather_cols_f32")?);
             e.bind(0, *x);
             e.bind(1, *idx);
             e.bind(2, s.out);
-            set_bytes(enc, 3, &[u32_of(*total)?, u32_of(*cols)?, u32_of(*k)?, *shared as u32]);
+            set_bytes(
+                enc,
+                3,
+                &[u32_of(*total)?, u32_of(*cols)?, u32_of(*k)?, *shared as u32],
+            );
             e.grid1(*total);
         }
-        Step::ExpertLinear { x, bank, ids, dtype, rows, cols, slots, top_k, experts, x_per_slot } => {
-            let c = bank_codec(*dtype).ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
+        Step::ExpertLinear {
+            x,
+            bank,
+            ids,
+            dtype,
+            rows,
+            cols,
+            slots,
+            top_k,
+            experts,
+            x_per_slot,
+        } => {
+            let c = bank_codec(*dtype)
+                .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
             let pso = moe_gemv_pso(sess, c)?;
             enc.set_compute_pipeline_state(&pso);
             e.bind(0, *bank);
@@ -435,9 +466,16 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 ],
             );
             e.bind(4, *ids);
-            let rows_per_tg = gemv_rows_per_tg(GemvParams { rows_per_sg: ROWS_PER_SG, ..Default::default() });
+            let rows_per_tg = gemv_rows_per_tg(GemvParams {
+                rows_per_sg: ROWS_PER_SG,
+                ..Default::default()
+            });
             enc.dispatch_thread_groups(
-                MTLSize::new((*rows as u64).div_ceil(rows_per_tg as u64), *slots as u64, 1),
+                MTLSize::new(
+                    (*rows as u64).div_ceil(rows_per_tg as u64),
+                    *slots as u64,
+                    1,
+                ),
                 MTLSize::new(256, 1, 1),
             );
         }
@@ -645,7 +683,11 @@ mod tests {
     #[test]
     fn topk_orders_by_value_then_lower_index() {
         let (want, got) = topk_both(vec![1.0, 3.0, 3.0, 2.0, -0.0, 0.0, f32::NAN, 5.0], 2, 4, 3);
-        assert_eq!(want, vec![1, 2, 3, 3, 0, 1], "ties and signed zeros keep the lower index first");
+        assert_eq!(
+            want,
+            vec![1, 2, 3, 3, 0, 1],
+            "ties and signed zeros keep the lower index first"
+        );
         assert_eq!(got, want);
         // NaN ranks below every number: it is picked last even when k covers the whole row.
         let (want, got) = topk_both(vec![f32::NAN, 1.0, f32::NAN, 2.0], 1, 4, 4);
@@ -671,7 +713,11 @@ mod tests {
             // A handful of levels: most values tie.
             let tied: Vec<f32> = distinct.iter().map(|v| (v * 3.0).round()).collect();
             let constant = vec![0.5f32; rows * cols];
-            for (name, x) in [("distinct", distinct), ("tied", tied), ("constant", constant)] {
+            for (name, x) in [
+                ("distinct", distinct),
+                ("tied", tied),
+                ("constant", constant),
+            ] {
                 let (want, got) = topk_both(x, rows, cols, k);
                 assert_eq!(got, want, "topk {name} {rows}x{cols} k={k}");
             }
@@ -691,7 +737,9 @@ mod tests {
                 .run(&g, inputs.clone())
                 .unwrap_err();
             assert!(e.contains("tk"), "{e}");
-            assert!(cpu::run_stateless(&g, &Weights::new(), inputs).unwrap_err().contains("tk"));
+            assert!(cpu::run_stateless(&g, &Weights::new(), inputs)
+                .unwrap_err()
+                .contains("tk"));
         }
     }
 
@@ -709,7 +757,11 @@ mod tests {
             for (r, row) in want.chunks(k).enumerate() {
                 let mut sorted = xs[r * cols..(r + 1) * cols].to_vec();
                 sorted.sort_by(|a, b| b.total_cmp(a));
-                assert_eq!(row, &sorted[..k], "row {r} holds the k largest values, descending");
+                assert_eq!(
+                    row,
+                    &sorted[..k],
+                    "row {r} holds the k largest values, descending"
+                );
             }
         }
     }
@@ -721,13 +773,22 @@ mod tests {
         let mut g = Graph::new();
         let table = g.input("table", vec![1, e], DType::F32);
         let ids = g.input("ids", vec![n, k], DType::U32);
-        let y = g.add("scale", Op::GatherCols, &[table, ids], vec![n, k], DType::F32);
+        let y = g.add(
+            "scale",
+            Op::GatherCols,
+            &[table, ids],
+            vec![n, k],
+            DType::F32,
+        );
         g.output(y);
         let table = rand(e, 5);
         let ids = vec![0u32, 7, 3, 3, 6, 1];
         let inputs = vec![Tensor::F32(table.clone()), Tensor::U32(ids.clone())];
         let (want, got) = both(&g, &Weights::new(), inputs);
-        assert_eq!(want, ids.iter().map(|&i| table[i as usize]).collect::<Vec<_>>());
+        assert_eq!(
+            want,
+            ids.iter().map(|&i| table[i as usize]).collect::<Vec<_>>()
+        );
         assert_eq!(got, want);
     }
 
@@ -819,7 +880,8 @@ mod tests {
                 let bad = want
                     .iter()
                     .zip(&got)
-                    .position(|(a, b)| a.to_bits() != b.to_bits());
+                    // Values, not bits: a zero code times a negative scale is -0.0 on the CPU, +0.0 from fma.
+                    .position(|(a, b)| a != b && !(a.is_nan() && b.is_nan()));
                 assert!(
                     bad.is_none(),
                     "{f:?} {rows} rows x {} cols: element {bad:?} differs",
@@ -883,7 +945,11 @@ mod tests {
         g.output(y);
         let mut w = Weights::new();
         w.insert("bank", bank);
-        both(&g, &w, vec![Tensor::F32(rand(x_rows * cols, seed + 7)), Tensor::U32(ids)])
+        both(
+            &g,
+            &w,
+            vec![Tensor::F32(rand(x_rows * cols, seed + 7)), Tensor::U32(ids)],
+        )
     }
 
     #[test]
@@ -902,7 +968,16 @@ mod tests {
             };
             // Broadcast x (2 rows x 3 slots) and one x row per slot.
             for x_rows in [2, 6] {
-                let (want, got) = moe_both(*fmt, x_rows, cols, rows, experts, top_k, ids.clone(), 10 + i as u64);
+                let (want, got) = moe_both(
+                    *fmt,
+                    x_rows,
+                    cols,
+                    rows,
+                    experts,
+                    top_k,
+                    ids.clone(),
+                    10 + i as u64,
+                );
                 let err = rel_err(&want, &got);
                 assert!(err < 1e-4, "{fmt:?} x_rows={x_rows}: {err}");
             }
@@ -915,25 +990,39 @@ mod tests {
         let mut route = |n: usize, experts: usize| -> Vec<u32> {
             (0..n)
                 .map(|_| {
-                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     ((s >> 33) % experts as u64) as u32
                 })
                 .collect()
         };
         for (i, (m, top_k, experts, rows, cols)) in [
             (1, 1, 1, 8, 8),
-            (1, 8, 128, 17, 64),   // a decode token: 8 of 128 experts
-            (37, 2, 12, 33, 40),   // prefill-sized, rows not a tile multiple
-            (3, 4, 4, 129, 24),    // every expert routed several times
-            (2, 1, 5, 1, 16),      // one output row per expert
+            (1, 8, 128, 17, 64), // a decode token: 8 of 128 experts
+            (37, 2, 12, 33, 40), // prefill-sized, rows not a tile multiple
+            (3, 4, 4, 129, 24),  // every expert routed several times
+            (2, 1, 5, 1, 16),    // one output row per expert
         ]
         .into_iter()
         .enumerate()
         {
             let ids = route(m * top_k, experts);
             for x_rows in [m, m * top_k] {
-                let (want, got) = moe_both(Fmt::F32, x_rows, cols, rows, experts, top_k, ids.clone(), 40 + i as u64);
-                assert!(rel_err(&want, &got) < 1e-4, "m={m} top_k={top_k} E={experts} {rows}x{cols} x_rows={x_rows}");
+                let (want, got) = moe_both(
+                    Fmt::F32,
+                    x_rows,
+                    cols,
+                    rows,
+                    experts,
+                    top_k,
+                    ids.clone(),
+                    40 + i as u64,
+                );
+                assert!(
+                    rel_err(&want, &got) < 1e-4,
+                    "m={m} top_k={top_k} E={experts} {rows}x{cols} x_rows={x_rows}"
+                );
             }
         }
     }
@@ -946,7 +1035,13 @@ mod tests {
         let x = g.input("x", vec![1, cols], DType::F32);
         let b = g.weight("bank", vec![experts * rows, cols], DType::F32);
         let ids = g.input("ids", vec![1, 2], DType::U32);
-        let y = g.add("moe", Op::MoeLinear { experts, top_k: 2 }, &[x, b, ids], vec![2, rows], DType::F32);
+        let y = g.add(
+            "moe",
+            Op::MoeLinear { experts, top_k: 2 },
+            &[x, b, ids],
+            vec![2, rows],
+            DType::F32,
+        );
         g.output(y);
         let mut bank = rand(experts * rows * cols, 5);
         let run = |bank: &[f32]| {
@@ -954,14 +1049,19 @@ mod tests {
             w.insert("bank", Tensor::F32(bank.to_vec()));
             Session::new(rt(), &w)
                 .unwrap()
-                .run(&g, vec![Tensor::F32(rand(cols, 1)), Tensor::U32(vec![2, 0])])
+                .run(
+                    &g,
+                    vec![Tensor::F32(rand(cols, 1)), Tensor::U32(vec![2, 0])],
+                )
                 .unwrap()
                 .remove(0)
                 .into_f32()
                 .unwrap()
         };
         let clean = run(&bank);
-        bank[3 * rows * cols..].iter_mut().for_each(|v| *v = f32::NAN);
+        bank[3 * rows * cols..]
+            .iter_mut()
+            .for_each(|v| *v = f32::NAN);
         let poisoned = run(&bank);
         assert!(clean.iter().all(|v| v.is_finite()));
         assert_eq!(clean, poisoned);
@@ -970,19 +1070,36 @@ mod tests {
     #[test]
     fn moe_linear_rejects_malformed_nodes() {
         // (experts, top_k, bank rows, cols, x rows, ids, bank format) -> error must name the node.
-        let run = |experts: usize, top_k: usize, bank_rows: usize, cols: usize, x_rows: usize, fmt: Fmt| {
+        let run = |experts: usize,
+                   top_k: usize,
+                   bank_rows: usize,
+                   cols: usize,
+                   x_rows: usize,
+                   fmt: Fmt| {
             let (dt, bank) = weight(fmt, bank_rows, cols, 3);
             let mut g = Graph::new();
             let x = g.input("x", vec![x_rows, cols], DType::F32);
             let b = g.weight("bank", vec![bank_rows, cols], dt);
             let ids = g.input("ids", vec![1, 2], DType::U32);
-            let y = g.add("moe", Op::MoeLinear { experts, top_k }, &[x, b, ids], vec![2, 4], DType::F32);
+            let y = g.add(
+                "moe",
+                Op::MoeLinear { experts, top_k },
+                &[x, b, ids],
+                vec![2, 4],
+                DType::F32,
+            );
             g.output(y);
             let mut w = Weights::new();
             w.insert("bank", bank);
             Session::new(rt(), &w)
                 .unwrap()
-                .run(&g, vec![Tensor::F32(vec![0.5; x_rows * cols]), Tensor::U32(vec![0, 1])])
+                .run(
+                    &g,
+                    vec![
+                        Tensor::F32(vec![0.5; x_rows * cols]),
+                        Tensor::U32(vec![0, 1]),
+                    ],
+                )
                 .map(|_| ())
         };
         run(4, 2, 16, 8, 1, Fmt::F32).unwrap();
@@ -997,11 +1114,23 @@ mod tests {
         let x = g.input("x", vec![1, 16], DType::F32);
         let b = g.weight("bank", vec![16, 16], DType::Quant(Q::GGUF_Q4_K_M));
         let ids = g.input("ids", vec![1, 2], DType::U32);
-        let y = g.add("moe", Op::MoeLinear { experts: 4, top_k: 2 }, &[x, b, ids], vec![2, 4], DType::F32);
+        let y = g.add(
+            "moe",
+            Op::MoeLinear {
+                experts: 4,
+                top_k: 2,
+            },
+            &[x, b, ids],
+            vec![2, 4],
+            DType::F32,
+        );
         g.output(y);
         let e = Session::new(rt(), &Weights::new())
             .unwrap()
-            .run(&g, vec![Tensor::F32(vec![0.5; 16]), Tensor::U32(vec![0, 1])])
+            .run(
+                &g,
+                vec![Tensor::F32(vec![0.5; 16]), Tensor::U32(vec![0, 1])],
+            )
             .unwrap_err();
         assert!(e.contains("moe") && e.contains("block"), "{e}");
     }
@@ -1012,11 +1141,21 @@ mod tests {
         let x = g.input("x", vec![1, 8], DType::F32);
         let b = g.weight("bank", vec![8, 8], DType::F32);
         let ids = g.input("ids", vec![1, 1], DType::U32);
-        let y = g.add("moe", Op::MoeLinear { experts: 2, top_k: 1 }, &[x, b, ids], vec![1, 4], DType::F32);
+        let y = g.add(
+            "moe",
+            Op::MoeLinear {
+                experts: 2,
+                top_k: 1,
+            },
+            &[x, b, ids],
+            vec![1, 4],
+            DType::F32,
+        );
         g.output(y);
         let mut w = Weights::new();
         w.insert("bank", Tensor::F32(rand(64, 1)));
-        let e = cpu::run_stateless(&g, &w, vec![Tensor::F32(rand(8, 2)), Tensor::U32(vec![2])]).unwrap_err();
+        let e = cpu::run_stateless(&g, &w, vec![Tensor::F32(rand(8, 2)), Tensor::U32(vec![2])])
+            .unwrap_err();
         assert!(e.contains("routes to expert 2"), "{e}");
     }
 
@@ -1027,7 +1166,16 @@ mod tests {
         let x = g.input("x", vec![1, 8], DType::F32);
         let b = g.weight("bank", vec![8, 8], DType::F32);
         let ids = g.input("ids", vec![1, 2], DType::U32);
-        let y = g.add("moe", Op::MoeLinear { experts: 2, top_k: 2 }, &[x, b, ids], vec![2, 4], DType::F32);
+        let y = g.add(
+            "moe",
+            Op::MoeLinear {
+                experts: 2,
+                top_k: 2,
+            },
+            &[x, b, ids],
+            vec![2, 4],
+            DType::F32,
+        );
         g.output(y);
         let mut w = Weights::new();
         w.insert("bank", Tensor::F32(rand(64, 1)));
@@ -1199,4 +1347,3 @@ mod tests {
         assert!(e.contains("multiple"), "{e}");
     }
 }
-
