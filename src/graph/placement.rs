@@ -76,7 +76,8 @@ pub fn device_supports_op(device: Device, op: &Op, dtype: DType) -> bool {
 fn node_dtype(graph: &Graph, node: &crate::graph::Node) -> DType {
     let operand = |i: usize| node.inputs.get(i).map(|&v| graph.value(v).dtype);
     match &node.op {
-        Op::Linear => operand(1),
+        Op::Linear | Op::MoeLinear { .. } => operand(1),
+        Op::TopK { .. } | Op::GatherCols => operand(0),
         Op::Embedding => operand(0),
         Op::Megakernel(_) => operand(2),
         _ => node.outputs.first().map(|&v| graph.value(v).dtype),
@@ -95,7 +96,6 @@ pub fn place_graph(
     profiles: &[(Device, DeviceProfile)],
     supports: &dyn Fn(Device, &Op, DType) -> bool,
 ) -> Result<PlacementPlan, GpuReport> {
-    let _ = crate::graph::lower_moe_pass(graph);
     let available: Vec<Device> = profiles.iter().map(|(d, _)| *d).collect();
     let target = match mode {
         PlacementMode::Pin(d) if available.contains(&d) => d,
@@ -223,163 +223,96 @@ mod tests {
     }
 
     #[test]
-    fn test_moe_lowering_and_topk_parity() {
-        use crate::graph::Tensor;
+    fn moe_ops_place_on_metal_and_match_reference() {
+        use crate::graph::{ReduceKind, Tensor};
 
         let (m, d_in, d_out, experts, top_k) = (4, 8, 8, 4, 2);
-
         let mut seed = 42u64;
-        let mut next_f32 = || -> f32 {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        let mut rnd = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect()
         };
+        let (x_data, router_data, bank_data) =
+            (rnd(m * d_in), rnd(experts * d_in), rnd(experts * d_out * d_in));
 
-        let mut x_data = Vec::with_capacity(m * d_in);
-        for _ in 0..m * d_in {
-            x_data.push(next_f32());
-        }
-
-        let mut router_data = Vec::with_capacity(experts * d_in);
-        for _ in 0..experts * d_in {
-            router_data.push(next_f32());
-        }
-
-        let mut exp_data = Vec::with_capacity(experts);
-        for _ in 0..experts {
-            let mut ed = Vec::with_capacity(d_out * d_in);
-            for _ in 0..d_out * d_in {
-                ed.push(next_f32());
-            }
-            exp_data.push(ed);
-        }
-
-        // 1. Scalar Top-K reference calculation
+        // Scalar reference: softmax over the top-k router logits weighs the picked experts' outputs.
+        let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(&a, &b)| a * b).sum() };
         let mut expected = vec![0.0f32; m * d_out];
         for r in 0..m {
             let xr = &x_data[r * d_in..(r + 1) * d_in];
-            let mut logits = Vec::with_capacity(experts);
-            for e in 0..experts {
-                let rw = &router_data[e * d_in..(e + 1) * d_in];
-                let dot: f32 = xr.iter().zip(rw).map(|(&a, &b)| a * b).sum();
-                logits.push(dot);
-            }
-
-            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-            indexed.sort_unstable_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let top = &indexed[..top_k];
-            let max_val = top[0].1;
-            let mut sum_e = 0.0f32;
-            let mut exps = Vec::with_capacity(top_k);
-            for &(_, val) in top {
-                let e = (val - max_val).exp();
-                exps.push(e);
-                sum_e += e;
-            }
-            let inv = 1.0 / sum_e.max(1e-12);
-            let mut probs = vec![0.0f32; experts];
-            for (&(idx, _), e) in top.iter().zip(exps) {
-                probs[idx] = e * inv;
-            }
-
-            for e in 0..experts {
-                let p = probs[e];
-                if p == 0.0 {
-                    continue;
-                }
-                let ew = &exp_data[e];
+            let mut logits: Vec<(usize, f32)> = (0..experts)
+                .map(|e| (e, dot(xr, &router_data[e * d_in..(e + 1) * d_in])))
+                .collect();
+            logits.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let top = &logits[..top_k];
+            let exps: Vec<f32> = top.iter().map(|t| (t.1 - top[0].1).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for (&(e, _), p) in top.iter().zip(&exps) {
                 for o in 0..d_out {
-                    let w_row = &ew[o * d_in..(o + 1) * d_in];
-                    let dot: f32 = xr.iter().zip(w_row).map(|(&a, &b)| a * b).sum();
-                    expected[r * d_out + o] += p * dot;
+                    let w = &bank_data[(e * d_out + o) * d_in..][..d_in];
+                    expected[r * d_out + o] += p / sum * dot(xr, w);
                 }
             }
         }
 
-        // 2. Build graph with Op::Moe
         let mut g = Graph::new();
-        let x = g.input("x", vec![m, d_in], DType::F32);
-        let rw = g.weight("router", vec![experts, d_in], DType::F32);
-        let mut ins = vec![x, rw];
-        for e in 0..experts {
-            ins.push(g.weight(format!("exp_{e}"), vec![d_out, d_in], DType::F32));
-        }
+        let f = DType::F32;
+        let x = g.input("x", vec![m, d_in], f);
+        let rw = g.weight("router", vec![experts, d_in], f);
+        let bank = g.weight("bank", vec![experts * d_out, d_in], f);
+        let logits = g.add("logits", Op::Linear, &[x, rw], vec![m, experts], f);
+        let ids = g.add("ids", Op::TopK { k: top_k }, &[logits], vec![m, top_k], DType::U32);
+        let picked = g.add("picked", Op::GatherCols, &[logits, ids], vec![m, top_k], f);
+        let probs = g.add("probs", Op::Softmax { axis: -1 }, &[picked], vec![m, top_k], f);
+        let y = g.add("y", Op::MoeLinear { experts, top_k }, &[x, bank, ids], vec![m * top_k, d_out], f);
+        let p_col = g.add("p_col", Op::Reshape { shape: Some(vec![m * top_k, 1]) }, &[probs], vec![m * top_k, 1], f);
+        let weighted = g.add("weighted", Op::Mul, &[y, p_col], vec![m * top_k, d_out], f);
+        let grouped = g.add("grouped", Op::Reshape { shape: Some(vec![m, top_k, d_out]) }, &[weighted], vec![m, top_k, d_out], f);
         let out = g.add(
-            "moe",
-            Op::Moe { experts, top_k },
-            &ins,
+            "out",
+            Op::Reduce { kind: ReduceKind::Sum, axes: vec![1], keep_dims: false },
+            &[grouped],
             vec![m, d_out],
-            DType::F32,
+            f,
         );
         g.output(out);
 
         let mut weights = crate::graph::Weights::new();
         weights.insert("router", Tensor::F32(router_data));
-        for e in 0..experts {
-            weights.insert(format!("exp_{e}"), Tensor::F32(exp_data[e].clone()));
-        }
+        weights.insert("bank", Tensor::F32(bank_data));
         let inputs = vec![Tensor::F32(x_data)];
 
-        // Run on CPU
-        let plan = place_graph_default(
-            &mut g,
-            PlacementMode::Pin(Device::Cpu),
-            &[Device::Cpu],
-            None,
-            &device_supports_op,
-        )
-        .unwrap();
-        assert_eq!(plan.segments[0].device, Device::Cpu);
+        let mut cpu_g = g.clone();
+        place_graph_default(&mut cpu_g, PlacementMode::Pin(Device::Cpu), &[Device::Cpu], None, &device_supports_op)
+            .unwrap();
         let mut state = crate::graph::StateStore::new();
-        let cpu_out = crate::graph::cpu::run(&g, &weights, &mut state, inputs.clone()).unwrap();
-        let cpu_out_f32 = cpu_out[0].as_f32().unwrap();
-
-        for i in 0..m * d_out {
-            assert!(
-                (cpu_out_f32[i] - expected[i]).abs() < 1e-4,
-                "CPU MoE mismatch at {i}: got {} vs expected {}",
-                cpu_out_f32[i],
-                expected[i]
-            );
+        let cpu_out = crate::graph::cpu::run(&cpu_g, &weights, &mut state, inputs.clone()).unwrap();
+        for (i, (got, want)) in cpu_out[0].as_f32().unwrap().iter().zip(&expected).enumerate() {
+            assert!((got - want).abs() < 1e-4, "CPU MoE mismatch at {i}: {got} vs {want}");
         }
 
-        // Run on Metal if available
         #[cfg(target_os = "macos")]
         {
-            let rt =
-                crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir())
-                    .unwrap();
-            let session = crate::graph::metal::Session::new(rt, &weights).unwrap();
-            let metal_out = session.run(&g, inputs).unwrap();
-            let metal_out_f32 = metal_out[0].as_f32().unwrap();
-            for i in 0..m * d_out {
-                assert!(
-                    (metal_out_f32[i] - expected[i]).abs() < 1e-4,
-                    "Metal MoE mismatch at {i}: got {} vs expected {}",
-                    metal_out_f32[i],
-                    expected[i]
-                );
+            let plan = place_graph_default(
+                &mut g,
+                PlacementMode::Auto,
+                &[Device::Cpu, Device::Metal],
+                None,
+                &device_supports_op,
+            )
+            .unwrap();
+            assert!(plan.segments.iter().all(|s| s.device == Device::Metal), "every MoE node lowers to Metal");
+            let rt = crate::graph::metal::Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
+            let metal_out = crate::graph::metal::Session::new(rt, &weights).unwrap().run(&g, inputs).unwrap();
+            for (i, (got, want)) in metal_out[0].as_f32().unwrap().iter().zip(&expected).enumerate() {
+                assert!((got - want).abs() < 1e-4, "Metal MoE mismatch at {i}: {got} vs {want}");
             }
         }
-
-        // 3. Error on zero experts
-        let mut bad_g = Graph::new();
-        let bad_x = bad_g.input("x", vec![2, 4], DType::F32);
-        let bad_rw = bad_g.weight("rw", vec![4, 4], DType::F32);
-        let bad_out = bad_g.add(
-            "bad_moe",
-            Op::Moe {
-                experts: 0,
-                top_k: 1,
-            },
-            &[bad_x, bad_rw],
-            vec![2, 4],
-            DType::F32,
-        );
-        bad_g.output(bad_out);
-        assert!(crate::graph::lower_moe_pass(&mut bad_g).is_err());
     }
 }
