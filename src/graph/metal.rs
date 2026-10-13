@@ -3639,6 +3639,8 @@ pub struct Planned {
     pub name: String,
     pub op: Step,
     pub out: ValueId,
+    /// Further values this step writes (multi-output fusions); empty for every single-output step.
+    pub extra_outs: Vec<ValueId>,
     pub reads: Vec<ValueId>,
 }
 
@@ -3688,6 +3690,46 @@ fn numel(g: &Graph, v: ValueId) -> Result<usize, String> {
 
 fn u32_of(n: usize) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("dimension {n} exceeds the Metal kernels' u32 range"))
+}
+
+/// Fusion classes `plan()` may form. `GIBBS_FUSION=xla` restricts planning to what XLA's GPU fusion
+/// pipeline forms (loop, input, dot-epilogue, same-shape sibling fusion: `autoresearch/xla-catalog.md`)
+/// so `scripts/fusion_vs_xla.py` has an in-repo comparator; every other value allows all classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FusionPolicy {
+    Full,
+    XlaClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FusionClass {
+    ElementwiseChain,
+    ReduceInput,
+    DotEpilogue,
+    SiblingSameKind,
+    NormPrologue,
+    CrossCodecSiblings,
+    EpilogueScatter,
+    AttentionSingleDispatch,
+}
+
+impl FusionPolicy {
+    pub(crate) fn allows(self, k: FusionClass) -> bool {
+        use FusionClass::*;
+        self == FusionPolicy::Full
+            || matches!(
+                k,
+                ElementwiseChain | ReduceInput | DotEpilogue | SiblingSameKind
+            )
+    }
+}
+
+pub(crate) fn fusion_policy() -> FusionPolicy {
+    static P: std::sync::OnceLock<FusionPolicy> = std::sync::OnceLock::new();
+    *P.get_or_init(|| match std::env::var("GIBBS_FUSION").as_deref() {
+        Ok("xla") => FusionPolicy::XlaClass,
+        _ => FusionPolicy::Full,
+    })
 }
 
 /// Lowers nodes to dispatches, validating ops and shapes. A Linear whose output has exactly one
@@ -3822,7 +3864,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     format = None;
                 }
                 let (mut epi, mut res) = (Epi::None, None);
-                if format != Some(WeightFormat::JesseLUT) {
+                if format != Some(WeightFormat::JesseLUT)
+                    && fusion_policy().allows(FusionClass::DotEpilogue)
+                {
                     if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
                         let c = &g.nodes[*j];
                         if !g.outputs.contains(&out) {
@@ -3984,7 +4028,11 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 }
                 // `norm(x) + r` with a single reader: one dispatch (`rmsnorm_residual_f32`).
                 let mut res = None;
-                if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
+                if let Some([j]) = readers
+                    .get(&out)
+                    .map(Vec::as_slice)
+                    .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
+                {
                     let c = &g.nodes[*j];
                     if c.op == Op::Add && c.inputs.len() == 2 && !g.outputs.contains(&out) {
                         let r = if c.inputs[0] == out {
@@ -4422,6 +4470,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             name: name.clone(),
             op,
             out,
+            extra_outs: Vec::new(),
             reads,
         });
     }
@@ -4474,6 +4523,9 @@ fn allocate(
     }
     for (s, st) in steps.iter().enumerate() {
         alloc(st.out, &mut live)?;
+        for &v in &st.extra_outs {
+            alloc(v, &mut live)?;
+        }
         live.retain(|&(_, _, v)| last.get(&v).is_some_and(|&l| l > s));
     }
     for (&val, &(src, byte_off)) in aliases {
@@ -5274,6 +5326,163 @@ mod tests {
             ];
             let (want, got) = both(&g, &w, inputs, None);
             assert!(rel_err(&want, &got) < 1e-6);
+        }
+    }
+
+    /// One Gemma-4-E2B sliding-layer decode block (f16 dense weights, hidden 1536, 8 heads, 1 KV head,
+    /// head_dim 256, intermediate 6144, 128-key cache): the fixture `scripts/fusion_vs_xla.py` compares
+    /// with XLA. Prints `FUSION_BLOCK {"us": <median GPU us>, "dispatches": <n>}`; run once per
+    /// `GIBBS_FUSION` value (`cargo test --release --lib fusion_block_bench -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement"]
+    fn fusion_block_bench() {
+        let (h, nh, hd, ff, t) = (1536usize, 8usize, 256usize, 6144usize, 128usize);
+        let f = DType::F32;
+        let (mut g, mut w) = (Graph::new(), Weights::new());
+        let mut dense = |g: &mut Graph, name: &str, rows: usize, cols: usize, seed: u64| {
+            let scale = 1.0 / (cols as f32).sqrt();
+            let data: Vec<u16> = rand(rows * cols, seed)
+                .into_iter()
+                .map(|v| crate::graph::coreml::f32_to_f16(v * scale))
+                .collect();
+            w.insert(name.to_string(), Tensor::F16(data));
+            g.weight(name, vec![rows, cols], DType::F16)
+        };
+        let x0 = g.input("x", vec![1, h], f);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let ks = g.state("k_state", vec![t, hd], f);
+        let vs = g.state("v_state", vec![t, hd], f);
+        let (wq, wk, wv) = (
+            dense(&mut g, "wq", nh * hd, h, 1),
+            dense(&mut g, "wk", hd, h, 2),
+            dense(&mut g, "wv", hd, h, 3),
+        );
+        let (wo, wg, wu, wd) = (
+            dense(&mut g, "wo", h, nh * hd, 4),
+            dense(&mut g, "wg", ff, h, 5),
+            dense(&mut g, "wu", ff, h, 6),
+            dense(&mut g, "wd", h, ff, 7),
+        );
+        let mut ones = |g: &mut Graph, name: &str, n: usize| {
+            w.insert(name.to_string(), Tensor::F32(vec![1.0; n]));
+            g.weight(name, vec![n], f)
+        };
+        let (g1, g2) = (ones(&mut g, "g1", h), ones(&mut g, "g2", h));
+        let (qn, kn) = (ones(&mut g, "qn", hd), ones(&mut g, "kn", hd));
+        w.insert(
+            "inv_freq".to_string(),
+            Tensor::F32(
+                (0..hd / 2)
+                    .map(|i| 10000f32.powf(-(i as f32) / (hd / 2) as f32))
+                    .collect(),
+            ),
+        );
+        let inv = g.weight("inv_freq", vec![hd / 2], f);
+        let eps = Op::RmsNorm { eps: 1e-6 };
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: crate::graph::RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        let a = g.add("a", eps.clone(), &[x0, g1], vec![1, h], f);
+        let q = g.add("q", Op::Linear, &[a, wq], vec![1, nh * hd], f);
+        let k = g.add("k", Op::Linear, &[a, wk], vec![1, hd], f);
+        let v = g.add("v", Op::Linear, &[a, wv], vec![1, hd], f);
+        let q = g.add("qn", eps.clone(), &[q, qn], vec![1, nh * hd], f);
+        let k = g.add("kn", eps.clone(), &[k, kn], vec![1, hd], f);
+        let q = g.add("qr", rope.clone(), &[q, pos, inv], vec![1, nh * hd], f);
+        let k = g.add("kr", rope, &[k, pos, inv], vec![1, hd], f);
+        let att = Op::CachedAttention {
+            heads: nh,
+            kv_heads: 1,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write: true,
+        };
+        let o = g.add("attn", att, &[q, k, v, ks, vs, pos], vec![1, nh * hd], f);
+        let o = g.add("o", Op::Linear, &[o, wo], vec![1, h], f);
+        let x1 = g.add("res1", Op::Add, &[x0, o], vec![1, h], f);
+        let b = g.add("b", eps, &[x1, g2], vec![1, h], f);
+        let gate = g.add("gate", Op::Linear, &[b, wg], vec![1, ff], f);
+        let up = g.add("up", Op::Linear, &[b, wu], vec![1, ff], f);
+        let act = g.add("act", Op::GeGlu, &[gate, up], vec![1, ff], f);
+        let d = g.add("down", Op::Linear, &[act, wd], vec![1, h], f);
+        let out = g.add("res2", Op::Add, &[x1, d], vec![1, h], f);
+        g.output(out);
+
+        let s = Session::new(rt(), &w).unwrap();
+        let plan = s.prepare_plan(&g).unwrap();
+        let mut state = StateStore::new();
+        let mut run = || {
+            let inputs = vec![Tensor::F32(rand(h, 9)), Tensor::U32(vec![100])];
+            s.run_prepared(&g, &plan, Some(&mut state), inputs).unwrap();
+        };
+        for _ in 0..20 {
+            run();
+        }
+        take_run_samples();
+        for _ in 0..200 {
+            run();
+        }
+        let mut samples = take_run_samples();
+        assert_eq!(samples.len(), 200);
+        samples.sort_by_key(|s| s.gpu_ns);
+        println!(
+            "FUSION_BLOCK {{\"us\": {:.1}, \"dispatches\": {}}}",
+            samples[100].gpu_ns as f64 / 1e3,
+            samples[100].dispatches
+        );
+    }
+
+    /// A two-output step's outputs are both live until their own last reader: later steps never
+    /// get arena space that overlaps a still-live extra output.
+    #[test]
+    fn allocate_gives_extra_outs_distinct_live_ranges() {
+        let f = DType::F32;
+        let mut g = Graph::new();
+        let x = g.input("x", vec![2, 4], f);
+        let gv = g.weight("g", vec![4], f);
+        let a = g.add("a", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![2, 4], f);
+        let b = g.add("b", Op::Silu, &[x], vec![2, 4], f);
+        let c = g.add("c", Op::RmsNorm { eps: 1e-5 }, &[a, gv], vec![2, 4], f);
+        let d = g.add("d", Op::Add, &[b, c], vec![2, 4], f);
+        g.output(d);
+        let norm = |x, out, extra_outs: Vec<ValueId>, reads| Planned {
+            name: String::new(),
+            op: Step::RmsNorm {
+                x,
+                g: gv,
+                res: None,
+                rows: 2,
+                d: 4,
+                eps: 1e-5,
+            },
+            out,
+            extra_outs,
+            reads,
+        };
+        let steps = vec![
+            norm(x, a, vec![b], vec![x, gv]),
+            norm(a, c, vec![], vec![a, gv]),
+            norm(b, d, vec![], vec![b, c]),
+        ];
+        let (offsets, _) = allocate(&g, &steps, &HashMap::new()).unwrap();
+        let range = |v: ValueId| (offsets[&v], offsets[&v] + 2 * 4 * 4);
+        let disjoint =
+            |p: ValueId, q: ValueId| range(p).1 <= range(q).0 || range(q).1 <= range(p).0;
+        // a is read by step 1, b by step 2, c by step 2, d is the graph output.
+        for (p, q) in [(a, b), (a, c), (b, c), (b, d), (c, d)] {
+            assert!(
+                disjoint(p, q),
+                "{p:?} and {q:?} overlap: {:?} {:?}",
+                range(p),
+                range(q)
+            );
         }
     }
 
