@@ -25,7 +25,16 @@ for i, m in enumerate(s["models"]):
 print(len(s["models"]))
 PY
 )
+quiet() {  # wait (<= 120 s) until no other process is using the GPU; log when it never gets idle
+  for _ in $(seq 1 40); do
+    u=$(ioreg -r -d 1 -c IOAccelerator | grep -o '"Device Utilization %"=[0-9]*' | head -1 | cut -d= -f2)
+    [ "${u:-0}" -lt 5 ] && return 0
+    sleep 3
+  done
+  echo "gpu busy before $1 (device utilization ${u}%)" >> target/loop/contention.log
+}
 run() {  # tag binary suite
+  quiet "$1 $3"
   "$2" --bench "$3" >> "target/loop/$1.out" 2>> "target/loop/$1.err"
   code=$?
   case $code in 0|3) ;; *) echo "metric-error: $1 $3 exited $code" >&2; return 1 ;; esac
