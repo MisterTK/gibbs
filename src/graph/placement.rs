@@ -84,6 +84,79 @@ fn node_dtype(graph: &Graph, node: &crate::graph::Node) -> DType {
     .unwrap_or(DType::F32)
 }
 
+/// Graph nodes of one op kind placed on one device by one avenue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementRow {
+    pub op: String,
+    pub device: Device,
+    /// `kernel` where the device runs the op as is, else the avenue that lowers it.
+    pub avenue: String,
+    pub count: usize,
+}
+
+/// The nodes of a placed `graph` grouped by op kind, device and avenue, most numerous first.
+pub fn placement_rows(graph: &Graph) -> Vec<PlacementRow> {
+    let mut counts: HashMap<(String, Device, String), usize> = HashMap::new();
+    for node in &graph.nodes {
+        let dtype = node_dtype(graph, node);
+        let avenue = if device_supports_op(node.device, &node.op, dtype) {
+            "kernel".to_string()
+        } else {
+            explore_node(&node.name, &node.op, dtype)
+                .lowered_by()
+                .map_or("unlowered", |(avenue, _)| avenue.name())
+                .to_string()
+        };
+        let kind = format!("{:?}", node.op)
+            .split([' ', '{', '('])
+            .next()
+            .unwrap_or("?")
+            .to_string();
+        *counts.entry((kind, node.device, avenue)).or_default() += 1;
+    }
+    let mut rows: Vec<PlacementRow> = counts
+        .into_iter()
+        .map(|((op, device, avenue), count)| PlacementRow {
+            op,
+            device,
+            avenue,
+            count,
+        })
+        .collect();
+    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.op.cmp(&b.op)));
+    rows
+}
+
+/// `rows` as an aligned text table (op, device, avenue, node count) with a total line.
+pub fn placement_table(rows: &[PlacementRow]) -> String {
+    let w = rows.iter().map(|r| r.op.len()).max().unwrap_or(0).max(2);
+    let mut out = format!("{:<w$}  {:<6}  {:<12}  {:>5}\n", "op", "device", "avenue", "nodes");
+    for r in rows {
+        out += &format!(
+            "{:<w$}  {:<6}  {:<12}  {:>5}\n",
+            r.op,
+            format!("{:?}", r.device),
+            r.avenue,
+            r.count
+        );
+    }
+    out + &format!("{} nodes", rows.iter().map(|r| r.count).sum::<usize>())
+}
+
+/// `Ok("100% Metal")` when no node runs on the CPU, else `Err` naming the CPU ops and their counts.
+pub fn placement_verdict(rows: &[PlacementRow]) -> Result<String, String> {
+    let cpu: Vec<String> = rows
+        .iter()
+        .filter(|r| r.device == Device::Cpu)
+        .map(|r| format!("{} ×{}", r.op, r.count))
+        .collect();
+    if cpu.is_empty() {
+        let device = rows.first().map_or(Device::Cpu, |r| r.device);
+        return Ok(format!("100% {device:?}"));
+    }
+    Err(format!("CPU ops: {}", cpu.join(", ")))
+}
+
 /// Places every node of `graph` on one device.
 ///
 /// `supports` answers whether a device runs `(op, dtype)`; production passes
@@ -381,5 +454,26 @@ mod tests {
         );
         bad_g.output(bad_out);
         assert!(crate::graph::lower_moe_pass(&mut bad_g).is_err());
+    }
+
+    fn row(op: &str, device: Device, count: usize) -> PlacementRow {
+        PlacementRow {
+            op: op.into(),
+            device,
+            avenue: "kernel".into(),
+            count,
+        }
+    }
+
+    #[test]
+    fn verdict_is_all_on_one_gpu_or_the_cpu_ops_by_name() {
+        let gpu = [row("Linear", Device::Metal, 232), row("RmsNorm", Device::Metal, 5)];
+        assert_eq!(placement_verdict(&gpu), Ok("100% Metal".to_string()));
+        let table = placement_table(&gpu);
+        assert!(table.starts_with("op       device  avenue "), "{table}");
+        assert!(table.contains("Linear   Metal   kernel   "), "{table}");
+        assert!(table.ends_with("237 nodes"), "{table}");
+        let mixed = [row("Linear", Device::Metal, 3), row("Relu", Device::Cpu, 2)];
+        assert_eq!(placement_verdict(&mixed), Err("CPU ops: Relu ×2".to_string()));
     }
 }

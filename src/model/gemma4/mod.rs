@@ -241,6 +241,10 @@ impl NativeLm for Gemma4 {
         }
         Device::Cpu
     }
+
+    fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
+        Some(self.program.as_ref()?.lock().placement_summary())
+    }
     fn summary(&self) -> String {
         let t = &self.text;
         format!(
