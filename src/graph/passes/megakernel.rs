@@ -119,9 +119,6 @@ pub fn fuse_attn_prep_pass(graph: &mut Graph) -> usize {
 
 /// Fuses `RmsNorm -> [Gate, Up Linear] -> SwiGLU/GeGLU -> Down Linear -> Add(residual)`
 fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
-    if std::env::var_os("GIBBS_NO_MLP_MEGAKERNEL").is_some() {
-        return 0;
-    }
     let mut rewrites = 0;
     let mut eliminated_nodes: HashSet<NodeId> = HashSet::new();
 

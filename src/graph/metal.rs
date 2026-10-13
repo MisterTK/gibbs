@@ -117,35 +117,6 @@ pub fn take_run_samples() -> Vec<RunSample> {
     RUN_SAMPLES.lock().drain(..).collect()
 }
 
-/// Output vectors of large readbacks (logits) handed back by the consumer with [`recycle_f32`]: a fresh
-/// 0.5-1 MB `Vec` per decoded token is a page-fault storm (the allocator returns it to the OS on free).
-static F32_POOL: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
-
-/// Returns a readback vector for reuse by the next [`pooled_f32`].
-pub fn recycle_f32(v: Vec<f32>) {
-    if v.capacity() >= 1 << 14 {
-        let mut pool = F32_POOL.lock();
-        if pool.len() < 4 {
-            pool.push(v);
-        }
-    }
-}
-
-fn pooled_f32(src: &[f32]) -> Vec<f32> {
-    let mut v = if src.len() >= 1 << 14 {
-        let mut pool = F32_POOL.lock();
-        pool.iter()
-            .position(|v| v.capacity() >= src.len())
-            .map(|i| pool.swap_remove(i))
-    } else {
-        None
-    }
-    .unwrap_or_else(|| Vec::with_capacity(src.len()));
-    v.clear();
-    v.extend_from_slice(src);
-    v
-}
-
 /// GEMV shapes resolved by the tuner this process, and how many came from the persisted cache.
 static TUNE_SHAPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static TUNE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -432,8 +403,6 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-/// Ticket counters at the start of the split-attention scratch (one u32 per head tile, <= 256 tiles).
-const ATTN_CTR_BYTES: usize = 1024;
 const BASE_KERNELS: [&str; 58] = [
     "embedding_f32",
     "layer_norm_f32",
@@ -1427,10 +1396,6 @@ pub struct Session {
     dequant_scratch: Mutex<Option<Buffer>>,
     /// Per-slice partials of the split decode attention (grown to the largest).
     attn_scratch: Mutex<Option<Buffer>>,
-    /// Decode fusion switches chosen by the on-device search ([`FusionFlags`]).
-    fusion_flags: std::sync::atomic::AtomicU8,
-    /// Test hook of [`Session::fusion_cost`]: when positive, the dispatch cost the model uses.
-    dispatch_us_override: std::sync::atomic::AtomicU64,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -1988,8 +1953,6 @@ impl Session {
             mlp_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
-            fusion_flags: std::sync::atomic::AtomicU8::new(FusionFlags::ALL.bits()),
-            dispatch_us_override: std::sync::atomic::AtomicU64::new(0),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
@@ -2106,41 +2069,10 @@ impl Session {
         }
     }
 
-    /// Device constants of the fusion cost model: the measured dispatch cost (1.2 us, the value
-    /// iteration 5 measured, before the host profile has one) and streaming ceiling.
-    fn fusion_cost(&self) -> super::fusion_cost::FusionCost {
-        let p = &self.rt.profile;
-        let forced = f64::from_bits(
-            self.dispatch_us_override
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-        super::fusion_cost::FusionCost {
-            dispatch_us: if forced > 0.0 {
-                forced
-            } else if p.dispatch_us > 0.0 {
-                p.dispatch_us
-            } else {
-                1.2
-            },
-            ceiling_gbps: p.ceiling_gbps.max(p.stream_gbps).max(1.0),
-        }
-    }
-
-    /// Pins the cost model's dispatch cost (tests: a large value makes every fusion profitable).
-    #[cfg(test)]
-    fn force_dispatch_us(&self, us: f64) {
-        self.dispatch_us_override
-            .store(us.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (steps, aliases) = plan(graph)?;
-        let mut steps = if self.fusion_flags().batch {
-            batch_horizontal(steps, &aliases, &self.fusion_cost())
-        } else {
-            steps
-        };
+        let mut steps = batch_horizontal(steps, &aliases);
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
                 eprintln!(
@@ -2525,80 +2457,37 @@ impl Session {
                 }
                 *LAST_PROFILE.lock() = Some((Instant::now(), rows));
             } else {
-                // The command buffer is cut into chunks, each committed as soon as it is encoded: the GPU
-                // runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
-                // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
-                // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
-                // `GIBBS_CB_CHUNK=0` keeps a single buffer.
-                // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
-                // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
-                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
-                    cb_chunking()
-                } else {
-                    (usize::MAX, usize::MAX)
-                };
-                let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
+                let cb = self.rt.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                let counted = Counted::new(enc);
                 let mut err = None;
-                let mut dispatches = 0u32;
                 let encode_start = std::time::Instant::now();
-                let mut at = 0;
-                while at < steps.len() && err.is_none() {
-                    let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
-                    let cb = self.rt.queue.new_command_buffer().to_owned();
-                    let enc = cb.new_compute_command_encoder();
-                    let counted = Counted::new(enc);
-                    for (s_idx, s) in steps.iter().enumerate().take(end).skip(at) {
-                        if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
-                            err = Some(e);
-                            break;
-                        }
+                for (s_idx, s) in steps.iter().enumerate() {
+                    if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
+                        err = Some(e);
+                        break;
                     }
-                    enc.end_encoding();
-                    dispatches += counted.dispatches();
-                    if end < steps.len() && err.is_none() {
-                        cb.commit();
-                    }
-                    cbs.push(cb);
-                    at = end;
                 }
+                enc.end_encoding();
                 let encode_dur = encode_start.elapsed();
                 if let Some(e) = err {
-                    // Earlier chunks are already on the GPU: let them finish before reporting.
-                    if cbs.len() > 1 {
-                        cbs[cbs.len() - 2].wait_until_completed();
-                    }
                     return Err(e);
                 }
-                if cbs.is_empty() {
-                    let cb = self.rt.queue.new_command_buffer().to_owned();
-                    cb.new_compute_command_encoder().end_encoding();
-                    cbs.push(cb);
-                }
-                let last = cbs.last().expect("a plan has at least one step");
-                commit_and_wait(last)?;
-                for cb in &cbs[..cbs.len() - 1] {
-                    if cb.status() != metal::MTLCommandBufferStatus::Completed {
-                        return Err(format!(
-                            "Metal command buffer ended with status {:?}",
-                            cb.status()
-                        ));
-                    }
-                }
-                let span = gpu_span_seconds(&cbs[0], last);
+                commit_and_wait(cb)?;
                 sample = Some(RunSample {
-                    gpu_ns: (span * 1e9) as u64,
+                    gpu_ns: (gpu_seconds(cb) * 1e9) as u64,
                     run_ns: 0,
                     encode_ns: encode_dur.as_nanos() as u64,
-                    dispatches,
+                    dispatches: counted.dispatches(),
                 });
-                self.last_gpu_s
-                    .store(span.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                self.last_gpu_s.store(
+                    gpu_seconds(cb).to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
                     let enc_us = encode_dur.as_micros();
-                    eprintln!(
-                        "[ICB profile] CPU encode: {enc_us} µs, GPU time: {:.2} ms",
-                        span * 1e3
-                    );
+                    let gpu_ms = gpu_seconds(cb) * 1e3;
+                    eprintln!("[ICB profile] CPU encode: {enc_us} µs, GPU time: {gpu_ms:.2} ms");
                 }
             }
             Ok(())
@@ -2616,7 +2505,7 @@ impl Session {
                         n,
                     )
                 };
-                Ok(Tensor::F32(pooled_f32(s)))
+                Ok(Tensor::F32(s.to_vec()))
             })
             .collect::<Result<Vec<_>, String>>()?;
         if let Some(mut s) = sample {
@@ -3242,17 +3131,7 @@ impl Session {
                         ));
                     }
                 }
-                // Decode append fused into the attention launch: the kernel reads the new K/V row from the
-                // inputs and stores it (`AttentionSingleDispatch`; XlaClass keeps the separate dispatch).
-                let fuse_append = write
-                    && m == 1
-                    && vis.is_none()
-                    && k_state.is_some()
-                    && v_state.is_some()
-                    && fusion_policy().allows(FusionClass::AttentionSingleDispatch)
-                    && self.fusion_cost().append_in_kernel_wins()
-                    && self.fusion_flags().append;
-                if write && k_state.is_some() && v_state.is_some() && !fuse_append {
+                if write && k_state.is_some() && v_state.is_some() {
                     let ks = k_state.unwrap();
                     let vs = v_state.unwrap();
                     enc.set_compute_pipeline_state(rt.pso("kv_append_batched")?);
@@ -3299,18 +3178,8 @@ impl Session {
                     1
                 };
                 let mut scratch_guard = self.attn_scratch.lock();
-                let head_tiles = kv_heads * group.div_ceil(ATTN_HPT);
-                let fuse_merge = n_splits > 1
-                    && head_tiles * 4 <= ATTN_CTR_BYTES
-                    && fusion_policy().allows(FusionClass::AttentionSingleDispatch)
-                    && self.fusion_cost().merge_in_kernel_wins(
-                        group.min(ATTN_HPT),
-                        n_splits,
-                        head_dim,
-                    )
-                    && self.fusion_flags().merge;
                 if n_splits > 1 {
-                    let bytes = ATTN_CTR_BYTES + heads * n_splits * (head_dim + 2) * 4;
+                    let bytes = heads * n_splits * (head_dim + 2) * 4;
                     if scratch_guard
                         .as_ref()
                         .map_or(true, |b| (b.length() as usize) < bytes)
@@ -3334,18 +3203,11 @@ impl Session {
                 bind(1, k_buf_id);
                 bind(2, v_buf_id);
                 match scratch_guard.as_ref().filter(|_| n_splits > 1) {
-                    Some(part) => enc.set_buffer(3, Some(part), ATTN_CTR_BYTES as u64),
+                    Some(part) => enc.set_buffer(3, Some(part), 0),
                     None => bind(3, s.out),
                 }
                 // Rows see keys `< vis[row]` when the operand is present (default `pos + row + 1`).
                 bind(5, vis.unwrap_or(q));
-                bind(6, k);
-                bind(7, v);
-                bind(8, s.out);
-                match scratch_guard.as_ref().filter(|_| n_splits > 1) {
-                    Some(ctr) => enc.set_buffer(9, Some(ctr), 0),
-                    None => bind(9, s.out),
-                }
                 #[repr(C)]
                 struct AttnCachedParams {
                     n_heads: u32,
@@ -3360,8 +3222,6 @@ impl Session {
                     has_vis: u32,
                     n_splits: u32,
                     chunk: u32,
-                    fuse_append: u32,
-                    fuse_merge: u32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -3376,8 +3236,6 @@ impl Session {
                     has_vis: vis.is_some() as u32,
                     n_splits: n_splits as u32,
                     chunk: n_keys.div_ceil(n_splits) as u32,
-                    fuse_append: fuse_append as u32,
-                    fuse_merge: fuse_merge as u32,
                 };
                 set_bytes(enc, 4, &p);
                 let tgs_x = if n_splits > 1 {
@@ -3389,12 +3247,9 @@ impl Session {
                     MTLSize::new(tgs_x as u64, m as u64, n_splits as u64),
                     MTLSize::new(TG4, 1, 1),
                 );
-                if let Some(part) = scratch_guard
-                    .as_ref()
-                    .filter(|_| n_splits > 1 && !fuse_merge)
-                {
+                if let Some(part) = scratch_guard.as_ref().filter(|_| n_splits > 1) {
                     enc.set_compute_pipeline_state(rt.pso("attn_cached_merge_f32")?);
-                    enc.set_buffer(0, Some(part), ATTN_CTR_BYTES as u64);
+                    enc.set_buffer(0, Some(part), 0);
                     bind(1, s.out);
                     set_bytes(enc, 2, &p);
                     enc.dispatch_thread_groups(
@@ -3609,66 +3464,40 @@ impl Session {
                 set_bytes(enc, 3, &p);
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
 
-                // 2-4. Gate and up GEMVs, then the GLU. Packed weights run the gate GEMV last with the GLU
-                // as its epilogue reading the up result (one dispatch fewer, no second pass over `inter`).
-                let packed = self
-                    .weights
-                    .get(gate_name)
-                    .is_some_and(|w| !matches!(w.3, WeightFormat::F32 | WeightFormat::U32 | WeightFormat::JesseLUT));
-                if packed {
-                    self.encode_gemv_or_gemm(
-                        enc,
-                        (scratch, off_norm),
-                        loc(up_w),
-                        up_name,
-                        None,
-                        (scratch, off_up),
-                        inter,
-                        hidden,
-                        Epi::None,
-                    )?;
-                    self.encode_gemv_or_gemm(
-                        enc,
-                        (scratch, off_norm),
-                        loc(gate_w),
-                        gate_name,
-                        Some((scratch, off_up)),
-                        (scratch, off_gate),
-                        inter,
-                        hidden,
-                        if is_geglu { Epi::GeGlu } else { Epi::SwiGlu },
-                    )?;
-                } else {
-                    self.encode_gemv_or_gemm(
-                        enc,
-                        (scratch, off_norm),
-                        loc(gate_w),
-                        gate_name,
-                        None,
-                        (scratch, off_gate),
-                        inter,
-                        hidden,
-                        Epi::None,
-                    )?;
-                    self.encode_gemv_or_gemm(
-                        enc,
-                        (scratch, off_norm),
-                        loc(up_w),
-                        up_name,
-                        None,
-                        (scratch, off_up),
-                        inter,
-                        hidden,
-                        Epi::None,
-                    )?;
-                    let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                    enc.set_buffer(0, Some(scratch), off_gate as u64);
-                    enc.set_buffer(1, Some(scratch), off_up as u64);
-                    enc.set_buffer(2, Some(scratch), off_gate as u64);
-                    set_bytes(enc, 3, &u32_of(inter)?);
-                    grid1(inter);
-                }
+                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
+                self.encode_gemv_or_gemm(
+                    enc,
+                    (scratch, off_norm),
+                    loc(gate_w),
+                    gate_name,
+                    None,
+                    (scratch, off_gate),
+                    inter,
+                    hidden,
+                    Epi::None,
+                )?;
+
+                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
+                self.encode_gemv_or_gemm(
+                    enc,
+                    (scratch, off_norm),
+                    loc(up_w),
+                    up_name,
+                    None,
+                    (scratch, off_up),
+                    inter,
+                    hidden,
+                    Epi::None,
+                )?;
+
+                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
+                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                enc.set_buffer(0, Some(scratch), off_gate as u64);
+                enc.set_buffer(1, Some(scratch), off_up as u64);
+                enc.set_buffer(2, Some(scratch), off_gate as u64);
+                set_bytes(enc, 3, &u32_of(inter)?);
+                grid1(inter);
 
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
@@ -3995,248 +3824,6 @@ impl FusionPolicy {
     }
 }
 
-/// Decode fusion switches the load-time search ([`Session::prepare_plan_searched`]) decides per graph.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FusionFlags {
-    pub batch: bool,
-    pub append: bool,
-    pub merge: bool,
-}
-
-impl FusionFlags {
-    pub const ALL: Self = Self {
-        batch: true,
-        append: true,
-        merge: true,
-    };
-    pub fn bits(self) -> u8 {
-        self.batch as u8 | (self.append as u8) << 1 | (self.merge as u8) << 2
-    }
-    pub fn from_bits(b: u8) -> Self {
-        Self {
-            batch: b & 1 != 0,
-            append: b & 2 != 0,
-            merge: b & 4 != 0,
-        }
-    }
-}
-
-/// Relative speed-up a switch must show before the search drops a fusion.
-const FUSION_SEARCH_TIE: f64 = 0.03;
-/// Wall-time budget of one search; later candidates are skipped once it is spent.
-const FUSION_SEARCH_BUDGET_MS: u128 = 1500;
-
-/// Whether another client keeps the GPU busy (`ioreg` "Device Utilization %" above 60): timings taken now
-/// are not persisted. An unreadable value counts as idle.
-fn device_busy() -> bool {
-    std::process::Command::new("ioreg")
-        .args(["-r", "-d", "1", "-c", "IOAccelerator"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let t = String::from_utf8_lossy(&o.stdout).into_owned();
-            let rest = t.split("\"Device Utilization %\"=").nth(1)?;
-            rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().ok()
-        })
-        .is_some_and(|u| u > 60)
-}
-
-fn fusion_key(graph: &Graph) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    // v1: switches batch, append, merge.
-    (1u32, KERNELS_MSL.len()).hash(&mut h);
-    for n in &graph.nodes {
-        format!("{:?}", n.op).hash(&mut h);
-        for &o in &n.outputs {
-            graph.value(o).shape.hash(&mut h);
-        }
-    }
-    format!("{:016x}", h.finish())
-}
-
-impl Session {
-    pub fn fusion_flags(&self) -> FusionFlags {
-        FusionFlags::from_bits(self.fusion_flags.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    fn set_fusion_flags(&self, f: FusionFlags) {
-        self.fusion_flags
-            .store(f.bits(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// [`Self::prepare_plan`] for a program's graph. For a decode graph (one row, with KV state) the
-    /// fusion switches are chosen by timing the graph on this device with each switch off in turn and
-    /// persisted by graph hash next to the GEMV tuner's cache (XLA analogue: its Triton GEMM autotuner;
-    /// `GIBBS_FUSION_SEARCH=off` or `GIBBS_FUSION=xla` keeps every switch on / the XLA class).
-    pub fn prepare_plan_searched(&self, graph: &Graph) -> Result<PreparedPlan, String> {
-        self.set_fusion_flags(FusionFlags::ALL);
-        let plan = self.prepare_plan(graph)?;
-        let off = std::env::var("GIBBS_FUSION_SEARCH").is_ok_and(|v| v == "off");
-        if off
-            || fusion_policy() != FusionPolicy::Full
-            || !plan.is_decode
-            || plan.state_reads.is_empty()
-        {
-            return Ok(plan);
-        }
-        let key = fusion_key(graph);
-        let name = self
-            .rt
-            .tune_path
-            .file_name()
-            .map(|n| n.to_string_lossy().replacen("tune-", "fusion-", 1))
-            .unwrap_or_default();
-        let path = self.rt.tune_path.with_file_name(name);
-        let mut cache: HashMap<String, u8> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let chosen = match cache.get(&key) {
-            Some(&b) => FusionFlags::from_bits(b),
-            None => {
-                let (f, complete) = match self.search_fusion(graph, &plan) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // A graph the probe inputs cannot drive (tiny test caches, odd inputs) keeps every fusion.
-                        eprintln!("fusion search skipped: {e}");
-                        self.set_fusion_flags(FusionFlags::ALL);
-                        return Ok(plan);
-                    }
-                };
-                // A search cut short by its budget (a busy device) is not persisted.
-                if complete && !device_busy() {
-                    cache.insert(key, f.bits());
-                    if let Some(dir) = path.parent() {
-                        let _ = std::fs::create_dir_all(dir);
-                    }
-                    if let Ok(s) = serde_json::to_string(&cache) {
-                        let _ = std::fs::write(&path, s);
-                    }
-                }
-                f
-            }
-        };
-        self.set_fusion_flags(chosen);
-        if chosen == FusionFlags::ALL {
-            Ok(plan)
-        } else {
-            self.prepare_plan(graph)
-        }
-    }
-
-    // ponytail: one switch off at a time (4 candidates); combinations of two switches that are each
-    // faster off are not explored. Candidate runs use position 100 and zero activations.
-    fn search_fusion(
-        &self,
-        graph: &Graph,
-        all_plan: &PreparedPlan,
-    ) -> Result<(FusionFlags, bool), String> {
-        let t0 = Instant::now();
-        let all = FusionFlags::ALL;
-        let candidates = [
-            all,
-            FusionFlags {
-                batch: false,
-                ..all
-            },
-            FusionFlags {
-                append: false,
-                ..all
-            },
-            FusionFlags {
-                merge: false,
-                ..all
-            },
-        ];
-        let (mut best, mut best_us, mut report) = (all, f64::INFINITY, Vec::new());
-        let mut complete = true;
-        let mut all_us = f64::INFINITY;
-        for (i, f) in candidates.into_iter().enumerate() {
-            if i > 0 && t0.elapsed().as_millis() > FUSION_SEARCH_BUDGET_MS {
-                complete = false;
-                break;
-            }
-            self.set_fusion_flags(f);
-            let plan = if i == 0 {
-                all_plan.clone()
-            } else {
-                self.prepare_plan(graph)?
-            };
-            // Each candidate is timed twice, interleaved with a re-timing of "all on" (best of both): a
-            // switch is dropped only when it wins against a contemporaneous baseline, not against noise.
-            let mut us = self.time_decode(graph, &plan)?;
-            if i > 0 {
-                self.set_fusion_flags(all);
-                let a1 = self.time_decode(graph, all_plan)?;
-                self.set_fusion_flags(f);
-                us = us.min(self.time_decode(graph, &plan)?);
-                self.set_fusion_flags(all);
-                all_us = all_us.min(a1).min(self.time_decode(graph, all_plan)?);
-            }
-            report.push(format!("{:03b} {us:.0}us", f.bits()));
-            if i == 0 {
-                (all_us, best_us) = (us, us);
-            } else if us < all_us * (1.0 - FUSION_SEARCH_TIE) && us < best_us {
-                (best, best_us) = (f, us);
-            }
-        }
-        eprintln!(
-            "fusion search: {} -> chosen {:03b} ({} ms)",
-            report.join(", "),
-            best.bits(),
-            t0.elapsed().as_millis()
-        );
-        // The runs above are not decode tokens: keep them out of the run-sample ring.
-        take_run_samples();
-        Ok((best, complete))
-    }
-
-    /// Best GPU time in us of 5 runs of `plan` at position 100 (after 2 warm-up runs).
-    fn time_decode(&self, graph: &Graph, plan: &PreparedPlan) -> Result<f64, String> {
-        // Position 100, or half of the smallest KV cache (rows > 16: conv and recurrent states are not caches).
-        let probe_pos = graph
-            .nodes
-            .iter()
-            .flat_map(|n| n.inputs.iter())
-            .filter(|&&v| matches!(graph.value(v).kind, ValueKind::State(_)))
-            .filter_map(|&v| graph.value(v).shape.first().copied())
-            .filter(|&r| r > 16)
-            .min()
-            .map_or(100, |r| (r as u32 / 2).min(100));
-        let inputs = |_: ()| -> Vec<Tensor> {
-            graph
-                .inputs
-                .iter()
-                .map(|&v| {
-                    let val = graph.value(v);
-                    let n: usize = val.shape.iter().product();
-                    match val.dtype {
-                        DType::U32 => Tensor::U32(vec![
-                            if val.name.contains("pos") {
-                                probe_pos
-                            } else {
-                                1
-                            };
-                            n
-                        ]),
-                        _ => Tensor::F32(vec![0.0; n]),
-                    }
-                })
-                .collect()
-        };
-        let mut state = crate::graph::StateStore::new();
-        let mut best = f64::INFINITY;
-        for i in 0..7 {
-            self.run_prepared(graph, plan, Some(&mut state), inputs(()))?;
-            if i >= 2 {
-                best = best.min(self.last_gpu_seconds() * 1e6);
-            }
-        }
-        Ok(best)
-    }
-}
-
 pub(crate) fn fusion_policy() -> FusionPolicy {
     static P: std::sync::OnceLock<FusionPolicy> = std::sync::OnceLock::new();
     *P.get_or_init(|| match std::env::var("GIBBS_FUSION").as_deref() {
@@ -4263,7 +3850,6 @@ pub struct NormSeg {
 fn batch_horizontal(
     steps: Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
-    cost: &super::fusion_cost::FusionCost,
 ) -> Vec<Planned> {
     if !fusion_policy().allows(FusionClass::HorizontalBatch) {
         return steps;
@@ -4321,7 +3907,7 @@ fn batch_horizontal(
         while run.len() < 4 && it.peek().is_some_and(|n| joins(&run, n)) {
             run.push(it.next().expect("peeked"));
         }
-        if run.len() == 1 || !cost.batch_wins(run.len()) {
+        if run.len() == 1 {
             out.extend(run);
             continue;
         }
@@ -5434,35 +5020,6 @@ fn print_kernel_profile(
     }
 }
 
-const CB_CHUNK_MIN_STEPS: usize = 400;
-
-/// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
-fn cb_chunking() -> (usize, usize) {
-    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *C.get_or_init(|| {
-        let v = std::env::var("GIBBS_CB_CHUNK").ok();
-        match v.as_deref() {
-            Some("0") => (usize::MAX, usize::MAX),
-            Some(s) => {
-                let mut it = s.split(',').filter_map(|p| p.trim().parse::<usize>().ok());
-                match (it.next(), it.next()) {
-                    (Some(a), Some(b)) if a > 0 && b > 0 => (a, b),
-                    _ => (24, 160),
-                }
-            }
-            None => (24, 160),
-        }
-    })
-}
-
-/// GPU time from the start of the first to the end of the last of consecutive command buffers.
-fn gpu_span_seconds(first: &CommandBufferRef, last: &CommandBufferRef) -> f64 {
-    // SAFETY: GPUStartTime/GPUEndTime are CFTimeInterval (f64) properties of completed buffers.
-    let (t0, t1): (f64, f64) =
-        unsafe { (msg_send![first, GPUStartTime], msg_send![last, GPUEndTime]) };
-    t1 - t0
-}
-
 /// GPU execution time of a completed command buffer, in seconds.
 fn gpu_seconds(cb: &CommandBufferRef) -> f64 {
     // SAFETY: GPUStartTime/GPUEndTime are CFTimeInterval (f64) properties of a completed buffer.
@@ -6028,7 +5585,9 @@ mod tests {
     /// head_dim 256, intermediate 6144, 128-key cache): the fixture `scripts/fusion_vs_xla.py` compares
     /// with XLA. Prints `FUSION_BLOCK {"us": <median GPU us>, "dispatches": <n>}`; run once per
     /// `GIBBS_FUSION` value (`cargo test --release --lib fusion_block_bench -- --ignored --nocapture`).
-    fn decode_block() -> (Graph, Weights) {
+    #[test]
+    #[ignore = "measurement"]
+    fn fusion_block_bench() {
         let (h, nh, hd, ff, t) = (1536usize, 8usize, 256usize, 6144usize, 128usize);
         let f = DType::F32;
         let (mut g, mut w) = (Graph::new(), Weights::new());
@@ -6107,15 +5666,7 @@ mod tests {
         let d = g.add("down", Op::Linear, &[act, wd], vec![1, h], f);
         let out = g.add("res2", Op::Add, &[x1, d], vec![1, h], f);
         g.output(out);
-        (g, w)
-    }
 
-    /// `scripts/fusion_vs_xla.py` side: median GPU time and dispatch count of `decode_block`.
-    #[test]
-    #[ignore = "measurement"]
-    fn fusion_block_bench() {
-        let (g, w) = decode_block();
-        let h = 1536;
         let s = Session::new(rt(), &w).unwrap();
         let plan = s.prepare_plan(&g).unwrap();
         let mut state = StateStore::new();
@@ -6132,80 +5683,12 @@ mod tests {
         }
         let mut samples = take_run_samples();
         assert_eq!(samples.len(), 200);
-        let mut run: Vec<u64> = samples.iter().map(|s| s.run_ns).collect();
-        run.sort_unstable();
         samples.sort_by_key(|s| s.gpu_ns);
-        // `run_us` (host wall per call, dispatch and sync included) is the basis comparable with XLA's timing.
         println!(
-            "FUSION_BLOCK {{\"us\": {:.1}, \"run_us\": {:.1}, \"dispatches\": {}}}",
+            "FUSION_BLOCK {{\"us\": {:.1}, \"dispatches\": {}}}",
             samples[100].gpu_ns as f64 / 1e3,
-            run[100] as f64 / 1e3,
             samples[100].dispatches
         );
-    }
-
-    /// Every combination of the decode fusion switches (horizontal batching, attention append, attention
-    /// merge) gives the CPU executor's answer on a realistic block at a position past the split threshold.
-    #[test]
-    fn fusion_switches_match_cpu_on_a_decode_block() {
-        let (g, w) = decode_block();
-        let inputs = vec![Tensor::F32(rand(1536, 9)), Tensor::U32(vec![100])];
-        let want = cpu::run(&g, &w, &mut StateStore::new(), inputs.clone())
-            .unwrap()
-            .remove(0)
-            .into_f32()
-            .unwrap();
-        let s = Session::new(rt(), &w).unwrap();
-        // The cost model would decline some fusions at the measured dispatch cost: make all profitable.
-        s.force_dispatch_us(1000.0);
-        let mut dispatches = Vec::new();
-        for bits in 0..8u8 {
-            s.set_fusion_flags(FusionFlags::from_bits(bits));
-            let plan = s.prepare_plan(&g).unwrap();
-            take_run_samples();
-            let got = s
-                .run_prepared(&g, &plan, Some(&mut StateStore::new()), inputs.clone())
-                .unwrap()
-                .remove(0)
-                .into_f32()
-                .unwrap();
-            let e = rel_err(&want, &got);
-            assert!(e < 2e-3, "switches {bits:03b}: {e}");
-            dispatches.push(take_run_samples()[0].dispatches);
-        }
-        // Each switch removes dispatches (index = switch bits: batch 1, append 2, merge 4).
-        for off in [0b110, 0b101, 0b011] {
-            assert!(dispatches[7] < dispatches[off], "{dispatches:?}");
-        }
-    }
-
-    /// Consecutive decode steps (positions 60..128, fresh random activations each, the cache filling as it
-    /// goes) with every fusion forced on, against the CPU executor on the same state sequence: the fused append
-    /// and the ticket merge reuse one partials scratch and counters across steps, so a stale read or an
-    /// unreset ticket shows up as a drift after the first step.
-    #[test]
-    fn fused_decode_steps_stay_equal_to_cpu_over_many_positions() {
-        let (g, w) = decode_block();
-        let s = Session::new(rt(), &w).unwrap();
-        s.force_dispatch_us(1000.0);
-        let plan = s.prepare_plan(&g).unwrap();
-        let (mut cpu_state, mut gpu_state) = (StateStore::new(), StateStore::new());
-        for (i, pos) in (60u32..128).enumerate() {
-            let inputs = vec![Tensor::F32(rand(1536, 100 + i as u64)), Tensor::U32(vec![pos])];
-            let want = cpu::run(&g, &w, &mut cpu_state, inputs.clone())
-                .unwrap()
-                .remove(0)
-                .into_f32()
-                .unwrap();
-            let got = s
-                .run_prepared(&g, &plan, Some(&mut gpu_state), inputs)
-                .unwrap()
-                .remove(0)
-                .into_f32()
-                .unwrap();
-            let e = rel_err(&want, &got);
-            assert!(e < 2e-3, "position {pos}: {e}");
-        }
     }
 
     /// A two-output step's outputs are both live until their own last reader: later steps never
@@ -6292,14 +5775,7 @@ mod tests {
             g.output(o);
         }
         let (steps, aliases) = plan(&g).unwrap();
-        let steps = batch_horizontal(
-            steps,
-            &aliases,
-            &crate::graph::fusion_cost::FusionCost {
-                dispatch_us: 1.2,
-                ceiling_gbps: 300.0,
-            },
-        );
+        let steps = batch_horizontal(steps, &aliases);
         let kinds: Vec<_> = steps
             .iter()
             .map(|s| kernel_kind(&format!("{:?}", s.op)).to_string())
