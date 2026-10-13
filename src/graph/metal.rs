@@ -286,7 +286,7 @@ impl WeightFormat {
             v.push(GemvVariant::HAND);
         }
         if generated {
-            v.extend(tune::gen_variants());
+            v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
         }
         v
     }
@@ -1004,14 +1004,17 @@ impl Runtime {
         Ok(out)
     }
 
-    /// The generated packed-GEMV pipeline for `f` in generated variant `v`, compiled on first use.
-    fn gen_pso(&self, f: QuantFormat, v: GemvVariant) -> Result<ComputePipelineState, String> {
+    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
+    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, v.rows_per_sg * 16 + v.unroll);
+        let key = (c.format, rows_per_sg);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
-        let params = v.params();
+        let params = crate::graph::codegen::GemvParams {
+            rows_per_sg: rows_per_sg as usize,
+            ..Default::default()
+        };
         let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
         src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
         src.push_str(&crate::graph::codegen::gemv_packed(c, params));
@@ -1063,8 +1066,14 @@ impl Runtime {
             mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
-            for v in tune::gen_variants() {
-                mix(&gemv_packed(c, v.params()));
+            for r in tune::GEN_ROWS {
+                mix(&gemv_packed(
+                    c,
+                    GemvParams {
+                        rows_per_sg: r as usize,
+                        ..Default::default()
+                    },
+                ));
             }
         }
         h
@@ -1916,7 +1925,7 @@ impl Session {
             })
             .collect();
         for q in gen_formats {
-            rt.gen_pso(q, GemvVariant::generated(2))?;
+            rt.gen_pso(q, 2)?;
         }
         Ok(Self {
             rt,
@@ -1971,24 +1980,26 @@ impl Session {
         format: WeightFormat,
         variant: GemvVariant,
     ) -> Result<(ComputePipelineState, u64), String> {
-        let generated =
-            |q: QuantFormat, v: GemvVariant| -> Result<(ComputePipelineState, u64), String> {
-                Ok((
-                    self.rt.gen_pso(q, v)?,
-                    crate::graph::codegen::gemv_rows_per_tg(v.params()) as u64,
-                ))
-            };
+        let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
+            Ok((
+                self.rt.gen_pso(q, r)?,
+                crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
+                    rows_per_sg: r as usize,
+                    ..Default::default()
+                }) as u64,
+            ))
+        };
         match (format, variant.kernel) {
             (WeightFormat::Gen(q), _) => generated(
                 q,
                 if variant.kernel == GemvKernel::Gen {
-                    variant
+                    variant.rows_per_sg
                 } else {
-                    GemvVariant::generated(2)
+                    2
                 },
             ),
             (_, GemvKernel::Gen) => match format.codec_format() {
-                Some(q) => generated(q, variant),
+                Some(q) => generated(q, variant.rows_per_sg),
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
             (_, GemvKernel::Hand) => match format.hand_kernel() {
@@ -4511,11 +4522,7 @@ fn print_kernel_profile(
     let mut slowest: Vec<_> = timings.iter().collect();
     slowest.sort_by(|a, b| b.2.total_cmp(&a.2));
     for (name, op_desc, s, bytes) in slowest.into_iter().take(10) {
-        let gbps = if *s > 0.0 {
-            *bytes as f64 / s / 1e9
-        } else {
-            0.0
-        };
+        let gbps = if *s > 0.0 { *bytes as f64 / s / 1e9 } else { 0.0 };
         eprintln!(
             "{:<20} | {:<25} | {:>8.1} | {:>8} | {:>8.1} | {:>7.1}%",
             name,
@@ -7113,9 +7120,6 @@ mod tests {
         assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-6);
         let (_, rows) = last_kernel_profile().unwrap();
         assert!(rows.iter().map(|r| r.steps).sum::<usize>() >= 1, "{rows:?}");
-        assert!(
-            rows.iter().all(|r| r.us >= 0.0 && r.gbps >= 0.0),
-            "{rows:?}"
-        );
+        assert!(rows.iter().all(|r| r.us >= 0.0 && r.gbps >= 0.0), "{rows:?}");
     }
 }
