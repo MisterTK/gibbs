@@ -237,6 +237,11 @@ def main():
         json.dump(state, open(STATE, "w"), indent=1)
         print(f"reset {len(gone)} items")
         return
+    lock = open("target/matrix/runner.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("matrix_run: another runner holds target/matrix/runner.lock")
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     done = 0
