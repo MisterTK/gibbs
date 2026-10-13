@@ -624,15 +624,9 @@ pub fn source_hash() -> u64 {
     let mut h = 0xcbf29ce484222325u64 ^ u64::from(CODEC_VERSION);
     for f in formats() {
         let c = codec(f).expect("listed formats are registered");
-        let generated = crate::graph::tune::GEN_ROWS.map(|r| {
-            gemv_packed(
-                c,
-                GemvParams {
-                    rows_per_sg: r as usize,
-                    ..Default::default()
-                },
-            )
-        });
+        let generated: Vec<String> = crate::graph::tune::gen_variants()
+            .map(|v| gemv_packed(c, v.params()))
+            .collect();
         for b in format!("{f:?}")
             .bytes()
             .chain(c.msl.bytes())
