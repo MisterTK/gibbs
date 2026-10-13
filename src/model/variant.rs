@@ -62,10 +62,14 @@ pub(crate) fn with_unmeasured_host<R>(f: impl FnOnce() -> R) -> R {
 }
 
 fn host<R>(f: impl Fn(&(f64, Option<CodecEff>)) -> R) -> R {
+    // Tests see an unmeasured host unless they pin one: any Metal `Runtime` built by another test thread
+    // publishes its measured rates into HOST, which would make rate-dependent rankings follow the machine.
     #[cfg(test)]
-    if let Some(r) = TEST_HOST.with(|t| t.borrow().as_ref().map(&f)) {
-        return r;
-    }
+    return TEST_HOST.with(|t| match t.borrow().as_ref() {
+        Some(h) => f(h),
+        None => f(&(0.0, None)),
+    });
+    #[cfg(not(test))]
     f(&HOST.read())
 }
 
