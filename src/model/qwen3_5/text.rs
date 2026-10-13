@@ -1929,14 +1929,9 @@ impl TextModel {
                         n,
                     )
                 }
-                Ffn::Moe(_) => {
-                    // `Op::Moe` is one Linear per expert; this FFN is SwiGLU per routed expert over
-                    // packed `[E, out, in]` banks plus a gated shared expert (S4.5 `MoeLinear` /
-                    // `MoeCombine`), which no Metal kernel reads yet.
-                    return Err(format!(
-                        "layer {li}: the mixture-of-experts FFN has no Metal program (needs bank-indexed expert GEMV); run with --backend cpu"
-                    ));
-                }
+                Ffn::Moe(m) => m
+                    .add_to_graph(&mut g, &mut w, &format!("{p}.mlp"), normed_post, n)
+                    .map_err(|e| format!("layer {li}: {e}"))?,
             };
 
             x = g.add(
@@ -2024,6 +2019,21 @@ pub fn tiny_model() -> (TextModel, usize) {
 /// [`tiny_model`] with every weight multiplied by `scale` (the unit-scale weights overflow over
 /// longer prompts, which parity tests need to avoid).
 pub fn tiny_model_scaled(scale: f32) -> (TextModel, usize) {
+    tiny_model_with(scale, None)
+}
+
+/// Tiny synthetic `qwen35moe` text model: [`tiny_model`]'s layers with 8 routed experts (top 2, bf16
+/// fused gate/up tensors) and a shared expert in place of the dense MLPs; `norm` is `norm_topk_prob`.
+pub fn tiny_moe_model(norm: bool) -> (TextModel, usize) {
+    tiny_model_with(0.6, Some(norm))
+}
+
+/// Decode graph of [`tiny_moe_model`].
+pub fn tiny_moe_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    tiny_moe_model(true).0.to_decode_graph()
+}
+
+fn tiny_model_with(scale: f32, moe: Option<bool>) -> (TextModel, usize) {
     let (hidden, vocab, layers, heads, kv_heads, hd) = (128, 128, 2, 4, 2, 32);
     let inter = 128;
     let c_kernel = 4;
@@ -2052,7 +2062,35 @@ pub fn tiny_model_scaled(scale: f32) -> (TextModel, usize) {
             "mrope_section": [1, 1, 2]
         }
     });
+    let (experts, top_k, moe_ff) = (8usize, 2usize, 32usize);
+    let mut cfg = cfg;
+    if let Some(norm) = moe {
+        cfg["num_experts"] = experts.into();
+        cfg["num_experts_per_tok"] = top_k.into();
+        cfg["norm_topk_prob"] = norm.into();
+    }
 
+    // Dense SwiGLU MLP, or routed experts (HF's fused `gate_up_proj` layout) plus a gated shared expert.
+    let mlp_specs = |l: usize| -> Vec<(String, Vec<usize>)> {
+        let p = format!("model.layers.{l}.mlp");
+        let s = |n: &str, shape: Vec<usize>| (format!("{p}.{n}"), shape);
+        if moe.is_none() {
+            return vec![
+                s("gate_proj.weight", vec![inter, hidden]),
+                s("up_proj.weight", vec![inter, hidden]),
+                s("down_proj.weight", vec![hidden, inter]),
+            ];
+        }
+        vec![
+            s("gate.weight", vec![experts, hidden]),
+            s("experts.gate_up_proj", vec![experts, 2 * moe_ff, hidden]),
+            s("experts.down_proj", vec![experts, hidden, moe_ff]),
+            s("shared_expert.gate_proj.weight", vec![moe_ff, hidden]),
+            s("shared_expert.up_proj.weight", vec![moe_ff, hidden]),
+            s("shared_expert.down_proj.weight", vec![hidden, moe_ff]),
+            s("shared_expert_gate.weight", vec![1, hidden]),
+        ]
+    };
     let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
     specs.push(("model.embed_tokens.weight".into(), vec![vocab, hidden]));
     specs.push(("model.norm.weight".into(), vec![hidden]));
@@ -2095,18 +2133,7 @@ pub fn tiny_model_scaled(scale: f32) -> (TextModel, usize) {
         "model.layers.0.linear_attn.out_proj.weight".into(),
         vec![hidden, lin_vh * lin_vd],
     ));
-    specs.push((
-        "model.layers.0.mlp.gate_proj.weight".into(),
-        vec![inter, hidden],
-    ));
-    specs.push((
-        "model.layers.0.mlp.up_proj.weight".into(),
-        vec![inter, hidden],
-    ));
-    specs.push((
-        "model.layers.0.mlp.down_proj.weight".into(),
-        vec![hidden, inter],
-    ));
+    specs.extend(mlp_specs(0));
 
     // Layer 1: Full Attention (with attn_output_gate)
     specs.push(("model.layers.1.input_layernorm.weight".into(), vec![hidden]));
@@ -2132,18 +2159,7 @@ pub fn tiny_model_scaled(scale: f32) -> (TextModel, usize) {
     ));
     specs.push(("model.layers.1.self_attn.q_norm.weight".into(), vec![hd]));
     specs.push(("model.layers.1.self_attn.k_norm.weight".into(), vec![hd]));
-    specs.push((
-        "model.layers.1.mlp.gate_proj.weight".into(),
-        vec![inter, hidden],
-    ));
-    specs.push((
-        "model.layers.1.mlp.up_proj.weight".into(),
-        vec![inter, hidden],
-    ));
-    specs.push((
-        "model.layers.1.mlp.down_proj.weight".into(),
-        vec![hidden, inter],
-    ));
+    specs.extend(mlp_specs(1));
 
     let shapes: std::collections::HashMap<String, usize> = specs
         .iter()
@@ -2157,9 +2173,16 @@ pub fn tiny_model_scaled(scale: f32) -> (TextModel, usize) {
             .map(|(i, b)| (i + 1) * b as usize)
             .sum();
         let count = shapes[name];
-        Ok((0..count)
-            .map(|i| scale * (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0)
-            .collect())
+        // The periodic pattern ties router logits between experts; a sparse model needs distinct ones.
+        let value = |i: usize| match moe {
+            None => (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0,
+            Some(_) => {
+                let h = ((i + 1) as u64 * 0x9E3779B97F4A7C15 ^ n as u64 * 0xD1B54A32D192ED03)
+                    .wrapping_mul(0x2545F4914F6CDD1D);
+                ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 1.6
+            }
+        };
+        Ok((0..count).map(|i| scale * value(i)).collect())
     })
     .unwrap();
 
@@ -2663,5 +2686,125 @@ mod tests {
         );
         assert!(!generated.is_empty(), "Must generate tokens");
         assert!(!text.is_empty(), "Generated text must not be empty");
+    }
+
+    /// Tiny synthetic `qwen3moe`: two full-attention layers, per-expert bf16 matrices
+    /// (`mlp.experts.N.*_proj`), no shared expert.
+    fn tiny_qwen3_moe_model(norm: bool) -> (TextModel, usize) {
+        let (hidden, vocab, heads, hd, kv_heads) = (64usize, 128usize, 4usize, 16usize, 2usize);
+        let (experts, top_k, ff) = (8usize, 2usize, 32usize);
+        let cfg = serde_json::json!({
+            "hidden_size": hidden, "vocab_size": vocab, "num_hidden_layers": 2,
+            "num_attention_heads": heads, "num_key_value_heads": kv_heads, "head_dim": hd,
+            "max_position_embeddings": 64, "rope_scaling": {"rope_theta": 10000.0},
+            "num_experts": experts, "num_experts_per_tok": top_k, "norm_topk_prob": norm,
+        });
+        let mut specs: Vec<(String, Vec<usize>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![vocab, hidden]),
+            ("model.norm.weight".into(), vec![hidden]),
+            ("lm_head.weight".into(), vec![vocab, hidden]),
+        ];
+        for l in 0..2 {
+            let p = format!("model.layers.{l}");
+            let mut s = |n: &str, shape: Vec<usize>| specs.push((format!("{p}.{n}"), shape));
+            s("input_layernorm.weight", vec![hidden]);
+            s("post_attention_layernorm.weight", vec![hidden]);
+            s("self_attn.q_proj.weight", vec![heads * hd, hidden]);
+            s("self_attn.k_proj.weight", vec![kv_heads * hd, hidden]);
+            s("self_attn.v_proj.weight", vec![kv_heads * hd, hidden]);
+            s("self_attn.o_proj.weight", vec![hidden, heads * hd]);
+            s("self_attn.q_norm.weight", vec![hd]);
+            s("self_attn.k_norm.weight", vec![hd]);
+            s("mlp.gate.weight", vec![experts, hidden]);
+            for e in 0..experts {
+                s(&format!("mlp.experts.{e}.gate_proj.weight"), vec![ff, hidden]);
+                s(&format!("mlp.experts.{e}.up_proj.weight"), vec![ff, hidden]);
+                s(&format!("mlp.experts.{e}.down_proj.weight"), vec![hidden, ff]);
+            }
+        }
+        let sizes: std::collections::HashMap<String, usize> = specs
+            .iter()
+            .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
+            .collect();
+        let weights = crate::model::weights::Weights::from_f32(specs, |name| {
+            let n: u64 = name.bytes().enumerate().map(|(i, b)| (i as u64 + 1) * b as u64).sum();
+            Ok((0..sizes[name])
+                .map(|i| {
+                    let h = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15) ^ n.wrapping_mul(0xD1B54A32D192ED03))
+                        .wrapping_mul(0x2545F4914F6CDD1D);
+                    ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.8
+                })
+                .collect())
+        })
+        .unwrap();
+        (TextModel::load(&weights, &cfg, Arch::Qwen3).unwrap(), hidden)
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+        dot / (norm(a) * norm(b)).max(1e-30)
+    }
+
+    /// Greedy steps of the host forward against the decode graph on the CPU executor and (macOS) the
+    /// Metal program: cosine >= 0.999 on every step, and the same arg-max token.
+    fn moe_program_matches_host(text_model: &TextModel, hidden: usize, what: &str) {
+        let (g, w) = text_model.to_decode_graph().unwrap();
+        assert!(
+            g.nodes.iter().any(|n| matches!(n.op, crate::graph::Op::MoeLinear { .. })),
+            "{what}: the decode graph routes through MoeLinear"
+        );
+        #[cfg(target_os = "macos")]
+        let mut prog = crate::graph::program::GraphProgram::compile(
+            g.clone(),
+            w.clone(),
+            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+        )
+        .expect("compile the MoE decode graph on Metal");
+        #[cfg(target_os = "macos")]
+        assert_eq!(prog.cpu_node_count(), 0, "{what}: every node runs on Metal");
+        let mut host_state = text_model.new_state();
+        let mut cpu_state = crate::graph::StateStore::new();
+        let mut tok = 7u32;
+        for pos in 0..6usize {
+            let mut emb = vec![0.0f32; hidden];
+            text_model.embed(tok, &mut emb).unwrap();
+            let hid = text_model.forward_rows(
+                emb.clone(), &[[pos as u32; 3]], pos, &mut host_state, 0, usize::MAX,
+                &[], &[], false, &[], &mut Vec::new(),
+            );
+            let want = text_model.logits(&hid, 1);
+            let inputs = || vec![crate::graph::Tensor::F32(emb.clone()), crate::graph::Tensor::U32(vec![pos as u32])];
+            let on_cpu = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
+            let on_cpu = on_cpu[0].as_f32().unwrap();
+            let c = cosine(&want, on_cpu);
+            assert!(c >= 0.999, "{what}: step {pos}: CPU graph vs host cosine {c}");
+            #[cfg(target_os = "macos")]
+            {
+                let on_metal = prog.run(inputs()).unwrap();
+                let on_metal = on_metal[0].as_f32().unwrap();
+                let c = cosine(&want, on_metal);
+                assert!(c >= 0.999, "{what}: step {pos}: Metal program vs host cosine {c}");
+                let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+                assert_eq!(argmax(&want), argmax(on_metal), "{what}: step {pos}: greedy token");
+            }
+            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        }
+    }
+
+    #[test]
+    fn qwen35moe_decode_graph_matches_host_forward() {
+        for norm in [true, false] {
+            let (m, hidden) = tiny_moe_model(norm);
+            moe_program_matches_host(&m, hidden, &format!("qwen35moe norm_topk_prob={norm}"));
+        }
+    }
+
+    #[test]
+    fn qwen3moe_decode_graph_matches_host_forward() {
+        for norm in [true, false] {
+            let (m, hidden) = tiny_qwen3_moe_model(norm);
+            moe_program_matches_host(&m, hidden, &format!("qwen3moe norm_topk_prob={norm}"));
+        }
     }
 }

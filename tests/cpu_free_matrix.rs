@@ -85,10 +85,15 @@ fn gpu_fixture(f: Family) {
         Family::Gemma4 => {
             let (g, w) = gibbs_engine::model::gemma4::tiny_decode_graph().expect("tiny gemma4 graph");
             run_on_gpu("Gemma4", g, w);
+            // Sparse layers: router, TopK, GatherCols and the banked expert GEMVs, all on Metal.
+            let (g, w) = gibbs_engine::model::gemma4::tiny_moe_decode_graph().expect("tiny gemma4 MoE graph");
+            run_on_gpu("Gemma4 MoE", g, w);
         }
         Family::Qwen35 => {
             let (g, w) = gibbs_engine::model::qwen3_5::tiny_decode_graph().expect("tiny qwen graph");
             run_on_gpu("Qwen35", g, w);
+            let (g, w) = gibbs_engine::model::qwen3_5::tiny_moe_decode_graph().expect("tiny qwen MoE graph");
+            run_on_gpu("Qwen35 MoE", g, w);
         }
         Family::Qwen35Vision => {
             let (g, w) = gibbs_engine::model::qwen3_5::tiny_vision_tower_graph().expect("tiny vision tower graph");
