@@ -398,8 +398,11 @@ const ATTN_MAX_HEAD_DIM: usize = 512;
 /// Decode attention splits its keys across threadgroups from this many visible keys, about
 /// `ATTN_SPLIT_KEYS` per slice and at most `ATTN_MAX_SPLITS` slices.
 const ATTN_SPLIT_MIN_KEYS: usize = 128;
-const ATTN_SPLIT_KEYS: usize = 64;
+const ATTN_SPLIT_KEYS: usize = 32;
 const ATTN_MAX_SPLITS: usize = 32;
+const ATTN_TARGET_TGS: usize = 64;
+/// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
+const ATTN_HPT: usize = 4;
 const BASE_KERNELS: [&str; 52] = [
     "embedding_f32",
     "layer_norm_f32",
@@ -446,7 +449,7 @@ const BASE_KERNELS: [&str; 52] = [
     "kv_append_batched",
     "attn_cached_f32",
     "flash_attn_cached_f32",
-    "attn_cached_split_f32",
+    "attn_cached_gqa_split_f32",
     "attn_cached_merge_f32",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
@@ -3038,13 +3041,18 @@ impl Session {
                     (k, v)
                 };
 
-                // Long decode cache: one threadgroup per (head, key slice) plus a merge, instead of one per
-                // head scanning every key (8 threadgroups on a 20-core GPU).
+                // Long decode cache: one threadgroup per (KV head group, key slice) plus a merge, instead of
+                // one per head scanning every key (8 threadgroups on a 20-core GPU). Slices of at least
+                // `ATTN_SPLIT_KEYS` keys, enough of them for about `ATTN_TARGET_TGS` threadgroups.
                 let len = start_pos as usize + 1;
                 let lo = window.map_or(0, |w| len.saturating_sub(w));
                 let n_keys = len - lo;
                 let n_splits = if m == 1 && vis.is_none() && n_keys >= ATTN_SPLIT_MIN_KEYS {
-                    (n_keys / ATTN_SPLIT_KEYS).clamp(2, ATTN_MAX_SPLITS)
+                    let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
+                    ATTN_TARGET_TGS
+                        .div_ceil(head_tgs)
+                        .min(n_keys / ATTN_SPLIT_KEYS)
+                        .clamp(2, ATTN_MAX_SPLITS)
                 } else {
                     1
                 };
@@ -3059,7 +3067,7 @@ impl Session {
                     }
                 }
                 enc.set_compute_pipeline_state(if n_splits > 1 {
-                    rt.pso("attn_cached_split_f32")?
+                    rt.pso("attn_cached_gqa_split_f32")?
                 } else {
                     rt.pso("flash_attn_cached_f32")
                         .or_else(|_| rt.pso("attn_cached_f32"))?
@@ -3103,8 +3111,13 @@ impl Session {
                     chunk: n_keys.div_ceil(n_splits) as u32,
                 };
                 set_bytes(enc, 4, &p);
+                let tgs_x = if n_splits > 1 {
+                    kv_heads * group.div_ceil(ATTN_HPT)
+                } else {
+                    heads
+                };
                 enc.dispatch_thread_groups(
-                    MTLSize::new(heads as u64, m as u64, n_splits as u64),
+                    MTLSize::new(tgs_x as u64, m as u64, n_splits as u64),
                     MTLSize::new(TG4, 1, 1),
                 );
                 if let Some(part) = scratch_guard.as_ref().filter(|_| n_splits > 1) {
@@ -7127,77 +7140,144 @@ mod tests {
     /// grouped KV heads): the split + merge path equals the CPU executor.
     #[test]
     fn split_decode_attention_matches_cpu() {
-        let (heads, kv_heads, hd, max_seq, prefill) = (4, 2, 32, 1024, 700);
-        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-        for window in [None, Some(300), Some(90)] {
-            let make = |m: usize| {
-                let mut g = Graph::new();
-                let q = g.input("q", vec![m, q_dim], DType::F32);
-                let k = g.input("k", vec![m, kv_dim], DType::F32);
-                let v = g.input("v", vec![m, kv_dim], DType::F32);
-                let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
-                let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
-                let pos = g.input("pos", vec![m], DType::U32);
-                let out = g.add(
-                    "attn",
-                    Op::CachedAttention {
-                        heads,
-                        kv_heads,
-                        head_dim: hd,
-                        v_head_dim: hd,
-                        scale: 1.0 / (hd as f32).sqrt(),
-                        causal: true,
-                        window,
-                        soft_cap: Some(30.0),
-                        write: true,
-                    },
-                    &[q, k, v, ks, vs, pos],
-                    vec![m, q_dim],
-                    DType::F32,
-                );
-                g.output(out);
-                g
-            };
-            let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
-            let session = Session::new(rt(), &Weights::new()).unwrap();
-            let step = |g: &Graph,
-                        m: usize,
-                        at: usize,
-                        seed: u64,
-                        cs: &mut StateStore,
-                        ms: &mut StateStore| {
-                let inputs = vec![
-                    Tensor::F32(rand(m * q_dim, seed)),
-                    Tensor::F32(rand(m * kv_dim, seed + 1)),
-                    Tensor::F32(rand(m * kv_dim, seed + 2)),
-                    Tensor::U32((at..at + m).map(|p| p as u32).collect()),
-                ];
-                let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
-                let got = session.run_with_state(g, Some(ms), inputs).unwrap();
-                rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
-            };
-            let e = step(
-                &make(prefill),
-                prefill,
-                0,
-                1,
-                &mut cpu_state,
-                &mut metal_state,
-            );
-            assert!(e < 1e-4, "prefill {window:?}: {e}");
-            let decode = make(1);
-            // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
-            for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
+        let (max_seq, prefill) = (1024, 700);
+        // Query heads per KV head: 2 (a partial head tile), 8 (two tiles), 1.
+        for (heads, kv_heads, hd) in [(4usize, 2usize, 32usize), (8, 1, 64), (3, 3, 32)] {
+            let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+            for window in [None, Some(300), Some(90)] {
+                let make = |m: usize| {
+                    let mut g = Graph::new();
+                    let q = g.input("q", vec![m, q_dim], DType::F32);
+                    let k = g.input("k", vec![m, kv_dim], DType::F32);
+                    let v = g.input("v", vec![m, kv_dim], DType::F32);
+                    let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
+                    let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+                    let pos = g.input("pos", vec![m], DType::U32);
+                    let out = g.add(
+                        "attn",
+                        Op::CachedAttention {
+                            heads,
+                            kv_heads,
+                            head_dim: hd,
+                            v_head_dim: hd,
+                            scale: 1.0 / (hd as f32).sqrt(),
+                            causal: true,
+                            window,
+                            soft_cap: Some(30.0),
+                            write: true,
+                        },
+                        &[q, k, v, ks, vs, pos],
+                        vec![m, q_dim],
+                        DType::F32,
+                    );
+                    g.output(out);
+                    g
+                };
+                let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
+                let session = Session::new(rt(), &Weights::new()).unwrap();
+                let step = |g: &Graph,
+                            m: usize,
+                            at: usize,
+                            seed: u64,
+                            cs: &mut StateStore,
+                            ms: &mut StateStore| {
+                    let inputs = vec![
+                        Tensor::F32(rand(m * q_dim, seed)),
+                        Tensor::F32(rand(m * kv_dim, seed + 1)),
+                        Tensor::F32(rand(m * kv_dim, seed + 2)),
+                        Tensor::U32((at..at + m).map(|p| p as u32).collect()),
+                    ];
+                    let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
+                    let got = session.run_with_state(g, Some(ms), inputs).unwrap();
+                    rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
+                };
                 let e = step(
-                    &decode,
+                    &make(prefill),
+                    prefill,
+                    0,
                     1,
-                    at,
-                    10 + 3 * i as u64,
                     &mut cpu_state,
                     &mut metal_state,
                 );
-                assert!(e < 1e-4, "decode at {at} {window:?}: {e}");
+                assert!(e < 1e-4, "prefill {window:?}: {e}");
+                let decode = make(1);
+                // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
+                for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
+                    let e = step(
+                        &decode,
+                        1,
+                        at,
+                        10 + 3 * i as u64,
+                        &mut cpu_state,
+                        &mut metal_state,
+                    );
+                    assert!(e < 1e-4, "decode at {at} {window:?}: {e}");
+                }
             }
+        }
+    }
+
+    /// Decode attention GPU time over a long cache for the Gemma-4 layer shapes (8 query heads on one KV
+    /// head: full attention hd 512, sliding hd 256 with a 512 window)
+    /// (`cargo test --release --lib attention_decode_rates -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn attention_decode_rates() {
+        for (heads, kv_heads, hd, window, at) in [
+            (8usize, 1usize, 512usize, None, 4096usize),
+            (8, 1, 256, Some(512usize), 4096),
+            (8, 4, 128, None, 4096),
+        ] {
+            let (q_dim, kv_dim, max_seq) = (heads * hd, kv_heads * hd, 8192);
+            let mut g = Graph::new();
+            let q = g.input("q", vec![1, q_dim], DType::F32);
+            let k = g.input("k", vec![1, kv_dim], DType::F32);
+            let v = g.input("v", vec![1, kv_dim], DType::F32);
+            let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
+            let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+            let pos = g.input("pos", vec![1], DType::U32);
+            let out = g.add(
+                "attn",
+                Op::CachedAttention {
+                    heads,
+                    kv_heads,
+                    head_dim: hd,
+                    v_head_dim: hd,
+                    scale: 1.0,
+                    causal: true,
+                    window,
+                    soft_cap: None,
+                    write: true,
+                },
+                &[q, k, v, ks, vs, pos],
+                vec![1, q_dim],
+                DType::F32,
+            );
+            g.output(out);
+            let session = Session::new(rt(), &Weights::new()).unwrap();
+            let mut state = StateStore::new();
+            let mut best = f64::INFINITY;
+            for i in 0..12 {
+                let inputs = vec![
+                    Tensor::F32(rand(q_dim, 1 + i)),
+                    Tensor::F32(rand(kv_dim, 2)),
+                    Tensor::F32(rand(kv_dim, 3)),
+                    Tensor::U32(vec![at as u32]),
+                ];
+                session
+                    .run_with_state(&g, Some(&mut state), inputs)
+                    .unwrap();
+                if i >= 2 {
+                    best = best.min(session.last_gpu_seconds());
+                }
+            }
+            let keys = window.map_or(at + 1, |w| w.min(at + 1));
+            let bytes = (keys * kv_dim * 2 * 4) as f64;
+            println!(
+                "attention heads {heads} kv {kv_heads} hd {hd} window {window:?} keys {keys}: {:.0} us, {:.0} GB/s of KV",
+                best * 1e6,
+                bytes / best / 1e9
+            );
         }
     }
 
