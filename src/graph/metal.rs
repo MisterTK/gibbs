@@ -4617,7 +4617,11 @@ fn print_kernel_profile(
     }
     let mut slowest: Vec<_> = timings.iter().collect();
     slowest.sort_by(|a, b| b.2.total_cmp(&a.2));
-    for (name, op_desc, s, bytes) in slowest.into_iter().take(10) {
+    let show = std::env::var("GIBBS_PROFILE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    for (name, op_desc, s, bytes) in slowest.into_iter().take(show) {
         let gbps = if *s > 0.0 {
             *bytes as f64 / s / 1e9
         } else {

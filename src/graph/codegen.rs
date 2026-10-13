@@ -1,4 +1,4 @@
-use crate::graph::codec::Codec;
+use crate::graph::codec::{wide, Codec};
 
 #[derive(Debug, Clone, Copy)]
 pub struct GemvParams {
@@ -253,18 +253,12 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let dec = format!("decode8_{:?}", codec.format);
     let codec_msl = codec.msl.replace("decode8", &dec);
     let r = p.rows_per_sg;
-    let (be, bb) = (codec.block_elems, codec.block_bytes);
+    let be = codec.block_elems;
     let acc_decl = (0..r)
         .map(|i| format!("float acc{i} = 0.0f;"))
         .collect::<Vec<_>>()
         .join(" ");
-    let rows_loop: String = (0..r)
-        .map(|i| {
-            format!(
-                "        if (row0 + {i} < p.rows) {{\n            device const uchar* b = w + ((ulong)(row0 + {i}) * blocks_per_row + blk) * {bb};\n            float v[8];\n            {dec}(b, sub, v);\n            acc{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n        }}\n"
-            )
-        })
-        .collect();
+    let loop_src = gemv_loop(codec, p, &dec);
     let store: String = (0..r)
         .map(|i| {
             format!(
@@ -278,7 +272,7 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     format!(
         r#"
 {codec_msl}
-
+{wide_msl}
 kernel void {name}(
     device const uchar* w [[buffer(0)]],
     device const float* x [[buffer(1)]],
@@ -293,21 +287,78 @@ kernel void {name}(
     const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint batch = tg.y;
     if (row0 >= p.rows || batch >= p.batch_size) return;
-    const uint subs = p.cols / 8;
     const uint blocks_per_row = p.cols / {be};
     device const float* xb = x + (ulong)batch * p.cols;
     {acc_decl}
-    for (uint s = lane; s < subs; s += 32) {{
-        float4 x0 = *(device const float4*)(xb + s * 8);
-        float4 x1 = *(device const float4*)(xb + s * 8 + 4);
-        const uint blk = (s * 8) / {be};
-        const uint sub = ((s * 8) % {be}) / 8;
-{rows_loop}    }}
-{sums}    if (lane == 0) {{
+{loop_src}{sums}    if (lane == 0) {{
 {store}    }}
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
+        wide_msl = wide(codec.format)
+            .map(|w| w
+                .msl
+                .replace("decode_group", &dec.replace("decode8", "decode_group"))
+                .replace("group_seg", &dec.replace("decode8", "group_seg")))
+            .unwrap_or_default(),
+    )
+}
+
+/// The lane loop of [`gemv_packed`]: one 8-element sub-block per iteration (`decode8`), or, for a codec
+/// with a [`wide`] decode, one group of `segs` sub-blocks (its bytes are read once, not once per sub-block).
+fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
+    let (be, bb, r) = (codec.block_elems, codec.block_bytes, p.rows_per_sg);
+    let row = |i: usize, decode: &str, dots: &str, v_len: u32| {
+        format!(
+            "        if (row0 + {i} < p.rows) {{\n            device const uchar* b = w + ((ulong)(row0 + {i}) * blocks_per_row + blk) * {bb};\n            float v[{v_len}];\n            {decode}\n{dots}        }}\n"
+        )
+    };
+    let Some(wd) = wide(codec.format) else {
+        let rows: String = (0..r)
+            .map(|i| {
+                row(
+                    i,
+                    &format!("{dec}(b, sub, v);"),
+                    &format!("            acc{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n"),
+                    8,
+                )
+            })
+            .collect();
+        return format!(
+            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
+        );
+    };
+    let (gdec, gseg) = (
+        dec.replace("decode8", "decode_group"),
+        dec.replace("decode8", "group_seg"),
+    );
+    let xs: String = (0..wd.segs)
+        .map(|k| {
+            format!(
+                "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = *(device const float4*)(xb + e); xs[{}] = *(device const float4*)(xb + e + 4); }}\n",
+                2 * k,
+                2 * k + 1
+            )
+        })
+        .collect();
+    let rows: String = (0..r)
+        .map(|i| {
+            let mut dots: String = "            float t = 0.0f;\n".into();
+            for k in 0..wd.segs {
+                let o = 8 * k;
+                dots += &format!("            t += dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs[{}]);\n", o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1);
+            }
+            dots += &format!("            acc{i} += v[{}] * (t - {:?}f * sx);\n", 8 * wd.segs, wd.offset);
+            row(i, &format!("{gdec}(b, g, v);"), &dots, 8 * wd.segs + 1)
+        })
+        .collect();
+    let groups = wd.groups;
+    let sx: String = (0..2 * wd.segs)
+        .map(|j| format!(" + xs[{j}].x + xs[{j}].y + xs[{j}].z + xs[{j}].w"))
+        .collect();
+    format!(
+        "    const uint groups = blocks_per_row * {groups};\n    for (uint s = lane; s < groups; s += 32) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        float4 xs[{}];\n{xs}        const float sx = 0.0f{sx};\n{rows}    }}\n",
+        2 * wd.segs
     )
 }
 
@@ -327,7 +378,10 @@ pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
     let codec_msl = codec.msl.replace("decode8", &dec);
     let r = p.rows_per_sg;
     let (be, bb) = (codec.block_elems, codec.block_bytes);
-    let acc_decl = (0..r).map(|i| format!("float acc{i} = 0.0f;")).collect::<Vec<_>>().join(" ");
+    let acc_decl = (0..r)
+        .map(|i| format!("float acc{i} = 0.0f;"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let rows_loop: String = (0..r)
         .map(|i| {
             format!(
