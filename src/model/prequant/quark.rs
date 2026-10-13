@@ -305,7 +305,13 @@ pub fn annotate(m: &mut ModelManifest, config_path: Option<&Path>) -> Result<(),
     }
     m.metadata.extend(specs);
     for (name, shape) in shapes {
-        m.tensors.get_mut(&name).unwrap().shape = shape.to_vec();
+        let t = m.tensors.get_mut(&name).unwrap();
+        t.shape = shape.to_vec();
+        // quark expands its own fp4 (`dequantize`); `alias_packed` cannot tell it from OCP MXFP4
+        // checkpoints, which repack to ggml blocks, so it keeps the tag it always had.
+        if t.quant_format == crate::hardware::QuantFormat::MXFP4 {
+            t.quant_format = crate::hardware::QuantFormat::NVFP4;
+        }
     }
     Ok(())
 }
@@ -803,5 +809,47 @@ mod tests {
         assert_eq!(dtype("lm_head"), Ok(None));
         assert_eq!(dtype("model.layers.3.mlp.gate"), Ok(None));
         assert!(dtype("model.layers.0.self_attn.v_proj").is_err());
+    }
+
+    /// A quark MX fp4 weight still is not repacked (it decodes through [`dequantize`]) and keeps its
+    /// pre-existing NVFP4 tag once the config has been applied.
+    #[test]
+    fn quark_fp4_stays_out_of_the_mxfp4_repack() {
+        use crate::model::{ModelManifest, VirtualTensor};
+        let (rows, cols) = (2usize, 64usize);
+        let mut m = ModelManifest::default();
+        let mut data = Vec::new();
+        for (name, shape, len) in [
+            ("l.weight", vec![rows, cols / 2], rows * cols / 2),
+            ("l.weight_scale", vec![rows, cols / 32], rows * cols / 32),
+        ] {
+            m.tensors.insert(
+                name.into(),
+                VirtualTensor {
+                    name: name.into(),
+                    shape,
+                    quant_format: crate::hardware::QuantFormat::FP32,
+                    byte_offset: data.len(),
+                    byte_len: len,
+                    dtype: "U8".into(),
+                    shard_index: 0,
+                },
+            );
+            data.extend(std::iter::repeat(0x77u8).take(len));
+        }
+        super::super::alias_packed(&mut m, &data).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"quantization_config":{"quant_method":"quark","global_quant_config":{"weight":{"dtype":"fp4","qscheme":"per_group","group_size":32,"ch_axis":-1,"scale_format":"e8m0"}}}}"#,
+        )
+        .unwrap();
+        super::annotate(&mut m, Some(&cfg)).unwrap();
+        assert_eq!(m.tensors["l.weight"].quant_format, crate::hardware::QuantFormat::NVFP4);
+        assert_eq!(m.tensors["l.weight"].shape, [rows, cols]);
+        // `repack` reads only MXFP4-tagged weights, so quark's fp4 goes the way it always did.
+        assert!(crate::model::repack::repack(&m, &data, "l.weight").unwrap().is_none());
+        assert!(super::super::dequantize(&m, &data, "l.weight").unwrap().is_some());
     }
 }
