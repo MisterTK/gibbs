@@ -2059,6 +2059,10 @@ struct DeltaRuleParams {
     uint rep;
 };
 
+// Gated delta rule, one threadgroup per (32 value columns, head): 4 simdgroups split the key rows of the
+// state (`i = group + 4r`), lanes are the columns (coalesced state access), q/k are normalised once into
+// threadgroup memory and the per-column sums are combined through it. Requires key_dim <= DELTA_MAX_KD.
+constant uint DELTA_MAX_KD = 512;
 kernel void delta_rule_f32(device const float* q [[buffer(0)]],
                            device const float* k [[buffer(1)]],
                            device const float* v [[buffer(2)]],
@@ -2068,16 +2072,17 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
                            device float* out [[buffer(6)]],
                            constant DeltaRuleParams& p [[buffer(7)]],
                            uint2 tg [[threadgroup_position_in_grid]],
-                           uint lane [[thread_index_in_simdgroup]]) {
-    uint j = tg.x * 32 + lane;
-    uint h = tg.y;
-    if (h >= p.val_heads || j >= p.val_dim) return;
-    uint kh = p.key_heads;
-    uint kd = p.key_dim;
-    uint vd = p.val_dim;
-    uint vh = p.val_heads;
-    uint rep = p.rep;
-    uint k_h = h / rep;
+                           uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float ks[DELTA_MAX_KD];
+    threadgroup float qs[DELTA_MAX_KD];
+    threadgroup float red[8];
+    threadgroup float part[128];
+    const uint lane = tid & 31, g = tid >> 5;
+    const uint j = tg.x * 32 + lane;
+    const uint h = tg.y;
+    const bool live = j < p.val_dim;
+    const uint kh = p.key_heads, kd = p.key_dim, vd = p.val_dim, vh = p.val_heads;
+    const uint k_h = h / p.rep;
 
     device float* ssm_state = state + (ulong)h * kd * vd;
 
@@ -2085,34 +2090,55 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
         device const float* q_in = q + ((ulong)t * kh + k_h) * kd;
         device const float* k_in = k + ((ulong)t * kh + k_h) * kd;
         device const float* v_t = v + ((ulong)t * vh + h) * vd;
-        float b = beta[(ulong)t * vh + h];
-        float ld = log_decay[(ulong)t * vh + h];
-        float decay = exp(ld);
+        const float b = beta[(ulong)t * vh + h];
+        const float decay = exp(log_decay[(ulong)t * vh + h]);
 
-        float q_norm = 0.0f;
-        float k_norm = 0.0f;
-        for (uint i = 0; i < kd; ++i) {
-            q_norm += q_in[i] * q_in[i];
-            k_norm += k_in[i] * k_in[i];
+        float qn = 0.0f, kn = 0.0f;
+        for (uint i = tid; i < kd; i += 128) {
+            qn += q_in[i] * q_in[i];
+            kn += k_in[i] * k_in[i];
         }
-        q_norm = max(sqrt(q_norm), 1e-12f);
-        k_norm = max(sqrt(k_norm), 1e-12f);
-        float q_scale = (1.0f / sqrt(float(kd))) / q_norm;
-        float k_scale = 1.0f / k_norm;
+        qn = simd_sum(qn);
+        kn = simd_sum(kn);
+        if (lane == 0) {
+            red[g] = qn;
+            red[4 + g] = kn;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float q_norm = max(sqrt(red[0] + red[1] + red[2] + red[3]), 1e-12f);
+        const float k_norm = max(sqrt(red[4] + red[5] + red[6] + red[7]), 1e-12f);
+        const float q_scale = (1.0f / sqrt(float(kd))) / q_norm;
+        const float k_scale = 1.0f / k_norm;
+        for (uint i = tid; i < kd; i += 128) {
+            ks[i] = k_in[i] * k_scale;
+            qs[i] = q_in[i] * q_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float kv_j = 0.0f;
-        for (uint i = 0; i < kd; ++i) {
-            kv_j += ssm_state[i * vd + j] * (k_in[i] * k_scale);
+        float kv = 0.0f;
+        if (live) {
+            for (uint i = g; i < kd; i += 4) kv += ssm_state[i * vd + j] * ks[i];
         }
-        float delta_j = b * (v_t[j] - decay * kv_j);
-        for (uint i = 0; i < kd; ++i) {
-            ssm_state[i * vd + j] = decay * ssm_state[i * vd + j] + (k_in[i] * k_scale) * delta_j;
+        part[tid] = kv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float kv_j = part[lane] + part[32 + lane] + part[64 + lane] + part[96 + lane];
+        const float delta_j = live ? b * (v_t[j] - decay * kv_j) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float o = 0.0f;
+        if (live) {
+            for (uint i = g; i < kd; i += 4) {
+                const float s = decay * ssm_state[i * vd + j] + ks[i] * delta_j;
+                ssm_state[i * vd + j] = s;
+                o += s * qs[i];
+            }
         }
-        float out_j = 0.0f;
-        for (uint i = 0; i < kd; ++i) {
-            out_j += ssm_state[i * vd + j] * (q_in[i] * q_scale);
+        part[tid] = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (g == 0 && live) {
+            out[((ulong)t * vh + h) * vd + j] = part[lane] + part[32 + lane] + part[64 + lane] + part[96 + lane];
         }
-        out[((ulong)t * vh + h) * vd + j] = out_j;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
