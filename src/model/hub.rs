@@ -846,7 +846,8 @@ pub fn select_weight_files(
                 files: vec![p],
                 tier: 0,
                 // SD repos ship `*-inpainting.safetensors` beside the text-to-image checkpoint.
-                rank: hub_rank(q, bytes, policy) + if lower.contains("inpaint") { 1e6 } else { 0.0 },
+                rank: hub_rank(q, bytes, policy)
+                    + if lower.contains("inpaint") { 1e6 } else { 0.0 },
                 matches: Box::new(move |eq| quant_matches(eq, q, p)),
             });
         } else if let Some((prefix, ext)) =
@@ -2929,8 +2930,13 @@ mod tests {
         );
     }
 
+    // The default ranking reads measured codec rates; pin them so the expectations do not follow the host.
     #[test]
     fn test_select_weight_files_policy() {
+        crate::model::variant::with_unmeasured_host(select_weight_files_policy);
+    }
+
+    fn select_weight_files_policy() {
         let ls = |names: &[(&str, Option<u64>)]| -> Vec<RepoFile> {
             names
                 .iter()
