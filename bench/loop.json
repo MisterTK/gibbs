@@ -34,6 +34,9 @@
       "reference": true
     },
     {
+      "id": "unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf"
+    },
+    {
       "id": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
       "name": "e2b-qat-ctx4k",
       "prompt_file": "prompts/long-4k.txt",
