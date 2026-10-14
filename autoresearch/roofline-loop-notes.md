@@ -277,3 +277,6 @@ The 0.69x host-wall ratio above compares a Rust host wall with jax-metal's Pytho
 ## Iteration 27 (lane-split Q4_0 hand GEMV, `6126f9d`): verify INVALID, still unverdicted
 - The quiet gate opened (rc=0) but the ABBA ran at 11.2% geomean (normal 47%) and E2B QAT at 24 tok/s (normal 130): the user's `forecast` job (a `proxy` stage) resumed during the run. delta -0.03 pp, noise 0.26, but 1 model ratio 0.918 and absolute numbers 4x low make the run unusable (`target/loop/verify28c_invalid.json`). The gate only checks before launch; a mid-run check would need a change to the frozen `loop_verify.sh`.
 - Contended tune entries (Q4_0, norm) were purged from the tune cache before this run. State: Q4_0 change on main HEAD unverified; F2 (`experiment/f2-norm-prologue`) waits behind it. A valid verify needs `forecast` paused for about 45 min.
+
+## Iteration 27b (Q4_0 lane-split, ungated verify): INCONCLUSIVE
+- User directive: run without waiting for a quiet GPU. Result: delta +0.92 pp, noise 1.37, min ratio 0.955 (Llama Q4_0), base geomean 38.6 (normal 47), so the machine was ~20% slower than usual during the run. Not a keep (delta < noise). Not reverted: F2 (`experiment/f2-norm-prologue`) sits on it, so the next verify measures F2 + Q4_0 split together against base `33187e7`; microbench (164 -> 206 GB/s on 2048x1536) supports the Q4_0 part.
