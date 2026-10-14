@@ -34,11 +34,23 @@ quiet() {  # wait (<= 15 s) for an idle GPU, always log the utilization seen (ot
   done
   echo "before $1: device utilization ${u:-?}%" >> target/loop/contention.log
 }
+contended() {  # tag: abort (exit 4, nothing recorded) when E2B QAT decodes < 100 tok/s in this run
+  python3 - "target/loop/$1.out" <<'PY'
+import json, sys
+for l in open(sys.argv[1]):
+    if l.startswith("{"):
+        r = json.loads(l)
+        if "gemma-4-E2B-it-qat" in r.get("model", "") and r.get("decode_tok_s", 1e9) < 100:
+            print(f"contention-aborted: {r['model']} {r['decode_tok_s']:.1f} tok/s < 100", file=sys.stderr)
+            sys.exit(4)
+PY
+}
 run() {  # tag binary suite
   quiet "$1 $3"
   "$2" --bench "$3" >> "target/loop/$1.out" 2>> "target/loop/$1.err"
   code=$?
   case $code in 0|3) ;; *) echo "metric-error: $1 $3 exited $code" >&2; return 1 ;; esac
+  contended "$1" || exit 4
 }
 status=0
 for ((i = 0; i < n; i++)); do

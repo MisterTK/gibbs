@@ -27,6 +27,10 @@ a generic capability requires. `scripts/generic_guard.sh` forbids model-specific
    `GIBBS_PROFILE_KERNELS=1 target/release/gibbs --bench bench/profile.json` per-kind table.
 3. Roofline arithmetic: targeted ms term, expected ms saved per model, `expected_pp ~ geomean x mean_i(dpct_i/pct_i)`.
 4. References: `autoresearch/luminal-catalog.md` row -> TSV `luminal_ref` (or why none applies).
+   v2 invariant: every pass cites a concrete catalog `file:line` anchor, or is logged `original` together with the
+   proof that it is generic (pattern over graph IR nodes/codec descriptors, no model names; `scripts/generic_guard.sh`).
+   The catalog is authoritative where the v2 plan's anchor differs (L1 TopK: catalog says `original`, luminal's
+   `binary.rs:559-622` is only an embedding gather; L15 f16 KV, E2 ICB, E3 layout: `original`).
 5. Design note: generic op-level pattern, applicability, invariants, fallback, test.
 6. Implement one change + test; `cargo build --release`; `git commit -m "experiment: <hypothesis>"`.
 7. Verify then Guard; apply keep rule; promote base or revert.
@@ -36,6 +40,15 @@ a generic capability requires. `scripts/generic_guard.sh` forbids model-specific
 ## Stop rules
 (A) every loop.json model >= 90%, E2B QAT >= 150 tok/s, every matrix item's latest row ok, >= 90%, parity ok,
 oracle != fail. (B) three consecutive checkpoints each improve the kept geomean by < 0.5 pp after E1-E4 were tried.
+
+## v2 measurement rigor (approved plan `gibbs-roofline-loop-v2`)
+- `scripts/verify_when_quiet.sh`: waits for 5 consecutive 10 s samples of foreign GPU utilization <= 15% (logs
+  `quiet-wait: GPU busy (u%)`), exponential backoff after 30 min, gives up after 3 h.
+- Contention tripwire (the only edit to the frozen `loop_verify.sh`/`loop_score.py`; the metric is untouched):
+  any run with E2B QAT < 100 tok/s, or a scored `base_pct` < 35, exits 4 (`contention-aborted`) without writing
+  `verify.json` or a TSV row.
+- `TuneCache`: a GEMV winner timed while foreign GPU utilization was > 20% (sampled before the process loads the
+  GPU) is used in-process only (`insert_contended`), never persisted to `tune-*.json`.
 
 ## Iterations
 

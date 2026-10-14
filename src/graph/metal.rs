@@ -1110,6 +1110,9 @@ impl Runtime {
             TUNE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return t.variant;
         }
+        // Foreign GPU load, sampled before this process times anything: busy means the winner is
+        // used here but never persisted.
+        let busy = tune::gpu_utilization().is_some_and(|u| u > tune::BUSY_PCT);
         let timings = match self.bench_gemv(q, &[(rows, cols)], &variants) {
             Ok(t) => t,
             Err(e) => {
@@ -1127,16 +1130,19 @@ impl Runtime {
             best.label(),
             variants.len()
         );
+        let tuned = tune::Tuned {
+            variant: best,
+            us: bytes / (gbps * 1e9) * 1e6,
+            gbps,
+        };
         let mut cache = self.tune.lock();
-        cache.insert(
-            key,
-            tune::Tuned {
-                variant: best,
-                us: bytes / (gbps * 1e9) * 1e6,
-                gbps,
-            },
-        );
-        cache.save(&self.tune_path);
+        if busy {
+            tracing::warn!("tune {q:?} {rows}x{cols}: GPU busy, winner not persisted");
+            cache.insert_contended(key, tuned);
+        } else {
+            cache.insert(key, tuned);
+            cache.save(&self.tune_path);
+        }
         best
     }
 
@@ -6088,7 +6094,9 @@ mod tests {
             (seed >> 33) as u32
         };
         for (n, k) in [(37usize, 1280usize), (101, 2304), (19, 2048), (5, 768)] {
-            let mut raw: Vec<u8> = (0..n * (k / 256) * 66).map(|_| (next() >> 4) as u8).collect();
+            let mut raw: Vec<u8> = (0..n * (k / 256) * 66)
+                .map(|_| (next() >> 4) as u8)
+                .collect();
             for blk in raw.chunks_exact_mut(66) {
                 // Finite f16 scale in 2^-6..2^4.
                 let exp = 9 + (next() % 14) as u16;
@@ -6129,7 +6137,10 @@ mod tests {
                         .into_f32()
                         .unwrap();
                     let err = rel_err(&want, &got);
-                    assert!(err < 1e-4, "TQ2_0 {n}x{k} m={m} {v:?}: differs from CPU by {err}");
+                    assert!(
+                        err < 1e-4,
+                        "TQ2_0 {n}x{k} m={m} {v:?}: differs from CPU by {err}"
+                    );
                 }
             }
         }
