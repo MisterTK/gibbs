@@ -187,7 +187,7 @@ use metal::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::path::Path;
 use std::sync::Arc;
@@ -315,6 +315,44 @@ impl WeightFormat {
         ) || self
             .codec_format()
             .is_some_and(|f| crate::graph::codec::codec(f).is_some())
+    }
+}
+
+/// The code behind a packed GEMV [`GemvVariant`] of a storage format: a hand kernel of
+/// `metal_kernels.metal` or the codec-generated kernel at some rows per simdgroup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GemvSrc {
+    Hand(&'static str),
+    Gen(QuantFormat, u8),
+}
+
+impl GemvSrc {
+    /// Output rows one threadgroup of the kernel covers.
+    fn rows_per_tg(self) -> usize {
+        match self {
+            GemvSrc::Hand(_) => 16,
+            GemvSrc::Gen(_, r) => crate::graph::codegen::gemv_rows_per_tg(
+                crate::graph::codegen::GemvParams {
+                    rows_per_sg: r as usize,
+                    ..Default::default()
+                },
+            ),
+        }
+    }
+}
+
+/// What runs `format`'s m = 1 packed GEMV in `variant`; `None` when the format has no such kernel.
+fn gemv_src(format: WeightFormat, variant: GemvVariant) -> Option<GemvSrc> {
+    match (format, variant.kernel) {
+        (WeightFormat::Gen(q), k) => Some(GemvSrc::Gen(
+            q,
+            if k == GemvKernel::Gen { variant.rows_per_sg } else { 2 },
+        )),
+        (_, GemvKernel::Gen) => format
+            .codec_format()
+            .map(|q| GemvSrc::Gen(q, variant.rows_per_sg)),
+        (_, GemvKernel::Hand) => format.hand_kernel().map(GemvSrc::Hand),
+        (_, GemvKernel::HandSplit) => format.hand_split_kernel().map(GemvSrc::Hand),
     }
 }
 
@@ -615,6 +653,8 @@ pub struct Runtime {
     profile_path: std::path::PathBuf,
     /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
     gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
+    /// Merged sibling-GEMV pipelines ([`codegen::gemv_multi`]) by kernel name, compiled on first use.
+    multi_psos: Mutex<HashMap<String, ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
@@ -686,6 +726,7 @@ impl Runtime {
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
             gen_psos: Mutex::new(HashMap::new()),
+            multi_psos: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
@@ -1053,6 +1094,41 @@ impl Runtime {
         let name = crate::graph::codegen::gemv_packed_name(c, params);
         let pso = self.compile_generated(&src, &name)?;
         self.gen_psos.lock().insert(key, pso.clone());
+        Ok(pso)
+    }
+
+    /// The merged kernel for `parts` ([`codegen::gemv_multi`]), compiled on first use.
+    fn multi_pso(&self, parts: &[GemvSrc]) -> Result<ComputePipelineState, String> {
+        use crate::graph::codegen::{gemv_multi, GemvParams, MultiPart};
+        let codecs: Vec<Option<&codec::Codec>> = parts
+            .iter()
+            .map(|p| match p {
+                GemvSrc::Gen(q, _) => codec::codec(*q),
+                GemvSrc::Hand(_) => None,
+            })
+            .collect();
+        let mp: Vec<MultiPart> = parts
+            .iter()
+            .zip(&codecs)
+            .map(|(p, c)| match (p, c) {
+                (GemvSrc::Hand(n), _) => Ok(MultiPart::Hand(n)),
+                (GemvSrc::Gen(_, r), Some(c)) => Ok(MultiPart::Gen(
+                    c,
+                    GemvParams {
+                        rows_per_sg: *r as usize,
+                        ..Default::default()
+                    },
+                )),
+                (GemvSrc::Gen(q, _), None) => Err(format!("no codec for {q:?}")),
+            })
+            .collect::<Result<_, String>>()?;
+        let (name, src) = gemv_multi(&mp, &KERNELS_MSL)
+            .ok_or("merged GEMV: a part has no inlinable kernel")?;
+        if let Some(p) = self.multi_psos.lock().get(&name) {
+            return Ok(p.clone());
+        }
+        let pso = self.compile_generated(&src, &name)?;
+        self.multi_psos.lock().insert(name, pso.clone());
         Ok(pso)
     }
 
@@ -2030,41 +2106,21 @@ impl Session {
         format: WeightFormat,
         variant: GemvVariant,
     ) -> Result<(ComputePipelineState, u64), String> {
-        let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
-            Ok((
+        match gemv_src(format, variant) {
+            Some(GemvSrc::Gen(q, r)) => Ok((
                 self.rt.gen_pso(q, r)?,
                 crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
                     rows_per_sg: r as usize,
                     ..Default::default()
                 }) as u64,
-            ))
-        };
-        match (format, variant.kernel) {
-            (WeightFormat::Gen(q), _) => generated(
-                q,
-                if variant.kernel == GemvKernel::Gen {
-                    variant.rows_per_sg
-                } else {
-                    2
-                },
-            ),
-            (_, GemvKernel::Gen) => match format.codec_format() {
-                Some(q) => generated(q, variant.rows_per_sg),
-                None => Err(format!("no generated GEMV for {format:?}")),
-            },
-            (_, GemvKernel::Hand | GemvKernel::HandSplit) => {
-                let name = if variant.kernel == GemvKernel::HandSplit {
-                    format.hand_split_kernel()
-                } else {
-                    format.hand_kernel()
-                };
-                match name {
-                    Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
-                    None => Err(format!(
-                        "Metal executor: unsupported packed GEMV format {format:?}"
-                    )),
-                }
+            )),
+            Some(GemvSrc::Hand(name)) => Ok((self.rt.pso(name)?.clone(), 16)),
+            None if variant.kernel == GemvKernel::Gen => {
+                Err(format!("no generated GEMV for {format:?}"))
             }
+            None => Err(format!(
+                "Metal executor: unsupported packed GEMV format {format:?}"
+            )),
         }
     }
 
@@ -2111,15 +2167,6 @@ impl Session {
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (steps, aliases) = plan(graph)?;
         let mut steps = batch_horizontal(steps, &aliases);
-        if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
-            for (i, s) in steps.iter().enumerate() {
-                eprintln!(
-                    "plan {i:4} {:<46} {}",
-                    s.name,
-                    kernel_kind(&format!("{:?}", s.op))
-                );
-            }
-        }
         for s in &steps {
             for &v in &s.reads {
                 let val = graph.value(v);
@@ -2159,6 +2206,29 @@ impl Session {
             }
         }
         self.assign_variants(&mut steps);
+        let mut steps = merge_gemv_siblings(steps);
+        if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
+            for (i, s) in steps.iter().enumerate() {
+                let detail = match &s.op {
+                    Step::GemvPacked {
+                        x,
+                        rows,
+                        cols,
+                        m,
+                        format,
+                        variant,
+                        epi,
+                        ..
+                    } => format!(" x={} {format:?}/{} m={m} {rows}x{cols} {epi:?}", x.0, variant.label()),
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "plan {i:4} {:<46} {}{detail}",
+                    s.name,
+                    kernel_kind(&format!("{:?}", s.op))
+                );
+            }
+        }
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
         let mut arena = self.arena.lock();
         if arena
@@ -2232,6 +2302,9 @@ impl Session {
                 }
                 Step::GemvPacked { rows, cols, .. } => {
                     flops_per_run += 2 * (*rows as u64) * (*cols as u64);
+                }
+                Step::GemvPackedMulti { cols, parts, .. } => {
+                    flops_per_run += parts.iter().map(|p| 2 * (p.rows * cols) as u64).sum::<u64>();
                 }
                 _ => {}
             }
@@ -3094,6 +3167,32 @@ impl Session {
                 set_bytes(enc, 4, &p);
                 grid1(n_seq * n_heads * head_dim);
             }
+            Step::GemvPackedMulti { x, cols, ref parts } => {
+                let n = parts.len();
+                let srcs: Vec<GemvSrc> = parts.iter().map(|p| p.src).collect();
+                let pso = rt.multi_pso(&srcs)?;
+                enc.set_compute_pipeline_state(&pso);
+                bind(n as u64, x);
+                let (mut ps, mut starts, mut tgs) = (Vec::new(), [0u32; 3], 0usize);
+                for (i, p) in parts.iter().enumerate() {
+                    bind(i as u64, p.w);
+                    bind(
+                        (n + 1 + i) as u64,
+                        if i == 0 { s.out } else { s.extra_outs[i - 1] },
+                    );
+                    // `PackedGemvParams { rows, cols, batch_size, has_bias, epi }`.
+                    ps.push([u32_of(p.rows)?, u32_of(cols)?, 1, 0, 0]);
+                    starts[i] = u32_of(tgs)?;
+                    tgs += p.rows.div_ceil(p.src.rows_per_tg());
+                }
+                enc.set_bytes(
+                    (2 * n + 1) as u64,
+                    (ps.len() * 20) as u64,
+                    ps.as_ptr() as *const std::ffi::c_void,
+                );
+                set_bytes(enc, (2 * n + 2) as u64, &starts);
+                enc.dispatch_thread_groups(MTLSize::new(tgs as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
             Step::RmsNormBatch { ref segs } => {
                 enc.set_compute_pipeline_state(rt.pso("rmsnorm_batch_f32")?);
                 #[repr(C)]
@@ -3726,6 +3825,13 @@ pub enum Step {
     RmsNormBatch {
         segs: Vec<NormSeg>,
     },
+    /// Up to 3 independent m = 1 packed GEMVs over the same `x` (no bias, residual or epilogue) in one
+    /// dispatch (`merge_gemv_siblings`); part `i` writes the step's `i`-th output (`out`, then `extra_outs`).
+    GemvPackedMulti {
+        x: ValueId,
+        cols: usize,
+        parts: Vec<GemvPart>,
+    },
     /// Horizontal batch of up to 4 Rope segments `(x, out, n_heads)` sharing pos, inv_freq and geometry.
     RopeBatch {
         pos: ValueId,
@@ -3913,6 +4019,14 @@ pub(crate) fn fusion_policy() -> FusionPolicy {
     })
 }
 
+/// One weight of [`Step::GemvPackedMulti`].
+#[derive(Debug, Clone)]
+pub struct GemvPart {
+    pub w: ValueId,
+    pub rows: usize,
+    src: GemvSrc,
+}
+
 /// One segment of [`Step::RmsNormBatch`].
 #[derive(Debug, Clone)]
 pub struct NormSeg {
@@ -3922,6 +4036,81 @@ pub struct NormSeg {
     pub rows: usize,
     pub d: usize,
     pub eps: f32,
+}
+
+/// Merges up to 3 m = 1 packed GEMVs that read the same `x` (same `cols`), have no bias, residual or
+/// epilogue and run a kernel `codegen::gemv_multi` can inline into one [`Step::GemvPackedMulti`] at the first
+/// member's position; the members' codecs and variants may differ (q/k/v with a different codec for v).
+/// A member reads only `x` and its weight, both available at the first member, so hoisting it past the
+/// steps between them reorders nothing it depends on. Runs after `assign_variants` (the variants decide
+/// which kernels are folded in).
+fn merge_gemv_siblings(steps: Vec<Planned>) -> Vec<Planned> {
+    if !fusion_policy().allows(FusionClass::CrossCodecSiblings) {
+        return steps;
+    }
+    let member = |s: &Planned| match &s.op {
+        Step::GemvPacked {
+            x,
+            w,
+            m: 1,
+            rows,
+            cols,
+            bias: None,
+            res: None,
+            epi: Epi::None,
+            format,
+            variant,
+            ..
+        } => {
+            let src = gemv_src(*format, *variant).filter(|src| match src {
+                GemvSrc::Hand(n) => crate::graph::codegen::hand_inlinable(n),
+                GemvSrc::Gen(..) => true,
+            })?;
+            Some(((*x, *cols), GemvPart { w: *w, rows: *rows, src }))
+        }
+        _ => None,
+    };
+    let mut groups: HashMap<(ValueId, usize), Vec<usize>> = HashMap::new();
+    for (i, s) in steps.iter().enumerate() {
+        if let Some((key, _)) = member(s) {
+            groups.entry(key).or_default().push(i);
+        }
+    }
+    let mut heads: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut absorbed = HashSet::new();
+    for idx in groups.values() {
+        for run in idx.chunks(3).filter(|r| r.len() > 1) {
+            heads.insert(run[0], run.to_vec());
+            absorbed.extend(run[1..].iter().copied());
+        }
+    }
+    let mut out = Vec::with_capacity(steps.len() - absorbed.len());
+    for (i, s) in steps.iter().enumerate() {
+        if absorbed.contains(&i) {
+            continue;
+        }
+        let Some(run) = heads.get(&i) else {
+            out.push(s.clone());
+            continue;
+        };
+        let members: Vec<&Planned> = run.iter().map(|&j| &steps[j]).collect();
+        let (key, _) = member(s).expect("heads are members");
+        let outs: Vec<ValueId> = members.iter().map(|m| m.out).collect();
+        let mut reads = vec![key.0];
+        reads.extend(members.iter().map(|m| m.reads[1]));
+        out.push(Planned {
+            name: members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join("+"),
+            op: Step::GemvPackedMulti {
+                x: key.0,
+                cols: key.1,
+                parts: members.iter().filter_map(|m| member(m)).map(|(_, p)| p).collect(),
+            },
+            out: outs[0],
+            extra_outs: outs[1..].to_vec(),
+            reads,
+        });
+    }
+    out
 }
 
 /// Merges runs (<= 4) of adjacent steps that are independent of each other into one dispatch:
@@ -4749,7 +4938,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .flatten()
             .collect(),
             // Built only by `batch_horizontal`, after `plan` has returned.
-            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } => {
+            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } | Step::GemvPackedMulti { .. } => {
                 unreachable!("batch steps are created after plan()")
             }
             Step::MegakernelMlp {
@@ -5397,6 +5586,7 @@ mod tests {
     fn rt() -> Arc<Runtime> {
         RT.clone()
     }
+
 
     fn kinds() -> Vec<GemmKernel> {
         let mut k = vec![GemmKernel::Simdgroup, GemmKernel::Rows];
@@ -6157,6 +6347,102 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `rows` x `k` weights of codec `f` from random bytes with every aligned f16 forced finite and small
+    /// (any other bit pattern is a valid block), for CPU-vs-Metal parity.
+    fn random_packed(f: QuantFormat, rows: usize, k: usize, seed: u64) -> Tensor {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        let (be, bb, _) = gguf_block_codec(f).unwrap();
+        let mut seed = seed;
+        let mut raw: Vec<u8> = (0..rows * (k / be) * bb)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 40) as u8
+            })
+            .collect();
+        for h in raw.chunks_exact_mut(2) {
+            let v = u16::from_le_bytes([h[0], h[1]]);
+            let exp = 8 + (v >> 3) % 7;
+            h.copy_from_slice(&((v & 0x83FF) | exp << 10).to_le_bytes());
+        }
+        Tensor::Quantized(Arc::new(QuantizedWeight::GgufQuantized {
+            format: f,
+            raw_data: raw.into(),
+            in_features: k,
+            out_features: rows,
+        }))
+    }
+
+    /// q/k/v-like siblings (one `x`, one Linear per `(codec, rows)` of `specs`) become one
+    /// `GemvPackedMulti` and every output equals the CPU executor's, for each GEMV variant override.
+    fn sibling_gemvs_match_cpu(specs: &[(QuantFormat, usize)], k: usize) {
+        let mut w = Weights::new();
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, k], DType::F32);
+        for (i, &(f, rows)) in specs.iter().enumerate() {
+            w.insert(&format!("w{i}"), random_packed(f, rows, k, 7 + i as u64));
+            let wv = g.weight(&format!("w{i}"), vec![rows, k], DType::Quant(f));
+            let y = g.add(&format!("lin{i}"), Op::Linear, &[x, wv], vec![1, rows], DType::F32);
+            g.output(y);
+        }
+        let xs = rand(k, 5);
+        let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())]).unwrap();
+        let overrides = [None, Some(GemvVariant::HAND), Some(GemvVariant::HAND_SPLIT)]
+            .into_iter()
+            .chain(tune::GEN_ROWS.map(|r| Some(GemvVariant::generated(r))));
+        for o in overrides {
+            let mut s = Session::new(rt(), &w).unwrap();
+            s.set_variant_override(o);
+            let plan = s.prepare_plan(&g).unwrap();
+            let multi = plan
+                .steps
+                .iter()
+                .filter(|st| matches!(st.op, Step::GemvPackedMulti { .. }))
+                .count();
+            let single = plan
+                .steps
+                .iter()
+                .filter(|st| matches!(st.op, Step::GemvPacked { .. }))
+                .count();
+            assert_eq!((multi, single), (1, 0), "{specs:?} {o:?}: {:?}", plan.steps);
+            let got = s.run_prepared(&g, &plan, None, vec![Tensor::F32(xs.clone())]).unwrap();
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                let err = rel_err(a.as_f32().unwrap(), b.as_f32().unwrap());
+                assert!(err < 1e-4, "{specs:?} {o:?} output {i}: differs from CPU by {err}");
+            }
+        }
+    }
+
+    /// The merged sibling-GEMV kernel runs each member's own codec (planar TQ2_0, Q4_0 and Q8_0 hand
+    /// kernels and generated variants) over a concatenated row range; rows are not whole threadgroups.
+    #[test]
+    fn merged_sibling_gemvs_mixed_codecs_match_cpu() {
+        sibling_gemvs_match_cpu(
+            &[
+                (QuantFormat::GGUF_TQ2_0, 37),
+                (QuantFormat::GGUF_Q4_0, 21),
+                (QuantFormat::GGUF_Q8_0, 70),
+            ],
+            1280,
+        );
+    }
+
+    /// Gemma Q4_K_M's q/k/v: two hand-kernel Q4_K weights and a generated Q6_K one.
+    #[test]
+    fn merged_sibling_gemvs_q4_k_q6_k_match_cpu() {
+        sibling_gemvs_match_cpu(
+            &[
+                (QuantFormat::GGUF_Q4_K_M, 33),
+                (QuantFormat::GGUF_Q4_K_M, 17),
+                (QuantFormat::GGUF_Q6_K, 29),
+            ],
+            512,
+        );
+        sibling_gemvs_match_cpu(
+            &[(QuantFormat::GGUF_Q4_0, 45), (QuantFormat::GGUF_Q4_0, 19)],
+            256,
+        );
     }
 
     /// Generated-GEMV bandwidth at lm_head-like shapes (`cargo test --release -- --ignored --nocapture`).
