@@ -451,6 +451,52 @@ kernel void rmsnorm_residual_f32(device const float* x [[buffer(0)]],
         outr[i] = resr[i] + xr[i] * scale * g[i];
     }
 }
+// One row per threadgroup: y = norm(x) * g [+ res] [* sc[0]]; out = y; optionally out2 = norm(y) * g2
+// (a second RmsNorm of the same width and eps reading y). flags: 1 res, 2 scale, 4 second norm.
+struct RmsNormFusedParams { uint rows; uint d; float eps; uint flags; };
+kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
+                              device const float* g [[buffer(1)]],
+                              device const float* res [[buffer(2)]],
+                              device const float* sc [[buffer(3)]],
+                              device const float* g2 [[buffer(4)]],
+                              device float* out [[buffer(5)]],
+                              device float* out2 [[buffer(6)]],
+                              constant RmsNormFusedParams& p [[buffer(7)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint nsg [[simdgroups_per_threadgroup]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    uint row = tg;
+    if (row >= p.rows) return;
+    ulong base = (ulong)row * p.d;
+    device const float* xr = x + base;
+    device const float* resr = res + base;
+    device float* outr = out + base;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.d; i += tpg) {
+        float v = xr[i];
+        sq += v * v;
+    }
+    float inv = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
+    float s = (p.flags & 2) ? sc[0] : 1.0f;
+    float sq2 = 0.0f;
+    for (uint i = tid; i < p.d; i += tpg) {
+        float y = xr[i] * inv * g[i];
+        if (p.flags & 1) y += resr[i];
+        y *= s;
+        outr[i] = y;
+        sq2 += y * y;
+    }
+    if (p.flags & 4) {
+        float inv2 = rsqrt(block_sum(sq2, scratch, sg, lane, nsg) / float(p.d) + p.eps);
+        device float* out2r = out2 + base;
+        // Each thread re-reads only the elements it wrote above.
+        for (uint i = tid; i < p.d; i += tpg) out2r[i] = outr[i] * inv2 * g2[i];
+    }
+}
 
 
 struct GraphRopeParams { uint n_heads; uint head_dim; uint pairs; uint pair_stride; uint pair_gap; };

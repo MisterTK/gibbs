@@ -418,7 +418,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 59] = [
+const BASE_KERNELS: [&str; 60] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -435,6 +435,7 @@ const BASE_KERNELS: [&str; 59] = [
     "gemm_rows_residual",
     "rmsnorm_f32",
     "rmsnorm_residual_f32",
+    "rmsnorm_fused_f32",
     "graph_rope_f32",
     "rmsnorm_batch_f32",
     "rope_batch_f32",
@@ -2110,6 +2111,7 @@ impl Session {
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (steps, aliases) = plan(graph)?;
+        let steps = fuse_chains(graph, steps, &aliases);
         let mut steps = batch_horizontal(steps, &aliases);
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
@@ -2838,6 +2840,31 @@ impl Session {
                 struct RmsNormParams(u32, u32, f32);
                 let p = RmsNormParams(u32_of(rows)?, u32_of(d)?, eps);
                 set_bytes(enc, slot + 1, &p);
+                enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(TG, 1, 1));
+            }
+            Step::RmsNormFused {
+                x,
+                g,
+                res,
+                scale,
+                g2,
+                rows,
+                d,
+                eps,
+            } => {
+                enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
+                // Unused operands rebind a live buffer of the right size class; `flags` keeps them unread.
+                bind(0, x);
+                bind(1, g);
+                bind(2, res.unwrap_or(x));
+                bind(3, scale.unwrap_or(g));
+                bind(4, g2.unwrap_or(g));
+                bind(5, s.out);
+                bind(6, s.extra_outs.first().copied().unwrap_or(s.out));
+                #[repr(C)]
+                struct RmsNormFusedParams(u32, u32, f32, u32);
+                let flags = res.is_some() as u32 | (scale.is_some() as u32) << 1 | (g2.is_some() as u32) << 2;
+                set_bytes(enc, 7, &RmsNormFusedParams(u32_of(rows)?, u32_of(d)?, eps, flags));
                 enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(TG, 1, 1));
             }
             Step::GemvPacked {
@@ -3674,6 +3701,19 @@ pub enum Step {
         d: usize,
         eps: f32,
     },
+    /// `fuse_chains`' RmsNorm fusion (`rmsnorm_fused_f32`): `y = norm(x) * g [+ res] [* scale[0]]`
+    /// written to `Planned::out`; with `g2`, a second RmsNorm of `y` (same `eps`) written to
+    /// `Planned::extra_outs[0]`.
+    RmsNormFused {
+        x: ValueId,
+        g: ValueId,
+        res: Option<ValueId>,
+        scale: Option<ValueId>,
+        g2: Option<ValueId>,
+        rows: usize,
+        d: usize,
+        eps: f32,
+    },
     GemvPacked {
         x: ValueId,
         w: ValueId,
@@ -4059,6 +4099,144 @@ fn batch_horizontal(
         });
     }
     out
+}
+
+/// Folds single-reader producer steps into their consumer, per fusion class:
+/// * `ElementwiseChain`: a unary step feeding an operand of a binary step becomes that binary's `pre`
+///   map (`binary_f32`), so `sigmoid(g) * x` or `softplus(a) * b` is one dispatch.
+/// * `ReduceInput`: an `RmsNorm` (with or without residual) whose only reader is a `Mul` by a
+///   one-element value takes that factor as an epilogue; an `RmsNorm` whose output is also read by a
+///   plain second `RmsNorm` of the same shape and eps writes both (`Planned::extra_outs`) in one
+///   dispatch (`rmsnorm_fused_f32`).
+/// The fused step runs at the consumer's position (unary, norm + scale) or the producer's (two-output
+/// norm), so every operand must exist there: planned values are write-once, and `State` operands are
+/// left alone because attention mutates them in place. A fused-away value is not materialised, so it
+/// must have no other reader, no alias and not be a graph output.
+fn fuse_chains(
+    g: &Graph,
+    mut steps: Vec<Planned>,
+    aliases: &HashMap<ValueId, (ValueId, usize)>,
+) -> Vec<Planned> {
+    let (chain, reduce) = (
+        fusion_policy().allows(FusionClass::ElementwiseChain),
+        fusion_policy().allows(FusionClass::ReduceInput),
+    );
+    let stable = |v: ValueId| {
+        let root = aliases.get(&v).map_or(v, |a| a.0);
+        !matches!(g.value(root).kind, ValueKind::State(_))
+    };
+    let aliased: std::collections::HashSet<ValueId> =
+        aliases.iter().flat_map(|(&k, &(r, _))| [k, r]).collect();
+    let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    let mut producer: HashMap<ValueId, usize> = HashMap::new();
+    for (i, s) in steps.iter().enumerate() {
+        producer.insert(s.out, i);
+        for &v in &s.reads {
+            let r = readers.entry(v).or_default();
+            if r.last() != Some(&i) {
+                r.push(i);
+            }
+        }
+    }
+    // The one step reading `steps[i]`'s output, when that output can be fused away.
+    let only_reader = |steps: &[Planned], i: usize| -> Option<usize> {
+        let out = steps[i].out;
+        match readers.get(&out).map(Vec::as_slice) {
+            Some(&[j])
+                if steps[i].extra_outs.is_empty()
+                    && !g.outputs.contains(&out)
+                    && !aliased.contains(&out) =>
+            {
+                Some(j)
+            }
+            _ => None,
+        }
+    };
+    let mut dead = vec![false; steps.len()];
+    if reduce {
+        // Norm -> second norm of its output.
+        for i in 0..steps.len() {
+            let Step::RmsNorm { x, g: g1, res, rows, d, eps } = steps[i].op else {
+                continue;
+            };
+            if dead[i] || !steps[i].extra_outs.is_empty() {
+                continue;
+            }
+            let h = steps[i].out;
+            let second = readers.get(&h).into_iter().flatten().copied().find(|&j| {
+                !dead[j]
+                    && matches!(steps[j].op, Step::RmsNorm { x: x2, g: g2, res: None, rows: r2, d: d2, eps: e2 }
+                        if x2 == h && r2 == rows && d2 == d && e2 == eps && g.value(g2).kind == ValueKind::Weight)
+            });
+            let Some(j) = second else { continue };
+            let Step::RmsNorm { g: g2, .. } = steps[j].op else {
+                unreachable!("matched above")
+            };
+            let out2 = steps[j].out;
+            steps[i] = Planned {
+                name: format!("{}+{}", steps[i].name, steps[j].name),
+                op: Step::RmsNormFused { x, g: g1, res, scale: None, g2: Some(g2), rows, d, eps },
+                out: h,
+                extra_outs: vec![out2],
+                reads: [Some(x), Some(g1), res, Some(g2)].into_iter().flatten().collect(),
+            };
+            dead[j] = true;
+        }
+    }
+    for j in 0..steps.len() {
+        let Step::Ext(ext::ExtStep::Elementwise(bin @ ext::elementwise::Step::Binary { a, b, n, kind, pre, .. })) = &steps[j].op
+        else {
+            continue;
+        };
+        let (bin, a, b, n, kind) = (bin.clone(), *a, *b, *n, *kind);
+        if dead[j] || a == b || *pre != ext::elementwise::Pre::NONE {
+            continue;
+        }
+        if chain {
+            let fused = [(1, a, b), (2, b, a)].into_iter().find_map(|(side, v, other)| {
+                let i = *producer.get(&v)?;
+                let Step::Ext(ext::ExtStep::Elementwise(u)) = &steps[i].op else {
+                    return None;
+                };
+                let (x, k, ua, ub) = ext::elementwise::as_unary(u)?;
+                if dead[i] || only_reader(&steps, i) != Some(j) || !stable(x) {
+                    return None;
+                }
+                Some((i, ext::elementwise::with_pre(&bin, side, x, k, ua, ub)?, vec![x, other]))
+            });
+            if let Some((i, st, reads)) = fused {
+                dead[i] = true;
+                steps[j].name = format!("{}+{}", steps[i].name, steps[j].name);
+                steps[j].op = Step::Ext(ext::ExtStep::Elementwise(st));
+                steps[j].reads = reads;
+                continue;
+            }
+        }
+        // binary_f32 code 2 = Mul.
+        if reduce && kind == 2 {
+            let fused = [(a, b), (b, a)].into_iter().find_map(|(v, s)| {
+                let i = *producer.get(&v)?;
+                let Step::RmsNorm { x, g: g1, res, rows, d, eps } = steps[i].op else {
+                    return None;
+                };
+                let scalar = g.value(s).shape.iter().product::<usize>() == 1 && !g.value(s).shape.is_empty();
+                let moved = [Some(x), Some(g1), res].into_iter().flatten().all(stable);
+                (!dead[i] && scalar && n == rows * d && moved && only_reader(&steps, i) == Some(j))
+                    .then_some((i, x, g1, res, s, rows, d, eps))
+            });
+            if let Some((i, x, g1, res, s, rows, d, eps)) = fused {
+                dead[i] = true;
+                steps[j].name = format!("{}+{}", steps[i].name, steps[j].name);
+                steps[j].op = Step::RmsNormFused { x, g: g1, res, scale: Some(s), g2: None, rows, d, eps };
+                steps[j].reads = [Some(x), Some(g1), res, Some(s)].into_iter().flatten().collect();
+            }
+        }
+    }
+    steps
+        .into_iter()
+        .zip(dead)
+        .filter_map(|(s, dead)| (!dead).then_some(s))
+        .collect()
 }
 
 /// Lowers nodes to dispatches, validating ops and shapes. A Linear whose output has exactly one
@@ -4748,9 +4926,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .into_iter()
             .flatten()
             .collect(),
-            // Built only by `batch_horizontal`, after `plan` has returned.
-            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } => {
-                unreachable!("batch steps are created after plan()")
+            // Built only by `batch_horizontal` / `fuse_chains`, after `plan` has returned.
+            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } | Step::RmsNormFused { .. } => {
+                unreachable!("fused steps are created after plan()")
             }
             Step::MegakernelMlp {
                 x,
@@ -5967,6 +6145,107 @@ mod tests {
         ];
         let (want, got) = both(&g, &w, inputs, None);
         assert!(rel_err(&want, &got) < 1e-5);
+    }
+
+    fn fused_kinds(g: &Graph) -> Vec<String> {
+        let (steps, aliases) = plan(g).unwrap();
+        fuse_chains(g, steps, &aliases)
+            .iter()
+            .map(|s| kernel_kind(&format!("{:?}", s.op)).to_string())
+            .collect()
+    }
+
+    /// `norm(x) [+ r]` followed by a `Mul` by a one-element weight (either operand order) is one
+    /// `RmsNormFused` step; when the norm output has a second reader it stays unfused. Widths are off
+    /// the threadgroup size. All outputs match the CPU executor.
+    #[test]
+    fn rmsnorm_scale_epilogue_fuses_and_matches_cpu() {
+        let f = DType::F32;
+        for (rows, d) in [(1usize, 33usize), (3, 300), (2, 1000)] {
+            for (with_res, scalar_first, shared) in [
+                (false, false, false),
+                (true, false, false),
+                (true, true, false),
+                (false, true, false),
+                (false, false, true),
+                (true, false, true),
+            ] {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![rows, d], f);
+                let r = g.input("r", vec![rows, d], f);
+                let (gv, sv) = (g.weight("g", vec![d], f), g.weight("s", vec![1], f));
+                let n = g.add("n", Op::RmsNorm { eps: 1e-6 }, &[x, gv], vec![rows, d], f);
+                let h = if with_res {
+                    g.add("h", Op::Add, &[r, n], vec![rows, d], f)
+                } else {
+                    n
+                };
+                let ins = if scalar_first { [sv, h] } else { [h, sv] };
+                let m = g.add("m", Op::Mul, &ins, vec![rows, d], f);
+                let out = if shared {
+                    g.add("o", Op::Add, &[m, h], vec![rows, d], f)
+                } else {
+                    m
+                };
+                g.output(out);
+                let case = format!("{rows}x{d} res {with_res} scalar_first {scalar_first} shared {shared}");
+                let want_kinds: &[&str] = if shared {
+                    &["RmsNorm", "Binary", "Binary"]
+                } else {
+                    &["RmsNormFused"]
+                };
+                assert_eq!(fused_kinds(&g), want_kinds, "{case}");
+                let mut w = Weights::new();
+                w.insert("g", Tensor::F32(rand(d, 3).iter().map(|v| v + 1.5).collect()));
+                w.insert("s", Tensor::F32(vec![0.37]));
+                let inputs = vec![Tensor::F32(rand(rows * d, 1)), Tensor::F32(rand(rows * d, 2))];
+                let (want, got) = both(&g, &w, inputs, None);
+                assert!(rel_err(&want, &got) < 1e-5, "{case}");
+            }
+        }
+    }
+
+    /// A norm (with or without residual) whose output `h` is also read elsewhere and by a second plain
+    /// norm of the same shape and eps writes `h` and the second norm's output in one dispatch; another
+    /// eps keeps them apart. Both outputs match the CPU executor.
+    #[test]
+    fn rmsnorm_pair_writes_both_outputs_and_matches_cpu() {
+        let f = DType::F32;
+        for (rows, d) in [(1usize, 33usize), (3, 300), (2, 1000)] {
+            for (with_res, eps2) in [(false, 1e-6f32), (true, 1e-6), (true, 1e-3)] {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![rows, d], f);
+                let r = g.input("r", vec![rows, d], f);
+                let (g1, g2) = (g.weight("g1", vec![d], f), g.weight("g2", vec![d], f));
+                let n1 = g.add("n1", Op::RmsNorm { eps: 1e-6 }, &[x, g1], vec![rows, d], f);
+                let h = if with_res {
+                    g.add("h", Op::Add, &[r, n1], vec![rows, d], f)
+                } else {
+                    n1
+                };
+                let n2 = g.add("n2", Op::RmsNorm { eps: eps2 }, &[h, g2], vec![rows, d], f);
+                let o = g.add("o", Op::Add, &[h, n2], vec![rows, d], f);
+                g.output(o);
+                g.output(n2);
+                let case = format!("{rows}x{d} res {with_res} eps2 {eps2}");
+                let want_kinds: &[&str] = if eps2 == 1e-6 {
+                    &["RmsNormFused", "Binary"]
+                } else {
+                    &["RmsNorm", "RmsNorm", "Binary"]
+                };
+                assert_eq!(fused_kinds(&g), want_kinds, "{case}");
+                let mut w = Weights::new();
+                w.insert("g1", Tensor::F32(rand(d, 3).iter().map(|v| v + 1.5).collect()));
+                w.insert("g2", Tensor::F32(rand(d, 4).iter().map(|v| v + 1.5).collect()));
+                let inputs = vec![Tensor::F32(rand(rows * d, 1)), Tensor::F32(rand(rows * d, 2))];
+                let want = cpu::run_stateless(&g, &w, inputs.clone()).unwrap();
+                let got = Session::new(rt(), &w).unwrap().run(&g, inputs).unwrap();
+                for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                    let e = rel_err(a.as_f32().unwrap(), b.as_f32().unwrap());
+                    assert!(e < 1e-5, "{case} output {i}: {e}");
+                }
+            }
+        }
     }
 
     /// Every packed format (generated and hand kernels): the GPU GEMV equals the CPU executor
