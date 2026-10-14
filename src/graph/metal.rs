@@ -267,38 +267,9 @@ impl WeightFormat {
         })
     }
 
-    /// Name of the lane-split hand kernel ([`GemvKernel::HandSplit`]), when this format has one.
-    fn hand_split_kernel(self) -> Option<&'static str> {
-        Some(match self {
-            WeightFormat::Q4_0 => "gemv_q4_0_split",
-            _ => return None,
-        })
-    }
-
-    /// Name of the hand kernel `kernel` of this format that runs the RmsNorm prologue (buffers 6 = gamma,
-    /// 7 = eps), when it has one. The generated kernels all can.
-    fn hand_norm_kernel(self, kernel: GemvKernel) -> Option<&'static str> {
-        Some(match (self, kernel) {
-            (WeightFormat::Q4_0, GemvKernel::HandSplit) => "gemv_q4_0_split_norm",
-            (WeightFormat::Q8_0, GemvKernel::Hand) => "gemv_q8_0_norm",
-            _ => return None,
-        })
-    }
-
-    /// The variants of [`Self::gemv_variants`] that can run the RmsNorm prologue.
-    fn norm_variants(self) -> Vec<GemvVariant> {
-        let mut v = self.gemv_variants();
-        v.retain(|v| v.kernel == GemvKernel::Gen || self.hand_norm_kernel(v.kernel).is_some());
-        v
-    }
-
-    /// The kernel for steps the tuner does not cover (megakernel MLPs, `GIBBS_TUNE=off`): the lane-split
-    /// hand kernel where it exists (faster than the per-block one at 7 of the 8 shapes measured), else the
-    /// hand one, else generated at 2 rows.
+    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if self.hand_split_kernel().is_some() {
-            GemvVariant::HAND_SPLIT
-        } else if self.hand_kernel().is_some() {
+        if self.hand_kernel().is_some() {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)
@@ -313,9 +284,6 @@ impl WeightFormat {
         let mut v = Vec::new();
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
-        }
-        if self.hand_split_kernel().is_some() {
-            v.push(GemvVariant::HAND_SPLIT);
         }
         if generated {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
@@ -435,7 +403,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 61] = [
+const BASE_KERNELS: [&str; 58] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -458,10 +426,7 @@ const BASE_KERNELS: [&str; 61] = [
     "swiglu_f32",
     "geglu_f32",
     "gemv_q4_0",
-    "gemv_q4_0_split",
-    "gemv_q4_0_split_norm",
     "gemv_q8_0",
-    "gemv_q8_0_norm",
     "gemv_bf16",
     "gemv_f16",
     "gemv_tq2_0",
@@ -633,9 +598,7 @@ pub struct Runtime {
     /// Where `profile` is persisted.
     profile_path: std::path::PathBuf,
     /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
-    gen_psos: Mutex<HashMap<(QuantFormat, u8, bool), ComputePipelineState>>,
-    /// [`Runtime::norm_dispatch_us`] by row width: measured once per process, the minimum of three samples.
-    norm_us: Mutex<HashMap<usize, f64>>,
+    gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
@@ -707,7 +670,6 @@ impl Runtime {
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
             gen_psos: Mutex::new(HashMap::new()),
-            norm_us: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
@@ -957,89 +919,6 @@ impl Runtime {
         })
     }
 
-    /// `copies` distinct `[n, k]` weights of `f` (enough to overflow the system cache) each multiplying
-    /// the input row `x` as one graph, each behind its own `RmsNorm(x, gamma)` when `norm`. The weights go
-    /// into `weights` under names tagged `tag`. Returns the graph, `copies` and the bytes of one weight;
-    /// `None` when `k` is not a whole number of `f`'s blocks.
-    fn gemv_bench_graph(
-        f: QuantFormat,
-        tag: usize,
-        (n, k): (usize, usize),
-        norm: bool,
-        weights: &mut Weights,
-    ) -> Result<Option<(Graph, usize, usize)>, String> {
-        use crate::model::layers::QuantizedWeight;
-        let float = matches!(f, QuantFormat::BF16 | QuantFormat::FP16);
-        let (elems, block_bytes) = if float {
-            (1, 2)
-        } else {
-            let c = codec::codec(f).ok_or("no codec")?;
-            (c.block_elems as usize, c.block_bytes as usize)
-        };
-        if k % elems != 0 {
-            return Ok(None);
-        }
-        let mut pattern = vec![0u8; 1 << 20];
-        let mut s = 0x9E3779B97F4A7C15u64;
-        for b in &mut pattern {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *b = (s >> 56) as u8;
-        }
-        let bytes = n * (k / elems) * block_bytes;
-        let mut raw = Vec::with_capacity(bytes);
-        while raw.len() < bytes {
-            raw.extend_from_slice(&pattern[..(bytes - raw.len()).min(pattern.len())]);
-        }
-        let raw = bytes::Bytes::from(raw);
-        let halves: Vec<u16> = if float {
-            raw.chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let copies = ((192usize << 20) / bytes).max(1);
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, k], DType::F32);
-        let gamma = norm.then(|| {
-            weights.insert(format!("gamma{tag}"), Tensor::F32(vec![1.0; k]));
-            g.weight(&format!("gamma{tag}"), vec![k], DType::F32)
-        });
-        for c in 0..copies {
-            let name = format!("w{tag}_{c}");
-            let (dtype, t) = match f {
-                QuantFormat::BF16 => (DType::BF16, Tensor::BF16(halves.clone())),
-                QuantFormat::FP16 => (DType::F16, Tensor::F16(halves.clone())),
-                _ => (
-                    DType::Quant(f),
-                    Tensor::Quantized(Arc::new(QuantizedWeight::GgufQuantized {
-                        format: f,
-                        raw_data: raw.clone(),
-                        in_features: k,
-                        out_features: n,
-                    })),
-                ),
-            };
-            let w = g.weight(&name, vec![n, k], dtype);
-            let xin = match gamma {
-                Some(gm) => g.add(
-                    &format!("norm{c}"),
-                    Op::RmsNorm { eps: 1e-6 },
-                    &[x, gm],
-                    vec![1, k],
-                    DType::F32,
-                ),
-                None => x,
-            };
-            let y = g.add(&format!("lin{c}"), Op::Linear, &[xin, w], vec![1, n], DType::F32);
-            g.output(y);
-            weights.insert(name, t);
-        }
-        Ok(Some((g, copies, bytes)))
-    }
-
     /// GB/s of the M=1 GEMV in `f` for each of `variants`: weight bytes over GPU time summed across
     /// `shapes` (`(rows, cols)`). Each shape runs on enough distinct copies of the weights (one
     /// command buffer) to overflow the system cache, so the number is DRAM streaming, not cache hits.
@@ -1049,12 +928,71 @@ impl Runtime {
         shapes: &[(usize, usize)],
         variants: &[GemvVariant],
     ) -> Result<Vec<(GemvVariant, f64)>, String> {
+        use crate::model::layers::QuantizedWeight;
+        let float = matches!(f, QuantFormat::BF16 | QuantFormat::FP16);
+        let (elems, block_bytes) = if float {
+            (1, 2)
+        } else {
+            let c = codec::codec(f).ok_or("no codec")?;
+            (c.block_elems as usize, c.block_bytes as usize)
+        };
+        let mut pattern = vec![0u8; 1 << 20];
+        let mut s = 0x9E3779B97F4A7C15u64;
+        for b in &mut pattern {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (s >> 56) as u8;
+        }
         let mut weights = Weights::new();
         let mut runs = Vec::new();
-        for (si, &shape) in shapes.iter().enumerate() {
-            if let Some((g, copies, bytes)) = Self::gemv_bench_graph(f, si, shape, false, &mut weights)? {
-                runs.push((g, shape.1, copies * bytes));
+        for (si, (n, k)) in shapes.iter().copied().enumerate() {
+            if k % elems != 0 {
+                continue;
             }
+            let bytes = n * (k / elems) * block_bytes;
+            let mut raw = Vec::with_capacity(bytes);
+            while raw.len() < bytes {
+                raw.extend_from_slice(&pattern[..(bytes - raw.len()).min(pattern.len())]);
+            }
+            let raw = bytes::Bytes::from(raw);
+            let halves: Vec<u16> = if float {
+                raw.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let copies = ((192usize << 20) / bytes).max(1);
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, k], DType::F32);
+            for c in 0..copies {
+                let name = format!("w{si}_{c}");
+                let (dtype, t) = match f {
+                    QuantFormat::BF16 => (DType::BF16, Tensor::BF16(halves.clone())),
+                    QuantFormat::FP16 => (DType::F16, Tensor::F16(halves.clone())),
+                    _ => (
+                        DType::Quant(f),
+                        Tensor::Quantized(Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.clone(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    ),
+                };
+                let w = g.weight(&name, vec![n, k], dtype);
+                let y = g.add(
+                    &format!("lin{c}"),
+                    Op::Linear,
+                    &[x, w],
+                    vec![1, n],
+                    DType::F32,
+                );
+                g.output(y);
+                weights.insert(name, t);
+            }
+            runs.push((g, k, copies * bytes));
         }
         if runs.is_empty() {
             return Err("no benchmark shape tiles this format's blocks".into());
@@ -1082,107 +1020,19 @@ impl Runtime {
         Ok(out)
     }
 
-    /// Per weight copy, in µs, the `rows x cols` M=1 GEMV of `f` in the `plain` variant and each of `fused`
-    /// with the RmsNorm prologue (every copy behind its own norm in the fused graph, absorbed). The
-    /// configurations alternate round by round in one session and each keeps its minimum, so drifting
-    /// GPU load shifts them together.
-    fn bench_norm_prologue(
-        self: &Arc<Self>,
-        f: QuantFormat,
-        shape: (usize, usize),
-        plain: GemvVariant,
-        fused: &[GemvVariant],
-    ) -> Result<(f64, Vec<(GemvVariant, f64)>), String> {
-        let mut weights = Weights::new();
-        let tiles = "shape does not tile the format's blocks";
-        let (gp, copies, _) = Self::gemv_bench_graph(f, 0, shape, false, &mut weights)?.ok_or(tiles)?;
-        let (gf, ..) = Self::gemv_bench_graph(f, 0, shape, true, &mut weights)?.ok_or(tiles)?;
-        let mut session = Session::new(self.clone(), &weights)?;
-        session.set_variant_override(Some(plain));
-        session.set_norm_prologue(Some(false));
-        let mut cfgs = vec![(&gp, session.prepare_plan(&gp)?)];
-        session.set_norm_prologue(Some(true));
-        for &v in fused {
-            session.set_variant_override(Some(v));
-            let plan = session.prepare_plan(&gf)?;
-            if plan.steps.iter().any(|s| matches!(s.op, Step::RmsNorm { .. })) {
-                return Err(format!("{v:?} did not absorb the norm"));
-            }
-            cfgs.push((&gf, plan));
-        }
-        let x = Tensor::F32(vec![0.5; shape.1]);
-        let mut best = vec![f64::INFINITY; cfgs.len()];
-        for _round in 0..5 {
-            for (i, (g, plan)) in cfgs.iter().enumerate() {
-                for rep in 0..3 {
-                    session.run_prepared(g, plan, None, vec![x.clone()])?;
-                    if rep > 0 {
-                        best[i] = best[i].min(session.last_gpu_seconds());
-                    }
-                }
-            }
-        }
-        let us = |s: f64| s * 1e6 / copies as f64;
-        Ok((
-            us(best[0]),
-            fused.iter().copied().zip(best[1..].iter().map(|&s| us(s))).collect(),
-        ))
-    }
-
-    /// GPU µs of one single-row `d`-wide `rmsnorm_f32` dispatch (including the gap to the dispatch before
-    /// it, which is what a dependent norm costs in a decode graph). It does not depend on the GEMV it
-    /// precedes, so it is measured once per `d` (the minimum of three samples) and remembered.
-    fn norm_dispatch_us(&self, d: usize) -> Result<f64, String> {
-        if let Some(&us) = self.norm_us.lock().get(&d) {
-            return Ok(us);
-        }
-        let buf = |n: usize| {
-            self.device
-                .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
-        };
-        let (x, g, o) = (buf(d), buf(d), buf(d));
-        let pso = self.pso("rmsnorm_f32")?;
-        let mut best = f64::INFINITY;
-        for _ in 0..3 {
-            best = best.min(self.timed(200, |enc| {
-                enc.set_compute_pipeline_state(pso);
-                enc.set_buffer(0, Some(&x), 0);
-                enc.set_buffer(1, Some(&g), 0);
-                enc.set_buffer(2, Some(&o), 0);
-                #[repr(C)]
-                struct RmsNormParams(u32, u32, f32);
-                set_bytes(enc, 3, &RmsNormParams(1, u32_of(d)?, 1e-6));
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
-                Ok(())
-            })?);
-        }
-        self.norm_us.lock().insert(d, best);
-        Ok(best)
-    }
-
-    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg` (with the RmsNorm prologue when
-    /// `norm`), compiled on first use.
-    fn gen_pso(
-        &self,
-        f: QuantFormat,
-        rows_per_sg: u8,
-        norm: bool,
-    ) -> Result<ComputePipelineState, String> {
+    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
+    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, rows_per_sg, norm);
+        let key = (c.format, rows_per_sg);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
         let params = crate::graph::codegen::GemvParams {
             rows_per_sg: rows_per_sg as usize,
-            norm,
             ..Default::default()
         };
         let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
         src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
-        if norm {
-            src.push_str(crate::graph::codegen::gemv_norm_common(&KERNELS_MSL));
-        }
         src.push_str(&crate::graph::codegen::gemv_packed(c, params));
         let name = crate::graph::codegen::gemv_packed_name(c, params);
         let pso = self.compile_generated(&src, &name)?;
@@ -1210,7 +1060,7 @@ impl Runtime {
     /// otherwise unused `rows_per_sg == 0` slot).
     fn dequant_pso(&self, f: QuantFormat) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, 0, false);
+        let key = (c.format, 0);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
@@ -1221,23 +1071,15 @@ impl Runtime {
         Ok(pso)
     }
 
-    /// Hash of the kernel sources behind every variant of `fmt` (with the prologue when `norm`): an edit
-    /// invalidates only the tune entries of the formats whose kernels it changed.
-    fn variants_hash(&self, fmt: WeightFormat, norm: bool) -> u64 {
-        use crate::graph::codegen::{gemv_common, gemv_norm_common, gemv_packed, GemvParams};
+    /// Hash of the kernel sources behind every variant of `fmt`: an edit invalidates only the
+    /// tune entries of the formats whose kernels it changed.
+    fn variants_hash(&self, fmt: WeightFormat) -> u64 {
+        use crate::graph::codegen::{gemv_common, gemv_packed, GemvParams};
         let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
         let mut mix =
             |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
-        // The hand kernels that run the prologue are `_t` templates over it.
-        let hand = |n: &str| match tune::kernel_source(&KERNELS_MSL, n) {
-            "" => tune::kernel_source(&KERNELS_MSL, &format!("{n}_t")),
-            s => s,
-        };
-        for name in [fmt.hand_kernel(), fmt.hand_split_kernel()].into_iter().flatten() {
-            mix(hand(name));
-        }
-        if norm {
-            mix(gemv_norm_common(&KERNELS_MSL));
+        if let Some(name) = fmt.hand_kernel() {
+            mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
             for r in tune::GEN_ROWS {
@@ -1245,7 +1087,6 @@ impl Runtime {
                     c,
                     GemvParams {
                         rows_per_sg: r as usize,
-                        norm,
                         ..Default::default()
                     },
                 ));
@@ -1263,7 +1104,7 @@ impl Runtime {
             return default;
         };
         TUNE_SHAPES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let key = tune::TuneCache::key(&format!("{q:?}"), rows, cols, self.variants_hash(fmt, false));
+        let key = tune::TuneCache::key(&format!("{q:?}"), rows, cols, self.variants_hash(fmt));
         let cached = self.tune.lock().get(&key);
         if let Some(t) = cached {
             TUNE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1293,88 +1134,10 @@ impl Runtime {
                 variant: best,
                 us: bytes / (gbps * 1e9) * 1e6,
                 gbps,
-                plain_us: 0.0,
-                chain_us: 0.0,
             },
         );
         cache.save(&self.tune_path);
         best
-    }
-
-    /// Times `fmt`'s `rows x cols` M=1 GEMV with the RmsNorm prologue against the plain GEMV in the best
-    /// plain variant ([`Self::bench_norm_prologue`]): the fastest prologue-capable variant (`variant`, `us`,
-    /// `gbps`), the plain GEMV (`plain_us`) and what it costs behind its own `cols`-wide RmsNorm dispatch
-    /// (`chain_us`), per norm -> GEMV pair on this device. The persisted result, else measured now and
-    /// persisted. `None`: no variant of `fmt` runs the prologue, or the measurement is not credible.
-    fn tuned_norm(self: &Arc<Self>, fmt: WeightFormat, rows: usize, cols: usize) -> Option<tune::Tuned> {
-        let variants = fmt.norm_variants();
-        let q = fmt.codec_format().filter(|_| !variants.is_empty())?;
-        let key = tune::TuneCache::key(
-            &format!("{q:?}+norm2"),
-            rows,
-            cols,
-            self.variants_hash(fmt, true),
-        );
-        // An entry an older binary re-saved lost `plain_us`/`chain_us` (serde default 0): measure it again.
-        let cached = self
-            .tune
-            .lock()
-            .get(&key)
-            .filter(|t| t.us >= 1e11 || t.chain_us > t.plain_us);
-        if cached.is_some() {
-            return cached;
-        }
-        let plain = self.tuned_variant(fmt, rows, cols);
-        let bytes = weight_format_bytes(fmt, rows * cols) as f64;
-        let measured = || -> Result<tune::Tuned, String> {
-            let (plain_us, fused) = self.bench_norm_prologue(q, (rows, cols), plain, &variants)?;
-            // bytes per us = MB/s, so GB/s is a thousandth of it.
-            let gbps: Vec<_> = fused.iter().map(|&(v, us)| (v, bytes / us / 1e3)).collect();
-            let best = tune::choose(&gbps).ok_or("no fused variant timed")?;
-            let us = fused.iter().find(|t| t.0 == best).map_or(f64::NAN, |t| t.1);
-            // The prologue only adds work: a fused kernel under the plain one (beyond a little slack) is noise.
-            if !(us >= 0.9 * plain_us) {
-                return Err(format!("fused {us:.1} us under plain {plain_us:.1} us: measurement is noise"));
-            }
-            Ok(tune::Tuned {
-                variant: best,
-                us,
-                gbps: bytes / us / 1e3,
-                plain_us,
-                chain_us: plain_us + self.norm_dispatch_us(cols)?,
-            })
-        };
-        // A measurement that fails the plausibility check is retried (GPU load from other processes comes in
-        // bursts). If none passes, "never fuse here" is persisted, so the plan does not depend on the load
-        // of the next process: a prologue that costs 1e12 us never pays.
-        let never = tune::Tuned {
-            variant: variants[0],
-            us: 1e12,
-            gbps: 0.0,
-            plain_us: 0.0,
-            chain_us: 0.0,
-        };
-        let t = (0..3)
-            .find_map(|_| match measured() {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    tracing::warn!("tune {q:?}+norm {rows}x{cols}: {e}");
-                    None
-                }
-            })
-            .unwrap_or(never);
-        tracing::info!(
-            "tune: {q:?}+norm {rows}x{cols}: {} {:.1} us vs plain {} {:.1} us + norm {:.1} us",
-            t.variant.label(),
-            t.us,
-            plain.label(),
-            t.plain_us,
-            t.chain_us - t.plain_us
-        );
-        let mut cache = self.tune.lock();
-        cache.insert(key, t);
-        cache.save(&self.tune_path);
-        Some(t)
     }
 
     /// Starts [`Self::benchmark_codecs`] on a background thread unless this host profile already
@@ -1639,10 +1402,6 @@ pub struct Session {
     jesse_aux: HashMap<String, (Buffer, usize)>,
     /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
     variant_override: Option<GemvVariant>,
-    /// `Some(true)`: every RmsNorm a packed GEMV can absorb is absorbed; `Some(false)`: none; `None`: the
-    /// tuner decides per shape ([`Session::fuse_norm_prologue`]). `GIBBS_NORM_PROLOGUE=on|off` sets it
-    /// for every new session.
-    norm_prologue: Option<bool>,
     last_gpu_s: std::sync::atomic::AtomicU64,
 }
 impl Session {
@@ -2199,7 +1958,7 @@ impl Session {
             })
             .collect();
         for q in gen_formats {
-            rt.gen_pso(q, 2, false)?;
+            rt.gen_pso(q, 2)?;
         }
         Ok(Self {
             rt,
@@ -2214,11 +1973,6 @@ impl Session {
             nvfp4_aux,
             jesse_aux,
             variant_override: None,
-            norm_prologue: match std::env::var("GIBBS_NORM_PROLOGUE").as_deref() {
-                Ok("on") => Some(true),
-                Ok("off") => Some(false),
-                _ => None,
-            },
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -2231,11 +1985,6 @@ impl Session {
         self.rt.pso(&format!("{}_none", kind.spec(1, 1).0))?;
         self.gemm = Some(kind);
         Ok(())
-    }
-
-    /// Forces ([`Some`]) or forbids the RmsNorm prologue of packed GEMVs (`None`: the tuner decides).
-    pub(crate) fn set_norm_prologue(&mut self, v: Option<bool>) {
-        self.norm_prologue = v;
     }
 
     /// Forces every packed GEMV onto `v` where the format can run it (`None`: tuned/default).
@@ -2259,17 +2008,15 @@ impl Session {
         (n * 4) as u64
     }
 
-    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`, running the RmsNorm
-    /// prologue when `norm` (buffers 6 = gamma, 7 = eps).
+    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`.
     fn gemv_pipeline(
         &self,
         format: WeightFormat,
         variant: GemvVariant,
-        norm: bool,
     ) -> Result<(ComputePipelineState, u64), String> {
         let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
             Ok((
-                self.rt.gen_pso(q, r, norm)?,
+                self.rt.gen_pso(q, r)?,
                 crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
                     rows_per_sg: r as usize,
                     ..Default::default()
@@ -2289,27 +2036,18 @@ impl Session {
                 Some(q) => generated(q, variant.rows_per_sg),
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
-            (_, GemvKernel::Hand | GemvKernel::HandSplit) => {
-                let name = if norm {
-                    format.hand_norm_kernel(variant.kernel)
-                } else if variant.kernel == GemvKernel::HandSplit {
-                    format.hand_split_kernel()
-                } else {
-                    format.hand_kernel()
-                };
-                match name {
-                    Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
-                    None => Err(format!(
-                        "Metal executor: unsupported packed GEMV format {format:?}"
-                    )),
-                }
-            }
+            (_, GemvKernel::Hand) => match format.hand_kernel() {
+                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                None => Err(format!(
+                    "Metal executor: unsupported packed GEMV format {format:?}"
+                )),
+            },
         }
     }
 
     /// `format`'s default-variant GEMV pipeline (steps that are not tuned).
     fn gemv_pso(&self, format: WeightFormat) -> Result<ComputePipelineState, String> {
-        self.gemv_pipeline(format, format.default_variant(), false)
+        self.gemv_pipeline(format, format.default_variant())
             .map(|p| p.0)
     }
 
@@ -2324,7 +2062,6 @@ impl Session {
                 cols,
                 format,
                 variant,
-                norm: None,
                 ..
             } = &mut s.op
             else {
@@ -2347,172 +2084,9 @@ impl Session {
         }
     }
 
-    /// Drops each `RmsNorm(x, gamma)` step whose every reader is a packed GEMV of one row taking its output as
-    /// `x` (`cols == d`, `d % 8 == 0`, `d <= 16384`) and has those GEMVs normalise `x` themselves
-    /// ([`GemvPacked::norm`]): each threadgroup computes `rsqrt(mean(x^2) + eps)` and applies it with
-    /// `gamma` where it loads `x`. A norm that something else reads (or that is a graph output) stays.
-    ///
-    /// Unless [`Self::set_norm_prologue`] forces it, the tuner decides ([`Runtime::tuned_norm`]): the
-    /// norm goes only when every consumer's fused kernel costs less together than the norm dispatch
-    /// ([`tune::norm_pays`]). `GIBBS_TUNE=off` and `GIBBS_FUSION=xla` keep every norm.
-    fn fuse_norm_prologue(
-        &self,
-        graph: &Graph,
-        mut steps: Vec<Planned>,
-        aliases: &HashMap<ValueId, (ValueId, usize)>,
-    ) -> Vec<Planned> {
-        let forced = self.norm_prologue;
-        if forced == Some(false)
-            || !fusion_policy().allows(FusionClass::NormPrologue)
-            || (forced.is_none() && !tune::enabled())
-        {
-            return steps;
-        }
-        let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
-        let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
-        for (i, s) in steps.iter().enumerate() {
-            for &r in &s.reads {
-                let list = readers.entry(root(r)).or_default();
-                if list.last() != Some(&i) {
-                    list.push(i);
-                }
-            }
-        }
-        let mut dropped = vec![false; steps.len()];
-        for i in 0..steps.len() {
-            let Step::RmsNorm {
-                x: raw,
-                g: gamma,
-                res: None,
-                rows: 1,
-                d,
-                eps,
-            } = steps[i].op
-            else {
-                continue;
-            };
-            let out = steps[i].out;
-            if d % 8 != 0 || d > 16384 || graph.outputs.iter().any(|&o| root(o) == root(out)) {
-                continue;
-            }
-            let Some(consumers) = readers.get(&root(out)).filter(|c| !c.is_empty()) else {
-                continue;
-            };
-            // Every reader is a one-row GEMV whose `x` is exactly the norm's output (a plain view or the
-            // value itself) and that reads it nowhere else.
-            let exact = |v: ValueId| v == out || aliases.get(&v) == Some(&(out, 0));
-            let reads_x_only = |j: usize| match steps[j].op {
-                Step::GemvPacked {
-                    x,
-                    m: 1,
-                    cols,
-                    bias,
-                    res,
-                    norm: None,
-                    ..
-                } => cols == d && exact(x) && [bias, res].into_iter().flatten().all(|v| root(v) != root(out)),
-                _ => false,
-            };
-            if !consumers.iter().all(|&j| j > i && reads_x_only(j)) {
-                continue;
-            }
-            // One variant per consumer: the session's override, else the tuned prologue kernel.
-            let mut chosen: Vec<GemvVariant> = Vec::new();
-            let mut tuned: Vec<tune::Tuned> = Vec::new();
-            for &j in consumers {
-                let Step::GemvPacked { format, rows, cols, .. } = steps[j].op else {
-                    unreachable!("checked above");
-                };
-                match self.norm_choice(format, rows, cols, &mut tuned) {
-                    Some(v) => chosen.push(v),
-                    None => break,
-                }
-            }
-            if chosen.len() != consumers.len() || (forced.is_none() && !tune::norm_pays(&tuned)) {
-                continue;
-            }
-
-            for (&j, v) in consumers.iter().zip(chosen) {
-                let s = &mut steps[j];
-                if let Step::GemvPacked { x, variant, norm, .. } = &mut s.op {
-                    (*x, *variant, *norm) = (raw, v, Some((gamma, eps)));
-                }
-                for r in &mut s.reads {
-                    if *r == out || aliases.get(r) == Some(&(out, 0)) {
-                        *r = raw;
-                    }
-                }
-                s.reads.dedup();
-                if !s.reads.contains(&gamma) {
-                    s.reads.push(gamma);
-                }
-            }
-            dropped[i] = true;
-        }
-        // A megakernel MLP's norm feeds its gate and up GEMVs only.
-        for s in steps.iter_mut() {
-            let Step::MegakernelMlp { gate_name, up_name, hidden, inter, norm_fuse, .. } = &mut s.op else {
-                continue;
-            };
-            let (hidden, inter) = (*hidden, *inter);
-            let format = |n: &str| self.weights.get(n).map(|w| w.3);
-            let (Some(fg), Some(fu)) = (format(gate_name), format(up_name)) else {
-                continue;
-            };
-            if hidden % 8 != 0 || hidden > 16384 {
-                continue;
-            }
-            let mut tuned: Vec<tune::Tuned> = Vec::new();
-            let (vg, vu) = (
-                self.norm_choice(fg, inter, hidden, &mut tuned),
-                self.norm_choice(fu, inter, hidden, &mut tuned),
-            );
-            if let (Some(vg), Some(vu)) = (vg, vu) {
-                if forced.is_some() || tune::norm_pays(&tuned) {
-                    *norm_fuse = Some([vg, vu]);
-                }
-            }
-        }
-        let mut i = 0;
-        steps.retain(|_| {
-            i += 1;
-            !dropped[i - 1]
-        });
-        steps
-    }
-
-    /// The prologue variant for a one-row GEMV of `format` (`rows x cols`) under this session's settings:
-    /// its override (if it can run the prologue), the format's default when forced, else the tuned winner
-    /// (pushed on `tuned` for [`tune::norm_pays`]). `None`: this GEMV cannot take the prologue.
-    fn norm_choice(
-        &self,
-        format: WeightFormat,
-        rows: usize,
-        cols: usize,
-        tuned: &mut Vec<tune::Tuned>,
-    ) -> Option<GemvVariant> {
-        let capable = format.norm_variants();
-        if let Some(o) = self.variant_override {
-            capable.contains(&o).then_some(o)
-        } else if self.norm_prologue == Some(true) {
-            let d = format.default_variant();
-            if capable.contains(&d) {
-                Some(d)
-            } else {
-                capable.first().copied()
-            }
-        } else {
-            self.rt.tuned_norm(format, rows, cols).map(|t| {
-                tuned.push(t);
-                t.variant
-            })
-        }
-    }
-
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (steps, aliases) = plan(graph)?;
-        let steps = self.fuse_norm_prologue(graph, steps, &aliases);
         let mut steps = batch_horizontal(steps, &aliases);
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
@@ -3011,7 +2585,6 @@ impl Session {
         rows: usize,
         cols: usize,
         epi: Epi,
-        norm: Option<(GemvVariant, (&Buffer, usize), f32)>,
     ) -> Result<(), String> {
         let format = self
             .weights
@@ -3085,10 +2658,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = match norm {
-                    Some((v, ..)) => self.gemv_pipeline(format, v, true)?,
-                    None => self.gemv_pipeline(format, format.default_variant(), false)?,
-                };
+                let pso = self.gemv_pso(format)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -3104,10 +2674,12 @@ impl Session {
                 } else {
                     enc.set_buffer(5, Some(out.0), out.1 as u64);
                 }
-                if let Some((_, gamma, eps)) = norm {
-                    enc.set_buffer(6, Some(gamma.0), gamma.1 as u64);
-                    set_bytes(enc, 7, &eps);
-                }
+                let rows_per_tg = match format {
+                    WeightFormat::Gen(_) => {
+                        crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64
+                    }
+                    _ => 16,
+                };
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -3257,7 +2829,6 @@ impl Session {
                 cols,
                 format,
                 variant,
-                norm,
             } => {
                 if format == WeightFormat::NvFp4 {
                     let (scales_buf, global_scale) = self
@@ -3320,15 +2891,11 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, norm.is_some())?;
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
                 bind(2, s.out);
-                if let Some((gamma, eps)) = norm {
-                    bind(6, gamma);
-                    set_bytes(enc, 7, &eps);
-                }
                 #[repr(C)]
                 struct PackedGemvParams(u32, u32, u32, u32, u32);
                 let epi_u32 = epi.as_u32();
@@ -3925,7 +3492,6 @@ impl Session {
                 inter,
                 eps,
                 is_geglu,
-                norm_fuse,
             } => {
                 let bytes_norm = hidden * 4;
                 let bytes_inter = inter * 4;
@@ -3945,32 +3511,21 @@ impl Session {
                 let off_gate = bytes_norm;
                 let off_up = bytes_norm + bytes_inter;
 
-                // 1. RMSNorm: x * norm_w -> scratch[off_norm], unless the gate and up GEMVs run it in their prologue.
-                if norm_fuse.is_none() {
-                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
-                    bind(0, x);
-                    bind(1, norm_w);
-                    enc.set_buffer(2, Some(scratch), off_norm as u64);
-                    #[repr(C)]
-                    struct RmsNormParams(u32, u32, f32);
-                    let p = RmsNormParams(1, u32_of(hidden)?, eps);
-                    set_bytes(enc, 3, &p);
-                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
-                }
-                // The GEMVs' input: the normalised row, or the raw `x` with the prologue's gamma and eps.
-                let (gemv_x, gate_norm, up_norm) = match norm_fuse {
-                    Some([vg, vu]) => (
-                        loc(x),
-                        Some((vg, loc(norm_w), eps)),
-                        Some((vu, loc(norm_w), eps)),
-                    ),
-                    None => ((scratch, off_norm), None, None),
-                };
+                // 1. RMSNorm: x * norm_w -> scratch[off_norm]
+                enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
+                bind(0, x);
+                bind(1, norm_w);
+                enc.set_buffer(2, Some(scratch), off_norm as u64);
+                #[repr(C)]
+                struct RmsNormParams(u32, u32, f32);
+                let p = RmsNormParams(1, u32_of(hidden)?, eps);
+                set_bytes(enc, 3, &p);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
 
-                // 2. Gate GEMV: normalised x * gate_w -> scratch[off_gate]
+                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
                 self.encode_gemv_or_gemm(
                     enc,
-                    gemv_x,
+                    (scratch, off_norm),
                     loc(gate_w),
                     gate_name,
                     None,
@@ -3978,13 +3533,12 @@ impl Session {
                     inter,
                     hidden,
                     Epi::None,
-                    gate_norm,
                 )?;
 
-                // 3. Up GEMV: normalised x * up_w -> scratch[off_up]
+                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
                 self.encode_gemv_or_gemm(
                     enc,
-                    gemv_x,
+                    (scratch, off_norm),
                     loc(up_w),
                     up_name,
                     None,
@@ -3992,7 +3546,6 @@ impl Session {
                     inter,
                     hidden,
                     Epi::None,
-                    up_norm,
                 )?;
 
                 // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
@@ -4017,7 +3570,6 @@ impl Session {
                         hidden,
                         inter,
                         Epi::None,
-                        None,
                     )?;
 
                     // 6. Post-down RMSNorm with residual add: scratch[off_norm] * pn + x -> s.out
@@ -4043,7 +3595,6 @@ impl Session {
                         hidden,
                         inter,
                         Epi::Residual,
-                        None,
                     )?;
                 }
             }
@@ -4113,8 +3664,6 @@ pub enum Step {
         format: WeightFormat,
         /// Kernel variant, set by [`Session::prepare_plan`] from the tuner (or the format default).
         variant: GemvVariant,
-        /// RmsNorm prologue `(gamma, eps)`: `x` is the un-normalised row ([`Session::fuse_norm_prologue`]).
-        norm: Option<(ValueId, f32)>,
     },
     GemmBatchedPacked {
         x: ValueId,
@@ -4236,8 +3785,6 @@ pub enum Step {
         inter: usize,
         eps: f32,
         is_geglu: bool,
-        /// Variants of the gate and up GEMVs when they run the RmsNorm prologue instead of a norm dispatch.
-        norm_fuse: Option<[GemvVariant; 2]>,
     },
 }
 
@@ -4716,7 +4263,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                                 cols: k,
                                 format: fmt,
                                 variant: fmt.default_variant(),
-                                norm: None,
                             },
                             m * n,
                         )
@@ -5081,7 +4627,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                             inter: *intermediate_dim,
                             eps: *eps,
                             is_geglu: *is_geglu,
-                            norm_fuse: None,
                         },
                         n,
                     )
@@ -6401,38 +5946,6 @@ mod tests {
         assert!(rel_err(&want, &got) < 1e-5);
     }
 
-    /// Random blocks for an `[n, k]` weight of `f` with finite f16 scales (|scale| in 2^-6..2^4), so the
-    /// reference and the GPU never meet NaN/inf.
-    fn random_gguf_blocks(
-        f: QuantFormat,
-        n: usize,
-        k: usize,
-        next: &mut dyn FnMut() -> u32,
-    ) -> Vec<u8> {
-        let (be, bb, _) = crate::model::layers::gguf_block_codec(f).expect("CPU dequantizer");
-        let scale_at: &[usize] = match f {
-            QuantFormat::GGUF_Q4_1
-            | QuantFormat::GGUF_Q5_1
-            | QuantFormat::GGUF_Q5_K_M
-            | QuantFormat::GGUF_Q4_K_M => &[0, 2],
-            QuantFormat::GGUF_Q2_K => &[80, 82],
-            QuantFormat::GGUF_Q6_K => &[208],
-            QuantFormat::GGUF_Q3_K => &[108],
-            QuantFormat::GGUF_TQ1_0 => &[52],
-            QuantFormat::GGUF_TQ2_0 => &[64],
-            _ => &[0],
-        };
-        let mut raw: Vec<u8> = (0..n * (k / be) * bb).map(|_| (next() >> 4) as u8).collect();
-        for blk in raw.chunks_exact_mut(bb) {
-            for &o in scale_at {
-                let exp = 9 + (next() % 14) as u16;
-                let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
-                blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
-            }
-        }
-        raw
-    }
-
     /// Every packed format (generated and hand kernels): the GPU GEMV equals the CPU executor
     /// (which dequantizes through `dequantize_*_block`), with and without a bias epilogue.
     #[test]
@@ -6470,12 +5983,35 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
+        // Finite f16 scale (|x| in 2^-6..2^4) so the reference and the GPU never meet NaN/inf.
+        let mut f16 = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
+            let exp = 9 + (next() % 14) as u16;
+            (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
+        };
         // m = 3 runs the GEMV kernels; m = 20 (>= 16) the batched GEMM (hand kernels, or codec expansion + f32 GEMM).
         for (f, m) in formats.into_iter().flat_map(|f| [(f, 3usize), (f, 20)]) {
-            let (be, _, _) = gguf_block_codec(f).expect("CPU dequantizer");
-            // Q4_0 gets more than the 16 blocks one pass of its lane-split kernel covers.
-            let (n, k) = (37usize, be * if f == QuantFormat::GGUF_Q4_0 { 37 } else { 3 });
-            let raw = random_gguf_blocks(f, n, k, &mut next);
+            let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+            let scale_at: &[usize] = match f {
+                QuantFormat::GGUF_Q4_1
+                | QuantFormat::GGUF_Q5_1
+                | QuantFormat::GGUF_Q5_K_M
+                | QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                QuantFormat::GGUF_Q2_K => &[80, 82],
+                QuantFormat::GGUF_Q6_K => &[208],
+                QuantFormat::GGUF_Q3_K => &[108],
+                QuantFormat::GGUF_TQ1_0 => &[52],
+                QuantFormat::GGUF_TQ2_0 => &[64],
+                _ => &[0],
+            };
+            let (n, k) = (37usize, be * 3);
+            let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                .map(|_| (next() >> 4) as u8)
+                .collect();
+            for blk in raw.chunks_exact_mut(bb) {
+                for &o in scale_at {
+                    blk[o..o + 2].copy_from_slice(&f16(&mut next));
+                }
+            }
             let mut g = Graph::new();
             let x = g.input("x", vec![m, k], DType::F32);
             let w_val = g.weight("w", vec![n, k], DType::Quant(f));
@@ -6599,272 +6135,6 @@ mod tests {
         }
     }
 
-    /// `RmsNorm(x, gamma) -> Linear` of one row: for every variant that runs the prologue the GEMV absorbs
-    /// the norm (no RmsNorm step is left) and equals the CPU executor's norm + Linear, with non-unit
-    /// gamma, rows that are not a multiple of the rows per threadgroup, blocks that are not whole
-    /// planar groups, and K long enough for several passes of the sum-of-squares loop.
-    #[test]
-    fn norm_prologue_matches_cpu() {
-        use crate::model::layers::QuantizedWeight;
-        let mut seed = 0xD1B54A32D192ED03u64;
-        let mut next = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (seed >> 33) as u32
-        };
-        let formats = [
-            QuantFormat::GGUF_TQ2_0,
-            QuantFormat::GGUF_Q4_0,
-            QuantFormat::GGUF_Q8_0,
-            QuantFormat::GGUF_Q6_K,
-            QuantFormat::GGUF_Q5_0,
-            QuantFormat::GGUF_Q4_K_M,
-            QuantFormat::GGUF_Q2_K,
-            QuantFormat::GGUF_Q3_K,
-            QuantFormat::GGUF_IQ4_XS,
-            QuantFormat::GGUF_IQ3_S,
-        ];
-        for f in formats {
-            let (be, _, _) = crate::model::layers::gguf_block_codec(f).expect("CPU dequantizer");
-            for k in [be * 5, 4096] {
-                let n = 37usize;
-                let mut g = Graph::new();
-                let x = g.input("x", vec![1, k], DType::F32);
-                let gm = g.weight("g", vec![k], DType::F32);
-                let nx = g.add("norm", Op::RmsNorm { eps: 1e-6 }, &[x, gm], vec![1, k], DType::F32);
-                let w_val = g.weight("w", vec![n, k], DType::Quant(f));
-                let b_val = g.weight("b", vec![n], DType::F32);
-                let y = g.add("lin", Op::Linear, &[nx, w_val, b_val], vec![1, n], DType::F32);
-                g.output(y);
-                let mut w = Weights::new();
-                w.insert(
-                    "w",
-                    Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                        format: f,
-                        raw_data: random_gguf_blocks(f, n, k, &mut next).into(),
-                        in_features: k,
-                        out_features: n,
-                    })),
-                );
-                w.insert("g", Tensor::F32((0..k).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect()));
-                w.insert("b", Tensor::F32((0..n).map(|i| i as f32 * 0.01 - 0.2).collect()));
-                let xs: Vec<f32> = (0..k).map(|_| (next() % 2001) as f32 / 1000.0 - 0.7).collect();
-                let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())])
-                    .unwrap()
-                    .remove(0)
-                    .into_f32()
-                    .unwrap();
-                for v in WeightFormat::of_quant(f).norm_variants() {
-                    let mut s = Session::new(rt(), &w).unwrap();
-                    s.set_variant_override(Some(v));
-                    s.set_norm_prologue(Some(true));
-                    let steps = s.prepare_plan(&g).unwrap().steps;
-                    assert!(
-                        steps.iter().all(|p| !matches!(p.op, Step::RmsNorm { .. }))
-                            && steps
-                                .iter()
-                                .any(|p| matches!(p.op, Step::GemvPacked { norm: Some(_), .. })),
-                        "{f:?} k={k} {v:?}: the norm was not absorbed"
-                    );
-                    let got = s
-                        .run(&g, vec![Tensor::F32(xs.clone())])
-                        .unwrap()
-                        .remove(0)
-                        .into_f32()
-                        .unwrap();
-                    let err = rel_err(&want, &got);
-                    assert!(err < 1e-4, "{f:?} k={k} {v:?}: fused norm + GEMV differs from CPU by {err}");
-                }
-            }
-        }
-    }
-
-    /// One norm feeding two GEMVs of different codecs fuses into both; a norm something else reads (here
-    /// also a graph output) or that feeds a batched (m > 1) Linear stays a step.
-    #[test]
-    fn norm_prologue_needs_every_reader_to_be_a_one_row_gemv() {
-        use crate::model::layers::QuantizedWeight;
-        let mut next = {
-            let mut seed = 0x8E7C1B2A5D3F4961u64;
-            move || {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (seed >> 33) as u32
-            }
-        };
-        let (n, k) = (40usize, 512usize);
-        let fmts = [QuantFormat::GGUF_Q4_0, QuantFormat::GGUF_TQ2_0];
-        let mut w = Weights::new();
-        for (i, f) in fmts.into_iter().enumerate() {
-            w.insert(
-                &format!("w{i}"),
-                Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                    format: f,
-                    raw_data: random_gguf_blocks(f, n, k, &mut next).into(),
-                    in_features: k,
-                    out_features: n,
-                })),
-            );
-        }
-        w.insert("g", Tensor::F32((0..k).map(|i| 0.75 + (i % 5) as f32 * 0.2).collect()));
-        let build = |m: usize, norm_is_output: bool| {
-            let mut g = Graph::new();
-            let x = g.input("x", vec![m, k], DType::F32);
-            let gm = g.weight("g", vec![k], DType::F32);
-            let nx = g.add("norm", Op::RmsNorm { eps: 1e-5 }, &[x, gm], vec![m, k], DType::F32);
-            for (i, f) in fmts.into_iter().enumerate() {
-                let wv = g.weight(&format!("w{i}"), vec![n, k], DType::Quant(f));
-                let y = g.add(&format!("lin{i}"), Op::Linear, &[nx, wv], vec![m, n], DType::F32);
-                g.output(y);
-            }
-            if norm_is_output {
-                g.output(nx);
-            }
-            g
-        };
-        let norms = |g: &Graph, w: &Weights| {
-            let mut s = Session::new(rt(), w).unwrap();
-            s.set_norm_prologue(Some(true));
-            let steps = s.prepare_plan(g).unwrap().steps;
-            steps.iter().filter(|p| matches!(p.op, Step::RmsNorm { .. })).count()
-        };
-        let g = build(1, false);
-        assert_eq!(norms(&g, &w), 0, "both one-row GEMV readers absorb the norm");
-        let xs: Vec<f32> = (0..k).map(|_| (next() % 2001) as f32 / 1000.0 - 0.3).collect();
-        let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())]).unwrap();
-        let mut s = Session::new(rt(), &w).unwrap();
-        s.set_norm_prologue(Some(true));
-        let got = s.run(&g, vec![Tensor::F32(xs)]).unwrap();
-        for (a, b) in want.into_iter().zip(got) {
-            let err = rel_err(&a.into_f32().unwrap(), &b.into_f32().unwrap());
-            assert!(err < 1e-4, "two-consumer fusion differs from CPU by {err}");
-        }
-        assert_eq!(norms(&build(1, true), &w), 1, "a graph-output norm stays");
-        assert_eq!(norms(&build(3, false), &w), 1, "rows != 1 stays");
-        let mut off = Session::new(rt(), &w).unwrap();
-        off.set_norm_prologue(Some(false));
-        assert_eq!(
-            off.prepare_plan(&g).unwrap().steps.iter().filter(|p| matches!(p.op, Step::RmsNorm { .. })).count(),
-            1
-        );
-    }
-
-    /// A megakernel MLP over packed weights runs its gate and up GEMVs on the raw row with the RmsNorm
-    /// prologue (no norm dispatch) and equals the CPU executor's unfused norm + MLP, as when the prologue
-    /// is off.
-    #[test]
-    fn megakernel_mlp_norm_prologue_matches_cpu() {
-        use crate::model::layers::QuantizedWeight;
-        let mut seed = 0x51ED270B3A94C6F1u64;
-        let mut next = move || {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (seed >> 33) as u32
-        };
-        let (hidden, inter) = (256usize, 512usize);
-        for (post, (fgu, fd)) in [false, true].into_iter().flat_map(|p| {
-            [
-                (QuantFormat::GGUF_Q4_0, QuantFormat::GGUF_Q4_0),
-                (QuantFormat::GGUF_Q4_K_M, QuantFormat::GGUF_Q8_0),
-            ]
-            .map(move |f| (p, f))
-        }) {
-            let mut g = Graph::new();
-            let mut w = Weights::new();
-            w.insert("norm", Tensor::F32((0..hidden).map(|i| 0.6 + (i % 5) as f32 * 0.2).collect()));
-            let mut quant = |g: &mut Graph, name: &str, f: QuantFormat, n: usize, k: usize| {
-                w.insert(
-                    name,
-                    Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                        format: f,
-                        raw_data: random_gguf_blocks(f, n, k, &mut next).into(),
-                        in_features: k,
-                        out_features: n,
-                    })),
-                );
-                g.weight(name, vec![n, k], DType::Quant(f))
-            };
-            let x = g.input("x", vec![1, hidden], DType::F32);
-            let norm_w = g.weight("norm", vec![hidden], DType::F32);
-            let gate_w = quant(&mut g, "gate", fgu, inter, hidden);
-            let up_w = quant(&mut g, "up", fgu, inter, hidden);
-            let down_w = quant(&mut g, "down", fd, hidden, inter);
-            let nx = g.add("n", Op::RmsNorm { eps: 1e-6 }, &[x, norm_w], vec![1, hidden], DType::F32);
-            let gate = g.add("g", Op::Linear, &[nx, gate_w], vec![1, inter], DType::F32);
-            let up = g.add("u", Op::Linear, &[nx, up_w], vec![1, inter], DType::F32);
-            let act = g.add("a", Op::SwiGlu, &[gate, up], vec![1, inter], DType::F32);
-            let down = g.add("d", Op::Linear, &[act, down_w], vec![1, hidden], DType::F32);
-            // With a post-norm the megakernel also runs the down GEMV into scratch and a residual norm.
-            let down = if post {
-                w.insert("pn", Tensor::F32((0..hidden).map(|i| 0.8 + (i % 3) as f32 * 0.3).collect()));
-                let pn_w = g.weight("pn", vec![hidden], DType::F32);
-                g.add("pn_norm", Op::RmsNorm { eps: 1e-6 }, &[down, pn_w], vec![1, hidden], DType::F32)
-            } else {
-                down
-            };
-            let out = g.add("r", Op::Add, &[x, down], vec![1, hidden], DType::F32);
-            g.output(out);
-            let xs: Vec<f32> = (0..hidden).map(|_| (next() % 2001) as f32 / 1000.0 - 0.6).collect();
-            let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())])
-                .unwrap()
-                .remove(0)
-                .into_f32()
-                .unwrap();
-            assert_eq!(crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g), 1);
-            for forced in [true, false] {
-                let mut s = Session::new(rt(), &w).unwrap();
-                s.set_norm_prologue(Some(forced));
-                let steps = s.prepare_plan(&g).unwrap().steps;
-                let fused = steps
-                    .iter()
-                    .any(|p| matches!(p.op, Step::MegakernelMlp { norm_fuse: Some(_), .. }));
-                assert_eq!(fused, forced, "{fgu:?}/{fd:?}: norm_fuse");
-                let got = s
-                    .run(&g, vec![Tensor::F32(xs.clone())])
-                    .unwrap()
-                    .remove(0)
-                    .into_f32()
-                    .unwrap();
-                let err = rel_err(&want, &got);
-                assert!(err < 1e-4, "{fgu:?}/{fd:?} prologue={forced}: differs from CPU by {err}");
-            }
-        }
-    }
-
-    /// Per norm -> GEMV pair at decode-like shapes: the plain GEMV, the best prologue variant and one
-    /// separate norm dispatch, in µs (`cargo test --release norm_prologue_microbench -- --ignored --nocapture`).
-    #[test]
-    #[ignore = "timing measurement"]
-    fn norm_prologue_microbench() {
-        let rt = rt();
-        for (f, n, k) in [
-            (QuantFormat::GGUF_Q4_0, 512usize, 1536usize),
-            (QuantFormat::GGUF_Q4_0, 2048, 1536),
-            (QuantFormat::GGUF_Q4_0, 6144, 1536),
-            (QuantFormat::GGUF_Q8_0, 256, 1536),
-            (QuantFormat::GGUF_TQ2_0, 12288, 1536),
-            (QuantFormat::GGUF_TQ2_0, 262144, 1536),
-            (QuantFormat::GGUF_Q4_K_M, 1536, 2048),
-        ] {
-            let fmt = WeightFormat::of_quant(f);
-            let plain = rt.tuned_variant(fmt, n, k);
-            let (plain_us, fused) = rt
-                .bench_norm_prologue(f, (n, k), plain, &fmt.norm_variants())
-                .unwrap();
-            let norm_us = rt.norm_dispatch_us(k).unwrap();
-            let (v, us) = fused.iter().copied().fold((plain, f64::INFINITY), |a, b| if b.1 < a.1 { b } else { a });
-            println!(
-                "NORM_PROLOGUE {f:?} {n}x{k}: plain {} {plain_us:.1} us, fused {} {us:.1} us, norm {norm_us:.1} us -> {:+.1} us per pair",
-                plain.label(),
-                v.label(),
-                us - plain_us - norm_us
-            );
-        }
-    }
-
     /// Generated-GEMV bandwidth at lm_head-like shapes (`cargo test --release -- --ignored --nocapture`).
     #[test]
     #[ignore = "bandwidth measurement"]
@@ -6941,9 +6211,6 @@ mod tests {
                 (1536, 6144),
                 (2048, 1536),
                 (1536, 2048),
-                (256, 1536),
-                (12288, 1536),
-                (1536, 12288),
                 (262144, 1536),
             ] {
                 let t = rt().bench_gemv(f, &[shape], &fmt.gemv_variants()).unwrap();

@@ -12,9 +12,6 @@ use std::path::Path;
 pub enum GemvKernel {
     /// The hand-written kernel of `metal_kernels.metal` (formats that have one).
     Hand,
-    /// The hand kernel that gives each weight block to several lanes (short or odd-length rows keep every
-    /// lane busy); formats that have one.
-    HandSplit,
     /// The kernel generated from the format's codec (`codegen::gemv_packed`).
     Gen,
 }
@@ -35,10 +32,6 @@ impl GemvVariant {
         kernel: GemvKernel::Hand,
         rows_per_sg: 0,
     };
-    pub const HAND_SPLIT: Self = Self {
-        kernel: GemvKernel::HandSplit,
-        rows_per_sg: 0,
-    };
     pub const fn generated(rows_per_sg: u8) -> Self {
         Self {
             kernel: GemvKernel::Gen,
@@ -49,7 +42,6 @@ impl GemvVariant {
     pub fn label(&self) -> String {
         match self.kernel {
             GemvKernel::Hand => "hand".into(),
-            GemvKernel::HandSplit => "hand/split".into(),
             GemvKernel::Gen => format!("gen/r{}", self.rows_per_sg),
         }
     }
@@ -80,24 +72,6 @@ pub struct Tuned {
     pub variant: GemvVariant,
     pub us: f64,
     pub gbps: f64,
-    /// RmsNorm-prologue entries (`<format>+norm`) only: per norm -> GEMV pair, the best plain GEMV's
-    /// time and that GEMV behind its own RmsNorm dispatch (`variant`/`us` are the fused kernel).
-    #[serde(default)]
-    pub plain_us: f64,
-    #[serde(default)]
-    pub chain_us: f64,
-}
-
-/// Whether dropping a RmsNorm dispatch pays when its output feeds GEMVs with these tuned prologue
-/// entries (`<format>+norm`): the prologue costs each consumer `us - plain_us` more, and the norm
-/// dispatch costs `chain_us - plain_us`. Ties fuse (one dispatch fewer).
-pub fn norm_pays(consumers: &[Tuned]) -> bool {
-    let Some(first) = consumers.first() else {
-        return false;
-    };
-    let norm_us = (first.chain_us - first.plain_us).max(0.0);
-    let extra: f64 = consumers.iter().map(|t| t.us - t.plain_us).sum();
-    extra <= norm_us
 }
 
 /// Persisted winners: `"<format>|<rows>|<cols>|<kernel hash>"` -> result.
@@ -106,13 +80,10 @@ pub struct TuneCache(BTreeMap<String, Tuned>);
 
 impl TuneCache {
     pub fn load(path: &Path) -> Self {
-        let Ok(bytes) = std::fs::read(path) else {
-            return Self::default();
-        };
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("tune cache: ignoring unreadable {}: {e}", path.display());
-            Self::default()
-        })
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) {
@@ -120,13 +91,9 @@ impl TuneCache {
             if let Some(d) = path.parent() {
                 std::fs::create_dir_all(d)?;
             }
-            // Written whole through a rename: concurrent processes never read a torn file. Entries other
-            // processes saved since this one loaded the cache are kept (ours win on a shared key), so
-            // alternating binaries do not erase each other's measurements.
-            let mut merged = Self::load(path);
-            merged.0.extend(self.0.iter().map(|(k, v)| (k.clone(), *v)));
+            // Written whole through a rename: concurrent processes never read a torn file.
             let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-            std::fs::write(&tmp, serde_json::to_vec_pretty(&merged)?)?;
+            std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
             std::fs::rename(&tmp, path)
         };
         if let Err(e) = write() {
@@ -142,14 +109,8 @@ impl TuneCache {
         self.0.get(key).copied()
     }
 
-    /// Stores `t`, unless a field is not finite: JSON writes those as `null`, which would make the whole
-    /// file unreadable (and silently empty) for every later load.
     pub fn insert(&mut self, key: String, t: Tuned) {
-        if [t.us, t.gbps, t.plain_us, t.chain_us].iter().all(|v| v.is_finite()) {
-            self.0.insert(key, t);
-        } else {
-            tracing::warn!("tune cache: not storing {key}: non-finite timing");
-        }
+        self.0.insert(key, t);
     }
 }
 
@@ -212,23 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn norm_pays_when_the_prologue_costs_less_than_the_norm_dispatch() {
-        let t = |us, plain_us, chain_us| Tuned {
-            variant: GemvVariant::generated(2),
-            us,
-            gbps: 0.0,
-            plain_us,
-            chain_us,
-        };
-        // Norm costs 3 us; one consumer's prologue adds 1 us: fuse. Two consumers add 2 x 1.6: keep the norm.
-        assert!(norm_pays(&[t(11.0, 10.0, 13.0)]));
-        assert!(!norm_pays(&[t(11.6, 10.0, 13.0), t(11.6, 10.0, 13.0)]));
-        assert!(norm_pays(&[t(10.0, 10.0, 12.0)]));
-        assert!(!norm_pays(&[t(14.0, 10.0, 13.0)]));
-        assert!(!norm_pays(&[]));
-    }
-
-    #[test]
     fn kernel_source_extracts_one_function() {
         let msl = "kernel void a(int x) { if (x) { x++; } }\nkernel void b(int y) { y--; }";
         assert_eq!(
@@ -251,8 +195,6 @@ mod tests {
                 variant: GemvVariant::generated(4),
                 us: 12.5,
                 gbps: 231.0,
-                plain_us: 0.0,
-                chain_us: 0.0,
             },
         );
         c.save(&path);

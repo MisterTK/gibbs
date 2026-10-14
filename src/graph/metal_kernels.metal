@@ -66,27 +66,6 @@ static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemv
 }
 // GEMV-COMMON-END
 
-// GEMV-NORM-BEGIN (also prepended to the generated GEMV kernels that run the RmsNorm prologue)
-// RmsNorm prologue of a GEMV threadgroup (8 simdgroups): rsqrt(mean(x^2) + eps) over the whole row `x`
-// (cols % 4 == 0), computed redundantly by every threadgroup from the L1/L2-resident row. The kernel
-// then applies it as `x * scale * gamma` where it loads x (the order of `rmsnorm_f32`). Holds a
-// barrier: every thread calls it before any early return.
-static inline float gemv_norm_scale(device const float* x, uint cols, float eps, threadgroup float* scratch,
-                                    uint sg, uint lane) {
-    float sq = 0.0f;
-    for (uint i = (sg * 32 + lane) * 4; i < cols; i += 256 * 4) {
-        const float4 v = *reinterpret_cast<device const float4*>(x + i);
-        sq += dot(v, v);
-    }
-    sq = simd_sum(sq);
-    if (lane == 0) scratch[sg] = sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float t = 0.0f;
-    for (uint i = 0; i < 8; ++i) t += scratch[i];
-    return rsqrt(t / float(cols) + eps);
-}
-// GEMV-NORM-END
-
 // Sum across the whole threadgroup; every thread gets the total. Safe to call repeatedly.
 static inline float block_sum(float v, threadgroup float* scratch, uint sg, uint lane, uint nsg) {
     v = simd_sum(v);
@@ -601,118 +580,20 @@ kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
     }
 }
 
-// `NORM`: `x` is the un-normalised row, scaled by `gemv_norm_scale` and `gamma` on load (buffers 6, 7).
-template <bool NORM>
-kernel void gemv_q4_0_split_t(device const block_q4_0* w [[buffer(0)]],
-                      device const float* x [[buffer(1)]],
-                      device float* y [[buffer(2)]],
-                      constant PackedGemvParams& p [[buffer(3)]],
-                      device const float* bias [[buffer(4)]],
-                      device const float* res [[buffer(5)]],
-                      device const float* gamma [[buffer(6)]],
-                      constant float& norm_eps [[buffer(7)]],
-                      uint2 tg [[threadgroup_position_in_grid]],
-                      uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float nscr[8];
-    float nsc = 1.0f;
-    if (NORM) nsc = gemv_norm_scale(x + (ulong)tg.y * p.cols, p.cols, norm_eps, nscr, sg, lane);
-    uint row0 = tg.x * 16 + sg * 2;
-    uint row1 = row0 + 1;
-    uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    bool has_row1 = (row1 < p.rows);
-
-    uint n_blocks = p.cols / 32;
-    device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
-    device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
-    device const float* xb_base = x + (ulong)batch * p.cols;
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-
-    // Two lanes per block, each one half of its 16 bytes (16 elements): the lanes stay balanced when a
-    // row has 48 blocks, and a lane's loads are 8 weight bytes + 4 float4 of x.
-    const uint il = lane & 1;
-    #pragma unroll 2
-    for (uint b = lane >> 1; b < n_blocks; b += 16) {
-        device const block_q4_0* blk0 = r0_blocks + b;
-        device const block_q4_0* blk1 = r1_blocks + b;
-        device const packed_ushort4* qp0 = (device const packed_ushort4*)(blk0->qs + il * 8);
-        device const packed_ushort4* qp1 = (device const packed_ushort4*)(blk1->qs + il * 8);
-        ushort4 h0 = ushort4(*qp0);
-        ushort4 h1 = ushort4(*qp1);
-        float d0 = float(blk0->d);
-        float d1 = float(blk1->d);
-        device const float* xb = xb_base + b * 32 + il * 8;
-        float4 xa0 = *reinterpret_cast<device const float4*>(xb);
-        float4 xa1 = *reinterpret_cast<device const float4*>(xb + 4);
-        float4 xc0 = *reinterpret_cast<device const float4*>(xb + 16);
-        float4 xc1 = *reinterpret_cast<device const float4*>(xb + 20);
-        if (NORM) {
-            device const float* gb = gamma + b * 32 + il * 8;
-            xa0 = xa0 * nsc * *reinterpret_cast<device const float4*>(gb);
-            xa1 = xa1 * nsc * *reinterpret_cast<device const float4*>(gb + 4);
-            xc0 = xc0 * nsc * *reinterpret_cast<device const float4*>(gb + 16);
-            xc1 = xc1 * nsc * *reinterpret_cast<device const float4*>(gb + 20);
-        }
-
-        uint2 q0 = uint2(h0.x | (uint(h0.y) << 16), h0.z | (uint(h0.w) << 16));
-        uint2 q1 = uint2(h1.x | (uint(h1.y) << 16), h1.z | (uint(h1.w) << 16));
-        float4 lo0a = float4(int4(q0.x & 0x0F, (q0.x >> 8) & 0x0F, (q0.x >> 16) & 0x0F, (q0.x >> 24) & 0x0F) - 8);
-        float4 hi0a = float4(int4((q0.x >> 4) & 0x0F, (q0.x >> 12) & 0x0F, (q0.x >> 20) & 0x0F, (q0.x >> 28) & 0x0F) - 8);
-        float4 lo0b = float4(int4(q0.y & 0x0F, (q0.y >> 8) & 0x0F, (q0.y >> 16) & 0x0F, (q0.y >> 24) & 0x0F) - 8);
-        float4 hi0b = float4(int4((q0.y >> 4) & 0x0F, (q0.y >> 12) & 0x0F, (q0.y >> 20) & 0x0F, (q0.y >> 28) & 0x0F) - 8);
-        acc0 += d0 * (dot(lo0a, xa0) + dot(lo0b, xa1) + dot(hi0a, xc0) + dot(hi0b, xc1));
-        float4 lo1a = float4(int4(q1.x & 0x0F, (q1.x >> 8) & 0x0F, (q1.x >> 16) & 0x0F, (q1.x >> 24) & 0x0F) - 8);
-        float4 hi1a = float4(int4((q1.x >> 4) & 0x0F, (q1.x >> 12) & 0x0F, (q1.x >> 20) & 0x0F, (q1.x >> 28) & 0x0F) - 8);
-        float4 lo1b = float4(int4(q1.y & 0x0F, (q1.y >> 8) & 0x0F, (q1.y >> 16) & 0x0F, (q1.y >> 24) & 0x0F) - 8);
-        float4 hi1b = float4(int4((q1.y >> 4) & 0x0F, (q1.y >> 12) & 0x0F, (q1.y >> 20) & 0x0F, (q1.y >> 28) & 0x0F) - 8);
-        if (has_row1) {
-            acc1 += d1 * (dot(lo1a, xa0) + dot(lo1b, xa1) + dot(hi1a, xc0) + dot(hi1b, xc1));
-        }
-    }
-
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
-
-    if (lane == 0) {
-        if (p.has_bias != 0) {
-            acc0 += bias[row0];
-            if (has_row1) acc1 += bias[row1];
-        }
-        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
-        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
-        y[(ulong)batch * p.rows + row0] = acc0;
-        if (has_row1) {
-            y[(ulong)batch * p.rows + row1] = acc1;
-        }
-    }
-}
-typedef decltype(gemv_q4_0_split_t<false>) gemv_q4_0_split_k;
-template [[host_name("gemv_q4_0_split")]] kernel gemv_q4_0_split_k gemv_q4_0_split_t<false>;
-template [[host_name("gemv_q4_0_split_norm")]] kernel gemv_q4_0_split_k gemv_q4_0_split_t<true>;
-
 struct block_q8_0 {
     half d;
     int8_t qs[32];
 };
 
-template <bool NORM>
-kernel void gemv_q8_0_t(device const block_q8_0* w [[buffer(0)]],
+kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
                       device const float* x [[buffer(1)]],
                       device float* y [[buffer(2)]],
                       constant PackedGemvParams& p [[buffer(3)]],
                       device const float* bias [[buffer(4)]],
                       device const float* res [[buffer(5)]],
-                      device const float* gamma [[buffer(6)]],
-                      constant float& norm_eps [[buffer(7)]],
                       uint2 tg [[threadgroup_position_in_grid]],
                       uint sg [[simdgroup_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float nscr[8];
-    float nsc = 1.0f;
-    if (NORM) nsc = gemv_norm_scale(x + (ulong)tg.y * p.cols, p.cols, norm_eps, nscr, sg, lane);
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -744,7 +625,6 @@ kernel void gemv_q8_0_t(device const block_q8_0* w [[buffer(0)]],
             float4 v0 = float4(as_type<char4>(q_raw0));
             float4 v1 = float4(as_type<char4>(q_raw1));
             float4 x_vec = *reinterpret_cast<device const float4*>(xb + j);
-            if (NORM) x_vec = x_vec * nsc * *reinterpret_cast<device const float4*>(gamma + b * 32 + j);
             b_acc0 += dot(v0, x_vec);
             b_acc1 += dot(v1, x_vec);
         }
@@ -769,9 +649,6 @@ kernel void gemv_q8_0_t(device const block_q8_0* w [[buffer(0)]],
         }
     }
 }
-typedef decltype(gemv_q8_0_t<false>) gemv_q8_0_k;
-template [[host_name("gemv_q8_0")]] kernel gemv_q8_0_k gemv_q8_0_t<false>;
-template [[host_name("gemv_q8_0_norm")]] kernel gemv_q8_0_k gemv_q8_0_t<true>;
 
 kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
                       device const float* x [[buffer(1)]],

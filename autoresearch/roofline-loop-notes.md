@@ -280,3 +280,8 @@ The 0.69x host-wall ratio above compares a Rust host wall with jax-metal's Pytho
 
 ## Iteration 27b (Q4_0 lane-split, ungated verify): INCONCLUSIVE
 - User directive: run without waiting for a quiet GPU. Result: delta +0.92 pp, noise 1.37, min ratio 0.955 (Llama Q4_0), base geomean 38.6 (normal 47), so the machine was ~20% slower than usual during the run. Not a keep (delta < noise). Not reverted: F2 (`experiment/f2-norm-prologue`) sits on it, so the next verify measures F2 + Q4_0 split together against base `33187e7`; microbench (164 -> 206 GB/s on 2048x1536) supports the Q4_0 part.
+
+## Iterations 28-31 (F2 + Q4_0 split, F3, F4, MegakernelMlp tuned variants): all DISCARD (ambient GPU load 45-97%)
+- All verdicts come from the loaded machine. Full ABBA verify only for F2+Q4_0 (noise 1.6 pp; unusable per-model ratios); F3/F4/MLP by paired alternated A/B screens of branch binaries on E2B QAT (6 rounds, medians): base 7.928 ms wall; F2+Q4_0 7.919 (580 dispatches); F3 8.230 (+3.8%, 597); F4 7.911 (571); MLP variants 8.682 (+9.5%).
+- Pattern, now seven items: removing 30-70 dispatches per E2B token (F2 -47, F4 -56, F5 -15, F6 -15) never moves the wall time; the per-dispatch floor is not the limiter. F3's merged kernel is slower than three dispatches. The MLP-variant regression is probably tuner picks made under load (not proven).
+- src restored to base `33187e7` (`git checkout 33187e7 -- src`). Branches kept: experiment/f2-norm-prologue (includes the Q4_0 lane-split), experiment/f3-sibling-gemv, experiment/f4-elementwise, experiment/megamlp-variants, experiment/bundle-f2-f4-f3-mlp. Stop rule B's F-item rows: F1-F8 now all have rows (F7/F8 only via bundle row 20).
