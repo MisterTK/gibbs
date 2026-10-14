@@ -4,9 +4,6 @@ use crate::graph::codec::{planar, tile, wide, Codec, Tile};
 pub struct GemvParams {
     pub rows_per_sg: usize,
     pub k_unroll: usize,
-    /// RmsNorm prologue ([`gemv_packed`]): `x` is the un-normalised row; the threadgroup computes
-    /// `rsqrt(mean(x^2) + eps)` and applies it with `gamma` at every `x` load.
-    pub norm: bool,
 }
 
 impl Default for GemvParams {
@@ -14,7 +11,6 @@ impl Default for GemvParams {
         Self {
             rows_per_sg: 2,
             k_unroll: 1,
-            norm: false,
         }
     }
 }
@@ -245,29 +241,7 @@ pub fn gemv_common(kernels_msl: &str) -> &str {
 
 /// Name of the kernel [`gemv_packed`] emits for `codec` with `p`.
 pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
-    format!("gemvgen_{:?}_r{}{}", codec.format, p.rows_per_sg, if p.norm { "_n" } else { "" })
-}
-
-/// `gemv_norm_scale`, the RmsNorm prologue helper, taken from `metal_kernels.metal` between its
-/// `GEMV-NORM` markers; prepended to the generated kernels with [`GemvParams::norm`].
-pub fn gemv_norm_common(kernels_msl: &str) -> &str {
-    let begin = kernels_msl
-        .find("// GEMV-NORM-BEGIN")
-        .expect("GEMV-NORM-BEGIN marker in metal_kernels.metal");
-    let end = kernels_msl
-        .find("// GEMV-NORM-END")
-        .expect("GEMV-NORM-END marker in metal_kernels.metal");
-    &kernels_msl[begin..end]
-}
-
-/// The `float4` of `x` at element `idx` (an MSL expression), normalised on load when `norm` (the
-/// prologue's `nsc` and `gamma`, in the order of `rmsnorm_f32`: `x * scale * gamma`).
-fn xld(norm: bool, idx: &str) -> String {
-    if norm {
-        format!("(*(device const float4*)(xb + {idx}) * nsc * *(device const float4*)(gamma + {idx}))")
-    } else {
-        format!("*(device const float4*)(xb + {idx})")
-    }
+    format!("gemvgen_{:?}_r{}", codec.format, p.rows_per_sg)
 }
 
 /// Name of the kernel [`dequant_packed`] emits for `codec`.
@@ -371,9 +345,9 @@ kernel void {name}(
     device const float* res [[buffer(5)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]{norm_args}
+    uint lane [[thread_index_in_simdgroup]]
 ) {{
-{norm_pro}    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint batch = tg.y;
     if (row0 >= p.rows || batch >= p.batch_size) return;
     const uint blocks_per_row = p.cols / {be};
@@ -384,17 +358,6 @@ kernel void {name}(
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
-        norm_args = if p.norm {
-            ",\n    device const float* gamma [[buffer(6)]],\n    constant float& norm_eps [[buffer(7)]]"
-        } else {
-            ""
-        },
-        // Before the early return: `gemv_norm_scale` holds a threadgroup barrier every thread must reach.
-        norm_pro = if p.norm {
-            "    threadgroup float nscr[8];\n    const float nsc = gemv_norm_scale(x + (ulong)tg.y * p.cols, p.cols, norm_eps, nscr, sg, lane);\n"
-        } else {
-            ""
-        },
         wide_msl = wide(codec.format)
             .map(|w| w
                 .msl
@@ -413,8 +376,6 @@ kernel void {name}(
 /// with a [`wide`] decode, one group of `segs` sub-blocks (its bytes are read once, not once per sub-block).
 fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
     let (be, r) = (codec.block_elems, p.rows_per_sg);
-    let (xe, xe4) = (xld(p.norm, "e"), xld(p.norm, "e + 4"));
-    let (x_s8, x_s8_4) = (xld(p.norm, "s * 8"), xld(p.norm, "s * 8 + 4"));
     // `decode` gets the block's prefixes (`BlockRef::sub` for decode8, `group` for decode_group).
     let row = |i: usize, decode: &dyn Fn(&BlockRef) -> String, dots: &str, v_len: u32| {
         let br = block_ref(codec, "w", &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"));
@@ -439,7 +400,7 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
             })
             .collect();
         return format!(
-            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = {x_s8};\n        float4 x1 = {x_s8_4};\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
+            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
         );
     };
     let (gdec, gseg) = (
@@ -449,7 +410,7 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
     let xs: String = (0..wd.segs)
         .map(|k| {
             format!(
-                "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = {xe}; xs[{}] = {xe4}; }}\n",
+                "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = *(device const float4*)(xb + e); xs[{}] = *(device const float4*)(xb + e + 4); }}\n",
                 2 * k,
                 2 * k + 1
             )
@@ -508,7 +469,6 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
 /// lanes per row), walks that row's tiles `sl, sl + lpr, …`, loads the tile and its scale, then decodes one
 /// 8-element segment at a time against `x` and accumulates `scale * (dot(codes, x) - sum(x))`.
 fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
-    let (xe, xe4) = (xld(p.norm, "e"), xld(p.norm, "e + 4"));
     let (be, r, segs) = (codec.block_elems, p.rows_per_sg, t.segs);
     let lpr = 32 / r;
     assert!(segs as usize % r == 0, "{} rows per simdgroup do not divide {segs} segments", r);
@@ -523,7 +483,7 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
     let body: String = (0..segs)
         .map(|k| {
             format!(
-                "        {{\n            const uint e = blk * {be} + {seg}(g, {k});\n            const float4 xa = {xe}, xc = {xe4};\n            float v[8];\n            {tseg}(q, {k}, v);\n            t += dot(float4(v[0], v[1], v[2], v[3]), xa) + dot(float4(v[4], v[5], v[6], v[7]), xc);\n        }}\n"
+                "        {{\n            const uint e = blk * {be} + {seg}(g, {k});\n            const float4 xa = *(device const float4*)(xb + e), xc = *(device const float4*)(xb + e + 4);\n            float v[8];\n            {tseg}(q, {k}, v);\n            t += dot(float4(v[0], v[1], v[2], v[3]), xa) + dot(float4(v[4], v[5], v[6], v[7]), xc);\n        }}\n"
             )
         })
         .collect();
@@ -533,7 +493,7 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
     let sx_parts: String = (0..spr)
         .map(|m| {
             format!(
-                "        {{\n            const uint e = blk * {be} + {seg}(g, rl * {spr} + {m});\n            sx += {xe} + {xe4};\n        }}\n"
+                "        {{\n            const uint e = blk * {be} + {seg}(g, rl * {spr} + {m});\n            sx += *(device const float4*)(xb + e) + *(device const float4*)(xb + e + 4);\n        }}\n"
             )
         })
         .collect();
