@@ -267,3 +267,9 @@ The 0.69x host-wall ratio above compares a Rust host wall with jax-metal's Pytho
 - +0.17 pp, noise 0.14, min ratio 0.995. E4 (combine near-misses) is tried; stack kept on branch `experiment/e4-stack`. Dispatch-count reductions of 30 per token are worth ~0.2 pp at most: stop pursuing them.
 - Next: the TQ2_0 decode-bound GEMVs (lm_head 105 MB at 51.6% of ceiling; iteration 1 limiter probe: decode work, not bandwidth, dominates) via a planar repack with aligned loads (L5).
 - Pending check on 4.9: XLA pipelined calls are independent, so 286.9 us may be a throughput figure; chain the calls (x = f(x, ...)) before treating the 1.11x as per-block latency.
+
+## Iteration 26 (planar TQ2_0 layout, L5): KEEP
+- Verify (quiet gate): +0.65 pp (46.69 -> 47.34), noise 0.13, min ratio 0.998; E2B QAT 1.034x, ctx4k 1.069x. Guard pass. Base = `33187e7`.
+- Design: upload repacks TQ2_0 into 8-block groups (512 quant bytes then 8 f16 scales; 528 B per group); the mmap zero-copy path is skipped for TQ2_0 (+0.08 GB RSS on E2B). The tile GEMV reads 16 B per lane and splits the simdgroup's lanes across rows. lm_head 154 -> ~202 GB/s; with decode and FMA removed the layout reads 287 GB/s, so the remaining limit is per-weight ALU work at 2 bits/weight (LUT or matrix-unit GEMV would be the next step).
+- Caveat: TQ2_0 rounding differs slightly from before (next-token top-5 identity checked on 5 prompts, not multi-token greedy identity).
+- Next: same layout idea for the Q4_0/Q8_0-class codecs is not needed (they run 250-290 GB/s); E2B remaining slack: other small GEMVs (100-150 GB/s) and the host gap.
