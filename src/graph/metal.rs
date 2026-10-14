@@ -267,9 +267,21 @@ impl WeightFormat {
         })
     }
 
-    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
+    /// Name of the lane-split hand kernel ([`GemvKernel::HandSplit`]), when this format has one.
+    fn hand_split_kernel(self) -> Option<&'static str> {
+        Some(match self {
+            WeightFormat::Q4_0 => "gemv_q4_0_split",
+            _ => return None,
+        })
+    }
+
+    /// The kernel for steps the tuner does not cover (megakernel MLPs, `GIBBS_TUNE=off`): the lane-split
+    /// hand kernel where it exists (faster than the per-block one at 7 of the 8 shapes measured), else the
+    /// hand one, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if self.hand_kernel().is_some() {
+        if self.hand_split_kernel().is_some() {
+            GemvVariant::HAND_SPLIT
+        } else if self.hand_kernel().is_some() {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)
@@ -284,6 +296,9 @@ impl WeightFormat {
         let mut v = Vec::new();
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
+        }
+        if self.hand_split_kernel().is_some() {
+            v.push(GemvVariant::HAND_SPLIT);
         }
         if generated {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
@@ -403,7 +418,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 58] = [
+const BASE_KERNELS: [&str; 59] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -426,6 +441,7 @@ const BASE_KERNELS: [&str; 58] = [
     "swiglu_f32",
     "geglu_f32",
     "gemv_q4_0",
+    "gemv_q4_0_split",
     "gemv_q8_0",
     "gemv_bf16",
     "gemv_f16",
@@ -1078,7 +1094,7 @@ impl Runtime {
         let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
         let mut mix =
             |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
-        if let Some(name) = fmt.hand_kernel() {
+        for name in [fmt.hand_kernel(), fmt.hand_split_kernel()].into_iter().flatten() {
             mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
@@ -2036,12 +2052,19 @@ impl Session {
                 Some(q) => generated(q, variant.rows_per_sg),
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
-            (_, GemvKernel::Hand) => match format.hand_kernel() {
-                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
-                None => Err(format!(
-                    "Metal executor: unsupported packed GEMV format {format:?}"
-                )),
-            },
+            (_, GemvKernel::Hand | GemvKernel::HandSplit) => {
+                let name = if variant.kernel == GemvKernel::HandSplit {
+                    format.hand_split_kernel()
+                } else {
+                    format.hand_kernel()
+                };
+                match name {
+                    Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                    None => Err(format!(
+                        "Metal executor: unsupported packed GEMV format {format:?}"
+                    )),
+                }
+            }
         }
     }
 
@@ -6003,7 +6026,8 @@ mod tests {
                 QuantFormat::GGUF_TQ2_0 => &[64],
                 _ => &[0],
             };
-            let (n, k) = (37usize, be * 3);
+            // Q4_0 gets more than the 16 blocks one pass of its lane-split kernel covers.
+            let (n, k) = (37usize, be * if f == QuantFormat::GGUF_Q4_0 { 37 } else { 3 });
             let mut raw: Vec<u8> = (0..n * (k / be) * bb)
                 .map(|_| (next() >> 4) as u8)
                 .collect();
@@ -6211,6 +6235,9 @@ mod tests {
                 (1536, 6144),
                 (2048, 1536),
                 (1536, 2048),
+                (256, 1536),
+                (12288, 1536),
+                (1536, 12288),
                 (262144, 1536),
             ] {
                 let t = rt().bench_gemv(f, &[shape], &fmt.gemv_variants()).unwrap();
