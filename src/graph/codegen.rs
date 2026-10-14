@@ -1,4 +1,5 @@
 use crate::graph::codec::{planar, tile, wide, Codec, Tile};
+use crate::graph::tune;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GemvParams {
@@ -87,80 +88,6 @@ kernel void gemv_{format_str}(
     )
 }
 
-/// Generates an MSL Multi-GEMV kernel where N weights share the same input activation vector.
-pub fn multi_gemv(codec: &Codec, n_weights: usize, prologue: &str, epilogue: &str) -> String {
-    let format_str = format!("{:?}", codec.format).to_lowercase();
-    let prologue_expr = if prologue.is_empty() {
-        "x[col]"
-    } else {
-        prologue
-    };
-    let epilogue_stmt = if epilogue.is_empty() {
-        "for (uint w = 0; w < N; w++) out[w * p.rows + row] = sum[w];"
-    } else {
-        epilogue
-    };
-
-    format!(
-        r#"
-// Generated Multi-GEMV (N={n_weights}) for {format_str}
-{codec_msl}
-
-struct MultiGemvParams_{format_str} {{
-    uint rows;
-    uint cols;
-    uint block_elems;
-    uint block_bytes;
-}};
-
-kernel void multi_gemv_{format_str}_{n_weights}(
-    device const uchar* weights [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* out [[buffer(2)]],
-    constant MultiGemvParams_{format_str}& p [[buffer(3)]],
-    uint tg [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {{
-    uint row = tg * 2 + (sg % 2);
-    if (row >= p.rows) return;
-
-    float sum[{n_weights}];
-    for (uint w = 0; w < {n_weights}; w++) sum[w] = 0.0f;
-
-    uint num_sub = p.cols / 8;
-    for (uint s = lane; s < num_sub; s += 32) {{
-        for (uint i = 0; i < 8; i++) {{
-            uint col = s * 8 + i;
-            float x_val = {prologue_expr};
-            for (uint w = 0; w < {n_weights}; w++) {{
-                float dec8[8];
-                uint blk_idx = (s * 8) / p.block_elems;
-                uint sub_in_blk = (s * 8) % p.block_elems / 8;
-                device const uchar* blk = weights + (ulong)(w * p.rows + row) * (p.cols / p.block_elems * p.block_bytes) + blk_idx * p.block_bytes;
-                decode8(blk, sub_in_blk, dec8);
-                sum[w] += dec8[i] * x_val;
-            }}
-        }}
-    }}
-
-    for (uint w = 0; w < {n_weights}; w++) {{
-        sum[w] = simd_sum(sum[w]);
-    }}
-
-    if (lane == 0) {{
-        {epilogue_stmt}
-    }}
-}}
-"#,
-        format_str = format_str,
-        codec_msl = codec.msl,
-        n_weights = n_weights,
-        prologue_expr = prologue_expr,
-        epilogue_stmt = epilogue_stmt,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,13 +99,6 @@ mod tests {
         assert!(code.contains("kernel void gemv_gguf_q4_0"));
         assert!(code.contains("decode8("));
         assert!(code.contains("out[row] = sum;"));
-    }
-
-    #[test]
-    fn test_multi_gemv_codegen() {
-        let code = multi_gemv(&CODEC_Q4_0, 2, "x[col]", "out[row] = sum[0] * sum[1];");
-        assert!(code.contains("kernel void multi_gemv_gguf_q4_0_2"));
-        assert!(code.contains("out[row] = sum[0] * sum[1];"));
     }
 }
 
@@ -407,6 +327,126 @@ kernel void {name}(
             }))
             .unwrap_or_default(),
     )
+}
+
+/// One member of a [`gemv_multi`] kernel: a hand kernel of `metal_kernels.metal` (by name) or the
+/// codec-generated GEMV.
+#[derive(Clone, Copy)]
+pub enum MultiPart<'a> {
+    Hand(&'a str),
+    Gen(&'a Codec, GemvParams),
+}
+
+/// The declarations a hand GEMV needs besides `PackedGemvParams`, or `None` for a hand kernel
+/// [`gemv_multi`] cannot inline (it needs more than its block struct and these helpers).
+fn hand_decls(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "gemv_q4_0" | "gemv_q4_0_split" => &["struct block_q4_0 {"],
+        "gemv_q8_0" => &["struct block_q8_0 {"],
+        "gemv_q4_k" => &[
+            "struct block_q4_k {",
+            "inline float2 k4_scale_min(uint j, thread const uint8_t* s) {",
+            "inline float2 k4_scale_min(uint j, device const uint8_t* s) {",
+        ],
+        _ => return None,
+    })
+}
+
+/// Whether [`gemv_multi`] can fold the hand kernel `name` into a merged kernel.
+pub fn hand_inlinable(name: &str) -> bool {
+    hand_decls(name).is_some()
+}
+
+/// `kernel` (one `kernel void name(w, x, y, p, bias, res, tg, sg, lane)` function) as `static inline void
+/// new_name(...)` with its attributes dropped, and the type of its weight pointer.
+fn as_inline(kernel: &str, name: &str, new_name: &str) -> Option<(String, String)> {
+    let brace = kernel.find('{')?;
+    let mut sig = kernel[..brace].replace(&format!("kernel void {name}("), "(");
+    while let Some(a) = sig.find("[[") {
+        let end = a + sig[a..].find("]]")? + 2;
+        sig.replace_range(a..end, "");
+    }
+    let params: Vec<&str> = sig
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .split(',')
+        .collect();
+    let names: Vec<&str> = params
+        .iter()
+        .map(|q| q.trim().rsplit([' ', '*', '&']).next().unwrap_or(""))
+        .collect();
+    if names != ["w", "x", "y", "p", "bias", "res", "tg", "sg", "lane"] {
+        return None;
+    }
+    let w_ty = params[0].trim().strip_suffix('w')?.trim().to_string();
+    let body = format!(
+        "static inline void {new_name}({}) {}",
+        params.join(","),
+        &kernel[brace..]
+    );
+    Some((body, w_ty))
+}
+
+/// One kernel running `parts` (<= 3 independent `m = 1` GEMVs over the same `x`, no bias, residual or
+/// epilogue) as a single dispatch of `sum(ceil(rows_i / rows_per_tg_i))` threadgroups: threadgroup `t`
+/// belongs to part `i` when `starts[i] <= t < starts[i + 1]` and runs that part's own kernel body, so the
+/// result is bit-identical to the separate dispatches. Buffers: `w_0..w_{n-1}`, `x`, `y_0..y_{n-1}`,
+/// `PackedGemvParams[n]` (slot `2n + 1`), `uint starts[n]` (slot `2n + 2`). Returns `(kernel name, MSL)`,
+/// or `None` when a part is not inlinable ([`hand_inlinable`]).
+pub fn gemv_multi(parts: &[MultiPart], kernels_msl: &str) -> Option<(String, String)> {
+    let n = parts.len();
+    let mut preamble: Vec<String> = Vec::new();
+    let mut fns = String::new();
+    let mut calls = String::new();
+    let mut name = String::from("gemvmulti");
+    for (i, part) in parts.iter().enumerate() {
+        let (kname, support, kernel) = match *part {
+            MultiPart::Hand(k) => {
+                let decls: String = hand_decls(k)?
+                    .iter()
+                    .map(|d| {
+                        let semi = if d.starts_with("struct") { ";" } else { "" };
+                        format!("{}{semi}\n", tune::decl_source(kernels_msl, d))
+                    })
+                    .collect();
+                (k.to_string(), decls, tune::kernel_source(kernels_msl, k).to_string())
+            }
+            MultiPart::Gen(c, p) => {
+                let k = gemv_packed_name(c, p);
+                let text = gemv_packed(c, p);
+                let at = text.find(&format!("kernel void {k}("))?;
+                (k, text[..at].to_string(), text[at..].to_string())
+            }
+        };
+        let (body, w_ty) = as_inline(&kernel, &kname, &format!("gemvpart{i}"))?;
+        if !preamble.contains(&support) {
+            preamble.push(support);
+        }
+        fns += &format!("{body}\n");
+        let cond = if i + 1 < n {
+            format!("t < starts[{}]", i + 1)
+        } else {
+            "true".into()
+        };
+        calls += &format!(
+            "    if ({cond}) {{ gemvpart{i}(({w_ty})w{i}, x, y{i}, ps[{i}], y{i}, y{i}, uint2(t - starts[{i}], 0), sg, lane); return; }}\n"
+        );
+        name += &format!("_{kname}");
+    }
+    let bufs: String = (0..n)
+        .map(|i| format!("    device const uchar* w{i} [[buffer({i})]],\n"))
+        .chain([format!("    device const float* x [[buffer({n})]],\n")])
+        .chain((0..n).map(|i| format!("    device float* y{i} [[buffer({})]],\n", n + 1 + i)))
+        .collect();
+    let src = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n{common}{pre}{fns}\nkernel void {name}(\n{bufs}    constant PackedGemvParams* ps [[buffer({pb})]],\n    constant uint* starts [[buffer({sb})]],\n    uint2 tg [[threadgroup_position_in_grid]],\n    uint sg [[simdgroup_index_in_threadgroup]],\n    uint lane [[thread_index_in_simdgroup]]\n) {{\n    const uint t = tg.x;\n{calls}}}\n",
+        common = gemv_common(kernels_msl),
+        pre = preamble.concat(),
+        pb = 2 * n + 1,
+        sb = 2 * n + 2,
+    );
+    Some((name, src))
 }
 
 /// The lane loop of [`gemv_packed`]: one 8-element sub-block per iteration (`decode8`), or, for a codec

@@ -161,7 +161,13 @@ pub fn enabled() -> bool {
 /// Source text of the kernel function `name` in `msl` (from `kernel void name(` to its closing
 /// brace), for hashing exactly what a hand variant runs.
 pub fn kernel_source<'a>(msl: &'a str, name: &str) -> &'a str {
-    let Some(start) = msl.find(&format!("kernel void {name}(")) else {
+    decl_source(msl, &format!("kernel void {name}("))
+}
+
+/// The braced declaration of `msl` that begins with `marker`, through its closing brace; empty when
+/// `marker` is absent.
+pub fn decl_source<'a>(msl: &'a str, marker: &str) -> &'a str {
+    let Some(start) = msl.find(marker) else {
         return "";
     };
     let body = &msl[start..];
