@@ -59,5 +59,9 @@ e2b = next((m["cand_tok_s"] for m in models if "gemma-4-E2B-it-qat" in m["model"
 v = {"base_pct": base, "cand_pct": cand, "delta_pp": cand - base, "noise_pp": abs(g["base1"] - g["base2"]),
      "e2b_tok_s": e2b, "min_ratio": min(m["ratio"] for m in models),
      "ratios_ok": all(m["ratio_ok"] for m in models), "models": models}
+# Contention tripwire: a machine this slow invalidates the run; exit 4, write nothing.
+if base < 35 or (e2b is not None and e2b < 100):
+    print(f"contention-aborted: base_pct {base:.1f}, e2b_tok_s {e2b}", file=sys.stderr)
+    sys.exit(4)
 json.dump(v, open(os.path.join(d, "verify.json"), "w"), indent=1)
 print(f"{v['delta_pp']:.2f}")

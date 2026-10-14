@@ -47,6 +47,30 @@ impl GemvVariant {
     }
 }
 
+/// Winners measured while another process kept the GPU busier than this are used in-process but
+/// never persisted: contended timings would poison later runs' variant choices.
+pub const BUSY_PCT: u32 = 20;
+
+/// The `Device Utilization %` field of an `ioreg -r -d 1 -c IOAccelerator` dump.
+pub fn parse_utilization(ioreg: &str) -> Option<u32> {
+    let rest =
+        &ioreg[ioreg.find("\"Device Utilization %\"=")? + "\"Device Utilization %\"=".len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Current GPU utilization (percent) from the IOAccelerator registry; `None` when unreadable.
+/// Sample it before this process loads the GPU, so only foreign load is seen.
+pub fn gpu_utilization() -> Option<u32> {
+    let out = std::process::Command::new("ioreg")
+        .args(["-r", "-d", "1", "-c", "IOAccelerator"])
+        .output()
+        .ok()?;
+    parse_utilization(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// Timings within this fraction of the best are ties (measurement noise): the simpler variant wins.
 const TIE: f64 = 0.01;
 
@@ -74,9 +98,15 @@ pub struct Tuned {
     pub gbps: f64,
 }
 
-/// Persisted winners: `"<format>|<rows>|<cols>|<kernel hash>"` -> result.
+/// Persisted winners: `"<format>|<rows>|<cols>|<kernel hash>"` -> result. Winners timed under foreign
+/// GPU load (`insert_contended`) answer `get` for this process only and are never written by `save`.
 #[derive(Default, Serialize, Deserialize)]
-pub struct TuneCache(BTreeMap<String, Tuned>);
+#[serde(transparent)]
+pub struct TuneCache {
+    entries: BTreeMap<String, Tuned>,
+    #[serde(skip)]
+    contended: BTreeMap<String, Tuned>,
+}
 
 impl TuneCache {
     pub fn load(path: &Path) -> Self {
@@ -86,6 +116,7 @@ impl TuneCache {
             .unwrap_or_default()
     }
 
+    /// Writes the persisted winners.
     pub fn save(&self, path: &Path) {
         let write = || -> std::io::Result<()> {
             if let Some(d) = path.parent() {
@@ -106,11 +137,20 @@ impl TuneCache {
     }
 
     pub fn get(&self, key: &str) -> Option<Tuned> {
-        self.0.get(key).copied()
+        self.entries
+            .get(key)
+            .or_else(|| self.contended.get(key))
+            .copied()
     }
 
     pub fn insert(&mut self, key: String, t: Tuned) {
-        self.0.insert(key, t);
+        self.contended.remove(&key);
+        self.entries.insert(key, t);
+    }
+
+    /// A winner measured while the GPU was busy: kept for this process, not persisted.
+    pub fn insert_contended(&mut self, key: String, t: Tuned) {
+        self.contended.insert(key, t);
     }
 }
 
@@ -207,5 +247,39 @@ mod tests {
             .get(&TuneCache::key("GGUF_Q4_0", 4096, 4096, 8))
             .is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn contended_winners_serve_this_process_but_never_reach_disk() {
+        let dir = std::env::temp_dir().join(format!("gibbs-tune-busy-{}", std::process::id()));
+        let path = dir.join("tune.json");
+        let t = |g| Tuned {
+            variant: GemvVariant::generated(2),
+            us: 1.0,
+            gbps: g,
+        };
+        let mut c = TuneCache::default();
+        c.insert_contended("busy".into(), t(100.0));
+        c.insert("quiet".into(), t(200.0));
+        assert_eq!(c.get("busy").map(|x| x.gbps), Some(100.0));
+        c.save(&path);
+        let back = TuneCache::load(&path);
+        assert!(back.get("busy").is_none());
+        assert_eq!(back.get("quiet").map(|x| x.gbps), Some(200.0));
+        // A later quiet measurement replaces the contended one.
+        c.insert("busy".into(), t(250.0));
+        c.save(&path);
+        assert_eq!(
+            TuneCache::load(&path).get("busy").map(|x| x.gbps),
+            Some(250.0)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn utilization_is_parsed_from_the_ioreg_dump() {
+        let dump = r#""PerformanceStatistics" = {"Alloc system memory"=1,"Device Utilization %"=37,"Renderer Utilization %"=4}"#;
+        assert_eq!(parse_utilization(dump), Some(37));
+        assert_eq!(parse_utilization("nothing here"), None);
     }
 }
