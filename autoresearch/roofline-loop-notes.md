@@ -286,3 +286,6 @@ The 0.69x host-wall ratio above compares a Rust host wall with jax-metal's Pytho
 - Pattern, now seven items: removing 30-70 dispatches per E2B token (F2 -47, F4 -56, F5 -15, F6 -15) never moves the wall time; the per-dispatch floor is not the limiter. F3's merged kernel is slower than three dispatches. The MLP-variant regression is probably tuner picks made under load (not proven).
 - src restored to base `33187e7` (`git checkout 33187e7 -- src`). Branches kept: experiment/f2-norm-prologue (includes the Q4_0 lane-split), experiment/f3-sibling-gemv, experiment/f4-elementwise, experiment/megamlp-variants, experiment/bundle-f2-f4-f3-mlp. Stop rule B's F-item rows: F1-F8 now all have rows (F7/F8 only via bundle row 20).
 - matrix runner restarted at 2026-10-14T21:58:23Z after iteration 31 (paused since iteration 20)
+
+## F7 / F8 rows (32-33)
+Both have rows now (stop rule B's F-item condition: F1-F8 each has a kept/discarded row), but with the honest caveat that neither was verified in isolation: F7 changes no decisions at recompute_us = 0, and F8 had nothing to choose between (E2B search differences <= 3%). The bundle's parts were attributed individually where they could be: chunked CBs kept (row 21), F6 merge and append discarded (22, 23), GLU epilogue discarded (24), E4 stack discarded (25).
