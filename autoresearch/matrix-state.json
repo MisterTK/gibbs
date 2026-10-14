@@ -96,5 +96,26 @@
   "roofline_pct": null,
   "attempts": 1,
   "error": "exit -15"
+ },
+ "unsloth/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct-Q6_K.gguf": {
+  "last_commit": "33187e7",
+  "last_status": "ok",
+  "roofline_pct": 23.602847694952416,
+  "attempts": 1,
+  "error": ""
+ },
+ "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-UD-Q3_K_XL.gguf": {
+  "last_commit": "33187e7",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-UD-Q3_K_XL.gguf: tensor 'blk.4.attn_k_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
+ },
+ "unsloth/LFM2.5-230M-GGUF/LFM2.5-230M-IQ4_XS.gguf": {
+  "last_commit": "33187e7",
+  "last_status": "error",
+  "roofline_pct": null,
+  "attempts": 1,
+  "error": "Failed to load /Users/keas/code/rust-inference-server/disk/matrix-cache/models--unsloth--LFM2.5-230M-GGUF/snapshots/main/LFM2.5-230M-IQ4_XS.gguf: tensor 'blk.2.attn_k_norm.weight': per-head q/k RMSNorm is not implemented by this decoder"
  }
 }
