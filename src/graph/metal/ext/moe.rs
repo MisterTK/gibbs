@@ -10,7 +10,9 @@
 use super::super::{numel, set_bytes, u32_of, Planned, Session, TG};
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
-use crate::graph::codegen::{gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams};
+use crate::graph::codegen::{
+    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams,
+};
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
 use metal::{CompileOptions, ComputePipelineState, MTLSize};
@@ -324,7 +326,9 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
 
 /// Generated gather for one codec: one thread per 8-element sub-block of one token's row.
 fn quant_embed_src(c: &Codec) -> String {
-    let (be, bb) = (c.block_elems, c.block_bytes);
+    let be = c.block_elems;
+    let br = block_ref(c, "table", &format!("(ulong)ids[gid.y] * (d / {be}u) + blk"));
+    let (decl, sub) = (&br.decl, &br.sub);
     format!(
         r#"#include <metal_stdlib>
 using namespace metal;
@@ -338,13 +342,13 @@ kernel void embed_quant(device const uchar* table [[buffer(0)]],
     if (gid.x * 8 >= d || gid.y >= n) return;
     uint blk = (gid.x * 8) / {be}u;
     uint sub = ((gid.x * 8) % {be}u) / 8;
-    device const uchar* b = table + ((ulong)ids[gid.y] * (d / {be}u) + blk) * {bb}ul;
+    {decl}
     float v[8];
-    decode8(b, sub, v);
+    decode8(b, {sub}sub, v);
     for (uint i = 0; i < 8; ++i) out[(ulong)gid.y * d + gid.x * 8 + i] = v[i];
 }}
 "#,
-        msl = c.msl
+        msl = device_msl(c)
     )
 }
 

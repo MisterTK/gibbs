@@ -57,7 +57,6 @@ pub struct Wide {
 
 pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
     match format {
-        QuantFormat::GGUF_TQ2_0 => Some(&WIDE_TQ2_0),
         QuantFormat::GGUF_Q6_K => Some(&WIDE_Q6_K),
         QuantFormat::GGUF_Q4_K_M => Some(&WIDE_Q4_K),
         QuantFormat::GGUF_Q5_K_M => Some(&WIDE_Q5_K),
@@ -68,27 +67,124 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
     }
 }
 
-static WIDE_TQ2_0: Wide = Wide {
-    uniform: true,
-    groups: 8,
-    segs: 4,
-    // Byte j of a 32-byte plane holds elements j, j+32, j+64, j+96 of its 128-element half, so group g
-    // (8 bytes of half g/4) is segment k at element (g/4)*128 + k*32 + (g%4)*8; value = (code - 1) * d.
-    msl: r#"
-inline uint group_seg(uint g, uint k) { return (g >> 2) * 128 + k * 32 + (g & 3) * 8; }
-inline void decode_group(device const uchar* blk, uint g, thread float* out) {
-    float d = cd_f16(blk + 64);
-    device const ushort* q = (device const ushort*)(blk + (g >> 2) * 32 + (g & 3) * 8);
-    uint a = uint(q[0]) | (uint(q[1]) << 16);
-    uint b = uint(q[2]) | (uint(q[3]) << 16);
-    for (uint k = 0; k < 4; k++) {
-        float4 lo = float4(as_type<uchar4>((a >> (2 * k)) & 0x03030303u));
-        float4 hi = float4(as_type<uchar4>((b >> (2 * k)) & 0x03030303u));
-        out[8 * k + 0] = lo.x; out[8 * k + 1] = lo.y; out[8 * k + 2] = lo.z; out[8 * k + 3] = lo.w;
-        out[8 * k + 4] = hi.x; out[8 * k + 5] = hi.y; out[8 * k + 6] = hi.z; out[8 * k + 7] = hi.w;
-        out[32 + k] = d;
-        out[36 + k] = -d;
+/// A planar-layout codec decoded one lane-tile at a time (`groups` tiles per block, each loaded whole and
+/// decoded per segment of 8 elements, so only a few registers are live at once) where every element is
+/// `scale * (code - 1)` with one scale per tile. `tile_seg` writes a value `u` per element (not necessarily
+/// the code: whatever the cheapest bit trick to make a float gives) with `code - 1 == a * u - b`, so the GEMV
+/// applies `scale * (a * sum(u * x) - b * sum(x))`, the same algebra as a `uniform` [`Wide`] (and the same
+/// non-bit-exact rounding vs `decode8`).
+pub struct Tile {
+    pub groups: u32,
+    pub segs: u32,
+    pub a: f32,
+    pub b: f32,
+    /// MSL defining `uint group_seg(uint g, uint k)` (block offset of segment `k` of tile `g`),
+    /// `uint4 tile_load(device const uchar* grp, uint g)` (the tile's bytes), `float tile_scale(grp, g)` and
+    /// `void tile_seg(uint4 q, uint k, thread float* out8)` (`u` of segment `k`; `k` is a compile-time
+    /// constant at every call). `grp` is the block's [`Planar`] group and `g` continues across the group's
+    /// blocks (`(i % blocks) * groups + tile`); `group_seg` takes the tile within the block.
+    pub msl: &'static str,
+}
+
+pub fn tile(format: QuantFormat) -> Option<&'static Tile> {
+    match format {
+        QuantFormat::GGUF_TQ2_0 => Some(&TILE_TQ2_0),
+        _ => None,
     }
+}
+
+/// TQ2_0: byte `j` of a 32-byte plane holds elements `j, j+32, j+64, j+96` of its 128-element half
+/// (value = `(code - 1) * d`), so tile `g` of a block (16 bytes at `(g>>1)*32 + (g&1)*16`) is, for shift
+/// level `k` of 4, two segments of 8 elements at `(g>>1)*128 + k*32 + (g&1)*16`; segment `s` is level `s>>1`,
+/// chunk `s&1`. Under [`PLANAR_TQ2_0`] the tile is one aligned 16-byte load and the scale is in the group's
+/// scale plane. `u` is the float `1 + code/4` (the 2-bit code moved into the top two mantissa bits of 1.0f:
+/// one shift, one mask, one or per element instead of a byte-to-float conversion), so `code - 1 == 4u - 5`.
+static TILE_TQ2_0: Tile = Tile {
+    groups: 4,
+    segs: 8,
+    a: 4.0,
+    b: 5.0,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return (g >> 1) * 128 + (k >> 1) * 32 + (g & 1) * 16 + (k & 1) * 8; }
+inline uint4 tile_load(device const uchar* grp, uint g) {
+    return *(device const uint4*)(grp + (g >> 2) * 64 + (g & 3) * 16);
+}
+inline float tile_scale(device const uchar* grp, uint g) {
+    return float(*(device const half*)(grp + 512 + (g >> 2) * 2));
+}
+inline void tile_seg(uint4 q, uint k, thread float* out) {
+    const int lv = int(k >> 1) * 2;
+    for (uint w = 0; w < 2; w++) {
+        const uint x = q[(k & 1) * 2 + w];
+        for (int j = 0; j < 4; j++) {
+            // The field of byte j at level lv is bits 8j+lv..+1; mantissa bits 22..21 are where it goes.
+            const int sh = 21 - 8 * j - lv;
+            const uint y = sh >= 0 ? (x << sh) : (x >> -sh);
+            out[4 * w + j] = as_type<float>(0x3F800000u | (y & 0x00600000u));
+        }
+    }
+}
+"#,
+};
+
+/// Device layout of a codec whose block is `[data bytes][tail bytes]` (quants, then scales): the GPU weight
+/// buffer stores `blocks` consecutive blocks as one group, all their data bytes first and all their tails
+/// after (`blocks * block_bytes` bytes per group), so the quants of block `i` start at
+/// `(i / blocks) * group_bytes + (i % blocks) * data`, which is 16-byte aligned when `data` is, instead of
+/// at `i * block_bytes`. The last group is zero-padded. Blocks are numbered across rows (and expert
+/// banks), so a row never has to be a whole number of groups. [`Planar::msl`] replaces [`Codec::msl`]
+/// for every GPU consumer of the buffer: its `decode8(grp, sub, out8)` takes the group base and a `sub`
+/// that continues across the group's blocks (`(i % blocks) * block_elems / 8 + sub_in_block`);
+/// [`Tile`]'s functions likewise take `(i % blocks) * groups + g`. [`Codec::msl`] stays the as-stored
+/// (GGUF) layout that `tests/codec_parity.rs` proves against the CPU dequantizer.
+pub struct Planar {
+    pub blocks: u32,
+    pub data: u32,
+    pub msl: &'static str,
+}
+
+pub fn planar(format: QuantFormat) -> Option<&'static Planar> {
+    match format {
+        QuantFormat::GGUF_TQ2_0 => Some(&PLANAR_TQ2_0),
+        _ => None,
+    }
+}
+
+impl Planar {
+    /// `raw` (whole as-stored blocks of `block_bytes`) in the device layout.
+    pub fn repack(&self, raw: &[u8], block_bytes: usize) -> Vec<u8> {
+        let (g, data) = (self.blocks as usize, self.data as usize);
+        let tail = block_bytes - data;
+        let group = g * block_bytes;
+        let mut out = vec![0u8; (raw.len() / block_bytes).div_ceil(g) * group];
+        for (dst, src) in out.chunks_exact_mut(group).zip(raw.chunks(group)) {
+            for (j, b) in src.chunks_exact(block_bytes).enumerate() {
+                dst[j * data..][..data].copy_from_slice(&b[..data]);
+                dst[g * data + j * tail..][..tail].copy_from_slice(&b[data..]);
+            }
+        }
+        out
+    }
+}
+
+/// TQ2_0 blocks are 64 data bytes and an f16 scale: 8 blocks are 512 data bytes then 8 scales.
+static PLANAR_TQ2_0: Planar = Planar {
+    blocks: 8,
+    data: 64,
+    msl: r#"
+inline void decode8(device const uchar* grp, uint sub, thread float* out8) {
+    const uint n = sub >> 5;
+    float d = float(*(device const half*)(grp + 512 + n * 2));
+    uint e0 = (sub & 31) * 8;
+    // Eight consecutive elements are eight consecutive bytes that share one shift: one aligned 8-byte load.
+    uint2 q = *(device const uint2*)(grp + n * 64 + (e0 >> 7) * 32 + (e0 & 31));
+    uint sh = ((e0 >> 5) & 3) * 2;
+    uint a = (q.x >> sh) & 0x03030303u;
+    uint b = (q.y >> sh) & 0x03030303u;
+    float4 lo = (float4(as_type<uchar4>(a)) - 1.0f) * d;
+    float4 hi = (float4(as_type<uchar4>(b)) - 1.0f) * d;
+    out8[0] = lo.x; out8[1] = lo.y; out8[2] = lo.z; out8[3] = lo.w;
+    out8[4] = hi.x; out8[5] = hi.y; out8[6] = hi.z; out8[7] = hi.w;
 }
 "#,
 };

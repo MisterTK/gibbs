@@ -1527,7 +1527,8 @@ impl Session {
                         QuantFormat::BF16 => Some(WeightFormat::BF16),
                         QuantFormat::FP16 => Some(WeightFormat::F16),
                         f if crate::graph::codec::codec(f).is_some()
-                            && f != QuantFormat::GGUF_Q2_K =>
+                            && f != QuantFormat::GGUF_Q2_K
+                            && codec::planar(f).is_none() =>
                         {
                             Some(WeightFormat::Gen(f))
                         }
@@ -1916,6 +1917,20 @@ impl Session {
                         (None, ptr, len, len * 2, WeightFormat::BF16)
                     }
                 }
+            };
+            // Planar codecs are stored in the device layout, never as the checkpoint's bytes (no zero-copy map).
+            let planar_bytes;
+            let (ptr, byte_len) = match fmt {
+                WeightFormat::Gen(f) if byte_len > 0 => match (codec::planar(f), codec::codec(f)) {
+                    (Some(pl), Some(c)) => {
+                        // SAFETY: `ptr` addresses `byte_len` readable bytes of the source tensor.
+                        let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, byte_len) };
+                        planar_bytes = pl.repack(raw, c.block_bytes as usize);
+                        (planar_bytes.as_ptr() as *const c_void, planar_bytes.len())
+                    }
+                    _ => (ptr, byte_len),
+                },
+                _ => (ptr, byte_len),
             };
             let buf = if byte_len == 0 {
                 new_shared_buffer(&rt.device, 4)?
@@ -6053,6 +6068,69 @@ mod tests {
                     err < 1e-4,
                     "{f:?} m={m} {v:?}: packed linear differs from CPU by {err}"
                 );
+            }
+        }
+    }
+
+    /// TQ2_0 lives in the planar device layout (groups of 8 blocks): GEMV (m = 1, every variant), the
+    /// dequantizing batched path (m = 20) equal the CPU executor at shapes where rows are not whole groups
+    /// (5, 9 blocks per row), n is not a multiple of the rows per threadgroup and the total block count is
+    /// not a multiple of 8.
+    #[test]
+    fn tq2_0_planar_layout_matches_cpu() {
+        use crate::model::layers::QuantizedWeight;
+        let f = QuantFormat::GGUF_TQ2_0;
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        for (n, k) in [(37usize, 1280usize), (101, 2304), (19, 2048), (5, 768)] {
+            let mut raw: Vec<u8> = (0..n * (k / 256) * 66).map(|_| (next() >> 4) as u8).collect();
+            for blk in raw.chunks_exact_mut(66) {
+                // Finite f16 scale in 2^-6..2^4.
+                let exp = 9 + (next() % 14) as u16;
+                let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                blk[64..].copy_from_slice(&d.to_le_bytes());
+            }
+            let mut w = Weights::new();
+            w.insert(
+                "w",
+                Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                    format: f,
+                    raw_data: raw.into(),
+                    in_features: k,
+                    out_features: n,
+                })),
+            );
+            for m in [1usize, 20] {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, k], DType::F32);
+                let w_val = g.weight("w", vec![n, k], DType::Quant(f));
+                let y = g.add("lin", Op::Linear, &[x, w_val], vec![m, n], DType::F32);
+                g.output(y);
+                let xs: Vec<f32> = (0..m * k)
+                    .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                    .collect();
+                let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())])
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                for v in WeightFormat::of_quant(f).gemv_variants() {
+                    let mut s = Session::new(rt(), &w).unwrap();
+                    s.set_variant_override(Some(v));
+                    let got = s
+                        .run(&g, vec![Tensor::F32(xs.clone())])
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap();
+                    let err = rel_err(&want, &got);
+                    assert!(err < 1e-4, "TQ2_0 {n}x{k} m={m} {v:?}: differs from CPU by {err}");
+                }
             }
         }
     }
