@@ -31,6 +31,8 @@ pub enum Step {
         b: f32,
     },
     /// `out = a ∘ b` over `dims` (outermost first); `sa`/`sb` are element strides, 0 when broadcast.
+    /// `pre` maps one operand through a unary kind first (`Pre::NONE`: none): a single-reader unary
+    /// producer fused into its consumer.
     Binary {
         a: ValueId,
         b: ValueId,
@@ -40,7 +42,41 @@ pub enum Step {
         dims: [u32; MAX_RANK],
         sa: [u32; MAX_RANK],
         sb: [u32; MAX_RANK],
+        pre: Pre,
     },
+}
+
+/// A unary map applied to a [`Step::Binary`] operand while it is read: `side` 0 = none, 1 = `a`, 2 = `b`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pre {
+    pub side: u32,
+    pub kind: u32,
+    pub a: f32,
+    pub b: f32,
+}
+
+impl Pre {
+    pub const NONE: Pre = Pre { side: 0, kind: 0, a: 0.0, b: 0.0 };
+}
+
+/// The `(x, kind, a, b)` of an unary step, `None` for any other.
+pub(in crate::graph::metal) fn as_unary(st: &Step) -> Option<(ValueId, u32, f32, f32)> {
+    match *st {
+        Step::Unary { x, kind, a, b, .. } => Some((x, kind, a, b)),
+        Step::Binary { .. } => None,
+    }
+}
+
+/// Folds the unary step `(kind, a, b)` that produced operand `side` (1 = `a`, 2 = `b`) of binary
+/// step `bin` into it, reading the unary's input `x` instead. `None` unless `bin` is a plain binary.
+pub(in crate::graph::metal) fn with_pre(bin: &Step, side: u32, x: ValueId, kind: u32, a: f32, b: f32) -> Option<Step> {
+    match *bin {
+        Step::Binary { a: ba, b: bb, n, kind: k, rank, dims, sa, sb, pre } if pre == Pre::NONE => {
+            let (ba, bb) = if side == 1 { (x, bb) } else { (ba, x) };
+            Some(Step::Binary { a: ba, b: bb, n, kind: k, rank, dims, sa, sb, pre: Pre { side, kind, a, b } })
+        }
+        _ => None,
+    }
 }
 
 /// `(kind code, a, b)` for ops that are an element-wise unary map. The match is exhaustive over
@@ -271,6 +307,7 @@ fn plan_binary(g: &Graph, node: &Node, kind: u32) -> Result<PlanOut<Step>, Strin
             dims: pack(&dims)?,
             sa: pack(&sa)?,
             sb: pack(&sb)?,
+            pre: Pre::NONE,
         },
         out_n,
     ))
@@ -314,6 +351,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             dims,
             sa,
             sb,
+            pre,
         } => {
             if n == 0 {
                 return Ok(());
@@ -323,7 +361,10 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 n: u32,
                 kind: u32,
                 rank: u32,
-                pad: u32,
+                pre_side: u32,
+                pre_kind: u32,
+                pre_a: f32,
+                pre_b: f32,
                 dims: [u32; MAX_RANK],
                 sa: [u32; MAX_RANK],
                 sb: [u32; MAX_RANK],
@@ -336,7 +377,10 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 n: u32_of(n)?,
                 kind,
                 rank: rank as u32,
-                pad: 0,
+                pre_side: pre.side,
+                pre_kind: pre.kind,
+                pre_a: pre.a,
+                pre_b: pre.b,
                 dims,
                 sa,
                 sb,
@@ -780,5 +824,63 @@ mod tests {
         }
         assert!(!supports(&Op::Softmax { axis: -1 }, DType::F32));
         assert!(!supports(&Op::SwiGlu, DType::F32));
+    }
+
+    /// A unary whose only reader is a binary becomes that binary's `pre` map (either operand side,
+    /// equal-shape and broadcast operands, widths off the threadgroup size); a second reader keeps it a
+    /// separate step. Every case matches the CPU executor.
+    #[test]
+    fn unary_feeding_binary_fuses_and_matches_cpu() {
+        use super::super::super::{fuse_chains, plan, Step as CoreStep};
+        let f = DType::F32;
+        let shapes: [(&[usize], &[usize]); 3] =
+            [(&[7, 33], &[7, 33]), (&[5, 300], &[300]), (&[257], &[1])];
+        let fused_steps = |g: &Graph| {
+            let (steps, aliases) = plan(g).unwrap();
+            let steps = fuse_chains(g, steps, &aliases);
+            let pre = steps
+                .iter()
+                .filter(|s| {
+                    matches!(&s.op, CoreStep::Ext(super::super::ExtStep::Elementwise(Step::Binary { pre, .. })) if pre.side != 0)
+                })
+                .count();
+            (steps.len(), pre)
+        };
+        for (op, scale, positive) in all_unary() {
+            for (si, (ash, bsh)) in shapes.into_iter().enumerate() {
+                for (bin, unary_side, shared) in [
+                    (Op::Mul, 1, false),
+                    (Op::Binary { kind: BinaryKind::Sub }, 1, false),
+                    (Op::Binary { kind: BinaryKind::Sub }, 2, false),
+                    (Op::Add, 1, true),
+                ] {
+                    let ushape: Vec<usize> = if unary_side == 1 { ash } else { bsh }.to_vec();
+                    let other_shape: Vec<usize> = if unary_side == 1 { bsh } else { ash }.to_vec();
+                    let mut g = Graph::new();
+                    let x = g.input("x", ushape.clone(), f);
+                    let o = g.input("o", other_shape.clone(), f);
+                    let u = g.add("u", op.clone(), &[x], ushape.clone(), f);
+                    let ins = if unary_side == 1 { [u, o] } else { [o, u] };
+                    let z = g.add("z", bin, &ins, ash.to_vec(), f);
+                    // `shared`: u is also read by the final Add, so it must stay materialised.
+                    let shared = shared && ushape == ash;
+                    let out = if shared {
+                        g.add("t", Op::Add, &[z, u], ash.to_vec(), f)
+                    } else {
+                        z
+                    };
+                    g.output(out);
+                    let case = format!("{op:?} shape {si} side {unary_side} shared {shared}");
+                    assert_eq!(fused_steps(&g), if shared { (3, 0) } else { (1, 1) }, "{case}");
+                    let xs: Vec<f32> = rand(prod(&ushape), 11 + si as u64)
+                        .into_iter()
+                        .map(|v| if positive { (v + 1.05) * scale } else { v * scale })
+                        .collect();
+                    let inputs = vec![Tensor::F32(xs), Tensor::F32(rand(prod(&other_shape), 99))];
+                    let (want, got) = both(&g, &Weights::new(), inputs);
+                    close(&want, &got, 1e-5, &case);
+                }
+            }
+        }
     }
 }
