@@ -358,8 +358,18 @@ pub fn hand_inlinable(name: &str) -> bool {
 }
 
 /// `kernel` (one `kernel void name(w, x, y, p, bias, res, tg, sg, lane)` function) as `static inline void
-/// new_name(...)` with its attributes dropped, and the type of its weight pointer.
+/// new_name(...)` with its attributes dropped, and the type of its weight pointer. A `template <bool NORM>`
+/// kernel (`name` = its `_t` function) is taken with `NORM` false: the prologue lines and the threadgroup
+/// scratch (not allowed outside a kernel) are dropped and `norm_eps` becomes a by-value argument; its
+/// `gamma`/`norm_eps` params stay, so the caller passes two extra (unused) arguments (`names` has them).
 fn as_inline(kernel: &str, name: &str, new_name: &str) -> Option<(String, String)> {
+    let kernel = &kernel
+        .lines()
+        .filter(|l| !l.contains("threadgroup float nscr[8];") && !l.contains("if (NORM) nsc = "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("if (NORM)", "if (false)")
+        .replace("constant float& norm_eps", "float norm_eps");
     let brace = kernel.find('{')?;
     let mut sig = kernel[..brace].replace(&format!("kernel void {name}("), "(");
     while let Some(a) = sig.find("[[") {
@@ -376,7 +386,9 @@ fn as_inline(kernel: &str, name: &str, new_name: &str) -> Option<(String, String
         .iter()
         .map(|q| q.trim().rsplit([' ', '*', '&']).next().unwrap_or(""))
         .collect();
-    if names != ["w", "x", "y", "p", "bias", "res", "tg", "sg", "lane"] {
+    if names != ["w", "x", "y", "p", "bias", "res", "tg", "sg", "lane"]
+        && names != ["w", "x", "y", "p", "bias", "res", "gamma", "norm_eps", "tg", "sg", "lane"]
+    {
         return None;
     }
     let w_ty = params[0].trim().strip_suffix('w')?.trim().to_string();
@@ -410,7 +422,13 @@ pub fn gemv_multi(parts: &[MultiPart], kernels_msl: &str) -> Option<(String, Str
                         format!("{}{semi}\n", tune::decl_source(kernels_msl, d))
                     })
                     .collect();
-                (k.to_string(), decls, tune::kernel_source(kernels_msl, k).to_string())
+                let mut src = tune::kernel_source(kernels_msl, k);
+                let mut kn = k.to_string();
+                if src.is_empty() {
+                    kn = format!("{k}_t"); // `template <bool NORM>` hand kernel, host-named `k`
+                    src = tune::kernel_source(kernels_msl, &kn);
+                }
+                (kn, decls, src.to_string())
             }
             MultiPart::Gen(c, p) => {
                 let k = gemv_packed_name(c, p);
@@ -420,6 +438,7 @@ pub fn gemv_multi(parts: &[MultiPart], kernels_msl: &str) -> Option<(String, Str
             }
         };
         let (body, w_ty) = as_inline(&kernel, &kname, &format!("gemvpart{i}"))?;
+        let norm_args = if body.contains("norm_eps") { "y{i}, 0.0f, " } else { "" }.replace("{i}", &i.to_string());
         if !preamble.contains(&support) {
             preamble.push(support);
         }
@@ -430,7 +449,7 @@ pub fn gemv_multi(parts: &[MultiPart], kernels_msl: &str) -> Option<(String, Str
             "true".into()
         };
         calls += &format!(
-            "    if ({cond}) {{ gemvpart{i}(({w_ty})w{i}, x, y{i}, ps[{i}], y{i}, y{i}, uint2(t - starts[{i}], 0), sg, lane); return; }}\n"
+            "    if ({cond}) {{ gemvpart{i}(({w_ty})w{i}, x, y{i}, ps[{i}], y{i}, y{i}, {norm_args}uint2(t - starts[{i}], 0), sg, lane); return; }}\n"
         );
         name += &format!("_{kname}");
     }

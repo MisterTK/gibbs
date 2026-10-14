@@ -7374,6 +7374,82 @@ mod tests {
         }
     }
 
+    fn step_kinds(plan: &PreparedPlan) -> (usize, usize, usize, usize, usize) {
+        let c = |f: fn(&Step) -> bool| plan.steps.iter().filter(|p| f(&p.op)).count();
+        (
+            c(|s| matches!(s, Step::RmsNorm { .. })),
+            c(|s| matches!(s, Step::RmsNormFused { .. })),
+            c(|s| matches!(s, Step::GemvPackedMulti { .. })),
+            c(|s| matches!(s, Step::GemvPacked { norm: None, .. })),
+            c(|s| matches!(s, Step::GemvPacked { norm: Some(_), .. })),
+        )
+    }
+
+    /// All passes on: a norm feeding mixed-codec q/k/v siblings is absorbed by F2 into each GEMV, so F3
+    /// must not merge them (the merged kernel would read the un-normalised x); with F2 off they merge.
+    /// Both match the CPU executor.
+    #[test]
+    fn norm_prologue_siblings_are_not_merged_and_match_cpu() {
+        let k = 512;
+        let specs = [(QuantFormat::GGUF_TQ2_0, 40usize), (QuantFormat::GGUF_Q4_0, 24), (QuantFormat::GGUF_Q8_0, 24)];
+        let mut w = Weights::new();
+        w.insert("g", Tensor::F32((0..k).map(|i| 0.75 + (i % 5) as f32 * 0.2).collect()));
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, k], DType::F32);
+        let gm = g.weight("g", vec![k], DType::F32);
+        let nx = g.add("norm", Op::RmsNorm { eps: 1e-5 }, &[x, gm], vec![1, k], DType::F32);
+        for (i, &(f, rows)) in specs.iter().enumerate() {
+            w.insert(&format!("w{i}"), random_packed(f, rows, k, 7 + i as u64));
+            let wv = g.weight(&format!("w{i}"), vec![rows, k], DType::Quant(f));
+            let y = g.add(&format!("lin{i}"), Op::Linear, &[nx, wv], vec![1, rows], DType::F32);
+            g.output(y);
+        }
+        let xs = rand(k, 5);
+        let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())]).unwrap();
+        for (prologue, kinds) in [(true, (0, 0, 0, 0, 3)), (false, (1, 0, 1, 0, 0))] {
+            let mut s = Session::new(rt(), &w).unwrap();
+            s.set_norm_prologue(Some(prologue));
+            let plan = s.prepare_plan(&g).unwrap();
+            assert_eq!(step_kinds(&plan), kinds, "prologue {prologue}: {:?}", plan.steps);
+            let got = s.run_prepared(&g, &plan, None, vec![Tensor::F32(xs.clone())]).unwrap();
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                let err = rel_err(a.as_f32().unwrap(), b.as_f32().unwrap());
+                assert!(err < 1e-4, "prologue {prologue} output {i}: differs from CPU by {err}");
+            }
+        }
+    }
+
+    /// All passes on: a norm read by a one-row GEMV and by a second same-eps norm is not absorbed (a
+    /// non-GEMV reader), so F4 fuses the pair; the GEMV keeps its plain x. Matches the CPU executor.
+    #[test]
+    fn norm_pair_with_gemv_reader_fuses_as_pair_and_matches_cpu() {
+        let (k, rows) = (512, 40);
+        let mut w = Weights::new();
+        w.insert("g1", Tensor::F32((0..k).map(|i| 0.75 + (i % 5) as f32 * 0.2).collect()));
+        w.insert("g2", Tensor::F32((0..k).map(|i| 1.1 + (i % 3) as f32 * 0.1).collect()));
+        w.insert("w", random_packed(QuantFormat::GGUF_Q4_0, rows, k, 9));
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, k], DType::F32);
+        let (g1, g2) = (g.weight("g1", vec![k], DType::F32), g.weight("g2", vec![k], DType::F32));
+        let wv = g.weight("w", vec![rows, k], DType::Quant(QuantFormat::GGUF_Q4_0));
+        let n1 = g.add("n1", Op::RmsNorm { eps: 1e-6 }, &[x, g1], vec![1, k], DType::F32);
+        let y = g.add("lin", Op::Linear, &[n1, wv], vec![1, rows], DType::F32);
+        let n2 = g.add("n2", Op::RmsNorm { eps: 1e-6 }, &[n1, g2], vec![1, k], DType::F32);
+        g.output(y);
+        g.output(n2);
+        let xs = rand(k, 5);
+        let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())]).unwrap();
+        let mut s = Session::new(rt(), &w).unwrap();
+        s.set_norm_prologue(Some(true));
+        let plan = s.prepare_plan(&g).unwrap();
+        assert_eq!(step_kinds(&plan), (0, 1, 0, 1, 0), "{:?}", plan.steps);
+        let got = s.run_prepared(&g, &plan, None, vec![Tensor::F32(xs)]).unwrap();
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            let err = rel_err(a.as_f32().unwrap(), b.as_f32().unwrap());
+            assert!(err < 1e-4, "output {i}: differs from CPU by {err}");
+        }
+    }
+
     /// One norm feeding two GEMVs of different codecs fuses into both; a norm something else reads (here
     /// also a graph output) or that feeds a batched (m > 1) Linear stays a step.
     #[test]
