@@ -262,3 +262,8 @@ Verdict: time 0.69x XLA (<= 0.8 required): met against jax-metal. Kernels 14 vs 
 ### 4.9 correction (device-side basis): NOT ACHIEVED
 
 The 0.69x host-wall ratio above compares a Rust host wall with jax-metal's Python per-call wall; Full vs XlaClass differ by 0.3-0.5% (noise), so the margin is not a fusion effect. With XLA timed pipelined (200 back-to-back calls, one sync: device-side basis) it takes 286.9 us/call vs gibbs GPU time 317.1 us (Full) / 318.7 (XlaClass): gibbs is 1.11x SLOWER than XLA on this fixture, with 14 vs 16 kernels (XlaClass). 4.9 is measured and NOT achieved on either time basis or the kernel ratio (0.875 vs <= 0.6). The checkbox in the todo list means "measured", not "met". `fusion_vs_xla.py` now prints both bases and uses the strict rule. F6-append-only is kept as branch `experiment/f6-append` (stack candidate), F5/F6-merge/F7/F8 on `experiment/bundle-21`.
+
+## Iteration 25 (E4: stack of F6 append-only + F5): DISCARD
+- +0.17 pp, noise 0.14, min ratio 0.995. E4 (combine near-misses) is tried; stack kept on branch `experiment/e4-stack`. Dispatch-count reductions of 30 per token are worth ~0.2 pp at most: stop pursuing them.
+- Next: the TQ2_0 decode-bound GEMVs (lm_head 105 MB at 51.6% of ceiling; iteration 1 limiter probe: decode work, not bandwidth, dominates) via a planar repack with aligned loads (L5).
+- Pending check on 4.9: XLA pipelined calls are independent, so 286.9 us may be a throughput figure; chain the calls (x = f(x, ...)) before treating the 1.11x as per-block latency.
