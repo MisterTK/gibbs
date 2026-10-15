@@ -299,6 +299,7 @@ make tui ARGS="--model THUDM/glm-edge-1.5b-chat --port 8081"
 | `--prompt`, `--image`, `--output`, `--steps`, `--strength` (default 0.7), `--negative-prompt`, `--width`, `--height`, `--guidance` | Run one image generation from the CLI; steps, size and guidance default from the model. With an LLM, `--prompt` generates once and exits; with a classifier, `--prompt "text"` (or `"a \|\| b"`) prints the scores and exits. |
 | `--draft <repo>` | Attaches a speculative drafter (DFlash, DFlash2, DSpark, or a small LM with the same tokenizer). See [Speculative decoding](#speculative-decoding). |
 | `GIBBS_SPEC=off` | Disables speculative decoding (built-in MTP heads and `--draft`). |
+| `GIBBS_KV_DTYPE=f32\|f16` | Metal attention KV cache storage (default `f16`: half the cache bytes, attention accumulates in f32; K/V beyond ±65504 saturate). `f32` is the A/B switch. Caches that anything other than cached attention also reads (encoder-decoder self attention) stay f32. |
 | `--frames` (default 16), `--guidance` (default 9.0), `--steps` (default 25), `--output <file.mp4>` | Text-to-video options (see [Text-to-video](#text-to-video-modelscope-from-the-cli)); LTX-Video has its own defaults, `--image` (first frame) and `--text-encoder`. |
 | `--tui` | Opens the terminal dashboard. |
 | `--hf-token`, `--port`, `--storage` | Hugging Face auth, listen port, and storage backend. |

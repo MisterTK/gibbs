@@ -256,9 +256,17 @@ pub(crate) mod tests {
                 .zip(&got)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f32::max);
+            // Default f16 KV caches add rounding of about 2^-11 relative to every cached K/V, so the
+            // bound grows with the logit scale (f32 caches keep the strict bar).
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let bound = if crate::graph::metal::kv_f16_default() {
+                1e-3 + 2e-3 * scale
+            } else {
+                1e-3
+            };
             assert!(
-                err <= 1e-3,
-                "{ids:?}: want {want:?} got {got:?} (abs {err})"
+                err <= bound,
+                "{ids:?}: want {want:?} got {got:?} (abs {err}, bound {bound})"
             );
             worst = worst.max(err);
         }

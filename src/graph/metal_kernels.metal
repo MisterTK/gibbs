@@ -1713,20 +1713,31 @@ struct KvAppendParams {
     uint start_pos;
 };
 
-kernel void kv_append_batched(device const float* k_in [[buffer(0)]],
-                              device const float* v_in [[buffer(1)]],
-                              device float* k_state [[buffer(2)]],
-                              device float* v_state [[buffer(3)]],
-                              constant KvAppendParams& p [[buffer(4)]],
-                              uint gid [[thread_position_in_grid]]) {
+// KV cache element type: float, or half (round-to-nearest-even; |x| > 65504 saturates instead of becoming inf,
+// NaN is kept).
+inline float kv_store(float x, float) { return x; }
+inline half kv_store(float x, half) { return isnan(x) ? half(x) : half(clamp(x, -65504.0f, 65504.0f)); }
+
+template <typename T>
+kernel void kv_append_t(device const float* k_in [[buffer(0)]],
+                        device const float* v_in [[buffer(1)]],
+                        device T* k_state [[buffer(2)]],
+                        device T* v_state [[buffer(3)]],
+                        constant KvAppendParams& p [[buffer(4)]],
+                        uint gid [[thread_position_in_grid]]) {
     uint total = p.m * p.kv_dim;
     if (gid >= total) return;
     uint tok = gid / p.kv_dim;
     uint d = gid % p.kv_dim;
     ulong dst_idx = (ulong)(p.start_pos + tok) * p.stride + d;
-    k_state[dst_idx] = k_in[gid];
-    v_state[dst_idx] = v_in[gid];
+    k_state[dst_idx] = kv_store(k_in[gid], T(0));
+    v_state[dst_idx] = kv_store(v_in[gid], T(0));
 }
+
+typedef decltype(kv_append_t<float>) kv_append_k;
+typedef decltype(kv_append_t<half>) kv_append_kh;
+template [[host_name("kv_append_batched")]] kernel kv_append_k kv_append_t<float>;
+template [[host_name("kv_append_batched_f16")]] kernel kv_append_kh kv_append_t<half>;
 
 struct AttnCachedParams {
     uint n_heads;
@@ -1743,19 +1754,20 @@ struct AttnCachedParams {
     uint chunk;
 };
 
-inline void attn_cached_f32_impl(device const float* q,
-                                 device const float* kc,
-                                 device const float* vc,
-                                 device float* out,
-                                 constant AttnCachedParams& p,
-                                 device const uint* vis,
-                                 uint2 tg,
-                                 uint sg,
-                                 uint lane,
-                                 uint nsg,
-                                 threadgroup float* tg_m,
-                                 threadgroup float* tg_l,
-                                 threadgroup float* tg_acc) {
+template <typename T>
+inline void attn_cached_impl(device const float* q,
+                             device const T* kc,
+                             device const T* vc,
+                             device float* out,
+                             constant AttnCachedParams& p,
+                             device const uint* vis,
+                             uint2 tg,
+                             uint sg,
+                             uint lane,
+                             uint nsg,
+                             threadgroup float* tg_m,
+                             threadgroup float* tg_l,
+                             threadgroup float* tg_acc) {
     const uint hd = p.head_dim;
     const uint row = ATTN_MAX_PER_LANE * 32;
     const uint head = tg.x;
@@ -1779,12 +1791,12 @@ inline void attn_cached_f32_impl(device const float* q,
     const uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
     const uint hi = len;
     for (uint t = lo + sg; t < hi; t += nsg) {
-        device const float* k = kc + (ulong)t * p.stride + kv_off;
-        device const float* v = vc + (ulong)t * p.stride + kv_off;
+        device const T* k = kc + (ulong)t * p.stride + kv_off;
+        device const T* v = vc + (ulong)t * p.stride + kv_off;
         float s = 0.0f;
         for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
             uint d = lane + 32 * j;
-            if (d < hd) s += qr[j] * k[d];
+            if (d < hd) s += qr[j] * float(k[d]);
         }
         s = simd_sum(s) * p.scale;
         if (p.softcap > 0.0f) {
@@ -1796,7 +1808,7 @@ inline void attn_cached_f32_impl(device const float* q,
         l = l * corr + e;
         for (uint j = 0; j < ATTN_MAX_PER_LANE; ++j) {
             uint d = lane + 32 * j;
-            if (d < hd) acc[j] = acc[j] * corr + e * v[d];
+            if (d < hd) acc[j] = acc[j] * corr + e * float(v[d]);
         }
         m = m_new;
     }
@@ -1821,37 +1833,27 @@ inline void attn_cached_f32_impl(device const float* q,
     }
 }
 
-kernel void attn_cached_f32(device const float* q [[buffer(0)]],
-                            device const float* kc [[buffer(1)]],
-                            device const float* vc [[buffer(2)]],
-                            device float* out [[buffer(3)]],
-                            constant AttnCachedParams& p [[buffer(4)]],
-                            device const uint* vis [[buffer(5)]],
-                            uint2 tg [[threadgroup_position_in_grid]],
-                            uint sg [[simdgroup_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]],
-                            uint nsg [[simdgroups_per_threadgroup]]) {
+template <typename T>
+kernel void attn_cached_t(device const float* q [[buffer(0)]],
+                          device const T* kc [[buffer(1)]],
+                          device const T* vc [[buffer(2)]],
+                          device float* out [[buffer(3)]],
+                          constant AttnCachedParams& p [[buffer(4)]],
+                          device const uint* vis [[buffer(5)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint nsg [[simdgroups_per_threadgroup]]) {
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
-kernel void flash_attn_cached_f32(device const float* q [[buffer(0)]],
-                                  device const float* kc [[buffer(1)]],
-                                  device const float* vc [[buffer(2)]],
-                                  device float* out [[buffer(3)]],
-                                  constant AttnCachedParams& p [[buffer(4)]],
-                                  device const uint* vis [[buffer(5)]],
-                                  uint2 tg [[threadgroup_position_in_grid]],
-                                  uint sg [[simdgroup_index_in_threadgroup]],
-                                  uint lane [[thread_index_in_simdgroup]],
-                                  uint nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float tg_m[ATTN_MAX_SG];
-    threadgroup float tg_l[ATTN_MAX_SG];
-    threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl(q, kc, vc, out, p, vis, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
-}
+typedef decltype(attn_cached_t<float>) attn_cached_k;
+typedef decltype(attn_cached_t<half>) attn_cached_kh;
+template [[host_name("flash_attn_cached_f32")]] kernel attn_cached_k attn_cached_t<float>;
+template [[host_name("flash_attn_cached_f16")]] kernel attn_cached_kh attn_cached_t<half>;
 
 kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
                                   device float* out [[buffer(1)]],
@@ -1878,10 +1880,10 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
 // once for all of them (the per-head kernel above re-reads them `group` times). Partials have the layout of
 // `attn_cached_split_f32`; `attn_cached_merge_f32` combines them.
 constant uint ATTN_HPT = 4;
-template <uint NJ>
+template <uint NJ, typename T>
 kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
-                                      device const float* kc [[buffer(1)]],
-                                      device const float* vc [[buffer(2)]],
+                                      device const T* kc [[buffer(1)]],
+                                      device const T* vc [[buffer(2)]],
                                       device float* part [[buffer(3)]],
                                       constant AttnCachedParams& p [[buffer(4)]],
                                       uint3 tg3 [[threadgroup_position_in_grid]],
@@ -1922,17 +1924,17 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
         for (uint j = 0; j < NJ; ++j) acc[h][j] = 0.0f;
     }
     for (uint t = lo + sg; t < hi; t += nsg) {
-        device const float* k = kc + (ulong)t * p.stride + kv_off;
-        device const float* v = vc + (ulong)t * p.stride + kv_off;
+        device const T* k = kc + (ulong)t * p.stride + kv_off;
+        device const T* v = vc + (ulong)t * p.stride + kv_off;
         float kr[NJ];
         for (uint j = 0; j < NJ; ++j) {
             const uint d = lane + 32 * j;
-            kr[j] = d < hd ? k[d] : 0.0f;
+            kr[j] = d < hd ? float(k[d]) : 0.0f;
         }
         float vr[NJ];
         for (uint j = 0; j < NJ; ++j) {
             const uint d = lane + 32 * j;
-            vr[j] = d < hd ? v[d] : 0.0f;
+            vr[j] = d < hd ? float(v[d]) : 0.0f;
         }
         for (uint h = 0; h < ATTN_HPT; ++h) {
             if (h >= nh) break;
@@ -1977,12 +1979,18 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
     }
 }
 
-typedef decltype(attn_cached_gqa_split_t<1>) attn_cached_gqa_split_k;
-template [[host_name("attn_cached_gqa_split_f32_1")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<1>;
-template [[host_name("attn_cached_gqa_split_f32_2")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<2>;
-template [[host_name("attn_cached_gqa_split_f32_4")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<4>;
-template [[host_name("attn_cached_gqa_split_f32_8")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<8>;
-template [[host_name("attn_cached_gqa_split_f32_16")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<16>;
+typedef decltype(attn_cached_gqa_split_t<1, float>) attn_cached_gqa_split_k;
+typedef decltype(attn_cached_gqa_split_t<1, half>) attn_cached_gqa_split_kh;
+template [[host_name("attn_cached_gqa_split_f32_1")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<1, float>;
+template [[host_name("attn_cached_gqa_split_f32_2")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<2, float>;
+template [[host_name("attn_cached_gqa_split_f32_4")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<4, float>;
+template [[host_name("attn_cached_gqa_split_f32_8")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<8, float>;
+template [[host_name("attn_cached_gqa_split_f32_16")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<16, float>;
+template [[host_name("attn_cached_gqa_split_f16_1")]] kernel attn_cached_gqa_split_kh attn_cached_gqa_split_t<1, half>;
+template [[host_name("attn_cached_gqa_split_f16_2")]] kernel attn_cached_gqa_split_kh attn_cached_gqa_split_t<2, half>;
+template [[host_name("attn_cached_gqa_split_f16_4")]] kernel attn_cached_gqa_split_kh attn_cached_gqa_split_t<4, half>;
+template [[host_name("attn_cached_gqa_split_f16_8")]] kernel attn_cached_gqa_split_kh attn_cached_gqa_split_t<8, half>;
+template [[host_name("attn_cached_gqa_split_f16_16")]] kernel attn_cached_gqa_split_kh attn_cached_gqa_split_t<16, half>;
 
 struct PagedAttnCachedParams {
     uint n_heads;

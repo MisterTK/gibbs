@@ -244,6 +244,7 @@ impl EncDec {
     pub fn fork(&self, seq: &Seq) -> Result<Seq, String> {
         let mut state = StateStore::new();
         state.buffers = seq.state.buffers.clone();
+        state.metal_f16 = seq.state.metal_f16.clone();
         let device = crate::graph::metal::system_device()?;
         for (name, (buf, n)) in &seq.state.metal_buffers {
             if name.starts_with('x') {
@@ -252,15 +253,17 @@ impl EncDec {
             }
             // ponytail: host memcpy of the filled rows (unified memory) instead of a blit /
             // `StateReorder`, which cannot write state in place.
-            let fresh = crate::graph::metal::new_shared_buffer(&device, *n * 4)?;
+            // Self-attention caches may be f16 (see `Session::assign_kv_dtypes`); copy bytes.
+            let eb = if seq.state.metal_f16.contains(name) { 2 } else { 4 };
+            let fresh = crate::graph::metal::new_shared_buffer(&device, *n * eb)?;
             let rows = (seq.len * self.d.inner).min(*n);
-            // SAFETY: both buffers are shared-storage with at least `rows` f32s; steps are
-            // synchronous so no GPU work is in flight.
+            // SAFETY: both buffers are shared-storage with at least `rows` elements of `eb` bytes;
+            // steps are synchronous so no GPU work is in flight.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    buf.contents() as *const f32,
-                    fresh.contents() as *mut f32,
-                    rows,
+                    buf.contents() as *const u8,
+                    fresh.contents() as *mut u8,
+                    rows * eb,
                 );
             }
             state.metal_buffers.insert(name.clone(), (Arc::new(fresh), *n));
