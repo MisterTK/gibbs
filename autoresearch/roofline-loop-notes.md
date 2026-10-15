@@ -314,11 +314,11 @@ Status: 83 ok/parity ok/oracle pass, 22 ok (non-GGUF, oracle skip), 3 oracle fai
 Classes affecting more than one model (all `unsloth/*`, a first-party lab per the plan, so burn-down defects, not `unsupported-variant`):
 | n | class | note |
 |--:|:--|:--|
-| 155 | per-head q/k RMSNorm "not implemented by this decoder" (LFM2.5-230M 82+73 GGUF; gemma-3-270m bnb 12) | one missing generic graph pattern covers most of the matrix |
+| 155 | per-head q/k RMSNorm "not implemented by this decoder": LFM2.5-230M GGUF 143, gemma-3-270m bnb 12 | gemma-3 is plain q/k-norm. LFM2.5 is `lfm2`, a hybrid with gated short-conv blocks (`lfm2.shortconv.l_cache` in its GGUF header, read by range request): q/k-norm is only the first missing tensor, expect a shortconv error next; the real gap is the LFM2 conv block graph |
 | 24 | `granitehybrid` (Mamba / expert layers) on the dense path | needs the hybrid layer graph |
 | 21 | `granite.embedding_scale` "multipliers not implemented" | targeted by v2 1.1 (graph_lm Granite scales); re-run these to confirm |
 | 18 | ERNIE-4.5-0.3B `layer_N_qkv` weight size mismatch | loader shape bug |
 | 8 | granite bnb-4bit missing MLP/qkv tensor names | safetensors name mapping |
 | 2 | LFM2 bnb `duplicate field num_heads` in config.json | serde alias clash |
 Singletons: 3 curl download failures (retry), 1 Qwen-Image-ComfyUI (no LLM weights: `unsupported-variant`), 2 exit -15 (killed).
-Next: the q/k-norm class first (155 models), then Granite re-run, then ERNIE.
+All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of 394 rows are `33187e7`), so none exercise the v2 Phase 1 fixes. Before fixing anything: re-run one representative per class with a HEAD binary (granite-4.0-350m dense first, for the multipliers), then fix what remains: LFM2 shortconv + q/k-norm (143), granitehybrid (24), ERNIE qkv (18).
