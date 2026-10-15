@@ -248,7 +248,7 @@ impl GraphLmConfig {
             hf.hidden_dim,
             hf.resolved_intermediate_dim(),
             hf.num_layers,
-            hf.num_heads,
+            hf.resolved_num_heads(),
             quant_mode,
         );
         cfg.head_dim = hf.head_dim.unwrap_or(cfg.head_dim);
@@ -1617,6 +1617,9 @@ impl GraphLm {
                 "tensor '{n}': per-head q/k RMSNorm is not implemented by this decoder"
             ));
         }
+        if let Some(n) = manifest.tensors.keys().find(|n| n.contains(".block_sparse_moe.")) {
+            return Err(format!("tensor '{n}': expert (MoE) layers are not implemented on the dense path"));
+        }
         // Gemma 3 / EXAONE 4 carry q/k norms but also sliding-window layers, per-layer RoPE bases and
         // (Gemma) scaled embeddings, none of which this decoder has: refuse instead of running a
         // plausible-looking wrong model.
@@ -1990,8 +1993,10 @@ impl GraphLm {
                         raw_gate_up = Some(duplicated);
                     }
                 }
-            } else if let Ok(vec) = ext(&format!("model.layers.{}.mlp.gate_up_proj.weight", l)) {
-                // HF fused [gate; up] rows (GLM, Phi-3): already our gate-first layout.
+            } else if let Ok(vec) = ext(&format!("model.layers.{}.mlp.gate_up_proj.weight", l))
+                .or_else(|_| ext(&format!("model.layers.{}.shared_mlp.input_linear.weight", l)))
+            {
+                // HF fused [gate; up] rows (GLM, Phi-3, Granite-4 `shared_mlp.input_linear`): already our gate-first layout.
                 raw_gate_up = Some(vec);
             } else if let (Ok(g), Ok(u)) = (proj(&gate_name), proj(&up_name)) {
                 let mut fused = Vec::with_capacity(g.len() + u.len());
@@ -2039,6 +2044,7 @@ impl GraphLm {
                 format!("blk.{}.ffn_down.weight", l),
                 format!("model.layers.{}.mlp.down_proj.weight", l),
                 format!("model.layers.{}.feed_forward.w2.weight", l),
+                format!("model.layers.{}.shared_mlp.output_linear.weight", l),
                 format!("gpt_neox.layers.{}.mlp.dense_4h_to_h.weight", l),
                 format!("transformer.h.{}.mlp.c_proj.weight", l),
             ];
@@ -4380,10 +4386,40 @@ mod tests {
         let hf: crate::model::hf_loader::HfConfigJson = serde_json::from_str(
             r#"{"model_type":"lfm2","hidden_size":1024,"num_hidden_layers":16,"num_attention_heads":16,
                 "intermediate_size":6656,"block_auto_adjust_ff_dim":true,"block_ffn_dim_multiplier":1.0,
-                "block_multiple_of":256,"norm_eps":2e-5}"#,
+                "block_multiple_of":256,"norm_eps":2e-5,"num_heads":16,"num_key_value_heads":8}"#,
         )
         .unwrap();
         let cfg = GraphLmConfig::from_hf(&hf, QuantMode::Uncompressed);
         assert_eq!((cfg.intermediate_dim, cfg.norm_eps), (4608, 2e-5));
+        // `num_attention_heads` and `num_heads` together parse (no duplicate field); each alone works too.
+        assert_eq!((cfg.num_heads, hf.resolved_num_kv_heads()), (16, 8));
+        for key in ["num_heads", "n_heads", "num_attention_heads"] {
+            let hf: crate::model::hf_loader::HfConfigJson =
+                serde_json::from_str(&format!(r#"{{"hidden_size":64,"{key}":8}}"#)).unwrap();
+            assert_eq!(hf.resolved_num_heads(), 8, "{key}");
+        }
+    }
+
+    /// Granite-4 HF (`GraniteMoeHybrid`, attention-only layers): the MLP lives in `shared_mlp.input_linear`
+    /// (fused gate; up) and `output_linear`; it loads exactly like the Llama gate/up/down names. Expert
+    /// layers (`block_sparse_moe`) fail instead of running without their experts.
+    #[test]
+    fn granite_hf_shared_mlp_names_load_like_gate_up_down() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let tokens = [3u32, 17, 5, 9];
+        let mut tiny = Tiny::new(16, 2, 2, 8, false);
+        let want = tiny.reference(&tokens);
+        for l in 0..tiny.cfg.num_layers {
+            let p = format!("model.layers.{l}");
+            let (gate, up) = (tiny.t.remove(&format!("{p}.mlp.gate_proj.weight")).unwrap(), tiny.t.remove(&format!("{p}.mlp.up_proj.weight")).unwrap());
+            let fused = ([gate.0[0] + up.0[0], gate.0[1]].to_vec(), [gate.1, up.1].concat());
+            tiny.t.insert(format!("{p}.shared_mlp.input_linear.weight"), fused);
+            let down = tiny.t.remove(&format!("{p}.mlp.down_proj.weight")).unwrap();
+            tiny.t.insert(format!("{p}.shared_mlp.output_linear.weight"), down);
+        }
+        let model = tiny.load().expect("loads");
+        assert_close(&model.forward(&tokens), &want, "host");
+        tiny.t.insert("model.layers.0.block_sparse_moe.router.layer.weight".into(), (vec![2, 16], vec![0.0; 32]));
+        assert!(tiny.load().expect_err("moe").contains("expert"));
     }
 }
