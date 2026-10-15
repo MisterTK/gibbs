@@ -17,12 +17,13 @@ pub struct HfConfigJson {
         default = "default_layers"
     )]
     pub num_layers: usize,
-    #[serde(
-        alias = "num_attention_heads",
-        alias = "n_heads",
-        default = "default_heads"
-    )]
-    pub num_heads: usize,
+    // Separate fields (not aliases): LFM2 configs carry both `num_attention_heads` and `num_heads`.
+    #[serde(default)]
+    num_attention_heads: Option<usize>,
+    #[serde(default)]
+    num_heads: Option<usize>,
+    #[serde(default)]
+    n_heads: Option<usize>,
     #[serde(alias = "intermediate_size", default)]
     pub intermediate_dim: Option<usize>,
     #[serde(alias = "vocab_size", default = "default_vocab")]
@@ -143,8 +144,16 @@ impl HfConfigJson {
         false
     }
 
+    /// Attention head count: `num_attention_heads`, else `num_heads`, else `n_heads`.
+    pub fn resolved_num_heads(&self) -> usize {
+        self.num_attention_heads
+            .or(self.num_heads)
+            .or(self.n_heads)
+            .unwrap_or_else(default_heads)
+    }
+
     pub fn resolved_num_kv_heads(&self) -> usize {
-        self.num_key_value_heads.unwrap_or(self.num_heads)
+        self.num_key_value_heads.unwrap_or_else(|| self.resolved_num_heads())
     }
 
     pub fn resolved_rotary_pct(&self) -> f32 {
@@ -545,8 +554,8 @@ impl HuggingFaceModelDir {
                 hidden_dim: hf_cfg.hidden_dim,
                 intermediate_dim: hf_cfg.resolved_intermediate_dim(),
                 num_layers: hf_cfg.num_layers,
-                num_heads: hf_cfg.num_heads,
-                head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+                num_heads: hf_cfg.resolved_num_heads(),
+                head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
                 eps: 1e-5,
             }
         } else {
