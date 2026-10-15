@@ -48,8 +48,23 @@ impl GemvVariant {
 }
 
 /// Winners measured while another process kept the GPU busier than this are used in-process but
-/// never persisted: contended timings would poison later runs' variant choices.
+/// never persisted: contended timings would poison later runs' variant choices. `GIBBS_TUNE_BUSY_PCT`
+/// overrides it (set it to the verify gate's `QUIET_MAX_PCT` on a machine whose idle floor is higher).
 pub const BUSY_PCT: u32 = 20;
+
+/// Whether foreign load kept the GPU busy: sampled ONCE per process, on first use, before this process
+/// has run any tuning kernel (a later sample would include its own earlier benchmarks, and the
+/// utilization counter is a trailing average, so one reading per process is the only clean one).
+pub fn foreign_busy() -> bool {
+    static BUSY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BUSY.get_or_init(|| {
+        let limit = std::env::var("GIBBS_TUNE_BUSY_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BUSY_PCT);
+        gpu_utilization().is_some_and(|u| u > limit)
+    })
+}
 
 /// The `Device Utilization %` field of an `ioreg -r -d 1 -c IOAccelerator` dump.
 pub fn parse_utilization(ioreg: &str) -> Option<u32> {
