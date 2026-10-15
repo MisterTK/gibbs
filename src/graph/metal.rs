@@ -6268,14 +6268,13 @@ mod tests {
         }
     }
 
-    /// TQ2_0 lives in the planar device layout (groups of 8 blocks): GEMV (m = 1, every variant), the
-    /// dequantizing batched path (m = 20) equal the CPU executor at shapes where rows are not whole groups
-    /// (5, 9 blocks per row), n is not a multiple of the rows per threadgroup and the total block count is
-    /// not a multiple of 8.
-    #[test]
-    fn tq2_0_planar_layout_matches_cpu() {
-        use crate::model::layers::QuantizedWeight;
-        let f = QuantFormat::GGUF_TQ2_0;
+    /// A planar-layout format (groups of 8 blocks; `scale_at` are the byte offsets of its f16 scales): GEMV
+    /// (m = 1, every variant) and the dequantizing batched path (m = 20) equal the CPU executor at shapes where
+    /// rows are not whole groups (5, 9 blocks per row), n is not a multiple of the rows per threadgroup and the
+    /// total block count is not a multiple of 8.
+    fn planar_layout_matches_cpu(f: QuantFormat, scale_at: &[usize]) {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
         let mut seed = 0x2545F4914F6CDD1Du64;
         let mut next = move || {
             seed = seed
@@ -6284,14 +6283,14 @@ mod tests {
             (seed >> 33) as u32
         };
         for (n, k) in [(37usize, 1280usize), (101, 2304), (19, 2048), (5, 768)] {
-            let mut raw: Vec<u8> = (0..n * (k / 256) * 66)
-                .map(|_| (next() >> 4) as u8)
-                .collect();
-            for blk in raw.chunks_exact_mut(66) {
-                // Finite f16 scale in 2^-6..2^4.
-                let exp = 9 + (next() % 14) as u16;
-                let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
-                blk[64..].copy_from_slice(&d.to_le_bytes());
+            let mut raw: Vec<u8> = (0..n * (k / be) * bb).map(|_| (next() >> 4) as u8).collect();
+            for blk in raw.chunks_exact_mut(bb) {
+                for &o in scale_at {
+                    // Finite f16 scale in 2^-6..2^4.
+                    let exp = 9 + (next() % 14) as u16;
+                    let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                    blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                }
             }
             let mut w = Weights::new();
             w.insert(
@@ -6329,10 +6328,54 @@ mod tests {
                     let err = rel_err(&want, &got);
                     assert!(
                         err < 1e-4,
-                        "TQ2_0 {n}x{k} m={m} {v:?}: differs from CPU by {err}"
+                        "{f:?} {n}x{k} m={m} {v:?}: differs from CPU by {err}"
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tq2_0_planar_layout_matches_cpu() {
+        planar_layout_matches_cpu(QuantFormat::GGUF_TQ2_0, &[64]);
+    }
+
+    #[test]
+    fn q3_k_planar_layout_matches_cpu() {
+        planar_layout_matches_cpu(QuantFormat::GGUF_Q3_K, &[108]);
+    }
+
+    #[test]
+    fn q5_k_planar_layout_matches_cpu() {
+        planar_layout_matches_cpu(QuantFormat::GGUF_Q5_K_M, &[0, 2]);
+    }
+
+    /// `Planar::repack` is a pure permutation of whole blocks (padded to whole groups with zeros) that
+    /// puts every block's data at a 16-byte-aligned group offset and keeps its scale bytes together.
+    #[test]
+    fn planar_repack_layout() {
+        for f in [QuantFormat::GGUF_TQ2_0, QuantFormat::GGUF_Q3_K, QuantFormat::GGUF_Q5_K_M] {
+            let (pl, c) = (codec::planar(f).unwrap(), codec::codec(f).unwrap());
+            let bb = c.block_bytes as usize;
+            assert_eq!(pl.data % 16, 0, "{f:?}");
+            assert_eq!((pl.blocks as usize * bb) % 16, 0, "{f:?}: groups must keep 16-byte alignment");
+            let nblocks = 11; // one full group and a ragged one
+            let raw: Vec<u8> = (0..nblocks * bb).map(|i| (i * 7 + i / bb) as u8).collect();
+            let out = pl.repack(&raw, bb);
+            let (g, data, lead) = (pl.blocks as usize, pl.data as usize, pl.lead as usize);
+            assert_eq!(out.len(), nblocks.div_ceil(g) * g * bb);
+            for i in 0..nblocks {
+                let (grp, j) = (&out[i / g * g * bb..][..g * bb], i % g);
+                let src = &raw[i * bb..][..bb];
+                assert_eq!(&grp[j * data..][..data], &src[lead..lead + data], "{f:?} block {i} data");
+                let sc = &grp[g * data + j * (bb - data)..][..bb - data];
+                assert_eq!(&sc[..lead], &src[..lead], "{f:?} block {i} lead");
+                assert_eq!(&sc[lead..], &src[lead + data..], "{f:?} block {i} tail");
+            }
+            let last = &out[g * bb..];
+            let sb = bb - data;
+            assert!(last[(nblocks - g) * data..g * data].iter().all(|&b| b == 0), "{f:?} data padding");
+            assert!(last[g * data + (nblocks - g) * sb..].iter().all(|&b| b == 0), "{f:?} scale padding");
         }
     }
 
