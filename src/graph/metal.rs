@@ -1413,6 +1413,77 @@ pub struct Session {
     variant_override: Option<GemvVariant>,
     last_gpu_s: std::sync::atomic::AtomicU64,
 }
+/// Packs all active graph weights in `bufs` into one contiguous 256-byte-aligned `MTLBuffer`
+/// ordered by their first appearance along `graph.nodes` (execution order, E3).
+fn pack_weights_in_execution_order(
+    device: &Device,
+    bufs: &mut HashMap<String, (Buffer, usize, usize, WeightFormat)>,
+    map_buffers: &HashMap<*const u8, Buffer>,
+    graph: &Graph,
+) -> Result<(), String> {
+    if bufs.len() <= 1 {
+        return Ok(());
+    }
+    let map_ptrs: std::collections::HashSet<usize> =
+        map_buffers.values().map(|b| b.as_ptr() as usize).collect();
+    let mut order: Vec<String> = Vec::with_capacity(bufs.len());
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(bufs.len());
+    for node in &graph.nodes {
+        for &in_id in &node.inputs {
+            let val = graph.value(in_id);
+            if val.kind == ValueKind::Weight
+                && bufs.contains_key(&val.name)
+                && seen.insert(val.name.clone())
+            {
+                order.push(val.name.clone());
+            }
+        }
+    }
+    let mut rest: Vec<String> = bufs
+        .keys()
+        .filter(|k| !seen.contains(*k))
+        .cloned()
+        .collect();
+    rest.sort();
+    order.extend(rest);
+
+    let mut spans: Vec<(String, usize, usize)> = Vec::with_capacity(order.len());
+    let mut cursor = 0usize;
+    for name in order {
+        let (buf, off, num_elements, fmt) = &bufs[&name];
+        let byte_len = if map_ptrs.contains(&(buf.as_ptr() as usize)) {
+            weight_format_bytes(*fmt, *num_elements)
+        } else {
+            (buf.length() as usize).saturating_sub(*off)
+        };
+        cursor = (cursor + 255) & !255;
+        spans.push((name, cursor, byte_len));
+        cursor += byte_len.max(4);
+    }
+    if cursor == 0 {
+        return Ok(());
+    }
+    let contig = new_shared_buffer(device, (cursor + 255) & !255)?;
+    let dst_base = contig.contents() as *mut u8;
+    for (name, dst_off, byte_len) in spans {
+        let (buf, src_off, num_elements, fmt) = bufs.remove(&name).expect("present");
+        if byte_len > 0 {
+            // SAFETY: `buf` has at least `src_off + byte_len` readable bytes and `contig` has
+            // `dst_off + byte_len` writable bytes in non-overlapping host-visible shared memory.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (buf.contents() as *const u8).add(src_off),
+                    dst_base.add(dst_off),
+                    byte_len,
+                );
+            }
+        }
+        bufs.insert(name, (contig.clone(), dst_off, num_elements, fmt));
+    }
+    Ok(())
+}
+
 impl Session {
     /// Uploads every weight once. Preserves packed formats without f32 expansion.
     pub fn new(rt: Arc<Runtime>, weights: &Weights) -> Result<Self, String> {
@@ -1957,6 +2028,12 @@ impl Session {
             }
             bufs.insert(name.to_string(), (buf, 0, num_elements, fmt));
         }
+        if let Some(g) = graph.filter(|_| {
+            std::env::var("GIBBS_EXEC_ORDER_WEIGHTS")
+                .is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+        }) {
+            pack_weights_in_execution_order(&rt.device, &mut bufs, &map_buffers, g)?;
+        }
         // The default (2 rows/simdgroup) kernel of every generated format, compiled up front so the
         // first token never waits on a compiler.
         let gen_formats: std::collections::HashSet<QuantFormat> = bufs
@@ -1988,6 +2065,25 @@ impl Session {
     /// GPU seconds of the last completed (non-profiled) [`Self::run`] command buffer.
     pub fn last_gpu_seconds(&self) -> f64 {
         f64::from_bits(self.last_gpu_s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Repacks all weights of `self` into one contiguous 256-byte-aligned `MTLBuffer` ordered by
+    /// their first appearance along `graph.nodes` (E3).
+    pub fn pack_weights_exec_order(&mut self, graph: &Graph) -> Result<(), String> {
+        pack_weights_in_execution_order(&self.rt.device, &mut self.weights, &HashMap::new(), graph)
+    }
+    /// Number of distinct backing `MTLBuffer` allocations across `self.weights` (1 when packed in
+    /// execution order).
+    pub fn weight_buffer_count(&self) -> usize {
+        let ptrs: std::collections::HashSet<usize> = self
+            .weights
+            .values()
+            .map(|(b, _, _, _)| b.as_ptr() as usize)
+            .collect();
+        ptrs.len()
+    }
+    /// Byte offset of `name` inside its backing weight buffer.
+    pub fn weight_offset(&self, name: &str) -> Option<usize> {
+        self.weights.get(name).map(|w| w.1)
     }
     /// Uses `kind` for every Linear instead of the host profile's choice.
     pub fn force_gemm(&mut self, kind: GemmKernel) -> Result<(), String> {
@@ -8359,5 +8455,51 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             rows.iter().all(|r| r.us >= 0.0 && r.gbps >= 0.0),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn exec_order_weight_packing_shares_one_buffer_and_matches_cpu() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 64], DType::F32);
+        let w1 = g.weight("z_first", vec![64, 64], DType::F32);
+        let w2 = g.weight("m_second", vec![64, 64], DType::F32);
+        let w3 = g.weight("a_third", vec![32, 64], DType::F32);
+        let h1 = g.add("l1", Op::Linear, &[x, w1], vec![1, 64], DType::F32);
+        let h2 = g.add("l2", Op::Linear, &[h1, w2], vec![1, 64], DType::F32);
+        let out = g.add("l3", Op::Linear, &[h2, w3], vec![1, 32], DType::F32);
+        g.output(out);
+
+        let mut weights = Weights::new();
+        let gen = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 17 + seed) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        weights.insert("a_third", Tensor::F32(gen(3, 32 * 64)));
+        weights.insert("m_second", Tensor::F32(gen(2, 64 * 64)));
+        weights.insert("z_first", Tensor::F32(gen(1, 64 * 64)));
+
+        let inp = vec![Tensor::F32(gen(7, 64))];
+        let want = cpu::run_stateless(&g, &weights, inp.clone()).unwrap();
+        let mut sess = Session::new_for_graph(rt(), &weights, Some(&g)).unwrap();
+        assert_eq!(sess.weight_buffer_count(), 3);
+        sess.pack_weights_exec_order(&g).unwrap();
+        assert_eq!(
+            sess.weight_buffer_count(),
+            1,
+            "all weights must share one contiguous MTLBuffer"
+        );
+        let o1 = sess.weight_offset("z_first").unwrap();
+        let o2 = sess.weight_offset("m_second").unwrap();
+        let o3 = sess.weight_offset("a_third").unwrap();
+        assert!(
+            o1 < o2 && o2 < o3,
+            "offsets must follow execution order: {o1} < {o2} < {o3}"
+        );
+        assert_eq!(o1 % 256, 0);
+        assert_eq!(o2 % 256, 0);
+        assert_eq!(o3 % 256, 0);
+        let got = sess.run(&g, inp).unwrap();
+        assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
     }
 }
