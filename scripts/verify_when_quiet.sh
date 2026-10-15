@@ -5,6 +5,9 @@
 # (contention-aborted) when a run shows base_pct < 35 or e2b_tok_s < 100: nothing is recorded then.
 cd "$(dirname "$0")/.."
 max=${QUIET_MAX_PCT:-15}  # raise only when the idle floor itself is higher (compositor): then the tripwires carry validity
+# The tuner uses the same busy threshold: an idle floor above 20% must not make every verify process
+# retune from scratch and never persist.
+export GIBBS_TUNE_BUSY_PCT=${GIBBS_TUNE_BUSY_PCT:-$max}
 ok=0; t0=$(date +%s); sleep_s=10; warned=0
 while [ $ok -lt 5 ]; do
   u=$(ioreg -r -d 1 -c IOAccelerator | grep -o '"Device Utilization %"=[0-9]*' | head -1 | grep -o '[0-9]*$')
