@@ -243,6 +243,19 @@ pub fn gemv_common(kernels_msl: &str) -> &str {
     &kernels_msl[begin..end]
 }
 
+/// Function-constant indices of the shape a [`gemv_packed`] pipeline may be specialized to: `rows` and blocks
+/// per row (`cols / block_elems`). Left undefined, the kernel reads both from `PackedGemvParams`; defined, loop
+/// trip counts and row guards fold when the pipeline is compiled.
+pub const FC_ROWS: u64 = 0;
+pub const FC_BLOCKS_PER_ROW: u64 = 1;
+
+const GEMV_SPECIALIZATION: &str = r#"
+constant uint fc_rows [[function_constant(0)]];
+constant uint fc_bpr [[function_constant(1)]];
+constant bool fc_has_rows = is_function_constant_defined(fc_rows);
+constant bool fc_has_bpr = is_function_constant_defined(fc_bpr);
+"#;
+
 /// Name of the kernel [`gemv_packed`] emits for `codec` with `p`.
 pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
     format!("gemvgen_{:?}_r{}", codec.format, p.rows_per_sg)
@@ -303,7 +316,7 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let loop_src = gemv_loop(codec, p, &dec);
     let store_row = |acc: &str, row: &str, ind: &str| {
         format!(
-            "{ind}float a = {acc};\n{ind}if (p.has_bias != 0) a += bias[{row}];\n{ind}ulong o = (ulong)batch * p.rows + {row};\n{ind}y[o] = apply_gemv_epi(a, o, p, res);\n"
+            "{ind}float a = {acc};\n{ind}if (p.has_bias != 0) a += bias[{row}];\n{ind}ulong o = (ulong)batch * n_rows + {row};\n{ind}y[o] = apply_gemv_epi(a, o, p, res);\n"
         )
     };
     // A tile codec splits the simdgroup's lanes across its `r` rows (`32 / r` lanes per row, summed by
@@ -317,14 +330,14 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
         (
             format!("const uint sl = lane % {lpr}, rl = lane / {lpr}, myrow = row0 + rl;\n    float acc0 = 0.0f;"),
             shuffles,
-            format!("sl == 0 && myrow < p.rows"),
+            format!("sl == 0 && myrow < n_rows"),
             store_row("acc0", "myrow", "        "),
         )
     } else {
         let store: String = (0..r)
             .map(|i| {
                 format!(
-                    "        if (row0 + {i} < p.rows) {{\n{}        }}\n",
+                    "        if (row0 + {i} < n_rows) {{\n{}        }}\n",
                     store_row(&format!("simd_sum_{i}"), &format!("row0 + {i}"), "            ")
                 )
             })
@@ -340,6 +353,7 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
         r#"
 {codec_msl}
 {wide_msl}
+{GEMV_SPECIALIZATION}
 kernel void {name}(
     device const uchar* w [[buffer(0)]],
     device const float* x [[buffer(1)]],
@@ -351,11 +365,13 @@ kernel void {name}(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {{
+    const uint n_rows = fc_has_rows ? fc_rows : p.rows;
+    const uint n_cols = fc_has_bpr ? fc_bpr * {be} : p.cols;
     const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    const uint blocks_per_row = p.cols / {be};
-    device const float* xb = x + (ulong)batch * p.cols;
+    if (row0 >= n_rows || batch >= p.batch_size) return;
+    const uint blocks_per_row = n_cols / {be};
+    device const float* xb = x + (ulong)batch * n_cols;
     {acc_decl}
 {loop_src}{sums}    if ({guard}) {{
 {store}    }}
@@ -385,7 +401,7 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
     let row = |i: usize, decode: &dyn Fn(&BlockRef) -> String, dots: &str, v_len: u32| {
         let br = block_ref(codec, "w", &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"));
         format!(
-            "        if (row0 + {i} < p.rows) {{\n            {}\n            float v[{v_len}];\n            {}\n{dots}        }}\n",
+            "        if (row0 + {i} < n_rows) {{\n            {}\n            float v[{v_len}];\n            {}\n{dots}        }}\n",
             br.decl,
             decode(&br)
         )
@@ -405,7 +421,7 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
             })
             .collect();
         return format!(
-            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
+            "    const uint subs = n_cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
         );
     };
     let (gdec, gseg) = (
