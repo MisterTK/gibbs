@@ -99,6 +99,48 @@ pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
         .min_by_key(|v| (v.rows_per_sg, v.kernel == GemvKernel::Gen))
 }
 
+/// Under foreign GPU load an alternative must beat the default's throughput by this fraction in every
+/// measurement round: contended timings differ from a quiet GPU's by more than the 1% tie band.
+pub const BUSY_MARGIN: f64 = 0.08;
+
+/// The variant to use from `rounds` of timings (`GB/s`, each round measuring the variants in another
+/// order). A quiet GPU takes [`choose`] over the first round. A `busy` GPU keeps `default` (the proven
+/// variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round; among
+/// those the one with the best worst-round ratio wins. `None`: no usable timing.
+pub fn decide(
+    rounds: &[Vec<(GemvVariant, f64)>],
+    default: GemvVariant,
+    busy: bool,
+) -> Option<GemvVariant> {
+    let first = rounds.first()?;
+    if !busy {
+        return choose(first);
+    }
+    let rate = |round: &[(GemvVariant, f64)], v: GemvVariant| {
+        round
+            .iter()
+            .find(|t| t.0 == v)
+            .map(|t| t.1)
+            .filter(|g| g.is_finite() && *g > 0.0)
+    };
+    let worst_ratio = |v: GemvVariant| {
+        rounds
+            .iter()
+            .map(|r| Some(rate(r, v)? / rate(r, default)?))
+            .try_fold(f64::INFINITY, |m, ratio| Some(m.min(ratio?)))
+    };
+    Some(
+        first
+            .iter()
+            .map(|t| t.0)
+            .filter(|&v| v != default)
+            .filter_map(|v| Some((v, worst_ratio(v)?)))
+            .filter(|c| c.1 >= 1.0 + BUSY_MARGIN)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(default, |c| c.0),
+    )
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Tuned {
     pub variant: GemvVariant,
@@ -282,6 +324,96 @@ mod tests {
             Some(250.0)
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn busy_gpu_keeps_the_default_unless_an_alternative_wins_every_round_by_the_margin() {
+        let (def, hand, r1, r4) = (
+            GemvVariant::generated(2),
+            GemvVariant::HAND,
+            GemvVariant::generated(1),
+            GemvVariant::generated(4),
+        );
+        let round = |d: f64, h: f64, a: f64, b: f64| vec![(hand, h), (r1, a), (def, d), (r4, b)];
+        // Quiet: plain choose() over round one, whatever round two says.
+        assert_eq!(
+            decide(&[round(100.0, 120.0, 90.0, 80.0)], def, false),
+            Some(hand)
+        );
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 120.0, 90.0, 80.0),
+                    round(100.0, 50.0, 90.0, 80.0)
+                ],
+                def,
+                false
+            ),
+            Some(hand)
+        );
+        // Busy: hand wins round one by 20% but not round two: the default stays.
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 120.0, 90.0, 80.0),
+                    round(100.0, 105.0, 90.0, 80.0)
+                ],
+                def,
+                true
+            ),
+            Some(def)
+        );
+        // Busy, 7.9% in one round is below the margin.
+        assert_eq!(
+            decide(&[round(100.0, 107.9, 90.0, 80.0)], def, true),
+            Some(def)
+        );
+        // Beats the default by >= 8% in both rounds: taken; with two such, the larger worst-round ratio.
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 108.5, 90.0, 80.0),
+                    round(100.0, 130.0, 90.0, 80.0)
+                ],
+                def,
+                true
+            ),
+            Some(hand)
+        );
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 112.0, 90.0, 140.0),
+                    round(100.0, 150.0, 90.0, 115.0)
+                ],
+                def,
+                true
+            ),
+            Some(r4)
+        );
+        // Busy and the default itself could not be timed (or is NaN): it stays.
+        assert_eq!(
+            decide(&[vec![(hand, 200.0), (r1, 90.0)]], def, true),
+            Some(def)
+        );
+        assert_eq!(
+            decide(&[vec![(hand, 200.0), (def, f64::NAN)]], def, true),
+            Some(def)
+        );
+        // A variant missing from one round cannot win.
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 120.0, 90.0, 80.0),
+                    vec![(def, 100.0), (r1, 90.0)]
+                ],
+                def,
+                true
+            ),
+            Some(def)
+        );
+        assert_eq!(decide(&[], def, true), None);
+        assert_eq!(decide(&[], def, false), None);
     }
 
     #[test]
