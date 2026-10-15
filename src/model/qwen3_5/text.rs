@@ -934,9 +934,18 @@ impl TextModel {
     /// Names of the decode program's recurrent states (Gated DeltaNet conv window and delta-rule
     /// state, one pair per linear-attention layer).
     pub(super) fn recurrent_state_names(&self) -> Vec<String> {
-        let delta = self.layers.iter().enumerate().filter(|(_, l)| matches!(l.mixer, Mixer::Delta(_)));
+        let delta = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l.mixer, Mixer::Delta(_)));
         delta
-            .flat_map(|(i, _)| [format!("layers.{i}.conv_state"), format!("layers.{i}.ssm_state")])
+            .flat_map(|(i, _)| {
+                [
+                    format!("layers.{i}.conv_state"),
+                    format!("layers.{i}.ssm_state"),
+                ]
+            })
             .collect()
     }
 
@@ -1204,7 +1213,12 @@ impl TextModel {
         &self,
         score: &[f32],
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph_impl(self.decode_max_ctx, DecodeOpts::default(), false, Some(score))
+        self.decode_graph_impl(
+            self.decode_max_ctx,
+            DecodeOpts::default(),
+            false,
+            Some(score),
+        )
     }
 
     /// The MTP head's decode step as a program: inputs `inputs_embeds` (the next token's
@@ -1729,8 +1743,12 @@ impl TextModel {
                     };
 
                     let inv_freq_name = "rope.inv_freq.default";
-                    let inv_freq_val = g.weight(inv_freq_name, vec![self.inv_freq.len()], DType::F32);
-                    w.insert(inv_freq_name.to_string(), Tensor::F32(self.inv_freq.clone()));
+                    let inv_freq_val =
+                        g.weight(inv_freq_name, vec![self.inv_freq.len()], DType::F32);
+                    w.insert(
+                        inv_freq_name.to_string(),
+                        Tensor::F32(self.inv_freq.clone()),
+                    );
                     let (rope_variant, rope_pos) = match (&rope_pos, self.mrope) {
                         (Some(rp), Some(sections)) => (
                             RopeVariant::MRope {
@@ -2177,8 +2195,9 @@ fn tiny_model_with(scale: f32, moe: Option<bool>) -> (TextModel, usize) {
         let value = |i: usize| match moe {
             None => (((i * 19 + n * 13) % 41) as f32 - 20.0) / 25.0,
             Some(_) => {
-                let h = ((i + 1) as u64 * 0x9E3779B97F4A7C15 ^ n as u64 * 0xD1B54A32D192ED03)
-                    .wrapping_mul(0x2545F4914F6CDD1D);
+                let h = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)
+                    ^ (n as u64).wrapping_mul(0xD1B54A32D192ED03))
+                .wrapping_mul(0x2545F4914F6CDD1D);
                 ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 1.6
             }
         };
@@ -2717,9 +2736,15 @@ mod tests {
             s("self_attn.k_norm.weight", vec![hd]);
             s("mlp.gate.weight", vec![experts, hidden]);
             for e in 0..experts {
-                s(&format!("mlp.experts.{e}.gate_proj.weight"), vec![ff, hidden]);
+                s(
+                    &format!("mlp.experts.{e}.gate_proj.weight"),
+                    vec![ff, hidden],
+                );
                 s(&format!("mlp.experts.{e}.up_proj.weight"), vec![ff, hidden]);
-                s(&format!("mlp.experts.{e}.down_proj.weight"), vec![hidden, ff]);
+                s(
+                    &format!("mlp.experts.{e}.down_proj.weight"),
+                    vec![hidden, ff],
+                );
             }
         }
         let sizes: std::collections::HashMap<String, usize> = specs
@@ -2727,21 +2752,33 @@ mod tests {
             .map(|(n, s)| (n.clone(), s.iter().product::<usize>()))
             .collect();
         let weights = crate::model::weights::Weights::from_f32(specs, |name| {
-            let n: u64 = name.bytes().enumerate().map(|(i, b)| (i as u64 + 1) * b as u64).sum();
+            let n: u64 = name
+                .bytes()
+                .enumerate()
+                .map(|(i, b)| (i as u64 + 1) * b as u64)
+                .sum();
             Ok((0..sizes[name])
                 .map(|i| {
-                    let h = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15) ^ n.wrapping_mul(0xD1B54A32D192ED03))
-                        .wrapping_mul(0x2545F4914F6CDD1D);
+                    let h = ((i as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15)
+                        ^ n.wrapping_mul(0xD1B54A32D192ED03))
+                    .wrapping_mul(0x2545F4914F6CDD1D);
                     ((h >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.8
                 })
                 .collect())
         })
         .unwrap();
-        (TextModel::load(&weights, &cfg, Arch::Qwen3).unwrap(), hidden)
+        (
+            TextModel::load(&weights, &cfg, Arch::Qwen3).unwrap(),
+            hidden,
+        )
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
-        let dot: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64) * (*y as f64)).sum();
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (*x as f64) * (*y as f64))
+            .sum();
         let norm = |v: &[f32]| v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
         dot / (norm(a) * norm(b)).max(1e-30)
     }
@@ -2751,7 +2788,9 @@ mod tests {
     fn moe_program_matches_host(text_model: &TextModel, hidden: usize, what: &str) {
         let (g, w) = text_model.to_decode_graph().unwrap();
         assert!(
-            g.nodes.iter().any(|n| matches!(n.op, crate::graph::Op::MoeLinear { .. })),
+            g.nodes
+                .iter()
+                .any(|n| matches!(n.op, crate::graph::Op::MoeLinear { .. })),
             "{what}: the decode graph routes through MoeLinear"
         );
         #[cfg(target_os = "macos")]
@@ -2770,25 +2809,60 @@ mod tests {
             let mut emb = vec![0.0f32; hidden];
             text_model.embed(tok, &mut emb).unwrap();
             let hid = text_model.forward_rows(
-                emb.clone(), &[[pos as u32; 3]], pos, &mut host_state, 0, usize::MAX,
-                &[], &[], false, &[], &mut Vec::new(),
+                emb.clone(),
+                &[[pos as u32; 3]],
+                pos,
+                &mut host_state,
+                0,
+                usize::MAX,
+                &[],
+                &[],
+                false,
+                &[],
+                &mut Vec::new(),
             );
             let want = text_model.logits(&hid, 1);
-            let inputs = || vec![crate::graph::Tensor::F32(emb.clone()), crate::graph::Tensor::U32(vec![pos as u32])];
+            let inputs = || {
+                vec![
+                    crate::graph::Tensor::F32(emb.clone()),
+                    crate::graph::Tensor::U32(vec![pos as u32]),
+                ]
+            };
             let on_cpu = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
             let on_cpu = on_cpu[0].as_f32().unwrap();
             let c = cosine(&want, on_cpu);
-            assert!(c >= 0.999, "{what}: step {pos}: CPU graph vs host cosine {c}");
+            assert!(
+                c >= 0.999,
+                "{what}: step {pos}: CPU graph vs host cosine {c}"
+            );
             #[cfg(target_os = "macos")]
             {
                 let on_metal = prog.run(inputs()).unwrap();
                 let on_metal = on_metal[0].as_f32().unwrap();
                 let c = cosine(&want, on_metal);
-                assert!(c >= 0.999, "{what}: step {pos}: Metal program vs host cosine {c}");
-                let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
-                assert_eq!(argmax(&want), argmax(on_metal), "{what}: step {pos}: greedy token");
+                assert!(
+                    c >= 0.999,
+                    "{what}: step {pos}: Metal program vs host cosine {c}"
+                );
+                let argmax = |v: &[f32]| {
+                    v.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .unwrap()
+                        .0
+                };
+                assert_eq!(
+                    argmax(&want),
+                    argmax(on_metal),
+                    "{what}: step {pos}: greedy token"
+                );
             }
-            tok = want.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+            tok = want
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0 as u32;
         }
     }
 

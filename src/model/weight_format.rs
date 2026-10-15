@@ -1308,6 +1308,22 @@ mod tests {
         );
     }
 
+    /// Gate thresholds: max-speed KL <= 0.10 and top-1 >= 0.90; low-bit-native KL <= 0.01 (top-1 >= 0.99);
+    /// a NaN KL never passes; an explicit `max_kl` overrides the KL limit only.
+    #[test]
+    fn gate_thresholds_per_policy() {
+        let r = |mean_kl: f64, top1: f64| GateReport { mean_kl, top1, tokens: 8 };
+        use ReencodePolicy::*;
+        assert!(gate_passes(MaxSpeed, None, &r(0.10, 0.90)));
+        assert!(!gate_passes(MaxSpeed, None, &r(0.1001, 0.95)));
+        assert!(!gate_passes(MaxSpeed, None, &r(0.01, 0.8999)));
+        assert!(gate_passes(LowBitNative, None, &r(0.01, 0.99)));
+        assert!(!gate_passes(LowBitNative, None, &r(0.011, 1.0)));
+        assert!(!gate_passes(MaxSpeed, None, &r(f64::NAN, 1.0)));
+        assert!(gate_passes(LowBitNative, Some(0.05), &r(0.04, 0.99)));
+        assert!(!gate_passes(MaxSpeed, Some(0.02), &r(0.05, 1.0)));
+
+    }
     use crate::model::graph_lm::GraphLmConfig;
 
     /// The quality floor on real weights: f16 and Q8_0 pass it, 4-bit NVFP4 and the LUT do not.

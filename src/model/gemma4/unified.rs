@@ -12,6 +12,10 @@ use crate::model::image::ImageBuffer;
 use crate::model::nn::layer_norm;
 use crate::model::weights::{Mat, Weights};
 use serde_json::Value;
+use crate::graph::{DType, Graph, Op, Tensor, ValueId, Weights as GWeights};
+use crate::hardware::PlacementMode;
+use crate::model::bf16_to_f32;
+use crate::model::vision_graph::{Gb, ProgramCache};
 
 /// `nn.LayerNorm` default eps.
 const LN_EPS: f32 = 1e-5;
@@ -20,6 +24,21 @@ const LN_EPS: f32 = 1e-5;
 fn project(mut x: Vec<f32>, rows: usize, proj: &Mat, eps: f32) -> Vec<f32> {
     rms_norm(&mut x, proj.cols, None, eps);
     linear(&x, rows, proj)
+}
+
+/// `project` as nodes under `tag`: the unit-gain RMSNorm over `proj.cols`, then the projection.
+fn project_node(b: &mut Gb, tag: &str, x: ValueId, rows: usize, proj: &Mat, eps: f32) -> ValueId {
+    let x = b.rms(&format!("{tag}.embed_norm"), x, vec![1.0; proj.cols], eps, vec![rows, proj.cols]);
+    let w = b.mat(&format!("{tag}.embed_proj.weight"), proj);
+    b.linear(&format!("{tag}.embed_proj"), x, w, None, rows, proj.rows)
+}
+
+/// `nn.LayerNorm` (default eps) over rows of `x [n, width]` with the checkpoint's `(gamma, beta)`.
+fn layer_norm_node(b: &mut Gb, name: &str, x: ValueId, ln: &(Vec<f32>, Vec<f32>), n: usize) -> ValueId {
+    let (gamma, beta) = ln;
+    let w = b.f32w(&format!("{name}.weight"), vec![gamma.len()], gamma.clone());
+    let bias = b.f32w(&format!("{name}.bias"), vec![beta.len()], beta.clone());
+    b.op(name, Op::LayerNorm { eps: LN_EPS }, &[x, w, bias], vec![n, gamma.len()])
 }
 
 pub struct VisionEmbedder {
@@ -36,6 +55,8 @@ pub struct VisionEmbedder {
     pos: Mat,
     pos_ln: (Vec<f32>, Vec<f32>),
     proj: Mat,
+    /// Metal programs (set by [`Self::on_gpu`]), one per patch count; `None` = the host forward.
+    gpu: Option<ProgramCache>,
 }
 
 impl VisionEmbedder {
@@ -89,7 +110,76 @@ impl VisionEmbedder {
             pos,
             pos_ln: ln("pos_norm", d)?,
             proj,
+            gpu: None,
         })
+    }
+}
+
+impl VisionEmbedder {
+    /// Runs the embedder as Metal graph programs on `mode` (the default is the host forward).
+    pub fn on_gpu(mut self, mode: PlacementMode) -> Self {
+        self.gpu = Some(ProgramCache::new(mode));
+        self
+    }
+
+    /// The x / y position-table rows of the `n` patches of a grid `gw` wide, as f32 `[n, d]` each
+    /// (checkpoint row lookups).
+    fn pos_rows(&self, n: usize, gw: usize) -> (Vec<f32>, Vec<f32>) {
+        let d = self.dense.rows;
+        let (mut xs, mut ys) = (Vec::with_capacity(n * d), Vec::with_capacity(n * d));
+        for i in 0..n {
+            xs.extend(self.pos.row(i % gw)[..d].iter().map(|&v| bf16_to_f32(v)));
+            ys.extend(self.pos.row(i / gw)[d..].iter().map(|&v| bf16_to_f32(v)));
+        }
+        (xs, ys)
+    }
+
+    /// The host forward (`--backend cpu`): `[n, patch px]` patches in a grid `gw` wide → soft tokens.
+    fn forward_cpu(&self, pix: &[f32], n: usize, gw: usize) -> Vec<f32> {
+        crate::hardware::cpu_compute::enter("gemma4::unified::vision");
+        let (pd, d) = (pix.len() / n, self.dense.rows);
+        let x = layer_norm(pix, n, pd, &self.ln1.0, &self.ln1.1, LN_EPS);
+        let mut x = linear(&x, n, &self.dense);
+        for row in x.chunks_exact_mut(d) {
+            row.iter_mut().zip(&self.dense_b).for_each(|(v, b)| *v += b);
+        }
+        let mut x = layer_norm(&x, n, d, &self.ln2.0, &self.ln2.1, LN_EPS);
+        let (xs, ys) = self.pos_rows(n, gw);
+        x.iter_mut().zip(xs.iter().zip(&ys)).for_each(|(v, (a, b))| *v += a + b);
+        let x = layer_norm(&x, n, d, &self.pos_ln.0, &self.pos_ln.1, LN_EPS);
+        project(x, n, &self.proj, self.eps)
+    }
+
+    /// The embedder as a graph for `n` patches. Inputs: `patches [n, patch px]` and the x / y
+    /// position rows `[n, d]`. Output: `[n, text_hidden]` soft tokens.
+    fn build_graph(&self, n: usize) -> (Graph, GWeights) {
+        let (pd, d) = (self.ln1.0.len(), self.dense.rows);
+        let mut b = Gb::new();
+        let pix = b.input("patches", vec![n, pd], DType::F32);
+        let xe = b.input("pos_x", vec![n, d], DType::F32);
+        let ye = b.input("pos_y", vec![n, d], DType::F32);
+        let x = layer_norm_node(&mut b, "vision.patch_ln1", pix, &self.ln1, n);
+        let w = b.mat("vision.patch_dense.weight", &self.dense);
+        let bias = b.f32w("vision.patch_dense.bias", vec![d], self.dense_b.clone());
+        let x = b.linear("vision.patch_dense", x, w, Some(bias), n, d);
+        let x = layer_norm_node(&mut b, "vision.patch_ln2", x, &self.ln2, n);
+        let x = b.add("vision.pos_x", x, xe, vec![n, d]);
+        let x = b.add("vision.pos_y", x, ye, vec![n, d]);
+        let x = layer_norm_node(&mut b, "vision.pos_norm", x, &self.pos_ln, n);
+        let out = project_node(&mut b, "vision", x, n, &self.proj, self.eps);
+        b.finish(&[out])
+    }
+
+    /// Runs the embedder as a Metal program (compiled once per patch count).
+    fn forward_gpu(&self, gpu: &ProgramCache, pix: &[f32], n: usize, gw: usize) -> Result<Vec<f32>, String> {
+        let prog = gpu
+            .get(&[n], || Ok(self.build_graph(n)))
+            .map_err(|e| format!("vision: {e}"))?;
+        let (xs, ys) = self.pos_rows(n, gw);
+        let out = prog
+            .lock()
+            .run(vec![Tensor::F32(pix.to_vec()), Tensor::F32(xs), Tensor::F32(ys)])?;
+        out.into_iter().next().ok_or("vision program returned nothing")?.into_f32()
     }
 }
 
@@ -130,21 +220,11 @@ impl Encoder for VisionEmbedder {
                 }
             }
         }
-        let x = layer_norm(&pix, n, pd, &self.ln1.0, &self.ln1.1, LN_EPS);
-        let mut x = linear(&x, n, &self.dense);
-        let d = self.dense.rows;
-        for row in x.chunks_exact_mut(d) {
-            row.iter_mut().zip(&self.dense_b).for_each(|(v, b)| *v += b);
-        }
-        let mut x = layer_norm(&x, n, d, &self.ln2.0, &self.ln2.1, LN_EPS);
-        for (i, row) in x.chunks_exact_mut(d).enumerate() {
-            let (xe, ye) = (&self.pos.row(i % gw)[..d], &self.pos.row(i / gw)[d..]);
-            for ((v, &a), &b) in row.iter_mut().zip(xe).zip(ye) {
-                *v += crate::model::bf16_to_f32(a) + crate::model::bf16_to_f32(b);
-            }
-        }
-        let x = layer_norm(&x, n, d, &self.pos_ln.0, &self.pos_ln.1, LN_EPS);
-        Ok((project(x, n, &self.proj, self.eps), n))
+        let rows = match &self.gpu {
+            Some(gpu) => self.forward_gpu(gpu, &pix, n, gw)?,
+            None => self.forward_cpu(&pix, n, gw),
+        };
+        Ok((rows, n))
     }
 }
 
@@ -154,6 +234,8 @@ pub struct AudioEmbedder {
     max_tokens: usize,
     eps: f32,
     proj: Mat,
+    /// Metal programs (set by [`Self::on_gpu`]), one per token count; `None` = the host forward.
+    gpu: Option<ProgramCache>,
 }
 
 impl AudioEmbedder {
@@ -176,7 +258,34 @@ impl AudioEmbedder {
             max_tokens: processor["audio_seq_length"].as_u64().unwrap_or(750) as usize,
             eps: ac["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
             proj,
+            gpu: None,
         })
+    }
+}
+
+impl AudioEmbedder {
+    /// Runs the embedder as Metal graph programs on `mode` (the default is the host forward).
+    pub fn on_gpu(mut self, mode: PlacementMode) -> Self {
+        self.gpu = Some(ProgramCache::new(mode));
+        self
+    }
+
+    /// `n` frames of `frame` samples (`n * frame` of `x`) to soft tokens.
+    fn forward(&self, x: Vec<f32>, n: usize) -> Result<Vec<f32>, String> {
+        let Some(gpu) = &self.gpu else {
+            crate::hardware::cpu_compute::enter("gemma4::unified::audio");
+            return Ok(project(x, n, &self.proj, self.eps));
+        };
+        let prog = gpu
+            .get(&[n], || {
+                let mut b = Gb::new();
+                let frames = b.input("frames", vec![n, self.frame], DType::F32);
+                let out = project_node(&mut b, "audio", frames, n, &self.proj, self.eps);
+                Ok(b.finish(&[out]))
+            })
+            .map_err(|e| format!("audio: {e}"))?;
+        let out = prog.lock().run(vec![Tensor::F32(x)])?;
+        out.into_iter().next().ok_or("audio program returned nothing")?.into_f32()
     }
 }
 
@@ -209,7 +318,7 @@ impl Encoder for AudioEmbedder {
         let (wav, rate, n) = self.tokens(bytes)?;
         let mut x = resample(&wav, rate, self.rate);
         x.resize(n * self.frame, 0.0); // zero-pad the last frame
-        Ok((project(x, n, &self.proj, self.eps), n))
+        Ok((self.forward(x, n)?, n))
     }
 }
 
@@ -225,7 +334,7 @@ mod tests {
     /// A 2-layer `gemma4_unified` (sliding + full attention with `attention_k_eq_v`, image blocks
     /// bidirectional) with pseudo-random weights: the real checkpoint's layout and code paths at
     /// toy size.
-    fn tiny() -> Gemma4 {
+    fn tiny_weights() -> Weights {
         let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
         let mut t = |n: &str, s: &[usize]| specs.push((n.to_string(), s.to_vec()));
         let p = "model.language_model";
@@ -264,7 +373,7 @@ mod tests {
         t(&format!("{v}.pos_embedding"), &[1120, 2, H]);
         t("model.embed_vision.embedding_projection.weight", &[H, H]);
         t("model.embed_audio.embedding_projection.weight", &[H, 640]);
-        let w = Weights::from_f32(specs.clone(), |name| {
+        Weights::from_f32(specs.clone(), |name| {
             let (_, shape) = specs.iter().find(|(n, _)| n == name).unwrap();
             let mut s = name
                 .bytes()
@@ -283,7 +392,11 @@ mod tests {
                 })
                 .collect())
         })
-        .unwrap();
+        .unwrap()
+    }
+
+    fn tiny() -> Gemma4 {
+        let w = tiny_weights();
         let tc = serde_json::json!({
             "hidden_size": H, "num_hidden_layers": 2, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 16, "global_head_dim": 32,
@@ -396,5 +509,39 @@ mod tests {
             max_diff(&one, &causal) > 1e-3,
             "image block mask had no effect"
         );
+    }
+
+    /// The Metal embedders (LayerNorm / dense / position adds, unit-gain RMSNorm, projection) match the
+    /// host forwards for a photo and a resampled clip.
+    #[test]
+    fn metal_embedders_match_the_host_forward() {
+        use crate::hardware::{available_devices, cpu_compute, Device};
+        if !available_devices().contains(&Device::Metal) {
+            println!("SKIP: no Metal device");
+            return;
+        }
+        let _allow = cpu_compute::allow();
+        let w = tiny_weights();
+        let mode = PlacementMode::Pin(Device::Metal);
+        let vc =
+            serde_json::json!({"patch_size": 16, "pooling_kernel_size": 3, "model_patch_size": 48});
+        let processor = serde_json::json!({"image_processor": {"max_soft_tokens": 280}});
+        let load_v = || VisionEmbedder::load(&w, &vc, &processor).unwrap();
+        let load_a = || AudioEmbedder::load(&w, &Value::Null, &processor).unwrap();
+        let (cpu_v, gpu_v) = (load_v(), load_v().on_gpu(mode));
+        let (cpu_a, gpu_a) = (load_a(), load_a().on_gpu(mode));
+        let rel = |want: &[f32], got: &[f32]| {
+            assert_eq!(want.len(), got.len());
+            let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+            max_diff(want, got) / scale
+        };
+        let img = photo();
+        let ((want, n), (got, m)) = (cpu_v.encode(&img).unwrap(), gpu_v.encode(&img).unwrap());
+        assert_eq!(n, m);
+        assert!(rel(&want, &got) < 1e-3, "vision rel err {}", rel(&want, &got));
+        let clip = wav(22_050, 30_000);
+        let ((want, n), (got, m)) = (cpu_a.encode(&clip).unwrap(), gpu_a.encode(&clip).unwrap());
+        assert_eq!((n, m), (35, 35));
+        assert!(rel(&want, &got) < 1e-3, "audio rel err {}", rel(&want, &got));
     }
 }

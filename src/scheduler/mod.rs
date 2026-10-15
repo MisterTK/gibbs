@@ -15,6 +15,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+/// Prefix of the error that ends a sequence aborted by [`Scheduler::swap_model`]; the server
+/// answers such a request with 503 (retry) rather than 500.
+pub const MODEL_SWAPPED: &str = "model swapped to ";
+
 /// Label for CPU execution, shared by the banner, logs, and TUI.
 pub fn cpu_backend_label() -> String {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -1255,7 +1259,7 @@ impl ContinuousBatchScheduler {
         self.fail_all(
             &mut active,
             &mut waiting,
-            &format!("model swapped to {model_id}"),
+            &format!("{MODEL_SWAPPED}{model_id}"),
         );
         *self.tokenizer.write() = Arc::new(model.tokenizer());
         *self.drafter.write() = builtin_drafter(Some(&model));

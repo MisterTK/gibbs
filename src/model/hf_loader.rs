@@ -61,6 +61,15 @@ pub struct HfConfigJson {
     pub weight_bits: Option<u32>,
     #[serde(default)]
     pub input_bits: Option<u32>,
+    /// Granite (`model_type: granite`): attention scale, embedding / residual multipliers, logit divisor.
+    #[serde(default)]
+    pub attention_multiplier: Option<f32>,
+    #[serde(default)]
+    pub embedding_multiplier: Option<f32>,
+    #[serde(default)]
+    pub residual_multiplier: Option<f32>,
+    #[serde(default)]
+    pub logits_scaling: Option<f32>,
 }
 
 impl HfConfigJson {

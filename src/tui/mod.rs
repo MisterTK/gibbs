@@ -31,6 +31,7 @@ use crate::model::tokenizer::Tokenizer;
 use crate::model::reencode::ReencodeProgress;
 use crate::model::weight_format::{
     load_causal_lm_for, reencode_override, set_reencode_override, Choice, ReencodeConfig,
+    ReencodePolicy, VariantPolicy,
 };
 use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, ExecutableModel, SamplingParams};
 use crate::telemetry::{EngineTelemetry, KernelRow};
@@ -68,6 +69,61 @@ const SPARK_SECONDS: usize = 120;
 const STREAM_UPDATE: Duration = Duration::from_millis(30);
 /// A sampled kernel profile is at least this old before the TUI asks for the next.
 const PROFILE_EVERY: Duration = Duration::from_secs(5);
+
+/// The slash commands that take arguments, parsed without touching the app.
+#[derive(Debug, PartialEq)]
+enum SlashCmd {
+    /// `None` cycles to the next policy.
+    Reencode(Option<ReencodePolicy>),
+    Variant(Option<VariantPolicy>),
+    Profile(ProfileArg),
+    Placement,
+}
+
+/// `/profile` arguments.
+#[derive(Debug, PartialEq)]
+enum ProfileArg {
+    Status,
+    On,
+    Off,
+    /// `None` cycles the column.
+    Sort(Option<crate::telemetry::KernelSort>),
+}
+
+/// Parses `/reencode`, `/variant`, `/profile` and `/placement` lines; `None` for any other command.
+fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
+    let (cmd, rest) = raw.split_once(char::is_whitespace).unwrap_or((raw, ""));
+    let arg = rest.trim();
+    Some(match cmd {
+        "/placement" => Ok(SlashCmd::Placement),
+        "/reencode" if arg.is_empty() => Ok(SlashCmd::Reencode(None)),
+        "/reencode" => arg.parse().map(|p| SlashCmd::Reencode(Some(p))).map_err(|_| {
+            format!("unknown reencode policy '{arg}'; valid: max-speed, low-bit-native, bit-exact")
+        }),
+        "/variant" if arg.is_empty() => Ok(SlashCmd::Variant(None)),
+        "/variant" => arg.parse().map(|p| SlashCmd::Variant(Some(p))).map_err(|_| {
+            format!("unknown variant policy '{arg}'; valid: fastest, fastest-4bit, best-quality")
+        }),
+        "/profile" => parse_profile(arg).map(SlashCmd::Profile),
+        _ => return None,
+    })
+}
+
+fn parse_profile(arg: &str) -> Result<ProfileArg, String> {
+    let (word, col) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    match (word, col.trim()) {
+        ("", _) => Ok(ProfileArg::Status),
+        ("on" | "1" | "true", _) => Ok(ProfileArg::On),
+        ("off" | "0" | "false", _) => Ok(ProfileArg::Off),
+        ("sort", "") => Ok(ProfileArg::Sort(None)),
+        ("sort", c) => crate::telemetry::KernelSort::parse(c)
+            .map(|s| ProfileArg::Sort(Some(s)))
+            .ok_or_else(|| format!("unknown sort column '{c}'; valid: time, bandwidth, share")),
+        (w, _) => Err(format!(
+            "unknown /profile argument '{w}'; use on, off, or sort <time|bandwidth|share>"
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
@@ -364,6 +420,8 @@ pub struct TuiApp {
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::scheduler::TokenLogprobInfo>>,
     pub roofline_probe_result: Option<String>,
     pub show_settings_modal: bool,
+    /// `/placement` modal: the placement rows and the first visible line (Esc closes).
+    placement_modal: Option<(Vec<crate::graph::placement::PlacementRow>, usize)>,
     pub reencode_policy: crate::model::weight_format::ReencodePolicy,
     pub variant_policy: crate::model::weight_format::VariantPolicy,
     pub ctx_limit: usize,
@@ -373,6 +431,8 @@ pub struct TuiApp {
     profile_sampling: bool,
     /// The last per-kind kernel profile and when it was taken.
     kernel_profile: Option<(Instant, Vec<KernelRow>)>,
+    /// Column the Kernels table is ordered by (`s` cycles it, `/profile sort <col>` sets it).
+    kernel_sort: crate::telemetry::KernelSort,
     /// When this app last asked the engine for a profile sample.
     profile_asked: Option<Instant>,
     /// Set by every frame that draws the Kernels panel.
@@ -463,6 +523,7 @@ impl TuiApp {
             gemm_peak_gflops,
             gemm_top,
             show_settings_modal: false,
+            placement_modal: None,
             reencode_policy: crate::model::weight_format::ReencodePolicy::MaxSpeed,
             variant_policy: crate::model::weight_format::VariantPolicy::Fastest,
             ctx_limit: 8192,
@@ -470,6 +531,7 @@ impl TuiApp {
             frame_log_path: None,
             profile_sampling: false,
             kernel_profile: None,
+            kernel_sort: crate::telemetry::KernelSort::default(),
             profile_asked: None,
             kernels_visible: std::cell::Cell::new(false),
             device_status: DeviceStatus::default(),
@@ -561,18 +623,11 @@ impl TuiApp {
                 self.roofline_probe_result = probe.as_ref().ok().cloned();
                 Some(probe)
             }
-            "/reencode" | "/variant" => Some(self.change_policy(cmd, rest.trim())),
-            "/profile" => {
-                match rest.trim() {
-                    "on" | "1" | "true" => self.profile_sampling = true,
-                    "off" | "0" | "false" => self.profile_sampling = false,
-                    _ => {}
-                }
-                Some(Ok(format!(
-                    "Kernel profiling is {} (use /profile on|off): while the KERNELS panel shows, one decode token every 5 s is timed step by step into it",
-                    if self.profile_sampling { "ON" } else { "OFF" }
-                )))
-            }
+            "/reencode" | "/variant" | "/profile" | "/placement" => Some(
+                parse_slash(&raw)
+                    .unwrap_or_else(|| Err(format!("unknown command '{cmd}'")))
+                    .and_then(|c| self.run_slash(c, &raw)),
+            ),
             "/settings" => {
                 self.show_settings_modal = !self.show_settings_modal;
                 Some(Ok(format!(
@@ -581,7 +636,6 @@ impl TuiApp {
                 )))
             }
             "/bench" => Some(self.start_bench()),
-            "/placement" => Some(self.placement_report(&raw)),
             "/quant" => {
                 Some(Ok(format!(
                     "MODEL QUANTIZATION:\n\
@@ -605,7 +659,7 @@ impl TuiApp {
                      · /reencode [max-speed|low-bit-native|bit-exact] : Set the weight re-encode policy (no argument cycles) and reload the active model under it\n\
                      · /variant [fastest|fastest-4bit|best-quality] : Set the variant policy of the picker and downloads (no argument cycles) and reload the active model\n\
                      · /settings  : Show the policy settings modal (F4) and the current policies\n\
-                     · /profile on|off : Sample one decode token every 5 s, step by step, into the KERNELS panel\n\
+                     · /profile on|off|sort <time|bandwidth|share> : Sample one decode token every 5 s, step by step, into the KERNELS panel; sort its rows (key s cycles)\n\
                      · /bench     : Benchmark the loaded model on Metal (128 tokens x 3 runs): tok/s, roofline % and where each token's time goes; refuses while generating\n\
                      · /placement : Where every graph node of the loaded model runs (op, device, avenue): 100% Metal, or the CPU ops\n\
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
@@ -676,42 +730,59 @@ impl TuiApp {
         }
     }
 
-    /// `/reencode [policy]` and `/variant [policy]`: the named policy, else the next one in the
-    /// cycle. It is saved to the settings file and the loaded model is reloaded under it.
-    fn change_policy(&mut self, cmd: &str, arg: &str) -> Result<String, String> {
-        use crate::model::weight_format::{ReencodePolicy as R, VariantPolicy as V};
+    /// Runs a parsed slash command.
+    fn run_slash(&mut self, cmd: SlashCmd, prompt: &str) -> Result<String, String> {
+        match cmd {
+            SlashCmd::Placement => self.placement_report(prompt),
+            SlashCmd::Reencode(p) => self.set_reencode(p),
+            SlashCmd::Variant(p) => self.set_variant(p),
+            SlashCmd::Profile(a) => {
+                match a {
+                    ProfileArg::Status => {}
+                    ProfileArg::On => self.profile_sampling = true,
+                    ProfileArg::Off => self.profile_sampling = false,
+                    ProfileArg::Sort(s) => {
+                        self.kernel_sort = s.unwrap_or_else(|| self.kernel_sort.next())
+                    }
+                }
+                Ok(format!(
+                    "Kernel profiling is {} (use /profile on|off): while the KERNELS panel shows, one decode token every 5 s is timed step by step into it; sorted by {} (/profile sort time|bandwidth|share, or s)",
+                    if self.profile_sampling { "ON" } else { "OFF" },
+                    self.kernel_sort.name()
+                ))
+            }
+        }
+    }
+
+    /// `/reencode [policy]`: the named policy, else the next one in the cycle. It is saved to the
+    /// settings file and the loaded model is reloaded under it.
+    fn set_reencode(&mut self, policy: Option<ReencodePolicy>) -> Result<String, String> {
+        use ReencodePolicy as R;
+        let next = policy.unwrap_or(match self.reencode_policy {
+            R::MaxSpeed => R::LowBitNative,
+            R::LowBitNative => R::BitExact,
+            R::BitExact => R::MaxSpeed,
+        });
+        self.reencode_policy = next;
         let mut s = settings::load_settings();
-        let value = if cmd == "/reencode" {
-            let next = match arg {
-                "" => match self.reencode_policy {
-                    R::MaxSpeed => R::LowBitNative,
-                    R::LowBitNative => R::BitExact,
-                    R::BitExact => R::MaxSpeed,
-                },
-                a => a.parse().map_err(|_| {
-                    format!("unknown reencode policy '{a}'; valid: max-speed, low-bit-native, bit-exact")
-                })?,
-            };
-            self.reencode_policy = next;
-            s.reencode = next.name().to_string();
-            next.name()
-        } else {
-            let next = match arg {
-                "" => match self.variant_policy {
-                    V::Fastest => V::Fastest4Bit,
-                    V::Fastest4Bit => V::BestQuality,
-                    V::BestQuality => V::Fastest,
-                },
-                a => a.parse().map_err(|_| {
-                    format!("unknown variant policy '{a}'; valid: fastest, fastest-4bit, best-quality")
-                })?,
-            };
-            self.variant_policy = next;
-            s.variant = next.name().to_string();
-            next.name()
-        };
+        s.reencode = next.name().to_string();
         settings::save_settings(&s)?;
-        Ok(self.reload_for(cmd.trim_start_matches('/'), value))
+        Ok(self.reload_for("reencode", next.name()))
+    }
+
+    /// `/variant [policy]`: as [`Self::set_reencode`], for the variant policy.
+    fn set_variant(&mut self, policy: Option<VariantPolicy>) -> Result<String, String> {
+        use VariantPolicy as V;
+        let next = policy.unwrap_or(match self.variant_policy {
+            V::Fastest => V::Fastest4Bit,
+            V::Fastest4Bit => V::BestQuality,
+            V::BestQuality => V::Fastest,
+        });
+        self.variant_policy = next;
+        let mut s = settings::load_settings();
+        s.variant = next.name().to_string();
+        settings::save_settings(&s)?;
+        Ok(self.reload_for("variant", next.name()))
     }
 
     /// The reply to a changed setting. A loaded model is reloaded so the setting takes effect now;
@@ -810,7 +881,9 @@ impl TuiApp {
             .placement_summary()
             .ok_or("the loaded model runs no graph program, so it has no placement to explain")?;
         let table = placement_table(&rows);
-        match placement_verdict(&rows) {
+        let verdict = placement_verdict(&rows);
+        self.placement_modal = Some((rows, 0));
+        match verdict {
             Ok(all_gpu) => Ok(format!("{table}\n{all_gpu}")),
             Err(cpu_ops) => {
                 self.push_entry(prompt.to_string(), Kind::Text, table);
@@ -1711,6 +1784,21 @@ impl TuiApp {
                 return false;
             }
         }
+        if self.placement_modal.is_some() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                self.placement_modal = None;
+            } else if let Some((rows, scroll)) = &mut self.placement_modal {
+                let last = rows.len() + 2;
+                match key.code {
+                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => *scroll = (*scroll + 1).min(last),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                    KeyCode::PageDown => *scroll = (*scroll + 10).min(last),
+                    _ => {}
+                }
+            }
+            return false;
+        }
         if self.detail.is_some() && self.focus != Focus::Picker {
             match (self.detail, key.code) {
                 (_, KeyCode::Esc) => {
@@ -1848,6 +1936,7 @@ impl TuiApp {
                     self.picker.open(&self.model_id());
                     self.focus = Focus::Picker;
                 }
+                KeyCode::Char('s') => self.kernel_sort = self.kernel_sort.next(),
                 KeyCode::Char('k') => self.scroll_console(KeyCode::Up),
                 KeyCode::Char('j') => self.scroll_console(KeyCode::Down),
                 code => self.scroll_console(code),
@@ -2941,7 +3030,7 @@ mod tests {
             assert!(last.output.ends_with("100% Metal"), "{}", last.output);
         } else {
             assert_eq!(last.kind, Kind::Error);
-            assert!(last.output.starts_with("CPU ops"), "{}", last.output);
+            assert!(last.output.contains("CPU node"), "{}", last.output);
         }
     }
 
@@ -2975,8 +3064,76 @@ mod tests {
         });
         let app = TuiApp::new(telemetry, Arc::new(PagedKVPool::new(64)));
         let text = lines_of(&snapshot::render_buffer(&app, 120, 40)).join("\n");
-        assert!(text.contains("■0.00 ms"), "{text}");
+        assert!(text.contains("■0.000 ms"), "{text}");
         assert!(!text.contains("■-"), "{text}");
+    }
+
+    /// `/profile sort <col>` and `s` pick the Kernels table order; the panel follows it.
+    #[test]
+    fn kernels_table_follows_the_sort_column() {
+        use crate::telemetry::KernelSort;
+        let _g = truecolor();
+        let mut app = snapshot::fixture_app();
+        let pos = |app: &TuiApp, kind: &str| {
+            let text = lines_of(&snapshot::render_buffer(app, 160, 50)).join("\n");
+            assert!(text.contains("µs▼") || text.contains("GB/s▼") || text.contains("%gpu▼"));
+            text.find(kind).unwrap_or_else(|| panic!("no {kind}\n{text}"))
+        };
+        // By time RmsNorm (410 µs) precedes CachedAttention (260 µs); by bandwidth it follows.
+        assert_eq!(app.kernel_sort, KernelSort::Time);
+        assert!(pos(&app, "RmsNorm") < pos(&app, "CachedAtt"));
+        type_and_run(&mut app, "/profile sort bandwidth");
+        assert_eq!(app.kernel_sort, KernelSort::Bandwidth);
+        assert!(pos(&app, "CachedAtt") < pos(&app, "RmsNorm"));
+        type_and_run(&mut app, "/profile sort nope");
+        assert_eq!(app.history.last().unwrap().kind, Kind::Error);
+        assert_eq!(app.kernel_sort, KernelSort::Bandwidth);
+        app.focus = Focus::Dashboard;
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.kernel_sort, KernelSort::GpuShare);
+    }
+
+    #[test]
+    fn slash_commands_parse_without_an_app() {
+        use crate::telemetry::KernelSort as K;
+        let ok = |s: &str| parse_slash(s).expect("a parsed command").expect("valid arguments");
+        let err = |s: &str| parse_slash(s).expect("a parsed command").expect_err("invalid arguments");
+        assert_eq!(ok("/placement"), SlashCmd::Placement);
+        assert_eq!(ok("/reencode"), SlashCmd::Reencode(None));
+        assert_eq!(ok("/reencode  bit-exact "), SlashCmd::Reencode(Some(ReencodePolicy::BitExact)));
+        assert_eq!(ok("/variant"), SlashCmd::Variant(None));
+        assert_eq!(ok("/variant fastest-4bit"), SlashCmd::Variant(Some(VariantPolicy::Fastest4Bit)));
+        assert_eq!(ok("/profile"), SlashCmd::Profile(ProfileArg::Status));
+        assert_eq!(ok("/profile on"), SlashCmd::Profile(ProfileArg::On));
+        assert_eq!(ok("/profile off"), SlashCmd::Profile(ProfileArg::Off));
+        assert_eq!(ok("/profile sort"), SlashCmd::Profile(ProfileArg::Sort(None)));
+        assert_eq!(ok("/profile sort bw"), SlashCmd::Profile(ProfileArg::Sort(Some(K::Bandwidth))));
+        assert!(err("/reencode turbo").contains("valid: max-speed"));
+        assert!(err("/variant best").contains("valid: fastest"));
+        assert!(err("/profile sort size").contains("'size'"));
+        assert!(err("/profile xyz").contains("'xyz'"));
+        assert_eq!(parse_slash("/help"), None);
+    }
+
+    /// The documented `/reencode` and `/variant` arguments are exactly the names that parse.
+    #[test]
+    fn policy_slash_arguments_parse_exactly_the_documented_names() {
+        use crate::model::weight_format::{ReencodePolicy as R, VariantPolicy as V};
+        for (s, p) in [("max-speed", R::MaxSpeed), ("low-bit-native", R::LowBitNative), ("bit-exact", R::BitExact)] {
+            assert_eq!(s.parse::<R>().ok(), Some(p));
+            assert_eq!(p.name(), s);
+        }
+        for (s, p) in [("fastest", V::Fastest), ("fastest-4bit", V::Fastest4Bit), ("best-quality", V::BestQuality)] {
+            assert_eq!(s.parse::<V>().ok(), Some(p));
+            assert_eq!(p.name(), s);
+        }
+        let mut app = TuiApp::new(EngineTelemetry::new(), Arc::new(PagedKVPool::new(64)));
+        for bad in ["/reencode turbo", "/variant best", "/profile sort size"] {
+            type_and_run(&mut app, bad);
+            let e = app.history.last().unwrap();
+            assert_eq!(e.kind, Kind::Error, "{bad}: {}", e.output);
+        }
+        assert!(app.load.is_none());
     }
 
     /// `/help` and the unknown-command text list every command.
@@ -3066,7 +3223,10 @@ mod tests {
                 for title in ["ROOFLINE", "GAP", "TOKENS", "LATENCY"] {
                     assert!(text.contains(title), "{w}x{h}: no {title}\n{text}");
                 }
-                assert!(text.contains("to 90%: -1.07 ms"), "{w}x{h}: gap line\n{text}");
+                assert!(
+                    text.contains("to 90%") && text.contains("-1.07 ms"),
+                    "{w}x{h}: gap line\n{text}"
+                );
             }
             if w >= 160 && h >= 50 {
                 for want in ["KERNELS", "GemvPacked", "codec-bench ✓ · tune 31/31"] {

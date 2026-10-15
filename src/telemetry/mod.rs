@@ -70,8 +70,70 @@ pub struct KernelRow {
     pub pct: f64,
 }
 
-/// EWMA weight of the newest token in [`GapStats`].
-const GAP_ALPHA: f32 = 0.1;
+/// Column the Kernels panel orders [`KernelRow`]s by, highest first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KernelSort {
+    /// Summed GPU time of the kind (µs).
+    #[default]
+    Time,
+    /// Operand bytes over that time (GB/s).
+    Bandwidth,
+    /// Share of the token's GPU time (%).
+    GpuShare,
+}
+
+impl KernelSort {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Time => Self::Bandwidth,
+            Self::Bandwidth => Self::GpuShare,
+            Self::GpuShare => Self::Time,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "time" | "us" | "µs" => Some(Self::Time),
+            "bandwidth" | "bw" | "gbps" | "gb/s" => Some(Self::Bandwidth),
+            "share" | "gpu" | "pct" | "%" => Some(Self::GpuShare),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Bandwidth => "bandwidth",
+            Self::GpuShare => "gpu share",
+        }
+    }
+
+    /// `rows` ordered by this column, highest first; ties keep the kind-name order.
+    pub fn sorted(self, rows: &[KernelRow]) -> Vec<KernelRow> {
+        let total: f64 = rows.iter().map(|r| r.us).sum();
+        let key = |r: &KernelRow| match self {
+            Self::Time => r.us,
+            Self::Bandwidth => r.gbps,
+            Self::GpuShare => gpu_share(r.us, total),
+        };
+        let mut out = rows.to_vec();
+        out.sort_by(|a, b| key(b).total_cmp(&key(a)).then_with(|| a.kind.cmp(&b.kind)));
+        out
+    }
+}
+
+/// `us` as a percentage of `total_us` (0 when nothing was timed).
+pub fn gpu_share(us: f64, total_us: f64) -> f64 {
+    if total_us > 0.0 {
+        us / total_us * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Samples the [`GapStats`] average spans: an EWMA of weight `2 / (GAP_WINDOW + 1)`, seeded by a
+/// running mean while that weight exceeds `1 / n`.
+const GAP_WINDOW: u64 = 100;
 
 /// One decode token's timing as the scheduler measured it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -87,7 +149,7 @@ pub struct GapSample {
     pub dispatches: u32,
 }
 
-/// Where a decode token's wall time goes: an EWMA ([`GAP_ALPHA`]) of recent [`GapSample`]s.
+/// Where a decode token's wall time goes: a [`GAP_WINDOW`]-sample EWMA of recent [`GapSample`]s.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct GapStats {
     pub wall_ms: f32,
@@ -101,11 +163,13 @@ pub struct GapStats {
 
 impl GapStats {
     fn push(&mut self, s: GapSample) {
+        // A running mean (weight 1/n) until that falls to the EWMA weight, then the EWMA.
+        let alpha = (1.0 / (self.samples + 1) as f32).max(2.0 / (GAP_WINDOW + 1) as f32);
         let mix = |old: f32, new: f32| {
             if self.samples == 0 {
                 new
             } else {
-                old + GAP_ALPHA * (new - old)
+                old + alpha * (new - old)
             }
         };
         *self = Self {
@@ -139,6 +203,25 @@ impl GapStats {
     /// ms the token must lose to reach `frac` of the roofline (`0.9` = 90%); negative once past it.
     pub fn ms_to(&self, frac: f32) -> f32 {
         self.wall_ms - self.weights_ms / frac
+    }
+
+    /// The distance to `frac` of the roofline as `(long, short)` labels: `to 90% roofline: -X.XX
+    /// ms (current: YY.Y% of ceiling)` while short of it, `90% roofline reached: +X.XX ms to
+    /// spare (...)` once past it. `None` without samples or a measured ceiling.
+    pub fn deficit_labels(&self, frac: f32) -> Option<(String, String)> {
+        let cur = self.roofline_pct()?;
+        let (to, pct) = (self.ms_to(frac), frac * 100.0);
+        Some(if to > 0.0 {
+            (
+                format!("to {pct:.0}% roofline: -{to:.2} ms (current: {cur:.1}% of ceiling)"),
+                format!("to {pct:.0}%: -{to:.2} ms"),
+            )
+        } else {
+            (
+                format!("{pct:.0}% roofline reached: +{:.2} ms to spare (current: {cur:.1}% of ceiling)", to.abs()),
+                format!("{pct:.0}% reached (+{:.2} ms)", to.abs()),
+            )
+        })
     }
 }
 
@@ -405,15 +488,36 @@ mod tests {
     }
 
     #[test]
-    fn gap_averages_with_alpha_a_tenth_and_seeds_on_the_first_token() {
+    fn gap_is_a_running_mean_then_a_hundred_sample_ewma() {
         let t = EngineTelemetry::new();
         assert_eq!(t.get_summary().gap.samples, 0);
         t.record_gap(sample(10.0, 9.0, 8.0, 3.0));
         assert_eq!(t.get_summary().gap.wall_ms, 10.0);
         t.record_gap(sample(20.0, 9.0, 8.0, 3.0));
         let g = t.get_summary().gap;
-        assert!((g.wall_ms - 11.0).abs() < 1e-5, "{g:?}");
+        assert!((g.wall_ms - 15.0).abs() < 1e-5, "{g:?}");
         assert_eq!((g.samples, g.dispatches), (2, 700.0));
+        // After the window, a new token weighs 2 / 101.
+        let mut g = GapStats::default();
+        for _ in 0..GAP_WINDOW {
+            g.push(sample(10.0, 9.0, 8.0, 3.0));
+        }
+        g.push(sample(20.0, 9.0, 8.0, 3.0));
+        assert!((g.wall_ms - (10.0 + 10.0 * 2.0 / 101.0)).abs() < 1e-4, "{g:?}");
+    }
+
+    #[test]
+    fn gap_deficit_labels_give_the_distance_to_ninety_percent() {
+        let mut g = GapStats::default();
+        assert_eq!(g.deficit_labels(0.9), None);
+        g.push(sample(10.0, 9.0, 8.0, 4.5));
+        let (long, short) = g.deficit_labels(0.9).unwrap();
+        assert_eq!(long, "to 90% roofline: -5.00 ms (current: 45.0% of ceiling)");
+        assert_eq!(short, "to 90%: -5.00 ms");
+        let mut g = GapStats::default();
+        g.push(sample(4.4, 4.3, 4.2, 4.0));
+        let (long, _) = g.deficit_labels(0.9).unwrap();
+        assert_eq!(long, "90% roofline reached: +0.04 ms to spare (current: 90.9% of ceiling)");
     }
 
     #[test]
@@ -438,6 +542,27 @@ mod tests {
         let mut g = GapStats::default();
         g.push(sample(10.0, 9.0, 8.0, 0.0));
         assert_eq!(g.roofline_pct(), None);
+    }
+
+    fn krow(kind: &str, us: f64, gbps: f64) -> KernelRow {
+        KernelRow { kind: kind.into(), steps: 1, us, gbps, pct: gbps / 3.0 }
+    }
+
+    #[test]
+    fn kernel_sort_orders_by_each_column_and_cycles() {
+        let rows = [krow("Norm", 100.0, 250.0), krow("Linear", 900.0, 120.0), krow("Attn", 400.0, 300.0)];
+        let kinds = |s: KernelSort| s.sorted(&rows).into_iter().map(|r| r.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(KernelSort::Time), ["Linear", "Attn", "Norm"]);
+        assert_eq!(kinds(KernelSort::Bandwidth), ["Attn", "Norm", "Linear"]);
+        assert_eq!(kinds(KernelSort::GpuShare), ["Linear", "Attn", "Norm"]);
+        // Ties fall back to the kind name.
+        let tie = [krow("B", 5.0, 1.0), krow("A", 5.0, 1.0)];
+        assert_eq!(KernelSort::Time.sorted(&tie)[0].kind, "A");
+        assert_eq!(KernelSort::default().next().next().next(), KernelSort::Time);
+        assert_eq!(KernelSort::parse("bw"), Some(KernelSort::Bandwidth));
+        assert_eq!(KernelSort::parse("nope"), None);
+        assert_eq!(gpu_share(25.0, 100.0), 25.0);
+        assert_eq!(gpu_share(1.0, 0.0), 0.0);
     }
 }
 

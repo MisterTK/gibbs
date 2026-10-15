@@ -951,6 +951,19 @@ mod tests {
         })
     }
 
+    /// Smaller is not faster: slow Q4_K (4.5/100) loses to the larger Q5_K (5.5/240); once Q4_K is fast it wins back.
+    #[test]
+    fn max_speed_picks_min_bytes_over_gbps_not_min_bytes() {
+        let slow_q4k = |f: Q| if f == Q::GGUF_Q4_K_M { Some(100.0) } else { rates(f) };
+        // Q4_K 4.5/100 = .045; Q8_0 8.5/380 = .0224; Q4_0 4.5/300 = .015 is best of all.
+        assert_eq!(rule_with(MaxSpeed, Q::BF16, &slow_q4k), Target::Encode(Q::GGUF_Q4_0));
+        // Without Q4_0: Q5_K (5.5/240) beats slow Q4_K; Q8_0 (8.5/380) is inside the noise margin of it.
+        let no_q4_0 = |f: Q| if f == Q::GGUF_Q4_0 { None } else { slow_q4k(f) };
+        assert_eq!(rule_with(MaxSpeed, Q::BF16, &no_q4_0), Target::Encode(Q::GGUF_Q5_K_M));
+        let fast_q4k = |f: Q| if f == Q::GGUF_Q4_K_M { Some(400.0) } else { no_q4_0(f) };
+        assert_eq!(rule_with(MaxSpeed, Q::BF16, &fast_q4k), Target::Encode(Q::GGUF_Q4_K_M));
+    }
+
     #[test]
     fn max_speed_moves_a_slow_low_bit_source_to_the_faster_target() {
         // 2.06 bpw / 110 GB/s is slower per weight than 4.5 bpw / 300 GB/s.

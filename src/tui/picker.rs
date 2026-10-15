@@ -827,7 +827,7 @@ impl Picker {
                 .total_memory
                 .map(|m| (sz_gb * 1e9) as u64 <= m)
                 .unwrap_or(true);
-            let fit_tag = if fits { "fits" } else { "no-fit" };
+            let fit_tag = if fits { "fit" } else { "no-fit" };
             // Predicted decode speed (S3.6) and its share of the roofline: from the weight header
             // once read, `~` while it is being read (size × bpw), `?` when it cannot be read or
             // the ceiling is unmeasured.

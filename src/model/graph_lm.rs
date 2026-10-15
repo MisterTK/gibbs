@@ -65,6 +65,16 @@ pub struct GraphLmConfig {
     /// Attention logit scale; 0 means 1/sqrt(head_dim).
     #[serde(default)]
     pub attention_scale: f32,
+    /// Granite `embedding_scale`: input embeddings are multiplied by it; 0 = unset.
+    #[serde(default)]
+    pub embedding_scale: f32,
+    /// Granite `residual_scale`: each block's attention / MLP output is multiplied by it before the
+    /// residual add; 0 = unset.
+    #[serde(default)]
+    pub residual_scale: f32,
+    /// Granite `logit_scale`: the logits are divided by it; 0 = unset.
+    #[serde(default)]
+    pub logit_scale: f32,
 }
 
 impl GraphLmConfig {
@@ -75,6 +85,26 @@ impl GraphLmConfig {
         } else {
             1.0 / (self.head_dim as f32).sqrt()
         }
+    }
+
+    /// `Some(s)` for a multiplier that is set and not the identity.
+    fn mult(s: f32) -> Option<f32> {
+        (s > 0.0 && s != 1.0).then_some(s)
+    }
+
+    /// Factor applied to the input embeddings, if any.
+    pub fn embedding_mult(&self) -> Option<f32> {
+        Self::mult(self.embedding_scale)
+    }
+
+    /// Factor applied to each block's branch output before the residual add, if any.
+    pub fn residual_mult(&self) -> Option<f32> {
+        Self::mult(self.residual_scale)
+    }
+
+    /// Factor applied to the logits (1 / `logit_scale`), if any.
+    pub fn logit_mult(&self) -> Option<f32> {
+        Self::mult(self.logit_scale).map(|s| 1.0 / s)
     }
 }
 
@@ -103,6 +133,9 @@ impl GraphLmConfig {
             ternarize_weights: false,
             use_relu2_mlp: false,
             attention_scale: 0.0,
+            embedding_scale: 0.0,
+            residual_scale: 0.0,
+            logit_scale: 0.0,
         }
     }
 
@@ -130,6 +163,9 @@ impl GraphLmConfig {
             ternarize_weights: false,
             use_relu2_mlp: false,
             attention_scale: 0.0,
+            embedding_scale: 0.0,
+            residual_scale: 0.0,
+            logit_scale: 0.0,
         }
     }
 
@@ -157,6 +193,9 @@ impl GraphLmConfig {
             ternarize_weights: false,
             use_relu2_mlp: false,
             attention_scale: 0.0,
+            embedding_scale: 0.0,
+            residual_scale: 0.0,
+            logit_scale: 0.0,
         }
     }
 
@@ -190,6 +229,9 @@ impl GraphLmConfig {
             ternarize_weights: false,
             use_relu2_mlp: false,
             attention_scale: 0.0,
+            embedding_scale: 0.0,
+            residual_scale: 0.0,
+            logit_scale: 0.0,
         }
     }
 
@@ -215,6 +257,10 @@ impl GraphLmConfig {
             cfg.ternarize_weights = ternarize;
         }
         cfg.use_relu2_mlp = hf.hidden_act.as_deref() == Some("relu2");
+        cfg.attention_scale = hf.attention_multiplier.unwrap_or(0.0);
+        cfg.embedding_scale = hf.embedding_multiplier.unwrap_or(0.0);
+        cfg.residual_scale = hf.residual_multiplier.unwrap_or(0.0);
+        cfg.logit_scale = hf.logits_scaling.unwrap_or(0.0);
         cfg
     }
 
@@ -268,6 +314,16 @@ impl GraphLmConfig {
             attention_scale: get("attention.scale")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(base.attention_scale),
+            // Granite's embedding / residual multipliers and logit divisor (llama.cpp `f_*_scale`).
+            embedding_scale: get("embedding_scale")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base.embedding_scale),
+            residual_scale: get("residual_scale")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base.residual_scale),
+            logit_scale: get("logit_scale")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(base.logit_scale),
             // llama.cpp's LLAMA_ROPE_TYPE_NORM archs rotate adjacent (2i, 2i+1) pairs; for llama,
             // convert_hf_to_gguf permutes q/k rows into exactly that layout.
             rope_interleaved: matches!(
@@ -1085,6 +1141,11 @@ impl GraphLm {
             };
             g.add(name, op, &[x], vec![n, end - start], DType::F32)
         }
+        /// `x * s` as a graph node (Granite multipliers, a model attention scale folded into q).
+        fn scale_by(g: &mut Graph, name: String, x: ValueId, s: f32, shape: Vec<usize>) -> ValueId {
+            let op = Op::Unary { kind: crate::graph::UnaryKind::Scale(s) };
+            g.add(name, op, &[x], shape, DType::F32)
+        }
 
         let c = &self.config;
         let (h, v, inter, eps, ln) = (
@@ -1145,6 +1206,9 @@ impl GraphLm {
             );
             (x, positions)
         };
+        if let Some(s) = c.embedding_mult() {
+            x = scale_by(&mut g, "model.embed_scale".into(), x, s, vec![n, h]);
+        }
         if let Some(pos) = &self.pos_embedding {
             let wpe = g.weight(
                 "model.embed_positions.weight",
@@ -1241,6 +1305,13 @@ impl GraphLm {
                     DType::F32,
                 )
             } else {
+                // `Op::Attention` has no scale parameter (it is 1/sqrt(head_dim)): fold the model's into q.
+                let q = if c.attention_scale > 0.0 {
+                    let s = c.attn_scale() * (c.head_dim as f32).sqrt();
+                    scale_by(&mut g, format!("{p}.self_attn.q_scale"), q, s, vec![n, h])
+                } else {
+                    q
+                };
                 g.add(
                     format!("{p}.self_attn"),
                     attention.clone(),
@@ -1269,6 +1340,9 @@ impl GraphLm {
                     eps,
                     n,
                 );
+            }
+            if let Some(s) = c.residual_mult() {
+                o = scale_by(&mut g, format!("{p}.attn_residual_scale"), o, s, vec![n, h]);
             }
             let x_attn = g.add(
                 format!("{p}.residual_1"),
@@ -1338,6 +1412,9 @@ impl GraphLm {
                     n,
                 );
             }
+            if let Some(s) = c.residual_mult() {
+                d = scale_by(&mut g, format!("{p}.mlp_residual_scale"), d, s, vec![n, h]);
+            }
             x = g.add(
                 format!("{p}.residual_2"),
                 Op::Add,
@@ -1359,7 +1436,13 @@ impl GraphLm {
             n,
         );
         let logits = match score {
-            None => linear(&mut g, &mut w_map, "lm_head", n_norm, &self.lm_head, n),
+            None => {
+                let l = linear(&mut g, &mut w_map, "lm_head", n_norm, &self.lm_head, n);
+                match c.logit_mult() {
+                    Some(s) => scale_by(&mut g, "logit_scale".into(), l, s, vec![n, self.lm_head.out_features]),
+                    None => l,
+                }
+            }
             Some(s) => {
                 let labels = s.len() / h;
                 let w = g.weight("score.weight", vec![labels, h], DType::F32);
@@ -1392,9 +1475,9 @@ impl GraphLm {
         Self::from_manifest(GraphLmConfig::from_gguf(&manifest, config), &manifest, data)
     }
 
-    /// Granite GGUFs: the embedding / residual / logit multipliers and Mamba (`granitehybrid`) layers are not
-    /// implemented, so a file that needs them is an error instead of a plausible-looking wrong model.
-    /// (`attention.scale` is honoured through [`GraphLmConfig::attn_scale`].)
+    /// Granite GGUFs: Mamba (`granitehybrid`) and expert (`granitemoe`) layers are not implemented on the
+    /// dense path, so such a file is an error instead of a plausible-looking wrong model. The attention,
+    /// embedding, residual and logit multipliers are honoured through [`GraphLmConfig`].
     fn check_granite(manifest: &ModelManifest) -> Result<(), String> {
         let md = &manifest.metadata;
         let Some(arch) = md
@@ -1405,17 +1488,6 @@ impl GraphLm {
         };
         if arch == "granitehybrid" || arch == "granitemoe" {
             return Err(format!("architecture '{arch}' (Mamba / expert layers) is not implemented on the dense path"));
-        }
-        for k in ["embedding_scale", "residual_scale", "logit_scale"] {
-            let v = md
-                .get(&format!("{arch}.{k}"))
-                .and_then(|s| s.parse::<f32>().ok())
-                .unwrap_or(1.0);
-            if v != 1.0 {
-                return Err(format!(
-                    "{arch}.{k} = {v}: the Granite multipliers are not implemented"
-                ));
-            }
         }
         Ok(())
     }
@@ -2239,8 +2311,10 @@ impl GraphLm {
         crate::hardware::cpu_compute::enter("graph_lm::forward");
         let mut logits = vec![0.0f32; self.config.vocab_size];
         if !tokens.is_empty() {
-            self.lm_head
-                .forward(&self.final_hidden(tokens), &mut logits);
+            self.lm_head.forward(&self.final_hidden(tokens), &mut logits);
+            if let Some(s) = self.config.logit_mult() {
+                logits.iter_mut().for_each(|l| *l *= s);
+            }
         }
         logits
     }
@@ -2272,6 +2346,9 @@ impl GraphLm {
             .map(|(t, &tok)| {
                 let tok_idx = (tok as usize).min(v - 1);
                 let mut emb = self.embedding[tok_idx * h..(tok_idx + 1) * h].to_vec();
+                if let Some(s) = self.config.embedding_mult() {
+                    emb.iter_mut().for_each(|e| *e *= s);
+                }
                 if let Some(pos_emb) = &self.pos_embedding {
                     let pos_idx = t.min(self.config.max_seq_len.saturating_sub(1));
                     if (pos_idx + 1) * h <= pos_emb.len() {
@@ -2424,6 +2501,9 @@ impl GraphLm {
                         proj_out[i] = proj_out[i] * scale * pan[i];
                     }
                 }
+                if let Some(s) = self.config.residual_mult() {
+                    proj_out.iter_mut().for_each(|p| *p *= s);
+                }
 
                 if !self.config.use_parallel_residual {
                     for i in 0..h {
@@ -2496,6 +2576,9 @@ impl GraphLm {
                     for i in 0..h {
                         down_out[i] = down_out[i] * scale * pfn[i];
                     }
+                }
+                if let Some(s) = self.config.residual_mult() {
+                    down_out.iter_mut().for_each(|d| *d *= s);
                 }
 
                 if self.config.use_parallel_residual {
@@ -2581,6 +2664,9 @@ impl GraphLm {
         let head_dim = self.config.head_dim;
         let eps = self.config.norm_eps;
         let bits = self.config.act_quant_bits;
+        if let Some(s) = self.config.embedding_mult() {
+            pad.hidden.iter_mut().for_each(|e| *e *= s);
+        }
         if let Some(pos_emb) = &self.pos_embedding {
             let pos_idx = pos.min(self.config.max_seq_len.saturating_sub(1));
             if (pos_idx + 1) * h <= pos_emb.len() {
@@ -2756,6 +2842,9 @@ impl GraphLm {
                     pad.proj_out[i] = pad.proj_out[i] * scale * pan[i];
                 }
             }
+            if let Some(s) = self.config.residual_mult() {
+                pad.proj_out.iter_mut().for_each(|p| *p *= s);
+            }
             // 7. Fused Residual Add + Norm 2
             if !self.config.use_parallel_residual {
                 if self.config.use_standard_layernorm {
@@ -2840,6 +2929,9 @@ impl GraphLm {
                     pad.down_out[i] = pad.down_out[i] * scale * pfn[i];
                 }
             }
+            if let Some(s) = self.config.residual_mult() {
+                pad.down_out.iter_mut().for_each(|d| *d *= s);
+            }
             // 9. Residual addition
             if self.config.use_parallel_residual {
                 crate::model::simd::vector_fused_scale_add(&mut pad.hidden, &pad.proj_out, 1.0);
@@ -2872,6 +2964,9 @@ impl GraphLm {
 
         // 11. LM Head projection
         self.lm_head.forward(&pad.final_normed, &mut pad.logits);
+        if let Some(s) = self.config.logit_mult() {
+            pad.logits.iter_mut().for_each(|l| *l *= s);
+        }
     }
 
     /// Evaluates a single newly-generated token at position `pos` using cached keys/values.
@@ -3310,30 +3405,101 @@ mod tests {
         }
     }
 
-    /// Granite multipliers other than 1.0, and hybrid (Mamba) Granites, are rejected instead of loaded wrong.
+    fn granite_manifest(arch: &str, extra: &[(&str, &str)]) -> ModelManifest {
+        let mut md = std::collections::HashMap::new();
+        md.insert("general.architecture".to_string(), arch.to_string());
+        for (k, v) in extra {
+            md.insert(format!("{arch}.{k}"), v.to_string());
+        }
+        ModelManifest {
+            format: crate::model::SourceFormat::Gguf,
+            tensors: Default::default(),
+            metadata: md,
+            shard_count: 1,
+            detected_architecture: String::new(),
+        }
+    }
+
+    /// Hybrid (Mamba) and expert Granites are rejected instead of loaded wrong; dense ones load with their
+    /// multipliers, which no longer make a file an error.
     #[test]
-    fn granite_gguf_with_unimplemented_scales_is_rejected() {
-        let manifest = |arch: &str, extra: &[(&str, &str)]| {
-            let mut md = std::collections::HashMap::new();
-            md.insert("general.architecture".to_string(), arch.to_string());
-            for (k, v) in extra {
-                md.insert(format!("{arch}.{k}"), v.to_string());
-            }
-            ModelManifest {
-                format: crate::model::SourceFormat::Gguf,
-                tensors: Default::default(),
-                metadata: md,
-                shard_count: 1,
-                detected_architecture: String::new(),
+    fn granite_gguf_accepts_scales_and_rejects_unsupported_layers() {
+        for extra in [&[("residual_scale", "0.22")][..], &[("logit_scale", "16")], &[("embedding_scale", "12")]] {
+            assert!(GraphLm::check_granite(&granite_manifest("granite", extra)).is_ok());
+        }
+        assert!(GraphLm::check_granite(&granite_manifest("granitehybrid", &[])).is_err());
+        assert!(GraphLm::check_granite(&granite_manifest("granitemoe", &[])).is_err());
+        assert!(GraphLm::check_granite(&granite_manifest("llama", &[("residual_scale", "0.22")])).is_ok());
+    }
+
+    /// `granite.{embedding,residual,logit}_scale` land in the config; 1.0 and absent keys are the identity.
+    #[test]
+    fn gguf_granite_multipliers_reach_the_config() {
+        let m = granite_manifest(
+            "granite",
+            &[("embedding_scale", "12"), ("residual_scale", "0.22"), ("logit_scale", "8")],
+        );
+        let c = GraphLmConfig::from_gguf(&m, GraphLmConfig::smollm_1m());
+        assert_eq!(c.embedding_mult(), Some(12.0));
+        assert_eq!(c.residual_mult(), Some(0.22));
+        assert_eq!(c.logit_mult(), Some(0.125));
+        let ones = granite_manifest("granite", &[("embedding_scale", "1.0"), ("logit_scale", "1.0")]);
+        let c = GraphLmConfig::from_gguf(&ones, GraphLmConfig::smollm_1m());
+        assert_eq!((c.embedding_mult(), c.residual_mult(), c.logit_mult()), (None, None, None));
+    }
+
+    /// The Granite config.json multipliers map onto the same fields.
+    #[test]
+    fn hf_granite_multipliers_reach_the_config() {
+        let hf: crate::model::hf_loader::HfConfigJson = serde_json::from_str(
+            r#"{"model_type":"granite","hidden_size":64,"num_hidden_layers":2,"num_attention_heads":2,
+                "attention_multiplier":0.015625,"embedding_multiplier":12.0,
+                "residual_multiplier":0.22,"logits_scaling":8.0}"#,
+        )
+        .unwrap();
+        let c = GraphLmConfig::from_hf(&hf, QuantMode::Uncompressed);
+        assert_eq!(c.attn_scale(), 0.015625);
+        assert_eq!((c.embedding_mult(), c.residual_mult(), c.logit_mult()), (Some(12.0), Some(0.22), Some(0.125)));
+    }
+
+    /// With every Granite multiplier set, the prefill/decode graphs (cached attention) and the uncached
+    /// graph (q pre-scaled) agree with the host forward, and differ from the unscaled model.
+    #[test]
+    fn granite_scales_graph_matches_host_forward() {
+        let scaled = GraphLmConfig {
+            attention_scale: 0.2,
+            embedding_scale: 3.0,
+            residual_scale: 0.5,
+            logit_scale: 4.0,
+            ..GraphLmConfig::smollm_1m()
+        };
+        let model = GraphLm::new(scaled);
+        let plain = GraphLm::new(GraphLmConfig::smollm_1m());
+        let tokens = [12u32, 45, 99, 101];
+        let want = model.forward(&tokens);
+        assert!(want.iter().zip(plain.forward(&tokens)).any(|(a, b)| (a - b).abs() > 1e-3));
+
+        let v = model.config.vocab_size;
+        let run = |g: &crate::graph::Graph, w: &crate::graph::Weights, toks: &[u32], pos: &[u32]| {
+            let mut state = crate::graph::StateStore::new();
+            let inputs = vec![
+                crate::graph::Tensor::U32(toks.to_vec()),
+                crate::graph::Tensor::U32(pos.to_vec()),
+            ];
+            match crate::graph::cpu::run(g, w, &mut state, inputs).expect("graph runs").remove(0) {
+                crate::graph::Tensor::F32(l) => l,
+                other => panic!("expected F32 logits, got {other:?}"),
             }
         };
-        assert!(GraphLm::check_granite(&manifest("granite", &[("residual_scale", "1.0")])).is_ok());
-        assert!(
-            GraphLm::check_granite(&manifest("granite", &[("residual_scale", "0.22")])).is_err()
-        );
-        assert!(GraphLm::check_granite(&manifest("granite", &[("logit_scale", "16")])).is_err());
-        assert!(GraphLm::check_granite(&manifest("granitehybrid", &[])).is_err());
-        assert!(GraphLm::check_granite(&manifest("llama", &[("residual_scale", "0.22")])).is_ok());
+        let pos: Vec<u32> = (0..tokens.len() as u32).collect();
+        for cached in [true, false] {
+            let (g, w) = model.build_graph(tokens.len(), cached);
+            let logits = run(&g, &w, &tokens, &pos);
+            let last = &logits[logits.len() - v..];
+            for (i, (&got, &exp)) in last.iter().zip(&want).enumerate() {
+                assert!((got - exp).abs() < 1e-3, "cached={cached} logit {i}: graph={got}, host={exp}");
+            }
+        }
     }
 
     #[test]
