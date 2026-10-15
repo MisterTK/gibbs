@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 BASE=target/loop-base/gibbs
 if [ ! -x "$BASE" ]; then echo "metric-error: $BASE missing" >&2; exit 1; fi
 # Quiet machine: the matrix runner abandons its in-flight item while this file exists.
-mkdir -p target/matrix && touch target/matrix/PAUSE && trap 'rm -f target/matrix/PAUSE' EXIT
+rm -f target/loop/verify.json  # an aborted run must not leave the previous verdict readable
+mkdir -p target/matrix && touch target/matrix/PAUSE && trap 'rm -f target/matrix/PAUSE bench/.loop-model-*.json' EXIT
 # PAUSE only abandons a bench, so stop a running model download too (precaution: an unexplained ~13 %
 # slower machine state, E2B QAT 106-108 vs 122-125 tok/s, appeared in several sessions, also without it).
 pkill -f 'curl.*matrix-cache' || true

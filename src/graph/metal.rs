@@ -1115,7 +1115,7 @@ impl Runtime {
         }
         // Foreign GPU load, sampled before this process times anything: busy means the winner is
         // used here but never persisted.
-        let busy = tune::gpu_utilization().is_some_and(|u| u > tune::BUSY_PCT);
+        let busy = tune::foreign_busy();
         let timings = match self.bench_gemv(q, &[(rows, cols)], &variants) {
             Ok(t) => t,
             Err(e) => {

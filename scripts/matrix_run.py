@@ -165,7 +165,7 @@ def process(item, nxt):
         verdict = [l for l in perr.strip().splitlines() if l.startswith("parity:")]
         if pcode == 0:
             row["parity"] = "ok"
-        elif not verdict and "panicked" not in perr and (pcode < 0 or pcode in (124, 137)):
+        elif not verdict and "panicked" not in perr and pcode in (-9, 124, 137):
             # The CPU reference (the graph executor on the same graph, scales included) was killed or timed out
             # before it compared anything: no verdict, so not a parity failure. The llama.cpp oracle still judges.
             row["parity"], row["parity_error"] = "skip", f"cpu reference died, exit {pcode}"
