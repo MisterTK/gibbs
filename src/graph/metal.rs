@@ -351,22 +351,24 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         },
         Op::Gelu { .. } => dtype == DType::F32,
         // The Attention megakernel has no Metal step (`plan` rejects it), so only the MLP kind is lowered.
-        Op::Megakernel(d) if matches!(d.kind, crate::graph::MegakernelKind::Mlp { .. }) => matches!(
-            dtype,
-            DType::F32
-                | DType::F16
-                | DType::BF16
-                | DType::Quant(QuantFormat::GGUF_Q4_0)
-                | DType::Quant(QuantFormat::GGUF_Q8_0)
-                | DType::Quant(QuantFormat::GGUF_IQ4_XS)
-                | DType::Quant(QuantFormat::GGUF_IQ2_M)
-                | DType::Quant(QuantFormat::GGUF_IQ2_S)
-                | DType::Quant(QuantFormat::GGUF_Q4_K_M)
-                | DType::Quant(QuantFormat::GGUF_Q2_K)
-                | DType::Quant(QuantFormat::GGUF_IQ3_S)
-                | DType::Quant(QuantFormat::NVFP4)
-                | DType::Quant(QuantFormat::WeightlessJesseLUT)
-        ),
+        Op::Megakernel(d) if matches!(d.kind, crate::graph::MegakernelKind::Mlp { .. }) => {
+            matches!(
+                dtype,
+                DType::F32
+                    | DType::F16
+                    | DType::BF16
+                    | DType::Quant(QuantFormat::GGUF_Q4_0)
+                    | DType::Quant(QuantFormat::GGUF_Q8_0)
+                    | DType::Quant(QuantFormat::GGUF_IQ4_XS)
+                    | DType::Quant(QuantFormat::GGUF_IQ2_M)
+                    | DType::Quant(QuantFormat::GGUF_IQ2_S)
+                    | DType::Quant(QuantFormat::GGUF_Q4_K_M)
+                    | DType::Quant(QuantFormat::GGUF_Q2_K)
+                    | DType::Quant(QuantFormat::GGUF_IQ3_S)
+                    | DType::Quant(QuantFormat::NVFP4)
+                    | DType::Quant(QuantFormat::WeightlessJesseLUT)
+            )
+        }
         _ => false,
     }
 }
@@ -6202,7 +6204,8 @@ mod tests {
     }
 
     /// Best GEMV rate per format at the projection shapes of a ~2B model, DRAM-streaming conditions
-    /// (`cargo test --release --lib shape_rates -- --ignored --nocapture`).
+    /// (`cargo test --release --lib shape_rates -- --ignored --nocapture`; `SHAPE_RATES_FMT=TQ2_0`
+    /// keeps only the formats whose name contains the text).
     #[test]
     #[ignore = "bandwidth measurement"]
     fn shape_rates() {
@@ -6217,6 +6220,9 @@ mod tests {
             QuantFormat::GGUF_Q3_K,
             QuantFormat::GGUF_IQ4_NL,
         ] {
+            if std::env::var("SHAPE_RATES_FMT").is_ok_and(|s| !format!("{f:?}").contains(&s)) {
+                continue;
+            }
             let fmt = WeightFormat::of_quant(f);
             for shape in [
                 (6144usize, 1536usize),
