@@ -618,6 +618,11 @@ pub struct Runtime {
     profile_path: std::path::PathBuf,
     /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
     gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
+    /// The libraries behind [`Self::gen_psos`]' generated GEMVs, kept to specialize them without recompiling.
+    gen_libs: Mutex<HashMap<(QuantFormat, u8), Library>>,
+    /// Generated GEMV pipelines with `rows` and blocks per row baked in as function constants, by
+    /// (codec format, rows per simdgroup, rows, blocks per row).
+    gen_spec_psos: Mutex<HashMap<(QuantFormat, u8, u32, u32), ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
@@ -689,6 +694,8 @@ impl Runtime {
             report: String::new(),
             profile_path: std::path::PathBuf::new(),
             gen_psos: Mutex::new(HashMap::new()),
+            gen_libs: Mutex::new(HashMap::new()),
+            gen_spec_psos: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
@@ -1039,12 +1046,11 @@ impl Runtime {
         Ok(out)
     }
 
-    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
-    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
-        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+    /// The library of the generated packed GEMV of `c` at `rows_per_sg`, compiled on first use.
+    fn gen_lib(&self, c: &codec::Codec, rows_per_sg: u8) -> Result<Library, String> {
         let key = (c.format, rows_per_sg);
-        if let Some(p) = self.gen_psos.lock().get(&key) {
-            return Ok(p.clone());
+        if let Some(l) = self.gen_libs.lock().get(&key) {
+            return Ok(l.clone());
         }
         let params = crate::graph::codegen::GemvParams {
             rows_per_sg: rows_per_sg as usize,
@@ -1053,26 +1059,98 @@ impl Runtime {
         let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
         src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
         src.push_str(&crate::graph::codegen::gemv_packed(c, params));
-        let name = crate::graph::codegen::gemv_packed_name(c, params);
-        let pso = self.compile_generated(&src, &name)?;
+        let lib = self.compile_library(&src)?;
+        self.gen_libs.lock().insert(key, lib.clone());
+        Ok(lib)
+    }
+
+    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
+    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
+        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+        let key = (c.format, rows_per_sg);
+        if let Some(p) = self.gen_psos.lock().get(&key) {
+            return Ok(p.clone());
+        }
+        let pso = self.gen_pipeline(c, rows_per_sg, None)?;
         self.gen_psos.lock().insert(key, pso.clone());
         Ok(pso)
     }
 
+    /// [`Self::gen_pso`] with a `rows` x `cols` weight's shape baked in (`cols` a multiple of the block size):
+    /// the specialization compiled by [`Self::specialize_gen_pso`], if any.
+    fn gen_spec_pso(&self, f: QuantFormat, rows_per_sg: u8, rows: usize, cols: usize) -> Option<ComputePipelineState> {
+        let key = Self::spec_key(f, rows_per_sg, rows, cols)?;
+        self.gen_spec_psos.lock().get(&key).cloned()
+    }
+
+    fn spec_key(f: QuantFormat, rows_per_sg: u8, rows: usize, cols: usize) -> Option<(QuantFormat, u8, u32, u32)> {
+        let be = codec::codec(f)?.block_elems as usize;
+        (cols % be == 0).then_some(())?;
+        Some((f, rows_per_sg, u32::try_from(rows).ok()?, u32::try_from(cols / be).ok()?))
+    }
+
+    /// Compiles (once) the generated GEMV of `f` at `rows_per_sg` for a `rows` x `cols` weight.
+    fn specialize_gen_pso(&self, f: QuantFormat, rows_per_sg: u8, rows: usize, cols: usize) -> Result<(), String> {
+        let key = Self::spec_key(f, rows_per_sg, rows, cols)
+            .ok_or_else(|| format!("{f:?} {rows}x{cols} cannot be specialized"))?;
+        if self.gen_spec_psos.lock().contains_key(&key) {
+            return Ok(());
+        }
+        let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
+        let pso = self.gen_pipeline(c, rows_per_sg, Some((key.2, key.3)))?;
+        self.gen_spec_psos.lock().insert(key, pso);
+        Ok(())
+    }
+
+    /// The pipeline of the generated GEMV of `c` at `rows_per_sg`, with `(rows, blocks per row)` as function
+    /// constants when given.
+    fn gen_pipeline(
+        &self,
+        c: &codec::Codec,
+        rows_per_sg: u8,
+        shape: Option<(u32, u32)>,
+    ) -> Result<ComputePipelineState, String> {
+        use crate::graph::codegen::{FC_BLOCKS_PER_ROW, FC_ROWS};
+        let params = crate::graph::codegen::GemvParams {
+            rows_per_sg: rows_per_sg as usize,
+            ..Default::default()
+        };
+        let name = crate::graph::codegen::gemv_packed_name(c, params);
+        let lib = self.gen_lib(c, rows_per_sg)?;
+        // A function declaring function constants must be built from a (possibly empty) value set.
+        let consts = metal::FunctionConstantValues::new();
+        for (value, index) in shape.into_iter().flat_map(|(rows, bpr)| [(rows, FC_ROWS), (bpr, FC_BLOCKS_PER_ROW)]) {
+            consts.set_constant_value_at_index(
+                &value as *const u32 as *const c_void,
+                metal::MTLDataType::UInt,
+                index,
+            );
+        }
+        let func = lib
+            .get_function(&name, Some(consts))
+            .map_err(|e| format!("generated function '{name}': {e}"))?;
+        self.device
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(|e| format!("generated pipeline '{name}': {e}"))
+    }
+
     /// Compiles one generated kernel `name` from `src` (fast-math off, as for the hand kernels).
     fn compile_generated(&self, src: &str, name: &str) -> Result<ComputePipelineState, String> {
-        let opts = CompileOptions::new();
-        opts.set_fast_math_enabled(false);
-        let lib = self
-            .device
-            .new_library_with_source(src, &opts)
-            .map_err(|e| format!("generated kernel compilation failed: {e}"))?;
-        let func = lib
+        let func = self
+            .compile_library(src)?
             .get_function(name, None)
             .map_err(|e| format!("generated function '{name}': {e}"))?;
         self.device
             .new_compute_pipeline_state_with_function(&func)
             .map_err(|e| format!("generated pipeline '{name}': {e}"))
+    }
+
+    fn compile_library(&self, src: &str) -> Result<Library, String> {
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        self.device
+            .new_library_with_source(src, &opts)
+            .map_err(|e| format!("generated kernel compilation failed: {e}"))
     }
 
     /// The generated dequantize-to-f32 pipeline for `f`, compiled on first use (cached under the
@@ -1437,6 +1515,9 @@ pub struct Session {
     jesse_aux: HashMap<String, (Buffer, usize)>,
     /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
     variant_override: Option<GemvVariant>,
+    /// Whether packed GEMVs run shape-specialized pipelines ([`Session::specialize_gemvs`]); `GIBBS_SPECIALIZE=off`
+    /// turns it off.
+    specialize: bool,
     last_gpu_s: std::sync::atomic::AtomicU64,
 }
 impl Session {
@@ -2008,6 +2089,7 @@ impl Session {
             nvfp4_aux,
             jesse_aux,
             variant_override: None,
+            specialize: !std::env::var("GIBBS_SPECIALIZE").is_ok_and(|v| matches!(v.as_str(), "off" | "0" | "false")),
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -2027,6 +2109,10 @@ impl Session {
         self.variant_override = v;
     }
 
+    pub(crate) fn set_specialize(&mut self, on: bool) {
+        self.specialize = on;
+    }
+
     pub fn runtime(&self) -> &Runtime {
         &self.rt
     }
@@ -2043,15 +2129,23 @@ impl Session {
         (n * 4) as u64
     }
 
-    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`.
+    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`; a generated one runs its
+    /// shape-specialized pipeline when `shape` (rows, cols) has one.
     fn gemv_pipeline(
         &self,
         format: WeightFormat,
         variant: GemvVariant,
+        shape: Option<(usize, usize)>,
     ) -> Result<(ComputePipelineState, u64), String> {
         let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
+            let spec = shape
+                .filter(|_| self.specialize)
+                .and_then(|(rows, cols)| self.rt.gen_spec_pso(q, r, rows, cols));
             Ok((
-                self.rt.gen_pso(q, r)?,
+                match spec {
+                    Some(p) => p,
+                    None => self.rt.gen_pso(q, r)?,
+                },
                 crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
                     rows_per_sg: r as usize,
                     ..Default::default()
@@ -2086,6 +2180,7 @@ impl Session {
             }
         }
     }
+
 
     /// Picks each m = 1 packed GEMV's kernel variant: the session override, else the tuner's
     /// winner for its `(format, rows, cols)` (`GIBBS_TUNE=off`: the format's default).
@@ -2158,6 +2253,33 @@ impl Session {
         }
     }
 
+    /// Compiles shape-specialized pipelines ([`Runtime::specialize_gen_pso`]) for the generated packed GEMVs
+    /// that stream the most weight bytes per run, at most [`MAX_SPECIALIZED_SHAPES`] distinct
+    /// (format, rows per simdgroup, rows, cols): every compile costs milliseconds at load, a shape that
+    /// streams few bytes gains nothing. The rest (and any compile failure) keep the generic pipeline.
+    fn specialize_gemvs(&self, steps: &[Planned]) {
+        if !self.specialize {
+            return;
+        }
+        let mut bytes: HashMap<(QuantFormat, u8, usize, usize), usize> = HashMap::new();
+        for s in steps {
+            let Step::GemvPacked { rows, cols, format, variant, .. } = &s.op else {
+                continue;
+            };
+            let Some((q, r)) = generated_kernel(*format, *variant) else {
+                continue;
+            };
+            *bytes.entry((q, r, *rows, *cols)).or_default() += weight_format_bytes(*format, rows * cols);
+        }
+        let mut shapes: Vec<_> = bytes.into_iter().collect();
+        shapes.sort_by_key(|&(k, b)| (std::cmp::Reverse(b), k.2, k.3));
+        for ((q, r, rows, cols), _) in shapes.into_iter().take(MAX_SPECIALIZED_SHAPES) {
+            if let Err(e) = self.rt.specialize_gen_pso(q, r, rows, cols) {
+                tracing::warn!("GEMV specialization for {q:?} {rows}x{cols} skipped: {e}");
+            }
+        }
+    }
+
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (steps, aliases) = plan(graph)?;
@@ -2210,6 +2332,7 @@ impl Session {
             }
         }
         self.assign_variants(&mut steps);
+        self.specialize_gemvs(&steps);
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
         let mut arena = self.arena.lock();
         if arena
@@ -2733,7 +2856,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, Some((rows, cols)))?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -2960,7 +3083,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, Some((rows, cols)))?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
@@ -4947,6 +5070,19 @@ fn compile(device: &Device) -> Result<(Library, Result<(), String>), String> {
 }
 
 /// Stored size of `n` weight elements in `fmt`.
+/// Distinct packed-GEMV shapes [`Session::specialize_gemvs`] specializes per plan.
+const MAX_SPECIALIZED_SHAPES: usize = 8;
+
+/// The codec format and rows per simdgroup of the generated GEMV `format` runs in `variant`, if it runs one.
+fn generated_kernel(format: WeightFormat, variant: GemvVariant) -> Option<(QuantFormat, u8)> {
+    match (format, variant.kernel) {
+        (WeightFormat::Gen(q), GemvKernel::Gen) => Some((q, variant.rows_per_sg)),
+        (WeightFormat::Gen(q), _) => Some((q, 2)),
+        (_, GemvKernel::Gen) => format.codec_format().map(|q| (q, variant.rows_per_sg)),
+        _ => None,
+    }
+}
+
 fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
     match fmt {
         WeightFormat::F32 | WeightFormat::U32 => n * 4,
@@ -6377,6 +6513,118 @@ mod tests {
             assert!(last[(nblocks - g) * data..g * data].iter().all(|&b| b == 0), "{f:?} data padding");
             assert!(last[g * data + (nblocks - g) * sb..].iter().all(|&b| b == 0), "{f:?} scale padding");
         }
+    }
+
+    /// Random as-stored blocks of `f` with finite f16 scales at `scale_at`, as a one-weight [`Weights`].
+    fn random_quant_weight(
+        f: QuantFormat,
+        name: &str,
+        (n, k): (usize, usize),
+        scale_at: &[usize],
+        next: &mut dyn FnMut() -> u32,
+        w: &mut Weights,
+    ) {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+        let mut raw: Vec<u8> = (0..n * (k / be) * bb).map(|_| (next() >> 4) as u8).collect();
+        for blk in raw.chunks_exact_mut(bb) {
+            for &o in scale_at {
+                let exp = 9 + (next() % 14) as u16;
+                let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+            }
+        }
+        w.insert(
+            name,
+            Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                format: f,
+                raw_data: raw.into(),
+                in_features: k,
+                out_features: n,
+            })),
+        );
+    }
+
+    /// A shape-specialized generated GEMV (rows and blocks per row as function constants) computes exactly
+    /// what the generic pipeline does, bit for bit, for the tile (TQ2_0), wide (Q3_K, Q5_K, Q6_K) and plain
+    /// (Q4_1, Q5_0) loops at every rows-per-simdgroup variant, for rows that are not whole threadgroups.
+    #[test]
+    fn shape_specialized_gemv_is_bitwise_identical() {
+        let mut seed = 0x1D872B41u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let formats: [(QuantFormat, &[usize]); 6] = [
+            (QuantFormat::GGUF_TQ2_0, &[64]),
+            (QuantFormat::GGUF_Q3_K, &[108]),
+            (QuantFormat::GGUF_Q5_K_M, &[0, 2]),
+            (QuantFormat::GGUF_Q6_K, &[208]),
+            (QuantFormat::GGUF_Q4_1, &[0, 2]),
+            (QuantFormat::GGUF_Q5_0, &[0]),
+        ];
+        for (f, scale_at) in formats {
+            for shape @ (n, k) in [(37usize, 1280usize), (101, 2304), (64, 2048), (5, 768)] {
+                let mut w = Weights::new();
+                random_quant_weight(f, "w", shape, scale_at, &mut next, &mut w);
+                for m in [1usize, 3] {
+                    let mut g = Graph::new();
+                    let x = g.input("x", vec![m, k], DType::F32);
+                    let w_val = g.weight("w", vec![n, k], DType::Quant(f));
+                    let y = g.add("lin", Op::Linear, &[x, w_val], vec![m, n], DType::F32);
+                    g.output(y);
+                    let xs: Vec<f32> = (0..m * k).map(|_| (next() % 2001) as f32 / 1000.0 - 1.0).collect();
+                    for v in WeightFormat::of_quant(f).gemv_variants() {
+                        if v.kernel != GemvKernel::Gen {
+                            continue;
+                        }
+                        let mut run = |specialize: bool| {
+                            let mut s = Session::new(rt(), &w).unwrap();
+                            s.set_variant_override(Some(v));
+                            s.set_specialize(specialize);
+                            let out = s.run(&g, vec![Tensor::F32(xs.clone())]).unwrap().remove(0);
+                            out.into_f32().unwrap()
+                        };
+                        let generic = run(false);
+                        let special = run(true);
+                        assert!(
+                            rt().gen_spec_pso(f, v.rows_per_sg, n, k).is_some(),
+                            "{f:?} {n}x{k} {v:?}: no specialized pipeline was compiled"
+                        );
+                        let bad = generic.iter().zip(&special).position(|(a, b)| a.to_bits() != b.to_bits());
+                        assert!(bad.is_none(), "{f:?} {n}x{k} m={m} {v:?}: element {bad:?} differs");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One plan specializes at most `MAX_SPECIALIZED_SHAPES` shapes, the ones streaming the most bytes.
+    #[test]
+    fn specialization_is_capped_to_the_heaviest_shapes() {
+        let f = QuantFormat::GGUF_Q4_1;
+        let mut seed = 7u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let k = 64;
+        let rows: Vec<usize> = (0..MAX_SPECIALIZED_SHAPES + 3).map(|i| 1001 + 3 * i).collect(); // ascending bytes
+        let mut w = Weights::new();
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, k], DType::F32);
+        for (i, &n) in rows.iter().enumerate() {
+            random_quant_weight(f, &format!("w{i}"), (n, k), &[0, 2], &mut next, &mut w);
+            let w_val = g.weight(&format!("w{i}"), vec![n, k], DType::Quant(f));
+            let y = g.add(&format!("lin{i}"), Op::Linear, &[x, w_val], vec![1, n], DType::F32);
+            g.output(y);
+        }
+        let mut s = Session::new(rt(), &w).unwrap();
+        s.set_variant_override(Some(GemvVariant::generated(2)));
+        s.run(&g, vec![Tensor::F32(vec![0.5; k])]).unwrap();
+        let specialized: Vec<usize> =
+            rows.iter().copied().filter(|&n| rt().gen_spec_pso(f, 2, n, k).is_some()).collect();
+        assert_eq!(specialized, rows[rows.len() - MAX_SPECIALIZED_SHAPES..], "heaviest shapes only");
     }
 
     /// Generated-GEMV bandwidth at lm_head-like shapes (`cargo test --release -- --ignored --nocapture`).
