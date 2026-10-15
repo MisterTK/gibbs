@@ -124,6 +124,8 @@ pub fn run(
                 } else {
                     let numel = if v.shape.is_empty() {
                         0
+                    } else if v.shape.len() == 2 && v.shape[0] > 4096 {
+                        4096 * v.shape[1]
                     } else {
                         v.shape.iter().product::<usize>()
                     };
@@ -645,7 +647,9 @@ pub fn run(
                 let idx = operand_u32(&bound, &slots, ins, name, 1)?;
                 let (cols, k) = (last_dim(0), last_dim(1));
                 if cols == 0 || k == 0 || x.len() % cols != 0 || idx.len() % k != 0 {
-                    return Err(format!("node '{name}': GatherCols needs x [rows, n] and idx [rows, k]"));
+                    return Err(format!(
+                        "node '{name}': GatherCols needs x [rows, n] and idx [rows, k]"
+                    ));
                 }
                 // One x row serves every idx row (a shared table such as per-expert scales).
                 let shared = x.len() == cols;
@@ -657,9 +661,11 @@ pub fn run(
                 let mut out = Vec::with_capacity(idx.len());
                 for (r, row) in idx.chunks_exact(k).enumerate() {
                     for &c in row {
-                        let v = x[if shared { 0 } else { r * cols }..][..cols].get(c as usize).ok_or_else(|| {
-                            format!("node '{name}': column {c} out of range for {cols} columns")
-                        })?;
+                        let v = x[if shared { 0 } else { r * cols }..][..cols]
+                            .get(c as usize)
+                            .ok_or_else(|| {
+                                format!("node '{name}': column {c} out of range for {cols} columns")
+                            })?;
                         out.push(*v);
                     }
                 }
@@ -670,9 +676,16 @@ pub fn run(
                 let bank = slot(&bound, &slots, ins, name, 1)?;
                 let ids = operand_u32(&bound, &slots, ins, name, 2)?;
                 let [bank_rows, in_f] = graph.value(ins[1]).shape[..] else {
-                    return Err(format!("node '{name}': the expert bank is not [experts * out, in]"));
+                    return Err(format!(
+                        "node '{name}': the expert bank is not [experts * out, in]"
+                    ));
                 };
-                if *experts == 0 || *top_k == 0 || in_f == 0 || bank_rows % experts != 0 || ids.len() % top_k != 0 {
+                if *experts == 0
+                    || *top_k == 0
+                    || in_f == 0
+                    || bank_rows % experts != 0
+                    || ids.len() % top_k != 0
+                {
                     return Err(format!(
                         "node '{name}': MoeLinear needs experts, top_k >= 1 and a [experts * out, in] bank with [m, top_k] ids"
                     ));
@@ -888,18 +901,16 @@ pub fn run(
                     // A `write: false` layer reads another layer's cache, which already holds this
                     // position; its `k`/`v` operands are placeholders and must not overwrite it.
                     if *write {
-                        let start_k = pos * kvh * hd;
-                        if start_k + k_in.len() <= k_all.len() {
-                            k_all[start_k..start_k + k_in.len()].copy_from_slice(k_in);
-                        } else {
-                            k_all.extend_from_slice(k_in);
+                        let end_k = (pos * kvh * hd) + k_in.len();
+                        if end_k > k_all.len() {
+                            k_all.resize(end_k, 0.0);
                         }
-                        let start_v = pos * kvh * vhd;
-                        if start_v + v_in.len() <= v_all.len() {
-                            v_all[start_v..start_v + v_in.len()].copy_from_slice(v_in);
-                        } else {
-                            v_all.extend_from_slice(v_in);
+                        k_all[end_k - k_in.len()..end_k].copy_from_slice(k_in);
+                        let end_v = (pos * kvh * vhd) + v_in.len();
+                        if end_v > v_all.len() {
+                            v_all.resize(end_v, 0.0);
                         }
+                        v_all[end_v - v_in.len()..end_v].copy_from_slice(v_in);
                     }
                     (k_all, v_all, pos)
                 } else {
@@ -2340,7 +2351,12 @@ pub(crate) fn topk_row(row: &[f32], k: usize) -> Vec<u32> {
         v if v.is_nan() => f32::NEG_INFINITY,
         v => v,
     };
-    let before = |a: &u32, b: &u32| key(*b).partial_cmp(&key(*a)).expect("NaN mapped away").then(a.cmp(b));
+    let before = |a: &u32, b: &u32| {
+        key(*b)
+            .partial_cmp(&key(*a))
+            .expect("NaN mapped away")
+            .then(a.cmp(b))
+    };
     let mut order: Vec<u32> = (0..row.len() as u32).collect();
     order.select_nth_unstable_by(k - 1, before);
     order.truncate(k);
@@ -2353,18 +2369,28 @@ fn bank_row(bank: &Tensor, row: usize, out: &mut [f32]) -> Result<(), String> {
     let cols = out.len();
     let short = || format!("expert bank has no row {row}");
     match bank {
-        Tensor::F32(v) => out.copy_from_slice(v.get(row * cols..(row + 1) * cols).ok_or_else(short)?),
+        Tensor::F32(v) => {
+            out.copy_from_slice(v.get(row * cols..(row + 1) * cols).ok_or_else(short)?)
+        }
         Tensor::BF16(v) => {
             let r = v.get(row * cols..(row + 1) * cols).ok_or_else(short)?;
-            out.iter_mut().zip(r).for_each(|(o, &b)| *o = crate::model::bf16_to_f32(b));
+            out.iter_mut()
+                .zip(r)
+                .for_each(|(o, &b)| *o = crate::model::bf16_to_f32(b));
         }
         Tensor::F16(v) => {
             let r = v.get(row * cols..(row + 1) * cols).ok_or_else(short)?;
-            out.iter_mut().zip(r).for_each(|(o, &b)| *o = crate::model::f16_to_f32(b));
+            out.iter_mut()
+                .zip(r)
+                .for_each(|(o, &b)| *o = crate::model::f16_to_f32(b));
         }
         Tensor::Mat(m) if row < m.rows && m.cols == cols => m.decode_row_f32(row, out),
         Tensor::Quantized(q) => match q.as_ref() {
-            crate::model::layers::QuantizedWeight::GgufQuantized { raw_data: data, format, .. }
+            crate::model::layers::QuantizedWeight::GgufQuantized {
+                raw_data: data,
+                format,
+                ..
+            }
             | crate::model::layers::QuantizedWeight::ZeroCopySlice { data, format, .. } => {
                 let (be, bb, _) = crate::model::layers::gguf_block_codec(*format)
                     .ok_or_else(|| format!("no dequantizer for {format:?}"))?;
@@ -2392,8 +2418,14 @@ fn moe_linear_cpu(
     [experts, top_k, in_f, out_f]: [usize; 4],
     name: &str,
 ) -> Result<Vec<f32>, String> {
-    if let Some((s, e)) = ids.iter().enumerate().find(|&(_, &e)| e as usize >= experts) {
-        return Err(format!("node '{name}': slot {s} routes to expert {e} of {experts}"));
+    if let Some((s, e)) = ids
+        .iter()
+        .enumerate()
+        .find(|&(_, &e)| e as usize >= experts)
+    {
+        return Err(format!(
+            "node '{name}': slot {s} routes to expert {e} of {experts}"
+        ));
     }
     const ROW_BLOCK: usize = 16;
     let per_slot = x.len() / in_f == ids.len();
