@@ -57,6 +57,16 @@ pub struct HfConfigJson {
     pub layer_norm_eps: Option<f32>,
     #[serde(default)]
     pub layer_norm_epsilon: Option<f32>,
+    /// LFM2 spells its RMSNorm epsilon `norm_eps`.
+    #[serde(default)]
+    pub norm_eps: Option<f32>,
+    /// LFM2 MLP width rule (`Lfm2MLP`): `intermediate_size` is shrunk to 2/3 and rounded up to `block_multiple_of`.
+    #[serde(default)]
+    pub block_auto_adjust_ff_dim: Option<bool>,
+    #[serde(default)]
+    pub block_ffn_dim_multiplier: Option<f32>,
+    #[serde(default)]
+    pub block_multiple_of: Option<usize>,
     #[serde(default)]
     pub quantization_config: Option<serde_json::Value>,
     /// 1bitLLM BitNet b1.58 checkpoints (`model_type: llama`): `weight_bits: 1`, `input_bits: 8`.
@@ -77,7 +87,18 @@ pub struct HfConfigJson {
 
 impl HfConfigJson {
     pub fn resolved_intermediate_dim(&self) -> usize {
-        self.intermediate_dim.unwrap_or(self.hidden_dim * 4)
+        let ff = self.intermediate_dim.unwrap_or(self.hidden_dim * 4);
+        if self.block_auto_adjust_ff_dim != Some(true) {
+            return ff;
+        }
+        let ff = ff * 2 / 3;
+        match self.block_ffn_dim_multiplier {
+            Some(m) => {
+                let multiple = self.block_multiple_of.unwrap_or(256);
+                multiple * ((m * ff as f32) as usize).div_ceil(multiple)
+            }
+            None => ff,
+        }
     }
 
     pub fn resolved_rope_theta(&self) -> f32 {
@@ -91,6 +112,7 @@ impl HfConfigJson {
         self.rms_norm_eps
             .or(self.layer_norm_eps)
             .or(self.layer_norm_epsilon)
+            .or(self.norm_eps)
             .unwrap_or(1e-5)
     }
 

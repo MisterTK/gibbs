@@ -594,6 +594,9 @@ pub struct GraphLayer {
     /// Per-head RMSNorm gains (`head_dim`) on q and k before RoPE (Qwen3, LFM2 attention).
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
+    /// LFM2 gated short-conv layer: the depthwise causal conv taps `[hidden, kernel]`. Such a layer has no
+    /// attention; `qkv_proj` is its `in_proj` (`[B; C; x]`, 3 * hidden rows) and `out_proj` its `out_proj`.
+    pub conv: Option<Vec<f32>>,
 }
 
 /// BitNet BitLinear activation quant (transformers `ActQuant`, 1bitLLM `activation_quant`): rounds
@@ -614,6 +617,22 @@ pub fn ternarize(w: &mut [f32], cast: impl Fn(f32) -> f32) {
     let step = cast(1.0 / scale);
     for v in w {
         *v = (*v * scale).round_ties_even().clamp(-1.0, 1.0) * step;
+    }
+}
+
+/// LFM2 gated short conv at one position: `out[ch] = c[ch] * sum_tap taps[ch][tap] * bx[row tap][ch]`, where
+/// `recent` are the last `kernel` (or fewer at the sequence start, zero before it) rows of `B * x`,
+/// oldest first, and the newest tap multiplies the current row.
+fn short_conv(taps: &[f32], c: &[f32], recent: &[&[f32]], out: &mut [f32]) {
+    let kernel = taps.len() / out.len();
+    let skipped = kernel - recent.len();
+    for (ch, o) in out.iter_mut().enumerate() {
+        let acc: f32 = recent
+            .iter()
+            .enumerate()
+            .map(|(j, row)| taps[ch * kernel + skipped + j] * row[ch])
+            .sum();
+        *o = c[ch] * acc;
     }
 }
 
@@ -973,6 +992,7 @@ impl GraphLm {
                 ffn_sub_norm: None,
                 q_norm: None,
                 k_norm: None,
+                conv: None,
             });
         }
 
@@ -1280,7 +1300,7 @@ impl GraphLm {
             let qkv = linear(
                 &mut g,
                 &mut w_map,
-                &format!("{p}.self_attn.qkv_proj"),
+                &format!("{p}.{}", if layer.conv.is_some() { "conv.in_proj" } else { "self_attn.qkv_proj" }),
                 n1,
                 &layer.qkv_proj,
                 n,
@@ -1293,7 +1313,7 @@ impl GraphLm {
                 q = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.q_norm"), q, qn, eps, vec![n, a]);
                 k = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.k_norm"), k, kn, eps, vec![n, a]);
             }
-            if rotary_dim > 0 {
+            if rotary_dim > 0 && layer.conv.is_none() {
                 let inv_freq_val = g.weight(
                     "rope.inv_freq.default",
                     vec![inv_freq_vec.len()],
@@ -1317,7 +1337,23 @@ impl GraphLm {
                     DType::F32,
                 );
             }
-            let a = if cached {
+            let a = if let Some(taps) = &layer.conv {
+                // LFM2 `C * conv(B * x)`: q/k/v above are the B, C, x chunks of `in_proj`.
+                let kernel = taps.len() / h;
+                let bx = g.add(format!("{p}.conv.bx"), Op::Mul, &[q, vv], vec![n, h], DType::F32);
+                let w_name = format!("{p}.conv.conv.weight");
+                let taps_w = g.weight(&w_name, vec![h, kernel], DType::F32);
+                if let Some(map) = &mut w_map {
+                    map.insert(w_name, Tensor::F32(taps.clone()));
+                }
+                let mut conv_in = vec![bx, taps_w];
+                if cached {
+                    conv_in.push(g.state(format!("conv.{i}"), vec![kernel - 1, h], DType::F32));
+                }
+                let op = Op::CausalConv1dCached { kernel, dilation: 1 };
+                let conv = g.add(format!("{p}.conv.conv"), op, &conv_in, vec![n, h], DType::F32);
+                g.add(format!("{p}.conv.gate"), Op::Mul, &[k, conv], vec![n, h], DType::F32)
+            } else if cached {
                 let k_state = g.state(
                     format!("kv.{i}.k"),
                     vec![c.max_seq_len, c.num_heads * c.head_dim],
@@ -1364,7 +1400,7 @@ impl GraphLm {
             let mut o = linear(
                 &mut g,
                 &mut w_map,
-                &format!("{p}.self_attn.o_proj"),
+                &format!("{p}.{}", if layer.conv.is_some() { "conv.out_proj" } else { "self_attn.o_proj" }),
                 a,
                 &layer.out_proj,
                 n,
@@ -1565,6 +1601,8 @@ impl GraphLm {
                 format!("blk.{l}.attn_k_norm.weight"),
                 format!("model.layers.{l}.self_attn.q_norm.weight"),
                 format!("model.layers.{l}.self_attn.k_norm.weight"),
+                format!("model.layers.{l}.self_attn.q_layernorm.weight"),
+                format!("model.layers.{l}.self_attn.k_layernorm.weight"),
             ]
         };
         let consumed: std::collections::HashSet<String> =
@@ -1593,8 +1631,8 @@ impl GraphLm {
         }
         // `head_dim` gains of layer `l`'s q (or k) norm; both or neither must exist.
         let qk_norm = |l: usize, q: bool| -> Result<Option<Vec<f32>>, String> {
-            let [gq, gk, hq, hk] = qk_names(l);
-            let names = if q { [gq, hq] } else { [gk, hk] };
+            let [gq, gk, hq, hk, lq, lk] = qk_names(l);
+            let names = if q { [gq, hq, lq] } else { [gk, hk, lk] };
             let Some(n) = names.iter().find(|n| manifest.tensors.contains_key(*n)) else {
                 return Ok(None);
             };
@@ -1706,10 +1744,34 @@ impl GraphLm {
         };
         let mut layers = Vec::with_capacity(layers_count);
         for l in 0..layers_count {
+            // LFM2 gated short-conv layer: `in_proj` ([B; C; x]), the depthwise `conv` taps and `out_proj`.
+            let conv_pick = |names: [String; 2]| names.into_iter().find(|n| manifest.tensors.contains_key(n));
+            let conv = match (
+                conv_pick([format!("blk.{l}.shortconv.conv.weight"), format!("model.layers.{l}.conv.conv.weight")]),
+                conv_pick([format!("blk.{l}.shortconv.in_proj.weight"), format!("model.layers.{l}.conv.in_proj.weight")]),
+            ) {
+                (Some(taps_name), Some(in_proj)) => {
+                    if a != h {
+                        return Err(format!("layer {l}: short-conv layers need num_heads * head_dim == hidden_dim"));
+                    }
+                    if manifest.tensors.contains_key(&format!("{}bias", taps_name.trim_end_matches("weight"))) {
+                        return Err(format!("layer {l}: conv bias is not implemented by this decoder"));
+                    }
+                    let taps = manifest.extract_tensor_f32(data, &taps_name)?;
+                    let kernel = taps.len() / h;
+                    let l_cache: Option<usize> = manifest.metadata.get("lfm2.shortconv.l_cache").and_then(|s| s.parse().ok());
+                    if taps.len() % h != 0 || kernel < 2 || l_cache.is_some_and(|k| k != kernel) {
+                        return Err(format!("tensor '{taps_name}': {} taps for hidden {h} (l_cache {l_cache:?})", taps.len()));
+                    }
+                    Some((taps, in_proj))
+                }
+                _ => None,
+            };
             // norm1
             let norm1_candidates = [
                 format!("blk.{}.attn_norm.weight", l),
                 format!("model.layers.{}.input_layernorm.weight", l),
+                format!("model.layers.{}.operator_norm.weight", l),
                 format!("transformer.h.{}.ln_1.weight", l),
                 format!("gpt_neox.layers.{}.input_layernorm.weight", l),
             ];
@@ -1731,6 +1793,9 @@ impl GraphLm {
             // QKV projection
             let mut raw_qkv: Option<Vec<f32>> = None;
             let mut is_neox_qkv = false;
+            if let Some((_, in_proj)) = &conv {
+                raw_qkv = Some(ext(in_proj)?);
+            }
 
             let gguf_qkv = format!("blk.{}.attn_qkv.weight", l);
             if manifest.tensors.contains_key(&gguf_qkv) {
@@ -1849,6 +1914,9 @@ impl GraphLm {
             let out_candidates = [
                 format!("blk.{}.attn_output.weight", l),
                 format!("model.layers.{}.self_attn.o_proj.weight", l),
+                format!("blk.{}.shortconv.out_proj.weight", l),
+                format!("model.layers.{}.conv.out_proj.weight", l),
+                format!("model.layers.{}.self_attn.out_proj.weight", l),
                 format!("gpt_neox.layers.{}.attention.dense.weight", l),
                 format!("transformer.h.{}.attn.attention.out_proj.weight", l),
                 format!("transformer.h.{}.attn.c_proj.weight", l),
@@ -1873,6 +1941,7 @@ impl GraphLm {
             let norm2_candidates = [
                 format!("blk.{}.ffn_norm.weight", l),
                 format!("model.layers.{}.post_attention_layernorm.weight", l),
+                format!("model.layers.{}.ffn_norm.weight", l),
                 format!("gpt_neox.layers.{}.post_attention_layernorm.weight", l),
                 format!("transformer.h.{}.ln_2.weight", l),
             ];
@@ -1929,6 +1998,15 @@ impl GraphLm {
                 fused.extend(g);
                 fused.extend(u);
                 raw_gate_up = Some(fused);
+            } else if let (Ok(g), Ok(u)) = (
+                proj(&format!("model.layers.{l}.feed_forward.w1.weight")),
+                proj(&format!("model.layers.{l}.feed_forward.w3.weight")),
+            ) {
+                // LFM2: w1 = gate, w3 = up.
+                let mut fused = Vec::with_capacity(g.len() + u.len());
+                fused.extend(g);
+                fused.extend(u);
+                raw_gate_up = Some(fused);
             } else if let Ok(vec) = ext(&neo_fc) {
                 if config.use_gelu_mlp {
                     raw_gate_up = Some(vec);
@@ -1960,6 +2038,7 @@ impl GraphLm {
             let down_candidates = [
                 format!("blk.{}.ffn_down.weight", l),
                 format!("model.layers.{}.mlp.down_proj.weight", l),
+                format!("model.layers.{}.feed_forward.w2.weight", l),
                 format!("gpt_neox.layers.{}.mlp.dense_4h_to_h.weight", l),
                 format!("transformer.h.{}.mlp.c_proj.weight", l),
             ];
@@ -2249,16 +2328,22 @@ impl GraphLm {
                 ffn_sub_norm,
                 q_norm,
                 k_norm,
+                conv: conv.map(|(taps, _)| taps),
             });
         }
 
         // final_norm
-        let final_norm_candidates = [
+        // LFM2 names its final norm `embedding_norm` (HF) / `token_embd_norm` (GGUF).
+        let mut final_norm_candidates = vec![
             "output_norm.weight",
             "model.norm.weight",
             "gpt_neox.final_layer_norm.weight",
             "transformer.ln_f.weight",
+            "model.embedding_norm.weight",
         ];
+        if arch == Some("lfm2") {
+            final_norm_candidates.push("token_embd_norm.weight");
+        }
         let mut final_norm: Option<Vec<f32>> = None;
         for &name in &final_norm_candidates {
             if manifest.tensors.contains_key(name) {
@@ -2369,6 +2454,7 @@ impl GraphLm {
             }
             total += layer.q_norm.as_ref().map_or(0, Vec::len);
             total += layer.k_norm.as_ref().map_or(0, Vec::len);
+            total += layer.conv.as_ref().map_or(0, Vec::len);
         }
         total += self.final_norm.len();
         total += self.lm_head.in_features * self.lm_head.out_features;
@@ -2455,6 +2541,7 @@ impl GraphLm {
 
         // 2. Transformer layers
         for layer in &self.layers {
+            let heads_here = if layer.conv.is_some() { 0 } else { num_heads };
             let mut q_all: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
             let mut k_all: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
             let mut v_all: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
@@ -2497,6 +2584,12 @@ impl GraphLm {
                     head_rms_norm(&mut k_vec, kn, eps);
                 }
 
+                if layer.conv.is_some() {
+                    // short conv: q_all = C, k_all = B * x (the conv input); no RoPE or attention
+                    let (b, x) = (&qkv[..a], &qkv[2 * a..]);
+                    k_vec = b.iter().zip(x).map(|(b, x)| b * x).collect();
+                    q_vec = qkv[a..2 * a].to_vec();
+                }
                 // Rotary Position Embeddings (RoPE)
                 let rotary_dim = ((head_dim as f32) * self.config.rotary_pct) as usize;
                 let half_dim = (rotary_dim / 2).min(head_dim / 2);
@@ -2506,7 +2599,7 @@ impl GraphLm {
                 } else {
                     (1, half_dim)
                 };
-                for head in 0..num_heads {
+                for head in 0..heads_here {
                     let head_offset = head * head_dim;
                     for d in 0..half_dim {
                         let freq = 1.0
@@ -2541,7 +2634,7 @@ impl GraphLm {
             for t in 0..seq_len {
                 let mut attn_out = vec![0.0f32; a];
 
-                for head in 0..num_heads {
+                for head in 0..heads_here {
                     let head_offset = head * head_dim;
 
                     // Compute dot-product attention scores for causal history s <= t
@@ -2580,6 +2673,11 @@ impl GraphLm {
                     }
                 }
 
+                if let Some(taps) = &layer.conv {
+                    let lo = (t + 1).saturating_sub(taps.len() / h);
+                    let recent: Vec<&[f32]> = k_all[lo..=t].iter().map(Vec::as_slice).collect();
+                    short_conv(taps, &q_all[t], &recent, &mut attn_out);
+                }
                 // Output projection
                 let mut proj_out = vec![0.0f32; h];
                 if let Some(w) = &layer.attn_sub_norm {
@@ -2796,6 +2894,7 @@ impl GraphLm {
 
         for (l, layer) in self.layers.iter().enumerate() {
             let cache = &mut kv_cache[l];
+            let heads_here = if layer.conv.is_some() { 0 } else { num_heads };
 
             // 1. Norm 1 using vectorized SIMD primitives
             if self.config.use_standard_layernorm {
@@ -2829,7 +2928,7 @@ impl GraphLm {
             // Pair i is (i, i + half) for half-split RoPE, (2i, 2i + 1) for interleaved.
             let interleaved = self.config.rope_interleaved;
             let (pair_stride, pair_gap) = if interleaved { (2, 1) } else { (1, half_dim) };
-            for head in 0..num_heads {
+            for head in 0..heads_here {
                 let head_offset = head * head_dim;
                 let mut d = 0;
 
@@ -2892,13 +2991,22 @@ impl GraphLm {
             }
 
             // 4. Append K and V directly from pad.qkv into LayerKVCache
-            cache.push_kv(&pad.qkv[a..2 * a], &pad.qkv[2 * a..3 * a]);
+            if let Some(taps) = &layer.conv {
+                // ponytail: host reference path; the whole B * x history stays in `cache.k` and one row is allocated per token.
+                let bx: Vec<f32> = pad.qkv[..a].iter().zip(&pad.qkv[2 * a..]).map(|(b, x)| b * x).collect();
+                cache.push_kv(&bx, &[]);
+                let skip = cache.len.saturating_sub(taps.len() / h);
+                let recent: Vec<&[f32]> = cache.k.chunks_exact(h).skip(skip).collect();
+                short_conv(taps, &pad.qkv[a..2 * a], &recent, &mut pad.attn_out);
+            } else {
+                cache.push_kv(&pad.qkv[a..2 * a], &pad.qkv[2 * a..3 * a]);
+            }
             let current_len = cache.len;
 
             // 5. Causal attention for this token against cached 0..=pos in O(pos) time
             let scale_attn = self.config.attn_scale();
 
-            for head in 0..num_heads {
+            for head in 0..heads_here {
                 let head_offset = head * head_dim;
                 if self.config.use_hadamard_attention && head_dim.is_power_of_two() {
                     crate::quant::needle::hadamard_attention_f32(
@@ -3818,54 +3926,159 @@ mod tests {
             other => panic!("expected F32 logits, got {:?}", other),
         }
     }
-    /// Synthetic HF-named decoder checkpoint (F32 safetensors) plus an independent reference of the
-    /// architecture: no code shared with [`GraphLm`].
+    #[derive(Clone, Copy, PartialEq)]
+    enum Naming {
+        Llama,
+        Lfm2Hf,
+        Lfm2Gguf,
+    }
+
+    /// Synthetic decoder checkpoint (F32 safetensors, HF Llama / LFM2 or llama.cpp LFM2 tensor names)
+    /// plus an independent reference of the architecture: no code shared with [`GraphLm`].
     struct Tiny {
         cfg: GraphLmConfig,
         kv_heads: usize,
         qk_norm: bool,
+        naming: Naming,
+        /// Per layer: LFM2 gated short conv instead of attention.
+        conv: Vec<bool>,
+        kernel: usize,
         t: std::collections::BTreeMap<String, (Vec<usize>, Vec<f32>)>,
     }
 
     impl Tiny {
         fn new(h: usize, heads: usize, kv_heads: usize, head_dim: usize, qk_norm: bool) -> Self {
-            let (v, inter, layers) = (24, 32, 2);
+            Self::build(h, heads, kv_heads, head_dim, qk_norm, Naming::Llama, &[false, false], 0)
+        }
+
+        /// LFM2-shaped: hidden 16, 4 heads (2 kv) of 4, q/k norms, a conv layer wherever `conv` is true.
+        fn lfm2(naming: Naming, conv: &[bool], kernel: usize) -> Self {
+            Self::build(16, 4, 2, 4, true, naming, conv, kernel)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build(
+            h: usize,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            qk_norm: bool,
+            naming: Naming,
+            conv: &[bool],
+            kernel: usize,
+        ) -> Self {
+            let (v, inter, layers) = (24, 32, conv.len());
             let mut cfg = GraphLmConfig::from_hf_config(v, h, inter, layers, heads, QuantMode::Uncompressed);
             cfg.head_dim = head_dim;
             cfg.max_seq_len = 16;
-            let mut t = std::collections::BTreeMap::new();
+            let mut tiny = Self { cfg, kv_heads, qk_norm, naming, conv: conv.to_vec(), kernel, t: Default::default() };
             let mut seed = 0usize;
-            let mut put = |name: String, shape: Vec<usize>, amp: f32, bias: f32| {
+            let mut put = |tiny: &mut Self, name: String, shape: Vec<usize>, amp: f32, bias: f32| {
                 seed += 1;
                 let n: usize = shape.iter().product();
                 let vals = (0..n)
                     .map(|i| bias + amp * ((i * 7 + seed * 131) as f32 * 0.37 + (i % 13) as f32).sin())
                     .collect();
-                t.insert(name, (shape, vals));
+                tiny.t.insert(name, (shape, vals));
             };
-            put("model.embed_tokens.weight".into(), vec![v, h], 0.5, 0.0);
-            put("model.norm.weight".into(), vec![h], 0.2, 1.0);
-            for l in 0..layers {
-                let p = format!("model.layers.{l}");
-                put(format!("{p}.input_layernorm.weight"), vec![h], 0.2, 1.0);
-                put(format!("{p}.post_attention_layernorm.weight"), vec![h], 0.2, 1.0);
-                put(format!("{p}.self_attn.q_proj.weight"), vec![heads * head_dim, h], 0.4, 0.0);
-                put(format!("{p}.self_attn.k_proj.weight"), vec![kv_heads * head_dim, h], 0.4, 0.0);
-                put(format!("{p}.self_attn.v_proj.weight"), vec![kv_heads * head_dim, h], 0.4, 0.0);
-                put(format!("{p}.self_attn.o_proj.weight"), vec![h, heads * head_dim], 0.4, 0.0);
-                put(format!("{p}.mlp.gate_proj.weight"), vec![inter, h], 0.4, 0.0);
-                put(format!("{p}.mlp.up_proj.weight"), vec![inter, h], 0.4, 0.0);
-                put(format!("{p}.mlp.down_proj.weight"), vec![h, inter], 0.4, 0.0);
-                if qk_norm {
-                    put(format!("{p}.self_attn.q_norm.weight"), vec![head_dim], 0.5, 1.0);
-                    put(format!("{p}.self_attn.k_norm.weight"), vec![head_dim], 0.5, 1.0);
+            let n = |t: &Self, l: usize, what: &str| t.name(l, what);
+            let name = n(&tiny, 0, "embed");
+            put(&mut tiny, name, vec![v, h], 0.5, 0.0);
+            let name = n(&tiny, 0, "final_norm");
+            put(&mut tiny, name, vec![h], 0.2, 1.0);
+            for (l, &is_conv) in conv.iter().enumerate() {
+                let mut layer = vec![
+                    ("attn_norm", vec![h], 0.2, 1.0),
+                    ("ffn_norm", vec![h], 0.2, 1.0),
+                    ("gate", vec![inter, h], 0.4, 0.0),
+                    ("up", vec![inter, h], 0.4, 0.0),
+                    ("down", vec![h, inter], 0.4, 0.0),
+                ];
+                if is_conv {
+                    let conv_w = if naming == Naming::Lfm2Hf { vec![h, 1, kernel] } else { vec![h, kernel] };
+                    layer.extend([
+                        ("conv_in", vec![3 * h, h], 0.4, 0.0),
+                        ("conv_w", conv_w, 0.6, 0.0),
+                        ("conv_out", vec![h, h], 0.4, 0.0),
+                    ]);
+                } else {
+                    let a = heads * head_dim;
+                    layer.extend([
+                        ("q", vec![a, h], 0.4, 0.0),
+                        ("k", vec![kv_heads * head_dim, h], 0.4, 0.0),
+                        ("v", vec![kv_heads * head_dim, h], 0.4, 0.0),
+                        ("o", vec![h, a], 0.4, 0.0),
+                    ]);
+                    if qk_norm {
+                        layer.extend([("q_norm", vec![head_dim], 0.5, 1.0), ("k_norm", vec![head_dim], 0.5, 1.0)]);
+                    }
+                }
+                for (what, shape, amp, bias) in layer {
+                    let name = n(&tiny, l, what);
+                    put(&mut tiny, name, shape, amp, bias);
                 }
             }
-            Self { cfg, kv_heads, qk_norm, t }
+            tiny
+        }
+
+        fn name(&self, l: usize, what: &str) -> String {
+            let (hf, g) = (format!("model.layers.{l}"), format!("blk.{l}"));
+            match (self.naming, what) {
+                (Naming::Lfm2Gguf, "embed") => "token_embd.weight".into(),
+                (Naming::Lfm2Gguf, "final_norm") => "token_embd_norm.weight".into(),
+                (_, "embed") => "model.embed_tokens.weight".into(),
+                (Naming::Llama, "final_norm") => "model.norm.weight".into(),
+                (_, "final_norm") => "model.embedding_norm.weight".into(),
+                (Naming::Llama, w) => match w {
+                    "attn_norm" => format!("{hf}.input_layernorm.weight"),
+                    "ffn_norm" => format!("{hf}.post_attention_layernorm.weight"),
+                    "q" | "k" | "v" => format!("{hf}.self_attn.{w}_proj.weight"),
+                    "o" => format!("{hf}.self_attn.o_proj.weight"),
+                    "gate" | "up" | "down" => format!("{hf}.mlp.{w}_proj.weight"),
+                    "q_norm" | "k_norm" => format!("{hf}.self_attn.{w}.weight"),
+                    _ => unreachable!("{w}"),
+                },
+                (Naming::Lfm2Hf, w) => match w {
+                    "attn_norm" => format!("{hf}.operator_norm.weight"),
+                    "ffn_norm" => format!("{hf}.ffn_norm.weight"),
+                    "q" | "k" | "v" => format!("{hf}.self_attn.{w}_proj.weight"),
+                    "o" => format!("{hf}.self_attn.out_proj.weight"),
+                    "gate" => format!("{hf}.feed_forward.w1.weight"),
+                    "up" => format!("{hf}.feed_forward.w3.weight"),
+                    "down" => format!("{hf}.feed_forward.w2.weight"),
+                    "q_norm" => format!("{hf}.self_attn.q_layernorm.weight"),
+                    "k_norm" => format!("{hf}.self_attn.k_layernorm.weight"),
+                    "conv_in" => format!("{hf}.conv.in_proj.weight"),
+                    "conv_w" => format!("{hf}.conv.conv.weight"),
+                    "conv_out" => format!("{hf}.conv.out_proj.weight"),
+                    _ => unreachable!("{w}"),
+                },
+                (Naming::Lfm2Gguf, w) => match w {
+                    "attn_norm" | "ffn_norm" => format!("{g}.{w}.weight"),
+                    "q" | "k" | "v" => format!("{g}.attn_{w}.weight"),
+                    "o" => format!("{g}.attn_output.weight"),
+                    "gate" | "up" | "down" => format!("{g}.ffn_{w}.weight"),
+                    "q_norm" => format!("{g}.attn_q_norm.weight"),
+                    "k_norm" => format!("{g}.attn_k_norm.weight"),
+                    "conv_in" => format!("{g}.shortconv.in_proj.weight"),
+                    "conv_w" => format!("{g}.shortconv.conv.weight"),
+                    "conv_out" => format!("{g}.shortconv.out_proj.weight"),
+                    _ => unreachable!("{w}"),
+                },
+            }
         }
 
         fn bytes(&self) -> Vec<u8> {
             let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
+            if self.naming == Naming::Lfm2Gguf {
+                header.insert(
+                    "__metadata__".into(),
+                    serde_json::json!({
+                        "general.architecture": "lfm2",
+                        "lfm2.shortconv.l_cache": self.kernel.to_string(),
+                    }),
+                );
+            }
             for (name, (shape, vals)) in &self.t {
                 let start = data.len();
                 vals.iter().for_each(|v| data.extend_from_slice(&v.to_le_bytes()));
@@ -3885,12 +4098,12 @@ mod tests {
             GraphLm::from_safetensors_data(self.cfg.clone(), &self.bytes())
         }
 
-        /// Last-position logits of a plain pre-norm Llama-style decoder (half-split RoPE, SwiGLU,
-        /// GQA by repeating kv heads, optional per-head q/k RMSNorm before RoPE), tied head.
+        /// Last-position logits of a pre-norm decoder (half-split RoPE, SwiGLU, GQA by repeating kv heads,
+        /// optional per-head q/k RMSNorm before RoPE, optional LFM2 gated short-conv layers), tied head.
         fn reference(&self, tokens: &[u32]) -> Vec<f32> {
             let c = &self.cfg;
             let (h, nh, hd, kvh) = (c.hidden_dim, c.num_heads, c.head_dim, self.kv_heads);
-            let w = |n: &str| &self.t[n].1;
+            let w = |l: usize, what: &str| &self.t[&self.name(l, what)].1;
             let mv = |m: &[f32], x: &[f32]| -> Vec<f32> {
                 m.chunks(x.len()).map(|r| r.iter().zip(x).map(|(a, b)| a * b).sum()).collect()
             };
@@ -3898,63 +4111,87 @@ mod tests {
                 let s = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + c.norm_eps).sqrt();
                 x.iter().zip(g).map(|(v, g)| v * s * g).collect()
             };
-            let emb = w("model.embed_tokens.weight");
+            let emb = w(0, "embed");
             let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| emb[t as usize * h..][..h].to_vec()).collect();
             for l in 0..c.num_layers {
-                let p = format!("model.layers.{l}");
-                let (mut qs, mut ks, mut vs) = (vec![], vec![], vec![]);
-                for (pos, x) in xs.iter().enumerate() {
-                    let n1 = rms(x, w(&format!("{p}.input_layernorm.weight")));
-                    let mut q = mv(w(&format!("{p}.self_attn.q_proj.weight")), &n1);
-                    let mut k = mv(w(&format!("{p}.self_attn.k_proj.weight")), &n1);
-                    vs.push(mv(w(&format!("{p}.self_attn.v_proj.weight")), &n1));
-                    for (x, heads, name) in [(&mut q, nh, "q_norm"), (&mut k, kvh, "k_norm")] {
-                        for head in x.chunks_mut(hd) {
-                            if self.qk_norm {
-                                head.copy_from_slice(&rms(head, w(&format!("{p}.self_attn.{name}.weight"))));
-                            }
-                            for d in 0..hd / 2 {
-                                let th = pos as f32 * c.rope_theta.powf(-((2 * d) as f32) / hd as f32);
-                                let (x0, x1) = (head[d], head[d + hd / 2]);
-                                head[d] = x0 * th.cos() - x1 * th.sin();
-                                head[d + hd / 2] = x1 * th.cos() + x0 * th.sin();
-                            }
-                        }
-                        assert_eq!(x.len(), heads * hd);
+                // Per position: the mixer's output before the residual add.
+                let mut mixed: Vec<Vec<f32>> = vec![];
+                let n1: Vec<Vec<f32>> = xs.iter().map(|x| rms(x, w(l, "attn_norm"))).collect();
+                if self.conv[l] {
+                    let (mut cs, mut bx) = (vec![], vec![]);
+                    for n in &n1 {
+                        let bcx = mv(w(l, "conv_in"), n);
+                        cs.push(bcx[h..2 * h].to_vec());
+                        bx.push((0..h).map(|i| bcx[i] * bcx[2 * h + i]).collect::<Vec<f32>>());
                     }
-                    qs.push(q);
-                    ks.push(k);
-                }
-                for t in 0..xs.len() {
-                    let mut att = vec![0.0f32; nh * hd];
-                    for head in 0..nh {
-                        let kv = head / (nh / kvh);
-                        let sc: Vec<f32> = (0..=t)
-                            .map(|s| {
-                                let d: f32 = (0..hd).map(|d| qs[t][head * hd + d] * ks[s][kv * hd + d]).sum();
-                                d / (hd as f32).sqrt()
+                    let k = self.kernel;
+                    for t in 0..xs.len() {
+                        let y: Vec<f32> = (0..h)
+                            .map(|ch| {
+                                let conv: f32 = (0..k)
+                                    .filter(|tap| t + tap + 1 >= k)
+                                    .map(|tap| w(l, "conv_w")[ch * k + tap] * bx[t + tap + 1 - k][ch])
+                                    .sum();
+                                cs[t][ch] * conv
                             })
                             .collect();
-                        let m = sc.iter().cloned().fold(f32::MIN, f32::max);
-                        let e: Vec<f32> = sc.iter().map(|v| (v - m).exp()).collect();
-                        let z: f32 = e.iter().sum();
-                        for (s, e) in e.iter().enumerate() {
-                            for d in 0..hd {
-                                att[head * hd + d] += e / z * vs[s][kv * hd + d];
+                        mixed.push(mv(w(l, "conv_out"), &y));
+                    }
+                } else {
+                    let (mut qs, mut ks, mut vs) = (vec![], vec![], vec![]);
+                    for (pos, n) in n1.iter().enumerate() {
+                        let mut q = mv(w(l, "q"), n);
+                        let mut k = mv(w(l, "k"), n);
+                        vs.push(mv(w(l, "v"), n));
+                        for (x, heads, what) in [(&mut q, nh, "q_norm"), (&mut k, kvh, "k_norm")] {
+                            for head in x.chunks_mut(hd) {
+                                if self.qk_norm {
+                                    head.copy_from_slice(&rms(head, w(l, what)));
+                                }
+                                for d in 0..hd / 2 {
+                                    let th = pos as f32 * c.rope_theta.powf(-((2 * d) as f32) / hd as f32);
+                                    let (x0, x1) = (head[d], head[d + hd / 2]);
+                                    head[d] = x0 * th.cos() - x1 * th.sin();
+                                    head[d + hd / 2] = x1 * th.cos() + x0 * th.sin();
+                                }
+                            }
+                            assert_eq!(x.len(), heads * hd);
+                        }
+                        qs.push(q);
+                        ks.push(k);
+                    }
+                    for t in 0..xs.len() {
+                        let mut att = vec![0.0f32; nh * hd];
+                        for head in 0..nh {
+                            let kv = head / (nh / kvh);
+                            let sc: Vec<f32> = (0..=t)
+                                .map(|s| {
+                                    let d: f32 = (0..hd).map(|d| qs[t][head * hd + d] * ks[s][kv * hd + d]).sum();
+                                    d / (hd as f32).sqrt()
+                                })
+                                .collect();
+                            let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                            let e: Vec<f32> = sc.iter().map(|v| (v - m).exp()).collect();
+                            let z: f32 = e.iter().sum();
+                            for (s, e) in e.iter().enumerate() {
+                                for d in 0..hd {
+                                    att[head * hd + d] += e / z * vs[s][kv * hd + d];
+                                }
                             }
                         }
+                        mixed.push(mv(w(l, "o"), &att));
                     }
-                    let o = mv(w(&format!("{p}.self_attn.o_proj.weight")), &att);
-                    xs[t].iter_mut().zip(&o).for_each(|(x, o)| *x += o);
-                    let n2 = rms(&xs[t], w(&format!("{p}.post_attention_layernorm.weight")));
-                    let g = mv(w(&format!("{p}.mlp.gate_proj.weight")), &n2);
-                    let u = mv(w(&format!("{p}.mlp.up_proj.weight")), &n2);
+                }
+                for (x, o) in xs.iter_mut().zip(&mixed) {
+                    x.iter_mut().zip(o).for_each(|(x, o)| *x += o);
+                    let n2 = rms(x, w(l, "ffn_norm"));
+                    let (g, u) = (mv(w(l, "gate"), &n2), mv(w(l, "up"), &n2));
                     let a: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
-                    let d = mv(w(&format!("{p}.mlp.down_proj.weight")), &a);
-                    xs[t].iter_mut().zip(&d).for_each(|(x, d)| *x += d);
+                    let d = mv(w(l, "down"), &a);
+                    x.iter_mut().zip(&d).for_each(|(x, d)| *x += d);
                 }
             }
-            let last = rms(xs.last().unwrap(), w("model.norm.weight"));
+            let last = rms(xs.last().unwrap(), w(0, "final_norm"));
             mv(emb, &last)
         }
     }
@@ -4078,5 +4315,75 @@ mod tests {
         };
         assert_eq!(gguf(&[]).head_dim, 64);
         assert_eq!(gguf(&[("attention.key_length", "128")]).attn_dim(), 2048);
+    }
+
+    /// Token-at-a-time decode graph with persistent state (KV rows, conv windows): last logits.
+    fn decode_logits(model: &GraphLm, tokens: &[u32]) -> Vec<f32> {
+        let (g, w) = model.build_graph(1, true);
+        let mut state = crate::graph::StateStore::new();
+        let mut last = vec![];
+        for (p, &t) in tokens.iter().enumerate() {
+            let inputs = vec![crate::graph::Tensor::U32(vec![t]), crate::graph::Tensor::U32(vec![p as u32])];
+            last = match crate::graph::cpu::run(&g, &w, &mut state, inputs).expect("decode runs").remove(0) {
+                crate::graph::Tensor::F32(l) => l,
+                other => panic!("expected F32 logits, got {other:?}"),
+            };
+        }
+        last
+    }
+
+    /// LFM2 (HF and llama.cpp names): hybrid gated short-conv + attention layers with q/k norms and GQA.
+    /// Prefill graph, cached graph, token-by-token decode graph, host forward and host KV path all match
+    /// an independent reference; the conv taps reach back further than the first tokens.
+    #[test]
+    fn lfm2_short_conv_hybrid_matches_reference() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let tokens = [3u32, 17, 5, 9, 21, 2];
+        for naming in [Naming::Lfm2Hf, Naming::Lfm2Gguf] {
+            let tiny = Tiny::lfm2(naming, &[true, false, true, true, false], 3);
+            let model = tiny.load().expect("loads");
+            assert_eq!(
+                model.layers.iter().map(|l| l.conv.is_some()).collect::<Vec<_>>(),
+                [true, false, true, true, false]
+            );
+            let want = tiny.reference(&tokens);
+            assert_close(&model.forward(&tokens), &want, "host");
+            for (cached, got) in [true, false].into_iter().zip(graph_logits(&model, &tokens)) {
+                assert_close(&got, &want, &format!("graph cached={cached}"));
+            }
+            assert_close(&decode_logits(&model, &tokens), &want, "decode graph");
+            let mut kv: Vec<LayerKVCache> = (0..model.layers.len())
+                .map(|_| LayerKVCache::new(model.config.max_seq_len, model.config.hidden_dim))
+                .collect();
+            let mut last = vec![];
+            for (p, &t) in tokens.iter().enumerate() {
+                last = model.forward_token_with_kv(t, p, &mut kv);
+            }
+            assert_close(&last, &want, "host kv");
+        }
+    }
+
+    /// A conv bias or a taps count disagreeing with `lfm2.shortconv.l_cache` fails the load.
+    #[test]
+    fn lfm2_conv_bias_and_cache_mismatch_are_rejected() {
+        let mut bias = Tiny::lfm2(Naming::Lfm2Hf, &[true, false], 3);
+        bias.t.insert("model.layers.0.conv.conv.bias".into(), (vec![16], vec![0.0; 16]));
+        assert!(bias.load().expect_err("bias").contains("conv bias"));
+        let mut cache = Tiny::lfm2(Naming::Lfm2Gguf, &[true, false], 3);
+        cache.kernel = 2;
+        assert!(cache.load().expect_err("l_cache").contains("l_cache"));
+    }
+
+    /// LFM2 `config.json`: `intermediate_size` 6656 is the pre-adjust width (real MLP 4608), `norm_eps` is the epsilon.
+    #[test]
+    fn lfm2_hf_config_resolves_ff_dim_and_eps() {
+        let hf: crate::model::hf_loader::HfConfigJson = serde_json::from_str(
+            r#"{"model_type":"lfm2","hidden_size":1024,"num_hidden_layers":16,"num_attention_heads":16,
+                "intermediate_size":6656,"block_auto_adjust_ff_dim":true,"block_ffn_dim_multiplier":1.0,
+                "block_multiple_of":256,"norm_eps":2e-5}"#,
+        )
+        .unwrap();
+        let cfg = GraphLmConfig::from_hf(&hf, QuantMode::Uncompressed);
+        assert_eq!((cfg.intermediate_dim, cfg.norm_eps), (4608, 2e-5));
     }
 }
