@@ -583,6 +583,9 @@ pub struct GraphLayer {
     pub attn_sub_norm: Option<Vec<f32>>,
     /// BitNet RMSNorm on the gated MLP activation before `down_proj`.
     pub ffn_sub_norm: Option<Vec<f32>>,
+    /// Per-head RMSNorm gains (`head_dim`) on q and k before RoPE (Qwen3, LFM2 attention).
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
 }
 
 /// BitNet BitLinear activation quant (transformers `ActQuant`, 1bitLLM `activation_quant`): rounds
@@ -612,6 +615,11 @@ fn rms_norm_inplace(x: &mut [f32], w: &[f32], eps: f32) {
     for (v, g) in x.iter_mut().zip(w) {
         *v *= scale * g;
     }
+}
+
+/// Per-head RMSNorm in place: `x` is a row of heads, `w` the `head_dim` gains shared by every head.
+fn head_rms_norm(x: &mut [f32], w: &[f32], eps: f32) {
+    x.chunks_exact_mut(w.len()).for_each(|head| rms_norm_inplace(head, w, eps));
 }
 
 /// Helper to extract/dequantize f32 weights from a [`QuantizedLinearLayer`].
@@ -955,6 +963,8 @@ impl GraphLm {
                 post_ffw_norm: None,
                 attn_sub_norm: None,
                 ffn_sub_norm: None,
+                q_norm: None,
+                k_norm: None,
             });
         }
 
@@ -1146,6 +1156,23 @@ impl GraphLm {
             let op = Op::Unary { kind: crate::graph::UnaryKind::Scale(s) };
             g.add(name, op, &[x], shape, DType::F32)
         }
+        /// Per-head RMSNorm: a `head_dim`-wide gain over each head of `x`.
+        fn head_norm(
+            g: &mut Graph,
+            w_map: &mut Option<&mut crate::graph::Weights>,
+            name: String,
+            x: ValueId,
+            gamma: &[f32],
+            eps: f32,
+            shape: Vec<usize>,
+        ) -> ValueId {
+            let w_name = format!("{name}.weight");
+            let w = g.weight(&w_name, vec![gamma.len()], DType::F32);
+            if let Some(map) = w_map {
+                map.insert(w_name, Tensor::F32(gamma.to_vec()));
+            }
+            g.add(name, Op::RmsNorm { eps }, &[x, w], shape, DType::F32)
+        }
 
         let c = &self.config;
         let (h, v, inter, eps, ln) = (
@@ -1252,6 +1279,11 @@ impl GraphLm {
             let mut q = slice(&mut g, format!("{p}.self_attn.q"), qkv, 0, h, n);
             let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, h, 2 * h, n);
             let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * h, 3 * h, n);
+            if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                // `RmsNorm` with a head_dim-wide gain normalises each head of the row.
+                q = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.q_norm"), q, qn, eps, vec![n, h]);
+                k = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.k_norm"), k, kn, eps, vec![n, h]);
+            }
             if rotary_dim > 0 {
                 let inv_freq_val = g.weight(
                     "rope.inv_freq.default",
@@ -1515,16 +1547,57 @@ impl GraphLm {
         let h = config.hidden_dim;
         let inter = config.intermediate_dim;
         let layers_count = config.num_layers;
-        // ponytail: deny-list of known per-head q/k norms, not a full consumed-tensor audit.
+        // Per-head q/k RMSNorm (`head_dim` gains, before RoPE) is consumed below; any other tensor of
+        // that family (hunyuan's after-RoPE `query_layernorm`, a vision tower's, full-width OLMo2) is not.
+        let qk_names = |l: usize| {
+            [
+                format!("blk.{l}.attn_q_norm.weight"),
+                format!("blk.{l}.attn_k_norm.weight"),
+                format!("model.layers.{l}.self_attn.q_norm.weight"),
+                format!("model.layers.{l}.self_attn.k_norm.weight"),
+            ]
+        };
+        let consumed: std::collections::HashSet<String> =
+            (0..layers_count).flat_map(qk_names).collect();
         if let Some(n) = manifest.tensors.keys().find(|n| {
             ["q_norm.", "k_norm.", "query_layernorm.", "key_layernorm."]
                 .iter()
                 .any(|s| n.contains(s))
+                && !consumed.contains(*n)
         }) {
             return Err(format!(
                 "tensor '{n}': per-head q/k RMSNorm is not implemented by this decoder"
             ));
         }
+        // Gemma 3 / EXAONE 4 carry q/k norms but also sliding-window layers, per-layer RoPE bases and
+        // (Gemma) scaled embeddings, none of which this decoder has: refuse instead of running a
+        // plausible-looking wrong model.
+        let arch = manifest.metadata.get("general.architecture").map(String::as_str);
+        let sandwich_qk = manifest.tensors.contains_key("model.layers.0.pre_feedforward_layernorm.weight")
+            && manifest.tensors.contains_key("model.layers.0.self_attn.q_norm.weight");
+        if matches!(arch, Some("gemma3" | "exaone4")) || sandwich_qk {
+            return Err(format!(
+                "architecture '{}' (sliding-window layers, per-layer RoPE, scaled embeddings) is not implemented on the dense path",
+                arch.unwrap_or("gemma3")
+            ));
+        }
+        // `head_dim` gains of layer `l`'s q (or k) norm; both or neither must exist.
+        let qk_norm = |l: usize, q: bool| -> Result<Option<Vec<f32>>, String> {
+            let [gq, gk, hq, hk] = qk_names(l);
+            let names = if q { [gq, hq] } else { [gk, hk] };
+            let Some(n) = names.iter().find(|n| manifest.tensors.contains_key(*n)) else {
+                return Ok(None);
+            };
+            let w = manifest.extract_tensor_f32(data, n)?;
+            if w.len() != config.head_dim {
+                return Err(format!(
+                    "tensor '{n}': {} gains, expected head_dim {} (full-width q/k norm is not implemented)",
+                    w.len(),
+                    config.head_dim
+                ));
+            }
+            Ok(Some(w))
+        };
 
         // Try candidate embedding names
         let embed_candidates = [
@@ -2160,6 +2233,8 @@ impl GraphLm {
                 post_ffw_norm,
                 attn_sub_norm,
                 ffn_sub_norm,
+                q_norm: qk_norm(l, true)?,
+                k_norm: qk_norm(l, false)?,
             });
         }
 
@@ -2278,6 +2353,8 @@ impl GraphLm {
             if let Some(pfn) = &layer.post_ffw_norm {
                 total += pfn.len();
             }
+            total += layer.q_norm.as_ref().map_or(0, Vec::len);
+            total += layer.k_norm.as_ref().map_or(0, Vec::len);
         }
         total += self.final_norm.len();
         total += self.lm_head.in_features * self.lm_head.out_features;
@@ -2400,6 +2477,10 @@ impl GraphLm {
                 let mut q_vec = qkv[0..h].to_vec();
                 let mut k_vec = qkv[h..2 * h].to_vec();
                 let v_vec = qkv[2 * h..3 * h].to_vec();
+                if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                    head_rms_norm(&mut q_vec, qn, eps);
+                    head_rms_norm(&mut k_vec, kn, eps);
+                }
 
                 // Rotary Position Embeddings (RoPE)
                 let rotary_dim = ((head_dim as f32) * self.config.rotary_pct) as usize;
@@ -2723,6 +2804,10 @@ impl GraphLm {
                 act_quant(&mut pad.norm1_x, bits);
             }
             layer.qkv_proj.forward(&pad.norm1_x, &mut pad.qkv);
+            if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
+                head_rms_norm(&mut pad.qkv[..h], qn, eps);
+                head_rms_norm(&mut pad.qkv[h..2 * h], kn, eps);
+            }
 
             // 3. Rotary Position Embeddings (RoPE) at position pos in-place on pad.qkv
             // Pair i is (i, i + half) for half-split RoPE, (2i, 2i + 1) for interleaved.
@@ -3716,5 +3801,211 @@ mod tests {
             }
             other => panic!("expected F32 logits, got {:?}", other),
         }
+    }
+    /// Synthetic HF-named decoder checkpoint (F32 safetensors) plus an independent reference of the
+    /// architecture: no code shared with [`GraphLm`].
+    struct Tiny {
+        cfg: GraphLmConfig,
+        kv_heads: usize,
+        qk_norm: bool,
+        t: std::collections::BTreeMap<String, (Vec<usize>, Vec<f32>)>,
+    }
+
+    impl Tiny {
+        fn new(h: usize, heads: usize, kv_heads: usize, head_dim: usize, qk_norm: bool) -> Self {
+            let (v, inter, layers) = (24, 32, 2);
+            let mut cfg = GraphLmConfig::from_hf_config(v, h, inter, layers, heads, QuantMode::Uncompressed);
+            cfg.head_dim = head_dim;
+            cfg.max_seq_len = 16;
+            let mut t = std::collections::BTreeMap::new();
+            let mut seed = 0usize;
+            let mut put = |name: String, shape: Vec<usize>, amp: f32, bias: f32| {
+                seed += 1;
+                let n: usize = shape.iter().product();
+                let vals = (0..n)
+                    .map(|i| bias + amp * ((i * 7 + seed * 131) as f32 * 0.37 + (i % 13) as f32).sin())
+                    .collect();
+                t.insert(name, (shape, vals));
+            };
+            put("model.embed_tokens.weight".into(), vec![v, h], 0.5, 0.0);
+            put("model.norm.weight".into(), vec![h], 0.2, 1.0);
+            for l in 0..layers {
+                let p = format!("model.layers.{l}");
+                put(format!("{p}.input_layernorm.weight"), vec![h], 0.2, 1.0);
+                put(format!("{p}.post_attention_layernorm.weight"), vec![h], 0.2, 1.0);
+                put(format!("{p}.self_attn.q_proj.weight"), vec![heads * head_dim, h], 0.4, 0.0);
+                put(format!("{p}.self_attn.k_proj.weight"), vec![kv_heads * head_dim, h], 0.4, 0.0);
+                put(format!("{p}.self_attn.v_proj.weight"), vec![kv_heads * head_dim, h], 0.4, 0.0);
+                put(format!("{p}.self_attn.o_proj.weight"), vec![h, heads * head_dim], 0.4, 0.0);
+                put(format!("{p}.mlp.gate_proj.weight"), vec![inter, h], 0.4, 0.0);
+                put(format!("{p}.mlp.up_proj.weight"), vec![inter, h], 0.4, 0.0);
+                put(format!("{p}.mlp.down_proj.weight"), vec![h, inter], 0.4, 0.0);
+                if qk_norm {
+                    put(format!("{p}.self_attn.q_norm.weight"), vec![head_dim], 0.5, 1.0);
+                    put(format!("{p}.self_attn.k_norm.weight"), vec![head_dim], 0.5, 1.0);
+                }
+            }
+            Self { cfg, kv_heads, qk_norm, t }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            let (mut header, mut data) = (serde_json::Map::new(), Vec::new());
+            for (name, (shape, vals)) in &self.t {
+                let start = data.len();
+                vals.iter().for_each(|v| data.extend_from_slice(&v.to_le_bytes()));
+                header.insert(
+                    name.clone(),
+                    serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
+                );
+            }
+            let header = serde_json::to_vec(&header).unwrap();
+            let mut out = (header.len() as u64).to_le_bytes().to_vec();
+            out.extend(header);
+            out.extend(data);
+            out
+        }
+
+        fn load(&self) -> Result<GraphLm, String> {
+            GraphLm::from_safetensors_data(self.cfg.clone(), &self.bytes())
+        }
+
+        /// Last-position logits of a plain pre-norm Llama-style decoder (half-split RoPE, SwiGLU,
+        /// GQA by repeating kv heads, optional per-head q/k RMSNorm before RoPE), tied head.
+        fn reference(&self, tokens: &[u32]) -> Vec<f32> {
+            let c = &self.cfg;
+            let (h, nh, hd, kvh) = (c.hidden_dim, c.num_heads, c.head_dim, self.kv_heads);
+            let w = |n: &str| &self.t[n].1;
+            let mv = |m: &[f32], x: &[f32]| -> Vec<f32> {
+                m.chunks(x.len()).map(|r| r.iter().zip(x).map(|(a, b)| a * b).sum()).collect()
+            };
+            let rms = |x: &[f32], g: &[f32]| -> Vec<f32> {
+                let s = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + c.norm_eps).sqrt();
+                x.iter().zip(g).map(|(v, g)| v * s * g).collect()
+            };
+            let emb = w("model.embed_tokens.weight");
+            let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| emb[t as usize * h..][..h].to_vec()).collect();
+            for l in 0..c.num_layers {
+                let p = format!("model.layers.{l}");
+                let (mut qs, mut ks, mut vs) = (vec![], vec![], vec![]);
+                for (pos, x) in xs.iter().enumerate() {
+                    let n1 = rms(x, w(&format!("{p}.input_layernorm.weight")));
+                    let mut q = mv(w(&format!("{p}.self_attn.q_proj.weight")), &n1);
+                    let mut k = mv(w(&format!("{p}.self_attn.k_proj.weight")), &n1);
+                    vs.push(mv(w(&format!("{p}.self_attn.v_proj.weight")), &n1));
+                    for (x, heads, name) in [(&mut q, nh, "q_norm"), (&mut k, kvh, "k_norm")] {
+                        for head in x.chunks_mut(hd) {
+                            if self.qk_norm {
+                                head.copy_from_slice(&rms(head, w(&format!("{p}.self_attn.{name}.weight"))));
+                            }
+                            for d in 0..hd / 2 {
+                                let th = pos as f32 * c.rope_theta.powf(-((2 * d) as f32) / hd as f32);
+                                let (x0, x1) = (head[d], head[d + hd / 2]);
+                                head[d] = x0 * th.cos() - x1 * th.sin();
+                                head[d + hd / 2] = x1 * th.cos() + x0 * th.sin();
+                            }
+                        }
+                        assert_eq!(x.len(), heads * hd);
+                    }
+                    qs.push(q);
+                    ks.push(k);
+                }
+                for t in 0..xs.len() {
+                    let mut att = vec![0.0f32; nh * hd];
+                    for head in 0..nh {
+                        let kv = head / (nh / kvh);
+                        let sc: Vec<f32> = (0..=t)
+                            .map(|s| {
+                                let d: f32 = (0..hd).map(|d| qs[t][head * hd + d] * ks[s][kv * hd + d]).sum();
+                                d / (hd as f32).sqrt()
+                            })
+                            .collect();
+                        let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                        let e: Vec<f32> = sc.iter().map(|v| (v - m).exp()).collect();
+                        let z: f32 = e.iter().sum();
+                        for (s, e) in e.iter().enumerate() {
+                            for d in 0..hd {
+                                att[head * hd + d] += e / z * vs[s][kv * hd + d];
+                            }
+                        }
+                    }
+                    let o = mv(w(&format!("{p}.self_attn.o_proj.weight")), &att);
+                    xs[t].iter_mut().zip(&o).for_each(|(x, o)| *x += o);
+                    let n2 = rms(&xs[t], w(&format!("{p}.post_attention_layernorm.weight")));
+                    let g = mv(w(&format!("{p}.mlp.gate_proj.weight")), &n2);
+                    let u = mv(w(&format!("{p}.mlp.up_proj.weight")), &n2);
+                    let a: Vec<f32> = g.iter().zip(&u).map(|(g, u)| g / (1.0 + (-g).exp()) * u).collect();
+                    let d = mv(w(&format!("{p}.mlp.down_proj.weight")), &a);
+                    xs[t].iter_mut().zip(&d).for_each(|(x, d)| *x += d);
+                }
+            }
+            let last = rms(xs.last().unwrap(), w("model.norm.weight"));
+            mv(emb, &last)
+        }
+    }
+
+    /// Runs `model`'s prefill and cached-decode graphs on the CPU executor; last-row logits per path.
+    fn graph_logits(model: &GraphLm, tokens: &[u32]) -> Vec<Vec<f32>> {
+        let v = model.config.vocab_size;
+        let pos: Vec<u32> = (0..tokens.len() as u32).collect();
+        [true, false]
+            .into_iter()
+            .map(|cached| {
+                let (g, w) = model.build_graph(tokens.len(), cached);
+                let inputs = vec![
+                    crate::graph::Tensor::U32(tokens.to_vec()),
+                    crate::graph::Tensor::U32(pos.clone()),
+                ];
+                let mut state = crate::graph::StateStore::new();
+                match crate::graph::cpu::run(&g, &w, &mut state, inputs).expect("graph runs").remove(0) {
+                    crate::graph::Tensor::F32(l) => l[l.len() - v..].to_vec(),
+                    other => panic!("expected F32 logits, got {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-3 * (1.0 + w.abs()), "{what} logit {i}: got {g}, want {w}");
+        }
+    }
+
+    /// Qwen3-style per-head q/k RMSNorm: the graph (prefill and cached) and the host forward match an
+    /// independent reference, and the norm visibly changes the logits.
+    #[test]
+    fn qk_norm_graph_and_host_match_reference() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let tokens = [3u32, 17, 5, 9];
+        let tiny = Tiny::new(16, 2, 2, 8, true);
+        let want = tiny.reference(&tokens);
+        let plain = Tiny { qk_norm: false, ..Tiny::new(16, 2, 2, 8, false) };
+        assert!(want.iter().zip(plain.reference(&tokens)).any(|(a, b)| (a - b).abs() > 1e-2));
+
+        let model = tiny.load().expect("loads with q/k norms");
+        assert!(model.layers.iter().all(|l| l.q_norm.is_some() && l.k_norm.is_some()));
+        assert_close(&model.forward(&tokens), &want, "host");
+        for (cached, got) in [true, false].into_iter().zip(graph_logits(&model, &tokens)) {
+            assert_close(&got, &want, &format!("graph cached={cached}"));
+        }
+    }
+
+    /// Norm tensors the decoder does not consume still fail the load: full-width (OLMo2-style) gains,
+    /// after-RoPE hunyuan names, and Gemma 3 (norms plus layers this decoder lacks).
+    #[test]
+    fn unconsumed_qk_norm_tensors_are_rejected() {
+        let mut full = Tiny::new(16, 2, 2, 8, true);
+        let wide = (vec![16], vec![1.0; 16]);
+        full.t.insert("model.layers.0.self_attn.q_norm.weight".into(), wide);
+        let e = full.load().expect_err("full-width q norm");
+        assert!(e.contains("head_dim"), "{e}");
+
+        let mut hunyuan = Tiny::new(16, 2, 2, 8, false);
+        hunyuan.t.insert("model.layers.0.self_attn.query_layernorm.weight".into(), (vec![8], vec![1.0; 8]));
+        assert!(hunyuan.load().expect_err("after-RoPE norm").contains("not implemented"));
+
+        let mut gemma = Tiny::new(16, 2, 2, 8, true);
+        gemma.t.insert("model.layers.0.pre_feedforward_layernorm.weight".into(), (vec![16], vec![1.0; 16]));
+        assert!(gemma.load().expect_err("gemma3").contains("sliding-window"));
     }
 }
