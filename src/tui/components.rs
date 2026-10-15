@@ -8,7 +8,7 @@ use super::widgets::{gauge, instrument, orbit, spark, stacked_bar, text_width, t
 use super::{Load, TuiApp};
 use crate::model::weight_format::MAX_MEAN_KL;
 use crate::scheduler::SequenceState;
-use crate::telemetry::TelemetrySnapshot;
+use crate::telemetry::{gpu_share, KernelSort, TelemetrySnapshot};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -104,6 +104,11 @@ pub(super) fn codec_bench_text(codec: (u8, usize, usize)) -> String {
         (2, _, _) => "codec-bench ✓".to_string(),
         _ => "codec-bench —".to_string(),
     }
+}
+
+/// One row of the Kernels table: the kind, then right-aligned numeric columns.
+fn kernel_line(kind: &str, steps: String, us: String, share: String, gbps: String, pct: String) -> String {
+    format!("{kind:<11}{steps:>5}{us:>6}{share:>6}{gbps:>6}{pct:>4}")
 }
 
 /// Parts joined by `sep`, left to right while they fit; the rest are dropped.
@@ -1036,7 +1041,7 @@ impl TuiApp {
         let item = |i: usize| -> Vec<Span<'static>> {
             vec![
                 Span::styled("■ ", th.fg(parts[i].1)),
-                Span::styled(format!("{} {:.2}", parts[i].0, ms[i]), ink),
+                Span::styled(format!("{} {:.3}", parts[i].0, ms[i]), ink),
             ]
         };
         let mut lines = vec![Line::from(stacked_bar(&bar, w, th))];
@@ -1047,27 +1052,27 @@ impl TuiApp {
             let mut spans = Vec::new();
             for (i, m) in ms.iter().enumerate() {
                 spans.push(Span::styled("■", th.fg(parts[i].1)));
-                spans.push(Span::styled(format!("{m:.2} "), ink));
+                spans.push(Span::styled(format!("{m:.3} "), ink));
             }
             spans.push(Span::styled("ms", dim));
             lines.push(Line::from(spans));
         }
-        let to_90 = g.ms_to(0.9);
-        lines.push(Line::from(if g.weights_ms <= 0.0 {
-            Span::styled("to 90%: ceiling unmeasured", dim)
-        } else if to_90 > 0.0 {
-            Span::styled(format!("to 90%: -{to_90:.2} ms"), th.fg(Token::Ember))
-        } else {
-            Span::styled(
-                format!("90% reached ({:.2} ms to spare)", -to_90),
-                th.fg(Token::Jade),
-            )
+        lines.push(Line::from(match g.deficit_labels(0.9) {
+            None => Span::styled("to 90%: ceiling unmeasured", dim),
+            Some((long, short)) => {
+                let reached = g.ms_to(0.9) <= 0.0;
+                let text = if text_width(&long) <= w { long } else { short };
+                Span::styled(
+                    trunc(&text, w),
+                    th.fg(if reached { Token::Jade } else { Token::Ember }),
+                )
+            }
         }));
         if h >= 5 {
             lines.push(Line::from(Span::styled(
                 trunc(
                     &format!(
-                        "wall {:.2} · run {:.2} · gpu {:.2} ms · {:.0} disp",
+                        "wall {:.3} · run {:.3} · gpu {:.3} ms · {:.0} disp",
                         g.wall_ms, g.run_ms, g.gpu_ms, g.dispatches
                     ),
                     w,
@@ -1107,23 +1112,43 @@ impl TuiApp {
             f.render_widget(Paragraph::new(Span::styled(trunc(text, w), dim)), inner);
             return;
         };
+        let mark = |col: KernelSort, s: &str| {
+            if self.kernel_sort == col {
+                format!("{s}▼")
+            } else {
+                s.to_string()
+            }
+        };
         let mut lines = vec![Line::from(Span::styled(
             trunc(
-                &format!("{:<12}{:>5}{:>7}{:>7}{:>5}", "kind", "steps", "µs", "GB/s", "%"),
+                &kernel_line(
+                    "kind",
+                    "steps".into(),
+                    mark(KernelSort::Time, "µs"),
+                    mark(KernelSort::GpuShare, "%gpu"),
+                    mark(KernelSort::Bandwidth, "GB/s"),
+                    "%".into(),
+                ),
                 w,
             ),
             dim,
         ))];
-        for r in rows.iter().take((inner.height as usize).saturating_sub(2)) {
+        let total_us: f64 = rows.iter().map(|r| r.us).sum();
+        for r in self
+            .kernel_sort
+            .sorted(rows)
+            .iter()
+            .take((inner.height as usize).saturating_sub(2))
+        {
             lines.push(Line::from(Span::styled(
                 trunc(
-                    &format!(
-                        "{:<12}{:>5}{:>7.0}{:>7.1}{:>4.0}%",
-                        trunc(&r.kind, 11),
-                        r.steps,
-                        r.us,
-                        r.gbps,
-                        r.pct
+                    &kernel_line(
+                        &trunc(&r.kind, 10),
+                        r.steps.to_string(),
+                        format!("{:.0}", r.us),
+                        format!("{:.1}", gpu_share(r.us, total_us)),
+                        format!("{:.1}", r.gbps),
+                        format!("{:.0}%", r.pct),
                     ),
                     w,
                 ),
@@ -1133,8 +1158,9 @@ impl TuiApp {
         lines.push(Line::from(Span::styled(
             trunc(
                 &format!(
-                    "{} steps · sampled {} ago",
+                    "{} steps · sort: {} (s) · {} ago",
                     rows.iter().map(|r| r.steps).sum::<usize>(),
+                    self.kernel_sort.name(),
                     super::render::secs(at.elapsed())
                 ),
                 w,

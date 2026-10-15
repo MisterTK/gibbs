@@ -655,6 +655,15 @@ impl Stops {
     }
 }
 
+/// 503 for a generation aborted because the model was swapped (the client should retry), else 500.
+pub fn error_status(message: &str) -> StatusCode {
+    if message.starts_with(crate::scheduler::MODEL_SWAPPED) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// Waits for the whole generation.
 pub async fn collect(mut gen: Generation) -> Result<Output, ApiError> {
     let (mut text, mut calls) = (String::new(), Vec::new());
@@ -675,7 +684,7 @@ pub async fn collect(mut gen: Generation) -> Result<Output, ApiError> {
             }
             Event::Error(e) => {
                 return Err(ApiError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    status: error_status(&e),
                     message: e,
                 })
             }
@@ -763,6 +772,20 @@ pub fn stream_response<W: Wire>(gen: Generation, wire: W, framing: Framing) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swap_abort_is_a_503_and_other_errors_stay_500() {
+        let swapped = format!("{}org/model", crate::scheduler::MODEL_SWAPPED);
+        assert_eq!(error_status(&swapped), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_status("decode failed: boom"), StatusCode::INTERNAL_SERVER_ERROR);
+        let (tx, rx) = unbounded_channel();
+        tx.send(Event::Error(swapped)).unwrap();
+        let gen = Generation { id: 0, prompt_tokens: 0, events: rx };
+        let Err(err) = futures::executor::block_on(collect(gen)) else {
+            panic!("a swap abort is an error");
+        };
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn nothing_follows_a_stop_sequence_even_when_it_emits_no_text() {

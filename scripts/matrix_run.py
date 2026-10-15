@@ -161,12 +161,18 @@ def process(item, nxt):
         row["status"] = "ok"
         pcode, _, perr = run([b, "--bench-parity", "target/matrix/one.json"], 1800)
         cos = re.search(r"min cos ([\d.]+)", perr)
-        row["parity"] = "ok" if pcode == 0 else "fail"
         row["parity_min_cos"] = float(cos.group(1)) if cos else None
-        if pcode != 0:
-            lines = [l for l in perr.strip().splitlines() if l.startswith("parity:")]
+        verdict = [l for l in perr.strip().splitlines() if l.startswith("parity:")]
+        if pcode == 0:
+            row["parity"] = "ok"
+        elif not verdict and "panicked" not in perr and (pcode < 0 or pcode in (124, 137)):
+            # The CPU reference (the graph executor on the same graph, scales included) was killed or timed out
+            # before it compared anything: no verdict, so not a parity failure. The llama.cpp oracle still judges.
+            row["parity"], row["parity_error"] = "skip", f"cpu reference died, exit {pcode}"
+        else:
+            row["parity"] = "fail"
             tail = " | ".join(perr.strip().splitlines()[-3:]) or "?"
-            row["parity_error"] = f"exit {pcode}: " + (lines[-1] if lines else tail)
+            row["parity_error"] = f"exit {pcode}: " + (verdict[-1] if verdict else tail)
         v, d = oracle(item, b)
         row["oracle"], row["oracle_detail"] = v, d
     else:

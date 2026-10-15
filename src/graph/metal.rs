@@ -350,7 +350,8 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
             _ => false,
         },
         Op::Gelu { .. } => dtype == DType::F32,
-        Op::Megakernel(_) => matches!(
+        // The Attention megakernel has no Metal step (`plan` rejects it), so only the MLP kind is lowered.
+        Op::Megakernel(d) if matches!(d.kind, crate::graph::MegakernelKind::Mlp { .. }) => matches!(
             dtype,
             DType::F32
                 | DType::F16

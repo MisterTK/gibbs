@@ -483,16 +483,20 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         let _lock = crate::hardware::gpu_lock()?;
 
         // Load Native Metal and CPU models for bit-parity verification
-        let (metal_exec, cpu_exec) = match (
-            crate::model::native::load_native(
-                &artifacts,
-                crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
-            ),
+        // The CPU leg is the deliberate reference: only its load and forwards run under `allow`, so the
+        // Metal leg stays under the GPU-only tripwire.
+        let metal_loaded = crate::model::native::load_native(
+            &artifacts,
+            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+        );
+        let cpu_loaded = {
+            let _cpu = crate::hardware::cpu_compute::allow();
             crate::model::native::load_native(
                 &artifacts,
                 crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
-            ),
-        ) {
+            )
+        };
+        let (metal_exec, cpu_exec) = match (metal_loaded, cpu_loaded) {
             (Some(Ok(m)), Some(Ok(c))) => (m, c),
             (None, _) | (_, None) => {
                 // GraphLm checkpoint: no separate native forward, so compare the Metal decode
@@ -521,12 +525,18 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         let prompt = "Explain physics";
         let prompt_ids = metal_exec.tokenizer().encode(prompt);
         let (prompt_tokens, mut m_state) = metal_exec.prepare(prompt_ids, &[])?;
-        let (_, mut c_state) = cpu_exec.prepare(prompt_tokens.clone(), &[])?;
+        let (_, mut c_state) = {
+            let _cpu = crate::hardware::cpu_compute::allow();
+            cpu_exec.prepare(prompt_tokens.clone(), &[])?
+        };
 
         let mut metal_tokens = prompt_tokens.clone();
         let mut cpu_tokens = prompt_tokens.clone();
         let mut m_logits = metal_exec.forward(&prompt_tokens, 0, &mut m_state)?;
-        let mut c_logits = cpu_exec.forward(&prompt_tokens, 0, &mut c_state)?;
+        let mut c_logits = {
+            let _cpu = crate::hardware::cpu_compute::allow();
+            cpu_exec.forward(&prompt_tokens, 0, &mut c_state)?
+        };
         let mut min_cos = 1.0f32;
 
         for i in 0..8 {
@@ -563,7 +573,10 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
             cpu_tokens.push(c_top as u32);
 
             m_logits = metal_exec.forward(&[m_top as u32], metal_tokens.len() - 1, &mut m_state)?;
-            c_logits = cpu_exec.forward(&[c_top as u32], cpu_tokens.len() - 1, &mut c_state)?;
+            c_logits = {
+                let _cpu = crate::hardware::cpu_compute::allow();
+                cpu_exec.forward(&[c_top as u32], cpu_tokens.len() - 1, &mut c_state)?
+            };
         }
         eprintln!(
             "parity: {} ok (8 steps, min cos {min_cos:.5})",
@@ -690,10 +703,11 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
 
 /// `--explain-placement`: loads `model_id` on Metal under the effective re-encode policy and
 /// prints where its graph nodes run (op kind, device, avenue) and whether that is 100% on the GPU.
+/// Returns the process exit code: 0 only when every node runs on Metal ([`placement_exit_code`]).
 pub fn explain_placement(
     hub: &crate::model::hub::HuggingFaceHub,
     model_id: &str,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     use crate::graph::placement::{placement_table, placement_verdict};
     let artifacts = hub.auto_download_and_cache(model_id, None)?;
     let _lock = crate::hardware::gpu_lock()?;
@@ -703,6 +717,32 @@ pub fn explain_placement(
         .placement_summary()
         .ok_or("this model runs no graph program: there is no placement to explain")?;
     println!("{}", placement_table(&rows));
+    let code = placement_exit_code(&rows);
     println!("{}", placement_verdict(&rows).unwrap_or_else(|cpu| cpu));
-    Ok(())
+    Ok(code)
+}
+
+/// 0 when every placed node runs on Metal, else 1 (CPU nodes, another device, or no nodes).
+pub fn placement_exit_code(rows: &[crate::graph::placement::PlacementRow]) -> i32 {
+    let metal = crate::hardware::Device::Metal;
+    i32::from(rows.is_empty() || rows.iter().any(|r| r.device != metal))
+}
+
+#[cfg(test)]
+mod placement_exit_tests {
+    use super::placement_exit_code;
+    use crate::graph::placement::PlacementRow;
+    use crate::hardware::Device;
+
+    fn row(device: Device) -> PlacementRow {
+        PlacementRow { op: "Linear".into(), device, avenue: "kernel".into(), count: 1 }
+    }
+
+    #[test]
+    fn explain_placement_exits_zero_only_when_everything_is_metal() {
+        assert_eq!(placement_exit_code(&[row(Device::Metal), row(Device::Metal)]), 0);
+        assert_eq!(placement_exit_code(&[row(Device::Metal), row(Device::Cpu)]), 1);
+        assert_eq!(placement_exit_code(&[row(Device::Cpu)]), 1);
+        assert_eq!(placement_exit_code(&[]), 1);
+    }
 }

@@ -305,6 +305,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.reencode_max_kl,
         )?));
     }
+    // The one-shot Metal tools (--bench, --bench-parity, --probe-top5, --explain-placement) exit before the
+    // backend is resolved below: arm the GPU-only tripwire for them too, unless `--backend cpu` opts out.
+    let one_shot_metal = cli.bench.is_some()
+        || cli.bench_parity.is_some()
+        || cli.probe_top5.is_some()
+        || cli.explain_placement;
+    if one_shot_metal
+        && cli.backend.parse::<gibbs_engine::hardware::PlacementMode>()?
+            != gibbs_engine::hardware::PlacementMode::Pin(Device::Cpu)
+    {
+        gibbs_engine::hardware::cpu_compute::ban(true);
+    }
     if let Some(bench_path) = &cli.bench {
         let code = gibbs_engine::bench::run_bench_suite(bench_path)?;
         std::process::exit(code);
@@ -319,8 +331,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.explain_placement {
         let hub = HuggingFaceHub::new().with_storage(StorageBackend::from_uri(&cli.storage)?);
-        gibbs_engine::bench::explain_placement(&hub, &cli.model)?;
-        std::process::exit(0);
+        let code = gibbs_engine::bench::explain_placement(&hub, &cli.model)?;
+        std::process::exit(code);
     }
     let telemetry = EngineTelemetry::new();
     #[cfg(target_os = "macos")]

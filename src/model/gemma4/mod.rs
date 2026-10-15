@@ -135,20 +135,16 @@ pub fn load(
     let (vc, ac) = (&cfg["vision_config"], &cfg["audio_config"]);
     let mode = mode.into();
     let gpu = crate::model::vision_graph::is_gpu(mode);
-    let (vision, audio): (Box<dyn Encoder>, Box<dyn Encoder>) = if unified && gpu {
-        let why = "gpu-only: the gemma4_unified vision/audio embedders have no Metal program yet; run with --backend cpu".to_string();
-        (Box::new(NoEncoder(why.clone())), Box::new(NoEncoder(why)))
-    } else if unified {
-        (
-            Box::new(
-                unified::VisionEmbedder::load(&w, vc, &processor)
-                    .map_err(|e| format!("gemma4 vision: {e}"))?,
-            ),
-            Box::new(
-                unified::AudioEmbedder::load(&w, ac, &processor)
-                    .map_err(|e| format!("gemma4 audio: {e}"))?,
-            ),
-        )
+    let (vision, audio): (Box<dyn Encoder>, Box<dyn Encoder>) = if unified {
+        let v = unified::VisionEmbedder::load(&w, vc, &processor)
+            .map_err(|e| format!("gemma4 vision: {e}"))?;
+        let a = unified::AudioEmbedder::load(&w, ac, &processor)
+            .map_err(|e| format!("gemma4 audio: {e}"))?;
+        if gpu {
+            (Box::new(v.on_gpu(mode)), Box::new(a.on_gpu(mode)))
+        } else {
+            (Box::new(v), Box::new(a))
+        }
     } else {
         let v = Vision::load(&w, vc, &processor).map_err(|e| format!("gemma4 vision: {e}"))?;
         let a = Audio::load(&w, ac, &processor).map_err(|e| format!("gemma4 audio: {e}"))?;

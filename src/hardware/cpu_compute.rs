@@ -30,11 +30,21 @@ pub fn allow() -> AllowGuard {
     AllowGuard(())
 }
 
+/// The panic text: the entry point, the thread, and a forced backtrace naming the caller that bypassed the gate.
+fn violation(site: &str) -> String {
+    format!(
+        "gpu-only violation: CPU compute entered at {site} on thread {:?}; a code path bypassed the family gate \
+         (run with --backend cpu to accept the CPU executor)\nstack backtrace:\n{}",
+        std::thread::current().name().unwrap_or("<unnamed>"),
+        std::backtrace::Backtrace::force_capture()
+    )
+}
+
 /// Called at the top of every CPU compute entry point.
 pub fn enter(site: &'static str) {
     ENTERED.with(|c| c.set(c.get() + 1));
     if BAN.load(Ordering::Relaxed) && ALLOW.load(Ordering::SeqCst) == 0 {
-        panic!("gpu-only violation: CPU compute entered at {site}; a code path bypassed the family gate");
+        panic!("{}", violation(site));
     }
 }
 
@@ -46,4 +56,28 @@ thread_local! {
 /// GPU leg stayed off the CPU without arming the process-wide ban.
 pub fn entered() -> usize {
     ENTERED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn violation_names_the_site_and_carries_a_backtrace() {
+        let msg = violation("graph::cpu::run");
+        assert!(msg.contains("graph::cpu::run"), "{msg}");
+        assert!(msg.contains("--backend cpu"), "{msg}");
+        assert!(msg.contains("backtrace"), "{msg}");
+    }
+
+    /// Unarmed (the library default) `enter` only counts; it never panics.
+    #[test]
+    fn enter_counts_without_the_ban() {
+        if banned() {
+            return;
+        }
+        let before = entered();
+        enter("test::site");
+        assert_eq!(entered(), before + 1);
+    }
 }

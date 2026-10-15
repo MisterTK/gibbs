@@ -9,7 +9,10 @@ use gibbs_engine::graph::{
 
 /// `(op key, dtype, reason)`; the reason is the avenue verdict text of the first rejected avenue.
 const KNOWN_UNLOWERED: &[(&str, &str, &str)] = &[
-
+    // The fused-attention megakernel is declared in the IR but the Metal planner has no step for it.
+    ("Megakernel::Attention", "F32", "no Metal kernel for Megakernel at F32"),
+    ("Megakernel::Attention", "F16", "no Metal kernel for Megakernel at F16"),
+    ("Megakernel::Attention", "BF16", "no Metal kernel for Megakernel at BF16"),
 ];
 
 const DTYPES: [(DType, &str); 3] = [(DType::F32, "F32"), (DType::F16, "F16"), (DType::BF16, "BF16")];
@@ -75,6 +78,10 @@ fn key(op: &Op) -> String {
         Op::Binary { kind } => format!("Binary::{kind:?}"),
         Op::Reduce { kind, .. } => format!("Reduce::{kind:?}"),
         Op::Gelu { tanh } => format!("Gelu::{}", if *tanh { "tanh" } else { "erf" }),
+        Op::Megakernel(d) => match d.kind {
+            MegakernelKind::Mlp { .. } => "Megakernel::Mlp".to_string(),
+            MegakernelKind::Attention { .. } => "Megakernel::Attention".to_string(),
+        },
         other => other.name().to_string(),
     }
 }
@@ -159,6 +166,12 @@ fn all_ops() -> Vec<Op> {
     for kind in [ReduceKind::Sum, ReduceKind::Mean, ReduceKind::Max, ReduceKind::Min] {
         ops.push(Op::Reduce { kind, axes: vec![-1], keep_dims: true });
     }
+    ops.push(Op::Megakernel(MegakernelDescriptor {
+        kind: MegakernelKind::Attention {
+            hidden_dim: 64, heads: 2, kv_heads: 2, head_dim: 16, eps: 1e-6, is_delta: false,
+        },
+        name: "attn".into(),
+    }));
     ops
 }
 

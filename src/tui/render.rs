@@ -4,6 +4,8 @@ use super::layout::{self, Tier};
 use super::theme::{theme, Theme, Token};
 use super::widgets::{chip, instrument};
 use super::{Entry, Focus, Kind, TuiApp};
+use crate::graph::placement::PlacementRow;
+use crate::hardware::Device;
 use crate::scheduler::SequenceState;
 use crate::telemetry::LogLevel;
 use ratatui::{
@@ -155,6 +157,9 @@ impl TuiApp {
         }
         if self.show_settings_modal {
             self.render_settings_modal(f, area, &th);
+        }
+        if let Some((rows, scroll)) = &self.placement_modal {
+            self.render_placement_modal(f, area, rows, *scroll, &th);
         }
     }
 
@@ -481,6 +486,70 @@ impl TuiApp {
         ];
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
+
+    /// `/placement`: every graph node group (op, device, avenue) of the loaded program, with the
+    /// verdict; CPU nodes and the CPU verdict are drawn in the alert colour.
+    fn render_placement_modal(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        rows: &[PlacementRow],
+        scroll: usize,
+        th: &Theme,
+    ) {
+        let popup = centered(
+            area,
+            (area.width * 70 / 100).max(50),
+            (area.height * 70 / 100).max(14),
+        );
+        f.render_widget(Clear, popup);
+        let block = instrument("Placement", None, true, th);
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        let body = inner.height.saturating_sub(1) as usize;
+        let lines = placement_modal_lines(rows);
+        let start = scroll.min(lines.len().saturating_sub(body));
+        let mut out: Vec<Line> = lines
+            .into_iter()
+            .skip(start)
+            .take(body)
+            .map(|(text, alert)| {
+                Line::from(Span::styled(
+                    text,
+                    if alert {
+                        th.fg(Token::Crimson).add_modifier(Modifier::BOLD)
+                    } else {
+                        th.fg(Token::Parchment)
+                    },
+                ))
+            })
+            .collect();
+        out.push(Line::from(Span::styled(
+            " Esc / Enter / q: close | ↑↓ PgUp PgDn: scroll",
+            th.fg(Token::Dim),
+        )));
+        f.render_widget(Paragraph::new(out), inner);
+    }
+}
+
+/// The `/placement` modal text: the placement table, a blank line, then the verdict. The flag
+/// marks lines drawn as alerts: rows placed on the CPU and a verdict naming CPU ops.
+pub(super) fn placement_modal_lines(rows: &[PlacementRow]) -> Vec<(String, bool)> {
+    let table = crate::graph::placement::placement_table(rows);
+    let mut out: Vec<(String, bool)> = table
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            let cpu = i > 0 && rows.get(i - 1).is_some_and(|r| r.device == Device::Cpu);
+            (l.to_string(), cpu)
+        })
+        .collect();
+    out.push((String::new(), false));
+    out.push(match crate::graph::placement::placement_verdict(rows) {
+        Ok(all) => (all, false),
+        Err(cpu) => (cpu, true),
+    });
+    out
 }
 
 /// One console entry as wrapped lines, followed by a blank separator line.
@@ -544,5 +613,22 @@ mod tests {
         assert_eq!(wrap("the quick brown", 10), ["the quick", "brown"]);
         assert_eq!(thousands(1234567), "1,234,567");
         assert_eq!(thousands(999), "999");
+    }
+
+    #[test]
+    fn placement_modal_flags_cpu_rows_and_the_verdict() {
+        let row = |op: &str, device, count| PlacementRow {
+            op: op.into(),
+            device,
+            avenue: "kernel".into(),
+            count,
+        };
+        let gpu = placement_modal_lines(&[row("Linear", Device::Metal, 4)]);
+        assert!(gpu.iter().all(|l| !l.1), "{gpu:?}");
+        assert_eq!(gpu.last().unwrap().0, "100% Metal");
+        let mixed = placement_modal_lines(&[row("Linear", Device::Metal, 3), row("Relu", Device::Cpu, 2)]);
+        let flagged: Vec<&str> = mixed.iter().filter(|l| l.1).map(|l| l.0.as_str()).collect();
+        assert_eq!(flagged.len(), 2, "{mixed:?}");
+        assert!(flagged[0].starts_with("Relu") && flagged[1] == "2 CPU nodes (of 5): Relu ×2");
     }
 }

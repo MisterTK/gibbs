@@ -69,22 +69,29 @@ pub fn spark(values: &[f32], cells: usize) -> String {
     s
 }
 
-/// One coloured run per part, widths by largest remainder so the total is exactly `cells`.
-pub fn stacked_bar(parts: &[(Token, f32)], cells: usize, theme: &Theme) -> Vec<Span<'static>> {
-    let total: f32 = parts.iter().map(|p| p.1.max(0.0)).sum();
+/// Cell widths of `parts` over `cells` by largest remainder: they sum to exactly `cells` (all
+/// zero when no part is positive).
+pub fn segment_widths(parts: &[f32], cells: usize) -> Vec<usize> {
+    let total: f32 = parts.iter().map(|p| p.max(0.0)).sum();
     if total <= 0.0 || cells == 0 {
-        return vec![Span::styled("░".repeat(cells), theme.fg(Token::Hairline))];
+        return vec![0; parts.len()];
     }
-    let exact: Vec<f32> = parts
-        .iter()
-        .map(|p| p.1.max(0.0) / total * cells as f32)
-        .collect();
+    let exact: Vec<f32> = parts.iter().map(|p| p.max(0.0) / total * cells as f32).collect();
     let mut w: Vec<usize> = exact.iter().map(|e| e.floor() as usize).collect();
     let mut order: Vec<usize> = (0..parts.len()).collect();
     order.sort_by(|&a, &b| (exact[b] - w[b] as f32).total_cmp(&(exact[a] - w[a] as f32)));
     let short = cells - w.iter().sum::<usize>();
     for &i in order.iter().take(short) {
         w[i] += 1;
+    }
+    w
+}
+
+/// One coloured run per part, widths by [`segment_widths`] so the total is exactly `cells`.
+pub fn stacked_bar(parts: &[(Token, f32)], cells: usize, theme: &Theme) -> Vec<Span<'static>> {
+    let w = segment_widths(&parts.iter().map(|p| p.1).collect::<Vec<_>>(), cells);
+    if w.iter().sum::<usize>() == 0 {
+        return vec![Span::styled("░".repeat(cells), theme.fg(Token::Hairline))];
     }
     parts
         .iter()
@@ -225,6 +232,15 @@ mod tests {
         }
         let empty = stacked_bar(&[], 5, &th);
         assert_eq!(empty.iter().map(|s| s.width()).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn segment_widths_sum_to_cells_and_follow_the_shares() {
+        assert_eq!(segment_widths(&[3.0, 5.0, 2.0, 1.0], 11), vec![3, 5, 2, 1]);
+        assert_eq!(segment_widths(&[1.0, 1.0, 1.0], 10).iter().sum::<usize>(), 10);
+        assert_eq!(segment_widths(&[0.0, -1.0], 8), vec![0, 0]);
+        assert_eq!(segment_widths(&[4.0, 0.0], 0), vec![0, 0]);
+        assert_eq!(segment_widths(&[9.0, 1.0], 10), vec![9, 1]);
     }
 
     #[test]

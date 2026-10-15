@@ -144,18 +144,24 @@ pub fn placement_table(rows: &[PlacementRow]) -> String {
     out + &format!("{} nodes", rows.iter().map(|r| r.count).sum::<usize>())
 }
 
-/// `Ok("100% Metal")` when no node runs on the CPU, else `Err` naming the CPU ops and their counts.
+/// `Ok("100% Metal")` when no node runs on the CPU, else `Err` with the CPU node count and the CPU
+/// ops with their counts (`5 CPU nodes (of 237): Relu ×2, …`).
 pub fn placement_verdict(rows: &[PlacementRow]) -> Result<String, String> {
-    let cpu: Vec<String> = rows
-        .iter()
-        .filter(|r| r.device == Device::Cpu)
-        .map(|r| format!("{} ×{}", r.op, r.count))
-        .collect();
+    let cpu: Vec<&PlacementRow> = rows.iter().filter(|r| r.device == Device::Cpu).collect();
     if cpu.is_empty() {
         let device = rows.first().map_or(Device::Cpu, |r| r.device);
         return Ok(format!("100% {device:?}"));
     }
-    Err(format!("CPU ops: {}", cpu.join(", ")))
+    let (n, total) = (
+        cpu.iter().map(|r| r.count).sum::<usize>(),
+        rows.iter().map(|r| r.count).sum::<usize>(),
+    );
+    let ops: Vec<String> = cpu.iter().map(|r| format!("{} ×{}", r.op, r.count)).collect();
+    Err(format!(
+        "{n} CPU node{} (of {total}): {}",
+        if n == 1 { "" } else { "s" },
+        ops.join(", ")
+    ))
 }
 
 /// Places every node of `graph` on one device.
@@ -407,6 +413,8 @@ mod tests {
         assert!(table.contains("Linear   Metal   kernel   "), "{table}");
         assert!(table.ends_with("237 nodes"), "{table}");
         let mixed = [row("Linear", Device::Metal, 3), row("Relu", Device::Cpu, 2)];
-        assert_eq!(placement_verdict(&mixed), Err("CPU ops: Relu ×2".to_string()));
+        assert_eq!(placement_verdict(&mixed), Err("2 CPU nodes (of 5): Relu ×2".to_string()));
+        let one = [row("Linear", Device::Metal, 4), row("Relu", Device::Cpu, 1), row("Gelu", Device::Cpu, 2)];
+        assert_eq!(placement_verdict(&one), Err("3 CPU nodes (of 7): Relu ×1, Gelu ×2".to_string()));
     }
 }
