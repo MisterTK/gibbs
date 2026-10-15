@@ -308,3 +308,17 @@ Both have rows now (stop rule B's F-item condition: F1-F8 each has a kept/discar
 - Upper bound probe (`SHAPE_RATES_FMT=TQ2_0 cargo test --release --lib shape_rates -- --ignored --nocapture`, decode replaced by `as_type<float>(m + j)`, parity off): lm_head 262144x1536 255 GB/s vs 200 GB/s now, i.e. at most 0.11 ms/token on lm_head and ~0.43 ms (5%) on the whole 396 MB of E2B TQ2_0 weights. Small shapes (2048x1536) stay at 142 GB/s even with free decode: latency/parallelism, not ALU.
 - Tried (parity passed for the first, microbench under 85-99% foreign GPU load, noise ~10%): (V1) `(q >> lv) & 0x03030303` + `float4(uchar4)`: lm_head 185 GB/s (no gain; conversion not cheaper than shift/mask/or); (V2) next-tile load issued before decoding the current tile (two loads in flight): 245 vs 255 on the free-decode kernel (no gain). Reverted. half2 SWAR with half x accumulation fails the 1e-4 CPU parity tolerance, and float accumulation of converted halves costs the same conversions.
 - The GPU was at 85-99% from the user's `forecast` jobs the whole time; no ABBA verify was possible (the new tripwire would abort it).
+
+## Matrix burn-down classes (v2 Phase 5.2; analysis of `matrix-results.jsonl`, 355 items, latest row per id)
+Status: 83 ok/parity ok/oracle pass, 22 ok (non-GGUF, oracle skip), 3 oracle fail (Qwen3.5-0.8B UD-Q3_K_XL: top1 gibbs 7172 vs llama 279), 1 parity+oracle fail (granite-4.2-8b Q2_K, row from commit 977074f, before the Granite scale work), 246 load errors. Most error rows were produced at `33187e7`, i.e. before v2 Phase 1.1.
+Classes affecting more than one model (all `unsloth/*`, a first-party lab per the plan, so burn-down defects, not `unsupported-variant`):
+| n | class | note |
+|--:|:--|:--|
+| 155 | per-head q/k RMSNorm "not implemented by this decoder" (LFM2.5-230M 82+73 GGUF; gemma-3-270m bnb 12) | one missing generic graph pattern covers most of the matrix |
+| 24 | `granitehybrid` (Mamba / expert layers) on the dense path | needs the hybrid layer graph |
+| 21 | `granite.embedding_scale` "multipliers not implemented" | targeted by v2 1.1 (graph_lm Granite scales); re-run these to confirm |
+| 18 | ERNIE-4.5-0.3B `layer_N_qkv` weight size mismatch | loader shape bug |
+| 8 | granite bnb-4bit missing MLP/qkv tensor names | safetensors name mapping |
+| 2 | LFM2 bnb `duplicate field num_heads` in config.json | serde alias clash |
+Singletons: 3 curl download failures (retry), 1 Qwen-Image-ComfyUI (no LLM weights: `unsupported-variant`), 2 exit -15 (killed).
+Next: the q/k-norm class first (155 models), then Granite re-run, then ERNIE.
