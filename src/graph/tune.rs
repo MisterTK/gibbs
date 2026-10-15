@@ -12,6 +12,9 @@ use std::path::Path;
 pub enum GemvKernel {
     /// The hand-written kernel of `metal_kernels.metal` (formats that have one).
     Hand,
+    /// The hand kernel that gives each weight block to several lanes (short or odd-length rows keep every
+    /// lane busy); formats that have one.
+    HandSplit,
     /// The kernel generated from the format's codec (`codegen::gemv_packed`).
     Gen,
 }
@@ -32,6 +35,10 @@ impl GemvVariant {
         kernel: GemvKernel::Hand,
         rows_per_sg: 0,
     };
+    pub const HAND_SPLIT: Self = Self {
+        kernel: GemvKernel::HandSplit,
+        rows_per_sg: 0,
+    };
     pub const fn generated(rows_per_sg: u8) -> Self {
         Self {
             kernel: GemvKernel::Gen,
@@ -42,6 +49,7 @@ impl GemvVariant {
     pub fn label(&self) -> String {
         match self.kernel {
             GemvKernel::Hand => "hand".into(),
+            GemvKernel::HandSplit => "hand/split".into(),
             GemvKernel::Gen => format!("gen/r{}", self.rows_per_sg),
         }
     }

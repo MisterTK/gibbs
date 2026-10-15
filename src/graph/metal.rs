@@ -267,9 +267,21 @@ impl WeightFormat {
         })
     }
 
-    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
+    /// Name of the lane-split hand kernel ([`GemvKernel::HandSplit`]), when this format has one.
+    fn hand_split_kernel(self) -> Option<&'static str> {
+        Some(match self {
+            WeightFormat::Q4_0 => "gemv_q4_0_split",
+            _ => return None,
+        })
+    }
+
+    /// The kernel for steps the tuner does not cover (megakernel MLPs, `GIBBS_TUNE=off`): the lane-split
+    /// hand kernel where it exists (faster than the per-block one at 7 of the 8 shapes measured), else the
+    /// hand one, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if self.hand_kernel().is_some() {
+        if self.hand_split_kernel().is_some() {
+            GemvVariant::HAND_SPLIT
+        } else if self.hand_kernel().is_some() {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)
@@ -284,6 +296,9 @@ impl WeightFormat {
         let mut v = Vec::new();
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
+        }
+        if self.hand_split_kernel().is_some() {
+            v.push(GemvVariant::HAND_SPLIT);
         }
         if generated {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
@@ -406,7 +421,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 58] = [
+const BASE_KERNELS: [&str; 59] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -429,6 +444,7 @@ const BASE_KERNELS: [&str; 58] = [
     "swiglu_f32",
     "geglu_f32",
     "gemv_q4_0",
+    "gemv_q4_0_split",
     "gemv_q8_0",
     "gemv_bf16",
     "gemv_f16",
@@ -1081,7 +1097,7 @@ impl Runtime {
         let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
         let mut mix =
             |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
-        if let Some(name) = fmt.hand_kernel() {
+        for name in [fmt.hand_kernel(), fmt.hand_split_kernel()].into_iter().flatten() {
             mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
@@ -2045,12 +2061,19 @@ impl Session {
                 Some(q) => generated(q, variant.rows_per_sg),
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
-            (_, GemvKernel::Hand) => match format.hand_kernel() {
-                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
-                None => Err(format!(
-                    "Metal executor: unsupported packed GEMV format {format:?}"
-                )),
-            },
+            (_, GemvKernel::Hand | GemvKernel::HandSplit) => {
+                let name = if variant.kernel == GemvKernel::HandSplit {
+                    format.hand_split_kernel()
+                } else {
+                    format.hand_kernel()
+                };
+                match name {
+                    Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                    None => Err(format!(
+                        "Metal executor: unsupported packed GEMV format {format:?}"
+                    )),
+                }
+            }
         }
     }
 
@@ -6012,7 +6035,8 @@ mod tests {
                 QuantFormat::GGUF_TQ2_0 => &[64],
                 _ => &[0],
             };
-            let (n, k) = (37usize, be * 3);
+            // Q4_0 gets more than the 16 blocks one pass of its lane-split kernel covers.
+            let (n, k) = (37usize, be * if f == QuantFormat::GGUF_Q4_0 { 37 } else { 3 });
             let mut raw: Vec<u8> = (0..n * (k / be) * bb)
                 .map(|_| (next() >> 4) as u8)
                 .collect();
@@ -6229,6 +6253,9 @@ mod tests {
                 (1536, 6144),
                 (2048, 1536),
                 (1536, 2048),
+                (256, 1536),
+                (12288, 1536),
+                (1536, 12288),
                 (262144, 1536),
             ] {
                 let t = rt().bench_gemv(f, &[shape], &fmt.gemv_variants()).unwrap();
@@ -6411,6 +6438,78 @@ mod tests {
             &want[..4],
             &got[..4]
         );
+    }
+
+    /// The lane-split Q4_0 kernel (two lanes per block, 16 blocks per pass) and the per-block one equal
+    /// the CPU executor with m = 1 at K = 1536 (48 blocks: three passes, lanes balanced), K = 96 + 32 j
+    /// (3..20 blocks: lanes idle, block counts not a multiple of 16), and row counts that are odd and
+    /// not a multiple of the 16 rows a threadgroup owns.
+    #[test]
+    fn q4_0_lane_split_matches_cpu_at_ragged_shapes() {
+        use crate::model::layers::QuantizedWeight;
+        let f = QuantFormat::GGUF_Q4_0;
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let shapes = [
+            (37usize, 1536usize),
+            (17, 96),
+            (33, 128),
+            (1, 160),
+            (45, 224),
+            (19, 96 + 32 * 17),
+        ];
+        for (n, k) in shapes {
+            let mut raw: Vec<u8> = (0..n * (k / 32) * 18)
+                .map(|_| (next() >> 4) as u8)
+                .collect();
+            for blk in raw.chunks_exact_mut(18) {
+                // Finite f16 scale in 2^-6..2^0.
+                let d = 9 + (next() % 7) as u16;
+                blk[..2].copy_from_slice(&((d << 10) | (next() & 0x3FF) as u16).to_le_bytes());
+            }
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, k], DType::F32);
+            let wv = g.weight("w", vec![n, k], DType::Quant(f));
+            let bv = g.weight("b", vec![n], DType::F32);
+            let y = g.add("lin", Op::Linear, &[x, wv, bv], vec![1, n], DType::F32);
+            g.output(y);
+            let mut w = Weights::new();
+            w.insert(
+                "w",
+                Tensor::Quantized(Arc::new(QuantizedWeight::GgufQuantized {
+                    format: f,
+                    raw_data: raw.into(),
+                    in_features: k,
+                    out_features: n,
+                })),
+            );
+            w.insert("b", Tensor::F32(rand(n, 5)));
+            let xs: Vec<f32> = (0..k)
+                .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let want = cpu::run_stateless(&g, &w, vec![Tensor::F32(xs.clone())])
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            for v in [GemvVariant::HAND, GemvVariant::HAND_SPLIT] {
+                let mut s = Session::new(rt(), &w).unwrap();
+                s.set_variant_override(Some(v));
+                let got = s
+                    .run(&g, vec![Tensor::F32(xs.clone())])
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let err = rel_err(&want, &got);
+                assert!(err < 1e-4, "Q4_0 {n}x{k} {v:?}: differs from CPU by {err}");
+            }
+        }
     }
 
     #[test]
