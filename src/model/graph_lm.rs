@@ -3007,6 +3007,10 @@ impl GraphLm {
     }
 }
 
+/// Candidates a decode program reads back from the device instead of the logits row
+/// ([`crate::graph::program::GraphProgram::enable_topk`]); the sampler's top-k must not exceed it.
+pub const SAMPLE_TOPK: usize = 64;
+
 /// Index of the first largest element of `slice` (NaNs never win; 0 when nothing is above -inf).
 /// Two passes with 16 independent running maxima so the max pass vectorises: the single-pass
 /// `if v > best` scan is a loop-carried branch, ~0.12 ms for a 262k vocabulary on the decode path.
@@ -3096,16 +3100,20 @@ pub fn sample_logits(
     }
 
     let (active_candidates, active_probs) = nucleus(&working_logits, temperature, top_k, top_p);
-    let active_sum: f32 = active_probs.iter().sum();
+    draw(&active_candidates, &active_probs, recent_tokens)
+}
 
-    // 3. Step-varying seeded PRNG mixing token history and active distribution
+/// The seeded draw over the nucleus candidates: the PRNG mixes the token history and the kept
+/// distribution, so a step's pick varies with both and is reproducible.
+fn draw(active_candidates: &[(usize, f32)], active_probs: &[f32], recent_tokens: &[u32]) -> u32 {
+    let active_sum: f32 = active_probs.iter().sum();
     let mut hash =
         0x811c9dc5u32.wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
     for (pos, &tok) in recent_tokens.iter().enumerate() {
         hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
         hash = hash.rotate_left(13).wrapping_mul(0x01000193);
     }
-    for &(idx, val) in &active_candidates {
+    for &(idx, val) in active_candidates {
         hash ^= (idx as u32).wrapping_mul(0x27d4eb2d);
         hash ^= val.to_bits();
         hash = hash.rotate_left(7).wrapping_mul(0x01000193);
@@ -3121,6 +3129,43 @@ pub fn sample_logits(
     }
 
     active_candidates[0].0 as u32
+}
+
+/// [`sample_logits`] over the first `valid` entries of a row, decided from the row's device-side top
+/// candidates `(idx[i], val[i])` (value descending, equal values lower index first, as a full sort
+/// orders them) instead of the row. `None` when the candidates cannot decide the pick exactly: a
+/// repetition penalty is active, fewer than `top_k` candidates lie inside `valid` (the pick may be
+/// ranked below the list), or a decisive candidate is NaN or -inf. Otherwise returns the token
+/// `sample_logits` returns.
+pub fn sample_from_topk(
+    idx: &[u32],
+    val: &[f32],
+    valid: usize,
+    recent_tokens: &[u32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repetition_penalty: f32,
+) -> Option<u32> {
+    if valid == 0 || (repetition_penalty > 1.0 && !recent_tokens.is_empty()) {
+        return None;
+    }
+    let mut inside = idx
+        .iter()
+        .zip(val)
+        .filter(|&(&i, _)| (i as usize) < valid)
+        .map(|(&i, &v)| (i as usize, v));
+    if temperature <= 1e-4 {
+        let (i, v) = inside.next()?;
+        return (v > f32::NEG_INFINITY).then_some(i as u32);
+    }
+    let k = top_k.max(1).min(valid);
+    let top: Vec<(usize, f32)> = inside.take(k).collect();
+    if top.len() < k || top.iter().any(|&(_, v)| !(v > f32::NEG_INFINITY)) {
+        return None;
+    }
+    let (cands, probs) = nucleus_sorted(top, temperature, top_p);
+    Some(draw(&cands, &probs, recent_tokens))
 }
 
 /// The candidates [`sample_logits`] draws from at `temperature > 1e-4` (after any penalty):
@@ -3145,7 +3190,15 @@ pub(crate) fn nucleus(
     }
     indexed_logits.truncate(k);
     indexed_logits.sort_by(order);
+    nucleus_sorted(indexed_logits, temperature, top_p)
+}
 
+/// [`nucleus`] over the already selected top-k `(token, logit)` pairs, highest logit first.
+fn nucleus_sorted(
+    mut indexed_logits: Vec<(usize, f32)>,
+    temperature: f32,
+    top_p: f32,
+) -> (Vec<(usize, f32)>, Vec<f32>) {
     let max_val = indexed_logits
         .iter()
         .map(|&(_, val)| val / temperature)
@@ -3403,6 +3456,56 @@ mod tests {
                 assert_eq!(argmax_first(&v), idx, "{v:?}");
             }
         }
+    }
+
+    /// A pick decided from the device top-64 candidates is the pick over the whole row; whenever
+    /// the candidates cannot decide (`None`) the caller reads the row.
+    #[test]
+    fn sample_from_topk_matches_sample_logits() {
+        let mut seed = 0x1234_5679u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        let (mut decided, mut undecided) = (0, 0);
+        for n in [100usize, 700, 4099] {
+            for round in 0..12 {
+                // Odd rounds quantise the row so the top candidates tie.
+                let row: Vec<f32> = (0..n)
+                    .map(|_| {
+                        let v = (next() % 20_000) as f32 / 1000.0 - 10.0;
+                        if round % 2 == 1 { (v * 0.5).round() } else { v }
+                    })
+                    .collect();
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap().then(a.cmp(&b)));
+                let idx: Vec<u32> = order[..SAMPLE_TOPK].iter().map(|&i| i as u32).collect();
+                let val: Vec<f32> = idx.iter().map(|&i| row[i as usize]).collect();
+                let recent: Vec<u32> = (0..(next() % 70)).map(|_| next() % n as u32).collect();
+                for valid in [n, n - 7, n / 2, 40] {
+                    for (temp, top_k, top_p) in
+                        [(0.0, 50, 0.9), (0.7, 50, 0.9), (1.3, 1, 1.0), (1.0, 50, 1.0), (0.8, 64, 0.5), (0.8, 65, 0.9)]
+                    {
+                        let want = sample_logits(&row[..valid], &recent, temp, top_k, top_p, 1.0);
+                        match sample_from_topk(&idx, &val, valid, &recent, temp, top_k, top_p, 1.0) {
+                            Some(got) => {
+                                decided += 1;
+                                assert_eq!(got, want, "n={n} valid={valid} temp={temp} top_k={top_k} top_p={top_p}");
+                            }
+                            None => undecided += 1,
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decided > undecided, "decided {decided}, undecided {undecided}");
+        // Undecidable cases: a repetition penalty, too few candidates inside `valid`, a -inf pick.
+        let (idx, val) = ([7u32, 3, 900], [2.0f32, 1.0, 0.5]);
+        assert_eq!(sample_from_topk(&idx, &val, 1000, &[3], 0.0, 50, 0.9, 1.15), None);
+        assert_eq!(sample_from_topk(&idx, &val, 8, &[], 1.0, 3, 0.9, 1.0), None);
+        assert_eq!(sample_from_topk(&idx, &val, 8, &[], 0.0, 50, 0.9, 1.0), Some(7));
+        assert_eq!(sample_from_topk(&idx, &val, 3, &[], 0.0, 50, 0.9, 1.0), None);
+        assert_eq!(sample_from_topk(&[1, 2], &[f32::NEG_INFINITY; 2], 8, &[], 0.0, 50, 0.9, 1.0), None);
     }
 
     fn granite_manifest(arch: &str, extra: &[(&str, &str)]) -> ModelManifest {

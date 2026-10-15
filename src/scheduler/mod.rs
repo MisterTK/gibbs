@@ -4,7 +4,7 @@ use crate::hardware::{Device, QuantMode};
 use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
 use crate::model::graph_lm::{sample_logits, GraphLm, LayerKVCache};
 use crate::model::nano::NanoTransformerModel;
-use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
+use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SampleReq, Sampled, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::telemetry::{EngineTelemetry, GapSample};
 use parking_lot::{Mutex, RwLock};
@@ -110,11 +110,12 @@ impl ExecutableModel {
             #[cfg(target_os = "macos")]
             Device::Metal => {
                 let (decode_g, weights) = model.to_decode_graph();
-                let prog = crate::graph::program::GraphProgram::compile(
+                let mut prog = crate::graph::program::GraphProgram::compile(
                     decode_g,
                     weights,
                     crate::hardware::PlacementMode::Pin(Device::Metal),
                 )?;
+                prog.enable_topk(crate::model::graph_lm::SAMPLE_TOPK);
                 Ok(Self::Program(
                     Arc::new(parking_lot::RwLock::new(prog)),
                     Arc::new(parking_lot::RwLock::new(model)),
@@ -171,7 +172,18 @@ impl ExecutableModel {
             Self::Nano(m) => return Ok(m.read().forward_token(last_token, pos)),
             // `pos` counts `last_token` itself.
             Self::Native(m) => match kv_cache {
-                Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
+                Some(SeqKvCache::Native(state)) => {
+                    let req = SampleReq {
+                        recent: recent(all_tokens),
+                        temperature: temp,
+                        top_k: 50,
+                        top_p,
+                    };
+                    match m.forward_sampled(&[last_token], pos - 1, state, &req)? {
+                        Sampled::Token(t) => return Ok(t),
+                        Sampled::Logits(l) => l,
+                    }
+                }
                 _ => return Err(WRONG_KV.into()),
             },
             Self::GraphLm(m) => {
@@ -217,12 +229,37 @@ impl ExecutableModel {
                             crate::graph::Tensor::U32(vec![last_token]),
                             crate::graph::Tensor::U32(vec![actual_pos]),
                         ];
-                        let out = p.run(inputs);
+                        // Device-side top-k when the program has it: the sampler reads 64 pairs, not the row.
+                        let out = if p.has_topk() {
+                            p.run_topk(inputs).and_then(|top| {
+                                let valid = match model.tokenizer.vocab_size() {
+                                    0 => model.config.vocab_size,
+                                    v => model.config.vocab_size.min(v),
+                                };
+                                match crate::model::graph_lm::sample_from_topk(
+                                    &top.idx,
+                                    &top.val,
+                                    valid,
+                                    recent(all_tokens),
+                                    temp,
+                                    50,
+                                    top_p,
+                                    1.0,
+                                ) {
+                                    Some(t) => Ok(Sampled::Token(t)),
+                                    None => p.read_logits().map(Sampled::Logits),
+                                }
+                            })
+                        } else {
+                            p.run(inputs).and_then(|out| match out.into_iter().next() {
+                                Some(crate::graph::Tensor::F32(v)) => Ok(Sampled::Logits(v)),
+                                _ => Err("GraphProgram did not return F32 logits".into()),
+                            })
+                        };
                         std::mem::swap(&mut p.state, state);
-                        let out = out?;
-                        match out.into_iter().next() {
-                            Some(crate::graph::Tensor::F32(v)) => v,
-                            _ => return Err("GraphProgram did not return F32 logits".into()),
+                        match out? {
+                            Sampled::Token(t) => return Ok(t),
+                            Sampled::Logits(l) => l,
                         }
                     }
                     None => {
@@ -2190,6 +2227,55 @@ mod tests {
         assert_eq!(out.len(), 12);
         assert!(out.iter().all(|&t| (t as usize) < 2048));
     }
+    /// The device-side top-64 of every decode step equals a CPU full sort of that step's logits
+    /// (80 steps cross the KV growth), and the greedy and sampled picks made from it equal the picks
+    /// made from the row.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gpu_topk_parity_against_cpu_argmax() {
+        use crate::graph::Tensor;
+        use crate::model::graph_lm::{sample_from_topk, sample_logits, SAMPLE_TOPK};
+        let model = ExecutableModel::load_graph_lm(never_eos_model(), Device::Metal).unwrap();
+        let ExecutableModel::Program(prog, _) = &model else {
+            panic!("expected a Program");
+        };
+        let mut p = prog.write();
+        assert!(p.has_topk(), "the Metal decode program carries a top-k head");
+        let step = |pos: u32, tok: u32| vec![Tensor::U32(vec![tok]), Tensor::U32(vec![pos])];
+        // The head reads the same row the plain program returns.
+        let row = |v: Vec<Tensor>| match v.into_iter().next() {
+            Some(Tensor::F32(v)) => v,
+            _ => panic!("expected f32 logits"),
+        };
+        p.state = crate::graph::StateStore::new();
+        let plain = row(p.run(step(0, 5)).unwrap());
+        p.state = crate::graph::StateStore::new();
+        p.run_topk(step(0, 5)).unwrap();
+        let read = p.read_logits().unwrap();
+        assert!(plain.iter().zip(&read).all(|(a, b)| (a - b).abs() <= 1e-5), "head changes the logits");
+
+        p.state = crate::graph::StateStore::new();
+        let mut tok = 5u32;
+        let mut recent = vec![5u32];
+        for pos in 0..80u32 {
+            let top = p.run_topk(step(pos, tok)).unwrap();
+            let logits = p.read_logits().unwrap();
+            let mut order: Vec<usize> = (0..logits.len()).collect();
+            order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap().then(a.cmp(&b)));
+            let want_idx: Vec<u32> = order[..SAMPLE_TOPK].iter().map(|&i| i as u32).collect();
+            let want_val: Vec<f32> = want_idx.iter().map(|&i| logits[i as usize]).collect();
+            assert_eq!(top.idx, want_idx, "step {pos}: top-{SAMPLE_TOPK} indices");
+            assert_eq!(top.val, want_val, "step {pos}: top-{SAMPLE_TOPK} values");
+            for temp in [0.0, 0.8] {
+                let want = sample_logits(&logits, &recent, temp, 50, 0.9, 1.0);
+                let got = sample_from_topk(&top.idx, &top.val, logits.len(), &recent, temp, 50, 0.9, 1.0);
+                assert_eq!(got, Some(want), "step {pos} temp {temp}");
+            }
+            tok = want_idx[0];
+            recent.push(tok);
+        }
+    }
+
     #[test]
     fn test_program_scheduler_prefill_and_decode_parity() {
         let raw_model = never_eos_model();

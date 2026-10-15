@@ -30,6 +30,21 @@ pub struct PrepareCtx {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// What a sampler needs to pick the next token from a decode step's logits (the scheduler's
+/// settings: no repetition penalty).
+pub struct SampleReq<'a> {
+    pub recent: &'a [u32],
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+}
+
+/// One decode step's outcome: the sampled token, or the logits when the model did not sample.
+pub enum Sampled {
+    Token(u32),
+    Logits(Vec<f32>),
+}
+
 pub trait NativeLm: Send + Sync {
     /// Compute label for logs and the TUI header, e.g. `CPU (NEON SIMD), 15 threads`.
     fn backend_label(&self) -> String;
@@ -75,6 +90,18 @@ pub trait NativeLm: Send + Sync {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String>;
+    /// [`Self::forward`] for one decode token, sampling inside the model when it can do that
+    /// without reading back the whole logits row (device-side top-k), exactly as
+    /// [`crate::model::graph_lm::sample_logits`] over the logits would. Otherwise the logits.
+    fn forward_sampled(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+        _req: &SampleReq,
+    ) -> Result<Sampled, String> {
+        self.forward(tokens, start_pos, state).map(Sampled::Logits)
+    }
 
     // Speculative decoding (see `crate::scheduler::spec`): a model supports it by verifying
     // several positions in one pass and rewinding the ones the target rejects.

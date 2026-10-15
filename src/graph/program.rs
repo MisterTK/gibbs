@@ -22,7 +22,27 @@ pub enum CompiledSegment {
         plan: crate::graph::metal::PreparedPlan,
         input_orig_ids: Vec<ValueId>,
         output_orig_ids: Vec<ValueId>,
+        topk: Option<TopKHead>,
     },
+}
+
+/// The segment's graph with `TopK` + `GatherCols` appended after its single logits output, planned
+/// separately so programs that read the full row do not pay for them.
+#[cfg(target_os = "macos")]
+pub struct TopKHead {
+    k: usize,
+    graph: Graph,
+    plan: crate::graph::metal::PreparedPlan,
+    logits: ValueId,
+    ids: ValueId,
+    vals: ValueId,
+}
+
+/// The `k` largest values of the logits row, value descending, equal values lower index first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopK {
+    pub idx: Vec<u32>,
+    pub val: Vec<f32>,
 }
 
 impl CompiledSegment {
@@ -120,6 +140,7 @@ impl GraphProgram {
                     plan: prepared_plan,
                     input_orig_ids,
                     output_orig_ids,
+                    topk: None,
                 }
             }
             _ => CompiledSegment::Cpu {
@@ -223,6 +244,77 @@ impl GraphProgram {
         (bytes, ceiling_gbps, roofline_tok_s)
     }
 
+    /// Appends a device-side top-`k` of the logits to a one-segment Metal program whose only output is
+    /// one f32 row ([`Self::run_topk`] then reads back `k` pairs instead of the row). `false` (nothing
+    /// changes) for any other program, rows narrower than `k`, or `k == 0`.
+    pub fn enable_topk(&mut self, k: usize) -> bool {
+        #[cfg(target_os = "macos")]
+        if let [CompiledSegment::Metal { graph, session, topk, .. }] = self.segments.as_mut_slice() {
+            let &[logits] = graph.outputs.as_slice() else {
+                return false;
+            };
+            let v = graph.value(logits);
+            let n = v.shape.last().copied().unwrap_or(0);
+            if v.dtype != crate::graph::DType::F32 || k == 0 || k > n || v.shape.iter().product::<usize>() != n {
+                return false;
+            }
+            let mut g = graph.clone();
+            let ids = g.add("logits_topk_ids", crate::graph::Op::TopK { k }, &[logits], vec![1, k], crate::graph::DType::U32);
+            let vals = g.add("logits_topk_vals", crate::graph::Op::GatherCols, &[logits, ids], vec![1, k], crate::graph::DType::F32);
+            for node in g.nodes.iter_mut().rev().take(2) {
+                node.device = Device::Metal;
+            }
+            g.outputs = vec![logits, ids, vals];
+            return match session.prepare_plan(&g) {
+                Ok(plan) => {
+                    *topk = Some(TopKHead { k, graph: g, plan, logits, ids, vals });
+                    true
+                }
+                Err(_) => false,
+            };
+        }
+        let _ = k;
+        false
+    }
+
+    /// Whether [`Self::enable_topk`] succeeded.
+    pub fn has_topk(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return matches!(self.segments.as_slice(), [CompiledSegment::Metal { topk: Some(_), .. }]);
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    /// Runs the program like [`Self::run`] but returns the device-side top-k of the logits instead of
+    /// the row; [`Self::read_logits`] fetches the row afterwards if the top-k cannot decide.
+    pub fn run_topk(&mut self, inputs: Vec<Tensor>) -> Result<TopK, String> {
+        #[cfg(target_os = "macos")]
+        if let [CompiledSegment::Metal { session, topk: Some(h), .. }] = self.segments.as_slice() {
+            if inputs.len() != h.graph.inputs.len() {
+                return Err(format!("program expects {} inputs, got {}", h.graph.inputs.len(), inputs.len()));
+            }
+            let mut out = session
+                .run_prepared_outputs(&h.graph, &h.plan, Some(&mut self.state), inputs, &[h.ids, h.vals])?
+                .into_iter();
+            if let (Some(Tensor::F32(ids)), Some(Tensor::F32(val))) = (out.next(), out.next()) {
+                debug_assert_eq!((ids.len(), val.len()), (h.k, h.k));
+                return Ok(TopK { idx: ids.iter().map(|v| v.to_bits()).collect(), val });
+            }
+            return Err("run_topk: the top-k outputs are not f32 slots".into());
+        }
+        let _ = inputs;
+        Err("run_topk: no top-k head on this program".into())
+    }
+
+    /// The full logits row of the last [`Self::run_topk`].
+    pub fn read_logits(&self) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        if let [CompiledSegment::Metal { session, topk: Some(h), .. }] = self.segments.as_slice() {
+            return session.read_value(&h.graph, &h.plan, h.logits);
+        }
+        Err("read_logits: no top-k head on this program".into())
+    }
+
     /// Whether the program is exactly one Metal segment (the shape [`Self::run_reshaped`] needs).
     pub fn is_single_metal(&self) -> bool {
         #[cfg(target_os = "macos")]
@@ -290,6 +382,7 @@ impl GraphProgram {
                     plan,
                     input_orig_ids,
                     output_orig_ids,
+                    ..
                 } => {
                     let seg_inputs: Vec<Tensor> = input_orig_ids
                         .iter()

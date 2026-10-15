@@ -21,7 +21,7 @@ pub use gguf::{gguf_decode_fixture, load_gguf};
 
 use crate::hardware::Device;
 use crate::model::hub::ModelArtifacts;
-use crate::model::native::{MediaInput, NativeLm, SeqState};
+use crate::model::native::{MediaInput, NativeLm, SampleReq, Sampled, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weights::Weights;
 use audio::Audio;
@@ -325,6 +325,30 @@ impl NativeLm for Gemma4 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
+        match self.forward_impl(tokens, start_pos, state, None)? {
+            Sampled::Logits(l) => Ok(l),
+            Sampled::Token(_) => unreachable!("no sampling requested"),
+        }
+    }
+    fn forward_sampled(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+        req: &SampleReq,
+    ) -> Result<Sampled, String> {
+        self.forward_impl(tokens, start_pos, state, Some(req))
+    }
+}
+
+impl Gemma4 {
+    fn forward_impl(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+        req: Option<&SampleReq>,
+    ) -> Result<Sampled, String> {
         let st = state
             .downcast_mut::<State>()
             .ok_or("gemma4: foreign sequence state")?;
@@ -340,7 +364,7 @@ impl NativeLm for Gemma4 {
         let end = start_pos + tokens.len();
         st.asked = end;
         if end <= st.done {
-            return Ok(st.logits.clone()); // run ahead with an earlier chunk's image block
+            return Ok(Sampled::Logits(st.logits.clone())); // run ahead with an earlier chunk's image block
         }
 
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
@@ -371,18 +395,21 @@ impl NativeLm for Gemma4 {
                 Err(_) => return Err(format!("gemma4: token id {t} outside the vocabulary")),
             }
         }
+        // A straddled image block caches the logits for the chunks that follow: only a plain step samples.
+        let req = req.filter(|_| stop == end);
         let logits = match &self.program {
-            Some(prog) => self.run_program(prog, st, &x, &ple_ids, from)?,
+            Some(prog) => self.run_program(prog, st, &x, &ple_ids, from, req)?,
             None if self.text.has_moe() => {
                 return Err("gemma4 MoE: host forward not implemented; the graph program runs on Metal and the CPU graph executor".into())
             }
-            None => self
-                .text
-                .forward(x, &ple_ids, from, &mut st.cache, &st.blocks),
+            None => Sampled::Logits(
+                self.text
+                    .forward(x, &ple_ids, from, &mut st.cache, &st.blocks),
+            ),
         };
         st.done = stop;
-        if stop > end {
-            st.logits = logits.clone();
+        if let (true, Sampled::Logits(l)) = (stop > end, &logits) {
+            st.logits = l.clone();
         }
         Ok(logits)
     }
@@ -403,11 +430,12 @@ impl Gemma4 {
         x: &[f32],
         ids: &[u32],
         from: usize,
-    ) -> Result<Vec<f32>, String> {
+        req: Option<&SampleReq>,
+    ) -> Result<Sampled, String> {
         let h = self.text.hidden;
         let mut p = prog.lock();
         std::mem::swap(&mut p.state, &mut st.program_state);
-        let mut last = Ok(Vec::new());
+        let mut last = Ok(Sampled::Logits(Vec::new()));
         let mut at = 0;
         while at < ids.len() && last.is_ok() {
             let mut end = (at + PREFILL_ROWS).min(ids.len());
@@ -430,6 +458,7 @@ impl Gemma4 {
                     &x[at * h..end * h],
                     &ids[at..end],
                     from + at,
+                    req,
                 )
             };
             at = end;
@@ -447,7 +476,8 @@ impl Gemma4 {
         x: &[f32],
         ids: &[u32],
         pos0: usize,
-    ) -> Result<Vec<f32>, String> {
+        req: Option<&SampleReq>,
+    ) -> Result<Sampled, String> {
         use crate::graph::Tensor;
         let (h, m) = (self.text.hidden, ids.len());
         let mut ple = Vec::new();
@@ -485,7 +515,7 @@ impl Gemma4 {
                 inputs.push(Tensor::F32(ple));
             }
             inputs.push(Tensor::U32((pos0..pos0 + m).map(end).collect()));
-            return logits(p.run_reshaped(&g, inputs)?);
+            return logits(p.run_reshaped(&g, inputs)?).map(Sampled::Logits);
         }
         if m > 1 && blocks.iter().any(|b| b.start < pos0 + m && pos0 < b.end) {
             return Err("gpu-only: image blocks are attended bidirectionally, which needs the Metal program; rerun with --backend cpu".into());
@@ -499,9 +529,23 @@ impl Gemma4 {
             if self.text.ple.is_some() {
                 inputs.push(Tensor::F32(ple[i * ple_row..(i + 1) * ple_row].to_vec()));
             }
+            if let (Some(req), true, true) = (req, m == 1, p.has_topk()) {
+                let top = p.run_topk(inputs)?;
+                let vocab = self.tokenizer.vocab_size();
+                let logits_len = self.text.vocab;
+                let valid = if vocab > 0 { logits_len.min(vocab) } else { logits_len };
+                return Ok(
+                    match crate::model::graph_lm::sample_from_topk(
+                        &top.idx, &top.val, valid, req.recent, req.temperature, req.top_k, req.top_p, 1.0,
+                    ) {
+                        Some(t) => Sampled::Token(t),
+                        None => Sampled::Logits(p.read_logits()?),
+                    },
+                );
+            }
             last = logits(p.run(inputs)?)?;
         }
-        Ok(last)
+        Ok(Sampled::Logits(last))
     }
 }
 
@@ -520,6 +564,64 @@ pub(crate) fn compile_gemma4_program(
         .to_decode_graph()
         .map_err(|e| format!("Gemma 4: {e}"))?;
     crate::graph::program::GraphProgram::compile(graph, weights, mode)
-        .map(|prog| Some(Arc::new(parking_lot::Mutex::new(prog))))
+        .map(|mut prog| {
+            prog.enable_topk(crate::model::graph_lm::SAMPLE_TOPK);
+            Some(Arc::new(parking_lot::Mutex::new(prog)))
+        })
         .map_err(|e| format!("Gemma 4: {e}"))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::model::graph_lm::sample_logits;
+
+    /// Sampling on the device top-k picks the token `sample_logits` picks from the logits row.
+    #[test]
+    fn forward_sampled_matches_sampling_the_forward_logits() {
+        let text = Arc::new(text::tiny_model());
+        let mode = crate::hardware::PlacementMode::Pin(Device::Metal);
+        let program = compile_gemma4_program(&text, mode).unwrap();
+        assert!(program.as_ref().unwrap().lock().has_topk());
+        let no = |what: &str| -> Box<dyn Encoder> { Box::new(NoEncoder(what.into())) };
+        let m = Gemma4 {
+            tokenizer: Tokenizer::default_bpe(),
+            text: text.clone(),
+            program,
+            unified: false,
+            vision: no("no image"),
+            audio: no("no audio"),
+            image_token: 1000,
+            audio_token: 1001,
+            boi: 1002,
+            eoi: 1003,
+            boa: 1004,
+            eoa: 1005,
+        };
+        let prompt = vec![5u32, 9, 13];
+        let (mut a, mut b) = (m.prepare(prompt.clone(), &[]).unwrap().1, m.prepare(prompt.clone(), &[]).unwrap().1);
+        m.forward(&prompt, 0, &mut a).unwrap();
+        m.forward(&prompt, 0, &mut b).unwrap();
+        let vocab = m.tokenizer.vocab_size();
+        let valid = if vocab > 0 { text.vocab.min(vocab) } else { text.vocab };
+        let (mut tok, mut recent, mut sampled) = (13u32, prompt.clone(), 0);
+        for step in 0..40usize {
+            let pos = prompt.len() + step;
+            let temp = if step % 2 == 0 { 0.0 } else { 0.8 };
+            let logits = m.forward(&[tok], pos, &mut a).unwrap();
+            let want = sample_logits(&logits[..valid], &recent, temp, 50, 0.9, 1.0);
+            let req = SampleReq { recent: &recent, temperature: temp, top_k: 50, top_p: 0.9 };
+            let got = match m.forward_sampled(&[tok], pos, &mut b, &req).unwrap() {
+                Sampled::Token(t) => {
+                    sampled += 1;
+                    t
+                }
+                Sampled::Logits(l) => sample_logits(&l[..valid], &recent, temp, 50, 0.9, 1.0),
+            };
+            assert_eq!(got, want, "step {step} temp {temp}");
+            tok = want;
+            recent.push(tok);
+        }
+        assert!(sampled > 0, "no step sampled on the device");
+    }
 }
