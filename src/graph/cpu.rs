@@ -122,9 +122,13 @@ pub fn run(
                 if let Some(t) = state.get(state_name) {
                     slots[i] = Some(t.clone());
                 } else {
+                    let cached_attn_only = graph.nodes.iter().all(|n| {
+                        !n.inputs.contains(&ValueId(i as u32))
+                            || matches!(n.op, Op::CachedAttention { .. })
+                    });
                     let numel = if v.shape.is_empty() {
                         0
-                    } else if v.shape.len() == 2 && v.shape[0] > 4096 {
+                    } else if cached_attn_only && v.shape.len() == 2 && v.shape[0] > 4096 {
                         4096 * v.shape[1]
                     } else {
                         v.shape.iter().product::<usize>()
