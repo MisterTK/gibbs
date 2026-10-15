@@ -252,7 +252,11 @@ impl GraphLmConfig {
             quant_mode,
         );
         cfg.head_dim = hf.head_dim.unwrap_or(cfg.head_dim);
-        cfg.rotary_pct = hf.resolved_rotary_pct();
+        cfg.rotary_pct = if hf.position_embedding_type.as_deref() == Some("nope") {
+            0.0
+        } else {
+            hf.resolved_rotary_pct()
+        };
         cfg.use_parallel_residual = hf.resolved_parallel_residual();
         cfg.use_standard_layernorm = hf.resolved_use_standard_layernorm();
         cfg.use_gelu_mlp = hf.resolved_use_gelu_mlp();
@@ -1238,7 +1242,7 @@ impl GraphLm {
             soft_cap: None,
         };
 
-        let a = c.attn_dim();
+        let attn_w = c.attn_dim();
         let mut g = Graph::new();
         let (mut x, positions) = if embeds {
             let e = g.input("inputs_embeds", vec![n, h], DType::F32);
@@ -1305,13 +1309,13 @@ impl GraphLm {
                 &layer.qkv_proj,
                 n,
             );
-            let mut q = slice(&mut g, format!("{p}.self_attn.q"), qkv, 0, a, n);
-            let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, a, 2 * a, n);
-            let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * a, 3 * a, n);
+            let mut q = slice(&mut g, format!("{p}.self_attn.q"), qkv, 0, attn_w, n);
+            let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, attn_w, 2 * attn_w, n);
+            let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * attn_w, 3 * attn_w, n);
             if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
                 // `RmsNorm` with a head_dim-wide gain normalises each head of the row.
-                q = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.q_norm"), q, qn, eps, vec![n, a]);
-                k = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.k_norm"), k, kn, eps, vec![n, a]);
+                q = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.q_norm"), q, qn, eps, vec![n, attn_w]);
+                k = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.k_norm"), k, kn, eps, vec![n, attn_w]);
             }
             if rotary_dim > 0 && layer.conv.is_none() {
                 let inv_freq_val = g.weight(
@@ -1326,14 +1330,14 @@ impl GraphLm {
                     format!("{p}.self_attn.rope_q"),
                     rope.clone(),
                     &[q, positions, inv_freq_val],
-                    vec![n, a],
+                    vec![n, attn_w],
                     DType::F32,
                 );
                 k = g.add(
                     format!("{p}.self_attn.rope_k"),
                     rope.clone(),
                     &[k, positions, inv_freq_val],
-                    vec![n, a],
+                    vec![n, attn_w],
                     DType::F32,
                 );
             }
@@ -1348,7 +1352,8 @@ impl GraphLm {
                 }
                 let mut conv_in = vec![bx, taps_w];
                 if cached {
-                    conv_in.push(g.state(format!("conv.{i}"), vec![kernel - 1, h], DType::F32));
+                    // `conv_state` in the name: `StateStore::truncate` refuses to rewind recurrent state.
+                    conv_in.push(g.state(format!("layers.{i}.conv_state"), vec![kernel - 1, h], DType::F32));
                 }
                 let op = Op::CausalConv1dCached { kernel, dilation: 1 };
                 let conv = g.add(format!("{p}.conv.conv"), op, &conv_in, vec![n, h], DType::F32);
@@ -1385,7 +1390,7 @@ impl GraphLm {
                 // `Op::Attention` has no scale parameter (it is 1/sqrt(head_dim)): fold the model's into q.
                 let q = if c.attention_scale > 0.0 {
                     let s = c.attn_scale() * (c.head_dim as f32).sqrt();
-                    scale_by(&mut g, format!("{p}.self_attn.q_scale"), q, s, vec![n, a])
+                    scale_by(&mut g, format!("{p}.self_attn.q_scale"), q, s, vec![n, attn_w])
                 } else {
                     q
                 };
@@ -1608,7 +1613,7 @@ impl GraphLm {
         let consumed: std::collections::HashSet<String> =
             (0..layers_count).flat_map(qk_names).collect();
         if let Some(n) = manifest.tensors.keys().find(|n| {
-            ["q_norm.", "k_norm.", "query_layernorm.", "key_layernorm."]
+            ["q_norm.", "k_norm.", "q_layernorm.", "k_layernorm.", "query_layernorm.", "key_layernorm."]
                 .iter()
                 .any(|s| n.contains(s))
                 && !consumed.contains(*n)
@@ -3002,7 +3007,8 @@ impl GraphLm {
                 let bx: Vec<f32> = pad.qkv[..a].iter().zip(&pad.qkv[2 * a..]).map(|(b, x)| b * x).collect();
                 cache.push_kv(&bx, &[]);
                 let skip = cache.len.saturating_sub(taps.len() / h);
-                let recent: Vec<&[f32]> = cache.k.chunks_exact(h).skip(skip).collect();
+                // Only rows below `cache.len`: a spec/draft rewind lowers `len` without truncating `k`.
+                let recent: Vec<&[f32]> = cache.k[..cache.len * h].chunks_exact(h).skip(skip).collect();
                 short_conv(taps, &pad.qkv[a..2 * a], &recent, &mut pad.attn_out);
             } else {
                 cache.push_kv(&pad.qkv[a..2 * a], &pad.qkv[2 * a..3 * a]);
@@ -4421,5 +4427,34 @@ mod tests {
         assert_close(&model.forward(&tokens), &want, "host");
         tiny.t.insert("model.layers.0.block_sparse_moe.router.layer.weight".into(), (vec![2, 16], vec![0.0; 32]));
         assert!(tiny.load().expect_err("moe").contains("expert"));
+    }
+
+    /// A speculative / draft rewind lowers `LayerKVCache::len` without truncating `k`: conv layers must
+    /// ignore the stale rows past `len`, and the graph's conv state must refuse `StateStore::truncate`.
+    #[test]
+    fn lfm2_rewind_ignores_stale_rows_and_conv_state_cannot_truncate() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let tokens = [3u32, 17, 5, 9, 21, 2];
+        let tiny = Tiny::lfm2(Naming::Lfm2Hf, &[true, false, true], 3);
+        let model = tiny.load().expect("loads");
+        let mut kv: Vec<LayerKVCache> = (0..model.layers.len())
+            .map(|_| LayerKVCache::new(model.config.max_seq_len, model.config.hidden_dim))
+            .collect();
+        for (p, &t) in tokens.iter().enumerate() {
+            model.forward_token_with_kv(t, p, &mut kv);
+        }
+        // Reject the last three tokens, then replay them.
+        kv.iter_mut().for_each(|c| c.len = 3);
+        let mut last = vec![];
+        for (p, &t) in tokens.iter().enumerate().skip(3) {
+            last = model.forward_token_with_kv(t, p, &mut kv);
+        }
+        assert_close(&last, &tiny.reference(&tokens), "after rewind");
+
+        let (g, w) = model.build_graph(1, true);
+        let mut state = crate::graph::StateStore::new();
+        let inputs = vec![crate::graph::Tensor::U32(vec![3]), crate::graph::Tensor::U32(vec![0])];
+        crate::graph::cpu::run(&g, &w, &mut state, inputs).expect("decode runs");
+        assert!(state.truncate(0).unwrap_err().contains("conv_state"));
     }
 }
