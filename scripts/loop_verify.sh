@@ -40,9 +40,12 @@ import json, sys
 for l in open(sys.argv[1]):
     if l.startswith("{"):
         r = json.loads(l)
-        if "gemma-4-E2B-it-qat" in r.get("model", "") and r.get("decode_tok_s", 1e9) < 100:
-            print(f"contention-aborted: {r['model']} {r['decode_tok_s']:.1f} tok/s < 100", file=sys.stderr)
-            sys.exit(4)
+        if "gemma-4-E2B-it-qat" in r.get("model", ""):
+            # First E2B QAT row only (the plain-context entry, as loop_score.py's e2b_tok_s).
+            if r.get("decode_tok_s", 1e9) < 100:
+                print(f"contention-aborted: {r['model']} {r['decode_tok_s']:.1f} tok/s < 100", file=sys.stderr)
+                sys.exit(4)
+            break
 PY
 }
 run() {  # tag binary suite

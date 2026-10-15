@@ -74,13 +74,18 @@ for _ in range(200):
     t = time.perf_counter()
     jax.block_until_ready(f(x, kc, vc, pos, P))
     ts.append((time.perf_counter() - t) * 1e6)
-# Pipelined: 200 back-to-back calls, one sync: amortises the Python dispatch + sync, so it approaches XLA's device time.
-piped = []
+# Chained: 200 serially dependent calls (x, kc, vc = f(x, kc, vc, pos, P)), one sync at the end. This is
+# Gibbs' execution model (each block consumes the previous block's output), so it measures per-block
+# latency; independent back-to-back calls would measure overlapped throughput.
+chained, finite = [], True
 for _ in range(5):
+    xs, kcs, vcs = x, kc, vc
     t = time.perf_counter()
-    outs = [f(x, kc, vc, pos, P) for _ in range(200)]
-    jax.block_until_ready(outs)
-    piped.append((time.perf_counter() - t) * 1e6 / 200)
-print(json.dumps({"xla_us_per_block": round(statistics.median(ts), 1), "xla_us_pipelined": round(min(piped), 1),
-                  "xla_kernels": kernels,
+    for _ in range(200):
+        xs, kcs, vcs = f(xs, kcs, vcs, pos, P)
+    jax.block_until_ready((xs, kcs, vcs))
+    chained.append((time.perf_counter() - t) * 1e6 / 200)
+    finite = finite and bool(jnp.all(jnp.isfinite(xs)))
+print(json.dumps({"xla_us_per_block": round(statistics.median(ts), 1), "xla_us_chained": round(min(chained), 1),
+                  "xla_chain_finite": finite, "xla_kernels": kernels,
                   "backend": jax.default_backend(), "note": "wall time incl. dispatch, block_until_ready"}))
