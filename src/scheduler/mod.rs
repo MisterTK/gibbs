@@ -2276,6 +2276,67 @@ mod tests {
         }
     }
 
+    /// Greedy and sampled token streams with decode-ahead (the next step's command buffer encoded while
+    /// this one runs) are identical to synchronous steps: one sequence, an abandoned sequence (the
+    /// stop condition) followed by a new one, and two sequences stepped alternately.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_decode_ahead_token_streams_match_synchronous() {
+        use crate::graph::program::CompiledSegment;
+        let model = ExecutableModel::load_graph_lm(never_eos_model(), Device::Metal).unwrap();
+        let ExecutableModel::Program(prog, _) = &model else {
+            panic!("expected a Program");
+        };
+        let session = |f: &dyn Fn(&crate::graph::metal::Session)| match prog.read().segments.first() {
+            Some(CompiledSegment::Metal { session, .. }) => f(session),
+            _ => panic!("expected a Metal segment"),
+        };
+        struct Seq {
+            all: Vec<u32>,
+            kv: Option<SeqKvCache>,
+        }
+        let start = |prompt: &[u32], temp: f32| {
+            let mut kv = None;
+            let first = model
+                .step_prefill_chunk(prompt, 0, true, prompt, temp, 0.9, &mut kv)
+                .unwrap()
+                .unwrap();
+            Seq { all: [prompt, &[first]].concat(), kv }
+        };
+        let step = |s: &mut Seq, temp: f32| {
+            let last = *s.all.last().unwrap();
+            let t = model
+                .step_token_with_kv(&s.all, last, s.all.len(), temp, 0.9, &mut s.kv)
+                .unwrap();
+            s.all.push(t);
+        };
+        let run = |prompt: &[u32], n: usize, temp: f32| {
+            let mut s = start(prompt, temp);
+            (0..n).for_each(|_| step(&mut s, temp));
+            s.all
+        };
+        let interleaved = |a: &[u32], b: &[u32], n: usize| {
+            let (mut sa, mut sb) = (start(a, 0.0), start(b, 0.8));
+            for _ in 0..n {
+                step(&mut sa, 0.0);
+                step(&mut sb, 0.8);
+            }
+            (sa.all, sb.all)
+        };
+        let (p1, p2) = ([5u32, 9, 13, 2, 77], [31u32, 4, 8]);
+        session(&|s| s.set_decode_ahead(false));
+        let want = (run(&p1, 120, 0.0), run(&p2, 60, 0.8), interleaved(&p1, &p2, 40));
+        session(&|s| s.set_decode_ahead(true));
+        assert_eq!(run(&p1, 120, 0.0), want.0, "greedy stream");
+        run(&p1, 10, 0.0); // abandoned mid-sequence: its encoded-ahead buffer is stale
+        assert_eq!(run(&p2, 60, 0.8), want.1, "sampled stream after an abandoned sequence");
+        assert_eq!(interleaved(&p1, &p2, 40), want.2, "alternating sequences");
+        let hits = std::cell::Cell::new(0);
+        session(&|s| hits.set(s.decode_ahead_hits()));
+        let hits = hits.get();
+        assert!(hits >= 150, "only {hits} steps ran a pre-encoded command buffer");
+    }
+
     #[test]
     fn test_program_scheduler_prefill_and_decode_parity() {
         let raw_model = never_eos_model();

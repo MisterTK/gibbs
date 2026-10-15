@@ -13,6 +13,11 @@ use super::codec;
 use super::{DType, Graph, Op, Tensor, ValueId, ValueKind, Weights};
 pub fn commit_and_wait(cb: &CommandBufferRef) -> Result<(), String> {
     cb.commit();
+    wait_checked(cb)
+}
+
+/// Waits for a committed buffer; an error carries the driver's description.
+pub fn wait_checked(cb: &CommandBufferRef) -> Result<(), String> {
     cb.wait_until_completed();
     match cb.status() {
         metal::MTLCommandBufferStatus::Completed => Ok(()),
@@ -1533,7 +1538,12 @@ pub struct Session {
     attn_scratch: Mutex<Option<Buffer>>,
     /// Chunk maxima and candidates of the wide-row top-k (`ext::moe`).
     topk_scratch: Mutex<Option<Buffer>>,
-    params_buffer: Mutex<Option<Buffer>>,
+    /// Two parameter buffers: the next token's pre-encoded buffer fills the one the running buffer is not using.
+    params_buffer: [Mutex<Option<Buffer>>; 2],
+    /// The next decode step's command buffer, encoded while this one runs (see [`Ahead`]).
+    ahead: Mutex<AheadState>,
+    ahead_on: std::sync::atomic::AtomicBool,
+    ahead_hits: std::sync::atomic::AtomicU64,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
     jesse_aux: HashMap<String, (Buffer, usize)>,
@@ -2111,7 +2121,12 @@ impl Session {
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
             topk_scratch: Mutex::new(None),
-            params_buffer: Mutex::new(None),
+            params_buffer: [Mutex::new(None), Mutex::new(None)],
+            ahead: Mutex::new(AheadState::default()),
+            ahead_on: std::sync::atomic::AtomicBool::new(
+                std::env::var("GIBBS_DECODE_AHEAD").map_or(true, |v| v != "0"),
+            ),
+            ahead_hits: std::sync::atomic::AtomicU64::new(0),
             gemm: None,
             nvfp4_aux,
             jesse_aux,
@@ -2513,6 +2528,28 @@ impl Session {
             }
         }
         let params_buffer_size = steps.len() * 64;
+        let ahead_pos = (is_decode && !state_reads.is_empty())
+            .then(|| {
+                let mut ids: Vec<ValueId> = Vec::new();
+                for s in &steps {
+                    if let Step::CachedAttention { pos: Some(p), .. }
+                    | Step::PagedCachedAttention { pos: Some(p), .. } = s.op
+                    {
+                        if !ids.contains(&p) {
+                            ids.push(p);
+                        }
+                    }
+                }
+                ids
+            })
+            .filter(|ids| {
+                !ids.is_empty()
+                    && ids.iter().all(|&v| {
+                        graph.inputs.contains(&v)
+                            && graph.value(v).dtype == DType::U32
+                            && numel(graph, v).is_ok_and(|n| n == 1)
+                    })
+            });
 
         Ok(PreparedPlan {
             steps,
@@ -2524,6 +2561,8 @@ impl Session {
             flops_per_run,
             params_buffer_size,
             f16_states,
+            id: PLAN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ahead_pos,
         })
     }
 
@@ -2534,20 +2573,12 @@ impl Session {
 
     /// Returns the raw pointer to the unified params buffer, allocating it if needed.
     pub fn params_buffer_ptr(&self, size: usize) -> Result<*mut std::ffi::c_void, String> {
-        let mut guard = self.params_buffer.lock();
-        if guard.is_none() || guard.as_ref().unwrap().length() < size as u64 {
-            let aligned = (size + 63) & !63;
-            let buf = self
-                .rt
-                .device
-                .new_buffer(aligned as u64, MTLResourceOptions::StorageModeShared);
-            *guard = Some(buf);
-        }
-        Ok(guard.as_ref().unwrap().contents())
+        Ok(self.ensure_params_buffer(0, size)?.contents())
     }
 
-    pub fn ensure_params_buffer(&self, size: usize) -> Result<Buffer, String> {
-        let mut guard = self.params_buffer.lock();
+    /// Parameter buffer `idx` (0 or 1), grown to hold `size` bytes.
+    pub fn ensure_params_buffer(&self, idx: usize, size: usize) -> Result<Buffer, String> {
+        let mut guard = self.params_buffer[idx].lock();
         if guard.is_none() || guard.as_ref().unwrap().length() < size as u64 {
             let aligned = (size.max(64) + 63) & !63;
             let buf = self
@@ -2557,6 +2588,19 @@ impl Session {
             *guard = Some(buf);
         }
         Ok(guard.as_ref().unwrap().clone())
+    }
+
+    /// Turns encode-ahead of the next decode step on or off (default on; `GIBBS_DECODE_AHEAD=0` starts it off).
+    pub fn set_decode_ahead(&self, on: bool) {
+        self.ahead_on.store(on, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            *self.ahead.lock() = AheadState::default();
+        }
+    }
+
+    /// Runs that committed a command buffer encoded during the previous run.
+    pub fn decode_ahead_hits(&self) -> u64 {
+        self.ahead_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Runs `graph` with `inputs` bound positionally to `graph.inputs`; returns `graph.outputs`.
@@ -2786,7 +2830,36 @@ impl Session {
                 (&w.0, w.1)
             }
         };
-        let params_buf = self.ensure_params_buffer(plan.params_buffer_size)?;
+        let params_buf = self.ensure_params_buffer(0, plan.params_buffer_size)?;
+        // The positions this step runs at, when the next step can be encoded ahead (see [`Ahead`]).
+        let ahead_pos: Option<Vec<u32>> = plan
+            .ahead_pos
+            .as_ref()
+            .filter(|_| self.ahead_on.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|ids| {
+                ids.iter()
+                    .map(|&p| {
+                        let i = graph.inputs.iter().position(|&x| x == p).expect("checked by prepare_plan");
+                        match &inputs[i] {
+                            Tensor::U32(v) => v.first().copied().unwrap_or(0),
+                            _ => 0,
+                        }
+                    })
+                    .collect()
+            });
+        let arena_id = arena.as_ptr() as usize;
+        let state_key = if ahead_pos.is_some() {
+            use std::hash::{Hash, Hasher};
+            // Order-free hash of (state name, buffer): a different sequence's state differs.
+            state_map.iter().fold(0u64, |acc, (name, buf)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                name.hash(&mut h);
+                (Arc::as_ptr(buf) as usize).hash(&mut h);
+                acc.wrapping_add(h.finish())
+            })
+        } else {
+            0
+        };
         metal::objc::rc::autoreleasepool(|| {
             let print_profile = std::env::var_os("GIBBS_PROFILE_KERNELS").is_some();
             // A requested sample is one real decode token; the printing profiler profiles every run.
@@ -2832,42 +2905,82 @@ impl Session {
                 // `GIBBS_CB_CHUNK=0` keeps a single buffer.
                 // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
                 // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
-                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
-                    cb_chunking()
-                } else {
-                    (usize::MAX, usize::MAX)
-                };
-                let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
-                let mut err = None;
-                let mut dispatches = 0u32;
-                let encode_start = std::time::Instant::now();
-                let mut at = 0;
-                while at < steps.len() && err.is_none() {
-                    let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
-                    let cb = self.rt.queue.new_command_buffer().to_owned();
-                    let enc = cb.new_compute_command_encoder();
-                    let counted = Counted::new(enc);
-                    for (s_idx, s) in steps.iter().enumerate().take(end).skip(at) {
-                        if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
-                            err = Some(e);
-                            break;
-                        }
-                    }
-                    enc.end_encoding();
-                    dispatches += counted.dispatches();
-                    if end < steps.len() && err.is_none() {
-                        cb.commit();
-                    }
-                    cbs.push(cb);
-                    at = end;
+                let mut ahead = self.ahead.lock();
+                let prev = ahead.last.take();
+                // Decode-ahead: the buffer encoded during the previous run is this run's if it was
+                // encoded for this plan, these state buffers, this arena and this position.
+                let hit = ahead.next.take().filter(|a| {
+                    a.plan_id == plan.id
+                        && a.state_key == state_key
+                        && a.arena == arena_id
+                        && ahead_pos.as_ref() == Some(&a.pos)
+                });
+                if let Some(cur) = &ahead_pos {
+                    ahead.last = Some(LastRun {
+                        plan_id: plan.id,
+                        state_key,
+                        pos: cur.clone(),
+                    });
                 }
-                let encode_dur = encode_start.elapsed();
-                if let Some(e) = err {
-                    // Earlier chunks are already on the GPU: let them finish before reporting.
-                    if cbs.len() > 1 {
-                        cbs[cbs.len() - 2].wait_until_completed();
+                let advancing = hit.is_some()
+                    || prev.zip(ahead_pos.as_ref()).is_some_and(|(p, cur)| {
+                        p.plan_id == plan.id
+                            && p.state_key == state_key
+                            && p.pos.iter().zip(cur).all(|(a, b)| a + 1 == *b)
+                    });
+                let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
+                let mut dispatches = 0u32;
+                let mut encode_dur = std::time::Duration::ZERO;
+                let mut params_idx = 0;
+                if let Some(a) = hit {
+                    self.ahead_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    (dispatches, params_idx) = (a.dispatches, a.params_idx);
+                    cbs.push(a.cb);
+                } else {
+                    // Cut into chunks, each committed as soon as it is encoded: the GPU runs the first
+                    // `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs ~0.4 us per
+                    // dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and the
+                    // arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
+                    // `GIBBS_CB_CHUNK=0` keeps a single buffer.
+                    // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch
+                    // Llama-1B decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms
+                    // of encoding to hide.
+                    let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
+                        cb_chunking()
+                    } else {
+                        (usize::MAX, usize::MAX)
+                    };
+                    let mut err = None;
+                    let encode_start = std::time::Instant::now();
+                    let mut at = 0;
+                    while at < steps.len() && err.is_none() {
+                        let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
+                        let cb = self.rt.queue.new_command_buffer().to_owned();
+                        let enc = cb.new_compute_command_encoder();
+                        let counted = Counted::new(enc);
+                        for (s_idx, s) in steps.iter().enumerate().take(end).skip(at) {
+                            if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                        enc.end_encoding();
+                        dispatches += counted.dispatches();
+                        if end < steps.len() && err.is_none() {
+                            cb.commit();
+                        }
+                        cbs.push(cb);
+                        at = end;
                     }
-                    return Err(e);
+                    encode_dur = encode_start.elapsed();
+                    if let Some(e) = err {
+                        // Earlier chunks are already on the GPU: let them finish before reporting.
+                        if cbs.len() > 1 {
+                            cbs[cbs.len() - 2].wait_until_completed();
+                        }
+                        return Err(e);
+                    }
                 }
                 if cbs.is_empty() {
                     let cb = self.rt.queue.new_command_buffer().to_owned();
@@ -2875,7 +2988,14 @@ impl Session {
                     cbs.push(cb);
                 }
                 let last = cbs.last().expect("a plan has at least one step");
-                commit_and_wait(last)?;
+                last.commit();
+                // The GPU is running: encode the next step now, for the other parameter buffer.
+                if let (true, Some(cur), Some(ids)) = (advancing, &ahead_pos, &plan.ahead_pos) {
+                    ahead.next =
+                        self.encode_ahead(plan, &loc, ids, cur, 1 - params_idx, state_key, arena_id);
+                }
+                drop(ahead);
+                wait_checked(last)?;
                 for cb in &cbs[..cbs.len() - 1] {
                     if cb.status() != metal::MTLCommandBufferStatus::Completed {
                         return Err(format!(
@@ -2923,6 +3043,57 @@ impl Session {
             push_run_sample(s);
         }
         Ok(outs)
+    }
+
+    /// Encodes `plan` for the step after one at `pos` (positions `pos + 1`) into one uncommitted
+    /// command buffer using parameter buffer `params_idx`. The positions are read by `encode` on the
+    /// host and the kernels on the GPU, so they are bound from a small buffer holding the predicted
+    /// values (the arena still holds the running step's); the caller commits it only when the real
+    /// positions equal them. `None` when the plan does not encode (it then re-encodes on its own run).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ahead<'a>(
+        &self,
+        plan: &PreparedPlan,
+        loc: &impl Fn(ValueId) -> (&'a Buffer, usize),
+        pos_ids: &[ValueId],
+        pos: &[u32],
+        params_idx: usize,
+        state_key: u64,
+        arena: usize,
+    ) -> Option<Ahead> {
+        let next: Vec<u32> = pos.iter().map(|p| p + 1).collect();
+        // 256 bytes per position keeps every binding offset aligned.
+        let side = new_shared_buffer(&self.rt.device, 256 * next.len()).ok()?;
+        for (i, p) in next.iter().enumerate() {
+            // SAFETY: `side` holds 256 bytes per position.
+            unsafe { *((side.contents() as *mut u8).add(i * 256) as *mut u32) = *p };
+        }
+        let params = self.ensure_params_buffer(params_idx, plan.params_buffer_size).ok()?;
+        let at = |v: ValueId| -> (&Buffer, usize) {
+            match pos_ids.iter().position(|&x| x == v) {
+                Some(i) => (&side, i * 256),
+                None => loc(v),
+            }
+        };
+        let cb = self.rt.queue.new_command_buffer().to_owned();
+        let enc = cb.new_compute_command_encoder();
+        let counted = Counted::new(enc);
+        let ok = plan
+            .steps
+            .iter()
+            .enumerate()
+            .all(|(i, s)| self.encode(&counted, s, i, &params, &at).is_ok());
+        enc.end_encoding();
+        let dispatches = counted.dispatches();
+        ok.then(|| Ahead {
+            plan_id: plan.id,
+            pos: next,
+            state_key,
+            arena,
+            cb,
+            params_idx,
+            dispatches,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4186,6 +4357,42 @@ pub struct PreparedPlan {
     pub params_buffer_size: usize,
     /// Names of the states stored as f16 (see [`Session::assign_kv_dtypes`]).
     pub f16_states: std::collections::HashSet<String>,
+    /// Unique per `prepare_plan`: what a pre-encoded command buffer is valid for.
+    pub id: u64,
+    /// The graph-input positions of a decode plan (attention `pos` inputs): the only input values
+    /// `encode` reads on the host, so the only thing the next step's command buffer must predict.
+    /// `None` when the plan cannot be encoded ahead.
+    pub ahead_pos: Option<Vec<ValueId>>,
+}
+
+static PLAN_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The command buffer of the step after the one that just ran, fully encoded and not committed: a
+/// decode step whose position is the last one's plus one and whose state buffers are the same is
+/// committed as is, so the host encodes (~0.25 ms for a 600-dispatch plan) while the GPU runs.
+/// luminal: luminal_metal/src/command_buffer.rs:21-202.
+struct Ahead {
+    plan_id: u64,
+    /// The values of the plan's `ahead_pos` inputs the buffer was encoded for.
+    pos: Vec<u32>,
+    state_key: u64,
+    arena: usize,
+    cb: metal::CommandBuffer,
+    params_idx: usize,
+    dispatches: u32,
+}
+
+/// The last decode run's identity, to tell a sequence advancing by one position from other traffic.
+struct LastRun {
+    plan_id: u64,
+    state_key: u64,
+    pos: Vec<u32>,
+}
+
+#[derive(Default)]
+struct AheadState {
+    next: Option<Ahead>,
+    last: Option<LastRun>,
 }
 
 /// Element count of the physical buffer for a state value: 2-D states with more than 4096 declared rows
@@ -6163,6 +6370,108 @@ mod tests {
             run[100] as f64 / 1e3,
             samples[100].dispatches
         );
+    }
+
+    /// A small decode block (rmsnorm, qkv, rope, cached attention over a `t`-row state, MLP).
+    fn decode_block(t: usize) -> (Graph, Weights) {
+        let (h, nh, hd, ff) = (64usize, 2usize, 32usize, 128usize);
+        let f = DType::F32;
+        let (mut g, mut w) = (Graph::new(), Weights::new());
+        let mut dense = |g: &mut Graph, name: &str, rows: usize, cols: usize, seed: u64| {
+            let scale = 1.0 / (cols as f32).sqrt();
+            w.insert(
+                name.to_string(),
+                Tensor::F32(rand(rows * cols, seed).into_iter().map(|v| v * scale).collect()),
+            );
+            g.weight(name, vec![rows, cols], f)
+        };
+        let x0 = g.input("x", vec![1, h], f);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let ks = g.state("k_state", vec![t, hd], f);
+        let vs = g.state("v_state", vec![t, hd], f);
+        let (wq, wk, wv) = (
+            dense(&mut g, "wq", nh * hd, h, 1),
+            dense(&mut g, "wk", hd, h, 2),
+            dense(&mut g, "wv", hd, h, 3),
+        );
+        let (wo, wg, wu, wd) = (
+            dense(&mut g, "wo", h, nh * hd, 4),
+            dense(&mut g, "wg", ff, h, 5),
+            dense(&mut g, "wu", ff, h, 6),
+            dense(&mut g, "wd", h, ff, 7),
+        );
+        w.insert(
+            "inv_freq".to_string(),
+            Tensor::F32((0..hd / 2).map(|i| 10000f32.powf(-(i as f32) / (hd / 2) as f32)).collect()),
+        );
+        let inv = g.weight("inv_freq", vec![hd / 2], f);
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: crate::graph::RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        let q = g.add("q", Op::Linear, &[x0, wq], vec![1, nh * hd], f);
+        let k = g.add("k", Op::Linear, &[x0, wk], vec![1, hd], f);
+        let v = g.add("v", Op::Linear, &[x0, wv], vec![1, hd], f);
+        let q = g.add("qr", rope.clone(), &[q, pos, inv], vec![1, nh * hd], f);
+        let k = g.add("kr", rope, &[k, pos, inv], vec![1, hd], f);
+        let att = Op::CachedAttention {
+            heads: nh,
+            kv_heads: 1,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write: true,
+        };
+        let o = g.add("attn", att, &[q, k, v, ks, vs, pos], vec![1, nh * hd], f);
+        let o = g.add("o", Op::Linear, &[o, wo], vec![1, h], f);
+        let x1 = g.add("res1", Op::Add, &[x0, o], vec![1, h], f);
+        let gate = g.add("gate", Op::Linear, &[x1, wg], vec![1, ff], f);
+        let up = g.add("up", Op::Linear, &[x1, wu], vec![1, ff], f);
+        let act = g.add("act", Op::GeGlu, &[gate, up], vec![1, ff], f);
+        let d = g.add("down", Op::Linear, &[act, wd], vec![1, h], f);
+        let out = g.add("res2", Op::Add, &[x1, d], vec![1, h], f);
+        g.output(out);
+        (g, w)
+    }
+
+    /// Decode steps whose command buffer was encoded during the previous step are bit-identical to
+    /// synchronous steps: across the KV growth (4096 rows, at step 4096, where the state buffer is
+    /// replaced), a sequence switch, a rewind, a jump, and an interleave of two sequences.
+    #[test]
+    fn decode_ahead_matches_synchronous_steps() {
+        let (g, w) = decode_block(8192);
+        let (on, off) = (Session::new(rt(), &w).unwrap(), Session::new(rt(), &w).unwrap());
+        off.set_decode_ahead(false);
+        let (plan_on, plan_off) = (on.prepare_plan(&g).unwrap(), off.prepare_plan(&g).unwrap());
+        assert!(plan_on.ahead_pos.is_some(), "the decode block is eligible for encode-ahead");
+        let mut states = [
+            (StateStore::new(), StateStore::new()),
+            (StateStore::new(), StateStore::new()),
+        ];
+        // (sequence, position) of each step.
+        let mut script: Vec<(usize, u32)> = (0..4200).map(|p| (0, p)).collect();
+        script.extend((0..30).map(|i| (1, i)));
+        script.extend((0..10).flat_map(|i| [(0, 4200 + i), (1, 30 + i)]));
+        script.extend((0..5).map(|i| (0, 7 + i)));
+        script.extend([(0, 100), (0, 101), (0, 102), (0, 50), (0, 51)]);
+        // The other sequence at exactly the position the pre-encoded step predicted: only its state differs.
+        script.extend([(0, 199), (0, 200), (1, 201), (0, 202), (1, 203), (1, 204)]);
+        for (n, &(seq, pos)) in script.iter().enumerate() {
+            let x = rand(64, 1000 + n as u64);
+            let inputs = || vec![Tensor::F32(x.clone()), Tensor::U32(vec![pos])];
+            let a = on.run_prepared(&g, &plan_on, Some(&mut states[seq].0), inputs()).unwrap();
+            let b = off.run_prepared(&g, &plan_off, Some(&mut states[seq].1), inputs()).unwrap();
+            assert_eq!(a[0].as_f32().unwrap(), b[0].as_f32().unwrap(), "step {n} (seq {seq}, pos {pos})");
+        }
+        // Every step of a long run after the first two is a hit, bar the growth step and the switches.
+        let hits = on.decode_ahead_hits();
+        assert!(hits >= 4190, "only {hits} of {} steps ran a pre-encoded buffer", script.len());
+        assert_eq!(off.decode_ahead_hits(), 0);
     }
 
     /// A two-output step's outputs are both live until their own last reader: later steps never
