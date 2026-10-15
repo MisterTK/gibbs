@@ -24,6 +24,9 @@ pub(super) const MSL: &str = include_str!("moe.metal");
 /// Compute functions in `moe.metal`.
 pub(super) const KERNELS: &[&str] = &[
     "moe_topk_f32",
+    "moe_topk_wide_max",
+    "moe_topk_wide_collect",
+    "moe_topk_wide_final",
     "moe_gather_cols_f32",
     "moe_embed_f16",
     "moe_embed_bf16",
@@ -409,9 +412,46 @@ fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, Strin
     Ok(pso)
 }
 
+/// Rows at least this wide (and k <= [`WIDE_TOPK_MAX`]) take the multi-threadgroup top-k.
+const WIDE_TOPK_COLS: usize = 2048;
+const WIDE_TOPK_MAX: usize = 64;
+/// Threadgroups per row of the wide top-k's chunk scans (`TK_CHUNKS` in `moe.metal`).
+const TOPK_CHUNKS: usize = 256;
+/// Scratch words per row of the wide top-k (`TK_ROW_WORDS` in `moe.metal`).
+const TOPK_ROW_WORDS: usize = 260 + 2 * 1024;
+
+/// The session's top-k scratch buffer, grown to `bytes`.
+fn topk_scratch(sess: &Session, bytes: usize) -> Result<metal::Buffer, String> {
+    let mut g = sess.topk_scratch.lock();
+    if g.as_ref().is_none_or(|b| (b.length() as usize) < bytes) {
+        *g = Some(super::super::new_shared_buffer(&sess.rt.device, bytes)?);
+    }
+    Ok(g.as_ref().expect("allocated above").clone())
+}
+
 pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<(), String> {
     let (enc, rt) = (e.enc, &sess.rt);
     match st {
+        Step::TopK { x, rows, cols, k } if *cols >= WIDE_TOPK_COLS && *k <= WIDE_TOPK_MAX => {
+            let scratch = topk_scratch(sess, rows * TOPK_ROW_WORDS * 4)?;
+            let len = cols.div_ceil(TOPK_CHUNKS);
+            let p = [u32_of(*rows)?, u32_of(*cols)?, u32_of(*k)?, u32_of(len)?];
+            let grid = MTLSize::new(TOPK_CHUNKS as u64, *rows as u64, 1);
+            let tg = MTLSize::new(256, 1, 1);
+            for name in ["moe_topk_wide_max", "moe_topk_wide_collect"] {
+                enc.set_compute_pipeline_state(rt.pso(name)?);
+                e.bind(0, *x);
+                enc.set_buffer(1, Some(&scratch), 0);
+                set_bytes(enc, 2, &p);
+                enc.dispatch_thread_groups(grid, tg);
+            }
+            enc.set_compute_pipeline_state(rt.pso("moe_topk_wide_final")?);
+            e.bind(0, *x);
+            e.bind(1, s.out);
+            enc.set_buffer(2, Some(&scratch), 0);
+            set_bytes(enc, 3, &p);
+            enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), tg);
+        }
         Step::TopK { x, rows, cols, k } => {
             enc.set_compute_pipeline_state(rt.pso("moe_topk_f32")?);
             e.bind(0, *x);
@@ -724,6 +764,52 @@ mod tests {
             ] {
                 let (want, got) = topk_both(x, rows, cols, k);
                 assert_eq!(got, want, "topk {name} {rows}x{cols} k={k}");
+            }
+        }
+    }
+
+    /// Wide rows (the multi-threadgroup path): top-k indices equal the CPU full sort for distinct
+    /// values, boundary ties below and above the candidate cap, constant rows, NaN and infinities.
+    #[test]
+    fn topk_wide_rows_match_cpu() {
+        let vocab = [2048usize, 2049, 4096, 5000, 32000, 151_936, 262_144];
+        for &cols in &vocab {
+            for k in [1usize, 8, 50, 64] {
+                let rows = if cols <= 5000 { 3 } else { 1 };
+                let distinct = rand(rows * cols, 7 + cols as u64);
+                let mut cases = vec![("distinct", distinct.clone())];
+                // The k-th value ties with 300 (under the cap) / 3000 (over the cap) other elements.
+                for (name, ties) in [("tie300", 300usize), ("tie3000", 3000)] {
+                    let mut x = distinct.clone();
+                    for r in 0..rows {
+                        let row = &mut x[r * cols..(r + 1) * cols];
+                        for (i, v) in row.iter_mut().enumerate() {
+                            *v = (*v).clamp(-0.5, 0.5);
+                            if i < k - 1 {
+                                *v = 10.0 + i as f32;
+                            } else if i < k - 1 + ties.min(cols - k) {
+                                *v = 5.0;
+                            }
+                        }
+                        row.rotate_left(cols / 3);
+                    }
+                    cases.push((name, x));
+                }
+                cases.push(("constant", vec![0.25; rows * cols]));
+                let mut special = distinct.clone();
+                for (i, v) in special.iter_mut().enumerate() {
+                    match i % 97 {
+                        0 => *v = f32::NAN,
+                        1 => *v = f32::INFINITY,
+                        2 => *v = f32::NEG_INFINITY,
+                        _ => {}
+                    }
+                }
+                cases.push(("nan_inf", special));
+                for (name, x) in cases {
+                    let (want, got) = topk_both(x, rows, cols, k);
+                    assert_eq!(got, want, "wide topk {name} {rows}x{cols} k={k}");
+                }
             }
         }
     }

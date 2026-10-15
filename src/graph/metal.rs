@@ -1405,6 +1405,8 @@ pub struct Session {
     dequant_scratch: Mutex<Option<Buffer>>,
     /// Per-slice partials of the split decode attention (grown to the largest).
     attn_scratch: Mutex<Option<Buffer>>,
+    /// Chunk maxima and candidates of the wide-row top-k (`ext::moe`).
+    topk_scratch: Mutex<Option<Buffer>>,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -1977,6 +1979,7 @@ impl Session {
             mlp_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
+            topk_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
@@ -2289,8 +2292,38 @@ impl Session {
         &self,
         graph: &Graph,
         plan: &PreparedPlan,
+        state: Option<&mut crate::graph::StateStore>,
+        inputs: Vec<Tensor>,
+    ) -> Result<Vec<Tensor>, String> {
+        self.run_prepared_outputs(graph, plan, state, inputs, &graph.outputs)
+    }
+
+    /// The `n` f32 elements of `v` in the activation arena as the last run left them (valid until
+    /// the next run on this session).
+    pub fn read_value(&self, graph: &Graph, plan: &PreparedPlan, v: ValueId) -> Result<Vec<f32>, String> {
+        let off = *plan
+            .offsets
+            .get(&v)
+            .ok_or_else(|| format!("value '{}' has no arena slot", graph.value(v).name))?;
+        let n = numel(graph, v)?;
+        let arena = self.arena.lock();
+        let buf = arena.as_ref().ok_or("no run has allocated the arena")?;
+        if off + n * 4 > buf.length() as usize {
+            return Err(format!("value '{}' lies past the arena", graph.value(v).name));
+        }
+        // SAFETY: bounds checked above; the last run's command buffers have completed.
+        let s = unsafe { std::slice::from_raw_parts((buf.contents() as *const u8).add(off) as *const f32, n) };
+        Ok(s.to_vec())
+    }
+
+    /// [`Self::run_prepared`] returning only `outputs` (any values the plan keeps live, in order).
+    pub fn run_prepared_outputs(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
         mut state: Option<&mut crate::graph::StateStore>,
         inputs: Vec<Tensor>,
+        outputs: &[ValueId],
     ) -> Result<Vec<Tensor>, String> {
         let run_start = Instant::now();
         let mut sample: Option<RunSample> = None;
@@ -2559,8 +2592,7 @@ impl Session {
             }
             Ok(())
         })?;
-        let outs = graph
-            .outputs
+        let outs = outputs
             .iter()
             .map(|&v| {
                 let (buf, off) = loc(v);
