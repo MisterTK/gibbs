@@ -7,7 +7,7 @@ For every round and model the two binaries run back to back (order alternates be
 GPU burst hits both arms of a pair about equally; the verdict per model is the median of the per-pair
 cand/base tok/s ratios plus how many pairs favour the candidate. This is a SCREEN for machines where the
 frozen ABBA verify (scripts/loop_verify.sh) keeps aborting on contention: it never replaces the keep rule.
-Prints one JSON line per model and a summary of host/gpu/wall medians.
+Touches target/matrix/PAUSE for its duration. Prints one JSON line per model and a summary of host/gpu/wall medians.
 """
 import argparse, json, os, statistics, subprocess, sys
 
@@ -23,6 +23,10 @@ a = ap.parse_args()
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 suite = json.load(open(os.path.join(root, a.suite)))
+# Quiet machine, as loop_verify.sh: the matrix runner abandons its in-flight item while PAUSE exists.
+os.makedirs(os.path.join(root, "target/matrix"), exist_ok=True)
+open(os.path.join(root, "target/matrix/PAUSE"), "w").close()
+subprocess.run(["pkill", "-f", "curl.*matrix-cache"])
 files = {}
 for i in (int(x) for x in a.models.split(",")):
     # Flat in bench/: prompt_file resolves relative to the suite file's directory.
@@ -31,7 +35,7 @@ for i in (int(x) for x in a.models.split(",")):
     files[i] = p
 
 def run(binary, path, extra):
-    env = dict(os.environ, **dict(kv.split("=", 1) for kv in extra))
+    env = dict(os.environ, GIBBS_TUNE_BUSY_PCT=os.environ.get('GIBBS_TUNE_BUSY_PCT', '35'), **dict(kv.split("=", 1) for kv in extra))
     r = subprocess.run([binary, "--bench", path], capture_output=True, text=True, cwd=root, env=env)
     for l in r.stdout.splitlines():
         if l.startswith("{"):
@@ -53,6 +57,7 @@ try:
 finally:
     for p in files.values():
         os.remove(p)
+    os.remove(os.path.join(root, "target/matrix/PAUSE"))
 
 for i, r in res.items():
     ratios = [c["decode_tok_s"] / b["decode_tok_s"] for b, c in zip(r["base"], r["cand"])]
