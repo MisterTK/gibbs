@@ -2303,10 +2303,18 @@ mod tests {
         let chunk2_tok = exec_model
             .step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut chunk_kv)
             .expect("Metal chunk 2 prefill succeeds");
-        assert_eq!(
-            chunk2_tok,
-            Some(exp_tok),
-            "Metal chunked prefill greedy token must match CPU reference"
+        // Synthetic weights tie the top logits to within an ulp, so compare the picked token's reference
+        // logit, not its id (as the sibling test does).
+        let tied = |tok: u32, what: &str| {
+            let (got, want) = (exp_next[tok as usize], exp_next[exp_tok as usize]);
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{what}: picked token {tok} (reference logit {got}) vs reference {exp_tok} (logit {want})"
+            );
+        };
+        tied(
+            chunk2_tok.expect("last chunk samples a token"),
+            "Metal chunked prefill greedy token must match CPU reference",
         );
 
         // 2b. Single-call prefill + decode on Metal
@@ -2321,10 +2329,7 @@ mod tests {
                 &mut kv,
             )
             .expect("Metal step_token_with_kv succeeds");
-        assert_eq!(
-            next_tok, exp_tok,
-            "Metal Program greedy token must match GraphLm forward"
-        );
+        tied(next_tok, "Metal Program greedy token must match GraphLm forward");
 
         // 2c. Sequential decode step on Metal
         let mut full_prompt = prompt.clone();
