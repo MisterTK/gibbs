@@ -42,6 +42,9 @@ pub struct HfConfigJson {
     /// Explicit per-head width (Qwen3, ERNIE-4.5, Gemma): `num_heads * head_dim` need not equal `hidden_size`.
     #[serde(default)]
     pub head_dim: Option<usize>,
+    /// Granite-4 hybrids: `"nope"` means no rotary embedding.
+    #[serde(default)]
+    pub position_embedding_type: Option<String>,
     #[serde(default)]
     pub architectures: Vec<String>,
     #[serde(alias = "hidden_act", alias = "activation_function", default)]
