@@ -87,6 +87,12 @@ impl GraphLmConfig {
         }
     }
 
+    /// Width of q (and of the expanded k, v and the attention output): `num_heads * head_dim`, which
+    /// differs from `hidden_dim` for models with an explicit `head_dim` (Qwen3, ERNIE-4.5, Gemma).
+    pub fn attn_dim(&self) -> usize {
+        self.num_heads * self.head_dim
+    }
+
     /// `Some(s)` for a multiplier that is set and not the identity.
     fn mult(s: f32) -> Option<f32> {
         (s > 0.0 && s != 1.0).then_some(s)
@@ -245,6 +251,7 @@ impl GraphLmConfig {
             hf.num_heads,
             quant_mode,
         );
+        cfg.head_dim = hf.head_dim.unwrap_or(cfg.head_dim);
         cfg.rotary_pct = hf.resolved_rotary_pct();
         cfg.use_parallel_residual = hf.resolved_parallel_residual();
         cfg.use_standard_layernorm = hf.resolved_use_standard_layernorm();
@@ -440,15 +447,15 @@ pub struct DecodeScratchpad {
 }
 
 impl DecodeScratchpad {
-    pub fn new(hidden_dim: usize, intermediate_dim: usize, vocab_size: usize) -> Self {
+    pub fn new(hidden_dim: usize, attn_dim: usize, intermediate_dim: usize, vocab_size: usize) -> Self {
         Self {
             hidden: vec![0.0f32; hidden_dim],
             norm1_x: vec![0.0f32; hidden_dim],
-            qkv: vec![0.0f32; 3 * hidden_dim],
-            q_vec: vec![0.0f32; hidden_dim],
-            k_vec: vec![0.0f32; hidden_dim],
-            v_vec: vec![0.0f32; hidden_dim],
-            attn_out: vec![0.0f32; hidden_dim],
+            qkv: vec![0.0f32; 3 * attn_dim],
+            q_vec: vec![0.0f32; attn_dim],
+            k_vec: vec![0.0f32; attn_dim],
+            v_vec: vec![0.0f32; attn_dim],
+            attn_out: vec![0.0f32; attn_dim],
             attn_scores: vec![0.0f32; 2048],
             proj_out: vec![0.0f32; hidden_dim],
             norm2_x: vec![0.0f32; hidden_dim],
@@ -473,6 +480,7 @@ impl DecodeScratchpad {
         }
         let mut pad = Self::new(
             config.hidden_dim,
+            config.attn_dim(),
             config.intermediate_dim,
             config.vocab_size,
         );
@@ -1210,6 +1218,7 @@ impl GraphLm {
             soft_cap: None,
         };
 
+        let a = c.attn_dim();
         let mut g = Graph::new();
         let (mut x, positions) = if embeds {
             let e = g.input("inputs_embeds", vec![n, h], DType::F32);
@@ -1276,13 +1285,13 @@ impl GraphLm {
                 &layer.qkv_proj,
                 n,
             );
-            let mut q = slice(&mut g, format!("{p}.self_attn.q"), qkv, 0, h, n);
-            let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, h, 2 * h, n);
-            let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * h, 3 * h, n);
+            let mut q = slice(&mut g, format!("{p}.self_attn.q"), qkv, 0, a, n);
+            let mut k = slice(&mut g, format!("{p}.self_attn.k"), qkv, a, 2 * a, n);
+            let vv = slice(&mut g, format!("{p}.self_attn.v"), qkv, 2 * a, 3 * a, n);
             if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
                 // `RmsNorm` with a head_dim-wide gain normalises each head of the row.
-                q = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.q_norm"), q, qn, eps, vec![n, h]);
-                k = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.k_norm"), k, kn, eps, vec![n, h]);
+                q = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.q_norm"), q, qn, eps, vec![n, a]);
+                k = head_norm(&mut g, &mut w_map, format!("{p}.self_attn.k_norm"), k, kn, eps, vec![n, a]);
             }
             if rotary_dim > 0 {
                 let inv_freq_val = g.weight(
@@ -1297,14 +1306,14 @@ impl GraphLm {
                     format!("{p}.self_attn.rope_q"),
                     rope.clone(),
                     &[q, positions, inv_freq_val],
-                    vec![n, h],
+                    vec![n, a],
                     DType::F32,
                 );
                 k = g.add(
                     format!("{p}.self_attn.rope_k"),
                     rope.clone(),
                     &[k, positions, inv_freq_val],
-                    vec![n, h],
+                    vec![n, a],
                     DType::F32,
                 );
             }
@@ -1340,7 +1349,7 @@ impl GraphLm {
                 // `Op::Attention` has no scale parameter (it is 1/sqrt(head_dim)): fold the model's into q.
                 let q = if c.attention_scale > 0.0 {
                     let s = c.attn_scale() * (c.head_dim as f32).sqrt();
-                    scale_by(&mut g, format!("{p}.self_attn.q_scale"), q, s, vec![n, h])
+                    scale_by(&mut g, format!("{p}.self_attn.q_scale"), q, s, vec![n, a])
                 } else {
                     q
                 };
@@ -1547,6 +1556,7 @@ impl GraphLm {
         let h = config.hidden_dim;
         let inter = config.intermediate_dim;
         let layers_count = config.num_layers;
+        let a = config.attn_dim();
         // Per-head q/k RMSNorm (`head_dim` gains, before RoPE) is consumed below; any other tensor of
         // that family (hunyuan's after-RoPE `query_layernorm`, a vision tower's, full-width OLMo2) is not.
         let qk_names = |l: usize| {
@@ -1998,7 +2008,7 @@ impl GraphLm {
             let mut qkv_proj = QuantizedLinearLayer::from_f32(
                 &format!("layer_{}_qkv", l),
                 h,
-                3 * h,
+                3 * a,
                 &raw_qkv,
                 QuantFormat::FP32,
             )
@@ -2026,8 +2036,8 @@ impl GraphLm {
                     fused_bias.extend(qb);
                     fused_bias.extend(kb_exp);
                     fused_bias.extend(vb_exp);
-                    if fused_bias.len() != 3 * h {
-                        fused_bias.resize(3 * h, 0.0);
+                    if fused_bias.len() != 3 * a {
+                        fused_bias.resize(3 * a, 0.0);
                     }
                     qwen_qkv_bias = Some(fused_bias);
                 }
@@ -2044,8 +2054,8 @@ impl GraphLm {
                     fused_bias.extend(qb);
                     fused_bias.extend(kb_exp);
                     fused_bias.extend(vb_exp);
-                    if fused_bias.len() != 3 * h {
-                        fused_bias.resize(3 * h, 0.0);
+                    if fused_bias.len() != 3 * a {
+                        fused_bias.resize(3 * a, 0.0);
                     }
                     qwen_qkv_bias = Some(fused_bias);
                 }
@@ -2099,7 +2109,7 @@ impl GraphLm {
 
             let mut out_proj = QuantizedLinearLayer::from_f32(
                 &format!("layer_{}_out", l),
-                h,
+                a,
                 h,
                 &raw_out,
                 QuantFormat::FP32,
@@ -2220,6 +2230,10 @@ impl GraphLm {
                 ));
             }
 
+            let (q_norm, k_norm) = (qk_norm(l, true)?, qk_norm(l, false)?);
+            if q_norm.is_some() != k_norm.is_some() {
+                return Err(format!("layer {l}: q and k norm gains must come as a pair"));
+            }
             layers.push(GraphLayer {
                 norm1,
                 norm1_bias,
@@ -2233,8 +2247,8 @@ impl GraphLm {
                 post_ffw_norm,
                 attn_sub_norm,
                 ffn_sub_norm,
-                q_norm: qk_norm(l, true)?,
-                k_norm: qk_norm(l, false)?,
+                q_norm,
+                k_norm,
             });
         }
 
@@ -2404,6 +2418,7 @@ impl GraphLm {
         let inter = self.config.intermediate_dim;
         let num_heads = self.config.num_heads;
         let head_dim = self.config.head_dim;
+        let a = self.config.attn_dim();
         let eps = self.config.norm_eps;
         let bits = self.config.act_quant_bits;
         assert!(!tokens.is_empty(), "final_hidden needs at least one token");
@@ -2467,16 +2482,16 @@ impl GraphLm {
                     }
                 }
 
-                // QKV projection: produces 3 * h
-                let mut qkv = vec![0.0f32; 3 * h];
+                // QKV projection: produces 3 * a (a = num_heads * head_dim)
+                let mut qkv = vec![0.0f32; 3 * a];
                 if bits > 0 {
                     act_quant(&mut norm1_x, bits);
                 }
                 layer.qkv_proj.forward(&norm1_x, &mut qkv);
 
-                let mut q_vec = qkv[0..h].to_vec();
-                let mut k_vec = qkv[h..2 * h].to_vec();
-                let v_vec = qkv[2 * h..3 * h].to_vec();
+                let mut q_vec = qkv[0..a].to_vec();
+                let mut k_vec = qkv[a..2 * a].to_vec();
+                let v_vec = qkv[2 * a..3 * a].to_vec();
                 if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
                     head_rms_norm(&mut q_vec, qn, eps);
                     head_rms_norm(&mut k_vec, kn, eps);
@@ -2524,7 +2539,7 @@ impl GraphLm {
             // Multi-head causal attention execution
             let scale_attn = self.config.attn_scale();
             for t in 0..seq_len {
-                let mut attn_out = vec![0.0f32; h];
+                let mut attn_out = vec![0.0f32; a];
 
                 for head in 0..num_heads {
                     let head_offset = head * head_dim;
@@ -2743,6 +2758,7 @@ impl GraphLm {
         let inter = self.config.intermediate_dim;
         let num_heads = self.config.num_heads;
         let head_dim = self.config.head_dim;
+        let a = self.config.attn_dim();
         let eps = self.config.norm_eps;
         let bits = self.config.act_quant_bits;
         if let Some(s) = self.config.embedding_mult() {
@@ -2805,8 +2821,8 @@ impl GraphLm {
             }
             layer.qkv_proj.forward(&pad.norm1_x, &mut pad.qkv);
             if let (Some(qn), Some(kn)) = (&layer.q_norm, &layer.k_norm) {
-                head_rms_norm(&mut pad.qkv[..h], qn, eps);
-                head_rms_norm(&mut pad.qkv[h..2 * h], kn, eps);
+                head_rms_norm(&mut pad.qkv[..a], qn, eps);
+                head_rms_norm(&mut pad.qkv[a..2 * a], kn, eps);
             }
 
             // 3. Rotary Position Embeddings (RoPE) at position pos in-place on pad.qkv
@@ -2833,8 +2849,8 @@ impl GraphLm {
                                 vaddq_f32(vmulq_f32(x1, cos_vec), vmulq_f32(x0, sin_vec)),
                             )
                         };
-                        // q at head_offset, k at h + head_offset
-                        for base in [head_offset, h + head_offset] {
+                        // q at head_offset, k at a + head_offset
+                        for base in [head_offset, a + head_offset] {
                             if interleaved {
                                 let p = qkv_ptr.add(base + 2 * d);
                                 let x = vld2q_f32(p);
@@ -2864,8 +2880,8 @@ impl GraphLm {
                     pad.qkv[idx0] = q0 * cos_th - q1 * sin_th;
                     pad.qkv[idx1] = q1 * cos_th + q0 * sin_th;
 
-                    let k_idx0 = h + idx0;
-                    let k_idx1 = h + idx1;
+                    let k_idx0 = a + idx0;
+                    let k_idx1 = a + idx1;
                     let k0 = pad.qkv[k_idx0];
                     let k1 = pad.qkv[k_idx1];
                     pad.qkv[k_idx0] = k0 * cos_th - k1 * sin_th;
@@ -2876,7 +2892,7 @@ impl GraphLm {
             }
 
             // 4. Append K and V directly from pad.qkv into LayerKVCache
-            cache.push_kv(&pad.qkv[h..2 * h], &pad.qkv[2 * h..3 * h]);
+            cache.push_kv(&pad.qkv[a..2 * a], &pad.qkv[2 * a..3 * a]);
             let current_len = cache.len;
 
             // 5. Causal attention for this token against cached 0..=pos in O(pos) time
@@ -2891,7 +2907,7 @@ impl GraphLm {
                         &cache.v[head_offset..],
                         head_dim,
                         current_len,
-                        h,
+                        a,
                         &mut pad.attn_out[head_offset..head_offset + head_dim],
                     );
                 } else {
@@ -2901,7 +2917,7 @@ impl GraphLm {
                         &cache.v[head_offset..],
                         head_dim,
                         current_len,
-                        h,
+                        a,
                         scale_attn,
                         &mut pad.attn_out[head_offset..head_offset + head_dim],
                     );
@@ -4007,5 +4023,60 @@ mod tests {
         let mut gemma = Tiny::new(16, 2, 2, 8, true);
         gemma.t.insert("model.layers.0.pre_feedforward_layernorm.weight".into(), (vec![16], vec![1.0; 16]));
         assert!(gemma.load().expect_err("gemma3").contains("sliding-window"));
+    }
+
+    /// Attention wider than the hidden size (ERNIE-4.5, Qwen3: `head_dim` 128 with hidden 1024 and 16
+    /// heads) with GQA: loads, and the graph and host forward match the reference.
+    #[test]
+    fn attention_wider_than_hidden_with_gqa_matches_reference() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let tokens = [3u32, 17, 5, 9];
+        for qk_norm in [false, true] {
+            let tiny = Tiny::new(16, 4, 2, 8, qk_norm);
+            let model = tiny.load().expect("loads");
+            let a = model.config.attn_dim();
+            assert_eq!(a, 32);
+            assert!(model.layers.iter().all(|l| {
+                (l.qkv_proj.in_features, l.qkv_proj.out_features) == (16, 3 * a)
+                    && (l.out_proj.in_features, l.out_proj.out_features) == (a, 16)
+            }));
+            let want = tiny.reference(&tokens);
+            assert_close(&model.forward(&tokens), &want, &format!("host qk_norm={qk_norm}"));
+            for (cached, got) in [true, false].into_iter().zip(graph_logits(&model, &tokens)) {
+                assert_close(&got, &want, &format!("graph cached={cached} qk_norm={qk_norm}"));
+            }
+            // The per-token KV-cache path (what the CPU scheduler runs) agrees too.
+            let mut kv: Vec<LayerKVCache> = (0..model.layers.len())
+                .map(|_| LayerKVCache::new(model.config.max_seq_len, model.config.hidden_dim))
+                .collect();
+            let mut last = vec![];
+            for (p, &t) in tokens.iter().enumerate() {
+                last = model.forward_token_with_kv(t, p, &mut kv);
+            }
+            assert_close(&last, &want, &format!("host kv qk_norm={qk_norm}"));
+        }
+    }
+
+    /// `head_dim` comes from HF `head_dim` and GGUF `attention.key_length`, else hidden / heads.
+    #[test]
+    fn explicit_head_dim_reaches_the_config() {
+        let hf = |extra: &str| -> GraphLmConfig {
+            let j = format!(
+                r#"{{"hidden_size":1024,"num_hidden_layers":2,"num_attention_heads":16{extra}}}"#
+            );
+            GraphLmConfig::from_hf(&serde_json::from_str(&j).unwrap(), QuantMode::Uncompressed)
+        };
+        assert_eq!(hf("").head_dim, 64);
+        let wide = hf(r#","head_dim":128"#);
+        assert_eq!((wide.head_dim, wide.attn_dim()), (128, 2048));
+
+        let base = GraphLmConfig::smollm_1m();
+        let gguf = |extra: &[(&str, &str)]| {
+            let mut e = vec![("embedding_length", "1024"), ("attention.head_count", "16")];
+            e.extend_from_slice(extra);
+            GraphLmConfig::from_gguf(&granite_manifest("ernie4_5", &e), base.clone())
+        };
+        assert_eq!(gguf(&[]).head_dim, 64);
+        assert_eq!(gguf(&[("attention.key_length", "128")]).attn_dim(), 2048);
     }
 }
