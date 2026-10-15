@@ -127,25 +127,34 @@ inline void tile_seg(uint4 q, uint k, thread float* out) {
 "#,
 };
 
-/// Device layout of a codec whose block is `[data bytes][tail bytes]` (quants, then scales): the GPU weight
-/// buffer stores `blocks` consecutive blocks as one group, all their data bytes first and all their tails
-/// after (`blocks * block_bytes` bytes per group), so the quants of block `i` start at
-/// `(i / blocks) * group_bytes + (i % blocks) * data`, which is 16-byte aligned when `data` is, instead of
-/// at `i * block_bytes`. The last group is zero-padded. Blocks are numbered across rows (and expert
-/// banks), so a row never has to be a whole number of groups. [`Planar::msl`] replaces [`Codec::msl`]
-/// for every GPU consumer of the buffer: its `decode8(grp, sub, out8)` takes the group base and a `sub`
-/// that continues across the group's blocks (`(i % blocks) * block_elems / 8 + sub_in_block`);
-/// [`Tile`]'s functions likewise take `(i % blocks) * groups + g`. [`Codec::msl`] stays the as-stored
-/// (GGUF) layout that `tests/codec_parity.rs` proves against the CPU dequantizer.
+/// Device layout of a codec whose block is `[lead][data][tail]` (`lead`/`tail` hold the scales; `data` the
+/// quants, a multiple of 16 bytes): the GPU weight buffer stores `blocks` consecutive blocks as one group,
+/// all their data bytes first and then all their lead + tail bytes (per block, lead first), `blocks *
+/// block_bytes` bytes per group, so the quants of block `i` start at `(i / blocks) * group_bytes + (i %
+/// blocks) * data`, which is 16-byte aligned, instead of at `i * block_bytes`; the scales of block `i` are at
+/// `blocks * data + (i % blocks) * (block_bytes - data)` of its group. The last group is zero-padded. Blocks
+/// are numbered across rows (and expert banks), so a row never has to be a whole number of groups.
+/// [`Planar::msl`] replaces [`Codec::msl`] for every GPU consumer of the buffer: its `decode8(grp, sub, out8)`
+/// takes the group base and a `sub` that continues across the group's blocks (`(i % blocks) * block_elems / 8
+/// + sub_in_block`); [`Wide`] codecs replace their MSL by `wide_msl` (same functions, `decode_group` takes
+/// `(i % blocks) * groups + g`), and [`Tile`]'s functions likewise take `(i % blocks) * groups + g`.
+/// [`Codec::msl`] stays the as-stored (GGUF) layout that `tests/codec_parity.rs` proves against the CPU
+/// dequantizer.
 pub struct Planar {
     pub blocks: u32,
     pub data: u32,
+    /// Scale bytes before `data` in the as-stored block.
+    pub lead: u32,
     pub msl: &'static str,
+    /// The [`Wide`] MSL for this layout; empty for a codec without a wide decode.
+    pub wide_msl: &'static str,
 }
 
 pub fn planar(format: QuantFormat) -> Option<&'static Planar> {
     match format {
         QuantFormat::GGUF_TQ2_0 => Some(&PLANAR_TQ2_0),
+        QuantFormat::GGUF_Q3_K => Some(&PLANAR_Q3_K),
+        QuantFormat::GGUF_Q5_K_M => Some(&PLANAR_Q5_K),
         _ => None,
     }
 }
@@ -153,14 +162,16 @@ pub fn planar(format: QuantFormat) -> Option<&'static Planar> {
 impl Planar {
     /// `raw` (whole as-stored blocks of `block_bytes`) in the device layout.
     pub fn repack(&self, raw: &[u8], block_bytes: usize) -> Vec<u8> {
-        let (g, data) = (self.blocks as usize, self.data as usize);
-        let tail = block_bytes - data;
+        let (g, data, lead) = (self.blocks as usize, self.data as usize, self.lead as usize);
+        let scales = block_bytes - data;
         let group = g * block_bytes;
         let mut out = vec![0u8; (raw.len() / block_bytes).div_ceil(g) * group];
         for (dst, src) in out.chunks_exact_mut(group).zip(raw.chunks(group)) {
             for (j, b) in src.chunks_exact(block_bytes).enumerate() {
-                dst[j * data..][..data].copy_from_slice(&b[..data]);
-                dst[g * data + j * tail..][..tail].copy_from_slice(&b[data..]);
+                dst[j * data..][..data].copy_from_slice(&b[lead..lead + data]);
+                let s = &mut dst[g * data + j * scales..][..scales];
+                s[..lead].copy_from_slice(&b[..lead]);
+                s[lead..].copy_from_slice(&b[lead + data..]);
             }
         }
         out
@@ -171,6 +182,8 @@ impl Planar {
 static PLANAR_TQ2_0: Planar = Planar {
     blocks: 8,
     data: 64,
+    lead: 0,
+    wide_msl: "",
     msl: r#"
 inline void decode8(device const uchar* grp, uint sub, thread float* out8) {
     const uint n = sub >> 5;
@@ -185,6 +198,126 @@ inline void decode8(device const uchar* grp, uint sub, thread float* out8) {
     float4 hi = (float4(as_type<uchar4>(b)) - 1.0f) * d;
     out8[0] = lo.x; out8[1] = lo.y; out8[2] = lo.z; out8[3] = lo.w;
     out8[4] = hi.x; out8[5] = hi.y; out8[6] = hi.z; out8[7] = hi.w;
+}
+"#,
+};
+
+/// Q5_K blocks are `[d, dmin, 12 scale bytes][32 qh][128 qs]`: 8 blocks are 1280 data bytes (qh, qs) then 8
+/// 16-byte scale heads. Every 8-byte group load of `decode_group` is one aligned `uint2`.
+static PLANAR_Q5_K: Planar = Planar {
+    blocks: 8,
+    data: 160,
+    lead: 16,
+    msl: r#"
+inline void decode8(device const uchar* grp, uint sub, thread float* out8) {
+    #pragma clang fp contract(off)
+    const uint bj = sub >> 5, s = sub & 31;
+    device const uchar* sc = grp + 1280 + bj * 16;
+    float d = cd_f16(sc), dmin = cd_f16(sc + 2);
+    uint j = s >> 2;
+    uint sv, mv;
+    cd_k4(j, sc + 4, sv, mv);
+    float d0 = d * float(sv), min0 = dmin * float(mv);
+    device const uchar* data = grp + bj * 160;
+    device const uchar* qh = data + (s & 3) * 8;
+    device const uchar* q = data + 32 + (j >> 1) * 32 + (s & 3) * 8;
+    uint sh = (j & 1) * 4;
+    for (uint i = 0; i < 8; i++) {
+        uint v = ((q[i] >> sh) & 0x0Fu) | (((uint(qh[i]) >> j) & 1u) << 4);
+        out8[i] = d0 * float(v) - min0;
+    }
+}
+"#,
+    wide_msl: r#"
+inline uint group_seg(uint g, uint k) { return ((g >> 2) * 2 + k) * 32 + (g & 3) * 8; }
+inline void decode_group(device const uchar* grp, uint gg, thread float* out) {
+    const uint bj = gg >> 4, g = gg & 15;
+    device const uchar* sc = grp + 1280 + bj * 16;
+    float d = cd_f16(sc), dmin = cd_f16(sc + 2);
+    uint p = g >> 2, l0 = (g & 3) * 8;
+    device const uchar* data = grp + bj * 160;
+    const uint2 q = *(device const uint2*)(data + 32 + p * 32 + l0);
+    const uint2 qh = *(device const uint2*)(data + l0);
+    for (uint w = 0; w < 2; w++) {
+        uint a = q[w];
+        uint h = qh[w];
+        float4 lo = float4(as_type<uchar4>((a & 0x0F0F0F0Fu) | (((h >> (2 * p)) & 0x01010101u) << 4)));
+        float4 hi = float4(as_type<uchar4>(((a >> 4) & 0x0F0F0F0Fu) | (((h >> (2 * p + 1)) & 0x01010101u) << 4)));
+        for (uint i = 0; i < 4; i++) { out[4 * w + i] = lo[i]; out[8 + 4 * w + i] = hi[i]; }
+    }
+    for (uint k = 0; k < 2; k++) {
+        uint sv, mv;
+        cd_k4(2 * p + k, sc + 4, sv, mv);
+        out[16 + k] = d * float(sv);
+        out[18 + k] = -(dmin * float(mv));
+    }
+}
+"#,
+};
+
+/// Q3_K blocks are `[32 hmask][64 qs][12 scale bytes][d]`: 8 blocks are 768 data bytes (hmask, qs) then 8
+/// 14-byte scale tails; every 8-byte group load of `decode_group` is one aligned `uint2`.
+static PLANAR_Q3_K: Planar = Planar {
+    blocks: 8,
+    data: 96,
+    lead: 0,
+    msl: r#"
+inline void decode8(device const uchar* grp, uint sub, thread float* out8) {
+    const uint bj = sub >> 5, s = sub & 31;
+    device const uchar* data = grp + bj * 96;
+    device const uchar* tail = grp + 768 + bj * 14;
+    float d_all = cd_f16(tail + 12);
+    uint a0 = cd_u32(tail), a1 = cd_u32(tail + 4), a2 = cd_u32(tail + 8);
+    const uint k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
+    uint is = s >> 1;
+    uint w = is >> 2;
+    uint aux = w == 0 ? ((a0 & k2) | ((a2 & k1) << 4))
+             : w == 1 ? ((a1 & k2) | (((a2 >> 2) & k1) << 4))
+             : w == 2 ? (((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4))
+                      : (((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4));
+    int scale = int(as_type<char>(uchar((aux >> (8 * (is & 3))) & 0xFFu))) - 32;
+    float dl = d_all * float(scale);
+    uint n = s >> 4, si = (s >> 2) & 3, half_ = (s >> 1) & 1;
+    uint m = 1u << (n * 4 + si);
+    for (uint i = 0; i < 8; i++) {
+        uint k = (s & 1) * 8 + i + 16 * half_;
+        int h = (data[k] & m) ? 0 : 4;
+        int qv = int((data[32 + n * 32 + k] >> (2 * si)) & 3u);
+        out8[i] = dl * float(qv - h);
+    }
+}
+"#,
+    wide_msl: r#"
+inline uint group_seg(uint g, uint k) { return (g >> 2) * 128 + k * 32 + (g & 3) * 8; }
+inline void decode_group(device const uchar* grp, uint gg, thread float* out) {
+    const uint bj = gg >> 3, g = gg & 7;
+    device const uchar* data = grp + bj * 96;
+    device const uchar* tail = grp + 768 + bj * 14;
+    float d_all = cd_f16(tail + 12);
+    uint n = g >> 2, l0 = (g & 3) * 8;
+    const uint2 q = *(device const uint2*)(data + 32 + n * 32 + l0);
+    const uint2 hm = *(device const uint2*)(data + l0);
+    for (uint w = 0; w < 2; w++) {
+        uint a = q[w];
+        uint h = hm[w];
+        for (uint k = 0; k < 4; k++) {
+            float4 c = float4(as_type<uchar4>(((a >> (2 * k)) & 0x03030303u) | (((h >> (n * 4 + k)) & 0x01010101u) << 2)));
+            for (uint i = 0; i < 4; i++) out[8 * k + 4 * w + i] = c[i];
+        }
+    }
+    uint a0 = cd_u32(tail), a1 = cd_u32(tail + 4), a2 = cd_u32(tail + 8);
+    const uint k1 = 0x03030303u, k2 = 0x0f0f0f0fu;
+    for (uint k = 0; k < 4; k++) {
+        uint is = n * 8 + 2 * k + (l0 >> 4);
+        uint w = is >> 2;
+        uint aux = w == 0 ? ((a0 & k2) | ((a2 & k1) << 4))
+                 : w == 1 ? ((a1 & k2) | (((a2 >> 2) & k1) << 4))
+                 : w == 2 ? (((a0 >> 4) & k2) | (((a2 >> 4) & k1) << 4))
+                          : (((a1 >> 4) & k2) | (((a2 >> 6) & k1) << 4));
+        float s = d_all * float(int(as_type<char>(uchar((aux >> (8 * (is & 3))) & 0xFFu))) - 32);
+        out[32 + k] = s;
+        out[36 + k] = -4.0f * s;
+    }
 }
 "#,
 };
@@ -436,7 +569,7 @@ static REGISTRY: LazyLock<Vec<Codec>> = LazyLock::new(|| {
         .collect()
 });
 
-const HELPERS: &str = r#"
+pub const HELPERS: &str = r#"
 #ifndef GIBBS_CODEC_HELPERS
 #define GIBBS_CODEC_HELPERS
 inline uint cd_u16(device const uchar* p) { return uint(*(device const ushort*)p); }

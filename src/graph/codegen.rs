@@ -1,4 +1,4 @@
-use crate::graph::codec::{planar, tile, wide, Codec, Tile};
+use crate::graph::codec::{planar, tile, wide, Codec, Tile, HELPERS};
 
 #[derive(Debug, Clone, Copy)]
 pub struct GemvParams {
@@ -192,8 +192,9 @@ pub const fn gemv_rows_per_tg(p: GemvParams) -> usize {
 
 /// The MSL a GPU consumer of the device weight buffer includes: [`Codec::msl`], or the planar-layout decoder
 /// for a codec stored [`planar`].
-pub fn device_msl(codec: &Codec) -> &'static str {
-    planar(codec.format).map_or(codec.msl, |p| p.msl)
+pub fn device_msl(codec: &Codec) -> String {
+    // The planar decoders use the codec helpers (guarded, so a duplicate is harmless).
+    planar(codec.format).map_or_else(|| codec.msl.to_string(), |p| format!("{HELPERS}{}", p.msl))
 }
 
 /// How MSL addresses block `idx` (a `ulong` expression) of weights `w`: a declaration of `b` (what `decode8`
@@ -213,7 +214,10 @@ pub fn block_ref(codec: &Codec, w: &str, idx: &str) -> BlockRef {
             group: String::new(),
         },
         Some(p) => {
-            let groups = tile(codec.format).map_or(0, |t| t.groups);
+            let groups = tile(codec.format)
+                .map(|t| t.groups)
+                .or_else(|| wide(codec.format).map(|w| w.groups))
+                .unwrap_or(0);
             BlockRef {
                 decl: format!(
                     "const ulong bi = {idx}; device const uchar* b = {w} + (bi / {}) * {};",
@@ -359,8 +363,9 @@ kernel void {name}(
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
         wide_msl = wide(codec.format)
-            .map(|w| w
-                .msl
+            .map(|w| planar(codec.format)
+                .filter(|p| !p.wide_msl.is_empty())
+                .map_or(w.msl, |p| p.wide_msl)
                 .replace("decode_group", &dec.replace("decode8", "decode_group"))
                 .replace("group_seg", &dec.replace("decode8", "group_seg")))
             .or_else(|| tile(codec.format).map(|t| {
