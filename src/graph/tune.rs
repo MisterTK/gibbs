@@ -173,21 +173,38 @@ pub struct TuneCache {
 
 impl TuneCache {
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
+        let raw: BTreeMap<String, serde_json::Value> = std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let entries = raw
+            .into_iter()
+            .filter_map(|(k, v)| Some((k, serde_json::from_value(v).ok()?)))
+            .collect();
+        Self {
+            entries,
+            contended: BTreeMap::new(),
+        }
     }
 
-    /// Writes the persisted winners.
+    /// Writes the persisted winners, preserving any entries on disk written by other builds.
     pub fn save(&self, path: &Path) {
         let write = || -> std::io::Result<()> {
             if let Some(d) = path.parent() {
                 std::fs::create_dir_all(d)?;
             }
+            let mut raw: BTreeMap<String, serde_json::Value> = std::fs::read(path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            for (k, v) in &self.entries {
+                if let Ok(val) = serde_json::to_value(v) {
+                    raw.insert(k.clone(), val);
+                }
+            }
             // Written whole through a rename: concurrent processes never read a torn file.
             let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-            std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&raw)?)?;
             std::fs::rename(&tmp, path)
         };
         if let Err(e) = write() {
@@ -391,6 +408,33 @@ mod tests {
         );
         assert_eq!(decide(&[], def, true), None);
         assert_eq!(decide(&[], def, false), None);
+    }
+
+    #[test]
+    fn load_and_save_preserve_entries_with_unknown_variants_from_other_builds() {
+        let dir = std::env::temp_dir().join(format!("gibbs-tune-compat-{}", std::process::id()));
+        let path = dir.join("tune.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"future|16|16|1": {"variant": {"kernel": "FutureKernel", "rows_per_sg": 0}, "us": 1.0, "gbps": 250.0}}"#,
+        )
+        .unwrap();
+        let mut c = TuneCache::load(&path);
+        c.insert(
+            "known|16|16|1".into(),
+            Tuned {
+                variant: GemvVariant::HAND,
+                us: 1.0,
+                gbps: 200.0,
+            },
+        );
+        c.save(&path);
+        let raw: BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(raw.contains_key("future|16|16|1"));
+        assert!(raw.contains_key("known|16|16|1"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
