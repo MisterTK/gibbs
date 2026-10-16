@@ -3604,13 +3604,10 @@ impl Session {
                 eps,
                 is_geglu,
             } => {
-                let fuse_glu =
-                    self.weights.get(up_name).is_some_and(|w| {
-                        !matches!(w.3, WeightFormat::F32 | WeightFormat::JesseLUT)
-                    }) && fusion_policy().allows(FusionClass::DotEpilogue);
                 let bytes_norm = hidden * 4;
                 let bytes_inter = inter * 4;
                 let total_scratch = bytes_norm + 2 * bytes_inter;
+
                 let mut guard = self.mlp_scratch.lock();
                 if guard
                     .as_ref()
@@ -3649,52 +3646,34 @@ impl Session {
                     Epi::None,
                 )?;
 
-                // 3. Up GEMV (+ non-aliasing fused GeGLU/SwiGLU into off_up on packed weights; separate GLU on F32)
-                let off_act = if fuse_glu {
-                    self.encode_gemv_or_gemm(
-                        enc,
-                        (scratch, off_norm),
-                        loc(up_w),
-                        up_name,
-                        Some((scratch, off_gate)),
-                        (scratch, off_up),
-                        inter,
-                        hidden,
-                        if is_geglu {
-                            Epi::UpGeGlu
-                        } else {
-                            Epi::UpSwiGlu
-                        },
-                    )?;
-                    off_up
-                } else {
-                    self.encode_gemv_or_gemm(
-                        enc,
-                        (scratch, off_norm),
-                        loc(up_w),
-                        up_name,
-                        None,
-                        (scratch, off_up),
-                        inter,
-                        hidden,
-                        Epi::None,
-                    )?;
-                    let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                    enc.set_buffer(0, Some(scratch), off_gate as u64);
-                    enc.set_buffer(1, Some(scratch), off_up as u64);
-                    enc.set_buffer(2, Some(scratch), off_gate as u64);
-                    set_bytes(enc, 3, &u32_of(inter)?);
-                    grid1(inter);
-                    off_gate
-                };
+                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
+                self.encode_gemv_or_gemm(
+                    enc,
+                    (scratch, off_norm),
+                    loc(up_w),
+                    up_name,
+                    None,
+                    (scratch, off_up),
+                    inter,
+                    hidden,
+                    Epi::None,
+                )?;
 
-                // 5. Down GEMV with residual addition: scratch[off_act] * down_w + x -> s.out
+                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
+                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
+                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                enc.set_buffer(0, Some(scratch), off_gate as u64);
+                enc.set_buffer(1, Some(scratch), off_up as u64);
+                enc.set_buffer(2, Some(scratch), off_gate as u64);
+                set_bytes(enc, 3, &u32_of(inter)?);
+                grid1(inter);
+
+                // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
-                    // 5. Down GEMV into scratch[off_norm]: scratch[off_act] * down_w -> scratch[off_norm]
+                    // 5. Down GEMV into scratch[off_norm]: scratch[off_gate] * down_w -> scratch[off_norm]
                     self.encode_gemv_or_gemm(
                         enc,
-                        (scratch, off_act),
+                        (scratch, off_gate),
                         loc(down_w),
                         down_name,
                         None,
@@ -3719,7 +3698,7 @@ impl Session {
                     // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                     self.encode_gemv_or_gemm(
                         enc,
-                        (scratch, off_act),
+                        (scratch, off_gate),
                         loc(down_w),
                         down_name,
                         Some(loc(x)),
