@@ -267,6 +267,14 @@ impl WeightFormat {
         })
     }
 
+    /// Name of the lane-split hand kernel ([`GemvKernel::HandSplit`]), when this format has one.
+    fn hand_split_kernel(self) -> Option<&'static str> {
+        Some(match self {
+            WeightFormat::Q4_0 => "gemv_q4_0_split",
+            _ => return None,
+        })
+    }
+
     /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
         if self.hand_kernel().is_some() {
@@ -284,6 +292,9 @@ impl WeightFormat {
         let mut v = Vec::new();
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
+        }
+        if self.hand_split_kernel().is_some() {
+            v.push(GemvVariant::HAND_SPLIT);
         }
         if generated {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
@@ -406,7 +417,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 58] = [
+const BASE_KERNELS: [&str; 59] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -429,6 +440,7 @@ const BASE_KERNELS: [&str; 58] = [
     "swiglu_f32",
     "geglu_f32",
     "gemv_q4_0",
+    "gemv_q4_0_split",
     "gemv_q8_0",
     "gemv_bf16",
     "gemv_f16",
@@ -1081,7 +1093,10 @@ impl Runtime {
         let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
         let mut mix =
             |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
-        if let Some(name) = fmt.hand_kernel() {
+        for name in [fmt.hand_kernel(), fmt.hand_split_kernel()]
+            .into_iter()
+            .flatten()
+        {
             mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
@@ -2149,12 +2164,19 @@ impl Session {
                 Some(q) => generated(q, variant.rows_per_sg),
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
-            (_, GemvKernel::Hand) => match format.hand_kernel() {
-                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
-                None => Err(format!(
-                    "Metal executor: unsupported packed GEMV format {format:?}"
-                )),
-            },
+            (_, GemvKernel::Hand | GemvKernel::HandSplit) => {
+                let k = if variant.kernel == GemvKernel::HandSplit {
+                    format.hand_split_kernel()
+                } else {
+                    format.hand_kernel()
+                };
+                match k {
+                    Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                    None => Err(format!(
+                        "Metal executor: unsupported packed GEMV {variant:?} for {format:?}"
+                    )),
+                }
+            }
         }
     }
 
