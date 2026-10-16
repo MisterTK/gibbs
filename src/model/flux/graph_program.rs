@@ -89,7 +89,10 @@ pub(super) fn rope_tables(axes: &[usize], theta: f64) -> (Vec<f32>, [u32; 3], [u
         let mut f = f;
         // The merged section's first `axes[0] / 2` pairs belong to the t axis: no rotation.
         let (h, _) = dg::axis_freqs(&[axes[1]], theta);
-        f.splice(0..(axes[0] + axes[1]) / 2, std::iter::repeat_n(0.0, axes[0] / 2).chain(h));
+        f.splice(
+            0..(axes[0] + axes[1]) / 2,
+            std::iter::repeat_n(0.0, axes[0] / 2).chain(h),
+        );
         (f, sec, [1, 2, 3])
     } else {
         let (f, sec) = dg::axis_freqs(axes, theta);
@@ -130,13 +133,14 @@ impl FluxTransformer {
                 inputs.push(Tensor::F32(sinusoid(t as f64 * 1000.0, 256)));
                 inputs.push(Tensor::F32(pooled.to_vec()));
                 if guided {
-                    inputs.push(Tensor::F32(sinusoid(guidance.unwrap_or(0.0) as f64 * 1000.0, 256)));
+                    inputs.push(Tensor::F32(sinusoid(
+                        guidance.unwrap_or(0.0) as f64 * 1000.0,
+                        256,
+                    )));
                 }
             }
             Modulation::Table(a) => inputs.push(Tensor::F32(a.input_rows(t, self.table_rows()))),
-            Modulation::Shared { .. } => {
-                inputs.push(Tensor::F32(sinusoid(t as f64 * 1000.0, 256)))
-            }
+            Modulation::Shared { .. } => inputs.push(Tensor::F32(sinusoid(t as f64 * 1000.0, 256))),
         }
         let mut out = cache.run((ni, nt, guided), || self.build(ni, nt, guided), inputs)?;
         Ok(out.remove(0))
@@ -221,13 +225,28 @@ impl FluxTransformer {
             let (im, tm) = match shared {
                 Some((im, tm, _)) => (im, tm),
                 None => (
-                    modv(&mut b, &format!("{p}.img.mod"), &blk.img.modl, 3 * ns + 6 * i, 6),
-                    modv(&mut b, &format!("{p}.txt.mod"), &blk.txt.modl, 3 * ns + 6 * nd + 6 * i, 6),
+                    modv(
+                        &mut b,
+                        &format!("{p}.img.mod"),
+                        &blk.img.modl,
+                        3 * ns + 6 * i,
+                        6,
+                    ),
+                    modv(
+                        &mut b,
+                        &format!("{p}.txt.mod"),
+                        &blk.txt.modl,
+                        3 * ns + 6 * nd + 6 * i,
+                        6,
+                    ),
                 ),
             };
-            let mut qkv = |b: &mut Gb, st: &Stream, tag: &str, m: ValueId, x: ValueId, n: usize| {
+            let qkv = |b: &mut Gb, st: &Stream, tag: &str, m: ValueId, x: ValueId, n: usize| {
                 let name = format!("{p}.{tag}");
-                let (sh, sc) = (chunk(b, &format!("{name}.m"), m, 0), chunk(b, &format!("{name}.m"), m, 1));
+                let (sh, sc) = (
+                    chunk(b, &format!("{name}.m"), m, 0),
+                    chunk(b, &format!("{name}.m"), m, 1),
+                );
                 let h = b.ln_mod(&format!("{name}.in"), x, sh, sc, EPS);
                 let f = st.qkv.emit(b, &format!("{name}.qkv"), h);
                 let q = b.slice(&format!("{name}.q"), f, 1, 0, d);
@@ -248,12 +267,31 @@ impl FluxTransformer {
             let q = b.concat(&format!("{p}.q"), &[tq, iq], 0);
             let k = b.concat(&format!("{p}.k"), &[tk, ik], 0);
             let v = b.concat(&format!("{p}.v"), &[tv, iv], 0);
-            let q = b.rope(&format!("{p}.rq"), q, pos, inv_freq, HEAD_DIM, sections, PairLayout::Adjacent);
-            let k = b.rope(&format!("{p}.rk"), k, pos, inv_freq, HEAD_DIM, sections, PairLayout::Adjacent);
+            let q = b.rope(
+                &format!("{p}.rq"),
+                q,
+                pos,
+                inv_freq,
+                HEAD_DIM,
+                sections,
+                PairLayout::Adjacent,
+            );
+            let k = b.rope(
+                &format!("{p}.rk"),
+                k,
+                pos,
+                inv_freq,
+                HEAD_DIM,
+                sections,
+                PairLayout::Adjacent,
+            );
             let a = b.attention(&format!("{p}.attn"), q, k, v, self.heads);
             let ta = b.slice(&format!("{p}.ta"), a, 0, 0, nt);
             let ia = b.slice(&format!("{p}.ia"), a, 0, nt, s);
-            for (tag, st, m, x, ao) in [("img", &blk.img, im, &mut img, ia), ("txt", &blk.txt, tm, &mut txt, ta)] {
+            for (tag, st, m, x, ao) in [
+                ("img", &blk.img, im, &mut img, ia),
+                ("txt", &blk.txt, tm, &mut txt, ta),
+            ] {
                 let name = format!("{p}.{tag}");
                 let o = st.proj.emit(&mut b, &format!("{name}.proj"), ao);
                 let g1 = chunk(&mut b, &format!("{name}.g1"), m, 2);
@@ -311,8 +349,24 @@ impl FluxTransformer {
             );
             let q = b.heads_rms(&format!("{p}.qnorm"), q, qn, HEAD_DIM, EPS);
             let k = b.heads_rms(&format!("{p}.knorm"), k, kn, HEAD_DIM, EPS);
-            let q = b.rope(&format!("{p}.rq"), q, pos, inv_freq, HEAD_DIM, sections, PairLayout::Adjacent);
-            let k = b.rope(&format!("{p}.rk"), k, pos, inv_freq, HEAD_DIM, sections, PairLayout::Adjacent);
+            let q = b.rope(
+                &format!("{p}.rq"),
+                q,
+                pos,
+                inv_freq,
+                HEAD_DIM,
+                sections,
+                PairLayout::Adjacent,
+            );
+            let k = b.rope(
+                &format!("{p}.rk"),
+                k,
+                pos,
+                inv_freq,
+                HEAD_DIM,
+                sections,
+                PairLayout::Adjacent,
+            );
             let a = b.attention(&format!("{p}.attn"), q, k, v, self.heads);
             let cat = b.concat(&format!("{p}.cat"), &[a, act], 1);
             let o = blk.linear2.emit(&mut b, &format!("{p}.linear2"), cat);
@@ -320,7 +374,10 @@ impl FluxTransformer {
         }
 
         let m = modv(&mut b, "final.mod", &self.final_mod, 3 * ns + 12 * nd, 2);
-        let (mut shift, mut scale) = (chunk(&mut b, "final.m", m, 0), chunk(&mut b, "final.m", m, 1));
+        let (mut shift, mut scale) = (
+            chunk(&mut b, "final.m", m, 0),
+            chunk(&mut b, "final.m", m, 1),
+        );
         if self.final_swap {
             (shift, scale) = (scale, shift);
         }
@@ -374,6 +431,7 @@ pub(super) mod fixture {
         Ok((b.g, b.w))
     }
 
+    #[allow(dead_code)]
     #[derive(Clone, Copy, Debug)]
     pub(in crate::model::flux) enum Kind {
         Flux1,
@@ -440,11 +498,17 @@ pub(super) mod fixture {
         let mlp = if flux2 { 2 * 384 } else { 4 * D };
         let mlp_out_in = if flux2 { 384 } else { 4 * D };
         let (nd, ns) = (2usize, 2usize);
-        let mut stream = |r: &mut Rng, lora: bool| Stream {
+        let stream = |r: &mut Rng, lora: bool| Stream {
             modl: (!chroma && !flux2).then(|| lin(r, 6 * D, D)),
             qkv: lin_parts(r, &[D, D, D], D, lora),
-            qn: rand(HEAD_DIM, r.seed(), 1.0).iter().map(|v| 1.0 + 0.3 * v).collect(),
-            kn: rand(HEAD_DIM, r.seed(), 1.0).iter().map(|v| 1.0 + 0.3 * v).collect(),
+            qn: rand(HEAD_DIM, r.seed(), 1.0)
+                .iter()
+                .map(|v| 1.0 + 0.3 * v)
+                .collect(),
+            kn: rand(HEAD_DIM, r.seed(), 1.0)
+                .iter()
+                .map(|v| 1.0 + 0.3 * v)
+                .collect(),
             proj: lin(r, D, D),
             mlp0: lin(r, mlp, D),
             mlp2: lin(r, D, mlp_out_in),
@@ -463,8 +527,14 @@ pub(super) mod fixture {
                     modl: (!chroma && !flux2).then(|| lin(r, 3 * D, D)),
                     linear1: lin_parts(r, &[D, D, D, mlp_in], D, false),
                     linear2: lin(r, D, D + mlp_w),
-                    qn: rand(HEAD_DIM, r.seed(), 1.0).iter().map(|v| 1.0 + 0.3 * v).collect(),
-                    kn: rand(HEAD_DIM, r.seed(), 1.0).iter().map(|v| 1.0 + 0.3 * v).collect(),
+                    qn: rand(HEAD_DIM, r.seed(), 1.0)
+                        .iter()
+                        .map(|v| 1.0 + 0.3 * v)
+                        .collect(),
+                    kn: rand(HEAD_DIM, r.seed(), 1.0)
+                        .iter()
+                        .map(|v| 1.0 + 0.3 * v)
+                        .collect(),
                 }
             })
             .collect();
@@ -477,7 +547,15 @@ pub(super) mod fixture {
             Kind::Chroma => Modulation::Table(Approx {
                 in_proj: lin(r, D, 64),
                 layers: (0..2)
-                    .map(|_| (rand(D, r.seed(), 1.0).iter().map(|v| 1.0 + 0.2 * v).collect(), embed(r, D, D)))
+                    .map(|_| {
+                        (
+                            rand(D, r.seed(), 1.0)
+                                .iter()
+                                .map(|v| 1.0 + 0.2 * v)
+                                .collect(),
+                            embed(r, D, D),
+                        )
+                    })
                     .collect(),
                 out_proj: lin(r, D, D),
             }),
@@ -512,7 +590,7 @@ pub(super) mod fixture {
 mod tests {
     use super::fixture::*;
     use super::*;
-    use crate::model::dit_graph::fixture::{cosine, mat, rand, rel_err};
+    use crate::model::dit_graph::fixture::{cosine, rand, rel_err};
 
     /// Metal program == native CPU forward, per FLUX variant, at f32 (bf16 weights shared).
     #[test]
@@ -538,7 +616,11 @@ mod tests {
                         let _cpu = crate::hardware::cpu_compute::allow();
                         tr.forward(&img, ni, &txt, nt, &y, t, guidance, &rope)
                     };
-                    let pooled_in: &[f32] = if matches!(kind, Kind::Flux1) { &pooled } else { &[] };
+                    let pooled_in: &[f32] = if matches!(kind, Kind::Flux1) {
+                        &pooled
+                    } else {
+                        &[]
+                    };
                     let got = tr
                         .forward_gpu(&tr.gpu, &img, ni, &ctx, nt, pooled_in, t, guidance, &ids)
                         .expect("metal program");
@@ -559,11 +641,26 @@ mod approx_tests {
 
     #[test]
     fn approx_table_matches_cpu() {
-        let lin = |n: usize, k: usize, s: u64| Lin::new(Wt::Bf16(mat(n, k, s)), Some(rand(n, s + 99, 0.1)), vec![]);
-        let emb = |s: u64| Embed { a: lin(256, 256, s), b: lin(256, 256, s + 1) };
+        let lin = |n: usize, k: usize, s: u64| {
+            Lin::new(Wt::Bf16(mat(n, k, s)), Some(rand(n, s + 99, 0.1)), vec![])
+        };
+        let emb = |s: u64| Embed {
+            a: lin(256, 256, s),
+            b: lin(256, 256, s + 1),
+        };
         let a = Approx {
             in_proj: lin(256, 64, 1),
-            layers: (0..2).map(|i| (rand(256, 7 + i, 1.0).iter().map(|v| 1.0 + 0.2 * v).collect(), emb(10 + 3 * i))).collect(),
+            layers: (0..2)
+                .map(|i| {
+                    (
+                        rand(256, 7 + i, 1.0)
+                            .iter()
+                            .map(|v| 1.0 + 0.2 * v)
+                            .collect(),
+                        emb(10 + 3 * i),
+                    )
+                })
+                .collect(),
             out_proj: lin(256, 256, 40),
         };
         let rows = 32;
@@ -575,7 +672,10 @@ mod approx_tests {
         let input = b.input("approx_in", &[rows, 64]);
         let out = a.emit(&mut b, input);
         let mut p = crate::model::dit_graph::Program::compile(b, &[out]).unwrap();
-        let got = p.run(vec![Tensor::F32(a.input_rows(0.6, rows))]).unwrap().remove(0);
+        let got = p
+            .run(vec![Tensor::F32(a.input_rows(0.6, rows))])
+            .unwrap()
+            .remove(0);
         eprintln!("approx rel {:.2e}", rel_err(&want, &got));
         assert!(rel_err(&want, &got) < 1e-3);
     }

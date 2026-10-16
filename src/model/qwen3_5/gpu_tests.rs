@@ -9,7 +9,6 @@ use super::*;
 use crate::hardware::{cpu_compute, PlacementMode};
 use crate::model::native::MediaInput;
 
-
 const PRE: &str = r#"{"size":{"shortest_edge":64,"longest_edge":100000},
     "image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]}"#;
 
@@ -22,7 +21,10 @@ fn pair(vision: bool, mtp: bool) -> (Arc<dyn NativeLm>, Arc<dyn NativeLm>) {
     let (ck, cfg) = checkpoint(vision, mtp);
     let build = |mode: Device| {
         let text = Arc::new(TextModel::load(&ck, text_config(&cfg), Arch::Qwen35).unwrap());
-        let vis = load_vision(&ck, &cfg, &text, || Preprocessor::parse(PRE.as_bytes(), "test")).unwrap();
+        let vis = load_vision(&ck, &cfg, &text, || {
+            Preprocessor::parse(PRE.as_bytes(), "test")
+        })
+        .unwrap();
         assemble(tokenizer(), text, vis, PlacementMode::Pin(mode)).unwrap()
     };
     (build(Device::Cpu), build(Device::Metal))
@@ -31,11 +33,18 @@ fn pair(vision: bool, mtp: bool) -> (Arc<dyn NativeLm>, Arc<dyn NativeLm>) {
 fn rel(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let scale = a.iter().fold(1e-6f32, |m, x| m.max(x.abs()));
-    a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+    a.iter()
+        .zip(b)
+        .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
+        / scale
 }
 
 fn argmax(v: &[f32]) -> u32 {
-    v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0 as u32
 }
 
 fn png(w: usize, h: usize) -> Vec<u8> {
@@ -57,14 +66,20 @@ fn image_prompt_program_matches_host() {
     let (ids_g, mut sg) = gpu.prepare(ids, &media).unwrap();
     assert_eq!(ids_c, ids_g);
     assert!(ids_c.len() > 20, "image expanded to its 4x6 merged grid");
-    let (lc, lg) = (cpu.forward(&ids_c, 0, &mut sc).unwrap(), gpu.forward(&ids_g, 0, &mut sg).unwrap());
+    let (lc, lg) = (
+        cpu.forward(&ids_c, 0, &mut sc).unwrap(),
+        gpu.forward(&ids_g, 0, &mut sg).unwrap(),
+    );
     let e = rel(&lc, &lg);
     println!("prefill (image) rel err {e:e}");
     assert!(e < 1e-3, "{e}");
     assert_eq!(argmax(&lc), argmax(&lg));
     let (mut tok, mut pos) = (argmax(&lc), ids_c.len());
     for step in 0..4 {
-        let (a, b) = (cpu.forward(&[tok], pos, &mut sc).unwrap(), gpu.forward(&[tok], pos, &mut sg).unwrap());
+        let (a, b) = (
+            cpu.forward(&[tok], pos, &mut sc).unwrap(),
+            gpu.forward(&[tok], pos, &mut sg).unwrap(),
+        );
         let e = rel(&a, &b);
         println!("decode {step} rel err {e:e}");
         assert!(e < 1e-3, "decode {step}: {e}");
@@ -86,10 +101,16 @@ fn vision_tower_program_matches_host() {
         .unwrap();
     for (w, h) in [(16, 24), (24, 8)] {
         let img = ImageBuffer::decode(&png(w, h)).unwrap();
-        let (a, b) = (host.encode(&img, &pre).unwrap(), dev.encode(&img, &pre).unwrap());
+        let (a, b) = (
+            host.encode(&img, &pre).unwrap(),
+            dev.encode(&img, &pre).unwrap(),
+        );
         assert_eq!((a.rows, a.cols), (b.rows, b.cols));
         assert_eq!(a.deepstack.len(), 1);
-        let (e, ed) = (rel(&a.embeds, &b.embeds), rel(&a.deepstack[0], &b.deepstack[0]));
+        let (e, ed) = (
+            rel(&a.embeds, &b.embeds),
+            rel(&a.deepstack[0], &b.deepstack[0]),
+        );
         println!("{w}x{h}: embeds rel err {e:e}, deepstack {ed:e}");
         assert!(e < 1e-3 && ed < 1e-3, "{w}x{h}: {e} {ed}");
     }
@@ -116,7 +137,10 @@ fn verify_rewind_is_exact_on_metal() {
     let want = gpu.forward_all(&[32, 33], n + 2, &mut b).unwrap();
     assert!(got == want, "rewound state diverges from the plain run");
 
-    assert!(gpu.truncate(&mut a, n + 1).is_err(), "before the verified span");
+    assert!(
+        gpu.truncate(&mut a, n + 1).is_err(),
+        "before the verified span"
+    );
     assert!(gpu.truncate(&mut a, n + 5).is_err(), "past the sequence");
     gpu.forward(&[34], n + 4, &mut a).unwrap();
     assert!(gpu.truncate(&mut a, n + 4).is_err(), "checkpoints dropped");
@@ -128,7 +152,10 @@ fn verify_rewind_is_exact_on_metal() {
 fn mtp_drafter_program_matches_host() {
     let _g = cpu_compute::allow();
     let (cpu, gpu) = pair(false, true);
-    let (dc, dg) = (cpu.drafter().expect("host MTP"), gpu.drafter().expect("Metal MTP"));
+    let (dc, dg) = (
+        cpu.drafter().expect("host MTP"),
+        gpu.drafter().expect("Metal MTP"),
+    );
     assert_eq!(dc.tap_layers(), dg.tap_layers());
     let prompt = vec![4u32, 8, 15, 16, 23, 42];
     let (_, mut sc) = cpu.prepare(prompt.clone(), &[]).unwrap();
@@ -142,7 +169,10 @@ fn mtp_drafter_program_matches_host() {
     gpu.forward(&prompt[..n - 1], 0, &mut sg).unwrap();
     let (hc, hg) = (cpu.take_taps(&mut sc), gpu.take_taps(&mut sg));
     let mut errs = Vec::new();
-    let mut draw = |d: &Arc<dyn Drafter>, st: &mut crate::scheduler::spec::DraftState, toks: &[u32], h: &[f32]| {
+    let draw = |d: &Arc<dyn Drafter>,
+                st: &mut crate::scheduler::spec::DraftState,
+                toks: &[u32],
+                h: &[f32]| {
         let mut seen = Vec::new();
         let out = d
             .propose(st, toks, h, 3, &mut |l: &[f32]| {
@@ -198,7 +228,9 @@ fn scheduler_mtp_speculation_on_metal_keeps_greedy_output() {
             max_new_tokens: 40,
             top_logprobs: None,
         };
-        let mut rx = sched.submit_with_params(params, |_| vec![4, 8, 15, 16, 23]).1;
+        let mut rx = sched
+            .submit_with_params(params, |_| vec![4, 8, 15, 16, 23])
+            .1;
         while sched.step().active_sequences_count > 0 || !sched.waiting_queue.read().is_empty() {}
         let out: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let s = sched.telemetry.get_summary();
@@ -207,7 +239,10 @@ fn scheduler_mtp_speculation_on_metal_keeps_greedy_output() {
     };
     let (plain, _) = run(false);
     let (spec, accept) = run(true);
-    println!("MTP on Metal: {} tokens, acceptance {accept:.2}", plain.len());
+    println!(
+        "MTP on Metal: {} tokens, acceptance {accept:.2}",
+        plain.len()
+    );
     assert_eq!(plain.len(), 40);
     assert_eq!(plain, spec);
 }

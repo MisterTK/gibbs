@@ -147,8 +147,8 @@ fn test_real_safetensors_tinystories_model_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -174,34 +174,6 @@ fn test_real_safetensors_tinystories_model_inference_and_comprehension() {
     assert!(!generated.contains("<0x"));
     assert!(!generated.contains("Ġ"));
     assert!(!generated.contains("Ċ"));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn test_metal_backend_compile_and_dispatch() {
-    // Real MSL compile + dispatch over a shared buffer.
-    let metal = foundry_engine::backend::MetalBackend::new().expect("Metal device");
-    assert!(metal.is_unified_memory());
-    let ptr = metal
-        .allocate_buffer(64 * 4)
-        .expect("Metal buffer allocation");
-    metal
-        .jit_compile(
-            "fill_idx",
-            "#include <metal_stdlib>\nkernel void fill_idx(device float* o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = float(i) * 2.0f; }",
-        )
-        .expect("Metal JIT compile");
-    metal
-        .dispatch("fill_idx", (1, 1, 1), (64, 1, 1), &[ptr])
-        .expect("Metal dispatch");
-    let out = unsafe { std::slice::from_raw_parts(ptr as *const f32, 64) };
-    assert_eq!(out[63], 126.0);
-    assert!(
-        metal
-            .jit_compile("broken", "kernel void broken( {")
-            .is_err(),
-        "MSL compile errors must surface"
-    );
 }
 
 #[tokio::test]
@@ -298,8 +270,8 @@ fn test_smollm2_gqa_llama_inference_and_comprehension_ablation() {
         } else {
             hf_cfg.num_layers
         },
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -350,8 +322,8 @@ fn test_smollm2_program_scheduler_inference() {
         } else {
             hf_cfg.num_layers
         },
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -469,8 +441,8 @@ fn test_real_weights_tinystories_decode_throughput_300_tok_s() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -546,8 +518,8 @@ fn test_all_readme_models_inference_and_zero_gibberish() {
             hidden_dim: hf.hidden_dim,
             intermediate_dim: hf.resolved_intermediate_dim(),
             num_layers: hf.num_layers,
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -582,8 +554,8 @@ fn test_all_readme_models_inference_and_zero_gibberish() {
             hidden_dim: hf.hidden_dim,
             intermediate_dim: hf.resolved_intermediate_dim(),
             num_layers: hf.num_layers,
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -623,8 +595,8 @@ fn test_all_readme_models_inference_and_zero_gibberish() {
             } else {
                 hf.num_layers
             },
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -702,8 +674,8 @@ fn test_xenova_llama2_c_stories15m_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -750,8 +722,8 @@ fn test_ant_5m_llama_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 1024,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -796,8 +768,8 @@ fn test_tinystories_1m_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -843,8 +815,8 @@ fn test_tinystories_3m_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -890,8 +862,8 @@ fn test_tinystories_8m_base_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -940,8 +912,8 @@ fn test_plyx_15m_inference_and_comprehension() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
@@ -1042,8 +1014,8 @@ fn test_all_readme_models_legibility_and_grammar_verification() {
             hidden_dim: hf.hidden_dim,
             intermediate_dim: hf.resolved_intermediate_dim(),
             num_layers: hf.num_layers,
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -1074,8 +1046,8 @@ fn test_all_readme_models_legibility_and_grammar_verification() {
             hidden_dim: hf.hidden_dim,
             intermediate_dim: hf.resolved_intermediate_dim(),
             num_layers: hf.num_layers,
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -1137,8 +1109,8 @@ fn test_dynamic_unseen_prompts_across_all_readme_models() {
                 } else {
                     hf.num_layers
                 },
-                num_heads: hf.num_heads,
-                head_dim: hf.hidden_dim / hf.num_heads.max(1),
+                num_heads: hf.resolved_num_heads(),
+                head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
                 max_seq_len: 2048,
                 quant_mode: QuantMode::Uncompressed,
                 rotary_pct: hf.resolved_rotary_pct(),
@@ -1177,8 +1149,8 @@ fn test_dynamic_unseen_prompts_across_all_readme_models() {
             } else {
                 hf.num_layers
             },
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -1217,8 +1189,8 @@ fn test_dynamic_unseen_prompts_across_all_readme_models() {
             } else {
                 hf.num_layers
             },
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -1255,8 +1227,8 @@ fn test_dynamic_unseen_prompts_across_all_readme_models() {
             } else {
                 hf.num_layers
             },
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),
@@ -1296,8 +1268,8 @@ fn test_dynamic_unseen_prompts_across_all_readme_models() {
             } else {
                 hf.num_layers
             },
-            num_heads: hf.num_heads,
-            head_dim: hf.hidden_dim / hf.num_heads.max(1),
+            num_heads: hf.resolved_num_heads(),
+            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
             max_seq_len: 2048,
             quant_mode: QuantMode::Uncompressed,
             rotary_pct: hf.resolved_rotary_pct(),

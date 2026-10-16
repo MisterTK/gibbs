@@ -8,8 +8,8 @@
 //! Run with: `cargo test --release --test model_benchmark_matrix -- --nocapture --ignored`
 
 use gibbs_engine::hardware::QuantMode;
-use gibbs_engine::model::hf_loader::HfConfigJson;
 use gibbs_engine::model::graph_lm::{GraphLm, GraphLmConfig};
+use gibbs_engine::model::hf_loader::HfConfigJson;
 use gibbs_engine::model::tokenizer::Tokenizer;
 use gibbs_engine::model::UniversalModelLoader;
 use std::path::Path;
@@ -248,8 +248,8 @@ fn eval_safetensors_causal_model(
         } else {
             hf_cfg.num_layers
         },
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         quant_mode: QuantMode::Uncompressed,
         rotary_pct: hf_cfg.resolved_rotary_pct(),

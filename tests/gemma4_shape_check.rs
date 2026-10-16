@@ -39,7 +39,7 @@ fn test_gemma4_shape_check_fused_pipeline() {
     // Invariant: exactly zero Slice / Concat / Reshape / Transpose steps in execution plan
     for s in &plan.steps {
         assert!(
-            !matches!(s.op, gibbs_engine::graph::metal::Step::Slice { .. }),
+            !format!("{:?}", s.op).contains("Slice"),
             "Step {:?} should be aliased with zero dispatch steps",
             s.op
         );

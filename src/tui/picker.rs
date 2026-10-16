@@ -18,9 +18,9 @@ use ratatui::{
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEBOUNCE: Duration = Duration::from_millis(250);
@@ -169,7 +169,11 @@ pub struct Picker {
     headers: Headers,
 }
 
-type Headers = Arc<parking_lot::Mutex<HashMap<String, Option<Result<Arc<crate::model::variant::WeightHeader>, String>>>>>;
+type Headers = Arc<
+    parking_lot::Mutex<
+        HashMap<String, Option<Result<Arc<crate::model::variant::WeightHeader>, String>>>,
+    >,
+>;
 
 impl Picker {
     /// `hub`: where models are cached/downloaded (`hub.cache_root`). `pinned`: ids always offered.
@@ -244,11 +248,10 @@ impl Picker {
 
         let scan_tx = self.scan_tx.clone();
         let hub = self.hub.clone();
-        let pinned = self.pinned.clone();
         let total_mem = self.total_memory;
         std::thread::spawn(move || {
             crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
-            let entries = scan_local_static(&hub, &pinned, total_mem);
+            let entries = scan_local_static(&hub, total_mem);
             let free = free_disk(&hub.cache_root);
             let _ = scan_tx.send((entries, free));
         });
@@ -522,8 +525,13 @@ impl Picker {
             let known = m.get(&q.id).cloned();
             if known.is_none() {
                 m.insert(q.id.clone(), None);
-                let (headers, hub, token, id, cached) =
-                    (self.headers.clone(), self.hub.clone(), self.hf_token.clone(), q.id.clone(), q.cached);
+                let (headers, hub, token, id, cached) = (
+                    self.headers.clone(),
+                    self.hub.clone(),
+                    self.hf_token.clone(),
+                    q.id.clone(),
+                    q.cached,
+                );
                 std::thread::spawn(move || {
                     crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
                     let got = (|| {
@@ -532,7 +540,11 @@ impl Picker {
                         let local = cached.then(|| hub.locate_model(repo).local_dir).flatten();
                         match local {
                             Some(dir) => crate::model::variant::read_local_header(&dir.join(file)),
-                            None => crate::model::variant::fetch_remote_header(repo, file, token.as_deref()),
+                            None => crate::model::variant::fetch_remote_header(
+                                repo,
+                                file,
+                                token.as_deref(),
+                            ),
                         }
                     })();
                     headers.lock().insert(id, Some(got.map(Arc::new)));
@@ -583,7 +595,11 @@ fn sort_variants(v: &mut [Entry], total_memory: Option<u64>) {
             },
         })
         .collect();
-    rank_variants(variant_policy(), total_memory.unwrap_or(u64::MAX), &mut ranked);
+    rank_variants(
+        variant_policy(),
+        total_memory.unwrap_or(u64::MAX),
+        &mut ranked,
+    );
     v.sort_by_key(|e| ranked.iter().position(|r| r.name == e.id));
 }
 impl Picker {
@@ -842,7 +858,10 @@ impl Picker {
             );
             quant_spans.push(pred_span);
             let right_hint = vec![Span::styled(
-                format!("(★ best for {} · ←/→ choose · enter load)", settings.variant),
+                format!(
+                    "(★ best for {} · ←/→ choose · enter load)",
+                    settings.variant
+                ),
                 dim,
             )];
             lines.push(spread(quant_spans, right_hint, width));
@@ -946,7 +965,10 @@ impl Picker {
             return PickerAction::None;
         };
         if !e.cached {
-            self.note = Some((format!("{} is not in the local cache", e.id), Token::Crimson));
+            self.note = Some((
+                format!("{} is not in the local cache", e.id),
+                Token::Crimson,
+            ));
             return PickerAction::None;
         }
         if pending.is_some_and(|(id, at)| id == e.id && at.elapsed() < DELETE_CONFIRM) {
@@ -988,18 +1010,9 @@ impl Picker {
         }
         self.refilter();
     }
-
-    /// One read_dir of the cache root; keeps text-generation repos with weights on disk.
-    fn scan_local(&mut self) {
-        self.local = scan_local_static(&self.hub, &self.pinned, self.total_memory);
-    }
 }
 
-fn scan_local_static(
-    hub: &HuggingFaceHub,
-    pinned: &[String],
-    total_memory: Option<u64>,
-) -> Vec<Entry> {
+fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Entry> {
     let mut local = Vec::new();
     let Ok(dir) = std::fs::read_dir(&hub.cache_root) else {
         return local;
@@ -2510,7 +2523,9 @@ mod tests {
                     size: None,
                 })
                 .collect();
-            crate::model::variant::with_unmeasured_host(|| select_weight_files(&files, None).unwrap())
+            crate::model::variant::with_unmeasured_host(|| {
+                select_weight_files(&files, None).unwrap()
+            })
         };
         let uc = pick(&[
             "README.md",
@@ -2817,7 +2832,8 @@ mod tests {
                 .style()
         };
         let hot = |s: ratatui::style::Style| {
-            s.fg == Some(theme().color(Token::Brass)) && s.add_modifier.contains(Modifier::UNDERLINED)
+            s.fg == Some(theme().color(Token::Brass))
+                && s.add_modifier.contains(Modifier::UNDERLINED)
         };
         assert!(hot(header(&p, "♥")) && !hot(header(&p, "↓")));
         p.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -2872,12 +2888,19 @@ mod tests {
             t.draw(|f| p.render(f, f.area(), "", None)).unwrap();
             let buf = t.backend().buffer().clone();
             (0..buf.area.height)
-                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         });
         assert!(text.contains(&format!("[★{}]", tag(0))), "{text}");
-        assert!(text.contains(&tag(1)) && !text.contains(&format!("★{}", tag(1))), "{text}");
+        assert!(
+            text.contains(&tag(1)) && !text.contains(&format!("★{}", tag(1))),
+            "{text}"
+        );
         assert!(text.contains("tok/s 90%"), "{text}");
     }
 
@@ -2997,7 +3020,13 @@ mod tests {
                 None,
             )
         };
-        assert_eq!(bnb(serde_json::json!({ "quant_method": "bitsandbytes" })), None);
-        assert!(bnb(serde_json::json!({ "quant_method": "bitsandbytes", "load_in_8bit": true })).is_some());
+        assert_eq!(
+            bnb(serde_json::json!({ "quant_method": "bitsandbytes" })),
+            None
+        );
+        assert!(
+            bnb(serde_json::json!({ "quant_method": "bitsandbytes", "load_in_8bit": true }))
+                .is_some()
+        );
     }
 }

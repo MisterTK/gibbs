@@ -1,4 +1,3 @@
-use gibbs_engine::graph::Graph;
 use gibbs_engine::model::graph_lm::{GraphLm, GraphLmConfig};
 
 #[test]

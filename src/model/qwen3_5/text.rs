@@ -148,7 +148,6 @@ pub(crate) struct TextModel {
     /// Inverse frequency of each rotary pair (rotary dim / 2 of them) and the M-RoPE axis
     /// (0 = t, 1 = h, 2 = w) that drives it.
     pub(crate) inv_freq: Vec<f32>,
-    pub(crate) rope_theta: f32,
     axis: Vec<usize>,
     /// M-RoPE sections (t, h, w) of the qwen3_5 / qwen3_vl decoders.
     mrope: Option<[u32; 3]>,
@@ -458,7 +457,6 @@ impl TextModel {
             attn_gate,
             norm_after_rope: arch == Arch::HunYuan,
             inv_freq,
-            rope_theta: theta as f32,
             axis,
             mrope,
             lin,
@@ -1187,14 +1185,6 @@ impl TextModel {
     /// Emits static-shape decode graph (n = 1) with stateful KV and DeltaNet caching and zero-copy weight bindings.
     pub fn to_decode_graph(&self) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         self.to_decode_graph_with(self.decode_max_ctx, DecodeOpts::default())
-    }
-
-    /// Emits static-shape decode graph (n = 1) with stateful KV and DeltaNet caching sized to `max_ctx`.
-    pub fn to_decode_graph_with_max_ctx(
-        &self,
-        max_ctx: usize,
-    ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.to_decode_graph_with(max_ctx, DecodeOpts::default())
     }
 
     /// [`Self::to_decode_graph`] with the inputs/outputs of `opts` (input order: `inputs_embeds`,

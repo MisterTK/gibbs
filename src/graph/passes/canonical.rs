@@ -82,7 +82,7 @@ pub fn eliminate_dead_nodes(g: &mut Graph) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{DType, Op, Weights};
+    use crate::graph::{DType, Op};
 
     #[test]
     fn test_canonical_dce_and_cse() {
@@ -109,6 +109,7 @@ mod tests {
         // We should have only add1 and mul (2 nodes).
         assert_eq!(g.nodes.len(), 2);
         // `mul` now sits at index 1 and its value says so (the SSA check reads this).
-        crate::graph::pattern::validate_ssa(&g).expect("producer indices follow the retained nodes");
+        crate::graph::pattern::validate_ssa(&g)
+            .expect("producer indices follow the retained nodes");
     }
 }

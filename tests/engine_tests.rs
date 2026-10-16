@@ -137,7 +137,10 @@ fn test_codec_benchmark_efficiency() {
         }
         for fmt in ["GGUF_Q4_0", "GGUF_Q8_0", "BF16"] {
             let eff = e.eff[fmt];
-            assert!(eff > 0.5 && eff <= 1.0, "{fmt}: eff {eff:.3} outside (0.5, 1.0]");
+            assert!(
+                eff > 0.5 && eff <= 1.0,
+                "{fmt}: eff {eff:.3} outside (0.5, 1.0]"
+            );
         }
     }
 }
@@ -170,8 +173,8 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
         hidden_dim: hf_cfg.hidden_dim,
         intermediate_dim: hf_cfg.resolved_intermediate_dim(),
         num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.num_heads,
-        head_dim: hf_cfg.hidden_dim / hf_cfg.num_heads.max(1),
+        num_heads: hf_cfg.resolved_num_heads(),
+        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
         max_seq_len: 2048,
         rotary_pct: hf_cfg.resolved_rotary_pct(),
         use_parallel_residual: hf_cfg.resolved_parallel_residual(),

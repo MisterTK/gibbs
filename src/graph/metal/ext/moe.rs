@@ -327,7 +327,11 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
 /// Generated gather for one codec: one thread per 8-element sub-block of one token's row.
 fn quant_embed_src(c: &Codec) -> String {
     let be = c.block_elems;
-    let br = block_ref(c, "table", &format!("(ulong)ids[gid.y] * (d / {be}u) + blk"));
+    let br = block_ref(
+        c,
+        "table",
+        &format!("(ulong)ids[gid.y] * (d / {be}u) + blk"),
+    );
     let (decl, sub) = (&br.decl, &br.sub);
     format!(
         r#"#include <metal_stdlib>
@@ -573,7 +577,7 @@ mod tests {
     fn random_blocks(f: Q, n_blocks: usize, small: bool, seed: u64) -> Vec<u8> {
         let bb = crate::graph::codec::codec(f).expect("codec").block_bytes as usize;
         let mut r = Lcg(seed);
-        let mut f16 = |r: &mut Lcg| -> u16 {
+        let f16 = |r: &mut Lcg| -> u16 {
             let sign = (r.next() & 1) as u16;
             let exp = if small {
                 10 + (r.next() % 6) as u16

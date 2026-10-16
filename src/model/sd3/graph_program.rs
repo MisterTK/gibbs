@@ -22,7 +22,7 @@ impl Lin {
 impl Proj {
     /// `x -> (q, k, v)` with the optional per-head QK RMSNorm on q and k.
     fn emit_qkv(&self, b: &mut Gb, p: &str, x: ValueId) -> (ValueId, ValueId, ValueId) {
-        let mut qk = |b: &mut Gb, tag: &str, l: &Lin, g: &Option<Vec<f32>>| {
+        let qk = |b: &mut Gb, tag: &str, l: &Lin, g: &Option<Vec<f32>>| {
             let y = l.emit(b, &format!("{p}.{tag}"), x);
             match g {
                 Some(g) => {
@@ -100,7 +100,13 @@ impl Mmdit {
         // Patch projection + cropped positional embedding.
         let x = self.patch_proj.emit(&mut b, "pos_embed.proj", patches);
         let table = b.mat("pos_embed.table", &self.pos_embed);
-        let pe = b.g.add("pos_embed.rows", Op::Embedding, &[table, rows], vec![n, d], DType::F32);
+        let pe = b.g.add(
+            "pos_embed.rows",
+            Op::Embedding,
+            &[table, rows],
+            vec![n, d],
+            DType::F32,
+        );
         let mut x = b.add("pos_embed.add", x, pe);
 
         // Conditioning: SiLU(timestep MLP + pooled-text MLP).
@@ -115,7 +121,15 @@ impl Mmdit {
         let mut cx = self.context_embedder.emit(&mut b, "context_embedder", ctx);
 
         for (i, blk) in self.blocks.iter().enumerate() {
-            (x, cx) = blk.emit(&mut b, &format!("blk{i}"), st, x, cx, (n, n_ctx), (d, self.heads));
+            (x, cx) = blk.emit(
+                &mut b,
+                &format!("blk{i}"),
+                st,
+                x,
+                cx,
+                (n, n_ctx),
+                (d, self.heads),
+            );
         }
 
         // AdaLayerNormContinuous: chunks (scale, shift).
@@ -317,7 +331,10 @@ mod tests {
                     .expect("metal program");
                 let (e, c) = (rel_err(&want, &got), cosine(&want, &got));
                 eprintln!("dual={dual} qk_norm={qk_norm} t={t}: rel {e:.2e} cos {c:.7}");
-                assert!(e < 1e-3 && c > 0.99999, "dual={dual} qk={qk_norm}: rel {e} cos {c}");
+                assert!(
+                    e < 1e-3 && c > 0.99999,
+                    "dual={dual} qk={qk_norm}: rel {e} cos {c}"
+                );
             }
         }
     }

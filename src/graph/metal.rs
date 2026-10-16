@@ -2808,13 +2808,6 @@ impl Session {
             let (b, off) = loc(v);
             enc.set_buffer(i, Some(b), off as u64);
         };
-        let bind_param = |slot: u64, bytes: &[u8]| {
-            unsafe {
-                let dst = (params_buf.contents() as *mut u8).add(step_idx * 64);
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len().min(64));
-            }
-            enc.set_buffer(slot, Some(params_buf), (step_idx * 64) as u64);
-        };
         let grid1 = |n: usize| {
             enc.dispatch_thread_groups(
                 MTLSize::new((n as u64).div_ceil(TG), 1, 1),
@@ -3961,6 +3954,7 @@ pub(crate) enum FusionPolicy {
     XlaClass,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FusionClass {
     ElementwiseChain,
@@ -6089,7 +6083,7 @@ mod tests {
             (seed >> 33) as u32
         };
         // Finite f16 scale (|x| in 2^-6..2^4) so the reference and the GPU never meet NaN/inf.
-        let mut f16 = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
+        let f16 = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
             let exp = 9 + (next() % 14) as u16;
             (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
         };

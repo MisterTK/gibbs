@@ -1441,10 +1441,9 @@ mod tests {
     fn test_gemma4_to_decode_graph_cpu_parity() {
         use crate::graph::cpu::run_stateless;
         use crate::graph::Tensor;
-        use crate::model::weights::Weights;
 
         let model = tiny_model();
-        let (h, v) = (model.hidden, model.vocab);
+        let h = model.hidden;
 
         // 1. Reference forward pass
         let tok = 5u32;

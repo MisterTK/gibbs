@@ -70,8 +70,14 @@ impl Dit {
 
         for (i, blk) in self.blocks.iter().enumerate() {
             let p = format!("blk{i}");
-            let mi = blk.img.modulation.emit(&mut b, &format!("{p}.img.mod"), cond);
-            let mt = blk.txt.modulation.emit(&mut b, &format!("{p}.txt.mod"), cond);
+            let mi = blk
+                .img
+                .modulation
+                .emit(&mut b, &format!("{p}.img.mod"), cond);
+            let mt = blk
+                .txt
+                .modulation
+                .emit(&mut b, &format!("{p}.txt.mod"), cond);
             let qkv = |b: &mut Gb, st: &Stream, tag: &str, m: ValueId, x: ValueId| {
                 let name = format!("{p}.{tag}");
                 let (sh, sc) = (
@@ -96,8 +102,24 @@ impl Dit {
             let q = b.concat(&format!("{p}.q"), &[tq, iq], 0);
             let k = b.concat(&format!("{p}.k"), &[tk, ik], 0);
             let v = b.concat(&format!("{p}.v"), &[tv, iv], 0);
-            let q = b.rope(&format!("{p}.rq"), q, pos, inv_freq, hd, sections, PairLayout::Adjacent);
-            let k = b.rope(&format!("{p}.rk"), k, pos, inv_freq, hd, sections, PairLayout::Adjacent);
+            let q = b.rope(
+                &format!("{p}.rq"),
+                q,
+                pos,
+                inv_freq,
+                hd,
+                sections,
+                PairLayout::Adjacent,
+            );
+            let k = b.rope(
+                &format!("{p}.rk"),
+                k,
+                pos,
+                inv_freq,
+                hd,
+                sections,
+                PairLayout::Adjacent,
+            );
             let a = b.attention(&format!("{p}.attn"), q, k, v, heads);
             let ta = b.slice(&format!("{p}.ta"), a, 0, 0, nt);
             let ia = b.slice(&format!("{p}.ia"), a, 0, nt, n);
@@ -124,7 +146,10 @@ impl Dit {
 
         // AdaLayerNormContinuous: `emb = [scale | shift]`.
         let emb = self.norm_out.emit(&mut b, "norm_out", cond);
-        let (sc, sh) = (chunk(&mut b, "final.m", emb, 0), chunk(&mut b, "final.m", emb, 1));
+        let (sc, sh) = (
+            chunk(&mut b, "final.m", emb, 0),
+            chunk(&mut b, "final.m", emb, 1),
+        );
         let y = b.ln_mod("final.in", xi, sh, sc, 1e-6);
         let out = self.proj_out.emit(&mut b, "proj_out", y);
         Ok((b, vec![out]))
@@ -162,7 +187,7 @@ mod tests {
         let s = &mut Seed(200);
         let blocks = (0..2)
             .map(|_| {
-                let mut stream = |s: &mut Seed| Stream {
+                let stream = |s: &mut Seed| Stream {
                     modulation: s.lin(6 * D, D),
                     q: s.lin(D, D),
                     k: s.lin(D, D),

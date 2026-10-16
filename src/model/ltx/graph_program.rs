@@ -131,20 +131,21 @@ impl LtxTransformer {
         let temb = self.ada.emit(&mut b, "time.ada", a);
 
         // `rms(x) * (1 + scale) + shift` per span with chunks `(i, j)` of the `[spans, 6d]` table `m`.
-        let norm_mod = |b: &mut Gb, p: &str, x: ValueId, m: ValueId, (i, j): (usize, usize), layer: bool| {
-            let nrm = if layer {
-                b.layer_norm(&format!("{p}.ln"), x, 1e-6)
-            } else {
-                b.rms_norm(&format!("{p}.rms"), x, ones, 1e-6)
+        let norm_mod =
+            |b: &mut Gb, p: &str, x: ValueId, m: ValueId, (i, j): (usize, usize), layer: bool| {
+                let nrm = if layer {
+                    b.layer_norm(&format!("{p}.ln"), x, 1e-6)
+                } else {
+                    b.rms_norm(&format!("{p}.rms"), x, ones, 1e-6)
+                };
+                let sh = b.slice(&format!("{p}.sh"), m, 1, i * d, (i + 1) * d);
+                let sc = b.slice(&format!("{p}.sc"), m, 1, j * d, (j + 1) * d);
+                per_span(b, p, nrm, &sp, |b, xs, s| {
+                    let sh = row(b, &format!("{p}.sh{s}"), sh, s, ns);
+                    let sc = row(b, &format!("{p}.sc{s}"), sc, s, ns);
+                    b.modulate(&format!("{p}.m{s}"), xs, sh, sc)
+                })
             };
-            let sh = b.slice(&format!("{p}.sh"), m, 1, i * d, (i + 1) * d);
-            let sc = b.slice(&format!("{p}.sc"), m, 1, j * d, (j + 1) * d);
-            per_span(b, p, nrm, &sp, |b, xs, s| {
-                let sh = row(b, &format!("{p}.sh{s}"), sh, s, ns);
-                let sc = row(b, &format!("{p}.sc{s}"), sc, s, ns);
-                b.modulate(&format!("{p}.m{s}"), xs, sh, sc)
-            })
-        };
         // `x + gate * y` per span, `gate` chunk `i` of `m`.
         let gate = |b: &mut Gb, p: &str, x: ValueId, y: ValueId, m: ValueId, i: usize| {
             let g = b.slice(&format!("{p}.g"), m, 1, i * d, (i + 1) * d);
@@ -233,7 +234,10 @@ pub(super) mod fixture {
     }
 
     fn gain(s: &mut Seed, n: usize) -> Vec<f32> {
-        rand(n, s.next(), 1.0).iter().map(|v| 1.0 + 0.3 * v).collect()
+        rand(n, s.next(), 1.0)
+            .iter()
+            .map(|v| 1.0 + 0.3 * v)
+            .collect()
     }
 
     pub(super) const D: usize = 512;
@@ -241,7 +245,7 @@ pub(super) mod fixture {
 
     pub(super) fn tiny(seed: u64) -> LtxTransformer {
         let s = &mut Seed(seed * 1000);
-        let mut attn = |s: &mut Seed| Attn {
+        let attn = |s: &mut Seed| Attn {
             q: lin(s, D, D),
             k: lin(s, D, D),
             v: lin(s, D, D),
@@ -301,7 +305,10 @@ mod tests {
                 .expect("metal program");
             let (e, c) = (rel_err(&want, &got), cosine(&want, &got));
             eprintln!("t={t} clean={clean}: rel {e:.2e} cos {c:.8}");
-            assert!(e < 1e-3 && c > 0.99999, "t={t} clean={clean}: rel {e} cos {c}");
+            assert!(
+                e < 1e-3 && c > 0.99999,
+                "t={t} clean={clean}: rel {e} cos {c}"
+            );
         }
     }
 }

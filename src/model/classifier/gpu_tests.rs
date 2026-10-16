@@ -5,8 +5,6 @@
 
 use super::*;
 use crate::hardware::{available_devices, cpu_compute};
-use serde_json::json;
-
 
 use super::synth::*;
 
@@ -26,7 +24,11 @@ fn parity(name: &str, cfg: Value, ts: Ts) {
     let _g = cpu_compute::allow();
     let cpu = SequenceClassifier::load(&hub, &id, Device::Cpu).unwrap();
     let gpu = SequenceClassifier::load(&hub, &id, Device::Metal).unwrap();
-    assert_eq!((cpu.device(), gpu.device()), (Device::Cpu, Device::Metal), "{name}");
+    assert_eq!(
+        (cpu.device(), gpu.device()),
+        (Device::Cpu, Device::Metal),
+        "{name}"
+    );
     for pair in [None, Some(PAIR)] {
         let (want, n) = cpu.classify(TEXT, pair).unwrap();
         let (got, m) = gpu.classify(TEXT, pair).unwrap();
@@ -38,9 +40,19 @@ fn parity(name: &str, cfg: Value, ts: Ts) {
         };
         let (want, got) = (key(&want), key(&got));
         let scale = want.iter().fold(1e-3f32, |m, (_, s)| m.max(s.abs()));
-        let err = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max((a.1 - b.1).abs())) / scale;
-        eprintln!("{name} pair={}: max rel err {err:.2e}  cpu {want:?}  metal {got:?}", pair.is_some());
-        assert!(err < 1e-3, "{name}: Metal scores differ from the CPU forward by {err}: {want:?} vs {got:?}");
+        let err = want
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (a, b)| m.max((a.1 - b.1).abs()))
+            / scale;
+        eprintln!(
+            "{name} pair={}: max rel err {err:.2e}  cpu {want:?}  metal {got:?}",
+            pair.is_some()
+        );
+        assert!(
+            err < 1e-3,
+            "{name}: Metal scores differ from the CPU forward by {err}: {want:?} vs {got:?}"
+        );
     }
 }
 
@@ -118,7 +130,11 @@ fn setfit_pool_and_logistic_head_on_metal() {
     };
     let _g = cpu_compute::allow();
     let cpu = BertEncoder::load(dims, Device::Cpu, get).unwrap();
-    let (ids, pos, types) = ([3u32, 7, 1, 9, 2, 5, 11, 4, 6], (0..9).collect::<Vec<u32>>(), [0u32; 9]);
+    let (ids, pos, types) = (
+        [3u32, 7, 1, 9, 2, 5, 11, 4, 6],
+        (0..9).collect::<Vec<u32>>(),
+        [0u32; 9],
+    );
     let hidden = cpu.run(&ids, &pos, &types, false).unwrap();
     for (p, normalize, rows, ovr) in [
         (Pool::Mean, true, 1, true),
@@ -134,11 +150,19 @@ fn setfit_pool_and_logistic_head_on_metal() {
             ovr,
         };
         let want = head.proba(&pool(&hidden, 16, p, normalize));
-        let gpu = BertEncoder::load_with_head(dims, Device::Metal, get, Some(head.graph(p, normalize))).unwrap();
+        let gpu =
+            BertEncoder::load_with_head(dims, Device::Metal, get, Some(head.graph(p, normalize)))
+                .unwrap();
         let got = gpu.run_head(&ids, &pos, &types).unwrap();
         assert_eq!(got.len(), want.len());
-        let err = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        let err = want
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
         eprintln!("setfit {p:?} norm={normalize} rows={rows} ovr={ovr}: max abs err {err:.2e}  {want:?} vs {got:?}");
-        assert!(err < 1e-3, "{p:?} {normalize} {rows} {ovr}: {want:?} vs {got:?}");
+        assert!(
+            err < 1e-3,
+            "{p:?} {normalize} {rows} {ovr}: {want:?} vs {got:?}"
+        );
     }
 }

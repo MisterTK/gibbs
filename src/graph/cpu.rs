@@ -64,7 +64,6 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Upsample { .. } => true,
         Op::MatMul { .. } => true,
         Op::Gelu { .. } => true,
-        _ => false,
     }
 }
 
@@ -1703,13 +1702,6 @@ pub fn run(
                     ));
                 }
                 concat_cpu(&parts, *axis, name)?
-            }
-            op => {
-                return Err(format!(
-                    "CPU executor does not implement {} (node '{}')",
-                    op.name(),
-                    node.name
-                ))
             }
         };
 
