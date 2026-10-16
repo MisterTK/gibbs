@@ -529,4 +529,4 @@ Real-weight tests read models from `disk/` and print `SKIP: <reason>` when one i
 The optimization log is `autoresearch/roofline-loop.tsv` with notes in `autoresearch/roofline-loop-notes.md`.
 
 ## License
-Dual-licensed under Apache License, Version 2.0 or MIT license, at your option.
+Dual-licensed under [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
