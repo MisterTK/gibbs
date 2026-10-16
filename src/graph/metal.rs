@@ -3954,17 +3954,10 @@ pub(crate) enum FusionPolicy {
     XlaClass,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FusionClass {
-    ElementwiseChain,
     ReduceInput,
     DotEpilogue,
-    SiblingSameKind,
-    NormPrologue,
-    CrossCodecSiblings,
-    EpilogueScatter,
-    AttentionSingleDispatch,
     /// Several independent steps of one kind with different shapes in one dispatch. XLA's GPU
     /// pipeline in the catalogued revision has no horizontal-fusion pass, so this is Full-only.
     HorizontalBatch,
@@ -3973,11 +3966,7 @@ pub(crate) enum FusionClass {
 impl FusionPolicy {
     pub(crate) fn allows(self, k: FusionClass) -> bool {
         use FusionClass::*;
-        self == FusionPolicy::Full
-            || matches!(
-                k,
-                ElementwiseChain | ReduceInput | DotEpilogue | SiblingSameKind
-            )
+        self == FusionPolicy::Full || matches!(k, ReduceInput | DotEpilogue)
     }
 }
 
