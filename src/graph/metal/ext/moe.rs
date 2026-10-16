@@ -400,7 +400,6 @@ fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, Strin
         gemv_indexed(c, params)
     );
     let opts = CompileOptions::new();
-    opts.set_fast_math_enabled(false);
     let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
         format!(
             "generated {:?} expert GEMV failed to compile: {e}",
@@ -1352,5 +1351,56 @@ mod tests {
         assert!(e.contains("delta"), "{e}");
         let e = run(&delta_graph(2, 3, 2, 2, 1, 3), [4, 4, 6, 3, 3]);
         assert!(e.contains("multiple"), "{e}");
+    }
+
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn moe_gemv_bandwidth() {
+        let (experts, top_k) = (16usize, 8usize);
+        let ids = Tensor::U32(vec![0, 2, 5, 7, 9, 11, 13, 15]);
+        for (f, rows, cols, x_rows) in [
+            (Q::GGUF_IQ2_XXS, 1408usize, 2816usize, 1usize),
+            (Q::GGUF_IQ2_M, 1408, 2816, 1),
+            (Q::GGUF_IQ4_NL, 2816, 704, 8),
+        ] {
+            let c = crate::graph::codec::codec(f).unwrap();
+            let (dt, bank) = weight(Fmt::Q(f), experts * rows, cols, 1);
+            let routed_bytes =
+                top_k * rows * (cols / c.block_elems as usize) * c.block_bytes as usize;
+            let mut g = Graph::new();
+            let x = g.input("x", vec![x_rows, cols], DType::F32);
+            let b = g.weight("bank", vec![experts * rows, cols], dt);
+            let id_in = g.input("ids", vec![1, top_k], DType::U32);
+            for step in 0..8 {
+                let y = g.add(
+                    format!("moe_{step}"),
+                    Op::MoeLinear { experts, top_k },
+                    &[x, b, id_in],
+                    vec![top_k, rows],
+                    DType::F32,
+                );
+                g.output(y);
+            }
+            let mut w = Weights::new();
+            w.insert("bank", bank);
+            let s = Session::new(rt(), &w).unwrap();
+            let plan = s.prepare_plan(&g).unwrap();
+            let xs = Tensor::F32(vec![0.25; x_rows * cols]);
+            for _ in 0..10 {
+                s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                    .unwrap();
+            }
+            let mut dt_s = 0.0;
+            for _ in 0..20 {
+                s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                    .unwrap();
+                dt_s += s.last_gpu_seconds() / (20.0 * 8.0);
+            }
+            println!(
+                "moe_gemv {f:?} {rows}x{cols} (top_k={top_k}, x_rows={x_rows}): {:.1} us, {:.1} GB/s",
+                dt_s * 1e6,
+                routed_bytes as f64 / dt_s / 1e9
+            );
+        }
     }
 }

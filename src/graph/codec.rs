@@ -46,8 +46,8 @@ pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
 pub struct Wide {
     pub groups: u32,
     pub segs: u32,
-    /// Every segment of a group shares one scale (`out[8 * segs]`) and has bias `-scale`: the GEMV sums
-    /// the group's dots and x once and multiplies by the scale a single time.
+    /// Every segment of a group shares one scale (`out[8 * segs]`) and has zero bias: the GEMV sums
+    /// the group's segment dots once and multiplies by the scale a single time.
     pub uniform: bool,
     /// MSL defining `inline uint group_seg(uint g, uint k)` (block offset of segment `k` of group `g`) and
     /// `inline void decode_group(device const uchar* blk, uint g, thread float* out)`, which writes the
@@ -63,6 +63,7 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
         QuantFormat::GGUF_Q3_K => Some(&WIDE_Q3_K),
         QuantFormat::GGUF_IQ4_XS => Some(&WIDE_IQ4_XS),
         QuantFormat::GGUF_IQ4_NL => Some(&WIDE_IQ4_NL),
+        QuantFormat::GGUF_IQ2_XXS => Some(&WIDE_IQ2_XXS),
         _ => None,
     }
 }
@@ -327,7 +328,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // IQ4_XS: group g = (32-element group ib = g/2, 8 bytes at (g%2)*8): low nibbles are elements 0..15 of the
 // group's half, high nibbles 16..31; value = d * (ls - 32) * KVALUES[nibble] (a table, so no bias).
 static WIDE_IQ4_XS: Wide = Wide {
-    uniform: false,
+    uniform: true,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -342,26 +343,48 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
         out[8 + i] = float(KVALUES_IQ4NL[q[i] >> 4]);
     }
     uint ls = ((uint(blk[4 + (ib >> 1)]) >> (4 * (ib & 1))) & 0x0Fu) | (((scales_h >> (2 * ib)) & 3u) << 4);
-    float s = d * float(int(ls) - 32);
-    out[16] = s; out[17] = s; out[18] = 0.0f; out[19] = 0.0f;
+    out[16] = d * float(int(ls) - 32);
 }
 "#,
 };
 
 static WIDE_IQ4_NL: Wide = Wide {
-    uniform: false,
+    uniform: true,
     groups: 2,
     segs: 2,
     msl: r#"
 inline uint group_seg(uint g, uint k) { return g * 8 + k * 16; }
 inline void decode_group(device const uchar* blk, uint g, thread float* out) {
-    float d = cd_f16(blk);
+    out[16] = cd_f16(blk);
     device const uchar* q = blk + 2 + g * 8;
     for (uint i = 0; i < 8; i++) {
         out[i] = float(KVALUES_IQ4NL[q[i] & 0x0Fu]);
         out[8 + i] = float(KVALUES_IQ4NL[q[i] >> 4]);
     }
-    out[16] = d; out[17] = d; out[18] = 0.0f; out[19] = 0.0f;
+}
+"#,
+};
+
+static WIDE_IQ2_XXS: Wide = Wide {
+    uniform: true,
+    groups: 8,
+    segs: 4,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    float d = cd_f16(blk);
+    device const uchar* q = blk + 2 + 8 * g;
+    uint q4 = cd_u32(q), aux1 = cd_u32(q + 4);
+    out[32] = d * (0.5f + float(aux1 >> 28)) * 0.25f;
+    for (uint k = 0; k < 4; k++) {
+        uint2 gw = as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]);
+        float4 g0 = float4(as_type<uchar4>(gw.x)), g1 = float4(as_type<uchar4>(gw.y));
+        uint s = KSIGNS_IQ2XS[(aux1 >> (7 * k)) & 127u];
+        for (uint j = 0; j < 4; j++) {
+            out[8 * k + j] = (s & (1u << j)) ? -g0[j] : g0[j];
+            out[8 * k + 4 + j] = (s & (16u << j)) ? -g1[j] : g1[j];
+        }
+    }
 }
 "#,
 };

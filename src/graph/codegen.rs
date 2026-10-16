@@ -208,7 +208,10 @@ pub struct BlockRef {
 pub fn block_ref(codec: &Codec, w: &str, idx: &str) -> BlockRef {
     match planar(codec.format) {
         None => BlockRef {
-            decl: format!("device const uchar* b = {w} + ({idx}) * {};", codec.block_bytes),
+            decl: format!(
+                "device const uchar* b = {w} + ({idx}) * {};",
+                codec.block_bytes
+            ),
             sub: String::new(),
             group: String::new(),
         },
@@ -296,7 +299,7 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let codec_msl = device_msl(codec).replace("decode8", &dec);
     let r = p.rows_per_sg;
     let be = codec.block_elems;
-    let loop_src = gemv_loop(codec, p, &dec);
+    let loop_src = gemv_loop(codec, p, &dec, "(ulong)(row0", true);
     let store_row = |acc: &str, row: &str, ind: &str| {
         format!(
             "{ind}float a = {acc};\n{ind}if (p.has_bias != 0) a += bias[{row}];\n{ind}ulong o = (ulong)batch * p.rows + {row};\n{ind}y[o] = apply_gemv_epi(a, o, p, res);\n"
@@ -321,13 +324,22 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
             .map(|i| {
                 format!(
                     "        if (row0 + {i} < p.rows) {{\n{}        }}\n",
-                    store_row(&format!("simd_sum_{i}"), &format!("row0 + {i}"), "            ")
+                    store_row(
+                        &format!("simd_sum_{i}"),
+                        &format!("row0 + {i}"),
+                        "            "
+                    )
                 )
             })
             .collect();
         (
-            (0..r).map(|i| format!("float acc{i} = 0.0f;")).collect::<Vec<_>>().join(" "),
-            (0..r).map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n")).collect(),
+            (0..r)
+                .map(|i| format!("float acc{i} = 0.0f;"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (0..r)
+                .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
+                .collect(),
             "lane == 0".to_string(),
             store,
         )
@@ -358,35 +370,50 @@ kernel void {name}(
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
-        wide_msl = wide(codec.format)
-            .map(|w| w
-                .msl
-                .replace("decode_group", &dec.replace("decode8", "decode_group"))
-                .replace("group_seg", &dec.replace("decode8", "group_seg")))
-            .or_else(|| tile(codec.format).map(|t| {
-                ["group_seg", "tile_load", "tile_scale", "tile_seg"]
-                    .iter()
-                    .fold(t.msl.to_string(), |m, n| m.replace(n, &dec.replace("decode8", n)))
-            }))
-            .unwrap_or_default(),
+        wide_msl = wide_msl(codec, &dec, true),
     )
 }
 
-/// The lane loop of [`gemv_packed`]: one 8-element sub-block per iteration (`decode8`), or, for a codec
-/// with a [`wide`] decode, one group of `segs` sub-blocks (its bytes are read once, not once per sub-block).
-fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
+fn wide_msl(codec: &Codec, dec: &str, allow_tile: bool) -> String {
+    wide(codec.format)
+        .map(|w| {
+            w.msl
+                .replace("decode_group", &dec.replace("decode8", "decode_group"))
+                .replace("group_seg", &dec.replace("decode8", "group_seg"))
+        })
+        .or_else(|| {
+            allow_tile.then(|| tile(codec.format)).flatten().map(|t| {
+                ["group_seg", "tile_load", "tile_scale", "tile_seg"]
+                    .iter()
+                    .fold(t.msl.to_string(), |m, n| {
+                        m.replace(n, &dec.replace("decode8", n))
+                    })
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// The lane loop of [`gemv_packed`] / [`gemv_indexed`]: one 8-element sub-block per iteration (`decode8`), or,
+/// for a codec with a [`wide`] decode, one group of `segs` sub-blocks (its bytes are read once, not once per sub-block).
+fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile: bool) -> String {
     let (be, r) = (codec.block_elems, p.rows_per_sg);
     // `decode` gets the block's prefixes (`BlockRef::sub` for decode8, `group` for decode_group).
     let row = |i: usize, decode: &dyn Fn(&BlockRef) -> String, dots: &str, v_len: u32| {
-        let br = block_ref(codec, "w", &format!("(ulong)(row0 + {i}) * blocks_per_row + blk"));
+        let br = block_ref(
+            codec,
+            "w",
+            &format!("{row_base} + {i}) * blocks_per_row + blk"),
+        );
         format!(
             "        if (row0 + {i} < p.rows) {{\n            {}\n            float v[{v_len}];\n            {}\n{dots}        }}\n",
             br.decl,
             decode(&br)
         )
     };
-    if let Some(t) = tile(codec.format) {
-        return tile_loop(codec, t, p, dec);
+    if allow_tile {
+        if let Some(t) = tile(codec.format) {
+            return tile_loop(codec, t, p, dec);
+        }
     }
     let Some(wd) = wide(codec.format) else {
         let rows: String = (0..r)
@@ -429,7 +456,7 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
             let mut dots = String::new();
             if wd.uniform {
                 let sum = (0..nseg).map(|k| format!("({})", seg_dot(k))).collect::<Vec<_>>().join(" + ");
-                dots += &format!("            acc{i} += v[{}] * ({sum} - sxall);\n", 8 * nseg);
+                dots += &format!("            acc{i} += v[{}] * ({sum});\n", 8 * nseg);
             } else {
                 for k in 0..nseg {
                     dots += &format!(
@@ -438,16 +465,13 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
                     );
                 }
             }
-            row(i, &|br| format!("{gdec}(b, {}g, v);", br.group), &dots, 10 * wd.segs)
+            let v_len = if wd.uniform { 8 * wd.segs + 1 } else { 10 * wd.segs };
+            row(i, &|br| format!("{gdec}(b, {}g, v);", br.group), &dots, v_len)
         })
         .collect();
     let groups = wd.groups;
     let sx: String = if wd.uniform {
-        let all = (0..2 * nseg)
-            .map(|j| format!("xs[{j}]"))
-            .collect::<Vec<_>>()
-            .join(" + ");
-        format!("        const float sxall = dot({all}, float4(1.0f));\n")
+        String::new()
     } else {
         (0..nseg)
             .map(|k| {
@@ -471,7 +495,11 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
 fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
     let (be, r, segs) = (codec.block_elems, p.rows_per_sg, t.segs);
     let lpr = 32 / r;
-    assert!(segs as usize % r == 0, "{} rows per simdgroup do not divide {segs} segments", r);
+    assert!(
+        segs as usize % r == 0,
+        "{} rows per simdgroup do not divide {segs} segments",
+        r
+    );
     let name = |n: &str| dec.replace("decode8", n);
     let (seg, load, scale, tseg) = (
         name("group_seg"),
@@ -528,15 +556,7 @@ pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
         .map(|i| format!("float acc{i} = 0.0f;"))
         .collect::<Vec<_>>()
         .join(" ");
-    let rows_loop: String = (0..r)
-        .map(|i| {
-            let br = block_ref(codec, "w", &format!("(bank_row + row0 + {i}) * blocks_per_row + blk"));
-            format!(
-                "        if (row0 + {i} < p.rows) {{\n            {}\n            float v[8];\n            {dec}(b, {}sub, v);\n            acc{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n        }}\n",
-                br.decl, br.sub
-            )
-        })
-        .collect();
+    let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
     let sums: String = (0..r)
         .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
         .collect();
@@ -548,6 +568,7 @@ pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
     format!(
         r#"
 {codec_msl}
+{wide_msl}
 
 struct MoeGemvParams {{
     uint rows;
@@ -579,20 +600,14 @@ kernel void {name}(
         return;
     }}
     const ulong bank_row = (ulong)expert * p.rows;
-    const uint subs = p.cols / 8;
     const uint blocks_per_row = p.cols / {be};
     device const float* xb = x + (ulong)(p.x_per_slot != 0 ? slot : slot / p.top_k) * p.cols;
     {acc_decl}
-    for (uint s = lane; s < subs; s += 32) {{
-        float4 x0 = *(device const float4*)(xb + s * 8);
-        float4 x1 = *(device const float4*)(xb + s * 8 + 4);
-        const uint blk = (s * 8) / {be};
-        const uint sub = ((s * 8) % {be}) / 8;
-{rows_loop}    }}
-{sums}    if (lane == 0) {{
+{loop_src}{sums}    if (lane == 0) {{
 {store}    }}
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
+        wide_msl = wide_msl(codec, &dec, false),
     )
 }

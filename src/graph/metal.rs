@@ -641,7 +641,7 @@ impl Runtime {
         if !archive_hit {
             // Archives and profiles of other kernel sources: ABBA runs alternate two binaries, so
             // keep the newest few instead of deleting what the other binary will need.
-            prune_cache(&cache.join("metal"), &tag, &archive, 3);
+            prune_cache(&cache.join("metal"), &tag, &archive, 8);
         }
         let pso_ms = t1.elapsed().as_secs_f64() * 1e3;
         for (name, pso) in &psos {
@@ -676,10 +676,11 @@ impl Runtime {
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
+        let profile_hash = src_hash ^ codec::source_hash().rotate_left(13);
         let profile_path = cache
             .join("host")
-            .join(format!("{tag}-{src_hash:016x}.json"));
-        prune_cache(&cache.join("host"), &tag, &profile_path, 3);
+            .join(format!("{tag}-{profile_hash:016x}.json"));
+        prune_cache(&cache.join("host"), &tag, &profile_path, 8);
         let cached = std::fs::read(&profile_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
@@ -1381,7 +1382,11 @@ impl Runtime {
             Epi::None => "none",
             Epi::Gelu => "gelu",
             Epi::Residual => "residual",
-            _ => "none",
+            other => {
+                return Err(format!(
+                    "Metal GEMM kernel '{prefix}' does not support epilogue {other:?}"
+                ));
+            }
         };
         enc.set_compute_pipeline_state(self.pso(&format!("{prefix}_{suffix}"))?);
         // Absent bias/residual slots are bound to `out` and never read (has_bias = 0, no residual epilogue).

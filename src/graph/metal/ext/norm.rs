@@ -8,8 +8,8 @@
 //! gamma already normalizes x in chunks of its length) and `L2Normalize` (whole tensor, no axis
 //! attribute) stay on the core arms.
 
-use super::{Enc, PlanOut};
 use super::super::{set_bytes, u32_of, Planned, Session, TG};
+use super::{Enc, PlanOut};
 use crate::graph::cpu::channel_layout;
 use crate::graph::{DType, Graph, Node, Op, ReduceKind, ValueId};
 use metal::MTLSize;
@@ -33,6 +33,7 @@ pub struct ReduceParams {
     rcount: u32,
     nk: u32,
     nr: u32,
+    n_out: u32,
     kdim: [u32; 4],
     kstr: [u32; 4],
     rdim: [u32; 4],
@@ -42,11 +43,40 @@ pub struct ReduceParams {
 /// Steps this group adds to the executor.
 #[derive(Debug, Clone)]
 pub enum Step {
-    Reduce { x: ValueId, p: ReduceParams, n_out: usize },
-    Softmax { x: ValueId, outer: usize, n: usize, inner: usize },
-    LayerNormNoBeta { x: ValueId, g: ValueId, rows: usize, d: usize, eps: f32 },
-    RmsNormNoGamma { x: ValueId, rows: usize, d: usize, eps: f32 },
-    Group { x: ValueId, g: ValueId, b: ValueId, tgs: usize, groups: usize, cg: usize, hw: usize, eps: f32 },
+    Reduce {
+        x: ValueId,
+        p: ReduceParams,
+        n_out: usize,
+    },
+    Softmax {
+        x: ValueId,
+        outer: usize,
+        n: usize,
+        inner: usize,
+    },
+    LayerNormNoBeta {
+        x: ValueId,
+        g: ValueId,
+        rows: usize,
+        d: usize,
+        eps: f32,
+    },
+    RmsNormNoGamma {
+        x: ValueId,
+        rows: usize,
+        d: usize,
+        eps: f32,
+    },
+    Group {
+        x: ValueId,
+        g: ValueId,
+        b: ValueId,
+        tgs: usize,
+        groups: usize,
+        cg: usize,
+        hw: usize,
+        eps: f32,
+    },
 }
 
 /// Whether the Metal executor lowers `op` for `dtype` (the weight/output dtype the placer passes).
@@ -84,7 +114,11 @@ fn reduce_params(
     for &a in axes {
         match norm_axis(a, rank) {
             Some(ax) if !red[ax] => red[ax] = true,
-            _ => return Err(format!("node '{name}': bad Reduce axis {a} for rank {rank}")),
+            _ => {
+                return Err(format!(
+                    "node '{name}': bad Reduce axis {a} for rank {rank}"
+                ))
+            }
         }
     }
     let mut stride = vec![1usize; rank];
@@ -134,6 +168,7 @@ fn reduce_params(
         rcount *= d;
     }
     p.rcount = u32_of(rcount)?;
+    p.n_out = u32_of(n_out)?;
     Ok((p, n_out))
 }
 
@@ -154,7 +189,10 @@ pub(super) fn plan(
     let n_of = |v: ValueId| -> Result<usize, String> {
         let n: usize = g.value(v).shape.iter().product();
         if n == 0 {
-            Err(format!("node '{name}': value '{}' has no static non-empty shape", g.value(v).name))
+            Err(format!(
+                "node '{name}': value '{}' has no static non-empty shape",
+                g.value(v).name
+            ))
         } else {
             Ok(n)
         }
@@ -190,7 +228,16 @@ pub(super) fn plan(
                 return Err(format!("node '{name}': x/gamma lengths {xl}/{d} disagree"));
             }
             u32_of(d)?;
-            Ok((Step::LayerNormNoBeta { x, g: gm, rows: xl / d, d, eps: *eps }, xl))
+            Ok((
+                Step::LayerNormNoBeta {
+                    x,
+                    g: gm,
+                    rows: xl / d,
+                    d,
+                    eps: *eps,
+                },
+                xl,
+            ))
         }
         // The gamma form stays on the core arm (gamma `[group]` already normalizes x in chunks).
         Op::RmsNorm { eps } if node.inputs.len() == 1 => {
@@ -198,7 +245,15 @@ pub(super) fn plan(
             let xl = n_of(x)?;
             let d = g.value(x).shape.last().copied().unwrap_or(0);
             u32_of(d)?;
-            Ok((Step::RmsNormNoGamma { x, rows: xl / d.max(1), d, eps: *eps }, xl))
+            Ok((
+                Step::RmsNormNoGamma {
+                    x,
+                    rows: xl / d.max(1),
+                    d,
+                    eps: *eps,
+                },
+                xl,
+            ))
         }
         Op::GroupNorm { .. } | Op::InstanceNorm { .. } => {
             let (x, gm, b) = (arg(0)?, arg(1)?, arg(2)?);
@@ -214,13 +269,28 @@ pub(super) fn plan(
                     n_of(b)?
                 ));
             }
-            let (n, hw) = channel_layout(&g.value(x).shape, c).map_err(|e| format!("node '{name}': {e}"))?;
+            let (n, hw) =
+                channel_layout(&g.value(x).shape, c).map_err(|e| format!("node '{name}': {e}"))?;
             if n * c * hw != xl {
-                return Err(format!("node '{name}': x of {xl} elements is not {n}*{c}*{hw}"));
+                return Err(format!(
+                    "node '{name}': x of {xl} elements is not {n}*{c}*{hw}"
+                ));
             }
             u32_of(c / groups * hw)?;
             u32_of(n * groups)?;
-            Ok((Step::Group { x, g: gm, b, tgs: n * groups, groups, cg: c / groups, hw, eps }, xl))
+            Ok((
+                Step::Group {
+                    x,
+                    g: gm,
+                    b,
+                    tgs: n * groups,
+                    groups,
+                    cg: c / groups,
+                    hw,
+                    eps,
+                },
+                xl,
+            ))
         }
         _ => Err(String::new()),
     })();
@@ -234,7 +304,9 @@ pub(super) fn plan(
 /// Every value the step reads (drives arena liveness and barriers).
 pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match *st {
-        Step::Reduce { x, .. } | Step::Softmax { x, .. } | Step::RmsNormNoGamma { x, .. } => vec![x],
+        Step::Reduce { x, .. } | Step::Softmax { x, .. } | Step::RmsNormNoGamma { x, .. } => {
+            vec![x]
+        }
         Step::LayerNormNoBeta { x, g, .. } => vec![x, g],
         Step::Group { x, g, b, .. } => vec![x, g, b],
     }
@@ -249,43 +321,71 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
     let tg = MTLSize::new(TG, 1, 1);
     match *st {
         Step::Reduce { x, ref p, n_out } => {
-            e.enc.set_compute_pipeline_state(sess.rt.pso("norm_reduce_f32")?);
+            e.enc
+                .set_compute_pipeline_state(sess.rt.pso("norm_reduce_f32")?);
             e.bind(0, x);
             e.bind(1, s.out);
             set_bytes(e.enc, 2, p);
-            // ponytail: one simdgroup per output; few outputs over a huge axis run at 32 lanes.
-            e.enc.dispatch_thread_groups(MTLSize::new(n_out as u64, 1, 1), MTLSize::new(32, 1, 1));
+            if p.rcount <= 32 {
+                e.grid1(n_out);
+            } else {
+                e.enc.dispatch_thread_groups(
+                    MTLSize::new(n_out as u64, 1, 1),
+                    MTLSize::new(32, 1, 1),
+                );
+            }
         }
         Step::Softmax { x, outer, n, inner } => {
-            e.enc.set_compute_pipeline_state(sess.rt.pso("norm_softmax_f32")?);
+            e.enc
+                .set_compute_pipeline_state(sess.rt.pso("norm_softmax_f32")?);
             e.bind(0, x);
             e.bind(1, s.out);
             set_bytes(e.enc, 2, &[u32_of(n)?, u32_of(inner)?]);
-            e.enc.dispatch_thread_groups(MTLSize::new((outer * inner) as u64, 1, 1), tg);
+            e.enc
+                .dispatch_thread_groups(MTLSize::new((outer * inner) as u64, 1, 1), tg);
         }
         Step::LayerNormNoBeta { x, g, rows, d, eps } => {
-            e.enc.set_compute_pipeline_state(sess.rt.pso("norm_layernorm_nobeta_f32")?);
+            e.enc
+                .set_compute_pipeline_state(sess.rt.pso("norm_layernorm_nobeta_f32")?);
             e.bind(0, x);
             e.bind(1, g);
             e.bind(2, s.out);
             set_bytes(e.enc, 3, &[u32_of(d)?, eps.to_bits()]);
-            e.enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), tg);
+            e.enc
+                .dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), tg);
         }
         Step::RmsNormNoGamma { x, rows, d, eps } => {
-            e.enc.set_compute_pipeline_state(sess.rt.pso("norm_rmsnorm_nogamma_f32")?);
+            e.enc
+                .set_compute_pipeline_state(sess.rt.pso("norm_rmsnorm_nogamma_f32")?);
             e.bind(0, x);
             e.bind(1, s.out);
             set_bytes(e.enc, 2, &[u32_of(d)?, eps.to_bits()]);
-            e.enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), tg);
+            e.enc
+                .dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), tg);
         }
-        Step::Group { x, g, b, tgs, groups, cg, hw, eps } => {
-            e.enc.set_compute_pipeline_state(sess.rt.pso("norm_group_f32")?);
+        Step::Group {
+            x,
+            g,
+            b,
+            tgs,
+            groups,
+            cg,
+            hw,
+            eps,
+        } => {
+            e.enc
+                .set_compute_pipeline_state(sess.rt.pso("norm_group_f32")?);
             e.bind(0, x);
             e.bind(1, g);
             e.bind(2, b);
             e.bind(3, s.out);
-            set_bytes(e.enc, 4, &[u32_of(groups)?, u32_of(cg)?, u32_of(hw)?, eps.to_bits()]);
-            e.enc.dispatch_thread_groups(MTLSize::new(tgs as u64, 1, 1), tg);
+            set_bytes(
+                e.enc,
+                4,
+                &[u32_of(groups)?, u32_of(cg)?, u32_of(hw)?, eps.to_bits()],
+            );
+            e.enc
+                .dispatch_thread_groups(MTLSize::new(tgs as u64, 1, 1), tg);
         }
     }
     Ok(())
@@ -315,7 +415,12 @@ mod tests {
             &[2, 3, 4, 5, 3],
             &[1, 1],
         ];
-        let kinds = [ReduceKind::Sum, ReduceKind::Mean, ReduceKind::Max, ReduceKind::Min];
+        let kinds = [
+            ReduceKind::Sum,
+            ReduceKind::Mean,
+            ReduceKind::Max,
+            ReduceKind::Min,
+        ];
         let mut cases = 0;
         for shape in shapes {
             let rank = shape.len();
@@ -323,7 +428,13 @@ mod tests {
             for mask in 1u32..(1 << rank) {
                 let axes: Vec<isize> = (0..rank)
                     .filter(|i| mask >> i & 1 == 1)
-                    .map(|i| if mask % 2 == 1 { i as isize } else { i as isize - rank as isize })
+                    .map(|i| {
+                        if mask % 2 == 1 {
+                            i as isize
+                        } else {
+                            i as isize - rank as isize
+                        }
+                    })
                     .collect();
                 for keep_dims in [true, false] {
                     let out_shape: Vec<usize> = (0..rank)
@@ -343,12 +454,25 @@ mod tests {
                     for kind in kinds {
                         let mut g = Graph::new();
                         let x = g.input("x", shape.to_vec(), F);
-                        let y = g.add("r", Op::Reduce { kind, axes: axes.clone(), keep_dims }, &[x], out_shape.clone(), F);
+                        let y = g.add(
+                            "r",
+                            Op::Reduce {
+                                kind,
+                                axes: axes.clone(),
+                                keep_dims,
+                            },
+                            &[x],
+                            out_shape.clone(),
+                            F,
+                        );
                         g.output(y);
                         let n: usize = shape.iter().product();
                         let (want, got) = run1(&g, &Weights::new(), &rand(n, 7 + cases as u64));
                         let e = rel_err(&want, &got);
-                        assert!(e < 1e-4, "{kind:?} {shape:?} axes {axes:?} keep {keep_dims}: {e}");
+                        assert!(
+                            e < 1e-4,
+                            "{kind:?} {shape:?} axes {axes:?} keep {keep_dims}: {e}"
+                        );
                         cases += 1;
                     }
                 }
@@ -361,7 +485,17 @@ mod tests {
     fn reduce_large_axis_and_scalar_keepdims() {
         let mut g = Graph::new();
         let x = g.input("x", vec![5, 4099], F);
-        let y = g.add("r", Op::Reduce { kind: ReduceKind::Sum, axes: vec![1], keep_dims: false }, &[x], vec![5], F);
+        let y = g.add(
+            "r",
+            Op::Reduce {
+                kind: ReduceKind::Sum,
+                axes: vec![1],
+                keep_dims: false,
+            },
+            &[x],
+            vec![5],
+            F,
+        );
         g.output(y);
         let (want, got) = run1(&g, &Weights::new(), &rand(5 * 4099, 3));
         assert!(rel_err(&want, &got) < 1e-4);
@@ -369,7 +503,15 @@ mod tests {
 
     #[test]
     fn softmax_every_axis_matches_cpu() {
-        for shape in [vec![1usize], vec![37], vec![3, 5], vec![129, 3], vec![2, 3, 4], vec![2, 37, 3, 2], vec![4, 300]] {
+        for shape in [
+            vec![1usize],
+            vec![37],
+            vec![3, 5],
+            vec![129, 3],
+            vec![2, 3, 4],
+            vec![2, 37, 3, 2],
+            vec![4, 300],
+        ] {
             for axis in 0..shape.len() as isize {
                 for ax in [axis, axis - shape.len() as isize] {
                     let mut g = Graph::new();
@@ -395,7 +537,10 @@ mod tests {
                 let gm = g.weight("g", vec![d], F);
                 let mut ins = vec![x, gm];
                 let mut w = Weights::new();
-                w.insert("g", Tensor::F32(rand(d, 5).iter().map(|v| v + 1.5).collect()));
+                w.insert(
+                    "g",
+                    Tensor::F32(rand(d, 5).iter().map(|v| v + 1.5).collect()),
+                );
                 if with_beta {
                     ins.push(g.weight("b", vec![d], F));
                     w.insert("b", Tensor::F32(rand(d, 6)));
@@ -436,13 +581,19 @@ mod tests {
                 let y = g.add("n", op, &[x, gm, b], shape.to_vec(), F);
                 g.output(y);
                 let mut w = Weights::new();
-                w.insert("g", Tensor::F32(rand(c, 1).iter().map(|v| v + 1.2).collect()));
+                w.insert(
+                    "g",
+                    Tensor::F32(rand(c, 1).iter().map(|v| v + 1.2).collect()),
+                );
                 w.insert("b", Tensor::F32(rand(c, 2)));
                 let n: usize = shape.iter().product();
                 let xs: Vec<f32> = rand(n, 4).iter().map(|v| v * 3.0 + 0.7).collect();
                 let (want, got) = run1(&g, &w, &xs);
                 let e = rel_err(&want, &got);
-                assert!(e < 1e-4, "{shape:?} c {c} groups {groups} instance {instance}: {e}");
+                assert!(
+                    e < 1e-4,
+                    "{shape:?} c {c} groups {groups} instance {instance}: {e}"
+                );
             }
         }
     }
@@ -459,13 +610,20 @@ mod tests {
             for ni in 0..n {
                 for gi in 0..groups {
                     let idx = |ci: usize, j: usize| ((ni * c) + gi * cg + ci) * hw + j;
-                    let vals: Vec<f64> = (0..cg).flat_map(|ci| (0..hw).map(move |j| (ci, j))).map(|(ci, j)| xs[idx(ci, j)] as f64).collect();
+                    let vals: Vec<f64> = (0..cg)
+                        .flat_map(|ci| (0..hw).map(move |j| (ci, j)))
+                        .map(|(ci, j)| xs[idx(ci, j)] as f64)
+                        .collect();
                     let mean = vals.iter().sum::<f64>() / vals.len() as f64;
-                    let var = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
+                    let var =
+                        vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
                     for ci in 0..cg {
                         for j in 0..hw {
                             let ch = gi * cg + ci;
-                            want[idx(ci, j)] = ((xs[idx(ci, j)] as f64 - mean) / (var + 1e-5).sqrt() * ga[ch] as f64 + be[ch] as f64) as f32;
+                            want[idx(ci, j)] =
+                                ((xs[idx(ci, j)] as f64 - mean) / (var + 1e-5).sqrt()
+                                    * ga[ch] as f64
+                                    + be[ch] as f64) as f32;
                         }
                     }
                 }
@@ -474,7 +632,13 @@ mod tests {
             let x = g.input("x", vec![n, c, 8, 8], F);
             let gm = g.weight("g", vec![c], F);
             let b = g.weight("b", vec![c], F);
-            let y = g.add("n", Op::GroupNorm { groups, eps: 1e-5 }, &[x, gm, b], vec![n, c, 8, 8], F);
+            let y = g.add(
+                "n",
+                Op::GroupNorm { groups, eps: 1e-5 },
+                &[x, gm, b],
+                vec![n, c, 8, 8],
+                F,
+            );
             g.output(y);
             let mut w = Weights::new();
             w.insert("g", Tensor::F32(ga.clone()));
@@ -488,14 +652,25 @@ mod tests {
     #[test]
     fn rmsnorm_without_gamma_and_group_gamma_match_cpu() {
         // (x shape, gamma len or 0 for none)
-        for (shape, glen) in [(vec![3usize, 37], 0usize), (vec![5, 129], 0), (vec![1, 1], 0), (vec![2, 3, 8], 0), (vec![5, 4 * 16], 16), (vec![3, 6 * 7], 7), (vec![2, 37], 37)] {
+        for (shape, glen) in [
+            (vec![3usize, 37], 0usize),
+            (vec![5, 129], 0),
+            (vec![1, 1], 0),
+            (vec![2, 3, 8], 0),
+            (vec![5, 4 * 16], 16),
+            (vec![3, 6 * 7], 7),
+            (vec![2, 37], 37),
+        ] {
             let mut g = Graph::new();
             let x = g.input("x", shape.clone(), F);
             let mut ins = vec![x];
             let mut w = Weights::new();
             if glen > 0 {
                 ins.push(g.weight("g", vec![glen], F));
-                w.insert("g", Tensor::F32(rand(glen, 8).iter().map(|v| v + 1.3).collect()));
+                w.insert(
+                    "g",
+                    Tensor::F32(rand(glen, 8).iter().map(|v| v + 1.3).collect()),
+                );
             }
             let y = g.add("rms", Op::RmsNorm { eps: 1e-6 }, &ins, shape.clone(), F);
             g.output(y);

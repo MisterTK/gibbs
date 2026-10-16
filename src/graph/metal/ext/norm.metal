@@ -11,18 +11,23 @@ static inline float block_max_nb(float v, threadgroup float* scratch, uint sg, u
     return m;
 }
 
-// Reduce over a strided subset of axes. One simdgroup (32 threads) per output element. The host
-// coalesces adjacent same-kind axes into at most 4 kept and 4 reduced runs (dim, stride).
+// Reduce over a strided subset of axes. One thread per output element when `rcount <= 32`
+// (coalesced across kept inner axes), else one simdgroup (32 threads) per output element.
+// The host coalesces adjacent same-kind axes into at most 4 kept and 4 reduced runs (dim, stride).
 // kind: 0 sum, 1 mean, 2 max, 3 min. Output index = row-major over the kept runs.
 struct NormReduceParams {
-    uint kind; uint rcount; uint nk; uint nr;
+    uint kind; uint rcount; uint nk; uint nr; uint n_out;
     uint kdim[4]; uint kstr[4]; uint rdim[4]; uint rstr[4];
 };
 kernel void norm_reduce_f32(device const float* x [[buffer(0)]],
                             device float* out [[buffer(1)]],
                             constant NormReduceParams& p [[buffer(2)]],
-                            uint o [[threadgroup_position_in_grid]],
+                            uint gid [[thread_position_in_grid]],
+                            uint tg [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]]) {
+    const bool scalar = p.rcount <= 32;
+    const uint o = scalar ? gid : tg;
+    if (o >= p.n_out) return;
     ulong base = 0;
     uint rem = o;
     for (int i = int(p.nk) - 1; i >= 0; --i) {
@@ -30,7 +35,7 @@ kernel void norm_reduce_f32(device const float* x [[buffer(0)]],
         rem /= p.kdim[i];
     }
     float acc = p.kind == 2 ? -INFINITY : (p.kind == 3 ? INFINITY : 0.0f);
-    for (uint r = lane; r < p.rcount; r += 32) {
+    for (uint r = scalar ? 0u : lane; r < p.rcount; r += scalar ? 1u : 32u) {
         ulong off = base;
         if (p.nr == 1) {
             off += (ulong)r * p.rstr[0];
@@ -44,8 +49,11 @@ kernel void norm_reduce_f32(device const float* x [[buffer(0)]],
         float v = x[off];
         acc = p.kind < 2 ? acc + v : (p.kind == 2 ? max(acc, v) : min(acc, v));
     }
-    acc = p.kind < 2 ? simd_sum(acc) : (p.kind == 2 ? simd_max(acc) : simd_min(acc));
-    if (lane == 0) out[o] = p.kind == 1 ? acc / float(p.rcount) : acc;
+    if (!scalar) {
+        acc = p.kind < 2 ? simd_sum(acc) : (p.kind == 2 ? simd_max(acc) : simd_min(acc));
+        if (lane != 0) return;
+    }
+    out[o] = p.kind == 1 ? acc / float(p.rcount) : acc;
 }
 
 // Softmax along one axis of an [outer, n, inner] view; one threadgroup per (outer, inner) pair.
