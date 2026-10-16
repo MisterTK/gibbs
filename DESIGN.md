@@ -78,9 +78,9 @@ v1 values changed where AA failed as text: `MAHOGANY_DIM #8C6D46` (3.96:1) was s
 
 | Tier | Width | Layout |
 |:---|:---|:---|
-| Compact | < 100, or height < 20 | no sidebar; a bottom dock (`min(8, h/3)` rows) shows each component's one-line form |
-| Standard | 100–159 | one sidebar flow column, width `clamp(w·36/100, 40, 64)` |
-| Wide | ≥ 160 | two flow columns, total `clamp(w·40/100, 84, 120)`, each `(total−1)/2` |
+| Compact | < 100, or height < 20 | no sidebar; a bottom flex dock (`Flex { min: 0, basis: 3, max: 8, grow: 1, shrink: 2 }`) shows each component's one-line form |
+| Standard | 100–159 | one sidebar flow column solved by `flex()` (`Flex { min: 40, basis: 40, max: 64, grow: 9, shrink: 1 }` vs main `grow: 16`) |
+| Wide | ≥ 160 | two equal flow columns solved by `flex()` (`Flex { min: 83, basis: 84, max: 120, grow: 10, shrink: 1 }` vs main `grow: 15`, 1-cell gap) |
 
 Floor: 80×24 renders without panic; below 20 rows only the dock/status remain.
 
@@ -123,8 +123,8 @@ Generator: `cargo run --release --example gibbs_art` (deterministic; no randomne
 
 - **Pipe overlay** (source-normalized): mouth/stem start `(0.250, 0.430)`, stem end `(0.140, 0.470)`, bowl centre `(0.120, 0.485)`, bowl radius `0.030·source_width`; ember pixel at `(0.120, 0.455)`. Stem and bowl are class `p`, ember class `e`. In the SVG the pipe is painted SHADOW `#1A130C` (the photograph background is light; DIM `#A8895F` disappears against it).
 - **Smoke**: 6 frames, 5 puffs; puff `k` at frame `f`: `t=(f+1.2k) mod 6`, `y = ember_y − t·0.055·H`, `x = ember_x + 0.012·W·sin(0.9t + 1.7k)`, 1 px (2×2 when `t ≥ 3`), level `5 − floor(t/2)`. The ember is drawn over the smoke.
-- **Timings**: ember 2.4 s, 3 frames (`#FF8C00`, `#FF5500`, `#FFC040`), `steps(1,end)`; smoke 4.8 s, 6 frames (one visible per 0.8 s); scanline 6 s linear; roofline dash 3 s. Reduced motion = static frame 0.
-- **Outputs**: `assets/art/gibbs-sprite.txt` (TUI source of truth), `assets/art/gibbs-ascii.txt` (half-block text, ink when level ≥ 4), `assets/gibbs-portrait.svg`, `assets/gibbs-hero.svg`, and the README ASCII block between the `gibbs-ascii` markers. `assets/gibbs-hero-static.png` is produced separately (§6).
+- **Timings**: ember 2.4 s, 3 frames (`#FF8C00`, `#FF5500`, `#FFC040`), `steps(1,end)`; smoke 4.8 s, 6 frames (one visible per 0.8 s); scanline 6 s linear. Reduced motion = static frame 0.
+- **Outputs**: `assets/art/gibbs-sprite.txt` (TUI source of truth), `assets/art/gibbs-ascii.txt` (half-block text, ink when level ≥ 4), `assets/gibbs-portrait.svg`, `assets/gibbs-hero.svg`, `assets/gibbs-architecture.svg`, `assets/gibbs-roofline.svg`, and the README bench table between the `gibbs-bench` markers (from `autoresearch/bench-readme.jsonl` + `.meta.json` and `bench/loop.json`). `assets/gibbs-hero-static.png` is produced separately (§6).
 
 Sprite file: `GIBBS-SPRITE 1`, `size 48 60`, `rows`, 60 lines of 48 chars from `01234567pe`, then `smoke <f> x,y x,y …` for f = 0..5.
 
@@ -147,9 +147,9 @@ Each component has `compact` (the rows below) and `detail` (adds rows from the f
 |LOAD · `{pct:.0}%`|1 `{id}` + `{rate} MB/s · ETA {eta}`; 2 track `RESOLVE ▸ DOWNLOAD ▸ MAP ▸ COMPILE` (done JADE `✓`, current BRASS bold `[ ]`, rest DIM); 3 `gauge(pct, W−14)` + `{done}/{total} MB`; 4 `reencode {done}/{total} tensors` while re-encoding.|
 |AVATAR · state name|cameo from the sprite engine + one ticker line (state equation / `Flow ⚡`).|
 
-**Flow layout.** Fixed specs (min/pref/max height, priority): Load 7/7/7/0 (only while loading), Roofline 6/8/12/1, Tokens 5/6/8/2, Latency 5/6/8/3, Logprobs 6/8/12/4, Weights 5/7/12/5, Avatar 12/16/30/6 (only when the column is ≥ 24 wide and the area is ≥ 44 rows), Memory 4/4/6/7, Device 3/3/4/8. Components are stable-sorted by priority and placed at `min_h`; what does not fit goes to the next column, then is hidden; spare rows go to `pref_h`, then `max_h`. A focused component takes priority 0 with `pref_h = min(area.h, 24)`.
+**Flow layout.** Fixed specs (min/pref/max height, priority): Load 7/7/7/0 (only while loading), Roofline 6/8/12/1, Gap 4/6/7/2, Tokens 5/6/8/3, Latency 5/6/8/4, Logprobs 6/8/12/5, Weights 5/7/12/6, Avatar 12/16/30/7 (only when the column is ≥ 24 wide and the area is ≥ 44 rows), Memory 4/4/6/8, Device 4/4/6/9, Kernels 6/10/14/10. Components are stable-sorted by priority and placed at `min_h`; what does not fit goes to the next column, then is hidden; spare rows grow in priority order to `pref_h` (`flex-basis`), then proportionally via `flex()` toward `max_h`. A focused component takes priority 0 with `pref_h = min(area.h, 24)`.
 
-**Main column** (not sidebar): STATUS / REQUESTS (min 5, pref 8) / CONSOLE (flex) / LOG (`h ≥ 40 ? 5 : 3`) / KEYS (chips). In the Compact tier the dock shows each component's one-line form horizontally, e.g. `ROOF 91% ▕████████▏ · TOK 187 · p99 7.1 ms · KV 12%`.
+**Main column** (not sidebar): solved vertically by `layout::main_stack` via `flex()`: STATUS (`1`) / DETAIL (`8..24`, compact focus only) / REQUESTS (`4..8`, basis `5`, grow `1`) / CONSOLE (`3..∞`, basis `12`, grow `6`) / LOG (`2..5`, basis `3`, grow `1`) / KEYS (`1`). In the Compact tier the dock shows each component's one-line form horizontally, e.g. `ROOF 91% ▕████████▏ · TOK 187 · p99 7.1 ms · KV 12%`.
 
 **Mascot.** Rendered from the sprite with `▀` half-block cells (foreground = top pixel, background = bottom pixel), scaled with a box filter to the available area; below 12 px wide it falls back to the mini badge. Pipe DIM; ember cycles `#FF8C00,#FF5500,#FFC040` every 4 ticks (every 2 while Generating); smoke frame `(tick/4) % 6` at level 4.
 
@@ -157,10 +157,12 @@ Each component has `compact` (the rows below) and `detail` (adds rows from the f
 
 ## 6. README and web assets
 
-- **Hero**: `assets/gibbs-hero.svg` (viewBox `0 0 1200 440`): VOID rounded rect with a Double hairline frame (outer 2 px HAIRLINE, inner 1 px at 6 px inset), four 4×4 BRASS corner rivets; the dithered portrait (288×360 at `translate(40,40)`) with ember, smoke and a 288×2 BRASS scanline (opacity 0.18); caption in 11 px mono DIM; `GIBBS` wordmark in a high-contrast serif stack (`'Bodoni 72','Didot','Playfair Display','Bodoni MT',Georgia,'Times New Roman',serif`) with a BRASS→PARCHMENT gradient; subtitle `THERMODYNAMIC INFERENCE ENGINE` in tracked mono; four governing lines (labels DIM, values BRASS); a decorative 1 px CYANOTYPE roofline polyline; a faint (8% opacity) isometric wireframe `h(i,j)=0.6·sin(0.35i)·cos(0.3j)+0.012·(i−12)²` on a 24×24 grid, projected `x'=(i−j)·14, y'=(i+j)·7−h·40` (illustrative; labelled so in `<desc>`).
-- **Accessibility of the SVG**: `role="img"`, `aria-labelledby="gibbs-hero-title gibbs-hero-desc"`; keyframes use opacity, transform and stroke-dashoffset only (no `filter`); `@media (prefers-reduced-motion: reduce){.anim{animation:none!important}}`; the un-animated default state shows frame 0 of every layer.
+- **Hero**: `assets/gibbs-hero.svg` (viewBox `0 0 1200 440`): VOID rounded rect with a Double hairline frame (outer 2 px HAIRLINE, inner 1 px at 6 px inset), four 4×4 BRASS corner rivets; the dithered portrait (288×360 at `translate(40,40)`) with ember, smoke and a 288×2 BRASS scanline (opacity 0.18); caption in 11 px mono DIM at `(40,415)` and `(40,429)`; right panel with the `GIBBS` wordmark at `(380,156)` (120 px serif stack `'Bodoni 72','Didot','Playfair Display','Bodoni MT',Georgia,'Times New Roman',serif`, BRASS→PARCHMENT gradient), subtitle `METAL-NATIVE INFERENCE ENGINE` at `(384,196)` (18 px PARCHMENT, `0.3em` tracking), a `780×1` HAIRLINE rule at `(380,216)`, four 2×2 metric cells (`(380|780, 248|328)` 12 px DIM labels, `(380|780, 288|368)` 36 px values in tier/BRASS/CYANOTYPE), and a provenance footer at `(380,412)` (11 px DIM). No wireframe, decorative equations or non-clickable nav strip.
+- **Accessibility of the SVG**: `role="img"`, `aria-labelledby="gibbs-hero-title gibbs-hero-desc"`; keyframes use opacity and transform only (no `filter`); `@media (prefers-reduced-motion: reduce){.anim{animation:none!important}}`; the un-animated default state shows frame 0 of every layer.
 - **Static fallback**: `assets/gibbs-hero-static.png`, rasterized with `rsvg-convert -w 2400 assets/gibbs-hero.svg -o assets/gibbs-hero-static.png` (not a build dependency); the README `<picture>` serves it under `prefers-reduced-motion: reduce`.
-- **Terminal ASCII block**: `assets/art/gibbs-ascii.txt` framed by a Double box (width `art_width + 4`) between `<!-- gibbs-ascii:begin -->` and `<!-- gibbs-ascii:end -->` in `README.md`.
+- **Terminal ASCII art**: `assets/art/gibbs-ascii.txt` feeds the TUI only; the README does not embed it.
+- **Roofline chart**: `assets/gibbs-roofline.svg` (static, viewBox `0 0 1200 H` with `H = 160 + 40n + 80`, `role="img"`, `aria-labelledby="gibbs-roofline-title gibbs-roofline-desc"`): double HAIRLINE frame and BRASS rivets; serif geomean headline; one horizontal bar per non-errored `bench/loop.json` model coloured by efficiency tier (JADE ≥ 90%, GOLD 60–90%, EMBER 30–60%, CRIMSON < 30%) on a 600 px PLINTH track; dashed 1 px CYANOTYPE `90% TARGET` line at `x=900`; tier swatch legend and formula footer.
+- **Architecture diagram**: `assets/gibbs-architecture.svg` (static, viewBox `0 0 1200 560`, `role="img"`, `aria-labelledby="gibbs-arch-title gibbs-arch-desc"`): double HAIRLINE frame and BRASS rivets; 9 `176×80` PLINTH nodes on a 3-row grid (`Weights` → `Loaders` → `Graph IR` → `Passes` → focal BRASS `Metal executor`; dashed opt-in `Core ML → ANE` and `CPU executor`; `Surfaces` → `Scheduler` → `Metal executor`) with 8 orthogonal/rounded arrows and a path/placement legend.
 - **TUI screenshot**: `assets/tui-snapshot.png`, from the ignored test `snapshot_tui` (`GIBBS_TUI_SNAPSHOT=1`).
 - Wordmark font is a stack, not outlined glyphs; non-Apple viewers see Georgia/Times.
 

@@ -1,65 +1,112 @@
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="assets/gibbs-hero-static.png">
-  <img src="assets/gibbs-hero.svg" alt="Gibbs: thermodynamic inference engine; dithered 1895 portrait of J. Willard Gibbs with pipe smoke" width="100%">
+  <img src="assets/gibbs-hero.svg" alt="Gibbs: Metal-native inference engine; dithered 1895 portrait of J. Willard Gibbs beside measured decode figures" width="100%">
 </picture>
 
-[→ Quickstart](#quickstart) · [→ Backends](#backends) · [→ Verified models](#verified-models) · [→ TUI](#tui---tui-or-make-tui) · [→ HTTP API](#http-api) · [→ DESIGN.md](DESIGN.md)
-
-<!-- gibbs-ascii:begin -->
-```
-╔══════════════════════════════════════════════════╗
-║        ▄████████████████████████████████▀        ║
-║      ▄███████████████████████████████████▄       ║
-║     ███████████████████████████████████████▄     ║
-║    ▄████████████████████████████████████████▀    ║
-║   ▀███████████████████████▀██▀ ▀▀▀▀██████████▄   ║
-║   ▀█████████████████████▀ ▀█▀  ▄▄▄  ▀████████▄   ║
-║  ▄▀███████████████████▀   ▀   ▀▀█▀▀  █████████▀  ║
-║  █████████████████▀▀█          ██     █████████▄ ║
-║ ▀██████████ ██▀               ▀  █    █████████▄ ║
-║ ▀█████████████  ▄▄▄▄                  ██████████ ║
-║ █████████████   ██████                ██████████ ║
-║ █████████████   ▀███▀ ▀              ▄██████████ ║
-║ ████████████     ██                 ████████████ ║
-║ █████████████▄ ▄██▄               ▄█████████████ ║
-║ ██████████████▀                  ▄██████████████ ║
-║ ▀█████████████▀  ▄▀             ████████████████ ║
-║ ▀█████████████████ ▄            ████████████████ ║
-║ ▀█████████████████▀              ▀█████████████  ║
-║ ▀████████████████             ▀    ███████████▀  ║
-║   ▀███████████▀ ██       ▄█▀        ▀█████████▀  ║
-║   ▀███████████ ████▄▄▄██▀              ▀████▀    ║
-║   ▀██████████ ▀█▀  ▀██▀                 ▀▀██▀    ║
-║     ▀███████▀ ▄█▀                                ║
-║       ▀█████    ▄▄▀                              ║
-║       ▀████▀ ███▀                                ║
-║         ▀██▄███ ▀▀▀ ▄▄▄▄ ▄█▄                     ║
-║           ▀    ▄▄▄██████████▀▄█▄█▄▀ ▀            ║
-║               ▀▀▀█▀█▀█████████▀▀▀ ▀              ║
-║                 ▀ ▀ ▀█▀█▀█▀▀▀                    ║
-║                                                  ║
-╚══════════════════════════════════════════════════╝
-```
-<!-- gibbs-ascii:end -->
+[Performance](#performance) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Models](#models) · [Weight formats](#weight-formats) · [Usage](#usage) · [HTTP API](#http-api) · [Status](#status) · [DESIGN.md](DESIGN.md)
 
 > *"The whole is simpler than the sum of its parts."*
 > — **J. Willard Gibbs** (1839–1903), Professor of Mathematical Physics at Yale University
 
----
+Gibbs is an LLM inference engine in Rust for Apple Silicon. Models are described once in a graph IR and lowered to Metal kernels: every family except the DFlash/DSpark block drafters runs on the GPU, and there is no silent CPU fallback (`--backend cpu` is an explicit opt-in). Decode speed is measured against the machine's own memory-bandwidth roofline. Gibbs serves text, vision, audio, translation, classification, image and video models over OpenAI, OpenAI Responses, Anthropic and Ollama APIs, with a terminal dashboard and a CLI.
 
-### What is Gibbs?
+## Performance
 
-**Gibbs** is an architecture-agnostic, zero-overhead computational inference runtime and compiler built in Rust for universal hardware acceleration. Named after **Josiah Willard Gibbs**—the father of statistical mechanics, vector calculus, and thermodynamic potentials—the engine treats token generation and tensor contraction not as sequential interpreted kernel dispatches, but as an **irreversible thermodynamic flow toward minimum free energy ($dG \le 0$)**.
+<img src="assets/gibbs-roofline.svg" alt="Decode speed of each bench model as a percent of the memory-bandwidth roofline" width="100%">
 
-### The Maxwell-Gibbs 1873 Geometric Foundations
-In 1873, Gibbs published his seminal treatises *"Graphical Methods in the Thermodynamics of Fluids"* and *"A Method of Geometrical Representation of the Thermodynamic Properties of Substances by Means of Surfaces"*. James Clerk Maxwell at Cambridge was so captivated that he sculpted a physical 3D thermodynamic surface ($U = f(V, S)$) in plaster and brass and sent a cast copy across the Atlantic to Gibbs at Yale.
+<!-- gibbs-bench:begin -->
+| Model | Decode tok/s | % of roofline | Roofline tok/s | GPU ms/token | Host ms/token | Dispatches/token |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Gemma 4 E2B QAT · UD-Q2_K_XL | 135.3 | 37.9% | 357 | 6.93 | 0.46 | 662 |
+| Gemma 4 E2B · Q4_K_M | 106.4 | 52.7% | 202 | 8.96 | 0.44 | 665 |
+| Qwen3.5 2B · UD-Q4_K_XL | 112.7 | 48.9% | 231 | 8.38 | 0.49 | 448 |
+| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 38.7 | 58.4% | 66 | 25.49 | 0.35 | 610 |
+| Llama 3.2 1B · Q4_0 | 252.2 | 64.8% | 390 | 3.66 | 0.30 | 179 |
+| SmolLM2 135M · safetensors | 425.7 | 38.4% | 1108 | 1.97 | 0.38 | 333 |
+| Llama 3.2 1B · bnb 4-bit | 218.3 | 56.1% | 389 | 4.28 | 0.30 | 179 |
+| Gemma 4 26B-A4B · UD-IQ2_XXS | 66.7 | 48.8% | 137 | 14.58 | 0.41 | 1108 |
+| Gemma 4 E2B QAT · 4k context | 123.0 | 34.5% | 357 | 7.86 | 0.27 | 662 |
+| **Geomean** | | **47.9%** | | | | |
 
-In the Gibbs runtime:
-- **Autoregressive Generation**: Trajectory across the ruled geometric surface toward free-energy equilibrium ($dG \le 0$).
-- **Tensor Contraction**: Evaluated through Gibbs' vector mechanics and dyadics ($\mathbf{u} \otimes \mathbf{v}$) compiled directly to native SIMD / GPU matrix instructions.
-- **Instrument Aesthetics**: Designed per the canonical [**DESIGN.md**](DESIGN.md) specification: warm brass on obsidian with a cold cyanotype data channel, double-line hairline borders (`╔══╗║╚══╝`) and an engraved, dithered 1895 portrait of Gibbs.
+Apple M5 Pro, Metal, measured streaming ceiling 298.0 GB/s. Binary built from `57a08d4` (2026-10-15); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 135.3 tok/s against its 150 tok/s target.
+<!-- gibbs-bench:end -->
+
+System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
+
+```bash
+target/release/gibbs --bench bench/loop.json
+target/release/gibbs --bench-parity bench/loop.json
+cargo run --release --example gibbs_art   # regenerates the hero, charts and this table from autoresearch/bench-readme.jsonl
+```
+
+## Quickstart
+
+### Build
+```bash
+cargo build --release      # or: make release
+# Produces ./target/release/gibbs (also ./target/release/foundry-engine)
+
+make tui                   # build, then open the dashboard
+make tui ARGS="--model THUDM/glm-edge-1.5b-chat --port 8081"
+```
+
+### Run
+```bash
+# Defaults: --model HuggingFaceTB/SmolLM2-135M-Instruct, --port 8080, --backend auto (Metal on Apple Silicon), weights re-encoded per the Metal policy
+./target/release/gibbs --model HuggingFaceTB/SmolLM2-135M-Instruct --port 8080 --tui
+
+# GGUF checkpoint
+./target/release/gibbs --model unsloth/SmolLM2-135M-Instruct-GGUF --port 8080
+
+# CPU executor (explicit opt-in)
+./target/release/gibbs --model unsloth/SmolLM2-135M-Instruct-GGUF --backend cpu --port 8080
+```
+
+### Connect a coding agent
+Every API is a thin adapter over one generation path; any model name serves the loaded model and auth headers are ignored, so coding agents can use gibbs as a drop-in local backend while the TUI runs (`/connect` prints these with the real address):
+
+| Client | Point it at | API |
+| :--- | :--- | :--- |
+| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=gibbs claude` | Anthropic `/v1/messages` (+ `/v1/messages/count_tokens`), SSE |
+| Codex CLI | `~/.codex/config.toml`: `model_provider = "gibbs"`, `[model_providers.gibbs] base_url = "http://127.0.0.1:8080/v1"`, `wire_api = "responses"` | OpenAI `/v1/responses` (stateless; `previous_response_id` is a 400) |
+| opencode / Continue / aider / OpenAI SDKs | base URL `http://127.0.0.1:8080/v1`, any API key | OpenAI `/v1/chat/completions`, `/v1/completions` |
+| Ollama clients (`ollama run`, Open WebUI, …) | `OLLAMA_HOST=127.0.0.1:8080` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/version`, `GET`/`HEAD /` |
+
+## Architecture
+
+<img src="assets/gibbs-architecture.svg" alt="Gibbs architecture: weights, loaders, graph IR, passes, Metal executor; CPU and Core ML/ANE as opt-in placements; surfaces and scheduler" width="100%">
+
+The design describes every model once in a shared graph IR (`src/graph`) and has each executor run that description; weights are bound by name, so the same graph can also be fingerprinted. Models compile to a `GraphProgram` that places every node on Metal (or, with `--backend cpu`, on the CPU); System 1 additionally has a Core ML lowering for the Apple Neural Engine. [PLAN.md](PLAN.md) has the phases and the measurements behind the design.
+
+### Backends
+
+| `--backend` | What runs there |
+| :--- | :--- |
+| `auto` (default) | Resolves to Metal on Apple Silicon; to the CPU executor only on a host with no Metal device. |
+| `metal` | The default compute path. Every model family except the block drafters (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the six avenues tried per node (Metal kernel, decompose, dtype adapt, generated kernel, matmul primitive, Core ML/ANE), or with a family-gate error. A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
+| `cpu` | Explicit opt-in to the native CPU executor (NEON SIMD). It is the only way to run the DFlash/DFlash2/DSpark block drafters, and it is where the CPU weight-format measure/choose path runs. |
+| `ane` | System 1 only (`--backend ane --system1`) through Core ML; without `--system1` startup fails. |
+| `cuda`, `rocm`, `level-zero` | Stubs: a startup error, because no such hardware is available to build and verify them. |
+
+Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
+
+### Components
+
+| Box | Status |
+| :--- | :--- |
+| Graph IR, CPU executor | Built. System 1 runs on it. During the cutover its embeddings matched the old hand-written encoder's saved output bit-for-bit (4 texts); the old encoder is gone, so that check cannot be re-run. |
+| Graph builders | System 1, GraphLm and the other families in the [GPU coverage](#gpu-coverage) table run from their graph on Metal. The native CPU forward passes remain as the `--backend cpu` path and as the parity reference. |
+| Fingerprint pass | Built, on the IR. |
+| Host profile | Static detection (the startup banner), plus measured Metal micro-benchmarks run once per GPU and OS build and cached in `~/.cache/gibbs/host/`: MPP `matmul2d` checked against the CPU, dispatch cost, and GEMM timings that pick the GEMM kernel per shape. |
+| Weight-format selection | **Metal:** the re-encode policy (`--reencode`, see [Weight formats](#weight-formats)) picks each streamed matrix's format from the weight header (`src/model/reencode.rs`, `weight_format.rs`); a re-encode is accepted only if the GPU KL gate passes, and accepted encodings are cached. A Metal load never runs the CPU format probe. Variant ranking in the model picker uses a predicted decode tok/s from the GGUF/safetensors header and measured codec efficiencies (`src/model/variant.rs`, policies `fastest`, `fastest-4bit`, `best-quality`). The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy yet. **`--backend cpu` only:** the engine times one decoder layer's GEMVs in every format the CPU has kernels for (f32, f16, bf16, Q8_0, EXL3 3/4/5-bit, NVFP4, hybrid, Weightless Jesse), quantizes the formats that beat f32, teacher-forces a probe text, and takes the fastest whose mean KL from f32 stays ≤ 0.01 nats; the decision is cached per CPU, backend, weight file and engine build in `~/.cache/gibbs/host/`. |
+| Metal executor | `src/graph/metal.rs` and `src/graph/metal/ext/`: the forward pass in command buffers, activations in one arena planned from value lifetimes, three GEMM kernels (MetalPerformancePrimitives `matmul2d`, `simdgroup_matrix`, and one simdgroup per output column for few rows), online-softmax attention, pipelines cached in an `MTLBinaryArchive` under `~/.cache/gibbs/metal/`. 23 GGUF block formats decode on the GPU through MSL GEMV generated in `src/graph/codegen.rs` and `codec.rs` (bit-exact against the CPU dequantizer in `tests/codec_parity.rs`), plus hand kernels for Q4_0, Q8_0, IQ4_XS, IQ2_M, Q4_K, Q2_K, IQ3_S, repacked bitsandbytes NF4/FP4, FP8, MLX affine-4, int4 and NVFP4. A weight whose format has no GPU codec is dequantized to f32 at load (logged per tensor) and the load fails with `gpu-only:` if that tensor would exceed 2 GiB; the GraphLm re-encode policy may re-encode such weights instead. A decode indirect-command-buffer variant was measured (encoding is 2–3% of GPU time) and not adopted. A per-shape tuner (`src/graph/tune.rs`) times hand and generated GEMV variants and caches winners in `~/.cache/gibbs/host/tune-<device>.json`; winners measured under foreign GPU load are not persisted. |
+| Core ML → ANE | Built for System 1 (`src/graph/coreml.rs`): native lowering of BERT layers to MIL with rank-4 layout `[1, C, 1, S]`, 1×1 convolutions, multi-head attention with additive padding mask, exact GELU, LayerNorm with 1D `[C]` gamma/beta, external `weights/weight.bin` MILBlob storage, candidate buckets `[16, 64, 128, 256, 512]` scanned via `MLComputePlan`, and compiled `.mlmodelc` bundles cached under `~/.cache/gibbs/coreml/`. An earlier release measured 144/144 ops on the Neural Engine; that was not re-measured this sprint. |
+| Fusion | MLP megakernel pass (`src/graph/passes/megakernel.rs`: RmsNorm → gate/up → SwiGLU/GeGLU → down → residual in one step). The Metal planner adds dot epilogues, reduce-input fusion and horizontal batching of up to four independent RmsNorm/Rope steps (`FusionClass`, `batch_horizontal` in `src/graph/metal.rs`). `GIBBS_FUSION=xla` restricts planning to XLA's fusion classes for comparison. |
+| CUDA / ROCm / Level Zero | Stubs that return errors. |
 
 ### GPU coverage
+
+<details><summary>21 model families: 20 on Metal, block drafters CPU-only</summary>
 
 | family | status | unlowered ops |
 |:---|:---|:---|
@@ -85,26 +132,11 @@ In the Gibbs runtime:
 | VideoModelScope | GPU | — |
 | Audio | GPU | — |
 
-Generated by `cargo test --release --test cpu_free_matrix -- --nocapture`. `GPU` means two things only: the family's tiny synthetic fixture matches the native CPU forward on Metal (relative error 1e-7..1e-5) and the loader uses the Metal program. `DraftersBlock` (DFlash, DFlash2, DSpark block drafters) runs as host Rust and needs arbitrary-layer taps; it works with `--backend cpu`. Real-checkpoint verification on Metal exists only for the models listed under [Verified models](#verified-models); every other family (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-VL vision, MTP drafters, `.ninfer`, UNet/VAE/UNet3D, FLUX/SD3/Krea/Z-Image/Sana DiTs, LTX DiT, the audio conformer on other checkpoints) is verified on tiny synthetic fixtures only, because no real checkpoint was cached. Known refusal on Metal: fastText classifiers fail at load with a `gpu-only:` error (the `gemma4_unified` image/audio embedders and bidirectional image blocks run as Metal programs).
+Generated by `cargo test --release --test cpu_free_matrix -- --nocapture`. `GPU` means two things only: the family's tiny synthetic fixture matches the native CPU forward on Metal (relative error 1e-7..1e-5) and the loader uses the Metal program. `DraftersBlock` (DFlash, DFlash2, DSpark block drafters) runs as host Rust and needs arbitrary-layer taps; it works with `--backend cpu`. Real-checkpoint verification on Metal exists only for the models listed under [Verified on Metal](#verified-on-metal); every other family (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-VL vision, MTP drafters, `.ninfer`, UNet/VAE/UNet3D, FLUX/SD3/Krea/Z-Image/Sana DiTs, LTX DiT, the audio conformer on other checkpoints) is verified on tiny synthetic fixtures only, because no real checkpoint was cached. Known refusal on Metal: fastText classifiers fail at load with a `gpu-only:` error (the `gemma4_unified` image/audio embedders and bidirectional image blocks run as Metal programs).
 
-One graph IR lowers to Metal kernels; the executors and their status:
+</details>
 
-```
-                    Graph IR (SSA)  →  passes (decompose, dtype-adapt, MLP megakernel, arena planning)
-                                           │
-                 ┌─────────────────────────┼─────────────────────────┐
-                 ▼                         ▼                         ▼
-        Metal (default)            Core ML → ANE (System 1)    CPU executor (--backend cpu)
-     generated + hand MSL           MIL lowering of BERT        native forward passes
-                 │
-     CUDA / ROCm / Level Zero: stubs, startup error
-```
-
-Measured decode reaches 8–49% of the memory-bandwidth roofline on this sprint's local bench (geomean 29.0%; see [Measured performance](#measured-performance)).
-
-Gibbs serves text generation, translation, summarization, text classification, multimodal vision-language, text-to-image (Stable Diffusion, SDXL, SD3.5, Sana, FLUX), and System 1 embeddings and decisions over an OpenAI-style HTTP API, with a terminal dashboard and a CLI. Metal is the default backend; the list of families that run on the GPU is the [table above](#gpu-coverage).
-
-## How does Gibbs compare to vLLM and SGLang?
+### Compared with vLLM and SGLang
 
 Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter NVIDIA throughput, and Gibbs targets any machine latency.
 
@@ -118,50 +150,9 @@ Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter
 | Scheduler | Has a scheduler, KV blocks and an HTTP API. Concurrency is also at its design centre. | Core feature, and where most of their engineering goes. |
 | UX | Built-in TUI with roofline telemetry, a CLI, and a local model picker. | Server-first, with an OpenAI-compatible API and no TUI. |
 
-## Backends
+## Models
 
-| `--backend` | What runs there |
-| :--- | :--- |
-| `auto` (default) | Resolves to Metal on Apple Silicon; to the CPU executor only on a host with no Metal device. |
-| `metal` | The default compute path. Every model family except the block drafters (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the six avenues tried per node (Metal kernel, decompose, dtype adapt, generated kernel, matmul primitive, Core ML/ANE), or with a family-gate error. A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
-| `cpu` | Explicit opt-in to the native CPU executor (NEON SIMD). It is the only way to run the DFlash/DFlash2/DSpark block drafters, and it is where the CPU weight-format measure/choose path runs. |
-| `ane` | System 1 only (`--backend ane --system1`) through Core ML; without `--system1` startup fails. |
-| `cuda`, `rocm`, `level-zero` | Stubs: a startup error, because no such hardware is available to build and verify them. |
-
-Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
-
-### Architecture
-
-The design describes every model once in a shared graph IR (`src/graph`) and has each executor run that description; weights are bound by name, so the same graph can also be fingerprinted. Models compile to a `GraphProgram` that places every node on Metal (or, with `--backend cpu`, on the CPU); System 1 additionally has a Core ML lowering for the Apple Neural Engine. [PLAN.md](PLAN.md) has the phases and the measurements behind the design.
-
-```mermaid
-flowchart LR
-  W[GGUF / safetensors / ONNX] --> B[graph builder per model]
-  B --> IR[src/graph IR]
-  IR --> FP[fingerprint pass]
-  IR --> HP[host profile pass]
-  IR --> WF[weight-format selection]
-  IR --> F[fusion / megakernel pass]
-  F --> PL[placement pass]
-  PL --> CPU[CPU executor: nn.rs]
-  PL --> MTL[Metal executor]
-  PL --> CML[Core ML → ANE]
-  PL --> STUB[CUDA / ROCm / Level Zero stubs]
-```
-
-| Box | Status |
-| :--- | :--- |
-| Graph IR, CPU executor | Built. System 1 runs on it. During the cutover its embeddings matched the old hand-written encoder's saved output bit-for-bit (4 texts); the old encoder is gone, so that check cannot be re-run. |
-| Graph builders | System 1, GraphLm and the other families in the [GPU coverage](#gpu-coverage) table run from their graph on Metal. The native CPU forward passes remain as the `--backend cpu` path and as the parity reference. |
-| Fingerprint pass | Built, on the IR. |
-| Host profile | Static detection (the startup banner), plus measured Metal micro-benchmarks run once per GPU and OS build and cached in `~/.cache/gibbs/host/`: MPP `matmul2d` checked against the CPU, dispatch cost, and GEMM timings that pick the GEMM kernel per shape. |
-| Weight-format selection | **Metal:** the re-encode policy (`--reencode`, see [Weight files](#weight-files)) picks each streamed matrix's format from the weight header (`src/model/reencode.rs`, `weight_format.rs`); a re-encode is accepted only if the GPU KL gate passes, and accepted encodings are cached. A Metal load never runs the CPU format probe. Variant ranking in the model picker uses a predicted decode tok/s from the GGUF/safetensors header and measured codec efficiencies (`src/model/variant.rs`, policies `fastest`, `fastest-4bit`, `best-quality`). The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy yet. **`--backend cpu` only:** the engine times one decoder layer's GEMVs in every format the CPU has kernels for (f32, f16, bf16, Q8_0, EXL3 3/4/5-bit, NVFP4, hybrid, Weightless Jesse), quantizes the formats that beat f32, teacher-forces a probe text, and takes the fastest whose mean KL from f32 stays ≤ 0.01 nats; the decision is cached per CPU, backend, weight file and engine build in `~/.cache/gibbs/host/`. |
-| Metal executor | `src/graph/metal.rs` and `src/graph/metal/ext/`: the forward pass in command buffers, activations in one arena planned from value lifetimes, three GEMM kernels (MetalPerformancePrimitives `matmul2d`, `simdgroup_matrix`, and one simdgroup per output column for few rows), online-softmax attention, pipelines cached in an `MTLBinaryArchive` under `~/.cache/gibbs/metal/`. 23 GGUF block formats decode on the GPU through MSL GEMV generated in `src/graph/codegen.rs` and `codec.rs` (bit-exact against the CPU dequantizer in `tests/codec_parity.rs`), plus hand kernels for Q4_0, Q8_0, IQ4_XS, IQ2_M, Q4_K, Q2_K, IQ3_S, repacked bitsandbytes NF4/FP4, FP8, MLX affine-4, int4 and NVFP4. A weight whose format has no GPU codec is dequantized to f32 at load (logged per tensor) and the load fails with `gpu-only:` if that tensor would exceed 2 GiB; the GraphLm re-encode policy may re-encode such weights instead. A decode indirect-command-buffer variant was measured (encoding is 2–3% of GPU time) and not adopted. |
-| Core ML → ANE | Built for System 1 (`src/graph/coreml.rs`): native lowering of BERT layers to MIL with rank-4 layout `[1, C, 1, S]`, 1×1 convolutions, multi-head attention with additive padding mask, exact GELU, LayerNorm with 1D `[C]` gamma/beta, external `weights/weight.bin` MILBlob storage, candidate buckets `[16, 64, 128, 256, 512]` scanned via `MLComputePlan`, and compiled `.mlmodelc` bundles cached under `~/.cache/gibbs/coreml/`. An earlier release measured 144/144 ops on the Neural Engine; that was not re-measured this sprint. |
-| Fusion | Not implemented beyond the MLP megakernel pass and GEMM epilogues (`Op::Fused`, horizontal multi-GEMV and prologue/epilogue patterns do not exist). This is the main reason decode sits far below the roofline. |
-| CUDA / ROCm / Level Zero | Stubs that return errors. |
-
-## Verified models
+### Verified on Metal
 
 Verification status depends on where a model ran. **On Metal with a real checkpoint** (the only models whose GPU path has been checked end to end):
 
@@ -173,10 +164,15 @@ Verification status depends on where a model ran. **On Metal with a real checkpo
 | Qwen 3.5 9B IQ2_M (DavidAU MTP GGUF) | Text generation | Output is coherent; benchmarked below. |
 | `google-t5/t5-small` | Translation | `translate English to German: The house is wonderful.` → `Das Haus ist wunderbar.` at ~264 tok/s on Metal. |
 | Qwen-Image 2.1 Q4_0 DiT | One transformer forward | Relative error 1.5e-5 against the CPU forward. |
+| `bench/loop.json` models (Gemma 4 E2B QAT, Qwen3.5 2B, Llama 3.2 1B Q4_0, SmolLM2 135M, Llama 3.2 1B bnb 4-bit) | Text generation | `--bench-parity`: Metal program vs the CPU graph executor, min cosine 1.00000 over 8–16 decode steps (build `57a08d4`); decode speed in [Performance](#performance). |
 
 Everything else on Metal (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-VL vision, MTP drafters, `.ninfer`, UNet/VAE/UNet3D, FLUX/SD3/Krea/Z-Image/Sana DiTs, LTX DiT, the audio conformer on other checkpoints) is verified on tiny synthetic fixtures only; no real checkpoint was cached to run them.
 
-**Verified on the CPU executor (`--backend cpu`, or before the GPU-only default).** The table below records what ran on real weights, mostly on the native CPU forward passes; its rows say "CPU" where that is the case. Metal was not re-run on these checkpoints. The older tok/s and s/step figures in it are from earlier releases on a shared host and are not comparable to the [bench below](#measured-performance).
+### Verified on the CPU executor
+
+**Verified on the CPU executor (`--backend cpu`, or before the GPU-only default).** The table below records what ran on real weights, mostly on the native CPU forward passes; its rows say "CPU" where that is the case. Metal was not re-run on these checkpoints. The older tok/s and s/step figures in it are from earlier releases on a shared host and are not comparable to the [bench above](#performance).
+
+<details><summary>Real-weight checks on the CPU executor (33 rows)</summary>
 
 | Model | Task | Notes |
 | :--- | :--- | :--- |
@@ -215,9 +211,13 @@ Everything else on Metal (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-
 | `ali-vilab/text-to-video-ms-1.7b` | Text-to-video, 256×256, 16 frames, CLI only | 10 example clips judged by an independent Gemini verifier: 6 fully on-prompt, 4 coherent but missing a prompt detail, 0 broken. CC-BY-NC-4.0. |
 | `city96/LTX-Video-gguf` (Q4_0 + `LTX-Video-VAE-BF16.safetensors`), `city96/t5-v1_1-xxl-encoder-gguf` (Q4_K_M) | Text-to-video and image-to-video, LTX-Video v0.9.0 2B, 512×320, 9–25 frames, CLI and TUI | A 25-frame prompt clip shows the red balloon, meadow and sky asked for; image-to-video keeps the given first frame (PSNR 36.6 dB against the input after mp4 encoding). VAE encode→decode PSNR 31.3 dB on a procedural picture. No reference implementation run: checked by those outputs and by tests. |
 
-### Weight files
+</details>
+
+## Weight formats
 
 A GraphLm checkpoint loads projection by projection (never as one f32 model). On `--backend cpu` the engine then measures and picks the runtime weight format (see [Architecture](#architecture)). On Metal the **re-encode policy** (`--reencode max-speed|low-bit-native|bit-exact`, default `max-speed`, also `~/.cache/gibbs/settings.json`) decides each streamed matrix's format: `max-speed` re-encodes sources above 4.5 bits per weight (and sources the GPU has no codec for) to Q4_K, `low-bit-native` turns float sources into Q8_0, `bit-exact` runs the checkpoint's own blocks. A re-encode is accepted only if a teacher-forced probe through both programs, run on Metal, stays within the policy's mean KL (`max-speed` 0.10 nats and 90% top-1, others 0.01 and 99%; `--reencode-max-kl` overrides the KL limit); a rejection falls back to FFN-only, then `low-bit-native`, then `bit-exact`, logging `reencode: ... rejected (mean KL ..., top-1 ...%); trying ...`. Models above half of RAM, and any codec-less tensor (EXL3, GLQ, ...), are gated per tensor on relative RMSE ≤ 0.08 instead. Results are cached in `~/.cache/gibbs/reencoded/` keyed by file, policy and codec version. Gemma 4 and Qwen3.5 (native loaders) stream their GGUF blocks as stored and do not apply the policy yet. Native models (Qwen3.5/Qwen3-VL, Qwen3, HunYuan dense, Gemma 4, T5) memory-map their bf16 safetensors (single or sharded; Qwen3.5-0.8B serves with a 284 MB footprint) and run their own CPU kernels; they are chosen from `config.json` `model_type` before the GraphLm path. Native qwen3 also loads `*.gguf` with `general.architecture = qwen3`, and Gemma 4 `general.architecture = gemma4` with its `mmproj` (both dequantized to bf16); T5 loads safetensors, `.bin`, Flax and candle GGUF, with `tokenizer.json` or `spiece.model`.
+
+<details><summary>Every supported weight file format</summary>
 
 - **Safetensors**: one file, or sharded through `model.safetensors.index.json` (all shards are read into one buffer; Qwen3.5's `model.safetensors-00001-of-00001.safetensors` naming included). F32/F16/BF16/F8_E4M3/F8_E5M2 tensors decode natively.
 - **Pre-quantized safetensors**: bitsandbytes 4-bit (NF4/FP4, nested absmax; blocksize 64/128/256; 8-bit is refused); compressed-tensors `int-quantized` and `naive-quantized` (int8), `float-quantized` (FP8 per tensor, per channel, or 128×128 blocks), `pack-quantized` (int4/int8, symmetric or asymmetric, group or channel, activation-order `g_idx`), `nvfp4-pack-quantized` and `mxfp4-pack-quantized`; NVIDIA modelopt FP8 and NVFP4 (`quantization_config` or `hf_quant_config.json`); GPTQ and AWQ-GEMM 4-bit; gpt-oss `*_blocks` / `*_scales` MXFP4 pairs (exposed as one `[experts·rows, cols]` bank); BitNet `quant_method: "bitnet"` with `linear_class: "autobitlinear"` (2-bit packed, unpacked as transformers' `unpack_weights`). Sources that already are a GPU format are repacked without re-quantizing: MXFP4 (compressed-tensors and gpt-oss; Quark's fp4 keeps its own decoder) to ggml MXFP4 blocks (scale byte kept, nibbles reordered), and GPTQ/AWQ with group size 32/64/128 and no `g_idx` (or a sequential one) to int4 group blocks (`(nibble − zero)·scale`, f16 scale and zero; GPTQ's stored `zero − 1` is undone unless `checkpoint_format` is `gptq_v2`). Activation-ordered GPTQ, other group sizes and scales that are not exactly f16 are expanded to f32 and go through the re-encode policy. NVFP4 requested through `UniversalModelLoader::extract_tensor_as_quantized` stays an NVFP4 tensor holding the checkpoint's E4M3 block scales and global scale, uploaded verbatim; the GraphLm loader still expands NVFP4 to f32 and re-encodes it. The MXFP4, GPTQ/AWQ and NVFP4-source paths are checked on synthetic tensors only (bit-exact against the reference dequantization), not on a real checkpoint. GPTQ/AWQ other than 4-bit, AWQ gemv/marlin, GPTQ marlin or `dynamic`, sparse/marlin, rotated (`transform_config`), and BitNet `bitlinear` checkpoints are refused with the reason before any weight is read; the hub picker applies the same rule.
@@ -236,59 +236,22 @@ A GraphLm checkpoint loads projection by projection (never as one f32 model). On
 - **PyTorch pickle**: `pytorch_model.bin`, `*.pt`, `*.pth`, `*.ckpt`, and sharded `pytorch_model.bin.index.json`, in zip, legacy, and tar containers, read by a restricted unpickler that never runs code; `state_dict`/`model`/`model_state_dict`/`module.` wrappers are unwrapped. TorchScript archives (including rust-bert `.ot`) are refused.
 - **Flax** `flax_model.msgpack` (and `.index.json` shards), renamed to the PyTorch names with dense kernels transposed; **NumPy** `weights.npz` / `*.npy` (uncompressed `np.savez`/`mx.savez`). TF `tf_model.h5`, `.tflite`, and Core ML packages are not supported (named in the selection error).
 
+</details>
+
+### Which files are downloaded
+
 Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetches `config.json`, `tokenizer.json`, `tokenizer_config.json`, `generation_config.json`, `hf_quant_config.json`, `tokenizer.model`, `special_tokens_map.json`, `chat_template.jinja`, `chat_template.json`, `preprocessor_config.json`, and `processor_config.json` when present, and one weight set: the smallest at or above 4.5 bits per weight among GGUF files and single or sharded safetensors, else ONNX (smallest download), else a GGUF below 4.5 bpw, else PyTorch/Flax/NumPy weights (smallest download; optimizer, scheduler, trainer-state, and LoRA-adapter files are never weights). `GIBBS_QUANT` picks a specific file and never falls back; a GGUF size tag must match the file's own tag (`Q3_K_M` matches only `*q3_k_m*.gguf`).
 
-## Measured performance
+## Usage
 
-Apple M5 Pro, Metal, measured streaming ceiling 299.7 GB/s. Produced by `gibbs --bench bench/local.json` (64 decode tokens, median of 2 runs, greedy, `--reencode max-speed`); raw JSON in `autoresearch/bench-local-final.jsonl`. Roofline = ceiling ÷ bytes one decode step streams (streamed matrices after the re-encode policy; gather tables excluded; `bytes_basis: streamed` in the JSON).
+### Flags
 
-| Model | Decode tok/s | Roofline tok/s | % of roofline |
-| :--- | :--- | :--- | :--- |
-| gemma-4-E2B-it-qat-UD-Q2_K_XL | 96.8 | 368 | 26.3% |
-| gemma-4-E4B-it-qat-UD-Q2_K_XL | 61.3 | 124 | 49.2% |
-| Qwen3.5-9B IQ2_M (DavidAU MTP GGUF) | 37.4 | 99 | 37.8% |
-| Llama-3.2-1B-Instruct Q4_0 | 197.5 | 431 | 45.8% |
-| SmolLM2-135M-Instruct | 326.0 | 3962 | 8.2% |
-| Gemma-4-E2B HauhauCS Q2_K_P | 75.2 | 318 | 23.6% |
-| gemma-4-E2B-it Q4_0 (ggml-org) | 92.2 | 234 | 39.5% |
-| **geomean** | | | **29.0%** |
-
-The sprint's 150 tok/s target for Gemma 4 E2B QAT was **not met**: 96.8 tok/s measured. The per-step profile shows about 700 dispatches per token, among them 212 RmsNorm, 128 elementwise and 50 Rope steps that each run at under 3 GB/s. The gap is dispatch count and small-kernel latency, that is, fusion work that has not been done, not codec throughput.
-
-System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
-
-## Quickstart
-
-### Build
-```bash
-cargo build --release      # or: make release
-# Produces ./target/release/gibbs (also ./target/release/foundry-engine)
-
-make tui                   # build, then open the dashboard
-make tui ARGS="--model THUDM/glm-edge-1.5b-chat --port 8081"
-```
-
-### Text generation server
-```bash
-# Defaults: --model HuggingFaceTB/SmolLM2-135M-Instruct, --port 8080, --backend auto (Metal on Apple Silicon), weights re-encoded per the Metal policy
-./target/release/gibbs --model HuggingFaceTB/SmolLM2-135M-Instruct --port 8080 --tui
-
-# GGUF checkpoint
-./target/release/gibbs --model unsloth/SmolLM2-135M-Instruct-GGUF --port 8080
-
-# CPU executor (explicit opt-in)
-./target/release/gibbs --model unsloth/SmolLM2-135M-Instruct-GGUF --backend cpu --port 8080
-```
-
-### Flags and environment
-
-| Flag / env | Meaning |
+| Flag | Meaning |
 | :--- | :--- |
 | `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path. The kind of model comes from its files: a diffusers `model_index.json` (text-to-image or text-to-video), an SD/FLUX GGUF or single-file checkpoint or LoRA, a classifier `architectures` entry, a native `model_type` (Qwen3.5/Qwen3-VL, Qwen3, HunYuan dense, Gemma 4, T5/mT5/UMT5, Marian/M2M100/NLLB/MBart/FSMT/BART, Idefics3/SmolVLM), else a GraphLm causal LM. |
 | `--backend auto\|metal\|cpu\|ane\|cuda\|rocm\|level-zero` | The compute backend (default `auto`, which is Metal on Apple Silicon; see [Backends](#backends)). `cpu` is the only CPU opt-in; `ane` is for `--system1`; `cuda`, `rocm`, and `level-zero` fail at startup. A model or op with no Metal lowering fails at load with a `gpu-only:` report. The Metal pipeline cache and host profile go to `~/.cache/gibbs/`. |
 | `--quant <format>` | Forces a weight format: `uncompressed` (f32), `f16`, `bf16`, `q8_0`, `nvfp4`, `exl3-3`/`exl3-4`/`exl3-5`, `hybrid`, `turbo`, or `jesse`. A format the backend has no kernels for is an error; the Metal LLM path accepts only `uncompressed` here (use `--reencode` instead). Without it, Metal applies the re-encode policy and `--backend cpu` measures and picks (see [Architecture](#architecture)). |
-| `GIBBS_QUANT=<quant>` | Chooses which weight file to fetch: a GGUF quant (`Q4_K_M`, `IQ4_XS`, `FP16`, …) or an ONNX variant (`fp32`, `fp16`, `q4`, `q4f16`, `int8`, `uint8`, `quantized`, `bnb4`). Only a matching file is used. |
-| `--reencode max-speed\|low-bit-native\|bit-exact`, `--reencode-max-kl <nats>` | Metal weight re-encode policy and the mean-KL limit of its GPU gate; they override `reencode` / `reencode_max_kl` in `~/.cache/gibbs/settings.json` (see [Weight files](#weight-files)). |
+| `--reencode max-speed\|low-bit-native\|bit-exact`, `--reencode-max-kl <nats>` | Metal weight re-encode policy and the mean-KL limit of its GPU gate; they override `reencode` / `reencode_max_kl` in `~/.cache/gibbs/settings.json` (see [Weight formats](#weight-formats)). |
 | `--variant fastest\|fastest-4bit\|best-quality` | Which variant of a multi-file GGUF/safetensors repo to pick (default `fastest`), ranked by predicted decode tok/s from the file header and measured codec efficiencies. |
 | `--max-tokens <n>`, `--ctx <n>` (default 8192) | Generation length for `--prompt`, and the context length. |
 | `--bench <file.json>`, `--bench-parity <file.json>` | Run a benchmark suite (JSON lines with `decode_tok_s`, `roofline_pct`) or the Metal-vs-CPU parity suite, then exit. |
@@ -298,16 +261,32 @@ make tui ARGS="--model THUDM/glm-edge-1.5b-chat --port 8081"
 | `--seed <n>` | The image/video seed. Without it, a clock-based seed is used and printed so you can reproduce the run. |
 | `--prompt`, `--image`, `--output`, `--steps`, `--strength` (default 0.7), `--negative-prompt`, `--width`, `--height`, `--guidance` | Run one image generation from the CLI; steps, size and guidance default from the model. With an LLM, `--prompt` generates once and exits; with a classifier, `--prompt "text"` (or `"a \|\| b"`) prints the scores and exits. |
 | `--draft <repo>` | Attaches a speculative drafter (DFlash, DFlash2, DSpark, or a small LM with the same tokenizer). See [Speculative decoding](#speculative-decoding). |
-| `GIBBS_SPEC=off` | Disables speculative decoding (built-in MTP heads and `--draft`). |
-| `--frames` (default 16), `--guidance` (default 9.0), `--steps` (default 25), `--output <file.mp4>` | Text-to-video options (see [Text-to-video](#text-to-video-modelscope-from-the-cli)); LTX-Video has its own defaults, `--image` (first frame) and `--text-encoder`. |
+| `--frames` (default 16), `--guidance` (default 9.0), `--steps` (default 25), `--output <file.mp4>` | Text-to-video options (see [Text-to-video: ModelScope](#text-to-video-modelscope)); LTX-Video has its own defaults, `--image` (first frame) and `--text-encoder`. |
 | `--tui` | Opens the terminal dashboard. |
 | `--hf-token`, `--port`, `--storage` | Hugging Face auth, listen port, and storage backend. |
 
+### Environment variables
+
+| Variable | Effect |
+| :--- | :--- |
+| `GIBBS_QUANT=<quant>` | Chooses which weight file to fetch: a GGUF quant (`Q4_K_M`, `IQ4_XS`, `FP16`, …) or an ONNX variant (`fp32`, `fp16`, `q4`, `q4f16`, `int8`, `uint8`, `quantized`, `bnb4`). Only a matching file is used. |
+| `GIBBS_SPEC=off` | Disables speculative decoding (built-in MTP heads and `--draft`). |
+| `GIBBS_TUNE=off` (also `0`, `false`) | Keeps each weight format's default GEMV variant without running the per-shape tuner or reading the tune cache (`src/graph/tune.rs`). |
+| `GIBBS_TUNE_BUSY_PCT=<n>` | Device-utilization percent above which foreign GPU load is assumed and tuned winners are kept in-memory only instead of persisted (default `20`). |
+| `GIBBS_FUSION=xla` | Restricts the Metal planner to XLA's GPU fusion classes (elementwise chain, reduce-input, dot-epilogue, sibling same-kind), disabling horizontal batching for comparison (`src/graph/metal.rs`). |
+| `GIBBS_CB_CHUNK=<first>,<chunk>` | Steps encoded into the first Metal command buffer and into each subsequent buffer when a plan has at least 400 steps (default `24,160`; `0` encodes the whole forward pass in a single command buffer). |
+| `GIBBS_EXEC_ORDER_WEIGHTS=1` (also `on`, `true`) | Repacks Metal weight buffers in graph execution order at load time (experimental, off by default). |
+| `GIBBS_PROFILE_KERNELS=1` / `GIBBS_PROFILE_ROWS=<n>` | Prints a per-command-buffer kernel timing table by kind and the `<n>` slowest steps (default `10`) with effective GB/s and % of ceiling to stderr. |
+| `GIBBS_DUMP_PLAN=1` | Prints every planned Metal step index, name and kernel kind to stderr during `prepare_plan`. |
+| `GIBBS_TRACE_ENCODE=1` | Prints CPU command-buffer encode time (µs) and GPU execution time (ms) per decode step to stderr. |
+
+### Sampling and scheduling
+
 **Sampling defaults.** A request that omits `temperature`/`top_p` takes `generation_config.json`'s values when it sets them (`do_sample: false` means greedy), as vLLM does; configs silent on both keep the engine defaults. Encoder-decoders (T5 family, Marian/M2M100/NLLB/MBart/FSMT/BART) default to greedy. Seq2seq models whose generation_config sets `num_beams > 1` run beam search, which ignores sampling parameters (`max_tokens` and client disconnect still apply); greedy seq2seq configs decode and stream token by token. Generation stops on generation_config's `eos_token_id`s and the template's turn-end special tokens. OpenAI chat accepts `chat_template_kwargs` (e.g. `{"enable_thinking": false}`); Ollama `/api/chat` accepts `think: false`.
 
-There are no runtime tuning knobs. The engine sets serving parameters itself: the weight format is measured at load; a sequence ends at the model's context length; and the prompt tokens prefilled per scheduler step come from measured costs. While other sequences decode, a step's prefill is sized to cost about one decode round (at least one token); otherwise it is sized to about 100 ms. Prompts with the fewest remaining tokens go first, and the oldest prompt still prefilling keeps up to half of each step's budget, so a stream of short prompts cannot hold a long one back. On CPU, where one prompt token can cost more than a decode round, a stream's median gap between tokens went from 18.9 ms to 40.9 ms (p90 73 ms, max 300 ms) while a 481-token prompt was ingested.
+Serving parameters are measured, not configured: the weight format is measured at load; a sequence ends at the model's context length; and the prompt tokens prefilled per scheduler step come from measured costs. While other sequences decode, a step's prefill is sized to cost about one decode round (at least one token); otherwise it is sized to about 100 ms. Prompts with the fewest remaining tokens go first, and the oldest prompt still prefilling keeps up to half of each step's budget, so a stream of short prompts cannot hold a long one back. On CPU, where one prompt token can cost more than a decode round, a stream's median gap between tokens went from 18.9 ms to 40.9 ms (p90 73 ms, max 300 ms) while a 481-token prompt was ingested.
 
-### TUI (`--tui`, or `make tui`)
+### TUI
 
 One screen, redrawn on input and streamed output and every 250 ms otherwise; prompts and model loads run in the background, so the UI never blocks. Framed with double hairline borders (`BorderType::Double`) in the palette of [DESIGN.md](DESIGN.md): warm brass for compute, cyanotype blue for memory bandwidth, jade at the roofline. Panel titles carry their live headline metric. At 100 columns and up the instrument panels form a sidebar (two columns at 160 and up); below 100 columns a one-row-per-component dock replaces it.
 
@@ -334,6 +313,8 @@ One screen, redrawn on input and streamed output and every 250 ms otherwise; pro
 | `↑↓` / `j k`, `PgUp PgDn`, `Home End` | Scroll the console. |
 | `q` | Quit from the dashboard; `Ctrl-C` quits anywhere. |
 
+<details><summary>Model picker and console commands</summary>
+
 **Model picker.** Type to search the cached models, the verified models, and huggingface.co (through `curl`, 250 ms after the last key; `HF_TOKEN` is sent when set). The match is fuzzy: every space-separated term must appear in the repo id in order, e.g. `smol inst`, and letters can be left out (`smolm2 inst` finds SmolLM2-…-Instruct) because the picker also searches with shortened terms when a query has few hits; swapped or wrong letters still miss. Nothing is filtered by tag or pipeline: not-for-all-audiences and gated repos are listed (gated ones need `HF_TOKEN`). `Tab` cycles the sort between favorites (♥ likes, the default), most downloaded, and most recently updated; the header of the sorted column is bold, underlined and cyan, and that column is the secondary sort key for equal values elsewhere.
 
 The picker gives every refused repo a specific reason (remote code, custom PEFT head, non-transformers library, no config.json, unsupported pipeline, …). GGUF repos tagged for a non-generation task load when their llama.cpp architecture is llama, qwen2, qwen3, hunyuan-dense, qwen35 or gemma4; otherwise the row says `llama.cpp GGUF architecture 'X' (not supported; …)`. Native model types whose repo ships only GGUF weights and has no GGUF loader (qwen3_vl, idefics3, …) say `'X' loads from safetensors only; this repo's weights are GGUF`. Drafter repos show as attachable; `Enter` attaches one to the active model. Over the top 300 Hub repos per task, the picker allows: text-classification 245, translation 209, summarization 204, zero-shot-classification 191, text-to-image 111, feature-extraction 105, image-text-to-text 100, sentence-similarity 87, automatic-speech-recognition 40.
@@ -351,21 +332,16 @@ Prompt console commands:
 | `/connect` | Nothing; prints ready-to-paste setups for Claude Code, Codex, opencode/aider/Continue, and Ollama clients with the real listen address | Text |
 | `/agent claude\|codex\|opencode\|aider` | Starts that CLI pointed at this server in a new tmux window (inside tmux) or a new macOS Terminal window; otherwise prints the command | Text |
 
-`/video` (also `/vid`, `/t2v`) and `/i2v <image path> <prompt>` generate LTX-Video clips once an LTX-Video repo is loaded from the picker (see [Text-to-video and image-to-video](#text-to-video-and-image-to-video-ltx-video-v090)); without one they answer `no video model loaded`. ModelScope video is CLI-only.
+`/video` (also `/vid`, `/t2v`) and `/i2v <image path> <prompt>` generate LTX-Video clips once an LTX-Video repo is loaded from the picker (see [Text-to-video and image-to-video: LTX-Video v0.9.0](#text-to-video-and-image-to-video-ltx-video-v090)); without one they answer `no video model loaded`. ModelScope video is CLI-only.
+
+</details>
 
 ## HTTP API
 
 Engine failures return HTTP 500 with an error body in the schema's shape. With streaming, an engine error arrives as an event after the 200 response has started. Requests in flight when a model is hot-swapped, or when a scheduler step panics, end with such an error. A client that disconnects stops its generation on the next scheduler step. Requests for a capability that the loaded model does not provide return HTTP 400 (e.g. chat while a classifier is active, or an image sent to a text-only model). Request bodies up to 64 MB are accepted (base64 images).
 
-### Agent APIs: OpenAI, OpenAI Responses, Anthropic, Ollama
-Every API is a thin adapter over one generation path; any model name serves the loaded model and auth headers are ignored, so coding agents can use gibbs as a drop-in local backend while the TUI runs (`/connect` prints these with the real address):
-
-| Client | Point it at | API |
-| :--- | :--- | :--- |
-| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_AUTH_TOKEN=gibbs claude` | Anthropic `/v1/messages` (+ `/v1/messages/count_tokens`), SSE |
-| Codex CLI | `~/.codex/config.toml`: `model_provider = "gibbs"`, `[model_providers.gibbs] base_url = "http://127.0.0.1:8080/v1"`, `wire_api = "responses"` | OpenAI `/v1/responses` (stateless; `previous_response_id` is a 400) |
-| opencode / Continue / aider / OpenAI SDKs | base URL `http://127.0.0.1:8080/v1`, any API key | OpenAI `/v1/chat/completions`, `/v1/completions` |
-| Ollama clients (`ollama run`, Open WebUI, …) | `OLLAMA_HOST=127.0.0.1:8080` | `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/version`, `GET`/`HEAD /` |
+### Chat, completions and tool calls
+See [Connect a coding agent](#connect-a-coding-agent) for client setup across OpenAI, OpenAI Responses, Anthropic and Ollama endpoints.
 
 Tools reach the model's own chat template, and the model's tool-call output (Hermes/Qwen2.5 `<tool_call>`, Qwen3-Coder/Qwen3.5 XML, Llama-3.x JSON, Mistral `[TOOL_CALLS]`) comes back as structured calls in each schema's shape, streamed or not. `tool_choice` none/auto/required/named is honored: forced calls are prefixed into the assistant turn and validated, never invented. Client-side built-in tools the model cannot run (Codex `web_search`/`local_shell`, Anthropic server tools without `input_schema`) are left out of the prompt and named in the log; a `tool_choice` naming one is a 400, as is JSON mode (`response_format`, Ollama `format`). `stop`, `top_p`, `max_tokens`/`max_completion_tokens`/`max_output_tokens`/`num_predict`, and `stream_options.include_usage` are passed through.
 ```bash
@@ -424,7 +400,9 @@ curl http://localhost:8080/v1/decisions -H "Content-Type: application/json" -d '
   ]}'
 ```
 
-## Stable Diffusion 2.1 Turbo from the CLI
+## Images, video and speculative decoding
+
+### Stable Diffusion 2.1 Turbo
 gibbs picks image mode from the weights file itself. If the GGUF contains SD UNet and VAE tensors, it loads the SD pipeline and no LLM. The first run also fetches the CLIP `tokenizer.json`. Each run prints its seed.
 ```bash
 SD=gpustack/stable-diffusion-v2-1-turbo-GGUF
@@ -438,12 +416,14 @@ GIBBS_QUANT=FP16 ./target/release/gibbs --model $SD --prompt "a lighthouse on a 
 ./target/release/gibbs --model $SD --port 8080
 ```
 
-## Text-to-image from diffusers repos
-
+### Diffusers pipelines
 Loads diffusers `StableDiffusionPipeline`, `StableDiffusionXLPipeline`, `LatentConsistencyModelPipeline` (fp16 variant preferred), LDM single-file `.safetensors` for SD1/SD2/SDXL, kohya and diffusers/PEFT LoRAs merged onto the card's `base_model`, `StableDiffusion3Pipeline`, `SanaPipeline`, `ZImagePipeline`, and `FluxPipeline`/`ChromaPipeline`/`Flux2KleinPipeline` (also transformer-only FLUX GGUFs, single-file FLUX checkpoints and FLUX LoRAs, with the other components fetched from the card's `base_model`). Schedulers come from `scheduler_config.json`: Euler, EulerAncestral, PNDM, DDIM, LCM, DPM++ 2M (Karras); flow-matching Euler and DPM-Solver++ for the DiT pipelines. Each run prints its time per phase.
 ```bash
 ./target/release/gibbs --model stabilityai/sdxl-turbo --prompt "a raccoon in a priest robe" --output raccoon.png
 ```
+
+<details><summary>Notes</summary>
+
 - FLUX repos that name a BFL base (FLUX.1-schnell/dev) need the `HF_TOKEN` account to have accepted the BFL license. There is no mirror fallback; the error names the license URL.
 - Krea 2 (`krea/Krea-2-Turbo`, `krea/Krea-2-Raw`: `Krea2Pipeline`, 13B transformer + Qwen3-VL-4B + Qwen-Image VAE; bf16 only, on the CPU) is gated: accept the license at https://huggingface.co/krea/Krea-2-Turbo with the `HF_TOKEN` account. `Comfy-Org/Krea-2` is ComfyUI's ungated split-file distribution of the same weights (`diffusion_models/krea2_turbo_bf16.safetensors`, `text_encoders/`, `vae/`; turbo by default, Raw as `Comfy-Org/Krea-2/diffusion_models/krea2_raw_bf16.safetensors`); finetunes, city96-style GGUFs (`krea2` and mislabeled `qwen_image` architectures) and LoRAs of either base load on the base the card names. A base that is gated for the token is an error naming its license page; there is no mirror fallback. The float8/nvfp4/mxfp8/int8 ComfyUI quants load with `--quant` or `GIBBS_QUANT`.
 - Qwen-Image: `QwenImagePipeline` (60-block MMDiT, Qwen2.5-VL text encoder, true CFG) and `QwenImage21Pipeline` (32-block single-stream DiT, Qwen3-VL text encoder, RGBA VAE composited over white) load, as do transformer-only `qwen_image`/`qwen_image21` GGUFs and full-weight finetunes (text encoder, tokenizer and VAE come from the card's `base_model`). Not loaded: Qwen-Image-Edit (reference-image conditioning) and Qwen-Image LoRA adapters.
@@ -451,9 +431,12 @@ Loads diffusers `StableDiffusionPipeline`, `StableDiffusionXLPipeline`, `LatentC
 - SDXL peaks at ~12.3–13 GB for ~7 GB of fp16 weights. FLUX attention builds the full score matrix, so 1024² is slow.
 - These pipelines were verified on the CPU executor (including "on the CPU" above). They now default to Metal, where UNet, DiT and VAE programs are verified on tiny synthetic fixtures only; Qwen-Image 2.1 Q4_0 also matched the CPU on one real-weights forward. Use `--backend cpu` to reproduce the CPU timings.
 
-## Speculative decoding
+</details>
 
+### Speculative decoding
 Qwen3.5 checkpoints with an `mtp.*` head (`mtp_num_hidden_layers: 1`) decode speculatively by default; `--draft <repo>` (or `Enter` on a drafter row in the picker) attaches a DFlash, DFlash2 or DSpark drafter, or a small LM with the same tokenizer, to Qwen3.5 or GraphLm (Llama) targets. The target verifies k+1 positions in one forward; greedy output is identical to plain decoding, and sampled requests use rejection sampling, so the distribution is unchanged. k is picked from measured tokens/s and drops to k=0 (a plain forward) when drafting doesn't pay, so speculation is not meant to slow decoding; `GIBBS_SPEC=off` turns it off. `/metrics` reports `spec_drafted`, `spec_accepted`, `spec_forwards`, `spec_accept_rate`, `spec_tokens_per_forward`; the TUI Tokens component shows the acceptance percent.
+
+<details><summary>Measurements and limits</summary>
 
 Measured on the CPU executor (decode tok/s, shared host, all with the earlier k-tuner; the current tuner is checked only by unit tests and the Qwen3.5-0.8B MTP tests). MTP drafters have a Metal program verified on tiny fixtures only; DFlash/DFlash2/DSpark block drafters run with `--backend cpu` only:
 
@@ -467,18 +450,25 @@ Measured on the CPU executor (decode tok/s, shared host, all with the earlier k-
 
 Attached drafters run a 248k-vocabulary output layer per draft row, which costs more than it saves on this CPU. Refused: hidden-state drafters on Gemma 4 targets, fork-architecture `dflash` GGUF sidecars, MTP configs with more than one layer or dedicated embeddings, MiMo MTP, and the Gemma 4 assistant drafter. On image prompts MTP acceptance drops (37%), output stays exact.
 
-## Text-to-video (ModelScope) from the CLI
+</details>
+
+### Text-to-video: ModelScope
 gibbs picks video mode from the checkpoint: if the repo's `model_index.json` declares `TextToVideoSDPipeline`, it loads ModelScope's CLIP text encoder, UNet3D, and VAE from the repo's fp16 safetensors (about 3.7 GB, upcast to f32) and no LLM. A repo that is already cached is checked locally. Otherwise only `model_index.json` is fetched for the check. Sampling uses DDIM with classifier-free guidance against the empty prompt. Output is 256×256 at 8 fps, written by piping frames to `ffmpeg` (libx264), which must be on `PATH`. Each run prints its seed and the time of every step.
 ```bash
 ./target/release/gibbs --model ali-vilab/text-to-video-ms-1.7b --prompt "an astronaut riding a horse" \
   --frames 16 --steps 25 --guidance 9.0 --seed 42 --output astronaut.mp4
 ```
+
+<details><summary>Notes</summary>
+
 - `--output` is required and must end in `.mp4`. `--frames` accepts 16–24 (default 16) and `--steps` accepts 1–100. ModelScope is trained on 16-frame clips. 16 frames give coherent motion, though fine prompt details are often missed (4 of our 10 example clips lacked one). 24 frames gave coherent motion but drifted off-prompt in our one test, and 8 frames produced garbage. Lengths outside 16–24 are rejected; 12 and anything above 24 are untested.
 - ModelScope text-to-video is verified on the CPU executor; the UNet3D has a Metal program verified on a tiny fixture only. There is no HTTP or TUI video endpoint, and starting a video model without `--prompt` (server, daemon, or `--tui`) is an error.
 - Measured on an Apple M5 Pro CPU (15 threads), 16 frames, 25 steps, guidance 9: 19.4–20.7 s per step (CFG = 2 UNet passes), 485–518 s per clip, 2.6–5.4 s model load from cache (186 s on first run including the 3.7 GB download), peak RSS 10.0 GB (measured on an 8-frame run).
 - Expect ModelScope's training-data artifacts: a faint "shutterstock" watermark appears on many clips.
 
-## Text-to-video and image-to-video (LTX-Video v0.9.0)
+</details>
+
+### Text-to-video and image-to-video: LTX-Video v0.9.0
 
 > Status: the LTX DiT and VAE have a Metal program verified on tiny synthetic fixtures only. The description and measurements below (including "all on the CPU" and "minutes on the CPU") are from the CPU executor; reproduce them with `--backend cpu`.
 
@@ -490,19 +480,33 @@ gibbs picks video mode from the checkpoint: if the repo's `model_index.json` dec
 # image-to-video: the image becomes frame 0 (VAE latent, held at timestep 0)
 ./target/release/gibbs --model city96/LTX-Video-gguf --image first.png --prompt "The balloon rises into the sky" --frames 9 --output rise.mp4
 ```
+
+<details><summary>Notes</summary>
+
 - `--frames` must be 8k+1 (default 25), `--width`/`--height` multiples of 32 (default 512×320), `--steps` 1–200 (default 30), `--guidance` default 3 (CFG against `--negative-prompt`, default empty). The mp4 is 25 fps.
 - Only the v0.9.0 generation loads: the 2B `ltx-video-2b-v0.9-*.gguf` files and the v0.9.0 VAE (`LTX-Video-VAE-BF16.safetensors`, or `vae/` of `Lightricks/LTX-Video`). v0.9.1+, 0.9.5–0.9.8 and the 13B GGUFs (`wsbagnsv1/ltxv-13b-*`, `QuantStack/LTXV-13B-*`) need other VAE decoders (timestep conditioning, noise injection, wider blocks) and are refused with the file names found; `LTXConditionPipeline` repos and LTX-2.x are not implemented.
 - In the TUI, loading an LTX-Video repo from the picker enables `/video <prompt>` and `/i2v <image path> <prompt>` (25 frames, 512×320, 30 steps, written to the TUI scratch directory; no progress display, minutes on the CPU). The HTTP server has no video endpoint.
 - Measured on an Apple M5 Pro CPU (15 threads), Q4_0 transformer, 512×320, 25 frames (640 tokens), CFG: about 7 s per step on an idle host (2 transformer passes), 24 s VAE decode, 3.3 s to encode two prompts with the Q4_K_M T5. The 9-frame image-to-video example took 4.2 s per step and 0.8 s to encode the image.
 - Not exercised: `--model Lightricks/LTX-Video` (the diffusers-name transformer and 19 GB `text_encoder/` route; only a tiny synthetic checkpoint checks the name mapping) and `calcuis/ltxv-gguf` (file-name rules only). The image-to-video example conditions on a frame of the text-to-video clip, so it shows frame 0 is reproduced but not that the image steers later frames; image-to-video uses the posterior mode of the VAE encoder, not the reference's sampled latent. Output is only as good as v0.9.0 at this size: coherent and on-prompt with mild drift, and a faint text-like artifact in later image-to-video frames.
 
-## Implemented, not verified in this release
+</details>
+
+## Status
+
+### Known gaps
+- See [Performance](#performance) for which suite models are below the 90% roofline target.
+- The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy.
+- Real-weights verification on Metal covers only the models listed in [Verified on Metal](#verified-on-metal).
+- DFlash, DFlash2 and DSpark block drafters run on the CPU only (`--backend cpu`).
+- Idefics3 and Gemma 4 media prefill run one token at a time (~51 tok/s).
+- Convolution kernels reach about 0.55–0.59 TFLOP/s.
+
+### Not verified on real weights
 - `--storage s3://bucket/prefix` and `--storage gs://bucket/prefix` (also `gcs://`). Models still download from Hugging Face into the local HF cache (`HF_HUB_CACHE`, `HF_HOME/hub`, or `~/.cache/huggingface/hub`). After a fresh repository download, gibbs runs `aws s3 sync <snapshot> s3://bucket/prefix/<repo>` or `gcloud storage rsync <snapshot> gs://bucket/prefix/<repo>` and ignores failures. Nothing is read back from the bucket.
 - Krea 2: one image exists, a 1-step 256² Turbo render of "a red fox in the snow" from `Comfy-Org/Krea-2` (bf16, 45.5 s per step): a smooth, blurry orange blob on a pale background, no recognisable fox. It shows the path runs; it does not show the transformer is right (no ComfyUI/diffusers reference was run, and one step of an 8-step model is not expected to look like a fox). Not run: 512²/8 steps, Raw, `/v1/images/generations`, the TUI, LoRA/GGUF/finetune repos with real data. The gated `krea/Krea-2-*` repos were never downloaded (HF_TOKEN has not accepted the license). Checked on small real files: the VAE round trip (30.6 dB PSNR), the chat-template token counts, tensor tables of four LoRAs and three GGUFs.
 - Round of "load everything the picker refuses": not verified on real weights - a real 35B-A3B Qwen3.5-MoE (only the 14B-A3B REAP MXFP4 GGUF ran), `qwen4exp` quality (the tiny GGUF agrees with llama.cpp only at noise level, cosine 0.98 F16), the Gemma 4 12B GGUF (header-checked; E2B ran, cosine 0.99979 against llama.cpp), LTX-Video via the diffusers repo (19 GB T5; only a synthetic checkpoint checks the name mapping), `calcuis/ltxv-gguf` (file-name rules only), Qwen-Image 1 end to end, the speculative k-tuner on a real drafter, TUI attach of a GGUF drafter. Larger quantized native models are not smaller in memory: native loaders expand to bf16 whatever the file holds (only GGUF MoE expert banks stay packed).
-- Metal programs for every family in [GPU coverage](#gpu-coverage) except the models listed under "On Metal with a real checkpoint" in [Verified models](#verified-models): tiny synthetic fixtures only.
+- Metal programs for every family in [GPU coverage](#gpu-coverage) except the models listed under "On Metal with a real checkpoint" in [Verified on Metal](#verified-on-metal): tiny synthetic fixtures only.
 
-## Verified earlier, not re-verified on the merged build
 A 30 GB model-cache cap removed these models before the merged build could re-run them:
 - Z-Image-Turbo: never produced an image (unverified). Sana and SD3.5-medium produced images only before the final rebase.
 - FLUX.1-schnell bf16, FLUX LoRAs, Chroma, FLUX.2 klein, FLUX.1-dev: written and unit-tested, never run on real weights.
@@ -514,21 +518,15 @@ A 30 GB model-cache cap removed these models before the merged build could re-ru
 - The current speculative k-tuner on a real attached drafter (Qwen3.5-2B + DSpark).
 - Classifiers whose models were pruned (KoalaAI, ALBERT, CamemBERT, fastText, the GGUF rerankers, nest-sparrow) now SKIP in tests; they passed earlier.
 
-## Known gaps
-- Fusion is not implemented: no `Op::Fused`, no horizontal multi-GEMV, no prologue/epilogue patterns. The MLP megakernel pass is the only fusion. This is why decode sits at 29% of the roofline.
-- The hand GEMV kernels were not deleted; the generated ones are not faster.
-- The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy.
-- The autoresearch performance loop (`plans/research-sprint-2.md` S8) ran only its first iterations.
-- Real-weights verification on Metal covers only the models listed in [Verified models](#verified-models).
-- DFlash, DFlash2 and DSpark block drafters run on the CPU only (`--backend cpu`).
-- Idefics3 and Gemma 4 media prefill run one token at a time (~51 tok/s).
-- Convolution kernels reach about 0.55–0.59 TFLOP/s.
-
-## Tests
+## Tests and benchmarks
 ```bash
 cargo test --release
+scripts/loop_guard.sh
+python3 scripts/ab_screen.py <base-bin> <cand-bin> --rounds 3 --models 0
 ```
 Real-weight tests read models from `disk/` and print `SKIP: <reason>` when one is missing. Some take their inputs from the environment: `GIBBS_VLM_IMAGES=<dir>` (photos named cat/dog/eiffel/banana for `tests/vlm_tests.rs` and `tests/image_decode_tests.rs`), `GIBBS_GEMMA4_DIR` / `GIBBS_GEMMA4_GGUF_DIR` / `GIBBS_SMOLVLM_DIR` (checkpoint directories), `GIBBS_TEST_STORAGE=<cache>` (a second `--storage` cache the Qwen3/HunYuan/Qwen3.5 GGUF tests in `src/model/qwen3_5.rs` also search), and the BitNet tests also look in `/tmp/gibbs-models`.
 
+The optimization log is `autoresearch/roofline-loop.tsv` with notes in `autoresearch/roofline-loop-notes.md`.
+
 ## License
-Dual-licensed under [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+Dual-licensed under Apache License, Version 2.0 or MIT license, at your option.
