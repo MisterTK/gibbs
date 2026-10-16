@@ -64,6 +64,9 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
         QuantFormat::GGUF_IQ4_XS => Some(&WIDE_IQ4_XS),
         QuantFormat::GGUF_IQ4_NL => Some(&WIDE_IQ4_NL),
         QuantFormat::GGUF_IQ2_XXS => Some(&WIDE_IQ2_XXS),
+        QuantFormat::BNB_NF4_B64 => Some(&WIDE_BNB_NF4_B64),
+        QuantFormat::BNB_NF4_B128 => Some(&WIDE_BNB_NF4_B128),
+        QuantFormat::BNB_NF4_B256 => Some(&WIDE_BNB_NF4_B256),
         _ => None,
     }
 }
@@ -387,6 +390,34 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
     }
 }
 "#,
+};
+
+static WIDE_BNB_NF4_B64: Wide = Wide {
+    uniform: true,
+    groups: 4,
+    segs: 2,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return g * 16 + k * 8; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    uint2 q = *(device const packed_uint2*)(blk + 4 + g * 8);
+    for (uint w = 0; w < 2; w++) {
+        uchar4 b = as_type<uchar4>(q[w]);
+        for (uint j = 0; j < 4; j++) {
+            out[8 * w + 2 * j] = BNB_NF4[b[j] >> 4];
+            out[8 * w + 2 * j + 1] = BNB_NF4[b[j] & 0x0Fu];
+        }
+    }
+    out[16] = *(device const float*)blk;
+}
+"#,
+};
+static WIDE_BNB_NF4_B128: Wide = Wide {
+    groups: 8,
+    ..WIDE_BNB_NF4_B64
+};
+static WIDE_BNB_NF4_B256: Wide = Wide {
+    groups: 16,
+    ..WIDE_BNB_NF4_B64
 };
 
 pub const CODEC_Q4_0: Codec = Codec {
