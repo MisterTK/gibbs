@@ -1,5 +1,5 @@
-//! Terminal-size tiers and the sidebar `flow()` engine: components are placed by priority at
-//! their minimum height, then grown toward their preferred and maximum heights.
+//! Terminal-size tiers, 1D `flex()` solver, and the sidebar `flow()` engine: regions and
+//! columns resolve `min`/`basis`/`max` with `grow`/`shrink` weights instead of raw percentages.
 
 use ratatui::layout::Rect;
 
@@ -16,6 +16,168 @@ pub enum Comp {
     Device,
     Kernels,
     Load,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Flex {
+    pub min: u16,
+    pub basis: u16,
+    pub max: u16,
+    pub grow: u16,
+    pub shrink: u16,
+}
+
+impl Flex {
+    pub const fn new(min: u16, basis: u16, max: u16, grow: u16, shrink: u16) -> Self {
+        Self {
+            min,
+            basis,
+            max,
+            grow,
+            shrink,
+        }
+    }
+}
+
+/// Resolves 1D flexible lengths (CSS Flexbox §9.7) within `avail` with `gap` between active items.
+/// Returns `(offset, size)` in `0..=avail` for each item in `items`.
+pub fn flex(avail: u16, gap: u16, items: &[Flex]) -> Vec<(u16, u16)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut sz: Vec<u16> = items
+        .iter()
+        .map(|it| it.basis.clamp(it.min, it.max.max(it.min)))
+        .collect();
+    let active_gaps = |sz: &[u16]| -> u16 {
+        let n = sz.iter().filter(|&&s| s > 0).count();
+        gap.saturating_mul(n.saturating_sub(1) as u16)
+    };
+    let space = avail.saturating_sub(gap.saturating_mul(items.len().saturating_sub(1) as u16));
+
+    // Grow from basis toward max proportionally to `grow`.
+    loop {
+        let used: u16 = sz.iter().sum();
+        if used >= space {
+            break;
+        }
+        let rem = space - used;
+        let total_grow: u32 = items
+            .iter()
+            .enumerate()
+            .filter(|&(i, it)| sz[i] < it.max.max(it.min) && it.grow > 0)
+            .map(|(_, it)| u32::from(it.grow))
+            .sum();
+        if total_grow == 0 {
+            break;
+        }
+        let mut hit_cap = false;
+        let mut rems: Vec<(u32, u16, usize)> = Vec::new();
+        let mut used_step = 0u16;
+        for (i, it) in items.iter().enumerate() {
+            let cap = it.max.max(it.min).saturating_sub(sz[i]);
+            if cap == 0 || it.grow == 0 {
+                continue;
+            }
+            let num = u32::from(rem) * u32::from(it.grow);
+            let add = (num / total_grow) as u16;
+            if add >= cap {
+                sz[i] += cap;
+                used_step += cap;
+                hit_cap = true;
+            } else {
+                sz[i] += add;
+                used_step += add;
+                rems.push((num % total_grow, it.grow, i));
+            }
+        }
+        if !hit_cap {
+            rems.sort_by_key(|&(r, g, i)| (std::cmp::Reverse(r), std::cmp::Reverse(g), i));
+            let left = usize::from(rem.saturating_sub(used_step));
+            for (_, _, i) in rems.into_iter().take(left) {
+                sz[i] += 1;
+            }
+            break;
+        }
+    }
+
+    // Shrink from basis toward min proportionally to `shrink`.
+    loop {
+        let used: u16 = sz.iter().sum();
+        if used <= space {
+            break;
+        }
+        let over = used - space;
+        let total_shrink: u32 = items
+            .iter()
+            .enumerate()
+            .filter(|&(i, it)| sz[i] > it.min && it.shrink > 0)
+            .map(|(_, it)| u32::from(it.shrink))
+            .sum();
+        if total_shrink == 0 {
+            break;
+        }
+        let mut hit_floor = false;
+        let mut rems: Vec<(u32, u16, usize)> = Vec::new();
+        let mut cut_step = 0u16;
+        for (i, it) in items.iter().enumerate() {
+            let room = sz[i].saturating_sub(it.min);
+            if room == 0 || it.shrink == 0 {
+                continue;
+            }
+            let num = u32::from(over) * u32::from(it.shrink);
+            let cut = (num / total_shrink) as u16;
+            if cut >= room {
+                sz[i] -= room;
+                cut_step += room;
+                hit_floor = true;
+            } else {
+                sz[i] -= cut;
+                cut_step += cut;
+                rems.push((num % total_shrink, it.shrink, i));
+            }
+        }
+        if !hit_floor {
+            rems.sort_by_key(|&(r, s, i)| {
+                (
+                    std::cmp::Reverse(r),
+                    std::cmp::Reverse(s),
+                    std::cmp::Reverse(i),
+                )
+            });
+            let left = usize::from(over.saturating_sub(cut_step));
+            for (_, _, i) in rems.into_iter().take(left) {
+                sz[i] -= 1;
+            }
+            break;
+        }
+    }
+    // Hard clamp from the tail if sum(min) + gaps still exceeds `avail`.
+    for i in (0..sz.len()).rev() {
+        let total = sz.iter().sum::<u16>().saturating_add(active_gaps(&sz));
+        if total <= avail {
+            break;
+        }
+        let cut = (total - avail).min(sz[i]);
+        sz[i] -= cut;
+    }
+
+    let mut pos = 0u16;
+    let mut seen_nonzero = false;
+    sz.into_iter()
+        .map(|s| {
+            if s > 0 && seen_nonzero {
+                pos = pos.saturating_add(gap).min(avail);
+            }
+            let start = pos;
+            let len = s.min(avail.saturating_sub(start));
+            pos = start + len;
+            if len > 0 {
+                seen_nonzero = true;
+            }
+            (start, len)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,10 +245,11 @@ pub fn default_specs(col_w: u16, area_h: u16, loading: bool, focused: Option<Com
 
 /// Places `specs` into `columns` equal columns (1 cell apart) of `area`.
 pub fn flow(specs: &[Spec], area: Rect, columns: u16) -> Plan {
-    let n = columns.max(1);
-    let cw = area.width.saturating_sub(n - 1) / n;
-    let rects: Vec<Rect> = (0..n)
-        .map(|i| Rect::new(area.x + i * (cw + 1), area.y, cw, area.height))
+    let n = usize::from(columns.max(1));
+    let items: Vec<Flex> = vec![Flex::new(0, 1, u16::MAX, 1, 1); n];
+    let rects: Vec<Rect> = flex(area.width, 1, &items)
+        .into_iter()
+        .map(|(dx, cw)| Rect::new(area.x + dx, area.y, cw, area.height))
         .collect();
     flow_in(specs, &rects)
 }
@@ -114,13 +277,32 @@ fn flow_in(specs: &[Spec], cols: &[Rect]) -> Plan {
         }
     }
     let hidden = specs.len() - placed.len();
-    for target in [|s: &Spec| s.pref_h, |s: &Spec| s.max_h] {
-        for i in 0..placed.len() {
-            let (s, c, cur) = placed[i];
-            let want = target(s).max(cur);
-            let grow = (want - cur).min(h - used[c]);
-            used[c] += grow;
-            placed[i].2 = cur + grow;
+    // Pass 1: priority-ordered shrink/grow between `min_h` and `pref_h` (flex-basis).
+    for (s, c, cur) in &mut placed {
+        let want = s.pref_h.max(*cur);
+        let grow = (want - *cur).min(h - used[*c]);
+        used[*c] += grow;
+        *cur += grow;
+    }
+    // Pass 2: proportional flexbox grow from `pref_h` (`basis`) toward `max_h` per column.
+    for col_idx in 0..cols.len() {
+        let indices: Vec<usize> = (0..placed.len())
+            .filter(|&i| placed[i].1 == col_idx)
+            .collect();
+        if indices.is_empty() {
+            continue;
+        }
+        let items: Vec<Flex> = indices
+            .iter()
+            .map(|&i| {
+                let (s, _, cur) = placed[i];
+                let max_h = s.max_h.max(cur);
+                let grow = max_h.saturating_sub(cur).max(1);
+                Flex::new(cur, cur, max_h, grow, 1)
+            })
+            .collect();
+        for (idx, (_, sz)) in indices.into_iter().zip(flex(h, 0, &items)) {
+            placed[idx].2 = sz;
         }
     }
     let mut y = vec![first.y; cols.len()];
@@ -160,14 +342,53 @@ impl Regions {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MainStack {
+    pub detail: Option<Rect>,
+    pub requests: Option<Rect>,
+    pub console: Rect,
+    pub log: Rect,
+}
+
+/// Splits the main column vertically with `flex()` instead of fixed height thresholds.
+pub fn main_stack(
+    area: Rect,
+    show_requests: bool,
+    loading_compact: bool,
+    detail_compact: bool,
+) -> MainStack {
+    let want_detail = detail_compact && area.height >= 9;
+    let detail_flex = if want_detail {
+        Flex::new(8, 12, 24, 2, 1)
+    } else {
+        Flex::new(0, 0, 0, 0, 0)
+    };
+    let req_flex = if !show_requests || want_detail {
+        Flex::new(0, 0, 0, 0, 0)
+    } else if loading_compact {
+        Flex::new(5, 7, 7, 0, 1)
+    } else {
+        Flex::new(4, 5, 8, 1, 1)
+    };
+    let console_flex = Flex::new(3, 12, u16::MAX, 6, 1);
+    let log_flex = Flex::new(2, 3, 5, 1, 1);
+    let spans = flex(
+        area.height,
+        0,
+        &[detail_flex, req_flex, console_flex, log_flex],
+    );
+    let rect = |(dy, dh): (u16, u16)| Rect::new(area.x, area.y + dy, area.width, dh);
+    MainStack {
+        detail: (spans[0].1 > 0).then(|| rect(spans[0])),
+        requests: (spans[1].1 > 0).then(|| rect(spans[1])),
+        console: rect(spans[2]),
+        log: rect(spans[3]),
+    }
+}
+
 pub fn regions(area: Rect) -> Regions {
     let (x, y, w, h) = (area.x, area.y, area.width, area.height);
-    let status = Rect::new(x, y, w, h.min(1));
-    let keys_h = if h >= 2 { 1 } else { 0 };
-    let keys = Rect::new(x, y + h - keys_h, w, keys_h);
-    let mid_y = y + status.height;
-    let mid_h = h - status.height - keys_h;
-    // Short terminals get the dock layout whatever their width.
+    // Short or narrow terminals use the single-column Compact flex layout with a bottom dock.
     let tier = if w < 100 || h < 20 {
         Tier::Compact
     } else if w < 160 {
@@ -175,40 +396,84 @@ pub fn regions(area: Rect) -> Regions {
     } else {
         Tier::Wide
     };
-    let side_w = match tier {
-        Tier::Compact => 0,
-        Tier::Standard => (w * 36 / 100).clamp(40, 64),
-        // Two columns of (total − 1) / 2 and a one-cell gap, so `flow` splits the same way.
-        Tier::Wide => {
-            let total = (w * 40 / 100).clamp(84, 120);
-            2 * ((total - 1) / 2) + 1
-        }
-    };
+
+    let status_min = h.min(1);
+    let keys_min = u16::from(h >= 2);
     if tier == Tier::Compact {
-        let dock_h = (h / 3).min(8).min(mid_h);
-        let main = Rect::new(x, mid_y, w, mid_h - dock_h);
-        let dock = (dock_h > 0).then(|| Rect::new(x, mid_y + main.height, w, dock_h));
+        let v = flex(
+            h,
+            0,
+            &[
+                Flex::new(status_min, status_min, 1, 0, 0),
+                Flex::new(0, 12, u16::MAX, 2, 1),
+                Flex::new(0, 3, 8, 1, 2),
+                Flex::new(keys_min, keys_min, 1, 0, 0),
+            ],
+        );
+        let vrect = |(dy, dh): (u16, u16)| Rect::new(x, y + dy, w, dh);
+        let dock = (v[2].1 > 0).then(|| vrect(v[2]));
         return Regions {
             tier,
-            status,
-            main,
+            status: vrect(v[0]),
+            main: vrect(v[1]),
             sidebar: vec![],
             dock,
-            keys,
+            keys: vrect(v[3]),
         };
     }
-    let main_w = w - side_w;
-    let main = Rect::new(x, mid_y, main_w, mid_h);
-    let sx = x + main_w;
+
+    let v = flex(
+        h,
+        0,
+        &[
+            Flex::new(status_min, status_min, 1, 0, 0),
+            Flex::new(0, 18, u16::MAX, 1, 1),
+            Flex::new(keys_min, keys_min, 1, 0, 0),
+        ],
+    );
+    let status = Rect::new(x, y + v[0].0, w, v[0].1);
+    let (mid_y, mid_h) = (y + v[1].0, v[1].1);
+    let keys = Rect::new(x, y + v[2].0, w, v[2].1);
+
     let sidebar = if tier == Tier::Wide {
-        let c0 = (side_w - 1) / 2;
+        // Two sidebar columns (min 41, max 60 each, 1-cell gap) and main column solved via flex.
+        let h_spans = flex(
+            w,
+            0,
+            &[
+                Flex::new(76, 76, u16::MAX, 15, 1),
+                Flex::new(83, 84, 120, 10, 1),
+            ],
+        );
+        let c0 = (h_spans[1].1.saturating_sub(1)) / 2;
+        let side_w = 2 * c0 + 1;
+        let sx = x + w - side_w;
+        let cols = flex(
+            side_w,
+            1,
+            &[Flex::new(c0, c0, c0, 1, 1), Flex::new(c0, c0, c0, 1, 1)],
+        );
         vec![
-            Rect::new(sx, mid_y, c0, mid_h),
-            Rect::new(sx + c0 + 1, mid_y, c0, mid_h),
+            Rect::new(sx + cols[0].0, mid_y, cols[0].1, mid_h),
+            Rect::new(sx + cols[1].0, mid_y, cols[1].1, mid_h),
         ]
     } else {
-        vec![Rect::new(sx, mid_y, side_w, mid_h)]
+        let h_spans = flex(
+            w,
+            0,
+            &[
+                Flex::new(60, 60, u16::MAX, 16, 1),
+                Flex::new(40, 40, 64, 9, 1),
+            ],
+        );
+        vec![Rect::new(x + h_spans[1].0, mid_y, h_spans[1].1, mid_h)]
     };
+    let side_w = sidebar
+        .iter()
+        .copied()
+        .reduce(|a, b| a.union(b))
+        .map_or(0, |r| r.width);
+    let main = Rect::new(x, mid_y, w - side_w, mid_h);
     Regions {
         tier,
         status,
@@ -321,5 +586,31 @@ mod tests {
         assert!(default_specs(24, 44, false, None)
             .iter()
             .any(|s| s.comp == Comp::Avatar));
+    }
+
+    #[test]
+    fn flex_grows_and_shrinks_by_weights_and_caps() {
+        // Surplus distributes by `grow`, freezes at `max`, and spills remainder to uncapped items.
+        let grown = flex(
+            100,
+            0,
+            &[
+                Flex::new(40, 40, 50, 1, 1),
+                Flex::new(40, 40, u16::MAX, 1, 1),
+            ],
+        );
+        assert_eq!(grown, vec![(0, 50), (50, 50)]);
+        // Deficit shrinks proportionally by `shrink`, respecting `min`.
+        let shrunk = flex(
+            20,
+            0,
+            &[Flex::new(6, 12, 20, 1, 1), Flex::new(4, 12, 20, 1, 3)],
+        );
+        assert_eq!(shrunk, vec![(0, 11), (11, 9)]);
+        // Sidebar pass 2 distributes spare height across multiple components instead of first-wins.
+        let specs = default_specs(40, 30, false, None);
+        let roomy = flow(&specs[..2], Rect::new(0, 0, 40, 17), 1);
+        assert_eq!(roomy.rect(Comp::Roofline).unwrap().height, 10);
+        assert_eq!(roomy.rect(Comp::Gap).unwrap().height, 7);
     }
 }

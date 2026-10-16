@@ -89,12 +89,11 @@ impl TuiApp {
         let compact = r.tier == Tier::Compact;
         let loading = self.load.is_some();
         let mut main = r.main;
-        let mut show_requests = true;
         let mut hidden = 0;
 
         if compact {
             if let Some(dock) = r.dock {
-                // The dock takes the rows its content needs; the rest returns to the main column.
+                // The dock shrinks to its content height; unused flex rows return to `main`.
                 let need = self
                     .dock_lines(&v, &th, dock.width.saturating_sub(2) as usize)
                     .len() as u16
@@ -103,15 +102,6 @@ impl TuiApp {
                 main.height += dock.height - used;
                 let d = Rect::new(dock.x, dock.y + dock.height - used, dock.width, used);
                 self.render_dock(f, d, &v, &th);
-            }
-            if let Some(c) = self.detail {
-                let dh = (main.height * 2 / 3).min(24);
-                if dh >= 6 {
-                    let top = Rect::new(main.x, main.y, main.width, dh);
-                    main = Rect::new(main.x, main.y + dh, main.width, main.height - dh);
-                    self.render_comp(f, c, top, &v, &th);
-                    show_requests = false;
-                }
             }
         } else if let Some(side) = r.sidebar_area() {
             let cw = r.sidebar.first().map_or(0, |c| c.width);
@@ -124,29 +114,23 @@ impl TuiApp {
         }
         self.render_keys(f, r.keys, &th, hidden);
 
-        let log_h = if area.height >= 40 { 5 } else { 3 };
-        let req_h = if !show_requests {
-            0
-        } else if loading && compact {
-            7
-        } else if area.height >= 40 {
-            8
-        } else {
-            5
-        };
-        let [req, console, log] = Layout::vertical([
-            Constraint::Length(req_h),
-            Constraint::Min(3),
-            Constraint::Length(log_h),
-        ])
-        .areas(main);
-        match &self.load {
-            Some(l) if compact && show_requests => self.render_load(f, req, l, &th),
-            _ if show_requests => self.render_requests(f, req, &th),
-            _ => {}
+        let stack = layout::main_stack(
+            main,
+            true,
+            loading && compact,
+            compact && self.detail.is_some(),
+        );
+        if let (Some(c), Some(top)) = (self.detail, stack.detail) {
+            self.render_comp(f, c, top, &v, &th);
         }
-        self.render_console(f, console, &th);
-        self.render_log(f, log, &th);
+        if let Some(req) = stack.requests {
+            match &self.load {
+                Some(l) if compact => self.render_load(f, req, l, &th),
+                _ => self.render_requests(f, req, &th),
+            }
+        }
+        self.render_console(f, stack.console, &th);
+        self.render_log(f, stack.log, &th);
 
         if self.focus == Focus::Picker {
             let loading = self.load.as_ref().map(|l| l.id.as_str());
@@ -626,7 +610,8 @@ mod tests {
         let gpu = placement_modal_lines(&[row("Linear", Device::Metal, 4)]);
         assert!(gpu.iter().all(|l| !l.1), "{gpu:?}");
         assert_eq!(gpu.last().unwrap().0, "100% Metal");
-        let mixed = placement_modal_lines(&[row("Linear", Device::Metal, 3), row("Relu", Device::Cpu, 2)]);
+        let mixed =
+            placement_modal_lines(&[row("Linear", Device::Metal, 3), row("Relu", Device::Cpu, 2)]);
         let flagged: Vec<&str> = mixed.iter().filter(|l| l.1).map(|l| l.0.as_str()).collect();
         assert_eq!(flagged.len(), 2, "{mixed:?}");
         assert!(flagged[0].starts_with("Relu") && flagged[1] == "2 CPU nodes (of 5): Relu ×2");
