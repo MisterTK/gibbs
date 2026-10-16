@@ -3,7 +3,7 @@
   <img src="assets/gibbs-hero.svg" alt="Gibbs: Metal-native inference engine; dithered 1895 portrait of J. Willard Gibbs beside measured decode figures" width="100%">
 </picture>
 
-[Performance](#performance) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Models](#models) · [Weight formats](#weight-formats) · [Usage](#usage) · [HTTP API](#http-api) · [Status](#status) · [DESIGN.md](DESIGN.md)
+[Performance](#performance) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Models](#models) · [Weight formats](#weight-formats) · [Usage](#usage) · [HTTP API](#http-api) · [DESIGN.md](DESIGN.md)
 
 > *"The whole is simpler than the sum of its parts."*
 > — **J. Willard Gibbs** (1839–1903), Professor of Mathematical Physics at Yale University
@@ -17,18 +17,18 @@ Gibbs is an LLM inference engine in Rust for Apple Silicon. Models are described
 <!-- gibbs-bench:begin -->
 | Model | Decode tok/s | % of roofline | Roofline tok/s | GPU ms/token | Host ms/token | Dispatches/token |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Gemma 4 E2B QAT · UD-Q2_K_XL | 135.3 | 37.9% | 357 | 6.93 | 0.46 | 662 |
-| Gemma 4 E2B · Q4_K_M | 106.4 | 52.7% | 202 | 8.96 | 0.44 | 665 |
-| Qwen3.5 2B · UD-Q4_K_XL | 112.7 | 48.9% | 231 | 8.38 | 0.49 | 448 |
-| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 38.7 | 58.4% | 66 | 25.49 | 0.35 | 610 |
-| Llama 3.2 1B · Q4_0 | 252.2 | 64.8% | 390 | 3.66 | 0.30 | 179 |
-| SmolLM2 135M · safetensors | 425.7 | 38.4% | 1108 | 1.97 | 0.38 | 333 |
-| Llama 3.2 1B · bnb 4-bit | 218.3 | 56.1% | 389 | 4.28 | 0.30 | 179 |
-| Gemma 4 26B-A4B · UD-IQ2_XXS | 66.7 | 48.8% | 137 | 14.58 | 0.41 | 1108 |
-| Gemma 4 E2B QAT · 4k context | 123.0 | 34.5% | 357 | 7.86 | 0.27 | 662 |
-| **Geomean** | | **47.9%** | | | | |
+| Gemma 4 E2B QAT · UD-Q2_K_XL | 137.8 | 39.0% | 353 | 6.82 | 0.43 | 662 |
+| Gemma 4 E2B · Q4_K_M | 105.7 | 52.8% | 200 | 9.01 | 0.45 | 665 |
+| Qwen3.5 2B · UD-Q4_K_XL | 109.9 | 47.1% | 233 | 8.62 | 0.48 | 458 |
+| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 38.3 | 58.3% | 66 | 25.84 | 0.27 | 610 |
+| Llama 3.2 1B · Q4_0 | 247.2 | 64.0% | 386 | 3.74 | 0.31 | 179 |
+| SmolLM2 135M · safetensors | 422.1 | 38.5% | 1098 | 1.98 | 0.39 | 333 |
+| Llama 3.2 1B · bnb 4-bit | 218.3 | 56.6% | 386 | 4.28 | 0.30 | 179 |
+| Gemma 4 26B-A4B · UD-IQ2_XXS | 69.3 | 51.1% | 135 | 14.03 | 0.41 | 1108 |
+| Gemma 4 E2B QAT · 4k context | 123.9 | 35.1% | 353 | 7.78 | 0.29 | 662 |
+| **Geomean** | | **48.2%** | | | | |
 
-Apple M5 Pro, Metal, measured streaming ceiling 298.0 GB/s. Binary built from `57a08d4` (2026-10-15); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 135.3 tok/s against its 150 tok/s target.
+Apple M5 Pro, Metal, measured streaming ceiling 295.2 GB/s. Binary built from `792ceb0` (2026-10-16); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 137.8 tok/s against its 150 tok/s target.
 <!-- gibbs-bench:end -->
 
 System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
@@ -164,7 +164,7 @@ Verification status depends on where a model ran. **On Metal with a real checkpo
 | Qwen 3.5 9B IQ2_M (DavidAU MTP GGUF) | Text generation | Output is coherent; benchmarked below. |
 | `google-t5/t5-small` | Translation | `translate English to German: The house is wonderful.` → `Das Haus ist wunderbar.` at ~264 tok/s on Metal. |
 | Qwen-Image 2.1 Q4_0 DiT | One transformer forward | Relative error 1.5e-5 against the CPU forward. |
-| `bench/loop.json` models (Gemma 4 E2B QAT, Qwen3.5 2B, Llama 3.2 1B Q4_0, SmolLM2 135M, Llama 3.2 1B bnb 4-bit) | Text generation | `--bench-parity`: Metal program vs the CPU graph executor, min cosine 1.00000 over 8–16 decode steps (build `57a08d4`); decode speed in [Performance](#performance). |
+| `bench/loop.json` models (Gemma 4 E2B QAT, Qwen3.5 2B, Llama 3.2 1B Q4_0, SmolLM2 135M, Llama 3.2 1B bnb 4-bit) | Text generation | `--bench-parity`: Metal program vs the CPU graph executor, min cosine 1.00000 over 8–16 decode steps (build `792ceb0`); decode speed in [Performance](#performance). |
 
 Everything else on Metal (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-VL vision, MTP drafters, `.ninfer`, UNet/VAE/UNet3D, FLUX/SD3/Krea/Z-Image/Sana DiTs, LTX DiT, the audio conformer on other checkpoints) is verified on tiny synthetic fixtures only; no real checkpoint was cached to run them.
 
@@ -470,8 +470,6 @@ gibbs picks video mode from the checkpoint: if the repo's `model_index.json` dec
 
 ### Text-to-video and image-to-video: LTX-Video v0.9.0
 
-> Status: the LTX DiT and VAE have a Metal program verified on tiny synthetic fixtures only. The description and measurements below (including "all on the CPU" and "minutes on the CPU") are from the CPU executor; reproduce them with `--backend cpu`.
-
 `--model city96/LTX-Video-gguf` (or `calcuis/ltxv-gguf`, any hub repo whose GGUF architecture is `ltxv` and whose card names an `LTXPipeline` base such as `Lightricks/LTX-Video`) runs LTX-Video 2B: a T5-XXL text encoder, the 28-block video DiT (adaLN-single, RMS-normed q/k, 3-axis RoPE, flow-matching Euler with dynamic shifting and the 0.1 terminal stretch) and the causal 3D VAE. `--model Lightricks/LTX-Video` runs the diffusers `LTXPipeline` repo itself. The transformer GGUF stays quantized and mapped (decoded per GEMM panel). With a GGUF transformer the text encoder defaults to the Q4_K_M `city96/t5-v1_1-xxl-encoder-gguf` (2.9 GB, ComfyUI `t5encoder` names); `--text-encoder org/repo[/file.gguf]` picks another quant, and a diffusers repo uses `text_encoder/`.
 
 ```bash
@@ -490,33 +488,6 @@ gibbs picks video mode from the checkpoint: if the repo's `model_index.json` dec
 - Not exercised: `--model Lightricks/LTX-Video` (the diffusers-name transformer and 19 GB `text_encoder/` route; only a tiny synthetic checkpoint checks the name mapping) and `calcuis/ltxv-gguf` (file-name rules only). The image-to-video example conditions on a frame of the text-to-video clip, so it shows frame 0 is reproduced but not that the image steers later frames; image-to-video uses the posterior mode of the VAE encoder, not the reference's sampled latent. Output is only as good as v0.9.0 at this size: coherent and on-prompt with mild drift, and a faint text-like artifact in later image-to-video frames.
 
 </details>
-
-## Status
-
-### Known gaps
-- See [Performance](#performance) for which suite models are below the 90% roofline target.
-- The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy.
-- Real-weights verification on Metal covers only the models listed in [Verified on Metal](#verified-on-metal).
-- DFlash, DFlash2 and DSpark block drafters run on the CPU only (`--backend cpu`).
-- Idefics3 and Gemma 4 media prefill run one token at a time (~51 tok/s).
-- Convolution kernels reach about 0.55–0.59 TFLOP/s.
-
-### Not verified on real weights
-- `--storage s3://bucket/prefix` and `--storage gs://bucket/prefix` (also `gcs://`). Models still download from Hugging Face into the local HF cache (`HF_HUB_CACHE`, `HF_HOME/hub`, or `~/.cache/huggingface/hub`). After a fresh repository download, gibbs runs `aws s3 sync <snapshot> s3://bucket/prefix/<repo>` or `gcloud storage rsync <snapshot> gs://bucket/prefix/<repo>` and ignores failures. Nothing is read back from the bucket.
-- Krea 2: one image exists, a 1-step 256² Turbo render of "a red fox in the snow" from `Comfy-Org/Krea-2` (bf16, 45.5 s per step): a smooth, blurry orange blob on a pale background, no recognisable fox. It shows the path runs; it does not show the transformer is right (no ComfyUI/diffusers reference was run, and one step of an 8-step model is not expected to look like a fox). Not run: 512²/8 steps, Raw, `/v1/images/generations`, the TUI, LoRA/GGUF/finetune repos with real data. The gated `krea/Krea-2-*` repos were never downloaded (HF_TOKEN has not accepted the license). Checked on small real files: the VAE round trip (30.6 dB PSNR), the chat-template token counts, tensor tables of four LoRAs and three GGUFs.
-- Round of "load everything the picker refuses": not verified on real weights - a real 35B-A3B Qwen3.5-MoE (only the 14B-A3B REAP MXFP4 GGUF ran), `qwen4exp` quality (the tiny GGUF agrees with llama.cpp only at noise level, cosine 0.98 F16), the Gemma 4 12B GGUF (header-checked; E2B ran, cosine 0.99979 against llama.cpp), LTX-Video via the diffusers repo (19 GB T5; only a synthetic checkpoint checks the name mapping), `calcuis/ltxv-gguf` (file-name rules only), Qwen-Image 1 end to end, the speculative k-tuner on a real drafter, TUI attach of a GGUF drafter. Larger quantized native models are not smaller in memory: native loaders expand to bf16 whatever the file holds (only GGUF MoE expert banks stay packed).
-- Metal programs for every family in [GPU coverage](#gpu-coverage) except the models listed under "On Metal with a real checkpoint" in [Verified on Metal](#verified-on-metal): tiny synthetic fixtures only.
-
-A 30 GB model-cache cap removed these models before the merged build could re-run them:
-- Z-Image-Turbo: never produced an image (unverified). Sana and SD3.5-medium produced images only before the final rebase.
-- FLUX.1-schnell bf16, FLUX LoRAs, Chroma, FLUX.2 klein, FLUX.1-dev: written and unit-tested, never run on real weights.
-- Gemma-4 GLQ: no Gemma-4 GLQ model loaded end to end (e8p was checked only on extracted 12B layers, min cosine 0.973).
-- Gemma 4 12B: real-weight runs were on the pre-rebase tree; the TUI with `@` attachments was never run. Gemma 4 MLX vision has not been rerun since a layout fix.
-- `davidburhans/gevva-e2b` (Gemma 4 classifier): does not match its card (wrong top class on the card's Medication X example; accuracy 0.839 on every 10th test item vs the repo's 0.8195).
-- OTel-LLM-8.3B-Classification: loads and runs; accuracy not measured.
-- Qwen-Image 2.1 ran end to end only through a test harness: a Viggle Q4_K_M GGUF, the official VAE and a quantized stand-in for the text encoder (512², 6 steps). Never run (disk cap): `qwen_image::load_derived` (GGUF or finetune repo plus the text encoder, tokenizer and VAE fetched from `base_model`), `--model <gguf repo>` from the CLI/TUI, the diffusers-directory path, `Qwen3Encoder::open` on the 8B safetensors, the abenzerps GGUF, and Qwen-Image 1 end to end (20B transformer). Qwen-Image 1 was checked on real weights only for block 0 + globals (bf16 vs a JS reference), city96's GGUF per tensor on block 0, the tokenizer, and the Qwen2 decoder on Qwen2.5-0.5B.
-- The current speculative k-tuner on a real attached drafter (Qwen3.5-2B + DSpark).
-- Classifiers whose models were pruned (KoalaAI, ALBERT, CamemBERT, fastText, the GGUF rerankers, nest-sparrow) now SKIP in tests; they passed earlier.
 
 ## Tests and benchmarks
 ```bash
