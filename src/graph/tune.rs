@@ -12,6 +12,9 @@ use std::path::Path;
 pub enum GemvKernel {
     /// The hand-written kernel of `metal_kernels.metal` (formats that have one).
     Hand,
+    /// The hand kernel that gives each weight block to several lanes (short or odd-length rows keep every
+    /// lane busy); formats that have one.
+    HandSplit,
     /// The kernel generated from the format's codec (`codegen::gemv_packed`).
     Gen,
 }
@@ -32,16 +35,21 @@ impl GemvVariant {
         kernel: GemvKernel::Hand,
         rows_per_sg: 0,
     };
+    pub const HAND_SPLIT: Self = Self {
+        kernel: GemvKernel::HandSplit,
+        rows_per_sg: 0,
+    };
     pub const fn generated(rows_per_sg: u8) -> Self {
         Self {
             kernel: GemvKernel::Gen,
             rows_per_sg,
         }
     }
-    /// `hand` or `gen/r4`.
+    /// `hand`, `hand/split`, or `gen/r4`.
     pub fn label(&self) -> String {
         match self.kernel {
             GemvKernel::Hand => "hand".into(),
+            GemvKernel::HandSplit => "hand/split".into(),
             GemvKernel::Gen => format!("gen/r{}", self.rows_per_sg),
         }
     }
@@ -56,14 +64,20 @@ pub const BUSY_PCT: u32 = 20;
 /// has run any tuning kernel (a later sample would include its own earlier benchmarks, and the
 /// utilization counter is a trailing average, so one reading per process is the only clean one).
 pub fn foreign_busy() -> bool {
-    static BUSY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *BUSY.get_or_init(|| {
+    static BUSY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         let limit = std::env::var("GIBBS_TUNE_BUSY_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(BUSY_PCT);
+        if !gpu_utilization().is_some_and(|u| u > limit) {
+            return false;
+        }
+        // IOAccelerator utilization is a ~1 s trailing average: wait once so a just-exited peer
+        // benchmark process decays to idle before classifying the GPU as foreign-busy.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
         gpu_utilization().is_some_and(|u| u > limit)
-    })
+    });
+    *BUSY
 }
 
 /// The `Device Utilization %` field of an `ioreg -r -d 1 -c IOAccelerator` dump.
@@ -104,6 +118,48 @@ pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
         .filter(|t| t.1 >= best * (1.0 - TIE))
         .map(|t| t.0)
         .min_by_key(|v| (v.rows_per_sg, v.kernel == GemvKernel::Gen))
+}
+
+/// Under foreign GPU load an alternative must beat the default's throughput by this fraction in every
+/// measurement round: contended timings differ from a quiet GPU's by more than the 1% tie band.
+pub const BUSY_MARGIN: f64 = 0.08;
+
+/// The variant to use from `rounds` of timings (`GB/s`, each round measuring the variants in another
+/// order). A quiet GPU takes [`choose`] over the first round. A `busy` GPU keeps `default` (the proven
+/// variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round; among
+/// those the one with the best worst-round ratio wins. `None`: no usable timing.
+pub fn decide(
+    rounds: &[Vec<(GemvVariant, f64)>],
+    default: GemvVariant,
+    busy: bool,
+) -> Option<GemvVariant> {
+    let first = rounds.first()?;
+    if !busy {
+        return choose(first);
+    }
+    let rate = |round: &[(GemvVariant, f64)], v: GemvVariant| {
+        round
+            .iter()
+            .find(|t| t.0 == v)
+            .map(|t| t.1)
+            .filter(|g| g.is_finite() && *g > 0.0)
+    };
+    let worst_ratio = |v: GemvVariant| {
+        rounds
+            .iter()
+            .map(|r| Some(rate(r, v)? / rate(r, default)?))
+            .try_fold(f64::INFINITY, |m, ratio| Some(m.min(ratio?)))
+    };
+    Some(
+        first
+            .iter()
+            .map(|t| t.0)
+            .filter(|&v| v != default)
+            .filter_map(|v| Some((v, worst_ratio(v)?)))
+            .filter(|c| c.1 >= 1.0 + BUSY_MARGIN)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(default, |c| c.0),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -289,6 +345,60 @@ mod tests {
             Some(250.0)
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn busy_gpu_keeps_the_default_unless_an_alternative_wins_every_round_by_the_margin() {
+        let (def, hand, r1, r4) = (
+            GemvVariant::generated(2),
+            GemvVariant::HAND,
+            GemvVariant::generated(1),
+            GemvVariant::generated(4),
+        );
+        let round = |d: f64, h: f64, a: f64, b: f64| vec![(hand, h), (r1, a), (def, d), (r4, b)];
+        assert_eq!(
+            decide(&[round(100.0, 120.0, 90.0, 80.0)], def, false),
+            Some(hand)
+        );
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 120.0, 90.0, 80.0),
+                    round(100.0, 105.0, 90.0, 80.0)
+                ],
+                def,
+                true
+            ),
+            Some(def)
+        );
+        assert_eq!(
+            decide(&[round(100.0, 107.9, 90.0, 80.0)], def, true),
+            Some(def)
+        );
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 108.5, 90.0, 80.0),
+                    round(100.0, 130.0, 90.0, 80.0)
+                ],
+                def,
+                true
+            ),
+            Some(hand)
+        );
+        assert_eq!(
+            decide(
+                &[
+                    round(100.0, 112.0, 90.0, 140.0),
+                    round(100.0, 150.0, 90.0, 115.0)
+                ],
+                def,
+                true
+            ),
+            Some(r4)
+        );
+        assert_eq!(decide(&[], def, true), None);
+        assert_eq!(decide(&[], def, false), None);
     }
 
     #[test]
