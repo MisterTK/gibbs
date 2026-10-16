@@ -267,12 +267,9 @@ impl WeightFormat {
         })
     }
 
-    /// Today's kernel for this format: for `Wide` codecs, generated at 1 row (4-segment) or 2 rows
-    /// (2-segment); else the hand kernel where it exists, else generated at 2 rows.
+    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if let Some(w) = self.codec_format().and_then(codec::wide) {
-            GemvVariant::generated(if w.segs >= 4 { 1 } else { 2 })
-        } else if self.hand_kernel().is_some() {
+        if self.hand_kernel().is_some() {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)
@@ -2138,13 +2135,9 @@ impl Session {
         let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
             Ok((
                 self.rt.gen_pso(q, r)?,
-                (if codec::tile(q).is_some() {
-                    8 * crate::graph::codegen::tile_rows_per_sg(r as usize)
-                } else {
-                    crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
-                        rows_per_sg: r as usize,
-                        ..Default::default()
-                    })
+                crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
+                    rows_per_sg: r as usize,
+                    ..Default::default()
                 }) as u64,
             ))
         };
@@ -2168,6 +2161,12 @@ impl Session {
                 )),
             },
         }
+    }
+
+    /// `format`'s default-variant GEMV pipeline (steps that are not tuned).
+    fn gemv_pso(&self, format: WeightFormat) -> Result<ComputePipelineState, String> {
+        self.gemv_pipeline(format, format.default_variant())
+            .map(|p| p.0)
     }
 
     /// Picks each m = 1 packed GEMV's kernel variant: the session override, else the tuner's
@@ -2777,7 +2776,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, format.default_variant())?;
+                let pso = self.gemv_pso(format)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -2793,6 +2792,12 @@ impl Session {
                 } else {
                     enc.set_buffer(5, Some(out.0), out.1 as u64);
                 }
+                let rows_per_tg = match format {
+                    WeightFormat::Gen(_) => {
+                        crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64
+                    }
+                    _ => 16,
+                };
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
                     MTLSize::new(256, 1, 1),

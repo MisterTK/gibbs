@@ -190,15 +190,6 @@ pub const fn gemv_rows_per_tg(p: GemvParams) -> usize {
     8 * p.rows_per_sg
 }
 
-/// Rows one simdgroup of [`gemv_packed`] covers for a [`Tile`] codec at `rows_per_sg`.
-pub const fn tile_rows_per_sg(rows_per_sg: usize) -> usize {
-    match rows_per_sg {
-        1 => 1,
-        2 => 4,
-        _ => 8,
-    }
-}
-
 /// The MSL a GPU consumer of the device weight buffer includes: [`Codec::msl`], or the planar-layout decoder
 /// for a codec stored [`planar`].
 pub fn device_msl(codec: &Codec) -> &'static str {
@@ -317,37 +308,16 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     // A tile codec splits the simdgroup's lanes across its `r` rows (`32 / r` lanes per row, summed by
     // xor-shuffles): its row has few 16-byte tiles, so letting every lane serve one row keeps all of them busy.
     let (acc_decl, sums, guard, store) = if tile(codec.format).is_some() {
-        let r_sg = tile_rows_per_sg(r);
-        let m = if r >= 4 { 2usize } else { 1 };
-        let r_grp = r_sg / m;
-        let lpr = 32 / r_grp;
+        let lpr = 32 / r;
         let shuffles: String = std::iter::successors(Some(lpr / 2), |o| Some(o / 2))
             .take_while(|&o| o > 0)
-            .map(|o| {
-                (0..m)
-                    .map(|i| format!("    acc{i} += simd_shuffle_xor(acc{i}, {o});\n"))
-                    .collect::<String>()
-            })
-            .collect();
-        let rows_decl = (0..m)
-            .map(|i| format!("myrow{i} = row0 + {i} * {r_grp} + rl"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let accs_decl = (0..m)
-            .map(|i| format!("acc{i} = 0.0f"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let stores: String = (0..m)
-            .map(|i| {
-                let sr = store_row(&format!("acc{i}"), &format!("myrow{i}"), "            ");
-                format!("        if (myrow{i} < p.rows) {{\n{sr}        }}\n")
-            })
+            .map(|o| format!("    acc0 += simd_shuffle_xor(acc0, {o});\n"))
             .collect();
         (
-            format!("const uint sl = lane % {lpr}, rl = lane / {lpr}, {rows_decl};\n    float {accs_decl};"),
+            format!("const uint sl = lane % {lpr}, rl = lane / {lpr}, myrow = row0 + rl;\n    float acc0 = 0.0f;"),
             shuffles,
-            "sl == 0".to_string(),
-            stores,
+            format!("sl == 0 && myrow < p.rows"),
+            store_row("acc0", "myrow", "        "),
         )
     } else {
         let store: String = (0..r)
@@ -389,7 +359,7 @@ kernel void {name}(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {{
-    const uint row0 = tg.x * {rows_per_tg} + sg * {r_sg};
+    const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint batch = tg.y;
     if (row0 >= p.rows || batch >= p.batch_size) return;
     const uint blocks_per_row = p.cols / {be};
@@ -399,16 +369,7 @@ kernel void {name}(
 {store}    }}
 }}
 "#,
-        rows_per_tg = if tile(codec.format).is_some() {
-            8 * tile_rows_per_sg(r)
-        } else {
-            gemv_rows_per_tg(p)
-        },
-        r_sg = if tile(codec.format).is_some() {
-            tile_rows_per_sg(r)
-        } else {
-            r
-        },
+        rows_per_tg = gemv_rows_per_tg(p),
         wide_msl = wide_msl(codec, &dec, true),
     )
 }
@@ -533,10 +494,12 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile
 /// 8-element segment at a time against `x` and accumulates `scale * (dot(codes, x) - sum(x))`.
 fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
     let (be, r, segs) = (codec.block_elems, p.rows_per_sg, t.segs);
-    let r_sg = tile_rows_per_sg(r);
-    let m = if r >= 4 { 2usize } else { 1 };
-    let r_grp = r_sg / m;
-    let lpr = 32 / r_grp;
+    let lpr = 32 / r;
+    assert!(
+        segs as usize % r == 0,
+        "{} rows per simdgroup do not divide {segs} segments",
+        r
+    );
     let name = |n: &str| dec.replace("decode8", n);
     let (seg, load, scale, tseg) = (
         name("group_seg"),
@@ -544,11 +507,21 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
         name("tile_scale"),
         name("tile_seg"),
     );
-    let spr = segs as usize / r_grp;
-    let sx_parts: String = (0..spr)
-        .map(| idx| {
+    let br = block_ref(codec, "w", "(ulong)myrow * blocks_per_row + blk");
+    let body: String = (0..segs)
+        .map(|k| {
             format!(
-                "        {{\n            const uint e = blk * {be} + {seg}(g, rl * {spr} + {idx});\n            sx += *(device const float4*)(xb + e) + *(device const float4*)(xb + e + 4);\n        }}\n"
+                "        {{\n            const uint e = blk * {be} + {seg}(g, {k});\n            const float4 xa = *(device const float4*)(xb + e), xc = *(device const float4*)(xb + e + 4);\n            float v[8];\n            {tseg}(q, {k}, v);\n            t += dot(float4(v[0], v[1], v[2], v[3]), xa) + dot(float4(v[4], v[5], v[6], v[7]), xc);\n        }}\n"
+            )
+        })
+        .collect();
+    // The lanes serving the same tile of different rows (`lane % lpr` equal) split sum(x) over the tile
+    // between them (`segs / r` segments each) and add the parts with xor-shuffles.
+    let spr = segs as usize / r;
+    let sx_parts: String = (0..spr)
+        .map(|m| {
+            format!(
+                "        {{\n            const uint e = blk * {be} + {seg}(g, rl * {spr} + {m});\n            sx += *(device const float4*)(xb + e) + *(device const float4*)(xb + e + 4);\n        }}\n"
             )
         })
         .collect();
@@ -556,49 +529,10 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
         .take_while(|&o| o < 32)
         .map(|o| format!("        sxs += simd_shuffle_xor(sxs, {o});\n"))
         .collect();
-    let q_decl = (0..m)
-        .map(|i| format!("q{i} = uint4(0)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let dt_decl = (0..m)
-        .map(|i| format!("d{i} = 0.0f, t{i} = 0.0f"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let loads: String = (0..m)
-        .map(|i| {
-            let br = block_ref(codec, "w", &format!("(ulong)myrow{i} * blocks_per_row + blk"));
-            format!(
-                "        if (myrow{i} < p.rows) {{\n            {}\n            q{i} = {load}(b, {}g);\n            d{i} = {scale}(b, {}g);\n        }}\n",
-                br.decl, br.group, br.group
-            )
-        })
-        .collect();
-    let body: String = (0..segs)
-        .map(|k| {
-            let dots: String = (0..m)
-                .map(|i| {
-                    format!(
-                        "            {tseg}(q{i}, {k}, v);\n            t{i} += dot(float4(v[0], v[1], v[2], v[3]), xa) + dot(float4(v[4], v[5], v[6], v[7]), xc);\n"
-                    )
-                })
-                .collect();
-            format!(
-                "        {{\n            const uint e = blk * {be} + {seg}(g, {k});\n            const float4 xa = *(device const float4*)(xb + e), xc = *(device const float4*)(xb + e + 4);\n            float v[8];\n{dots}        }}\n"
-            )
-        })
-        .collect();
-    let accs: String = (0..m)
-        .map(|i| {
-            format!(
-                "        acc{i} += d{i} * ({a:?}f * t{i} - {b:?}f * sxs);\n",
-                a = t.a,
-                b = t.b
-            )
-        })
-        .collect();
     let groups = t.groups;
     format!(
-        "    const uint tiles = blocks_per_row * {groups};\n    for (uint s = sl; s < tiles; s += {lpr}) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        uint4 {q_decl};\n        float {dt_decl};\n{loads}        float4 sx = float4(0.0f);\n{sx_parts}        float sxs = dot(sx, float4(1.0f));\n{sx_sum}{body}{accs}    }}\n"
+        "    const uint tiles = blocks_per_row * {groups};\n    for (uint s = sl; s < tiles; s += {lpr}) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        uint4 q = uint4(0);\n        float d = 0.0f, t = 0.0f;\n        if (myrow < p.rows) {{\n            {}\n            q = {load}(b, {}g);\n            d = {scale}(b, {}g);\n        }}\n        float4 sx = float4(0.0f);\n{sx_parts}        float sxs = dot(sx, float4(1.0f));\n{sx_sum}{body}        acc0 += d * ({a:?}f * t - {b:?}f * sxs);\n    }}\n",
+        br.decl, br.group, br.group, a = t.a, b = t.b
     )
 }
 
