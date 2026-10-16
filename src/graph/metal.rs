@@ -1116,17 +1116,25 @@ impl Runtime {
         // Foreign GPU load, sampled before this process times anything: busy means the winner is
         // used here but never persisted.
         let busy = tune::foreign_busy();
-        let timings = match self.bench_gemv(q, &[(rows, cols)], &variants) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("tune {q:?} {rows}x{cols}: {e}");
-                return default;
+        let mut rounds = Vec::new();
+        for round in 0..1 + usize::from(busy) {
+            let order: Vec<GemvVariant> = if round == 0 {
+                variants.clone()
+            } else {
+                variants.iter().rev().copied().collect()
+            };
+            match self.bench_gemv(q, &[(rows, cols)], &order) {
+                Ok(t) => rounds.push(t),
+                Err(e) => {
+                    tracing::warn!("tune {q:?} {rows}x{cols}: {e}");
+                    return default;
+                }
             }
-        };
-        let Some(best) = tune::choose(&timings) else {
+        }
+        let Some(best) = tune::decide(&rounds, default, busy) else {
             return default;
         };
-        let gbps = timings.iter().find(|t| t.0 == best).map_or(0.0, |t| t.1);
+        let gbps = rounds[0].iter().find(|t| t.0 == best).map_or(0.0, |t| t.1);
         let bytes = weight_format_bytes(fmt, rows * cols) as f64;
         tracing::info!(
             "tune: {q:?} {rows}x{cols}: {} {gbps:.0} GB/s ({} variants)",
