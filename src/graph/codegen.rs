@@ -15,6 +15,244 @@ impl Default for GemvParams {
     }
 }
 
+impl crate::hardware::QuantFormat {
+    /// Alias for the GGUF Q4_K block format.
+    pub const GGUF_Q4_K: Self = Self::GGUF_Q4_K_M;
+
+    /// Every `QuantFormat` variant.
+    pub const ALL: &'static [Self] = &[
+        Self::FP32,
+        Self::FP16,
+        Self::BF16,
+        Self::FP8_E4M3,
+        Self::FP8_E5M2,
+        Self::NVFP4,
+        Self::NVFP4_E2M1,
+        Self::MXFP4,
+        Self::MXFP6,
+        Self::EXL3_3Bit,
+        Self::EXL3_4Bit,
+        Self::EXL3_5Bit,
+        Self::AWQ_W4A16,
+        Self::GPTQ_W4A16,
+        Self::GGUF_Q4_0,
+        Self::GGUF_Q4_1,
+        Self::GGUF_Q4_K_M,
+        Self::GGUF_Q5_0,
+        Self::GGUF_Q5_1,
+        Self::GGUF_Q5_K_M,
+        Self::GGUF_Q6_K,
+        Self::GGUF_Q8_0,
+        Self::GGUF_IQ4_XS,
+        Self::GGUF_IQ4_NL,
+        Self::GGUF_Q2_K,
+        Self::GGUF_Q3_K,
+        Self::GGUF_IQ3_XXS,
+        Self::GGUF_IQ3_S,
+        Self::GGUF_IQ2_XXS,
+        Self::GGUF_IQ2_XS,
+        Self::GGUF_IQ2_S,
+        Self::GGUF_IQ2_M,
+        Self::GGUF_IQ1_S,
+        Self::GGUF_IQ1_M,
+        Self::GGUF_TQ1_0,
+        Self::GGUF_TQ2_0,
+        Self::BitNet_B1_58,
+        Self::KIVI_2Bit,
+        Self::TurboQuant,
+        Self::WeightlessJesseLUT,
+        Self::HadamardNeedle,
+        Self::BNB_NF4,
+        Self::BNB_FP4,
+        Self::BNB_NF4_B64,
+        Self::BNB_NF4_B128,
+        Self::BNB_NF4_B256,
+        Self::BNB_FP4_B64,
+        Self::BNB_FP4_B128,
+        Self::BNB_FP4_B256,
+        Self::FP8_E4M3_B32,
+        Self::MLX_AFFINE4_G32,
+        Self::MLX_AFFINE4_G64,
+        Self::MLX_AFFINE4_G128,
+        Self::INT4_G32,
+        Self::INT4_G64,
+        Self::INT4_G128,
+        Self::GGUF_NVFP4,
+    ];
+}
+
+/// Target GPU shading/compute language dialect for kernel synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Msl,
+    Cuda,
+    Hip,
+}
+
+impl Dialect {
+    /// Selects the kernel dialect corresponding to a hardware profile's compute device.
+    pub fn from_profile(profile: &crate::hardware::profile::HardwareProfile) -> Self {
+        use crate::hardware::Device;
+        match profile.device {
+            Device::Cuda => Self::Cuda,
+            Device::Rocm => Self::Hip,
+            Device::Metal | Device::Ane | Device::Cpu | Device::LevelZero => Self::Msl,
+        }
+    }
+
+    /// Returns the SIMD/warp/wavefront width for this dialect and optional hardware profile.
+    pub fn simd_width(self, profile: Option<&crate::hardware::profile::HardwareProfile>) -> usize {
+        profile.map(|p| p.simd_width).unwrap_or(match self {
+            Self::Msl | Self::Cuda => 32,
+            Self::Hip => 64,
+        })
+    }
+}
+
+fn translate_as_type(mut src: String) -> String {
+    while let Some(pos) = src.find("as_type<") {
+        let after_prefix = pos + "as_type<".len();
+        let Some(gt_rel) = src[after_prefix..].find('>') else {
+            break;
+        };
+        let gt_pos = after_prefix + gt_rel;
+        let ty = src[after_prefix..gt_pos].trim().to_string();
+        let open_paren = gt_pos + 1;
+        if src.as_bytes().get(open_paren) != Some(&b'(') {
+            break;
+        }
+        let mut depth = 1usize;
+        let mut i = open_paren + 1;
+        let bytes = src.as_bytes();
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            break;
+        }
+        let close_paren = i - 1;
+        let inner = translate_as_type(src[open_paren + 1..close_paren].to_string());
+        let trimmed = inner.trim();
+        let is_ident = !trimmed.is_empty()
+            && trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let replacement = match ty.as_str() {
+            "float" => format!("__uint_as_float({inner})"),
+            "uint" => format!("__float_as_uint({inner})"),
+            "uchar4" if is_ident => format!("*reinterpret_cast<const uchar4*>(&{trimmed})"),
+            "uchar4" => format!("gibbs_bitcast<uchar4>({inner})"),
+            "char" => format!("static_cast<signed char>({inner})"),
+            "half" => format!("gibbs_bitcast<__half>({inner})"),
+            other => format!("gibbs_bitcast<{other}>({inner})"),
+        };
+        src.replace_range(pos..=close_paren, &replacement);
+    }
+    src
+}
+
+fn translate_codec_msl_to_c(msl: &str) -> String {
+    let s = msl
+        .replace("#pragma clang fp contract(off)\n", "")
+        .replace("#pragma clang fp contract(off)", "")
+        .replace(
+            "float(*(device const half*)blk)",
+            "__half2float(*(const __half*)blk)",
+        )
+        .replace(
+            "float(*(device const half*)p)",
+            "__half2float(*(const __half*)p)",
+        )
+        .replace(
+            "half d = *(device const half*)blk;",
+            "__half d = *(const __half*)blk;",
+        )
+        .replace("float(d)", "__half2float(d)")
+        .replace(
+            "float(as_type<half>(hb))",
+            "__half2float(gibbs_bitcast<__half>(hb))",
+        )
+        .replace("device const uchar*", "const unsigned char*")
+        .replace("device const ushort*", "const unsigned short*")
+        .replace("device const char*", "const signed char*")
+        .replace("device const half*", "const __half*")
+        .replace("device const ", "const ")
+        .replace("thread float*", "float*")
+        .replace("thread uint&", "unsigned int&")
+        .replace("constant const ", "__device__ const ")
+        .replace("\nconstant ", "\n__device__ const ")
+        .replace("float4", "msl_float4")
+        .replace("inline ", "__device__ inline ");
+    translate_as_type(s)
+}
+
+fn dialect_preamble(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Cuda => {
+            r#"#include <cuda_fp16.h>
+typedef unsigned char uchar;
+typedef unsigned short ushort;
+typedef unsigned int uint;
+typedef unsigned long long ulong;
+template <typename T, typename U> __device__ inline T gibbs_bitcast(U u) { T t; __builtin_memcpy(&t, &u, sizeof(T)); return t; }
+struct msl_float4 {
+    float x, y, z, w;
+    __device__ inline msl_float4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
+    __device__ inline msl_float4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
+    __device__ inline explicit msl_float4(uchar4 u) : x(float(u.x)), y(float(u.y)), z(float(u.z)), w(float(u.w)) {}
+    __device__ inline float operator[](unsigned int i) const { return (&x)[i]; }
+    __device__ inline msl_float4 operator-(float s) const { return msl_float4(x - s, y - s, z - s, w - s); }
+    __device__ inline msl_float4 operator*(float s) const { return msl_float4(x * s, y * s, z * s, w * s); }
+};"#
+        }
+        Dialect::Hip => {
+            r#"#include <hip/hip_fp16.h>
+typedef unsigned char uchar;
+typedef unsigned short ushort;
+typedef unsigned int uint;
+typedef unsigned long long ulong;
+template <typename T, typename U> __device__ inline T gibbs_bitcast(U u) { T t; __builtin_memcpy(&t, &u, sizeof(T)); return t; }
+struct msl_float4 {
+    float x, y, z, w;
+    __device__ inline msl_float4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
+    __device__ inline msl_float4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
+    __device__ inline explicit msl_float4(uchar4 u) : x(float(u.x)), y(float(u.y)), z(float(u.z)), w(float(u.w)) {}
+    __device__ inline float operator[](unsigned int i) const { return (&x)[i]; }
+    __device__ inline msl_float4 operator-(float s) const { return msl_float4(x - s, y - s, z - s, w - s); }
+    __device__ inline msl_float4 operator*(float s) const { return msl_float4(x * s, y * s, z * s, w * s); }
+};"#
+        }
+        Dialect::Msl => "",
+    }
+}
+
+fn warp_reduce_sum(var: &str, dialect: Dialect, simd_width: usize, indent: &str) -> String {
+    let mut out = String::new();
+    let mut offset = simd_width / 2;
+    while offset >= 1 {
+        match dialect {
+            Dialect::Cuda => {
+                out.push_str(&format!(
+                    "{indent}{var} += __shfl_xor_sync(0xffffffffu, {var}, {offset});\n"
+                ));
+            }
+            Dialect::Hip => {
+                out.push_str(&format!(
+                    "{indent}{var} += __shfl_xor({var}, {offset}, {simd_width});\n"
+                ));
+            }
+            Dialect::Msl => unreachable!(),
+        }
+        offset /= 2;
+    }
+    out
+}
+
 /// Generates an MSL GEMV kernel function from a codec, parameters, prologue, and epilogue.
 pub fn gemv(codec: &Codec, p: GemvParams, prologue: &str, epilogue: &str) -> String {
     let format_str = format!("{:?}", codec.format).to_lowercase();
@@ -157,10 +395,172 @@ kernel void multi_gemv_{format_str}_{n_weights}(
     )
 }
 
+/// Generates a dialect-parameterized GEMV kernel function from a codec, parameters, dialect,
+/// SIMD/warp width, prologue, and epilogue.
+pub fn gemv_for_dialect(
+    codec: &Codec,
+    p: GemvParams,
+    dialect: Dialect,
+    simd_width: usize,
+    prologue: &str,
+    epilogue: &str,
+) -> String {
+    if dialect == Dialect::Msl {
+        return gemv(codec, p, prologue, epilogue);
+    }
+    let simd_width = simd_width.max(1);
+    let format_str = format!("{:?}", codec.format).to_lowercase();
+    let prologue_expr = if prologue.is_empty() {
+        "x[col]"
+    } else {
+        prologue
+    };
+    let epilogue_stmt = if epilogue.is_empty() {
+        "out[row] = sum;"
+    } else {
+        epilogue
+    };
+    let preamble = dialect_preamble(dialect);
+    let codec_c = translate_codec_msl_to_c(codec.msl);
+    let reduction = warp_reduce_sum("sum", dialect, simd_width, "    ");
+
+    format!(
+        r#"
+// Generated GEMV ({dialect:?}) for {format_str}
+{preamble}
+{codec_c}
+
+extern "C" __global__ void gemv_{format_str}(const unsigned char* __restrict__ weights, const float* __restrict__ x, float* __restrict__ out, unsigned int rows, unsigned int cols, unsigned int block_elems, unsigned int block_bytes) {{
+    unsigned int tg = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int sg = tid / {simd_width};
+    unsigned int lane = tid % {simd_width};
+    unsigned int row = tg * {rows_per_sg} + (sg % {rows_per_sg});
+    if (row >= rows) return;
+
+    float sum = 0.0f;
+    unsigned int num_sub = cols / 8;
+    for (unsigned int s = lane; s < num_sub; s += {simd_width}) {{
+        float dec8[8];
+        unsigned int blk_idx = (s * 8) / block_elems;
+        unsigned int sub_in_blk = (s * 8) % block_elems / 8;
+        const unsigned char* blk = weights + (unsigned long long)row * (cols / block_elems * block_bytes) + blk_idx * block_bytes;
+        decode8(blk, sub_in_blk, dec8);
+
+        for (unsigned int i = 0; i < 8; i++) {{
+            unsigned int col = s * 8 + i;
+            float x_val = {prologue_expr};
+            sum += dec8[i] * x_val;
+        }}
+    }}
+
+{reduction}    if (lane == 0) {{
+        {epilogue_stmt}
+    }}
+}}
+"#,
+        dialect = dialect,
+        format_str = format_str,
+        preamble = preamble,
+        codec_c = codec_c,
+        simd_width = simd_width,
+        rows_per_sg = p.rows_per_sg,
+        prologue_expr = prologue_expr,
+        reduction = reduction,
+        epilogue_stmt = epilogue_stmt,
+    )
+}
+
+/// Generates a dialect-parameterized Multi-GEMV kernel where N weights share the same input activation vector.
+pub fn multi_gemv_for_dialect(
+    codec: &Codec,
+    n_weights: usize,
+    dialect: Dialect,
+    simd_width: usize,
+    prologue: &str,
+    epilogue: &str,
+) -> String {
+    if dialect == Dialect::Msl {
+        return multi_gemv(codec, n_weights, prologue, epilogue);
+    }
+    let simd_width = simd_width.max(1);
+    let format_str = format!("{:?}", codec.format).to_lowercase();
+    let prologue_expr = if prologue.is_empty() {
+        "x[col]"
+    } else {
+        prologue
+    };
+    let default_epi;
+    let epilogue_stmt = if epilogue.is_empty() {
+        default_epi = format!(
+            "for (unsigned int w = 0; w < {n_weights}; w++) out[w * rows + row] = sum[w];"
+        );
+        default_epi.as_str()
+    } else {
+        epilogue
+    };
+    let preamble = dialect_preamble(dialect);
+    let codec_c = translate_codec_msl_to_c(codec.msl);
+    let reduction_w = warp_reduce_sum("sum[w]", dialect, simd_width, "        ");
+
+    format!(
+        r#"
+// Generated Multi-GEMV ({dialect:?}, N={n_weights}) for {format_str}
+{preamble}
+{codec_c}
+
+extern "C" __global__ void multi_gemv_{format_str}_{n_weights}(const unsigned char* __restrict__ weights, const float* __restrict__ x, float* __restrict__ out, unsigned int rows, unsigned int cols, unsigned int block_elems, unsigned int block_bytes) {{
+    unsigned int tg = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    unsigned int sg = tid / {simd_width};
+    unsigned int lane = tid % {simd_width};
+    unsigned int row = tg * 2 + (sg % 2);
+    if (row >= rows) return;
+
+    float sum[{n_weights}];
+    for (unsigned int w = 0; w < {n_weights}; w++) sum[w] = 0.0f;
+
+    unsigned int num_sub = cols / 8;
+    for (unsigned int s = lane; s < num_sub; s += {simd_width}) {{
+        for (unsigned int i = 0; i < 8; i++) {{
+            unsigned int col = s * 8 + i;
+            float x_val = {prologue_expr};
+            for (unsigned int w = 0; w < {n_weights}; w++) {{
+                float dec8[8];
+                unsigned int blk_idx = (s * 8) / block_elems;
+                unsigned int sub_in_blk = (s * 8) % block_elems / 8;
+                const unsigned char* blk = weights + (unsigned long long)(w * rows + row) * (cols / block_elems * block_bytes) + blk_idx * block_bytes;
+                decode8(blk, sub_in_blk, dec8);
+                sum[w] += dec8[i] * x_val;
+            }}
+        }}
+    }}
+
+    for (unsigned int w = 0; w < {n_weights}; w++) {{
+{reduction_w}    }}
+
+    if (lane == 0) {{
+        {epilogue_stmt}
+    }}
+}}
+"#,
+        dialect = dialect,
+        n_weights = n_weights,
+        format_str = format_str,
+        preamble = preamble,
+        codec_c = codec_c,
+        simd_width = simd_width,
+        prologue_expr = prologue_expr,
+        reduction_w = reduction_w,
+        epilogue_stmt = epilogue_stmt,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::codec::CODEC_Q4_0;
+    use crate::graph::codec::{codec, CODEC_Q4_0};
+    use crate::hardware::{Device, HardwareProfile, QuantFormat};
 
     #[test]
     fn test_gemv_codegen() {
@@ -175,6 +575,137 @@ mod tests {
         let code = multi_gemv(&CODEC_Q4_0, 2, "x[col]", "out[row] = sum[0] * sum[1];");
         assert!(code.contains("kernel void multi_gemv_gguf_q4_0_2"));
         assert!(code.contains("out[row] = sum[0] * sum[1];"));
+    }
+
+    #[test]
+    fn test_dialect_from_profile_and_simd_width() {
+        let cuda_prof = HardwareProfile::for_device(Device::Cuda);
+        let rocm_prof = HardwareProfile::for_device(Device::Rocm);
+        let metal_prof = HardwareProfile::for_device(Device::Metal);
+        let cpu_prof = HardwareProfile::for_device(Device::Cpu);
+
+        assert_eq!(Dialect::from_profile(&cuda_prof), Dialect::Cuda);
+        assert_eq!(Dialect::from_profile(&rocm_prof), Dialect::Hip);
+        assert_eq!(Dialect::from_profile(&metal_prof), Dialect::Msl);
+        assert_eq!(Dialect::from_profile(&cpu_prof), Dialect::Msl);
+
+        assert_eq!(Dialect::Msl.simd_width(None), 32);
+        assert_eq!(Dialect::Cuda.simd_width(None), 32);
+        assert_eq!(Dialect::Hip.simd_width(None), 64);
+        assert_eq!(
+            Dialect::Cuda.simd_width(Some(&cuda_prof)),
+            cuda_prof.simd_width
+        );
+        assert_eq!(
+            Dialect::Hip.simd_width(Some(&rocm_prof)),
+            rocm_prof.simd_width
+        );
+    }
+
+    #[test]
+    fn test_dialect_msl_matches_gemv_byte_for_byte_across_all_formats() {
+        assert!(crate::graph::codec::formats()
+            .iter()
+            .all(|f| QuantFormat::ALL.contains(f)));
+        let p = GemvParams::default();
+        let mut checked = 0usize;
+        for &fmt in QuantFormat::ALL {
+            if let Some(c) = codec(fmt) {
+                assert_eq!(
+                    gemv_for_dialect(c, p, Dialect::Msl, 32, "", ""),
+                    gemv(c, p, "", ""),
+                    "MSL GEMV mismatch for {:?}",
+                    fmt
+                );
+                assert_eq!(
+                    multi_gemv_for_dialect(c, 2, Dialect::Msl, 32, "", ""),
+                    multi_gemv(c, 2, "", ""),
+                    "MSL Multi-GEMV mismatch for {:?}",
+                    fmt
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn test_dialect_cuda_and_hip_across_all_codecs() {
+        let p = GemvParams::default();
+        let forbidden = [
+            "[[buffer",
+            "[[threadgroup_position_in_grid]]",
+            "device const",
+            "thread float*",
+            "simd_sum(",
+            "as_type<",
+        ];
+        let mut checked = 0usize;
+        for &fmt in QuantFormat::ALL {
+            let Some(c) = codec(fmt) else { continue };
+            checked += 1;
+
+            let cuda_src = gemv_for_dialect(c, p, Dialect::Cuda, 32, "", "");
+            assert!(!cuda_src.is_empty());
+            assert!(cuda_src.contains("#include <cuda_fp16.h>"));
+            assert!(cuda_src.contains("extern \"C\" __global__ void gemv_"));
+            assert!(cuda_src.contains("decode8("));
+            assert!(cuda_src.contains("unsigned int tg = blockIdx.x;"));
+            assert!(cuda_src.contains("unsigned int tid = threadIdx.x;"));
+            assert!(cuda_src.contains("unsigned int sg = tid / 32;"));
+            assert!(cuda_src.contains("unsigned int lane = tid % 32;"));
+            assert!(!cuda_src.contains("&a &"));
+            for tok in forbidden {
+                assert!(
+                    !cuda_src.contains(tok),
+                    "CUDA kernel for {:?} contains leftover MSL token {tok:?}",
+                    fmt
+                );
+            }
+            for off in [16, 8, 4, 2, 1] {
+                let pat = format!("__shfl_xor_sync(0xffffffffu, sum, {off});");
+                assert!(
+                    cuda_src.contains(&pat),
+                    "CUDA kernel for {:?} missing warp shuffle {pat}",
+                    fmt
+                );
+            }
+
+            let hip_src = gemv_for_dialect(c, p, Dialect::Hip, 64, "", "");
+            assert!(!hip_src.is_empty());
+            assert!(hip_src.contains("#include <hip/hip_fp16.h>"));
+            assert!(hip_src.contains("extern \"C\" __global__ void gemv_"));
+            assert!(hip_src.contains("decode8("));
+            assert!(hip_src.contains("unsigned int tg = blockIdx.x;"));
+            assert!(hip_src.contains("unsigned int tid = threadIdx.x;"));
+            assert!(hip_src.contains("unsigned int sg = tid / 64;"));
+            assert!(hip_src.contains("unsigned int lane = tid % 64;"));
+            assert!(!hip_src.contains("&a &"));
+            for tok in forbidden {
+                assert!(
+                    !hip_src.contains(tok),
+                    "HIP kernel for {:?} contains leftover MSL token {tok:?}",
+                    fmt
+                );
+            }
+            for off in [32, 16, 8, 4, 2, 1] {
+                let pat = format!("__shfl_xor(sum, {off}, 64);");
+                assert!(
+                    hip_src.contains(&pat),
+                    "HIP kernel for {:?} missing wave shuffle {pat}",
+                    fmt
+                );
+            }
+
+            let cuda_multi = multi_gemv_for_dialect(c, 2, Dialect::Cuda, 32, "", "");
+            assert!(cuda_multi.contains("extern \"C\" __global__ void multi_gemv_"));
+            assert!(cuda_multi.contains("__shfl_xor_sync(0xffffffffu, sum[w], 16);"));
+
+            let hip_multi = multi_gemv_for_dialect(c, 2, Dialect::Hip, 64, "", "");
+            assert!(hip_multi.contains("extern \"C\" __global__ void multi_gemv_"));
+            assert!(hip_multi.contains("__shfl_xor(sum[w], 32, 64);"));
+        }
+        assert!(checked >= 25);
     }
 }
 

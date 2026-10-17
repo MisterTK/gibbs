@@ -136,6 +136,22 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
     }
 }
 
+/// Synthesizes a HIP C++ quantized GEMV kernel source for `format` and `p`.
+pub fn quant_gemv_kernel_source(
+    format: crate::hardware::QuantFormat,
+    p: crate::graph::codegen::GemvParams,
+) -> Option<String> {
+    let c = crate::graph::codec::codec(format)?;
+    Some(crate::graph::codegen::gemv_for_dialect(
+        c,
+        p,
+        crate::graph::codegen::Dialect::Hip,
+        64,
+        "",
+        "",
+    ))
+}
+
 /// ROCm session executing a graph program.
 pub struct RocmSession {
     ctx: *mut c_void,
@@ -185,6 +201,8 @@ impl Drop for RocmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::codegen::GemvParams;
+    use crate::hardware::QuantFormat;
 
     #[test]
     fn test_rocm_probe_on_current_host() {
@@ -192,5 +210,26 @@ mod tests {
         assert!(!is_available());
         assert!(!supports_op(&Op::Linear, DType::F32));
         assert!(RocmSession::new(&Weights::new()).is_err());
+    }
+
+    #[test]
+    fn test_rocm_quant_gemv_kernel_source() {
+        let p = GemvParams::default();
+        for fmt in [
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_K,
+            QuantFormat::GGUF_IQ4_XS,
+            QuantFormat::GGUF_TQ2_0,
+        ] {
+            let src = quant_gemv_kernel_source(fmt, p)
+                .unwrap_or_else(|| panic!("expected HIP GEMV source for {fmt:?}"));
+            assert!(src.contains("extern \"C\" __global__ void gemv_"));
+            assert!(src.contains("decode8("));
+            assert!(src.contains("__shfl_xor(sum, 32, 64);"));
+            assert!(!src.contains("[[buffer"));
+            assert!(!src.contains("device const"));
+            assert!(!src.contains("simd_sum("));
+        }
+        assert!(quant_gemv_kernel_source(QuantFormat::FP32, p).is_none());
     }
 }
