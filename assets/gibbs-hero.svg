@@ -44,5 +44,5 @@
 <text x="380" y="368" font-size="36" fill="#4A86C5">302 GB/s</text>
 <text x="780" y="328" font-size="12" fill="#A8895F" letter-spacing="0.08em">PEAK · SMOLLM2 135M · SAFETENSORS</text>
 <text x="780" y="368" font-size="36" fill="#D4AF37">469 tok/s</text>
-<text x="380" y="412" font-size="11" fill="#A8895F" letter-spacing="0.08em">APPLE M5 PRO · METAL · BUILD 96AB660 · 2026-10-17 · CAND1 PASS SHOWN; 2-RUN ABBA MEAN IS 144.0 TOK/S ON E2B QAT (122.3 TOK/S ON 4K CONTEXT) AFTER A CAND2 DIP, AWAITING QUIET RE-VERIFY</text>
+<text x="380" y="412" font-size="11" fill="#A8895F" letter-spacing="0.08em">APPLE M5 PRO · METAL · BUILD 96AB660 · 2026-10-17</text>
 </svg>

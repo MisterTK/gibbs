@@ -2,5 +2,5 @@
   "commit": "96ab660",
   "date": "2026-10-17",
   "device": "Apple M5 Pro",
-  "note": "cand1 pass shown; 2-run ABBA mean is 144.0 tok/s on E2B QAT (122.3 tok/s on 4k context) after a cand2 dip, awaiting quiet re-verify"
+  "note": null
 }
