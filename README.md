@@ -17,18 +17,18 @@ Gibbs is an LLM inference engine in Rust for Apple Silicon. Models are described
 <!-- gibbs-bench:begin -->
 | Model | Decode tok/s | % of roofline | Roofline tok/s | GPU ms/token | Host ms/token | Dispatches/token |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Gemma 4 E2B QAT · UD-Q2_K_XL | 137.8 | 39.0% | 353 | 6.82 | 0.43 | 662 |
-| Gemma 4 E2B · Q4_K_M | 105.7 | 52.8% | 200 | 9.01 | 0.45 | 665 |
-| Qwen3.5 2B · UD-Q4_K_XL | 109.9 | 47.1% | 233 | 8.62 | 0.48 | 458 |
-| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 38.3 | 58.3% | 66 | 25.84 | 0.27 | 610 |
-| Llama 3.2 1B · Q4_0 | 247.2 | 64.0% | 386 | 3.74 | 0.31 | 179 |
-| SmolLM2 135M · safetensors | 422.1 | 38.5% | 1098 | 1.98 | 0.39 | 333 |
-| Llama 3.2 1B · bnb 4-bit | 218.3 | 56.6% | 386 | 4.28 | 0.30 | 179 |
-| Gemma 4 26B-A4B · UD-IQ2_XXS | 69.3 | 51.1% | 135 | 14.03 | 0.41 | 1108 |
-| Gemma 4 E2B QAT · 4k context | 123.9 | 35.1% | 353 | 7.78 | 0.29 | 662 |
-| **Geomean** | | **48.2%** | | | | |
+| Gemma 4 E2B QAT · UD-Q2_K_XL | 137.1 | 38.8% | 353 | 6.88 | 0.41 | 662 |
+| Gemma 4 E2B · Q4_K_M | 105.5 | 52.7% | 200 | 9.03 | 0.46 | 665 |
+| Qwen3.5 2B · UD-Q4_K_XL | 111.9 | 49.0% | 228 | 8.47 | 0.47 | 448 |
+| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 38.3 | 58.4% | 66 | 25.80 | 0.30 | 610 |
+| Llama 3.2 1B · Q4_0 | 248.8 | 64.5% | 386 | 3.71 | 0.31 | 179 |
+| SmolLM2 135M · safetensors | 423.4 | 38.6% | 1097 | 1.98 | 0.38 | 333 |
+| Llama 3.2 1B · bnb 4-bit | 224.9 | 58.4% | 385 | 4.14 | 0.31 | 179 |
+| Gemma 4 26B-A4B · UD-IQ2_XXS | 69.3 | 51.2% | 135 | 14.00 | 0.43 | 1108 |
+| Gemma 4 E2B QAT · 4k context | 123.2 | 34.9% | 353 | 7.81 | 0.30 | 662 |
+| **Geomean** | | **48.6%** | | | | |
 
-Apple M5 Pro, Metal, measured streaming ceiling 295.2 GB/s. Binary built from `792ceb0` (2026-10-16); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 137.8 tok/s against its 150 tok/s target.
+Apple M5 Pro, Metal, measured streaming ceiling 295.0 GB/s. Binary built from `a701ad7` (2026-10-16); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 137.1 tok/s against its 150 tok/s target.
 <!-- gibbs-bench:end -->
 
 System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
@@ -164,7 +164,7 @@ Verification status depends on where a model ran. **On Metal with a real checkpo
 | Qwen 3.5 9B IQ2_M (DavidAU MTP GGUF) | Text generation | Output is coherent; benchmarked below. |
 | `google-t5/t5-small` | Translation | `translate English to German: The house is wonderful.` → `Das Haus ist wunderbar.` at ~264 tok/s on Metal. |
 | Qwen-Image 2.1 Q4_0 DiT | One transformer forward | Relative error 1.5e-5 against the CPU forward. |
-| `bench/loop.json` models (Gemma 4 E2B QAT, Qwen3.5 2B, Llama 3.2 1B Q4_0, SmolLM2 135M, Llama 3.2 1B bnb 4-bit) | Text generation | `--bench-parity`: Metal program vs the CPU graph executor, min cosine 1.00000 over 8–16 decode steps (build `792ceb0`); decode speed in [Performance](#performance). |
+| `bench/loop.json` models (Gemma 4 E2B QAT, Qwen3.5 2B, Llama 3.2 1B Q4_0, SmolLM2 135M, Llama 3.2 1B bnb 4-bit) | Text generation | `--bench-parity`: Metal program vs the CPU graph executor, min cosine 1.00000 over 8–16 decode steps (build `a701ad7`); decode speed in [Performance](#performance). |
 
 Everything else on Metal (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-VL vision, MTP drafters, `.ninfer`, UNet/VAE/UNet3D, FLUX/SD3/Krea/Z-Image/Sana DiTs, LTX DiT, the audio conformer on other checkpoints) is verified on tiny synthetic fixtures only; no real checkpoint was cached to run them.
 
