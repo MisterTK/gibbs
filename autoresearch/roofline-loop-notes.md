@@ -418,3 +418,15 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
   - `bg_88` (`814a880`): `base_pct = 45.16%`, `cand_pct = 45.82%`, `delta_pp = +0.66 pp`, `noise_pp = 1.18 pp`, `min_ratio = 0.9712`, `ratios_ok = true`, `Qwen3.5 9B IQ2_M` `35.41 -> 36.84 tok/s` (`+4.03%`).
   - `bg_90` (`814a880`): `base_pct = 46.29%`, `cand_pct = 46.24%`, `delta_pp = -0.06 pp`, `noise_pp = 0.56 pp`, `min_ratio = 0.8799` (`Llama 3.2 1B Q4_0` `cand2` dropped to `183.5 tok/s` vs `243.7 tok/s` in `cand1` when `PID 73352` `forecast screen` hit 99% GPU), `ratios_ok = false`, `Qwen3.5 9B IQ2_M` `36.10 -> 38.95 tok/s` (`+7.89%`).
   - `loop_guard = 0`. Marked `inconclusive` until verified on an idle GPU; `target/loop-base/gibbs` restored to `a701ad7`.
+
+## Iteration `rsi-12` (`17cd933`): KEEP (`+0.48 pp` >= `max(0.30, noise_pp 0.04)`, `min_ratio = 0.9969`, `ratios_ok = true`, `loop_guard = 0`, promoted to `target/loop-base/gibbs`)
+- **Changes**:
+  1. Zero-bias `TILE_TQ2_0` (`a = 4.0, b = 0.0` via `as_type<float>(0x3F800000u | (y & 0x00600000u)) - 1.25f`) in `src/graph/codec.rs` and `t.b == 0.0` fast path in `tile_loop` (`src/graph/codegen.rs`), eliminating `sx_parts` (16 extra `xb` float loads per tile) and `simd_shuffle_xor` reductions (`TQ2_0` `1536x6144`: `150 -> 158 GB/s`, `262144x1536`: `200 -> 204 GB/s`).
+  2. Added `rmsnorm_fused_f32` (`src/graph/metal_kernels.metal`, `src/graph/metal.rs`): `Op::RmsNorm` in `plan()` absorbs a single-reader scalar `Op::Mul` (`numel == 1`, `scale: Option<ValueId>`), and `batch_horizontal()` chains a following pre-norm `Step::RmsNorm` (`chain: Option<(ValueId, ValueId, f32)>`) that normalizes the post-norm/residual output into the same dispatch, eliminating 91 dispatches/token on `Gemma 4 E2B` (`662 -> 571` on QAT, `665 -> 577` on Q4_K_M) and 90 dispatches/token on `Gemma 4 26B-A4B` (`1108 -> 1018`).
+  3. Combined with `rsi-10`/`rsi-11`'s `WIDE_IQ2_M` + `WIDE_IQ3_S` (`groups = 8, segs = 4, uniform: true`) and per-weight tuned `variants` in `Step::MegakernelMlp` (keeping `Q4_0`/`Q4_K` on `HAND`).
+- **Full ABBA Verify (`bg_99`, vs `a701ad7`)**: `base_pct = 49.00% -> cand_pct = 49.49%`, `delta_pp = +0.4820 pp`, `noise_pp = 0.0362 pp`, `min_ratio = 0.9969`, `ratios_ok = true` (all 9 models `< 0.3%` base spread):
+  - `Gemma 4 E2B QAT`: `139.57 -> 143.32 tok/s` (`+2.69%`, `40.34%` roofline, `gpu_ms 6.55 ms`, `dispatches 662 -> 571`)
+  - `Gemma 4 E2B QAT ctx4k`: `125.11 -> 128.25 tok/s` (`+2.51%`, `36.10%` roofline, `gpu_ms 7.51 ms`, `dispatches 662 -> 571`)
+  - `Qwen3.5 9B IQ2_M`: `39.01 -> 40.43 tok/s` (`+3.63%`, `61.18%` roofline, `gpu_ms 24.39 ms`)
+  - `Gemma 4 E2B Q4_K_M`: `106.80 -> 107.54 tok/s` (`+0.69%`, `53.43%` roofline, `gpu_ms 8.84 ms`, `dispatches 665 -> 577`)
+  - `Llama 3.2 1B Q4_0`: `254.51 tok/s` (`65.57%` roofline), `Llama 3.2 1B bnb 4-bit`: `228.26 tok/s` (`58.86%` roofline), `Qwen3.5 2B`: `114.31 tok/s` (`48.70%` roofline), `26B-A4B`: `69.82 tok/s` (`51.26%` roofline, `dispatches 1108 -> 1018`), `SmolLM2 135M`: `428.21 tok/s` (`38.79%` roofline).

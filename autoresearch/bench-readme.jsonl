@@ -1,20 +1,72 @@
-{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":835682304,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":137.07208578574676,"roofline_tok_s":353.0244287385672,"roofline_pct":38.82793218461823,"wall_ms":7.295431409448819,"gpu_ms":6.884375,"run_ms":7.141625,"host_ms":0.41105640944881827,"encode_us":232.042,"dispatches":662.0,"weights_ms":2.832665160236125,"rss_gb":5.04520704}
-{"model":"unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-GGUF/snapshots/main/config.json","bytes_per_token":1474940928,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":105.45180221007615,"roofline_tok_s":200.019039661858,"roofline_pct":52.720882166191586,"wall_ms":9.483005307086614,"gpu_ms":9.027916,"run_ms":9.266417,"host_ms":0.4550893070866149,"encode_us":221.791,"dispatches":665.0,"weights_ms":4.999524053762827,"rss_gb":5.140201472}
-{"model":"unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf","file":"unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf","bytes_per_token":1291870208,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":111.91620831016374,"roofline_tok_s":228.36370569552577,"roofline_pct":49.00787888745338,"wall_ms":8.935256251968504,"gpu_ms":8.46575,"run_ms":8.882667,"host_ms":0.4695062519685038,"encode_us":123.125,"dispatches":448.0,"weights_ms":4.37897956224833,"rss_gb":4.657987584}
-{"model":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","file":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","bytes_per_token":4493328384,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":38.31476287824866,"roofline_tok_s":65.65651178022819,"roofline_pct":58.35637903898936,"wall_ms":26.099600385826772,"gpu_ms":25.799583,"run_ms":26.050375,"host_ms":0.3000173858267736,"encode_us":216.583,"dispatches":610.0,"weights_ms":15.2307817288146,"rss_gb":3.457531904}
-{"model":"unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/main/config.json","bytes_per_token":764923904,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":248.788909302291,"roofline_tok_s":385.6805447362901,"roofline_pct":64.5064711450252,"wall_ms":4.019471779527559,"gpu_ms":3.712499,"run_ms":3.9835,"host_ms":0.30697277952755897,"encode_us":52.041,"dispatches":179.0,"weights_ms":2.5928194036433756,"rss_gb":6.524256256}
-{"model":"HuggingFaceTB/SmolLM2-135M-Instruct","file":"/Users/keas/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/config.json","bytes_per_token":268959744,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":423.37772589915295,"roofline_tok_s":1096.8788993810526,"roofline_pct":38.59840189633119,"wall_ms":2.3619570393700786,"gpu_ms":1.983624,"run_ms":2.33225,"host_ms":0.37833303937007856,"encode_us":93.25,"dispatches":333.0,"weights_ms":0.9116776706747487,"rss_gb":1.435435008}
-{"model":"unsloth/Llama-3.2-1B-Instruct-bnb-4bit","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-bnb-4bit/snapshots/main/config.json","bytes_per_token":765624320,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":224.9477712899259,"roofline_tok_s":385.3277126522439,"roofline_pct":58.37830083426675,"wall_ms":4.445476362204724,"gpu_ms":4.13725,"run_ms":4.418167,"host_ms":0.3082263622047243,"encode_us":51.875,"dispatches":179.0,"weights_ms":2.5951935642440915,"rss_gb":7.91363584}
-{"model":"unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/main/config.json","bytes_per_token":2179676928,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":69.30895680347318,"roofline_tok_s":135.3486217093773,"roofline_pct":51.207730029415785,"wall_ms":14.428149637795276,"gpu_ms":13.997624,"run_ms":14.243417,"host_ms":0.43052563779527553,"encode_us":372.542,"dispatches":1108.0,"weights_ms":7.388327914762336,"rss_gb":2.582724608}
-{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":835682304,"bytes_basis":"streamed","ceiling_gbps":295.01626797652966,"decode_tok_s":123.20113653869798,"roofline_tok_s":353.0244287385672,"roofline_pct":34.89875671746636,"wall_ms":8.116808238095237,"gpu_ms":7.811874,"run_ms":8.057709,"host_ms":0.30493423809523623,"encode_us":218.709,"dispatches":662.0,"weights_ms":2.832665160236125,"rss_gb":5.047713792}
-METRIC geomean_roofline_pct=48.628909
-METRIC min_roofline_pct=34.898757
-METRIC gemma-4-E2B-it-qat-UD-Q2_K_XL_tok_s=137.1
-METRIC gemma-4-E2B-it-Q4_K_M_tok_s=105.5
-METRIC Qwen3.5-2B-UD-Q4_K_XL_tok_s=111.9
-METRIC Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M_tok_s=38.3
-METRIC Llama-3.2-1B-Instruct-Q4_0_tok_s=248.8
-METRIC SmolLM2-135M-Instruct_tok_s=423.4
-METRIC Llama-3.2-1B-Instruct-bnb-4bit_tok_s=224.9
-METRIC gemma-4-26B-A4B-it-UD-IQ2_XXS_tok_s=69.3
-METRIC e2b-qat-ctx4k_tok_s=123.2
+⚡ Prefill: 20 tokens in 102.49ms (195.1 tok/s)
+⚡ Prefill: 20 tokens in 88.91ms (224.9 tok/s)
+⚡ Prefill: 20 tokens in 88.60ms (225.7 tok/s)
+⚡ Prefill: 20 tokens in 88.73ms (225.4 tok/s)
+{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":835682304,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":143.28069315742562,"roofline_tok_s":361.94178252686146,"roofline_pct":39.58666837443452,"wall_ms":6.979307385826772,"gpu_ms":6.552458,"run_ms":6.805042,"host_ms":0.4268493858267721,"encode_us":196.708,"dispatches":571.0,"weights_ms":2.762875269659659,"rss_gb":5.015814144}
+METRIC geomean_roofline_pct=39.59
+METRIC min_roofline_pct=39.59
+METRIC gemma-4-E2B-it-qat-UD-Q2_K_XL_tok_s=143.3
+⚡ Prefill: 20 tokens in 116.30ms (172.0 tok/s)
+⚡ Prefill: 20 tokens in 89.79ms (222.7 tok/s)
+⚡ Prefill: 20 tokens in 90.09ms (222.0 tok/s)
+⚡ Prefill: 20 tokens in 90.21ms (221.7 tok/s)
+{"model":"unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-GGUF/snapshots/main/config.json","bytes_per_token":1474940928,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":107.62434075038455,"roofline_tok_s":205.07149608090236,"roofline_pct":52.481374938585255,"wall_ms":9.291578401574803,"gpu_ms":8.839499,"run_ms":9.093875,"host_ms":0.4520794015748031,"encode_us":197.625,"dispatches":577.0,"weights_ms":4.87634809864308,"rss_gb":5.093965824}
+METRIC geomean_roofline_pct=52.48
+METRIC min_roofline_pct=52.48
+METRIC gemma-4-E2B-it-Q4_K_M_tok_s=107.6
+⚡ Prefill: 25 tokens in 228.64ms (109.3 tok/s)
+⚡ Prefill: 25 tokens in 219.46ms (113.9 tok/s)
+⚡ Prefill: 25 tokens in 219.46ms (113.9 tok/s)
+⚡ Prefill: 25 tokens in 219.11ms (114.1 tok/s)
+{"model":"unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf","file":"unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf","bytes_per_token":1264869376,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":114.23506094341109,"roofline_tok_s":239.1301018706255,"roofline_pct":47.77109199126034,"wall_ms":8.753879866141732,"gpu_ms":8.251791,"run_ms":8.696041,"host_ms":0.5020888661417313,"encode_us":122.709,"dispatches":458.0,"weights_ms":4.181824003658984,"rss_gb":4.76381184}
+METRIC geomean_roofline_pct=47.77
+METRIC min_roofline_pct=47.77
+METRIC Qwen3.5-2B-UD-Q4_K_XL_tok_s=114.2
+⚡ Prefill: 23 tokens in 618.52ms (37.2 tok/s)
+⚡ Prefill: 23 tokens in 570.92ms (40.3 tok/s)
+⚡ Prefill: 23 tokens in 569.00ms (40.4 tok/s)
+⚡ Prefill: 23 tokens in 569.09ms (40.4 tok/s)
+{"model":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","file":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","bytes_per_token":4493328384,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":40.44167954241642,"roofline_tok_s":67.31498721815088,"roofline_pct":60.078269659853234,"wall_ms":24.72696513385827,"gpu_ms":24.386791,"run_ms":24.651625,"host_ms":0.34017413385826956,"encode_us":204.0,"dispatches":610.0,"weights_ms":14.855532791817259,"rss_gb":3.448602624}
+METRIC geomean_roofline_pct=60.08
+METRIC min_roofline_pct=60.08
+METRIC Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M_tok_s=40.4
+⚡ Prefill: 64 tokens in 165.12ms (387.6 tok/s)
+⚡ Prefill: 64 tokens in 102.98ms (621.5 tok/s)
+⚡ Prefill: 64 tokens in 100.09ms (639.5 tok/s)
+⚡ Prefill: 64 tokens in 100.42ms (637.3 tok/s)
+{"model":"unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/main/config.json","bytes_per_token":764923904,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":254.18902767042712,"roofline_tok_s":395.42278801096865,"roofline_pct":64.2828474679047,"wall_ms":3.934080118110236,"gpu_ms":3.621666,"run_ms":3.899458,"host_ms":0.3124141181102362,"encode_us":50.792,"dispatches":179.0,"weights_ms":2.528938721589968,"rss_gb":6.530695168}
+METRIC geomean_roofline_pct=64.28
+METRIC min_roofline_pct=64.28
+METRIC Llama-3.2-1B-Instruct-Q4_0_tok_s=254.2
+⚡ Prefill: 41 tokens in 31.34ms (1308.3 tok/s)
+⚡ Prefill: 41 tokens in 15.65ms (2619.7 tok/s)
+⚡ Prefill: 41 tokens in 15.40ms (2662.6 tok/s)
+⚡ Prefill: 41 tokens in 15.33ms (2674.8 tok/s)
+{"model":"HuggingFaceTB/SmolLM2-135M-Instruct","file":"/Users/keas/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/config.json","bytes_per_token":268959744,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":428.82563341623273,"roofline_tok_s":1124.5859258994333,"roofline_pct":38.13186912091773,"wall_ms":2.3319501496062993,"gpu_ms":1.9515,"run_ms":2.30525,"host_ms":0.3804501496062993,"encode_us":94.459,"dispatches":333.0,"weights_ms":0.8892161790129194,"rss_gb":1.435615232}
+METRIC geomean_roofline_pct=38.13
+METRIC min_roofline_pct=38.13
+METRIC SmolLM2-135M-Instruct_tok_s=428.8
+⚡ Prefill: 48 tokens in 112.79ms (425.6 tok/s)
+⚡ Prefill: 48 tokens in 76.54ms (627.1 tok/s)
+⚡ Prefill: 48 tokens in 72.80ms (659.3 tok/s)
+⚡ Prefill: 48 tokens in 72.49ms (662.2 tok/s)
+{"model":"unsloth/Llama-3.2-1B-Instruct-bnb-4bit","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-bnb-4bit/snapshots/main/config.json","bytes_per_token":765624320,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":228.34611460554484,"roofline_tok_s":395.0610434317375,"roofline_pct":57.80021047430881,"wall_ms":4.3793169055118115,"gpu_ms":4.070624,"run_ms":4.348916,"host_ms":0.30869290551181194,"encode_us":50.0,"dispatches":179.0,"weights_ms":2.5312543887228145,"rss_gb":7.918747648}
+METRIC geomean_roofline_pct=57.80
+METRIC min_roofline_pct=57.80
+METRIC Llama-3.2-1B-Instruct-bnb-4bit_tok_s=228.3
+⚡ Prefill: 24 tokens in 234.08ms (102.5 tok/s)
+⚡ Prefill: 24 tokens in 171.21ms (140.2 tok/s)
+⚡ Prefill: 24 tokens in 171.61ms (139.8 tok/s)
+⚡ Prefill: 24 tokens in 172.03ms (139.5 tok/s)
+{"model":"unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/main/config.json","bytes_per_token":2179676928,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":69.87433090582755,"roofline_tok_s":138.76751129969043,"roofline_pct":50.35352313476521,"wall_ms":14.31140716535433,"gpu_ms":13.892416,"run_ms":14.147208,"host_ms":0.41899116535432945,"encode_us":330.5,"dispatches":1018.0,"weights_ms":7.20629771791714,"rss_gb":3.452469248}
+METRIC geomean_roofline_pct=50.35
+METRIC min_roofline_pct=50.35
+METRIC gemma-4-26B-A4B-it-UD-IQ2_XXS_tok_s=69.9
+⚡ Prefill: 5777 tokens in 28446.09ms (203.1 tok/s)
+⚡ Prefill: 5777 tokens in 28776.24ms (200.8 tok/s)
+⚡ Prefill: 5777 tokens in 28391.11ms (203.5 tok/s)
+⚡ Prefill: 5777 tokens in 28158.35ms (205.2 tok/s)
+{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":835682304,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":128.20491087771518,"roofline_tok_s":361.94178252686146,"roofline_pct":35.421417771295985,"wall_ms":7.800013222222222,"gpu_ms":7.509541,"run_ms":7.759833,"host_ms":0.29047222222222224,"encode_us":193.084,"dispatches":571.0,"weights_ms":2.762875269659659,"rss_gb":5.04520704}
+METRIC geomean_roofline_pct=35.42
+METRIC min_roofline_pct=35.42
+METRIC e2b-qat-ctx4k_tok_s=128.2
