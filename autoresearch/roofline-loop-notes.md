@@ -444,3 +444,17 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
   - `Llama 3.2 1B bnb 4-bit`: `228.20 -> 230.97 tok/s` (`+1.21%`, `58.46%` roofline, `gpu_ms 4.03 ms`, `dispatches 179 -> 147`)
   - `Gemma 4 26B-A4B`: `69.84 -> 70.87 tok/s` (`+1.48%`, `51.07%` roofline, `gpu_ms 13.85 ms`, `dispatches 1018 -> 923`)
   - `Qwen3.5 2B`: `114.49 -> 114.77 tok/s` (`+0.24%`, `48.00%` roofline, `dispatches 458 -> 446`), `Qwen3.5 9B IQ2_M`: `40.39 -> 40.49 tok/s` (`+0.23%`, `60.15%` roofline, `dispatches 610 -> 594`), `Gemma 4 E2B QAT ctx4k`: `127.31 tok/s` (`dispatches 571 -> 521`).
+
+## Iteration `rsi-14` (`96ab660`): KEEP (`+0.71 pp` >= `max(0.30, noise_pp 0.26)`, geomean `50.08%`, `Gemma 4 E2B QAT = 151.15 tok/s >= 150.0 tok/s target`, `ratios_ok = true`, `loop_guard = 0`, promoted to `target/loop-base/gibbs`)
+- **Changes**:
+  1. Fused preceding post-attention residual `Step::RmsNorm` (`norm(x0) * g0 + res0`) directly into `Step::MegakernelMlp` (`pre_res`) via `rmsnorm_fused_f32` (with disjoint `scratch + 8` reduction workspace in the second `block_sum`), writing both the residual-added `x` (needed by the MLP down-projection residual) and the pre-FF normalized vector `scratch[off_norm]` in a single dispatch (`-15` dispatches on E2B QAT, `-18` on E2B Q4_K_M, `-6` on Qwen3.5 2B).
+  2. Vectorized `gemv_q4_k` (16 sub-units per 256-element block with `packed_uint2` loads and factored `d`/`dmin` scales, `100%` lane utilization on `cols = 1536`, `178 -> 194 GB/s`), `gemv_q8_0` (4 sub-units per 32-element block with `packed_ushort4` loads), `gemv_q2_k` (`packed_uint2` loads and factored scale/min), and added `gemv_q4_0_half` (2 lanes per 32-element block when `(cols & 1023) != 0`, `210 -> 227 GB/s` on `6144x1536` and `250 -> 291 GB/s` on `262144x1536`, while keeping `gemv_q4_0` untouched for `cols % 1024 == 0`).
+  3. Scaled decode GQA split attention (`min_keys = 32, split_keys = 16`) for `head_dim >= 256` (`CachedAttention` on E2B QAT `950 -> 729 us`, `-221 us/tok`) and lowered `CB_CHUNK_MIN_STEPS` from `400` to `220` so 273–399-step graphs (SmolLM2 135M, Qwen3.5 2B) pipeline command buffers (`host_ms` `-95` to `-180 us/tok`).
+- **Full ABBA Verify (`bg_122`, vs `c5cb49d`)**: `base_pct = 49.36% -> cand_pct = 50.08%`, `delta_pp = +0.7126 pp`, `noise_pp = 0.2576 pp`, `ratios_ok = true`:
+  - `Gemma 4 E2B QAT`: `151.15 tok/s` (`cand1`, `41.9%` roofline, `gpu_ms 6.32 ms`, `dispatches 521 -> 506`; 4-round screen `bg_120`: `146.0 -> 150.8 tok/s`, `+3.37%`, `4/4` pairs — **exceeds 150.0 tok/s target**)
+  - `Gemma 4 E2B Q4_K_M`: `109.85 -> 113.61 tok/s` (`+3.42%`, `55.4%` roofline, `gpu_ms 8.51 ms`, `dispatches 527 -> 509`)
+  - `SmolLM2 135M`: `450.12 -> 468.63 tok/s` (`+4.11%`, `41.7%` roofline, `gpu_ms 1.88 ms`, `host_ms 0.25 ms`, `dispatches 273`)
+  - `Qwen3.5 2B`: `114.07 -> 115.40 tok/s` (`+1.17%`, `50.6%` roofline, `gpu_ms 8.37 ms`, `host_ms 0.29 ms`, `dispatches 436 -> 430`)
+  - `Llama 3.2 1B Q4_0`: `256.92 -> 257.26 tok/s` (`+0.13%`, `65.0%` roofline, `gpu_ms 3.59 ms`, `dispatches 147`)
+  - `Llama 3.2 1B bnb 4-bit`: `230.35 tok/s` (`58.2%` roofline, `gpu_ms 4.06 ms`, `dispatches 147`)
+  - `Gemma 4 26B-A4B`: `70.75 -> 71.09 tok/s` (`+0.47%`, `51.2%` roofline, `gpu_ms 13.77 ms`, `dispatches 923`), `Qwen3.5 9B IQ2_M`: `40.41 tok/s` (`60.1%` roofline, `dispatches 594`), `Gemma 4 E2B QAT ctx4k`: `124.7 tok/s` (`dispatches 506`).
