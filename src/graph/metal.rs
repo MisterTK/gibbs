@@ -267,10 +267,15 @@ impl WeightFormat {
         })
     }
 
-    /// Today's kernel for this format: the hand one where it exists (except `IQ4_XS`, whose `Wide`
-    /// codec is faster at 2 rows), else generated at 2 rows.
+    /// Today's kernel for this format: the hand one where it exists (except `IQ4_XS`, `IQ2_M`, and
+    /// `IQ3_S`, whose `Wide` codecs are faster at 2 rows), else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if self.hand_kernel().is_some() && self != WeightFormat::IQ4_XS {
+        if self.hand_kernel().is_some()
+            && !matches!(
+                self,
+                WeightFormat::IQ4_XS | WeightFormat::IQ2_M | WeightFormat::IQ3_S
+            )
+        {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)

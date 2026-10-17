@@ -64,6 +64,8 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
         QuantFormat::GGUF_IQ4_XS => Some(&WIDE_IQ4_XS),
         QuantFormat::GGUF_IQ4_NL => Some(&WIDE_IQ4_NL),
         QuantFormat::GGUF_IQ2_XXS => Some(&WIDE_IQ2_XXS),
+        QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => Some(&WIDE_IQ2_M),
+        QuantFormat::GGUF_IQ3_S => Some(&WIDE_IQ3_S),
         QuantFormat::BNB_NF4_B64 => Some(&WIDE_BNB_NF4_B64),
         QuantFormat::BNB_NF4_B128 => Some(&WIDE_BNB_NF4_B128),
         QuantFormat::BNB_NF4_B256 => Some(&WIDE_BNB_NF4_B256),
@@ -418,6 +420,61 @@ static WIDE_BNB_NF4_B128: Wide = Wide {
 static WIDE_BNB_NF4_B256: Wide = Wide {
     groups: 16,
     ..WIDE_BNB_NF4_B64
+};
+
+static WIDE_IQ2_M: Wide = Wide {
+    uniform: true,
+    groups: 8,
+    segs: 4,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    uint q4 = cd_u32(blk + 2 + 4 * g);
+    uint s4 = cd_u32(blk + 34 + 4 * g);
+    uint qh = blk[66 + g];
+    uint sc = blk[74 + g];
+    float sc0 = 0.5f + float(sc & 0x0Fu);
+    float sc1 = 0.5f + float(sc >> 4);
+    for (uint k = 0; k < 4; k++) {
+        float sk = (k < 2) ? sc0 : sc1;
+        uint idx = ((q4 >> (8 * k)) & 0xFFu) | ((qh << (8 - 2 * k)) & 0x300u);
+        uint2 gv = as_type<uint2>(IQ2S_GRID[idx]);
+        float4 v0 = float4(as_type<uchar4>(gv.x)) * sk;
+        float4 v1 = float4(as_type<uchar4>(gv.y)) * sk;
+        uint s = (s4 >> (8 * k)) & 0xFFu;
+        for (uint j = 0; j < 4; j++) {
+            out[8 * k + j] = (s & (1u << j)) ? -v0[j] : v0[j];
+            out[8 * k + 4 + j] = (s & (16u << j)) ? -v1[j] : v1[j];
+        }
+    }
+    out[32] = cd_f16(blk) * 0.25f;
+}
+"#,
+};
+
+static WIDE_IQ3_S: Wide = Wide {
+    uniform: true,
+    groups: 8,
+    segs: 4,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    uint h = blk[66 + g];
+    uint s4 = cd_u32(blk + 74 + 4 * g);
+    for (uint k = 0; k < 4; k++) {
+        uint q2 = cd_u16(blk + 2 + 8 * g + 2 * k);
+        float4 v0 = float4(as_type<uchar4>(IQ3S_GRID[(q2 & 0xFFu) | ((h << (8 - 2 * k)) & 256u)]));
+        float4 v1 = float4(as_type<uchar4>(IQ3S_GRID[(q2 >> 8) | ((h << (7 - 2 * k)) & 256u)]));
+        uint s = (s4 >> (8 * k)) & 0xFFu;
+        for (uint j = 0; j < 4; j++) {
+            out[8 * k + j] = (s & (1u << j)) ? -v0[j] : v0[j];
+            out[8 * k + 4 + j] = (s & (16u << j)) ? -v1[j] : v1[j];
+        }
+    }
+    uint sc = (uint(blk[106 + (g >> 1)]) >> (4 * (g & 1u))) & 0x0Fu;
+    out[32] = cd_f16(blk) * float(1 + 2 * int(sc));
+}
+"#,
 };
 
 pub const CODEC_Q4_0: Codec = Codec {
