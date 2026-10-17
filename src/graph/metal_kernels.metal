@@ -564,7 +564,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
             outr[i] = v;
             sq2 += v * v;
         }
-        float inv2 = rsqrt(block_sum(sq2, scratch, sg, lane, nsg) / float(p.d) + p.eps2);
+        float inv2 = rsqrt(block_sum(sq2, scratch + 8, sg, lane, nsg) / float(p.d) + p.eps2);
         for (uint i = tid; i < p.d; i += tpg) {
             out2r[i] = outr[i] * inv2 * g2[i];
         }
@@ -687,7 +687,77 @@ kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
             acc1 += d1 * b_acc1;
         }
     }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
+                           device const float* x [[buffer(1)]],
+                           device float* y [[buffer(2)]],
+                           constant PackedGemvParams& p [[buffer(3)]],
+                           device const float* bias [[buffer(4)]],
+                           device const float* res [[buffer(5)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 32;
+    uint n_sub = n_blocks * 2;
+    device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 1;
+        uint half_off = (s & 1) * 8;
+        device const float* xb = xb_base + b * 32 + half_off;
+
+        float4 x_lo0 = *reinterpret_cast<device const float4*>(xb);
+        float4 x_lo1 = *reinterpret_cast<device const float4*>(xb + 4);
+        float4 x_hi0 = *reinterpret_cast<device const float4*>(xb + 16);
+        float4 x_hi1 = *reinterpret_cast<device const float4*>(xb + 20);
+        float sum_x = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                    + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
+                    + (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                    + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
+
+        uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + half_off)));
+        float dot0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
+                   + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1)
+                   + dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                   + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+        acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
+
+        if (has_row1) {
+            uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + half_off)));
+            float dot1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
+                       + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
+                       + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                       + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
+        }
+    }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
 
@@ -726,6 +796,7 @@ kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
     bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 32;
+    uint n_sub = n_blocks * 4;
     device const block_q8_0* r0_blocks = w + (ulong)row0 * n_blocks;
     device const block_q8_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
@@ -733,29 +804,17 @@ kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
-    for (uint b = lane; b < n_blocks; b += 32) {
-        block_q8_0 blk0 = r0_blocks[b];
-        block_q8_0 blk1 = has_row1 ? r1_blocks[b] : blk0;
-        float d0 = float(blk0.d);
-        float d1 = float(blk1.d);
-        device const float* xb = xb_base + b * 32;
-
-        float b_acc0 = 0.0f;
-        float b_acc1 = 0.0f;
-
-        #pragma unroll
-        for (uint j = 0; j < 32; j += 4) {
-            uint32_t q_raw0 = *reinterpret_cast<thread const uint32_t*>(&blk0.qs[j]);
-            uint32_t q_raw1 = *reinterpret_cast<thread const uint32_t*>(&blk1.qs[j]);
-            float4 v0 = float4(as_type<char4>(q_raw0));
-            float4 v1 = float4(as_type<char4>(q_raw1));
-            float4 x_vec = *reinterpret_cast<device const float4*>(xb + j);
-            b_acc0 += dot(v0, x_vec);
-            b_acc1 += dot(v1, x_vec);
-        }
-        acc0 += d0 * b_acc0;
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 2;
+        uint j = (s & 3) * 8;
+        device const float* xb = xb_base + b * 32 + j;
+        float4 x0 = *reinterpret_cast<device const float4*>(xb);
+        float4 x1 = *reinterpret_cast<device const float4*>(xb + 4);
+        uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + j)));
+        acc0 += float(r0_blocks[b].d) * (dot(float4(as_type<char4>(q0.x)), x0) + dot(float4(as_type<char4>(q0.y)), x1));
         if (has_row1) {
-            acc1 += d1 * b_acc1;
+            uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + j)));
+            acc1 += float(r1_blocks[b].d) * (dot(float4(as_type<char4>(q1.x)), x0) + dot(float4(as_type<char4>(q1.y)), x1));
         }
     }
     acc0 = simd_sum(acc0);
@@ -961,17 +1020,13 @@ kernel void gemv_iq4_xs(device const block_iq4_xs* w [[buffer(0)]],
         for (uint j = 0; j < 16; ++j) {
             uint8_t q0 = blk0.qs[ib * 16 + j];
             uint8_t q1 = blk1.qs[ib * 16 + j];
-            float v0_0 = dl0 * kvalues_iq4nl[q0 & 0x0F];
-            float v1_0 = dl0 * kvalues_iq4nl[q0 >> 4];
-            float v0_1 = dl1 * kvalues_iq4nl[q1 & 0x0F];
-            float v1_1 = dl1 * kvalues_iq4nl[q1 >> 4];
             float xj = xb_sub[j];
             float xj16 = xb_sub[j + 16];
-            sb_acc0 += v0_0 * xj + v1_0 * xj16;
-            sb_acc1 += v0_1 * xj + v1_1 * xj16;
+            sb_acc0 += kvalues_iq4nl[q0 & 0x0F] * xj + kvalues_iq4nl[q0 >> 4] * xj16;
+            sb_acc1 += kvalues_iq4nl[q1 & 0x0F] * xj + kvalues_iq4nl[q1 >> 4] * xj16;
         }
-        acc0 += sb_acc0;
-        acc1 += sb_acc1;
+        acc0 += dl0 * sb_acc0;
+        acc1 += dl1 * sb_acc1;
     }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
@@ -1262,57 +1317,52 @@ kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
     bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 256;
-    uint n_groups = n_blocks * 4;
+    uint n_sub = n_blocks * 16;
     device const block_q4_k* r0_blocks = w + (ulong)row0 * n_blocks;
     device const block_q4_k* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-    for (uint grp = lane; grp < n_groups; grp += 32) {
-        uint b = grp >> 2;
-        uint g = grp & 3;
-        device const block_q4_k& blk0 = r0_blocks[b];
-        device const block_q4_k& blk1 = has_row1 ? r1_blocks[b] : blk0;
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 4;
+        uint g = (s >> 2) & 3;
+        uint sub = s & 3;
+        uint q_off = g * 32 + sub * 8;
+        device const float* xb_g = xb_base + (ulong)(b * 256 + g * 64 + sub * 8);
 
-        float d0 = float(blk0.d);
-        float dmin0 = float(blk0.dmin);
+        float4 x_lo0 = *reinterpret_cast<device const float4*>(xb_g);
+        float4 x_lo1 = *reinterpret_cast<device const float4*>(xb_g + 4);
+        float4 x_hi0 = *reinterpret_cast<device const float4*>(xb_g + 32);
+        float4 x_hi1 = *reinterpret_cast<device const float4*>(xb_g + 36);
+        float sum_x_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                       + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w);
+        float sum_x_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                       + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
+
+        device const block_q4_k& blk0 = r0_blocks[b];
         float2 sm0_0 = k4_scale_min(2 * g, blk0.scales);
         float2 sm1_0 = k4_scale_min(2 * g + 1, blk0.scales);
-        float d0_0 = d0 * sm0_0.x;
-        float min0_0 = dmin0 * sm0_0.y;
-        float d1_0 = d0 * sm1_0.x;
-        float min1_0 = dmin0 * sm1_0.y;
+        uint2 q0 = uint2(*reinterpret_cast<device const packed_uint2*>(blk0.qs + q_off));
+        float dot_lo0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
+                      + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1);
+        float dot_hi0 = dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                      + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+        acc0 += float(blk0.d) * (sm0_0.x * dot_lo0 + sm1_0.x * dot_hi0)
+              - float(blk0.dmin) * (sm0_0.y * sum_x_lo + sm1_0.y * sum_x_hi);
 
-        float d1 = float(blk1.d);
-        float dmin1 = float(blk1.dmin);
-        float2 sm0_1 = k4_scale_min(2 * g, blk1.scales);
-        float2 sm1_1 = k4_scale_min(2 * g + 1, blk1.scales);
-        float d0_1 = d1 * sm0_1.x;
-        float min0_1 = dmin1 * sm0_1.y;
-        float d1_1 = d1 * sm1_1.x;
-        float min1_1 = dmin1 * sm1_1.y;
-
-        device const float* xb_g = xb_base + (ulong)grp * 64;
-
-        float grp_acc0 = 0.0f;
-        float grp_acc1 = 0.0f;
-        for (uint l = 0; l < 32; ++l) {
-            float x_lo = xb_g[l];
-            float x_hi = xb_g[32 + l];
-
-            uint8_t q0 = blk0.qs[g * 32 + l];
-            float v0_0 = d0_0 * float(q0 & 0x0F) - min0_0;
-            float v1_0 = d1_0 * float(q0 >> 4) - min1_0;
-            grp_acc0 += v0_0 * x_lo + v1_0 * x_hi;
-
-            uint8_t q1 = blk1.qs[g * 32 + l];
-            float v0_1 = d0_1 * float(q1 & 0x0F) - min0_1;
-            float v1_1 = d1_1 * float(q1 >> 4) - min1_1;
-            grp_acc1 += v0_1 * x_lo + v1_1 * x_hi;
+        if (has_row1) {
+            device const block_q4_k& blk1 = r1_blocks[b];
+            float2 sm0_1 = k4_scale_min(2 * g, blk1.scales);
+            float2 sm1_1 = k4_scale_min(2 * g + 1, blk1.scales);
+            uint2 q1 = uint2(*reinterpret_cast<device const packed_uint2*>(blk1.qs + q_off));
+            float dot_lo1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
+                          + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1);
+            float dot_hi1 = dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                          + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(blk1.d) * (sm0_1.x * dot_lo1 + sm1_1.x * dot_hi1)
+                  - float(blk1.dmin) * (sm0_1.y * sum_x_lo + sm1_1.y * sum_x_hi);
         }
-        acc0 += grp_acc0;
-        if (has_row1) acc1 += grp_acc1;
     }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
@@ -1380,35 +1430,31 @@ kernel void gemv_q2_k(device const block_q2_k* w [[buffer(0)]],
         uint sc0 = blk0.scales[is];
         float dl0 = d0 * float(sc0 & 0x0F);
         float ml0 = min0 * float(sc0 >> 4);
-
         uint sc1 = blk1.scales[is];
         float dl1 = d1 * float(sc1 & 0x0F);
         float ml1 = min1 * float(sc1 >> 4);
 
-        // n in 0..2, shift in [0, 2, 4, 6], half in 0..2
-        // is = n * 8 + (shift / 2) * 2 + half
-        uint n_part = is >> 3; // 0 or 1
-        uint shift = (is & 6); // 0, 2, 4, or 6
-        uint half_sub = is & 1; // 0 or 1
+        uint n_part = is >> 3;
+        uint shift = (is & 6);
+        uint half_sub = is & 1;
 
         uint q_off = n_part * 32 + half_sub * 16 + half_idx * 8;
         device const float* x_sub = xb + is * 16 + half_idx * 8;
 
-        float b_acc0 = 0.0f;
-        float b_acc1 = 0.0f;
+        float4 x0 = *reinterpret_cast<device const float4*>(x_sub);
+        float4 x1 = *reinterpret_cast<device const float4*>(x_sub + 4);
+        float sum_x = (x0.x + x0.y + x0.z + x0.w) + (x1.x + x1.y + x1.z + x1.w);
 
-        #pragma unroll
-        for (uint l = 0; l < 8; ++l) {
-            float x_val = x_sub[l];
-            uint q0 = (uint(blk0.qs[q_off + l]) >> shift) & 3;
-            uint q1 = (uint(blk1.qs[q_off + l]) >> shift) & 3;
-            b_acc0 += (dl0 * float(q0) - ml0) * x_val;
-            b_acc1 += (dl1 * float(q1) - ml1) * x_val;
-        }
+        uint2 q0 = uint2(*reinterpret_cast<device const packed_uint2*>(blk0.qs + q_off));
+        float dot0 = dot(float4(as_type<uchar4>((q0.x >> shift) & 0x03030303u)), x0)
+                   + dot(float4(as_type<uchar4>((q0.y >> shift) & 0x03030303u)), x1);
+        acc0 += dl0 * dot0 - ml0 * sum_x;
 
-        acc0 += b_acc0;
         if (has_row1) {
-            acc1 += b_acc1;
+            uint2 q1 = uint2(*reinterpret_cast<device const packed_uint2*>(blk1.qs + q_off));
+            float dot1 = dot(float4(as_type<uchar4>((q1.x >> shift) & 0x03030303u)), x0)
+                       + dot(float4(as_type<uchar4>((q1.y >> shift) & 0x03030303u)), x1);
+            acc1 += dl1 * dot1 - ml1 * sum_x;
         }
     }
 
@@ -2017,10 +2063,11 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
     for (uint s = 0; s < p.n_splits; ++s) gm = max(gm, base[s * (hd + 2)]);
     float gl = 0.0f;
     for (uint s = 0; s < p.n_splits; ++s) gl += base[s * (hd + 2) + 1] * exp(base[s * (hd + 2)] - gm);
+    float inv_gl = 1.0f / gl;
     for (uint d = tid; d < hd; d += ntg.x) {
         float o = 0.0f;
         for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
-        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o * inv_gl;
     }
 }
 

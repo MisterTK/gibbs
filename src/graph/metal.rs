@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 63] = [
+const BASE_KERNELS: [&str; 64] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -436,6 +436,7 @@ const BASE_KERNELS: [&str; 63] = [
     "swiglu_f32",
     "geglu_f32",
     "gemv_q4_0",
+    "gemv_q4_0_half",
     "gemv_q8_0",
     "gemv_bf16",
     "gemv_f16",
@@ -2142,6 +2143,7 @@ impl Session {
         &self,
         format: WeightFormat,
         variant: GemvVariant,
+        cols: usize,
     ) -> Result<(ComputePipelineState, u64), String> {
         let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
             Ok((
@@ -2166,6 +2168,9 @@ impl Session {
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
             (_, GemvKernel::Hand) => match format.hand_kernel() {
+                Some(_) if format == WeightFormat::Q4_0 && (cols & 1023) != 0 => {
+                    Ok((self.rt.pso("gemv_q4_0_half")?.clone(), 16))
+                }
                 Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
                 None => Err(format!(
                     "Metal executor: unsupported packed GEMV format {format:?}"
@@ -2823,7 +2828,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -3104,7 +3109,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
@@ -3461,11 +3466,16 @@ impl Session {
                 let len = start_pos as usize + 1;
                 let lo = window.map_or(0, |w| len.saturating_sub(w));
                 let n_keys = len - lo;
-                let n_splits = if gqa_decode && n_keys >= ATTN_SPLIT_MIN_KEYS {
+                let (min_keys, split_keys) = if head_dim >= 256 {
+                    (32, 16)
+                } else {
+                    (ATTN_SPLIT_MIN_KEYS, ATTN_SPLIT_KEYS)
+                };
+                let n_splits = if gqa_decode && n_keys >= min_keys {
                     let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
                     ATTN_TARGET_TGS
                         .div_ceil(head_tgs)
-                        .min(n_keys / ATTN_SPLIT_KEYS)
+                        .min(n_keys / split_keys)
                         .clamp(2, ATTN_MAX_SPLITS)
                 } else {
                     1
@@ -3742,6 +3752,7 @@ impl Session {
                 up_w,
                 down_w,
                 post_norm_w,
+                pre_res,
                 ref gate_name,
                 ref up_name,
                 ref down_name,
@@ -3769,17 +3780,55 @@ impl Session {
                 let off_gate = bytes_norm;
                 let off_up = bytes_norm + bytes_inter;
 
-                // 1. RMSNorm: x * norm_w -> scratch[off_norm]
-                enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
-                bind(0, x);
-                bind(1, norm_w);
-                enc.set_buffer(2, Some(scratch), off_norm as u64);
-                #[repr(C)]
-                struct RmsNormParams(u32, u32, f32);
-                let p = RmsNormParams(1, u32_of(hidden)?, eps);
-                set_bytes(enc, 3, &p);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
-
+                // 1. RMSNorm: x * norm_w -> scratch[off_norm] (optionally fused with preceding post-attn norm/residual -> x)
+                if let Some((x0, g0, res0, scale0, eps0)) = pre_res {
+                    #[repr(C)]
+                    struct RmsNormFusedParams {
+                        rows: u32,
+                        d: u32,
+                        eps: f32,
+                        eps2: f32,
+                        flags: u32,
+                        n_seq: u32,
+                        rotary_dim: u32,
+                        pair_stride: u32,
+                        mscale: f32,
+                    }
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
+                    bind(0, x0);
+                    bind(1, g0);
+                    bind(2, res0.unwrap_or(x0));
+                    bind(3, scale0.unwrap_or(x0));
+                    bind(4, x);
+                    bind(5, norm_w);
+                    enc.set_buffer(6, Some(scratch), off_norm as u64);
+                    let flags = (res0.is_some() as u32) | ((scale0.is_some() as u32) << 1) | 4;
+                    let p = RmsNormFusedParams {
+                        rows: 1,
+                        d: u32_of(hidden)?,
+                        eps: eps0,
+                        eps2: eps,
+                        flags,
+                        n_seq: 1,
+                        rotary_dim: 0,
+                        pair_stride: 1,
+                        mscale: 1.0,
+                    };
+                    set_bytes(enc, 7, &p);
+                    bind(8, x0);
+                    bind(9, x0);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
+                } else {
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_f32")?);
+                    bind(0, x);
+                    bind(1, norm_w);
+                    enc.set_buffer(2, Some(scratch), off_norm as u64);
+                    #[repr(C)]
+                    struct RmsNormParams(u32, u32, f32);
+                    let p = RmsNormParams(1, u32_of(hidden)?, eps);
+                    set_bytes(enc, 3, &p);
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
+                }
                 // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
                 self.encode_gemv_or_gemm(
                     enc,
@@ -4048,6 +4097,7 @@ pub enum Step {
         up_w: ValueId,
         down_w: ValueId,
         post_norm_w: Option<ValueId>,
+        pre_res: Option<(ValueId, ValueId, Option<ValueId>, Option<ValueId>, f32)>,
         gate_name: String,
         up_name: String,
         down_name: String,
@@ -4304,6 +4354,50 @@ fn batch_horizontal(
                             }
                             first.name = format!("{}+{}", first.name, next.name);
                         }
+                    }
+                }
+            }
+            if let Step::RmsNorm {
+                x: x0,
+                g: g0,
+                res: res0,
+                scale: scale0,
+                chain: None,
+                rope: None,
+                rows: 1,
+                d: d0,
+                eps: eps0,
+            } = first.op
+            {
+                if (res0.is_some() || scale0.is_some()) && first.extra_outs.is_empty() {
+                    let can_absorb = !aliases.contains_key(&first.out)
+                        && it.peek().is_some_and(|next| {
+                            matches!(
+                                next.op,
+                                Step::MegakernelMlp {
+                                    x: x_mlp,
+                                    pre_res: None,
+                                    hidden,
+                                    ..
+                                } if hidden == d0 && x_mlp == first.out
+                            )
+                        });
+                    if can_absorb {
+                        let mut mlp = it.next().expect("peeked");
+                        if let Step::MegakernelMlp {
+                            ref mut pre_res, ..
+                        } = mlp.op
+                        {
+                            *pre_res = Some((x0, g0, res0, scale0, eps0));
+                        }
+                        mlp.extra_outs.push(first.out);
+                        for &r in &first.reads {
+                            if !mlp.reads.contains(&r) {
+                                mlp.reads.push(r);
+                            }
+                        }
+                        mlp.name = format!("{}+{}", first.name, mlp.name);
+                        first = mlp;
                     }
                 }
             }
@@ -5157,6 +5251,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                             up_w,
                             down_w,
                             post_norm_w,
+                            pre_res: None,
                             gate_name,
                             up_name,
                             down_name,
@@ -5644,7 +5739,7 @@ fn print_kernel_profile(
     }
 }
 
-const CB_CHUNK_MIN_STEPS: usize = 400;
+const CB_CHUNK_MIN_STEPS: usize = 220;
 
 /// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
 fn cb_chunking() -> (usize, usize) {
@@ -6519,6 +6614,78 @@ mod tests {
                 assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
             }
         }
+    }
+
+    /// A residual RmsNorm (`norm(x0) * g0 + res0`) feeding a MegakernelMlp fuses into the MLP's
+    /// `pre_res` (`rmsnorm_fused_f32`) while keeping `x` live for the MLP down-projection residual.
+    #[test]
+    fn megakernel_mlp_fuses_pre_residual_norm_and_matches_cpu() {
+        let f = DType::F32;
+        let (h, inter) = (96usize, 192usize);
+        let mut g = Graph::new();
+        let x0 = g.input("x0", vec![1, h], f);
+        let res0 = g.input("res0", vec![1, h], f);
+        let g0 = g.weight("g0", vec![h], f);
+        let norm_w = g.weight("norm_w", vec![h], f);
+        let gate_w = g.weight("gate_w", vec![inter, h], f);
+        let up_w = g.weight("up_w", vec![inter, h], f);
+        let down_w = g.weight("down_w", vec![h, inter], f);
+        let post_w = g.weight("post_w", vec![h], f);
+
+        let attn_norm = g.add(
+            "attn_norm",
+            Op::RmsNorm { eps: 1e-5 },
+            &[x0, g0],
+            vec![1, h],
+            f,
+        );
+        let x = g.add("res_attn", Op::Add, &[res0, attn_norm], vec![1, h], f);
+        let ff_in = g.add(
+            "pre_ff_ln",
+            Op::RmsNorm { eps: 1e-6 },
+            &[x, norm_w],
+            vec![1, h],
+            f,
+        );
+        let gate = g.add("gate", Op::Linear, &[ff_in, gate_w], vec![1, inter], f);
+        let up = g.add("up", Op::Linear, &[ff_in, up_w], vec![1, inter], f);
+        let act = g.add("act", Op::GeGlu, &[gate, up], vec![1, inter], f);
+        let down = g.add("down", Op::Linear, &[act, down_w], vec![1, h], f);
+        let down_norm = g.add(
+            "post_ff_ln",
+            Op::RmsNorm { eps: 1e-5 },
+            &[down, post_w],
+            vec![1, h],
+            f,
+        );
+        let out = g.add("res_ff", Op::Add, &[x, down_norm], vec![1, h], f);
+        g.output(out);
+        crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g);
+
+        let mut w = Weights::new();
+        for (k, s) in [("g0", 1u64), ("norm_w", 2), ("post_w", 3)] {
+            w.insert(k, Tensor::F32(rand(h, s)));
+        }
+        for (k, n, s) in [
+            ("gate_w", inter * h, 4u64),
+            ("up_w", inter * h, 5),
+            ("down_w", h * inter, 6),
+        ] {
+            w.insert(k, Tensor::F32(rand(n, s)));
+        }
+        let sess = Session::new(rt(), &w).unwrap();
+        let prep = sess.prepare_plan(&g).unwrap();
+        assert_eq!(prep.steps.len(), 1);
+        assert!(matches!(
+            prep.steps[0].op,
+            Step::MegakernelMlp {
+                pre_res: Some(_),
+                ..
+            }
+        ));
+        let inp = vec![Tensor::F32(rand(h, 7)), Tensor::F32(rand(h, 8))];
+        let (want, got) = both(&g, &w, inp, None);
+        assert!(rel_err(&want, &got) < 1e-4);
     }
 
     /// Adjacent independent RmsNorms (different rows and eps) and Ropes (different head counts) become
