@@ -481,3 +481,25 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
   - `bg_136`: `base_pct = 50.46% -> cand_pct = 50.96%` (`delta_pp = +0.50 pp`, `min_ratio = 0.9938`, `ratios_ok = true`; `Qwen3.5 2B` `+1.53%`, `Qwen3.5 9B` `+1.93%`, `Gemma 4 26B-A4B` `+5.12%`), but control `Llama 3.2 1B bnb` drifted (`ratio = 1.032`, `base_spread = 0.070`), giving `noise_pp = 0.97 pp > delta_pp 0.50 pp`.
   - `bg_138` (re-verify): Uncontended `Model 0` (`Gemma 4 E2B QAT`) confirmed `base` (`96ab660`) at **`150.18 tok/s`** 2-run ABBA mean (`base_spread = 0.0017`, confirming `rsi-14` crosses the 150 tok/s target!) and `Qwen3.5 2B` at `+1.61%` (`112.02 -> 113.83 tok/s`, `base_spread = 0.0025`), before a foreign GPU spike hit `Model 3` (`24.5 tok/s`, `host_ms = 7.94 ms`) and `Model 6` (`base_spread = 0.157`).
   - Per `autoresearch/rsi-avantgarde-loop.md` §2.4, logged as `inconclusive (contended)`, preserved on branch `experiment/rsi-16-b2-e4-stack`, and reverted on `main` (`fbe44bd`) so `target/loop-base/gibbs` remains at `96ab660`.
+
+## Iteration `rsi-17` (`fd7c127`, reverted at `df186fe`): DISCARD (Screen)
+- **Changes**:
+  1. **Track A1 (`ExpertA1PairedGlu`)**: Added single-dispatch paired `(gate, up) -> GLU` kernels (`gemv_q4_k_paired_glu`, `gemv_q4_0_paired_glu`, `gemv_q4_0_half_paired_glu`) and 2-dispatch `gate` + `up(Epi::UpGeGlu / Epi::UpSwiGlu)` in `Step::MegakernelMlp`, removing standalone `geglu_f32` / `swiglu_f32` dispatches (`dispatches`: `506 -> 476` on E2B QAT/ctx4k, `509 -> 473` on E2B Q4_K_M, `430 -> 312` on Qwen3.5 2B).
+  2. **Track A4 (`ExpertA4PleQtr`)**: Added 4-lanes-per-block (`packed_ushort2`, `n_sub = n_blocks * 4`, 100% SIMD lane utilization) branch in `gemv_q4_0_half` for `(p.cols & 511u) != 0u` (`cols = 256` on `ple.proj` `[1536, 256]`).
+- **Guard & Fast Screens (`bg_141`, `bg_142`)**:
+  - `scripts/loop_guard.sh` (`bg_141`) passed (`rc = 0`, `parity: 5 compared`).
+  - While `ctx4k` improved (`median_ratio = 1.0032`, `4/4` pairs, `gpu_ms 7.719 -> 7.689 ms`) and `Qwen3.5 2B` improved (`1.0098` / `1.0161`, `4/4` pairs), doubling the live `Q4_K` row state in `gemv_q4_k_paired_glu` (and `Epi::UpGeGlu` inside `gemv_q4_k`) regressed `Gemma 4 E2B Q4_K_M` (`0.9846` in `bg_141`, `0.9936` `0/4` in `bg_142`) and left `Gemma 4 E2B QAT` flat (`0.9980` / `0.9977`).
+  - Reverted `fd7c127` at `df186fe` and removed temporary worktrees `../gibbs-wt/{exp-b2-b3,exp-a3-a4,exp-a1-e4,exp-a1-paired,exp-a4-ple-qtr}` (uncommitted worktree-only experiments: `Step::RmsNorm` `post_scale` + `Step::MegakernelMlp` `post_chain` in `exp-a3-a4`, and `delta_rule_f32` `tgs_x = 1` in-register `post_norm` in `exp-a1-e4`).
+
+## Iteration `rsi-18` (`3557243`, reverted at `8852e52`, saved on `experiment/rsi-18-b2-qwen-fusions`): DISCARD (`delta_pp = -0.01 pp < max(0.30, noise_pp 0.03)`, `ratios_ok = true`, `E4` candidate for Qwen3.5 + IQ4_XS)
+- **Changes**:
+  1. **Track B2 + Qwen3.5 Fusions (without `fold_weightless_rmsnorm_mul`)**: Vectorized `gemv_iq4_xs` (`116 -> 215 GB/s` on `6144x1536`, `135 -> 256 GB/s` on `262144x1536`), set `WeightFormat::IQ4_XS::default_variant` to `GemvVariant::HAND`, and fused `CausalConv1dCached+Silu`, `DeltaRule` `beta_sigmoid`/`neg_a`, `RmsNorm` vector `scale`, and `CachedAttention` sigmoid `gate` while leaving `src/graph/passes/canonical.rs` and `src/graph/codec.rs` untouched so `Model 7` (`26B-A4B`) and `codec::source_hash()` stay identical to `base`.
+  2. **`HostProfile.codec` Carry-Over (`src/graph/metal.rs:710-729`)**: When `KERNELS_MSL` changes (`src_hash`), inherit existing `HostProfile.codec` from `~/.cache/gibbs/host/{tag}-*.json` whenever `codec_hash == codec::source_hash()`, preventing contended `run_codec_bench()` re-runs from flipping `ReencodePolicy::MaxSpeed` (`Q4_0` vs `Q4_K`) and changing `bytes_per_token` between `base` and `cand` (which had penalized `cand` by `-2.77%` `bytes_per_token` on `Model 2` in `bg_145`).
+- **Fast Screen (`bg_144`) & Clean ABBA Verify (`bg_146`, vs `96ab660`)**:
+  - `bg_144` (4-round screen on Models 1, 2, 3, 7): `Qwen3.5 2B` `median_ratio = 1.0211` (`4/4` pairs, `dispatches 430 -> 334`), `Qwen3.5 9B` `1.0071` (`4/4` pairs, `dispatches 594 -> 458`), controls `Model 1` (`0.9972`) and `Model 7` (`0.9956`) clean.
+  - `bg_146` (full ABBA verify): Ultra-clean run (`noise_pp = 0.0319 pp`, `min_ratio = 0.9926`, `ratios_ok = true`, `bytes_per_token` 100% identical across all 9 models):
+    - `Qwen3.5 2B`: `111.35 -> 112.79 tok/s` (`+1.29%`, `51.98%` roofline, `dispatches 430 -> 328`, `-102` dispatches/tok)
+    - `Qwen3.5 9B`: `39.21 -> 39.53 tok/s` (`+0.81%`, `61.62%` roofline, `dispatches 594 -> 458`, `-136` dispatches/tok)
+    - `SmolLM2 135M`: `461.69 -> 462.32 tok/s` (`+0.14%`), `ctx4k`: `123.01 -> 123.16 tok/s` (`+0.13%`)
+    - Because `Models 2` and `3` are 2 of 9 models (`(+1.29% + +0.81%) / 9 = +0.23%` relative = `+0.12 pp`), small `-0.4%..-0.7%` process-level variance on untouched models netted `delta_pp = -0.006 pp < 0.30 pp`.
+  - Reverted at `8852e52` and preserved on branch `experiment/rsi-18-b2-qwen-fusions` as a verified `E4` stack component.

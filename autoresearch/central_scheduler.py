@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Centralized machine-wide FIFO resource scheduler for Gibbs builds, tests, screens, and benchmarks.
+
+Ensures strictly ONE system-resource-intensive job (cargo build/test, shape_rates, ab_screen.py,
+loop_guard.sh, verify_when_quiet.sh, gibbs --bench) runs at a time across the main checkout and any
+worktrees. Holds a global lock at `~/.cache/gibbs/sched.lock` (without touching `~/.cache/gibbs/gpu.lock`,
+which `gibbs --bench` and `with_gpu_lock.py` acquire internally), executes in the caller's `os.getcwd()`,
+caps `QUIET_MAX_PCT` at `<= 40` (`min(floor, 34) + 5`, min 20) so foreign GPU load is never mistaken
+for the compositor floor, and journals every job in `~/.cache/gibbs/sched.log`.
+"""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gibbs")
+SCHED_LOCK = os.path.join(CACHE_DIR, "sched.lock")
+SCHED_LOG = os.path.join(CACHE_DIR, "sched.log")
+COMPOSITOR_FLOOR_CAP = 34
+
+
+def now_iso() -> str:
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log_event(event: dict) -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(SCHED_LOG, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+
+def sample_gpu_util() -> int:
+    try:
+        out = subprocess.check_output(
+            ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        m = re.search(r'"Device Utilization %"=(\d+)', out)
+        return int(m.group(1)) if m else 100
+    except Exception:
+        return 100
+
+
+def measure_idle_floor(samples: int = 3, delay_s: float = 0.5) -> int:
+    vals = []
+    for i in range(samples):
+        vals.append(sample_gpu_util())
+        if i + 1 < samples:
+            time.sleep(delay_s)
+    return min(vals) if vals else 100
+
+
+def compute_quiet_max(raw_floor: int) -> int:
+    effective_floor = min(raw_floor, COMPOSITOR_FLOOR_CAP)
+    return max(20, min(40, effective_floor + 5))
+
+
+def run_job(args: argparse.Namespace) -> int:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        sys.exit("central_scheduler: empty command")
+
+    cwd = os.getcwd()
+    wait_t0 = time.time()
+    with open(SCHED_LOCK, "a") as sched_f:
+        fcntl.flock(sched_f, fcntl.LOCK_EX)
+        try:
+            wait_s = round(time.time() - wait_t0, 3)
+            raw_floor = measure_idle_floor(samples=args.floor_samples, delay_s=0.4)
+            quiet_max = compute_quiet_max(raw_floor)
+            env = dict(os.environ)
+            env.setdefault("QUIET_MAX_PCT", str(quiet_max))
+            env.setdefault("GIBBS_TUNE_BUSY_PCT", str(quiet_max))
+
+            start_ev = {
+                "ts": now_iso(),
+                "event": "start",
+                "label": args.label or " ".join(cmd[:3]),
+                "cwd": cwd,
+                "cmd": cmd,
+                "wait_s": wait_s,
+                "gpu_raw_pct": raw_floor,
+                "quiet_max_pct": int(env["QUIET_MAX_PCT"]),
+            }
+            log_event(start_ev)
+            run_t0 = time.time()
+            proc = subprocess.run(cmd, cwd=cwd, env=env)
+            dur_s = round(time.time() - run_t0, 3)
+            end_ev = {
+                "ts": now_iso(),
+                "event": "done",
+                "label": args.label or " ".join(cmd[:3]),
+                "cwd": cwd,
+                "rc": proc.returncode,
+                "dur_s": dur_s,
+                "gpu_after_pct": sample_gpu_util(),
+            }
+            log_event(end_ev)
+            return proc.returncode
+        finally:
+            fcntl.flock(sched_f, fcntl.LOCK_UN)
+
+
+def show_status(_args: argparse.Namespace) -> int:
+    raw_floor = measure_idle_floor(samples=2, delay_s=0.4)
+    print(
+        f"gpu_raw_pct={raw_floor} recommended_QUIET_MAX_PCT={compute_quiet_max(raw_floor)} lock={SCHED_LOCK}"
+    )
+    if os.path.exists(SCHED_LOG):
+        lines = open(SCHED_LOG).read().splitlines()[-10:]
+        for l in lines:
+            print(l)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Centralized single-job resource scheduler")
+    sub = ap.add_subparsers(dest="sub", required=True)
+
+    p_run = sub.add_parser("run", help="Run a resource-intensive command exclusively")
+    p_run.add_argument("--label", default="", help="Job label for sched.log")
+    p_run.add_argument("--floor-samples", type=int, default=2)
+    p_run.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    sub.add_parser("status", help="Show GPU idle floor and recent scheduled jobs")
+    args = ap.parse_args()
+    if args.sub == "run":
+        return run_job(args)
+    return show_status(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
