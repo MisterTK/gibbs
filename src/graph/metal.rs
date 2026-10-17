@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 59] = [
+const BASE_KERNELS: [&str; 63] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -460,6 +460,10 @@ const BASE_KERNELS: [&str; 59] = [
     "rope_general_f32",
     "kv_append_batched",
     "attn_cached_f32",
+    "flash_attn_cached_f32_1",
+    "flash_attn_cached_f32_2",
+    "flash_attn_cached_f32_4",
+    "flash_attn_cached_f32_8",
     "flash_attn_cached_f32",
     "attn_cached_gqa_split_f32_1",
     "attn_cached_gqa_split_f32_2",
@@ -2944,11 +2948,12 @@ impl Session {
                 res,
                 scale,
                 chain,
+                rope,
                 rows,
                 d,
                 eps,
             } => {
-                if scale.is_some() || chain.is_some() {
+                if scale.is_some() || chain.is_some() || rope.is_some() {
                     enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
                     bind(0, x);
                     bind(1, g);
@@ -2963,18 +2968,40 @@ impl Session {
                         bind(6, s.out);
                     }
                     #[repr(C)]
-                    struct RmsNormFusedParams(u32, u32, f32, f32, u32);
+                    struct RmsNormFusedParams {
+                        rows: u32,
+                        d: u32,
+                        eps: f32,
+                        eps2: f32,
+                        flags: u32,
+                        n_seq: u32,
+                        rotary_dim: u32,
+                        pair_stride: u32,
+                        mscale: f32,
+                    }
                     let flags = (res.is_some() as u32)
                         | ((scale.is_some() as u32) << 1)
-                        | ((chain.is_some() as u32) << 2);
-                    let p = RmsNormFusedParams(
-                        u32_of(rows)?,
-                        u32_of(d)?,
+                        | ((chain.is_some() as u32) << 2)
+                        | ((rope.is_some() as u32) << 3);
+                    let p = RmsNormFusedParams {
+                        rows: u32_of(rows)?,
+                        d: u32_of(d)?,
                         eps,
-                        chain.map_or(0.0, |c| c.2),
+                        eps2: chain.map_or(0.0, |c| c.2),
                         flags,
-                    );
+                        n_seq: rope.map_or(1, |r| r.n_seq as u32),
+                        rotary_dim: rope.map_or(0, |r| r.rotary_dim as u32),
+                        pair_stride: rope.map_or(1, |r| r.pair_stride as u32),
+                        mscale: rope.map_or(1.0, |r| r.mscale),
+                    };
                     set_bytes(enc, 7, &p);
+                    if let Some(rp) = rope {
+                        bind(8, rp.pos);
+                        bind(9, rp.inv_freq);
+                    } else {
+                        bind(8, x);
+                        bind(9, x);
+                    }
                     enc.dispatch_thread_groups(
                         MTLSize::new(rows as u64, 1, 1),
                         MTLSize::new(TG, 1, 1),
@@ -3257,7 +3284,7 @@ impl Session {
                 set_bytes(enc, 4, &p);
                 grid1(n_seq * n_heads * head_dim);
             }
-            Step::RmsNormBatch { ref segs } => {
+            Step::RmsNormBatch { ref segs, rope } => {
                 enc.set_compute_pipeline_state(rt.pso("rmsnorm_batch_f32")?);
                 #[repr(C)]
                 #[derive(Default)]
@@ -3266,9 +3293,18 @@ impl Session {
                     d: [u32; 4],
                     eps: [f32; 4],
                     nseg: u32,
+                    rope_mask: u32,
+                    n_seq: u32,
+                    rotary_dim: u32,
+                    pair_stride: u32,
+                    mscale: f32,
                 }
                 let mut p = RmsNormBatchParams {
                     nseg: segs.len() as u32,
+                    n_seq: rope.map_or(1, |r| r.n_seq as u32),
+                    rotary_dim: rope.map_or(0, |r| r.rotary_dim as u32),
+                    pair_stride: rope.map_or(1, |r| r.pair_stride as u32),
+                    mscale: rope.map_or(1.0, |r| r.mscale),
                     ..Default::default()
                 };
                 let mut total = 0usize;
@@ -3282,10 +3318,20 @@ impl Session {
                         p.rows[i] = u32_of(sg.rows)?;
                         p.d[i] = u32_of(sg.d)?;
                         p.eps[i] = sg.eps;
+                        if sg.has_rope {
+                            p.rope_mask |= 1u32 << i;
+                        }
                         total += sg.rows;
                     }
                 }
                 set_bytes(enc, 12, &p);
+                if let Some(rp) = rope {
+                    bind(13, rp.pos);
+                    bind(14, rp.inv_freq);
+                } else {
+                    bind(13, segs[0].x);
+                    bind(14, segs[0].x);
+                }
                 enc.dispatch_thread_groups(
                     MTLSize::new(total as u64, 1, 1),
                     MTLSize::new(TG, 1, 1),
@@ -3344,6 +3390,7 @@ impl Session {
                 v_state,
                 pos,
                 vis,
+                rope,
                 heads,
                 head_dim,
                 kv_heads,
@@ -3375,7 +3422,9 @@ impl Session {
                         ));
                     }
                 }
-                if write && k_state.is_some() && v_state.is_some() {
+                let gqa_decode = m == 1 && vis.is_none();
+                let fuse_kv_write = gqa_decode && write && k_state.is_some() && v_state.is_some();
+                if write && k_state.is_some() && v_state.is_some() && !fuse_kv_write {
                     let ks = k_state.unwrap();
                     let vs = v_state.unwrap();
                     enc.set_compute_pipeline_state(rt.pso("kv_append_batched")?);
@@ -3412,7 +3461,7 @@ impl Session {
                 let len = start_pos as usize + 1;
                 let lo = window.map_or(0, |w| len.saturating_sub(w));
                 let n_keys = len - lo;
-                let n_splits = if m == 1 && vis.is_none() && n_keys >= ATTN_SPLIT_MIN_KEYS {
+                let n_splits = if gqa_decode && n_keys >= ATTN_SPLIT_MIN_KEYS {
                     let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
                     ATTN_TARGET_TGS
                         .div_ceil(head_tgs)
@@ -3431,7 +3480,7 @@ impl Session {
                         *scratch_guard = Some(new_shared_buffer(&rt.device, bytes)?);
                     }
                 }
-                enc.set_compute_pipeline_state(if n_splits > 1 {
+                enc.set_compute_pipeline_state(if gqa_decode {
                     rt.pso(match head_dim.div_ceil(32) {
                         0..=1 => "attn_cached_gqa_split_f32_1",
                         2 => "attn_cached_gqa_split_f32_2",
@@ -3440,8 +3489,14 @@ impl Session {
                         _ => "attn_cached_gqa_split_f32_16",
                     })?
                 } else {
-                    rt.pso("flash_attn_cached_f32")
-                        .or_else(|_| rt.pso("attn_cached_f32"))?
+                    rt.pso(match head_dim.div_ceil(32) {
+                        0..=1 => "flash_attn_cached_f32_1",
+                        2 => "flash_attn_cached_f32_2",
+                        3..=4 => "flash_attn_cached_f32_4",
+                        5..=8 => "flash_attn_cached_f32_8",
+                        _ => "flash_attn_cached_f32",
+                    })
+                    .or_else(|_| rt.pso("attn_cached_f32"))?
                 });
                 bind(0, q);
                 bind(1, k_buf_id);
@@ -3450,8 +3505,16 @@ impl Session {
                     Some(part) => enc.set_buffer(3, Some(part), 0),
                     None => bind(3, s.out),
                 }
-                // Rows see keys `< vis[row]` when the operand is present (default `pos + row + 1`).
-                bind(5, vis.unwrap_or(q));
+                if gqa_decode {
+                    bind(5, k);
+                    bind(6, v);
+                    bind(7, rope.map_or(q, |r| r.inv_freq));
+                } else {
+                    // Rows see keys `< vis[row]` when the operand is present (default `pos + row + 1`).
+                    bind(5, vis.unwrap_or(q));
+                    bind(6, k);
+                    bind(7, v);
+                }
                 #[repr(C)]
                 struct AttnCachedParams {
                     n_heads: u32,
@@ -3466,6 +3529,10 @@ impl Session {
                     has_vis: u32,
                     n_splits: u32,
                     chunk: u32,
+                    write_kv: u32,
+                    rotary_dim: u32,
+                    pair_stride: u32,
+                    mscale: f32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -3480,9 +3547,13 @@ impl Session {
                     has_vis: vis.is_some() as u32,
                     n_splits: n_splits as u32,
                     chunk: n_keys.div_ceil(n_splits) as u32,
+                    write_kv: fuse_kv_write as u32,
+                    rotary_dim: rope.map_or(0, |r| r.rotary_dim as u32),
+                    pair_stride: rope.map_or(1, |r| r.pair_stride as u32),
+                    mscale: rope.map_or(1.0, |r| r.mscale),
                 };
                 set_bytes(enc, 4, &p);
-                let tgs_x = if n_splits > 1 {
+                let tgs_x = if gqa_decode {
                     kv_heads * group.div_ceil(ATTN_HPT)
                 } else {
                     heads
@@ -3842,6 +3913,8 @@ pub enum Step {
         scale: Option<ValueId>,
         /// Chained pre-norm `(g2, out2, eps2)` over this step's output `out`.
         chain: Option<(ValueId, ValueId, f32)>,
+        /// Fused RoPE applied per head after normalisation when the norm's only reader was a Rope.
+        rope: Option<NormRope>,
         rows: usize,
         d: usize,
         eps: f32,
@@ -3897,6 +3970,7 @@ pub enum Step {
     /// Horizontal batch of up to 4 independent RmsNorm segments (`batch_horizontal`).
     RmsNormBatch {
         segs: Vec<NormSeg>,
+        rope: Option<NormRope>,
     },
     /// Horizontal batch of up to 4 Rope segments `(x, out, n_heads)` sharing pos, inv_freq and geometry.
     RopeBatch {
@@ -3917,6 +3991,7 @@ pub enum Step {
         v_state: Option<ValueId>,
         pos: Option<ValueId>,
         vis: Option<ValueId>,
+        rope: Option<NormRope>,
         heads: usize,
         head_dim: usize,
         kv_heads: usize,
@@ -4077,6 +4152,17 @@ pub(crate) fn fusion_policy() -> FusionPolicy {
     })
 }
 
+/// RoPE parameters fused into [`Step::RmsNorm`] / [`Step::RmsNormBatch`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormRope {
+    pub pos: ValueId,
+    pub inv_freq: ValueId,
+    pub n_seq: usize,
+    pub rotary_dim: usize,
+    pub pair_stride: usize,
+    pub mscale: f32,
+}
+
 /// One segment of [`Step::RmsNormBatch`].
 #[derive(Debug, Clone)]
 pub struct NormSeg {
@@ -4086,6 +4172,7 @@ pub struct NormSeg {
     pub rows: usize,
     pub d: usize,
     pub eps: f32,
+    pub has_rope: bool,
 }
 
 /// Merges runs (<= 4) of adjacent steps that are independent of each other into one dispatch:
@@ -4113,9 +4200,19 @@ fn batch_horizontal(
                     res: None,
                     scale: None,
                     chain: None,
+                    rope: r_next,
                     ..
                 },
-            ) => true,
+            ) => {
+                let r_existing = run.iter().find_map(|s| match s.op {
+                    Step::RmsNorm { rope, .. } => rope,
+                    _ => None,
+                });
+                match (r_existing, *r_next) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                }
+            }
             (
                 Step::Rope {
                     pos: p0,
@@ -4171,6 +4268,7 @@ fn batch_horizontal(
                 res,
                 scale,
                 ref mut chain,
+                rope: None,
                 rows,
                 d,
                 ..
@@ -4186,6 +4284,7 @@ fn batch_horizontal(
                                     res: None,
                                     scale: None,
                                     chain: None,
+                                    rope: None,
                                     rows: r2,
                                     d: d2,
                                     ..
@@ -4225,11 +4324,21 @@ fn batch_horizontal(
         }
         let op = match &run[0].op {
             Step::RmsNorm { .. } => Step::RmsNormBatch {
+                rope: run.iter().find_map(|s| match s.op {
+                    Step::RmsNorm { rope, .. } => rope,
+                    _ => None,
+                }),
                 segs: run
                     .iter()
                     .map(|s| match s.op {
                         Step::RmsNorm {
-                            x, g, rows, d, eps, ..
+                            x,
+                            g,
+                            rows,
+                            d,
+                            eps,
+                            rope,
+                            ..
                         } => NormSeg {
                             x,
                             g,
@@ -4237,6 +4346,7 @@ fn batch_horizontal(
                             rows,
                             d,
                             eps,
+                            has_rope: rope.is_some(),
                         },
                         _ => unreachable!("run members share a kind"),
                     })
@@ -4297,6 +4407,107 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
     let mut fused = vec![false; g.nodes.len()];
     let mut steps = Vec::new();
     let mut aliases: HashMap<ValueId, (ValueId, usize)> = HashMap::new();
+    let mut attn_ropes: HashMap<usize, (ValueId, ValueId, NormRope)> = HashMap::new();
+    if fusion_policy().allows(FusionClass::ReduceInput) {
+        let is_rmsnorm = |v: ValueId| {
+            matches!(
+                g.value(v).kind,
+                ValueKind::Node(n) if matches!(g.nodes[n.0 as usize].op, Op::RmsNorm { .. })
+            )
+        };
+        for (ai, node) in g.nodes.iter().enumerate() {
+            let Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim,
+                v_head_dim,
+                write: true,
+                ..
+            } = &node.op
+            else {
+                continue;
+            };
+            if node.inputs.len() != 6 || *head_dim != *v_head_dim || *head_dim > ATTN_MAX_HEAD_DIM {
+                continue;
+            }
+            let (q_out, k_out, pos) = (node.inputs[0], node.inputs[1], node.inputs[5]);
+            if g.outputs.contains(&q_out)
+                || g.outputs.contains(&k_out)
+                || readers.get(&q_out).map(Vec::as_slice) != Some(&[ai])
+                || readers.get(&k_out).map(Vec::as_slice) != Some(&[ai])
+            {
+                continue;
+            }
+            let (ValueKind::Node(q_nid), ValueKind::Node(k_nid)) =
+                (&g.value(q_out).kind, &g.value(k_out).kind)
+            else {
+                continue;
+            };
+            let (qi, ki) = (q_nid.0 as usize, k_nid.0 as usize);
+            if qi == ki || qi >= ai || ki >= ai {
+                continue;
+            }
+            let (qn, kn) = (&g.nodes[qi], &g.nodes[ki]);
+            if qn.op != kn.op || qn.inputs.len() < 3 || kn.inputs.len() < 3 {
+                continue;
+            }
+            let Op::Rope {
+                head_dim: rhd,
+                rotary_dim,
+                variant,
+                mscale,
+            } = &qn.op
+            else {
+                continue;
+            };
+            if *rhd != *head_dim
+                || *rotary_dim == 0
+                || *rotary_dim > *rhd
+                || *rotary_dim % 2 != 0
+                || matches!(variant, crate::graph::RopeVariant::MRope { .. })
+            {
+                continue;
+            }
+            let (q_raw, k_raw, inv_freq) = (qn.inputs[0], kn.inputs[0], qn.inputs[2]);
+            if qn.inputs[1] != pos
+                || kn.inputs[1] != pos
+                || kn.inputs[2] != inv_freq
+                || is_rmsnorm(q_raw)
+                || is_rmsnorm(k_raw)
+                || !exists_before(q_raw, ai)
+                || !exists_before(k_raw, ai)
+                || !exists_before(inv_freq, ai)
+                || numel(g, q_raw).ok() != Some(*heads * *head_dim)
+                || numel(g, k_raw).ok() != Some(*kv_heads * *head_dim)
+                || numel(g, pos).ok() != Some(1)
+                || numel(g, inv_freq).map_or(true, |l| l < *rotary_dim / 2)
+            {
+                continue;
+            }
+            let pair_stride = match variant {
+                crate::graph::RopeVariant::Interleaved => 2,
+                crate::graph::RopeVariant::HalfSplit => 1,
+                crate::graph::RopeVariant::MRope { .. } => unreachable!(),
+            };
+            fused[qi] = true;
+            fused[ki] = true;
+            attn_ropes.insert(
+                ai,
+                (
+                    q_raw,
+                    k_raw,
+                    NormRope {
+                        pos,
+                        inv_freq,
+                        n_seq: 1,
+                        rotary_dim: *rotary_dim,
+                        pair_stride,
+                        mscale: *mscale,
+                    },
+                ),
+            );
+        }
+    }
     for (i, node) in g.nodes.iter().enumerate() {
         if fused[i] {
             continue;
@@ -4620,6 +4831,59 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         }
                     }
                 }
+                // `norm(x)` (no residual/scale) whose only reader is a 1-D Rope over the same head_dim:
+                // fused per-head norm + rotary embedding.
+                let mut rope = None;
+                if res.is_none() && scale.is_none() {
+                    if let Some([j]) = readers
+                        .get(&out)
+                        .map(Vec::as_slice)
+                        .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
+                    {
+                        let c = &g.nodes[*j];
+                        if let Op::Rope {
+                            head_dim,
+                            rotary_dim,
+                            variant:
+                                variant @ (crate::graph::RopeVariant::Interleaved
+                                | crate::graph::RopeVariant::HalfSplit),
+                            mscale,
+                        } = &c.op
+                        {
+                            let rows = xl / d;
+                            if c.inputs.len() >= 3
+                                && c.inputs[0] == out
+                                && *head_dim == d
+                                && *rotary_dim <= d
+                                && *rotary_dim % 2 == 0
+                                && !g.outputs.contains(&out)
+                            {
+                                let (pos, inv_freq) = (c.inputs[1], c.inputs[2]);
+                                let n_seq = n_of(pos)?;
+                                if exists_before(pos, i)
+                                    && exists_before(inv_freq, i)
+                                    && n_seq > 0
+                                    && rows % n_seq == 0
+                                {
+                                    let pair_stride = match variant {
+                                        crate::graph::RopeVariant::Interleaved => 2,
+                                        _ => 1,
+                                    };
+                                    rope = Some(NormRope {
+                                        pos,
+                                        inv_freq,
+                                        n_seq,
+                                        rotary_dim: *rotary_dim,
+                                        pair_stride,
+                                        mscale: *mscale,
+                                    });
+                                    fused[*j] = true;
+                                    out = c.outputs[0];
+                                }
+                            }
+                        }
+                    }
+                }
                 (
                     Step::RmsNorm {
                         x,
@@ -4627,6 +4891,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         res,
                         scale,
                         chain: None,
+                        rope,
                         rows: xl / d,
                         d,
                         eps: *eps,
@@ -4696,8 +4961,10 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 soft_cap,
                 write,
             } => {
-                let q = arg(0)?;
-                let k = arg(1)?;
+                let (q, k, rope) = match attn_ropes.remove(&i) {
+                    Some((qr, kr, r)) => (qr, kr, Some(r)),
+                    None => (arg(0)?, arg(1)?, None),
+                };
                 let v = arg(2)?;
                 let k_state = if node.inputs.len() >= 4 {
                     Some(arg(3)?)
@@ -4736,6 +5003,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         v_state,
                         pos,
                         vis,
+                        rope,
                         heads: *heads,
                         head_dim: *head_dim,
                         kv_heads: *kv_heads,
@@ -4948,11 +5216,20 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 res,
                 scale,
                 chain,
+                rope,
                 ..
-            } => [Some(x), Some(g), res, scale, chain.map(|c| c.0)]
-                .into_iter()
-                .flatten()
-                .collect(),
+            } => [
+                Some(x),
+                Some(g),
+                res,
+                scale,
+                chain.map(|c| c.0),
+                rope.map(|r| r.pos),
+                rope.map(|r| r.inv_freq),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             Step::SwiGlu { gate, up, .. } | Step::GeGlu { gate, up, .. } => vec![gate, up],
             Step::Rope {
                 x, pos, inv_freq, ..
@@ -4965,11 +5242,21 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 v_state,
                 pos,
                 vis,
+                rope,
                 ..
-            } => [Some(q), Some(k), Some(v), k_state, v_state, pos, vis]
-                .into_iter()
-                .flatten()
-                .collect(),
+            } => [
+                Some(q),
+                Some(k),
+                Some(v),
+                k_state,
+                v_state,
+                pos,
+                vis,
+                rope.map(|r| r.inv_freq),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             Step::PagedCachedAttention {
                 q,
                 k_pool,
@@ -5031,6 +5318,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Step::MeanPool { mask, .. } => v == *mask,
                 Step::GemvPacked { w, .. } | Step::GemmBatchedPacked { w, .. } => v == *w,
                 Step::Rope { pos, .. } => v == *pos,
+                Step::RmsNorm { rope: Some(r), .. } => v == r.pos,
                 Step::CachedAttention { pos, vis, .. } => Some(v) == *pos || Some(v) == *vis,
                 Step::PagedCachedAttention {
                     block_table, pos, ..
@@ -6081,6 +6369,7 @@ mod tests {
                 res: None,
                 scale: None,
                 chain: None,
+                rope: None,
                 rows: 2,
                 d: 4,
                 eps: 1e-5,
@@ -6106,6 +6395,129 @@ mod tests {
                 range(p),
                 range(q)
             );
+        }
+    }
+
+    /// Single-reader Rope after RmsNorm (and RmsNormBatch) and single-reader Q/K Rope feeding
+    /// decode CachedAttention fuse into their producer/consumer steps and match the CPU executor.
+    #[test]
+    fn rmsnorm_and_cached_attention_fuse_rope_and_match_cpu() {
+        let f = DType::F32;
+        let (heads, kv_heads, hd) = (4usize, 2usize, 8usize);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: crate::graph::RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        // 1. Q/K/V RmsNorms + Q/K Ropes batch into one RmsNormBatch with rope_mask.
+        let mut g1 = Graph::new();
+        let q_in = g1.input("q", vec![1, q_dim], f);
+        let k_in = g1.input("k", vec![1, kv_dim], f);
+        let v_in = g1.input("v", vec![1, kv_dim], f);
+        let pos = g1.input("pos", vec![1], DType::U32);
+        let gw = g1.weight("gw", vec![hd], f);
+        let inv = g1.weight("inv", vec![hd / 2], f);
+        let qn = g1.add(
+            "qn",
+            Op::RmsNorm { eps: 1e-5 },
+            &[q_in, gw],
+            vec![1, q_dim],
+            f,
+        );
+        let kn = g1.add(
+            "kn",
+            Op::RmsNorm { eps: 1e-5 },
+            &[k_in, gw],
+            vec![1, kv_dim],
+            f,
+        );
+        let vn = g1.add(
+            "vn",
+            Op::RmsNorm { eps: 1e-5 },
+            &[v_in, gw],
+            vec![1, kv_dim],
+            f,
+        );
+        let qr = g1.add("qr", rope.clone(), &[qn, pos, inv], vec![1, q_dim], f);
+        let kr = g1.add("kr", rope.clone(), &[kn, pos, inv], vec![1, kv_dim], f);
+        let ks = g1.state("ks", vec![16, kv_dim], f);
+        let vs = g1.state("vs", vec![16, kv_dim], f);
+        let att = Op::CachedAttention {
+            heads,
+            kv_heads,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 0.25,
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write: true,
+        };
+        let out1 = g1.add(
+            "att",
+            att.clone(),
+            &[qr, kr, vn, ks, vs, pos],
+            vec![1, q_dim],
+            f,
+        );
+        g1.output(out1);
+        let mut w = Weights::new();
+        w.insert("gw", Tensor::F32(rand(hd, 1)));
+        w.insert("inv", Tensor::F32(rand(hd / 2, 2)));
+        let sess1 = Session::new(rt(), &w).unwrap();
+        let prep1 = sess1.prepare_plan(&g1).unwrap();
+        assert_eq!(
+            prep1.steps.len(),
+            2,
+            "RmsNormBatch(with Q/K Rope) + CachedAttention"
+        );
+        assert!(matches!(
+            prep1.steps[0].op,
+            Step::RmsNormBatch { rope: Some(_), .. }
+        ));
+
+        // 2. Without Q/K RmsNorms, Q/K Ropes fuse directly into decode CachedAttention.
+        let mut g2 = Graph::new();
+        let q2 = g2.input("q", vec![1, q_dim], f);
+        let k2 = g2.input("k", vec![1, kv_dim], f);
+        let v2 = g2.input("v", vec![1, kv_dim], f);
+        let pos2 = g2.input("pos", vec![1], DType::U32);
+        let inv2 = g2.weight("inv", vec![hd / 2], f);
+        let qr2 = g2.add("qr", rope.clone(), &[q2, pos2, inv2], vec![1, q_dim], f);
+        let kr2 = g2.add("kr", rope, &[k2, pos2, inv2], vec![1, kv_dim], f);
+        let ks2 = g2.state("ks", vec![16, kv_dim], f);
+        let vs2 = g2.state("vs", vec![16, kv_dim], f);
+        let out2 = g2.add(
+            "att",
+            att,
+            &[qr2, kr2, v2, ks2, vs2, pos2],
+            vec![1, q_dim],
+            f,
+        );
+        g2.output(out2);
+        let sess2 = Session::new(rt(), &w).unwrap();
+        let prep2 = sess2.prepare_plan(&g2).unwrap();
+        assert_eq!(prep2.steps.len(), 1, "Q/K Rope fused into CachedAttention");
+        assert!(matches!(
+            prep2.steps[0].op,
+            Step::CachedAttention { rope: Some(_), .. }
+        ));
+
+        for (g, sess) in [(&g1, &sess1), (&g2, &sess2)] {
+            let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+            for step in 0..3u32 {
+                let inp = vec![
+                    Tensor::F32(rand(q_dim, 10 + step as u64)),
+                    Tensor::F32(rand(kv_dim, 20 + step as u64)),
+                    Tensor::F32(rand(kv_dim, 30 + step as u64)),
+                    Tensor::U32(vec![step]),
+                ];
+                let want = cpu::run(g, &w, &mut cs, inp.clone()).unwrap();
+                let got = sess.run_with_state(g, Some(&mut ms), inp).unwrap();
+                assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
+            }
         }
     }
 
