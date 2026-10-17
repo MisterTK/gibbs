@@ -109,7 +109,7 @@ static TILE_TQ2_0: Tile = Tile {
     groups: 4,
     segs: 8,
     a: 4.0,
-    b: 5.0,
+    b: 0.0,
     msl: r#"
 inline uint group_seg(uint g, uint k) { return (g >> 1) * 128 + (k >> 1) * 32 + (g & 1) * 16 + (k & 1) * 8; }
 inline uint4 tile_load(device const uchar* grp, uint g) {
@@ -123,10 +123,9 @@ inline void tile_seg(uint4 q, uint k, thread float* out) {
     for (uint w = 0; w < 2; w++) {
         const uint x = q[(k & 1) * 2 + w];
         for (int j = 0; j < 4; j++) {
-            // The field of byte j at level lv is bits 8j+lv..+1; mantissa bits 22..21 are where it goes.
             const int sh = 21 - 8 * j - lv;
             const uint y = sh >= 0 ? (x << sh) : (x >> -sh);
-            out[4 * w + j] = as_type<float>(0x3F800000u | (y & 0x00600000u));
+            out[4 * w + j] = as_type<float>(0x3F800000u | (y & 0x00600000u)) - 1.25f;
         }
     }
 }

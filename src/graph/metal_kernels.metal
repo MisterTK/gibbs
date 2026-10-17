@@ -451,6 +451,57 @@ kernel void rmsnorm_residual_f32(device const float* x [[buffer(0)]],
         outr[i] = resr[i] + xr[i] * scale * g[i];
     }
 }
+struct RmsNormFusedParams { uint rows; uint d; float eps; float eps2; uint flags; };
+kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
+                              device const float* g [[buffer(1)]],
+                              device const float* res [[buffer(2)]],
+                              device const float* scale_buf [[buffer(3)]],
+                              device float* out [[buffer(4)]],
+                              device const float* g2 [[buffer(5)]],
+                              device float* out2 [[buffer(6)]],
+                              constant RmsNormFusedParams& p [[buffer(7)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint nsg [[simdgroups_per_threadgroup]],
+                              uint tid [[thread_position_in_threadgroup]],
+                              uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    uint row = tg;
+    if (row >= p.rows) return;
+    device const float* xr = x + (ulong)row * p.d;
+    device const float* resr = res + (ulong)row * p.d;
+    device float* outr = out + (ulong)row * p.d;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.d; i += tpg) {
+        float v = xr[i];
+        sq += v * v;
+    }
+    float inv = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
+    float mul = (p.flags & 2u) ? scale_buf[0] : 1.0f;
+    bool has_res = (p.flags & 1u) != 0;
+    if (p.flags & 4u) {
+        device float* out2r = out2 + (ulong)row * p.d;
+        float sq2 = 0.0f;
+        for (uint i = tid; i < p.d; i += tpg) {
+            float v = xr[i] * inv * g[i];
+            if (has_res) v += resr[i];
+            v *= mul;
+            outr[i] = v;
+            sq2 += v * v;
+        }
+        float inv2 = rsqrt(block_sum(sq2, scratch, sg, lane, nsg) / float(p.d) + p.eps2);
+        for (uint i = tid; i < p.d; i += tpg) {
+            out2r[i] = outr[i] * inv2 * g2[i];
+        }
+    } else {
+        for (uint i = tid; i < p.d; i += tpg) {
+            float v = xr[i] * inv * g[i];
+            if (has_res) v += resr[i];
+            outr[i] = v * mul;
+        }
+    }
+}
 
 
 struct GraphRopeParams { uint n_heads; uint head_dim; uint pairs; uint pair_stride; uint pair_gap; };

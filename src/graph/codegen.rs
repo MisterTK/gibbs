@@ -216,7 +216,10 @@ pub fn block_ref(codec: &Codec, w: &str, idx: &str) -> BlockRef {
             group: String::new(),
         },
         Some(p) => {
-            let groups = tile(codec.format).map_or(0, |t| t.groups);
+            let groups = tile(codec.format)
+                .map(|t| t.groups)
+                .or_else(|| wide(codec.format).map(|w| w.groups))
+                .unwrap_or(0);
             BlockRef {
                 decl: format!(
                     "const ulong bi = {idx}; device const uchar* b = {w} + (bi / {}) * {};",
@@ -515,6 +518,13 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
             )
         })
         .collect();
+    let groups = t.groups;
+    if t.b == 0.0 {
+        return format!(
+            "    const uint tiles = blocks_per_row * {groups};\n    for (uint s = sl; s < tiles; s += {lpr}) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        uint4 q = uint4(0);\n        float d = 0.0f, t = 0.0f;\n        if (myrow < p.rows) {{\n            {}\n            q = {load}(b, {}g);\n            d = {scale}(b, {}g);\n        }}\n{body}        acc0 += d * ({a:?}f * t);\n    }}\n",
+            br.decl, br.group, br.group, a = t.a
+        );
+    }
     // The lanes serving the same tile of different rows (`lane % lpr` equal) split sum(x) over the tile
     // between them (`segs / r` segments each) and add the parts with xor-shuffles.
     let spr = segs as usize / r;
@@ -529,7 +539,6 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
         .take_while(|&o| o < 32)
         .map(|o| format!("        sxs += simd_shuffle_xor(sxs, {o});\n"))
         .collect();
-    let groups = t.groups;
     format!(
         "    const uint tiles = blocks_per_row * {groups};\n    for (uint s = sl; s < tiles; s += {lpr}) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        uint4 q = uint4(0);\n        float d = 0.0f, t = 0.0f;\n        if (myrow < p.rows) {{\n            {}\n            q = {load}(b, {}g);\n            d = {scale}(b, {}g);\n        }}\n        float4 sx = float4(0.0f);\n{sx_parts}        float sxs = dot(sx, float4(1.0f));\n{sx_sum}{body}        acc0 += d * ({a:?}f * t - {b:?}f * sxs);\n    }}\n",
         br.decl, br.group, br.group, a = t.a, b = t.b
