@@ -267,14 +267,11 @@ impl WeightFormat {
         })
     }
 
-    /// Today's kernel for this format: the hand one where it exists (except `IQ4_XS`, `IQ2_M`, and
+    /// Today's kernel for this format: the hand one where it exists (except `IQ2_M` and
     /// `IQ3_S`, whose `Wide` codecs are faster at 2 rows), else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
         if self.hand_kernel().is_some()
-            && !matches!(
-                self,
-                WeightFormat::IQ4_XS | WeightFormat::IQ2_M | WeightFormat::IQ3_S
-            )
+            && !matches!(self, WeightFormat::IQ2_M | WeightFormat::IQ3_S)
         {
             GemvVariant::HAND
         } else {
@@ -412,7 +409,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 64] = [
+const BASE_KERNELS: [&str; 71] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -424,9 +421,13 @@ const BASE_KERNELS: [&str; 64] = [
     "gemm_sg_none",
     "gemm_sg_gelu",
     "gemm_sg_residual",
+    "gemm_sg_up_swiglu",
+    "gemm_sg_up_geglu",
     "gemm_rows_none",
     "gemm_rows_gelu",
     "gemm_rows_residual",
+    "gemm_rows_up_swiglu",
+    "gemm_rows_up_geglu",
     "rmsnorm_f32",
     "rmsnorm_residual_f32",
     "rmsnorm_fused_f32",
@@ -437,6 +438,8 @@ const BASE_KERNELS: [&str; 64] = [
     "geglu_f32",
     "gemv_q4_0",
     "gemv_q4_0_half",
+    "gemv_q4_0_paired_glu",
+    "gemv_q4_0_half_paired_glu",
     "gemv_q8_0",
     "gemv_bf16",
     "gemv_f16",
@@ -444,6 +447,7 @@ const BASE_KERNELS: [&str; 64] = [
     "gemv_iq4_xs",
     "gemv_iq2_m",
     "gemv_q4_k",
+    "gemv_q4_k_paired_glu",
     "gemv_q2_k",
     "gemv_iq3_s",
     "gemm_batched_bf16_none",
@@ -478,7 +482,13 @@ const BASE_KERNELS: [&str; 64] = [
     "gemv_nvfp4",
     "gemv_jesse_lut",
 ];
-const MPP_KERNELS: [&str; 3] = ["gemm_mpp_none", "gemm_mpp_gelu", "gemm_mpp_residual"];
+const MPP_KERNELS: [&str; 5] = [
+    "gemm_mpp_none",
+    "gemm_mpp_gelu",
+    "gemm_mpp_residual",
+    "gemm_mpp_up_swiglu",
+    "gemm_mpp_up_geglu",
+];
 
 /// GEMM implementation for `Op::Linear`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1394,6 +1404,8 @@ impl Runtime {
             Epi::None => "none",
             Epi::Gelu => "gelu",
             Epi::Residual => "residual",
+            Epi::UpSwiGlu => "up_swiglu",
+            Epi::UpGeGlu => "up_geglu",
             other => {
                 return Err(format!(
                     "Metal GEMM kernel '{prefix}' does not support epilogue {other:?}"
@@ -2822,6 +2834,12 @@ impl Session {
                     set_bytes(enc, 4, &u32_of(cols)?);
                     set_bytes(enc, 5, &u32_of(rows)?);
                     set_bytes(enc, 6, &(*address_bits as u32));
+                    #[repr(C)]
+                    struct PackedGemvParams(u32, u32, u32, u32, u32);
+                    let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi.as_u32());
+                    set_bytes(enc, 7, &p);
+                    let r = res.unwrap_or(out);
+                    enc.set_buffer(8, Some(r.0), r.1 as u64);
                     enc.dispatch_thread_groups(
                         MTLSize::new((rows as u64).div_ceil(32), 1, 1),
                         MTLSize::new(32, 1, 1),
@@ -2963,7 +2981,7 @@ impl Session {
                     bind(0, x);
                     bind(1, g);
                     bind(2, res.unwrap_or(x));
-                    bind(3, scale.unwrap_or(x));
+                    bind(3, scale.map_or(x, |s| s.0));
                     bind(4, s.out);
                     if let Some((g2, out2, _)) = chain {
                         bind(5, g2);
@@ -2987,7 +3005,8 @@ impl Session {
                     let flags = (res.is_some() as u32)
                         | ((scale.is_some() as u32) << 1)
                         | ((chain.is_some() as u32) << 2)
-                        | ((rope.is_some() as u32) << 3);
+                        | ((rope.is_some() as u32) << 3)
+                        | ((scale.is_some_and(|s| s.1) as u32) << 4);
                     let p = RmsNormFusedParams {
                         rows: u32_of(rows)?,
                         d: u32_of(d)?,
@@ -3102,6 +3121,16 @@ impl Session {
                         set_bytes(enc, 4, &u32_of(cols)?);
                         set_bytes(enc, 5, &u32_of(rows)?);
                         set_bytes(enc, 6, &(*address_bits as u32));
+                        #[repr(C)]
+                        struct PackedGemvParams(u32, u32, u32, u32, u32);
+                        let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi.as_u32());
+                        set_bytes(enc, 7, &p);
+                        if let Some(rv) = res {
+                            let (rb, ro) = loc(rv);
+                            enc.set_buffer(8, Some(rb), (ro + row_idx * rows * 4) as u64);
+                        } else {
+                            enc.set_buffer(8, Some(out_buf), (out_off + row_idx * rows * 4) as u64);
+                        }
                         enc.dispatch_thread_groups(
                             MTLSize::new((rows as u64).div_ceil(32), 1, 1),
                             MTLSize::new(32, 1, 1),
@@ -3401,6 +3430,7 @@ impl Session {
                 kv_heads,
                 v_head_dim: _,
                 scale,
+                gate,
                 window,
                 soft_cap,
                 write,
@@ -3525,6 +3555,7 @@ impl Session {
                     bind(6, k);
                     bind(7, v);
                 }
+                bind(8, gate.unwrap_or(q));
                 #[repr(C)]
                 struct AttnCachedParams {
                     n_heads: u32,
@@ -3543,6 +3574,7 @@ impl Session {
                     rotary_dim: u32,
                     pair_stride: u32,
                     mscale: f32,
+                    has_gate: u32,
                 }
                 let p = AttnCachedParams {
                     n_heads: heads as u32,
@@ -3561,6 +3593,7 @@ impl Session {
                     rotary_dim: rope.map_or(0, |r| r.rotary_dim as u32),
                     pair_stride: rope.map_or(1, |r| r.pair_stride as u32),
                     mscale: rope.map_or(1.0, |r| r.mscale),
+                    has_gate: gate.is_some() as u32,
                 };
                 set_bytes(enc, 4, &p);
                 let tgs_x = if gqa_decode {
@@ -3577,6 +3610,7 @@ impl Session {
                     enc.set_buffer(0, Some(part), 0);
                     bind(1, s.out);
                     set_bytes(enc, 2, &p);
+                    bind(3, gate.unwrap_or(q));
                     enc.dispatch_thread_groups(
                         MTLSize::new(heads as u64, m as u64, 1),
                         MTLSize::new(TG4, 1, 1),
@@ -3656,6 +3690,7 @@ impl Session {
                 channels,
                 kernel,
                 dilation,
+                silu,
             } => {
                 enc.set_compute_pipeline_state(rt.pso("causal_conv1d_f32")?);
                 bind(0, x);
@@ -3675,6 +3710,7 @@ impl Session {
                     dilation: u32,
                     hist: u32,
                     has_state: u32,
+                    silu: u32,
                 }
                 let p = Conv1dParams {
                     n: n as u32,
@@ -3683,6 +3719,7 @@ impl Session {
                     dilation: dilation as u32,
                     hist: hist as u32,
                     has_state: state.is_some() as u32,
+                    silu: silu as u32,
                 };
                 set_bytes(enc, 4, &p);
                 grid1(channels);
@@ -3694,6 +3731,8 @@ impl Session {
                 beta,
                 log_decay,
                 state,
+                neg_a,
+                beta_sigmoid,
                 n,
                 key_heads,
                 val_heads,
@@ -3724,6 +3763,8 @@ impl Session {
                     key_dim: u32,
                     val_dim: u32,
                     rep: u32,
+                    beta_sigmoid: u32,
+                    has_neg_a: u32,
                 }
                 let p = DeltaRuleParams {
                     n: n as u32,
@@ -3732,8 +3773,11 @@ impl Session {
                     key_dim: key_dim as u32,
                     val_dim: val_dim as u32,
                     rep: rep as u32,
+                    beta_sigmoid: beta_sigmoid as u32,
+                    has_neg_a: neg_a.is_some() as u32,
                 };
                 set_bytes(enc, 7, &p);
+                bind(8, neg_a.unwrap_or(q));
                 if key_dim > 512 {
                     return Err(format!(
                         "node '{}': delta rule key_dim {key_dim} exceeds 512",
@@ -3764,7 +3808,7 @@ impl Session {
             } => {
                 let bytes_norm = hidden * 4;
                 let bytes_inter = inter * 4;
-                let total_scratch = bytes_norm + 2 * bytes_inter;
+                let total_scratch = bytes_norm + bytes_inter;
 
                 let mut guard = self.mlp_scratch.lock();
                 if guard
@@ -3778,7 +3822,7 @@ impl Session {
 
                 let off_norm = 0usize;
                 let off_gate = bytes_norm;
-                let off_up = bytes_norm + bytes_inter;
+
 
                 // 1. RMSNorm: x * norm_w -> scratch[off_norm] (optionally fused with preceding post-attn norm/residual -> x)
                 if let Some((x0, g0, res0, scale0, eps0)) = pre_res {
@@ -3798,11 +3842,14 @@ impl Session {
                     bind(0, x0);
                     bind(1, g0);
                     bind(2, res0.unwrap_or(x0));
-                    bind(3, scale0.unwrap_or(x0));
+                    bind(3, scale0.map_or(x0, |s| s.0));
                     bind(4, x);
                     bind(5, norm_w);
                     enc.set_buffer(6, Some(scratch), off_norm as u64);
-                    let flags = (res0.is_some() as u32) | ((scale0.is_some() as u32) << 1) | 4;
+                    let flags = (res0.is_some() as u32)
+                        | ((scale0.is_some() as u32) << 1)
+                        | 4
+                        | ((scale0.is_some_and(|s| s.1) as u32) << 4);
                     let p = RmsNormFusedParams {
                         rows: 1,
                         d: u32_of(hidden)?,
@@ -3829,43 +3876,89 @@ impl Session {
                     set_bytes(enc, 3, &p);
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(TG, 1, 1));
                 }
-                // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(gate_w),
-                    variants[0],
-                    gate_name,
-                    None,
-                    (scratch, off_gate),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
+                let gate_fmt = self
+                    .weights
+                    .get(gate_name)
+                    .map(|w| w.3)
+                    .unwrap_or(WeightFormat::F32);
+                let up_fmt = self
+                    .weights
+                    .get(up_name)
+                    .map(|w| w.3)
+                    .unwrap_or(WeightFormat::F32);
+                let paired_pso = if variants[0] == GemvVariant::HAND
+                    && variants[1] == GemvVariant::HAND
+                    && gate_fmt == up_fmt
+                {
+                    match gate_fmt {
+                        WeightFormat::Q4_K => Some("gemv_q4_k_paired_glu"),
+                        WeightFormat::Q4_0 if (hidden & 1023) != 0 => {
+                            Some("gemv_q4_0_half_paired_glu")
+                        }
+                        WeightFormat::Q4_0 => Some("gemv_q4_0_paired_glu"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(pso_name) = paired_pso {
+                    // 2. Paired (Gate, Up) -> GLU in one dispatch: scratch[off_norm] * (gate_w, up_w) -> scratch[off_gate]
+                    enc.set_compute_pipeline_state(rt.pso(pso_name)?);
+                    let (gw_buf, gw_off) = loc(gate_w);
+                    let (uw_buf, uw_off) = loc(up_w);
+                    enc.set_buffer(0, Some(gw_buf), gw_off as u64);
+                    enc.set_buffer(1, Some(uw_buf), uw_off as u64);
+                    enc.set_buffer(2, Some(scratch), off_norm as u64);
+                    enc.set_buffer(3, Some(scratch), off_gate as u64);
+                    #[repr(C)]
+                    struct PackedGemvParams(u32, u32, u32, u32, u32);
+                    let epi = if is_geglu { Epi::GeGlu } else { Epi::SwiGlu };
+                    let p = PackedGemvParams(
+                        u32_of(inter)?,
+                        u32_of(hidden)?,
+                        1,
+                        0,
+                        epi.as_u32(),
+                    );
+                    set_bytes(enc, 4, &p);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((inter as u64).div_ceil(16), 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                } else {
+                    // 2. Gate GEMV: scratch[off_norm] * gate_w -> scratch[off_gate]
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(gate_w),
+                        variants[0],
+                        gate_name,
+                        None,
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        Epi::None,
+                    )?;
 
-                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
-                self.encode_gemv_or_gemm(
-                    enc,
-                    (scratch, off_norm),
-                    loc(up_w),
-                    variants[1],
-                    up_name,
-                    None,
-                    (scratch, off_up),
-                    inter,
-                    hidden,
-                    Epi::None,
-                )?;
-
-                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
-                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                enc.set_buffer(0, Some(scratch), off_gate as u64);
-                enc.set_buffer(1, Some(scratch), off_up as u64);
-                enc.set_buffer(2, Some(scratch), off_gate as u64);
-                set_bytes(enc, 3, &u32_of(inter)?);
-                grid1(inter);
-
+                    // 3. Up GEMV + fused GLU epilogue: glu(scratch[off_gate]) * (scratch[off_norm] * up_w) -> scratch[off_gate]
+                    let up_epi = if is_geglu {
+                        Epi::UpGeGlu
+                    } else {
+                        Epi::UpSwiGlu
+                    };
+                    self.encode_gemv_or_gemm(
+                        enc,
+                        (scratch, off_norm),
+                        loc(up_w),
+                        variants[1],
+                        up_name,
+                        Some((scratch, off_gate)),
+                        (scratch, off_gate),
+                        inter,
+                        hidden,
+                        up_epi,
+                    )?;
+                }
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
                     // 5. Down GEMV into scratch[off_norm]: scratch[off_gate] * down_w -> scratch[off_norm]
@@ -3958,8 +4051,8 @@ pub enum Step {
         g: ValueId,
         /// Added to the normalised output (`res + norm(x) * g`) when the norm's only reader was an Add.
         res: Option<ValueId>,
-        /// Scalar multiplier (`(norm(x) * g [+ res]) * scale[0]`) when the only reader was a scalar Mul.
-        scale: Option<ValueId>,
+        /// Scalar or elementwise multiplier (`(norm(x) * g [+ res]) * scale`, `(id, is_vec)`).
+        scale: Option<(ValueId, bool)>,
         /// Chained pre-norm `(g2, out2, eps2)` over this step's output `out`.
         chain: Option<(ValueId, ValueId, f32)>,
         /// Fused RoPE applied per head after normalisation when the norm's only reader was a Rope.
@@ -4041,6 +4134,7 @@ pub enum Step {
         pos: Option<ValueId>,
         vis: Option<ValueId>,
         rope: Option<NormRope>,
+        gate: Option<ValueId>,
         heads: usize,
         head_dim: usize,
         kv_heads: usize,
@@ -4076,6 +4170,7 @@ pub enum Step {
         channels: usize,
         kernel: usize,
         dilation: usize,
+        silu: bool,
     },
     DeltaRule {
         q: ValueId,
@@ -4084,6 +4179,8 @@ pub enum Step {
         beta: ValueId,
         log_decay: ValueId,
         state: Option<ValueId>,
+        neg_a: Option<ValueId>,
+        beta_sigmoid: bool,
         n: usize,
         key_heads: usize,
         val_heads: usize,
@@ -4097,7 +4194,13 @@ pub enum Step {
         up_w: ValueId,
         down_w: ValueId,
         post_norm_w: Option<ValueId>,
-        pre_res: Option<(ValueId, ValueId, Option<ValueId>, Option<ValueId>, f32)>,
+        pre_res: Option<(
+            ValueId,
+            ValueId,
+            Option<ValueId>,
+            Option<(ValueId, bool)>,
+            f32,
+        )>,
         gate_name: String,
         up_name: String,
         down_name: String,
@@ -4602,6 +4705,133 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             );
         }
     }
+    let mut attn_gates: HashMap<usize, (ValueId, ValueId)> = HashMap::new();
+    let mut delta_fusions: HashMap<usize, (ValueId, bool, ValueId, Option<ValueId>)> =
+        HashMap::new();
+    if fusion_policy().allows(FusionClass::ReduceInput) {
+        for (ai, node) in g.nodes.iter().enumerate() {
+            if !matches!(node.op, Op::CachedAttention { .. }) || node.outputs.is_empty() {
+                continue;
+            }
+            let a_out = node.outputs[0];
+            if g.outputs.contains(&a_out) {
+                continue;
+            }
+            let Some(&[mi]) = readers.get(&a_out).map(Vec::as_slice) else {
+                continue;
+            };
+            if mi <= ai || g.nodes[mi].op != Op::Mul || g.nodes[mi].inputs.len() != 2 {
+                continue;
+            }
+            let g_act = if g.nodes[mi].inputs[0] == a_out {
+                g.nodes[mi].inputs[1]
+            } else {
+                g.nodes[mi].inputs[0]
+            };
+            if g_act == a_out
+                || g.outputs.contains(&g_act)
+                || readers.get(&g_act).map(Vec::as_slice) != Some(&[mi])
+            {
+                continue;
+            }
+            let ValueKind::Node(gn) = g.value(g_act).kind else {
+                continue;
+            };
+            let gi = gn.0 as usize;
+            if gi >= mi
+                || !matches!(
+                    g.nodes[gi].op,
+                    Op::Unary {
+                        kind: crate::graph::UnaryKind::Sigmoid
+                    }
+                )
+                || g.nodes[gi].inputs.len() != 1
+            {
+                continue;
+            }
+            let gate_in = g.nodes[gi].inputs[0];
+            if exists_before(gate_in, ai)
+                && g.value(gate_in).dtype == DType::F32
+                && numel(g, gate_in).ok() == numel(g, a_out).ok()
+            {
+                fused[gi] = true;
+                fused[mi] = true;
+                attn_gates.insert(ai, (gate_in, g.nodes[mi].outputs[0]));
+            }
+        }
+        for (di, node) in g.nodes.iter().enumerate() {
+            let Op::DeltaRule { val_heads, .. } = &node.op else {
+                continue;
+            };
+            if node.inputs.len() < 5 {
+                continue;
+            }
+            let (mut beta, mut beta_sig) = (node.inputs[3], false);
+            if !g.outputs.contains(&beta) && readers.get(&beta).map(Vec::as_slice) == Some(&[di]) {
+                if let ValueKind::Node(bn) = g.value(beta).kind {
+                    let bi = bn.0 as usize;
+                    if bi < di
+                        && matches!(
+                            g.nodes[bi].op,
+                            Op::Unary {
+                                kind: crate::graph::UnaryKind::Sigmoid
+                            }
+                        )
+                        && g.nodes[bi].inputs.len() == 1
+                    {
+                        let b_in = g.nodes[bi].inputs[0];
+                        if exists_before(b_in, di) {
+                            beta = b_in;
+                            beta_sig = true;
+                            fused[bi] = true;
+                        }
+                    }
+                }
+            }
+            let (mut ld, mut neg_a) = (node.inputs[4], None);
+            if !g.outputs.contains(&ld) && readers.get(&ld).map(Vec::as_slice) == Some(&[di]) {
+                if let ValueKind::Node(mn) = g.value(ld).kind {
+                    let mi = mn.0 as usize;
+                    if mi < di && g.nodes[mi].op == Op::Mul && g.nodes[mi].inputs.len() == 2 {
+                        let (i0, i1) = (g.nodes[mi].inputs[0], g.nodes[mi].inputs[1]);
+                        for (sp_val, na_val) in [(i0, i1), (i1, i0)] {
+                            if !g.outputs.contains(&sp_val)
+                                && readers.get(&sp_val).map(Vec::as_slice) == Some(&[mi])
+                                && numel(g, na_val).ok() == Some(*val_heads)
+                                && g.value(na_val).dtype == DType::F32
+                                && exists_before(na_val, di)
+                            {
+                                if let ValueKind::Node(sn) = g.value(sp_val).kind {
+                                    let si = sn.0 as usize;
+                                    if si < mi
+                                        && matches!(
+                                            g.nodes[si].op,
+                                            Op::Unary {
+                                                kind: crate::graph::UnaryKind::Softplus
+                                            }
+                                        )
+                                        && g.nodes[si].inputs.len() == 1
+                                    {
+                                        let a_in = g.nodes[si].inputs[0];
+                                        if exists_before(a_in, di) {
+                                            ld = a_in;
+                                            neg_a = Some(na_val);
+                                            fused[si] = true;
+                                            fused[mi] = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if beta_sig || neg_a.is_some() {
+                delta_fusions.insert(di, (beta, beta_sig, ld, neg_a));
+            }
+        }
+    }
     for (i, node) in g.nodes.iter().enumerate() {
         if fused[i] {
             continue;
@@ -4914,12 +5144,13 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         } else {
                             c.inputs[0]
                         };
+                        let sl = n_of(s)?;
                         if s != out
                             && exists_before(s, i)
-                            && n_of(s)? == 1
+                            && (sl == 1 || (sl == xl && res.is_none() && s != x))
                             && g.value(s).dtype == DType::F32
                         {
-                            scale = Some(s);
+                            scale = Some((s, sl > 1));
                             fused[*k] = true;
                             out = c.outputs[0];
                         }
@@ -5080,6 +5311,13 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 } else {
                     None
                 };
+                let gate = match attn_gates.remove(&i) {
+                    Some((g_in, m_out)) => {
+                        out = m_out;
+                        Some(g_in)
+                    }
+                    None => None,
+                };
                 if (*head_dim).max(*v_head_dim) > ATTN_MAX_HEAD_DIM {
                     return Err(format!(
                         "node '{name}': head_dim {} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}",
@@ -5098,6 +5336,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         pos,
                         vis,
                         rope,
+                        gate,
                         heads: *heads,
                         head_dim: *head_dim,
                         kv_heads: *kv_heads,
@@ -5175,6 +5414,19 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let wl = n_of(w)?;
                 let channels = wl / k.max(1);
                 let n = xl / channels.max(1);
+                let mut silu = false;
+                if let Some([j]) = readers
+                    .get(&out)
+                    .map(Vec::as_slice)
+                    .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
+                {
+                    let c = &g.nodes[*j];
+                    if c.op == Op::Silu && c.inputs.len() == 1 && !g.outputs.contains(&out) {
+                        silu = true;
+                        fused[*j] = true;
+                        out = c.outputs[0];
+                    }
+                }
                 (
                     Step::CausalConv1dCached {
                         x,
@@ -5184,6 +5436,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         channels,
                         kernel: k,
                         dilation: d,
+                        silu,
                     },
                     xl,
                 )
@@ -5197,8 +5450,10 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let q = arg(0)?;
                 let k = arg(1)?;
                 let v = arg(2)?;
-                let beta = arg(3)?;
-                let log_decay = arg(4)?;
+                let (beta, beta_sigmoid, log_decay, neg_a) = match delta_fusions.remove(&i) {
+                    Some(f) => f,
+                    None => (arg(3)?, false, arg(4)?, None),
+                };
                 let state = if node.inputs.len() >= 6 {
                     Some(arg(5)?)
                 } else {
@@ -5218,6 +5473,8 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         beta,
                         log_decay,
                         state,
+                        neg_a,
+                        beta_sigmoid,
                         n,
                         key_heads: kh,
                         val_heads: vh,
@@ -5317,7 +5574,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Some(x),
                 Some(g),
                 res,
-                scale,
+                scale.map(|s| s.0),
                 chain.map(|c| c.0),
                 rope.map(|r| r.pos),
                 rope.map(|r| r.inv_freq),
@@ -5338,6 +5595,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 pos,
                 vis,
                 rope,
+                gate,
                 ..
             } => [
                 Some(q),
@@ -5348,6 +5606,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 pos,
                 vis,
                 rope.map(|r| r.inv_freq),
+                gate,
             ]
             .into_iter()
             .flatten()
@@ -5373,6 +5632,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 beta,
                 log_decay,
                 state,
+                neg_a,
                 ..
             } => [
                 Some(q),
@@ -5381,6 +5641,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Some(beta),
                 Some(log_decay),
                 state,
+                neg_a,
             ]
             .into_iter()
             .flatten()
@@ -6493,6 +6754,149 @@ mod tests {
         }
     }
 
+    /// CausalConv1dCached+Silu, DeltaRule beta/log_decay pre-activations, RmsNorm vector scale,
+    /// and CachedAttention sigmoid gate fuse into their steps and match the CPU executor.
+    #[test]
+    fn deltarule_conv_and_attention_gate_fuse_and_match_cpu() {
+        let f = DType::F32;
+        let (kh, vh, kd, vd) = (2usize, 4usize, 8usize, 8usize);
+        let cd = 2 * kh * kd + vh * vd;
+        let mut g = Graph::new();
+        let x_conv = g.input("x_conv", vec![1, cd], f);
+        let b_in = g.input("b_in", vec![1, vh], f);
+        let a_in = g.input("a_in", vec![1, vh], f);
+        let z_in = g.input("z_in", vec![1, vh * vd], f);
+        let conv_w = g.weight("conv_w", vec![cd, 4], f);
+        let neg_a = g.weight("neg_a", vec![vh], f);
+        let norm_w = g.weight("norm_w", vec![vd], f);
+        let c_state = g.state("c_state", vec![3, cd], f);
+        let s_state = g.state("s_state", vec![vh * kd * vd], f);
+
+        let conv = g.add(
+            "conv",
+            Op::CausalConv1dCached {
+                kernel: 4,
+                dilation: 1,
+            },
+            &[x_conv, conv_w, c_state],
+            vec![1, cd],
+            f,
+        );
+        let mixed = g.add("silu", Op::Silu, &[conv], vec![1, cd], f);
+        let q = g.add(
+            "q",
+            Op::Slice {
+                axis: -1,
+                start: 0,
+                end: (kh * kd) as i64,
+            },
+            &[mixed],
+            vec![1, kh * kd],
+            f,
+        );
+        let k = g.add(
+            "k",
+            Op::Slice {
+                axis: -1,
+                start: (kh * kd) as i64,
+                end: (2 * kh * kd) as i64,
+            },
+            &[mixed],
+            vec![1, kh * kd],
+            f,
+        );
+        let v = g.add(
+            "v",
+            Op::Slice {
+                axis: -1,
+                start: (2 * kh * kd) as i64,
+                end: cd as i64,
+            },
+            &[mixed],
+            vec![1, vh * vd],
+            f,
+        );
+        let beta = g.add(
+            "beta",
+            Op::Unary {
+                kind: crate::graph::UnaryKind::Sigmoid,
+            },
+            &[b_in],
+            vec![1, vh],
+            f,
+        );
+        let a_sp = g.add(
+            "a_sp",
+            Op::Unary {
+                kind: crate::graph::UnaryKind::Softplus,
+            },
+            &[a_in],
+            vec![1, vh],
+            f,
+        );
+        let ld = g.add("ld", Op::Mul, &[neg_a, a_sp], vec![1, vh], f);
+        let core = g.add(
+            "delta",
+            Op::DeltaRule {
+                key_heads: kh,
+                val_heads: vh,
+                key_dim: kd,
+                val_dim: vd,
+            },
+            &[q, k, v, beta, ld, s_state],
+            vec![1, vh * vd],
+            f,
+        );
+        let normed = g.add(
+            "norm",
+            Op::RmsNorm { eps: 1e-5 },
+            &[core, norm_w],
+            vec![1, vh * vd],
+            f,
+        );
+        let gated = g.add("gated", Op::Mul, &[normed, z_in], vec![1, vh * vd], f);
+        g.output(gated);
+
+        let mut w = Weights::new();
+        w.insert("conv_w", Tensor::F32(rand(cd * 4, 1)));
+        w.insert("neg_a", Tensor::F32(vec![-0.5, -1.0, -1.5, -2.0]));
+        w.insert("norm_w", Tensor::F32(rand(vd, 2)));
+        let sess = Session::new(rt(), &w).unwrap();
+        let prep = sess.prepare_plan(&g).unwrap();
+        assert_eq!(prep.steps.len(), 3, "conv+silu, delta_rule, rmsnorm+mul");
+        assert!(matches!(
+            prep.steps[0].op,
+            Step::CausalConv1dCached { silu: true, .. }
+        ));
+        assert!(matches!(
+            prep.steps[1].op,
+            Step::DeltaRule {
+                beta_sigmoid: true,
+                neg_a: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            prep.steps[2].op,
+            Step::RmsNorm {
+                scale: Some((_, true)),
+                ..
+            }
+        ));
+        let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+        for step in 0..3u64 {
+            let inp = vec![
+                Tensor::F32(rand(cd, 10 + step)),
+                Tensor::F32(rand(vh, 20 + step)),
+                Tensor::F32(rand(vh, 30 + step)),
+                Tensor::F32(rand(vh * vd, 40 + step)),
+            ];
+            let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
+            let got = sess.run_with_state(&g, Some(&mut ms), inp).unwrap();
+            assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-4);
+        }
+    }
+
     /// Single-reader Rope after RmsNorm (and RmsNormBatch) and single-reader Q/K Rope feeding
     /// decode CachedAttention fuse into their producer/consumer steps and match the CPU executor.
     #[test]
@@ -7102,6 +7506,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn megakernel_mlp_paired_glu_matches_cpu() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        for (f, hidden) in [
+            (QuantFormat::GGUF_Q4_K_M, 512usize),
+            (QuantFormat::GGUF_Q4_0, 1536usize),
+            (QuantFormat::GGUF_Q4_0, 1024usize),
+            (QuantFormat::GGUF_IQ4_XS, 512usize),
+        ] {
+            for act_op in [Op::SwiGlu, Op::GeGlu] {
+                let inter = 512usize;
+                let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (f as u64) ^ (hidden as u64);
+                let mut next = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u32
+                };
+                let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+                let scale_at: &[usize] = match f {
+                    QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                    _ => &[0],
+                };
+                let mut w = Weights::new();
+                let mut g = Graph::new();
+                let mut quant = |g: &mut Graph, w: &mut Weights, name: &str, n: usize, k: usize| {
+                    let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                        .map(|_| (next() >> 4) as u8)
+                        .collect();
+                    for blk in raw.chunks_exact_mut(bb) {
+                        for &o in scale_at {
+                            let exp = 9 + (next() % 14) as u16;
+                            let d =
+                                ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                            blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                        }
+                    }
+                    w.insert(
+                        name,
+                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.into(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    );
+                    g.weight(name, vec![n, k], DType::Quant(f))
+                };
+                let x = g.input("x", vec![1, hidden], DType::F32);
+                let norm_w = g.weight("norm.weight", vec![hidden], DType::F32);
+                w.insert("norm.weight", Tensor::F32(vec![1.0; hidden]));
+                let normed = g.add(
+                    "norm",
+                    Op::RmsNorm { eps: 1e-5 },
+                    &[x, norm_w],
+                    vec![1, hidden],
+                    DType::F32,
+                );
+                let gw = quant(&mut g, &mut w, "gate.weight", inter, hidden);
+                let uw = quant(&mut g, &mut w, "up.weight", inter, hidden);
+                let dw = quant(&mut g, &mut w, "down.weight", hidden, inter);
+                let gate = g.add("gate", Op::Linear, &[normed, gw], vec![1, inter], DType::F32);
+                let up = g.add("up", Op::Linear, &[normed, uw], vec![1, inter], DType::F32);
+                let act = g.add("glu", act_op.clone(), &[gate, up], vec![1, inter], DType::F32);
+                let down = g.add("down", Op::Linear, &[act, dw], vec![1, hidden], DType::F32);
+                let out = g.add("add", Op::Add, &[x, down], vec![1, hidden], DType::F32);
+                g.output(out);
+                let unfused = g.clone();
+                assert_eq!(
+                    crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+                    1
+                );
+                let xs: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.37).sin()).collect();
+                let want = cpu::run_stateless(&unfused, &w, vec![Tensor::F32(xs.clone())])
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let mut s = Session::new(rt(), &w).unwrap();
+                s.set_variant_override(Some(GemvVariant::HAND));
+                let got = s
+                    .run(&g, vec![Tensor::F32(xs)])
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let err = rel_err(&want, &got);
+                assert!(
+                    err < 1e-3,
+                    "{f:?} hidden={hidden} {act_op:?}: paired/fused megakernel MLP differs from CPU by {err}"
+                );
+            }
+        }
+    }
+
     /// TQ2_0 lives in the planar device layout (groups of 8 blocks): GEMV (m = 1, every variant), the
     /// dequantizing batched path (m = 20) equal the CPU executor at shapes where rows are not whole groups
     /// (5, 9 blocks per row), n is not a multiple of the rows per threadgroup and the total block count is
@@ -7435,6 +7934,115 @@ mod tests {
     }
 
     #[test]
+    fn gemv_q4_0_half_quarter_and_half_block_epilogues_match_cpu() {
+        let make_q4_0 = |n: usize, k: usize, seed: usize| {
+            let n_blocks = n * (k / 32);
+            let mut raw = Vec::with_capacity(n_blocks * 18);
+            for b in 0..n_blocks {
+                let d = crate::model::f32_to_f16(0.125 * (((b + seed) % 5) as f32 + 1.0));
+                raw.extend_from_slice(&d.to_le_bytes());
+                for j in 0..16 {
+                    let low = (j * 3 + b + seed) % 16;
+                    let high = (j * 5 + b * 2 + seed) % 16;
+                    raw.push((low | (high << 4)) as u8);
+                }
+            }
+            Tensor::Quantized(Arc::new(
+                crate::model::layers::QuantizedWeight::GgufQuantized {
+                    format: QuantFormat::GGUF_Q4_0,
+                    raw_data: bytes::Bytes::from(raw),
+                    in_features: k,
+                    out_features: n,
+                },
+            ))
+        };
+
+        for &(rows, cols) in &[(1536usize, 256usize), (256, 1536)] {
+            // 1. Epi::GeGlu
+            {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![1, cols], DType::F32);
+                let up = g.input("up", vec![1, rows], DType::F32);
+                let w_val = g.weight("w", vec![rows, cols], DType::Quant(QuantFormat::GGUF_Q4_0));
+                let y = g.add("lin", Op::Linear, &[x, w_val], vec![1, rows], DType::F32);
+                let out = g.add("geglu", Op::GeGlu, &[y, up], vec![1, rows], DType::F32);
+                g.output(out);
+
+                let (steps, _) = plan(&g).unwrap();
+                assert!(
+                    matches!(
+                        steps.as_slice(),
+                        [Planned {
+                            op: Step::GemvPacked {
+                                epi: Epi::GeGlu,
+                                rows: r,
+                                cols: c,
+                                format: WeightFormat::Q4_0,
+                                ..
+                            },
+                            ..
+                        }] if *r == rows && *c == cols
+                    ),
+                    "expected fused GemvPacked GeGlu for ({rows}, {cols}), got {steps:?}"
+                );
+
+                let mut w = Weights::new();
+                w.insert("w", make_q4_0(rows, cols, 11));
+                let inputs = vec![Tensor::F32(rand(cols, 31)), Tensor::F32(rand(rows, 37))];
+                let (want, got) = both(&g, &w, inputs, None);
+                let err = rel_err(&want, &got);
+                assert!(
+                    err < 1e-4,
+                    "GeGlu ({rows}, {cols}) rel_err {err}: want {:?} vs got {:?}",
+                    &want[..4],
+                    &got[..4]
+                );
+            }
+
+            // 2. Epi::Residual
+            {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![1, cols], DType::F32);
+                let res_in = g.input("res", vec![1, rows], DType::F32);
+                let w_val = g.weight("w", vec![rows, cols], DType::Quant(QuantFormat::GGUF_Q4_0));
+                let y = g.add("lin", Op::Linear, &[x, w_val], vec![1, rows], DType::F32);
+                let out = g.add("add", Op::Add, &[y, res_in], vec![1, rows], DType::F32);
+                g.output(out);
+
+                let (steps, _) = plan(&g).unwrap();
+                assert!(
+                    matches!(
+                        steps.as_slice(),
+                        [Planned {
+                            op: Step::GemvPacked {
+                                epi: Epi::Residual,
+                                rows: r,
+                                cols: c,
+                                format: WeightFormat::Q4_0,
+                                ..
+                            },
+                            ..
+                        }] if *r == rows && *c == cols
+                    ),
+                    "expected fused GemvPacked Residual for ({rows}, {cols}), got {steps:?}"
+                );
+
+                let mut w = Weights::new();
+                w.insert("w", make_q4_0(rows, cols, 19));
+                let inputs = vec![Tensor::F32(rand(cols, 41)), Tensor::F32(rand(rows, 43))];
+                let (want, got) = both(&g, &w, inputs, None);
+                let err = rel_err(&want, &got);
+                assert!(
+                    err < 1e-4,
+                    "Residual ({rows}, {cols}) rel_err {err}: want {:?} vs got {:?}",
+                    &want[..4],
+                    &got[..4]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn gemv_iq4_xs_matches_cpu() {
         let (m, n, k) = (1, 16, 256 * 2);
         let mut g = Graph::new();
@@ -7704,6 +8312,11 @@ mod tests {
             set_bytes(enc, 4, &(in_f as u32));
             set_bytes(enc, 5, &(out_f as u32));
             set_bytes(enc, 6, &(addr_bits as u32));
+            #[repr(C)]
+            struct PackedGemvParams(u32, u32, u32, u32, u32);
+            let p = PackedGemvParams(out_f as u32, in_f as u32, 1, 0, 0);
+            set_bytes(enc, 7, &p);
+            enc.set_buffer(8, Some(&y_buf), 0);
 
             enc.dispatch_thread_groups(
                 MTLSize::new((out_f as u64).div_ceil(32), 1, 1),
