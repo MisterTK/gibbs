@@ -2168,17 +2168,52 @@ impl Session {
             },
         }
     }
-
-    /// `format`'s default-variant GEMV pipeline (steps that are not tuned).
-    fn gemv_pso(&self, format: WeightFormat) -> Result<ComputePipelineState, String> {
-        self.gemv_pipeline(format, format.default_variant())
-            .map(|p| p.0)
-    }
-
     /// Picks each m = 1 packed GEMV's kernel variant: the session override, else the tuner's
     /// winner for its `(format, rows, cols)` (`GIBBS_TUNE=off`: the format's default).
     fn assign_variants(&self, steps: &mut [Planned]) {
         let mut chosen: HashMap<(WeightFormat, usize, usize), GemvVariant> = HashMap::new();
+        for s in steps.iter_mut() {
+            let Step::MegakernelMlp {
+                gate_name,
+                up_name,
+                down_name,
+                hidden,
+                inter,
+                variants,
+                ..
+            } = &mut s.op
+            else {
+                continue;
+            };
+            for (v, (name, rows, cols)) in variants.iter_mut().zip([
+                (&*gate_name, *inter, *hidden),
+                (&*up_name, *inter, *hidden),
+                (&*down_name, *hidden, *inter),
+            ]) {
+                let Some(f) = self
+                    .weights
+                    .get(name)
+                    .map(|w| w.3)
+                    .filter(|f| !f.gemv_variants().is_empty())
+                else {
+                    continue;
+                };
+                let allowed = f.gemv_variants();
+                *v = match self.variant_override {
+                    Some(o) if allowed.contains(&o) => o,
+                    Some(_) => f.default_variant(),
+                    None if !matches!(f, WeightFormat::Q4_0 | WeightFormat::Q4_K)
+                        && tune::enabled()
+                        && allowed.len() > 1 =>
+                    {
+                        *chosen
+                            .entry((f, rows, cols))
+                            .or_insert_with(|| self.rt.tuned_variant(f, rows, cols))
+                    }
+                    None => f.default_variant(),
+                };
+            }
+        }
         for s in steps.iter_mut() {
             let Step::GemvPacked {
                 m,
@@ -2703,6 +2738,7 @@ impl Session {
         enc: &Counted,
         x: (&Buffer, usize),
         w_loc: (&Buffer, usize),
+        variant: GemvVariant,
         graph_val_name: &str,
         res: Option<(&Buffer, usize)>,
         out: (&Buffer, usize),
@@ -2782,7 +2818,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let pso = self.gemv_pso(format)?;
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -2798,12 +2834,6 @@ impl Session {
                 } else {
                     enc.set_buffer(5, Some(out.0), out.1 as u64);
                 }
-                let rows_per_tg = match format {
-                    WeightFormat::Gen(_) => {
-                        crate::graph::codegen::gemv_rows_per_tg(Default::default()) as u64
-                    }
-                    _ => 16,
-                };
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -3605,6 +3635,7 @@ impl Session {
                 ref gate_name,
                 ref up_name,
                 ref down_name,
+                variants,
                 hidden,
                 inter,
                 eps,
@@ -3644,6 +3675,7 @@ impl Session {
                     enc,
                     (scratch, off_norm),
                     loc(gate_w),
+                    variants[0],
                     gate_name,
                     None,
                     (scratch, off_gate),
@@ -3657,6 +3689,7 @@ impl Session {
                     enc,
                     (scratch, off_norm),
                     loc(up_w),
+                    variants[1],
                     up_name,
                     None,
                     (scratch, off_up),
@@ -3681,6 +3714,7 @@ impl Session {
                         enc,
                         (scratch, off_gate),
                         loc(down_w),
+                        variants[2],
                         down_name,
                         None,
                         (scratch, off_norm),
@@ -3706,6 +3740,7 @@ impl Session {
                         enc,
                         (scratch, off_gate),
                         loc(down_w),
+                        variants[2],
                         down_name,
                         Some(loc(x)),
                         loc(s.out),
@@ -3898,6 +3933,8 @@ pub enum Step {
         gate_name: String,
         up_name: String,
         down_name: String,
+        /// gate / up / down GEMV kernels, set by [`Session::prepare_plan`] like `GemvPacked::variant`.
+        variants: [GemvVariant; 3],
         hidden: usize,
         inter: usize,
         eps: f32,
@@ -4730,6 +4767,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                             gate_name,
                             up_name,
                             down_name,
+                            variants: [GemvVariant::HAND; 3],
                             hidden: *hidden_dim,
                             inter: *intermediate_dim,
                             eps: *eps,
@@ -6175,6 +6213,125 @@ mod tests {
                     err < 1e-4,
                     "{f:?} m={m} {v:?}: packed linear differs from CPU by {err}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn megakernel_mlp_matches_cpu_for_every_variant() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        for f in [
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q8_0,
+        ] {
+            for post_norm in [false, true] {
+                let (hidden, inter) = (256usize, 512usize);
+                let mut seed = 0x1234_5678_9ABC_DEF1u64 ^ f as u64;
+                let mut next = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u32
+                };
+                let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+                let scale_at: &[usize] = match f {
+                    QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                    _ => &[0],
+                };
+                let mut w = Weights::new();
+                let mut g = Graph::new();
+                let mut quant = |g: &mut Graph, w: &mut Weights, name: &str, n: usize, k: usize| {
+                    let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                        .map(|_| (next() >> 4) as u8)
+                        .collect();
+                    for blk in raw.chunks_exact_mut(bb) {
+                        for &o in scale_at {
+                            let exp = 9 + (next() % 14) as u16;
+                            let d =
+                                ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                            blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                        }
+                    }
+                    w.insert(
+                        name,
+                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.into(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    );
+                    g.weight(name, vec![n, k], DType::Quant(f))
+                };
+                let x = g.input("x", vec![1, hidden], DType::F32);
+                let norm_w = g.weight("norm.weight", vec![hidden], DType::F32);
+                w.insert("norm.weight", Tensor::F32(vec![1.0; hidden]));
+                let normed = g.add(
+                    "norm",
+                    Op::RmsNorm { eps: 1e-5 },
+                    &[x, norm_w],
+                    vec![1, hidden],
+                    DType::F32,
+                );
+                let gw = quant(&mut g, &mut w, "gate.weight", inter, hidden);
+                let uw = quant(&mut g, &mut w, "up.weight", inter, hidden);
+                let dw = quant(&mut g, &mut w, "down.weight", hidden, inter);
+                let gate = g.add(
+                    "gate",
+                    Op::Linear,
+                    &[normed, gw],
+                    vec![1, inter],
+                    DType::F32,
+                );
+                let up = g.add("up", Op::Linear, &[normed, uw], vec![1, inter], DType::F32);
+                let act = g.add(
+                    "swiglu",
+                    Op::SwiGlu,
+                    &[gate, up],
+                    vec![1, inter],
+                    DType::F32,
+                );
+                let mut down = g.add("down", Op::Linear, &[act, dw], vec![1, hidden], DType::F32);
+                if post_norm {
+                    let pn = g.weight("post_norm.weight", vec![hidden], DType::F32);
+                    w.insert("post_norm.weight", Tensor::F32(vec![0.9; hidden]));
+                    down = g.add(
+                        "post_norm",
+                        Op::RmsNorm { eps: 1e-5 },
+                        &[down, pn],
+                        vec![1, hidden],
+                        DType::F32,
+                    );
+                }
+                let out = g.add("add", Op::Add, &[x, down], vec![1, hidden], DType::F32);
+                g.output(out);
+                let unfused = g.clone();
+                assert_eq!(
+                    crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+                    1
+                );
+                let xs: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
+                let want = cpu::run_stateless(&unfused, &w, vec![Tensor::F32(xs.clone())])
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                for v in WeightFormat::of_quant(f).gemv_variants() {
+                    let mut s = Session::new(rt(), &w).unwrap();
+                    s.set_variant_override(Some(v));
+                    let got = s
+                        .run(&g, vec![Tensor::F32(xs.clone())])
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap();
+                    let err = rel_err(&want, &got);
+                    assert!(
+                        err < 1e-3,
+                        "{f:?} post_norm={post_norm} {v:?}: megakernel MLP differs from CPU by {err}"
+                    );
+                }
             }
         }
     }
