@@ -342,14 +342,9 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
     uint scales_h = cd_u16(blk + 2);
     uint ib = g >> 1;
     device const uchar* q = blk + 8 + 16 * ib + (g & 1) * 8;
-    uint q0 = cd_u32(q), q1 = cd_u32(q + 4);
-    for (uint i = 0; i < 4; i++) {
-        uint b0 = (q0 >> (8 * i)) & 0xFFu;
-        uint b1 = (q1 >> (8 * i)) & 0xFFu;
-        out[i] = float(KVALUES_IQ4NL[b0 & 0x0Fu]);
-        out[4 + i] = float(KVALUES_IQ4NL[b1 & 0x0Fu]);
-        out[8 + i] = float(KVALUES_IQ4NL[b0 >> 4]);
-        out[12 + i] = float(KVALUES_IQ4NL[b1 >> 4]);
+    for (uint i = 0; i < 8; i++) {
+        out[i] = float(KVALUES_IQ4NL[q[i] & 0x0Fu]);
+        out[8 + i] = float(KVALUES_IQ4NL[q[i] >> 4]);
     }
     uint ls = ((uint(blk[4 + (ib >> 1)]) >> (4 * (ib & 1))) & 0x0Fu) | (((scales_h >> (2 * ib)) & 3u) << 4);
     out[16] = d * float(int(ls) - 32);

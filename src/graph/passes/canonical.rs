@@ -6,59 +6,8 @@ use std::collections::{HashMap, HashSet};
 /// 2. Common Subexpression Elimination (CSE)
 /// 3. Dead Code Elimination (DCE)
 pub fn run(g: &mut Graph) {
-    fold_weightless_rmsnorm_mul(g);
     eliminate_common_subexpressions(g);
     eliminate_dead_nodes(g);
-}
-
-/// Folds `unit = RmsNorm(x)` (1 input, no gamma) followed by `Mul(unit, scale)` (where `scale` has
-/// shape `[d]` matching the last dimension of `x` and `unit` has no other readers) into a single
-/// 2-input `RmsNorm(x, scale)`.
-fn fold_weightless_rmsnorm_mul(g: &mut Graph) {
-    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
-    for n in &g.nodes {
-        for &inp in &n.inputs {
-            *use_count.entry(inp).or_insert(0) += 1;
-        }
-    }
-    for &out in &g.outputs {
-        *use_count.entry(out).or_insert(0) += 1;
-    }
-    let mut unit_norms: HashMap<ValueId, (ValueId, f32, usize)> = HashMap::new();
-    for n in &g.nodes {
-        if let Op::RmsNorm { eps } = n.op {
-            if n.inputs.len() == 1 && n.outputs.len() == 1 {
-                let out = n.outputs[0];
-                if use_count.get(&out).copied() == Some(1) {
-                    if let Some(&d) = g.value(out).shape.last() {
-                        if d > 0 {
-                            unit_norms.insert(out, (n.inputs[0], eps, d));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if unit_norms.is_empty() {
-        return;
-    }
-    for i in 0..g.nodes.len() {
-        if g.nodes[i].op != Op::Mul || g.nodes[i].inputs.len() != 2 {
-            continue;
-        }
-        let (a, b) = (g.nodes[i].inputs[0], g.nodes[i].inputs[1]);
-        for (u, s) in [(a, b), (b, a)] {
-            if let Some(&(x, eps, d)) = unit_norms.get(&u) {
-                if g.value(s).shape.as_slice() == [d]
-                    && g.value(s).dtype == crate::graph::DType::F32
-                {
-                    g.nodes[i].op = Op::RmsNorm { eps };
-                    g.nodes[i].inputs = vec![x, s];
-                    break;
-                }
-            }
-        }
-    }
 }
 
 /// Identifies identical operations on identical inputs and merges them.

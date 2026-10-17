@@ -78,7 +78,7 @@ static inline float block_sum(float v, threadgroup float* scratch, uint sg, uint
 }
 
 // GEMM epilogues, applied to x·Wᵀ (+ bias) before the store.
-enum : int { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2, EPI_UP_SWIGLU = 6, EPI_UP_GEGLU = 7 };
+enum : int { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2 };
 
 template <int EPI>
 static inline float epilogue(float acc, uint row, uint col, constant GemmParams& p,
@@ -86,13 +86,6 @@ static inline float epilogue(float acc, uint row, uint col, constant GemmParams&
     float v = p.has_bias ? acc + bias[col] : acc;
     if (EPI == EPI_GELU) v = gelu_erf(v);
     if (EPI == EPI_RESIDUAL) v += res[(ulong)row * p.n + col];
-    if (EPI == EPI_UP_SWIGLU) {
-        float g = res[(ulong)row * p.n + col];
-        v *= g / (1.0f + exp(-g));
-    }
-    if (EPI == EPI_UP_GEGLU) {
-        v *= gelu_tanh(res[(ulong)row * p.n + col]);
-    }
     return v;
 }
 
@@ -146,8 +139,6 @@ kernel void gemm_sg(device const float* x [[buffer(0)]],
 GEMM_INSTANCE("gemm_sg_none", gemm_sg, EPI_NONE)
 GEMM_INSTANCE("gemm_sg_gelu", gemm_sg, EPI_GELU)
 GEMM_INSTANCE("gemm_sg_residual", gemm_sg, EPI_RESIDUAL)
-GEMM_INSTANCE("gemm_sg_up_swiglu", gemm_sg, EPI_UP_SWIGLU)
-GEMM_INSTANCE("gemm_sg_up_geglu", gemm_sg, EPI_UP_GEGLU)
 
 // Same contract for few rows (decode-like m): one simdgroup per output column, i.e. per row of w,
 // which is read once per 8 rows of x; 8 columns per threadgroup. Lanes take float4 chunks of k
@@ -192,8 +183,6 @@ kernel void gemm_rows(device const float* x [[buffer(0)]],
 GEMM_INSTANCE("gemm_rows_none", gemm_rows, EPI_NONE)
 GEMM_INSTANCE("gemm_rows_gelu", gemm_rows, EPI_GELU)
 GEMM_INSTANCE("gemm_rows_residual", gemm_rows, EPI_RESIDUAL)
-GEMM_INSTANCE("gemm_rows_up_swiglu", gemm_rows, EPI_UP_SWIGLU)
-GEMM_INSTANCE("gemm_rows_up_geglu", gemm_rows, EPI_UP_GEGLU)
 
 #if defined(GIBBS_MPP)
 using namespace mpp::tensor_ops;
@@ -238,8 +227,6 @@ kernel void gemm_mpp(device float* x [[buffer(0)]],
 GEMM_INSTANCE("gemm_mpp_none", gemm_mpp, EPI_NONE)
 GEMM_INSTANCE("gemm_mpp_gelu", gemm_mpp, EPI_GELU)
 GEMM_INSTANCE("gemm_mpp_residual", gemm_mpp, EPI_RESIDUAL)
-GEMM_INSTANCE("gemm_mpp_up_swiglu", gemm_mpp, EPI_UP_SWIGLU)
-GEMM_INSTANCE("gemm_mpp_up_geglu", gemm_mpp, EPI_UP_GEGLU)
 #endif
 
 // out[r, :] = table[ids[r], :]; ids are range-checked on the host before dispatch.
@@ -562,9 +549,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
         sq += v * v;
     }
     float inv = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
-    device const float* scaler = scale_buf + (ulong)row * p.d;
     float mul = (p.flags & 2u) ? scale_buf[0] : 1.0f;
-    bool vec_scale = (p.flags & 16u) != 0;
     bool has_res = (p.flags & 1u) != 0;
     if (p.flags & 8u) {
         rmsnorm_rope_row(xr, g, outr, inv, p.d, row, p.rows / max(p.n_seq, 1u),
@@ -575,7 +560,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
         for (uint i = tid; i < p.d; i += tpg) {
             float v = xr[i] * inv * g[i];
             if (has_res) v += resr[i];
-            v *= vec_scale ? scaler[i] : mul;
+            v *= mul;
             outr[i] = v;
             sq2 += v * v;
         }
@@ -587,7 +572,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
         for (uint i = tid; i < p.d; i += tpg) {
             float v = xr[i] * inv * g[i];
             if (has_res) v += resr[i];
-            outr[i] = v * (vec_scale ? scaler[i] : mul);
+            outr[i] = v * mul;
         }
     }
 }
@@ -735,197 +720,13 @@ kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
     bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 32;
+    uint n_sub = n_blocks * 2;
     device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
     device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-
-    if ((p.cols & 511u) != 0u) {
-        uint n_sub = n_blocks * 4;
-        for (uint s = lane; s < n_sub; s += 32) {
-            uint b = s >> 2;
-            uint qtr_off = (s & 3u) * 4u;
-            device const float* xb = xb_base + b * 32 + qtr_off;
-            float4 x_lo = *reinterpret_cast<device const float4*>(xb);
-            float4 x_hi = *reinterpret_cast<device const float4*>(xb + 16);
-            float sum_x = (x_lo.x + x_lo.y + x_lo.z + x_lo.w)
-                        + (x_hi.x + x_hi.y + x_hi.z + x_hi.w);
-
-            uint q0 = as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2*>(r0_blocks[b].qs + qtr_off)));
-            float dot0 = dot(float4(as_type<uchar4>(q0 & 0x0F0F0F0Fu)), x_lo)
-                       + dot(float4(as_type<uchar4>((q0 >> 4) & 0x0F0F0F0Fu)), x_hi);
-            acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
-
-            if (has_row1) {
-                uint q1 = as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2*>(r1_blocks[b].qs + qtr_off)));
-                float dot1 = dot(float4(as_type<uchar4>(q1 & 0x0F0F0F0Fu)), x_lo)
-                           + dot(float4(as_type<uchar4>((q1 >> 4) & 0x0F0F0F0Fu)), x_hi);
-                acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
-            }
-        }
-    } else {
-        uint n_sub = n_blocks * 2;
-        for (uint s = lane; s < n_sub; s += 32) {
-            uint b = s >> 1;
-            uint half_off = (s & 1) * 8;
-            device const float* xb = xb_base + b * 32 + half_off;
-
-            float4 x_lo0 = *reinterpret_cast<device const float4*>(xb);
-            float4 x_lo1 = *reinterpret_cast<device const float4*>(xb + 4);
-            float4 x_hi0 = *reinterpret_cast<device const float4*>(xb + 16);
-            float4 x_hi1 = *reinterpret_cast<device const float4*>(xb + 20);
-            float sum_x = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
-                        + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
-                        + (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
-                        + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
-
-            uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + half_off)));
-            float dot0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
-                       + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1)
-                       + dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                       + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-            acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
-
-            if (has_row1) {
-                uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + half_off)));
-                float dot1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
-                           + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
-                           + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                           + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-                acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
-            }
-        }
-    }
-    acc0 = simd_sum(acc0);
-    acc1 = simd_sum(acc1);
-
-    if (lane == 0) {
-        if (p.has_bias != 0) {
-            acc0 += bias[row0];
-            if (has_row1) acc1 += bias[row1];
-        }
-        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
-        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
-        y[(ulong)batch * p.rows + row0] = acc0;
-        if (has_row1) {
-            y[(ulong)batch * p.rows + row1] = acc1;
-        }
-    }
-}
-
-kernel void gemv_q4_0_paired_glu(device const block_q4_0* w_gate [[buffer(0)]],
-                                 device const block_q4_0* w_up [[buffer(1)]],
-                                 device const float* x [[buffer(2)]],
-                                 device float* y [[buffer(3)]],
-                                 constant PackedGemvParams& p [[buffer(4)]],
-                                 uint2 tg [[threadgroup_position_in_grid]],
-                                 uint sg [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
-    uint row0 = tg.x * 16 + sg * 2;
-    uint row1 = row0 + 1;
-    uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    bool has_row1 = (row1 < p.rows);
-
-    uint n_blocks = p.cols / 32;
-    device const block_q4_0* g0_blocks = w_gate + (ulong)row0 * n_blocks;
-    device const block_q4_0* u0_blocks = w_up + (ulong)row0 * n_blocks;
-    device const block_q4_0* g1_blocks = has_row1 ? (w_gate + (ulong)row1 * n_blocks) : g0_blocks;
-    device const block_q4_0* u1_blocks = has_row1 ? (w_up + (ulong)row1 * n_blocks) : u0_blocks;
-    device const float* xb_base = x + (ulong)batch * p.cols;
-
-    float acc_g0 = 0.0f;
-    float acc_u0 = 0.0f;
-    float acc_g1 = 0.0f;
-    float acc_u1 = 0.0f;
-
-    for (uint b = lane; b < n_blocks; b += 32) {
-        block_q4_0 g_blk0 = g0_blocks[b];
-        block_q4_0 u_blk0 = u0_blocks[b];
-        block_q4_0 g_blk1 = has_row1 ? g1_blocks[b] : g_blk0;
-        block_q4_0 u_blk1 = has_row1 ? u1_blocks[b] : u_blk0;
-        device const float* xb = xb_base + b * 32;
-
-        float b_g0 = 0.0f;
-        float b_u0 = 0.0f;
-        float b_g1 = 0.0f;
-        float b_u1 = 0.0f;
-
-        #pragma unroll
-        for (uint j = 0; j < 16; j += 4) {
-            float4 x0 = *reinterpret_cast<device const float4*>(xb + j);
-            float4 x1 = *reinterpret_cast<device const float4*>(xb + j + 16);
-
-            uint32_t qg0 = *reinterpret_cast<thread const uint32_t*>(&g_blk0.qs[j]);
-            uint32_t qu0 = *reinterpret_cast<thread const uint32_t*>(&u_blk0.qs[j]);
-            float4 vg0_0 = float4(int4((qg0 & 0x0F), ((qg0 >> 8) & 0x0F), ((qg0 >> 16) & 0x0F), ((qg0 >> 24) & 0x0F)) - 8);
-            float4 vg1_0 = float4(int4(((qg0 >> 4) & 0x0F), ((qg0 >> 12) & 0x0F), ((qg0 >> 20) & 0x0F), ((qg0 >> 28) & 0x0F)) - 8);
-            float4 vu0_0 = float4(int4((qu0 & 0x0F), ((qu0 >> 8) & 0x0F), ((qu0 >> 16) & 0x0F), ((qu0 >> 24) & 0x0F)) - 8);
-            float4 vu1_0 = float4(int4(((qu0 >> 4) & 0x0F), ((qu0 >> 12) & 0x0F), ((qu0 >> 20) & 0x0F), ((qu0 >> 28) & 0x0F)) - 8);
-            b_g0 += dot(vg0_0, x0) + dot(vg1_0, x1);
-            b_u0 += dot(vu0_0, x0) + dot(vu1_0, x1);
-
-            if (has_row1) {
-                uint32_t qg1 = *reinterpret_cast<thread const uint32_t*>(&g_blk1.qs[j]);
-                uint32_t qu1 = *reinterpret_cast<thread const uint32_t*>(&u_blk1.qs[j]);
-                float4 vg0_1 = float4(int4((qg1 & 0x0F), ((qg1 >> 8) & 0x0F), ((qg1 >> 16) & 0x0F), ((qg1 >> 24) & 0x0F)) - 8);
-                float4 vg1_1 = float4(int4(((qg1 >> 4) & 0x0F), ((qg1 >> 12) & 0x0F), ((qg1 >> 20) & 0x0F), ((qg1 >> 28) & 0x0F)) - 8);
-                float4 vu0_1 = float4(int4((qu1 & 0x0F), ((qu1 >> 8) & 0x0F), ((qu1 >> 16) & 0x0F), ((qu1 >> 24) & 0x0F)) - 8);
-                float4 vu1_1 = float4(int4(((qu1 >> 4) & 0x0F), ((qu1 >> 12) & 0x0F), ((qu1 >> 20) & 0x0F), ((qu1 >> 28) & 0x0F)) - 8);
-                b_g1 += dot(vg0_1, x0) + dot(vg1_1, x1);
-                b_u1 += dot(vu0_1, x0) + dot(vu1_1, x1);
-            }
-        }
-        acc_g0 += float(g_blk0.d) * b_g0;
-        acc_u0 += float(u_blk0.d) * b_u0;
-        if (has_row1) {
-            acc_g1 += float(g_blk1.d) * b_g1;
-            acc_u1 += float(u_blk1.d) * b_u1;
-        }
-    }
-    acc_g0 = simd_sum(acc_g0);
-    acc_u0 = simd_sum(acc_u0);
-    acc_g1 = simd_sum(acc_g1);
-    acc_u1 = simd_sum(acc_u1);
-
-    if (lane == 0) {
-        float act0 = (p.epi == 5) ? gelu_tanh(acc_g0) : (acc_g0 / (1.0f + exp(-acc_g0)));
-        y[(ulong)batch * p.rows + row0] = act0 * acc_u0;
-        if (has_row1) {
-            float act1 = (p.epi == 5) ? gelu_tanh(acc_g1) : (acc_g1 / (1.0f + exp(-acc_g1)));
-            y[(ulong)batch * p.rows + row1] = act1 * acc_u1;
-        }
-    }
-}
-
-kernel void gemv_q4_0_half_paired_glu(device const block_q4_0* w_gate [[buffer(0)]],
-                                      device const block_q4_0* w_up [[buffer(1)]],
-                                      device const float* x [[buffer(2)]],
-                                      device float* y [[buffer(3)]],
-                                      constant PackedGemvParams& p [[buffer(4)]],
-                                      uint2 tg [[threadgroup_position_in_grid]],
-                                      uint sg [[simdgroup_index_in_threadgroup]],
-                                      uint lane [[thread_index_in_simdgroup]]) {
-    uint row0 = tg.x * 16 + sg * 2;
-    uint row1 = row0 + 1;
-    uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    bool has_row1 = (row1 < p.rows);
-
-    uint n_blocks = p.cols / 32;
-    uint n_sub = n_blocks * 2;
-    device const block_q4_0* g0_blocks = w_gate + (ulong)row0 * n_blocks;
-    device const block_q4_0* u0_blocks = w_up + (ulong)row0 * n_blocks;
-    device const block_q4_0* g1_blocks = has_row1 ? (w_gate + (ulong)row1 * n_blocks) : g0_blocks;
-    device const block_q4_0* u1_blocks = has_row1 ? (w_up + (ulong)row1 * n_blocks) : u0_blocks;
-    device const float* xb_base = x + (ulong)batch * p.cols;
-
-    float acc_g0 = 0.0f;
-    float acc_u0 = 0.0f;
-    float acc_g1 = 0.0f;
-    float acc_u1 = 0.0f;
 
     for (uint s = lane; s < n_sub; s += 32) {
         uint b = s >> 1;
@@ -941,47 +742,35 @@ kernel void gemv_q4_0_half_paired_glu(device const block_q4_0* w_gate [[buffer(0
                     + (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
                     + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
 
-        uint2 qg0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(g0_blocks[b].qs + half_off)));
-        float dot_g0 = dot(float4(as_type<uchar4>(qg0.x & 0x0F0F0F0Fu)), x_lo0)
-                     + dot(float4(as_type<uchar4>(qg0.y & 0x0F0F0F0Fu)), x_lo1)
-                     + dot(float4(as_type<uchar4>((qg0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                     + dot(float4(as_type<uchar4>((qg0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-        acc_g0 += float(g0_blocks[b].d) * (dot_g0 - 8.0f * sum_x);
-
-        uint2 qu0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(u0_blocks[b].qs + half_off)));
-        float dot_u0 = dot(float4(as_type<uchar4>(qu0.x & 0x0F0F0F0Fu)), x_lo0)
-                     + dot(float4(as_type<uchar4>(qu0.y & 0x0F0F0F0Fu)), x_lo1)
-                     + dot(float4(as_type<uchar4>((qu0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                     + dot(float4(as_type<uchar4>((qu0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-        acc_u0 += float(u0_blocks[b].d) * (dot_u0 - 8.0f * sum_x);
+        uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + half_off)));
+        float dot0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
+                   + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1)
+                   + dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                   + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+        acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
 
         if (has_row1) {
-            uint2 qg1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(g1_blocks[b].qs + half_off)));
-            float dot_g1 = dot(float4(as_type<uchar4>(qg1.x & 0x0F0F0F0Fu)), x_lo0)
-                         + dot(float4(as_type<uchar4>(qg1.y & 0x0F0F0F0Fu)), x_lo1)
-                         + dot(float4(as_type<uchar4>((qg1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                         + dot(float4(as_type<uchar4>((qg1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-            acc_g1 += float(g1_blocks[b].d) * (dot_g1 - 8.0f * sum_x);
-
-            uint2 qu1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(u1_blocks[b].qs + half_off)));
-            float dot_u1 = dot(float4(as_type<uchar4>(qu1.x & 0x0F0F0F0Fu)), x_lo0)
-                         + dot(float4(as_type<uchar4>(qu1.y & 0x0F0F0F0Fu)), x_lo1)
-                         + dot(float4(as_type<uchar4>((qu1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                         + dot(float4(as_type<uchar4>((qu1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-            acc_u1 += float(u1_blocks[b].d) * (dot_u1 - 8.0f * sum_x);
+            uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + half_off)));
+            float dot1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
+                       + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
+                       + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                       + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
         }
     }
-    acc_g0 = simd_sum(acc_g0);
-    acc_u0 = simd_sum(acc_u0);
-    acc_g1 = simd_sum(acc_g1);
-    acc_u1 = simd_sum(acc_u1);
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
 
     if (lane == 0) {
-        float act0 = (p.epi == 5) ? gelu_tanh(acc_g0) : (acc_g0 / (1.0f + exp(-acc_g0)));
-        y[(ulong)batch * p.rows + row0] = act0 * acc_u0;
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
         if (has_row1) {
-            float act1 = (p.epi == 5) ? gelu_tanh(acc_g1) : (acc_g1 / (1.0f + exp(-acc_g1)));
-            y[(ulong)batch * p.rows + row1] = act1 * acc_u1;
+            y[(ulong)batch * p.rows + row1] = acc1;
         }
     }
 }
@@ -1204,73 +993,40 @@ kernel void gemv_iq4_xs(device const block_iq4_xs* w [[buffer(0)]],
     bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 256;
-    uint n_sub = n_blocks * 16;
+    uint n_sub_blocks = n_blocks * 8;
     device const block_iq4_xs* r0_blocks = w + (ulong)row0 * n_blocks;
     device const block_iq4_xs* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-    for (uint s = lane; s < n_sub; s += 32) {
-        uint b = s >> 4;
-        uint ib = (s >> 1) & 7u;
-        uint half_off = (s & 1u) * 8u;
+    for (uint sb = lane; sb < n_sub_blocks; sb += 32) {
+        uint b = sb >> 3;
+        uint ib = sb & 7;
         device const block_iq4_xs& blk0 = r0_blocks[b];
+        device const block_iq4_xs& blk1 = r1_blocks[b];
         float d0 = float(blk0.d);
-        int ls0 = int((blk0.scales_l[ib >> 1] >> (4 * (ib & 1u))) & 0x0Fu)
-                | (int((blk0.scales_h >> (2 * ib)) & 3u) << 4);
+        float d1 = float(blk1.d);
+        int ls0 = int((blk0.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+                | (int((blk0.scales_h >> (2 * ib)) & 3) << 4);
+        int ls1 = int((blk1.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+                | (int((blk1.scales_h >> (2 * ib)) & 3) << 4);
         float dl0 = d0 * float(ls0 - 32);
+        float dl1 = d1 * float(ls1 - 32);
+        device const float* xb_sub = xb_base + (ulong)sb * 32;
 
-        device const float* xb_sub = xb_base + (ulong)b * 256 + (ulong)ib * 32 + half_off;
-        float4 x_lo0 = *reinterpret_cast<device const float4*>(xb_sub);
-        float4 x_lo1 = *reinterpret_cast<device const float4*>(xb_sub + 4);
-        float4 x_hi0 = *reinterpret_cast<device const float4*>(xb_sub + 16);
-        float4 x_hi1 = *reinterpret_cast<device const float4*>(xb_sub + 20);
-
-        uint2 q0 = *reinterpret_cast<device const uint2*>(blk0.qs + ib * 16 + half_off);
-        float4 v0_lo0 = float4(kvalues_iq4nl[q0.x & 0x0Fu],
-                               kvalues_iq4nl[(q0.x >> 8) & 0x0Fu],
-                               kvalues_iq4nl[(q0.x >> 16) & 0x0Fu],
-                               kvalues_iq4nl[(q0.x >> 24) & 0x0Fu]);
-        float4 v0_lo1 = float4(kvalues_iq4nl[q0.y & 0x0Fu],
-                               kvalues_iq4nl[(q0.y >> 8) & 0x0Fu],
-                               kvalues_iq4nl[(q0.y >> 16) & 0x0Fu],
-                               kvalues_iq4nl[(q0.y >> 24) & 0x0Fu]);
-        float4 v0_hi0 = float4(kvalues_iq4nl[(q0.x >> 4) & 0x0Fu],
-                               kvalues_iq4nl[(q0.x >> 12) & 0x0Fu],
-                               kvalues_iq4nl[(q0.x >> 20) & 0x0Fu],
-                               kvalues_iq4nl[q0.x >> 28]);
-        float4 v0_hi1 = float4(kvalues_iq4nl[(q0.y >> 4) & 0x0Fu],
-                               kvalues_iq4nl[(q0.y >> 12) & 0x0Fu],
-                               kvalues_iq4nl[(q0.y >> 20) & 0x0Fu],
-                               kvalues_iq4nl[q0.y >> 28]);
-        acc0 += dl0 * (dot(v0_lo0, x_lo0) + dot(v0_lo1, x_lo1) + dot(v0_hi0, x_hi0) + dot(v0_hi1, x_hi1));
-
-        if (has_row1) {
-            device const block_iq4_xs& blk1 = r1_blocks[b];
-            float d1 = float(blk1.d);
-            int ls1 = int((blk1.scales_l[ib >> 1] >> (4 * (ib & 1u))) & 0x0Fu)
-                    | (int((blk1.scales_h >> (2 * ib)) & 3u) << 4);
-            float dl1 = d1 * float(ls1 - 32);
-            uint2 q1 = *reinterpret_cast<device const uint2*>(blk1.qs + ib * 16 + half_off);
-            float4 v1_lo0 = float4(kvalues_iq4nl[q1.x & 0x0Fu],
-                                   kvalues_iq4nl[(q1.x >> 8) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.x >> 16) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.x >> 24) & 0x0Fu]);
-            float4 v1_lo1 = float4(kvalues_iq4nl[q1.y & 0x0Fu],
-                                   kvalues_iq4nl[(q1.y >> 8) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.y >> 16) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.y >> 24) & 0x0Fu]);
-            float4 v1_hi0 = float4(kvalues_iq4nl[(q1.x >> 4) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.x >> 12) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.x >> 20) & 0x0Fu],
-                                   kvalues_iq4nl[q1.x >> 28]);
-            float4 v1_hi1 = float4(kvalues_iq4nl[(q1.y >> 4) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.y >> 12) & 0x0Fu],
-                                   kvalues_iq4nl[(q1.y >> 20) & 0x0Fu],
-                                   kvalues_iq4nl[q1.y >> 28]);
-            acc1 += dl1 * (dot(v1_lo0, x_lo0) + dot(v1_lo1, x_lo1) + dot(v1_hi0, x_hi0) + dot(v1_hi1, x_hi1));
+        float sb_acc0 = 0.0f;
+        float sb_acc1 = 0.0f;
+        for (uint j = 0; j < 16; ++j) {
+            uint8_t q0 = blk0.qs[ib * 16 + j];
+            uint8_t q1 = blk1.qs[ib * 16 + j];
+            float xj = xb_sub[j];
+            float xj16 = xb_sub[j + 16];
+            sb_acc0 += kvalues_iq4nl[q0 & 0x0F] * xj + kvalues_iq4nl[q0 >> 4] * xj16;
+            sb_acc1 += kvalues_iq4nl[q1 & 0x0F] * xj + kvalues_iq4nl[q1 >> 4] * xj16;
         }
+        acc0 += dl0 * sb_acc0;
+        acc1 += dl1 * sb_acc1;
     }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
@@ -1621,109 +1377,6 @@ kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
         if (has_row1) {
             acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
             y[(ulong)batch * p.rows + row1] = acc1;
-        }
-    }
-}
-
-kernel void gemv_q4_k_paired_glu(device const block_q4_k* w_gate [[buffer(0)]],
-                                 device const block_q4_k* w_up [[buffer(1)]],
-                                 device const float* x [[buffer(2)]],
-                                 device float* y [[buffer(3)]],
-                                 constant PackedGemvParams& p [[buffer(4)]],
-                                 uint2 tg [[threadgroup_position_in_grid]],
-                                 uint sg [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]]) {
-    uint row0 = tg.x * 16 + sg * 2;
-    uint row1 = row0 + 1;
-    uint batch = tg.y;
-    if (row0 >= p.rows || batch >= p.batch_size) return;
-    bool has_row1 = (row1 < p.rows);
-
-    uint n_blocks = p.cols / 256;
-    uint n_sub = n_blocks * 16;
-    device const block_q4_k* g0_blocks = w_gate + (ulong)row0 * n_blocks;
-    device const block_q4_k* u0_blocks = w_up + (ulong)row0 * n_blocks;
-    device const block_q4_k* g1_blocks = has_row1 ? (w_gate + (ulong)row1 * n_blocks) : g0_blocks;
-    device const block_q4_k* u1_blocks = has_row1 ? (w_up + (ulong)row1 * n_blocks) : u0_blocks;
-    device const float* xb_base = x + (ulong)batch * p.cols;
-
-    float acc_g0 = 0.0f;
-    float acc_u0 = 0.0f;
-    float acc_g1 = 0.0f;
-    float acc_u1 = 0.0f;
-    for (uint s = lane; s < n_sub; s += 32) {
-        uint b = s >> 4;
-        uint g = (s >> 2) & 3;
-        uint sub = s & 3;
-        uint q_off = g * 32 + sub * 8;
-        device const float* xb_g = xb_base + (ulong)(b * 256 + g * 64 + sub * 8);
-
-        float4 x_lo0 = *reinterpret_cast<device const float4*>(xb_g);
-        float4 x_lo1 = *reinterpret_cast<device const float4*>(xb_g + 4);
-        float4 x_hi0 = *reinterpret_cast<device const float4*>(xb_g + 32);
-        float4 x_hi1 = *reinterpret_cast<device const float4*>(xb_g + 36);
-        float sum_x_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
-                       + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w);
-        float sum_x_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
-                       + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
-
-        device const block_q4_k& g_blk0 = g0_blocks[b];
-        float2 sm0_g0 = k4_scale_min(2 * g, g_blk0.scales);
-        float2 sm1_g0 = k4_scale_min(2 * g + 1, g_blk0.scales);
-        uint2 qg0 = uint2(*reinterpret_cast<device const packed_uint2*>(g_blk0.qs + q_off));
-        float dot_lo_g0 = dot(float4(as_type<uchar4>(qg0.x & 0x0F0F0F0Fu)), x_lo0)
-                        + dot(float4(as_type<uchar4>(qg0.y & 0x0F0F0F0Fu)), x_lo1);
-        float dot_hi_g0 = dot(float4(as_type<uchar4>((qg0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                        + dot(float4(as_type<uchar4>((qg0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-        acc_g0 += float(g_blk0.d) * (sm0_g0.x * dot_lo_g0 + sm1_g0.x * dot_hi_g0)
-                - float(g_blk0.dmin) * (sm0_g0.y * sum_x_lo + sm1_g0.y * sum_x_hi);
-
-        device const block_q4_k& u_blk0 = u0_blocks[b];
-        float2 sm0_u0 = k4_scale_min(2 * g, u_blk0.scales);
-        float2 sm1_u0 = k4_scale_min(2 * g + 1, u_blk0.scales);
-        uint2 qu0 = uint2(*reinterpret_cast<device const packed_uint2*>(u_blk0.qs + q_off));
-        float dot_lo_u0 = dot(float4(as_type<uchar4>(qu0.x & 0x0F0F0F0Fu)), x_lo0)
-                        + dot(float4(as_type<uchar4>(qu0.y & 0x0F0F0F0Fu)), x_lo1);
-        float dot_hi_u0 = dot(float4(as_type<uchar4>((qu0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                        + dot(float4(as_type<uchar4>((qu0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-        acc_u0 += float(u_blk0.d) * (sm0_u0.x * dot_lo_u0 + sm1_u0.x * dot_hi_u0)
-                - float(u_blk0.dmin) * (sm0_u0.y * sum_x_lo + sm1_u0.y * sum_x_hi);
-
-        if (has_row1) {
-            device const block_q4_k& g_blk1 = g1_blocks[b];
-            float2 sm0_g1 = k4_scale_min(2 * g, g_blk1.scales);
-            float2 sm1_g1 = k4_scale_min(2 * g + 1, g_blk1.scales);
-            uint2 qg1 = uint2(*reinterpret_cast<device const packed_uint2*>(g_blk1.qs + q_off));
-            float dot_lo_g1 = dot(float4(as_type<uchar4>(qg1.x & 0x0F0F0F0Fu)), x_lo0)
-                            + dot(float4(as_type<uchar4>(qg1.y & 0x0F0F0F0Fu)), x_lo1);
-            float dot_hi_g1 = dot(float4(as_type<uchar4>((qg1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                            + dot(float4(as_type<uchar4>((qg1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-            acc_g1 += float(g_blk1.d) * (sm0_g1.x * dot_lo_g1 + sm1_g1.x * dot_hi_g1)
-                    - float(g_blk1.dmin) * (sm0_g1.y * sum_x_lo + sm1_g1.y * sum_x_hi);
-
-            device const block_q4_k& u_blk1 = u1_blocks[b];
-            float2 sm0_u1 = k4_scale_min(2 * g, u_blk1.scales);
-            float2 sm1_u1 = k4_scale_min(2 * g + 1, u_blk1.scales);
-            uint2 qu1 = uint2(*reinterpret_cast<device const packed_uint2*>(u_blk1.qs + q_off));
-            float dot_lo_u1 = dot(float4(as_type<uchar4>(qu1.x & 0x0F0F0F0Fu)), x_lo0)
-                            + dot(float4(as_type<uchar4>(qu1.y & 0x0F0F0F0Fu)), x_lo1);
-            float dot_hi_u1 = dot(float4(as_type<uchar4>((qu1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                            + dot(float4(as_type<uchar4>((qu1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-            acc_u1 += float(u_blk1.d) * (sm0_u1.x * dot_lo_u1 + sm1_u1.x * dot_hi_u1)
-                    - float(u_blk1.dmin) * (sm0_u1.y * sum_x_lo + sm1_u1.y * sum_x_hi);
-        }
-    }
-    acc_g0 = simd_sum(acc_g0);
-    acc_u0 = simd_sum(acc_u0);
-    acc_g1 = simd_sum(acc_g1);
-    acc_u1 = simd_sum(acc_u1);
-
-    if (lane == 0) {
-        float act0 = (p.epi == 5) ? gelu_tanh(acc_g0) : (acc_g0 / (1.0f + exp(-acc_g0)));
-        y[(ulong)batch * p.rows + row0] = act0 * acc_u0;
-        if (has_row1) {
-            float act1 = (p.epi == 5) ? gelu_tanh(acc_g1) : (acc_g1 / (1.0f + exp(-acc_g1)));
-            y[(ulong)batch * p.rows + row1] = act1 * acc_u1;
         }
     }
 }
@@ -2263,7 +1916,6 @@ struct AttnCachedParams {
     uint rotary_dim;
     uint pair_stride;
     float mscale;
-    uint has_gate;
 };
 
 template <uint NJ>
@@ -2275,7 +1927,6 @@ inline void attn_cached_f32_impl(device const float* q,
                                  device const uint* vis,
                                  device const float* k_in,
                                  device const float* v_in,
-                                 device const float* gate,
                                  uint2 tg,
                                  uint sg,
                                  uint lane,
@@ -2352,10 +2003,7 @@ inline void attn_cached_f32_impl(device const float* q,
     for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
         float o = 0.0f;
         for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
-        ulong idx = ((ulong)q_tok * p.n_heads + head) * hd + d;
-        float val = o / gl;
-        if (p.has_gate != 0) val *= 1.0f / (1.0f + exp(-gate[idx]));
-        out[idx] = val;
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
     }
 }
 
@@ -2368,7 +2016,6 @@ kernel void flash_attn_cached_t(device const float* q [[buffer(0)]],
                                 device const uint* vis [[buffer(5)]],
                                 device const float* k_in [[buffer(6)]],
                                 device const float* v_in [[buffer(7)]],
-                                device const float* gate [[buffer(8)]],
                                 uint2 tg [[threadgroup_position_in_grid]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]],
@@ -2376,7 +2023,7 @@ kernel void flash_attn_cached_t(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * NJ * 32];
-    attn_cached_f32_impl<NJ>(q, kc, vc, out, p, vis, k_in, v_in, gate, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl<NJ>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 typedef decltype(flash_attn_cached_t<1>) flash_attn_cached_k;
@@ -2393,7 +2040,6 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
                             device const uint* vis [[buffer(5)]],
                             device const float* k_in [[buffer(6)]],
                             device const float* v_in [[buffer(7)]],
-                            device const float* gate [[buffer(8)]],
                             uint2 tg [[threadgroup_position_in_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]],
@@ -2401,13 +2047,12 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl<ATTN_MAX_PER_LANE>(q, kc, vc, out, p, vis, k_in, v_in, gate, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl<ATTN_MAX_PER_LANE>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
                                   device float* out [[buffer(1)]],
                                   constant AttnCachedParams& p [[buffer(2)]],
-                                  device const float* gate [[buffer(3)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint2 ntg [[threads_per_threadgroup]]) {
@@ -2422,10 +2067,7 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
     for (uint d = tid; d < hd; d += ntg.x) {
         float o = 0.0f;
         for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
-        ulong idx = ((ulong)q_tok * p.n_heads + head) * hd + d;
-        float val = o * inv_gl;
-        if (p.has_gate != 0) val *= 1.0f / (1.0f + exp(-gate[idx]));
-        out[idx] = val;
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o * inv_gl;
     }
 }
 
@@ -2471,7 +2113,6 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
                                       device const float* k_in [[buffer(5)]],
                                       device const float* v_in [[buffer(6)]],
                                       device const float* inv_freq [[buffer(7)]],
-                                      device const float* gate [[buffer(8)]],
                                       uint3 tg3 [[threadgroup_position_in_grid]],
                                       uint sg [[simdgroup_index_in_threadgroup]],
                                       uint lane [[thread_index_in_simdgroup]],
@@ -2578,14 +2219,11 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
         for (uint i = 0; i < nsg; ++i) gl += tg_l[h * ATTN_MAX_SG + i] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
         if (p.n_splits == 1) {
             device float* out = part + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
-            device const float* gh = gate + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
             float inv_gl = 1.0f / gl;
             for (uint d = tid; d < hd; d += nsg * 32) {
                 float o = 0.0f;
                 for (uint i = 0; i < nsg; ++i) o += tg_red[i * row + d] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
-                float val = o * inv_gl;
-                if (p.has_gate != 0) val *= 1.0f / (1.0f + exp(-gh[d]));
-                out[d] = val;
+                out[d] = o * inv_gl;
             }
         } else {
             device float* out = part + (((ulong)q_tok * p.n_heads + head0 + h) * p.n_splits + split) * (hd + 2);
@@ -2711,7 +2349,6 @@ struct Conv1dParams {
     uint dilation;
     uint hist;
     uint has_state;
-    uint silu;
 };
 
 kernel void causal_conv1d_f32(device const float* x [[buffer(0)]],
@@ -2741,7 +2378,6 @@ kernel void causal_conv1d_f32(device const float* x [[buffer(0)]],
                 acc += w_ch[tap] * val;
             }
         }
-        if (p.silu != 0) acc = acc / (1.0f + exp(-acc));
         out[(ulong)i * p.channels + ch] = acc;
     }
 
@@ -2766,8 +2402,6 @@ struct DeltaRuleParams {
     uint key_dim;
     uint val_dim;
     uint rep;
-    uint beta_sigmoid;
-    uint has_neg_a;
 };
 
 // Gated delta rule, one threadgroup per (32 value columns, head): 4 simdgroups split the key rows of the
@@ -2782,7 +2416,6 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
                            device float* state [[buffer(5)]],
                            device float* out [[buffer(6)]],
                            constant DeltaRuleParams& p [[buffer(7)]],
-                           device const float* neg_a [[buffer(8)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float ks[DELTA_MAX_KD];
@@ -2802,14 +2435,8 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
         device const float* q_in = q + ((ulong)t * kh + k_h) * kd;
         device const float* k_in = k + ((ulong)t * kh + k_h) * kd;
         device const float* v_t = v + ((ulong)t * vh + h) * vd;
-        float b_raw = beta[(ulong)t * vh + h];
-        const float b = (p.beta_sigmoid != 0) ? (1.0f / (1.0f + exp(-b_raw))) : b_raw;
-        float ld_raw = log_decay[(ulong)t * vh + h];
-        if (p.has_neg_a != 0) {
-            float sp = ld_raw > 20.0f ? ld_raw : log(1.0f + exp(ld_raw));
-            ld_raw = neg_a[h] * sp;
-        }
-        const float decay = exp(ld_raw);
+        const float b = beta[(ulong)t * vh + h];
+        const float decay = exp(log_decay[(ulong)t * vh + h]);
 
         float qn = 0.0f, kn = 0.0f;
         for (uint i = tid; i < kd; i += 128) {
@@ -2965,8 +2592,6 @@ kernel void gemv_jesse_lut(
     constant uint& in_features [[buffer(4)]],
     constant uint& out_features [[buffer(5)]],
     constant uint& address_bits [[buffer(6)]],
-    constant PackedGemvParams& p [[buffer(7)]],
-    device const float* res [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= out_features) return;
     uint num_luts = (in_features + address_bits - 1) / address_bits;
@@ -2985,7 +2610,7 @@ kernel void gemv_jesse_lut(
         }
         accum += (int)lut_tables[lut_out_offset + (ulong)lut_idx * lut_size + addr];
     }
-    y[gid] = apply_gemv_epi(float(accum), (ulong)gid, p, res);
+    y[gid] = float(accum);
 }
 
 struct Conv2dParams {
