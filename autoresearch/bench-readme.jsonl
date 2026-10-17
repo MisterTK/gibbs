@@ -1,72 +1,9 @@
-⚡ Prefill: 20 tokens in 102.49ms (195.1 tok/s)
-⚡ Prefill: 20 tokens in 88.91ms (224.9 tok/s)
-⚡ Prefill: 20 tokens in 88.60ms (225.7 tok/s)
-⚡ Prefill: 20 tokens in 88.73ms (225.4 tok/s)
-{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":835682304,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":143.28069315742562,"roofline_tok_s":361.94178252686146,"roofline_pct":39.58666837443452,"wall_ms":6.979307385826772,"gpu_ms":6.552458,"run_ms":6.805042,"host_ms":0.4268493858267721,"encode_us":196.708,"dispatches":571.0,"weights_ms":2.762875269659659,"rss_gb":5.015814144}
-METRIC geomean_roofline_pct=39.59
-METRIC min_roofline_pct=39.59
-METRIC gemma-4-E2B-it-qat-UD-Q2_K_XL_tok_s=143.3
-⚡ Prefill: 20 tokens in 116.30ms (172.0 tok/s)
-⚡ Prefill: 20 tokens in 89.79ms (222.7 tok/s)
-⚡ Prefill: 20 tokens in 90.09ms (222.0 tok/s)
-⚡ Prefill: 20 tokens in 90.21ms (221.7 tok/s)
-{"model":"unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-GGUF/snapshots/main/config.json","bytes_per_token":1474940928,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":107.62434075038455,"roofline_tok_s":205.07149608090236,"roofline_pct":52.481374938585255,"wall_ms":9.291578401574803,"gpu_ms":8.839499,"run_ms":9.093875,"host_ms":0.4520794015748031,"encode_us":197.625,"dispatches":577.0,"weights_ms":4.87634809864308,"rss_gb":5.093965824}
-METRIC geomean_roofline_pct=52.48
-METRIC min_roofline_pct=52.48
-METRIC gemma-4-E2B-it-Q4_K_M_tok_s=107.6
-⚡ Prefill: 25 tokens in 228.64ms (109.3 tok/s)
-⚡ Prefill: 25 tokens in 219.46ms (113.9 tok/s)
-⚡ Prefill: 25 tokens in 219.46ms (113.9 tok/s)
-⚡ Prefill: 25 tokens in 219.11ms (114.1 tok/s)
-{"model":"unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf","file":"unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf","bytes_per_token":1264869376,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":114.23506094341109,"roofline_tok_s":239.1301018706255,"roofline_pct":47.77109199126034,"wall_ms":8.753879866141732,"gpu_ms":8.251791,"run_ms":8.696041,"host_ms":0.5020888661417313,"encode_us":122.709,"dispatches":458.0,"weights_ms":4.181824003658984,"rss_gb":4.76381184}
-METRIC geomean_roofline_pct=47.77
-METRIC min_roofline_pct=47.77
-METRIC Qwen3.5-2B-UD-Q4_K_XL_tok_s=114.2
-⚡ Prefill: 23 tokens in 618.52ms (37.2 tok/s)
-⚡ Prefill: 23 tokens in 570.92ms (40.3 tok/s)
-⚡ Prefill: 23 tokens in 569.00ms (40.4 tok/s)
-⚡ Prefill: 23 tokens in 569.09ms (40.4 tok/s)
-{"model":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","file":"DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf","bytes_per_token":4493328384,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":40.44167954241642,"roofline_tok_s":67.31498721815088,"roofline_pct":60.078269659853234,"wall_ms":24.72696513385827,"gpu_ms":24.386791,"run_ms":24.651625,"host_ms":0.34017413385826956,"encode_us":204.0,"dispatches":610.0,"weights_ms":14.855532791817259,"rss_gb":3.448602624}
-METRIC geomean_roofline_pct=60.08
-METRIC min_roofline_pct=60.08
-METRIC Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M_tok_s=40.4
-⚡ Prefill: 64 tokens in 165.12ms (387.6 tok/s)
-⚡ Prefill: 64 tokens in 102.98ms (621.5 tok/s)
-⚡ Prefill: 64 tokens in 100.09ms (639.5 tok/s)
-⚡ Prefill: 64 tokens in 100.42ms (637.3 tok/s)
-{"model":"unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/main/config.json","bytes_per_token":764923904,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":254.18902767042712,"roofline_tok_s":395.42278801096865,"roofline_pct":64.2828474679047,"wall_ms":3.934080118110236,"gpu_ms":3.621666,"run_ms":3.899458,"host_ms":0.3124141181102362,"encode_us":50.792,"dispatches":179.0,"weights_ms":2.528938721589968,"rss_gb":6.530695168}
-METRIC geomean_roofline_pct=64.28
-METRIC min_roofline_pct=64.28
-METRIC Llama-3.2-1B-Instruct-Q4_0_tok_s=254.2
-⚡ Prefill: 41 tokens in 31.34ms (1308.3 tok/s)
-⚡ Prefill: 41 tokens in 15.65ms (2619.7 tok/s)
-⚡ Prefill: 41 tokens in 15.40ms (2662.6 tok/s)
-⚡ Prefill: 41 tokens in 15.33ms (2674.8 tok/s)
-{"model":"HuggingFaceTB/SmolLM2-135M-Instruct","file":"/Users/keas/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/config.json","bytes_per_token":268959744,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":428.82563341623273,"roofline_tok_s":1124.5859258994333,"roofline_pct":38.13186912091773,"wall_ms":2.3319501496062993,"gpu_ms":1.9515,"run_ms":2.30525,"host_ms":0.3804501496062993,"encode_us":94.459,"dispatches":333.0,"weights_ms":0.8892161790129194,"rss_gb":1.435615232}
-METRIC geomean_roofline_pct=38.13
-METRIC min_roofline_pct=38.13
-METRIC SmolLM2-135M-Instruct_tok_s=428.8
-⚡ Prefill: 48 tokens in 112.79ms (425.6 tok/s)
-⚡ Prefill: 48 tokens in 76.54ms (627.1 tok/s)
-⚡ Prefill: 48 tokens in 72.80ms (659.3 tok/s)
-⚡ Prefill: 48 tokens in 72.49ms (662.2 tok/s)
-{"model":"unsloth/Llama-3.2-1B-Instruct-bnb-4bit","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-bnb-4bit/snapshots/main/config.json","bytes_per_token":765624320,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":228.34611460554484,"roofline_tok_s":395.0610434317375,"roofline_pct":57.80021047430881,"wall_ms":4.3793169055118115,"gpu_ms":4.070624,"run_ms":4.348916,"host_ms":0.30869290551181194,"encode_us":50.0,"dispatches":179.0,"weights_ms":2.5312543887228145,"rss_gb":7.918747648}
-METRIC geomean_roofline_pct=57.80
-METRIC min_roofline_pct=57.80
-METRIC Llama-3.2-1B-Instruct-bnb-4bit_tok_s=228.3
-⚡ Prefill: 24 tokens in 234.08ms (102.5 tok/s)
-⚡ Prefill: 24 tokens in 171.21ms (140.2 tok/s)
-⚡ Prefill: 24 tokens in 171.61ms (139.8 tok/s)
-⚡ Prefill: 24 tokens in 172.03ms (139.5 tok/s)
-{"model":"unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/main/config.json","bytes_per_token":2179676928,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":69.87433090582755,"roofline_tok_s":138.76751129969043,"roofline_pct":50.35352313476521,"wall_ms":14.31140716535433,"gpu_ms":13.892416,"run_ms":14.147208,"host_ms":0.41899116535432945,"encode_us":330.5,"dispatches":1018.0,"weights_ms":7.20629771791714,"rss_gb":3.452469248}
-METRIC geomean_roofline_pct=50.35
-METRIC min_roofline_pct=50.35
-METRIC gemma-4-26B-A4B-it-UD-IQ2_XXS_tok_s=69.9
-⚡ Prefill: 5777 tokens in 28446.09ms (203.1 tok/s)
-⚡ Prefill: 5777 tokens in 28776.24ms (200.8 tok/s)
-⚡ Prefill: 5777 tokens in 28391.11ms (203.5 tok/s)
-⚡ Prefill: 5777 tokens in 28158.35ms (205.2 tok/s)
-{"model":"unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf","file":"/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json","bytes_per_token":835682304,"bytes_basis":"streamed","ceiling_gbps":302.4683427359145,"decode_tok_s":128.20491087771518,"roofline_tok_s":361.94178252686146,"roofline_pct":35.421417771295985,"wall_ms":7.800013222222222,"gpu_ms":7.509541,"run_ms":7.759833,"host_ms":0.29047222222222224,"encode_us":193.084,"dispatches":571.0,"weights_ms":2.762875269659659,"rss_gb":5.04520704}
-METRIC geomean_roofline_pct=35.42
-METRIC min_roofline_pct=35.42
-METRIC e2b-qat-ctx4k_tok_s=128.2
+{"model": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf", "file": "/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json", "bytes_per_token": 835682304, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 146.69859435777295, "roofline_tok_s": 361.94178252686146, "roofline_pct": 40.53099184449248, "wall_ms": 6.8166991496063, "gpu_ms": 6.544041, "run_ms": 6.7924375, "host_ms": 0.27265814960629964, "encode_us": 193.27100000000002, "dispatches": 521.0, "weights_ms": 2.762875269659659, "rss_gb": 7.119273984}
+{"model": "unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf", "file": "/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-GGUF/snapshots/main/config.json", "bytes_per_token": 1474940928, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 109.81118299586893, "roofline_tok_s": 205.07149608090236, "roofline_pct": 53.54775534116527, "wall_ms": 9.106542307086615, "gpu_ms": 8.832436999999999, "run_ms": 9.0728955, "host_ms": 0.2741053070866153, "encode_us": 187.4795, "dispatches": 527.0, "weights_ms": 4.87634809864308, "rss_gb": 5.159698432}
+{"model": "unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf", "file": "unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf", "bytes_per_token": 1264869376, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 114.77162129609303, "roofline_tok_s": 239.1301018706255, "roofline_pct": 47.99547208748606, "wall_ms": 8.712956716535434, "gpu_ms": 8.2369785, "run_ms": 8.6687505, "host_ms": 0.4759782165354327, "encode_us": 115.2495, "dispatches": 446.0, "weights_ms": 4.181824003658984, "rss_gb": 4.788895744}
+{"model": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf", "file": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf", "bytes_per_token": 4493328384, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 40.487996171313384, "roofline_tok_s": 67.31498721815088, "roofline_pct": 60.14707547979176, "wall_ms": 24.69867892913386, "gpu_ms": 24.379582499999998, "run_ms": 24.6470415, "host_ms": 0.31909642913385916, "encode_us": 202.2295, "dispatches": 594.0, "weights_ms": 14.855532791817259, "rss_gb": 3.472736256}
+{"model": "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf", "file": "/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-GGUF/snapshots/main/config.json", "bytes_per_token": 764923904, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 256.22482373838693, "roofline_tok_s": 395.42278801096865, "roofline_pct": 64.7976878184571, "wall_ms": 3.902892377952756, "gpu_ms": 3.5961035, "run_ms": 3.8700205, "host_ms": 0.3067888779527561, "encode_us": 43.0625, "dispatches": 147.0, "weights_ms": 2.528938721589968, "rss_gb": 6.531252224}
+{"model": "HuggingFaceTB/SmolLM2-135M-Instruct", "file": "/Users/keas/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main/config.json", "bytes_per_token": 268959744, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 451.04120987568194, "roofline_tok_s": 1124.5859258994333, "roofline_pct": 40.10731412230181, "wall_ms": 2.217092492125984, "gpu_ms": 1.8753324999999998, "run_ms": 2.2014585, "host_ms": 0.34175999212598407, "encode_us": 77.0, "dispatches": 273.0, "weights_ms": 0.8892161790129194, "rss_gb": 1.435860992}
+{"model": "unsloth/Llama-3.2-1B-Instruct-bnb-4bit", "file": "/Users/keas/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct-bnb-4bit/snapshots/main/config.json", "bytes_per_token": 765624320, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 230.9702542114389, "roofline_tok_s": 395.0610434317375, "roofline_pct": 58.46444696371289, "wall_ms": 4.329563992125985, "gpu_ms": 4.0314165, "run_ms": 4.304792, "host_ms": 0.298147492125985, "encode_us": 43.8335, "dispatches": 147.0, "weights_ms": 2.5312543887228145, "rss_gb": 7.93018368}
+{"model": "unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf", "file": "/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/main/config.json", "bytes_per_token": 2179676928, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 70.87196972935104, "roofline_tok_s": 138.76751129969043, "roofline_pct": 51.0724513724915, "wall_ms": 14.10995207480315, "gpu_ms": 13.8412495, "run_ms": 14.088146, "host_ms": 0.2687025748031502, "encode_us": 320.6665, "dispatches": 923.0, "weights_ms": 7.20629771791714, "rss_gb": 3.51985664}
+{"model": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf", "file": "/Users/keas/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/config.json", "bytes_per_token": 835682304, "bytes_basis": "streamed", "ceiling_gbps": 302.4683427359145, "decode_tok_s": 127.30733332481176, "roofline_tok_s": 361.94178252686146, "roofline_pct": 35.173428288944145, "wall_ms": 7.855008301587302, "gpu_ms": 7.557041, "run_ms": 7.811875000000001, "host_ms": 0.29796730158730167, "encode_us": 183.667, "dispatches": 521.0, "weights_ms": 2.762875269659659, "rss_gb": 5.08076032}

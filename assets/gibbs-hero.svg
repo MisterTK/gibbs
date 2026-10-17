@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 440" width="1200" height="440" role="img" aria-labelledby="gibbs-hero-title gibbs-hero-desc">
 <title id="gibbs-hero-title">Gibbs: Metal-native inference engine</title>
-<desc id="gibbs-hero-desc">Ordered-dithered 1895 photograph of J. Willard Gibbs in brass tones with a pipe whose ember glows and smoke rises, the GIBBS wordmark, and four measured figures from the README benchmark: roofline geomean 48.6%, Gemma 4 E2B QAT 143 tok/s, streaming ceiling 302 GB/s, peak 429 tok/s.</desc>
+<desc id="gibbs-hero-desc">Ordered-dithered 1895 photograph of J. Willard Gibbs in brass tones with a pipe whose ember glows and smoke rises, the GIBBS wordmark, and four measured figures from the README benchmark: roofline geomean 49.3%, Gemma 4 E2B QAT 147 tok/s, streaming ceiling 302 GB/s, peak 451 tok/s.</desc>
 <defs>
 <linearGradient id="wm" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#D4AF37"/><stop offset="1" stop-color="#F5EEDB"/></linearGradient>
 <clipPath id="pc"><rect width="96" height="120"/></clipPath>
@@ -37,12 +37,12 @@
 <text x="384" y="196" font-size="18" letter-spacing="0.3em" fill="#F5EEDB">METAL-NATIVE INFERENCE ENGINE</text>
 <rect x="380" y="216" width="780" height="1" fill="#7A6040"/>
 <text x="380" y="248" font-size="12" fill="#A8895F" letter-spacing="0.08em">ROOFLINE GEOMEAN · 9 MODELS</text>
-<text x="380" y="288" font-size="36" fill="#FF8C00">48.6%</text>
+<text x="380" y="288" font-size="36" fill="#FF8C00">49.3%</text>
 <text x="780" y="248" font-size="12" fill="#A8895F" letter-spacing="0.08em">GEMMA 4 E2B QAT · DECODE</text>
-<text x="780" y="288" font-size="36" fill="#D4AF37">143 tok/s</text>
+<text x="780" y="288" font-size="36" fill="#D4AF37">147 tok/s</text>
 <text x="380" y="328" font-size="12" fill="#A8895F" letter-spacing="0.08em">STREAMING CEILING</text>
 <text x="380" y="368" font-size="36" fill="#4A86C5">302 GB/s</text>
 <text x="780" y="328" font-size="12" fill="#A8895F" letter-spacing="0.08em">PEAK · SMOLLM2 135M · SAFETENSORS</text>
-<text x="780" y="368" font-size="36" fill="#D4AF37">429 tok/s</text>
-<text x="380" y="412" font-size="11" fill="#A8895F" letter-spacing="0.08em">APPLE M5 PRO · METAL · BUILD 17CD933 · 2026-10-17</text>
+<text x="780" y="368" font-size="36" fill="#D4AF37">451 tok/s</text>
+<text x="380" y="412" font-size="11" fill="#A8895F" letter-spacing="0.08em">APPLE M5 PRO · METAL · BUILD C5CB49D · 2026-10-17</text>
 </svg>

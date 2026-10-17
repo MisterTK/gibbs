@@ -430,3 +430,17 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
   - `Qwen3.5 9B IQ2_M`: `39.01 -> 40.43 tok/s` (`+3.63%`, `61.18%` roofline, `gpu_ms 24.39 ms`)
   - `Gemma 4 E2B Q4_K_M`: `106.80 -> 107.54 tok/s` (`+0.69%`, `53.43%` roofline, `gpu_ms 8.84 ms`, `dispatches 665 -> 577`)
   - `Llama 3.2 1B Q4_0`: `254.51 tok/s` (`65.57%` roofline), `Llama 3.2 1B bnb 4-bit`: `228.26 tok/s` (`58.86%` roofline), `Qwen3.5 2B`: `114.31 tok/s` (`48.70%` roofline), `26B-A4B`: `69.82 tok/s` (`51.26%` roofline, `dispatches 1108 -> 1018`), `SmolLM2 135M`: `428.21 tok/s` (`38.79%` roofline).
+
+## Iteration `rsi-13` (`c5cb49d`): KEEP (`+0.81 pp` >= `max(0.30, noise_pp 0.14)`, `min_ratio = 0.9931`, `ratios_ok = true`, `loop_guard = 0`, promoted to `target/loop-base/gibbs`)
+- **Changes**:
+  1. Fused single-reader `Op::Rope` into `Step::RmsNorm` (`rmsnorm_fused_f32`), `Step::RmsNormBatch` (`rmsnorm_batch_f32` with per-segment `rope_mask`), and decode `Step::CachedAttention` (`attn_cached_gqa_split_t<NJ>` when `q`/`k` are not preceded by `RmsNorm`), eliminating all standalone `Rope` / `RopeBatch` dispatches across every model in `bench/loop.json` (`-35` on E2B, `-65` on 26B-A4B, `-30` on SmolLM2, `-16` on Llama 3.2 1B, `-8` on Qwen3.5).
+  2. Fused decode KV-cache append (`write_kv`) directly into `attn_cached_gqa_split_t<NJ>` (`split == 0, tg3.x % hgroups == 0` writes `k_in`/`v_in` to `kc`/`vc` while `t == start_pos` reads `k_in`/`v_in` directly), eliminating `kv_append_batched` dispatches during `m == 1` decode (`-15` on E2B, `-30` on SmolLM2 and 26B-A4B, `-16` on Llama 3.2 1B, `-6`..`-8` on Qwen3.5).
+  3. Routed `n_splits == 1` `gqa_decode` (`m == 1 && vis.is_none()`) through `attn_cached_gqa_split_t<NJ>` (writing `o / gl` directly to `out` without a merge dispatch) and templated `flash_attn_cached_t<NJ>` (`NJ = 1, 2, 4, 8, 16`), cutting short-context `CachedAttention` time by `-211 us` on E2B and `-263 us` on SmolLM2 135M.
+- **Full ABBA Verify (`bg_107`, vs `17cd933`)**: `base_pct = 48.46% -> cand_pct = 49.27%`, `delta_pp = +0.8058 pp`, `noise_pp = 0.1363 pp`, `min_ratio = 0.9931`, `ratios_ok = true`:
+  - `Gemma 4 E2B QAT`: `143.23 -> 146.70 tok/s` (`+2.42%`, `40.53%` roofline, `gpu_ms 6.54 ms`, `host_ms 0.275 ms`, `dispatches 571 -> 521`)
+  - `Gemma 4 E2B Q4_K_M`: `107.53 -> 109.81 tok/s` (`+2.12%`, `53.55%` roofline, `gpu_ms 8.83 ms`, `dispatches 577 -> 527`)
+  - `SmolLM2 135M`: `427.22 -> 451.04 tok/s` (`+5.58%`, `40.11%` roofline, `gpu_ms 1.88 ms`, `dispatches 333 -> 273`)
+  - `Llama 3.2 1B Q4_0`: `250.04 -> 256.22 tok/s` (`+2.47%`, `64.80%` roofline, `gpu_ms 3.61 ms`, `dispatches 179 -> 147`)
+  - `Llama 3.2 1B bnb 4-bit`: `228.20 -> 230.97 tok/s` (`+1.21%`, `58.46%` roofline, `gpu_ms 4.03 ms`, `dispatches 179 -> 147`)
+  - `Gemma 4 26B-A4B`: `69.84 -> 70.87 tok/s` (`+1.48%`, `51.07%` roofline, `gpu_ms 13.85 ms`, `dispatches 1018 -> 923`)
+  - `Qwen3.5 2B`: `114.49 -> 114.77 tok/s` (`+0.24%`, `48.00%` roofline, `dispatches 458 -> 446`), `Qwen3.5 9B IQ2_M`: `40.39 -> 40.49 tok/s` (`+0.23%`, `60.15%` roofline, `dispatches 610 -> 594`), `Gemma 4 E2B QAT ctx4k`: `127.31 tok/s` (`dispatches 571 -> 521`).
