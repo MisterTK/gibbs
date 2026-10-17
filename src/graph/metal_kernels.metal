@@ -549,9 +549,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
         sq += v * v;
     }
     float inv = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
-    device const float* scaler = scale_buf + (ulong)row * p.d;
     float mul = (p.flags & 2u) ? scale_buf[0] : 1.0f;
-    bool vec_scale = (p.flags & 16u) != 0;
     bool has_res = (p.flags & 1u) != 0;
     if (p.flags & 8u) {
         rmsnorm_rope_row(xr, g, outr, inv, p.d, row, p.rows / max(p.n_seq, 1u),
@@ -562,7 +560,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
         for (uint i = tid; i < p.d; i += tpg) {
             float v = xr[i] * inv * g[i];
             if (has_res) v += resr[i];
-            v *= vec_scale ? scaler[i] : mul;
+            v *= mul;
             outr[i] = v;
             sq2 += v * v;
         }
@@ -574,7 +572,7 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
         for (uint i = tid; i < p.d; i += tpg) {
             float v = xr[i] * inv * g[i];
             if (has_res) v += resr[i];
-            outr[i] = v * (vec_scale ? scaler[i] : mul);
+            outr[i] = v * mul;
         }
     }
 }
@@ -1918,7 +1916,6 @@ struct AttnCachedParams {
     uint rotary_dim;
     uint pair_stride;
     float mscale;
-    uint has_gate;
 };
 
 template <uint NJ>
@@ -1930,7 +1927,6 @@ inline void attn_cached_f32_impl(device const float* q,
                                  device const uint* vis,
                                  device const float* k_in,
                                  device const float* v_in,
-                                 device const float* gate,
                                  uint2 tg,
                                  uint sg,
                                  uint lane,
@@ -2007,10 +2003,7 @@ inline void attn_cached_f32_impl(device const float* q,
     for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
         float o = 0.0f;
         for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
-        ulong idx = ((ulong)q_tok * p.n_heads + head) * hd + d;
-        float val = o / gl;
-        if (p.has_gate != 0) val *= 1.0f / (1.0f + exp(-gate[idx]));
-        out[idx] = val;
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
     }
 }
 
@@ -2023,7 +2016,6 @@ kernel void flash_attn_cached_t(device const float* q [[buffer(0)]],
                                 device const uint* vis [[buffer(5)]],
                                 device const float* k_in [[buffer(6)]],
                                 device const float* v_in [[buffer(7)]],
-                                device const float* gate [[buffer(8)]],
                                 uint2 tg [[threadgroup_position_in_grid]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
                                 uint lane [[thread_index_in_simdgroup]],
@@ -2031,7 +2023,7 @@ kernel void flash_attn_cached_t(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * NJ * 32];
-    attn_cached_f32_impl<NJ>(q, kc, vc, out, p, vis, k_in, v_in, gate, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl<NJ>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 typedef decltype(flash_attn_cached_t<1>) flash_attn_cached_k;
@@ -2048,7 +2040,6 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
                             device const uint* vis [[buffer(5)]],
                             device const float* k_in [[buffer(6)]],
                             device const float* v_in [[buffer(7)]],
-                            device const float* gate [[buffer(8)]],
                             uint2 tg [[threadgroup_position_in_grid]],
                             uint sg [[simdgroup_index_in_threadgroup]],
                             uint lane [[thread_index_in_simdgroup]],
@@ -2056,13 +2047,12 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl<ATTN_MAX_PER_LANE>(q, kc, vc, out, p, vis, k_in, v_in, gate, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl<ATTN_MAX_PER_LANE>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
                                   device float* out [[buffer(1)]],
                                   constant AttnCachedParams& p [[buffer(2)]],
-                                  device const float* gate [[buffer(3)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint2 ntg [[threads_per_threadgroup]]) {
@@ -2077,10 +2067,7 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
     for (uint d = tid; d < hd; d += ntg.x) {
         float o = 0.0f;
         for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
-        ulong idx = ((ulong)q_tok * p.n_heads + head) * hd + d;
-        float val = o * inv_gl;
-        if (p.has_gate != 0) val *= 1.0f / (1.0f + exp(-gate[idx]));
-        out[idx] = val;
+        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o * inv_gl;
     }
 }
 
@@ -2126,7 +2113,6 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
                                       device const float* k_in [[buffer(5)]],
                                       device const float* v_in [[buffer(6)]],
                                       device const float* inv_freq [[buffer(7)]],
-                                      device const float* gate [[buffer(8)]],
                                       uint3 tg3 [[threadgroup_position_in_grid]],
                                       uint sg [[simdgroup_index_in_threadgroup]],
                                       uint lane [[thread_index_in_simdgroup]],
@@ -2233,14 +2219,11 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
         for (uint i = 0; i < nsg; ++i) gl += tg_l[h * ATTN_MAX_SG + i] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
         if (p.n_splits == 1) {
             device float* out = part + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
-            device const float* gh = gate + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
             float inv_gl = 1.0f / gl;
             for (uint d = tid; d < hd; d += nsg * 32) {
                 float o = 0.0f;
                 for (uint i = 0; i < nsg; ++i) o += tg_red[i * row + d] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
-                float val = o * inv_gl;
-                if (p.has_gate != 0) val *= 1.0f / (1.0f + exp(-gh[d]));
-                out[d] = val;
+                out[d] = o * inv_gl;
             }
         } else {
             device float* out = part + (((ulong)q_tok * p.n_heads + head0 + h) * p.n_splits + split) * (hd + 2);
@@ -2366,7 +2349,6 @@ struct Conv1dParams {
     uint dilation;
     uint hist;
     uint has_state;
-    uint silu;
 };
 
 kernel void causal_conv1d_f32(device const float* x [[buffer(0)]],
@@ -2396,7 +2378,6 @@ kernel void causal_conv1d_f32(device const float* x [[buffer(0)]],
                 acc += w_ch[tap] * val;
             }
         }
-        if (p.silu != 0) acc = acc / (1.0f + exp(-acc));
         out[(ulong)i * p.channels + ch] = acc;
     }
 
@@ -2421,8 +2402,6 @@ struct DeltaRuleParams {
     uint key_dim;
     uint val_dim;
     uint rep;
-    uint beta_sigmoid;
-    uint has_neg_a;
 };
 
 // Gated delta rule, one threadgroup per (32 value columns, head): 4 simdgroups split the key rows of the
@@ -2437,7 +2416,6 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
                            device float* state [[buffer(5)]],
                            device float* out [[buffer(6)]],
                            constant DeltaRuleParams& p [[buffer(7)]],
-                           device const float* neg_a [[buffer(8)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float ks[DELTA_MAX_KD];
@@ -2457,14 +2435,8 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
         device const float* q_in = q + ((ulong)t * kh + k_h) * kd;
         device const float* k_in = k + ((ulong)t * kh + k_h) * kd;
         device const float* v_t = v + ((ulong)t * vh + h) * vd;
-        float b_raw = beta[(ulong)t * vh + h];
-        const float b = (p.beta_sigmoid != 0) ? (1.0f / (1.0f + exp(-b_raw))) : b_raw;
-        float ld_raw = log_decay[(ulong)t * vh + h];
-        if (p.has_neg_a != 0) {
-            float sp = ld_raw > 20.0f ? ld_raw : log(1.0f + exp(ld_raw));
-            ld_raw = neg_a[h] * sp;
-        }
-        const float decay = exp(ld_raw);
+        const float b = beta[(ulong)t * vh + h];
+        const float decay = exp(log_decay[(ulong)t * vh + h]);
 
         float qn = 0.0f, kn = 0.0f;
         for (uint i = tid; i < kd; i += 128) {
