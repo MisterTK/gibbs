@@ -29,6 +29,8 @@ Gibbs is an LLM inference engine in Rust for Apple Silicon. Models are described
 | **Geomean** | | **50.0%** | | | | |
 
 Apple M5 Pro, Metal, measured streaming ceiling 302.5 GB/s. Binary built from `96ab660` (2026-10-17); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 151.1 tok/s against its 150 tok/s target.
+
+> cand1 pass shown; 2-run ABBA mean is 144.0 tok/s on E2B QAT (122.3 tok/s on 4k context) after a cand2 dip, awaiting quiet re-verify
 <!-- gibbs-bench:end -->
 
 System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
