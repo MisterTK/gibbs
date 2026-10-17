@@ -43,7 +43,7 @@ async fn media_for_a_text_only_model_is_a_400() {
             Some(ExecutableModel::from(model)),
         )),
         telemetry: EngineTelemetry::new(),
-        jev_model: None,
+        jev_model: Default::default(),
         image_model: Default::default(),
         classifier: Default::default(),
     });
@@ -115,7 +115,7 @@ async fn qwen_tool_calls_in_every_schema() {
     let app = create_router(AppState {
         scheduler: sched,
         telemetry: EngineTelemetry::new(),
-        jev_model: None,
+        jev_model: Default::default(),
         image_model: Default::default(),
         classifier: Default::default(),
     });

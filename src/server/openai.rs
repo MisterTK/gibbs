@@ -118,9 +118,9 @@ pub async fn chat_completions(
         Err(e) => return error(ApiError::bad(e.body_text())),
     };
     let tools = req.tools.as_deref().unwrap_or_default();
-    // System 1 handles `tools` only when an encoder is loaded; otherwise the LLM calls them.
-    if let (Some(_), false) = (state.jev_model.as_ref(), tools.is_empty()) {
-        return system1_tool_route(&state, &req).unwrap_or_else(error);
+    // System 1 handles `tools` when an encoder (or an LLM in System 1 mode) is active in the slot.
+    if let (Some(jev), false) = (state.jev_model.read().clone(), tools.is_empty()) {
+        return system1_tool_route(&jev, &req).unwrap_or_else(error);
     }
     chat(state, headers, req).await.unwrap_or_else(error)
 }
@@ -254,8 +254,10 @@ impl Wire for ChatWire {
 }
 
 /// Zero-shot tool routing with the System 1 encoder (no LLM): picks the tool only.
-fn system1_tool_route(state: &AppState, req: &ChatCompletionRequest) -> Result<Response, ApiError> {
-    let jev = state.jev_model.as_ref().expect("checked by the caller");
+fn system1_tool_route(
+    jev: &crate::model::jev::JevSystem1Model,
+    req: &ChatCompletionRequest,
+) -> Result<Response, ApiError> {
     let options: Vec<ChoiceOption> = req
         .tools
         .iter()

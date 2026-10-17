@@ -85,7 +85,7 @@ The design describes every model once in a shared graph IR (`src/graph`) and has
 | `auto` (default) | Resolves to Metal on Apple Silicon; to the CPU executor only on a host with no Metal device. |
 | `metal` | The default compute path. Every model family except the block drafters (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the six avenues tried per node (Metal kernel, decompose, dtype adapt, generated kernel, matmul primitive, Core ML/ANE), or with a family-gate error. A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
 | `cpu` | Explicit opt-in to the native CPU executor (NEON SIMD). It is the only way to run the DFlash/DFlash2/DSpark block drafters, and it is where the CPU weight-format measure/choose path runs. |
-| `ane` | System 1 only (`--backend ane --system1`) through Core ML; without `--system1` startup fails. |
+| `ane` | System 1 BERT sentence encoders (`--model sentence-transformers/all-MiniLM-L6-v2 --backend ane`) through Core ML. |
 | `cuda`, `rocm`, `level-zero` | Stubs: a startup error, because no such hardware is available to build and verify them. |
 
 Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
@@ -248,16 +248,14 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 
 | Flag | Meaning |
 | :--- | :--- |
-| `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path. The kind of model comes from its files: a diffusers `model_index.json` (text-to-image or text-to-video), an SD/FLUX GGUF or single-file checkpoint or LoRA, a classifier `architectures` entry, a native `model_type` (Qwen3.5/Qwen3-VL, Qwen3, HunYuan dense, Gemma 4, T5/mT5/UMT5, Marian/M2M100/NLLB/MBart/FSMT/BART, Idefics3/SmolVLM), else a GraphLm causal LM. |
-| `--backend auto\|metal\|cpu\|ane\|cuda\|rocm\|level-zero` | The compute backend (default `auto`, which is Metal on Apple Silicon; see [Backends](#backends)). `cpu` is the only CPU opt-in; `ane` is for `--system1`; `cuda`, `rocm`, and `level-zero` fail at startup. A model or op with no Metal lowering fails at load with a `gpu-only:` report. The Metal pipeline cache and host profile go to `~/.cache/gibbs/`. |
+| `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path. The kind of model comes from its files: a diffusers `model_index.json` (text-to-image or text-to-video), an SD/FLUX GGUF or single-file checkpoint or LoRA, a classifier `architectures` entry, a System 1 BERT sentence encoder (`sentence-transformers/all-MiniLM-L6-v2`), a native `model_type` (Qwen3.5/Qwen3-VL, Qwen3, HunYuan dense, Gemma 4, T5/mT5/UMT5, Marian/M2M100/NLLB/MBart/FSMT/BART, Idefics3/SmolVLM), else a GraphLm causal LM. |
+| `--backend auto\|metal\|cpu\|ane\|cuda\|rocm\|level-zero` | The compute backend (default `auto`, which is Metal on Apple Silicon; see [Backends](#backends)). `cpu` is the only CPU opt-in; `ane` runs System 1 BERT sentence encoders on the Neural Engine; `cuda`, `rocm`, and `level-zero` fail at startup. A model or op with no Metal lowering fails at load with a `gpu-only:` report. The Metal pipeline cache and host profile go to `~/.cache/gibbs/`. |
 | `--quant <format>` | Forces a weight format: `uncompressed` (f32), `f16`, `bf16`, `q8_0`, `nvfp4`, `exl3-3`/`exl3-4`/`exl3-5`, `hybrid`, `turbo`, or `jesse`. A format the backend has no kernels for is an error; the Metal LLM path accepts only `uncompressed` here (use `--reencode` instead). Without it, Metal applies the re-encode policy and `--backend cpu` measures and picks (see [Architecture](#architecture)). |
 | `--reencode max-speed\|low-bit-native\|bit-exact`, `--reencode-max-kl <nats>` | Metal weight re-encode policy and the mean-KL limit of its GPU gate; they override `reencode` / `reencode_max_kl` in `~/.cache/gibbs/settings.json` (see [Weight formats](#weight-formats)). |
 | `--variant fastest\|fastest-4bit\|best-quality` | Which variant of a multi-file GGUF/safetensors repo to pick (default `fastest`), ranked by predicted decode tok/s from the file header and measured codec efficiencies. |
 | `--max-tokens <n>`, `--ctx <n>` (default 8192) | Generation length for `--prompt`, and the context length. |
 | `--bench <file.json>`, `--bench-parity <file.json>` | Run a benchmark suite (JSON lines with `decode_tok_s`, `roofline_pct`) or the Metal-vs-CPU parity suite, then exit. |
 | `--tui-frame-log <file>` | With `--tui`, logs frame intervals. |
-| `--system1` | Loads the System 1 encoder. |
-| `--system1-model <repo>` | The BERT encoder used by `--system1`. It needs `config.json`, `tokenizer.json`, and `model.safetensors`. The default is `sentence-transformers/all-MiniLM-L6-v2`. |
 | `--seed <n>` | The image/video seed. Without it, a clock-based seed is used and printed so you can reproduce the run. |
 | `--prompt`, `--image`, `--output`, `--steps`, `--strength` (default 0.7), `--negative-prompt`, `--width`, `--height`, `--guidance` | Run one image generation from the CLI; steps, size and guidance default from the model. With an LLM, `--prompt` generates once and exits; with a classifier, `--prompt "text"` (or `"a \|\| b"`) prints the scores and exits. |
 | `--draft <repo>` | Attaches a speculative drafter (DFlash, DFlash2, DSpark, or a small LM with the same tokenizer). See [Speculative decoding](#speculative-decoding). |
@@ -378,16 +376,16 @@ curl http://localhost:8080/v1/images/edits \
 ```
 
 ### `POST /v1/embeddings`
-Returns 384-d embeddings. Requires `--system1`; without it, the endpoint returns 400.
+Returns 384-d L2-normalized embeddings from the loaded System 1 BERT encoder (`--model sentence-transformers/all-MiniLM-L6-v2` or loaded from the TUI picker) or from any loaded LLM (via a single forward pass and 384-d CountSketch projection).
 ```bash
 curl http://localhost:8080/v1/embeddings -H "Content-Type: application/json" \
   -d '{"input": "Remote code execution in JSON parser"}'
 ```
 
 ### `POST /v1/decisions`
-Requires `--system1`. Questions are answered by zero-shot cosine similarity. `bool` and `choice` are supported, and `score` questions return an error.
+Works with any loaded System 1 BERT encoder or any loaded LLM (and `/system1` in the TUI turns the active LLM into a System 1 model for bare prompts and zero-shot tool routing). Questions are answered by zero-shot cosine similarity. `bool` and `choice` are supported, and `score` questions return an error.
 ```bash
-./target/release/gibbs --system1 --port 8080   # the encoder runs on Metal by default; --backend ane for the Neural Engine, --backend cpu for the CPU
+./target/release/gibbs --model sentence-transformers/all-MiniLM-L6-v2 --port 8080   # Metal by default; --backend ane for the Neural Engine, or use any LLM
 curl http://localhost:8080/v1/decisions -H "Content-Type: application/json" -d '{
   "state": "User requested immediate subscription cancellation and refund due to service downtime.",
   "questions": [

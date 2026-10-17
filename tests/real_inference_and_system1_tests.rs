@@ -182,7 +182,7 @@ async fn test_server_real_streaming_and_system1_endpoint() {
     let telemetry = EngineTelemetry::new();
 
     let tiny_model = Arc::new(GraphLm::new(GraphLmConfig::smollm_1m()));
-    let jev_model = None;
+    let jev_model = Default::default();
 
     let scheduler = Arc::new(ContinuousBatchScheduler::new(
         "",

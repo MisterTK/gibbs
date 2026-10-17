@@ -1060,9 +1060,13 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
                 &[],
                 gguf_arch.as_deref(),
             );
+            let system1 = cfg
+                .as_ref()
+                .is_some_and(crate::model::jev::is_bert_encoder_config);
             // Same test as hub rows ([`native_type`]): native models keep bf16 weights.
             let bf16 = cfg.is_some_and(|c| native_type(&serde_json::json!({ "config": c })));
-            let runnable = super::is_chat_model(&id) || classifier || draft_for.is_some();
+            let runnable =
+                super::is_chat_model(&id) || classifier || system1 || draft_for.is_some();
             if !runnable || art.weights_path.is_none() {
                 continue;
             }
@@ -1881,14 +1885,14 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
         }
     }
     let tag = m["pipeline_tag"].as_str()?;
-    if let Some(verdict) = crate::model::classifier::hub_verdict(m) {
-        return verdict.err();
-    }
     if matches!(tag, "feature-extraction" | "sentence-similarity") {
         let gguf = m["gguf"]["architecture"].as_str();
         if model_type == Some("bert") || gguf == Some("bert") {
             return None;
         }
+    }
+    if let Some(verdict) = crate::model::classifier::hub_verdict(m) {
+        return verdict.err();
     }
     if let Some(a) = m["gguf"]["architecture"]
         .as_str()

@@ -27,7 +27,7 @@ use std::time::Instant;
 pub struct AppState {
     pub scheduler: Arc<ContinuousBatchScheduler>,
     pub telemetry: Arc<EngineTelemetry>,
-    pub jev_model: Option<Arc<JevSystem1Model>>,
+    pub jev_model: crate::model::jev::System1Slot,
     /// Active image model (shared with the TUI, hot-swapped by its picker).
     pub image_model: crate::model::text_to_image::ImageSlot,
     /// Active sequence classifier (shared with the TUI); while set, text generation answers 400.
@@ -161,14 +161,21 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The loaded System 1 encoder, or a 400 explaining how to start one.
-fn system1_model(state: &AppState) -> Result<&Arc<JevSystem1Model>, (StatusCode, String)> {
-    state.jev_model.as_ref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "no System 1 encoder loaded; start the server with --system1".to_string(),
-        )
-    })
+/// The loaded System 1 encoder (or active LLM turned into a System 1 encoder), or a 400.
+fn system1_model(state: &AppState) -> Result<Arc<JevSystem1Model>, (StatusCode, String)> {
+    if let Some(jev) = state.jev_model.read().clone() {
+        return Ok(jev);
+    }
+    if let Some(model) = state.scheduler.model() {
+        return Ok(Arc::new(JevSystem1Model::from_llm(
+            state.scheduler.model_id(),
+            model,
+        )));
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "no System 1 or LLM model loaded".to_string(),
+    ))
 }
 
 fn to_jev_question(q: System1QuestionItem) -> JevQuestion {
@@ -311,7 +318,7 @@ async fn handle_decisions(
         Some(v) => serde_json::to_string(v).unwrap_or_default(),
         None => String::new(),
     };
-    let decisions = evaluate_questions(jev, &state_str, payload.questions)?;
+    let decisions = evaluate_questions(&jev, &state_str, payload.questions)?;
     Ok(Json(DecisionResponse {
         model: jev.repo_id.clone(),
         decisions,
@@ -330,7 +337,7 @@ async fn handle_system1_judge(
     } else {
         serde_json::to_string(&payload.state).unwrap_or_default()
     };
-    let decisions = evaluate_questions(jev, &state_str, payload.questions)?;
+    let decisions = evaluate_questions(&jev, &state_str, payload.questions)?;
     Ok(Json(System1JudgeResponse {
         model: jev.repo_id.clone(),
         decisions,
@@ -349,7 +356,7 @@ async fn handle_list_models(State(state): State<AppState>) -> Json<serde_json::V
     if let Some(c) = state.classifier.read().as_ref() {
         data.push(entry(&c.repo_id, "text_classification"));
     }
-    if let Some(jev) = &state.jev_model {
+    if let Some(jev) = state.jev_model.read().as_ref() {
         data.push(entry(&jev.repo_id, "sentence_encoder"));
     }
     if let Some(m) = state.image_model.read().as_ref() {
@@ -589,7 +596,10 @@ async fn handle_image_generations(
         payload.guidance,
     )?;
     run_image_jobs(n, seed, move |s| {
-        let req = crate::model::text_to_image::ImageRequest { seed: s, ..req.clone() };
+        let req = crate::model::text_to_image::ImageRequest {
+            seed: s,
+            ..req.clone()
+        };
         sd.text_to_image(&req)
     })
     .await
@@ -602,7 +612,10 @@ async fn handle_image_edits(
     // Base64, data: or http(s) only: the server binds 0.0.0.0, so a path would let any client read
     // server-local files.
     let src = payload.image.trim();
-    let bytes = if ["data:", "http://", "https://"].iter().any(|p| src.starts_with(p)) {
+    let bytes = if ["data:", "http://", "https://"]
+        .iter()
+        .any(|p| src.starts_with(p))
+    {
         core::fetch_url(src)
             .await
             .map_err(|e| api_error(e.status, format!("Invalid input image: {}", e.message)))?
@@ -610,7 +623,9 @@ async fn handle_image_edits(
         crate::model::image::base64_decode(src).map_err(|e| {
             api_error(
                 StatusCode::BAD_REQUEST,
-                format!("Invalid input image (expected base64, a data: URL or an http(s) URL): {e}"),
+                format!(
+                    "Invalid input image (expected base64, a data: URL or an http(s) URL): {e}"
+                ),
             )
         })?
     };
@@ -648,7 +663,10 @@ async fn handle_image_edits(
     }
     req.steps = Some(steps);
     run_image_jobs(n, seed, move |s| {
-        let req = crate::model::text_to_image::ImageRequest { seed: s, ..req.clone() };
+        let req = crate::model::text_to_image::ImageRequest {
+            seed: s,
+            ..req.clone()
+        };
         sd.image_to_image(&req, &init, strength)
     })
     .await
@@ -670,7 +688,7 @@ mod tests {
                 None,
             )),
             telemetry: EngineTelemetry::new(),
-            jev_model: None,
+            jev_model: Default::default(),
             image_model: Default::default(),
             classifier: Default::default(),
         }
@@ -790,7 +808,11 @@ mod tests {
     async fn image_edit_never_reads_server_paths() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret.png");
-        std::fs::write(&path, crate::model::image::ImageBuffer::new(64, 64).to_png()).unwrap();
+        std::fs::write(
+            &path,
+            crate::model::image::ImageBuffer::new(64, 64).to_png(),
+        )
+        .unwrap();
         let edit = serde_json::json!({"prompt": "x", "image": path.to_string_lossy()});
         let body = post_body("/v1/images/edits", edit).await;
         assert!(body.contains("Invalid input image"), "{body}");

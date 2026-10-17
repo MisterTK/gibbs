@@ -39,13 +39,6 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     tui: bool,
 
-    #[arg(long, default_value_t = false)]
-    system1: bool,
-
-    /// Hugging Face BERT sentence encoder backing --system1 (needs config.json, tokenizer.json, model.safetensors).
-    #[arg(long, default_value = "sentence-transformers/all-MiniLM-L6-v2")]
-    system1_model: String,
-
     /// Weight format override (uncompressed, f16, bf16, q8_0, nvfp4, exl3-3/4/5, hybrid, turbo,
     /// jesse). Without it the engine measures the formats its kernels support on this host and
     /// picks the fastest one that stays within its quality floor.
@@ -312,7 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || cli.probe_top5.is_some()
         || cli.explain_placement;
     if one_shot_metal
-        && cli.backend.parse::<gibbs_engine::hardware::PlacementMode>()?
+        && cli
+            .backend
+            .parse::<gibbs_engine::hardware::PlacementMode>()?
             != gibbs_engine::hardware::PlacementMode::Pin(Device::Cpu)
     {
         gibbs_engine::hardware::cpu_compute::ban(true);
@@ -387,9 +382,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(backend, Device::Metal | Device::Ane) {
         gibbs_engine::hardware::cpu_compute::ban(true);
     }
-    if backend == Device::Ane && !cli.system1 {
-        return Err("--backend ane runs System 1 only (add --system1)".into());
-    }
     println!("═══════════════════════════════════════════════════════════════");
     println!("  GIBBS INFERENCE ENGINE // v0.1.0");
     println!("═══════════════════════════════════════════════════════════════");
@@ -410,25 +402,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_budget(usize::MAX);
 
     // Text-to-video is chosen by the checkpoint's model_index.json / hub GGUF architecture, never by the model id.
-    if !cli.system1 {
+    let is_system1 = gibbs_engine::model::jev::detect(&hub, &cli.model);
+    if backend == Device::Ane && !is_system1 {
+        return Err("--backend ane runs System 1 sentence encoders only".into());
+    }
+    if !is_system1 {
         if let Some(plan) = ltx::resolve(&hub, &cli.model, cli.quant.as_deref()) {
             return run_ltx(&cli, &hub, &plan?).map_err(Into::into);
         }
     }
-    if !cli.system1 && TextToVideoPipeline::is_t2v_repo(&hub, &cli.model) {
+    if !is_system1 && TextToVideoPipeline::is_t2v_repo(&hub, &cli.model) {
         return run_text_to_video(&cli, &hub, backend).map_err(Into::into);
     }
     let token = cli.hf_token.or_else(|| std::env::var("HF_TOKEN").ok());
 
     // A `*ForSequenceClassification` config.json makes `--model` a classifier (/v1/classify).
-    let classifier_arch = if cli.system1 {
+    let classifier_arch = if is_system1 {
         None
     } else {
         classifier::detect(&hub, &cli.model)
     };
-    // `--system1` loads its own encoder (JevSystem1Model::load) and a classifier its own files;
-    // `--model` is then not resolved as an LLM.
-    let artifacts = if cli.system1 || classifier_arch.is_some() {
+    let artifacts = if is_system1 || classifier_arch.is_some() {
         None
     } else {
         telemetry.log_info(&format!(
@@ -567,12 +561,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut weights = None;
     let mut drafter = None;
     let classifier_slot = ClassifierSlot::default();
-    let (model_exec, jev_model) = if is_image {
-        (None, None)
-    } else if cli.system1 {
+    let jev_slot = gibbs_engine::model::jev::System1Slot::default();
+    let model_exec = if is_image {
+        None
+    } else if is_system1 {
         telemetry.log_info(&format!(
             "Loading System 1 sentence encoder '{}'",
-            cli.system1_model
+            cli.model
         ));
         let t0 = std::time::Instant::now();
         let jev_backend = if backend == Device::Cpu
@@ -582,26 +577,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             backend
         };
-        let jev = JevSystem1Model::load(&hub, &cli.system1_model, jev_backend)
-            .map_err(|e| format!("Cannot load System 1 encoder '{}': {e}", cli.system1_model))?;
-        if let Some(report) = jev.encoder.executor_report() {
-            if report.starts_with("Core ML") {
-                telemetry.log_info(&report);
-            } else {
-                telemetry.log_info(&format!("Metal: {report}"));
+        let jev = JevSystem1Model::load(&hub, &cli.model, jev_backend)
+            .map_err(|e| format!("Cannot load System 1 encoder '{}': {e}", cli.model))?;
+        if let Some(enc) = jev.bert() {
+            if let Some(report) = enc.executor_report() {
+                if report.starts_with("Core ML") {
+                    telemetry.log_info(&report);
+                } else {
+                    telemetry.log_info(&format!("Metal: {report}"));
+                }
             }
+            telemetry.log_info(&format!(
+                "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",
+                jev.repo_id,
+                enc.device(),
+                enc.dims.num_layers,
+                enc.dims.hidden_size,
+                enc.dims.num_heads,
+                enc.parameter_count() as f64 / 1e6,
+                t0.elapsed().as_secs_f64()
+            ));
         }
-        telemetry.log_info(&format!(
-            "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",
-            jev.repo_id,
-            jev.encoder.device(),
-            jev.encoder.dims.num_layers,
-            jev.encoder.dims.hidden_size,
-            jev.encoder.dims.num_heads,
-            jev.encoder.parameter_count() as f64 / 1e6,
-            t0.elapsed().as_secs_f64()
-        ));
-        (None, Some(Arc::new(jev)))
+        if let Some(prompt) = &cli.prompt {
+            if prompt.contains('|') {
+                let (query, opts) = prompt
+                    .split_once('|')
+                    .map(|(q, o)| (q.trim(), o))
+                    .unwrap_or((prompt.as_str(), ""));
+                let options: Vec<gibbs_engine::model::jev::ChoiceOption> = opts
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| gibbs_engine::model::jev::ChoiceOption::new(s, None::<String>))
+                    .collect();
+                let decision = jev
+                    .embed(query)
+                    .and_then(|s| jev.evaluate_choice_embedded(&s, &options))?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "query": query,
+                        "model": jev.repo_id,
+                        "decision": decision,
+                    }))?
+                );
+            } else {
+                let v = jev.embed(prompt)?;
+                println!("{} dimensions · head={:?}", v.len(), &v[..v.len().min(8)]);
+            }
+            return Ok(());
+        }
+        *jev_slot.write() = Some(Arc::new(jev));
+        None
     } else if classifier_arch.is_some() {
         let t0 = Instant::now();
         let c = SequenceClassifier::load(&hub, &cli.model, backend)
@@ -622,7 +649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         *classifier_slot.write() = Some(Arc::new(c));
-        (None, None)
+        None
     } else {
         let artifacts = artifacts
             .as_ref()
@@ -732,7 +759,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        (Some(model_exec), None)
+        Some(model_exec)
     };
 
     // 5. Initialize Continuous Batch Scheduler with Real Streaming Channel & Telemetry
@@ -780,7 +807,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         scheduler: scheduler.clone(),
         telemetry: telemetry.clone(),
-        jev_model: jev_model.clone(),
+        jev_model: jev_slot.clone(),
         image_model: image_slot.clone(),
         classifier: classifier_slot.clone(),
     };
@@ -804,12 +831,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. Interactive TUI or Headless Daemon Mode
     if cli.tui {
-        let mut tui_app = TuiApp::new(telemetry, kv_pool)
-            .with_runtime(scheduler, hub, token, jev_model, image_slot);
+        let mut tui_app =
+            TuiApp::new(telemetry, kv_pool).with_runtime(scheduler, hub, token, None, image_slot);
         tui_app.quant_override = quant_override;
         tui_app.weights = weights;
         tui_app.frame_log_path = cli.tui_frame_log;
         tui_app.classifier = classifier_slot;
+        tui_app.jev_model = jev_slot;
         tui_app.http_addr = Some(addr);
         tui_app.placement = placement;
         tokio::task::spawn_blocking(move || tui_app.run()).await??;

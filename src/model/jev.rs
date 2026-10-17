@@ -576,16 +576,104 @@ impl BertEncoder {
     }
 }
 
-/// Pretrained BERT sentence encoder used zero-shot for System 1 decisions.
+/// Shared, hot-swappable System 1 model slot (native BERT encoder or any LLM).
+pub type System1Slot = std::sync::Arc<parking_lot::RwLock<Option<std::sync::Arc<JevSystem1Model>>>>;
+
+/// True when `cfg` is a BERT encoder `config.json` (not a sequence classifier or generator).
+pub fn is_bert_encoder_config(cfg: &serde_json::Value) -> bool {
+    if cfg["model_type"].as_str() != Some("bert")
+        || !cfg["hidden_size"].is_u64()
+        || !cfg["num_hidden_layers"].is_u64()
+    {
+        return false;
+    }
+    match cfg["architectures"][0].as_str() {
+        Some(a) => {
+            !a.ends_with("ForSequenceClassification")
+                && !crate::model::classifier::is_generator(a)
+                && !crate::model::classifier::ARCHITECTURES.contains(&a)
+        }
+        None => true,
+    }
+}
+
+/// True when `repo_id` is a BERT sentence encoder checkpoint (`sentence-transformers/all-MiniLM-L6-v2`, etc.).
+pub fn detect(hub: &HuggingFaceHub, repo_id: &str) -> bool {
+    if crate::model::hub::is_synthetic_model_id(repo_id)
+        || crate::model::hub::split_weight_file(repo_id).1.is_some()
+        || std::path::Path::new(repo_id).is_dir()
+        || repo_id.ends_with(".gguf")
+        || repo_id.ends_with(".safetensors")
+    {
+        return false;
+    }
+    let Some(config) = hub
+        .locate_model(repo_id)
+        .config_path
+        .or_else(|| hub.fetch_file(repo_id, "config.json").ok())
+    else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(config) else {
+        return false;
+    };
+    let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    is_bert_encoder_config(&cfg)
+}
+
+const LLM_EMBED_DIM: usize = 384;
+
+/// Deterministic 384-d L2-normalized CountSketch of a centered LLM next-token logit vector.
+fn llm_embed_from_logits(logits: &[f32]) -> Vec<f32> {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for &x in logits {
+        if x.is_finite() {
+            sum += x as f64;
+            count += 1;
+        }
+    }
+    let mean = if count > 0 {
+        (sum / count as f64) as f32
+    } else {
+        0.0
+    };
+    let mut out = vec![0.0f32; LLM_EMBED_DIM];
+    for (i, &x) in logits.iter().enumerate() {
+        if !x.is_finite() {
+            continue;
+        }
+        let h = (i as u64).wrapping_add(1).wrapping_mul(0x9E3779B97F4A7C15);
+        let bucket = ((h >> 32) as usize) % LLM_EMBED_DIM;
+        let sign = if (h & 1) == 0 { 1.0f32 } else { -1.0f32 };
+        out[bucket] += sign * (x - mean);
+    }
+    let norm = out.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+    for v in &mut out {
+        *v /= norm;
+    }
+    out
+}
+
+/// Backing model for System 1 embeddings and zero-shot decisions.
+pub enum System1Backend {
+    Bert {
+        tokenizer: tokenizers::Tokenizer,
+        encoder: BertEncoder,
+    },
+    Llm(crate::scheduler::ExecutableModel),
+}
+
+/// Pretrained BERT sentence encoder or LLM used zero-shot for System 1 decisions.
 pub struct JevSystem1Model {
     pub repo_id: String,
     /// Softmax temperature over cosine similarities.
     // ponytail: zero-shot similarity, not a trained head; calibrate T or train heads if accuracy matters.
     pub temperature: f32,
-    tokenizer: tokenizers::Tokenizer,
-    pub encoder: BertEncoder,
+    pub backend: System1Backend,
 }
-
 impl JevSystem1Model {
     /// Fetches config.json, tokenizer.json and model.safetensors from `repo_id` and builds the
     /// encoder on `device` (CPU, or Metal/ANE on macOS; anything else is an error).
@@ -643,31 +731,89 @@ impl JevSystem1Model {
         Ok(Self {
             repo_id: repo_id.to_string(),
             temperature: 0.05,
-            tokenizer,
-            encoder: BertEncoder::load(dims, device, t)?,
+            backend: System1Backend::Bert {
+                tokenizer,
+                encoder: BertEncoder::load(dims, device, t)?,
+            },
         })
     }
 
-    /// Number of WordPiece tokens the encoder sees for `text` (incl. [CLS]/[SEP], after truncation).
+    /// Turns any loaded LLM (`ExecutableModel`) into a System 1 embedding and zero-shot decision model.
+    pub fn from_llm(repo_id: impl Into<String>, llm: crate::scheduler::ExecutableModel) -> Self {
+        Self {
+            repo_id: repo_id.into(),
+            temperature: 0.05,
+            backend: System1Backend::Llm(llm),
+        }
+    }
+
+    /// The underlying BERT encoder when backed by BERT, or `None` when backed by an LLM.
+    pub fn bert(&self) -> Option<&BertEncoder> {
+        match &self.backend {
+            System1Backend::Bert { encoder, .. } => Some(encoder),
+            System1Backend::Llm(_) => None,
+        }
+    }
+
+    /// True when this System 1 model wraps an LLM rather than a dedicated BERT encoder.
+    pub fn is_llm(&self) -> bool {
+        matches!(self.backend, System1Backend::Llm(_))
+    }
+
+    /// Human-readable summary for the TUI and startup logs.
+    pub fn summary(&self) -> String {
+        match &self.backend {
+            System1Backend::Bert { encoder, .. } => format!(
+                "System 1 BERT encoder ({} layers, hidden {}, {} heads, {:.1}M params) on {:?}; /decide <state> | <opt1>, <opt2> or /embed <text>",
+                encoder.dims.num_layers,
+                encoder.dims.hidden_size,
+                encoder.dims.num_heads,
+                encoder.parameter_count() as f64 / 1e6,
+                encoder.device()
+            ),
+            System1Backend::Llm(llm) => format!(
+                "System 1 LLM encoder on {}; /decide <state> | <opt1>, <opt2> or /embed <text> (/system1 off for chat)",
+                llm.backend_label()
+            ),
+        }
+    }
+
+    /// Number of tokens the model sees for `text`.
     pub fn token_count(&self, text: &str) -> Result<usize, String> {
-        let enc = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| format!("tokenize: {e}"))?;
-        Ok(enc.get_ids().len())
+        match &self.backend {
+            System1Backend::Bert { tokenizer, .. } => {
+                let enc = tokenizer
+                    .encode(text, true)
+                    .map_err(|e| format!("tokenize: {e}"))?;
+                Ok(enc.get_ids().len())
+            }
+            System1Backend::Llm(llm) => Ok(llm.tokenizer().encode(text).len().max(1)),
+        }
     }
 
-    /// Sentence embedding: BERT forward, mean pooling over tokens, L2 normalisation.
+    /// Sentence embedding: L2-normalized vector (BERT mean-pooled hidden state or 384-d LLM logit sketch).
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let enc = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| format!("tokenize: {e}"))?;
-        let positions: Vec<u32> = (0..enc.get_ids().len() as u32).collect();
-        self.encoder
-            .run(enc.get_ids(), &positions, enc.get_type_ids(), true)
+        match &self.backend {
+            System1Backend::Bert { tokenizer, encoder } => {
+                let enc = tokenizer
+                    .encode(text, true)
+                    .map_err(|e| format!("tokenize: {e}"))?;
+                let positions: Vec<u32> = (0..enc.get_ids().len() as u32).collect();
+                encoder.run(enc.get_ids(), &positions, enc.get_type_ids(), true)
+            }
+            System1Backend::Llm(llm) => {
+                let mut ids = llm.tokenizer().encode(text);
+                if ids.is_empty() {
+                    ids = llm.tokenizer().encode(" ");
+                    if ids.is_empty() {
+                        ids.push(0);
+                    }
+                }
+                let logits = llm.prompt_logits(ids)?;
+                Ok(llm_embed_from_logits(&logits))
+            }
+        }
     }
-
     /// Zero-shot choice: softmax(cos(state, option) / T).
     pub fn evaluate_choice_embedded(
         &self,
@@ -868,7 +1014,10 @@ mod tests {
         let [empty, word, long, unicode, sentence] = edge_texts();
         let texts = [empty.as_str(), &word, &long, &unicode, &sentence];
         assert_eq!(m.token_count("").unwrap(), 2);
-        assert_eq!(m.token_count(&long).unwrap(), m.encoder.dims.max_positions);
+        assert_eq!(
+            m.token_count(&long).unwrap(),
+            m.bert().unwrap().dims.max_positions
+        );
         // FNV-1a over every output bit: stable across Rust releases, unlike DefaultHasher.
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |v: f32| {
@@ -929,7 +1078,7 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(gpu.encoder.device(), Device::Metal);
+        assert_eq!(gpu.bert().unwrap().device(), Device::Metal);
         for t in edge_texts() {
             let (a, b) = (cpu.embed(&t).unwrap(), gpu.embed(&t).unwrap());
             let cos = dot(&a, &b) / (dot(&a, &a) * dot(&b, &b)).sqrt();
@@ -997,8 +1146,8 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(ane.encoder.device(), Device::Ane);
-        let report = ane.encoder.executor_report().unwrap();
+        assert_eq!(ane.bert().unwrap().device(), Device::Ane);
+        let report = ane.bert().unwrap().executor_report().unwrap();
         assert!(report.contains("Core ML ANE:"), "report: {report}");
         assert!(report.contains("Neural Engine"), "report: {report}");
         let mut min_cos = 1.0f32;
@@ -1068,5 +1217,42 @@ mod tests {
         }
         let s = format!("min_cosine={min_cos:.6} max_bool_prob_diff={max_dp:.6}\n");
         let _ = std::fs::write("/tmp/gibbs-p2/accuracy.log", s);
+    }
+
+    #[test]
+    fn llm_acts_as_system1_model() {
+        use crate::model::graph_lm::{GraphLm, GraphLmConfig};
+        use crate::scheduler::ExecutableModel;
+        use std::sync::Arc;
+
+        let llm = ExecutableModel::from(Arc::new(GraphLm::new(GraphLmConfig::smollm_1m())));
+        let s1 = JevSystem1Model::from_llm("foundry/smollm-1m", llm);
+        assert!(s1.is_llm());
+        assert!(s1.token_count("reactor overheating").unwrap() >= 1);
+        assert_eq!(s1.token_count("").unwrap(), 1);
+        let emb = s1.embed("reactor overheating").unwrap();
+        assert_eq!(emb.len(), LLM_EMBED_DIM);
+        let norm = dot(&emb, &emb).sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm={norm}");
+        let empty_emb = s1.embed("").unwrap();
+        assert_eq!(empty_emb.len(), LLM_EMBED_DIM);
+        let JevDecision::Choice {
+            selected,
+            probabilities,
+            ..
+        } = s1
+            .evaluate_choice_embedded(
+                &emb,
+                &[
+                    ChoiceOption::new("reactor overheating", None::<&str>),
+                    ChoiceOption::new("billing invoice", None::<&str>),
+                ],
+            )
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(selected, "reactor overheating");
+        assert!(probabilities["reactor overheating"] > probabilities["billing invoice"]);
     }
 }

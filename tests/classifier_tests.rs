@@ -353,7 +353,7 @@ async fn http_classify_rerank_and_chat_refusal() {
             Some(ExecutableModel::from(llm)),
         )),
         telemetry: EngineTelemetry::new(),
-        jev_model: None,
+        jev_model: Default::default(),
         image_model: Default::default(),
         classifier: Default::default(),
     };

@@ -140,9 +140,11 @@ pub fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// An LLM is loaded and no classifier has taken its place.
+/// An LLM is loaded and no classifier or System 1 encoder has taken its place.
 pub fn text_model_active(state: &AppState) -> bool {
-    state.scheduler.has_model() && state.classifier.read().is_none()
+    state.scheduler.has_model()
+        && state.classifier.read().is_none()
+        && state.jev_model.read().is_none()
 }
 
 pub fn no_text_model(state: &AppState) -> ApiError {
@@ -151,6 +153,11 @@ pub fn no_text_model(state: &AppState) -> ApiError {
             "The active model {} classifies text ({}); it does not generate. Use /v1/classify (or /v1/rerank for 1-label pair models)",
             c.repo_id,
             c.summary()
+        )
+    } else if let Some(jev) = state.jev_model.read().as_ref() {
+        format!(
+            "The active model {} is running in System 1 mode; use /v1/decisions, /v1/system1/decide, or /v1/embeddings",
+            jev.repo_id
         )
     } else if state.image_model.read().is_some() {
         "No text generation model is loaded (this server is serving an image model); use /v1/images/generations".to_string()
@@ -777,10 +784,17 @@ mod tests {
     fn a_swap_abort_is_a_503_and_other_errors_stay_500() {
         let swapped = format!("{}org/model", crate::scheduler::MODEL_SWAPPED);
         assert_eq!(error_status(&swapped), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error_status("decode failed: boom"), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_status("decode failed: boom"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
         let (tx, rx) = unbounded_channel();
         tx.send(Event::Error(swapped)).unwrap();
-        let gen = Generation { id: 0, prompt_tokens: 0, events: rx };
+        let gen = Generation {
+            id: 0,
+            prompt_tokens: 0,
+            events: rx,
+        };
         let Err(err) = futures::executor::block_on(collect(gen)) else {
             panic!("a swap abort is an error");
         };

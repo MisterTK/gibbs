@@ -26,9 +26,9 @@ use crate::model::image::ImageBuffer;
 use crate::model::jev::{ChoiceOption, JevSystem1Model};
 use crate::model::ltx;
 use crate::model::native::{load_native, MediaInput};
+use crate::model::reencode::ReencodeProgress;
 use crate::model::text_to_image::{load_image_model, ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
-use crate::model::reencode::ReencodeProgress;
 use crate::model::weight_format::{
     load_causal_lm_for, reencode_override, set_reencode_override, Choice, ReencodeConfig,
     ReencodePolicy, VariantPolicy,
@@ -58,6 +58,7 @@ const PINNED_MODELS: &[&str] = &[
     "Qwen/Qwen2.5-0.5B-Instruct",
     "roneneldan/TinyStories-Instruct-8M",
     "EleutherAI/pythia-14m",
+    "sentence-transformers/all-MiniLM-L6-v2",
 ];
 /// Redraw interval locked to 60 FPS tick (16.6 ms) without frame drops.
 const REFRESH: Duration = Duration::from_nanos(16_666_667);
@@ -97,13 +98,23 @@ fn parse_slash(raw: &str) -> Option<Result<SlashCmd, String>> {
     Some(match cmd {
         "/placement" => Ok(SlashCmd::Placement),
         "/reencode" if arg.is_empty() => Ok(SlashCmd::Reencode(None)),
-        "/reencode" => arg.parse().map(|p| SlashCmd::Reencode(Some(p))).map_err(|_| {
-            format!("unknown reencode policy '{arg}'; valid: max-speed, low-bit-native, bit-exact")
-        }),
+        "/reencode" => arg
+            .parse()
+            .map(|p| SlashCmd::Reencode(Some(p)))
+            .map_err(|_| {
+                format!(
+                    "unknown reencode policy '{arg}'; valid: max-speed, low-bit-native, bit-exact"
+                )
+            }),
         "/variant" if arg.is_empty() => Ok(SlashCmd::Variant(None)),
-        "/variant" => arg.parse().map(|p| SlashCmd::Variant(Some(p))).map_err(|_| {
-            format!("unknown variant policy '{arg}'; valid: fastest, fastest-4bit, best-quality")
-        }),
+        "/variant" => arg
+            .parse()
+            .map(|p| SlashCmd::Variant(Some(p)))
+            .map_err(|_| {
+                format!(
+                    "unknown variant policy '{arg}'; valid: fastest, fastest-4bit, best-quality"
+                )
+            }),
         "/profile" => parse_profile(arg).map(SlashCmd::Profile),
         _ => return None,
     })
@@ -374,7 +385,7 @@ pub struct TuiApp {
     pub scheduler: Option<Arc<ContinuousBatchScheduler>>,
     pub hub: HuggingFaceHub,
     pub hf_token: Option<String>,
-    pub jev_model: Option<Arc<JevSystem1Model>>,
+    pub jev_model: crate::model::jev::System1Slot,
     /// Shared with the HTTP server; `Some` makes `/image` and bare prompts generate images.
     pub image_model: ImageSlot,
     /// Set by loading an LTX-Video repo; `/video` and `/i2v` generate clips with it.
@@ -489,7 +500,7 @@ impl TuiApp {
             scheduler: None,
             hub,
             hf_token,
-            jev_model: None,
+            jev_model: crate::model::jev::System1Slot::default(),
             image_model: ImageSlot::default(),
             video: ltx::VideoSlot::default(),
             classifier: ClassifierSlot::default(),
@@ -560,7 +571,7 @@ impl TuiApp {
         self.scheduler = Some(scheduler);
         self.hub = hub;
         self.hf_token = hf_token;
-        self.jev_model = jev_model;
+        *self.jev_model.write() = jev_model;
         self.image_model = image_model;
         self
     }
@@ -573,6 +584,9 @@ impl TuiApp {
         }
         if let Some(c) = self.classifier.read().as_ref() {
             return c.repo_id.clone();
+        }
+        if let Some(jev) = self.jev_model.read().as_ref() {
+            return jev.repo_id.clone();
         }
         self.scheduler
             .as_ref()
@@ -636,6 +650,7 @@ impl TuiApp {
                 )))
             }
             "/bench" => Some(self.start_bench()),
+            "/system1" | "/s1" => Some(self.toggle_system1(rest.trim())),
             "/quant" => {
                 Some(Ok(format!(
                     "MODEL QUANTIZATION:\n\
@@ -665,6 +680,9 @@ impl TuiApp {
                      · /roofline  : Focus ROOFLINE detail & run the calibration sweep\n\
                      · /quant     : Display active weight quantization formats\n\
                      · /gibbs     : Full historical biography & ASCII portrait of J. Willard Gibbs\n\
+                     · /system1 [on|off] : Turn the active LLM into a System 1 encoder & zero-shot judge (or return to chat)\n\
+                     · /decide <q> | a, b: Zero-shot System 1 choice on the active System 1 or LLM model\n\
+                     · /embed <text>     : Compute L2-normalized embedding on the active System 1 or LLM model\n\
                      · /chat <msg>: Send chat message to active model\n\
                      · /connect   : Print curl/OpenAI API connection commands\n\
                      · /help      : This reference"
@@ -691,9 +709,17 @@ impl TuiApp {
             "/classify" | "/cls" => (Ok(Route::Classify), rest.trim()),
             "/i2v" => (Ok(Route::Video { image: true }), rest.trim()),
             "/video" | "/vid" | "/t2v" => (Ok(Route::Video { image: false }), rest.trim()),
-            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /reencode, /variant, /settings, /profile, /bench, /placement, /quant, /help, /gibbs")), ""),
+            c if c.starts_with('/') => (Err(format!("unknown command '{c}'; use /chat, /system1, /image, /decide, /embed, /classify, /connect, /agent, /roofline, /reencode, /variant, /settings, /profile, /bench, /placement, /quant, /help, /gibbs")), ""),
             _ if self.classifier.read().is_some() => (Ok(Route::Classify), raw.as_str()),
             _ if self.image_model.read().is_some() => (Ok(Route::Image), raw.as_str()),
+            _ if self.jev_model.read().is_some() => (
+                Ok(if raw.contains('|') {
+                    Route::Decide
+                } else {
+                    Route::Embed
+                }),
+                raw.as_str(),
+            ),
             _ => (Ok(route_for_model(&self.model_id())), raw.as_str()),
         };
         let body = body.to_string();
@@ -754,6 +780,51 @@ impl TuiApp {
         }
     }
 
+    /// `/system1 [on|off]`: turns any loaded LLM into a System 1 model (or returns it to chat).
+    fn toggle_system1(&mut self, arg: &str) -> Result<String, String> {
+        let want_off = matches!(arg, "off" | "0" | "false" | "chat");
+        let want_on = matches!(arg, "on" | "1" | "true");
+        if want_off || (!want_on && self.jev_model.read().as_ref().is_some_and(|j| j.is_llm())) {
+            if self.jev_model.read().as_ref().is_some_and(|j| j.is_llm()) {
+                *self.jev_model.write() = None;
+                let id = self.model_id();
+                self.telemetry
+                    .log_info(&format!("TUI: System 1 mode disabled for '{id}'"));
+                return Ok(format!(
+                    "System 1 mode OFF: {id} returned to text generation (/chat)"
+                ));
+            }
+            if let Some(jev) = self.jev_model.read().as_ref() {
+                return Ok(format!(
+                    "{} is a dedicated System 1 encoder; press m to load an LLM for chat",
+                    jev.repo_id
+                ));
+            }
+            return Ok("System 1 mode is already off".to_string());
+        }
+        if let Some(sched) = &self.scheduler {
+            if let Some(llm) = sched.model() {
+                let id = sched.model_id();
+                let jev = Arc::new(JevSystem1Model::from_llm(id.clone(), llm));
+                let shape = jev.summary();
+                *self.jev_model.write() = Some(jev);
+                *self.classifier.write() = None;
+                *self.image_model.write() = None;
+                self.telemetry
+                    .log_info(&format!("TUI: '{id}' activated as System 1 model"));
+                return Ok(format!("System 1 mode ON ({id}): {shape}"));
+            }
+        }
+        if let Some(jev) = self.jev_model.read().as_ref() {
+            return Ok(format!(
+                "System 1 mode ON ({}): {}",
+                jev.repo_id,
+                jev.summary()
+            ));
+        }
+        Err("no LLM or System 1 model loaded; press m to load a model".to_string())
+    }
+
     /// `/reencode [policy]`: the named policy, else the next one in the cycle. It is saved to the
     /// settings file and the loaded model is reloaded under it.
     fn set_reencode(&mut self, policy: Option<ReencodePolicy>) -> Result<String, String> {
@@ -789,7 +860,9 @@ impl TuiApp {
     /// otherwise it applies to the next load.
     fn reload_for(&mut self, what: &str, value: &str) -> String {
         if self.benchmarking {
-            return format!("{what} -> {value}; a benchmark is running, so it applies to the next load");
+            return format!(
+                "{what} -> {value}; a benchmark is running, so it applies to the next load"
+            );
         }
         let loaded = self
             .scheduler
@@ -830,7 +903,9 @@ impl TuiApp {
         if !view.seqs.is_empty() || view.waiting > 0 || self.running > 0 {
             return Err("busy: finish or cancel generation first".into());
         }
-        let exec = sched.model().ok_or("no text model loaded; press m to load one")?;
+        let exec = sched
+            .model()
+            .ok_or("no text model loaded; press m to load one")?;
         let id = sched.model_id();
         let (policy, saved) =
             crate::bench::applied_policy(self.weights.as_ref(), self.reencode_policy);
@@ -1218,9 +1293,18 @@ impl TuiApp {
                 ))
             }
             Route::Decide | Route::Embed => {
-                let jev = self.jev_model.clone().ok_or(
-                    "no System 1 (decision/embedding) model loaded; launch with `--system1 --tui`",
-                )?;
+                let jev = self
+                    .jev_model
+                    .read()
+                    .clone()
+                    .or_else(|| {
+                        let sched = self.scheduler.as_ref()?;
+                        Some(Arc::new(JevSystem1Model::from_llm(
+                            sched.model_id(),
+                            sched.model()?,
+                        )))
+                    })
+                    .ok_or("no System 1 or LLM model loaded; press m to load a model")?;
                 let run: fn(&JevSystem1Model, &str) -> Result<String, String> =
                     if route == Route::Decide {
                         decide
@@ -1289,6 +1373,7 @@ impl TuiApp {
         hub.progress = Some(progress);
         let (token, tx) = (self.hf_token.clone(), self.updates_tx.clone());
         let slot = self.classifier.clone();
+        let jev_slot = self.jev_model.clone();
         let images = self.image_model.clone();
         let video = self.video.clone();
         let (quant_override, hw, id, placement) = (
@@ -1327,13 +1412,24 @@ impl TuiApp {
                     let c = SequenceClassifier::load(&hub, &id, backend)?;
                     let shape = c.summary();
                     *slot.write() = Some(Arc::new(c));
+                    *jev_slot.write() = None;
                     *images.write() = None;
+                    return Ok((None, shape));
+                }
+                if crate::model::jev::detect(&hub, &id) {
+                    let jev = JevSystem1Model::load(&hub, &id, backend)?;
+                    let shape = jev.summary();
+                    *jev_slot.write() = Some(Arc::new(jev));
+                    *slot.write() = None;
+                    *images.write() = None;
+                    *video.write() = None;
                     return Ok((None, shape));
                 }
                 if let Some(plan) = crate::model::ltx::resolve(&hub, &id, None) {
                     let plan = plan?;
                     let shape = format!("LTX-Video {}; /video <prompt> and /i2v <image> <prompt> write .mp4 clips (CPU, minutes)", plan.label());
                     *video.write() = Some(Arc::new((hub.clone(), plan)));
+                    *jev_slot.write() = None;
                     *images.write() = None;
                     *slot.write() = None;
                     return Ok((None, shape));
@@ -1372,6 +1468,7 @@ impl TuiApp {
                         d.guidance
                     );
                     *images.write() = Some(g);
+                    *jev_slot.write() = None;
                     *slot.write() = None;
                     return Ok((None, shape));
                 }
@@ -1380,6 +1477,7 @@ impl TuiApp {
                     let shape = format!("{}, on {}", m.summary(), m.backend_label());
                     sched.swap_model(&id, ExecutableModel::Native(m));
                     refine(None);
+                    *jev_slot.write() = None;
                     *slot.write() = None;
                     *images.write() = None;
                     return Ok((None, shape));
@@ -1392,6 +1490,7 @@ impl TuiApp {
                 *stage.lock() = "compiling + tuning kernels";
                 sched.swap_model(&id, ExecutableModel::load_graph_lm(llm, placement)?);
                 refine(Some(&choice));
+                *jev_slot.write() = None;
                 *slot.write() = None;
                 *images.write() = None;
                 Ok((
@@ -1712,10 +1811,7 @@ impl TuiApp {
                 && !self.benchmarking
                 && self.running > 0;
             let old = |at: Option<Instant>| at.is_none_or(|t| t.elapsed() >= PROFILE_EVERY);
-            if wanted
-                && old(self.profile_asked)
-                && old(self.kernel_profile.as_ref().map(|p| p.0))
-            {
+            if wanted && old(self.profile_asked) && old(self.kernel_profile.as_ref().map(|p| p.0)) {
                 metal::request_kernel_profile();
                 self.profile_asked = Some(Instant::now());
             }
@@ -1900,7 +1996,11 @@ impl TuiApp {
                     if let Ok(p) = s.variant.parse() {
                         self.variant_policy = p;
                     }
-                    let value = if what == "reencode" { s.reencode } else { s.variant };
+                    let value = if what == "reencode" {
+                        s.reencode
+                    } else {
+                        s.variant
+                    };
                     let note = self.reload_for(what, &value);
                     self.picker.set_note(note, theme::Token::Jade);
                 }
@@ -2915,7 +3015,8 @@ mod tests {
         assert!(app.load.is_some(), "a loaded model is reloaded");
         let e = app.history.last().unwrap();
         assert!(
-            e.output.contains("variant -> best-quality; reloading gibbs/tiny-5m"),
+            e.output
+                .contains("variant -> best-quality; reloading gibbs/tiny-5m"),
             "{}",
             e.output
         );
@@ -2940,10 +3041,17 @@ mod tests {
         type_and_run(&mut app, "/bench");
         assert!(app.benchmarking);
         let e = app.history.last().unwrap();
-        assert!(e.output.contains("benchmarking gibbs/tiny-5m"), "{}", e.output);
+        assert!(
+            e.output.contains("benchmarking gibbs/tiny-5m"),
+            "{}",
+            e.output
+        );
         type_and_run(&mut app, "/chat hi");
         let e = app.history.last().unwrap();
-        assert_eq!((e.kind, e.output.as_str()), (Kind::Error, "benchmark running"));
+        assert_eq!(
+            (e.kind, e.output.as_str()),
+            (Kind::Error, "benchmark running")
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         while app.benchmarking {
             app.drain_updates();
@@ -2995,7 +3103,15 @@ mod tests {
             top_kernels: None,
         };
         let text = bench_report(&r);
-        for want in ["180.0 tok/s", "= 90.0%", "weights 5.00", "gpu excess 0.20", "run host 0.10", "outside 0.20", "612 dispatches"] {
+        for want in [
+            "180.0 tok/s",
+            "= 90.0%",
+            "weights 5.00",
+            "gpu excess 0.20",
+            "run host 0.10",
+            "outside 0.20",
+            "612 dispatches",
+        ] {
             assert!(text.contains(want), "{want}: {text}");
         }
     }
@@ -3077,7 +3193,8 @@ mod tests {
         let pos = |app: &TuiApp, kind: &str| {
             let text = lines_of(&snapshot::render_buffer(app, 160, 50)).join("\n");
             assert!(text.contains("µs▼") || text.contains("GB/s▼") || text.contains("%gpu▼"));
-            text.find(kind).unwrap_or_else(|| panic!("no {kind}\n{text}"))
+            text.find(kind)
+                .unwrap_or_else(|| panic!("no {kind}\n{text}"))
         };
         // By time RmsNorm (410 µs) precedes CachedAttention (260 µs); by bandwidth it follows.
         assert_eq!(app.kernel_sort, KernelSort::Time);
@@ -3096,18 +3213,38 @@ mod tests {
     #[test]
     fn slash_commands_parse_without_an_app() {
         use crate::telemetry::KernelSort as K;
-        let ok = |s: &str| parse_slash(s).expect("a parsed command").expect("valid arguments");
-        let err = |s: &str| parse_slash(s).expect("a parsed command").expect_err("invalid arguments");
+        let ok = |s: &str| {
+            parse_slash(s)
+                .expect("a parsed command")
+                .expect("valid arguments")
+        };
+        let err = |s: &str| {
+            parse_slash(s)
+                .expect("a parsed command")
+                .expect_err("invalid arguments")
+        };
         assert_eq!(ok("/placement"), SlashCmd::Placement);
         assert_eq!(ok("/reencode"), SlashCmd::Reencode(None));
-        assert_eq!(ok("/reencode  bit-exact "), SlashCmd::Reencode(Some(ReencodePolicy::BitExact)));
+        assert_eq!(
+            ok("/reencode  bit-exact "),
+            SlashCmd::Reencode(Some(ReencodePolicy::BitExact))
+        );
         assert_eq!(ok("/variant"), SlashCmd::Variant(None));
-        assert_eq!(ok("/variant fastest-4bit"), SlashCmd::Variant(Some(VariantPolicy::Fastest4Bit)));
+        assert_eq!(
+            ok("/variant fastest-4bit"),
+            SlashCmd::Variant(Some(VariantPolicy::Fastest4Bit))
+        );
         assert_eq!(ok("/profile"), SlashCmd::Profile(ProfileArg::Status));
         assert_eq!(ok("/profile on"), SlashCmd::Profile(ProfileArg::On));
         assert_eq!(ok("/profile off"), SlashCmd::Profile(ProfileArg::Off));
-        assert_eq!(ok("/profile sort"), SlashCmd::Profile(ProfileArg::Sort(None)));
-        assert_eq!(ok("/profile sort bw"), SlashCmd::Profile(ProfileArg::Sort(Some(K::Bandwidth))));
+        assert_eq!(
+            ok("/profile sort"),
+            SlashCmd::Profile(ProfileArg::Sort(None))
+        );
+        assert_eq!(
+            ok("/profile sort bw"),
+            SlashCmd::Profile(ProfileArg::Sort(Some(K::Bandwidth)))
+        );
         assert!(err("/reencode turbo").contains("valid: max-speed"));
         assert!(err("/variant best").contains("valid: fastest"));
         assert!(err("/profile sort size").contains("'size'"));
@@ -3119,11 +3256,19 @@ mod tests {
     #[test]
     fn policy_slash_arguments_parse_exactly_the_documented_names() {
         use crate::model::weight_format::{ReencodePolicy as R, VariantPolicy as V};
-        for (s, p) in [("max-speed", R::MaxSpeed), ("low-bit-native", R::LowBitNative), ("bit-exact", R::BitExact)] {
+        for (s, p) in [
+            ("max-speed", R::MaxSpeed),
+            ("low-bit-native", R::LowBitNative),
+            ("bit-exact", R::BitExact),
+        ] {
             assert_eq!(s.parse::<R>().ok(), Some(p));
             assert_eq!(p.name(), s);
         }
-        for (s, p) in [("fastest", V::Fastest), ("fastest-4bit", V::Fastest4Bit), ("best-quality", V::BestQuality)] {
+        for (s, p) in [
+            ("fastest", V::Fastest),
+            ("fastest-4bit", V::Fastest4Bit),
+            ("best-quality", V::BestQuality),
+        ] {
             assert_eq!(s.parse::<V>().ok(), Some(p));
             assert_eq!(p.name(), s);
         }
@@ -3144,7 +3289,15 @@ mod tests {
         let help = app.history.last().unwrap().output.clone();
         type_and_run(&mut app, "/nope");
         let unknown = app.history.last().unwrap().output.clone();
-        for c in ["/reencode", "/variant", "/settings", "/profile", "/bench", "/placement", "/help"] {
+        for c in [
+            "/reencode",
+            "/variant",
+            "/settings",
+            "/profile",
+            "/bench",
+            "/placement",
+            "/help",
+        ] {
             assert!(help.contains(c), "help lacks {c}");
             assert!(unknown.contains(c), "unknown-command text lacks {c}");
         }
@@ -3321,5 +3474,59 @@ mod tests {
             .filter(|&(x, y)| buf[(x, y)].symbol() == "╔" && buf[(x, y)].fg == brass)
             .count();
         assert_eq!(corners, 1);
+    }
+
+    #[test]
+    fn llm_can_be_used_and_toggled_as_system1_in_tui() {
+        use crate::model::graph_lm::{GraphLm, GraphLmConfig};
+
+        let kv = Arc::new(PagedKVPool::new(64));
+        let llm = ExecutableModel::from(Arc::new(GraphLm::new(GraphLmConfig::smollm_1m())));
+        let sched = Arc::new(ContinuousBatchScheduler::new(
+            "foundry/smollm-1m",
+            kv.clone(),
+            Some(llm),
+        ));
+        let mut app = TuiApp::new(EngineTelemetry::new(), kv).with_runtime(
+            sched,
+            HuggingFaceHub::new(),
+            None,
+            None,
+            ImageSlot::default(),
+        );
+
+        // Even before `/system1`, `/decide` and `/embed` work directly on the loaded LLM.
+        app.input = "/decide reactor overheating | reactor overheating, billing".into();
+        app.submit_prompt();
+        settle(&mut app);
+        assert_eq!(app.history.last().unwrap().kind, Kind::Json);
+        assert!(app.history.last().unwrap().output.contains("selected"));
+
+        // `/system1` turns the active LLM into a System 1 model for bare prompts too.
+        app.input = "/system1".into();
+        app.submit_prompt();
+        assert!(app.jev_model.read().is_some());
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("System 1 mode ON"));
+
+        app.input = "reactor overheating | reactor overheating, billing".into();
+        app.submit_prompt();
+        settle(&mut app);
+        assert_eq!(app.history.last().unwrap().kind, Kind::Json);
+
+        // `/system1 off` returns the LLM to normal chat mode.
+        app.input = "/system1 off".into();
+        app.submit_prompt();
+        assert!(app.jev_model.read().is_none());
+        assert!(app
+            .history
+            .last()
+            .unwrap()
+            .output
+            .contains("System 1 mode OFF"));
     }
 }
