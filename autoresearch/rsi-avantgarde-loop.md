@@ -60,25 +60,27 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 6 Avant-Garde Priority Queue (Promoting `rsi-31`, Two-Pass Multi-TG `MoeWeightedSumNorm`, & Attention `k_proj`/`v_proj` Hoisting)
+## 3. Wave 6 Avant-Garde Priority Queue (`W1 + M1 + W2` without `M3`, Race-Free Multi-TG `MoeWeightedSumNorm`, & Indexed GEMV `shared_x` Bandwidth)
 
-### 1. Promote `rsi-31` (`experiment/rsi-31-w1-m1-rsi23` `799202e`: `WIDE_Q4_0` + `Track M1` + `rsi-23`) on a Quiet Host
-- **Verified Stack (`799202e`)**:
-  - **Track W1 (`WIDE_Q4_0`, `1a93e18`)**: `+25%` `Q4_0` generated GEMV bandwidth (`6144x1536` `gen/r1` `192 -> 243 GB/s`, `2048x1536` `gen/r1` `161 -> 202 GB/s`), lifting `E2B QAT` `+0.89%` (`148.8 -> 150.7 tok/s`, `4/4` pairs) and `Llama 3.2 1B Q4_0` `+1.40%` (`252.4 -> 256.5 tok/s`) in `bg_192`.
-  - **Track M1 (`TopKSoftmax` + `SplitGlu` + `MoeWeightedSum`, `9b7940f`)**: Cuts `210` dispatches/token on `Model 7` (`923 -> 713`), verified for 32-token real-weight greedy parity on `26B-A4B` and delivering `+1.77%` (`-258 us/tok`) in solo screen `bg_194` and `+3.86%` in ABBA `bg_195`.
-  - **`rsi-23` (`2b7b6c8`)**: Zero-tax Qwen3.5 fusions (`-102` dispatches on `Qwen3.5 2B`, `-136` on `9B`), vectorized `gemv_iq4_xs`, pure-vec4 GQA split-K `NJ=4,8,16`, `gemv_q4_0_quarter`, and 2-CB `(16, usize::MAX)` pipeline for `96..220` steps.
-  - In contended ABBA `bg_195`, `799202e` achieved **`delta_pp = +0.94 pp > max(0.30, noise_pp = 0.37 pp)`** and **`ratios_ok = true` (`min_ratio = 0.9926`)**. Re-verify on an uncontended host (`base_spread <= 0.04`) and promote into `target/loop-base/`.
+### 1. Track W2-v2 (`exp-w2v2-gate-up-glu-nom3`, branched from `74c00eb` `W1 + M1` without `M3`) — Isolate `Step::ExpertGateUpGlu` with Fast-Math Preserved
+- **Context**: In Wave 5, `Step::ExpertGateUpGlu` (`3a7ba6a`, `-270` dispatches/tok on `Model 7`, `923 -> 653`, verified for 31/31 real-weight greedy tokens in `bg_191`) was only ever measured on top of `Track M3` (`bg_192`), which `bg_193` showed cancels `M1`'s gain, and with `set_fast_math_enabled(false)` disabling fast-math FMA across the entire GEMV loop.
+- **Design**:
+  - Port `Step::ExpertGateUpGlu` (`gemv_indexed_glu`) onto `74c00eb` (`W1 + M1` alone, **without** `M3`), keeping **fast-math enabled** (`CompileOptions::new()`) on both `moe_gemv_pso` and `moe_gemv_glu_pso`.
+  - Prevent `tanh` overflow under fast-math by clamping the `tanh` argument inside `gelu_tanh` (`tanh(clamp(0.79788456f * x * (1.0f + 0.044715f * x * x), -10.0f, 10.0f))`) or calling `metal::precise::tanh`, and add ` IQ2_XXS + Q4_0` (`m = 1, 24`) to `moe_subgraph_fusions_match_cpu`.
 
-### 2. Track M3-v2 (`exp-m3v2-multitg-wsum-norm`: Multi-TG `MoeWeightedSum` + Last-TG Atomic Counter `RmsNorm + Residual + Scale`)
+### 2. Track M3-v2 (`exp-m3v2-multitg-wsum-norm`, branched from `74c00eb` `W1 + M1`) — Race-Free Multi-TG `MoeWeightedSumNorm`
 - **Root Cause of Track M3 v1 (`beafc9b`) Regression (`bg_193` vs `bg_194`)**:
   - Track M3 v1 launched a **single threadgroup (`1` of `16` GPU cores)** to read all `90 KB` (`8 * 2816 * 4` B) of `down [slots, h]`, serializing `2.7 MB/token` of reads onto 1 core (`+275 us/tok`).
-- **Design**:
-  - Launch `ceil(h / 256)` threadgroups (`11` TGs across `11` GPU cores for `h = 2816`): each TG `tg_x` computes `256` columns of `routed[c] = sum_s down[s, c] * weights[s]`, writes `routed[c]` to a scratch slice, accumulates its 256-column partial sum-of-squares `sum_sq_tg` into `scratch_partials[tg_x]`, executes `threadgroup_barrier(mem_flags::mem_device)`, and increments an atomic counter `atomic_fetch_add_explicit(&scratch_counter[0], 1u, memory_order_relaxed)`.
-  - The **last finishing threadgroup** (`old == num_tgs - 1`) resets `scratch_counter[0] = 0`, sums `scratch_partials[0..num_tgs]`, computes `inv_rms = rsqrt(total_sq / float(h) + eps)`, and normalizes all `h` columns (`out[c] = (routed[c] * inv_rms * g[c] + res[c]) * scale`) in L1 cache (`11 KB`)!
-  - Keeps all `11` GPU cores reading `90 KB` in parallel while still eliminating `-30` dispatches/token on `Model 7`.
+- **Race-Free Design**:
+  - Launch `num_tgs = ceil(h / 256)` threadgroups (`11` TGs across `11` GPU cores for `h = 2816`, grid `(num_tgs, n, 1)`): each TG `tg_x` computes `256` columns of `routed[r, c] = sum_s down[(r*k + s)*h + c] * weights[r*k + s]`, writes `routed[r, c]` to a device scratch buffer, and writes its 256-column partial sum-of-squares `sum_sq_tg` to `scratch_partials[r * num_tgs + tg_x]`.
+  - Lane 0 of each TG executes `atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device)` (NOT `threadgroup_barrier`, which only orders within one TG!) and then `uint done = atomic_fetch_add_explicit(&scratch_counters[r], 1u, memory_order_acq_rel);` + `simd_broadcast_first(done)` / `threadgroup_barrier(mem_flags::mem_threadgroup)`.
+  - Only the **last finishing threadgroup** (`done == num_tgs - 1`) executes `atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device)`, resets `scratch_counters[r] = 0u` (on lane 0), sums `scratch_partials[r * num_tgs .. + num_tgs]`, computes `inv_rms = rsqrt(total_sq / float(h) + eps)`, and normalizes `routed[r, 0..h]` -> `out[r, 0..h]` (`+res`, `*scale`).
 
-### 3. Track A6 (`exp-a6-kv-hoist-gen1-pair`: Attention `k_proj`/`v_proj` & DeltaNet `proj_b`/`proj_a` `Gen(1)` Pairing)
-- **Root Cause of Track A5-v2 (`696810f`) No-Op (`bg_187`)**:
-  - `tune-Apple-M5-Pro-25G241.json` selects `GemvKernel::Gen { rows_per_sg: 1 }` (not `HAND`) on `k_proj`/`v_proj` (`256x1536` `Q4_0` on `Model 0`, `512x2048` `Q4_K_M` on `Model 2`), and `proj_b`/`proj_a` (`16x2048` on `Model 2`) are `BF16`.
+### 3. Track M4 (`exp-m4-moe-indexed-bw`, branched from `main`) — `ExpertLinear` `gemv_indexed` Bandwidth Optimization (`moe_gemv_bandwidth`)
+- **Context**: `moe_gemv_bandwidth` (`moe-gemv-bw-r2`) measured `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)` at `143.7 GB/s` (`56.9 us`) and `GGUF_IQ4_NL 2816x704 (top_k=8, x_rows=8)` at `158.3 GB/s` (`56.3 us`) against a `~290 GB/s` ceiling (`~3.4–4.5 ms/token` across 60 `ExpertLinear` steps on `Model 7`).
 - **Design**:
-  - Extend `Step::GemvPackedPair` to support `GemvKernel::Gen { rows_per_sg: 1 }` and `WeightFormat::BF16` for adjacent sibling projections sharing `x` with `rows <= 512`, cutting `-18` dispatches on `Qwen3.5 2B` DeltaNet `proj_b + proj_a` (`16x2048` `BF16`) and `-6` dispatches on `Qwen3.5 2B` Full Attention `k_proj + v_proj` (`512x2048`).
+  - Add `GGUF_Q4_0 2816x704 (top_k=8, x_rows=8)` to `moe_gemv_bandwidth` in `src/graph/metal/ext/moe.rs`.
+  - In `gemv_indexed` (`src/graph/codegen.rs`), cooperately stage `xb[0..p.cols]` into `threadgroup float shared_x[2048]` (`8 KB` max, preserving `1024` max threads/TG = 100% occupancy) when `p.cols <= 2048` (or tile `xb` in `2048`-float chunks) and vectorize `WIDE_IQ2_XXS` sign selection (`select(g0, -g0, ...)`), gated directly by `moe_gemv_bandwidth`.
+
+### 4. Staged Stack Ready for Quiet ABBA Promotion
+- **`experiment/rsi-31-w1-m1` (`74c00eb`)** and **`experiment/rsi-31-w1-m1-rsi23` (`799202e`)**: Staged for `scripts/verify_when_quiet.sh` once the host GPU is idle (`base_spread <= 0.04`).
