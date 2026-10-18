@@ -60,32 +60,25 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 4 Avant-Garde Priority Queue (Real-Weight MoE Parity, Fused `MoeWeightedSum+RmsNorm`, Zero-Tax Small-Row Pair GEMV & Cross-Hardware MoE Fusions)
+## 3. Wave 5 Avant-Garde Priority Queue (Targeting the `3.86 ms` `26B-A4B` `lm_head` Bottleneck, Promoting `rsi-24` + `M3`, & `Gen(r)` Pair GEMV)
 
-### Track M1-Verify & `rsi-24` Promotion (`experiment/rsi-24-full-stack`, `57dcdf2`)
-- **Prerequisite Real-Weight MoE Parity Gate**:
-  - `--bench-parity` covers the 5 `<= 4B` non-MoE reference models (`E2B QAT`, `Qwen3.5 2B`, `Llama 3.2 1B Q4_0`, `SmolLM2 135M`, `Llama 3.2 1B bnb`).
-  - Before promoting `30f6633` (`Track M1`) or `57dcdf2` (`rsi-24`), run a 16-token greedy decode on `Model 7` (`unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf`) with both `target/loop-base/gibbs` and the `rsi-24` binary via `central_scheduler.py` and verify **100% identical greedy token output**, plus capture `GIBBS_PROFILE_KERNELS=1` on `Model 7` to record the exact per-kind GPU ms/token breakdown.
+### 1. Promote `rsi-24` + `Track M3` (`experiment/rsi-24-full-stack` `57dcdf2` + `experiment/rsi-26-m1-m3-moe-fusions` `beafc9b`) on a Quiet Host
+- **Verified Prerequisites**:
+  - `57dcdf2` (`rsi-24`) already passed `scripts/loop_guard.sh` (`bg_180`, `rc=0`, `parity: 5 compared`).
+  - `beafc9b` (`Track M1 + M3`) passed **real-weight 32-token greedy (`temperature = 0.0`) parity** on `Model 7` (`Gemma 4 26B-A4B · UD-IQ2_XXS`, `bg_185`: `923 -> 683` dispatches, `-240` dispatches/tok, 31/31 greedy tokens identical).
+  - `c43c9fd` fixed `HostProfile` `(memory_bandwidth_gbps, stream_gbps, ceiling_gbps, codec)` carry-over on `main` so `base` and `cand` share the exact same `ceiling_gbps`.
+- **Action**: Cherry-pick `2b7b6c8` (`rsi-23`) + `beafc9b` (`Track M1 + M3`) onto `main` and run `python3 autoresearch/central_scheduler.py run --quiet --quiet-max 20 --quiet-timeout 3600 -- scripts/verify_when_quiet.sh`.
 
-### Track M3 (`exp-m3-moe-epi`, `ExpertM3MoeNormFusion`) — Fused `MoeWeightedSum + RmsNorm + Residual (+ Scale)` (`-30` dispatches/tok & `-22 KB/layer` DRAM on `Model 7`)
+### 2. Track B5 (`lm_head` `[262144, 2816]` Non-Power-of-2 Column Bandwidth Bottleneck on `Model 7`)
+- **Empirical Discovery (`bg_183` `GIBBS_PROFILE_KERNELS=1`)**:
+  - On `Model 7` (`Gemma 4 26B-A4B · UD-IQ2_XXS`), `lm_head` (`[262144, 2816]`, `416.3 MB` re-encoded to `Q4_K`) takes **`3.86 ms` (`28%` of the entire 30-layer model's `13.5 ms` decode time!) at only `107.8 GB/s` (`37.1%` of ceiling)**!
+  - Why does `[262144, 2816]` `Q4_K` run at `107.8 GB/s` when `[262144, 1536]` runs at `220+ GB/s`?
+    - `cols = 2816 = 11 * 256` (`11` `Q4_K` blocks of `144` bytes = `1584` bytes/row, which is `99 * 16` bytes — NOT a multiple of `64` or `128` cache-line bytes!).
+    - Even worse: in `gemv_q4_k` (`src/graph/metal_kernels.metal:1320`, `n_sub = n_blocks * 16 = 11 * 16 = 176`) and `WIDE_Q4_K` (`src/graph/codec.rs:240`, `groups = 16`, `total_groups = 11 * 16 = 176 = 5 * 32 + 16`), `176 % 32 == 16`, so on the 6th loop iteration **16 of 32 SIMD lanes (50% of the simdgroup) sit idle** across all `262,144` rows (`8,192` threadgroups)!
+  - **Design**:
+    - Add a 32-sub-units-per-block (`n_sub = n_blocks * 32`, `8` elements/lane: `4` low nibbles + `4` high nibbles per lane via a single `uint` `qs` load instead of `uint2`) specialization `gemv_q4_k_odd_blocks` (used when `(n_blocks & 1) != 0`, such as `n_blocks = 11` for `cols = 2816`!) so every 256-element `Q4_K` block maps to **32 lanes (100% SIMD utilization on `n_blocks = 11`: `11 * 32 = 352` iterations, zero idle tail lanes!)**.
+    - Lifting `lm_head` from `107.8 GB/s` (`3.86 ms`) to `~215 GB/s` (`1.93 ms`) saves **`~1.9 ms/token` (`+14%` whole-model decode speedup on `Model 7`, jumping `26B-A4B` from `72.5 tok/s` (`54.4%` roofline) to `~84 tok/s` (`63%` roofline))!**
+
+### 3. Track A3-v2 (Deterministic Last-TG Fence `post_norm + residual + scale` Epilogue)
 - **Files**: `src/graph/metal.rs`, `src/graph/metal_kernels.metal`
-- **Problem**: After `Track M1` fuses `Mul(down, w_col) + Reshape + Reduce(Sum)` into `Step::MoeWeightedSum` (writing `routed [n, h]`), `routed` is immediately consumed by a single-reader `Step::RmsNorm { x: routed, g, res: Some(dense), scale, rows: n, d: h, eps }` (`post_ff_ln_2 + ffn_sum` in `src/model/gemma4/moe.rs:368-375`).
-- **Design**:
-  - When `Step::MoeWeightedSum { down, weights, n, k, h }` (`h <= 4096`, `k <= 32`) has a single reader `Step::RmsNorm { x, g, res, scale, chain: None, rope: None, rows, d, eps }` with `x == routed && rows == n && d == h`, fuse both steps into `Step::MoeWeightedSumNorm` (`moe_weighted_sum_rmsnorm_f32`, 1 threadgroup of 256 threads per token row `r in 0..n`):
-  - Each thread `tid` (`0..255`) loops `c = tid, tid + 256, ... < h` (`<= 16` iterations for `h <= 4096`), computes `float v = sum_{s=0..k-1} down[(r * k + s) * h + c] * weights[r * k + s]`, caches `vals[idx] = v` in registers (`float vals[16]`), and accumulates `sq += v * v`.
-  - One `simd_sum(sq)` + 8-float `threadgroup float shared[8]` reduction (`32 bytes` of threadgroup SRAM = 100% occupancy) computes `inv_rms = rsqrt(total_sq / float(h) + eps)`, and each thread writes `out[r * h + c] = (vals[idx] * inv_rms * g[c] + res[r * h + c]) * scale` directly — eliminating 30 dispatches/token and the `routed` device-memory round-trip!
-
-### Track A5-v2 (`exp-a5v2-pair`, `ExpertA5v2ZeroTaxPair`) — Zero-Tax Standalone `gemv_q4_k_pair` / `gemv_q8_0_pair` for Small Projections (`rows <= 512`)
-- **Files**: `src/graph/metal.rs`, `src/graph/metal_kernels.metal`
-- **Lessons from `Track A5` (`bg_176`)**:
-  1. Extracting `inline void gemv_<fmt>_body(...)` from shared hand kernels (`gemv_q4_0`, `gemv_q4_k`, etc.) taxed `Model 4` (`0.9896`) and `Model 5` (`0.9881`) where pairing never fired.
-  2. Pairing only helps when each projection has few threadgroups (`rows <= 512`, i.e. `1..32` TGs, such as Qwen3.5 `in_proj_b + in_proj_a` `[16, 2048]` which gained `+1.03%` `4/4` in `bg_176`, and Gemma 4 `k_proj + v_proj` `[512, 1536]`) so a single projection under-fills the 16 GPU cores.
-- **Design**:
-  - Keep `gemv_q4_0`, `gemv_q4_0_half`, `gemv_q8_0`, `gemv_bf16`, `gemv_f16`, and `gemv_q4_k` **100% byte-for-byte untouched** in `src/graph/metal_kernels.metal` (zero tax on single-matrix callers!).
-  - Add standalone `gemv_q4_k_pair`, `gemv_q8_0_pair`, and `gemv_q4_0_half_pair` kernels with their own self-contained bodies.
-  - Pair two sibling `Step::GemvPacked` steps ONLY after `assign_variants` (in `prepare_plan`) when BOTH steps resolved to the same hand kernel (`HAND` on `Q4_K`, `Q8_0`, or `Q4_0` with `cols >= 512`), share `x`, `m == 1`, `cols0 == cols1`, and **`rows0 + rows1 <= 1024`** (`<= 64` total TGs).
-
-### Track D4 (`exp-d4-cuda-moe-fuse`, `ExpertD4CrossHwMoeFusion`) — Cross-Hardware MoE Subgraph Fusion (`TopKSoftmax`, `SplitGlu`, `MoeWeightedSum`) in CUDA & ROCm Planners
-- **Files**: `src/graph/cuda.rs`, `src/graph/rocm.rs`
-- **Design**:
-  - Mirror `Track M1`'s three generic MoE subgraph fusions (`TopKSoftmax`, `SplitGlu`, `MoeWeightedSum`) in `src/graph/cuda.rs` (`CudaStep` + `plan_graph` + NVRTC kernel sources) and `src/graph/rocm.rs` (`RocmStep` + `plan_graph` + HIPRTC kernel sources), and verify with `/opt/homebrew/opt/llvm/bin/clang -x cuda --cuda-gpu-arch=sm_80 -fsyntax-only` and `-x hip --offload-arch=gfx90a -fsyntax-only` plus unit tests in `cuda::tests` and `rocm::tests` that the 12-step MoE subgraph fuses to 5 steps on CUDA and ROCm just like Metal!
+- **Design**: Fuse single-reader `RmsNorm -> Add(res) -> Mul(scale)` into `down_proj` and `o_proj` using per-TG `scratch_partials[tg_id]` + `atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device)` (`-70` dispatches/tok on Gemma 4).
