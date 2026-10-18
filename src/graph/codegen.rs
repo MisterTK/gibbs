@@ -1504,7 +1504,7 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let codec_msl = device_msl(codec).replace("decode8", &dec);
     let r = p.rows_per_sg;
     let be = codec.block_elems;
-    let loop_src = gemv_loop(codec, p, &dec, "(ulong)(row0", true);
+    let loop_src = gemv_loop(codec, p, &dec, "(ulong)(row0", true, false);
     let store_row = |acc: &str, row: &str, ind: &str| {
         format!(
             "{ind}float a = {acc};\n{ind}if (p.has_bias != 0) a += bias[{row}];\n{ind}ulong o = (ulong)batch * p.rows + {row};\n{ind}y[o] = apply_gemv_epi(a, o, p, res);\n"
@@ -1600,7 +1600,14 @@ fn wide_msl(codec: &Codec, dec: &str, allow_tile: bool) -> String {
 
 /// The lane loop of [`gemv_packed`] / [`gemv_indexed`]: one 8-element sub-block per iteration (`decode8`), or,
 /// for a codec with a [`wide`] decode, one group of `segs` sub-blocks (its bytes are read once, not once per sub-block).
-fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile: bool) -> String {
+fn gemv_loop(
+    codec: &Codec,
+    p: GemvParams,
+    dec: &str,
+    row_base: &str,
+    allow_tile: bool,
+    use_shared_x: bool,
+) -> String {
     let (be, r) = (codec.block_elems, p.rows_per_sg);
     // `decode` gets the block's prefixes (`BlockRef::sub` for decode8, `group` for decode_group).
     let row = |i: usize, decode: &dyn Fn(&BlockRef) -> String, dots: &str, v_len: u32| {
@@ -1620,6 +1627,13 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile
             return tile_loop(codec, t, p, dec);
         }
     }
+    let x_vec4 = |off: &str| {
+        if use_shared_x {
+            format!("(p.cols <= 2816 ? *(threadgroup const float4*)(shared_x + {off}) : *(device const float4*)(xb + {off}))")
+        } else {
+            format!("*(device const float4*)(xb + {off})")
+        }
+    };
     let Some(wd) = wide(codec.format) else {
         let rows: String = (0..r)
             .map(|i| {
@@ -1631,18 +1645,22 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile
                 )
             })
             .collect();
+        let x0 = x_vec4("s * 8");
+        let x1 = x_vec4("s * 8 + 4");
         return format!(
-            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
+            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = {x0};\n        float4 x1 = {x1};\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
         );
     };
     let (gdec, gseg) = (
         dec.replace("decode8", "decode_group"),
         dec.replace("decode8", "group_seg"),
     );
+    let xs_e0 = x_vec4("e");
+    let xs_e1 = x_vec4("e + 4");
     let xs: String = (0..wd.segs)
         .map(|k| {
             format!(
-                "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = *(device const float4*)(xb + e); xs[{}] = *(device const float4*)(xb + e + 4); }}\n",
+                "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = {xs_e0}; xs[{}] = {xs_e1}; }}\n",
                 2 * k,
                 2 * k + 1
             )
@@ -1773,7 +1791,7 @@ pub fn gemv_indexed_for_dialect(dialect: Dialect, codec: &Codec, p: GemvParams) 
             .map(|i| format!("float acc{i} = 0.0f;"))
             .collect::<Vec<_>>()
             .join(" ");
-        let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
+        let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false, true);
         let sums: String = (0..r)
             .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
             .collect();
@@ -1803,22 +1821,32 @@ kernel void {name}(
     constant MoeGemvParams& p [[buffer(3)]],
     device const uint* ids [[buffer(4)]],
     uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
 ) {{
     const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint slot = tg.y;
-    if (row0 >= p.rows || slot >= p.slots) return;
+    if (slot >= p.slots) return;
     const uint expert = ids[slot];
     if (expert >= p.experts) {{
-        if (lane == 0) {{
+        if (row0 < p.rows && lane == 0) {{
             for (uint i = 0; i < {r}; i++) if (row0 + i < p.rows) y[(ulong)slot * p.rows + row0 + i] = 0.0f;
         }}
         return;
     }}
+    threadgroup float shared_x[2816];
+    device const float* xb_dev = x + (ulong)(p.x_per_slot != 0 ? slot : slot / p.top_k) * p.cols;
+    if (p.cols <= 2816) {{
+        for (uint i = tid; i < p.cols; i += 256) {{
+            shared_x[i] = xb_dev[i];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    if (row0 >= p.rows) return;
     const ulong bank_row = (ulong)expert * p.rows;
     const uint blocks_per_row = p.cols / {be};
-    device const float* xb = x + (ulong)(p.x_per_slot != 0 ? slot : slot / p.top_k) * p.cols;
+    device const float* xb = xb_dev;
     {acc_decl}
 {loop_src}{sums}    if (lane == 0) {{
 {store}    }}
