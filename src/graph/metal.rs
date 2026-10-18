@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 64] = [
+const BASE_KERNELS: [&str; 70] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -446,6 +446,12 @@ const BASE_KERNELS: [&str; 64] = [
     "gemv_q4_k",
     "gemv_q2_k",
     "gemv_iq3_s",
+    "gemv_q4_0_pair",
+    "gemv_q4_0_half_pair",
+    "gemv_q8_0_pair",
+    "gemv_bf16_pair",
+    "gemv_f16_pair",
+    "gemv_q4_k_pair",
     "gemm_batched_bf16_none",
     "gemm_batched_bf16_gelu",
     "gemm_batched_bf16_residual",
@@ -2257,31 +2263,41 @@ impl Session {
             }
         }
         for s in steps.iter_mut() {
-            let Step::GemvPacked {
-                m,
-                rows,
-                cols,
-                format,
-                variant,
-                ..
-            } = &mut s.op
-            else {
-                continue;
-            };
-            let allowed = format.gemv_variants();
-            *variant = if let Some(o) = self.variant_override {
-                if allowed.contains(&o) {
-                    o
-                } else {
-                    format.default_variant()
+            match &mut s.op {
+                Step::GemvPacked {
+                    m,
+                    rows,
+                    cols,
+                    format,
+                    variant,
+                    ..
+                } => {
+                    let allowed = format.gemv_variants();
+                    *variant = if let Some(o) = self.variant_override {
+                        if allowed.contains(&o) {
+                            o
+                        } else {
+                            format.default_variant()
+                        }
+                    } else if *m == 1 && tune::enabled() && allowed.len() > 1 {
+                        *chosen
+                            .entry((*format, *rows, *cols))
+                            .or_insert_with(|| self.rt.tuned_variant(*format, *rows, *cols))
+                    } else {
+                        format.default_variant()
+                    };
                 }
-            } else if *m == 1 && tune::enabled() && allowed.len() > 1 {
-                *chosen
-                    .entry((*format, *rows, *cols))
-                    .or_insert_with(|| self.rt.tuned_variant(*format, *rows, *cols))
-            } else {
-                format.default_variant()
-            };
+                Step::GemvPackedPair { format, legs, .. } => {
+                    let allowed = format.gemv_variants();
+                    let v = match self.variant_override {
+                        Some(o) if allowed.contains(&o) => o,
+                        _ => format.default_variant(),
+                    };
+                    legs[0].variant = v;
+                    legs[1].variant = v;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2410,6 +2426,10 @@ impl Session {
                 }
                 Step::GemvPacked { rows, cols, .. } => {
                     flops_per_run += 2 * (*rows as u64) * (*cols as u64);
+                }
+                Step::GemvPackedPair { cols, legs, .. } => {
+                    flops_per_run +=
+                        2 * ((legs[0].rows + legs[1].rows) as u64) * (*cols as u64);
                 }
                 _ => {}
             }
@@ -3171,6 +3191,106 @@ impl Session {
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
                     MTLSize::new(256, 1, 1),
                 );
+            }
+            Step::GemvPackedPair {
+                x,
+                m,
+                cols,
+                format,
+                ref legs,
+            } => {
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct PackedGemvParams(u32, u32, u32, u32, u32);
+                #[repr(C)]
+                struct PackedGemvPairParams {
+                    p0: PackedGemvParams,
+                    p1: PackedGemvParams,
+                    tgs0: u32,
+                    pad0: u32,
+                    pad1: u32,
+                    pad2: u32,
+                }
+                let pair_kernel = if m == 1
+                    && legs[0].variant.kernel == GemvKernel::Hand
+                    && legs[1].variant.kernel == GemvKernel::Hand
+                {
+                    match format {
+                        WeightFormat::Q4_0 if (cols & 1023) != 0 => Some("gemv_q4_0_half_pair"),
+                        WeightFormat::Q4_0 => Some("gemv_q4_0_pair"),
+                        WeightFormat::Q4_K => Some("gemv_q4_k_pair"),
+                        WeightFormat::Q8_0 => Some("gemv_q8_0_pair"),
+                        WeightFormat::BF16 => Some("gemv_bf16_pair"),
+                        WeightFormat::F16 => Some("gemv_f16_pair"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(kname) = pair_kernel {
+                    let l0 = &legs[0];
+                    let l1 = &legs[1];
+                    enc.set_compute_pipeline_state(rt.pso(kname)?);
+                    bind(0, l0.w);
+                    bind(1, l1.w);
+                    bind(2, x);
+                    bind(3, l0.out);
+                    bind(4, l1.out);
+                    let tgs0 = (l0.rows as u64).div_ceil(16);
+                    let tgs1 = (l1.rows as u64).div_ceil(16);
+                    let pp = PackedGemvPairParams {
+                        p0: PackedGemvParams(
+                            u32_of(l0.rows)?,
+                            u32_of(cols)?,
+                            u32_of(m)?,
+                            l0.bias.is_some() as u32,
+                            l0.epi.as_u32(),
+                        ),
+                        p1: PackedGemvParams(
+                            u32_of(l1.rows)?,
+                            u32_of(cols)?,
+                            u32_of(m)?,
+                            l1.bias.is_some() as u32,
+                            l1.epi.as_u32(),
+                        ),
+                        tgs0: u32_of(tgs0 as usize)?,
+                        pad0: 0,
+                        pad1: 0,
+                        pad2: 0,
+                    };
+                    set_bytes(enc, 5, &pp);
+                    bind(6, l0.bias.unwrap_or(l0.out));
+                    bind(7, l1.bias.unwrap_or(l1.out));
+                    bind(8, l0.res.unwrap_or(l0.out));
+                    bind(9, l1.res.unwrap_or(l1.out));
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(tgs0 + tgs1, m as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                } else {
+                    for leg in legs {
+                        let (pso, rows_per_tg) =
+                            self.gemv_pipeline(format, leg.variant, cols)?;
+                        enc.set_compute_pipeline_state(&pso);
+                        bind(0, leg.w);
+                        bind(1, x);
+                        bind(2, leg.out);
+                        let p = PackedGemvParams(
+                            u32_of(leg.rows)?,
+                            u32_of(cols)?,
+                            u32_of(m)?,
+                            leg.bias.is_some() as u32,
+                            leg.epi.as_u32(),
+                        );
+                        set_bytes(enc, 3, &p);
+                        bind(4, leg.bias.unwrap_or(leg.out));
+                        bind(5, leg.res.unwrap_or(leg.out));
+                        enc.dispatch_thread_groups(
+                            MTLSize::new((leg.rows as u64).div_ceil(rows_per_tg), m as u64, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                }
             }
             Step::GemmBatchedPacked {
                 x,
@@ -4014,6 +4134,13 @@ pub enum Step {
         /// Kernel variant, set by [`Session::prepare_plan`] from the tuner (or the format default).
         variant: GemvVariant,
     },
+    GemvPackedPair {
+        x: ValueId,
+        m: usize,
+        cols: usize,
+        format: WeightFormat,
+        legs: [GemvPairLeg; 2],
+    },
     GemmBatchedPacked {
         x: ValueId,
         w: ValueId,
@@ -4257,6 +4384,19 @@ pub struct NormSeg {
     pub has_rope: bool,
 }
 
+/// One projection leg of [`Step::GemvPackedPair`].
+#[derive(Debug, Clone)]
+pub struct GemvPairLeg {
+    pub w: ValueId,
+    pub weight_name: String,
+    pub bias: Option<ValueId>,
+    pub res: Option<ValueId>,
+    pub epi: Epi,
+    pub rows: usize,
+    pub out: ValueId,
+    pub variant: GemvVariant,
+}
+
 /// Merges runs (<= 4) of adjacent steps that are independent of each other into one dispatch:
 /// RmsNorm without a residual (any rows/d/eps) and Rope with identical geometry (any head count).
 /// A step joins a run only if it reads none of the run's outputs, so order is preserved and the
@@ -4269,6 +4409,52 @@ fn batch_horizontal(
         return steps;
     }
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
+    let mut grouped: Vec<Planned> = Vec::with_capacity(steps.len());
+    for step in steps {
+        if step.extra_outs.is_empty() {
+            if let Step::GemvPacked { x, m: 1, .. } = step.op {
+                let mut idx = grouped.len();
+                while idx > 0 {
+                    let prev = &grouped[idx - 1];
+                    let is_stateless_norm_or_rope = matches!(
+                        prev.op,
+                        Step::RmsNorm {
+                            res: None,
+                            scale: None,
+                            chain: None,
+                            ..
+                        } | Step::Rope { .. }
+                    );
+                    if !is_stateless_norm_or_rope {
+                        break;
+                    }
+                    let depends = step.reads.iter().any(|&r| {
+                        let rr = root(r);
+                        rr == root(prev.out) || prev.extra_outs.iter().any(|&eo| rr == root(eo))
+                    });
+                    if depends {
+                        break;
+                    }
+                    idx -= 1;
+                }
+                if idx < grouped.len() && idx > 0 {
+                    if matches!(
+                        grouped[idx - 1].op,
+                        Step::GemvPacked {
+                            x: prev_x,
+                            m: 1,
+                            ..
+                        } if prev_x == x
+                    ) {
+                        grouped.insert(idx, step);
+                        continue;
+                    }
+                }
+            }
+        }
+        grouped.push(step);
+    }
+    let steps = grouped;
     let joins = |run: &[Planned], next: &Planned| {
         let same_kind = match (&run[0].op, &next.op) {
             (
@@ -4513,7 +4699,140 @@ fn batch_horizontal(
             reads,
         });
     }
-    out
+    let can_pair = |a: &Planned, b: &Planned| -> bool {
+        if !a.extra_outs.is_empty() || !b.extra_outs.is_empty() {
+            return false;
+        }
+        let (
+            Step::GemvPacked {
+                x: x0,
+                m: 1,
+                rows: r0,
+                cols: c0,
+                format: f0,
+                ..
+            },
+            Step::GemvPacked {
+                x: x1,
+                m: 1,
+                rows: r1,
+                cols: c1,
+                format: f1,
+                ..
+            },
+        ) = (&a.op, &b.op)
+        else {
+            return false;
+        };
+        x0 == x1
+            && f0 == f1
+            && c0 == c1
+            && (r0 == r1 || (*r0 <= 1024 && *r1 <= 1024))
+            && matches!(
+                f0,
+                WeightFormat::Q4_0
+                    | WeightFormat::Q4_K
+                    | WeightFormat::Q8_0
+                    | WeightFormat::BF16
+                    | WeightFormat::F16
+            )
+            && !b.reads.iter().any(|&r| root(r) == root(a.out))
+    };
+    let same_rows = |a: &Planned, b: &Planned| -> bool {
+        matches!(
+            (&a.op, &b.op),
+            (
+                Step::GemvPacked { rows: r0, .. },
+                Step::GemvPacked { rows: r1, .. }
+            ) if r0 == r1
+        )
+    };
+    let mut paired: Vec<Planned> = Vec::with_capacity(out.len());
+    let mut i = 0;
+    while i < out.len() {
+        let defer_to_next = i + 2 < out.len()
+            && can_pair(&out[i], &out[i + 1])
+            && !same_rows(&out[i], &out[i + 1])
+            && can_pair(&out[i + 1], &out[i + 2])
+            && same_rows(&out[i + 1], &out[i + 2]);
+        if i + 1 < out.len() && !defer_to_next && can_pair(&out[i], &out[i + 1]) {
+            let s0 = out[i].clone();
+            let s1 = out[i + 1].clone();
+            let (
+                Step::GemvPacked {
+                    x,
+                    w: w0,
+                    weight_name: wn0,
+                    bias: bias0,
+                    res: res0,
+                    epi: epi0,
+                    m,
+                    rows: rows0,
+                    cols,
+                    format,
+                    variant: var0,
+                },
+                Step::GemvPacked {
+                    w: w1,
+                    weight_name: wn1,
+                    bias: bias1,
+                    res: res1,
+                    epi: epi1,
+                    rows: rows1,
+                    variant: var1,
+                    ..
+                },
+            ) = (s0.op, s1.op)
+            else {
+                unreachable!("checked by can_pair");
+            };
+            let mut reads = s0.reads;
+            for r in s1.reads {
+                if !reads.contains(&r) {
+                    reads.push(r);
+                }
+            }
+            paired.push(Planned {
+                name: format!("{}+{}", s0.name, s1.name),
+                op: Step::GemvPackedPair {
+                    x,
+                    m,
+                    cols,
+                    format,
+                    legs: [
+                        GemvPairLeg {
+                            w: w0,
+                            weight_name: wn0,
+                            bias: bias0,
+                            res: res0,
+                            epi: epi0,
+                            rows: rows0,
+                            out: s0.out,
+                            variant: var0,
+                        },
+                        GemvPairLeg {
+                            w: w1,
+                            weight_name: wn1,
+                            bias: bias1,
+                            res: res1,
+                            epi: epi1,
+                            rows: rows1,
+                            out: s1.out,
+                            variant: var1,
+                        },
+                    ],
+                },
+                out: s0.out,
+                extra_outs: vec![s1.out],
+                reads,
+            });
+            i += 2;
+        } else {
+            paired.push(out[i].clone());
+            i += 1;
+        }
+    }
+    paired
 }
 
 /// Lowers nodes to dispatches, validating ops and shapes. A Linear whose output has exactly one
@@ -5418,7 +5737,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .flatten()
             .collect(),
             // Built only by `batch_horizontal`, after `plan` has returned.
-            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } => {
+            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } | Step::GemvPackedPair { .. } => {
                 unreachable!("batch steps are created after plan()")
             }
             Step::MegakernelMlp {
@@ -7011,6 +7330,78 @@ mod tests {
                     err < 1e-4,
                     "{f:?} m={m} {v:?}: packed linear differs from CPU by {err}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn gemv_packed_pair_matches_cpu() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        for f in [QuantFormat::GGUF_Q4_0, QuantFormat::GGUF_Q4_K_M] {
+            for (rows0, rows1, cols) in [(512usize, 512usize, 1536usize), (256, 512, 512)] {
+                let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (f as u64) ^ (cols as u64);
+                let mut next = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u32
+                };
+                let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+                let scale_at: &[usize] = match f {
+                    QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                    _ => &[0],
+                };
+                let mut w = Weights::new();
+                let mut g = Graph::new();
+                let mut quant = |g: &mut Graph, w: &mut Weights, name: &str, n: usize, k: usize| {
+                    let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                        .map(|_| (next() >> 4) as u8)
+                        .collect();
+                    for blk in raw.chunks_exact_mut(bb) {
+                        for &o in scale_at {
+                            let exp = 9 + (next() % 14) as u16;
+                            let d =
+                                ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                            blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                        }
+                    }
+                    w.insert(
+                        name,
+                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.into(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    );
+                    g.weight(name, vec![n, k], DType::Quant(f))
+                };
+                let x = g.input("x", vec![1, cols], DType::F32);
+                let kw = quant(&mut g, &mut w, "k_w", rows0, cols);
+                let vw = quant(&mut g, &mut w, "v_w", rows1, cols);
+                let kb = g.weight("k_b", vec![rows0], DType::F32);
+                w.insert("k_b", Tensor::F32(rand(rows0, 11)));
+                let k_out = g.add("k_proj", Op::Linear, &[x, kw, kb], vec![1, rows0], DType::F32);
+                let v_out = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
+                g.output(k_out);
+                g.output(v_out);
+
+                let s = Session::new(rt(), &w).unwrap();
+                let plan = s.prepare_plan(&g).unwrap();
+                assert_eq!(plan.steps.len(), 1);
+                assert!(matches!(plan.steps[0].op, Step::GemvPackedPair { .. }));
+
+                let inp = vec![Tensor::F32(rand(cols, 42))];
+                let mut cs = StateStore::new();
+                let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
+                let got = s.run_prepared(&g, &plan, None, inp).unwrap();
+                for (i, (wt, gt)) in want.iter().zip(&got).enumerate() {
+                    let err = rel_err(wt.as_f32().unwrap(), gt.as_f32().unwrap());
+                    assert!(
+                        err < 1e-5,
+                        "{f:?} ({rows0},{rows1},{cols}) out {i}: err {err}"
+                    );
+                }
             }
         }
     }

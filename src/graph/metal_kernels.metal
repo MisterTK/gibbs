@@ -631,16 +631,24 @@ struct block_q4_0 {
     uint8_t qs[16];
 };
 
+struct PackedGemvPairParams {
+    PackedGemvParams p0;
+    PackedGemvParams p1;
+    uint tgs0;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
 
-kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
-                      device const float* x [[buffer(1)]],
-                      device float* y [[buffer(2)]],
-                      constant PackedGemvParams& p [[buffer(3)]],
-                      device const float* bias [[buffer(4)]],
-                      device const float* res [[buffer(5)]],
-                      uint2 tg [[threadgroup_position_in_grid]],
-                      uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
+inline void gemv_q4_0_body(device const block_q4_0* w,
+                           device const float* x,
+                           device float* y,
+                           constant PackedGemvParams& p,
+                           device const float* bias,
+                           device const float* res,
+                           uint2 tg,
+                           uint sg,
+                           uint lane) {
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -704,15 +712,47 @@ kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
     }
 }
 
-kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
-                           device const float* x [[buffer(1)]],
-                           device float* y [[buffer(2)]],
-                           constant PackedGemvParams& p [[buffer(3)]],
-                           device const float* bias [[buffer(4)]],
-                           device const float* res [[buffer(5)]],
+kernel void gemv_q4_0(device const block_q4_0* w [[buffer(0)]],
+                      device const float* x [[buffer(1)]],
+                      device float* y [[buffer(2)]],
+                      constant PackedGemvParams& p [[buffer(3)]],
+                      device const float* bias [[buffer(4)]],
+                      device const float* res [[buffer(5)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    gemv_q4_0_body(w, x, y, p, bias, res, tg, sg, lane);
+}
+
+kernel void gemv_q4_0_pair(device const block_q4_0* w0 [[buffer(0)]],
+                           device const block_q4_0* w1 [[buffer(1)]],
+                           device const float* x [[buffer(2)]],
+                           device float* y0 [[buffer(3)]],
+                           device float* y1 [[buffer(4)]],
+                           constant PackedGemvPairParams& pp [[buffer(5)]],
+                           device const float* bias0 [[buffer(6)]],
+                           device const float* bias1 [[buffer(7)]],
+                           device const float* res0 [[buffer(8)]],
+                           device const float* res1 [[buffer(9)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
+    if (tg.x < pp.tgs0) {
+        gemv_q4_0_body(w0, x, y0, pp.p0, bias0, res0, tg, sg, lane);
+    } else {
+        gemv_q4_0_body(w1, x, y1, pp.p1, bias1, res1, uint2(tg.x - pp.tgs0, tg.y), sg, lane);
+    }
+}
+
+inline void gemv_q4_0_half_body(device const block_q4_0* w,
+                                device const float* x,
+                                device float* y,
+                                constant PackedGemvParams& p,
+                                device const float* bias,
+                                device const float* res,
+                                uint2 tg,
+                                uint sg,
+                                uint lane) {
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -775,20 +815,52 @@ kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
     }
 }
 
+kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
+                           device const float* x [[buffer(1)]],
+                           device float* y [[buffer(2)]],
+                           constant PackedGemvParams& p [[buffer(3)]],
+                           device const float* bias [[buffer(4)]],
+                           device const float* res [[buffer(5)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    gemv_q4_0_half_body(w, x, y, p, bias, res, tg, sg, lane);
+}
+
+kernel void gemv_q4_0_half_pair(device const block_q4_0* w0 [[buffer(0)]],
+                                device const block_q4_0* w1 [[buffer(1)]],
+                                device const float* x [[buffer(2)]],
+                                device float* y0 [[buffer(3)]],
+                                device float* y1 [[buffer(4)]],
+                                constant PackedGemvPairParams& pp [[buffer(5)]],
+                                device const float* bias0 [[buffer(6)]],
+                                device const float* bias1 [[buffer(7)]],
+                                device const float* res0 [[buffer(8)]],
+                                device const float* res1 [[buffer(9)]],
+                                uint2 tg [[threadgroup_position_in_grid]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    if (tg.x < pp.tgs0) {
+        gemv_q4_0_half_body(w0, x, y0, pp.p0, bias0, res0, tg, sg, lane);
+    } else {
+        gemv_q4_0_half_body(w1, x, y1, pp.p1, bias1, res1, uint2(tg.x - pp.tgs0, tg.y), sg, lane);
+    }
+}
+
 struct block_q8_0 {
     half d;
     int8_t qs[32];
 };
 
-kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
-                      device const float* x [[buffer(1)]],
-                      device float* y [[buffer(2)]],
-                      constant PackedGemvParams& p [[buffer(3)]],
-                      device const float* bias [[buffer(4)]],
-                      device const float* res [[buffer(5)]],
-                      uint2 tg [[threadgroup_position_in_grid]],
-                      uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
+inline void gemv_q8_0_body(device const block_q8_0* w,
+                           device const float* x,
+                           device float* y,
+                           constant PackedGemvParams& p,
+                           device const float* bias,
+                           device const float* res,
+                           uint2 tg,
+                           uint sg,
+                           uint lane) {
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -834,7 +906,7 @@ kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
     }
 }
 
-kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
+kernel void gemv_q8_0(device const block_q8_0* w [[buffer(0)]],
                       device const float* x [[buffer(1)]],
                       device float* y [[buffer(2)]],
                       constant PackedGemvParams& p [[buffer(3)]],
@@ -843,6 +915,38 @@ kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
                       uint2 tg [[threadgroup_position_in_grid]],
                       uint sg [[simdgroup_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
+    gemv_q8_0_body(w, x, y, p, bias, res, tg, sg, lane);
+}
+
+kernel void gemv_q8_0_pair(device const block_q8_0* w0 [[buffer(0)]],
+                           device const block_q8_0* w1 [[buffer(1)]],
+                           device const float* x [[buffer(2)]],
+                           device float* y0 [[buffer(3)]],
+                           device float* y1 [[buffer(4)]],
+                           constant PackedGemvPairParams& pp [[buffer(5)]],
+                           device const float* bias0 [[buffer(6)]],
+                           device const float* bias1 [[buffer(7)]],
+                           device const float* res0 [[buffer(8)]],
+                           device const float* res1 [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    if (tg.x < pp.tgs0) {
+        gemv_q8_0_body(w0, x, y0, pp.p0, bias0, res0, tg, sg, lane);
+    } else {
+        gemv_q8_0_body(w1, x, y1, pp.p1, bias1, res1, uint2(tg.x - pp.tgs0, tg.y), sg, lane);
+    }
+}
+
+inline void gemv_bf16_body(device const ushort* w,
+                           device const float* x,
+                           device float* y,
+                           constant PackedGemvParams& p,
+                           device const float* bias,
+                           device const float* res,
+                           uint2 tg,
+                           uint sg,
+                           uint lane) {
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -903,15 +1007,47 @@ kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
     }
 }
 
-kernel void gemv_f16(device const half* w [[buffer(0)]],
-                     device const float* x [[buffer(1)]],
-                     device float* y [[buffer(2)]],
-                     constant PackedGemvParams& p [[buffer(3)]],
-                     device const float* bias [[buffer(4)]],
-                     device const float* res [[buffer(5)]],
-                     uint2 tg [[threadgroup_position_in_grid]],
-                     uint sg [[simdgroup_index_in_threadgroup]],
-                     uint lane [[thread_index_in_simdgroup]]) {
+kernel void gemv_bf16(device const ushort* w [[buffer(0)]],
+                      device const float* x [[buffer(1)]],
+                      device float* y [[buffer(2)]],
+                      constant PackedGemvParams& p [[buffer(3)]],
+                      device const float* bias [[buffer(4)]],
+                      device const float* res [[buffer(5)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    gemv_bf16_body(w, x, y, p, bias, res, tg, sg, lane);
+}
+
+kernel void gemv_bf16_pair(device const ushort* w0 [[buffer(0)]],
+                           device const ushort* w1 [[buffer(1)]],
+                           device const float* x [[buffer(2)]],
+                           device float* y0 [[buffer(3)]],
+                           device float* y1 [[buffer(4)]],
+                           constant PackedGemvPairParams& pp [[buffer(5)]],
+                           device const float* bias0 [[buffer(6)]],
+                           device const float* bias1 [[buffer(7)]],
+                           device const float* res0 [[buffer(8)]],
+                           device const float* res1 [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    if (tg.x < pp.tgs0) {
+        gemv_bf16_body(w0, x, y0, pp.p0, bias0, res0, tg, sg, lane);
+    } else {
+        gemv_bf16_body(w1, x, y1, pp.p1, bias1, res1, uint2(tg.x - pp.tgs0, tg.y), sg, lane);
+    }
+}
+
+inline void gemv_f16_body(device const half* w,
+                          device const float* x,
+                          device float* y,
+                          constant PackedGemvParams& p,
+                          device const float* bias,
+                          device const float* res,
+                          uint2 tg,
+                          uint sg,
+                          uint lane) {
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -962,6 +1098,38 @@ kernel void gemv_f16(device const half* w [[buffer(0)]],
             acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
             y[(ulong)batch * p.rows + row1] = acc1;
         }
+    }
+}
+
+kernel void gemv_f16(device const half* w [[buffer(0)]],
+                     device const float* x [[buffer(1)]],
+                     device float* y [[buffer(2)]],
+                     constant PackedGemvParams& p [[buffer(3)]],
+                     device const float* bias [[buffer(4)]],
+                     device const float* res [[buffer(5)]],
+                     uint2 tg [[threadgroup_position_in_grid]],
+                     uint sg [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    gemv_f16_body(w, x, y, p, bias, res, tg, sg, lane);
+}
+
+kernel void gemv_f16_pair(device const half* w0 [[buffer(0)]],
+                          device const half* w1 [[buffer(1)]],
+                          device const float* x [[buffer(2)]],
+                          device float* y0 [[buffer(3)]],
+                          device float* y1 [[buffer(4)]],
+                          constant PackedGemvPairParams& pp [[buffer(5)]],
+                          device const float* bias0 [[buffer(6)]],
+                          device const float* bias1 [[buffer(7)]],
+                          device const float* res0 [[buffer(8)]],
+                          device const float* res1 [[buffer(9)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    if (tg.x < pp.tgs0) {
+        gemv_f16_body(w0, x, y0, pp.p0, bias0, res0, tg, sg, lane);
+    } else {
+        gemv_f16_body(w1, x, y1, pp.p1, bias1, res1, uint2(tg.x - pp.tgs0, tg.y), sg, lane);
     }
 }
 
@@ -1301,15 +1469,15 @@ inline float2 k4_scale_min(uint j, device const uint8_t* s) {
     }
 }
 
-kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
-                      device const float* x [[buffer(1)]],
-                      device float* y [[buffer(2)]],
-                      constant PackedGemvParams& p [[buffer(3)]],
-                      device const float* bias [[buffer(4)]],
-                      device const float* res [[buffer(5)]],
-                      uint2 tg [[threadgroup_position_in_grid]],
-                      uint sg [[simdgroup_index_in_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
+inline void gemv_q4_k_body(device const block_q4_k* w,
+                           device const float* x,
+                           device float* y,
+                           constant PackedGemvParams& p,
+                           device const float* bias,
+                           device const float* res,
+                           uint2 tg,
+                           uint sg,
+                           uint lane) {
     uint row0 = tg.x * 16 + sg * 2;
     uint row1 = row0 + 1;
     uint batch = tg.y;
@@ -1378,6 +1546,38 @@ kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
             acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
             y[(ulong)batch * p.rows + row1] = acc1;
         }
+    }
+}
+
+kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
+                      device const float* x [[buffer(1)]],
+                      device float* y [[buffer(2)]],
+                      constant PackedGemvParams& p [[buffer(3)]],
+                      device const float* bias [[buffer(4)]],
+                      device const float* res [[buffer(5)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    gemv_q4_k_body(w, x, y, p, bias, res, tg, sg, lane);
+}
+
+kernel void gemv_q4_k_pair(device const block_q4_k* w0 [[buffer(0)]],
+                           device const block_q4_k* w1 [[buffer(1)]],
+                           device const float* x [[buffer(2)]],
+                           device float* y0 [[buffer(3)]],
+                           device float* y1 [[buffer(4)]],
+                           constant PackedGemvPairParams& pp [[buffer(5)]],
+                           device const float* bias0 [[buffer(6)]],
+                           device const float* bias1 [[buffer(7)]],
+                           device const float* res0 [[buffer(8)]],
+                           device const float* res1 [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    if (tg.x < pp.tgs0) {
+        gemv_q4_k_body(w0, x, y0, pp.p0, bias0, res0, tg, sg, lane);
+    } else {
+        gemv_q4_k_body(w1, x, y1, pp.p1, bias1, res1, uint2(tg.x - pp.tgs0, tg.y), sg, lane);
     }
 }
 
