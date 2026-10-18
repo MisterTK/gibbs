@@ -1493,6 +1493,22 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
     )
 }
 
+/// 32-sub-blocks-per-block (`subs = p.cols / 8`) indexed GEMV loop for `GGUF_IQ2_XXS`: every
+/// 256-element block has 32 8-element sub-blocks, so all 32 SIMD lanes stay active on any
+/// multiple of 256 columns while keeping only two `float4` input registers live per lane.
+fn iq2_xxs_indexed_loop(r: usize) -> String {
+    let rows: String = (0..r)
+        .map(|i| {
+            format!(
+                "        if (row0 + {i} < p.rows) {{\n            device const uchar* b = w + ((bank_row + row0 + {i}) * blocks_per_row + blk) * 66u;\n            float d = cd_f16(b);\n            device const uchar* q = b + 2u + 8u * ib;\n            uint aux1 = cd_u32(q + 4u);\n            float db = d * (0.5f + float(aux1 >> 28)) * 0.25f;\n            uint2 gw = as_type<uint2>(IQ2XXS_GRID[q[l]]);\n            float4 v0 = float4(as_type<uchar4>(gw.x));\n            float4 v1 = float4(as_type<uchar4>(gw.y));\n            uint sgn = KSIGNS_IQ2XS[(aux1 >> shift) & 127u];\n            float4 s0 = float4((sgn & 1u) ? -1.0f : 1.0f, (sgn & 2u) ? -1.0f : 1.0f, (sgn & 4u) ? -1.0f : 1.0f, (sgn & 8u) ? -1.0f : 1.0f);\n            float4 s1 = float4((sgn & 16u) ? -1.0f : 1.0f, (sgn & 32u) ? -1.0f : 1.0f, (sgn & 64u) ? -1.0f : 1.0f, (sgn & 128u) ? -1.0f : 1.0f);\n            acc{i} += db * (dot(v0 * s0, x0) + dot(v1 * s1, x1));\n        }}\n"
+            )
+        })
+        .collect();
+    format!(
+        "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = s >> 5;\n        const uint sub = s & 31u;\n        const uint ib = sub >> 2;\n        const uint l = sub & 3u;\n        const uint shift = 7u * l;\n{rows}    }}\n"
+    )
+}
+
 /// Name of the kernel [`gemv_indexed`] emits for `codec` with `p`.
 pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
     format!("gemvgen_{:?}_r{}_ix", codec.format, p.rows_per_sg)
@@ -1513,7 +1529,12 @@ pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
         .map(|i| format!("float acc{i} = 0.0f;"))
         .collect::<Vec<_>>()
         .join(" ");
-    let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
+    let is_iq2_xxs = codec.format == crate::hardware::QuantFormat::GGUF_IQ2_XXS;
+    let loop_src = if is_iq2_xxs {
+        iq2_xxs_indexed_loop(r)
+    } else {
+        gemv_loop(codec, p, &dec, "(bank_row + row0", false)
+    };
     let sums: String = (0..r)
         .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
         .collect();
@@ -1565,6 +1586,10 @@ kernel void {name}(
 }}
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
-        wide_msl = wide_msl(codec, &dec, false),
+        wide_msl = if is_iq2_xxs {
+            String::new()
+        } else {
+            wide_msl(codec, &dec, false)
+        },
     )
 }

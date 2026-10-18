@@ -991,6 +991,28 @@ mod tests {
     }
 
     #[test]
+    fn moe_linear_iq2_xxs_non_1024_aligned_cols_match_cpu() {
+        let (experts, top_k, rows) = (16, 8, 19);
+        let ids = vec![0, 2, 5, 7, 9, 11, 13, 15];
+        for (i, cols) in [768usize, 512].into_iter().enumerate() {
+            for x_rows in [1, top_k] {
+                let (want, got) = moe_both(
+                    Fmt::Q(Q::GGUF_IQ2_XXS),
+                    x_rows,
+                    cols,
+                    rows,
+                    experts,
+                    top_k,
+                    ids.clone(),
+                    70 + i as u64,
+                );
+                let err = rel_err(&want, &got);
+                assert!(err < 1e-5, "IQ2_XXS cols={cols} x_rows={x_rows}: {err}");
+            }
+        }
+    }
+
+    #[test]
     fn moe_linear_shapes_and_routing_match_cpu() {
         let mut s = 7u64;
         let mut route = |n: usize, experts: usize| -> Vec<u32> {
