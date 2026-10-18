@@ -156,7 +156,11 @@ fn translate_as_type(mut src: String) -> String {
     src
 }
 
-fn translate_codec_msl_to_c(msl: &str) -> String {
+/// Translates an MSL codec or epilogue snippet into the target C++/GPU compute dialect.
+pub fn translate_msl_to_c_dialect(msl: &str, dialect: Dialect) -> String {
+    if dialect == Dialect::Msl {
+        return msl.to_string();
+    }
     let s = msl
         .replace("#pragma clang fp contract(off)\n", "")
         .replace("#pragma clang fp contract(off)", "")
@@ -167,6 +171,10 @@ fn translate_codec_msl_to_c(msl: &str) -> String {
         .replace(
             "float(*(device const half*)p)",
             "__half2float(*(const __half*)p)",
+        )
+        .replace(
+            "float(*(device const half*)",
+            "__half2float(*(const __half*)",
         )
         .replace(
             "half d = *(device const half*)blk;",
@@ -181,54 +189,272 @@ fn translate_codec_msl_to_c(msl: &str) -> String {
         .replace("device const ushort*", "const unsigned short*")
         .replace("device const char*", "const signed char*")
         .replace("device const half*", "const __half*")
+        .replace("device const float*", "const float*")
         .replace("device const ", "const ")
+        .replace("device float*", "float*")
         .replace("thread float*", "float*")
         .replace("thread uint&", "unsigned int&")
         .replace("constant const ", "__device__ const ")
+        .replace("\nconstant char ", "\n__device__ const signed char ")
         .replace("\nconstant ", "\n__device__ const ")
+        .replace(", constant ", ", const ")
+        .replace("(constant ", "(const ")
         .replace("float4", "msl_float4")
-        .replace("inline ", "__device__ inline ");
+        .replace("static inline ", "static __device__ inline ")
+        .replace("inline ", "__device__ inline ")
+        .replace(
+            "static __device__ __device__ inline ",
+            "static __device__ inline ",
+        );
     translate_as_type(s)
 }
 
-fn dialect_preamble(dialect: Dialect) -> &'static str {
+/// Self-contained device prelude for CUDA and HIP translation units.
+pub fn c_dialect_prelude(dialect: Dialect) -> &'static str {
     match dialect {
         Dialect::Cuda => {
-            r#"#include <cuda_fp16.h>
+            r#"#ifndef GIBBS_C_DIALECT_PRELUDE
+#define GIBBS_C_DIALECT_PRELUDE
+#if __has_include(<cuda_fp16.h>)
+#include <cuda_fp16.h>
+#else
+#ifndef __global__
+#define __global__ __attribute__((global))
+#endif
+#ifndef __device__
+#define __device__ __attribute__((device))
+#endif
+#ifndef __shared__
+#define __shared__ __attribute__((shared))
+#endif
+#ifndef __constant__
+#define __constant__ __attribute__((constant))
+#endif
+struct dim3 { unsigned int x, y, z; };
+extern const __device__ dim3 blockIdx;
+extern const __device__ dim3 blockDim;
+extern const __device__ dim3 threadIdx;
+extern const __device__ dim3 gridDim;
+struct __half { unsigned short __x; __device__ inline operator float() const; };
+typedef __half half;
+__device__ inline float __uint_as_float(unsigned int u) { return __builtin_bit_cast(float, u); }
+__device__ inline unsigned int __float_as_uint(float f) { return __builtin_bit_cast(unsigned int, f); }
+__device__ inline float __half2float(__half h) {
+    unsigned int s = (unsigned int)(h.__x >> 15) & 1u;
+    unsigned int e = (unsigned int)(h.__x >> 10) & 0x1fu;
+    unsigned int m = (unsigned int)h.__x & 0x3ffu;
+    unsigned int bits = (e == 0u) ? (s << 31) : ((s << 31) | ((e + 112u) << 23) | (m << 13));
+    return __uint_as_float(bits);
+}
+__device__ inline __half::operator float() const { return __half2float(*this); }
+__device__ inline float __shfl_xor_sync(unsigned int, float v, int) { return v; }
+__device__ inline float fabs(float x) { return __builtin_fabsf(x); }
+__device__ inline float exp(float x) { return __builtin_expf(x); }
+__device__ inline float tanh(float x) { return __builtin_tanhf(x); }
+#endif
+#ifndef M_SQRT1_2_F
+#define M_SQRT1_2_F 0.7071067811865475244f
+#endif
+#define GIBBS_CAT2(a, b) a##b
+#define GIBBS_CAT(a, b) GIBBS_CAT2(a, b)
 typedef unsigned char uchar;
 typedef unsigned short ushort;
 typedef unsigned int uint;
 typedef unsigned long long ulong;
-template <typename T, typename U> __device__ inline T gibbs_bitcast(U u) { T t; __builtin_memcpy(&t, &u, sizeof(T)); return t; }
+struct msl_uchar4 {
+    unsigned char x, y, z, w;
+    __device__ inline msl_uchar4() : x(0), y(0), z(0), w(0) {}
+    __device__ inline explicit msl_uchar4(unsigned char s) : x(s), y(s), z(s), w(s) {}
+    __device__ inline msl_uchar4(unsigned char x_, unsigned char y_, unsigned char z_, unsigned char w_) : x(x_), y(y_), z(z_), w(w_) {}
+    __device__ inline unsigned char operator[](unsigned int i) const { return (&x)[i]; }
+};
+struct msl_ushort2 {
+    unsigned short x, y;
+    __device__ inline msl_ushort2() : x(0), y(0) {}
+    __device__ inline explicit msl_ushort2(unsigned short s) : x(s), y(s) {}
+    __device__ inline msl_ushort2(unsigned short x_, unsigned short y_) : x(x_), y(y_) {}
+    __device__ inline unsigned short operator[](unsigned int i) const { return (&x)[i]; }
+};
+struct msl_uint2 {
+    unsigned int x, y;
+    __device__ inline msl_uint2() : x(0), y(0) {}
+    __device__ inline explicit msl_uint2(unsigned int s) : x(s), y(s) {}
+    __device__ inline msl_uint2(unsigned int x_, unsigned int y_) : x(x_), y(y_) {}
+    __device__ inline unsigned int operator[](unsigned int i) const { return (&x)[i]; }
+};
+struct msl_uint4 {
+    unsigned int x, y, z, w;
+    __device__ inline msl_uint4() : x(0), y(0), z(0), w(0) {}
+    __device__ inline explicit msl_uint4(unsigned int s) : x(s), y(s), z(s), w(s) {}
+    __device__ inline msl_uint4(unsigned int x_, unsigned int y_, unsigned int z_, unsigned int w_) : x(x_), y(y_), z(z_), w(w_) {}
+    __device__ inline unsigned int operator[](unsigned int i) const { return (&x)[i]; }
+};
+#undef uchar4
+#define uchar4 msl_uchar4
+#undef ushort2
+#define ushort2 msl_ushort2
+#undef uint2
+#define uint2 msl_uint2
+#undef uint4
+#define uint4 msl_uint4
+typedef msl_uint2 packed_uint2;
+typedef msl_ushort2 packed_ushort2;
+template <typename T, typename U> __device__ inline T gibbs_bitcast(U u) { return __builtin_bit_cast(T, u); }
 struct msl_float4 {
     float x, y, z, w;
     __device__ inline msl_float4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
+    __device__ inline explicit msl_float4(float s) : x(s), y(s), z(s), w(s) {}
     __device__ inline msl_float4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
-    __device__ inline explicit msl_float4(uchar4 u) : x(float(u.x)), y(float(u.y)), z(float(u.z)), w(float(u.w)) {}
+    __device__ inline explicit msl_float4(msl_uchar4 u) : x(float(u.x)), y(float(u.y)), z(float(u.z)), w(float(u.w)) {}
     __device__ inline float operator[](unsigned int i) const { return (&x)[i]; }
+    __device__ inline msl_float4 operator+(msl_float4 o) const { return msl_float4(x + o.x, y + o.y, z + o.z, w + o.w); }
+    __device__ inline msl_float4& operator+=(msl_float4 o) { x += o.x; y += o.y; z += o.z; w += o.w; return *this; }
     __device__ inline msl_float4 operator-(float s) const { return msl_float4(x - s, y - s, z - s, w - s); }
     __device__ inline msl_float4 operator*(float s) const { return msl_float4(x * s, y * s, z * s, w * s); }
-};"#
+};
+__device__ inline msl_float4 make_float4(float x, float y, float z, float w) { return msl_float4(x, y, z, w); }
+__device__ inline float dot(msl_float4 a, msl_float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+static __device__ inline float erf_approx(float x) {
+    float z = fabs(x);
+    float t = 1.0f / (1.0f + 0.5f * z);
+    float poly = -z * z - 1.26551223f
+        + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f + t * (-0.18628806f
+        + t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f))))))));
+    float erfc_v = t * exp(poly);
+    return x >= 0.0f ? 1.0f - erfc_v : erfc_v - 1.0f;
+}
+#endif"#
         }
         Dialect::Hip => {
-            r#"#include <hip/hip_fp16.h>
+            r#"#ifndef GIBBS_C_DIALECT_PRELUDE
+#define GIBBS_C_DIALECT_PRELUDE
+#if __has_include(<hip/hip_fp16.h>)
+#include <hip/hip_fp16.h>
+#else
+#ifndef __global__
+#define __global__ __attribute__((global))
+#endif
+#ifndef __device__
+#define __device__ __attribute__((device))
+#endif
+#ifndef __shared__
+#define __shared__ __attribute__((shared))
+#endif
+#ifndef __constant__
+#define __constant__ __attribute__((constant))
+#endif
+struct dim3 { unsigned int x, y, z; };
+extern const __device__ dim3 blockIdx;
+extern const __device__ dim3 blockDim;
+extern const __device__ dim3 threadIdx;
+extern const __device__ dim3 gridDim;
+struct __half { unsigned short __x; __device__ inline operator float() const; };
+typedef __half half;
+__device__ inline float __uint_as_float(unsigned int u) { return __builtin_bit_cast(float, u); }
+__device__ inline unsigned int __float_as_uint(float f) { return __builtin_bit_cast(unsigned int, f); }
+__device__ inline float __half2float(__half h) {
+    unsigned int s = (unsigned int)(h.__x >> 15) & 1u;
+    unsigned int e = (unsigned int)(h.__x >> 10) & 0x1fu;
+    unsigned int m = (unsigned int)h.__x & 0x3ffu;
+    unsigned int bits = (e == 0u) ? (s << 31) : ((s << 31) | ((e + 112u) << 23) | (m << 13));
+    return __uint_as_float(bits);
+}
+__device__ inline __half::operator float() const { return __half2float(*this); }
+__device__ inline float __shfl_xor(float v, int, int = 64) { return v; }
+__device__ inline float fabs(float x) { return __builtin_fabsf(x); }
+__device__ inline float exp(float x) { return __builtin_expf(x); }
+__device__ inline float tanh(float x) { return __builtin_tanhf(x); }
+#endif
+#ifndef M_SQRT1_2_F
+#define M_SQRT1_2_F 0.7071067811865475244f
+#endif
+#define GIBBS_CAT2(a, b) a##b
+#define GIBBS_CAT(a, b) GIBBS_CAT2(a, b)
 typedef unsigned char uchar;
 typedef unsigned short ushort;
 typedef unsigned int uint;
 typedef unsigned long long ulong;
-template <typename T, typename U> __device__ inline T gibbs_bitcast(U u) { T t; __builtin_memcpy(&t, &u, sizeof(T)); return t; }
+struct msl_uchar4 {
+    unsigned char x, y, z, w;
+    __device__ inline msl_uchar4() : x(0), y(0), z(0), w(0) {}
+    __device__ inline explicit msl_uchar4(unsigned char s) : x(s), y(s), z(s), w(s) {}
+    __device__ inline msl_uchar4(unsigned char x_, unsigned char y_, unsigned char z_, unsigned char w_) : x(x_), y(y_), z(z_), w(w_) {}
+    __device__ inline unsigned char operator[](unsigned int i) const { return (&x)[i]; }
+};
+struct msl_ushort2 {
+    unsigned short x, y;
+    __device__ inline msl_ushort2() : x(0), y(0) {}
+    __device__ inline explicit msl_ushort2(unsigned short s) : x(s), y(s) {}
+    __device__ inline msl_ushort2(unsigned short x_, unsigned short y_) : x(x_), y(y_) {}
+    __device__ inline unsigned short operator[](unsigned int i) const { return (&x)[i]; }
+};
+struct msl_uint2 {
+    unsigned int x, y;
+    __device__ inline msl_uint2() : x(0), y(0) {}
+    __device__ inline explicit msl_uint2(unsigned int s) : x(s), y(s) {}
+    __device__ inline msl_uint2(unsigned int x_, unsigned int y_) : x(x_), y(y_) {}
+    __device__ inline unsigned int operator[](unsigned int i) const { return (&x)[i]; }
+};
+struct msl_uint4 {
+    unsigned int x, y, z, w;
+    __device__ inline msl_uint4() : x(0), y(0), z(0), w(0) {}
+    __device__ inline explicit msl_uint4(unsigned int s) : x(s), y(s), z(s), w(s) {}
+    __device__ inline msl_uint4(unsigned int x_, unsigned int y_, unsigned int z_, unsigned int w_) : x(x_), y(y_), z(z_), w(w_) {}
+    __device__ inline unsigned int operator[](unsigned int i) const { return (&x)[i]; }
+};
+#undef uchar4
+#define uchar4 msl_uchar4
+#undef ushort2
+#define ushort2 msl_ushort2
+#undef uint2
+#define uint2 msl_uint2
+#undef uint4
+#define uint4 msl_uint4
+typedef msl_uint2 packed_uint2;
+typedef msl_ushort2 packed_ushort2;
+template <typename T, typename U> __device__ inline T gibbs_bitcast(U u) { return __builtin_bit_cast(T, u); }
 struct msl_float4 {
     float x, y, z, w;
     __device__ inline msl_float4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
+    __device__ inline explicit msl_float4(float s) : x(s), y(s), z(s), w(s) {}
     __device__ inline msl_float4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
-    __device__ inline explicit msl_float4(uchar4 u) : x(float(u.x)), y(float(u.y)), z(float(u.z)), w(float(u.w)) {}
+    __device__ inline explicit msl_float4(msl_uchar4 u) : x(float(u.x)), y(float(u.y)), z(float(u.z)), w(float(u.w)) {}
     __device__ inline float operator[](unsigned int i) const { return (&x)[i]; }
+    __device__ inline msl_float4 operator+(msl_float4 o) const { return msl_float4(x + o.x, y + o.y, z + o.z, w + o.w); }
+    __device__ inline msl_float4& operator+=(msl_float4 o) { x += o.x; y += o.y; z += o.z; w += o.w; return *this; }
     __device__ inline msl_float4 operator-(float s) const { return msl_float4(x - s, y - s, z - s, w - s); }
     __device__ inline msl_float4 operator*(float s) const { return msl_float4(x * s, y * s, z * s, w * s); }
-};"#
+};
+__device__ inline msl_float4 make_float4(float x, float y, float z, float w) { return msl_float4(x, y, z, w); }
+__device__ inline float dot(msl_float4 a, msl_float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+static __device__ inline float erf_approx(float x) {
+    float z = fabs(x);
+    float t = 1.0f / (1.0f + 0.5f * z);
+    float poly = -z * z - 1.26551223f
+        + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f + t * (-0.18628806f
+        + t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f))))))));
+    float erfc_v = t * exp(poly);
+    return x >= 0.0f ? 1.0f - erfc_v : erfc_v - 1.0f;
+}
+#endif"#
         }
         Dialect::Msl => "",
     }
+}
+
+fn dialect_preamble(dialect: Dialect) -> &'static str {
+    c_dialect_prelude(dialect)
+}
+
+fn gemv_common_for_dialect(dialect: Dialect) -> String {
+    let common_msl = gemv_common(include_str!("metal_kernels.metal"));
+    if dialect == Dialect::Msl {
+        return common_msl.to_string();
+    }
+    format!(
+        "#ifndef GIBBS_GEMV_COMMON\n#define GIBBS_GEMV_COMMON\n{}\n#endif\n",
+        translate_msl_to_c_dialect(common_msl, dialect)
+    )
 }
 
 fn warp_reduce_sum(var: &str, dialect: Dialect, simd_width: usize, indent: &str) -> String {
@@ -395,6 +621,11 @@ kernel void multi_gemv_{format_str}_{n_weights}(
     )
 }
 
+/// Alias for [`multi_gemv`].
+pub fn gemv_multi(codec: &Codec, n_weights: usize, prologue: &str, epilogue: &str) -> String {
+    multi_gemv(codec, n_weights, prologue, epilogue)
+}
+
 /// Generates a dialect-parameterized GEMV kernel function from a codec, parameters, dialect,
 /// SIMD/warp width, prologue, and epilogue.
 pub fn gemv_for_dialect(
@@ -411,25 +642,37 @@ pub fn gemv_for_dialect(
     let simd_width = simd_width.max(1);
     let format_str = format!("{:?}", codec.format).to_lowercase();
     let prologue_expr = if prologue.is_empty() {
-        "x[col]"
+        "x[col]".to_string()
     } else {
-        prologue
+        translate_msl_to_c_dialect(prologue, dialect)
     };
     let epilogue_stmt = if epilogue.is_empty() {
-        "out[row] = sum;"
+        "out[row] = sum;".to_string()
     } else {
-        epilogue
+        translate_msl_to_c_dialect(epilogue, dialect)
     };
     let preamble = dialect_preamble(dialect);
-    let codec_c = translate_codec_msl_to_c(codec.msl);
+    let common_c = gemv_common_for_dialect(dialect);
+    let codec_c = translate_msl_to_c_dialect(codec.msl, dialect);
     let reduction = warp_reduce_sum("sum", dialect, simd_width, "    ");
 
     format!(
         r#"
 // Generated GEMV ({dialect:?}) for {format_str}
 {preamble}
+{common_c}
+#undef decode8
+#define decode8 decode8_{format_str}
+#ifndef GIBBS_DEC8_{format_str}
+#define GIBBS_DEC8_{format_str}
 {codec_c}
+#endif
 
+#ifdef GIBBS_KERN_gemv_{format_str}
+#undef gemv_{format_str}
+#define gemv_{format_str} GIBBS_CAT(gemv_{format_str}_v, __COUNTER__)
+#endif
+#define GIBBS_KERN_gemv_{format_str}
 extern "C" __global__ void gemv_{format_str}(const unsigned char* __restrict__ weights, const float* __restrict__ x, float* __restrict__ out, unsigned int rows, unsigned int cols, unsigned int block_elems, unsigned int block_bytes) {{
     unsigned int tg = blockIdx.x;
     unsigned int tid = threadIdx.x;
@@ -455,6 +698,10 @@ extern "C" __global__ void gemv_{format_str}(const unsigned char* __restrict__ w
     }}
 
 {reduction}    if (lane == 0) {{
+        const PackedGemvParams p = {{ rows, cols, 1u, 0u, 0u }};
+        const float* res = out;
+        (void)p;
+        (void)res;
         {epilogue_stmt}
     }}
 }}
@@ -462,6 +709,7 @@ extern "C" __global__ void gemv_{format_str}(const unsigned char* __restrict__ w
         dialect = dialect,
         format_str = format_str,
         preamble = preamble,
+        common_c = common_c,
         codec_c = codec_c,
         simd_width = simd_width,
         rows_per_sg = p.rows_per_sg,
@@ -486,29 +734,37 @@ pub fn multi_gemv_for_dialect(
     let simd_width = simd_width.max(1);
     let format_str = format!("{:?}", codec.format).to_lowercase();
     let prologue_expr = if prologue.is_empty() {
-        "x[col]"
+        "x[col]".to_string()
     } else {
-        prologue
+        translate_msl_to_c_dialect(prologue, dialect)
     };
-    let default_epi;
     let epilogue_stmt = if epilogue.is_empty() {
-        default_epi = format!(
-            "for (unsigned int w = 0; w < {n_weights}; w++) out[w * rows + row] = sum[w];"
-        );
-        default_epi.as_str()
+        format!("for (unsigned int w = 0; w < {n_weights}; w++) out[w * rows + row] = sum[w];")
     } else {
-        epilogue
+        translate_msl_to_c_dialect(epilogue, dialect)
     };
     let preamble = dialect_preamble(dialect);
-    let codec_c = translate_codec_msl_to_c(codec.msl);
+    let common_c = gemv_common_for_dialect(dialect);
+    let codec_c = translate_msl_to_c_dialect(codec.msl, dialect);
     let reduction_w = warp_reduce_sum("sum[w]", dialect, simd_width, "        ");
 
     format!(
         r#"
 // Generated Multi-GEMV ({dialect:?}, N={n_weights}) for {format_str}
 {preamble}
+{common_c}
+#undef decode8
+#define decode8 decode8_{format_str}
+#ifndef GIBBS_DEC8_{format_str}
+#define GIBBS_DEC8_{format_str}
 {codec_c}
+#endif
 
+#ifdef GIBBS_KERN_multi_gemv_{format_str}_{n_weights}
+#undef multi_gemv_{format_str}_{n_weights}
+#define multi_gemv_{format_str}_{n_weights} GIBBS_CAT(multi_gemv_{format_str}_{n_weights}_v, __COUNTER__)
+#endif
+#define GIBBS_KERN_multi_gemv_{format_str}_{n_weights}
 extern "C" __global__ void multi_gemv_{format_str}_{n_weights}(const unsigned char* __restrict__ weights, const float* __restrict__ x, float* __restrict__ out, unsigned int rows, unsigned int cols, unsigned int block_elems, unsigned int block_bytes) {{
     unsigned int tg = blockIdx.x;
     unsigned int tid = threadIdx.x;
@@ -540,6 +796,12 @@ extern "C" __global__ void multi_gemv_{format_str}_{n_weights}(const unsigned ch
 {reduction_w}    }}
 
     if (lane == 0) {{
+        const unsigned int N = {n_weights};
+        const PackedGemvParams p = {{ rows, cols, 1u, 0u, 0u }};
+        const float* res = out;
+        (void)N;
+        (void)p;
+        (void)res;
         {epilogue_stmt}
     }}
 }}
@@ -548,11 +810,50 @@ extern "C" __global__ void multi_gemv_{format_str}_{n_weights}(const unsigned ch
         n_weights = n_weights,
         format_str = format_str,
         preamble = preamble,
+        common_c = common_c,
         codec_c = codec_c,
         simd_width = simd_width,
         prologue_expr = prologue_expr,
         reduction_w = reduction_w,
         epilogue_stmt = epilogue_stmt,
+    )
+}
+
+/// Alias for [`multi_gemv_for_dialect`].
+pub fn gemv_multi_for_dialect(
+    codec: &Codec,
+    n_weights: usize,
+    dialect: Dialect,
+    simd_width: usize,
+    prologue: &str,
+    epilogue: &str,
+) -> String {
+    multi_gemv_for_dialect(codec, n_weights, dialect, simd_width, prologue, epilogue)
+}
+
+/// Emits a self-contained translation unit for `dialect` (prepending device prelude,
+/// `GEMV_COMMON` epilogue helpers translated to `dialect`, and the GEMV kernel).
+pub fn c_dialect_translation_unit(
+    codec: &Codec,
+    p: GemvParams,
+    dialect: Dialect,
+    prologue: &str,
+    epilogue: &str,
+) -> String {
+    if dialect == Dialect::Msl {
+        return format!(
+            "{}\n{}",
+            gemv_common(include_str!("metal_kernels.metal")),
+            gemv(codec, p, prologue, epilogue)
+        );
+    }
+    gemv_for_dialect(
+        codec,
+        p,
+        dialect,
+        dialect.simd_width(None),
+        prologue,
+        epilogue,
     )
 }
 
@@ -706,6 +1007,112 @@ mod tests {
             assert!(hip_multi.contains("__shfl_xor(sum[w], 32, 64);"));
         }
         assert!(checked >= 25);
+    }
+
+    #[test]
+    fn clang_compiles_cuda_and_hip_kernels_for_every_codec() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let clang_bin = if std::path::Path::new("/opt/homebrew/opt/llvm/bin/clang").exists() {
+            "/opt/homebrew/opt/llvm/bin/clang"
+        } else {
+            let ok = Command::new("clang")
+                .args([
+                    "-x",
+                    "cuda",
+                    "--cuda-device-only",
+                    "-nocudainc",
+                    "-nocudalib",
+                    "--cuda-gpu-arch=sm_80",
+                    "-fsyntax-only",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                return;
+            }
+            "clang"
+        };
+
+        let p = GemvParams::default();
+        for (dialect, simd_width, args) in [
+            (
+                Dialect::Cuda,
+                32usize,
+                &[
+                    "-x",
+                    "cuda",
+                    "--cuda-device-only",
+                    "-nocudainc",
+                    "-nocudalib",
+                    "--cuda-gpu-arch=sm_80",
+                    "-fsyntax-only",
+                    "-",
+                ][..],
+            ),
+            (
+                Dialect::Hip,
+                64usize,
+                &[
+                    "-x",
+                    "hip",
+                    "-nogpuinc",
+                    "-nogpulib",
+                    "--offload-arch=gfx90a",
+                    "-fsyntax-only",
+                    "-",
+                ][..],
+            ),
+        ] {
+            let mut tu = String::new();
+            for &fmt in QuantFormat::ALL {
+                if let Some(c) = codec(fmt) {
+                    tu.push_str(&c_dialect_translation_unit(c, p, dialect, "", ""));
+                }
+            }
+            tu.push_str(&gemv_multi_for_dialect(
+                &CODEC_Q4_0,
+                2,
+                dialect,
+                simd_width,
+                "x[col]",
+                "out[row] = gelu_erf(sum[0]) * gelu_tanh(sum[1]);",
+            ));
+            tu.push_str(&c_dialect_translation_unit(
+                &CODEC_Q4_0,
+                p,
+                dialect,
+                "x[col]",
+                "for (uint epi = 0; epi <= 7; ++epi) { PackedGemvParams ep = { rows, cols, 1u, 0u, epi }; sum = apply_gemv_epi(sum, (ulong)row, ep, res); } out[row] = sum + erf_approx(sum);",
+            ));
+
+            let mut child = Command::new(clang_bin)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn clang");
+            child
+                .stdin
+                .take()
+                .expect("clang stdin")
+                .write_all(tu.as_bytes())
+                .expect("write translation unit to clang stdin");
+            let out = child.wait_with_output().expect("wait clang");
+            assert!(
+                out.status.success(),
+                "clang {:?} syntax/typecheck failed:\n{}",
+                dialect,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
 

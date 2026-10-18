@@ -249,21 +249,76 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
     }
 }
 
-/// Synthesizes a CUDA C++ quantized GEMV kernel source for `format` and `p`.
+/// Compiles a CUDA C++ translation unit into PTX via runtime NVRTC (`libnvrtc`).
+pub fn compile_ptx(src: &str, name: &str) -> Result<Vec<u8>, String> {
+    let nvrtc = NVRTC.as_ref().ok_or_else(|| {
+        "NVRTC library (libnvrtc.so.1 / nvrtc.dll) is not available on this platform".to_string()
+    })?;
+    let c_src =
+        std::ffi::CString::new(src).map_err(|e| format!("NVRTC source contains NUL byte: {e}"))?;
+    let c_name =
+        std::ffi::CString::new(name).map_err(|e| format!("NVRTC name contains NUL byte: {e}"))?;
+    unsafe {
+        let mut prog: *mut c_void = std::ptr::null_mut();
+        let res = (nvrtc.nvrtc_create_program)(
+            &mut prog,
+            c_src.as_ptr(),
+            c_name.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        if res != CUDA_SUCCESS {
+            return Err(format!("nvrtcCreateProgram failed with error code {res}"));
+        }
+        let compile_res = (nvrtc.nvrtc_compile_program)(prog, 0, std::ptr::null());
+        if compile_res != CUDA_SUCCESS {
+            let _ = (nvrtc.nvrtc_destroy_program)(&mut prog);
+            return Err(format!(
+                "nvrtcCompileProgram({name}) failed with error code {compile_res}"
+            ));
+        }
+        let mut ptx_size = 0usize;
+        let size_res = (nvrtc.nvrtc_get_ptx_size)(prog, &mut ptx_size);
+        if size_res != CUDA_SUCCESS || ptx_size == 0 {
+            let _ = (nvrtc.nvrtc_destroy_program)(&mut prog);
+            return Err(format!("nvrtcGetPTXSize failed with error code {size_res}"));
+        }
+        let mut ptx = vec![0u8; ptx_size];
+        let get_res = (nvrtc.nvrtc_get_ptx)(prog, ptx.as_mut_ptr() as *mut c_char);
+        let _ = (nvrtc.nvrtc_destroy_program)(&mut prog);
+        if get_res != CUDA_SUCCESS {
+            return Err(format!("nvrtcGetPTX failed with error code {get_res}"));
+        }
+        Ok(ptx)
+    }
+}
+
+/// Synthesizes a self-contained CUDA C++ quantized GEMV translation unit for `format` and `p`.
 pub fn quant_gemv_kernel_source(
     format: crate::hardware::QuantFormat,
     p: crate::graph::codegen::GemvParams,
 ) -> Option<String> {
     let c = crate::graph::codec::codec(format)?;
-    Some(crate::graph::codegen::gemv_for_dialect(
+    Some(crate::graph::codegen::c_dialect_translation_unit(
         c,
         p,
         crate::graph::codegen::Dialect::Cuda,
-        32,
         "",
         "",
     ))
 }
+
+/// JIT-compiled CUDA quantized GEMV module and kernel function handle.
+pub struct CudaQuantGemv {
+    pub module: *mut c_void,
+    pub func: *mut c_void,
+    pub kernel_name: String,
+    pub ptx: Vec<u8>,
+}
+
+unsafe impl Send for CudaQuantGemv {}
+unsafe impl Sync for CudaQuantGemv {}
 
 /// CUDA session executing a graph program.
 pub struct CudaSession {
@@ -296,6 +351,51 @@ impl CudaSession {
 
     pub fn run(&self, _graph: &Graph, _inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         Err("CUDA execution graph compilation requires runtime NVRTC toolchain".to_string())
+    }
+
+    /// JIT-compiles a packed `Codec` quantized GEMV kernel via `c_dialect_translation_unit` and NVRTC.
+    pub fn compile_quant_gemv(
+        &mut self,
+        fmt: crate::hardware::QuantFormat,
+        p: crate::graph::codegen::GemvParams,
+    ) -> Result<CudaQuantGemv, String> {
+        let codec = crate::graph::codec::codec(fmt)
+            .ok_or_else(|| format!("no packed GPU codec registered for {fmt:?}"))?;
+        let src = crate::graph::codegen::c_dialect_translation_unit(
+            codec,
+            p,
+            crate::graph::codegen::Dialect::Cuda,
+            "",
+            "",
+        );
+        let format_str = format!("{:?}", codec.format).to_lowercase();
+        let kernel_name = format!("gemv_{format_str}");
+        let ptx = compile_ptx(&src, &kernel_name)?;
+        let driver = CUDA_DRIVER.as_ref().ok_or_else(|| {
+            "CUDA driver (libcuda.so.1 / nvcuda.dll) is not available on this platform".to_string()
+        })?;
+        unsafe {
+            let mut module: *mut c_void = std::ptr::null_mut();
+            let res = (driver.cu_module_load_data)(&mut module, ptx.as_ptr() as *const c_void);
+            if res != CUDA_SUCCESS {
+                return Err(format!("cuModuleLoadData failed with error code {res}"));
+            }
+            let c_func = std::ffi::CString::new(kernel_name.as_str())
+                .map_err(|e| format!("invalid kernel name: {e}"))?;
+            let mut func: *mut c_void = std::ptr::null_mut();
+            let res = (driver.cu_module_get_function)(&mut func, module, c_func.as_ptr());
+            if res != CUDA_SUCCESS {
+                return Err(format!(
+                    "cuModuleGetFunction({kernel_name}) failed with error code {res}"
+                ));
+            }
+            Ok(CudaQuantGemv {
+                module,
+                func,
+                kernel_name,
+                ptx,
+            })
+        }
     }
 }
 

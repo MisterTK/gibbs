@@ -110,6 +110,75 @@ static HIP_DRIVER: LazyLock<Option<HipFunctions>> = LazyLock::new(|| {
     None
 });
 
+/// Dynamically resolved function pointers from HIPRTC (`libhiprtc.so`).
+#[allow(dead_code)]
+struct HiprtcFunctions {
+    _lib: Library,
+    hiprtc_create_program: unsafe extern "C" fn(
+        prog: *mut *mut c_void,
+        src: *const c_char,
+        name: *const c_char,
+        num_headers: i32,
+        headers: *const *const c_char,
+        include_names: *const *const c_char,
+    ) -> HipResult,
+    hiprtc_compile_program: unsafe extern "C" fn(
+        prog: *mut c_void,
+        num_options: i32,
+        options: *const *const c_char,
+    ) -> HipResult,
+    hiprtc_get_code_size:
+        unsafe extern "C" fn(prog: *mut c_void, code_size_ret: *mut usize) -> HipResult,
+    hiprtc_get_code: unsafe extern "C" fn(prog: *mut c_void, code: *mut c_char) -> HipResult,
+    hiprtc_destroy_program: unsafe extern "C" fn(prog: *mut *mut c_void) -> HipResult,
+}
+
+#[allow(dead_code)]
+static HIPRTC: LazyLock<Option<HiprtcFunctions>> = LazyLock::new(|| {
+    let lib_names = if cfg!(target_os = "windows") {
+        &["hiprtc.dll"][..]
+    } else {
+        &["libhiprtc.so.6", "libhiprtc.so.5", "libhiprtc.so"][..]
+    };
+
+    for &name in lib_names {
+        if let Ok(lib) = unsafe { Library::new(name) } {
+            unsafe {
+                let hiprtc_create_program = match lib.get(b"hiprtcCreateProgram\0") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let hiprtc_compile_program = match lib.get(b"hiprtcCompileProgram\0") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let hiprtc_get_code_size = match lib.get(b"hiprtcGetCodeSize\0") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let hiprtc_get_code = match lib.get(b"hiprtcGetCode\0") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let hiprtc_destroy_program = match lib.get(b"hiprtcDestroyProgram\0") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                return Some(HiprtcFunctions {
+                    hiprtc_create_program: *hiprtc_create_program,
+                    hiprtc_compile_program: *hiprtc_compile_program,
+                    hiprtc_get_code_size: *hiprtc_get_code_size,
+                    hiprtc_get_code: *hiprtc_get_code,
+                    hiprtc_destroy_program: *hiprtc_destroy_program,
+                    _lib: lib,
+                });
+            }
+        }
+    }
+    None
+});
+
 /// Returns whether a functional ROCm / HIP driver and runtime are present on this system.
 pub fn is_available() -> bool {
     HIP_DRIVER.is_some()
@@ -136,21 +205,76 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
     }
 }
 
-/// Synthesizes a HIP C++ quantized GEMV kernel source for `format` and `p`.
+/// Compiles a HIP C++ translation unit into HSACO code object bytes via runtime HIPRTC (`libhiprtc`).
+pub fn compile_hsaco(src: &str, name: &str) -> Result<Vec<u8>, String> {
+    let hiprtc = HIPRTC.as_ref().ok_or_else(|| {
+        "HIPRTC library (libhiprtc.so / hiprtc.dll) is not available on this platform".to_string()
+    })?;
+    let c_src =
+        std::ffi::CString::new(src).map_err(|e| format!("HIPRTC source contains NUL byte: {e}"))?;
+    let c_name =
+        std::ffi::CString::new(name).map_err(|e| format!("HIPRTC name contains NUL byte: {e}"))?;
+    unsafe {
+        let mut prog: *mut c_void = std::ptr::null_mut();
+        let res = (hiprtc.hiprtc_create_program)(
+            &mut prog,
+            c_src.as_ptr(),
+            c_name.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        if res != HIP_SUCCESS {
+            return Err(format!("hiprtcCreateProgram failed with error code {res}"));
+        }
+        let compile_res = (hiprtc.hiprtc_compile_program)(prog, 0, std::ptr::null());
+        if compile_res != HIP_SUCCESS {
+            let _ = (hiprtc.hiprtc_destroy_program)(&mut prog);
+            return Err(format!(
+                "hiprtcCompileProgram({name}) failed with error code {compile_res}"
+            ));
+        }
+        let mut code_size = 0usize;
+        let size_res = (hiprtc.hiprtc_get_code_size)(prog, &mut code_size);
+        if size_res != HIP_SUCCESS || code_size == 0 {
+            let _ = (hiprtc.hiprtc_destroy_program)(&mut prog);
+            return Err(format!("hiprtcGetCodeSize failed with error code {size_res}"));
+        }
+        let mut hsaco = vec![0u8; code_size];
+        let get_res = (hiprtc.hiprtc_get_code)(prog, hsaco.as_mut_ptr() as *mut c_char);
+        let _ = (hiprtc.hiprtc_destroy_program)(&mut prog);
+        if get_res != HIP_SUCCESS {
+            return Err(format!("hiprtcGetCode failed with error code {get_res}"));
+        }
+        Ok(hsaco)
+    }
+}
+
+/// Synthesizes a self-contained HIP C++ quantized GEMV translation unit for `format` and `p`.
 pub fn quant_gemv_kernel_source(
     format: crate::hardware::QuantFormat,
     p: crate::graph::codegen::GemvParams,
 ) -> Option<String> {
     let c = crate::graph::codec::codec(format)?;
-    Some(crate::graph::codegen::gemv_for_dialect(
+    Some(crate::graph::codegen::c_dialect_translation_unit(
         c,
         p,
         crate::graph::codegen::Dialect::Hip,
-        64,
         "",
         "",
     ))
 }
+
+/// JIT-compiled ROCm/HIP quantized GEMV module and kernel function handle.
+pub struct RocmQuantGemv {
+    pub module: *mut c_void,
+    pub func: *mut c_void,
+    pub kernel_name: String,
+    pub hsaco: Vec<u8>,
+}
+
+unsafe impl Send for RocmQuantGemv {}
+unsafe impl Sync for RocmQuantGemv {}
 
 /// ROCm session executing a graph program.
 pub struct RocmSession {
@@ -183,6 +307,51 @@ impl RocmSession {
 
     pub fn run(&self, _graph: &Graph, _inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
         Err("ROCm execution graph compilation requires runtime HIPRTC toolchain".to_string())
+    }
+
+    /// JIT-compiles a packed `Codec` quantized GEMV kernel via `c_dialect_translation_unit` and HIPRTC.
+    pub fn compile_quant_gemv(
+        &mut self,
+        fmt: crate::hardware::QuantFormat,
+        p: crate::graph::codegen::GemvParams,
+    ) -> Result<RocmQuantGemv, String> {
+        let codec = crate::graph::codec::codec(fmt)
+            .ok_or_else(|| format!("no packed GPU codec registered for {fmt:?}"))?;
+        let src = crate::graph::codegen::c_dialect_translation_unit(
+            codec,
+            p,
+            crate::graph::codegen::Dialect::Hip,
+            "",
+            "",
+        );
+        let format_str = format!("{:?}", codec.format).to_lowercase();
+        let kernel_name = format!("gemv_{format_str}");
+        let hsaco = compile_hsaco(&src, &kernel_name)?;
+        let driver = HIP_DRIVER.as_ref().ok_or_else(|| {
+            "ROCm driver (libamdhip64.so) is not available on this platform".to_string()
+        })?;
+        unsafe {
+            let mut module: *mut c_void = std::ptr::null_mut();
+            let res = (driver.hip_module_load_data)(&mut module, hsaco.as_ptr() as *const c_void);
+            if res != HIP_SUCCESS {
+                return Err(format!("hipModuleLoadData failed with error code {res}"));
+            }
+            let c_func = std::ffi::CString::new(kernel_name.as_str())
+                .map_err(|e| format!("invalid kernel name: {e}"))?;
+            let mut func: *mut c_void = std::ptr::null_mut();
+            let res = (driver.hip_module_get_function)(&mut func, module, c_func.as_ptr());
+            if res != HIP_SUCCESS {
+                return Err(format!(
+                    "hipModuleGetFunction({kernel_name}) failed with error code {res}"
+                ));
+            }
+            Ok(RocmQuantGemv {
+                module,
+                func,
+                kernel_name,
+                hsaco,
+            })
+        }
     }
 }
 
