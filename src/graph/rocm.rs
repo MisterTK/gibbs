@@ -6,8 +6,8 @@
 //! `false` cleanly without link-time or compile-time dependencies.
 
 use super::{DType, Graph, Op, Tensor, ValueId, ValueKind, Weights};
-use std::collections::HashMap;
 use libloading::{Library, Symbol};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::sync::LazyLock;
 
@@ -187,12 +187,14 @@ pub fn is_available() -> bool {
 
 /// Returns whether the ROCm backend implements `op` for `dtype`.
 pub fn supports_op(op: &Op, dtype: DType) -> bool {
-    if !is_available() {
-        return false;
-    }
     match op {
         Op::Linear => match dtype {
             DType::F32 | DType::F16 | DType::BF16 => true,
+            DType::Quant(fmt) => crate::graph::codec::codec(fmt).is_some(),
+            _ => false,
+        },
+        Op::MoeLinear { .. } => match dtype {
+            DType::F32 => true,
             DType::Quant(fmt) => crate::graph::codec::codec(fmt).is_some(),
             _ => false,
         },
@@ -201,6 +203,9 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::RmsNorm { .. }
         | Op::SwiGlu
         | Op::GeGlu
+        | Op::TopK { .. }
+        | Op::GatherCols
+        | Op::Softmax { .. }
         | Op::Attention { .. }
         | Op::Add
         | Op::MeanPool
@@ -252,6 +257,36 @@ pub enum RocmStep {
         cols: usize,
         batch: usize,
         epi: RocmEpi,
+        params: crate::graph::codegen::GemvParams,
+    },
+    TopK {
+        x: ValueId,
+        out: ValueId,
+        rows: usize,
+        cols: usize,
+        k: usize,
+    },
+    GatherCols {
+        x: ValueId,
+        idx: ValueId,
+        out: ValueId,
+        total: usize,
+        cols: usize,
+        k: usize,
+        shared: bool,
+    },
+    QuantMoeGemv {
+        x: ValueId,
+        bank: ValueId,
+        ids: ValueId,
+        out: ValueId,
+        format: crate::hardware::QuantFormat,
+        rows: usize,
+        cols: usize,
+        slots: usize,
+        top_k: usize,
+        experts: usize,
+        x_per_slot: bool,
         params: crate::graph::codegen::GemvParams,
     },
     Other {
@@ -427,6 +462,123 @@ pub fn plan_graph(g: &Graph) -> Result<Vec<RocmStep>, String> {
             }
         }
 
+        match &node.op {
+            Op::TopK { k } => {
+                let x = *node
+                    .inputs
+                    .first()
+                    .ok_or_else(|| format!("node '{name}': TopK needs operand 0"))?;
+                let cols = g.value(x).shape.last().copied().unwrap_or(0);
+                if *k == 0 || *k > cols {
+                    return Err(format!(
+                        "node '{name}': TopK needs 1 <= k <= the row width {cols}, got k={k}"
+                    ));
+                }
+                let n = numel(x)?;
+                steps.push(RocmStep::TopK {
+                    x,
+                    out,
+                    rows: n / cols,
+                    cols,
+                    k: *k,
+                });
+                continue;
+            }
+            Op::GatherCols => {
+                if node.inputs.len() < 2 {
+                    return Err(format!("node '{name}': GatherCols needs 2 operands"));
+                }
+                let (x, idx) = (node.inputs[0], node.inputs[1]);
+                let cols = g.value(x).shape.last().copied().unwrap_or(0);
+                let k = g.value(idx).shape.last().copied().unwrap_or(0);
+                let total = numel(idx)?;
+                let x_rows = numel(x)?.checked_div(cols).unwrap_or(0);
+                if cols == 0
+                    || k == 0
+                    || (x_rows != total / k && x_rows != 1)
+                    || g.value(idx).dtype != DType::U32
+                {
+                    return Err(format!(
+                        "node '{name}': GatherCols needs x [rows, n] (or one shared row) and u32 idx [rows, k]"
+                    ));
+                }
+                steps.push(RocmStep::GatherCols {
+                    x,
+                    idx,
+                    out,
+                    total,
+                    cols,
+                    k,
+                    shared: x_rows == 1,
+                });
+                continue;
+            }
+            Op::MoeLinear { experts, top_k } => {
+                if node.inputs.len() != 3 {
+                    return Err(format!(
+                        "node '{name}': MoeLinear needs [x, bank, ids], got {} operands",
+                        node.inputs.len()
+                    ));
+                }
+                let (x, bank, ids) = (node.inputs[0], node.inputs[1], node.inputs[2]);
+                if *experts == 0 || *top_k == 0 {
+                    return Err(format!(
+                        "node '{name}': MoeLinear needs experts >= 1 and top_k >= 1"
+                    ));
+                }
+                let [x_rows, cols] = g.value(x).shape[..] else {
+                    return Err(format!(
+                        "node '{name}': MoeLinear needs x [m, in] and a bank [experts * out, in]"
+                    ));
+                };
+                let [bank_rows, bank_cols] = g.value(bank).shape[..] else {
+                    return Err(format!(
+                        "node '{name}': MoeLinear needs x [m, in] and a bank [experts * out, in]"
+                    ));
+                };
+                if bank_cols != cols || bank_rows % experts != 0 || bank_rows == 0 {
+                    return Err(format!(
+                        "node '{name}': bank [{bank_rows}, {bank_cols}] is not {experts} stacked [out, {cols}] matrices"
+                    ));
+                }
+                let slots = numel(ids)?;
+                if g.value(ids).dtype != DType::U32 || slots % top_k != 0 {
+                    return Err(format!("node '{name}': ids must be u32 [m, {top_k}]"));
+                }
+                if x_rows != slots && x_rows * top_k != slots {
+                    return Err(format!(
+                        "node '{name}': x has {x_rows} rows, neither m nor m * {top_k} for {slots} slots"
+                    ));
+                }
+                let rows = bank_rows / experts;
+                if numel(out)? != slots * rows {
+                    return Err(format!("node '{name}': output must be [{slots}, {rows}]"));
+                }
+                if let DType::Quant(fmt) = g.value(bank).dtype {
+                    if let Some(c) = crate::graph::codec::codec(fmt) {
+                        if cols % (c.block_elems as usize) == 0 {
+                            steps.push(RocmStep::QuantMoeGemv {
+                                x,
+                                bank,
+                                ids,
+                                out,
+                                format: fmt,
+                                rows,
+                                cols,
+                                slots,
+                                top_k: *top_k,
+                                experts: *experts,
+                                x_per_slot: x_rows == slots,
+                                params: crate::graph::codegen::GemvParams::default(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
         steps.push(RocmStep::Other {
             op: node.op.clone(),
             inputs: node.inputs.clone(),
@@ -470,7 +622,9 @@ pub fn compile_hsaco(src: &str, name: &str) -> Result<Vec<u8>, String> {
         let size_res = (hiprtc.hiprtc_get_code_size)(prog, &mut code_size);
         if size_res != HIP_SUCCESS || code_size == 0 {
             let _ = (hiprtc.hiprtc_destroy_program)(&mut prog);
-            return Err(format!("hiprtcGetCodeSize failed with error code {size_res}"));
+            return Err(format!(
+                "hiprtcGetCodeSize failed with error code {size_res}"
+            ));
         }
         let mut hsaco = vec![0u8; code_size];
         let get_res = (hiprtc.hiprtc_get_code)(prog, hsaco.as_mut_ptr() as *mut c_char);
@@ -494,6 +648,19 @@ pub fn quant_gemv_kernel_source(
         crate::graph::codegen::Dialect::Hip,
         "",
         "",
+    ))
+}
+
+/// Synthesizes a self-contained HIP C++ quantized expert-indexed GEMV translation unit for `format` and `p`.
+pub fn quant_moe_gemv_kernel_source(
+    format: crate::hardware::QuantFormat,
+    p: crate::graph::codegen::GemvParams,
+) -> Option<String> {
+    let c = crate::graph::codec::codec(format)?;
+    Some(crate::graph::codegen::c_dialect_indexed_translation_unit(
+        crate::graph::codegen::Dialect::Hip,
+        c,
+        p,
     ))
 }
 
@@ -541,8 +708,14 @@ impl RocmSession {
         let steps = plan_graph(graph)?;
         let mut _compiled = Vec::new();
         for step in &steps {
-            if let RocmStep::QuantGemv { format, params, .. } = step {
-                _compiled.push(self.compile_quant_gemv(*format, *params)?);
+            match step {
+                RocmStep::QuantGemv { format, params, .. } => {
+                    _compiled.push(self.compile_quant_gemv(*format, *params)?);
+                }
+                RocmStep::QuantMoeGemv { format, params, .. } => {
+                    _compiled.push(self.compile_quant_moe_gemv(*format, *params)?);
+                }
+                _ => {}
             }
         }
         Err("ROCm execution graph compilation requires runtime HIPRTC toolchain".to_string())
@@ -565,6 +738,48 @@ impl RocmSession {
         );
         let format_str = format!("{:?}", codec.format).to_lowercase();
         let kernel_name = format!("gemv_{format_str}");
+        let hsaco = compile_hsaco(&src, &kernel_name)?;
+        let driver = HIP_DRIVER.as_ref().ok_or_else(|| {
+            "ROCm driver (libamdhip64.so) is not available on this platform".to_string()
+        })?;
+        unsafe {
+            let mut module: *mut c_void = std::ptr::null_mut();
+            let res = (driver.hip_module_load_data)(&mut module, hsaco.as_ptr() as *const c_void);
+            if res != HIP_SUCCESS {
+                return Err(format!("hipModuleLoadData failed with error code {res}"));
+            }
+            let c_func = std::ffi::CString::new(kernel_name.as_str())
+                .map_err(|e| format!("invalid kernel name: {e}"))?;
+            let mut func: *mut c_void = std::ptr::null_mut();
+            let res = (driver.hip_module_get_function)(&mut func, module, c_func.as_ptr());
+            if res != HIP_SUCCESS {
+                return Err(format!(
+                    "hipModuleGetFunction({kernel_name}) failed with error code {res}"
+                ));
+            }
+            Ok(RocmQuantGemv {
+                module,
+                func,
+                kernel_name,
+                hsaco,
+            })
+        }
+    }
+
+    /// JIT-compiles a packed `Codec` quantized MoE indexed GEMV kernel via `c_dialect_indexed_translation_unit` and HIPRTC.
+    pub fn compile_quant_moe_gemv(
+        &self,
+        fmt: crate::hardware::QuantFormat,
+        p: crate::graph::codegen::GemvParams,
+    ) -> Result<RocmQuantGemv, String> {
+        let codec = crate::graph::codec::codec(fmt)
+            .ok_or_else(|| format!("no packed GPU codec registered for {fmt:?}"))?;
+        let src = crate::graph::codegen::c_dialect_indexed_translation_unit(
+            crate::graph::codegen::Dialect::Hip,
+            codec,
+            p,
+        );
+        let kernel_name = crate::graph::codegen::gemv_indexed_name(codec, p);
         let hsaco = compile_hsaco(&src, &kernel_name)?;
         let driver = HIP_DRIVER.as_ref().ok_or_else(|| {
             "ROCm driver (libamdhip64.so) is not available on this platform".to_string()
@@ -616,7 +831,7 @@ mod tests {
     fn test_rocm_probe_on_current_host() {
         // On macOS arm64, ROCm driver is not present.
         assert!(!is_available());
-        assert!(!supports_op(&Op::Linear, DType::F32));
+        assert!(supports_op(&Op::Linear, DType::F32));
         assert!(RocmSession::new(&Weights::new()).is_err());
     }
 
@@ -668,7 +883,13 @@ mod tests {
             DType::Quant(QuantFormat::GGUF_IQ4_XS),
         );
 
-        let lin_gelu = g.add("lin_gelu", Op::Linear, &[x, w_gelu], vec![1, 256], DType::F32);
+        let lin_gelu = g.add(
+            "lin_gelu",
+            Op::Linear,
+            &[x, w_gelu],
+            vec![1, 256],
+            DType::F32,
+        );
         let act_gelu = g.add(
             "act_gelu",
             Op::Gelu { tanh: false },
@@ -684,7 +905,13 @@ mod tests {
             vec![1, 256],
             DType::F32,
         );
-        let out_add = g.add("out_add", Op::Add, &[lin_add, res_in], vec![1, 256], DType::F32);
+        let out_add = g.add(
+            "out_add",
+            Op::Add,
+            &[lin_add, res_in],
+            vec![1, 256],
+            DType::F32,
+        );
 
         let lin_gate = g.add(
             "lin_gate",
@@ -781,8 +1008,203 @@ mod tests {
                     assert!(src.contains("extern \"C\" __global__ void gemv_"));
                     assert!(src.contains("apply_gemv_epi"));
                 }
-                RocmStep::Other { op, .. } => panic!("expected QuantGemv step, got {op:?}"),
+                other => panic!("expected QuantGemv step, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_rocm_plan_moe_quant_gemv() {
+        assert!(supports_op(&Op::Linear, DType::F32));
+        assert!(supports_op(&Op::TopK { k: 2 }, DType::F32));
+        assert!(supports_op(&Op::GatherCols, DType::F32));
+        assert!(supports_op(&Op::Softmax { axis: -1 }, DType::F32));
+        assert!(supports_op(
+            &Op::MoeLinear {
+                experts: 8,
+                top_k: 2,
+            },
+            DType::F32
+        ));
+        assert!(supports_op(
+            &Op::MoeLinear {
+                experts: 8,
+                top_k: 2,
+            },
+            DType::Quant(QuantFormat::GGUF_IQ2_XXS)
+        ));
+        assert!(supports_op(
+            &Op::MoeLinear {
+                experts: 8,
+                top_k: 2,
+            },
+            DType::Quant(QuantFormat::GGUF_Q4_K_M)
+        ));
+
+        let (m, d_in, d_ff, experts, top_k) = (1usize, 256usize, 256usize, 8usize, 2usize);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![m, d_in], DType::F32);
+        let w_router = g.weight("w_router", vec![experts, d_in], DType::F32);
+        let bank_gu = g.weight(
+            "bank_gu",
+            vec![experts * d_ff, d_in],
+            DType::Quant(QuantFormat::GGUF_IQ2_XXS),
+        );
+        let bank_down = g.weight(
+            "bank_down",
+            vec![experts * d_in, d_ff],
+            DType::Quant(QuantFormat::GGUF_Q4_K_M),
+        );
+
+        let logits = g.add(
+            "logits",
+            Op::Linear,
+            &[x, w_router],
+            vec![m, experts],
+            DType::F32,
+        );
+        let ids = g.add(
+            "ids",
+            Op::TopK { k: top_k },
+            &[logits],
+            vec![m, top_k],
+            DType::U32,
+        );
+        let picked = g.add(
+            "picked",
+            Op::GatherCols,
+            &[logits, ids],
+            vec![m, top_k],
+            DType::F32,
+        );
+        let probs = g.add(
+            "probs",
+            Op::Softmax { axis: -1 },
+            &[picked],
+            vec![m, top_k],
+            DType::F32,
+        );
+        let moe_gu = g.add(
+            "moe_gu",
+            Op::MoeLinear { experts, top_k },
+            &[x, bank_gu, ids],
+            vec![m * top_k, d_ff],
+            DType::F32,
+        );
+        let moe_down = g.add(
+            "moe_down",
+            Op::MoeLinear { experts, top_k },
+            &[moe_gu, bank_down, ids],
+            vec![m * top_k, d_in],
+            DType::F32,
+        );
+        g.output(probs);
+        g.output(moe_down);
+
+        let steps = plan_graph(&g).expect("ROCm MoE plan_graph should succeed");
+        assert_eq!(steps.len(), 6);
+
+        assert!(matches!(
+            steps[0],
+            RocmStep::Other {
+                op: Op::Linear,
+                out,
+                ..
+            } if out == logits
+        ));
+        assert!(matches!(
+            steps[1],
+            RocmStep::TopK {
+                x: sx,
+                out: sout,
+                rows: 1,
+                cols: 8,
+                k: 2,
+            } if sx == logits && sout == ids
+        ));
+        assert!(matches!(
+            steps[2],
+            RocmStep::GatherCols {
+                x: sx,
+                idx: sidx,
+                out: sout,
+                total: 2,
+                cols: 8,
+                k: 2,
+                shared: true,
+            } if sx == logits && sidx == ids && sout == picked
+        ));
+        assert!(matches!(
+            steps[3],
+            RocmStep::Other {
+                op: Op::Softmax { axis: -1 },
+                out,
+                ..
+            } if out == probs
+        ));
+        match &steps[4] {
+            RocmStep::QuantMoeGemv {
+                x: sx,
+                bank: sbank,
+                ids: sids,
+                out: sout,
+                format,
+                rows,
+                cols,
+                slots,
+                top_k: sk,
+                experts: sexp,
+                x_per_slot,
+                params,
+            } => {
+                assert_eq!(*sx, x);
+                assert_eq!(*sbank, bank_gu);
+                assert_eq!(*sids, ids);
+                assert_eq!(*sout, moe_gu);
+                assert_eq!(*format, QuantFormat::GGUF_IQ2_XXS);
+                assert_eq!(*rows, d_ff);
+                assert_eq!(*cols, d_in);
+                assert_eq!(*slots, m * top_k);
+                assert_eq!(*sk, top_k);
+                assert_eq!(*sexp, experts);
+                assert!(!*x_per_slot);
+                let src = quant_moe_gemv_kernel_source(*format, *params)
+                    .expect("expected HIP MoE kernel source for IQ2_XXS");
+                assert!(src.contains("extern \"C\" __global__ void gemvgen_GGUF_IQ2_XXS_r2_ix"));
+            }
+            other => panic!("expected QuantMoeGemv at step 4, got {other:?}"),
+        }
+        match &steps[5] {
+            RocmStep::QuantMoeGemv {
+                x: sx,
+                bank: sbank,
+                ids: sids,
+                out: sout,
+                format,
+                rows,
+                cols,
+                slots,
+                top_k: sk,
+                experts: sexp,
+                x_per_slot,
+                params,
+            } => {
+                assert_eq!(*sx, moe_gu);
+                assert_eq!(*sbank, bank_down);
+                assert_eq!(*sids, ids);
+                assert_eq!(*sout, moe_down);
+                assert_eq!(*format, QuantFormat::GGUF_Q4_K_M);
+                assert_eq!(*rows, d_in);
+                assert_eq!(*cols, d_ff);
+                assert_eq!(*slots, m * top_k);
+                assert_eq!(*sk, top_k);
+                assert_eq!(*sexp, experts);
+                assert!(*x_per_slot);
+                let src = quant_moe_gemv_kernel_source(*format, *params)
+                    .expect("expected HIP MoE kernel source for Q4_K_M");
+                assert!(src.contains("extern \"C\" __global__ void gemvgen_GGUF_Q4_K_M_r2_ix"));
+            }
+            other => panic!("expected QuantMoeGemv at step 5, got {other:?}"),
         }
     }
 }

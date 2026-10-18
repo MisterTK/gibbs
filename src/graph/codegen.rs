@@ -857,6 +857,22 @@ pub fn c_dialect_translation_unit(
     )
 }
 
+/// Emits a self-contained expert-indexed GEMV translation unit (`Op::MoeLinear`) for `dialect`.
+pub fn c_dialect_indexed_translation_unit(
+    dialect: Dialect,
+    codec: &Codec,
+    p: GemvParams,
+) -> String {
+    if dialect == Dialect::Msl {
+        return format!(
+            "{}\n{}",
+            gemv_common(include_str!("metal_kernels.metal")),
+            gemv_indexed(codec, p)
+        );
+    }
+    gemv_indexed_for_dialect(dialect, codec, p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +938,12 @@ mod tests {
                     multi_gemv_for_dialect(c, 2, Dialect::Msl, 32, "", ""),
                     multi_gemv(c, 2, "", ""),
                     "MSL Multi-GEMV mismatch for {:?}",
+                    fmt
+                );
+                assert_eq!(
+                    gemv_indexed_for_dialect(Dialect::Msl, c, p),
+                    gemv_indexed(c, p),
+                    "MSL Indexed GEMV mismatch for {:?}",
                     fmt
                 );
                 checked += 1;
@@ -1005,6 +1027,34 @@ mod tests {
             let hip_multi = multi_gemv_for_dialect(c, 2, Dialect::Hip, 64, "", "");
             assert!(hip_multi.contains("extern \"C\" __global__ void multi_gemv_"));
             assert!(hip_multi.contains("__shfl_xor(sum[w], 32, 64);"));
+
+            let cuda_ix = gemv_indexed_for_dialect(Dialect::Cuda, c, p);
+            assert!(cuda_ix.contains(&format!(
+                "extern \"C\" __global__ void {}",
+                gemv_indexed_name(c, p)
+            )));
+            assert!(cuda_ix.contains("__shfl_xor_sync(0xffffffffu, sum, 16);"));
+            for tok in forbidden {
+                assert!(
+                    !cuda_ix.contains(tok),
+                    "CUDA indexed kernel for {:?} contains leftover MSL token {tok:?}",
+                    fmt
+                );
+            }
+
+            let hip_ix = gemv_indexed_for_dialect(Dialect::Hip, c, p);
+            assert!(hip_ix.contains(&format!(
+                "extern \"C\" __global__ void {}",
+                gemv_indexed_name(c, p)
+            )));
+            assert!(hip_ix.contains("__shfl_xor(sum, 32, 64);"));
+            for tok in forbidden {
+                assert!(
+                    !hip_ix.contains(tok),
+                    "HIP indexed kernel for {:?} contains leftover MSL token {tok:?}",
+                    fmt
+                );
+            }
         }
         assert!(checked >= 25);
     }
@@ -1077,6 +1127,7 @@ mod tests {
                 if let Some(c) = codec(fmt) {
                     compiled_codecs += 1;
                     tu.push_str(&c_dialect_translation_unit(c, p, dialect, "", ""));
+                    tu.push_str(&c_dialect_indexed_translation_unit(dialect, c, p));
                 }
             }
             assert!(
@@ -1504,26 +1555,32 @@ pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
 /// slots, top_k, experts, x_per_slot}, ids`; grid `(ceil(rows / gemv_rows_per_tg), slots)` of 256
 /// threads. A slot whose id is not below `experts` writes zeros.
 pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
-    let name = gemv_indexed_name(codec, p);
-    let dec = format!("decode8_{:?}", codec.format);
-    let codec_msl = device_msl(codec).replace("decode8", &dec);
-    let r = p.rows_per_sg;
-    let be = codec.block_elems;
-    let acc_decl = (0..r)
-        .map(|i| format!("float acc{i} = 0.0f;"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
-    let sums: String = (0..r)
-        .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
-        .collect();
-    let store: String = (0..r)
-        .map(|i| {
-            format!("        if (row0 + {i} < p.rows) y[(ulong)slot * p.rows + row0 + {i}] = simd_sum_{i};\n")
-        })
-        .collect();
-    format!(
-        r#"
+    gemv_indexed_for_dialect(Dialect::Msl, codec, p)
+}
+
+/// Dialect-parameterized [`gemv_indexed`] kernel across `Dialect::Msl`, `Dialect::Cuda`, and `Dialect::Hip`.
+pub fn gemv_indexed_for_dialect(dialect: Dialect, codec: &Codec, p: GemvParams) -> String {
+    if dialect == Dialect::Msl {
+        let name = gemv_indexed_name(codec, p);
+        let dec = format!("decode8_{:?}", codec.format);
+        let codec_msl = device_msl(codec).replace("decode8", &dec);
+        let r = p.rows_per_sg;
+        let be = codec.block_elems;
+        let acc_decl = (0..r)
+            .map(|i| format!("float acc{i} = 0.0f;"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
+        let sums: String = (0..r)
+            .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
+            .collect();
+        let store: String = (0..r)
+            .map(|i| {
+                format!("        if (row0 + {i} < p.rows) y[(ulong)slot * p.rows + row0 + {i}] = simd_sum_{i};\n")
+            })
+            .collect();
+        return format!(
+            r#"
 {codec_msl}
 {wide_msl}
 
@@ -1564,7 +1621,96 @@ kernel void {name}(
 {store}    }}
 }}
 "#,
-        rows_per_tg = gemv_rows_per_tg(p),
-        wide_msl = wide_msl(codec, &dec, false),
+            rows_per_tg = gemv_rows_per_tg(p),
+            wide_msl = wide_msl(codec, &dec, false),
+        );
+    }
+
+    let simd_width = dialect.simd_width(None).max(1);
+    let name = gemv_indexed_name(codec, p);
+    let format_str = format!("{:?}", codec.format).to_lowercase();
+    let preamble = dialect_preamble(dialect);
+    let common_c = gemv_common_for_dialect(dialect);
+    let codec_c = translate_msl_to_c_dialect(codec.msl, dialect);
+    let r = p.rows_per_sg.max(1);
+    let rows_per_tg = gemv_rows_per_tg(p);
+    let be = codec.block_elems;
+    let bb = codec.block_bytes;
+    let reduction = warp_reduce_sum("sum", dialect, simd_width, "        ");
+
+    format!(
+        r#"
+// Generated Indexed GEMV ({dialect:?}) for {format_str}
+{preamble}
+{common_c}
+#undef decode8
+#define decode8 decode8_{format_str}
+#ifndef GIBBS_DEC8_{format_str}
+#define GIBBS_DEC8_{format_str}
+{codec_c}
+#endif
+
+#ifdef GIBBS_KERN_{name}
+#undef {name}
+#define {name} GIBBS_CAT({name}_v, __COUNTER__)
+#endif
+#define GIBBS_KERN_{name}
+extern "C" __global__ void {name}(const unsigned char* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, unsigned int p_rows, unsigned int p_cols, unsigned int p_slots, unsigned int p_top_k, unsigned int p_experts, unsigned int p_x_per_slot, const unsigned int* __restrict__ ids) {{
+    unsigned int tg = blockIdx.x;
+    unsigned int slot = blockIdx.y;
+    unsigned int tid = threadIdx.x;
+    unsigned int sg = tid / {simd_width};
+    unsigned int lane = tid % {simd_width};
+    unsigned int row0 = tg * {rows_per_tg} + sg * {r};
+    if (row0 >= p_rows || slot >= p_slots) return;
+    unsigned int expert = ids[slot];
+    if (expert >= p_experts) {{
+        if (lane == 0) {{
+            for (unsigned int i = 0; i < {r}; i++) {{
+                if (row0 + i < p_rows) y[(unsigned long long)slot * p_rows + row0 + i] = 0.0f;
+            }}
+        }}
+        return;
+    }}
+    unsigned long long bank_row = (unsigned long long)expert * p_rows;
+    unsigned int blocks_per_row = p_cols / {be};
+    const float* xb = x + (unsigned long long)(p_x_per_slot != 0 ? slot : slot / p_top_k) * p_cols;
+    float acc[{r}];
+    for (unsigned int i = 0; i < {r}; i++) acc[i] = 0.0f;
+    unsigned int num_sub = p_cols / 8;
+    for (unsigned int s = lane; s < num_sub; s += {simd_width}) {{
+        unsigned int blk_idx = (s * 8) / {be};
+        unsigned int sub_in_blk = ((s * 8) % {be}) / 8;
+        for (unsigned int r_i = 0; r_i < {r}; r_i++) {{
+            if (row0 + r_i < p_rows) {{
+                float dec8[8];
+                const unsigned char* blk = w + ((bank_row + row0 + r_i) * blocks_per_row + blk_idx) * {bb};
+                decode8(blk, sub_in_blk, dec8);
+                for (unsigned int i = 0; i < 8; i++) {{
+                    acc[r_i] += dec8[i] * xb[s * 8 + i];
+                }}
+            }}
+        }}
+    }}
+    for (unsigned int r_i = 0; r_i < {r}; r_i++) {{
+        float sum = acc[r_i];
+{reduction}        if (lane == 0 && row0 + r_i < p_rows) {{
+            y[(unsigned long long)slot * p_rows + row0 + r_i] = sum;
+        }}
+    }}
+}}
+"#,
+        dialect = dialect,
+        format_str = format_str,
+        preamble = preamble,
+        common_c = common_c,
+        codec_c = codec_c,
+        name = name,
+        simd_width = simd_width,
+        rows_per_tg = rows_per_tg,
+        r = r,
+        be = be,
+        bb = bb,
+        reduction = reduction,
     )
 }
