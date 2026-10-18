@@ -60,19 +60,21 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 7 Avant-Garde Priority Queue (Promoting `M4 + M1 + rsi-23`, `WIDE_IQ2_XXS` Shared-Memory `x` Broadcast, & Attention/DeltaNet `Gen(1)` Pairing)
+## 3. Wave 7 Avant-Garde Priority Queue (`IQ2_XXS` Indexed GEMV Bottleneck, Clean Standalone `M4 + M1` Verification, & Attention/DeltaNet `Gen(1)`/`BF16` Pairing)
 
-### 1. Promote Stacked `Track M4 + Track M1 + rsi-23` (`experiment/rsi-32-m4-m1` `d03ead3` + `2b7b6c8`) on a Quiet Host
-- **Staged Components**:
-  - **Track M4 (`41b39c9`, `experiment/rsi-32-m4-vec-wide-decode`)**: `packed_ushort4` / `packed_float4` vectorized `WIDE_Q4_0`, `WIDE_IQ4_NL`, and `WIDE_IQ2_XXS` `decode_group` (`moe_gemv_bandwidth`: `IQ4_NL 2816x704` `158.3 -> 181.2 GB/s`, `+14.5%`; `Q4_0 2816x704` `181.7 GB/s`; `IQ2_XXS 1408x2816` `143.8 -> 145.9 GB/s`; `Q4_0` `shape_rates` `gen/r1` beats `hand` across `(6144,1536)`, `(2048,1536)`, `(1536,2048)`, `(1536,2816)`, `(2816,768)`).
-  - **Track M1 (`68b1a41`)**: Fused MoE `TopKSoftmax` + `SplitGlu` + `MoeWeightedSum` (`-210` dispatches/tok on `Model 7`: `923 -> 713`). Together with `W1`/`M4`, verified in ultra-clean ABBA `bg_197` (`noise_pp = 0.037 pp`, `e2b_tok_s = 150.03 tok/s`, `Llama 1B Q4_0` `+2.02%`, `26B-A4B MoE` `+1.66%` at `71.65..72.1 tok/s`, `delta_pp = +0.253 pp`).
-  - **`rsi-23` (`2b7b6c8`)**: Zero-tax Qwen3.5 fusions (`-102` dispatches on `Qwen3.5 2B`, `-136` on `9B`), vectorized `gemv_iq4_xs`, pure-vec4 GQA split-K `NJ=4,8,16`, `gemv_q4_0_quarter`, and 2-CB `(16, usize::MAX)` pipeline for `96..220` steps (providing the additional `+0.60+ pp` suite uplift to clear `delta_pp >= max(0.30, noise_pp)`).
+### 1. Closed Lines (Do Not Revisit)
+- **`Track M3` / `Track M3-v2` (`Step::MoeWeightedSumNorm`)**: Both single-TG `M3` (`beafc9b`, `-1.9%` on `Model 7` due to single-TG `90 KB` read serialization) and race-free 11-TG `M3-v2` (`2f1a896`, `-13.8%` / `+1.86 ms/tok` on `Model 7` due to device-scope `memory_order_seq_cst` fences) regressed `Model 7`. Furthermore, `Track W2-v2` (`7c004af`, `-30` dispatches, `+0.25%` / `0.000 ms` GPU delta) proved that saving 30 dispatches on `Model 7` is worth `0 us`. Do not revisit `MoeWeightedSumNorm` or `ExpertGateUpGlu`.
 
-### 2. Track M5 (`exp-m5-iq2xxs-shared-x`: Cooperative `threadgroup float shared_x` in `gemv_indexed`)
+### 2. Track M5 (`exp-m5a-iq2xxs-tg-lut` & `exp-m5b-iq2xxs-direct-dot`: Attacking the `145.9 GB/s` `GGUF_IQ2_XXS 1408x2816` `ExpertLinear` Bottleneck)
 - **Empirical Bottleneck (`bg_200` `moe_gemv_bandwidth`)**:
-  - After `Track M4` lifted `expert_down` (`GGUF_IQ4_NL 2816x704`) to `181.2 GB/s` (`49.2 us`), `expert_gate_up` (`GGUF_IQ2_XXS 1408x2816`, `top_k=8, x_rows=1`) remains at `145.9 GB/s` (`56.1 us`).
-- **Design**:
-  - In `gemv_indexed` (`src/graph/codegen.rs`), all 8 simdgroups in a threadgroup share the exact same `xb` row (`slot` or `slot / top_k`). Stage `xb` in `2048`-float (`8 KB`, preserving `1024` max threads/TG = 100% occupancy) tiles in `threadgroup float shared_x[2048]` or preload `xs` across simdgroups, gated directly by `moe_gemv_bandwidth` on `GGUF_IQ2_XXS 1408x2816` and `GGUF_IQ4_NL 2816x704`.
+  - After `Track M4` lifted `expert_down` (`GGUF_IQ4_NL 2816x704`, `top_k=8, x_rows=8`) to **`181.2 GB/s` (`49.2 us`)**, `expert_gate_up` (`GGUF_IQ2_XXS 1408x2816`, `top_k=8, x_rows=1`) remains at **`145.9 GB/s` (`56.1 us`)** whereas `GGUF_IQ2_M 1408x2816` runs at **`171.7 GB/s` (`59.2 us`)** (`20%` more weight bytes in nearly the same `56–59 us` kernel time, proving `IQ2_XXS` is instruction / table-lookup / `x`-load bound, not DRAM bandwidth bound).
+  - Across 30 MoE layers (`60` `ExpertLinear` dispatches on `Model 7`, where `30` are `expert_gate_up` `IQ2_XXS 1408x2816`), `expert_gate_up` + `expert_down` account for **`~3.4–4.5 ms/token`** (`25–33%` of `Model 7`'s `13.58 ms` decode time).
+- **Two Orthogonal Designs to Test in Isolation**:
+  1. **`Track M5a` (`exp-m5a-iq2xxs-tg-lut`)**: In `WIDE_IQ2_XXS` (`src/graph/codec.rs`), each lane performs 4 divergent random lookups into `constant uint64_t IQ2XXS_GRID[256]` (`2 KB`) and `constant uchar KSIGNS_IQ2XS[128]` (`128 B`). On Apple GPUs, `constant` address space is a broadcast cache optimized for uniform SIMD-group addresses; 32 divergent lane indices serialize. Replace `KSIGNS_IQ2XS` table lookup with 3 ALU instructions computing the odd-parity 8th sign bit (`uint s7 = (aux1 >> (7 * k)) & 127u; uint p = s7 ^ (s7 >> 4); p ^= p >> 2; p ^= p >> 1; uint s = s7 | ((p & 1u) << 7);`), and in `gemv_indexed` (`src/graph/codegen.rs`) cooperatively stage `IQ2XXS_GRID` into 32-bank `threadgroup uint2 tg_iq2xxs_grid[256]` (`2 KB` threadgroup SRAM).
+  2. **`Track M5b` (`exp-m5b-iq2xxs-direct-dot`)**: In `gemv_indexed` (`src/graph/codegen.rs`), when `p.x_per_slot == 0 && p.cols <= 2816`, all 8 simdgroups (`256` threads) in a threadgroup read the exact same `xb` vector (`2816` floats = `11.0 KB <= 32 KB` threadgroup limit, preserving `1024` max threads/TG = 100% occupancy). Cooperatively load `xb[0..p.cols]` into `threadgroup float shared_x[2816]` once per threadgroup (eliminating 8x redundant global `xb` loads per TG and cross-lane `simd_shuffle` traffic).
 
-### 3. Track A6 (`exp-a6-kv-hoist-gen1-pair`: `GemvKernel::Gen { rows_per_sg: 1 }` & `BF16` Sibling Projection Pairing)
-- Extend `Step::GemvPackedPair` to support `Gen(1)` and `BF16` for adjacent sibling projections sharing `x` with `rows <= 512` (targeting `Qwen3.5 2B` DeltaNet `proj_b + proj_a` `16x2048` `BF16` and Full Attention `k_proj + v_proj` `512x2048`).
+### 3. Track A6 (`exp-a6-gen1-bf16-pair`: `GemvKernel::Gen { rows_per_sg: 1 }` & `BF16` Sibling Projection Pairing)
+- Extend standalone `Step::GemvPackedPair` (`experiment/rsi-27-a5v2-zero-tax-pair` `696810f`) to support `WeightFormat::BF16` (`gemv_bf16_pair`) and `GemvKernel::Gen { rows_per_sg: 1 }` for adjacent sibling projections sharing `x` with `rows <= 512` (targeting `Qwen3.5 2B` DeltaNet `proj_b + proj_a` `16x2048` `BF16` and Full Attention `k_proj + v_proj` `512x2048`).
+
+### 4. Standalone Verification Before Stacking
+- Clean poisoned `GGUF_Q4_0|2048|1536` `Gen(2)` entries from `~/.cache/gibbs/host/tune-Apple-M5-Pro-25G241.json`, pre-warm the tune cache on an idle GPU, and verify `M4 + M1` (+ `M5a`/`M5b` winner) standalone on `Models 0, 1, 2, 4, 7` before stacking with `rsi-23` (`2b7b6c8`).

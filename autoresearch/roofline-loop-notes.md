@@ -630,23 +630,37 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
 
 ## Wave 6 — Clean ABBA of `W1 + M1` (`bg_197`), Track M4 Vectorized `Wide` Decode (`+14.5%` `IQ4_NL` MoE GEMV), Isolated Track W2-v2 (`bg_201`), & Race-Free Multi-TG Track M3-v2 (`bg_202`)
 - **Reverting Unnecessary `moe_gemv_pso` Fast-Math Disable (`b3d6dd2`)**:
-  - Restored default `CompileOptions::new()` (fast-math enabled) in `moe_gemv_pso` (`src/graph/metal/ext/moe.rs`), which immediately lifted `moe_gemv_bandwidth` on `GGUF_IQ4_NL 2816x704` from `158.3 GB/s` (`56.3 us`) to **`169.7 GB/s` (`52.6 us`, `+7.2%`)** (`promote-w1-m1-base`).
+  - Restored default `CompileOptions::new()` in `moe_gemv_pso` (`src/graph/metal/ext/moe.rs`), returning `src/graph/metal/ext/moe.rs` to its pre-`8debfd4` state with no measured effect (`158.3 GB/s` in `moe-gemv-bw-r2` on `1a93e18` already had fast-math enabled prior to `8debfd4`, so the `158.3` vs `169.7 GB/s` difference on `0e282a5` was run-to-run / build variance).
 - **Ultra-Clean 4-Pass ABBA of `Track W1 + Track M1` Alone (`74c00eb`, `bg_197`)**:
   - `noise_pp = 0.037 pp`, `max base_spread = 0.0058` across all 9 models, `delta_pp = +0.253 pp` (`51.90% -> 52.16%`), `ratios_ok = true` (`min_ratio = 0.9925`):
     - `Model 0` (`Gemma 4 E2B QAT`): **`148.57 -> 150.03 tok/s` (`+0.98%`, `base_spread = 0.0030`)**
     - `Model 4` (`Llama 3.2 1B Q4_0`): **`251.36 -> 256.43 tok/s` (`+2.02%`, `base_spread = 0.0058`)**
     - `Model 7` (`Gemma 4 26B-A4B MoE`): **`70.47 -> 71.65 tok/s` (`+1.66%`, `base_spread = 0.00028`, `dispatches 923 -> 713`)**
     - `Model 8` (`E2B QAT ctx4k`): **`124.19 -> 124.91 tok/s` (`+0.58%`, `base_spread = 0.0034`)**
-  - Because `delta_pp = +0.253 pp < 0.30 pp` and untouched `Model 3` (`Qwen3.5-9B IQ2_M`) was `0.9925 < 0.995` (the alternate targeted-keep control floor), `74c00eb` was not promoted alone and remains staged on `experiment/rsi-31-w1-m1` to be stacked with `rsi-23` (`+0.80..+0.94 pp` suite delta).
+  - Why `74c00eb` missed both keep paths in §2.3:
+    1. Aggregate `delta_pp = +0.253 pp < 0.30 pp`.
+    2. Alternate targeted-keep path requires targeted models `>= +1.2%` and untouched controls `>= 0.995`: while `Model 4` (`+2.02%`) and `Model 7` (`+1.66%`) cleared `+1.2%`, `Model 0` (`E2B QAT`) was `+0.98%` (`< +1.2%`) and untouched `Model 3` (`Qwen3.5-9B IQ2_M`) was `0.9925` (`< 0.995`, `base_spread = 0.0028`).
+    3. Inspection of `~/.cache/gibbs/host/tune-Apple-M5-Pro-25G241.json` revealed why `Model 0` (`E2B QAT`) was only `+0.98%`: when `W1` (`hash = de19cee9ffcfa698`) and `M4` (`hash = fc235aa90db71dcd`) first tuned `GGUF_Q4_0|2048|1536` (`q_proj` across 35 layers of `E2B QAT`), a transient GPU blip during the single-round probe caused `tune.rs` to persist `Gen(2)` (`153.9` / `166.0 GB/s`, `10.66–11.50 us`) instead of `Gen(1)` (`201 GB/s`, `8.80 us` in `bg_200` `shape_rates`, costing `+65–94 us/tok` on `Model 0`!).
 - **Track M4 (`ExpertM4IndexedGemvBw`, `41b39c9` on `experiment/rsi-32-m4-vec-wide-decode`, stacked with `M1` at `d03ead3` on `experiment/rsi-32-m4-m1`)**:
   - Vectorized `WIDE_Q4_0` and `WIDE_IQ4_NL` using 2-byte-aligned `packed_ushort4` 64-bit loads + `uchar4` unpacks + 4-byte-aligned `packed_float4` stores, and replaced `WIDE_IQ2_XXS`'s scalar sign-bit ternary loop with branchless `select(g0, -g0, int4(...) < 0)` (`src/graph/codec.rs`).
   - Passed `codec_parity`, `gemv_matches_cpu_for_every_packed_format`, and `moe_linear_matches_cpu_for_every_format` (`bg_200`).
   - **`moe_gemv_bandwidth` (`bg_200`)**:
-    - `GGUF_IQ4_NL 2816x704 (top_k=8, x_rows=8)` (`Model 7` `expert_down`): **`169.7 -> 181.2 GB/s` (`52.6 -> 49.2 us`, `-3.4 us/layer` = `-102 us/tok` vs fast-math baseline, and `+14.5%` / `-7.1 us/layer` vs `158.3 GB/s`!)**.
+    - `GGUF_IQ4_NL 2816x704 (top_k=8, x_rows=8)` (`Model 7` `expert_down`): **`169.7 -> 181.2 GB/s` (`52.6 -> 49.2 us`, `+6.8%` / `-3.4 us/layer` vs `0e282a5`, and `+14.5%` vs `158.3 GB/s`)**.
     - `GGUF_Q4_0 2816x704 (top_k=8, x_rows=8)`: **`181.7 GB/s` (`49.1 us`)**.
     - `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)` (`Model 7` `expert_gate_up`): **`143.8 -> 145.9 GB/s` (`56.9 -> 56.1 us`)**.
   - **`SHAPE_RATES_FMT=Q4_0` (`bg_200`)**: `(2816, 768)` `gen/r1` jumped **`149 -> 156 GB/s` (beating `hand` `154 GB/s`)**, `(262144, 1536)` `gen/r2` jumped **`276 -> 282 GB/s`**, `(262144, 2816)` `gen/r2` **`281 GB/s` (beating `hand` `273 GB/s`)**.
-  - Lifted `Model 7` (`26B-A4B MoE`) in quiet 4-round screens `bg_201`/`bg_202` to **`71.8–72.1 tok/s` (`gpu_ms = 13.581–13.626 ms`)**. Full 9-model ABBA `bg_203` on `d03ead3` (`M4 + M1`) showed `+1.21%` on `Model 0` (`E2B QAT`) and `+1.78%` on `Model 7` (`26B-A4B`), but was hit mid-run by foreign GPU load on `Model 1` (`host_ms = 0.96 ms`) and `Model 6` (`base_spread = 0.199`, `host_ms = 1.45 ms`, `noise_pp = 1.10 pp`) -> classified as `inconclusive (contended)` (`--`) and staged on `experiment/rsi-32-m4-m1`.
+  - Lifted `Model 7` (`26B-A4B MoE`) in quiet 4-round screens `bg_201`/`bg_202` to **`71.8–72.1 tok/s` (`gpu_ms = 13.581–13.626 ms`)**.
+  - **Full 9-model ABBA `bg_203` on `d03ead3` (`M4 + M1`) per-model breakdown**:
+    - `Model 0` (`E2B QAT`): `1.0121` (`146.55 -> 148.32 tok/s`, `spread = 0.0081`)
+    - `Model 1` (`E2B Q4_K_M`): `0.9672` (`spread = 0.0007`; `base1 = 109.8`, `cand1 = 101.8 [host_ms = 0.96 ms spike]`, `cand2 = 110.4 [g = 8.76 ms, h = 0.30 ms]`, `base2 = 109.7`)
+    - `Model 2` (`Qwen3.5-2B`): `0.9819` (`spread = 0.0009`; `base1 = 111.4 [g = 8.71]`, `cand1 = 111.1 [g = 8.71]`, `cand2 = 107.4 [g = 8.90, h = 0.41 spike]`, `base2 = 111.3 [g = 8.72]`)
+    - `Model 3` (`Qwen3.5-9B IQ2_M`): `0.9985` (`spread = 0.0020`)
+    - `Model 4` (`Llama 1B Q4_0`): `1.0002` (`spread = 0.020`)
+    - `Model 5` (`SmolLM2`): `0.9844` (`spread = 0.013`)
+    - `Model 6` (`Llama 1B bnb`): `0.9503` (`spread = 0.199`, `host_ms = 1.45 ms`)
+    - `Model 7` (`26B-A4B MoE`): `1.0178` (`68.17 -> 69.39 tok/s`, `spread = 0.036`)
+    - `Model 8` (`E2B QAT ctx4k`): `1.0007` (`spread = 0.0062`)
+  - Because `bg_203` had candidate-pass spikes on `Model 1` (`cand1`) and `Model 2` (`cand2`), high contention on `Model 6` (`spread = 0.199`), and the poisoned `Gen(2)` tune cache entry on `GGUF_Q4_0|2048|1536`, `d03ead3` (`M4 + M1`) must pass a standalone screen/ABBA with a clean pre-warmed `tune-*.json` cache before any stacking with `rsi-23`.
 - **Track W2-v2 (`ExpertW2v2GateUpGluNoM3`, `7c004af` on `experiment/rsi-33-m4-m1-w2v2`): DISCARD (Perf-Neutral in Isolation)**:
   - Ported `Step::ExpertGateUpGlu` onto `M4 + M1` **without `M3`**, keeping `fast_math_enabled = true` (`CompileOptions::new()`) on both `moe_gemv_pso` and `moe_gemv_glu_pso` and clamping `tanh` input to `[-10.0f, 10.0f]` (`moe_subgraph_fusions_match_cpu` passed on `F32` and `IQ2_XXS + Q4_0` `m = 1, 24`).
   - 4-round isolated screen against `/tmp/gibbs-m4-m1` on `Model 7` (`bg_201`): `median_ratio = 1.0025` (`3/4` pairs `[0.959, 1.003, 1.002, 1.004]`, `72.1 -> 72.2 tok/s`, `gpu_ms: 13.581 -> 13.581 ms`, `dispatches: 713 -> 683`). Saving the `2 us` `SplitGlu` dispatch is perf-neutral (`+0.25% < +1.2%` screen bar); preserved on `experiment/rsi-33-m4-m1-w2v2`.
