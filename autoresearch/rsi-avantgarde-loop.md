@@ -60,19 +60,22 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 9 Avant-Garde Priority Queue (Promoting `experiment/rsi-40-w8-hardened` on a Quiet Host & Exploiting the `IQ2_XXS` `199.9 GB/s` Constant-Decode Ablation)
+## 3. Wave 9 Avant-Garde Priority Queue (Pre-Warming `fc235aa90db71dcd` & Re-Measuring `IQ2_XXS` Live-`q4` ALU Ablation Before Promoting `experiment/rsi-40-w8-hardened`)
 
-### 1. Immediate First Action — Single Quiet ABBA & Promotion of `experiment/rsi-40-w8-hardened` (`425f1e7`) Before Opening New Branches
-- **`experiment/rsi-40-w8-hardened` (`425f1e7`)** has already passed:
-  - `cargo test --release --test codec_parity` (`2 passed; 0 failed`, `bg_212`/`bg_214`),
-  - Full `scripts/loop_guard.sh` (`rc = 0`, `parity: 5 compared`, `min cos 1.00000`, `bg_215`),
-  - All Wave 8 unit tests (`graph::tune::tests`, `gemv_packed_pair_small_rows_matches_cpu`, `moe_subgraph_fusions_match_cpu`, `moe_linear_matches_cpu_for_every_format`, `moe_gemv_pipeline_max_threads_and_occupancy`, `bg_214`), and
-  - Re-tuned `GGUF_Q4_0|2048|1536|de19cee9ffcfa698` via the 2-round contention-proof tuner (`Track W8a` `2e80fee`) to `Gen(1)` (`202.44 GB/s`, `8.74 us`), achieving `ratio_ok = true` across all 8 models `Models 0..7` in `bg_215` (`M0 E2B QAT +2.89%`, `M1 E2B Q4_K_M +0.05%`, `M2 Qwen3.5-2B +1.06% [430->412 disp]`, `M3 Qwen3.5-9B +0.97% [594->570 disp]`, `M4 Llama 1B Q4_0 +1.74%`, `M5 SmolLM2 +4.04%`, `M7 26B-A4B MoE +1.30% [923->713 disp]`).
-- **Action**: Once desktop compositor / host load drops (`<= 20%` GPU, `host_ms <= 0.35 ms`), run a single quiet 4-pass ABBA (`scripts/verify_when_quiet.sh`) of `experiment/rsi-40-w8-hardened` (`425f1e7`) against `target/loop-base/gibbs` via `central_scheduler.py` and promote it to `main` + `target/loop-base/` before opening any new feature branches.
+### 1. Immediate First Action — Pre-Warm `fc235aa90db71dcd` (`2048|1536` and `2048|2048`) & Pass Quiet 4-Pass ABBA Before Promoting `experiment/rsi-40-w8-hardened` (`425f1e7`)
+- **`experiment/rsi-40-w8-hardened` (`425f1e7`) test coverage**:
+  - `cargo test --release --test codec_parity` (`2 passed; 0 failed`, `bg_212`/`bg_214`): note explicitly that `tests/codec_parity.rs` exercises `decode8` + `msl_prelude_compiles`, whereas `Wide` `decode_group` (`WIDE_Q4_0`, `WIDE_IQ4_NL`, `WIDE_IQ2_XXS`) is covered by `gemv_matches_cpu_for_every_packed_format` (dense) and `moe_linear_matches_cpu_for_every_format` (indexed), both of which passed on the assembled stack.
+  - Full `scripts/loop_guard.sh` (`rc = 0`, `parity: 5 compared`, `min cos 1.00000`, `bg_215`) and all Wave 8 unit tests (`graph::tune::tests`, `gemv_packed_pair_small_rows_matches_cpu`, `moe_subgraph_fusions_match_cpu`, `moe_linear_matches_cpu_for_every_format`, `moe_gemv_pipeline_max_threads_and_occupancy`, `bg_214`).
+- **Why `bg_215` did NOT confirm the `Gen(2)` poisoning hypothesis or clear promotion gates**:
+  - `experiment/rsi-40-w8-hardened` uses `M4`'s `GGUF_Q4_0` hash `fc235aa90db71dcd`, which still had only 8 entries in `tune-Apple-M5-Pro-25G241.json` (missing `2048|1536` and `2048|2048`) because `foreign_busy()` defaulted to `BUSY_PCT = 20` during `bg_215` and sent new `fc235aa90db71dcd` winners to `insert_contended`.
+  - In `bg_215`, the aggregate `delta_pp = +0.10 pp` (`noise_pp = 0.29 pp`, `ratios_ok = false` due to `M8` `cand1 = 94.8 tok/s` vs `cand2 = 112.7 tok/s`, and `M7` `gpu_ms = 15.45 ms` vs `base 15.09..15.78 ms` under load) did **not** clear `delta_pp >= max(0.30, noise_pp)` or the alternate control band (`M5 = 1.0404`, `M6 = 0.9893`).
+- **Promotion status & required action**:
+  - No performance code has been promoted to `main` yet; promotion requires pre-warming `fc235aa90db71dcd` (`2048|1536` and `2048|2048`) into `tune-Apple-M5-Pro-25G241.json` and passing a 4-pass ABBA with `ratios_ok == true` and `delta_pp >= max(0.30, noise_pp)` (or promoting individual tracks via the targeted-model rule with controls in `0.995..1.008`).
 
-### 2. Next Avant-Garde Track After Promoting `rsi-40`: Attacking the Proven `16.5 us` `IQ2XXS_GRID` Bottleneck (`bg_214`)
-- **Confirmed Ablation Evidence (`moe_gemv_iq2xxs_constant_decode_ablation` in `bg_214`)**:
-  - Across 3 interleaved ABBA rounds on `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)`, replacing `IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]` with a constant literal dropped kernel time from **`57.4 us` (`142.5 GB/s`) to `40.9 us` (`199.9 GB/s`, `-16.5 us/dispatch` = `-495 us/token` across 30 MoE layers on `Model 7`)**.
-  - Why `IQ2XXS_GRID` (`constant ulong IQ2XXS_GRID[256]`) costs `16.5 us` even though `tg_iq2xxs_grid[256]` (`Track M5a`) was neutral:
+### 2. Next Avant-Garde Track: Live-`q4` ALU Stub Re-Measurement & `IQ2XXS_GRID` Optimization (`bg_214`)
+- **Ablation Evidence (`moe_gemv_iq2xxs_constant_decode_ablation` in `bg_214`)**:
+  - Across 3 interleaved ABBA rounds on `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)`, replacing `IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]` with a constant literal dropped kernel time from `57.4 us` (`142.5 GB/s`) to `40.9 us` (`199.9 GB/s`) — labeled as **`ablation (not shippable; literal stub allowed DCE of q4): decode + lookup upper bound <= 16.5 us of 57.4 us`**.
+  - Wave 9 re-measures with a live-`q4` ALU stub (`0x08080808u ^ ((q4 >> (8*k)) & 0xFFu)`) to isolate the table-read cost without DCE.
+  - Why `IQ2XXS_GRID` (`constant ulong IQ2XXS_GRID[256]`) is targeted even though `tg_iq2xxs_grid[256]` (`Track M5a`) was neutral:
     - In `msl_prelude()`, `IQ2XXS_GRID` is a 256-entry `ulong` (`64`-bit) table (`2 KB`), and in `WIDE_IQ2_XXS` (`src/graph/codec.rs`), each group `g` unpacks `32` floats into `float out[33]` across `k = 0..4` before `gemv_loop` dots `out[0..31]` with `xs[0..7]`.
-    - Binding `IQ2XXS_GRID` as a `constant uint2*` buffer (`[[buffer(5)]]`, which uses Apple Silicon's hardware constant-buffer cache / preload engine rather than inline program-scope constant data) or fusing the dot product directly inside `decode_group` (so `g0`/`g1` never round-trip through `float v[33]`) can be tested directly against `moe_gemv_iq2xxs_constant_decode_ablation` (`57.4 us -> target <= 46 us`).
+    - Binding `IQ2XXS_GRID` as a `constant uint2*` buffer (`[[buffer(5)]]`, which uses Apple Silicon's hardware constant-buffer cache / preload engine rather than inline program-scope constant data) or fusing the dot product directly inside `decode_group` (so `g0`/`g1` never round-trip through `float v[33]`) can be evaluated once the live-`q4` ALU stub isolates the true non-DCE table-read cost.
