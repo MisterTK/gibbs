@@ -5,7 +5,8 @@
 //! hardware or drivers (such as macOS Apple Silicon hosts), `is_available()` returns
 //! `false` cleanly without link-time or compile-time dependencies.
 
-use super::{DType, Graph, Op, Tensor, Weights};
+use super::{DType, Graph, Op, Tensor, ValueId, ValueKind, Weights};
+use std::collections::HashMap;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_void};
 use std::sync::LazyLock;
@@ -190,7 +191,11 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         return false;
     }
     match op {
-        Op::Linear => matches!(dtype, DType::F32 | DType::F16 | DType::BF16),
+        Op::Linear => match dtype {
+            DType::F32 | DType::F16 | DType::BF16 => true,
+            DType::Quant(fmt) => crate::graph::codec::codec(fmt).is_some(),
+            _ => false,
+        },
         Op::Embedding => matches!(dtype, DType::F32 | DType::U32),
         Op::LayerNorm { .. }
         | Op::RmsNorm { .. }
@@ -203,6 +208,233 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         Op::Gelu { tanh } => !*tanh && dtype == DType::F32,
         _ => false,
     }
+}
+
+/// Epilogue fused into a packed quantized ROCm/HIP GEMV dispatch (`PackedGemvParams.epi`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RocmEpi {
+    None,
+    Gelu,
+    Residual,
+    Silu,
+    SwiGlu,
+    GeGlu,
+    UpSwiGlu,
+    UpGeGlu,
+}
+
+impl RocmEpi {
+    pub fn code(self) -> u32 {
+        match self {
+            RocmEpi::None => 0,
+            RocmEpi::Gelu => 1,
+            RocmEpi::Residual => 2,
+            RocmEpi::Silu => 3,
+            RocmEpi::SwiGlu => 4,
+            RocmEpi::GeGlu => 5,
+            RocmEpi::UpSwiGlu => 6,
+            RocmEpi::UpGeGlu => 7,
+        }
+    }
+}
+
+/// Planned execution step on the ROCm/HIP backend.
+#[derive(Debug, Clone)]
+pub enum RocmStep {
+    QuantGemv {
+        x: ValueId,
+        w: ValueId,
+        bias: Option<ValueId>,
+        res: Option<ValueId>,
+        out: ValueId,
+        format: crate::hardware::QuantFormat,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        epi: RocmEpi,
+        params: crate::graph::codegen::GemvParams,
+    },
+    Other {
+        op: Op,
+        inputs: Vec<ValueId>,
+        out: ValueId,
+    },
+}
+
+/// Lowers `g.nodes` into [`RocmStep`]s, fusing single-reader GELU, SiLU, residual Add,
+/// SwiGLU, and GeGLU epilogues into preceding packed quantized `Op::Linear` steps.
+pub fn plan_graph(g: &Graph) -> Result<Vec<RocmStep>, String> {
+    let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for &v in &n.inputs {
+            readers.entry(v).or_default().push(i);
+        }
+    }
+    let exists_before = |v: ValueId, i: usize| match &g.value(v).kind {
+        ValueKind::Input | ValueKind::Weight | ValueKind::State(_) => true,
+        ValueKind::Node(n) => (n.0 as usize) < i,
+    };
+    let numel = |v: ValueId| -> Result<usize, String> {
+        let s = &g.value(v).shape;
+        if s.is_empty() {
+            return Err(format!("value '{}' has unknown shape", g.value(v).name));
+        }
+        Ok(s.iter().product())
+    };
+
+    let mut fused = vec![false; g.nodes.len()];
+    let mut steps = Vec::with_capacity(g.nodes.len());
+
+    for (i, node) in g.nodes.iter().enumerate() {
+        if fused[i] {
+            continue;
+        }
+        let name = &node.name;
+        let mut out = *node
+            .outputs
+            .first()
+            .ok_or_else(|| format!("node '{name}' has no output"))?;
+
+        if node.op == Op::Linear && node.inputs.len() >= 2 {
+            let x = node.inputs[0];
+            let w = node.inputs[1];
+            let bias = node.inputs.get(2).copied();
+            if let DType::Quant(fmt) = g.value(w).dtype {
+                if let Some(c) = crate::graph::codec::codec(fmt) {
+                    let ws = &g.value(w).shape;
+                    let [rows, cols] = ws[..] else {
+                        return Err(format!(
+                            "node '{name}': weight shape {ws:?} is not [out, in]"
+                        ));
+                    };
+                    let xl = numel(x)?;
+                    if cols == 0 || xl % cols != 0 {
+                        return Err(format!(
+                            "node '{name}': x of {xl} elements does not match weight {ws:?}"
+                        ));
+                    }
+                    if let Some(b) = bias {
+                        if numel(b)? != rows {
+                            return Err(format!("node '{name}': bias is not [{rows}]"));
+                        }
+                    }
+                    let batch = xl / cols;
+                    if cols % (c.block_elems as usize) == 0 {
+                        let (mut epi, mut res) = (RocmEpi::None, None);
+                        if !g.outputs.contains(&out) {
+                            if let Some(&[j]) = readers.get(&out).map(Vec::as_slice) {
+                                if j > i && !fused[j] {
+                                    let consumer = &g.nodes[j];
+                                    match &consumer.op {
+                                        Op::Gelu { tanh: false }
+                                        | Op::Unary {
+                                            kind: super::UnaryKind::GeluErf,
+                                        } => {
+                                            epi = RocmEpi::Gelu;
+                                        }
+                                        Op::Silu
+                                        | Op::Unary {
+                                            kind: super::UnaryKind::Silu,
+                                        } => {
+                                            epi = RocmEpi::Silu;
+                                        }
+                                        Op::SwiGlu if consumer.inputs.len() == 2 => {
+                                            if consumer.inputs[0] == out {
+                                                let up = consumer.inputs[1];
+                                                if up != out
+                                                    && exists_before(up, i)
+                                                    && numel(up)? == batch * rows
+                                                {
+                                                    epi = RocmEpi::SwiGlu;
+                                                    res = Some(up);
+                                                }
+                                            } else if consumer.inputs[1] == out {
+                                                let gate = consumer.inputs[0];
+                                                if gate != out
+                                                    && exists_before(gate, i)
+                                                    && numel(gate)? == batch * rows
+                                                {
+                                                    epi = RocmEpi::UpSwiGlu;
+                                                    res = Some(gate);
+                                                }
+                                            }
+                                        }
+                                        Op::GeGlu if consumer.inputs.len() == 2 => {
+                                            if consumer.inputs[0] == out {
+                                                let up = consumer.inputs[1];
+                                                if up != out
+                                                    && exists_before(up, i)
+                                                    && numel(up)? == batch * rows
+                                                {
+                                                    epi = RocmEpi::GeGlu;
+                                                    res = Some(up);
+                                                }
+                                            } else if consumer.inputs[1] == out {
+                                                let gate = consumer.inputs[0];
+                                                if gate != out
+                                                    && exists_before(gate, i)
+                                                    && numel(gate)? == batch * rows
+                                                {
+                                                    epi = RocmEpi::UpGeGlu;
+                                                    res = Some(gate);
+                                                }
+                                            }
+                                        }
+                                        Op::Add
+                                        | Op::Binary {
+                                            kind: super::BinaryKind::Add,
+                                        } if consumer.inputs.len() == 2 => {
+                                            let r = if consumer.inputs[0] == out {
+                                                consumer.inputs[1]
+                                            } else {
+                                                consumer.inputs[0]
+                                            };
+                                            if r != out
+                                                && exists_before(r, i)
+                                                && numel(r)? == batch * rows
+                                            {
+                                                epi = RocmEpi::Residual;
+                                                res = Some(r);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if epi != RocmEpi::None {
+                                        fused[j] = true;
+                                        out = *consumer.outputs.first().ok_or_else(|| {
+                                            format!("node '{}' has no output", consumer.name)
+                                        })?;
+                                    }
+                                }
+                            }
+                        }
+                        steps.push(RocmStep::QuantGemv {
+                            x,
+                            w,
+                            bias,
+                            res,
+                            out,
+                            format: fmt,
+                            rows,
+                            cols,
+                            batch,
+                            epi,
+                            params: crate::graph::codegen::GemvParams::default(),
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
+
+        steps.push(RocmStep::Other {
+            op: node.op.clone(),
+            inputs: node.inputs.clone(),
+            out,
+        });
+    }
+
+    Ok(steps)
 }
 
 /// Compiles a HIP C++ translation unit into HSACO code object bytes via runtime HIPRTC (`libhiprtc`).
@@ -305,13 +537,20 @@ impl RocmSession {
         }
     }
 
-    pub fn run(&self, _graph: &Graph, _inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
+    pub fn run(&self, graph: &Graph, _inputs: Vec<Tensor>) -> Result<Vec<Tensor>, String> {
+        let steps = plan_graph(graph)?;
+        let mut _compiled = Vec::new();
+        for step in &steps {
+            if let RocmStep::QuantGemv { format, params, .. } = step {
+                _compiled.push(self.compile_quant_gemv(*format, *params)?);
+            }
+        }
         Err("ROCm execution graph compilation requires runtime HIPRTC toolchain".to_string())
     }
 
     /// JIT-compiles a packed `Codec` quantized GEMV kernel via `c_dialect_translation_unit` and HIPRTC.
     pub fn compile_quant_gemv(
-        &mut self,
+        &self,
         fmt: crate::hardware::QuantFormat,
         p: crate::graph::codegen::GemvParams,
     ) -> Result<RocmQuantGemv, String> {
@@ -400,5 +639,150 @@ mod tests {
             assert!(!src.contains("simd_sum("));
         }
         assert!(quant_gemv_kernel_source(QuantFormat::FP32, p).is_none());
+    }
+
+    #[test]
+    fn test_rocm_plan_quant_gemv_and_epilogue_fusion() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 256], DType::F32);
+        let res_in = g.input("res_in", vec![1, 256], DType::F32);
+        let up_in = g.input("up_in", vec![1, 256], DType::F32);
+        let w_gelu = g.weight(
+            "w_gelu",
+            vec![256, 256],
+            DType::Quant(QuantFormat::GGUF_Q4_K),
+        );
+        let w_add = g.weight(
+            "w_add",
+            vec![256, 256],
+            DType::Quant(QuantFormat::GGUF_IQ4_XS),
+        );
+        let w_gate = g.weight(
+            "w_gate",
+            vec![256, 256],
+            DType::Quant(QuantFormat::GGUF_Q4_K),
+        );
+        let w_up = g.weight(
+            "w_up",
+            vec![256, 256],
+            DType::Quant(QuantFormat::GGUF_IQ4_XS),
+        );
+
+        let lin_gelu = g.add("lin_gelu", Op::Linear, &[x, w_gelu], vec![1, 256], DType::F32);
+        let act_gelu = g.add(
+            "act_gelu",
+            Op::Gelu { tanh: false },
+            &[lin_gelu],
+            vec![1, 256],
+            DType::F32,
+        );
+
+        let lin_add = g.add(
+            "lin_add",
+            Op::Linear,
+            &[act_gelu, w_add],
+            vec![1, 256],
+            DType::F32,
+        );
+        let out_add = g.add("out_add", Op::Add, &[lin_add, res_in], vec![1, 256], DType::F32);
+
+        let lin_gate = g.add(
+            "lin_gate",
+            Op::Linear,
+            &[out_add, w_gate],
+            vec![1, 256],
+            DType::F32,
+        );
+        let out_swiglu = g.add(
+            "out_swiglu",
+            Op::SwiGlu,
+            &[lin_gate, up_in],
+            vec![1, 256],
+            DType::F32,
+        );
+
+        let gate2 = g.add(
+            "gate2",
+            Op::Linear,
+            &[out_swiglu, w_gate],
+            vec![1, 256],
+            DType::F32,
+        );
+        let up2 = g.add(
+            "up2",
+            Op::Linear,
+            &[out_swiglu, w_up],
+            vec![1, 256],
+            DType::F32,
+        );
+        let out_upswiglu = g.add(
+            "out_upswiglu",
+            Op::SwiGlu,
+            &[gate2, up2],
+            vec![1, 256],
+            DType::F32,
+        );
+        g.output(out_upswiglu);
+
+        let steps = plan_graph(&g).expect("plan_graph should succeed");
+        assert_eq!(steps.len(), 5);
+
+        let expected = [
+            (QuantFormat::GGUF_Q4_K, RocmEpi::Gelu, 1u32, None, act_gelu),
+            (
+                QuantFormat::GGUF_IQ4_XS,
+                RocmEpi::Residual,
+                2u32,
+                Some(res_in),
+                out_add,
+            ),
+            (
+                QuantFormat::GGUF_Q4_K,
+                RocmEpi::SwiGlu,
+                4u32,
+                Some(up_in),
+                out_swiglu,
+            ),
+            (QuantFormat::GGUF_Q4_K, RocmEpi::None, 0u32, None, gate2),
+            (
+                QuantFormat::GGUF_IQ4_XS,
+                RocmEpi::UpSwiGlu,
+                6u32,
+                Some(gate2),
+                out_upswiglu,
+            ),
+        ];
+
+        for (step, (exp_fmt, exp_epi, exp_code, exp_res, exp_out)) in
+            steps.iter().zip(expected.iter())
+        {
+            match step {
+                RocmStep::QuantGemv {
+                    format,
+                    rows,
+                    cols,
+                    batch,
+                    epi,
+                    res,
+                    out,
+                    params,
+                    ..
+                } => {
+                    assert_eq!(*format, *exp_fmt);
+                    assert_eq!(*rows, 256);
+                    assert_eq!(*cols, 256);
+                    assert_eq!(*batch, 1);
+                    assert_eq!(*epi, *exp_epi);
+                    assert_eq!(epi.code(), *exp_code);
+                    assert_eq!(*res, *exp_res);
+                    assert_eq!(*out, *exp_out);
+                    let src = quant_gemv_kernel_source(*format, *params)
+                        .expect("expected HIP kernel source");
+                    assert!(src.contains("extern \"C\" __global__ void gemv_"));
+                    assert!(src.contains("apply_gemv_epi"));
+                }
+                RocmStep::Other { op, .. } => panic!("expected QuantGemv step, got {op:?}"),
+            }
+        }
     }
 }

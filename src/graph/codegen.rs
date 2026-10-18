@@ -1035,6 +1035,7 @@ mod tests {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok {
+                eprintln!("SKIPPED clang_compiles_cuda_and_hip_kernels_for_every_codec: clang without CUDA/HIP target support");
                 return;
             }
             "clang"
@@ -1071,11 +1072,17 @@ mod tests {
             ),
         ] {
             let mut tu = String::new();
+            let mut compiled_codecs = 0usize;
             for &fmt in QuantFormat::ALL {
                 if let Some(c) = codec(fmt) {
+                    compiled_codecs += 1;
                     tu.push_str(&c_dialect_translation_unit(c, p, dialect, "", ""));
                 }
             }
+            assert!(
+                compiled_codecs >= 25,
+                "expected at least 25 codecs compiled, got {compiled_codecs}"
+            );
             tu.push_str(&gemv_multi_for_dialect(
                 &CODEC_Q4_0,
                 2,
@@ -1111,6 +1118,9 @@ mod tests {
                 "clang {:?} syntax/typecheck failed:\n{}",
                 dialect,
                 String::from_utf8_lossy(&out.stderr)
+            );
+            eprintln!(
+                "clang_compiles_cuda_and_hip_kernels_for_every_codec: {clang_bin} verified {compiled_codecs} codecs for {dialect:?}"
             );
         }
     }
