@@ -56,12 +56,10 @@ def measure_idle_floor(samples: int = 3, delay_s: float = 0.5) -> int:
     return min(vals) if vals else 100
 
 
-def compute_quiet_max(raw_floor: int) -> int:
-    effective_floor = min(raw_floor, COMPOSITOR_FLOOR_CAP)
-    return max(20, min(40, effective_floor + 5))
+def compute_quiet_max(_raw_floor: int | None = None) -> int:
+    return int(os.environ.get("QUIET_MAX_PCT", "20"))
 
-
-def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float]:
+def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float, bool]:
     t0 = time.time()
     ok = 0
     last = sample_gpu_util()
@@ -75,8 +73,7 @@ def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300)
         else:
             ok = 0
             time.sleep(2.0)
-    return last, round(time.time() - t0, 3)
-
+    return last, round(time.time() - t0, 3), (ok >= required_ok)
 
 def run_job(args: argparse.Namespace) -> int:
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -93,17 +90,32 @@ def run_job(args: argparse.Namespace) -> int:
         try:
             wait_s = round(time.time() - wait_t0, 3)
             raw_floor = measure_idle_floor(samples=args.floor_samples, delay_s=0.4)
-            quiet_max = compute_quiet_max(raw_floor)
+            quiet_max = int(os.environ.get("QUIET_MAX_PCT", str(args.quiet_max)))
             quiet_wait_s = 0.0
             if getattr(args, "quiet", False):
-                raw_floor, quiet_wait_s = wait_until_quiet(
+                raw_floor, quiet_wait_s, is_quiet = wait_until_quiet(
                     quiet_max=quiet_max,
                     required_ok=args.quiet_samples,
                     timeout_s=args.quiet_timeout,
                 )
-                quiet_max = compute_quiet_max(raw_floor)
+                if not is_quiet:
+                    fail_ev = {
+                        "ts": now_iso(),
+                        "event": "quiet_timeout",
+                        "label": args.label or " ".join(cmd[:3]),
+                        "cwd": cwd,
+                        "quiet_wait_s": quiet_wait_s,
+                        "gpu_raw_pct": raw_floor,
+                        "quiet_max_pct": quiet_max,
+                    }
+                    log_event(fail_ev)
+                    print(
+                        f"central_scheduler: GPU busy ({raw_floor}% > {quiet_max}%) after {quiet_wait_s}s; aborting",
+                        file=sys.stderr,
+                    )
+                    return 2
             env = dict(os.environ)
-            env.setdefault("QUIET_MAX_PCT", str(quiet_max))
+            env["QUIET_MAX_PCT"] = str(quiet_max)
             env.setdefault("GIBBS_TUNE_BUSY_PCT", str(quiet_max))
 
             start_ev = {
@@ -155,6 +167,7 @@ def main() -> int:
     p_run.add_argument("--label", default="", help="Job label for sched.log")
     p_run.add_argument("--floor-samples", type=int, default=2)
     p_run.add_argument("--quiet", action="store_true", help="Wait for quiet GPU before starting")
+    p_run.add_argument("--quiet-max", type=int, default=20, help="Max GPU utilization %% for --quiet (default 20)")
     p_run.add_argument("--quiet-samples", type=int, default=5)
     p_run.add_argument("--quiet-timeout", type=int, default=300)
     p_run.add_argument("cmd", nargs=argparse.REMAINDER)
