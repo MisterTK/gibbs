@@ -1362,6 +1362,7 @@ mod tests {
             (Q::GGUF_IQ2_XXS, 1408usize, 2816usize, 1usize),
             (Q::GGUF_IQ2_M, 1408, 2816, 1),
             (Q::GGUF_IQ4_NL, 2816, 704, 8),
+            (Q::GGUF_Q4_0, 2816, 704, 8),
         ] {
             let c = crate::graph::codec::codec(f).unwrap();
             let (dt, bank) = weight(Fmt::Q(f), experts * rows, cols, 1);
