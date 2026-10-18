@@ -655,6 +655,108 @@ kernel void moe_weighted_sum_f32(device const float* down [[buffer(0)]],
     out[idx] = sum;
 }
 
+struct MoeWeightedSumNormParams {
+    uint n;
+    uint k;
+    uint h;
+    uint num_tgs;
+    float eps;
+    uint has_res;
+    uint has_scale;
+};
+
+kernel void moe_weighted_sum_rmsnorm_f32(device const float* down [[buffer(0)]],
+                                         device const float* weights [[buffer(1)]],
+                                         device const float* gamma [[buffer(2)]],
+                                         device const float* res [[buffer(3)]],
+                                         device const float* scale_buf [[buffer(4)]],
+                                         device float* out [[buffer(5)]],
+                                         device atomic_uint* counters [[buffer(6)]],
+                                         device float* partials [[buffer(7)]],
+                                         device float* routed_tmp [[buffer(8)]],
+                                         constant MoeWeightedSumNormParams& p [[buffer(9)]],
+                                         uint2 tg [[threadgroup_position_in_grid]],
+                                         uint sg [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]],
+                                         uint nsg [[simdgroups_per_threadgroup]],
+                                         uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float shared_sq[8];
+    threadgroup uint shared_done;
+    uint tg_x = tg.x;
+    uint r = tg.y;
+    if (r >= p.n || tg_x >= p.num_tgs) return;
+
+    uint c = tg_x * 256u + tid;
+    float acc = 0.0f;
+    if (c < p.h) {
+        ulong base = (ulong)r * p.k;
+        for (uint s = 0u; s < p.k; ++s) {
+            acc += down[(base + s) * p.h + c] * weights[base + s];
+        }
+        if (p.num_tgs > 1u) {
+            routed_tmp[(ulong)r * p.h + c] = acc;
+        }
+    }
+
+    float sq = (c < p.h) ? (acc * acc) : 0.0f;
+    float sg_sq = simd_sum(sq);
+    if (lane == 0u) {
+        shared_sq[sg] = sg_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (p.num_tgs <= 1u) {
+        if (tid == 0u) {
+            float tg_sq = 0.0f;
+            for (uint i = 0u; i < nsg; ++i) tg_sq += shared_sq[i];
+            shared_sq[0] = rsqrt(tg_sq / float(p.h) + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (c < p.h) {
+            float inv_rms = shared_sq[0];
+            float out_scale = (p.has_scale != 0u) ? scale_buf[0] : 1.0f;
+            float v = acc * inv_rms * gamma[c];
+            if (p.has_res != 0u) v += res[(ulong)r * p.h + c];
+            out[(ulong)r * p.h + c] = v * out_scale;
+        }
+        return;
+    }
+
+    if (tid == 0u) {
+        float tg_sq = 0.0f;
+        for (uint i = 0u; i < nsg; ++i) tg_sq += shared_sq[i];
+        partials[(ulong)r * p.num_tgs + tg_x] = tg_sq;
+    }
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        uint prev = atomic_fetch_add_explicit(&counters[r], 1u, memory_order_relaxed);
+        shared_done = (prev == p.num_tgs - 1u) ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (shared_done == 0u) return;
+
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    if (tid == 0u) {
+        atomic_store_explicit(&counters[r], 0u, memory_order_relaxed);
+        float total_sq = 0.0f;
+        for (uint t = 0u; t < p.num_tgs; ++t) {
+            total_sq += partials[(ulong)r * p.num_tgs + t];
+        }
+        shared_sq[0] = rsqrt(total_sq / float(p.h) + p.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    float inv_rms = shared_sq[0];
+    float out_scale = (p.has_scale != 0u) ? scale_buf[0] : 1.0f;
+    for (uint col = tid; col < p.h; col += 256u) {
+        float v = routed_tmp[(ulong)r * p.h + col] * inv_rms * gamma[col];
+        if (p.has_res != 0u) v += res[(ulong)r * p.h + col];
+        out[(ulong)r * p.h + col] = v * out_scale;
+    }
+}
+
 struct block_q4_0 {
     half d;
     uint8_t qs[16];

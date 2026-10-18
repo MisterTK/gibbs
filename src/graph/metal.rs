@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 66] = [
+const BASE_KERNELS: [&str; 67] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -437,6 +437,7 @@ const BASE_KERNELS: [&str; 66] = [
     "geglu_f32",
     "split_glu_f32",
     "moe_weighted_sum_f32",
+    "moe_weighted_sum_rmsnorm_f32",
     "gemv_q4_0",
     "gemv_q4_0_half",
     "gemv_q8_0",
@@ -1488,6 +1489,7 @@ pub struct Session {
     dequant_scratch: Mutex<Option<Buffer>>,
     /// Per-slice partials of the split decode attention (grown to the largest).
     attn_scratch: Mutex<Option<Buffer>>,
+    moe_norm_scratch: Mutex<Option<Buffer>>,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -2137,6 +2139,7 @@ impl Session {
             mlp_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
+            moe_norm_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
@@ -2484,6 +2487,31 @@ impl Session {
             *guard = Some(buf);
         }
         Ok(guard.as_ref().unwrap().clone())
+    }
+
+    fn ensure_moe_norm_scratch(
+        &self,
+        n: usize,
+        num_tgs: usize,
+        h: usize,
+    ) -> Result<(Buffer, usize, usize), String> {
+        let align64 = |x: usize| (x + 63) & !63;
+        let off_partials = align64(n.max(1) * 4);
+        let off_routed = off_partials + align64(n.max(1) * num_tgs.max(16) * 4);
+        let total = off_routed + align64(n.max(1) * h.max(1) * 4);
+        let mut guard = self.moe_norm_scratch.lock();
+        if guard
+            .as_ref()
+            .map_or(true, |b| (b.length() as usize) < total)
+        {
+            let alloc = total.max(256);
+            let buf = new_shared_buffer(&self.rt.device, alloc)?;
+            unsafe {
+                std::ptr::write_bytes(buf.contents() as *mut u8, 0, alloc);
+            }
+            *guard = Some(buf);
+        }
+        Ok((guard.as_ref().unwrap().clone(), off_partials, off_routed))
     }
 
     /// Runs `graph` with `inputs` bound positionally to `graph.inputs`; returns `graph.outputs`.
@@ -3325,6 +3353,55 @@ impl Session {
                 set_bytes(enc, 3, &[u32_of(n)?, u32_of(k)?, u32_of(h)?, 0u32]);
                 grid1(n * h);
             }
+            Step::MoeWeightedSumNorm {
+                down,
+                weights,
+                g,
+                res,
+                scale,
+                n,
+                k,
+                h,
+                eps,
+            } => {
+                let num_tgs = h.div_ceil(256);
+                let (scratch, off_partials, off_routed) =
+                    self.ensure_moe_norm_scratch(n, num_tgs, h)?;
+                enc.set_compute_pipeline_state(rt.pso("moe_weighted_sum_rmsnorm_f32")?);
+                bind(0, down);
+                bind(1, weights);
+                bind(2, g);
+                bind(3, res.unwrap_or(down));
+                bind(4, scale.unwrap_or(down));
+                bind(5, s.out);
+                enc.set_buffer(6, Some(&scratch), 0);
+                enc.set_buffer(7, Some(&scratch), off_partials as u64);
+                enc.set_buffer(8, Some(&scratch), off_routed as u64);
+                #[repr(C)]
+                struct MoeWeightedSumNormParams {
+                    n: u32,
+                    k: u32,
+                    h: u32,
+                    num_tgs: u32,
+                    eps: f32,
+                    has_res: u32,
+                    has_scale: u32,
+                }
+                let p = MoeWeightedSumNormParams {
+                    n: u32_of(n)?,
+                    k: u32_of(k)?,
+                    h: u32_of(h)?,
+                    num_tgs: u32_of(num_tgs)?,
+                    eps,
+                    has_res: res.is_some() as u32,
+                    has_scale: scale.is_some() as u32,
+                };
+                set_bytes(enc, 9, &p);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_tgs as u64, n as u64, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
             Step::Rope {
                 x,
                 pos,
@@ -4099,6 +4176,17 @@ pub enum Step {
         n: usize,
         k: usize,
         h: usize,
+    },
+    MoeWeightedSumNorm {
+        down: ValueId,
+        weights: ValueId,
+        g: ValueId,
+        res: Option<ValueId>,
+        scale: Option<ValueId>,
+        n: usize,
+        k: usize,
+        h: usize,
+        eps: f32,
     },
     Rope {
         x: ValueId,
@@ -5492,7 +5580,8 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             Step::RmsNormBatch { .. }
             | Step::RopeBatch { .. }
             | Step::SplitGlu { .. }
-            | Step::MoeWeightedSum { .. } => {
+            | Step::MoeWeightedSum { .. }
+            | Step::MoeWeightedSumNorm { .. } => {
                 unreachable!("post-pass steps are created after node lowering")
             }
             Step::MegakernelMlp {
@@ -5562,7 +5651,9 @@ fn fuse_moe_subgraphs(
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
 ) {
-    if !fusion_policy().allows(FusionClass::ReduceInput) {
+    if !fusion_policy().allows(FusionClass::ReduceInput)
+        || std::env::var_os("GIBBS_NO_MOE_FUSION").is_some()
+    {
         return;
     }
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
@@ -5886,6 +5977,53 @@ fn fuse_moe_subgraphs(
                                     extra_outs: Vec::new(),
                                     reads: vec![down, w_col],
                                 };
+                                let routed = steps[i].out;
+                                if h <= 4096 && k <= 32 && single_use(routed) && i + 1 < steps.len()
+                                {
+                                    let norm_match = match steps[i + 1].op {
+                                        Step::RmsNorm {
+                                            x,
+                                            g,
+                                            res,
+                                            scale,
+                                            chain: None,
+                                            rope: None,
+                                            rows,
+                                            d,
+                                            eps,
+                                        } if x == routed
+                                            && rows == n
+                                            && d == h
+                                            && steps[i + 1].extra_outs.is_empty() =>
+                                        {
+                                            Some((g, res, scale, eps))
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some((g, res, scale, eps)) = norm_match {
+                                        let norm_step = steps.remove(i + 1);
+                                        steps[i] = Planned {
+                                            name: norm_step.name,
+                                            op: Step::MoeWeightedSumNorm {
+                                                down,
+                                                weights: w_col,
+                                                g,
+                                                res,
+                                                scale,
+                                                n,
+                                                k,
+                                                h,
+                                                eps,
+                                            },
+                                            out: norm_step.out,
+                                            extra_outs: Vec::new(),
+                                            reads: [Some(down), Some(w_col), Some(g), res, scale]
+                                                .into_iter()
+                                                .flatten()
+                                                .collect(),
+                                        };
+                                    }
+                                }
                                 i += 1;
                                 continue;
                             }
@@ -9887,8 +10025,9 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
     fn moe_subgraph_fusions_match_cpu() {
         use crate::graph::ReduceKind;
 
-        for m in [1usize, 2] {
-            let (h, ff, experts, top_k) = (16, 16, 6, 3);
+        for (h, ff) in [(16usize, 16usize), (2816, 64)] {
+            for m in [1usize, 2] {
+                let (experts, top_k) = (6, 3);
             let f = DType::F32;
 
             // 1. MoE subgraph starting from router logits (12 raw steps -> 5 fused steps).
@@ -10024,6 +10163,201 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 "rel_err = {}",
                 rel_err(&want, &got)
             );
+
+                // 2. MoeWeightedSum -> RmsNorm -> Add(dense) -> Mul(scale) fuses into Step::MoeWeightedSumNorm.
+                let mut g2 = Graph::new();
+                let x2 = g2.input("x", vec![m, h], f);
+                let logits2 = g2.input("logits", vec![m, experts], f);
+                let dense2 = g2.input("dense", vec![m, h], f);
+                let scale_w2 = g2.weight("scale", vec![1, experts], f);
+                let gu_w2 = g2.weight("gate_up", vec![experts * 2 * ff, h], f);
+                let down_w2 = g2.weight("down", vec![experts * h, ff], f);
+                let norm_g2 = g2.weight("norm_g", vec![h], f);
+                let out_sc2 = g2.weight("out_sc", vec![1], f);
+
+                let ids2 = g2.add(
+                    "topk",
+                    Op::TopK { k: top_k },
+                    &[logits2],
+                    vec![m, top_k],
+                    DType::U32,
+                );
+                let picked2 = g2.add(
+                    "picked",
+                    Op::GatherCols,
+                    &[logits2, ids2],
+                    vec![m, top_k],
+                    f,
+                );
+                let probs2 = g2.add(
+                    "probs",
+                    Op::Softmax { axis: -1 },
+                    &[picked2],
+                    vec![m, top_k],
+                    f,
+                );
+                let sc2 = g2.add("sc", Op::GatherCols, &[scale_w2, ids2], vec![m, top_k], f);
+                let weights_v2 = g2.add("weights", Op::Mul, &[probs2, sc2], vec![m, top_k], f);
+                let gu2 = g2.add(
+                    "gu",
+                    Op::MoeLinear { experts, top_k },
+                    &[x2, gu_w2, ids2],
+                    vec![m * top_k, 2 * ff],
+                    f,
+                );
+                let gate2 = g2.add(
+                    "gate",
+                    Op::Slice {
+                        axis: 1,
+                        start: 0,
+                        end: ff as i64,
+                    },
+                    &[gu2],
+                    vec![m * top_k, ff],
+                    f,
+                );
+                let up2 = g2.add(
+                    "up",
+                    Op::Slice {
+                        axis: 1,
+                        start: ff as i64,
+                        end: (2 * ff) as i64,
+                    },
+                    &[gu2],
+                    vec![m * top_k, ff],
+                    f,
+                );
+                let act2 = g2.add("act", Op::GeGlu, &[gate2, up2], vec![m * top_k, ff], f);
+                let down2 = g2.add(
+                    "down",
+                    Op::MoeLinear { experts, top_k },
+                    &[act2, down_w2, ids2],
+                    vec![m * top_k, h],
+                    f,
+                );
+                let w_col2 = g2.add(
+                    "w_col",
+                    Op::Reshape {
+                        shape: Some(vec![m * top_k, 1]),
+                    },
+                    &[weights_v2],
+                    vec![m * top_k, 1],
+                    f,
+                );
+                let weighted2 =
+                    g2.add("weighted", Op::Mul, &[down2, w_col2], vec![m * top_k, h], f);
+                let slots2 = g2.add(
+                    "slots",
+                    Op::Reshape {
+                        shape: Some(vec![m, top_k, h]),
+                    },
+                    &[weighted2],
+                    vec![m, top_k, h],
+                    f,
+                );
+                let routed2 = g2.add(
+                    "routed",
+                    Op::Reduce {
+                        kind: ReduceKind::Sum,
+                        axes: vec![1],
+                        keep_dims: false,
+                    },
+                    &[slots2],
+                    vec![m, h],
+                    f,
+                );
+                let normed2 = g2.add(
+                    "normed",
+                    Op::RmsNorm { eps: 1e-6 },
+                    &[routed2, norm_g2],
+                    vec![m, h],
+                    f,
+                );
+                let sum2 = g2.add("sum", Op::Add, &[dense2, normed2], vec![m, h], f);
+                let out2 = g2.add("out", Op::Mul, &[sum2, out_sc2], vec![m, h], f);
+                g2.output(out2);
+
+                w.insert("norm_g", Tensor::F32(rand(h, 66)));
+                w.insert("out_sc", Tensor::F32(vec![0.70710677]));
+
+                let sess2 = Session::new(rt(), &w).unwrap();
+                let prep2 = sess2.prepare_plan(&g2).unwrap();
+                assert_eq!(
+                    prep2.steps.len(),
+                    5,
+                    "15 raw MoE+norm+res+scale steps fuse to 5"
+                );
+                assert!(matches!(
+                    prep2.steps[4].op,
+                    Step::MoeWeightedSumNorm {
+                        res: Some(_),
+                        scale: Some(_),
+                        ..
+                    }
+                ));
+
+                for run_idx in 0..3u64 {
+                    let inputs2 = vec![
+                        Tensor::F32(rand(m * h, 44 + run_idx * 100)),
+                        Tensor::F32(rand(m * experts, 55 + run_idx * 100)),
+                        Tensor::F32(rand(m * h, 77 + run_idx * 100)),
+                    ];
+                    let want2 = cpu::run_stateless(&g2, &w, inputs2.clone())
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap();
+                    let got2 = sess2
+                        .run_prepared(&g2, &prep2, None, inputs2)
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap();
+                    assert!(
+                        rel_err(&want2, &got2) < 1e-5,
+                        "h={h} m={m} run={run_idx} rel_err = {}",
+                        rel_err(&want2, &got2)
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    #[ignore = "real 26B-A4B MoE checkpoint greedy 32-token parity check"]
+    fn model7_real_weights_moe_fusions_greedy_parity() {
+        let id = "unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf";
+        let hub = crate::model::hub::HuggingFaceHub::new();
+        let Ok(artifacts) = hub.auto_download_and_cache(id, None) else {
+            println!("SKIPPED: {id} not cached");
+            return;
+        };
+        let prompt = "Explain the second law of thermodynamics to a curious student.";
+
+        std::env::set_var("GIBBS_NO_MOE_FUSION", "1");
+        let base_load = crate::bench::load_for_bench(&artifacts, "max-speed").unwrap();
+        take_run_samples();
+        let (base_text, base_toks, _) = base_load
+            .exec
+            .generate_text_measured_plain(prompt, 32, 0.0)
+            .unwrap();
+        let base_disp = take_run_samples().last().map(|s| s.dispatches).unwrap_or(0);
+        std::env::remove_var("GIBBS_NO_MOE_FUSION");
+
+        let cand_load = crate::bench::load_for_bench(&artifacts, "max-speed").unwrap();
+        take_run_samples();
+        let (cand_text, cand_toks, _) = cand_load
+            .exec
+            .generate_text_measured_plain(prompt, 32, 0.0)
+            .unwrap();
+        let cand_disp = take_run_samples().last().map(|s| s.dispatches).unwrap_or(0);
+
+        println!("Model 7 greedy parity ({base_toks} vs {cand_toks} tokens, dispatches {base_disp} -> {cand_disp}):\nBASE: {base_text:?}\nCAND: {cand_text:?}");
+        assert_eq!(base_disp, 923, "unfused Model 7 dispatches");
+        assert_eq!(cand_disp, 683, "M1+M3 fused Model 7 dispatches (-240)");
+        assert_eq!(
+            base_text, cand_text,
+            "32 greedy tokens on real 26B-A4B MoE weights must match identically"
+        );
     }
 }
