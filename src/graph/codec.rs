@@ -63,6 +63,7 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
         QuantFormat::GGUF_Q3_K => Some(&WIDE_Q3_K),
         QuantFormat::GGUF_IQ4_XS => Some(&WIDE_IQ4_XS),
         QuantFormat::GGUF_IQ4_NL => Some(&WIDE_IQ4_NL),
+        QuantFormat::GGUF_Q4_0 => Some(&WIDE_Q4_0),
         QuantFormat::GGUF_IQ2_XXS => Some(&WIDE_IQ2_XXS),
         QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => Some(&WIDE_IQ2_M),
         QuantFormat::GGUF_IQ3_S => Some(&WIDE_IQ3_S),
@@ -360,11 +361,34 @@ static WIDE_IQ4_NL: Wide = Wide {
 inline uint group_seg(uint g, uint k) { return g * 8 + k * 16; }
 inline void decode_group(device const uchar* blk, uint g, thread float* out) {
     out[16] = cd_f16(blk);
-    device const uchar* q = blk + 2 + g * 8;
-    for (uint i = 0; i < 8; i++) {
-        out[i] = float(KVALUES_IQ4NL[q[i] & 0x0Fu]);
-        out[8 + i] = float(KVALUES_IQ4NL[q[i] >> 4]);
+    uint2 qw = as_type<uint2>(ushort4(*(device const packed_ushort4*)(blk + 2 + g * 8)));
+    uchar4 b0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu), b1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+    uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu), h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+    for (uint i = 0; i < 4; i++) {
+        out[i] = float(KVALUES_IQ4NL[b0[i]]);
+        out[4 + i] = float(KVALUES_IQ4NL[b1[i]]);
+        out[8 + i] = float(KVALUES_IQ4NL[h0[i]]);
+        out[12 + i] = float(KVALUES_IQ4NL[h1[i]]);
     }
+}
+"#,
+};
+
+static WIDE_Q4_0: Wide = Wide {
+    uniform: true,
+    groups: 2,
+    segs: 2,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return g * 8 + k * 16; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    out[16] = float(*(device const half*)blk);
+    uint2 qw = as_type<uint2>(ushort4(*(device const packed_ushort4*)(blk + 2 + g * 8)));
+    uchar4 b0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu), b1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+    uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu), h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+    *(thread packed_float4*)(out + 0) = float4(b0) - 8.0f;
+    *(thread packed_float4*)(out + 4) = float4(b1) - 8.0f;
+    *(thread packed_float4*)(out + 8) = float4(h0) - 8.0f;
+    *(thread packed_float4*)(out + 12) = float4(h1) - 8.0f;
 }
 "#,
 };
@@ -384,10 +408,10 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
         uint2 gw = as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]);
         float4 g0 = float4(as_type<uchar4>(gw.x)), g1 = float4(as_type<uchar4>(gw.y));
         uint s = KSIGNS_IQ2XS[(aux1 >> (7 * k)) & 127u];
-        for (uint j = 0; j < 4; j++) {
-            out[8 * k + j] = (s & (1u << j)) ? -g0[j] : g0[j];
-            out[8 * k + 4 + j] = (s & (16u << j)) ? -g1[j] : g1[j];
-        }
+        float4 s0 = select(g0, -g0, int4((s << 31), (s << 30), (s << 29), (s << 28)) < 0);
+        float4 s1 = select(g1, -g1, int4((s << 27), (s << 26), (s << 25), (s << 24)) < 0);
+        *(thread packed_float4*)(out + 8 * k) = s0;
+        *(thread packed_float4*)(out + 8 * k + 4) = s1;
     }
 }
 "#,
