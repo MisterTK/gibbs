@@ -723,11 +723,25 @@ impl Runtime {
                         let matched = std::fs::read(e.path())
                             .ok()
                             .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
-                            .filter(|prev| prev.os_build == os_build)
-                            .and_then(|prev| prev.codec)
-                            .filter(|c| c.codec_hash == ch);
-                        if let Some(c) = matched {
-                            rt.profile.ceiling_gbps = rt.profile.stream_gbps.max(c.ceiling_gbps);
+                            .filter(|prev| {
+                                prev.os_build == os_build
+                                    && prev.memory_bandwidth_gbps > 0.0
+                                    && prev.stream_gbps > 0.0
+                                    && prev.ceiling_gbps > 0.0
+                            })
+                            .and_then(|prev| {
+                                let c = prev.codec.filter(|c| c.codec_hash == ch)?;
+                                Some((
+                                    prev.memory_bandwidth_gbps,
+                                    prev.stream_gbps,
+                                    prev.ceiling_gbps,
+                                    c,
+                                ))
+                            });
+                        if let Some((bw, stream, ceil, c)) = matched {
+                            rt.profile.memory_bandwidth_gbps = bw;
+                            rt.profile.stream_gbps = stream;
+                            rt.profile.ceiling_gbps = ceil;
                             rt.profile.codec = Some(c);
                             break;
                         }
