@@ -775,6 +775,193 @@ kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
     }
 }
 
+kernel void gemv_q4_0_norm(device const block_q4_0* w [[buffer(0)]],
+                           device const float* x [[buffer(1)]],
+                           device float* y [[buffer(2)]],
+                           constant PackedGemvParams& p [[buffer(3)]],
+                           device const float* bias [[buffer(4)]],
+                           device const float* res [[buffer(5)]],
+                           device const float* gamma [[buffer(6)]],
+                           constant float& eps [[buffer(7)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup float shared_x[4096];
+    threadgroup float tg_sq[8];
+    uint tid = sg * 32 + lane;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.cols; i += 256) {
+        float v = x[i];
+        sq += v * v;
+    }
+    sq = simd_sum(sq);
+    if (lane == 0) {
+        tg_sq[sg] = sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt((tg_sq[0] + tg_sq[1] + tg_sq[2] + tg_sq[3]
+                     + tg_sq[4] + tg_sq[5] + tg_sq[6] + tg_sq[7]) / float(p.cols) + eps);
+    for (uint i = tid; i < p.cols; i += 256) {
+        shared_x[i] = x[i] * inv * gamma[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 32;
+    device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    threadgroup const float* xb_base = shared_x;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint b = lane; b < n_blocks; b += 32) {
+        block_q4_0 blk0 = r0_blocks[b];
+        block_q4_0 blk1 = has_row1 ? r1_blocks[b] : blk0;
+        float d0 = float(blk0.d);
+        float d1 = float(blk1.d);
+        threadgroup const float* xb = xb_base + b * 32;
+
+        float b_acc0 = 0.0f;
+        float b_acc1 = 0.0f;
+
+        #pragma unroll
+        for (uint j = 0; j < 16; j += 4) {
+            uint32_t q0 = *reinterpret_cast<thread const uint32_t*>(&blk0.qs[j]);
+            uint32_t q1 = *reinterpret_cast<thread const uint32_t*>(&blk1.qs[j]);
+
+            float4 v0_0 = float4(int4((q0 & 0x0F), ((q0 >> 8) & 0x0F), ((q0 >> 16) & 0x0F), ((q0 >> 24) & 0x0F)) - 8);
+            float4 v1_0 = float4(int4(((q0 >> 4) & 0x0F), ((q0 >> 12) & 0x0F), ((q0 >> 20) & 0x0F), ((q0 >> 28) & 0x0F)) - 8);
+
+            float4 v0_1 = float4(int4((q1 & 0x0F), ((q1 >> 8) & 0x0F), ((q1 >> 16) & 0x0F), ((q1 >> 24) & 0x0F)) - 8);
+            float4 v1_1 = float4(int4(((q1 >> 4) & 0x0F), ((q1 >> 12) & 0x0F), ((q1 >> 20) & 0x0F), ((q1 >> 28) & 0x0F)) - 8);
+
+            float4 x0 = *reinterpret_cast<threadgroup const float4*>(xb + j);
+            float4 x1 = *reinterpret_cast<threadgroup const float4*>(xb + j + 16);
+
+            b_acc0 += dot(v0_0, x0) + dot(v1_0, x1);
+            b_acc1 += dot(v0_1, x0) + dot(v1_1, x1);
+        }
+        acc0 += d0 * b_acc0;
+        if (has_row1) {
+            acc1 += d1 * b_acc1;
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+kernel void gemv_q4_0_half_norm(device const block_q4_0* w [[buffer(0)]],
+                                device const float* x [[buffer(1)]],
+                                device float* y [[buffer(2)]],
+                                constant PackedGemvParams& p [[buffer(3)]],
+                                device const float* bias [[buffer(4)]],
+                                device const float* res [[buffer(5)]],
+                                device const float* gamma [[buffer(6)]],
+                                constant float& eps [[buffer(7)]],
+                                uint2 tg [[threadgroup_position_in_grid]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup float shared_x[4096];
+    threadgroup float tg_sq[8];
+    uint tid = sg * 32 + lane;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.cols; i += 256) {
+        float v = x[i];
+        sq += v * v;
+    }
+    sq = simd_sum(sq);
+    if (lane == 0) {
+        tg_sq[sg] = sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt((tg_sq[0] + tg_sq[1] + tg_sq[2] + tg_sq[3]
+                     + tg_sq[4] + tg_sq[5] + tg_sq[6] + tg_sq[7]) / float(p.cols) + eps);
+    for (uint i = tid; i < p.cols; i += 256) {
+        shared_x[i] = x[i] * inv * gamma[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 32;
+    uint n_sub = n_blocks * 2;
+    device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    threadgroup const float* xb_base = shared_x;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 1;
+        uint half_off = (s & 1) * 8;
+        threadgroup const float* xb = xb_base + b * 32 + half_off;
+
+        float4 x_lo0 = *reinterpret_cast<threadgroup const float4*>(xb);
+        float4 x_lo1 = *reinterpret_cast<threadgroup const float4*>(xb + 4);
+        float4 x_hi0 = *reinterpret_cast<threadgroup const float4*>(xb + 16);
+        float4 x_hi1 = *reinterpret_cast<threadgroup const float4*>(xb + 20);
+        float sum_x = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                    + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
+                    + (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                    + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
+
+        uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + half_off)));
+        float dot0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
+                   + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1)
+                   + dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                   + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+        acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
+
+        if (has_row1) {
+            uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + half_off)));
+            float dot1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
+                       + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
+                       + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                       + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
 struct block_q8_0 {
     half d;
     int8_t qs[32];
@@ -1335,6 +1522,108 @@ kernel void gemv_q4_k(device const block_q4_k* w [[buffer(0)]],
         float4 x_lo1 = *reinterpret_cast<device const float4*>(xb_g + 4);
         float4 x_hi0 = *reinterpret_cast<device const float4*>(xb_g + 32);
         float4 x_hi1 = *reinterpret_cast<device const float4*>(xb_g + 36);
+        float sum_x_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                       + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w);
+        float sum_x_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                       + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
+
+        device const block_q4_k& blk0 = r0_blocks[b];
+        float2 sm0_0 = k4_scale_min(2 * g, blk0.scales);
+        float2 sm1_0 = k4_scale_min(2 * g + 1, blk0.scales);
+        uint2 q0 = uint2(*reinterpret_cast<device const packed_uint2*>(blk0.qs + q_off));
+        float dot_lo0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
+                      + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1);
+        float dot_hi0 = dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                      + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+        acc0 += float(blk0.d) * (sm0_0.x * dot_lo0 + sm1_0.x * dot_hi0)
+              - float(blk0.dmin) * (sm0_0.y * sum_x_lo + sm1_0.y * sum_x_hi);
+
+        if (has_row1) {
+            device const block_q4_k& blk1 = r1_blocks[b];
+            float2 sm0_1 = k4_scale_min(2 * g, blk1.scales);
+            float2 sm1_1 = k4_scale_min(2 * g + 1, blk1.scales);
+            uint2 q1 = uint2(*reinterpret_cast<device const packed_uint2*>(blk1.qs + q_off));
+            float dot_lo1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
+                          + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1);
+            float dot_hi1 = dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                          + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(blk1.d) * (sm0_1.x * dot_lo1 + sm1_1.x * dot_hi1)
+                  - float(blk1.dmin) * (sm0_1.y * sum_x_lo + sm1_1.y * sum_x_hi);
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+kernel void gemv_q4_k_norm(device const block_q4_k* w [[buffer(0)]],
+                           device const float* x [[buffer(1)]],
+                           device float* y [[buffer(2)]],
+                           constant PackedGemvParams& p [[buffer(3)]],
+                           device const float* bias [[buffer(4)]],
+                           device const float* res [[buffer(5)]],
+                           device const float* gamma [[buffer(6)]],
+                           constant float& eps [[buffer(7)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    alignas(16) threadgroup float shared_x[4096];
+    threadgroup float tg_sq[8];
+    uint tid = sg * 32 + lane;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.cols; i += 256) {
+        float v = x[i];
+        sq += v * v;
+    }
+    sq = simd_sum(sq);
+    if (lane == 0) {
+        tg_sq[sg] = sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rsqrt((tg_sq[0] + tg_sq[1] + tg_sq[2] + tg_sq[3]
+                     + tg_sq[4] + tg_sq[5] + tg_sq[6] + tg_sq[7]) / float(p.cols) + eps);
+    for (uint i = tid; i < p.cols; i += 256) {
+        shared_x[i] = x[i] * inv * gamma[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 256;
+    uint n_sub = n_blocks * 16;
+    device const block_q4_k* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q4_k* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    threadgroup const float* xb_base = shared_x;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 4;
+        uint g = (s >> 2) & 3;
+        uint sub = s & 3;
+        uint q_off = g * 32 + sub * 8;
+        threadgroup const float* xb_g = xb_base + (ulong)(b * 256 + g * 64 + sub * 8);
+
+        float4 x_lo0 = *reinterpret_cast<threadgroup const float4*>(xb_g);
+        float4 x_lo1 = *reinterpret_cast<threadgroup const float4*>(xb_g + 4);
+        float4 x_hi0 = *reinterpret_cast<threadgroup const float4*>(xb_g + 32);
+        float4 x_hi1 = *reinterpret_cast<threadgroup const float4*>(xb_g + 36);
         float sum_x_lo = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
                        + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w);
         float sum_x_hi = (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
