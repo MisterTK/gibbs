@@ -5847,6 +5847,74 @@ fn fuse_moe_subgraphs(
                                 extra_outs: glu_step.extra_outs,
                                 reads: vec![gu0],
                             };
+                            let can_fuse_gu = i > 0
+                                && steps[i - 1].extra_outs.is_empty()
+                                && steps[i - 1].out == gu0
+                                && use_count.get(&root(gu0)).copied() == Some(2);
+                            if can_fuse_gu {
+                                let gu_match = match steps[i - 1].op {
+                                    Step::Ext(ext::ExtStep::Experts(
+                                        ext::moe::Step::ExpertLinear {
+                                            x,
+                                            bank,
+                                            ids,
+                                            dtype,
+                                            rows,
+                                            cols,
+                                            slots,
+                                            top_k,
+                                            experts,
+                                            x_per_slot,
+                                        },
+                                    )) if rows == 2 * hc0 && slots == r0 => Some((
+                                        x, bank, ids, dtype, cols, slots, top_k, experts,
+                                        x_per_slot,
+                                    )),
+                                    _ => None,
+                                };
+                                if let Some((
+                                    x,
+                                    bank,
+                                    ids,
+                                    dtype,
+                                    cols,
+                                    slots,
+                                    top_k,
+                                    experts,
+                                    x_per_slot,
+                                )) = gu_match
+                                {
+                                    let split_step = steps.remove(i);
+                                    let (is_geglu, tanh) = match kind {
+                                        0 => (true, false),
+                                        1 => (true, true),
+                                        _ => (false, false),
+                                    };
+                                    steps[i - 1] = Planned {
+                                        name: split_step.name,
+                                        op: Step::Ext(ext::ExtStep::Experts(
+                                            ext::moe::Step::ExpertGateUpGlu {
+                                                x,
+                                                bank,
+                                                ids,
+                                                dtype,
+                                                ff: hc0,
+                                                cols,
+                                                slots,
+                                                top_k,
+                                                experts,
+                                                x_per_slot,
+                                                is_geglu,
+                                                tanh,
+                                            },
+                                        )),
+                                        out: split_step.out,
+                                        extra_outs: split_step.extra_outs,
+                                        reads: vec![x, bank, ids],
+                                    };
+                                    continue;
+                                }
+                            }
                             i += 1;
                             continue;
                         }
@@ -10092,7 +10160,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
 
             let sess = Session::new(rt(), &w).unwrap();
             let prep = sess.prepare_plan(&g).unwrap();
-            assert_eq!(prep.steps.len(), 5, "12 raw MoE steps fuse to 5");
+            assert_eq!(prep.steps.len(), 4, "12 raw MoE steps fuse to 4");
             assert!(matches!(
                 prep.steps[0].op,
                 Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
@@ -10101,8 +10169,15 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                     ..
                 }))
             ));
-            assert!(matches!(prep.steps[2].op, Step::SplitGlu { kind: 1, .. }));
-            assert!(matches!(prep.steps[4].op, Step::MoeWeightedSum { .. }));
+            assert!(matches!(
+                prep.steps[1].op,
+                Step::Ext(ext::ExtStep::Experts(ext::moe::Step::ExpertGateUpGlu {
+                    is_geglu: true,
+                    tanh: true,
+                    ..
+                }))
+            ));
+            assert!(matches!(prep.steps[3].op, Step::MoeWeightedSum { .. }));
 
             let inputs = vec![
                 Tensor::F32(rand(m * h, 44)),
@@ -10244,11 +10319,11 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let prep2 = sess2.prepare_plan(&g2).unwrap();
             assert_eq!(
                 prep2.steps.len(),
-                5,
-                "15 raw MoE+norm+res+scale steps fuse to 5"
+                4,
+                "15 raw MoE+norm+res+scale steps fuse to 4"
             );
             assert!(matches!(
-                prep2.steps[4].op,
+                prep2.steps[3].op,
                 Step::MoeWeightedSumNorm {
                     res: Some(_),
                     scale: Some(_),
@@ -10276,6 +10351,177 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 rel_err(&want2, &got2) < 1e-5,
                 "rel_err = {}",
                 rel_err(&want2, &got2)
+            );
+        }
+
+        // 3. Quantized GGUF_IQ2_XXS gate_up + GGUF_Q4_0 down (Model 7 codec mix) for m in [1, 24].
+        for m in [1usize, 24] {
+            let (h, ff, experts, top_k) = (256, 64, 8, 4);
+            let f = DType::F32;
+            let q_gu = crate::hardware::QuantFormat::GGUF_IQ2_XXS;
+            let q_dn = crate::hardware::QuantFormat::GGUF_Q4_0;
+            let mut g3 = Graph::new();
+            let x3 = g3.input("x", vec![m, h], f);
+            let logits3 = g3.input("logits", vec![m, experts], f);
+            let gu_w3 = g3.weight("gate_up", vec![experts * 2 * ff, h], DType::Quant(q_gu));
+            let down_w3 = g3.weight("down", vec![experts * h, ff], DType::Quant(q_dn));
+            let ids3 = g3.add(
+                "topk",
+                Op::TopK { k: top_k },
+                &[logits3],
+                vec![m, top_k],
+                DType::U32,
+            );
+            let picked3 = g3.add(
+                "picked",
+                Op::GatherCols,
+                &[logits3, ids3],
+                vec![m, top_k],
+                f,
+            );
+            let probs3 = g3.add(
+                "probs",
+                Op::Softmax { axis: -1 },
+                &[picked3],
+                vec![m, top_k],
+                f,
+            );
+            let gu3 = g3.add(
+                "gu",
+                Op::MoeLinear { experts, top_k },
+                &[x3, gu_w3, ids3],
+                vec![m * top_k, 2 * ff],
+                f,
+            );
+            let gate3 = g3.add(
+                "gate",
+                Op::Slice {
+                    axis: 1,
+                    start: 0,
+                    end: ff as i64,
+                },
+                &[gu3],
+                vec![m * top_k, ff],
+                f,
+            );
+            let up3 = g3.add(
+                "up",
+                Op::Slice {
+                    axis: 1,
+                    start: ff as i64,
+                    end: (2 * ff) as i64,
+                },
+                &[gu3],
+                vec![m * top_k, ff],
+                f,
+            );
+            let act3 = g3.add("act", Op::GeGlu, &[gate3, up3], vec![m * top_k, ff], f);
+            let down3 = g3.add(
+                "down",
+                Op::MoeLinear { experts, top_k },
+                &[act3, down_w3, ids3],
+                vec![m * top_k, h],
+                f,
+            );
+            let w_col3 = g3.add(
+                "w_col",
+                Op::Reshape {
+                    shape: Some(vec![m * top_k, 1]),
+                },
+                &[probs3],
+                vec![m * top_k, 1],
+                f,
+            );
+            let weighted3 = g3.add("weighted", Op::Mul, &[down3, w_col3], vec![m * top_k, h], f);
+            let slots3 = g3.add(
+                "slots",
+                Op::Reshape {
+                    shape: Some(vec![m, top_k, h]),
+                },
+                &[weighted3],
+                vec![m, top_k, h],
+                f,
+            );
+            let out3 = g3.add(
+                "out",
+                Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    axes: vec![1],
+                    keep_dims: false,
+                },
+                &[slots3],
+                vec![m, h],
+                f,
+            );
+            g3.output(out3);
+
+            let mut w3 = Weights::new();
+            let gu_blocks = (experts * 2 * ff * h) / 256;
+            let mut gu_bytes = vec![0u8; gu_blocks * 66];
+            for b in 0..gu_blocks {
+                let d = crate::model::f32_to_f16(0.02 * ((b % 7) as f32 + 1.0)).to_le_bytes();
+                gu_bytes[b * 66] = d[0];
+                gu_bytes[b * 66 + 1] = d[1];
+                for j in 2..66 {
+                    gu_bytes[b * 66 + j] = ((b * 13 + j * 29) & 0xFF) as u8;
+                }
+            }
+            w3.insert(
+                "gate_up",
+                Tensor::Quantized(
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data: gu_bytes.into(),
+                        out_features: experts * 2 * ff,
+                        in_features: h,
+                        format: q_gu,
+                    }
+                    .into(),
+                ),
+            );
+            let dn_blocks = (experts * h * ff) / 32;
+            let mut dn_bytes = vec![0u8; dn_blocks * 18];
+            for b in 0..dn_blocks {
+                let d = crate::model::f32_to_f16(0.02 * ((b % 5) as f32 + 1.0)).to_le_bytes();
+                dn_bytes[b * 18] = d[0];
+                dn_bytes[b * 18 + 1] = d[1];
+                for j in 2..18 {
+                    dn_bytes[b * 18 + j] = ((b * 17 + j * 31) & 0xFF) as u8;
+                }
+            }
+            w3.insert(
+                "down",
+                Tensor::Quantized(
+                    crate::model::layers::QuantizedWeight::GgufQuantized {
+                        raw_data: dn_bytes.into(),
+                        out_features: experts * h,
+                        in_features: ff,
+                        format: q_dn,
+                    }
+                    .into(),
+                ),
+            );
+            let sess3 = Session::new(rt(), &w3).unwrap();
+            let prep3 = sess3.prepare_plan(&g3).unwrap();
+            assert_eq!(prep3.steps.len(), 4);
+            let inputs3 = vec![
+                Tensor::F32(rand(m * h, 88)),
+                Tensor::F32(rand(m * experts, 99)),
+            ];
+            let want3 = cpu::run_stateless(&g3, &w3, inputs3.clone())
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            let got3 = sess3
+                .run_prepared(&g3, &prep3, None, inputs3)
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            assert!(
+                rel_err(&want3, &got3) < 2e-4,
+                "IQ2_XXS m={m} rel_err = {}",
+                rel_err(&want3, &got3)
             );
         }
     }
@@ -10311,7 +10557,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
 
         println!("Model 7 greedy parity ({base_toks} vs {cand_toks} tokens, dispatches {base_disp} -> {cand_disp}):\nBASE: {base_text:?}\nCAND: {cand_text:?}");
         assert_eq!(base_disp, 923, "unfused Model 7 dispatches");
-        assert_eq!(cand_disp, 683, "M1+M3 fused Model 7 dispatches (-240)");
+        assert_eq!(cand_disp, 653, "M1+M3+W2 fused Model 7 dispatches (-270)");
         assert_eq!(
             base_text, cand_text,
             "32 greedy tokens on real 26B-A4B MoE weights must match identically"

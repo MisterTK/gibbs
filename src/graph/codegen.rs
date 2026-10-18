@@ -1917,3 +1917,190 @@ extern "C" __global__ void {name}(const unsigned char* __restrict__ w, const flo
         reduction = reduction,
     )
 }
+
+/// Name of the kernel [`gemv_indexed_glu`] emits for `codec` with `p`.
+pub fn gemv_indexed_glu_name(codec: &Codec, p: GemvParams) -> String {
+    format!("gemvgen_{:?}_r{}_ix_glu", codec.format, p.rows_per_sg)
+}
+
+/// Fused expert-indexed `gate_up` GEMV + GLU activation: the weight is `experts` stacked
+/// `[2 * ff, cols]` matrices (`[gate; up]`), and each simdgroup decodes `p.rows_per_sg` gate rows
+/// (`bank_row + out_col0 + i`) and `p.rows_per_sg` up rows (`bank_row + p.ff + out_col0 + i`) in a
+/// single pass over `x`, writing `act(gate) * up` to `y` (`[slots, ff]`).
+pub fn gemv_indexed_glu(codec: &Codec, p: GemvParams) -> String {
+    let name = gemv_indexed_glu_name(codec, p);
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = device_msl(codec).replace("decode8", &dec);
+    let common_msl = gemv_common(include_str!("metal_kernels.metal"));
+    let r = p.rows_per_sg;
+    let be = codec.block_elems;
+    let acc_decl = (0..r)
+        .map(|i| format!("float acc_g{i} = 0.0f, acc_u{i} = 0.0f;"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let loop_src = gemv_glu_loop(codec, p, &dec);
+    let sums: String = (0..r)
+        .map(|i| {
+            format!("    float g{i} = simd_sum(acc_g{i});\n    float u{i} = simd_sum(acc_u{i});\n")
+        })
+        .collect();
+    let store: String = (0..r)
+        .map(|i| {
+            format!(
+                "        if (out_col0 + {i} < p.ff) {{\n            float act = p.glu_kind == 0u ? (g{i} / (1.0f + exp(-g{i}))) : (p.glu_kind == 1u ? gelu_erf(g{i}) : gelu_tanh(g{i}));\n            y[(ulong)slot * p.ff + out_col0 + {i}] = act * u{i};\n        }}\n"
+            )
+        })
+        .collect();
+    format!(
+        r#"
+{common_msl}
+{codec_msl}
+{wide_msl}
+
+struct MoeGemvGluParams {{
+    uint ff;
+    uint cols;
+    uint slots;
+    uint top_k;
+    uint experts;
+    uint x_per_slot;
+    uint glu_kind;
+}};
+
+kernel void {name}(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant MoeGemvGluParams& p [[buffer(3)]],
+    device const uint* ids [[buffer(4)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {{
+    const uint out_col0 = tg.x * {rows_per_tg} + sg * {r};
+    const uint slot = tg.y;
+    if (out_col0 >= p.ff || slot >= p.slots) return;
+    const uint expert = ids[slot];
+    if (expert >= p.experts) {{
+        if (lane == 0) {{
+            for (uint i = 0; i < {r}; i++) if (out_col0 + i < p.ff) y[(ulong)slot * p.ff + out_col0 + i] = 0.0f;
+        }}
+        return;
+    }}
+    const ulong bank_row = (ulong)expert * (2 * p.ff);
+    const uint blocks_per_row = p.cols / {be};
+    device const float* xb = x + (ulong)(p.x_per_slot != 0 ? slot : slot / p.top_k) * p.cols;
+    {acc_decl}
+{loop_src}{sums}    if (lane == 0) {{
+{store}    }}
+}}
+"#,
+        rows_per_tg = gemv_rows_per_tg(p),
+        wide_msl = wide_msl(codec, &dec, false),
+    )
+}
+
+fn gemv_glu_loop(codec: &Codec, p: GemvParams, dec: &str) -> String {
+    let (be, r) = (codec.block_elems, p.rows_per_sg);
+    let row_pair = |i: usize,
+                    decode: &dyn Fn(&BlockRef) -> String,
+                    dots_g: &str,
+                    dots_u: &str,
+                    v_len: u32| {
+        let br_g = block_ref(
+            codec,
+            "w",
+            &format!("(bank_row + out_col0 + {i}) * blocks_per_row + blk"),
+        );
+        let br_u = block_ref(
+            codec,
+            "w",
+            &format!("(bank_row + p.ff + out_col0 + {i}) * blocks_per_row + blk"),
+        );
+        format!(
+            "        if (out_col0 + {i} < p.ff) {{\n            float v[{v_len}];\n            {{ {}\n            {}\n{dots_g}            }}\n            {{ {}\n            {}\n{dots_u}            }}\n        }}\n",
+            br_g.decl,
+            decode(&br_g),
+            br_u.decl,
+            decode(&br_u),
+        )
+    };
+    let Some(wd) = wide(codec.format) else {
+        let rows: String = (0..r)
+            .map(|i| {
+                row_pair(
+                    i,
+                    &|br| format!("{dec}(b, {}sub, v);", br.sub),
+                    &format!("            acc_g{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n"),
+                    &format!("            acc_u{i} += dot(float4(v[0], v[1], v[2], v[3]), x0) + dot(float4(v[4], v[5], v[6], v[7]), x1);\n"),
+                    8,
+                )
+            })
+            .collect();
+        return format!(
+            "    const uint subs = p.cols / 8;\n    for (uint s = lane; s < subs; s += 32) {{\n        float4 x0 = *(device const float4*)(xb + s * 8);\n        float4 x1 = *(device const float4*)(xb + s * 8 + 4);\n        const uint blk = (s * 8) / {be};\n        const uint sub = ((s * 8) % {be}) / 8;\n{rows}    }}\n"
+        );
+    };
+    let (gdec, gseg) = (
+        dec.replace("decode8", "decode_group"),
+        dec.replace("decode8", "group_seg"),
+    );
+    let xs: String = (0..wd.segs)
+        .map(|k| {
+            format!(
+                "        {{ const uint e = blk * {be} + {gseg}(g, {k}); xs[{}] = *(device const float4*)(xb + e); xs[{}] = *(device const float4*)(xb + e + 4); }}\n",
+                2 * k,
+                2 * k + 1
+            )
+        })
+        .collect();
+    let nseg = wd.segs as usize;
+    let rows: String = (0..r)
+        .map(|i| {
+            let seg_dot = |k: usize| {
+                let o = 8 * k;
+                format!(
+                    "dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs[{}])",
+                    o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1
+                )
+            };
+            let (mut dots_g, mut dots_u) = (String::new(), String::new());
+            if wd.uniform {
+                let sum = (0..nseg).map(|k| format!("({})", seg_dot(k))).collect::<Vec<_>>().join(" + ");
+                dots_g += &format!("            acc_g{i} += v[{}] * ({sum});\n", 8 * nseg);
+                dots_u += &format!("            acc_u{i} += v[{}] * ({sum});\n", 8 * nseg);
+            } else {
+                for k in 0..nseg {
+                    dots_g += &format!(
+                        "            acc_g{i} += v[{}] * ({}) + v[{}] * sx{k};\n",
+                        8 * nseg + k, seg_dot(k), 9 * nseg + k
+                    );
+                    dots_u += &format!(
+                        "            acc_u{i} += v[{}] * ({}) + v[{}] * sx{k};\n",
+                        8 * nseg + k, seg_dot(k), 9 * nseg + k
+                    );
+                }
+            }
+            let v_len = if wd.uniform { 8 * wd.segs + 1 } else { 10 * wd.segs };
+            row_pair(i, &|br| format!("{gdec}(b, {}g, v);", br.group), &dots_g, &dots_u, v_len)
+        })
+        .collect();
+    let groups = wd.groups;
+    let sx: String = if wd.uniform {
+        String::new()
+    } else {
+        (0..nseg)
+            .map(|k| {
+                format!(
+                    "        const float sx{k} = dot(xs[{}], float4(1.0f)) + dot(xs[{}], float4(1.0f));\n",
+                    2 * k,
+                    2 * k + 1
+                )
+            })
+            .collect()
+    };
+    format!(
+        "    const uint groups = blocks_per_row * {groups};\n    for (uint s = lane; s < groups; s += 32) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        float4 xs[{}];\n{xs}{sx}{rows}    }}\n",
+        2 * wd.segs
+    )
+}
