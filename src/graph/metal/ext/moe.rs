@@ -379,20 +379,43 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
 }
 
 /// Rows per simdgroup of the expert GEMV.
-const ROWS_PER_SG: usize = 2;
+fn moe_rows_per_sg(format: QuantFormat, rows: usize) -> usize {
+    if rows < 8 {
+        return 1;
+    }
+    if rows >= 4096
+        || matches!(
+            format,
+            QuantFormat::GGUF_IQ2_XXS
+                | QuantFormat::GGUF_IQ2_XS
+                | QuantFormat::GGUF_IQ2_S
+                | QuantFormat::GGUF_IQ2_M
+                | QuantFormat::GGUF_IQ3_XXS
+                | QuantFormat::GGUF_IQ3_S
+                | QuantFormat::GGUF_Q2_K
+                | QuantFormat::GGUF_Q3_K
+                | QuantFormat::GGUF_TQ1_0
+                | QuantFormat::GGUF_TQ2_0
+        )
+    {
+        2
+    } else {
+        1
+    }
+}
 
-/// Per (device, codec) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat), ComputePipelineState>>> =
+/// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, String> {
+fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
     let device = &sess.rt.device;
-    let key = (device.registry_id(), c.format);
+    let key = (device.registry_id(), c.format, r);
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
     let params = GemvParams {
-        rows_per_sg: ROWS_PER_SG,
+        rows_per_sg: r,
         ..Default::default()
     };
     let src = format!(
@@ -455,7 +478,8 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
         } => {
             let c = bank_codec(*dtype)
                 .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
-            let pso = moe_gemv_pso(sess, c)?;
+            let r = moe_rows_per_sg(c.format, *rows);
+            let pso = moe_gemv_pso(sess, c, r)?;
             enc.set_compute_pipeline_state(&pso);
             e.bind(0, *bank);
             e.bind(1, *x);
@@ -474,7 +498,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             );
             e.bind(4, *ids);
             let rows_per_tg = gemv_rows_per_tg(GemvParams {
-                rows_per_sg: ROWS_PER_SG,
+                rows_per_sg: r,
                 ..Default::default()
             });
             enc.dispatch_thread_groups(
@@ -1402,5 +1426,31 @@ mod tests {
                 routed_bytes as f64 / dt_s / 1e9
             );
         }
+    }
+
+    #[test]
+    fn moe_gemv_pipeline_max_threads_and_occupancy() {
+        let s = Session::new(rt(), &Weights::new()).unwrap();
+        for (fmt, r) in [
+            (Q::GGUF_IQ2_XXS, 1),
+            (Q::GGUF_IQ2_XXS, 2),
+            (Q::GGUF_Q4_0, 1),
+            (Q::GGUF_Q4_0, 2),
+            (Q::GGUF_Q4_K_M, 1),
+            (Q::GGUF_Q6_K, 1),
+        ] {
+            let c = super::codec(fmt).unwrap();
+            let pso = super::moe_gemv_pso(&s, c, r).unwrap();
+            eprintln!(
+                "{fmt:?} r={r}: max_total_threads_per_threadgroup={} thread_execution_width={}",
+                pso.max_total_threads_per_threadgroup(),
+                pso.thread_execution_width()
+            );
+            assert!(pso.max_total_threads_per_threadgroup() >= 256);
+        }
+        assert_eq!(super::moe_rows_per_sg(Q::GGUF_IQ2_XXS, 1408), 2);
+        assert_eq!(super::moe_rows_per_sg(Q::GGUF_Q4_0, 1408), 1);
+        assert_eq!(super::moe_rows_per_sg(Q::GGUF_Q4_K_M, 2816), 1);
+        assert_eq!(super::moe_rows_per_sg(Q::GGUF_Q4_0, 4096), 2);
     }
 }
