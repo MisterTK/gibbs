@@ -56,9 +56,12 @@ def measure_idle_floor(samples: int = 3, delay_s: float = 0.5) -> int:
     return min(vals) if vals else 100
 
 
-def compute_quiet_max(_raw_floor: int | None = None) -> int:
-    return int(os.environ.get("QUIET_MAX_PCT", "20"))
-def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float, bool]:
+def compute_quiet_max(raw_floor: int | None = None) -> int:
+    if "QUIET_MAX_PCT" in os.environ:
+        return int(os.environ["QUIET_MAX_PCT"])
+    if raw_floor is None:
+        return 20
+    return max(20, min(raw_floor, COMPOSITOR_FLOOR_CAP) + 6)
     t0 = time.time()
     ok = 0
     last = sample_gpu_util()
@@ -193,6 +196,7 @@ def main() -> int:
     p_run.add_argument("--quiet", action="store_true", help="Wait for quiet GPU before starting")
     p_run.add_argument("--quiet-max", type=int, default=20, help="Max GPU utilization %% for --quiet (default 20)")
     p_run.add_argument("--quiet-samples", type=int, default=5)
+    p_run.add_argument("--quiet-max", type=int, default=None, help="Max GPU utilization %% for --quiet (default: auto <=40 from idle floor)")
     p_run.add_argument("--quiet-timeout", type=int, default=3600)
     p_run.add_argument("--allow-zero-tests", action="store_true", help="Allow 'running 0 tests' in cargo test")
     p_run.add_argument("cmd", nargs=argparse.REMAINDER)
