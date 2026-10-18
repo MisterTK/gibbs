@@ -267,11 +267,14 @@ impl WeightFormat {
         })
     }
 
-    /// Today's kernel for this format: the hand one where it exists (except `IQ2_M` and
+    /// Today's kernel for this format: the hand one where it exists (except `IQ4_XS`, `IQ2_M`, and
     /// `IQ3_S`, whose `Wide` codecs are faster at 2 rows), else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
         if self.hand_kernel().is_some()
-            && !matches!(self, WeightFormat::IQ2_M | WeightFormat::IQ3_S)
+            && !matches!(
+                self,
+                WeightFormat::IQ4_XS | WeightFormat::IQ2_M | WeightFormat::IQ3_S
+            )
         {
             GemvVariant::HAND
         } else {
@@ -409,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 83] = [
+const BASE_KERNELS: [&str; 64] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -427,7 +430,6 @@ const BASE_KERNELS: [&str; 83] = [
     "rmsnorm_f32",
     "rmsnorm_residual_f32",
     "rmsnorm_fused_f32",
-    "rmsnorm_fused_vecscale_f32",
     "graph_rope_f32",
     "rmsnorm_batch_f32",
     "rope_batch_f32",
@@ -435,7 +437,6 @@ const BASE_KERNELS: [&str; 83] = [
     "geglu_f32",
     "gemv_q4_0",
     "gemv_q4_0_half",
-    "gemv_q4_0_quarter",
     "gemv_q8_0",
     "gemv_bf16",
     "gemv_f16",
@@ -471,23 +472,6 @@ const BASE_KERNELS: [&str; 83] = [
     "attn_cached_gqa_split_f32_8",
     "attn_cached_gqa_split_f32_16",
     "attn_cached_merge_f32",
-    "flash_attn_cached_gated_f32_1",
-    "flash_attn_cached_gated_f32_2",
-    "flash_attn_cached_gated_f32_4",
-    "flash_attn_cached_gated_f32_8",
-    "flash_attn_cached_gated_f32",
-    "attn_cached_gqa_split_gated_f32_1",
-    "attn_cached_gqa_split_gated_f32_2",
-    "attn_cached_gqa_split_gated_f32_4",
-    "attn_cached_gqa_split_gated_f32_8",
-    "attn_cached_gqa_split_gated_f32_16",
-    "attn_cached_merge_gated_f32",
-    "attn_cached_gqa_split_vec4_f32_4",
-    "attn_cached_gqa_split_vec4_f32_8",
-    "attn_cached_gqa_split_vec4_f32_16",
-    "attn_cached_gqa_split_vec4_gated_f32_4",
-    "attn_cached_gqa_split_vec4_gated_f32_8",
-    "attn_cached_gqa_split_vec4_gated_f32_16",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
@@ -2216,9 +2200,6 @@ impl Session {
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
             (_, GemvKernel::Hand) => match format.hand_kernel() {
-                Some(_) if format == WeightFormat::Q4_0 && cols < 512 && (cols & 255) == 0 => {
-                    Ok((self.rt.pso("gemv_q4_0_quarter")?.clone(), 16))
-                }
                 Some(_) if format == WeightFormat::Q4_0 && (cols & 1023) != 0 => {
                     Ok((self.rt.pso("gemv_q4_0_half")?.clone(), 16))
                 }
@@ -2699,19 +2680,18 @@ impl Session {
                 // `GIBBS_CB_CHUNK=0` keeps a single buffer.
                 // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
                 // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
-                let (first, chunk) = cb_chunking(steps.len());
+                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
+                    cb_chunking()
+                } else {
+                    (usize::MAX, usize::MAX)
+                };
                 let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
                 let mut err = None;
                 let mut dispatches = 0u32;
                 let encode_start = std::time::Instant::now();
                 let mut at = 0;
                 while at < steps.len() && err.is_none() {
-                    let end = if cbs.is_empty() {
-                        first
-                    } else {
-                        at.saturating_add(chunk)
-                    }
-                    .min(steps.len());
+                    let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
                     let cb = self.rt.queue.new_command_buffer().to_owned();
                     let enc = cb.new_compute_command_encoder();
                     let counted = Counted::new(enc);
@@ -3011,16 +2991,11 @@ impl Session {
                 eps,
             } => {
                 if scale.is_some() || chain.is_some() || rope.is_some() {
-                    let kname = if scale.is_some_and(|s| s.1) {
-                        "rmsnorm_fused_vecscale_f32"
-                    } else {
-                        "rmsnorm_fused_f32"
-                    };
-                    enc.set_compute_pipeline_state(rt.pso(kname)?);
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
                     bind(0, x);
                     bind(1, g);
                     bind(2, res.unwrap_or(x));
-                    bind(3, scale.map_or(x, |s| s.0));
+                    bind(3, scale.unwrap_or(x));
                     bind(4, s.out);
                     if let Some((g2, out2, _)) = chain {
                         bind(5, g2);
@@ -3453,7 +3428,6 @@ impl Session {
                 pos,
                 vis,
                 rope,
-                gate,
                 heads,
                 head_dim,
                 kv_heads,
@@ -3549,37 +3523,20 @@ impl Session {
                     }
                 }
                 enc.set_compute_pipeline_state(if gqa_decode {
-                    let vec4_ok = (stride & 3) == 0 && matches!(head_dim, 128 | 256 | 512);
-                    rt.pso(match (gate.is_some(), vec4_ok, head_dim.div_ceil(32)) {
-                        (false, true, 4) => "attn_cached_gqa_split_vec4_f32_4",
-                        (false, true, 8) => "attn_cached_gqa_split_vec4_f32_8",
-                        (false, true, 16) => "attn_cached_gqa_split_vec4_f32_16",
-                        (true, true, 4) => "attn_cached_gqa_split_vec4_gated_f32_4",
-                        (true, true, 8) => "attn_cached_gqa_split_vec4_gated_f32_8",
-                        (true, true, 16) => "attn_cached_gqa_split_vec4_gated_f32_16",
-                        (false, _, 0..=1) => "attn_cached_gqa_split_f32_1",
-                        (false, _, 2) => "attn_cached_gqa_split_f32_2",
-                        (false, _, 3..=4) => "attn_cached_gqa_split_f32_4",
-                        (false, _, 5..=8) => "attn_cached_gqa_split_f32_8",
-                        (false, _, _) => "attn_cached_gqa_split_f32_16",
-                        (true, _, 0..=1) => "attn_cached_gqa_split_gated_f32_1",
-                        (true, _, 2) => "attn_cached_gqa_split_gated_f32_2",
-                        (true, _, 3..=4) => "attn_cached_gqa_split_gated_f32_4",
-                        (true, _, 5..=8) => "attn_cached_gqa_split_gated_f32_8",
-                        (true, _, _) => "attn_cached_gqa_split_gated_f32_16",
+                    rt.pso(match head_dim.div_ceil(32) {
+                        0..=1 => "attn_cached_gqa_split_f32_1",
+                        2 => "attn_cached_gqa_split_f32_2",
+                        3..=4 => "attn_cached_gqa_split_f32_4",
+                        5..=8 => "attn_cached_gqa_split_f32_8",
+                        _ => "attn_cached_gqa_split_f32_16",
                     })?
                 } else {
-                    rt.pso(match (gate.is_some(), head_dim.div_ceil(32)) {
-                        (false, 0..=1) => "flash_attn_cached_f32_1",
-                        (false, 2) => "flash_attn_cached_f32_2",
-                        (false, 3..=4) => "flash_attn_cached_f32_4",
-                        (false, 5..=8) => "flash_attn_cached_f32_8",
-                        (false, _) => "flash_attn_cached_f32",
-                        (true, 0..=1) => "flash_attn_cached_gated_f32_1",
-                        (true, 2) => "flash_attn_cached_gated_f32_2",
-                        (true, 3..=4) => "flash_attn_cached_gated_f32_4",
-                        (true, 5..=8) => "flash_attn_cached_gated_f32_8",
-                        (true, _) => "flash_attn_cached_gated_f32",
+                    rt.pso(match head_dim.div_ceil(32) {
+                        0..=1 => "flash_attn_cached_f32_1",
+                        2 => "flash_attn_cached_f32_2",
+                        3..=4 => "flash_attn_cached_f32_4",
+                        5..=8 => "flash_attn_cached_f32_8",
+                        _ => "flash_attn_cached_f32",
                     })
                     .or_else(|_| rt.pso("attn_cached_f32"))?
                 });
@@ -3599,9 +3556,6 @@ impl Session {
                     bind(5, vis.unwrap_or(q));
                     bind(6, k);
                     bind(7, v);
-                }
-                if let Some(g_id) = gate {
-                    bind(14, g_id);
                 }
                 #[repr(C)]
                 struct AttnCachedParams {
@@ -3651,18 +3605,10 @@ impl Session {
                     MTLSize::new(TG4, 1, 1),
                 );
                 if let Some(part) = scratch_guard.as_ref().filter(|_| n_splits > 1) {
-                    let merge_k = if gate.is_some() {
-                        "attn_cached_merge_gated_f32"
-                    } else {
-                        "attn_cached_merge_f32"
-                    };
-                    enc.set_compute_pipeline_state(rt.pso(merge_k)?);
+                    enc.set_compute_pipeline_state(rt.pso("attn_cached_merge_f32")?);
                     enc.set_buffer(0, Some(part), 0);
                     bind(1, s.out);
                     set_bytes(enc, 2, &p);
-                    if let Some(g_id) = gate {
-                        bind(14, g_id);
-                    }
                     enc.dispatch_thread_groups(
                         MTLSize::new(heads as u64, m as u64, 1),
                         MTLSize::new(TG4, 1, 1),
@@ -3742,7 +3688,6 @@ impl Session {
                 channels,
                 kernel,
                 dilation,
-                silu,
             } => {
                 enc.set_compute_pipeline_state(rt.pso("causal_conv1d_f32")?);
                 bind(0, x);
@@ -3762,7 +3707,6 @@ impl Session {
                     dilation: u32,
                     hist: u32,
                     has_state: u32,
-                    silu: u32,
                 }
                 let p = Conv1dParams {
                     n: n as u32,
@@ -3771,7 +3715,6 @@ impl Session {
                     dilation: dilation as u32,
                     hist: hist as u32,
                     has_state: state.is_some() as u32,
-                    silu: silu as u32,
                 };
                 set_bytes(enc, 4, &p);
                 grid1(channels);
@@ -3783,8 +3726,6 @@ impl Session {
                 beta,
                 log_decay,
                 state,
-                neg_a,
-                beta_sigmoid,
                 n,
                 key_heads,
                 val_heads,
@@ -3815,8 +3756,6 @@ impl Session {
                     key_dim: u32,
                     val_dim: u32,
                     rep: u32,
-                    beta_sigmoid: u32,
-                    has_neg_a: u32,
                 }
                 let p = DeltaRuleParams {
                     n: n as u32,
@@ -3825,11 +3764,8 @@ impl Session {
                     key_dim: key_dim as u32,
                     val_dim: val_dim as u32,
                     rep: rep as u32,
-                    beta_sigmoid: beta_sigmoid as u32,
-                    has_neg_a: neg_a.is_some() as u32,
                 };
                 set_bytes(enc, 7, &p);
-                bind(8, neg_a.unwrap_or(q));
                 if key_dim > 512 {
                     return Err(format!(
                         "node '{}': delta rule key_dim {key_dim} exceeds 512",
@@ -3890,16 +3826,11 @@ impl Session {
                         pair_stride: u32,
                         mscale: f32,
                     }
-                    let kname = if scale0.is_some_and(|s| s.1) {
-                        "rmsnorm_fused_vecscale_f32"
-                    } else {
-                        "rmsnorm_fused_f32"
-                    };
-                    enc.set_compute_pipeline_state(rt.pso(kname)?);
+                    enc.set_compute_pipeline_state(rt.pso("rmsnorm_fused_f32")?);
                     bind(0, x0);
                     bind(1, g0);
                     bind(2, res0.unwrap_or(x0));
-                    bind(3, scale0.map_or(x0, |s| s.0));
+                    bind(3, scale0.unwrap_or(x0));
                     bind(4, x);
                     bind(5, norm_w);
                     enc.set_buffer(6, Some(scratch), off_norm as u64);
@@ -4059,8 +3990,8 @@ pub enum Step {
         g: ValueId,
         /// Added to the normalised output (`res + norm(x) * g`) when the norm's only reader was an Add.
         res: Option<ValueId>,
-        /// Scalar or elementwise multiplier (`(norm(x) * g [+ res]) * scale`, `(id, is_vec)`).
-        scale: Option<(ValueId, bool)>,
+        /// Scalar multiplier (`(norm(x) * g [+ res]) * scale[0]`) when the only reader was a scalar Mul.
+        scale: Option<ValueId>,
         /// Chained pre-norm `(g2, out2, eps2)` over this step's output `out`.
         chain: Option<(ValueId, ValueId, f32)>,
         /// Fused RoPE applied per head after normalisation when the norm's only reader was a Rope.
@@ -4142,7 +4073,6 @@ pub enum Step {
         pos: Option<ValueId>,
         vis: Option<ValueId>,
         rope: Option<NormRope>,
-        gate: Option<ValueId>,
         heads: usize,
         head_dim: usize,
         kv_heads: usize,
@@ -4178,7 +4108,6 @@ pub enum Step {
         channels: usize,
         kernel: usize,
         dilation: usize,
-        silu: bool,
     },
     DeltaRule {
         q: ValueId,
@@ -4187,8 +4116,6 @@ pub enum Step {
         beta: ValueId,
         log_decay: ValueId,
         state: Option<ValueId>,
-        neg_a: Option<ValueId>,
-        beta_sigmoid: bool,
         n: usize,
         key_heads: usize,
         val_heads: usize,
@@ -4202,13 +4129,7 @@ pub enum Step {
         up_w: ValueId,
         down_w: ValueId,
         post_norm_w: Option<ValueId>,
-        pre_res: Option<(
-            ValueId,
-            ValueId,
-            Option<ValueId>,
-            Option<(ValueId, bool)>,
-            f32,
-        )>,
+        pre_res: Option<(ValueId, ValueId, Option<ValueId>, Option<ValueId>, f32)>,
         gate_name: String,
         up_name: String,
         down_name: String,
@@ -4713,133 +4634,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             );
         }
     }
-    let mut attn_gates: HashMap<usize, (ValueId, ValueId)> = HashMap::new();
-    let mut delta_fusions: HashMap<usize, (ValueId, bool, ValueId, Option<ValueId>)> =
-        HashMap::new();
-    if fusion_policy().allows(FusionClass::ReduceInput) {
-        for (ai, node) in g.nodes.iter().enumerate() {
-            if !matches!(node.op, Op::CachedAttention { .. }) || node.outputs.is_empty() {
-                continue;
-            }
-            let a_out = node.outputs[0];
-            if g.outputs.contains(&a_out) {
-                continue;
-            }
-            let Some(&[mi]) = readers.get(&a_out).map(Vec::as_slice) else {
-                continue;
-            };
-            if mi <= ai || g.nodes[mi].op != Op::Mul || g.nodes[mi].inputs.len() != 2 {
-                continue;
-            }
-            let g_act = if g.nodes[mi].inputs[0] == a_out {
-                g.nodes[mi].inputs[1]
-            } else {
-                g.nodes[mi].inputs[0]
-            };
-            if g_act == a_out
-                || g.outputs.contains(&g_act)
-                || readers.get(&g_act).map(Vec::as_slice) != Some(&[mi])
-            {
-                continue;
-            }
-            let ValueKind::Node(gn) = g.value(g_act).kind else {
-                continue;
-            };
-            let gi = gn.0 as usize;
-            if gi >= mi
-                || !matches!(
-                    g.nodes[gi].op,
-                    Op::Unary {
-                        kind: crate::graph::UnaryKind::Sigmoid
-                    }
-                )
-                || g.nodes[gi].inputs.len() != 1
-            {
-                continue;
-            }
-            let gate_in = g.nodes[gi].inputs[0];
-            if exists_before(gate_in, ai)
-                && g.value(gate_in).dtype == DType::F32
-                && numel(g, gate_in).ok() == numel(g, a_out).ok()
-            {
-                fused[gi] = true;
-                fused[mi] = true;
-                attn_gates.insert(ai, (gate_in, g.nodes[mi].outputs[0]));
-            }
-        }
-        for (di, node) in g.nodes.iter().enumerate() {
-            let Op::DeltaRule { val_heads, .. } = &node.op else {
-                continue;
-            };
-            if node.inputs.len() < 5 {
-                continue;
-            }
-            let (mut beta, mut beta_sig) = (node.inputs[3], false);
-            if !g.outputs.contains(&beta) && readers.get(&beta).map(Vec::as_slice) == Some(&[di]) {
-                if let ValueKind::Node(bn) = g.value(beta).kind {
-                    let bi = bn.0 as usize;
-                    if bi < di
-                        && matches!(
-                            g.nodes[bi].op,
-                            Op::Unary {
-                                kind: crate::graph::UnaryKind::Sigmoid
-                            }
-                        )
-                        && g.nodes[bi].inputs.len() == 1
-                    {
-                        let b_in = g.nodes[bi].inputs[0];
-                        if exists_before(b_in, di) {
-                            beta = b_in;
-                            beta_sig = true;
-                            fused[bi] = true;
-                        }
-                    }
-                }
-            }
-            let (mut ld, mut neg_a) = (node.inputs[4], None);
-            if !g.outputs.contains(&ld) && readers.get(&ld).map(Vec::as_slice) == Some(&[di]) {
-                if let ValueKind::Node(mn) = g.value(ld).kind {
-                    let mi = mn.0 as usize;
-                    if mi < di && g.nodes[mi].op == Op::Mul && g.nodes[mi].inputs.len() == 2 {
-                        let (i0, i1) = (g.nodes[mi].inputs[0], g.nodes[mi].inputs[1]);
-                        for (sp_val, na_val) in [(i0, i1), (i1, i0)] {
-                            if !g.outputs.contains(&sp_val)
-                                && readers.get(&sp_val).map(Vec::as_slice) == Some(&[mi])
-                                && numel(g, na_val).ok() == Some(*val_heads)
-                                && g.value(na_val).dtype == DType::F32
-                                && exists_before(na_val, di)
-                            {
-                                if let ValueKind::Node(sn) = g.value(sp_val).kind {
-                                    let si = sn.0 as usize;
-                                    if si < mi
-                                        && matches!(
-                                            g.nodes[si].op,
-                                            Op::Unary {
-                                                kind: crate::graph::UnaryKind::Softplus
-                                            }
-                                        )
-                                        && g.nodes[si].inputs.len() == 1
-                                    {
-                                        let a_in = g.nodes[si].inputs[0];
-                                        if exists_before(a_in, di) {
-                                            ld = a_in;
-                                            neg_a = Some(na_val);
-                                            fused[si] = true;
-                                            fused[mi] = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if beta_sig || neg_a.is_some() {
-                delta_fusions.insert(di, (beta, beta_sig, ld, neg_a));
-            }
-        }
-    }
     for (i, node) in g.nodes.iter().enumerate() {
         if fused[i] {
             continue;
@@ -5152,13 +4946,12 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         } else {
                             c.inputs[0]
                         };
-                        let sl = n_of(s)?;
                         if s != out
                             && exists_before(s, i)
-                            && (sl == 1 || (sl == xl && res.is_none() && s != x))
+                            && n_of(s)? == 1
                             && g.value(s).dtype == DType::F32
                         {
-                            scale = Some((s, sl > 1));
+                            scale = Some(s);
                             fused[*k] = true;
                             out = c.outputs[0];
                         }
@@ -5319,13 +5112,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 } else {
                     None
                 };
-                let gate = match attn_gates.remove(&i) {
-                    Some((g_in, m_out)) => {
-                        out = m_out;
-                        Some(g_in)
-                    }
-                    None => None,
-                };
                 if (*head_dim).max(*v_head_dim) > ATTN_MAX_HEAD_DIM {
                     return Err(format!(
                         "node '{name}': head_dim {} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}",
@@ -5344,7 +5130,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         pos,
                         vis,
                         rope,
-                        gate,
                         heads: *heads,
                         head_dim: *head_dim,
                         kv_heads: *kv_heads,
@@ -5422,19 +5207,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let wl = n_of(w)?;
                 let channels = wl / k.max(1);
                 let n = xl / channels.max(1);
-                let mut silu = false;
-                if let Some([j]) = readers
-                    .get(&out)
-                    .map(Vec::as_slice)
-                    .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
-                {
-                    let c = &g.nodes[*j];
-                    if c.op == Op::Silu && c.inputs.len() == 1 && !g.outputs.contains(&out) {
-                        silu = true;
-                        fused[*j] = true;
-                        out = c.outputs[0];
-                    }
-                }
                 (
                     Step::CausalConv1dCached {
                         x,
@@ -5444,7 +5216,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         channels,
                         kernel: k,
                         dilation: d,
-                        silu,
                     },
                     xl,
                 )
@@ -5458,10 +5229,8 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 let q = arg(0)?;
                 let k = arg(1)?;
                 let v = arg(2)?;
-                let (beta, beta_sigmoid, log_decay, neg_a) = match delta_fusions.remove(&i) {
-                    Some(f) => f,
-                    None => (arg(3)?, false, arg(4)?, None),
-                };
+                let beta = arg(3)?;
+                let log_decay = arg(4)?;
                 let state = if node.inputs.len() >= 6 {
                     Some(arg(5)?)
                 } else {
@@ -5481,8 +5250,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         beta,
                         log_decay,
                         state,
-                        neg_a,
-                        beta_sigmoid,
                         n,
                         key_heads: kh,
                         val_heads: vh,
@@ -5582,7 +5349,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Some(x),
                 Some(g),
                 res,
-                scale.map(|s| s.0),
+                scale,
                 chain.map(|c| c.0),
                 rope.map(|r| r.pos),
                 rope.map(|r| r.inv_freq),
@@ -5603,7 +5370,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 pos,
                 vis,
                 rope,
-                gate,
                 ..
             } => [
                 Some(q),
@@ -5614,7 +5380,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 pos,
                 vis,
                 rope.map(|r| r.inv_freq),
-                gate,
             ]
             .into_iter()
             .flatten()
@@ -5640,7 +5405,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 beta,
                 log_decay,
                 state,
-                neg_a,
                 ..
             } => [
                 Some(q),
@@ -5649,7 +5413,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Some(beta),
                 Some(log_decay),
                 state,
-                neg_a,
             ]
             .into_iter()
             .flatten()
@@ -6011,27 +5774,22 @@ fn print_kernel_profile(
 const CB_CHUNK_MIN_STEPS: usize = 220;
 
 /// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
-fn cb_chunking(steps_len: usize) -> (usize, usize) {
-    static C: std::sync::LazyLock<Option<(usize, usize)>> = std::sync::LazyLock::new(|| {
-        let v = std::env::var("GIBBS_CB_CHUNK").ok()?;
-        match v.as_str() {
-            "0" => Some((usize::MAX, usize::MAX)),
-            s => {
+fn cb_chunking() -> (usize, usize) {
+    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let v = std::env::var("GIBBS_CB_CHUNK").ok();
+        match v.as_deref() {
+            Some("0") => (usize::MAX, usize::MAX),
+            Some(s) => {
                 let mut it = s.split(',').filter_map(|p| p.trim().parse::<usize>().ok());
                 match (it.next(), it.next()) {
-                    (Some(a), Some(b)) if a > 0 && b > 0 => Some((a, b)),
-                    _ => None,
+                    (Some(a), Some(b)) if a > 0 && b > 0 => (a, b),
+                    _ => (24, 160),
                 }
             }
+            None => (24, 160),
         }
-    });
-    if steps_len >= CB_CHUNK_MIN_STEPS {
-        (*C).unwrap_or((24, 160))
-    } else if steps_len >= 96 && C.is_none() {
-        (16, usize::MAX)
-    } else {
-        (usize::MAX, usize::MAX)
-    }
+    })
 }
 
 /// GPU time from the start of the first to the end of the last of consecutive command buffers.
@@ -6764,208 +6522,6 @@ mod tests {
                 range(p),
                 range(q)
             );
-        }
-    }
-
-    /// CausalConv1dCached+Silu, DeltaRule beta/log_decay pre-activations, RmsNorm vector scale,
-    /// and CachedAttention sigmoid gate fuse into their steps and match the CPU executor.
-    #[test]
-    fn deltarule_conv_and_attention_gate_fuse_and_match_cpu() {
-        let f = DType::F32;
-        let (kh, vh, kd, vd) = (2usize, 4usize, 8usize, 8usize);
-        let cd = 2 * kh * kd + vh * vd;
-        let mut g = Graph::new();
-        let x_conv = g.input("x_conv", vec![1, cd], f);
-        let b_in = g.input("b_in", vec![1, vh], f);
-        let a_in = g.input("a_in", vec![1, vh], f);
-        let z_in = g.input("z_in", vec![1, vh * vd], f);
-        let conv_w = g.weight("conv_w", vec![cd, 4], f);
-        let neg_a = g.weight("neg_a", vec![vh], f);
-        let norm_w = g.weight("norm_w", vec![vd], f);
-        let c_state = g.state("c_state", vec![3, cd], f);
-        let s_state = g.state("s_state", vec![vh * kd * vd], f);
-
-        let conv = g.add(
-            "conv",
-            Op::CausalConv1dCached {
-                kernel: 4,
-                dilation: 1,
-            },
-            &[x_conv, conv_w, c_state],
-            vec![1, cd],
-            f,
-        );
-        let mixed = g.add("silu", Op::Silu, &[conv], vec![1, cd], f);
-        let q = g.add(
-            "q",
-            Op::Slice {
-                axis: -1,
-                start: 0,
-                end: (kh * kd) as i64,
-            },
-            &[mixed],
-            vec![1, kh * kd],
-            f,
-        );
-        let k = g.add(
-            "k",
-            Op::Slice {
-                axis: -1,
-                start: (kh * kd) as i64,
-                end: (2 * kh * kd) as i64,
-            },
-            &[mixed],
-            vec![1, kh * kd],
-            f,
-        );
-        let v = g.add(
-            "v",
-            Op::Slice {
-                axis: -1,
-                start: (2 * kh * kd) as i64,
-                end: cd as i64,
-            },
-            &[mixed],
-            vec![1, vh * vd],
-            f,
-        );
-        let beta = g.add(
-            "beta",
-            Op::Unary {
-                kind: crate::graph::UnaryKind::Sigmoid,
-            },
-            &[b_in],
-            vec![1, vh],
-            f,
-        );
-        let a_sp = g.add(
-            "a_sp",
-            Op::Unary {
-                kind: crate::graph::UnaryKind::Softplus,
-            },
-            &[a_in],
-            vec![1, vh],
-            f,
-        );
-        let ld = g.add("ld", Op::Mul, &[neg_a, a_sp], vec![1, vh], f);
-        let core = g.add(
-            "delta",
-            Op::DeltaRule {
-                key_heads: kh,
-                val_heads: vh,
-                key_dim: kd,
-                val_dim: vd,
-            },
-            &[q, k, v, beta, ld, s_state],
-            vec![1, vh * vd],
-            f,
-        );
-        let normed = g.add(
-            "norm",
-            Op::RmsNorm { eps: 1e-5 },
-            &[core, norm_w],
-            vec![1, vh * vd],
-            f,
-        );
-        let gated = g.add("gated", Op::Mul, &[normed, z_in], vec![1, vh * vd], f);
-        g.output(gated);
-
-        let mut w = Weights::new();
-        w.insert("conv_w", Tensor::F32(rand(cd * 4, 1)));
-        w.insert("neg_a", Tensor::F32(vec![-0.5, -1.0, -1.5, -2.0]));
-        w.insert("norm_w", Tensor::F32(rand(vd, 2)));
-        let sess = Session::new(rt(), &w).unwrap();
-        let prep = sess.prepare_plan(&g).unwrap();
-        assert_eq!(prep.steps.len(), 3, "conv+silu, delta_rule, rmsnorm+mul");
-        assert!(matches!(
-            prep.steps[0].op,
-            Step::CausalConv1dCached { silu: true, .. }
-        ));
-        assert!(matches!(
-            prep.steps[1].op,
-            Step::DeltaRule {
-                beta_sigmoid: true,
-                neg_a: Some(_),
-                ..
-            }
-        ));
-        assert!(matches!(
-            prep.steps[2].op,
-            Step::RmsNorm {
-                scale: Some((_, true)),
-                ..
-            }
-        ));
-        let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
-        for step in 0..3u64 {
-            let inp = vec![
-                Tensor::F32(rand(cd, 10 + step)),
-                Tensor::F32(rand(vh, 20 + step)),
-                Tensor::F32(rand(vh, 30 + step)),
-                Tensor::F32(rand(vh * vd, 40 + step)),
-            ];
-            let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
-            let got = sess.run_with_state(&g, Some(&mut ms), inp).unwrap();
-            assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-4);
-        }
-
-        let (heads, kv_heads, hd) = (4usize, 2usize, 8usize);
-        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-        let mut ga = Graph::new();
-        let qa = ga.input("q", vec![1, q_dim], f);
-        let ka = ga.input("k", vec![1, kv_dim], f);
-        let va = ga.input("v", vec![1, kv_dim], f);
-        let gate_in = ga.input("gate", vec![1, q_dim], f);
-        let pos = ga.input("pos", vec![1], DType::U32);
-        let ks = ga.state("ks", vec![16, kv_dim], f);
-        let vs = ga.state("vs", vec![16, kv_dim], f);
-        let att = ga.add(
-            "att",
-            Op::CachedAttention {
-                heads,
-                kv_heads,
-                head_dim: hd,
-                v_head_dim: hd,
-                scale: 0.25,
-                causal: true,
-                window: None,
-                soft_cap: None,
-                write: true,
-            },
-            &[qa, ka, va, ks, vs, pos],
-            vec![1, q_dim],
-            f,
-        );
-        let gate_sig = ga.add(
-            "gate_sig",
-            Op::Unary {
-                kind: crate::graph::UnaryKind::Sigmoid,
-            },
-            &[gate_in],
-            vec![1, q_dim],
-            f,
-        );
-        let att_out = ga.add("att_out", Op::Mul, &[att, gate_sig], vec![1, q_dim], f);
-        ga.output(att_out);
-        let sessa = Session::new(rt(), &Weights::new()).unwrap();
-        let prepa = sessa.prepare_plan(&ga).unwrap();
-        assert_eq!(prepa.steps.len(), 1, "CachedAttention+Sigmoid+Mul fused");
-        assert!(matches!(
-            prepa.steps[0].op,
-            Step::CachedAttention { gate: Some(_), .. }
-        ));
-        let (mut csa, mut msa) = (StateStore::new(), StateStore::new());
-        for step in 0..3u32 {
-            let inp = vec![
-                Tensor::F32(rand(q_dim, 50 + step as u64)),
-                Tensor::F32(rand(kv_dim, 60 + step as u64)),
-                Tensor::F32(rand(kv_dim, 70 + step as u64)),
-                Tensor::F32(rand(q_dim, 80 + step as u64)),
-                Tensor::U32(vec![step]),
-            ];
-            let want = cpu::run(&ga, &Weights::new(), &mut csa, inp.clone()).unwrap();
-            let got = sessa.run_with_state(&ga, Some(&mut msa), inp).unwrap();
-            assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
         }
     }
 
@@ -9902,205 +9458,5 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         assert_eq!(o3 % 256, 0);
         let got = sess.run(&g, inp).unwrap();
         assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
-    }
-
-    #[test]
-    fn gemv_q4_0_half_quarter_block_cols256_matches_cpu() {
-        let make_q4_0 = |n: usize, k: usize, seed: usize| {
-            let n_blocks = n * (k / 32);
-            let mut raw = Vec::with_capacity(n_blocks * 18);
-            for b in 0..n_blocks {
-                let d = crate::model::f32_to_f16(0.125 * (((b + seed) % 5) as f32 + 1.0));
-                raw.extend_from_slice(&d.to_le_bytes());
-                for j in 0..16 {
-                    let low = (j * 3 + b + seed) % 16;
-                    let high = (j * 5 + b * 2 + seed) % 16;
-                    raw.push((low | (high << 4)) as u8);
-                }
-            }
-            Tensor::Quantized(Arc::new(
-                crate::model::layers::QuantizedWeight::GgufQuantized {
-                    format: QuantFormat::GGUF_Q4_0,
-                    raw_data: bytes::Bytes::from(raw),
-                    in_features: k,
-                    out_features: n,
-                },
-            ))
-        };
-
-        for &(rows, cols) in &[(1536usize, 256usize), (256, 768)] {
-            for epi_case in [Epi::None, Epi::Gelu, Epi::Residual] {
-                let mut g = Graph::new();
-                let x = g.input("x", vec![1, cols], DType::F32);
-                let res_in = if epi_case == Epi::Residual {
-                    Some(g.input("res", vec![1, rows], DType::F32))
-                } else {
-                    None
-                };
-                let w_val = g.weight("w", vec![rows, cols], DType::Quant(QuantFormat::GGUF_Q4_0));
-                let y = g.add("lin", Op::Linear, &[x, w_val], vec![1, rows], DType::F32);
-                let out = match epi_case {
-                    Epi::None => y,
-                    Epi::Gelu => g.add(
-                        "gelu",
-                        Op::Gelu { tanh: false },
-                        &[y],
-                        vec![1, rows],
-                        DType::F32,
-                    ),
-                    Epi::Residual => g.add(
-                        "add",
-                        Op::Add,
-                        &[y, res_in.unwrap()],
-                        vec![1, rows],
-                        DType::F32,
-                    ),
-                    _ => unreachable!(),
-                };
-                g.output(out);
-
-                let (steps, _) = plan(&g).unwrap();
-                assert!(
-                    matches!(
-                        steps.as_slice(),
-                        [Planned {
-                            op: Step::GemvPacked {
-                                epi,
-                                rows: r,
-                                cols: c,
-                                format: WeightFormat::Q4_0,
-                                ..
-                            },
-                            ..
-                        }] if *epi == epi_case && *r == rows && *c == cols
-                    ),
-                    "expected fused GemvPacked {epi_case:?} for ({rows}, {cols}), got {steps:?}"
-                );
-
-                let mut w = Weights::new();
-                w.insert("w", make_q4_0(rows, cols, 11));
-                let mut inputs = vec![Tensor::F32(rand(cols, 31))];
-                if epi_case == Epi::Residual {
-                    inputs.push(Tensor::F32(rand(rows, 37)));
-                }
-                let want = cpu::run(&g, &w, &mut StateStore::new(), inputs.clone())
-                    .unwrap()
-                    .remove(0)
-                    .into_f32()
-                    .unwrap();
-                let mut s = Session::new(rt(), &w).unwrap();
-                s.set_variant_override(Some(GemvVariant::HAND));
-                let got = s
-                    .run_with_state(&g, Some(&mut StateStore::new()), inputs)
-                    .unwrap()
-                    .remove(0)
-                    .into_f32()
-                    .unwrap();
-                let err = rel_err(&want, &got);
-                assert!(
-                    err < 1e-4,
-                    "{epi_case:?} ({rows}, {cols}) rel_err {err}: want {:?} vs got {:?}",
-                    &want[..4],
-                    &got[..4]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn attn_cached_gqa_split_vec4_matches_cpu() {
-        let f = DType::F32;
-        let (heads, kv_heads, max_seq) = (8usize, 2usize, 320usize);
-        for hd in [128usize, 256, 512] {
-            let prefill_len = if hd >= 256 { 128usize } else { 256usize };
-            let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-            let scale = 1.0 / (hd as f32).sqrt();
-            for with_rope in [false, true] {
-                let make_graph = |m: usize| {
-                    let mut g = Graph::new();
-                    let q_in = g.input("q", vec![m, q_dim], f);
-                    let k_in = g.input("k", vec![m, kv_dim], f);
-                    let v_in = g.input("v", vec![m, kv_dim], f);
-                    let pos = g.input("pos", vec![m], DType::U32);
-                    let (q_att, k_att) = if with_rope {
-                        let inv = g.weight("inv", vec![hd / 2], f);
-                        let rope = Op::Rope {
-                            head_dim: hd,
-                            rotary_dim: hd,
-                            variant: crate::graph::RopeVariant::HalfSplit,
-                            mscale: 1.0,
-                        };
-                        let qr = g.add("qr", rope.clone(), &[q_in, pos, inv], vec![m, q_dim], f);
-                        let kr = g.add("kr", rope, &[k_in, pos, inv], vec![m, kv_dim], f);
-                        (qr, kr)
-                    } else {
-                        (q_in, k_in)
-                    };
-                    let ks = g.state("ks", vec![max_seq, kv_dim], f);
-                    let vs = g.state("vs", vec![max_seq, kv_dim], f);
-                    let out = g.add(
-                        "att",
-                        Op::CachedAttention {
-                            heads,
-                            kv_heads,
-                            head_dim: hd,
-                            v_head_dim: hd,
-                            scale,
-                            causal: true,
-                            window: None,
-                            soft_cap: Some(30.0),
-                            write: true,
-                        },
-                        &[q_att, k_att, v_in, ks, vs, pos],
-                        vec![m, q_dim],
-                        f,
-                    );
-                    g.output(out);
-                    g
-                };
-                let mut w = Weights::new();
-                if with_rope {
-                    w.insert("inv", Tensor::F32(rand(hd / 2, 77 + hd as u64)));
-                }
-                let prefill_g = make_graph(prefill_len);
-                let decode_g = make_graph(1);
-                let sess = Session::new(rt(), &w).unwrap();
-                if with_rope {
-                    let prep = sess.prepare_plan(&decode_g).unwrap();
-                    assert!(matches!(
-                        prep.steps[0].op,
-                        Step::CachedAttention { rope: Some(_), .. }
-                    ));
-                }
-                let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
-                let prefill_inp = vec![
-                    Tensor::F32(rand(prefill_len * q_dim, 100 + hd as u64)),
-                    Tensor::F32(rand(prefill_len * kv_dim, 200 + hd as u64)),
-                    Tensor::F32(rand(prefill_len * kv_dim, 300 + hd as u64)),
-                    Tensor::U32((0..prefill_len as u32).collect()),
-                ];
-                cpu::run(&prefill_g, &w, &mut cs, prefill_inp.clone()).unwrap();
-                sess.run_with_state(&prefill_g, Some(&mut ms), prefill_inp)
-                    .unwrap();
-                for step in 0..2u32 {
-                    let p_idx = prefill_len as u32 + step;
-                    let dec_inp = vec![
-                        Tensor::F32(rand(q_dim, 400 + step as u64)),
-                        Tensor::F32(rand(kv_dim, 500 + step as u64)),
-                        Tensor::F32(rand(kv_dim, 600 + step as u64)),
-                        Tensor::U32(vec![p_idx]),
-                    ];
-                    let want = cpu::run(&decode_g, &w, &mut cs, dec_inp.clone()).unwrap();
-                    let got = sess
-                        .run_with_state(&decode_g, Some(&mut ms), dec_inp)
-                        .unwrap();
-                    let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-                    assert!(
-                        err < 1e-4,
-                        "vec4 split-K mismatch for hd={hd} with_rope={with_rope} step={step}: {err}"
-                    );
-                }
-            }
-        }
     }
 }
