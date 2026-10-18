@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 66] = [
+const BASE_KERNELS: [&str; 69] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -448,6 +448,9 @@ const BASE_KERNELS: [&str; 66] = [
     "gemv_q4_k",
     "gemv_q2_k",
     "gemv_iq3_s",
+    "gemv_q4_0_half_pair",
+    "gemv_q8_0_pair",
+    "gemv_q4_k_pair",
     "gemm_batched_bf16_none",
     "gemm_batched_bf16_gelu",
     "gemm_batched_bf16_residual",
@@ -2364,6 +2367,7 @@ impl Session {
         }
         self.assign_variants(&mut steps);
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
+        pair_small_hand_gemvs(graph, &mut steps, &aliases, &offsets);
         let mut arena = self.arena.lock();
         if arena
             .as_ref()
@@ -2436,6 +2440,10 @@ impl Session {
                 }
                 Step::GemvPacked { rows, cols, .. } => {
                     flops_per_run += 2 * (*rows as u64) * (*cols as u64);
+                }
+                Step::GemvPackedPair { cols, legs, .. } => {
+                    flops_per_run +=
+                        2 * ((legs[0].rows + legs[1].rows) as u64) * (*cols as u64);
                 }
                 _ => {}
             }
@@ -3197,6 +3205,103 @@ impl Session {
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
                     MTLSize::new(256, 1, 1),
                 );
+            }
+            Step::GemvPackedPair {
+                x,
+                m,
+                cols,
+                format,
+                ref legs,
+            } => {
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct PackedGemvParams(u32, u32, u32, u32, u32);
+                #[repr(C)]
+                struct PackedGemvPairParams {
+                    p0: PackedGemvParams,
+                    p1: PackedGemvParams,
+                    tgs0: u32,
+                    pad0: u32,
+                    pad1: u32,
+                    pad2: u32,
+                }
+                let pair_kernel = if m == 1
+                    && legs[0].variant.kernel == GemvKernel::Hand
+                    && legs[1].variant.kernel == GemvKernel::Hand
+                {
+                    match format {
+                        WeightFormat::Q4_0 => Some("gemv_q4_0_half_pair"),
+                        WeightFormat::Q8_0 => Some("gemv_q8_0_pair"),
+                        WeightFormat::Q4_K => Some("gemv_q4_k_pair"),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(kname) = pair_kernel {
+                    let l0 = &legs[0];
+                    let l1 = &legs[1];
+                    enc.set_compute_pipeline_state(rt.pso(kname)?);
+                    bind(0, l0.w);
+                    bind(1, l1.w);
+                    bind(2, x);
+                    bind(3, l0.out);
+                    bind(4, l1.out);
+                    let tgs0 = (l0.rows as u64).div_ceil(16);
+                    let tgs1 = (l1.rows as u64).div_ceil(16);
+                    let pp = PackedGemvPairParams {
+                        p0: PackedGemvParams(
+                            u32_of(l0.rows)?,
+                            u32_of(cols)?,
+                            u32_of(m)?,
+                            l0.bias.is_some() as u32,
+                            l0.epi.as_u32(),
+                        ),
+                        p1: PackedGemvParams(
+                            u32_of(l1.rows)?,
+                            u32_of(cols)?,
+                            u32_of(m)?,
+                            l1.bias.is_some() as u32,
+                            l1.epi.as_u32(),
+                        ),
+                        tgs0: u32_of(tgs0 as usize)?,
+                        pad0: 0,
+                        pad1: 0,
+                        pad2: 0,
+                    };
+                    set_bytes(enc, 5, &pp);
+                    bind(6, l0.bias.unwrap_or(l0.out));
+                    bind(7, l1.bias.unwrap_or(l1.out));
+                    bind(8, l0.res.unwrap_or(l0.out));
+                    bind(9, l1.res.unwrap_or(l1.out));
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(tgs0 + tgs1, m as u64, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                } else {
+                    for leg in legs {
+                        let (pso, rows_per_tg) =
+                            self.gemv_pipeline(format, leg.variant, cols)?;
+                        enc.set_compute_pipeline_state(&pso);
+                        bind(0, leg.w);
+                        bind(1, x);
+                        bind(2, leg.out);
+                        let p = PackedGemvParams(
+                            u32_of(leg.rows)?,
+                            u32_of(cols)?,
+                            u32_of(m)?,
+                            leg.bias.is_some() as u32,
+                            leg.epi.as_u32(),
+                        );
+                        set_bytes(enc, 3, &p);
+                        bind(4, leg.bias.unwrap_or(leg.out));
+                        bind(5, leg.res.unwrap_or(leg.out));
+                        enc.dispatch_thread_groups(
+                            MTLSize::new((leg.rows as u64).div_ceil(rows_per_tg), m as u64, 1),
+                            MTLSize::new(256, 1, 1),
+                        );
+                    }
+                }
             }
             Step::GemmBatchedPacked {
                 x,
@@ -4066,6 +4171,13 @@ pub enum Step {
         /// Kernel variant, set by [`Session::prepare_plan`] from the tuner (or the format default).
         variant: GemvVariant,
     },
+    GemvPackedPair {
+        x: ValueId,
+        m: usize,
+        cols: usize,
+        format: WeightFormat,
+        legs: [GemvPairLeg; 2],
+    },
     GemmBatchedPacked {
         x: ValueId,
         w: ValueId,
@@ -4326,6 +4438,200 @@ pub struct NormSeg {
     pub d: usize,
     pub eps: f32,
     pub has_rope: bool,
+}
+
+/// One projection leg of [`Step::GemvPackedPair`].
+#[derive(Debug, Clone)]
+pub struct GemvPairLeg {
+    pub w: ValueId,
+    pub weight_name: String,
+    pub bias: Option<ValueId>,
+    pub res: Option<ValueId>,
+    pub epi: Epi,
+    pub rows: usize,
+    pub out: ValueId,
+    pub variant: GemvVariant,
+}
+
+/// Pairs already-adjacent small-row (`rows <= 512`) `HAND` `Step::GemvPacked` projections sharing
+/// `x`, `cols`, and `format` after variant assignment and arena allocation, verifying disjoint
+/// arena ranges for outputs and inputs.
+fn pair_small_hand_gemvs(
+    graph: &Graph,
+    steps: &mut Vec<Planned>,
+    aliases: &HashMap<ValueId, (ValueId, usize)>,
+    offsets: &HashMap<ValueId, usize>,
+) {
+    if !fusion_policy().allows(FusionClass::HorizontalBatch) {
+        return;
+    }
+    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
+    let range_of = |v: ValueId| -> Option<(usize, usize)> {
+        let off = *offsets.get(&v)?;
+        let len = graph.value(v).shape.iter().product::<usize>() * 4;
+        Some((off, off + len))
+    };
+    let overlaps = |(a0, a1): (usize, usize), (b0, b1): (usize, usize)| a0 < b1 && b0 < a1;
+    let can_pair = |a: &Planned, b: &Planned| -> bool {
+        if !a.extra_outs.is_empty() || !b.extra_outs.is_empty() {
+            return false;
+        }
+        let (
+            Step::GemvPacked {
+                x: x0,
+                m: 1,
+                rows: r0,
+                cols: c0,
+                format: f0,
+                variant: v0,
+                ..
+            },
+            Step::GemvPacked {
+                x: x1,
+                m: 1,
+                rows: r1,
+                cols: c1,
+                format: f1,
+                variant: v1,
+                ..
+            },
+        ) = (&a.op, &b.op)
+        else {
+            return false;
+        };
+        if x0 != x1
+            || f0 != f1
+            || c0 != c1
+            || *v0 != GemvVariant::HAND
+            || *v1 != GemvVariant::HAND
+            || *r0 > 512
+            || *r1 > 512
+        {
+            return false;
+        }
+        let fmt_ok = *f0 == WeightFormat::Q4_K
+            || *f0 == WeightFormat::Q8_0
+            || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0);
+        if !fmt_ok || b.reads.iter().any(|&r| r == a.out || root(r) == root(a.out)) {
+            return false;
+        }
+        let (Some(out0_r), Some(out1_r)) = (range_of(a.out), range_of(b.out)) else {
+            return false;
+        };
+        if overlaps(out0_r, out1_r) {
+            return false;
+        }
+        if a.reads
+            .iter()
+            .filter_map(|&r| range_of(r))
+            .any(|rr| overlaps(out1_r, rr))
+        {
+            return false;
+        }
+        if b.reads
+            .iter()
+            .filter_map(|&r| range_of(r))
+            .any(|rr| overlaps(out0_r, rr))
+        {
+            return false;
+        }
+        true
+    };
+    let same_rows = |a: &Planned, b: &Planned| -> bool {
+        matches!(
+            (&a.op, &b.op),
+            (
+                Step::GemvPacked { rows: r0, .. },
+                Step::GemvPacked { rows: r1, .. }
+            ) if r0 == r1
+        )
+    };
+    let old = std::mem::take(steps);
+    steps.reserve(old.len());
+    let mut i = 0;
+    while i < old.len() {
+        let defer_to_next = i + 2 < old.len()
+            && can_pair(&old[i], &old[i + 1])
+            && !same_rows(&old[i], &old[i + 1])
+            && can_pair(&old[i + 1], &old[i + 2])
+            && same_rows(&old[i + 1], &old[i + 2]);
+        if i + 1 < old.len() && !defer_to_next && can_pair(&old[i], &old[i + 1]) {
+            let s0 = old[i].clone();
+            let s1 = old[i + 1].clone();
+            let (
+                Step::GemvPacked {
+                    x,
+                    w: w0,
+                    weight_name: wn0,
+                    bias: bias0,
+                    res: res0,
+                    epi: epi0,
+                    m,
+                    rows: rows0,
+                    cols,
+                    format,
+                    variant: var0,
+                },
+                Step::GemvPacked {
+                    w: w1,
+                    weight_name: wn1,
+                    bias: bias1,
+                    res: res1,
+                    epi: epi1,
+                    rows: rows1,
+                    variant: var1,
+                    ..
+                },
+            ) = (s0.op, s1.op)
+            else {
+                unreachable!("checked by can_pair");
+            };
+            let mut reads = s0.reads;
+            for r in s1.reads {
+                if !reads.contains(&r) {
+                    reads.push(r);
+                }
+            }
+            steps.push(Planned {
+                name: format!("{}+{}", s0.name, s1.name),
+                op: Step::GemvPackedPair {
+                    x,
+                    m,
+                    cols,
+                    format,
+                    legs: [
+                        GemvPairLeg {
+                            w: w0,
+                            weight_name: wn0,
+                            bias: bias0,
+                            res: res0,
+                            epi: epi0,
+                            rows: rows0,
+                            out: s0.out,
+                            variant: var0,
+                        },
+                        GemvPairLeg {
+                            w: w1,
+                            weight_name: wn1,
+                            bias: bias1,
+                            res: res1,
+                            epi: epi1,
+                            rows: rows1,
+                            out: s1.out,
+                            variant: var1,
+                        },
+                    ],
+                },
+                out: s0.out,
+                extra_outs: vec![s1.out],
+                reads,
+            });
+            i += 2;
+        } else {
+            steps.push(old[i].clone());
+            i += 1;
+        }
+    }
 }
 
 /// Merges runs (<= 4) of adjacent steps that are independent of each other into one dispatch:
@@ -5492,7 +5798,8 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             Step::RmsNormBatch { .. }
             | Step::RopeBatch { .. }
             | Step::SplitGlu { .. }
-            | Step::MoeWeightedSum { .. } => {
+            | Step::MoeWeightedSum { .. }
+            | Step::GemvPackedPair { .. } => {
                 unreachable!("post-pass steps are created after node lowering")
             }
             Step::MegakernelMlp {
@@ -10024,6 +10331,83 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 "rel_err = {}",
                 rel_err(&want, &got)
             );
+        }
+    }
+
+    #[test]
+    fn gemv_packed_pair_small_rows_matches_cpu() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        for f in [
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q8_0,
+            QuantFormat::GGUF_Q4_0,
+        ] {
+            for (rows0, rows1, cols) in [(256usize, 256usize, 512usize), (16, 16, 2048)] {
+                let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (f as u64) ^ (cols as u64);
+                let mut next = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u32
+                };
+                let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+                let scale_at: &[usize] = match f {
+                    QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                    _ => &[0],
+                };
+                let mut w = Weights::new();
+                let mut g = Graph::new();
+                let mut quant = |g: &mut Graph, w: &mut Weights, name: &str, n: usize, k: usize| {
+                    let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                        .map(|_| (next() >> 4) as u8)
+                        .collect();
+                    for blk in raw.chunks_exact_mut(bb) {
+                        for &o in scale_at {
+                            let exp = 9 + (next() % 14) as u16;
+                            let d =
+                                ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                            blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                        }
+                    }
+                    w.insert(
+                        name,
+                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.into(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    );
+                    g.weight(name, vec![n, k], DType::Quant(f))
+                };
+                let x = g.input("x", vec![1, cols], DType::F32);
+                let kw = quant(&mut g, &mut w, "k_w", rows0, cols);
+                let vw = quant(&mut g, &mut w, "v_w", rows1, cols);
+                let kb = g.weight("k_b", vec![rows0], DType::F32);
+                w.insert("k_b", Tensor::F32(rand(rows0, 11)));
+                let k_out = g.add("k_proj", Op::Linear, &[x, kw, kb], vec![1, rows0], DType::F32);
+                let v_out = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
+                g.output(k_out);
+                g.output(v_out);
+
+                let mut s = Session::new(rt(), &w).unwrap();
+                s.set_variant_override(Some(GemvVariant::HAND));
+                let plan = s.prepare_plan(&g).unwrap();
+                assert_eq!(plan.steps.len(), 1);
+                assert!(matches!(plan.steps[0].op, Step::GemvPackedPair { .. }));
+
+                let inp = vec![Tensor::F32(rand(cols, 42))];
+                let mut cs = StateStore::new();
+                let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
+                let got = s.run_prepared(&g, &plan, None, inp).unwrap();
+                for (i, (wt, gt)) in want.iter().zip(&got).enumerate() {
+                    let err = rel_err(wt.as_f32().unwrap(), gt.as_f32().unwrap());
+                    assert!(
+                        err < 1e-5,
+                        "{f:?} ({rows0},{rows1},{cols}) out {i}: err {err}"
+                    );
+                }
+            }
         }
     }
 }
