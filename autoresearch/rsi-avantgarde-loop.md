@@ -60,27 +60,19 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 6 Avant-Garde Priority Queue (`W1 + M1 + W2` without `M3`, Race-Free Multi-TG `MoeWeightedSumNorm`, & Indexed GEMV `shared_x` Bandwidth)
+## 3. Wave 7 Avant-Garde Priority Queue (Promoting `M4 + M1 + rsi-23`, `WIDE_IQ2_XXS` Shared-Memory `x` Broadcast, & Attention/DeltaNet `Gen(1)` Pairing)
 
-### 1. Track W2-v2 (`exp-w2v2-gate-up-glu-nom3`, branched from `74c00eb` `W1 + M1` without `M3`) — Isolate `Step::ExpertGateUpGlu` with Fast-Math Preserved
-- **Context**: In Wave 5, `Step::ExpertGateUpGlu` (`3a7ba6a`, `-270` dispatches/tok on `Model 7`, `923 -> 653`, verified for 31/31 real-weight greedy tokens in `bg_191`) was only ever measured on top of `Track M3` (`bg_192`), which `bg_193` showed cancels `M1`'s gain, and with `set_fast_math_enabled(false)` disabling fast-math FMA across the entire GEMV loop.
+### 1. Promote Stacked `Track M4 + Track M1 + rsi-23` (`experiment/rsi-32-m4-m1` `d03ead3` + `2b7b6c8`) on a Quiet Host
+- **Staged Components**:
+  - **Track M4 (`41b39c9`, `experiment/rsi-32-m4-vec-wide-decode`)**: `packed_ushort4` / `packed_float4` vectorized `WIDE_Q4_0`, `WIDE_IQ4_NL`, and `WIDE_IQ2_XXS` `decode_group` (`moe_gemv_bandwidth`: `IQ4_NL 2816x704` `158.3 -> 181.2 GB/s`, `+14.5%`; `Q4_0 2816x704` `181.7 GB/s`; `IQ2_XXS 1408x2816` `143.8 -> 145.9 GB/s`; `Q4_0` `shape_rates` `gen/r1` beats `hand` across `(6144,1536)`, `(2048,1536)`, `(1536,2048)`, `(1536,2816)`, `(2816,768)`).
+  - **Track M1 (`68b1a41`)**: Fused MoE `TopKSoftmax` + `SplitGlu` + `MoeWeightedSum` (`-210` dispatches/tok on `Model 7`: `923 -> 713`). Together with `W1`/`M4`, verified in ultra-clean ABBA `bg_197` (`noise_pp = 0.037 pp`, `e2b_tok_s = 150.03 tok/s`, `Llama 1B Q4_0` `+2.02%`, `26B-A4B MoE` `+1.66%` at `71.65..72.1 tok/s`, `delta_pp = +0.253 pp`).
+  - **`rsi-23` (`2b7b6c8`)**: Zero-tax Qwen3.5 fusions (`-102` dispatches on `Qwen3.5 2B`, `-136` on `9B`), vectorized `gemv_iq4_xs`, pure-vec4 GQA split-K `NJ=4,8,16`, `gemv_q4_0_quarter`, and 2-CB `(16, usize::MAX)` pipeline for `96..220` steps (providing the additional `+0.60+ pp` suite uplift to clear `delta_pp >= max(0.30, noise_pp)`).
+
+### 2. Track M5 (`exp-m5-iq2xxs-shared-x`: Cooperative `threadgroup float shared_x` in `gemv_indexed`)
+- **Empirical Bottleneck (`bg_200` `moe_gemv_bandwidth`)**:
+  - After `Track M4` lifted `expert_down` (`GGUF_IQ4_NL 2816x704`) to `181.2 GB/s` (`49.2 us`), `expert_gate_up` (`GGUF_IQ2_XXS 1408x2816`, `top_k=8, x_rows=1`) remains at `145.9 GB/s` (`56.1 us`).
 - **Design**:
-  - Port `Step::ExpertGateUpGlu` (`gemv_indexed_glu`) onto `74c00eb` (`W1 + M1` alone, **without** `M3`), keeping **fast-math enabled** (`CompileOptions::new()`) on both `moe_gemv_pso` and `moe_gemv_glu_pso`.
-  - Prevent `tanh` overflow under fast-math by clamping the `tanh` argument inside `gelu_tanh` (`tanh(clamp(0.79788456f * x * (1.0f + 0.044715f * x * x), -10.0f, 10.0f))`) or calling `metal::precise::tanh`, and add ` IQ2_XXS + Q4_0` (`m = 1, 24`) to `moe_subgraph_fusions_match_cpu`.
+  - In `gemv_indexed` (`src/graph/codegen.rs`), all 8 simdgroups in a threadgroup share the exact same `xb` row (`slot` or `slot / top_k`). Stage `xb` in `2048`-float (`8 KB`, preserving `1024` max threads/TG = 100% occupancy) tiles in `threadgroup float shared_x[2048]` or preload `xs` across simdgroups, gated directly by `moe_gemv_bandwidth` on `GGUF_IQ2_XXS 1408x2816` and `GGUF_IQ4_NL 2816x704`.
 
-### 2. Track M3-v2 (`exp-m3v2-multitg-wsum-norm`, branched from `74c00eb` `W1 + M1`) — Race-Free Multi-TG `MoeWeightedSumNorm`
-- **Root Cause of Track M3 v1 (`beafc9b`) Regression (`bg_193` vs `bg_194`)**:
-  - Track M3 v1 launched a **single threadgroup (`1` of `16` GPU cores)** to read all `90 KB` (`8 * 2816 * 4` B) of `down [slots, h]`, serializing `2.7 MB/token` of reads onto 1 core (`+275 us/tok`).
-- **Race-Free Design**:
-  - Launch `num_tgs = ceil(h / 256)` threadgroups (`11` TGs across `11` GPU cores for `h = 2816`, grid `(num_tgs, n, 1)`): each TG `tg_x` computes `256` columns of `routed[r, c] = sum_s down[(r*k + s)*h + c] * weights[r*k + s]`, writes `routed[r, c]` to a device scratch buffer, and writes its 256-column partial sum-of-squares `sum_sq_tg` to `scratch_partials[r * num_tgs + tg_x]`.
-  - Lane 0 of each TG executes `atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device)` (NOT `threadgroup_barrier`, which only orders within one TG!) and then `uint done = atomic_fetch_add_explicit(&scratch_counters[r], 1u, memory_order_acq_rel);` + `simd_broadcast_first(done)` / `threadgroup_barrier(mem_flags::mem_threadgroup)`.
-  - Only the **last finishing threadgroup** (`done == num_tgs - 1`) executes `atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device)`, resets `scratch_counters[r] = 0u` (on lane 0), sums `scratch_partials[r * num_tgs .. + num_tgs]`, computes `inv_rms = rsqrt(total_sq / float(h) + eps)`, and normalizes `routed[r, 0..h]` -> `out[r, 0..h]` (`+res`, `*scale`).
-
-### 3. Track M4 (`exp-m4-moe-indexed-bw`, branched from `main`) — `ExpertLinear` `gemv_indexed` Bandwidth Optimization (`moe_gemv_bandwidth`)
-- **Context**: `moe_gemv_bandwidth` (`moe-gemv-bw-r2`) measured `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)` at `143.7 GB/s` (`56.9 us`) and `GGUF_IQ4_NL 2816x704 (top_k=8, x_rows=8)` at `158.3 GB/s` (`56.3 us`) against a `~290 GB/s` ceiling (`~3.4–4.5 ms/token` across 60 `ExpertLinear` steps on `Model 7`).
-- **Design**:
-  - Add `GGUF_Q4_0 2816x704 (top_k=8, x_rows=8)` to `moe_gemv_bandwidth` in `src/graph/metal/ext/moe.rs`.
-  - In `gemv_indexed` (`src/graph/codegen.rs`), cooperately stage `xb[0..p.cols]` into `threadgroup float shared_x[2048]` (`8 KB` max, preserving `1024` max threads/TG = 100% occupancy) when `p.cols <= 2048` (or tile `xb` in `2048`-float chunks) and vectorize `WIDE_IQ2_XXS` sign selection (`select(g0, -g0, ...)`), gated directly by `moe_gemv_bandwidth`.
-
-### 4. Staged Stack Ready for Quiet ABBA Promotion
-- **`experiment/rsi-31-w1-m1` (`74c00eb`)** and **`experiment/rsi-31-w1-m1-rsi23` (`799202e`)**: Staged for `scripts/verify_when_quiet.sh` once the host GPU is idle (`base_spread <= 0.04`).
+### 3. Track A6 (`exp-a6-kv-hoist-gen1-pair`: `GemvKernel::Gen { rows_per_sg: 1 }` & `BF16` Sibling Projection Pairing)
+- Extend `Step::GemvPackedPair` to support `Gen(1)` and `BF16` for adjacent sibling projections sharing `x` with `rows <= 512` (targeting `Qwen3.5 2B` DeltaNet `proj_b + proj_a` `16x2048` `BF16` and Full Attention `k_proj + v_proj` `512x2048`).

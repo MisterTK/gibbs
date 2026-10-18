@@ -627,3 +627,29 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
     - **`W1 + M1` alone (`bg_194`, `713` dispatches, `74c00eb` on `experiment/rsi-31-w1-m1`)**: **`median_ratio = 1.0177` (`+1.77%`, `3/4` pairs `[1.018, 1.023, 0.880, 1.017]`, `69.9 -> 71.3 tok/s`, `gpu_ms 13.910 -> 13.652 ms`, `-258 us/tok`)**.
 - **Stacked `rsi-31` (`Track W1 WIDE_Q4_0` + `Track M1` + `rsi-23`, `799202e` staged on `experiment/rsi-31-w1-m1-rsi23`) ABBA Verification (`bg_195`)**:
   - Aggregate `delta_pp = +0.94 pp` (`noise_pp = 0.37 pp`, `ratios_ok = true`, `min_ratio = 0.9926`), but classified as **`inconclusive (contended)`** (`--`) because foreign GPU load (`90%`/`24%` in `quiet-wait`) caused elevated `base_spread` across models (`Model 0` `0.195`, `Model 2` `0.056`, `Model 4` `0.058`; `e2b_tok_s = 128.64 tok/s`). Staged on `experiment/rsi-31-w1-m1-rsi23`.
+
+## Wave 6 — Clean ABBA of `W1 + M1` (`bg_197`), Track M4 Vectorized `Wide` Decode (`+14.5%` `IQ4_NL` MoE GEMV), Isolated Track W2-v2 (`bg_201`), & Race-Free Multi-TG Track M3-v2 (`bg_202`)
+- **Reverting Unnecessary `moe_gemv_pso` Fast-Math Disable (`b3d6dd2`)**:
+  - Restored default `CompileOptions::new()` (fast-math enabled) in `moe_gemv_pso` (`src/graph/metal/ext/moe.rs`), which immediately lifted `moe_gemv_bandwidth` on `GGUF_IQ4_NL 2816x704` from `158.3 GB/s` (`56.3 us`) to **`169.7 GB/s` (`52.6 us`, `+7.2%`)** (`promote-w1-m1-base`).
+- **Ultra-Clean 4-Pass ABBA of `Track W1 + Track M1` Alone (`74c00eb`, `bg_197`)**:
+  - `noise_pp = 0.037 pp`, `max base_spread = 0.0058` across all 9 models, `delta_pp = +0.253 pp` (`51.90% -> 52.16%`), `ratios_ok = true` (`min_ratio = 0.9925`):
+    - `Model 0` (`Gemma 4 E2B QAT`): **`148.57 -> 150.03 tok/s` (`+0.98%`, `base_spread = 0.0030`)**
+    - `Model 4` (`Llama 3.2 1B Q4_0`): **`251.36 -> 256.43 tok/s` (`+2.02%`, `base_spread = 0.0058`)**
+    - `Model 7` (`Gemma 4 26B-A4B MoE`): **`70.47 -> 71.65 tok/s` (`+1.66%`, `base_spread = 0.00028`, `dispatches 923 -> 713`)**
+    - `Model 8` (`E2B QAT ctx4k`): **`124.19 -> 124.91 tok/s` (`+0.58%`, `base_spread = 0.0034`)**
+  - Because `delta_pp = +0.253 pp < 0.30 pp` and untouched `Model 3` (`Qwen3.5-9B IQ2_M`) was `0.9925 < 0.995` (the alternate targeted-keep control floor), `74c00eb` was not promoted alone and remains staged on `experiment/rsi-31-w1-m1` to be stacked with `rsi-23` (`+0.80..+0.94 pp` suite delta).
+- **Track M4 (`ExpertM4IndexedGemvBw`, `41b39c9` on `experiment/rsi-32-m4-vec-wide-decode`, stacked with `M1` at `d03ead3` on `experiment/rsi-32-m4-m1`)**:
+  - Vectorized `WIDE_Q4_0` and `WIDE_IQ4_NL` using 2-byte-aligned `packed_ushort4` 64-bit loads + `uchar4` unpacks + 4-byte-aligned `packed_float4` stores, and replaced `WIDE_IQ2_XXS`'s scalar sign-bit ternary loop with branchless `select(g0, -g0, int4(...) < 0)` (`src/graph/codec.rs`).
+  - Passed `codec_parity`, `gemv_matches_cpu_for_every_packed_format`, and `moe_linear_matches_cpu_for_every_format` (`bg_200`).
+  - **`moe_gemv_bandwidth` (`bg_200`)**:
+    - `GGUF_IQ4_NL 2816x704 (top_k=8, x_rows=8)` (`Model 7` `expert_down`): **`169.7 -> 181.2 GB/s` (`52.6 -> 49.2 us`, `-3.4 us/layer` = `-102 us/tok` vs fast-math baseline, and `+14.5%` / `-7.1 us/layer` vs `158.3 GB/s`!)**.
+    - `GGUF_Q4_0 2816x704 (top_k=8, x_rows=8)`: **`181.7 GB/s` (`49.1 us`)**.
+    - `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)` (`Model 7` `expert_gate_up`): **`143.8 -> 145.9 GB/s` (`56.9 -> 56.1 us`)**.
+  - **`SHAPE_RATES_FMT=Q4_0` (`bg_200`)**: `(2816, 768)` `gen/r1` jumped **`149 -> 156 GB/s` (beating `hand` `154 GB/s`)**, `(262144, 1536)` `gen/r2` jumped **`276 -> 282 GB/s`**, `(262144, 2816)` `gen/r2` **`281 GB/s` (beating `hand` `273 GB/s`)**.
+  - Lifted `Model 7` (`26B-A4B MoE`) in quiet 4-round screens `bg_201`/`bg_202` to **`71.8–72.1 tok/s` (`gpu_ms = 13.581–13.626 ms`)**. Full 9-model ABBA `bg_203` on `d03ead3` (`M4 + M1`) showed `+1.21%` on `Model 0` (`E2B QAT`) and `+1.78%` on `Model 7` (`26B-A4B`), but was hit mid-run by foreign GPU load on `Model 1` (`host_ms = 0.96 ms`) and `Model 6` (`base_spread = 0.199`, `host_ms = 1.45 ms`, `noise_pp = 1.10 pp`) -> classified as `inconclusive (contended)` (`--`) and staged on `experiment/rsi-32-m4-m1`.
+- **Track W2-v2 (`ExpertW2v2GateUpGluNoM3`, `7c004af` on `experiment/rsi-33-m4-m1-w2v2`): DISCARD (Perf-Neutral in Isolation)**:
+  - Ported `Step::ExpertGateUpGlu` onto `M4 + M1` **without `M3`**, keeping `fast_math_enabled = true` (`CompileOptions::new()`) on both `moe_gemv_pso` and `moe_gemv_glu_pso` and clamping `tanh` input to `[-10.0f, 10.0f]` (`moe_subgraph_fusions_match_cpu` passed on `F32` and `IQ2_XXS + Q4_0` `m = 1, 24`).
+  - 4-round isolated screen against `/tmp/gibbs-m4-m1` on `Model 7` (`bg_201`): `median_ratio = 1.0025` (`3/4` pairs `[0.959, 1.003, 1.002, 1.004]`, `72.1 -> 72.2 tok/s`, `gpu_ms: 13.581 -> 13.581 ms`, `dispatches: 713 -> 683`). Saving the `2 us` `SplitGlu` dispatch is perf-neutral (`+0.25% < +1.2%` screen bar); preserved on `experiment/rsi-33-m4-m1-w2v2`.
+- **Track M3-v2 (`ExpertM3v2MultiTgNorm`, `2f1a896` on `experiment/rsi-34-m4-m1-m3v2`): DISCARD (Device-Scope `seq_cst` Fence Cost)**:
+  - Implemented race-free 11-threadgroup `MoeWeightedSumNorm` using `atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device)` before and after the last-TG atomic counter (`moe_subgraph_fusions_match_cpu` passed for `h = 16` and `h = 2816` across 3 back-to-back calls).
+  - 4-round isolated screen against `/tmp/gibbs-m4-m1` on `Model 7` (`bg_202`): `median_ratio = 0.8616` (`71.8 -> 62.2 tok/s`, `gpu_ms: 13.626 -> 15.483 ms`, `+1.86 ms/tok` = `+62 us/layer` across 30 layers), confirming `plans/research-sprint-2.md` line 63 (`PLAN.md:17`): device-scope `seq_cst` fences across threadgroups on Apple Silicon are far more expensive than a dispatch boundary (`1.6–2.7 us`).
