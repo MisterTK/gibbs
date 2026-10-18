@@ -655,6 +655,57 @@ kernel void moe_weighted_sum_f32(device const float* down [[buffer(0)]],
     out[idx] = sum;
 }
 
+struct MoeWeightedSumNormParams {
+    uint n;
+    uint k;
+    uint h;
+    float eps;
+    uint has_res;
+    uint has_scale;
+};
+
+kernel void moe_weighted_sum_rmsnorm_f32(device const float* down [[buffer(0)]],
+                                         device const float* weights [[buffer(1)]],
+                                         device const float* gamma [[buffer(2)]],
+                                         device const float* res [[buffer(3)]],
+                                         device const float* scale_buf [[buffer(4)]],
+                                         device float* out [[buffer(5)]],
+                                         constant MoeWeightedSumNormParams& p [[buffer(6)]],
+                                         uint tg_id [[threadgroup_position_in_grid]],
+                                         uint sg [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]],
+                                         uint nsg [[simdgroups_per_threadgroup]],
+                                         uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float shared[8];
+    uint row = tg_id;
+    if (row >= p.n) return;
+    float w_local[32];
+    for (uint s = 0; s < p.k; ++s) {
+        w_local[s] = weights[(ulong)row * p.k + s];
+    }
+    float sq = 0.0f;
+    float vals[16];
+    uint idx = 0;
+    for (uint c = tid; c < p.h; c += 256, ++idx) {
+        float sum = 0.0f;
+        ulong base = (ulong)row * p.k;
+        for (uint s = 0; s < p.k; ++s) {
+            sum += down[(base + s) * p.h + c] * w_local[s];
+        }
+        vals[idx] = sum;
+        sq += sum * sum;
+    }
+    float total_sq = block_sum(sq, shared, sg, lane, nsg);
+    float inv_rms = rsqrt(total_sq / float(p.h) + p.eps);
+    float sc = (p.has_scale != 0u) ? scale_buf[0] : 1.0f;
+    idx = 0;
+    for (uint c = tid; c < p.h; c += 256, ++idx) {
+        float v = vals[idx] * inv_rms * gamma[c];
+        if (p.has_res != 0u) v += res[(ulong)row * p.h + c];
+        out[(ulong)row * p.h + c] = v * sc;
+    }
+}
+
 struct block_q4_0 {
     half d;
     uint8_t qs[16];
