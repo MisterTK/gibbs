@@ -2680,19 +2680,18 @@ impl Session {
                 // `GIBBS_CB_CHUNK=0` keeps a single buffer.
                 // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
                 // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
-                let (first, chunk) = cb_chunking(steps.len());
+                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
+                    cb_chunking()
+                } else {
+                    (usize::MAX, usize::MAX)
+                };
                 let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
                 let mut err = None;
                 let mut dispatches = 0u32;
                 let encode_start = std::time::Instant::now();
                 let mut at = 0;
                 while at < steps.len() && err.is_none() {
-                    let end = if cbs.is_empty() {
-                        first
-                    } else {
-                        at.saturating_add(chunk)
-                    }
-                    .min(steps.len());
+                    let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
                     let cb = self.rt.queue.new_command_buffer().to_owned();
                     let enc = cb.new_compute_command_encoder();
                     let counted = Counted::new(enc);
@@ -5775,27 +5774,22 @@ fn print_kernel_profile(
 const CB_CHUNK_MIN_STEPS: usize = 220;
 
 /// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
-fn cb_chunking(steps_len: usize) -> (usize, usize) {
-    static C: std::sync::LazyLock<Option<(usize, usize)>> = std::sync::LazyLock::new(|| {
-        let v = std::env::var("GIBBS_CB_CHUNK").ok()?;
-        match v.as_str() {
-            "0" => Some((usize::MAX, usize::MAX)),
-            s => {
+fn cb_chunking() -> (usize, usize) {
+    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        let v = std::env::var("GIBBS_CB_CHUNK").ok();
+        match v.as_deref() {
+            Some("0") => (usize::MAX, usize::MAX),
+            Some(s) => {
                 let mut it = s.split(',').filter_map(|p| p.trim().parse::<usize>().ok());
                 match (it.next(), it.next()) {
-                    (Some(a), Some(b)) if a > 0 && b > 0 => Some((a, b)),
-                    _ => None,
+                    (Some(a), Some(b)) if a > 0 && b > 0 => (a, b),
+                    _ => (24, 160),
                 }
             }
+            None => (24, 160),
         }
-    });
-    if steps_len >= CB_CHUNK_MIN_STEPS {
-        (*C).unwrap_or((24, 160))
-    } else if steps_len >= 96 && C.is_none() {
-        (16, usize::MAX)
-    } else {
-        (usize::MAX, usize::MAX)
-    }
+    })
 }
 
 /// GPU time from the start of the first to the end of the last of consecutive command buffers.
