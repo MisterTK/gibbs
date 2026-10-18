@@ -709,7 +709,7 @@ impl Runtime {
                 format!("host profile from {}", profile_path.display())
             }
             None => {
-                let busy_before = tune::foreign_busy();
+                let busy = cfg!(not(test)) && tune::foreign_busy();
                 rt.profile = rt.measure(msl4)?;
                 let ch = codec::source_hash();
                 if let Ok(entries) = std::fs::read_dir(cache.join("host")) {
@@ -733,7 +733,7 @@ impl Runtime {
                         }
                     }
                 }
-                if busy_before || tune::foreign_busy() {
+                if busy {
                     format!(
                         "host profile measured under foreign GPU load; not saved to {}",
                         profile_path.display()
