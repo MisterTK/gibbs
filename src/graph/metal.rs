@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 64] = [
+const BASE_KERNELS: [&str; 68] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -424,9 +424,13 @@ const BASE_KERNELS: [&str; 64] = [
     "gemm_sg_none",
     "gemm_sg_gelu",
     "gemm_sg_residual",
+    "gemm_sg_up_swiglu",
+    "gemm_sg_up_geglu",
     "gemm_rows_none",
     "gemm_rows_gelu",
     "gemm_rows_residual",
+    "gemm_rows_up_swiglu",
+    "gemm_rows_up_geglu",
     "rmsnorm_f32",
     "rmsnorm_residual_f32",
     "rmsnorm_fused_f32",
@@ -478,7 +482,13 @@ const BASE_KERNELS: [&str; 64] = [
     "gemv_nvfp4",
     "gemv_jesse_lut",
 ];
-const MPP_KERNELS: [&str; 3] = ["gemm_mpp_none", "gemm_mpp_gelu", "gemm_mpp_residual"];
+const MPP_KERNELS: [&str; 5] = [
+    "gemm_mpp_none",
+    "gemm_mpp_gelu",
+    "gemm_mpp_residual",
+    "gemm_mpp_up_swiglu",
+    "gemm_mpp_up_geglu",
+];
 
 /// GEMM implementation for `Op::Linear`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1426,6 +1436,8 @@ impl Runtime {
             Epi::None => "none",
             Epi::Gelu => "gelu",
             Epi::Residual => "residual",
+            Epi::UpSwiGlu => "up_swiglu",
+            Epi::UpGeGlu => "up_geglu",
             other => {
                 return Err(format!(
                     "Metal GEMM kernel '{prefix}' does not support epilogue {other:?}"
@@ -2854,6 +2866,12 @@ impl Session {
                     set_bytes(enc, 4, &u32_of(cols)?);
                     set_bytes(enc, 5, &u32_of(rows)?);
                     set_bytes(enc, 6, &(*address_bits as u32));
+                    #[repr(C)]
+                    struct PackedGemvParams(u32, u32, u32, u32, u32);
+                    let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi.as_u32());
+                    set_bytes(enc, 7, &p);
+                    let r = res.unwrap_or(out);
+                    enc.set_buffer(8, Some(r.0), r.1 as u64);
                     enc.dispatch_thread_groups(
                         MTLSize::new((rows as u64).div_ceil(32), 1, 1),
                         MTLSize::new(32, 1, 1),
@@ -3134,6 +3152,16 @@ impl Session {
                         set_bytes(enc, 4, &u32_of(cols)?);
                         set_bytes(enc, 5, &u32_of(rows)?);
                         set_bytes(enc, 6, &(*address_bits as u32));
+                        #[repr(C)]
+                        struct PackedGemvParams(u32, u32, u32, u32, u32);
+                        let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi.as_u32());
+                        set_bytes(enc, 7, &p);
+                        if let Some(rv) = res {
+                            let (rb, ro) = loc(rv);
+                            enc.set_buffer(8, Some(rb), (ro + row_idx * rows * 4) as u64);
+                        } else {
+                            enc.set_buffer(8, Some(out_buf), (out_off + row_idx * rows * 4) as u64);
+                        }
                         enc.dispatch_thread_groups(
                             MTLSize::new((rows as u64).div_ceil(32), 1, 1),
                             MTLSize::new(32, 1, 1),
@@ -3796,7 +3824,7 @@ impl Session {
             } => {
                 let bytes_norm = hidden * 4;
                 let bytes_inter = inter * 4;
-                let total_scratch = bytes_norm + 2 * bytes_inter;
+                let total_scratch = bytes_norm + bytes_inter;
 
                 let mut guard = self.mlp_scratch.lock();
                 if guard
@@ -3810,7 +3838,6 @@ impl Session {
 
                 let off_norm = 0usize;
                 let off_gate = bytes_norm;
-                let off_up = bytes_norm + bytes_inter;
 
                 // 1. RMSNorm: x * norm_w -> scratch[off_norm] (optionally fused with preceding post-attn norm/residual -> x)
                 if let Some((x0, g0, res0, scale0, eps0)) = pre_res {
@@ -3875,29 +3902,24 @@ impl Session {
                     Epi::None,
                 )?;
 
-                // 3. Up GEMV: scratch[off_norm] * up_w -> scratch[off_up]
+                // 3. Up GEMV + fused GLU epilogue: glu(scratch[off_gate]) * (scratch[off_norm] * up_w) -> scratch[off_gate]
+                let epi = if is_geglu {
+                    Epi::UpGeGlu
+                } else {
+                    Epi::UpSwiGlu
+                };
                 self.encode_gemv_or_gemm(
                     enc,
                     (scratch, off_norm),
                     loc(up_w),
                     variants[1],
                     up_name,
-                    None,
-                    (scratch, off_up),
+                    Some((scratch, off_gate)),
+                    (scratch, off_gate),
                     inter,
                     hidden,
-                    Epi::None,
+                    epi,
                 )?;
-
-                // 4. SwiGLU / GeGLU: scratch[off_gate] * scratch[off_up] -> scratch[off_gate]
-                let pso_name = if is_geglu { "geglu_f32" } else { "swiglu_f32" };
-                enc.set_compute_pipeline_state(rt.pso(pso_name)?);
-                enc.set_buffer(0, Some(scratch), off_gate as u64);
-                enc.set_buffer(1, Some(scratch), off_up as u64);
-                enc.set_buffer(2, Some(scratch), off_gate as u64);
-                set_bytes(enc, 3, &u32_of(inter)?);
-                grid1(inter);
-
                 // 5. Down GEMV with residual addition: scratch[off_gate] * down_w + x -> s.out
                 if let Some(pn) = post_norm_w {
                     // 5. Down GEMV into scratch[off_norm]: scratch[off_gate] * down_w -> scratch[off_norm]
@@ -7134,6 +7156,217 @@ mod tests {
         }
     }
 
+    #[test]
+    fn megakernel_mlp_epilogue_glu_matches_cpu() {
+        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        for f in [
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_IQ2_S,
+        ] {
+            for act_op in [Op::SwiGlu, Op::GeGlu] {
+                let (hidden, inter) = (256usize, 512usize);
+                let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (f as u64);
+                let mut next = move || {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (seed >> 33) as u32
+                };
+                let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
+                let scale_at: &[usize] = match f {
+                    QuantFormat::GGUF_Q4_K_M => &[0, 2],
+                    _ => &[0],
+                };
+                let mut w = Weights::new();
+                let mut g = Graph::new();
+                let mut quant = |g: &mut Graph, w: &mut Weights, name: &str, n: usize, k: usize| {
+                    let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                        .map(|_| (next() >> 4) as u8)
+                        .collect();
+                    for blk in raw.chunks_exact_mut(bb) {
+                        for &o in scale_at {
+                            let exp = 9 + (next() % 14) as u16;
+                            let d =
+                                ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
+                            blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
+                        }
+                    }
+                    w.insert(
+                        name,
+                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
+                            format: f,
+                            raw_data: raw.into(),
+                            in_features: k,
+                            out_features: n,
+                        })),
+                    );
+                    g.weight(name, vec![n, k], DType::Quant(f))
+                };
+                let x = g.input("x", vec![1, hidden], DType::F32);
+                let norm_w = g.weight("norm.weight", vec![hidden], DType::F32);
+                w.insert("norm.weight", Tensor::F32(vec![1.0; hidden]));
+                let normed = g.add(
+                    "norm",
+                    Op::RmsNorm { eps: 1e-5 },
+                    &[x, norm_w],
+                    vec![1, hidden],
+                    DType::F32,
+                );
+                let gw = quant(&mut g, &mut w, "gate.weight", inter, hidden);
+                let uw = quant(&mut g, &mut w, "up.weight", inter, hidden);
+                let dw = quant(&mut g, &mut w, "down.weight", hidden, inter);
+                let gate = g.add("gate", Op::Linear, &[normed, gw], vec![1, inter], DType::F32);
+                let up = g.add("up", Op::Linear, &[normed, uw], vec![1, inter], DType::F32);
+                let act = g.add("glu", act_op.clone(), &[gate, up], vec![1, inter], DType::F32);
+                let down = g.add("down", Op::Linear, &[act, dw], vec![1, hidden], DType::F32);
+                let out = g.add("add", Op::Add, &[x, down], vec![1, hidden], DType::F32);
+                g.output(out);
+                let unfused = g.clone();
+                assert_eq!(
+                    crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+                    1
+                );
+                let xs: Vec<f32> = (0..hidden).map(|i| (i as f32 * 0.37).sin()).collect();
+                let want = cpu::run(
+                    &unfused,
+                    &w,
+                    &mut StateStore::new(),
+                    vec![Tensor::F32(xs.clone())],
+                )
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+                for v in [
+                    None,
+                    Some(GemvVariant::HAND),
+                    Some(GemvVariant::generated(2)),
+                ] {
+                    let mut s = Session::new(rt(), &w).unwrap();
+                    s.set_variant_override(v);
+                    let prep = s.prepare_plan(&g).unwrap();
+                    assert_eq!(prep.steps.len(), 1);
+                    assert!(matches!(prep.steps[0].op, Step::MegakernelMlp { .. }));
+                    let got = s
+                        .run_with_state(
+                            &g,
+                            Some(&mut StateStore::new()),
+                            vec![Tensor::F32(xs.clone())],
+                        )
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap();
+                    let err = rel_err(&want, &got);
+                    assert!(
+                        err < 1e-3,
+                        "{f:?} {act_op:?} {v:?}: megakernel MLP differs from CPU by {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemv_q4_0_half_quarter_block_cols256_matches_cpu() {
+        let make_q4_0 = |n: usize, k: usize, seed: usize| {
+            let n_blocks = n * (k / 32);
+            let mut raw = Vec::with_capacity(n_blocks * 18);
+            for b in 0..n_blocks {
+                let d = crate::model::f32_to_f16(0.125 * (((b + seed) % 5) as f32 + 1.0));
+                raw.extend_from_slice(&d.to_le_bytes());
+                for j in 0..16 {
+                    let low = (j * 3 + b + seed) % 16;
+                    let high = (j * 5 + b * 2 + seed) % 16;
+                    raw.push((low | (high << 4)) as u8);
+                }
+            }
+            Tensor::Quantized(Arc::new(
+                crate::model::layers::QuantizedWeight::GgufQuantized {
+                    format: QuantFormat::GGUF_Q4_0,
+                    raw_data: bytes::Bytes::from(raw),
+                    in_features: k,
+                    out_features: n,
+                },
+            ))
+        };
+
+        for &(rows, cols) in &[(1536usize, 256usize), (256, 768)] {
+            for epi_case in [Epi::None, Epi::Gelu, Epi::Residual] {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![1, cols], DType::F32);
+                let res_in = if epi_case == Epi::Residual {
+                    Some(g.input("res", vec![1, rows], DType::F32))
+                } else {
+                    None
+                };
+                let w_val = g.weight("w", vec![rows, cols], DType::Quant(QuantFormat::GGUF_Q4_0));
+                let y = g.add("lin", Op::Linear, &[x, w_val], vec![1, rows], DType::F32);
+                let out = match epi_case {
+                    Epi::None => y,
+                    Epi::Gelu => g.add(
+                        "gelu",
+                        Op::Gelu { tanh: false },
+                        &[y],
+                        vec![1, rows],
+                        DType::F32,
+                    ),
+                    Epi::Residual => {
+                        g.add("add", Op::Add, &[y, res_in.unwrap()], vec![1, rows], DType::F32)
+                    }
+                    _ => unreachable!(),
+                };
+                g.output(out);
+
+                let (steps, _) = plan(&g).unwrap();
+                assert!(
+                    matches!(
+                        steps.as_slice(),
+                        [Planned {
+                            op: Step::GemvPacked {
+                                epi,
+                                rows: r,
+                                cols: c,
+                                format: WeightFormat::Q4_0,
+                                ..
+                            },
+                            ..
+                        }] if *epi == epi_case && *r == rows && *c == cols
+                    ),
+                    "expected fused GemvPacked {epi_case:?} for ({rows}, {cols}), got {steps:?}"
+                );
+
+                let mut w = Weights::new();
+                w.insert("w", make_q4_0(rows, cols, 11));
+                let mut inputs = vec![Tensor::F32(rand(cols, 31))];
+                if epi_case == Epi::Residual {
+                    inputs.push(Tensor::F32(rand(rows, 37)));
+                }
+                let want = cpu::run(&g, &w, &mut StateStore::new(), inputs.clone())
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let mut s = Session::new(rt(), &w).unwrap();
+                s.set_variant_override(Some(GemvVariant::HAND));
+                let got = s
+                    .run_with_state(&g, Some(&mut StateStore::new()), inputs)
+                    .unwrap()
+                    .remove(0)
+                    .into_f32()
+                    .unwrap();
+                let err = rel_err(&want, &got);
+                assert!(
+                    err < 1e-4,
+                    "{epi_case:?} ({rows}, {cols}) rel_err {err}: want {:?} vs got {:?}",
+                    &want[..4],
+                    &got[..4]
+                );
+            }
+        }
+    }
+
     /// TQ2_0 lives in the planar device layout (groups of 8 blocks): GEMV (m = 1, every variant), the
     /// dequantizing batched path (m = 20) equal the CPU executor at shapes where rows are not whole groups
     /// (5, 9 blocks per row), n is not a multiple of the rows per threadgroup and the total block count is
@@ -7736,6 +7969,11 @@ mod tests {
             set_bytes(enc, 4, &(in_f as u32));
             set_bytes(enc, 5, &(out_f as u32));
             set_bytes(enc, 6, &(addr_bits as u32));
+            #[repr(C)]
+            struct PackedGemvParams(u32, u32, u32, u32, u32);
+            let p = PackedGemvParams(out_f as u32, in_f as u32, 1, 0, 0);
+            set_bytes(enc, 7, &p);
+            enc.set_buffer(8, Some(&y_buf), 0);
 
             enc.dispatch_thread_groups(
                 MTLSize::new((out_f as u64).div_ceil(32), 1, 1),
