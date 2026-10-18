@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 64] = [
+const BASE_KERNELS: [&str; 66] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -435,6 +435,8 @@ const BASE_KERNELS: [&str; 64] = [
     "rope_batch_f32",
     "swiglu_f32",
     "geglu_f32",
+    "split_glu_f32",
+    "moe_weighted_sum_f32",
     "gemv_q4_0",
     "gemv_q4_0_half",
     "gemv_q8_0",
@@ -3297,6 +3299,32 @@ impl Session {
                 set_bytes(enc, 3, &u32_of(n)?);
                 grid1(n);
             }
+            Step::SplitGlu {
+                x,
+                rows,
+                half_cols,
+                kind,
+            } => {
+                enc.set_compute_pipeline_state(rt.pso("split_glu_f32")?);
+                bind(0, x);
+                bind(1, s.out);
+                set_bytes(enc, 2, &[u32_of(rows)?, u32_of(half_cols)?, kind, 0u32]);
+                grid1(rows * half_cols);
+            }
+            Step::MoeWeightedSum {
+                down,
+                weights,
+                n,
+                k,
+                h,
+            } => {
+                enc.set_compute_pipeline_state(rt.pso("moe_weighted_sum_f32")?);
+                bind(0, down);
+                bind(1, weights);
+                bind(2, s.out);
+                set_bytes(enc, 3, &[u32_of(n)?, u32_of(k)?, u32_of(h)?, 0u32]);
+                grid1(n * h);
+            }
             Step::Rope {
                 x,
                 pos,
@@ -4058,6 +4086,19 @@ pub enum Step {
         gate: ValueId,
         up: ValueId,
         n: usize,
+    },
+    SplitGlu {
+        x: ValueId,
+        rows: usize,
+        half_cols: usize,
+        kind: u32,
+    },
+    MoeWeightedSum {
+        down: ValueId,
+        weights: ValueId,
+        n: usize,
+        k: usize,
+        h: usize,
     },
     Rope {
         x: ValueId,
@@ -5447,9 +5488,12 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .into_iter()
             .flatten()
             .collect(),
-            // Built only by `batch_horizontal`, after `plan` has returned.
-            Step::RmsNormBatch { .. } | Step::RopeBatch { .. } => {
-                unreachable!("batch steps are created after plan()")
+            // Built only by post-passes (`fuse_moe_subgraphs` / `batch_horizontal`).
+            Step::RmsNormBatch { .. }
+            | Step::RopeBatch { .. }
+            | Step::SplitGlu { .. }
+            | Step::MoeWeightedSum { .. } => {
+                unreachable!("post-pass steps are created after node lowering")
             }
             Step::MegakernelMlp {
                 x,
@@ -5507,7 +5551,352 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             reads,
         });
     }
+    fuse_moe_subgraphs(g, &mut steps, &aliases);
     Ok((steps, aliases))
+}
+
+/// Fuses MoE router TopK+GatherCols+Softmax(+GatherCols+Mul), fused gate/up Slice+Slice+GeGlu/SwiGlu,
+/// and expert down Mul+Reshape+Reduce(Sum) subgraphs when intermediate values have a single reader.
+fn fuse_moe_subgraphs(
+    g: &Graph,
+    steps: &mut Vec<Planned>,
+    aliases: &HashMap<ValueId, (ValueId, usize)>,
+) {
+    if !fusion_policy().allows(FusionClass::ReduceInput) {
+        return;
+    }
+    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
+    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
+    for st in steps.iter() {
+        for &r in &st.reads {
+            *use_count.entry(root(r)).or_insert(0) += 1;
+        }
+    }
+    for &o in &g.outputs {
+        *use_count.entry(root(o)).or_insert(0) += 1;
+    }
+    let single_use = |v: ValueId| use_count.get(&v).copied() == Some(1);
+
+    let slice_half = |v: ValueId| -> Option<(ValueId, usize, usize, bool)> {
+        let ValueKind::Node(nid) = g.value(v).kind else {
+            return None;
+        };
+        let node = &g.nodes[nid.0 as usize];
+        let Op::Slice { axis, start, end } = node.op else {
+            return None;
+        };
+        let src = *node.inputs.first()?;
+        let sh = &g.value(src).shape;
+        if sh.len() < 2 {
+            return None;
+        }
+        let rank = sh.len();
+        let ax = if axis < 0 { axis + rank as isize } else { axis };
+        if ax != rank as isize - 1 {
+            return None;
+        }
+        let cols = sh[rank - 1];
+        if cols == 0 || cols % 2 != 0 {
+            return None;
+        }
+        let half = cols / 2;
+        let rows: usize = sh[..rank - 1].iter().product();
+        let dim = cols as i64;
+        let clampi = |x: i64| {
+            if x < 0 {
+                (dim + x).max(0) as usize
+            } else {
+                x.min(dim) as usize
+            }
+        };
+        let (s, e) = (clampi(start), clampi(end));
+        if s == 0 && e == half {
+            Some((src, rows, half, false))
+        } else if s == half && e == cols {
+            Some((src, rows, half, true))
+        } else {
+            None
+        }
+    };
+
+    let mut i = 0;
+    while i < steps.len() {
+        // 1. Fused TopK + GatherCols + Softmax (+ optional GatherCols(scale) + Mul).
+        let topk_match = match steps[i].op {
+            Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
+                x: logits,
+                rows,
+                cols,
+                k,
+                weights_out: None,
+                scale: None,
+            })) if k <= 32 => Some((logits, rows, cols, k, steps[i].out)),
+            _ => None,
+        };
+        if let Some((logits, rows, cols, k, ids)) = topk_match {
+            let base_ok = if i + 2 < steps.len() {
+                let s1_ok = match steps[i + 1].op {
+                    Step::Ext(ext::ExtStep::Experts(ext::moe::Step::GatherCols {
+                        x: g_x,
+                        idx: g_idx,
+                        total,
+                        cols: g_cols,
+                        k: g_k,
+                        shared,
+                    })) => {
+                        (!shared || rows == 1)
+                            && g_x == logits
+                            && g_idx == ids
+                            && g_cols == cols
+                            && g_k == k
+                            && total == rows * k
+                            && single_use(steps[i + 1].out)
+                    }
+                    _ => false,
+                };
+                let s2_ok = match steps[i + 2].op {
+                    Step::Ext(ext::ExtStep::Norm(ext::norm::Step::Softmax {
+                        x: sm_x,
+                        outer: sm_outer,
+                        n: sm_inner,
+                        inner: 1,
+                    })) => sm_x == steps[i + 1].out && sm_outer == rows && sm_inner == k,
+                    _ => false,
+                };
+                s1_ok && s2_ok
+            } else {
+                false
+            };
+            if base_ok {
+                let sm_out = steps[i + 2].out;
+                let scaled = if i + 4 < steps.len() && single_use(sm_out) {
+                    let sc_table_opt = match steps[i + 3].op {
+                        Step::Ext(ext::ExtStep::Experts(ext::moe::Step::GatherCols {
+                            x: sc_table,
+                            idx: sc_idx,
+                            total: sc_tot,
+                            cols: sc_cols,
+                            k: sc_k,
+                            shared: true,
+                        })) if sc_idx == ids
+                            && sc_cols == cols
+                            && sc_k == k
+                            && sc_tot == rows * k
+                            && single_use(steps[i + 3].out) =>
+                        {
+                            Some((sc_table, steps[i + 3].out))
+                        }
+                        _ => None,
+                    };
+                    if let Some((sc_table, sc_out)) = sc_table_opt {
+                        match steps[i + 4].op {
+                            Step::Ext(ext::ExtStep::Elementwise(
+                                ext::elementwise::Step::Binary {
+                                    a,
+                                    b,
+                                    n,
+                                    kind: 2,
+                                    rank: 1,
+                                    ..
+                                },
+                            )) if ((a == sm_out && b == sc_out)
+                                || (b == sm_out && a == sc_out))
+                                && n == rows * k =>
+                            {
+                                Some((sc_table, steps[i + 4].out))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((sc_table, w_out)) = scaled {
+                    if let Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
+                        ref mut weights_out,
+                        ref mut scale,
+                        ..
+                    })) = steps[i].op
+                    {
+                        *weights_out = Some(w_out);
+                        *scale = Some(sc_table);
+                    }
+                    steps[i].extra_outs.push(w_out);
+                    if !steps[i].reads.contains(&sc_table) {
+                        steps[i].reads.push(sc_table);
+                    }
+                    steps.drain(i + 1..=i + 4);
+                    i += 1;
+                    continue;
+                } else {
+                    if let Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
+                        ref mut weights_out,
+                        ..
+                    })) = steps[i].op
+                    {
+                        *weights_out = Some(sm_out);
+                    }
+                    steps[i].extra_outs.push(sm_out);
+                    steps.drain(i + 1..=i + 2);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Fused SplitGlu: two single-reader 2D column slices (0..half, half..2*half) + GeGlu/SwiGlu.
+        if i + 2 < steps.len() {
+            let glu = match steps[i + 2].op {
+                Step::GeGlu { gate, up, n } => Some((gate, up, n, 1u32)),
+                Step::SwiGlu { gate, up, n } => Some((gate, up, n, 2u32)),
+                _ => None,
+            };
+            if let Some((gate_v, up_v, n, kind)) = glu {
+                let copies_ok = matches!(
+                    (&steps[i].op, &steps[i + 1].op),
+                    (
+                        Step::Ext(ext::ExtStep::Movement(ext::movement::Step::Copy {
+                            fill: None,
+                            parts: p0,
+                        })),
+                        Step::Ext(ext::ExtStep::Movement(ext::movement::Step::Copy {
+                            fill: None,
+                            parts: p1,
+                        })),
+                    ) if p0.len() == 1 && p1.len() == 1
+                );
+                let pair_ok = (steps[i].out == gate_v && steps[i + 1].out == up_v)
+                    || (steps[i].out == up_v && steps[i + 1].out == gate_v);
+                if copies_ok
+                    && pair_ok
+                    && steps[i].extra_outs.is_empty()
+                    && steps[i + 1].extra_outs.is_empty()
+                    && single_use(gate_v)
+                    && single_use(up_v)
+                {
+                    if let (Some((gu0, r0, hc0, false)), Some((gu1, r1, hc1, true))) =
+                        (slice_half(gate_v), slice_half(up_v))
+                    {
+                        if gu0 == gu1 && r0 == r1 && hc0 == hc1 && n == r0 * hc0 {
+                            let glu_step = steps.remove(i + 2);
+                            steps.remove(i + 1);
+                            steps[i] = Planned {
+                                name: glu_step.name,
+                                op: Step::SplitGlu {
+                                    x: gu0,
+                                    rows: r0,
+                                    half_cols: hc0,
+                                    kind,
+                                },
+                                out: glu_step.out,
+                                extra_outs: glu_step.extra_outs,
+                                reads: vec![gu0],
+                            };
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fused MoeWeightedSum: single-reader BroadcastBinary(Mul, [slots, h], [slots, 1]) + Reduce(Sum).
+        if i + 1 < steps.len() {
+            let mul_match = match steps[i].op {
+                Step::Ext(ext::ExtStep::Elementwise(ext::elementwise::Step::Binary {
+                    a,
+                    b,
+                    n: mul_n,
+                    kind: 2,
+                    ..
+                })) if steps[i].extra_outs.is_empty() && single_use(steps[i].out) => {
+                    Some((a, b, mul_n, steps[i].out))
+                }
+                _ => None,
+            };
+            let red_match = match steps[i + 1].op {
+                Step::Ext(ext::ExtStep::Norm(ext::norm::Step::Reduce {
+                    x: red_x, n_out, ..
+                })) if steps[i + 1].extra_outs.is_empty() => Some((red_x, n_out, steps[i + 1].out)),
+                _ => None,
+            };
+            if let (Some((a, b, mul_n, mul_out)), Some((red_x, n_out, red_out))) =
+                (mul_match, red_match)
+            {
+                let (rx_root, rx_off) = aliases.get(&red_x).copied().unwrap_or((red_x, 0));
+                if rx_root == mul_out && rx_off == 0 {
+                    let red_dims = match g.value(red_out).kind {
+                        ValueKind::Node(nid) => match &g.nodes[nid.0 as usize].op {
+                            Op::Reduce {
+                                kind: crate::graph::ReduceKind::Sum,
+                                axes,
+                                ..
+                            } if axes.len() == 1 => {
+                                let rsh = &g.value(red_x).shape;
+                                let ax = if axes[0] < 0 {
+                                    axes[0] + rsh.len() as isize
+                                } else {
+                                    axes[0]
+                                };
+                                if ax >= 0 && (ax as usize) < rsh.len() {
+                                    let ax = ax as usize;
+                                    let n: usize = rsh[..ax].iter().product();
+                                    let k = rsh[ax];
+                                    let h: usize = rsh[ax + 1..].iter().product();
+                                    Some((n, k, h))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((n, k, h)) = red_dims {
+                        let slots = n * k;
+                        let a_sh = g.value(a).shape.as_slice();
+                        let b_sh = g.value(b).shape.as_slice();
+                        let out_sh = g.value(mul_out).shape.as_slice();
+                        let operands = if out_sh == [slots, h] {
+                            if a_sh == [slots, h] && b_sh == [slots, 1] {
+                                Some((a, b))
+                            } else if b_sh == [slots, h] && a_sh == [slots, 1] {
+                                Some((b, a))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some((down, w_col)) = operands {
+                            if mul_n == slots * h && n_out == n * h {
+                                let red_step = steps.remove(i + 1);
+                                steps[i] = Planned {
+                                    name: red_step.name,
+                                    op: Step::MoeWeightedSum {
+                                        down,
+                                        weights: w_col,
+                                        n,
+                                        k,
+                                        h,
+                                    },
+                                    out: red_out,
+                                    extra_outs: Vec::new(),
+                                    reads: vec![down, w_col],
+                                };
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
 }
 
 /// First-fit arena offsets for graph inputs and step outputs; a value's space is reused once its
@@ -9492,5 +9881,149 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         assert_eq!(o3 % 256, 0);
         let got = sess.run(&g, inp).unwrap();
         assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
+    }
+
+    #[test]
+    fn moe_subgraph_fusions_match_cpu() {
+        use crate::graph::ReduceKind;
+
+        for m in [1usize, 2] {
+            let (h, ff, experts, top_k) = (16, 16, 6, 3);
+            let f = DType::F32;
+
+            // 1. MoE subgraph starting from router logits (12 raw steps -> 5 fused steps).
+            let mut g = Graph::new();
+            let x = g.input("x", vec![m, h], f);
+            let logits = g.input("logits", vec![m, experts], f);
+            let scale_w = g.weight("scale", vec![1, experts], f);
+            let gu_w = g.weight("gate_up", vec![experts * 2 * ff, h], f);
+            let down_w = g.weight("down", vec![experts * h, ff], f);
+
+            let ids = g.add(
+                "topk",
+                Op::TopK { k: top_k },
+                &[logits],
+                vec![m, top_k],
+                DType::U32,
+            );
+            let picked = g.add("picked", Op::GatherCols, &[logits, ids], vec![m, top_k], f);
+            let probs = g.add(
+                "probs",
+                Op::Softmax { axis: -1 },
+                &[picked],
+                vec![m, top_k],
+                f,
+            );
+            let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], f);
+            let weights_v = g.add("weights", Op::Mul, &[probs, sc], vec![m, top_k], f);
+            let gu = g.add(
+                "gu",
+                Op::MoeLinear { experts, top_k },
+                &[x, gu_w, ids],
+                vec![m * top_k, 2 * ff],
+                f,
+            );
+            let gate = g.add(
+                "gate",
+                Op::Slice {
+                    axis: 1,
+                    start: 0,
+                    end: ff as i64,
+                },
+                &[gu],
+                vec![m * top_k, ff],
+                f,
+            );
+            let up = g.add(
+                "up",
+                Op::Slice {
+                    axis: 1,
+                    start: ff as i64,
+                    end: (2 * ff) as i64,
+                },
+                &[gu],
+                vec![m * top_k, ff],
+                f,
+            );
+            let act = g.add("act", Op::GeGlu, &[gate, up], vec![m * top_k, ff], f);
+            let down = g.add(
+                "down",
+                Op::MoeLinear { experts, top_k },
+                &[act, down_w, ids],
+                vec![m * top_k, h],
+                f,
+            );
+            let w_col = g.add(
+                "w_col",
+                Op::Reshape {
+                    shape: Some(vec![m * top_k, 1]),
+                },
+                &[weights_v],
+                vec![m * top_k, 1],
+                f,
+            );
+            let weighted = g.add("weighted", Op::Mul, &[down, w_col], vec![m * top_k, h], f);
+            let slots = g.add(
+                "slots",
+                Op::Reshape {
+                    shape: Some(vec![m, top_k, h]),
+                },
+                &[weighted],
+                vec![m, top_k, h],
+                f,
+            );
+            let out = g.add(
+                "out",
+                Op::Reduce {
+                    kind: ReduceKind::Sum,
+                    axes: vec![1],
+                    keep_dims: false,
+                },
+                &[slots],
+                vec![m, h],
+                f,
+            );
+            g.output(out);
+
+            let mut w = Weights::new();
+            w.insert("scale", Tensor::F32(rand(experts, 11)));
+            w.insert("gate_up", Tensor::F32(rand(experts * 2 * ff * h, 22)));
+            w.insert("down", Tensor::F32(rand(experts * h * ff, 33)));
+
+            let sess = Session::new(rt(), &w).unwrap();
+            let prep = sess.prepare_plan(&g).unwrap();
+            assert_eq!(prep.steps.len(), 5, "12 raw MoE steps fuse to 5");
+            assert!(matches!(
+                prep.steps[0].op,
+                Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
+                    weights_out: Some(_),
+                    scale: Some(_),
+                    ..
+                }))
+            ));
+            assert!(matches!(prep.steps[2].op, Step::SplitGlu { kind: 1, .. }));
+            assert!(matches!(prep.steps[4].op, Step::MoeWeightedSum { .. }));
+
+            let inputs = vec![
+                Tensor::F32(rand(m * h, 44)),
+                Tensor::F32(rand(m * experts, 55)),
+            ];
+            let want = cpu::run_stateless(&g, &w, inputs.clone())
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            let got = sess
+                .run_prepared(&g, &prep, None, inputs)
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+            assert!(
+                rel_err(&want, &got) < 1e-5,
+                "rel_err = {}",
+                rel_err(&want, &got)
+            );
+        }
     }
 }
