@@ -714,12 +714,17 @@ impl Runtime {
                 let ch = codec::source_hash();
                 if let Ok(entries) = std::fs::read_dir(cache.join("host")) {
                     let prefix = format!("{tag}-");
+                    let mut best = None;
                     for e in entries.flatten() {
                         let name = e.file_name();
                         let Some(s) = name.to_str() else { continue };
                         if !s.starts_with(&prefix) || !s.ends_with(".json") {
                             continue;
                         }
+                        let mtime = e
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         let matched = std::fs::read(e.path())
                             .ok()
                             .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
@@ -738,13 +743,18 @@ impl Runtime {
                                     c,
                                 ))
                             });
-                        if let Some((bw, stream, ceil, c)) = matched {
-                            rt.profile.memory_bandwidth_gbps = bw;
-                            rt.profile.stream_gbps = stream;
-                            rt.profile.ceiling_gbps = ceil;
-                            rt.profile.codec = Some(c);
-                            break;
+                        if let Some(vals) = matched {
+                            let key = (mtime, s.to_owned());
+                            if best.as_ref().is_none_or(|(k, _)| key > *k) {
+                                best = Some((key, vals));
+                            }
                         }
+                    }
+                    if let Some((_, (bw, stream, ceil, c))) = best {
+                        rt.profile.memory_bandwidth_gbps = bw;
+                        rt.profile.stream_gbps = stream;
+                        rt.profile.ceiling_gbps = ceil;
+                        rt.profile.codec = Some(c);
                     }
                 }
                 if busy {
@@ -4222,6 +4232,7 @@ fn u32_of(n: usize) -> Result<u32, String> {
 pub(crate) enum FusionPolicy {
     Full,
     XlaClass,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4236,7 +4247,11 @@ pub(crate) enum FusionClass {
 impl FusionPolicy {
     pub(crate) fn allows(self, k: FusionClass) -> bool {
         use FusionClass::*;
-        self == FusionPolicy::Full || matches!(k, ReduceInput | DotEpilogue)
+        match self {
+            FusionPolicy::Full => true,
+            FusionPolicy::XlaClass => matches!(k, ReduceInput | DotEpilogue),
+            FusionPolicy::None => false,
+        }
     }
 }
 
@@ -4244,6 +4259,7 @@ pub(crate) fn fusion_policy() -> FusionPolicy {
     static P: std::sync::OnceLock<FusionPolicy> = std::sync::OnceLock::new();
     *P.get_or_init(|| match std::env::var("GIBBS_FUSION").as_deref() {
         Ok("xla") => FusionPolicy::XlaClass,
+        Ok("none" | "off" | "0") => FusionPolicy::None,
         _ => FusionPolicy::Full,
     })
 }
@@ -7283,6 +7299,7 @@ mod tests {
             QuantFormat::GGUF_Q6_K,
             QuantFormat::GGUF_Q8_0,
             QuantFormat::GGUF_IQ4_XS,
+            QuantFormat::GGUF_IQ2_XXS,
             QuantFormat::GGUF_Q5_K_M,
             QuantFormat::GGUF_Q3_K,
             QuantFormat::GGUF_IQ4_NL,
@@ -7296,7 +7313,10 @@ mod tests {
                 (1536, 6144),
                 (2048, 1536),
                 (1536, 2048),
+                (1536, 2816),
+                (2816, 768),
                 (262144, 1536),
+                (262144, 2816),
             ] {
                 let t = rt().bench_gemv(f, &[shape], &fmt.gemv_variants()).unwrap();
                 let best = t.iter().map(|x| x.1).fold(0.0, f64::max);
