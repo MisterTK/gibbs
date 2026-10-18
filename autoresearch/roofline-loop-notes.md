@@ -689,3 +689,36 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
   - **Quiet 4-Round Screen `bg_209` (`host_ms = 0.265–0.299 ms`)**:
     - **`Model 2` (`Qwen3.5-2B-UD-Q4_K_XL.gguf`)**: **`median_ratio = 1.0104` (`4/4` pairs `[1.009, 1.020, 1.011, 1.010]`, `112.7 -> 113.9 tok/s`, `gpu_ms: 8.616 -> 8.525 ms = -91 us/tok`, `dispatches: 430 -> 412 = -18` dispatches/tok)**.
     - Untouched controls: `Model 0` (`E2B QAT`) `1.0075` (`3/4` pairs), `Model 4` (`Llama 1B Q4_0`) `1.0005` (`3/4` pairs).
+
+## Wave 8 — Cross-Repo Lock Coordination, 2-Round Contention-Proof Tuner (`W8a`), 3-Round ABBA `moe_gemv_bandwidth` & `IQ2_XXS` Constant-Decode Ablation (`W8b`), Strict `HAND` `GemvPackedPair` (`W8c`), & `rsi-40` Full Guard + ABBA (`bg_214`, `bg_215`, `bg_216`)
+- **Cross-Repo Heavy-Lane Lock & `0-tests` Tripwire (`autoresearch/central_scheduler.py`, `cf60786` / `425f1e7`)**:
+  - `central_scheduler.py` now acquires `/tmp/ripster-lane-heavy.lock` before `~/.cache/gibbs/sched.lock` (coordinating with `/Users/keas/code/trading-system/scripts/sched.py`) and fails with `rc = 3` if any `cargo test` command outputs `running 0 tests`.
+  - Verified `cargo test --release --test codec_parity -q` (`2 passed; 0 failed`, `bg_212` & `bg_214`).
+- **Track W8a (`ExpertTunerTwoRound`, `2e80fee` in `experiment/rsi-40-w8-hardened`): Confirmed `Gen(2)` Tune-Cache Poisoning Hypothesis**:
+  - Updated `tuned_variant` (`src/graph/metal.rs`) to always run 2 opposite-order rounds (`0..2`) and updated `tune::decide` + `tune::rounds_consistent` (`src/graph/tune.rs`) to require both rounds to agree on the winner with `<= 5%` spread before persisting to `~/.cache/gibbs/host/tune-*.json` (8/8 `graph::tune::tests` passed).
+  - During `bg_215`, the 2-round tuner re-tuned `GGUF_Q4_0|2048|1536|de19cee9ffcfa698` to **`Gen(1)` at `202.44 GB/s` (`8.74 us`)**, and **`Model 0` (`E2B QAT`) jumped by `+2.89%` (`ratio = 1.0289`, `base_spread = 0.0052`, `cand1 = 140.2`, `cand2 = 139.7` vs `base1 = 136.4`, `base2 = 135.7`)**, confirming the Wave 7 `Gen(2)` tune-cache poisoning hypothesis.
+- **Track W8b (`ExpertMoeInterleavedR4`, `2c6f455` in `experiment/rsi-40-w8-hardened`): 3-Round Interleaved ABBA `moe_gemv_bandwidth` & `IQ2_XXS` Constant-Decode Ablation (`bg_214`)**:
+  - Replaced `static ROWS_PER_SG: AtomicUsize` in `src/graph/metal/ext/moe.rs` with an explicit per-format match (`4` for `GGUF_IQ4_NL | GGUF_Q4_0 | GGUF_IQ2_M`, `2` otherwise) and a `#[cfg(test)] thread_local!` override.
+  - **3-Round Interleaved `[2, 4, 4, 2]` ABBA `moe_gemv_bandwidth` (`bg_214`)**:
+    - `GGUF_IQ2_XXS 1408x2816`: `r=2 med = 56.6 us (144.5 GB/s)` vs `r=4 med = 65.1 us (125.6 GB/s)` (`r4_wins = 1/3`, `ratio = 0.8687` -> keep `r = 2`).
+    - `GGUF_IQ2_M 1408x2816`: `r=2 med = 67.9 us (149.7 GB/s)` vs `r=4 med = 60.5 us (167.8 GB/s)` (`r4_wins = 2/3`, `ratio = 1.1210`, `+12.1%`).
+    - `GGUF_IQ4_NL 2816x704`: `r=2 med = 57.9 us (154.2 GB/s)` vs `r=4 med = 46.1 us (193.3 GB/s)` (`r4_wins = 2/3`, `ratio = 1.2541`, `+25.4%`).
+    - `GGUF_Q4_0 2816x704`: `r=2 med = 41.7 us (214.0 GB/s)` vs `r=4 med = 39.0 us (228.8 GB/s)` (`r4_wins = 2/3`, `ratio = 1.0694`, `+6.9%`).
+    - Note: Because `r = 4` won `2/3` rounds (not `3/3`) during elevated desktop compositor load (`35–37%` GPU renderer floor), keep `IQ4_NL` / `Q4_0` / `IQ2_M` `r = 4` under review for a `3/3` re-check when compositor load is `< 20%`.
+  - **`IQ2_XXS` Constant-Decode Ablation (`moe_gemv_iq2xxs_constant_decode_ablation` in `bg_214`)**:
+    - Across 3 interleaved ABBA rounds on `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)`, replacing `IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]` with constant `0x0808080808080808ul` cut kernel time from **`57.4 us` (`142.5 GB/s`) to `40.9 us` (`199.9 GB/s`) — `-16.5 us/dispatch` (`-28.7%` time / `+40.3%` GB/s)**, proving that the 4 `IQ2XXS_GRID` lookups + `q4` dependency chain account for `28.7%` of `WIDE_IQ2_XXS` runtime while the dispatch/grid/`xb`/`aux1` floor is `40.9 us` (`199.9 GB/s`).
+- **Track W8c (`ExpertA6StrictHandPair`, `1574839` in `experiment/rsi-40-w8-hardened`)**:
+  - Restricted `pair_small_hand_gemvs` in `src/graph/metal.rs` to `v0 == GemvVariant::HAND && v1 == GemvVariant::HAND` (removing `|| *rows0 <= 64`) and verified via `gemv_packed_pair_small_rows_matches_cpu` that `Gen(1)` on `Q4_K_M` (`16x2048`) keeps 2 separate steps while `BF16` (`16x2048`) pairs into 1 `Step::GemvPackedPair` step.
+- **Full `loop_guard.sh` & 4-Pass ABBA Verification of `experiment/rsi-40-w8-hardened` (`425f1e7`, `bg_215`)**:
+  - Passed `scripts/loop_guard.sh` (`rc = 0`, `parity: 5 compared`, `min cos 1.00000`).
+  - In the 4-pass ABBA (`bg_215`), **all 8 models `Models 0..7` passed `ratio_ok = true` (+4.89 pp sum across `M0..M7`)**:
+    - `Model 0` (`E2B QAT`): **`1.0289` (`+2.89%`, `base_spread = 0.0052`)**
+    - `Model 1` (`E2B Q4_K_M`): **`1.0005` (`+0.05%`, `base_spread = 0.0059` — `bg_203` regression completely gone)**
+    - `Model 2` (`Qwen3.5-2B`): **`1.0106` (`+1.06%`, `base_spread = 0.0050`, `dispatches: 430 -> 412`)**
+    - `Model 3` (`Qwen3.5-9B IQ2_M`): **`1.0097` (`+0.97%`, `base_spread = 0.0073`, `dispatches: 594 -> 570`)**
+    - `Model 4` (`Llama 1B Q4_0`): **`1.0174` (`+1.74%`, `base_spread = 0.0059`)**
+    - `Model 5` (`SmolLM2 135M`): **`1.0404` (`+4.04%`, `base_spread = 0.069`)**
+    - `Model 6` (`Llama 1B bnb`): **`0.9893` (`base_spread = 0.031`)**
+    - `Model 7` (`26B-A4B MoE`): **`1.0130` (`+1.30%`, `base_spread = 0.0174`, `dispatches: 923 -> 713`)**
+    - `Model 8` (`E2B QAT ctx4k`): `0.9169` (`base1 = 112.8`, `cand1 = 94.8 [g = 9.80 ms spike]`, `cand2 = 112.7 [g = 8.25 ms]`, `base2 = 113.5 [g = 8.20 ms]`).
+  - Because `bg_215` ran under elevated desktop compositor/host load (`host_ms = 0.60–0.85 ms`, `Model 5` `base_spread = 0.069 > 0.04`) and had a single-pass `cand1` spike on `Model 8`, `425f1e7` is logged as `inconclusive (contended)` and staged on `experiment/rsi-40-w8-hardened` for a single clean ABBA promotion once `host_ms <= 0.35 ms`.

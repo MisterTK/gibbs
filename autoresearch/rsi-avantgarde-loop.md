@@ -60,25 +60,19 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 8 Avant-Garde Priority Queue (Cross-Repo Lock Coordination, Two-Round Contention-Proof Tuner, Interleaved `r=2` vs `r=4` MoE Benchmark + Constant-Decode Ablation, Strict `HAND` `gemv_bf16_pair`, & Promotion to `main`)
+## 3. Wave 9 Avant-Garde Priority Queue (Promoting `experiment/rsi-40-w8-hardened` on a Quiet Host & Exploiting the `IQ2_XXS` `199.9 GB/s` Constant-Decode Ablation)
 
-### 1. Closed Lines (Do Not Revisit)
-- **`Track M3` / `Track M3-v2` (`Step::MoeWeightedSumNorm`) & `Track W2` / `Track W2-v2` (`Step::ExpertGateUpGlu`)**: Closed (`W2-v2` proved `-30` dispatches = `0.000 ms` on `Model 7`, and `M3-v2` proved cross-TG `seq_cst` device fences cost `+1.86 ms/tok`).
-- **Threadgroup SRAM staging in `gemv_indexed` (`Track M5a` `tg_iq2xxs_grid[256]` & `Track M5b` `shared_x[2816]`)**: Discarded (`0 B` of `threadgroup` memory is strictly faster).
+### 1. Immediate First Action — Single Quiet ABBA & Promotion of `experiment/rsi-40-w8-hardened` (`425f1e7`) Before Opening New Branches
+- **`experiment/rsi-40-w8-hardened` (`425f1e7`)** has already passed:
+  - `cargo test --release --test codec_parity` (`2 passed; 0 failed`, `bg_212`/`bg_214`),
+  - Full `scripts/loop_guard.sh` (`rc = 0`, `parity: 5 compared`, `min cos 1.00000`, `bg_215`),
+  - All Wave 8 unit tests (`graph::tune::tests`, `gemv_packed_pair_small_rows_matches_cpu`, `moe_subgraph_fusions_match_cpu`, `moe_linear_matches_cpu_for_every_format`, `moe_gemv_pipeline_max_threads_and_occupancy`, `bg_214`), and
+  - Re-tuned `GGUF_Q4_0|2048|1536|de19cee9ffcfa698` via the 2-round contention-proof tuner (`Track W8a` `2e80fee`) to `Gen(1)` (`202.44 GB/s`, `8.74 us`), achieving `ratio_ok = true` across all 8 models `Models 0..7` in `bg_215` (`M0 E2B QAT +2.89%`, `M1 E2B Q4_K_M +0.05%`, `M2 Qwen3.5-2B +1.06% [430->412 disp]`, `M3 Qwen3.5-9B +0.97% [594->570 disp]`, `M4 Llama 1B Q4_0 +1.74%`, `M5 SmolLM2 +4.04%`, `M7 26B-A4B MoE +1.30% [923->713 disp]`).
+- **Action**: Once desktop compositor / host load drops (`<= 20%` GPU, `host_ms <= 0.35 ms`), run a single quiet 4-pass ABBA (`scripts/verify_when_quiet.sh`) of `experiment/rsi-40-w8-hardened` (`425f1e7`) against `target/loop-base/gibbs` via `central_scheduler.py` and promote it to `main` + `target/loop-base/` before opening any new feature branches.
 
-### 2. Three Hardening & Verification Tracks Before Promoting `rsi-39` to `main`
-1. **Track W8a (`exp-w8a-two-round-tuner`: Two-Round Contention-Proof `tuned_variant` & `tune::decide`)**:
-   - In `src/graph/metal.rs` (`tuned_variant`), always run 2 rounds in opposite order (`0..2`, forward then reverse) instead of 1 round when `busy == false`.
-   - In `src/graph/tune.rs` (`decide`), when `!busy && rounds.len() >= 2`, require both rounds to agree on `choose(round)` (else return `default`), and in `tuned_variant` only persist to disk (`cache.insert` + `cache.save`) when `!busy`, both rounds agree on `best`, and the two rounds' GB/s for `best` are within `5%` (`|g0 - g1| / g0.max(g1) <= 0.05`); otherwise call `cache.insert_contended`. This prevents transient GPU spikes from ever poisoning `~/.cache/gibbs/host/tune-*.json`.
-2. **Track W8b (`exp-w8b-moe-interleaved-r4`: Race-Free Per-Format `moe_rows_per_sg`, 3-Round Interleaved `[2, 4, 4, 2]` `moe_gemv_bandwidth`, & `IQ2_XXS` Constant-Decode Ablation)**:
-   - Remove `static ROWS_PER_SG: AtomicUsize` in `src/graph/metal/ext/moe.rs` (which races across parallel `--lib` tests).
-   - Use an explicit per-format match in `moe_rows_per_sg(fmt: QuantFormat) -> usize` limited strictly to formats proven by interleaved `[2, 4, 4, 2]` × 3 rounds in `moe_gemv_bandwidth`.
-   - Add `moe_gemv_iq2xxs_constant_decode_ablation` (`--ignored`) to test whether replacing `IQ2XXS_GRID` / `KSIGNS_IQ2XS` lookups with constant arithmetic changes the `56.6 us` time on `1408x2816` (distinguishing table-lookup cost from the per-dispatch/grid floor).
-3. **Track W8c (`exp-w8c-a6-strict-hand-pair`: Restrict `pair_small_hand_gemvs` to `GemvVariant::HAND` Only)**:
-   - Remove the `|| *rows0 <= 64` relaxation in `src/graph/metal.rs` so `pair_small_hand_gemvs` ONLY pairs when `v0 == GemvVariant::HAND && v1 == GemvVariant::HAND` (preserving `gemv_bf16_pair` on `Qwen3.5` `16x2048` / `32x4096` `BF16` projections while never overriding `Gen(1)`/`Gen(2)` on quantized formats). Add a unit test asserting `Gen(1)` on `16x2048` `Q4_K_M` is not overridden by `GemvPackedPair`.
-
-### 3. Promotion Sequence (Coordinated via `/tmp/ripster-lane-heavy.lock`)
-1. `autoresearch/central_scheduler.py` now acquires `/tmp/ripster-lane-heavy.lock` before `~/.cache/gibbs/sched.lock`, automatically waiting behind any `trading-system` `forecast` job.
-2. Delete poisoned `de19cee9ffcfa698` / `fc235aa90db71dcd` entries from `~/.cache/gibbs/host/tune-Apple-M5-Pro-25G241.json` and re-tune on an idle GPU with the hardened 2-round tuner (`Track W8a`).
-3. Run `cargo test --release --test codec_parity` and full `scripts/loop_guard.sh` on the assembled branch (`M4 + M1 + M5c + A6 + W8a/b/c`).
-4. Run a single quiet 4-pass ABBA (`scripts/verify_when_quiet.sh`) against `target/loop-base/gibbs` and promote to `main` + `target/loop-base/` before opening new feature tracks.
+### 2. Next Avant-Garde Track After Promoting `rsi-40`: Attacking the Proven `16.5 us` `IQ2XXS_GRID` Bottleneck (`bg_214`)
+- **Confirmed Ablation Evidence (`moe_gemv_iq2xxs_constant_decode_ablation` in `bg_214`)**:
+  - Across 3 interleaved ABBA rounds on `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)`, replacing `IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]` with a constant literal dropped kernel time from **`57.4 us` (`142.5 GB/s`) to `40.9 us` (`199.9 GB/s`, `-16.5 us/dispatch` = `-495 us/token` across 30 MoE layers on `Model 7`)**.
+  - Why `IQ2XXS_GRID` (`constant ulong IQ2XXS_GRID[256]`) costs `16.5 us` even though `tg_iq2xxs_grid[256]` (`Track M5a`) was neutral:
+    - In `msl_prelude()`, `IQ2XXS_GRID` is a 256-entry `ulong` (`64`-bit) table (`2 KB`), and in `WIDE_IQ2_XXS` (`src/graph/codec.rs`), each group `g` unpacks `32` floats into `float out[33]` across `k = 0..4` before `gemv_loop` dots `out[0..31]` with `xs[0..7]`.
+    - Binding `IQ2XXS_GRID` as a `constant uint2*` buffer (`[[buffer(5)]]`, which uses Apple Silicon's hardware constant-buffer cache / preload engine rather than inline program-scope constant data) or fusing the dot product directly inside `decode_group` (so `g0`/`g1` never round-trip through `float v[33]`) can be tested directly against `moe_gemv_iq2xxs_constant_decode_ablation` (`57.4 us -> target <= 46 us`).

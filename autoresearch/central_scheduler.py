@@ -62,6 +62,9 @@ def compute_quiet_max(raw_floor: int | None = None) -> int:
     if raw_floor is None:
         return 20
     return max(20, min(raw_floor, COMPOSITOR_FLOOR_CAP) + 6)
+
+
+def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float, bool]:
     t0 = time.time()
     ok = 0
     last = sample_gpu_util()
@@ -194,12 +197,12 @@ def main() -> int:
     p_run.add_argument("--label", default="", help="Job label for sched.log")
     p_run.add_argument("--floor-samples", type=int, default=2)
     p_run.add_argument("--quiet", action="store_true", help="Wait for quiet GPU before starting")
-    p_run.add_argument("--quiet-max", type=int, default=20, help="Max GPU utilization %% for --quiet (default 20)")
     p_run.add_argument("--quiet-samples", type=int, default=5)
     p_run.add_argument("--quiet-max", type=int, default=None, help="Max GPU utilization %% for --quiet (default: auto <=40 from idle floor)")
     p_run.add_argument("--quiet-timeout", type=int, default=3600)
     p_run.add_argument("--allow-zero-tests", action="store_true", help="Allow 'running 0 tests' in cargo test")
     p_run.add_argument("cmd", nargs=argparse.REMAINDER)
+    sub.add_parser("status", help="Show GPU idle floor and recent scheduled jobs")
     args = ap.parse_args()
     if args.sub == "run":
         return run_job(args)
