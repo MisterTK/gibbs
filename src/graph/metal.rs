@@ -1188,11 +1188,11 @@ impl Runtime {
             TUNE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return t.variant;
         }
-        // Foreign GPU load, sampled before this process times anything: busy means the winner is
-        // used here but never persisted.
+        // Foreign GPU load, sampled before this process times anything, or rounds that disagree /
+        // drift > 5%: the winner is used here but never persisted to disk.
         let busy = tune::foreign_busy();
         let mut rounds = Vec::new();
-        for round in 0..1 + usize::from(busy) {
+        for round in 0..2 {
             let order: Vec<GemvVariant> = if round == 0 {
                 variants.clone()
             } else {
@@ -1209,7 +1209,12 @@ impl Runtime {
         let Some(best) = tune::decide(&rounds, default, busy) else {
             return default;
         };
-        let gbps = rounds[0].iter().find(|t| t.0 == best).map_or(0.0, |t| t.1);
+        let consistent = !busy && tune::rounds_consistent(&rounds, best);
+        let gbps = rounds
+            .iter()
+            .filter_map(|r| r.iter().find(|t| t.0 == best).map(|t| t.1))
+            .sum::<f64>()
+            / rounds.len() as f64;
         let bytes = weight_format_bytes(fmt, rows * cols) as f64;
         tracing::info!(
             "tune: {q:?} {rows}x{cols}: {} {gbps:.0} GB/s ({} variants)",
@@ -1222,12 +1227,14 @@ impl Runtime {
             gbps,
         };
         let mut cache = self.tune.lock();
-        if busy {
-            tracing::warn!("tune {q:?} {rows}x{cols}: GPU busy, winner not persisted");
-            cache.insert_contended(key, tuned);
-        } else {
+        if consistent {
             cache.insert(key, tuned);
             cache.save(&self.tune_path);
+        } else {
+            tracing::warn!(
+                "tune {q:?} {rows}x{cols}: GPU busy or rounds inconsistent, winner not persisted"
+            );
+            cache.insert_contended(key, tuned);
         }
         best
     }

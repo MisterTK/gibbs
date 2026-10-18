@@ -117,9 +117,10 @@ pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
 pub const BUSY_MARGIN: f64 = 0.08;
 
 /// The variant to use from `rounds` of timings (`GB/s`, each round measuring the variants in another
-/// order). A quiet GPU takes [`choose`] over the first round. A `busy` GPU keeps `default` (the proven
-/// variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round; among
-/// those the one with the best worst-round ratio wins. `None`: no usable timing.
+/// order). A single quiet round takes [`choose`] over that round; two or more quiet rounds require
+/// every round to agree on [`choose`], otherwise `default` wins. A `busy` GPU keeps `default` (the
+/// proven variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round;
+/// among those the one with the best worst-round ratio wins. `None`: no usable timing.
 pub fn decide(
     rounds: &[Vec<(GemvVariant, f64)>],
     default: GemvVariant,
@@ -127,7 +128,15 @@ pub fn decide(
 ) -> Option<GemvVariant> {
     let first = rounds.first()?;
     if !busy {
-        return choose(first);
+        if rounds.len() == 1 {
+            return choose(first);
+        }
+        let w0 = choose(first)?;
+        return Some(if rounds[1..].iter().all(|r| choose(r) == Some(w0)) {
+            w0
+        } else {
+            default
+        });
     }
     let rate = |round: &[(GemvVariant, f64)], v: GemvVariant| {
         round
@@ -152,6 +161,33 @@ pub fn decide(
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(default, |c| c.0),
     )
+}
+
+/// Maximum relative spread `(hi - lo) / hi` across rounds for a winner to be persisted to disk.
+pub const MAX_ROUND_SPREAD: f64 = 0.05;
+
+/// Whether `winner` won [`choose`] in every round of `rounds` and its throughput stayed within
+/// [`MAX_ROUND_SPREAD`] (5%) across rounds. Single-round measurements return `true`.
+pub fn rounds_consistent(rounds: &[Vec<(GemvVariant, f64)>], winner: GemvVariant) -> bool {
+    if rounds.len() < 2 {
+        return true;
+    }
+    if rounds.iter().any(|r| choose(r) != Some(winner)) {
+        return false;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for r in rounds {
+        let Some((_, g)) = r.iter().find(|t| t.0 == winner) else {
+            return false;
+        };
+        if !g.is_finite() {
+            return false;
+        }
+        lo = lo.min(*g);
+        hi = hi.max(*g);
+    }
+    lo > 0.0 && hi.is_finite() && (hi - lo) / hi <= MAX_ROUND_SPREAD
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -408,6 +444,40 @@ mod tests {
         );
         assert_eq!(decide(&[], def, true), None);
         assert_eq!(decide(&[], def, false), None);
+    }
+
+    #[test]
+    fn quiet_two_round_agreement_and_consistency_gate() {
+        let (def, r1, r2) = (
+            GemvVariant::HAND,
+            GemvVariant::generated(1),
+            GemvVariant::generated(2),
+        );
+        // Two quiet rounds agree on Gen(1) within 5% spread (201.0 vs 198.0).
+        let agree = [
+            vec![(def, 180.0), (r1, 201.0), (r2, 190.0)],
+            vec![(r2, 189.0), (r1, 198.0), (def, 179.0)],
+        ];
+        assert_eq!(decide(&agree, def, false), Some(r1));
+        assert!(rounds_consistent(&agree, r1));
+
+        // Two quiet rounds disagree (Gen(2) in round 0, Gen(1) in round 1) -> returns default.
+        let disagree = [
+            vec![(def, 180.0), (r1, 195.0), (r2, 210.0)],
+            vec![(r2, 190.0), (r1, 205.0), (def, 180.0)],
+        ];
+        assert_eq!(decide(&disagree, def, false), Some(def));
+        assert!(!rounds_consistent(&disagree, def));
+        assert!(!rounds_consistent(&disagree, r1));
+        assert!(!rounds_consistent(&disagree, r2));
+
+        // Both rounds pick Gen(1), but rates differ by > 5% (200.0 vs 170.0 -> 15% spread).
+        let noisy = [
+            vec![(def, 150.0), (r1, 200.0), (r2, 160.0)],
+            vec![(r2, 155.0), (r1, 170.0), (def, 145.0)],
+        ];
+        assert_eq!(decide(&noisy, def, false), Some(r1));
+        assert!(!rounds_consistent(&noisy, r1));
     }
 
     #[test]
