@@ -60,21 +60,22 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 7 Avant-Garde Priority Queue (`IQ2_XXS` Indexed GEMV Bottleneck, Clean Standalone `M4 + M1` Verification, & Attention/DeltaNet `Gen(1)`/`BF16` Pairing)
+## 3. Wave 9 Avant-Garde Priority Queue (Pre-Warming `fc235aa90db71dcd` & Re-Measuring `IQ2_XXS` Live-`q4` ALU Ablation Before Promoting `experiment/rsi-40-w8-hardened`)
 
-### 1. Closed Lines (Do Not Revisit)
-- **`Track M3` / `Track M3-v2` (`Step::MoeWeightedSumNorm`)**: Both single-TG `M3` (`beafc9b`, `-1.9%` on `Model 7` due to single-TG `90 KB` read serialization) and race-free 11-TG `M3-v2` (`2f1a896`, `-13.8%` / `+1.86 ms/tok` on `Model 7` due to device-scope `memory_order_seq_cst` fences) regressed `Model 7`. Furthermore, `Track W2-v2` (`7c004af`, `-30` dispatches, `+0.25%` / `0.000 ms` GPU delta) proved that saving 30 dispatches on `Model 7` is worth `0 us`. Do not revisit `MoeWeightedSumNorm` or `ExpertGateUpGlu`.
+### 1. Immediate First Action — Pre-Warm `fc235aa90db71dcd` (`2048|1536` and `2048|2048`) & Pass Quiet 4-Pass ABBA Before Promoting `experiment/rsi-40-w8-hardened` (`425f1e7`)
+- **`experiment/rsi-40-w8-hardened` (`425f1e7`) test coverage**:
+  - `cargo test --release --test codec_parity` (`2 passed; 0 failed`, `bg_212`/`bg_214`): note explicitly that `tests/codec_parity.rs` exercises `decode8` + `msl_prelude_compiles`, whereas `Wide` `decode_group` (`WIDE_Q4_0`, `WIDE_IQ4_NL`, `WIDE_IQ2_XXS`) is covered by `gemv_matches_cpu_for_every_packed_format` (dense) and `moe_linear_matches_cpu_for_every_format` (indexed), both of which passed on the assembled stack.
+  - Full `scripts/loop_guard.sh` (`rc = 0`, `parity: 5 compared`, `min cos 1.00000`, `bg_215`) and all Wave 8 unit tests (`graph::tune::tests`, `gemv_packed_pair_small_rows_matches_cpu`, `moe_subgraph_fusions_match_cpu`, `moe_linear_matches_cpu_for_every_format`, `moe_gemv_pipeline_max_threads_and_occupancy`, `bg_214`).
+- **Why `bg_215` did NOT confirm the `Gen(2)` poisoning hypothesis or clear promotion gates**:
+  - `experiment/rsi-40-w8-hardened` uses `M4`'s `GGUF_Q4_0` hash `fc235aa90db71dcd`, which still had only 8 entries in `tune-Apple-M5-Pro-25G241.json` (missing `2048|1536` and `2048|2048`) because `foreign_busy()` defaulted to `BUSY_PCT = 20` during `bg_215` and sent new `fc235aa90db71dcd` winners to `insert_contended`.
+  - In `bg_215`, the aggregate `delta_pp = +0.10 pp` (`noise_pp = 0.29 pp`, `ratios_ok = false` due to `M8` `cand1 = 94.8 tok/s` vs `cand2 = 112.7 tok/s`, and `M7` `gpu_ms = 15.45 ms` vs `base 15.09..15.78 ms` under load) did **not** clear `delta_pp >= max(0.30, noise_pp)` or the alternate control band (`M5 = 1.0404`, `M6 = 0.9893`).
+- **Promotion status & required action**:
+  - No performance code has been promoted to `main` yet; promotion requires pre-warming `fc235aa90db71dcd` (`2048|1536` and `2048|2048`) into `tune-Apple-M5-Pro-25G241.json` and passing a 4-pass ABBA with `ratios_ok == true` and `delta_pp >= max(0.30, noise_pp)` (or promoting individual tracks via the targeted-model rule with controls in `0.995..1.008`).
 
-### 2. Track M5 (`exp-m5a-iq2xxs-tg-lut` & `exp-m5b-iq2xxs-direct-dot`: Attacking the `145.9 GB/s` `GGUF_IQ2_XXS 1408x2816` `ExpertLinear` Bottleneck)
-- **Empirical Bottleneck (`bg_200` `moe_gemv_bandwidth`)**:
-  - After `Track M4` lifted `expert_down` (`GGUF_IQ4_NL 2816x704`, `top_k=8, x_rows=8`) to **`181.2 GB/s` (`49.2 us`)**, `expert_gate_up` (`GGUF_IQ2_XXS 1408x2816`, `top_k=8, x_rows=1`) remains at **`145.9 GB/s` (`56.1 us`)** whereas `GGUF_IQ2_M 1408x2816` runs at **`171.7 GB/s` (`59.2 us`)** (`20%` more weight bytes in nearly the same `56–59 us` kernel time, proving `IQ2_XXS` is instruction / table-lookup / `x`-load bound, not DRAM bandwidth bound).
-  - Across 30 MoE layers (`60` `ExpertLinear` dispatches on `Model 7`, where `30` are `expert_gate_up` `IQ2_XXS 1408x2816`), `expert_gate_up` + `expert_down` account for **`~3.4–4.5 ms/token`** (`25–33%` of `Model 7`'s `13.58 ms` decode time).
-- **Two Orthogonal Designs to Test in Isolation**:
-  1. **`Track M5a` (`exp-m5a-iq2xxs-tg-lut`)**: In `WIDE_IQ2_XXS` (`src/graph/codec.rs`), each lane performs 4 divergent random lookups into `constant uint64_t IQ2XXS_GRID[256]` (`2 KB`) and `constant uchar KSIGNS_IQ2XS[128]` (`128 B`). On Apple GPUs, `constant` address space is a broadcast cache optimized for uniform SIMD-group addresses; 32 divergent lane indices serialize. Replace `KSIGNS_IQ2XS` table lookup with 3 ALU instructions computing the odd-parity 8th sign bit (`uint s7 = (aux1 >> (7 * k)) & 127u; uint p = s7 ^ (s7 >> 4); p ^= p >> 2; p ^= p >> 1; uint s = s7 | ((p & 1u) << 7);`), and in `gemv_indexed` (`src/graph/codegen.rs`) cooperatively stage `IQ2XXS_GRID` into 32-bank `threadgroup uint2 tg_iq2xxs_grid[256]` (`2 KB` threadgroup SRAM).
-  2. **`Track M5b` (`exp-m5b-iq2xxs-direct-dot`)**: In `gemv_indexed` (`src/graph/codegen.rs`), when `p.x_per_slot == 0 && p.cols <= 2816`, all 8 simdgroups (`256` threads) in a threadgroup read the exact same `xb` vector (`2816` floats = `11.0 KB <= 32 KB` threadgroup limit, preserving `1024` max threads/TG = 100% occupancy). Cooperatively load `xb[0..p.cols]` into `threadgroup float shared_x[2816]` once per threadgroup (eliminating 8x redundant global `xb` loads per TG and cross-lane `simd_shuffle` traffic).
-
-### 3. Track A6 (`exp-a6-gen1-bf16-pair`: `GemvKernel::Gen { rows_per_sg: 1 }` & `BF16` Sibling Projection Pairing)
-- Extend standalone `Step::GemvPackedPair` (`experiment/rsi-27-a5v2-zero-tax-pair` `696810f`) to support `WeightFormat::BF16` (`gemv_bf16_pair`) and `GemvKernel::Gen { rows_per_sg: 1 }` for adjacent sibling projections sharing `x` with `rows <= 512` (targeting `Qwen3.5 2B` DeltaNet `proj_b + proj_a` `16x2048` `BF16` and Full Attention `k_proj + v_proj` `512x2048`).
-
-### 4. Standalone Verification Before Stacking
-- Clean poisoned `GGUF_Q4_0|2048|1536` `Gen(2)` entries from `~/.cache/gibbs/host/tune-Apple-M5-Pro-25G241.json`, pre-warm the tune cache on an idle GPU, and verify `M4 + M1` (+ `M5a`/`M5b` winner) standalone on `Models 0, 1, 2, 4, 7` before stacking with `rsi-23` (`2b7b6c8`).
+### 2. Next Avant-Garde Track: Live-`q4` ALU Stub Re-Measurement & `IQ2XXS_GRID` Optimization (`bg_214`)
+- **Ablation Evidence (`moe_gemv_iq2xxs_constant_decode_ablation` in `bg_214`)**:
+  - Across 3 interleaved ABBA rounds on `GGUF_IQ2_XXS 1408x2816 (top_k=8, x_rows=1)`, replacing `IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]` with a constant literal dropped kernel time from `57.4 us` (`142.5 GB/s`) to `40.9 us` (`199.9 GB/s`) — labeled as **`ablation (not shippable; literal stub allowed DCE of q4): decode + lookup upper bound <= 16.5 us of 57.4 us`**.
+  - Wave 9 re-measures with a live-`q4` ALU stub (`0x08080808u ^ ((q4 >> (8*k)) & 0xFFu)`) to isolate the table-read cost without DCE.
+  - Why `IQ2XXS_GRID` (`constant ulong IQ2XXS_GRID[256]`) is targeted even though `tg_iq2xxs_grid[256]` (`Track M5a`) was neutral:
+    - In `msl_prelude()`, `IQ2XXS_GRID` is a 256-entry `ulong` (`64`-bit) table (`2 KB`), and in `WIDE_IQ2_XXS` (`src/graph/codec.rs`), each group `g` unpacks `32` floats into `float out[33]` across `k = 0..4` before `gemv_loop` dots `out[0..31]` with `xs[0..7]`.
+    - Binding `IQ2XXS_GRID` as a `constant uint2*` buffer (`[[buffer(5)]]`, which uses Apple Silicon's hardware constant-buffer cache / preload engine rather than inline program-scope constant data) or fusing the dot product directly inside `decode_group` (so `g0`/`g1` never round-trip through `float v[33]`) can be evaluated once the live-`q4` ALU stub isolates the true non-DCE table-read cost.
