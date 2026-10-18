@@ -84,11 +84,11 @@ pub struct Tile {
     pub segs: u32,
     pub a: f32,
     pub b: f32,
-    /// MSL defining `uint group_seg(uint g, uint k)` (block offset of `float4` segment `k` of tile `g`),
-    /// `uint tile_load(device const uchar* grp, uint g)` (the tile's 4 bytes), `float tile_scale(grp, g)` and
-    /// `float4 tile_seg(uint q, uint k)` (`u` of segment `k`; `k` is a compile-time constant at every call).
-    /// `grp` is the block's [`Planar`] group and `g` continues across the group's blocks
-    /// (`(i % blocks) * groups + tile`); `group_seg` takes the tile within the block.
+    /// MSL defining `uint group_seg(uint g, uint k)` (block offset of segment `k` of tile `g`),
+    /// `uint4 tile_load(device const uchar* grp, uint g)` (the tile's bytes), `float tile_scale(grp, g)` and
+    /// `void tile_seg(uint4 q, uint k, thread float* out8)` (`u` of segment `k`; `k` is a compile-time
+    /// constant at every call). `grp` is the block's [`Planar`] group and `g` continues across the group's
+    /// blocks (`(i % blocks) * groups + tile`); `group_seg` takes the tile within the block.
     pub msl: &'static str,
 }
 
@@ -100,25 +100,34 @@ pub fn tile(format: QuantFormat) -> Option<&'static Tile> {
 }
 
 /// TQ2_0: byte `j` of a 32-byte plane holds elements `j, j+32, j+64, j+96` of its 128-element half
-/// (value = `(code - 1) * d`), so 4-byte tile `g` of a block (`0..16`, at `(g>>3)*32 + (g&7)*4`) holds, for
-/// shift level `k` of 4 (`sh = 2 * k`), four consecutive elements at `(g>>3)*128 + k*32 + (g&7)*4`. Under
-/// [`PLANAR_TQ2_0`] the tile is one aligned 4-byte load (`uint`) and the scale is in the group's scale plane;
-/// `tile_seg` unpacks the four 2-bit codes of level `k` via `as_type<uchar4>((q >> (2 * k)) & 0x03030303u)`.
+/// (value = `(code - 1) * d`), so tile `g` of a block (16 bytes at `(g>>1)*32 + (g&1)*16`) is, for shift
+/// level `k` of 4, two segments of 8 elements at `(g>>1)*128 + k*32 + (g&1)*16`; segment `s` is level `s>>1`,
+/// chunk `s&1`. Under [`PLANAR_TQ2_0`] the tile is one aligned 16-byte load and the scale is in the group's
+/// scale plane. `u` is the float `1 + code/4` (the 2-bit code moved into the top two mantissa bits of 1.0f:
+/// one shift, one mask, one or per element instead of a byte-to-float conversion), so `code - 1 == 4u - 5`.
 static TILE_TQ2_0: Tile = Tile {
-    groups: 16,
-    segs: 4,
-    a: 1.0,
-    b: 1.0,
+    groups: 4,
+    segs: 8,
+    a: 4.0,
+    b: 0.0,
     msl: r#"
-inline uint group_seg(uint g, uint k) { return (g >> 3) * 128 + k * 32 + (g & 7) * 4; }
-inline uint tile_load(device const uchar* grp, uint g) {
-    return *(device const uint*)(grp + (g >> 4) * 64 + (g & 15) * 4);
+inline uint group_seg(uint g, uint k) { return (g >> 1) * 128 + (k >> 1) * 32 + (g & 1) * 16 + (k & 1) * 8; }
+inline uint4 tile_load(device const uchar* grp, uint g) {
+    return *(device const uint4*)(grp + (g >> 2) * 64 + (g & 3) * 16);
 }
 inline float tile_scale(device const uchar* grp, uint g) {
-    return float(*(device const half*)(grp + 512 + (g >> 4) * 2));
+    return float(*(device const half*)(grp + 512 + (g >> 2) * 2));
 }
-inline float4 tile_seg(uint q, uint k) {
-    return float4(as_type<uchar4>((q >> (2 * k)) & 0x03030303u));
+inline void tile_seg(uint4 q, uint k, thread float* out) {
+    const int lv = int(k >> 1) * 2;
+    for (uint w = 0; w < 2; w++) {
+        const uint x = q[(k & 1) * 2 + w];
+        for (int j = 0; j < 4; j++) {
+            const int sh = 21 - 8 * j - lv;
+            const uint y = sh >= 0 ? (x << sh) : (x >> -sh);
+            out[4 * w + j] = as_type<float>(0x3F800000u | (y & 0x00600000u)) - 1.25f;
+        }
+    }
 }
 "#,
 };
