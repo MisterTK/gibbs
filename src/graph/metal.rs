@@ -709,19 +709,51 @@ impl Runtime {
                 format!("host profile from {}", profile_path.display())
             }
             None => {
+                let busy_before = tune::foreign_busy();
                 rt.profile = rt.measure(msl4)?;
-                let saved = profile_path
-                    .parent()
-                    .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|_| {
-                        std::fs::write(&profile_path, serde_json::to_vec_pretty(&rt.profile)?)
-                    });
-                match saved {
-                    Ok(()) => format!("host profile measured, saved {}", profile_path.display()),
-                    Err(e) => format!(
-                        "host profile measured; saving {} failed: {e}",
+                let ch = codec::source_hash();
+                if let Ok(entries) = std::fs::read_dir(cache.join("host")) {
+                    let prefix = format!("{tag}-");
+                    for e in entries.flatten() {
+                        let name = e.file_name();
+                        let Some(s) = name.to_str() else { continue };
+                        if !s.starts_with(&prefix) || !s.ends_with(".json") {
+                            continue;
+                        }
+                        let matched = std::fs::read(e.path())
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
+                            .filter(|prev| prev.os_build == os_build)
+                            .and_then(|prev| prev.codec)
+                            .filter(|c| c.codec_hash == ch);
+                        if let Some(c) = matched {
+                            rt.profile.ceiling_gbps = rt.profile.stream_gbps.max(c.ceiling_gbps);
+                            rt.profile.codec = Some(c);
+                            break;
+                        }
+                    }
+                }
+                if busy_before || tune::foreign_busy() {
+                    format!(
+                        "host profile measured under foreign GPU load; not saved to {}",
                         profile_path.display()
-                    ),
+                    )
+                } else {
+                    let saved = profile_path
+                        .parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|_| {
+                            std::fs::write(&profile_path, serde_json::to_vec_pretty(&rt.profile)?)
+                        });
+                    match saved {
+                        Ok(()) => {
+                            format!("host profile measured, saved {}", profile_path.display())
+                        }
+                        Err(e) => format!(
+                            "host profile measured; saving {} failed: {e}",
+                            profile_path.display()
+                        ),
+                    }
                 }
             }
         };

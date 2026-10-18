@@ -61,6 +61,23 @@ def compute_quiet_max(raw_floor: int) -> int:
     return max(20, min(40, effective_floor + 5))
 
 
+def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float]:
+    t0 = time.time()
+    ok = 0
+    last = sample_gpu_util()
+    while ok < required_ok and (time.time() - t0) < timeout_s:
+        last = sample_gpu_util()
+        if last <= quiet_max:
+            ok += 1
+            if ok >= required_ok:
+                break
+            time.sleep(0.5)
+        else:
+            ok = 0
+            time.sleep(2.0)
+    return last, round(time.time() - t0, 3)
+
+
 def run_job(args: argparse.Namespace) -> int:
     os.makedirs(CACHE_DIR, exist_ok=True)
     cmd = list(args.cmd)
@@ -77,6 +94,14 @@ def run_job(args: argparse.Namespace) -> int:
             wait_s = round(time.time() - wait_t0, 3)
             raw_floor = measure_idle_floor(samples=args.floor_samples, delay_s=0.4)
             quiet_max = compute_quiet_max(raw_floor)
+            quiet_wait_s = 0.0
+            if getattr(args, "quiet", False):
+                raw_floor, quiet_wait_s = wait_until_quiet(
+                    quiet_max=quiet_max,
+                    required_ok=args.quiet_samples,
+                    timeout_s=args.quiet_timeout,
+                )
+                quiet_max = compute_quiet_max(raw_floor)
             env = dict(os.environ)
             env.setdefault("QUIET_MAX_PCT", str(quiet_max))
             env.setdefault("GIBBS_TUNE_BUSY_PCT", str(quiet_max))
@@ -88,6 +113,7 @@ def run_job(args: argparse.Namespace) -> int:
                 "cwd": cwd,
                 "cmd": cmd,
                 "wait_s": wait_s,
+                "quiet_wait_s": quiet_wait_s,
                 "gpu_raw_pct": raw_floor,
                 "quiet_max_pct": int(env["QUIET_MAX_PCT"]),
             }
@@ -109,7 +135,6 @@ def run_job(args: argparse.Namespace) -> int:
         finally:
             fcntl.flock(sched_f, fcntl.LOCK_UN)
 
-
 def show_status(_args: argparse.Namespace) -> int:
     raw_floor = measure_idle_floor(samples=2, delay_s=0.4)
     print(
@@ -129,8 +154,10 @@ def main() -> int:
     p_run = sub.add_parser("run", help="Run a resource-intensive command exclusively")
     p_run.add_argument("--label", default="", help="Job label for sched.log")
     p_run.add_argument("--floor-samples", type=int, default=2)
+    p_run.add_argument("--quiet", action="store_true", help="Wait for quiet GPU before starting")
+    p_run.add_argument("--quiet-samples", type=int, default=5)
+    p_run.add_argument("--quiet-timeout", type=int, default=300)
     p_run.add_argument("cmd", nargs=argparse.REMAINDER)
-
     sub.add_parser("status", help="Show GPU idle floor and recent scheduled jobs")
     args = ap.parse_args()
     if args.sub == "run":
