@@ -24,6 +24,7 @@ pub(super) const MSL: &str = include_str!("moe.metal");
 /// Compute functions in `moe.metal`.
 pub(super) const KERNELS: &[&str] = &[
     "moe_topk_f32",
+    "moe_topk_softmax_f32",
     "moe_gather_cols_f32",
     "moe_embed_f16",
     "moe_embed_bf16",
@@ -45,6 +46,8 @@ pub enum Step {
         rows: usize,
         cols: usize,
         k: usize,
+        weights_out: Option<ValueId>,
+        scale: Option<ValueId>,
     },
     GatherCols {
         x: ValueId,
@@ -155,7 +158,17 @@ pub(super) fn plan(
             }
             let n = numel(g, x)?;
             u32_of(*k)?;
-            Ok(PlanOut::Step(Step::TopK { x, rows: n / cols, cols, k: *k }, n / cols * k))
+            Ok(PlanOut::Step(
+                Step::TopK {
+                    x,
+                    rows: n / cols,
+                    cols,
+                    k: *k,
+                    weights_out: None,
+                    scale: None,
+                },
+                n / cols * k,
+            ))
         })()),
         Op::GatherCols => Some((|| {
             let (x, idx) = (arg(0)?, arg(1)?);
@@ -307,7 +320,13 @@ pub(super) fn plan(
 /// Every value the step reads (drives arena liveness and barriers).
 pub(super) fn reads(st: &Step) -> Vec<ValueId> {
     match st {
-        Step::TopK { x, .. } => vec![*x],
+        Step::TopK { x, scale, .. } => {
+            let mut v = vec![*x];
+            if let Some(sc) = *scale {
+                v.push(sc);
+            }
+            v
+        }
         Step::GatherCols { x, idx, .. } => vec![*x, *idx],
         Step::ExpertLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
         Step::Embed { table, ids, .. } => vec![*table, *ids],
@@ -415,12 +434,38 @@ fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, Strin
 pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<(), String> {
     let (enc, rt) = (e.enc, &sess.rt);
     match st {
-        Step::TopK { x, rows, cols, k } => {
-            enc.set_compute_pipeline_state(rt.pso("moe_topk_f32")?);
-            e.bind(0, *x);
-            e.bind(1, s.out);
-            set_bytes(enc, 2, &[u32_of(*rows)?, u32_of(*cols)?, u32_of(*k)?]);
-            enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+        Step::TopK {
+            x,
+            rows,
+            cols,
+            k,
+            weights_out,
+            scale,
+        } => {
+            if let Some(w_out) = *weights_out {
+                enc.set_compute_pipeline_state(rt.pso("moe_topk_softmax_f32")?);
+                e.bind(0, *x);
+                e.bind(1, s.out);
+                e.bind(2, w_out);
+                e.bind(3, scale.unwrap_or(*x));
+                set_bytes(
+                    enc,
+                    4,
+                    &[
+                        u32_of(*rows)?,
+                        u32_of(*cols)?,
+                        u32_of(*k)?,
+                        scale.is_some() as u32,
+                    ],
+                );
+                enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+            } else {
+                enc.set_compute_pipeline_state(rt.pso("moe_topk_f32")?);
+                e.bind(0, *x);
+                e.bind(1, s.out);
+                set_bytes(enc, 2, &[u32_of(*rows)?, u32_of(*cols)?, u32_of(*k)?]);
+                enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
         }
         Step::GatherCols {
             x,
