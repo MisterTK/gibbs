@@ -58,7 +58,6 @@ def measure_idle_floor(samples: int = 3, delay_s: float = 0.5) -> int:
 
 def compute_quiet_max(_raw_floor: int | None = None) -> int:
     return int(os.environ.get("QUIET_MAX_PCT", "20"))
-
 def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float, bool]:
     t0 = time.time()
     ok = 0
@@ -90,7 +89,8 @@ def run_job(args: argparse.Namespace) -> int:
         try:
             wait_s = round(time.time() - wait_t0, 3)
             raw_floor = measure_idle_floor(samples=args.floor_samples, delay_s=0.4)
-            quiet_max = int(os.environ.get("QUIET_MAX_PCT", str(args.quiet_max)))
+            default_max = args.quiet_max if args.quiet_max is not None else compute_quiet_max(raw_floor)
+            quiet_max = int(os.environ.get("QUIET_MAX_PCT", str(default_max)))
             quiet_wait_s = 0.0
             if getattr(args, "quiet", False):
                 raw_floor, quiet_wait_s, is_quiet = wait_until_quiet(
@@ -169,7 +169,7 @@ def main() -> int:
     p_run.add_argument("--quiet", action="store_true", help="Wait for quiet GPU before starting")
     p_run.add_argument("--quiet-max", type=int, default=20, help="Max GPU utilization %% for --quiet (default 20)")
     p_run.add_argument("--quiet-samples", type=int, default=5)
-    p_run.add_argument("--quiet-timeout", type=int, default=300)
+    p_run.add_argument("--quiet-timeout", type=int, default=3600)
     p_run.add_argument("cmd", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="Show GPU idle floor and recent scheduled jobs")
     args = ap.parse_args()
