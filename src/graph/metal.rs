@@ -3234,9 +3234,8 @@ impl Session {
                     pad2: u32,
                 }
                 let pair_kernel = if m == 1
-                    && ((legs[0].variant.kernel == GemvKernel::Hand
-                        && legs[1].variant.kernel == GemvKernel::Hand)
-                        || (legs[0].rows <= 64 && legs[1].rows <= 64))
+                    && legs[0].variant.kernel == GemvKernel::Hand
+                    && legs[1].variant.kernel == GemvKernel::Hand
                 {
                     match format {
                         WeightFormat::BF16 => Some("gemv_bf16_pair"),
@@ -4509,12 +4508,11 @@ fn pair_small_hand_gemvs(
         else {
             return false;
         };
-        let var_ok = (*v0 == GemvVariant::HAND && *v1 == GemvVariant::HAND)
-            || (*r0 <= 64 && *r1 <= 64);
         if x0 != x1
             || f0 != f1
             || c0 != c1
-            || !var_ok
+            || *v0 != GemvVariant::HAND
+            || *v1 != GemvVariant::HAND
             || *r0 > 512
             || *r1 > 512
         {
@@ -10418,6 +10416,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                         err < 1e-5,
                         "{f:?} ({rows0},{rows1},{cols}) out {i}: err {err}"
                     );
+                }
+                if f == QuantFormat::GGUF_Q4_K_M && (rows0, rows1, cols) == (16, 16, 2048) {
+                    s.set_variant_override(Some(GemvVariant::generated(1)));
+                    assert_eq!(s.prepare_plan(&g).unwrap().steps.len(), 2);
                 }
             }
         }
