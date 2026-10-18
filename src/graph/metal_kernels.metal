@@ -577,6 +577,59 @@ kernel void rmsnorm_fused_f32(device const float* x [[buffer(0)]],
     }
 }
 
+kernel void rmsnorm_fused_vecscale_f32(device const float* x [[buffer(0)]],
+                                       device const float* g [[buffer(1)]],
+                                       device const float* res [[buffer(2)]],
+                                       device const float* scale_buf [[buffer(3)]],
+                                       device float* out [[buffer(4)]],
+                                       device const float* g2 [[buffer(5)]],
+                                       device float* out2 [[buffer(6)]],
+                                       constant RmsNormFusedParams& p [[buffer(7)]],
+                                       device const uint* pos [[buffer(8)]],
+                                       device const float* inv_freq [[buffer(9)]],
+                                       uint tg [[threadgroup_position_in_grid]],
+                                       uint sg [[simdgroup_index_in_threadgroup]],
+                                       uint lane [[thread_index_in_simdgroup]],
+                                       uint nsg [[simdgroups_per_threadgroup]],
+                                       uint tid [[thread_position_in_threadgroup]],
+                                       uint tpg [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    uint row = tg;
+    if (row >= p.rows) return;
+    device const float* xr = x + (ulong)row * p.d;
+    device const float* resr = res + (ulong)row * p.d;
+    device const float* scaler = scale_buf + (ulong)row * p.d;
+    device float* outr = out + (ulong)row * p.d;
+    float sq = 0.0f;
+    for (uint i = tid; i < p.d; i += tpg) {
+        float v = xr[i];
+        sq += v * v;
+    }
+    float inv = rsqrt(block_sum(sq, scratch, sg, lane, nsg) / float(p.d) + p.eps);
+    bool has_res = (p.flags & 1u) != 0;
+    if (p.flags & 4u) {
+        device float* out2r = out2 + (ulong)row * p.d;
+        float sq2 = 0.0f;
+        for (uint i = tid; i < p.d; i += tpg) {
+            float v = xr[i] * inv * g[i];
+            if (has_res) v += resr[i];
+            v *= scaler[i];
+            outr[i] = v;
+            sq2 += v * v;
+        }
+        float inv2 = rsqrt(block_sum(sq2, scratch + 8, sg, lane, nsg) / float(p.d) + p.eps2);
+        for (uint i = tid; i < p.d; i += tpg) {
+            out2r[i] = outr[i] * inv2 * g2[i];
+        }
+    } else {
+        for (uint i = tid; i < p.d; i += tpg) {
+            float v = xr[i] * inv * g[i];
+            if (has_res) v += resr[i];
+            outr[i] = v * scaler[i];
+        }
+    }
+}
+
 
 struct GraphRopeParams { uint n_heads; uint head_dim; uint pairs; uint pair_stride; uint pair_gap; };
 kernel void graph_rope_f32(device const float* x [[buffer(0)]],
@@ -755,6 +808,68 @@ kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
                        + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
                        + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
                        + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+
+kernel void gemv_q4_0_quarter(device const block_q4_0* w [[buffer(0)]],
+                              device const float* x [[buffer(1)]],
+                              device float* y [[buffer(2)]],
+                              constant PackedGemvParams& p [[buffer(3)]],
+                              device const float* bias [[buffer(4)]],
+                              device const float* res [[buffer(5)]],
+                              uint2 tg [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    uint row0 = tg.x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    uint n_blocks = p.cols / 32;
+    uint n_sub = n_blocks * 4;
+    device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
+    device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
+    device const float* xb_base = x + (ulong)batch * p.cols;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 2;
+        uint qtr_off = (s & 3u) * 4u;
+        device const float* xb = xb_base + b * 32 + qtr_off;
+        float4 x_lo = *reinterpret_cast<device const float4*>(xb);
+        float4 x_hi = *reinterpret_cast<device const float4*>(xb + 16);
+        float sum_x = (x_lo.x + x_lo.y + x_lo.z + x_lo.w)
+                    + (x_hi.x + x_hi.y + x_hi.z + x_hi.w);
+
+        uint q0 = as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2*>(r0_blocks[b].qs + qtr_off)));
+        float dot0 = dot(float4(as_type<uchar4>(q0 & 0x0F0F0F0Fu)), x_lo)
+                   + dot(float4(as_type<uchar4>((q0 >> 4) & 0x0F0F0F0Fu)), x_hi);
+        acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
+
+        if (has_row1) {
+            uint q1 = as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2*>(r1_blocks[b].qs + qtr_off)));
+            float dot1 = dot(float4(as_type<uchar4>(q1 & 0x0F0F0F0Fu)), x_lo)
+                       + dot(float4(as_type<uchar4>((q1 >> 4) & 0x0F0F0F0Fu)), x_hi);
             acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
         }
     }
@@ -993,40 +1108,73 @@ kernel void gemv_iq4_xs(device const block_iq4_xs* w [[buffer(0)]],
     bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 256;
-    uint n_sub_blocks = n_blocks * 8;
+    uint n_sub = n_blocks * 16;
     device const block_iq4_xs* r0_blocks = w + (ulong)row0 * n_blocks;
     device const block_iq4_xs* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-    for (uint sb = lane; sb < n_sub_blocks; sb += 32) {
-        uint b = sb >> 3;
-        uint ib = sb & 7;
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 4;
+        uint ib = (s >> 1) & 7u;
+        uint half_off = (s & 1u) * 8u;
         device const block_iq4_xs& blk0 = r0_blocks[b];
-        device const block_iq4_xs& blk1 = r1_blocks[b];
         float d0 = float(blk0.d);
-        float d1 = float(blk1.d);
-        int ls0 = int((blk0.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
-                | (int((blk0.scales_h >> (2 * ib)) & 3) << 4);
-        int ls1 = int((blk1.scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
-                | (int((blk1.scales_h >> (2 * ib)) & 3) << 4);
+        int ls0 = int((blk0.scales_l[ib >> 1] >> (4 * (ib & 1u))) & 0x0Fu)
+                | (int((blk0.scales_h >> (2 * ib)) & 3u) << 4);
         float dl0 = d0 * float(ls0 - 32);
-        float dl1 = d1 * float(ls1 - 32);
-        device const float* xb_sub = xb_base + (ulong)sb * 32;
 
-        float sb_acc0 = 0.0f;
-        float sb_acc1 = 0.0f;
-        for (uint j = 0; j < 16; ++j) {
-            uint8_t q0 = blk0.qs[ib * 16 + j];
-            uint8_t q1 = blk1.qs[ib * 16 + j];
-            float xj = xb_sub[j];
-            float xj16 = xb_sub[j + 16];
-            sb_acc0 += kvalues_iq4nl[q0 & 0x0F] * xj + kvalues_iq4nl[q0 >> 4] * xj16;
-            sb_acc1 += kvalues_iq4nl[q1 & 0x0F] * xj + kvalues_iq4nl[q1 >> 4] * xj16;
+        device const float* xb_sub = xb_base + (ulong)b * 256 + (ulong)ib * 32 + half_off;
+        float4 x_lo0 = *reinterpret_cast<device const float4*>(xb_sub);
+        float4 x_lo1 = *reinterpret_cast<device const float4*>(xb_sub + 4);
+        float4 x_hi0 = *reinterpret_cast<device const float4*>(xb_sub + 16);
+        float4 x_hi1 = *reinterpret_cast<device const float4*>(xb_sub + 20);
+
+        uint2 q0 = *reinterpret_cast<device const uint2*>(blk0.qs + ib * 16 + half_off);
+        float4 v0_lo0 = float4(kvalues_iq4nl[q0.x & 0x0Fu],
+                               kvalues_iq4nl[(q0.x >> 8) & 0x0Fu],
+                               kvalues_iq4nl[(q0.x >> 16) & 0x0Fu],
+                               kvalues_iq4nl[(q0.x >> 24) & 0x0Fu]);
+        float4 v0_lo1 = float4(kvalues_iq4nl[q0.y & 0x0Fu],
+                               kvalues_iq4nl[(q0.y >> 8) & 0x0Fu],
+                               kvalues_iq4nl[(q0.y >> 16) & 0x0Fu],
+                               kvalues_iq4nl[(q0.y >> 24) & 0x0Fu]);
+        float4 v0_hi0 = float4(kvalues_iq4nl[(q0.x >> 4) & 0x0Fu],
+                               kvalues_iq4nl[(q0.x >> 12) & 0x0Fu],
+                               kvalues_iq4nl[(q0.x >> 20) & 0x0Fu],
+                               kvalues_iq4nl[q0.x >> 28]);
+        float4 v0_hi1 = float4(kvalues_iq4nl[(q0.y >> 4) & 0x0Fu],
+                               kvalues_iq4nl[(q0.y >> 12) & 0x0Fu],
+                               kvalues_iq4nl[(q0.y >> 20) & 0x0Fu],
+                               kvalues_iq4nl[q0.y >> 28]);
+        acc0 += dl0 * (dot(v0_lo0, x_lo0) + dot(v0_lo1, x_lo1) + dot(v0_hi0, x_hi0) + dot(v0_hi1, x_hi1));
+
+        if (has_row1) {
+            device const block_iq4_xs& blk1 = r1_blocks[b];
+            float d1 = float(blk1.d);
+            int ls1 = int((blk1.scales_l[ib >> 1] >> (4 * (ib & 1u))) & 0x0Fu)
+                    | (int((blk1.scales_h >> (2 * ib)) & 3u) << 4);
+            float dl1 = d1 * float(ls1 - 32);
+            uint2 q1 = *reinterpret_cast<device const uint2*>(blk1.qs + ib * 16 + half_off);
+            float4 v1_lo0 = float4(kvalues_iq4nl[q1.x & 0x0Fu],
+                                   kvalues_iq4nl[(q1.x >> 8) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.x >> 16) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.x >> 24) & 0x0Fu]);
+            float4 v1_lo1 = float4(kvalues_iq4nl[q1.y & 0x0Fu],
+                                   kvalues_iq4nl[(q1.y >> 8) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.y >> 16) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.y >> 24) & 0x0Fu]);
+            float4 v1_hi0 = float4(kvalues_iq4nl[(q1.x >> 4) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.x >> 12) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.x >> 20) & 0x0Fu],
+                                   kvalues_iq4nl[q1.x >> 28]);
+            float4 v1_hi1 = float4(kvalues_iq4nl[(q1.y >> 4) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.y >> 12) & 0x0Fu],
+                                   kvalues_iq4nl[(q1.y >> 20) & 0x0Fu],
+                                   kvalues_iq4nl[q1.y >> 28]);
+            acc1 += dl1 * (dot(v1_lo0, x_lo0) + dot(v1_lo1, x_lo1) + dot(v1_hi0, x_hi0) + dot(v1_hi1, x_hi1));
         }
-        acc0 += dl0 * sb_acc0;
-        acc1 += dl1 * sb_acc1;
     }
     acc0 = simd_sum(acc0);
     acc1 = simd_sum(acc1);
@@ -1918,7 +2066,7 @@ struct AttnCachedParams {
     float mscale;
 };
 
-template <uint NJ>
+template <uint NJ, bool HAS_GATE = false>
 inline void attn_cached_f32_impl(device const float* q,
                                  device float* kc,
                                  device float* vc,
@@ -1927,6 +2075,7 @@ inline void attn_cached_f32_impl(device const float* q,
                                  device const uint* vis,
                                  device const float* k_in,
                                  device const float* v_in,
+                                 device const float* gate,
                                  uint2 tg,
                                  uint sg,
                                  uint lane,
@@ -2003,7 +2152,10 @@ inline void attn_cached_f32_impl(device const float* q,
     for (uint d = sg * 32 + lane; d < hd; d += nsg * 32) {
         float o = 0.0f;
         for (uint i = 0; i < nsg; ++i) o += tg_acc[i * row + d] * exp(tg_m[i] - gm);
-        out[((ulong)q_tok * p.n_heads + head) * hd + d] = o / gl;
+        ulong idx = ((ulong)q_tok * p.n_heads + head) * hd + d;
+        float val = o / gl;
+        if (HAS_GATE) val *= 1.0f / (1.0f + exp(-gate[idx]));
+        out[idx] = val;
     }
 }
 
@@ -2023,7 +2175,27 @@ kernel void flash_attn_cached_t(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * NJ * 32];
-    attn_cached_f32_impl<NJ>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl<NJ, false>(q, kc, vc, out, p, vis, k_in, v_in, nullptr, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+}
+
+template <uint NJ>
+kernel void flash_attn_cached_gated_t(device const float* q [[buffer(0)]],
+                                      device float* kc [[buffer(1)]],
+                                      device float* vc [[buffer(2)]],
+                                      device float* out [[buffer(3)]],
+                                      constant AttnCachedParams& p [[buffer(4)]],
+                                      device const uint* vis [[buffer(5)]],
+                                      device const float* k_in [[buffer(6)]],
+                                      device const float* v_in [[buffer(7)]],
+                                      device const float* gate [[buffer(14)]],
+                                      uint2 tg [[threadgroup_position_in_grid]],
+                                      uint sg [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]],
+                                      uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tg_m[ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_MAX_SG];
+    threadgroup float tg_acc[ATTN_MAX_SG * NJ * 32];
+    attn_cached_f32_impl<NJ, true>(q, kc, vc, out, p, vis, k_in, v_in, gate, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 typedef decltype(flash_attn_cached_t<1>) flash_attn_cached_k;
@@ -2032,6 +2204,13 @@ template [[host_name("flash_attn_cached_f32_2")]] kernel flash_attn_cached_k fla
 template [[host_name("flash_attn_cached_f32_4")]] kernel flash_attn_cached_k flash_attn_cached_t<4>;
 template [[host_name("flash_attn_cached_f32_8")]] kernel flash_attn_cached_k flash_attn_cached_t<8>;
 template [[host_name("flash_attn_cached_f32")]] kernel flash_attn_cached_k flash_attn_cached_t<16>;
+
+typedef decltype(flash_attn_cached_gated_t<1>) flash_attn_cached_gated_k;
+template [[host_name("flash_attn_cached_gated_f32_1")]] kernel flash_attn_cached_gated_k flash_attn_cached_gated_t<1>;
+template [[host_name("flash_attn_cached_gated_f32_2")]] kernel flash_attn_cached_gated_k flash_attn_cached_gated_t<2>;
+template [[host_name("flash_attn_cached_gated_f32_4")]] kernel flash_attn_cached_gated_k flash_attn_cached_gated_t<4>;
+template [[host_name("flash_attn_cached_gated_f32_8")]] kernel flash_attn_cached_gated_k flash_attn_cached_gated_t<8>;
+template [[host_name("flash_attn_cached_gated_f32")]] kernel flash_attn_cached_gated_k flash_attn_cached_gated_t<16>;
 kernel void attn_cached_f32(device const float* q [[buffer(0)]],
                             device float* kc [[buffer(1)]],
                             device float* vc [[buffer(2)]],
@@ -2047,7 +2226,7 @@ kernel void attn_cached_f32(device const float* q [[buffer(0)]],
     threadgroup float tg_m[ATTN_MAX_SG];
     threadgroup float tg_l[ATTN_MAX_SG];
     threadgroup float tg_acc[ATTN_MAX_SG * ATTN_MAX_PER_LANE * 32];
-    attn_cached_f32_impl<ATTN_MAX_PER_LANE>(q, kc, vc, out, p, vis, k_in, v_in, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
+    attn_cached_f32_impl<ATTN_MAX_PER_LANE, false>(q, kc, vc, out, p, vis, k_in, v_in, nullptr, tg, sg, lane, nsg, tg_m, tg_l, tg_acc);
 }
 
 kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
@@ -2068,6 +2247,29 @@ kernel void attn_cached_merge_f32(device const float* part [[buffer(0)]],
         float o = 0.0f;
         for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
         out[((ulong)q_tok * p.n_heads + head) * hd + d] = o * inv_gl;
+    }
+}
+
+kernel void attn_cached_merge_gated_f32(device const float* part [[buffer(0)]],
+                                        device float* out [[buffer(1)]],
+                                        constant AttnCachedParams& p [[buffer(2)]],
+                                        device const float* gate [[buffer(14)]],
+                                        uint2 tg [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_index_in_threadgroup]],
+                                        uint2 ntg [[threads_per_threadgroup]]) {
+    const uint hd = p.head_dim, head = tg.x, q_tok = tg.y;
+    if (head >= p.n_heads || q_tok >= p.m) return;
+    device const float* base = part + ((ulong)q_tok * p.n_heads + head) * p.n_splits * (hd + 2);
+    float gm = -FLT_MAX;
+    for (uint s = 0; s < p.n_splits; ++s) gm = max(gm, base[s * (hd + 2)]);
+    float gl = 0.0f;
+    for (uint s = 0; s < p.n_splits; ++s) gl += base[s * (hd + 2) + 1] * exp(base[s * (hd + 2)] - gm);
+    float inv_gl = 1.0f / gl;
+    for (uint d = tid; d < hd; d += ntg.x) {
+        float o = 0.0f;
+        for (uint s = 0; s < p.n_splits; ++s) o += base[s * (hd + 2) + 2 + d] * exp(base[s * (hd + 2)] - gm);
+        ulong idx = ((ulong)q_tok * p.n_heads + head) * hd + d;
+        out[idx] = (o * inv_gl) * (1.0f / (1.0f + exp(-gate[idx])));
     }
 }
 
@@ -2104,23 +2306,24 @@ inline float attn_rope_val(device const float* xh,
     }
 }
 
-template <uint NJ>
-kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
-                                      device float* kc [[buffer(1)]],
-                                      device float* vc [[buffer(2)]],
-                                      device float* part [[buffer(3)]],
-                                      constant AttnCachedParams& p [[buffer(4)]],
-                                      device const float* k_in [[buffer(5)]],
-                                      device const float* v_in [[buffer(6)]],
-                                      device const float* inv_freq [[buffer(7)]],
-                                      uint3 tg3 [[threadgroup_position_in_grid]],
-                                      uint sg [[simdgroup_index_in_threadgroup]],
-                                      uint lane [[thread_index_in_simdgroup]],
-                                      uint nsg [[simdgroups_per_threadgroup]]) {
-    threadgroup float tq[ATTN_HPT * NJ * 32];
-    threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
-    threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
-    threadgroup float tg_red[ATTN_MAX_SG * NJ * 32];
+template <uint NJ, bool HAS_GATE = false>
+inline void attn_cached_gqa_split_impl(device const float* q,
+                                       device float* kc,
+                                       device float* vc,
+                                       device float* part,
+                                       constant AttnCachedParams& p,
+                                       device const float* k_in,
+                                       device const float* v_in,
+                                       device const float* inv_freq,
+                                       device const float* gate,
+                                       uint3 tg3,
+                                       uint sg,
+                                       uint lane,
+                                       uint nsg,
+                                       threadgroup float* tq,
+                                       threadgroup float* tg_m,
+                                       threadgroup float* tg_l,
+                                       threadgroup float* tg_red) {
     const uint hd = p.head_dim;
     const uint row = NJ * 32;
     const uint hgroups = (p.group + ATTN_HPT - 1) / ATTN_HPT;
@@ -2219,11 +2422,14 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
         for (uint i = 0; i < nsg; ++i) gl += tg_l[h * ATTN_MAX_SG + i] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
         if (p.n_splits == 1) {
             device float* out = part + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
+            device const float* gh = HAS_GATE ? (gate + ((ulong)q_tok * p.n_heads + head0 + h) * hd) : nullptr;
             float inv_gl = 1.0f / gl;
             for (uint d = tid; d < hd; d += nsg * 32) {
                 float o = 0.0f;
                 for (uint i = 0; i < nsg; ++i) o += tg_red[i * row + d] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
-                out[d] = o * inv_gl;
+                float val = o * inv_gl;
+                if (HAS_GATE) val *= 1.0f / (1.0f + exp(-gh[d]));
+                out[d] = val;
             }
         } else {
             device float* out = part + (((ulong)q_tok * p.n_heads + head0 + h) * p.n_splits + split) * (hd + 2);
@@ -2241,12 +2447,273 @@ kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
     }
 }
 
+template <uint NJ>
+kernel void attn_cached_gqa_split_t(device const float* q [[buffer(0)]],
+                                    device float* kc [[buffer(1)]],
+                                    device float* vc [[buffer(2)]],
+                                    device float* part [[buffer(3)]],
+                                    constant AttnCachedParams& p [[buffer(4)]],
+                                    device const float* k_in [[buffer(5)]],
+                                    device const float* v_in [[buffer(6)]],
+                                    device const float* inv_freq [[buffer(7)]],
+                                    uint3 tg3 [[threadgroup_position_in_grid]],
+                                    uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]],
+                                    uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tq[ATTN_HPT * NJ * 32];
+    threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_red[ATTN_MAX_SG * NJ * 32];
+    attn_cached_gqa_split_impl<NJ, false>(q, kc, vc, part, p, k_in, v_in, inv_freq, nullptr, tg3, sg, lane, nsg, tq, tg_m, tg_l, tg_red);
+}
+
+template <uint NJ>
+kernel void attn_cached_gqa_split_gated_t(device const float* q [[buffer(0)]],
+                                          device float* kc [[buffer(1)]],
+                                          device float* vc [[buffer(2)]],
+                                          device float* part [[buffer(3)]],
+                                          constant AttnCachedParams& p [[buffer(4)]],
+                                          device const float* k_in [[buffer(5)]],
+                                          device const float* v_in [[buffer(6)]],
+                                          device const float* inv_freq [[buffer(7)]],
+                                          device const float* gate [[buffer(14)]],
+                                          uint3 tg3 [[threadgroup_position_in_grid]],
+                                          uint sg [[simdgroup_index_in_threadgroup]],
+                                          uint lane [[thread_index_in_simdgroup]],
+                                          uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float tq[ATTN_HPT * NJ * 32];
+    threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_red[ATTN_MAX_SG * NJ * 32];
+    attn_cached_gqa_split_impl<NJ, true>(q, kc, vc, part, p, k_in, v_in, inv_freq, gate, tg3, sg, lane, nsg, tq, tg_m, tg_l, tg_red);
+}
+
 typedef decltype(attn_cached_gqa_split_t<1>) attn_cached_gqa_split_k;
 template [[host_name("attn_cached_gqa_split_f32_1")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<1>;
 template [[host_name("attn_cached_gqa_split_f32_2")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<2>;
 template [[host_name("attn_cached_gqa_split_f32_4")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<4>;
 template [[host_name("attn_cached_gqa_split_f32_8")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<8>;
 template [[host_name("attn_cached_gqa_split_f32_16")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_t<16>;
+
+typedef decltype(attn_cached_gqa_split_gated_t<1>) attn_cached_gqa_split_gated_k;
+template [[host_name("attn_cached_gqa_split_gated_f32_1")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_gated_t<1>;
+template [[host_name("attn_cached_gqa_split_gated_f32_2")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_gated_t<2>;
+template [[host_name("attn_cached_gqa_split_gated_f32_4")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_gated_t<4>;
+template [[host_name("attn_cached_gqa_split_gated_f32_8")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_gated_t<8>;
+template [[host_name("attn_cached_gqa_split_gated_f32_16")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_gated_t<16>;
+
+template <uint NJ, bool HAS_GATE = false>
+inline void attn_cached_gqa_split_vec4_impl(device const float* q,
+                                            device float* kc,
+                                            device float* vc,
+                                            device float* part,
+                                            constant AttnCachedParams& p,
+                                            device const float* k_in,
+                                            device const float* v_in,
+                                            device const float* inv_freq,
+                                            device const float* gate,
+                                            uint3 tg3,
+                                            uint sg,
+                                            uint lane,
+                                            uint nsg,
+                                            threadgroup float4* tq4_buf,
+                                            threadgroup float* tg_m,
+                                            threadgroup float* tg_l,
+                                            threadgroup float4* tg_red4_buf) {
+    constexpr uint NJ4 = NJ / 4;
+    constexpr uint row = NJ * 32;
+    constexpr uint row4 = NJ * 8;
+    threadgroup float* tq = (threadgroup float*)tq4_buf;
+    threadgroup float* tg_red = (threadgroup float*)tg_red4_buf;
+    const uint hd = row;
+    const uint hgroups = (p.group + ATTN_HPT - 1) / ATTN_HPT;
+    const uint kvh = tg3.x / hgroups;
+    const uint head0 = kvh * p.group + (tg3.x % hgroups) * ATTN_HPT;
+    const uint nh = min(ATTN_HPT, kvh * p.group + p.group - head0);
+    const uint q_tok = 0;
+    const uint split = tg3.z;
+    const uint tid = sg * 32 + lane;
+    if (p.rotary_dim == 0) {
+        device const float4* q4 = (device const float4*)(q + ((ulong)q_tok * p.n_heads + head0) * hd);
+        const uint n_vec4 = nh * row4;
+        for (uint i4 = tid; i4 < n_vec4; i4 += nsg * 32) {
+            tq4_buf[i4] = q4[i4];
+        }
+    } else {
+        for (uint i = tid; i < nh * row; i += nsg * 32) {
+            const uint h = i / row, d = i % row;
+            device const float* qh = q + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
+            tq[i] = attn_rope_val(qh, d, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint kv_off = kvh * hd;
+    if (p.write_kv != 0 && (tg3.x % hgroups) == 0 && split == 0) {
+        ulong dst_base = (ulong)p.start_pos * p.stride + kv_off;
+        if (p.rotary_dim == 0) {
+            device float4* kc4 = (device float4*)(kc + dst_base);
+            device float4* vc4 = (device float4*)(vc + dst_base);
+            device const float4* kin4 = (device const float4*)(k_in + kv_off);
+            device const float4* vin4 = (device const float4*)(v_in + kv_off);
+            for (uint d4 = tid; d4 < row4; d4 += nsg * 32) {
+                kc4[d4] = kin4[d4];
+                vc4[d4] = vin4[d4];
+            }
+        } else {
+            for (uint d = tid; d < hd; d += nsg * 32) {
+                kc[dst_base + d] = attn_rope_val(k_in + kv_off, d, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale);
+                vc[dst_base + d] = v_in[kv_off + d];
+            }
+        }
+    }
+    const uint cur_pos = p.start_pos + q_tok;
+    const uint len = cur_pos + 1;
+    uint lo = (p.window > 0 && cur_pos + 1 > p.window) ? (cur_pos + 1 - p.window) : 0;
+    lo += split * p.chunk;
+    const uint hi = min(len, lo + p.chunk);
+
+    float4 acc4[ATTN_HPT][NJ4];
+    float m[ATTN_HPT], l[ATTN_HPT];
+    for (uint h = 0; h < ATTN_HPT; ++h) {
+        m[h] = -FLT_MAX;
+        l[h] = 0.0f;
+        for (uint j4 = 0; j4 < NJ4; ++j4) acc4[h][j4] = float4(0.0f);
+    }
+    for (uint t = lo + sg; t < hi; t += nsg) {
+        const bool cur_tok = (p.write_kv != 0 && t == p.start_pos);
+        device const float* k = cur_tok ? (k_in + kv_off) : (kc + (ulong)t * p.stride + kv_off);
+        device const float* v = cur_tok ? (v_in + kv_off) : (vc + (ulong)t * p.stride + kv_off);
+        float4 kr4[NJ4];
+        if (cur_tok && p.rotary_dim > 0) {
+            for (uint j4 = 0; j4 < NJ4; ++j4) {
+                const uint d0 = (lane + 32 * j4) * 4;
+                kr4[j4] = float4(
+                    attn_rope_val(k, d0 + 0, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale),
+                    attn_rope_val(k, d0 + 1, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale),
+                    attn_rope_val(k, d0 + 2, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale),
+                    attn_rope_val(k, d0 + 3, p.start_pos, inv_freq, p.rotary_dim, p.pair_stride, p.mscale)
+                );
+            }
+        } else {
+            device const float4* k4 = (device const float4*)k;
+            for (uint j4 = 0; j4 < NJ4; ++j4) {
+                kr4[j4] = k4[lane + 32 * j4];
+            }
+        }
+        device const float4* v4 = (device const float4*)v;
+        float4 vr4[NJ4];
+        for (uint j4 = 0; j4 < NJ4; ++j4) {
+            vr4[j4] = v4[lane + 32 * j4];
+        }
+        for (uint h = 0; h < ATTN_HPT; ++h) {
+            if (h >= nh) break;
+            threadgroup const float4* tq4 = tq4_buf + h * row4;
+            float s = 0.0f;
+            for (uint j4 = 0; j4 < NJ4; ++j4) {
+                s += dot(tq4[lane + 32 * j4], kr4[j4]);
+            }
+            s = simd_sum(s) * p.scale;
+            if (p.softcap > 0.0f) s = tanh(s / p.softcap) * p.softcap;
+            const float m_new = max(m[h], s);
+            const float corr = exp(m[h] - m_new);
+            const float e = exp(s - m_new);
+            l[h] = l[h] * corr + e;
+            for (uint j4 = 0; j4 < NJ4; ++j4) {
+                acc4[h][j4] = acc4[h][j4] * corr + e * vr4[j4];
+            }
+            m[h] = m_new;
+        }
+    }
+    for (uint h = 0; h < ATTN_HPT; ++h) {
+        if (h >= nh) break;
+        if (lane == 0) {
+            tg_m[h * ATTN_MAX_SG + sg] = m[h];
+            tg_l[h * ATTN_MAX_SG + sg] = l[h];
+        }
+        threadgroup float4* red4 = tg_red4_buf + sg * row4;
+        for (uint j4 = 0; j4 < NJ4; ++j4) {
+            red4[lane + 32 * j4] = acc4[h][j4];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float gm = -FLT_MAX;
+        for (uint i = 0; i < nsg; ++i) gm = max(gm, tg_m[h * ATTN_MAX_SG + i]);
+        float gl = 0.0f;
+        for (uint i = 0; i < nsg; ++i) gl += tg_l[h * ATTN_MAX_SG + i] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
+        if (p.n_splits == 1) {
+            device float* out = part + ((ulong)q_tok * p.n_heads + head0 + h) * hd;
+            device const float* gh = HAS_GATE ? (gate + ((ulong)q_tok * p.n_heads + head0 + h) * hd) : nullptr;
+            float inv_gl = 1.0f / gl;
+            for (uint d = tid; d < hd; d += nsg * 32) {
+                float o = 0.0f;
+                for (uint i = 0; i < nsg; ++i) o += tg_red[i * row + d] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
+                float val = o * inv_gl;
+                if (HAS_GATE) val *= 1.0f / (1.0f + exp(-gh[d]));
+                out[d] = val;
+            }
+        } else {
+            device float* out = part + (((ulong)q_tok * p.n_heads + head0 + h) * p.n_splits + split) * (hd + 2);
+            if (tid == 0) {
+                out[0] = gm;
+                out[1] = gl;
+            }
+            for (uint d = tid; d < hd; d += nsg * 32) {
+                float o = 0.0f;
+                for (uint i = 0; i < nsg; ++i) o += tg_red[i * row + d] * exp(tg_m[h * ATTN_MAX_SG + i] - gm);
+                out[2 + d] = o;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template <uint NJ>
+kernel void attn_cached_gqa_split_vec4_t(device const float* q [[buffer(0)]],
+                                         device float* kc [[buffer(1)]],
+                                         device float* vc [[buffer(2)]],
+                                         device float* part [[buffer(3)]],
+                                         constant AttnCachedParams& p [[buffer(4)]],
+                                         device const float* k_in [[buffer(5)]],
+                                         device const float* v_in [[buffer(6)]],
+                                         device const float* inv_freq [[buffer(7)]],
+                                         uint3 tg3 [[threadgroup_position_in_grid]],
+                                         uint sg [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]],
+                                         uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float4 tq4_buf[ATTN_HPT * NJ * 8];
+    threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float4 tg_red4_buf[ATTN_MAX_SG * NJ * 8];
+    attn_cached_gqa_split_vec4_impl<NJ, false>(q, kc, vc, part, p, k_in, v_in, inv_freq, nullptr, tg3, sg, lane, nsg, tq4_buf, tg_m, tg_l, tg_red4_buf);
+}
+
+template <uint NJ>
+kernel void attn_cached_gqa_split_vec4_gated_t(device const float* q [[buffer(0)]],
+                                               device float* kc [[buffer(1)]],
+                                               device float* vc [[buffer(2)]],
+                                               device float* part [[buffer(3)]],
+                                               constant AttnCachedParams& p [[buffer(4)]],
+                                               device const float* k_in [[buffer(5)]],
+                                               device const float* v_in [[buffer(6)]],
+                                               device const float* inv_freq [[buffer(7)]],
+                                               device const float* gate [[buffer(14)]],
+                                               uint3 tg3 [[threadgroup_position_in_grid]],
+                                               uint sg [[simdgroup_index_in_threadgroup]],
+                                               uint lane [[thread_index_in_simdgroup]],
+                                               uint nsg [[simdgroups_per_threadgroup]]) {
+    threadgroup float4 tq4_buf[ATTN_HPT * NJ * 8];
+    threadgroup float tg_m[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float tg_l[ATTN_HPT * ATTN_MAX_SG];
+    threadgroup float4 tg_red4_buf[ATTN_MAX_SG * NJ * 8];
+    attn_cached_gqa_split_vec4_impl<NJ, true>(q, kc, vc, part, p, k_in, v_in, inv_freq, gate, tg3, sg, lane, nsg, tq4_buf, tg_m, tg_l, tg_red4_buf);
+}
+
+template [[host_name("attn_cached_gqa_split_vec4_f32_4")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_vec4_t<4>;
+template [[host_name("attn_cached_gqa_split_vec4_f32_8")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_vec4_t<8>;
+template [[host_name("attn_cached_gqa_split_vec4_f32_16")]] kernel attn_cached_gqa_split_k attn_cached_gqa_split_vec4_t<16>;
+template [[host_name("attn_cached_gqa_split_vec4_gated_f32_4")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_vec4_gated_t<4>;
+template [[host_name("attn_cached_gqa_split_vec4_gated_f32_8")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_vec4_gated_t<8>;
+template [[host_name("attn_cached_gqa_split_vec4_gated_f32_16")]] kernel attn_cached_gqa_split_gated_k attn_cached_gqa_split_vec4_gated_t<16>;
 
 struct PagedAttnCachedParams {
     uint n_heads;
@@ -2349,6 +2816,7 @@ struct Conv1dParams {
     uint dilation;
     uint hist;
     uint has_state;
+    uint silu;
 };
 
 kernel void causal_conv1d_f32(device const float* x [[buffer(0)]],
@@ -2378,6 +2846,7 @@ kernel void causal_conv1d_f32(device const float* x [[buffer(0)]],
                 acc += w_ch[tap] * val;
             }
         }
+        if (p.silu != 0) acc = acc / (1.0f + exp(-acc));
         out[(ulong)i * p.channels + ch] = acc;
     }
 
@@ -2402,6 +2871,8 @@ struct DeltaRuleParams {
     uint key_dim;
     uint val_dim;
     uint rep;
+    uint beta_sigmoid;
+    uint has_neg_a;
 };
 
 // Gated delta rule, one threadgroup per (32 value columns, head): 4 simdgroups split the key rows of the
@@ -2416,6 +2887,7 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
                            device float* state [[buffer(5)]],
                            device float* out [[buffer(6)]],
                            constant DeltaRuleParams& p [[buffer(7)]],
+                           device const float* neg_a [[buffer(8)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float ks[DELTA_MAX_KD];
@@ -2435,8 +2907,14 @@ kernel void delta_rule_f32(device const float* q [[buffer(0)]],
         device const float* q_in = q + ((ulong)t * kh + k_h) * kd;
         device const float* k_in = k + ((ulong)t * kh + k_h) * kd;
         device const float* v_t = v + ((ulong)t * vh + h) * vd;
-        const float b = beta[(ulong)t * vh + h];
-        const float decay = exp(log_decay[(ulong)t * vh + h]);
+        float b_raw = beta[(ulong)t * vh + h];
+        const float b = (p.beta_sigmoid != 0) ? (1.0f / (1.0f + exp(-b_raw))) : b_raw;
+        float ld_raw = log_decay[(ulong)t * vh + h];
+        if (p.has_neg_a != 0) {
+            float sp = ld_raw > 20.0f ? ld_raw : log(1.0f + exp(ld_raw));
+            ld_raw = neg_a[h] * sp;
+        }
+        const float decay = exp(ld_raw);
 
         float qn = 0.0f, kn = 0.0f;
         for (uint i = tid; i < kd; i += 128) {
