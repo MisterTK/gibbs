@@ -397,17 +397,24 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
     Ok(pso)
 }
 
-/// Override for rows per simdgroup of the expert GEMV (`0` = `moe_rows_per_sg(c)`).
-static ROWS_PER_SG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    static TEST_ROWS_PER_SG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_PSO_OVERRIDE: std::cell::RefCell<Option<ComputePipelineState>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn moe_rows_per_sg(c: &Codec) -> usize {
-    let ov = ROWS_PER_SG.load(std::sync::atomic::Ordering::Relaxed);
-    if ov != 0 {
-        ov
-    } else if c.block_elems <= 32 {
-        4
-    } else {
-        2
+    #[cfg(test)]
+    {
+        let ov = TEST_ROWS_PER_SG.get();
+        if ov != 0 {
+            return ov;
+        }
+    }
+    match c.format {
+        QuantFormat::GGUF_IQ4_NL | QuantFormat::GGUF_Q4_0 | QuantFormat::GGUF_IQ2_M => 4,
+        _ => 2,
     }
 }
 /// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
@@ -415,6 +422,10 @@ static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipeli
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
+    #[cfg(test)]
+    if let Some(pso) = TEST_PSO_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Ok(pso);
+    }
     let device = &sess.rt.device;
     let key = (device.registry_id(), c.format, r);
     if let Some(p) = MOE_GEMV.lock().get(&key) {
@@ -1026,8 +1037,17 @@ mod tests {
         fmts.extend(crate::graph::codec::formats().into_iter().map(Fmt::Q));
         let (experts, top_k, rows) = (6, 3, 35);
         let ids = vec![4, 0, 5, 2, 2, 1];
+        super::TEST_ROWS_PER_SG.set(0);
+        for f in crate::graph::codec::formats() {
+            let c = crate::graph::codec::codec(f).expect("codec");
+            let want_r = match f {
+                Q::GGUF_IQ4_NL | Q::GGUF_Q4_0 | Q::GGUF_IQ2_M => 4,
+                _ => 2,
+            };
+            assert_eq!(super::moe_rows_per_sg(c), want_r, "{f:?}");
+        }
         for r in [2usize, 4usize] {
-            super::ROWS_PER_SG.store(r, std::sync::atomic::Ordering::Relaxed);
+            super::TEST_ROWS_PER_SG.set(r);
             for (i, fmt) in fmts.iter().enumerate() {
                 let cols = match fmt {
                     Fmt::Q(f) => {
@@ -1054,7 +1074,7 @@ mod tests {
                 }
             }
         }
-        super::ROWS_PER_SG.store(0, std::sync::atomic::Ordering::Relaxed);
+        super::TEST_ROWS_PER_SG.set(0);
     }
 
     #[test]
@@ -1489,24 +1509,151 @@ mod tests {
             let plan = s.prepare_plan(&g).unwrap();
             let xs = Tensor::F32(vec![0.25; x_rows * cols]);
             for r in [2usize, 4usize] {
-                super::ROWS_PER_SG.store(r, std::sync::atomic::Ordering::Relaxed);
+                super::TEST_ROWS_PER_SG.set(r);
+                for _ in 0..5 {
+                    s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                        .unwrap();
+                }
+            }
+            let mut r2_rounds = Vec::with_capacity(3);
+            let mut r4_rounds = Vec::with_capacity(3);
+            let mut r4_wins = 0usize;
+            for _round in 0..3 {
+                let mut r2_sum = 0.0;
+                let mut r4_sum = 0.0;
+                for r in [2usize, 4, 4, 2] {
+                    super::TEST_ROWS_PER_SG.set(r);
+                    let mut leg_s = 0.0;
+                    for _ in 0..10 {
+                        s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                            .unwrap();
+                        leg_s += s.last_gpu_seconds() / (10.0 * 8.0);
+                    }
+                    if r == 2 {
+                        r2_sum += 0.5 * leg_s;
+                    } else {
+                        r4_sum += 0.5 * leg_s;
+                    }
+                }
+                if r4_sum < r2_sum {
+                    r4_wins += 1;
+                }
+                r2_rounds.push(r2_sum);
+                r4_rounds.push(r4_sum);
+            }
+            super::TEST_ROWS_PER_SG.set(0);
+            r2_rounds.sort_by(|a, b| a.total_cmp(b));
+            r4_rounds.sort_by(|a, b| a.total_cmp(b));
+            let (r2_s, r4_s) = (r2_rounds[1], r4_rounds[1]);
+            let (r2_us, r4_us) = (r2_s * 1e6, r4_s * 1e6);
+            let r2_gbps = routed_bytes as f64 / r2_s / 1e9;
+            let r4_gbps = routed_bytes as f64 / r4_s / 1e9;
+            println!(
+                "moe_gemv {f:?} {rows}x{cols}: r=2 med={r2_us:.1}us ({r2_gbps:.1} GB/s) vs r=4 med={r4_us:.1}us ({r4_gbps:.1} GB/s) [r4_wins={r4_wins}/3, ratio={:.4}]",
+                r2_us / r4_us
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn moe_gemv_iq2xxs_constant_decode_ablation() {
+        let f = Q::GGUF_IQ2_XXS;
+        let (experts, top_k, rows, cols, x_rows) = (16usize, 8usize, 1408usize, 2816usize, 1usize);
+        let ids = Tensor::U32(vec![0, 2, 5, 7, 9, 11, 13, 15]);
+        let c = crate::graph::codec::codec(f).unwrap();
+        let (dt, bank) = weight(Fmt::Q(f), experts * rows, cols, 1);
+        let routed_bytes =
+            top_k * rows * (cols / c.block_elems as usize) * c.block_bytes as usize;
+        let mut g = Graph::new();
+        let x = g.input("x", vec![x_rows, cols], DType::F32);
+        let b = g.weight("bank", vec![experts * rows, cols], dt);
+        let id_in = g.input("ids", vec![1, top_k], DType::U32);
+        for step in 0..8 {
+            let y = g.add(
+                format!("moe_{step}"),
+                Op::MoeLinear { experts, top_k },
+                &[x, b, id_in],
+                vec![top_k, rows],
+                DType::F32,
+            );
+            g.output(y);
+        }
+        let mut w = Weights::new();
+        w.insert("bank", bank);
+        let s = Session::new(rt(), &w).unwrap();
+        let plan = s.prepare_plan(&g).unwrap();
+        let xs = Tensor::F32(vec![0.25; x_rows * cols]);
+        let params = super::GemvParams {
+            rows_per_sg: 2,
+            ..Default::default()
+        };
+        let real_pso = super::moe_gemv_pso(&s, c, 2).unwrap();
+        let real_msl = super::gemv_indexed(c, params);
+        let stub_msl = real_msl.replace(
+            "IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]",
+            "0x0808080808080808ul",
+        );
+        assert_ne!(
+            stub_msl, real_msl,
+            "expected IQ2XXS_GRID lookup in decode_group"
+        );
+        let stub_src = format!("#include <metal_stdlib>\nusing namespace metal;\n{stub_msl}");
+        let opts = super::CompileOptions::new();
+        let lib = s
+            .rt
+            .device
+            .new_library_with_source(&stub_src, &opts)
+            .expect("compile IQ2_XXS const_stub MSL");
+        let func = lib
+            .get_function(&super::gemv_indexed_name(c, params), None)
+            .expect("get function");
+        let stub_pso = s
+            .rt
+            .device
+            .new_compute_pipeline_state_with_function(&func)
+            .expect("create const_stub PSO");
+        super::TEST_ROWS_PER_SG.set(2);
+        for pso in [&real_pso, &stub_pso] {
+            super::TEST_PSO_OVERRIDE.with(|cell| *cell.borrow_mut() = Some((*pso).clone()));
+            for _ in 0..5 {
+                s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                    .unwrap();
+            }
+        }
+        let mut real_rounds = Vec::with_capacity(3);
+        let mut stub_rounds = Vec::with_capacity(3);
+        for _round in 0..3 {
+            let mut real_sum = 0.0;
+            let mut stub_sum = 0.0;
+            for is_stub in [false, true, true, false] {
+                let pso = if is_stub { &stub_pso } else { &real_pso };
+                super::TEST_PSO_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(pso.clone()));
+                let mut leg_s = 0.0;
                 for _ in 0..10 {
                     s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
                         .unwrap();
+                    leg_s += s.last_gpu_seconds() / (10.0 * 8.0);
                 }
-                let mut dt_s = 0.0;
-                for _ in 0..20 {
-                    s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
-                        .unwrap();
-                    dt_s += s.last_gpu_seconds() / (20.0 * 8.0);
+                if is_stub {
+                    stub_sum += 0.5 * leg_s;
+                } else {
+                    real_sum += 0.5 * leg_s;
                 }
-                println!(
-                    "moe_gemv r={r} {f:?} {rows}x{cols} (top_k={top_k}, x_rows={x_rows}): {:.1} us, {:.1} GB/s",
-                    dt_s * 1e6,
-                    routed_bytes as f64 / dt_s / 1e9
-                );
             }
-            super::ROWS_PER_SG.store(0, std::sync::atomic::Ordering::Relaxed);
+            real_rounds.push(real_sum);
+            stub_rounds.push(stub_sum);
         }
+        super::TEST_PSO_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        super::TEST_ROWS_PER_SG.set(0);
+        real_rounds.sort_by(|a, b| a.total_cmp(b));
+        stub_rounds.sort_by(|a, b| a.total_cmp(b));
+        let (real_s, stub_s) = (real_rounds[1], stub_rounds[1]);
+        let (real_us, stub_us) = (real_s * 1e6, stub_s * 1e6);
+        let real_gbps = routed_bytes as f64 / real_s / 1e9;
+        let stub_gbps = routed_bytes as f64 / stub_s / 1e9;
+        println!(
+            "iq2xxs_ablation 1408x2816: real={real_us:.1}us ({real_gbps:.1} GB/s) vs const_stub={stub_us:.1}us ({stub_gbps:.1} GB/s)"
+        );
     }
 }
