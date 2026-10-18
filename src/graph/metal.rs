@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 64] = [
+const BASE_KERNELS: [&str; 67] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -471,6 +471,9 @@ const BASE_KERNELS: [&str; 64] = [
     "attn_cached_gqa_split_f32_4",
     "attn_cached_gqa_split_f32_8",
     "attn_cached_gqa_split_f32_16",
+    "attn_cached_gqa_split_vec4_f32_4",
+    "attn_cached_gqa_split_vec4_f32_8",
+    "attn_cached_gqa_split_vec4_f32_16",
     "attn_cached_merge_f32",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
@@ -3523,13 +3526,24 @@ impl Session {
                     }
                 }
                 enc.set_compute_pipeline_state(if gqa_decode {
-                    rt.pso(match head_dim.div_ceil(32) {
+                    let kernel_name = if (stride & 3) == 0 {
+                        match head_dim {
+                            128 => Some("attn_cached_gqa_split_vec4_f32_4"),
+                            256 => Some("attn_cached_gqa_split_vec4_f32_8"),
+                            512 => Some("attn_cached_gqa_split_vec4_f32_16"),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                    .unwrap_or(match head_dim.div_ceil(32) {
                         0..=1 => "attn_cached_gqa_split_f32_1",
                         2 => "attn_cached_gqa_split_f32_2",
                         3..=4 => "attn_cached_gqa_split_f32_4",
                         5..=8 => "attn_cached_gqa_split_f32_8",
                         _ => "attn_cached_gqa_split_f32_16",
-                    })?
+                    });
+                    rt.pso(kernel_name)?
                 } else {
                     rt.pso(match head_dim.div_ceil(32) {
                         0..=1 => "flash_attn_cached_f32_1",
