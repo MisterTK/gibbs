@@ -679,6 +679,35 @@ kernel void geglu_f32(device const float* gate [[buffer(0)]],
     out[i] = gelu_tanh(gate[i]) * up[i];
 }
 
+kernel void split_glu_f32(device const float* gu [[buffer(0)]],
+                          device float* out [[buffer(1)]],
+                          constant uint4& p [[buffer(2)]],
+                          uint idx [[thread_position_in_grid]]) {
+    if (idx >= p.x * p.y) return;
+    uint r = idx / p.y;
+    uint c = idx % p.y;
+    float g = gu[(ulong)r * (2u * p.y) + c];
+    float u = gu[(ulong)r * (2u * p.y) + p.y + c];
+    float act = p.z == 0u ? gelu_erf(g) : (p.z == 1u ? gelu_tanh(g) : (g / (1.0f + exp(-g))));
+    out[idx] = act * u;
+}
+
+kernel void moe_weighted_sum_f32(device const float* down [[buffer(0)]],
+                                 device const float* weights [[buffer(1)]],
+                                 device float* out [[buffer(2)]],
+                                 constant uint3& p [[buffer(3)]],
+                                 uint idx [[thread_position_in_grid]]) {
+    if (idx >= p.x * p.z) return;
+    uint r = idx / p.z;
+    uint c = idx % p.z;
+    float sum = 0.0f;
+    ulong base = (ulong)r * p.y;
+    for (uint s = 0; s < p.y; ++s) {
+        sum += down[(base + s) * p.z + c] * weights[base + s];
+    }
+    out[idx] = sum;
+}
+
 struct block_q4_0 {
     half d;
     uint8_t qs[16];
