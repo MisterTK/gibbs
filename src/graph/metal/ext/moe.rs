@@ -11,7 +11,8 @@ use super::super::{numel, set_bytes, u32_of, Planned, Session, TG};
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
-    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams,
+    block_ref, device_msl, gemv_indexed, gemv_indexed_glu, gemv_indexed_glu_name,
+    gemv_indexed_name, gemv_rows_per_tg, GemvParams,
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
@@ -71,6 +72,20 @@ pub enum Step {
         top_k: usize,
         experts: usize,
         x_per_slot: bool,
+    },
+    ExpertGateUpGlu {
+        x: ValueId,
+        bank: ValueId,
+        ids: ValueId,
+        dtype: DType,
+        ff: usize,
+        cols: usize,
+        slots: usize,
+        top_k: usize,
+        experts: usize,
+        x_per_slot: bool,
+        is_geglu: bool,
+        tanh: bool,
     },
     Embed {
         table: ValueId,
@@ -328,7 +343,9 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
             v
         }
         Step::GatherCols { x, idx, .. } => vec![*x, *idx],
-        Step::ExpertLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
+        Step::ExpertLinear { x, bank, ids, .. } | Step::ExpertGateUpGlu { x, bank, ids, .. } => {
+            vec![*x, *bank, *ids]
+        }
         Step::Embed { table, ids, .. } => vec![*table, *ids],
     }
 }
@@ -338,7 +355,7 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
     match st {
         Step::TopK { .. } => false,
         Step::GatherCols { idx, .. } => v == *idx,
-        Step::ExpertLinear { x, .. } => v != *x,
+        Step::ExpertLinear { x, .. } | Step::ExpertGateUpGlu { x, .. } => v != *x,
         Step::Embed { .. } => true,
     }
 }
@@ -428,6 +445,40 @@ fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, Strin
     let func = lib.get_function(&gemv_indexed_name(c, params), None)?;
     let pso = device.new_compute_pipeline_state_with_function(&func)?;
     MOE_GEMV.lock().insert(key, pso.clone());
+    Ok(pso)
+}
+
+/// Rows per simdgroup of the fused `gate_up` + GLU expert GEMV (`1` `ff`-column = `2` matrix rows per SG).
+const ROWS_PER_SG_GLU: usize = 1;
+
+/// Per (device, codec) pipelines of [`gemv_indexed_glu`], compiled on first use.
+static MOE_GEMV_GLU: LazyLock<Mutex<HashMap<(u64, QuantFormat), ComputePipelineState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn moe_gemv_glu_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, String> {
+    let device = &sess.rt.device;
+    let key = (device.registry_id(), c.format);
+    if let Some(p) = MOE_GEMV_GLU.lock().get(&key) {
+        return Ok(p.clone());
+    }
+    let params = GemvParams {
+        rows_per_sg: ROWS_PER_SG_GLU,
+        ..Default::default()
+    };
+    let src = format!(
+        "#include <metal_stdlib>\nusing namespace metal;\n{}",
+        gemv_indexed_glu(c, params)
+    );
+    let opts = CompileOptions::new();
+    let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
+        format!(
+            "generated {:?} expert gate_up GLU GEMV failed to compile: {e}",
+            c.format
+        )
+    })?;
+    let func = lib.get_function(&gemv_indexed_glu_name(c, params), None)?;
+    let pso = device.new_compute_pipeline_state_with_function(&func)?;
+    MOE_GEMV_GLU.lock().insert(key, pso.clone());
     Ok(pso)
 }
 
@@ -528,6 +579,53 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                     *slots as u64,
                     1,
                 ),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+        Step::ExpertGateUpGlu {
+            x,
+            bank,
+            ids,
+            dtype,
+            ff,
+            cols,
+            slots,
+            top_k,
+            experts,
+            x_per_slot,
+            is_geglu,
+            tanh,
+        } => {
+            let c = bank_codec(*dtype)
+                .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
+            let pso = moe_gemv_glu_pso(sess, c)?;
+            enc.set_compute_pipeline_state(&pso);
+            e.bind(0, *bank);
+            e.bind(1, *x);
+            e.bind(2, s.out);
+            let glu_kind: u32 = if !*is_geglu {
+                0
+            } else if !*tanh {
+                1
+            } else {
+                2
+            };
+            set_bytes(
+                enc,
+                3,
+                &[
+                    u32_of(*ff)?,
+                    u32_of(*cols)?,
+                    u32_of(*slots)?,
+                    u32_of(*top_k)?,
+                    u32_of(*experts)?,
+                    *x_per_slot as u32,
+                    glu_kind,
+                ],
+            );
+            e.bind(4, *ids);
+            enc.dispatch_thread_groups(
+                MTLSize::new((*ff as u64).div_ceil(8), *slots as u64, 1),
                 MTLSize::new(256, 1, 1),
             );
         }
