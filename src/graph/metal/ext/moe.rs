@@ -397,21 +397,21 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
     Ok(pso)
 }
 
-/// Rows per simdgroup of the expert GEMV.
-const ROWS_PER_SG: usize = 2;
+/// Default rows per simdgroup of the expert GEMV.
+static ROWS_PER_SG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 
-/// Per (device, codec) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat), ComputePipelineState>>> =
+/// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, String> {
+fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
     let device = &sess.rt.device;
-    let key = (device.registry_id(), c.format);
+    let key = (device.registry_id(), c.format, r);
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
     let params = GemvParams {
-        rows_per_sg: ROWS_PER_SG,
+        rows_per_sg: r,
         ..Default::default()
     };
     let src = format!(
@@ -500,7 +500,8 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
         } => {
             let c = bank_codec(*dtype)
                 .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
-            let pso = moe_gemv_pso(sess, c)?;
+            let r = ROWS_PER_SG.load(std::sync::atomic::Ordering::Relaxed);
+            let pso = moe_gemv_pso(sess, c, r)?;
             enc.set_compute_pipeline_state(&pso);
             e.bind(0, *bank);
             e.bind(1, *x);
@@ -519,7 +520,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             );
             e.bind(4, *ids);
             let rows_per_tg = gemv_rows_per_tg(GemvParams {
-                rows_per_sg: ROWS_PER_SG,
+                rows_per_sg: r,
                 ..Default::default()
             });
             enc.dispatch_thread_groups(
@@ -1007,32 +1008,36 @@ mod tests {
     fn moe_linear_matches_cpu_for_every_format() {
         let mut fmts = vec![Fmt::F32, Fmt::F16, Fmt::BF16];
         fmts.extend(crate::graph::codec::formats().into_iter().map(Fmt::Q));
-        let (experts, top_k, rows) = (6, 3, 19);
+        let (experts, top_k, rows) = (6, 3, 35);
         let ids = vec![4, 0, 5, 2, 2, 1];
-        for (i, fmt) in fmts.iter().enumerate() {
-            let cols = match fmt {
-                Fmt::Q(f) => {
-                    let be = crate::graph::codec::codec(*f).expect("codec").block_elems as usize;
-                    (512 / be).max(1) * be
+        for r in [2usize, 4usize] {
+            super::ROWS_PER_SG.store(r, std::sync::atomic::Ordering::Relaxed);
+            for (i, fmt) in fmts.iter().enumerate() {
+                let cols = match fmt {
+                    Fmt::Q(f) => {
+                        let be = crate::graph::codec::codec(*f).expect("codec").block_elems as usize;
+                        (512 / be).max(1) * be
+                    }
+                    _ => 64,
+                };
+                // Broadcast x (2 rows x 3 slots) and one x row per slot.
+                for x_rows in [2, 6] {
+                    let (want, got) = moe_both(
+                        *fmt,
+                        x_rows,
+                        cols,
+                        rows,
+                        experts,
+                        top_k,
+                        ids.clone(),
+                        10 + i as u64,
+                    );
+                    let err = rel_err(&want, &got);
+                    assert!(err < 1e-4, "r={r} {fmt:?} x_rows={x_rows}: {err}");
                 }
-                _ => 64,
-            };
-            // Broadcast x (2 rows x 3 slots) and one x row per slot.
-            for x_rows in [2, 6] {
-                let (want, got) = moe_both(
-                    *fmt,
-                    x_rows,
-                    cols,
-                    rows,
-                    experts,
-                    top_k,
-                    ids.clone(),
-                    10 + i as u64,
-                );
-                let err = rel_err(&want, &got);
-                assert!(err < 1e-4, "{fmt:?} x_rows={x_rows}: {err}");
             }
         }
+        super::ROWS_PER_SG.store(2, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -1399,6 +1404,36 @@ mod tests {
     }
 
     #[test]
+    fn moe_gemv_pipeline_max_threads_and_occupancy() {
+        let s = Session::new(rt(), &Weights::new()).unwrap();
+        for (fmt, r) in [
+            (Q::GGUF_IQ2_XXS, 1),
+            (Q::GGUF_IQ2_XXS, 2),
+            (Q::GGUF_IQ2_XXS, 4),
+            (Q::GGUF_IQ2_M, 2),
+            (Q::GGUF_IQ2_M, 4),
+            (Q::GGUF_IQ4_NL, 2),
+            (Q::GGUF_IQ4_NL, 4),
+            (Q::GGUF_Q4_0, 1),
+            (Q::GGUF_Q4_0, 2),
+            (Q::GGUF_Q4_0, 4),
+            (Q::GGUF_Q4_K_M, 1),
+            (Q::GGUF_Q4_K_M, 2),
+            (Q::GGUF_Q6_K, 1),
+            (Q::GGUF_Q6_K, 2),
+        ] {
+            let c = super::codec(fmt).unwrap();
+            let pso = super::moe_gemv_pso(&s, c, r).unwrap();
+            eprintln!(
+                "{fmt:?} r={r}: max_total_threads_per_threadgroup={} thread_execution_width={}",
+                pso.max_total_threads_per_threadgroup(),
+                pso.thread_execution_width()
+            );
+            assert_eq!(pso.max_total_threads_per_threadgroup(), 1024, "{fmt:?} r={r}");
+        }
+    }
+
+    #[test]
     #[ignore = "bandwidth measurement"]
     fn moe_gemv_bandwidth() {
         let (experts, top_k) = (16usize, 8usize);
@@ -1432,21 +1467,25 @@ mod tests {
             let s = Session::new(rt(), &w).unwrap();
             let plan = s.prepare_plan(&g).unwrap();
             let xs = Tensor::F32(vec![0.25; x_rows * cols]);
-            for _ in 0..10 {
-                s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
-                    .unwrap();
+            for r in [2usize, 4usize] {
+                super::ROWS_PER_SG.store(r, std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..10 {
+                    s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                        .unwrap();
+                }
+                let mut dt_s = 0.0;
+                for _ in 0..20 {
+                    s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
+                        .unwrap();
+                    dt_s += s.last_gpu_seconds() / (20.0 * 8.0);
+                }
+                println!(
+                    "moe_gemv r={r} {f:?} {rows}x{cols} (top_k={top_k}, x_rows={x_rows}): {:.1} us, {:.1} GB/s",
+                    dt_s * 1e6,
+                    routed_bytes as f64 / dt_s / 1e9
+                );
             }
-            let mut dt_s = 0.0;
-            for _ in 0..20 {
-                s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
-                    .unwrap();
-                dt_s += s.last_gpu_seconds() / (20.0 * 8.0);
-            }
-            println!(
-                "moe_gemv {f:?} {rows}x{cols} (top_k={top_k}, x_rows={x_rows}): {:.1} us, {:.1} GB/s",
-                dt_s * 1e6,
-                routed_bytes as f64 / dt_s / 1e9
-            );
+            super::ROWS_PER_SG.store(2, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

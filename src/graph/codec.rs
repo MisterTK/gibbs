@@ -401,13 +401,15 @@ static WIDE_IQ2_XXS: Wide = Wide {
 inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
 inline void decode_group(device const uchar* blk, uint g, thread float* out) {
     float d = cd_f16(blk);
-    device const uchar* q = blk + 2 + 8 * g;
-    uint q4 = cd_u32(q), aux1 = cd_u32(q + 4);
+    ushort4 qw = *(device const packed_ushort4*)(blk + 2 + 8 * g);
+    uint q4 = uint(qw.x) | (uint(qw.y) << 16);
+    uint aux1 = uint(qw.z) | (uint(qw.w) << 16);
     out[32] = d * (0.5f + float(aux1 >> 28)) * 0.25f;
     for (uint k = 0; k < 4; k++) {
         uint2 gw = as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]);
         float4 g0 = float4(as_type<uchar4>(gw.x)), g1 = float4(as_type<uchar4>(gw.y));
-        uint s = KSIGNS_IQ2XS[(aux1 >> (7 * k)) & 127u];
+        uint s7 = (aux1 >> (7 * k)) & 127u;
+        uint s = s7 | ((popcount(s7) & 1u) << 7);
         float4 s0 = select(g0, -g0, int4((s << 31), (s << 30), (s << 29), (s << 28)) < 0);
         float4 s1 = select(g1, -g1, int4((s << 27), (s << 26), (s << 25), (s << 24)) < 0);
         *(thread packed_float4*)(out + 8 * k) = s0;
