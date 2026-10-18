@@ -63,6 +63,7 @@ pub fn wide(format: QuantFormat) -> Option<&'static Wide> {
         QuantFormat::GGUF_Q3_K => Some(&WIDE_Q3_K),
         QuantFormat::GGUF_IQ4_XS => Some(&WIDE_IQ4_XS),
         QuantFormat::GGUF_IQ4_NL => Some(&WIDE_IQ4_NL),
+        QuantFormat::GGUF_Q4_0 => Some(&WIDE_Q4_0),
         QuantFormat::GGUF_IQ2_XXS => Some(&WIDE_IQ2_XXS),
         QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => Some(&WIDE_IQ2_M),
         QuantFormat::GGUF_IQ3_S => Some(&WIDE_IQ3_S),
@@ -364,6 +365,23 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
     for (uint i = 0; i < 8; i++) {
         out[i] = float(KVALUES_IQ4NL[q[i] & 0x0Fu]);
         out[8 + i] = float(KVALUES_IQ4NL[q[i] >> 4]);
+    }
+}
+"#,
+};
+
+static WIDE_Q4_0: Wide = Wide {
+    uniform: true,
+    groups: 2,
+    segs: 2,
+    msl: r#"
+inline uint group_seg(uint g, uint k) { return g * 8 + k * 16; }
+inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+    out[16] = float(*(device const half*)blk);
+    device const uchar* q = blk + 2 + g * 8;
+    for (uint i = 0; i < 8; i++) {
+        out[i] = float(int(q[i] & 0x0Fu) - 8);
+        out[8 + i] = float(int(q[i] >> 4) - 8);
     }
 }
 "#,
