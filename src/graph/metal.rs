@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 67] = [
+const BASE_KERNELS: [&str; 64] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -438,8 +438,6 @@ const BASE_KERNELS: [&str; 67] = [
     "gemv_q4_0",
     "gemv_q4_0_half",
     "gemv_q8_0",
-    "gemv_q4_0_norm",
-    "gemv_q4_0_half_norm",
     "gemv_bf16",
     "gemv_f16",
     "gemv_tq2_0",
@@ -447,7 +445,6 @@ const BASE_KERNELS: [&str; 67] = [
     "gemv_iq2_m",
     "gemv_q4_k",
     "gemv_q2_k",
-    "gemv_q4_k_norm",
     "gemv_iq3_s",
     "gemm_batched_bf16_none",
     "gemm_batched_bf16_gelu",
@@ -2266,16 +2263,11 @@ impl Session {
                 cols,
                 format,
                 variant,
-                norm_g,
                 ..
             } = &mut s.op
             else {
                 continue;
             };
-            if norm_g.is_some() {
-                *variant = GemvVariant::HAND;
-                continue;
-            }
             let allowed = format.gemv_variants();
             *variant = if let Some(o) = self.variant_override {
                 if allowed.contains(&o) {
@@ -3081,7 +3073,6 @@ impl Session {
                 ref weight_name,
                 bias,
                 res,
-                norm_g,
                 epi,
                 m,
                 rows,
@@ -3150,21 +3141,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = if norm_g.is_some() {
-                    let name = match format {
-                        WeightFormat::Q4_0 if (cols & 1023) != 0 => "gemv_q4_0_half_norm",
-                        WeightFormat::Q4_0 => "gemv_q4_0_norm",
-                        WeightFormat::Q4_K => "gemv_q4_k_norm",
-                        _ => {
-                            return Err(format!(
-                                "Metal executor: unsupported norm-prologue GEMV format {format:?}"
-                            ))
-                        }
-                    };
-                    (rt.pso(name)?.clone(), 16)
-                } else {
-                    self.gemv_pipeline(format, variant, cols)?
-                };
+                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
@@ -3189,10 +3166,6 @@ impl Session {
                     bind(5, r);
                 } else {
                     bind(5, s.out);
-                }
-                if let Some((g, eps)) = norm_g {
-                    bind(6, g);
-                    set_bytes(enc, 7, &eps);
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
@@ -4033,7 +4006,6 @@ pub enum Step {
         weight_name: String,
         bias: Option<ValueId>,
         res: Option<ValueId>,
-        norm_g: Option<(ValueId, f32)>,
         epi: Epi,
         m: usize,
         rows: usize,
@@ -4297,12 +4269,6 @@ fn batch_horizontal(
         return steps;
     }
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
-    let mut read_counts: HashMap<ValueId, usize> = HashMap::new();
-    for s in &steps {
-        for &r in &s.reads {
-            *read_counts.entry(root(r)).or_insert(0) += 1;
-        }
-    }
     let joins = |run: &[Planned], next: &Planned| {
         let same_kind = match (&run[0].op, &next.op) {
             (
@@ -4464,53 +4430,6 @@ fn batch_horizontal(
                         }
                         mlp.name = format!("{}+{}", first.name, mlp.name);
                         first = mlp;
-                    }
-                } else if res0.is_none()
-                    && scale0.is_none()
-                    && first.extra_outs.is_empty()
-                    && d0 <= 4096
-                    && !aliases.contains_key(&first.out)
-                    && read_counts.get(&first.out).copied() == Some(1)
-                {
-                    let can_absorb = it.peek().is_some_and(|next| {
-                        next.extra_outs.is_empty()
-                            && matches!(
-                                next.op,
-                                Step::GemvPacked {
-                                    x: x_gemv,
-                                    bias,
-                                    res: r_gemv,
-                                    norm_g: None,
-                                    m: 1,
-                                    cols,
-                                    format: WeightFormat::Q4_0 | WeightFormat::Q4_K,
-                                    ..
-                                } if cols == d0
-                                    && root(x_gemv) == first.out
-                                    && aliases.get(&x_gemv).map_or(true, |a| a.1 == 0)
-                                    && bias.map_or(true, |b| root(b) != first.out)
-                                    && r_gemv.map_or(true, |r| root(r) != first.out)
-                            )
-                    });
-                    if can_absorb {
-                        let mut gemv = it.next().expect("peeked");
-                        if let Step::GemvPacked {
-                            ref mut x,
-                            ref mut norm_g,
-                            ..
-                        } = gemv.op
-                        {
-                            *x = x0;
-                            *norm_g = Some((g0, eps0));
-                        }
-                        gemv.reads.retain(|&r| root(r) != first.out);
-                        for &r in &first.reads {
-                            if !gemv.reads.contains(&r) {
-                                gemv.reads.push(r);
-                            }
-                        }
-                        gemv.name = format!("{}+{}", first.name, gemv.name);
-                        first = gemv;
                     }
                 }
             }
@@ -4917,7 +4836,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                                 weight_name: g.value(w).name.clone(),
                                 bias,
                                 res,
-                                norm_g: None,
                                 epi,
                                 m,
                                 rows: n,
@@ -5407,13 +5325,8 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 .flatten()
                 .collect(),
             Step::GemvPacked {
-                x,
-                w,
-                bias,
-                res,
-                norm_g,
-                ..
-            } => [Some(x), Some(w), bias, res, norm_g.map(|(g, _)| g)]
+                x, w, bias, res, ..
+            } => [Some(x), Some(w), bias, res]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -7218,96 +7131,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn gemv_prologue_rmsnorm_matches_cpu() {
-        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
-        for (f, cols) in [
-            (QuantFormat::GGUF_Q4_0, 2048usize),
-            (QuantFormat::GGUF_Q4_0, 1536),
-            (QuantFormat::GGUF_Q4_K_M, 1536),
-        ] {
-            let rows = 37usize;
-            let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (f as u64) ^ (cols as u64);
-            let mut next = move || {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (seed >> 33) as u32
-            };
-            let (be, bb, _) = gguf_block_codec(f).expect("CPU dequantizer");
-            let scale_at: &[usize] = match f {
-                QuantFormat::GGUF_Q4_K_M => &[0, 2],
-                _ => &[0],
-            };
-            let mut raw: Vec<u8> = (0..rows * (cols / be) * bb)
-                .map(|_| (next() >> 4) as u8)
-                .collect();
-            for blk in raw.chunks_exact_mut(bb) {
-                for &o in scale_at {
-                    let exp = 9 + (next() % 14) as u16;
-                    let d = ((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16;
-                    blk[o..o + 2].copy_from_slice(&d.to_le_bytes());
-                }
-            }
-            let mut w = Weights::new();
-            let mut g = Graph::new();
-            let x = g.input("x", vec![1, cols], DType::F32);
-            let gw = g.weight("norm.weight", vec![cols], DType::F32);
-            let gamma: Vec<f32> = (0..cols)
-                .map(|i| 0.5 + ((i * 7) % 23) as f32 * 0.05)
-                .collect();
-            w.insert("norm.weight", Tensor::F32(gamma));
-            let normed = g.add(
-                "norm",
-                Op::RmsNorm { eps: 1e-5 },
-                &[x, gw],
-                vec![1, cols],
-                DType::F32,
-            );
-            w.insert(
-                "proj.weight",
-                Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                    format: f,
-                    raw_data: raw.into(),
-                    in_features: cols,
-                    out_features: rows,
-                })),
-            );
-            let pw = g.weight("proj.weight", vec![rows, cols], DType::Quant(f));
-            let out = g.add("proj", Op::Linear, &[normed, pw], vec![1, rows], DType::F32);
-            g.output(out);
-
-            let s = Session::new(rt(), &w).unwrap();
-            let prep = s.prepare_plan(&g).unwrap();
-            assert_eq!(prep.steps.len(), 1, "{f:?} cols={cols}: fused into 1 step");
-            assert!(matches!(
-                prep.steps[0].op,
-                Step::GemvPacked {
-                    norm_g: Some(_),
-                    ..
-                }
-            ));
-            let xs: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.13).sin()).collect();
-            let mut cpu_st = StateStore::new();
-            let want = cpu::run(&g, &w, &mut cpu_st, vec![Tensor::F32(xs.clone())])
-                .unwrap()
-                .remove(0)
-                .into_f32()
-                .unwrap();
-            let got = s
-                .run_prepared(&g, &prep, None, vec![Tensor::F32(xs)])
-                .unwrap()
-                .remove(0)
-                .into_f32()
-                .unwrap();
-            let err = rel_err(&want, &got);
-            assert!(
-                err < 1e-3,
-                "{f:?} cols={cols}: prologue RmsNorm GEMV differs from CPU by {err}"
-            );
         }
     }
 
