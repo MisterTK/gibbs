@@ -60,33 +60,25 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 5 Avant-Garde Priority Queue (Measured `shape_rates` & MoE Indexed GEMV Specialization)
+## 3. Wave 6 Avant-Garde Priority Queue (Promoting `rsi-31`, Two-Pass Multi-TG `MoeWeightedSumNorm`, & Attention `k_proj`/`v_proj` Hoisting)
 
-### 0. Empirical `shape_rates` Findings (`shape-rates-m7` & `shape-rates-q40`)
-- **`GGUF_Q4_K_M` at `(262144, 2816)` (`Model 7` `lm_head`)**: Achieves **`231 GB/s` (`1.77 ms`)** on both `hand` and `gen/r4` (`tune-Apple-M5-Pro-25G241.json` picks `Hand` at `234.5 GB/s`, matching line 14 of `m7-cand.prof` at `1,785.6 µs` / `233.1 GB/s`). The `3.86 ms` in `m7-cand.prof` decode rows was an artifact of `GIBBS_PROFILE_KERNELS=1`'s per-step synchronous `commit_and_wait` downclocking the GPU DVFS governor.
-- **`GGUF_Q4_0` (`shape-rates-q40`, `Model 7` `expert_down` `[128, 2816, 704]`)**:
-  - `(2816, 768)`: `hand` `156 GB/s` vs `gen/r1` `140 GB/s`, `gen/r2` `139 GB/s`, `gen/r4` `116 GB/s`.
-  - `(6144, 1536)`: `hand` `226 GB/s` vs `gen/r1` `192 GB/s`, `gen/r2` `190 GB/s`, `gen/r4` `178 GB/s`.
-  - `(262144, 2816)`: `hand` `286 GB/s` vs `gen/r2` `233 GB/s`.
-  - Root cause: `GGUF_Q4_0` has no `Wide` entry (`WIDE_Q4_0`) in `src/graph/codec.rs`, so `gemv_packed` (`gen/r*`) and `gemv_indexed` (`ExpertLinear` on `expert_down`) fall back to per-sub-block `decode8` (`4x` scale reads and per-element scale multiply).
-- **`GGUF_IQ2_XXS` (`shape-rates-m7`, `Model 7` `expert_gate_up` `[128, 1408, 2816]`)**:
-  - `(1536, 2816)`: `gen/r1` `96 GB/s`, `gen/r2` `106 GB/s`, `gen/r4` `98 GB/s`.
-  - `(2816, 768)`: `gen/r1` `66 GB/s`, `gen/r2` `71 GB/s`, `gen/r4` `66 GB/s`.
-  - `(262144, 2816)`: `gen/r1` `128 GB/s`, `gen/r2` `152 GB/s`, `gen/r4` `153 GB/s`.
+### 1. Promote `rsi-31` (`experiment/rsi-31-w1-m1-rsi23` `799202e`: `WIDE_Q4_0` + `Track M1` + `rsi-23`) on a Quiet Host
+- **Verified Stack (`799202e`)**:
+  - **Track W1 (`WIDE_Q4_0`, `1a93e18`)**: `+25%` `Q4_0` generated GEMV bandwidth (`6144x1536` `gen/r1` `192 -> 243 GB/s`, `2048x1536` `gen/r1` `161 -> 202 GB/s`), lifting `E2B QAT` `+0.89%` (`148.8 -> 150.7 tok/s`, `4/4` pairs) and `Llama 3.2 1B Q4_0` `+1.40%` (`252.4 -> 256.5 tok/s`) in `bg_192`.
+  - **Track M1 (`TopKSoftmax` + `SplitGlu` + `MoeWeightedSum`, `9b7940f`)**: Cuts `210` dispatches/token on `Model 7` (`923 -> 713`), verified for 32-token real-weight greedy parity on `26B-A4B` and delivering `+1.77%` (`-258 us/tok`) in solo screen `bg_194` and `+3.86%` in ABBA `bg_195`.
+  - **`rsi-23` (`2b7b6c8`)**: Zero-tax Qwen3.5 fusions (`-102` dispatches on `Qwen3.5 2B`, `-136` on `9B`), vectorized `gemv_iq4_xs`, pure-vec4 GQA split-K `NJ=4,8,16`, `gemv_q4_0_quarter`, and 2-CB `(16, usize::MAX)` pipeline for `96..220` steps.
+  - In contended ABBA `bg_195`, `799202e` achieved **`delta_pp = +0.94 pp > max(0.30, noise_pp = 0.37 pp)`** and **`ratios_ok = true` (`min_ratio = 0.9926`)**. Re-verify on an uncontended host (`base_spread <= 0.04`) and promote into `target/loop-base/`.
 
-### 1. Track W1 (`exp-w1-wide-q40`) — `WIDE_Q4_0` in `src/graph/codec.rs`
-- **Files**: `src/graph/codec.rs`
-- **Design**: Add `WIDE_Q4_0` (`uniform: true, groups: 2, segs: 2`, mirroring `WIDE_IQ4_NL` with `float(int(q[i] & 0x0Fu) - 8)` and `float(int(q[i] >> 4) - 8)`) and wire `QuantFormat::GGUF_Q4_0 => Some(&WIDE_Q4_0)` in `wide()`.
-- **Gate**: `tests/codec_parity.rs`, `gemv_matches_cpu_for_every_packed_format`, and `SHAPE_RATES_FMT=Q4_0` on `(2816, 768)` and `(6144, 1536)` via `central_scheduler.py`.
+### 2. Track M3-v2 (`exp-m3v2-multitg-wsum-norm`: Multi-TG `MoeWeightedSum` + Last-TG Atomic Counter `RmsNorm + Residual + Scale`)
+- **Root Cause of Track M3 v1 (`beafc9b`) Regression (`bg_193` vs `bg_194`)**:
+  - Track M3 v1 launched a **single threadgroup (`1` of `16` GPU cores)** to read all `90 KB` (`8 * 2816 * 4` B) of `down [slots, h]`, serializing `2.7 MB/token` of reads onto 1 core (`+275 us/tok`).
+- **Design**:
+  - Launch `ceil(h / 256)` threadgroups (`11` TGs across `11` GPU cores for `h = 2816`): each TG `tg_x` computes `256` columns of `routed[c] = sum_s down[s, c] * weights[s]`, writes `routed[c]` to a scratch slice, accumulates its 256-column partial sum-of-squares `sum_sq_tg` into `scratch_partials[tg_x]`, executes `threadgroup_barrier(mem_flags::mem_device)`, and increments an atomic counter `atomic_fetch_add_explicit(&scratch_counter[0], 1u, memory_order_relaxed)`.
+  - The **last finishing threadgroup** (`old == num_tgs - 1`) resets `scratch_counter[0] = 0`, sums `scratch_partials[0..num_tgs]`, computes `inv_rms = rsqrt(total_sq / float(h) + eps)`, and normalizes all `h` columns (`out[c] = (routed[c] * inv_rms * g[c] + res[c]) * scale`) in L1 cache (`11 KB`)!
+  - Keeps all `11` GPU cores reading `90 KB` in parallel while still eliminating `-30` dispatches/token on `Model 7`.
 
-### 2. Track W2 (`exp-w2-moe-gate-up-glu`, branched from `experiment/rsi-26-m1-m3-moe-fusions` `beafc9b`) — Fused `gemv_indexed` Gate+Up+GLU Kernel (`Step::ExpertGateUpGlu`)
-- **Files**: `src/graph/codegen.rs`, `src/graph/metal/ext/moe.rs`, `src/graph/metal.rs`
-- **Design**: Add `gemv_indexed_glu` in `src/graph/codegen.rs` and `moe::Step::ExpertGateUpGlu` in `src/graph/metal/ext/moe.rs`. When `fuse_moe_subgraphs` sees `Step::Ext(ExtStep::Experts(moe::Step::ExpertLinear { rows, .. }))` (with `rows == 2 * ff`) immediately followed by single-reader `Step::SplitGlu { ff, is_geglu, tanh, .. }`, fuse them into `moe::Step::ExpertGateUpGlu`: each simdgroup reads `xb` once, computes the `gate` row (`row0 + i` in `0..ff`) and `up` row (`row0 + ff + i` in `ff..2*ff`) in the same loop, and lane 0 writes `act(simd_sum(acc_gate)) * simd_sum(acc_up)` directly to `out [slots, ff]`, dropping `Step::SplitGlu` (`-30` dispatches/token on `Model 7`, `923 -> 653` dispatches with M1+M3+W2).
-- **Gate**: `moe_subgraph_fusions_match_cpu`, `graph::metal::ext::moe::tests`, and `model7_real_weights_moe_fusions_greedy_parity` via `central_scheduler.py`.
-
-### 3. Track W3 (`exp-w3-moe-rows-per-sg`) — Per-Codec `rows_per_sg` & Occupancy Probe (`max_total_threads_per_threadgroup`) for `ExpertLinear`
-- **Files**: `src/graph/metal/ext/moe.rs`, `src/graph/codegen.rs`
-- **Design**: Select `rows_per_sg` per `(codec.format, rows, cols)` in `src/graph/metal/ext/moe.rs` (`r = 1` for `Q4_0`/`Q8_0`/`Q4_K`/`Q5_K`/`Q6_K` at small/medium `rows` where `shape_rates` shows `gen/r1 > gen/r2`, `r = 2` for `IQ2_XXS`/`IQ2_M`/`IQ3_S`), and add a unit test in `src/graph/metal/ext/moe.rs` that inspects `pso.max_total_threads_per_threadgroup()` and `pso.thread_execution_width()` across `GGUF_IQ2_XXS`, `GGUF_Q4_0`, `GGUF_Q4_K_M`, and `GGUF_Q6_K` to verify whether `WIDE_IQ2_XXS` (`v[33]` + `xs[8]`) drops `max_total_threads_per_threadgroup()` below `1024`.
-
-### 4. Later Track — Attention `k_proj`/`v_proj` Sibling Hoisting & `Gen(1)` Pairing
-- Hoist `v_proj` above `q_norm`/`k_norm` when `q`/`k`/`v` share `norm_x` and support `GemvKernel::Gen { rows_per_sg: 1 }` in `Step::GemvPackedPair`.
+### 3. Track A6 (`exp-a6-kv-hoist-gen1-pair`: Attention `k_proj`/`v_proj` & DeltaNet `proj_b`/`proj_a` `Gen(1)` Pairing)
+- **Root Cause of Track A5-v2 (`696810f`) No-Op (`bg_187`)**:
+  - `tune-Apple-M5-Pro-25G241.json` selects `GemvKernel::Gen { rows_per_sg: 1 }` (not `HAND`) on `k_proj`/`v_proj` (`256x1536` `Q4_0` on `Model 0`, `512x2048` `Q4_K_M` on `Model 2`), and `proj_b`/`proj_a` (`16x2048` on `Model 2`) are `BF16`.
+- **Design**:
+  - Extend `Step::GemvPackedPair` to support `GemvKernel::Gen { rows_per_sg: 1 }` and `WeightFormat::BF16` for adjacent sibling projections sharing `x` with `rows <= 512`, cutting `-18` dispatches on `Qwen3.5 2B` DeltaNet `proj_b + proj_a` (`16x2048` `BF16`) and `-6` dispatches on `Qwen3.5 2B` Full Attention `k_proj + v_proj` (`512x2048`).

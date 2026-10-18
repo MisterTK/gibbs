@@ -597,3 +597,40 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
     - Contended screen `bg_187` (ran while foreign desktop GPU load depressed `Model 7` base to `53.1 tok/s` and `Model 0` base to `111.6 tok/s`): `Model 7` `gpu_ms` dropped `18.072 -> 17.383 ms` (`-689 us/tok`, `dispatches 923 -> 683`). Preserved on `experiment/rsi-26-m1-m3-moe-fusions`.
 - **Track A5-v2 (`ExpertA5v2ZeroTaxPair`, `696810f`, saved on `experiment/rsi-27-a5v2-zero-tax-pair`): DISCARD (No-Op)**:
   - Unit test `gemv_packed_pair_small_rows_matches_cpu` passed (`bg_186`), but without hoisting sibling `GemvPacked` steps past intervening `k_norm`/`k_rope` steps (and because Qwen3.5 `in_proj_b`/`in_proj_a` select `Gen(r)` variants rather than `HAND`), `pair_small_hand_gemvs` matched 0 steps on `Models 0, 2, 4, 5` (`dispatches` unchanged in `bg_187`).
+
+## Wave 5 — Empirical `shape_rates` (`Q4_K`, `IQ2_XXS`, `Q4_0`), Track W1 (`WIDE_Q4_0` `+25%`), Track W2 (`ExpertGateUpGlu` + Fast-Math `tanh` Fix), Track W3 (Occupancy `1024`), & `rsi-31` Full-Stack ABBA (`+0.94 pp`)
+- **Deterministic `HostProfile` Carry-Over (`669e23f` / `1e3d2c4`) & Control Screen (`bg_189`)**:
+  - Updated `Runtime::new` (`src/graph/metal.rs:717-761`) to select the matching `HostProfile` deterministically by `(mtime, filename)` rather than `read_dir` order, added `GIBBS_FUSION=none` (`FusionPolicy::None`), and added `Model 7` shapes `(1536, 2816)`, `(2816, 768)`, `(262144, 2816)` plus `QuantFormat::GGUF_IQ2_XXS` to `shape_rates`.
+  - Control screen `bg_189` passed with `1.0002` (`Model 0`), `0.9991` (`Model 2`), `1.0023` (`Model 5`), and updated `target/loop-base/gibbs` to `1e3d2c4`.
+- **Empirical `shape_rates` Resolution of the `lm_head` `[262144, 2816]` Question (`shape-rates-m7`, `shape-rates-q40`)**:
+  - `GGUF_Q4_K_M (262144, 2816)` (`Model 7` `lm_head`) achieves **`231 GB/s` (`1.77 ms`)** on both `hand` and `gen/r4` (`tune-Apple-M5-Pro-25G241.json` selects `Hand` at `234.5 GB/s`, matching line 14 of `m7-cand.prof` right after prefill: `1,785.6 us`, `233.1 GB/s`). The `3.86 ms` in `m7-cand.prof`'s decode rows was caused by `GIBBS_PROFILE_KERNELS=1` submitting `2 * 683 = 1,366` synchronous `commit_and_wait` command buffers per token, which downclocks the Apple GPU DVFS governor during `m = 1` steps.
+  - `GGUF_Q4_0` (`shape-rates-q40`) showed `gen/r1` lagging `hand` (`140` vs `156 GB/s` at `(2816, 768)`, `192` vs `226 GB/s` at `(6144, 1536)`) because `GGUF_Q4_0` had no `Wide` entry in `src/graph/codec.rs`.
+- **Track W1 (`ExpertW1WideQ40`, `1a93e18`, saved on `experiment/rsi-28-w1-wide-q40`): KEEP (Staged)**:
+  - Added `WIDE_Q4_0` (`uniform: true, groups: 2, segs: 2`, using `float(*(device const half*)blk)`) in `src/graph/codec.rs`.
+  - Passed `tests/codec_parity.rs` and `gemv_matches_cpu_for_every_packed_format`.
+  - `SHAPE_RATES_FMT=Q4_0` (`verify-w1-wide-q40`) jumped **`+25%` across generated `Q4_0` GEMVs**, beating `hand` on medium shapes:
+    - `(6144, 1536)`: `gen/r1` **`192 -> 243 GB/s`** (beats `hand` `223 GB/s` by `+20 GB/s`), `gen/r2` `190 -> 219 GB/s`.
+    - `(2048, 1536)`: `gen/r1` **`161 -> 202 GB/s`** (beats `hand` `181 GB/s` by `+21 GB/s`).
+    - `(1536, 2048)`: `gen/r1` **`160 -> 205 GB/s`** (beats `hand` `182 GB/s` by `+23 GB/s`).
+    - `(1536, 2816)`: `gen/r1` **`171 -> 193 GB/s`** (beats `hand` `180 GB/s`).
+    - `(2816, 768)`: `gen/r1` **`140 -> 149 GB/s`**, `gen/r2` **`139 -> 146 GB/s`**.
+    - `(262144, 2816)`: `gen/r2` **`233 -> 283 GB/s`** (matches `hand` `284 GB/s`).
+  - 4-round screen (`bg_192`): **`Model 0` (`E2B QAT`) `median_ratio = 1.0089` (`4/4` pairs, `148.8 -> 150.7 tok/s`, `-75 us/tok`)**, **`Model 4` (`Llama 3.2 1B Q4_0`) `median_ratio = 1.0140` (`3/4` pairs, `252.4 -> 256.5 tok/s`, `-56 us/tok`)**.
+- **Track W3 (`ExpertW3MoeRowsPerSg`, `61dace4`, saved on `experiment/rsi-29-w1-w3-moe-rows-per-sg`): DISCARD (`r = 1` override)**:
+  - `moe_gemv_pipeline_max_threads_and_occupancy` (`verify-w3-occupancy`) proved `pso.max_total_threads_per_threadgroup() == 1024` (`thread_execution_width = 32`, 100% hardware occupancy) across `GGUF_IQ2_XXS` (`r = 1, 2`), `GGUF_Q4_0` (`r = 1, 2`), `GGUF_Q4_K_M` (`r = 1`), and `GGUF_Q6_K` (`r = 1`).
+  - `moe_gemv_bandwidth` (`moe-gemv-bw` vs `moe-gemv-bw-r2`) showed `Model 7`'s `expert_down` (`GGUF_IQ4_NL 2816x704`, `top_k=8, x_rows=8`) runs at **`158.3 GB/s` (`56.3 us`) with `r = 2`** vs `151.4 GB/s` (`58.9 us`) with `r = 1` (`-4.4%`, because when `x_rows = 8`, `r = 2` amortizes each slot's `x` load over 2 expert rows).
+- **Track W2 (`ExpertW2MoeGateUpGlu`, `3a7ba6a`, saved on `experiment/rsi-30-w1-m1-m3-w2`) & Isolation of `M1` vs `M3` vs `W2` (`bg_191`..`bg_194`)**:
+  - Found and fixed a critical bug in `moe_gemv_pso` and `moe_gemv_glu_pso` (`src/graph/metal/ext/moe.rs`): `CompileOptions::new()` defaulted to `fast_math_enabled = true`, causing `gelu_tanh`'s `tanh(x)` (`sinh/cosh`) to return `NaN` for large gate activations on `GGUF_IQ2_XXS` (`h = 256`). Setting `opts.set_fast_math_enabled(false)` (landed on `main` as well) fixed `moe_subgraph_fusions_match_cpu` on `IQ2_XXS + Q4_0` (`m = 1, 24`) and passed **32-token real-weight greedy parity on `Gemma 4 26B-A4B · UD-IQ2_XXS` (`bg_191`: 31/31 greedy tokens identical, `dispatches 923 -> 653`, `-270` dispatches/tok!)**.
+  - Controlled 4-round A/B isolation on `Model 7` (`bg_192`, `bg_193`, `bg_194`):
+    - `W1 + M1 + M3 + W2` (`bg_192`, `653` dispatches): `median_ratio = 1.0022` (`gpu_ms 13.907 -> 13.856 ms`, `-51 us/tok`), because `W2` (`ExpertGateUpGlu`) reads `gate` (row `out_col0`) and `up` (row `out_col0 + 704`, `+511 KB` away!) in the same simdgroup loop, doubling active TLB/L1 pages compared to adjacent-row `ExpertLinear` + `2 us` SLC `SplitGlu`.
+    - `W1 + M1 + M3` (`bg_193`, `683` dispatches): `median_ratio = 0.9989` (`gpu_ms 13.897 -> 13.914 ms`), because `M3` (`moe_weighted_sum_rmsnorm_f32`) launches **1 threadgroup (`1` GPU core out of `16`)** to read all `90 KB` of `down [8, 2816]` so it can reduce the `RmsNorm` sum-of-squares in shared memory, costing `+275 us/tok`!
+    - **`W1 + M1` alone (`bg_194`, `713` dispatches, `9b7940f` on `experiment/rsi-31-w1-m1`)**: **`median_ratio = 1.0177` (`+1.77%`, `3/4` pairs `[1.018, 1.023, 0.880, 1.017]`, `69.9 -> 71.3 tok/s`, `gpu_ms 13.910 -> 13.652 ms`, `-258 us/tok`)**!
+- **Stacked `rsi-31` (`Track W1 WIDE_Q4_0` + `Track M1` + `rsi-23`, `799202e` on `experiment/rsi-31-w1-m1-rsi23`) ABBA Verification (`bg_195`)**:
+  - Achieved **`delta_pp = +0.94 pp > max(0.30, noise_pp = 0.37 pp)`** and **`ratios_ok = true` (`min_ratio = 0.9926`)**, with 7 of 9 models accelerating:
+    - `Model 2` (`Qwen3.5 2B`): **`+8.63%`** (`dispatches 430 -> 328`)
+    - `Model 4` (`Llama 3.2 1B Q4_0`): **`+4.20%`** (`dispatches 147`, powered by `WIDE_Q4_0` + `gemv_q4_0_quarter`)
+    - `Model 7` (`Gemma 4 26B-A4B MoE`): **`+3.86%`** (`dispatches 923 -> 713`, `base_spread = 0.0164`, powered by `Track M1`)
+    - `Model 6` (`Llama 3.2 1B bnb-4bit`): **`+2.07%`** (`base_spread = 0.0179`)
+    - `Model 3` (`Qwen3.5 9B IQ2_M`): **`+1.28%`** (`dispatches 594 -> 458`)
+    - `Model 8` (`E2B QAT ctx4k`): **`+1.04%`** (`base_spread = 0.0030`)
+  - Classified as **`inconclusive (contended)`** (`--`) because foreign GPU load (`90%`/`24%` in `quiet-wait`) caused `Model 0` `base_spread = 0.195 > 0.04` (`e2b_tok_s = 128.64 tok/s`); preserved on `experiment/rsi-31-w1-m1-rsi23` ready for immediate promotion when the host is quiet.
