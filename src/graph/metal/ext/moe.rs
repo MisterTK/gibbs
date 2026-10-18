@@ -397,9 +397,19 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
     Ok(pso)
 }
 
-/// Default rows per simdgroup of the expert GEMV.
-static ROWS_PER_SG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
+/// Override for rows per simdgroup of the expert GEMV (`0` = `moe_rows_per_sg(c)`).
+static ROWS_PER_SG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+fn moe_rows_per_sg(c: &Codec) -> usize {
+    let ov = ROWS_PER_SG.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        ov
+    } else if c.block_elems <= 32 {
+        4
+    } else {
+        2
+    }
+}
 /// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
 static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -458,13 +468,19 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                         scale.is_some() as u32,
                     ],
                 );
-                enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new(*rows as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             } else {
                 enc.set_compute_pipeline_state(rt.pso("moe_topk_f32")?);
                 e.bind(0, *x);
                 e.bind(1, s.out);
                 set_bytes(enc, 2, &[u32_of(*rows)?, u32_of(*cols)?, u32_of(*k)?]);
-                enc.dispatch_thread_groups(MTLSize::new(*rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new(*rows as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             }
         }
         Step::GatherCols {
@@ -500,7 +516,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
         } => {
             let c = bank_codec(*dtype)
                 .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
-            let r = ROWS_PER_SG.load(std::sync::atomic::Ordering::Relaxed);
+            let r = moe_rows_per_sg(c);
             let pso = moe_gemv_pso(sess, c, r)?;
             enc.set_compute_pipeline_state(&pso);
             e.bind(0, *bank);
@@ -1015,7 +1031,8 @@ mod tests {
             for (i, fmt) in fmts.iter().enumerate() {
                 let cols = match fmt {
                     Fmt::Q(f) => {
-                        let be = crate::graph::codec::codec(*f).expect("codec").block_elems as usize;
+                        let be =
+                            crate::graph::codec::codec(*f).expect("codec").block_elems as usize;
                         (512 / be).max(1) * be
                     }
                     _ => 64,
@@ -1037,7 +1054,7 @@ mod tests {
                 }
             }
         }
-        super::ROWS_PER_SG.store(2, std::sync::atomic::Ordering::Relaxed);
+        super::ROWS_PER_SG.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -1429,7 +1446,11 @@ mod tests {
                 pso.max_total_threads_per_threadgroup(),
                 pso.thread_execution_width()
             );
-            assert_eq!(pso.max_total_threads_per_threadgroup(), 1024, "{fmt:?} r={r}");
+            assert_eq!(
+                pso.max_total_threads_per_threadgroup(),
+                1024,
+                "{fmt:?} r={r}"
+            );
         }
     }
 
@@ -1485,7 +1506,7 @@ mod tests {
                     routed_bytes as f64 / dt_s / 1e9
                 );
             }
-            super::ROWS_PER_SG.store(2, std::sync::atomic::Ordering::Relaxed);
+            super::ROWS_PER_SG.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
