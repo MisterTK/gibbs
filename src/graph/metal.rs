@@ -9459,4 +9459,101 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let got = sess.run(&g, inp).unwrap();
         assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
     }
+
+    #[test]
+    fn attn_cached_gqa_split_vec4_matches_cpu() {
+        let f = DType::F32;
+        let (heads, kv_heads, max_seq) = (8usize, 2usize, 320usize);
+        for hd in [128usize, 256, 512] {
+            let prefill_len = if hd >= 256 { 128usize } else { 256usize };
+            let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+            let scale = 1.0 / (hd as f32).sqrt();
+            for with_rope in [false, true] {
+                let make_graph = |m: usize| {
+                    let mut g = Graph::new();
+                    let q_in = g.input("q", vec![m, q_dim], f);
+                    let k_in = g.input("k", vec![m, kv_dim], f);
+                    let v_in = g.input("v", vec![m, kv_dim], f);
+                    let pos = g.input("pos", vec![m], DType::U32);
+                    let (q_att, k_att) = if with_rope {
+                        let inv = g.weight("inv", vec![hd / 2], f);
+                        let rope = Op::Rope {
+                            head_dim: hd,
+                            rotary_dim: hd,
+                            variant: crate::graph::RopeVariant::HalfSplit,
+                            mscale: 1.0,
+                        };
+                        let qr = g.add("qr", rope.clone(), &[q_in, pos, inv], vec![m, q_dim], f);
+                        let kr = g.add("kr", rope, &[k_in, pos, inv], vec![m, kv_dim], f);
+                        (qr, kr)
+                    } else {
+                        (q_in, k_in)
+                    };
+                    let ks = g.state("ks", vec![max_seq, kv_dim], f);
+                    let vs = g.state("vs", vec![max_seq, kv_dim], f);
+                    let out = g.add(
+                        "att",
+                        Op::CachedAttention {
+                            heads,
+                            kv_heads,
+                            head_dim: hd,
+                            v_head_dim: hd,
+                            scale,
+                            causal: true,
+                            window: None,
+                            soft_cap: Some(30.0),
+                            write: true,
+                        },
+                        &[q_att, k_att, v_in, ks, vs, pos],
+                        vec![m, q_dim],
+                        f,
+                    );
+                    g.output(out);
+                    g
+                };
+                let mut w = Weights::new();
+                if with_rope {
+                    w.insert("inv", Tensor::F32(rand(hd / 2, 77 + hd as u64)));
+                }
+                let prefill_g = make_graph(prefill_len);
+                let decode_g = make_graph(1);
+                let sess = Session::new(rt(), &w).unwrap();
+                if with_rope {
+                    let prep = sess.prepare_plan(&decode_g).unwrap();
+                    assert!(matches!(
+                        prep.steps[0].op,
+                        Step::CachedAttention { rope: Some(_), .. }
+                    ));
+                }
+                let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+                let prefill_inp = vec![
+                    Tensor::F32(rand(prefill_len * q_dim, 100 + hd as u64)),
+                    Tensor::F32(rand(prefill_len * kv_dim, 200 + hd as u64)),
+                    Tensor::F32(rand(prefill_len * kv_dim, 300 + hd as u64)),
+                    Tensor::U32((0..prefill_len as u32).collect()),
+                ];
+                cpu::run(&prefill_g, &w, &mut cs, prefill_inp.clone()).unwrap();
+                sess.run_with_state(&prefill_g, Some(&mut ms), prefill_inp)
+                    .unwrap();
+                for step in 0..2u32 {
+                    let p_idx = prefill_len as u32 + step;
+                    let dec_inp = vec![
+                        Tensor::F32(rand(q_dim, 400 + step as u64)),
+                        Tensor::F32(rand(kv_dim, 500 + step as u64)),
+                        Tensor::F32(rand(kv_dim, 600 + step as u64)),
+                        Tensor::U32(vec![p_idx]),
+                    ];
+                    let want = cpu::run(&decode_g, &w, &mut cs, dec_inp.clone()).unwrap();
+                    let got = sess
+                        .run_with_state(&decode_g, Some(&mut ms), dec_inp)
+                        .unwrap();
+                    let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                    assert!(
+                        err < 1e-4,
+                        "vec4 split-K mismatch for hd={hd} with_rope={with_rope} step={step}: {err}"
+                    );
+                }
+            }
+        }
+    }
 }
