@@ -252,6 +252,16 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::Softmax { .. }
         | Op::Attention { .. }
         | Op::Add
+        | Op::Mul
+        | Op::Binary {
+            kind: super::BinaryKind::Mul,
+        }
+        | Op::Slice { .. }
+        | Op::Reshape { .. }
+        | Op::Reduce {
+            kind: super::ReduceKind::Sum,
+            ..
+        }
         | Op::MeanPool
         | Op::L2Normalize => dtype == DType::F32,
         Op::Gelu { tanh } => !*tanh && dtype == DType::F32,
@@ -309,6 +319,8 @@ pub enum CudaStep {
         rows: usize,
         cols: usize,
         k: usize,
+        weights_out: Option<ValueId>,
+        scale: Option<ValueId>,
     },
     GatherCols {
         x: ValueId,
@@ -332,6 +344,21 @@ pub enum CudaStep {
         experts: usize,
         x_per_slot: bool,
         params: crate::graph::codegen::GemvParams,
+    },
+    SplitGlu {
+        x: ValueId,
+        out: ValueId,
+        rows: usize,
+        half_cols: usize,
+        kind: u32,
+    },
+    MoeWeightedSum {
+        down: ValueId,
+        weights: ValueId,
+        out: ValueId,
+        n: usize,
+        k: usize,
+        h: usize,
     },
     Other {
         op: Op,
@@ -525,6 +552,8 @@ pub fn plan_graph(g: &Graph) -> Result<Vec<CudaStep>, String> {
                     rows: n / cols,
                     cols,
                     k: *k,
+                    weights_out: None,
+                    scale: None,
                 });
                 continue;
             }
@@ -630,7 +659,420 @@ pub fn plan_graph(g: &Graph) -> Result<Vec<CudaStep>, String> {
         });
     }
 
+    fuse_moe_subgraphs(g, &mut steps);
     Ok(steps)
+}
+
+fn step_reads(step: &CudaStep) -> Vec<ValueId> {
+    match step {
+        CudaStep::QuantGemv {
+            x, w, bias, res, ..
+        } => {
+            let mut v = vec![*x, *w];
+            if let Some(b) = *bias {
+                v.push(b);
+            }
+            if let Some(r) = *res {
+                v.push(r);
+            }
+            v
+        }
+        CudaStep::TopK { x, scale, .. } => {
+            let mut v = vec![*x];
+            if let Some(sc) = *scale {
+                v.push(sc);
+            }
+            v
+        }
+        CudaStep::GatherCols { x, idx, .. } => vec![*x, *idx],
+        CudaStep::QuantMoeGemv { x, bank, ids, .. } => vec![*x, *bank, *ids],
+        CudaStep::SplitGlu { x, .. } => vec![*x],
+        CudaStep::MoeWeightedSum { down, weights, .. } => vec![*down, *weights],
+        CudaStep::Other { inputs, .. } => inputs.clone(),
+    }
+}
+
+/// Fuses MoE router TopK+GatherCols+Softmax(+GatherCols+Mul), fused gate/up Slice+Slice+GeGlu/SwiGlu,
+/// and expert down Mul+Reshape+Reduce(Sum) subgraphs when intermediate values have a single reader.
+fn fuse_moe_subgraphs(g: &Graph, steps: &mut Vec<CudaStep>) {
+    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
+    for st in steps.iter() {
+        for r in step_reads(st) {
+            *use_count.entry(r).or_insert(0) += 1;
+        }
+    }
+    for &o in &g.outputs {
+        *use_count.entry(o).or_insert(0) += 1;
+    }
+    let single_use = |v: ValueId| use_count.get(&v).copied() == Some(1);
+
+    let slice_half = |v: ValueId| -> Option<(ValueId, usize, usize, bool)> {
+        let ValueKind::Node(nid) = g.value(v).kind else {
+            return None;
+        };
+        let node = &g.nodes[nid.0 as usize];
+        let Op::Slice { axis, start, end } = node.op else {
+            return None;
+        };
+        let src = *node.inputs.first()?;
+        let sh = &g.value(src).shape;
+        if sh.len() < 2 {
+            return None;
+        }
+        let rank = sh.len();
+        let ax = if axis < 0 { axis + rank as isize } else { axis };
+        if ax != rank as isize - 1 {
+            return None;
+        }
+        let cols = sh[rank - 1];
+        if cols == 0 || cols % 2 != 0 {
+            return None;
+        }
+        let half = cols / 2;
+        let rows: usize = sh[..rank - 1].iter().product();
+        let dim = cols as i64;
+        let clampi = |x: i64| {
+            if x < 0 {
+                (dim + x).max(0) as usize
+            } else {
+                x.min(dim) as usize
+            }
+        };
+        let (s, e) = (clampi(start), clampi(end));
+        if s == 0 && e == half {
+            Some((src, rows, half, false))
+        } else if s == half && e == cols {
+            Some((src, rows, half, true))
+        } else {
+            None
+        }
+    };
+
+    let mut i = 0;
+    while i < steps.len() {
+        // 1. Fused TopK + GatherCols + Softmax (+ optional GatherCols(scale) + Mul).
+        let topk_match = match steps[i] {
+            CudaStep::TopK {
+                x: logits,
+                out: ids,
+                rows,
+                cols,
+                k,
+                weights_out: None,
+                scale: None,
+            } if k <= 32 => Some((logits, rows, cols, k, ids)),
+            _ => None,
+        };
+        if let Some((logits, rows, cols, k, ids)) = topk_match {
+            let base_ok = if i + 2 < steps.len() {
+                let picked_opt = match steps[i + 1] {
+                    CudaStep::GatherCols {
+                        x: g_x,
+                        idx: g_idx,
+                        out: g_out,
+                        total,
+                        cols: g_cols,
+                        k: g_k,
+                        shared,
+                    } if (!shared || rows == 1)
+                        && g_x == logits
+                        && g_idx == ids
+                        && g_cols == cols
+                        && g_k == k
+                        && total == rows * k
+                        && single_use(g_out) =>
+                    {
+                        Some(g_out)
+                    }
+                    _ => None,
+                };
+                if let Some(picked) = picked_opt {
+                    match steps[i + 2] {
+                        CudaStep::Other {
+                            op: Op::Softmax { axis },
+                            ref inputs,
+                            out: sm_out,
+                        } if inputs.as_slice() == [picked] => {
+                            let sh = g.value(sm_out).shape.as_slice();
+                            let rank = sh.len() as isize;
+                            let ax = if axis < 0 { axis + rank } else { axis };
+                            if sh == [rows, k] && ax == rank - 1 {
+                                Some(sm_out)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(sm_out) = base_ok {
+                let scaled = if i + 4 < steps.len() && single_use(sm_out) {
+                    let sc_table_opt = match steps[i + 3] {
+                        CudaStep::GatherCols {
+                            x: sc_table,
+                            idx: sc_idx,
+                            out: sc_out,
+                            total: sc_tot,
+                            cols: sc_cols,
+                            k: sc_k,
+                            shared: true,
+                        } if sc_idx == ids
+                            && sc_cols == cols
+                            && sc_k == k
+                            && sc_tot == rows * k
+                            && single_use(sc_out) =>
+                        {
+                            Some((sc_table, sc_out))
+                        }
+                        _ => None,
+                    };
+                    if let Some((sc_table, sc_out)) = sc_table_opt {
+                        match steps[i + 4] {
+                            CudaStep::Other {
+                                ref op,
+                                ref inputs,
+                                out: w_out,
+                            } if matches!(
+                                op,
+                                Op::Mul
+                                    | Op::Binary {
+                                        kind: super::BinaryKind::Mul
+                                    }
+                            ) && inputs.len() == 2 =>
+                            {
+                                let (a, b) = (inputs[0], inputs[1]);
+                                let n: usize = g.value(w_out).shape.iter().product();
+                                if ((a == sm_out && b == sc_out) || (b == sm_out && a == sc_out))
+                                    && n == rows * k
+                                {
+                                    Some((sc_table, w_out))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some((sc_table, w_out)) = scaled {
+                    if let CudaStep::TopK {
+                        ref mut weights_out,
+                        ref mut scale,
+                        ..
+                    } = steps[i]
+                    {
+                        *weights_out = Some(w_out);
+                        *scale = Some(sc_table);
+                    }
+                    steps.drain(i + 1..=i + 4);
+                    i += 1;
+                    continue;
+                } else {
+                    if let CudaStep::TopK {
+                        ref mut weights_out,
+                        ..
+                    } = steps[i]
+                    {
+                        *weights_out = Some(sm_out);
+                    }
+                    steps.drain(i + 1..=i + 2);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Fused SplitGlu: two single-reader 2D column slices (0..half, half..2*half) + GeGlu/SwiGlu.
+        if i + 2 < steps.len() {
+            let glu = match steps[i + 2] {
+                CudaStep::Other {
+                    op: Op::GeGlu,
+                    ref inputs,
+                    out: glu_out,
+                } if inputs.len() == 2 => Some((inputs[0], inputs[1], glu_out, 1u32)),
+                CudaStep::Other {
+                    op: Op::SwiGlu,
+                    ref inputs,
+                    out: glu_out,
+                } if inputs.len() == 2 => Some((inputs[0], inputs[1], glu_out, 2u32)),
+                _ => None,
+            };
+            if let Some((gate_v, up_v, glu_out, kind)) = glu {
+                let slices_ok = match (&steps[i], &steps[i + 1]) {
+                    (
+                        CudaStep::Other {
+                            op: Op::Slice { .. },
+                            inputs: in0,
+                            out: out0,
+                        },
+                        CudaStep::Other {
+                            op: Op::Slice { .. },
+                            inputs: in1,
+                            out: out1,
+                        },
+                    ) if in0.len() == 1
+                        && in1.len() == 1
+                        && ((*out0 == gate_v && *out1 == up_v)
+                            || (*out0 == up_v && *out1 == gate_v)) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if slices_ok && single_use(gate_v) && single_use(up_v) {
+                    if let (Some((gu0, r0, hc0, false)), Some((gu1, r1, hc1, true))) =
+                        (slice_half(gate_v), slice_half(up_v))
+                    {
+                        let n: usize = g.value(glu_out).shape.iter().product();
+                        if gu0 == gu1 && r0 == r1 && hc0 == hc1 && n == r0 * hc0 {
+                            steps.drain(i + 1..=i + 2);
+                            steps[i] = CudaStep::SplitGlu {
+                                x: gu0,
+                                out: glu_out,
+                                rows: r0,
+                                half_cols: hc0,
+                                kind,
+                            };
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Fused MoeWeightedSum: single-reader Mul([slots, h], [slots, 1]) + Reshape([n, k, h]) + Reduce(Sum, axes=[1]).
+        if i + 2 < steps.len() {
+            let mul_match = match steps[i] {
+                CudaStep::Other {
+                    ref op,
+                    ref inputs,
+                    out: mul_out,
+                } if matches!(
+                    op,
+                    Op::Mul
+                        | Op::Binary {
+                            kind: super::BinaryKind::Mul
+                        }
+                ) && inputs.len() == 2
+                    && single_use(mul_out) =>
+                {
+                    Some((inputs[0], inputs[1], mul_out))
+                }
+                _ => None,
+            };
+            let res_match = match steps[i + 1] {
+                CudaStep::Other {
+                    op: Op::Reshape { .. },
+                    ref inputs,
+                    out: slots_out,
+                } if inputs.len() == 1 && single_use(slots_out) => Some((inputs[0], slots_out)),
+                _ => None,
+            };
+            let red_match = match steps[i + 2] {
+                CudaStep::Other {
+                    op:
+                        Op::Reduce {
+                            kind: super::ReduceKind::Sum,
+                            ref axes,
+                            ..
+                        },
+                    ref inputs,
+                    out: red_out,
+                } if inputs.len() == 1 && axes.len() == 1 => Some((inputs[0], axes[0], red_out)),
+                _ => None,
+            };
+            if let (
+                Some((a, b, mul_out)),
+                Some((res_in, slots_out)),
+                Some((red_in, axis0, red_out)),
+            ) = (mul_match, res_match, red_match)
+            {
+                if res_in == mul_out && red_in == slots_out {
+                    let rsh = &g.value(slots_out).shape;
+                    let ax = if axis0 < 0 {
+                        axis0 + rsh.len() as isize
+                    } else {
+                        axis0
+                    };
+                    if ax >= 0 && (ax as usize) < rsh.len() {
+                        let ax = ax as usize;
+                        let n: usize = rsh[..ax].iter().product();
+                        let k = rsh[ax];
+                        let h: usize = rsh[ax + 1..].iter().product();
+                        let slots = n * k;
+                        let a_sh = g.value(a).shape.as_slice();
+                        let b_sh = g.value(b).shape.as_slice();
+                        let out_sh = g.value(mul_out).shape.as_slice();
+                        let n_out: usize = g.value(red_out).shape.iter().product();
+                        let operands = if out_sh == [slots, h] {
+                            if a_sh == [slots, h] && (b_sh == [slots, 1] || b_sh == [n, k]) {
+                                Some((a, b))
+                            } else if b_sh == [slots, h] && (a_sh == [slots, 1] || a_sh == [n, k]) {
+                                Some((b, a))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some((down, mut w_val)) = operands {
+                            if n_out == n * h {
+                                let mut reshape_idx = None;
+                                if single_use(w_val) {
+                                    for j in 0..i {
+                                        if let CudaStep::Other {
+                                            op: Op::Reshape { .. },
+                                            ref inputs,
+                                            out,
+                                        } = steps[j]
+                                        {
+                                            if out == w_val && inputs.len() == 1 {
+                                                let src = inputs[0];
+                                                let src_n: usize =
+                                                    g.value(src).shape.iter().product();
+                                                if src_n == slots {
+                                                    w_val = src;
+                                                    reshape_idx = Some(j);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                steps.drain(i + 1..=i + 2);
+                                steps[i] = CudaStep::MoeWeightedSum {
+                                    down,
+                                    weights: w_val,
+                                    out: red_out,
+                                    n,
+                                    k,
+                                    h,
+                                };
+                                if let Some(r_idx) = reshape_idx {
+                                    steps.remove(r_idx);
+                                } else {
+                                    i += 1;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
 }
 
 /// Compiles a CUDA C++ translation unit into PTX via runtime NVRTC (`libnvrtc`).
@@ -706,6 +1148,21 @@ pub fn quant_moe_gemv_kernel_source(
     ))
 }
 
+/// Synthesizes a self-contained CUDA C++ fused `gibbs_topk_softmax_f32` translation unit.
+pub fn topk_softmax_kernel_source() -> String {
+    crate::graph::codegen::topk_softmax_for_dialect(crate::graph::codegen::Dialect::Cuda)
+}
+
+/// Synthesizes a self-contained CUDA C++ fused `gibbs_split_glu_f32` translation unit.
+pub fn split_glu_kernel_source() -> String {
+    crate::graph::codegen::split_glu_for_dialect(crate::graph::codegen::Dialect::Cuda)
+}
+
+/// Synthesizes a self-contained CUDA C++ fused `gibbs_moe_weighted_sum_f32` translation unit.
+pub fn moe_weighted_sum_kernel_source() -> String {
+    crate::graph::codegen::moe_weighted_sum_for_dialect(crate::graph::codegen::Dialect::Cuda)
+}
+
 /// JIT-compiled CUDA quantized GEMV module and kernel function handle.
 pub struct CudaQuantGemv {
     pub module: *mut c_void,
@@ -756,6 +1213,18 @@ impl CudaSession {
                 }
                 CudaStep::QuantMoeGemv { format, params, .. } => {
                     _compiled.push(self.compile_quant_moe_gemv(*format, *params)?);
+                }
+                CudaStep::TopK {
+                    weights_out: Some(_),
+                    ..
+                } => {
+                    _compiled.push(self.compile_topk_softmax()?);
+                }
+                CudaStep::SplitGlu { .. } => {
+                    _compiled.push(self.compile_split_glu()?);
+                }
+                CudaStep::MoeWeightedSum { .. } => {
+                    _compiled.push(self.compile_moe_weighted_sum()?);
                 }
                 _ => {}
             }
@@ -848,6 +1317,54 @@ impl CudaSession {
                 ptx,
             })
         }
+    }
+
+    /// JIT-compiles a CUDA C++ kernel source via NVRTC and loads `kernel_name` into the active context.
+    pub fn compile_c_kernel(&self, src: &str, kernel_name: &str) -> Result<CudaQuantGemv, String> {
+        let ptx = compile_ptx(src, kernel_name)?;
+        let driver = CUDA_DRIVER.as_ref().ok_or_else(|| {
+            "CUDA driver (libcuda.so.1 / nvcuda.dll) is not available on this platform".to_string()
+        })?;
+        unsafe {
+            let mut module: *mut c_void = std::ptr::null_mut();
+            let res = (driver.cu_module_load_data)(&mut module, ptx.as_ptr() as *const c_void);
+            if res != CUDA_SUCCESS {
+                return Err(format!("cuModuleLoadData failed with error code {res}"));
+            }
+            let c_func = std::ffi::CString::new(kernel_name)
+                .map_err(|e| format!("invalid kernel name: {e}"))?;
+            let mut func: *mut c_void = std::ptr::null_mut();
+            let res = (driver.cu_module_get_function)(&mut func, module, c_func.as_ptr());
+            if res != CUDA_SUCCESS {
+                return Err(format!(
+                    "cuModuleGetFunction({kernel_name}) failed with error code {res}"
+                ));
+            }
+            Ok(CudaQuantGemv {
+                module,
+                func,
+                kernel_name: kernel_name.to_string(),
+                ptx,
+            })
+        }
+    }
+
+    /// JIT-compiles the fused `gibbs_topk_softmax_f32` CUDA kernel.
+    pub fn compile_topk_softmax(&self) -> Result<CudaQuantGemv, String> {
+        let src = topk_softmax_kernel_source();
+        self.compile_c_kernel(&src, "gibbs_topk_softmax_f32")
+    }
+
+    /// JIT-compiles the fused `gibbs_split_glu_f32` CUDA kernel.
+    pub fn compile_split_glu(&self) -> Result<CudaQuantGemv, String> {
+        let src = split_glu_kernel_source();
+        self.compile_c_kernel(&src, "gibbs_split_glu_f32")
+    }
+
+    /// JIT-compiles the fused `gibbs_moe_weighted_sum_f32` CUDA kernel.
+    pub fn compile_moe_weighted_sum(&self) -> Result<CudaQuantGemv, String> {
+        let src = moe_weighted_sum_kernel_source();
+        self.compile_c_kernel(&src, "gibbs_moe_weighted_sum_f32")
     }
 }
 
@@ -1140,6 +1657,7 @@ mod tests {
             vec![m * top_k, d_in],
             DType::F32,
         );
+        g.output(picked);
         g.output(probs);
         g.output(moe_down);
 
@@ -1162,6 +1680,8 @@ mod tests {
                 rows: 1,
                 cols: 8,
                 k: 2,
+                weights_out: None,
+                scale: None,
             } if sx == logits && sout == ids
         ));
         assert!(matches!(
@@ -1247,6 +1767,252 @@ mod tests {
                 assert!(src.contains("extern \"C\" __global__ void gemvgen_GGUF_Q4_K_M_r2_ix"));
             }
             other => panic!("expected QuantMoeGemv at step 5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cuda_moe_subgraph_fusions() {
+        use crate::graph::ReduceKind;
+
+        let topk_src = topk_softmax_kernel_source();
+        assert!(topk_src.contains("extern \"C\" __global__ void gibbs_topk_softmax_f32"));
+        let sglu_src = split_glu_kernel_source();
+        assert!(sglu_src.contains("extern \"C\" __global__ void gibbs_split_glu_f32"));
+        let wsum_src = moe_weighted_sum_kernel_source();
+        assert!(wsum_src.contains("extern \"C\" __global__ void gibbs_moe_weighted_sum_f32"));
+
+        for m in [1usize, 2] {
+            for with_w_col_reshape in [false, true] {
+                let (d_in, ff, experts, top_k) = (256usize, 256usize, 8usize, 2usize);
+                let f = DType::F32;
+
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, d_in], f);
+                let w_router = g.weight("w_router", vec![experts, d_in], f);
+                let scale_w = g.weight("scale", vec![1, experts], f);
+                let bank_gu = g.weight(
+                    "bank_gu",
+                    vec![experts * 2 * ff, d_in],
+                    DType::Quant(QuantFormat::GGUF_IQ2_XXS),
+                );
+                let bank_down = g.weight(
+                    "bank_down",
+                    vec![experts * d_in, ff],
+                    DType::Quant(QuantFormat::GGUF_Q4_K_M),
+                );
+
+                let logits = g.add("logits", Op::Linear, &[x, w_router], vec![m, experts], f);
+                let ids = g.add(
+                    "ids",
+                    Op::TopK { k: top_k },
+                    &[logits],
+                    vec![m, top_k],
+                    DType::U32,
+                );
+                let picked = g.add("picked", Op::GatherCols, &[logits, ids], vec![m, top_k], f);
+                let probs = g.add(
+                    "probs",
+                    Op::Softmax { axis: -1 },
+                    &[picked],
+                    vec![m, top_k],
+                    f,
+                );
+                let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], f);
+                let weights_v = g.add(
+                    "weights",
+                    Op::Mul,
+                    &[probs, sc],
+                    if with_w_col_reshape {
+                        vec![m, top_k]
+                    } else {
+                        vec![m * top_k, 1]
+                    },
+                    f,
+                );
+                let gu = g.add(
+                    "gu",
+                    Op::MoeLinear { experts, top_k },
+                    &[x, bank_gu, ids],
+                    vec![m * top_k, 2 * ff],
+                    f,
+                );
+                let gate = g.add(
+                    "gate",
+                    Op::Slice {
+                        axis: 1,
+                        start: 0,
+                        end: ff as i64,
+                    },
+                    &[gu],
+                    vec![m * top_k, ff],
+                    f,
+                );
+                let up = g.add(
+                    "up",
+                    Op::Slice {
+                        axis: 1,
+                        start: ff as i64,
+                        end: (2 * ff) as i64,
+                    },
+                    &[gu],
+                    vec![m * top_k, ff],
+                    f,
+                );
+                let act = g.add("act", Op::GeGlu, &[gate, up], vec![m * top_k, ff], f);
+                let down = g.add(
+                    "down",
+                    Op::MoeLinear { experts, top_k },
+                    &[act, bank_down, ids],
+                    vec![m * top_k, d_in],
+                    f,
+                );
+                let w_for_mul = if with_w_col_reshape {
+                    g.add(
+                        "w_col",
+                        Op::Reshape {
+                            shape: Some(vec![m * top_k, 1]),
+                        },
+                        &[weights_v],
+                        vec![m * top_k, 1],
+                        f,
+                    )
+                } else {
+                    weights_v
+                };
+                let weighted = g.add(
+                    "weighted",
+                    Op::Mul,
+                    &[down, w_for_mul],
+                    vec![m * top_k, d_in],
+                    f,
+                );
+                let slots = g.add(
+                    "slots",
+                    Op::Reshape {
+                        shape: Some(vec![m, top_k, d_in]),
+                    },
+                    &[weighted],
+                    vec![m, top_k, d_in],
+                    f,
+                );
+                let out = g.add(
+                    "out",
+                    Op::Reduce {
+                        kind: ReduceKind::Sum,
+                        axes: vec![1],
+                        keep_dims: false,
+                    },
+                    &[slots],
+                    vec![m, d_in],
+                    f,
+                );
+                g.output(out);
+
+                let steps =
+                    plan_graph(&g).expect("CUDA MoE subgraph fusion plan_graph should succeed");
+                assert_eq!(steps.len(), 6, "m={m}: MoE subgraph must fuse to 6 steps");
+
+                assert!(matches!(
+                    steps[0],
+                    CudaStep::Other {
+                        op: Op::Linear,
+                        out: sout,
+                        ..
+                    } if sout == logits
+                ));
+                assert!(matches!(
+                    steps[1],
+                    CudaStep::TopK {
+                        x: sx,
+                        out: sout,
+                        rows: srows,
+                        cols: scols,
+                        k: sk,
+                        weights_out: Some(sw),
+                        scale: Some(ssc),
+                    } if sx == logits
+                        && sout == ids
+                        && srows == m
+                        && scols == experts
+                        && sk == top_k
+                        && sw == weights_v
+                        && ssc == scale_w
+                ));
+                assert!(matches!(
+                    steps[2],
+                    CudaStep::QuantMoeGemv {
+                        x: sx,
+                        bank: sbank,
+                        ids: sids,
+                        out: sout,
+                        rows: srows,
+                        cols: scols,
+                        slots: sslots,
+                        top_k: sk,
+                        experts: sexp,
+                        x_per_slot: false,
+                        ..
+                    } if sx == x
+                        && sbank == bank_gu
+                        && sids == ids
+                        && sout == gu
+                        && srows == 2 * ff
+                        && scols == d_in
+                        && sslots == m * top_k
+                        && sk == top_k
+                        && sexp == experts
+                ));
+                assert!(matches!(
+                    steps[3],
+                    CudaStep::SplitGlu {
+                        x: sx,
+                        out: sout,
+                        rows: srows,
+                        half_cols: shc,
+                        kind: 1,
+                    } if sx == gu && sout == act && srows == m * top_k && shc == ff
+                ));
+                assert!(matches!(
+                    steps[4],
+                    CudaStep::QuantMoeGemv {
+                        x: sx,
+                        bank: sbank,
+                        ids: sids,
+                        out: sout,
+                        rows: srows,
+                        cols: scols,
+                        slots: sslots,
+                        top_k: sk,
+                        experts: sexp,
+                        x_per_slot: true,
+                        ..
+                    } if sx == act
+                        && sbank == bank_down
+                        && sids == ids
+                        && sout == down
+                        && srows == d_in
+                        && scols == ff
+                        && sslots == m * top_k
+                        && sk == top_k
+                        && sexp == experts
+                ));
+                assert!(matches!(
+                    steps[5],
+                    CudaStep::MoeWeightedSum {
+                        down: sdown,
+                        weights: sweights,
+                        out: sout,
+                        n: sn,
+                        k: sk,
+                        h: sh,
+                    } if sdown == down
+                        && sweights == weights_v
+                        && sout == out
+                        && sn == m
+                        && sk == top_k
+                        && sh == d_in
+                ));
+            }
         }
     }
 }

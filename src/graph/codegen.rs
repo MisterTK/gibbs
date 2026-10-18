@@ -873,6 +873,190 @@ pub fn c_dialect_indexed_translation_unit(
     gemv_indexed_for_dialect(dialect, codec, p)
 }
 
+fn warp_reduce_topk(dialect: Dialect, simd_width: usize, indent: &str) -> String {
+    let mut out = String::new();
+    let mut offset = simd_width / 2;
+    while offset >= 1 {
+        let (shfl_v, shfl_i) = match dialect {
+            Dialect::Cuda => (
+                format!("__shfl_xor_sync(0xffffffffu, bv, {offset})"),
+                format!("__shfl_xor_sync(0xffffffffu, bi_f, {offset})"),
+            ),
+            Dialect::Hip => (
+                format!("__shfl_xor(bv, {offset}, {simd_width})"),
+                format!("__shfl_xor(bi_f, {offset}, {simd_width})"),
+            ),
+            Dialect::Msl => unreachable!(),
+        };
+        out.push_str(&format!(
+            "{indent}{{\n{indent}    float bi_f = (bi == 0xffffffffu) ? -1.0f : (float)bi;\n{indent}    float ov = {shfl_v};\n{indent}    float oi_f = {shfl_i};\n{indent}    unsigned int oi = (oi_f < 0.0f) ? 0xffffffffu : (unsigned int)oi_f;\n{indent}    if (oi != 0xffffffffu && (bi == 0xffffffffu || ov > bv || (ov == bv && oi < bi))) {{\n{indent}        bv = ov;\n{indent}        bi = oi;\n{indent}    }}\n{indent}}}\n"
+        ));
+        offset /= 2;
+    }
+    out
+}
+
+/// Emits a self-contained fused `gibbs_topk_softmax_f32` translation unit for `Dialect::Cuda` / `Dialect::Hip`.
+pub fn topk_softmax_for_dialect(dialect: Dialect) -> String {
+    if dialect == Dialect::Msl {
+        return String::new();
+    }
+    let simd_width = dialect.simd_width(None).max(1);
+    let preamble = dialect_preamble(dialect);
+    let reduction = warp_reduce_topk(dialect, simd_width, "        ");
+    format!(
+        r#"
+// Generated TopKSoftmax ({dialect:?})
+{preamble}
+#ifndef GIBBS_KERN_gibbs_topk_softmax_f32
+#define GIBBS_KERN_gibbs_topk_softmax_f32
+extern "C" __global__ void gibbs_topk_softmax_f32(
+    const float* __restrict__ x,
+    unsigned int* __restrict__ out_ids,
+    float* __restrict__ out_weights,
+    const float* __restrict__ scale,
+    unsigned int p_rows,
+    unsigned int p_cols,
+    unsigned int p_k,
+    unsigned int p_has_scale
+) {{
+    unsigned int row = blockIdx.x;
+    unsigned int lane = threadIdx.x;
+    if (row >= p_rows || lane >= {simd_width}) return;
+    const float pos_inf = __uint_as_float(0x7f800000u);
+    const float neg_inf = __uint_as_float(0xff800000u);
+    const float nan_val = __uint_as_float(0x7fc00000u);
+    const float* xr = x + (unsigned long long)row * p_cols;
+    float picked_v[32];
+    unsigned int picked_i[32];
+    float pv = pos_inf;
+    unsigned int pi = 0xffffffffu;
+    unsigned int k_lim = p_k <= 32u ? p_k : 32u;
+    for (unsigned int round = 0; round < k_lim; ++round) {{
+        float bv = neg_inf;
+        unsigned int bi = 0xffffffffu;
+        for (unsigned int i = lane; i < p_cols; i += {simd_width}) {{
+            float raw = xr[i];
+            float v = (raw == raw) ? raw : neg_inf;
+            if (pi == 0xffffffffu || v < pv || (v == pv && i > pi)) {{
+                if (bi == 0xffffffffu || v > bv || (v == bv && i < bi)) {{
+                    bv = v;
+                    bi = i;
+                }}
+            }}
+        }}
+{reduction}        if (lane == 0) {{
+            out_ids[(unsigned long long)row * p_k + round] = bi;
+            picked_v[round] = bv;
+            picked_i[round] = bi;
+        }}
+        pv = bv;
+        pi = bi;
+    }}
+    if (lane == 0 && k_lim > 0u && out_weights != 0) {{
+        float max_v = picked_v[0];
+        for (unsigned int r = 1; r < k_lim; ++r) {{
+            if (picked_v[r] > max_v) max_v = picked_v[r];
+        }}
+        float sum_exp = 0.0f;
+        for (unsigned int r = 0; r < k_lim; ++r) {{
+            picked_v[r] = exp(picked_v[r] - max_v);
+            sum_exp += picked_v[r];
+        }}
+        for (unsigned int r = 0; r < k_lim; ++r) {{
+            float w = picked_v[r] / sum_exp;
+            if (p_has_scale != 0u && scale != 0) {{
+                w *= (picked_i[r] < p_cols ? scale[picked_i[r]] : nan_val);
+            }}
+            out_weights[(unsigned long long)row * p_k + r] = w;
+        }}
+    }}
+}}
+#endif
+"#,
+        dialect = dialect,
+        preamble = preamble,
+        simd_width = simd_width,
+        reduction = reduction,
+    )
+}
+
+/// Emits a self-contained fused `gibbs_split_glu_f32` translation unit for `Dialect::Cuda` / `Dialect::Hip`.
+pub fn split_glu_for_dialect(dialect: Dialect) -> String {
+    if dialect == Dialect::Msl {
+        return String::new();
+    }
+    let preamble = dialect_preamble(dialect);
+    let common_c = gemv_common_for_dialect(dialect);
+    format!(
+        r#"
+// Generated SplitGlu ({dialect:?})
+{preamble}
+{common_c}
+#ifndef GIBBS_KERN_gibbs_split_glu_f32
+#define GIBBS_KERN_gibbs_split_glu_f32
+extern "C" __global__ void gibbs_split_glu_f32(
+    const float* __restrict__ gu,
+    float* __restrict__ out,
+    unsigned int p_rows,
+    unsigned int p_half_cols,
+    unsigned int p_kind
+) {{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= p_rows * p_half_cols) return;
+    unsigned int r = idx / p_half_cols;
+    unsigned int c = idx % p_half_cols;
+    float g = gu[(unsigned long long)r * (2u * p_half_cols) + c];
+    float u = gu[(unsigned long long)r * (2u * p_half_cols) + p_half_cols + c];
+    float act = p_kind == 0u ? gelu_erf(g) : (p_kind == 1u ? gelu_tanh(g) : (g / (1.0f + exp(-g))));
+    out[idx] = act * u;
+}}
+#endif
+"#,
+        dialect = dialect,
+        preamble = preamble,
+        common_c = common_c,
+    )
+}
+
+/// Emits a self-contained fused `gibbs_moe_weighted_sum_f32` translation unit for `Dialect::Cuda` / `Dialect::Hip`.
+pub fn moe_weighted_sum_for_dialect(dialect: Dialect) -> String {
+    if dialect == Dialect::Msl {
+        return String::new();
+    }
+    let preamble = dialect_preamble(dialect);
+    format!(
+        r#"
+// Generated MoeWeightedSum ({dialect:?})
+{preamble}
+#ifndef GIBBS_KERN_gibbs_moe_weighted_sum_f32
+#define GIBBS_KERN_gibbs_moe_weighted_sum_f32
+extern "C" __global__ void gibbs_moe_weighted_sum_f32(
+    const float* __restrict__ down,
+    const float* __restrict__ weights,
+    float* __restrict__ out,
+    unsigned int p_n,
+    unsigned int p_k,
+    unsigned int p_h
+) {{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= p_n * p_h) return;
+    unsigned int r = idx / p_h;
+    unsigned int c = idx % p_h;
+    float sum = 0.0f;
+    unsigned long long base = (unsigned long long)r * p_k;
+    for (unsigned int s = 0; s < p_k; ++s) {{
+        sum += down[(base + s) * p_h + c] * weights[base + s];
+    }}
+    out[idx] = sum;
+}}
+#endif
+"#,
+        dialect = dialect,
+        preamble = preamble,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1241,22 @@ mod tests {
             }
         }
         assert!(checked >= 25);
+        for dialect in [Dialect::Cuda, Dialect::Hip] {
+            let topk_src = topk_softmax_for_dialect(dialect);
+            assert!(topk_src.contains("extern \"C\" __global__ void gibbs_topk_softmax_f32"));
+            let sglu_src = split_glu_for_dialect(dialect);
+            assert!(sglu_src.contains("extern \"C\" __global__ void gibbs_split_glu_f32"));
+            let wsum_src = moe_weighted_sum_for_dialect(dialect);
+            assert!(wsum_src.contains("extern \"C\" __global__ void gibbs_moe_weighted_sum_f32"));
+            for src in [&topk_src, &sglu_src, &wsum_src] {
+                for tok in forbidden {
+                    assert!(
+                        !src.contains(tok),
+                        "{dialect:?} fused MoE kernel contains leftover MSL token {tok:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1149,6 +1349,9 @@ mod tests {
                 "x[col]",
                 "for (uint epi = 0; epi <= 7; ++epi) { PackedGemvParams ep = { rows, cols, 1u, 0u, epi }; sum = apply_gemv_epi(sum, (ulong)row, ep, res); } out[row] = sum + erf_approx(sum);",
             ));
+            tu.push_str(&topk_softmax_for_dialect(dialect));
+            tu.push_str(&split_glu_for_dialect(dialect));
+            tu.push_str(&moe_weighted_sum_for_dialect(dialect));
 
             let mut child = Command::new(clang_bin)
                 .args(args)
