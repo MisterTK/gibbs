@@ -400,7 +400,6 @@ fn moe_gemv_pso(sess: &Session, c: &Codec) -> Result<ComputePipelineState, Strin
         gemv_indexed(c, params)
     );
     let opts = CompileOptions::new();
-    opts.set_fast_math_enabled(false);
     let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
         format!(
             "generated {:?} expert GEMV failed to compile: {e}",
