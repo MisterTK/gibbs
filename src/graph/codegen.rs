@@ -1773,7 +1773,28 @@ pub fn gemv_indexed_for_dialect(dialect: Dialect, codec: &Codec, p: GemvParams) 
             .map(|i| format!("float acc{i} = 0.0f;"))
             .collect::<Vec<_>>()
             .join(" ");
-        let loop_src = gemv_loop(codec, p, &dec, "(bank_row + row0", false);
+        let is_iq2xxs = codec.format == crate::hardware::QuantFormat::GGUF_IQ2_XXS;
+        let (wide_msl, loop_src, tid_param, tg_lut_init) = if is_iq2xxs {
+            (
+                wide_msl(codec, &dec, false)
+                    .replace(
+                        "thread float* out)",
+                        "thread float* out, threadgroup const ulong* tg_iq2xxs_grid)",
+                    )
+                    .replace("IQ2XXS_GRID[", "tg_iq2xxs_grid["),
+                gemv_loop(codec, p, &dec, "(bank_row + row0", false)
+                    .replace(", v);", ", v, tg_iq2xxs_grid);"),
+                ",\n    uint tid [[thread_index_in_threadgroup]]",
+                "    threadgroup ulong tg_iq2xxs_grid[256];\n    if (tid < 256) tg_iq2xxs_grid[tid] = IQ2XXS_GRID[tid];\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+            )
+        } else {
+            (
+                wide_msl(codec, &dec, false),
+                gemv_loop(codec, p, &dec, "(bank_row + row0", false),
+                "",
+                "",
+            )
+        };
         let sums: String = (0..r)
             .map(|i| format!("    float simd_sum_{i} = simd_sum(acc{i});\n"))
             .collect();
@@ -1804,11 +1825,11 @@ kernel void {name}(
     device const uint* ids [[buffer(4)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
+    uint lane [[thread_index_in_simdgroup]]{tid_param}
 ) {{
     const uint row0 = tg.x * {rows_per_tg} + sg * {r};
     const uint slot = tg.y;
-    if (row0 >= p.rows || slot >= p.slots) return;
+{tg_lut_init}    if (row0 >= p.rows || slot >= p.slots) return;
     const uint expert = ids[slot];
     if (expert >= p.experts) {{
         if (lane == 0) {{
@@ -1825,7 +1846,6 @@ kernel void {name}(
 }}
 "#,
             rows_per_tg = gemv_rows_per_tg(p),
-            wide_msl = wide_msl(codec, &dec, false),
         );
     }
 
