@@ -2875,3 +2875,84 @@ kernel void gemv_q4_k_pair(device const block_q4_k* w0 [[buffer(0)]],
     }
 }
 
+kernel void gemv_bf16_pair(device const ushort* w0 [[buffer(0)]],
+                           device const ushort* w1 [[buffer(1)]],
+                           device const float* x [[buffer(2)]],
+                           device float* y0 [[buffer(3)]],
+                           device float* y1 [[buffer(4)]],
+                           constant PackedGemvPairParams& pp [[buffer(5)]],
+                           device const float* bias0 [[buffer(6)]],
+                           device const float* bias1 [[buffer(7)]],
+                           device const float* res0 [[buffer(8)]],
+                           device const float* res1 [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    bool is_leg1 = (tg.x >= pp.tgs0);
+    uint tg_x = is_leg1 ? (tg.x - pp.tgs0) : tg.x;
+    constant PackedGemvParams& p = is_leg1 ? pp.p1 : pp.p0;
+    device const ushort* w = is_leg1 ? w1 : w0;
+    device float* y = is_leg1 ? y1 : y0;
+    device const float* bias = is_leg1 ? bias1 : bias0;
+    device const float* res = is_leg1 ? res1 : res0;
+
+    uint row0 = tg_x * 16 + sg * 2;
+    uint row1 = row0 + 1;
+    uint batch = tg.y;
+    if (row0 >= p.rows || batch >= p.batch_size) return;
+    bool has_row1 = (row1 < p.rows);
+
+    device const ushort* r0_w = w + (ulong)row0 * p.cols;
+    device const ushort* r1_w = has_row1 ? (w + (ulong)row1 * p.cols) : r0_w;
+    device const float* xb = x + (ulong)batch * p.cols;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    uint col_rem = p.cols % 8;
+    uint col_aligned = p.cols - col_rem;
+
+    for (uint i = lane * 8; i < col_aligned; i += 32 * 8) {
+        ushort4 w0_0 = *reinterpret_cast<device const ushort4*>(r0_w + i);
+        ushort4 w0_1 = *reinterpret_cast<device const ushort4*>(r0_w + i + 4);
+        ushort4 w1_0 = *reinterpret_cast<device const ushort4*>(r1_w + i);
+        ushort4 w1_1 = *reinterpret_cast<device const ushort4*>(r1_w + i + 4);
+
+        float4 xb0 = *reinterpret_cast<device const float4*>(xb + i);
+        float4 xb1 = *reinterpret_cast<device const float4*>(xb + i + 4);
+
+        float4 val0_0 = as_type<float4>(uint4(w0_0) << 16);
+        float4 val0_1 = as_type<float4>(uint4(w0_1) << 16);
+        acc0 += dot(val0_0, xb0) + dot(val0_1, xb1);
+
+        if (has_row1) {
+            float4 val1_0 = as_type<float4>(uint4(w1_0) << 16);
+            float4 val1_1 = as_type<float4>(uint4(w1_1) << 16);
+            acc1 += dot(val1_0, xb0) + dot(val1_1, xb1);
+        }
+    }
+    for (uint i = col_aligned + lane; i < p.cols; i += 32) {
+        uint u0 = uint(r0_w[i]) << 16;
+        acc0 += as_type<float>(u0) * xb[i];
+        if (has_row1) {
+            uint u1 = uint(r1_w[i]) << 16;
+            acc1 += as_type<float>(u1) * xb[i];
+        }
+    }
+
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+
+    if (lane == 0) {
+        if (p.has_bias != 0) {
+            acc0 += bias[row0];
+            if (has_row1) acc1 += bias[row1];
+        }
+        acc0 = apply_gemv_epi(acc0, (ulong)batch * p.rows + row0, p, res);
+        if (has_row1) acc1 = apply_gemv_epi(acc1, (ulong)batch * p.rows + row1, p, res);
+        y[(ulong)batch * p.rows + row0] = acc0;
+        if (has_row1) {
+            y[(ulong)batch * p.rows + row1] = acc1;
+        }
+    }
+}
+

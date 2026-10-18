@@ -412,7 +412,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 67] = [
+const BASE_KERNELS: [&str; 68] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -449,6 +449,7 @@ const BASE_KERNELS: [&str; 67] = [
     "gemv_q4_0_half_pair",
     "gemv_q8_0_pair",
     "gemv_q4_k_pair",
+    "gemv_bf16_pair",
     "gemm_batched_bf16_none",
     "gemm_batched_bf16_gelu",
     "gemm_batched_bf16_residual",
@@ -3214,10 +3215,12 @@ impl Session {
                     pad2: u32,
                 }
                 let pair_kernel = if m == 1
-                    && legs[0].variant.kernel == GemvKernel::Hand
-                    && legs[1].variant.kernel == GemvKernel::Hand
+                    && ((legs[0].variant.kernel == GemvKernel::Hand
+                        && legs[1].variant.kernel == GemvKernel::Hand)
+                        || (legs[0].rows <= 64 && legs[1].rows <= 64))
                 {
                     match format {
+                        WeightFormat::BF16 => Some("gemv_bf16_pair"),
                         WeightFormat::Q4_0 => Some("gemv_q4_0_half_pair"),
                         WeightFormat::Q8_0 => Some("gemv_q8_0_pair"),
                         WeightFormat::Q4_K => Some("gemv_q4_k_pair"),
@@ -4442,17 +4445,19 @@ fn pair_small_hand_gemvs(
         else {
             return false;
         };
+        let var_ok = (*v0 == GemvVariant::HAND && *v1 == GemvVariant::HAND)
+            || (*r0 <= 64 && *r1 <= 64);
         if x0 != x1
             || f0 != f1
             || c0 != c1
-            || *v0 != GemvVariant::HAND
-            || *v1 != GemvVariant::HAND
+            || !var_ok
             || *r0 > 512
             || *r1 > 512
         {
             return false;
         }
-        let fmt_ok = *f0 == WeightFormat::Q4_K
+        let fmt_ok = *f0 == WeightFormat::BF16
+            || *f0 == WeightFormat::Q4_K
             || *f0 == WeightFormat::Q8_0
             || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0);
         if !fmt_ok || b.reads.iter().any(|&r| r == a.out || root(r) == root(a.out)) {
@@ -9853,6 +9858,44 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                         "{f:?} ({rows0},{rows1},{cols}) out {i}: err {err}"
                     );
                 }
+            }
+        }
+        for (rows0, rows1, cols) in [(256usize, 256usize, 512usize), (16, 16, 2048)] {
+            let mut w = Weights::new();
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, cols], DType::F32);
+            let kw = g.weight("k_w", vec![rows0, cols], DType::BF16);
+            let vw = g.weight("v_w", vec![rows1, cols], DType::BF16);
+            let kb = g.weight("k_b", vec![rows0], DType::F32);
+            let vb = g.weight("v_b", vec![rows1], DType::F32);
+            let to_bf16 = |vals: Vec<f32>| -> Vec<u16> {
+                vals.iter().map(|&v| (v.to_bits() >> 16) as u16).collect()
+            };
+            w.insert("k_w", Tensor::BF16(to_bf16(rand(rows0 * cols, 71))));
+            w.insert("v_w", Tensor::BF16(to_bf16(rand(rows1 * cols, 73))));
+            w.insert("k_b", Tensor::F32(rand(rows0, 11)));
+            w.insert("v_b", Tensor::F32(rand(rows1, 13)));
+            let k_out = g.add("k_proj", Op::Linear, &[x, kw, kb], vec![1, rows0], DType::F32);
+            let v_raw = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
+            let v_out = g.add("v_biased", Op::Add, &[v_raw, vb], vec![1, rows1], DType::F32);
+            g.output(k_out);
+            g.output(v_out);
+
+            let s = Session::new(rt(), &w).unwrap();
+            let plan = s.prepare_plan(&g).unwrap();
+            assert_eq!(plan.steps.len(), 1);
+            assert!(matches!(plan.steps[0].op, Step::GemvPackedPair { .. }));
+
+            let inp = vec![Tensor::F32(rand(cols, 42))];
+            let mut cs = StateStore::new();
+            let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
+            let got = s.run_prepared(&g, &plan, None, inp).unwrap();
+            for (i, (wt, gt)) in want.iter().zip(&got).enumerate() {
+                let err = rel_err(wt.as_f32().unwrap(), gt.as_f32().unwrap());
+                assert!(
+                    err < 1e-5,
+                    "BF16 ({rows0},{rows1},{cols}) out {i}: err {err}"
+                );
             }
         }
     }
