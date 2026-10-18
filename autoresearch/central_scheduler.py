@@ -19,10 +19,10 @@ import sys
 import time
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "gibbs")
+RIPSTER_HEAVY_LOCK = "/tmp/ripster-lane-heavy.lock"
 SCHED_LOCK = os.path.join(CACHE_DIR, "sched.lock")
 SCHED_LOG = os.path.join(CACHE_DIR, "sched.log")
 COMPOSITOR_FLOOR_CAP = 34
-
 
 def now_iso() -> str:
     return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -56,8 +56,14 @@ def measure_idle_floor(samples: int = 3, delay_s: float = 0.5) -> int:
     return min(vals) if vals else 100
 
 
-def compute_quiet_max(_raw_floor: int | None = None) -> int:
-    return int(os.environ.get("QUIET_MAX_PCT", "20"))
+def compute_quiet_max(raw_floor: int | None = None) -> int:
+    if "QUIET_MAX_PCT" in os.environ:
+        return int(os.environ["QUIET_MAX_PCT"])
+    if raw_floor is None:
+        return 20
+    return max(20, min(raw_floor, COMPOSITOR_FLOOR_CAP) + 6)
+
+
 def wait_until_quiet(quiet_max: int, required_ok: int = 5, timeout_s: int = 300) -> tuple[int, float, bool]:
     t0 = time.time()
     ok = 0
@@ -84,7 +90,8 @@ def run_job(args: argparse.Namespace) -> int:
 
     cwd = os.getcwd()
     wait_t0 = time.time()
-    with open(SCHED_LOCK, "a") as sched_f:
+    with open(RIPSTER_HEAVY_LOCK, "a") as ripster_f, open(SCHED_LOCK, "a") as sched_f:
+        fcntl.flock(ripster_f, fcntl.LOCK_EX)
         fcntl.flock(sched_f, fcntl.LOCK_EX)
         try:
             wait_s = round(time.time() - wait_t0, 3)
@@ -131,22 +138,45 @@ def run_job(args: argparse.Namespace) -> int:
             }
             log_event(start_ev)
             run_t0 = time.time()
-            proc = subprocess.run(cmd, cwd=cwd, env=env)
+            is_cargo_test = "cargo test" in " ".join(cmd)
+            saw_zero_tests = False
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if is_cargo_test and "running 0 tests" in line:
+                    saw_zero_tests = True
+            rc = proc.wait()
+            if saw_zero_tests and rc == 0 and not getattr(args, "allow_zero_tests", False):
+                print(
+                    "central_scheduler: ERROR: cargo test matched 'running 0 tests' (check --lib vs --test filter)",
+                    file=sys.stderr,
+                )
+                rc = 3
             dur_s = round(time.time() - run_t0, 3)
             end_ev = {
                 "ts": now_iso(),
                 "event": "done",
                 "label": args.label or " ".join(cmd[:3]),
                 "cwd": cwd,
-                "rc": proc.returncode,
+                "rc": rc,
                 "dur_s": dur_s,
                 "gpu_after_pct": sample_gpu_util(),
             }
             log_event(end_ev)
-            return proc.returncode
+            return rc
         finally:
             fcntl.flock(sched_f, fcntl.LOCK_UN)
-
+            fcntl.flock(ripster_f, fcntl.LOCK_UN)
 def show_status(_args: argparse.Namespace) -> int:
     raw_floor = measure_idle_floor(samples=2, delay_s=0.4)
     print(
@@ -167,9 +197,10 @@ def main() -> int:
     p_run.add_argument("--label", default="", help="Job label for sched.log")
     p_run.add_argument("--floor-samples", type=int, default=2)
     p_run.add_argument("--quiet", action="store_true", help="Wait for quiet GPU before starting")
-    p_run.add_argument("--quiet-max", type=int, default=20, help="Max GPU utilization %% for --quiet (default 20)")
     p_run.add_argument("--quiet-samples", type=int, default=5)
+    p_run.add_argument("--quiet-max", type=int, default=None, help="Max GPU utilization %% for --quiet (default: auto <=40 from idle floor)")
     p_run.add_argument("--quiet-timeout", type=int, default=3600)
+    p_run.add_argument("--allow-zero-tests", action="store_true", help="Allow 'running 0 tests' in cargo test")
     p_run.add_argument("cmd", nargs=argparse.REMAINDER)
     sub.add_parser("status", help="Show GPU idle floor and recent scheduled jobs")
     args = ap.parse_args()
