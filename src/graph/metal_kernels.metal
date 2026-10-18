@@ -78,7 +78,7 @@ static inline float block_sum(float v, threadgroup float* scratch, uint sg, uint
 }
 
 // GEMM epilogues, applied to x·Wᵀ (+ bias) before the store.
-enum : int { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2, EPI_UP_SWIGLU = 6, EPI_UP_GEGLU = 7 };
+enum : int { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2 };
 
 template <int EPI>
 static inline float epilogue(float acc, uint row, uint col, constant GemmParams& p,
@@ -86,13 +86,6 @@ static inline float epilogue(float acc, uint row, uint col, constant GemmParams&
     float v = p.has_bias ? acc + bias[col] : acc;
     if (EPI == EPI_GELU) v = gelu_erf(v);
     if (EPI == EPI_RESIDUAL) v += res[(ulong)row * p.n + col];
-    if (EPI == EPI_UP_SWIGLU) {
-        float g = res[(ulong)row * p.n + col];
-        v *= g / (1.0f + exp(-g));
-    }
-    if (EPI == EPI_UP_GEGLU) {
-        v *= gelu_tanh(res[(ulong)row * p.n + col]);
-    }
     return v;
 }
 
@@ -146,8 +139,6 @@ kernel void gemm_sg(device const float* x [[buffer(0)]],
 GEMM_INSTANCE("gemm_sg_none", gemm_sg, EPI_NONE)
 GEMM_INSTANCE("gemm_sg_gelu", gemm_sg, EPI_GELU)
 GEMM_INSTANCE("gemm_sg_residual", gemm_sg, EPI_RESIDUAL)
-GEMM_INSTANCE("gemm_sg_up_swiglu", gemm_sg, EPI_UP_SWIGLU)
-GEMM_INSTANCE("gemm_sg_up_geglu", gemm_sg, EPI_UP_GEGLU)
 
 // Same contract for few rows (decode-like m): one simdgroup per output column, i.e. per row of w,
 // which is read once per 8 rows of x; 8 columns per threadgroup. Lanes take float4 chunks of k
@@ -192,8 +183,6 @@ kernel void gemm_rows(device const float* x [[buffer(0)]],
 GEMM_INSTANCE("gemm_rows_none", gemm_rows, EPI_NONE)
 GEMM_INSTANCE("gemm_rows_gelu", gemm_rows, EPI_GELU)
 GEMM_INSTANCE("gemm_rows_residual", gemm_rows, EPI_RESIDUAL)
-GEMM_INSTANCE("gemm_rows_up_swiglu", gemm_rows, EPI_UP_SWIGLU)
-GEMM_INSTANCE("gemm_rows_up_geglu", gemm_rows, EPI_UP_GEGLU)
 
 #if defined(GIBBS_MPP)
 using namespace mpp::tensor_ops;
@@ -238,8 +227,6 @@ kernel void gemm_mpp(device float* x [[buffer(0)]],
 GEMM_INSTANCE("gemm_mpp_none", gemm_mpp, EPI_NONE)
 GEMM_INSTANCE("gemm_mpp_gelu", gemm_mpp, EPI_GELU)
 GEMM_INSTANCE("gemm_mpp_residual", gemm_mpp, EPI_RESIDUAL)
-GEMM_INSTANCE("gemm_mpp_up_swiglu", gemm_mpp, EPI_UP_SWIGLU)
-GEMM_INSTANCE("gemm_mpp_up_geglu", gemm_mpp, EPI_UP_GEGLU)
 #endif
 
 // out[r, :] = table[ids[r], :]; ids are range-checked on the host before dispatch.
@@ -733,6 +720,7 @@ kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
     bool has_row1 = (row1 < p.rows);
 
     uint n_blocks = p.cols / 32;
+    uint n_sub = n_blocks * 2;
     device const block_q4_0* r0_blocks = w + (ulong)row0 * n_blocks;
     device const block_q4_0* r1_blocks = has_row1 ? (w + (ulong)row1 * n_blocks) : r0_blocks;
     device const float* xb_base = x + (ulong)batch * p.cols;
@@ -740,60 +728,34 @@ kernel void gemv_q4_0_half(device const block_q4_0* w [[buffer(0)]],
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
-    if (p.cols < 512u && (p.cols & 255u) == 0u) {
-        uint n_sub = n_blocks * 4;
-        for (uint s = lane; s < n_sub; s += 32) {
-            uint b = s >> 2;
-            uint qtr_off = (s & 3u) * 4u;
-            device const float* xb = xb_base + b * 32 + qtr_off;
-            float4 x_lo = *reinterpret_cast<device const float4*>(xb);
-            float4 x_hi = *reinterpret_cast<device const float4*>(xb + 16);
-            float sum_x = (x_lo.x + x_lo.y + x_lo.z + x_lo.w)
-                        + (x_hi.x + x_hi.y + x_hi.z + x_hi.w);
+    for (uint s = lane; s < n_sub; s += 32) {
+        uint b = s >> 1;
+        uint half_off = (s & 1) * 8;
+        device const float* xb = xb_base + b * 32 + half_off;
 
-            uint q0 = as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2*>(r0_blocks[b].qs + qtr_off)));
-            float dot0 = dot(float4(as_type<uchar4>(q0 & 0x0F0F0F0Fu)), x_lo)
-                       + dot(float4(as_type<uchar4>((q0 >> 4) & 0x0F0F0F0Fu)), x_hi);
-            acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
+        float4 x_lo0 = *reinterpret_cast<device const float4*>(xb);
+        float4 x_lo1 = *reinterpret_cast<device const float4*>(xb + 4);
+        float4 x_hi0 = *reinterpret_cast<device const float4*>(xb + 16);
+        float4 x_hi1 = *reinterpret_cast<device const float4*>(xb + 20);
+        float sum_x = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
+                    + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
+                    + (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
+                    + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
 
-            if (has_row1) {
-                uint q1 = as_type<uint>(ushort2(*reinterpret_cast<device const packed_ushort2*>(r1_blocks[b].qs + qtr_off)));
-                float dot1 = dot(float4(as_type<uchar4>(q1 & 0x0F0F0F0Fu)), x_lo)
-                           + dot(float4(as_type<uchar4>((q1 >> 4) & 0x0F0F0F0Fu)), x_hi);
-                acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
-            }
-        }
-    } else {
-        uint n_sub = n_blocks * 2;
-        for (uint s = lane; s < n_sub; s += 32) {
-            uint b = s >> 1;
-            uint half_off = (s & 1) * 8;
-            device const float* xb = xb_base + b * 32 + half_off;
+        uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + half_off)));
+        float dot0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
+                   + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1)
+                   + dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                   + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+        acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
 
-            float4 x_lo0 = *reinterpret_cast<device const float4*>(xb);
-            float4 x_lo1 = *reinterpret_cast<device const float4*>(xb + 4);
-            float4 x_hi0 = *reinterpret_cast<device const float4*>(xb + 16);
-            float4 x_hi1 = *reinterpret_cast<device const float4*>(xb + 20);
-            float sum_x = (x_lo0.x + x_lo0.y + x_lo0.z + x_lo0.w)
-                        + (x_lo1.x + x_lo1.y + x_lo1.z + x_lo1.w)
-                        + (x_hi0.x + x_hi0.y + x_hi0.z + x_hi0.w)
-                        + (x_hi1.x + x_hi1.y + x_hi1.z + x_hi1.w);
-
-            uint2 q0 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r0_blocks[b].qs + half_off)));
-            float dot0 = dot(float4(as_type<uchar4>(q0.x & 0x0F0F0F0Fu)), x_lo0)
-                       + dot(float4(as_type<uchar4>(q0.y & 0x0F0F0F0Fu)), x_lo1)
-                       + dot(float4(as_type<uchar4>((q0.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                       + dot(float4(as_type<uchar4>((q0.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-            acc0 += float(r0_blocks[b].d) * (dot0 - 8.0f * sum_x);
-
-            if (has_row1) {
-                uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + half_off)));
-                float dot1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
-                           + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
-                           + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
-                           + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
-                acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
-            }
+        if (has_row1) {
+            uint2 q1 = as_type<uint2>(ushort4(*reinterpret_cast<device const packed_ushort4*>(r1_blocks[b].qs + half_off)));
+            float dot1 = dot(float4(as_type<uchar4>(q1.x & 0x0F0F0F0Fu)), x_lo0)
+                       + dot(float4(as_type<uchar4>(q1.y & 0x0F0F0F0Fu)), x_lo1)
+                       + dot(float4(as_type<uchar4>((q1.x >> 4) & 0x0F0F0F0Fu)), x_hi0)
+                       + dot(float4(as_type<uchar4>((q1.y >> 4) & 0x0F0F0F0Fu)), x_hi1);
+            acc1 += float(r1_blocks[b].d) * (dot1 - 8.0f * sum_x);
         }
     }
     acc0 = simd_sum(acc0);
@@ -2630,8 +2592,6 @@ kernel void gemv_jesse_lut(
     constant uint& in_features [[buffer(4)]],
     constant uint& out_features [[buffer(5)]],
     constant uint& address_bits [[buffer(6)]],
-    constant PackedGemvParams& p [[buffer(7)]],
-    device const float* res [[buffer(8)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= out_features) return;
     uint num_luts = (in_features + address_bits - 1) / address_bits;
@@ -2650,7 +2610,7 @@ kernel void gemv_jesse_lut(
         }
         accum += (int)lut_tables[lut_out_offset + (ulong)lut_idx * lut_size + addr];
     }
-    y[gid] = apply_gemv_epi(float(accum), (ulong)gid, p, res);
+    y[gid] = float(accum);
 }
 
 struct Conv2dParams {
