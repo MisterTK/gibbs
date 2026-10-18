@@ -60,23 +60,25 @@ Run an unbounded (`Iterations: unlimited`) autonomous optimization loop on `/Use
 
 ---
 
-## 3. Wave 8 Avant-Garde Priority Queue (Eliminating the 64-Register Cliff in `segs = 4` `Wide` Codecs & Promoting `experiment/rsi-39-m4-m1-m5c-a6`)
+## 3. Wave 8 Avant-Garde Priority Queue (Cross-Repo Lock Coordination, Two-Round Contention-Proof Tuner, Interleaved `r=2` vs `r=4` MoE Benchmark + Constant-Decode Ablation, Strict `HAND` `gemv_bf16_pair`, & Promotion to `main`)
 
 ### 1. Closed Lines (Do Not Revisit)
 - **`Track M3` / `Track M3-v2` (`Step::MoeWeightedSumNorm`) & `Track W2` / `Track W2-v2` (`Step::ExpertGateUpGlu`)**: Closed (`W2-v2` proved `-30` dispatches = `0.000 ms` on `Model 7`, and `M3-v2` proved cross-TG `seq_cst` device fences cost `+1.86 ms/tok`).
-- **Threadgroup SRAM staging in `gemv_indexed` (`Track M5a` `tg_iq2xxs_grid[256]` & `Track M5b` `shared_x[2816]`)**: `shared_x[2816]` (`11.25 KB` TG SRAM) drops Apple Silicon core residency from 4 TGs/core (`1024` threads) to `floor(32 KB / 11.25 KB) = 2` TGs/core (`512` threads), and `tg_iq2xxs_grid[256]` (`2 KB` + `threadgroup_barrier`) adds `~1.2 us/dispatch`. Keep `gemv_indexed` at **`0 B` of `threadgroup` memory** (full 4 TGs/core).
+- **Threadgroup SRAM staging in `gemv_indexed` (`Track M5a` `tg_iq2xxs_grid[256]` & `Track M5b` `shared_x[2816]`)**: Discarded (`0 B` of `threadgroup` memory is strictly faster).
 
-### 2. Verify & Promote `experiment/rsi-39-m4-m1-m5c-a6` (`02805f5`) Standalone on a Quiet Host (`<= 20%` GPU), Then Stack `rsi-23` (`2b7b6c8`)
-- **`experiment/rsi-39-m4-m1-m5c-a6` (`02805f5`)** combines four verified, unit-tested, zero-TG-SRAM improvements:
-  1. **Track M4 (`41b39c9`)**: Vectorized `WIDE_Q4_0`, `WIDE_IQ4_NL`, and `WIDE_IQ2_XXS` `decode_group` (`packed_ushort4` + `packed_float4` + `select`).
-  2. **Track M5c (`7ac216c` / `02805f5`)**: `WIDE_IQ2_XXS` `packed_ushort4` load + `popcount` `KSIGNS` parity + `moe_rows_per_sg(c) = 4` for `c.block_elems <= 32`, lifting `Model 7` `expert_down` (`GGUF_IQ4_NL 2816x704`) to **`192.7 GB/s` (`46.3 us`, `+21.7%` / `-10.0 us/layer` = `-300 us/tok` vs `158.3 GB/s`)** and `GGUF_Q4_0 2816x704` to **`181.0 GB/s` (`49.3 us`)**.
-  3. **Track M1 (`68b1a41`)**: Fused MoE `TopKSoftmax` + `SplitGlu` + `MoeWeightedSum` (`-210` dispatches/tok on `Model 7`: `923 -> 713`).
-  4. **Track A6 (`c5cabc7` on top of `696810f`)**: Standalone `Step::GemvPackedPair` with `gemv_bf16_pair` (`4/4` pairs on `Qwen3.5-2B` in quiet screen `bg_209`, `112.7 -> 113.9 tok/s`, `-91 us/tok`, `dispatches: 430 -> 412`).
-- First run a quiet standalone screen/ABBA of `02805f5` before stacking `rsi-23` (`2b7b6c8`).
+### 2. Three Hardening & Verification Tracks Before Promoting `rsi-39` to `main`
+1. **Track W8a (`exp-w8a-two-round-tuner`: Two-Round Contention-Proof `tuned_variant` & `tune::decide`)**:
+   - In `src/graph/metal.rs` (`tuned_variant`), always run 2 rounds in opposite order (`0..2`, forward then reverse) instead of 1 round when `busy == false`.
+   - In `src/graph/tune.rs` (`decide`), when `!busy && rounds.len() >= 2`, require both rounds to agree on `choose(round)` (else return `default`), and in `tuned_variant` only persist to disk (`cache.insert` + `cache.save`) when `!busy`, both rounds agree on `best`, and the two rounds' GB/s for `best` are within `5%` (`|g0 - g1| / g0.max(g1) <= 0.05`); otherwise call `cache.insert_contended`. This prevents transient GPU spikes from ever poisoning `~/.cache/gibbs/host/tune-*.json`.
+2. **Track W8b (`exp-w8b-moe-interleaved-r4`: Race-Free Per-Format `moe_rows_per_sg`, 3-Round Interleaved `[2, 4, 4, 2]` `moe_gemv_bandwidth`, & `IQ2_XXS` Constant-Decode Ablation)**:
+   - Remove `static ROWS_PER_SG: AtomicUsize` in `src/graph/metal/ext/moe.rs` (which races across parallel `--lib` tests).
+   - Use an explicit per-format match in `moe_rows_per_sg(fmt: QuantFormat) -> usize` limited strictly to formats proven by interleaved `[2, 4, 4, 2]` × 3 rounds in `moe_gemv_bandwidth`.
+   - Add `moe_gemv_iq2xxs_constant_decode_ablation` (`--ignored`) to test whether replacing `IQ2XXS_GRID` / `KSIGNS_IQ2XS` lookups with constant arithmetic changes the `56.6 us` time on `1408x2816` (distinguishing table-lookup cost from the per-dispatch/grid floor).
+3. **Track W8c (`exp-w8c-a6-strict-hand-pair`: Restrict `pair_small_hand_gemvs` to `GemvVariant::HAND` Only)**:
+   - Remove the `|| *rows0 <= 64` relaxation in `src/graph/metal.rs` so `pair_small_hand_gemvs` ONLY pairs when `v0 == GemvVariant::HAND && v1 == GemvVariant::HAND` (preserving `gemv_bf16_pair` on `Qwen3.5` `16x2048` / `32x4096` `BF16` projections while never overriding `Gen(1)`/`Gen(2)` on quantized formats). Add a unit test asserting `Gen(1)` on `16x2048` `Q4_K_M` is not overridden by `GemvPackedPair`.
 
-### 3. Track M6 (`exp-m6-segs2-iq2xxs`: Breaking the 64-Register Residency Cliff on `WIDE_IQ2_XXS` / `WIDE_IQ2_M`)
-- **Root Cause Identified in Wave 7 (`verify-m5c-iq2xxs-r4-probe`)**:
-  - `WIDE_IQ4_NL` and `WIDE_Q4_0` have `segs = 2` (`16` elements per group), so `gemv_loop` allocates `float4 xs[4]` (`16` regs) + `float v[17]` (`17` regs) = **`33` registers**, staying well under Apple Silicon's **64-register/thread cliff** (`64 KB` register file per core / `1,024` threads = `64` floats/thread for 100% 32-SIMD-group residency) and scaling to **`192.7 GB/s`** at `r = 4`.
-  - In contrast, `WIDE_IQ2_XXS` (`groups = 8, segs = 4`), `WIDE_IQ2_M` (`groups = 8, segs = 4`), and `WIDE_IQ3_S` (`groups = 8, segs = 4`) decode `32` elements per group (`segs = 4`), forcing `gemv_loop` to allocate `float4 xs[8]` (`32` regs) + `float v[33]` (`33` regs) = **`65+` registers per thread**, which crosses the 64-register cliff and caps `GGUF_IQ2_XXS 1408x2816` at `144.5 GB/s` (`56.6 us`).
-- **Design**:
-  - In `gemv_loop` (`src/graph/codegen.rs:1642-1695`), for `wd.segs == 4` (or all `Wide` codecs), split `decode_group` into 2 half-group calls or change `WIDE_IQ2_XXS` to `groups: 16, segs: 2` (`16` elements = `2` grid lookups per group, where `q = blk + 2 + 8 * (g >> 1)`, reading the `k = 0..1` half for `g & 1 == 0` and the `k = 2..3` half for `g & 1 == 1`), cutting `xs` + `v` from `32 + 33 = 65` registers down to **`16 + 17 = 33` registers** (100% 1024-thread residency) AND doubling `groups` on `cols = 2816` from `88` (`88 / 96 = 91.7%` lane utilization) to **`176` (`5 * 32 + 16 = 176 / 192 = 91.7%` or `100%` with 16-lane half-warps)**!
+### 3. Promotion Sequence (Coordinated via `/tmp/ripster-lane-heavy.lock`)
+1. `autoresearch/central_scheduler.py` now acquires `/tmp/ripster-lane-heavy.lock` before `~/.cache/gibbs/sched.lock`, automatically waiting behind any `trading-system` `forecast` job.
+2. Delete poisoned `de19cee9ffcfa698` / `fc235aa90db71dcd` entries from `~/.cache/gibbs/host/tune-Apple-M5-Pro-25G241.json` and re-tune on an idle GPU with the hardened 2-round tuner (`Track W8a`).
+3. Run `cargo test --release --test codec_parity` and full `scripts/loop_guard.sh` on the assembled branch (`M4 + M1 + M5c + A6 + W8a/b/c`).
+4. Run a single quiet 4-pass ABBA (`scripts/verify_when_quiet.sh`) against `target/loop-base/gibbs` and promote to `main` + `target/loop-base/` before opening new feature tracks.
