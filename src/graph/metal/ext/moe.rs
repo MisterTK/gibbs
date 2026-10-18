@@ -404,7 +404,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-fn moe_rows_per_sg(c: &Codec) -> usize {
+fn moe_rows_per_sg(_c: &Codec) -> usize {
     #[cfg(test)]
     {
         let ov = TEST_ROWS_PER_SG.get();
@@ -412,10 +412,12 @@ fn moe_rows_per_sg(c: &Codec) -> usize {
             return ov;
         }
     }
-    match c.format {
-        QuantFormat::GGUF_IQ4_NL | QuantFormat::GGUF_Q4_0 | QuantFormat::GGUF_IQ2_M => 4,
-        _ => 2,
-    }
+    // Conservative default 2 until a format wins >= 6/7 ABBA rounds with worst_ratio > 1.0:
+    // match c.format {
+    //     QuantFormat::GGUF_IQ4_NL | QuantFormat::GGUF_Q4_0 | QuantFormat::GGUF_IQ2_M => 4,
+    //     _ => 2,
+    // }
+    2
 }
 /// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
 static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
@@ -1040,10 +1042,11 @@ mod tests {
         super::TEST_ROWS_PER_SG.set(0);
         for f in crate::graph::codec::formats() {
             let c = crate::graph::codec::codec(f).expect("codec");
-            let want_r = match f {
-                Q::GGUF_IQ4_NL | Q::GGUF_Q4_0 | Q::GGUF_IQ2_M => 4,
-                _ => 2,
-            };
+            // let want_r = match f {
+            //     Q::GGUF_IQ4_NL | Q::GGUF_Q4_0 | Q::GGUF_IQ2_M => 4,
+            //     _ => 2,
+            // };
+            let want_r = 2;
             assert_eq!(super::moe_rows_per_sg(c), want_r, "{f:?}");
         }
         for r in [2usize, 4usize] {
@@ -1515,10 +1518,11 @@ mod tests {
                         .unwrap();
                 }
             }
-            let mut r2_rounds = Vec::with_capacity(3);
-            let mut r4_rounds = Vec::with_capacity(3);
+            let mut r2_rounds = Vec::with_capacity(7);
+            let mut r4_rounds = Vec::with_capacity(7);
             let mut r4_wins = 0usize;
-            for _round in 0..3 {
+            let mut worst_round_ratio = f64::INFINITY;
+            for _round in 0..7 {
                 let mut r2_sum = 0.0;
                 let mut r4_sum = 0.0;
                 for r in [2usize, 4, 4, 2] {
@@ -1538,18 +1542,19 @@ mod tests {
                 if r4_sum < r2_sum {
                     r4_wins += 1;
                 }
+                worst_round_ratio = worst_round_ratio.min(r2_sum / r4_sum);
                 r2_rounds.push(r2_sum);
                 r4_rounds.push(r4_sum);
             }
             super::TEST_ROWS_PER_SG.set(0);
             r2_rounds.sort_by(|a, b| a.total_cmp(b));
             r4_rounds.sort_by(|a, b| a.total_cmp(b));
-            let (r2_s, r4_s) = (r2_rounds[1], r4_rounds[1]);
+            let (r2_s, r4_s) = (r2_rounds[3], r4_rounds[3]);
             let (r2_us, r4_us) = (r2_s * 1e6, r4_s * 1e6);
             let r2_gbps = routed_bytes as f64 / r2_s / 1e9;
             let r4_gbps = routed_bytes as f64 / r4_s / 1e9;
             println!(
-                "moe_gemv {f:?} {rows}x{cols}: r=2 med={r2_us:.1}us ({r2_gbps:.1} GB/s) vs r=4 med={r4_us:.1}us ({r4_gbps:.1} GB/s) [r4_wins={r4_wins}/3, ratio={:.4}]",
+                "moe_gemv {f:?} {rows}x{cols}: r=2 med={r2_us:.1}us ({r2_gbps:.1} GB/s) vs r=4 med={r4_us:.1}us ({r4_gbps:.1} GB/s) [r4_wins={r4_wins}/7, med_ratio={:.4}, worst_ratio={worst_round_ratio:.4}]",
                 r2_us / r4_us
             );
         }
@@ -1592,7 +1597,7 @@ mod tests {
         let real_msl = super::gemv_indexed(c, params);
         let stub_msl = real_msl.replace(
             "IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]",
-            "0x0808080808080808ul",
+            "as_type<ulong>(uint2(0x08080808u ^ ((q4 >> (8 * k)) & 0xFFu), 0x08080808u))",
         );
         assert_ne!(
             stub_msl, real_msl,
@@ -1621,9 +1626,9 @@ mod tests {
                     .unwrap();
             }
         }
-        let mut real_rounds = Vec::with_capacity(3);
-        let mut stub_rounds = Vec::with_capacity(3);
-        for _round in 0..3 {
+        let mut real_rounds = Vec::with_capacity(5);
+        let mut stub_rounds = Vec::with_capacity(5);
+        for _round in 0..5 {
             let mut real_sum = 0.0;
             let mut stub_sum = 0.0;
             for is_stub in [false, true, true, false] {
@@ -1648,12 +1653,13 @@ mod tests {
         super::TEST_ROWS_PER_SG.set(0);
         real_rounds.sort_by(|a, b| a.total_cmp(b));
         stub_rounds.sort_by(|a, b| a.total_cmp(b));
-        let (real_s, stub_s) = (real_rounds[1], stub_rounds[1]);
-        let (real_us, stub_us) = (real_s * 1e6, stub_s * 1e6);
+        let (real_s, stub_s) = (real_rounds[2], stub_rounds[2]);
+        let (real_med_us, live_q4_no_lut_med_us) = (real_s * 1e6, stub_s * 1e6);
+        let lut_cost_us = real_med_us - live_q4_no_lut_med_us;
         let real_gbps = routed_bytes as f64 / real_s / 1e9;
         let stub_gbps = routed_bytes as f64 / stub_s / 1e9;
         println!(
-            "iq2xxs_ablation 1408x2816: real={real_us:.1}us ({real_gbps:.1} GB/s) vs const_stub={stub_us:.1}us ({stub_gbps:.1} GB/s)"
+            "iq2xxs_ablation 1408x2816: real_med_us={real_med_us:.1}us ({real_gbps:.1} GB/s) vs live_q4_no_lut_med_us={live_q4_no_lut_med_us:.1}us ({stub_gbps:.1} GB/s) [lut_cost_us={lut_cost_us:.1}us]"
         );
     }
 }
