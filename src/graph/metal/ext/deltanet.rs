@@ -23,7 +23,7 @@ pub(super) const KERNELS: &[&str] = &[
 ];
 
 /// Threads per threadgroup and the kernel's fixed-size limits (`DN_*` in `deltanet.metal`).
-const THREADS: usize = 1024;
+pub(in super::super) const THREADS: usize = 1024;
 const MAX_KD: usize = 256;
 const MAX_VD: usize = 256;
 const MAX_RPT: usize = 16;

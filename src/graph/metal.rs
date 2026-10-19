@@ -7546,15 +7546,44 @@ mod tests {
     }
 
     /// Every kernel source this build emits compiles to a pipeline: the hand library as MSL 4.0
-    /// with MPP, each generated GEMV (`gen` and `gen64`) and dequant variant, each expert-GEMV grid
-    /// binding, and the fused GeGlu→GEMV chain. Compile only: nothing is dispatched and no
-    /// runtime (host-profile measurement) is created.
+    /// with MPP (each hand, group and MPP kernel as a pipeline with SIMD width 32 and at least the
+    /// threads its encoder dispatches), each generated GEMV (`gen` and `gen64`) and dequant variant,
+    /// each expert-GEMV grid binding, and the fused GeGlu→GEMV chain. Compile only: nothing is
+    /// dispatched and no runtime (host-profile measurement) is created.
     #[test]
     fn every_kernel_source_compiles() {
         use crate::graph::codegen::{self, GemvParams, Iq2Grid};
         let device = Device::system_default().expect("Metal device");
-        let (_, mpp) = compile(&device).expect("kernel library");
+        let (lib, mpp) = compile(&device).expect("kernel library");
         mpp.expect("MSL 4.0 kernel library");
+        // `Runtime::new` checks only the `TG` floor; the fused delta-rule step dispatches more.
+        let need = |name: &str| -> u64 {
+            if name.starts_with("deltanet_step_") {
+                ext::deltanet::THREADS as u64
+            } else {
+                TG
+            }
+        };
+        let check = |name: &str, pso: &ComputePipelineState| {
+            assert_eq!(pso.thread_execution_width(), 32, "{name}");
+            assert!(
+                pso.max_total_threads_per_threadgroup() >= need(name),
+                "{name}: at most {} threads per threadgroup",
+                pso.max_total_threads_per_threadgroup()
+            );
+        };
+        for name in BASE_KERNELS
+            .iter()
+            .copied()
+            .chain(ext::kernel_names())
+            .chain(MPP_KERNELS)
+        {
+            let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let pso = device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            check(name, &pso);
+        }
         let build = |src: &str, name: &str| {
             let opts = CompileOptions::new();
             opts.set_fast_math_enabled(false);
@@ -7562,9 +7591,10 @@ mod tests {
                 .new_library_with_source(src, &opts)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
-            device
+            let pso = device
                 .new_compute_pipeline_state_with_function(&f)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
+            check(name, &pso);
         };
         let head = "#include <metal_stdlib>\nusing namespace metal;\n";
         let common = codegen::gemv_common(&KERNELS_MSL);
@@ -7642,6 +7672,9 @@ mod tests {
             codec::codec(QuantFormat::GGUF_Q4_K_M).unwrap(),
         );
         build(&ext::ple::kernel_src(q4_0, q4_k), &ext::ple::kernel_name(q4_0, q4_k));
+        // TQ2_0's device source is the planar layout, the one codec outside `codec.msl`.
+        let tq2 = codec::codec(QuantFormat::GGUF_TQ2_0).unwrap();
+        build(&ext::ple::kernel_src(tq2, q4_k), &ext::ple::kernel_name(tq2, q4_k));
         for f in [QuantFormat::BF16, QuantFormat::FP16] {
             let c = ext::ple::codec_of(f).expect("pseudo-codec");
             build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
