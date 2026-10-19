@@ -46,6 +46,9 @@ pub struct GraphProgram {
     /// [`Self::run_greedy`]'s graph and plan, with the `valid` they were built for.
     #[cfg(target_os = "macos")]
     argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
+    /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
+    #[cfg(target_os = "macos")]
+    reshaped: Vec<(usize, Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
 }
 
 /// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
@@ -197,6 +200,8 @@ impl GraphProgram {
             graph_outputs,
             #[cfg(target_os = "macos")]
             argmax: None,
+            #[cfg(target_os = "macos")]
+            reshaped: Vec::new(),
         })
     }
 
@@ -292,7 +297,8 @@ impl GraphProgram {
     }
 
     /// Runs `graph` on the program's Metal segment inside the program's state: another row count of the
-    /// compiled network (same weight and state names), e.g. a batched prefill pass. The plan is built per call.
+    /// compiled network (same weight and state names), e.g. a batched prefill pass. Plans are cached by
+    /// the graph's node count and input shapes, which identify such a graph (prefill chunks repeat).
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
@@ -300,8 +306,25 @@ impl GraphProgram {
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(target_os = "macos")]
         if let [CompiledSegment::Metal { session, .. }] = self.segments.as_slice() {
-            let plan = session.prepare_plan(graph)?;
-            return session.run_prepared(graph, &plan, Some(&mut self.state), inputs);
+            let shapes: Vec<Vec<usize>> =
+                graph.inputs.iter().map(|&v| graph.value(v).shape.clone()).collect();
+            let n = graph.nodes.len();
+            let hit = self.reshaped.iter().position(|(c, s, _)| *c == n && *s == shapes);
+            // Least recently used first: a varying tail chunk must not evict the full chunk's plan.
+            let entry = match hit {
+                Some(i) => self.reshaped.remove(i),
+                None => {
+                    // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
+                    // their row counts more.
+                    if self.reshaped.len() == 4 {
+                        self.reshaped.remove(0);
+                    }
+                    (n, shapes, session.prepare_plan(graph)?)
+                }
+            };
+            self.reshaped.push(entry);
+            let plan = &self.reshaped[self.reshaped.len() - 1].2;
+            return session.run_prepared(graph, plan, Some(&mut self.state), inputs);
         }
         let _ = (graph, inputs);
         Err("run_reshaped: the program is not a single Metal segment".into())
@@ -657,6 +680,39 @@ mod tests {
             close(&run(&g, &w), &format!("{set:?}"));
         }
         assert!(changed, "no candidate changed the plan");
+    }
+
+    /// GPU: `run_reshaped` plans a row count once and reuses it; another row count gets its own plan.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "GPU: cargo test --lib run_reshaped_caches -- --ignored --test-threads=1"]
+    fn run_reshaped_caches_one_plan_per_shape() {
+        let (g, w) = two_linears();
+        let mut prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).unwrap();
+        let rows = |m: usize| {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![m, 4], DType::F32);
+            let w = g.weight("w", vec![4, 4], DType::F32);
+            let a = g.add("lin0", Op::Linear, &[x, w], vec![m, 4], DType::F32);
+            let b = g.add("lin1", Op::Linear, &[a, w], vec![m, 4], DType::F32);
+            g.output(b);
+            g
+        };
+        let x = |m: usize| vec![Tensor::F32((0..m * 4).map(|i| i as f32 * 0.25).collect())];
+        // Callers rebuild the graph per chunk: the second call's graph is a fresh, equal one.
+        let a = prog.run_reshaped(&rows(2), x(2)).unwrap();
+        let b = prog.run_reshaped(&rows(2), x(2)).unwrap();
+        assert_eq!(prog.reshaped.len(), 1);
+        assert_eq!(a[0].as_f32().unwrap(), b[0].as_f32().unwrap());
+        // 0.25 * i through two all-0.1 4x4 layers: every output of row r is 0.04 * (sum of its x).
+        let want: Vec<f32> = (0..2)
+            .flat_map(|r| [0.04 * (0..4).map(|c| (r * 4 + c) as f32 * 0.25).sum::<f32>(); 4])
+            .collect();
+        for (got, want) in a[0].as_f32().unwrap().iter().zip(&want) {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+        prog.run_reshaped(&rows(3), x(3)).unwrap();
+        assert_eq!(prog.reshaped.len(), 2);
     }
 
     #[test]

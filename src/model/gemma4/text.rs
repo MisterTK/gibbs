@@ -1553,7 +1553,8 @@ mod tests {
     fn qkv_fusion_keeps_node_order_of_moe_decode_graph() {
         let (g, mut w) = tiny_moe_decode_graph().unwrap();
         let mut fg = g.clone();
-        assert!(crate::graph::passes::fusion::fuse_qkv_pass(&mut fg, Some(&mut w)) > 0);
+        let qkv = crate::graph::egraph::Rule::Qkv;
+        assert!(crate::graph::egraph::fuse_rule(&mut fg, Some(&mut w), qkv) > 0);
         let names = |g: &crate::graph::Graph| -> Vec<String> {
             g.nodes.iter().map(|n| n.name.clone()).collect()
         };

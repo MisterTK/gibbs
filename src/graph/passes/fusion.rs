@@ -1,6 +1,6 @@
 //! Subgraph fusion optimization passes for Graph IR.
 
-use crate::graph::pattern::{any, capture, op_type, GraphRewriter, MatchContext, Pattern};
+use crate::graph::pattern::{GraphRewriter, MatchContext};
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
@@ -216,23 +216,9 @@ pub(crate) fn feeds_attention(g: &Graph, v: crate::graph::ValueId) -> bool {
     false
 }
 
-/// Fuses parallel Q, K, V linear projections branching from the same input into a single
-/// fused linear projection, followed by slices.
-///
-/// Reduces memory bandwidth by streaming input activations once instead of 3 times.
-pub fn fuse_qkv_pass(graph: &mut Graph, weights: Option<&mut Weights>) -> usize {
-    let mut pat = Pattern::new();
-    let root = pat.add_node(any());
-    let q = pat.add_node(capture("q", op_type("Linear")));
-    let k = pat.add_node(capture("k", op_type("Linear")));
-    let v = pat.add_node(capture("v", op_type("Linear")));
-    pat.add_branch(root, &[q, k, v]);
-
-    let matches = pat.search(graph);
-    rewrite_qkv(graph, &matches, weights)
-}
-
-/// Applies the QKV fusion to `matches` (captures `q`, `k`, `v`; `q` first in the fused weight).
+/// Fuses parallel Q, K, V linear projections of one input into one projection and slices (streams
+/// the activations once instead of 3 times): materializes the e-graph's chosen `matches` (captures
+/// `q`, `k`, `v`; `q` first in the fused weight).
 pub(crate) fn rewrite_qkv(
     graph: &mut Graph,
     matches: &[MatchContext],
@@ -370,21 +356,9 @@ pub(crate) fn rewrite_qkv(
     rewrites
 }
 
-/// Fuses Gate and Up linear projections branching into SwiGLU / GeGLU into a single
-/// fused linear projection.
-///
-/// Reduces memory bandwidth by streaming input activations once instead of twice.
-pub fn fuse_gate_up_pass(graph: &mut Graph, weights: Option<&mut Weights>) -> usize {
-    let mut pat = Pattern::new();
-    let gate = pat.add_node(capture("gate", op_type("Linear")));
-    let up = pat.add_node(capture("up", op_type("Linear")));
-    pat.add_shared_input(gate, up);
-
-    let matches = pat.search(graph);
-    rewrite_gate_up(graph, &matches, weights)
-}
-
-/// Applies the gate/up fusion to `matches` (captures `gate`, `up`; roles come from the GLU).
+/// Fuses the gate and up projections of a SwiGLU / GeGLU into one projection (streams the
+/// activations once instead of twice): materializes the e-graph's chosen `matches` (captures
+/// `gate`, `up`; roles come from the GLU).
 pub(crate) fn rewrite_gate_up(
     graph: &mut Graph,
     matches: &[MatchContext],
@@ -533,6 +507,7 @@ pub(crate) fn rewrite_gate_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::egraph::{fuse_rule, Rule};
     use crate::graph::pattern::validate_ssa;
 
     #[test]
@@ -565,7 +540,7 @@ mod tests {
         weights.insert("w_k", Tensor::F32(vec![2.0; 32 * 64]));
         weights.insert("w_v", Tensor::F32(vec![3.0; 32 * 64]));
 
-        let rewrites = fuse_qkv_pass(&mut g, Some(&mut weights));
+        let rewrites = fuse_rule(&mut g, Some(&mut weights), Rule::Qkv);
         assert_eq!(rewrites, 1);
         assert!(validate_ssa(&g).is_ok());
 
@@ -593,7 +568,7 @@ mod tests {
         weights.insert("w_g", Tensor::F32(vec![0.5; 128 * 64]));
         weights.insert("w_u", Tensor::F32(vec![0.75; 128 * 64]));
 
-        let rewrites = fuse_gate_up_pass(&mut g, Some(&mut weights));
+        let rewrites = fuse_rule(&mut g, Some(&mut weights), Rule::GateUp);
         assert_eq!(rewrites, 1);
         assert!(validate_ssa(&g).is_ok());
         assert!(weights.get("gate_fused_gate_up_w").is_some());
@@ -664,8 +639,8 @@ mod tests {
         // 2. Run passes
         let mut opt_g = g.clone();
         let mut opt_w = weights.clone();
-        let qkv_rewrites = fuse_qkv_pass(&mut opt_g, Some(&mut opt_w));
-        let glu_rewrites = fuse_gate_up_pass(&mut opt_g, Some(&mut opt_w));
+        let qkv_rewrites = fuse_rule(&mut opt_g, Some(&mut opt_w), Rule::Qkv);
+        let glu_rewrites = fuse_rule(&mut opt_g, Some(&mut opt_w), Rule::GateUp);
         assert_eq!(qkv_rewrites, 1);
         assert_eq!(glu_rewrites, 1);
         assert!(validate_ssa(&opt_g).is_ok());
@@ -785,14 +760,14 @@ mod tests {
         Tensor::Mat(Mat::from_packed(p, rows, cols))
     }
 
-    /// Runs `fuse_qkv_pass`, checks CPU parity with the unfused graph, and returns the names of
+    /// Runs the QKV rule, checks CPU parity with the unfused graph, and returns the names of
     /// the remaining Linear nodes.
     fn fuse_and_check(dts: [DType; 3]) -> Vec<String> {
         use crate::graph::cpu::run_stateless;
         let (g, w, input) = qkv_graph(dts, true);
         let base = run_stateless(&g, &w, input.clone()).unwrap();
         let (mut fg, mut fw) = (g.clone(), w.clone());
-        assert_eq!(fuse_qkv_pass(&mut fg, Some(&mut fw)), 1);
+        assert_eq!(fuse_rule(&mut fg, Some(&mut fw), Rule::Qkv), 1);
         assert!(validate_ssa(&fg).is_ok());
         let fused = run_stateless(&fg, &fw, input).unwrap();
         assert_eq!(base.len(), fused.len());
@@ -816,10 +791,10 @@ mod tests {
         assert_eq!(fuse_and_check([f, h, h]), ["k.fused_kv", "q"]);
         // Same-format pair not adjacent in q|k|v order: nothing to fuse.
         let (mut g, mut w, _) = qkv_graph([h, f, h], true);
-        assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 0);
+        assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0);
         // Mixed-format trio that feeds no attention (router, side projections): left alone.
         let (mut g, mut w, _) = qkv_graph([h, h, f], false);
-        assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 0);
+        assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0);
     }
 
     #[test]
@@ -836,7 +811,7 @@ mod tests {
         assert_eq!(fuse_and_check([k4, k4, q4]), ["q.fused_qk", "v"]);
         // The fused weight is one packed Mat of the shared format and replaces its parts.
         let (mut g, mut w, _) = qkv_graph([k4, k4, q4], true);
-        assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 1);
+        assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 1);
         assert!(w.get("w_q").is_none() && w.get("w_k").is_none() && w.get("w_v").is_some());
         let Some(Tensor::Mat(m)) = w.get("q_fused_qk_w") else {
             panic!("fused weight is not a Mat");
@@ -846,11 +821,11 @@ mod tests {
     }
 }
 
-/// Fuses QKV slices and RoPE directly into CachedAttention, eliminating intermediate Slice and RoPE nodes.
-/// `only` restricts the rewrite to those attention nodes.
+/// Fuses QKV slices and RoPE directly into CachedAttention, eliminating intermediate Slice and RoPE
+/// nodes: materializes the e-graph's choice for the `only` attention nodes.
 pub fn fuse_qkv_slices_and_attn_pass(
     graph: &mut Graph,
-    only: Option<&std::collections::HashSet<crate::graph::NodeId>>,
+    only: &std::collections::HashSet<crate::graph::NodeId>,
 ) -> usize {
     let mut rewrites = 0;
     let mut eliminated_nodes: std::collections::HashSet<crate::graph::NodeId> =
@@ -868,7 +843,7 @@ pub fn fuse_qkv_slices_and_attn_pass(
     for i in 0..n_nodes {
         let nid = crate::graph::NodeId(i as u32);
         let node = graph.node(nid);
-        if only.is_some_and(|s| !s.contains(&nid)) {
+        if !only.contains(&nid) {
             continue;
         }
         if let crate::graph::Op::CachedAttention { .. } = &node.op {

@@ -206,7 +206,7 @@ mod tests {
 
     fn planned(g: &Graph) -> (Vec<Planned>, HashMap<ValueId, (ValueId, usize)>) {
         let (steps, mut aliases) = plan(g).unwrap();
-        let mut steps = batch_horizontal(steps, &aliases);
+        let mut steps = batch_horizontal(steps, &aliases).unwrap();
         elide(g, &mut steps, &mut aliases);
         (steps, aliases)
     }

@@ -1,10 +1,9 @@
-//! Equality-saturation fusion (research sprint 3, phase 3, stage 1; opt-in via `GIBBS_EGRAPH=1`).
-//!
-//! The graph-level fusions of [`crate::graph::passes`] (megakernel MLP, gate/up, QKV, and the
-//! QKV-slices→attention rewrite) as non-destructive egglog rules. Every fused form is unioned
-//! into the e-class of the value it computes, so the unfused forms stay available, and one
+//! Equality-saturation fusion: the graph-level fusions (megakernel MLP, gate/up, QKV, and the
+//! opt-in QKV-slices→attention rewrite) as non-destructive egglog rules. Every fused form is
+//! unioned into the e-class of the value it computes, so the unfused forms stay available, and one
 //! extraction picks a consistent set of fusions with a cost model. The chosen fusions are then
-//! materialized by the passes' own rewriters (same node layout, same `concat_weight_tensors`).
+//! materialized by the rewriters in [`crate::graph::passes`] (`fuse_mlp_blocks`, `rewrite_gate_up`,
+//! `rewrite_qkv`, `fuse_qkv_slices_and_attn_pass`), restricted to the extracted members.
 //!
 //! * **Encoding.** Every value is an e-class named `(V value-id)` (no global `let`s: they
 //!   dominate parse time on model graphs); a node's class also holds `(Node node-id args)`.
@@ -29,23 +28,19 @@
 //!   switches its member classes together; groups are tried greedily by cost delta (ties: lowest
 //!   member node ids, the passes' match order) and kept when the DAG gets cheaper.
 //!
-//! # Stage 2 (after the other sprint-3 tracks merge)
-//! Planner fusions become rules over fused constructors that lower 1:1 to planner steps:
-//! `RmsNorm`+`Add` → `(AddRmsNorm ..)`; batched norms/ropes → `(RmsNormBatch L)` /
-//! `(RopeBatch L)` built from a commutation rule over independent siblings (replacing the
-//! explicit reorder in `batch_horizontal`); `GemvPackedPair` → `(GemvPair a b)` over two `Lin`s
-//! sharing `x`; MoE → `(TopKSoftmax ..)`, `(SplitGlu ..)`, `(WeightedSum ..)`; RoPE→attention →
-//! `Rewired` over `Slice`s of the QKV `Lin` (today's `qkv-slices-attn` matches only original
-//! `Slice` nodes); PLE/DeltaNet/QKV-pair/view fusions likewise. The planner then reads the
-//! extracted constructors instead of matching greedily, and the destructive passes plus the
-//! greedy matchers (`plan`, `batch_horizontal`, `fuse_moe_subgraphs`) are deleted. The `Uses`
-//! guards then go too: extraction already prices a fused value whose parts stay live.
+//! # Planner fusions
+//! The Metal planner's fusions are rules too ([`crate::graph::metal`]'s `fuse` module, and the
+//! `ple`/`deltanet` groups): GEMV epilogues, RmsNorm residual/scale/RoPE, attention q/k RoPE,
+//! horizontal batching, MoE, PLE and DeltaNet chains are extracted from saturated node/step facts
+//! and only lowered by the planner. Allocation-dependent rewrites stay planner post-passes: the
+//! zero-copy views (`views::elide`) and the GEMV pairing (`pair_small_hand_gemvs`, which needs
+//! arena offsets and tuned variants).
 
 use crate::graph::passes::{fusion, megakernel};
 use crate::graph::pattern::MatchContext;
 use crate::graph::{DType, Graph, NodeId, Op, Tensor, ValueId, ValueKind, Weights};
 use egglog::scheduler::{Matches, Scheduler};
-use egglog::{EGraph, Value};
+use egglog::{EGraph, Value, Write as _};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::time::Instant;
@@ -87,13 +82,13 @@ const SCHEMA: &str = r#"
 /// One ported fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
-    /// `megakernel::fuse_mlp_blocks`.
+    /// `RmsNorm -> gate/up -> GLU -> down -> Add` → one `Megakernel` MLP node.
     MegakernelMlp,
-    /// `fusion::fuse_gate_up_pass`.
+    /// Gate and up Linears of one GLU → one Linear over the concatenated weight.
     GateUp,
-    /// `fusion::fuse_qkv_pass`.
+    /// Q, K, V Linears of one input → one Linear (or the same-format pair of them).
     Qkv,
-    /// `fusion::fuse_qkv_slices_and_attn_pass` (not in the pass pipeline).
+    /// QKV slices and RoPE folded into CachedAttention (not in [`DEFAULT_RULES`]).
     QkvSlicesAttn,
 }
 
@@ -384,82 +379,92 @@ fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<(String, 
     Some((format!("{:?}/{cols}/{storage}", val.dtype), mat))
 }
 
-/// The egglog facts of `g` (schema and rules excluded).
-fn encode(g: &Graph, weights: Option<&Weights>) -> Result<String, String> {
+/// Inserts the facts of `g` into `eg` (schema and rules already declared) through the row API:
+/// parsing an equivalent program costs several times the saturation on model graphs.
+fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), String> {
     let mut uses = vec![0i64; g.values.len()];
-    for n in &g.nodes {
-        for i in &n.inputs {
-            uses[i.0 as usize] += 1;
-        }
-    }
-    let mut p = String::with_capacity(g.nodes.len() * 256);
     let mut declared = vec![false; g.values.len()];
-    let mut w_declared = vec![false; g.values.len()];
-    for (id, n) in g.nodes.iter().enumerate() {
-        let [out] = n.outputs[..] else {
+    for n in &g.nodes {
+        if n.outputs.len() != 1 {
             return Err(format!(
                 "egraph: node {} has {} outputs",
                 n.name,
                 n.outputs.len()
             ));
-        };
-        let mut args = String::new();
+        }
         for &v in &n.inputs {
-            let vi = v.0 as usize;
-            if !declared[vi] {
-                if matches!(g.value(v).kind, ValueKind::Node(_)) {
-                    return Err(format!(
-                        "egraph: node {} reads {} before it is produced",
-                        n.name, v.0
-                    ));
-                }
-                declared[vi] = true;
-                if rows(&g.value(v).shape) == 1 {
-                    let _ = writeln!(p, "(OneRow (V {vi}))");
-                }
-                if megakernel::fusible_weight(g, v) {
-                    let _ = writeln!(p, "(MkW (V {vi}))");
-                }
+            if !declared[v.0 as usize] && matches!(g.value(v).kind, ValueKind::Node(_)) {
+                return Err(format!(
+                    "egraph: node {} reads {} before it is produced",
+                    n.name, v.0
+                ));
             }
-            let _ = write!(args, "(Cons (V {vi}) ");
+            uses[v.0 as usize] += 1;
         }
-        args.push_str("(Nil)");
-        args.push_str(&")".repeat(n.inputs.len()));
-        let o = out.0 as usize;
-        declared[o] = true;
-        let _ = writeln!(p, "(union (V {o}) (Node {id} {args}))");
-        let _ = writeln!(p, "(K {id} \"{}\")", n.op.name());
-        if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
-            let _ = writeln!(p, "(K {id} \"Glu\")");
-        }
-        let _ = writeln!(p, "(set (Uses (V {o})) {})", uses[o]);
-        if rows(&g.value(out).shape) == 1 {
-            let _ = writeln!(p, "(OneRow (V {o}))");
-        }
-        if let (Op::Linear, [x, w]) = (&n.op, &n.inputs[..]) {
-            if let Some((key, mat)) = cat_key(g, *w, weights) {
-                let wi = w.0 as usize;
-                if !w_declared[wi] {
-                    w_declared[wi] = true;
-                    let _ = writeln!(
-                        p,
-                        "(set (wrows (Wt {wi})) {}) (set (wkey (Wt {wi})) \"{key}\") \
-                         (set (wdt (Wt {wi})) \"{:?}\") (QkvIn (Wt {wi}))",
-                        g.value(*w).shape[0],
-                        g.value(*w).dtype
-                    );
-                    if !mat {
-                        let _ = writeln!(p, "(GuOk (Wt {wi}))");
+        declared[n.outputs[0].0 as usize] = true;
+    }
+    eg.update(|mut fs| -> Result<(), egglog::Error> {
+        let mut seen = vec![false; g.values.len()];
+        let mut w_seen = vec![false; g.values.len()];
+        for (id, n) in g.nodes.iter().enumerate() {
+            let id = id as i64;
+            let mut args = Vec::with_capacity(n.inputs.len());
+            for &v in &n.inputs {
+                let vi = v.0 as usize;
+                let c = fs.add("V", vi as i64)?;
+                if !seen[vi] {
+                    seen[vi] = true;
+                    if rows(&g.value(v).shape) == 1 {
+                        fs.add("OneRow", c)?;
+                    }
+                    if megakernel::fusible_weight(g, v) {
+                        fs.add("MkW", c)?;
                     }
                 }
-                let _ = writeln!(p, "(union (V {o}) (Lin {id} (V {}) (Wt {wi})))", x.0);
-                if fusion::feeds_attention(g, out) {
-                    let _ = writeln!(p, "(FeedsAttn (V {o}))");
+                args.push(c);
+            }
+            let mut list = fs.add("Nil", egglog::api::RawValues(Vec::new()))?;
+            for &c in args.iter().rev() {
+                list = fs.add("Cons", (c, list))?;
+            }
+            let out = n.outputs[0];
+            let o = fs.add("V", out.0 as i64)?;
+            seen[out.0 as usize] = true;
+            let node = fs.add("Node", (id, list))?;
+            fs.union(o, node)?;
+            fs.add("K", (id, n.op.name()))?;
+            if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
+                fs.add("K", (id, "Glu"))?;
+            }
+            fs.set("Uses", o, uses[out.0 as usize])?;
+            if rows(&g.value(out).shape) == 1 {
+                fs.add("OneRow", o)?;
+            }
+            if let (Op::Linear, [_, w]) = (&n.op, &n.inputs[..]) {
+                if let Some((key, mat)) = cat_key(g, *w, weights) {
+                    let wi = w.0 as usize;
+                    let wt = fs.add("Wt", wi as i64)?;
+                    if !w_seen[wi] {
+                        w_seen[wi] = true;
+                        fs.set("wrows", wt, g.value(*w).shape[0] as i64)?;
+                        fs.set("wkey", wt, key)?;
+                        fs.set("wdt", wt, format!("{:?}", g.value(*w).dtype))?;
+                        fs.add("QkvIn", wt)?;
+                        if !mat {
+                            fs.add("GuOk", wt)?;
+                        }
+                    }
+                    let lin = fs.add("Lin", (id, args[0], wt))?;
+                    fs.union(o, lin)?;
+                    if fusion::feeds_attention(g, out) {
+                        fs.add("FeedsAttn", o)?;
+                    }
                 }
             }
         }
-    }
-    Ok(p)
+        Ok(())
+    })
+    .map_err(|e| format!("egraph: {e}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,6 +679,19 @@ pub fn fuse(
     Fusion::new(graph, weights.as_deref(), rules, cost, budget)?.apply(graph, weights, &[])
 }
 
+/// `rule` alone with constant costs (tests of one fusion): how many it applied.
+#[cfg(test)]
+pub(crate) fn fuse_rule(graph: &mut Graph, weights: Option<&mut Weights>, rule: Rule) -> usize {
+    let r = fuse(
+        graph,
+        weights,
+        &[rule],
+        &CostModel::constants(),
+        Budget::default(),
+    );
+    r.expect("egraph fusion").applied[rule as usize]
+}
+
 impl Fusion {
     /// Encodes, saturates and extracts `g` (`weights` decide which concatenations are possible).
     pub fn new(
@@ -713,8 +731,8 @@ impl Fusion {
         for r in rules {
             program.push_str(r.text());
         }
-        program.push_str(&encode(g, weights)?);
         eg.parse_and_run_program(None, &program).map_err(err)?;
+        encode(&mut eg, g, weights)?;
         report.encode_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let t = Instant::now();
@@ -1181,7 +1199,7 @@ impl Fusion {
         report.applied = [0; 4];
         if !mlp_adds.is_empty() {
             let s = only(graph, &mlp_adds);
-            report.applied[0] = megakernel::fuse_mlp_blocks(graph, Some(&s));
+            report.applied[0] = megakernel::fuse_mlp_blocks(graph, &s);
         }
         let ms = contexts(graph, &gate_up, &["gate", "up"]);
         report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
@@ -1189,7 +1207,7 @@ impl Fusion {
         report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
         if !attn.is_empty() {
             let s = only(graph, &attn);
-            report.applied[3] = fusion::fuse_qkv_slices_and_attn_pass(graph, Some(&s));
+            report.applied[3] = fusion::fuse_qkv_slices_and_attn_pass(graph, &s);
         }
         report.decode_ms = t.elapsed().as_secs_f64() * 1e3;
         if report.applied != want {
@@ -1212,7 +1230,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::graph::passes::{canonical, decompose, dtype_adapt};
-    use std::hash::{DefaultHasher, Hash, Hasher};
 
     type Gw = (Graph, Weights);
 
@@ -1222,21 +1239,6 @@ mod tests {
         dtype_adapt::run(g);
     }
 
-    /// The shipped pass pipeline (`GIBBS_EGRAPH` unset, so `run_optimization_passes` runs the passes).
-    fn run_passes((g, w): &mut Gw) {
-        assert!(
-            std::env::var_os("GIBBS_EGRAPH").is_none(),
-            "the reference pipeline must not be the e-graph"
-        );
-        crate::graph::passes::run_optimization_passes(g, Some(w)).expect("pass pipeline");
-    }
-
-    fn by_passes(gw: &Gw) -> Gw {
-        let mut gw = gw.clone();
-        run_passes(&mut gw);
-        gw
-    }
-
     fn by_egraph((mut g, mut w): Gw, rules: &[Rule], cost: &CostModel) -> (Gw, Report) {
         prep(&mut g);
         let r = fuse(&mut g, Some(&mut w), rules, cost, Budget::default()).expect("egraph fusion");
@@ -1244,66 +1246,28 @@ mod tests {
         ((g, w), r)
     }
 
-    /// Sorted node signatures and output signatures: op, shape, dtype, layout and input structure,
-    /// without node ids or node names (leaves by kind and name).
-    fn signatures(g: &Graph) -> (Vec<u64>, Vec<u64>) {
-        let leaf = |v: ValueId| {
-            let val = g.value(v);
-            let mut h = DefaultHasher::new();
-            format!("{:?}{}{:?}{:?}", val.kind, val.name, val.shape, val.dtype).hash(&mut h);
-            h.finish()
-        };
-        let mut memo: HashMap<ValueId, u64> = HashMap::new();
-        let mut nodes = Vec::with_capacity(g.nodes.len());
-        for n in &g.nodes {
-            let mut h = DefaultHasher::new();
-            format!("{:?}", n.op).hash(&mut h);
-            for i in &n.inputs {
-                memo.get(i)
-                    .copied()
-                    .unwrap_or_else(|| leaf(*i))
-                    .hash(&mut h);
-            }
-            let out = g.value(n.outputs[0]);
-            format!("{:?}{:?}{:?}", out.shape, out.dtype, out.layout).hash(&mut h);
-            let s = h.finish();
-            memo.insert(n.outputs[0], s);
-            nodes.push(s);
-        }
-        nodes.sort_unstable();
-        let outs = g
-            .outputs
-            .iter()
-            .map(|o| memo.get(o).copied().unwrap_or_else(|| leaf(*o)))
-            .collect();
-        (nodes, outs)
-    }
-
-    fn assert_same(what: &str, a: &Gw, b: &Gw) {
-        assert_eq!(a.0.nodes.len(), b.0.nodes.len(), "{what}: node count");
-        assert!(
-            signatures(&a.0) == signatures(&b.0),
-            "{what}: graph structure differs"
-        );
-        let names = |w: &Weights| {
-            let mut v: Vec<String> = w.iter().map(|(n, _)| n.to_owned()).collect();
-            v.sort_unstable();
-            v
-        };
-        assert_eq!(names(&a.1), names(&b.1), "{what}: weight names");
-        for (n, t) in a.1.iter() {
-            assert!(b.1.get(n) == Some(t), "{what}: weight {n} differs");
-        }
-    }
-
-    fn check(what: &str, gw: &Gw) -> Report {
-        let want = by_passes(gw);
+    /// The default rules with constant costs; `golden` is the [`digest`] of the result, recorded
+    /// from the destructive passes these rules replaced (stage 1 asserted equality with them).
+    fn check(what: &str, gw: &Gw, golden: u64) -> Report {
         let (got, r) = by_egraph(gw.clone(), DEFAULT_RULES, &CostModel::constants());
-        assert_same(what, &want, &got);
-        // Same rewriters in the same order: even the node order matches.
-        let order = |g: &Graph| g.nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
-        assert_eq!(order(&want.0), order(&got.0), "{what}: node order");
+        assert_eq!(
+            digest(&got),
+            golden,
+            "{what}: fused graph differs from its golden"
+        );
         r
+    }
+
+    /// Node order, structure, values and weights of a fused graph (a golden for the fusions).
+    fn digest((g, w): &Gw) -> u64 {
+        use std::fmt::Write as _;
+        let mut s = format!("{:?}|{:?}|{:?}|", g.nodes, g.values, g.outputs);
+        let mut names: Vec<&str> = w.iter().map(|(n, _)| n).collect();
+        names.sort_unstable();
+        for n in names {
+            let _ = write!(s, "{n}:{:?};", w.get(n));
+        }
+        fnv1a(s.as_bytes())
     }
 
     struct B {
@@ -1389,25 +1353,33 @@ mod tests {
     }
 
     #[test]
-    fn megakernel_mlp_and_qkv_match_passes() {
-        let r = check("layer", &layer(1, false, false, false));
+    fn megakernel_mlp_and_qkv_fuse() {
+        let r = check("layer", &layer(1, false, false, false), 0xc6f5c97096765749);
         assert_eq!(r.applied, [1, 0, 1, 0]);
-        let r = check("post-norm, swapped add", &layer(1, true, true, false));
+        let r = check(
+            "post-norm, swapped",
+            &layer(1, true, true, false),
+            0x548dc4df19e94c99,
+        );
         assert_eq!(r.applied, [1, 0, 1, 0]);
-        let r = check("geglu", &layer(1, false, true, true));
+        let r = check("geglu", &layer(1, false, true, true), 0xd9052cf30bd86222);
         assert_eq!(r.applied, [1, 0, 1, 0]);
     }
 
     #[test]
-    fn gate_up_matches_passes_when_megakernel_refuses() {
+    fn gate_up_fuses_when_megakernel_refuses() {
         // Two rows: the megakernel is a one-row chain, so gate/up and QKV fuse instead.
-        let r = check("two rows", &layer(2, false, false, false));
+        let r = check(
+            "two rows",
+            &layer(2, false, false, false),
+            0xaf6a40bde60528f7,
+        );
         assert_eq!(r.applied, [0, 1, 1, 0]);
     }
 
     #[test]
-    fn qkv_picks_the_passes_triple_among_four_linears() {
-        // `b` has another dtype: the pass rejects (a,b,c) and (a,b,d) and fuses (a,c,d).
+    fn qkv_picks_the_first_compatible_triple_among_four_linears() {
+        // `b` has another dtype: (a,b,c) and (a,b,d) are rejected and (a,c,d) fuses.
         let mut b = B::new();
         let x = b.g.input("x", vec![1, 64], DType::F32);
         let n = b.norm("n", x);
@@ -1420,10 +1392,10 @@ mod tests {
         for o in outs {
             b.g.output(o);
         }
-        let r = check("four linears", &b.done());
+        let r = check("four linears", &b.done(), 0x566dfadfc7c6bb6d);
         assert_eq!(r.applied, [0, 0, 1, 0]);
 
-        // Five same-dtype linears: the lowest triple wins, as in the pass's match order.
+        // Five same-dtype linears: the lowest triple wins.
         let mut b = B::new();
         let x = b.g.input("x", vec![1, 64], DType::F32);
         let n = b.norm("n", x);
@@ -1431,12 +1403,12 @@ mod tests {
             let o = b.lin(&format!("l{i}"), n, 16 * (i + 1));
             b.g.output(o);
         }
-        let r = check("five linears", &b.done());
+        let r = check("five linears", &b.done(), 0x951cf9bcebed410d);
         assert_eq!(r.applied, [0, 0, 1, 0]);
     }
 
     #[test]
-    fn parallel_block_fuses_gate_up_then_qkv_like_passes() {
+    fn parallel_block_fuses_gate_up_then_qkv() {
         // One norm feeds q, k, v, gate and up (parallel attention + MLP), two rows.
         let mut b = B::new();
         let x = b.g.input("x", vec![2, 64], DType::F32);
@@ -1450,7 +1422,7 @@ mod tests {
         for o in [q, k, v, m] {
             b.g.output(o);
         }
-        let r = check("parallel", &b.done());
+        let r = check("parallel", &b.done(), 0xff392cdb64415b10);
         assert_eq!(r.applied, [0, 1, 1, 0]);
     }
 
@@ -1509,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn qkv_slices_attn_matches_its_pass() {
+    fn qkv_slices_attn_fuses() {
         let mut b = B::new();
         let x = b.g.input("x", vec![1, 64], DType::F32);
         let pos = b.g.input("pos", vec![1], DType::U32);
@@ -1548,16 +1520,13 @@ mod tests {
         b.g.output(a);
         let gw = b.done();
 
-        let mut want = gw.clone();
-        prep(&mut want.0);
-        assert_eq!(fusion::fuse_qkv_slices_and_attn_pass(&mut want.0, None), 1);
         let (got, r) = by_egraph(gw, &[Rule::QkvSlicesAttn], &CostModel::constants());
         assert_eq!(r.applied, [0, 0, 0, 1]);
-        assert_same("qkv slices attn", &want, &got);
+        assert_eq!(digest(&got), 0x80577259c0881959, "qkv slices attn: golden");
     }
 
     #[test]
-    fn synthetic_models_match_passes() {
+    fn synthetic_models_match_goldens() {
         let models: Vec<(&str, Gw)> = vec![
             (
                 "dense decoder (4 layers)",
@@ -1590,15 +1559,15 @@ mod tests {
             ),
         ];
         let want = [
-            [4, 0, 4, 0],
-            [0; 4],
-            [1, 0, 1, 0],
-            [0, 0, 2, 0],
-            [2, 0, 2, 0],
-            [0, 0, 4, 0],
+            ([4, 0, 4, 0], 0x0f6c66a3986ad984),
+            ([0; 4], 0x6091321c90c7fe27),
+            ([1, 0, 1, 0], 0xd21669a62ae9e3a2),
+            ([0, 0, 2, 0], 0x27bf67be1fb7a3c8),
+            ([2, 0, 2, 0], 0x8c650215e399b6fa),
+            ([0, 0, 4, 0], 0xa9fb4095114906dc),
         ];
-        for ((what, gw), want) in models.iter().zip(want) {
-            let r = check(what, gw);
+        for ((what, gw), (want, golden)) in models.iter().zip(want) {
+            let r = check(what, gw, golden);
             println!("{what}: {} nodes, {r:?}", gw.0.nodes.len());
             assert_eq!(r.applied, want, "{what}: fusions applied");
         }
@@ -1608,7 +1577,7 @@ mod tests {
     /// suite's Llama-3.2-1B Q4_0 in the HF cache). Run with `--ignored --nocapture`.
     #[test]
     #[ignore = "loads real checkpoints (GIBBS_EGRAPH_MODELS)"]
-    fn real_models_match_passes() {
+    fn real_models_fuse() {
         let hub =
             std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub");
         let paths: Vec<std::path::PathBuf> = match std::env::var("GIBBS_EGRAPH_MODELS") {
@@ -1639,21 +1608,13 @@ mod tests {
                 .to_decode_graph(),
             };
             let nodes = gw.0.nodes.len();
-            let mut want = gw.clone();
-            let t = Instant::now();
-            run_passes(&mut want);
-            let pass_ms = t.elapsed().as_secs_f64() * 1e3;
             // The shipped configuration: rates from the tune cache when present.
-            let (got, r) = by_egraph(gw, DEFAULT_RULES, &CostModel::from_tune_cache());
-            assert_same(&p.display().to_string(), &want, &got);
-            let order = |g: &Graph| g.nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
+            let (_, r) = by_egraph(gw, DEFAULT_RULES, &CostModel::from_tune_cache());
             println!(
-                "{} ({arch}): {} nodes, applied {:?}, same node order: {}; egraph compile {:.1} ms \
-                 (encode {:.1} + saturate {:.1} + extract {:.1}), decode {:.1} ms; passes {pass_ms:.1} ms; {r:?}",
+                "{} ({arch}): {nodes} nodes, applied {:?}; egraph compile {:.1} ms \
+                 (encode {:.1} + saturate {:.1} + extract {:.1}), decode {:.1} ms; {r:?}",
                 p.file_name().unwrap().to_string_lossy(),
-                nodes,
                 r.applied,
-                order(&want.0) == order(&got.0),
                 r.compile_ms(),
                 r.encode_ms,
                 r.saturate_ms,

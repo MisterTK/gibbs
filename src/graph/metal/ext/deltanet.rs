@@ -10,7 +10,7 @@
 
 use super::super::{fusion_policy, numel, set_bytes, FusionPolicy, Planned, Session};
 use super::{Enc, ExtStep};
-use crate::graph::{BinaryKind, Graph, Node, Op, UnaryKind, ValueId, ValueKind};
+use crate::graph::{BinaryKind, Graph, Op, UnaryKind, ValueId, ValueKind};
 use metal::MTLSize;
 use std::collections::HashMap;
 
@@ -143,12 +143,7 @@ pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), 
     }
     let step_of: HashMap<ValueId, usize> =
         steps.iter().enumerate().map(|(i, s)| (s.out, i)).collect();
-    let mut found = Vec::new();
-    for di in 0..steps.len() {
-        if let Some(m) = match_chain(g, steps, di, &readers, &step_of, *STATE_DTYPE) {
-            found.push(m);
-        }
-    }
+    let found = chains(g, steps, &readers, &step_of, *STATE_DTYPE)?;
     let mut drop = Vec::new();
     for (at, rm, st) in found {
         // `rm[0]` is the DeltaRule step: profiles and plan dumps show the fused step under its name.
@@ -182,222 +177,314 @@ fn check_state_dtype(steps: &[Planned], dtype: StateDtype) -> Result<(), String>
     }
 }
 
-/// Matches the chain around the `DeltaRule` step `di`: `(index of its last step, other step indices
-/// starting with `di`, step)`.
-fn match_chain(
+/// The `deltanet-chain` rules. Facts are value / node / step ids: `DR` a decode `DeltaRule` step
+/// with a state and a kernel layout, `Sl` a last-axis Slice, `Un`/`Bi` one/two-input SiLU(1),
+/// Sigmoid(2), Softplus(3) / Mul(1), Add(2) nodes, `Cv` a cached causal conv, `Rn` an RmsNorm with
+/// gamma, `Own n i` step `i` lowering exactly node `n`, `Single v`/`OnlyR v n` one reader node and not
+/// a graph output. `Dn` is the fixed part of a chain; `DnB`/`DnL`/`DnD`/`DnZ` are the alternatives
+/// for beta, log_decay, dt_bias and the gate.
+const PROGRAM: &str = r#"
+(relation DR (i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64))
+(relation Sl (i64 i64 i64 i64 i64))
+(relation Single (i64))
+(relation OnlyR (i64 i64))
+(relation NR (i64 i64))
+(relation NotOut (i64))
+(relation Len (i64 i64))
+(relation IsSt (i64))
+(relation Un (i64 i64 i64 i64))
+(relation Bi (i64 i64 i64 i64 i64))
+(relation Cv (i64 i64 i64 i64 i64 i64 i64))
+(relation Rn (i64 i64 i64 i64))
+(relation Own (i64 i64))
+(relation PlainRms (i64))
+(relation Dn (i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64 i64))
+(relation DnRm (i64 i64))
+(relation DnZa (i64 i64))
+(relation DnZ (i64 i64 i64 i64))
+(relation DnB (i64 i64 i64 i64))
+(relation DnL (i64 i64 i64 i64 i64))
+(relation DnD (i64 i64 i64 i64 i64 i64))
+(ruleset dn)
+; conv -> SiLU (m, 3 readers) -> q|k|v slices -> DeltaRule -> RmsNorm (plain step) -> Mul.
+(rule ((DR di q k v beta ld st kh vh kd vd core)
+       (= kk (* kh kd)) (= kk2 (* 2 kk)) (= cd (+ kk2 (* vh vd)))
+       (Sl q m 0 kk qn) (Single q) (Sl k m kk kk2 kn) (Single k) (Sl v m kk2 cd vn) (Single v)
+       (Len m cd) (NR m 3) (NotOut m)
+       (Un m 1 c sn) (Own sn si) (Single c)
+       (Cv c x cw cs ker dil cn) (Own cn ci) (> ker 0) (> dil 0) (IsSt cs) (Len x cd)
+       (Len cw lw) (= lw (* cd ker)) (Len cs ls) (= ls (* (* (- ker 1) dil) cd))
+       (Bi ld 1 l0 l1 ln) (Single ld) (Own ln li)
+       (OnlyR core rnn) (Rn rv core nw rnn) (Own rnn ri) (PlainRms ri)
+       (= lc (* vh vd)) (Len core lc) (Len nw vd)
+       (OnlyR rv gmn) (Bi gmo 1 g0 g1 gmn) (Own gmn at))
+      ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn)) :ruleset dn)
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Sl q m s e n) (Own n i)) ((DnRm di i)) :ruleset dn)
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Sl k m s e n) (Own n i)) ((DnRm di i)) :ruleset dn)
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Sl v m s e n) (Own n i)) ((DnRm di i)) :ruleset dn)
+; The gate: the Mul's other operand za, or the SiLU / Sigmoid it is of.
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Bi gmo 1 rv za gmn) (= lc (* vh vd)) (Len za lc)) ((DnZa di za)) :ruleset dn)
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Bi gmo 1 za rv gmn) (= lc (* vh vd)) (Len za lc)) ((DnZa di za)) :ruleset dn)
+(rule ((DnZa di za) (Un za 1 z zn) (Single za) (Own zn zi)) ((DnZ di 1 z zi)) :ruleset dn)
+(rule ((DnZa di za) (Un za 2 z zn) (Single za) (Own zn zi)) ((DnZ di 2 z zi)) :ruleset dn)
+(rule ((DnZa di za)) ((DnZ di 0 za -1)) :ruleset dn)
+; beta = Sigmoid(b), or beta itself.
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Un beta 2 b bn) (Single beta) (Own bn bi)) ((DnB di 1 b bi)) :ruleset dn)
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core))
+      ((DnB di 0 beta -1)) :ruleset dn)
+; log_decay = neg_a * Softplus(u), either operand order; u = a + dt_bias, or u itself.
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Bi ld 1 l0 l1 ln) (Un l1 3 u spn) (Single l1) (Own spn spi)) ((DnL di 0 l0 u spi)) :ruleset dn)
+(rule ((Dn di x cw cs ker dil si ci li ri at rv gmn rnn) (DR di q k v beta ld st kh vh kd vd core)
+       (Bi ld 1 l0 l1 ln) (Un l0 3 u spn) (Single l0) (Own spn spi)) ((DnL di 1 l1 u spi)) :ruleset dn)
+(rule ((DnL di o na u spi) (DR di q k v beta ld st kh vh kd vd core)
+       (Bi u 2 a bias an) (Single u) (Own an ai) (Len a vh) (Len bias vh))
+      ((DnD di u 1 a bias ai)) :ruleset dn)
+(rule ((DnL di o na u spi)) ((DnD di u 0 u -1 -1)) :ruleset dn)
+(run-schedule (saturate (run dn)))
+"#;
+
+/// Saturates the `deltanet-chain` rules over the lowered `steps` and extracts each chain: per part,
+/// the alternative absorbing the most (log_decay: `neg_a` first operand first; gate: SiLU, then
+/// Sigmoid), kept when its operand widths fit and every absorbed step precedes the last one.
+/// Returns `(index of its last step, other step indices starting with the DeltaRule's, step)`.
+fn chains(
     g: &Graph,
     steps: &[Planned],
-    di: usize,
     readers: &HashMap<ValueId, Vec<usize>>,
     step_of: &HashMap<ValueId, usize>,
     state_dtype: StateDtype,
-) -> Option<(usize, Vec<usize>, DeltaNetStep)> {
-    let super::super::Step::DeltaRule {
-        q,
-        k,
-        v,
-        beta,
-        log_decay,
-        state: Some(state),
-        n: 1,
-        key_heads: kh,
-        val_heads: vh,
-        key_dim: kd,
-        val_dim: vd,
-    } = steps[di].op
-    else {
-        return None;
-    };
+) -> Result<Vec<(usize, Vec<usize>, DeltaNetStep)>, String> {
+    use super::super::fuse::{err, loaded, relation};
+    use egglog::{Core as _, Write as _};
+    // Every rule is anchored on a DeltaRule step: skip the e-graph without one.
+    if !steps
+        .iter()
+        .any(|s| matches!(s.op, super::super::Step::DeltaRule { .. }))
+    {
+        return Ok(Vec::new());
+    }
     let is_state = |v: ValueId| matches!(g.value(v).kind, ValueKind::State(_));
     let len = |v: ValueId| numel(g, v).ok();
-    let node_of = |v: ValueId| match g.value(v).kind {
-        ValueKind::Node(n) => Some(&g.nodes[n.0 as usize]),
-        _ => None,
-    };
-    let only_reader = |v: ValueId| -> Option<&Node> {
-        match readers.get(&v).map(Vec::as_slice) {
-            Some(&[r]) if !g.outputs.contains(&v) => Some(&g.nodes[r]),
-            _ => None,
-        }
-    };
-    let single = |v: ValueId| only_reader(v).is_some();
-    // The step lowering exactly node `n`: same output, same name (not a producer that absorbed it).
-    let own = |n: &Node| {
-        step_of
-            .get(n.outputs.first()?)
-            .copied()
-            .filter(|&i| steps[i].name == n.name)
-    };
-    // `f(input)` as its own step with a single reader: `Some((input, step))`.
-    let absorbable = |v: ValueId, f: fn(&Op) -> bool| -> Option<(ValueId, usize)> {
-        let n = node_of(v).filter(|n| f(&n.op) && n.inputs.len() == 1 && single(v))?;
-        Some((n.inputs[0], own(n)?))
-    };
-
-    if !is_state(state) || kh == 0 || vh % kh != 0 {
-        return None;
-    }
-    layout(kd, vd)?;
-    let kk = kh * kd;
-    let cd = 2 * kk + vh * vd;
-    let mut rm = vec![di];
-
-    // q | k | v: last-axis slices of one SiLU(conv) value, views or single-reader copies.
-    let slice_of = |x: ValueId, lo: usize, hi: usize| -> Option<ValueId> {
-        let n = node_of(x)?;
-        let Op::Slice { axis, start, end } = n.op else {
-            return None;
-        };
-        let src = *n.inputs.first()?;
-        let rank = g.value(src).shape.len() as isize;
-        let last = axis == -1 || axis == rank - 1;
-        (single(x) && last && start == lo as i64 && end == hi as i64 && len(src)? == cd)
-            .then_some(src)
-    };
-    let m = slice_of(q, 0, kk)?;
-    if slice_of(k, kk, 2 * kk)? != m || slice_of(v, 2 * kk, cd)? != m {
-        return None;
-    }
-    if readers.get(&m).map_or(0, Vec::len) != 3 || g.outputs.contains(&m) {
-        return None;
-    }
-    for x in [q, k, v] {
-        rm.extend(node_of(x).and_then(own));
-    }
-    let silu = node_of(m).filter(|n| is_silu(&n.op) && n.inputs.len() == 1)?;
-    rm.push(own(silu)?);
-    let c = silu.inputs[0];
-    let conv = node_of(c).filter(|_| single(c))?;
-    let Op::CausalConv1dCached { kernel, dilation } = conv.op else {
-        return None;
-    };
-    let &[x, conv_w, conv_state] = conv.inputs.as_slice() else {
-        return None;
-    };
-    if kernel == 0
-        || dilation == 0
-        || !is_state(conv_state)
-        || len(x)? != cd
-        || len(conv_w)? != cd * kernel
-        || len(conv_state)? != (kernel - 1) * dilation * cd
-    {
-        return None;
-    }
-    rm.push(own(conv)?);
-
-    // beta = sigmoid(b), or any [val_heads] value.
-    let (b, beta_sigmoid) = match absorbable(beta, is_sigmoid) {
-        Some((b, i)) => {
-            rm.push(i);
-            (b, true)
-        }
-        None => (beta, false),
-    };
-    // log_decay = w * softplus(u), u = a + bias or any [val_heads] value.
-    let ldn =
-        node_of(log_decay).filter(|n| is_mul(&n.op) && n.inputs.len() == 2 && single(log_decay))?;
-    rm.push(own(ldn)?);
-    let is_softplus = |op: &Op| {
-        matches!(
-            op,
-            Op::Unary {
-                kind: UnaryKind::Softplus
+    let vi = |v: ValueId| v.0 as i64;
+    let (schema, run) = PROGRAM.split_at(PROGRAM.find("(run-schedule").expect("schedule"));
+    let mut eg = loaded(schema)?;
+    eg.update(|mut fs| -> Result<(), egglog::Error> {
+        for (vid, v) in g.values.iter().enumerate() {
+            let id = ValueId(vid as u32);
+            let rs = readers.get(&id).map_or(0, Vec::len);
+            let out = g.outputs.contains(&id);
+            if rs > 0 {
+                fs.add("NR", (vid as i64, rs as i64))?;
             }
-        )
-    };
-    let (neg_a, (u, sp_i)) = [
-        (ldn.inputs[0], ldn.inputs[1]),
-        (ldn.inputs[1], ldn.inputs[0]),
-    ]
-    .into_iter()
-    .find_map(|(w, s)| Some((w, absorbable(s, is_softplus)?)))?;
-    rm.push(sp_i);
-    let (a, dt_bias) = match node_of(u)
-        .filter(|n| is_add(&n.op) && n.inputs.len() == 2 && single(u))
-        .and_then(|n| Some((n, own(n)?)))
-    {
-        Some((n, i)) if len(n.inputs[0])? == vh && len(n.inputs[1])? == vh => {
-            rm.push(i);
-            (n.inputs[0], Some(n.inputs[1]))
+            if rs == 1 && !out {
+                fs.add("Single", vid as i64)?;
+                fs.add("OnlyR", (vid as i64, readers[&id][0] as i64))?;
+            }
+            if !out {
+                fs.add("NotOut", vid as i64)?;
+            }
+            if let Some(n) = len(id) {
+                fs.add("Len", (vid as i64, n as i64))?;
+            }
+            if matches!(v.kind, ValueKind::State(_)) {
+                fs.add("IsSt", vid as i64)?;
+            }
         }
-        _ => (u, None),
-    };
-    if [b, neg_a, a].into_iter().any(|v| len(v) != Some(vh)) {
-        return None;
-    }
+        for (nid, n) in g.nodes.iter().enumerate() {
+            let Some(&o) = n.outputs.first() else {
+                continue;
+            };
+            let (o, ni) = (vi(o), nid as i64);
+            if let Some(&i) = step_of
+                .get(&n.outputs[0])
+                .filter(|&&i| steps[i].name == n.name)
+            {
+                fs.add("Own", (ni, i as i64))?;
+            }
+            match (&n.op, &n.inputs[..]) {
+                (&Op::Slice { axis, start, end }, [src, ..]) => {
+                    let rank = g.value(*src).shape.len() as isize;
+                    if axis == -1 || axis == rank - 1 {
+                        fs.add("Sl", (o, vi(*src), start, end, ni))?;
+                    }
+                }
+                (op, &[x]) => {
+                    let kind = if is_silu(op) {
+                        1
+                    } else if is_sigmoid(op) {
+                        2
+                    } else if matches!(
+                        op,
+                        Op::Unary {
+                            kind: UnaryKind::Softplus
+                        }
+                    ) {
+                        3
+                    } else {
+                        continue;
+                    };
+                    fs.add("Un", (o, kind, vi(x), ni))?;
+                }
+                (&Op::CausalConv1dCached { kernel, dilation }, &[x, w, st]) => {
+                    let f = (o, vi(x), vi(w), vi(st), kernel as i64, dilation as i64);
+                    fs.add("Cv", (f.0, f.1, f.2, f.3, f.4, f.5, ni))?;
+                }
+                (Op::RmsNorm { .. }, &[x, w]) => {
+                    fs.add("Rn", (o, vi(x), vi(w), ni))?;
+                }
+                (op, &[a, b]) if is_mul(op) || is_add(op) => {
+                    let kind = if is_mul(op) { 1 } else { 2 };
+                    fs.add("Bi", (o, kind, vi(a), vi(b), ni))?;
+                }
+                _ => {}
+            }
+        }
+        for (i, s) in steps.iter().enumerate() {
+            match s.op {
+                super::super::Step::RmsNorm {
+                    res: None,
+                    scale: None,
+                    chain: None,
+                    rope: None,
+                    ..
+                } => {
+                    fs.add("PlainRms", i as i64)?;
+                }
+                super::super::Step::DeltaRule {
+                    q,
+                    k,
+                    v,
+                    beta,
+                    log_decay,
+                    state: Some(state),
+                    n: 1,
+                    key_heads: kh,
+                    val_heads: vh,
+                    key_dim: kd,
+                    val_dim: vd,
+                } if is_state(state) && kh != 0 && vh % kh == 0 && layout(kd, vd).is_some() => {
+                    let f = [q, k, v, beta, log_decay, state].map(vi);
+                    let p = [kh, vh, kd, vd].map(|x| x as i64);
+                    let row = [i as i64, f[0], f[1], f[2], f[3], f[4], f[5]];
+                    let row = [&row[..], &p[..], &[vi(s.out)]].concat();
+                    let row = row
+                        .into_iter()
+                        .map(|x| fs.base_to_value::<i64>(x))
+                        .collect();
+                    fs.add("DR", egglog::api::RawValues(row))?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .map_err(err)?;
+    eg.parse_and_run_program(None, run).map_err(err)?;
 
-    // out = RmsNorm(core, g[val_dim]) * gate, gate = act(z) or any [val_heads * val_dim] value.
-    let core = steps[di].out;
-    let rn = only_reader(core)?;
-    let Op::RmsNorm { eps } = rn.op else {
-        return None;
-    };
-    let &[rx, norm_w] = rn.inputs.as_slice() else {
-        return None;
-    };
-    let rn_i = own(rn)?;
-    if rx != core || len(core)? != vh * vd || len(norm_w)? != vd {
-        return None;
-    }
-    if !matches!(
-        steps[rn_i].op,
-        super::super::Step::RmsNorm {
-            res: None,
-            scale: None,
-            chain: None,
-            rope: None,
-            ..
+    let by_di = |name: &str| -> Result<HashMap<i64, Vec<Vec<i64>>>, String> {
+        let mut m: HashMap<i64, Vec<Vec<i64>>> = HashMap::new();
+        for r in relation(&eg, name)? {
+            m.entry(r[0]).or_default().push(r);
         }
-    ) {
-        return None;
-    }
-    rm.push(rn_i);
-    let normed = rn.outputs[0];
-    let gm = only_reader(normed).filter(|n| is_mul(&n.op) && n.inputs.len() == 2)?;
-    let za = if gm.inputs[0] == normed {
-        gm.inputs[1]
-    } else {
-        gm.inputs[0]
+        Ok(m)
     };
-    if za == normed || len(za)? != vh * vd {
-        return None;
-    }
-    let at = own(gm)?;
-    let (z, z_act) = if let Some((z, i)) = absorbable(za, is_silu) {
-        rm.push(i);
-        (z, 1)
-    } else if let Some((z, i)) = absorbable(za, is_sigmoid) {
-        rm.push(i);
-        (z, 2)
-    } else {
-        (za, 0)
+    let (rms, zs, bs, ls, ds) = (
+        by_di("DnRm")?,
+        by_di("DnZ")?,
+        by_di("DnB")?,
+        by_di("DnL")?,
+        by_di("DnD")?,
+    );
+    let dr: HashMap<i64, Vec<i64>> = relation(&eg, "DR")?
+        .into_iter()
+        .map(|r| (r[0], r))
+        .collect();
+    // A part's alternative in preference order (column 1 holds the variant).
+    let pick = |rows: Option<&Vec<Vec<i64>>>, order: &[i64]| -> Option<Vec<i64>> {
+        let rows = rows?;
+        order
+            .iter()
+            .find_map(|&o| rows.iter().find(|r| r[1] == o))
+            .cloned()
     };
-    if len(z)? != vh * vd || rm.iter().any(|&i| i >= at) {
-        return None;
+    let v = |x: i64| ValueId(x as u32);
+    let mut dn = relation(&eg, "Dn")?;
+    dn.sort_unstable();
+    let mut found = Vec::new();
+    for r in dn {
+        let [di, x, cw, cs, ker, dil, si, ci, li, ri, at, _rv, _gmn, rnn] = r[..] else {
+            unreachable!("Dn has 14 columns")
+        };
+        let d = &dr[&di];
+        let (kh, vh, kd, vd) = (d[7] as usize, d[8] as usize, d[9] as usize, d[10] as usize);
+        // Gate: SiLU, then Sigmoid, then itself; beta: Sigmoid, then itself; log_decay: `neg_a` first.
+        let (Some(z), Some(b), Some(l)) = (
+            pick(zs.get(&di), &[1, 2, 0]),
+            pick(bs.get(&di), &[1, 0]),
+            pick(ls.get(&di), &[0, 1]),
+        ) else {
+            continue;
+        };
+        let (neg_a, u, spi) = (l[2], l[3], l[4]);
+        let Some(dt) = ds
+            .get(&di)
+            .and_then(|rows| rows.iter().filter(|r| r[1] == u).max_by_key(|r| r[2]))
+        else {
+            continue;
+        };
+        let (a, dt_bias, dti) = (dt[3], (dt[2] == 1).then(|| v(dt[4])), dt[5]);
+        if [b[2], neg_a, a].into_iter().any(|x| len(v(x)) != Some(vh))
+            || len(v(z[2])) != Some(vh * vd)
+        {
+            continue;
+        }
+        let mut rm = vec![di as usize];
+        rm.extend(rms.get(&di).into_iter().flatten().map(|r| r[1] as usize));
+        rm.extend([si, ci].map(|i| i as usize));
+        rm.extend(
+            [b[3], li, spi, dti, ri, z[3]]
+                .into_iter()
+                .filter(|&i| i >= 0)
+                .map(|i| i as usize),
+        );
+        if rm.iter().any(|&i| i >= at as usize) {
+            continue;
+        }
+        let Op::RmsNorm { eps } = g.nodes[rnn as usize].op else {
+            unreachable!("Rn facts are RmsNorm nodes")
+        };
+        let st = DeltaNetStep {
+            x: v(x),
+            conv_w: v(cw),
+            conv_state: v(cs),
+            z: v(z[2]),
+            b: v(b[2]),
+            a: v(a),
+            dt_bias,
+            neg_a: v(neg_a),
+            state: v(d[6]),
+            norm_w: g.nodes[rnn as usize].inputs[1],
+            kernel: ker as usize,
+            dilation: dil as usize,
+            key_heads: kh,
+            val_heads: vh,
+            key_dim: kd,
+            val_dim: vd,
+            eps,
+            z_act: z[1] as u32,
+            beta_sigmoid: b[1] == 1,
+            state_dtype,
+        };
+        found.push((at as usize, rm, st));
     }
-    let st = DeltaNetStep {
-        x,
-        conv_w,
-        conv_state,
-        z,
-        b,
-        a,
-        dt_bias,
-        neg_a,
-        state,
-        norm_w,
-        kernel,
-        dilation,
-        key_heads: kh,
-        val_heads: vh,
-        key_dim: kd,
-        val_dim: vd,
-        eps,
-        z_act,
-        beta_sigmoid,
-        state_dtype,
-    };
-    Some((at, rm, st))
+    Ok(found)
 }
 
 /// Every value the step reads (drives arena liveness and barriers).
