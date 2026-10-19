@@ -6171,6 +6171,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
     if ext::ple::enabled() {
         ext::ple::fuse(g, &mut steps, &aliases);
     }
+    ext::deltanet::fuse(g, &mut steps)?;
     Ok((steps, aliases))
 }
 

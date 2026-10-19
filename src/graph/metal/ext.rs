@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 pub(super) mod attn;
 pub(super) mod conv;
+pub(super) mod deltanet;
 pub(super) mod elementwise;
 pub(super) mod matmul;
 pub(super) mod moe;
@@ -27,6 +28,7 @@ pub(super) fn msl() -> String {
     s.push_str(conv::MSL);
     s.push_str(attn::MSL);
     s.push_str(moe::MSL);
+    s.push_str(deltanet::MSL);
     s
 }
 
@@ -40,6 +42,7 @@ pub(super) fn kernel_names() -> Vec<&'static str> {
     v.extend(conv::KERNELS);
     v.extend(attn::KERNELS);
     v.extend(moe::KERNELS);
+    v.extend(deltanet::KERNELS);
     v
 }
 
@@ -59,6 +62,8 @@ pub enum ExtStep {
     Attn(attn::Step),
     Experts(moe::Step),
     Ple(ple::Step),
+    /// Built only by the [`deltanet::fuse`] post-pass.
+    DeltaNet(deltanet::DeltaNetStep),
 }
 
 pub(super) fn supports(op: &Op, dtype: DType) -> bool {
@@ -133,6 +138,7 @@ pub(super) fn reads(st: &ExtStep) -> Vec<ValueId> {
         ExtStep::Attn(e) => attn::reads(e),
         ExtStep::Experts(e) => moe::reads(e),
         ExtStep::Ple(e) => ple::reads(e),
+        ExtStep::DeltaNet(e) => deltanet::reads(e),
     }
 }
 
@@ -146,6 +152,7 @@ pub(super) fn allows_non_f32(st: &ExtStep, v: ValueId) -> bool {
         ExtStep::Attn(e) => attn::allows_non_f32(e, v),
         ExtStep::Experts(e) => moe::allows_non_f32(e, v),
         ExtStep::Ple(e) => ple::allows_non_f32(e, v),
+        ExtStep::DeltaNet(e) => deltanet::allows_non_f32(e, v),
     }
 }
 
@@ -159,6 +166,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &ExtStep) -> Resu
         ExtStep::Attn(e_) => attn::encode(sess, e, s, e_),
         ExtStep::Experts(e_) => moe::encode(sess, e, s, e_),
         ExtStep::Ple(e_) => ple::encode(sess, e, s, e_),
+        ExtStep::DeltaNet(e_) => deltanet::encode(sess, e, s, e_),
     }
 }
 
