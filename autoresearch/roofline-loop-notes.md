@@ -770,3 +770,34 @@ All of these rows come from the matrix runner's `target/loop-base/gibbs` (383 of
   - **Track W10b (`ExpertW10bFusedDotGroupAndIq2U16`)**:
     - `Wide::fused_dot` (`dot_group` on-the-fly dot product in `WIDE_Q4_0`, `WIDE_IQ4_NL`, `WIDE_IQ2_XXS`, `WIDE_IQ2_M`, `WIDE_IQ3_S`, eliminating `float v[17..33]` live register arrays and vectorizing `WIDE_IQ2_M` / `WIDE_IQ3_S`), plus the 5-round `IQ2XXS_GRID_U16[256]` (`512` B `ushort` codebook using exact `8u + c * 17u + (c >> 1u)`) ablation.
     - The register-pressure reduction (`float4 xs[8]` + `float v[33]` -> no `v[33]`) is stated strictly as a **hypothesis** to be confirmed by the 7-round `moe_gemv_bandwidth` harness (noting that `moe_gemv_pipeline_max_threads_and_occupancy` already reports static `maxTotalThreadsPerThreadgroup = 1024`).
+
+## Wave 10 — Fast `PlanValueLoc` + `(32, usize::MAX)` 2-Chunk CB (`W10a`), `Wide::fused_dot` On-the-Fly `dot_group` (`W10b`), and Unspliced `+0.88 pp` Promotion to `main` (`bg_226`, `bg_227`, `bg_228`, `838c19d`)
+- **Track W10a (`ExpertW10aFastPlanLocAndCb2`, `2b5de70` on `main`): Pre-Indexed `PlanValueLoc`, 2-Chunk `(32, usize::MAX)` Command Buffer Submission, and `QUIET_MARGIN = 0.02` in `tune::decide`**:
+  - Pre-indexed `PlanValueLoc` (`Arena(usize)`, `Weight(Buffer, usize)`, `State(usize)`) plus `embedding_checks`, `attn_pos_inputs`, and `state_vars` once in `prepare_plan` (`src/graph/metal.rs`), replacing per-token `steps` scans, `state_map: HashMap<String, Arc<Buffer>>` construction (`70+` `String` clones/tok), and `~2,500` `SipHash-1-3` `HashMap` lookups/tok in `run_prepared` with O(1) slice indexing (`plan_value_locs_resolve_without_per_token_hashmap` passed).
+  - Changed default `cb_chunking()` from `(24, 160)` (`4–5` command buffers/tok) to `(32, usize::MAX)` (`2` command buffers/tok for plans `>= 220` steps: a 32-step starter CB committed after `~8 us` of CPU encoding followed by 1 uninterrupted CB for the remaining steps, eliminating 2–3 mid-token command-buffer boundaries and compositor preemption windows; `cb_chunking_default_is_two_chunk_starter` passed).
+  - Added `QUIET_MARGIN: f64 = 0.02` in `src/graph/tune.rs` (`decide`) so 2-round quiet disagreement between `Gen(1)` and `Gen(2)` uses a `2%` (`1.02`) worst-round-ratio margin over `default` (`HAND`) rather than `BUSY_MARGIN` (`8%`), while keeping `TIE = 0.01` (`1%`) in `choose()` and `rounds_consistent == false` (`8/8` `graph::tune::tests` passed).
+- **Track W10b (`ExpertW10bFusedDotGroupAndIq2U16`, `838c19d` on `main`): `Wide::fused_dot` (`dot_group`) on `segs = 4` `IQ2_XXS` / `IQ2_M` / `IQ3_S` & 5-Round `u16_grid` Ablation (`bg_226`)**:
+  - Added `pub fused_dot: bool` to `Wide` (`src/graph/codec.rs` + `src/graph/codegen.rs`) and implemented `dot_group(b, g, xs)` for `WIDE_IQ2_XXS`, `WIDE_IQ2_M` (with `packed_ushort2` loads and vector `select`), and `WIDE_IQ3_S` (with `packed_ushort4` + `packed_ushort2` loads and vector `select`), eliminating the `33`-float `float v[33]` intermediate array per thread while keeping `WIDE_Q4_0` and `WIDE_IQ4_NL` (`segs = 2`) on `M4`'s `decode_group` (preserving the warm 16-shape `de19cee9ffcfa698` `TuneCache`).
+  - **7-Round Interleaved `moe_gemv_bandwidth` (`bg_226`)**:
+    - `GGUF_IQ2_XXS 1408x2816`: `r=2 med = 57.5 us (142.1 GB/s)` vs `r=4 med = 60.1 us (136.1 GB/s)` (`r4_wins = 3/7`, improved from `60.1 us / 136.2 GB/s` in `bg_220`).
+    - `GGUF_IQ2_M 1408x2816`: `r=2 med = 62.4 us (162.7 GB/s)` vs `r=4 med = 61.9 us (164.1 GB/s)` (`r4_wins = 4/7`, improved from `63.3 us / 160.4 GB/s` in `bg_220`).
+    - `GGUF_IQ4_NL 2816x704`: `r=2 med = 50.6 us (176.3 GB/s)` vs `r=4 med = 49.9 us (178.8 GB/s)` (`r4_wins = 3/7`).
+    - `GGUF_Q4_0 2816x704`: `r=2 med = 43.6 us (204.7 GB/s)` vs `r=4 med = 47.6 us (187.5 GB/s)` (`r4_wins = 2/7`).
+  - **5-Round Interleaved `moe_gemv_iq2xxs_constant_decode_ablation` (`bg_226`)**:
+    - `real_med_us` (`dot_group` with `ulong IQ2XXS_GRID[256]`): **`55.0 us` (`148.8 GB/s`, `-2.8 us` / `+5.2%` faster than `decode_group`'s `57.8 us / 141.4 GB/s` in `bg_220`!)**.
+    - `u16_med_us` (`ushort IQ2XXS_GRID_U16[256]` `512 B` + `8u + c * 17u + (c >> 1u)`): **`97.5 us` (`83.9 GB/s`)** — 32 integer shift/mul/add ops per group cost `+42.5 us` more than the `ulong[256]` lookup, refuting `u16_grid` ALU unpacking.
+    - `live_q4_no_lut_med_us` (`dot_group` with live-`q4` ALU stub): **`39.0 us` (`209.6 GB/s`, `-11.3 us` faster than `decode_group`'s `50.3 us` live-`q4` stub in `bg_220`, isolating `15.9 us` remaining `IQ2XXS_GRID` lookup cost)**.
+- **Full `loop_guard.sh` & Unspliced 4-Pass ABBA Verification (`bg_228`) — PROMOTED TO `main` (`838c19d`)**:
+  - Passed `scripts/loop_guard.sh` (`rc = 0`, `parity: 5 compared`, `min cos 1.00000`).
+  - **Single Unspliced 4-Pass ABBA (`bg_228`)**:
+    - **`base_pct = 51.45% -> cand_pct = 52.33%` (`delta_pp = +0.880 pp`, `noise_pp = 0.036 pp`, `ratios_ok = true`, `min_ratio = 0.9992`, `max base_spread = 0.0049`, `host_ms = 0.23..0.31 ms` across all 9 models)**:
+      - `Model 0` (`E2B QAT`): **`146.85 -> 148.92 tok/s` (`ratio = 1.0141`, `+1.41%`, `base_spread = 0.0028`, `cand_pct = 43.42%`, `gpu_ms = 6.410 ms`, `host_ms = 0.316 ms`, `dispatches = 506`)**
+      - `Model 1` (`E2B Q4_K_M`): `110.43 -> 110.34 tok/s` (`ratio = 0.9992`, `base_spread = 0.0038`, `cand_pct = 56.64%`, `gpu_ms = 8.790 ms`, `host_ms = 0.284 ms`, `dispatches = 509`)
+      - `Model 2` (`Qwen3.5-2B`): **`111.57 -> 112.85 tok/s` (`ratio = 1.0115`, `+1.15%`, `base_spread = 0.0013`, `cand_pct = 52.17%`, `gpu_ms = 8.593 ms`, `host_ms = 0.278 ms`, `dispatches: 430 -> 412`)**
+      - `Model 3` (`Qwen3.5-9B IQ2_M`): **`39.35 -> 41.48 tok/s` (`ratio = 1.0539`, `+5.39%`!, `base_spread = 0.0004`, `cand_pct = 64.86%`, `gpu_ms = 23.820 ms`, `host_ms = 0.285 ms`, `dispatches: 594 -> 570`)**
+      - `Model 4` (`Llama 1B Q4_0`): **`249.43 -> 251.75 tok/s` (`ratio = 1.0093`, `+0.93%`, `base_spread = 0.0027`, `cand_pct = 67.02%`, `gpu_ms = 3.687 ms`, `host_ms = 0.294 ms`, `dispatches = 147`)**
+      - `Model 5` (`SmolLM2 135M`): **`463.44 -> 468.22 tok/s` (`ratio = 1.0103`, `+1.03%`, `base_spread = 0.0025`, `cand_pct = 43.83%`, `gpu_ms = 1.904 ms`, `host_ms = 0.233 ms`, `dispatches = 273`)**
+      - `Model 6` (`Llama 1B bnb`): **`226.14 -> 226.53 tok/s` (`ratio = 1.0017`, `+0.17%`, `base_spread = 0.0009`, `cand_pct = 60.36%`, `gpu_ms = 4.140 ms`, `host_ms = 0.280 ms`, `dispatches = 147`)**
+      - `Model 7` (`26B-A4B MoE`): **`69.69 -> 72.27 tok/s` (`ratio = 1.0369`, `+3.69%`!, `base_spread = 0.0006`, `cand_pct = 54.82%`, `gpu_ms = 13.537 ms`, `host_ms = 0.296 ms`, `dispatches: 923 -> 713`)**
+      - `Model 8` (`E2B QAT ctx4k`): **`122.62 -> 124.84 tok/s` (`ratio = 1.0181`, `+1.81%`!, `base_spread = 0.0049`, `cand_pct = 36.40%`, `gpu_ms = 7.713 ms`, `host_ms = 0.283 ms`, `dispatches = 506`)**
+  - Promoted to `main` (`838c19d`) and updated `target/loop-base/gibbs` + `target/loop-base/COMMIT`.
