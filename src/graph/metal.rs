@@ -6003,6 +6003,9 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
         });
     }
     fuse_moe_subgraphs(g, &mut steps, &aliases);
+    if ext::ple::enabled() {
+        ext::ple::fuse(g, &mut steps, &aliases);
+    }
     Ok((steps, aliases))
 }
 
