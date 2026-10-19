@@ -1084,6 +1084,31 @@ mod tests {
     }
 
     #[test]
+    fn iq2_grid_rewrites_hit_every_anchor() {
+        let c = codec(QuantFormat::GGUF_IQ2_XXS).unwrap();
+        for r in [1, 2, 4] {
+            let p = GemvParams {
+                rows_per_sg: r,
+                ..Default::default()
+            };
+            let src = gemv_indexed(c, p);
+            assert_eq!(iq2_grid_msl(src.clone(), Iq2Grid::Program).unwrap(), src);
+            let tg = iq2_grid_msl(src.clone(), Iq2Grid::Threadgroup).unwrap();
+            assert!(tg.contains("threadgroup uint grid[512];"));
+            assert_eq!(tg.matches("(b, g, xs, grid);").count(), r);
+            let buf = iq2_grid_msl(src.clone(), Iq2Grid::Buffer).unwrap();
+            assert!(buf.contains("constant uint2* grid [[buffer(5)]],"));
+            assert!(buf.contains("uint2 gw = grid[((q4 >> (8 * k)) & 0xFFu)];"));
+            for s in [&tg, &buf] {
+                assert!(!s.contains("as_type<uint2>(IQ2XXS_GRID[(q4"));
+            }
+        }
+        // Any other codec has no grid lookup to rewrite.
+        let q4 = gemv_indexed(codec(QuantFormat::GGUF_Q4_0).unwrap(), GemvParams::default());
+        assert!(iq2_grid_msl(q4, Iq2Grid::Buffer).is_err());
+    }
+
+    #[test]
     fn test_gemv_codegen() {
         let code = gemv(&CODEC_Q4_0, GemvParams::default(), "", "");
         assert!(code.contains("kernel void gemv_gguf_q4_0"));
@@ -1810,6 +1835,54 @@ pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
 /// threads. A slot whose id is not below `experts` writes zeros.
 pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
     gemv_indexed_for_dialect(Dialect::Msl, codec, p)
+}
+
+/// Where an IQ2_XXS [`gemv_indexed`] reads its 2 KB grid: the codec's program-scope `constant ulong`
+/// array (default), a per-threadgroup `uint` copy staged once behind one barrier, or a `constant`
+/// buffer bound at slot 5 (the host binds `IQ2XXS_GRID`'s bytes there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Iq2Grid {
+    Program,
+    Threadgroup,
+    Buffer,
+}
+
+/// Rewrites the IQ2_XXS [`gemv_indexed`] source so `dot_group` reads the grid through a `grid`
+/// pointer: a threadgroup `uint[512]` copy the kernel's 256 threads stage before any early return,
+/// or the `constant uint2*` buffer at slot 5. `Err` when the source lacks an anchor.
+pub fn iq2_grid_msl(src: String, mode: Iq2Grid) -> Result<String, String> {
+    const IDX: &str = "((q4 >> (8 * k)) & 0xFFu)";
+    let (param, lookup, kparam, stage) = match mode {
+        Iq2Grid::Program => return Ok(src),
+        Iq2Grid::Threadgroup => (
+            "threadgroup const uint* grid",
+            format!("uint2(grid[2u * {IDX}], grid[2u * {IDX} + 1u])"),
+            "",
+            "    threadgroup uint grid[512];\n    {\n        const uint t = sg * 32 + lane;\n        const uint2 e = as_type<uint2>(IQ2XXS_GRID[t]);\n        grid[2 * t] = e.x;\n        grid[2 * t + 1] = e.y;\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        ),
+        Iq2Grid::Buffer => (
+            "constant uint2* grid",
+            format!("grid[{IDX}]"),
+            "    constant uint2* grid [[buffer(5)]],\n",
+            "",
+        ),
+    };
+    let ids_param = "    device const uint* ids [[buffer(4)]],\n";
+    let body = "    const uint row0 = tg.x * ";
+    let edits = [
+        ("as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu])".to_string(), lookup),
+        ("thread const float4* xs) {".to_string(), format!("thread const float4* xs, {param}) {{")),
+        ("(b, g, xs);".to_string(), "(b, g, xs, grid);".to_string()),
+        (ids_param.to_string(), format!("{ids_param}{kparam}")),
+        (body.to_string(), format!("{stage}{body}")),
+    ];
+    edits.into_iter().try_fold(src, |s, (from, to)| {
+        if s.contains(&from) {
+            Ok(s.replace(&from, &to))
+        } else {
+            Err(format!("IQ2_XXS grid {mode:?}: generated GEMV has no `{from}`"))
+        }
+    })
 }
 
 /// Dialect-parameterized [`gemv_indexed`] kernel across `Dialect::Msl`, `Dialect::Cuda`, and `Dialect::Hip`.
