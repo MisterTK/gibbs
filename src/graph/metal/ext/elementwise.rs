@@ -5,6 +5,7 @@
 //! Owned ops, all at F32: every `Unary` kind (plus `Relu`, `Silu`, `Gelu` which are the same maps),
 //! every `Binary` kind (plus `Add`, `Mul`) with numpy broadcasting.
 
+use super::super::views::Rows;
 use super::super::{numel, set_bytes, u32_of, Planned, Session};
 use super::{Enc, PlanOut};
 use crate::graph::{BinaryKind, DType, Graph, Node, Op, UnaryKind, ValueId};
@@ -22,13 +23,15 @@ const MAX_RANK: usize = 6;
 /// Steps this group adds to the executor.
 #[derive(Debug, Clone)]
 pub enum Step {
-    /// `out = f(x)`; `kind` is the `unary_f32` switch code, `a`/`b` its parameters.
+    /// `out = f(x)`; `kind` is the `unary_f32` switch code, `a`/`b` its parameters, `xv` the
+    /// layout of `x` (row-strided when it is a view).
     Unary {
         x: ValueId,
         n: usize,
         kind: u32,
         a: f32,
         b: f32,
+        xv: Rows,
     },
     /// `out = a ∘ b` over `dims` (outermost first); `sa`/`sb` are element strides, 0 when broadcast.
     Binary {
@@ -115,7 +118,7 @@ fn plan_unary(g: &Graph, node: &Node, kind: u32, a: f32, b: f32) -> Result<PlanO
         .ok_or_else(|| format!("node '{}': {} needs operand 0", node.name, node.op.name()))?;
     let n = numel(g, x)?;
     u32_of(n)?;
-    Ok(PlanOut::Step(Step::Unary { x, n, kind, a, b }, n))
+    Ok(PlanOut::Step(Step::Unary { x, n, kind, a, b, xv: Rows::dense(n) }, n))
 }
 
 /// Output dims and each operand's element strides (0 where broadcast), outermost first.
@@ -293,16 +296,17 @@ pub(super) fn allows_non_f32(st: &Step, _v: ValueId) -> bool {
 
 pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<(), String> {
     match *st {
-        Step::Unary { x, n, kind, a, b } => {
+        Step::Unary { x, n, kind, a, b, xv } => {
             if n == 0 {
                 return Ok(());
             }
             #[repr(C)]
-            struct Params(u32, u32, f32, f32);
+            struct Params(u32, u32, f32, f32, u32, u32);
             e.enc.set_compute_pipeline_state(sess.rt.pso("unary_f32")?);
             e.bind(0, x);
             e.bind(1, s.out);
-            set_bytes(e.enc, 2, &Params(u32_of(n)?, kind, a, b));
+            let p = Params(u32_of(n)?, kind, a, b, u32_of(xv.len)?, u32_of(xv.stride)?);
+            set_bytes(e.enc, 2, &p);
             e.grid1(n);
         }
         Step::Binary {
