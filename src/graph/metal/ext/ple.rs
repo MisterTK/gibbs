@@ -8,11 +8,13 @@
 //! (`ceil(rows / PROJ_ROWS_PER_TG)` times per call, from cache); default off until an ABBA shows
 //! the saved dispatch beats that redundant traffic.
 
-use super::super::{set_bytes, u32_of, Epi, Planned, Session, Step as Core, KERNELS_MSL};
+use super::super::{
+    set_bytes, u32_of, Epi, Planned, Session, Step as Core, WeightFormat, KERNELS_MSL,
+};
 use super::{Enc, ExtStep};
-use crate::graph::codec::{codec, Codec};
+use crate::graph::codec::Codec;
 use crate::graph::codegen::{block_ref, device_msl, gemv_common};
-use crate::graph::{Graph, ValueId};
+use crate::graph::{DType, Graph, ValueId};
 use crate::hardware::QuantFormat;
 use metal::{ComputePipelineState, MTLSize};
 use parking_lot::Mutex;
@@ -57,12 +59,29 @@ pub(in super::super) fn enabled() -> bool {
     *ON
 }
 
-/// Codec of an m = 1 `GemvPacked` whose `cols` are whole blocks of it.
+/// How the kernel decodes weights of `f`: every codec format, plus BF16/F16 through the expert
+/// GEMV's pseudo-codecs.
+fn codec_of(f: QuantFormat) -> Option<&'static Codec> {
+    super::moe::bank_codec(match f {
+        QuantFormat::BF16 => DType::BF16,
+        QuantFormat::FP16 => DType::F16,
+        f => DType::Quant(f),
+    })
+}
+
+/// Codec of an m = 1 `GemvPacked` whose `cols` are whole blocks of it (NVFP4 keeps its scales in
+/// a side buffer, JesseLUT in hash planes: neither is a `decode8` layout).
 fn gemv_codec(st: &Core, cols: usize) -> Option<&'static Codec> {
     let Core::GemvPacked { format, .. } = st else {
         return None;
     };
-    codec(format.codec_format()?).filter(|c| cols % c.block_elems as usize == 0)
+    let f = match format {
+        WeightFormat::BF16 => QuantFormat::BF16,
+        WeightFormat::F16 => QuantFormat::FP16,
+        WeightFormat::NvFp4 | WeightFormat::JesseLUT => return None,
+        fmt => fmt.codec_format()?,
+    };
+    codec_of(f).filter(|c| cols % c.block_elems as usize == 0)
 }
 
 /// Rewrites each `GemvPacked{GeGlu, side}` → `GemvPacked` pair (see the module doc) into one
@@ -244,8 +263,8 @@ fn pso(sess: &Session, fa: QuantFormat, fb: QuantFormat) -> Result<ComputePipeli
         return Ok(p.clone());
     }
     let (a, b) = (
-        codec(fa).ok_or_else(|| format!("no codec for {fa:?}"))?,
-        codec(fb).ok_or_else(|| format!("no codec for {fb:?}"))?,
+        codec_of(fa).ok_or_else(|| format!("no codec for {fa:?}"))?,
+        codec_of(fb).ok_or_else(|| format!("no codec for {fb:?}"))?,
     );
     let pso = sess
         .rt
@@ -317,7 +336,7 @@ mod tests {
                 vec![1, mid],
                 F,
             );
-            let wa = g.weight(format!("l{l}.wa"), vec![mid, h], DType::Quant(fa));
+            let wa = g.weight(format!("l{l}.wa"), vec![mid, h], dt(fa));
             let gate = g.add(format!("l{l}.gate"), Op::Linear, &[x, wa], vec![1, mid], F);
             let act = g.add(
                 format!("l{l}.act"),
@@ -326,7 +345,7 @@ mod tests {
                 vec![1, mid],
                 F,
             );
-            let wb = g.weight(format!("l{l}.wb"), vec![h, mid], DType::Quant(fb));
+            let wb = g.weight(format!("l{l}.wb"), vec![h, mid], dt(fb));
             let proj = g.add(format!("l{l}.proj"), Op::Linear, &[act, wb], vec![1, h], F);
             let nw = g.weight(format!("l{l}.nw"), vec![h], F);
             let norm = g.add(
@@ -364,18 +383,19 @@ mod tests {
     /// and `fuse` turns the two GEMVs into one `GluGemvChain`.
     #[test]
     fn glu_gemv_chain_plans_to_one_step() {
-        let mut g = chain_graph(
-            512,
-            256,
-            2,
-            QuantFormat::GGUF_Q4_0,
-            QuantFormat::GGUF_Q4_K_M,
-        );
+        use QuantFormat::{BF16, GGUF_Q4_0 as Q4, GGUF_Q4_K_M as QK, GGUF_Q5_K_M as Q5K};
+        for (fa, fb) in [(Q4, QK), (Q5K, Q5K), (BF16, BF16)] {
+            plans_to_one_step(fa, fb);
+        }
+    }
+
+    fn plans_to_one_step(fa: QuantFormat, fb: QuantFormat) {
+        let mut g = chain_graph(512, 256, 2, fa, fb);
         // The compile pipeline (`program.rs`) runs these before planning.
         crate::graph::passes::run_optimization_passes(&mut g, None).unwrap();
         let (steps, aliases) = plan(&g).unwrap();
         let base = kinds(&batch_horizontal(steps.clone(), &aliases));
-        eprintln!("default: {base:?}");
+        eprintln!("{fa:?}/{fb:?} default: {base:?}");
         let layer = [
             "GemvPacked(GeGlu,res=true)",
             "GemvPacked(None,res=false)",
@@ -393,7 +413,7 @@ mod tests {
         let mut fused = steps;
         fuse(&g, &mut fused, &aliases);
         let fused = kinds(&batch_horizontal(fused, &aliases));
-        eprintln!("fused: {fused:?}");
+        eprintln!("{fa:?}/{fb:?} fused: {fused:?}");
         assert_eq!(
             fused[1..],
             [
@@ -433,7 +453,7 @@ mod tests {
     fn blocks(f: QuantFormat, n_blocks: usize, seed: u64) -> Vec<u8> {
         let (_, bb, _) = crate::model::layers::gguf_block_codec(f).unwrap();
         let scale_at: &[usize] = match f {
-            QuantFormat::GGUF_Q4_K_M => &[0, 2],
+            QuantFormat::GGUF_Q4_K_M | QuantFormat::GGUF_Q5_K_M => &[0, 2],
             _ => &[0],
         };
         let r = rand(n_blocks * bb, seed);
@@ -447,7 +467,24 @@ mod tests {
         raw
     }
 
+    /// Graph dtype of a test weight format (`BF16` is the unquantized bf16 dtype).
+    fn dt(f: QuantFormat) -> DType {
+        if f == QuantFormat::BF16 {
+            DType::BF16
+        } else {
+            DType::Quant(f)
+        }
+    }
+
     fn quant(f: QuantFormat, rows: usize, cols: usize, seed: u64) -> Tensor {
+        if f == QuantFormat::BF16 {
+            let v = rand(rows * cols, seed);
+            return Tensor::BF16(
+                v.iter()
+                    .map(|&x| crate::model::f32_to_bf16(0.1 * x))
+                    .collect(),
+            );
+        }
         let (be, _, _) = crate::model::layers::gguf_block_codec(f).unwrap();
         Tensor::Quantized(std::sync::Arc::new(
             crate::model::layers::QuantizedWeight::GgufQuantized {
@@ -460,12 +497,12 @@ mod tests {
     }
 
     /// Metal vs CPU for the default (GeGlu-epilogue GEMV + GEMV) and the forced one-dispatch form,
-    /// on Q4_0, Q4_K and a mixed pair.
+    /// on Q4_0, Q4_K, Q5_K, BF16 and a mixed pair.
     #[test]
     fn glu_gemv_chain_matches_cpu() {
-        use QuantFormat::{GGUF_Q4_0 as Q4, GGUF_Q4_K_M as QK};
+        use QuantFormat::{BF16, GGUF_Q4_0 as Q4, GGUF_Q4_K_M as QK, GGUF_Q5_K_M as Q5K};
         let (h, mid, layers) = (512usize, 256usize, 2usize);
-        for (fa, fb) in [(Q4, Q4), (QK, QK), (Q4, QK)] {
+        for (fa, fb) in [(Q4, Q4), (QK, QK), (Q5K, Q5K), (BF16, BF16), (Q4, QK)] {
             let g = chain_graph(h, mid, layers, fa, fb);
             let mut w = Weights::new();
             w.insert("half", Tensor::F32(vec![std::f32::consts::FRAC_1_SQRT_2]));

@@ -103,7 +103,7 @@ static CODEC_BF16: Codec = Codec {
 };
 
 /// How the expert GEMV reads a bank stored as `dtype`: every codec format, plus f32/f16/bf16.
-fn bank_codec(dtype: DType) -> Option<&'static Codec> {
+pub(super) fn bank_codec(dtype: DType) -> Option<&'static Codec> {
     match dtype {
         DType::F32 => Some(&CODEC_F32),
         DType::F16 => Some(&CODEC_F16),
