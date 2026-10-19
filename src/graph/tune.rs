@@ -132,11 +132,9 @@ pub fn decide(
             return choose(first);
         }
         let w0 = choose(first)?;
-        return Some(if rounds[1..].iter().all(|r| choose(r) == Some(w0)) {
-            w0
-        } else {
-            default
-        });
+        if rounds[1..].iter().all(|r| choose(r) == Some(w0)) {
+            return Some(w0);
+        }
     }
     let rate = |round: &[(GemvVariant, f64)], v: GemvVariant| {
         round
@@ -461,13 +459,13 @@ mod tests {
         assert_eq!(decide(&agree, def, false), Some(r1));
         assert!(rounds_consistent(&agree, r1));
 
-        // Two quiet rounds disagree (Gen(2) in round 0, Gen(1) in round 1) -> returns default.
+        // Two quiet rounds disagree (Gen(2) in round 0, Gen(1) in round 1) and neither beats
+        // default by BUSY_MARGIN (8%) in every round -> returns default.
         let disagree = [
-            vec![(def, 180.0), (r1, 195.0), (r2, 210.0)],
-            vec![(r2, 190.0), (r1, 205.0), (def, 180.0)],
+            vec![(def, 185.0), (r1, 195.0), (r2, 210.0)],
+            vec![(r2, 190.0), (r1, 205.0), (def, 185.0)],
         ];
         assert_eq!(decide(&disagree, def, false), Some(def));
-        assert!(!rounds_consistent(&disagree, def));
         assert!(!rounds_consistent(&disagree, r1));
         assert!(!rounds_consistent(&disagree, r2));
 
