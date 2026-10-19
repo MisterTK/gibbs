@@ -1,0 +1,18 @@
+{
+  "defaults": {
+    "prompt": "Explain the second law of thermodynamics to a curious student.",
+    "decode_tokens": 128,
+    "runs": 3,
+    "reencode": "bit-exact"
+  },
+  "models": [
+    {
+      "id": "ggml-org/Llama-2-7B-GGUF/Llama-2-7B-Q4_0.gguf",
+      "name": "llama2-7b-q4_0"
+    },
+    {
+      "id": "ggml-org/Llama-2-7B-GGUF/Llama-2-7B-Q8_0.gguf",
+      "name": "llama2-7b-q8_0"
+    }
+  ]
+}
