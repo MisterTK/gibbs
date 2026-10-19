@@ -6757,15 +6757,16 @@ fn attn_splits(
 }
 
 /// CPU-only listing of what [`Session::prepare_plan`] schedules for `g`: `plan` (MoE subgraph
-/// fusion included), `batch_horizontal`, the arena `allocate` and `pair_small_hand_gemvs`, without a
+/// fusion included), `batch_horizontal`, `views::elide`, the arena `allocate` and `pair_small_hand_gemvs`, without a
 /// device, weights or the tuner. A GEMV whose variant the tuner picks prints `variant=unassigned`
 /// (pairing is unaffected: without a variant override it pairs only BF16, which has one kernel).
 /// Dispatches per step follow the encoder: attention with `ctx` keys in the cache, and
 /// `MegakernelMlp`'s norm, gate, up, activation, down and optional post-norm.
 pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
     use std::fmt::Write;
-    let (steps, aliases) = plan(g)?;
+    let (steps, mut aliases) = plan(g)?;
     let mut steps = batch_horizontal(steps, &aliases);
+    views::elide(g, &mut steps, &mut aliases);
     let (offsets, arena) = allocate(g, &steps, &aliases)?;
     pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
     let mut out = String::new();
