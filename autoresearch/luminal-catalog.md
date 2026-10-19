@@ -37,6 +37,8 @@ This catalog supersedes the S8.3 labels in `plans/research-sprint-2.md`, which m
 | E3 | weights in execution order | original | | measured per block, unverified (`v2-36-blk`) | 6.6 ABBA (GPU, deferred) |
 | E4 | combine near-misses | n/a | | discarded (25) | — |
 
+Sprint 3 state: every item in the Sprint 3 column is implemented on branch `sprint3`, and none has been measured on the GPU. Knobs, defaults and CPU evidence are in the status table of `plans/research-sprint-3.md`; ledger rows are `s3-*` in `roofline-loop.tsv`. L20 replaced the greedy planner outright, with plans byte-identical on the suite rows checked.
+
 Other anchors: 0.2 `matmul.rs:79-103` matvec dispatch, compiler :196-410; 0.2 `generic.rs:88-169` CSE,
 :233-253 RemoveUnusedNodes, :382-574 ArithmeticElimination; main `src/egglog_core/`,
 `crates/luminal_metal/src/egraph_postpass.rs:31-134`, `kernels.rs:494-748` (elementwise/reduce codegen),

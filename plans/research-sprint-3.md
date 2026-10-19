@@ -3,6 +3,58 @@
 ## Goal
 Implement every Luminal technique Gibbs does not use yet, and every TODO from the Wave 12 deep dive. The five "highest-ROI" items come first (Phase 1). Phase 0 gives them their go/no-go numbers; it is a prerequisite, not new scope. Every change must be generic (graph-IR patterns and codec descriptors, no model names), must pass `scripts/loop_guard.sh` plus a multi-commit `generic_guard` over the promoted range, and is kept only through an unspliced 4-pass ABBA (`scripts/loop_verify.sh`). Every GPU job runs through `python3 ~/.cache/gibbs/central_scheduler.py run [--quiet] --label <name> -- <cmd>`.
 
+## Status on branch `sprint3` (implemented; nothing measured on the GPU)
+
+All code is on `sprint3`. The user's GPU was in use for training, so no benchmark, profile, A/B, `--bench-parity` or Metal kernel test has run. What did run, all CPU-only:
+- 102 tests that never touch a device (list: `target/sprint3/cpu-tests.txt` in the integration worktree);
+- `graph::metal::tests::every_kernel_source_compiles`, which builds the hand library (MSL 4.0 + MPP) and every generated GEMV/dequant/expert/PLE-chain variant into pipelines without dispatching. It caught a reserved MSL field name (`kernel`) in the new DeltaNet params that would have broken every Metal model at startup;
+- CPU plan dumps (P0.2 tables in `autoresearch/sprint3-probes.md`);
+- `generic_guard` over `main..sprint3`.
+
+| Item | State | Default | Per-token change in the CPU plan (dispatches) |
+| :--- | :--- | :--- | :--- |
+| P0.2 | done (`examples/plan_dump.rs`, `--rates`) | — | — |
+| P0.1 / P0.3 / P0.4 / P0.5 | `scripts/sprint3_probes.sh p01\|p03\|p04\|p05`, `bench/reference-7b.json`; not run | — | — |
+| 1.1 PLE | the default path was already 3 dispatches per layer (slice view, GeGlu GEMV epilogue, RmsNorm + residual); added the 2-dispatch chain | opt-in `GIBBS_PLE_FUSED=one` | −35 on E2B rows when on |
+| 1.2 q/k/v | fused over loader `Tensor::Mat` weights (no suite model fused q/k/v before), same-format pairs when formats differ, order-stable rewrites | on | M0/M8 −30, M1 −23, M2 −6, M3 −8 (from GGUF headers), M7 −50 |
+| 1.3 DeltaNet | one `DeltaNetStep` per layer (conv → gates → delta rule → gated norm) | on (`GIBBS_FUSION=none` disables) | M2 −126 (18 × 7); M3 −168 by layer count |
+| M2 BF16 fix (found by P0.2) | DeltaNet `in_proj_qkv`/`in_proj_z`/`out_proj` stay packed when the Qwen3.5 transform is an identity | on | about −467 MB/token streamed on M2; +18 dispatches from FP16 a/b no longer pairing |
+| 1.4 f16 KV | port of `v2-40`; split-K, flash and kv-append kernels store half, accumulate f32 | on (`GIBBS_KV_DTYPE=f32` restores) | 0 dispatches; KV bytes halved |
+| Phase 2 views | row-strided slice views for stride-taking readers (`RmsNormBatch`, `RopeBatch`, `Unary`), destination-passing concat, alias-root liveness | on | M2 −12 (q/gate copies) |
+| Phase 3 e-graph | egglog 3.0; graph fusions and every planner fusion are rules; greedy matchers, destructive passes and the `Pattern` matcher deleted; `views::elide` and `pair_small_hand_gemvs` stay post-passes (they need arena offsets / tuned variants) | on (the only planner) | 0 by construction: plan dumps byte-identical before/after on rows 0/1/2/4/7 and 12 synthetic graphs |
+| Phase 4 search | per-layer-pattern flips of e-graph choices, timed with the tuner's gating, cached in the tune file, 2 s budget | opt-in `GIBBS_PLAN_SEARCH=1` | — |
+| Phase 5 | the PLE chain (above); the DeltaNet step runs one threadgroup per key head (the scoped persistent form) | as above | — |
+| 6.1 | `gen64` 64-thread K-quant GEMV as a tuner candidate (Q4_K/Q5_K/Q6_K) | tuner decides | — |
+| 6.2 | `kquant_fused_dot_ablation` and the TQ2_0 ablation rotate ≥ 64 MB | — | — |
+| 6.3 | IQ2_XXS expert GEMV grid in threadgroup memory or a bound constant buffer | opt-in `GIBBS_IQ2_GRID=tg\|buf` | — |
+| 6.4 | DeltaNet state in f16/bf16 | opt-in `GIBBS_DELTANET_STATE=f16\|bf16` | — |
+| 6.5 | two-pass GPU argmax, one-u32 readback for greedy decode at vocab ≥ 150k | opt-in `GIBBS_GPU_ARGMAX=1` | — |
+| 6.6 | L13 / E3 verification is ABBA only | — | — |
+| 6.7 | `MTLResidencySet` not pursued (llama.cpp `NO_RESIDENCY` showed no effect) | — | — |
+| Phase 7 | catalog status/sprint columns, this table, ledger rows `s3-*` | — | — |
+
+**Premises this plan got wrong, found while implementing:**
+- "M1 already fuses QKV": no suite model fused q/k/v. `fuse_qkv_pass` rejected every `Tensor::Mat`, which every model builder supplies.
+- "M7 mixes q/k/v formats": every M7 layer shares one format. M1, M2 and M3 are the mixed ones.
+- PLE was already fused to 3 dispatches per layer; only the opt-in 2-dispatch chain is new.
+- M2's real gap included 467 MB/token of needlessly dequantized DeltaNet projections: about 1.80 GB streamed against the 1.33 GB the roofline counts.
+
+**Costs introduced:**
+- About +6 ms per uncached `prepare_plan` (egglog saturation floor). Gemma prefill's fixed 64-row chunks hit a 4-entry plan cache; scheduler prefill chunks (Llama/SmolLM path) vary in length and pay it each time.
+- Graph-level e-graph compile is 6–38 ms per model at load. The post-extraction weight rewrite adds 38–44 ms on M0/M1/M2 and 365 ms on M7.
+- Up to 378 MiB more resident memory on M7 for the concatenated q/k/v copies (worst case, if the original file pages stay resident).
+
+**Pending the GPU go-ahead, in order:**
+1. Metal tests:
+   - `cargo test --lib` (all), then the `#[ignore]` GPU tests named in the ledger rows;
+   - `--bench-parity` on the 5 parity models.
+2. `scripts/sprint3_probes.sh p01 p03 p04 p05`.
+3. ABBA (`scripts/loop_verify.sh`):
+   - `main` vs `sprint3` on the whole suite.
+   - Within `sprint3`, A/B every item that has a switch: `GIBBS_KV_DTYPE=f32`, `GIBBS_FUSION=none` (covers the DeltaNet step), and each opt-in knob alone.
+   - q/k/v-over-`Mat`, views and the M2 packing fix have no switch, so they are measured together through the per-model rows. A model that loses gets bisected against its plan-dump deltas.
+4. Merge to `main` only through the keep gate.
+
 ## Baseline (`main` @ `5de3057`, README rows = `bg_232` cand1 pass)
 
 | Model | tok/s | % roofline | dispatches | GPU ms | weights ms at ceiling | GPU ms not streaming weights | llama.cpp tok/s (2026-10-13) |
