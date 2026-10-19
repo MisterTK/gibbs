@@ -1545,6 +1545,35 @@ mod tests {
         let got = run_stateless(&og, &ow, inputs).unwrap();
         assert_eq!(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
     }
+
+    /// Fusing q/k/v keeps every other node in its original relative order and puts the fused
+    /// projection and its slices where the first fused projection was, so order-sensitive planner
+    /// fusions downstream (MoE router/top-k, norm batching) still see their patterns.
+    #[test]
+    fn qkv_fusion_keeps_node_order_of_moe_decode_graph() {
+        let (g, mut w) = tiny_moe_decode_graph().unwrap();
+        let mut fg = g.clone();
+        assert!(crate::graph::passes::fusion::fuse_qkv_pass(&mut fg, Some(&mut w)) > 0);
+        let names = |g: &crate::graph::Graph| -> Vec<String> {
+            g.nodes.iter().map(|n| n.name.clone()).collect()
+        };
+        let (before, after) = (names(&g), names(&fg));
+        let fused: Vec<&String> = before.iter().filter(|n| !after.contains(n)).collect();
+        assert!(!fused.is_empty());
+        let kept: Vec<&String> = before.iter().filter(|n| after.contains(n)).collect();
+        let kept_after: Vec<&String> = after.iter().filter(|n| before.contains(n)).collect();
+        assert_eq!(kept, kept_after);
+        // Each layer's fused Linear sits right after the last node that preceded its q.
+        for (i, n) in after
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.ends_with(".fused_qkv"))
+        {
+            let q = n.trim_end_matches(".fused_qkv");
+            let q_at = before.iter().position(|b| b == q).unwrap();
+            assert_eq!(after[i - 1], before[q_at - 1], "{n}");
+        }
+    }
     #[test]
     fn test_gemma4_to_decode_graph_with_ple_cpu_parity() {
         use crate::graph::cpu::run_stateless;
