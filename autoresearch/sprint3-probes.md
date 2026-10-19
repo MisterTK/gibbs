@@ -71,7 +71,7 @@ None of the four models fuses Q/K/V. Separate q/k/v `GemvPacked` steps per token
 | M7 | 30 | 30 | 25 | 85 | **same dtype within every layer**: Q5_K × 3 (25 layers), Q5_K q/k with no v (4), Q6_K q/k with no v (1) |
 
 - **M7 per-layer dtypes:** read from the dump and confirmed from the GGUF header (CPU tensor-info parse). q/k/v share a dtype in every layer. This contradicts the plan's "M7 (mixed formats)". The 5 layers without a v GEMV use k as v.
-- **Fusion gap:** `fuse_qkv_pass` (`src/graph/passes/fusion.rs:203`) cannot fuse any of these triples, whatever their dtypes. The Gemma 4 builder inserts q/k/v as `Mat::to_graph_tensor()` (`src/model/gemma4/text.rs:732, 792, 838`), which returns `Tensor::Mat` (`src/model/weights.rs:46-47`). The pass returns `None` whenever q, k or v is a `Tensor::Mat` (`fusion.rs:280-285`). That covers M0, M1, M7 and M8, which share the builder. The Qwen builder (M2) was not checked.
+- **Fusion gap:** `fuse_qkv_pass` (`src/graph/passes/fusion.rs:203`) cannot fuse any of these triples, whatever their dtypes. The Gemma 4 builder inserts q/k/v as `Mat::to_graph_tensor()` (`src/model/gemma4/text.rs:732, 792, 838`), which returns `Tensor::Mat` (`src/model/weights.rs:46-47`). The pass returns `None` whenever q, k or v is a `Tensor::Mat` (`fusion.rs:280-285`). The Qwen builder (M2) does the same (`part.to_graph_tensor()`, `src/model/qwen3_5/text.rs:1264, 1287`), so this blocks every suite GGUF model.
 - **Plan correction:** the plan's "M1 is already fused" is not what the dump shows.
 - **Go condition (≥ 30 separable q/k/v dispatches on some model):** met on M0, M1 and M7.
 
