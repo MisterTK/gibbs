@@ -288,7 +288,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
 #[cfg(test)]
 mod tests {
     use super::super::super::testutil::{rand, rel_err, rt};
-    use super::super::super::{batch_horizontal, plan, Session, Step as Core};
+    use super::super::super::{batch_horizontal, plan, Epi, Session, Step as Core};
     use super::super::ExtStep;
     use super::{fuse, Step, FORCE};
     use crate::graph::{cpu, DType, Graph, Op, Tensor, Weights};
@@ -364,13 +364,15 @@ mod tests {
     /// and `fuse` turns the two GEMVs into one `GluGemvChain`.
     #[test]
     fn glu_gemv_chain_plans_to_one_step() {
-        let g = chain_graph(
+        let mut g = chain_graph(
             512,
             256,
             2,
             QuantFormat::GGUF_Q4_0,
             QuantFormat::GGUF_Q4_K_M,
         );
+        // The compile pipeline (`program.rs`) runs these before planning.
+        crate::graph::passes::run_optimization_passes(&mut g, None).unwrap();
         let (steps, aliases) = plan(&g).unwrap();
         let base = kinds(&batch_horizontal(steps.clone(), &aliases));
         eprintln!("default: {base:?}");
@@ -486,13 +488,18 @@ mod tests {
             for force in [false, true] {
                 FORCE.set(force);
                 let s = Session::new(rt(), &w).unwrap();
-                let n_fused = s
-                    .prepare_plan(&g)
-                    .unwrap()
-                    .steps
-                    .iter()
-                    .filter(|st| matches!(st.op, Core::Ext(ExtStep::Ple(_))))
-                    .count();
+                let plan = s.prepare_plan(&g).unwrap();
+                let count = |f: fn(&Core) -> bool| plan.steps.iter().filter(|st| f(&st.op)).count();
+                let n_fused = count(|op| matches!(op, Core::Ext(ExtStep::Ple(_))));
+                let n_epi = count(|op| {
+                    matches!(
+                        op,
+                        Core::GemvPacked {
+                            epi: Epi::GeGlu,
+                            ..
+                        }
+                    )
+                });
                 let got = s
                     .run(&g, inputs.clone())
                     .unwrap()
@@ -501,6 +508,7 @@ mod tests {
                     .unwrap();
                 FORCE.set(false);
                 assert_eq!(n_fused, if force { layers } else { 0 }, "{fa:?}/{fb:?}");
+                assert_eq!(n_epi, if force { 0 } else { layers }, "{fa:?}/{fb:?}");
                 let err = rel_err(&want, &got);
                 assert!(err < 1e-4, "{fa:?}/{fb:?} force={force}: rel err {err}");
             }
