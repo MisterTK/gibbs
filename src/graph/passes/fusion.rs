@@ -235,63 +235,55 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
             return None;
         }
 
-        let q_w_id = g.node(q_id).inputs.get(1).copied()?;
-        let k_w_id = g.node(k_id).inputs.get(1).copied()?;
-        let v_w_id = g.node(v_id).inputs.get(1).copied()?;
+        let all = [
+            ("q", q_id, g.node(q_id).inputs.get(1).copied()?),
+            ("k", k_id, g.node(k_id).inputs.get(1).copied()?),
+            ("v", v_id, g.node(v_id).inputs.get(1).copied()?),
+        ];
 
-        // Verify identical dtypes
-        let dtype = g.value(q_w_id).dtype;
-        if g.value(k_w_id).dtype != dtype || g.value(v_w_id).dtype != dtype {
+        // Fuse all three when their formats match; otherwise the same-format pair that is
+        // adjacent in q|k|v row order, leaving the odd one as its own projection.
+        let dt = |i: usize| g.value(all[i].2).dtype;
+        let legs: &[_] = if dt(0) == dt(1) && dt(1) == dt(2) {
+            &all
+        } else if dt(0) == dt(1) {
+            &all[..2]
+        } else if dt(1) == dt(2) {
+            &all[1..]
+        } else {
+            return None;
+        };
+        let dtype = g.value(legs[0].2).dtype;
+
+        let w_shapes: Vec<Vec<usize>> = legs.iter().map(|l| g.value(l.2).shape.clone()).collect();
+        if w_shapes
+            .iter()
+            .any(|s| s.len() != 2 || s[1] != w_shapes[0][1])
+        {
             return None;
         }
+        let in_features = w_shapes[0][1];
+        let total_out: usize = w_shapes.iter().map(|s| s[0]).sum();
 
-        let q_w_shape = g.value(q_w_id).shape.clone();
-        let k_w_shape = g.value(k_w_id).shape.clone();
-        let v_w_shape = g.value(v_w_id).shape.clone();
-
-        if q_w_shape.len() != 2 || k_w_shape.len() != 2 || v_w_shape.len() != 2 {
-            return None;
-        }
-        if q_w_shape[1] != k_w_shape[1] || q_w_shape[1] != v_w_shape[1] {
-            return None;
-        }
-
-        let in_features = q_w_shape[1];
-        let q_out = q_w_shape[0];
-        let k_out = k_w_shape[0];
-        let v_out = v_w_shape[0];
-        let total_out = q_out + k_out + v_out;
-
-        let q_name = g.node(q_id).name.clone();
-        let k_name = g.node(k_id).name.clone();
-        let v_name = g.node(v_id).name.clone();
-
-        let q_out_shape = g.value(g.node(q_id).outputs[0]).shape.clone();
-        let k_out_shape = g.value(g.node(k_id).outputs[0]).shape.clone();
-        let v_out_shape = g.value(g.node(v_id).outputs[0]).shape.clone();
-
-        let fused_w_name = format!("{}_fused_qkv_w", q_name);
+        let first_name = g.node(legs[0].1).name.clone();
+        let tag: String = legs.iter().map(|l| l.0).collect();
+        let fused_w_name = format!("{first_name}_fused_{tag}_w");
 
         // If weights are provided, we MUST be able to fuse the weight tensors
-        if let Some(ref w_store) = weights {
-            let q_t = w_store.get(&g.value(q_w_id).name)?;
-            let k_t = w_store.get(&g.value(k_w_id).name)?;
-            let v_t = w_store.get(&g.value(v_w_id).name)?;
-            if matches!(q_t, Tensor::Mat(_))
-                || matches!(k_t, Tensor::Mat(_))
-                || matches!(v_t, Tensor::Mat(_))
-            {
-                return None;
+        if let Some(w_store) = &weights {
+            let mut ts = Vec::with_capacity(legs.len());
+            for l in legs {
+                let t = w_store.get(&g.value(l.2).name)?;
+                if matches!(t, Tensor::Mat(_)) {
+                    return None;
+                }
+                ts.push(t);
             }
-            let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t], in_features)?;
+            let fused_tensor = concat_weight_tensors(&ts, in_features)?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
-            let old_names = vec![
-                g.value(q_w_id).name.clone(),
-                g.value(k_w_id).name.clone(),
-                g.value(v_w_id).name.clone(),
-            ];
+            let old_names = legs.iter().map(|l| g.value(l.2).name.clone()).collect();
             weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
         }
 
@@ -303,50 +295,34 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
         }
 
         let fused_lin = g.add(
-            format!("{}.fused_qkv", q_name),
+            format!("{first_name}.fused_{tag}"),
             Op::Linear,
             &[in_val, fused_w],
             fused_out_shape,
             DType::F32,
         );
 
-        let q_slice = g.add(
-            format!("{}.q_slice", q_name),
-            Op::Slice {
-                axis: -1,
-                start: 0,
-                end: q_out as i64,
-            },
-            &[fused_lin],
-            q_out_shape,
-            DType::F32,
-        );
+        let mut start = 0;
+        let mut slices = Vec::with_capacity(legs.len());
+        for (l, ws) in legs.iter().zip(&w_shapes) {
+            let name = format!("{}.{}_slice", g.node(l.1).name, l.0);
+            let out_shape = g.value(g.node(l.1).outputs[0]).shape.clone();
+            let end = start + ws[0];
+            slices.push(g.add(
+                name,
+                Op::Slice {
+                    axis: -1,
+                    start: start as i64,
+                    end: end as i64,
+                },
+                &[fused_lin],
+                out_shape,
+                DType::F32,
+            ));
+            start = end;
+        }
 
-        let k_slice = g.add(
-            format!("{}.k_slice", k_name),
-            Op::Slice {
-                axis: -1,
-                start: q_out as i64,
-                end: (q_out + k_out) as i64,
-            },
-            &[fused_lin],
-            k_out_shape,
-            DType::F32,
-        );
-
-        let v_slice = g.add(
-            format!("{}.v_slice", v_name),
-            Op::Slice {
-                axis: -1,
-                start: (q_out + k_out) as i64,
-                end: total_out as i64,
-            },
-            &[fused_lin],
-            v_out_shape,
-            DType::F32,
-        );
-
-        Some((vec![q_id, k_id, v_id], vec![q_slice, k_slice, v_slice]))
+        Some((legs.iter().map(|l| l.1).collect(), slices))
     });
 
     if let Some(ref mut w_store) = weights {
@@ -666,6 +642,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// x -> norm -> {q,k,v} Linear with per-projection weight dtypes (F16 weights stand in for a
+    /// second codec). Returns the graph, its weights and the input.
+    fn qkv_graph(dts: [DType; 3]) -> (Graph, Weights, Vec<Tensor>) {
+        let (h, rows) = (8usize, [8usize, 4, 4]);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, h], DType::F32);
+        let gamma = g.weight("gamma", vec![h], DType::F32);
+        let norm = g.add(
+            "norm",
+            Op::RmsNorm { eps: 1e-5 },
+            &[x, gamma],
+            vec![1, h],
+            DType::F32,
+        );
+        let mut weights = Weights::new();
+        weights.insert("gamma", Tensor::F32(vec![1.0; h]));
+        for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
+            let n = rows[i] * h;
+            let wn = format!("w_{name}");
+            let w = g.weight(&wn, vec![rows[i], h], dts[i]);
+            // Exact halves of the form ±(j%5)/4, so F16 and F32 weights both decode exactly.
+            let vals = (0..n).map(|j| ((j * (i + 3)) % 5) as f32 / 4.0 - 0.5);
+            weights.insert(
+                wn,
+                match dts[i] {
+                    DType::F16 => Tensor::F16(
+                        vals.map(|f| match (f * 4.0) as i32 {
+                            -2 => 0xB800,
+                            -1 => 0xB400,
+                            0 => 0,
+                            1 => 0x3400,
+                            _ => 0x3800,
+                        })
+                        .collect(),
+                    ),
+                    _ => Tensor::F32(vals.collect()),
+                },
+            );
+            let out = g.add(name, Op::Linear, &[norm, w], vec![1, rows[i]], DType::F32);
+            g.output(out);
+        }
+        let input = vec![Tensor::F32((0..h).map(|i| i as f32 * 0.3 - 1.0).collect())];
+        (g, weights, input)
+    }
+
+    /// Runs `fuse_qkv_pass`, checks CPU parity with the unfused graph, and returns the names of
+    /// the remaining Linear nodes.
+    fn fuse_and_check(dts: [DType; 3]) -> Vec<String> {
+        use crate::graph::cpu::run_stateless;
+        let (g, w, input) = qkv_graph(dts);
+        let base = run_stateless(&g, &w, input.clone()).unwrap();
+        let (mut fg, mut fw) = (g.clone(), w.clone());
+        assert_eq!(fuse_qkv_pass(&mut fg, Some(&mut fw)), 1);
+        assert!(validate_ssa(&fg).is_ok());
+        let fused = run_stateless(&fg, &fw, input).unwrap();
+        assert_eq!(base.len(), fused.len());
+        for (b, f) in base.iter().zip(&fused) {
+            assert_eq!(b.as_f32().unwrap(), f.as_f32().unwrap());
+        }
+        let mut names: Vec<String> = fg
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, Op::Linear))
+            .map(|n| n.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn fuse_qkv_pass_mixed_formats_fuses_adjacent_pair() {
+        let (h, f) = (DType::F16, DType::F32);
+        assert_eq!(fuse_and_check([h, h, f]), ["q.fused_qk", "v"]);
+        assert_eq!(fuse_and_check([f, h, h]), ["k.fused_kv", "q"]);
+        // Same-format pair not adjacent in q|k|v order: nothing to fuse.
+        let (mut g, mut w, _) = qkv_graph([h, f, h]);
+        assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 0);
+    }
+
+    #[test]
+    fn fuse_qkv_pass_same_format_still_fuses_all_three() {
+        let f = DType::F32;
+        assert_eq!(fuse_and_check([f, f, f]), ["q.fused_qkv"]);
     }
 }
 
