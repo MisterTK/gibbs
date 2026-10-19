@@ -1041,7 +1041,7 @@ impl NativeLm for Dense {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, false, false)?.into_f32()
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, false, false)?)
     }
 
     fn forward_greedy(
@@ -1059,7 +1059,7 @@ impl NativeLm for Dense {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, true, false)?.into_f32()
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, true, false)?)
     }
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
@@ -1343,7 +1343,7 @@ impl NativeLm for Qwen35 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, false, false)?.into_f32()
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, false, false)?)
     }
 
     fn forward_greedy(
@@ -1364,7 +1364,7 @@ impl NativeLm for Qwen35 {
         if self.text.is_hc() {
             return Err("this model cannot verify draft tokens".into());
         }
-        self.run(tokens, start_pos, state, true, false)?.into_f32()
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, true, false)?)
     }
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {

@@ -325,7 +325,7 @@ impl NativeLm for Gemma4 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.pass(tokens, start_pos, state, false)?.into_f32()
+        crate::model::native::logits_of(self.pass(tokens, start_pos, state, false)?)
     }
     fn forward_greedy(
         &self,
@@ -414,7 +414,7 @@ impl Gemma4 {
         };
         st.done = stop;
         if stop > end {
-            st.logits = logits.clone().into_f32()?;
+            st.logits = crate::model::native::logits_of(logits.clone())?;
         }
         Ok(logits)
     }

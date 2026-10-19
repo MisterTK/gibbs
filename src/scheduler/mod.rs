@@ -176,7 +176,7 @@ impl ExecutableModel {
                 Some(SeqKvCache::Native(state)) if greedy => {
                     match m.forward_greedy(&[last_token], pos - 1, state)? {
                         crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok(t[0]),
-                        t => t.into_f32()?,
+                        t => crate::model::native::logits_of(t)?,
                     }
                 }
                 Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,

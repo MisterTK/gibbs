@@ -30,6 +30,15 @@ pub struct PrepareCtx {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// The logits of a forward result; a device-picked token (`U32`, [`NativeLm::forward_greedy`])
+/// where logits are expected is an error, never a one-element row.
+pub fn logits_of(t: crate::graph::Tensor) -> Result<Vec<f32>, String> {
+    match t {
+        crate::graph::Tensor::F32(v) => Ok(v),
+        _ => Err("expected f32 logits, got a device-picked token".into()),
+    }
+}
+
 pub trait NativeLm: Send + Sync {
     /// Compute label for logs and the TUI header, e.g. `CPU (NEON SIMD), 15 threads`.
     fn backend_label(&self) -> String;
