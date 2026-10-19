@@ -1601,25 +1601,59 @@ mod tests {
         );
         assert_ne!(
             stub_msl, real_msl,
-            "expected IQ2XXS_GRID lookup in decode_group"
+            "expected IQ2XXS_GRID lookup in dot_group"
         );
-        let stub_src = format!("#include <metal_stdlib>\nusing namespace metal;\n{stub_msl}");
+        let u16_items: Vec<String> = crate::model::layers::IQ2XXS_GRID
+            .iter()
+            .map(|&v| {
+                let mut code16 = 0u16;
+                for j in 0..8 {
+                    let b = ((v >> (8 * j)) & 0xFF) as u8;
+                    let c: u16 = match b {
+                        8 => 0,
+                        25 => 1,
+                        43 => 2,
+                        other => panic!("unexpected IQ2XXS_GRID byte {other}"),
+                    };
+                    code16 |= c << (2 * j);
+                }
+                format!("{code16:#06x}u")
+            })
+            .collect();
+        let u16_tbl = format!(
+            "constant ushort IQ2XXS_GRID_U16[256] = {{\n{}\n}};\n",
+            u16_items.join(",")
+        );
+        let u16_msl = format!(
+            "{u16_tbl}{}",
+            real_msl.replace(
+                "uint2 gw = as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]);\n        float4 g0 = float4(as_type<uchar4>(gw.x)), g1 = float4(as_type<uchar4>(gw.y));",
+                "uint g16 = uint(IQ2XXS_GRID_U16[(q4 >> (8 * k)) & 0xFFu]);\n        uint4 c0 = (uint4(g16) >> uint4(0u, 2u, 4u, 6u)) & 3u;\n        uint4 c1 = (uint4(g16) >> uint4(8u, 10u, 12u, 14u)) & 3u;\n        float4 g0 = float4(8u + c0 * 17u + (c0 >> 1u)), g1 = float4(8u + c1 * 17u + (c1 >> 1u));",
+            )
+        );
+        assert!(
+            u16_msl.contains("IQ2XXS_GRID_U16[(q4 >> (8 * k)) & 0xFFu]"),
+            "expected IQ2XXS_GRID_U16 lookup in u16_msl"
+        );
         let opts = super::CompileOptions::new();
-        let lib = s
-            .rt
-            .device
-            .new_library_with_source(&stub_src, &opts)
-            .expect("compile IQ2_XXS const_stub MSL");
-        let func = lib
-            .get_function(&super::gemv_indexed_name(c, params), None)
-            .expect("get function");
-        let stub_pso = s
-            .rt
-            .device
-            .new_compute_pipeline_state_with_function(&func)
-            .expect("create const_stub PSO");
+        let compile_pso = |msl: &str, label: &str| {
+            let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{msl}");
+            let lib = s
+                .rt
+                .device
+                .new_library_with_source(&src, &opts)
+                .unwrap_or_else(|e| panic!("compile {label}: {e}"));
+            let func = lib
+                .get_function(&super::gemv_indexed_name(c, params), None)
+                .expect("get function");
+            s.rt.device
+                .new_compute_pipeline_state_with_function(&func)
+                .unwrap_or_else(|e| panic!("create {label} PSO: {e}"))
+        };
+        let u16_pso = compile_pso(&u16_msl, "IQ2_XXS u16_grid");
+        let stub_pso = compile_pso(&stub_msl, "IQ2_XXS const_stub");
         super::TEST_ROWS_PER_SG.set(2);
-        for pso in [&real_pso, &stub_pso] {
+        for pso in [&real_pso, &u16_pso, &stub_pso] {
             super::TEST_PSO_OVERRIDE.with(|cell| *cell.borrow_mut() = Some((*pso).clone()));
             for _ in 0..5 {
                 s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
@@ -1627,12 +1661,16 @@ mod tests {
             }
         }
         let mut real_rounds = Vec::with_capacity(5);
+        let mut u16_rounds = Vec::with_capacity(5);
         let mut stub_rounds = Vec::with_capacity(5);
         for _round in 0..5 {
-            let mut real_sum = 0.0;
-            let mut stub_sum = 0.0;
-            for is_stub in [false, true, true, false] {
-                let pso = if is_stub { &stub_pso } else { &real_pso };
+            let mut sums = [0.0f64; 3];
+            for idx in [0usize, 1, 2, 2, 1, 0] {
+                let pso = match idx {
+                    0 => &real_pso,
+                    1 => &u16_pso,
+                    _ => &stub_pso,
+                };
                 super::TEST_PSO_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(pso.clone()));
                 let mut leg_s = 0.0;
                 for _ in 0..10 {
@@ -1640,26 +1678,26 @@ mod tests {
                         .unwrap();
                     leg_s += s.last_gpu_seconds() / (10.0 * 8.0);
                 }
-                if is_stub {
-                    stub_sum += 0.5 * leg_s;
-                } else {
-                    real_sum += 0.5 * leg_s;
-                }
+                sums[idx] += 0.5 * leg_s;
             }
-            real_rounds.push(real_sum);
-            stub_rounds.push(stub_sum);
+            real_rounds.push(sums[0]);
+            u16_rounds.push(sums[1]);
+            stub_rounds.push(sums[2]);
         }
         super::TEST_PSO_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
         super::TEST_ROWS_PER_SG.set(0);
         real_rounds.sort_by(|a, b| a.total_cmp(b));
+        u16_rounds.sort_by(|a, b| a.total_cmp(b));
         stub_rounds.sort_by(|a, b| a.total_cmp(b));
-        let (real_s, stub_s) = (real_rounds[2], stub_rounds[2]);
-        let (real_med_us, live_q4_no_lut_med_us) = (real_s * 1e6, stub_s * 1e6);
+        let (real_s, u16_s, stub_s) = (real_rounds[2], u16_rounds[2], stub_rounds[2]);
+        let (real_med_us, u16_med_us, live_q4_no_lut_med_us) =
+            (real_s * 1e6, u16_s * 1e6, stub_s * 1e6);
         let lut_cost_us = real_med_us - live_q4_no_lut_med_us;
         let real_gbps = routed_bytes as f64 / real_s / 1e9;
+        let u16_gbps = routed_bytes as f64 / u16_s / 1e9;
         let stub_gbps = routed_bytes as f64 / stub_s / 1e9;
         println!(
-            "iq2xxs_ablation 1408x2816: real_med_us={real_med_us:.1}us ({real_gbps:.1} GB/s) vs live_q4_no_lut_med_us={live_q4_no_lut_med_us:.1}us ({stub_gbps:.1} GB/s) [lut_cost_us={lut_cost_us:.1}us]"
+            "iq2xxs_ablation 1408x2816: real_med_us={real_med_us:.1}us ({real_gbps:.1} GB/s) vs u16_med_us={u16_med_us:.1}us ({u16_gbps:.1} GB/s) vs live_q4_no_lut_med_us={live_q4_no_lut_med_us:.1}us ({stub_gbps:.1} GB/s) [lut_cost_us={lut_cost_us:.1}us]"
         );
     }
 }
