@@ -6,6 +6,8 @@ struct EwUnaryParams {
     uint kind;
     float a; // Scale: factor; Clamp: min; SoftCap: cap
     float b; // Clamp: max
+    uint xlen;    // x is rows of `xlen` elements `xstride` apart (dense: xlen == xstride)
+    uint xstride;
 };
 
 kernel void unary_f32(device const float* x [[buffer(0)]],
@@ -13,7 +15,7 @@ kernel void unary_f32(device const float* x [[buffer(0)]],
                       constant EwUnaryParams& p [[buffer(2)]],
                       uint i [[thread_position_in_grid]]) {
     if (i >= p.n) return;
-    float v = x[i];
+    float v = x[p.xlen == p.xstride ? i : (i / p.xlen) * p.xstride + i % p.xlen];
     float r = v;
     switch (p.kind) {
         case 0: r = exp(v); break;
