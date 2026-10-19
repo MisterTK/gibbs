@@ -1814,19 +1814,17 @@ mod tests {
         let cpu_logits = cpu_res[0].as_f32().expect("f32 cpu logits");
 
         let rt = Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
-        let session = Session::new(rt, &w).expect("session succeeds");
+        let mut session = Session::new(rt, &w).expect("session succeeds");
+        session.set_kv_f16(false);
         let metal_res = session.run(&decode_g, inputs).expect("metal run succeeds");
         let metal_logits = metal_res[0].as_f32().expect("f32 metal logits");
 
         assert_eq!(cpu_logits.len(), metal_logits.len());
-        // Shared-KV layers read the cache: default f16 KV adds ~2^-11 relative rounding per cached value.
-        let scale = cpu_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let bound = if crate::graph::metal::kv_f16_default() { 1e-4 + 2e-3 * scale } else { 1e-4 };
         for (i, (&c, &m)) in cpu_logits.iter().zip(metal_logits).enumerate() {
             let diff = (c - m).abs();
             assert!(
-                diff < bound,
-                "Metal mismatch at index {i}: cpu={c}, metal={m} (bound {bound})"
+                diff < 1e-4,
+                "Metal mismatch at index {i}: cpu={c}, metal={m}"
             );
         }
     }
@@ -1925,7 +1923,8 @@ mod tests {
         }
         let graph = model.to_prefill_graph(ids.len()).unwrap();
         let weights = model.to_decode_graph().unwrap().1;
-        let session = Session::new(Runtime::shared().unwrap(), &weights).unwrap();
+        let mut session = Session::new(Runtime::shared().unwrap(), &weights).unwrap();
+        session.set_kv_f16(false);
         for blocks in [vec![], vec![3..7]] {
             let want = model.forward(x.clone(), &ids, 0, &mut model.new_cache(), &blocks);
             let visible_end = (0..ids.len())
@@ -1951,12 +1950,9 @@ mod tests {
                 .zip(got)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            // Default f16 KV adds ~2^-11 relative rounding per cached K/V, growing with the logit scale.
-            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let bound = if crate::graph::metal::kv_f16_default() { 2e-3 + 2e-3 * scale } else { 2e-3 };
             assert!(
-                worst < bound,
-                "blocks {blocks:?}: max |host - metal| = {worst} (bound {bound})"
+                worst < 2e-3,
+                "blocks {blocks:?}: max |host - metal| = {worst}"
             );
         }
     }
