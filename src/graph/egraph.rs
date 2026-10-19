@@ -494,6 +494,8 @@ struct Group {
     anchor: i64,
     /// QKV pair fusions: the class of the triple's unfused projection (the rewriter's third capture).
     odd: Option<Value>,
+    /// Class of the fused `Lin` whose slices the members are (gate/up, QKV).
+    fused: Option<Value>,
 }
 
 struct Extract<'a> {
@@ -566,346 +568,593 @@ impl Extract<'_> {
     }
 }
 
+/// One fusion the extraction chose or rejected: the unit of Phase-4 plan search.
+#[derive(Debug, Clone)]
+pub struct Choice {
+    /// Index into [`Fusion::choices`]; what [`Fusion::apply`] flips.
+    pub id: usize,
+    /// `"megakernel-mlp"`, `"gate-up"`, `"qkv"` or `"qkv-slices-attn"`.
+    pub kind: &'static str,
+    /// Structural key (FNV-1a over kind, op kinds, shapes and dtypes of the fused values and their
+    /// weights; no ids or names): repeated layers share it, stable across processes.
+    pub pattern: u64,
+    /// Whether the cost model applies it.
+    pub on: bool,
+    /// Modelled cost change of applying it alone to the unfused graph (µs; negative = faster).
+    pub delta_us: f64,
+}
+
+/// How to materialize one choice.
+struct Pick {
+    kind: Kind,
+    /// Add / attention output (`Mlp` / `Rewired`).
+    anchor: Option<ValueId>,
+    /// Gate/up and QKV members (+ a pair's odd projection); `Err(glu)`: a fused gate/up Linear.
+    members: Vec<Result<ValueId, ValueId>>,
+    /// Original node outputs the fusion removes; `touches` adds what it reads unfused (a pair's
+    /// odd projection), which another fusion must not remove first.
+    covers: Vec<ValueId>,
+    touches: Vec<ValueId>,
+    /// Fused gate/up picks a QKV pick reads.
+    requires: Vec<usize>,
+}
+
+impl Pick {
+    fn conflicts(&self, o: &Pick) -> bool {
+        self.touches.iter().any(|v| o.covers.contains(v))
+            || o.touches.iter().any(|v| self.covers.contains(v))
+    }
+}
+
+/// Node outputs a megakernel MLP anchored at Add output `add` replaces (the pass's chain).
+fn mlp_cover(g: &Graph, add: ValueId) -> Vec<ValueId> {
+    let prod = |v: ValueId| match g.value(v).kind {
+        ValueKind::Node(n) => Some(&g.nodes[n.0 as usize]),
+        _ => None,
+    };
+    let mut out = vec![add];
+    let Some(a) = prod(add) else { return out };
+    for &d in &a.inputs {
+        let mut d = d;
+        let mut chain = vec![d];
+        if let Some(p) = prod(d).filter(|p| matches!(p.op, Op::RmsNorm { .. })) {
+            d = p.inputs[0];
+            chain.push(d);
+        }
+        let Some(down) = prod(d).filter(|p| p.op == Op::Linear) else {
+            continue;
+        };
+        let Some(glu) = prod(down.inputs[0]).filter(|p| matches!(p.op, Op::SwiGlu | Op::GeGlu))
+        else {
+            continue;
+        };
+        chain.push(down.inputs[0]);
+        chain.extend(&glu.inputs);
+        if let Some(gate) = prod(glu.inputs[0]) {
+            chain.push(gate.inputs[0]);
+        }
+        out.extend(chain);
+        break;
+    }
+    out
+}
+
+/// Node outputs the QKV-slices→attention rewrite at attention output `a` removes.
+fn attn_cover(g: &Graph, a: ValueId) -> Vec<ValueId> {
+    let mut out = vec![a];
+    if let ValueKind::Node(n) = g.value(a).kind {
+        let att = &g.nodes[n.0 as usize];
+        for (i, &v) in att.inputs.iter().take(3).enumerate() {
+            out.push(v);
+            if let (true, ValueKind::Node(r)) = (i < 2, &g.value(v).kind) {
+                out.push(g.nodes[r.0 as usize].inputs[0]);
+            }
+        }
+    }
+    out
+}
+
+/// A saturated and extracted e-graph of one graph: its fusion choices, and the materialization of
+/// the cost model's set ([`Fusion::apply`] with no flips) or of any other consistent set.
+pub struct Fusion {
+    choices: Vec<Choice>,
+    picks: Vec<Pick>,
+    report: Report,
+}
+
 /// Runs the e-graph fusion on `graph` (after canonical/decompose/dtype_adapt), applying the
 /// extracted fusions in place and updating `weights` like the passes do.
 pub fn fuse(
     graph: &mut Graph,
-    mut weights: Option<&mut Weights>,
+    weights: Option<&mut Weights>,
     rules: &[Rule],
     cost: &CostModel,
     budget: Budget,
 ) -> Result<Report, String> {
-    let mut report = Report::default();
-    let err = |e: egglog::Error| format!("egraph: {e}");
+    Fusion::new(graph, weights.as_deref(), rules, cost, budget)?.apply(graph, weights, &[])
+}
 
-    let t = Instant::now();
-    let mut eg = EGraph::default();
-    let mut program = String::from(SCHEMA);
-    for r in rules {
-        program.push_str(r.text());
+impl Fusion {
+    /// Encodes, saturates and extracts `g` (`weights` decide which concatenations are possible).
+    pub fn new(
+        g: &Graph,
+        weights: Option<&Weights>,
+        rules: &[Rule],
+        cost: &CostModel,
+        budget: Budget,
+    ) -> Result<Self, String> {
+        Self::build(g, weights, rules, cost, budget)
     }
-    program.push_str(&encode(graph, weights.as_deref())?);
-    eg.parse_and_run_program(None, &program).map_err(err)?;
-    report.encode_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let t = Instant::now();
-    let sid = eg.add_scheduler(Box::new(MatchBudget {
-        limit: budget.match_limit,
-        used: HashMap::new(),
-    }));
-    for _ in 0..budget.max_iters {
-        if !eg
-            .step_rules_with_scheduler(sid, "fuse")
-            .map_err(err)?
-            .updated
-        {
-            break;
+    pub fn choices(&self) -> &[Choice] {
+        &self.choices
+    }
+
+    /// Timings of [`Fusion::new`] (encode, saturate, extract) and counts.
+    pub fn report(&self) -> &Report {
+        &self.report
+    }
+}
+
+impl Fusion {
+    fn build(
+        g: &Graph,
+        weights: Option<&Weights>,
+        rules: &[Rule],
+        cost: &CostModel,
+        budget: Budget,
+    ) -> Result<Self, String> {
+        let mut report = Report::default();
+        let err = |e: egglog::Error| format!("egraph: {e}");
+
+        let t = Instant::now();
+        let mut eg = EGraph::default();
+        let mut program = String::from(SCHEMA);
+        for r in rules {
+            program.push_str(r.text());
         }
-    }
-    eg.remove_scheduler(sid);
-    report.saturate_ms = t.elapsed().as_secs_f64() * 1e3;
+        program.push_str(&encode(g, weights)?);
+        eg.parse_and_run_program(None, &program).map_err(err)?;
+        report.encode_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let t = Instant::now();
-    let rows_of = |name: &str| -> Result<Vec<(Value, Vec<Value>)>, String> {
-        let mut out = Vec::new();
-        eg.constructor_enodes(name, |en| out.push((en.eclass, en.children.to_vec())))
-            .map_err(err)?;
-        Ok(out)
-    };
-    let int = |v: Value| eg.value_to_base::<i64>(v);
-    let g: &Graph = graph;
-
-    // Lists, weight terms, leaves.
-    let mut lists: HashMap<Value, Option<(Value, Value)>> = HashMap::new();
-    for (c, ch) in rows_of("Cons")? {
-        lists.insert(c, Some((ch[0], ch[1])));
-    }
-    for (c, _) in rows_of("Nil")? {
-        lists.insert(c, None);
-    }
-    let flatten = |mut l: Value| -> Vec<Value> {
-        let mut out = Vec::new();
-        while let Some(Some((h, t))) = lists.get(&l) {
-            out.push(*h);
-            l = *t;
-        }
-        out
-    };
-    let mut wterm: HashMap<Value, Result<ValueId, Vec<Value>>> = HashMap::new();
-    for (c, ch) in rows_of("Wt")? {
-        wterm.insert(c, Ok(ValueId(int(ch[0]) as u32)));
-    }
-    let mut catp: HashSet<Value> = HashSet::new();
-    for name in ["Cat2", "Cat3", "CatP"] {
-        for (c, ch) in rows_of(name)? {
-            if name == "CatP" {
-                catp.insert(c);
-            }
-            wterm.insert(c, Err(ch));
-        }
-    }
-    let pair_odd: HashMap<Value, Value> = rows_of("PairOdd")?
-        .into_iter()
-        .map(|(_, ch)| (ch[0], ch[1]))
-        .collect();
-    let wleaves = |w: Value| -> Vec<ValueId> {
-        let (mut out, mut stack) = (Vec::new(), vec![w]);
-        while let Some(w) = stack.pop() {
-            match &wterm[&w] {
-                Ok(v) => out.push(*v),
-                Err(ch) => stack.extend(ch.iter().rev()),
+        let t = Instant::now();
+        let sid = eg.add_scheduler(Box::new(MatchBudget {
+            limit: budget.match_limit,
+            used: HashMap::new(),
+        }));
+        for _ in 0..budget.max_iters {
+            if !eg
+                .step_rules_with_scheduler(sid, "fuse")
+                .map_err(err)?
+                .updated
+            {
+                break;
             }
         }
-        out
-    };
-    // Graph value of every e-class the encoding named.
-    let mut value_of: HashMap<Value, ValueId> = HashMap::new();
-    for (c, ch) in rows_of("V")? {
-        value_of.insert(c, ValueId(int(ch[0]) as u32));
-    }
-    let node_rows = rows_of("Node")?;
-    let is_leaf = |c: &Value| {
-        value_of
-            .get(c)
-            .is_some_and(|v| !matches!(g.value(*v).kind, ValueKind::Node(_)))
-    };
-    let kids_of =
-        |cs: &[Value]| -> Vec<Value> { cs.iter().filter(|c| !is_leaf(c)).copied().collect() };
-    let reads_us = |cs: &[Value]| -> f64 { cs.iter().map(|c| cost.read_us(g, value_of[c])).sum() };
-    let op_cost = |id: usize, args: &[Value]| -> f64 {
-        let n = &g.nodes[id];
-        if matches!(
-            n.op,
-            Op::Slice { .. } | Op::Reshape { .. } | Op::Squeeze { .. } | Op::Unsqueeze { .. }
-        ) {
-            return 0.0;
+        eg.remove_scheduler(sid);
+        report.saturate_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let t = Instant::now();
+        let rows_of = |name: &str| -> Result<Vec<(Value, Vec<Value>)>, String> {
+            let mut out = Vec::new();
+            eg.constructor_enodes(name, |en| out.push((en.eclass, en.children.to_vec())))
+                .map_err(err)?;
+            Ok(out)
+        };
+        let int = |v: Value| eg.value_to_base::<i64>(v);
+
+        // Lists, weight terms, leaves.
+        let mut lists: HashMap<Value, Option<(Value, Value)>> = HashMap::new();
+        for (c, ch) in rows_of("Cons")? {
+            lists.insert(c, Some((ch[0], ch[1])));
         }
-        let out = g.value(n.outputs[0]);
-        cost.dispatch_us
-            + reads_us(args)
-            + cost.act_us(out.shape.iter().product::<usize>() as f64 * dtype_bytes(out.dtype))
-    };
-
-    let mut classes: HashMap<Value, Class> = HashMap::new();
-    for (c, ch) in &node_rows {
-        let id = int(ch[0]);
-        let args = flatten(ch[1]);
-        classes.insert(
-            *c,
-            Class {
-                nodes: vec![ENode {
-                    cost: op_cost(id as usize, &args),
-                    kids: kids_of(&args),
-                }],
-                key: id,
-            },
-        );
-    }
-    // Fused `Lin`s (over a `Cat`) are classes of their own; `Lin` over `Wt` is a view.
-    let mut fused_kind: HashMap<Value, Kind> = HashMap::new();
-    for (c, ch) in rows_of("Lin")? {
-        let Err(parts) = &wterm[&ch[2]] else { continue };
-        let x = ch[1];
-        let leaves = wleaves(ch[2]);
-        let out_rows: usize = leaves.iter().map(|w| g.value(*w).shape[0]).sum();
-        let xv = g.value(value_of[&x]);
-        let cost_us = cost.dispatch_us
-            + cost.read_us(g, value_of[&x])
-            + leaves.iter().map(|w| cost.read_us(g, *w)).sum::<f64>()
-            + cost.act_us((rows(&xv.shape) * out_rows * 4) as f64);
-        fused_kind.insert(
-            c,
-            if catp.contains(&ch[2]) || parts.len() == 3 {
-                Kind::Qkv
-            } else {
-                Kind::GateUp
-            },
-        );
-        classes.insert(
-            c,
-            Class {
-                nodes: vec![ENode {
-                    cost: cost_us,
-                    kids: kids_of(&[x]),
-                }],
-                key: int(ch[0]),
-            },
-        );
-    }
-
-    // Alternatives and their groups.
-    let mut groups: Vec<Group> = Vec::new();
-    let mut by_fused: HashMap<Value, usize> = HashMap::new();
-    let mut slices = rows_of("Slice")?;
-    slices.sort_by_key(|(_, ch)| int(ch[1]));
-    for (c, ch) in slices {
-        let f = ch[0];
-        let class = classes
-            .get_mut(&c)
-            .ok_or("egraph: Slice outside a known class")?;
-        class.nodes.push(ENode {
-            cost: 0.0,
-            kids: vec![f],
-        });
-        let (idx, key) = (class.nodes.len() - 1, class.key);
-        let gi = *by_fused.entry(f).or_insert_with(|| {
-            groups.push(Group {
-                kind: fused_kind[&f],
-                members: Vec::new(),
-                keys: Vec::new(),
-                anchor: -1,
-                odd: pair_odd.get(&f).copied(),
-            });
-            groups.len() - 1
-        });
-        groups[gi].members.push((c, idx));
-        groups[gi].keys.push(key);
-    }
-    let mut singles =
-        |name: &str, kind: Kind, args: &dyn Fn(&[Value]) -> Vec<Value>| -> Result<(), String> {
+        for (c, _) in rows_of("Nil")? {
+            lists.insert(c, None);
+        }
+        let flatten = |mut l: Value| -> Vec<Value> {
+            let mut out = Vec::new();
+            while let Some(Some((h, t))) = lists.get(&l) {
+                out.push(*h);
+                l = *t;
+            }
+            out
+        };
+        let mut wterm: HashMap<Value, Result<ValueId, Vec<Value>>> = HashMap::new();
+        for (c, ch) in rows_of("Wt")? {
+            wterm.insert(c, Ok(ValueId(int(ch[0]) as u32)));
+        }
+        let mut catp: HashSet<Value> = HashSet::new();
+        for name in ["Cat2", "Cat3", "CatP"] {
             for (c, ch) in rows_of(name)? {
-                let a = args(&ch);
-                let class = classes
-                    .get_mut(&c)
-                    .ok_or("egraph: fused e-node outside a known class")?;
-                let anchor = class.key;
-                let cost_us = match kind {
-                    Kind::AttnSlices => op_cost(anchor as usize, &a),
-                    _ => {
-                        let out = g.value(g.nodes[anchor as usize].outputs[0]);
-                        cost.dispatch_us
-                            + reads_us(&a)
-                            + cost.act_us(out.shape.iter().product::<usize>() as f64 * 4.0)
-                    }
-                };
-                class.nodes.push(ENode {
-                    cost: cost_us,
-                    kids: kids_of(&a),
-                });
+                if name == "CatP" {
+                    catp.insert(c);
+                }
+                wterm.insert(c, Err(ch));
+            }
+        }
+        let pair_odd: HashMap<Value, Value> = rows_of("PairOdd")?
+            .into_iter()
+            .map(|(_, ch)| (ch[0], ch[1]))
+            .collect();
+        let wleaves = |w: Value| -> Vec<ValueId> {
+            let (mut out, mut stack) = (Vec::new(), vec![w]);
+            while let Some(w) = stack.pop() {
+                match &wterm[&w] {
+                    Ok(v) => out.push(*v),
+                    Err(ch) => stack.extend(ch.iter().rev()),
+                }
+            }
+            out
+        };
+        // Graph value of every e-class the encoding named.
+        let mut value_of: HashMap<Value, ValueId> = HashMap::new();
+        for (c, ch) in rows_of("V")? {
+            value_of.insert(c, ValueId(int(ch[0]) as u32));
+        }
+        let node_rows = rows_of("Node")?;
+        let is_leaf = |c: &Value| {
+            value_of
+                .get(c)
+                .is_some_and(|v| !matches!(g.value(*v).kind, ValueKind::Node(_)))
+        };
+        let kids_of =
+            |cs: &[Value]| -> Vec<Value> { cs.iter().filter(|c| !is_leaf(c)).copied().collect() };
+        let reads_us =
+            |cs: &[Value]| -> f64 { cs.iter().map(|c| cost.read_us(g, value_of[c])).sum() };
+        let op_cost = |id: usize, args: &[Value]| -> f64 {
+            let n = &g.nodes[id];
+            if matches!(
+                n.op,
+                Op::Slice { .. } | Op::Reshape { .. } | Op::Squeeze { .. } | Op::Unsqueeze { .. }
+            ) {
+                return 0.0;
+            }
+            let out = g.value(n.outputs[0]);
+            cost.dispatch_us
+                + reads_us(args)
+                + cost.act_us(out.shape.iter().product::<usize>() as f64 * dtype_bytes(out.dtype))
+        };
+
+        let mut classes: HashMap<Value, Class> = HashMap::new();
+        for (c, ch) in &node_rows {
+            let id = int(ch[0]);
+            let args = flatten(ch[1]);
+            classes.insert(
+                *c,
+                Class {
+                    nodes: vec![ENode {
+                        cost: op_cost(id as usize, &args),
+                        kids: kids_of(&args),
+                    }],
+                    key: id,
+                },
+            );
+        }
+        // Fused `Lin`s (over a `Cat`) are classes of their own; `Lin` over `Wt` is a view.
+        let mut fused_kind: HashMap<Value, Kind> = HashMap::new();
+        for (c, ch) in rows_of("Lin")? {
+            let Err(parts) = &wterm[&ch[2]] else { continue };
+            let x = ch[1];
+            let leaves = wleaves(ch[2]);
+            let out_rows: usize = leaves.iter().map(|w| g.value(*w).shape[0]).sum();
+            let xv = g.value(value_of[&x]);
+            let cost_us = cost.dispatch_us
+                + cost.read_us(g, value_of[&x])
+                + leaves.iter().map(|w| cost.read_us(g, *w)).sum::<f64>()
+                + cost.act_us((rows(&xv.shape) * out_rows * 4) as f64);
+            fused_kind.insert(
+                c,
+                if catp.contains(&ch[2]) || parts.len() == 3 {
+                    Kind::Qkv
+                } else {
+                    Kind::GateUp
+                },
+            );
+            classes.insert(
+                c,
+                Class {
+                    nodes: vec![ENode {
+                        cost: cost_us,
+                        kids: kids_of(&[x]),
+                    }],
+                    key: int(ch[0]),
+                },
+            );
+        }
+
+        // Alternatives and their groups.
+        let mut groups: Vec<Group> = Vec::new();
+        let mut by_fused: HashMap<Value, usize> = HashMap::new();
+        let mut slices = rows_of("Slice")?;
+        slices.sort_by_key(|(_, ch)| int(ch[1]));
+        for (c, ch) in slices {
+            let f = ch[0];
+            let class = classes
+                .get_mut(&c)
+                .ok_or("egraph: Slice outside a known class")?;
+            class.nodes.push(ENode {
+                cost: 0.0,
+                kids: vec![f],
+            });
+            let (idx, key) = (class.nodes.len() - 1, class.key);
+            let gi = *by_fused.entry(f).or_insert_with(|| {
                 groups.push(Group {
-                    kind,
-                    members: vec![(c, class.nodes.len() - 1)],
-                    keys: vec![anchor],
-                    anchor,
-                    odd: None,
+                    kind: fused_kind[&f],
+                    members: Vec::new(),
+                    keys: Vec::new(),
+                    anchor: -1,
+                    odd: pair_odd.get(&f).copied(),
+                    fused: Some(f),
                 });
-            }
-            Ok(())
-        };
-    singles("Mlp", Kind::Mlp, &|ch| ch[2..7].to_vec())?;
-    singles("MlpPn", Kind::Mlp, &|ch| [&ch[2..7], &ch[8..9]].concat())?;
-    singles("Rewired", Kind::AttnSlices, &|ch| flatten(ch[1]))?;
-    report.groups = groups.len();
-    report.enodes = classes.values().map(|c| c.nodes.len()).sum();
+                groups.len() - 1
+            });
+            groups[gi].members.push((c, idx));
+            groups[gi].keys.push(key);
+        }
+        let mut singles =
+            |name: &str, kind: Kind, args: &dyn Fn(&[Value]) -> Vec<Value>| -> Result<(), String> {
+                for (c, ch) in rows_of(name)? {
+                    let a = args(&ch);
+                    let class = classes
+                        .get_mut(&c)
+                        .ok_or("egraph: fused e-node outside a known class")?;
+                    let anchor = class.key;
+                    let cost_us = match kind {
+                        Kind::AttnSlices => op_cost(anchor as usize, &a),
+                        _ => {
+                            let out = g.value(g.nodes[anchor as usize].outputs[0]);
+                            cost.dispatch_us
+                                + reads_us(&a)
+                                + cost.act_us(out.shape.iter().product::<usize>() as f64 * 4.0)
+                        }
+                    };
+                    class.nodes.push(ENode {
+                        cost: cost_us,
+                        kids: kids_of(&a),
+                    });
+                    groups.push(Group {
+                        kind,
+                        members: vec![(c, class.nodes.len() - 1)],
+                        keys: vec![anchor],
+                        anchor,
+                        odd: None,
+                        fused: None,
+                    });
+                }
+                Ok(())
+            };
+        singles("Mlp", Kind::Mlp, &|ch| ch[2..7].to_vec())?;
+        singles("MlpPn", Kind::Mlp, &|ch| [&ch[2..7], &ch[8..9]].concat())?;
+        singles("Rewired", Kind::AttnSlices, &|ch| flatten(ch[1]))?;
+        report.groups = groups.len();
+        report.enodes = classes.values().map(|c| c.nodes.len()).sum();
 
-    // Greedy DAG extraction.
-    let mut ex = Extract {
-        classes: &classes,
-        choice: HashMap::new(),
-        rc: HashMap::new(),
-    };
-    let mut uses = vec![0usize; g.values.len()];
-    for n in &g.nodes {
-        for i in &n.inputs {
-            uses[i.0 as usize] += 1;
-        }
-    }
-    for (c, ch) in &node_rows {
-        let out = g.nodes[int(ch[0]) as usize].outputs[0];
-        if uses[out.0 as usize] == 0 || g.outputs.contains(&out) {
-            ex.add_ref(*c);
-        }
-    }
-    let usable = |ex: &Extract, gr: &Group| {
-        gr.members
-            .iter()
-            .all(|&(c, _)| ex.live(c) && ex.choice.get(&c).copied().unwrap_or(0) == 0)
-            && gr
-                .odd
-                .is_none_or(|c| ex.choice.get(&c).copied().unwrap_or(0) == 0)
-    };
-    let mut order: Vec<(i64, usize)> = Vec::with_capacity(groups.len());
-    for (i, gr) in groups.iter().enumerate() {
-        let d = if usable(&ex, gr) {
-            let d = ex.apply(gr, false);
-            ex.apply(gr, true);
-            d
-        } else {
-            0.0
+        // Greedy DAG extraction.
+        let mut ex = Extract {
+            classes: &classes,
+            choice: HashMap::new(),
+            rc: HashMap::new(),
         };
-        order.push(((d * 1e3).round() as i64, i));
-    }
-    order.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| groups[a.1].keys.cmp(&groups[b.1].keys))
-    });
-    let mut committed = vec![false; groups.len()];
-    loop {
-        let mut changed = false;
-        for &(_, i) in &order {
-            if committed[i] || !usable(&ex, &groups[i]) {
-                continue;
+        let mut uses = vec![0usize; g.values.len()];
+        for n in &g.nodes {
+            for i in &n.inputs {
+                uses[i.0 as usize] += 1;
             }
-            let d = ex.apply(&groups[i], false);
-            if d < -1e-9 {
-                committed[i] = true;
-                changed = true;
+        }
+        for (c, ch) in &node_rows {
+            let out = g.nodes[int(ch[0]) as usize].outputs[0];
+            if uses[out.0 as usize] == 0 || g.outputs.contains(&out) {
+                ex.add_ref(*c);
+            }
+        }
+        let usable = |ex: &Extract, gr: &Group| {
+            gr.members
+                .iter()
+                .all(|&(c, _)| ex.live(c) && ex.choice.get(&c).copied().unwrap_or(0) == 0)
+                && gr
+                    .odd
+                    .is_none_or(|c| ex.choice.get(&c).copied().unwrap_or(0) == 0)
+        };
+        let mut order: Vec<(i64, usize)> = Vec::with_capacity(groups.len());
+        let mut deltas = vec![0.0; groups.len()];
+        for (i, gr) in groups.iter().enumerate() {
+            let d = if usable(&ex, gr) {
+                let d = ex.apply(gr, false);
+                ex.apply(gr, true);
+                d
             } else {
-                ex.apply(&groups[i], true);
+                0.0
+            };
+            deltas[i] = d;
+            order.push(((d * 1e3).round() as i64, i));
+        }
+        order.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| groups[a.1].keys.cmp(&groups[b.1].keys))
+        });
+        let mut committed = vec![false; groups.len()];
+        loop {
+            let mut changed = false;
+            for &(_, i) in &order {
+                if committed[i] || !usable(&ex, &groups[i]) {
+                    continue;
+                }
+                let d = ex.apply(&groups[i], false);
+                if d < -1e-9 {
+                    committed[i] = true;
+                    changed = true;
+                } else {
+                    ex.apply(&groups[i], true);
+                }
+            }
+            if !changed {
+                break;
             }
         }
-        if !changed {
-            break;
+        report.extract_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        // Choices: members as graph values; a fused gate/up `Lin` is named by its GLU.
+        let orig_out = |id: i64| g.nodes[id as usize].outputs[0];
+        let fused_pick: HashMap<Value, usize> = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(i, gr)| Some((gr.fused?, i)))
+            .collect();
+        let describe = |v: ValueId| -> String {
+            let val = g.value(v);
+            let mut s = format!("{:?}{:?}", val.shape, val.dtype);
+            if let ValueKind::Node(n) = val.kind {
+                let n = &g.nodes[n.0 as usize];
+                s.push_str(n.op.name());
+                for &i in &n.inputs {
+                    let iv = g.value(i);
+                    let _ = write!(s, "<{:?}{:?}>", iv.shape, iv.dtype);
+                }
+            }
+            s
+        };
+        let mut choices = Vec::with_capacity(groups.len());
+        let mut picks = Vec::with_capacity(groups.len());
+        for (i, gr) in groups.iter().enumerate() {
+            let members: Vec<Result<ValueId, ValueId>> = match gr.kind {
+                Kind::GateUp | Kind::Qkv => gr
+                    .members
+                    .iter()
+                    .map(|(c, _)| c)
+                    .chain(&gr.odd)
+                    .map(|c| match value_of.get(c) {
+                        Some(v) => Ok(*v),
+                        None => Err(orig_out(classes[c].key - FUSED_KEY_BASE)),
+                    })
+                    .collect(),
+                Kind::Mlp | Kind::AttnSlices => Vec::new(),
+            };
+            let anchor =
+                matches!(gr.kind, Kind::Mlp | Kind::AttnSlices).then(|| orig_out(gr.anchor));
+            let kind = ["megakernel-mlp", "gate-up", "qkv", "qkv-slices-attn"][gr.kind as usize];
+            let mut key = kind.to_string();
+            for v in anchor
+                .iter()
+                .chain(members.iter().map(|m| m.as_ref().unwrap_or_else(|e| e)))
+            {
+                key.push('|');
+                key.push_str(&describe(*v));
+            }
+            choices.push(Choice {
+                id: i,
+                kind,
+                pattern: fnv1a(key.as_bytes()),
+                on: committed[i],
+                delta_us: deltas[i],
+            });
+            let nl = gr.members.len().min(members.len());
+            let legs = &members[..nl];
+            let covers: Vec<ValueId> = match (gr.kind, anchor) {
+                (Kind::Mlp, Some(a)) => mlp_cover(g, a),
+                (Kind::AttnSlices, Some(a)) => attn_cover(g, a),
+                _ => legs.iter().filter_map(|m| m.ok()).collect(),
+            };
+            let mut touches = covers.clone();
+            touches.extend(members[nl..].iter().filter_map(|m| m.ok()));
+            picks.push(Pick {
+                kind: gr.kind,
+                anchor,
+                members,
+                covers,
+                touches,
+                requires: gr
+                    .members
+                    .iter()
+                    .filter_map(|(c, _)| fused_pick.get(c).copied())
+                    .collect(),
+            });
         }
+        Ok(Self {
+            choices,
+            picks,
+            report,
+        })
     }
-    report.extract_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    // Materialize with the passes' rewriters, in pipeline order.
-    let t = Instant::now();
-    let chosen = |k: Kind| {
-        groups
-            .iter()
-            .zip(&committed)
-            .filter(move |(gr, &c)| c && gr.kind == k)
-            .map(|(gr, _)| gr)
-    };
-    let orig_out = |id: i64| g.nodes[id as usize].outputs[0];
-    let mlp_adds: Vec<ValueId> = chosen(Kind::Mlp).map(|gr| orig_out(gr.anchor)).collect();
-    let attn: Vec<ValueId> = chosen(Kind::AttnSlices)
-        .map(|gr| orig_out(gr.anchor))
-        .collect();
-    // Member values; a fused gate/up `Lin` is named by its GLU, resolved after the gate/up stage.
-    let member_vals = |gr: &Group| -> Vec<Result<ValueId, ValueId>> {
-        gr.members
-            .iter()
-            .map(|(c, _)| c)
-            .chain(&gr.odd)
-            .map(|c| match value_of.get(c) {
-                Some(v) => Ok(*v),
-                None => Err(orig_out(classes[c].key - FUSED_KEY_BASE)),
-            })
-            .collect()
-    };
-    let gate_up: Vec<Vec<Result<ValueId, ValueId>>> =
-        chosen(Kind::GateUp).map(member_vals).collect();
-    let qkv: Vec<Vec<Result<ValueId, ValueId>>> = chosen(Kind::Qkv).map(member_vals).collect();
-
-    let node_of = |g: &Graph, v: ValueId| match g.value(v).kind {
-        ValueKind::Node(n) => n,
-        _ => unreachable!("fusion member is a node output"),
-    };
-    let resolve = |g: &Graph, m: &Result<ValueId, ValueId>| -> NodeId {
-        match m {
-            Ok(v) => node_of(g, *v),
-            // GLU input 0 is the gate slice of the fused gate/up Linear.
-            Err(glu) => {
-                let slice = g.nodes[node_of(g, *glu).0 as usize].inputs[0];
-                node_of(g, g.nodes[node_of(g, slice).0 as usize].inputs[0])
+    /// Applies the cost model's choices with `flip` toggled to `graph` (the graph [`Fusion::new`]
+    /// saw, unchanged), concatenating `weights` like the passes do. A choice flipped on wins: the
+    /// cost model's choices it overlaps are switched off and the gate/up fusions it reads are
+    /// switched on; choices left reading a gate/up fusion that is off are switched off. Two
+    /// flipped-on choices that overlap are an error.
+    pub fn apply(
+        &self,
+        graph: &mut Graph,
+        mut weights: Option<&mut Weights>,
+        flip: &[usize],
+    ) -> Result<Report, String> {
+        let mut report = self.report.clone();
+        let mut on: Vec<bool> = self.choices.iter().map(|c| c.on).collect();
+        let mut forced = vec![false; on.len()];
+        for &i in flip {
+            let o = on
+                .get_mut(i)
+                .ok_or_else(|| format!("egraph: no choice {i}"))?;
+            *o = !*o;
+            forced[i] = *o;
+        }
+        let mut work: Vec<usize> = (0..on.len()).filter(|&i| forced[i]).collect();
+        while let Some(i) = work.pop() {
+            for &r in &self.picks[i].requires {
+                if !on[r] {
+                    on[r] = true;
+                    forced[r] = true;
+                    work.push(r);
+                }
+            }
+            for j in 0..on.len() {
+                if j != i && on[j] && self.picks[i].conflicts(&self.picks[j]) {
+                    if forced[j] {
+                        return Err(format!("egraph: choices {i} and {j} overlap"));
+                    }
+                    on[j] = false;
+                }
             }
         }
-    };
-    let contexts =
-        |g: &Graph, sets: &[Vec<Result<ValueId, ValueId>>], names: &[&str]| -> Vec<MatchContext> {
+        while let Some(j) =
+            (0..on.len()).find(|&j| on[j] && self.picks[j].requires.iter().any(|&r| !on[r]))
+        {
+            on[j] = false;
+        }
+
+        // Materialize with the passes' rewriters, in pipeline order.
+        let t = Instant::now();
+        let chosen = |k: Kind| {
+            self.picks
+                .iter()
+                .zip(&on)
+                .filter(move |(p, &c)| c && p.kind == k)
+                .map(|(p, _)| p)
+        };
+        let mlp_adds: Vec<ValueId> = chosen(Kind::Mlp).filter_map(|p| p.anchor).collect();
+        let attn: Vec<ValueId> = chosen(Kind::AttnSlices).filter_map(|p| p.anchor).collect();
+        let gate_up: Vec<&[Result<ValueId, ValueId>]> =
+            chosen(Kind::GateUp).map(|p| &p.members[..]).collect();
+        let qkv: Vec<&[Result<ValueId, ValueId>]> =
+            chosen(Kind::Qkv).map(|p| &p.members[..]).collect();
+
+        let node_of = |g: &Graph, v: ValueId| match g.value(v).kind {
+            ValueKind::Node(n) => n,
+            _ => unreachable!("fusion member is a node output"),
+        };
+        let resolve = |g: &Graph, m: &Result<ValueId, ValueId>| -> NodeId {
+            match m {
+                Ok(v) => node_of(g, *v),
+                // GLU input 0 is the gate slice of the fused gate/up Linear.
+                Err(glu) => {
+                    let slice = g.nodes[node_of(g, *glu).0 as usize].inputs[0];
+                    node_of(g, g.nodes[node_of(g, slice).0 as usize].inputs[0])
+                }
+            }
+        };
+        let contexts = |g: &Graph,
+                        sets: &[&[Result<ValueId, ValueId>]],
+                        names: &[&str]|
+         -> Vec<MatchContext> {
             let mut ms: Vec<Vec<NodeId>> = sets
                 .iter()
                 .map(|s| {
@@ -925,31 +1174,38 @@ pub fn fuse(
                 })
                 .collect()
         };
+        let only = |g: &Graph, vs: &[ValueId]| -> HashSet<NodeId> {
+            vs.iter().map(|v| node_of(g, *v)).collect()
+        };
+        let want = [mlp_adds.len(), gate_up.len(), qkv.len(), attn.len()];
+        report.applied = [0; 4];
+        if !mlp_adds.is_empty() {
+            let s = only(graph, &mlp_adds);
+            report.applied[0] = megakernel::fuse_mlp_blocks(graph, Some(&s));
+        }
+        let ms = contexts(graph, &gate_up, &["gate", "up"]);
+        report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
+        let ms = contexts(graph, &qkv, &["q", "k", "v"]);
+        report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
+        if !attn.is_empty() {
+            let s = only(graph, &attn);
+            report.applied[3] = fusion::fuse_qkv_slices_and_attn_pass(graph, Some(&s));
+        }
+        report.decode_ms = t.elapsed().as_secs_f64() * 1e3;
+        if report.applied != want {
+            return Err(format!(
+                "egraph: extracted fusions {want:?} but the rewriters applied {:?}",
+                report.applied
+            ));
+        }
+        Ok(report)
+    }
+}
 
-    let only = |g: &Graph, vs: &[ValueId]| -> HashSet<NodeId> {
-        vs.iter().map(|v| node_of(g, *v)).collect()
-    };
-    let want = [mlp_adds.len(), gate_up.len(), qkv.len(), attn.len()];
-    if !mlp_adds.is_empty() {
-        let s = only(graph, &mlp_adds);
-        report.applied[0] = megakernel::fuse_mlp_blocks(graph, Some(&s));
-    }
-    let ms = contexts(graph, &gate_up, &["gate", "up"]);
-    report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
-    let ms = contexts(graph, &qkv, &["q", "k", "v"]);
-    report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
-    if !attn.is_empty() {
-        let s = only(graph, &attn);
-        report.applied[3] = fusion::fuse_qkv_slices_and_attn_pass(graph, Some(&s));
-    }
-    report.decode_ms = t.elapsed().as_secs_f64() * 1e3;
-    if report.applied != want {
-        return Err(format!(
-            "egraph: extracted fusions {want:?} but the rewriters applied {:?}",
-            report.applied
-        ));
-    }
-    Ok(report)
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 #[cfg(test)]
@@ -1196,6 +1452,60 @@ mod tests {
         }
         let r = check("parallel", &b.done());
         assert_eq!(r.applied, [0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn choices_share_patterns_across_layers_and_flips_resolve() {
+        let (g, w) =
+            crate::model::gemma4::graph::Gemma4Graph::build_synthetic_graph(4, 64, 128, 4, 2, 16);
+        let mut g = g;
+        prep(&mut g);
+        let f = Fusion::new(
+            &g,
+            Some(&w),
+            DEFAULT_RULES,
+            &CostModel::constants(),
+            Budget::default(),
+        )
+        .unwrap();
+        let by_kind =
+            |k: &str| -> Vec<&Choice> { f.choices().iter().filter(|c| c.kind == k).collect() };
+        // Per kind: how many the cost model applies; those (one per layer) share a pattern.
+        for (k, n_on) in [("megakernel-mlp", 4), ("gate-up", 0), ("qkv", 4)] {
+            let on: Vec<&Choice> = by_kind(k).into_iter().filter(|c| c.on).collect();
+            assert_eq!(on.len(), n_on, "{k}");
+            assert!(on.iter().all(|c| c.pattern == on[0].pattern), "{k}");
+        }
+        assert_eq!(by_kind("gate-up").len(), 4);
+        // No flips: the cost model's set, as `fuse` applies it.
+        let (mut a, mut aw) = (g.clone(), w.clone());
+        assert_eq!(
+            f.apply(&mut a, Some(&mut aw), &[]).unwrap().applied,
+            [4, 0, 4, 0]
+        );
+        // Gate/up on in one layer switches that layer's megakernel off.
+        let gu = by_kind("gate-up")[0].id;
+        let (mut b, mut bw) = (g.clone(), w.clone());
+        let r = f.apply(&mut b, Some(&mut bw), &[gu]).unwrap();
+        assert_eq!(r.applied, [3, 1, 4, 0]);
+        crate::graph::pattern::validate_ssa(&b).unwrap();
+        // Turning the conflicting megakernel off as well gives the same set.
+        let mlp = by_kind("megakernel-mlp")
+            .into_iter()
+            .find(|c| f.picks[c.id].conflicts(&f.picks[gu]))
+            .unwrap()
+            .id;
+        let (mut c, mut cw) = (g.clone(), w.clone());
+        assert_eq!(
+            f.apply(&mut c, Some(&mut cw), &[gu, mlp]).unwrap().applied,
+            [3, 1, 4, 0]
+        );
+        // A cost-model choice switched off.
+        let (mut d, mut dw) = (g.clone(), w.clone());
+        assert_eq!(
+            f.apply(&mut d, Some(&mut dw), &[mlp]).unwrap().applied,
+            [3, 0, 4, 0]
+        );
     }
 
     #[test]
