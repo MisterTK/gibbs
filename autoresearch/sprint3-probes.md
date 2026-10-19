@@ -130,3 +130,25 @@ Then a post-norm and an MLP. The 8 post-projection steps (conv … gated) are 14
 |---|---|---|
 | M0, M1, M7, M8 | 0 | every movement op is aliased |
 | M2 | 12 | `self_attn.q_slice` and `self_attn.gate_slice` in each of the 6 attention layers: `Copy → [8, 256]`, slice axis 1 `[0..256]` / `[256..512]` of `[8, 512]`, **not contiguous** (8 heads, q and gate interleaved per head) |
+
+## P0.2 after the Wave A merges (CPU, no GPU)
+
+- **Commit:** `sprint3` @ `b0f86ee`.
+- **Command:** `target/release/examples/plan_dump bench/loop.json <row> --ctx <n> --rates ~/.cache/gibbs/host/Apple-M5-Pro-25G241-92719a27da496e4e.json`.
+- **Why `--rates`:** gen64 and the new kernels change `codec::source_hash()`, so without it the dump falls back to the static re-encode rule. On M7 that rule re-encodes 174 of 205 tensors, which changes the plans for reasons unrelated to the sprint. `--rates` reuses the profile the baseline above was dumped with (0 re-encoded on M1/M7, 70 of 275 on M0).
+- **The dump now runs `views::elide`,** as `prepare_plan` does. The baseline above did not, so its 12 M2 `Copy` steps were never planned on the device after Phase 2.
+
+| row | baseline steps / dispatches | sprint3 steps / dispatches | Δ dispatches | from |
+|---|---|---|---|---|
+| M0 (ctx 84) | 396 / 506 | 366 / 476 | −30 | q/k/v fused in the 15 layers that compute their own k/v (loader `Mat` concat) |
+| M1 (ctx 84) | 384 / 509 | 361 / 486 | −23 | 8 full q/k/v triples + 7 same-format pairs |
+| M2 (ctx 89) | 374 / 412 | 248 / 286 | −126 | DeltaNet chain 8 → 1 step × 18 layers (−126), q/gate copies elided (−12), q/k pairs (−6), lost BF16 `proj_b+proj_a` pairing (+18; see below) |
+| M4 (ctx 80) | — / 147 | 131 / 147 | 0 | no sprint fusion applies |
+| M7 (ctx 88) | 628 / 658 | 578 / 608 | −50 | q/k/v fused in the 25 layers with a v projection |
+
+- **M2 bytes:** `in_proj_qkv`, `in_proj_z` and `out_proj` now stay in their GGUF formats (Q5_K / Q5_K / Q8_0), since `qwen35_from_gguf` is an identity at 16/16 heads. That is about 757 → 290 MB/token, so streamed bytes drop to about the 1.33 GB the roofline already counts. CPU parity on the real GGUF: same top-1 on 4 steps, min cosine 0.9999985.
+- **M2 pairing loss:** `in_proj_a`/`in_proj_b` stay FP16, and `pair_small_hand_gemvs` pairs only BF16, so 18 pairs split. About 22 µs/token at the measured ~1.2 µs per dispatch. A `gemv_f16_pair` would recover it; add it if the M2 ABBA shows the gap matters.
+- **Regression caught on the way:** fusing q/k/v over `Mat` re-sorted the graph (`GraphRewriter::replace`), which split M7's MoE subgraph and norm pairs (658 → 818 dispatches). Fixed at the root in `src/graph/pattern.rs` (`15da3aa`), with a CPU order test.
+- **Not dumped:** M3 (9B: the loader's f32/bf16 conversions need more free memory than the shared machine had), M5/M6 (safetensors; same planner path, no sprint fusion applies), M8 (= M0's plan at 4k ctx).
+- **Device check:** rows 0/1/2/7 never loaded the AGX driver. Row 4 loaded `AGXMetalG17X` and `IOGPU` as the last two images, after the dump printed, so something on the Llama path creates a device on exit. Nothing is dispatched, but the tool is not strictly device-free there.
+
