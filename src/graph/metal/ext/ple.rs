@@ -374,7 +374,7 @@ mod tests {
         // The compile pipeline (`program.rs`) runs these before planning.
         crate::graph::passes::run_optimization_passes(&mut g, None).unwrap();
         let (steps, aliases) = plan(&g).unwrap();
-        let base = kinds(&batch_horizontal(steps.clone(), &aliases));
+        let base = kinds(&batch_horizontal(steps.clone(), &aliases).unwrap());
         eprintln!("default: {base:?}");
         let layer = [
             "GemvPacked(GeGlu,res=true)",
@@ -392,7 +392,7 @@ mod tests {
 
         let mut fused = steps;
         fuse(&g, &mut fused, &aliases);
-        let fused = kinds(&batch_horizontal(fused, &aliases));
+        let fused = kinds(&batch_horizontal(fused, &aliases).unwrap());
         eprintln!("fused: {fused:?}");
         assert_eq!(
             fused[1..],
