@@ -26,7 +26,7 @@ const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
     crate::hardware::QuantFormat::WeightlessJesseLUT,
 ];
 
-fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
+pub(crate) fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
     match graph.value(w).dtype {
         crate::graph::DType::Quant(f) => MEGAKERNEL_QUANT.contains(&f),
         _ => true,
@@ -35,7 +35,7 @@ fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
 
 /// Detects and fuses transformer decoder blocks into unified Megakernel nodes.
 pub fn fuse_megakernel_blocks_pass(graph: &mut Graph) -> usize {
-    let mlp = fuse_mlp_blocks(graph);
+    let mlp = fuse_mlp_blocks(graph, None);
     let attn = fuse_attn_prep_pass(graph);
     mlp + attn
 }
@@ -117,8 +117,9 @@ pub fn fuse_attn_prep_pass(graph: &mut Graph) -> usize {
     matches
 }
 
-/// Fuses `RmsNorm -> [Gate, Up Linear] -> SwiGLU/GeGLU -> Down Linear -> Add(residual)`
-fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
+/// Fuses `RmsNorm -> [Gate, Up Linear] -> SwiGLU/GeGLU -> Down Linear -> Add(residual)`.
+/// `only` restricts the rewrite to blocks ending in those Add nodes.
+pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: Option<&HashSet<NodeId>>) -> usize {
     let mut rewrites = 0;
     let mut eliminated_nodes: HashSet<NodeId> = HashSet::new();
 
@@ -143,7 +144,10 @@ fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
     for i in 0..n_nodes {
         let add_nid = NodeId(i as u32);
         let add_node = graph.node(add_nid);
-        if !matches!(add_node.op, Op::Add) || add_node.inputs.len() != 2 {
+        if !matches!(add_node.op, Op::Add)
+            || add_node.inputs.len() != 2
+            || only.is_some_and(|s| !s.contains(&add_nid))
+        {
             continue;
         }
 

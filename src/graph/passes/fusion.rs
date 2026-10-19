@@ -1,6 +1,6 @@
 //! Subgraph fusion optimization passes for Graph IR.
 
-use crate::graph::pattern::{any, capture, op_type, GraphRewriter, Pattern};
+use crate::graph::pattern::{any, capture, op_type, GraphRewriter, MatchContext, Pattern};
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
@@ -174,7 +174,7 @@ fn concat_weight_tensors_inner(tensors: &[&Tensor], in_features: usize) -> Optio
 }
 
 /// Validates that `tensor` matches the declared graph `dtype`.
-fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
+pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
     match (dtype, tensor) {
         (DType::F32, Tensor::F32(_)) => true,
         (DType::BF16, Tensor::BF16(_)) => true,
@@ -220,7 +220,7 @@ fn feeds_attention(g: &Graph, v: crate::graph::ValueId) -> bool {
 /// fused linear projection, followed by slices.
 ///
 /// Reduces memory bandwidth by streaming input activations once instead of 3 times.
-pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> usize {
+pub fn fuse_qkv_pass(graph: &mut Graph, weights: Option<&mut Weights>) -> usize {
     let mut pat = Pattern::new();
     let root = pat.add_node(any());
     let q = pat.add_node(capture("q", op_type("Linear")));
@@ -229,13 +229,21 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
     pat.add_branch(root, &[q, k, v]);
 
     let matches = pat.search(graph);
+    rewrite_qkv(graph, &matches, weights)
+}
+
+/// Applies the QKV fusion to `matches` (captures `q`, `k`, `v`; `q` first in the fused weight).
+pub(crate) fn rewrite_qkv(
+    graph: &mut Graph,
+    matches: &[MatchContext],
+    mut weights: Option<&mut Weights>,
+) -> usize {
     if matches.is_empty() {
         return 0;
     }
-
     let mut weight_updates: Vec<(String, Tensor, Vec<String>)> = Vec::new();
 
-    let rewrites = GraphRewriter::replace(graph, &matches, |g, m| {
+    let rewrites = GraphRewriter::replace(graph, matches, |g, m| {
         let q_id = m.get("q")?;
         let k_id = m.get("k")?;
         let v_id = m.get("v")?;
@@ -366,20 +374,28 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
 /// fused linear projection.
 ///
 /// Reduces memory bandwidth by streaming input activations once instead of twice.
-pub fn fuse_gate_up_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> usize {
+pub fn fuse_gate_up_pass(graph: &mut Graph, weights: Option<&mut Weights>) -> usize {
     let mut pat = Pattern::new();
     let gate = pat.add_node(capture("gate", op_type("Linear")));
     let up = pat.add_node(capture("up", op_type("Linear")));
     pat.add_shared_input(gate, up);
 
     let matches = pat.search(graph);
+    rewrite_gate_up(graph, &matches, weights)
+}
+
+/// Applies the gate/up fusion to `matches` (captures `gate`, `up`; roles come from the GLU).
+pub(crate) fn rewrite_gate_up(
+    graph: &mut Graph,
+    matches: &[MatchContext],
+    mut weights: Option<&mut Weights>,
+) -> usize {
     if matches.is_empty() {
         return 0;
     }
-
     let mut weight_updates: Vec<(String, Tensor, Vec<String>)> = Vec::new();
 
-    let rewrites = GraphRewriter::replace(graph, &matches, |g, m| {
+    let rewrites = GraphRewriter::replace(graph, matches, |g, m| {
         let a_id = m.get("gate")?;
         let b_id = m.get("up")?;
 
@@ -831,7 +847,11 @@ mod tests {
 }
 
 /// Fuses QKV slices and RoPE directly into CachedAttention, eliminating intermediate Slice and RoPE nodes.
-pub fn fuse_qkv_slices_and_attn_pass(graph: &mut Graph) -> usize {
+/// `only` restricts the rewrite to those attention nodes.
+pub fn fuse_qkv_slices_and_attn_pass(
+    graph: &mut Graph,
+    only: Option<&std::collections::HashSet<crate::graph::NodeId>>,
+) -> usize {
     let mut rewrites = 0;
     let mut eliminated_nodes: std::collections::HashSet<crate::graph::NodeId> =
         std::collections::HashSet::new();
@@ -848,6 +868,9 @@ pub fn fuse_qkv_slices_and_attn_pass(graph: &mut Graph) -> usize {
     for i in 0..n_nodes {
         let nid = crate::graph::NodeId(i as u32);
         let node = graph.node(nid);
+        if only.is_some_and(|s| !s.contains(&nid)) {
+            continue;
+        }
         if let crate::graph::Op::CachedAttention { .. } = &node.op {
             if node.inputs.len() >= 3 {
                 let q_val = node.inputs[0];
