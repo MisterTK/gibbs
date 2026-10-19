@@ -1,7 +1,7 @@
 //! Execution of placed computational graphs: one device per program.
 
 use crate::graph::placement::{
-    device_supports_op, place_graph_default, placement_rows, PlacementPlan, PlacementRow,
+    device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow,
 };
 use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, ValueId, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
@@ -88,6 +88,9 @@ pub(crate) fn argmax_head(graph: &Graph, valid: usize) -> Option<Graph> {
     Some(g)
 }
 
+/// The error a `GIBBS_PLAN_DUMP_CPU` Metal compile ends with once the plan is printed.
+pub const PLAN_DUMPED: &str = "GIBBS_PLAN_DUMP_CPU: plan printed; compile stopped before any device work";
+
 /// Programs being compiled right now: placement, weight upload, kernel build and tuning.
 static COMPILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -115,6 +118,9 @@ impl GraphProgram {
     /// Compiles a Graph and Weights into a single-device GraphProgram under `mode`.
     ///
     /// Fails with the avenue report when `mode` targets the GPU and a node has no GPU lowering.
+    /// `GIBBS_PLAN_DUMP_CPU=<ctx>`: a Metal compile prints [`crate::graph::metal::plan_dump`] at
+    /// context length `ctx` (`1` when not a number) to stdout and fails with [`PLAN_DUMPED`]
+    /// before any device, weight upload or tuning.
     pub fn compile(
         mut graph: Graph,
         mut weights: Weights,
@@ -122,8 +128,15 @@ impl GraphProgram {
     ) -> Result<Self, String> {
         let _compiling = CompileGuard::enter();
         crate::graph::passes::run_optimization_passes(&mut graph, Some(&mut weights))?;
-        let available = available_devices();
-        let plan = place_graph_default(&mut graph, mode, &available, None, &device_supports_op)
+        let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
+            .ok()
+            .map(|v| v.parse().unwrap_or(1));
+        let available = if dump.is_some() {
+            vec![Device::Cpu, Device::Metal]
+        } else {
+            available_devices()
+        };
+        let plan = place_graph(&mut graph, mode, &available, &device_supports_op)
             .map_err(|report| report.error())?;
         assert!(
             plan.segments.len() <= 1,
@@ -139,6 +152,11 @@ impl GraphProgram {
                     crate::graph::DType::Quant(f),
                 )
             })?;
+        }
+        #[cfg(target_os = "macos")]
+        if let (Some(ctx), Device::Metal) = (dump, primary_device) {
+            print!("{}", crate::graph::metal::plan_dump(&graph, ctx)?);
+            return Err(PLAN_DUMPED.into());
         }
         eprintln!(
             "Compiled GraphProgram: {} segments, primary device: {:?}",

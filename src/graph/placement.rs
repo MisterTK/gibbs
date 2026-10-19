@@ -6,7 +6,7 @@
 
 use crate::graph::avenues::{explore_node, GpuReport};
 use crate::graph::{DType, Graph, NodeId, Op};
-use crate::hardware::{Device, DeviceProfile, PlacementMode};
+use crate::hardware::{Device, PlacementMode};
 use std::collections::HashMap;
 
 /// A contiguous sequence of graph nodes assigned to run on a single compute device.
@@ -172,10 +172,9 @@ pub fn placement_verdict(rows: &[PlacementRow]) -> Result<String, String> {
 pub fn place_graph(
     graph: &mut Graph,
     mode: PlacementMode,
-    profiles: &[(Device, DeviceProfile)],
+    available: &[Device],
     supports: &dyn Fn(Device, &Op, DType) -> bool,
 ) -> Result<PlacementPlan, GpuReport> {
-    let available: Vec<Device> = profiles.iter().map(|(d, _)| *d).collect();
     let target = match mode {
         PlacementMode::Pin(d) if available.contains(&d) => d,
         PlacementMode::Auto if available.contains(&Device::Metal) => Device::Metal,
@@ -213,21 +212,6 @@ pub fn place_graph(
     Ok(PlacementPlan { segments, report: PlacementReport { device_op_counts } })
 }
 
-/// Convenience helper constructing standard device profiles from available devices and measured bandwidth.
-pub fn place_graph_default(
-    graph: &mut Graph,
-    mode: PlacementMode,
-    available: &[Device],
-    host_bandwidth_gbps: Option<f64>,
-    supports: &dyn Fn(Device, &Op, DType) -> bool,
-) -> Result<PlacementPlan, GpuReport> {
-    let profiles: Vec<(Device, DeviceProfile)> = available
-        .iter()
-        .map(|&d| (d, DeviceProfile::for_device(d, host_bandwidth_gbps)))
-        .collect();
-    place_graph(graph, mode, &profiles, supports)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,11 +225,10 @@ mod tests {
         let out = g.add("lin", Op::Linear, &[x, w], vec![2, 4], DType::F32);
         g.output(out);
 
-        let plan = place_graph_default(
+        let plan = place_graph(
             &mut g,
             PlacementMode::Pin(Device::Cpu),
             &[Device::Cpu],
-            None,
             &device_supports_op,
         )
         .unwrap();
@@ -273,7 +256,7 @@ mod tests {
     #[test]
     fn unlowered_node_fails_with_every_avenue() {
         let mut g = relu_graph();
-        let err = place_graph_default(&mut g, PlacementMode::Auto, &[Device::Cpu, Device::Metal], None, &no_relu)
+        let err = place_graph(&mut g, PlacementMode::Auto, &[Device::Cpu, Device::Metal], &no_relu)
             .unwrap_err();
         let text = err.error();
         assert!(text.starts_with("gpu-only: 1 of 2 graph nodes"), "{text}");
@@ -286,7 +269,7 @@ mod tests {
     #[test]
     fn pin_cpu_accepts_unlowered_node() {
         let mut g = relu_graph();
-        let plan = place_graph_default(&mut g, PlacementMode::Pin(Device::Cpu), &[Device::Cpu, Device::Metal], None, &no_relu)
+        let plan = place_graph(&mut g, PlacementMode::Pin(Device::Cpu), &[Device::Cpu, Device::Metal], &no_relu)
             .unwrap();
         assert_eq!(plan.segments.len(), 1);
         assert_eq!(plan.segments[0].device, Device::Cpu);
@@ -295,7 +278,7 @@ mod tests {
     #[test]
     fn supported_graph_is_all_metal() {
         let mut g = relu_graph();
-        let plan = place_graph_default(&mut g, PlacementMode::Auto, &[Device::Cpu, Device::Metal], None, &|_, _, _| true)
+        let plan = place_graph(&mut g, PlacementMode::Auto, &[Device::Cpu, Device::Metal], &|_, _, _| true)
             .unwrap();
         assert_eq!(plan.segments.len(), 1);
         assert!(g.nodes.iter().all(|n| n.device == Device::Metal));
@@ -368,7 +351,7 @@ mod tests {
         let inputs = vec![Tensor::F32(x_data)];
 
         let mut cpu_g = g.clone();
-        place_graph_default(&mut cpu_g, PlacementMode::Pin(Device::Cpu), &[Device::Cpu], None, &device_supports_op)
+        place_graph(&mut cpu_g, PlacementMode::Pin(Device::Cpu), &[Device::Cpu], &device_supports_op)
             .unwrap();
         let mut state = crate::graph::StateStore::new();
         let cpu_out = crate::graph::cpu::run(&cpu_g, &weights, &mut state, inputs.clone()).unwrap();
@@ -378,11 +361,10 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
-            let plan = place_graph_default(
+            let plan = place_graph(
                 &mut g,
                 PlacementMode::Auto,
                 &[Device::Cpu, Device::Metal],
-                None,
                 &device_supports_op,
             )
             .unwrap();

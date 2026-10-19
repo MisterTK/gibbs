@@ -23,7 +23,8 @@ fn default_decode_tokens() -> usize {
 fn default_runs() -> usize {
     3
 }
-fn default_reencode() -> String {
+/// The re-encode policy a model loads under unless the suite names one.
+pub fn default_reencode() -> String {
     "max-speed".into()
 }
 
@@ -744,5 +745,28 @@ mod placement_exit_tests {
         assert_eq!(placement_exit_code(&[row(Device::Metal), row(Device::Cpu)]), 1);
         assert_eq!(placement_exit_code(&[row(Device::Cpu)]), 1);
         assert_eq!(placement_exit_code(&[]), 1);
+    }
+}
+
+#[cfg(test)]
+mod suite_tests {
+    /// Every committed suite parses as `run_bench_suite` reads it, with a valid re-encode policy per row.
+    #[test]
+    fn bench_suites_parse() {
+        for path in ["bench/loop.json", "bench/reference-7b.json"] {
+            let text = std::fs::read_to_string(path).unwrap();
+            let suite: super::BenchSuite = serde_json::from_str(&text).unwrap();
+            assert!(!suite.models.is_empty(), "{path}: no models");
+            for m in &suite.models {
+                let policy = m
+                    .reencode
+                    .clone()
+                    .or_else(|| suite.defaults.as_ref().map(|d| d.reencode.clone()))
+                    .unwrap_or_else(super::default_reencode);
+                policy
+                    .parse::<crate::model::weight_format::ReencodePolicy>()
+                    .unwrap();
+            }
+        }
     }
 }
