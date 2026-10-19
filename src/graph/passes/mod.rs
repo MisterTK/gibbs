@@ -15,7 +15,7 @@ pub fn run_optimization_passes(
     weights: Option<&mut Weights>,
 ) -> Result<(), String> {
     prefuse(graph);
-    fuse(graph, weights)
+    fuse(graph, weights).map(|_| ())
 }
 
 /// The passes before fusion: the graph [`crate::graph::egraph`] fusion starts from.
@@ -27,7 +27,10 @@ pub fn prefuse(graph: &mut Graph) {
 
 /// The graph fusions (megakernel MLP, gate/up, QKV), chosen by equality saturation and cost-model
 /// extraction ([`crate::graph::egraph`]), and the SSA check.
-pub fn fuse(graph: &mut Graph, weights: Option<&mut Weights>) -> Result<(), String> {
+pub fn fuse(
+    graph: &mut Graph,
+    weights: Option<&mut Weights>,
+) -> Result<crate::graph::egraph::Report, String> {
     let r = crate::graph::egraph::fuse(
         graph,
         weights,
@@ -35,8 +38,15 @@ pub fn fuse(graph: &mut Graph, weights: Option<&mut Weights>) -> Result<(), Stri
         &crate::graph::egraph::CostModel::from_tune_cache(),
         crate::graph::egraph::Budget::default(),
     )?;
-    tracing::info!("egraph fusion: {r:?}, compile {:.1} ms", r.compile_ms());
-    validate_ssa(graph)
+    tracing::info!(
+        "egraph fusion: applied {:?} ({} groups, {} e-nodes), compile {:.1} ms",
+        r.applied,
+        r.groups,
+        r.enodes,
+        r.compile_ms()
+    );
+    validate_ssa(graph)?;
+    Ok(r)
 }
 
 #[cfg(test)]

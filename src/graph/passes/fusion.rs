@@ -356,6 +356,31 @@ pub(crate) fn rewrite_qkv(
     rewrites
 }
 
+/// Re-applies the QKV fusions named by `trios` (q, k, v node names from
+/// [`crate::graph::egraph::Report::qkv`]) to another build of the same network, e.g. a batched
+/// prefill graph: graph only, so it reads the fused weights its compiled program holds instead
+/// of the parts that fusion removed.
+pub(crate) fn replay_qkv(graph: &mut Graph, trios: &[[String; 3]]) -> usize {
+    let ids: std::collections::HashMap<&str, crate::graph::NodeId> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.name.as_str(), crate::graph::NodeId(i as u32)))
+        .collect();
+    let mut ms: Vec<MatchContext> = trios
+        .iter()
+        .filter_map(|t| {
+            let mut m = MatchContext::default();
+            for (role, name) in ["q", "k", "v"].into_iter().zip(t) {
+                m.insert(role, *ids.get(name.as_str())?);
+            }
+            Some(m)
+        })
+        .collect();
+    ms.sort_by_key(|m| m.get("q").map(|n| n.0));
+    rewrite_qkv(graph, &ms, None)
+}
+
 /// Fuses the gate and up projections of a SwiGLU / GeGLU into one projection (streams the
 /// activations once instead of twice): materializes the e-graph's chosen `matches` (captures
 /// `gate`, `up`; roles come from the GLU).
@@ -818,6 +843,35 @@ mod tests {
         };
         assert_eq!((m.rows, m.cols), (12, 256));
         assert_eq!(m.packed().map(|p| p.format), Some(Q::GGUF_Q4_K_M));
+    }
+
+    /// A batched prefill graph is a fresh build of the compiled network: with the program's QKV
+    /// fusions replayed it must read only weights the fused program holds, with equal outputs.
+    #[test]
+    fn replayed_qkv_reads_only_the_fused_program_weights() {
+        use crate::graph::cpu::run_stateless;
+        use crate::graph::egraph::{fuse, Budget, CostModel};
+        use crate::hardware::QuantFormat as Q;
+        let (k4, q4) = (DType::Quant(Q::GGUF_Q4_K_M), DType::Quant(Q::GGUF_Q4_0));
+        for dts in [[q4, q4, q4], [k4, k4, q4]] {
+            let (mut g, mut w, input) = qkv_graph(dts, true);
+            let (fresh, parts) = (g.clone(), w.clone());
+            let cost = CostModel::constants();
+            let r = fuse(&mut g, Some(&mut w), &[Rule::Qkv], &cost, Budget::default()).unwrap();
+            let mut re = fresh.clone();
+            assert_eq!(replay_qkv(&mut re, &r.qkv), 1);
+            for v in re.nodes.iter().flat_map(|n| &n.inputs) {
+                let val = re.value(*v);
+                if val.kind == crate::graph::ValueKind::Weight {
+                    assert!(w.get(&val.name).is_some(), "{dts:?} reads '{}'", val.name);
+                }
+            }
+            let want = run_stateless(&fresh, &parts, input.clone()).unwrap();
+            let got = run_stateless(&re, &w, input).unwrap();
+            for (a, b) in want.iter().zip(&got) {
+                assert_eq!(a.as_f32().unwrap(), b.as_f32().unwrap(), "{dts:?}");
+            }
+        }
     }
 
     /// `GIBBS_DISABLE=qkv_mat`: loader Mat triples and pairs stay unfused, plain weights still fuse.

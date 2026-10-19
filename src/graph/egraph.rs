@@ -331,6 +331,9 @@ pub struct Report {
     pub groups: usize,
     /// Fusions applied: megakernel MLP, gate/up, QKV, QKV-slices→attention.
     pub applied: [usize; 4],
+    /// Node names (q, k, v) of each applied QKV fusion, which
+    /// [`crate::graph::passes::fusion::replay_qkv`] re-applies to other row counts of the network.
+    pub qkv: Vec<[String; 3]>,
 }
 
 impl Report {
@@ -1204,6 +1207,13 @@ impl Fusion {
         let ms = contexts(graph, &gate_up, &["gate", "up"]);
         report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
         let ms = contexts(graph, &qkv, &["q", "k", "v"]);
+        report.qkv = ms
+            .iter()
+            .filter_map(|m| {
+                let name = |r: &str| m.get(r).map(|n| graph.node(n).name.clone());
+                Some([name("q")?, name("k")?, name("v")?])
+            })
+            .collect();
         report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
         if !attn.is_empty() {
             let s = only(graph, &attn);

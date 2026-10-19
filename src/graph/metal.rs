@@ -11026,8 +11026,9 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         assert_eq!(plan.mlp_scratch_size, h * 4 + 2 * inter * 4);
     }
 
-    /// q/k/v projections on packed GGUF `Mat`s, fused by the optimization passes (all three for
-    /// one format, the q/k pair when v differs), on Metal against the unfused graph on the CPU.
+    /// q/k/v projections of one RmsNorm output on packed GGUF `Mat`s, fused by the optimization
+    /// passes (all three for one format, the q/k pair when v differs; the rule needs a producer
+    /// node), on Metal against the unfused graph on the CPU.
     #[test]
     fn fused_qkv_packed_mats_match_unfused_cpu() {
         use crate::hardware::QuantFormat as Q;
@@ -11065,8 +11066,11 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         ] {
             let mut g = Graph::new();
             let x = g.input("x", vec![1, h], DType::F32);
+            let gamma = g.weight("gamma", vec![h], DType::F32);
+            let x = g.add("norm", Op::RmsNorm { eps: 1e-5 }, &[x, gamma], vec![1, h], DType::F32);
             let pos = g.input("pos", vec![1], DType::U32);
             let mut w = Weights::new();
+            w.insert("gamma", Tensor::F32(vec![1.0; h]));
             let mut outs = Vec::new();
             for (i, (n, rows)) in [("q", q_dim), ("k", kv_dim), ("v", kv_dim)]
                 .into_iter()
