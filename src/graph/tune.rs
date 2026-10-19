@@ -14,6 +14,9 @@ pub enum GemvKernel {
     Hand,
     /// The kernel generated from the format's codec (`codegen::gemv_packed`).
     Gen,
+    /// [`Self::Gen`] launched as 64-thread threadgroups (2 simdgroups), ggml-metal's K-quant
+    /// `mul_mv` shape (`N_SG_Q*_K = 2`).
+    Gen64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,11 +41,26 @@ impl GemvVariant {
             rows_per_sg,
         }
     }
-    /// `hand` or `gen/r4`.
+    pub const fn generated64(rows_per_sg: u8) -> Self {
+        Self {
+            kernel: GemvKernel::Gen64,
+            rows_per_sg,
+        }
+    }
+    /// `hand`, `gen/r4` or `gen64/r2`.
     pub fn label(&self) -> String {
         match self.kernel {
             GemvKernel::Hand => "hand".into(),
             GemvKernel::Gen => format!("gen/r{}", self.rows_per_sg),
+            GemvKernel::Gen64 => format!("gen64/r{}", self.rows_per_sg),
+        }
+    }
+    /// The generated kernel's parameters ([`GemvKernel::Hand`] has none; it maps to the 256-thread form).
+    pub fn gen_params(self) -> crate::graph::codegen::GemvParams {
+        crate::graph::codegen::GemvParams {
+            rows_per_sg: self.rows_per_sg as usize,
+            simdgroups: if self.kernel == GemvKernel::Gen64 { 2 } else { 8 },
+            ..Default::default()
         }
     }
 }
@@ -96,7 +114,7 @@ pub fn gpu_utilization() -> Option<u32> {
 const TIE: f64 = 0.01;
 
 /// The fastest variant of `timings` (`GB/s`, higher is better). Variants within 1% of the best tie;
-/// ties go to fewer rows per simdgroup, then to the hand kernel.
+/// ties go to the 256-thread kernels, then fewer rows per simdgroup, then the hand kernel.
 pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
     let best = timings
         .iter()
@@ -109,7 +127,13 @@ pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
         .iter()
         .filter(|t| t.1 >= best * (1.0 - TIE))
         .map(|t| t.0)
-        .min_by_key(|v| (v.rows_per_sg, v.kernel == GemvKernel::Gen))
+        .min_by_key(|v| {
+            (
+                v.kernel == GemvKernel::Gen64,
+                v.rows_per_sg,
+                v.kernel == GemvKernel::Gen,
+            )
+        })
 }
 
 /// Under foreign GPU load an alternative must beat the default's throughput by this fraction in every
@@ -328,6 +352,10 @@ mod tests {
             Some(hand)
         );
         assert_eq!(choose(&[(r2, 250.0), (r1, 250.0)]), Some(r1));
+        // A 64-thread variant wins only outside the tie band.
+        let g64 = GemvVariant::generated64(1);
+        assert_eq!(choose(&[(r2, 250.0), (g64, 251.0)]), Some(r2));
+        assert_eq!(choose(&[(r2, 250.0), (g64, 260.0)]), Some(g64));
         assert_eq!(choose(&[]), None);
         assert_eq!(choose(&[(r1, f64::NAN)]), None);
     }

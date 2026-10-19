@@ -4,6 +4,9 @@ use crate::graph::codec::{planar, tile, wide, Codec, Tile};
 pub struct GemvParams {
     pub rows_per_sg: usize,
     pub k_unroll: usize,
+    /// Simdgroups per threadgroup of [`gemv_packed`]: 8 (256 threads), or 2 (64 threads, ggml-metal's
+    /// K-quant launch shape).
+    pub simdgroups: usize,
 }
 
 impl Default for GemvParams {
@@ -11,6 +14,7 @@ impl Default for GemvParams {
         Self {
             rows_per_sg: 2,
             k_unroll: 1,
+            simdgroups: 8,
         }
     }
 }
@@ -1064,6 +1068,22 @@ mod tests {
     use crate::hardware::{Device, HardwareProfile, QuantFormat};
 
     #[test]
+    fn gemv_packed_64_thread_variant_covers_two_simdgroups() {
+        let c = codec(QuantFormat::GGUF_Q4_K_M).unwrap();
+        let p = GemvParams {
+            simdgroups: 2,
+            ..Default::default()
+        };
+        assert_eq!((gemv_rows_per_tg(p), gemv_threads(p)), (4, 64));
+        assert_eq!(gemv_packed_name(c, p), "gemvgen_GGUF_Q4_K_M_r2_sg2");
+        assert!(gemv_packed(c, p).contains("const uint row0 = tg.x * 4 + sg * 2;"));
+        // The 256-thread default keeps its name and source (tuned shapes keep their cache keys).
+        let d = GemvParams::default();
+        assert_eq!(gemv_packed_name(c, d), "gemvgen_GGUF_Q4_K_M_r2");
+        assert!(gemv_packed(c, d).contains("const uint row0 = tg.x * 16 + sg * 2;"));
+    }
+
+    #[test]
     fn test_gemv_codegen() {
         let code = gemv(&CODEC_Q4_0, GemvParams::default(), "", "");
         assert!(code.contains("kernel void gemv_gguf_q4_0"));
@@ -1387,9 +1407,14 @@ pub fn can_generate(_op: &crate::graph::Op, _dtype: crate::graph::DType) -> bool
     false
 }
 
-/// Rows one threadgroup of [`gemv_packed`] covers: 8 simdgroups × `rows_per_sg`.
+/// Rows one threadgroup of [`gemv_packed`] covers: `simdgroups` × `rows_per_sg`.
 pub const fn gemv_rows_per_tg(p: GemvParams) -> usize {
-    8 * p.rows_per_sg
+    p.simdgroups * p.rows_per_sg
+}
+
+/// Threads per threadgroup of [`gemv_packed`]: 32 per simdgroup.
+pub const fn gemv_threads(p: GemvParams) -> usize {
+    32 * p.simdgroups
 }
 
 /// The MSL a GPU consumer of the device weight buffer includes: [`Codec::msl`], or the planar-layout decoder
@@ -1447,9 +1472,14 @@ pub fn gemv_common(kernels_msl: &str) -> &str {
     &kernels_msl[begin..end]
 }
 
-/// Name of the kernel [`gemv_packed`] emits for `codec` with `p`.
+/// Name of the kernel [`gemv_packed`] emits for `codec` with `p` (`_sg2` suffix off the 8-simdgroup default).
 pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
-    format!("gemvgen_{:?}_r{}", codec.format, p.rows_per_sg)
+    let sg = if p.simdgroups == 8 {
+        String::new()
+    } else {
+        format!("_sg{}", p.simdgroups)
+    };
+    format!("gemvgen_{:?}_r{}{sg}", codec.format, p.rows_per_sg)
 }
 
 /// Name of the kernel [`dequant_packed`] emits for `codec`.
@@ -1494,7 +1524,7 @@ kernel void {name}(
 }
 
 /// A packed-weight GEMV with the `Step::GemvPacked` contract: buffers `w, x, y, PackedGemvParams,
-/// bias, res`; grid `(ceil(rows / gemv_rows_per_tg), batch)` of 256 threads. Lane `l` of a
+/// bias, res`; grid `(ceil(rows / gemv_rows_per_tg), batch)` of `gemv_threads` threads. Lane `l` of a
 /// simdgroup walks each row's 8-element sub-blocks `l, l+32, …`, decodes them with the codec's
 /// `decode8`, and the simdgroup sums the row. Bias and the fused epilogue are applied by lane 0.
 pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {

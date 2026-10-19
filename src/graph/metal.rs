@@ -293,6 +293,14 @@ impl WeightFormat {
         }
         if generated {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
+            // ggml-metal's K-quant launch shape: 2 simdgroups x N_R0 rows (2 / 1 / 2 for Q4_K / Q5_K / Q6_K).
+            match self.codec_format() {
+                Some(QuantFormat::GGUF_Q4_K_M | QuantFormat::GGUF_Q6_K) => {
+                    v.push(GemvVariant::generated64(2))
+                }
+                Some(QuantFormat::GGUF_Q5_K_M) => v.push(GemvVariant::generated64(1)),
+                _ => {}
+            }
         }
         v
     }
@@ -618,8 +626,8 @@ pub struct Runtime {
     pub report: String,
     /// Where `profile` is persisted.
     profile_path: std::path::PathBuf,
-    /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
-    gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
+    /// Generated GEMV pipelines by (codec format, rows per simdgroup, simdgroups), compiled on first use.
+    gen_psos: Mutex<HashMap<(QuantFormat, u8, u8), ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
@@ -1098,17 +1106,17 @@ impl Runtime {
         Ok(out)
     }
 
-    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
-    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
+    /// The generated packed-GEMV pipeline for `f` with `params`, compiled on first use.
+    fn gen_pso(
+        &self,
+        f: QuantFormat,
+        params: crate::graph::codegen::GemvParams,
+    ) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, rows_per_sg);
+        let key = (c.format, params.rows_per_sg as u8, params.simdgroups as u8);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
-        let params = crate::graph::codegen::GemvParams {
-            rows_per_sg: rows_per_sg as usize,
-            ..Default::default()
-        };
         let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
         src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
         src.push_str(&crate::graph::codegen::gemv_packed(c, params));
@@ -1138,7 +1146,7 @@ impl Runtime {
     /// otherwise unused `rows_per_sg == 0` slot).
     fn dequant_pso(&self, f: QuantFormat) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, 0);
+        let key = (c.format, 0, 0);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
@@ -1152,7 +1160,7 @@ impl Runtime {
     /// Hash of the kernel sources behind every variant of `fmt`: an edit invalidates only the
     /// tune entries of the formats whose kernels it changed.
     fn variants_hash(&self, fmt: WeightFormat) -> u64 {
-        use crate::graph::codegen::{gemv_common, gemv_packed, GemvParams};
+        use crate::graph::codegen::{gemv_common, gemv_packed};
         let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
         let mut mix =
             |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
@@ -1160,14 +1168,10 @@ impl Runtime {
             mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
-            for r in tune::GEN_ROWS {
-                mix(&gemv_packed(
-                    c,
-                    GemvParams {
-                        rows_per_sg: r as usize,
-                        ..Default::default()
-                    },
-                ));
+            for v in fmt.gemv_variants() {
+                if v.kernel != GemvKernel::Hand {
+                    mix(&gemv_packed(c, v.gen_params()));
+                }
             }
         }
         h
@@ -2138,7 +2142,7 @@ impl Session {
             })
             .collect();
         for q in gen_formats {
-            rt.gen_pso(q, 2)?;
+            rt.gen_pso(q, crate::graph::codegen::GemvParams::default())?;
         }
         Ok(Self {
             rt,
@@ -2207,43 +2211,36 @@ impl Session {
         (n * 4) as u64
     }
 
-    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`.
+    /// The pipeline, rows per threadgroup and threads per threadgroup of `format`'s packed GEMV in `variant`.
     fn gemv_pipeline(
         &self,
         format: WeightFormat,
         variant: GemvVariant,
         cols: usize,
-    ) -> Result<(ComputePipelineState, u64), String> {
-        let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
+    ) -> Result<(ComputePipelineState, u64, u64), String> {
+        use crate::graph::codegen::{gemv_rows_per_tg, gemv_threads};
+        let generated = |q: QuantFormat, v: GemvVariant| -> Result<(ComputePipelineState, u64, u64), String> {
+            let p = v.gen_params();
             Ok((
-                self.rt.gen_pso(q, r)?,
-                crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
-                    rows_per_sg: r as usize,
-                    ..Default::default()
-                }) as u64,
+                self.rt.gen_pso(q, p)?,
+                gemv_rows_per_tg(p) as u64,
+                gemv_threads(p) as u64,
             ))
         };
         match (format, variant.kernel) {
-            (WeightFormat::Gen(q), _) => generated(
-                q,
-                if variant.kernel == GemvKernel::Gen {
-                    variant.rows_per_sg
-                } else {
-                    2
-                },
-            ),
-            (_, GemvKernel::Gen) => match format.codec_format() {
-                Some(q) => generated(q, variant.rows_per_sg),
-                None => Err(format!("no generated GEMV for {format:?}")),
-            },
+            (WeightFormat::Gen(q), GemvKernel::Hand) => generated(q, GemvVariant::generated(2)),
             (_, GemvKernel::Hand) => match format.hand_kernel() {
                 Some(_) if format == WeightFormat::Q4_0 && (cols & 1023) != 0 => {
-                    Ok((self.rt.pso("gemv_q4_0_half")?.clone(), 16))
+                    Ok((self.rt.pso("gemv_q4_0_half")?.clone(), 16, 256))
                 }
-                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                Some(name) => Ok((self.rt.pso(name)?.clone(), 16, 256)),
                 None => Err(format!(
                     "Metal executor: unsupported packed GEMV format {format:?}"
                 )),
+            },
+            (_, GemvKernel::Gen | GemvKernel::Gen64) => match format.codec_format() {
+                Some(q) => generated(q, variant),
+                None => Err(format!("no generated GEMV for {format:?}")),
             },
         }
     }
@@ -2988,7 +2985,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
+                let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -3006,7 +3003,7 @@ impl Session {
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
-                    MTLSize::new(256, 1, 1),
+                    MTLSize::new(threads, 1, 1),
                 );
                 Ok(())
             }
@@ -3270,7 +3267,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
+                let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
@@ -3298,7 +3295,7 @@ impl Session {
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
-                    MTLSize::new(256, 1, 1),
+                    MTLSize::new(threads, 1, 1),
                 );
             }
             Step::GemvPackedPair {
@@ -3376,7 +3373,7 @@ impl Session {
                     );
                 } else {
                     for leg in legs {
-                        let (pso, rows_per_tg) =
+                        let (pso, rows_per_tg, threads) =
                             self.gemv_pipeline(format, leg.variant, cols)?;
                         enc.set_compute_pipeline_state(&pso);
                         bind(0, leg.w);
@@ -3394,7 +3391,7 @@ impl Session {
                         bind(5, leg.res.unwrap_or(leg.out));
                         enc.dispatch_thread_groups(
                             MTLSize::new((leg.rows as u64).div_ceil(rows_per_tg), m as u64, 1),
-                            MTLSize::new(256, 1, 1),
+                            MTLSize::new(threads, 1, 1),
                         );
                     }
                 }
