@@ -11503,4 +11503,93 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let plan = s.prepare_plan(&g).unwrap();
         assert_eq!(plan.mlp_scratch_size, h * 4 + 2 * inter * 4);
     }
+
+    /// q/k/v projections on packed GGUF `Mat`s, fused by the optimization passes (all three for
+    /// one format, the q/k pair when v differs), on Metal against the unfused graph on the CPU.
+    #[test]
+    fn fused_qkv_packed_mats_match_unfused_cpu() {
+        use crate::hardware::QuantFormat as Q;
+        use crate::model::weights::{Mat, Packed};
+        let (heads, kv_heads, hd, h) = (4usize, 2usize, 16usize, 512usize);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let packed = |fmt: Q, rows: usize, seed: usize| {
+            let (block, header) = if fmt == Q::GGUF_Q4_0 {
+                (18, 2)
+            } else {
+                (144, 4)
+            };
+            let mut map = memmap2::MmapMut::map_anon(rows * fmt.tensor_bytes(h)).unwrap();
+            for (j, b) in map.iter_mut().enumerate() {
+                *b = (j * 31 + seed * 7) as u8;
+            }
+            for blk in map.chunks_exact_mut(block) {
+                for c in blk[..header].chunks_exact_mut(2) {
+                    c.copy_from_slice(&crate::graph::coreml::f32_to_f16(0.03).to_le_bytes());
+                }
+            }
+            let p = Packed {
+                map: Arc::new(crate::model::loaders::gguf::GgufData::Map(
+                    map.make_read_only().unwrap(),
+                )),
+                off: 0,
+                format: fmt,
+                shape: vec![rows, h],
+            };
+            Tensor::Mat(Mat::from_packed(p, rows, h))
+        };
+        for fmts in [
+            [Q::GGUF_Q4_0; 3],
+            [Q::GGUF_Q4_K_M, Q::GGUF_Q4_K_M, Q::GGUF_Q4_0],
+        ] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, h], DType::F32);
+            let pos = g.input("pos", vec![1], DType::U32);
+            let mut w = Weights::new();
+            let mut outs = Vec::new();
+            for (i, (n, rows)) in [("q", q_dim), ("k", kv_dim), ("v", kv_dim)]
+                .into_iter()
+                .enumerate()
+            {
+                let wn = format!("w{n}");
+                let wv = g.weight(&wn, vec![rows, h], DType::Quant(fmts[i]));
+                w.insert(wn, packed(fmts[i], rows, i));
+                let o = g.add(n, Op::Linear, &[x, wv], vec![1, rows], DType::F32);
+                g.output(o);
+                outs.push(o);
+            }
+            let ks = g.state("ks", vec![16, kv_dim], DType::F32);
+            let vs = g.state("vs", vec![16, kv_dim], DType::F32);
+            let att = g.add(
+                "att",
+                Op::CachedAttention {
+                    heads,
+                    kv_heads,
+                    head_dim: hd,
+                    v_head_dim: hd,
+                    scale: 0.25,
+                    causal: true,
+                    window: None,
+                    soft_cap: None,
+                    write: true,
+                },
+                &[outs[0], outs[1], outs[2], ks, vs, pos],
+                vec![1, q_dim],
+                DType::F32,
+            );
+            g.output(att);
+            let (mut og, mut ow) = (g.clone(), w.clone());
+            crate::graph::passes::run_optimization_passes(&mut og, Some(&mut ow)).unwrap();
+            assert!(og.nodes.iter().any(|n| n.name.starts_with("q.fused_qk")));
+            let inputs = vec![Tensor::F32(rand(h, 7)), Tensor::U32(vec![0])];
+            let want = cpu::run(&g, &w, &mut StateStore::new(), inputs.clone()).unwrap();
+            let got = Session::new(rt(), &ow)
+                .unwrap()
+                .run_with_state(&og, Some(&mut StateStore::new()), inputs)
+                .unwrap();
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                let e = rel_err(a.as_f32().unwrap(), b.as_f32().unwrap());
+                assert!(e < 1e-3, "{fmts:?} output {i}: {e}");
+            }
+        }
+    }
 }

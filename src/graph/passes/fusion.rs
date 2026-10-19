@@ -4,29 +4,21 @@ use crate::graph::pattern::{any, capture, op_type, GraphRewriter, Pattern};
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
-/// Supports F32, BF16, F16, GGUF-quantized, and Mat.
+/// Supports F32, BF16, F16, GGUF-quantized, and Mat (all parts Mat: [`Mat::concat_rows`]).
+///
+/// [`Mat::concat_rows`]: crate::model::weights::Mat::concat_rows
 pub fn concat_weight_tensors(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
-    if tensors.is_empty() {
-        return None;
+    if tensors.iter().any(|t| matches!(t, Tensor::Mat(_))) {
+        let mats = tensors
+            .iter()
+            .map(|t| match t {
+                Tensor::Mat(m) if m.cols == in_features => Some(m),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return crate::model::weights::Mat::concat_rows(&mats).map(Tensor::Mat);
     }
-    // Normalize any Tensor::Mat: if packed GGUF, convert to Tensor::Quantized(ZeroCopySlice);
-    // if uncompressed safetensors, extract as Tensor::BF16.
-    let normalized: Vec<Tensor> = tensors
-        .iter()
-        .map(|&t| match t {
-            Tensor::Mat(m) => {
-                if m.packed().is_some() {
-                    m.to_graph_tensor()
-                } else {
-                    Tensor::BF16(m.data().to_vec())
-                }
-            }
-            _ => t.clone(),
-        })
-        .collect();
-
-    let norm_refs: Vec<&Tensor> = normalized.iter().collect();
-    concat_weight_tensors_inner(&norm_refs, in_features)
+    concat_weight_tensors_inner(tensors, in_features)
 }
 
 fn concat_weight_tensors_inner(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
@@ -192,6 +184,16 @@ fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
             crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. } => *format == fmt,
             _ => false,
         },
+        (_, Tensor::Mat(m)) => {
+            use crate::hardware::QuantFormat as Q;
+            dtype
+                == match m.packed().map_or(Q::BF16, |p| p.format) {
+                    Q::FP32 => DType::F32,
+                    Q::FP16 => DType::F16,
+                    Q::BF16 => DType::BF16,
+                    f => DType::Quant(f),
+                }
+        }
         _ => false,
     }
 }
@@ -298,14 +300,10 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
 
         // If weights are provided, we MUST be able to fuse the weight tensors
         if let Some(w_store) = &weights {
-            let mut ts = Vec::with_capacity(legs.len());
-            for l in legs {
-                let t = w_store.get(&g.value(l.2).name)?;
-                if matches!(t, Tensor::Mat(_)) {
-                    return None;
-                }
-                ts.push(t);
-            }
+            let ts = legs
+                .iter()
+                .map(|l| w_store.get(&g.value(l.2).name))
+                .collect::<Option<Vec<_>>>()?;
             let fused_tensor = concat_weight_tensors(&ts, in_features)?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
@@ -444,6 +442,10 @@ pub fn fuse_gate_up_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -
         if let Some(ref w_store) = weights {
             let gate_t = w_store.get(&g.value(gate_w_id).name)?;
             let up_t = w_store.get(&g.value(up_w_id).name)?;
+            // Model-loader Mats stay unfused: the Metal planner folds the GLU into the up GEMV's
+            // epilogue (`Epi::UpGeGlu`/`UpSwiGlu`) when gate and up are separate, while the fused
+            // form plans as one GEMV plus a standalone GLU step: same dispatch count, one more
+            // activation round trip.
             if matches!(gate_t, Tensor::Mat(_)) || matches!(up_t, Tensor::Mat(_)) {
                 return None;
             }
@@ -671,11 +673,12 @@ mod tests {
         }
     }
 
-    /// x -> norm -> {q,k,v} Linear with per-projection weight dtypes (F16 weights stand in for a
-    /// second codec), optionally consumed by an `Attention`. Returns the graph, its weights and
-    /// the input.
+    /// x -> norm -> {q,k,v} Linear with per-projection weight dtypes, optionally consumed by an
+    /// `Attention`. F16 weights stand in for a second plain codec; `Quant(f)` weights are packed
+    /// GGUF `Mat`s in an anonymous mapping, as the GGUF loaders produce them. Returns the graph,
+    /// its weights and the input.
     fn qkv_graph(dts: [DType; 3], attn: bool) -> (Graph, Weights, Vec<Tensor>) {
-        let (h, rows) = (8usize, [8usize, 4, 4]);
+        let (h, rows) = (256usize, [8usize, 4, 4]);
         let mut g = Graph::new();
         let x = g.input("x", vec![1, h], DType::F32);
         let gamma = g.weight("gamma", vec![h], DType::F32);
@@ -708,6 +711,7 @@ mod tests {
                         })
                         .collect(),
                     ),
+                    DType::Quant(fmt) => packed_mat(fmt, rows[i], h, i),
                     _ => Tensor::F32(vals.collect()),
                 },
             );
@@ -723,11 +727,46 @@ mod tests {
                 window: None,
                 soft_cap: None,
             };
-            let a = g.add("attn", op, &outs, vec![1, h], DType::F32);
+            let a = g.add("attn", op, &outs, vec![1, rows[0]], DType::F32);
             g.output(a);
         }
         let input = vec![Tensor::F32((0..h).map(|i| i as f32 * 0.3 - 1.0).collect())];
         (g, weights, input)
+    }
+
+    /// A `[rows, cols]` packed GGUF `Mat` of patterned blocks whose f16 scales (Q4_0: `d`;
+    /// Q4_K: `d`, `dmin`) are a finite 0.0625.
+    fn packed_mat(
+        fmt: crate::hardware::QuantFormat,
+        rows: usize,
+        cols: usize,
+        seed: usize,
+    ) -> Tensor {
+        use crate::model::weights::{Mat, Packed};
+        let (block, header) = match fmt {
+            crate::hardware::QuantFormat::GGUF_Q4_0 => (18, 2),
+            crate::hardware::QuantFormat::GGUF_Q4_K_M => (144, 4),
+            f => panic!("no fixture for {f:?}"),
+        };
+        let n = rows * fmt.tensor_bytes(cols);
+        let mut map = memmap2::MmapMut::map_anon(n).unwrap();
+        for (j, b) in map.iter_mut().enumerate() {
+            *b = (j * 31 + seed * 7) as u8;
+        }
+        for blk in map.chunks_exact_mut(block) {
+            for c in blk[..header].chunks_exact_mut(2) {
+                c.copy_from_slice(&0x2C00u16.to_le_bytes());
+            }
+        }
+        let p = Packed {
+            map: std::sync::Arc::new(crate::model::loaders::gguf::GgufData::Map(
+                map.make_read_only().unwrap(),
+            )),
+            off: 0,
+            format: fmt,
+            shape: vec![rows, cols],
+        };
+        Tensor::Mat(Mat::from_packed(p, rows, cols))
     }
 
     /// Runs `fuse_qkv_pass`, checks CPU parity with the unfused graph, and returns the names of
@@ -771,6 +810,23 @@ mod tests {
     fn fuse_qkv_pass_same_format_still_fuses_all_three() {
         let f = DType::F32;
         assert_eq!(fuse_and_check([f, f, f]), ["q.fused_qkv"]);
+    }
+
+    #[test]
+    fn fuse_qkv_pass_fuses_packed_gguf_mats() {
+        use crate::hardware::QuantFormat as Q;
+        let (k4, q4) = (DType::Quant(Q::GGUF_Q4_K_M), DType::Quant(Q::GGUF_Q4_0));
+        assert_eq!(fuse_and_check([q4, q4, q4]), ["q.fused_qkv"]);
+        assert_eq!(fuse_and_check([k4, k4, q4]), ["q.fused_qk", "v"]);
+        // The fused weight is one packed Mat of the shared format and replaces its parts.
+        let (mut g, mut w, _) = qkv_graph([k4, k4, q4], true);
+        assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 1);
+        assert!(w.get("w_q").is_none() && w.get("w_k").is_none() && w.get("w_v").is_some());
+        let Some(Tensor::Mat(m)) = w.get("q_fused_qk_w") else {
+            panic!("fused weight is not a Mat");
+        };
+        assert_eq!((m.rows, m.cols), (12, 256));
+        assert_eq!(m.packed().map(|p| p.format), Some(Q::GGUF_Q4_K_M));
     }
 }
 
