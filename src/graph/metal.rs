@@ -400,6 +400,10 @@ const F16_MAX: f32 = 65504.0;
 /// `f16` is also accepted). K/V rows are normalised projections, far inside f16 range; the kernels saturate
 /// at +-65504 and accumulate and softmax in f32.
 pub(crate) fn kv_f16_default() -> bool {
+    #[cfg(test)]
+    if KV_F32_IN_TEST.get() {
+        return false;
+    }
     match std::env::var("GIBBS_KV_DTYPE").as_deref() {
         Ok("f32") => false,
         Ok("f16") | Err(_) => true,
@@ -408,6 +412,11 @@ pub(crate) fn kv_f16_default() -> bool {
             true
         }
     }
+}
+#[cfg(test)]
+thread_local! {
+    /// Test-only: sessions created on this thread default to f32 KV (parity tests not about KV dtype).
+    pub(crate) static KV_F32_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 /// Threads per threadgroup: element-wise and row kernels, and the 4-simdgroup GEMM/attention kernels.
 const TG: u64 = 256;
@@ -10785,7 +10794,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         w.insert("wk", Tensor::F32(rand(16, 3)));
         w.insert("wv", Tensor::F32(rand(16, 4)));
 
-        let s = Session::new(rt(), &w).unwrap();
+        let mut s = Session::new(rt(), &w).unwrap();
+        s.set_kv_f16(false);
         let plan = s.prepare_plan(&g).unwrap();
 
         assert_eq!(plan.value_locs.len(), g.values.len());
@@ -10820,9 +10830,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 .run_prepared(&g, &plan, Some(&mut m_state), inp)
                 .unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-            // Default f16 KV rounds each cached K/V (see `KV_DTYPES`).
-            let tol = KV_DTYPES[kv_f16_default() as usize].1;
-            assert!(err < tol, "step {step_pos}: rel_err {err}");
+            assert!(err < 1e-4, "step {step_pos}: rel_err {err}");
         }
     }
 
@@ -10921,7 +10929,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         w.insert("gw", Tensor::F32(rand(hd, 4)));
         w.insert("inv", Tensor::F32(rand(hd / 2, 5)));
 
-        let sess = Session::new(rt(), &w).unwrap();
+        let mut sess = Session::new(rt(), &w).unwrap();
+        sess.set_kv_f16(false);
         let plan = sess.prepare_plan(&g).unwrap();
         assert_eq!(plan.steps.len(), 5);
         assert!(matches!(plan.steps[0].op, Step::GemvPacked { .. }));
@@ -10948,8 +10957,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
             let got = sess.run_prepared(&g, &plan, Some(&mut ms), inp).unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-            let tol = KV_DTYPES[kv_f16_default() as usize].1;
-            assert!(err < tol, "step {step}: rel_err {err}");
+            assert!(err < 1e-4, "step {step}: rel_err {err}");
         }
     }
 
