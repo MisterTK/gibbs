@@ -56,6 +56,59 @@ kernel void moe_topk_f32(device const float* x [[buffer(0)]],
     }
 }
 
+// TopK k = 1 over one wide row, in two passes: `moe_argmax_part_f32` gives threadgroup g the span
+// [g * span, (g + 1) * span) and writes its best (value, index); `moe_argmax_reduce_f32` reduces
+// the partials in one threadgroup. Same order as `moe_topk_f32`. 256 threads per threadgroup.
+// Threadgroup best of every thread's (bv, bi), valid in simdgroup 0: simd_max of the values, then
+// the lowest index holding it (keys are never NaN, empty lanes hold (-inf, none)).
+inline void moe_argmax_tg(thread float& bv, thread uint& bi, threadgroup float* sv,
+                          threadgroup uint* si, uint sg, uint lane) {
+    float m = simd_max(bv);
+    uint i = simd_min(bv == m ? bi : 0xFFFFFFFFu);
+    if (lane == 0) { sv[sg] = m; si[sg] = i; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const float v = lane < 8 ? sv[lane] : -INFINITY;
+        const uint j = lane < 8 ? si[lane] : 0xFFFFFFFFu;
+        bv = simd_max(v);
+        bi = simd_min(v == bv ? j : 0xFFFFFFFFu);
+    }
+}
+
+kernel void moe_argmax_part_f32(device const float* x [[buffer(0)]],
+                                device float* part_v [[buffer(1)]],
+                                device uint* part_i [[buffer(2)]],
+                                constant uint2& p [[buffer(3)]],  // cols, span
+                                uint g [[threadgroup_position_in_grid]],
+                                uint t [[thread_position_in_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sv[8];
+    threadgroup uint si[8];
+    const uint hi = min((g + 1) * p.y, p.x);
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint i = g * p.y + t; i < hi; i += 256) moe_pick(bv, bi, moe_key(x[i]), i);
+    moe_argmax_tg(bv, bi, sv, si, sg, lane);
+    if (t == 0) { part_v[g] = bv; part_i[g] = bi; }
+}
+
+kernel void moe_argmax_reduce_f32(device const float* part_v [[buffer(0)]],
+                                  device const uint* part_i [[buffer(1)]],
+                                  device uint* out [[buffer(2)]],
+                                  constant uint& parts [[buffer(3)]],
+                                  uint t [[thread_position_in_threadgroup]],
+                                  uint sg [[simdgroup_index_in_threadgroup]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float sv[8];
+    threadgroup uint si[8];
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint j = t; j < parts; j += 256) moe_pick(bv, bi, part_v[j], part_i[j]);
+    moe_argmax_tg(bv, bi, sv, si, sg, lane);
+    if (t == 0) out[0] = bi;
+}
+
 kernel void moe_topk_softmax_f32(device const float* x [[buffer(0)]],
                                  device uint* out_ids [[buffer(1)]],
                                  device float* out_weights [[buffer(2)]],

@@ -7,7 +7,7 @@
 //! pseudo-codecs), `Embedding` over F16/BF16/codec-quantized tables, and shape guards for
 //! `CausalConv1dCached` / `DeltaRule` forms the core kernels would read out of bounds.
 
-use super::super::{numel, set_bytes, u32_of, Planned, Session, TG};
+use super::super::{new_shared_buffer, numel, set_bytes, u32_of, Planned, Session, TG};
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
@@ -24,11 +24,18 @@ pub(super) const MSL: &str = include_str!("moe.metal");
 /// Compute functions in `moe.metal`.
 pub(super) const KERNELS: &[&str] = &[
     "moe_topk_f32",
+    "moe_argmax_part_f32",
+    "moe_argmax_reduce_f32",
     "moe_topk_softmax_f32",
     "moe_gather_cols_f32",
     "moe_embed_f16",
     "moe_embed_bf16",
 ];
+
+/// A single-row `TopK { k: 1 }` at least this wide runs the two-pass argmax (one threadgroup per
+/// `ARGMAX_SPAN` columns, then one reducing threadgroup) instead of one threadgroup over the row.
+const ARGMAX_WIDE: usize = 8192;
+const ARGMAX_SPAN: usize = 4096;
 
 /// Source encoding of an embedding table.
 #[derive(Debug, Clone, Copy)]
@@ -485,6 +492,32 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                     MTLSize::new(*rows as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+            } else if *rows == 1 && *k == 1 && *cols >= ARGMAX_WIDE {
+                let parts = cols.div_ceil(ARGMAX_SPAN);
+                let mut guard = sess.argmax_scratch.lock();
+                if guard
+                    .as_ref()
+                    .is_none_or(|b| (b.length() as usize) < parts * 8)
+                {
+                    *guard = Some(new_shared_buffer(&rt.device, parts * 8)?);
+                }
+                let part = guard.as_ref().expect("allocated above");
+                let idx_off = (parts * 4) as u64;
+                enc.set_compute_pipeline_state(rt.pso("moe_argmax_part_f32")?);
+                e.bind(0, *x);
+                enc.set_buffer(1, Some(part), 0);
+                enc.set_buffer(2, Some(part), idx_off);
+                set_bytes(enc, 3, &[u32_of(*cols)?, ARGMAX_SPAN as u32]);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(parts as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.set_compute_pipeline_state(rt.pso("moe_argmax_reduce_f32")?);
+                enc.set_buffer(0, Some(part), 0);
+                enc.set_buffer(1, Some(part), idx_off);
+                e.bind(2, s.out);
+                set_bytes(enc, 3, &u32_of(parts)?);
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
             } else {
                 enc.set_compute_pipeline_state(rt.pso("moe_topk_f32")?);
                 e.bind(0, *x);
@@ -775,6 +808,69 @@ mod tests {
         let (want, got) = topk_both(vec![f32::NAN, 1.0, f32::NAN, 2.0], 1, 4, 4);
         assert_eq!(want, vec![3, 1, 0, 2]);
         assert_eq!(got, want);
+    }
+
+    /// The two-pass wide-row argmax (`TopK { k: 1 }` over one row >= `ARGMAX_WIDE`) equals the CPU
+    /// TopK, and the decode argmax head over a valid prefix (`program::argmax_head`, a Slice view
+    /// then TopK) equals the host greedy pick, with the maximum tied across threadgroup spans.
+    #[test]
+    fn wide_argmax_matches_cpu_and_host_greedy() {
+        for cols in [
+            super::ARGMAX_WIDE,
+            super::ARGMAX_WIDE + 1,
+            3 * super::ARGMAX_SPAN + 17,
+            262_144,
+        ] {
+            let distinct = rand(cols, cols as u64);
+            let mut tied: Vec<f32> = distinct.iter().map(|v| (v * 3.0).round()).collect();
+            // The same maximum in several spans and at both span edges; the first must win.
+            for i in [
+                super::ARGMAX_SPAN - 1,
+                super::ARGMAX_SPAN,
+                cols / 2,
+                cols - 1,
+            ] {
+                tied[i] = 100.0;
+            }
+            let mut nan = distinct.clone();
+            nan.iter_mut().step_by(7).for_each(|v| *v = f32::NAN);
+            let late = {
+                let mut v = vec![-1.0f32; cols];
+                v[cols - 1] = 0.0;
+                v
+            };
+            for (name, x) in [
+                ("distinct", distinct),
+                ("tied", tied),
+                ("nan", nan),
+                ("late", late),
+                ("constant", vec![0.5f32; cols]),
+                ("-inf", vec![f32::NEG_INFINITY; cols]),
+            ] {
+                let (want, got) = topk_both(x.clone(), 1, cols, 1);
+                assert_eq!(got, want, "argmax {name} cols={cols}");
+                if name == "nan" {
+                    continue; // the host scan skips NaN instead of ranking it lowest
+                }
+                let mut g = Graph::new();
+                let xv = g.input("x", vec![1, cols], DType::F32);
+                g.output(xv);
+                for valid in [cols, cols - cols / 20] {
+                    let head = crate::graph::program::argmax_head(&g, valid).unwrap();
+                    let got = Session::new(rt(), &Weights::new())
+                        .unwrap()
+                        .run(&head, vec![Tensor::F32(x.clone())])
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap()[0]
+                        .to_bits();
+                    let want =
+                        crate::model::graph_lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0, 1.0);
+                    assert_eq!(got, want, "head {name} cols={cols} valid={valid}");
+                }
+            }
+        }
     }
 
     #[test]
