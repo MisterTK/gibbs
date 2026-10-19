@@ -75,6 +75,18 @@ pub trait NativeLm: Send + Sync {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String>;
+    /// [`Self::forward`] for a greedy step: `U32([token])` when the device picked the first largest
+    /// logit within the tokenizer's vocabulary ([`crate::graph::program::GraphProgram::run_greedy`]),
+    /// else `F32(logits)`.
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.forward(tokens, start_pos, state)
+            .map(crate::graph::Tensor::F32)
+    }
 
     // Speculative decoding (see `crate::scheduler::spec`): a model supports it by verifying
     // several positions in one pass and rewinding the ones the target rejects.

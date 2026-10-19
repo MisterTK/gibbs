@@ -3,7 +3,7 @@
 use crate::graph::placement::{
     device_supports_op, place_graph_default, placement_rows, PlacementPlan, PlacementRow,
 };
-use crate::graph::{cpu, Graph, StateStore, Tensor, ValueId, Weights};
+use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, ValueId, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
 use std::collections::HashMap;
 
@@ -43,6 +43,49 @@ pub struct GraphProgram {
     pub state: StateStore,
     pub graph_inputs: Vec<ValueId>,
     pub graph_outputs: Vec<ValueId>,
+    /// [`Self::run_greedy`]'s graph and plan, with the `valid` they were built for.
+    #[cfg(target_os = "macos")]
+    argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
+}
+
+/// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
+pub const GPU_ARGMAX_MIN_VOCAB: usize = 150_000;
+
+/// `GIBBS_GPU_ARGMAX=1`: greedy decode steps pick the token on the device, read once.
+fn gpu_argmax() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("GIBBS_GPU_ARGMAX").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+    });
+    *ON
+}
+
+/// `graph` with output 0 (one f32 row) replaced by the `[.., 1]` u32 index of the first largest of
+/// its first `valid` entries (0 = all), NaN ranking lowest: a prefix `Slice` then `TopK { k: 1 }`.
+/// The other outputs stay. `None` when output 0 is not one f32 row.
+pub(crate) fn argmax_head(graph: &Graph, valid: usize) -> Option<Graph> {
+    let &logits = graph.outputs.first()?;
+    let v = graph.value(logits);
+    let cols = v.shape.last().copied().filter(|&c| c > 0)?;
+    if v.dtype != DType::F32 || v.shape.iter().product::<usize>() != cols {
+        return None;
+    }
+    let valid = if valid == 0 { cols } else { valid.min(cols) };
+    let mut shape = v.shape.clone();
+    let mut g = graph.clone();
+    let row = if valid < cols {
+        *shape.last_mut()? = valid;
+        let slice = Op::Slice {
+            axis: -1,
+            start: 0,
+            end: valid as i64,
+        };
+        g.add("argmax_valid", slice, &[logits], shape.clone(), DType::F32)
+    } else {
+        logits
+    };
+    *shape.last_mut()? = 1;
+    g.outputs[0] = g.add("argmax", Op::TopK { k: 1 }, &[row], shape, DType::U32);
+    Some(g)
 }
 
 /// Programs being compiled right now: placement, weight upload, kernel build and tuning.
@@ -137,6 +180,8 @@ impl GraphProgram {
             state: StateStore::new(),
             graph_inputs,
             graph_outputs,
+            #[cfg(target_os = "macos")]
+            argmax: None,
         })
     }
 
@@ -316,6 +361,45 @@ impl GraphProgram {
             })
             .collect()
     }
+
+    /// [`Self::run`] for a greedy decode step whose token is the first largest of the first `valid`
+    /// entries of output 0 (0 = all). With `GIBBS_GPU_ARGMAX=1` on a single Metal segment whose
+    /// output 0 is one f32 row of at least [`GPU_ARGMAX_MIN_VOCAB`], the device picks it and output 0
+    /// comes back as `U32([token])` (one u32 read back instead of the row); otherwise exactly `run`.
+    pub fn run_greedy(&mut self, inputs: Vec<Tensor>, valid: usize) -> Result<Vec<Tensor>, String> {
+        #[cfg(target_os = "macos")]
+        if let ([CompiledSegment::Metal { graph, session, .. }], true) =
+            (self.segments.as_slice(), gpu_argmax())
+        {
+            let wide = graph.outputs.first().is_some_and(|&o| {
+                graph.value(o).shape.last().copied().unwrap_or(0) >= GPU_ARGMAX_MIN_VOCAB
+            });
+            if wide && self.argmax.as_ref().map(|a| a.0) != Some(valid) {
+                self.argmax = match argmax_head(graph, valid) {
+                    Some(g) => {
+                        let plan = session.prepare_plan(&g)?;
+                        Some((valid, g, plan))
+                    }
+                    None => None,
+                };
+            }
+            if let (true, Some((_, g, plan))) = (wide, &self.argmax) {
+                if inputs.len() != g.inputs.len() {
+                    return Err(format!(
+                        "program expects {} inputs, got {}",
+                        g.inputs.len(),
+                        inputs.len()
+                    ));
+                }
+                let mut out = session.run_prepared(g, plan, Some(&mut self.state), inputs)?;
+                // Outputs come back as f32 slots; output 0 holds the u32 index's bits.
+                out[0] = Tensor::U32(out[0].as_f32()?.iter().map(|v| v.to_bits()).collect());
+                return Ok(out);
+            }
+        }
+        let _ = valid;
+        self.run(inputs)
+    }
 }
 
 #[cfg(test)]
@@ -362,5 +446,52 @@ mod tests {
             // Counts never increase down the table.
             assert!(rows.windows(2).all(|p| p[0].count >= p[1].count));
         }
+    }
+
+    /// The device-argmax graph (`argmax_head`) run on the CPU executor picks the host greedy token
+    /// (`sample_logits` at temperature 0) over the first `valid` logits, ties to the lower index,
+    /// and keeps the other outputs.
+    #[test]
+    fn argmax_head_picks_the_host_greedy_token() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for n in [1usize, 7, 1000, 4099] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, n], DType::F32);
+            let tap = g.input("tap", vec![1, 3], DType::F32);
+            g.output(x);
+            g.output(tap);
+            for round in 0..6 {
+                // A few levels, so the maximum ties; round 5 is all -inf.
+                let row: Vec<f32> = (0..n)
+                    .map(|_| match round {
+                        5 => f32::NEG_INFINITY,
+                        r => (next() % (4 + r * 1000)) as f32 * 0.25 - 3.0,
+                    })
+                    .collect();
+                for valid in [0, n, n - n / 3, 1, n + 5] {
+                    let head = argmax_head(&g, valid).expect("one f32 row");
+                    let inputs = vec![Tensor::F32(row.clone()), Tensor::F32(vec![1.0, 2.0, 3.0])];
+                    let out = cpu::run_stateless(&head, &Weights::new(), inputs).unwrap();
+                    let v = if valid == 0 { n } else { valid.min(n) };
+                    let want =
+                        crate::model::graph_lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
+                    assert_eq!(
+                        out[0],
+                        Tensor::U32(vec![want]),
+                        "n={n} round={round} valid={valid}"
+                    );
+                    assert_eq!(out[1], Tensor::F32(vec![1.0, 2.0, 3.0]));
+                }
+            }
+        }
+        // Output 0 must be one f32 row.
+        let mut g = Graph::new();
+        let x = g.input("x", vec![2, 4], DType::F32);
+        g.output(x);
+        assert!(argmax_head(&g, 0).is_none());
     }
 }

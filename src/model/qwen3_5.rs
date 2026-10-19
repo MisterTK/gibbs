@@ -1041,7 +1041,16 @@ impl NativeLm for Dense {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, false)
+        self.run(tokens, start_pos, state, false, false)?.into_f32()
+    }
+
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.run(tokens, start_pos, state, false, true)
     }
 
     fn forward_all(
@@ -1050,7 +1059,7 @@ impl NativeLm for Dense {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, true)
+        self.run(tokens, start_pos, state, true, false)?.into_f32()
     }
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
@@ -1088,14 +1097,17 @@ impl Dense {
     }
 
     /// Runs `tokens` from `start_pos` (rewinding the KV caches to it); logits after the last
-    /// token, or after every token when `all`.
+    /// token, or after every token when `all`. `greedy`: the program may return the last
+    /// position's device-picked token instead (`U32([token])`).
     fn run(
         &self,
         tokens: &[u32],
         start_pos: usize,
         state: &mut SeqState,
         all: bool,
-    ) -> Result<Vec<f32>, String> {
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
+        use crate::graph::Tensor;
         let seq = Self::seq(state)?;
         if start_pos > seq.len || tokens.is_empty() {
             return Err(format!(
@@ -1108,7 +1120,7 @@ impl Dense {
             if seq.taps.is_empty() {
                 let mut p = prog.lock();
                 std::mem::swap(&mut p.state, &mut seq.program_state);
-                let mut logits = Vec::new();
+                let mut logits = Tensor::F32(Vec::new());
                 for (i, &tok) in tokens.iter().enumerate() {
                     let pos = start_pos + i;
                     if pos >= self.text.decode_max_ctx {
@@ -1120,19 +1132,21 @@ impl Dense {
                     }
                     let mut emb = vec![0.0f32; self.text.hidden()];
                     self.text.embed(tok, &mut emb)?;
-                    let inputs = vec![
-                        crate::graph::Tensor::F32(emb),
-                        crate::graph::Tensor::U32(vec![pos as u32]),
-                    ];
-                    let step_out = p.run(inputs);
+                    let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos as u32])];
+                    let last = i + 1 == tokens.len();
+                    let step_out = if greedy && last {
+                        p.run_greedy(inputs, self.tok.vocab_size())
+                    } else {
+                        p.run(inputs)
+                    };
                     match step_out {
-                        Ok(res) => {
-                            if all || i + 1 == tokens.len() {
-                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
-                                    logits.extend_from_slice(&v);
-                                }
+                        Ok(res) => match (res.into_iter().next(), &mut logits) {
+                            (Some(t @ Tensor::U32(_)), l) => *l = t,
+                            (Some(Tensor::F32(v)), Tensor::F32(l)) if all || last => {
+                                l.extend_from_slice(&v)
                             }
-                        }
+                            _ => {}
+                        },
                         Err(e) => {
                             std::mem::swap(&mut p.state, &mut seq.program_state);
                             return Err(e);
@@ -1165,11 +1179,11 @@ impl Dense {
             &mut seq.tapped,
         );
         seq.len = start_pos + n;
-        Ok(if all {
+        Ok(Tensor::F32(if all {
             self.text.logits(&h, n)
         } else {
             self.text.logits(&h[(n - 1) * d..], 1)
-        })
+        }))
     }
 }
 
@@ -1329,7 +1343,16 @@ impl NativeLm for Qwen35 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, false)
+        self.run(tokens, start_pos, state, false, false)?.into_f32()
+    }
+
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.run(tokens, start_pos, state, false, true)
     }
 
     fn forward_all(
@@ -1341,7 +1364,7 @@ impl NativeLm for Qwen35 {
         if self.text.is_hc() {
             return Err("this model cannot verify draft tokens".into());
         }
-        self.run(tokens, start_pos, state, true)
+        self.run(tokens, start_pos, state, true, false)?.into_f32()
     }
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
@@ -1416,7 +1439,9 @@ impl Qwen35 {
     /// The program path of [`Self::run`]: `p.state` is the sequence's state. Image positions feed
     /// their feature row for the token embedding, the `[t, h, w]` rope positions and, per deepstack
     /// layer, the row added after it. `all` snapshots the recurrent states `refs` after every
-    /// position for [`NativeLm::truncate`].
+    /// position for [`NativeLm::truncate`]; `greedy` runs the last position through
+    /// [`crate::graph::program::GraphProgram::run_greedy`].
+    #[allow(clippy::too_many_arguments)]
     fn program_steps(
         &self,
         p: &mut crate::graph::program::GraphProgram,
@@ -1424,15 +1449,16 @@ impl Qwen35 {
         tokens: &[u32],
         start_pos: usize,
         all: bool,
+        greedy: bool,
         refs: &[&str],
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<crate::graph::Tensor, String> {
         use crate::graph::Tensor;
         let d = self.text.hidden();
         let ds_layers = self
             .vision
             .as_ref()
             .map_or(0, |(v, ..)| v.deepstack_layers());
-        let mut logits = Vec::new();
+        let (mut logits, mut picked) = (Vec::new(), None);
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = start_pos + i;
             if pos >= self.text.decode_max_ctx {
@@ -1463,13 +1489,17 @@ impl Qwen35 {
                     inputs.push(Tensor::F32(row));
                 }
             }
-            let mut res = p.run(inputs)?.into_iter();
-            if all || i + 1 == tokens.len() {
-                if let Some(Tensor::F32(v)) = res.next() {
-                    logits.extend_from_slice(&v);
-                }
+            let last = i + 1 == tokens.len();
+            let mut res = if greedy && last {
+                p.run_greedy(inputs, self.tok.vocab_size())?
             } else {
-                res.next();
+                p.run(inputs)?
+            }
+            .into_iter();
+            match res.next() {
+                Some(Tensor::U32(t)) => picked = t.first().copied(),
+                Some(Tensor::F32(v)) if all || last => logits.extend_from_slice(&v),
+                _ => {}
             }
             if !seq.taps.is_empty() {
                 match res.next() {
@@ -1481,18 +1511,23 @@ impl Qwen35 {
                 seq.ckpt.push(p.state.snapshot(refs));
             }
         }
-        Ok(logits)
+        Ok(match picked {
+            Some(t) => Tensor::U32(vec![t]),
+            None => Tensor::F32(logits),
+        })
     }
 
     /// Runs `tokens` from `start_pos`; logits after the last token, or after every token (with
-    /// recurrent checkpoints for `truncate`) when `all`.
+    /// recurrent checkpoints for `truncate`) when `all`. `greedy`: the program may return the last
+    /// position's device-picked token instead (`U32([token])`).
     fn run(
         &self,
         tokens: &[u32],
         start_pos: usize,
         state: &mut SeqState,
         all: bool,
-    ) -> Result<Vec<f32>, String> {
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
         let seq = Self::seq(state)?;
         if start_pos != seq.len {
             return Err(format!(
@@ -1511,7 +1546,7 @@ impl Qwen35 {
             }
             let mut p = prog.lock();
             std::mem::swap(&mut p.state, &mut seq.program_state);
-            let out = self.program_steps(&mut p, seq, tokens, start_pos, all, &refs);
+            let out = self.program_steps(&mut p, seq, tokens, start_pos, all, greedy, &refs);
             std::mem::swap(&mut p.state, &mut seq.program_state);
             if out.is_ok() {
                 seq.len = start_pos + tokens.len();
@@ -1556,11 +1591,11 @@ impl Qwen35 {
         seq.len += tokens.len();
         let n = tokens.len();
         let w = self.text.width();
-        Ok(if all {
+        Ok(crate::graph::Tensor::F32(if all {
             self.text.logits(&h, n)
         } else {
             self.text.logits(&h[(n - 1) * w..], 1)
-        })
+        }))
     }
 }
 
