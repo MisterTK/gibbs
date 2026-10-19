@@ -45,7 +45,7 @@ use crate::graph::passes::{fusion, megakernel};
 use crate::graph::pattern::MatchContext;
 use crate::graph::{DType, Graph, NodeId, Op, Tensor, ValueId, ValueKind, Weights};
 use egglog::scheduler::{Matches, Scheduler};
-use egglog::{EGraph, Value};
+use egglog::{EGraph, Value, Write as _};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::time::Instant;
@@ -384,82 +384,92 @@ fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<(String, 
     Some((format!("{:?}/{cols}/{storage}", val.dtype), mat))
 }
 
-/// The egglog facts of `g` (schema and rules excluded).
-fn encode(g: &Graph, weights: Option<&Weights>) -> Result<String, String> {
+/// Inserts the facts of `g` into `eg` (schema and rules already declared) through the row API:
+/// parsing an equivalent program costs several times the saturation on model graphs.
+fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), String> {
     let mut uses = vec![0i64; g.values.len()];
-    for n in &g.nodes {
-        for i in &n.inputs {
-            uses[i.0 as usize] += 1;
-        }
-    }
-    let mut p = String::with_capacity(g.nodes.len() * 256);
     let mut declared = vec![false; g.values.len()];
-    let mut w_declared = vec![false; g.values.len()];
-    for (id, n) in g.nodes.iter().enumerate() {
-        let [out] = n.outputs[..] else {
+    for n in &g.nodes {
+        if n.outputs.len() != 1 {
             return Err(format!(
                 "egraph: node {} has {} outputs",
                 n.name,
                 n.outputs.len()
             ));
-        };
-        let mut args = String::new();
+        }
         for &v in &n.inputs {
-            let vi = v.0 as usize;
-            if !declared[vi] {
-                if matches!(g.value(v).kind, ValueKind::Node(_)) {
-                    return Err(format!(
-                        "egraph: node {} reads {} before it is produced",
-                        n.name, v.0
-                    ));
-                }
-                declared[vi] = true;
-                if rows(&g.value(v).shape) == 1 {
-                    let _ = writeln!(p, "(OneRow (V {vi}))");
-                }
-                if megakernel::fusible_weight(g, v) {
-                    let _ = writeln!(p, "(MkW (V {vi}))");
-                }
+            if !declared[v.0 as usize] && matches!(g.value(v).kind, ValueKind::Node(_)) {
+                return Err(format!(
+                    "egraph: node {} reads {} before it is produced",
+                    n.name, v.0
+                ));
             }
-            let _ = write!(args, "(Cons (V {vi}) ");
+            uses[v.0 as usize] += 1;
         }
-        args.push_str("(Nil)");
-        args.push_str(&")".repeat(n.inputs.len()));
-        let o = out.0 as usize;
-        declared[o] = true;
-        let _ = writeln!(p, "(union (V {o}) (Node {id} {args}))");
-        let _ = writeln!(p, "(K {id} \"{}\")", n.op.name());
-        if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
-            let _ = writeln!(p, "(K {id} \"Glu\")");
-        }
-        let _ = writeln!(p, "(set (Uses (V {o})) {})", uses[o]);
-        if rows(&g.value(out).shape) == 1 {
-            let _ = writeln!(p, "(OneRow (V {o}))");
-        }
-        if let (Op::Linear, [x, w]) = (&n.op, &n.inputs[..]) {
-            if let Some((key, mat)) = cat_key(g, *w, weights) {
-                let wi = w.0 as usize;
-                if !w_declared[wi] {
-                    w_declared[wi] = true;
-                    let _ = writeln!(
-                        p,
-                        "(set (wrows (Wt {wi})) {}) (set (wkey (Wt {wi})) \"{key}\") \
-                         (set (wdt (Wt {wi})) \"{:?}\") (QkvIn (Wt {wi}))",
-                        g.value(*w).shape[0],
-                        g.value(*w).dtype
-                    );
-                    if !mat {
-                        let _ = writeln!(p, "(GuOk (Wt {wi}))");
+        declared[n.outputs[0].0 as usize] = true;
+    }
+    eg.update(|mut fs| -> Result<(), egglog::Error> {
+        let mut seen = vec![false; g.values.len()];
+        let mut w_seen = vec![false; g.values.len()];
+        for (id, n) in g.nodes.iter().enumerate() {
+            let id = id as i64;
+            let mut args = Vec::with_capacity(n.inputs.len());
+            for &v in &n.inputs {
+                let vi = v.0 as usize;
+                let c = fs.add("V", vi as i64)?;
+                if !seen[vi] {
+                    seen[vi] = true;
+                    if rows(&g.value(v).shape) == 1 {
+                        fs.add("OneRow", c)?;
+                    }
+                    if megakernel::fusible_weight(g, v) {
+                        fs.add("MkW", c)?;
                     }
                 }
-                let _ = writeln!(p, "(union (V {o}) (Lin {id} (V {}) (Wt {wi})))", x.0);
-                if fusion::feeds_attention(g, out) {
-                    let _ = writeln!(p, "(FeedsAttn (V {o}))");
+                args.push(c);
+            }
+            let mut list = fs.add("Nil", egglog::api::RawValues(Vec::new()))?;
+            for &c in args.iter().rev() {
+                list = fs.add("Cons", (c, list))?;
+            }
+            let out = n.outputs[0];
+            let o = fs.add("V", out.0 as i64)?;
+            seen[out.0 as usize] = true;
+            let node = fs.add("Node", (id, list))?;
+            fs.union(o, node)?;
+            fs.add("K", (id, n.op.name()))?;
+            if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
+                fs.add("K", (id, "Glu"))?;
+            }
+            fs.set("Uses", o, uses[out.0 as usize])?;
+            if rows(&g.value(out).shape) == 1 {
+                fs.add("OneRow", o)?;
+            }
+            if let (Op::Linear, [_, w]) = (&n.op, &n.inputs[..]) {
+                if let Some((key, mat)) = cat_key(g, *w, weights) {
+                    let wi = w.0 as usize;
+                    let wt = fs.add("Wt", wi as i64)?;
+                    if !w_seen[wi] {
+                        w_seen[wi] = true;
+                        fs.set("wrows", wt, g.value(*w).shape[0] as i64)?;
+                        fs.set("wkey", wt, key)?;
+                        fs.set("wdt", wt, format!("{:?}", g.value(*w).dtype))?;
+                        fs.add("QkvIn", wt)?;
+                        if !mat {
+                            fs.add("GuOk", wt)?;
+                        }
+                    }
+                    let lin = fs.add("Lin", (id, args[0], wt))?;
+                    fs.union(o, lin)?;
+                    if fusion::feeds_attention(g, out) {
+                        fs.add("FeedsAttn", o)?;
+                    }
                 }
             }
         }
-    }
-    Ok(p)
+        Ok(())
+    })
+    .map_err(|e| format!("egraph: {e}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,8 +723,8 @@ impl Fusion {
         for r in rules {
             program.push_str(r.text());
         }
-        program.push_str(&encode(g, weights)?);
         eg.parse_and_run_program(None, &program).map_err(err)?;
+        encode(&mut eg, g, weights)?;
         report.encode_ms = t.elapsed().as_secs_f64() * 1e3;
 
         let t = Instant::now();
