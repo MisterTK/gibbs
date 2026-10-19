@@ -184,6 +184,67 @@ impl Mat {
         });
         out
     }
+
+    /// `parts` stacked along rows into one packed tensor, or `None` unless every part is a
+    /// row-major `[rows, cols]` tensor of one storage format with whole blocks per row: packed
+    /// GGUF blocks of one format (2-D only, no expert banks), or bf16 (packed, mapped or owned).
+    /// The result lives in a page-aligned anonymous mapping (page-rounded length), so a zero-copy
+    /// device mapping can take it the way it takes the file mapping the parts point into.
+    pub fn concat_rows(parts: &[&Mat]) -> Option<Mat> {
+        use crate::hardware::QuantFormat as Q;
+        let first = parts.first()?;
+        let (cols, format) = (first.cols, first.packed().map_or(Q::BF16, |p| p.format));
+        let elems = match format {
+            Q::BF16 | Q::FP16 | Q::FP32 => 1,
+            f => crate::model::layers::gguf_block_codec(f)?.0,
+        };
+        if cols == 0 || cols % elems != 0 {
+            return None;
+        }
+        let row_bytes = format.tensor_bytes(cols);
+        let mut rows = 0;
+        for m in parts {
+            let ok = m.cols == cols
+                && match &m.buf {
+                    Buf::Packed(p) => {
+                        p.format == format
+                            && p.shape == [m.rows, cols]
+                            && p.off + m.rows * row_bytes <= p.map.len()
+                    }
+                    Buf::Map(..) | Buf::Owned(_) => format == Q::BF16,
+                };
+            if !ok {
+                return None;
+            }
+            rows += m.rows;
+        }
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+        let total = rows * row_bytes;
+        let mut map = memmap2::MmapMut::map_anon(total.next_multiple_of(page).max(page)).ok()?;
+        let mut at = 0;
+        for m in parts {
+            let dst = &mut map[at..at + m.rows * row_bytes];
+            match &m.buf {
+                Buf::Packed(p) => dst.copy_from_slice(&p.map[p.off..p.off + dst.len()]),
+                _ => {
+                    for (d, v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(m.data()) {
+                        *d = v.to_le_bytes();
+                    }
+                }
+            }
+            at += dst.len();
+        }
+        let p = Packed {
+            map: Arc::new(crate::model::loaders::gguf::GgufData::Map(
+                map.make_read_only().ok()?,
+            )),
+            off: 0,
+            format,
+            shape: vec![rows, cols],
+        };
+        Some(Mat::from_packed(p, rows, cols))
+    }
 }
 
 impl PartialEq for Mat {
@@ -919,6 +980,70 @@ mod tests {
 
         for (a, b) in out_gemv.iter().zip(&ref_out) {
             assert!((a - b).abs() < 1e-4, "gemv {a} vs ref {b}");
+        }
+    }
+
+    #[test]
+    fn concat_rows_stacks_bf16_and_packed_rows_exactly() {
+        use super::{Arc, Mat};
+        use crate::hardware::QuantFormat;
+        let cat = |a: &Mat, b: &Mat| [a.to_f32(), b.to_f32()].concat();
+        let w = Weights::from_f32(
+            vec![
+                ("a".into(), vec![3, 4]),
+                ("b".into(), vec![2, 4]),
+                ("c".into(), vec![1, 8]),
+            ],
+            |n| {
+                Ok((0..if n == "a" { 12 } else { 8 })
+                    .map(|i| i as f32 * 0.25 - 1.0)
+                    .collect())
+            },
+        )
+        .unwrap();
+        let (a, b, c) = (
+            w.mat("a").unwrap(),
+            w.mat("b").unwrap(),
+            w.mat("c").unwrap(),
+        );
+        let ab = Mat::concat_rows(&[&a, &b]).unwrap();
+        assert_eq!((ab.rows, ab.cols), (5, 4));
+        assert_eq!(ab.packed().map(|p| p.format), Some(QuantFormat::BF16));
+        assert_eq!(ab.to_f32(), cat(&a, &b));
+        assert!(Mat::concat_rows(&[&a, &c]).is_none(), "cols differ");
+
+        // Two Q4_0 tensors (2 and 1 rows of 64) back to back in one mapping.
+        let mut raw: Vec<u8> = (0..3 * 36).map(|i| (i * 37) as u8).collect();
+        for blk in raw.chunks_exact_mut(18) {
+            blk[..2].copy_from_slice(&crate::graph::coreml::f32_to_f16(0.5).to_le_bytes());
+        }
+        let mut map = memmap2::MmapMut::map_anon(raw.len()).unwrap();
+        map.copy_from_slice(&raw);
+        let map = Arc::new(crate::model::loaders::gguf::GgufData::Map(
+            map.make_read_only().unwrap(),
+        ));
+        let q = Weights::from_f32(vec![], |_| Ok(vec![]))
+            .unwrap()
+            .with_gguf_packed(
+                &map,
+                vec![
+                    ("x".into(), 0, QuantFormat::GGUF_Q4_0, vec![2, 64]),
+                    ("y".into(), 72, QuantFormat::GGUF_Q4_0, vec![1, 64]),
+                    ("bank".into(), 0, QuantFormat::GGUF_Q4_0, vec![1, 1, 64]),
+                ],
+            );
+        let (x, y) = (q.mat("x").unwrap(), q.mat("y").unwrap());
+        let xy = Mat::concat_rows(&[&x, &y]).unwrap();
+        assert_eq!(xy.packed().map(|p| p.format), Some(QuantFormat::GGUF_Q4_0));
+        assert_eq!(xy.to_f32(), cat(&x, &y));
+        let w64 =
+            Weights::from_f32(vec![("d".into(), vec![1, 64])], |_| Ok(vec![0.5; 64])).unwrap();
+        assert!(
+            Mat::concat_rows(&[&x, &w64.mat("d").unwrap()]).is_none(),
+            "formats differ"
+        );
+        if let Ok(bank) = q.mat("bank") {
+            assert!(Mat::concat_rows(&[&x, &bank]).is_none(), "expert bank");
         }
     }
 }

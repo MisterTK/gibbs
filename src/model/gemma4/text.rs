@@ -1469,6 +1469,35 @@ mod tests {
             );
         }
     }
+
+    /// The optimization passes fuse the builder's q/k/v `Mat` projections into one Linear
+    /// (q_norm/k_norm/RoPE/CachedAttention read its slices) without changing the logits.
+    #[test]
+    fn optimized_decode_graph_fuses_qkv_and_matches_unoptimized() {
+        use crate::graph::cpu::run_stateless;
+        use crate::graph::Tensor;
+        let model = tiny_model();
+        let (g, w) = model.to_decode_graph().unwrap();
+        let (mut og, mut ow) = (g.clone(), w.clone());
+        crate::graph::passes::run_optimization_passes(&mut og, Some(&mut ow)).unwrap();
+        let linears: Vec<&str> = og
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, crate::graph::Op::Linear))
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            linears.contains(&"layers.0.attn.q.fused_qkv"),
+            "{linears:?}"
+        );
+        assert!(ow.get("layers.0.attn.q.weight").is_none());
+        let mut emb = vec![0.0f32; model.hidden];
+        model.embed_row(5, &mut emb);
+        let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![0])];
+        let want = run_stateless(&g, &w, inputs.clone()).unwrap();
+        let got = run_stateless(&og, &ow, inputs).unwrap();
+        assert_eq!(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+    }
     #[test]
     fn test_gemma4_to_decode_graph_with_ple_cpu_parity() {
         use crate::graph::cpu::run_stateless;
