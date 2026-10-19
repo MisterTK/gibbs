@@ -16,21 +16,23 @@ use egglog::{EGraph, Write as _};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+// Flat i64 facts keyed by node and value ids: egglog's generic join orders the variables of nested
+// term patterns badly here (a ~780-node graph took 170 ms, quadratic in the pattern variables), so
+// each fact carries the columns its rules join on.
 const PROGRAM: &str = r#"
-(datatype* (E (V i64) (Node i64 L)) (L (Nil) (Cons E L)))
-(relation P (i64 String))
-(function Uses (E) i64 :no-merge)
-(function Pos (E) i64 :no-merge)
-(function Numel (E) i64 :no-merge)
-(function Vi (E) i64 :no-merge)
-(relation NotOut (E))
-(relation NotNorm (E))
-(relation F32 (E))
-(relation LinMN (i64 i64))
+(relation Out (i64 i64))
+(relation Single (i64))
+(relation Val (i64 i64 i64))
+(relation F32 (i64))
+(relation NotNorm (i64))
+(relation Rd1 (i64 String i64))
+(relation Rd2 (i64 String i64 i64))
+(relation Lin (i64 i64 i64))
 (relation PackedEpi (i64))
-(relation NormP (i64 i64 i64))
+(relation Norm (i64 i64 i64 i64))
+(relation Rope (i64 i64 i64 i64 i64))
 (relation RopeP (i64 i64 i64 i64 i64))
-(relation AttnP (i64 i64 i64 i64))
+(relation Attn (i64 i64 i64 i64 i64 i64 i64))
 (relation Epi (i64 i64 i64 i64))
 (relation NormRes (i64 i64 i64))
 (relation NormScale (i64 i64 i64))
@@ -38,79 +40,47 @@ const PROGRAM: &str = r#"
 (relation AttnRope (i64 i64 i64))
 (ruleset plan)
 
-; Linear `li` (output `l`, one reader `j`) → GEMV epilogue (Epi li j kind side-value|-1).
-(rule ((P li "LinEpi") (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons l r))) (P j "GeluErf"))
-      ((Epi li j 1 -1)) :ruleset plan)
-(rule ((P li "LinEpi") (PackedEpi li) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons l r))) (P j "Silu"))
-      ((Epi li j 2 -1)) :ruleset plan)
-(rule ((P li "LinEpi") (PackedEpi li) (LinMN li mn) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons l (Cons o (Nil))))) (P j "SwiGlu")
-       (= po (Pos o)) (< po li) (= (Numel o) mn) (= vo (Vi o)))
-      ((Epi li j 3 vo)) :ruleset plan)
-(rule ((P li "LinEpi") (PackedEpi li) (LinMN li mn) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons o (Cons l (Nil))))) (P j "SwiGlu")
-       (= po (Pos o)) (< po li) (= (Numel o) mn) (= vo (Vi o)))
-      ((Epi li j 4 vo)) :ruleset plan)
-(rule ((P li "LinEpi") (PackedEpi li) (LinMN li mn) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons l (Cons o (Nil))))) (P j "GeGlu")
-       (= po (Pos o)) (< po li) (= (Numel o) mn) (= vo (Vi o)))
-      ((Epi li j 5 vo)) :ruleset plan)
-(rule ((P li "LinEpi") (PackedEpi li) (LinMN li mn) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons o (Cons l (Nil))))) (P j "GeGlu")
-       (= po (Pos o)) (< po li) (= (Numel o) mn) (= vo (Vi o)))
-      ((Epi li j 6 vo)) :ruleset plan)
-(rule ((P li "LinEpi") (LinMN li mn) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons l (Cons o (Nil))))) (P j "Add")
-       (= po (Pos o)) (< po li) (= (Numel o) mn) (= vo (Vi o)))
-      ((Epi li j 7 vo)) :ruleset plan)
-(rule ((P li "LinEpi") (LinMN li mn) (= l (Node li la)) (= (Uses l) 1) (NotOut l)
-       (= c (Node j (Cons o (Cons l (Nil))))) (P j "Add")
-       (= po (Pos o)) (< po li) (= (Numel o) mn) (= vo (Vi o)))
-      ((Epi li j 7 vo)) :ruleset plan)
+; Linear `li` (output `l` of m*n elements, one reader `j`) → GEMV epilogue (Epi li j kind side|-1).
+(rule ((Lin li l mn) (Single l) (Rd1 j "GeluErf" l)) ((Epi li j 1 -1)) :ruleset plan)
+(rule ((Lin li l mn) (PackedEpi li) (Single l) (Rd1 j "Silu" l)) ((Epi li j 2 -1)) :ruleset plan)
+(rule ((Lin li l mn) (PackedEpi li) (Single l) (Rd2 j "SwiGlu" l o) (Val o po mn) (< po li))
+      ((Epi li j 3 o)) :ruleset plan)
+(rule ((Lin li l mn) (PackedEpi li) (Single l) (Rd2 j "SwiGlu" o l) (Val o po mn) (< po li))
+      ((Epi li j 4 o)) :ruleset plan)
+(rule ((Lin li l mn) (PackedEpi li) (Single l) (Rd2 j "GeGlu" l o) (Val o po mn) (< po li))
+      ((Epi li j 5 o)) :ruleset plan)
+(rule ((Lin li l mn) (PackedEpi li) (Single l) (Rd2 j "GeGlu" o l) (Val o po mn) (< po li))
+      ((Epi li j 6 o)) :ruleset plan)
+(rule ((Lin li l mn) (Single l) (Rd2 j "Add" l o) (Val o po mn) (< po li))
+      ((Epi li j 7 o)) :ruleset plan)
+(rule ((Lin li l mn) (Single l) (Rd2 j "Add" o l) (Val o po mn) (< po li))
+      ((Epi li j 7 o)) :ruleset plan)
 
-; RmsNorm `ni` (gamma width d, x of xl elements): `+ r`, then `* s` (scalar f32), or a RoPE.
-(rule ((NormP ni d xl) (= n (Node ni na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node j (Cons n (Cons o (Nil))))) (P j "Add")
-       (= po (Pos o)) (< po ni) (= (Numel o) xl) (= vo (Vi o)))
-      ((NormRes ni j vo)) :ruleset plan)
-(rule ((NormP ni d xl) (= n (Node ni na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node j (Cons o (Cons n (Nil))))) (P j "Add")
-       (= po (Pos o)) (< po ni) (= (Numel o) xl) (= vo (Vi o)))
-      ((NormRes ni j vo)) :ruleset plan)
-(rule ((NormP ni d xl) (= n (Node ni na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node k (Cons n (Cons o (Nil))))) (P k "Mul")
-       (= po (Pos o)) (< po ni) (= (Numel o) 1) (F32 o) (= vo (Vi o)))
-      ((NormScale ni k vo)) :ruleset plan)
-(rule ((NormP ni d xl) (= n (Node ni na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node k (Cons o (Cons n (Nil))))) (P k "Mul")
-       (= po (Pos o)) (< po ni) (= (Numel o) 1) (F32 o) (= vo (Vi o)))
-      ((NormScale ni k vo)) :ruleset plan)
-(rule ((NormRes ni j vr) (= n (Node j na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node k (Cons n (Cons o (Nil))))) (P k "Mul")
-       (= po (Pos o)) (< po ni) (= (Numel o) 1) (F32 o) (= vo (Vi o)))
-      ((NormScale ni k vo)) :ruleset plan)
-(rule ((NormRes ni j vr) (= n (Node j na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node k (Cons o (Cons n (Nil))))) (P k "Mul")
-       (= po (Pos o)) (< po ni) (= (Numel o) 1) (F32 o) (= vo (Vi o)))
-      ((NormScale ni k vo)) :ruleset plan)
-(rule ((NormP ni d xl) (= n (Node ni na)) (= (Uses n) 1) (NotOut n)
-       (= c (Node j (Cons n (Cons pos (Cons inv r))))) (RopeP j d rot var ms) (<= rot d)
-       (= pp (Pos pos)) (< pp ni) (= pv (Pos inv)) (< pv ni)
-       (= ns (Numel pos)) (> ns 0) (= 0 (% (/ xl d) ns)))
+; RmsNorm `ni` (output `n`, gamma width d, x of xl elements): `+ r`, then `* s` (scalar f32), or a
+; RoPE.
+(rule ((Norm ni n d xl) (Single n) (Rd2 j "Add" n o) (Val o po xl) (< po ni))
+      ((NormRes ni j o)) :ruleset plan)
+(rule ((Norm ni n d xl) (Single n) (Rd2 j "Add" o n) (Val o po xl) (< po ni))
+      ((NormRes ni j o)) :ruleset plan)
+(rule ((Norm ni n d xl) (Single n) (Rd2 k "Mul" n o) (Val o po 1) (F32 o) (< po ni))
+      ((NormScale ni k o)) :ruleset plan)
+(rule ((Norm ni n d xl) (Single n) (Rd2 k "Mul" o n) (Val o po 1) (F32 o) (< po ni))
+      ((NormScale ni k o)) :ruleset plan)
+(rule ((NormRes ni j vr) (Out j n) (Single n) (Rd2 k "Mul" n o) (Val o po 1) (F32 o) (< po ni))
+      ((NormScale ni k o)) :ruleset plan)
+(rule ((NormRes ni j vr) (Out j n) (Single n) (Rd2 k "Mul" o n) (Val o po 1) (F32 o) (< po ni))
+      ((NormScale ni k o)) :ruleset plan)
+(rule ((Norm ni n d xl) (Single n) (Rope j r n pos inv) (RopeP j d rot var ms) (<= rot d)
+       (Val pos pp ns) (< pp ni) (Val inv pv ni_) (< pv ni) (> ns 0) (= 0 (% (/ xl d) ns)))
       ((NormRope ni j)) :ruleset plan)
 
 ; Cached attention `ai` writing its KV state: q and k each the single-reader RoPE of a non-norm.
-(rule ((AttnP ai h kvh hd)
-       (= a (Node ai (Cons q (Cons k (Cons v (Cons ks (Cons vs (Cons pos (Nil)))))))))
-       (= (Uses q) 1) (= (Uses k) 1) (NotOut q) (NotOut k)
-       (= q (Node qi (Cons qr (Cons pos (Cons inv qx)))))
-       (= k (Node ki (Cons kr (Cons pos (Cons inv kx)))))
+(rule ((Attn ai h kvh hd q k pos) (Single q) (Single k)
+       (Rope qi q qx pos inv) (Rope ki k kx pos inv)
        (RopeP qi hd rot var ms) (RopeP ki hd rot var ms) (> rot 0) (<= rot hd)
-       (NotNorm qr) (NotNorm kr)
-       (= nq (Numel qr)) (= nq (* h hd)) (= nk (Numel kr)) (= nk (* kvh hd))
-       (= (Numel pos) 1) (= ni (Numel inv)) (>= ni (/ rot 2)))
+       (NotNorm qx) (NotNorm kx)
+       (Val qx pq nq) (= nq (* h hd)) (Val kx pk nk) (= nk (* kvh hd))
+       (Val pos pp 1) (Val inv pi ni) (>= ni (/ rot 2)))
       ((AttnRope ai qi ki)) :ruleset plan)
 
 (run-schedule (saturate (run plan)))
@@ -153,6 +123,21 @@ pub(super) fn err(e: egglog::Error) -> String {
     format!("planner e-graph: {e}")
 }
 
+/// A fresh e-graph with `program` (relations and rules) loaded: a clone of this thread's parsed
+/// copy, since parsing (~1 ms) costs more than most plans' encoding and saturation together.
+pub(super) fn loaded(program: &str) -> Result<EGraph, String> {
+    thread_local!(static PARSED: std::cell::RefCell<HashMap<String, EGraph>> = Default::default());
+    PARSED.with_borrow_mut(|parsed| {
+        if let Some(eg) = parsed.get(program) {
+            return Ok(eg.clone());
+        }
+        let mut eg = EGraph::default();
+        eg.parse_and_run_program(None, program).map_err(err)?;
+        parsed.insert(program.to_string(), eg.clone());
+        Ok(eg)
+    })
+}
+
 /// The rows of the all-`i64` relation `name`.
 pub(super) fn relation(eg: &EGraph, name: &str) -> Result<Vec<Vec<i64>>, String> {
     let mut out = Vec::new();
@@ -182,53 +167,41 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
         matches!(g.value(v).kind,
             ValueKind::Node(n) if matches!(g.nodes[n.0 as usize].op, Op::RmsNorm { .. }))
     };
-    let mut eg = EGraph::default();
     let (schema, run) = PROGRAM.split_at(PROGRAM.find("(run-schedule").expect("schedule"));
-    eg.parse_and_run_program(None, schema).map_err(err)?;
+    let mut eg = loaded(schema)?;
     eg.update(|mut fs| -> Result<(), egglog::Error> {
-        let mut seen = vec![false; g.values.len()];
-        let mut class =
-            |fs: &mut egglog::FullState<'_, '_>, v: ValueId| -> Result<_, egglog::Error> {
-                let c = fs.add("V", v.0 as i64)?;
-                if !std::mem::replace(&mut seen[v.0 as usize], true) {
-                    let pos = match g.value(v).kind {
-                        ValueKind::Node(n) => n.0 as i64,
-                        _ => -1,
-                    };
-                    fs.set("Pos", c, pos)?;
-                    fs.set("Vi", c, v.0 as i64)?;
-                    if let Ok(n) = numel(g, v) {
-                        fs.set("Numel", c, n as i64)?;
-                    }
-                    if g.value(v).dtype == DType::F32 {
-                        fs.add("F32", c)?;
-                    }
-                    if !produced_by_norm(v) {
-                        fs.add("NotNorm", c)?;
-                    }
-                    if matches!(g.value(v).kind, ValueKind::Node(_)) && !g.outputs.contains(&v) {
-                        fs.add("NotOut", c)?;
-                    }
-                }
-                Ok(c)
+        // Facts for the values nodes read or produce (passes leave dead values behind).
+        let mut live = vec![false; g.values.len()];
+        for n in &g.nodes {
+            for v in n.inputs.iter().chain(n.outputs.first()) {
+                live[v.0 as usize] = true;
+            }
+        }
+        for vi in (0..g.values.len()).filter(|&vi| live[vi]) {
+            let (id, v) = (vi as i64, ValueId(vi as u32));
+            let pos = match g.value(v).kind {
+                ValueKind::Node(n) => n.0 as i64,
+                _ => -1,
             };
+            fs.add("Val", (id, pos, numel(g, v).map_or(-1, |n| n as i64)))?;
+            if g.value(v).dtype == DType::F32 {
+                fs.add("F32", id)?;
+            }
+            if !produced_by_norm(v) {
+                fs.add("NotNorm", id)?;
+            }
+        }
         for (i, n) in g.nodes.iter().enumerate() {
             let id = i as i64;
-            let mut args = Vec::with_capacity(n.inputs.len());
-            for &v in &n.inputs {
-                args.push(class(&mut fs, v)?);
-            }
-            let mut list = fs.add("Nil", egglog::api::RawValues(Vec::new()))?;
-            for &c in args.iter().rev() {
-                list = fs.add("Cons", (c, list))?;
-            }
             let Some(&out) = n.outputs.first() else {
                 continue;
             };
-            let o = class(&mut fs, out)?;
-            let node = fs.add("Node", (id, list))?;
-            fs.union(o, node)?;
-            fs.set("Uses", o, uses[out.0 as usize])?;
+            let o = out.0 as i64;
+            fs.add("Out", (id, o))?;
+            if uses[out.0 as usize] == 1 && !g.outputs.contains(&out) {
+                fs.add("Single", o)?;
+            }
+            let arg = |k: usize| n.inputs.get(k).map(|v| v.0 as i64);
             let tag = match &n.op {
                 Op::Gelu { tanh: false } => Some("GeluErf"),
                 Op::Silu => Some("Silu"),
@@ -238,8 +211,11 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                 Op::Mul => Some("Mul"),
                 _ => None,
             };
-            if let Some(t) = tag {
-                fs.add("P", (id, t))?;
+            if let (Some(t), Some(a)) = (tag, arg(0)) {
+                fs.add("Rd1", (id, t, a))?;
+                if let (Some(b), 2) = (arg(1), n.inputs.len()) {
+                    fs.add("Rd2", (id, t, a, b))?;
+                }
             }
             match &n.op {
                 Op::Linear if epilogues => {
@@ -254,8 +230,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                         continue;
                     }
                     let m = xl / k;
-                    fs.add("P", (id, "LinEpi"))?;
-                    fs.add("LinMN", (id, (m * rows) as i64))?;
+                    fs.add("Lin", (id, o, (m * rows) as i64))?;
                     // The batched GEMM kernels (m >= 16) only carry Gelu/Residual epilogues.
                     if format.is_some_and(|f| !(m >= 16 && f.batched_gemm())) {
                         fs.add("PackedEpi", id)?;
@@ -265,7 +240,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                     let d = g.value(n.inputs[1]).shape.last().copied().unwrap_or(0);
                     if let Ok(xl) = numel(g, n.inputs[0]) {
                         if d > 0 && xl % d == 0 {
-                            fs.add("NormP", (id, d as i64, xl as i64))?;
+                            fs.add("Norm", (id, o, d as i64, xl as i64))?;
                         }
                     }
                 }
@@ -282,6 +257,9 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                     };
                     let p = (id, *head_dim as i64, *rotary_dim as i64, var as i64);
                     fs.add("RopeP", (p.0, p.1, p.2, p.3, mscale.to_bits() as i64))?;
+                    if let (Some(x), Some(pos), Some(inv)) = (arg(0), arg(1), arg(2)) {
+                        fs.add("Rope", (id, o, x, pos, inv))?;
+                    }
                 }
                 Op::CachedAttention {
                     heads,
@@ -290,9 +268,14 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                     v_head_dim,
                     write: true,
                     ..
-                } if reduce_input && head_dim == v_head_dim && *head_dim <= ATTN_MAX_HEAD_DIM => {
+                } if reduce_input
+                    && head_dim == v_head_dim
+                    && *head_dim <= ATTN_MAX_HEAD_DIM
+                    && n.inputs.len() == 6 =>
+                {
                     let p = (*heads as i64, *kv_heads as i64, *head_dim as i64);
-                    fs.add("AttnP", (id, p.0, p.1, p.2))?;
+                    let (q, k, pos) = (n.inputs[0].0 as i64, n.inputs[1].0 as i64, n.inputs[5].0);
+                    fs.add("Attn", (id, p.0, p.1, p.2, q, k, pos as i64))?;
                 }
                 _ => {}
             }
@@ -382,9 +365,9 @@ pub(super) static COMMUTE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
     std::env::var("GIBBS_BATCH_COMMUTE").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
 });
 
-/// The run-growing rules of [`BATCH_PROGRAM`] for runs of 1..=3 members.
-fn batch_rules() -> String {
-    let mut p = String::new();
+/// [`BATCH_PROGRAM`] with its run-growing rules for runs of 1..=3 members.
+static BATCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut p = BATCH_PROGRAM.to_string();
     for l in 1..=3 {
         let ms: Vec<String> = (2..=l).map(|i| format!("m{i}")).collect();
         let members: Vec<&str> = std::iter::once("s")
@@ -424,9 +407,8 @@ fn batch_rules() -> String {
             }
         }
     }
-    p.push_str("(run-schedule (saturate (run batch)))\n");
     p
-}
+});
 
 fn intern<K: std::hash::Hash + Eq>(m: &mut HashMap<K, i64>, k: K) -> i64 {
     let n = m.len() as i64 + 1;
@@ -442,8 +424,7 @@ pub(super) fn batches(
     commute: bool,
 ) -> Result<Batches, String> {
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
-    let mut eg = EGraph::default();
-    eg.parse_and_run_program(None, BATCH_PROGRAM).map_err(err)?;
+    let mut eg = loaded(&BATCH)?;
     let mut ropes = HashMap::new();
     let mut geoms = HashMap::new();
     eg.update(|mut fs| -> Result<(), egglog::Error> {
@@ -538,7 +519,7 @@ pub(super) fn batches(
         Ok(())
     })
     .map_err(err)?;
-    eg.parse_and_run_program(None, &batch_rules())
+    eg.parse_and_run_program(None, "(run-schedule (saturate (run batch)))")
         .map_err(err)?;
 
     let mut b = Batches::default();
@@ -698,15 +679,26 @@ pub(super) fn moe(
     aliases: &HashMap<ValueId, (ValueId, usize)>,
 ) -> Result<HashMap<usize, MoeFusion>, String> {
     use super::ext::{elementwise, movement, norm, ExtStep};
+    // Every rule is anchored on a TopK, a GLU or a Reduce step: skip the e-graph without one.
+    if !steps.iter().any(|s| {
+        matches!(
+            s.op,
+            Step::Ext(ExtStep::Experts(super::ext::moe::Step::TopK { .. }))
+                | Step::Ext(ExtStep::Norm(norm::Step::Reduce { .. }))
+                | Step::GeGlu { .. }
+                | Step::SwiGlu { .. }
+        )
+    }) {
+        return Ok(HashMap::new());
+    }
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let mut use_count: HashMap<ValueId, usize> = HashMap::new();
     for v in steps.iter().flat_map(|s| &s.reads).chain(&g.outputs) {
         *use_count.entry(root(*v)).or_default() += 1;
     }
     let vi = |v: ValueId| v.0 as i64;
-    let mut eg = EGraph::default();
     let (schema, run) = MOE_PROGRAM.split_at(MOE_PROGRAM.find("(run-schedule").expect("schedule"));
-    eg.parse_and_run_program(None, schema).map_err(err)?;
+    let mut eg = loaded(schema)?;
     eg.update(|mut fs| -> Result<(), egglog::Error> {
         for (v, _) in use_count.iter().filter(|(_, &n)| n == 1) {
             fs.add("Single", vi(*v))?;

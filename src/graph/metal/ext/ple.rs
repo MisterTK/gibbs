@@ -84,15 +84,14 @@ pub(in super::super) fn fuse(
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
 ) -> Result<(), String> {
-    use super::super::fuse::{err, relation};
+    use super::super::fuse::{err, loaded, relation};
     use egglog::Write as _;
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let mut uses: HashMap<ValueId, usize> = HashMap::new();
     for v in steps.iter().flat_map(|s| s.reads.iter()).chain(&g.outputs) {
         *uses.entry(root(*v)).or_default() += 1;
     }
-    let mut eg = egglog::EGraph::default();
-    eg.parse_and_run_program(None, PROGRAM).map_err(err)?;
+    let mut eg = loaded(PROGRAM)?;
     eg.update(|mut fs| -> Result<(), egglog::Error> {
         for (p, s) in steps.iter().enumerate() {
             let solo = s.extra_outs.is_empty();

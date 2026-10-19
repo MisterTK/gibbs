@@ -261,14 +261,20 @@ fn chains(
     step_of: &HashMap<ValueId, usize>,
     state_dtype: StateDtype,
 ) -> Result<Vec<(usize, Vec<usize>, DeltaNetStep)>, String> {
-    use super::super::fuse::{err, relation};
+    use super::super::fuse::{err, loaded, relation};
     use egglog::{Core as _, Write as _};
+    // Every rule is anchored on a DeltaRule step: skip the e-graph without one.
+    if !steps
+        .iter()
+        .any(|s| matches!(s.op, super::super::Step::DeltaRule { .. }))
+    {
+        return Ok(Vec::new());
+    }
     let is_state = |v: ValueId| matches!(g.value(v).kind, ValueKind::State(_));
     let len = |v: ValueId| numel(g, v).ok();
     let vi = |v: ValueId| v.0 as i64;
-    let mut eg = egglog::EGraph::default();
     let (schema, run) = PROGRAM.split_at(PROGRAM.find("(run-schedule").expect("schedule"));
-    eg.parse_and_run_program(None, schema).map_err(err)?;
+    let mut eg = loaded(schema)?;
     eg.update(|mut fs| -> Result<(), egglog::Error> {
         for (vid, v) in g.values.iter().enumerate() {
             let id = ValueId(vid as u32);
