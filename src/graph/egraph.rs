@@ -365,7 +365,7 @@ fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<(String, 
                     } if *in_features == cols => "zc".into(),
                     _ => return None,
                 },
-                Tensor::Mat(m) if m.cols == cols => format!(
+                Tensor::Mat(m) if m.cols == cols && !crate::graph::disabled("qkv_mat") => format!(
                     "mat:{:?}",
                     m.packed()
                         .map_or(crate::hardware::QuantFormat::BF16, |p| p.format)

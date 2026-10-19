@@ -715,8 +715,9 @@ fn gguf_checkpoint(
             }
         }
 
-        let needs_transform =
-            matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) && qwen35_transforms(&hf, kh, vh);
+        let legacy = crate::graph::disabled("qwen_packed");
+        let needs_transform = matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp)
+            && qwen35_needs_transform(&hf, kh, vh, is_permuted_linear, legacy);
         // Matrices stay packed in BF16/FP16 and in any block format the GPU codec registry decodes (a
         // dequantized copy streams 2-3x the bytes per token). Expert banks keep the wider block-codec
         // predicate: dequantized they would not fit in memory.
@@ -738,6 +739,7 @@ fn gguf_checkpoint(
         // `vd`-column head is block aligned.
         // ponytail: unaligned formats still dequantize; permute the input activation instead if one ships.
         if needs_transform
+            && !legacy
             && kh != vh
             && hf.ends_with(".linear_attn.out_proj.weight")
             && shape.len() == 2
@@ -831,6 +833,18 @@ pub fn gguf_target(path: &Path) -> Result<(Value, Weights), String> {
         |hf| m.extract_tensor_f32(&data, names[hf]),
     )?;
     Ok((cfg, ck))
+}
+
+/// [`qwen35_transforms`], or with `legacy` (`GIBBS_DISABLE=qwen_packed`) the predicate before it:
+/// every `.linear_attn.` tensor that is not a permuted linear, plus `out_proj`, dequantizes.
+fn qwen35_needs_transform(hf: &str, kh: usize, vh: usize, permuted: bool, legacy: bool) -> bool {
+    if !legacy {
+        return qwen35_transforms(hf, kh, vh);
+    }
+    hf.ends_with("norm.weight")
+        || hf.contains(".ple.norm_")
+        || hf.ends_with(".linear_attn.out_proj.weight")
+        || (hf.contains(".linear_attn.") && !permuted)
 }
 
 /// Whether [`qwen35_from_gguf`] changes tensor `hf` (key / value head counts `kh` / `vh`).
@@ -2897,6 +2911,20 @@ mod tests {
             .map(f32::from)
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// `GIBBS_DISABLE=qwen_packed`: identity `.linear_attn.` tensors and `out_proj` dequantize again.
+    #[test]
+    fn qwen_packed_disabled_restores_dequantize_predicate() {
+        let p = "model.layers.0.linear_attn";
+        let needs = |n: &str, permuted: bool| {
+            let legacy = crate::graph::disabled("qwen_packed");
+            qwen35_needs_transform(&format!("{p}.{n}"), 16, 16, permuted, legacy)
+        };
+        assert!(!needs("in_proj_z.weight", false) && !needs("out_proj.weight", false));
+        crate::graph::TEST_DISABLE.with(|d| d.set("views,qwen_packed"));
+        assert!(needs("in_proj_z.weight", false) && needs("out_proj.weight", false));
+        assert!(needs("dt_bias", false) && !needs("in_proj_qkv.weight", true));
     }
 
     /// HY-MT1.5-1.8B from its llama.cpp `hunyuan-dense` GGUF: the GGUF vocabulary (pre-tokenizer

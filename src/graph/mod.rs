@@ -27,6 +27,26 @@ pub mod tune;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
 
+/// Whether `item` is in `GIBBS_DISABLE` (comma list, read once): per-item kill switch next to
+/// `metal::fusion_policy` (here because the e-graph and loaders build without Metal). Items:
+/// `qkv_mat`, `views`, `deltanet`, and loader items (README). Tests set [`TEST_DISABLE`] per thread.
+pub(crate) fn disabled(item: &str) -> bool {
+    #[cfg(test)]
+    let list = TEST_DISABLE.with(|d| d.get());
+    #[cfg(not(test))]
+    let list = {
+        static D: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| std::env::var("GIBBS_DISABLE").unwrap_or_default());
+        D.as_str()
+    };
+    list.split(',').any(|s| s.trim() == item)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_DISABLE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
 

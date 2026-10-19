@@ -132,7 +132,7 @@ fn is_add(op: &Op) -> bool {
 
 /// Replaces every matched decode (`n == 1`) chain by one fused step at the chain's last step.
 pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), String> {
-    if fusion_policy() != FusionPolicy::Full {
+    if fusion_policy() != FusionPolicy::Full || crate::graph::disabled("deltanet") {
         return check_state_dtype(steps, *STATE_DTYPE);
     }
     let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
@@ -775,6 +775,16 @@ mod tests {
             !names.iter().any(|n| n.ends_with(" DeltaNetStep")),
             "{names:?}"
         );
+    }
+
+    /// `GIBBS_DISABLE=deltanet`: the decode chain plans unfused, other fusions untouched.
+    #[test]
+    fn deltanet_disabled_plans_unfused() {
+        crate::graph::TEST_DISABLE.with(|d| d.set("deltanet"));
+        let (g, _, _) = layer(CASES[0].0, CASES[0].1, CASES[0].2);
+        let names = listing(&g);
+        assert!(names.iter().any(|n| n.ends_with(" DeltaRule")), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with(" DeltaNetStep")), "{names:?}");
     }
 
     #[test]
