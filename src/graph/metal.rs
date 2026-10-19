@@ -652,8 +652,8 @@ pub struct Runtime {
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
-    /// Plan-search picks ([`crate::graph::search`]), persisted in the same file.
-    plan_cache: Mutex<tune::TuneCache<crate::graph::search::Pick>>,
+    /// Plan-search verdicts ([`crate::graph::search`]), persisted in the same file.
+    plan_cache: Mutex<tune::TuneCache<crate::graph::search::Verdict>>,
 }
 
 impl Runtime {

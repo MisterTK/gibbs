@@ -596,10 +596,11 @@ mod tests {
         (g, w)
     }
 
-    /// GPU (compile-only while the device is reserved): the searched plan of a two-layer graph
-    /// computes what the cost-model plan computes.
+    /// GPU: the searched plan of a two-layer graph, and every single-pattern flip plus the
+    /// all-flipped plan the search may time, compute what the cost-model plan computes.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "GPU: plan search timing; cargo test --lib plan_search_keeps -- --ignored --test-threads=1"]
     fn plan_search_keeps_the_cost_model_outputs() {
         use crate::graph::egraph::{Budget, CostModel, Fusion, DEFAULT_RULES};
         use crate::graph::metal::{Runtime, Session};
@@ -632,11 +633,30 @@ mod tests {
                 _ => panic!("f32 output expected"),
             }
         };
-        let (a, b) = (run(&sg, &sw), run(&cg, &cw));
-        assert_eq!(a.len(), b.len());
-        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-            assert!((x - y).abs() <= 1e-4 + 1e-3 * y.abs(), "[{i}] {x} vs {y}");
+        let want = run(&cg, &cw);
+        let close = |a: &[f32], what: &str| {
+            assert_eq!(a.len(), want.len(), "{what}");
+            for (i, (x, y)) in a.iter().zip(&want).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-4 + 1e-3 * y.abs(),
+                    "{what} [{i}] {x} vs {y}"
+                );
+            }
+        };
+        close(&run(&sg, &sw), "searched");
+        let mut sets: Vec<Vec<(u64, bool)>> = pats.iter().map(|p| vec![(p.key, !p.on)]).collect();
+        sets.push(pats.iter().map(|p| (p.key, !p.on)).collect());
+        let mut changed = false;
+        for set in sets {
+            let flips = crate::graph::search::flips(fusion.choices(), &set);
+            // Flip sets the e-graph cannot resolve are dropped by the search too.
+            let Ok((g, w, _)) = fused(&base, &fusion, &flips, mode, &available) else {
+                continue;
+            };
+            changed |= g.nodes.len() != cg.nodes.len();
+            close(&run(&g, &w), &format!("{set:?}"));
         }
+        assert!(changed, "no candidate changed the plan");
     }
 
     #[test]

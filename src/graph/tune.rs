@@ -158,8 +158,8 @@ pub const QUIET_MARGIN: f64 = 0.02;
 /// The variant to use from `rounds` of timings (`GB/s`, each round measuring the variants in another
 /// order). A single quiet round takes [`choose`] over that round; two or more quiet rounds return
 /// the consensus [`choose`] winner when all rounds agree, else the variant with the best worst-round
-/// ratio at least `1 + QUIET_MARGIN` faster than `default` in every round. A `busy` GPU keeps `default`
-/// (the proven variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round;
+/// ratio above `1 + QUIET_MARGIN` against `default` in every round. A `busy` GPU keeps `default`
+/// (the proven variant) unless another variant is more than [`BUSY_MARGIN`] faster than it in EVERY round;
 /// among those the one with the best worst-round ratio wins. `None`: no usable timing.
 pub fn decide(
     rounds: &[Vec<(GemvVariant, f64)>],
@@ -181,7 +181,7 @@ pub fn decide(
 }
 
 /// Of the entries of `rounds` (rates, higher is better; each round measured in another order),
-/// the one with the best worst-round ratio to `default`, provided that ratio is at least
+/// the one with the best worst-round ratio to `default`, provided that ratio exceeds
 /// `1 + margin` in EVERY round; else `default` (ties and noise keep the incumbent).
 pub fn beats<T: Copy + PartialEq>(rounds: &[Vec<(T, f64)>], default: T, margin: f64) -> T {
     let rate = |round: &[(T, f64)], v: T| {
@@ -204,7 +204,7 @@ pub fn beats<T: Copy + PartialEq>(rounds: &[Vec<(T, f64)>], default: T, margin: 
         .map(|t| t.0)
         .filter(|&v| v != default)
         .filter_map(|v| Some((v, worst_ratio(v)?)))
-        .filter(|c| c.1 >= 1.0 + margin)
+        .filter(|c| c.1 > 1.0 + margin)
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map_or(default, |c| c.0)
 }
@@ -453,6 +453,17 @@ mod tests {
             Some(250.0)
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn beats_needs_more_than_the_margin_in_every_round() {
+        // Ratios exactly 1 + margin (1.5 is exact in binary) tie: the default stays.
+        let r = |a: f64, b: f64| vec![(0usize, 1.0), (1, a), (2, b)];
+        assert_eq!(beats(&[r(1.5, 1.0), r(1.5, 1.0)], 0, 0.5), 0);
+        assert_eq!(beats(&[r(1.6, 1.0), r(1.5, 1.0)], 0, 0.5), 0);
+        assert_eq!(beats(&[r(1.6, 1.0), r(1.7, 1.0)], 0, 0.5), 1);
+        assert_eq!(beats(&[r(1.6, 1.8), r(1.7, 1.9)], 0, 0.5), 2);
+        assert_eq!(beats(&[r(f64::NAN, 1.0), r(1.7, 1.0)], 0, 0.5), 0);
     }
 
     #[test]
