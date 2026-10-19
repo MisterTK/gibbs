@@ -32,7 +32,7 @@ Tuner-chosen GEMV variants print `variant=unassigned`.
 | M0 E2B QAT Q2_K_XL | 84 | 396 | 506 | 506 | +35 split attention (35 × 2), +75 MegakernelMlp (15 × 6) |
 | M1 E2B Q4_K_M | 84 | 384 | 509 | 509 | +35 split attention, +90 MegakernelMlp (18 × 6) |
 | M2 Qwen3.5-2B Q4_K_XL | 89 | 374 | 412 | 412 | +6 split attention, +32 MegakernelMlp (8 × 5, no post-norm) |
-| M7 26B-A4B IQ2_XXS | 88 | 628 | 658 | 658 | +30 split attention |
+| M7 26B-A4B IQ2_XXS | 88 | 628 | 658 | 658 | +30 split attention (run because `memory_pressure` showed 69 % free right before loading) |
 | M8 (= M0, ctx4k) | 5809 | 396 | 506 | 506 | same plan as M0; attention splits at every ctx ≥ 48 keys (≥ 32 at head_dim 256) |
 
 Splitting starts at 48 keys (32 at head_dim ≥ 256). Every attention step therefore costs 2 dispatches from ctx 48 on: this is why M8 has the same count as M0. `MegakernelMlp` is one step but 5–6 dispatches: norm, gate, up, activation, down, and an optional post-norm.
@@ -71,7 +71,7 @@ None of the four models fuses Q/K/V. Separate q/k/v `GemvPacked` steps per token
 | M7 | 30 | 30 | 25 | 85 | **same dtype within every layer**: Q5_K × 3 (25 layers), Q5_K q/k with no v (4), Q6_K q/k with no v (1) |
 
 - **M7 per-layer dtypes:** read from the dump and confirmed from the GGUF header (CPU tensor-info parse). q/k/v share a dtype in every layer. This contradicts the plan's "M7 (mixed formats)". The 5 layers without a v GEMV use k as v.
-- **Fusion gap:** `fuse_qkv_pass` (`src/graph/passes/fusion.rs:203`) did not fuse the same-dtype triples of M0 and M7. Why was not traced here.
+- **Fusion gap:** `fuse_qkv_pass` (`src/graph/passes/fusion.rs:203`) cannot fuse any of these triples, whatever their dtypes. The Gemma 4 builder inserts q/k/v as `Mat::to_graph_tensor()` (`src/model/gemma4/text.rs:732, 792, 838`), which returns `Tensor::Mat` (`src/model/weights.rs:46-47`). The pass returns `None` whenever q, k or v is a `Tensor::Mat` (`fusion.rs:280-285`). That covers M0, M1, M7 and M8, which share the builder. The Qwen builder (M2) was not checked.
 - **Plan correction:** the plan's "M1 is already fused" is not what the dump shows.
 - **Go condition (≥ 30 separable q/k/v dispatches on some model):** met on M0, M1 and M7.
 

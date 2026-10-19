@@ -62,8 +62,9 @@ p01() {
     row=${spec#*:}
     suite=$(one_model_suite "$row" "$tag")
     rc=0
+    echo "commit $(git rev-parse HEAD)" > "$OUT/p01-$tag.log"
     sched "p01-$tag" env GIBBS_PROFILE_KERNELS=1 GIBBS_PROFILE_ROWS=40 \
-      target/release/gibbs --bench "$suite" > "$OUT/p01-$tag.log" 2>&1 || rc=$?
+      target/release/gibbs --bench "$suite" >> "$OUT/p01-$tag.log" 2>&1 || rc=$?
     echo "p01 $tag: exit $rc -> $OUT/p01-$tag.log"
   done
 }
@@ -95,6 +96,8 @@ p03() {
 p04() {
   # loop_verify.sh runs HEAD's build (cand) against target/loop-base/gibbs (base), each model
   # base, cand, cand, base. Both commits get a detached worktree here; the base binary is copied in.
+  # loop_verify.sh, loop_score.py and bench/loop.json are identical at 5de3057 and 9045f1c.
+  # Its PAUSE file lands in the cand worktree, so this checkout's matrix runner is paused here too.
   local base=$OUT/p04-base cand=$OUT/p04-cand rc=0
   [ -d "$base" ] || git worktree add --detach "$base" 4ff5e60
   [ -d "$cand" ] || git worktree add --detach "$cand" 5de3057
@@ -102,7 +105,10 @@ p04() {
   mkdir -p "$cand/target/loop-base"
   cp "$base/target/release/gibbs" "$cand/target/loop-base/gibbs"
   (cd "$cand" && cargo build --release -q)  # loop_verify rebuilds too; this keeps the GPU slot short
-  sched p04-abba bash -c "cd '$cand' && scripts/loop_verify.sh" > "$OUT/p04-verify.log" 2>&1 || rc=$?
+  mkdir -p "$ROOT/target/matrix" && touch "$ROOT/target/matrix/PAUSE"
+  trap 'rm -f "$ROOT/target/matrix/PAUSE"' EXIT
+  echo "base 4ff5e60 cand 5de3057" > "$OUT/p04-verify.log"
+  sched p04-abba bash -c "cd '$cand' && scripts/loop_verify.sh" >> "$OUT/p04-verify.log" 2>&1 || rc=$?
   rm -rf "$OUT/p04-loop"
   cp -R "$cand/target/loop" "$OUT/p04-loop"
   echo "p04: exit $rc -> $OUT/p04-verify.log, $OUT/p04-loop/"
@@ -112,7 +118,8 @@ p05() {
   cargo build --release -q
   local rc=0
   # The first run downloads both GGUFs (3.8 + 7.2 GB) inside the scheduler slot.
-  sched p05-ref7b target/release/gibbs --bench bench/reference-7b.json > "$OUT/p05-ref7b.log" 2>&1 || rc=$?
+  echo "commit $(git rev-parse HEAD)" > "$OUT/p05-ref7b.log"
+  sched p05-ref7b target/release/gibbs --bench bench/reference-7b.json >> "$OUT/p05-ref7b.log" 2>&1 || rc=$?
   echo "p05: exit $rc -> $OUT/p05-ref7b.log"
 }
 
