@@ -241,30 +241,34 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 
 // Q4_K / Q5_K: group g = (pair p = g/4 of 32-element groups j = 2p, 2p+1, 8 bytes at l0 = (g%4)*8): the low
 // nibbles are group 2p and the high nibbles group 2p+1 (Q5_K adds bit j of the 32 high-bit bytes as the
-// fifth bit); value = d * sv_j * code - dmin * mv_j.
+// fifth bit); value = d * sv_j * code - dmin * mv_j. Q4_K dots its group directly (fused_dot): 2% faster
+// than decode-then-dot with >= 64 MB of weights rotating (sprint 3 item 6.2; Q6_K's fused form was not).
 static WIDE_Q4_K: Wide = Wide {
     uniform: false,
-    fused_dot: false,
+    fused_dot: true,
     groups: 16,
     segs: 2,
     msl: r#"
 inline uint group_seg(uint g, uint k) { return ((g >> 2) * 2 + k) * 32 + (g & 3) * 8; }
-inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+inline float dot_group(device const uchar* blk, uint g, thread const float4* xs) {
     float d = cd_f16(blk), dmin = cd_f16(blk + 2);
     uint p = g >> 2;
-    device const ushort* q = (device const ushort*)(blk + 16 + p * 32 + (g & 3) * 8);
-    for (uint w = 0; w < 2; w++) {
-        uint a = uint(q[2 * w]) | (uint(q[2 * w + 1]) << 16);
-        float4 lo = float4(as_type<uchar4>(a & 0x0F0F0F0Fu));
-        float4 hi = float4(as_type<uchar4>((a >> 4) & 0x0F0F0F0Fu));
-        for (uint i = 0; i < 4; i++) { out[4 * w + i] = lo[i]; out[8 + 4 * w + i] = hi[i]; }
-    }
-    for (uint k = 0; k < 2; k++) {
-        uint sv, mv;
-        cd_k4(2 * p + k, blk + 4, sv, mv);
-        out[16 + k] = d * float(sv);
-        out[18 + k] = -(dmin * float(mv));
-    }
+    ushort4 qw = *(device const packed_ushort4*)(blk + 16 + p * 32 + (g & 3) * 8);
+    uint a0 = uint(qw.x) | (uint(qw.y) << 16);
+    uint a1 = uint(qw.z) | (uint(qw.w) << 16);
+    float4 lo0 = float4(as_type<uchar4>(a0 & 0x0F0F0F0Fu));
+    float4 lo1 = float4(as_type<uchar4>(a1 & 0x0F0F0F0Fu));
+    float4 hi0 = float4(as_type<uchar4>((a0 >> 4) & 0x0F0F0F0Fu));
+    float4 hi1 = float4(as_type<uchar4>((a1 >> 4) & 0x0F0F0F0Fu));
+    float dot0 = dot(lo0, xs[0]) + dot(lo1, xs[1]);
+    float dot1 = dot(hi0, xs[2]) + dot(hi1, xs[3]);
+    uint sv0, mv0, sv1, mv1;
+    cd_k4(2 * p, blk + 4, sv0, mv0);
+    cd_k4(2 * p + 1, blk + 4, sv1, mv1);
+    float sx0 = dot(xs[0] + xs[1], float4(1.0f));
+    float sx1 = dot(xs[2] + xs[3], float4(1.0f));
+    return (d * float(sv0)) * dot0 - (dmin * float(mv0)) * sx0
+         + (d * float(sv1)) * dot1 - (dmin * float(mv1)) * sx1;
 }
 "#,
 };

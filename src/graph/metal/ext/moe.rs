@@ -448,8 +448,9 @@ fn moe_rows_per_sg(_c: &Codec) -> usize {
     2
 }
 /// Per (device, codec, rows_per_sg, grid binding) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize, Iq2Grid), ComputePipelineState>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static MOE_GEMV: LazyLock<
+    Mutex<HashMap<(u64, QuantFormat, usize, Iq2Grid), ComputePipelineState>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
     #[cfg(test)]
@@ -2041,17 +2042,12 @@ mod tests {
         let opts = super::CompileOptions::new();
         opts.set_fast_math_enabled(false);
 
-        let q4k_unfused_fn = "inline void decode_group_GGUF_Q4_K_M(device const uchar* blk, uint g, thread float* out) {\n    float d = cd_f16(blk), dmin = cd_f16(blk + 2);\n    uint p = g >> 2;\n    device const ushort* q = (device const ushort*)(blk + 16 + p * 32 + (g & 3) * 8);\n    for (uint w = 0; w < 2; w++) {\n        uint a = uint(q[2 * w]) | (uint(q[2 * w + 1]) << 16);\n        float4 lo = float4(as_type<uchar4>(a & 0x0F0F0F0Fu));\n        float4 hi = float4(as_type<uchar4>((a >> 4) & 0x0F0F0F0Fu));\n        for (uint i = 0; i < 4; i++) { out[4 * w + i] = lo[i]; out[8 + 4 * w + i] = hi[i]; }\n    }\n    for (uint k = 0; k < 2; k++) {\n        uint sv, mv;\n        cd_k4(2 * p + k, blk + 4, sv, mv);\n        out[16 + k] = d * float(sv);\n        out[18 + k] = -(dmin * float(mv));\n    }\n}";
-        let q4k_fused_fn = "inline float dot_group_GGUF_Q4_K_M(device const uchar* blk, uint g, thread const float4* xs) {\n    float d = cd_f16(blk), dmin = cd_f16(blk + 2);\n    uint p = g >> 2;\n    ushort4 qw = *(device const packed_ushort4*)(blk + 16 + p * 32 + (g & 3) * 8);\n    uint a0 = uint(qw.x) | (uint(qw.y) << 16);\n    uint a1 = uint(qw.z) | (uint(qw.w) << 16);\n    float4 lo0 = float4(as_type<uchar4>(a0 & 0x0F0F0F0Fu));\n    float4 lo1 = float4(as_type<uchar4>(a1 & 0x0F0F0F0Fu));\n    float4 hi0 = float4(as_type<uchar4>((a0 >> 4) & 0x0F0F0F0Fu));\n    float4 hi1 = float4(as_type<uchar4>((a1 >> 4) & 0x0F0F0F0Fu));\n    float dot0 = dot(lo0, xs[0]) + dot(lo1, xs[1]);\n    float dot1 = dot(hi0, xs[2]) + dot(hi1, xs[3]);\n    uint sv0, mv0, sv1, mv1;\n    cd_k4(2 * p, blk + 4, sv0, mv0);\n    cd_k4(2 * p + 1, blk + 4, sv1, mv1);\n    float sx0 = dot(xs[0] + xs[1], float4(1.0f));\n    float sx1 = dot(xs[2] + xs[3], float4(1.0f));\n    return (d * float(sv0)) * dot0 - (dmin * float(mv0)) * sx0\n         + (d * float(sv1)) * dot1 - (dmin * float(mv1)) * sx1;\n}";
-
         let q6k_unfused_fn = "inline void decode_group_GGUF_Q6_K(device const uchar* blk, uint g, thread float* out) {\n    float d = cd_f16(blk + 208);\n    uint n = g >> 2, l0 = (g & 3) * 8;\n    device const ushort* lo = (device const ushort*)(blk + n * 64 + l0);\n    device const ushort* hi = (device const ushort*)(blk + n * 64 + 32 + l0);\n    device const ushort* qh = (device const ushort*)(blk + 128 + n * 32 + l0);\n    for (uint w = 0; w < 2; w++) {\n        uint a = uint(lo[2 * w]) | (uint(lo[2 * w + 1]) << 16);\n        uint b = uint(hi[2 * w]) | (uint(hi[2 * w + 1]) << 16);\n        uint h = uint(qh[2 * w]) | (uint(qh[2 * w + 1]) << 16);\n        float4 c0 = float4(as_type<uchar4>((a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4)));\n        float4 c1 = float4(as_type<uchar4>((b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2)));\n        float4 c2 = float4(as_type<uchar4>(((a >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u)));\n        float4 c3 = float4(as_type<uchar4>(((b >> 4) & 0x0F0F0F0Fu) | ((h & 0xC0C0C0C0u) >> 2)));\n        for (uint i = 0; i < 4; i++) {\n            out[4 * w + i] = c0[i];\n            out[8 + 4 * w + i] = c1[i];\n            out[16 + 4 * w + i] = c2[i];\n            out[24 + 4 * w + i] = c3[i];\n        }\n    }\n    device const char* sc = (device const char*)(blk + 192 + n * 8 + (l0 >> 4));\n    for (uint k = 0; k < 4; k++) {\n        float s = d * float(sc[2 * k]);\n        out[32 + k] = s;\n        out[36 + k] = -32.0f * s;\n    }\n}";
         let q6k_fused_fn = "inline float dot_group_GGUF_Q6_K(device const uchar* blk, uint g, thread const float4* xs) {\n    float d = cd_f16(blk + 208);\n    uint n = g >> 2, l0 = (g & 3) * 8;\n    device const ushort* lo = (device const ushort*)(blk + n * 64 + l0);\n    device const ushort* hi = (device const ushort*)(blk + n * 64 + 32 + l0);\n    device const ushort* qh = (device const ushort*)(blk + 128 + n * 32 + l0);\n    float4 dots = float4(0.0f);\n    for (uint w = 0; w < 2; w++) {\n        ushort2 lw = *(device const packed_ushort2*)(lo + 2 * w);\n        ushort2 hw = *(device const packed_ushort2*)(hi + 2 * w);\n        ushort2 qw = *(device const packed_ushort2*)(qh + 2 * w);\n        uint a = uint(lw.x) | (uint(lw.y) << 16);\n        uint b = uint(hw.x) | (uint(hw.y) << 16);\n        uint h = uint(qw.x) | (uint(qw.y) << 16);\n        float4 c0 = float4(as_type<uchar4>((a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4)));\n        float4 c1 = float4(as_type<uchar4>((b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2)));\n        float4 c2 = float4(as_type<uchar4>(((a >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u)));\n        float4 c3 = float4(as_type<uchar4>(((b >> 4) & 0x0F0F0F0Fu) | ((h & 0xC0C0C0C0u) >> 2)));\n        dots.x += dot(c0, xs[w]);\n        dots.y += dot(c1, xs[2 + w]);\n        dots.z += dot(c2, xs[4 + w]);\n        dots.w += dot(c3, xs[6 + w]);\n    }\n    device const char* sc = (device const char*)(blk + 192 + n * 8 + (l0 >> 4));\n    float acc = 0.0f;\n    for (uint k = 0; k < 4; k++) {\n        float s = d * float(sc[2 * k]);\n        float sx = dot(xs[2 * k] + xs[2 * k + 1], float4(1.0f));\n        acc += s * dots[k] - 32.0f * s * sx;\n    }\n    return acc;\n}";
 
-        for (f, rows, cols, r) in [
-            (Q::GGUF_Q4_K_M, 12288usize, 1536usize, 2usize),
-            (Q::GGUF_Q4_K_M, 4096, 1536, 1),
-            (Q::GGUF_Q6_K, 1536, 12288, 1),
-        ] {
+        // Q4_K's fused form is the generated kernel since sprint 3 item 6.2 (2% faster under DRAM
+        // rotation); Q6_K's stays decode-then-dot.
+        for (f, rows, cols, r) in [(Q::GGUF_Q6_K, 1536usize, 12288usize, 1usize)] {
             let c = codec(f).unwrap();
             let params = GemvParams {
                 rows_per_sg: r,
@@ -2059,14 +2055,9 @@ mod tests {
             };
             let fn_name = gemv_packed_name(c, params);
             let unfused_body = gemv_packed(c, params);
-            let mut fused_body = if f == Q::GGUF_Q4_K_M {
-                assert!(unfused_body.contains(q4k_unfused_fn));
-                unfused_body.replace(q4k_unfused_fn, q4k_fused_fn)
-            } else {
-                assert!(unfused_body.contains(q6k_unfused_fn));
-                unfused_body.replace(q6k_unfused_fn, q6k_fused_fn)
-            };
-            let nseg = if f == Q::GGUF_Q4_K_M { 2usize } else { 4usize };
+            assert!(unfused_body.contains(q6k_unfused_fn));
+            let mut fused_body = unfused_body.replace(q6k_unfused_fn, q6k_fused_fn);
+            let nseg = 4usize;
             for k in 0..nseg {
                 let sx_line = format!(
                     "        const float sx{k} = dot(xs[{}], float4(1.0f)) + dot(xs[{}], float4(1.0f));\n",
