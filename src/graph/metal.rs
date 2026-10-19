@@ -10096,6 +10096,9 @@ mod tests {
                         &mut metal_state,
                     );
                     assert!(e < tol, "f16 KV {kv_f16} prefill {window:?}: {e}");
+                    let (kbuf, n) = &metal_state.metal_buffers["k_state"];
+                    assert_eq!(metal_state.metal_f16.contains("k_state"), kv_f16);
+                    assert_eq!(kbuf.length() as usize, (n * if kv_f16 { 2 } else { 4 }).max(ARENA_ALIGN));
                     let decode = make(1);
                     // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
                     for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
