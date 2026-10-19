@@ -932,6 +932,21 @@ mod tests {
         assert_eq!(absorbed, want);
     }
 
+    /// Passes leave values whose producer node is gone: `decide` encodes only referenced values.
+    #[test]
+    fn decide_skips_values_of_removed_nodes() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 64], F);
+        let gw = g.weight("g", vec![64], F);
+        let n = g.add("n", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
+        let r = g.add("r", Op::Add, &[n, x], vec![1, 64], F);
+        g.add("dead", Op::Silu, &[r], vec![1, 64], F);
+        g.nodes.pop();
+        g.output(r);
+        let d = decide(&g).unwrap();
+        assert_eq!(d.norm[&0].res, Some((1, x)));
+    }
+
     /// Norms around an independent elementwise step: no batch, unless commutation of any step is
     /// on; norms around a GEMV batch either way.
     #[test]

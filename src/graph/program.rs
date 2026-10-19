@@ -685,6 +685,7 @@ mod tests {
     /// GPU: `run_reshaped` plans a row count once and reuses it; another row count gets its own plan.
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "GPU: cargo test --lib run_reshaped_caches -- --ignored --test-threads=1"]
     fn run_reshaped_caches_one_plan_per_shape() {
         let (g, w) = two_linears();
         let mut prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).unwrap();
