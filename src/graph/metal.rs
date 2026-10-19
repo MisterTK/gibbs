@@ -2375,7 +2375,13 @@ impl Session {
         }
         self.assign_variants(&mut steps);
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
-        pair_small_hand_gemvs(graph, &mut steps, &aliases, &offsets);
+        pair_small_hand_gemvs(
+            graph,
+            &mut steps,
+            &aliases,
+            &offsets,
+            self.variant_override == Some(GemvVariant::HAND),
+        );
         let mut arena = self.arena.lock();
         if arena
             .as_ref()
@@ -2457,6 +2463,14 @@ impl Session {
             }
         }
         let params_buffer_size = steps.len() * 64;
+        let mlp_scratch_size = steps
+            .iter()
+            .filter_map(|s| match s.op {
+                Step::MegakernelMlp { hidden, inter, .. } => Some(hidden * 4 + 2 * inter * 4),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
         let mut embedding_checks = Vec::new();
         let mut attn_pos_inputs = Vec::new();
         let mut state_vars: Vec<(ValueId, String)> = Vec::new();
@@ -2519,6 +2533,7 @@ impl Session {
             state_reads,
             flops_per_run,
             params_buffer_size,
+            mlp_scratch_size,
             embedding_checks,
             attn_pos_inputs,
             state_vars,
@@ -2719,6 +2734,16 @@ impl Session {
             }
         };
         let params_buf = self.ensure_params_buffer(plan.params_buffer_size)?;
+        let mlp_scratch_buf = if plan.mlp_scratch_size > 0 {
+            let need = plan.mlp_scratch_size.max(256);
+            let mut guard = self.mlp_scratch.lock();
+            if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
+                *guard = Some(new_shared_buffer(&self.rt.device, need)?);
+            }
+            Some(guard.as_ref().expect("allocated above").clone())
+        } else {
+            None
+        };
         metal::objc::rc::autoreleasepool(|| {
             let print_profile = std::env::var_os("GIBBS_PROFILE_KERNELS").is_some();
             // A requested sample is one real decode token; the printing profiler profiles every run.
@@ -2737,7 +2762,14 @@ impl Session {
                     for _ in 0..if print_profile && !cold { 2 } else { 1 } {
                         let cb = self.rt.queue.new_command_buffer();
                         let enc = cb.new_compute_command_encoder();
-                        self.encode(&Counted::new(enc), s, s_idx, &params_buf, &loc)?;
+                        self.encode(
+                            &Counted::new(enc),
+                            s,
+                            s_idx,
+                            &params_buf,
+                            mlp_scratch_buf.as_ref(),
+                            &loc,
+                        )?;
                         enc.end_encoding();
                         commit_and_wait(cb)?;
                         gpu_s = gpu_seconds(cb);
@@ -2785,7 +2817,14 @@ impl Session {
                     let enc = cb.new_compute_command_encoder();
                     let counted = Counted::new(enc);
                     for (s_idx, s) in steps.iter().enumerate().take(end).skip(at) {
-                        if let Err(e) = self.encode(&counted, s, s_idx, &params_buf, &loc) {
+                        if let Err(e) = self.encode(
+                            &counted,
+                            s,
+                            s_idx,
+                            &params_buf,
+                            mlp_scratch_buf.as_ref(),
+                            &loc,
+                        ) {
                             err = Some(e);
                             break;
                         }
@@ -2981,6 +3020,7 @@ impl Session {
         s: &Planned,
         step_idx: usize,
         params_buf: &Buffer,
+        mlp_scratch_buf: Option<&Buffer>,
         loc: &impl Fn(ValueId) -> (&'a Buffer, usize),
     ) -> Result<(), String> {
         let rt = &self.rt;
@@ -4011,16 +4051,23 @@ impl Session {
                 let bytes_inter = inter * 4;
                 let total_scratch = bytes_norm + 2 * bytes_inter;
 
-                let mut guard = self.mlp_scratch.lock();
-                if guard
-                    .as_ref()
-                    .map_or(true, |b| (b.length() as usize) < total_scratch)
+                let fallback_scratch;
+                let scratch = if let Some(b) =
+                    mlp_scratch_buf.filter(|b| (b.length() as usize) >= total_scratch)
                 {
-                    let buf = new_shared_buffer(&self.rt.device, total_scratch.max(256))?;
-                    *guard = Some(buf);
-                }
-                let scratch = guard.as_ref().unwrap();
-
+                    b
+                } else {
+                    let mut guard = self.mlp_scratch.lock();
+                    if guard
+                        .as_ref()
+                        .is_none_or(|b| (b.length() as usize) < total_scratch)
+                    {
+                        let buf = new_shared_buffer(&self.rt.device, total_scratch.max(256))?;
+                        *guard = Some(buf);
+                    }
+                    fallback_scratch = guard.as_ref().expect("allocated above").clone();
+                    &fallback_scratch
+                };
                 let off_norm = 0usize;
                 let off_gate = bytes_norm;
                 let off_up = bytes_norm + bytes_inter;
@@ -4413,6 +4460,7 @@ pub struct PreparedPlan {
     pub state_reads: Vec<StateRead>,
     pub flops_per_run: u64,
     pub params_buffer_size: usize,
+    pub(crate) mlp_scratch_size: usize,
     pub(crate) embedding_checks: Vec<(usize, usize, String)>,
     pub(crate) attn_pos_inputs: Vec<(usize, usize)>,
     pub(crate) state_vars: Vec<(ValueId, String)>,
@@ -4529,6 +4577,7 @@ fn pair_small_hand_gemvs(
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
     offsets: &HashMap<ValueId, usize>,
+    allow_quant_pair: bool,
 ) {
     if !fusion_policy().allows(FusionClass::HorizontalBatch) {
         return;
@@ -4578,9 +4627,10 @@ fn pair_small_hand_gemvs(
             return false;
         }
         let fmt_ok = *f0 == WeightFormat::BF16
-            || *f0 == WeightFormat::Q4_K
-            || *f0 == WeightFormat::Q8_0
-            || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0);
+            || (allow_quant_pair
+                && (*f0 == WeightFormat::Q4_K
+                    || *f0 == WeightFormat::Q8_0
+                    || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0)));
         if !fmt_ok || b.reads.iter().any(|&r| r == a.out || root(r) == root(a.out)) {
             return false;
         }
@@ -4784,11 +4834,36 @@ fn batch_horizontal(
                 .any(|&r| run.iter().any(|s| root(s.out) == root(r)))
     };
     let mut out: Vec<Planned> = Vec::with_capacity(steps.len());
-    let mut it = steps.into_iter().peekable();
-    while let Some(first) = it.next() {
+    let mut it: std::collections::VecDeque<Planned> = steps.into();
+    while let Some(first) = it.pop_front() {
         let mut run = vec![first];
-        while run.len() < 4 && it.peek().is_some_and(|n| joins(&run, n)) {
-            run.push(it.next().expect("peeked"));
+        while run.len() < 4 {
+            if it.front().is_some_and(|n| joins(&run, n)) {
+                run.push(it.pop_front().expect("checked"));
+            } else if it.len() >= 2
+                && matches!(
+                    run[0].op,
+                    Step::RmsNorm {
+                        res: None,
+                        scale: None,
+                        chain: None,
+                        ..
+                    }
+                )
+                && matches!(it[0].op, Step::GemvPacked { .. })
+                && it[0].extra_outs.is_empty()
+                && !it[0]
+                    .reads
+                    .iter()
+                    .any(|&r| run.iter().any(|s| root(s.out) == root(r)))
+                && joins(&run, &it[1])
+            {
+                // Commute an independent GemvPacked before the pending RmsNorm run so sibling norms batch.
+                out.push(it.pop_front().expect("gemv"));
+                run.push(it.pop_front().expect("norm"));
+            } else {
+                break;
+            }
         }
         if run.len() == 1 {
             let mut first = run.pop().expect("len == 1");
@@ -4803,7 +4878,7 @@ fn batch_horizontal(
             } = first.op
             {
                 if (res.is_some() || scale.is_some()) && chain.is_none() {
-                    let can_chain = it.peek().is_some_and(|next| {
+                    let can_chain = it.front().is_some_and(|next| {
                         next.extra_outs.is_empty()
                             && matches!(
                                 next.op,
@@ -4820,7 +4895,7 @@ fn batch_horizontal(
                             )
                     });
                     if can_chain {
-                        let next = it.next().expect("peeked");
+                        let next = it.pop_front().expect("peeked");
                         if let Step::RmsNorm {
                             g: g2, eps: eps2, ..
                         } = next.op
@@ -4849,7 +4924,7 @@ fn batch_horizontal(
             {
                 if (res0.is_some() || scale0.is_some()) && first.extra_outs.is_empty() {
                     let can_absorb = !aliases.contains_key(&first.out)
-                        && it.peek().is_some_and(|next| {
+                        && it.front().is_some_and(|next| {
                             matches!(
                                 next.op,
                                 Step::MegakernelMlp {
@@ -4861,7 +4936,7 @@ fn batch_horizontal(
                             )
                         });
                     if can_absorb {
-                        let mut mlp = it.next().expect("peeked");
+                        let mut mlp = it.pop_front().expect("peeked");
                         if let Step::MegakernelMlp {
                             ref mut pre_res, ..
                         } = mlp.op
@@ -10607,5 +10682,165 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         if std::env::var_os("GIBBS_CB_CHUNK").is_none() {
             assert_eq!(cb_chunking(), (32, usize::MAX));
         }
+    }
+
+    #[test]
+    fn batch_horizontal_commutes_interleaved_gemv_and_rmsnorm() {
+        let f = DType::F32;
+        let (heads, kv_heads, hd, h) = (4usize, 2usize, 8usize, 32usize);
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: crate::graph::RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, h], f);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let wq = g.weight("wq", vec![q_dim, h], DType::F16);
+        let wk = g.weight("wk", vec![kv_dim, h], DType::F16);
+        let wv = g.weight("wv", vec![kv_dim, h], DType::F16);
+        let gw = g.weight("gw", vec![hd], f);
+        let inv = g.weight("inv", vec![hd / 2], f);
+
+        let q = g.add("q", Op::Linear, &[x, wq], vec![1, q_dim], f);
+        let qn = g.add("qn", Op::RmsNorm { eps: 1e-5 }, &[q, gw], vec![1, q_dim], f);
+        let qr = g.add("qr", rope.clone(), &[qn, pos, inv], vec![1, q_dim], f);
+
+        let k = g.add("k", Op::Linear, &[x, wk], vec![1, kv_dim], f);
+        let kn = g.add("kn", Op::RmsNorm { eps: 1e-5 }, &[k, gw], vec![1, kv_dim], f);
+        let kr = g.add("kr", rope, &[kn, pos, inv], vec![1, kv_dim], f);
+
+        let v = g.add("v", Op::Linear, &[x, wv], vec![1, kv_dim], f);
+        let vn = g.add("vn", Op::RmsNorm { eps: 1e-6 }, &[v, gw], vec![1, kv_dim], f);
+
+        let ks = g.state("ks", vec![16, kv_dim], f);
+        let vs = g.state("vs", vec![16, kv_dim], f);
+        let att = g.add(
+            "att",
+            Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 0.25,
+                causal: true,
+                window: None,
+                soft_cap: None,
+                write: true,
+            },
+            &[qr, kr, vn, ks, vs, pos],
+            vec![1, q_dim],
+            f,
+        );
+        g.output(att);
+
+        let to_f16 = |vals: Vec<f32>| -> Vec<u16> {
+            vals.into_iter()
+                .map(|v| crate::graph::coreml::f32_to_f16(v * 0.2))
+                .collect()
+        };
+        let mut w = Weights::new();
+        w.insert("wq", Tensor::F16(to_f16(rand(q_dim * h, 1))));
+        w.insert("wk", Tensor::F16(to_f16(rand(kv_dim * h, 2))));
+        w.insert("wv", Tensor::F16(to_f16(rand(kv_dim * h, 3))));
+        w.insert("gw", Tensor::F32(rand(hd, 4)));
+        w.insert("inv", Tensor::F32(rand(hd / 2, 5)));
+
+        let sess = Session::new(rt(), &w).unwrap();
+        let plan = sess.prepare_plan(&g).unwrap();
+        assert_eq!(plan.steps.len(), 5);
+        assert!(matches!(plan.steps[0].op, Step::GemvPacked { .. }));
+        assert!(matches!(plan.steps[1].op, Step::GemvPacked { .. }));
+        assert!(matches!(plan.steps[2].op, Step::GemvPacked { .. }));
+        match &plan.steps[3].op {
+            Step::RmsNormBatch {
+                rope: Some(_),
+                segs,
+            } => {
+                assert_eq!(segs.len(), 3);
+                assert_eq!(
+                    [segs[0].has_rope, segs[1].has_rope, segs[2].has_rope],
+                    [true, true, false]
+                );
+            }
+            other => panic!("expected RmsNormBatch, got {other:?}"),
+        }
+        assert!(matches!(plan.steps[4].op, Step::CachedAttention { .. }));
+
+        let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+        for step in 0..3u32 {
+            let inp = vec![Tensor::F32(rand(h, 10 + step as u64)), Tensor::U32(vec![step])];
+            let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
+            let got = sess.run_prepared(&g, &plan, Some(&mut ms), inp).unwrap();
+            let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            assert!(err < 1e-4, "step {step}: rel_err {err}");
+        }
+    }
+
+    #[test]
+    fn readback_span_timing_probe() {
+        let n = 262_144usize;
+        let buf = new_shared_buffer(&rt().device, n * 4).unwrap();
+        let ptr = buf.contents() as *mut f32;
+        unsafe {
+            for i in 0..n {
+                *ptr.add(i) = (i as f32) * 0.001;
+            }
+        }
+        let s = unsafe { std::slice::from_raw_parts(ptr as *const f32, n) };
+        let mut to_vec_us = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let t0 = Instant::now();
+            let v = std::hint::black_box(s.to_vec());
+            to_vec_us.push(t0.elapsed().as_secs_f64() * 1e6);
+            drop(v);
+        }
+        let mut reuse = vec![0.0f32; n];
+        let mut reuse_us = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let t0 = Instant::now();
+            reuse.copy_from_slice(std::hint::black_box(s));
+            std::hint::black_box(&reuse);
+            reuse_us.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        to_vec_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        reuse_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "readback_to_vec_med_us={:.2} readback_reuse_med_us={:.2}",
+            to_vec_us[50], reuse_us[50]
+        );
+    }
+
+    #[test]
+    fn prepared_plan_precomputes_mlp_scratch_size() {
+        let f = DType::F32;
+        let (h, inter) = (64usize, 128usize);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, h], f);
+        let norm_w = g.weight("norm_w", vec![h], f);
+        let gate_w = g.weight("gate_w", vec![inter, h], f);
+        let up_w = g.weight("up_w", vec![inter, h], f);
+        let down_w = g.weight("down_w", vec![h, inter], f);
+        let ff_in = g.add("ln", Op::RmsNorm { eps: 1e-5 }, &[x, norm_w], vec![1, h], f);
+        let gate = g.add("gate", Op::Linear, &[ff_in, gate_w], vec![1, inter], f);
+        let up = g.add("up", Op::Linear, &[ff_in, up_w], vec![1, inter], f);
+        let act = g.add("act", Op::SwiGlu, &[gate, up], vec![1, inter], f);
+        let down = g.add("down", Op::Linear, &[act, down_w], vec![1, h], f);
+        let out = g.add("res", Op::Add, &[x, down], vec![1, h], f);
+        g.output(out);
+        assert_eq!(
+            crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+            1
+        );
+        let mut w = Weights::new();
+        w.insert("norm_w", Tensor::F32(rand(h, 1)));
+        w.insert("gate_w", Tensor::F32(rand(inter * h, 2)));
+        w.insert("up_w", Tensor::F32(rand(inter * h, 3)));
+        w.insert("down_w", Tensor::F32(rand(h * inter, 4)));
+        let s = Session::new(rt(), &w).unwrap();
+        let plan = s.prepare_plan(&g).unwrap();
+        assert_eq!(plan.mlp_scratch_size, h * 4 + 2 * inter * 4);
     }
 }
