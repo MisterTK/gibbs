@@ -338,7 +338,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
 #[derive(Debug, Default)]
 pub(super) struct Batches {
     /// First member → the members (ascending, 2..=4) of one batched dispatch. Steps between members
-    /// are independent GEMVs that run ahead of the batch.
+    /// are independent steps that run ahead of the batch (GEMVs; any with `GIBBS_BATCH_COMMUTE`).
     pub runs: HashMap<usize, Vec<usize>>,
     /// An RmsNorm with a residual or scale whose next step, a plain RmsNorm of its output, chains in.
     pub chain: HashSet<usize>,
@@ -351,12 +351,13 @@ pub(super) struct Batches {
 /// `RopeKey p rk` (the RoPE fused into that norm, 0: none), `Indep a b` (step `b` reads no output of
 /// `a`, `b - a < 8`). `R{L}` is a run of `L` members from `s` whose next candidate is at `c` and
 /// whose RoPE is `rk`; it grows by the next step when that is of the run's kind, independent of
-/// every member and RoPE-compatible, or — for norm runs — by the step after an independent GEMV.
+/// every member and RoPE-compatible, or — for norm runs — by the step after an independent
+/// `Movable` one (a GEMV; with [`COMMUTE`], any single-output step that is no batch candidate).
 const BATCH_PROGRAM: &str = r#"
 (relation BKind (i64 i64))
 (relation RopeKey (i64 i64))
 (relation Solo (i64))
-(relation Gemv (i64))
+(relation Movable (i64))
 (relation Indep (i64 i64))
 (relation NormRS (i64 i64 i64 i64))
 (relation NormPlain0 (i64 i64 i64 i64))
@@ -373,6 +374,13 @@ const BATCH_PROGRAM: &str = r#"
 (rule ((NormRS s rows d o) (= n (+ s 1)) (NormPlain0 n rows d o)) ((Chain s)) :ruleset batch)
 (rule ((NormRS1 s d o) (= n (+ s 1)) (MlpIn n o d)) ((Absorb s)) :ruleset batch)
 "#;
+
+/// `GIBBS_BATCH_COMMUTE=1`: a norm batch may move any independent single-output step ahead of it,
+/// not only a GEMV (read once).
+// ponytail: measurement-gated new rule (changes plans); default off until an ABBA shows a gain.
+pub(super) static COMMUTE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("GIBBS_BATCH_COMMUTE").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+});
 
 /// The run-growing rules of [`BATCH_PROGRAM`] for runs of 1..=3 members.
 fn batch_rules() -> String {
@@ -392,7 +400,10 @@ fn batch_rules() -> String {
         let grow = [
             ("(BKind s k)".to_string(), "c"),
             (
-                format!("(BKind s k) (= k 1) (Gemv c) {}(= at (+ c 1))", indep("c")),
+                format!(
+                    "(BKind s k) (= k 1) (Movable c) {}(= at (+ c 1))",
+                    indep("c")
+                ),
                 "at",
             ),
         ];
@@ -423,10 +434,12 @@ fn intern<K: std::hash::Hash + Eq>(m: &mut HashMap<K, i64>, k: K) -> i64 {
 }
 
 /// Saturates the batching rules over `steps` and extracts what the greedy in-order walk takes:
-/// at each step, the longest run starting there, else its chain, else its absorption.
+/// at each step, the longest run starting there, else its chain, else its absorption. `commute`
+/// enables the any-step commutation ([`COMMUTE`]).
 pub(super) fn batches(
     steps: &[Planned],
     aliases: &HashMap<ValueId, (ValueId, usize)>,
+    commute: bool,
 ) -> Result<Batches, String> {
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let mut eg = EGraph::default();
@@ -497,10 +510,6 @@ pub(super) fn batches(
                     }
                     None
                 }
-                Step::GemvPacked { .. } if solo => {
-                    fs.add("Gemv", pi)?;
-                    None
-                }
                 Step::MegakernelMlp {
                     x,
                     pre_res: None,
@@ -512,6 +521,10 @@ pub(super) fn batches(
                 }
                 _ => None,
             };
+            let gemv = matches!(s.op, Step::GemvPacked { .. });
+            if kind.is_none() && solo && (gemv || commute) {
+                fs.add("Movable", pi)?;
+            }
             if let Some(k) = kind {
                 fs.add("BKind", (pi, k))?;
                 let out = root(s.out);
@@ -847,4 +860,195 @@ pub(super) fn moe(
         d.insert(r[0] as usize, f);
     }
     Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{batch_horizontal, plan};
+    use super::*;
+    use crate::graph::{ReduceKind, Weights};
+
+    const F: DType = DType::F32;
+
+    /// Linear epilogue (residual), RmsNorm residual + scale, and attention q/k RoPE are each
+    /// claimed once, by the node the rules name.
+    #[test]
+    fn decide_claims_epilogue_norm_and_attention_rope() {
+        let (h, hd) = (64usize, 16usize);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, h], F);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let gw = g.weight("g", vec![h], F);
+        let s = g.weight("s", vec![1], F);
+        let inv = g.weight("inv", vec![hd / 2], F);
+        let w = |g: &mut Graph, n: &str| g.weight(n, vec![h, h], DType::F16);
+        let (wq, wk, wv, wo) = (
+            w(&mut g, "wq"),
+            w(&mut g, "wk"),
+            w(&mut g, "wv"),
+            w(&mut g, "wo"),
+        );
+        let n0 = g.add("n0", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, h], F);
+        let o = g.add("o", Op::Linear, &[n0, wo], vec![1, h], F);
+        let r = g.add("r", Op::Add, &[o, x], vec![1, h], F);
+        let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[r, gw], vec![1, h], F);
+        let r1 = g.add("r1", Op::Add, &[r, n1], vec![1, h], F);
+        let sc = g.add("sc", Op::Mul, &[r1, s], vec![1, h], F);
+        let rope = Op::Rope {
+            head_dim: hd,
+            rotary_dim: hd,
+            variant: RopeVariant::HalfSplit,
+            mscale: 1.0,
+        };
+        let q = g.add("q", Op::Linear, &[sc, wq], vec![1, h], F);
+        let k = g.add("k", Op::Linear, &[sc, wk], vec![1, h], F);
+        let v = g.add("v", Op::Linear, &[sc, wv], vec![1, h], F);
+        let qr = g.add("qr", rope.clone(), &[q, pos, inv], vec![1, h], F);
+        let kr = g.add("kr", rope, &[k, pos, inv], vec![1, h], F);
+        let ks = g.state("ks", vec![8, h], F);
+        let vs = g.state("vs", vec![8, h], F);
+        let attn = Op::CachedAttention {
+            heads: h / hd,
+            kv_heads: h / hd,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 0.25,
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write: true,
+        };
+        let a = g.add("a", attn, &[qr, kr, v, ks, vs, pos], vec![1, h], F);
+        g.output(a);
+        let node = |v: ValueId| match g.value(v).kind {
+            ValueKind::Node(n) => n.0 as usize,
+            _ => unreachable!(),
+        };
+        let d = decide(&g).unwrap();
+        assert_eq!(d.epi.len(), 1);
+        let &(j, epi, side) = &d.epi[&node(o)];
+        assert_eq!((j, epi, side), (node(r), Epi::Residual, Some(x)));
+        let nf = d.norm[&node(n1)];
+        assert_eq!(nf.res, Some((node(r1), r)));
+        assert_eq!(nf.scale, Some((node(sc), s)));
+        assert!(nf.rope.is_none() && !d.norm.contains_key(&node(n0)));
+        assert_eq!(d.attn_rope[&node(a)], (node(qr), node(kr)));
+        let mut absorbed: Vec<usize> = d.absorbed().collect();
+        absorbed.sort_unstable();
+        let mut want = vec![node(r), node(r1), node(sc), node(qr), node(kr)];
+        want.sort_unstable();
+        assert_eq!(absorbed, want);
+    }
+
+    /// Norms around an independent elementwise step: no batch, unless commutation of any step is
+    /// on; norms around a GEMV batch either way.
+    #[test]
+    fn batches_commute_gemvs_and_with_the_knob_any_step() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 64], F);
+        let y = g.input("y", vec![1, 64], F);
+        let gw = g.weight("g", vec![64], F);
+        let w = g.weight("w", vec![64, 64], DType::F16);
+        let a = g.add("a", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
+        let neg = Op::Unary {
+            kind: crate::graph::UnaryKind::Neg,
+        };
+        let m = g.add("m", neg, &[y], vec![1, 64], F);
+        let b = g.add("b", Op::RmsNorm { eps: 1e-5 }, &[y, gw], vec![1, 64], F);
+        let l = g.add("l", Op::Linear, &[x, w], vec![1, 64], F);
+        let c = g.add("c", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
+        for o in [a, m, b, l, c] {
+            g.output(o);
+        }
+        let (steps, aliases) = plan(&g).unwrap();
+        assert_eq!(steps.len(), 5);
+        // b, then the GEMV l moved ahead, then c.
+        let off = batches(&steps, &aliases, false).unwrap();
+        assert_eq!(off.runs, HashMap::from([(2, vec![2, 4])]));
+        let on = batches(&steps, &aliases, true).unwrap();
+        // Every start's run is derived; the walk takes the one at its cursor (0): a, b, c.
+        assert_eq!(on.runs[&0], [0, 2, 4]);
+        let kinds: Vec<String> = batch_horizontal(steps, &aliases)
+            .unwrap()
+            .iter()
+            .map(|s| super::super::kernel_kind(&format!("{:?}", s.op)).to_string())
+            .collect();
+        assert_eq!(kinds, ["RmsNorm", "Unary", "GemvPacked", "RmsNormBatch"]);
+    }
+
+    /// Router TopK + GatherCols + Softmax (+ scale), the gate/up half-split GLU and the
+    /// expert-weighted Sum each plan as one step.
+    #[test]
+    fn moe_windows_plan_as_fused_steps() {
+        let (m, h, ff, experts, top_k) = (2usize, 16usize, 16usize, 6usize, 3usize);
+        let mut g = Graph::new();
+        let x = g.input("x", vec![m, h], F);
+        let logits = g.input("logits", vec![m, experts], F);
+        let scale_w = g.weight("scale", vec![1, experts], F);
+        let gu_w = g.weight("gate_up", vec![experts * 2 * ff, h], F);
+        let down_w = g.weight("down", vec![experts * h, ff], F);
+        let ids = g.add(
+            "topk",
+            Op::TopK { k: top_k },
+            &[logits],
+            vec![m, top_k],
+            DType::U32,
+        );
+        let picked = g.add("picked", Op::GatherCols, &[logits, ids], vec![m, top_k], F);
+        let probs = g.add(
+            "probs",
+            Op::Softmax { axis: -1 },
+            &[picked],
+            vec![m, top_k],
+            F,
+        );
+        let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], F);
+        let wv = g.add("weights", Op::Mul, &[probs, sc], vec![m, top_k], F);
+        let moe = Op::MoeLinear { experts, top_k };
+        let gu = g.add(
+            "gu",
+            moe.clone(),
+            &[x, gu_w, ids],
+            vec![m * top_k, 2 * ff],
+            F,
+        );
+        let half = |g: &mut Graph, n: &str, lo: usize| {
+            let op = Op::Slice {
+                axis: 1,
+                start: lo as i64,
+                end: (lo + ff) as i64,
+            };
+            g.add(n, op, &[gu], vec![m * top_k, ff], F)
+        };
+        let (gate, up) = (half(&mut g, "gate", 0), half(&mut g, "up", ff));
+        let act = g.add("act", Op::GeGlu, &[gate, up], vec![m * top_k, ff], F);
+        let down = g.add("down", moe, &[act, down_w, ids], vec![m * top_k, h], F);
+        let col = Op::Reshape {
+            shape: Some(vec![m * top_k, 1]),
+        };
+        let w_col = g.add("w_col", col, &[wv], vec![m * top_k, 1], F);
+        let weighted = g.add("weighted", Op::Mul, &[down, w_col], vec![m * top_k, h], F);
+        let slots = Op::Reshape {
+            shape: Some(vec![m, top_k, h]),
+        };
+        let slots = g.add("slots", slots, &[weighted], vec![m, top_k, h], F);
+        let sum = Op::Reduce {
+            kind: ReduceKind::Sum,
+            axes: vec![1],
+            keep_dims: false,
+        };
+        let out = g.add("out", sum, &[slots], vec![m, h], F);
+        g.output(out);
+        let _ = Weights::new();
+        let (steps, _) = plan(&g).unwrap();
+        let ops: Vec<String> = steps.iter().map(|s| format!("{:?}", s.op)).collect();
+        assert_eq!(steps.len(), 5, "{ops:#?}");
+        assert!(
+            ops[0].contains("TopK") && ops[0].contains("scale: Some"),
+            "{}",
+            ops[0]
+        );
+        assert!(ops[2].starts_with("SplitGlu"), "{}", ops[2]);
+        assert!(ops[4].starts_with("MoeWeightedSum"), "{}", ops[4]);
+    }
 }

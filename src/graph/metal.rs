@@ -4981,7 +4981,7 @@ fn batch_horizontal(
     if !fusion_policy().allows(FusionClass::HorizontalBatch) {
         return Ok(steps);
     }
-    let b = fuse::batches(&steps, aliases)?;
+    let b = fuse::batches(&steps, aliases, *fuse::COMMUTE)?;
     let n = steps.len();
     let mut out: Vec<Planned> = Vec::with_capacity(n);
     let mut steps: Vec<Option<Planned>> = steps.into_iter().map(Some).collect();
@@ -7348,7 +7348,7 @@ mod tests {
         );
         let out = g.add("res_ff", Op::Add, &[x, down_norm], vec![1, h], f);
         g.output(out);
-        crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g);
+        crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp);
 
         let mut w = Weights::new();
         for (k, s) in [("g0", 1u64), ("norm_w", 2), ("post_w", 3)] {
@@ -7861,7 +7861,7 @@ mod tests {
                 g.output(out);
                 let unfused = g.clone();
                 assert_eq!(
-                    crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+                    crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp),
                     1
                 );
                 let xs: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -10969,7 +10969,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let out = g.add("res", Op::Add, &[x, down], vec![1, h], f);
         g.output(out);
         assert_eq!(
-            crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+            crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp),
             1
         );
         let mut w = Weights::new();

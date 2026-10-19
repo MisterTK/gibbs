@@ -25,7 +25,7 @@ flowchart LR
   IR --> HP[host profile pass]
   HP --> Q[format selection + weight repack]
   Q --> L[layout pass]
-  L --> F[fusion / megakernel pass]
+  L --> F[fusion: e-graph saturation + extraction]
   F --> PL[placement pass]
   PL --> CPU[CPU executor: nn.rs]
   PL --> MTL[Metal: MSL JIT, MPP matmul2d/conv2d, binary-archive cache]

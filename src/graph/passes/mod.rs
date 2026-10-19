@@ -25,38 +25,20 @@ pub fn prefuse(graph: &mut Graph) {
     dtype_adapt::run(graph);
 }
 
-/// The fusion passes (or the e-graph) and the SSA check.
-pub fn fuse(graph: &mut Graph, mut weights: Option<&mut Weights>) -> Result<(), String> {
-    if *EGRAPH {
-        // Phase-3 stage 1: the same three fusions, chosen by equality saturation + extraction.
-        let r = crate::graph::egraph::fuse(
-            graph,
-            weights,
-            crate::graph::egraph::DEFAULT_RULES,
-            &crate::graph::egraph::CostModel::from_tune_cache(),
-            crate::graph::egraph::Budget::default(),
-        )?;
-        tracing::info!("egraph fusion: {r:?}, compile {:.1} ms", r.compile_ms());
-    } else {
-        // 1. Megakernel Fusion (fuses entire transformer blocks: RmsNorm -> Gate/Up -> SwiGlu -> Down -> Add)
-        megakernel::fuse_megakernel_blocks_pass(graph);
-
-        // 2. Gate-Up MLP Fusion (for any unfused MLP blocks)
-        fusion::fuse_gate_up_pass(graph, weights.as_deref_mut());
-
-        // 3. QKV Projection Fusion
-        fusion::fuse_qkv_pass(graph, weights.as_deref_mut());
-    }
-    // 4. Verify graph SSA integrity
-    validate_ssa(graph)?;
-
-    Ok(())
+/// The graph fusions (megakernel MLP, gate/up, QKV), chosen by equality saturation and cost-model
+/// extraction ([`crate::graph::egraph`]), and the SSA check.
+pub fn fuse(graph: &mut Graph, weights: Option<&mut Weights>) -> Result<(), String> {
+    let r = crate::graph::egraph::fuse(
+        graph,
+        weights,
+        crate::graph::egraph::DEFAULT_RULES,
+        &crate::graph::egraph::CostModel::from_tune_cache(),
+        crate::graph::egraph::Budget::default(),
+    )?;
+    tracing::info!("egraph fusion: {r:?}, compile {:.1} ms", r.compile_ms());
+    validate_ssa(graph)
 }
 
-/// `GIBBS_EGRAPH=1` replaces the fusion passes by [`crate::graph::egraph::fuse`] (read once).
-static EGRAPH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("GIBBS_EGRAPH").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
-});
 #[cfg(test)]
 mod tests {
     use super::*;
