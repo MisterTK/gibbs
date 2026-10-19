@@ -1499,6 +1499,8 @@ pub struct Session {
     dequant_scratch: Mutex<Option<Buffer>>,
     /// Per-slice partials of the split decode attention (grown to the largest).
     attn_scratch: Mutex<Option<Buffer>>,
+    /// Per-threadgroup (value, index) partials of the wide-row argmax (`ext::moe`).
+    argmax_scratch: Mutex<Option<Buffer>>,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -2148,6 +2150,7 @@ impl Session {
             mlp_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
+            argmax_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,

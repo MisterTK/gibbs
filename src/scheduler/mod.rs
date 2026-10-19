@@ -167,10 +167,18 @@ impl ExecutableModel {
         top_p: f32,
         kv_cache: &mut Option<SeqKvCache>,
     ) -> Result<u32, String> {
+        // Greedy (as `sample_logits` decides it): programs may pick the token on the device.
+        let greedy = temp <= 1e-4;
         let logits = match self {
             Self::Nano(m) => return Ok(m.read().forward_token(last_token, pos)),
             // `pos` counts `last_token` itself.
             Self::Native(m) => match kv_cache {
+                Some(SeqKvCache::Native(state)) if greedy => {
+                    match m.forward_greedy(&[last_token], pos - 1, state)? {
+                        crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok(t[0]),
+                        t => crate::model::native::logits_of(t)?,
+                    }
+                }
                 Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
                 _ => return Err(WRONG_KV.into()),
             },
@@ -217,11 +225,16 @@ impl ExecutableModel {
                             crate::graph::Tensor::U32(vec![last_token]),
                             crate::graph::Tensor::U32(vec![actual_pos]),
                         ];
-                        let out = p.run(inputs);
+                        let out = if greedy {
+                            p.run_greedy(inputs, model.tokenizer.vocab_size())
+                        } else {
+                            p.run(inputs)
+                        };
                         std::mem::swap(&mut p.state, state);
                         let out = out?;
                         match out.into_iter().next() {
                             Some(crate::graph::Tensor::F32(v)) => v,
+                            Some(crate::graph::Tensor::U32(t)) if t.len() == 1 => return Ok(t[0]),
                             _ => return Err("GraphProgram did not return F32 logits".into()),
                         }
                     }
