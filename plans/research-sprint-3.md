@@ -67,7 +67,7 @@ Implement every Luminal technique Gibbs does not use yet, and every TODO from th
 | :--- | :--- | :--- |
 | P0.1 kernel profile | `GIBBS_PROFILE_KERNELS=1 GIBBS_PROFILE_ROWS=40 target/release/gibbs --bench <one-model suite>` for M0, M1, M2, M7, M8 | µs per step kind and the 40 slowest steps: PLE GEMVs (M0/M1/M8), DeltaNet chain (M2), attention (M8), K-quant GEMVs (M1) |
 | P0.2 plan dump | `GIBBS_DUMP_PLAN=1` on M1, M2, M7 (and M0 for PLE) | separate q/k/v GEMVs per layer; PLE and DeltaNet step counts; materialized Slice/Concat steps |
-| P0.3 llama-bench refresh | `llama-bench -m <same GGUF> -p 0 -n 128 -r 3` for M0–M4 and M7 | refresh `autoresearch/bench-reference.json` `same_machine` (date, build), regenerate the README |
+| P0.3 llama-bench refresh | via `central_scheduler.py run --quiet`: `llama-bench -m <same GGUF> -p 0 -n 128 -r 3` for M0–M4 and M7; M8 adds `-d 5777` (the ctx4k prompt is 5777 tokens; confirm `-d/--n-depth` in `llama-bench --help`). M5 (safetensors) and M6 (bnb) stay n/a: no same-file llama.cpp run exists | refresh `autoresearch/bench-reference.json` `same_machine` (date, llama.cpp and ggml versions), regenerate the README |
 | P0.4 Wave 11 ABBA | `scripts/loop_verify.sh`, `5de3057` vs `4ff5e60`, quiet GPU | closes `rsi-44-w11` (currently merged, ABBA inconclusive) |
 | P0.5 same-model reference | new suite `bench/reference-7b.json` (Llama 2 7B Q4_0 and Q8_0, `ggml-org/Llama-2-7B-GGUF`); `bench/loop.json` stays frozen | puts Gibbs rows next to the published llama.cpp rows in README panel B |
 
@@ -76,12 +76,12 @@ Output: `autoresearch/sprint3-probes.md` with the raw tables. Each Phase 1 item 
 ## Phase 1 — Wave 12 priorities (in order)
 
 ### 1.1 Fused PLE subgraph (M0, M1, M8; M7 if P0.2 finds the pattern)
-- **Pattern (graph IR, generic):** `Linear([1,h]→[1,p])` → GELU → `Mul` with a contiguous `Slice` of a per-token side input `[1, L·p]` → `Linear([1,p]→[1,h])` → `RmsNorm` → `Add(residual)`, with `p ≤ 512`. Builder: `src/model/gemma4/text.rs` (the `ple.*` nodes around lines 1037–1050).
+- **Pattern (graph IR, generic; confirm the exact op chain in the builder and in P0.2 before coding):** `Linear([1,h]→[1,p])` → GELU → `Mul` with a contiguous `Slice` of a per-token side input `[1, L·p]` → `Linear([1,p]→[1,h])` → `RmsNorm` → `Add(residual)`, with `p ≤ 512`. Builder: `src/model/gemma4/text.rs` (the `ple.*` nodes around lines 1037–1050).
 - **Change:**
   1. Gate GEMV with a `GeluMulSide` epilogue that reads the side-input slice by offset (the slice becomes a Phase 2 view). The epilogue is a separate MSL helper outside the `GEMV-COMMON` markers, so `variants_hash` and the warm `TuneCache` keep their keys.
   2. Proj GEMV feeding the existing `rmsnorm_residual_f32` fusion.
   3. The target is 2–3 dispatches per layer instead of today's count, measured by P0.2.
-  4. A one-dispatch form needs either a grid barrier (the E1 failure mode) or one threadgroup streaming 442 KB per layer at roughly 1/16 of chip bandwidth. It goes to Phase 5 only if P0.1 shows the 256-column GEMVs are the cost.
+  4. A one-dispatch form needs either a grid barrier (the E1 failure mode) or one threadgroup streaming both PLE matrices per layer (check: if they are Q4_0 256×1536 as the `256|1536` / `1536|256` tune entries suggest, ~442 KB) on a single core of the 16. It goes to Phase 5 only if P0.1 shows the 256-column GEMVs are the cost.
 - **Read first:**
   - `git show fd58c71` (`gemv_q4_0_quarter`);
   - the `rsi-21` and `rsi-23` rows;
@@ -94,7 +94,7 @@ Output: `autoresearch/sprint3-probes.md` with the raw tables. Each Phase 1 item 
   - ABBA on the full suite.
 
 ### 1.2 Mixed-format Q/K/V projections (scope set by P0.2)
-- **Go condition:** P0.2 finds ≥ 30 separable q/k/v GEMV dispatches per token on some suite model. Known so far: M7 (mixed formats). M1 is already fused. M2 is unknown; Qwen3.5 has 6 GQA layers.
+- **Go condition:** P0.2 finds ≥ 30 separable q/k/v GEMV dispatches per token on some suite model. Known so far: M7 (mixed formats). M1 is already fused. M2 is unknown; P0.2 also records how many of its layers are attention vs DeltaNet.
 - **Change (option a):** in `fuse_qkv_pass` (`src/graph/passes/fusion.rs`), fuse the same-format pair (q,k) when v differs.
 - **Change (option b, only if a is insufficient):** a `GemvPackedMulti` with `x` read once into threadgroup memory. This is the piece F3 (row 29) lacked; note that L3 x-staging lost on single GEMVs.
 - **Hypothesis:** ≤ 36 µs/token on M7 (0.3%). Drop the item if P0.1 shows the separate GEMVs at the same GB/s as fused ones.
@@ -102,7 +102,7 @@ Output: `autoresearch/sprint3-probes.md` with the raw tables. Each Phase 1 item 
 ### 1.3 DeltaNet per-layer recurrent chain (M2, M3)
 - **Go condition:** P0.1 on M2 attributes ≥ 1 ms/token to the post-projection DeltaNet steps. Kind totals: `CausalConv1dCached`, `DeltaRule`, gating, norms.
 - **Change:** one generated kernel per DeltaNet layer for conv1d step + SiLU → q/k L2 norm → β/α gates → delta-rule state update → gated RmsNorm, one threadgroup per head.
-  - The recurrent state stays in device memory; at 128×128 f32 it is 64 KB per head, over the 8 KB threadgroup-memory occupancy limit.
+  - The recurrent state stays in device memory. Check its size per head from the model config (at 128×128 f32 it would be 64 KB, far over the 8 KB threadgroup-memory occupancy limit).
   - The fusion removes intermediate vectors and dispatches only. It differs from `rsi-15`/`rsi-18`, which fused 1–2 ops each.
 - **Reference:**
   - ggml-metal `gated_delta_net` (`/Users/keas/code/references/llama.cpp`), with llama.cpp at 148.3 tok/s on M2;
@@ -126,14 +126,14 @@ Output: `autoresearch/sprint3-probes.md` with the raw tables. Each Phase 1 item 
 Phases 2–4 below; ordered after 1.1–1.4 because each depends on Phase 0 data and on the Phase 2 IR change.
 
 ## Phase 2 — Zero-copy views (Luminal composed layouts)
-- **Today:** `aliases` in `src/graph/metal.rs` give offset aliasing, and `slice_half` (`metal.rs:6031-6071`) only recognizes last-axis halves feeding GLU. Other `Slice`, `Concat` and `Transpose` are materialized steps.
+- **Today:** `aliases` in `src/graph/metal.rs` give offset aliasing, and `slice_half` (`metal.rs:6031-6071`) only recognizes last-axis halves feeding GLU. Other `Slice` steps are planned as steps (`Op::Slice` in the Metal op list, `metal.rs:340`); P0.2 counts how many `Slice`, `Concat` and `Transpose` steps each suite plan actually materializes.
 - **2.1** A 2-D affine view `{base, offset, row_stride}` in `PlanValueLoc` for `Slice` on any axis and contiguous `Reshape`. Activation readers (GEMV `x`, elementwise, norm, attention q) take a stride parameter. Luminal: `crates/luminal_metal/src/kernels.rs:515-545` (`layout_read_index`), `layouts.rs`.
 - **2.2** Destination-passing `Concat`: producers write into their slot of the concat output. Luminal: `ToDps` / `alias_info` `Sharing::Must`, e.g. `ops/mul_reduce_sum/mod.rs:72-80`.
 - **2.3** Liveness in `allocate` follows the view root.
 - **Tests:** plan tests that a Slice→GEMV and a Concat of producers emit no copy step; parity on all fixtures; ABBA. P0.2's count of materialized steps sets the expected effect.
 
 ## Phase 3 — Equality saturation (egglog) over the step IR
-- **Why:** fusion today is a fixed order of destructive passes (`src/graph/passes/mod.rs:17-29`) plus greedy matches in `metal.rs` (`plan`, `batch_horizontal`, `fuse_moe_subgraphs`). W11a needed a commutation rule because of that ordering.
+- **Why:** fusion today is a fixed order of destructive passes (`src/graph/passes/mod.rs:17-29`) plus greedy matches in `metal.rs` (`plan`, `batch_horizontal`, `fuse_moe_subgraphs`). W11a had to add an explicit commutation step in `batch_horizontal` before interleaved q/k/v norms could batch; an e-graph keeps such orderings as alternatives instead.
 - **3.1** Add the `egglog` crate, pinned to the version luminal main uses. This is the sprint's only new dependency.
 - **3.2** Encode the post-Phase-2 step IR as egglog datatypes (GemvPacked, RmsNorm, Rope, Add, Mul, Gelu/SiLU, View, CachedAttention, MoE ops, DeltaRule).
 - **3.3** Port every current fusion as a non-destructive rewrite:
@@ -164,7 +164,7 @@ Phases 2–4 below; ordered after 1.1–1.4 because each depends on Phase 0 data
 - **Stop rule:** if the fused forms in 1.1/1.3 do not beat their multi-dispatch forms in ABBA, record E1 as closed.
 
 ## Phase 6 — Remaining deep-dive TODOs
-- **6.1** K-quant GEMV with 64-thread threadgroups (2 simdgroups × 4 rows; luminal 0.2 `quantized.rs:55-58`, ggml `kernel_mul_mv_q4_K_f32`) as a tuner variant for Q4_K/Q5_K/Q6_K (M1, M2). The TQ2_0 64-thread port was discarded (row 15); K-quants were not tried. Measure with `shape_rates` rotating ≥ 64 MB of weights.
+- **6.1** K-quant GEMV with 64-thread threadgroups (2 simdgroups × 4 rows, as in luminal 0.2 `quantized.rs:55-58`; check ggml-metal's `kernel_mul_mv_q4_K_f32` launch shape in `/Users/keas/code/references/llama.cpp` before porting) as a tuner variant for Q4_K/Q5_K/Q6_K (M1, M2). Confirm the current generated GEMV threadgroup size in `src/graph/codegen.rs` first. The TQ2_0 64-thread port was discarded (row 15); K-quants were not tried. Measure with `shape_rates` rotating ≥ 64 MB of weights.
 - **6.2** Re-measure `WIDE_Q4_K` `fused_dot` with ≥ 64 MB rotation; the `bg_231` legs were SLC-resident (Q6_K read 414.5 GB/s > ceiling). Keep Q6_K unfused.
 - **6.3** IQ2_XXS grid lookup: `uint` threadgroup staging or a constant-buffer binding (W11c), with the 7-round `moe_gemv_bandwidth` harness.
 - **6.4** DeltaNet state in bf16/f16 after 1.3; a parity study first.
