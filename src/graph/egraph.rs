@@ -55,7 +55,7 @@ use std::time::Instant;
 const FUSED_KEY_BASE: i64 = 1 << 40;
 
 const SCHEMA: &str = r#"
-(datatype W (Wt i64) (Cat2 W W) (Cat3 W W W))
+(datatype W (Wt i64) (Cat2 W W) (Cat3 W W W) (CatP W W))
 (datatype*
   (E (V i64)
      (Node i64 L)
@@ -71,7 +71,11 @@ const SCHEMA: &str = r#"
 (relation MkW (E))
 (function wrows (W) i64 :no-merge)
 (function wkey (W) String :no-merge)
+(function wdt (W) String :no-merge)
 (relation QkvIn (W))
+(relation GuOk (W))
+(relation FeedsAttn (E))
+(relation PairOdd (E E))
 (relation MlpDown (E E E i64 E E))
 (relation MlpGate (E E E E E i64 E E))
 (relation MlpUp (E E E E E i64 E E E))
@@ -140,10 +144,10 @@ impl Rule {
             Rule::GateUp => {
                 r#"
 (rule ((= s (Node lid (Cons g (Cons u (Nil))))) (K lid "Glu")
-       (= g (Lin gk x wg)) (= u (Lin uk x wu)) (!= gk uk)
-       (= key (wkey wg)) (= key (wkey wu)) (= rg (wrows wg)) (= ru (wrows wu)))
+       (= g (Lin gk x wg)) (= u (Lin uk x wu)) (!= gk uk) (GuOk wg) (GuOk wu)
+       (= key (wkey wg)) (= key (wkey wu)) (= rg (wrows wg)) (= ru (wrows wu)) (= dt (wdt wg)))
       ((let w (Cat2 wg wu))
-       (set (wrows w) (+ rg ru)) (set (wkey w) key) (QkvIn w)
+       (set (wrows w) (+ rg ru)) (set (wkey w) key) (set (wdt w) dt) (QkvIn w)
        (let f (Lin (+ lid 1099511627776) x w))
        (union g (Slice f 0 rg))
        (union u (Slice f rg (+ rg ru))))
@@ -164,6 +168,28 @@ impl Rule {
        (union k (Slice f rq (+ rq rk)))
        (union v (Slice f (+ rq rk) (+ rq (+ rk rv)))))
       :ruleset fuse :name "qkv")
+(rule ((= q (Lin kq x wq)) (= k (Lin kk x wk)) (< kq kk) (= v (Lin kv x wv)) (< kk kv)
+       (QkvIn wq) (QkvIn wk) (QkvIn wv)
+       (= dq (wdt wq)) (= dq (wdt wk)) (= dv (wdt wv)) (!= dq dv)
+       (= key (wkey wq)) (= key (wkey wk)) (FeedsAttn q) (FeedsAttn k)
+       (= x (Node xid xa))
+       (= rq (wrows wq)) (= rk (wrows wk)))
+      ((let f (Lin kq x (CatP wq wk)))
+       (PairOdd f v)
+       (union q (Slice f 0 rq))
+       (union k (Slice f rq (+ rq rk))))
+      :ruleset fuse :name "qkv-pair-qk")
+(rule ((= q (Lin kq x wq)) (= k (Lin kk x wk)) (< kq kk) (= v (Lin kv x wv)) (< kk kv)
+       (QkvIn wq) (QkvIn wk) (QkvIn wv)
+       (= dq (wdt wq)) (= dk (wdt wk)) (= dk (wdt wv)) (!= dq dk)
+       (= key (wkey wk)) (= key (wkey wv)) (FeedsAttn k) (FeedsAttn v)
+       (= x (Node xid xa))
+       (= rk (wrows wk)) (= rv (wrows wv)))
+      ((let f (Lin kk x (CatP wk wv)))
+       (PairOdd f q)
+       (union k (Slice f 0 rk))
+       (union v (Slice f rk (+ rk rv))))
+      :ruleset fuse :name "qkv-pair-kv")
 "#
             }
             Rule::QkvSlicesAttn => {
@@ -319,15 +345,16 @@ impl Report {
 }
 
 /// Concatenation class of weight `w` for the gate/up and QKV rules (`None`: never fused, as
-/// `concat_weight_tensors` / `matches_dtype` would refuse it).
-fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<String> {
+/// `concat_weight_tensors` / `matches_dtype` would refuse it), and whether it is a model-loader
+/// `Tensor::Mat` (QKV concatenates those with `Mat::concat_rows`; gate/up refuses them).
+fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<(String, bool)> {
     let val = g.value(w);
     if val.kind != ValueKind::Weight || val.shape.len() != 2 {
         return None;
     }
     let cols = val.shape[1];
     let storage = match weights {
-        None => "",
+        None => String::new(),
         Some(ws) => {
             let t = ws.get(&val.name)?;
             if !fusion::matches_dtype(val.dtype, t) {
@@ -337,17 +364,24 @@ fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<String> {
                 Tensor::Quantized(q) => match q.as_ref() {
                     crate::model::layers::QuantizedWeight::GgufQuantized {
                         in_features, ..
-                    } if *in_features == cols => "gguf",
+                    } if *in_features == cols => "gguf".into(),
                     crate::model::layers::QuantizedWeight::ZeroCopySlice {
                         in_features, ..
-                    } if *in_features == cols => "zc",
+                    } if *in_features == cols => "zc".into(),
                     _ => return None,
                 },
-                _ => "",
+                Tensor::Mat(m) if m.cols == cols => format!(
+                    "mat:{:?}",
+                    m.packed()
+                        .map_or(crate::hardware::QuantFormat::BF16, |p| p.format)
+                ),
+                Tensor::Mat(_) => return None,
+                _ => String::new(),
             }
         }
     };
-    Some(format!("{:?}/{cols}/{storage}", val.dtype))
+    let mat = storage.starts_with("mat:");
+    Some((format!("{:?}/{cols}/{storage}", val.dtype), mat))
 }
 
 /// The egglog facts of `g` (schema and rules excluded).
@@ -403,17 +437,25 @@ fn encode(g: &Graph, weights: Option<&Weights>) -> Result<String, String> {
             let _ = writeln!(p, "(OneRow (V {o}))");
         }
         if let (Op::Linear, [x, w]) = (&n.op, &n.inputs[..]) {
-            if let Some(key) = cat_key(g, *w, weights) {
+            if let Some((key, mat)) = cat_key(g, *w, weights) {
                 let wi = w.0 as usize;
                 if !w_declared[wi] {
                     w_declared[wi] = true;
                     let _ = writeln!(
                         p,
-                        "(set (wrows (Wt {wi})) {}) (set (wkey (Wt {wi})) \"{key}\") (QkvIn (Wt {wi}))",
-                        g.value(*w).shape[0]
+                        "(set (wrows (Wt {wi})) {}) (set (wkey (Wt {wi})) \"{key}\") \
+                         (set (wdt (Wt {wi})) \"{:?}\") (QkvIn (Wt {wi}))",
+                        g.value(*w).shape[0],
+                        g.value(*w).dtype
                     );
+                    if !mat {
+                        let _ = writeln!(p, "(GuOk (Wt {wi}))");
+                    }
                 }
                 let _ = writeln!(p, "(union (V {o}) (Lin {id} (V {}) (Wt {wi})))", x.0);
+                if fusion::feeds_attention(g, out) {
+                    let _ = writeln!(p, "(FeedsAttn (V {o}))");
+                }
             }
         }
     }
@@ -450,6 +492,8 @@ struct Group {
     keys: Vec<i64>,
     /// Anchor node id (`Mlp` / `Rewired`: the Add / attention node).
     anchor: i64,
+    /// QKV pair fusions: the class of the triple's unfused projection (the rewriter's third capture).
+    odd: Option<Value>,
 }
 
 struct Extract<'a> {
@@ -591,11 +635,19 @@ pub fn fuse(
     for (c, ch) in rows_of("Wt")? {
         wterm.insert(c, Ok(ValueId(int(ch[0]) as u32)));
     }
-    for name in ["Cat2", "Cat3"] {
+    let mut catp: HashSet<Value> = HashSet::new();
+    for name in ["Cat2", "Cat3", "CatP"] {
         for (c, ch) in rows_of(name)? {
+            if name == "CatP" {
+                catp.insert(c);
+            }
             wterm.insert(c, Err(ch));
         }
     }
+    let pair_odd: HashMap<Value, Value> = rows_of("PairOdd")?
+        .into_iter()
+        .map(|(_, ch)| (ch[0], ch[1]))
+        .collect();
     let wleaves = |w: Value| -> Vec<ValueId> {
         let (mut out, mut stack) = (Vec::new(), vec![w]);
         while let Some(w) = stack.pop() {
@@ -663,10 +715,10 @@ pub fn fuse(
             + cost.act_us((rows(&xv.shape) * out_rows * 4) as f64);
         fused_kind.insert(
             c,
-            if parts.len() == 2 {
-                Kind::GateUp
-            } else {
+            if catp.contains(&ch[2]) || parts.len() == 3 {
                 Kind::Qkv
+            } else {
+                Kind::GateUp
             },
         );
         classes.insert(
@@ -702,6 +754,7 @@ pub fn fuse(
                 members: Vec::new(),
                 keys: Vec::new(),
                 anchor: -1,
+                odd: pair_odd.get(&f).copied(),
             });
             groups.len() - 1
         });
@@ -734,6 +787,7 @@ pub fn fuse(
                     members: vec![(c, class.nodes.len() - 1)],
                     keys: vec![anchor],
                     anchor,
+                    odd: None,
                 });
             }
             Ok(())
@@ -766,6 +820,9 @@ pub fn fuse(
         gr.members
             .iter()
             .all(|&(c, _)| ex.live(c) && ex.choice.get(&c).copied().unwrap_or(0) == 0)
+            && gr
+                .odd
+                .is_none_or(|c| ex.choice.get(&c).copied().unwrap_or(0) == 0)
     };
     let mut order: Vec<(i64, usize)> = Vec::with_capacity(groups.len());
     for (i, gr) in groups.iter().enumerate() {
@@ -821,7 +878,9 @@ pub fn fuse(
     let member_vals = |gr: &Group| -> Vec<Result<ValueId, ValueId>> {
         gr.members
             .iter()
-            .map(|(c, _)| match value_of.get(c) {
+            .map(|(c, _)| c)
+            .chain(&gr.odd)
+            .map(|c| match value_of.get(c) {
                 Some(v) => Ok(*v),
                 None => Err(orig_out(classes[c].key - FUSED_KEY_BASE)),
             })
@@ -1224,9 +1283,9 @@ mod tests {
             [4, 0, 4, 0],
             [0; 4],
             [1, 0, 1, 0],
-            [0; 4],
-            [2, 0, 0, 0],
-            [0; 4],
+            [0, 0, 2, 0],
+            [2, 0, 2, 0],
+            [0, 0, 4, 0],
         ];
         for ((what, gw), want) in models.iter().zip(want) {
             let r = check(what, gw);
