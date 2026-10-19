@@ -11,6 +11,7 @@ pub mod avenues;
 pub mod codec;
 pub mod codegen;
 pub mod coreml;
+pub mod egraph;
 pub mod cpu;
 pub mod cuda;
 pub mod level_zero;

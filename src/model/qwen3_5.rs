@@ -426,6 +426,16 @@ pub fn load_gguf(
     .map(|r| r.map_err(|e| format!("{}: {e}", path.display())))
 }
 
+/// Decode graph and weights of a GGUF [`load_gguf`] takes, built on the host without a device
+/// (graph-compiler tests on real checkpoints).
+pub fn gguf_decode_graph(
+    path: &std::path::Path,
+) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    let (manifest, data) = crate::model::loaders::gguf::open(path)?;
+    let (ck, cfg, arch) = gguf_checkpoint(&Arc::new(data), &manifest)?;
+    TextModel::load(&ck, &cfg, arch)?.to_decode_graph()
+}
+
 fn gguf_model(
     map: &Arc<crate::model::loaders::gguf::GgufData>,
     m: &crate::model::ModelManifest,
