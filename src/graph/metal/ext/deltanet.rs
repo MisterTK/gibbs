@@ -466,7 +466,7 @@ pub(super) fn encode(
     #[repr(C)]
     struct DeltaNetParams {
         channels: u32,
-        kernel: u32,
+        taps: u32,
         dilation: u32,
         key_heads: u32,
         key_dim: u32,
@@ -483,7 +483,7 @@ pub(super) fn encode(
     let u = |v: usize| v as u32;
     let p = DeltaNetParams {
         channels: u(2 * st.key_heads * st.key_dim + st.val_heads * st.val_dim),
-        kernel: u(st.kernel),
+        taps: u(st.kernel),
         dilation: u(st.dilation),
         key_heads: u(st.key_heads),
         key_dim: u(st.key_dim),

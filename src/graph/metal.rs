@@ -7932,6 +7932,105 @@ mod tests {
         assert!(rel_err(&want, &got) < 1e-5);
     }
 
+    /// Every kernel source this build emits compiles to a pipeline: the hand library as MSL 4.0
+    /// with MPP, each generated GEMV (`gen` and `gen64`) and dequant variant, each expert-GEMV grid
+    /// binding, and the fused GeGlu→GEMV chain. Compile only: nothing is dispatched and no
+    /// runtime (host-profile measurement) is created.
+    #[test]
+    fn every_kernel_source_compiles() {
+        use crate::graph::codegen::{self, GemvParams, Iq2Grid};
+        let device = Device::system_default().expect("Metal device");
+        let (_, mpp) = compile(&device).expect("kernel library");
+        mpp.expect("MSL 4.0 kernel library");
+        let build = |src: &str, name: &str| {
+            let opts = CompileOptions::new();
+            opts.set_fast_math_enabled(false);
+            let lib = device
+                .new_library_with_source(src, &opts)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        };
+        let head = "#include <metal_stdlib>\nusing namespace metal;\n";
+        let common = codegen::gemv_common(&KERNELS_MSL);
+        let mut codecs: Vec<&codec::Codec> = Vec::new();
+        for f in [
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_1,
+            QuantFormat::GGUF_Q5_0,
+            QuantFormat::GGUF_Q5_1,
+            QuantFormat::GGUF_Q8_0,
+            QuantFormat::GGUF_Q2_K,
+            QuantFormat::GGUF_Q3_K,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q5_K_M,
+            QuantFormat::GGUF_Q6_K,
+            QuantFormat::GGUF_IQ4_NL,
+            QuantFormat::GGUF_IQ4_XS,
+            QuantFormat::GGUF_IQ3_XXS,
+            QuantFormat::GGUF_IQ3_S,
+            QuantFormat::GGUF_IQ2_XXS,
+            QuantFormat::GGUF_IQ2_XS,
+            QuantFormat::GGUF_IQ2_S,
+            QuantFormat::GGUF_IQ2_M,
+            QuantFormat::GGUF_IQ1_S,
+            QuantFormat::GGUF_TQ1_0,
+            QuantFormat::GGUF_TQ2_0,
+            QuantFormat::GGUF_NVFP4,
+        ] {
+            if let Some(c) = codec::codec(f) {
+                if !codecs.iter().any(|d| d.format == c.format) {
+                    codecs.push(c);
+                }
+            }
+        }
+        for &c in &codecs {
+            let variants = tune::GEN_ROWS
+                .iter()
+                .map(|&r| tune::GemvVariant::generated(r))
+                .chain(
+                    tune::gen64_rows(c.format)
+                        .iter()
+                        .map(|&r| tune::GemvVariant::generated64(r)),
+                );
+            for v in variants {
+                let p = v.gen_params();
+                build(
+                    &format!("{head}{common}{}", codegen::gemv_packed(c, p)),
+                    &codegen::gemv_packed_name(c, p),
+                );
+            }
+            build(
+                &format!("{head}{}", codegen::dequant_packed(c)),
+                &codegen::dequant_packed_name(c),
+            );
+            for r in [2, 4] {
+                let p = GemvParams {
+                    rows_per_sg: r,
+                    ..Default::default()
+                };
+                let grids: &[Iq2Grid] = if c.format == QuantFormat::GGUF_IQ2_XXS {
+                    &[Iq2Grid::Program, Iq2Grid::Threadgroup, Iq2Grid::Buffer]
+                } else {
+                    &[Iq2Grid::Program]
+                };
+                for &grid in grids {
+                    let src = codegen::iq2_grid_msl(codegen::gemv_indexed(c, p), grid)
+                        .unwrap_or_else(|e| panic!("{:?} {grid:?}: {e}", c.format));
+                    build(&format!("{head}{src}"), &codegen::gemv_indexed_name(c, p));
+                }
+            }
+            build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
+        }
+        let (q4_0, q4_k) = (
+            codec::codec(QuantFormat::GGUF_Q4_0).unwrap(),
+            codec::codec(QuantFormat::GGUF_Q4_K_M).unwrap(),
+        );
+        build(&ext::ple::kernel_src(q4_0, q4_k), &ext::ple::kernel_name(q4_0, q4_k));
+    }
+
     /// Every packed format (generated and hand kernels): the GPU GEMV equals the CPU executor
     /// (which dequantizes through `dequantize_*_block`), with and without a bias epilogue.
     #[test]

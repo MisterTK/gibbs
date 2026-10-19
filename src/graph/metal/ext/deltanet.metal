@@ -3,7 +3,7 @@
 
 struct DeltaNetParams {
     uint channels;     // conv channels: 2 * key_heads * key_dim + val_heads * val_dim
-    uint kernel;       // conv taps
+    uint taps;         // conv taps (`kernel` is reserved in MSL)
     uint dilation;
     uint key_heads;
     uint key_dim;
@@ -47,7 +47,7 @@ struct DnBF16 {
 // One-token causal conv of channel `c` over [state rows, x], shifting x into the state; then SiLU.
 static inline float dn_conv_silu(device const float* x, device const float* w, device float* cs,
                                  uint c, constant DeltaNetParams& p) {
-    const uint k = p.kernel, d = p.dilation, hist = (k - 1) * d, n = p.channels;
+    const uint k = p.taps, d = p.dilation, hist = (k - 1) * d, n = p.channels;
     float acc = 0.0f;
     for (uint tap = 0; tap < k; ++tap) {
         const uint back = (k - 1 - tap) * d;

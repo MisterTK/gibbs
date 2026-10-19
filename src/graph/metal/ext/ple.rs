@@ -158,12 +158,12 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
     v == w_a || v == w_b
 }
 
-fn kernel_name(a: &Codec, b: &Codec) -> String {
+pub(in super::super) fn kernel_name(a: &Codec, b: &Codec) -> String {
     format!("glu_gemv_chain_{:?}_{:?}", a.format, b.format)
 }
 
 /// Buffers `w_a, x, y, uint3(cols, mid, rows), side, w_b`; 256-thread groups.
-fn kernel_src(a: &Codec, b: &Codec) -> String {
+pub(in super::super) fn kernel_src(a: &Codec, b: &Codec) -> String {
     let (da, db) = (
         format!("decode8_{:?}", a.format),
         format!("decode8_{:?}", b.format),
