@@ -149,12 +149,12 @@ impl Decisions {
     }
 }
 
-fn err(e: egglog::Error) -> String {
+pub(super) fn err(e: egglog::Error) -> String {
     format!("planner e-graph: {e}")
 }
 
 /// The rows of the all-`i64` relation `name`.
-fn relation(eg: &EGraph, name: &str) -> Result<Vec<Vec<i64>>, String> {
+pub(super) fn relation(eg: &EGraph, name: &str) -> Result<Vec<Vec<i64>>, String> {
     let mut out = Vec::new();
     eg.constructor_enodes(name, |en| {
         out.push(
@@ -545,4 +545,306 @@ pub(super) fn batches(
         .map(|r| r[0] as usize)
         .collect();
     Ok(b)
+}
+
+/// One MoE subgraph fusion [`moe`] extracts, at its first step.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum MoeFusion {
+    /// TopK + GatherCols(logits) + Softmax (3 steps): the softmax output becomes TopK's weights.
+    TopKSoftmax { weights: ValueId },
+    /// ... + GatherCols(scale) + Mul (5 steps): scaled weights.
+    TopKSoftmaxScaled { scale: ValueId, weights: ValueId },
+    /// Copy(lower half) + Copy(upper half) + GeGlu/SwiGlu (3 steps) of one `[rows, 2 * half]` value.
+    SplitGlu {
+        x: ValueId,
+        rows: usize,
+        half_cols: usize,
+        kind: u32,
+    },
+    /// Mul([slots, h] by [slots, 1]) + Reduce(Sum) over `k` (2 steps).
+    WeightedSum {
+        down: ValueId,
+        weights: ValueId,
+        n: usize,
+        k: usize,
+        h: usize,
+    },
+}
+
+impl MoeFusion {
+    /// Steps the fusion replaces, starting at its position.
+    pub fn len(&self) -> usize {
+        match self {
+            MoeFusion::TopKSoftmax { .. } | MoeFusion::SplitGlu { .. } => 3,
+            MoeFusion::TopKSoftmaxScaled { .. } => 5,
+            MoeFusion::WeightedSum { .. } => 2,
+        }
+    }
+}
+
+/// Step-window facts of [`moe`]: `Single v` (one reader across steps and graph outputs, by alias
+/// root), `Solo p` (no extra outputs), and per-kind step fields.
+const MOE_PROGRAM: &str = r#"
+(relation Single (i64))
+(relation Solo (i64))
+(relation TopK (i64 i64 i64 i64 i64 i64))
+(relation Gat (i64 i64 i64 i64 i64 i64 i64 i64))
+(relation Smax (i64 i64 i64 i64 i64))
+(relation Bin (i64 i64 i64 i64 i64 i64 i64))
+(relation Copy1 (i64 i64))
+(relation Glu (i64 i64 i64 i64 i64 i64))
+(relation Half (i64 i64 i64 i64 i64))
+(relation RedSum (i64 i64 i64 i64 i64 i64 i64 i64))
+(relation Shape2 (i64 i64 i64))
+(relation MoeTopK (i64 i64))
+(relation MoeScaled (i64 i64 i64))
+(relation SplitG (i64 i64 i64 i64 i64))
+(relation WSum (i64 i64 i64 i64 i64 i64 i64))
+(ruleset moe)
+; TopK(logits) -> ids; GatherCols(logits, ids) single-use; Softmax over k.
+(rule ((TopK p l rows cols k ids) (= p1 (+ p 1)) (Gat p1 l ids tot cols k 0 go) (= tot (* rows k))
+       (Single go) (= p2 (+ p 2)) (Smax p2 go rows k so))
+      ((MoeTopK p so)) :ruleset moe)
+(rule ((TopK p l 1 cols k ids) (= p1 (+ p 1)) (Gat p1 l ids k cols k 1 go)
+       (Single go) (= p2 (+ p 2)) (Smax p2 go 1 k so))
+      ((MoeTopK p so)) :ruleset moe)
+; ... * GatherCols(scale table, ids) (shared), both single-use.
+(rule ((MoeTopK p so) (TopK p l rows cols k ids) (Single so) (= p3 (+ p 3))
+       (Gat p3 sct ids tot cols k 1 sco) (= tot (* rows k)) (Single sco)
+       (= p4 (+ p 4)) (Bin p4 so sco tot 2 1 wo))
+      ((MoeScaled p sct wo)) :ruleset moe)
+(rule ((MoeTopK p so) (TopK p l rows cols k ids) (Single so) (= p3 (+ p 3))
+       (Gat p3 sct ids tot cols k 1 sco) (= tot (* rows k)) (Single sco)
+       (= p4 (+ p 4)) (Bin p4 sco so tot 2 1 wo))
+      ((MoeScaled p sct wo)) :ruleset moe)
+; Copy, Copy, Glu(gate, up): gate the lower and up the upper last-axis half of one value.
+(rule ((Copy1 p o0) (Solo p) (= p1 (+ p 1)) (Copy1 p1 o1) (Solo p1) (= p2 (+ p 2))
+       (Glu p2 o0 o1 n kind go) (Single o0) (Single o1)
+       (Half o0 src r hc 0) (Half o1 src r hc 1) (= n (* r hc)))
+      ((SplitG p src r hc kind)) :ruleset moe)
+(rule ((Copy1 p o0) (Solo p) (= p1 (+ p 1)) (Copy1 p1 o1) (Solo p1) (= p2 (+ p 2))
+       (Glu p2 o1 o0 n kind go) (Single o0) (Single o1)
+       (Half o1 src r hc 0) (Half o0 src r hc 1) (= n (* r hc)))
+      ((SplitG p src r hc kind)) :ruleset moe)
+; Mul(down [slots, h], w [slots, 1]) single-use, then its Sum over k: WSum p down w n k h.
+(rule ((Bin p a b mn 2 rk mo) (Solo p) (Single mo) (= p1 (+ p 1)) (RedSum p1 mo 0 nout ro n k h)
+       (Solo p1) (= slots (* n k)) (Shape2 mo slots h) (= mn (* slots h)) (= nout (* n h))
+       (Shape2 a slots h) (Shape2 b slots 1))
+      ((WSum p 0 a b n k h)) :ruleset moe)
+(rule ((Bin p a b mn 2 rk mo) (Solo p) (Single mo) (= p1 (+ p 1)) (RedSum p1 mo 0 nout ro n k h)
+       (Solo p1) (= slots (* n k)) (Shape2 mo slots h) (= mn (* slots h)) (= nout (* n h))
+       (Shape2 b slots h) (Shape2 a slots 1))
+      ((WSum p 1 b a n k h)) :ruleset moe)
+(run-schedule (saturate (run moe)))
+"#;
+
+/// The last-axis half `v` copies, when `v` is `Slice(src)` of exactly the lower or upper half of an
+/// even last axis: `(src, rows, half, upper)`.
+fn slice_half(g: &Graph, v: ValueId) -> Option<(ValueId, usize, usize, bool)> {
+    let ValueKind::Node(nid) = g.value(v).kind else {
+        return None;
+    };
+    let node = &g.nodes[nid.0 as usize];
+    let Op::Slice { axis, start, end } = node.op else {
+        return None;
+    };
+    let src = *node.inputs.first()?;
+    let sh = &g.value(src).shape;
+    let rank = sh.len();
+    let ax = if axis < 0 { axis + rank as isize } else { axis };
+    if rank < 2 || ax != rank as isize - 1 {
+        return None;
+    }
+    let cols = sh[rank - 1];
+    if cols == 0 || cols % 2 != 0 {
+        return None;
+    }
+    let half = cols / 2;
+    let rows: usize = sh[..rank - 1].iter().product();
+    let dim = cols as i64;
+    let clamp = |x: i64| {
+        if x < 0 {
+            (dim + x).max(0) as usize
+        } else {
+            x.min(dim) as usize
+        }
+    };
+    match (clamp(start), clamp(end)) {
+        (0, e) if e == half => Some((src, rows, half, false)),
+        (s, e) if s == half && e == cols => Some((src, rows, half, true)),
+        _ => None,
+    }
+}
+
+/// Saturates the MoE window rules over `steps` and extracts, in step order, the fusion each
+/// window start takes (scaled TopK before plain TopK; for a weighted sum, `down` is the first
+/// operand when both operand orders fit).
+pub(super) fn moe(
+    g: &Graph,
+    steps: &[Planned],
+    aliases: &HashMap<ValueId, (ValueId, usize)>,
+) -> Result<HashMap<usize, MoeFusion>, String> {
+    use super::ext::{elementwise, movement, norm, ExtStep};
+    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
+    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
+    for v in steps.iter().flat_map(|s| &s.reads).chain(&g.outputs) {
+        *use_count.entry(root(*v)).or_default() += 1;
+    }
+    let vi = |v: ValueId| v.0 as i64;
+    let mut eg = EGraph::default();
+    let (schema, run) = MOE_PROGRAM.split_at(MOE_PROGRAM.find("(run-schedule").expect("schedule"));
+    eg.parse_and_run_program(None, schema).map_err(err)?;
+    eg.update(|mut fs| -> Result<(), egglog::Error> {
+        for (v, _) in use_count.iter().filter(|(_, &n)| n == 1) {
+            fs.add("Single", vi(*v))?;
+        }
+        let shape2 = |fs: &mut egglog::FullState<'_, '_>, v: ValueId| match g.value(v).shape[..] {
+            [a, b] => fs.add("Shape2", (vi(v), a as i64, b as i64)).map(|_| ()),
+            _ => Ok(()),
+        };
+        for (p, s) in steps.iter().enumerate() {
+            let pi = p as i64;
+            if s.extra_outs.is_empty() {
+                fs.add("Solo", pi)?;
+            }
+            let o = vi(s.out);
+            match &s.op {
+                Step::Ext(ExtStep::Experts(super::ext::moe::Step::TopK {
+                    x,
+                    rows,
+                    cols,
+                    k,
+                    weights_out: None,
+                    scale: None,
+                })) if *k <= 32 => {
+                    let f = (pi, vi(*x), *rows as i64, *cols as i64, *k as i64, o);
+                    fs.add("TopK", f)?;
+                }
+                Step::Ext(ExtStep::Experts(super::ext::moe::Step::GatherCols {
+                    x,
+                    idx,
+                    total,
+                    cols,
+                    k,
+                    shared,
+                })) => {
+                    let f = (pi, vi(*x), vi(*idx), *total as i64, *cols as i64, *k as i64);
+                    fs.add("Gat", (f.0, f.1, f.2, f.3, f.4, f.5, *shared as i64, o))?;
+                }
+                Step::Ext(ExtStep::Norm(norm::Step::Softmax {
+                    x,
+                    outer,
+                    n,
+                    inner: 1,
+                })) => {
+                    fs.add("Smax", (pi, vi(*x), *outer as i64, *n as i64, o))?;
+                }
+                Step::Ext(ExtStep::Elementwise(elementwise::Step::Binary {
+                    a,
+                    b,
+                    n,
+                    kind,
+                    rank,
+                    ..
+                })) => {
+                    let f = (pi, vi(*a), vi(*b), *n as i64, *kind as i64, *rank as i64, o);
+                    fs.add("Bin", f)?;
+                    for v in [*a, *b, s.out] {
+                        shape2(&mut fs, v)?;
+                    }
+                }
+                Step::Ext(ExtStep::Movement(movement::Step::Copy { fill: None, parts }))
+                    if parts.len() == 1 =>
+                {
+                    fs.add("Copy1", (pi, o))?;
+                }
+                Step::GeGlu { gate, up, n } | Step::SwiGlu { gate, up, n } => {
+                    let kind = if matches!(s.op, Step::GeGlu { .. }) {
+                        1
+                    } else {
+                        2
+                    };
+                    fs.add("Glu", (pi, vi(*gate), vi(*up), *n as i64, kind, o))?;
+                    for v in [*gate, *up] {
+                        if let Some((src, rows, half, upper)) = slice_half(g, v) {
+                            let f = (vi(v), vi(src), rows as i64, half as i64, upper as i64);
+                            fs.add("Half", f)?;
+                        }
+                    }
+                }
+                Step::Ext(ExtStep::Norm(norm::Step::Reduce { x, n_out, .. })) => {
+                    let ValueKind::Node(nid) = g.value(s.out).kind else {
+                        continue;
+                    };
+                    let Op::Reduce {
+                        kind: crate::graph::ReduceKind::Sum,
+                        axes,
+                        ..
+                    } = &g.nodes[nid.0 as usize].op
+                    else {
+                        continue;
+                    };
+                    let rsh = &g.value(*x).shape;
+                    let ax = match axes[..] {
+                        [a] if a < 0 => a + rsh.len() as isize,
+                        [a] => a,
+                        _ => continue,
+                    };
+                    if ax < 0 || ax as usize >= rsh.len() {
+                        continue;
+                    }
+                    let ax = ax as usize;
+                    let n: usize = rsh[..ax].iter().product();
+                    let h: usize = rsh[ax + 1..].iter().product();
+                    let (rx, off) = aliases.get(x).copied().unwrap_or((*x, 0));
+                    let f = (pi, vi(rx), off as i64, *n_out as i64, o, n as i64);
+                    fs.add(
+                        "RedSum",
+                        (f.0, f.1, f.2, f.3, f.4, f.5, rsh[ax] as i64, h as i64),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .map_err(err)?;
+    eg.parse_and_run_program(None, run).map_err(err)?;
+
+    let v = |x: i64| ValueId(x as u32);
+    let mut d: HashMap<usize, MoeFusion> = HashMap::new();
+    // Lowest priority first: later inserts at the same start win.
+    let mut wsum = relation(&eg, "WSum")?;
+    wsum.sort_by_key(|r| std::cmp::Reverse(r[1]));
+    for r in wsum {
+        let (n, k, h) = (r[4] as usize, r[5] as usize, r[6] as usize);
+        let f = MoeFusion::WeightedSum {
+            down: v(r[2]),
+            weights: v(r[3]),
+            n,
+            k,
+            h,
+        };
+        d.insert(r[0] as usize, f);
+    }
+    for r in relation(&eg, "SplitG")? {
+        let f = MoeFusion::SplitGlu {
+            x: v(r[1]),
+            rows: r[2] as usize,
+            half_cols: r[3] as usize,
+            kind: r[4] as u32,
+        };
+        d.insert(r[0] as usize, f);
+    }
+    for r in relation(&eg, "MoeTopK")? {
+        d.insert(r[0] as usize, MoeFusion::TopKSoftmax { weights: v(r[1]) });
+    }
+    for r in relation(&eg, "MoeScaled")? {
+        let f = MoeFusion::TopKSoftmaxScaled {
+            scale: v(r[1]),
+            weights: v(r[2]),
+        };
+        d.insert(r[0] as usize, f);
+    }
+    Ok(d)
 }

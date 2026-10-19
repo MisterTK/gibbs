@@ -65,84 +65,123 @@ fn gemv_codec(st: &Core, cols: usize) -> Option<&'static Codec> {
     codec(format.codec_format()?).filter(|c| cols % c.block_elems as usize == 0)
 }
 
-/// Rewrites each `GemvPacked{GeGlu, side}` → `GemvPacked` pair (see the module doc) into one
-/// [`Step::GluGemvChain`] at the first step's position. `act` must have no other reader, view, or
-/// graph-output use.
+/// The `ple-chain` rule: an m = 1 `GemvPacked{GeGlu, side}` whose output `act` (`PleA p act mid`) has
+/// a first reader `j` that is a plain m = 1 `GemvPacked` of `act` over `mid` columns (`PleB`).
+const PROGRAM: &str = r#"
+(relation PleA (i64 i64 i64))
+(relation FirstReader (i64 i64))
+(relation PleB (i64 i64 i64))
+(relation Ple (i64 i64))
+(ruleset ple)
+(rule ((PleA p act mid) (FirstReader act j) (PleB j act mid)) ((Ple p j)) :ruleset ple)
+"#;
+
+/// Rewrites each `GemvPacked{GeGlu, side}` → `GemvPacked` pair (see the module doc) the `ple-chain`
+/// rule matches into one [`Step::GluGemvChain`] at the first step's position. `act` must have no
+/// other reader, view, or graph-output use.
 pub(in super::super) fn fuse(
     g: &Graph,
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
-) {
+) -> Result<(), String> {
+    use super::super::fuse::{err, relation};
+    use egglog::Write as _;
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let mut uses: HashMap<ValueId, usize> = HashMap::new();
     for v in steps.iter().flat_map(|s| s.reads.iter()).chain(&g.outputs) {
         *uses.entry(root(*v)).or_default() += 1;
     }
-    let mut i = 0;
-    while i < steps.len() {
-        let a = &steps[i];
-        let Core::GemvPacked {
-            x,
-            w: w_a,
-            bias: None,
-            res: Some(side),
-            epi: Epi::GeGlu,
-            m: 1,
-            rows: mid,
-            cols,
-            ..
-        } = a.op
-        else {
-            i += 1;
-            continue;
-        };
-        let act = a.out;
-        let found = (mid <= MAX_MID && a.extra_outs.is_empty() && uses.get(&act) == Some(&1))
-            .then(|| gemv_codec(&a.op, cols))
-            .flatten()
-            .and_then(|ca| {
-                let j = i + 1 + steps[i + 1..].iter().position(|s| s.reads.contains(&act))?;
-                let b = &steps[j];
-                match b.op {
-                    Core::GemvPacked {
-                        x: bx,
-                        w: w_b,
-                        bias: None,
-                        res: None,
-                        epi: Epi::None,
-                        m: 1,
-                        rows,
-                        cols: bc,
-                        ..
-                    } if bx == act && bc == mid && b.extra_outs.is_empty() => {
-                        let cb = gemv_codec(&b.op, mid)?;
-                        Some((j, w_b, rows, ca.format, cb.format))
+    let mut eg = egglog::EGraph::default();
+    eg.parse_and_run_program(None, PROGRAM).map_err(err)?;
+    eg.update(|mut fs| -> Result<(), egglog::Error> {
+        for (p, s) in steps.iter().enumerate() {
+            let solo = s.extra_outs.is_empty();
+            match s.op {
+                Core::GemvPacked {
+                    bias: None,
+                    res: Some(_),
+                    epi: Epi::GeGlu,
+                    m: 1,
+                    rows: mid,
+                    cols,
+                    ..
+                } if mid <= MAX_MID
+                    && solo
+                    && uses.get(&s.out) == Some(&1)
+                    && gemv_codec(&s.op, cols).is_some() =>
+                {
+                    let act = s.out.0 as i64;
+                    fs.add("PleA", (p as i64, act, mid as i64))?;
+                    if let Some(j) = steps[p + 1..].iter().position(|t| t.reads.contains(&s.out)) {
+                        fs.add("FirstReader", (act, (p + 1 + j) as i64))?;
                     }
-                    _ => None,
                 }
-            });
-        let Some((j, w_b, rows, fmt_a, fmt_b)) = found else {
-            i += 1;
+                Core::GemvPacked {
+                    x,
+                    bias: None,
+                    res: None,
+                    epi: Epi::None,
+                    m: 1,
+                    cols,
+                    ..
+                } if solo && gemv_codec(&s.op, cols).is_some() => {
+                    fs.add("PleB", (p as i64, x.0 as i64, cols as i64))?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .map_err(err)?;
+    eg.parse_and_run_program(None, "(run-schedule (saturate (run ple)))")
+        .map_err(err)?;
+    let chains: HashMap<usize, usize> = relation(&eg, "Ple")?
+        .iter()
+        .map(|r| (r[0] as usize, r[1] as usize))
+        .collect();
+    let mut old: Vec<Option<Planned>> = std::mem::take(steps).into_iter().map(Some).collect();
+    for p in 0..old.len() {
+        let Some(mut a) = old[p].take() else {
             continue;
         };
-        let b = steps.remove(j);
-        let a = &mut steps[i];
-        a.name = format!("{}+{}", a.name, b.name);
-        a.op = Core::Ext(ExtStep::Ple(Step::GluGemvChain {
-            x,
-            w_a,
-            side,
-            w_b,
-            cols,
-            mid,
-            rows,
-            fmt_a,
-            fmt_b,
-        }));
-        a.out = b.out;
-        a.reads = vec![x, w_a, side, w_b];
-        i += 1;
+        if let Some(&j) = chains.get(&p) {
+            let b = old[j].take().expect("a chain's second step is taken once");
+            let (
+                &Core::GemvPacked {
+                    x,
+                    w: w_a,
+                    res: Some(side),
+                    rows: mid,
+                    cols,
+                    ..
+                },
+                &Core::GemvPacked { w: w_b, rows, .. },
+            ) = (&a.op, &b.op)
+            else {
+                unreachable!("ple-chain matches GemvPacked pairs")
+            };
+            let (fmt_a, fmt_b) = (
+                gemv_codec(&a.op, cols).expect("matched").format,
+                gemv_codec(&b.op, mid).expect("matched").format,
+            );
+            a.name = format!("{}+{}", a.name, b.name);
+            a.op = Core::Ext(ExtStep::Ple(Step::GluGemvChain {
+                x,
+                w_a,
+                side,
+                w_b,
+                cols,
+                mid,
+                rows,
+                fmt_a,
+                fmt_b,
+            }));
+            a.out = b.out;
+            a.reads = vec![x, w_a, side, w_b];
+        }
+        steps.push(a);
     }
+    Ok(())
 }
 
 pub(super) fn reads(st: &Step) -> Vec<ValueId> {
@@ -391,7 +430,7 @@ mod tests {
         );
 
         let mut fused = steps;
-        fuse(&g, &mut fused, &aliases);
+        fuse(&g, &mut fused, &aliases).unwrap();
         let fused = kinds(&batch_horizontal(fused, &aliases).unwrap());
         eprintln!("fused: {fused:?}");
         assert_eq!(
@@ -413,7 +452,7 @@ mod tests {
         g.output(act);
         let (mut steps, aliases) = plan(&g).unwrap();
         let n = steps.len();
-        fuse(&g, &mut steps, &aliases);
+        fuse(&g, &mut steps, &aliases).unwrap();
         assert_eq!(steps.len(), n);
 
         let g = chain_graph(
@@ -425,7 +464,7 @@ mod tests {
         );
         let (mut steps, aliases) = plan(&g).unwrap();
         let n = steps.len();
-        fuse(&g, &mut steps, &aliases);
+        fuse(&g, &mut steps, &aliases).unwrap();
         assert_eq!(steps.len(), n);
     }
 
