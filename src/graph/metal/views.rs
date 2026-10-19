@@ -94,8 +94,10 @@ fn row_view(
 }
 
 /// Whether `op` reads `v` only through operands that take a row stride; with `apply`, gives them
-/// `view`. ponytail: RmsNormBatch, RopeBatch and Unary are the readers of strided slices in the
-/// suite's plans; any other reader (plain RmsNorm, Rope, attention `v`, GLU) keeps the copy step.
+/// `view`. ponytail: only RmsNormBatch, RopeBatch and Unary take strides. Suite prefill readers
+/// still copying: attention `v` of an unfused QKV split (read by both kv-append and the attention
+/// kernel) and the GeGlu `up` of a multi-row per-layer-embedding slice; add a stride to those
+/// kernels when prefill copies show up in a profile. Plain RmsNorm/Rope/Binary also keep the copy.
 fn take_view(op: &mut Step, v: ValueId, view: Rows, apply: bool) -> bool {
     match op {
         Step::RmsNormBatch { segs, rope } => {
