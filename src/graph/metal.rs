@@ -2328,11 +2328,7 @@ impl Session {
         let mut steps = batch_horizontal(steps, &aliases);
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
-                eprintln!(
-                    "plan {i:4} {:<46} {}",
-                    s.name,
-                    kernel_kind(&format!("{:?}", s.op))
-                );
+                eprintln!("{}", plan_line(i, s));
             }
         }
         for s in &steps {
@@ -3751,20 +3747,7 @@ impl Session {
                 let len = start_pos as usize + 1;
                 let lo = window.map_or(0, |w| len.saturating_sub(w));
                 let n_keys = len - lo;
-                let (min_keys, split_keys) = if head_dim >= 256 {
-                    (32, 16)
-                } else {
-                    (ATTN_SPLIT_MIN_KEYS, ATTN_SPLIT_KEYS)
-                };
-                let n_splits = if gqa_decode && n_keys >= min_keys {
-                    let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
-                    ATTN_TARGET_TGS
-                        .div_ceil(head_tgs)
-                        .min(n_keys / split_keys)
-                        .clamp(2, ATTN_MAX_SPLITS)
-                } else {
-                    1
-                };
+                let n_splits = attn_splits(n_keys, head_dim, kv_heads, group, gqa_decode);
                 let mut scratch_guard = self.attn_scratch.lock();
                 if n_splits > 1 {
                     let bytes = heads * n_splits * (head_dim + 2) * 4;
@@ -6570,6 +6553,158 @@ fn kernel_kind(desc: &str) -> &str {
             _ => return if ident.is_empty() { "?" } else { ident },
         }
     }
+}
+
+/// One `GIBBS_DUMP_PLAN` line.
+fn plan_line(i: usize, s: &Planned) -> String {
+    format!(
+        "plan {i:4} {:<46} {}",
+        s.name,
+        kernel_kind(&format!("{:?}", s.op))
+    )
+}
+
+/// Key slices a cached-attention step splits `n_keys` visible keys into; above 1 the step adds a
+/// merge dispatch.
+fn attn_splits(
+    n_keys: usize,
+    head_dim: usize,
+    kv_heads: usize,
+    group: usize,
+    gqa_decode: bool,
+) -> usize {
+    let (min_keys, split_keys) = if head_dim >= 256 {
+        (32, 16)
+    } else {
+        (ATTN_SPLIT_MIN_KEYS, ATTN_SPLIT_KEYS)
+    };
+    if gqa_decode && n_keys >= min_keys {
+        let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
+        ATTN_TARGET_TGS
+            .div_ceil(head_tgs)
+            .min(n_keys / split_keys)
+            .clamp(2, ATTN_MAX_SPLITS)
+    } else {
+        1
+    }
+}
+
+/// CPU-only listing of what [`Session::prepare_plan`] schedules for `g`: `plan` (MoE subgraph
+/// fusion included), `batch_horizontal`, the arena `allocate` and `pair_small_hand_gemvs`, without a
+/// device, weights or the tuner. A GEMV whose variant the tuner picks prints `variant=unassigned`
+/// (pairing is unaffected: without a variant override it pairs only BF16, which has one kernel).
+/// Dispatches per step follow the encoder: attention with `ctx` keys in the cache, and
+/// `MegakernelMlp`'s norm, gate, up, activation, down and optional post-norm.
+pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
+    use std::fmt::Write;
+    let (steps, aliases) = plan(g)?;
+    let mut steps = batch_horizontal(steps, &aliases);
+    let (offsets, arena) = allocate(g, &steps, &aliases)?;
+    pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
+    let mut out = String::new();
+    let mut kinds: HashMap<String, usize> = HashMap::new();
+    let (mut layer, mut dispatches, mut unassigned) = (None, 0usize, 0usize);
+    for (i, s) in steps.iter().enumerate() {
+        *kinds
+            .entry(kernel_kind(&format!("{:?}", s.op)).to_string())
+            .or_default() += 1;
+        // The layer index: the first all-digit segment of the step name.
+        let l = s.name.split('.').find_map(|p| p.parse::<usize>().ok());
+        if i == 0 || l != layer {
+            layer = l;
+            let _ = writeln!(out, "-- layer {}", l.map_or("-".into(), |l| l.to_string()));
+        }
+        let v = g.value(s.out);
+        let mut line = format!("{} -> {:?} {:?}", plan_line(i, s), v.shape, v.dtype);
+        if !s.extra_outs.is_empty() {
+            let _ = write!(line, " +{} outs", s.extra_outs.len());
+        }
+        for &r in &s.reads {
+            let w = g.value(r);
+            if w.kind == ValueKind::Weight {
+                let _ = write!(line, " w:{:?}{:?}", w.dtype, w.shape);
+            }
+        }
+        let mut n = 1;
+        match &s.op {
+            Step::GemvPacked { m, format, .. } | Step::GemvPackedPair { m, format, .. } => {
+                if *m == 1 && tune::enabled() && format.gemv_variants().len() > 1 {
+                    unassigned += 1;
+                    let _ = write!(line, " fmt={format:?} variant=unassigned");
+                } else {
+                    let d = format.default_variant();
+                    let _ = write!(line, " fmt={format:?} variant={:?}{}", d.kernel, d.rows_per_sg);
+                }
+            }
+            &Step::CachedAttention {
+                vis,
+                k_state,
+                v_state,
+                heads,
+                kv_heads,
+                head_dim,
+                window,
+                write,
+                m,
+                ..
+            } => {
+                // Mirrors the encoder: kv_append unless fused into the GQA decode kernel, then the
+                // attention, then a merge when the keys are split.
+                let gqa_decode = m == 1 && vis.is_none();
+                let n_keys = window.map_or(ctx, |w| ctx.min(w));
+                let group = (heads / kv_heads.max(1)).max(1);
+                let splits = attn_splits(n_keys, head_dim, kv_heads, group, gqa_decode);
+                n = usize::from(write && k_state.is_some() && v_state.is_some() && !gqa_decode)
+                    + 1
+                    + usize::from(splits > 1);
+                let _ = write!(line, " window={window:?} keys@ctx={n_keys} splits={splits}");
+            }
+            Step::MegakernelMlp { post_norm_w, .. } => n = 5 + usize::from(post_norm_w.is_some()),
+            _ => {}
+        }
+        dispatches += n;
+        if let ValueKind::Node(id) = v.kind {
+            let node = &g.nodes[id.0 as usize];
+            let src = |k: usize| node.inputs.get(k).map(|&x| g.value(x).shape.clone());
+            match &node.op {
+                Op::Slice { axis, start, end } => {
+                    let shape = src(0).unwrap_or_default();
+                    let ax = if *axis < 0 { *axis + shape.len() as isize } else { *axis } as usize;
+                    let outer: usize = shape.iter().take(ax).product();
+                    let _ = write!(
+                        line,
+                        " slice axis={ax} [{start}..{end}] of {shape:?} contiguous={}",
+                        outer == 1
+                    );
+                }
+                Op::Concat { axis } => {
+                    let ins: Vec<_> = (0..node.inputs.len()).filter_map(src).collect();
+                    let _ = write!(line, " concat axis={axis} of {ins:?}");
+                }
+                Op::Transpose { perm } => {
+                    let _ = write!(line, " transpose {perm:?} of {:?}", src(0).unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+        if n != 1 {
+            let _ = write!(line, " dispatches={n}");
+        }
+        let _ = writeln!(out, "{line}");
+    }
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let _ = writeln!(out, "-- step kinds");
+    for (k, c) in &kinds {
+        let _ = writeln!(out, "kind {c:5} {k}");
+    }
+    let _ = writeln!(
+        out,
+        "plan-dump: {} steps, {dispatches} dispatches at ctx {ctx}, arena {arena} B, \
+         {unassigned} GEMV steps unassigned (tuner)",
+        steps.len()
+    );
+    Ok(out)
 }
 
 /// Per-step GPU timings `(step, op description, seconds, bytes)` grouped by kernel kind, slowest
@@ -10682,6 +10817,31 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         if std::env::var_os("GIBBS_CB_CHUNK").is_none() {
             assert_eq!(cb_chunking(), (32, usize::MAX));
         }
+    }
+
+    /// CPU only: `plan_dump` groups steps by layer and describes a materialized strided slice.
+    #[test]
+    fn plan_dump_describes_layers_and_slices() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![2, 8], DType::F32);
+        let op = Op::Slice {
+            axis: 1,
+            start: 0,
+            end: 4,
+        };
+        let s = g.add("blk.3.slice", op, &[x], vec![2, 4], DType::F32);
+        let neg = Op::Unary {
+            kind: crate::graph::UnaryKind::Neg,
+        };
+        let y = g.add("blk.3.neg", neg, &[s], vec![2, 4], DType::F32);
+        g.output(y);
+        let d = plan_dump(&g, 1).unwrap();
+        assert!(d.contains("-- layer 3\n"), "{d}");
+        assert!(
+            d.contains("slice axis=1 [0..4] of [2, 8] contiguous=false"),
+            "{d}"
+        );
+        assert!(d.contains("plan-dump: 2 steps, 2 dispatches at ctx 1"), "{d}");
     }
 
     #[test]
