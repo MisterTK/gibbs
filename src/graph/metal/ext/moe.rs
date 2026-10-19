@@ -11,7 +11,8 @@ use super::super::{new_shared_buffer, numel, set_bytes, u32_of, Planned, Session
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
-    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams,
+    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, iq2_grid_msl,
+    GemvParams, Iq2Grid,
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
@@ -409,6 +410,26 @@ thread_local! {
     static TEST_ROWS_PER_SG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_PSO_OVERRIDE: std::cell::RefCell<Option<ComputePipelineState>> =
         const { std::cell::RefCell::new(None) };
+    static TEST_IQ2_GRID: std::cell::Cell<Option<Iq2Grid>> = const { std::cell::Cell::new(None) };
+}
+
+/// The grid binding of `c`'s expert GEMV: [`Iq2Grid::Program`] unless `c` is IQ2_XXS and
+/// `GIBBS_IQ2_GRID=tg|buf` (read once) picks the threadgroup-staged or bound-buffer lookup.
+fn iq2_grid(c: &Codec) -> Iq2Grid {
+    if c.format != QuantFormat::GGUF_IQ2_XXS {
+        return Iq2Grid::Program;
+    }
+    #[cfg(test)]
+    if let Some(m) = TEST_IQ2_GRID.get() {
+        return m;
+    }
+    static MODE: LazyLock<Iq2Grid> =
+        LazyLock::new(|| match std::env::var("GIBBS_IQ2_GRID").as_deref() {
+            Ok("tg") => Iq2Grid::Threadgroup,
+            Ok("buf") => Iq2Grid::Buffer,
+            _ => Iq2Grid::Program,
+        });
+    *MODE
 }
 
 fn moe_rows_per_sg(_c: &Codec) -> usize {
@@ -426,8 +447,8 @@ fn moe_rows_per_sg(_c: &Codec) -> usize {
     // }
     2
 }
-/// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
+/// Per (device, codec, rows_per_sg, grid binding) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize, Iq2Grid), ComputePipelineState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
@@ -436,7 +457,8 @@ fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineSt
         return Ok(pso);
     }
     let device = &sess.rt.device;
-    let key = (device.registry_id(), c.format, r);
+    let grid = iq2_grid(c);
+    let key = (device.registry_id(), c.format, r, grid);
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
@@ -446,7 +468,7 @@ fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineSt
     };
     let src = format!(
         "#include <metal_stdlib>\nusing namespace metal;\n{}",
-        gemv_indexed(c, params)
+        iq2_grid_msl(gemv_indexed(c, params), grid)?
     );
     let opts = CompileOptions::new();
     let lib = device.new_library_with_source(&src, &opts).map_err(|e| {
@@ -581,6 +603,9 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 ],
             );
             e.bind(4, *ids);
+            if iq2_grid(c) == Iq2Grid::Buffer {
+                set_bytes(enc, 5, &crate::model::layers::IQ2XXS_GRID);
+            }
             let rows_per_tg = gemv_rows_per_tg(GemvParams {
                 rows_per_sg: r,
                 ..Default::default()
@@ -1176,6 +1201,35 @@ mod tests {
         super::TEST_ROWS_PER_SG.set(0);
     }
 
+    /// The threadgroup-staged and bound-buffer IQ2_XXS grid lookups match the CPU reference, with a
+    /// row tail (35 rows) whose idle simdgroups still reach the staging barrier.
+    #[test]
+    fn moe_linear_iq2xxs_grid_modes_match_cpu() {
+        let ids = vec![4, 0, 5, 2, 2, 1];
+        for grid in [super::Iq2Grid::Threadgroup, super::Iq2Grid::Buffer] {
+            super::TEST_IQ2_GRID.set(Some(grid));
+            for r in [2usize, 4] {
+                super::TEST_ROWS_PER_SG.set(r);
+                for x_rows in [2, 6] {
+                    let (want, got) = moe_both(
+                        Fmt::Q(Q::GGUF_IQ2_XXS),
+                        x_rows,
+                        512,
+                        35,
+                        6,
+                        3,
+                        ids.clone(),
+                        21,
+                    );
+                    let err = rel_err(&want, &got);
+                    assert!(err < 1e-4, "{grid:?} r={r} x_rows={x_rows}: {err}");
+                }
+            }
+        }
+        super::TEST_IQ2_GRID.set(None);
+        super::TEST_ROWS_PER_SG.set(0);
+    }
+
     #[test]
     fn moe_linear_shapes_and_routing_match_cpu() {
         let mut s = 7u64;
@@ -1573,10 +1627,15 @@ mod tests {
         }
     }
 
+    /// 7 interleaved rounds (legs forward then reversed) of each format's expert GEMV variants:
+    /// rows per simdgroup 2 vs 4, plus for IQ2_XXS the threadgroup-staged and bound-buffer grid
+    /// lookups at r=2. Each of the 8 steps reads its own bank (>= 128 MB in all), so experts stream
+    /// from DRAM rather than the system-level cache. Ratios are leg 0 (r=2, default grid) over the leg.
     #[test]
     #[ignore = "bandwidth measurement"]
     fn moe_gemv_bandwidth() {
-        let (experts, top_k) = (16usize, 8usize);
+        use super::Iq2Grid as G;
+        let (experts, top_k, steps) = (16usize, 8usize, 8usize);
         let ids = Tensor::U32(vec![0, 2, 5, 7, 9, 11, 13, 15]);
         for (f, rows, cols, x_rows) in [
             (Q::GGUF_IQ2_XXS, 1408usize, 2816usize, 1usize),
@@ -1589,10 +1648,13 @@ mod tests {
             let routed_bytes =
                 top_k * rows * (cols / c.block_elems as usize) * c.block_bytes as usize;
             let mut g = Graph::new();
+            let mut w = Weights::new();
             let x = g.input("x", vec![x_rows, cols], DType::F32);
-            let b = g.weight("bank", vec![experts * rows, cols], dt);
             let id_in = g.input("ids", vec![1, top_k], DType::U32);
-            for step in 0..8 {
+            for step in 0..steps {
+                let name = format!("bank{step}");
+                let b = g.weight(&name, vec![experts * rows, cols], dt);
+                w.insert(name, bank.clone());
                 let y = g.add(
                     format!("moe_{step}"),
                     Op::MoeLinear { experts, top_k },
@@ -1602,57 +1664,65 @@ mod tests {
                 );
                 g.output(y);
             }
-            let mut w = Weights::new();
-            w.insert("bank", bank);
             let s = Session::new(rt(), &w).unwrap();
             let plan = s.prepare_plan(&g).unwrap();
             let xs = Tensor::F32(vec![0.25; x_rows * cols]);
-            for r in [2usize, 4usize] {
+            let mut legs = vec![("r2", 2usize, G::Program), ("r4", 4, G::Program)];
+            if f == Q::GGUF_IQ2_XXS {
+                legs.extend([("r2/tg", 2, G::Threadgroup), ("r2/buf", 2, G::Buffer)]);
+            }
+            let run_leg = |&(_, r, grid): &(&str, usize, G), n: usize| -> f64 {
                 super::TEST_ROWS_PER_SG.set(r);
-                for _ in 0..5 {
+                super::TEST_IQ2_GRID.set(Some(grid));
+                let mut leg_s = 0.0;
+                for _ in 0..n {
                     s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
                         .unwrap();
+                    leg_s += s.last_gpu_seconds() / (n * steps) as f64;
                 }
+                leg_s
+            };
+            for leg in &legs {
+                run_leg(leg, 5);
             }
-            let mut r2_rounds = Vec::with_capacity(7);
-            let mut r4_rounds = Vec::with_capacity(7);
-            let mut r4_wins = 0usize;
-            let mut worst_round_ratio = f64::INFINITY;
+            let mut rounds = vec![Vec::with_capacity(7); legs.len()];
             for _round in 0..7 {
-                let mut r2_sum = 0.0;
-                let mut r4_sum = 0.0;
-                for r in [2usize, 4, 4, 2] {
-                    super::TEST_ROWS_PER_SG.set(r);
-                    let mut leg_s = 0.0;
-                    for _ in 0..10 {
-                        s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
-                            .unwrap();
-                        leg_s += s.last_gpu_seconds() / (10.0 * 8.0);
-                    }
-                    if r == 2 {
-                        r2_sum += 0.5 * leg_s;
-                    } else {
-                        r4_sum += 0.5 * leg_s;
-                    }
+                let mut sums = vec![0.0f64; legs.len()];
+                for i in (0..legs.len()).chain((0..legs.len()).rev()) {
+                    sums[i] += 0.5 * run_leg(&legs[i], 10);
                 }
-                if r4_sum < r2_sum {
-                    r4_wins += 1;
+                for (r, v) in rounds.iter_mut().zip(sums) {
+                    r.push(v);
                 }
-                worst_round_ratio = worst_round_ratio.min(r2_sum / r4_sum);
-                r2_rounds.push(r2_sum);
-                r4_rounds.push(r4_sum);
             }
             super::TEST_ROWS_PER_SG.set(0);
-            r2_rounds.sort_by(|a, b| a.total_cmp(b));
-            r4_rounds.sort_by(|a, b| a.total_cmp(b));
-            let (r2_s, r4_s) = (r2_rounds[3], r4_rounds[3]);
-            let (r2_us, r4_us) = (r2_s * 1e6, r4_s * 1e6);
-            let r2_gbps = routed_bytes as f64 / r2_s / 1e9;
-            let r4_gbps = routed_bytes as f64 / r4_s / 1e9;
-            println!(
-                "moe_gemv {f:?} {rows}x{cols}: r=2 med={r2_us:.1}us ({r2_gbps:.1} GB/s) vs r=4 med={r4_us:.1}us ({r4_gbps:.1} GB/s) [r4_wins={r4_wins}/7, med_ratio={:.4}, worst_ratio={worst_round_ratio:.4}]",
-                r2_us / r4_us
-            );
+            super::TEST_IQ2_GRID.set(None);
+            let median = |t: &[f64]| {
+                let mut v = t.to_vec();
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[v.len() / 2]
+            };
+            let (base, base_med) = (&rounds[0], median(&rounds[0]));
+            let report: Vec<String> = legs
+                .iter()
+                .zip(&rounds)
+                .map(|(&(label, _, _), t)| {
+                    let wins = t.iter().zip(base).filter(|(a, b)| a < b).count();
+                    let worst = t
+                        .iter()
+                        .zip(base)
+                        .map(|(a, b)| b / a)
+                        .fold(f64::INFINITY, f64::min);
+                    let med = median(t);
+                    format!(
+                        "{label} med={:.1}us ({:.1} GB/s) [wins={wins}/7, med_ratio={:.4}, worst_ratio={worst:.4}]",
+                        med * 1e6,
+                        routed_bytes as f64 / med / 1e9,
+                        base_med / med
+                    )
+                })
+                .collect();
+            println!("moe_gemv {f:?} {rows}x{cols}: {}", report.join(" vs "));
         }
     }
 
@@ -1795,6 +1865,21 @@ mod tests {
         );
     }
 
+    /// `raw` uploaded as distinct buffers totalling >= 64 MB: a dispatch loop rotating through them
+    /// streams weights from DRAM, where one 3-16 MB buffer re-read back to back stays resident in the
+    /// system-level cache (bg_231's Q6_K leg read 414.5 GB/s, above the DRAM ceiling).
+    fn dram_rotation(dev: &metal::DeviceRef, raw: &[u8]) -> Vec<metal::Buffer> {
+        (0..(64usize << 20).div_ceil(raw.len()))
+            .map(|_| {
+                dev.new_buffer_with_data(
+                    raw.as_ptr() as *const std::ffi::c_void,
+                    raw.len() as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     #[ignore = "bandwidth measurement"]
     fn tq2_0_tile_vector_vs_bit_hack_ablation() {
@@ -1857,11 +1942,8 @@ mod tests {
             let w_bytes = n_blocks * c.block_bytes as usize;
             let xv = rand(cols, 200 + r as u64);
 
-            let w_buf = rt.device.new_buffer_with_data(
-                repacked.as_ptr() as *const c_void,
-                repacked.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let w_bufs = dram_rotation(&rt.device, &repacked);
+            let reps = (2 * w_bufs.len()).max(20);
             let x_buf = rt.device.new_buffer_with_data(
                 xv.as_ptr() as *const c_void,
                 (xv.len() * 4) as u64,
@@ -1886,13 +1968,13 @@ mod tests {
                     let cb = rt.queue.new_command_buffer();
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(&w_buf), 0);
                     enc.set_buffer(1, Some(&x_buf), 0);
                     enc.set_buffer(2, Some(out), 0);
                     super::set_bytes(enc, 3, &p_bytes);
                     enc.set_buffer(4, Some(out), 0);
                     enc.set_buffer(5, Some(out), 0);
-                    for _ in 0..n {
+                    for i in 0..n {
+                        enc.set_buffer(0, Some(&w_bufs[i % w_bufs.len()]), 0);
                         enc.dispatch_thread_groups(grid, tg);
                     }
                     enc.end_encoding();
@@ -1909,8 +1991,8 @@ mod tests {
             assert!(err < 1e-5, "TQ2_0 {rows}x{cols} r={r} parity rel_err={err}");
 
             for _ in 0..3 {
-                run_n(&bithack_pso, &y_a, 20);
-                run_n(&uchar4_pso, &y_b, 20);
+                run_n(&bithack_pso, &y_a, reps);
+                run_n(&uchar4_pso, &y_b, reps);
             }
 
             let mut bithack_rounds = Vec::with_capacity(5);
@@ -1921,9 +2003,9 @@ mod tests {
                 let mut b_sum = 0.0;
                 for leg in [0usize, 1, 1, 0] {
                     if leg == 0 {
-                        a_sum += 0.5 * run_n(&bithack_pso, &y_a, 20);
+                        a_sum += 0.5 * run_n(&bithack_pso, &y_a, reps);
                     } else {
-                        b_sum += 0.5 * run_n(&uchar4_pso, &y_b, 20);
+                        b_sum += 0.5 * run_n(&uchar4_pso, &y_b, reps);
                     }
                 }
                 if b_sum < a_sum {
@@ -2042,11 +2124,8 @@ mod tests {
             let w_bytes = raw.len();
             let xv = rand(cols, 400 + r as u64);
 
-            let w_buf = rt.device.new_buffer_with_data(
-                raw.as_ptr() as *const c_void,
-                raw.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let w_bufs = dram_rotation(&rt.device, &raw);
+            let reps = (2 * w_bufs.len()).max(20);
             let x_buf = rt.device.new_buffer_with_data(
                 xv.as_ptr() as *const c_void,
                 (xv.len() * 4) as u64,
@@ -2071,13 +2150,13 @@ mod tests {
                     let cb = rt.queue.new_command_buffer();
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(&w_buf), 0);
                     enc.set_buffer(1, Some(&x_buf), 0);
                     enc.set_buffer(2, Some(out), 0);
                     super::set_bytes(enc, 3, &p_bytes);
                     enc.set_buffer(4, Some(out), 0);
                     enc.set_buffer(5, Some(out), 0);
-                    for _ in 0..n {
+                    for i in 0..n {
+                        enc.set_buffer(0, Some(&w_bufs[i % w_bufs.len()]), 0);
                         enc.dispatch_thread_groups(grid, tg);
                     }
                     enc.end_encoding();
@@ -2094,8 +2173,8 @@ mod tests {
             assert!(err < 1e-5, "{f:?} {rows}x{cols} r={r} parity rel_err={err}");
 
             for _ in 0..3 {
-                run_n(&unfused_pso, &y_a, 20);
-                run_n(&fused_pso, &y_b, 20);
+                run_n(&unfused_pso, &y_a, reps);
+                run_n(&fused_pso, &y_b, reps);
             }
 
             let mut unfused_rounds = Vec::with_capacity(5);
@@ -2106,9 +2185,9 @@ mod tests {
                 let mut b_sum = 0.0;
                 for leg in [0usize, 1, 1, 0] {
                     if leg == 0 {
-                        a_sum += 0.5 * run_n(&unfused_pso, &y_a, 20);
+                        a_sum += 0.5 * run_n(&unfused_pso, &y_a, reps);
                     } else {
-                        b_sum += 0.5 * run_n(&fused_pso, &y_b, 20);
+                        b_sum += 0.5 * run_n(&fused_pso, &y_b, reps);
                     }
                 }
                 if b_sum < a_sum {

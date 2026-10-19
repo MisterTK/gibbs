@@ -4,6 +4,9 @@ use crate::graph::codec::{planar, tile, wide, Codec, Tile};
 pub struct GemvParams {
     pub rows_per_sg: usize,
     pub k_unroll: usize,
+    /// Simdgroups per threadgroup of [`gemv_packed`]: 8 (256 threads), or 2 (64 threads, ggml-metal's
+    /// K-quant launch shape).
+    pub simdgroups: usize,
 }
 
 impl Default for GemvParams {
@@ -11,6 +14,7 @@ impl Default for GemvParams {
         Self {
             rows_per_sg: 2,
             k_unroll: 1,
+            simdgroups: 8,
         }
     }
 }
@@ -1064,6 +1068,48 @@ mod tests {
     use crate::hardware::{Device, HardwareProfile, QuantFormat};
 
     #[test]
+    fn gemv_packed_64_thread_variant_covers_two_simdgroups() {
+        let c = codec(QuantFormat::GGUF_Q4_K_M).unwrap();
+        let p = GemvParams {
+            simdgroups: 2,
+            ..Default::default()
+        };
+        assert_eq!((gemv_rows_per_tg(p), gemv_threads(p)), (4, 64));
+        assert_eq!(gemv_packed_name(c, p), "gemvgen_GGUF_Q4_K_M_r2_sg2");
+        assert!(gemv_packed(c, p).contains("const uint row0 = tg.x * 4 + sg * 2;"));
+        // The 256-thread default keeps its name and source (tuned shapes keep their cache keys).
+        let d = GemvParams::default();
+        assert_eq!(gemv_packed_name(c, d), "gemvgen_GGUF_Q4_K_M_r2");
+        assert!(gemv_packed(c, d).contains("const uint row0 = tg.x * 16 + sg * 2;"));
+    }
+
+    #[test]
+    fn iq2_grid_rewrites_hit_every_anchor() {
+        let c = codec(QuantFormat::GGUF_IQ2_XXS).unwrap();
+        for r in [1, 2, 4] {
+            let p = GemvParams {
+                rows_per_sg: r,
+                ..Default::default()
+            };
+            let src = gemv_indexed(c, p);
+            assert_eq!(iq2_grid_msl(src.clone(), Iq2Grid::Program).unwrap(), src);
+            let tg = iq2_grid_msl(src.clone(), Iq2Grid::Threadgroup).unwrap();
+            assert!(tg.contains("threadgroup uint grid[512];"));
+            assert_eq!(tg.matches("(b, g, xs, grid);").count(), r);
+            let buf = iq2_grid_msl(src.clone(), Iq2Grid::Buffer).unwrap();
+            assert!(buf.starts_with("struct Iq2GridTable { uint2 g[256]; };"));
+            assert!(buf.contains("constant Iq2GridTable& grid [[buffer(5)]],"));
+            assert!(buf.contains("uint2 gw = grid.g[((q4 >> (8 * k)) & 0xFFu)];"));
+            for s in [&tg, &buf] {
+                assert!(!s.contains("as_type<uint2>(IQ2XXS_GRID[(q4"));
+            }
+        }
+        // Any other codec has no grid lookup to rewrite.
+        let q4 = gemv_indexed(codec(QuantFormat::GGUF_Q4_0).unwrap(), GemvParams::default());
+        assert!(iq2_grid_msl(q4, Iq2Grid::Buffer).is_err());
+    }
+
+    #[test]
     fn test_gemv_codegen() {
         let code = gemv(&CODEC_Q4_0, GemvParams::default(), "", "");
         assert!(code.contains("kernel void gemv_gguf_q4_0"));
@@ -1387,9 +1433,14 @@ pub fn can_generate(_op: &crate::graph::Op, _dtype: crate::graph::DType) -> bool
     false
 }
 
-/// Rows one threadgroup of [`gemv_packed`] covers: 8 simdgroups × `rows_per_sg`.
+/// Rows one threadgroup of [`gemv_packed`] covers: `simdgroups` × `rows_per_sg`.
 pub const fn gemv_rows_per_tg(p: GemvParams) -> usize {
-    8 * p.rows_per_sg
+    p.simdgroups * p.rows_per_sg
+}
+
+/// Threads per threadgroup of [`gemv_packed`]: 32 per simdgroup.
+pub const fn gemv_threads(p: GemvParams) -> usize {
+    32 * p.simdgroups
 }
 
 /// The MSL a GPU consumer of the device weight buffer includes: [`Codec::msl`], or the planar-layout decoder
@@ -1447,9 +1498,14 @@ pub fn gemv_common(kernels_msl: &str) -> &str {
     &kernels_msl[begin..end]
 }
 
-/// Name of the kernel [`gemv_packed`] emits for `codec` with `p`.
+/// Name of the kernel [`gemv_packed`] emits for `codec` with `p` (`_sg2` suffix off the 8-simdgroup default).
 pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
-    format!("gemvgen_{:?}_r{}", codec.format, p.rows_per_sg)
+    let sg = if p.simdgroups == 8 {
+        String::new()
+    } else {
+        format!("_sg{}", p.simdgroups)
+    };
+    format!("gemvgen_{:?}_r{}{sg}", codec.format, p.rows_per_sg)
 }
 
 /// Name of the kernel [`dequant_packed`] emits for `codec`.
@@ -1494,7 +1550,7 @@ kernel void {name}(
 }
 
 /// A packed-weight GEMV with the `Step::GemvPacked` contract: buffers `w, x, y, PackedGemvParams,
-/// bias, res`; grid `(ceil(rows / gemv_rows_per_tg), batch)` of 256 threads. Lane `l` of a
+/// bias, res`; grid `(ceil(rows / gemv_rows_per_tg), batch)` of `gemv_threads` threads. Lane `l` of a
 /// simdgroup walks each row's 8-element sub-blocks `l, l+32, …`, decodes them with the codec's
 /// `decode8`, and the simdgroup sums the row. Bias and the fused epilogue are applied by lane 0.
 pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
@@ -1780,6 +1836,58 @@ pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
 /// threads. A slot whose id is not below `experts` writes zeros.
 pub fn gemv_indexed(codec: &Codec, p: GemvParams) -> String {
     gemv_indexed_for_dialect(Dialect::Msl, codec, p)
+}
+
+/// Where an IQ2_XXS [`gemv_indexed`] reads its 2 KB grid: the codec's program-scope `constant ulong`
+/// array (default), a per-threadgroup `uint` copy staged once behind one barrier, or a `constant`
+/// buffer bound at slot 5 (the host binds `IQ2XXS_GRID`'s bytes there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Iq2Grid {
+    Program,
+    Threadgroup,
+    Buffer,
+}
+
+/// Rewrites the IQ2_XXS [`gemv_indexed`] source so `dot_group` reads the grid through `grid`: a
+/// threadgroup `uint[512]` copy the kernel's 256 threads stage (2 stores each, one barrier) before
+/// any early return, or a reference to a sized `constant` table at slot 5 (statically sized, so the
+/// driver may preload it, which an unbounded `constant` pointer forbids). `Err` when the source lacks an anchor.
+pub fn iq2_grid_msl(src: String, mode: Iq2Grid) -> Result<String, String> {
+    const IDX: &str = "((q4 >> (8 * k)) & 0xFFu)";
+    let (decl, param, lookup, kparam, stage) = match mode {
+        Iq2Grid::Program => return Ok(src),
+        Iq2Grid::Threadgroup => (
+            "",
+            "threadgroup const uint* grid",
+            format!("uint2(grid[2u * {IDX}], grid[2u * {IDX} + 1u])"),
+            "",
+            "    threadgroup uint grid[512];\n    {\n        const uint t = sg * 32 + lane;\n        const uint2 e = as_type<uint2>(IQ2XXS_GRID[t]);\n        grid[2 * t] = e.x;\n        grid[2 * t + 1] = e.y;\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+        ),
+        Iq2Grid::Buffer => (
+            "struct Iq2GridTable { uint2 g[256]; };\n",
+            "constant Iq2GridTable& grid",
+            format!("grid.g[{IDX}]"),
+            "    constant Iq2GridTable& grid [[buffer(5)]],\n",
+            "",
+        ),
+    };
+    let ids_param = "    device const uint* ids [[buffer(4)]],\n";
+    let body = "    const uint row0 = tg.x * ";
+    let edits = [
+        ("as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu])".to_string(), lookup),
+        ("thread const float4* xs) {".to_string(), format!("thread const float4* xs, {param}) {{")),
+        ("(b, g, xs);".to_string(), "(b, g, xs, grid);".to_string()),
+        (ids_param.to_string(), format!("{ids_param}{kparam}")),
+        (body.to_string(), format!("{stage}{body}")),
+    ];
+    let src = edits.into_iter().try_fold(src, |s, (from, to)| {
+        if s.contains(&from) {
+            Ok(s.replace(&from, &to))
+        } else {
+            Err(format!("IQ2_XXS grid {mode:?}: generated GEMV has no `{from}`"))
+        }
+    })?;
+    Ok(format!("{decl}{src}"))
 }
 
 /// Dialect-parameterized [`gemv_indexed`] kernel across `Dialect::Msl`, `Dialect::Cuda`, and `Dialect::Hip`.
