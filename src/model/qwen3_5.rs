@@ -705,11 +705,8 @@ fn gguf_checkpoint(
             }
         }
 
-        let needs_transform = matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp)
-            && (hf.ends_with("norm.weight")
-                || hf.contains(".ple.norm_")
-                || hf.ends_with(".linear_attn.out_proj.weight")
-                || (hf.contains(".linear_attn.") && !is_permuted_linear));
+        let needs_transform =
+            matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp) && qwen35_transforms(&hf, kh, vh);
         // Matrices stay packed in BF16/FP16 and in any block format the GPU codec registry decodes (a
         // dequantized copy streams 2-3x the bytes per token). Expert banks keep the wider block-codec
         // predicate: dequantized they would not fit in memory.
@@ -727,6 +724,36 @@ fn gguf_checkpoint(
         let can_pack = ((shape.len() == 2 && packable(shape[1]))
             || (bank && (packable(shape[shape.len() - 1]) || block_ok(shape[shape.len() - 1]))))
             && !needs_transform;
+        // Value heads tiled across `out_proj` columns: untile whole quant blocks per row when each
+        // `vd`-column head is block aligned.
+        // ponytail: unaligned formats still dequantize; permute the input activation instead if one ships.
+        if needs_transform
+            && kh != vh
+            && hf.ends_with(".linear_attn.out_proj.weight")
+            && shape.len() == 2
+            && packable(shape[1])
+            && packable(vd)
+        {
+            let row_bytes = t.quant_format.tensor_bytes(shape[1]);
+            let seg = t.quant_format.tensor_bytes(vd);
+            let total = shape[0] * row_bytes;
+            if seg * vh == row_bytes && t.byte_offset + total <= data.len() {
+                let permuted: Vec<u8> = data[t.byte_offset..t.byte_offset + total]
+                    .chunks_exact(row_bytes)
+                    .flat_map(|row| untile_packed_rows(row, seg, 1, kh, vh, 0))
+                    .collect();
+                permuted_packed.push((
+                    hf,
+                    crate::model::weights::Packed {
+                        map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(permuted)),
+                        off: 0,
+                        format: t.quant_format,
+                        shape,
+                    },
+                ));
+                continue;
+            }
+        }
 
         if can_pack {
             packed.push((hf, t.byte_offset, t.quant_format, shape));
@@ -794,6 +821,27 @@ pub fn gguf_target(path: &Path) -> Result<(Value, Weights), String> {
         |hf| m.extract_tensor_f32(&data, names[hf]),
     )?;
     Ok((cfg, ck))
+}
+
+/// Whether [`qwen35_from_gguf`] changes tensor `hf` (key / value head counts `kh` / `vh`).
+fn qwen35_transforms(hf: &str, kh: usize, vh: usize) -> bool {
+    match hf.rsplit_once(".linear_attn.") {
+        None => hf.ends_with("norm.weight") || hf.contains(".ple.norm_"),
+        Some((_, rest)) => {
+            kh != vh
+                && matches!(
+                    rest,
+                    "in_proj_qkv.weight"
+                        | "conv1d.weight"
+                        | "in_proj_z.weight"
+                        | "in_proj_a.weight"
+                        | "in_proj_b.weight"
+                        | "neg_A"
+                        | "dt_bias"
+                        | "out_proj.weight"
+                )
+        }
+    }
 }
 
 /// Undoes llama.cpp's Qwen3.5 conversion (`Qwen3NextModel` and `_LinearAttentionVReorderBase`
@@ -2780,6 +2828,65 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(err < 1e-5, "{name}: {hf:?} -> {v:?}");
         }
+    }
+
+    /// Tensors [`qwen35_from_gguf`] leaves unchanged stay packed, and the packed `out_proj`
+    /// column untile matches the f32 one.
+    #[test]
+    fn qwen35_identity_transforms_stay_packed() {
+        let c = |kh: usize, vh: usize| {
+            serde_json::json!({"linear_num_key_heads": kh, "linear_num_value_heads": vh,
+                "linear_key_head_dim": 2, "linear_value_head_dim": 2})
+        };
+        let p = "model.layers.0";
+        for (kh, vh) in [(2, 2), (2, 6)] {
+            for n in [
+                "in_proj_qkv.weight",
+                "in_proj_z.weight",
+                "in_proj_a.weight",
+                "in_proj_b.weight",
+                "out_proj.weight",
+                "conv1d.weight",
+                "neg_A",
+                "dt_bias",
+                "norm.weight",
+            ] {
+                let hf = format!("{p}.linear_attn.{n}");
+                let len = (4 * kh + vh * 2) * 4 * vh;
+                let x: Vec<f32> = (0..len).map(|i| i as f32).collect();
+                let mut v = x.clone();
+                qwen35_from_gguf(&hf, &mut v, &c(kh, vh));
+                if !qwen35_transforms(&hf, kh, vh) {
+                    assert_eq!(v, x, "{hf} {kh}/{vh}");
+                }
+            }
+            assert!(qwen35_transforms(
+                &format!("{p}.input_layernorm.weight"),
+                kh,
+                vh
+            ));
+        }
+        assert!(!qwen35_transforms(
+            &format!("{p}.linear_attn.out_proj.weight"),
+            16,
+            16
+        ));
+        // out_proj rows of 6 heads x 2 columns, one byte per column.
+        let (kh, vh, vd) = (2, 6, 2);
+        let rows: Vec<f32> = (0..3 * vh * vd).map(|i| i as f32).collect();
+        let mut want = rows.clone();
+        qwen35_from_gguf(
+            &format!("{p}.linear_attn.out_proj.weight"),
+            &mut want,
+            &c(kh, vh),
+        );
+        let bytes: Vec<u8> = rows.iter().map(|&v| v as u8).collect();
+        let got: Vec<f32> = bytes
+            .chunks_exact(vh * vd)
+            .flat_map(|r| untile_packed_rows(r, vd, 1, kh, vh, 0))
+            .map(f32::from)
+            .collect();
+        assert_eq!(got, want);
     }
 
     /// HY-MT1.5-1.8B from its llama.cpp `hunyuan-dense` GGUF: the GGUF vocabulary (pre-tokenizer
