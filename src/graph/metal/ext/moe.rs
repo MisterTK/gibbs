@@ -1769,6 +1769,21 @@ mod tests {
         );
     }
 
+    /// `raw` uploaded as distinct buffers totalling >= 64 MB: a dispatch loop rotating through them
+    /// streams weights from DRAM, where one 3-16 MB buffer re-read back to back stays resident in the
+    /// system-level cache (bg_231's Q6_K leg read 414.5 GB/s, above the DRAM ceiling).
+    fn dram_rotation(dev: &metal::DeviceRef, raw: &[u8]) -> Vec<metal::Buffer> {
+        (0..(64usize << 20).div_ceil(raw.len()))
+            .map(|_| {
+                dev.new_buffer_with_data(
+                    raw.as_ptr() as *const std::ffi::c_void,
+                    raw.len() as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     #[ignore = "bandwidth measurement"]
     fn tq2_0_tile_vector_vs_bit_hack_ablation() {
@@ -1831,11 +1846,8 @@ mod tests {
             let w_bytes = n_blocks * c.block_bytes as usize;
             let xv = rand(cols, 200 + r as u64);
 
-            let w_buf = rt.device.new_buffer_with_data(
-                repacked.as_ptr() as *const c_void,
-                repacked.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let w_bufs = dram_rotation(&rt.device, &repacked);
+            let reps = (2 * w_bufs.len()).max(20);
             let x_buf = rt.device.new_buffer_with_data(
                 xv.as_ptr() as *const c_void,
                 (xv.len() * 4) as u64,
@@ -1860,13 +1872,13 @@ mod tests {
                     let cb = rt.queue.new_command_buffer();
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(&w_buf), 0);
                     enc.set_buffer(1, Some(&x_buf), 0);
                     enc.set_buffer(2, Some(out), 0);
                     super::set_bytes(enc, 3, &p_bytes);
                     enc.set_buffer(4, Some(out), 0);
                     enc.set_buffer(5, Some(out), 0);
-                    for _ in 0..n {
+                    for i in 0..n {
+                        enc.set_buffer(0, Some(&w_bufs[i % w_bufs.len()]), 0);
                         enc.dispatch_thread_groups(grid, tg);
                     }
                     enc.end_encoding();
@@ -1883,8 +1895,8 @@ mod tests {
             assert!(err < 1e-5, "TQ2_0 {rows}x{cols} r={r} parity rel_err={err}");
 
             for _ in 0..3 {
-                run_n(&bithack_pso, &y_a, 20);
-                run_n(&uchar4_pso, &y_b, 20);
+                run_n(&bithack_pso, &y_a, reps);
+                run_n(&uchar4_pso, &y_b, reps);
             }
 
             let mut bithack_rounds = Vec::with_capacity(5);
@@ -1895,9 +1907,9 @@ mod tests {
                 let mut b_sum = 0.0;
                 for leg in [0usize, 1, 1, 0] {
                     if leg == 0 {
-                        a_sum += 0.5 * run_n(&bithack_pso, &y_a, 20);
+                        a_sum += 0.5 * run_n(&bithack_pso, &y_a, reps);
                     } else {
-                        b_sum += 0.5 * run_n(&uchar4_pso, &y_b, 20);
+                        b_sum += 0.5 * run_n(&uchar4_pso, &y_b, reps);
                     }
                 }
                 if b_sum < a_sum {
@@ -2016,11 +2028,8 @@ mod tests {
             let w_bytes = raw.len();
             let xv = rand(cols, 400 + r as u64);
 
-            let w_buf = rt.device.new_buffer_with_data(
-                raw.as_ptr() as *const c_void,
-                raw.len() as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let w_bufs = dram_rotation(&rt.device, &raw);
+            let reps = (2 * w_bufs.len()).max(20);
             let x_buf = rt.device.new_buffer_with_data(
                 xv.as_ptr() as *const c_void,
                 (xv.len() * 4) as u64,
@@ -2045,13 +2054,13 @@ mod tests {
                     let cb = rt.queue.new_command_buffer();
                     let enc = cb.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pso);
-                    enc.set_buffer(0, Some(&w_buf), 0);
                     enc.set_buffer(1, Some(&x_buf), 0);
                     enc.set_buffer(2, Some(out), 0);
                     super::set_bytes(enc, 3, &p_bytes);
                     enc.set_buffer(4, Some(out), 0);
                     enc.set_buffer(5, Some(out), 0);
-                    for _ in 0..n {
+                    for i in 0..n {
+                        enc.set_buffer(0, Some(&w_bufs[i % w_bufs.len()]), 0);
                         enc.dispatch_thread_groups(grid, tg);
                     }
                     enc.end_encoding();
@@ -2068,8 +2077,8 @@ mod tests {
             assert!(err < 1e-5, "{f:?} {rows}x{cols} r={r} parity rel_err={err}");
 
             for _ in 0..3 {
-                run_n(&unfused_pso, &y_a, 20);
-                run_n(&fused_pso, &y_b, 20);
+                run_n(&unfused_pso, &y_a, reps);
+                run_n(&fused_pso, &y_b, reps);
             }
 
             let mut unfused_rounds = Vec::with_capacity(5);
@@ -2080,9 +2089,9 @@ mod tests {
                 let mut b_sum = 0.0;
                 for leg in [0usize, 1, 1, 0] {
                     if leg == 0 {
-                        a_sum += 0.5 * run_n(&unfused_pso, &y_a, 20);
+                        a_sum += 0.5 * run_n(&unfused_pso, &y_a, reps);
                     } else {
-                        b_sum += 0.5 * run_n(&fused_pso, &y_b, 20);
+                        b_sum += 0.5 * run_n(&fused_pso, &y_b, reps);
                     }
                 }
                 if b_sum < a_sum {
