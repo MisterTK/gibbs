@@ -10807,10 +10807,9 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             end: 4,
         };
         let s = g.add("blk.3.slice", op, &[x], vec![2, 4], DType::F32);
-        let neg = Op::Unary {
-            kind: crate::graph::UnaryKind::Neg,
-        };
-        let y = g.add("blk.3.neg", neg, &[s], vec![2, 4], DType::F32);
+        // `Binary` takes no row stride, so the non-contiguous slice stays a copy step.
+        let b = g.input("b", vec![2, 4], DType::F32);
+        let y = g.add("blk.3.add", Op::Add, &[s, b], vec![2, 4], DType::F32);
         g.output(y);
         let d = plan_dump(&g, 1).unwrap();
         assert!(d.contains("-- layer 3\n"), "{d}");
