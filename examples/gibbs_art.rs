@@ -1,4 +1,4 @@
-//! Single source of every Gibbs image: the TUI sprite and ASCII art, the README hero, architecture and roofline SVGs, and the README bench table.
+//! Single source of every Gibbs image: the TUI sprite and ASCII art, the README hero, architecture, roofline and comparison SVGs, and the README bench and comparison tables.
 //! `cargo run --release --example gibbs_art` (deterministic; run from the repo root).
 use gibbs_engine::model::image::ImageBuffer;
 use serde_json::Value;
@@ -19,6 +19,7 @@ const HI: (usize, usize) = (96, 120);
 const SUITE: &str = "bench/loop.json";
 const BENCH: &str = "autoresearch/bench-readme.jsonl";
 const META: &str = "autoresearch/bench-readme.meta.json";
+const REFERENCE: &str = "autoresearch/bench-reference.json";
 
 const VOID: &str = "#14100D";
 const PLINTH: &str = "#1B1510";
@@ -326,6 +327,8 @@ struct Row {
     gpu_ms: Option<f64>,
     host_ms: Option<f64>,
     dispatches: Option<f64>,
+    /// Bytes one decode step streams (`bytes_per_token`).
+    bytes: f64,
     ceiling: f64,
     error: Option<String>,
 }
@@ -454,6 +457,7 @@ fn bench() -> Bench {
                     gpu_ms: None,
                     host_ms: None,
                     dispatches: None,
+                    bytes: 0.0,
                     ceiling: 0.0,
                     error: Some(err.to_string()),
                 }
@@ -467,6 +471,7 @@ fn bench() -> Bench {
                     gpu_ms: r.get("gpu_ms").and_then(Value::as_f64),
                     host_ms: r.get("host_ms").and_then(Value::as_f64),
                     dispatches: r.get("dispatches").and_then(Value::as_f64),
+                    bytes: r["bytes_per_token"].as_f64().expect("bytes_per_token"),
                     ceiling: r["ceiling_gbps"].as_f64().expect("ceiling_gbps"),
                     error: None,
                 }
@@ -834,8 +839,371 @@ fn bench_block(b: &Bench) -> String {
     s
 }
 
+/// Reference numbers from other engines (`autoresearch/bench-reference.json`).
+struct Reference {
+    /// Same machine and GGUF files: (suite key, tok/s).
+    same: Vec<(String, f64)>,
+    same_build: String,
+    same_tool: String,
+    same_date: String,
+    same_source: String,
+    same_source_note: String,
+    /// Published rows: (format, bytes per token in GB, tok/s).
+    published: Vec<(String, f64, f64)>,
+    pub_source: String,
+    pub_source_name: String,
+    pub_device: String,
+    pub_spec: f64,
+    pub_model: String,
+    pub_test: String,
+    pub_commit: String,
+}
+
+fn reference(b: &Bench) -> Reference {
+    let v: Value = serde_json::from_str(&fs::read_to_string(REFERENCE).expect(REFERENCE))
+        .expect("parse reference");
+    let s = |o: &Value, k: &str| {
+        o[k].as_str()
+            .unwrap_or_else(|| panic!("{REFERENCE}: missing string {k}"))
+            .to_string()
+    };
+    let f = |o: &Value, k: &str| {
+        o[k].as_f64()
+            .unwrap_or_else(|| panic!("{REFERENCE}: missing number {k}"))
+    };
+    let (sm, pb) = (&v["same_machine"], &v["published"]);
+    let same: Vec<(String, f64)> = sm["rows"]
+        .as_array()
+        .expect("same_machine.rows")
+        .iter()
+        .map(|r| (s(r, "key"), f(r, "tok_s")))
+        .collect();
+    for (k, _) in &same {
+        assert!(
+            b.ok.iter().any(|r| &r.key == k),
+            "{REFERENCE}: key {k} is not a measured suite row"
+        );
+    }
+    Reference {
+        same,
+        same_build: s(sm, "build"),
+        same_tool: s(sm, "tool"),
+        same_date: s(sm, "date"),
+        same_source: s(sm, "source"),
+        same_source_note: s(sm, "source_note"),
+        published: pb["rows"]
+            .as_array()
+            .expect("published.rows")
+            .iter()
+            .map(|r| {
+                (
+                    s(r, "format"),
+                    f(r, "gib") * 1_073_741_824.0 / 1e9,
+                    f(r, "tok_s"),
+                )
+            })
+            .collect(),
+        pub_source: s(pb, "source"),
+        pub_source_name: s(pb, "source_name"),
+        pub_device: s(pb, "device"),
+        pub_spec: f(pb, "spec_gbps"),
+        pub_model: s(pb, "model"),
+        pub_test: s(pb, "test"),
+        pub_commit: s(pb, "commit"),
+    }
+}
+
+/// Suite rows with a same-machine llama.cpp number: (row, llama.cpp tok/s).
+fn pairs<'a>(b: &'a Bench, r: &Reference) -> Vec<(&'a Row, f64)> {
+    b.ok.iter()
+        .filter_map(|row| {
+            r.same
+                .iter()
+                .find(|(k, _)| *k == row.key)
+                .map(|(_, t)| (row, *t))
+        })
+        .collect()
+}
+
+/// Gibbs rows by bytes per token, largest first.
+fn by_bytes(b: &Bench) -> Vec<&Row> {
+    let mut v: Vec<&Row> = b.ok.iter().collect();
+    v.sort_by(|x, y| y.bytes.total_cmp(&x.bytes));
+    v
+}
+
+fn compare_svg(b: &Bench, r: &Reference) -> String {
+    const X0: usize = 430; // bar origin; 5 px per percent
+    let px = |p: f64| (5.0 * p.clamp(0.0, 100.0)).round() as usize;
+    let pairs = pairs(b, r);
+    let gibbs = by_bytes(b);
+    let ya = 168;
+    let ya_end = ya + 44 * pairs.len();
+    let yb_head = ya_end + 36;
+    let yb = yb_head + 12;
+    let yb_end = yb + 28 * (r.published.len() + gibbs.len());
+    let fy = yb_end + 16;
+    let ly = fy + 30;
+    let h = ly + 44;
+    let x90 = X0 + px(90.0);
+    let xceil = X0 + px(b.ceiling / r.pub_spec * 100.0);
+
+    let mut a = String::new();
+    let mut desc_a = Vec::new();
+    for (i, (row, l)) in pairs.iter().enumerate() {
+        let y = ya + 44 * i;
+        let lp = l / row.roofline_tok_s * 100.0;
+        let _ = writeln!(
+            a,
+            r#"<text x="48" y="{ly}" font-size="14" fill="{PARCHMENT}">{lbl}</text><rect x="{X0}" y="{g0}" width="500" height="12" fill="{PLINTH}" stroke="{HAIRLINE}" stroke-width="1"/><rect x="{X0}" y="{g0}" width="{gw}" height="12" fill="{BRASS}"/><rect x="{X0}" y="{l0}" width="500" height="12" fill="{PLINTH}" stroke="{HAIRLINE}" stroke-width="1"/><rect x="{X0}" y="{l0}" width="{lw}" height="12" fill="{CYANOTYPE}"/><text x="952" y="{gt}" font-size="12" fill="{BRASS}">{gt_s:.1} tok/s</text><text x="952" y="{lt}" font-size="12" fill="{CYANOTYPE}">{l:.1} tok/s</text><text x="1152" y="{ly}" font-size="14" text-anchor="end" fill="{PARCHMENT}">{ratio:.2}×</text>"#,
+            ly = y + 24,
+            lbl = esc(&row.label),
+            g0 = y + 6,
+            gw = px(row.pct),
+            l0 = y + 22,
+            lw = px(lp),
+            gt = y + 16,
+            gt_s = row.tok_s,
+            lt = y + 32,
+            ratio = row.tok_s / l,
+        );
+        desc_a.push(format!(
+            "{} Gibbs {:.1} tok/s ({:.1}%), llama.cpp {:.1} tok/s ({:.1}%)",
+            esc(&row.label),
+            row.tok_s,
+            row.pct,
+            l,
+            lp
+        ));
+    }
+
+    let mut bsvg = String::new();
+    let mut desc_b = Vec::new();
+    let mut y = yb;
+    let mut bar = |label: String, fill: &str, gbps: f64, out: &mut String| {
+        let p = gbps / r.pub_spec * 100.0;
+        let _ = writeln!(
+            out,
+            r#"<text x="48" y="{ty}" font-size="13" fill="{PARCHMENT}">{lbl}</text><rect x="{X0}" y="{by}" width="500" height="14" fill="{PLINTH}" stroke="{HAIRLINE}" stroke-width="1"/><rect x="{X0}" y="{by}" width="{bw}" height="14" fill="{fill}"/><text x="952" y="{ty}" font-size="12" fill="{PARCHMENT}">{gbps:.0} GB/s</text><text x="1152" y="{ty}" font-size="13" text-anchor="end" fill="{col}">{p:.1}%</text>"#,
+            ty = y + 19,
+            lbl = esc(&label),
+            by = y + 7,
+            bw = px(p),
+            col = tier(p),
+        );
+        desc_b.push(format!("{} {:.1}%", esc(&label), p));
+        y += 28;
+    };
+    for (fmt, gb, t) in &r.published {
+        bar(
+            format!("{} · {fmt} · {gb:.2} GB", r.pub_model),
+            CYANOTYPE,
+            gb * t,
+            &mut bsvg,
+        );
+    }
+    for row in &gibbs {
+        bar(
+            format!("{} · {:.2} GB", row.label, row.bytes / 1e9),
+            BRASS,
+            row.bytes / 1e9 * row.tok_s,
+            &mut bsvg,
+        );
+    }
+
+    let desc = format!(
+        "Two bar charts. A: decode speed on {dev} with the same GGUF files, as percent of the Gibbs roofline: {a}. B: bytes per token times tok/s as percent of Apple's {spec:.0} GB/s spec for {pdev}: llama.cpp {b}.",
+        dev = esc(&b.device),
+        a = desc_a.join("; "),
+        spec = r.pub_spec,
+        pdev = esc(&r.pub_device),
+        b = desc_b.join("; "),
+    );
+    let legend_a = esc(&format!(
+        "GIBBS · BUILD {} · {}",
+        b.commit.to_uppercase(),
+        b.date
+    ));
+    let legend_b = esc(&format!(
+        "LLAMA.CPP · A: {} · B: {} ({})",
+        r.same_date,
+        r.pub_source_name.to_uppercase(),
+        r.pub_commit.to_uppercase()
+    ));
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 {h}" width="1200" height="{h}" role="img" aria-labelledby="gibbs-compare-title gibbs-compare-desc">
+<title id="gibbs-compare-title">Gibbs vs llama.cpp on Apple Silicon</title>
+<desc id="gibbs-compare-desc">{desc}</desc>
+<style>text{{font-family:{MONO}}}.serif{{font-family:{SERIF}}}</style>
+<rect width="1200" height="{h}" rx="14" fill="{VOID}"/>
+<rect x="1" y="1" width="1198" height="{h_2}" rx="13" fill="none" stroke="{HAIRLINE}" stroke-width="2"/>
+<rect x="6" y="6" width="1188" height="{h_12}" rx="9" fill="none" stroke="{HAIRLINE}" stroke-width="1"/>
+<g fill="{BRASS}"><rect x="10" y="10" width="4" height="4"/><rect x="1186" y="10" width="4" height="4"/><rect x="10" y="{h_14}" width="4" height="4"/><rect x="1186" y="{h_14}" width="4" height="4"/></g>
+<text x="48" y="56" font-size="12" fill="{DIM}" letter-spacing="0.12em">HOW THE ROOFLINE COMPARES</text>
+<text class="serif" x="48" y="96" font-size="28" fill="{PARCHMENT}">Gibbs vs llama.cpp on {dev}</text>
+<text x="48" y="124" font-size="12" fill="{DIM}">A: SAME MACHINE, SAME GGUF FILES · B: BEST PUBLISHED LLAMA.CPP RESULT FOR THIS CHIP</text>
+<text x="48" y="156" font-size="12" fill="{DIM}" letter-spacing="0.08em">A · TOK/S AS % OF GIBBS ROOFLINE</text>
+<text x="{x90}" y="156" font-size="11" fill="{CYANOTYPE}" text-anchor="middle">90%</text>
+{a}<line x1="{x90}" y1="{ya}" x2="{x90}" y2="{ya_end}" stroke="{CYANOTYPE}" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="48" y="{yb_head}" font-size="12" fill="{DIM}" letter-spacing="0.08em">B · BYTES/TOKEN × TOK/S ÷ {spec:.0} GB/S SPEC</text>
+<text x="{x90_l}" y="{yb_head}" font-size="11" fill="{CYANOTYPE}" text-anchor="end">90%</text>
+<text x="{xceil_l}" y="{yb_head}" font-size="11" fill="{DIM}">GIBBS CEILING {ceil:.0} GB/S</text>
+{bsvg}<line x1="{x90}" y1="{yb}" x2="{x90}" y2="{yb_end}" stroke="{CYANOTYPE}" stroke-width="1" stroke-dasharray="4 4"/>
+<line x1="{xceil}" y1="{yb}" x2="{xceil}" y2="{yb_end}" stroke="{DIM}" stroke-width="1" stroke-dasharray="2 3"/>
+<rect x="48" y="{fy}" width="1104" height="1" fill="{HAIRLINE}"/>
+<rect x="48" y="{sy}" width="12" height="12" fill="{BRASS}"/><text x="68" y="{ly}" font-size="12" fill="{DIM}">{legend_a}</text>
+<rect x="420" y="{sy}" width="12" height="12" fill="{CYANOTYPE}"/><text x="440" y="{ly}" font-size="12" fill="{DIM}">{legend_b}</text>
+<text x="48" y="{ly2}" font-size="11" fill="{DIM}">A: LLAMA.CPP TOK/S ÷ GIBBS ROOFLINE TOK/S · B: LLAMA.CPP BYTES = GGUF FILE SIZE, GIBBS BYTES = STREAMED PER DECODE STEP</text>
+</svg>
+"##,
+        dev = esc(&b.device),
+        spec = r.pub_spec,
+        ceil = b.ceiling,
+        x90_l = x90 - 4,
+        xceil_l = xceil + 4,
+        sy = ly - 10,
+        ly2 = ly + 20,
+        h_2 = h - 2,
+        h_12 = h - 12,
+        h_14 = h - 14,
+    )
+}
+
+fn compare_block(b: &Bench, r: &Reference) -> String {
+    let pairs = pairs(b, r);
+    let mut s = format!(
+        "<!-- gibbs-compare:begin -->\n\
+         **Same machine, same GGUF files.** llama.cpp: `{tool}`, {build}, {date}, recorded in [`{src}`]({src}) ({note}); not re-measured since. Gibbs: the table above (build `{commit}`, {bdate}).\n\n\
+         | Model | Gibbs tok/s | llama.cpp tok/s | Gibbs ÷ llama.cpp | Gibbs % of roofline | llama.cpp % of Gibbs roofline |\n\
+         | :--- | ---: | ---: | ---: | ---: | ---: |\n",
+        tool = r.same_tool,
+        build = r.same_build,
+        date = r.same_date,
+        src = r.same_source,
+        note = r.same_source_note,
+        commit = b.commit,
+        bdate = b.date,
+    );
+    for (row, l) in &pairs {
+        let _ = writeln!(
+            s,
+            "| {} | {:.1} | {:.1} | {:.2}× | {:.1}% | {:.1}% |",
+            row.label,
+            row.tok_s,
+            l,
+            row.tok_s / l,
+            row.pct,
+            l / row.roofline_tok_s * 100.0
+        );
+    }
+    let missing: Vec<&str> =
+        b.ok.iter()
+            .filter(|row| !pairs.iter().any(|(p, _)| p.key == row.key))
+            .map(|row| row.label.as_str())
+            .collect();
+    let _ = write!(
+        s,
+        "\nllama.cpp % of Gibbs roofline = llama.cpp tok/s ÷ Gibbs roofline tok/s (the bytes Gibbs streams per decode step), so both percentage columns share one scale."
+    );
+    if !missing.is_empty() {
+        let _ = write!(s, " No llama.cpp number for: {}.", missing.join(", "));
+    }
+    let _ = write!(
+        s,
+        "\n\n**Best published result on this chip.** [{name}]({url}) lists an {dev} (Apple spec {spec:.0} GB/s) running {model}, `{test}`, llama.cpp `{commit}`:\n\n\
+         | Engine · model | Bytes per token | tok/s | Effective GB/s | % of {spec:.0} GB/s spec | % of Gibbs's {ceil:.1} GB/s ceiling |\n\
+         | :--- | ---: | ---: | ---: | ---: | ---: |\n",
+        name = r.pub_source_name,
+        url = r.pub_source,
+        dev = r.pub_device,
+        spec = r.pub_spec,
+        model = r.pub_model,
+        test = r.pub_test,
+        commit = r.pub_commit,
+        ceil = b.ceiling,
+    );
+    let row_md = |s: &mut String, name: &str, gb: f64, t: f64| {
+        let gbps = gb * t;
+        let _ = writeln!(
+            s,
+            "| {name} | {gb:.2} GB | {t:.1} | {gbps:.1} | {:.1}% | {:.1}% |",
+            gbps / r.pub_spec * 100.0,
+            gbps / b.ceiling * 100.0
+        );
+    };
+    for (fmt, gb, t) in &r.published {
+        row_md(
+            &mut s,
+            &format!("llama.cpp · {} {fmt}", r.pub_model),
+            *gb,
+            *t,
+        );
+    }
+    let gibbs = by_bytes(b);
+    for row in &gibbs {
+        row_md(
+            &mut s,
+            &format!("Gibbs · {}", row.label),
+            row.bytes / 1e9,
+            row.tok_s,
+        );
+    }
+    let pub_pct = |(_, gb, t): &(String, f64, f64)| gb * t / r.pub_spec * 100.0;
+    let (pmin, pmax) = r
+        .published
+        .iter()
+        .map(pub_pct)
+        .fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+    let (gbmin, gbmax) = r
+        .published
+        .iter()
+        .map(|p| p.1)
+        .fold((f64::MAX, f64::MIN), |(lo, hi), g| (lo.min(g), hi.max(g)));
+    let top = r
+        .published
+        .iter()
+        .max_by(|x, y| (x.1 * x.2).total_cmp(&(y.1 * y.2)))
+        .expect("published rows");
+    let best = gibbs
+        .iter()
+        .max_by(|x, y| (x.bytes * x.tok_s).total_cmp(&(y.bytes * y.tok_s)))
+        .expect("gibbs rows");
+    let _ = write!(
+        s,
+        "\nEffective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On {gbmin:.1}–{gbmax:.1} GB per token, llama.cpp streams at {pmin:.0}–{pmax:.0}% of the {spec:.0} GB/s spec; its {fmt} run reaches {tg:.0} GB/s, {tc:.1}% of the {ceil:.1} GB/s ceiling Gibbs measures. The Gibbs suite streams {smin:.2}–{smax:.2} GB per token; its highest row is {bl} at {bp:.1}% of spec. There is no Gibbs run of {model}, so this table compares different models on one chip. The work aimed at the remaining per-token time is in [`plans/research-sprint-3.md`](plans/research-sprint-3.md).\n",
+        spec = r.pub_spec,
+        fmt = top.0,
+        tg = top.1 * top.2,
+        tc = top.1 * top.2 / b.ceiling * 100.0,
+        ceil = b.ceiling,
+        smin = gibbs.last().expect("gibbs rows").bytes / 1e9,
+        smax = gibbs[0].bytes / 1e9,
+        bl = best.label,
+        bp = best.bytes / 1e9 * best.tok_s / r.pub_spec * 100.0,
+        model = r.pub_model,
+    );
+    s.push_str("<!-- gibbs-compare:end -->");
+    s
+}
+
 fn write_if(path: &str, body: &str) {
     fs::write(path, body).unwrap_or_else(|e| panic!("{path}: {e}"));
+}
+
+/// Replaces the `<!-- {name}:begin -->`…`<!-- {name}:end -->` span (markers included) with `body`.
+fn splice(doc: &str, name: &str, body: &str) -> String {
+    let (begin, end) = (
+        format!("<!-- {name}:begin -->"),
+        format!("<!-- {name}:end -->"),
+    );
+    let i = doc
+        .find(&begin)
+        .unwrap_or_else(|| panic!("{name} begin marker"));
+    let j = doc
+        .find(&end)
+        .unwrap_or_else(|| panic!("{name} end marker"))
+        + end.len();
+    format!("{}{}{}", &doc[..i], body, &doc[j..])
 }
 
 fn main() {
@@ -847,6 +1215,7 @@ fn main() {
     let tui = build(&lum, cw, ch, TUI);
     let hi = build(&lum, cw, ch, HI);
     let b = bench();
+    let r = reference(&b);
 
     write_if("assets/art/gibbs-sprite.txt", &sprite_txt(&tui));
     let ascii = ascii_lines(&tui);
@@ -855,6 +1224,7 @@ fn main() {
     write_if("assets/gibbs-hero.svg", &hero_svg(&hi, &b));
     write_if("assets/gibbs-architecture.svg", &architecture_svg());
     write_if("assets/gibbs-roofline.svg", &roofline_svg(&b));
+    write_if("assets/gibbs-compare.svg", &compare_svg(&b, &r));
     for f in [
         "assets/gibbs-1873-animated.svg",
         "assets/maxwell-surface-banner.svg",
@@ -863,11 +1233,9 @@ fn main() {
     }
 
     let readme = fs::read_to_string("README.md").expect("README.md");
-    let (begin, end) = ("<!-- gibbs-bench:begin -->", "<!-- gibbs-bench:end -->");
-    let i = readme.find(begin).expect("gibbs-bench begin marker");
-    let j = readme.find(end).expect("gibbs-bench end marker") + end.len();
+    let readme = splice(&readme, "gibbs-bench", &bench_block(&b));
     write_if(
         "README.md",
-        &format!("{}{}{}", &readme[..i], bench_block(&b), &readme[j..]),
+        &splice(&readme, "gibbs-compare", &compare_block(&b, &r)),
     );
 }

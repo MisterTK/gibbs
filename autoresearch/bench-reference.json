@@ -1,0 +1,59 @@
+{
+  "same_machine": {
+    "engine": "llama.cpp",
+    "build": "Homebrew llama.cpp 0.6.0_1 (ggml 0.26.0)",
+    "tool": "llama-bench tg128, Metal",
+    "date": "2026-10-13",
+    "source": "autoresearch/roofline-loop-notes.md",
+    "source_note": "iteration 6",
+    "rows": [
+      {
+        "key": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
+        "tok_s": 150.7
+      },
+      {
+        "key": "unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf",
+        "tok_s": 121.8
+      },
+      {
+        "key": "unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf",
+        "tok_s": 148.3
+      },
+      {
+        "key": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf",
+        "tok_s": 43.2
+      },
+      {
+        "key": "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf",
+        "tok_s": 269.0
+      }
+    ]
+  },
+  "published": {
+    "engine": "llama.cpp",
+    "source": "https://github.com/ggml-org/llama.cpp/discussions/4167",
+    "source_name": "ggml-org/llama.cpp#4167",
+    "device": "Apple M5 Pro, 16-core GPU",
+    "spec_gbps": 307.0,
+    "model": "Llama 2 7B",
+    "test": "tg128",
+    "commit": "60081bb",
+    "rows": [
+      {
+        "format": "F16",
+        "gib": 12.55,
+        "tok_s": 21.39
+      },
+      {
+        "format": "Q8_0",
+        "gib": 6.67,
+        "tok_s": 38.94
+      },
+      {
+        "format": "Q4_0",
+        "gib": 3.53,
+        "tok_s": 67.59
+      }
+    ]
+  }
+}
