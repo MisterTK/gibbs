@@ -1584,6 +1584,7 @@ fn wide_msl(codec: &Codec, dec: &str, allow_tile: bool) -> String {
         .map(|w| {
             w.msl
                 .replace("decode_group", &dec.replace("decode8", "decode_group"))
+                .replace("dot_group", &dec.replace("decode8", "dot_group"))
                 .replace("group_seg", &dec.replace("decode8", "group_seg"))
         })
         .or_else(|| {
@@ -1648,6 +1649,27 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile
             )
         })
         .collect();
+    let groups = wd.groups;
+    if wd.fused_dot {
+        let gdot = dec.replace("decode8", "dot_group");
+        let rows: String = (0..r)
+            .map(|i| {
+                let br = block_ref(
+                    codec,
+                    "w",
+                    &format!("{row_base} + {i}) * blocks_per_row + blk"),
+                );
+                format!(
+                    "        if (row0 + {i} < p.rows) {{\n            {}\n            acc{i} += {gdot}(b, {}g, xs);\n        }}\n",
+                    br.decl, br.group
+                )
+            })
+            .collect();
+        return format!(
+            "    const uint groups = blocks_per_row * {groups};\n    for (uint s = lane; s < groups; s += 32) {{\n        const uint blk = s / {groups};\n        const uint g = s % {groups};\n        float4 xs[{}];\n{xs}{rows}    }}\n",
+            2 * wd.segs
+        );
+    }
     let nseg = wd.segs as usize;
     let rows: String = (0..r)
         .map(|i| {
@@ -1674,7 +1696,6 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile
             row(i, &|br| format!("{gdec}(b, {}g, v);", br.group), &dots, v_len)
         })
         .collect();
-    let groups = wd.groups;
     let sx: String = if wd.uniform {
         String::new()
     } else {

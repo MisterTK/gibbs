@@ -49,9 +49,12 @@ pub struct Wide {
     /// Every segment of a group shares one scale (`out[8 * segs]`) and has zero bias: the GEMV sums
     /// the group's segment dots once and multiplies by the scale a single time.
     pub uniform: bool,
+    /// `msl` defines `inline float dot_group(device const uchar* blk, uint g, thread const float4* xs)`
+    /// instead of `decode_group`, computing the scaled dot product of group `g` against `xs[0..2*segs]`
+    /// directly without materializing `float v[...]`.
+    pub fused_dot: bool,
     /// MSL defining `inline uint group_seg(uint g, uint k)` (block offset of segment `k` of group `g`) and
-    /// `inline void decode_group(device const uchar* blk, uint g, thread float* out)`, which writes the
-    /// `8 * segs` raw codes of the group in segment order, then `segs` scales, then `segs` biases.
+    /// either `decode_group(device const uchar* blk, uint g, thread float* out)` or `dot_group`.
     pub msl: &'static str,
 }
 
@@ -197,6 +200,7 @@ inline void decode8(device const uchar* grp, uint sub, thread float* out8) {
 
 static WIDE_Q6_K: Wide = Wide {
     uniform: false,
+    fused_dot: false,
     groups: 8,
     segs: 4,
     // Group g = (half n = g/4, 8 bytes at l0 = (g%4)*8): ql[l] and ql[l+32] hold the low / high nibbles of
@@ -240,6 +244,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // fifth bit); value = d * sv_j * code - dmin * mv_j.
 static WIDE_Q4_K: Wide = Wide {
     uniform: false,
+    fused_dot: false,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -266,6 +271,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 
 static WIDE_Q5_K: Wide = Wide {
     uniform: false,
+    fused_dot: false,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -296,6 +302,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // plus bit n*4+k of the high-mask byte as bit 2; value = d * (scale - 32) * (code - 4).
 static WIDE_Q3_K: Wide = Wide {
     uniform: false,
+    fused_dot: false,
     groups: 8,
     segs: 4,
     msl: r#"
@@ -334,6 +341,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 // group's half, high nibbles 16..31; value = d * (ls - 32) * KVALUES[nibble] (a table, so no bias).
 static WIDE_IQ4_XS: Wide = Wide {
     uniform: true,
+    fused_dot: false,
     groups: 16,
     segs: 2,
     msl: r#"
@@ -355,6 +363,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 
 static WIDE_IQ4_NL: Wide = Wide {
     uniform: true,
+    fused_dot: false,
     groups: 2,
     segs: 2,
     msl: r#"
@@ -376,6 +385,7 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 
 static WIDE_Q4_0: Wide = Wide {
     uniform: true,
+    fused_dot: false,
     groups: 2,
     segs: 2,
     msl: r#"
@@ -395,16 +405,17 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
 
 static WIDE_IQ2_XXS: Wide = Wide {
     uniform: true,
+    fused_dot: true,
     groups: 8,
     segs: 4,
     msl: r#"
 inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
-inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+inline float dot_group(device const uchar* blk, uint g, thread const float4* xs) {
     float d = cd_f16(blk);
     ushort4 qw = *(device const packed_ushort4*)(blk + 2 + 8 * g);
     uint q4 = uint(qw.x) | (uint(qw.y) << 16);
     uint aux1 = uint(qw.z) | (uint(qw.w) << 16);
-    out[32] = d * (0.5f + float(aux1 >> 28)) * 0.25f;
+    float sum = 0.0f;
     for (uint k = 0; k < 4; k++) {
         uint2 gw = as_type<uint2>(IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]);
         float4 g0 = float4(as_type<uchar4>(gw.x)), g1 = float4(as_type<uchar4>(gw.y));
@@ -412,15 +423,16 @@ inline void decode_group(device const uchar* blk, uint g, thread float* out) {
         uint s = s7 | ((popcount(s7) & 1u) << 7);
         float4 s0 = select(g0, -g0, int4((s << 31), (s << 30), (s << 29), (s << 28)) < 0);
         float4 s1 = select(g1, -g1, int4((s << 27), (s << 26), (s << 25), (s << 24)) < 0);
-        *(thread packed_float4*)(out + 8 * k) = s0;
-        *(thread packed_float4*)(out + 8 * k + 4) = s1;
+        sum += dot(s0, xs[2 * k]) + dot(s1, xs[2 * k + 1]);
     }
+    return (d * (0.5f + float(aux1 >> 28)) * 0.25f) * sum;
 }
 "#,
 };
 
 static WIDE_BNB_NF4_B64: Wide = Wide {
     uniform: true,
+    fused_dot: false,
     groups: 4,
     segs: 2,
     msl: r#"
@@ -449,55 +461,61 @@ static WIDE_BNB_NF4_B256: Wide = Wide {
 
 static WIDE_IQ2_M: Wide = Wide {
     uniform: true,
+    fused_dot: true,
     groups: 8,
     segs: 4,
     msl: r#"
 inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
-inline void decode_group(device const uchar* blk, uint g, thread float* out) {
-    uint q4 = cd_u32(blk + 2 + 4 * g);
-    uint s4 = cd_u32(blk + 34 + 4 * g);
+inline float dot_group(device const uchar* blk, uint g, thread const float4* xs) {
+    ushort2 q2 = *(device const packed_ushort2*)(blk + 2 + 4 * g);
+    ushort2 s2 = *(device const packed_ushort2*)(blk + 34 + 4 * g);
+    uint q4 = uint(q2.x) | (uint(q2.y) << 16);
+    uint s4 = uint(s2.x) | (uint(s2.y) << 16);
     uint qh = blk[66 + g];
     uint sc = blk[74 + g];
     float sc0 = 0.5f + float(sc & 0x0Fu);
     float sc1 = 0.5f + float(sc >> 4);
+    float sum0 = 0.0f, sum1 = 0.0f;
     for (uint k = 0; k < 4; k++) {
-        float sk = (k < 2) ? sc0 : sc1;
         uint idx = ((q4 >> (8 * k)) & 0xFFu) | ((qh << (8 - 2 * k)) & 0x300u);
         uint2 gv = as_type<uint2>(IQ2S_GRID[idx]);
-        float4 v0 = float4(as_type<uchar4>(gv.x)) * sk;
-        float4 v1 = float4(as_type<uchar4>(gv.y)) * sk;
+        float4 g0 = float4(as_type<uchar4>(gv.x));
+        float4 g1 = float4(as_type<uchar4>(gv.y));
         uint s = (s4 >> (8 * k)) & 0xFFu;
-        for (uint j = 0; j < 4; j++) {
-            out[8 * k + j] = (s & (1u << j)) ? -v0[j] : v0[j];
-            out[8 * k + 4 + j] = (s & (16u << j)) ? -v1[j] : v1[j];
-        }
+        float4 s0 = select(g0, -g0, int4((s << 31), (s << 30), (s << 29), (s << 28)) < 0);
+        float4 s1 = select(g1, -g1, int4((s << 27), (s << 26), (s << 25), (s << 24)) < 0);
+        float d = dot(s0, xs[2 * k]) + dot(s1, xs[2 * k + 1]);
+        if (k < 2) sum0 += d; else sum1 += d;
     }
-    out[32] = cd_f16(blk) * 0.25f;
+    return (cd_f16(blk) * 0.25f) * (sc0 * sum0 + sc1 * sum1);
 }
 "#,
 };
 
 static WIDE_IQ3_S: Wide = Wide {
     uniform: true,
+    fused_dot: true,
     groups: 8,
     segs: 4,
     msl: r#"
 inline uint group_seg(uint g, uint k) { return (g * 4 + k) * 8; }
-inline void decode_group(device const uchar* blk, uint g, thread float* out) {
+inline float dot_group(device const uchar* blk, uint g, thread const float4* xs) {
     uint h = blk[66 + g];
-    uint s4 = cd_u32(blk + 74 + 4 * g);
+    ushort2 s2 = *(device const packed_ushort2*)(blk + 74 + 4 * g);
+    uint s4 = uint(s2.x) | (uint(s2.y) << 16);
+    ushort4 q4 = *(device const packed_ushort4*)(blk + 2 + 8 * g);
+    float sum = 0.0f;
     for (uint k = 0; k < 4; k++) {
-        uint q2 = cd_u16(blk + 2 + 8 * g + 2 * k);
-        float4 v0 = float4(as_type<uchar4>(IQ3S_GRID[(q2 & 0xFFu) | ((h << (8 - 2 * k)) & 256u)]));
-        float4 v1 = float4(as_type<uchar4>(IQ3S_GRID[(q2 >> 8) | ((h << (7 - 2 * k)) & 256u)]));
+        uint q2 = uint(q4[k]);
+        float4 g0 = float4(as_type<uchar4>(IQ3S_GRID[(q2 & 0xFFu) | ((h << (8 - 2 * k)) & 256u)]));
+        float4 g1 = float4(as_type<uchar4>(IQ3S_GRID[(q2 >> 8) | ((h << (7 - 2 * k)) & 256u)]));
         uint s = (s4 >> (8 * k)) & 0xFFu;
-        for (uint j = 0; j < 4; j++) {
-            out[8 * k + j] = (s & (1u << j)) ? -v0[j] : v0[j];
-            out[8 * k + 4 + j] = (s & (16u << j)) ? -v1[j] : v1[j];
-        }
+        float4 s0 = select(g0, -g0, int4((s << 31), (s << 30), (s << 29), (s << 28)) < 0);
+        float4 s1 = select(g1, -g1, int4((s << 27), (s << 26), (s << 25), (s << 24)) < 0);
+        sum += dot(s0, xs[2 * k]) + dot(s1, xs[2 * k + 1]);
     }
     uint sc = (uint(blk[106 + (g >> 1)]) >> (4 * (g & 1u))) & 0x0Fu;
-    out[32] = cd_f16(blk) * float(1 + 2 * int(sc));
+    return cd_f16(blk) * float(1 + 2 * int(sc)) * sum;
 }
 "#,
 };
