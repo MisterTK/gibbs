@@ -311,7 +311,7 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | `GIBBS_FUSION=xla` | Restricts the Metal planner to XLA's GPU fusion classes (elementwise chain, reduce-input, dot-epilogue, sibling same-kind), disabling horizontal batching for comparison (`src/graph/metal.rs`). |
 | `GIBBS_CB_CHUNK=<first>,<chunk>` | Steps encoded into the first Metal command buffer and into each subsequent buffer when a plan has at least 400 steps (default `24,160`; `0` encodes the whole forward pass in a single command buffer). |
 | `GIBBS_EXEC_ORDER_WEIGHTS=1` (also `on`, `true`) | Repacks Metal weight buffers in graph execution order at load time (experimental, off by default). |
-| `GIBBS_DELTANET_STATE=f16` (or `bf16`) | Stores the recurrent state of fused decode delta-rule layers in half / bfloat, with f32 arithmetic (opt-in, default `f32`; the host reads such a state only as raw bytes). |
+| `GIBBS_DELTANET_STATE=f16` (or `bf16`) | Stores the recurrent state of fused decode delta-rule layers in half / bfloat, with f32 arithmetic (opt-in, default `f32`; planning fails if a stateful delta rule stays unfused, and the host reads such a state only as raw bytes). |
 | `GIBBS_PROFILE_KERNELS=1` / `GIBBS_PROFILE_ROWS=<n>` | Prints a per-command-buffer kernel timing table by kind and the `<n>` slowest steps (default `10`) with effective GB/s and % of ceiling to stderr. |
 | `GIBBS_DUMP_PLAN=1` | Prints every planned Metal step index, name and kernel kind to stderr during `prepare_plan`. |
 | `GIBBS_TRACE_ENCODE=1` | Prints CPU command-buffer encode time (µs) and GPU execution time (ms) per decode step to stderr. |

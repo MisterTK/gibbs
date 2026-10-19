@@ -47,8 +47,8 @@ impl StateDtype {
 }
 
 // ponytail: a half/bfloat state is opaque to the host: `StateStore::snapshot`/`restore` round-trip its
-// bytes, but `sync_metal_to_cpu`, a CPU-seeded state, or an unfused `DeltaRule` on the same state read it
-// as f32. Hence opt-in only.
+// bytes, but `sync_metal_to_cpu` or a CPU-seeded state read it as f32. Hence opt-in only; an unfused
+// stateful `DeltaRule` (which reads f32) fails the plan instead (`check_state_dtype`).
 /// `GIBBS_DELTANET_STATE=f16|bf16` (read once); default f32.
 static STATE_DTYPE: std::sync::LazyLock<StateDtype> =
     std::sync::LazyLock::new(|| match std::env::var("GIBBS_DELTANET_STATE").as_deref() {
@@ -131,9 +131,9 @@ fn is_add(op: &Op) -> bool {
 }
 
 /// Replaces every matched decode (`n == 1`) chain by one fused step at the chain's last step.
-pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) {
+pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), String> {
     if fusion_policy() != FusionPolicy::Full {
-        return;
+        return check_state_dtype(steps, *STATE_DTYPE);
     }
     let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
     for (i, n) in g.nodes.iter().enumerate() {
@@ -164,6 +164,21 @@ pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) {
     drop.sort_unstable();
     for i in drop.into_iter().rev() {
         steps.remove(i);
+    }
+    check_state_dtype(steps, *STATE_DTYPE)
+}
+
+/// A non-f32 state is only written by the fused kernel: any stateful `DeltaRule` left unfused would
+/// read it as f32.
+fn check_state_dtype(steps: &[Planned], dtype: StateDtype) -> Result<(), String> {
+    match steps.iter().find(|s| {
+        matches!(s.op, super::super::Step::DeltaRule { state: Some(_), .. })
+    }) {
+        Some(s) if dtype != StateDtype::F32 => Err(format!(
+            "node '{}': GIBBS_DELTANET_STATE={dtype:?} needs every stateful DeltaRule fused, and this one is not",
+            s.name
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -501,20 +516,47 @@ mod tests {
     /// `(key_heads, val_heads, key_dim, val_dim, conv taps)`.
     type Dims = (usize, usize, usize, usize, usize);
 
-    /// One decode-token recurrent layer between its projections (inputs `x`, `z`, `b`, `a`), laid out
-    /// as the hybrid-LM graph builders emit it. Returns the graph, weights and the `log_decay` value.
-    fn layer((kh, vh, kd, vd, kw): Dims, sigmoid_gate: bool) -> (Graph, Weights, ValueId) {
+    /// One decode-token recurrent layer between its projections, laid out as the hybrid-LM graph
+    /// builders emit it. Inputs `x`, `z`, `b`, `a`; with `projected`, `z` (bf16 GEMV, so its SiLU
+    /// becomes the GEMV epilogue) and `a` (f32 Linear, so `+ dt_bias` becomes its residual) are
+    /// projections of an input `h` instead. Returns the graph, weights and the `log_decay` value.
+    fn layer(
+        (kh, vh, kd, vd, kw): Dims,
+        sigmoid_gate: bool,
+        projected: bool,
+    ) -> (Graph, Weights, ValueId) {
         let (kk, cd, f) = (kh * kd, 2 * kh * kd + vh * vd, DType::F32);
         let mut g = Graph::new();
         let mut w = Weights::new();
+        let x = g.input("x", vec![1, cd], f);
+        let (z, a) = if projected {
+            let hd = 64;
+            let h = g.input("h", vec![1, hd], f);
+            let bf16 = rand(vh * vd * hd, 9)
+                .iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect();
+            w.insert("w_z", Tensor::BF16(bf16));
+            w.insert("w_a", Tensor::F32(rand(vh * hd, 10)));
+            let (wz, wa) = (
+                g.weight("w_z", vec![vh * vd, hd], DType::BF16),
+                g.weight("w_a", vec![vh, hd], f),
+            );
+            (
+                g.add("proj_z", Op::Linear, &[h, wz], vec![1, vh * vd], f),
+                g.add("proj_a", Op::Linear, &[h, wa], vec![1, vh], f),
+            )
+        } else {
+            (
+                g.input("z", vec![1, vh * vd], f),
+                g.input("a", vec![1, vh], f),
+            )
+        };
+        let b = g.input("b", vec![1, vh], f);
         let mut weight = |g: &mut Graph, name: &str, shape: Vec<usize>, vals: Vec<f32>| {
             w.insert(name, Tensor::F32(vals));
             g.weight(name, shape, f)
         };
-        let x = g.input("x", vec![1, cd], f);
-        let z = g.input("z", vec![1, vh * vd], f);
-        let b = g.input("b", vec![1, vh], f);
-        let a = g.input("a", vec![1, vh], f);
         let conv_w = weight(&mut g, "conv_w", vec![cd, kw], rand(cd * kw, 5));
         let dt = weight(&mut g, "dt_bias", vec![vh], rand(vh, 6));
         let neg_a = weight(
@@ -602,28 +644,43 @@ mod tests {
             .collect()
     }
 
+    /// `(dims, sigmoid gate, projected)` cases: padded columns with rep 2, the 128x128 head with 16 rows
+    /// per thread, a 2-tap conv, and gate pieces absorbed into the projections.
+    const CASES: [(Dims, bool, bool); 4] = [
+        ((2, 4, 16, 48, 4), false, false),
+        ((2, 4, 128, 128, 4), true, false),
+        ((1, 1, 32, 32, 2), false, false),
+        ((2, 4, 16, 48, 4), false, true),
+    ];
+
     #[test]
     fn decode_chain_plans_one_step() {
-        for (dims, sigmoid_gate) in [((2, 4, 16, 48, 4), false), ((16, 16, 128, 128, 4), true)] {
-            let (g, _, _) = layer(dims, sigmoid_gate);
+        for (dims, sigmoid_gate, projected) in CASES {
+            let (g, _, _) = layer(dims, sigmoid_gate, projected);
             let (steps, _) = plan(&g).unwrap();
-            println!("{dims:?}: {:?}", listing(&g));
-            let [s] = steps.as_slice() else {
-                panic!("expected one step, got {}", steps.len())
+            println!("{dims:?} projected={projected}: {:?}", listing(&g));
+            let last = steps.last().expect("steps");
+            let Core::Ext(ExtStep::DeltaNet(st)) = &last.op else {
+                panic!("not fused: {:?}", listing(&g))
             };
-            let Core::Ext(ExtStep::DeltaNet(st)) = &s.op else {
-                panic!("not fused: {:?}", s.op)
-            };
-            assert_eq!(s.out, g.outputs[0]);
-            assert_eq!(st.z_act, if sigmoid_gate { 2 } else { 1 });
-            assert!(st.beta_sigmoid && st.dt_bias.is_some());
+            assert_eq!(steps.len(), if projected { 3 } else { 1 });
+            assert_eq!(last.out, g.outputs[0]);
+            assert!(st.beta_sigmoid);
             assert_eq!(st.state_dtype, StateDtype::F32);
+            // Projected: SiLU(z) is the z GEMV's epilogue and `+ dt_bias` the `a` Linear's residual.
+            let z_act = match (projected, sigmoid_gate) {
+                (true, _) => 0,
+                (false, true) => 2,
+                (false, false) => 1,
+            };
+            assert_eq!(st.z_act, z_act);
+            assert_eq!(st.dt_bias.is_some(), !projected);
         }
     }
 
     #[test]
     fn shared_intermediate_keeps_the_chain_unfused() {
-        let (mut g, _, ld) = layer((2, 4, 16, 48, 4), false);
+        let (mut g, _, ld) = layer((2, 4, 16, 48, 4), false, false);
         g.output(ld);
         let names = listing(&g);
         assert!(names.iter().any(|n| n.ends_with(" DeltaRule")), "{names:?}");
@@ -634,11 +691,14 @@ mod tests {
     }
 
     #[test]
-    fn oversized_heads_stay_unfused() {
+    fn oversized_heads_stay_unfused_and_refuse_reduced_state() {
         // key_dim 128 over val_dim 256 needs 32 state rows per thread (> MAX_RPT).
-        let (g, _, _) = layer((1, 1, 128, 256, 4), false);
+        let (g, _, _) = layer((1, 1, 128, 256, 4), false, false);
         let names = listing(&g);
         assert!(names.iter().any(|n| n.ends_with(" DeltaRule")), "{names:?}");
+        let (steps, _) = plan(&g).unwrap();
+        assert!(super::check_state_dtype(&steps, StateDtype::F32).is_ok());
+        assert!(super::check_state_dtype(&steps, StateDtype::F16).is_err());
     }
 
     fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -650,14 +710,11 @@ mod tests {
     /// Runs `tokens` decode steps on the CPU executor (f32 reference) and on Metal with the fused step
     /// storing its state as `dtype`; returns per-token (rel err, cosine) and the final state rel err.
     fn run(
-        dims: Dims,
-        sigmoid_gate: bool,
+        (dims, sigmoid_gate, projected): (Dims, bool, bool),
         dtype: StateDtype,
         tokens: usize,
     ) -> (Vec<(f32, f64)>, f32) {
-        let (kh, vh, kd, vd, _) = dims;
-        let cd = 2 * kh * kd + vh * vd;
-        let (g, w, _) = layer(dims, sigmoid_gate);
+        let (g, w, _) = layer(dims, sigmoid_gate, projected);
         let s = Session::new(rt(), &w).unwrap();
         let mut prep = s.prepare_plan(&g).unwrap();
         let fused: Vec<_> = prep
@@ -673,12 +730,15 @@ mod tests {
         let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
         let mut errs = Vec::new();
         for t in 0..tokens as u64 {
-            let inputs = vec![
-                Tensor::F32(rand(cd, 100 + t)),
-                Tensor::F32(rand(vh * vd, 200 + t)),
-                Tensor::F32(rand(vh, 300 + t)),
-                Tensor::F32(rand(vh, 400 + t)),
-            ];
+            let inputs: Vec<Tensor> = g
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let n = g.value(v).shape.iter().product();
+                    Tensor::F32(rand(n, 100 * (i as u64 + 1) + t))
+                })
+                .collect();
             let want = cpu::run(&g, &w, &mut cs, inputs.clone())
                 .unwrap()
                 .remove(0)
@@ -706,27 +766,23 @@ mod tests {
 
     #[test]
     fn fused_chain_matches_cpu_over_decode_steps() {
-        for (dims, sigmoid_gate) in [
-            ((2, 4, 16, 48, 4), false),
-            ((2, 4, 128, 128, 4), true),
-            ((1, 1, 32, 32, 2), false),
-        ] {
-            let (errs, state_err) = run(dims, sigmoid_gate, StateDtype::F32, 20);
+        for case in CASES {
+            let (errs, state_err) = run(case, StateDtype::F32, 20);
             for (t, &(e, _)) in errs.iter().enumerate() {
-                assert!(e < 1e-4, "{dims:?} token {t}: rel err {e}");
+                assert!(e < 1e-4, "{case:?} token {t}: rel err {e}");
             }
-            assert!(state_err < 1e-4, "{dims:?}: state rel err {state_err}");
+            assert!(state_err < 1e-4, "{case:?}: state rel err {state_err}");
         }
     }
 
     #[test]
     fn reduced_precision_state_tracks_f32_reference() {
-        // ponytail: bf16 bound is a margin guess (8-bit mantissa), not a measured floor.
+        // ponytail: bf16 bound is a margin guess (8-bit mantissa, round-to-nearest-even), not measured.
         for (dtype, min_cos) in [(StateDtype::F16, 0.9999), (StateDtype::BF16, 0.999)] {
-            for dims in [(2, 4, 16, 48, 4), (2, 4, 128, 128, 4)] {
-                let (errs, _) = run(dims, false, dtype, 32);
+            for case in [CASES[0], CASES[1]] {
+                let (errs, _) = run(case, dtype, 32);
                 let worst = errs.iter().map(|e| e.1).fold(1.0f64, f64::min);
-                assert!(worst >= min_cos, "{dtype:?} {dims:?}: min cosine {worst}");
+                assert!(worst >= min_cos, "{dtype:?} {case:?}: min cosine {worst}");
             }
         }
     }
