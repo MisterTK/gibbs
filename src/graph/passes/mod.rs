@@ -12,11 +12,21 @@ use crate::graph::{Graph, Weights};
 /// Runs all canonical graph optimization passes on `graph` and its `weights`.
 pub fn run_optimization_passes(
     graph: &mut Graph,
-    mut weights: Option<&mut Weights>,
+    weights: Option<&mut Weights>,
 ) -> Result<(), String> {
+    prefuse(graph);
+    fuse(graph, weights)
+}
+
+/// The passes before fusion: the graph [`crate::graph::egraph`] fusion starts from.
+pub fn prefuse(graph: &mut Graph) {
     canonical::run(graph);
     decompose::run(graph);
     dtype_adapt::run(graph);
+}
+
+/// The fusion passes (or the e-graph) and the SSA check.
+pub fn fuse(graph: &mut Graph, mut weights: Option<&mut Weights>) -> Result<(), String> {
     if *EGRAPH {
         // Phase-3 stage 1: the same three fusions, chosen by equality saturation + extraction.
         let r = crate::graph::egraph::fuse(
