@@ -819,6 +819,20 @@ mod tests {
         assert_eq!((m.rows, m.cols), (12, 256));
         assert_eq!(m.packed().map(|p| p.format), Some(Q::GGUF_Q4_K_M));
     }
+
+    /// `GIBBS_DISABLE=qkv_mat`: loader Mat triples and pairs stay unfused, plain weights still fuse.
+    #[test]
+    fn qkv_mat_disabled_leaves_mats_unfused() {
+        use crate::hardware::QuantFormat as Q;
+        crate::graph::TEST_DISABLE.with(|d| d.set("qkv_mat"));
+        let (k4, q4) = (DType::Quant(Q::GGUF_Q4_K_M), DType::Quant(Q::GGUF_Q4_0));
+        for dts in [[q4, q4, q4], [k4, k4, q4]] {
+            let (mut g, mut w, _) = qkv_graph(dts, true);
+            assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0);
+        }
+        let f = DType::F32;
+        assert_eq!(fuse_and_check([f, f, f]), ["q.fused_qkv"]);
+    }
 }
 
 /// Fuses QKV slices and RoPE directly into CachedAttention, eliminating intermediate Slice and RoPE

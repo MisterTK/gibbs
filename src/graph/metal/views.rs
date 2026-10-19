@@ -35,6 +35,9 @@ pub(super) fn elide(
     steps: &mut Vec<Planned>,
     aliases: &mut HashMap<ValueId, (ValueId, usize)>,
 ) {
+    if crate::graph::disabled("views") {
+        return;
+    }
     let mut i = 0;
     while i < steps.len() {
         if row_view(g, steps, i, aliases) || dest_passing(g, steps, i, aliases) {
@@ -379,6 +382,17 @@ mod tests {
             (offsets[&ea], offsets[&eb]),
             (offsets[&cat], offsets[&cat] + 32)
         );
+    }
+
+    /// `GIBBS_DISABLE=views`: every copy stays a step and nothing aliases.
+    #[test]
+    fn views_disabled_keeps_copies() {
+        let mut g = Graph::new();
+        concat_graph(&mut g);
+        crate::graph::TEST_DISABLE.with(|d| d.set("views"));
+        let (steps, aliases) = planned(&g);
+        assert_eq!(kinds(&steps), ["Unary", "Unary", "Copy", "Unary"]);
+        assert!(aliases.is_empty(), "{aliases:?}");
     }
 
     /// An alias root lives from its first writer (destination passing) to the last reader of any
