@@ -6003,6 +6003,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
         });
     }
     fuse_moe_subgraphs(g, &mut steps, &aliases);
+    ext::deltanet::fuse(g, &mut steps);
     Ok((steps, aliases))
 }
 
