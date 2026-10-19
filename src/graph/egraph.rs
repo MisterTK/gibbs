@@ -907,12 +907,13 @@ mod tests {
         dtype_adapt::run(g);
     }
 
-    /// The pass pipeline's fusions (what `run_optimization_passes` runs without `GIBBS_EGRAPH`).
+    /// The shipped pass pipeline (`GIBBS_EGRAPH` unset, so `run_optimization_passes` runs the passes).
     fn run_passes((g, w): &mut Gw) {
-        prep(g);
-        megakernel::fuse_megakernel_blocks_pass(g);
-        fusion::fuse_gate_up_pass(g, Some(w));
-        fusion::fuse_qkv_pass(g, Some(w));
+        assert!(
+            std::env::var_os("GIBBS_EGRAPH").is_none(),
+            "the reference pipeline must not be the e-graph"
+        );
+        crate::graph::passes::run_optimization_passes(g, Some(w)).expect("pass pipeline");
     }
 
     fn by_passes(gw: &Gw) -> Gw {
@@ -921,16 +922,9 @@ mod tests {
         gw
     }
 
-    fn by_egraph((mut g, mut w): Gw, rules: &[Rule]) -> (Gw, Report) {
+    fn by_egraph((mut g, mut w): Gw, rules: &[Rule], cost: &CostModel) -> (Gw, Report) {
         prep(&mut g);
-        let r = fuse(
-            &mut g,
-            Some(&mut w),
-            rules,
-            &CostModel::constants(),
-            Budget::default(),
-        )
-        .expect("egraph fusion");
+        let r = fuse(&mut g, Some(&mut w), rules, cost, Budget::default()).expect("egraph fusion");
         crate::graph::pattern::validate_ssa(&g).expect("SSA after egraph fusion");
         ((g, w), r)
     }
@@ -989,7 +983,7 @@ mod tests {
 
     fn check(what: &str, gw: &Gw) -> Report {
         let want = by_passes(gw);
-        let (got, r) = by_egraph(gw.clone(), DEFAULT_RULES);
+        let (got, r) = by_egraph(gw.clone(), DEFAULT_RULES, &CostModel::constants());
         assert_same(what, &want, &got);
         // Same rewriters in the same order: even the node order matches.
         let order = |g: &Graph| g.nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
@@ -1188,7 +1182,7 @@ mod tests {
         let mut want = gw.clone();
         prep(&mut want.0);
         assert_eq!(fusion::fuse_qkv_slices_and_attn_pass(&mut want.0, None), 1);
-        let (got, r) = by_egraph(gw, &[Rule::QkvSlicesAttn]);
+        let (got, r) = by_egraph(gw, &[Rule::QkvSlicesAttn], &CostModel::constants());
         assert_eq!(r.applied, [0, 0, 0, 1]);
         assert_same("qkv slices attn", &want, &got);
     }
@@ -1226,13 +1220,18 @@ mod tests {
                 crate::model::qwen3_5::tiny_moe_decode_graph().unwrap(),
             ),
         ];
-        for (what, gw) in &models {
+        let want = [
+            [4, 0, 4, 0],
+            [0; 4],
+            [1, 0, 0, 0],
+            [0; 4],
+            [2, 0, 0, 0],
+            [0; 4],
+        ];
+        for ((what, gw), want) in models.iter().zip(want) {
             let r = check(what, gw);
-            println!(
-                "{what}: {} nodes, applied {:?}, {r:?}",
-                gw.0.nodes.len(),
-                r.applied
-            );
+            println!("{what}: {} nodes, {r:?}", gw.0.nodes.len());
+            assert_eq!(r.applied, want, "{what}: fusions applied");
         }
     }
 
@@ -1275,7 +1274,8 @@ mod tests {
             let t = Instant::now();
             run_passes(&mut want);
             let pass_ms = t.elapsed().as_secs_f64() * 1e3;
-            let (got, r) = by_egraph(gw, DEFAULT_RULES);
+            // The shipped configuration: rates from the tune cache when present.
+            let (got, r) = by_egraph(gw, DEFAULT_RULES, &CostModel::from_tune_cache());
             assert_same(&p.display().to_string(), &want, &got);
             let order = |g: &Graph| g.nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
             println!(
