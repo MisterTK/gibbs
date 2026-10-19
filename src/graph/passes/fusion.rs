@@ -196,6 +196,24 @@ fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
     }
 }
 
+/// Whether `v` reaches an attention op without passing through another projection.
+fn feeds_attention(g: &Graph, v: crate::graph::ValueId) -> bool {
+    let mut stack = vec![v];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = stack.pop() {
+        for n in g.consumers(v) {
+            match n.op {
+                Op::Attention { .. }
+                | Op::CachedAttention { .. }
+                | Op::PagedCachedAttention { .. } => return true,
+                Op::Linear => {}
+                _ => stack.extend(n.outputs.iter().filter(|&&o| seen.insert(o))),
+            }
+        }
+    }
+    false
+}
+
 /// Fuses parallel Q, K, V linear projections branching from the same input into a single
 /// fused linear projection, followed by slices.
 ///
@@ -253,6 +271,15 @@ pub fn fuse_qkv_pass(graph: &mut Graph, mut weights: Option<&mut Weights>) -> us
         } else {
             return None;
         };
+        // A partial fusion only for attention projections, so unrelated mixed-format Linear
+        // trios on a shared input (routers, side projections) keep their own steps.
+        if legs.len() < all.len()
+            && !legs
+                .iter()
+                .all(|l| feeds_attention(g, g.node(l.1).outputs[0]))
+        {
+            return None;
+        }
         let dtype = g.value(legs[0].2).dtype;
 
         let w_shapes: Vec<Vec<usize>> = legs.iter().map(|l| g.value(l.2).shape.clone()).collect();
@@ -645,8 +672,9 @@ mod tests {
     }
 
     /// x -> norm -> {q,k,v} Linear with per-projection weight dtypes (F16 weights stand in for a
-    /// second codec). Returns the graph, its weights and the input.
-    fn qkv_graph(dts: [DType; 3]) -> (Graph, Weights, Vec<Tensor>) {
+    /// second codec), optionally consumed by an `Attention`. Returns the graph, its weights and
+    /// the input.
+    fn qkv_graph(dts: [DType; 3], attn: bool) -> (Graph, Weights, Vec<Tensor>) {
         let (h, rows) = (8usize, [8usize, 4, 4]);
         let mut g = Graph::new();
         let x = g.input("x", vec![1, h], DType::F32);
@@ -660,6 +688,7 @@ mod tests {
         );
         let mut weights = Weights::new();
         weights.insert("gamma", Tensor::F32(vec![1.0; h]));
+        let mut outs = Vec::new();
         for (i, name) in ["q", "k", "v"].into_iter().enumerate() {
             let n = rows[i] * h;
             let wn = format!("w_{name}");
@@ -684,6 +713,18 @@ mod tests {
             );
             let out = g.add(name, Op::Linear, &[norm, w], vec![1, rows[i]], DType::F32);
             g.output(out);
+            outs.push(out);
+        }
+        if attn {
+            let op = Op::Attention {
+                heads: 2,
+                kv_heads: 1,
+                causal: true,
+                window: None,
+                soft_cap: None,
+            };
+            let a = g.add("attn", op, &outs, vec![1, h], DType::F32);
+            g.output(a);
         }
         let input = vec![Tensor::F32((0..h).map(|i| i as f32 * 0.3 - 1.0).collect())];
         (g, weights, input)
@@ -693,7 +734,7 @@ mod tests {
     /// the remaining Linear nodes.
     fn fuse_and_check(dts: [DType; 3]) -> Vec<String> {
         use crate::graph::cpu::run_stateless;
-        let (g, w, input) = qkv_graph(dts);
+        let (g, w, input) = qkv_graph(dts, true);
         let base = run_stateless(&g, &w, input.clone()).unwrap();
         let (mut fg, mut fw) = (g.clone(), w.clone());
         assert_eq!(fuse_qkv_pass(&mut fg, Some(&mut fw)), 1);
@@ -719,7 +760,10 @@ mod tests {
         assert_eq!(fuse_and_check([h, h, f]), ["q.fused_qk", "v"]);
         assert_eq!(fuse_and_check([f, h, h]), ["k.fused_kv", "q"]);
         // Same-format pair not adjacent in q|k|v order: nothing to fuse.
-        let (mut g, mut w, _) = qkv_graph([h, f, h]);
+        let (mut g, mut w, _) = qkv_graph([h, f, h], true);
+        assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 0);
+        // Mixed-format trio that feeds no attention (router, side projections): left alone.
+        let (mut g, mut w, _) = qkv_graph([h, h, f], false);
         assert_eq!(fuse_qkv_pass(&mut g, Some(&mut w)), 0);
     }
 
