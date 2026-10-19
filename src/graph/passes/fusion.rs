@@ -199,7 +199,7 @@ pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
 }
 
 /// Whether `v` reaches an attention op without passing through another projection.
-fn feeds_attention(g: &Graph, v: crate::graph::ValueId) -> bool {
+pub(crate) fn feeds_attention(g: &Graph, v: crate::graph::ValueId) -> bool {
     let mut stack = vec![v];
     let mut seen = std::collections::HashSet::new();
     while let Some(v) = stack.pop() {
