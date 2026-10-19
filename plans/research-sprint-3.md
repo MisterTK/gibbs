@@ -5,22 +5,30 @@ Implement every Luminal technique Gibbs does not use yet, and every TODO from th
 
 ## Status on branch `sprint3` (implemented; nothing measured on the GPU)
 
-All code is on `sprint3`. The user's GPU was in use for training, so no benchmark, profile, A/B, `--bench-parity` or Metal kernel test has run. What did run, all CPU-only:
-- 102 tests that never touch a device (list: `target/sprint3/cpu-tests.txt` in the integration worktree);
-- `graph::metal::tests::every_kernel_source_compiles`, which builds the hand library (MSL 4.0 + MPP) and every generated GEMV/dequant/expert/PLE-chain variant into pipelines without dispatching. It caught a reserved MSL field name (`kernel`) in the new DeltaNet params that would have broken every Metal model at startup;
+All code is on `sprint3`. The user's GPU was in use for training, so no benchmark, profile, A/B or `--bench-parity` ran, and no kernel was dispatched on purpose. What ran, CPU-only:
+- 106 tests that never touch a device (list: `target/sprint3/cpu-tests.txt` in the integration worktree);
+- `graph::metal::tests::every_kernel_source_compiles`. It creates a device and builds pipelines without dispatching:
+  - the hand library (MSL 4.0 + MPP), every library kernel's pipeline (SIMD 32, at least the dispatched threads, 1024 for the delta-rule step);
+  - every generated GEMV/dequant/expert/PLE-chain variant.
+  It caught a reserved MSL field name (`kernel`) in the new DeltaNet params that would have broken every Metal model at startup;
 - CPU plan dumps (P0.2 tables in `autoresearch/sprint3-probes.md`);
 - `generic_guard` over `main..sprint3`.
+
+GPU contact that did happen, against the instruction:
+- **Agent test runs.** Two agents ran test-name prefix filters that included Metal tests: S3Qkv once with `graph::passes::` (the two `megakernel` fusion tests), and S3Egglog once with `graph::passes::` and `model::gemma4` (about 10 s of small sessions).
+- **Contaminated host profile.** Those runs wrote `~/.cache/gibbs/host/Apple-M5-Pro-25G241-4ed0d8e9b05eb2d9.json` (10:40, 156.0 GB/s measured under training load, against the 286.9 GB/s baseline). Its kernel hash matches `sprint3`, so the go-ahead bench would have reused it as the roofline ceiling. It is renamed `*.contaminated`, so the first quiet run re-measures. The tune file was last written the previous evening and is unaffected.
+- **Device on exit.** `plan_dump` loads the AGX driver on exit for M4 (no dispatch).
 
 | Item | State | Default | Per-token change in the CPU plan (dispatches) |
 | :--- | :--- | :--- | :--- |
 | P0.2 | done (`examples/plan_dump.rs`, `--rates`) | — | — |
 | P0.1 / P0.3 / P0.4 / P0.5 | `scripts/sprint3_probes.sh p01\|p03\|p04\|p05`, `bench/reference-7b.json`; not run | — | — |
-| 1.1 PLE | the default path was already 3 dispatches per layer (slice view, GeGlu GEMV epilogue, RmsNorm + residual); added the 2-dispatch chain | opt-in `GIBBS_PLE_FUSED=one` | −35 on E2B rows when on |
-| 1.2 q/k/v | fused over loader `Tensor::Mat` weights (no suite model fused q/k/v before), same-format pairs when formats differ, order-stable rewrites | on | M0/M8 −30, M1 −23, M2 −6, M3 −8 (from GGUF headers), M7 −50 |
-| 1.3 DeltaNet | one `DeltaNetStep` per layer (conv → gates → delta rule → gated norm) | on (`GIBBS_FUSION=none` disables) | M2 −126 (18 × 7); M3 −168 by layer count |
-| M2 BF16 fix (found by P0.2) | DeltaNet `in_proj_qkv`/`in_proj_z`/`out_proj` stay packed when the Qwen3.5 transform is an identity | on | about −467 MB/token streamed on M2; +18 dispatches from FP16 a/b no longer pairing |
-| 1.4 f16 KV | port of `v2-40`; split-K, flash and kv-append kernels store half, accumulate f32 | on (`GIBBS_KV_DTYPE=f32` restores) | 0 dispatches; KV bytes halved |
-| Phase 2 views | row-strided slice views for stride-taking readers (`RmsNormBatch`, `RopeBatch`, `Unary`), destination-passing concat, alias-root liveness | on | M2 −12 (q/gate copies) |
+| 1.1 PLE | the default path was already 3 dispatches per layer (slice view, GeGlu GEMV epilogue, RmsNorm + residual); added the 2-dispatch chain (quant codecs and BF16/F16 via the expert pseudo-codecs) | opt-in `GIBBS_PLE_FUSED=one` | M1 dump: 486 → 451 (36 `GluGemvChain`) when on |
+| 1.2 q/k/v | fused over loader `Tensor::Mat` weights (no suite model fused q/k/v before), same-format pairs when formats differ, order-stable rewrites | on (`GIBBS_DISABLE=qkv_mat`) | M0/M8 −30, M1 −23, M2 −6, M7 −50; M3 −8 inferred from GGUF headers, not dumped |
+| 1.3 DeltaNet | one `DeltaNetStep` per layer (conv → gates → delta rule → gated norm) | on (`GIBBS_DISABLE=deltanet`; `GIBBS_FUSION=none` also turns off epilogues, MoE and batching) | M2 −126 (18 × 7); M3 −168 inferred from layer count, not dumped |
+| M2 BF16 fix (found by P0.2) | DeltaNet `in_proj_qkv`/`in_proj_z`/`out_proj` stay packed when the Qwen3.5 transform is an identity | on (`GIBBS_DISABLE=qwen_packed`) | about −467 MB/token streamed on M2; +18 dispatches from FP16 a/b no longer pairing |
+| 1.4 f16 KV | port of `v2-40`; split-K, flash and kv-append kernels store half, accumulate f32; non-KV parity tests pinned to f32 KV at their original bounds | on (`GIBBS_KV_DTYPE=f32` restores) | 0 dispatches; KV bytes halved |
+| Phase 2 views | row-strided slice views for stride-taking readers (`RmsNormBatch`, `RopeBatch`, `Unary`), destination-passing concat, alias-root liveness | on (`GIBBS_DISABLE=views`) | M2 −12 (q/gate copies) |
 | Phase 3 e-graph | egglog 3.0; graph fusions and every planner fusion are rules; greedy matchers, destructive passes and the `Pattern` matcher deleted; `views::elide` and `pair_small_hand_gemvs` stay post-passes (they need arena offsets / tuned variants) | on (the only planner) | 0 by construction: plan dumps byte-identical before/after on rows 0/1/2/4/7 and 12 synthetic graphs |
 | Phase 4 search | per-layer-pattern flips of e-graph choices, timed with the tuner's gating, cached in the tune file, 2 s budget | opt-in `GIBBS_PLAN_SEARCH=1` | — |
 | Phase 5 | the PLE chain (above); the DeltaNet step runs one threadgroup per key head (the scoped persistent form) | as above | — |
@@ -40,9 +48,15 @@ All code is on `sprint3`. The user's GPU was in use for training, so no benchmar
 - M2's real gap included 467 MB/token of needlessly dequantized DeltaNet projections: about 1.80 GB streamed against the 1.33 GB the roofline counts.
 
 **Costs introduced:**
-- About +6 ms per uncached `prepare_plan` (egglog saturation floor). Gemma prefill's fixed 64-row chunks hit a 4-entry plan cache; scheduler prefill chunks (Llama/SmolLM path) vary in length and pay it each time.
-- Graph-level e-graph compile is 6–38 ms per model at load. The post-extraction weight rewrite adds 38–44 ms on M0/M1/M2 and 365 ms on M7.
-- Up to 378 MiB more resident memory on M7 for the concatenated q/k/v copies (worst case, if the original file pages stay resident).
+- **Planning time.** About +6 ms per uncached `prepare_plan` (egglog saturation floor).
+  - Greedy decode plans once and never re-plans.
+  - Gemma prefill's fixed 64-row chunks hit a 4-entry plan cache.
+  - Scheduler prefill now also goes through that cache, but its chunk sizes follow running averages and rarely repeat, so most chunks still pay it. The prefill timer includes planning, which shrinks the next budget. Rounding budgets to fixed sizes would fix this; not done, because it changes scheduler behavior.
+- **Load time.** Graph-level e-graph compile is 6–38 ms per model. The post-extraction weight rewrite adds 38–44 ms on M0/M1/M2 and 365 ms on M7.
+- **Memory.** Up to 378 MiB more resident on M7 for the concatenated q/k/v copies (worst case, if the original file pages stay resident).
+- **DeltaNet parallelism (unmeasured risk).** The fused step dispatches one 1024-thread group per key head: 16 groups, against 64 (M2) / 128 (M3) for the unfused delta rule. On M3 each group walks two value heads in sequence. The state traffic may lose more than the saved dispatches; `GIBBS_DISABLE=deltanet` isolates it.
+- **Plan-search memory.** `GIBBS_PLAN_SEARCH=1` clones the graph and weights, and re-concatenates q/k/v per candidate. That is cheap for mmap-backed weights but costly where the loader dequantized (M3). Do not enable it there before candidates share one weight set.
+- **Tuner margin.** `tune::beats` now needs a win strictly above the margin. That also applies to GEMV variant choice (ties keep the incumbent).
 
 **Pending the GPU go-ahead, in order:**
 1. Metal tests:
@@ -51,8 +65,8 @@ All code is on `sprint3`. The user's GPU was in use for training, so no benchmar
 2. `scripts/sprint3_probes.sh p01 p03 p04 p05`.
 3. ABBA (`scripts/loop_verify.sh`):
    - `main` vs `sprint3` on the whole suite.
-   - Within `sprint3`, A/B every item that has a switch: `GIBBS_KV_DTYPE=f32`, `GIBBS_FUSION=none` (covers the DeltaNet step), and each opt-in knob alone.
-   - q/k/v-over-`Mat`, views and the M2 packing fix have no switch, so they are measured together through the per-model rows. A model that loses gets bisected against its plan-dump deltas.
+   - Within `sprint3`, each default-on item with its switch: `GIBBS_DISABLE=qkv_mat`, `=views`, `=deltanet`, `=qwen_packed`, and `GIBBS_KV_DTYPE=f32`.
+   - Each opt-in knob alone.
 4. Merge to `main` only through the keep gate.
 
 ## Baseline (`main` @ `5de3057`, README rows = `bg_232` cand1 pass)
