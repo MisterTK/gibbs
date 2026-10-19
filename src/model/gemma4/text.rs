@@ -1437,6 +1437,53 @@ mod tests {
         }
     }
 
+    /// Greedy decoding on Metal with f16 and with f32 KV caches over the pseudo-random tiny MoE model (a
+    /// sliding layer with an 8-position window and a full layer): 48 steps give the same token stream and
+    /// logits within f16 rounding of the cached K/V.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_moe_greedy_stream_f16_kv_matches_f32() {
+        use crate::graph::metal::{Runtime, Session};
+        use crate::graph::{StateStore, Tensor};
+        let model = tiny_moe_model();
+        let (g, w) = model.to_decode_graph().unwrap();
+        let rt = Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
+        let stream = |kv_f16: bool| {
+            let mut session = Session::new(rt.clone(), &w).unwrap();
+            session.set_kv_f16(kv_f16);
+            let plan = session.prepare_plan(&g).unwrap();
+            assert_eq!(!plan.f16_states.is_empty(), kv_f16);
+            let mut state = StateStore::new();
+            let (mut tok, mut toks, mut all_logits) = (5u32, vec![], vec![]);
+            for pos in 0..48u32 {
+                let mut emb = vec![0.0f32; model.hidden];
+                model.embed_row(tok, &mut emb);
+                let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos])];
+                let out = session
+                    .run_prepared(&g, &plan, Some(&mut state), inputs)
+                    .unwrap();
+                let logits = out[0].as_f32().unwrap().to_vec();
+                tok = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0 as u32;
+                toks.push(tok);
+                all_logits.push(logits);
+            }
+            (toks, all_logits)
+        };
+        let (want_toks, want) = stream(false);
+        let (got_toks, got) = stream(true);
+        assert_eq!(got_toks, want_toks, "greedy streams diverge");
+        for (step, (w, g)) in want.iter().zip(&got).enumerate() {
+            let diff = w.iter().zip(g).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let scale = w.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+            assert!(diff / scale < 2e-3, "step {step}: max logit diff {diff} (scale {scale})");
+        }
+    }
+
     #[test]
     fn test_gemma4_to_decode_graph_cpu_parity() {
         use crate::graph::cpu::run_stateless;
@@ -1713,11 +1760,14 @@ mod tests {
         let metal_logits = metal_res[0].as_f32().expect("f32 metal logits");
 
         assert_eq!(cpu_logits.len(), metal_logits.len());
+        // Shared-KV layers read the cache: default f16 KV adds ~2^-11 relative rounding per cached value.
+        let scale = cpu_logits.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let bound = if crate::graph::metal::kv_f16_default() { 1e-4 + 2e-3 * scale } else { 1e-4 };
         for (i, (&c, &m)) in cpu_logits.iter().zip(metal_logits).enumerate() {
             let diff = (c - m).abs();
             assert!(
-                diff < 1e-4,
-                "Metal mismatch at index {i}: cpu={c}, metal={m}"
+                diff < bound,
+                "Metal mismatch at index {i}: cpu={c}, metal={m} (bound {bound})"
             );
         }
     }
@@ -1842,9 +1892,12 @@ mod tests {
                 .zip(got)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
+            // Default f16 KV adds ~2^-11 relative rounding per cached K/V, growing with the logit scale.
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let bound = if crate::graph::metal::kv_f16_default() { 2e-3 + 2e-3 * scale } else { 2e-3 };
             assert!(
-                worst < 2e-3,
-                "blocks {blocks:?}: max |host - metal| = {worst}"
+                worst < bound,
+                "blocks {blocks:?}: max |host - metal| = {worst} (bound {bound})"
             );
         }
     }
