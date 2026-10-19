@@ -187,7 +187,7 @@ use metal::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::path::Path;
 use std::sync::Arc;
@@ -390,6 +390,22 @@ static KERNELS_MSL: std::sync::LazyLock<String> =
 /// `MTLLanguageVersion4_0`; the metal crate's enum stops at 3.x.
 const MSL_4_0: u64 = 0x40000;
 const ARENA_ALIGN: usize = 256;
+/// Largest finite f16. K/V values beyond it saturate (kernels and host uploads alike) rather than become inf.
+const F16_MAX: f32 = 65504.0;
+
+/// Whether attention KV caches default to f16 storage: yes, unless `GIBBS_KV_DTYPE=f32` (A/B switch;
+/// `f16` is also accepted). K/V rows are normalised projections, far inside f16 range; the kernels saturate
+/// at +-65504 and accumulate and softmax in f32.
+pub(crate) fn kv_f16_default() -> bool {
+    match std::env::var("GIBBS_KV_DTYPE").as_deref() {
+        Ok("f32") => false,
+        Ok("f16") | Err(_) => true,
+        Ok(other) => {
+            eprintln!("GIBBS_KV_DTYPE={other:?} is not f32 or f16; using f16");
+            true
+        }
+    }
+}
 /// Threads per threadgroup: element-wise and row kernels, and the 4-simdgroup GEMM/attention kernels.
 const TG: u64 = 256;
 const TG4: u64 = 128;
@@ -412,7 +428,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 70] = [
+const BASE_KERNELS: [&str; 81] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -466,17 +482,28 @@ const BASE_KERNELS: [&str; 70] = [
     "gemm_batched_q8_0_residual",
     "rope_general_f32",
     "kv_append_batched",
+    "kv_append_batched_f16",
     "attn_cached_f32",
     "flash_attn_cached_f32_1",
     "flash_attn_cached_f32_2",
     "flash_attn_cached_f32_4",
     "flash_attn_cached_f32_8",
     "flash_attn_cached_f32",
+    "flash_attn_cached_f16_1",
+    "flash_attn_cached_f16_2",
+    "flash_attn_cached_f16_4",
+    "flash_attn_cached_f16_8",
+    "flash_attn_cached_f16",
     "attn_cached_gqa_split_f32_1",
     "attn_cached_gqa_split_f32_2",
     "attn_cached_gqa_split_f32_4",
     "attn_cached_gqa_split_f32_8",
     "attn_cached_gqa_split_f32_16",
+    "attn_cached_gqa_split_f16_1",
+    "attn_cached_gqa_split_f16_2",
+    "attn_cached_gqa_split_f16_4",
+    "attn_cached_gqa_split_f16_8",
+    "attn_cached_gqa_split_f16_16",
     "attn_cached_merge_f32",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
@@ -1506,6 +1533,8 @@ pub struct Session {
     /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
     variant_override: Option<GemvVariant>,
     last_gpu_s: std::sync::atomic::AtomicU64,
+    /// Store attention KV caches (states read only as `CachedAttention` k/v operands) as f16.
+    kv_f16: bool,
 }
 /// Packs all active graph weights in `bufs` into one contiguous 256-byte-aligned `MTLBuffer`
 /// ordered by their first appearance along `graph.nodes` (execution order, E3).
@@ -2154,11 +2183,17 @@ impl Session {
             jesse_aux,
             variant_override: None,
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
+            kv_f16: kv_f16_default(),
         })
     }
     /// GPU seconds of the last completed (non-profiled) [`Self::run`] command buffer.
     pub fn last_gpu_seconds(&self) -> f64 {
         f64::from_bits(self.last_gpu_s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Stores attention KV caches as f16 (`true`) or f32 for plans prepared after this call;
+    /// the default is f16 unless `GIBBS_KV_DTYPE=f32`.
+    pub fn set_kv_f16(&mut self, on: bool) {
+        self.kv_f16 = on;
     }
     /// Repacks all weights of `self` into one contiguous 256-byte-aligned `MTLBuffer` ordered by
     /// their first appearance along `graph.nodes` (E3).
@@ -2374,6 +2409,11 @@ impl Session {
             }
         }
         self.assign_variants(&mut steps);
+        let f16_states = if self.kv_f16 {
+            assign_kv_dtypes(graph, &mut steps)
+        } else {
+            HashSet::new()
+        };
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
         pair_small_hand_gemvs(
             graph,
@@ -2424,27 +2464,22 @@ impl Session {
             match &s.op {
                 Step::CachedAttention {
                     heads,
-                    kv_heads: _,
+                    kv_heads,
                     head_dim,
-                    v_head_dim: _,
+                    v_head_dim,
                     window,
+                    kv_f16,
                     ..
                 } => {
-                    let kv_width = (*heads * *head_dim) as u64;
-                    let dtype_bytes = 2u64; // F16 KV cache
-                    let bytes_per_pos = kv_width * dtype_bytes;
-                    state_reads.push(StateRead {
-                        name: format!("{}_k", s.name),
-                        bytes_per_pos,
-                        window: *window,
-                        fixed_bytes: 0,
-                    });
-                    state_reads.push(StateRead {
-                        name: format!("{}_v", s.name),
-                        bytes_per_pos,
-                        window: *window,
-                        fixed_bytes: 0,
-                    });
+                    let eb = if *kv_f16 { 2u64 } else { 4 };
+                    for (suffix, width) in [("k", *head_dim), ("v", *v_head_dim)] {
+                        state_reads.push(StateRead {
+                            name: format!("{}_{suffix}", s.name),
+                            bytes_per_pos: (*kv_heads * width) as u64 * eb,
+                            window: *window,
+                            fixed_bytes: 0,
+                        });
+                    }
                     let nq = 1u64;
                     let nk = 1u64;
                     flops_per_run += 4 * nq * nk * (*head_dim as u64) * (*heads as u64);
@@ -2538,6 +2573,7 @@ impl Session {
             attn_pos_inputs,
             state_vars,
             value_locs,
+            f16_states,
         })
     }
 
@@ -2648,26 +2684,48 @@ impl Session {
         if let Some(st) = &mut state {
             for &(v, ref name) in &plan.state_vars {
                 let n = state_len(graph, v, need_rows)?;
+                let f16 = plan.f16_states.contains(name);
+                let eb = if f16 { 2 } else { 4 };
+                if st.metal_buffers.contains_key(name) && st.metal_f16.contains(name) != f16 {
+                    return Err(format!(
+                        "state '{name}' is stored as {} but this program needs {}",
+                        if f16 { "f32" } else { "f16" },
+                        if f16 { "f16" } else { "f32" },
+                    ));
+                }
                 let grown = st.metal_buffers.get(name).is_some_and(|(_, old)| *old < n);
                 if grown || !st.metal_buffers.contains_key(name) {
-                    let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                    let buf = new_shared_buffer(&self.rt.device, (n * eb).max(ARENA_ALIGN))?;
                     if let Some((old, old_n)) = st.metal_buffers.get(name) {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
-                                old.contents() as *const f32,
-                                buf.contents() as *mut f32,
-                                *old_n,
+                                old.contents() as *const u8,
+                                buf.contents() as *mut u8,
+                                *old_n * eb,
                             );
                         }
                     } else if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
                         let copy_len = cur_data.len().min(n);
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                cur_data.as_ptr(),
-                                buf.contents() as *mut f32,
-                                copy_len,
-                            );
+                        if f16 {
+                            // SAFETY: the buffer holds n >= copy_len u16s.
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(buf.contents() as *mut u16, copy_len)
+                            };
+                            for (d, &x) in dst.iter_mut().zip(cur_data) {
+                                *d = crate::model::f32_to_f16(x.clamp(-F16_MAX, F16_MAX));
+                            }
+                        } else {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    cur_data.as_ptr(),
+                                    buf.contents() as *mut f32,
+                                    copy_len,
+                                );
+                            }
                         }
+                    }
+                    if f16 {
+                        st.metal_f16.insert(name.clone());
                     }
                     let arc_buf = Arc::new(buf);
                     st.metal_buffers.insert(name.clone(), (arc_buf.clone(), n));
@@ -2680,15 +2738,16 @@ impl Session {
             let mut sbufs = self.state_buffers.lock();
             for &(v, ref name) in &plan.state_vars {
                 let n = state_len(graph, v, need_rows)?;
+                let want = (n * if plan.f16_states.contains(name) { 2 } else { 4 }).max(ARENA_ALIGN);
                 let have = sbufs.get(name).map_or(0, |b| b.length() as usize);
-                if have < (n * 4).max(ARENA_ALIGN) {
-                    let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                if have < want {
+                    let buf = new_shared_buffer(&self.rt.device, want)?;
                     if let Some(old) = sbufs.get(name) {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 old.contents() as *const u8,
                                 buf.contents() as *mut u8,
-                                have.min(n * 4),
+                                have.min(want),
                             );
                         }
                     }
@@ -3690,6 +3749,7 @@ impl Session {
                 soft_cap,
                 write,
                 m,
+                kv_f16,
             } => {
                 let start_pos = if let Some(p_val) = pos {
                     let (p_buf, p_off) = loc(p_val);
@@ -3704,7 +3764,7 @@ impl Session {
                 // State buffers are physically capped (4096 rows); never write or read past them.
                 if let Some(ks) = k_state {
                     let (kb, ko) = loc(ks);
-                    let rows = (kb.length() as usize - ko) / (stride * 4).max(1);
+                    let rows = (kb.length() as usize - ko) / (stride * if kv_f16 { 2 } else { 4 }).max(1);
                     if start_pos as usize + m > rows {
                         return Err(format!(
                             "KV cache holds {rows} positions on this backend; need {}",
@@ -3717,7 +3777,11 @@ impl Session {
                 if write && k_state.is_some() && v_state.is_some() && !fuse_kv_write {
                     let ks = k_state.unwrap();
                     let vs = v_state.unwrap();
-                    enc.set_compute_pipeline_state(rt.pso("kv_append_batched")?);
+                    enc.set_compute_pipeline_state(rt.pso(if kv_f16 {
+                        "kv_append_batched_f16"
+                    } else {
+                        "kv_append_batched"
+                    })?);
                     bind(0, k);
                     bind(1, v);
                     bind(2, ks);
@@ -3775,23 +3839,52 @@ impl Session {
                         *scratch_guard = Some(new_shared_buffer(&rt.device, bytes)?);
                     }
                 }
+                // [KV dtype f32, f16][head_dim <= 32, 64, 128, 256, 512].
+                const GQA: [[&str; 5]; 2] = [
+                    [
+                        "attn_cached_gqa_split_f32_1",
+                        "attn_cached_gqa_split_f32_2",
+                        "attn_cached_gqa_split_f32_4",
+                        "attn_cached_gqa_split_f32_8",
+                        "attn_cached_gqa_split_f32_16",
+                    ],
+                    [
+                        "attn_cached_gqa_split_f16_1",
+                        "attn_cached_gqa_split_f16_2",
+                        "attn_cached_gqa_split_f16_4",
+                        "attn_cached_gqa_split_f16_8",
+                        "attn_cached_gqa_split_f16_16",
+                    ],
+                ];
+                const FLASH: [[&str; 5]; 2] = [
+                    [
+                        "flash_attn_cached_f32_1",
+                        "flash_attn_cached_f32_2",
+                        "flash_attn_cached_f32_4",
+                        "flash_attn_cached_f32_8",
+                        "flash_attn_cached_f32",
+                    ],
+                    [
+                        "flash_attn_cached_f16_1",
+                        "flash_attn_cached_f16_2",
+                        "flash_attn_cached_f16_4",
+                        "flash_attn_cached_f16_8",
+                        "flash_attn_cached_f16",
+                    ],
+                ];
+                let nj = match head_dim.div_ceil(32) {
+                    0..=1 => 0,
+                    2 => 1,
+                    3..=4 => 2,
+                    5..=8 => 3,
+                    _ => 4,
+                };
                 enc.set_compute_pipeline_state(if gqa_decode {
-                    rt.pso(match head_dim.div_ceil(32) {
-                        0..=1 => "attn_cached_gqa_split_f32_1",
-                        2 => "attn_cached_gqa_split_f32_2",
-                        3..=4 => "attn_cached_gqa_split_f32_4",
-                        5..=8 => "attn_cached_gqa_split_f32_8",
-                        _ => "attn_cached_gqa_split_f32_16",
-                    })?
+                    rt.pso(GQA[kv_f16 as usize][nj])?
+                } else if kv_f16 {
+                    rt.pso(FLASH[1][nj])?
                 } else {
-                    rt.pso(match head_dim.div_ceil(32) {
-                        0..=1 => "flash_attn_cached_f32_1",
-                        2 => "flash_attn_cached_f32_2",
-                        3..=4 => "flash_attn_cached_f32_4",
-                        5..=8 => "flash_attn_cached_f32_8",
-                        _ => "flash_attn_cached_f32",
-                    })
-                    .or_else(|_| rt.pso("attn_cached_f32"))?
+                    rt.pso(FLASH[0][nj]).or_else(|_| rt.pso("attn_cached_f32"))?
                 });
                 bind(0, q);
                 bind(1, k_buf_id);
@@ -4362,6 +4455,8 @@ pub enum Step {
         soft_cap: Option<f32>,
         write: bool,
         m: usize,
+        /// The k/v state buffers hold f16 (set by `assign_kv_dtypes`).
+        kv_f16: bool,
     },
     PagedCachedAttention {
         q: ValueId,
@@ -4465,6 +4560,67 @@ pub struct PreparedPlan {
     pub(crate) attn_pos_inputs: Vec<(usize, usize)>,
     pub(crate) state_vars: Vec<(ValueId, String)>,
     pub(crate) value_locs: Vec<PlanValueLoc>,
+    /// Names of the states stored as f16 (see [`assign_kv_dtypes`]).
+    pub f16_states: HashSet<String>,
+}
+
+/// The one f16 KV cache policy (`Session::set_kv_f16`, `GIBBS_KV_DTYPE`): decides which states are
+/// stored as f16 and flags their `CachedAttention` steps. A state qualifies when every step reading it
+/// uses it as the k or v state of a `CachedAttention` (any other reader, e.g. a plain `Attention` or
+/// `StateReorder` over the same cache, needs f32), and both states of a step agree. Returns the f16
+/// state names.
+fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
+    let name_of = |v: ValueId| match &graph.value(v).kind {
+        ValueKind::State(n) => Some(n.clone()),
+        _ => None,
+    };
+    let kv_pair = |op: &Step| match op {
+        Step::CachedAttention {
+            k_state: Some(k),
+            v_state: Some(v),
+            ..
+        } => Some((*k, *v)),
+        _ => None,
+    };
+    let (mut f16, mut other) = (HashSet::new(), HashSet::new());
+    for s in steps.iter() {
+        let pair = kv_pair(&s.op);
+        for &r in &s.reads {
+            if let Some(n) = name_of(r) {
+                if pair.is_some_and(|(k, v)| r == k || r == v) {
+                    f16.insert(n);
+                } else {
+                    other.insert(n);
+                }
+            }
+        }
+    }
+    f16.retain(|n| !other.contains(n));
+    // A step's two states share one kernel dtype: drop a state whose partner dropped out.
+    loop {
+        let before = f16.len();
+        for s in steps.iter() {
+            if let Some((k, v)) = kv_pair(&s.op) {
+                let (kn, vn) = (name_of(k).unwrap_or_default(), name_of(v).unwrap_or_default());
+                if !(f16.contains(&kn) && f16.contains(&vn)) {
+                    f16.remove(&kn);
+                    f16.remove(&vn);
+                }
+            }
+        }
+        if f16.len() == before {
+            break;
+        }
+    }
+    for s in steps.iter_mut() {
+        if let Some((k, _)) = kv_pair(&s.op) {
+            let on = name_of(k).is_some_and(|n| f16.contains(&n));
+            if let Step::CachedAttention { kv_f16, .. } = &mut s.op {
+                *kv_f16 = on;
+            }
+        }
+    }
+    f16
 }
 
 /// Element count of the physical buffer for a state value: 2-D states with more than 4096 declared rows
@@ -5660,6 +5816,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         soft_cap: *soft_cap,
                         write: *write,
                         m,
+                        kv_f16: false,
                     },
                     m * *heads * *v_head_dim,
                 )
@@ -7463,7 +7620,7 @@ mod tests {
         let mut w = Weights::new();
         w.insert("gw", Tensor::F32(rand(hd, 1)));
         w.insert("inv", Tensor::F32(rand(hd / 2, 2)));
-        let sess1 = Session::new(rt(), &w).unwrap();
+        let mut sess1 = Session::new(rt(), &w).unwrap();
         let prep1 = sess1.prepare_plan(&g1).unwrap();
         assert_eq!(
             prep1.steps.len(),
@@ -7494,7 +7651,7 @@ mod tests {
             f,
         );
         g2.output(out2);
-        let sess2 = Session::new(rt(), &w).unwrap();
+        let mut sess2 = Session::new(rt(), &w).unwrap();
         let prep2 = sess2.prepare_plan(&g2).unwrap();
         assert_eq!(prep2.steps.len(), 1, "Q/K Rope fused into CachedAttention");
         assert!(matches!(
@@ -7502,18 +7659,24 @@ mod tests {
             Step::CachedAttention { rope: Some(_), .. }
         ));
 
-        for (g, sess) in [(&g1, &sess1), (&g2, &sess2)] {
-            let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
-            for step in 0..3u32 {
-                let inp = vec![
-                    Tensor::F32(rand(q_dim, 10 + step as u64)),
-                    Tensor::F32(rand(kv_dim, 20 + step as u64)),
-                    Tensor::F32(rand(kv_dim, 30 + step as u64)),
-                    Tensor::U32(vec![step]),
-                ];
-                let want = cpu::run(g, &w, &mut cs, inp.clone()).unwrap();
-                let got = sess.run_with_state(g, Some(&mut ms), inp).unwrap();
-                assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
+        // f16 KV covers the RoPE-fused f16 store; its rounding (<= 2^-11 of each K/V) sets the bound.
+        for (kv_f16, tol) in [(false, 1e-5), (true, 1e-3)] {
+            sess1.set_kv_f16(kv_f16);
+            sess2.set_kv_f16(kv_f16);
+            for (g, sess) in [(&g1, &sess1), (&g2, &sess2)] {
+                let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+                for step in 0..3u32 {
+                    let inp = vec![
+                        Tensor::F32(rand(q_dim, 10 + step as u64)),
+                        Tensor::F32(rand(kv_dim, 20 + step as u64)),
+                        Tensor::F32(rand(kv_dim, 30 + step as u64)),
+                        Tensor::U32(vec![step]),
+                    ];
+                    let want = cpu::run(g, &w, &mut cs, inp.clone()).unwrap();
+                    let got = sess.run_with_state(g, Some(&mut ms), inp).unwrap();
+                    let e = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                    assert!(e < tol, "f16 KV {kv_f16} step {step}: {e}");
+                }
             }
         }
     }
@@ -9685,6 +9848,12 @@ mod tests {
 
     #[test]
     fn test_stateful_cached_attention_parity() {
+        for (kv_f16, tol) in KV_DTYPES {
+            stateful_cached_attention_parity(kv_f16, tol);
+        }
+    }
+
+    fn stateful_cached_attention_parity(kv_f16: bool, tol: f32) {
         let (heads, kv_heads, hd) = (4, 2, 8);
         let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
         let max_seq = 32;
@@ -9726,7 +9895,8 @@ mod tests {
 
         let mut cpu_state = StateStore::new();
         let mut metal_state = StateStore::new();
-        let session = Session::new(rt(), &Weights::new()).unwrap();
+        let mut session = Session::new(rt(), &Weights::new()).unwrap();
+        session.set_kv_f16(kv_f16);
 
         // 1. Prefill chunk of m = 5 (positions 0..5)
         {
@@ -9751,7 +9921,7 @@ mod tests {
             let cpu_out_f32 = cpu_out[0].as_f32().unwrap();
             let metal_out_f32 = metal_out[0].as_f32().unwrap();
             assert!(
-                rel_err(cpu_out_f32, metal_out_f32) < 1e-4,
+                rel_err(cpu_out_f32, metal_out_f32) < tol,
                 "Prefill output mismatch: max rel err {}",
                 rel_err(cpu_out_f32, metal_out_f32)
             );
@@ -9760,7 +9930,7 @@ mod tests {
             let cpu_k = cpu_state.get("k_state").unwrap().as_f32().unwrap();
             let metal_k = metal_state.get("k_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_k, metal_k) < 1e-4,
+                rel_err(cpu_k, metal_k) < tol,
                 "Prefill k_state mismatch: max rel err {}",
                 rel_err(cpu_k, metal_k)
             );
@@ -9768,7 +9938,7 @@ mod tests {
             let cpu_v = cpu_state.get("v_state").unwrap().as_f32().unwrap();
             let metal_v = metal_state.get("v_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_v, metal_v) < 1e-4,
+                rel_err(cpu_v, metal_v) < tol,
                 "Prefill v_state mismatch: max rel err {}",
                 rel_err(cpu_v, metal_v)
             );
@@ -9798,7 +9968,7 @@ mod tests {
             let cpu_out_f32 = cpu_out[0].as_f32().unwrap();
             let metal_out_f32 = metal_out[0].as_f32().unwrap();
             assert!(
-                rel_err(cpu_out_f32, metal_out_f32) < 1e-4,
+                rel_err(cpu_out_f32, metal_out_f32) < tol,
                 "Decode step {step} output mismatch: max rel err {}",
                 rel_err(cpu_out_f32, metal_out_f32)
             );
@@ -9807,7 +9977,7 @@ mod tests {
             let cpu_k = cpu_state.get("k_state").unwrap().as_f32().unwrap();
             let metal_k = metal_state.get("k_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_k, metal_k) < 1e-4,
+                rel_err(cpu_k, metal_k) < tol,
                 "Decode step {step} k_state mismatch: max rel err {}",
                 rel_err(cpu_k, metal_k)
             );
@@ -9815,17 +9985,36 @@ mod tests {
             let cpu_v = cpu_state.get("v_state").unwrap().as_f32().unwrap();
             let metal_v = metal_state.get("v_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_v, metal_v) < 1e-4,
+                rel_err(cpu_v, metal_v) < tol,
                 "Decode step {step} v_state mismatch: max rel err {}",
                 rel_err(cpu_v, metal_v)
             );
         }
     }
 
+    /// (KV dtype is f16?, rel_err bound against the f32 CPU executor): f16 rounds each stored K/V to 11 bits
+    /// (<= 2^-11 relative, 2.4e-4 absolute on |x| <= 1 inputs).
+    const KV_DTYPES: [(bool, f32); 2] = [(false, 1e-4), (true, 1e-3)];
+
+    /// Smallest cosine between matching `hd`-wide head rows of `want` and `got`.
+    fn min_head_cosine(want: &[f32], got: &[f32], hd: usize) -> f32 {
+        want.chunks(hd)
+            .zip(got.chunks(hd))
+            .map(|(a, b)| crate::model::dit_graph::fixture::cosine(a, b))
+            .fold(1.0, f32::min)
+    }
+
     /// Decode over a cache long enough to split across threadgroups (full and sliding window, soft cap,
-    /// grouped KV heads): the split + merge path equals the CPU executor.
+    /// grouped KV heads): the split + merge path equals the CPU executor, with f32 and f16 KV caches
+    /// (f16: every head row at cosine >= 0.9999).
     #[test]
     fn split_decode_attention_matches_cpu() {
+        for (kv_f16, tol) in KV_DTYPES {
+            split_decode_attention_matches_cpu_for(kv_f16, tol);
+        }
+    }
+
+    fn split_decode_attention_matches_cpu_for(kv_f16: bool, tol: f32) {
         // (cache size, prefill length) pairs are looped below.
         // Query heads per KV head: 2 (a partial head tile), 8 (two full tiles), 1, 6 (tiles of 4 and 2),
         // 3 (a single tile of 3); head dims below 512 exercise the q-tile zero fill.
@@ -9847,7 +10036,6 @@ mod tests {
                     continue;
                 }
                 let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-                let tol = 1e-4;
                 for window in [None, Some(300), Some(90)] {
                     let make = |m: usize| {
                         let mut g = Graph::new();
@@ -9878,7 +10066,8 @@ mod tests {
                         g
                     };
                     let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
-                    let session = Session::new(rt(), &Weights::new()).unwrap();
+                    let mut session = Session::new(rt(), &Weights::new()).unwrap();
+                    session.set_kv_f16(kv_f16);
                     let step = |g: &Graph,
                                 m: usize,
                                 at: usize,
@@ -9893,7 +10082,10 @@ mod tests {
                         ];
                         let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
                         let got = session.run_with_state(g, Some(ms), inputs).unwrap();
-                        rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
+                        let (want, got) = (want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                        let cos = min_head_cosine(want, got, hd);
+                        assert!(cos >= 0.9999, "f16 KV {kv_f16} at {at} {window:?}: min cosine {cos}");
+                        rel_err(want, got)
                     };
                     let e = step(
                         &make(prefill),
@@ -9903,7 +10095,7 @@ mod tests {
                         &mut cpu_state,
                         &mut metal_state,
                     );
-                    assert!(e < tol, "prefill {window:?}: {e}");
+                    assert!(e < tol, "f16 KV {kv_f16} prefill {window:?}: {e}");
                     let decode = make(1);
                     // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
                     for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
@@ -9915,7 +10107,7 @@ mod tests {
                             &mut cpu_state,
                             &mut metal_state,
                         );
-                        assert!(e < tol, "decode at {at} {window:?}: {e}");
+                        assert!(e < tol, "f16 KV {kv_f16} decode at {at} {window:?}: {e}");
                     }
                 }
             }
@@ -10184,12 +10376,205 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             Tensor::U32(vec![1, 2, 3, 6, 6, 6]),
         ];
         let want = cpu::run(&g, &Weights::new(), &mut StateStore::new(), inputs.clone()).unwrap();
-        let session = Session::new(rt(), &Weights::new()).unwrap();
-        let got = session
-            .run_with_state(&g, Some(&mut StateStore::new()), inputs)
-            .unwrap();
-        let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-        assert!(err < 1e-4, "visible_end mismatch: {err}");
+        for (kv_f16, tol) in KV_DTYPES {
+            let mut session = Session::new(rt(), &Weights::new()).unwrap();
+            session.set_kv_f16(kv_f16);
+            let got = session
+                .run_with_state(&g, Some(&mut StateStore::new()), inputs.clone())
+                .unwrap();
+            let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            assert!(err < tol, "visible_end mismatch (f16 KV {kv_f16}): {err}");
+        }
+    }
+
+    /// `m` rows of cached attention over `[max_seq, kv_heads * hd]` k/v states named `k_state` / `v_state`.
+    fn kv_attn_graph(
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        window: Option<usize>,
+        max_seq: usize,
+        m: usize,
+    ) -> Graph {
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let mut g = Graph::new();
+        let q = g.input("q", vec![m, q_dim], DType::F32);
+        let k = g.input("k", vec![m, kv_dim], DType::F32);
+        let v = g.input("v", vec![m, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
+        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+        let pos = g.input("pos", vec![m], DType::U32);
+        let out = g.add(
+            "attn",
+            Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 1.0 / (hd as f32).sqrt(),
+                causal: true,
+                window,
+                soft_cap: None,
+                write: true,
+            },
+            &[q, k, v, ks, vs, pos],
+            vec![m, q_dim],
+            DType::F32,
+        );
+        g.output(out);
+        g
+    }
+
+    /// f16 KV caches against the f32 CPU executor: prefills of 1, 63, 64, 65 and 4096 rows then two decode
+    /// steps (the last prefill's first decode crosses the 4096-row physical buffer: grown by a byte copy and
+    /// split across threadgroups), grouped / ungrouped KV heads and a sliding window. The stored caches are
+    /// exactly the round-to-nearest-even f16 of what the CPU executor stored (prefill via `kv_append`,
+    /// decode via the split kernel's fused write).
+    #[test]
+    fn f16_kv_attention_matches_cpu_across_lengths() {
+        use crate::model::{f16_to_f32, f32_to_f16};
+        let max_seq = 4400;
+        for (heads, kv_heads, hd, window) in [
+            (4usize, 2usize, 32usize, None),
+            (4, 4, 32, None),
+            (8, 1, 64, Some(40usize)),
+        ] {
+            let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+            for prefill in [1usize, 63, 64, 65, 4096] {
+                let mut session = Session::new(rt(), &Weights::new()).unwrap();
+                session.set_kv_f16(true);
+                let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+                let mut at = 0;
+                for (i, m) in [prefill, 1, 1].into_iter().enumerate() {
+                    let g = kv_attn_graph(heads, kv_heads, hd, window, max_seq, m);
+                    let seed = 100 * i as u64 + 7;
+                    let inputs = vec![
+                        Tensor::F32(rand(m * q_dim, seed)),
+                        Tensor::F32(rand(m * kv_dim, seed + 1)),
+                        Tensor::F32(rand(m * kv_dim, seed + 2)),
+                        Tensor::U32((at..at + m).map(|p| p as u32).collect()),
+                    ];
+                    let want = cpu::run(&g, &Weights::new(), &mut cs, inputs.clone()).unwrap();
+                    let got = session.run_with_state(&g, Some(&mut ms), inputs).unwrap();
+                    let (want, got) = (want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                    let (e, cos) = (rel_err(want, got), min_head_cosine(want, got, hd));
+                    assert!(
+                        e < 1e-3 && cos >= 0.9999,
+                        "heads {heads}/{kv_heads} hd {hd} {window:?} prefill {prefill} chunk {i}: {e}, cos {cos}"
+                    );
+                    at += m;
+                }
+                assert!(ms.metal_f16.contains("k_state") && ms.metal_f16.contains("v_state"));
+                let n_buf = ms.metal_buffers["k_state"].1;
+                assert_eq!(ms.metal_buffers["k_state"].0.length() as usize, n_buf * 2);
+                ms.sync_metal_to_cpu();
+                for name in ["k_state", "v_state"] {
+                    let want = &cs.get(name).unwrap().as_f32().unwrap()[..at * kv_dim];
+                    let got = &ms.get(name).unwrap().as_f32().unwrap()[..at * kv_dim];
+                    for (i, (&w, &g)) in want.iter().zip(got).enumerate() {
+                        assert_eq!(
+                            g,
+                            f16_to_f32(f32_to_f16(w)),
+                            "{name}[{i}] of {at} positions: stored {g}, f32 {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Out-of-range K/V saturate at +-65504 instead of becoming inf; NaN stays NaN; tiny values flush to 0.
+    /// Covers `kv_append_batched_f16` (m = 2 prefill) and the split kernel's fused f16 write (m = 1).
+    #[test]
+    fn f16_kv_saturates_out_of_range_values() {
+        let k = [1e6, -1e6, 70000.0, f32::NAN];
+        let v = [65504.0, 65520.0, 1e-9, -2.5];
+        for m in [1usize, 2] {
+            let g = kv_attn_graph(1, 1, 4, None, 16, m);
+            let mut session = Session::new(rt(), &Weights::new()).unwrap();
+            session.set_kv_f16(true);
+            let mut st = StateStore::new();
+            let inputs = vec![
+                Tensor::F32(vec![1.0; 4 * m]),
+                Tensor::F32(k.repeat(m)),
+                Tensor::F32(v.repeat(m)),
+                Tensor::U32((0..m as u32).collect()),
+            ];
+            session.run_with_state(&g, Some(&mut st), inputs).unwrap();
+            let (ks, vs) = (st.read_metal("k_state").unwrap(), st.read_metal("v_state").unwrap());
+            for row in 0..m {
+                let (kr, vr) = (&ks[row * 4..row * 4 + 4], &vs[row * 4..row * 4 + 4]);
+                assert_eq!(kr[..3], [65504.0, -65504.0, 65504.0], "m {m} row {row}");
+                assert!(kr[3].is_nan(), "m {m} row {row}");
+                assert_eq!(vr, [65504.0, 65504.0, 0.0, -2.5], "m {m} row {row}");
+            }
+        }
+    }
+
+    /// CPU-only: a state is f16 only when every reader is a `CachedAttention` k/v operand. Layers sharing
+    /// a cache stay f16; a plain `Attention` over the cache keeps it f32.
+    #[test]
+    fn kv_dtype_follows_the_states_readers() {
+        let (heads, hd, max_seq) = (2, 8, 16);
+        let f = DType::F32;
+        let attn = |write| Op::CachedAttention {
+            heads,
+            kv_heads: heads,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 0.3,
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write,
+        };
+        let build = |shared: bool, plain_reader: bool| {
+            let mut g = Graph::new();
+            let q = g.input("q", vec![1, heads * hd], f);
+            let k = g.input("k", vec![1, heads * hd], f);
+            let v = g.input("v", vec![1, heads * hd], f);
+            let pos = g.input("pos", vec![1], DType::U32);
+            let ks = g.state("k_state", vec![max_seq, heads * hd], f);
+            let vs = g.state("v_state", vec![max_seq, heads * hd], f);
+            let a = g.add("a", attn(true), &[q, k, v, ks, vs, pos], vec![1, heads * hd], f);
+            g.output(a);
+            if shared {
+                let (ks2, vs2) = (
+                    g.state("k_state", vec![max_seq, heads * hd], f),
+                    g.state("v_state", vec![max_seq, heads * hd], f),
+                );
+                let b = g.add("b", attn(false), &[a, k, v, ks2, vs2, pos], vec![1, heads * hd], f);
+                g.output(b);
+            }
+            if plain_reader {
+                let plain = Op::Attention {
+                    heads,
+                    kv_heads: heads,
+                    causal: false,
+                    window: None,
+                    soft_cap: None,
+                };
+                let c = g.add("c", plain, &[q, ks, vs], vec![1, heads * hd], f);
+                g.output(c);
+            }
+            g
+        };
+        let assign = |g: &Graph| {
+            let (mut steps, _) = plan(g).unwrap();
+            let f16 = assign_kv_dtypes(g, &mut steps);
+            let flags: Vec<bool> = steps
+                .iter()
+                .filter_map(|s| match s.op {
+                    Step::CachedAttention { kv_f16, .. } => Some(kv_f16),
+                    _ => None,
+                })
+                .collect();
+            (f16.len(), flags)
+        };
+        assert_eq!(assign(&build(false, false)), (2, vec![true]));
+        assert_eq!(assign(&build(true, false)), (2, vec![true, true]));
+        assert_eq!(assign(&build(false, true)), (0, vec![false]));
+        assert_eq!(assign(&build(true, true)), (0, vec![false, false]));
     }
 
     #[test]
@@ -10673,7 +11058,9 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 .run_prepared(&g, &plan, Some(&mut m_state), inp)
                 .unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-            assert!(err < 1e-4, "step {step_pos}: rel_err {err}");
+            // Default f16 KV rounds each cached K/V (see `KV_DTYPES`).
+            let tol = KV_DTYPES[kv_f16_default() as usize].1;
+            assert!(err < tol, "step {step_pos}: rel_err {err}");
         }
     }
 
@@ -10775,7 +11162,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
             let got = sess.run_prepared(&g, &plan, Some(&mut ms), inp).unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-            assert!(err < 1e-4, "step {step}: rel_err {err}");
+            let tol = KV_DTYPES[kv_f16_default() as usize].1;
+            assert!(err < tol, "step {step}: rel_err {err}");
         }
     }
 
