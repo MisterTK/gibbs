@@ -396,27 +396,18 @@ const ARENA_ALIGN: usize = 256;
 /// Largest finite f16. K/V values beyond it saturate (kernels and host uploads alike) rather than become inf.
 const F16_MAX: f32 = 65504.0;
 
-/// Whether attention KV caches default to f16 storage: yes, unless `GIBBS_KV_DTYPE=f32` (A/B switch;
-/// `f16` is also accepted). K/V rows are normalised projections, far inside f16 range; the kernels saturate
-/// at +-65504 and accumulate and softmax in f32.
+/// Whether attention KV caches default to f16 storage: only with `GIBBS_KV_DTYPE=f16` (opt-in). The
+/// f16 kernels accumulate and softmax in f32 and saturate stores at +-65504, but decode with them was
+/// 3.6-24% slower across the suite (sprint 3 ABBA, M8 at 4k context worst), so f32 is the default.
 pub(crate) fn kv_f16_default() -> bool {
-    #[cfg(test)]
-    if KV_F32_IN_TEST.get() {
-        return false;
-    }
     match std::env::var("GIBBS_KV_DTYPE").as_deref() {
-        Ok("f32") => false,
-        Ok("f16") | Err(_) => true,
+        Ok("f16") => true,
+        Ok("f32") | Err(_) => false,
         Ok(other) => {
-            eprintln!("GIBBS_KV_DTYPE={other:?} is not f32 or f16; using f16");
-            true
+            eprintln!("GIBBS_KV_DTYPE={other:?} is not f32 or f16; using f32");
+            false
         }
     }
-}
-#[cfg(test)]
-thread_local! {
-    /// Test-only: sessions created on this thread default to f32 KV (parity tests not about KV dtype).
-    pub(crate) static KV_F32_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 /// Threads per threadgroup: element-wise and row kernels, and the 4-simdgroup GEMM/attention kernels.
 const TG: u64 = 256;
@@ -2228,7 +2219,7 @@ impl Session {
         f64::from_bits(self.last_gpu_s.load(std::sync::atomic::Ordering::Relaxed))
     }
     /// Stores attention KV caches as f16 (`true`) or f32 for plans prepared after this call;
-    /// the default is f16 unless `GIBBS_KV_DTYPE=f32`.
+    /// the default is f32 unless `GIBBS_KV_DTYPE=f16`.
     pub fn set_kv_f16(&mut self, on: bool) {
         self.kv_f16 = on;
     }
