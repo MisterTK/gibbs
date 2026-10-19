@@ -127,7 +127,12 @@ impl GraphProgram {
         mode: PlacementMode,
     ) -> Result<Self, String> {
         let _compiling = CompileGuard::enter();
-        crate::graph::passes::run_optimization_passes(&mut graph, Some(&mut weights))?;
+        crate::graph::passes::prefuse(&mut graph);
+        // Phase-4 plan search re-extracts fusions from the graph before fusion.
+        #[cfg(target_os = "macos")]
+        let search_base =
+            crate::graph::search::enabled().then(|| (graph.clone(), weights.clone()));
+        crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
         let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
             .ok()
             .map(|v| v.parse().unwrap_or(1));
@@ -136,23 +141,16 @@ impl GraphProgram {
         } else {
             available_devices()
         };
-        let plan = place_graph(&mut graph, mode, &available, &device_supports_op)
-            .map_err(|report| report.error())?;
-        assert!(
-            plan.segments.len() <= 1,
-            "placement yields at most one segment"
-        );
-        let primary_device = plan.primary_device();
-        if primary_device == Device::Metal {
-            crate::graph::passes::dtype_adapt::run(&mut graph);
-            crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut graph, &|f| {
-                device_supports_op(
-                    Device::Metal,
-                    &crate::graph::Op::Linear,
-                    crate::graph::DType::Quant(f),
-                )
-            })?;
+        #[allow(unused_mut)]
+        let mut plan = place_and_adapt(&mut graph, mode, &available)?;
+        #[cfg(target_os = "macos")]
+        if let (Some(base), Device::Metal, None) = (&search_base, plan.primary_device(), dump) {
+            let rt = crate::graph::metal::Runtime::shared()?;
+            if let Some(s) = searched(&rt, base, mode, &available) {
+                (graph, weights, plan) = s;
+            }
         }
+        let primary_device = plan.primary_device();
         #[cfg(target_os = "macos")]
         if let (Some(ctx), Device::Metal) = (dump, primary_device) {
             print!("{}", crate::graph::metal::plan_dump(&graph, ctx)?);
@@ -420,6 +418,72 @@ impl GraphProgram {
     }
 }
 
+/// Places `graph` (at most one segment) and, on Metal, adapts its dtypes to the Metal kernels.
+fn place_and_adapt(
+    graph: &mut Graph,
+    mode: PlacementMode,
+    available: &[Device],
+) -> Result<PlacementPlan, String> {
+    let plan = place_graph(graph, mode, available, &device_supports_op)
+        .map_err(|report| report.error())?;
+    assert!(
+        plan.segments.len() <= 1,
+        "placement yields at most one segment"
+    );
+    if plan.primary_device() == Device::Metal {
+        crate::graph::passes::dtype_adapt::run(graph);
+        crate::graph::passes::dtype_adapt::retype_uncoded_weights(graph, &|f| {
+            device_supports_op(Device::Metal, &Op::Linear, DType::Quant(f))
+        })?;
+    }
+    Ok(plan)
+}
+
+/// `GIBBS_PLAN_SEARCH=1` (research sprint 3, phase 4): the e-graph extraction of `base` (the
+/// graph before fusion) with the fusion choices this device timed faster than the cost model's
+/// ([`crate::graph::search`]); `None` when the e-graph or the chosen plan fails, which keeps the
+/// compiled plan.
+#[cfg(target_os = "macos")]
+fn searched(
+    rt: &std::sync::Arc<crate::graph::metal::Runtime>,
+    base: &(Graph, Weights),
+    mode: PlacementMode,
+    available: &[Device],
+) -> Option<(Graph, Weights, PlacementPlan)> {
+    use crate::graph::egraph::{Budget, CostModel, Fusion, DEFAULT_RULES};
+    let run = || {
+        let cost = CostModel::from_tune_cache();
+        let fusion = Fusion::new(&base.0, Some(&base.1), DEFAULT_RULES, &cost, Budget::default())?;
+        let mut state = StateStore::new();
+        let flips = rt.plan_search(fusion.choices(), |flip| {
+            let (g, w, _) = fused(base, &fusion, flip, mode, available)?;
+            let s = crate::graph::metal::Session::new_for_graph(rt.clone(), &w, Some(&g))?;
+            let plan = s.prepare_plan(&g)?;
+            s.time_decode(&g, &plan, &mut state)
+        });
+        fused(base, &fusion, &flips, mode, available)
+    };
+    run()
+        .map_err(|e| tracing::warn!("plan search: {e}; cost-model plan kept"))
+        .ok()
+}
+
+/// `base` with the cost model's fusions and `flip` toggled, SSA-checked, placed and adapted.
+#[cfg(target_os = "macos")]
+fn fused(
+    base: &(Graph, Weights),
+    fusion: &crate::graph::egraph::Fusion,
+    flip: &[usize],
+    mode: PlacementMode,
+    available: &[Device],
+) -> Result<(Graph, Weights, PlacementPlan), String> {
+    let (mut g, mut w) = base.clone();
+    fusion.apply(&mut g, Some(&mut w), flip)?;
+    crate::graph::pattern::validate_ssa(&g)?;
+    let p = place_and_adapt(&mut g, mode, available)?;
+    Ok((g, w, p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +499,86 @@ mod tests {
         let mut weights = Weights::new();
         weights.insert("w", Tensor::F32(vec![0.1; 16]));
         (g, weights)
+    }
+
+    /// Two identical decode layers (norm, three projections of one input, normed SwiGLU MLP):
+    /// every fusion pattern has two instances.
+    #[cfg(target_os = "macos")]
+    fn two_layers() -> (Graph, Weights) {
+        let (mut g, mut w) = (Graph::new(), Weights::new());
+        let mut n = 0.0f32;
+        let mut weight = |g: &mut Graph, name: String, shape: Vec<usize>| {
+            n += 1.0;
+            let len = shape.iter().product::<usize>();
+            w.insert(
+                name.clone(),
+                Tensor::F32((0..len).map(|i| (n + i as f32 * 0.37).sin() * 0.05).collect()),
+            );
+            g.weight(name, shape, DType::F32)
+        };
+        let mut x = g.input("x", vec![1, 64], DType::F32);
+        for l in 0..2 {
+            let mut lin = |g: &mut Graph, name: &str, x: ValueId, out: usize| {
+                let shape = if out == 0 { vec![64] } else { vec![out, g.value(x).shape[1]] };
+                let wv = weight(g, format!("l{l}.{name}.w"), shape);
+                let (op, out) = if out == 0 {
+                    (Op::RmsNorm { eps: 1e-5 }, 64)
+                } else {
+                    (Op::Linear, out)
+                };
+                g.add(format!("l{l}.{name}"), op, &[x, wv], vec![1, out], DType::F32)
+            };
+            let n1 = lin(&mut g, "n1", x, 0);
+            let q = lin(&mut g, "q", n1, 64);
+            let k = lin(&mut g, "k", n1, 64);
+            let v = lin(&mut g, "v", n1, 64);
+            let qk = g.add(format!("l{l}.qk"), Op::Add, &[q, k], vec![1, 64], DType::F32);
+            let a = g.add(format!("l{l}.a"), Op::Mul, &[qk, v], vec![1, 64], DType::F32);
+            let o = lin(&mut g, "o", a, 64);
+            let r1 = g.add(format!("l{l}.r1"), Op::Add, &[o, x], vec![1, 64], DType::F32);
+            let n2 = lin(&mut g, "n2", r1, 0);
+            let gate = lin(&mut g, "gate", n2, 128);
+            let up = lin(&mut g, "up", n2, 128);
+            let m = g.add(format!("l{l}.glu"), Op::SwiGlu, &[gate, up], vec![1, 128], DType::F32);
+            let d = lin(&mut g, "down", m, 64);
+            x = g.add(format!("l{l}.r2"), Op::Add, &[r1, d], vec![1, 64], DType::F32);
+        }
+        g.output(x);
+        (g, w)
+    }
+
+    /// GPU (compile-only while the device is reserved): the searched plan of a two-layer graph
+    /// computes what the cost-model plan computes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plan_search_keeps_the_cost_model_outputs() {
+        use crate::graph::egraph::{Budget, CostModel, Fusion, DEFAULT_RULES};
+        use crate::graph::metal::{Runtime, Session};
+        let (mut g, w) = two_layers();
+        crate::graph::passes::prefuse(&mut g);
+        let base = (g, w);
+        let (mode, available) = (PlacementMode::Pin(Device::Metal), [Device::Cpu, Device::Metal]);
+        let rt = Runtime::shared().unwrap();
+        let (sg, sw, _) = searched(&rt, &base, mode, &available).expect("plan search");
+        let cost = CostModel::from_tune_cache();
+        let fusion = Fusion::new(&base.0, Some(&base.1), DEFAULT_RULES, &cost, Budget::default())
+            .unwrap();
+        let pats = crate::graph::search::patterns(fusion.choices());
+        assert!(pats.iter().any(|p| p.ids.len() == 2), "{pats:?}");
+        let (cg, cw, _) = fused(&base, &fusion, &[], mode, &available).unwrap();
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).cos()).collect();
+        let run = |g: &Graph, w: &Weights| {
+            let s = Session::new_for_graph(rt.clone(), w, Some(g)).unwrap();
+            match s.run(g, vec![Tensor::F32(x.clone())]).unwrap().remove(0) {
+                Tensor::F32(v) => v,
+                _ => panic!("f32 output expected"),
+            }
+        };
+        let (a, b) = (run(&sg, &sw), run(&cg, &cw));
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() <= 1e-4 + 1e-3 * y.abs(), "[{i}] {x} vs {y}");
+        }
     }
 
     #[test]

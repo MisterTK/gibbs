@@ -652,6 +652,8 @@ pub struct Runtime {
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
+    /// Plan-search picks ([`crate::graph::search`]), persisted in the same file.
+    plan_cache: Mutex<tune::TuneCache<crate::graph::search::Pick>>,
 }
 
 impl Runtime {
@@ -722,6 +724,7 @@ impl Runtime {
             gen_psos: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
+            plan_cache: Mutex::new(tune::TuneCache::default()),
         };
         let profile_hash = src_hash ^ codec::source_hash().rotate_left(13);
         let profile_path = cache
@@ -828,6 +831,7 @@ impl Runtime {
         rt.profile_path = profile_path;
         rt.tune_path = cache.join("host").join(format!("tune-{tag}.json"));
         rt.tune = Mutex::new(tune::TuneCache::load(&rt.tune_path));
+        rt.plan_cache = Mutex::new(tune::TuneCache::load(&rt.tune_path));
         let p = &rt.profile;
         let gemm: Vec<String> = p
             .gemm
@@ -1262,6 +1266,28 @@ impl Runtime {
             cache.insert_contended(key, tuned);
         }
         best
+    }
+
+    /// [`crate::graph::search::run`] against this device's tune file: the choice ids to flip
+    /// from the cost-model extraction (`time(flips)`: best GPU µs of one step of that plan).
+    pub fn plan_search(
+        &self,
+        choices: &[crate::graph::search::Choice],
+        time: impl FnMut(&[usize]) -> Result<f64, String>,
+    ) -> Vec<usize> {
+        let kernels = fnv1a(KERNELS_MSL.as_bytes()) ^ codec::source_hash().rotate_left(13);
+        let flips = crate::graph::search::run(
+            choices,
+            kernels,
+            &mut self.plan_cache.lock(),
+            &self.tune_path,
+            tune::foreign_busy(),
+            crate::graph::search::BUDGET,
+            time,
+        );
+        // The timed runs are not decode tokens: keep them out of the run-sample ring.
+        take_run_samples();
+        flips
     }
 
     /// Starts [`Self::benchmark_codecs`] on a background thread unless this host profile already
@@ -2614,6 +2640,51 @@ impl Session {
     ) -> Result<Vec<Tensor>, String> {
         let plan = self.prepare_plan(graph)?;
         self.run_prepared(graph, &plan, state, inputs)
+    }
+
+    /// Best GPU µs of 5 runs of `plan` (after 2 warm-up runs) on dummy inputs: zero activations,
+    /// token id 1, other u32 inputs (positions) at 100 or half the smallest KV cache.
+    pub fn time_decode(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
+        state: &mut crate::graph::StateStore,
+    ) -> Result<f64, String> {
+        // Rows > 16: conv and recurrent states are not caches.
+        let pos = graph
+            .values
+            .iter()
+            .filter(|v| matches!(v.kind, ValueKind::State(_)))
+            .filter_map(|v| v.shape.first().copied())
+            .filter(|&r| r > 16)
+            .min()
+            .map_or(100, |r| (r as u32 / 2).min(100));
+        let inputs = || -> Vec<Tensor> {
+            graph
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let val = graph.value(v);
+                    let n: usize = val.shape.iter().product();
+                    match val.dtype {
+                        DType::U32 if plan.embedding_checks.iter().any(|c| c.0 == i) => {
+                            Tensor::U32(vec![1; n])
+                        }
+                        DType::U32 => Tensor::U32(vec![pos; n]),
+                        _ => Tensor::F32(vec![0.0; n]),
+                    }
+                })
+                .collect()
+        };
+        let mut best = f64::INFINITY;
+        for i in 0..7 {
+            self.run_prepared(graph, plan, Some(state), inputs())?;
+            if i >= 2 {
+                best = best.min(self.last_gpu_seconds() * 1e6);
+            }
+        }
+        Ok(best)
     }
 
     /// Runs `graph` using a pre-planned execution schedule.

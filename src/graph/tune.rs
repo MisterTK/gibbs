@@ -176,30 +176,37 @@ pub fn decide(
             return Some(w0);
         }
     }
-    let rate = |round: &[(GemvVariant, f64)], v: GemvVariant| {
+    let margin = if busy { BUSY_MARGIN } else { QUIET_MARGIN };
+    Some(beats(rounds, default, margin))
+}
+
+/// Of the entries of `rounds` (rates, higher is better; each round measured in another order),
+/// the one with the best worst-round ratio to `default`, provided that ratio is at least
+/// `1 + margin` in EVERY round; else `default` (ties and noise keep the incumbent).
+pub fn beats<T: Copy + PartialEq>(rounds: &[Vec<(T, f64)>], default: T, margin: f64) -> T {
+    let rate = |round: &[(T, f64)], v: T| {
         round
             .iter()
             .find(|t| t.0 == v)
             .map(|t| t.1)
             .filter(|g| g.is_finite() && *g > 0.0)
     };
-    let worst_ratio = |v: GemvVariant| {
+    let worst_ratio = |v: T| {
         rounds
             .iter()
             .map(|r| Some(rate(r, v)? / rate(r, default)?))
             .try_fold(f64::INFINITY, |m, ratio| Some(m.min(ratio?)))
     };
-    let margin = if busy { BUSY_MARGIN } else { QUIET_MARGIN };
-    Some(
-        first
-            .iter()
-            .map(|t| t.0)
-            .filter(|&v| v != default)
-            .filter_map(|v| Some((v, worst_ratio(v)?)))
-            .filter(|c| c.1 >= 1.0 + margin)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map_or(default, |c| c.0),
-    )
+    rounds
+        .first()
+        .into_iter()
+        .flatten()
+        .map(|t| t.0)
+        .filter(|&v| v != default)
+        .filter_map(|v| Some((v, worst_ratio(v)?)))
+        .filter(|c| c.1 >= 1.0 + margin)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(default, |c| c.0)
 }
 
 /// Maximum relative spread `(hi - lo) / hi` across rounds for a winner to be persisted to disk.
@@ -236,17 +243,34 @@ pub struct Tuned {
     pub gbps: f64,
 }
 
-/// Persisted winners: `"<format>|<rows>|<cols>|<kernel hash>"` -> result. Winners timed under foreign
-/// GPU load (`insert_contended`) answer `get` for this process only and are never written by `save`.
-#[derive(Default, Serialize, Deserialize)]
+/// Persisted winners: `"<format>|<rows>|<cols>|<kernel hash>"` -> result (other value types `V`
+/// share the file under their own key prefix). Winners timed under foreign GPU load
+/// (`insert_contended`) answer `get` for this process only and are never written by `save`.
+#[derive(Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct TuneCache {
-    entries: BTreeMap<String, Tuned>,
+pub struct TuneCache<V = Tuned> {
+    entries: BTreeMap<String, V>,
     #[serde(skip)]
-    contended: BTreeMap<String, Tuned>,
+    contended: BTreeMap<String, V>,
+}
+
+impl<V> Default for TuneCache<V> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            contended: BTreeMap::new(),
+        }
+    }
 }
 
 impl TuneCache {
+    pub fn key(format: &str, rows: usize, cols: usize, kernel_hash: u64) -> String {
+        format!("{format}|{rows}|{cols}|{kernel_hash:016x}")
+    }
+}
+
+impl<V: Clone + Serialize + serde::de::DeserializeOwned> TuneCache<V> {
+    /// Entries of `path` that parse as `V`; others (another value type's) are skipped.
     pub fn load(path: &Path) -> Self {
         let raw: BTreeMap<String, serde_json::Value> = std::fs::read(path)
             .ok()
@@ -287,24 +311,20 @@ impl TuneCache {
         }
     }
 
-    pub fn key(format: &str, rows: usize, cols: usize, kernel_hash: u64) -> String {
-        format!("{format}|{rows}|{cols}|{kernel_hash:016x}")
-    }
-
-    pub fn get(&self, key: &str) -> Option<Tuned> {
+    pub fn get(&self, key: &str) -> Option<V> {
         self.entries
             .get(key)
             .or_else(|| self.contended.get(key))
-            .copied()
+            .cloned()
     }
 
-    pub fn insert(&mut self, key: String, t: Tuned) {
+    pub fn insert(&mut self, key: String, t: V) {
         self.contended.remove(&key);
         self.entries.insert(key, t);
     }
 
     /// A winner measured while the GPU was busy: kept for this process, not persisted.
-    pub fn insert_contended(&mut self, key: String, t: Tuned) {
+    pub fn insert_contended(&mut self, key: String, t: V) {
         self.contended.insert(key, t);
     }
 }
@@ -397,7 +417,7 @@ mod tests {
             },
         );
         c.save(&path);
-        let back = TuneCache::load(&path);
+        let back: TuneCache = TuneCache::load(&path);
         assert_eq!(
             back.get(&k).map(|t| t.variant),
             Some(GemvVariant::generated(4))
@@ -422,14 +442,14 @@ mod tests {
         c.insert("quiet".into(), t(200.0));
         assert_eq!(c.get("busy").map(|x| x.gbps), Some(100.0));
         c.save(&path);
-        let back = TuneCache::load(&path);
+        let back: TuneCache = TuneCache::load(&path);
         assert!(back.get("busy").is_none());
         assert_eq!(back.get("quiet").map(|x| x.gbps), Some(200.0));
         // A later quiet measurement replaces the contended one.
         c.insert("busy".into(), t(250.0));
         c.save(&path);
         assert_eq!(
-            TuneCache::load(&path).get("busy").map(|x| x.gbps),
+            TuneCache::<Tuned>::load(&path).get("busy").map(|x| x.gbps),
             Some(250.0)
         );
         let _ = std::fs::remove_dir_all(dir);
