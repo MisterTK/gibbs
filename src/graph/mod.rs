@@ -22,6 +22,7 @@ pub mod pattern;
 pub mod placement;
 pub mod program;
 pub mod rocm;
+pub mod search;
 pub mod tune;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
