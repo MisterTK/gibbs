@@ -14,8 +14,8 @@ pub enum GemvKernel {
     Hand,
     /// The kernel generated from the format's codec (`codegen::gemv_packed`).
     Gen,
-    /// [`Self::Gen`] launched as 64-thread threadgroups (2 simdgroups), ggml-metal's K-quant
-    /// `mul_mv` shape (`N_SG_Q*_K = 2`).
+    /// [`Self::Gen`] launched as 64-thread threadgroups (2 simdgroups): ggml-metal's K-quant
+    /// `mul_mv` shape (`N_SG_Q*_K = 2`) and luminal 0.2's; rows per simdgroup from [`gen64_rows`].
     Gen64,
 }
 
@@ -29,6 +29,17 @@ pub struct GemvVariant {
 
 /// Rows per simdgroup the generated kernel is tried with.
 pub const GEN_ROWS: [u8; 3] = [1, 2, 4];
+
+/// Rows per simdgroup the 64-thread generated kernel ([`GemvKernel::Gen64`]) is tried with for codec
+/// format `f`: ggml-metal's `N_R0` (2 / 1 / 2 for Q4_K / Q5_K / Q6_K) and luminal 0.2's 4.
+pub fn gen64_rows(f: crate::hardware::QuantFormat) -> &'static [u8] {
+    use crate::hardware::QuantFormat as Q;
+    match f {
+        Q::GGUF_Q4_K_M | Q::GGUF_Q6_K => &[2, 4],
+        Q::GGUF_Q5_K_M => &[1, 4],
+        _ => &[],
+    }
+}
 
 impl GemvVariant {
     pub const HAND: Self = Self {

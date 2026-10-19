@@ -291,16 +291,9 @@ impl WeightFormat {
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
         }
-        if generated {
+        if let Some(f) = self.codec_format().filter(|_| generated) {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
-            // ggml-metal's K-quant launch shape: 2 simdgroups x N_R0 rows (2 / 1 / 2 for Q4_K / Q5_K / Q6_K).
-            match self.codec_format() {
-                Some(QuantFormat::GGUF_Q4_K_M | QuantFormat::GGUF_Q6_K) => {
-                    v.push(GemvVariant::generated64(2))
-                }
-                Some(QuantFormat::GGUF_Q5_K_M) => v.push(GemvVariant::generated64(1)),
-                _ => {}
-            }
+            v.extend(tune::gen64_rows(f).iter().map(|&r| GemvVariant::generated64(r)));
         }
         v
     }

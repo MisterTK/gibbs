@@ -1097,8 +1097,9 @@ mod tests {
             assert!(tg.contains("threadgroup uint grid[512];"));
             assert_eq!(tg.matches("(b, g, xs, grid);").count(), r);
             let buf = iq2_grid_msl(src.clone(), Iq2Grid::Buffer).unwrap();
-            assert!(buf.contains("constant uint2* grid [[buffer(5)]],"));
-            assert!(buf.contains("uint2 gw = grid[((q4 >> (8 * k)) & 0xFFu)];"));
+            assert!(buf.starts_with("struct Iq2GridTable { uint2 g[256]; };"));
+            assert!(buf.contains("constant Iq2GridTable& grid [[buffer(5)]],"));
+            assert!(buf.contains("uint2 gw = grid.g[((q4 >> (8 * k)) & 0xFFu)];"));
             for s in [&tg, &buf] {
                 assert!(!s.contains("as_type<uint2>(IQ2XXS_GRID[(q4"));
             }
@@ -1847,23 +1848,26 @@ pub enum Iq2Grid {
     Buffer,
 }
 
-/// Rewrites the IQ2_XXS [`gemv_indexed`] source so `dot_group` reads the grid through a `grid`
-/// pointer: a threadgroup `uint[512]` copy the kernel's 256 threads stage before any early return,
-/// or the `constant uint2*` buffer at slot 5. `Err` when the source lacks an anchor.
+/// Rewrites the IQ2_XXS [`gemv_indexed`] source so `dot_group` reads the grid through `grid`: a
+/// threadgroup `uint[512]` copy the kernel's 256 threads stage (2 stores each, one barrier) before
+/// any early return, or a reference to a sized `constant` table at slot 5 (statically sized, so the
+/// driver may preload it, which an unbounded `constant` pointer forbids). `Err` when the source lacks an anchor.
 pub fn iq2_grid_msl(src: String, mode: Iq2Grid) -> Result<String, String> {
     const IDX: &str = "((q4 >> (8 * k)) & 0xFFu)";
-    let (param, lookup, kparam, stage) = match mode {
+    let (decl, param, lookup, kparam, stage) = match mode {
         Iq2Grid::Program => return Ok(src),
         Iq2Grid::Threadgroup => (
+            "",
             "threadgroup const uint* grid",
             format!("uint2(grid[2u * {IDX}], grid[2u * {IDX} + 1u])"),
             "",
             "    threadgroup uint grid[512];\n    {\n        const uint t = sg * 32 + lane;\n        const uint2 e = as_type<uint2>(IQ2XXS_GRID[t]);\n        grid[2 * t] = e.x;\n        grid[2 * t + 1] = e.y;\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n",
         ),
         Iq2Grid::Buffer => (
-            "constant uint2* grid",
-            format!("grid[{IDX}]"),
-            "    constant uint2* grid [[buffer(5)]],\n",
+            "struct Iq2GridTable { uint2 g[256]; };\n",
+            "constant Iq2GridTable& grid",
+            format!("grid.g[{IDX}]"),
+            "    constant Iq2GridTable& grid [[buffer(5)]],\n",
             "",
         ),
     };
@@ -1876,13 +1880,14 @@ pub fn iq2_grid_msl(src: String, mode: Iq2Grid) -> Result<String, String> {
         (ids_param.to_string(), format!("{ids_param}{kparam}")),
         (body.to_string(), format!("{stage}{body}")),
     ];
-    edits.into_iter().try_fold(src, |s, (from, to)| {
+    let src = edits.into_iter().try_fold(src, |s, (from, to)| {
         if s.contains(&from) {
             Ok(s.replace(&from, &to))
         } else {
             Err(format!("IQ2_XXS grid {mode:?}: generated GEMV has no `{from}`"))
         }
-    })
+    })?;
+    Ok(format!("{decl}{src}"))
 }
 
 /// Dialect-parameterized [`gemv_indexed`] kernel across `Dialect::Msl`, `Dialect::Cuda`, and `Dialect::Hip`.
