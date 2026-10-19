@@ -1568,8 +1568,7 @@ mod tests {
         let ids = Tensor::U32(vec![0, 2, 5, 7, 9, 11, 13, 15]);
         let c = crate::graph::codec::codec(f).unwrap();
         let (dt, bank) = weight(Fmt::Q(f), experts * rows, cols, 1);
-        let routed_bytes =
-            top_k * rows * (cols / c.block_elems as usize) * c.block_bytes as usize;
+        let routed_bytes = top_k * rows * (cols / c.block_elems as usize) * c.block_bytes as usize;
         let mut g = Graph::new();
         let x = g.input("x", vec![x_rows, cols], DType::F32);
         let b = g.weight("bank", vec![experts * rows, cols], dt);
@@ -1638,11 +1637,10 @@ mod tests {
         let opts = super::CompileOptions::new();
         let compile_pso = |msl: &str, label: &str| {
             let src = format!("#include <metal_stdlib>\nusing namespace metal;\n{msl}");
-            let lib = s
-                .rt
-                .device
-                .new_library_with_source(&src, &opts)
-                .unwrap_or_else(|e| panic!("compile {label}: {e}"));
+            let lib =
+                s.rt.device
+                    .new_library_with_source(&src, &opts)
+                    .unwrap_or_else(|e| panic!("compile {label}: {e}"));
             let func = lib
                 .get_function(&super::gemv_indexed_name(c, params), None)
                 .expect("get function");
@@ -1699,5 +1697,340 @@ mod tests {
         println!(
             "iq2xxs_ablation 1408x2816: real_med_us={real_med_us:.1}us ({real_gbps:.1} GB/s) vs u16_med_us={u16_med_us:.1}us ({u16_gbps:.1} GB/s) vs live_q4_no_lut_med_us={live_q4_no_lut_med_us:.1}us ({stub_gbps:.1} GB/s) [lut_cost_us={lut_cost_us:.1}us]"
         );
+    }
+
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn tq2_0_tile_vector_vs_bit_hack_ablation() {
+        use crate::graph::codec::{codec, planar};
+        use crate::graph::codegen::{
+            gemv_common, gemv_packed, gemv_packed_name, gemv_rows_per_tg, GemvParams,
+        };
+        use metal::MTLResourceOptions;
+        use std::ffi::c_void;
+
+        let f = Q::GGUF_TQ2_0;
+        let c = codec(f).unwrap();
+        let pl = planar(f).unwrap();
+        let rt = rt();
+        let opts = super::CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+
+        let old_seg = "inline void tile_seg_GGUF_TQ2_0(uint4 q, uint k, thread float* out) {\n    const int lv = int(k >> 1) * 2;\n    for (uint w = 0; w < 2; w++) {\n        const uint x = q[(k & 1) * 2 + w];\n        for (int j = 0; j < 4; j++) {\n            const int sh = 21 - 8 * j - lv;\n            const uint y = sh >= 0 ? (x << sh) : (x >> -sh);\n            out[4 * w + j] = as_type<float>(0x3F800000u | (y & 0x00600000u)) - 1.25f;\n        }\n    }\n}";
+        let new_seg = "inline void tile_seg_GGUF_TQ2_0(uint4 q, uint k, thread float* out) {\n    const uint lv = (k >> 1) * 2;\n    const uint i0 = (k & 1) * 2;\n    *(thread packed_float4*)(out + 0) = float4(as_type<uchar4>((q[i0] >> lv) & 0x03030303u)) - 1.0f;\n    *(thread packed_float4*)(out + 4) = float4(as_type<uchar4>((q[i0 + 1] >> lv) & 0x03030303u)) - 1.0f;\n}";
+
+        for (rows, cols, r) in [
+            (12288usize, 1536usize, 4usize),
+            (1536, 12288, 1),
+            (65536, 1536, 4),
+        ] {
+            let params = GemvParams {
+                rows_per_sg: r,
+                ..Default::default()
+            };
+            let fn_name = gemv_packed_name(c, params);
+            let bithack_body = gemv_packed(c, params);
+            assert!(
+                bithack_body.contains(old_seg) && bithack_body.contains("acc0 += d * (4.0f * t);"),
+                "expected TILE_TQ2_0 bithack in generated MSL"
+            );
+            let uchar4_body = bithack_body
+                .replace(old_seg, new_seg)
+                .replace("acc0 += d * (4.0f * t);", "acc0 += d * (1.0f * t);");
+
+            let compile_pso = |body: &str, label: &str| {
+                let src = format!(
+                    "#include <metal_stdlib>\nusing namespace metal;\n{}{body}",
+                    gemv_common(&super::super::super::KERNELS_MSL)
+                );
+                let lib = rt
+                    .device
+                    .new_library_with_source(&src, &opts)
+                    .unwrap_or_else(|e| panic!("compile {label}: {e}"));
+                let func = lib.get_function(&fn_name, None).expect("get function");
+                rt.device
+                    .new_compute_pipeline_state_with_function(&func)
+                    .unwrap_or_else(|e| panic!("create {label} PSO: {e}"))
+            };
+            let bithack_pso = compile_pso(&bithack_body, "tq2_0 bithack");
+            let uchar4_pso = compile_pso(&uchar4_body, "tq2_0 uchar4");
+
+            let n_blocks = rows * (cols / c.block_elems as usize);
+            let raw = random_blocks(f, n_blocks, true, 100 + rows as u64 + cols as u64);
+            let repacked = pl.repack(&raw, c.block_bytes as usize);
+            let w_bytes = n_blocks * c.block_bytes as usize;
+            let xv = rand(cols, 200 + r as u64);
+
+            let w_buf = rt.device.new_buffer_with_data(
+                repacked.as_ptr() as *const c_void,
+                repacked.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let x_buf = rt.device.new_buffer_with_data(
+                xv.as_ptr() as *const c_void,
+                (xv.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_a = rt
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_b = rt
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+            #[repr(C)]
+            struct PackedGemvParams(u32, u32, u32, u32, u32);
+            let p_bytes = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
+            let rows_per_tg = gemv_rows_per_tg(params) as u64;
+            let grid = super::MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1);
+            let tg = super::MTLSize::new(256, 1, 1);
+
+            let run_n = |pso: &super::ComputePipelineState, out: &metal::Buffer, n: usize| -> f64 {
+                metal::objc::rc::autoreleasepool(|| {
+                    let cb = rt.queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(pso);
+                    enc.set_buffer(0, Some(&w_buf), 0);
+                    enc.set_buffer(1, Some(&x_buf), 0);
+                    enc.set_buffer(2, Some(out), 0);
+                    super::set_bytes(enc, 3, &p_bytes);
+                    enc.set_buffer(4, Some(out), 0);
+                    enc.set_buffer(5, Some(out), 0);
+                    for _ in 0..n {
+                        enc.dispatch_thread_groups(grid, tg);
+                    }
+                    enc.end_encoding();
+                    super::super::super::commit_and_wait(cb).unwrap();
+                    super::super::super::gpu_seconds(cb) / n as f64
+                })
+            };
+
+            run_n(&bithack_pso, &y_a, 1);
+            run_n(&uchar4_pso, &y_b, 1);
+            let got_a = unsafe { std::slice::from_raw_parts(y_a.contents() as *const f32, rows) };
+            let got_b = unsafe { std::slice::from_raw_parts(y_b.contents() as *const f32, rows) };
+            let err = rel_err(got_a, got_b);
+            assert!(err < 1e-5, "TQ2_0 {rows}x{cols} r={r} parity rel_err={err}");
+
+            for _ in 0..3 {
+                run_n(&bithack_pso, &y_a, 20);
+                run_n(&uchar4_pso, &y_b, 20);
+            }
+
+            let mut bithack_rounds = Vec::with_capacity(5);
+            let mut uchar4_rounds = Vec::with_capacity(5);
+            let mut uchar4_wins = 0usize;
+            for _round in 0..5 {
+                let mut a_sum = 0.0;
+                let mut b_sum = 0.0;
+                for leg in [0usize, 1, 1, 0] {
+                    if leg == 0 {
+                        a_sum += 0.5 * run_n(&bithack_pso, &y_a, 20);
+                    } else {
+                        b_sum += 0.5 * run_n(&uchar4_pso, &y_b, 20);
+                    }
+                }
+                if b_sum < a_sum {
+                    uchar4_wins += 1;
+                }
+                bithack_rounds.push(a_sum);
+                uchar4_rounds.push(b_sum);
+            }
+            bithack_rounds.sort_by(|a, b| a.total_cmp(b));
+            uchar4_rounds.sort_by(|a, b| a.total_cmp(b));
+            let (a_s, b_s) = (bithack_rounds[2], uchar4_rounds[2]);
+            let (bithack_med_us, uchar4_med_us) = (a_s * 1e6, b_s * 1e6);
+            let bithack_gbps = w_bytes as f64 / a_s / 1e9;
+            let uchar4_gbps = w_bytes as f64 / b_s / 1e9;
+            let med_ratio = bithack_med_us / uchar4_med_us;
+            println!(
+                "tq2_0_ablation shape={rows}x{cols}_r{r}: bithack_med_us={bithack_med_us:.1}us ({bithack_gbps:.1} GB/s) vs uchar4_med_us={uchar4_med_us:.1}us ({uchar4_gbps:.1} GB/s) [uchar4_wins={uchar4_wins}/5, med_ratio={med_ratio:.4}]"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "bandwidth measurement"]
+    fn kquant_fused_dot_ablation() {
+        use crate::graph::codec::codec;
+        use crate::graph::codegen::{
+            gemv_common, gemv_packed, gemv_packed_name, gemv_rows_per_tg, GemvParams,
+        };
+        use metal::MTLResourceOptions;
+        use std::ffi::c_void;
+
+        let rt = rt();
+        let opts = super::CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+
+        let q4k_unfused_fn = "inline void decode_group_GGUF_Q4_K_M(device const uchar* blk, uint g, thread float* out) {\n    float d = cd_f16(blk), dmin = cd_f16(blk + 2);\n    uint p = g >> 2;\n    device const ushort* q = (device const ushort*)(blk + 16 + p * 32 + (g & 3) * 8);\n    for (uint w = 0; w < 2; w++) {\n        uint a = uint(q[2 * w]) | (uint(q[2 * w + 1]) << 16);\n        float4 lo = float4(as_type<uchar4>(a & 0x0F0F0F0Fu));\n        float4 hi = float4(as_type<uchar4>((a >> 4) & 0x0F0F0F0Fu));\n        for (uint i = 0; i < 4; i++) { out[4 * w + i] = lo[i]; out[8 + 4 * w + i] = hi[i]; }\n    }\n    for (uint k = 0; k < 2; k++) {\n        uint sv, mv;\n        cd_k4(2 * p + k, blk + 4, sv, mv);\n        out[16 + k] = d * float(sv);\n        out[18 + k] = -(dmin * float(mv));\n    }\n}";
+        let q4k_fused_fn = "inline float dot_group_GGUF_Q4_K_M(device const uchar* blk, uint g, thread const float4* xs) {\n    float d = cd_f16(blk), dmin = cd_f16(blk + 2);\n    uint p = g >> 2;\n    ushort4 qw = *(device const packed_ushort4*)(blk + 16 + p * 32 + (g & 3) * 8);\n    uint a0 = uint(qw.x) | (uint(qw.y) << 16);\n    uint a1 = uint(qw.z) | (uint(qw.w) << 16);\n    float4 lo0 = float4(as_type<uchar4>(a0 & 0x0F0F0F0Fu));\n    float4 lo1 = float4(as_type<uchar4>(a1 & 0x0F0F0F0Fu));\n    float4 hi0 = float4(as_type<uchar4>((a0 >> 4) & 0x0F0F0F0Fu));\n    float4 hi1 = float4(as_type<uchar4>((a1 >> 4) & 0x0F0F0F0Fu));\n    float dot0 = dot(lo0, xs[0]) + dot(lo1, xs[1]);\n    float dot1 = dot(hi0, xs[2]) + dot(hi1, xs[3]);\n    uint sv0, mv0, sv1, mv1;\n    cd_k4(2 * p, blk + 4, sv0, mv0);\n    cd_k4(2 * p + 1, blk + 4, sv1, mv1);\n    float sx0 = dot(xs[0] + xs[1], float4(1.0f));\n    float sx1 = dot(xs[2] + xs[3], float4(1.0f));\n    return (d * float(sv0)) * dot0 - (dmin * float(mv0)) * sx0\n         + (d * float(sv1)) * dot1 - (dmin * float(mv1)) * sx1;\n}";
+
+        let q6k_unfused_fn = "inline void decode_group_GGUF_Q6_K(device const uchar* blk, uint g, thread float* out) {\n    float d = cd_f16(blk + 208);\n    uint n = g >> 2, l0 = (g & 3) * 8;\n    device const ushort* lo = (device const ushort*)(blk + n * 64 + l0);\n    device const ushort* hi = (device const ushort*)(blk + n * 64 + 32 + l0);\n    device const ushort* qh = (device const ushort*)(blk + 128 + n * 32 + l0);\n    for (uint w = 0; w < 2; w++) {\n        uint a = uint(lo[2 * w]) | (uint(lo[2 * w + 1]) << 16);\n        uint b = uint(hi[2 * w]) | (uint(hi[2 * w + 1]) << 16);\n        uint h = uint(qh[2 * w]) | (uint(qh[2 * w + 1]) << 16);\n        float4 c0 = float4(as_type<uchar4>((a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4)));\n        float4 c1 = float4(as_type<uchar4>((b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2)));\n        float4 c2 = float4(as_type<uchar4>(((a >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u)));\n        float4 c3 = float4(as_type<uchar4>(((b >> 4) & 0x0F0F0F0Fu) | ((h & 0xC0C0C0C0u) >> 2)));\n        for (uint i = 0; i < 4; i++) {\n            out[4 * w + i] = c0[i];\n            out[8 + 4 * w + i] = c1[i];\n            out[16 + 4 * w + i] = c2[i];\n            out[24 + 4 * w + i] = c3[i];\n        }\n    }\n    device const char* sc = (device const char*)(blk + 192 + n * 8 + (l0 >> 4));\n    for (uint k = 0; k < 4; k++) {\n        float s = d * float(sc[2 * k]);\n        out[32 + k] = s;\n        out[36 + k] = -32.0f * s;\n    }\n}";
+        let q6k_fused_fn = "inline float dot_group_GGUF_Q6_K(device const uchar* blk, uint g, thread const float4* xs) {\n    float d = cd_f16(blk + 208);\n    uint n = g >> 2, l0 = (g & 3) * 8;\n    device const ushort* lo = (device const ushort*)(blk + n * 64 + l0);\n    device const ushort* hi = (device const ushort*)(blk + n * 64 + 32 + l0);\n    device const ushort* qh = (device const ushort*)(blk + 128 + n * 32 + l0);\n    float4 dots = float4(0.0f);\n    for (uint w = 0; w < 2; w++) {\n        ushort2 lw = *(device const packed_ushort2*)(lo + 2 * w);\n        ushort2 hw = *(device const packed_ushort2*)(hi + 2 * w);\n        ushort2 qw = *(device const packed_ushort2*)(qh + 2 * w);\n        uint a = uint(lw.x) | (uint(lw.y) << 16);\n        uint b = uint(hw.x) | (uint(hw.y) << 16);\n        uint h = uint(qw.x) | (uint(qw.y) << 16);\n        float4 c0 = float4(as_type<uchar4>((a & 0x0F0F0F0Fu) | ((h & 0x03030303u) << 4)));\n        float4 c1 = float4(as_type<uchar4>((b & 0x0F0F0F0Fu) | ((h & 0x0C0C0C0Cu) << 2)));\n        float4 c2 = float4(as_type<uchar4>(((a >> 4) & 0x0F0F0F0Fu) | (h & 0x30303030u)));\n        float4 c3 = float4(as_type<uchar4>(((b >> 4) & 0x0F0F0F0Fu) | ((h & 0xC0C0C0C0u) >> 2)));\n        dots.x += dot(c0, xs[w]);\n        dots.y += dot(c1, xs[2 + w]);\n        dots.z += dot(c2, xs[4 + w]);\n        dots.w += dot(c3, xs[6 + w]);\n    }\n    device const char* sc = (device const char*)(blk + 192 + n * 8 + (l0 >> 4));\n    float acc = 0.0f;\n    for (uint k = 0; k < 4; k++) {\n        float s = d * float(sc[2 * k]);\n        float sx = dot(xs[2 * k] + xs[2 * k + 1], float4(1.0f));\n        acc += s * dots[k] - 32.0f * s * sx;\n    }\n    return acc;\n}";
+
+        for (f, rows, cols, r) in [
+            (Q::GGUF_Q4_K_M, 12288usize, 1536usize, 2usize),
+            (Q::GGUF_Q4_K_M, 4096, 1536, 1),
+            (Q::GGUF_Q6_K, 1536, 12288, 1),
+        ] {
+            let c = codec(f).unwrap();
+            let params = GemvParams {
+                rows_per_sg: r,
+                ..Default::default()
+            };
+            let fn_name = gemv_packed_name(c, params);
+            let unfused_body = gemv_packed(c, params);
+            let mut fused_body = if f == Q::GGUF_Q4_K_M {
+                assert!(unfused_body.contains(q4k_unfused_fn));
+                unfused_body.replace(q4k_unfused_fn, q4k_fused_fn)
+            } else {
+                assert!(unfused_body.contains(q6k_unfused_fn));
+                unfused_body.replace(q6k_unfused_fn, q6k_fused_fn)
+            };
+            let nseg = if f == Q::GGUF_Q4_K_M { 2usize } else { 4usize };
+            for k in 0..nseg {
+                let sx_line = format!(
+                    "        const float sx{k} = dot(xs[{}], float4(1.0f)) + dot(xs[{}], float4(1.0f));\n",
+                    2 * k,
+                    2 * k + 1
+                );
+                assert!(fused_body.contains(&sx_line));
+                fused_body = fused_body.replace(&sx_line, "");
+            }
+            for i in 0..r {
+                let seg_dot = |k: usize| {
+                    let o = 8 * k;
+                    format!(
+                        "dot(float4(v[{o}], v[{}], v[{}], v[{}]), xs[{}]) + dot(float4(v[{}], v[{}], v[{}], v[{}]), xs[{}])",
+                        o + 1, o + 2, o + 3, 2 * k, o + 4, o + 5, o + 6, o + 7, 2 * k + 1
+                    )
+                };
+                let mut dots = String::new();
+                for k in 0..nseg {
+                    dots += &format!(
+                        "            acc{i} += v[{}] * ({}) + v[{}] * sx{k};\n",
+                        8 * nseg + k,
+                        seg_dot(k),
+                        9 * nseg + k
+                    );
+                }
+                let v_len = 10 * nseg;
+                let old_row = format!(
+                    "            float v[{v_len}];\n            decode_group_{f:?}(b, g, v);\n{dots}"
+                );
+                let new_row = format!("            acc{i} += dot_group_{f:?}(b, g, xs);\n");
+                assert!(fused_body.contains(&old_row));
+                fused_body = fused_body.replace(&old_row, &new_row);
+            }
+
+            let compile_pso = |body: &str, label: &str| {
+                let src = format!(
+                    "#include <metal_stdlib>\nusing namespace metal;\n{}{body}",
+                    gemv_common(&super::super::super::KERNELS_MSL)
+                );
+                let lib = rt
+                    .device
+                    .new_library_with_source(&src, &opts)
+                    .unwrap_or_else(|e| panic!("compile {label}: {e}"));
+                let func = lib.get_function(&fn_name, None).expect("get function");
+                rt.device
+                    .new_compute_pipeline_state_with_function(&func)
+                    .unwrap_or_else(|e| panic!("create {label} PSO: {e}"))
+            };
+            let unfused_pso = compile_pso(&unfused_body, "kquant unfused");
+            let fused_pso = compile_pso(&fused_body, "kquant fused");
+
+            let n_blocks = rows * (cols / c.block_elems as usize);
+            let raw = random_blocks(f, n_blocks, true, 300 + rows as u64 + cols as u64);
+            let w_bytes = raw.len();
+            let xv = rand(cols, 400 + r as u64);
+
+            let w_buf = rt.device.new_buffer_with_data(
+                raw.as_ptr() as *const c_void,
+                raw.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let x_buf = rt.device.new_buffer_with_data(
+                xv.as_ptr() as *const c_void,
+                (xv.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_a = rt
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            let y_b = rt
+                .device
+                .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+            #[repr(C)]
+            struct PackedGemvParams(u32, u32, u32, u32, u32);
+            let p_bytes = PackedGemvParams(rows as u32, cols as u32, 1, 0, 0);
+            let rows_per_tg = gemv_rows_per_tg(params) as u64;
+            let grid = super::MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1);
+            let tg = super::MTLSize::new(256, 1, 1);
+
+            let run_n = |pso: &super::ComputePipelineState, out: &metal::Buffer, n: usize| -> f64 {
+                metal::objc::rc::autoreleasepool(|| {
+                    let cb = rt.queue.new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(pso);
+                    enc.set_buffer(0, Some(&w_buf), 0);
+                    enc.set_buffer(1, Some(&x_buf), 0);
+                    enc.set_buffer(2, Some(out), 0);
+                    super::set_bytes(enc, 3, &p_bytes);
+                    enc.set_buffer(4, Some(out), 0);
+                    enc.set_buffer(5, Some(out), 0);
+                    for _ in 0..n {
+                        enc.dispatch_thread_groups(grid, tg);
+                    }
+                    enc.end_encoding();
+                    super::super::super::commit_and_wait(cb).unwrap();
+                    super::super::super::gpu_seconds(cb) / n as f64
+                })
+            };
+
+            run_n(&unfused_pso, &y_a, 1);
+            run_n(&fused_pso, &y_b, 1);
+            let got_a = unsafe { std::slice::from_raw_parts(y_a.contents() as *const f32, rows) };
+            let got_b = unsafe { std::slice::from_raw_parts(y_b.contents() as *const f32, rows) };
+            let err = rel_err(got_a, got_b);
+            assert!(err < 1e-5, "{f:?} {rows}x{cols} r={r} parity rel_err={err}");
+
+            for _ in 0..3 {
+                run_n(&unfused_pso, &y_a, 20);
+                run_n(&fused_pso, &y_b, 20);
+            }
+
+            let mut unfused_rounds = Vec::with_capacity(5);
+            let mut fused_rounds = Vec::with_capacity(5);
+            let mut fused_wins = 0usize;
+            for _round in 0..5 {
+                let mut a_sum = 0.0;
+                let mut b_sum = 0.0;
+                for leg in [0usize, 1, 1, 0] {
+                    if leg == 0 {
+                        a_sum += 0.5 * run_n(&unfused_pso, &y_a, 20);
+                    } else {
+                        b_sum += 0.5 * run_n(&fused_pso, &y_b, 20);
+                    }
+                }
+                if b_sum < a_sum {
+                    fused_wins += 1;
+                }
+                unfused_rounds.push(a_sum);
+                fused_rounds.push(b_sum);
+            }
+            unfused_rounds.sort_by(|a, b| a.total_cmp(b));
+            fused_rounds.sort_by(|a, b| a.total_cmp(b));
+            let (a_s, b_s) = (unfused_rounds[2], fused_rounds[2]);
+            let (unfused_med_us, fused_med_us) = (a_s * 1e6, b_s * 1e6);
+            let unfused_gbps = w_bytes as f64 / a_s / 1e9;
+            let fused_gbps = w_bytes as f64 / b_s / 1e9;
+            let med_ratio = unfused_med_us / fused_med_us;
+            println!(
+                "kquant_ablation format={f:?} shape={rows}x{cols}_r{r}: unfused_med_us={unfused_med_us:.1}us ({unfused_gbps:.1} GB/s) vs fused_med_us={fused_med_us:.1}us ({fused_gbps:.1} GB/s) [fused_wins={fused_wins}/5, med_ratio={med_ratio:.4}]"
+            );
+        }
     }
 }

@@ -1696,7 +1696,7 @@ fn gemv_loop(codec: &Codec, p: GemvParams, dec: &str, row_base: &str, allow_tile
             row(i, &|br| format!("{gdec}(b, {}g, v);", br.group), &dots, v_len)
         })
         .collect();
-    let sx: String = if wd.uniform {
+    let sx: String = if wd.uniform || wd.fused_dot {
         String::new()
     } else {
         (0..nseg)
