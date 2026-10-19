@@ -17,15 +17,7 @@
 //! * **Cache.** The winning pattern states persist in the tune file (one per device) under
 //!   `plan|<patterns hash>|<kernel-source hash>`, never when measured under foreign load.
 
-// Seam until the e-graph stage-2 API lands (same fields as `egraph::Choice`).
-#[derive(Debug, Clone)]
-pub struct Choice {
-    pub id: usize,
-    pub kind: &'static str,
-    pub pattern: u64,
-    pub on: bool,
-    pub delta_us: f64,
-}
+use crate::graph::egraph::Choice;
 use crate::graph::tune::{self, TuneCache};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -98,7 +90,10 @@ pub fn cache_key(pats: &[Pattern], kernels_hash: u64) -> String {
     let mut ks: Vec<(u64, u64)> = pats.iter().map(|p| (p.key, p.ids.len() as u64)).collect();
     ks.sort_unstable();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for b in ks.iter().flat_map(|&(k, n)| k.to_le_bytes().into_iter().chain(n.to_le_bytes())) {
+    for b in ks
+        .iter()
+        .flat_map(|&(k, n)| k.to_le_bytes().into_iter().chain(n.to_le_bytes()))
+    {
         h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
     }
     format!("plan|{h:016x}|{kernels_hash:016x}")
@@ -263,10 +258,7 @@ fn measure(
     let fit = ((left / per - 1.0) / 2.0).floor().max(0.0) as usize;
     let cands = &cands[..fit.min(cands.len())];
     if cands.is_empty() {
-        return Err(format!(
-            "budget too short (one plan: {:.0} ms)",
-            per * 1e3
-        ));
+        return Err(format!("budget too short (one plan: {:.0} ms)", per * 1e3));
     }
     let mut us = vec![f64::INFINITY; cands.len() + 1];
     us[0] = base;
@@ -349,7 +341,15 @@ mod tests {
     fn quiet(choices: &[Choice], factors: &[(u64, f64)]) -> Vec<usize> {
         let mut cache = TuneCache::default();
         let path = tmp("quiet");
-        let out = run(choices, 1, &mut cache, &path, false, BUDGET, timer(choices, factors));
+        let out = run(
+            choices,
+            1,
+            &mut cache,
+            &path,
+            false,
+            BUDGET,
+            timer(choices, factors),
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         out
     }
@@ -396,10 +396,18 @@ mod tests {
         let mut calls: Vec<Vec<usize>> = Vec::new();
         let mut cache = TuneCache::default();
         let path = tmp("cap");
-        let out = run(&choices, 1, &mut cache, &path, false, BUDGET, |f: &[usize]| {
-            calls.push(f.to_vec());
-            Ok(1000.0)
-        });
+        let out = run(
+            &choices,
+            1,
+            &mut cache,
+            &path,
+            false,
+            BUDGET,
+            |f: &[usize]| {
+                calls.push(f.to_vec());
+                Ok(1000.0)
+            },
+        );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert!(out.is_empty());
         // Incumbent, 12 singles, 12 singles reversed, incumbent.
@@ -420,7 +428,10 @@ mod tests {
     fn clear_winners_flip_and_combine() {
         let c = model();
         assert_eq!(quiet(&c, &[(20, 0.95)]), [1, 4]);
-        assert_eq!(quiet(&c, &[(10, 0.95), (20, 0.97), (30, 1.1)]), [0, 1, 3, 4]);
+        assert_eq!(
+            quiet(&c, &[(10, 0.95), (20, 0.97), (30, 1.1)]),
+            [0, 1, 3, 4]
+        );
         // A combination slower than its best member keeps the single.
         let mut cache = TuneCache::default();
         let path = tmp("combo");
@@ -457,10 +468,26 @@ mod tests {
         let path = tmp("busy");
         let key = cache_key(&patterns(&c), 1);
         let mut cache = TuneCache::default();
-        let out = run(&c, 1, &mut cache, &path, true, BUDGET, timer(&c, &[(10, 0.95)]));
+        let out = run(
+            &c,
+            1,
+            &mut cache,
+            &path,
+            true,
+            BUDGET,
+            timer(&c, &[(10, 0.95)]),
+        );
         assert!(out.is_empty());
         let mut cache = TuneCache::default();
-        let out = run(&c, 1, &mut cache, &path, true, BUDGET, timer(&c, &[(10, 0.9)]));
+        let out = run(
+            &c,
+            1,
+            &mut cache,
+            &path,
+            true,
+            BUDGET,
+            timer(&c, &[(10, 0.9)]),
+        );
         assert_eq!(out, [0, 3]);
         assert_eq!(cache.get(&key).map(|p| p.set), Some(vec![(10, false)]));
         assert!(!path.exists());
@@ -483,7 +510,15 @@ mod tests {
         );
         tuned.save(&path);
         let mut cache = TuneCache::default();
-        let out = run(&c, 7, &mut cache, &path, false, BUDGET, timer(&c, &[(30, 0.8)]));
+        let out = run(
+            &c,
+            7,
+            &mut cache,
+            &path,
+            false,
+            BUDGET,
+            timer(&c, &[(30, 0.8)]),
+        );
         assert_eq!(out, [2, 5]);
         let key = cache_key(&patterns(&c), 7);
         assert_ne!(key, cache_key(&patterns(&c), 8));
@@ -509,7 +544,15 @@ mod tests {
         let path = tmp("timeout");
         let key = cache_key(&patterns(&c), 1);
         let mut cache = TuneCache::default();
-        let out = run(&c, 1, &mut cache, &path, false, Duration::ZERO, timer(&c, &[(10, 0.5)]));
+        let out = run(
+            &c,
+            1,
+            &mut cache,
+            &path,
+            false,
+            Duration::ZERO,
+            timer(&c, &[(10, 0.5)]),
+        );
         assert!(out.is_empty() && cache.get(&key).is_none());
         let out = run(&c, 1, &mut cache, &path, false, BUDGET, |f: &[usize]| {
             if f.is_empty() {
@@ -520,11 +563,19 @@ mod tests {
         });
         assert!(out.is_empty() && cache.get(&key).is_none());
         // A failing candidate is only dropped.
-        let out = run(&c, 1, &mut cache, &path, false, BUDGET, |f: &[usize]| match f.first() {
-            Some(0) => Err("plan".into()),
-            Some(1) => Ok(900.0),
-            _ => Ok(1000.0),
-        });
+        let out = run(
+            &c,
+            1,
+            &mut cache,
+            &path,
+            false,
+            BUDGET,
+            |f: &[usize]| match f.first() {
+                Some(0) => Err("plan".into()),
+                Some(1) => Ok(900.0),
+                _ => Ok(1000.0),
+            },
+        );
         assert_eq!(out, [1, 4]);
         assert!(!path.exists() || cache.get(&key).is_some());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

@@ -1272,7 +1272,7 @@ impl Runtime {
     /// from the cost-model extraction (`time(flips)`: best GPU µs of one step of that plan).
     pub fn plan_search(
         &self,
-        choices: &[crate::graph::search::Choice],
+        choices: &[crate::graph::egraph::Choice],
         time: impl FnMut(&[usize]) -> Result<f64, String>,
     ) -> Vec<usize> {
         let kernels = fnv1a(KERNELS_MSL.as_bytes()) ^ codec::source_hash().rotate_left(13);

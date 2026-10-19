@@ -10,7 +10,10 @@ use crate::graph::pattern::validate_ssa;
 use crate::graph::{Graph, Weights};
 
 /// Runs all canonical graph optimization passes on `graph` and its `weights`.
-pub fn run_optimization_passes(graph: &mut Graph, weights: Option<&mut Weights>) -> Result<(), String> {
+pub fn run_optimization_passes(
+    graph: &mut Graph,
+    weights: Option<&mut Weights>,
+) -> Result<(), String> {
     prefuse(graph);
     fuse(graph, weights)
 }
