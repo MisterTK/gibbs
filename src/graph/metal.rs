@@ -2457,6 +2457,58 @@ impl Session {
             }
         }
         let params_buffer_size = steps.len() * 64;
+        let mut embedding_checks = Vec::new();
+        let mut attn_pos_inputs = Vec::new();
+        let mut state_vars: Vec<(ValueId, String)> = Vec::new();
+        let mut state_idx_map: HashMap<String, usize> = HashMap::new();
+        for s in &steps {
+            if let Step::Embedding { ids, rows, .. } = s.op {
+                let pos = graph.inputs.iter().position(|&i| i == ids).ok_or_else(|| {
+                    format!("node '{}': Metal embedding ids must be a graph input (range-checked on the host)", s.name)
+                })?;
+                embedding_checks.push((pos, rows, s.name.clone()));
+            }
+            if let Step::CachedAttention {
+                pos: Some(p), m, ..
+            } = s.op
+            {
+                if let Some(i) = graph.inputs.iter().position(|&x| x == p) {
+                    if !attn_pos_inputs.contains(&(i, m)) {
+                        attn_pos_inputs.push((i, m));
+                    }
+                }
+            }
+            for &v in &s.reads {
+                if let ValueKind::State(name) = &graph.value(v).kind {
+                    if !state_idx_map.contains_key(name) {
+                        let idx = state_vars.len();
+                        state_idx_map.insert(name.clone(), idx);
+                        state_vars.push((v, name.clone()));
+                    }
+                }
+            }
+        }
+        let mut value_locs = Vec::with_capacity(graph.values.len());
+        for (idx, val) in graph.values.iter().enumerate() {
+            let v = ValueId(idx as u32);
+            let loc = if let ValueKind::State(name) = &val.kind {
+                if let Some(&state_idx) = state_idx_map.get(name) {
+                    PlanValueLoc::State(state_idx)
+                } else {
+                    let state_idx = state_vars.len();
+                    state_idx_map.insert(name.clone(), state_idx);
+                    state_vars.push((v, name.clone()));
+                    PlanValueLoc::State(state_idx)
+                }
+            } else if let Some(&off) = offsets.get(&v) {
+                PlanValueLoc::Arena(off)
+            } else if let Some((buf, off, _, _)) = self.weights.get(&val.name) {
+                PlanValueLoc::Weight(buf.clone(), *off)
+            } else {
+                PlanValueLoc::Unbound
+            };
+            value_locs.push(loc);
+        }
 
         Ok(PreparedPlan {
             steps,
@@ -2467,6 +2519,10 @@ impl Session {
             state_reads,
             flops_per_run,
             params_buffer_size,
+            embedding_checks,
+            attn_pos_inputs,
+            state_vars,
+            value_locs,
         })
     }
 
@@ -2553,94 +2609,79 @@ impl Session {
         }
         let steps = &plan.steps;
         let offsets = &plan.offsets;
-        for s in steps {
-            if let Step::Embedding { ids, rows, .. } = s.op {
-                let pos = graph.inputs.iter().position(|&i| i == ids).ok_or_else(|| {
-                    format!("node '{}': Metal embedding ids must be a graph input (range-checked on the host)", s.name)
-                })?;
-                let Tensor::U32(v) = &inputs[pos] else {
-                    unreachable!("dtype checked above")
-                };
-                if let Some((r, &id)) = v.iter().enumerate().find(|&(_, &id)| id as usize >= rows) {
-                    return Err(format!(
-                        "node '{}': row {r} id {id} out of range for table of {rows} rows",
-                        s.name
-                    ));
-                }
+        for &(pos, rows, ref name) in &plan.embedding_checks {
+            let Tensor::U32(v) = &inputs[pos] else {
+                unreachable!("dtype checked above")
+            };
+            if let Some((r, &id)) = v.iter().enumerate().find(|&(_, &id)| id as usize >= rows) {
+                return Err(format!(
+                    "node '{name}': row {r} id {id} out of range for table of {rows} rows"
+                ));
             }
         }
         // Positions this call touches: 2-D states keep at least 4096 rows and grow in 4096-row steps.
-        let need_rows = steps
+        let need_rows = plan
+            .attn_pos_inputs
             .iter()
-            .filter_map(|s| match s.op {
-                Step::CachedAttention {
-                    pos: Some(p), m, ..
-                } => {
-                    let i = graph.inputs.iter().position(|&x| x == p)?;
-                    match &inputs[i] {
-                        Tensor::U32(v) => v.first().map(|&x| x as usize + m),
-                        _ => None,
-                    }
-                }
+            .filter_map(|&(i, m)| match &inputs[i] {
+                Tensor::U32(v) => v.first().map(|&x| x as usize + m),
                 _ => None,
             })
             .max()
             .unwrap_or(0);
-        let mut state_map: HashMap<String, Arc<Buffer>> = HashMap::new();
+        let mut state_bufs: Vec<Arc<Buffer>> = Vec::with_capacity(plan.state_vars.len());
         if let Some(st) = &mut state {
-            for s in steps {
-                for &v in &s.reads {
-                    if let ValueKind::State(name) = &graph.value(v).kind {
-                        let n = state_len(graph, v, need_rows)?;
-                        let grown = st.metal_buffers.get(name).is_some_and(|(_, old)| *old < n);
-                        if grown || !st.metal_buffers.contains_key(name) {
-                            let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
-                            if let Some((old, old_n)) = st.metal_buffers.get(name) {
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        old.contents() as *const f32,
-                                        buf.contents() as *mut f32,
-                                        *old_n,
-                                    );
-                                }
-                            } else if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
-                                let copy_len = cur_data.len().min(n);
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        cur_data.as_ptr(),
-                                        buf.contents() as *mut f32,
-                                        copy_len,
-                                    );
-                                }
-                            }
-                            st.metal_buffers.insert(name.clone(), (Arc::new(buf), n));
+            for &(v, ref name) in &plan.state_vars {
+                let n = state_len(graph, v, need_rows)?;
+                let grown = st.metal_buffers.get(name).is_some_and(|(_, old)| *old < n);
+                if grown || !st.metal_buffers.contains_key(name) {
+                    let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                    if let Some((old, old_n)) = st.metal_buffers.get(name) {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                old.contents() as *const f32,
+                                buf.contents() as *mut f32,
+                                *old_n,
+                            );
                         }
-                        state_map.insert(name.clone(), st.metal_buffers[name].0.clone());
+                    } else if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
+                        let copy_len = cur_data.len().min(n);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                cur_data.as_ptr(),
+                                buf.contents() as *mut f32,
+                                copy_len,
+                            );
+                        }
                     }
+                    let arc_buf = Arc::new(buf);
+                    st.metal_buffers.insert(name.clone(), (arc_buf.clone(), n));
+                    state_bufs.push(arc_buf);
+                } else {
+                    state_bufs.push(st.metal_buffers[name].0.clone());
                 }
             }
         } else {
             let mut sbufs = self.state_buffers.lock();
-            for s in steps {
-                for &v in &s.reads {
-                    if let ValueKind::State(name) = &graph.value(v).kind {
-                        let n = state_len(graph, v, need_rows)?;
-                        let have = sbufs.get(name).map_or(0, |b| b.length() as usize);
-                        if have < (n * 4).max(ARENA_ALIGN) {
-                            let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
-                            if let Some(old) = sbufs.get(name) {
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        old.contents() as *const u8,
-                                        buf.contents() as *mut u8,
-                                        have.min(n * 4),
-                                    );
-                                }
-                            }
-                            sbufs.insert(name.clone(), Arc::new(buf));
+            for &(v, ref name) in &plan.state_vars {
+                let n = state_len(graph, v, need_rows)?;
+                let have = sbufs.get(name).map_or(0, |b| b.length() as usize);
+                if have < (n * 4).max(ARENA_ALIGN) {
+                    let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                    if let Some(old) = sbufs.get(name) {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                old.contents() as *const u8,
+                                buf.contents() as *mut u8,
+                                have.min(n * 4),
+                            );
                         }
-                        state_map.insert(name.clone(), sbufs[name].clone());
                     }
+                    let arc_buf = Arc::new(buf);
+                    sbufs.insert(name.clone(), arc_buf.clone());
+                    state_bufs.push(arc_buf);
+                } else {
+                    state_bufs.push(sbufs[name].clone());
                 }
             }
         }
@@ -2667,13 +2708,14 @@ impl Session {
             unsafe { std::ptr::copy_nonoverlapping(src, base.add(offsets[&v]), len * 4) };
         }
         let loc = |v: ValueId| -> (&Buffer, usize) {
-            if let ValueKind::State(name) = &graph.value(v).kind {
-                (&state_map[name], 0)
-            } else if let Some(&off) = offsets.get(&v) {
-                (arena, off)
-            } else {
-                let w = &self.weights[&graph.value(v).name];
-                (&w.0, w.1)
+            match &plan.value_locs[v.0 as usize] {
+                PlanValueLoc::State(idx) => (&state_bufs[*idx], 0),
+                PlanValueLoc::Arena(off) => (arena, *off),
+                PlanValueLoc::Weight(buf, off) => (buf, *off),
+                PlanValueLoc::Unbound => {
+                    let w = &self.weights[&graph.value(v).name];
+                    (&w.0, w.1)
+                }
             }
         };
         let params_buf = self.ensure_params_buffer(plan.params_buffer_size)?;
@@ -2733,7 +2775,12 @@ impl Session {
                 let encode_start = std::time::Instant::now();
                 let mut at = 0;
                 while at < steps.len() && err.is_none() {
-                    let end = if cbs.is_empty() { first } else { at + chunk }.min(steps.len());
+                    let end = if cbs.is_empty() {
+                        first
+                    } else {
+                        at.saturating_add(chunk)
+                    }
+                    .min(steps.len());
                     let cb = self.rt.queue.new_command_buffer().to_owned();
                     let enc = cb.new_compute_command_encoder();
                     let counted = Counted::new(enc);
@@ -4347,6 +4394,14 @@ pub struct StateRead {
     pub fixed_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum PlanValueLoc {
+    Arena(usize),
+    Weight(Buffer, usize),
+    State(usize),
+    Unbound,
+}
+
 /// A pre-planned execution schedule and arena allocation for a static graph.
 #[derive(Debug, Clone)]
 pub struct PreparedPlan {
@@ -4358,6 +4413,10 @@ pub struct PreparedPlan {
     pub state_reads: Vec<StateRead>,
     pub flops_per_run: u64,
     pub params_buffer_size: usize,
+    pub(crate) embedding_checks: Vec<(usize, usize, String)>,
+    pub(crate) attn_pos_inputs: Vec<(usize, usize)>,
+    pub(crate) state_vars: Vec<(ValueId, String)>,
+    pub(crate) value_locs: Vec<PlanValueLoc>,
 }
 
 /// Element count of the physical buffer for a state value: 2-D states with more than 4096 declared rows
@@ -6520,10 +6579,10 @@ fn cb_chunking() -> (usize, usize) {
                 let mut it = s.split(',').filter_map(|p| p.trim().parse::<usize>().ok());
                 match (it.next(), it.next()) {
                     (Some(a), Some(b)) if a > 0 && b > 0 => (a, b),
-                    _ => (24, 160),
+                    _ => (32, usize::MAX),
                 }
             }
-            None => (24, 160),
+            None => (32, usize::MAX),
         }
     })
 }
@@ -10460,6 +10519,93 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                     "BF16 ({rows0},{rows1},{cols}) out {i}: err {err}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn plan_value_locs_resolve_without_per_token_hashmap() {
+        let f = DType::F32;
+        let mut g = Graph::new();
+        let ids = g.input("ids", vec![1], DType::U32);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let emb_w = g.weight("emb", vec![8, 4], f);
+        let x = g.add("emb_lookup", Op::Embedding, &[emb_w, ids], vec![1, 4], f);
+        let wq = g.weight("wq", vec![4, 4], f);
+        let wk = g.weight("wk", vec![4, 4], f);
+        let wv = g.weight("wv", vec![4, 4], f);
+        let q = g.add("q", Op::Linear, &[x, wq], vec![1, 4], f);
+        let k = g.add("k", Op::Linear, &[x, wk], vec![1, 4], f);
+        let v = g.add("v", Op::Linear, &[x, wv], vec![1, 4], f);
+        let ks = g.state("k_cache", vec![16, 4], f);
+        let vs = g.state("v_cache", vec![16, 4], f);
+        let attn = g.add(
+            "attn",
+            Op::CachedAttention {
+                heads: 1,
+                kv_heads: 1,
+                head_dim: 4,
+                v_head_dim: 4,
+                scale: 0.5,
+                causal: true,
+                window: None,
+                soft_cap: None,
+                write: true,
+            },
+            &[q, k, v, ks, vs, pos],
+            vec![1, 4],
+            f,
+        );
+        g.output(attn);
+
+        let mut w = Weights::new();
+        w.insert("emb", Tensor::F32(rand(8 * 4, 1)));
+        w.insert("wq", Tensor::F32(rand(16, 2)));
+        w.insert("wk", Tensor::F32(rand(16, 3)));
+        w.insert("wv", Tensor::F32(rand(16, 4)));
+
+        let s = Session::new(rt(), &w).unwrap();
+        let plan = s.prepare_plan(&g).unwrap();
+
+        assert_eq!(plan.value_locs.len(), g.values.len());
+        assert_eq!(plan.embedding_checks.len(), 1);
+        assert_eq!(plan.embedding_checks[0].0, 0);
+        assert_eq!(plan.embedding_checks[0].1, 8);
+        assert_eq!(plan.attn_pos_inputs, vec![(1, 1)]);
+        assert_eq!(plan.state_vars.len(), 2);
+        assert!(matches!(
+            plan.value_locs[ids.0 as usize],
+            PlanValueLoc::Arena(_)
+        ));
+        assert!(matches!(
+            plan.value_locs[emb_w.0 as usize],
+            PlanValueLoc::Weight(_, _)
+        ));
+        assert!(matches!(
+            plan.value_locs[ks.0 as usize],
+            PlanValueLoc::State(0)
+        ));
+        assert!(matches!(
+            plan.value_locs[vs.0 as usize],
+            PlanValueLoc::State(1)
+        ));
+
+        let mut m_state = StateStore::new();
+        let mut c_state = StateStore::new();
+        for step_pos in 0..3u32 {
+            let inp = vec![Tensor::U32(vec![step_pos + 1]), Tensor::U32(vec![step_pos])];
+            let want = cpu::run(&g, &w, &mut c_state, inp.clone()).unwrap();
+            let got = s
+                .run_prepared(&g, &plan, Some(&mut m_state), inp)
+                .unwrap();
+            let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            assert!(err < 1e-4, "step {step_pos}: rel_err {err}");
+        }
+    }
+
+    #[test]
+    fn cb_chunking_default_is_two_chunk_starter() {
+        if std::env::var_os("GIBBS_CB_CHUNK").is_none() {
+            assert_eq!(cb_chunking(), (32, usize::MAX));
         }
     }
 }

@@ -116,10 +116,15 @@ pub fn choose(timings: &[(GemvVariant, f64)]) -> Option<GemvVariant> {
 /// measurement round: contended timings differ from a quiet GPU's by more than the 1% tie band.
 pub const BUSY_MARGIN: f64 = 0.08;
 
+/// On a quiet GPU when rounds disagree on [`choose`], an alternative must beat `default` by this
+/// fraction (2%) in every round to win by worst-round ratio.
+pub const QUIET_MARGIN: f64 = 0.02;
+
 /// The variant to use from `rounds` of timings (`GB/s`, each round measuring the variants in another
-/// order). A single quiet round takes [`choose`] over that round; two or more quiet rounds require
-/// every round to agree on [`choose`], otherwise `default` wins. A `busy` GPU keeps `default` (the
-/// proven variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round;
+/// order). A single quiet round takes [`choose`] over that round; two or more quiet rounds return
+/// the consensus [`choose`] winner when all rounds agree, else the variant with the best worst-round
+/// ratio at least `1 + QUIET_MARGIN` faster than `default` in every round. A `busy` GPU keeps `default`
+/// (the proven variant) unless another variant is at least [`BUSY_MARGIN`] faster than it in EVERY round;
 /// among those the one with the best worst-round ratio wins. `None`: no usable timing.
 pub fn decide(
     rounds: &[Vec<(GemvVariant, f64)>],
@@ -149,13 +154,14 @@ pub fn decide(
             .map(|r| Some(rate(r, v)? / rate(r, default)?))
             .try_fold(f64::INFINITY, |m, ratio| Some(m.min(ratio?)))
     };
+    let margin = if busy { BUSY_MARGIN } else { QUIET_MARGIN };
     Some(
         first
             .iter()
             .map(|t| t.0)
             .filter(|&v| v != default)
             .filter_map(|v| Some((v, worst_ratio(v)?)))
-            .filter(|c| c.1 >= 1.0 + BUSY_MARGIN)
+            .filter(|c| c.1 >= 1.0 + margin)
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map_or(default, |c| c.0),
     )
@@ -459,16 +465,25 @@ mod tests {
         assert_eq!(decide(&agree, def, false), Some(r1));
         assert!(rounds_consistent(&agree, r1));
 
-        // Two quiet rounds disagree (Gen(2) in round 0, Gen(1) in round 1) and neither beats
-        // default by BUSY_MARGIN (8%) in every round -> returns default.
-        let disagree = [
+        // Two quiet rounds disagree (Gen(2) in round 0, Gen(1) in round 1), but Gen(1) beats
+        // default by >= QUIET_MARGIN (2%) in every round (195/185 = 1.054 >= 1.02) and has the best
+        // worst-round ratio -> quiet decide picks Gen(1), busy decide keeps default (< 1.08),
+        // and rounds_consistent is false so it is not persisted to disk.
+        let disagree_win = [
             vec![(def, 185.0), (r1, 195.0), (r2, 210.0)],
             vec![(r2, 190.0), (r1, 205.0), (def, 185.0)],
         ];
-        assert_eq!(decide(&disagree, def, false), Some(def));
-        assert!(!rounds_consistent(&disagree, r1));
-        assert!(!rounds_consistent(&disagree, r2));
+        assert_eq!(decide(&disagree_win, def, false), Some(r1));
+        assert_eq!(decide(&disagree_win, def, true), Some(def));
+        assert!(!rounds_consistent(&disagree_win, r1));
+        assert!(!rounds_consistent(&disagree_win, r2));
 
+        // Two quiet rounds disagree and neither beats default by QUIET_MARGIN (2%) in every round -> returns default.
+        let disagree_close = [
+            vec![(def, 185.0), (r1, 187.0), (r2, 195.0)],
+            vec![(r2, 186.0), (r1, 195.0), (def, 185.0)],
+        ];
+        assert_eq!(decide(&disagree_close, def, false), Some(def));
         // Both rounds pick Gen(1), but rates differ by > 5% (200.0 vs 170.0 -> 15% spread).
         let noisy = [
             vec![(def, 150.0), (r1, 200.0), (r2, 160.0)],
