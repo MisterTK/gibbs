@@ -17,18 +17,20 @@ Gibbs is an LLM inference engine in Rust for Apple Silicon. Models are described
 <!-- gibbs-bench:begin -->
 | Model | Decode tok/s | % of roofline | Roofline tok/s | GPU ms/token | Host ms/token | Dispatches/token |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Gemma 4 E2B QAT · UD-Q2_K_XL | 150.1 | 43.8% | 342 | 6.36 | 0.30 | 506 |
-| Gemma 4 E2B · Q4_K_M | 107.4 | 55.2% | 195 | 8.92 | 0.39 | 509 |
-| Qwen3.5 2B · UD-Q4_K_XL | 113.7 | 52.7% | 216 | 8.51 | 0.28 | 412 |
-| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 41.3 | 64.7% | 64 | 23.81 | 0.40 | 570 |
-| Llama 3.2 1B · Q4_0 | 254.0 | 67.7% | 375 | 3.65 | 0.28 | 147 |
-| SmolLM2 135M · safetensors | 468.1 | 43.9% | 1067 | 1.90 | 0.24 | 273 |
-| Llama 3.2 1B · bnb 4-bit | 224.8 | 60.0% | 375 | 4.13 | 0.32 | 147 |
-| Gemma 4 26B-A4B · UD-IQ2_XXS | 72.2 | 54.9% | 132 | 13.48 | 0.37 | 658 |
-| Gemma 4 E2B QAT · 4k context | 125.1 | 36.5% | 342 | 7.70 | 0.29 | 506 |
-| **Geomean** | | **52.3%** | | | | |
+| Gemma 4 E2B QAT · UD-Q2_K_XL | 143.3 | 41.0% | 349 | 6.38 | 0.59 | 506 |
+| Gemma 4 E2B · Q4_K_M | 105.9 | 53.4% | 198 | 9.15 | 0.28 | 509 |
+| Qwen3.5 2B · UD-Q4_K_XL | 124.9 | 55.5% | 225 | 7.40 | 0.61 | 304 |
+| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 40.4 | 62.0% | 65 | 24.37 | 0.37 | 402 |
+| Llama 3.2 1B · Q4_0 | 248.1 | 64.8% | 383 | 3.62 | 0.41 | 147 |
+| SmolLM2 135M · safetensors | 459.4 | 42.2% | 1088 | 1.89 | 0.29 | 273 |
+| Llama 3.2 1B · bnb 4-bit | 222.3 | 58.1% | 382 | 4.04 | 0.45 | 147 |
+| Gemma 4 26B-A4B · UD-IQ2_XXS | 71.3 | 53.1% | 134 | 13.95 | 0.08 | 658 |
+| Gemma 4 E2B QAT · 4k context | 119.7 | 34.2% | 349 | 8.20 | 0.15 | 506 |
+| **Geomean** | | **50.6%** | | | | |
 
-Apple M5 Pro, Metal, measured streaming ceiling 286.9 GB/s. Binary built from `5de3057` (2026-10-19); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 150.1 tok/s against its 150 tok/s target.
+Apple M5 Pro, Metal, measured streaming ceiling 292.7 GB/s. Binary built from `b7269ae` (2026-10-20); `gibbs --bench bench/loop.json`: 128 decode tokens, median of 3 runs, `--reencode max-speed`; raw rows in [`autoresearch/bench-readme.jsonl`](autoresearch/bench-readme.jsonl). Roofline = ceiling ÷ bytes one decode step streams (`bytes_basis` in each row). 0 of 9 models reach the 90% roofline target; Gemma 4 E2B QAT decodes at 143.3 tok/s against its 150 tok/s target.
+
+> one gibbs --bench process per bench/loop.json row (suite defaults: 128 tokens, 3 runs)
 <!-- gibbs-bench:end -->
 
 System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
@@ -44,36 +46,36 @@ cargo run --release --example gibbs_art   # regenerates the hero, charts and the
 <img src="assets/gibbs-compare.svg" alt="Two bar charts: Gibbs and llama.cpp decode speed on the same M5 Pro and GGUF files, and effective bandwidth as a percent of the M5 Pro's 307 GB/s spec for llama.cpp's published Llama 2 7B results and every Gibbs suite model" width="100%">
 
 <!-- gibbs-compare:begin -->
-**Same machine, same GGUF files.** llama.cpp: `llama-bench tg128, Metal`, Homebrew llama.cpp 0.6.0_1 (ggml 0.26.0), 2026-10-13, recorded in [`autoresearch/roofline-loop-notes.md`](autoresearch/roofline-loop-notes.md) (iteration 6); not re-measured since. Gibbs: the table above (build `5de3057`, 2026-10-19).
+**Same machine, same GGUF files.** llama.cpp: `llama-bench tg128, Metal`, Homebrew llama.cpp 0.6.0_1 (ggml 0.26.0), 2026-10-13, recorded in [`autoresearch/roofline-loop-notes.md`](autoresearch/roofline-loop-notes.md) (iteration 6); not re-measured since. Gibbs: the table above (build `b7269ae`, 2026-10-20).
 
 | Model | Gibbs tok/s | llama.cpp tok/s | Gibbs ÷ llama.cpp | Gibbs % of roofline | llama.cpp % of Gibbs roofline |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| Gemma 4 E2B QAT · UD-Q2_K_XL | 150.1 | 150.7 | 1.00× | 43.8% | 44.0% |
-| Gemma 4 E2B · Q4_K_M | 107.4 | 121.8 | 0.88× | 55.2% | 62.6% |
-| Qwen3.5 2B · UD-Q4_K_XL | 113.7 | 148.3 | 0.77× | 52.7% | 68.7% |
-| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 41.3 | 43.2 | 0.96× | 64.7% | 67.7% |
-| Llama 3.2 1B · Q4_0 | 254.0 | 269.0 | 0.94× | 67.7% | 71.7% |
+| Gemma 4 E2B QAT · UD-Q2_K_XL | 143.3 | 150.7 | 0.95× | 41.0% | 43.1% |
+| Gemma 4 E2B · Q4_K_M | 105.9 | 121.8 | 0.87× | 53.4% | 61.4% |
+| Qwen3.5 2B · UD-Q4_K_XL | 124.9 | 148.3 | 0.84× | 55.5% | 65.9% |
+| Qwen3.5 9B (DavidAU MTP) · IQ2_M | 40.4 | 43.2 | 0.94× | 62.0% | 66.3% |
+| Llama 3.2 1B · Q4_0 | 248.1 | 269.0 | 0.92× | 64.8% | 70.3% |
 
 llama.cpp % of Gibbs roofline = llama.cpp tok/s ÷ Gibbs roofline tok/s (the bytes Gibbs streams per decode step), so both percentage columns share one scale. No llama.cpp number for: SmolLM2 135M · safetensors, Llama 3.2 1B · bnb 4-bit, Gemma 4 26B-A4B · UD-IQ2_XXS, Gemma 4 E2B QAT · 4k context.
 
 **Best published result on this chip.** [ggml-org/llama.cpp#4167](https://github.com/ggml-org/llama.cpp/discussions/4167) lists an Apple M5 Pro, 16-core GPU (Apple spec 307 GB/s) running Llama 2 7B, `tg128`, llama.cpp `60081bb`:
 
-| Engine · model | Bytes per token | tok/s | Effective GB/s | % of 307 GB/s spec | % of Gibbs's 286.9 GB/s ceiling |
+| Engine · model | Bytes per token | tok/s | Effective GB/s | % of 307 GB/s spec | % of Gibbs's 292.7 GB/s ceiling |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| llama.cpp · Llama 2 7B F16 | 13.48 GB | 21.4 | 288.2 | 93.9% | 100.5% |
-| llama.cpp · Llama 2 7B Q8_0 | 7.16 GB | 38.9 | 278.9 | 90.8% | 97.2% |
-| llama.cpp · Llama 2 7B Q4_0 | 3.79 GB | 67.6 | 256.2 | 83.4% | 89.3% |
-| Gibbs · Qwen3.5 9B (DavidAU MTP) · IQ2_M | 4.49 GB | 41.3 | 185.6 | 60.5% | 64.7% |
-| Gibbs · Gemma 4 26B-A4B · UD-IQ2_XXS | 2.18 GB | 72.2 | 157.4 | 51.3% | 54.9% |
-| Gibbs · Gemma 4 E2B · Q4_K_M | 1.47 GB | 107.4 | 158.5 | 51.6% | 55.2% |
-| Gibbs · Qwen3.5 2B · UD-Q4_K_XL | 1.33 GB | 113.7 | 151.1 | 49.2% | 52.7% |
-| Gibbs · Gemma 4 E2B QAT · UD-Q2_K_XL | 0.84 GB | 150.1 | 125.8 | 41.0% | 43.8% |
-| Gibbs · Gemma 4 E2B QAT · 4k context | 0.84 GB | 125.1 | 104.8 | 34.1% | 36.5% |
-| Gibbs · Llama 3.2 1B · bnb 4-bit | 0.77 GB | 224.8 | 172.1 | 56.1% | 60.0% |
-| Gibbs · Llama 3.2 1B · Q4_0 | 0.76 GB | 254.0 | 194.3 | 63.3% | 67.7% |
-| Gibbs · SmolLM2 135M · safetensors | 0.27 GB | 468.1 | 125.9 | 41.0% | 43.9% |
+| llama.cpp · Llama 2 7B F16 | 13.48 GB | 21.4 | 288.2 | 93.9% | 98.5% |
+| llama.cpp · Llama 2 7B Q8_0 | 7.16 GB | 38.9 | 278.9 | 90.8% | 95.3% |
+| llama.cpp · Llama 2 7B Q4_0 | 3.79 GB | 67.6 | 256.2 | 83.4% | 87.5% |
+| Gibbs · Qwen3.5 9B (DavidAU MTP) · IQ2_M | 4.49 GB | 40.4 | 181.6 | 59.2% | 62.0% |
+| Gibbs · Gemma 4 26B-A4B · UD-IQ2_XXS | 2.18 GB | 71.3 | 155.4 | 50.6% | 53.1% |
+| Gibbs · Gemma 4 E2B · Q4_K_M | 1.47 GB | 105.9 | 156.3 | 50.9% | 53.4% |
+| Gibbs · Qwen3.5 2B · UD-Q4_K_XL | 1.30 GB | 124.9 | 162.3 | 52.9% | 55.5% |
+| Gibbs · Gemma 4 E2B QAT · UD-Q2_K_XL | 0.84 GB | 143.3 | 120.1 | 39.1% | 41.0% |
+| Gibbs · Gemma 4 E2B QAT · 4k context | 0.84 GB | 119.7 | 100.2 | 32.7% | 34.2% |
+| Gibbs · Llama 3.2 1B · bnb 4-bit | 0.77 GB | 222.3 | 170.2 | 55.4% | 58.1% |
+| Gibbs · Llama 3.2 1B · Q4_0 | 0.76 GB | 248.1 | 189.7 | 61.8% | 64.8% |
+| Gibbs · SmolLM2 135M · safetensors | 0.27 GB | 459.4 | 123.6 | 40.2% | 42.2% |
 
-Effective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On 3.8–13.5 GB per token, llama.cpp streams at 83–94% of the 307 GB/s spec; its F16 run reaches 288 GB/s, 100.5% of the 286.9 GB/s ceiling Gibbs measures. The Gibbs suite streams 0.27–4.49 GB per token; its highest row is Llama 3.2 1B · Q4_0 at 63.3% of spec. There is no Gibbs run of Llama 2 7B, so this table compares different models on one chip. The work aimed at the remaining per-token time is in [`plans/research-sprint-3.md`](plans/research-sprint-3.md).
+Effective GB/s = bytes per token × tok/s; llama.cpp's bytes are the GGUF file size, Gibbs's are the bytes one decode step streams. The file size includes the token-embedding table, of which a decode step reads one row, so the llama.cpp rates are slight upper bounds. On 3.8–13.5 GB per token, llama.cpp streams at 83–94% of the 307 GB/s spec; its F16 run reaches 288 GB/s, 98.5% of the 292.7 GB/s ceiling Gibbs measures. The Gibbs suite streams 0.27–4.49 GB per token; its highest row is Llama 3.2 1B · Q4_0 at 61.8% of spec. There is no Gibbs run of Llama 2 7B, so this table compares different models on one chip. The work aimed at the remaining per-token time is in [`plans/research-sprint-3.md`](plans/research-sprint-3.md).
 <!-- gibbs-compare:end -->
 
 ## Quickstart

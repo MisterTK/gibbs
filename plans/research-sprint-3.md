@@ -82,10 +82,10 @@ GPU contact that did happen, against the instruction:
 | L13 `GIBBS_SPECIALIZE=on` (`s3/l13-specialize`) | E2B 0.956 | −1.11 | discard, not merged |
 | 6.2 Q4_K `fused_dot` (`s3/q4k-fused-dot`) | E2B Q4_K_M 0.973 | −0.86 | discard, not merged (the kernel-level +2% did not survive the model) |
 
-- 6.1: after the quiet loads the tuner picked `gen64` on 4 of 48 Q4_K/Q5_K/Q6_K shapes (Q5_K 512/2048/6144 rows), each within 2% of `gen/r1`.
+- 6.1: the tune file holds 4 `gen64` picks (Q5_K 512/2048/6144-row shapes, each within 2% of `gen/r1`), all under the sprint3 `8cbbd9e` kernel hash `a58061…`. Under every other K-quant hash, including those the merged build tuned during the short A/Bs, the tuner picked `gen64` on 0 shapes.
 - Parity on `s3/final`: 5 reference rows and M1, M3 at min cosine 1.00000; M7 cannot run there (the CPU leg has no Gemma 4 MoE host forward).
 - `cargo test --lib` on `s3/final`: 861 passed, 0 failed; the kernel compile test and the guard's integration tests pass.
-- README bench numbers are not regenerated (that needs a full-length `gibbs --bench bench/loop.json`).
+- README bench numbers regenerated at `b7269ae` (one `gibbs --bench` process per suite row, suite defaults).
 
 ## Baseline (`main` @ `5de3057`, README rows = `bg_232` cand1 pass)
 

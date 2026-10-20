@@ -1,6 +1,6 @@
 {
-  "commit": "5de3057",
-  "date": "2026-10-19",
+  "commit": "b7269ae",
+  "date": "2026-10-20",
   "device": "Apple M5 Pro",
-  "note": null
+  "note": "one gibbs --bench process per bench/loop.json row (suite defaults: 128 tokens, 3 runs)"
 }
