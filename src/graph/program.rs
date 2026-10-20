@@ -1,9 +1,9 @@
 //! Execution of placed computational graphs: one device per program.
 
 use crate::graph::placement::{
-    device_supports_op, place_graph_default, placement_rows, PlacementPlan, PlacementRow,
+    device_supports_op, place_graph, placement_rows, PlacementPlan, PlacementRow,
 };
-use crate::graph::{cpu, Graph, StateStore, Tensor, ValueId, Weights};
+use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, ValueId, Weights};
 use crate::hardware::{available_devices, Device, PlacementMode};
 use std::collections::HashMap;
 
@@ -43,7 +43,57 @@ pub struct GraphProgram {
     pub state: StateStore,
     pub graph_inputs: Vec<ValueId>,
     pub graph_outputs: Vec<ValueId>,
+    /// [`Self::run_greedy`]'s graph and plan, with the `valid` they were built for.
+    #[cfg(target_os = "macos")]
+    argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
+    /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
+    #[cfg(target_os = "macos")]
+    reshaped: Vec<(usize, Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
 }
+
+/// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
+pub const GPU_ARGMAX_MIN_VOCAB: usize = 150_000;
+
+/// `GIBBS_GPU_ARGMAX=1`: greedy decode steps pick the token on the device, read once.
+fn gpu_argmax() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("GIBBS_GPU_ARGMAX").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+    });
+    *ON
+}
+
+/// `graph` with output 0 (one f32 row) replaced by the `[.., 1]` u32 index of the first largest of
+/// its first `valid` entries (0 = all), NaN ranking lowest: a prefix `Slice` then `TopK { k: 1 }`.
+/// The other outputs stay. `None` when output 0 is not one f32 row.
+pub(crate) fn argmax_head(graph: &Graph, valid: usize) -> Option<Graph> {
+    let &logits = graph.outputs.first()?;
+    let v = graph.value(logits);
+    let cols = v.shape.last().copied().filter(|&c| c > 0)?;
+    if v.dtype != DType::F32 || v.shape.iter().product::<usize>() != cols {
+        return None;
+    }
+    let valid = if valid == 0 { cols } else { valid.min(cols) };
+    let mut shape = v.shape.clone();
+    let mut g = graph.clone();
+    let row = if valid < cols {
+        *shape.last_mut()? = valid;
+        let slice = Op::Slice {
+            axis: -1,
+            start: 0,
+            end: valid as i64,
+        };
+        g.add("argmax_valid", slice, &[logits], shape.clone(), DType::F32)
+    } else {
+        logits
+    };
+    *shape.last_mut()? = 1;
+    g.outputs[0] = g.add("argmax", Op::TopK { k: 1 }, &[row], shape, DType::U32);
+    Some(g)
+}
+
+/// The error a `GIBBS_PLAN_DUMP_CPU` Metal compile ends with once the plan is printed.
+pub const PLAN_DUMPED: &str =
+    "GIBBS_PLAN_DUMP_CPU: plan printed; compile stopped before any device work";
 
 /// Programs being compiled right now: placement, weight upload, kernel build and tuning.
 static COMPILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -72,30 +122,42 @@ impl GraphProgram {
     /// Compiles a Graph and Weights into a single-device GraphProgram under `mode`.
     ///
     /// Fails with the avenue report when `mode` targets the GPU and a node has no GPU lowering.
+    /// `GIBBS_PLAN_DUMP_CPU=<ctx>`: a Metal compile prints [`crate::graph::metal::plan_dump`] at
+    /// context length `ctx` (`1` when not a number) to stdout and fails with [`PLAN_DUMPED`]
+    /// before any device, weight upload or tuning.
     pub fn compile(
         mut graph: Graph,
         mut weights: Weights,
         mode: PlacementMode,
     ) -> Result<Self, String> {
         let _compiling = CompileGuard::enter();
-        crate::graph::passes::run_optimization_passes(&mut graph, Some(&mut weights))?;
-        let available = available_devices();
-        let plan = place_graph_default(&mut graph, mode, &available, None, &device_supports_op)
-            .map_err(|report| report.error())?;
-        assert!(
-            plan.segments.len() <= 1,
-            "placement yields at most one segment"
-        );
+        crate::graph::passes::prefuse(&mut graph);
+        // Phase-4 plan search re-extracts fusions from the graph before fusion.
+        #[cfg(target_os = "macos")]
+        let search_base = crate::graph::search::enabled().then(|| (graph.clone(), weights.clone()));
+        crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
+        let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
+            .ok()
+            .map(|v| v.parse().unwrap_or(1));
+        let available = if dump.is_some() {
+            vec![Device::Cpu, Device::Metal]
+        } else {
+            available_devices()
+        };
+        #[allow(unused_mut)]
+        let mut plan = place_and_adapt(&mut graph, mode, &available)?;
+        #[cfg(target_os = "macos")]
+        if let (Some(base), Device::Metal, None) = (&search_base, plan.primary_device(), dump) {
+            let rt = crate::graph::metal::Runtime::shared()?;
+            if let Some(s) = searched(&rt, base, mode, &available) {
+                (graph, weights, plan) = s;
+            }
+        }
         let primary_device = plan.primary_device();
-        if primary_device == Device::Metal {
-            crate::graph::passes::dtype_adapt::run(&mut graph);
-            crate::graph::passes::dtype_adapt::retype_uncoded_weights(&mut graph, &|f| {
-                device_supports_op(
-                    Device::Metal,
-                    &crate::graph::Op::Linear,
-                    crate::graph::DType::Quant(f),
-                )
-            })?;
+        #[cfg(target_os = "macos")]
+        if let (Some(ctx), Device::Metal) = (dump, primary_device) {
+            print!("{}", crate::graph::metal::plan_dump(&graph, ctx)?);
+            return Err(PLAN_DUMPED.into());
         }
         eprintln!(
             "Compiled GraphProgram: {} segments, primary device: {:?}",
@@ -137,6 +199,10 @@ impl GraphProgram {
             state: StateStore::new(),
             graph_inputs,
             graph_outputs,
+            #[cfg(target_os = "macos")]
+            argmax: None,
+            #[cfg(target_os = "macos")]
+            reshaped: Vec::new(),
         })
     }
 
@@ -232,7 +298,8 @@ impl GraphProgram {
     }
 
     /// Runs `graph` on the program's Metal segment inside the program's state: another row count of the
-    /// compiled network (same weight and state names), e.g. a batched prefill pass. The plan is built per call.
+    /// compiled network (same weight and state names), e.g. a batched prefill pass. Plans are cached by
+    /// the graph's node count and input shapes, which identify such a graph (prefill chunks repeat).
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
@@ -240,8 +307,31 @@ impl GraphProgram {
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(target_os = "macos")]
         if let [CompiledSegment::Metal { session, .. }] = self.segments.as_slice() {
-            let plan = session.prepare_plan(graph)?;
-            return session.run_prepared(graph, &plan, Some(&mut self.state), inputs);
+            let shapes: Vec<Vec<usize>> = graph
+                .inputs
+                .iter()
+                .map(|&v| graph.value(v).shape.clone())
+                .collect();
+            let n = graph.nodes.len();
+            let hit = self
+                .reshaped
+                .iter()
+                .position(|(c, s, _)| *c == n && *s == shapes);
+            // Least recently used first: a varying tail chunk must not evict the full chunk's plan.
+            let entry = match hit {
+                Some(i) => self.reshaped.remove(i),
+                None => {
+                    // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
+                    // their row counts more.
+                    if self.reshaped.len() == 4 {
+                        self.reshaped.remove(0);
+                    }
+                    (n, shapes, session.prepare_plan(graph)?)
+                }
+            };
+            self.reshaped.push(entry);
+            let plan = &self.reshaped[self.reshaped.len() - 1].2;
+            return session.run_prepared(graph, plan, Some(&mut self.state), inputs);
         }
         let _ = (graph, inputs);
         Err("run_reshaped: the program is not a single Metal segment".into())
@@ -316,6 +406,117 @@ impl GraphProgram {
             })
             .collect()
     }
+
+    /// [`Self::run`] for a greedy decode step whose token is the first largest of the first `valid`
+    /// entries of output 0 (0 = all). With `GIBBS_GPU_ARGMAX=1` on a single Metal segment whose
+    /// output 0 is one f32 row of at least [`GPU_ARGMAX_MIN_VOCAB`], the device picks it and output 0
+    /// comes back as `U32([token])` (one u32 read back instead of the row); otherwise exactly `run`.
+    pub fn run_greedy(&mut self, inputs: Vec<Tensor>, valid: usize) -> Result<Vec<Tensor>, String> {
+        #[cfg(target_os = "macos")]
+        if let ([CompiledSegment::Metal { graph, session, .. }], true) =
+            (self.segments.as_slice(), gpu_argmax())
+        {
+            let wide = graph.outputs.first().is_some_and(|&o| {
+                graph.value(o).shape.last().copied().unwrap_or(0) >= GPU_ARGMAX_MIN_VOCAB
+            });
+            if wide && self.argmax.as_ref().map(|a| a.0) != Some(valid) {
+                self.argmax = match argmax_head(graph, valid) {
+                    Some(g) => {
+                        let plan = session.prepare_plan(&g)?;
+                        Some((valid, g, plan))
+                    }
+                    None => None,
+                };
+            }
+            if let (true, Some((_, g, plan))) = (wide, &self.argmax) {
+                if inputs.len() != g.inputs.len() {
+                    return Err(format!(
+                        "program expects {} inputs, got {}",
+                        g.inputs.len(),
+                        inputs.len()
+                    ));
+                }
+                let mut out = session.run_prepared(g, plan, Some(&mut self.state), inputs)?;
+                // Outputs come back as f32 slots; output 0 holds the u32 index's bits.
+                out[0] = Tensor::U32(out[0].as_f32()?.iter().map(|v| v.to_bits()).collect());
+                return Ok(out);
+            }
+        }
+        let _ = valid;
+        self.run(inputs)
+    }
+}
+
+/// Places `graph` (at most one segment) and, on Metal, adapts its dtypes to the Metal kernels.
+fn place_and_adapt(
+    graph: &mut Graph,
+    mode: PlacementMode,
+    available: &[Device],
+) -> Result<PlacementPlan, String> {
+    let plan = place_graph(graph, mode, available, &device_supports_op)
+        .map_err(|report| report.error())?;
+    assert!(
+        plan.segments.len() <= 1,
+        "placement yields at most one segment"
+    );
+    if plan.primary_device() == Device::Metal {
+        crate::graph::passes::dtype_adapt::run(graph);
+        crate::graph::passes::dtype_adapt::retype_uncoded_weights(graph, &|f| {
+            device_supports_op(Device::Metal, &Op::Linear, DType::Quant(f))
+        })?;
+    }
+    Ok(plan)
+}
+
+/// `GIBBS_PLAN_SEARCH=1` (research sprint 3, phase 4): the e-graph extraction of `base` (the
+/// graph before fusion) with the fusion choices this device timed faster than the cost model's
+/// ([`crate::graph::search`]); `None` when the e-graph or the chosen plan fails, which keeps the
+/// compiled plan.
+#[cfg(target_os = "macos")]
+fn searched(
+    rt: &std::sync::Arc<crate::graph::metal::Runtime>,
+    base: &(Graph, Weights),
+    mode: PlacementMode,
+    available: &[Device],
+) -> Option<(Graph, Weights, PlacementPlan)> {
+    use crate::graph::egraph::{Budget, CostModel, Fusion, DEFAULT_RULES};
+    let run = || {
+        let cost = CostModel::from_tune_cache();
+        let fusion = Fusion::new(
+            &base.0,
+            Some(&base.1),
+            DEFAULT_RULES,
+            &cost,
+            Budget::default(),
+        )?;
+        let mut state = StateStore::new();
+        let flips = rt.plan_search(fusion.choices(), |flip| {
+            let (g, w, _) = fused(base, &fusion, flip, mode, available)?;
+            let s = crate::graph::metal::Session::new_for_graph(rt.clone(), &w, Some(&g))?;
+            let plan = s.prepare_plan(&g)?;
+            s.time_decode(&g, &plan, &mut state)
+        });
+        fused(base, &fusion, &flips, mode, available)
+    };
+    run()
+        .map_err(|e| tracing::warn!("plan search: {e}; cost-model plan kept"))
+        .ok()
+}
+
+/// `base` with the cost model's fusions and `flip` toggled, SSA-checked, placed and adapted.
+#[cfg(target_os = "macos")]
+fn fused(
+    base: &(Graph, Weights),
+    fusion: &crate::graph::egraph::Fusion,
+    flip: &[usize],
+    mode: PlacementMode,
+    available: &[Device],
+) -> Result<(Graph, Weights, PlacementPlan), String> {
+    let (mut g, mut w) = base.clone();
+    fusion.apply(&mut g, Some(&mut w), flip)?;
+    crate::graph::pattern::validate_ssa(&g)?;
+    let p = place_and_adapt(&mut g, mode, available)?;
+    Ok((g, w, p))
 }
 
 #[cfg(test)]
@@ -333,6 +534,192 @@ mod tests {
         let mut weights = Weights::new();
         weights.insert("w", Tensor::F32(vec![0.1; 16]));
         (g, weights)
+    }
+
+    /// Two identical decode layers (norm, three projections of one input, normed SwiGLU MLP):
+    /// every fusion pattern has two instances.
+    #[cfg(target_os = "macos")]
+    fn two_layers() -> (Graph, Weights) {
+        let (mut g, mut w) = (Graph::new(), Weights::new());
+        let mut n = 0.0f32;
+        let mut weight = |g: &mut Graph, name: String, shape: Vec<usize>| {
+            n += 1.0;
+            let len = shape.iter().product::<usize>();
+            w.insert(
+                name.clone(),
+                Tensor::F32(
+                    (0..len)
+                        .map(|i| (n + i as f32 * 0.37).sin() * 0.05)
+                        .collect(),
+                ),
+            );
+            g.weight(name, shape, DType::F32)
+        };
+        let mut x = g.input("x", vec![1, 64], DType::F32);
+        for l in 0..2 {
+            let mut lin = |g: &mut Graph, name: &str, x: ValueId, out: usize| {
+                let shape = if out == 0 {
+                    vec![64]
+                } else {
+                    vec![out, g.value(x).shape[1]]
+                };
+                let wv = weight(g, format!("l{l}.{name}.w"), shape);
+                let (op, out) = if out == 0 {
+                    (Op::RmsNorm { eps: 1e-5 }, 64)
+                } else {
+                    (Op::Linear, out)
+                };
+                g.add(
+                    format!("l{l}.{name}"),
+                    op,
+                    &[x, wv],
+                    vec![1, out],
+                    DType::F32,
+                )
+            };
+            let n1 = lin(&mut g, "n1", x, 0);
+            let q = lin(&mut g, "q", n1, 64);
+            let k = lin(&mut g, "k", n1, 64);
+            let v = lin(&mut g, "v", n1, 64);
+            let qk = g.add(
+                format!("l{l}.qk"),
+                Op::Add,
+                &[q, k],
+                vec![1, 64],
+                DType::F32,
+            );
+            let a = g.add(
+                format!("l{l}.a"),
+                Op::Mul,
+                &[qk, v],
+                vec![1, 64],
+                DType::F32,
+            );
+            let o = lin(&mut g, "o", a, 64);
+            let r1 = g.add(
+                format!("l{l}.r1"),
+                Op::Add,
+                &[o, x],
+                vec![1, 64],
+                DType::F32,
+            );
+            let n2 = lin(&mut g, "n2", r1, 0);
+            let gate = lin(&mut g, "gate", n2, 128);
+            let up = lin(&mut g, "up", n2, 128);
+            let m = g.add(
+                format!("l{l}.glu"),
+                Op::SwiGlu,
+                &[gate, up],
+                vec![1, 128],
+                DType::F32,
+            );
+            let d = lin(&mut g, "down", m, 64);
+            x = g.add(
+                format!("l{l}.r2"),
+                Op::Add,
+                &[r1, d],
+                vec![1, 64],
+                DType::F32,
+            );
+        }
+        g.output(x);
+        (g, w)
+    }
+
+    /// GPU: the searched plan of a two-layer graph, and every single-pattern flip plus the
+    /// all-flipped plan the search may time, compute what the cost-model plan computes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "GPU: plan search timing; cargo test --lib plan_search_keeps -- --ignored --test-threads=1"]
+    fn plan_search_keeps_the_cost_model_outputs() {
+        use crate::graph::egraph::{Budget, CostModel, Fusion, DEFAULT_RULES};
+        use crate::graph::metal::{Runtime, Session};
+        let (mut g, w) = two_layers();
+        crate::graph::passes::prefuse(&mut g);
+        let base = (g, w);
+        let (mode, available) = (
+            PlacementMode::Pin(Device::Metal),
+            [Device::Cpu, Device::Metal],
+        );
+        let rt = Runtime::shared().unwrap();
+        let (sg, sw, _) = searched(&rt, &base, mode, &available).expect("plan search");
+        let cost = CostModel::from_tune_cache();
+        let fusion = Fusion::new(
+            &base.0,
+            Some(&base.1),
+            DEFAULT_RULES,
+            &cost,
+            Budget::default(),
+        )
+        .unwrap();
+        let pats = crate::graph::search::patterns(fusion.choices());
+        assert!(pats.iter().any(|p| p.ids.len() == 2), "{pats:?}");
+        let (cg, cw, _) = fused(&base, &fusion, &[], mode, &available).unwrap();
+        let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).cos()).collect();
+        let run = |g: &Graph, w: &Weights| {
+            let s = Session::new_for_graph(rt.clone(), w, Some(g)).unwrap();
+            match s.run(g, vec![Tensor::F32(x.clone())]).unwrap().remove(0) {
+                Tensor::F32(v) => v,
+                _ => panic!("f32 output expected"),
+            }
+        };
+        let want = run(&cg, &cw);
+        let close = |a: &[f32], what: &str| {
+            assert_eq!(a.len(), want.len(), "{what}");
+            for (i, (x, y)) in a.iter().zip(&want).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-4 + 1e-3 * y.abs(),
+                    "{what} [{i}] {x} vs {y}"
+                );
+            }
+        };
+        close(&run(&sg, &sw), "searched");
+        let mut sets: Vec<Vec<(u64, bool)>> = pats.iter().map(|p| vec![(p.key, !p.on)]).collect();
+        sets.push(pats.iter().map(|p| (p.key, !p.on)).collect());
+        let mut changed = false;
+        for set in sets {
+            let flips = crate::graph::search::flips(fusion.choices(), &set);
+            // Flip sets the e-graph cannot resolve are dropped by the search too.
+            let Ok((g, w, _)) = fused(&base, &fusion, &flips, mode, &available) else {
+                continue;
+            };
+            changed |= g.nodes.len() != cg.nodes.len();
+            close(&run(&g, &w), &format!("{set:?}"));
+        }
+        assert!(changed, "no candidate changed the plan");
+    }
+
+    /// GPU: `run_reshaped` plans a row count once and reuses it; another row count gets its own plan.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "GPU: cargo test --lib run_reshaped_caches -- --ignored --test-threads=1"]
+    fn run_reshaped_caches_one_plan_per_shape() {
+        let (g, w) = two_linears();
+        let mut prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).unwrap();
+        let rows = |m: usize| {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![m, 4], DType::F32);
+            let w = g.weight("w", vec![4, 4], DType::F32);
+            let a = g.add("lin0", Op::Linear, &[x, w], vec![m, 4], DType::F32);
+            let b = g.add("lin1", Op::Linear, &[a, w], vec![m, 4], DType::F32);
+            g.output(b);
+            g
+        };
+        let x = |m: usize| vec![Tensor::F32((0..m * 4).map(|i| i as f32 * 0.25).collect())];
+        // Callers rebuild the graph per chunk: the second call's graph is a fresh, equal one.
+        let a = prog.run_reshaped(&rows(2), x(2)).unwrap();
+        let b = prog.run_reshaped(&rows(2), x(2)).unwrap();
+        assert_eq!(prog.reshaped.len(), 1);
+        assert_eq!(a[0].as_f32().unwrap(), b[0].as_f32().unwrap());
+        // 0.25 * i through two all-0.1 4x4 layers: every output of row r is 0.04 * (sum of its x).
+        let want: Vec<f32> = (0..2)
+            .flat_map(|r| [0.04 * (0..4).map(|c| (r * 4 + c) as f32 * 0.25).sum::<f32>(); 4])
+            .collect();
+        for (got, want) in a[0].as_f32().unwrap().iter().zip(&want) {
+            assert!((got - want).abs() < 1e-4, "{got} vs {want}");
+        }
+        prog.run_reshaped(&rows(3), x(3)).unwrap();
+        assert_eq!(prog.reshaped.len(), 2);
     }
 
     #[test]
@@ -355,12 +742,63 @@ mod tests {
                 })
                 .sum();
             assert!(nodes > 0);
-            assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), nodes, "{rows:?}");
+            assert_eq!(
+                rows.iter().map(|r| r.count).sum::<usize>(),
+                nodes,
+                "{rows:?}"
+            );
             assert!(rows.iter().all(|r| r.device == device), "{rows:?}");
             assert!(rows.iter().any(|r| r.op == "Linear"), "{rows:?}");
             assert!(rows.iter().all(|r| r.avenue == "kernel"), "{rows:?}");
             // Counts never increase down the table.
             assert!(rows.windows(2).all(|p| p[0].count >= p[1].count));
         }
+    }
+
+    /// The device-argmax graph (`argmax_head`) run on the CPU executor picks the host greedy token
+    /// (`sample_logits` at temperature 0) over the first `valid` logits, ties to the lower index,
+    /// and keeps the other outputs.
+    #[test]
+    fn argmax_head_picks_the_host_greedy_token() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for n in [1usize, 7, 1000, 4099] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![1, n], DType::F32);
+            let tap = g.input("tap", vec![1, 3], DType::F32);
+            g.output(x);
+            g.output(tap);
+            for round in 0..6 {
+                // A few levels, so the maximum ties; round 5 is all -inf.
+                let row: Vec<f32> = (0..n)
+                    .map(|_| match round {
+                        5 => f32::NEG_INFINITY,
+                        r => (next() % (4 + r * 1000)) as f32 * 0.25 - 3.0,
+                    })
+                    .collect();
+                for valid in [0, n, n - n / 3, 1, n + 5] {
+                    let head = argmax_head(&g, valid).expect("one f32 row");
+                    let inputs = vec![Tensor::F32(row.clone()), Tensor::F32(vec![1.0, 2.0, 3.0])];
+                    let out = cpu::run_stateless(&head, &Weights::new(), inputs).unwrap();
+                    let v = if valid == 0 { n } else { valid.min(n) };
+                    let want =
+                        crate::model::graph_lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
+                    assert_eq!(
+                        out[0],
+                        Tensor::U32(vec![want]),
+                        "n={n} round={round} valid={valid}"
+                    );
+                    assert_eq!(out[1], Tensor::F32(vec![1.0, 2.0, 3.0]));
+                }
+            }
+        }
+        // Output 0 must be one f32 row.
+        let mut g = Graph::new();
+        let x = g.input("x", vec![2, 4], DType::F32);
+        g.output(x);
+        assert!(argmax_head(&g, 0).is_none());
     }
 }

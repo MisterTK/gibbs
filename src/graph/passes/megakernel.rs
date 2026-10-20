@@ -26,99 +26,16 @@ const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
     crate::hardware::QuantFormat::WeightlessJesseLUT,
 ];
 
-fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
+pub(crate) fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {
     match graph.value(w).dtype {
         crate::graph::DType::Quant(f) => MEGAKERNEL_QUANT.contains(&f),
         _ => true,
     }
 }
 
-/// Detects and fuses transformer decoder blocks into unified Megakernel nodes.
-pub fn fuse_megakernel_blocks_pass(graph: &mut Graph) -> usize {
-    let mlp = fuse_mlp_blocks(graph);
-    let attn = fuse_attn_prep_pass(graph);
-    mlp + attn
-}
-
-/// Matches attention preparation subgraphs (Linear Q/K/V -> HeadRMSNorm -> RoPE -> CachedAttention).
-/// Returns the number of matched attention layers.
-pub fn fuse_attn_prep_pass(graph: &mut Graph) -> usize {
-    let mut matches = 0;
-    let mut val_producers: HashMap<ValueId, NodeId> = HashMap::new();
-    for (idx, node) in graph.nodes.iter().enumerate() {
-        for &out in &node.outputs {
-            val_producers.insert(out, NodeId(idx as u32));
-        }
-    }
-
-    for node in &graph.nodes {
-        if let Op::CachedAttention { .. } = &node.op {
-            // inputs: [q, k, v, k_state, v_state, positions]
-            if node.inputs.len() >= 3 {
-                let q_val = node.inputs[0];
-                let k_val = node.inputs[1];
-                let v_val = node.inputs[2];
-
-                // Trace Q: may be from RoPE (or RmsNorm after RoPE)
-                let q_is_rope = val_producers.get(&q_val).map_or(false, |&nid| {
-                    let n = graph.node(nid);
-                    matches!(n.op, Op::Rope { .. }) || {
-                        if let Op::RmsNorm { .. } = n.op {
-                            n.inputs
-                                .first()
-                                .and_then(|inp| val_producers.get(inp))
-                                .map_or(false, |&rnid| {
-                                    matches!(graph.node(rnid).op, Op::Rope { .. })
-                                })
-                        } else {
-                            false
-                        }
-                    }
-                });
-
-                // Trace K: may be from RoPE (or RmsNorm after RoPE)
-                let k_is_rope = val_producers.get(&k_val).map_or(false, |&nid| {
-                    let n = graph.node(nid);
-                    matches!(n.op, Op::Rope { .. }) || {
-                        if let Op::RmsNorm { .. } = n.op {
-                            n.inputs
-                                .first()
-                                .and_then(|inp| val_producers.get(inp))
-                                .map_or(false, |&rnid| {
-                                    matches!(graph.node(rnid).op, Op::Rope { .. })
-                                })
-                        } else {
-                            false
-                        }
-                    }
-                });
-
-                // Trace V: from Linear (or Slice of QKV linear)
-                let v_is_linear = val_producers.get(&v_val).map_or(false, |&nid| {
-                    let n = graph.node(nid);
-                    matches!(n.op, Op::Linear) || {
-                        if let Op::Slice { .. } = n.op {
-                            n.inputs
-                                .first()
-                                .and_then(|inp| val_producers.get(inp))
-                                .map_or(false, |&lnid| matches!(graph.node(lnid).op, Op::Linear))
-                        } else {
-                            false
-                        }
-                    }
-                });
-
-                if q_is_rope && k_is_rope && v_is_linear {
-                    matches += 1;
-                }
-            }
-        }
-    }
-    matches
-}
-
-/// Fuses `RmsNorm -> [Gate, Up Linear] -> SwiGLU/GeGLU -> Down Linear -> Add(residual)`
-fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
+/// Materializes the e-graph's chosen `RmsNorm -> [Gate, Up Linear] -> SwiGLU/GeGLU -> Down Linear
+/// -> Add(residual)` blocks: those ending in the `only` Add nodes.
+pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usize {
     let mut rewrites = 0;
     let mut eliminated_nodes: HashSet<NodeId> = HashSet::new();
 
@@ -143,7 +60,10 @@ fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
     for i in 0..n_nodes {
         let add_nid = NodeId(i as u32);
         let add_node = graph.node(add_nid);
-        if !matches!(add_node.op, Op::Add) || add_node.inputs.len() != 2 {
+        if !matches!(add_node.op, Op::Add)
+            || add_node.inputs.len() != 2
+            || !only.contains(&add_nid)
+        {
             continue;
         }
 
@@ -370,6 +290,7 @@ fn fuse_mlp_blocks(graph: &mut Graph) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::egraph::Rule;
     use crate::graph::{DType, Op, Tensor, Weights};
 
     #[test]
@@ -439,7 +360,7 @@ mod tests {
         let ref_logits = ref_res[0].as_f32().expect("f32 output");
 
         // 2. Run fusion pass
-        let rewrites = fuse_megakernel_blocks_pass(&mut g);
+        let rewrites = crate::graph::egraph::fuse_rule(&mut g, None, Rule::MegakernelMlp);
         assert_eq!(rewrites, 1, "MLP block must be fused into megakernel");
 
         // 3. Validate SSA and check node structure
@@ -564,7 +485,7 @@ mod tests {
         let ref_logits = ref_res[0].as_f32().expect("f32 output");
 
         // 2. Run fusion pass
-        let rewrites = fuse_megakernel_blocks_pass(&mut g);
+        let rewrites = crate::graph::egraph::fuse_rule(&mut g, None, Rule::MegakernelMlp);
         assert_eq!(
             rewrites, 1,
             "MLP block with post-norm must be fused into megakernel"
@@ -612,88 +533,5 @@ mod tests {
                 );
             }
         }
-    }
-    #[test]
-    fn test_fuse_attn_prep_match_count() {
-        let (hidden, heads, kv_heads, hd) = (64, 2, 2, 32);
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, hidden], DType::F32);
-        let pos = g.input("pos", vec![1], DType::U32);
-
-        let qw = g.weight("qw", vec![heads * hd, hidden], DType::F32);
-        let kw = g.weight("kw", vec![kv_heads * hd, hidden], DType::F32);
-        let vw = g.weight("vw", vec![kv_heads * hd, hidden], DType::F32);
-
-        let q_lin = g.add(
-            "q_lin",
-            Op::Linear,
-            &[x, qw],
-            vec![1, heads * hd],
-            DType::F32,
-        );
-        let k_lin = g.add(
-            "k_lin",
-            Op::Linear,
-            &[x, kw],
-            vec![1, kv_heads * hd],
-            DType::F32,
-        );
-        let v_lin = g.add(
-            "v_lin",
-            Op::Linear,
-            &[x, vw],
-            vec![1, kv_heads * hd],
-            DType::F32,
-        );
-
-        let inv_freq = g.weight("inv_freq", vec![hd / 2], DType::F32);
-        let q_rope = g.add(
-            "q_rope",
-            Op::Rope {
-                head_dim: hd,
-                rotary_dim: hd,
-                variant: crate::graph::RopeVariant::HalfSplit,
-                mscale: 1.0,
-            },
-            &[q_lin, pos, inv_freq],
-            vec![1, heads * hd],
-            DType::F32,
-        );
-        let k_rope = g.add(
-            "k_rope",
-            Op::Rope {
-                head_dim: hd,
-                rotary_dim: hd,
-                variant: crate::graph::RopeVariant::HalfSplit,
-                mscale: 1.0,
-            },
-            &[k_lin, pos, inv_freq],
-            vec![1, kv_heads * hd],
-            DType::F32,
-        );
-
-        let ks = g.state("ks", vec![128, kv_heads * hd], DType::F32);
-        let vs = g.state("vs", vec![128, kv_heads * hd], DType::F32);
-
-        let _attn = g.add(
-            "attn",
-            Op::CachedAttention {
-                heads,
-                kv_heads,
-                head_dim: hd,
-                v_head_dim: hd,
-                scale: 1.0,
-                causal: true,
-                window: None,
-                soft_cap: None,
-                write: true,
-            },
-            &[q_rope, k_rope, v_lin, ks, vs, pos],
-            vec![1, heads * hd],
-            DType::F32,
-        );
-
-        let count = fuse_attn_prep_pass(&mut g);
-        assert_eq!(count, 1, "Should match 1 attention prep subgraph");
     }
 }

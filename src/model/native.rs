@@ -30,6 +30,15 @@ pub struct PrepareCtx {
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// The logits of a forward result; a device-picked token (`U32`, [`NativeLm::forward_greedy`])
+/// where logits are expected is an error, never a one-element row.
+pub fn logits_of(t: crate::graph::Tensor) -> Result<Vec<f32>, String> {
+    match t {
+        crate::graph::Tensor::F32(v) => Ok(v),
+        _ => Err("expected f32 logits, got a device-picked token".into()),
+    }
+}
+
 pub trait NativeLm: Send + Sync {
     /// Compute label for logs and the TUI header, e.g. `CPU (NEON SIMD), 15 threads`.
     fn backend_label(&self) -> String;
@@ -75,6 +84,18 @@ pub trait NativeLm: Send + Sync {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String>;
+    /// [`Self::forward`] for a greedy step: `U32([token])` when the device picked the first largest
+    /// logit within the tokenizer's vocabulary ([`crate::graph::program::GraphProgram::run_greedy`]),
+    /// else `F32(logits)`.
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.forward(tokens, start_pos, state)
+            .map(crate::graph::Tensor::F32)
+    }
 
     // Speculative decoding (see `crate::scheduler::spec`): a model supports it by verifying
     // several positions in one pass and rewinding the ones the target rejects.

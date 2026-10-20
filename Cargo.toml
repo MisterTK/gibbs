@@ -50,6 +50,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.12"
 libc = "0.2"
+# Equality saturation for graph fusion (src/graph/egraph.rs, GIBBS_EGRAPH=1)
+egglog = "3.0.0"
 
 # Apple GPU: MTLDevice, runtime MSL compilation, shared buffers (--backend metal)
 [target.'cfg(target_os = "macos")'.dependencies]

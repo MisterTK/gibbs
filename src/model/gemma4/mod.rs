@@ -325,6 +325,34 @@ impl NativeLm for Gemma4 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
+        crate::model::native::logits_of(self.pass(tokens, start_pos, state, false)?)
+    }
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.pass(tokens, start_pos, state, true)
+    }
+}
+
+/// Rows per batched prefill pass on the Metal program, and the most a pass may grow to when an image
+/// block (attended bidirectionally, so whole in one pass) straddles the boundary.
+const PREFILL_ROWS: usize = 64;
+const PREFILL_MAX_ROWS: usize = 512;
+
+impl Gemma4 {
+    /// [`NativeLm::forward`]; `greedy` lets the decode program pick the token on the device
+    /// (`U32([token])`, see [`crate::graph::program::GraphProgram::run_greedy`]), else `F32(logits)`.
+    fn pass(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
+        use crate::graph::Tensor;
         let st = state
             .downcast_mut::<State>()
             .ok_or("gemma4: foreign sequence state")?;
@@ -340,7 +368,7 @@ impl NativeLm for Gemma4 {
         let end = start_pos + tokens.len();
         st.asked = end;
         if end <= st.done {
-            return Ok(st.logits.clone()); // run ahead with an earlier chunk's image block
+            return Ok(Tensor::F32(st.logits.clone())); // run ahead with an earlier chunk's image block
         }
 
         // Bidirectional image blocks must be whole within one pass: finish a straddled block.
@@ -372,30 +400,27 @@ impl NativeLm for Gemma4 {
             }
         }
         let logits = match &self.program {
-            Some(prog) => self.run_program(prog, st, &x, &ple_ids, from)?,
+            // A straddled image block caches its logits for the run-ahead: no device pick then.
+            Some(prog) => {
+                self.run_program(prog, st, &x, &ple_ids, from, greedy && stop == end)?
+            }
             None if self.text.has_moe() => {
                 return Err("gemma4 MoE: host forward not implemented; the graph program runs on Metal and the CPU graph executor".into())
             }
-            None => self
-                .text
-                .forward(x, &ple_ids, from, &mut st.cache, &st.blocks),
+            None => Tensor::F32(
+                self.text
+                    .forward(x, &ple_ids, from, &mut st.cache, &st.blocks),
+            ),
         };
         st.done = stop;
         if stop > end {
-            st.logits = logits.clone();
+            st.logits = crate::model::native::logits_of(logits.clone())?;
         }
         Ok(logits)
     }
-}
-
-/// Rows per batched prefill pass on the Metal program, and the most a pass may grow to when an image
-/// block (attended bidirectionally, so whole in one pass) straddles the boundary.
-const PREFILL_ROWS: usize = 64;
-const PREFILL_MAX_ROWS: usize = 512;
-
-impl Gemma4 {
     /// Runs rows `[from, from + ids.len())` (`x` = their embeddings, `ids` = per-layer-embedding ids,
-    /// `u32::MAX` for media rows) through the graph program inside the sequence's state; the last row's logits.
+    /// `u32::MAX` for media rows) through the graph program inside the sequence's state; the last row's
+    /// logits, or its device-picked token when `greedy` ([`Self::pass`]).
     fn run_program(
         &self,
         prog: &parking_lot::Mutex<crate::graph::program::GraphProgram>,
@@ -403,11 +428,12 @@ impl Gemma4 {
         x: &[f32],
         ids: &[u32],
         from: usize,
-    ) -> Result<Vec<f32>, String> {
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
         let h = self.text.hidden;
         let mut p = prog.lock();
         std::mem::swap(&mut p.state, &mut st.program_state);
-        let mut last = Ok(Vec::new());
+        let mut last = Ok(crate::graph::Tensor::F32(Vec::new()));
         let mut at = 0;
         while at < ids.len() && last.is_ok() {
             let mut end = (at + PREFILL_ROWS).min(ids.len());
@@ -430,6 +456,7 @@ impl Gemma4 {
                     &x[at * h..end * h],
                     &ids[at..end],
                     from + at,
+                    greedy && end == ids.len(),
                 )
             };
             at = end;
@@ -439,7 +466,8 @@ impl Gemma4 {
     }
 
     /// One pass over `ids.len()` consecutive rows from position `pos0`: the single-row decode program for
-    /// one row (or when the program is not one Metal segment), else the batched prefill graph.
+    /// one row (or when the program is not one Metal segment), else the batched prefill graph. `greedy`:
+    /// the last single-row step goes through [`crate::graph::program::GraphProgram::run_greedy`].
     fn run_chunk(
         &self,
         p: &mut crate::graph::program::GraphProgram,
@@ -447,7 +475,8 @@ impl Gemma4 {
         x: &[f32],
         ids: &[u32],
         pos0: usize,
-    ) -> Result<Vec<f32>, String> {
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
         use crate::graph::Tensor;
         let (h, m) = (self.text.hidden, ids.len());
         let mut ple = Vec::new();
@@ -468,7 +497,7 @@ impl Gemma4 {
         }
         let ple_row = ple.len() / m;
         let logits = |res: Vec<Tensor>| match res.into_iter().next() {
-            Some(Tensor::F32(v)) => Ok(v),
+            Some(t @ (Tensor::F32(_) | Tensor::U32(_))) => Ok(t),
             _ => Err("gemma4: program did not return F32 logits".to_string()),
         };
         if m > 1 && p.is_single_metal() {
@@ -490,7 +519,7 @@ impl Gemma4 {
         if m > 1 && blocks.iter().any(|b| b.start < pos0 + m && pos0 < b.end) {
             return Err("gpu-only: image blocks are attended bidirectionally, which needs the Metal program; rerun with --backend cpu".into());
         }
-        let mut last = Vec::new();
+        let mut last = Tensor::F32(Vec::new());
         for (i, emb) in x.chunks_exact(h).enumerate() {
             let mut inputs = vec![
                 Tensor::F32(emb.to_vec()),
@@ -499,7 +528,11 @@ impl Gemma4 {
             if self.text.ple.is_some() {
                 inputs.push(Tensor::F32(ple[i * ple_row..(i + 1) * ple_row].to_vec()));
             }
-            last = logits(p.run(inputs)?)?;
+            last = logits(if greedy && i + 1 == m {
+                p.run_greedy(inputs, self.tokenizer.vocab_size())?
+            } else {
+                p.run(inputs)?
+            })?;
         }
         Ok(last)
     }

@@ -1437,6 +1437,53 @@ mod tests {
         }
     }
 
+    /// Greedy decoding on Metal with f16 and with f32 KV caches over the pseudo-random tiny MoE model (a
+    /// sliding layer with an 8-position window and a full layer): 48 steps give the same token stream and
+    /// logits within f16 rounding of the cached K/V.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_moe_greedy_stream_f16_kv_matches_f32() {
+        use crate::graph::metal::{Runtime, Session};
+        use crate::graph::{StateStore, Tensor};
+        let model = tiny_moe_model();
+        let (g, w) = model.to_decode_graph().unwrap();
+        let rt = Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
+        let stream = |kv_f16: bool| {
+            let mut session = Session::new(rt.clone(), &w).unwrap();
+            session.set_kv_f16(kv_f16);
+            let plan = session.prepare_plan(&g).unwrap();
+            assert_eq!(!plan.f16_states.is_empty(), kv_f16);
+            let mut state = StateStore::new();
+            let (mut tok, mut toks, mut all_logits) = (5u32, vec![], vec![]);
+            for pos in 0..48u32 {
+                let mut emb = vec![0.0f32; model.hidden];
+                model.embed_row(tok, &mut emb);
+                let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos])];
+                let out = session
+                    .run_prepared(&g, &plan, Some(&mut state), inputs)
+                    .unwrap();
+                let logits = out[0].as_f32().unwrap().to_vec();
+                tok = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0 as u32;
+                toks.push(tok);
+                all_logits.push(logits);
+            }
+            (toks, all_logits)
+        };
+        let (want_toks, want) = stream(false);
+        let (got_toks, got) = stream(true);
+        assert_eq!(got_toks, want_toks, "greedy streams diverge");
+        for (step, (w, g)) in want.iter().zip(&got).enumerate() {
+            let diff = w.iter().zip(g).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let scale = w.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+            assert!(diff / scale < 2e-3, "step {step}: max logit diff {diff} (scale {scale})");
+        }
+    }
+
     #[test]
     fn test_gemma4_to_decode_graph_cpu_parity() {
         use crate::graph::cpu::run_stateless;
@@ -1467,6 +1514,37 @@ mod tests {
                 diff < 1e-4,
                 "Logit mismatch at index {i}: ref={r}, graph={g}"
             );
+        }
+    }
+
+    /// Fusing q/k/v keeps every other node in its original relative order and puts the fused
+    /// projection and its slices where the first fused projection was, so order-sensitive planner
+    /// fusions downstream (MoE router/top-k, norm batching) still see their patterns. Graph only:
+    /// the builder's loader `Mat` weights are never fused.
+    #[test]
+    fn qkv_fusion_keeps_node_order_of_moe_decode_graph() {
+        let (g, _) = tiny_moe_decode_graph().unwrap();
+        let mut fg = g.clone();
+        let qkv = crate::graph::egraph::Rule::Qkv;
+        assert!(crate::graph::egraph::fuse_rule(&mut fg, None, qkv) > 0);
+        let names = |g: &crate::graph::Graph| -> Vec<String> {
+            g.nodes.iter().map(|n| n.name.clone()).collect()
+        };
+        let (before, after) = (names(&g), names(&fg));
+        let fused: Vec<&String> = before.iter().filter(|n| !after.contains(n)).collect();
+        assert!(!fused.is_empty());
+        let kept: Vec<&String> = before.iter().filter(|n| after.contains(n)).collect();
+        let kept_after: Vec<&String> = after.iter().filter(|n| before.contains(n)).collect();
+        assert_eq!(kept, kept_after);
+        // Each layer's fused Linear sits right after the last node that preceded its q.
+        for (i, n) in after
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.ends_with(".fused_qkv"))
+        {
+            let q = n.trim_end_matches(".fused_qkv");
+            let q_at = before.iter().position(|b| b == q).unwrap();
+            assert_eq!(after[i - 1], before[q_at - 1], "{n}");
         }
     }
     #[test]
@@ -1708,7 +1786,8 @@ mod tests {
         let cpu_logits = cpu_res[0].as_f32().expect("f32 cpu logits");
 
         let rt = Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
-        let session = Session::new(rt, &w).expect("session succeeds");
+        let mut session = Session::new(rt, &w).expect("session succeeds");
+        session.set_kv_f16(false);
         let metal_res = session.run(&decode_g, inputs).expect("metal run succeeds");
         let metal_logits = metal_res[0].as_f32().expect("f32 metal logits");
 
@@ -1816,7 +1895,8 @@ mod tests {
         }
         let graph = model.to_prefill_graph(ids.len()).unwrap();
         let weights = model.to_decode_graph().unwrap().1;
-        let session = Session::new(Runtime::shared().unwrap(), &weights).unwrap();
+        let mut session = Session::new(Runtime::shared().unwrap(), &weights).unwrap();
+        session.set_kv_f16(false);
         for blocks in [vec![], vec![3..7]] {
             let want = model.forward(x.clone(), &ids, 0, &mut model.new_cache(), &blocks);
             let visible_end = (0..ids.len())

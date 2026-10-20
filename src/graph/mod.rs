@@ -11,6 +11,7 @@ pub mod avenues;
 pub mod codec;
 pub mod codegen;
 pub mod coreml;
+pub mod egraph;
 pub mod cpu;
 pub mod cuda;
 pub mod level_zero;
@@ -21,9 +22,30 @@ pub mod pattern;
 pub mod placement;
 pub mod program;
 pub mod rocm;
+pub mod search;
 pub mod tune;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
+
+/// Whether `item` is in `GIBBS_DISABLE` (comma list, read once): per-item kill switch next to
+/// `metal::fusion_policy` (here because the e-graph and loaders build without Metal). Items:
+/// `deltanet` and loader items (README). Tests set [`TEST_DISABLE`] per thread.
+pub(crate) fn disabled(item: &str) -> bool {
+    #[cfg(test)]
+    let list = TEST_DISABLE.with(|d| d.get());
+    #[cfg(not(test))]
+    let list = {
+        static D: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| std::env::var("GIBBS_DISABLE").unwrap_or_default());
+        D.as_str()
+    };
+    list.split(',').any(|s| s.trim() == item)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_DISABLE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueId(pub u32);
@@ -618,6 +640,10 @@ pub struct StateStore {
     pub buffers: HashMap<String, Tensor>,
     #[cfg(target_os = "macos")]
     pub metal_buffers: HashMap<String, (std::sync::Arc<::metal::Buffer>, usize)>,
+    /// Names in `metal_buffers` whose elements are f16 (attention KV caches); the rest are f32. The
+    /// element count in `metal_buffers` counts elements of either type.
+    #[cfg(target_os = "macos")]
+    pub metal_f16: std::collections::HashSet<String>,
 }
 
 impl StateStore {
@@ -662,15 +688,31 @@ impl StateStore {
         std::iter::empty()
     }
 
+    /// Device buffer `name` as f32 (f16 buffers are widened).
+    #[cfg(target_os = "macos")]
+    pub fn read_metal(&self, name: &str) -> Option<Vec<f32>> {
+        let (buf, n) = self.metal_buffers.get(name)?;
+        // SAFETY: shared-storage buffer of `n` elements of the recorded type; programs run
+        // synchronously, so the GPU is idle.
+        Some(unsafe {
+            if self.metal_f16.contains(name) {
+                std::slice::from_raw_parts(buf.contents() as *const u16, *n)
+                    .iter()
+                    .map(|&h| crate::model::f16_to_f32(h))
+                    .collect()
+            } else {
+                std::slice::from_raw_parts(buf.contents() as *const f32, *n).to_vec()
+            }
+        })
+    }
+
     /// Copies of the named states (device-resident ones are read back from their buffers).
     pub fn snapshot(&self, names: &[&str]) -> HashMap<String, Tensor> {
         let mut snap = HashMap::new();
         for &name in names {
             #[cfg(target_os = "macos")]
-            if let Some((buf, n)) = self.metal_buffers.get(name) {
-                // SAFETY: shared-storage buffer of `n` f32; programs run synchronously, so the GPU is idle.
-                let s = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, *n) };
-                snap.insert(name.to_string(), Tensor::F32(s.to_vec()));
+            if let Some(v) = self.read_metal(name) {
+                snap.insert(name.to_string(), Tensor::F32(v));
                 continue;
             }
             if let Some(t) = self.buffers.get(name) {
@@ -691,13 +733,20 @@ impl StateStore {
                         v.len() <= *n,
                         "snapshot of state {name} is larger than its buffer"
                     );
-                    // SAFETY: as in `snapshot`; `v` has v.len() <= n f32.
+                    // SAFETY: as in `read_metal`; `v` has v.len() <= n elements.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            v.as_ptr(),
-                            buf.contents() as *mut f32,
-                            v.len(),
-                        )
+                        if self.metal_f16.contains(&name) {
+                            let dst = std::slice::from_raw_parts_mut(buf.contents() as *mut u16, v.len());
+                            for (d, &x) in dst.iter_mut().zip(v) {
+                                *d = crate::model::f32_to_f16(x.clamp(-65504.0, 65504.0));
+                            }
+                        } else {
+                            std::ptr::copy_nonoverlapping(
+                                v.as_ptr(),
+                                buf.contents() as *mut f32,
+                                v.len(),
+                            )
+                        }
                     };
                     self.buffers.remove(&name);
                     continue;
@@ -709,10 +758,13 @@ impl StateStore {
 
     #[cfg(target_os = "macos")]
     pub fn sync_metal_to_cpu(&mut self) {
-        for (name, (buf, n)) in &self.metal_buffers {
-            let slice = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, *n) };
-            self.buffers
-                .insert(name.clone(), Tensor::F32(slice.to_vec()));
+        let synced: Vec<_> = self
+            .metal_buffers
+            .keys()
+            .filter_map(|name| Some((name.clone(), self.read_metal(name)?)))
+            .collect();
+        for (name, v) in synced {
+            self.buffers.insert(name, Tensor::F32(v));
         }
     }
 }

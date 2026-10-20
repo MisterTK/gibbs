@@ -167,10 +167,18 @@ impl ExecutableModel {
         top_p: f32,
         kv_cache: &mut Option<SeqKvCache>,
     ) -> Result<u32, String> {
+        // Greedy (as `sample_logits` decides it): programs may pick the token on the device.
+        let greedy = temp <= 1e-4;
         let logits = match self {
             Self::Nano(m) => return Ok(m.read().forward_token(last_token, pos)),
             // `pos` counts `last_token` itself.
             Self::Native(m) => match kv_cache {
+                Some(SeqKvCache::Native(state)) if greedy => {
+                    match m.forward_greedy(&[last_token], pos - 1, state)? {
+                        crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok(t[0]),
+                        t => crate::model::native::logits_of(t)?,
+                    }
+                }
                 Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
                 _ => return Err(WRONG_KV.into()),
             },
@@ -217,11 +225,16 @@ impl ExecutableModel {
                             crate::graph::Tensor::U32(vec![last_token]),
                             crate::graph::Tensor::U32(vec![actual_pos]),
                         ];
-                        let out = p.run(inputs);
+                        let out = if greedy {
+                            p.run_greedy(inputs, model.tokenizer.vocab_size())
+                        } else {
+                            p.run(inputs)
+                        };
                         std::mem::swap(&mut p.state, state);
                         let out = out?;
                         match out.into_iter().next() {
                             Some(crate::graph::Tensor::F32(v)) => v,
+                            Some(crate::graph::Tensor::U32(t)) if t.len() == 1 => return Ok(t[0]),
                             _ => return Err("GraphProgram did not return F32 logits".into()),
                         }
                     }
@@ -518,39 +531,22 @@ impl ExecutableModel {
                         crate::graph::Tensor::U32(chunk_tokens.to_vec()),
                         crate::graph::Tensor::U32(pos_vec),
                     ];
-                    let crate::graph::program::GraphProgram {
-                        segments,
-                        state: prog_state,
-                        ..
-                    } = &mut *p;
-                    match segments.first() {
-                        #[cfg(target_os = "macos")]
-                        Some(crate::graph::program::CompiledSegment::Metal { session, .. }) => {
-                            let res = (|| -> Result<Vec<f32>, String> {
-                                let plan = session.prepare_plan(&prefill_g)?;
-                                let out = session.run_prepared(
-                                    &prefill_g,
-                                    &plan,
-                                    Some(prog_state),
-                                    inputs,
-                                )?;
-                                match out.into_iter().next() {
-                                    Some(crate::graph::Tensor::F32(v)) => {
-                                        let v_size = model.config.vocab_size;
-                                        Ok(v[(chunk_len - 1) * v_size..chunk_len * v_size].to_vec())
-                                    }
-                                    _ => Err("GraphProgram did not return F32 logits".into()),
-                                }
-                            })();
-                            match res {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    std::mem::swap(prog_state, seq_state);
-                                    return Err(e);
-                                }
+                    // `run_reshaped` caches the plan per chunk shape (an uncached plan costs ~6 ms).
+                    let res = p.run_reshaped(&prefill_g, inputs).and_then(|out| {
+                        match out.into_iter().next() {
+                            Some(crate::graph::Tensor::F32(v)) => {
+                                let v_size = model.config.vocab_size;
+                                Ok(v[(chunk_len - 1) * v_size..chunk_len * v_size].to_vec())
                             }
+                            _ => Err("GraphProgram did not return F32 logits".to_string()),
                         }
-                        _ => unreachable!(),
+                    });
+                    match res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            std::mem::swap(&mut p.state, seq_state);
+                            return Err(e);
+                        }
                     }
                 } else {
                     let mut last = Vec::new();

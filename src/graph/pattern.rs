@@ -1,7 +1,5 @@
-//! Declarative Subgraph Pattern Combinators for Graph IR.
-//!
-//! Provides a composable, backtracking subgraph isomorphism matcher and
-//! rewrite engine for structural graph fusions.
+//! Graph rewriting for the fusions [`crate::graph::egraph`] extracts: [`GraphRewriter::replace`]
+//! swaps captured subgraphs for new nodes, keeping the node order stable.
 
 use crate::graph::{Graph, Node, NodeId, ValueId, ValueKind};
 use std::collections::{HashMap, HashSet};
@@ -22,276 +20,23 @@ impl MatchContext {
     }
 }
 
-/// Pattern element representing a node matcher.
-pub enum PatternNode {
-    /// Matches by operation name or type predicate.
-    OpType(String),
-    /// Matches node with custom predicate.
-    Predicate(Box<dyn Fn(&Node, &Graph) -> bool + Send + Sync>),
-    /// Matches any node.
-    Any,
-    /// Captures matched node under a name.
-    Capture(String, Box<PatternNode>),
-}
-
-/// Structural constraint between pattern nodes.
-pub enum PatternEdge {
-    /// Producer output flows to consumer input: `(producer_idx, consumer_idx)`.
-    DataFlow(usize, usize),
-    /// Producer flows to multiple consumers: `(root_idx, vec![consumer_idx, ...])`.
-    Branch(usize, Vec<usize>),
-    /// Consumers share the same primary input: `(consumer_a, consumer_b)`.
-    SharedInput(usize, usize),
-}
-
-/// Composable pattern specification over subgraphs.
-pub struct Pattern {
-    pub nodes: Vec<PatternNode>,
-    pub edges: Vec<PatternEdge>,
-}
-
-impl Pattern {
-    pub fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            edges: Vec::new(),
-        }
-    }
-
-    /// Appends a node matcher to the pattern and returns its index.
-    pub fn add_node(&mut self, node: PatternNode) -> usize {
-        let idx = self.nodes.len();
-        self.nodes.push(node);
-        idx
-    }
-
-    /// Adds a dataflow edge: node `from` produces a value read by node `to`.
-    pub fn add_edge(&mut self, from: usize, to: usize) {
-        self.edges.push(PatternEdge::DataFlow(from, to));
-    }
-
-    /// Adds a branch constraint: node `root` produces a value read by all `consumers`.
-    pub fn add_branch(&mut self, root: usize, consumers: &[usize]) {
-        self.edges
-            .push(PatternEdge::Branch(root, consumers.to_vec()));
-    }
-    /// Adds a constraint that both consumers read the same primary input operand.
-    pub fn add_shared_input(&mut self, a: usize, b: usize) {
-        self.edges.push(PatternEdge::SharedInput(a, b));
-    }
-
-    /// Searches `graph` for all matching subgraphs via backtracking isomorphism.
-    pub fn search(&self, graph: &Graph) -> Vec<MatchContext> {
-        let mut results = Vec::new();
-        let mut assignment: Vec<Option<NodeId>> = vec![None; self.nodes.len()];
-        let mut used = HashSet::new();
-
-        self.backtrack(graph, 0, &mut assignment, &mut used, &mut results);
-
-        // Deduplicate symmetric matches that cover identical sets of nodes
-        let mut unique_results = Vec::new();
-        let mut seen_node_sets: HashSet<Vec<NodeId>> = HashSet::new();
-        for ctx in results {
-            let mut node_set: Vec<NodeId> = ctx.captures.values().copied().collect();
-            node_set.sort_by_key(|n| n.0);
-            if seen_node_sets.insert(node_set) {
-                unique_results.push(ctx);
-            }
-        }
-        unique_results
-    }
-
-    fn backtrack(
-        &self,
-        graph: &Graph,
-        pat_idx: usize,
-        assignment: &mut [Option<NodeId>],
-        used: &mut HashSet<NodeId>,
-        results: &mut Vec<MatchContext>,
-    ) {
-        if pat_idx == self.nodes.len() {
-            // All nodes assigned, verify edges
-            if self.check_edges(graph, assignment) {
-                let mut ctx = MatchContext::default();
-                for (idx, p_node) in self.nodes.iter().enumerate() {
-                    if let Some(nid) = assignment[idx] {
-                        extract_captures(p_node, nid, &mut ctx);
-                    }
-                }
-                results.push(ctx);
-            }
-            return;
-        }
-
-        let p_node = &self.nodes[pat_idx];
-        for (i, node) in graph.nodes.iter().enumerate() {
-            let nid = NodeId(i as u32);
-            if used.contains(&nid) {
-                continue;
-            }
-            if matches_node(p_node, node, graph) {
-                assignment[pat_idx] = Some(nid);
-                used.insert(nid);
-
-                // Early edge constraint pruning
-                if self.check_partial_edges(graph, assignment, pat_idx) {
-                    self.backtrack(graph, pat_idx + 1, assignment, used, results);
-                }
-
-                assignment[pat_idx] = None;
-                used.remove(&nid);
-            }
-        }
-    }
-
-    fn check_edges(&self, graph: &Graph, assignment: &[Option<NodeId>]) -> bool {
-        for edge in &self.edges {
-            match edge {
-                PatternEdge::DataFlow(from, to) => {
-                    let from_nid = assignment[*from].expect("assigned");
-                    let to_nid = assignment[*to].expect("assigned");
-                    if !node_flows_to(graph, from_nid, to_nid) {
-                        return false;
-                    }
-                }
-                PatternEdge::Branch(root, consumers) => {
-                    let root_nid = assignment[*root].expect("assigned");
-                    for &c_idx in consumers {
-                        let c_nid = assignment[c_idx].expect("assigned");
-                        if !node_flows_to(graph, root_nid, c_nid) {
-                            return false;
-                        }
-                    }
-                }
-                PatternEdge::SharedInput(a, b) => {
-                    let a_nid = assignment[*a].expect("assigned");
-                    let b_nid = assignment[*b].expect("assigned");
-                    let a_in = graph.node(a_nid).inputs.first();
-                    let b_in = graph.node(b_nid).inputs.first();
-                    if a_in != b_in || a_in.is_none() {
-                        return false;
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    fn check_partial_edges(
-        &self,
-        graph: &Graph,
-        assignment: &[Option<NodeId>],
-        current_idx: usize,
-    ) -> bool {
-        for edge in &self.edges {
-            match edge {
-                PatternEdge::DataFlow(from, to) => {
-                    if *from <= current_idx && *to <= current_idx {
-                        let f = assignment[*from].unwrap();
-                        let t = assignment[*to].unwrap();
-                        if !node_flows_to(graph, f, t) {
-                            return false;
-                        }
-                    }
-                }
-                PatternEdge::Branch(root, consumers) => {
-                    if *root <= current_idx {
-                        let r = assignment[*root].unwrap();
-                        for &c in consumers {
-                            if c <= current_idx {
-                                let c_nid = assignment[c].unwrap();
-                                if !node_flows_to(graph, r, c_nid) {
-                                    return false;
-                                }
-                            }
-                        }
-                    }
-                }
-                PatternEdge::SharedInput(a, b) => {
-                    if *a <= current_idx && *b <= current_idx {
-                        let a_nid = assignment[*a].unwrap();
-                        let b_nid = assignment[*b].unwrap();
-                        let a_in = graph.node(a_nid).inputs.first();
-                        let b_in = graph.node(b_nid).inputs.first();
-                        if a_in != b_in || a_in.is_none() {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-        true
-    }
-}
-
-impl Default for Pattern {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn matches_node(pat: &PatternNode, node: &Node, graph: &Graph) -> bool {
-    match pat {
-        PatternNode::OpType(op_name) => node.op.name() == op_name,
-        PatternNode::Predicate(pred) => pred(node, graph),
-        PatternNode::Any => true,
-        PatternNode::Capture(_, inner) => matches_node(inner, node, graph),
-    }
-}
-
-fn extract_captures(pat: &PatternNode, nid: NodeId, ctx: &mut MatchContext) {
-    if let PatternNode::Capture(name, inner) = pat {
-        ctx.insert(name.clone(), nid);
-        extract_captures(inner, nid, ctx);
-    }
-}
-
-fn node_flows_to(graph: &Graph, from: NodeId, to: NodeId) -> bool {
-    let from_node = graph.node(from);
-    let to_node = graph.node(to);
-    for out in &from_node.outputs {
-        if to_node.inputs.contains(out) {
-            return true;
-        }
-    }
-    false
-}
-
-// Combinator builder helpers
-
-/// Matches node with given operation name.
-pub fn op_type(name: &str) -> PatternNode {
-    PatternNode::OpType(name.to_string())
-}
-
-/// Matches node satisfying custom predicate.
-pub fn pred<F: Fn(&Node, &Graph) -> bool + Send + Sync + 'static>(f: F) -> PatternNode {
-    PatternNode::Predicate(Box::new(f))
-}
-
-/// Matches any node.
-pub fn any() -> PatternNode {
-    PatternNode::Any
-}
-
-/// Captures matched node under `name`.
-pub fn capture(name: &str, node: PatternNode) -> PatternNode {
-    PatternNode::Capture(name.to_string(), Box::new(node))
-}
-
 /// Graph rewriting engine.
 pub struct GraphRewriter;
 
 impl GraphRewriter {
     /// Replaces matched subgraphs with a new node generated by `builder_fn`.
-    /// Reroutes consumers of replaced nodes to the replacement node's outputs,
-    /// and removes eliminated nodes in topological order.
+    /// Reroutes consumers of replaced nodes to the replacement node's outputs and removes the
+    /// eliminated nodes. Every other node keeps its relative order; each match's new nodes take
+    /// the place of its first eliminated node.
     pub fn replace<F>(graph: &mut Graph, matches: &[MatchContext], mut builder_fn: F) -> usize
     where
         F: FnMut(&mut Graph, &MatchContext) -> Option<(Vec<NodeId>, Vec<ValueId>)>,
     {
         let mut total_rewrites = 0;
         let mut all_eliminated: HashSet<NodeId> = HashSet::new();
+        let orig_len = graph.nodes.len();
+        // First eliminated node of a match -> the nodes its builder appended.
+        let mut placed: HashMap<NodeId, std::ops::Range<usize>> = HashMap::new();
 
         for m in matches {
             // Skip match if any of its nodes are already eliminated
@@ -299,7 +44,11 @@ impl GraphRewriter {
                 continue;
             }
 
+            let first_new = graph.nodes.len();
             if let Some((elim_nodes, new_outputs)) = builder_fn(graph, m) {
+                if let Some(&anchor) = elim_nodes.iter().min_by_key(|n| n.0) {
+                    placed.insert(anchor, first_new..graph.nodes.len());
+                }
                 // Determine original output values from eliminated nodes
                 let mut old_outputs = Vec::new();
                 for &nid in &elim_nodes {
@@ -330,11 +79,61 @@ impl GraphRewriter {
         }
 
         if total_rewrites > 0 {
-            // Prune eliminated nodes and reconstruct graph values in topological order
-            compact_graph(graph, &all_eliminated);
+            let mut order = Vec::with_capacity(graph.nodes.len());
+            for i in 0..orig_len {
+                let nid = NodeId(i as u32);
+                if let Some(r) = placed.get(&nid) {
+                    order.extend(r.clone());
+                }
+                if !all_eliminated.contains(&nid) {
+                    order.push(i);
+                }
+            }
+            // Nodes appended by builders that then declined their match: kept, at the end.
+            order.extend(
+                (orig_len..graph.nodes.len()).filter(|i| !placed.values().any(|r| r.contains(i))),
+            );
+            if is_topological(graph, &order) {
+                apply_order(graph, order);
+            } else {
+                compact_graph(graph, &all_eliminated);
+            }
         }
 
         total_rewrites
+    }
+}
+
+/// Whether every node in `order` (indices into `graph.nodes`) only reads values produced earlier
+/// in `order` or by no node.
+fn is_topological(graph: &Graph, order: &[usize]) -> bool {
+    let mut done = vec![false; graph.nodes.len()];
+    for &i in order {
+        let ready = graph.nodes[i]
+            .inputs
+            .iter()
+            .all(|&v| match graph.value(v).kind {
+                ValueKind::Node(p) => done[p.0 as usize],
+                _ => true,
+            });
+        if !ready {
+            return false;
+        }
+        done[i] = true;
+    }
+    true
+}
+
+/// Keeps the nodes at `order` (indices into `graph.nodes`), in that order, and renumbers them.
+fn apply_order(graph: &mut Graph, order: Vec<usize>) {
+    let mut slots: Vec<Option<Node>> = graph.nodes.drain(..).map(Some).collect();
+    graph.nodes = order.into_iter().filter_map(|i| slots[i].take()).collect();
+    for (new_idx, node) in graph.nodes.iter().enumerate() {
+        for &out in &node.outputs {
+            if let Some(val) = graph.values.get_mut(out.0 as usize) {
+                val.kind = ValueKind::Node(NodeId(new_idx as u32));
+            }
+        }
     }
 }
 
@@ -458,46 +257,7 @@ mod tests {
     use crate::graph::{DType, Op};
 
     #[test]
-    fn test_graph_pattern_combinators_branch() {
-        let mut g = Graph::new();
-        let in_x = g.input("x", vec![1, 64], DType::F32);
-        let gamma = g.weight("gamma", vec![64], DType::F32);
-        let norm = g.add(
-            "norm",
-            Op::RmsNorm { eps: 1e-5 },
-            &[in_x, gamma],
-            vec![1, 64],
-            DType::F32,
-        );
-        let w_q = g.weight("w_q", vec![64, 64], DType::F32);
-        let w_k = g.weight("w_k", vec![64, 64], DType::F32);
-        let w_v = g.weight("w_v", vec![64, 64], DType::F32);
-        let _q = g.add("q", Op::Linear, &[norm, w_q], vec![1, 64], DType::F32);
-        let _k = g.add("k", Op::Linear, &[norm, w_k], vec![1, 64], DType::F32);
-        let _v = g.add("v", Op::Linear, &[norm, w_v], vec![1, 64], DType::F32);
-
-        let mut pat = Pattern::new();
-        let r = pat.add_node(capture("norm", op_type("RmsNorm")));
-        let q_node = pat.add_node(capture("q", op_type("Linear")));
-        let k_node = pat.add_node(capture("k", op_type("Linear")));
-        let v_node = pat.add_node(capture("v", op_type("Linear")));
-        pat.add_branch(r, &[q_node, k_node, v_node]);
-
-        let matches = pat.search(&g);
-        assert_eq!(
-            matches.len(),
-            1,
-            "Pattern should find exactly one QKV branch"
-        );
-        let m = &matches[0];
-        assert_eq!(m.get("norm"), Some(NodeId(0)));
-        assert!(m.get("q").is_some());
-        assert!(m.get("k").is_some());
-        assert!(m.get("v").is_some());
-    }
-
-    #[test]
-    fn test_graph_pattern_combinators_replace() {
+    fn graph_rewriter_replaces_captured_nodes() {
         let mut g = Graph::new();
         let in_x = g.input("x", vec![1, 64], DType::F32);
         let gamma = g.weight("gamma", vec![64], DType::F32);
@@ -535,16 +295,12 @@ mod tests {
         // Validate initial SSA
         assert!(validate_ssa(&g).is_ok());
 
-        // Pattern to find Q, K, V
-        let mut pat = Pattern::new();
-        let r = pat.add_node(capture("norm", op_type("RmsNorm")));
-        let q_node = pat.add_node(capture("q", op_type("Linear")));
-        let k_node = pat.add_node(capture("k", op_type("Linear")));
-        let v_node = pat.add_node(capture("v", op_type("Linear")));
-        pat.add_branch(r, &[q_node, k_node, v_node]);
-
-        let matches = pat.search(&g);
-        assert_eq!(matches.len(), 1);
+        // The captures an e-graph extraction hands the rewriter: nodes 0..=3 are norm, q, k, v.
+        let mut m = MatchContext::default();
+        for (i, name) in ["norm", "q", "k", "v"].into_iter().enumerate() {
+            m.insert(name, NodeId(i as u32));
+        }
+        let matches = vec![m];
 
         // Replace Q, K, V with a single fused QKV projection
         let rewrites = GraphRewriter::replace(&mut g, &matches, |graph, m| {

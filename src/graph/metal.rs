@@ -187,7 +187,7 @@ use metal::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CStr};
 use std::path::Path;
 use std::sync::Arc;
@@ -291,8 +291,9 @@ impl WeightFormat {
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
         }
-        if generated {
+        if let Some(f) = self.codec_format().filter(|_| generated) {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
+            v.extend(tune::gen64_rows(f).iter().map(|&r| GemvVariant::generated64(r)));
         }
         v
     }
@@ -380,6 +381,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
 }
 
 mod ext;
+mod fuse;
 #[cfg(test)]
 mod testutil;
 
@@ -390,6 +392,22 @@ static KERNELS_MSL: std::sync::LazyLock<String> =
 /// `MTLLanguageVersion4_0`; the metal crate's enum stops at 3.x.
 const MSL_4_0: u64 = 0x40000;
 const ARENA_ALIGN: usize = 256;
+/// Largest finite f16. K/V values beyond it saturate (kernels and host uploads alike) rather than become inf.
+const F16_MAX: f32 = 65504.0;
+
+/// Whether attention KV caches default to f16 storage: only with `GIBBS_KV_DTYPE=f16` (opt-in). The
+/// f16 kernels accumulate and softmax in f32 and saturate stores at +-65504, but decode with them was
+/// 0.5-24% slower per model (ledger row s3-abba-kv-f16; M8 at 4k context worst), so f32 is the default.
+pub(crate) fn kv_f16_default() -> bool {
+    match std::env::var("GIBBS_KV_DTYPE").as_deref() {
+        Ok("f16") => true,
+        Ok("f32") | Err(_) => false,
+        Ok(other) => {
+            eprintln!("GIBBS_KV_DTYPE={other:?} is not f32 or f16; using f32");
+            false
+        }
+    }
+}
 /// Threads per threadgroup: element-wise and row kernels, and the 4-simdgroup GEMM/attention kernels.
 const TG: u64 = 256;
 const TG4: u64 = 128;
@@ -412,7 +430,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 70] = [
+const BASE_KERNELS: [&str; 81] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -466,17 +484,28 @@ const BASE_KERNELS: [&str; 70] = [
     "gemm_batched_q8_0_residual",
     "rope_general_f32",
     "kv_append_batched",
+    "kv_append_batched_f16",
     "attn_cached_f32",
     "flash_attn_cached_f32_1",
     "flash_attn_cached_f32_2",
     "flash_attn_cached_f32_4",
     "flash_attn_cached_f32_8",
     "flash_attn_cached_f32",
+    "flash_attn_cached_f16_1",
+    "flash_attn_cached_f16_2",
+    "flash_attn_cached_f16_4",
+    "flash_attn_cached_f16_8",
+    "flash_attn_cached_f16",
     "attn_cached_gqa_split_f32_1",
     "attn_cached_gqa_split_f32_2",
     "attn_cached_gqa_split_f32_4",
     "attn_cached_gqa_split_f32_8",
     "attn_cached_gqa_split_f32_16",
+    "attn_cached_gqa_split_f16_1",
+    "attn_cached_gqa_split_f16_2",
+    "attn_cached_gqa_split_f16_4",
+    "attn_cached_gqa_split_f16_8",
+    "attn_cached_gqa_split_f16_16",
     "attn_cached_merge_f32",
     "paged_attn_cached_f32",
     "causal_conv1d_f32",
@@ -618,11 +647,13 @@ pub struct Runtime {
     pub report: String,
     /// Where `profile` is persisted.
     profile_path: std::path::PathBuf,
-    /// Generated GEMV pipelines by (codec format, rows per simdgroup), compiled on first use.
-    gen_psos: Mutex<HashMap<(QuantFormat, u8), ComputePipelineState>>,
+    /// Generated GEMV pipelines by (codec format, rows per simdgroup, simdgroups), compiled on first use.
+    gen_psos: Mutex<HashMap<(QuantFormat, u8, u8), ComputePipelineState>>,
     /// Measured GEMV variant winners ([`tune`]) and where they persist.
     tune: Mutex<tune::TuneCache>,
     tune_path: std::path::PathBuf,
+    /// Plan-search verdicts ([`crate::graph::search`]), persisted in the same file.
+    plan_cache: Mutex<tune::TuneCache<crate::graph::search::Verdict>>,
 }
 
 impl Runtime {
@@ -693,6 +724,7 @@ impl Runtime {
             gen_psos: Mutex::new(HashMap::new()),
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
+            plan_cache: Mutex::new(tune::TuneCache::default()),
         };
         let profile_hash = src_hash ^ codec::source_hash().rotate_left(13);
         let profile_path = cache
@@ -799,6 +831,7 @@ impl Runtime {
         rt.profile_path = profile_path;
         rt.tune_path = cache.join("host").join(format!("tune-{tag}.json"));
         rt.tune = Mutex::new(tune::TuneCache::load(&rt.tune_path));
+        rt.plan_cache = Mutex::new(tune::TuneCache::load(&rt.tune_path));
         let p = &rt.profile;
         let gemm: Vec<String> = p
             .gemm
@@ -1098,17 +1131,17 @@ impl Runtime {
         Ok(out)
     }
 
-    /// The generated packed-GEMV pipeline for `f` at `rows_per_sg`, compiled on first use.
-    fn gen_pso(&self, f: QuantFormat, rows_per_sg: u8) -> Result<ComputePipelineState, String> {
+    /// The generated packed-GEMV pipeline for `f` with `params`, compiled on first use.
+    fn gen_pso(
+        &self,
+        f: QuantFormat,
+        params: crate::graph::codegen::GemvParams,
+    ) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, rows_per_sg);
+        let key = (c.format, params.rows_per_sg as u8, params.simdgroups as u8);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
-        let params = crate::graph::codegen::GemvParams {
-            rows_per_sg: rows_per_sg as usize,
-            ..Default::default()
-        };
         let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n");
         src.push_str(crate::graph::codegen::gemv_common(&KERNELS_MSL));
         src.push_str(&crate::graph::codegen::gemv_packed(c, params));
@@ -1138,7 +1171,7 @@ impl Runtime {
     /// otherwise unused `rows_per_sg == 0` slot).
     fn dequant_pso(&self, f: QuantFormat) -> Result<ComputePipelineState, String> {
         let c = codec::codec(f).ok_or_else(|| format!("no codec for {f:?}"))?;
-        let key = (c.format, 0);
+        let key = (c.format, 0, 0);
         if let Some(p) = self.gen_psos.lock().get(&key) {
             return Ok(p.clone());
         }
@@ -1152,7 +1185,7 @@ impl Runtime {
     /// Hash of the kernel sources behind every variant of `fmt`: an edit invalidates only the
     /// tune entries of the formats whose kernels it changed.
     fn variants_hash(&self, fmt: WeightFormat) -> u64 {
-        use crate::graph::codegen::{gemv_common, gemv_packed, GemvParams};
+        use crate::graph::codegen::{gemv_common, gemv_packed};
         let mut h = fnv1a(gemv_common(&KERNELS_MSL).as_bytes());
         let mut mix =
             |s: &str| h = (h.rotate_left(5) ^ fnv1a(s.as_bytes())).wrapping_mul(0x100000001b3);
@@ -1160,14 +1193,10 @@ impl Runtime {
             mix(tune::kernel_source(&KERNELS_MSL, name));
         }
         if let Some(c) = fmt.codec_format().and_then(codec::codec) {
-            for r in tune::GEN_ROWS {
-                mix(&gemv_packed(
-                    c,
-                    GemvParams {
-                        rows_per_sg: r as usize,
-                        ..Default::default()
-                    },
-                ));
+            for v in fmt.gemv_variants() {
+                if v.kernel != GemvKernel::Hand {
+                    mix(&gemv_packed(c, v.gen_params()));
+                }
             }
         }
         h
@@ -1237,6 +1266,28 @@ impl Runtime {
             cache.insert_contended(key, tuned);
         }
         best
+    }
+
+    /// [`crate::graph::search::run`] against this device's tune file: the choice ids to flip
+    /// from the cost-model extraction (`time(flips)`: best GPU µs of one step of that plan).
+    pub fn plan_search(
+        &self,
+        choices: &[crate::graph::egraph::Choice],
+        time: impl FnMut(&[usize]) -> Result<f64, String>,
+    ) -> Vec<usize> {
+        let kernels = fnv1a(KERNELS_MSL.as_bytes()) ^ codec::source_hash().rotate_left(13);
+        let flips = crate::graph::search::run(
+            choices,
+            kernels,
+            &mut self.plan_cache.lock(),
+            &self.tune_path,
+            tune::foreign_busy(),
+            crate::graph::search::BUDGET,
+            time,
+        );
+        // The timed runs are not decode tokens: keep them out of the run-sample ring.
+        take_run_samples();
+        flips
     }
 
     /// Starts [`Self::benchmark_codecs`] on a background thread unless this host profile already
@@ -1499,6 +1550,8 @@ pub struct Session {
     dequant_scratch: Mutex<Option<Buffer>>,
     /// Per-slice partials of the split decode attention (grown to the largest).
     attn_scratch: Mutex<Option<Buffer>>,
+    /// Per-threadgroup (value, index) partials of the wide-row argmax (`ext::moe`).
+    argmax_scratch: Mutex<Option<Buffer>>,
     params_buffer: Mutex<Option<Buffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
@@ -1506,6 +1559,8 @@ pub struct Session {
     /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
     variant_override: Option<GemvVariant>,
     last_gpu_s: std::sync::atomic::AtomicU64,
+    /// Store attention KV caches (states read only as `CachedAttention` k/v operands) as f16.
+    kv_f16: bool,
 }
 /// Packs all active graph weights in `bufs` into one contiguous 256-byte-aligned `MTLBuffer`
 /// ordered by their first appearance along `graph.nodes` (execution order, E3).
@@ -2138,7 +2193,7 @@ impl Session {
             })
             .collect();
         for q in gen_formats {
-            rt.gen_pso(q, 2)?;
+            rt.gen_pso(q, crate::graph::codegen::GemvParams::default())?;
         }
         Ok(Self {
             rt,
@@ -2148,17 +2203,24 @@ impl Session {
             mlp_scratch: Mutex::new(None),
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
+            argmax_scratch: Mutex::new(None),
             params_buffer: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
             jesse_aux,
             variant_override: None,
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
+            kv_f16: kv_f16_default(),
         })
     }
     /// GPU seconds of the last completed (non-profiled) [`Self::run`] command buffer.
     pub fn last_gpu_seconds(&self) -> f64 {
         f64::from_bits(self.last_gpu_s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Stores attention KV caches as f16 (`true`) or f32 for plans prepared after this call;
+    /// the default is f32 unless `GIBBS_KV_DTYPE=f16`.
+    pub fn set_kv_f16(&mut self, on: bool) {
+        self.kv_f16 = on;
     }
     /// Repacks all weights of `self` into one contiguous 256-byte-aligned `MTLBuffer` ordered by
     /// their first appearance along `graph.nodes` (E3).
@@ -2207,43 +2269,36 @@ impl Session {
         (n * 4) as u64
     }
 
-    /// The pipeline and rows per threadgroup of `format`'s packed GEMV in `variant`.
+    /// The pipeline, rows per threadgroup and threads per threadgroup of `format`'s packed GEMV in `variant`.
     fn gemv_pipeline(
         &self,
         format: WeightFormat,
         variant: GemvVariant,
         cols: usize,
-    ) -> Result<(ComputePipelineState, u64), String> {
-        let generated = |q: QuantFormat, r: u8| -> Result<(ComputePipelineState, u64), String> {
+    ) -> Result<(ComputePipelineState, u64, u64), String> {
+        use crate::graph::codegen::{gemv_rows_per_tg, gemv_threads};
+        let generated = |q: QuantFormat, v: GemvVariant| -> Result<(ComputePipelineState, u64, u64), String> {
+            let p = v.gen_params();
             Ok((
-                self.rt.gen_pso(q, r)?,
-                crate::graph::codegen::gemv_rows_per_tg(crate::graph::codegen::GemvParams {
-                    rows_per_sg: r as usize,
-                    ..Default::default()
-                }) as u64,
+                self.rt.gen_pso(q, p)?,
+                gemv_rows_per_tg(p) as u64,
+                gemv_threads(p) as u64,
             ))
         };
         match (format, variant.kernel) {
-            (WeightFormat::Gen(q), _) => generated(
-                q,
-                if variant.kernel == GemvKernel::Gen {
-                    variant.rows_per_sg
-                } else {
-                    2
-                },
-            ),
-            (_, GemvKernel::Gen) => match format.codec_format() {
-                Some(q) => generated(q, variant.rows_per_sg),
-                None => Err(format!("no generated GEMV for {format:?}")),
-            },
+            (WeightFormat::Gen(q), GemvKernel::Hand) => generated(q, GemvVariant::generated(2)),
             (_, GemvKernel::Hand) => match format.hand_kernel() {
                 Some(_) if format == WeightFormat::Q4_0 && (cols & 1023) != 0 => {
-                    Ok((self.rt.pso("gemv_q4_0_half")?.clone(), 16))
+                    Ok((self.rt.pso("gemv_q4_0_half")?.clone(), 16, 256))
                 }
-                Some(name) => Ok((self.rt.pso(name)?.clone(), 16)),
+                Some(name) => Ok((self.rt.pso(name)?.clone(), 16, 256)),
                 None => Err(format!(
                     "Metal executor: unsupported packed GEMV format {format:?}"
                 )),
+            },
+            (_, GemvKernel::Gen | GemvKernel::Gen64) => match format.codec_format() {
+                Some(q) => generated(q, variant),
+                None => Err(format!("no generated GEMV for {format:?}")),
             },
         }
     }
@@ -2325,14 +2380,10 @@ impl Session {
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
         let (steps, aliases) = plan(graph)?;
-        let mut steps = batch_horizontal(steps, &aliases);
+        let mut steps = batch_horizontal(steps, &aliases)?;
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
-                eprintln!(
-                    "plan {i:4} {:<46} {}",
-                    s.name,
-                    kernel_kind(&format!("{:?}", s.op))
-                );
+                eprintln!("{}", plan_line(i, s));
             }
         }
         for s in &steps {
@@ -2374,6 +2425,11 @@ impl Session {
             }
         }
         self.assign_variants(&mut steps);
+        let f16_states = if self.kv_f16 {
+            assign_kv_dtypes(graph, &mut steps)
+        } else {
+            HashSet::new()
+        };
         let (offsets, arena_size) = allocate(graph, &steps, &aliases)?;
         pair_small_hand_gemvs(
             graph,
@@ -2424,27 +2480,22 @@ impl Session {
             match &s.op {
                 Step::CachedAttention {
                     heads,
-                    kv_heads: _,
+                    kv_heads,
                     head_dim,
-                    v_head_dim: _,
+                    v_head_dim,
                     window,
+                    kv_f16,
                     ..
                 } => {
-                    let kv_width = (*heads * *head_dim) as u64;
-                    let dtype_bytes = 2u64; // F16 KV cache
-                    let bytes_per_pos = kv_width * dtype_bytes;
-                    state_reads.push(StateRead {
-                        name: format!("{}_k", s.name),
-                        bytes_per_pos,
-                        window: *window,
-                        fixed_bytes: 0,
-                    });
-                    state_reads.push(StateRead {
-                        name: format!("{}_v", s.name),
-                        bytes_per_pos,
-                        window: *window,
-                        fixed_bytes: 0,
-                    });
+                    let eb = if *kv_f16 { 2u64 } else { 4 };
+                    for (suffix, width) in [("k", *head_dim), ("v", *v_head_dim)] {
+                        state_reads.push(StateRead {
+                            name: format!("{}_{suffix}", s.name),
+                            bytes_per_pos: (*kv_heads * width) as u64 * eb,
+                            window: *window,
+                            fixed_bytes: 0,
+                        });
+                    }
                     let nq = 1u64;
                     let nk = 1u64;
                     flops_per_run += 4 * nq * nk * (*head_dim as u64) * (*heads as u64);
@@ -2538,6 +2589,7 @@ impl Session {
             attn_pos_inputs,
             state_vars,
             value_locs,
+            f16_states,
         })
     }
 
@@ -2587,6 +2639,51 @@ impl Session {
     ) -> Result<Vec<Tensor>, String> {
         let plan = self.prepare_plan(graph)?;
         self.run_prepared(graph, &plan, state, inputs)
+    }
+
+    /// Best GPU µs of 5 runs of `plan` (after 2 warm-up runs) on dummy inputs: zero activations,
+    /// token id 1, other u32 inputs (positions) at 100 or half the smallest KV cache.
+    pub fn time_decode(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
+        state: &mut crate::graph::StateStore,
+    ) -> Result<f64, String> {
+        // Rows > 16: conv and recurrent states are not caches.
+        let pos = graph
+            .values
+            .iter()
+            .filter(|v| matches!(v.kind, ValueKind::State(_)))
+            .filter_map(|v| v.shape.first().copied())
+            .filter(|&r| r > 16)
+            .min()
+            .map_or(100, |r| (r as u32 / 2).min(100));
+        let inputs = || -> Vec<Tensor> {
+            graph
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let val = graph.value(v);
+                    let n: usize = val.shape.iter().product();
+                    match val.dtype {
+                        DType::U32 if plan.embedding_checks.iter().any(|c| c.0 == i) => {
+                            Tensor::U32(vec![1; n])
+                        }
+                        DType::U32 => Tensor::U32(vec![pos; n]),
+                        _ => Tensor::F32(vec![0.0; n]),
+                    }
+                })
+                .collect()
+        };
+        let mut best = f64::INFINITY;
+        for i in 0..7 {
+            self.run_prepared(graph, plan, Some(state), inputs())?;
+            if i >= 2 {
+                best = best.min(self.last_gpu_seconds() * 1e6);
+            }
+        }
+        Ok(best)
     }
 
     /// Runs `graph` using a pre-planned execution schedule.
@@ -2648,26 +2745,48 @@ impl Session {
         if let Some(st) = &mut state {
             for &(v, ref name) in &plan.state_vars {
                 let n = state_len(graph, v, need_rows)?;
+                let f16 = plan.f16_states.contains(name);
+                let eb = if f16 { 2 } else { 4 };
+                if st.metal_buffers.contains_key(name) && st.metal_f16.contains(name) != f16 {
+                    return Err(format!(
+                        "state '{name}' is stored as {} but this program needs {}",
+                        if f16 { "f32" } else { "f16" },
+                        if f16 { "f16" } else { "f32" },
+                    ));
+                }
                 let grown = st.metal_buffers.get(name).is_some_and(|(_, old)| *old < n);
                 if grown || !st.metal_buffers.contains_key(name) {
-                    let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                    let buf = new_shared_buffer(&self.rt.device, (n * eb).max(ARENA_ALIGN))?;
                     if let Some((old, old_n)) = st.metal_buffers.get(name) {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
-                                old.contents() as *const f32,
-                                buf.contents() as *mut f32,
-                                *old_n,
+                                old.contents() as *const u8,
+                                buf.contents() as *mut u8,
+                                *old_n * eb,
                             );
                         }
                     } else if let Some(Tensor::F32(cur_data)) = st.buffers.get(name) {
                         let copy_len = cur_data.len().min(n);
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                cur_data.as_ptr(),
-                                buf.contents() as *mut f32,
-                                copy_len,
-                            );
+                        if f16 {
+                            // SAFETY: the buffer holds n >= copy_len u16s.
+                            let dst = unsafe {
+                                std::slice::from_raw_parts_mut(buf.contents() as *mut u16, copy_len)
+                            };
+                            for (d, &x) in dst.iter_mut().zip(cur_data) {
+                                *d = crate::model::f32_to_f16(x.clamp(-F16_MAX, F16_MAX));
+                            }
+                        } else {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    cur_data.as_ptr(),
+                                    buf.contents() as *mut f32,
+                                    copy_len,
+                                );
+                            }
                         }
+                    }
+                    if f16 {
+                        st.metal_f16.insert(name.clone());
                     }
                     let arc_buf = Arc::new(buf);
                     st.metal_buffers.insert(name.clone(), (arc_buf.clone(), n));
@@ -2680,15 +2799,16 @@ impl Session {
             let mut sbufs = self.state_buffers.lock();
             for &(v, ref name) in &plan.state_vars {
                 let n = state_len(graph, v, need_rows)?;
+                let want = (n * if plan.f16_states.contains(name) { 2 } else { 4 }).max(ARENA_ALIGN);
                 let have = sbufs.get(name).map_or(0, |b| b.length() as usize);
-                if have < (n * 4).max(ARENA_ALIGN) {
-                    let buf = new_shared_buffer(&self.rt.device, (n * 4).max(ARENA_ALIGN))?;
+                if have < want {
+                    let buf = new_shared_buffer(&self.rt.device, want)?;
                     if let Some(old) = sbufs.get(name) {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 old.contents() as *const u8,
                                 buf.contents() as *mut u8,
-                                have.min(n * 4),
+                                have.min(want),
                             );
                         }
                     }
@@ -2988,7 +3108,7 @@ impl Session {
                     );
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
+                let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
                 enc.set_buffer(1, Some(x.0), x.1 as u64);
@@ -3006,7 +3126,7 @@ impl Session {
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), 1, 1),
-                    MTLSize::new(256, 1, 1),
+                    MTLSize::new(threads, 1, 1),
                 );
                 Ok(())
             }
@@ -3270,7 +3390,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                let (pso, rows_per_tg) = self.gemv_pipeline(format, variant, cols)?;
+                let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
                 bind(1, x);
@@ -3298,7 +3418,7 @@ impl Session {
                 }
                 enc.dispatch_thread_groups(
                     MTLSize::new((rows as u64).div_ceil(rows_per_tg), m as u64, 1),
-                    MTLSize::new(256, 1, 1),
+                    MTLSize::new(threads, 1, 1),
                 );
             }
             Step::GemvPackedPair {
@@ -3376,7 +3496,7 @@ impl Session {
                     );
                 } else {
                     for leg in legs {
-                        let (pso, rows_per_tg) =
+                        let (pso, rows_per_tg, threads) =
                             self.gemv_pipeline(format, leg.variant, cols)?;
                         enc.set_compute_pipeline_state(&pso);
                         bind(0, leg.w);
@@ -3394,7 +3514,7 @@ impl Session {
                         bind(5, leg.res.unwrap_or(leg.out));
                         enc.dispatch_thread_groups(
                             MTLSize::new((leg.rows as u64).div_ceil(rows_per_tg), m as u64, 1),
-                            MTLSize::new(256, 1, 1),
+                            MTLSize::new(threads, 1, 1),
                         );
                     }
                 }
@@ -3690,6 +3810,7 @@ impl Session {
                 soft_cap,
                 write,
                 m,
+                kv_f16,
             } => {
                 let start_pos = if let Some(p_val) = pos {
                     let (p_buf, p_off) = loc(p_val);
@@ -3704,7 +3825,7 @@ impl Session {
                 // State buffers are physically capped (4096 rows); never write or read past them.
                 if let Some(ks) = k_state {
                     let (kb, ko) = loc(ks);
-                    let rows = (kb.length() as usize - ko) / (stride * 4).max(1);
+                    let rows = (kb.length() as usize - ko) / (stride * if kv_f16 { 2 } else { 4 }).max(1);
                     if start_pos as usize + m > rows {
                         return Err(format!(
                             "KV cache holds {rows} positions on this backend; need {}",
@@ -3717,7 +3838,11 @@ impl Session {
                 if write && k_state.is_some() && v_state.is_some() && !fuse_kv_write {
                     let ks = k_state.unwrap();
                     let vs = v_state.unwrap();
-                    enc.set_compute_pipeline_state(rt.pso("kv_append_batched")?);
+                    enc.set_compute_pipeline_state(rt.pso(if kv_f16 {
+                        "kv_append_batched_f16"
+                    } else {
+                        "kv_append_batched"
+                    })?);
                     bind(0, k);
                     bind(1, v);
                     bind(2, ks);
@@ -3751,20 +3876,7 @@ impl Session {
                 let len = start_pos as usize + 1;
                 let lo = window.map_or(0, |w| len.saturating_sub(w));
                 let n_keys = len - lo;
-                let (min_keys, split_keys) = if head_dim >= 256 {
-                    (32, 16)
-                } else {
-                    (ATTN_SPLIT_MIN_KEYS, ATTN_SPLIT_KEYS)
-                };
-                let n_splits = if gqa_decode && n_keys >= min_keys {
-                    let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
-                    ATTN_TARGET_TGS
-                        .div_ceil(head_tgs)
-                        .min(n_keys / split_keys)
-                        .clamp(2, ATTN_MAX_SPLITS)
-                } else {
-                    1
-                };
+                let n_splits = attn_splits(n_keys, head_dim, kv_heads, group, gqa_decode);
                 let mut scratch_guard = self.attn_scratch.lock();
                 if n_splits > 1 {
                     let bytes = heads * n_splits * (head_dim + 2) * 4;
@@ -3775,23 +3887,52 @@ impl Session {
                         *scratch_guard = Some(new_shared_buffer(&rt.device, bytes)?);
                     }
                 }
+                // [KV dtype f32, f16][head_dim <= 32, 64, 128, 256, 512].
+                const GQA: [[&str; 5]; 2] = [
+                    [
+                        "attn_cached_gqa_split_f32_1",
+                        "attn_cached_gqa_split_f32_2",
+                        "attn_cached_gqa_split_f32_4",
+                        "attn_cached_gqa_split_f32_8",
+                        "attn_cached_gqa_split_f32_16",
+                    ],
+                    [
+                        "attn_cached_gqa_split_f16_1",
+                        "attn_cached_gqa_split_f16_2",
+                        "attn_cached_gqa_split_f16_4",
+                        "attn_cached_gqa_split_f16_8",
+                        "attn_cached_gqa_split_f16_16",
+                    ],
+                ];
+                const FLASH: [[&str; 5]; 2] = [
+                    [
+                        "flash_attn_cached_f32_1",
+                        "flash_attn_cached_f32_2",
+                        "flash_attn_cached_f32_4",
+                        "flash_attn_cached_f32_8",
+                        "flash_attn_cached_f32",
+                    ],
+                    [
+                        "flash_attn_cached_f16_1",
+                        "flash_attn_cached_f16_2",
+                        "flash_attn_cached_f16_4",
+                        "flash_attn_cached_f16_8",
+                        "flash_attn_cached_f16",
+                    ],
+                ];
+                let nj = match head_dim.div_ceil(32) {
+                    0..=1 => 0,
+                    2 => 1,
+                    3..=4 => 2,
+                    5..=8 => 3,
+                    _ => 4,
+                };
                 enc.set_compute_pipeline_state(if gqa_decode {
-                    rt.pso(match head_dim.div_ceil(32) {
-                        0..=1 => "attn_cached_gqa_split_f32_1",
-                        2 => "attn_cached_gqa_split_f32_2",
-                        3..=4 => "attn_cached_gqa_split_f32_4",
-                        5..=8 => "attn_cached_gqa_split_f32_8",
-                        _ => "attn_cached_gqa_split_f32_16",
-                    })?
+                    rt.pso(GQA[kv_f16 as usize][nj])?
+                } else if kv_f16 {
+                    rt.pso(FLASH[1][nj])?
                 } else {
-                    rt.pso(match head_dim.div_ceil(32) {
-                        0..=1 => "flash_attn_cached_f32_1",
-                        2 => "flash_attn_cached_f32_2",
-                        3..=4 => "flash_attn_cached_f32_4",
-                        5..=8 => "flash_attn_cached_f32_8",
-                        _ => "flash_attn_cached_f32",
-                    })
-                    .or_else(|_| rt.pso("attn_cached_f32"))?
+                    rt.pso(FLASH[0][nj]).or_else(|_| rt.pso("attn_cached_f32"))?
                 });
                 bind(0, q);
                 bind(1, k_buf_id);
@@ -4362,6 +4503,8 @@ pub enum Step {
         soft_cap: Option<f32>,
         write: bool,
         m: usize,
+        /// The k/v state buffers hold f16 (set by `assign_kv_dtypes`).
+        kv_f16: bool,
     },
     PagedCachedAttention {
         q: ValueId,
@@ -4465,6 +4608,67 @@ pub struct PreparedPlan {
     pub(crate) attn_pos_inputs: Vec<(usize, usize)>,
     pub(crate) state_vars: Vec<(ValueId, String)>,
     pub(crate) value_locs: Vec<PlanValueLoc>,
+    /// Names of the states stored as f16 (see [`assign_kv_dtypes`]).
+    pub f16_states: HashSet<String>,
+}
+
+/// The one f16 KV cache policy (`Session::set_kv_f16`, `GIBBS_KV_DTYPE`): decides which states are
+/// stored as f16 and flags their `CachedAttention` steps. A state qualifies when every step reading it
+/// uses it as the k or v state of a `CachedAttention` (any other reader, e.g. a plain `Attention` or
+/// `StateReorder` over the same cache, needs f32), and both states of a step agree. Returns the f16
+/// state names.
+fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
+    let name_of = |v: ValueId| match &graph.value(v).kind {
+        ValueKind::State(n) => Some(n.clone()),
+        _ => None,
+    };
+    let kv_pair = |op: &Step| match op {
+        Step::CachedAttention {
+            k_state: Some(k),
+            v_state: Some(v),
+            ..
+        } => Some((*k, *v)),
+        _ => None,
+    };
+    let (mut f16, mut other) = (HashSet::new(), HashSet::new());
+    for s in steps.iter() {
+        let pair = kv_pair(&s.op);
+        for &r in &s.reads {
+            if let Some(n) = name_of(r) {
+                if pair.is_some_and(|(k, v)| r == k || r == v) {
+                    f16.insert(n);
+                } else {
+                    other.insert(n);
+                }
+            }
+        }
+    }
+    f16.retain(|n| !other.contains(n));
+    // A step's two states share one kernel dtype: drop a state whose partner dropped out.
+    loop {
+        let before = f16.len();
+        for s in steps.iter() {
+            if let Some((k, v)) = kv_pair(&s.op) {
+                let (kn, vn) = (name_of(k).unwrap_or_default(), name_of(v).unwrap_or_default());
+                if !(f16.contains(&kn) && f16.contains(&vn)) {
+                    f16.remove(&kn);
+                    f16.remove(&vn);
+                }
+            }
+        }
+        if f16.len() == before {
+            break;
+        }
+    }
+    for s in steps.iter_mut() {
+        if let Some((k, _)) = kv_pair(&s.op) {
+            let on = name_of(k).is_some_and(|n| f16.contains(&n));
+            if let Step::CachedAttention { kv_f16, .. } = &mut s.op {
+                *kv_f16 = on;
+            }
+        }
+    }
+    f16
 }
 
 /// Element count of the physical buffer for a state value: 2-D states with more than 4096 declared rows
@@ -4753,210 +4957,86 @@ fn pair_small_hand_gemvs(
     }
 }
 
-/// Merges runs (<= 4) of adjacent steps that are independent of each other into one dispatch:
-/// RmsNorm without a residual (any rows/d/eps) and Rope with identical geometry (any head count).
-/// A step joins a run only if it reads none of the run's outputs, so order is preserved and the
-/// members could already execute in any order. Anything else is left untouched.
+/// Merges independent steps into one dispatch as [`fuse::batches`] extracts them: runs (<= 4) of
+/// RmsNorms without a residual (any rows/d/eps) or of Ropes with identical geometry (any head
+/// count), with independent GEMVs between norm members moved ahead of the run; an RmsNorm with a
+/// residual or scale chains the plain RmsNorm of its output, or the MegakernelMlp reading a one-row
+/// one absorbs it. Anything else is left untouched.
 fn batch_horizontal(
     steps: Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
-) -> Vec<Planned> {
+) -> Result<Vec<Planned>, String> {
     if !fusion_policy().allows(FusionClass::HorizontalBatch) {
-        return steps;
+        return Ok(steps);
     }
-    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
-    let joins = |run: &[Planned], next: &Planned| {
-        let same_kind = match (&run[0].op, &next.op) {
-            (
-                Step::RmsNorm {
-                    res: None,
-                    scale: None,
-                    chain: None,
-                    ..
-                },
-                Step::RmsNorm {
-                    res: None,
-                    scale: None,
-                    chain: None,
-                    rope: r_next,
-                    ..
-                },
-            ) => {
-                let r_existing = run.iter().find_map(|s| match s.op {
-                    Step::RmsNorm { rope, .. } => rope,
-                    _ => None,
-                });
-                match (r_existing, *r_next) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
+    let b = fuse::batches(&steps, aliases, *fuse::COMMUTE)?;
+    let n = steps.len();
+    let mut out: Vec<Planned> = Vec::with_capacity(n);
+    let mut steps: Vec<Option<Planned>> = steps.into_iter().map(Some).collect();
+    let mut take = |p: usize| steps[p].take().expect("each step is taken once");
+    let mut p = 0;
+    while p < n {
+        let run: Vec<Planned> = match b.runs.get(&p) {
+            Some(members) => {
+                let last = members[members.len() - 1];
+                for q in (p..=last).filter(|q| !members.contains(q)) {
+                    out.push(take(q));
                 }
+                p = last + 1;
+                members.iter().map(|&q| take(q)).collect()
             }
-            (
-                Step::Rope {
-                    pos: p0,
-                    inv_freq: f0,
-                    n_seq: s0,
-                    head_dim: h0,
-                    rotary_dim: r0,
-                    pair_stride: t0,
-                    mscale: m0,
-                    ..
-                },
-                Step::Rope {
-                    pos,
-                    inv_freq,
-                    n_seq,
-                    head_dim,
-                    rotary_dim,
-                    pair_stride,
-                    mscale,
-                    ..
-                },
-            ) => {
-                (p0, f0, s0, h0, r0, t0, m0)
-                    == (
-                        pos,
-                        inv_freq,
-                        n_seq,
-                        head_dim,
-                        rotary_dim,
-                        pair_stride,
-                        mscale,
-                    )
-            }
-            _ => false,
-        };
-        same_kind
-            && next.extra_outs.is_empty()
-            && !next
-                .reads
-                .iter()
-                .any(|&r| run.iter().any(|s| root(s.out) == root(r)))
-    };
-    let mut out: Vec<Planned> = Vec::with_capacity(steps.len());
-    let mut it: std::collections::VecDeque<Planned> = steps.into();
-    while let Some(first) = it.pop_front() {
-        let mut run = vec![first];
-        while run.len() < 4 {
-            if it.front().is_some_and(|n| joins(&run, n)) {
-                run.push(it.pop_front().expect("checked"));
-            } else if it.len() >= 2
-                && matches!(
-                    run[0].op,
-                    Step::RmsNorm {
-                        res: None,
-                        scale: None,
-                        chain: None,
-                        ..
-                    }
-                )
-                && matches!(it[0].op, Step::GemvPacked { .. })
-                && it[0].extra_outs.is_empty()
-                && !it[0]
-                    .reads
-                    .iter()
-                    .any(|&r| run.iter().any(|s| root(s.out) == root(r)))
-                && joins(&run, &it[1])
-            {
-                // Commute an independent GemvPacked before the pending RmsNorm run so sibling norms batch.
-                out.push(it.pop_front().expect("gemv"));
-                run.push(it.pop_front().expect("norm"));
-            } else {
-                break;
-            }
-        }
-        if run.len() == 1 {
-            let mut first = run.pop().expect("len == 1");
-            if let Step::RmsNorm {
-                res,
-                scale,
-                ref mut chain,
-                rope: None,
-                rows,
-                d,
-                ..
-            } = first.op
-            {
-                if (res.is_some() || scale.is_some()) && chain.is_none() {
-                    let can_chain = it.front().is_some_and(|next| {
-                        next.extra_outs.is_empty()
-                            && matches!(
-                                next.op,
-                                Step::RmsNorm {
-                                    x: x2,
-                                    res: None,
-                                    scale: None,
-                                    chain: None,
-                                    rope: None,
-                                    rows: r2,
-                                    d: d2,
-                                    ..
-                                } if r2 == rows && d2 == d && root(x2) == root(first.out)
-                            )
-                    });
-                    if can_chain {
-                        let next = it.pop_front().expect("peeked");
-                        if let Step::RmsNorm {
+            None => {
+                let mut first = take(p);
+                p += 1;
+                if b.chain.contains(&(p - 1)) {
+                    let next = take(p);
+                    p += 1;
+                    if let (
+                        Step::RmsNorm { ref mut chain, .. },
+                        Step::RmsNorm {
                             g: g2, eps: eps2, ..
-                        } = next.op
-                        {
-                            *chain = Some((g2, next.out, eps2));
-                            first.extra_outs.push(next.out);
-                            if !first.reads.contains(&g2) {
-                                first.reads.push(g2);
-                            }
-                            first.name = format!("{}+{}", first.name, next.name);
+                        },
+                    ) = (&mut first.op, &next.op)
+                    {
+                        *chain = Some((*g2, next.out, *eps2));
+                        first.extra_outs.push(next.out);
+                        if !first.reads.contains(g2) {
+                            first.reads.push(*g2);
                         }
+                        first.name = format!("{}+{}", first.name, next.name);
                     }
-                }
-            }
-            if let Step::RmsNorm {
-                x: x0,
-                g: g0,
-                res: res0,
-                scale: scale0,
-                chain: None,
-                rope: None,
-                rows: 1,
-                d: d0,
-                eps: eps0,
-            } = first.op
-            {
-                if (res0.is_some() || scale0.is_some()) && first.extra_outs.is_empty() {
-                    let can_absorb = !aliases.contains_key(&first.out)
-                        && it.front().is_some_and(|next| {
-                            matches!(
-                                next.op,
-                                Step::MegakernelMlp {
-                                    x: x_mlp,
-                                    pre_res: None,
-                                    hidden,
-                                    ..
-                                } if hidden == d0 && x_mlp == first.out
-                            )
-                        });
-                    if can_absorb {
-                        let mut mlp = it.pop_front().expect("peeked");
-                        if let Step::MegakernelMlp {
+                } else if b.absorb.contains(&(p - 1)) {
+                    let mut mlp = take(p);
+                    p += 1;
+                    if let (
+                        &Step::RmsNorm {
+                            x,
+                            g,
+                            res,
+                            scale,
+                            eps,
+                            ..
+                        },
+                        Step::MegakernelMlp {
                             ref mut pre_res, ..
-                        } = mlp.op
-                        {
-                            *pre_res = Some((x0, g0, res0, scale0, eps0));
-                        }
-                        mlp.extra_outs.push(first.out);
-                        for &r in &first.reads {
-                            if !mlp.reads.contains(&r) {
-                                mlp.reads.push(r);
-                            }
-                        }
-                        mlp.name = format!("{}+{}", first.name, mlp.name);
-                        first = mlp;
+                        },
+                    ) = (&first.op, &mut mlp.op)
+                    {
+                        *pre_res = Some((x, g, res, scale, eps));
                     }
+                    mlp.extra_outs.push(first.out);
+                    for &r in &first.reads {
+                        if !mlp.reads.contains(&r) {
+                            mlp.reads.push(r);
+                        }
+                    }
+                    mlp.name = format!("{}+{}", first.name, mlp.name);
+                    first = mlp;
                 }
+                out.push(first);
+                continue;
             }
-            out.push(first);
-            continue;
-        }
+        };
         let name = run
             .iter()
             .map(|s| s.name.as_str())
@@ -5034,127 +5114,85 @@ fn batch_horizontal(
             reads,
         });
     }
-    out
+    Ok(out)
 }
 
-/// Lowers nodes to dispatches, validating ops and shapes. A Linear whose output has exactly one
-/// reader, not a graph output, absorbs that reader when it is an exact GELU or an Add whose other
-/// operand already exists (a residual).
-fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>), String> {
-    let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();
-    for (i, n) in g.nodes.iter().enumerate() {
-        for &v in &n.inputs {
-            readers.entry(v).or_default().push(i);
-        }
-    }
-    let exists_before = |v: ValueId, i: usize| match &g.value(v).kind {
-        ValueKind::Input | ValueKind::Weight | ValueKind::State(_) => true,
-        ValueKind::Node(n) => (n.0 as usize) < i,
+/// The packed format a Linear over the `[n, k]` weight `w` runs in; `None`: the f32 kernels.
+fn linear_format(g: &Graph, w: ValueId) -> Option<WeightFormat> {
+    let &[n, k] = &g.value(w).shape[..] else {
+        return None;
     };
+    let format = match g.value(w).dtype {
+        DType::Quant(QuantFormat::GGUF_Q8_0) => WeightFormat::Q8_0,
+        DType::Quant(QuantFormat::GGUF_Q4_0) => WeightFormat::Q4_0,
+        DType::Quant(QuantFormat::GGUF_IQ4_XS) => WeightFormat::IQ4_XS,
+        DType::Quant(QuantFormat::GGUF_IQ2_M) | DType::Quant(QuantFormat::GGUF_IQ2_S) => {
+            WeightFormat::IQ2_M
+        }
+        DType::Quant(QuantFormat::GGUF_Q4_K_M) => WeightFormat::Q4_K,
+        DType::Quant(QuantFormat::GGUF_Q2_K) => WeightFormat::Q2_K,
+        DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
+        DType::Quant(QuantFormat::NVFP4_E2M1) | DType::Quant(QuantFormat::NVFP4) => {
+            WeightFormat::NvFp4
+        }
+        DType::Quant(QuantFormat::WeightlessJesseLUT) => WeightFormat::JesseLUT,
+        DType::Quant(f) if crate::graph::codec::codec(f).is_some() => WeightFormat::Gen(f),
+        DType::BF16 => WeightFormat::BF16,
+        DType::F16 => WeightFormat::F16,
+        _ => return None,
+    };
+    let fits = match format {
+        WeightFormat::Gen(f) => {
+            k % crate::graph::codec::codec(f).expect("checked").block_elems as usize == 0
+        }
+        WeightFormat::Q4_0 | WeightFormat::Q8_0 => k % 32 == 0,
+        WeightFormat::IQ4_XS
+        | WeightFormat::IQ2_M
+        | WeightFormat::Q4_K
+        | WeightFormat::Q2_K
+        | WeightFormat::IQ3_S => k % 256 == 0,
+        WeightFormat::NvFp4 => k % 16 == 0 && n != 0,
+        _ => true,
+    };
+    fits.then_some(format)
+}
+
+/// The [`NormRope`] of the RoPE node `r` (inputs `x, pos, inv_freq`) over `n_seq` positions.
+fn norm_rope(r: &crate::graph::Node, n_seq: usize) -> NormRope {
+    let Op::Rope {
+        rotary_dim,
+        variant,
+        mscale,
+        ..
+    } = &r.op
+    else {
+        unreachable!("planner rules fuse Rope nodes only")
+    };
+    NormRope {
+        pos: r.inputs[1],
+        inv_freq: r.inputs[2],
+        n_seq,
+        rotary_dim: *rotary_dim,
+        pair_stride: if matches!(variant, crate::graph::RopeVariant::Interleaved) {
+            2
+        } else {
+            1
+        },
+        mscale: *mscale,
+    }
+}
+
+/// Lowers nodes to dispatches, validating ops and shapes. The fusions [`fuse::decide`] extracts
+/// (GEMV epilogues, RmsNorm residual/scale/RoPE, attention q/k RoPE) lower inside the absorbing
+/// node's step; absorbed nodes emit nothing.
+fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>), String> {
+    let decided = fuse::decide(g)?;
     let mut fused = vec![false; g.nodes.len()];
+    for j in decided.absorbed() {
+        fused[j] = true;
+    }
     let mut steps = Vec::new();
     let mut aliases: HashMap<ValueId, (ValueId, usize)> = HashMap::new();
-    let mut attn_ropes: HashMap<usize, (ValueId, ValueId, NormRope)> = HashMap::new();
-    if fusion_policy().allows(FusionClass::ReduceInput) {
-        let is_rmsnorm = |v: ValueId| {
-            matches!(
-                g.value(v).kind,
-                ValueKind::Node(n) if matches!(g.nodes[n.0 as usize].op, Op::RmsNorm { .. })
-            )
-        };
-        for (ai, node) in g.nodes.iter().enumerate() {
-            let Op::CachedAttention {
-                heads,
-                kv_heads,
-                head_dim,
-                v_head_dim,
-                write: true,
-                ..
-            } = &node.op
-            else {
-                continue;
-            };
-            if node.inputs.len() != 6 || *head_dim != *v_head_dim || *head_dim > ATTN_MAX_HEAD_DIM {
-                continue;
-            }
-            let (q_out, k_out, pos) = (node.inputs[0], node.inputs[1], node.inputs[5]);
-            if g.outputs.contains(&q_out)
-                || g.outputs.contains(&k_out)
-                || readers.get(&q_out).map(Vec::as_slice) != Some(&[ai])
-                || readers.get(&k_out).map(Vec::as_slice) != Some(&[ai])
-            {
-                continue;
-            }
-            let (ValueKind::Node(q_nid), ValueKind::Node(k_nid)) =
-                (&g.value(q_out).kind, &g.value(k_out).kind)
-            else {
-                continue;
-            };
-            let (qi, ki) = (q_nid.0 as usize, k_nid.0 as usize);
-            if qi == ki || qi >= ai || ki >= ai {
-                continue;
-            }
-            let (qn, kn) = (&g.nodes[qi], &g.nodes[ki]);
-            if qn.op != kn.op || qn.inputs.len() < 3 || kn.inputs.len() < 3 {
-                continue;
-            }
-            let Op::Rope {
-                head_dim: rhd,
-                rotary_dim,
-                variant,
-                mscale,
-            } = &qn.op
-            else {
-                continue;
-            };
-            if *rhd != *head_dim
-                || *rotary_dim == 0
-                || *rotary_dim > *rhd
-                || *rotary_dim % 2 != 0
-                || matches!(variant, crate::graph::RopeVariant::MRope { .. })
-            {
-                continue;
-            }
-            let (q_raw, k_raw, inv_freq) = (qn.inputs[0], kn.inputs[0], qn.inputs[2]);
-            if qn.inputs[1] != pos
-                || kn.inputs[1] != pos
-                || kn.inputs[2] != inv_freq
-                || is_rmsnorm(q_raw)
-                || is_rmsnorm(k_raw)
-                || !exists_before(q_raw, ai)
-                || !exists_before(k_raw, ai)
-                || !exists_before(inv_freq, ai)
-                || numel(g, q_raw).ok() != Some(*heads * *head_dim)
-                || numel(g, k_raw).ok() != Some(*kv_heads * *head_dim)
-                || numel(g, pos).ok() != Some(1)
-                || numel(g, inv_freq).map_or(true, |l| l < *rotary_dim / 2)
-            {
-                continue;
-            }
-            let pair_stride = match variant {
-                crate::graph::RopeVariant::Interleaved => 2,
-                crate::graph::RopeVariant::HalfSplit => 1,
-                crate::graph::RopeVariant::MRope { .. } => unreachable!(),
-            };
-            fused[qi] = true;
-            fused[ki] = true;
-            attn_ropes.insert(
-                ai,
-                (
-                    q_raw,
-                    k_raw,
-                    NormRope {
-                        pos,
-                        inv_freq,
-                        n_seq: 1,
-                        rotary_dim: *rotary_dim,
-                        pair_stride,
-                        mscale: *mscale,
-                    },
-                ),
-            );
-        }
-    }
     for (i, node) in g.nodes.iter().enumerate() {
         if fused[i] {
             continue;
@@ -5226,112 +5264,11 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     }
                 }
                 let m = xl / k;
-                let mut format = match g.value(w).dtype {
-                    DType::Quant(QuantFormat::GGUF_Q8_0) => Some(WeightFormat::Q8_0),
-                    DType::Quant(QuantFormat::GGUF_Q4_0) => Some(WeightFormat::Q4_0),
-                    DType::Quant(QuantFormat::GGUF_IQ4_XS) => Some(WeightFormat::IQ4_XS),
-                    DType::Quant(QuantFormat::GGUF_IQ2_M)
-                    | DType::Quant(QuantFormat::GGUF_IQ2_S) => Some(WeightFormat::IQ2_M),
-                    DType::Quant(QuantFormat::GGUF_Q4_K_M) => Some(WeightFormat::Q4_K),
-                    DType::Quant(QuantFormat::GGUF_Q2_K) => Some(WeightFormat::Q2_K),
-                    DType::Quant(QuantFormat::GGUF_IQ3_S) => Some(WeightFormat::IQ3_S),
-                    DType::Quant(QuantFormat::NVFP4_E2M1) | DType::Quant(QuantFormat::NVFP4) => {
-                        Some(WeightFormat::NvFp4)
-                    }
-                    DType::Quant(QuantFormat::WeightlessJesseLUT) => Some(WeightFormat::JesseLUT),
-                    DType::Quant(f) if crate::graph::codec::codec(f).is_some() => {
-                        Some(WeightFormat::Gen(f))
-                    }
-                    DType::BF16 => Some(WeightFormat::BF16),
-                    DType::F16 => Some(WeightFormat::F16),
-                    _ => None,
-                };
-                if let Some(WeightFormat::Gen(f)) = format {
-                    let c = crate::graph::codec::codec(f).expect("checked");
-                    if k % c.block_elems as usize != 0 {
-                        format = None;
-                    }
-                }
-                if (format == Some(WeightFormat::Q4_0) || format == Some(WeightFormat::Q8_0))
-                    && k % 32 != 0
-                {
-                    format = None;
-                }
-                if (format == Some(WeightFormat::IQ4_XS)
-                    || format == Some(WeightFormat::IQ2_M)
-                    || format == Some(WeightFormat::Q4_K)
-                    || format == Some(WeightFormat::Q2_K)
-                    || format == Some(WeightFormat::IQ3_S))
-                    && k % 256 != 0
-                {
-                    format = None;
-                }
-                if format == Some(WeightFormat::NvFp4) && (k % 16 != 0 || n == 0) {
-                    format = None;
-                }
+                let format = linear_format(g, w);
                 let (mut epi, mut res) = (Epi::None, None);
-                if format != Some(WeightFormat::JesseLUT)
-                    && fusion_policy().allows(FusionClass::DotEpilogue)
-                {
-                    if let Some([j]) = readers.get(&out).map(Vec::as_slice) {
-                        let c = &g.nodes[*j];
-                        if !g.outputs.contains(&out) {
-                            // The batched GEMM kernels (m >= 16) only carry Gelu/Residual epilogues.
-                            let packed_epi = format.is_some()
-                                && !(m >= 16 && format.is_some_and(WeightFormat::batched_gemm));
-                            match c.op {
-                                Op::Gelu { tanh: false } => epi = Epi::Gelu,
-                                Op::Silu if packed_epi => epi = Epi::Silu,
-                                Op::SwiGlu if packed_epi && c.inputs.len() == 2 => {
-                                    if c.inputs[0] == out {
-                                        let up = c.inputs[1];
-                                        if up != out && exists_before(up, i) && n_of(up)? == m * n {
-                                            (epi, res) = (Epi::SwiGlu, Some(up));
-                                        }
-                                    } else if c.inputs[1] == out {
-                                        let gate = c.inputs[0];
-                                        if gate != out
-                                            && exists_before(gate, i)
-                                            && n_of(gate)? == m * n
-                                        {
-                                            (epi, res) = (Epi::UpSwiGlu, Some(gate));
-                                        }
-                                    }
-                                }
-                                Op::GeGlu if packed_epi && c.inputs.len() == 2 => {
-                                    if c.inputs[0] == out {
-                                        let up = c.inputs[1];
-                                        if up != out && exists_before(up, i) && n_of(up)? == m * n {
-                                            (epi, res) = (Epi::GeGlu, Some(up));
-                                        }
-                                    } else if c.inputs[1] == out {
-                                        let gate = c.inputs[0];
-                                        if gate != out
-                                            && exists_before(gate, i)
-                                            && n_of(gate)? == m * n
-                                        {
-                                            (epi, res) = (Epi::UpGeGlu, Some(gate));
-                                        }
-                                    }
-                                }
-                                Op::Add if c.inputs.len() == 2 => {
-                                    let r = if c.inputs[0] == out {
-                                        c.inputs[1]
-                                    } else {
-                                        c.inputs[0]
-                                    };
-                                    if r != out && exists_before(r, i) && n_of(r)? == m * n {
-                                        (epi, res) = (Epi::Residual, Some(r));
-                                    }
-                                }
-                                _ => {}
-                            }
-                            if epi != Epi::None {
-                                fused[*j] = true;
-                                out = c.outputs[0];
-                            }
-                        }
-                    }
+                if let Some(&(j, e, side)) = decided.epi.get(&i) {
+                    (epi, res) = (e, side);
+                    out = g.nodes[j].outputs[0];
                 }
                 if let Some(fmt) = format {
                     if m >= 16 && fmt.batched_gemm() {
@@ -5432,105 +5369,25 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 if d == 0 || xl % d != 0 {
                     return Err(format!("node '{name}': RmsNorm shapes mismatch"));
                 }
-                // `norm(x) + r` with a single reader: one dispatch (`rmsnorm_residual_f32`).
-                let mut res = None;
-                if let Some([j]) = readers
-                    .get(&out)
-                    .map(Vec::as_slice)
-                    .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
-                {
-                    let c = &g.nodes[*j];
-                    if c.op == Op::Add && c.inputs.len() == 2 && !g.outputs.contains(&out) {
-                        let r = if c.inputs[0] == out {
-                            c.inputs[1]
-                        } else {
-                            c.inputs[0]
-                        };
-                        if r != out && exists_before(r, i) && n_of(r)? == xl {
-                            res = Some(r);
-                            fused[*j] = true;
-                            out = c.outputs[0];
-                        }
+                // Absorbed `+ r` (`rmsnorm_residual_f32`), then `* s` (scalar output scale), or a
+                // RoPE over the same head_dim (per-head norm + rotary embedding).
+                let fz = decided.norm.get(&i).copied().unwrap_or_default();
+                let mut absorb = |j: usize| out = g.nodes[j].outputs[0];
+                let res = fz.res.map(|(j, r)| {
+                    absorb(j);
+                    r
+                });
+                let scale = fz.scale.map(|(k, s)| {
+                    absorb(k);
+                    s
+                });
+                let rope = match fz.rope {
+                    Some(j) => {
+                        absorb(j);
+                        Some(norm_rope(&g.nodes[j], n_of(g.nodes[j].inputs[1])?))
                     }
-                }
-                // `(norm(x) [+ r]) * s` with a single reader and scalar `s` (`numel == 1`): fused output scale.
-                let mut scale = None;
-                if let Some([k]) = readers
-                    .get(&out)
-                    .map(Vec::as_slice)
-                    .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
-                {
-                    let c = &g.nodes[*k];
-                    if c.op == Op::Mul && c.inputs.len() == 2 && !g.outputs.contains(&out) {
-                        let s = if c.inputs[0] == out {
-                            c.inputs[1]
-                        } else {
-                            c.inputs[0]
-                        };
-                        if s != out
-                            && exists_before(s, i)
-                            && n_of(s)? == 1
-                            && g.value(s).dtype == DType::F32
-                        {
-                            scale = Some(s);
-                            fused[*k] = true;
-                            out = c.outputs[0];
-                        }
-                    }
-                }
-                // `norm(x)` (no residual/scale) whose only reader is a 1-D Rope over the same head_dim:
-                // fused per-head norm + rotary embedding.
-                let mut rope = None;
-                if res.is_none() && scale.is_none() {
-                    if let Some([j]) = readers
-                        .get(&out)
-                        .map(Vec::as_slice)
-                        .filter(|_| fusion_policy().allows(FusionClass::ReduceInput))
-                    {
-                        let c = &g.nodes[*j];
-                        if let Op::Rope {
-                            head_dim,
-                            rotary_dim,
-                            variant:
-                                variant @ (crate::graph::RopeVariant::Interleaved
-                                | crate::graph::RopeVariant::HalfSplit),
-                            mscale,
-                        } = &c.op
-                        {
-                            let rows = xl / d;
-                            if c.inputs.len() >= 3
-                                && c.inputs[0] == out
-                                && *head_dim == d
-                                && *rotary_dim <= d
-                                && *rotary_dim % 2 == 0
-                                && !g.outputs.contains(&out)
-                            {
-                                let (pos, inv_freq) = (c.inputs[1], c.inputs[2]);
-                                let n_seq = n_of(pos)?;
-                                if exists_before(pos, i)
-                                    && exists_before(inv_freq, i)
-                                    && n_seq > 0
-                                    && rows % n_seq == 0
-                                {
-                                    let pair_stride = match variant {
-                                        crate::graph::RopeVariant::Interleaved => 2,
-                                        _ => 1,
-                                    };
-                                    rope = Some(NormRope {
-                                        pos,
-                                        inv_freq,
-                                        n_seq,
-                                        rotary_dim: *rotary_dim,
-                                        pair_stride,
-                                        mscale: *mscale,
-                                    });
-                                    fused[*j] = true;
-                                    out = c.outputs[0];
-                                }
-                            }
-                        }
-                    }
-                }
+                    None => None,
+                };
                 (
                     Step::RmsNorm {
                         x,
@@ -5608,8 +5465,12 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 soft_cap,
                 write,
             } => {
-                let (q, k, rope) = match attn_ropes.remove(&i) {
-                    Some((qr, kr, r)) => (qr, kr, Some(r)),
+                let (q, k, rope) = match decided.attn_rope.get(&i) {
+                    Some(&(qi, ki)) => (
+                        g.nodes[qi].inputs[0],
+                        g.nodes[ki].inputs[0],
+                        Some(norm_rope(&g.nodes[qi], 1)),
+                    ),
                     None => (arg(0)?, arg(1)?, None),
                 };
                 let v = arg(2)?;
@@ -5660,6 +5521,7 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         soft_cap: *soft_cap,
                         write: *write,
                         m,
+                        kv_f16: false,
                     },
                     m * *heads * *v_head_dim,
                 )
@@ -6002,352 +5864,104 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             reads,
         });
     }
-    fuse_moe_subgraphs(g, &mut steps, &aliases);
+    fuse_moe_subgraphs(g, &mut steps, &aliases)?;
+    if ext::ple::enabled() {
+        ext::ple::fuse(g, &mut steps, &aliases)?;
+    }
+    ext::deltanet::fuse(g, &mut steps)?;
     Ok((steps, aliases))
 }
 
-/// Fuses MoE router TopK+GatherCols+Softmax(+GatherCols+Mul), fused gate/up Slice+Slice+GeGlu/SwiGlu,
-/// and expert down Mul+Reshape+Reduce(Sum) subgraphs when intermediate values have a single reader.
+/// Applies the MoE subgraph fusions [`fuse::moe`] extracts: router TopK+GatherCols+Softmax
+/// (+GatherCols+Mul), fused gate/up Slice+Slice+GeGlu/SwiGlu, and expert down Mul+Reduce(Sum).
 fn fuse_moe_subgraphs(
     g: &Graph,
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
-) {
+) -> Result<(), String> {
     if !fusion_policy().allows(FusionClass::ReduceInput) {
-        return;
+        return Ok(());
     }
-    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
-    let mut use_count: HashMap<ValueId, usize> = HashMap::new();
-    for st in steps.iter() {
-        for &r in &st.reads {
-            *use_count.entry(root(r)).or_insert(0) += 1;
-        }
-    }
-    for &o in &g.outputs {
-        *use_count.entry(root(o)).or_insert(0) += 1;
-    }
-    let single_use = |v: ValueId| use_count.get(&v).copied() == Some(1);
-
-    let slice_half = |v: ValueId| -> Option<(ValueId, usize, usize, bool)> {
-        let ValueKind::Node(nid) = g.value(v).kind else {
-            return None;
+    let decided = fuse::moe(g, steps, aliases)?;
+    let mut old = std::mem::take(steps).into_iter().enumerate();
+    while let Some((p, mut st)) = old.next() {
+        let Some(&f) = decided.get(&p) else {
+            steps.push(st);
+            continue;
         };
-        let node = &g.nodes[nid.0 as usize];
-        let Op::Slice { axis, start, end } = node.op else {
-            return None;
-        };
-        let src = *node.inputs.first()?;
-        let sh = &g.value(src).shape;
-        if sh.len() < 2 {
-            return None;
-        }
-        let rank = sh.len();
-        let ax = if axis < 0 { axis + rank as isize } else { axis };
-        if ax != rank as isize - 1 {
-            return None;
-        }
-        let cols = sh[rank - 1];
-        if cols == 0 || cols % 2 != 0 {
-            return None;
-        }
-        let half = cols / 2;
-        let rows: usize = sh[..rank - 1].iter().product();
-        let dim = cols as i64;
-        let clampi = |x: i64| {
-            if x < 0 {
-                (dim + x).max(0) as usize
-            } else {
-                x.min(dim) as usize
-            }
-        };
-        let (s, e) = (clampi(start), clampi(end));
-        if s == 0 && e == half {
-            Some((src, rows, half, false))
-        } else if s == half && e == cols {
-            Some((src, rows, half, true))
-        } else {
-            None
-        }
-    };
-
-    let mut i = 0;
-    while i < steps.len() {
-        // 1. Fused TopK + GatherCols + Softmax (+ optional GatherCols(scale) + Mul).
-        let topk_match = match steps[i].op {
-            Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
-                x: logits,
-                rows,
-                cols,
-                k,
-                weights_out: None,
-                scale: None,
-            })) if k <= 32 => Some((logits, rows, cols, k, steps[i].out)),
-            _ => None,
-        };
-        if let Some((logits, rows, cols, k, ids)) = topk_match {
-            let base_ok = if i + 2 < steps.len() {
-                let s1_ok = match steps[i + 1].op {
-                    Step::Ext(ext::ExtStep::Experts(ext::moe::Step::GatherCols {
-                        x: g_x,
-                        idx: g_idx,
-                        total,
-                        cols: g_cols,
-                        k: g_k,
-                        shared,
-                    })) => {
-                        (!shared || rows == 1)
-                            && g_x == logits
-                            && g_idx == ids
-                            && g_cols == cols
-                            && g_k == k
-                            && total == rows * k
-                            && single_use(steps[i + 1].out)
-                    }
-                    _ => false,
-                };
-                let s2_ok = match steps[i + 2].op {
-                    Step::Ext(ext::ExtStep::Norm(ext::norm::Step::Softmax {
-                        x: sm_x,
-                        outer: sm_outer,
-                        n: sm_inner,
-                        inner: 1,
-                    })) => sm_x == steps[i + 1].out && sm_outer == rows && sm_inner == k,
-                    _ => false,
-                };
-                s1_ok && s2_ok
-            } else {
-                false
-            };
-            if base_ok {
-                let sm_out = steps[i + 2].out;
-                let scaled = if i + 4 < steps.len() && single_use(sm_out) {
-                    let sc_table_opt = match steps[i + 3].op {
-                        Step::Ext(ext::ExtStep::Experts(ext::moe::Step::GatherCols {
-                            x: sc_table,
-                            idx: sc_idx,
-                            total: sc_tot,
-                            cols: sc_cols,
-                            k: sc_k,
-                            shared: true,
-                        })) if sc_idx == ids
-                            && sc_cols == cols
-                            && sc_k == k
-                            && sc_tot == rows * k
-                            && single_use(steps[i + 3].out) =>
-                        {
-                            Some((sc_table, steps[i + 3].out))
-                        }
-                        _ => None,
-                    };
-                    if let Some((sc_table, sc_out)) = sc_table_opt {
-                        match steps[i + 4].op {
-                            Step::Ext(ext::ExtStep::Elementwise(
-                                ext::elementwise::Step::Binary {
-                                    a,
-                                    b,
-                                    n,
-                                    kind: 2,
-                                    rank: 1,
-                                    ..
-                                },
-                            )) if ((a == sm_out && b == sc_out)
-                                || (b == sm_out && a == sc_out))
-                                && n == rows * k =>
-                            {
-                                Some((sc_table, steps[i + 4].out))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some((sc_table, w_out)) = scaled {
-                    if let Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
-                        ref mut weights_out,
-                        ref mut scale,
-                        ..
-                    })) = steps[i].op
-                    {
-                        *weights_out = Some(w_out);
-                        *scale = Some(sc_table);
-                    }
-                    steps[i].extra_outs.push(w_out);
-                    if !steps[i].reads.contains(&sc_table) {
-                        steps[i].reads.push(sc_table);
-                    }
-                    steps.drain(i + 1..=i + 4);
-                    i += 1;
-                    continue;
-                } else {
-                    if let Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
-                        ref mut weights_out,
-                        ..
-                    })) = steps[i].op
-                    {
-                        *weights_out = Some(sm_out);
-                    }
-                    steps[i].extra_outs.push(sm_out);
-                    steps.drain(i + 1..=i + 2);
-                    i += 1;
-                    continue;
-                }
-            }
-        }
-
-        // 2. Fused SplitGlu: two single-reader 2D column slices (0..half, half..2*half) + GeGlu/SwiGlu.
-        if i + 2 < steps.len() {
-            let glu = match steps[i + 2].op {
-                Step::GeGlu { gate, up, n } => Some((gate, up, n, 1u32)),
-                Step::SwiGlu { gate, up, n } => Some((gate, up, n, 2u32)),
-                _ => None,
-            };
-            if let Some((gate_v, up_v, n, kind)) = glu {
-                let copies_ok = matches!(
-                    (&steps[i].op, &steps[i + 1].op),
-                    (
-                        Step::Ext(ext::ExtStep::Movement(ext::movement::Step::Copy {
-                            fill: None,
-                            parts: p0,
-                        })),
-                        Step::Ext(ext::ExtStep::Movement(ext::movement::Step::Copy {
-                            fill: None,
-                            parts: p1,
-                        })),
-                    ) if p0.len() == 1 && p1.len() == 1
-                );
-                let pair_ok = (steps[i].out == gate_v && steps[i + 1].out == up_v)
-                    || (steps[i].out == up_v && steps[i + 1].out == gate_v);
-                if copies_ok
-                    && pair_ok
-                    && steps[i].extra_outs.is_empty()
-                    && steps[i + 1].extra_outs.is_empty()
-                    && single_use(gate_v)
-                    && single_use(up_v)
-                {
-                    if let (Some((gu0, r0, hc0, false)), Some((gu1, r1, hc1, true))) =
-                        (slice_half(gate_v), slice_half(up_v))
-                    {
-                        if gu0 == gu1 && r0 == r1 && hc0 == hc1 && n == r0 * hc0 {
-                            let glu_step = steps.remove(i + 2);
-                            steps.remove(i + 1);
-                            steps[i] = Planned {
-                                name: glu_step.name,
-                                op: Step::SplitGlu {
-                                    x: gu0,
-                                    rows: r0,
-                                    half_cols: hc0,
-                                    kind,
-                                },
-                                out: glu_step.out,
-                                extra_outs: glu_step.extra_outs,
-                                reads: vec![gu0],
-                            };
-                            i += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Fused MoeWeightedSum: single-reader BroadcastBinary(Mul, [slots, h], [slots, 1]) + Reduce(Sum).
-        if i + 1 < steps.len() {
-            let mul_match = match steps[i].op {
-                Step::Ext(ext::ExtStep::Elementwise(ext::elementwise::Step::Binary {
-                    a,
-                    b,
-                    n: mul_n,
-                    kind: 2,
+        let mut rest: Vec<Planned> = old.by_ref().take(f.len() - 1).map(|(_, s)| s).collect();
+        match f {
+            fuse::MoeFusion::TopKSoftmax { weights } => {
+                if let Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
+                    ref mut weights_out,
                     ..
-                })) if steps[i].extra_outs.is_empty() && single_use(steps[i].out) => {
-                    Some((a, b, mul_n, steps[i].out))
+                })) = st.op
+                {
+                    *weights_out = Some(weights);
                 }
-                _ => None,
-            };
-            let red_match = match steps[i + 1].op {
-                Step::Ext(ext::ExtStep::Norm(ext::norm::Step::Reduce {
-                    x: red_x, n_out, ..
-                })) if steps[i + 1].extra_outs.is_empty() => Some((red_x, n_out, steps[i + 1].out)),
-                _ => None,
-            };
-            if let (Some((a, b, mul_n, mul_out)), Some((red_x, n_out, red_out))) =
-                (mul_match, red_match)
-            {
-                let (rx_root, rx_off) = aliases.get(&red_x).copied().unwrap_or((red_x, 0));
-                if rx_root == mul_out && rx_off == 0 {
-                    let red_dims = match g.value(red_out).kind {
-                        ValueKind::Node(nid) => match &g.nodes[nid.0 as usize].op {
-                            Op::Reduce {
-                                kind: crate::graph::ReduceKind::Sum,
-                                axes,
-                                ..
-                            } if axes.len() == 1 => {
-                                let rsh = &g.value(red_x).shape;
-                                let ax = if axes[0] < 0 {
-                                    axes[0] + rsh.len() as isize
-                                } else {
-                                    axes[0]
-                                };
-                                if ax >= 0 && (ax as usize) < rsh.len() {
-                                    let ax = ax as usize;
-                                    let n: usize = rsh[..ax].iter().product();
-                                    let k = rsh[ax];
-                                    let h: usize = rsh[ax + 1..].iter().product();
-                                    Some((n, k, h))
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some((n, k, h)) = red_dims {
-                        let slots = n * k;
-                        let a_sh = g.value(a).shape.as_slice();
-                        let b_sh = g.value(b).shape.as_slice();
-                        let out_sh = g.value(mul_out).shape.as_slice();
-                        let operands = if out_sh == [slots, h] {
-                            if a_sh == [slots, h] && b_sh == [slots, 1] {
-                                Some((a, b))
-                            } else if b_sh == [slots, h] && a_sh == [slots, 1] {
-                                Some((b, a))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some((down, w_col)) = operands {
-                            if mul_n == slots * h && n_out == n * h {
-                                let red_step = steps.remove(i + 1);
-                                steps[i] = Planned {
-                                    name: red_step.name,
-                                    op: Step::MoeWeightedSum {
-                                        down,
-                                        weights: w_col,
-                                        n,
-                                        k,
-                                        h,
-                                    },
-                                    out: red_out,
-                                    extra_outs: Vec::new(),
-                                    reads: vec![down, w_col],
-                                };
-                                i += 1;
-                                continue;
-                            }
-                        }
-                    }
+                st.extra_outs.push(weights);
+            }
+            fuse::MoeFusion::TopKSoftmaxScaled { scale: sc, weights } => {
+                if let Step::Ext(ext::ExtStep::Experts(ext::moe::Step::TopK {
+                    ref mut weights_out,
+                    ref mut scale,
+                    ..
+                })) = st.op
+                {
+                    *weights_out = Some(weights);
+                    *scale = Some(sc);
+                }
+                st.extra_outs.push(weights);
+                if !st.reads.contains(&sc) {
+                    st.reads.push(sc);
                 }
             }
+            fuse::MoeFusion::SplitGlu {
+                x,
+                rows,
+                half_cols,
+                kind,
+            } => {
+                let glu = rest.pop().expect("SplitGlu spans 3 steps");
+                st = Planned {
+                    name: glu.name,
+                    op: Step::SplitGlu {
+                        x,
+                        rows,
+                        half_cols,
+                        kind,
+                    },
+                    out: glu.out,
+                    extra_outs: glu.extra_outs,
+                    reads: vec![x],
+                };
+            }
+            fuse::MoeFusion::WeightedSum {
+                down,
+                weights,
+                n,
+                k,
+                h,
+            } => {
+                let red = rest.pop().expect("WeightedSum spans 2 steps");
+                st = Planned {
+                    name: red.name,
+                    op: Step::MoeWeightedSum {
+                        down,
+                        weights,
+                        n,
+                        k,
+                        h,
+                    },
+                    out: red.out,
+                    extra_outs: Vec::new(),
+                    reads: vec![down, weights],
+                };
+            }
         }
-
-        i += 1;
+        steps.push(st);
     }
+    Ok(())
 }
 
 /// First-fit arena offsets for graph inputs and step outputs; a value's space is reused once its
@@ -6570,6 +6184,158 @@ fn kernel_kind(desc: &str) -> &str {
             _ => return if ident.is_empty() { "?" } else { ident },
         }
     }
+}
+
+/// One `GIBBS_DUMP_PLAN` line.
+fn plan_line(i: usize, s: &Planned) -> String {
+    format!(
+        "plan {i:4} {:<46} {}",
+        s.name,
+        kernel_kind(&format!("{:?}", s.op))
+    )
+}
+
+/// Key slices a cached-attention step splits `n_keys` visible keys into; above 1 the step adds a
+/// merge dispatch.
+fn attn_splits(
+    n_keys: usize,
+    head_dim: usize,
+    kv_heads: usize,
+    group: usize,
+    gqa_decode: bool,
+) -> usize {
+    let (min_keys, split_keys) = if head_dim >= 256 {
+        (32, 16)
+    } else {
+        (ATTN_SPLIT_MIN_KEYS, ATTN_SPLIT_KEYS)
+    };
+    if gqa_decode && n_keys >= min_keys {
+        let head_tgs = kv_heads * group.div_ceil(ATTN_HPT);
+        ATTN_TARGET_TGS
+            .div_ceil(head_tgs)
+            .min(n_keys / split_keys)
+            .clamp(2, ATTN_MAX_SPLITS)
+    } else {
+        1
+    }
+}
+
+/// CPU-only listing of what [`Session::prepare_plan`] schedules for `g`: `plan` (MoE subgraph
+/// fusion included), `batch_horizontal`, the arena `allocate` and `pair_small_hand_gemvs`, without a
+/// device, weights or the tuner. A GEMV whose variant the tuner picks prints `variant=unassigned`
+/// (pairing is unaffected: without a variant override it pairs only BF16, which has one kernel).
+/// Dispatches per step follow the encoder: attention with `ctx` keys in the cache, and
+/// `MegakernelMlp`'s norm, gate, up, activation, down and optional post-norm.
+pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
+    use std::fmt::Write;
+    let (steps, aliases) = plan(g)?;
+    let mut steps = batch_horizontal(steps, &aliases)?;
+    let (offsets, arena) = allocate(g, &steps, &aliases)?;
+    pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
+    let mut out = String::new();
+    let mut kinds: HashMap<String, usize> = HashMap::new();
+    let (mut layer, mut dispatches, mut unassigned) = (None, 0usize, 0usize);
+    for (i, s) in steps.iter().enumerate() {
+        *kinds
+            .entry(kernel_kind(&format!("{:?}", s.op)).to_string())
+            .or_default() += 1;
+        // The layer index: the first all-digit segment of the step name.
+        let l = s.name.split('.').find_map(|p| p.parse::<usize>().ok());
+        if i == 0 || l != layer {
+            layer = l;
+            let _ = writeln!(out, "-- layer {}", l.map_or("-".into(), |l| l.to_string()));
+        }
+        let v = g.value(s.out);
+        let mut line = format!("{} -> {:?} {:?}", plan_line(i, s), v.shape, v.dtype);
+        if !s.extra_outs.is_empty() {
+            let _ = write!(line, " +{} outs", s.extra_outs.len());
+        }
+        for &r in &s.reads {
+            let w = g.value(r);
+            if w.kind == ValueKind::Weight {
+                let _ = write!(line, " w:{:?}{:?}", w.dtype, w.shape);
+            }
+        }
+        let mut n = 1;
+        match &s.op {
+            Step::GemvPacked { m, format, .. } | Step::GemvPackedPair { m, format, .. } => {
+                if *m == 1 && tune::enabled() && format.gemv_variants().len() > 1 {
+                    unassigned += 1;
+                    let _ = write!(line, " fmt={format:?} variant=unassigned");
+                } else {
+                    let d = format.default_variant();
+                    let _ = write!(line, " fmt={format:?} variant={:?}{}", d.kernel, d.rows_per_sg);
+                }
+            }
+            &Step::CachedAttention {
+                vis,
+                k_state,
+                v_state,
+                heads,
+                kv_heads,
+                head_dim,
+                window,
+                write,
+                m,
+                ..
+            } => {
+                // Mirrors the encoder: kv_append unless fused into the GQA decode kernel, then the
+                // attention, then a merge when the keys are split.
+                let gqa_decode = m == 1 && vis.is_none();
+                let n_keys = window.map_or(ctx, |w| ctx.min(w));
+                let group = (heads / kv_heads.max(1)).max(1);
+                let splits = attn_splits(n_keys, head_dim, kv_heads, group, gqa_decode);
+                n = usize::from(write && k_state.is_some() && v_state.is_some() && !gqa_decode)
+                    + 1
+                    + usize::from(splits > 1);
+                let _ = write!(line, " window={window:?} keys@ctx={n_keys} splits={splits}");
+            }
+            Step::MegakernelMlp { post_norm_w, .. } => n = 5 + usize::from(post_norm_w.is_some()),
+            _ => {}
+        }
+        dispatches += n;
+        if let ValueKind::Node(id) = v.kind {
+            let node = &g.nodes[id.0 as usize];
+            let src = |k: usize| node.inputs.get(k).map(|&x| g.value(x).shape.clone());
+            match &node.op {
+                Op::Slice { axis, start, end } => {
+                    let shape = src(0).unwrap_or_default();
+                    let ax = if *axis < 0 { *axis + shape.len() as isize } else { *axis } as usize;
+                    let outer: usize = shape.iter().take(ax).product();
+                    let _ = write!(
+                        line,
+                        " slice axis={ax} [{start}..{end}] of {shape:?} contiguous={}",
+                        outer == 1
+                    );
+                }
+                Op::Concat { axis } => {
+                    let ins: Vec<_> = (0..node.inputs.len()).filter_map(src).collect();
+                    let _ = write!(line, " concat axis={axis} of {ins:?}");
+                }
+                Op::Transpose { perm } => {
+                    let _ = write!(line, " transpose {perm:?} of {:?}", src(0).unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+        if n != 1 {
+            let _ = write!(line, " dispatches={n}");
+        }
+        let _ = writeln!(out, "{line}");
+    }
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let _ = writeln!(out, "-- step kinds");
+    for (k, c) in &kinds {
+        let _ = writeln!(out, "kind {c:5} {k}");
+    }
+    let _ = writeln!(
+        out,
+        "plan-dump: {} steps, {dispatches} dispatches at ctx {ctx}, arena {arena} B, \
+         {unassigned} GEMV steps unassigned (tuner)",
+        steps.len()
+    );
+    Ok(out)
 }
 
 /// Per-step GPU timings `(step, op description, seconds, bytes)` grouped by kernel kind, slowest
@@ -7463,7 +7229,7 @@ mod tests {
         let mut w = Weights::new();
         w.insert("gw", Tensor::F32(rand(hd, 1)));
         w.insert("inv", Tensor::F32(rand(hd / 2, 2)));
-        let sess1 = Session::new(rt(), &w).unwrap();
+        let mut sess1 = Session::new(rt(), &w).unwrap();
         let prep1 = sess1.prepare_plan(&g1).unwrap();
         assert_eq!(
             prep1.steps.len(),
@@ -7494,7 +7260,7 @@ mod tests {
             f,
         );
         g2.output(out2);
-        let sess2 = Session::new(rt(), &w).unwrap();
+        let mut sess2 = Session::new(rt(), &w).unwrap();
         let prep2 = sess2.prepare_plan(&g2).unwrap();
         assert_eq!(prep2.steps.len(), 1, "Q/K Rope fused into CachedAttention");
         assert!(matches!(
@@ -7502,18 +7268,24 @@ mod tests {
             Step::CachedAttention { rope: Some(_), .. }
         ));
 
-        for (g, sess) in [(&g1, &sess1), (&g2, &sess2)] {
-            let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
-            for step in 0..3u32 {
-                let inp = vec![
-                    Tensor::F32(rand(q_dim, 10 + step as u64)),
-                    Tensor::F32(rand(kv_dim, 20 + step as u64)),
-                    Tensor::F32(rand(kv_dim, 30 + step as u64)),
-                    Tensor::U32(vec![step]),
-                ];
-                let want = cpu::run(g, &w, &mut cs, inp.clone()).unwrap();
-                let got = sess.run_with_state(g, Some(&mut ms), inp).unwrap();
-                assert!(rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap()) < 1e-5);
+        // f16 KV covers the RoPE-fused f16 store; its rounding (<= 2^-11 of each K/V) sets the bound.
+        for (kv_f16, tol) in [(false, 1e-5), (true, 1e-3)] {
+            sess1.set_kv_f16(kv_f16);
+            sess2.set_kv_f16(kv_f16);
+            for (g, sess) in [(&g1, &sess1), (&g2, &sess2)] {
+                let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+                for step in 0..3u32 {
+                    let inp = vec![
+                        Tensor::F32(rand(q_dim, 10 + step as u64)),
+                        Tensor::F32(rand(kv_dim, 20 + step as u64)),
+                        Tensor::F32(rand(kv_dim, 30 + step as u64)),
+                        Tensor::U32(vec![step]),
+                    ];
+                    let want = cpu::run(g, &w, &mut cs, inp.clone()).unwrap();
+                    let got = sess.run_with_state(g, Some(&mut ms), inp).unwrap();
+                    let e = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                    assert!(e < tol, "f16 KV {kv_f16} step {step}: {e}");
+                }
             }
         }
     }
@@ -7562,7 +7334,7 @@ mod tests {
         );
         let out = g.add("res_ff", Op::Add, &[x, down_norm], vec![1, h], f);
         g.output(out);
-        crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g);
+        crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp);
 
         let mut w = Weights::new();
         for (k, s) in [("g0", 1u64), ("norm_w", 2), ("post_w", 3)] {
@@ -7627,7 +7399,7 @@ mod tests {
             g.output(o);
         }
         let (steps, aliases) = plan(&g).unwrap();
-        let steps = batch_horizontal(steps, &aliases);
+        let steps = batch_horizontal(steps, &aliases).unwrap();
         let kinds: Vec<_> = steps
             .iter()
             .map(|s| kernel_kind(&format!("{:?}", s.op)).to_string())
@@ -7757,6 +7529,142 @@ mod tests {
         ];
         let (want, got) = both(&g, &w, inputs, None);
         assert!(rel_err(&want, &got) < 1e-5);
+    }
+
+    /// Every kernel source this build emits compiles to a pipeline: the hand library as MSL 4.0
+    /// with MPP (each hand, group and MPP kernel as a pipeline with SIMD width 32 and at least the
+    /// threads its encoder dispatches), each generated GEMV (`gen` and `gen64`) and dequant variant,
+    /// each expert-GEMV grid binding, and the fused GeGlu→GEMV chain. Compile only: nothing is
+    /// dispatched and no runtime (host-profile measurement) is created.
+    #[test]
+    fn every_kernel_source_compiles() {
+        use crate::graph::codegen::{self, GemvParams, Iq2Grid};
+        let device = Device::system_default().expect("Metal device");
+        let (lib, mpp) = compile(&device).expect("kernel library");
+        mpp.expect("MSL 4.0 kernel library");
+        // `Runtime::new` checks only the `TG` floor; the fused delta-rule step dispatches more.
+        let need = |name: &str| -> u64 {
+            if name.starts_with("deltanet_step_") {
+                ext::deltanet::THREADS as u64
+            } else {
+                TG
+            }
+        };
+        let check = |name: &str, pso: &ComputePipelineState| {
+            assert_eq!(pso.thread_execution_width(), 32, "{name}");
+            assert!(
+                pso.max_total_threads_per_threadgroup() >= need(name),
+                "{name}: at most {} threads per threadgroup",
+                pso.max_total_threads_per_threadgroup()
+            );
+        };
+        for name in BASE_KERNELS
+            .iter()
+            .copied()
+            .chain(ext::kernel_names())
+            .chain(MPP_KERNELS)
+        {
+            let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let pso = device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            check(name, &pso);
+        }
+        let build = |src: &str, name: &str| {
+            let opts = CompileOptions::new();
+            opts.set_fast_math_enabled(false);
+            let lib = device
+                .new_library_with_source(src, &opts)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let pso = device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            check(name, &pso);
+        };
+        let head = "#include <metal_stdlib>\nusing namespace metal;\n";
+        let common = codegen::gemv_common(&KERNELS_MSL);
+        let mut codecs: Vec<&codec::Codec> = Vec::new();
+        for f in [
+            QuantFormat::GGUF_Q4_0,
+            QuantFormat::GGUF_Q4_1,
+            QuantFormat::GGUF_Q5_0,
+            QuantFormat::GGUF_Q5_1,
+            QuantFormat::GGUF_Q8_0,
+            QuantFormat::GGUF_Q2_K,
+            QuantFormat::GGUF_Q3_K,
+            QuantFormat::GGUF_Q4_K_M,
+            QuantFormat::GGUF_Q5_K_M,
+            QuantFormat::GGUF_Q6_K,
+            QuantFormat::GGUF_IQ4_NL,
+            QuantFormat::GGUF_IQ4_XS,
+            QuantFormat::GGUF_IQ3_XXS,
+            QuantFormat::GGUF_IQ3_S,
+            QuantFormat::GGUF_IQ2_XXS,
+            QuantFormat::GGUF_IQ2_XS,
+            QuantFormat::GGUF_IQ2_S,
+            QuantFormat::GGUF_IQ2_M,
+            QuantFormat::GGUF_IQ1_S,
+            QuantFormat::GGUF_TQ1_0,
+            QuantFormat::GGUF_TQ2_0,
+            QuantFormat::GGUF_NVFP4,
+        ] {
+            if let Some(c) = codec::codec(f) {
+                if !codecs.iter().any(|d| d.format == c.format) {
+                    codecs.push(c);
+                }
+            }
+        }
+        for &c in &codecs {
+            let variants = tune::GEN_ROWS
+                .iter()
+                .map(|&r| tune::GemvVariant::generated(r))
+                .chain(
+                    tune::gen64_rows(c.format)
+                        .iter()
+                        .map(|&r| tune::GemvVariant::generated64(r)),
+                );
+            for v in variants {
+                let p = v.gen_params();
+                build(
+                    &format!("{head}{common}{}", codegen::gemv_packed(c, p)),
+                    &codegen::gemv_packed_name(c, p),
+                );
+            }
+            build(
+                &format!("{head}{}", codegen::dequant_packed(c)),
+                &codegen::dequant_packed_name(c),
+            );
+            for r in [2, 4] {
+                let p = GemvParams {
+                    rows_per_sg: r,
+                    ..Default::default()
+                };
+                let grids: &[Iq2Grid] = if c.format == QuantFormat::GGUF_IQ2_XXS {
+                    &[Iq2Grid::Program, Iq2Grid::Threadgroup, Iq2Grid::Buffer]
+                } else {
+                    &[Iq2Grid::Program]
+                };
+                for &grid in grids {
+                    let src = codegen::iq2_grid_msl(codegen::gemv_indexed(c, p), grid)
+                        .unwrap_or_else(|e| panic!("{:?} {grid:?}: {e}", c.format));
+                    build(&format!("{head}{src}"), &codegen::gemv_indexed_name(c, p));
+                }
+            }
+            build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
+        }
+        let (q4_0, q4_k) = (
+            codec::codec(QuantFormat::GGUF_Q4_0).unwrap(),
+            codec::codec(QuantFormat::GGUF_Q4_K_M).unwrap(),
+        );
+        build(&ext::ple::kernel_src(q4_0, q4_k), &ext::ple::kernel_name(q4_0, q4_k));
+        // TQ2_0's device source is the planar layout, the one codec outside `codec.msl`.
+        let tq2 = codec::codec(QuantFormat::GGUF_TQ2_0).unwrap();
+        build(&ext::ple::kernel_src(tq2, q4_k), &ext::ple::kernel_name(tq2, q4_k));
+        for f in [QuantFormat::BF16, QuantFormat::FP16] {
+            let c = ext::ple::codec_of(f).expect("pseudo-codec");
+            build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
+        }
     }
 
     /// Every packed format (generated and hand kernels): the GPU GEMV equals the CPU executor
@@ -7976,7 +7884,7 @@ mod tests {
                 g.output(out);
                 let unfused = g.clone();
                 assert_eq!(
-                    crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+                    crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp),
                     1
                 );
                 let xs: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -9685,6 +9593,12 @@ mod tests {
 
     #[test]
     fn test_stateful_cached_attention_parity() {
+        for (kv_f16, tol) in KV_DTYPES {
+            stateful_cached_attention_parity(kv_f16, tol);
+        }
+    }
+
+    fn stateful_cached_attention_parity(kv_f16: bool, tol: f32) {
         let (heads, kv_heads, hd) = (4, 2, 8);
         let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
         let max_seq = 32;
@@ -9726,7 +9640,8 @@ mod tests {
 
         let mut cpu_state = StateStore::new();
         let mut metal_state = StateStore::new();
-        let session = Session::new(rt(), &Weights::new()).unwrap();
+        let mut session = Session::new(rt(), &Weights::new()).unwrap();
+        session.set_kv_f16(kv_f16);
 
         // 1. Prefill chunk of m = 5 (positions 0..5)
         {
@@ -9751,7 +9666,7 @@ mod tests {
             let cpu_out_f32 = cpu_out[0].as_f32().unwrap();
             let metal_out_f32 = metal_out[0].as_f32().unwrap();
             assert!(
-                rel_err(cpu_out_f32, metal_out_f32) < 1e-4,
+                rel_err(cpu_out_f32, metal_out_f32) < tol,
                 "Prefill output mismatch: max rel err {}",
                 rel_err(cpu_out_f32, metal_out_f32)
             );
@@ -9760,7 +9675,7 @@ mod tests {
             let cpu_k = cpu_state.get("k_state").unwrap().as_f32().unwrap();
             let metal_k = metal_state.get("k_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_k, metal_k) < 1e-4,
+                rel_err(cpu_k, metal_k) < tol,
                 "Prefill k_state mismatch: max rel err {}",
                 rel_err(cpu_k, metal_k)
             );
@@ -9768,7 +9683,7 @@ mod tests {
             let cpu_v = cpu_state.get("v_state").unwrap().as_f32().unwrap();
             let metal_v = metal_state.get("v_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_v, metal_v) < 1e-4,
+                rel_err(cpu_v, metal_v) < tol,
                 "Prefill v_state mismatch: max rel err {}",
                 rel_err(cpu_v, metal_v)
             );
@@ -9798,7 +9713,7 @@ mod tests {
             let cpu_out_f32 = cpu_out[0].as_f32().unwrap();
             let metal_out_f32 = metal_out[0].as_f32().unwrap();
             assert!(
-                rel_err(cpu_out_f32, metal_out_f32) < 1e-4,
+                rel_err(cpu_out_f32, metal_out_f32) < tol,
                 "Decode step {step} output mismatch: max rel err {}",
                 rel_err(cpu_out_f32, metal_out_f32)
             );
@@ -9807,7 +9722,7 @@ mod tests {
             let cpu_k = cpu_state.get("k_state").unwrap().as_f32().unwrap();
             let metal_k = metal_state.get("k_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_k, metal_k) < 1e-4,
+                rel_err(cpu_k, metal_k) < tol,
                 "Decode step {step} k_state mismatch: max rel err {}",
                 rel_err(cpu_k, metal_k)
             );
@@ -9815,17 +9730,36 @@ mod tests {
             let cpu_v = cpu_state.get("v_state").unwrap().as_f32().unwrap();
             let metal_v = metal_state.get("v_state").unwrap().as_f32().unwrap();
             assert!(
-                rel_err(cpu_v, metal_v) < 1e-4,
+                rel_err(cpu_v, metal_v) < tol,
                 "Decode step {step} v_state mismatch: max rel err {}",
                 rel_err(cpu_v, metal_v)
             );
         }
     }
 
+    /// (KV dtype is f16?, rel_err bound against the f32 CPU executor): f16 rounds each stored K/V to 11 bits
+    /// (<= 2^-11 relative, 2.4e-4 absolute on |x| <= 1 inputs).
+    const KV_DTYPES: [(bool, f32); 2] = [(false, 1e-4), (true, 1e-3)];
+
+    /// Smallest cosine between matching `hd`-wide head rows of `want` and `got`.
+    fn min_head_cosine(want: &[f32], got: &[f32], hd: usize) -> f32 {
+        want.chunks(hd)
+            .zip(got.chunks(hd))
+            .map(|(a, b)| crate::model::dit_graph::fixture::cosine(a, b))
+            .fold(1.0, f32::min)
+    }
+
     /// Decode over a cache long enough to split across threadgroups (full and sliding window, soft cap,
-    /// grouped KV heads): the split + merge path equals the CPU executor.
+    /// grouped KV heads): the split + merge path equals the CPU executor, with f32 and f16 KV caches
+    /// (f16: every head row at cosine >= 0.9999).
     #[test]
     fn split_decode_attention_matches_cpu() {
+        for (kv_f16, tol) in KV_DTYPES {
+            split_decode_attention_matches_cpu_for(kv_f16, tol);
+        }
+    }
+
+    fn split_decode_attention_matches_cpu_for(kv_f16: bool, tol: f32) {
         // (cache size, prefill length) pairs are looped below.
         // Query heads per KV head: 2 (a partial head tile), 8 (two full tiles), 1, 6 (tiles of 4 and 2),
         // 3 (a single tile of 3); head dims below 512 exercise the q-tile zero fill.
@@ -9847,7 +9781,6 @@ mod tests {
                     continue;
                 }
                 let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-                let tol = 1e-4;
                 for window in [None, Some(300), Some(90)] {
                     let make = |m: usize| {
                         let mut g = Graph::new();
@@ -9878,7 +9811,8 @@ mod tests {
                         g
                     };
                     let (mut cpu_state, mut metal_state) = (StateStore::new(), StateStore::new());
-                    let session = Session::new(rt(), &Weights::new()).unwrap();
+                    let mut session = Session::new(rt(), &Weights::new()).unwrap();
+                    session.set_kv_f16(kv_f16);
                     let step = |g: &Graph,
                                 m: usize,
                                 at: usize,
@@ -9893,7 +9827,10 @@ mod tests {
                         ];
                         let want = cpu::run(g, &Weights::new(), cs, inputs.clone()).unwrap();
                         let got = session.run_with_state(g, Some(ms), inputs).unwrap();
-                        rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap())
+                        let (want, got) = (want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                        let cos = min_head_cosine(want, got, hd);
+                        assert!(cos >= 0.9999, "f16 KV {kv_f16} at {at} {window:?}: min cosine {cos}");
+                        rel_err(want, got)
                     };
                     let e = step(
                         &make(prefill),
@@ -9903,7 +9840,10 @@ mod tests {
                         &mut cpu_state,
                         &mut metal_state,
                     );
-                    assert!(e < tol, "prefill {window:?}: {e}");
+                    assert!(e < tol, "f16 KV {kv_f16} prefill {window:?}: {e}");
+                    let (kbuf, n) = &metal_state.metal_buffers["k_state"];
+                    assert_eq!(metal_state.metal_f16.contains("k_state"), kv_f16);
+                    assert_eq!(kbuf.length() as usize, (n * if kv_f16 { 2 } else { 4 }).max(ARENA_ALIGN));
                     let decode = make(1);
                     // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
                     for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
@@ -9915,7 +9855,7 @@ mod tests {
                             &mut cpu_state,
                             &mut metal_state,
                         );
-                        assert!(e < tol, "decode at {at} {window:?}: {e}");
+                        assert!(e < tol, "f16 KV {kv_f16} decode at {at} {window:?}: {e}");
                     }
                 }
             }
@@ -10184,12 +10124,205 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             Tensor::U32(vec![1, 2, 3, 6, 6, 6]),
         ];
         let want = cpu::run(&g, &Weights::new(), &mut StateStore::new(), inputs.clone()).unwrap();
-        let session = Session::new(rt(), &Weights::new()).unwrap();
-        let got = session
-            .run_with_state(&g, Some(&mut StateStore::new()), inputs)
-            .unwrap();
-        let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-        assert!(err < 1e-4, "visible_end mismatch: {err}");
+        for (kv_f16, tol) in KV_DTYPES {
+            let mut session = Session::new(rt(), &Weights::new()).unwrap();
+            session.set_kv_f16(kv_f16);
+            let got = session
+                .run_with_state(&g, Some(&mut StateStore::new()), inputs.clone())
+                .unwrap();
+            let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            assert!(err < tol, "visible_end mismatch (f16 KV {kv_f16}): {err}");
+        }
+    }
+
+    /// `m` rows of cached attention over `[max_seq, kv_heads * hd]` k/v states named `k_state` / `v_state`.
+    fn kv_attn_graph(
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        window: Option<usize>,
+        max_seq: usize,
+        m: usize,
+    ) -> Graph {
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let mut g = Graph::new();
+        let q = g.input("q", vec![m, q_dim], DType::F32);
+        let k = g.input("k", vec![m, kv_dim], DType::F32);
+        let v = g.input("v", vec![m, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
+        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+        let pos = g.input("pos", vec![m], DType::U32);
+        let out = g.add(
+            "attn",
+            Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 1.0 / (hd as f32).sqrt(),
+                causal: true,
+                window,
+                soft_cap: None,
+                write: true,
+            },
+            &[q, k, v, ks, vs, pos],
+            vec![m, q_dim],
+            DType::F32,
+        );
+        g.output(out);
+        g
+    }
+
+    /// f16 KV caches against the f32 CPU executor: prefills of 1, 63, 64, 65 and 4096 rows then two decode
+    /// steps (the last prefill's first decode crosses the 4096-row physical buffer: grown by a byte copy and
+    /// split across threadgroups), grouped / ungrouped KV heads and a sliding window. The stored caches are
+    /// exactly the round-to-nearest-even f16 of what the CPU executor stored (prefill via `kv_append`,
+    /// decode via the split kernel's fused write).
+    #[test]
+    fn f16_kv_attention_matches_cpu_across_lengths() {
+        use crate::model::{f16_to_f32, f32_to_f16};
+        let max_seq = 4400;
+        for (heads, kv_heads, hd, window) in [
+            (4usize, 2usize, 32usize, None),
+            (4, 4, 32, None),
+            (8, 1, 64, Some(40usize)),
+        ] {
+            let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+            for prefill in [1usize, 63, 64, 65, 4096] {
+                let mut session = Session::new(rt(), &Weights::new()).unwrap();
+                session.set_kv_f16(true);
+                let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
+                let mut at = 0;
+                for (i, m) in [prefill, 1, 1].into_iter().enumerate() {
+                    let g = kv_attn_graph(heads, kv_heads, hd, window, max_seq, m);
+                    let seed = 100 * i as u64 + 7;
+                    let inputs = vec![
+                        Tensor::F32(rand(m * q_dim, seed)),
+                        Tensor::F32(rand(m * kv_dim, seed + 1)),
+                        Tensor::F32(rand(m * kv_dim, seed + 2)),
+                        Tensor::U32((at..at + m).map(|p| p as u32).collect()),
+                    ];
+                    let want = cpu::run(&g, &Weights::new(), &mut cs, inputs.clone()).unwrap();
+                    let got = session.run_with_state(&g, Some(&mut ms), inputs).unwrap();
+                    let (want, got) = (want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                    let (e, cos) = (rel_err(want, got), min_head_cosine(want, got, hd));
+                    assert!(
+                        e < 1e-3 && cos >= 0.9999,
+                        "heads {heads}/{kv_heads} hd {hd} {window:?} prefill {prefill} chunk {i}: {e}, cos {cos}"
+                    );
+                    at += m;
+                }
+                assert!(ms.metal_f16.contains("k_state") && ms.metal_f16.contains("v_state"));
+                let n_buf = ms.metal_buffers["k_state"].1;
+                assert_eq!(ms.metal_buffers["k_state"].0.length() as usize, n_buf * 2);
+                ms.sync_metal_to_cpu();
+                for name in ["k_state", "v_state"] {
+                    let want = &cs.get(name).unwrap().as_f32().unwrap()[..at * kv_dim];
+                    let got = &ms.get(name).unwrap().as_f32().unwrap()[..at * kv_dim];
+                    for (i, (&w, &g)) in want.iter().zip(got).enumerate() {
+                        assert_eq!(
+                            g,
+                            f16_to_f32(f32_to_f16(w)),
+                            "{name}[{i}] of {at} positions: stored {g}, f32 {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Out-of-range K/V saturate at +-65504 instead of becoming inf; NaN stays NaN; tiny values flush to 0.
+    /// Covers `kv_append_batched_f16` (m = 2 prefill) and the split kernel's fused f16 write (m = 1).
+    #[test]
+    fn f16_kv_saturates_out_of_range_values() {
+        let k = [1e6, -1e6, 70000.0, f32::NAN];
+        let v = [65504.0, 65520.0, 1e-9, -2.5];
+        for m in [1usize, 2] {
+            let g = kv_attn_graph(1, 1, 4, None, 16, m);
+            let mut session = Session::new(rt(), &Weights::new()).unwrap();
+            session.set_kv_f16(true);
+            let mut st = StateStore::new();
+            let inputs = vec![
+                Tensor::F32(vec![1.0; 4 * m]),
+                Tensor::F32(k.repeat(m)),
+                Tensor::F32(v.repeat(m)),
+                Tensor::U32((0..m as u32).collect()),
+            ];
+            session.run_with_state(&g, Some(&mut st), inputs).unwrap();
+            let (ks, vs) = (st.read_metal("k_state").unwrap(), st.read_metal("v_state").unwrap());
+            for row in 0..m {
+                let (kr, vr) = (&ks[row * 4..row * 4 + 4], &vs[row * 4..row * 4 + 4]);
+                assert_eq!(kr[..3], [65504.0, -65504.0, 65504.0], "m {m} row {row}");
+                assert!(kr[3].is_nan(), "m {m} row {row}");
+                assert_eq!(vr, [65504.0, 65504.0, 0.0, -2.5], "m {m} row {row}");
+            }
+        }
+    }
+
+    /// CPU-only: a state is f16 only when every reader is a `CachedAttention` k/v operand. Layers sharing
+    /// a cache stay f16; a plain `Attention` over the cache keeps it f32.
+    #[test]
+    fn kv_dtype_follows_the_states_readers() {
+        let (heads, hd, max_seq) = (2, 8, 16);
+        let f = DType::F32;
+        let attn = |write| Op::CachedAttention {
+            heads,
+            kv_heads: heads,
+            head_dim: hd,
+            v_head_dim: hd,
+            scale: 0.3,
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write,
+        };
+        let build = |shared: bool, plain_reader: bool| {
+            let mut g = Graph::new();
+            let q = g.input("q", vec![1, heads * hd], f);
+            let k = g.input("k", vec![1, heads * hd], f);
+            let v = g.input("v", vec![1, heads * hd], f);
+            let pos = g.input("pos", vec![1], DType::U32);
+            let ks = g.state("k_state", vec![max_seq, heads * hd], f);
+            let vs = g.state("v_state", vec![max_seq, heads * hd], f);
+            let a = g.add("a", attn(true), &[q, k, v, ks, vs, pos], vec![1, heads * hd], f);
+            g.output(a);
+            if shared {
+                let (ks2, vs2) = (
+                    g.state("k_state", vec![max_seq, heads * hd], f),
+                    g.state("v_state", vec![max_seq, heads * hd], f),
+                );
+                let b = g.add("b", attn(false), &[a, k, v, ks2, vs2, pos], vec![1, heads * hd], f);
+                g.output(b);
+            }
+            if plain_reader {
+                let plain = Op::Attention {
+                    heads,
+                    kv_heads: heads,
+                    causal: false,
+                    window: None,
+                    soft_cap: None,
+                };
+                let c = g.add("c", plain, &[q, ks, vs], vec![1, heads * hd], f);
+                g.output(c);
+            }
+            g
+        };
+        let assign = |g: &Graph| {
+            let (mut steps, _) = plan(g).unwrap();
+            let f16 = assign_kv_dtypes(g, &mut steps);
+            let flags: Vec<bool> = steps
+                .iter()
+                .filter_map(|s| match s.op {
+                    Step::CachedAttention { kv_f16, .. } => Some(kv_f16),
+                    _ => None,
+                })
+                .collect();
+            (f16.len(), flags)
+        };
+        assert_eq!(assign(&build(false, false)), (2, vec![true]));
+        assert_eq!(assign(&build(true, false)), (2, vec![true, true]));
+        assert_eq!(assign(&build(false, true)), (0, vec![false]));
+        assert_eq!(assign(&build(true, true)), (0, vec![false, false]));
     }
 
     #[test]
@@ -10638,7 +10771,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         w.insert("wk", Tensor::F32(rand(16, 3)));
         w.insert("wv", Tensor::F32(rand(16, 4)));
 
-        let s = Session::new(rt(), &w).unwrap();
+        let mut s = Session::new(rt(), &w).unwrap();
+        s.set_kv_f16(false);
         let plan = s.prepare_plan(&g).unwrap();
 
         assert_eq!(plan.value_locs.len(), g.values.len());
@@ -10682,6 +10816,31 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         if std::env::var_os("GIBBS_CB_CHUNK").is_none() {
             assert_eq!(cb_chunking(), (32, usize::MAX));
         }
+    }
+
+    /// CPU only: `plan_dump` groups steps by layer and describes a materialized strided slice.
+    #[test]
+    fn plan_dump_describes_layers_and_slices() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![2, 8], DType::F32);
+        let op = Op::Slice {
+            axis: 1,
+            start: 0,
+            end: 4,
+        };
+        let s = g.add("blk.3.slice", op, &[x], vec![2, 4], DType::F32);
+        let neg = Op::Unary {
+            kind: crate::graph::UnaryKind::Neg,
+        };
+        let y = g.add("blk.3.neg", neg, &[s], vec![2, 4], DType::F32);
+        g.output(y);
+        let d = plan_dump(&g, 1).unwrap();
+        assert!(d.contains("-- layer 3\n"), "{d}");
+        assert!(
+            d.contains("slice axis=1 [0..4] of [2, 8] contiguous=false"),
+            "{d}"
+        );
+        assert!(d.contains("plan-dump: 2 steps, 2 dispatches at ctx 1"), "{d}");
     }
 
     #[test]
@@ -10748,7 +10907,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         w.insert("gw", Tensor::F32(rand(hd, 4)));
         w.insert("inv", Tensor::F32(rand(hd / 2, 5)));
 
-        let sess = Session::new(rt(), &w).unwrap();
+        let mut sess = Session::new(rt(), &w).unwrap();
+        sess.set_kv_f16(false);
         let plan = sess.prepare_plan(&g).unwrap();
         assert_eq!(plan.steps.len(), 5);
         assert!(matches!(plan.steps[0].op, Step::GemvPacked { .. }));
@@ -10831,7 +10991,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let out = g.add("res", Op::Add, &[x, down], vec![1, h], f);
         g.output(out);
         assert_eq!(
-            crate::graph::passes::megakernel::fuse_megakernel_blocks_pass(&mut g),
+            crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp),
             1
         );
         let mut w = Weights::new();

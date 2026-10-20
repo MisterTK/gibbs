@@ -426,6 +426,16 @@ pub fn load_gguf(
     .map(|r| r.map_err(|e| format!("{}: {e}", path.display())))
 }
 
+/// Decode graph and weights of a GGUF [`load_gguf`] takes, built on the host without a device
+/// (graph-compiler tests on real checkpoints).
+pub fn gguf_decode_graph(
+    path: &std::path::Path,
+) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
+    let (manifest, data) = crate::model::loaders::gguf::open(path)?;
+    let (ck, cfg, arch) = gguf_checkpoint(&Arc::new(data), &manifest)?;
+    TextModel::load(&ck, &cfg, arch)?.to_decode_graph()
+}
+
 fn gguf_model(
     map: &Arc<crate::model::loaders::gguf::GgufData>,
     m: &crate::model::ModelManifest,
@@ -705,11 +715,9 @@ fn gguf_checkpoint(
             }
         }
 
+        let legacy = crate::graph::disabled("qwen_packed");
         let needs_transform = matches!(arch, Arch::Qwen35 | Arch::Qwen4Exp)
-            && (hf.ends_with("norm.weight")
-                || hf.contains(".ple.norm_")
-                || hf.ends_with(".linear_attn.out_proj.weight")
-                || (hf.contains(".linear_attn.") && !is_permuted_linear));
+            && qwen35_needs_transform(&hf, kh, vh, is_permuted_linear, legacy);
         // Matrices stay packed in BF16/FP16 and in any block format the GPU codec registry decodes (a
         // dequantized copy streams 2-3x the bytes per token). Expert banks keep the wider block-codec
         // predicate: dequantized they would not fit in memory.
@@ -727,6 +735,37 @@ fn gguf_checkpoint(
         let can_pack = ((shape.len() == 2 && packable(shape[1]))
             || (bank && (packable(shape[shape.len() - 1]) || block_ok(shape[shape.len() - 1]))))
             && !needs_transform;
+        // Value heads tiled across `out_proj` columns: untile whole quant blocks per row when each
+        // `vd`-column head is block aligned.
+        // ponytail: unaligned formats still dequantize; permute the input activation instead if one ships.
+        if needs_transform
+            && !legacy
+            && kh != vh
+            && hf.ends_with(".linear_attn.out_proj.weight")
+            && shape.len() == 2
+            && packable(shape[1])
+            && packable(vd)
+        {
+            let row_bytes = t.quant_format.tensor_bytes(shape[1]);
+            let seg = t.quant_format.tensor_bytes(vd);
+            let total = shape[0] * row_bytes;
+            if seg * vh == row_bytes && t.byte_offset + total <= data.len() {
+                let permuted: Vec<u8> = data[t.byte_offset..t.byte_offset + total]
+                    .chunks_exact(row_bytes)
+                    .flat_map(|row| untile_packed_rows(row, seg, 1, kh, vh, 0))
+                    .collect();
+                permuted_packed.push((
+                    hf,
+                    crate::model::weights::Packed {
+                        map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(permuted)),
+                        off: 0,
+                        format: t.quant_format,
+                        shape,
+                    },
+                ));
+                continue;
+            }
+        }
 
         if can_pack {
             packed.push((hf, t.byte_offset, t.quant_format, shape));
@@ -794,6 +833,39 @@ pub fn gguf_target(path: &Path) -> Result<(Value, Weights), String> {
         |hf| m.extract_tensor_f32(&data, names[hf]),
     )?;
     Ok((cfg, ck))
+}
+
+/// [`qwen35_transforms`], or with `legacy` (`GIBBS_DISABLE=qwen_packed`) the predicate before it:
+/// every `.linear_attn.` tensor that is not a permuted linear, plus `out_proj`, dequantizes.
+fn qwen35_needs_transform(hf: &str, kh: usize, vh: usize, permuted: bool, legacy: bool) -> bool {
+    if !legacy {
+        return qwen35_transforms(hf, kh, vh);
+    }
+    hf.ends_with("norm.weight")
+        || hf.contains(".ple.norm_")
+        || hf.ends_with(".linear_attn.out_proj.weight")
+        || (hf.contains(".linear_attn.") && !permuted)
+}
+
+/// Whether [`qwen35_from_gguf`] changes tensor `hf` (key / value head counts `kh` / `vh`).
+fn qwen35_transforms(hf: &str, kh: usize, vh: usize) -> bool {
+    match hf.rsplit_once(".linear_attn.") {
+        None => hf.ends_with("norm.weight") || hf.contains(".ple.norm_"),
+        Some((_, rest)) => {
+            kh != vh
+                && matches!(
+                    rest,
+                    "in_proj_qkv.weight"
+                        | "conv1d.weight"
+                        | "in_proj_z.weight"
+                        | "in_proj_a.weight"
+                        | "in_proj_b.weight"
+                        | "neg_A"
+                        | "dt_bias"
+                        | "out_proj.weight"
+                )
+        }
+    }
 }
 
 /// Undoes llama.cpp's Qwen3.5 conversion (`Qwen3NextModel` and `_LinearAttentionVReorderBase`
@@ -1041,7 +1113,16 @@ impl NativeLm for Dense {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, false)
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, false, false)?)
+    }
+
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.run(tokens, start_pos, state, false, true)
     }
 
     fn forward_all(
@@ -1050,7 +1131,7 @@ impl NativeLm for Dense {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, true)
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, true, false)?)
     }
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
@@ -1088,14 +1169,17 @@ impl Dense {
     }
 
     /// Runs `tokens` from `start_pos` (rewinding the KV caches to it); logits after the last
-    /// token, or after every token when `all`.
+    /// token, or after every token when `all`. `greedy`: the program may return the last
+    /// position's device-picked token instead (`U32([token])`).
     fn run(
         &self,
         tokens: &[u32],
         start_pos: usize,
         state: &mut SeqState,
         all: bool,
-    ) -> Result<Vec<f32>, String> {
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
+        use crate::graph::Tensor;
         let seq = Self::seq(state)?;
         if start_pos > seq.len || tokens.is_empty() {
             return Err(format!(
@@ -1108,7 +1192,7 @@ impl Dense {
             if seq.taps.is_empty() {
                 let mut p = prog.lock();
                 std::mem::swap(&mut p.state, &mut seq.program_state);
-                let mut logits = Vec::new();
+                let mut logits = Tensor::F32(Vec::new());
                 for (i, &tok) in tokens.iter().enumerate() {
                     let pos = start_pos + i;
                     if pos >= self.text.decode_max_ctx {
@@ -1120,19 +1204,21 @@ impl Dense {
                     }
                     let mut emb = vec![0.0f32; self.text.hidden()];
                     self.text.embed(tok, &mut emb)?;
-                    let inputs = vec![
-                        crate::graph::Tensor::F32(emb),
-                        crate::graph::Tensor::U32(vec![pos as u32]),
-                    ];
-                    let step_out = p.run(inputs);
+                    let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos as u32])];
+                    let last = i + 1 == tokens.len();
+                    let step_out = if greedy && last {
+                        p.run_greedy(inputs, self.tok.vocab_size())
+                    } else {
+                        p.run(inputs)
+                    };
                     match step_out {
-                        Ok(res) => {
-                            if all || i + 1 == tokens.len() {
-                                if let Some(crate::graph::Tensor::F32(v)) = res.into_iter().next() {
-                                    logits.extend_from_slice(&v);
-                                }
+                        Ok(res) => match (res.into_iter().next(), &mut logits) {
+                            (Some(t @ Tensor::U32(_)), l) => *l = t,
+                            (Some(Tensor::F32(v)), Tensor::F32(l)) if all || last => {
+                                l.extend_from_slice(&v)
                             }
-                        }
+                            _ => {}
+                        },
                         Err(e) => {
                             std::mem::swap(&mut p.state, &mut seq.program_state);
                             return Err(e);
@@ -1165,11 +1251,11 @@ impl Dense {
             &mut seq.tapped,
         );
         seq.len = start_pos + n;
-        Ok(if all {
+        Ok(Tensor::F32(if all {
             self.text.logits(&h, n)
         } else {
             self.text.logits(&h[(n - 1) * d..], 1)
-        })
+        }))
     }
 }
 
@@ -1329,7 +1415,16 @@ impl NativeLm for Qwen35 {
         start_pos: usize,
         state: &mut SeqState,
     ) -> Result<Vec<f32>, String> {
-        self.run(tokens, start_pos, state, false)
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, false, false)?)
+    }
+
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<crate::graph::Tensor, String> {
+        self.run(tokens, start_pos, state, false, true)
     }
 
     fn forward_all(
@@ -1341,7 +1436,7 @@ impl NativeLm for Qwen35 {
         if self.text.is_hc() {
             return Err("this model cannot verify draft tokens".into());
         }
-        self.run(tokens, start_pos, state, true)
+        crate::model::native::logits_of(self.run(tokens, start_pos, state, true, false)?)
     }
 
     fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
@@ -1416,7 +1511,9 @@ impl Qwen35 {
     /// The program path of [`Self::run`]: `p.state` is the sequence's state. Image positions feed
     /// their feature row for the token embedding, the `[t, h, w]` rope positions and, per deepstack
     /// layer, the row added after it. `all` snapshots the recurrent states `refs` after every
-    /// position for [`NativeLm::truncate`].
+    /// position for [`NativeLm::truncate`]; `greedy` runs the last position through
+    /// [`crate::graph::program::GraphProgram::run_greedy`].
+    #[allow(clippy::too_many_arguments)]
     fn program_steps(
         &self,
         p: &mut crate::graph::program::GraphProgram,
@@ -1424,15 +1521,16 @@ impl Qwen35 {
         tokens: &[u32],
         start_pos: usize,
         all: bool,
+        greedy: bool,
         refs: &[&str],
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<crate::graph::Tensor, String> {
         use crate::graph::Tensor;
         let d = self.text.hidden();
         let ds_layers = self
             .vision
             .as_ref()
             .map_or(0, |(v, ..)| v.deepstack_layers());
-        let mut logits = Vec::new();
+        let (mut logits, mut picked) = (Vec::new(), None);
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = start_pos + i;
             if pos >= self.text.decode_max_ctx {
@@ -1463,13 +1561,17 @@ impl Qwen35 {
                     inputs.push(Tensor::F32(row));
                 }
             }
-            let mut res = p.run(inputs)?.into_iter();
-            if all || i + 1 == tokens.len() {
-                if let Some(Tensor::F32(v)) = res.next() {
-                    logits.extend_from_slice(&v);
-                }
+            let last = i + 1 == tokens.len();
+            let mut res = if greedy && last {
+                p.run_greedy(inputs, self.tok.vocab_size())?
             } else {
-                res.next();
+                p.run(inputs)?
+            }
+            .into_iter();
+            match res.next() {
+                Some(Tensor::U32(t)) => picked = t.first().copied(),
+                Some(Tensor::F32(v)) if all || last => logits.extend_from_slice(&v),
+                _ => {}
             }
             if !seq.taps.is_empty() {
                 match res.next() {
@@ -1481,18 +1583,23 @@ impl Qwen35 {
                 seq.ckpt.push(p.state.snapshot(refs));
             }
         }
-        Ok(logits)
+        Ok(match picked {
+            Some(t) => Tensor::U32(vec![t]),
+            None => Tensor::F32(logits),
+        })
     }
 
     /// Runs `tokens` from `start_pos`; logits after the last token, or after every token (with
-    /// recurrent checkpoints for `truncate`) when `all`.
+    /// recurrent checkpoints for `truncate`) when `all`. `greedy`: the program may return the last
+    /// position's device-picked token instead (`U32([token])`).
     fn run(
         &self,
         tokens: &[u32],
         start_pos: usize,
         state: &mut SeqState,
         all: bool,
-    ) -> Result<Vec<f32>, String> {
+        greedy: bool,
+    ) -> Result<crate::graph::Tensor, String> {
         let seq = Self::seq(state)?;
         if start_pos != seq.len {
             return Err(format!(
@@ -1511,7 +1618,7 @@ impl Qwen35 {
             }
             let mut p = prog.lock();
             std::mem::swap(&mut p.state, &mut seq.program_state);
-            let out = self.program_steps(&mut p, seq, tokens, start_pos, all, &refs);
+            let out = self.program_steps(&mut p, seq, tokens, start_pos, all, greedy, &refs);
             std::mem::swap(&mut p.state, &mut seq.program_state);
             if out.is_ok() {
                 seq.len = start_pos + tokens.len();
@@ -1556,11 +1663,11 @@ impl Qwen35 {
         seq.len += tokens.len();
         let n = tokens.len();
         let w = self.text.width();
-        Ok(if all {
+        Ok(crate::graph::Tensor::F32(if all {
             self.text.logits(&h, n)
         } else {
             self.text.logits(&h[(n - 1) * w..], 1)
-        })
+        }))
     }
 }
 
@@ -2745,6 +2852,79 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(err < 1e-5, "{name}: {hf:?} -> {v:?}");
         }
+    }
+
+    /// Tensors [`qwen35_from_gguf`] leaves unchanged stay packed, and the packed `out_proj`
+    /// column untile matches the f32 one.
+    #[test]
+    fn qwen35_identity_transforms_stay_packed() {
+        let c = |kh: usize, vh: usize| {
+            serde_json::json!({"linear_num_key_heads": kh, "linear_num_value_heads": vh,
+                "linear_key_head_dim": 2, "linear_value_head_dim": 2})
+        };
+        let p = "model.layers.0";
+        for (kh, vh) in [(2, 2), (2, 6)] {
+            for n in [
+                "in_proj_qkv.weight",
+                "in_proj_z.weight",
+                "in_proj_a.weight",
+                "in_proj_b.weight",
+                "out_proj.weight",
+                "conv1d.weight",
+                "neg_A",
+                "dt_bias",
+                "norm.weight",
+            ] {
+                let hf = format!("{p}.linear_attn.{n}");
+                let len = (4 * kh + vh * 2) * 4 * vh;
+                let x: Vec<f32> = (0..len).map(|i| i as f32).collect();
+                let mut v = x.clone();
+                qwen35_from_gguf(&hf, &mut v, &c(kh, vh));
+                if !qwen35_transforms(&hf, kh, vh) {
+                    assert_eq!(v, x, "{hf} {kh}/{vh}");
+                }
+            }
+            assert!(qwen35_transforms(
+                &format!("{p}.input_layernorm.weight"),
+                kh,
+                vh
+            ));
+        }
+        assert!(!qwen35_transforms(
+            &format!("{p}.linear_attn.out_proj.weight"),
+            16,
+            16
+        ));
+        // out_proj rows of 6 heads x 2 columns, one byte per column.
+        let (kh, vh, vd) = (2, 6, 2);
+        let rows: Vec<f32> = (0..3 * vh * vd).map(|i| i as f32).collect();
+        let mut want = rows.clone();
+        qwen35_from_gguf(
+            &format!("{p}.linear_attn.out_proj.weight"),
+            &mut want,
+            &c(kh, vh),
+        );
+        let bytes: Vec<u8> = rows.iter().map(|&v| v as u8).collect();
+        let got: Vec<f32> = bytes
+            .chunks_exact(vh * vd)
+            .flat_map(|r| untile_packed_rows(r, vd, 1, kh, vh, 0))
+            .map(f32::from)
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// `GIBBS_DISABLE=qwen_packed`: identity `.linear_attn.` tensors and `out_proj` dequantize again.
+    #[test]
+    fn qwen_packed_disabled_restores_dequantize_predicate() {
+        let p = "model.layers.0.linear_attn";
+        let needs = |n: &str, permuted: bool| {
+            let legacy = crate::graph::disabled("qwen_packed");
+            qwen35_needs_transform(&format!("{p}.{n}"), 16, 16, permuted, legacy)
+        };
+        assert!(!needs("in_proj_z.weight", false) && !needs("out_proj.weight", false));
+        crate::graph::TEST_DISABLE.with(|d| d.set("views,qwen_packed"));
+        assert!(needs("in_proj_z.weight", false) && needs("out_proj.weight", false));
+        assert!(needs("dt_bias", false) && !needs("in_proj_qkv.weight", true));
     }
 
     /// HY-MT1.5-1.8B from its llama.cpp `hunyuan-dense` GGUF: the GGUF vocabulary (pre-tokenizer
