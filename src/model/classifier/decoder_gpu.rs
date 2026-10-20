@@ -222,8 +222,6 @@ pub(crate) mod tests {
             eprintln!("SKIPPED: no Metal device, seq-cls GPU parity not run");
             return None;
         }
-        // Strict f32 bar: every session this test thread builds uses f32 KV (f16 KV has its own tests).
-        crate::graph::metal::KV_F32_IN_TEST.set(true);
         let h = llm.hidden();
         llm.attach_score_gpu(score, labels).unwrap();
         let mut worst = 0.0f32;
