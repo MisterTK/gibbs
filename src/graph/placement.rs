@@ -65,10 +65,6 @@ pub fn device_supports_op(device: Device, op: &Op, dtype: DType) -> bool {
             #[cfg(not(target_os = "macos"))]
             false
         }
-        Device::Cuda => crate::graph::cuda::supports_op(op, dtype),
-        Device::Rocm => crate::graph::rocm::supports_op(op, dtype),
-        Device::LevelZero => crate::graph::level_zero::supports_op(op, dtype),
-        Device::Ane => false,
     }
 }
 

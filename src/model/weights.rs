@@ -870,7 +870,7 @@ mod tests {
         for r in 0..rows {
             for b in 0..2 {
                 let scale = 0.5f32 * (r as f32 + 1.0) * (b as f32 + 1.0);
-                let d_f16 = crate::graph::coreml::f32_to_f16(scale);
+                let d_f16 = crate::model::f32_to_f16(scale);
                 raw_bytes.extend(d_f16.to_le_bytes());
                 // 16 bytes of nibbles (32 values)
                 for i in 0..16 {

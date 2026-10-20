@@ -42,10 +42,6 @@ pub struct GraphLmConfig {
     pub use_gelu_mlp: bool,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
-    #[serde(default)]
-    pub use_hadamard_attention: bool,
-    #[serde(default)]
-    pub use_hadamard_mlp: bool,
     /// GLM-style RoPE: rotate adjacent pairs (2i, 2i+1) instead of LLaMA/NeoX halves (i, i + d/2).
     #[serde(default)]
     pub rope_interleaved: bool,
@@ -131,8 +127,6 @@ impl GraphLmConfig {
             use_standard_layernorm: false,
             use_gelu_mlp: false,
             rope_theta: 10000.0,
-            use_hadamard_attention: false,
-            use_hadamard_mlp: false,
             rope_interleaved: false,
             norm_eps: 1e-5,
             act_quant_bits: 0,
@@ -161,8 +155,6 @@ impl GraphLmConfig {
             use_standard_layernorm: false,
             use_gelu_mlp: false,
             rope_theta: 10000.0,
-            use_hadamard_attention: false,
-            use_hadamard_mlp: false,
             rope_interleaved: false,
             norm_eps: 1e-5,
             act_quant_bits: 0,
@@ -191,8 +183,6 @@ impl GraphLmConfig {
             use_standard_layernorm: false,
             use_gelu_mlp: false,
             rope_theta: 10000.0,
-            use_hadamard_attention: false,
-            use_hadamard_mlp: false,
             rope_interleaved: false,
             norm_eps: 1e-5,
             act_quant_bits: 0,
@@ -227,8 +217,6 @@ impl GraphLmConfig {
             use_standard_layernorm: false,
             use_gelu_mlp: false,
             rope_theta: 10000.0,
-            use_hadamard_attention: false,
-            use_hadamard_mlp: false,
             rope_interleaved: false,
             norm_eps: 1e-5,
             act_quant_bits: 0,
@@ -445,7 +433,6 @@ pub struct DecodeScratchpad {
     pub gate_up: Vec<f32>,
     pub down_out: Vec<f32>,
     pub final_normed: Vec<f32>,
-    pub hadamard_diag: Vec<f32>,
     pub rope_inv_freq: Vec<f32>,
     pub logits: Vec<f32>,
 }
@@ -472,7 +459,6 @@ impl DecodeScratchpad {
             gate_up: vec![0.0f32; 2 * intermediate_dim],
             down_out: vec![0.0f32; hidden_dim],
             final_normed: vec![0.0f32; hidden_dim],
-            hadamard_diag: vec![1.0f32; intermediate_dim],
             rope_inv_freq: Vec::new(),
             logits: vec![0.0f32; vocab_size],
         }
@@ -668,25 +654,6 @@ fn dequantize_layer(layer: &QuantizedLinearLayer) -> Vec<f32> {
             crate::quant::nvfp4::dequantize_nvfp4_tensor(tensor, &mut out);
             out
         }
-        crate::model::layers::QuantizedWeight::Exl3(tensor) => {
-            let mut out = vec![0.0f32; tensor.rows * tensor.cols];
-            crate::quant::exl3::dequantize_exl3_tensor(tensor, &mut out);
-            out
-        }
-        crate::model::layers::QuantizedWeight::WeightlessJesse(jesse) => {
-            let mut out = vec![0.0f32; layer.in_features * layer.out_features];
-            let mut unit = vec![0.0f32; layer.in_features];
-            let mut col = vec![0.0f32; layer.out_features];
-            for i in 0..layer.in_features {
-                unit[i] = 1.0;
-                jesse.forward(&unit, &mut col);
-                for o in 0..layer.out_features {
-                    out[o * layer.in_features + i] = col[o];
-                }
-                unit[i] = 0.0;
-            }
-            out
-        }
         crate::model::layers::QuantizedWeight::ZeroCopySlice {
             in_features,
             out_features,
@@ -714,15 +681,10 @@ fn dequantize_layer(layer: &QuantizedLinearLayer) -> Vec<f32> {
 }
 
 /// `layer` re-encoded as `want`, with its name and bias. Matrices that do not tile into `want`'s
-/// blocks (16 elements, EXL3's 32-element groups, or the GGUF block size along each row) stay f32.
+/// blocks (16 elements, or the GGUF block size along each row) stay f32.
 pub fn requantized(layer: &QuantizedLinearLayer, want: QuantFormat) -> QuantizedLinearLayer {
     let (in_f, out_f) = (layer.in_features, layer.out_features);
-    let row_block = match want {
-        QuantFormat::EXL3_3Bit | QuantFormat::EXL3_4Bit | QuantFormat::EXL3_5Bit => {
-            crate::quant::exl3::EXL3_GROUP_SIZE
-        }
-        _ => gguf_block_codec(want).map_or(16, |(n, _, _)| n),
-    };
+    let row_block = gguf_block_codec(want).map_or(16, |(n, _, _)| n);
     let format = if in_f % row_block == 0 && out_f % 16 == 0 {
         want
     } else {
@@ -743,16 +705,7 @@ pub fn projection_formats(mode: QuantMode) -> (QuantFormat, QuantFormat, QuantFo
         QuantMode::F16 => all(QuantFormat::FP16),
         QuantMode::BF16 => all(QuantFormat::BF16),
         QuantMode::Q8_0 => all(QuantFormat::GGUF_Q8_0),
-        QuantMode::NVFP4Ultra | QuantMode::TurboSqueeze => all(QuantFormat::NVFP4_E2M1),
-        QuantMode::EXL3Aggressive => all(QuantFormat::EXL3_3Bit),
-        QuantMode::EXL3Balanced => all(QuantFormat::EXL3_4Bit),
-        QuantMode::EXL3Quality => all(QuantFormat::EXL3_5Bit),
-        QuantMode::AdaptiveHybrid => (
-            QuantFormat::EXL3_4Bit,
-            QuantFormat::NVFP4_E2M1,
-            QuantFormat::EXL3_4Bit,
-        ),
-        QuantMode::WeightlessJesse => all(QuantFormat::WeightlessJesseLUT),
+        QuantMode::NVFP4Ultra => all(QuantFormat::NVFP4_E2M1),
     }
 }
 
@@ -1828,7 +1781,7 @@ impl GraphLm {
                         crate::model::bf16_to_f32(crate::model::f32_to_bf16(x))
                     }),
                     "F16" => ternarize(&mut w, |x| {
-                        crate::model::f16_to_f32(crate::graph::coreml::f32_to_f16(x))
+                        crate::model::f16_to_f32(crate::model::f32_to_f16(x))
                     }),
                     _ => ternarize(&mut w, |x| x),
                 }
@@ -3162,28 +3115,16 @@ impl GraphLm {
 
             for head in 0..heads_here {
                 let head_offset = head * head_dim;
-                if self.config.use_hadamard_attention && head_dim.is_power_of_two() {
-                    crate::quant::needle::hadamard_attention_f32(
-                        &pad.qkv[head_offset..head_offset + head_dim],
-                        &cache.k[head_offset..],
-                        &cache.v[head_offset..],
-                        head_dim,
-                        current_len,
-                        a,
-                        &mut pad.attn_out[head_offset..head_offset + head_dim],
-                    );
-                } else {
-                    crate::model::simd::vector_online_softmax_attention(
-                        &pad.qkv[head_offset..head_offset + head_dim],
-                        &cache.k[head_offset..],
-                        &cache.v[head_offset..],
-                        head_dim,
-                        current_len,
-                        a,
-                        scale_attn,
-                        &mut pad.attn_out[head_offset..head_offset + head_dim],
-                    );
-                }
+                crate::model::simd::vector_online_softmax_attention(
+                    &pad.qkv[head_offset..head_offset + head_dim],
+                    &cache.k[head_offset..],
+                    &cache.v[head_offset..],
+                    head_dim,
+                    current_len,
+                    a,
+                    scale_attn,
+                    &mut pad.attn_out[head_offset..head_offset + head_dim],
+                );
             }
 
             // 6. Out-projection
@@ -3247,14 +3188,7 @@ impl GraphLm {
                 }
             }
             // 8. SwiGLU / GELU MLP using vectorized SIMD primitives
-            if self.config.use_hadamard_mlp && inter.is_power_of_two() && inter <= h {
-                crate::quant::needle::hadamard_mlp_f32(
-                    &pad.norm2_x[..inter],
-                    &pad.hadamard_diag[..inter],
-                    &mut pad.mlp_inter[..inter],
-                );
-                layer.down_proj.forward(&pad.mlp_inter, &mut pad.down_out);
-            } else if self.config.use_gelu_mlp {
+            if self.config.use_gelu_mlp {
                 layer.gate_up_proj.forward(&pad.norm2_x, &mut pad.mlp_inter);
                 crate::model::simd::vector_gelu(&mut pad.mlp_inter);
                 layer.down_proj.forward(&pad.mlp_inter, &mut pad.down_out);
@@ -3964,16 +3898,6 @@ mod tests {
         let logits_nvfp4 = model.forward(&tokens);
         assert_eq!(logits_nvfp4.len(), model.config.vocab_size);
         assert!(logits_nvfp4.iter().all(|x| x.is_finite()));
-
-        model.quantize(QuantMode::EXL3Balanced);
-        let logits_exl3 = model.forward(&tokens);
-        assert_eq!(logits_exl3.len(), model.config.vocab_size);
-        assert!(logits_exl3.iter().all(|x| x.is_finite()));
-
-        model.quantize(QuantMode::AdaptiveHybrid);
-        let logits_hybrid = model.forward(&tokens);
-        assert_eq!(logits_hybrid.len(), model.config.vocab_size);
-        assert!(logits_hybrid.iter().all(|x| x.is_finite()));
     }
 
     #[test]
@@ -4044,23 +3968,6 @@ mod tests {
         assert_eq!(out_fast, out_compat);
     }
 
-    #[test]
-    fn test_hadamard_attention_and_weightless_in_graph_lm() {
-        let mut cfg = GraphLmConfig::smollm_1m();
-        cfg.use_hadamard_attention = true;
-        let model = GraphLm::new(cfg.clone());
-        let prompt = "The";
-        let out = model.generate_text_fast(prompt, 5, 0.0);
-        assert!(!out.is_empty());
-        assert!(out.starts_with(prompt));
-
-        // Quantize model to SolidSF Jesse weightless RAM lookup tables (zero FP multipliers)
-        let mut model_jesse = GraphLm::new(cfg);
-        model_jesse.quantize(QuantMode::WeightlessJesse);
-        let out_jesse = model_jesse.generate_text_fast(prompt, 5, 0.0);
-        assert!(!out_jesse.is_empty());
-        assert!(out_jesse.starts_with(prompt));
-    }
     #[test]
     fn test_generate_text_fast_timed() {
         let model = GraphLm::new(GraphLmConfig::smollm_1m());

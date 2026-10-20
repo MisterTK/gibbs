@@ -265,7 +265,6 @@ pub enum WeightFormat {
     Q2_K,
     IQ3_S,
     NvFp4,
-    JesseLUT,
     /// A format with no hand kernel: read through its [`codec::Codec`] by a generated GEMV.
     Gen(QuantFormat),
 }
@@ -282,7 +281,6 @@ impl WeightFormat {
             QuantFormat::GGUF_Q2_K => WeightFormat::Q2_K,
             QuantFormat::GGUF_IQ3_S => WeightFormat::IQ3_S,
             QuantFormat::NVFP4_E2M1 | QuantFormat::NVFP4 => WeightFormat::NvFp4,
-            QuantFormat::WeightlessJesseLUT => WeightFormat::JesseLUT,
             QuantFormat::BF16 => WeightFormat::BF16,
             QuantFormat::FP16 => WeightFormat::F16,
             f if codec::codec(f).is_some() => WeightFormat::Gen(f),
@@ -379,12 +377,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
             DType::F32 | DType::F16 | DType::BF16 => true,
             DType::Quant(f) => {
                 crate::graph::codec::codec(f).is_some()
-                    || matches!(
-                        f,
-                        QuantFormat::NVFP4_E2M1
-                            | QuantFormat::NVFP4
-                            | QuantFormat::WeightlessJesseLUT
-                    )
+                    || matches!(f, QuantFormat::NVFP4_E2M1 | QuantFormat::NVFP4)
             }
             DType::U32 => false,
         },
@@ -432,7 +425,6 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
                     | DType::Quant(QuantFormat::GGUF_Q2_K)
                     | DType::Quant(QuantFormat::GGUF_IQ3_S)
                     | DType::Quant(QuantFormat::NVFP4)
-                    | DType::Quant(QuantFormat::WeightlessJesseLUT)
             )
         }
         _ => false,
@@ -489,7 +481,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 81] = [
+const BASE_KERNELS: [&str; 80] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -570,7 +562,6 @@ const BASE_KERNELS: [&str; 81] = [
     "causal_conv1d_f32",
     "delta_rule_f32",
     "gemv_nvfp4",
-    "gemv_jesse_lut",
 ];
 const MPP_KERNELS: [&str; 3] = ["gemm_mpp_none", "gemm_mpp_gelu", "gemm_mpp_residual"];
 
@@ -1617,7 +1608,6 @@ pub struct Session {
     fed_tail: Mutex<Option<metal::CommandBuffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
-    jesse_aux: HashMap<String, (Buffer, usize)>,
     /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
     variant_override: Option<GemvVariant>,
     last_gpu_s: std::sync::atomic::AtomicU64,
@@ -1717,7 +1707,6 @@ impl Session {
         let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
         let mut bufs = HashMap::new();
         let mut nvfp4_aux = HashMap::new();
-        let mut jesse_aux = HashMap::new();
         for (name, t) in weights.iter() {
             if let Some(ref active) = active_names {
                 if !active.contains(name) {
@@ -1768,30 +1757,6 @@ impl Session {
                     bufs.insert(
                         name.to_string(),
                         (main_buf, 0, rows * cols, WeightFormat::NvFp4),
-                    );
-                    continue;
-                } else if let crate::model::layers::QuantizedWeight::WeightlessJesse(layer) =
-                    q.as_ref()
-                {
-                    let hash_buf = rt.device.new_buffer_with_data(
-                        layer.hash_planes.as_ptr() as *const c_void,
-                        (layer.hash_planes.len() * 4) as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-                    jesse_aux.insert(name.to_string(), (hash_buf, layer.address_bits));
-                    let main_buf = rt.device.new_buffer_with_data(
-                        layer.lut_tables.as_ptr() as *const c_void,
-                        layer.lut_tables.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-                    bufs.insert(
-                        name.to_string(),
-                        (
-                            main_buf,
-                            0,
-                            layer.out_features * layer.in_features,
-                            WeightFormat::JesseLUT,
-                        ),
                     );
                     continue;
                 }
@@ -2096,8 +2061,6 @@ impl Session {
                                 Some(format!("{format:?}"))
                             }
                             Q::Nvfp4(_) => Some("NVFP4".to_string()),
-                            Q::Exl3(_) => Some("EXL3".to_string()),
-                            Q::WeightlessJesse(_) => Some("Jesse".to_string()),
                             Q::Uncompressed { .. } => None,
                         };
                         if let Some(fmt_name) = fmt_name {
@@ -2270,7 +2233,6 @@ impl Session {
             fed_tail: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
-            jesse_aux,
             variant_override: None,
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
             kv_f16: kv_f16_default(),
@@ -2473,7 +2435,6 @@ impl Session {
                         DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
                         DType::Quant(QuantFormat::NVFP4_E2M1)
                         | DType::Quant(QuantFormat::NVFP4) => WeightFormat::NvFp4,
-                        DType::Quant(QuantFormat::WeightlessJesseLUT) => WeightFormat::JesseLUT,
                         DType::Quant(f) if crate::graph::codec::codec(f).is_some() => {
                             WeightFormat::Gen(f)
                         }
@@ -3297,7 +3258,6 @@ impl Session {
             | WeightFormat::Q2_K
             | WeightFormat::IQ3_S
             | WeightFormat::NvFp4
-            | WeightFormat::JesseLUT
             | WeightFormat::Gen(_) => {
                 if format == WeightFormat::NvFp4 {
                     let (scales_buf, global_scale) = self
@@ -3324,25 +3284,6 @@ impl Session {
                     enc.dispatch_thread_groups(
                         MTLSize::new((rows as u64).div_ceil(16), 1, 1),
                         MTLSize::new(256, 1, 1),
-                    );
-                    return Ok(());
-                }
-                if format == WeightFormat::JesseLUT {
-                    let (hash_buf, address_bits) =
-                        self.jesse_aux.get(graph_val_name).ok_or_else(|| {
-                            format!("missing JesseLUT hash planes for '{graph_val_name}'")
-                        })?;
-                    enc.set_compute_pipeline_state(self.rt.pso("gemv_jesse_lut")?);
-                    enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
-                    enc.set_buffer(1, Some(hash_buf), 0);
-                    enc.set_buffer(2, Some(x.0), x.1 as u64);
-                    enc.set_buffer(3, Some(out.0), out.1 as u64);
-                    set_bytes(enc, 4, &u32_of(cols)?);
-                    set_bytes(enc, 5, &u32_of(rows)?);
-                    set_bytes(enc, 6, &(*address_bits as u32));
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(32), 1, 1),
-                        MTLSize::new(32, 1, 1),
                     );
                     return Ok(());
                 }
@@ -3601,29 +3542,6 @@ impl Session {
                         MTLSize::new((rows as u64).div_ceil(16), m as u64, 1),
                         MTLSize::new(256, 1, 1),
                     );
-                    return Ok(());
-                }
-                if format == WeightFormat::JesseLUT {
-                    let (hash_buf, address_bits) =
-                        self.jesse_aux.get(weight_name).ok_or_else(|| {
-                            format!("missing JesseLUT hash planes for '{weight_name}'")
-                        })?;
-                    enc.set_compute_pipeline_state(rt.pso("gemv_jesse_lut")?);
-                    let (x_buf, x_off) = loc(x);
-                    let (out_buf, out_off) = loc(s.out);
-                    for row_idx in 0..m {
-                        bind(0, w);
-                        enc.set_buffer(1, Some(hash_buf), 0);
-                        enc.set_buffer(2, Some(x_buf), (x_off + row_idx * cols * 4) as u64);
-                        enc.set_buffer(3, Some(out_buf), (out_off + row_idx * rows * 4) as u64);
-                        set_bytes(enc, 4, &u32_of(cols)?);
-                        set_bytes(enc, 5, &u32_of(rows)?);
-                        set_bytes(enc, 6, &(*address_bits as u32));
-                        enc.dispatch_thread_groups(
-                            MTLSize::new((rows as u64).div_ceil(32), 1, 1),
-                            MTLSize::new(32, 1, 1),
-                        );
-                    }
                     return Ok(());
                 }
                 let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
@@ -5381,7 +5299,6 @@ fn linear_format(g: &Graph, w: ValueId) -> Option<WeightFormat> {
         DType::Quant(QuantFormat::NVFP4_E2M1) | DType::Quant(QuantFormat::NVFP4) => {
             WeightFormat::NvFp4
         }
-        DType::Quant(QuantFormat::WeightlessJesseLUT) => WeightFormat::JesseLUT,
         DType::Quant(f) if crate::graph::codec::codec(f).is_some() => WeightFormat::Gen(f),
         DType::BF16 => WeightFormat::BF16,
         DType::F16 => WeightFormat::F16,
@@ -6305,7 +6222,6 @@ fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
         WeightFormat::Q2_K => n / 256 * 84,
         WeightFormat::IQ3_S => n / 256 * 110,
         WeightFormat::NvFp4 => n / 2 + n / 16,
-        WeightFormat::JesseLUT => n,
         WeightFormat::Gen(f) => crate::graph::codec::codec(f).map_or(n * 4, |c| {
             n / c.block_elems as usize * c.block_bytes as usize
         }),
@@ -7269,7 +7185,7 @@ mod tests {
             let scale = 1.0 / (cols as f32).sqrt();
             let data: Vec<u16> = rand(rows * cols, seed)
                 .into_iter()
-                .map(|v| crate::graph::coreml::f32_to_f16(v * scale))
+                .map(|v| crate::model::f32_to_f16(v * scale))
                 .collect();
             w.insert(name.to_string(), Tensor::F16(data));
             g.weight(name, vec![rows, cols], DType::F16)
@@ -8737,76 +8653,6 @@ mod tests {
     }
 
     #[test]
-    fn gemv_jesse_lut_matches_cpu() {
-        if metal::Device::system_default().is_none() {
-            return;
-        }
-        let rt = rt();
-        let (in_f, out_f, addr_bits) = (32usize, 16usize, 6usize);
-        let layer = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
-            "test_jesse",
-            in_f,
-            out_f,
-            addr_bits,
-            &rand(in_f * out_f, 55),
-        );
-        let x_data = rand(in_f, 99);
-        let mut expected = vec![0.0f32; out_f];
-        layer.forward(&x_data, &mut expected);
-
-        let lut_buf = new_shared_buffer(&rt.device, layer.lut_tables.len()).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                layer.lut_tables.as_ptr() as *const u8,
-                lut_buf.contents() as *mut u8,
-                layer.lut_tables.len(),
-            )
-        };
-
-        let hash_buf = new_shared_buffer(&rt.device, layer.hash_planes.len() * 4).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                layer.hash_planes.as_ptr(),
-                hash_buf.contents() as *mut f32,
-                layer.hash_planes.len(),
-            )
-        };
-
-        let x_buf = new_shared_buffer(&rt.device, in_f * 4).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(x_data.as_ptr(), x_buf.contents() as *mut f32, in_f)
-        };
-
-        let y_buf = new_shared_buffer(&rt.device, out_f * 4).unwrap();
-
-        metal::objc::rc::autoreleasepool(|| {
-            let cb = rt.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(rt.pso("gemv_jesse_lut").unwrap());
-            enc.set_buffer(0, Some(&lut_buf), 0);
-            enc.set_buffer(1, Some(&hash_buf), 0);
-            enc.set_buffer(2, Some(&x_buf), 0);
-            enc.set_buffer(3, Some(&y_buf), 0);
-            set_bytes(enc, 4, &(in_f as u32));
-            set_bytes(enc, 5, &(out_f as u32));
-            set_bytes(enc, 6, &(addr_bits as u32));
-
-            enc.dispatch_thread_groups(
-                MTLSize::new((out_f as u64).div_ceil(32), 1, 1),
-                MTLSize::new(32, 1, 1),
-            );
-            enc.end_encoding();
-            commit_and_wait(cb).unwrap();
-        });
-
-        let mut got = vec![0.0f32; out_f];
-        unsafe {
-            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, got.as_mut_ptr(), out_f)
-        };
-
-        assert_eq!(expected, got);
-    }
-    #[test]
     fn test_graph_nvfp4_matches_cpu() {
         if metal::Device::system_default().is_none() {
             return;
@@ -8920,118 +8766,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_graph_jesse_lut_matches_cpu() {
-        if metal::Device::system_default().is_none() {
-            return;
-        }
-        let (in_f, out_f, addr_bits) = (32usize, 16usize, 6usize);
-        let weights = rand(in_f * out_f, 789);
-        let layer = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
-            "test_jesse",
-            in_f,
-            out_f,
-            addr_bits,
-            &weights,
-        );
-
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, in_f], DType::F32);
-        let w = g.weight(
-            "w",
-            vec![out_f, in_f],
-            DType::Quant(crate::hardware::QuantFormat::WeightlessJesseLUT),
-        );
-        let y = g.add("lin", Op::Linear, &[x, w], vec![1, out_f], DType::F32);
-        g.output(y);
-
-        let mut weights_store = Weights::new();
-        weights_store.insert(
-            "w",
-            Tensor::Quantized(Arc::new(
-                crate::model::layers::QuantizedWeight::WeightlessJesse(layer),
-            )),
-        );
-
-        let input_data = rand(in_f, 101);
-        let inputs = vec![Tensor::F32(input_data)];
-
-        let mut cpu_state = crate::graph::StateStore::new();
-        let cpu_res = crate::graph::cpu::run(&g, &weights_store, &mut cpu_state, inputs.clone())
-            .expect("CPU run");
-        let cpu_y = cpu_res[0].as_f32().unwrap();
-
-        let session = Session::new(rt(), &weights_store).expect("Metal Session creation");
-        let metal_res = session.run(&g, inputs).expect("Metal run");
-        let metal_y = metal_res[0].as_f32().unwrap();
-
-        assert_eq!(cpu_y.len(), metal_y.len());
-        for (r, (&c, &m)) in cpu_y.iter().zip(metal_y).enumerate() {
-            assert!((c - m).abs() < 1e-3, "row {r}: CPU {c} vs Metal {m}");
-        }
-    }
-    #[test]
-    fn test_graph_jesse_lut_batch_and_residual_matches_cpu() {
-        if metal::Device::system_default().is_none() {
-            return;
-        }
-        let (m, in_f, out_f, addr_bits) = (4usize, 32usize, 16usize, 6usize);
-        let weights = rand(in_f * out_f, 789);
-        let layer = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
-            "test_jesse_batch",
-            in_f,
-            out_f,
-            addr_bits,
-            &weights,
-        );
-
-        let mut g = Graph::new();
-        let x = g.input("x", vec![m, in_f], DType::F32);
-        let res_in = g.input("res", vec![m, out_f], DType::F32);
-        let w = g.weight(
-            "w",
-            vec![out_f, in_f],
-            DType::Quant(crate::hardware::QuantFormat::WeightlessJesseLUT),
-        );
-        let y_lin = g.add("lin", Op::Linear, &[x, w], vec![m, out_f], DType::F32);
-        let y = g.add(
-            "res_add",
-            Op::Add,
-            &[y_lin, res_in],
-            vec![m, out_f],
-            DType::F32,
-        );
-        g.output(y);
-
-        let mut weights_store = Weights::new();
-        weights_store.insert(
-            "w",
-            Tensor::Quantized(Arc::new(
-                crate::model::layers::QuantizedWeight::WeightlessJesse(layer),
-            )),
-        );
-
-        let input_x = rand(m * in_f, 101);
-        let input_res = rand(m * out_f, 202);
-        let inputs = vec![Tensor::F32(input_x), Tensor::F32(input_res)];
-
-        let mut cpu_state = crate::graph::StateStore::new();
-        let cpu_res = crate::graph::cpu::run(&g, &weights_store, &mut cpu_state, inputs.clone())
-            .expect("CPU run");
-        let cpu_y = cpu_res[0].as_f32().unwrap();
-
-        let session = Session::new(rt(), &weights_store).expect("Metal Session creation");
-        let metal_res = session.run(&g, inputs).expect("Metal run");
-        let metal_y = metal_res[0].as_f32().unwrap();
-
-        assert_eq!(cpu_y.len(), metal_y.len());
-        for (r, (&c, &m_val)) in cpu_y.iter().zip(metal_y).enumerate() {
-            assert!(
-                (c - m_val).abs() < 1e-3,
-                "idx {r}: CPU {c} vs Metal {m_val}"
-            );
-        }
-    }
 
     #[test]
     fn gemv_bf16_matches_cpu() {
@@ -11221,7 +10955,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
 
         let to_f16 = |vals: Vec<f32>| -> Vec<u16> {
             vals.into_iter()
-                .map(|v| crate::graph::coreml::f32_to_f16(v * 0.2))
+                .map(|v| crate::model::f32_to_f16(v * 0.2))
                 .collect()
         };
         let mut w = Weights::new();

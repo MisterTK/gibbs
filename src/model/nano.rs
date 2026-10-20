@@ -312,17 +312,5 @@ mod tests {
         assert_eq!(model.quant_mode, QuantMode::NVFP4Ultra);
         let t_nvfp4 = model.forward_token(42, 0);
         assert!(t_nvfp4 < 256);
-
-        // Quantize to EXL3
-        model.quantize_model(QuantMode::EXL3Balanced);
-        assert_eq!(model.quant_mode, QuantMode::EXL3Balanced);
-        let t_exl3 = model.forward_token(42, 0);
-        assert!(t_exl3 < 256);
-
-        // Quantize to AdaptiveHybrid
-        model.quantize_model(QuantMode::AdaptiveHybrid);
-        assert_eq!(model.quant_mode, QuantMode::AdaptiveHybrid);
-        let t_hybrid = model.forward_token(42, 0);
-        assert!(t_hybrid < 256);
     }
 }

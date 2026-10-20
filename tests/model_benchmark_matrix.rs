@@ -1,8 +1,7 @@
 //! Special Model Evaluation & Comparative Benchmark Suite
 //!
 //! Evaluates all models against 10 dynamically generated random prompts across
-//! ALL 8 QuantMode configurations (Uncompressed, NVFP4Ultra, EXL3Aggressive,
-//! EXL3Balanced, EXL3Quality, AdaptiveHybrid, TurboSqueeze, WeightlessJesse).
+//! every QuantMode configuration (Uncompressed, F16, BF16, Q8_0, NVFP4Ultra).
 //!
 //! Marked `#[ignore]` so it is NOT run alongside unit tests.
 //! Run with: `cargo test --release --test model_benchmark_matrix -- --nocapture --ignored`
@@ -73,18 +72,12 @@ impl DynamicPromptGenerator {
     }
 }
 
-const ALL_QUANT_MODES: [QuantMode; 11] = [
+const ALL_QUANT_MODES: [QuantMode; 5] = [
     QuantMode::Uncompressed,
     QuantMode::F16,
     QuantMode::BF16,
     QuantMode::Q8_0,
     QuantMode::NVFP4Ultra,
-    QuantMode::EXL3Aggressive,
-    QuantMode::EXL3Balanced,
-    QuantMode::EXL3Quality,
-    QuantMode::AdaptiveHybrid,
-    QuantMode::TurboSqueeze,
-    QuantMode::WeightlessJesse,
 ];
 
 fn quant_mode_name(mode: QuantMode) -> &'static str {
@@ -94,12 +87,6 @@ fn quant_mode_name(mode: QuantMode) -> &'static str {
         QuantMode::BF16 => "BF16",
         QuantMode::Q8_0 => "Q8_0 (8.5b)",
         QuantMode::NVFP4Ultra => "NVFP4Ultra (E2M1)",
-        QuantMode::EXL3Aggressive => "EXL3Aggressive (3-bit)",
-        QuantMode::EXL3Balanced => "EXL3Balanced (4-bit)",
-        QuantMode::EXL3Quality => "EXL3Quality (5-bit)",
-        QuantMode::AdaptiveHybrid => "AdaptiveHybrid (3.85b)",
-        QuantMode::TurboSqueeze => "TurboSqueeze (3.5b)",
-        QuantMode::WeightlessJesse => "WeightlessJesse (LUT)",
     }
 }
 

@@ -123,7 +123,7 @@ pub struct BertDims {
     pub layer_norm_eps: f32,
 }
 
-/// A post-LN BERT encoder graph on the CPU, Metal, or Core ML (ANE). System 1 mean-pools it into
+/// A post-LN BERT encoder graph on the CPU or Metal. System 1 mean-pools it into
 /// sentence embeddings; the sequence classifiers read its last hidden states.
 pub struct BertEncoder {
     pub dims: BertDims,
@@ -140,12 +140,10 @@ enum Executor {
     Cpu,
     #[cfg(target_os = "macos")]
     Metal(crate::graph::metal::Session),
-    #[cfg(target_os = "macos")]
-    CoreMl(std::sync::Mutex<crate::graph::coreml::Session>),
 }
 
 impl BertEncoder {
-    /// Builds the encoder on `device` (CPU, or Metal/ANE on macOS; anything else is an error).
+    /// Builds the encoder on `device` (CPU, or Metal on macOS; anything else is an error).
     /// `tensor(name, shape)` returns each tensor under its BERT name.
     pub fn load(
         dims: BertDims,
@@ -232,18 +230,7 @@ impl BertEncoder {
                 let rt = crate::graph::metal::Runtime::shared()?;
                 Executor::Metal(crate::graph::metal::Session::new(rt, &weights)?)
             }
-            #[cfg(target_os = "macos")]
-            Device::Ane => {
-                let cache_dir = crate::hardware::default_cache_dir()?;
-                let session = crate::graph::coreml::Session::new(
-                    &cache_dir,
-                    &weights,
-                    h,
-                    dims.num_layers,
-                    dims.num_heads,
-                )?;
-                Executor::CoreMl(std::sync::Mutex::new(session))
-            }
+            #[cfg(not(target_os = "macos"))]
             d => return Err(format!("the BERT encoder has no {d} executor")),
         };
         Ok(Self {
@@ -260,19 +247,15 @@ impl BertEncoder {
             Executor::Cpu => Device::Cpu,
             #[cfg(target_os = "macos")]
             Executor::Metal(_) => Device::Metal,
-            #[cfg(target_os = "macos")]
-            Executor::CoreMl(_) => Device::Ane,
         }
     }
 
-    /// Load summary for hardware runtimes (Metal, Core ML ANE); `None` on the CPU.
+    /// Load summary for the Metal runtime; `None` on the CPU.
     pub fn executor_report(&self) -> Option<String> {
         match &self.executor {
             Executor::Cpu => None,
             #[cfg(target_os = "macos")]
             Executor::Metal(s) => Some(s.runtime().report.clone()),
-            #[cfg(target_os = "macos")]
-            Executor::CoreMl(s) => Some(s.lock().ok()?.report.clone()),
         }
     }
 
@@ -473,106 +456,7 @@ impl BertEncoder {
                     .ok_or_else(|| "encoder graph produced no output".to_string())?
                     .into_f32()
             }
-            #[cfg(target_os = "macos")]
-            Executor::CoreMl(s) => {
-                if head {
-                    return Err("the Core ML encoder has no classification head".into());
-                }
-                let emb = Self::initial_embeddings(
-                    &self.weights,
-                    ids,
-                    positions,
-                    types,
-                    self.dims.layer_norm_eps,
-                    self.dims.hidden_size,
-                )?;
-                let mut session = s.lock().map_err(|e| e.to_string())?;
-                let out = session.run_encoder(&emb, n)?;
-                if !pooled {
-                    return Ok(out);
-                }
-                Ok(Self::mean_pool_and_normalize(
-                    &out,
-                    &vec![1.0; n],
-                    self.dims.hidden_size,
-                ))
-            }
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn initial_embeddings(
-        weights: &Weights,
-        ids: &[u32],
-        pos: &[u32],
-        types: &[u32],
-        eps: f32,
-        h: usize,
-    ) -> Result<Vec<f32>, String> {
-        let n = ids.len();
-        let w_emb = weights
-            .get("embeddings.word_embeddings.weight")
-            .ok_or("missing word embeddings")?
-            .as_f32()?;
-        let p_emb = weights
-            .get("embeddings.position_embeddings.weight")
-            .ok_or("missing position embeddings")?
-            .as_f32()?;
-        let t_emb = weights
-            .get("embeddings.token_type_embeddings.weight")
-            .ok_or("missing token type embeddings")?
-            .as_f32()?;
-        let ln_w = weights
-            .get("embeddings.LayerNorm.weight")
-            .ok_or("missing embeddings.LayerNorm.weight")?
-            .as_f32()?;
-        let ln_b = weights
-            .get("embeddings.LayerNorm.bias")
-            .ok_or("missing embeddings.LayerNorm.bias")?
-            .as_f32()?;
-
-        let mut x = vec![0.0f32; n * h];
-        for i in 0..n {
-            let wid = ids[i] as usize;
-            let pid = pos[i] as usize;
-            let tid = types[i] as usize;
-            for c in 0..h {
-                x[i * h + c] = w_emb[wid * h + c] + p_emb[pid * h + c] + t_emb[tid * h + c];
-            }
-            let token = &mut x[i * h..(i + 1) * h];
-            let mean = token.iter().sum::<f32>() / h as f32;
-            let var = token.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / h as f32;
-            let inv = 1.0 / (var + eps).sqrt();
-            for c in 0..h {
-                token[c] = (token[c] - mean) * inv * ln_w[c] + ln_b[c];
-            }
-        }
-        Ok(x)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn mean_pool_and_normalize(out: &[f32], mask: &[f32], h: usize) -> Vec<f32> {
-        let n = mask.len();
-        let mut sum = vec![0.0f32; h];
-        let mut count = 0.0f32;
-        for i in 0..n {
-            if mask[i] > 0.0 {
-                count += 1.0;
-                for c in 0..h {
-                    sum[c] += out[i * h + c];
-                }
-            }
-        }
-        let inv_count = if count > 0.0 { 1.0 / count } else { 1.0 };
-        for c in 0..h {
-            sum[c] *= inv_count;
-        }
-        let norm = sum.iter().map(|v| v * v).sum::<f32>().sqrt();
-        let inv_norm = if norm > 0.0 { 1.0 / norm } else { 1.0 };
-        for c in 0..h {
-            sum[c] *= inv_norm;
-        }
-        sum
     }
 }
 
@@ -676,7 +560,7 @@ pub struct JevSystem1Model {
 }
 impl JevSystem1Model {
     /// Fetches config.json, tokenizer.json and model.safetensors from `repo_id` and builds the
-    /// encoder on `device` (CPU, or Metal/ANE on macOS; anything else is an error).
+    /// encoder on `device` (CPU, or Metal on macOS; anything else is an error).
     pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
         let config_path = hub.fetch_file(repo_id, "config.json")?;
         let tok_path = hub.fetch_file(repo_id, "tokenizer.json")?;
@@ -1137,95 +1021,13 @@ mod tests {
         }
     }
 
-    /// P2 gate: on Core ML / ANE the real encoder matches the CPU (cosine >= 0.999 on edge texts)
-    /// and every decision on a fixed set picks the same answer.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn coreml_matches_cpu_embeddings_and_decisions() {
-        let (Some(cpu), Some(ane)) = (cached_minilm(Device::Cpu), cached_minilm(Device::Ane))
-        else {
-            return;
-        };
-        assert_eq!(ane.bert().unwrap().device(), Device::Ane);
-        let report = ane.bert().unwrap().executor_report().unwrap();
-        assert!(report.contains("Core ML ANE:"), "report: {report}");
-        assert!(report.contains("Neural Engine"), "report: {report}");
-        let mut min_cos = 1.0f32;
-        for t in edge_texts() {
-            let (a, b) = (cpu.embed(&t).unwrap(), ane.embed(&t).unwrap());
-            let cos = dot(&a, &b) / (dot(&a, &a) * dot(&b, &b)).sqrt();
-            assert!(cos >= 0.999, "{t:?}: cosine {cos}");
-            if cos < min_cos {
-                min_cos = cos;
-            }
-        }
-        let questions = [
-            JevQuestion::Bool {
-                id: "delete".into(),
-                instructions: String::new(),
-                criteria_true: Some("the user wants their account and data deleted".into()),
-                criteria_false: Some("the user wants to keep their account and data".into()),
-            },
-            JevQuestion::Choice {
-                id: "topic".into(),
-                instructions: String::new(),
-                options: ["billing", "privacy", "bug", "shipping"]
-                    .map(|l| ChoiceOption::new(l, None::<&str>))
-                    .to_vec(),
-            },
-        ];
-        let mut max_dp = 0.0f32;
-        for state in [
-            "Please remove my account and all my data permanently.",
-            "I was charged twice for my subscription this month.",
-            "The app crashes when I open the settings page.",
-            "Where is my package? It has not arrived yet.",
-            "",
-        ] {
-            let (a, b) = (
-                cpu.batch_evaluate(state, &questions).unwrap(),
-                ane.batch_evaluate(state, &questions).unwrap(),
-            );
-            for ((id, x), (_, y)) in a.iter().zip(&b) {
-                match (x.as_ref().unwrap(), y.as_ref().unwrap()) {
-                    (
-                        JevDecision::Bool {
-                            bool_prob: p,
-                            decision: d,
-                        },
-                        JevDecision::Bool {
-                            bool_prob: q,
-                            decision: e,
-                        },
-                    ) => {
-                        assert_eq!(d, e, "{state:?} {id}");
-                        let dp = (p - q).abs();
-                        assert!(dp < 1e-2, "{state:?} {id}: {p} vs {q}");
-                        if dp > max_dp {
-                            max_dp = dp;
-                        }
-                    }
-                    (
-                        JevDecision::Choice { selected: s, .. },
-                        JevDecision::Choice { selected: t, .. },
-                    ) => {
-                        assert_eq!(s, t, "{state:?} {id}")
-                    }
-                    other => panic!("{state:?} {id}: decision kinds differ: {other:?}"),
-                }
-            }
-        }
-        let s = format!("min_cosine={min_cos:.6} max_bool_prob_diff={max_dp:.6}\n");
-        let _ = std::fs::write("/tmp/gibbs-p2/accuracy.log", s);
-    }
-
     #[test]
     fn llm_acts_as_system1_model() {
         use crate::model::graph_lm::{GraphLm, GraphLmConfig};
         use crate::scheduler::ExecutableModel;
-        use std::sync::Arc;
 
-        let llm = ExecutableModel::from(Arc::new(GraphLm::new(GraphLmConfig::smollm_1m())));
+        let llm = ExecutableModel::load_graph_lm(GraphLm::new(GraphLmConfig::smollm_1m()), crate::hardware::Device::Cpu)
+            .unwrap();
         let s1 = JevSystem1Model::from_llm("foundry/smollm-1m", llm);
         assert!(s1.is_llm());
         assert!(s1.token_count("reactor overheating").unwrap() >= 1);

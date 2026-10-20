@@ -40,7 +40,7 @@ async fn media_for_a_text_only_model_is_a_400() {
         scheduler: Arc::new(ContinuousBatchScheduler::new(
             "tiny",
             Arc::new(PagedKVPool::new(64)),
-            Some(ExecutableModel::from(model)),
+            Some(ExecutableModel::load_graph_lm(model, gibbs_engine::hardware::Device::Cpu).unwrap()),
         )),
         telemetry: EngineTelemetry::new(),
         jev_model: Default::default(),
@@ -99,7 +99,7 @@ async fn qwen_tool_calls_in_every_schema() {
     let sched = Arc::new(ContinuousBatchScheduler::new(
         "Qwen/Qwen2.5-0.5B-Instruct",
         Arc::new(PagedKVPool::new(1024)),
-        Some(ExecutableModel::from(model)),
+        Some(ExecutableModel::load_graph_lm(model, gibbs_engine::hardware::Device::Cpu).unwrap()),
     ));
     let stop = Arc::new(AtomicBool::new(false));
     let engine = {

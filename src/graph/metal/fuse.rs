@@ -8,7 +8,7 @@
 //! before the claiming node, so at most one rule claims any node: extraction takes every match.
 
 use super::{
-    fusion_policy, linear_format, numel, Epi, FusionClass, Planned, Step, WeightFormat,
+    fusion_policy, linear_format, numel, Epi, FusionClass, Planned, Step,
     ATTN_MAX_HEAD_DIM,
 };
 use crate::graph::{DType, Graph, Op, RopeVariant, ValueId, ValueKind};
@@ -226,7 +226,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                         continue;
                     };
                     let format = linear_format(g, w);
-                    if k == 0 || format == Some(WeightFormat::JesseLUT) {
+                    if k == 0 {
                         continue;
                     }
                     let m = xl / k;

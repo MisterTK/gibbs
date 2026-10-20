@@ -3481,7 +3481,8 @@ mod tests {
         use crate::model::graph_lm::{GraphLm, GraphLmConfig};
 
         let kv = Arc::new(PagedKVPool::new(64));
-        let llm = ExecutableModel::from(Arc::new(GraphLm::new(GraphLmConfig::smollm_1m())));
+        let llm = ExecutableModel::load_graph_lm(GraphLm::new(GraphLmConfig::smollm_1m()), crate::hardware::Device::Cpu)
+            .unwrap();
         let sched = Arc::new(ContinuousBatchScheduler::new(
             "foundry/smollm-1m",
             kv.clone(),

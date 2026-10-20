@@ -108,19 +108,13 @@ const PROBE_TEXT: &str = "The engine measures each weight format on this machine
     the model. It keeps the fastest format whose predictions stay close to full precision, because \
     a format that is fast but wrong does not help anyone who reads the answers it writes.";
 
-/// CPU weight formats, most exact first. TurboSqueeze stores the same NVFP4 weights as
-/// NVFP4Ultra, so it is not a separate candidate.
+/// CPU weight formats, most exact first.
 const CPU_CANDIDATES: &[QuantMode] = &[
     QuantMode::Uncompressed,
     QuantMode::F16,
     QuantMode::BF16,
     QuantMode::Q8_0,
-    QuantMode::EXL3Quality,
-    QuantMode::EXL3Balanced,
-    QuantMode::AdaptiveHybrid,
     QuantMode::NVFP4Ultra,
-    QuantMode::EXL3Aggressive,
-    QuantMode::WeightlessJesse,
 ];
 
 /// Weight formats `backend` has LLM kernels for; the first is the f32 reference.
@@ -306,10 +300,7 @@ pub fn load_causal_lm_with(
     reencode: &ReencodeConfig,
 ) -> Result<(GraphLm, Choice), String> {
     if let Some(mode) = quant_override {
-        // TurboSqueeze stores NVFP4Ultra's weights, so it is not a separate CPU candidate.
-        let supported = candidates(backend).contains(&mode)
-            || (backend == Device::Cpu && mode == QuantMode::TurboSqueeze);
-        if !supported {
+        if !candidates(backend).contains(&mode) {
             return Err(format!(
                 "--quant {mode:?}: {backend} LLM kernels read {:?} weights only",
                 candidates(backend)
@@ -1360,7 +1351,7 @@ mod tests {
                 "{mode:?}: mean KL {k} should pass the gate"
             );
         }
-        for mode in [QuantMode::NVFP4Ultra, QuantMode::WeightlessJesse] {
+        for mode in [QuantMode::NVFP4Ultra] {
             let k = kl(mode);
             eprintln!("{mode:?}: mean KL {k:.6}");
             assert!(

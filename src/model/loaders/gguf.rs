@@ -921,8 +921,7 @@ mod tests {
         b
     }
 
-    /// Both GGUF readers decode `raw` of ggml type `ty` to `want`, and the f32 matrix path does not
-    /// hand the bytes out as a zero-copy slice.
+    /// Both GGUF readers decode `raw` of ggml type `ty` to `want`.
     fn assert_decodes(ty: u32, ne: &[u64], raw: &[u8], want: &[f32]) {
         let b = typed_gguf(ty, ne, raw);
         let loader = crate::model::UniversalModelLoader::from_bytes(&b).unwrap();
@@ -937,17 +936,6 @@ mod tests {
                 .load_tensor("t")
                 .unwrap(),
             want
-        );
-        let q = loader
-            .manifest
-            .extract_tensor_as_quantized(&b, "t", QuantFormat::FP32)
-            .unwrap();
-        assert!(
-            !matches!(
-                q,
-                crate::model::layers::QuantizedWeight::ZeroCopySlice { .. }
-            ),
-            "type {ty}"
         );
     }
 

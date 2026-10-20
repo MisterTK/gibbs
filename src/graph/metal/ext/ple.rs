@@ -70,7 +70,7 @@ pub(in super::super) fn codec_of(f: QuantFormat) -> Option<&'static Codec> {
 }
 
 /// Codec of an m = 1 `GemvPacked` whose `cols` are whole blocks of it (NVFP4 keeps its scales in
-/// a side buffer, JesseLUT in hash planes: neither is a `decode8` layout).
+/// a side buffer: not a `decode8` layout).
 fn gemv_codec(st: &Core, cols: usize) -> Option<&'static Codec> {
     let Core::GemvPacked { format, .. } = st else {
         return None;
@@ -78,7 +78,7 @@ fn gemv_codec(st: &Core, cols: usize) -> Option<&'static Codec> {
     let f = match format {
         WeightFormat::BF16 => QuantFormat::BF16,
         WeightFormat::F16 => QuantFormat::FP16,
-        WeightFormat::NvFp4 | WeightFormat::JesseLUT => return None,
+        WeightFormat::NvFp4 => return None,
         fmt => fmt.codec_format()?,
     };
     codec_of(f).filter(|c| cols % c.block_elems as usize == 0)

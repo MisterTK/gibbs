@@ -23,7 +23,6 @@ const MEGAKERNEL_QUANT: &[crate::hardware::QuantFormat] = &[
     crate::hardware::QuantFormat::GGUF_Q2_K,
     crate::hardware::QuantFormat::GGUF_IQ3_S,
     crate::hardware::QuantFormat::NVFP4,
-    crate::hardware::QuantFormat::WeightlessJesseLUT,
 ];
 
 pub(crate) fn fusible_weight(graph: &Graph, w: crate::graph::ValueId) -> bool {

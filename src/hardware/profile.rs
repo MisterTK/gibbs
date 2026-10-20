@@ -1,7 +1,6 @@
 //! Dynamic hardware analyzer and hardware profile representation.
 //!
-//! Inspects the host machine dynamically at startup across Apple Metal, Apple Neural Engine (ANE),
-//! NVIDIA CUDA, AMD ROCm, and multi-core CPU. Guides megakernel JIT compilation, tile sizing,
+//! Inspects the host machine dynamically at startup across Apple Metal and multi-core CPU. Guides megakernel JIT compilation, tile sizing,
 //! and device placement.
 
 use crate::hardware::{Device, HardwareCapability};
@@ -35,10 +34,7 @@ impl HardwareProfile {
     pub fn for_device(device: Device) -> Self {
         match device {
             Device::Metal => Self::detect_metal(),
-            Device::Ane => Self::detect_ane(),
-            Device::Cuda => Self::detect_cuda(),
-            Device::Rocm => Self::detect_rocm(),
-            Device::Cpu | Device::LevelZero => Self::detect_cpu(),
+            Device::Cpu => Self::detect_cpu(),
         }
     }
 
@@ -100,82 +96,6 @@ impl HardwareProfile {
             vector_width_bits: 128,
             compute_units: 16,
             has_unified_memory: true,
-            compute_capability: None,
-            max_systolic_tile: None,
-        }
-    }
-
-    fn detect_ane() -> Self {
-        #[cfg(target_os = "macos")]
-        let has_ane = true;
-        #[cfg(not(target_os = "macos"))]
-        let has_ane = false;
-
-        Self {
-            device: Device::Ane,
-            name: if has_ane {
-                "Apple Neural Engine (ANE)".into()
-            } else {
-                "ANE Unavailable".into()
-            },
-            memory_bandwidth_gbps: 100.0,
-            threadgroup_memory_bytes: 0,
-            max_threads_per_threadgroup: 1,
-            simd_width: 1,
-            m_tile: 1,
-            n_tile: 512,
-            k_tile: 512,
-            vector_width_bits: 512,
-            compute_units: 16,
-            has_unified_memory: true,
-            compute_capability: None,
-            max_systolic_tile: Some([1, 512, 1, 512]),
-        }
-    }
-
-    fn detect_cuda() -> Self {
-        let is_avail = crate::graph::cuda::is_available();
-        Self {
-            device: Device::Cuda,
-            name: if is_avail {
-                "NVIDIA CUDA Device".into()
-            } else {
-                "CUDA Unavailable".into()
-            },
-            memory_bandwidth_gbps: 500.0,
-            threadgroup_memory_bytes: 48 * 1024,
-            max_threads_per_threadgroup: 1024,
-            simd_width: 32, // Warp size
-            m_tile: 1,
-            n_tile: 32,
-            k_tile: 32,
-            vector_width_bits: 128,
-            compute_units: 64,
-            has_unified_memory: false,
-            compute_capability: if is_avail { Some((8, 0)) } else { None },
-            max_systolic_tile: None,
-        }
-    }
-
-    fn detect_rocm() -> Self {
-        let is_avail = crate::graph::rocm::is_available();
-        Self {
-            device: Device::Rocm,
-            name: if is_avail {
-                "AMD ROCm / HIP Device".into()
-            } else {
-                "ROCm Unavailable".into()
-            },
-            memory_bandwidth_gbps: 500.0,
-            threadgroup_memory_bytes: 64 * 1024,
-            max_threads_per_threadgroup: 1024,
-            simd_width: 64, // Wavefront size
-            m_tile: 1,
-            n_tile: 64,
-            k_tile: 32,
-            vector_width_bits: 128,
-            compute_units: 64,
-            has_unified_memory: false,
             compute_capability: None,
             max_systolic_tile: None,
         }

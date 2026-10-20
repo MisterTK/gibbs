@@ -33,7 +33,7 @@ Apple M5 Pro, Metal, measured streaming ceiling 292.7 GB/s. Binary built from `b
 > one gibbs --bench process per bench/loop.json row (suite defaults: 128 tokens, 3 runs); Qwen3.5-2B row re-run (first run 124.9 tok/s, three re-runs 134.5-135.4)
 <!-- gibbs-bench:end -->
 
-System 1 (CPU / Metal / ANE), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
+System 1 (CPU / Metal), ModelScope and Stable Diffusion timings from earlier releases are not shown: they were not re-measured on this build.
 
 ```bash
 target/release/gibbs --bench bench/loop.json
@@ -114,19 +114,17 @@ Every API is a thin adapter over one generation path; any model name serves the 
 
 ## Architecture
 
-<img src="assets/gibbs-architecture.svg" alt="Gibbs architecture: weights, loaders, graph IR, passes, Metal executor; CPU and Core ML/ANE as opt-in placements; surfaces and scheduler" width="100%">
+<img src="assets/gibbs-architecture.svg" alt="Gibbs architecture: weights, loaders, graph IR, passes, Metal executor; CPU as opt-in placement; surfaces and scheduler" width="100%">
 
-The design describes every model once in a shared graph IR (`src/graph`) and has each executor run that description; weights are bound by name, so the same graph can also be fingerprinted. Models compile to a `GraphProgram` that places every node on Metal (or, with `--backend cpu`, on the CPU); System 1 additionally has a Core ML lowering for the Apple Neural Engine. [PLAN.md](PLAN.md) has the phases and the measurements behind the design.
+The design describes every model once in a shared graph IR (`src/graph`) and has each executor run that description; weights are bound by name, so the same graph can also be fingerprinted. Models compile to a `GraphProgram` that places every node on Metal (or, with `--backend cpu`, on the CPU). [PLAN.md](PLAN.md) has the phases and the measurements behind the design.
 
 ### Backends
 
 | `--backend` | What runs there |
 | :--- | :--- |
 | `auto` (default) | Resolves to Metal on Apple Silicon; to the CPU executor only on a host with no Metal device. |
-| `metal` | The default compute path. Every model family except the block drafters (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the six avenues tried per node (Metal kernel, decompose, dtype adapt, generated kernel, matmul primitive, Core ML/ANE), or with a family-gate error. A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
+| `metal` | The default compute path. Every model family except the block drafters (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the five avenues tried per node (Metal kernel, decompose, dtype adapt, generated kernel, matmul primitive), or with a family-gate error. A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
 | `cpu` | Explicit opt-in to the native CPU executor (NEON SIMD). It is the only way to run the DFlash/DFlash2/DSpark block drafters, and it is where the CPU weight-format measure/choose path runs. |
-| `ane` | System 1 BERT sentence encoders (`--model sentence-transformers/all-MiniLM-L6-v2 --backend ane`) through Core ML. |
-| `cuda`, `rocm`, `level-zero` | Stubs: a startup error, because no such hardware is available to build and verify them. |
 
 Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
 
@@ -138,11 +136,9 @@ Startup prints the detected host (CPU, core counts, memory, GPU, and CPU feature
 | Graph builders | System 1, GraphLm and the other families in the [GPU coverage](#gpu-coverage) table run from their graph on Metal. The native CPU forward passes remain as the `--backend cpu` path and as the parity reference. |
 | Fingerprint pass | Built, on the IR. |
 | Host profile | Static detection (the startup banner), plus measured Metal micro-benchmarks run once per GPU and OS build and cached in `~/.cache/gibbs/host/`: MPP `matmul2d` checked against the CPU, dispatch cost, and GEMM timings that pick the GEMM kernel per shape. |
-| Weight-format selection | **Metal:** the re-encode policy (`--reencode`, see [Weight formats](#weight-formats)) picks each streamed matrix's format from the weight header (`src/model/reencode.rs`, `weight_format.rs`); a re-encode is accepted only if the GPU KL gate passes, and accepted encodings are cached. A Metal load never runs the CPU format probe. Variant ranking in the model picker uses a predicted decode tok/s from the GGUF/safetensors header and measured codec efficiencies (`src/model/variant.rs`, policies `fastest`, `fastest-4bit`, `best-quality`). The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy yet. **`--backend cpu` only:** the engine times one decoder layer's GEMVs in every format the CPU has kernels for (f32, f16, bf16, Q8_0, EXL3 3/4/5-bit, NVFP4, hybrid, Weightless Jesse), quantizes the formats that beat f32, teacher-forces a probe text, and takes the fastest whose mean KL from f32 stays ≤ 0.01 nats; the decision is cached per CPU, backend, weight file and engine build in `~/.cache/gibbs/host/`. |
+| Weight-format selection | **Metal:** the re-encode policy (`--reencode`, see [Weight formats](#weight-formats)) picks each streamed matrix's format from the weight header (`src/model/reencode.rs`, `weight_format.rs`); a re-encode is accepted only if the GPU KL gate passes, and accepted encodings are cached. A Metal load never runs the CPU format probe. Variant ranking in the model picker uses a predicted decode tok/s from the GGUF/safetensors header and measured codec efficiencies (`src/model/variant.rs`, policies `fastest`, `fastest-4bit`, `best-quality`). The Gemma 4 and Qwen3.5 native loaders do not apply the re-encode policy yet. **`--backend cpu` only:** the engine times one decoder layer's GEMVs in every format the CPU has kernels for (f32, f16, bf16, Q8_0, NVFP4), quantizes the formats that beat f32, teacher-forces a probe text, and takes the fastest whose mean KL from f32 stays ≤ 0.01 nats; the decision is cached per CPU, backend, weight file and engine build in `~/.cache/gibbs/host/`. |
 | Metal executor | `src/graph/metal.rs` and `src/graph/metal/ext/`: the forward pass in command buffers, activations in one arena planned from value lifetimes, three GEMM kernels (MetalPerformancePrimitives `matmul2d`, `simdgroup_matrix`, and one simdgroup per output column for few rows), online-softmax attention, pipelines cached in an `MTLBinaryArchive` under `~/.cache/gibbs/metal/`. 23 GGUF block formats decode on the GPU through MSL GEMV generated in `src/graph/codegen.rs` and `codec.rs` (bit-exact against the CPU dequantizer in `tests/codec_parity.rs`), plus hand kernels for Q4_0, Q8_0, IQ4_XS, IQ2_M, Q4_K, Q2_K, IQ3_S, repacked bitsandbytes NF4/FP4, FP8, MLX affine-4, int4 and NVFP4. A weight whose format has no GPU codec is dequantized to f32 at load (logged per tensor) and the load fails with `gpu-only:` if that tensor would exceed 2 GiB; the GraphLm re-encode policy may re-encode such weights instead. A decode indirect-command-buffer variant was measured (encoding is 2–3% of GPU time) and not adopted. A per-shape tuner (`src/graph/tune.rs`) times hand and generated GEMV variants and caches winners in `~/.cache/gibbs/host/tune-<device>.json`; winners measured under foreign GPU load are not persisted. |
-| Core ML → ANE | Built for System 1 (`src/graph/coreml.rs`): native lowering of BERT layers to MIL with rank-4 layout `[1, C, 1, S]`, 1×1 convolutions, multi-head attention with additive padding mask, exact GELU, LayerNorm with 1D `[C]` gamma/beta, external `weights/weight.bin` MILBlob storage, candidate buckets `[16, 64, 128, 256, 512]` scanned via `MLComputePlan`, and compiled `.mlmodelc` bundles cached under `~/.cache/gibbs/coreml/`. An earlier release measured 144/144 ops on the Neural Engine; that was not re-measured this sprint. |
 | Fusion | Every fusion is an egglog rule; extraction picks the set. Graph level (`src/graph/egraph.rs`, cost-model extraction over the tune cache's GEMV rates): MLP megakernel (RmsNorm → gate/up → SwiGLU/GeGLU → down → residual in one step), gate/up and QKV weight concatenation. Metal planner (`src/graph/metal/fuse.rs`, `ext/ple.rs`, `ext/deltanet.rs`, rules over node and step facts that `plan` lowers 1:1): GEMV epilogues, RmsNorm residual/scale/RoPE, attention q/k RoPE, horizontal batching of up to four independent RmsNorm/Rope steps, MoE router/GLU/weighted-sum steps, the opt-in PLE chain, and a decode-time gated delta-rule chain (conv step, SiLU, gates, state update, readout, gated RmsNorm) in one dispatch. Zero-copy views and small-GEMV pairing stay allocation-time post-passes (they need arena offsets and tuned variants). `GIBBS_FUSION=xla` restricts planning to XLA's fusion classes for comparison. |
-| CUDA / ROCm / Level Zero | Stubs that return errors. |
 
 ### GPU coverage
 
@@ -183,7 +179,7 @@ Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter
 |  | Gibbs | vLLM / SGLang |
 | --- | --- | --- |
 | Language and stack | Rust. One graph IR (`GraphLm`, `GraphProgram`) lowers to Metal kernels, with a CPU executor as an explicit opt-in. | Python on top of CUDA/Triton kernels. ROCm and others are secondary. |
-| Primary hardware | Apple Silicon, unified memory (Metal default). CUDA, ROCm and Level Zero are startup-error stubs. | NVIDIA GPUs, multi-GPU with tensor and pipeline parallelism. |
+| Primary hardware | Apple Silicon, unified memory (Metal default). | NVIDIA GPUs, multi-GPU with tensor and pipeline parallelism. |
 | Optimization goal | Single-stream decode against a measured memory-bandwidth roofline (`--bench`, `geomean_roofline_pct`). Tuning is mostly GEMV kernels and dispatch overhead. | Aggregate throughput under many concurrent requests: continuous batching, paged KV cache (vLLM PagedAttention), prefix sharing (SGLang RadixAttention). |
 | Quantization | Reads numerous formats directly (Q4_0, Q8_0, K-quants, IQ, TQ2_0 and others) through a codec layer, with per-model re-encode policy. | Mostly GPTQ, AWQ, FP8 and similar server formats. GGUF support is limited. |
 | Model breadth | Text LLMs, plus T5, classifiers, diffusion, video and audio families. | Mainly LLMs and VLMs. Diffusion and video are largely outside scope. |
@@ -289,8 +285,8 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | Flag | Meaning |
 | :--- | :--- |
 | `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path. The kind of model comes from its files: a diffusers `model_index.json` (text-to-image or text-to-video), an SD/FLUX GGUF or single-file checkpoint or LoRA, a classifier `architectures` entry, a System 1 BERT sentence encoder (`sentence-transformers/all-MiniLM-L6-v2`), a native `model_type` (Qwen3.5/Qwen3-VL, Qwen3, HunYuan dense, Gemma 4, T5/mT5/UMT5, Marian/M2M100/NLLB/MBart/FSMT/BART, Idefics3/SmolVLM), else a GraphLm causal LM. |
-| `--backend auto\|metal\|cpu\|ane\|cuda\|rocm\|level-zero` | The compute backend (default `auto`, which is Metal on Apple Silicon; see [Backends](#backends)). `cpu` is the only CPU opt-in; `ane` runs System 1 BERT sentence encoders on the Neural Engine; `cuda`, `rocm`, and `level-zero` fail at startup. A model or op with no Metal lowering fails at load with a `gpu-only:` report. The Metal pipeline cache and host profile go to `~/.cache/gibbs/`. |
-| `--quant <format>` | Forces a weight format: `uncompressed` (f32), `f16`, `bf16`, `q8_0`, `nvfp4`, `exl3-3`/`exl3-4`/`exl3-5`, `hybrid`, `turbo`, or `jesse`. A format the backend has no kernels for is an error; the Metal LLM path accepts only `uncompressed` here (use `--reencode` instead). Without it, Metal applies the re-encode policy and `--backend cpu` measures and picks (see [Architecture](#architecture)). |
+| `--backend auto\|metal\|cpu` | The compute backend (default `auto`, which is Metal on Apple Silicon; see [Backends](#backends)). `cpu` is the only CPU opt-in. A model or op with no Metal lowering fails at load with a `gpu-only:` report. The Metal pipeline cache and host profile go to `~/.cache/gibbs/`. |
+| `--quant <format>` | Forces a weight format: `uncompressed` (f32), `f16`, `bf16`, `q8_0`, or `nvfp4`. A format the backend has no kernels for is an error; the Metal LLM path accepts only `uncompressed` here (use `--reencode` instead). Without it, Metal applies the re-encode policy and `--backend cpu` measures and picks (see [Architecture](#architecture)). |
 | `--reencode max-speed\|low-bit-native\|bit-exact`, `--reencode-max-kl <nats>` | Metal weight re-encode policy and the mean-KL limit of its GPU gate; they override `reencode` / `reencode_max_kl` in `~/.cache/gibbs/settings.json` (see [Weight formats](#weight-formats)). |
 | `--variant fastest\|fastest-4bit\|best-quality` | Which variant of a multi-file GGUF/safetensors repo to pick (default `fastest`), ranked by predicted decode tok/s from the file header and measured codec efficiencies. |
 | `--max-tokens <n>`, `--ctx <n>` (default 8192) | Generation length for `--prompt`, and the context length. |
@@ -433,7 +429,7 @@ curl http://localhost:8080/v1/embeddings -H "Content-Type: application/json" \
 ### `POST /v1/decisions`
 Works with any loaded System 1 BERT encoder or any loaded LLM (and `/system1` in the TUI turns the active LLM into a System 1 model for bare prompts and zero-shot tool routing). Questions are answered by zero-shot cosine similarity. `bool` and `choice` are supported, and `score` questions return an error.
 ```bash
-./target/release/gibbs --model sentence-transformers/all-MiniLM-L6-v2 --port 8080   # Metal by default; --backend ane for the Neural Engine, or use any LLM
+./target/release/gibbs --model sentence-transformers/all-MiniLM-L6-v2 --port 8080   # Metal by default, or use any LLM
 curl http://localhost:8080/v1/decisions -H "Content-Type: application/json" -d '{
   "state": "User requested immediate subscription cancellation and refund due to service downtime.",
   "questions": [
