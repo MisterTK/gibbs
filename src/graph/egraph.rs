@@ -1293,15 +1293,15 @@ mod tests {
 
     #[test]
     fn megakernel_mlp_and_qkv_fuse() {
-        let r = check("layer", &layer(1, false, false, false), 0xc6f5c97096765749);
+        let r = check("layer", &layer(1, false, false, false), 0xf8ece718cf2b91b2);
         assert_eq!(r.applied, [1, 0, 1, 0]);
         let r = check(
             "post-norm, swapped",
             &layer(1, true, true, false),
-            0x548dc4df19e94c99,
+            0x06512cb92e10d33e,
         );
         assert_eq!(r.applied, [1, 0, 1, 0]);
-        let r = check("geglu", &layer(1, false, true, true), 0xd9052cf30bd86222);
+        let r = check("geglu", &layer(1, false, true, true), 0x2cc601392e956613);
         assert_eq!(r.applied, [1, 0, 1, 0]);
     }
 
@@ -1311,7 +1311,7 @@ mod tests {
         let r = check(
             "two rows",
             &layer(2, false, false, false),
-            0xaf6a40bde60528f7,
+            0x8d3eddb86ea59653,
         );
         assert_eq!(r.applied, [0, 1, 1, 0]);
     }
@@ -1498,12 +1498,12 @@ mod tests {
             ),
         ];
         let want = [
-            ([4, 0, 4, 0], 0x0f6c66a3986ad984),
-            ([0; 4], 0x6091321c90c7fe27),
-            ([1, 0, 0, 0], 0xde0d3b20eed2afd6),
-            ([0; 4], 0x3d09d0f9ee377a33),
-            ([2, 0, 0, 0], 0x16fabbc448999cfb),
-            ([0; 4], 0xd56dee782b84aea3),
+            ([4, 0, 4, 0], 0xd7511e08af7a8e06),
+            ([0; 4], 0x0c9f89f861991093),
+            ([1, 0, 0, 0], 0xf2c0536e6a69910f),
+            ([0; 4], 0xad1ccf01de308e25),
+            ([2, 0, 0, 0], 0xddacfb31b24a368d),
+            ([0; 4], 0xa518af0687efe3a1),
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);
