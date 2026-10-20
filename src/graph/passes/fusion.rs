@@ -4,21 +4,29 @@ use crate::graph::pattern::{GraphRewriter, MatchContext};
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
-/// Supports F32, BF16, F16, GGUF-quantized, and Mat (all parts Mat: [`Mat::concat_rows`]).
-///
-/// [`Mat::concat_rows`]: crate::model::weights::Mat::concat_rows
+/// Supports F32, BF16, F16, GGUF-quantized, and Mat.
 pub fn concat_weight_tensors(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
-    if tensors.iter().any(|t| matches!(t, Tensor::Mat(_))) {
-        let mats = tensors
-            .iter()
-            .map(|t| match t {
-                Tensor::Mat(m) if m.cols == in_features => Some(m),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
-        return crate::model::weights::Mat::concat_rows(&mats).map(Tensor::Mat);
+    if tensors.is_empty() {
+        return None;
     }
-    concat_weight_tensors_inner(tensors, in_features)
+    // Normalize any Tensor::Mat: if packed GGUF, convert to Tensor::Quantized(ZeroCopySlice);
+    // if uncompressed safetensors, extract as Tensor::BF16.
+    let normalized: Vec<Tensor> = tensors
+        .iter()
+        .map(|&t| match t {
+            Tensor::Mat(m) => {
+                if m.packed().is_some() {
+                    m.to_graph_tensor()
+                } else {
+                    Tensor::BF16(m.data().to_vec())
+                }
+            }
+            _ => t.clone(),
+        })
+        .collect();
+
+    let norm_refs: Vec<&Tensor> = normalized.iter().collect();
+    concat_weight_tensors_inner(&norm_refs, in_features)
 }
 
 fn concat_weight_tensors_inner(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
@@ -184,36 +192,8 @@ pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
             crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. } => *format == fmt,
             _ => false,
         },
-        (_, Tensor::Mat(m)) => {
-            use crate::hardware::QuantFormat as Q;
-            dtype
-                == match m.packed().map_or(Q::BF16, |p| p.format) {
-                    Q::FP32 => DType::F32,
-                    Q::FP16 => DType::F16,
-                    Q::BF16 => DType::BF16,
-                    f => DType::Quant(f),
-                }
-        }
         _ => false,
     }
-}
-
-/// Whether `v` reaches an attention op without passing through another projection.
-pub(crate) fn feeds_attention(g: &Graph, v: crate::graph::ValueId) -> bool {
-    let mut stack = vec![v];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(v) = stack.pop() {
-        for n in g.consumers(v) {
-            match n.op {
-                Op::Attention { .. }
-                | Op::CachedAttention { .. }
-                | Op::PagedCachedAttention { .. } => return true,
-                Op::Linear => {}
-                _ => stack.extend(n.outputs.iter().filter(|&&o| seen.insert(o))),
-            }
-        }
-    }
-    false
 }
 
 /// Fuses parallel Q, K, V linear projections of one input into one projection and slices (streams
@@ -249,60 +229,63 @@ pub(crate) fn rewrite_qkv(
             return None;
         }
 
-        let all = [
-            ("q", q_id, g.node(q_id).inputs.get(1).copied()?),
-            ("k", k_id, g.node(k_id).inputs.get(1).copied()?),
-            ("v", v_id, g.node(v_id).inputs.get(1).copied()?),
-        ];
+        let q_w_id = g.node(q_id).inputs.get(1).copied()?;
+        let k_w_id = g.node(k_id).inputs.get(1).copied()?;
+        let v_w_id = g.node(v_id).inputs.get(1).copied()?;
 
-        // Fuse all three when their formats match; otherwise the same-format pair that is
-        // adjacent in q|k|v row order, leaving the odd one as its own projection.
-        let dt = |i: usize| g.value(all[i].2).dtype;
-        let legs: &[_] = if dt(0) == dt(1) && dt(1) == dt(2) {
-            &all
-        } else if dt(0) == dt(1) {
-            &all[..2]
-        } else if dt(1) == dt(2) {
-            &all[1..]
-        } else {
-            return None;
-        };
-        // A partial fusion only for attention projections, so unrelated mixed-format Linear
-        // trios on a shared input (routers, side projections) keep their own steps.
-        if legs.len() < all.len()
-            && !legs
-                .iter()
-                .all(|l| feeds_attention(g, g.node(l.1).outputs[0]))
-        {
+        // Verify identical dtypes
+        let dtype = g.value(q_w_id).dtype;
+        if g.value(k_w_id).dtype != dtype || g.value(v_w_id).dtype != dtype {
             return None;
         }
-        let dtype = g.value(legs[0].2).dtype;
 
-        let w_shapes: Vec<Vec<usize>> = legs.iter().map(|l| g.value(l.2).shape.clone()).collect();
-        if w_shapes
-            .iter()
-            .any(|s| s.len() != 2 || s[1] != w_shapes[0][1])
-        {
+        let q_w_shape = g.value(q_w_id).shape.clone();
+        let k_w_shape = g.value(k_w_id).shape.clone();
+        let v_w_shape = g.value(v_w_id).shape.clone();
+
+        if q_w_shape.len() != 2 || k_w_shape.len() != 2 || v_w_shape.len() != 2 {
             return None;
         }
-        let in_features = w_shapes[0][1];
-        let total_out: usize = w_shapes.iter().map(|s| s[0]).sum();
+        if q_w_shape[1] != k_w_shape[1] || q_w_shape[1] != v_w_shape[1] {
+            return None;
+        }
 
-        let first_name = g.node(legs[0].1).name.clone();
-        let tag: String = legs.iter().map(|l| l.0).collect();
-        let fused_w_name = format!("{first_name}_fused_{tag}_w");
+        let in_features = q_w_shape[1];
+        let q_out = q_w_shape[0];
+        let k_out = k_w_shape[0];
+        let v_out = v_w_shape[0];
+        let total_out = q_out + k_out + v_out;
+
+        let q_name = g.node(q_id).name.clone();
+        let k_name = g.node(k_id).name.clone();
+        let v_name = g.node(v_id).name.clone();
+
+        let q_out_shape = g.value(g.node(q_id).outputs[0]).shape.clone();
+        let k_out_shape = g.value(g.node(k_id).outputs[0]).shape.clone();
+        let v_out_shape = g.value(g.node(v_id).outputs[0]).shape.clone();
+
+        let fused_w_name = format!("{}_fused_qkv_w", q_name);
 
         // If weights are provided, we MUST be able to fuse the weight tensors
-        if let Some(w_store) = &weights {
-            let ts = legs
-                .iter()
-                .map(|l| w_store.get(&g.value(l.2).name))
-                .collect::<Option<Vec<_>>>()?;
-            let fused_tensor = concat_weight_tensors(&ts, in_features)?;
+        if let Some(ref w_store) = weights {
+            let q_t = w_store.get(&g.value(q_w_id).name)?;
+            let k_t = w_store.get(&g.value(k_w_id).name)?;
+            let v_t = w_store.get(&g.value(v_w_id).name)?;
+            if matches!(q_t, Tensor::Mat(_))
+                || matches!(k_t, Tensor::Mat(_))
+                || matches!(v_t, Tensor::Mat(_))
+            {
+                return None;
+            }
+            let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t], in_features)?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
-            let old_names = legs.iter().map(|l| g.value(l.2).name.clone()).collect();
+            let old_names = vec![
+                g.value(q_w_id).name.clone(),
+                g.value(k_w_id).name.clone(),
+                g.value(v_w_id).name.clone(),
+            ];
             weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
         }
 
@@ -314,34 +297,50 @@ pub(crate) fn rewrite_qkv(
         }
 
         let fused_lin = g.add(
-            format!("{first_name}.fused_{tag}"),
+            format!("{}.fused_qkv", q_name),
             Op::Linear,
             &[in_val, fused_w],
             fused_out_shape,
             DType::F32,
         );
 
-        let mut start = 0;
-        let mut slices = Vec::with_capacity(legs.len());
-        for (l, ws) in legs.iter().zip(&w_shapes) {
-            let name = format!("{}.{}_slice", g.node(l.1).name, l.0);
-            let out_shape = g.value(g.node(l.1).outputs[0]).shape.clone();
-            let end = start + ws[0];
-            slices.push(g.add(
-                name,
-                Op::Slice {
-                    axis: -1,
-                    start: start as i64,
-                    end: end as i64,
-                },
-                &[fused_lin],
-                out_shape,
-                DType::F32,
-            ));
-            start = end;
-        }
+        let q_slice = g.add(
+            format!("{}.q_slice", q_name),
+            Op::Slice {
+                axis: -1,
+                start: 0,
+                end: q_out as i64,
+            },
+            &[fused_lin],
+            q_out_shape,
+            DType::F32,
+        );
 
-        Some((legs.iter().map(|l| l.1).collect(), slices))
+        let k_slice = g.add(
+            format!("{}.k_slice", k_name),
+            Op::Slice {
+                axis: -1,
+                start: q_out as i64,
+                end: (q_out + k_out) as i64,
+            },
+            &[fused_lin],
+            k_out_shape,
+            DType::F32,
+        );
+
+        let v_slice = g.add(
+            format!("{}.v_slice", v_name),
+            Op::Slice {
+                axis: -1,
+                start: (q_out + k_out) as i64,
+                end: total_out as i64,
+            },
+            &[fused_lin],
+            v_out_shape,
+            DType::F32,
+        );
+
+        Some((vec![q_id, k_id, v_id], vec![q_slice, k_slice, v_slice]))
     });
 
     if let Some(ref mut w_store) = weights {
@@ -354,31 +353,6 @@ pub(crate) fn rewrite_qkv(
     }
 
     rewrites
-}
-
-/// Re-applies the QKV fusions named by `trios` (q, k, v node names from
-/// [`crate::graph::egraph::Report::qkv`]) to another build of the same network, e.g. a batched
-/// prefill graph: graph only, so it reads the fused weights its compiled program holds instead
-/// of the parts that fusion removed.
-pub(crate) fn replay_qkv(graph: &mut Graph, trios: &[[String; 3]]) -> usize {
-    let ids: std::collections::HashMap<&str, crate::graph::NodeId> = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.name.as_str(), crate::graph::NodeId(i as u32)))
-        .collect();
-    let mut ms: Vec<MatchContext> = trios
-        .iter()
-        .filter_map(|t| {
-            let mut m = MatchContext::default();
-            for (role, name) in ["q", "k", "v"].into_iter().zip(t) {
-                m.insert(role, *ids.get(name.as_str())?);
-            }
-            Some(m)
-        })
-        .collect();
-    ms.sort_by_key(|m| m.get("q").map(|n| n.0));
-    rewrite_qkv(graph, &ms, None)
 }
 
 /// Fuses the gate and up projections of a SwiGLU / GeGLU into one projection (streams the
@@ -689,11 +663,11 @@ mod tests {
         }
     }
 
-    /// x -> norm -> {q,k,v} Linear with per-projection weight dtypes, optionally consumed by an
-    /// `Attention`. F16 weights stand in for a second plain codec; `Quant(f)` weights are packed
-    /// GGUF `Mat`s in an anonymous mapping, as the GGUF loaders produce them. Returns the graph,
-    /// its weights and the input.
-    fn qkv_graph(dts: [DType; 3], attn: bool) -> (Graph, Weights, Vec<Tensor>) {
+    /// x -> norm -> {q,k,v} Linear -> Attention with per-projection weight dtypes. F16 weights
+    /// stand in for a second plain codec; `Quant(f)` weights are packed GGUF `Mat`s in an
+    /// anonymous mapping, as the GGUF loaders produce them. Returns the graph, its weights and the
+    /// input.
+    fn qkv_graph(dts: [DType; 3]) -> (Graph, Weights, Vec<Tensor>) {
         let (h, rows) = (256usize, [8usize, 4, 4]);
         let mut g = Graph::new();
         let x = g.input("x", vec![1, h], DType::F32);
@@ -735,17 +709,15 @@ mod tests {
             g.output(out);
             outs.push(out);
         }
-        if attn {
-            let op = Op::Attention {
-                heads: 2,
-                kv_heads: 1,
-                causal: true,
-                window: None,
-                soft_cap: None,
-            };
-            let a = g.add("attn", op, &outs, vec![1, rows[0]], DType::F32);
-            g.output(a);
-        }
+        let op = Op::Attention {
+            heads: 2,
+            kv_heads: 1,
+            causal: true,
+            window: None,
+            soft_cap: None,
+        };
+        let a = g.add("attn", op, &outs, vec![1, rows[0]], DType::F32);
+        g.output(a);
         let input = vec![Tensor::F32((0..h).map(|i| i as f32 * 0.3 - 1.0).collect())];
         (g, weights, input)
     }
@@ -789,7 +761,7 @@ mod tests {
     /// the remaining Linear nodes.
     fn fuse_and_check(dts: [DType; 3]) -> Vec<String> {
         use crate::graph::cpu::run_stateless;
-        let (g, w, input) = qkv_graph(dts, true);
+        let (g, w, input) = qkv_graph(dts);
         let base = run_stateless(&g, &w, input.clone()).unwrap();
         let (mut fg, mut fw) = (g.clone(), w.clone());
         assert_eq!(fuse_rule(&mut fg, Some(&mut fw), Rule::Qkv), 1);
@@ -810,80 +782,17 @@ mod tests {
     }
 
     #[test]
-    fn fuse_qkv_pass_mixed_formats_fuses_adjacent_pair() {
-        let (h, f) = (DType::F16, DType::F32);
-        assert_eq!(fuse_and_check([h, h, f]), ["q.fused_qk", "v"]);
-        assert_eq!(fuse_and_check([f, h, h]), ["k.fused_kv", "q"]);
-        // Same-format pair not adjacent in q|k|v order: nothing to fuse.
-        let (mut g, mut w, _) = qkv_graph([h, f, h], true);
-        assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0);
-        // Mixed-format trio that feeds no attention (router, side projections): left alone.
-        let (mut g, mut w, _) = qkv_graph([h, h, f], false);
-        assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0);
+    fn fuse_qkv_pass_leaves_mixed_formats_and_mats_unfused() {
+        use crate::hardware::QuantFormat as Q;
+        let (h, f, q4) = (DType::F16, DType::F32, DType::Quant(Q::GGUF_Q4_0));
+        for dts in [[h, h, f], [f, h, h], [q4, q4, q4]] {
+            let (mut g, mut w, _) = qkv_graph(dts);
+            assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0, "{dts:?}");
+        }
     }
 
     #[test]
     fn fuse_qkv_pass_same_format_still_fuses_all_three() {
-        let f = DType::F32;
-        assert_eq!(fuse_and_check([f, f, f]), ["q.fused_qkv"]);
-    }
-
-    #[test]
-    fn fuse_qkv_pass_fuses_packed_gguf_mats() {
-        use crate::hardware::QuantFormat as Q;
-        let (k4, q4) = (DType::Quant(Q::GGUF_Q4_K_M), DType::Quant(Q::GGUF_Q4_0));
-        assert_eq!(fuse_and_check([q4, q4, q4]), ["q.fused_qkv"]);
-        assert_eq!(fuse_and_check([k4, k4, q4]), ["q.fused_qk", "v"]);
-        // The fused weight is one packed Mat of the shared format and replaces its parts.
-        let (mut g, mut w, _) = qkv_graph([k4, k4, q4], true);
-        assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 1);
-        assert!(w.get("w_q").is_none() && w.get("w_k").is_none() && w.get("w_v").is_some());
-        let Some(Tensor::Mat(m)) = w.get("q_fused_qk_w") else {
-            panic!("fused weight is not a Mat");
-        };
-        assert_eq!((m.rows, m.cols), (12, 256));
-        assert_eq!(m.packed().map(|p| p.format), Some(Q::GGUF_Q4_K_M));
-    }
-
-    /// A batched prefill graph is a fresh build of the compiled network: with the program's QKV
-    /// fusions replayed it must read only weights the fused program holds, with equal outputs.
-    #[test]
-    fn replayed_qkv_reads_only_the_fused_program_weights() {
-        use crate::graph::cpu::run_stateless;
-        use crate::graph::egraph::{fuse, Budget, CostModel};
-        use crate::hardware::QuantFormat as Q;
-        let (k4, q4) = (DType::Quant(Q::GGUF_Q4_K_M), DType::Quant(Q::GGUF_Q4_0));
-        for dts in [[q4, q4, q4], [k4, k4, q4]] {
-            let (mut g, mut w, input) = qkv_graph(dts, true);
-            let (fresh, parts) = (g.clone(), w.clone());
-            let cost = CostModel::constants();
-            let r = fuse(&mut g, Some(&mut w), &[Rule::Qkv], &cost, Budget::default()).unwrap();
-            let mut re = fresh.clone();
-            assert_eq!(replay_qkv(&mut re, &r.qkv), 1);
-            for v in re.nodes.iter().flat_map(|n| &n.inputs) {
-                let val = re.value(*v);
-                if val.kind == crate::graph::ValueKind::Weight {
-                    assert!(w.get(&val.name).is_some(), "{dts:?} reads '{}'", val.name);
-                }
-            }
-            let want = run_stateless(&fresh, &parts, input.clone()).unwrap();
-            let got = run_stateless(&re, &w, input).unwrap();
-            for (a, b) in want.iter().zip(&got) {
-                assert_eq!(a.as_f32().unwrap(), b.as_f32().unwrap(), "{dts:?}");
-            }
-        }
-    }
-
-    /// `GIBBS_DISABLE=qkv_mat`: loader Mat triples and pairs stay unfused, plain weights still fuse.
-    #[test]
-    fn qkv_mat_disabled_leaves_mats_unfused() {
-        use crate::hardware::QuantFormat as Q;
-        crate::graph::TEST_DISABLE.with(|d| d.set("qkv_mat"));
-        let (k4, q4) = (DType::Quant(Q::GGUF_Q4_K_M), DType::Quant(Q::GGUF_Q4_0));
-        for dts in [[q4, q4, q4], [k4, k4, q4]] {
-            let (mut g, mut w, _) = qkv_graph(dts, true);
-            assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0);
-        }
         let f = DType::F32;
         assert_eq!(fuse_and_check([f, f, f]), ["q.fused_qkv"]);
     }

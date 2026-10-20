@@ -46,18 +46,9 @@ pub struct GraphProgram {
     /// [`Self::run_greedy`]'s graph and plan, with the `valid` they were built for.
     #[cfg(target_os = "macos")]
     argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
-    /// [`Self::run_reshaped`]'s graphs (QKV fusions replayed) and plans, keyed by the caller's
-    /// graph's node count and input shapes.
+    /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
     #[cfg(target_os = "macos")]
-    reshaped: Vec<(
-        usize,
-        Vec<Vec<usize>>,
-        Graph,
-        crate::graph::metal::PreparedPlan,
-    )>,
-    /// The QKV fusions compiled into the program (q, k, v node names), for [`Self::run_reshaped`].
-    #[cfg(target_os = "macos")]
-    qkv: Vec<[String; 3]>,
+    reshaped: Vec<(usize, Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
 }
 
 /// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
@@ -144,11 +135,7 @@ impl GraphProgram {
         // Phase-4 plan search re-extracts fusions from the graph before fusion.
         #[cfg(target_os = "macos")]
         let search_base = crate::graph::search::enabled().then(|| (graph.clone(), weights.clone()));
-        let report = crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
-        #[cfg(target_os = "macos")]
-        let mut qkv = report.qkv;
-        #[cfg(not(target_os = "macos"))]
-        let _ = report;
+        crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
         let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
             .ok()
             .map(|v| v.parse().unwrap_or(1));
@@ -162,8 +149,8 @@ impl GraphProgram {
         #[cfg(target_os = "macos")]
         if let (Some(base), Device::Metal, None) = (&search_base, plan.primary_device(), dump) {
             let rt = crate::graph::metal::Runtime::shared()?;
-            if let Some((g, w, p, r)) = searched(&rt, base, mode, &available) {
-                (graph, weights, plan, qkv) = (g, w, p, r.qkv);
+            if let Some(s) = searched(&rt, base, mode, &available) {
+                (graph, weights, plan) = s;
             }
         }
         let primary_device = plan.primary_device();
@@ -216,8 +203,6 @@ impl GraphProgram {
             argmax: None,
             #[cfg(target_os = "macos")]
             reshaped: Vec::new(),
-            #[cfg(target_os = "macos")]
-            qkv,
         })
     }
 
@@ -313,10 +298,8 @@ impl GraphProgram {
     }
 
     /// Runs `graph` on the program's Metal segment inside the program's state: another row count of the
-    /// compiled network (same weight and state names), e.g. a batched prefill pass. The program's QKV
-    /// fusions are replayed on it first (its weights hold the fused tensors, not the parts). Plans are
-    /// cached by the graph's node count and input shapes, which identify such a graph (prefill chunks
-    /// repeat).
+    /// compiled network (same weight and state names), e.g. a batched prefill pass. Plans are cached by
+    /// the graph's node count and input shapes, which identify such a graph (prefill chunks repeat).
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
@@ -333,7 +316,7 @@ impl GraphProgram {
             let hit = self
                 .reshaped
                 .iter()
-                .position(|(c, s, _, _)| *c == n && *s == shapes);
+                .position(|(c, s, _)| *c == n && *s == shapes);
             // Least recently used first: a varying tail chunk must not evict the full chunk's plan.
             let entry = match hit {
                 Some(i) => self.reshaped.remove(i),
@@ -343,15 +326,12 @@ impl GraphProgram {
                     if self.reshaped.len() == 4 {
                         self.reshaped.remove(0);
                     }
-                    let mut g = graph.clone();
-                    crate::graph::passes::fusion::replay_qkv(&mut g, &self.qkv);
-                    let plan = session.prepare_plan(&g)?;
-                    (n, shapes, g, plan)
+                    (n, shapes, session.prepare_plan(graph)?)
                 }
             };
             self.reshaped.push(entry);
-            let (_, _, g, plan) = &self.reshaped[self.reshaped.len() - 1];
-            return session.run_prepared(g, plan, Some(&mut self.state), inputs);
+            let plan = &self.reshaped[self.reshaped.len() - 1].2;
+            return session.run_prepared(graph, plan, Some(&mut self.state), inputs);
         }
         let _ = (graph, inputs);
         Err("run_reshaped: the program is not a single Metal segment".into())
@@ -498,7 +478,7 @@ fn searched(
     base: &(Graph, Weights),
     mode: PlacementMode,
     available: &[Device],
-) -> Option<(Graph, Weights, PlacementPlan, crate::graph::egraph::Report)> {
+) -> Option<(Graph, Weights, PlacementPlan)> {
     use crate::graph::egraph::{Budget, CostModel, Fusion, DEFAULT_RULES};
     let run = || {
         let cost = CostModel::from_tune_cache();
@@ -511,7 +491,7 @@ fn searched(
         )?;
         let mut state = StateStore::new();
         let flips = rt.plan_search(fusion.choices(), |flip| {
-            let (g, w, _, _) = fused(base, &fusion, flip, mode, available)?;
+            let (g, w, _) = fused(base, &fusion, flip, mode, available)?;
             let s = crate::graph::metal::Session::new_for_graph(rt.clone(), &w, Some(&g))?;
             let plan = s.prepare_plan(&g)?;
             s.time_decode(&g, &plan, &mut state)
@@ -531,12 +511,12 @@ fn fused(
     flip: &[usize],
     mode: PlacementMode,
     available: &[Device],
-) -> Result<(Graph, Weights, PlacementPlan, crate::graph::egraph::Report), String> {
+) -> Result<(Graph, Weights, PlacementPlan), String> {
     let (mut g, mut w) = base.clone();
-    let r = fusion.apply(&mut g, Some(&mut w), flip)?;
+    fusion.apply(&mut g, Some(&mut w), flip)?;
     crate::graph::pattern::validate_ssa(&g)?;
     let p = place_and_adapt(&mut g, mode, available)?;
-    Ok((g, w, p, r))
+    Ok((g, w, p))
 }
 
 #[cfg(test)]
@@ -662,7 +642,7 @@ mod tests {
             [Device::Cpu, Device::Metal],
         );
         let rt = Runtime::shared().unwrap();
-        let (sg, sw, _, _) = searched(&rt, &base, mode, &available).expect("plan search");
+        let (sg, sw, _) = searched(&rt, &base, mode, &available).expect("plan search");
         let cost = CostModel::from_tune_cache();
         let fusion = Fusion::new(
             &base.0,
@@ -674,7 +654,7 @@ mod tests {
         .unwrap();
         let pats = crate::graph::search::patterns(fusion.choices());
         assert!(pats.iter().any(|p| p.ids.len() == 2), "{pats:?}");
-        let (cg, cw, _, _) = fused(&base, &fusion, &[], mode, &available).unwrap();
+        let (cg, cw, _) = fused(&base, &fusion, &[], mode, &available).unwrap();
         let x: Vec<f32> = (0..64).map(|i| (i as f32 * 0.3).cos()).collect();
         let run = |g: &Graph, w: &Weights| {
             let s = Session::new_for_graph(rt.clone(), w, Some(g)).unwrap();
@@ -700,7 +680,7 @@ mod tests {
         for set in sets {
             let flips = crate::graph::search::flips(fusion.choices(), &set);
             // Flip sets the e-graph cannot resolve are dropped by the search too.
-            let Ok((g, w, _, _)) = fused(&base, &fusion, &flips, mode, &available) else {
+            let Ok((g, w, _)) = fused(&base, &fusion, &flips, mode, &available) else {
                 continue;
             };
             changed |= g.nodes.len() != cg.nodes.len();

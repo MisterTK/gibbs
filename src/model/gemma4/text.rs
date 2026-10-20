@@ -1517,44 +1517,16 @@ mod tests {
         }
     }
 
-    /// The optimization passes fuse the builder's q/k/v `Mat` projections into one Linear
-    /// (q_norm/k_norm/RoPE/CachedAttention read its slices) without changing the logits.
-    #[test]
-    fn optimized_decode_graph_fuses_qkv_and_matches_unoptimized() {
-        use crate::graph::cpu::run_stateless;
-        use crate::graph::Tensor;
-        let model = tiny_model();
-        let (g, w) = model.to_decode_graph().unwrap();
-        let (mut og, mut ow) = (g.clone(), w.clone());
-        crate::graph::passes::run_optimization_passes(&mut og, Some(&mut ow)).unwrap();
-        let linears: Vec<&str> = og
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.op, crate::graph::Op::Linear))
-            .map(|n| n.name.as_str())
-            .collect();
-        assert!(
-            linears.contains(&"layers.0.attn.q.fused_qkv"),
-            "{linears:?}"
-        );
-        assert!(ow.get("layers.0.attn.q.weight").is_none());
-        let mut emb = vec![0.0f32; model.hidden];
-        model.embed_row(5, &mut emb);
-        let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![0])];
-        let want = run_stateless(&g, &w, inputs.clone()).unwrap();
-        let got = run_stateless(&og, &ow, inputs).unwrap();
-        assert_eq!(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-    }
-
     /// Fusing q/k/v keeps every other node in its original relative order and puts the fused
     /// projection and its slices where the first fused projection was, so order-sensitive planner
-    /// fusions downstream (MoE router/top-k, norm batching) still see their patterns.
+    /// fusions downstream (MoE router/top-k, norm batching) still see their patterns. Graph only:
+    /// the builder's loader `Mat` weights are never fused.
     #[test]
     fn qkv_fusion_keeps_node_order_of_moe_decode_graph() {
-        let (g, mut w) = tiny_moe_decode_graph().unwrap();
+        let (g, _) = tiny_moe_decode_graph().unwrap();
         let mut fg = g.clone();
         let qkv = crate::graph::egraph::Rule::Qkv;
-        assert!(crate::graph::egraph::fuse_rule(&mut fg, Some(&mut w), qkv) > 0);
+        assert!(crate::graph::egraph::fuse_rule(&mut fg, None, qkv) > 0);
         let names = |g: &crate::graph::Graph| -> Vec<String> {
             g.nodes.iter().map(|n| n.name.clone()).collect()
         };

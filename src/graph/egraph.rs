@@ -50,7 +50,7 @@ use std::time::Instant;
 const FUSED_KEY_BASE: i64 = 1 << 40;
 
 const SCHEMA: &str = r#"
-(datatype W (Wt i64) (Cat2 W W) (Cat3 W W W) (CatP W W))
+(datatype W (Wt i64) (Cat2 W W) (Cat3 W W W))
 (datatype*
   (E (V i64)
      (Node i64 L)
@@ -66,11 +66,7 @@ const SCHEMA: &str = r#"
 (relation MkW (E))
 (function wrows (W) i64 :no-merge)
 (function wkey (W) String :no-merge)
-(function wdt (W) String :no-merge)
 (relation QkvIn (W))
-(relation GuOk (W))
-(relation FeedsAttn (E))
-(relation PairOdd (E E))
 (relation MlpDown (E E E i64 E E))
 (relation MlpGate (E E E E E i64 E E))
 (relation MlpUp (E E E E E i64 E E E))
@@ -86,7 +82,7 @@ pub enum Rule {
     MegakernelMlp,
     /// Gate and up Linears of one GLU → one Linear over the concatenated weight.
     GateUp,
-    /// Q, K, V Linears of one input → one Linear (or the same-format pair of them).
+    /// Q, K, V Linears of one input → one Linear (all three of one format).
     Qkv,
     /// QKV slices and RoPE folded into CachedAttention (not in [`DEFAULT_RULES`]).
     QkvSlicesAttn,
@@ -139,10 +135,10 @@ impl Rule {
             Rule::GateUp => {
                 r#"
 (rule ((= s (Node lid (Cons g (Cons u (Nil))))) (K lid "Glu")
-       (= g (Lin gk x wg)) (= u (Lin uk x wu)) (!= gk uk) (GuOk wg) (GuOk wu)
-       (= key (wkey wg)) (= key (wkey wu)) (= rg (wrows wg)) (= ru (wrows wu)) (= dt (wdt wg)))
+       (= g (Lin gk x wg)) (= u (Lin uk x wu)) (!= gk uk)
+       (= key (wkey wg)) (= key (wkey wu)) (= rg (wrows wg)) (= ru (wrows wu)))
       ((let w (Cat2 wg wu))
-       (set (wrows w) (+ rg ru)) (set (wkey w) key) (set (wdt w) dt) (QkvIn w)
+       (set (wrows w) (+ rg ru)) (set (wkey w) key) (QkvIn w)
        (let f (Lin (+ lid 1099511627776) x w))
        (union g (Slice f 0 rg))
        (union u (Slice f rg (+ rg ru))))
@@ -163,28 +159,6 @@ impl Rule {
        (union k (Slice f rq (+ rq rk)))
        (union v (Slice f (+ rq rk) (+ rq (+ rk rv)))))
       :ruleset fuse :name "qkv")
-(rule ((= q (Lin kq x wq)) (= k (Lin kk x wk)) (< kq kk) (= v (Lin kv x wv)) (< kk kv)
-       (QkvIn wq) (QkvIn wk) (QkvIn wv)
-       (= dq (wdt wq)) (= dq (wdt wk)) (= dv (wdt wv)) (!= dq dv)
-       (= key (wkey wq)) (= key (wkey wk)) (FeedsAttn q) (FeedsAttn k)
-       (= x (Node xid xa))
-       (= rq (wrows wq)) (= rk (wrows wk)))
-      ((let f (Lin kq x (CatP wq wk)))
-       (PairOdd f v)
-       (union q (Slice f 0 rq))
-       (union k (Slice f rq (+ rq rk))))
-      :ruleset fuse :name "qkv-pair-qk")
-(rule ((= q (Lin kq x wq)) (= k (Lin kk x wk)) (< kq kk) (= v (Lin kv x wv)) (< kk kv)
-       (QkvIn wq) (QkvIn wk) (QkvIn wv)
-       (= dq (wdt wq)) (= dk (wdt wk)) (= dk (wdt wv)) (!= dq dk)
-       (= key (wkey wk)) (= key (wkey wv)) (FeedsAttn k) (FeedsAttn v)
-       (= x (Node xid xa))
-       (= rk (wrows wk)) (= rv (wrows wv)))
-      ((let f (Lin kk x (CatP wk wv)))
-       (PairOdd f q)
-       (union k (Slice f 0 rk))
-       (union v (Slice f rk (+ rk rv))))
-      :ruleset fuse :name "qkv-pair-kv")
 "#
             }
             Rule::QkvSlicesAttn => {
@@ -331,9 +305,6 @@ pub struct Report {
     pub groups: usize,
     /// Fusions applied: megakernel MLP, gate/up, QKV, QKV-slices→attention.
     pub applied: [usize; 4],
-    /// Node names (q, k, v) of each applied QKV fusion, which
-    /// [`crate::graph::passes::fusion::replay_qkv`] re-applies to other row counts of the network.
-    pub qkv: Vec<[String; 3]>,
 }
 
 impl Report {
@@ -343,16 +314,16 @@ impl Report {
 }
 
 /// Concatenation class of weight `w` for the gate/up and QKV rules (`None`: never fused, as
-/// `concat_weight_tensors` / `matches_dtype` would refuse it), and whether it is a model-loader
-/// `Tensor::Mat` (QKV concatenates those with `Mat::concat_rows`; gate/up refuses them).
-fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<(String, bool)> {
+/// `concat_weight_tensors` / `matches_dtype` would refuse it, including every model-loader
+/// `Tensor::Mat`).
+fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<String> {
     let val = g.value(w);
     if val.kind != ValueKind::Weight || val.shape.len() != 2 {
         return None;
     }
     let cols = val.shape[1];
     let storage = match weights {
-        None => String::new(),
+        None => "",
         Some(ws) => {
             let t = ws.get(&val.name)?;
             if !fusion::matches_dtype(val.dtype, t) {
@@ -362,24 +333,17 @@ fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<(String, 
                 Tensor::Quantized(q) => match q.as_ref() {
                     crate::model::layers::QuantizedWeight::GgufQuantized {
                         in_features, ..
-                    } if *in_features == cols => "gguf".into(),
+                    } if *in_features == cols => "gguf",
                     crate::model::layers::QuantizedWeight::ZeroCopySlice {
                         in_features, ..
-                    } if *in_features == cols => "zc".into(),
+                    } if *in_features == cols => "zc",
                     _ => return None,
                 },
-                Tensor::Mat(m) if m.cols == cols && !crate::graph::disabled("qkv_mat") => format!(
-                    "mat:{:?}",
-                    m.packed()
-                        .map_or(crate::hardware::QuantFormat::BF16, |p| p.format)
-                ),
-                Tensor::Mat(_) => return None,
-                _ => String::new(),
+                _ => "",
             }
         }
     };
-    let mat = storage.starts_with("mat:");
-    Some((format!("{:?}/{cols}/{storage}", val.dtype), mat))
+    Some(format!("{:?}/{cols}/{storage}", val.dtype))
 }
 
 /// Inserts the facts of `g` into `eg` (schema and rules already declared) through the row API:
@@ -444,24 +408,17 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
                 fs.add("OneRow", o)?;
             }
             if let (Op::Linear, [_, w]) = (&n.op, &n.inputs[..]) {
-                if let Some((key, mat)) = cat_key(g, *w, weights) {
+                if let Some(key) = cat_key(g, *w, weights) {
                     let wi = w.0 as usize;
                     let wt = fs.add("Wt", wi as i64)?;
                     if !w_seen[wi] {
                         w_seen[wi] = true;
                         fs.set("wrows", wt, g.value(*w).shape[0] as i64)?;
                         fs.set("wkey", wt, key)?;
-                        fs.set("wdt", wt, format!("{:?}", g.value(*w).dtype))?;
                         fs.add("QkvIn", wt)?;
-                        if !mat {
-                            fs.add("GuOk", wt)?;
-                        }
                     }
                     let lin = fs.add("Lin", (id, args[0], wt))?;
                     fs.union(o, lin)?;
-                    if fusion::feeds_attention(g, out) {
-                        fs.add("FeedsAttn", o)?;
-                    }
                 }
             }
         }
@@ -500,8 +457,6 @@ struct Group {
     keys: Vec<i64>,
     /// Anchor node id (`Mlp` / `Rewired`: the Add / attention node).
     anchor: i64,
-    /// QKV pair fusions: the class of the triple's unfused projection (the rewriter's third capture).
-    odd: Option<Value>,
     /// Class of the fused `Lin` whose slices the members are (gate/up, QKV).
     fused: Option<Value>,
 }
@@ -597,20 +552,17 @@ struct Pick {
     kind: Kind,
     /// Add / attention output (`Mlp` / `Rewired`).
     anchor: Option<ValueId>,
-    /// Gate/up and QKV members (+ a pair's odd projection); `Err(glu)`: a fused gate/up Linear.
+    /// Gate/up and QKV members; `Err(glu)`: a fused gate/up Linear.
     members: Vec<Result<ValueId, ValueId>>,
-    /// Original node outputs the fusion removes; `touches` adds what it reads unfused (a pair's
-    /// odd projection), which another fusion must not remove first.
+    /// Original node outputs the fusion removes, which another fusion must not remove first.
     covers: Vec<ValueId>,
-    touches: Vec<ValueId>,
     /// Fused gate/up picks a QKV pick reads.
     requires: Vec<usize>,
 }
 
 impl Pick {
     fn conflicts(&self, o: &Pick) -> bool {
-        self.touches.iter().any(|v| o.covers.contains(v))
-            || o.touches.iter().any(|v| self.covers.contains(v))
+        self.covers.iter().any(|v| o.covers.contains(v))
     }
 }
 
@@ -784,19 +736,11 @@ impl Fusion {
         for (c, ch) in rows_of("Wt")? {
             wterm.insert(c, Ok(ValueId(int(ch[0]) as u32)));
         }
-        let mut catp: HashSet<Value> = HashSet::new();
-        for name in ["Cat2", "Cat3", "CatP"] {
+        for name in ["Cat2", "Cat3"] {
             for (c, ch) in rows_of(name)? {
-                if name == "CatP" {
-                    catp.insert(c);
-                }
                 wterm.insert(c, Err(ch));
             }
         }
-        let pair_odd: HashMap<Value, Value> = rows_of("PairOdd")?
-            .into_iter()
-            .map(|(_, ch)| (ch[0], ch[1]))
-            .collect();
         let wleaves = |w: Value| -> Vec<ValueId> {
             let (mut out, mut stack) = (Vec::new(), vec![w]);
             while let Some(w) = stack.pop() {
@@ -865,7 +809,7 @@ impl Fusion {
                 + cost.act_us((rows(&xv.shape) * out_rows * 4) as f64);
             fused_kind.insert(
                 c,
-                if catp.contains(&ch[2]) || parts.len() == 3 {
+                if parts.len() == 3 {
                     Kind::Qkv
                 } else {
                     Kind::GateUp
@@ -904,7 +848,6 @@ impl Fusion {
                     members: Vec::new(),
                     keys: Vec::new(),
                     anchor: -1,
-                    odd: pair_odd.get(&f).copied(),
                     fused: Some(f),
                 });
                 groups.len() - 1
@@ -938,7 +881,6 @@ impl Fusion {
                         members: vec![(c, class.nodes.len() - 1)],
                         keys: vec![anchor],
                         anchor,
-                        odd: None,
                         fused: None,
                     });
                 }
@@ -972,9 +914,6 @@ impl Fusion {
             gr.members
                 .iter()
                 .all(|&(c, _)| ex.live(c) && ex.choice.get(&c).copied().unwrap_or(0) == 0)
-                && gr
-                    .odd
-                    .is_none_or(|c| ex.choice.get(&c).copied().unwrap_or(0) == 0)
         };
         let mut order: Vec<(i64, usize)> = Vec::with_capacity(groups.len());
         let mut deltas = vec![0.0; groups.len()];
@@ -1041,9 +980,7 @@ impl Fusion {
                 Kind::GateUp | Kind::Qkv => gr
                     .members
                     .iter()
-                    .map(|(c, _)| c)
-                    .chain(&gr.odd)
-                    .map(|c| match value_of.get(c) {
+                    .map(|(c, _)| match value_of.get(c) {
                         Some(v) => Ok(*v),
                         None => Err(orig_out(classes[c].key - FUSED_KEY_BASE)),
                     })
@@ -1068,21 +1005,16 @@ impl Fusion {
                 on: committed[i],
                 delta_us: deltas[i],
             });
-            let nl = gr.members.len().min(members.len());
-            let legs = &members[..nl];
             let covers: Vec<ValueId> = match (gr.kind, anchor) {
                 (Kind::Mlp, Some(a)) => mlp_cover(g, a),
                 (Kind::AttnSlices, Some(a)) => attn_cover(g, a),
-                _ => legs.iter().filter_map(|m| m.ok()).collect(),
+                _ => members.iter().filter_map(|m| m.ok()).collect(),
             };
-            let mut touches = covers.clone();
-            touches.extend(members[nl..].iter().filter_map(|m| m.ok()));
             picks.push(Pick {
                 kind: gr.kind,
                 anchor,
                 members,
                 covers,
-                touches,
                 requires: gr
                     .members
                     .iter()
@@ -1207,13 +1139,6 @@ impl Fusion {
         let ms = contexts(graph, &gate_up, &["gate", "up"]);
         report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
         let ms = contexts(graph, &qkv, &["q", "k", "v"]);
-        report.qkv = ms
-            .iter()
-            .filter_map(|m| {
-                let name = |r: &str| m.get(r).map(|n| graph.node(n).name.clone());
-                Some([name("q")?, name("k")?, name("v")?])
-            })
-            .collect();
         report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
         if !attn.is_empty() {
             let s = only(graph, &attn);
@@ -1571,10 +1496,10 @@ mod tests {
         let want = [
             ([4, 0, 4, 0], 0x0f6c66a3986ad984),
             ([0; 4], 0x6091321c90c7fe27),
-            ([1, 0, 1, 0], 0xd21669a62ae9e3a2),
-            ([0, 0, 2, 0], 0x27bf67be1fb7a3c8),
-            ([2, 0, 2, 0], 0x8c650215e399b6fa),
-            ([0, 0, 4, 0], 0xa9fb4095114906dc),
+            ([1, 0, 0, 0], 0xde0d3b20eed2afd6),
+            ([0; 4], 0x3d09d0f9ee377a33),
+            ([2, 0, 0, 0], 0x16fabbc448999cfb),
+            ([0; 4], 0xd56dee782b84aea3),
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);

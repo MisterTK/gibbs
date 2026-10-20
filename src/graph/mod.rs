@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 /// Whether `item` is in `GIBBS_DISABLE` (comma list, read once): per-item kill switch next to
 /// `metal::fusion_policy` (here because the e-graph and loaders build without Metal). Items:
-/// `qkv_mat`, `views`, `deltanet`, and loader items (README). Tests set [`TEST_DISABLE`] per thread.
+/// `views`, `deltanet`, and loader items (README). Tests set [`TEST_DISABLE`] per thread.
 pub(crate) fn disabled(item: &str) -> bool {
     #[cfg(test)]
     let list = TEST_DISABLE.with(|d| d.get());
