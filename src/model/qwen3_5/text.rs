@@ -1532,7 +1532,7 @@ impl TextModel {
                     );
                     let mixed = g.add(
                         format!("{p}.mixer.silu"),
-                        Op::Silu,
+                        Op::Unary { kind: UnaryKind::Silu },
                         &[conv_out],
                         vec![n, cd],
                         DType::F32,
@@ -1590,7 +1590,7 @@ impl TextModel {
                     );
                     let a_biased = g.add(
                         format!("{p}.mixer.a_biased"),
-                        Op::Add,
+                        Op::Binary { kind: crate::graph::BinaryKind::Add },
                         &[a, dt_bias_w],
                         vec![n, vh],
                         DType::F32,
@@ -1608,7 +1608,7 @@ impl TextModel {
                     w.insert(format!("{p}.mixer.neg_a"), Tensor::F32(dn.neg_a.clone()));
                     let log_decay = g.add(
                         format!("{p}.mixer.log_decay"),
-                        Op::Mul,
+                        Op::Binary { kind: crate::graph::BinaryKind::Mul },
                         &[neg_a_w, a_softplus],
                         vec![n, vh],
                         DType::F32,
@@ -1656,7 +1656,7 @@ impl TextModel {
                     } else {
                         g.add(
                             format!("{p}.mixer.z_act"),
-                            Op::Silu,
+                            Op::Unary { kind: UnaryKind::Silu },
                             &[z],
                             vec![n, vd],
                             DType::F32,
@@ -1664,7 +1664,7 @@ impl TextModel {
                     };
                     let gated = g.add(
                         format!("{p}.mixer.gated"),
-                        Op::Mul,
+                        Op::Binary { kind: crate::graph::BinaryKind::Mul },
                         &[normed_core, z_act],
                         vec![n, vd],
                         DType::F32,
@@ -1944,7 +1944,7 @@ impl TextModel {
                         );
                         attn_core = g.add(
                             format!("{p}.self_attn.gated_core"),
-                            Op::Mul,
+                            Op::Binary { kind: crate::graph::BinaryKind::Mul },
                             &[attn_core, gate_act],
                             vec![n, self.heads * self.head_dim],
                             DType::F32,
@@ -1965,7 +1965,7 @@ impl TextModel {
 
             x = g.add(
                 format!("{p}.add_mixer"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, mixer_out],
                 vec![n, self.hidden],
                 DType::F32,
@@ -2034,7 +2034,7 @@ impl TextModel {
 
             x = g.add(
                 format!("{p}.add_ffn"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, ffn_out],
                 vec![n, self.hidden],
                 DType::F32,
@@ -2042,7 +2042,7 @@ impl TextModel {
             if let Some(&ds) = deepstack.get(li) {
                 x = g.add(
                     format!("{p}.deepstack"),
-                    Op::Add,
+                    Op::Binary { kind: crate::graph::BinaryKind::Add },
                     &[x, ds],
                     vec![n, self.hidden],
                     DType::F32,

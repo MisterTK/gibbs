@@ -389,7 +389,7 @@ impl Vision {
             // gelu(gate) * up as Unary + Mul: a literal `GeGlu` here lets the megakernel MLP fusion
             // claim the block, and that kernel is single-row only (this graph has `np` rows).
             let g = b.unary(&format!("{p}.gelu"), UnaryKind::GeluTanh, g, vec![np, inter]);
-            let m = b.op(&format!("{p}.glu"), Op::Mul, &[g, u], vec![np, inter]);
+            let m = b.op(&format!("{p}.glu"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[g, u], vec![np, inter]);
             let m = l.down.add_to(&mut b, &format!("{p}.down"), m, np);
             let m = b.rms(&format!("{p}.post_ff_ln"), m, l.post_ff_ln.clone(), eps, vec![np, d]);
             h = b.add(&format!("{p}.res2"), h, m, vec![np, d]);

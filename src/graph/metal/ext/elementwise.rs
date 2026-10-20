@@ -47,9 +47,6 @@ pub enum Step {
 /// `UnaryKind`: a new kind breaks the build here until its kernel case exists.
 fn unary_code(op: &Op) -> Option<(u32, f32, f32)> {
     Some(match op {
-        Op::Relu => (8, 0.0, 0.0),
-        Op::Silu => (10, 0.0, 0.0),
-        Op::Gelu { tanh } => (if *tanh { 12 } else { 11 }, 0.0, 0.0),
         Op::Unary { kind } => match kind {
             UnaryKind::Exp => (0, 0.0, 0.0),
             UnaryKind::Sigmoid => (1, 0.0, 0.0),
@@ -75,8 +72,6 @@ fn unary_code(op: &Op) -> Option<(u32, f32, f32)> {
 /// `binary_f32` switch code for ops that are an element-wise binary map.
 fn binary_code(op: &Op) -> Option<u32> {
     Some(match op {
-        Op::Add => 0,
-        Op::Mul => 2,
         Op::Binary { kind } => match kind {
             BinaryKind::Add => 0,
             BinaryKind::Sub => 1,
@@ -239,7 +234,7 @@ fn plan_binary(g: &Graph, node: &Node, kind: u32) -> Result<PlanOut<Step>, Strin
     let out_n = numel(g, out)?;
     numel(g, a)?;
     numel(g, b)?;
-    let row_scale = matches!(node.op, Op::Mul);
+    let row_scale = matches!(node.op, Op::Binary { kind: BinaryKind::Mul });
     let (dims, sa, sb) = coalesce(broadcast_view(
         &g.value(a).shape,
         &g.value(b).shape,
@@ -421,10 +416,10 @@ mod tests {
         .into_iter()
         .map(|(k, s, p)| (Op::Unary { kind: k }, s, p))
         .collect();
-        v.push((Op::Relu, 3.0, false));
-        v.push((Op::Silu, 8.0, false));
-        v.push((Op::Gelu { tanh: false }, 6.0, false));
-        v.push((Op::Gelu { tanh: true }, 6.0, false));
+        v.push((Op::Unary { kind: UnaryKind::Relu }, 3.0, false));
+        v.push((Op::Unary { kind: UnaryKind::Silu }, 8.0, false));
+        v.push((Op::Unary { kind: UnaryKind::GeluErf }, 6.0, false));
+        v.push((Op::Unary { kind: UnaryKind::GeluTanh }, 6.0, false));
         v
     }
 
@@ -472,7 +467,7 @@ mod tests {
             Op::Unary {
                 kind: Clamp(-5.0, 5.0),
             },
-            Op::Gelu { tanh: true },
+            Op::Unary { kind: UnaryKind::GeluTanh },
         ] {
             let (want, got) = run1(op.clone(), x.clone());
             close(&want, &got, 1e-5, &format!("{op:?} saturation"));
@@ -580,9 +575,9 @@ mod tests {
                 for op in [
                     Op::Binary { kind },
                     if kind == BinaryKind::Add {
-                        Op::Add
+                        Op::Binary { kind: BinaryKind::Add }
                     } else if kind == BinaryKind::Mul {
-                        Op::Mul
+                        Op::Binary { kind: BinaryKind::Mul }
                     } else {
                         Op::Binary { kind }
                     },
@@ -623,8 +618,8 @@ mod tests {
         ] {
             let (a, b) = (rand(prod(&ash), 11), rand(prod(&bsh), 13));
             for op in [
-                Op::Add,
-                Op::Mul,
+                Op::Binary { kind: BinaryKind::Add },
+                Op::Binary { kind: BinaryKind::Mul },
                 Op::Binary {
                     kind: BinaryKind::Sub,
                 },
@@ -647,13 +642,13 @@ mod tests {
             (vec![5, 37], vec![5, 1], vec![5, 37]),
         ] {
             let (a, b) = (rand(prod(&ash), 17), rand(prod(&bsh), 19));
-            let (want, got) = run2(Op::Mul, (&ash, &bsh, &osh), (a, b));
+            let (want, got) = run2(Op::Binary { kind: BinaryKind::Mul }, (&ash, &bsh, &osh), (a, b));
             close(&want, &got, 1e-5, &format!("Mul {ash:?} {bsh:?}"));
         }
         // Row scaling by hand: row r of a is multiplied by b[r].
         let (a, b) = (rand(24, 1), rand(2, 2));
         let (cpu, metal) = run2(
-            Op::Mul,
+            Op::Binary { kind: BinaryKind::Mul },
             (&[2, 3, 4], &[2, 1], &[2, 3, 4]),
             (a.clone(), b.clone()),
         );
@@ -675,7 +670,7 @@ mod tests {
         );
         close(&want, &got, 1e-5, "large div");
         let (a, b) = (rand(1000 * 1001, 31), rand(1001, 37));
-        let (want, got) = run2(Op::Add, (&[1000, 1001], &[1001], &[1000, 1001]), (a, b));
+        let (want, got) = run2(Op::Binary { kind: BinaryKind::Add }, (&[1000, 1001], &[1001], &[1000, 1001]), (a, b));
         close(&want, &got, 1e-6, "large row add");
     }
 
@@ -708,7 +703,7 @@ mod tests {
         let f = DType::F32;
         let mut g = Graph::new();
         let (a, b) = (g.input("a", vec![5], f), g.input("b", vec![3], f));
-        let z = g.add("bad_add", Op::Add, &[a, b], vec![5], f);
+        let z = g.add("bad_add", Op::Binary { kind: BinaryKind::Add }, &[a, b], vec![5], f);
         g.output(z);
         let e = s(
             &g,
@@ -722,7 +717,7 @@ mod tests {
             g.input("a", vec![2, 1, 2, 1, 2, 1, 2], f),
             g.input("b", vec![1, 2, 1, 2, 1, 2, 1], f),
         );
-        let z = g.add("rank7", Op::Add, &[a, b], vec![2; 7], f);
+        let z = g.add("rank7", Op::Binary { kind: BinaryKind::Add }, &[a, b], vec![2; 7], f);
         g.output(z);
         let e = s(
             &g,
@@ -768,12 +763,12 @@ mod tests {
             assert!(!supports(&Op::Binary { kind: k }, DType::U32));
         }
         for op in [
-            Op::Relu,
-            Op::Silu,
-            Op::Gelu { tanh: true },
-            Op::Gelu { tanh: false },
-            Op::Add,
-            Op::Mul,
+            Op::Unary { kind: UnaryKind::Relu },
+            Op::Unary { kind: UnaryKind::Silu },
+            Op::Unary { kind: UnaryKind::GeluTanh },
+            Op::Unary { kind: UnaryKind::GeluErf },
+            Op::Binary { kind: BinaryKind::Add },
+            Op::Binary { kind: BinaryKind::Mul },
         ] {
             assert!(supports(&op, DType::F32), "{op:?}");
             assert!(!supports(&op, DType::F16), "{op:?}");

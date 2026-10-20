@@ -1,7 +1,7 @@
 //! GPU-only enforcement: the avenue ladder every node must climb before it may leave the GPU, the
 //! per-family gates for loaders that still run on the CPU, and the op list each family needs.
 //!
-//! `explore_node` tries five avenues in order and stops at the first that really has a code path.
+//! `explore_node` tries the avenues in order and stops at the first that really has a code path.
 //! A graph with an unlowered node fails to place with a [`GpuReport`] naming every avenue's reason.
 
 use crate::graph::{BinaryKind, DType, Op, PairLayout, ReduceKind, RopeVariant, UnaryKind, UpsampleMode};
@@ -11,28 +11,16 @@ use crate::hardware::QuantFormat;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Avenue {
     MetalKernel,
-    Decompose,
     DtypeAdapt,
-    GeneratedKernel,
-    MatmulPrimitive,
 }
 
 impl Avenue {
-    pub const ALL: [Avenue; 5] = [
-        Avenue::MetalKernel,
-        Avenue::Decompose,
-        Avenue::DtypeAdapt,
-        Avenue::GeneratedKernel,
-        Avenue::MatmulPrimitive,
-    ];
+    pub const ALL: [Avenue; 2] = [Avenue::MetalKernel, Avenue::DtypeAdapt];
 
     pub fn name(self) -> &'static str {
         match self {
             Avenue::MetalKernel => "metal-kernel",
-            Avenue::Decompose => "decompose",
             Avenue::DtypeAdapt => "dtype-adapt",
-            Avenue::GeneratedKernel => "generated-kernel",
-            Avenue::MatmulPrimitive => "matmul-primitive",
         }
     }
 }
@@ -101,13 +89,6 @@ fn metal_kernel(op: &Op, dtype: DType) -> Verdict {
     }
 }
 
-fn decompose(op: &Op, dtype: DType) -> Verdict {
-    match crate::graph::passes::decompose::rule_for(op, dtype) {
-        Some(how) => Verdict::Lowered(how),
-        None => Verdict::Rejected(format!("no rewrite rule for {}", op.name())),
-    }
-}
-
 /// Whether a quantized weight with no Metal codec is dequantized at load (`metal.rs` weight upload).
 fn load_time_dequant(op: &Op, dtype: DType) -> bool {
     matches!(op, Op::Linear | Op::Embedding | Op::Megakernel(_)) && matches!(dtype, DType::Quant(_))
@@ -127,35 +108,13 @@ fn dtype_adapt(op: &Op, dtype: DType) -> Verdict {
     ))
 }
 
-fn generated(op: &Op, dtype: DType) -> Verdict {
-    if crate::graph::codegen::can_generate(op, dtype) {
-        Verdict::Lowered("generated MSL kernel")
-    } else {
-        Verdict::Rejected(format!(
-            "op {} is not covered by the generated elementwise/movement/reduction templates",
-            op.name()
-        ))
-    }
-}
-
-/// `MatMul` through a simdgroup_matrix / matmul2d kernel. No such lowering exists yet (G4.1 step 5).
-fn matmul_primitive(op: &Op, _dtype: DType) -> Verdict {
-    Verdict::Rejected(format!(
-        "no simdgroup_matrix/matmul2d lowering for {}",
-        op.name()
-    ))
-}
-
-/// Tries the five avenues in order and stops at the first `Lowered`.
+/// Tries the avenues in order and stops at the first `Lowered`.
 pub fn explore_node(name: &str, op: &Op, dtype: DType) -> NodeReport {
     let mut attempts = Vec::with_capacity(Avenue::ALL.len());
     for avenue in Avenue::ALL {
         let verdict = match avenue {
             Avenue::MetalKernel => metal_kernel(op, dtype),
-            Avenue::Decompose => decompose(op, dtype),
             Avenue::DtypeAdapt => dtype_adapt(op, dtype),
-            Avenue::GeneratedKernel => generated(op, dtype),
-            Avenue::MatmulPrimitive => matmul_primitive(op, dtype),
         };
         let done = matches!(verdict, Verdict::Lowered(_));
         attempts.push(Attempt { avenue, verdict });
@@ -368,8 +327,8 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (rope_hs(), F32),
             (cached_attn(), F32),
             (Op::SwiGlu, F32),
-            (Op::Gelu { tanh: true }, F32),
-            (Op::Add, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
         ]);
     };
     match f {
@@ -378,7 +337,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             decoder(&mut ops);
             ops.extend([
                 (Op::GeGlu, F32),
-                (Op::Mul, F32),
+                (Op::Binary { kind: BinaryKind::Mul }, F32),
                 (unary(UnaryKind::SoftCap(30.0)), F32),
                 // The sparse (routed expert) layers.
                 (Op::TopK { k: 8 }, F32),
@@ -413,8 +372,8 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                     },
                     F32,
                 ),
-                (Op::Silu, F32),
-                (Op::Mul, F32),
+                (Op::Unary { kind: UnaryKind::Silu }, F32),
+                (Op::Binary { kind: BinaryKind::Mul }, F32),
                 (unary(UnaryKind::Sigmoid), F32),
                 (unary(UnaryKind::Softplus), F32),
                 (Op::L2Normalize, F32),
@@ -425,9 +384,9 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Linear, F32),
             (ln(), F32),
             (attn(), F32),
-            (Op::Gelu { tanh: false }, F32),
-            (Op::Add, F32),
-            (Op::Mul, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
             (Op::MeanPool, F32),
             (Op::L2Normalize, F32),
         ]),
@@ -445,7 +404,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Transpose { perm: vec![1, 0] }, F32),
             (attn(), F32),
             (Op::GeGlu, F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (Op::AvgPool2d { kernel: [3, 3], stride: [3, 3] }, F32),
             (unary(UnaryKind::Scale(2.0)), F32),
             (Op::Scatter { axis: 0 }, F32),
@@ -456,8 +415,8 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Linear, F32),
             (Op::Linear, BF16),
             (Op::Embedding, F32),
-            (Op::Mul, F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (reshape(), F32),
             (slice(), F32),
             (
@@ -478,14 +437,14 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             ),
             (attn(), F32),
             (ln(), F32),
-            (Op::Gelu { tanh: true }, F32),
-            (Op::Gelu { tanh: false }, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
         ]),
         // The MTP head (embed-norm, hidden-norm, concat, fc, one gated attention layer) and the
         // plain draft models' decode graphs.
         Family::DraftersMtp => {
             decoder(&mut ops);
-            ops.extend([(Op::Concat { axis: -1 }, F32), (Op::Mul, F32), (Op::Silu, F32)]);
+            ops.extend([(Op::Concat { axis: -1 }, F32), (Op::Binary { kind: BinaryKind::Mul }, F32), (Op::Unary { kind: UnaryKind::Silu }, F32)]);
         }
         Family::DraftersBlock => ops.extend([
             (Op::Linear, F32),
@@ -493,7 +452,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (attn(), F32),
             (rope_hs(), F32),
             (Op::SwiGlu, F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
         ]),
         Family::T5 => ops.extend([
             (Op::Embedding, F32),
@@ -521,9 +480,9 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (attn(), F32),
             (cached_attn(), F32),
             (unary(UnaryKind::Scale(2.0)), F32),
-            (Op::Relu, F32),
+            (Op::Unary { kind: UnaryKind::Relu }, F32),
             (Op::GeGlu, F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
         ]),
         // Positions are `Embedding` over the position table; beams are separate states forked
         // on the GPU (`StateReorder` cannot write state in place, so it is not used).
@@ -534,11 +493,11 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (attn(), F32),
             (cached_attn(), F32),
             (unary(UnaryKind::Scale(2.0)), F32),
-            (Op::Relu, F32),
-            (Op::Gelu { tanh: false }, F32),
-            (Op::Gelu { tanh: true }, F32),
-            (Op::Silu, F32),
-            (Op::Add, F32),
+            (Op::Unary { kind: UnaryKind::Relu }, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+            (Op::Unary { kind: UnaryKind::Silu }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
         ]),
         Family::Idefics3Siglip => ops.extend([
             // SigLIP tower + pixel-shuffle connector, the embeds-input Llama decoder, and the
@@ -546,10 +505,10 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (conv2d(), F32),
             (reshape(), F32),
             (Op::Transpose { perm: vec![0, 2, 1, 3, 4] }, F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (ln(), F32),
             (attn(), F32),
-            (Op::Gelu { tanh: true }, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
             (Op::Linear, F32),
             (rms(), F32),
             (slice(), F32),
@@ -566,9 +525,9 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (ln(), F32),
             (Op::Linear, F32),
             (attn(), F32),
-            (Op::Gelu { tanh: false }, F32),
-            (Op::Relu, F32),
-            (Op::Add, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
+            (Op::Unary { kind: UnaryKind::Relu }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (unary(UnaryKind::Tanh), F32),
             (unary(UnaryKind::Sigmoid), F32),
             (unary(UnaryKind::Neg), F32),
@@ -600,11 +559,11 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 F32,
             ),
             (rope_hs(), F32),
-            (Op::Gelu { tanh: false }, F32),
-            (Op::Gelu { tanh: true }, F32),
-            (Op::Silu, F32),
-            (Op::Mul, F32),
-            (Op::Add, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+            (Op::Unary { kind: UnaryKind::Silu }, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (slice(), F32),
             (Op::MeanPool, F32),
             (Op::MatMul { transpose_a: false, transpose_b: true }, F32),
@@ -634,16 +593,16 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (rope_hs(), F32),
             (Op::SwiGlu, F32),
             (Op::GeGlu, F32),
-            (Op::Gelu { tanh: true }, F32),
-            (Op::Relu, F32),
-            (Op::Mul, F32),
-            (Op::Add, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+            (Op::Unary { kind: UnaryKind::Relu }, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (slice(), F32),
         ]),
         Family::DiffusionUnet => ops.extend([
             (conv2d(), F32),
             (group_norm(), F32),
-            (Op::Silu, F32),
+            (Op::Unary { kind: UnaryKind::Silu }, F32),
             (
                 Op::Upsample {
                     scale: 2,
@@ -657,10 +616,10 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Linear, F32),
             (Op::Linear, DType::F16),
             (Op::Linear, BF16),
-            (Op::Add, F32),
-            (Op::Mul, F32),
             (Op::Binary { kind: BinaryKind::Add }, F32),
-            (Op::Gelu { tanh: false }, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
             (unary(UnaryKind::Scale(1.702)), F32),
             (unary(UnaryKind::Sigmoid), F32),
             (ln(), F32),
@@ -678,8 +637,8 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 (attn(), F32),
                 (ln(), F32),
                 (rms(), F32),
-                (Op::Mul, F32),
-                (Op::Add, F32),
+                (Op::Binary { kind: BinaryKind::Mul }, F32),
+                (Op::Binary { kind: BinaryKind::Add }, F32),
                 (
                     Op::Binary {
                         kind: BinaryKind::Div,
@@ -698,9 +657,9 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                     },
                     F32,
                 ),
-                (Op::Gelu { tanh: true }, F32),
-                (Op::Gelu { tanh: false }, F32),
-                (Op::Silu, F32),
+                (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+                (Op::Unary { kind: UnaryKind::GeluErf }, F32),
+                (Op::Unary { kind: UnaryKind::Silu }, F32),
                 (Op::SwiGlu, F32),
                 (Op::GeGlu, F32),
                 (
@@ -745,7 +704,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (conv2d(), F32),
             (conv3d(), F32),
             (group_norm(), F32),
-            (Op::Silu, F32),
+            (Op::Unary { kind: UnaryKind::Silu }, F32),
             (
                 Op::Upsample {
                     scale: 2,
@@ -754,10 +713,10 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 F32,
             ),
             (attn(), F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (Op::Binary { kind: BinaryKind::Add }, F32),
             (Op::Binary { kind: BinaryKind::Div }, F32),
-            (Op::Relu, F32),
+            (Op::Unary { kind: UnaryKind::Relu }, F32),
             (rms(), F32),
             (Op::Gather { axis: 0 }, F32),
             (Op::MatMul { transpose_a: false, transpose_b: true }, F32),
@@ -775,10 +734,10 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (attn(), F32),
             (ln(), F32),
             (rms(), F32),
-            (Op::Mul, F32),
-            (Op::Add, F32),
-            (Op::Silu, F32),
-            (Op::Gelu { tanh: true }, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
+            (Op::Unary { kind: UnaryKind::Silu }, F32),
+            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
             (reshape(), F32),
             (slice(), F32),
             (Op::Concat { axis: 0 }, F32),
@@ -789,13 +748,13 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (attn(), F32),
             (Op::Concat { axis: 0 }, F32),
             (conv2d(), F32),
-            (Op::Silu, F32),
+            (Op::Unary { kind: UnaryKind::Silu }, F32),
             (Op::Linear, F32),
             (Op::Linear, DType::F16),
-            (Op::Add, F32),
-            (Op::Mul, F32),
             (Op::Binary { kind: BinaryKind::Add }, F32),
-            (Op::Gelu { tanh: false }, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
+            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
             (ln(), F32),
             (slice(), F32),
             (reshape(), F32),
@@ -815,8 +774,8 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (Op::Linear, F32),
             (Op::Linear, BF16),
             (Op::Slice { axis: -1, start: 0, end: 1 }, F32),
-            (Op::Mul, F32),
-            (Op::Add, F32),
+            (Op::Binary { kind: BinaryKind::Mul }, F32),
+            (Op::Binary { kind: BinaryKind::Add }, F32),
             (unary(UnaryKind::Sqrt), F32),
             (conv2d(), F32),
             (

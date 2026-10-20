@@ -203,12 +203,12 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
             }
             let arg = |k: usize| n.inputs.get(k).map(|v| v.0 as i64);
             let tag = match &n.op {
-                Op::Gelu { tanh: false } => Some("GeluErf"),
-                Op::Silu => Some("Silu"),
+                Op::Unary { kind: crate::graph::UnaryKind::GeluErf } => Some("GeluErf"),
+                Op::Unary { kind: crate::graph::UnaryKind::Silu } => Some("Silu"),
                 Op::SwiGlu => Some("SwiGlu"),
                 Op::GeGlu => Some("GeGlu"),
-                Op::Add => Some("Add"),
-                Op::Mul => Some("Mul"),
+                Op::Binary { kind: crate::graph::BinaryKind::Add } => Some("Add"),
+                Op::Binary { kind: crate::graph::BinaryKind::Mul } => Some("Mul"),
                 _ => None,
             };
             if let (Some(t), Some(a)) = (tag, arg(0)) {
@@ -882,10 +882,10 @@ mod tests {
         );
         let n0 = g.add("n0", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, h], F);
         let o = g.add("o", Op::Linear, &[n0, wo], vec![1, h], F);
-        let r = g.add("r", Op::Add, &[o, x], vec![1, h], F);
+        let r = g.add("r", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![1, h], F);
         let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[r, gw], vec![1, h], F);
-        let r1 = g.add("r1", Op::Add, &[r, n1], vec![1, h], F);
-        let sc = g.add("sc", Op::Mul, &[r1, s], vec![1, h], F);
+        let r1 = g.add("r1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, n1], vec![1, h], F);
+        let sc = g.add("sc", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[r1, s], vec![1, h], F);
         let rope = Op::Rope {
             head_dim: hd,
             rotary_dim: hd,
@@ -939,8 +939,8 @@ mod tests {
         let x = g.input("x", vec![1, 64], F);
         let gw = g.weight("g", vec![64], F);
         let n = g.add("n", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
-        let r = g.add("r", Op::Add, &[n, x], vec![1, 64], F);
-        g.add("dead", Op::Silu, &[r], vec![1, 64], F);
+        let r = g.add("r", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[n, x], vec![1, 64], F);
+        g.add("dead", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[r], vec![1, 64], F);
         g.nodes.pop();
         g.output(r);
         let d = decide(&g).unwrap();
@@ -1010,7 +1010,7 @@ mod tests {
             F,
         );
         let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], F);
-        let wv = g.add("weights", Op::Mul, &[probs, sc], vec![m, top_k], F);
+        let wv = g.add("weights", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[probs, sc], vec![m, top_k], F);
         let moe = Op::MoeLinear { experts, top_k };
         let gu = g.add(
             "gu",
@@ -1034,7 +1034,7 @@ mod tests {
             shape: Some(vec![m * top_k, 1]),
         };
         let w_col = g.add("w_col", col, &[wv], vec![m * top_k, 1], F);
-        let weighted = g.add("weighted", Op::Mul, &[down, w_col], vec![m * top_k, h], F);
+        let weighted = g.add("weighted", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[down, w_col], vec![m * top_k, h], F);
         let slots = Op::Reshape {
             shape: Some(vec![m, top_k, h]),
         };

@@ -455,7 +455,7 @@ impl Gemma3Text {
             let a = b.g.add(format!("{p}.attn"), attn, &[q, k, v], vec![n, nh * hd], f);
             let o = lin(&mut b, &format!("{p}.o"), a, &l.o);
             let o = norm(&mut b, format!("{p}.post_attn_ln"), o, &l.post_attn_ln, vec![n, h]);
-            x = b.g.add(format!("{p}.res1"), Op::Add, &[x, o], vec![n, h], f);
+            x = b.g.add(format!("{p}.res1"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], vec![n, h], f);
             let a = norm(&mut b, format!("{p}.pre_ff_ln"), x, &l.pre_ff_ln, vec![n, h]);
             let gate = lin(&mut b, &format!("{p}.gate"), a, &l.gate);
             let up = lin(&mut b, &format!("{p}.up"), a, &l.up);
@@ -463,7 +463,7 @@ impl Gemma3Text {
             let gu = b.g.add(format!("{p}.mlp"), Op::GeGlu, &[gate, up], vec![n, inter], f);
             let d = lin(&mut b, &format!("{p}.down"), gu, &l.down);
             let d = norm(&mut b, format!("{p}.post_ff_ln"), d, &l.post_ff_ln, vec![n, h]);
-            x = b.g.add(format!("{p}.res2"), Op::Add, &[x, d], vec![n, h], f);
+            x = b.g.add(format!("{p}.res2"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, d], vec![n, h], f);
         }
         let slice = Op::Slice { axis: 0, start: n as i64 - 1, end: n as i64 };
         let last = b.g.add("last_row", slice, &[x], vec![1, h], f);

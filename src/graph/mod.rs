@@ -163,15 +163,6 @@ pub enum MegakernelKind {
         is_geglu: bool,
         has_post_norm: bool,
     },
-    /// Fused Attention: RmsNorm -> Linear(Q, K, V) -> Attention / RoPE / DeltaRule -> Linear(Out) -> Add
-    Attention {
-        hidden_dim: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        eps: f32,
-        is_delta: bool,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -323,12 +314,6 @@ pub enum Op {
         experts: usize,
         top_k: usize,
     },
-    Silu,
-    /// Exact (erf) GELU, or the tanh approximation.
-    Gelu {
-        tanh: bool,
-    },
-    Relu,
     Softmax {
         axis: isize,
     },
@@ -342,10 +327,6 @@ pub enum Op {
     },
     /// `[state, parent [batch] U32]` permuting batch rows in-place.
     StateReorder,
-    /// `[a, b]` element-wise.
-    Add,
-    /// `[a, b]` element-wise.
-    Mul,
     /// `[x [c_in, h, w], w [c_out, c_in/groups, kh, kw], bias? [c_out]]`; padding is
     /// `[top, left, bottom, right]`.
     Conv2d {
@@ -414,14 +395,9 @@ impl Op {
             Op::TopK { .. } => "TopK",
             Op::GatherCols => "GatherCols",
             Op::MoeLinear { .. } => "MoeLinear",
-            Op::Silu => "Silu",
-            Op::Gelu { .. } => "Gelu",
-            Op::Relu => "Relu",
             Op::Softmax { .. } => "Softmax",
             Op::RelPosBias { .. } => "RelPosBias",
             Op::StateReorder => "StateReorder",
-            Op::Add => "Add",
-            Op::Mul => "Mul",
             Op::Conv2d { .. } => "Conv2d",
             Op::Conv1d { .. } => "Conv1d",
             Op::Reshape { .. } => "Reshape",

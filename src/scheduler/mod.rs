@@ -396,14 +396,7 @@ impl ExecutableModel {
                 };
                 std::mem::swap(&mut p.state, seq_state);
                 let chunk_len = chunk_tokens.len();
-                #[cfg(target_os = "macos")]
-                let is_metal = p.segments.len() == 1
-                    && matches!(
-                        p.segments.first(),
-                        Some(crate::graph::program::CompiledSegment::Metal { .. })
-                    );
-                #[cfg(not(target_os = "macos"))]
-                let is_metal = false;
+                let is_metal = p.is_single_metal();
 
                 let last_logits = if chunk_len >= 16 && is_metal {
                     let model = m.read();

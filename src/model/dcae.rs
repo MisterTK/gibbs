@@ -512,7 +512,7 @@ impl DcAeDecoder {
             }
             x = emit_norm(&mut b, x, &self.norm_out);
             let s = b.shape(x).to_vec();
-            x = b.op("relu", Op::Relu, &[x], &s);
+            x = b.op("relu", Op::Unary { kind: crate::graph::UnaryKind::Relu }, &[x], &s);
             x = emit_conv(&mut b, x, &self.conv_out);
             b.output(x);
             b.compile()
@@ -545,8 +545,8 @@ impl DcAeDecoder {
         };
         let (q, k, v) = (part(b, 0), part(b, 1), part(b, 2));
         let sq = [heads, hd, hw];
-        let q = b.op("relu", Op::Relu, &[q], &sq);
-        let k = b.op("relu", Op::Relu, &[k], &sq);
+        let q = b.op("relu", Op::Unary { kind: crate::graph::UnaryKind::Relu }, &[q], &sq);
+        let k = b.op("relu", Op::Unary { kind: crate::graph::UnaryKind::Relu }, &[k], &sq);
         // kv[c][d] = sum_j v[c][j] k[d][j]; ksum[d] = sum_j k[d][j].
         let kv = b.op("kv", Op::MatMul { transpose_a: false, transpose_b: true }, &[v, k], &[heads, hd, hd]);
         let ksum = b.op(

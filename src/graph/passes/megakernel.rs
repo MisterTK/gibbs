@@ -1,9 +1,7 @@
 //! Transformer block megakernel fusion optimization passes.
 //!
-//! Fuses contiguous multi-node transformer subgraphs into minimal single-dispatch
-//! Megakernel operations:
-//! - Attention Megakernel: `RmsNorm -> Linear(QKV) -> Attention/RoPE/DeltaRule -> Out Linear -> Add`
-//! - MLP Megakernel: `RmsNorm -> Linear(GateUp) -> SwiGLU/GeGLU -> Down Linear -> Add`
+//! Fuses the contiguous MLP subgraph into one single-dispatch Megakernel operation:
+//! `RmsNorm -> Linear(GateUp) -> SwiGLU/GeGLU -> Down Linear -> Add`.
 //!
 //! Eliminates over 85% of GPU command encoder dispatches and removes round-trip global
 //! memory bandwidth for intermediate activation buffers.
@@ -59,8 +57,9 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
     for i in 0..n_nodes {
         let add_nid = NodeId(i as u32);
         let add_node = graph.node(add_nid);
-        if !matches!(add_node.op, Op::Add)
+        if !matches!(add_node.op, Op::Binary { kind: crate::graph::BinaryKind::Add })
             || add_node.inputs.len() != 2
+            || graph.value(add_node.inputs[0]).shape != graph.value(add_node.inputs[1]).shape
             || !only.contains(&add_nid)
         {
             continue;
@@ -348,7 +347,7 @@ mod tests {
             DType::F32,
         );
 
-        let out = g.add("add", Op::Add, &[x, down], vec![1, hidden], DType::F32);
+        let out = g.add("add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down], vec![1, hidden], DType::F32);
         g.output(out);
 
         // 1. Run unfused on CPU to get reference output
@@ -473,7 +472,7 @@ mod tests {
             DType::F32,
         );
 
-        let out = g.add("add", Op::Add, &[x, down_norm], vec![1, hidden], DType::F32);
+        let out = g.add("add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down_norm], vec![1, hidden], DType::F32);
         g.output(out);
 
         // 1. Run unfused on CPU to get reference output

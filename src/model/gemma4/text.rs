@@ -667,7 +667,7 @@ impl TextModel {
             w.insert("model.ple.proj_scale", Tensor::F32(vec![proj_scale]));
             let ple_scaled = g.add(
                 "model.ple.proj_scaled",
-                Op::Mul,
+                Op::Binary { kind: crate::graph::BinaryKind::Mul },
                 &[ple_proj, proj_scale_w],
                 vec![n, nl * pd],
                 DType::F32,
@@ -686,7 +686,7 @@ impl TextModel {
             );
             let ple_combined = g.add(
                 "model.ple.add",
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[ple_normed, ple_embed_input],
                 vec![n, nl * pd],
                 DType::F32,
@@ -696,7 +696,7 @@ impl TextModel {
             w.insert("model.ple.half", Tensor::F32(vec![half]));
             Some(g.add(
                 "model.ple.scaled",
-                Op::Mul,
+                Op::Binary { kind: crate::graph::BinaryKind::Mul },
                 &[ple_combined, half_w],
                 vec![n, nl * pd],
                 DType::F32,
@@ -937,7 +937,7 @@ impl TextModel {
             // Residual 1
             x = g.add(
                 format!("{p}.residual_attn"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, o_norm],
                 vec![n, h],
                 DType::F32,
@@ -1029,7 +1029,7 @@ impl TextModel {
             // Residual 2
             x = g.add(
                 format!("{p}.residual_ff"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, down_norm],
                 vec![n, h],
                 DType::F32,
@@ -1091,7 +1091,7 @@ impl TextModel {
                 );
                 x = g.add(
                     format!("{p}.ple.res"),
-                    Op::Add,
+                    Op::Binary { kind: crate::graph::BinaryKind::Add },
                     &[x, ple_normed],
                     vec![n, h],
                     DType::F32,
@@ -1104,7 +1104,7 @@ impl TextModel {
                 w.insert(format!("{p}.scalar"), Tensor::F32(vec![l.scalar]));
                 x = g.add(
                     format!("{p}.scaled"),
-                    Op::Mul,
+                    Op::Binary { kind: crate::graph::BinaryKind::Mul },
                     &[x, scalar_w],
                     vec![n, h],
                     DType::F32,

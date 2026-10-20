@@ -95,13 +95,7 @@ fn layout(kd: usize, vd: usize) -> Option<(usize, usize, usize)> {
 }
 
 fn is_silu(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Silu
-            | Op::Unary {
-                kind: UnaryKind::Silu
-            }
-    )
+    matches!(op, Op::Unary { kind: UnaryKind::Silu })
 }
 fn is_sigmoid(op: &Op) -> bool {
     matches!(
@@ -112,22 +106,10 @@ fn is_sigmoid(op: &Op) -> bool {
     )
 }
 fn is_mul(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Mul
-            | Op::Binary {
-                kind: BinaryKind::Mul
-            }
-    )
+    matches!(op, Op::Binary { kind: BinaryKind::Mul })
 }
 fn is_add(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Add
-            | Op::Binary {
-                kind: BinaryKind::Add
-            }
-    )
+    matches!(op, Op::Binary { kind: BinaryKind::Add })
 }
 
 /// Replaces every matched decode (`n == 1`) chain by one fused step at the chain's last step.
@@ -670,7 +652,7 @@ mod tests {
             vec![1, cd],
             f,
         );
-        let mixed = g.add("silu", Op::Silu, &[conv], vec![1, cd], f);
+        let mixed = g.add("silu", Op::Unary { kind: UnaryKind::Silu }, &[conv], vec![1, cd], f);
         let slice = |g: &mut Graph, name: &str, s: usize, e: usize| {
             g.add(
                 name,
@@ -689,9 +671,9 @@ mod tests {
         let v = slice(&mut g, "v", 2 * kk, cd);
         let un = |kind| Op::Unary { kind };
         let beta = g.add("beta", un(UnaryKind::Sigmoid), &[b], vec![1, vh], f);
-        let ab = g.add("a_biased", Op::Add, &[a, dt], vec![1, vh], f);
+        let ab = g.add("a_biased", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, dt], vec![1, vh], f);
         let sp = g.add("a_softplus", un(UnaryKind::Softplus), &[ab], vec![1, vh], f);
-        let ld = g.add("log_decay", Op::Mul, &[neg_a, sp], vec![1, vh], f);
+        let ld = g.add("log_decay", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[neg_a, sp], vec![1, vh], f);
         let delta = Op::DeltaRule {
             key_heads: kh,
             val_heads: vh,
@@ -715,10 +697,10 @@ mod tests {
         let gate = if sigmoid_gate {
             un(UnaryKind::Sigmoid)
         } else {
-            Op::Silu
+            Op::Unary { kind: UnaryKind::Silu }
         };
         let za = g.add("z_act", gate, &[z], vec![1, vh * vd], f);
-        let out = g.add("gated", Op::Mul, &[normed, za], vec![1, vh * vd], f);
+        let out = g.add("gated", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[normed, za], vec![1, vh * vd], f);
         g.output(out);
         (g, w, ld)
     }

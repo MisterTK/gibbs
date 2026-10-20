@@ -226,7 +226,7 @@ impl SiglipVision {
             let h2 = norm(b, &format!("{p}.ln2"), x, l.ln2);
             let inter = l.fc1.out_f;
             let m = lin(b, &format!("{p}.fc1"), h2, l.fc1);
-            let m = b.op(&format!("{p}.act"), Op::Gelu { tanh: true }, &[m], vec![n, inter]);
+            let m = b.op(&format!("{p}.act"), Op::Unary { kind: crate::graph::UnaryKind::GeluTanh }, &[m], vec![n, inter]);
             let m = lin(b, &format!("{p}.fc2"), m, l.fc2);
             x = b.add(&format!("{p}.res2"), x, m, vec![n, d]);
         }

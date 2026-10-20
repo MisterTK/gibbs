@@ -31,12 +31,12 @@ fn test_diffusion_denoising_and_vae_graph_programs() {
 
     let combined = denoise_g.add(
         "add_cond",
-        Op::Add,
+        Op::Binary { kind: gibbs_engine::graph::BinaryKind::Add },
         &[latent_in, cond_proj],
         vec![latent_elems],
         DType::F32,
     );
-    let act = denoise_g.add("act", Op::Silu, &[combined], vec![latent_elems], DType::F32);
+    let act = denoise_g.add("act", Op::Unary { kind: gibbs_engine::graph::UnaryKind::Silu }, &[combined], vec![latent_elems], DType::F32);
 
     let out_w = denoise_g.weight(
         "out_proj.weight",

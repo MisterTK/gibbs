@@ -239,14 +239,14 @@ mod tests {
         let w = g.weight("w", vec![4, 4], DType::F32);
         let lin = g.add("lin", Op::Linear, &[x, w], vec![2, 4], DType::F32);
         // U32 output: Relu has no lowering at that dtype on any avenue.
-        let out = g.add("act", Op::Relu, &[lin], vec![2, 4], DType::U32);
+        let out = g.add("act", Op::Unary { kind: crate::graph::UnaryKind::Relu }, &[lin], vec![2, 4], DType::U32);
         g.output(out);
         g
     }
 
     /// Metal that supports everything except `Relu`.
     fn no_relu(d: Device, op: &Op, dt: DType) -> bool {
-        d == Device::Metal && !matches!(op, Op::Relu) && device_supports_op(Device::Cpu, op, dt)
+        d == Device::Metal && !matches!(op, Op::Unary { kind: crate::graph::UnaryKind::Relu }) && device_supports_op(Device::Cpu, op, dt)
     }
 
     #[test]
@@ -330,7 +330,7 @@ mod tests {
         let probs = g.add("probs", Op::Softmax { axis: -1 }, &[picked], vec![m, top_k], f);
         let y = g.add("y", Op::MoeLinear { experts, top_k }, &[x, bank, ids], vec![m * top_k, d_out], f);
         let p_col = g.add("p_col", Op::Reshape { shape: Some(vec![m * top_k, 1]) }, &[probs], vec![m * top_k, 1], f);
-        let weighted = g.add("weighted", Op::Mul, &[y, p_col], vec![m * top_k, d_out], f);
+        let weighted = g.add("weighted", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[y, p_col], vec![m * top_k, d_out], f);
         let grouped = g.add("grouped", Op::Reshape { shape: Some(vec![m, top_k, d_out]) }, &[weighted], vec![m, top_k, d_out], f);
         let out = g.add(
             "out",

@@ -139,13 +139,13 @@ impl Gb {
 
     pub fn silu(&mut self, name: &str, x: ValueId) -> ValueId {
         let s = self.shape(x);
-        self.g.add(name, Op::Silu, &[x], s, DType::F32)
+        self.g.add(name, Op::Unary { kind: UnaryKind::Silu }, &[x], s, DType::F32)
     }
 
     pub fn gelu_tanh(&mut self, name: &str, x: ValueId) -> ValueId {
         let s = self.shape(x);
         self.g
-            .add(name, Op::Gelu { tanh: true }, &[x], s, DType::F32)
+            .add(name, Op::Unary { kind: UnaryKind::GeluTanh }, &[x], s, DType::F32)
     }
 
     /// `silu(gate) * up`.

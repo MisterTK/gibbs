@@ -1884,7 +1884,7 @@ fn g_residual(
     let shape = [n, p.d];
     let h = if p.pre_ln { g_ln(g, sig, ln, x, &shape) } else { x };
     let y = f(g, h);
-    let s = eg::node(g, format!("{ln}.res"), Op::Add, &[x, y], &shape);
+    let s = eg::node(g, format!("{ln}.res"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, y], &shape);
     if p.pre_ln {
         s
     } else {
@@ -1896,10 +1896,10 @@ fn g_ffn(g: &mut Graph, sig: &Sig, p: &Plan, pre: &str, h: ValueId, n: usize) ->
     let a = g_lin(g, sig, &format!("{pre}.fc1"), h, n);
     let shape = g.value(a).shape.clone();
     let op = match p.act {
-        ActKind::Relu => Op::Relu,
-        ActKind::Gelu => Op::Gelu { tanh: false },
-        ActKind::GeluTanh => Op::Gelu { tanh: true },
-        ActKind::Silu => Op::Silu,
+        ActKind::Relu => Op::Unary { kind: crate::graph::UnaryKind::Relu },
+        ActKind::Gelu => Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
+        ActKind::GeluTanh => Op::Unary { kind: crate::graph::UnaryKind::GeluTanh },
+        ActKind::Silu => Op::Unary { kind: crate::graph::UnaryKind::Silu },
     };
     let a = eg::node(g, format!("{pre}.act"), op, &[a], &shape);
     g_lin(g, sig, &format!("{pre}.fc2"), a, n)
@@ -1925,7 +1925,7 @@ fn g_embed(
     }
     let pt = sig.w(g, &format!("{side}.pos"));
     let pe = eg::node(g, format!("{side}.posrow"), Op::Embedding, &[pt, rows], &shape);
-    let x = eg::node(g, format!("{side}.embed"), Op::Add, &[e, pe], &shape);
+    let x = eg::node(g, format!("{side}.embed"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[e, pe], &shape);
     if p.ln_emb {
         g_ln(g, sig, &format!("{side}.lnemb"), x, &shape)
     } else {

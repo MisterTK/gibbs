@@ -356,7 +356,7 @@ mod tests {
                 if gelu {
                     y = g.add(
                         "gelu",
-                        Op::Gelu { tanh: false },
+                        Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
                         &[y],
                         vec![m, n],
                         DType::F32,
@@ -364,7 +364,7 @@ mod tests {
                 }
                 if resid {
                     let r = g.input("r", vec![m, n], DType::F32);
-                    y = g.add("res", Op::Add, &[y, r], vec![m, n], DType::F32);
+                    y = g.add("res", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[y, r], vec![m, n], DType::F32);
                     inputs.push(Tensor::F32(rand(m * n, 4)));
                 }
                 g.output(y);

@@ -433,23 +433,11 @@ pub fn infer(op: &Op, inputs: &[Operand]) -> Result<(Vec<usize>, DType), String>
         }
         // A residual block: `x + f(x)`, shaped like `x`.
         Op::Megakernel(desc) => {
-            let d = match desc.kind {
-                MegakernelKind::Mlp { hidden_dim, .. }
-                | MegakernelKind::Attention { hidden_dim, .. } => hidden_dim,
-            };
+            let MegakernelKind::Mlp { hidden_dim: d, .. } = desc.kind;
             if last(0) != d {
                 return Err(fail(format!("x width is not hidden_dim {d}")));
             }
             f32(s(0).to_vec())
-        }
-
-        // ---- Legacy forms of `Unary`/`Binary` (being deleted; drop with the variants). ----
-        Op::Silu | Op::Relu | Op::Gelu { .. } => f32(s(0).to_vec()),
-        Op::Add | Op::Mul => {
-            need(2)?;
-            let out =
-                broadcast(s(0), s(1)).ok_or_else(|| fail("operands do not broadcast".into()))?;
-            f32(out)
         }
     }
 }

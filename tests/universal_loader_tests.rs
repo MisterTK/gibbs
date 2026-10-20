@@ -312,8 +312,8 @@ fn test_architecture_fingerprinting_suite() {
         rope(256, 256, RopeVariant::HalfSplit),
         attn(8, Some(4096), Some(50.0)),
     );
-    let gelu = g.add("gelu", Op::Gelu { tanh: true }, &[a], vec![], F);
-    g.add("mul", Op::Mul, &[gelu, a], vec![], F);
+    let gelu = g.add("gelu", Op::Unary { kind: gibbs_engine::graph::UnaryKind::GeluTanh }, &[a], vec![], F);
+    g.add("mul", Op::Binary { kind: gibbs_engine::graph::BinaryKind::Mul }, &[gelu, a], vec![], F);
     let fp_gemma = fingerprint_graph(&g);
     assert_eq!(fp_gemma.family, "gemma");
     assert_eq!(fp_gemma.attention_soft_capping, Some(50.0));

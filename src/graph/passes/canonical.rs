@@ -91,14 +91,14 @@ mod tests {
         let b = g.input("b", vec![4], DType::F32);
 
         // Identical additions (CSE candidate)
-        let add1 = g.add("add1", Op::Add, &[a, b], vec![4], DType::F32);
-        let add2 = g.add("add2", Op::Add, &[a, b], vec![4], DType::F32);
+        let add1 = g.add("add1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b], vec![4], DType::F32);
+        let add2 = g.add("add2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b], vec![4], DType::F32);
 
         // Dead node (never used by outputs)
-        let _dead = g.add("dead", Op::Mul, &[a, b], vec![4], DType::F32);
+        let _dead = g.add("dead", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[a, b], vec![4], DType::F32);
 
         // Output depends on add1 and add2
-        let mul = g.add("mul", Op::Mul, &[add1, add2], vec![4], DType::F32);
+        let mul = g.add("mul", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[add1, add2], vec![4], DType::F32);
         g.output(mul);
 
         assert_eq!(g.nodes.len(), 4);

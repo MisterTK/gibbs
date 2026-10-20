@@ -32,7 +32,7 @@ pub struct ArchitectureFingerprint {
 pub fn fingerprint_graph(graph: &Graph) -> ArchitectureFingerprint {
     let producer_is = |v: ValueId, f: fn(&Op) -> bool| graph.producer(v).filter(|n| f(&n.op));
     let linear = |v: ValueId| producer_is(v, |op| matches!(op, Op::Linear));
-    let feeds_mul = |n: &Node| graph.consumers(n.outputs[0]).any(|c| matches!(c.op, Op::Mul));
+    let feeds_mul = |n: &Node| graph.consumers(n.outputs[0]).any(|c| matches!(c.op, Op::Binary { kind: crate::graph::BinaryKind::Mul }));
     // An attention operand's projection, looking through RoPE and (fused-QKV) slices.
     let projection = |mut v: ValueId| {
         while let Some(n) = producer_is(v, |op| matches!(op, Op::Rope { .. } | Op::Slice { .. })) {
@@ -61,8 +61,10 @@ pub fn fingerprint_graph(graph: &Graph) -> ArchitectureFingerprint {
             Op::LayerNorm { .. } => has_layernorm = true,
             Op::SwiGlu => has_swiglu = true,
             // Decomposed SwiGLU / GeGLU: the activation gates a Mul.
-            Op::Silu => has_swiglu |= feeds_mul(node),
-            Op::Gelu { .. } => has_geglu |= feeds_mul(node),
+            Op::Unary { kind: crate::graph::UnaryKind::Silu } => has_swiglu |= feeds_mul(node),
+            Op::Unary {
+                kind: crate::graph::UnaryKind::GeluErf | crate::graph::UnaryKind::GeluTanh,
+            } => has_geglu |= feeds_mul(node),
             Op::Rope {
                 head_dim,
                 rotary_dim,
@@ -309,8 +311,8 @@ mod tests {
         // GeGLU: gelu(gate) * up
         let gate = linear(&mut g, "gate", a, false);
         let up = linear(&mut g, "up", a, false);
-        let act = g.add("gelu", Op::Gelu { tanh: true }, &[gate], vec![], F);
-        g.add("mul", Op::Mul, &[act, up], vec![], F);
+        let act = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluTanh }, &[gate], vec![], F);
+        g.add("mul", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[act, up], vec![], F);
 
         let fp = fingerprint_graph(&g);
         assert_eq!(fp.family, "gemma");

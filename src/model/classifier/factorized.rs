@@ -222,8 +222,8 @@ impl Factorized {
             table(gb, "position", &self.pos, pos_v),
             table(gb, "type", &self.types, ty_v),
         );
-        let wp = gb.add("emb.add_position", Op::Add, &[w, p], vec![n, e]);
-        let wpt = gb.add("emb.add_type", Op::Add, &[wp, t], vec![n, e]);
+        let wp = gb.add("emb.add_position", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[w, p], vec![n, e]);
+        let wpt = gb.add("emb.add_type", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[wp, t], vec![n, e]);
         let mut x = gb.ln(wpt, "emb.ln", &self.emb_ln, self.eps);
         if let Some(proj) = &self.proj {
             x = gb.lin(x, "emb.proj", proj);
@@ -243,13 +243,13 @@ impl Factorized {
             let v = gb.lin(x, &format!("{p}.v"), &layer.v);
             let c = gb.add(&format!("{p}.attn"), attn.clone(), &[q, k, v], vec![n, h]);
             let o = gb.lin(c, &format!("{p}.o"), &layer.o);
-            let r = gb.add(&format!("{p}.res1"), Op::Add, &[o, x], vec![n, h]);
+            let r = gb.add(&format!("{p}.res1"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![n, h]);
             let a = gb.ln(r, &format!("{p}.ln1"), &layer.ln1, self.eps);
             let i = gb.lin(a, &format!("{p}.inter"), &layer.inter);
             let act = if self.gelu_tanh { Act::GeluTanh } else { Act::Gelu };
             let i = gb.act(&format!("{p}.act"), act, i);
             let o2 = gb.lin(i, &format!("{p}.out"), &layer.out);
-            let r2 = gb.add(&format!("{p}.res2"), Op::Add, &[o2, a], vec![n, h]);
+            let r2 = gb.add(&format!("{p}.res2"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o2, a], vec![n, h]);
             x = gb.ln(r2, &format!("{p}.ln2"), &layer.ln2, self.eps);
         }
         gb.scope.clear();

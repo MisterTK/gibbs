@@ -105,10 +105,10 @@ impl Gb {
         let shape = self.shape(x);
         let op = match a {
             Act::Tanh => return self.unary(name, UnaryKind::Tanh, x),
-            Act::Relu => Op::Relu,
-            Act::Gelu => Op::Gelu { tanh: false },
-            Act::GeluTanh => Op::Gelu { tanh: true },
-            Act::Silu => Op::Silu,
+            Act::Relu => Op::Unary { kind: UnaryKind::Relu },
+            Act::Gelu => Op::Unary { kind: UnaryKind::GeluErf },
+            Act::GeluTanh => Op::Unary { kind: UnaryKind::GeluTanh },
+            Act::Silu => Op::Unary { kind: UnaryKind::Silu },
         };
         self.add(name, op, &[x], shape)
     }

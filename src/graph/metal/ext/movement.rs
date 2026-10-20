@@ -593,7 +593,7 @@ mod tests {
         let t = b.op(Op::Transpose { perm: vec![1, 0, 2] }, &[u], &[5, 3, 1]);
         let y = b.f32(&[15]);
         let rt_ = b.op(Op::Reshape { shape: Some(vec![15]) }, &[t], &[15]);
-        let sum = b.op(Op::Add, &[rt_, y], &[15]);
+        let sum = b.op(Op::Binary { kind: crate::graph::BinaryKind::Add }, &[rt_, y], &[15]);
         b.check(sum, TOL);
 
         // Runtime-shape reshape (two operands) is still an alias.
@@ -955,7 +955,7 @@ mod tests {
         let mut b = B::new();
         let x = b.f32(&[4, 6]);
         let y = b.f32(&[4, 6]);
-        let s = b.op(Op::Add, &[x, y], &[4, 6]);
+        let s = b.op(Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, y], &[4, 6]);
         let t = b.op(Op::Transpose { perm: vec![1, 0] }, &[s], &[6, 4]);
         let a = b.op(Op::Slice { axis: 0, start: 2, end: 6 }, &[t], &[4, 4]);
         let u = b.op(Op::Upsample { scale: 2, mode: UpsampleMode::Nearest }, &[a], &[8, 8]);
@@ -964,7 +964,7 @@ mod tests {
         let r = b.op(Op::Reshape { shape: Some(vec![200]) }, &[c], &[200]);
         let tl = b.op(Op::Tile { reps: vec![2] }, &[r], &[400]);
         let d = b.op(Op::Slice { axis: 0, start: 100, end: 300 }, &[tl], &[200]);
-        let e = b.op(Op::Add, &[d, r], &[200]);
+        let e = b.op(Op::Binary { kind: crate::graph::BinaryKind::Add }, &[d, r], &[200]);
         b.check(e, TOL);
     }
 

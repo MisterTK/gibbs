@@ -74,6 +74,19 @@ const SCHEMA: &str = r#"
 (ruleset fuse)
 "#;
 
+/// The node's kind fact: `"Add"` for a same-shape `Binary{Add}` (the residual the MLP rules
+/// anchor on, and the pattern-key text refbase recorded), else [`Op::name`].
+fn rule_key(g: &Graph, n: &crate::graph::Node) -> &'static str {
+    match (&n.op, &n.inputs[..]) {
+        (Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b])
+            if g.value(a).shape == g.value(b).shape =>
+        {
+            "Add"
+        }
+        _ => n.op.name(),
+    }
+}
+
 /// One ported fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
@@ -398,7 +411,7 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
             seen[out.0 as usize] = true;
             let node = fs.add("Node", (id, list))?;
             fs.union(o, node)?;
-            fs.add("K", (id, n.op.name()))?;
+            fs.add("K", (id, rule_key(g, n)))?;
             if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
                 fs.add("K", (id, "Glu"))?;
             }
@@ -621,7 +634,7 @@ pub struct Fusion {
     report: Report,
 }
 
-/// Runs the e-graph fusion on `graph` (after canonical/decompose/dtype_adapt), applying the
+/// Runs the e-graph fusion on `graph` (after canonical/dtype_adapt), applying the
 /// extracted fusions in place and updating `weights` like the passes do.
 pub fn fuse(
     graph: &mut Graph,
@@ -964,7 +977,7 @@ impl Fusion {
             let mut s = format!("{:?}{:?}", val.shape, val.dtype);
             if let ValueKind::Node(n) = val.kind {
                 let n = &g.nodes[n.0 as usize];
-                s.push_str(n.op.name());
+                s.push_str(rule_key(g, n));
                 for &i in &n.inputs {
                     let iv = g.value(i);
                     let _ = write!(s, "<{:?}{:?}>", iv.shape, iv.dtype);
@@ -1163,13 +1176,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::passes::{canonical, decompose, dtype_adapt};
+    use crate::graph::passes::{canonical, dtype_adapt};
 
     type Gw = (Graph, Weights);
 
     fn prep(g: &mut Graph) {
         canonical::run(g);
-        decompose::run(g);
         dtype_adapt::run(g);
     }
 
@@ -1270,7 +1282,7 @@ mod tests {
         };
         let a = b.op("attn", attn, &[q, k, v], vec![rows, 64]);
         let o = b.lin("o", a, 64);
-        let r1 = b.op("r1", Op::Add, &[o, x], vec![rows, 64]);
+        let r1 = b.op("r1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![rows, 64]);
         let n2 = b.norm("n2", r1);
         let gate = b.lin("gate", n2, 128);
         let up = b.lin("up", n2, 128);
@@ -1281,22 +1293,22 @@ mod tests {
             d = b.norm("post", d);
         }
         let ins = if swap_add { [d, r1] } else { [r1, d] };
-        let r2 = b.op("r2", Op::Add, &ins, vec![rows, 64]);
+        let r2 = b.op("r2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &ins, vec![rows, 64]);
         b.g.output(r2);
         b.done()
     }
 
     #[test]
     fn megakernel_mlp_and_qkv_fuse() {
-        let r = check("layer", &layer(1, false, false, false), 0xc6f5c97096765749);
+        let r = check("layer", &layer(1, false, false, false), 0xf8ece718cf2b91b2);
         assert_eq!(r.applied, [1, 0, 1, 0]);
         let r = check(
             "post-norm, swapped",
             &layer(1, true, true, false),
-            0x548dc4df19e94c99,
+            0x06512cb92e10d33e,
         );
         assert_eq!(r.applied, [1, 0, 1, 0]);
-        let r = check("geglu", &layer(1, false, true, true), 0xd9052cf30bd86222);
+        let r = check("geglu", &layer(1, false, true, true), 0x2cc601392e956613);
         assert_eq!(r.applied, [1, 0, 1, 0]);
     }
 
@@ -1306,7 +1318,7 @@ mod tests {
         let r = check(
             "two rows",
             &layer(2, false, false, false),
-            0xaf6a40bde60528f7,
+            0x8d3eddb86ea59653,
         );
         assert_eq!(r.applied, [0, 1, 1, 0]);
     }
@@ -1493,12 +1505,12 @@ mod tests {
             ),
         ];
         let want = [
-            ([4, 0, 4, 0], 0x0f6c66a3986ad984),
-            ([0; 4], 0x6091321c90c7fe27),
-            ([1, 0, 0, 0], 0xde0d3b20eed2afd6),
-            ([0; 4], 0x3d09d0f9ee377a33),
-            ([2, 0, 0, 0], 0x16fabbc448999cfb),
-            ([0; 4], 0xd56dee782b84aea3),
+            ([4, 0, 4, 0], 0xd7511e08af7a8e06),
+            ([0; 4], 0x0c9f89f861991093),
+            ([1, 0, 0, 0], 0xf2c0536e6a69910f),
+            ([0; 4], 0xad1ccf01de308e25),
+            ([2, 0, 0, 0], 0xddacfb31b24a368d),
+            ([0; 4], 0xa518af0687efe3a1),
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);
