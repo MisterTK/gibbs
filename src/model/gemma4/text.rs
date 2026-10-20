@@ -46,6 +46,9 @@ pub struct PleTable {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
     row: Box<dyn Fn(usize, &mut [f32]) + Send + Sync>,
+    /// The table as a device-decodable matrix (a GGUF table in BF16/FP16 or a codec format): the
+    /// decode graph gathers its rows itself. `None`: rows come from the host only.
+    pub(crate) mat: Option<Mat>,
 }
 
 impl PleTable {
@@ -62,6 +65,7 @@ impl PleTable {
                     *o = bf16_to_f32(e);
                 }
             }),
+            mat: None,
         }
     }
 
@@ -74,6 +78,7 @@ impl PleTable {
             rows,
             cols,
             row: Box::new(row),
+            mat: None,
         }
     }
 }
@@ -354,6 +359,40 @@ impl TextModel {
         self.layers.iter().any(|l| l.moe.is_some())
     }
 
+    /// Whether the decode graph takes token ids and gathers the token and per-layer embeddings on
+    /// the device (else the host feeds `inputs_embeds` and `per_layer_embed`).
+    pub(crate) fn decode_takes_ids(&self) -> bool {
+        self.embed.gathers_on_device()
+            && self.ple.as_ref().is_none_or(|p| {
+                p.embed.rows >= self.vocab
+                    && p.embed.mat.as_ref().is_some_and(Mat::gathers_on_device)
+            })
+    }
+
+    /// The inputs [`Self::to_decode_graph`] takes for token `tok` at position `pos`.
+    pub fn decode_inputs(&self, tok: u32, pos: u32) -> Vec<crate::graph::Tensor> {
+        use crate::graph::Tensor;
+        if self.decode_takes_ids() {
+            return vec![Tensor::U32(vec![tok]), Tensor::U32(vec![pos])];
+        }
+        let mut e = vec![0.0f32; self.hidden];
+        self.embed_row(tok, &mut e);
+        let mut v = vec![Tensor::F32(e), Tensor::U32(vec![pos])];
+        if let Some(pl) = &self.ple {
+            let mut r = vec![0.0f32; self.layers_n * pl.dim];
+            let id = if (tok as usize) < pl.embed.rows {
+                tok
+            } else {
+                self.pad_id
+            };
+            pl.embed.get_row(id as usize, &mut r);
+            let scale = (pl.dim as f32).sqrt();
+            r.iter_mut().for_each(|x| *x *= scale);
+            v.push(Tensor::F32(r));
+        }
+        v
+    }
+
     pub fn new_cache(&self) -> TextCache {
         TextCache {
             kv: (0..self.layers.len()).map(|_| Kv::default()).collect(),
@@ -581,6 +620,8 @@ impl TextModel {
         out
     }
     /// Emits static-shape decode graph (n = 1) with stateful KV caching, PLE, and weight bindings.
+    /// Inputs `token_ids [1]`, `positions` when [`Self::decode_takes_ids`], else `inputs_embeds`,
+    /// `positions`, `per_layer_embed` (with PLE).
     pub fn to_decode_graph(&self) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         self.to_decode_graph_unchecked()
     }
@@ -588,14 +629,14 @@ impl TextModel {
     pub(crate) fn to_decode_graph_unchecked(
         &self,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph(1, false, self.max_pos, None)
+        self.decode_graph(1, false, self.max_pos, None, self.decode_takes_ids())
     }
 
     /// The same network over `rows` consecutive tokens (inputs `inputs_embeds [rows, h]`, `positions`,
     /// `per_layer_embed`, `visible_end [rows]`): output is the last row's logits `[1, vocab]`. Its weights
     /// are those of [`Self::to_decode_graph`], which is the program that owns them.
     pub(crate) fn to_prefill_graph(&self, rows: usize) -> Result<crate::graph::Graph, String> {
-        self.decode_graph(rows, true, self.max_pos, None)
+        self.decode_graph(rows, true, self.max_pos, None, false)
             .map(|(g, _)| g)
     }
 
@@ -609,17 +650,19 @@ impl TextModel {
         eps: f32,
         score: &[f32],
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
-        self.decode_graph(1, false, max_ctx, Some((head_norm, eps, score)))
+        self.decode_graph(1, false, max_ctx, Some((head_norm, eps, score)), false)
     }
 
     /// Builds the graph for `rows` token rows. `prefill` adds the `visible_end` input (sliding layers),
     /// slices the last row before the head and leaves the per-token decode shape (`rows == 1`) alone.
+    /// `ids`: the graph takes token ids and gathers its embeddings ([`Self::decode_takes_ids`]).
     fn decode_graph(
         &self,
         rows: usize,
         prefill: bool,
         max_ctx: usize,
         head: Option<(&[f32], f32, &[f32])>,
+        ids: bool,
     ) -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
         use crate::graph::{DType, Graph, Op, RopeVariant, Tensor};
         fn mat_dtype(m: &crate::model::weights::Mat) -> DType {
@@ -640,12 +683,75 @@ impl TextModel {
 
         let n = rows;
         let h = self.hidden;
-        let mut x = g.input("inputs_embeds", vec![n, h], DType::F32);
+        let token_ids = ids.then(|| g.input("token_ids", vec![n], DType::U32));
+        let x_in = (!ids).then(|| g.input("inputs_embeds", vec![n, h], DType::F32));
         let positions = g.input("positions", vec![n], DType::U32);
         let pd = self.ple.as_ref().map_or(0, |p| p.dim);
         let nl = self.layers_n;
+        // The tied LM head is also the token embedding table.
+        let lm_w = ids.then(|| {
+            let v = g.weight(
+                "lm_head.weight",
+                vec![self.vocab, h],
+                mat_dtype(&self.embed),
+            );
+            w.insert("lm_head.weight", self.embed.to_graph_tensor());
+            v
+        });
+        let mut x = match (x_in, token_ids, lm_w) {
+            (Some(x), ..) => x,
+            (None, Some(t), Some(table)) => {
+                let e = g.add(
+                    "model.embed",
+                    Op::Embedding,
+                    &[table, t],
+                    vec![n, h],
+                    DType::F32,
+                );
+                if (self.embed_scale - 1.0).abs() > 1e-6 {
+                    let s = g.weight("model.embed_scale", vec![1], DType::F32);
+                    w.insert("model.embed_scale", Tensor::F32(vec![self.embed_scale]));
+                    g.add(
+                        "model.embed_scaled",
+                        Op::Mul,
+                        &[e, s],
+                        vec![n, h],
+                        DType::F32,
+                    )
+                } else {
+                    e
+                }
+            }
+            _ => unreachable!("ids declare the token ids and the table"),
+        };
         let ple_node = if let Some(p_model) = &self.ple {
-            let ple_embed_input = g.input("per_layer_embed", vec![n, nl * pd], DType::F32);
+            let ple_embed_input = match token_ids {
+                None => g.input("per_layer_embed", vec![n, nl * pd], DType::F32),
+                Some(t) => {
+                    let mat = p_model.embed.mat.as_ref().ok_or("PLE table is host-only")?;
+                    let tw = g.weight("model.ple.table", vec![mat.rows, mat.cols], mat_dtype(mat));
+                    w.insert("model.ple.table", mat.to_graph_tensor());
+                    let e = g.add(
+                        "model.ple.embed",
+                        Op::Embedding,
+                        &[tw, t],
+                        vec![n, nl * pd],
+                        DType::F32,
+                    );
+                    let s = g.weight("model.ple.embed_scale", vec![1], DType::F32);
+                    w.insert(
+                        "model.ple.embed_scale",
+                        Tensor::F32(vec![(pd as f32).sqrt()]),
+                    );
+                    g.add(
+                        "model.ple.embed_scaled",
+                        Op::Mul,
+                        &[e, s],
+                        vec![n, nl * pd],
+                        DType::F32,
+                    )
+                }
+            };
             let model_proj_w = g.weight(
                 "model.ple.model_proj.weight",
                 vec![p_model.model_proj.rows, p_model.model_proj.cols],
@@ -1163,12 +1269,15 @@ impl TextModel {
             )
         } else {
             // 4. LM Head (quantized native representation, avoiding dense F32 dequantization)
-            let lm_w = g.weight(
-                "lm_head.weight",
-                vec![self.vocab, h],
-                mat_dtype(&self.embed),
-            );
-            w.insert("lm_head.weight", self.embed.to_graph_tensor());
+            let lm_w = lm_w.unwrap_or_else(|| {
+                let v = g.weight(
+                    "lm_head.weight",
+                    vec![self.vocab, h],
+                    mat_dtype(&self.embed),
+                );
+                w.insert("lm_head.weight", self.embed.to_graph_tensor());
+                v
+            });
             let logits = g.add(
                 "lm_head",
                 Op::Linear,
@@ -1404,14 +1513,7 @@ mod tests {
         let mut cpu_state = crate::graph::StateStore::new();
         let mut tok = 5u32;
         for pos in 0..6usize {
-            let mut emb = vec![0.0f32; model.hidden];
-            model.embed_row(tok, &mut emb);
-            let inputs = || {
-                vec![
-                    crate::graph::Tensor::F32(emb.clone()),
-                    crate::graph::Tensor::U32(vec![pos as u32]),
-                ]
-            };
+            let inputs = || model.decode_inputs(tok, pos as u32);
             let want = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
             let want = want[0].as_f32().unwrap();
             assert!(want.iter().all(|v| v.is_finite()));
@@ -1444,7 +1546,7 @@ mod tests {
     #[test]
     fn gemma4_moe_greedy_stream_f16_kv_matches_f32() {
         use crate::graph::metal::{Runtime, Session};
-        use crate::graph::{StateStore, Tensor};
+        use crate::graph::StateStore;
         let model = tiny_moe_model();
         let (g, w) = model.to_decode_graph().unwrap();
         let rt = Runtime::new(&crate::model::hub::HuggingFaceHub::cache_dir()).unwrap();
@@ -1456,9 +1558,7 @@ mod tests {
             let mut state = StateStore::new();
             let (mut tok, mut toks, mut all_logits) = (5u32, vec![], vec![]);
             for pos in 0..48u32 {
-                let mut emb = vec![0.0f32; model.hidden];
-                model.embed_row(tok, &mut emb);
-                let inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos])];
+                let inputs = model.decode_inputs(tok, pos);
                 let out = session
                     .run_prepared(&g, &plan, Some(&mut state), inputs)
                     .unwrap();
@@ -1478,16 +1578,22 @@ mod tests {
         let (got_toks, got) = stream(true);
         assert_eq!(got_toks, want_toks, "greedy streams diverge");
         for (step, (w, g)) in want.iter().zip(&got).enumerate() {
-            let diff = w.iter().zip(g).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let diff = w
+                .iter()
+                .zip(g)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
             let scale = w.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-            assert!(diff / scale < 2e-3, "step {step}: max logit diff {diff} (scale {scale})");
+            assert!(
+                diff / scale < 2e-3,
+                "step {step}: max logit diff {diff} (scale {scale})"
+            );
         }
     }
 
     #[test]
     fn test_gemma4_to_decode_graph_cpu_parity() {
         use crate::graph::cpu::run_stateless;
-        use crate::graph::Tensor;
 
         let model = tiny_model();
         let h = model.hidden;
@@ -1501,9 +1607,7 @@ mod tests {
 
         // 2. Graph forward pass
         let (decode_g, w) = model.to_decode_graph().unwrap();
-        let mut emb_in = vec![0.0f32; h];
-        model.embed_row(tok, &mut emb_in);
-        let inputs = vec![Tensor::F32(emb_in), Tensor::U32(vec![0])];
+        let inputs = model.decode_inputs(tok, 0);
         let graph_res = run_stateless(&decode_g, &w, inputs).expect("graph execution succeeds");
         let graph_logits = graph_res[0].as_f32().expect("f32 logits");
 
@@ -1700,7 +1804,6 @@ mod tests {
     fn test_gemma4_to_decode_graph_metal_matches_cpu() {
         use crate::graph::cpu::run_stateless;
         use crate::graph::metal::{Runtime, Session};
-        use crate::graph::Tensor;
         use crate::model::weights::Weights;
 
         let (h, v, nh, kvh, hd) = (64, 128, 2, 2, 32);
@@ -1778,9 +1881,7 @@ mod tests {
 
         let (decode_g, w) = model.to_decode_graph().unwrap();
         let tok = 7u32;
-        let mut emb_in = vec![0.0f32; h];
-        model.embed_row(tok, &mut emb_in);
-        let inputs = vec![Tensor::F32(emb_in), Tensor::U32(vec![0])];
+        let inputs = model.decode_inputs(tok, 0);
 
         let cpu_res = run_stateless(&decode_g, &w, inputs.clone()).expect("cpu run succeeds");
         let cpu_logits = cpu_res[0].as_f32().expect("f32 cpu logits");

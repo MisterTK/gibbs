@@ -33,8 +33,9 @@ pub fn load_gguf(
     })
 }
 
-/// Decode graph and weights of the text decoder of the `gemma4` GGUF at `path`, with its scaled token
-/// embedding lookup: what a parity test needs to run the same graph on the CPU executor and Metal.
+/// Decode graph and weights of the text decoder of the `gemma4` GGUF at `path`, with the inputs it
+/// takes for a token at a position: what a parity test needs to run the same graph on the CPU
+/// executor and Metal.
 #[allow(clippy::type_complexity)]
 pub fn gguf_decode_fixture(
     path: &Path,
@@ -42,20 +43,14 @@ pub fn gguf_decode_fixture(
     (
         crate::graph::Graph,
         crate::graph::Weights,
-        Box<dyn Fn(u32) -> Vec<f32>>,
+        Box<dyn Fn(u32, u32) -> Vec<crate::graph::Tensor>>,
     ),
     String,
 > {
     let (manifest, data) = crate::model::loaders::gguf::open(path)?;
     let text = load_text(&Arc::new(data), &manifest)?;
     let (g, w) = text.to_decode_graph()?;
-    let hidden = text.hidden;
-    let embed = move |id: u32| {
-        let mut row = vec![0.0f32; hidden];
-        text.embed_row(id, &mut row);
-        row
-    };
-    Ok((g, w, Box::new(embed)))
+    Ok((g, w, Box::new(move |tok, pos| text.decode_inputs(tok, pos))))
 }
 
 /// Metadata value(s) of `key`: one number, or a comma-joined array ([`UniversalModelLoader::parse_gguf`]).
@@ -344,6 +339,16 @@ fn ple_table(
         t.dtype.clone(),
         t.byte_offset,
     );
+    let mat = crate::model::weights::Mat::from_packed(
+        crate::model::weights::Packed {
+            map: map.clone(),
+            off: base,
+            format,
+            shape: vec![rows, cols],
+        },
+        rows,
+        cols,
+    );
     let row = move |id: usize| -> Result<Vec<f32>, String> {
         let raw = &map[base + id * row_bytes..][..row_bytes];
         match crate::model::layers::dequantize_gguf_blocks(format, raw) {
@@ -352,10 +357,12 @@ fn ple_table(
         }
     };
     row(0).map_err(|e| format!("per_layer_token_embd.weight: {e}"))?;
-    Ok(PleTable::lazy(rows, cols, move |id, out| {
+    let mut table = PleTable::lazy(rows, cols, move |id, out| {
         // Decodable: the first row was.
         out.copy_from_slice(&row(id).expect("per-layer embedding row")[..cols]);
-    }))
+    });
+    table.mat = mat.gathers_on_device().then_some(mat);
+    Ok(table)
 }
 
 /// transformers name of an `mmproj` tensor of the `gemma4v` / `gemma4a` projectors (`None`: not
@@ -823,13 +830,7 @@ mod tests {
         let mut cpu_state = crate::graph::StateStore::new();
         let mut tok = 5u32;
         for pos in 0..6usize {
-            let emb = embed(tok);
-            let inputs = || {
-                vec![
-                    crate::graph::Tensor::F32(emb.clone()),
-                    crate::graph::Tensor::U32(vec![pos as u32]),
-                ]
-            };
+            let inputs = || embed(tok, pos as u32);
             let want = crate::graph::cpu::run(&g, &w, &mut cpu_state, inputs()).unwrap();
             let want = want[0].as_f32().unwrap();
             let got = prog.run(inputs()).unwrap();
@@ -1011,7 +1012,7 @@ mod tests {
     #[test]
     #[ignore = "needs the real E2B QAT checkpoint under disk/"]
     fn gemma4_real_metal_cpu_bisect() {
-        use crate::graph::{StateStore, Tensor};
+        use crate::graph::StateStore;
         let default = "disk/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf".to_string();
         let path = std::env::var("GIBBS_GEMMA_GGUF").unwrap_or(default);
         let path = std::path::Path::new(&path);
@@ -1033,24 +1034,7 @@ mod tests {
         let tokens = [
             2u32, 105, 2364, 3041, 563, 506, 5279, 1855, 529, 5946, 38102, 236764, 710, 2364,
         ];
-        let build = |tok: u32, pos: usize| {
-            let mut emb = vec![0.0f32; text.hidden];
-            text.embed_row(tok, &mut emb);
-            let mut inputs = vec![Tensor::F32(emb), Tensor::U32(vec![pos as u32])];
-            if let Some(p) = &text.ple {
-                let mut e = vec![0.0f32; text.layers_n * p.dim];
-                let id = if (tok as usize) < p.embed.rows {
-                    tok
-                } else {
-                    text.pad_id
-                };
-                p.embed.get_row(id as usize, &mut e);
-                let sc = (p.dim as f32).sqrt();
-                e.iter_mut().for_each(|v| *v *= sc);
-                inputs.push(Tensor::F32(e));
-            }
-            inputs
-        };
+        let build = |tok: u32, pos: usize| text.decode_inputs(tok, pos as u32);
         let mut cpu_state = StateStore::new();
         let mut native_cache = text.new_cache();
         let mut mg = g.clone();

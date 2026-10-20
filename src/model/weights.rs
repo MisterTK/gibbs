@@ -43,6 +43,19 @@ impl Mat {
             _ => None,
         }
     }
+    /// Whether a device `Embedding` can gather rows of this matrix as stored: bf16, packed
+    /// BF16/FP16, or a GPU codec format whose blocks tile a row.
+    pub fn gathers_on_device(&self) -> bool {
+        use crate::hardware::QuantFormat as Q;
+        match self.packed() {
+            None => true,
+            Some(p) => {
+                matches!(p.format, Q::BF16 | Q::FP16)
+                    || crate::graph::codec::codec(p.format)
+                        .is_some_and(|c| self.cols % c.block_elems as usize == 0)
+            }
+        }
+    }
     pub fn to_graph_tensor(&self) -> crate::graph::Tensor {
         crate::graph::Tensor::Mat(self.clone())
     }

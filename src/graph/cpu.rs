@@ -287,6 +287,20 @@ pub fn run(
                             );
                         }
                     }
+                    Tensor::Mat(m) => {
+                        for (r, &id) in ids.iter().enumerate() {
+                            let id = id as usize;
+                            if id >= m.rows {
+                                return Err(format!(
+                                    "node '{name}': row {r} id {id} out of range for table of {} rows",
+                                    m.rows
+                                ));
+                            }
+                            let at = out.len();
+                            out.resize(at + d, 0.0);
+                            m.decode_row_f32(id, &mut out[at..]);
+                        }
+                    }
                     other => {
                         let full = other.to_f32();
                         let rows = full.len() / d;

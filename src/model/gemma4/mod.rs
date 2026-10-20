@@ -335,6 +335,50 @@ impl NativeLm for Gemma4 {
     ) -> Result<crate::graph::Tensor, String> {
         self.pass(tokens, start_pos, state, true)
     }
+    fn stream_greedy_token(
+        &self,
+        last: u32,
+        start_pos: usize,
+        max_new: usize,
+        state: &mut SeqState,
+    ) -> Result<Option<u32>, String> {
+        let st = state
+            .downcast_mut::<State>()
+            .ok_or("gemma4: foreign sequence state")?;
+        let Some(prog) = self
+            .program
+            .as_ref()
+            .filter(|_| self.text.decode_takes_ids())
+        else {
+            return Ok(None);
+        };
+        let mut p = prog.lock();
+        // Stream only where the per-token path would continue (no image run-ahead pending).
+        if !p.is_single_metal() || st.done != st.asked || start_pos != st.asked {
+            return Ok(None);
+        }
+        std::mem::swap(&mut p.state, &mut st.program_state);
+        let out = p.stream_next(last, start_pos as u32, max_new, self.tokenizer.vocab_size());
+        std::mem::swap(&mut p.state, &mut st.program_state);
+        if let Ok(Some(_)) = out {
+            st.asked = start_pos + 1;
+            st.done = st.asked;
+        }
+        out
+    }
+    fn stream_end(&self, state: &mut SeqState) -> Result<(), String> {
+        let st = state
+            .downcast_mut::<State>()
+            .ok_or("gemma4: foreign sequence state")?;
+        if let Some(prog) = &self.program {
+            let mut p = prog.lock();
+            std::mem::swap(&mut p.state, &mut st.program_state);
+            let out = p.stream_end();
+            std::mem::swap(&mut p.state, &mut st.program_state);
+            out?;
+        }
+        Ok(())
+    }
 }
 
 /// Rows per batched prefill pass on the Metal program, and the most a pass may grow to when an image
@@ -380,6 +424,8 @@ impl Gemma4 {
         let h = self.text.hidden;
         let mut x = vec![0.0f32; (stop - from) * h];
         let mut ple_ids = Vec::with_capacity(stop - from);
+        // A single row through an ids-taking decode program needs no host embedding.
+        let ids_only = self.program.is_some() && self.text.decode_takes_ids() && stop - from == 1;
         for (r, pos) in (from..stop).enumerate() {
             let row = &mut x[r * h..(r + 1) * h];
             // Positions past `tokens` are the rest of an image block: media rows.
@@ -393,7 +439,9 @@ impl Gemma4 {
                     ple_ids.push(u32::MAX); // media rows take the pad id's per-layer embedding
                 }
                 Err(_) if (t as usize) < self.text.vocab => {
-                    self.text.embed_row(t, row);
+                    if !ids_only {
+                        self.text.embed_row(t, row);
+                    }
                     ple_ids.push(t);
                 }
                 Err(_) => return Err(format!("gemma4: token id {t} outside the vocabulary")),
@@ -479,8 +527,14 @@ impl Gemma4 {
     ) -> Result<crate::graph::Tensor, String> {
         use crate::graph::Tensor;
         let (h, m) = (self.text.hidden, ids.len());
+        let takes_ids = self.text.decode_takes_ids();
         let mut ple = Vec::new();
-        if let Some(pl) = &self.text.ple {
+        if let Some(pl) = self
+            .text
+            .ple
+            .as_ref()
+            .filter(|_| !(takes_ids && m == 1 && ids[0] != u32::MAX))
+        {
             let (pd, nl) = (pl.dim, self.text.layers_n);
             for &id in ids {
                 let mut e = vec![0.0f32; nl * pd];
@@ -500,34 +554,54 @@ impl Gemma4 {
             Some(t @ (Tensor::F32(_) | Tensor::U32(_))) => Ok(t),
             _ => Err("gemma4: program did not return F32 logits".to_string()),
         };
-        if m > 1 && p.is_single_metal() {
-            let g = self.text.to_prefill_graph(m)?;
-            let end = |pos: usize| match blocks.iter().find(|b| b.contains(&pos)) {
-                Some(b) => b.end as u32,
-                None => pos as u32 + 1,
-            };
+        let end = |pos: usize| match blocks.iter().find(|b| b.contains(&pos)) {
+            Some(b) => b.end as u32,
+            None => pos as u32 + 1,
+        };
+        let prefill = |p: &mut crate::graph::program::GraphProgram,
+                       x: &[f32],
+                       ple: Vec<f32>,
+                       start: usize| {
+            let rows = x.len() / h;
+            let g = self.text.to_prefill_graph(rows)?;
             let mut inputs = vec![
                 Tensor::F32(x.to_vec()),
-                Tensor::U32((pos0..pos0 + m).map(|q| q as u32).collect()),
+                Tensor::U32((start..start + rows).map(|q| q as u32).collect()),
             ];
             if self.text.ple.is_some() {
                 inputs.push(Tensor::F32(ple));
             }
-            inputs.push(Tensor::U32((pos0..pos0 + m).map(end).collect()));
-            return logits(p.run_reshaped(&g, inputs)?);
+            inputs.push(Tensor::U32((start..start + rows).map(end).collect()));
+            logits(p.run_reshaped(&g, inputs)?)
+        };
+        if m > 1 && p.is_single_metal() {
+            return prefill(p, x, ple, pos0);
         }
         if m > 1 && blocks.iter().any(|b| b.start < pos0 + m && pos0 < b.end) {
             return Err("gpu-only: image blocks are attended bidirectionally, which needs the Metal program; rerun with --backend cpu".into());
         }
         let mut last = Tensor::F32(Vec::new());
         for (i, emb) in x.chunks_exact(h).enumerate() {
-            let mut inputs = vec![
-                Tensor::F32(emb.to_vec()),
-                Tensor::U32(vec![(pos0 + i) as u32]),
-            ];
-            if self.text.ple.is_some() {
-                inputs.push(Tensor::F32(ple[i * ple_row..(i + 1) * ple_row].to_vec()));
-            }
+            let pos = (pos0 + i) as u32;
+            let inputs = match (takes_ids, ids[i]) {
+                // A media row has no token id: the one-row prefill graph takes its embedding.
+                (true, u32::MAX) if p.is_single_metal() => {
+                    let row_ple = ple[i * ple_row..(i + 1) * ple_row].to_vec();
+                    last = prefill(p, emb, row_ple, pos0 + i)?;
+                    continue;
+                }
+                (true, u32::MAX) => {
+                    return Err("gpu-only: a media row needs the Metal prefill graph".into())
+                }
+                (true, id) => vec![Tensor::U32(vec![id]), Tensor::U32(vec![pos])],
+                (false, _) => {
+                    let mut v = vec![Tensor::F32(emb.to_vec()), Tensor::U32(vec![pos])];
+                    if self.text.ple.is_some() {
+                        v.push(Tensor::F32(ple[i * ple_row..(i + 1) * ple_row].to_vec()));
+                    }
+                    v
+                }
+            };
             last = logits(if greedy && i + 1 == m {
                 p.run_greedy(inputs, self.tokenizer.vocab_size())?
             } else {
