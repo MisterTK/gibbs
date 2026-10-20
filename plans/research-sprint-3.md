@@ -3,7 +3,7 @@
 ## Goal
 Implement every Luminal technique Gibbs does not use yet, and every TODO from the Wave 12 deep dive. The five "highest-ROI" items come first (Phase 1). Phase 0 gives them their go/no-go numbers; it is a prerequisite, not new scope. Every change must be generic (graph-IR patterns and codec descriptors, no model names), must pass `scripts/loop_guard.sh` plus a multi-commit `generic_guard` over the promoted range, and is kept only through an unspliced 4-pass ABBA (`scripts/loop_verify.sh`). Every GPU job runs through `python3 ~/.cache/gibbs/central_scheduler.py run [--quiet] --label <name> -- <cmd>`.
 
-## Status on branch `s3/final` (`sprint3` minus the removed items; GPU go-ahead run in progress)
+## Status: `s3/final` merged to `main` (`sprint3` minus the removed items)
 
 All code is on `sprint3`. Until the GPU go-ahead, the user's GPU was in use for training, so nothing below the go-ahead section was measured. What ran before it, CPU-only:
 - 106 tests that never touch a device (list: `target/sprint3/cpu-tests.txt` in the integration worktree);
@@ -66,13 +66,26 @@ GPU contact that did happen, against the instruction:
 5. ABBA, clean: `main` vs `sprint3` −2.13 pp, all of it f16 KV (−3.82 pp alone, now opt-in); views +0.01 and q/k/v over `Mat` −0.03 (neutral, both removed on the user's call: branch `s3/final`).
 6. Opt-in candidates prepared for ABBA: 6.2 Q4_K `fused_dot` (`s3/q4k-fused-dot`), 6.6 L13 as `GIBBS_SPECIALIZE=on` (`s3/l13-specialize`, a port of `aeb50b6`); E3 is the existing `GIBBS_EXEC_ORDER_WEIGHTS=1`.
 
-**Still pending (each needs a quiet GPU; a foreign graphics workload at ~45% contended the `deltanet` and `qwen_packed` runs):**
-1. Rerun the `deltanet` and `qwen_packed` ABBAs against `3929384`.
-2. Each opt-in knob alone (`GIBBS_PLE_FUSED=one`, `GIBBS_DELTANET_STATE=f16|bf16`, `GIBBS_IQ2_GRID=tg|buf`, `GIBBS_GPU_ARGMAX=1`, `GIBBS_PLAN_SEARCH=1`, `GIBBS_EXEC_ORDER_WEIGHTS=1`), then `GIBBS_SPECIALIZE=on` and the 6.2 Q4_K candidate (their branches need `every_kernel_source_compiles` and their GPU parity tests first).
-3. `s3/final`: `every_kernel_source_compiles`, full `cargo test --lib`, `--bench-parity` (the removals changed MSL and the planner).
-4. 6.1: the tuner's `gen64` picks on M1/M2's Q4_K/Q5_K/Q6_K shapes, read from the tune file after a quiet re-tune (only `shape_rates` ran).
-5. Real-weights parity for M1, M3 and M7, which `--bench-parity` does not cover (its suite marks 5 reference rows).
-6. `main` vs `s3/final`; merge to `main` only through the keep gate.
+**Short A/B round (2026-10-20, `s3/final` `1414253`; one-model suites, 64 decode tokens, warm-up + 2 timed runs, base/cand/cand/base per affected row; every bench process under a minute):**
+
+| A/B | tok/s ratio (cand / base) | delta_pp (noise) | verdict |
+| :--- | :--- | :--- | :--- |
+| `main` vs `s3/final`, all 9 rows | Qwen3.5-2B 1.253, 9B 1.012, others 0.991–1.002; geomean 1.025 | +1.14 (0.04) | keep: merged |
+| DeltaNet step vs `GIBBS_DISABLE=deltanet` | 2B 1.019, 9B 1.013 | +0.97 (0.39) | keep (default on) |
+| packed `linear_attn` vs `GIBBS_DISABLE=qwen_packed` | 2B 1.232, 9B 0.994 | +5.28 (0.02) | keep (default on) |
+| `GIBBS_PLE_FUSED=one` | E2B QAT 0.67, E2B Q4_K_M 0.83 | — | discard (stays opt-in) |
+| `GIBBS_DELTANET_STATE=f16` / `bf16` | 1.004–1.011 / 0.993–1.003 | +0.48 / −0.11 | opt-in, not default (f16 changes state precision) |
+| `GIBBS_IQ2_GRID=tg` / `buf` | 0.997–1.008 | +0.14 / +0.13 | neutral |
+| `GIBBS_GPU_ARGMAX=1` | E2B 1.043 (spread 7%), 2B 1.005 | +1.20 (1.68) | inconclusive |
+| `GIBBS_PLAN_SEARCH=1` | E2B Q4_K_M 0.965 | −0.81 | discard |
+| E3 `GIBBS_EXEC_ORDER_WEIGHTS=1` | E2B 0.976 | −0.66 | discard |
+| L13 `GIBBS_SPECIALIZE=on` (`s3/l13-specialize`) | E2B 0.956 | −1.11 | discard, not merged |
+| 6.2 Q4_K `fused_dot` (`s3/q4k-fused-dot`) | E2B Q4_K_M 0.973 | −0.86 | discard, not merged (the kernel-level +2% did not survive the model) |
+
+- 6.1: after the quiet loads the tuner picked `gen64` on 4 of 48 Q4_K/Q5_K/Q6_K shapes (Q5_K 512/2048/6144 rows), each within 2% of `gen/r1`.
+- Parity on `s3/final`: 5 reference rows and M1, M3 at min cosine 1.00000; M7 cannot run there (the CPU leg has no Gemma 4 MoE host forward).
+- `cargo test --lib` on `s3/final`: 861 passed, 0 failed; the kernel compile test and the guard's integration tests pass.
+- README bench numbers are not regenerated (that needs a full-length `gibbs --bench bench/loop.json`).
 
 ## Baseline (`main` @ `5de3057`, README rows = `bg_232` cand1 pass)
 
