@@ -1,6 +1,6 @@
 # Sprint 3 probes (Phase 0)
 
-Raw outputs of the Phase 0 probes in `plans/research-sprint-3.md`. The GPU probes (P0.1, P0.3, P0.4, P0.5) are queued in `scripts/sprint3_probes.sh p01|p03|p04|p05` and have not been run yet.
+Raw outputs of the Phase 0 probes in `plans/research-sprint-3.md`. The GPU probes (P0.1, P0.3, P0.4, P0.5) run through `scripts/sprint3_probes.sh p01|p03|p04|p05`; their results are in [GPU probes](#gpu-probes-go-ahead-run-2026-10-19) below.
 
 ## P0.2 plan dumps (CPU, no GPU)
 
@@ -154,5 +154,89 @@ Then a post-norm and an MLP. The 8 post-projection steps (conv … gated) are 14
 - **E-graph cutover:** dumps of rows 0/1/2/4/7 after the cutover (`61b27c6`) are byte-identical to the pre-cutover dumps above (step lines, kind histogram, totals).
 - **`GIBBS_PLE_FUSED=one` on M1:** 486 → 451 dispatches with 36 `GluGemvChain` steps (the BF16 PLE weights go through the expert pseudo-codecs).
 - **Device check:** rows 0/1/2/7 never loaded the AGX driver. Row 4 loaded `AGXMetalG17X` and `IOGPU` as the last two images, after the dump printed, so something on the Llama path creates a device on exit. Nothing is dispatched, but the tool is not strictly device-free there.
-- **Host profile quarantined:** `~/.cache/gibbs/host/Apple-M5-Pro-25G241-4ed0d8e9b05eb2d9.json` was written at 10:40 by Metal tests that agents ran by mistake, measuring 156.0 GB/s under training load (baseline 286.9). It is renamed `*.contaminated`, so the first quiet run on `sprint3` re-measures. Until then, dump with `--rates` pointing at the `92719a27…` baseline profile.
+- **Host profile quarantined:** `~/.cache/gibbs/host/Apple-M5-Pro-25G241-4ed0d8e9b05eb2d9.json` was written at 10:40 by Metal tests that agents ran by mistake, measuring 156.0 GB/s under training load (baseline 286.9). It is renamed `*.contaminated`. A second contaminated copy (11:45, 95.7 GB/s, 16 µs dispatch) is renamed `*.contaminated2`; the go-ahead run re-measured it (below).
 
+## GPU probes (go-ahead run, 2026-10-19)
+
+Every job ran through `central_scheduler.py run --quiet` on an otherwise idle GPU; raw logs are in `target/sprint3/` of the `s3-int` worktree.
+
+**Host profile and tune file.** `cargo test --lib` writes the host profile without the foreign-load check (`cfg!(not(test))` in `Runtime` setup), and its parallel tests persist tune winners measured under each other's load. Before the probes:
+- The `sprint3` profile was re-measured by one quiet single-model `gibbs --bench` (M0): 292.7 GB/s, 0.63 µs dispatch, codec rates included.
+- The 107 tune entries keyed by the current kernel hashes (main and sprint3 share them for 33 of 36 formats; only Q4_K/Q5_K/Q6_K differ, through `gen64`) moved to `~/.cache/gibbs/host.pre-s3libtests/tune-current-hash-entries.json`, so every current shape re-tunes on a quiet GPU. Later test runs restore the tune file afterwards.
+
+**Load bug found on the way.** M0 failed to load on `sprint3` (`missing weight 'layers.0.attn.q.weight'`): the q/k/v `Mat` fusion (1.2) removed the parts from the decode program's weights, but batched prefill plans a fresh, unfused build of the network through `GraphProgram::run_reshaped`. Fixed in `8cbbd9e`: the e-graph report names each applied q/k/v trio and `run_reshaped` replays them (`fusion::replay_qkv`), with a CPU regression test. After it: `cargo test --lib` 872 passed / 0 failed, the guard's integration tests pass, `--bench-parity` 5/5 (min cosine 0.99999–1.00000).
+
+### P0.1 kernel profile (`GIBBS_PROFILE_KERNELS=1`, sprint3 `8cbbd9e`)
+
+Last decode step's table per model (µs per token; CachedAttention's bytes count the whole KV allocation, so its GB/s is not a rate):
+
+| row | GemvPacked | MegakernelMlp | CachedAttention | RmsNorm (+Batch) | other |
+|---|---|---|---|---|---|
+| M0 | 202 steps, 3494 µs, 173 GB/s (59%) | 15, 1035 µs, 79% | 35, 1315 µs | 112, 733 µs | 15 µs |
+| M1 | 200, 4447 µs, 218 GB/s (74%) | 18, 2422 µs, 63% | 35, 1317 µs | 106, 701 µs | 14 µs |
+| M2 | 157, 4830 µs, 241 GB/s (82%) | 8, 895 µs, 65% | 6, 196 µs | 47, 255 µs | DeltaNetStep 18 steps 285 µs (15.8 µs each, 80 GB/s); 32 µs |
+| M7 | 186, 7027 µs, 235 GB/s (80%) | — | 30, 999 µs | 181, 1517 µs | ExpertLinear 60 steps 3180 µs; TopK 288 µs; MoeWeightedSum 116 µs |
+| M8 | 202, 3504 µs, 59% | 15, 1034 µs, 79% | 35, 3800 µs | 112, 746 µs | 14 µs |
+
+Profiling serializes command buffers, so the decode tok/s these runs print (5–12) is not a bench number.
+
+### P0.3 llama-bench refresh (`llama-bench -p 0 -n 128 -r 3`, Homebrew llama.cpp 0.6.0_1, ggml 0.26.0)
+
+| row | llama.cpp tg128 now | 2026-10-13 value in `bench-reference.json` |
+|---|---|---|
+| M0 | 145.11 ± 0.89 | 150.7 |
+| M1 | 115.69 ± 1.20 | 121.8 |
+| M2 | 143.78 ± 2.15 | 148.3 |
+| M3 | 42.60 ± 0.08 | 43.2 |
+| M4 | 260.23 ± 1.63 | 269.0 |
+| M7 | 80.86 ± 0.14 | — |
+| M8 (`-d 5777`) | 122.88 ± 9.32 | — |
+
+Every row reads 1.4–4% below the 2026-10-13 value on the same build. `bench-reference.json` is not updated by this probe.
+
+### P0.4 Wave 11 ABBA (`5de3057` cand vs `4ff5e60` base, `scripts/loop_verify.sh`)
+
+delta_pp +0.03, noise_pp 0.04, min ratio 0.990, ratios_ok, E2B QAT 149.1 tok/s. Below the 0.30 pp keep gate: Wave 11 is neutral on the suite, which closes `rsi-44-w11` as no measurable effect.
+
+### P0.5 same-model reference (`bench/reference-7b.json`, sprint3 `8cbbd9e`)
+
+| model | Gibbs decode tok/s | roofline % (292.7 GB/s ceiling, streamed bytes) |
+|---|---|---|
+| Llama 2 7B Q4_0 | 62.4 | 79.2 |
+| Llama 2 7B Q8_0 | 35.6 | 85.3 |
+
+### 6.2 K-quant `fused_dot` with ≥ 64 MB of weights rotating
+
+`kquant_fused_dot_ablation` (5 ABBA rounds, median):
+- Q4_K 12288×1536 r2: unfused 210.6 GB/s vs fused 214.5 GB/s, fused wins 5/5 (1.019×).
+- Q4_K 4096×1536 r1: 187.1 vs 191.8 GB/s, 5/5 (1.025×).
+- Q6_K 1536×12288 r1: 261.1 vs 258.9 GB/s, 2/5 (0.992×); a second run 260.2 vs 261.0, 4/5 (1.003×). Q6_K stays unfused.
+
+The Q4_K fused form is the candidate on branch `s3/q4k-fused-dot` (`3cc1ea3`), pending its own ABBA.
+
+### 6.1 `gen64` (64-thread K-quant GEMV) against the 256-thread variants (`shape_rates`, DRAM rotation)
+
+Best GB/s per shape, `gen64` vs the best other variant:
+- Q4_K: `gen64/r2` 196 vs 195 at 6144×1536 (tie); behind at 1536×6144 (184 vs 198), 2048×1536, 1536×2048, 1536×2816; tie at the lm_head shapes.
+- Q5_K: `gen64/r1` ahead by 1–3 GB/s at 6144×1536, 2048×1536, 2816×768; tie or behind elsewhere.
+- Q6_K: `gen64` never ahead (`gen/r1` best at every projection shape).
+
+No shape gains more than 1.5%. The tuner keeps the incumbent on ties (`tune::beats`), so `gen64` is picked only where it clears the margin; see the tune-file check after the suite ABBA.
+
+
+## Phase 4 ABBA (`scripts/loop_verify.sh`, full suite, base binary first)
+
+Clean runs started at 0% GPU utilization. From about 23:58Z a foreign graphics workload (Renderer ~45%, Tiler ~10%, no CPU-heavy process) held the GPU, so the `deltanet` and `qwen_packed` runs below are contended and need a rerun.
+
+| run | base | cand | delta_pp | noise_pp | ratios_ok | per-model (cand / base tok/s) |
+|---|---|---|---|---|---|---|
+| main vs sprint3 | main `5de3057` | sprint3 `8cbbd9e` | −2.13 | 1.78 | no | E2B QAT 0.91, E2B Q4_K_M 0.94, Qwen3.5-2B **1.30**, 9B 0.91, Llama Q4_0 0.97, SmolLM2 0.91, bnb 1.02, 26B-A4B 1.01, E2B ctx4k 0.77 |
+| f16 KV | sprint3, `GIBBS_KV_DTYPE=f32` | sprint3 (f16 default) | −3.82 | 0.06 | no | E2B QAT 0.91, E2B Q4_K_M 0.91, Qwen3.5-2B 0.99, 9B 1.00, Llama Q4_0 0.96, SmolLM2 0.92, bnb 0.97, 26B-A4B 0.96, E2B ctx4k **0.76** |
+| views | sprint3, `GIBBS_DISABLE=views` | sprint3 | +0.01 | 0.10 | yes | all within 0.99–1.01 |
+| q/k/v over `Mat` | sprint3, `GIBBS_DISABLE=qkv_mat` | sprint3 | −0.03 | 0.46 | yes | E2B QAT 1.02, E2B Q4_K_M 1.01, 26B-A4B 1.01, others 0.97–1.01 |
+| DeltaNet step (contended) | sprint3, `GIBBS_DISABLE=deltanet` | sprint3 | +1.35 | 1.20 | no | Qwen3.5-2B 1.02 (spread 5.5%), 9B 0.84 (spread 43%); unrelated rows moved ±30% |
+| Qwen3.5 packed (contended) | sprint3, `GIBBS_DISABLE=qwen_packed` | sprint3 | +0.51 | 0.17 | no (E2B QAT 0.96, unaffected by the switch) | Qwen3.5-2B **1.23** (105.1 → 129.2) |
+
+- **f16 KV** is the whole main-vs-sprint3 regression: with f32 KV, sprint3 decodes E2B QAT at 152.8 tok/s against main's 149.8. Dispatch counts are equal; the GPU time grows in attention (E2B ctx4k 7.61 → 10.06 ms/token). f32 is the default again (`3929384`), f16 is opt-in.
+- **views** and **q/k/v over `Mat`** are neutral: below the 0.30 pp keep gate, no ratio regression.
+- The Qwen3.5-2B gain (1.30× vs main) comes from the packed `linear_attn` projections (1.23× alone, contended) and the DeltaNet step.
