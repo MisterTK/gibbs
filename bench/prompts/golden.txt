@@ -1,0 +1,3 @@
+The capital of France is
+def fibonacci(n):
+Explain the second law of thermodynamics to a curious student.
