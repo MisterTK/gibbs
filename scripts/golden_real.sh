@@ -53,7 +53,7 @@ while IFS='|' read -r slug id kind; do
     HF_HUB_CACHE="$cache" python3 ~/.cache/gibbs/central_scheduler.py run --label "gr-$slug" -- \
       "$bin" -m "$id" --prompt "translate English to German: The house is wonderful." --max-tokens 16 \
       >"$tmp" 2>/dev/null
-    python3 -c 'import json,sys; print(json.dumps({"text": open(sys.argv[1]).read().strip()}))' "$tmp" >"$tmp.json"
+    python3 -c 'import json,re,sys; t=open(sys.argv[1]).read(); m=re.search(r"Output:\n(.*?)\n\S*\s*Decode:", t, re.S); print(json.dumps({"text": m.group(1).strip() if m else "NO OUTPUT"}))' "$tmp" >"$tmp.json"
   else
     : >"$tmp.json"
     while IFS= read -r prompt; do
