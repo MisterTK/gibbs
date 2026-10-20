@@ -2298,17 +2298,23 @@ pub fn tiny_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights
 mod tests {
     use super::*;
 
-    /// [`crate::graph::shape::assert_shapes`] except the gated-attention q path, whose builder
-    /// declares implicit reshapes the flat CPU executor tolerates: the q `Linear` (`[n, heads*2*hd]`)
-    /// as `[n*heads, 2*hd]`, and the q-norm / gate sigmoid over `[n*heads, hd]` operands as
-    /// `[n, heads*hd]`. Reported by the shape check, not inferred.
-    fn assert_shapes_but_gated_q(g: &crate::graph::Graph) {
-        let gated = [".self_attn.q':", ".self_attn.q_norm':", ".self_attn.gate_act':"];
-        let bad: Vec<String> = crate::graph::shape::shape_mismatches(g)
-            .into_iter()
-            .filter(|m| !gated.iter().any(|s| m.contains(s)))
+    /// [`crate::graph::shape::assert_shapes`] except the gated-attention q path of layers that have
+    /// one (a `{p}.self_attn.q_slice` node): its builder declares implicit reshapes the flat CPU
+    /// executor tolerates (the q `Linear` `[n, heads*2*hd]` as `[n*heads, 2*hd]`, the q-norm / gate
+    /// sigmoid over `[n*heads, hd]` operands as `[n, heads*hd]`). Reported, not inferred. Returns
+    /// how many mismatches were excused.
+    fn assert_shapes_but_gated_q(g: &crate::graph::Graph) -> usize {
+        let gated: Vec<String> = g
+            .nodes
+            .iter()
+            .filter_map(|n| n.name.strip_suffix(".self_attn.q_slice"))
+            .flat_map(|p| ["q", "q_norm", "gate_act"].map(|s| format!("node '{p}.self_attn.{s}':")))
             .collect();
+        let (excused, bad): (Vec<String>, Vec<String>) = crate::graph::shape::shape_mismatches(g)
+            .into_iter()
+            .partition(|m| gated.iter().any(|s| m.starts_with(s.as_str())));
         assert!(bad.is_empty(), "{} shape mismatches:\n{}", bad.len(), bad.join("\n"));
+        excused.len()
     }
 
     /// `graph::shape::infer` reproduces every node of the Qwen3.5 fixture graphs (dense and MoE
@@ -2317,8 +2323,9 @@ mod tests {
     fn graph_shapes_match_inference() {
         let (m, hidden) = tiny_model();
         assert_shapes_but_gated_q(&m.to_seqcls_graph(&vec![0.1; 3 * hidden]).unwrap().0);
+        // The excused mismatches are real: drop the allowlist when the builder declares them.
+        assert_eq!(assert_shapes_but_gated_q(&tiny_decode_graph().unwrap().0), 3);
         for g in [
-            tiny_decode_graph(),
             tiny_moe_decode_graph(),
             crate::model::qwen3_5::tiny_vision_tower_graph(),
             crate::model::qwen3_5::tiny_mtp_graph(),

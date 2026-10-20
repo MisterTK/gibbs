@@ -321,7 +321,12 @@ pub(crate) mod tests {
             for fmt in [QuantFormat::FP32, QuantFormat::BF16, QuantFormat::GGUF_Q8_0] {
                 let lm = tiny_graph_lm(variant, fmt);
                 let score = fill(3 * 32, 20, 0.5);
-                crate::graph::shape::assert_shapes(&lm.build_seqcls_graph(6, &score, None));
+                let g = lm.build_seqcls_graph(6, &score, None);
+                if fmt == QuantFormat::GGUF_Q8_0 {
+                    let quant = |v: &crate::graph::Value| matches!(v.dtype, crate::graph::DType::Quant(_));
+                    assert!(g.values.iter().any(quant), "Q8_0 projections stay packed");
+                }
+                crate::graph::shape::assert_shapes(&g);
             }
         }
     }

@@ -118,9 +118,8 @@ pub fn infer(op: &Op, inputs: &[Operand]) -> Result<(Vec<usize>, DType), String>
             rotary_dim,
             ..
         } => {
-            need(2)?;
-            let freqs_ok = inputs.len() < 3 || numel(2) == rotary_dim / 2;
-            if !freqs_ok || *head_dim == 0 || last(0) % head_dim != 0 {
+            need(3)?;
+            if numel(2) != rotary_dim / 2 || *head_dim == 0 || last(0) % head_dim != 0 {
                 return Err(fail(format!(
                     "x is not [n, heads*{head_dim}] or inv_freq is not [{}]",
                     rotary_dim / 2
@@ -638,11 +637,40 @@ mod tests {
             (&g.value(ids).shape[..], g.value(ids).dtype),
             (&[3, 2][..], DType::U32)
         );
+        let q = g.weight(
+            "q",
+            vec![5, 8],
+            DType::Quant(crate::hardware::QuantFormat::GGUF_Q8_0),
+        );
+        let yq = g.push("linq", Op::Linear, &[x, q]).unwrap();
+        assert_eq!(
+            (&g.value(yq).shape[..], g.value(yq).dtype),
+            (&[3, 5][..], DType::F32)
+        );
+        let ids_in = g.input("ids", vec![4], DType::U32);
+        let emb = g.push("emb", Op::Embedding, &[q, ids_in]).unwrap();
+        assert_eq!(&g.value(emb).shape[..], &[4, 8][..]);
+        let a = g.input("a", vec![2, 1, 4], DType::F32);
+        let b = g.input("b", vec![3, 1], DType::F32);
+        let ab = g
+            .push(
+                "ab",
+                Op::Binary {
+                    kind: super::super::BinaryKind::Mul,
+                },
+                &[a, b],
+            )
+            .unwrap();
+        assert_eq!(&g.value(ab).shape[..], &[2, 3, 4][..]);
+        assert!(g
+            .push("missing", Op::Linear, &[x, super::super::ValueId(999)])
+            .is_err());
+        let nodes = g.nodes.len();
         let e = g.push("bad", Op::Linear, &[y, w]).unwrap_err();
         assert!(
             e.contains("node 'bad': Linear") && e.contains("[5, 8] BF16"),
             "{e}"
         );
-        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.nodes.len(), nodes);
     }
 }
