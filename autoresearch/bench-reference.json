@@ -3,29 +3,33 @@
     "engine": "llama.cpp",
     "build": "Homebrew llama.cpp 0.6.0_1 (ggml 0.26.0)",
     "tool": "llama-bench tg128, Metal",
-    "date": "2026-10-13",
-    "source": "autoresearch/roofline-loop-notes.md",
-    "source_note": "iteration 6",
+    "date": "2026-10-19",
+    "source": "autoresearch/sprint3-probes.md",
+    "source_note": "P0.3",
     "rows": [
       {
         "key": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
-        "tok_s": 150.7
+        "tok_s": 145.11
       },
       {
         "key": "unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf",
-        "tok_s": 121.8
+        "tok_s": 115.69
       },
       {
         "key": "unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf",
-        "tok_s": 148.3
+        "tok_s": 143.78
       },
       {
         "key": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf",
-        "tok_s": 43.2
+        "tok_s": 42.6
       },
       {
         "key": "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf",
-        "tok_s": 269.0
+        "tok_s": 260.23
+      },
+      {
+        "key": "unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf",
+        "tok_s": 80.86
       }
     ]
   },
