@@ -8101,10 +8101,15 @@ mod tests {
                         s.set_specialize(specialize);
                         s.run(&g, vec![Tensor::F32(xs.clone())]).unwrap().remove(0).into_f32().unwrap()
                     };
-                    let (generic, special) = (run(false), run(true));
+                    let p = v.gen_params();
+                    let be = codec::codec(f).unwrap().block_elems as usize;
+                    let key = (f, p.rows_per_sg as u8, p.simdgroups as u8, n as u32, (k / be) as u32);
+                    let generic = run(false);
+                    assert!(!rt().gen_spec_psos.lock().contains_key(&key), "{f:?} {n}x{k} {v:?}: specialized while off");
+                    let special = run(true);
                     assert!(
-                        rt().gen_spec_pso(f, v.gen_params(), n, k).unwrap().is_some(),
-                        "{f:?} {n}x{k} {v:?}: no specialized pipeline"
+                        rt().gen_spec_psos.lock().contains_key(&key),
+                        "{f:?} {n}x{k} {v:?}: no specialized pipeline was used"
                     );
                     let bad = generic.iter().zip(&special).position(|(a, b)| a.to_bits() != b.to_bits());
                     assert!(bad.is_none(), "{f:?} {n}x{k} {v:?}: element {bad:?} differs");
