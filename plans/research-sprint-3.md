@@ -3,7 +3,7 @@
 ## Goal
 Implement every Luminal technique Gibbs does not use yet, and every TODO from the Wave 12 deep dive. The five "highest-ROI" items come first (Phase 1). Phase 0 gives them their go/no-go numbers; it is a prerequisite, not new scope. Every change must be generic (graph-IR patterns and codec descriptors, no model names), must pass `scripts/loop_guard.sh` plus a multi-commit `generic_guard` over the promoted range, and is kept only through an unspliced 4-pass ABBA (`scripts/loop_verify.sh`). Every GPU job runs through `python3 ~/.cache/gibbs/central_scheduler.py run [--quiet] --label <name> -- <cmd>`.
 
-## Status on branch `sprint3` (implemented; GPU go-ahead run in progress)
+## Status on branch `s3/final` (`sprint3` minus the removed items; GPU go-ahead run in progress)
 
 All code is on `sprint3`. Until the GPU go-ahead, the user's GPU was in use for training, so nothing below the go-ahead section was measured. What ran before it, CPU-only:
 - 106 tests that never touch a device (list: `target/sprint3/cpu-tests.txt` in the integration worktree);
@@ -24,12 +24,12 @@ GPU contact that did happen, against the instruction:
 | P0.2 | done (`examples/plan_dump.rs`, `--rates`) | — | — |
 | P0.1 / P0.3 / P0.4 / P0.5 | run on the go-ahead (`autoresearch/sprint3-probes.md`, GPU probes) | — | — |
 | 1.1 PLE | the default path was already 3 dispatches per layer (slice view, GeGlu GEMV epilogue, RmsNorm + residual); added the 2-dispatch chain (quant codecs and BF16/F16 via the expert pseudo-codecs) | opt-in `GIBBS_PLE_FUSED=one` | M1 dump: 486 → 451 (36 `GluGemvChain`) when on |
-| 1.2 q/k/v | fused over loader `Tensor::Mat` weights (no suite model fused q/k/v before), same-format pairs when formats differ, order-stable rewrites; batched prefill replays the program's fusions (`8cbbd9e`) | on (`GIBBS_DISABLE=qkv_mat`); ABBA neutral (−0.03 pp) | M0/M8 −30, M1 −23, M2 −6, M7 −50; M3 −8 inferred from GGUF headers, not dumped |
+| 1.2 q/k/v | fused over loader `Tensor::Mat` weights, same-format pairs when formats differ; batched prefill replayed the program's fusions (`8cbbd9e`) | **removed** (`af6dcb7`): ABBA neutral (−0.03 pp), up to 378 MiB on M7; the order-stable `GraphRewriter::replace` (`15da3aa`) stays | — |
 | 1.3 DeltaNet | one `DeltaNetStep` per layer (conv → gates → delta rule → gated norm) | on (`GIBBS_DISABLE=deltanet`; `GIBBS_FUSION=none` also turns off epilogues, MoE and batching) | M2 −126 (18 × 7); M3 −168 inferred from layer count, not dumped |
 | M2 BF16 fix (found by P0.2) | DeltaNet `in_proj_qkv`/`in_proj_z`/`out_proj` stay packed when the Qwen3.5 transform is an identity | on (`GIBBS_DISABLE=qwen_packed`) | about −467 MB/token streamed on M2; +18 dispatches from FP16 a/b no longer pairing |
 | 1.4 f16 KV | port of `v2-40`; split-K, flash and kv-append kernels store half, accumulate f32 | opt-in `GIBBS_KV_DTYPE=f16` since `3929384`: its ABBA lost 3.82 pp (E2B ctx4k −24%) | 0 dispatches; KV bytes halved |
-| Phase 2 views | row-strided slice views for stride-taking readers (`RmsNormBatch`, `RopeBatch`, `Unary`), destination-passing concat, alias-root liveness | on (`GIBBS_DISABLE=views`); ABBA neutral (+0.01 pp) | M2 −12 (q/gate copies) |
-| Phase 3 e-graph | egglog 3.0; graph fusions and every planner fusion are rules; greedy matchers, destructive passes and the `Pattern` matcher deleted; `views::elide` and `pair_small_hand_gemvs` stay post-passes (they need arena offsets / tuned variants) | on (the only planner) | 0 by construction: plan dumps byte-identical before/after on rows 0/1/2/4/7 and 12 synthetic graphs |
+| Phase 2 views | row-strided slice views for stride-taking readers (`RmsNormBatch`, `RopeBatch`, `Unary`), destination-passing concat, alias-root liveness | **removed** (`e3ce231`): ABBA neutral (+0.01 pp) | — |
+| Phase 3 e-graph | egglog 3.0; graph fusions and every planner fusion are rules; greedy matchers, destructive passes and the `Pattern` matcher deleted; `pair_small_hand_gemvs` stays a post-pass (it needs tuned variants) | on (the only planner) | 0 by construction: plan dumps byte-identical before/after on rows 0/1/2/4/7 and 12 synthetic graphs |
 | Phase 4 search | per-layer-pattern flips of e-graph choices, timed with the tuner's gating, cached in the tune file, 2 s budget | opt-in `GIBBS_PLAN_SEARCH=1` | — |
 | Phase 5 | the PLE chain (above); the DeltaNet step runs one threadgroup per key head (the scoped persistent form) | as above | — |
 | 6.1 | `gen64` 64-thread K-quant GEMV as a tuner candidate (Q4_K/Q5_K/Q6_K) | tuner decides; `shape_rates`: no shape gains > 1.5% | — |
@@ -63,12 +63,16 @@ GPU contact that did happen, against the instruction:
 2. M0 failed to load (`missing weight 'layers.0.attn.q.weight'`): batched prefill planned an unfused graph against the q/k/v-fused weights. Fixed in `8cbbd9e` (`fusion::replay_qkv`, CPU regression test).
 3. `cargo test --lib`: 872 passed, 0 failed (also after the f32 KV default); the guard's integration tests pass; `--bench-parity` 5/5.
 4. P0.1, P0.3, P0.4 (Wave 11 neutral, +0.03 pp), P0.5, 6.1 and 6.2 measured.
-5. ABBA, clean: `main` vs `sprint3` −2.13 pp, all of it f16 KV (−3.82 pp alone, now opt-in); views +0.01 and q/k/v over `Mat` −0.03 (neutral).
+5. ABBA, clean: `main` vs `sprint3` −2.13 pp, all of it f16 KV (−3.82 pp alone, now opt-in); views +0.01 and q/k/v over `Mat` −0.03 (neutral, both removed on the user's call: branch `s3/final`).
+6. Opt-in candidates prepared for ABBA: 6.2 Q4_K `fused_dot` (`s3/q4k-fused-dot`), 6.6 L13 as `GIBBS_SPECIALIZE=on` (`s3/l13-specialize`, a port of `aeb50b6`); E3 is the existing `GIBBS_EXEC_ORDER_WEIGHTS=1`.
 
 **Still pending (each needs a quiet GPU; a foreign graphics workload at ~45% contended the `deltanet` and `qwen_packed` runs):**
 1. Rerun the `deltanet` and `qwen_packed` ABBAs against `3929384`.
-2. Each opt-in knob alone (`GIBBS_PLE_FUSED=one`, `GIBBS_DELTANET_STATE=f16|bf16`, `GIBBS_IQ2_GRID=tg|buf`, `GIBBS_GPU_ARGMAX=1`, `GIBBS_PLAN_SEARCH=1`), the 6.2 Q4_K candidate, and 6.6 (L13 / E3).
-3. `main` vs `sprint3` again; merge to `main` only through the keep gate.
+2. Each opt-in knob alone (`GIBBS_PLE_FUSED=one`, `GIBBS_DELTANET_STATE=f16|bf16`, `GIBBS_IQ2_GRID=tg|buf`, `GIBBS_GPU_ARGMAX=1`, `GIBBS_PLAN_SEARCH=1`, `GIBBS_EXEC_ORDER_WEIGHTS=1`), then `GIBBS_SPECIALIZE=on` and the 6.2 Q4_K candidate (their branches need `every_kernel_source_compiles` and their GPU parity tests first).
+3. `s3/final`: `every_kernel_source_compiles`, full `cargo test --lib`, `--bench-parity` (the removals changed MSL and the planner).
+4. 6.1: the tuner's `gen64` picks on M1/M2's Q4_K/Q5_K/Q6_K shapes, read from the tune file after a quiet re-tune (only `shape_rates` ran).
+5. Real-weights parity for M1, M3 and M7, which `--bench-parity` does not cover (its suite marks 5 reference rows).
+6. `main` vs `s3/final`; merge to `main` only through the keep gate.
 
 ## Baseline (`main` @ `5de3057`, README rows = `bg_232` cand1 pass)
 

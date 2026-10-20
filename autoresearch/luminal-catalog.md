@@ -20,17 +20,17 @@ This catalog supersedes the S8.3 labels in `plans/research-sprint-2.md`, which m
 | L6 | RmsNorm prologue into GEMV | original | 0.2 `unary.rs:435-569` is standalone StdNorm | discarded (28) | — |
 | L7 | elementwise chain fusion; Add→RmsNorm | 0.2 `elementwise_fusion.rs:30-305` (codegen :245-303) | string-substitution fusion | kept (5, `rsi-13`, `rsi-14`); F4 discarded (30) | — |
 | L8 | per-head norm→RoPE; RoPE-k into kv_append | 0.2 `unary.rs:1073-1239` (MetalRope), `:1241-1432` (RopeCompiler) | | kept (`rsi-13`); F6 discarded (22, 23) | — |
-| L9 | multi-weight GEMV for sibling Linears | original | horizontal multi-output GEMV | pair kept (`rsi-38`, `rsi-43`); F3 multi discarded (29) | 1.2 same-dtype q/k/v pair |
+| L9 | multi-weight GEMV for sibling Linears | original | horizontal multi-output GEMV | pair kept (`rsi-38`, `rsi-43`); F3 multi discarded (29); q/k/v over loader `Mat` neutral, removed (`s3-abba-qkv-mat`) | 1.2 q/k/v over `Mat` (removed) |
 | L10 | paired-row GLU epilogue | 0.2 `kernels/steel/gemm` addmm epilogue | weak | discarded (24, `rsi-17`) | 1.1 GeGlu-with-side GEMV epilogue (PLE) |
 | L11 | GPU embedding / PLE gather | 0.2 `binary.rs:559-622` | | not logged | — |
 | L12 | decode-ahead, one cmdbuf in flight | 0.2 `command_buffer.rs:21-202` | rank-based command-buffer grouping | discarded (`v2-35-blk`); chunked CBs kept (21, `rsi-43`) | — |
 | L13 | function-constant shape specialization | 0.2 `elementwise_fusion.rs:245-303` | shape-baked codegen | measured per block, unverified (`v2-38-blk`) | 6.6 ABBA (GPU, deferred) |
 | L14 | split-K flash-decode threshold | 0.2 `unary.rs:991-1071` (Softmax) | weak | kept (2, 8, 9) | — |
-| L15 | f16 KV cache | original | | implemented, never measured (`v2-40`) | 1.4 port |
-| L16 | DFS step order + liveness arena | 0.2 `generic.rs:255-308` + `storage_buffer.rs:30-231`; main `arena.rs:1-24` | | in use (`allocate`, `src/graph/metal.rs`) | Phase 2 alias-root liveness |
+| L15 | f16 KV cache | original | | discarded as default (`s3-abba-kv-f16`, −3.82 pp); opt-in `GIBBS_KV_DTYPE=f16` | 1.4 port |
+| L16 | DFS step order + liveness arena | 0.2 `generic.rs:255-308` + `storage_buffer.rs:30-231`; main `arena.rs:1-24` | | in use (`allocate`, `src/graph/metal.rs`) | Phase 2 alias-root liveness (removed with views) |
 | L17 | MTLResidencySet | main `crates/luminal_metal/src/runtime.rs:91` (mentions residency set; no impl found in `device.rs`) | weak | not tried; llama.cpp `NO_RESIDENCY` showed no effect (notes, iteration 6) | 6.7 not pursued |
 | L18 | search over fusion alternatives, on-device timing | main `crates/luminal_metal/src/search.rs:116-164` (measure), `:212` (search_implementations), `finalists.rs:11-50`; `src/search_support.rs:385-460` (genome sampling), `src/extraction.rs:220-590` | e-graph search | per-GEMV tuner kept (`rsi-12`); F8 fusion search discarded (33) | Phase 4 layer-pattern search |
-| L19 | composed symbolic layouts (zero-copy views, destination-passing concat) | main `crates/luminal_metal/src/kernels.rs:515-545`, `layouts.rs`; `ops/mul_reduce_sum/mod.rs:72-80` (`alias_info`) | | partial: last-axis half split only (`slice_half`) | Phase 2 views |
+| L19 | composed symbolic layouts (zero-copy views, destination-passing concat) | main `crates/luminal_metal/src/kernels.rs:515-545`, `layouts.rs`; `ops/mul_reduce_sum/mod.rs:72-80` (`alias_info`) | | partial: last-axis half split only (`slice_half`); row-strided views neutral, removed (`s3-abba-views`) | Phase 2 views (removed) |
 | L20 | equality saturation over the op graph (egglog) | main `crates/luminal_metal/src/saturation.rs:19-46`, `egraph_postpass.rs` | | not tried | Phase 3 |
 | E1 | persistent per-layer kernel | original | | discarded (14) | Phase 5 scoped (opt-in one-dispatch PLE; DeltaNet per-head chain) |
 | E2 | ICB replay | original | | discarded (`v2-39-blk`) | — |
