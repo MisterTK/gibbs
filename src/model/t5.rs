@@ -1319,6 +1319,8 @@ mod tests {
     }
 
     fn parity_with(gated: bool, per_block_rel: bool, tied: bool, src_len: usize, bf16: bool) {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         let mut cpu = tiny(7, gated, per_block_rel, tied);
         let mut gpu = tiny(7, gated, per_block_rel, tied);
         if bf16 {

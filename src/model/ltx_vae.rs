@@ -1174,6 +1174,8 @@ mod tests {
     /// encoder (3 stride-2 downsamplers) on a tiny synthetic net (f32 vs f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::testutil::{rel_err, Lcg};
         let vae = fixture::tiny_vae();
         let cfg = vae.cfg;

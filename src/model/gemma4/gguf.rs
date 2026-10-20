@@ -807,6 +807,7 @@ mod tests {
         std::fs::write(&path, &file).unwrap();
 
         let (g, w, embed) = gguf_decode_fixture(&path).unwrap();
+        crate::graph::shape::assert_shapes(&g);
         assert!(
             g.values
                 .iter()

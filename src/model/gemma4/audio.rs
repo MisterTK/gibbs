@@ -972,6 +972,15 @@ pub mod tiny {
 mod tests {
     use super::*;
 
+    /// `graph::shape::infer` reproduces every node of the tiny conformer graphs.
+    #[test]
+    fn conformer_graph_shapes_match_inference() {
+        crate::graph::shape::assert_shapes(&tiny::wav_graph().0);
+        for t0 in [8, 37] {
+            crate::graph::shape::assert_shapes(&tiny::graph(t0).0);
+        }
+    }
+
     fn wav(format: u16, bits: u16, channels: u16, rate: u32, data: &[u8]) -> Vec<u8> {
         let mut b = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
         b.extend(16u32.to_le_bytes());

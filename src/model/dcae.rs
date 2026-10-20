@@ -721,6 +721,8 @@ mod tests {
     /// graph program (f32 vs f32: 1e-3), every node on the GPU.
     #[test]
     fn gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::testutil::{rel_err, Lcg};
         let dec = fixture::tiny();
         let latent = dec.latent_channels();

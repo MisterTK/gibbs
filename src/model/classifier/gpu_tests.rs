@@ -19,6 +19,8 @@ fn parity(name: &str, cfg: Value, ts: Ts) {
         eprintln!("SKIP {name}: no Metal device");
         return;
     }
+    // Every graph run here reproduces `graph::shape::infer`.
+    let _shapes = crate::graph::shape::CheckCompiled::new();
     let hub = repo(name, cfg, &ts);
     let id = format!("t/{name}");
     let _g = cpu_compute::allow();
@@ -113,6 +115,8 @@ fn setfit_pool_and_logistic_head_on_metal() {
     if !available_devices().contains(&Device::Metal) {
         return;
     }
+    // Every graph run here reproduces `graph::shape::infer`.
+    let _shapes = crate::graph::shape::CheckCompiled::new();
     let dims = BertDims {
         hidden_size: 16,
         num_layers: 2,

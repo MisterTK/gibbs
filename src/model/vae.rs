@@ -630,6 +630,8 @@ mod tests {
     /// CPU decoder/encoder vs the Metal graph programs on a tiny 2-level VAE (f32 vs f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
         let r = synth(&crate::model::diff_fixtures::vae_specs(4), 7);
         let t = Tensors::from_reader(&r).unwrap();

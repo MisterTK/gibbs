@@ -312,6 +312,20 @@ pub(crate) mod tests {
         }
     }
 
+    /// `graph::shape::infer` reproduces every node of the GraphLm seq-cls graphs, packed
+    /// (`DType::Quant`) projections included.
+    #[test]
+    fn seqcls_graph_shapes_match_inference() {
+        use crate::hardware::QuantFormat;
+        for variant in 0..3 {
+            for fmt in [QuantFormat::FP32, QuantFormat::BF16, QuantFormat::GGUF_Q8_0] {
+                let lm = tiny_graph_lm(variant, fmt);
+                let score = fill(3 * 32, 20, 0.5);
+                crate::graph::shape::assert_shapes(&lm.build_seqcls_graph(6, &score, None));
+            }
+        }
+    }
+
     #[test]
     fn backbone_without_program_refuses_cleanly() {
         struct NoGpu(Tokenizer);

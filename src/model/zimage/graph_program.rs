@@ -297,6 +297,8 @@ mod tests {
     /// 6x6 = 36 patches -> 64) and without (32 caption tokens, 8x8 = 64 patches), 96+ unified tokens.
     #[test]
     fn zimage_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         let tr = tiny(7);
         for (h, w, n_cap, sigma) in [(12usize, 12usize, 21usize, 0.7f32), (16, 16, 32, 0.25)] {
             let lat = rand(IN_CH * h * w, 11, 1.0);

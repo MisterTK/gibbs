@@ -637,6 +637,8 @@ mod tests {
     /// graph program (f32 vs f32: 1e-3), with every node on the GPU.
     #[test]
     fn gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::testutil::{rel_err, Lcg};
         let (vae, zc) = fixture::tiny();
         let (h, wd) = (3, 2);

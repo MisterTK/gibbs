@@ -4738,4 +4738,59 @@ mod tests {
         crate::graph::cpu::run(&g, &w, &mut state, inputs).expect("decode runs");
         assert!(state.truncate(0).unwrap_err().contains("conv_state"));
     }
+
+    /// `graph::shape::infer` reproduces every node of the GraphLm graphs (prefill, cached and
+    /// uncached, decode, embeds decode, seq-cls) across the config variants and fixtures.
+    #[test]
+    fn graph_shapes_match_inference() {
+        use crate::graph::shape::assert_shapes;
+        let base = GraphLmConfig::smollm_1m;
+        let mut models: Vec<GraphLm> = [
+            base(),
+            GraphLmConfig {
+                attention_scale: 0.2,
+                embedding_scale: 3.0,
+                residual_scale: 0.5,
+                logit_scale: 4.0,
+                ..base()
+            },
+            GraphLmConfig {
+                use_parallel_residual: true,
+                use_standard_layernorm: true,
+                // GELU MLPs need an up-only `gate_up_proj` (random init makes it gate+up): the
+                // `decoder_gpu::tiny_graph_lm` variants cover them.
+                rotary_pct: 0.5,
+                ..base()
+            },
+            GraphLmConfig {
+                rope_interleaved: true,
+                ..base()
+            },
+            GraphLmConfig {
+                act_quant_bits: 8,
+                use_relu2_mlp: true,
+                ..base()
+            },
+        ]
+        .into_iter()
+        .map(GraphLm::new)
+        .collect();
+        for tiny in [
+            Tiny::new(16, 2, 2, 8, true),
+            Tiny::new(16, 4, 2, 8, false),
+            Tiny::lfm2(Naming::Lfm2Hf, &[true, false, true], 3),
+            Tiny::lfm2(Naming::Lfm2Gguf, &[true, false], 3),
+        ] {
+            models.push(tiny.load().expect("loads"));
+        }
+        for m in &models {
+            for cached in [true, false] {
+                assert_shapes(&m.build_graph(5, cached).0);
+            }
+            assert_shapes(&m.to_decode_graph().0);
+            assert_shapes(&m.to_decode_graph_embeds().0);
+            let score = vec![0.1; 3 * m.config.hidden_dim];
+            assert_shapes(&m.build_seqcls_graph(5, &score, None));
+        }
+    }
 }

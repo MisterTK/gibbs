@@ -640,6 +640,8 @@ mod tests {
     /// CPU tower vs Metal program, both activations, with and without a projection (f32: 1e-3).
     #[test]
     fn gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::testutil::rel_err;
         for (act, proj) in [(Act::QuickGelu, false), (Act::Gelu, true)] {
             let clip = crate::model::diff_fixtures::tiny_clip(act, proj);

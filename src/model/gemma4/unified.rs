@@ -460,6 +460,30 @@ mod tests {
             .fold(0.0, f32::max)
     }
 
+    /// `graph::shape::infer` reproduces every node of the unified model's graphs: text decode and
+    /// prefill (k_eq_v, per-type head dims, proportional rope), the vision embedder and, on Metal,
+    /// the audio embedder program.
+    #[test]
+    fn graph_shapes_match_inference() {
+        use crate::graph::shape::{assert_compiled_shapes, assert_shapes};
+        let m = tiny();
+        assert_shapes(&m.text.to_decode_graph().unwrap().0);
+        assert_shapes(&m.text.to_prefill_graph(9).unwrap());
+        let w = tiny_weights();
+        let vc =
+            serde_json::json!({"patch_size": 16, "pooling_kernel_size": 3, "model_patch_size": 48});
+        let processor = serde_json::json!({"image_processor": {"max_soft_tokens": 280}});
+        let v = VisionEmbedder::load(&w, &vc, &processor).unwrap();
+        assert_shapes(&v.build_graph(9).0);
+        use crate::hardware::{available_devices, Device};
+        if available_devices().contains(&Device::Metal) {
+            let a = AudioEmbedder::load(&w, &Value::Null, &processor)
+                .unwrap()
+                .on_gpu(PlacementMode::Pin(Device::Metal));
+            assert_compiled_shapes(|| a.forward(vec![0.1; 3 * a.frame], 3).unwrap());
+        }
+    }
+
     /// The cheap counts (`prompt_len`, used for context checks and count_tokens) equal what the
     /// embedders produce and `prepare` lays out, for a photo and a resampled clip.
     #[test]
