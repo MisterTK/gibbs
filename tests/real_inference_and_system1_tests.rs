@@ -181,13 +181,13 @@ async fn test_server_real_streaming_and_system1_endpoint() {
     let kv_pool = Arc::new(PagedKVPool::new(1024));
     let telemetry = EngineTelemetry::new();
 
-    let tiny_model = Arc::new(GraphLm::new(GraphLmConfig::smollm_1m()));
+    let tiny_model = GraphLm::new(GraphLmConfig::smollm_1m());
     let jev_model = Default::default();
 
     let scheduler = Arc::new(ContinuousBatchScheduler::new(
         "",
         kv_pool.clone(),
-        Some(ExecutableModel::from(tiny_model)),
+        Some(ExecutableModel::load_graph_lm(tiny_model, foundry_engine::hardware::Device::Cpu).unwrap()),
     ));
 
     // Spawn scheduler step runner for the duration of the test
@@ -1622,25 +1622,10 @@ fn test_gguf_block_formats_decode_like_ggml() {
                 w[i]
             );
         }
-        let t = &manifest.tensors[name];
-        let QuantizedWeight::GgufQuantized {
-            format,
-            raw_data,
-            in_features,
-            out_features,
-        } = manifest
-            .extract_tensor_as_quantized(&data, name, t.quant_format)
-            .unwrap()
-        else {
-            panic!("{name}: expected zero-copy GGUF blocks");
-        };
-        assert_eq!(
-            (in_features, out_features),
-            (256, 2),
-            "{name}: GGUF dims are [in, out]"
-        );
+        let format = manifest.tensors[name].quant_format;
+        let raw_data = &tensors.iter().find(|t| t.0 == name).unwrap().3;
         let mut y = [0.0f32; 2];
-        dispatch_fused_gemv(&raw_data, format, 256, 2, &x, &mut y, None);
+        dispatch_fused_gemv(raw_data, format, 256, 2, &x, &mut y, None);
         for (got, want) in y.iter().zip(want_y) {
             assert!(
                 (got - want).abs() <= 1e-4 * want.abs().max(1.0),
@@ -1801,7 +1786,7 @@ fn test_chat_template_and_scheduler_greedy_match_hf() {
         let sched = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(1024)),
-            Some(ExecutableModel::from(model)),
+            Some(ExecutableModel::load_graph_lm(model, foundry_engine::hardware::Device::Cpu).unwrap()),
         );
         let greedy = SamplingParams {
             temperature: Some(0.0),

@@ -106,18 +106,6 @@ impl ExecutableModel {
     ) -> Result<Vec<f32>, String> {
         match (self, kv) {
             (Self::Native(m), Some(SeqKvCache::Native(st))) => m.forward_all(tokens, start, st),
-            (Self::GraphLm(m), Some(SeqKvCache::Cpu(cache))) => {
-                let m = m.read();
-                let held = cache.first().map_or(0, |c| c.len);
-                if held != start {
-                    return Err(format!("KV cache holds {held} positions, verify starts at {start}"));
-                }
-                let mut out = Vec::with_capacity(tokens.len() * m.config.vocab_size);
-                for (i, &t) in tokens.iter().enumerate() {
-                    out.extend(m.forward_token_with_kv(t, start + i, cache));
-                }
-                Ok(out)
-            }
             (Self::Program(prog, _), Some(SeqKvCache::Program(state))) => {
                 use crate::graph::Tensor;
                 let mut p = prog.write();
@@ -138,8 +126,7 @@ impl ExecutableModel {
                 std::mem::swap(&mut p.state, state);
                 res.map(|()| out)
             }
-            (Self::Native(_) | Self::GraphLm(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
-            _ => Err("speculative decoding is not supported by this model".into()),
+            (Self::Native(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
         }
     }
 
@@ -147,72 +134,27 @@ impl ExecutableModel {
     fn truncate(&self, kv: &mut Option<SeqKvCache>, len: usize) -> Result<(), String> {
         match (self, kv) {
             (Self::Native(m), Some(SeqKvCache::Native(st))) => m.truncate(st, len),
-            (Self::GraphLm(_), Some(SeqKvCache::Cpu(cache))) => {
-                for c in cache.iter_mut() {
-                    if len > c.len {
-                        return Err(format!("cannot rewind {} positions to {len}", c.len));
-                    }
-                    c.len = len;
-                }
-                Ok(())
-            }
             // The decode graph's KV rows are indexed by position: rewinding is writing from `len`.
             (Self::Program(..), Some(SeqKvCache::Program(_))) => Ok(()),
-            (Self::Native(_) | Self::GraphLm(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
-            _ => Err("speculative decoding is not supported by this model".into()),
+            (Self::Native(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
         }
     }
 
     fn set_taps(&self, kv: &mut Option<SeqKvCache>, layers: &[usize]) -> Result<(), String> {
         match (self, kv) {
             (Self::Native(m), Some(SeqKvCache::Native(st))) => m.set_taps(st, layers),
-            (Self::GraphLm(m), kv) => {
-                let m = m.read();
-                let cache = match kv.get_or_insert_with(|| SeqKvCache::Cpu(super::new_cpu_kv(&m))) {
-                    SeqKvCache::Cpu(c) => c,
-                    _ => return Err(WRONG_KV.into()),
-                };
-                if let Some(&l) = layers.iter().find(|&&l| l >= cache.len()) {
-                    return Err(format!("tap layer {l}: the decoder has {} layers", cache.len()));
-                }
-                for c in cache.iter_mut() {
-                    c.tap = None;
-                }
-                for (slot, &l) in layers.iter().enumerate() {
-                    cache[l].tap = Some((slot, Vec::new()));
-                }
-                Ok(())
-            }
             (Self::Program(..), _) if layers.is_empty() => Ok(()),
             (Self::Program(..), _) => Err(
                 "hidden-state drafters read tapped layers, which the GraphLm Metal program does not expose"
                     .into(),
             ),
             (Self::Native(_), _) => Err(WRONG_KV.into()),
-            _ => Err("speculative decoding is not supported by this model".into()),
         }
     }
 
     fn take_taps(&self, kv: &mut Option<SeqKvCache>) -> Vec<f32> {
         match (self, kv) {
             (Self::Native(m), Some(SeqKvCache::Native(st))) => m.take_taps(st),
-            // Per-layer rows, interleaved into `[positions, taps * hidden]` in tap order.
-            (Self::GraphLm(m), Some(SeqKvCache::Cpu(cache))) => {
-                let h = m.read().config.hidden_dim;
-                let mut taps: Vec<(usize, Vec<f32>)> = cache
-                    .iter_mut()
-                    .filter_map(|c| c.tap.as_mut().map(|(s, r)| (*s, std::mem::take(r))))
-                    .collect();
-                taps.sort_by_key(|t| t.0);
-                let rows = taps.first().map_or(0, |t| t.1.len() / h);
-                let mut out = Vec::with_capacity(rows * taps.len() * h);
-                for r in 0..rows {
-                    for (_, t) in &taps {
-                        out.extend_from_slice(&t[r * h..][..h]);
-                    }
-                }
-                out
-            }
             _ => Vec::new(),
         }
     }

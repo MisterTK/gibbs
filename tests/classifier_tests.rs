@@ -350,7 +350,7 @@ async fn http_classify_rerank_and_chat_refusal() {
         scheduler: Arc::new(ContinuousBatchScheduler::new(
             "gibbs/smollm-1m",
             Arc::new(PagedKVPool::new(64)),
-            Some(ExecutableModel::from(llm)),
+            Some(ExecutableModel::load_graph_lm(llm, gibbs_engine::hardware::Device::Cpu).unwrap()),
         )),
         telemetry: EngineTelemetry::new(),
         jev_model: Default::default(),

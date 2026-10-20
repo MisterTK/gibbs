@@ -148,12 +148,6 @@ impl Gb {
             .add(name, Op::Gelu { tanh: true }, &[x], s, DType::F32)
     }
 
-    pub fn gelu_erf(&mut self, name: &str, x: ValueId) -> ValueId {
-        let s = self.shape(x);
-        self.g
-            .add(name, Op::Gelu { tanh: false }, &[x], s, DType::F32)
-    }
-
     /// `silu(gate) * up`.
     pub fn swiglu(&mut self, name: &str, gate: ValueId, up: ValueId) -> ValueId {
         let s = self.shape(gate);
@@ -238,21 +232,6 @@ impl Gb {
         let gamma = self.konst(&format!("ones.{d}"), &[d], vec![1.0; d]);
         self.g
             .add(name, Op::LayerNorm { eps }, &[x, gamma], s, DType::F32)
-    }
-
-    /// LayerNorm with stored gain (and optional bias).
-    pub fn layer_norm_affine(
-        &mut self,
-        name: &str,
-        x: ValueId,
-        gamma: ValueId,
-        beta: Option<ValueId>,
-        eps: f32,
-    ) -> ValueId {
-        let s = self.shape(x);
-        let mut ins = vec![x, gamma];
-        ins.extend(beta);
-        self.g.add(name, Op::LayerNorm { eps }, &ins, s, DType::F32)
     }
 
     pub fn rms_norm(&mut self, name: &str, x: ValueId, gamma: ValueId, eps: f32) -> ValueId {

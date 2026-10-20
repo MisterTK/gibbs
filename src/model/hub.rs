@@ -101,20 +101,10 @@ pub fn detect_quant_format(path: &Path) -> Option<QuantFormat> {
     }
     if filename.contains("nvfp4") || filename.ends_with(".nvfp4") {
         Some(QuantFormat::NVFP4_E2M1)
-    } else if filename.contains("exl3_3") || filename.contains("exl3-3") {
-        Some(QuantFormat::EXL3_3Bit)
-    } else if filename.contains("exl3_5") || filename.contains("exl3-5") {
-        Some(QuantFormat::EXL3_5Bit)
-    } else if filename.contains("exl3") || filename.ends_with(".exl3") {
-        Some(QuantFormat::EXL3_4Bit)
     } else if filename.contains("kivi") {
         Some(QuantFormat::KIVI_2Bit)
     } else if filename.contains("turbo") {
         Some(QuantFormat::TurboQuant)
-    } else if filename.contains("jesse") {
-        Some(QuantFormat::WeightlessJesseLUT)
-    } else if filename.contains("hadamard") || filename.contains("needle") {
-        Some(QuantFormat::HadamardNeedle)
     } else if filename.contains("bf16") || filename.contains("bfloat16") {
         Some(QuantFormat::BF16)
     } else if filename.contains("fp32") || filename.contains("f32") {
@@ -132,7 +122,7 @@ pub fn detect_quant_format(path: &Path) -> Option<QuantFormat> {
 }
 
 /// Checks whether a weight file satisfies an explicit quant request. Specific tags (`Q4_K_M`, `Q4_0`,
-/// `FP16`/`f16`, `BF16`, ...) match exactly one format; only bare family names (`q4`, `q5`, `exl3`,
+/// `FP16`/`f16`, `BF16`, ...) match exactly one format; only bare family names (`q4`, `q5`,
 /// `fp4`/`nvfp4`, `uncompressed`) span several. Unknown tags match a whole `-`/`.`-separated filename token.
 pub fn quant_matches(expected_quant: &str, format: QuantFormat, filename: &str) -> bool {
     let exp = expected_quant.trim().to_lowercase().replace('-', "_");
@@ -146,10 +136,6 @@ pub fn quant_matches(expected_quant: &str, format: QuantFormat, filename: &str) 
             QuantFormat::GGUF_Q5_K_M | QuantFormat::GGUF_Q5_0 | QuantFormat::GGUF_Q5_1
         ),
         "q6" => matches!(format, QuantFormat::GGUF_Q6_K),
-        "exl3" => matches!(
-            format,
-            QuantFormat::EXL3_3Bit | QuantFormat::EXL3_4Bit | QuantFormat::EXL3_5Bit
-        ),
         "nvfp4" | "fp4" => matches!(
             format,
             QuantFormat::NVFP4 | QuantFormat::NVFP4_E2M1 | QuantFormat::MXFP4

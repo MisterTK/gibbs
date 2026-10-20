@@ -39,15 +39,13 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     tui: bool,
 
-    /// Weight format override (uncompressed, f16, bf16, q8_0, nvfp4, exl3-3/4/5, hybrid, turbo,
-    /// jesse). Without it the engine measures the formats its kernels support on this host and
+    /// Weight format override (uncompressed, f16, bf16, q8_0, nvfp4). Without it the engine measures the formats its kernels support on this host and
     /// picks the fastest one that stays within its quality floor.
     #[arg(long)]
     quant: Option<String>,
 
-    /// Compute backend: auto (Metal on Apple Silicon, CPU only where no GPU exists), metal, ane
-    /// (System 1), cuda, rocm, level-zero, or cpu. `cpu` is the explicit opt-in to the CPU executor;
-    /// cuda, rocm and level-zero are stubs that fail at startup.
+    /// Compute backend: auto (Metal on Apple Silicon, CPU only where no GPU exists), metal, or
+    /// cpu. `cpu` is the explicit opt-in to the CPU executor.
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -161,12 +159,6 @@ fn parse_quant(s: &str) -> Result<QuantMode, String> {
         "bf16" => QuantMode::BF16,
         "q8_0" | "q8" | "int8" => QuantMode::Q8_0,
         "nvfp4" | "nvfp4-ultra" | "fp4" => QuantMode::NVFP4Ultra,
-        "exl3-3bit" | "exl3-3" => QuantMode::EXL3Aggressive,
-        "exl3-4bit" | "exl3" | "exl3-4" => QuantMode::EXL3Balanced,
-        "exl3-5bit" | "exl3-5" => QuantMode::EXL3Quality,
-        "hybrid" | "adaptive" | "adaptivehybrid" => QuantMode::AdaptiveHybrid,
-        "turbo" | "turbosqueeze" => QuantMode::TurboSqueeze,
-        "jesse" | "weightless" | "lut" => QuantMode::WeightlessJesse,
         other => return Err(format!("Unknown --quant '{other}'")),
     })
 }
@@ -366,20 +358,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             #[cfg(not(target_os = "macos"))]
             Device::Metal => return Err("--backend metal requires macOS".into()),
-            #[cfg(target_os = "macos")]
-            Device::Ane => "Apple Neural Engine (Core ML)".into(),
-            #[cfg(not(target_os = "macos"))]
-            Device::Ane => return Err("--backend ane requires macOS".into()),
-            Device::Cuda | Device::Rocm | Device::LevelZero => {
-                return Err(d
-                    .stub_error()
-                    .expect("cuda/rocm/level-zero are stubs")
-                    .into())
-            }
         },
     };
     // GPU-only tripwire: from here on, any CPU compute outside `--backend cpu` panics.
-    if matches!(backend, Device::Metal | Device::Ane) {
+    if backend == Device::Metal {
         gibbs_engine::hardware::cpu_compute::ban(true);
     }
     println!("═══════════════════════════════════════════════════════════════");
@@ -403,9 +385,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Text-to-video is chosen by the checkpoint's model_index.json / hub GGUF architecture, never by the model id.
     let is_system1 = gibbs_engine::model::jev::detect(&hub, &cli.model);
-    if backend == Device::Ane && !is_system1 {
-        return Err("--backend ane runs System 1 sentence encoders only".into());
-    }
     if !is_system1 {
         if let Some(plan) = ltx::resolve(&hub, &cli.model, cli.quant.as_deref()) {
             return run_ltx(&cli, &hub, &plan?).map_err(Into::into);
@@ -581,11 +560,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("Cannot load System 1 encoder '{}': {e}", cli.model))?;
         if let Some(enc) = jev.bert() {
             if let Some(report) = enc.executor_report() {
-                if report.starts_with("Core ML") {
-                    telemetry.log_info(&report);
-                } else {
-                    telemetry.log_info(&format!("Metal: {report}"));
-                }
+                telemetry.log_info(&format!("Metal: {report}"));
             }
             telemetry.log_info(&format!(
                 "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",

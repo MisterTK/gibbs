@@ -34,7 +34,11 @@ fn generate(
 ) -> (Vec<u32>, u64, u64) {
     let model = match load_native(target, Device::Cpu) {
         Some(m) => ExecutableModel::Native(m.unwrap()),
-        None => ExecutableModel::from(load_causal_lm(target, QuantMode::Uncompressed).unwrap()),
+        None => ExecutableModel::load_graph_lm(
+            load_causal_lm(target, QuantMode::Uncompressed).unwrap(),
+            Device::Cpu,
+        )
+        .unwrap(),
     };
     let telemetry = EngineTelemetry::new();
     let sched = ContinuousBatchScheduler::with_telemetry(

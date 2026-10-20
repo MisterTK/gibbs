@@ -2641,35 +2641,6 @@ kernel void gemv_nvfp4(device const uchar* wq [[buffer(0)]],
     }
 }
 
-kernel void gemv_jesse_lut(
-    device const char* lut_tables [[buffer(0)]],
-    device const float* hash_planes [[buffer(1)]],
-    device const float* x [[buffer(2)]],
-    device float* y [[buffer(3)]],
-    constant uint& in_features [[buffer(4)]],
-    constant uint& out_features [[buffer(5)]],
-    constant uint& address_bits [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= out_features) return;
-    uint num_luts = (in_features + address_bits - 1) / address_bits;
-    uint lut_size = 1u << address_bits;
-    ulong lut_out_offset = (ulong)gid * num_luts * lut_size;
-
-    int accum = 0;
-    for (uint lut_idx = 0; lut_idx < num_luts; ++lut_idx) {
-        uint addr = 0;
-        for (uint b = 0; b < address_bits; ++b) {
-            uint feat_idx = (lut_idx * address_bits + b) % in_features;
-            float thresh = hash_planes[lut_idx * address_bits + b];
-            if (x[feat_idx] > thresh) {
-                addr |= (1u << b);
-            }
-        }
-        accum += (int)lut_tables[lut_out_offset + (ulong)lut_idx * lut_size + addr];
-    }
-    y[gid] = float(accum);
-}
-
 struct Conv2dParams {
     uint in_channels;
     uint in_h;

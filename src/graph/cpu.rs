@@ -2534,23 +2534,6 @@ fn dispatch_linear(
                     }
                     Ok(out)
                 }
-                crate::model::layers::QuantizedWeight::WeightlessJesse(layer) => {
-                    let mut out = vec![0.0f32; rows * out_f];
-                    for (r, x_row) in x.chunks(in_f).enumerate() {
-                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
-                        layer.forward(x_row, out_row);
-                        if let Some(b) = bias {
-                            for (o, &bi) in out_row.iter_mut().zip(b) {
-                                *o += bi;
-                            }
-                        }
-                    }
-                    Ok(out)
-                }
-                _ => {
-                    let w_f32 = q.to_f32();
-                    Ok(nn::linear(x, rows, &w_f32, bias, in_f, out_f))
-                }
             }
         }
         other => {

@@ -1,7 +1,5 @@
 use crate::hardware::QuantFormat;
 use crate::model::{f16_to_f32, f32_to_bf16, f32_to_f16};
-use crate::quant::exl3::{gemv_exl3_f32, quantize_exl3_tensor, Exl3BitRate, Exl3Tensor};
-use crate::quant::jesse::WeightlessJesseLayer;
 use crate::quant::nvfp4::{gemv_nvfp4_f32, quantize_nvfp4_tensor, Nvfp4Tensor};
 use bytes::Bytes;
 
@@ -28,8 +26,6 @@ pub enum QuantizedWeight {
         out_features: usize,
     },
     Nvfp4(Nvfp4Tensor),
-    Exl3(Exl3Tensor),
-    WeightlessJesse(WeightlessJesseLayer),
 }
 
 impl QuantizedWeight {
@@ -40,12 +36,6 @@ impl QuantizedWeight {
             Self::ZeroCopySlice { format, .. } => format.bits_per_weight(),
             Self::GgufQuantized { format, .. } => format.bits_per_weight(),
             Self::Nvfp4(_) => 4.25,
-            Self::Exl3(tensor) => match tensor.bit_rate {
-                Exl3BitRate::Bits3 => 3.125,
-                Exl3BitRate::Bits4 => 4.125,
-                Exl3BitRate::Bits5 => 5.125,
-            },
-            Self::WeightlessJesse(layer) => layer.bits_per_weight(),
         }
     }
 
@@ -55,8 +45,6 @@ impl QuantizedWeight {
             | Self::ZeroCopySlice { in_features, .. }
             | Self::GgufQuantized { in_features, .. } => *in_features,
             Self::Nvfp4(t) => t.cols,
-            Self::Exl3(t) => t.cols,
-            Self::WeightlessJesse(l) => l.in_features,
         }
     }
 
@@ -66,8 +54,6 @@ impl QuantizedWeight {
             | Self::ZeroCopySlice { out_features, .. }
             | Self::GgufQuantized { out_features, .. } => *out_features,
             Self::Nvfp4(t) => t.rows,
-            Self::Exl3(t) => t.rows,
-            Self::WeightlessJesse(l) => l.out_features,
         }
     }
 
@@ -99,27 +85,6 @@ impl QuantizedWeight {
             Self::Nvfp4(tensor) => {
                 let mut out = vec![0.0f32; tensor.rows * tensor.cols];
                 crate::quant::nvfp4::dequantize_nvfp4_tensor(tensor, &mut out);
-                out
-            }
-            Self::Exl3(tensor) => {
-                let mut out = vec![0.0f32; tensor.rows * tensor.cols];
-                crate::quant::exl3::dequantize_exl3_tensor(tensor, &mut out);
-                out
-            }
-            Self::WeightlessJesse(layer) => {
-                let in_f = layer.in_features;
-                let out_f = layer.out_features;
-                let mut out = vec![0.0f32; in_f * out_f];
-                let mut eye = vec![0.0f32; in_f];
-                let mut col_out = vec![0.0f32; out_f];
-                for c in 0..in_f {
-                    eye[c] = 1.0;
-                    layer.forward(&eye, &mut col_out);
-                    for r in 0..out_f {
-                        out[r * in_f + c] = col_out[r];
-                    }
-                    eye[c] = 0.0;
-                }
                 out
             }
         }
@@ -160,31 +125,6 @@ impl QuantizedLinearLayer {
             QuantFormat::NVFP4_E2M1 | QuantFormat::NVFP4 => {
                 let tensor = quantize_nvfp4_tensor(weights, out_features, in_features)?;
                 QuantizedWeight::Nvfp4(tensor)
-            }
-            QuantFormat::EXL3_3Bit => {
-                let tensor =
-                    quantize_exl3_tensor(weights, out_features, in_features, Exl3BitRate::Bits3)?;
-                QuantizedWeight::Exl3(tensor)
-            }
-            QuantFormat::EXL3_4Bit => {
-                let tensor =
-                    quantize_exl3_tensor(weights, out_features, in_features, Exl3BitRate::Bits4)?;
-                QuantizedWeight::Exl3(tensor)
-            }
-            QuantFormat::EXL3_5Bit => {
-                let tensor =
-                    quantize_exl3_tensor(weights, out_features, in_features, Exl3BitRate::Bits5)?;
-                QuantizedWeight::Exl3(tensor)
-            }
-            QuantFormat::WeightlessJesseLUT => {
-                let jesse = WeightlessJesseLayer::from_f32_weights(
-                    name,
-                    in_features,
-                    out_features,
-                    6,
-                    weights,
-                );
-                QuantizedWeight::WeightlessJesse(jesse)
             }
             QuantFormat::GGUF_Q4_0 => {
                 let raw = quantize_f32_to_q4_0(weights);
@@ -268,29 +208,6 @@ impl QuantizedLinearLayer {
         Ok(self)
     }
 
-    /// Creates a quantized linear layer backed by a SolidSF Jesse Weightless Neural Network.
-    pub fn from_weightless_jesse(
-        name: &str,
-        in_features: usize,
-        out_features: usize,
-        address_bits: usize,
-        weights: &[f32],
-    ) -> Self {
-        let layer = WeightlessJesseLayer::from_f32_weights(
-            name,
-            in_features,
-            out_features,
-            address_bits,
-            weights,
-        );
-        Self {
-            name: name.to_string(),
-            in_features,
-            out_features,
-            weight: QuantizedWeight::WeightlessJesse(layer),
-            bias: None,
-        }
-    }
     /// Creates a quantized linear layer directly from a zero-copy byte slice view.
     pub fn from_zero_copy_slice(
         name: &str,
@@ -336,12 +253,6 @@ impl QuantizedLinearLayer {
             QuantizedWeight::ZeroCopySlice { format, .. } => *format,
             QuantizedWeight::GgufQuantized { format, .. } => *format,
             QuantizedWeight::Nvfp4(_) => QuantFormat::NVFP4_E2M1,
-            QuantizedWeight::Exl3(t) => match t.bit_rate {
-                Exl3BitRate::Bits3 => QuantFormat::EXL3_3Bit,
-                Exl3BitRate::Bits4 => QuantFormat::EXL3_4Bit,
-                Exl3BitRate::Bits5 => QuantFormat::EXL3_5Bit,
-            },
-            QuantizedWeight::WeightlessJesse(_) => QuantFormat::WeightlessJesseLUT,
         }
     }
 
@@ -430,22 +341,6 @@ impl QuantizedLinearLayer {
             }
             QuantizedWeight::Nvfp4(tensor) => {
                 gemv_nvfp4_f32(tensor, x, out);
-                if let Some(bias) = &self.bias {
-                    for i in 0..self.out_features {
-                        out[i] += bias[i];
-                    }
-                }
-            }
-            QuantizedWeight::Exl3(tensor) => {
-                gemv_exl3_f32(tensor, x, out);
-                if let Some(bias) = &self.bias {
-                    for i in 0..self.out_features {
-                        out[i] += bias[i];
-                    }
-                }
-            }
-            QuantizedWeight::WeightlessJesse(layer) => {
-                layer.forward(x, out);
                 if let Some(bias) = &self.bias {
                     for i in 0..self.out_features {
                         out[i] += bias[i];
@@ -2386,38 +2281,6 @@ mod tests {
         assert!(out.iter().any(|&v| v.abs() > 1e-4));
     }
 
-    #[test]
-    fn test_exl3_forward_all_bitrates() {
-        let in_features = 64;
-        let out_features = 32;
-        let weights: Vec<f32> = (0..(in_features * out_features))
-            .map(|i| (i as f32 * 0.05).cos() * 0.5)
-            .collect();
-
-        for (format, expected_bpw) in [
-            (QuantFormat::EXL3_3Bit, 3.125),
-            (QuantFormat::EXL3_4Bit, 4.125),
-            (QuantFormat::EXL3_5Bit, 5.125),
-        ] {
-            let layer = QuantizedLinearLayer::from_f32(
-                "exl3_layer",
-                in_features,
-                out_features,
-                &weights,
-                format,
-            )
-            .unwrap();
-
-            assert_eq!(layer.bits_per_weight(), expected_bpw);
-
-            let x = vec![1.0; in_features];
-            let mut out = vec![0.0; out_features];
-            layer.forward(&x, &mut out);
-
-            assert!(out.iter().all(|&v| v.is_finite()));
-            assert!(out.iter().any(|&v| v.abs() > 1e-4));
-        }
-    }
 
     #[test]
     fn test_dot_product_f32_correctness() {
@@ -2526,57 +2389,6 @@ mod tests {
             let expected = dot_product_f32(&x, row) + bias[i];
             assert!((out[i] - expected).abs() < 1e-5);
         }
-    }
-
-    #[test]
-    fn test_weightless_jesse_layer_forward_zero_multiplications() {
-        let in_features = 32;
-        let out_features = 16;
-        let address_bits = 6;
-        let weights: Vec<f32> = (0..(in_features * out_features))
-            .map(|i| (i as f32 * 0.07).sin() * 2.0)
-            .collect();
-        let bias: Vec<f32> = (0..out_features).map(|i| i as f32 * 0.1).collect();
-
-        let layer = QuantizedLinearLayer::from_weightless_jesse(
-            "jesse_layer",
-            in_features,
-            out_features,
-            address_bits,
-            &weights,
-        )
-        .with_bias(bias.clone())
-        .unwrap();
-
-        let layer_from_format = QuantizedLinearLayer::from_f32(
-            "jesse_layer_fmt",
-            in_features,
-            out_features,
-            &weights,
-            QuantFormat::WeightlessJesseLUT,
-        )
-        .unwrap();
-        assert_eq!(layer_from_format.bits_per_weight(), 0.5);
-        assert!(matches!(
-            layer_from_format.weight,
-            QuantizedWeight::WeightlessJesse(_)
-        ));
-        assert_eq!(layer.bits_per_weight(), 0.5);
-
-        let x: Vec<f32> = (0..in_features).map(|i| (i as f32 * 0.15).cos()).collect();
-        let mut out = vec![0.0; out_features];
-
-        layer.forward(&x, &mut out);
-
-        // Verify valid activations produced
-        assert!(
-            out.iter().all(|&v| v.is_finite()),
-            "Activations must be finite"
-        );
-        assert!(
-            out.iter().any(|&v| v.abs() > 0.0),
-            "Activations must produce non-zero signal"
-        );
     }
 
     #[test]

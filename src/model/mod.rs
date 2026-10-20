@@ -12,8 +12,8 @@
 //!    - [`NanoLlm`]: Minimal reference transformer decoder for smoke tests and micro-benchmarking.
 //!
 //! 2. **Universal Quantization & Layer Abstractions**:
-//!    - [`layers::QuantizedLinearLayer`]: Architectural God Node abstracting FP16, NVFP4, EXL3,
-//!      and Jesse LUT weight representations behind a zero-copy forward interface.
+//!    - [`layers::QuantizedLinearLayer`]: Architectural God Node abstracting FP16, NVFP4 and
+//!      GGUF block weight representations behind a zero-copy forward interface.
 //!    - [`layers::QuantizedWeight`]: Memory-compact packed weight storage.
 //!
 //! 3. **SIMD & Compute Primitives**:
@@ -241,15 +241,6 @@ impl ModelManifest {
         self.extract_safetensors_tensor_f32(data, tensor_name)
     }
 
-    /// Extracts or on-the-fly quantizes a tensor from backing data buffer into the desired runtime execution format.
-    pub fn extract_tensor_as_quantized(
-        &self,
-        data: &[u8],
-        name: &str,
-        target_format: QuantFormat,
-    ) -> Result<QuantizedWeight, String> {
-        UniversalModelLoader::extract_tensor_as_quantized_from_data(self, data, name, target_format)
-    }
 }
 
 /// Universal model loader providing zero-copy parsing, index building, and
@@ -325,32 +316,6 @@ impl UniversalModelLoader {
             primary_data: Some(data),
             shards: Vec::new(),
         }
-    }
-
-    /// Universal extraction and on-the-fly quantization of any tensor into the desired runtime execution format.
-    pub fn extract_tensor_as_quantized(
-        &self,
-        name: &str,
-        target_format: QuantFormat,
-    ) -> Result<QuantizedWeight, String> {
-        let tensor = self
-            .manifest
-            .tensors
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in manifest", name))?;
-
-        let buffer = if tensor.shard_index < self.shards.len() {
-            &self.shards[tensor.shard_index]
-        } else if let Some(p) = &self.primary_data {
-            p
-        } else {
-            return Err(format!(
-                "No backing memory buffer available for tensor '{}' (shard {})",
-                name, tensor.shard_index
-            ));
-        };
-
-        Self::extract_tensor_as_quantized_from_data(&self.manifest, buffer, name, target_format)
     }
 
     /// Automatically detects container format by inspecting magic bytes and headers.
@@ -1162,206 +1127,6 @@ impl UniversalModelLoader {
         }
         decode_dtype(slice, &tensor.dtype).map_err(|e| format!("Tensor '{tensor_name}': {e}"))
     }
-
-    /// Extracts and dynamically quantizes a tensor from a manifest and raw byte buffer into the desired QuantFormat.
-    pub fn extract_tensor_as_quantized_from_data(
-        manifest: &ModelManifest,
-        data: &[u8],
-        name: &str,
-        target_format: QuantFormat,
-    ) -> Result<QuantizedWeight, String> {
-        let tensor = manifest
-            .tensors
-            .get(name)
-            .ok_or_else(|| format!("Tensor '{}' not found in manifest", name))?;
-
-        let end_offset = tensor.byte_offset + tensor.byte_len;
-        if end_offset > data.len() {
-            return Err(format!(
-                "Tensor '{}' offset range [{}..{}] exceeds buffer length {}",
-                name,
-                tensor.byte_offset,
-                end_offset,
-                data.len()
-            ));
-        }
-
-        let slice = &data[tensor.byte_offset..end_offset];
-        let shape = &tensor.shape;
-        let (out_features, in_features) = if shape.len() >= 2
-            && (manifest.format == SourceFormat::Gguf || manifest.format == SourceFormat::Ggml)
-        {
-            // GGUF/GGML dims are ne0-first: [in, out, ...].
-            (shape[1..].iter().product(), shape[0])
-        } else if shape.len() >= 2 {
-            (shape[0], shape[1..].iter().product())
-        } else if shape.len() == 1 {
-            (shape[0], 1)
-        } else {
-            (1, 1)
-        };
-
-        // 1. Direct zero-copy slice if format matches. The payload must be exactly the matrix the
-        // fused GEMV reads; a short tensor in a malformed file fails here, not as stale output.
-        let raw_len = |row_bytes: usize| {
-            if slice.len() == out_features * row_bytes {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Tensor '{name}': {} bytes for a {out_features}x{in_features} {target_format:?} matrix",
-                    slice.len()
-                ))
-            }
-        };
-        if tensor.quant_format == target_format {
-            match target_format {
-                // Raw GGUF/GGML blocks run through the same codec as the f32 path.
-                f if (manifest.format == SourceFormat::Gguf
-                    || manifest.format == SourceFormat::Ggml)
-                    && crate::model::layers::gguf_block_codec(f).is_some() =>
-                {
-                    let (block_elems, block_bytes, _) =
-                        crate::model::layers::gguf_block_codec(f).expect("checked above");
-                    raw_len(in_features.div_ceil(block_elems) * block_bytes)?;
-                    return Ok(QuantizedWeight::GgufQuantized {
-                        format: target_format,
-                        raw_data: Bytes::copy_from_slice(slice),
-                        in_features,
-                        out_features,
-                    });
-                }
-                // Only when the stored dtype really is that float (integer payloads are tagged FP32).
-                QuantFormat::FP32 | QuantFormat::FP16 | QuantFormat::BF16
-                    if tensor.dtype
-                        == match target_format {
-                            QuantFormat::FP32 => "F32",
-                            QuantFormat::FP16 => "F16",
-                            _ => "BF16",
-                        } =>
-                {
-                    raw_len(
-                        in_features
-                            * if target_format == QuantFormat::FP32 {
-                                4
-                            } else {
-                                2
-                            },
-                    )?;
-                    return Ok(QuantizedWeight::ZeroCopySlice {
-                        data: Bytes::copy_from_slice(slice),
-                        in_features,
-                        out_features,
-                        format: target_format,
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        // 1b. A checkpoint that already is NVFP4 keeps its own blocks, scales and global scale.
-        if matches!(target_format, QuantFormat::NVFP4 | QuantFormat::NVFP4_E2M1)
-            && manifest.format == SourceFormat::Safetensors
-        {
-            if let Some(nv) = prequant::nvfp4_source(manifest, data, name)? {
-                return Ok(QuantizedWeight::Nvfp4(nv));
-            }
-        }
-
-        // 2. Otherwise dequantize to f32 and re-quantize to target_format on the fly
-        let f32_weights = Self::extract_tensor_from_manifest(manifest, data, name)?;
-
-        match target_format {
-            QuantFormat::NVFP4 | QuantFormat::NVFP4_E2M1 => {
-                if in_features >= 16
-                    && out_features >= 16
-                    && in_features % 16 == 0
-                    && out_features % 16 == 0
-                {
-                    let nv = crate::quant::nvfp4::quantize_nvfp4_tensor(
-                        &f32_weights,
-                        out_features,
-                        in_features,
-                    )?;
-                    Ok(QuantizedWeight::Nvfp4(nv))
-                } else {
-                    let pad_in = ((in_features + 15) / 16) * 16;
-                    let pad_out = ((out_features + 15) / 16) * 16;
-                    let mut padded = vec![0.0f32; pad_in * pad_out];
-                    for r in 0..out_features {
-                        for c in 0..in_features {
-                            padded[r * pad_in + c] = f32_weights[r * in_features + c];
-                        }
-                    }
-                    let nv = crate::quant::nvfp4::quantize_nvfp4_tensor(&padded, pad_out, pad_in)?;
-                    Ok(QuantizedWeight::Nvfp4(nv))
-                }
-            }
-            QuantFormat::EXL3_3Bit | QuantFormat::EXL3_4Bit | QuantFormat::EXL3_5Bit => {
-                let bit_rate = match target_format {
-                    QuantFormat::EXL3_3Bit => crate::quant::exl3::Exl3BitRate::Bits3,
-                    QuantFormat::EXL3_4Bit => crate::quant::exl3::Exl3BitRate::Bits4,
-                    _ => crate::quant::exl3::Exl3BitRate::Bits5,
-                };
-                if in_features >= 32 && in_features % 32 == 0 {
-                    let ex = crate::quant::exl3::quantize_exl3_tensor(
-                        &f32_weights,
-                        out_features,
-                        in_features,
-                        bit_rate,
-                    )?;
-                    Ok(QuantizedWeight::Exl3(ex))
-                } else {
-                    let pad_in = ((in_features + 31) / 32) * 32;
-                    let mut padded = vec![0.0f32; out_features * pad_in];
-                    for r in 0..out_features {
-                        for c in 0..in_features {
-                            padded[r * pad_in + c] = f32_weights[r * in_features + c];
-                        }
-                    }
-                    let ex = crate::quant::exl3::quantize_exl3_tensor(
-                        &padded,
-                        out_features,
-                        pad_in,
-                        bit_rate,
-                    )?;
-                    Ok(QuantizedWeight::Exl3(ex))
-                }
-            }
-            QuantFormat::WeightlessJesseLUT => {
-                let jesse = crate::quant::jesse::WeightlessJesseLayer::from_f32_weights(
-                    name,
-                    in_features,
-                    out_features,
-                    6,
-                    &f32_weights,
-                );
-                Ok(QuantizedWeight::WeightlessJesse(jesse))
-            }
-            QuantFormat::GGUF_Q4_0 => {
-                let raw = crate::model::layers::quantize_f32_to_q4_0(&f32_weights);
-                Ok(QuantizedWeight::GgufQuantized {
-                    format: target_format,
-                    raw_data: Bytes::from(raw),
-                    in_features,
-                    out_features,
-                })
-            }
-            QuantFormat::GGUF_Q8_0 => {
-                let raw = crate::model::layers::quantize_f32_to_q8_0(&f32_weights);
-                Ok(QuantizedWeight::GgufQuantized {
-                    format: target_format,
-                    raw_data: Bytes::from(raw),
-                    in_features,
-                    out_features,
-                })
-            }
-            _ => Ok(QuantizedWeight::Uncompressed {
-                data: f32_weights,
-                in_features,
-                out_features,
-            }),
-        }
-    }
 }
 
 fn read_u16_le(data: &[u8], offset: &mut usize) -> Result<u16, String> {
@@ -1956,39 +1721,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_tensor_as_quantized_universal() {
-        let buffer = create_test_safetensors_buffer();
-        let loader = UniversalModelLoader::from_bytes(&buffer).unwrap();
-
-        // 1. Extract as FP32 zero copy
-        let q_f32 = loader
-            .extract_tensor_as_quantized("weight_f32", QuantFormat::FP32)
-            .unwrap();
-        assert!(matches!(q_f32, QuantizedWeight::ZeroCopySlice { .. }));
-
-        // 2. Extract as NVFP4 on the fly
-        let q_nvfp4 = loader
-            .extract_tensor_as_quantized("weight_f16", QuantFormat::NVFP4_E2M1)
-            .unwrap();
-        assert!(matches!(q_nvfp4, QuantizedWeight::Nvfp4(_)));
-        assert_eq!(q_nvfp4.bits_per_weight(), 4.25);
-
-        // 3. Extract as EXL3 on the fly
-        let q_exl3 = loader
-            .extract_tensor_as_quantized("weight_f16", QuantFormat::EXL3_4Bit)
-            .unwrap();
-        assert!(matches!(q_exl3, QuantizedWeight::Exl3(_)));
-        assert_eq!(q_exl3.bits_per_weight(), 4.125);
-
-        // 4. Extract as GGUF Q4_0 on the fly
-        let q_q4 = loader
-            .extract_tensor_as_quantized("weight_f16", QuantFormat::GGUF_Q4_0)
-            .unwrap();
-        assert!(matches!(q_q4, QuantizedWeight::GgufQuantized { .. }));
-        assert_eq!(q_q4.bits_per_weight(), 4.5);
-    }
-
-    #[test]
     fn test_multi_part_shards_loader() {
         let f32_vals = [1.0f32, 2.0f32];
         let mut f32_bytes = Vec::new();
@@ -2031,17 +1763,6 @@ mod tests {
         assert!(loader.manifest.tensors.contains_key("shard1_tensor"));
         assert!(loader.manifest.tensors.contains_key("shard2_tensor"));
 
-        // Extract from shard 1
-        let w1 = loader
-            .extract_tensor_as_quantized("shard1_tensor", QuantFormat::FP32)
-            .unwrap();
-        assert!(matches!(w1, QuantizedWeight::ZeroCopySlice { .. }));
-
-        // Extract from shard 2
-        let w2 = loader
-            .extract_tensor_as_quantized("shard2_tensor", QuantFormat::FP16)
-            .unwrap();
-        assert!(matches!(w2, QuantizedWeight::ZeroCopySlice { .. }));
     }
 
     #[test]

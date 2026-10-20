@@ -41,11 +41,6 @@ pub enum Device {
     Cpu,
     /// Apple GPU through Metal.
     Metal,
-    /// Apple Neural Engine through Core ML.
-    Ane,
-    Cuda,
-    Rocm,
-    LevelZero,
 }
 
 impl Device {
@@ -54,24 +49,7 @@ impl Device {
         match self {
             Device::Cpu => "cpu",
             Device::Metal => "metal",
-            Device::Ane => "ane",
-            Device::Cuda => "cuda",
-            Device::Rocm => "rocm",
-            Device::LevelZero => "level-zero",
         }
-    }
-
-    /// The startup error for backends that exist only as stubs (CUDA, ROCm, Level Zero); `None` otherwise.
-    pub fn stub_error(self) -> Option<String> {
-        let api = match self {
-            Device::Cuda => "CUDA",
-            Device::Rocm => "ROCm",
-            Device::LevelZero => "Level Zero",
-            Device::Cpu | Device::Metal | Device::Ane => return None,
-        };
-        Some(format!(
-            "--backend {self}: the {api} backend is a stub: it is not implemented because no {api} hardware is available to build and verify it"
-        ))
     }
 }
 
@@ -87,12 +65,8 @@ impl std::str::FromStr for Device {
         match s.to_ascii_lowercase().as_str() {
             "cpu" => Ok(Device::Cpu),
             "metal" => Ok(Device::Metal),
-            "ane" => Ok(Device::Ane),
-            "cuda" => Ok(Device::Cuda),
-            "rocm" => Ok(Device::Rocm),
-            "level-zero" | "levelzero" => Ok(Device::LevelZero),
             other => Err(format!(
-                "unknown --backend '{other}' (expected cpu, metal, ane, cuda, rocm, or level-zero)"
+                "unknown --backend '{other}' (expected auto, cpu, or metal)"
             )),
         }
     }
@@ -153,13 +127,6 @@ pub fn available_devices() -> Vec<Device> {
         if metal::Device::system_default().is_some() {
             devices.push(Device::Metal);
         }
-        devices.push(Device::Ane);
-    }
-    if crate::graph::cuda::is_available() {
-        devices.push(Device::Cuda);
-    }
-    if crate::graph::rocm::is_available() {
-        devices.push(Device::Rocm);
     }
     devices
 }
@@ -228,9 +195,6 @@ pub enum QuantFormat {
     NVFP4_E2M1,
     MXFP4,
     MXFP6,
-    EXL3_3Bit,
-    EXL3_4Bit,
-    EXL3_5Bit,
     AWQ_W4A16,
     GPTQ_W4A16,
     GGUF_Q4_0,
@@ -258,8 +222,6 @@ pub enum QuantFormat {
     BitNet_B1_58,
     KIVI_2Bit,
     TurboQuant,
-    WeightlessJesseLUT,
-    HadamardNeedle,
     /// bitsandbytes NF4/FP4 source tags; the GPU codecs are the blocksize-qualified `BNB_*_B*`.
     BNB_NF4,
     BNB_FP4,
@@ -287,7 +249,6 @@ pub enum QuantFormat {
 impl QuantFormat {
     pub fn bits_per_weight(&self) -> f32 {
         match self {
-            Self::WeightlessJesseLUT => 0.5,
             Self::BitNet_B1_58 => 1.58,
             Self::GGUF_IQ1_S => 1.5625,
             Self::GGUF_TQ1_0 => 1.6875,
@@ -302,16 +263,13 @@ impl QuantFormat {
             Self::GGUF_Q3_K | Self::GGUF_IQ3_S => 3.4375,
             Self::MXFP4 | Self::GGUF_IQ4_XS => 4.25,
             Self::GGUF_NVFP4 => 4.5,
-            Self::EXL3_3Bit => 3.0,
             Self::TurboQuant => 3.5,
-            Self::EXL3_4Bit => 4.0,
-            Self::HadamardNeedle => 4.0,
             Self::GGUF_Q4_0
             | Self::GGUF_Q4_K_M
             | Self::AWQ_W4A16
             | Self::GPTQ_W4A16
             | Self::GGUF_IQ4_NL => 4.5,
-            Self::EXL3_5Bit | Self::GGUF_Q4_1 => 5.0,
+            Self::GGUF_Q4_1 => 5.0,
             Self::GGUF_Q5_0 | Self::GGUF_Q5_K_M => 5.5,
             Self::MXFP6 | Self::GGUF_Q5_1 => 6.0,
             Self::GGUF_Q6_K => 6.5625,
@@ -360,9 +318,6 @@ impl QuantFormat {
             Self::NVFP4 | Self::NVFP4_E2M1 => "NVFP4",
             Self::MXFP4 => "MXFP4",
             Self::MXFP6 => "MXFP6",
-            Self::EXL3_3Bit => "EXL3_3Bit",
-            Self::EXL3_4Bit => "EXL3_4Bit",
-            Self::EXL3_5Bit => "EXL3_5Bit",
             Self::AWQ_W4A16 => "AWQ",
             Self::GPTQ_W4A16 => "GPTQ",
             Self::GGUF_Q4_0 => "Q4_0",
@@ -390,8 +345,6 @@ impl QuantFormat {
             Self::BitNet_B1_58 => "BitNet_1.58",
             Self::KIVI_2Bit => "KIVI_2Bit",
             Self::TurboQuant => "TurboQuant",
-            Self::WeightlessJesseLUT => "JesseLUT",
-            Self::HadamardNeedle => "Needle",
             Self::BNB_NF4 => "BNB_NF4",
             Self::BNB_FP4 => "BNB_FP4",
             Self::BNB_NF4_B64 => "BNB_NF4_B64",
@@ -415,9 +368,6 @@ impl QuantFormat {
         let clean = s.trim().to_lowercase().replace('-', "_");
         match clean.as_str() {
             "nvfp4" | "nvfp4_e2m1" | "fp4" => Some(Self::NVFP4_E2M1),
-            "exl3" | "exl3_3bit" | "exl3_3" => Some(Self::EXL3_3Bit),
-            "exl3_4bit" | "exl3_4" => Some(Self::EXL3_4Bit),
-            "exl3_5bit" | "exl3_5" => Some(Self::EXL3_5Bit),
             "q4_k_m" | "q4_k" | "gguf_q4_k_m" => Some(Self::GGUF_Q4_K_M),
             "q4_0" | "gguf_q4_0" => Some(Self::GGUF_Q4_0),
             "q4_1" | "gguf_q4_1" => Some(Self::GGUF_Q4_1),
@@ -449,8 +399,6 @@ impl QuantFormat {
             "gguf_nvfp4" => Some(Self::GGUF_NVFP4),
             "kivi" | "kivi_2bit" => Some(Self::KIVI_2Bit),
             "turbo" | "turboquant" => Some(Self::TurboQuant),
-            "jesse" | "weightless" | "lut" => Some(Self::WeightlessJesseLUT),
-            "needle" | "hadamard" => Some(Self::HadamardNeedle),
             _ => None,
         }
     }
@@ -463,12 +411,6 @@ pub enum QuantMode {
     BF16,
     Q8_0, // GGUF Q8_0: int8 values + f16 scale per 32
     NVFP4Ultra,
-    EXL3Aggressive,  // 3-bit multi-rate
-    EXL3Balanced,    // 4-bit multi-rate
-    EXL3Quality,     // 5-bit multi-rate
-    AdaptiveHybrid,  // Attention EXL3-4bit, FFN NVFP4, KV KIVI-2bit
-    TurboSqueeze,    // NVFP4 + TurboQuant KV residual
-    WeightlessJesse, // SolidSF Jesse Weightless Neural Network
 }
 
 impl QuantMode {
@@ -478,12 +420,7 @@ impl QuantMode {
             Self::F16 => QuantFormat::FP16,
             Self::BF16 => QuantFormat::BF16,
             Self::Q8_0 => QuantFormat::GGUF_Q8_0,
-            Self::NVFP4Ultra | Self::TurboSqueeze => QuantFormat::NVFP4_E2M1,
-            Self::EXL3Aggressive => QuantFormat::EXL3_3Bit,
-            Self::EXL3Balanced => QuantFormat::EXL3_4Bit,
-            Self::EXL3Quality => QuantFormat::EXL3_5Bit,
-            Self::AdaptiveHybrid => QuantFormat::NVFP4_E2M1,
-            Self::WeightlessJesse => QuantFormat::WeightlessJesseLUT,
+            Self::NVFP4Ultra => QuantFormat::NVFP4_E2M1,
         }
     }
 
@@ -493,12 +430,6 @@ impl QuantMode {
             Self::F16 | Self::BF16 => 16.0,
             Self::Q8_0 => 8.5,
             Self::NVFP4Ultra => 4.25, // 4-bit values + 16-elem block scale
-            Self::EXL3Aggressive => 3.125,
-            Self::EXL3Balanced => 4.125,
-            Self::EXL3Quality => 5.125,
-            Self::AdaptiveHybrid => 3.85,
-            Self::TurboSqueeze => 3.5,
-            Self::WeightlessJesse => 0.5,
         }
     }
 
@@ -947,25 +878,6 @@ impl QuantizationFormat for BF16 {
         }
         let u16_val = u16::from_le_bytes([block[0], block[1]]);
         Ok(vec![crate::model::bf16_to_f32(u16_val)])
-    }
-    fn extract_block_params(_: &[u8]) -> Result<Self::BlockParams, String> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WeightlessJesseLUT;
-
-impl QuantizationFormat for WeightlessJesseLUT {
-    type BlockParams = ();
-    fn block_size() -> (usize, usize) {
-        (1, 1)
-    }
-    fn bytes_per_block() -> usize {
-        1
-    }
-    fn dequantize_block(_: &[u8], _: &Self::BlockParams) -> Result<Vec<f32>, String> {
-        Err("WeightlessJesseLUT requires lookup table context".to_string())
     }
     fn extract_block_params(_: &[u8]) -> Result<Self::BlockParams, String> {
         Ok(())

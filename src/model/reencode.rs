@@ -169,8 +169,9 @@ pub fn declared_format(t: &VirtualTensor) -> Q {
         "F8_E4M3" => Q::FP8_E4M3,
         "F8_E5M2" => Q::FP8_E5M2,
         // Packed integers under a float tag: a quantized checkpoint (EXL3, GLQ, ...) no codec reads.
+        // TurboQuant is the codec-less low-bit tag: the ladder lifts it to Q4_K_M.
         "U8" | "I8" | "I16" | "U16" | "I32" | "U32" | "I64" | "U64" if is_float(t.quant_format) => {
-            Q::EXL3_4Bit
+            Q::TurboQuant
         }
         _ => t.quant_format,
     }
@@ -1098,20 +1099,12 @@ mod tests {
             ] {
                 assert_eq!(rule(MaxSpeed, src), Target::Native, "{src:?}");
             }
-            assert_eq!(rule(MaxSpeed, Q::EXL3_3Bit), Target::Encode(Q::GGUF_Q4_K_M));
+            assert_eq!(rule(MaxSpeed, Q::TurboQuant), Target::Encode(Q::GGUF_Q4_K_M));
             // LowBitNative: float -> Q8_0; codec-less -> smallest ladder format >= source bpw.
             for src in [Q::BF16, Q::FP16, Q::FP32] {
                 assert_eq!(rule(LowBitNative, src), Target::Encode(Q::GGUF_Q8_0));
             }
             assert_eq!(rule(LowBitNative, Q::GGUF_Q4_K_M), Target::Native);
-            assert_eq!(
-                rule(LowBitNative, Q::EXL3_3Bit),
-                Target::Encode(Q::GGUF_Q4_K_M)
-            );
-            assert_eq!(
-                rule(LowBitNative, Q::EXL3_5Bit),
-                Target::Encode(Q::GGUF_Q5_K_M)
-            );
             assert_eq!(
                 rule(LowBitNative, Q::TurboQuant),
                 Target::Encode(Q::GGUF_Q4_K_M)
@@ -1120,8 +1113,7 @@ mod tests {
             for src in [Q::BF16, Q::FP32, Q::GGUF_Q8_0, Q::GGUF_Q4_0] {
                 assert_eq!(rule(BitExact, src), Target::Native);
             }
-            assert_eq!(rule(BitExact, Q::EXL3_4Bit), Target::Encode(Q::GGUF_Q4_K_M));
-            assert_eq!(rule(BitExact, Q::EXL3_5Bit), Target::Encode(Q::GGUF_Q5_K_M));
+            assert_eq!(rule(BitExact, Q::TurboQuant), Target::Encode(Q::GGUF_Q4_K_M));
         });
     }
 

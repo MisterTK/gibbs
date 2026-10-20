@@ -476,10 +476,6 @@ impl SequenceClassifier {
     /// classifier on `device`. BERT-family encoders run on the CPU or Metal; DeBERTa and decoder
     /// classifiers on the CPU only.
     pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
-        // ponytail: Core ML (--backend ane) has no classification head program.
-        if device == Device::Ane {
-            return Err("gpu-only: classifiers run on Metal or the CPU; Core ML has no head program".into());
-        }
         let resolved = resolve_config(hub, repo_id);
         // SetFit: a sentence-transformers body (`BertModel`) + a scikit-learn head.
         if resolved.is_err() && hub.fetch_file(repo_id, "config_setfit.json").is_ok() {

@@ -1,5 +1,4 @@
-//! Gibbs graph IR: one model description shared by every executor (CPU today; Metal and
-//! Core ML/ANE per PLAN.md).
+//! Gibbs graph IR: one model description shared by every executor (CPU and Metal).
 //!
 //! A [`Graph`] is pure structure in SSA form. Every value is a graph input, a named weight, or the
 //! output of a node, and nodes are appended in topological order (a node can only reference values
@@ -10,18 +9,14 @@ pub mod avenues;
 #[cfg(target_os = "macos")]
 pub mod codec;
 pub mod codegen;
-pub mod coreml;
 pub mod cpu;
-pub mod cuda;
 pub mod egraph;
-pub mod level_zero;
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod passes;
 pub mod pattern;
 pub mod placement;
 pub mod program;
-pub mod rocm;
 pub mod search;
 pub mod tune;
 use crate::hardware::{Device, QuantFormat};
@@ -72,8 +67,6 @@ pub enum Layout {
     RowMajor,
     /// Channels-last images (Metal `convolution2d`).
     Nhwc,
-    /// `[1, C, 1, S]` (Core ML on the Neural Engine).
-    Ane,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

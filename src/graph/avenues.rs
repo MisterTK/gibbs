@@ -1,7 +1,7 @@
 //! GPU-only enforcement: the avenue ladder every node must climb before it may leave the GPU, the
 //! per-family gates for loaders that still run on the CPU, and the op list each family needs.
 //!
-//! `explore_node` tries six avenues in order and stops at the first that really has a code path.
+//! `explore_node` tries five avenues in order and stops at the first that really has a code path.
 //! A graph with an unlowered node fails to place with a [`GpuReport`] naming every avenue's reason.
 
 use crate::graph::{BinaryKind, DType, Op, PairLayout, ReduceKind, RopeVariant, UnaryKind, UpsampleMode};
@@ -15,17 +15,15 @@ pub enum Avenue {
     DtypeAdapt,
     GeneratedKernel,
     MatmulPrimitive,
-    CoreMlAne,
 }
 
 impl Avenue {
-    pub const ALL: [Avenue; 6] = [
+    pub const ALL: [Avenue; 5] = [
         Avenue::MetalKernel,
         Avenue::Decompose,
         Avenue::DtypeAdapt,
         Avenue::GeneratedKernel,
         Avenue::MatmulPrimitive,
-        Avenue::CoreMlAne,
     ];
 
     pub fn name(self) -> &'static str {
@@ -35,7 +33,6 @@ impl Avenue {
             Avenue::DtypeAdapt => "dtype-adapt",
             Avenue::GeneratedKernel => "generated-kernel",
             Avenue::MatmulPrimitive => "matmul-primitive",
-            Avenue::CoreMlAne => "core-ml-ane",
         }
     }
 }
@@ -149,15 +146,7 @@ fn matmul_primitive(op: &Op, _dtype: DType) -> Verdict {
     ))
 }
 
-fn core_ml(op: &Op) -> Verdict {
-    if crate::graph::coreml::supports_node(op) {
-        Verdict::Lowered("Core ML program")
-    } else {
-        Verdict::Rejected(format!("no Core ML lowering for {}", op.name()))
-    }
-}
-
-/// Tries the six avenues in order and stops at the first `Lowered`.
+/// Tries the five avenues in order and stops at the first `Lowered`.
 pub fn explore_node(name: &str, op: &Op, dtype: DType) -> NodeReport {
     let mut attempts = Vec::with_capacity(Avenue::ALL.len());
     for avenue in Avenue::ALL {
@@ -167,7 +156,6 @@ pub fn explore_node(name: &str, op: &Op, dtype: DType) -> NodeReport {
             Avenue::DtypeAdapt => dtype_adapt(op, dtype),
             Avenue::GeneratedKernel => generated(op, dtype),
             Avenue::MatmulPrimitive => matmul_primitive(op, dtype),
-            Avenue::CoreMlAne => core_ml(op),
         };
         let done = matches!(verdict, Verdict::Lowered(_));
         attempts.push(Attempt { avenue, verdict });

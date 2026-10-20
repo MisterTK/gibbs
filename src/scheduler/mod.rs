@@ -2,8 +2,7 @@ pub mod spec;
 
 use crate::hardware::{Device, QuantMode};
 use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
-use crate::model::graph_lm::{sample_logits, GraphLm, LayerKVCache};
-use crate::model::nano::NanoTransformerModel;
+use crate::model::graph_lm::{sample_logits, GraphLm};
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::telemetry::{EngineTelemetry, GapSample};
@@ -27,7 +26,6 @@ pub fn cpu_backend_label() -> String {
 
 /// Per-sequence KV state, owned by the backend that produced it.
 pub enum SeqKvCache {
-    Cpu(Vec<LayerKVCache>),
     /// StateStore for GraphProgram execution
     Program(crate::graph::StateStore),
     /// Built by [`NativeLm::prepare`] at submission.
@@ -35,8 +33,6 @@ pub enum SeqKvCache {
 }
 #[derive(Clone)]
 pub enum ExecutableModel {
-    Nano(Arc<parking_lot::RwLock<NanoTransformerModel>>),
-    GraphLm(Arc<parking_lot::RwLock<GraphLm>>),
     /// Multi-segment GraphProgram execution.
     Program(
         Arc<parking_lot::RwLock<crate::graph::program::GraphProgram>>,
@@ -44,30 +40,6 @@ pub enum ExecutableModel {
     ),
     /// A causal LM outside GraphLm (new architectures, multimodal); see [`crate::model::native`].
     Native(Arc<dyn NativeLm>),
-}
-
-impl From<Arc<NanoTransformerModel>> for ExecutableModel {
-    fn from(m: Arc<NanoTransformerModel>) -> Self {
-        Self::Nano(Arc::new(parking_lot::RwLock::new((*m).clone())))
-    }
-}
-
-impl From<Arc<GraphLm>> for ExecutableModel {
-    fn from(m: Arc<GraphLm>) -> Self {
-        Self::GraphLm(Arc::new(parking_lot::RwLock::new((*m).clone())))
-    }
-}
-
-impl From<GraphLm> for ExecutableModel {
-    fn from(m: GraphLm) -> Self {
-        Self::GraphLm(Arc::new(parking_lot::RwLock::new(m)))
-    }
-}
-
-impl From<NanoTransformerModel> for ExecutableModel {
-    fn from(m: NanoTransformerModel) -> Self {
-        Self::Nano(Arc::new(parking_lot::RwLock::new(m)))
-    }
 }
 
 /// Last 64 tokens: the window the sampler sees.
@@ -122,18 +94,11 @@ impl ExecutableModel {
             }
             #[cfg(not(target_os = "macos"))]
             Device::Metal => Err("the Metal backend requires macOS".into()),
-            Device::Ane => Err(
-                "--backend ane: LLM inference on the Neural Engine is not implemented yet".into(),
-            ),
-            Device::Cuda | Device::Rocm | Device::LevelZero => Err(target_device
-                .stub_error()
-                .expect("cuda/rocm/level-zero are stubs")),
         }
     }
 
     pub fn llm_backend(&self) -> Device {
         match self {
-            Self::Nano(_) | Self::GraphLm(_) => Device::Cpu,
             Self::Program(prog, _) => prog.read().primary_device(),
             Self::Native(m) => m.device(),
         }
@@ -142,7 +107,6 @@ impl ExecutableModel {
     /// e.g. `CPU (NEON SIMD), 14 threads` or `Metal (Apple M5 Pro)` (device name from the Metal API).
     pub fn backend_label(&self) -> String {
         match self {
-            Self::Nano(_) | Self::GraphLm(_) => cpu_backend_label(),
             Self::Program(prog, _) => prog.read().backend_label(),
             Self::Native(m) => m.backend_label(),
         }
@@ -151,7 +115,6 @@ impl ExecutableModel {
     /// program (CPU executors, seq2seq, vision models).
     pub fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
         match self {
-            Self::Nano(_) | Self::GraphLm(_) => None,
             Self::Program(prog, _) => Some(prog.read().placement_summary()),
             Self::Native(m) => m.placement_summary(),
         }
@@ -170,7 +133,6 @@ impl ExecutableModel {
         // Greedy (as `sample_logits` decides it): programs may pick the token on the device.
         let greedy = temp <= 1e-4;
         let logits = match self {
-            Self::Nano(m) => return Ok(m.read().forward_token(last_token, pos)),
             // `pos` counts `last_token` itself.
             Self::Native(m) => match kv_cache {
                 Some(SeqKvCache::Native(state)) if greedy => {
@@ -182,38 +144,6 @@ impl ExecutableModel {
                 Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
                 _ => return Err(WRONG_KV.into()),
             },
-            Self::GraphLm(m) => {
-                let model = m.read();
-                let logits = match kv_cache {
-                    Some(SeqKvCache::Cpu(cache)) => {
-                        let actual_pos = cache.first().map_or(0, |c| c.len);
-                        model.forward_token_with_kv(last_token, actual_pos, cache)
-                    }
-                    None => {
-                        let mut cache = new_cpu_kv(&model);
-                        let mut logits = vec![0.0f32; model.config.vocab_size];
-                        for (p, &tok) in all_tokens.iter().enumerate() {
-                            logits = model.forward_token_with_kv(tok, p, &mut cache);
-                        }
-                        *kv_cache = Some(SeqKvCache::Cpu(cache));
-                        logits
-                    }
-                    Some(SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
-                        return Err(WRONG_KV.into())
-                    }
-                };
-                // No repetition penalty (HF default 1.0): `all_tokens` includes the prompt,
-                // and penalizing it suppresses words an answer must reuse. `recent` only
-                // seeds sampling.
-                return Ok(model.sample_next_token_with_penalty(
-                    &logits,
-                    recent(all_tokens),
-                    temp,
-                    50,
-                    top_p,
-                    1.0,
-                ));
-            }
             Self::Program(prog, m) => {
                 let mut p = prog.write();
                 let model = m.read();
@@ -315,50 +245,6 @@ impl ExecutableModel {
         }
     }
 
-    /// Evaluates a single decode token returning logits directly without allocations.
-    pub fn decode_step_logits(
-        &self,
-        token: u32,
-        pos: usize,
-        kv_cache: &mut Option<SeqKvCache>,
-    ) -> Result<Vec<f32>, String> {
-        match self {
-            Self::Program(prog, _m) => {
-                let mut p = prog.write();
-                match kv_cache {
-                    Some(SeqKvCache::Program(state)) => {
-                        std::mem::swap(&mut p.state, state);
-                        let actual_pos = (pos.saturating_sub(1)) as u32;
-                        let inputs = vec![
-                            crate::graph::Tensor::U32(vec![token]),
-                            crate::graph::Tensor::U32(vec![actual_pos]),
-                        ];
-                        let out = p.run(inputs);
-                        std::mem::swap(&mut p.state, state);
-                        let out = out?;
-                        match out.into_iter().next() {
-                            Some(crate::graph::Tensor::F32(v)) => Ok(v),
-                            _ => Err("GraphProgram did not return F32 logits".into()),
-                        }
-                    }
-                    _ => Err(WRONG_KV.into()),
-                }
-            }
-            Self::Native(m) => match kv_cache {
-                Some(SeqKvCache::Native(s)) => m.forward(&[token], pos, s),
-                _ => Err(WRONG_KV.into()),
-            },
-            Self::GraphLm(m) => match kv_cache {
-                Some(SeqKvCache::Cpu(cache)) => {
-                    let model = m.read();
-                    let actual_pos = cache.first().map_or(0, |c| c.len);
-                    Ok(model.forward_token_with_kv(token, actual_pos, cache))
-                }
-                _ => Err(WRONG_KV.into()),
-            },
-            _ => Err("decode_step_logits not implemented for this model type".into()),
-        }
-    }
     pub fn step_token_with_kv_and_logprobs(
         &self,
         all_tokens: &[u32],
@@ -370,35 +256,10 @@ impl ExecutableModel {
         kv_cache: &mut Option<SeqKvCache>,
     ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
         let logits = match self {
-            Self::Nano(m) => {
-                let tok = m.read().forward_token(last_token, pos);
-                return Ok((tok, None));
-            }
             Self::Native(m) => match kv_cache {
                 Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
                 _ => return Err(WRONG_KV.into()),
             },
-            Self::GraphLm(m) => {
-                let model = m.read();
-                match kv_cache {
-                    Some(SeqKvCache::Cpu(cache)) => {
-                        let actual_pos = cache.first().map_or(0, |c| c.len);
-                        model.forward_token_with_kv(last_token, actual_pos, cache)
-                    }
-                    None => {
-                        let mut cache = new_cpu_kv(&model);
-                        let mut logits = vec![0.0f32; model.config.vocab_size];
-                        for (p, &tok) in all_tokens.iter().enumerate() {
-                            logits = model.forward_token_with_kv(tok, p, &mut cache);
-                        }
-                        *kv_cache = Some(SeqKvCache::Cpu(cache));
-                        logits
-                    }
-                    Some(SeqKvCache::Native(_) | SeqKvCache::Program(_)) => {
-                        return Err(WRONG_KV.into())
-                    }
-                }
-            }
             Self::Program(prog, m) => {
                 let mut p = prog.write();
                 let _model = m.read();
@@ -509,14 +370,6 @@ impl ExecutableModel {
         if chunk_tokens.is_empty() {
             return Ok(None);
         }
-        if let Self::Nano(m) = self {
-            let model = m.read();
-            let mut last_tok = 0;
-            for (i, &tok) in chunk_tokens.iter().enumerate() {
-                last_tok = model.forward_token(tok, start_pos + i);
-            }
-            return Ok(is_last_chunk.then_some(last_tok));
-        }
         let logits = self.prefill_logits(chunk_tokens, start_pos, kv_cache)?;
         Ok(is_last_chunk.then(|| self.sample(&logits, recent(all_prompt_tokens), temp, top_p)))
     }
@@ -529,21 +382,6 @@ impl ExecutableModel {
         kv_cache: &mut Option<SeqKvCache>,
     ) -> Result<Vec<f32>, String> {
         Ok(match self {
-            Self::Nano(_) => return Err("Nano models have no logits".into()),
-            Self::GraphLm(m) => {
-                let model = m.read();
-                let cache = match kv_cache
-                    .get_or_insert_with(|| SeqKvCache::Cpu(new_cpu_kv(&model)))
-                {
-                    SeqKvCache::Cpu(c) => c,
-                    SeqKvCache::Native(_) | SeqKvCache::Program(_) => return Err(WRONG_KV.into()),
-                };
-                let mut logits = Vec::new();
-                for (i, &tok) in chunk_tokens.iter().enumerate() {
-                    logits = model.forward_token_with_kv(tok, start_pos + i, cache);
-                }
-                logits
-            }
             Self::Native(m) => match kv_cache {
                 Some(SeqKvCache::Native(state)) => m.forward(chunk_tokens, start_pos, state)?,
                 _ => return Err(WRONG_KV.into()),
@@ -640,10 +478,6 @@ impl ExecutableModel {
     /// Top-k 50 / top-p sampling without repetition penalty; `temp <= 0` is greedy argmax.
     fn sample(&self, logits: &[f32], recent: &[u32], temp: f32, top_p: f32) -> u32 {
         match self {
-            Self::Nano(_) => unreachable!("Nano samples inside forward_token"),
-            Self::GraphLm(m) => m
-                .read()
-                .sample_next_token_with_penalty(logits, recent, temp, 50, top_p, 1.0),
             Self::Program(_, m) => m
                 .read()
                 .sample_next_token_with_penalty(logits, recent, temp, 50, top_p, 1.0),
@@ -659,16 +493,6 @@ impl ExecutableModel {
         }
     }
 
-    pub fn step_token(
-        &self,
-        all_tokens: &[u32],
-        last_token: u32,
-        pos: usize,
-        temp: f32,
-    ) -> Result<u32, String> {
-        self.step_token_with_kv(all_tokens, last_token, pos, temp, DEFAULT_TOP_P, &mut None)
-    }
-
     /// One-shot generation for the CLI `--prompt` path: (text, decode forward passes, decode time).
     /// `drafter` speculates; native models otherwise use the drafter they ship.
     pub fn generate_text_measured(
@@ -679,11 +503,6 @@ impl ExecutableModel {
         drafter: Option<Arc<dyn Drafter>>,
     ) -> Result<(String, usize, std::time::Duration), String> {
         match (self, drafter) {
-            (Self::Nano(_), _) => Err("Nano models have no text generation loop".into()),
-            (Self::GraphLm(m), None) => {
-                Ok(m.read()
-                    .generate_text_measured(prompt, max_new_tokens, temperature))
-            }
             (Self::Native(_), None) => spec_generate(
                 self,
                 builtin_drafter(Some(self)),
@@ -703,20 +522,11 @@ impl ExecutableModel {
         max_new_tokens: usize,
         temperature: f32,
     ) -> Result<(String, usize, std::time::Duration), String> {
-        match self {
-            Self::Nano(_) => Err("Nano models have no text generation loop".into()),
-            Self::GraphLm(m) => {
-                Ok(m.read()
-                    .generate_text_measured(prompt, max_new_tokens, temperature))
-            }
-            _ => spec_generate(self, None, prompt, max_new_tokens, temperature),
-        }
+        spec_generate(self, None, prompt, max_new_tokens, temperature)
     }
 
     pub fn tokenizer(&self) -> Tokenizer {
         match self {
-            Self::Nano(_) => Tokenizer::default_bpe(),
-            Self::GraphLm(m) => m.read().tokenizer.clone(),
             Self::Program(_, m) => m.read().tokenizer.clone(),
             Self::Native(m) => m.tokenizer().clone(),
         }
@@ -725,8 +535,6 @@ impl ExecutableModel {
     /// GraphLm weight format; `None` for native models, which keep their own representation.
     pub fn current_quant_mode(&self) -> Option<QuantMode> {
         match self {
-            Self::Nano(m) => Some(m.read().quant_mode),
-            Self::GraphLm(m) => Some(m.read().current_quant_mode()),
             Self::Program(_, m) => Some(m.read().current_quant_mode()),
             Self::Native(_) => None,
         }
@@ -735,8 +543,6 @@ impl ExecutableModel {
     /// Maximum positions the model's KV cache holds; `None` when the model has no fixed window.
     pub fn context_len(&self) -> Option<usize> {
         match self {
-            Self::Nano(_) => None,
-            Self::GraphLm(m) => Some(m.read().config.max_seq_len.max(1)),
             Self::Program(_, m) => Some(m.read().config.max_seq_len.max(1)),
             Self::Native(m) => Some(m.context_len().max(1)),
         }
@@ -885,13 +691,6 @@ fn spec_generate(
     }
     exec.stream_end(&mut kv)?;
     Ok((tok.decode(&out), decoded, decode))
-}
-
-fn new_cpu_kv(model: &GraphLm) -> Vec<LayerKVCache> {
-    let max_seq_len = model.config.max_seq_len.max(1);
-    (0..model.layers.len())
-        .map(|_| LayerKVCache::new(max_seq_len, model.config.hidden_dim))
-        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1935,7 +1734,19 @@ impl ContinuousBatchScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::graph_lm::GraphLmConfig;
+    use crate::model::graph_lm::{GraphLmConfig, LayerKVCache};
+
+    /// Host-forward KV cache: the reference the program-path tests compare against.
+    fn new_cpu_kv(model: &GraphLm) -> Vec<LayerKVCache> {
+        let max_seq_len = model.config.max_seq_len.max(1);
+        (0..model.layers.len())
+            .map(|_| LayerKVCache::new(max_seq_len, model.config.hidden_dim))
+            .collect()
+    }
+
+    fn cpu_exec(model: GraphLm) -> ExecutableModel {
+        ExecutableModel::load_graph_lm(model, Device::Cpu).unwrap()
+    }
 
     /// smollm_1m with room for prompts spanning several prefill budgets; never emits EOS.
     fn long_context_model() -> GraphLm {
@@ -1955,7 +1766,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(long_context_model().into()),
+            Some(cpu_exec(long_context_model())),
         );
         let greedy = |n| SamplingParams {
             temperature: Some(0.0),
@@ -2000,7 +1811,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(long_context_model().into()),
+            Some(cpu_exec(long_context_model())),
         );
         let greedy = SamplingParams {
             temperature: Some(0.0),
@@ -2023,7 +1834,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(long_context_model().into()),
+            Some(cpu_exec(long_context_model())),
         );
         let greedy = SamplingParams {
             temperature: Some(0.0),
@@ -2061,7 +1872,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(never_eos_model().into()),
+            Some(cpu_exec(never_eos_model())),
         );
         let params = SamplingParams {
             temperature: Some(0.0),
@@ -2083,7 +1894,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(never_eos_model().into()),
+            Some(cpu_exec(never_eos_model())),
         );
         assert_eq!(s.prompt_len(&[], |_| vec![1, 2, 3]).unwrap(), 3);
         assert!(s.waiting_queue.read().is_empty());
@@ -2098,7 +1909,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(never_eos_model().into()),
+            Some(cpu_exec(never_eos_model())),
         );
         let params = SamplingParams {
             temperature: Some(0.0),
@@ -2109,7 +1920,7 @@ mod tests {
         let (_, _rx, _, _, running) = s.submit_with_params(params, |_| vec![1, 2, 3]);
         s.step();
         let (_, _rx2, _, _, queued) = s.submit_with_params(params, |_| vec![4, 5]);
-        s.swap_model("other", never_eos_model().into());
+        s.swap_model("other", cpu_exec(never_eos_model()));
         assert!(finish_outcome(&running).is_err() && finish_outcome(&queued).is_err());
     }
 
@@ -2166,7 +1977,7 @@ mod tests {
             let scheduler = ContinuousBatchScheduler::new(
                 "",
                 Arc::new(PagedKVPool::new(512)),
-                Some(never_eos_model().into()),
+                Some(cpu_exec(never_eos_model())),
             );
             let params = SamplingParams {
                 temperature: Some(0.0),
@@ -2194,7 +2005,7 @@ mod tests {
         let model = never_eos_model();
         let ctx = model.config.max_seq_len;
         let scheduler =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(model.into()));
+            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(cpu_exec(model)));
         // Unclamped submit path: only the step's context check can stop this sequence.
         let (_, rx) = scheduler.submit_request_stream(vec![7u32; ctx - 12]);
         assert_eq!(run_to_completion(&scheduler, rx).len(), 12);
@@ -2231,7 +2042,7 @@ mod tests {
             .0 as u32;
 
         let scheduler =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(model.into()));
+            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(cpu_exec(model)));
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
