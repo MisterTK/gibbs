@@ -397,7 +397,7 @@ const F16_MAX: f32 = 65504.0;
 
 /// Whether attention KV caches default to f16 storage: only with `GIBBS_KV_DTYPE=f16` (opt-in). The
 /// f16 kernels accumulate and softmax in f32 and saturate stores at +-65504, but decode with them was
-/// 3.6-24% slower across the suite (sprint 3 ABBA, M8 at 4k context worst), so f32 is the default.
+/// 0.5-24% slower per model (ledger row s3-abba-kv-f16; M8 at 4k context worst), so f32 is the default.
 pub(crate) fn kv_f16_default() -> bool {
     match std::env::var("GIBBS_KV_DTYPE").as_deref() {
         Ok("f16") => true,

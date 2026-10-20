@@ -178,7 +178,7 @@ Last decode step's table per model (µs per token; CachedAttention's bytes count
 | M7 | 186, 7027 µs, 235 GB/s (80%) | — | 30, 999 µs | 181, 1517 µs | ExpertLinear 60 steps 3180 µs; TopK 288 µs; MoeWeightedSum 116 µs |
 | M8 | 202, 3504 µs, 59% | 15, 1034 µs, 79% | 35, 3800 µs | 112, 746 µs | 14 µs |
 
-Profiling serializes command buffers, so the decode tok/s these runs print (5–12) is not a bench number.
+M0 and M1 (finished 17:21 and 17:24) ran while an 11 GB model download was still writing (done 17:25), so their tables may read slow; nothing was decided from them. Profiling serializes command buffers, so the decode tok/s these runs print (5–12) is not a bench number.
 
 ### P0.3 llama-bench refresh (`llama-bench -p 0 -n 128 -r 3`, Homebrew llama.cpp 0.6.0_1, ggml 0.26.0)
 
@@ -192,7 +192,7 @@ Profiling serializes command buffers, so the decode tok/s these runs print (5–
 | M7 | 80.86 ± 0.14 | — |
 | M8 (`-d 5777`) | 122.88 ± 9.32 | — |
 
-Every row reads 1.4–4% below the 2026-10-13 value on the same build. `bench-reference.json` is not updated by this probe.
+Every row reads 1.4–5% below the 2026-10-13 value on the same build, so this machine state is slower than that day; compare sprint3 with main only inside one ABBA session, not against the README numbers. `bench-reference.json` is not updated by this probe.
 
 ### P0.4 Wave 11 ABBA (`5de3057` cand vs `4ff5e60` base, `scripts/loop_verify.sh`)
 
