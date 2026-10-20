@@ -9,6 +9,7 @@
 
 pub mod expr;
 pub mod names;
+pub mod gen;
 
 use serde::Deserialize;
 use serde_json::{Map, Value as J};
