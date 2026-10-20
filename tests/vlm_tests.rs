@@ -196,4 +196,5 @@ fn test_vlm_metal_lowering_zero_cpu_segments() {
 
     let prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).expect("compile");
     assert_eq!(prog.primary_device(), Device::Metal);
+    assert!(prog.is_single_metal(), "expected one Metal segment");
 }

@@ -74,6 +74,19 @@ const SCHEMA: &str = r#"
 (ruleset fuse)
 "#;
 
+/// The node's kind fact: `"Add"` for a same-shape `Binary{Add}` (the residual the MLP rules
+/// anchor on, and the pattern-key text refbase recorded), else [`Op::name`].
+fn rule_key(g: &Graph, n: &crate::graph::Node) -> &'static str {
+    match (&n.op, &n.inputs[..]) {
+        (Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b])
+            if g.value(a).shape == g.value(b).shape =>
+        {
+            "Add"
+        }
+        _ => n.op.name(),
+    }
+}
+
 /// One ported fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
@@ -398,13 +411,7 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
             seen[out.0 as usize] = true;
             let node = fs.add("Node", (id, list))?;
             fs.union(o, node)?;
-            let key = match n.op {
-                Op::Binary {
-                    kind: crate::graph::BinaryKind::Add,
-                } => "Add",
-                _ => n.op.name(),
-            };
-            fs.add("K", (id, key))?;
+            fs.add("K", (id, rule_key(g, n)))?;
             if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
                 fs.add("K", (id, "Glu"))?;
             }
@@ -970,7 +977,7 @@ impl Fusion {
             let mut s = format!("{:?}{:?}", val.shape, val.dtype);
             if let ValueKind::Node(n) = val.kind {
                 let n = &g.nodes[n.0 as usize];
-                s.push_str(n.op.name());
+                s.push_str(rule_key(g, n));
                 for &i in &n.inputs {
                     let iv = g.value(i);
                     let _ = write!(s, "<{:?}{:?}>", iv.shape, iv.dtype);

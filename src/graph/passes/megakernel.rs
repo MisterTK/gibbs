@@ -60,6 +60,7 @@ pub(crate) fn fuse_mlp_blocks(graph: &mut Graph, only: &HashSet<NodeId>) -> usiz
         let add_node = graph.node(add_nid);
         if !matches!(add_node.op, Op::Binary { kind: crate::graph::BinaryKind::Add })
             || add_node.inputs.len() != 2
+            || graph.value(add_node.inputs[0]).shape != graph.value(add_node.inputs[1]).shape
             || !only.contains(&add_nid)
         {
             continue;
