@@ -2686,6 +2686,8 @@ impl Session {
         state: Option<&mut crate::graph::StateStore>,
         inputs: Vec<Tensor>,
     ) -> Result<Vec<Tensor>, String> {
+        #[cfg(test)]
+        crate::graph::shape::note(graph);
         let plan = self.prepare_plan(graph)?;
         self.run_prepared(graph, &plan, state, inputs)
     }

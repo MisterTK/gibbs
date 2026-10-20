@@ -131,6 +131,8 @@ impl GraphProgram {
         mode: PlacementMode,
     ) -> Result<Self, String> {
         let _compiling = CompileGuard::enter();
+        #[cfg(test)]
+        crate::graph::shape::note(&graph);
         crate::graph::passes::prefuse(&mut graph);
         // Phase-4 plan search re-extracts fusions from the graph before fusion.
         #[cfg(target_os = "macos")]
@@ -305,6 +307,8 @@ impl GraphProgram {
         graph: &Graph,
         inputs: Vec<Tensor>,
     ) -> Result<Vec<Tensor>, String> {
+        #[cfg(test)]
+        crate::graph::shape::note(graph);
         #[cfg(target_os = "macos")]
         if let [CompiledSegment::Metal { session, .. }] = self.segments.as_slice() {
             let shapes: Vec<Vec<usize>> = graph
