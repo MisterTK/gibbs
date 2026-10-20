@@ -147,7 +147,7 @@ fn rope_params(c: &Value, ty: &str) -> Map<String, Value> {
 
 /// Inverse frequencies and the cos/sin scale (`attention_factor`) of one RoPE entry, as
 /// transformers' `default`, `linear` and `yarn` init functions compute them.
-fn inv_freq(
+pub(crate) fn inv_freq(
     p: &Map<String, Value>,
     dim: usize,
     max_pos: usize,

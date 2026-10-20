@@ -20,12 +20,12 @@ use std::path::Path;
 
 /// Network dimensions the loader and forward depend on (head width is 64 everywhere, 32 GroupNorm groups).
 #[derive(Clone, Copy)]
-struct Cfg {
-    in_ch: usize,
-    block_out: [usize; 4],
-    ctx_dim: usize,
+pub struct Cfg {
+    pub in_ch: usize,
+    pub block_out: [usize; 4],
+    pub ctx_dim: usize,
     /// `transformer_in` is `TransformerTemporalModel(num_attention_heads=8, attention_head_dim=64)`.
-    tin_width: usize,
+    pub tin_width: usize,
 }
 
 // ponytail: the ali-vilab/text-to-video-ms-1.7b unet/config.json is fixed in code; read it if other checkpoints matter.
@@ -205,7 +205,7 @@ pub struct Unet3d {
 }
 
 /// Strict safetensors loader: PyTorch shapes, F16/F32 -> f32, and a record of consumed tensors.
-struct St {
+pub struct St {
     reader: Box<dyn WeightReader>,
     cfg: Cfg,
     shapes: HashMap<String, Vec<usize>>,
@@ -213,7 +213,7 @@ struct St {
 }
 
 impl St {
-    fn open(path: &Path, cfg: Cfg) -> Result<Self, String> {
+    pub fn open(path: &Path, cfg: Cfg) -> Result<Self, String> {
         Self::from_reader(Box::new(SafetensorsWeightReader::new(path)?), cfg)
     }
 
@@ -340,7 +340,7 @@ impl Unet3d {
         Self::from_st(St::open(path, REAL)?)
     }
 
-    fn from_st(st: St) -> Result<Self, String> {
+    pub fn from_st(st: St) -> Result<Self, String> {
         let cfg = st.cfg;
         let bo = cfg.block_out;
         let c0 = bo[0];

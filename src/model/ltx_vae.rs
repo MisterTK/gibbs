@@ -15,12 +15,12 @@ use crate::model::weights::Weights;
 use std::path::Path;
 
 /// `[frames][channels][h * w]`.
-struct Vid {
-    d: Vec<f32>,
-    c: usize,
-    f: usize,
-    h: usize,
-    w: usize,
+pub struct Vid {
+    pub d: Vec<f32>,
+    pub c: usize,
+    pub f: usize,
+    pub h: usize,
+    pub w: usize,
 }
 
 impl Vid {
@@ -218,8 +218,8 @@ impl Res {
 /// Where a module sits in the checkpoint: the diffusers path, or the original `up_blocks.N` /
 /// `down_blocks.N` one with its running index.
 #[derive(Clone, Copy)]
-struct Names {
-    diffusers: bool,
+pub struct Names {
+    pub diffusers: bool,
 }
 
 impl Names {
@@ -277,7 +277,7 @@ struct Up {
     res: Vec<Res>,
 }
 
-struct Decoder {
+pub struct Decoder {
     conv_in: Conv,
     mid: Vec<Res>,
     ups: Vec<Up>,
@@ -287,12 +287,12 @@ struct Decoder {
 
 /// Widths of the checkpoints this module reads (diffusers `vae/config.json` of Lightricks/LTX-Video).
 #[derive(Clone, Copy)]
-struct Cfg {
-    ch: [usize; 4],
-    layers: [usize; 5],
-    up: [bool; 4],
-    patch: usize,
-    latent: usize,
+pub struct Cfg {
+    pub ch: [usize; 4],
+    pub layers: [usize; 5],
+    pub up: [bool; 4],
+    pub patch: usize,
+    pub latent: usize,
 }
 
 const V090: Cfg = Cfg {
@@ -363,7 +363,7 @@ impl Decoder {
         })
     }
 
-    fn fwd(&self, z: Vid) -> Vid {
+    pub fn fwd(&self, z: Vid) -> Vid {
         crate::hardware::cpu_compute::enter("ltx_vae::decode");
         let causal = false;
         let mut x = self.conv_in.fwd(&z, causal);
@@ -678,7 +678,7 @@ impl Encoder {
 
 impl LtxVae {
     /// Metal decoder over a `[f][c][h*w]` clip (same outputs as `Decoder::fwd`): one program per clip size.
-    fn decode_gpu(&self, z: Vid) -> Result<Vid, String> {
+    pub fn decode_gpu(&self, z: Vid) -> Result<Vid, String> {
         let net = self.gpu_dec.get(&[z.f, z.h, z.w], || {
             let mut b = Gb::new();
             let x = b.input("z", &[z.f, z.c, z.h, z.w]);
@@ -722,7 +722,7 @@ impl LtxVae {
 /// The decoder (and, for image-to-video, the encoder), plus the per-channel latent statistics the
 /// pipeline normalises with.
 pub struct LtxVae {
-    dec: Decoder,
+    pub dec: Decoder,
     enc: Option<Encoder>,
     mean: Vec<f32>,
     std: Vec<f32>,
@@ -758,7 +758,7 @@ impl LtxVae {
         Self::open(&w, Names { diffusers }, encoder, V090)
     }
 
-    fn open(w: &Weights, n: Names, encoder: bool, cfg: Cfg) -> Result<Self, String> {
+    pub fn open(w: &Weights, n: Names, encoder: bool, cfg: Cfg) -> Result<Self, String> {
         let (mean, std) = if n.diffusers {
             ("latents_mean", "latents_std")
         } else {

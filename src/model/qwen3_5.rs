@@ -15,7 +15,7 @@ mod gpu_tests;
 mod text;
 pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
 pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
-mod vision;
+pub mod vision;
 
 pub use draft::{
     gguf_checkpoint as gguf_drafter, load as load_drafter, ARCHITECTURES as DRAFT_ARCHITECTURES,

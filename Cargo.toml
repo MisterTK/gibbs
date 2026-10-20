@@ -36,6 +36,7 @@ libloading = "0.8"
 # Serialization & CLI
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+json5 = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 # Tokenization & chat templates (exact HF tokenizer.json semantics; model-declared Jinja templates)
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }

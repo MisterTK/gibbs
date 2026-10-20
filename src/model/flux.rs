@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-mod graph_program;
+pub(crate) mod graph_program;
 
 /// A tiny random-weight FLUX forward as a graph (the GPU-only matrix fixture).
 pub fn tiny_dit_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
@@ -130,13 +130,13 @@ impl Wt {
 }
 
 /// The transformer checkpoint: mmap'd safetensors (one file or shards) or one GGUF file.
-pub(crate) enum Store {
+pub enum Store {
     St(Weights, String),
     Gguf(Arc<GgufData>, HashMap<String, VirtualTensor>),
 }
 
 impl Store {
-    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> {
         if path.extension().is_some_and(|e| e == "gguf") {
             let (manifest, map) = crate::model::loaders::gguf::open(path)?;
             let tensors = manifest
@@ -271,7 +271,7 @@ pub(crate) struct Lora {
 
 /// One logical linear whose output rows may be stored as several matrices (diffusers keeps
 /// q/k/v apart where BFL fuses them).
-pub(crate) struct Lin {
+pub struct Lin {
     parts: Vec<(usize, Wt)>,
     bias: Option<Vec<f32>>,
     n: usize,
@@ -305,7 +305,7 @@ impl Lin {
         self.n
     }
 
-    pub(crate) fn fwd(&self, x: &[f32], m: usize) -> Vec<f32> {
+    pub fn fwd(&self, x: &[f32], m: usize) -> Vec<f32> {
         let mut out = vec![0.0; m * self.n];
         nn::matmul_rows(
             x,
@@ -341,7 +341,7 @@ impl Lin {
 /// so diffusers/PEFT (`transformer.transformer_blocks.0.attn.to_q`) and kohya
 /// (`lora_unet_double_blocks_0_img_attn_qkv`) keys meet the names the loader asks for.
 #[derive(Default)]
-pub(crate) struct Loras {
+pub struct Loras {
     pub(crate) by_module: HashMap<String, (Vec<f32>, Vec<f32>, usize, usize, f32)>,
     /// ComfyUI `<module>.diff_b` bias deltas (already scaled by the strength).
     pub(crate) bias: HashMap<String, Vec<f32>>,
@@ -701,7 +701,7 @@ enum Modulation {
 
 pub struct FluxTransformer {
     img_in: Lin,
-    txt_in: Lin,
+    pub txt_in: Lin,
     modulation: Modulation,
     double: Vec<Double>,
     single: Vec<Single>,
@@ -722,7 +722,7 @@ pub struct FluxTransformer {
 }
 
 impl FluxTransformer {
-    fn load(s: &Store, loras: &mut Loras) -> Result<Self, String> {
+    pub fn load(s: &Store, loras: &mut Loras) -> Result<Self, String> {
         let diffusers = s.has("x_embedder.weight");
         if !diffusers && !s.has("img_in.weight") {
             return Err("not a FLUX transformer: no x_embedder.weight or img_in.weight".into());
@@ -940,7 +940,7 @@ impl FluxTransformer {
     }
 
     /// Pooled-text embedding `vector_in(pooled)` (FLUX.1; Chroma has none).
-    fn pooled(&self, pooled: &[f32]) -> Vec<f32> {
+    pub fn pooled(&self, pooled: &[f32]) -> Vec<f32> {
         match &self.modulation {
             Modulation::Vector { vector_in, .. } => vector_in.fwd(pooled),
             Modulation::Table(_) | Modulation::Shared { .. } => Vec::new(),
@@ -950,7 +950,7 @@ impl FluxTransformer {
     /// Velocity for packed latents `img` `[ni, 64]` at time `t` (= sigma) given the projected
     /// text `txt` `[nt, d]` and the pooled-text embedding `y` from [`Self::pooled`].
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub fn forward(
         &self,
         img: &[f32],
         ni: usize,
@@ -1154,14 +1154,14 @@ pub(crate) fn sinusoid(x: f64, dim: usize) -> Vec<f32> {
 }
 
 /// Multi-axis rotary tables: per token, `HEAD_DIM / 2` angle pairs, axis 0 first.
-pub(crate) struct Rope {
+pub struct Rope {
     cos: Vec<f32>,
     sin: Vec<f32>,
 }
 
 impl Rope {
     /// `axes` widths (summing to `HEAD_DIM`) read the leading coordinates of each id.
-    fn new(ids: &[[usize; 4]], axes: &[usize], theta: f64) -> Self {
+    pub fn new(ids: &[[usize; 4]], axes: &[usize], theta: f64) -> Self {
         let (mut cos, mut sin) = (Vec::new(), Vec::new());
         for id in ids {
             for (pos, &dim) in id.iter().zip(axes) {
@@ -1198,7 +1198,7 @@ impl Rope {
 /// Position ids: `nt` text tokens, then the packed `hp x wp` latent grid as `(0, row, col, 0)`
 /// row-major (diffusers `_prepare_latent_image_ids`). FLUX.1 text sits at the origin; FLUX.2
 /// numbers it along the last axis (`text_axis`: `(0, 0, 0, l)`).
-fn position_ids(nt: usize, hp: usize, wp: usize, text_axis: bool) -> Vec<[usize; 4]> {
+pub(crate) fn position_ids(nt: usize, hp: usize, wp: usize, text_axis: bool) -> Vec<[usize; 4]> {
     let mut ids: Vec<[usize; 4]> = (0..nt)
         .map(|l| [0, 0, 0, if text_axis { l } else { 0 }])
         .collect();

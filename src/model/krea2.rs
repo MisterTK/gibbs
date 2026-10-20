@@ -317,7 +317,7 @@ impl Block {
     }
 }
 
-struct Dit {
+pub struct Dit {
     dim: usize,
     tdim: usize,
     chan: usize,
@@ -338,14 +338,14 @@ struct Dit {
     last_norm: Vec<f32>,
     last_mod: Vec<f32>,
     last: Lin,
-    gpu: graph_program::FwdCache,
-    gpu_fuse: graph_program::FuseCache,
+    pub gpu: graph_program::FwdCache,
+    pub gpu_fuse: graph_program::FuseCache,
 }
 
 impl Dit {
     /// `cfg`: the diffusers `transformer/config.json` when there is one (RoPE axes/theta; the sizes
     /// come from the tensors either way).
-    fn load(path: &Path, loras: &mut Loras, cfg: &Value) -> Result<Self, String> {
+    pub fn load(path: &Path, loras: &mut Loras, cfg: &Value) -> Result<Self, String> {
         let store = Store::open(path)?;
         let diffusers = !store.has("first.weight") && store.has("img_in.weight");
         let mut s = Src {
@@ -435,7 +435,7 @@ impl Dit {
     }
 
     /// The 12 tapped encoder states (`[12][n, txt_dim]`) -> text features `[n, dim]` for the DiT.
-    fn fuse(&self, taps: &[Vec<f32>], n: usize) -> Vec<f32> {
+    pub fn fuse(&self, taps: &[Vec<f32>], n: usize) -> Vec<f32> {
         let (td, nl) = (self.txt_norm.len(), taps.len());
         // Token-major rows: row t * nl + layer.
         let mut x = vec![0.0f32; n * nl * td];
@@ -492,7 +492,7 @@ impl Dit {
     }
 
     /// Velocity for latents `[C, h, w]` at noise level `sigma`; `ctx` is [`Self::fuse`]'s `[n_txt, dim]`.
-    fn forward(&self, lat: &[f32], h: usize, w: usize, sigma: f32, ctx: &[f32]) -> Vec<f32> {
+    pub fn forward(&self, lat: &[f32], h: usize, w: usize, sigma: f32, ctx: &[f32]) -> Vec<f32> {
         let (d, p) = (self.dim, PATCH);
         let (gh, gw) = (h / p, w / p);
         let n_img = gh * gw;

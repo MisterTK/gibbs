@@ -4,13 +4,13 @@
 //! weights read straight from the memory-mapped safetensors file, or dequantized from a llama.cpp
 //! `gemma4` GGUF and its `mmproj` ([`load_gguf`]).
 
-mod audio;
+pub(crate) mod audio;
 mod gguf;
 pub mod graph;
 mod moe;
 pub(crate) mod ops;
 pub mod seqcls;
-mod text;
+pub mod text;
 pub use audio::tiny::{graph as tiny_audio_graph, wav_graph as tiny_audio_wav_graph};
 pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 pub use vision::tiny::graph as tiny_vision_graph;

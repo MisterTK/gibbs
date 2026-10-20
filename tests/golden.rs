@@ -14,3 +14,24 @@ fn harness_roundtrip() {
     assert_eq!(util::f32_to_f16(-2.5), 0xC100);
     assert_eq!(util::f32_to_bf16(1.0), 0x3F80);
 }
+
+#[path = "golden/lm.rs"]
+mod lm;
+
+#[path = "golden/gemma.rs"]
+mod gemma;
+
+#[path = "golden/qwen.rs"]
+mod qwen;
+
+#[path = "golden/enc.rs"]
+mod enc;
+
+#[path = "golden/encdec.rs"]
+mod encdec;
+
+#[path = "golden/diffa.rs"]
+mod diffa;
+
+#[path = "golden/diffb.rs"]
+mod diffb;

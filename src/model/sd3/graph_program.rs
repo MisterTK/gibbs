@@ -57,7 +57,7 @@ impl Ff {
 impl Mmdit {
     /// The velocity for latents `[C, h, w]` (see [`Mmdit::forward`]) on the GPU.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_gpu(
+    pub fn forward_gpu(
         &self,
         lat: &[f32],
         h: usize,

@@ -107,7 +107,7 @@ fn depthwise(b: &mut Gb, p: &str, x: ValueId, h: usize, w: usize, wt: &[f32], bi
 impl SanaDit {
     /// Flow prediction for latents `lat [C, h, w]` at integer `timestep` given the raw encoder
     /// states `enc [n_cap, caption_channels]` (the program applies the caption projection).
-    pub(super) fn forward_gpu(
+    pub fn forward_gpu(
         &self,
         cache: &Cache,
         lat: &[f32],

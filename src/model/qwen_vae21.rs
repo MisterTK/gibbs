@@ -257,7 +257,7 @@ impl Up {
 
 /// Gather indices of [`dup_up`]: output channel `co*4 + fy*2 + fx` reads input channel
 /// `(((co*ft + ft-1)*2 + fy)*2 + fx) / repeats`.
-fn dup_idx(c_out: usize, repeats: usize, ft: usize) -> Vec<u32> {
+pub(crate) fn dup_idx(c_out: usize, repeats: usize, ft: usize) -> Vec<u32> {
     (0..c_out * 4)
         .map(|i| (((i / 4 * ft + ft - 1) * 4 + i % 4) / repeats) as u32)
         .collect()
@@ -397,7 +397,7 @@ impl QwenVae21 {
     }
 
     /// Native CPU decoder over de-normalised latents `z [z, h, w]` -> `[4, 16h, 16w]` (RGBA planes).
-    fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
+    pub fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> (Vec<f32>, usize, usize) {
         crate::hardware::cpu_compute::enter("qwen_vae21::decode");
         let x = self.post_quant.fwd(z, h, w);
         let mut x = self.conv_in.fwd(&x, h, w);
@@ -414,7 +414,7 @@ impl QwenVae21 {
 
     /// Metal decoder (same outputs as [`Self::decode_cpu`]); one program per latent size. The
     /// `DupUp3D` channel regrouping is a Gather whose U32 indices are extra program inputs.
-    fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize), String> {
+    pub fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize), String> {
         let net = self.gpu.get(&[h, w], || {
             let mut b = Gb::new();
             let x = b.input("z", &[self.latent_channels(), h, w]);

@@ -50,7 +50,7 @@ struct GLayer {
     down: Lin,
 }
 
-struct Gemma2 {
+pub struct Gemma2 {
     embed: Mat,
     layers: Vec<GLayer>,
     norm: Vec<f32>,
@@ -69,7 +69,7 @@ fn gemma_norm(w: &Weights, name: &str, d: usize) -> Result<Vec<f32>, String> {
 }
 
 impl Gemma2 {
-    fn load(dir: &Path) -> Result<Self, String> {
+    pub fn load(dir: &Path) -> Result<Self, String> {
         let c = read_config(dir)?;
         if c["model_type"] != "gemma2" {
             return Err(format!(
@@ -184,7 +184,7 @@ impl Gemma2 {
         });
     }
 
-    fn encode(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+    pub fn encode(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
         let (n, d) = (ids.len(), self.embed.cols);
         let normalizer = crate::model::bf16_to_f32(crate::model::f32_to_bf16((d as f32).sqrt()));
         let mut h = Vec::with_capacity(n * d);
@@ -246,7 +246,7 @@ struct Block {
     point: Lin,
 }
 
-struct SanaDit {
+pub struct SanaDit {
     d: usize,
     heads: usize,
     head_dim: usize,
@@ -338,7 +338,7 @@ fn linear_attention(
 }
 
 impl SanaDit {
-    fn load(dir: &Path) -> Result<Self, String> {
+    pub fn load(dir: &Path) -> Result<Self, String> {
         let c = read_config(dir)?;
         let get = |k: &str| {
             c[k].as_u64()
@@ -406,7 +406,7 @@ impl SanaDit {
     }
 
     /// Projected, normed caption [n, d] from encoder states [n, caption_channels].
-    fn caption(&self, enc: &[f32], n: usize) -> Vec<f32> {
+    pub fn caption(&self, enc: &[f32], n: usize) -> Vec<f32> {
         let mut c = self.cap1.fwd(enc, n);
         nn::gelu_tanh(&mut c);
         let mut c = self.cap2.fwd(&c, n);
@@ -415,7 +415,7 @@ impl SanaDit {
     }
 
     /// Flow prediction for latents [C, h, w] at integer `timestep`, caption [n_cap, d] (projected).
-    fn forward(
+    pub fn forward(
         &self,
         lat: &[f32],
         h: usize,

@@ -447,7 +447,7 @@ impl DcAeDecoder {
     }
 
     /// Native CPU decoder over `z = latents / scaling_factor` -> `[3, factor*h, factor*w]`.
-    fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
+    pub fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
         crate::hardware::cpu_compute::enter("dcae::decode");
         let c0 = self.conv_in.2;
         let mut x = conv(z, self.latent, h, w, &self.conv_in);
@@ -481,7 +481,7 @@ impl DcAeDecoder {
     }
 
     /// Metal decoder (same outputs as [`Self::decode_cpu`]); one program per latent size.
-    fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
+    pub fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
         let net = self.gpu.get(&[h, w], || {
             let mut b = Gb::new();
             let zv = b.input("z", &[self.latent, h, w]);

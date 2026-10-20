@@ -79,7 +79,7 @@ fn unpatchify(y: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
 
 /// (frame, row, col) RoPE positions of the padded image tokens (pads at the origin) and of the
 /// padded caption tokens (1, 2, ...).
-fn token_pos(wp: usize, n_img: usize, img_total: usize, cap_total: usize) -> (Vec<[usize; 3]>, Vec<[usize; 3]>) {
+pub(crate) fn token_pos(wp: usize, n_img: usize, img_total: usize, cap_total: usize) -> (Vec<[usize; 3]>, Vec<[usize; 3]>) {
     let img = (0..img_total)
         .map(|t| if t < n_img { [cap_total + 1, t / wp, t % wp] } else { [0, 0, 0] })
         .collect();
@@ -137,7 +137,7 @@ impl Block {
     }
 }
 
-struct ZDit {
+pub struct ZDit {
     dim: usize,
     heads: usize,
     head_dim: usize,
@@ -162,7 +162,7 @@ struct ZDit {
 }
 
 impl ZDit {
-    fn load(dir: &Path) -> Result<Self, String> {
+    pub fn load(dir: &Path) -> Result<Self, String> {
         let cfg = read_config(dir)?;
         let get = |k: &str| {
             cfg[k]
@@ -335,7 +335,7 @@ impl ZDit {
     }
 
     /// Raw model output for latents [C, h, w] at noise level `sigma`; `cap` is [n_cap, cap_feat_dim].
-    fn forward(
+    pub fn forward(
         &self,
         lat: &[f32],
         h: usize,

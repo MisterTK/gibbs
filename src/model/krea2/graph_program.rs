@@ -134,7 +134,7 @@ impl Block {
 
 impl Dit {
     /// `taps` (`[12][n, txt_dim]` flat, layer-major) -> text features `[n, dim]`, on the GPU.
-    pub(super) fn fuse_gpu(&self, cache: &FuseCache, taps: &[Vec<f32>], n: usize) -> Result<Vec<f32>, String> {
+    pub fn fuse_gpu(&self, cache: &FuseCache, taps: &[Vec<f32>], n: usize) -> Result<Vec<f32>, String> {
         let flat: Vec<f32> = taps.concat();
         let mut out = cache.run(n, || self.build_fuse(taps.len(), n), vec![Tensor::F32(flat)])?;
         Ok(out.remove(0))
@@ -169,7 +169,7 @@ impl Dit {
     }
 
     /// Velocity for latents `[C, h, w]` at noise level `sigma`; `ctx` is the fused `[n_txt, dim]`.
-    pub(super) fn forward_gpu(&self, cache: &FwdCache, lat: &[f32], h: usize, w: usize, sigma: f32, ctx: &[f32]) -> Result<Vec<f32>, String> {
+    pub fn forward_gpu(&self, cache: &FwdCache, lat: &[f32], h: usize, w: usize, sigma: f32, ctx: &[f32]) -> Result<Vec<f32>, String> {
         let (gw, n_img) = (w / PATCH, (h / PATCH) * (w / PATCH));
         let n_txt = ctx.len() / self.dim;
         let ids: Vec<Vec<usize>> = (0..n_txt + n_img)

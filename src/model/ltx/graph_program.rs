@@ -71,7 +71,7 @@ impl LtxTransformer {
     /// (the caption projection runs in the program), model timestep `t` and the first `clean`
     /// tokens held at timestep 0, on the GPU.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn forward_gpu(
+    pub fn forward_gpu(
         &self,
         x: &[f32],
         n: usize,

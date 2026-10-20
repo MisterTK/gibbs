@@ -65,7 +65,7 @@ impl Mods {
 }
 
 /// Rotary tables `[n, head_dim / 2]` over the joint sequence (text, then the target image).
-pub(crate) struct Rope {
+pub struct Rope {
     cos: Vec<f32>,
     sin: Vec<f32>,
 }
@@ -73,7 +73,7 @@ pub(crate) struct Rope {
 /// `QwenImage21Rope` positions `(frame, height, width)` of a text prompt of `n_text` tokens
 /// followed by one `h x w` image: text advances all three axes together; the image sits at the
 /// frame after the text, on a grid centred on zero.
-fn t2i_positions(n_text: usize, h: usize, w: usize) -> Vec<[i32; 3]> {
+pub fn t2i_positions(n_text: usize, h: usize, w: usize) -> Vec<[i32; 3]> {
     let mut pos: Vec<[i32; 3]> = (0..n_text as i32).map(|p| [p; 3]).collect();
     let (oy, ox) = ((h - h / 2) as i32, (w - w / 2) as i32);
     for y in 0..h as i32 {
@@ -85,7 +85,7 @@ fn t2i_positions(n_text: usize, h: usize, w: usize) -> Vec<[i32; 3]> {
 }
 
 impl Rope {
-    fn new(pos: &[[i32; 3]], axes: &[usize; 3]) -> Self {
+    pub fn new(pos: &[[i32; 3]], axes: &[usize; 3]) -> Self {
         let half: usize = axes.iter().map(|a| a / 2).sum();
         let freqs: Vec<(usize, f32)> = axes
             .iter()
@@ -172,12 +172,12 @@ fn gated_add(x: &mut [f32], d: usize, pre: usize, g0: &[f32], gt: &[f32], y: &[f
     add_gated(b, d, Some(gt), &y[pre * d..]);
 }
 
-pub(crate) struct Dit21 {
+pub struct Dit21 {
     dim: usize,
     heads: usize,
     head_dim: usize,
     in_ch: usize,
-    axes: [usize; 3],
+    pub axes: [usize; 3],
     img_in: QLin,
     /// `text_norm.weight + 1` (the checkpoint stores the zero-centred scale).
     text_norm: Vec<f32>,
@@ -190,13 +190,13 @@ pub(crate) struct Dit21 {
     norm_out: QLin,
     proj_out: QLin,
     /// Metal programs per (text tokens, h, w) (GPU-only runs).
-    gpu: graph_program::Cache,
+    pub gpu: graph_program::Cache,
 }
 
 impl Dit21 {
     /// Reads the transformer; sizes come from the tensors. `cfg` (a diffusers `config.json`, absent
     /// for GGUFs) only supplies what tensors cannot: the rotary axes and the unsupported options.
-    pub(crate) fn load(s: &Store, cfg: Option<&Value>) -> Result<Self, String> {
+    pub fn load(s: &Store, cfg: Option<&Value>) -> Result<Self, String> {
         let null = Value::Null;
         let cfg = cfg.unwrap_or(&null);
         if cfg["causal_condition"] == false || cfg["patch_size"].as_u64().is_some_and(|p| p != 1) {
@@ -295,7 +295,7 @@ impl Dit21 {
     }
 
     /// `txt_in` (zero-centred RMSNorm, linear, tanh-GELU, linear) of text features `[n, text_width]`.
-    fn project_text(&self, txt: &[f32], n: usize) -> Vec<f32> {
+    pub fn project_text(&self, txt: &[f32], n: usize) -> Vec<f32> {
         let mut t = txt.to_vec();
         rms_norm(&mut t, self.text_width(), &self.text_norm, 1e-6);
         let mut h = self.txt_in.fwd(&t, n);
@@ -334,7 +334,7 @@ impl Dit21 {
 
     /// Velocity of the packed latents `lat [n_img, in_ch]` at `sigma`, given the projected text
     /// `ctx [n_text, dim]`.
-    fn forward(&self, lat: &[f32], ctx: &[f32], rope: &Rope, sigma: f32) -> Vec<f32> {
+    pub fn forward(&self, lat: &[f32], ctx: &[f32], rope: &Rope, sigma: f32) -> Vec<f32> {
         let d = self.dim;
         let (pre, n_img) = (ctx.len() / d, lat.len() / self.in_ch);
         let mut x = ctx.to_vec();

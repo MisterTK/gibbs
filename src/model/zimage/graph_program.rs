@@ -26,7 +26,7 @@ fn flat(pos: &[[usize; 3]]) -> Vec<u32> {
 impl ZDit {
     /// The model output (as [`Self::forward`]) for latents [C, h, w] at noise level `sigma`
     /// given the raw caption features `cap [n_cap, cap_feat_dim]`, on the GPU.
-    pub(super) fn forward_gpu(
+    pub fn forward_gpu(
         &self,
         lat: &[f32],
         h: usize,

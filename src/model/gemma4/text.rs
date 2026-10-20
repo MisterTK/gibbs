@@ -131,7 +131,7 @@ fn usize_of(c: &Value, key: &str) -> Result<usize, String> {
 /// RoPE inverse frequencies for one layer type (`rope_parameters[type]`): `default` rotates every
 /// pair; `proportional` rotates the first `partial_rotary_factor` share, leaving the rest at
 /// frequency 0 (identity) while still spanning `head_dim / 2` pairs.
-fn inv_freq(p: &Value, head_dim: usize) -> Result<Vec<f32>, String> {
+pub(crate) fn inv_freq(p: &Value, head_dim: usize) -> Result<Vec<f32>, String> {
     let theta = p["rope_theta"]
         .as_f64()
         .ok_or("rope_parameters: rope_theta missing")?;

@@ -426,7 +426,7 @@ fn moses_tokenize(text: &str, lang: &str) -> String {
 }
 
 /// Marian: 10000^(-2i/d) angles, sin in the first half, cos in the second.
-fn sinusoidal_marian(rows: usize, d: usize) -> Vec<f32> {
+pub(crate) fn sinusoidal_marian(rows: usize, d: usize) -> Vec<f32> {
     let mut t = vec![0.0f32; rows * d];
     let half = d / 2;
     for p in 0..rows {
@@ -440,7 +440,7 @@ fn sinusoidal_marian(rows: usize, d: usize) -> Vec<f32> {
 }
 
 /// fairseq (M2M100, FSMT): exp(-i ln(10000)/(half-1)) angles, sin | cos halves, padding row 1 zero.
-fn sinusoidal_fairseq(rows: usize, d: usize) -> Vec<f32> {
+pub(crate) fn sinusoidal_fairseq(rows: usize, d: usize) -> Vec<f32> {
     let mut t = vec![0.0f32; rows * d];
     let half = d / 2;
     let step = (10000f64).ln() / (half as f64 - 1.0);

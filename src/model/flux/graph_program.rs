@@ -83,7 +83,7 @@ impl Embed {
 /// RoPE tables for `MRope`: per-pair frequencies, section sizes and which id axes feed the three
 /// position slots. FLUX.2's four axes `(t, h, w, l)` have `t == 0` for every token, so its pairs
 /// share the first section with `h` at zero frequency (an identity rotation).
-pub(super) fn rope_tables(axes: &[usize], theta: f64) -> (Vec<f32>, [u32; 3], [usize; 3]) {
+pub(crate) fn rope_tables(axes: &[usize], theta: f64) -> (Vec<f32>, [u32; 3], [usize; 3]) {
     if axes.len() == 4 {
         let (f, sec) = dg::axis_freqs(&[axes[0] + axes[1], axes[2], axes[3]], theta);
         let mut f = f;
@@ -105,7 +105,7 @@ impl FluxTransformer {
     /// the raw pooled CLIP vector (FLUX.1; empty otherwise), the time `t` (= sigma) and the
     /// guidance scale, on the GPU.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_gpu(
+    pub fn forward_gpu(
         &self,
         cache: &Cache,
         img: &[f32],

@@ -203,6 +203,19 @@ impl NanoTransformerModel {
 
     /// Single-token forward decode pass executing fused RMSNorm, GEMV, SwiGLU, and Softmax
     pub fn forward_token(&self, token: u32, _position: usize) -> u32 {
+        let mut best_token = 0;
+        let mut best_logit = f32::NEG_INFINITY;
+        for (t, &logit) in self.forward_logits(token).iter().enumerate() {
+            if logit > best_logit {
+                best_logit = logit;
+                best_token = t as u32;
+            }
+        }
+        best_token
+    }
+
+    /// Next-token logits of [`Self::forward_token`] (position-independent: no attention mixing).
+    pub fn forward_logits(&self, token: u32) -> Vec<f32> {
         let h = self.config.hidden_dim;
         let v = self.config.vocab_size;
         let inter = self.config.intermediate_dim;
@@ -259,32 +272,18 @@ impl NanoTransformerModel {
             hidden[i] = hidden[i] * scale * self.final_norm[i];
         }
 
-        // 4. LM Head Logits & Greedy Argmax Selection
-        let mut best_token = 0;
-        let mut best_logit = f32::NEG_INFINITY;
+        // 4. LM Head Logits
+        let mut logits = vec![0.0; v];
         if let Some(lm_head) = &self.quantized_lm_head {
-            let mut logits = vec![0.0; v];
             lm_head.forward(&hidden, &mut logits);
-            for (t, &logit) in logits.iter().enumerate() {
-                if logit > best_logit {
-                    best_logit = logit;
-                    best_token = t as u32;
-                }
-            }
         } else {
-            for t in 0..v {
-                let mut logit = 0.0;
+            for (t, logit) in logits.iter_mut().enumerate() {
                 for i in 0..h {
-                    logit += hidden[i] * self.lm_head[i * v + t];
-                }
-                if logit > best_logit {
-                    best_logit = logit;
-                    best_token = t as u32;
+                    *logit += hidden[i] * self.lm_head[i * v + t];
                 }
             }
         }
-
-        best_token
+        logits
     }
 }
 

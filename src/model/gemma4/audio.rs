@@ -131,9 +131,9 @@ pub struct Features {
     max_samples: usize,
     pad_multiple: usize,
     /// `[2 * bins, frame]`: windowed cos rows then sin rows (the real DFT as one GEMM).
-    dft: Vec<f32>,
+    pub(crate) dft: Vec<f32>,
     /// `[mel, bins]` HTK triangular filters, unnormalised.
-    filters: Vec<f32>,
+    pub(crate) filters: Vec<f32>,
 }
 
 fn hz_to_mel(f: f64) -> f64 {

@@ -112,7 +112,7 @@ impl Mods {
 }
 
 /// Rotary tables `[n, head_dim / 2]` over the joint sequence (text, then the image).
-struct Rope {
+pub struct Rope {
     cos: Vec<f32>,
     sin: Vec<f32>,
 }
@@ -121,7 +121,7 @@ struct Rope {
 /// `h x w` grid of packed patches (`scale_rope`): text sits on all three axes after the grid's
 /// larger half-side; the image is frame 0 on a grid centred on zero (negative positions are real
 /// angles).
-fn positions(n_text: usize, h: usize, w: usize) -> Vec<[i32; 3]> {
+pub fn positions(n_text: usize, h: usize, w: usize) -> Vec<[i32; 3]> {
     let m = (h / 2).max(w / 2) as i32;
     let mut pos: Vec<[i32; 3]> = (0..n_text as i32).map(|t| [m + t; 3]).collect();
     let (oy, ox) = ((h - h / 2) as i32, (w - w / 2) as i32);
@@ -134,7 +134,7 @@ fn positions(n_text: usize, h: usize, w: usize) -> Vec<[i32; 3]> {
 }
 
 impl Rope {
-    fn new(pos: &[[i32; 3]], axes: &[usize; 3]) -> Self {
+    pub fn new(pos: &[[i32; 3]], axes: &[usize; 3]) -> Self {
         let half: usize = axes.iter().map(|a| a / 2).sum();
         let freqs: Vec<(usize, f32)> = axes
             .iter()
@@ -178,13 +178,13 @@ fn ada_norm_out(x: &[f32], d: usize, emb: &[f32]) -> Vec<f32> {
     norm_modulate(x, d, 1e-6, &emb[..d], &emb[d..])
 }
 
-struct Dit {
+pub struct Dit {
     dim: usize,
     heads: usize,
     head_dim: usize,
     /// Packed latent features per image token (`Z * 4`).
     in_ch: usize,
-    axes: [usize; 3],
+    pub axes: [usize; 3],
     img_in: BLin,
     txt_norm: Vec<f32>,
     txt_in: BLin,
@@ -194,13 +194,13 @@ struct Dit {
     norm_out: BLin,
     proj_out: BLin,
     /// Metal programs per (text tokens, ph, pw) (GPU-only runs).
-    gpu: graph_program::Cache,
+    pub gpu: graph_program::Cache,
 }
 
 impl Dit {
     /// Reads the transformer (diffusers names); sizes come from the tensors. `cfg` (a diffusers
     /// `config.json`, absent for GGUFs) only supplies the rotary axes and the unsupported options.
-    fn load(s: &Store, cfg: Option<&Value>) -> Result<Self, String> {
+    pub fn load(s: &Store, cfg: Option<&Value>) -> Result<Self, String> {
         let null = Value::Null;
         let cfg = cfg.unwrap_or(&null);
         for k in [
@@ -350,7 +350,7 @@ impl Dit {
     }
 
     /// `txt_norm` (RMSNorm with an affine weight) and `txt_in` of text features `[n, text_width]`.
-    fn project_text(&self, txt: &[f32], n: usize) -> Vec<f32> {
+    pub fn project_text(&self, txt: &[f32], n: usize) -> Vec<f32> {
         let mut t = txt.to_vec();
         rms_norm(&mut t, self.text_width(), &self.txt_norm, 1e-6);
         self.txt_in.fwd(&t, n)
@@ -409,7 +409,7 @@ impl Dit {
 
     /// Velocity of the packed latents `lat [n_img, in_ch]` at `sigma`, given the projected text
     /// `ctx [n_text, dim]` and the rotary tables of the joint sequence.
-    fn forward(&self, lat: &[f32], ctx: &[f32], rope: &Rope, sigma: f32) -> Vec<f32> {
+    pub fn forward(&self, lat: &[f32], ctx: &[f32], rope: &Rope, sigma: f32) -> Vec<f32> {
         let d = self.dim;
         let n_img = lat.len() / self.in_ch;
         let (mut img, mut txt) = (self.img_in.fwd(lat, n_img), ctx.to_vec());

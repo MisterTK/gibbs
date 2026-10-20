@@ -124,9 +124,9 @@ fn gated_add(x: &mut [f32], y: &[f32], gate: &[f32]) {
 }
 
 /// Interleaved-pair rotary tables, `[tokens, d]` each.
-pub(crate) struct Rope {
-    cos: Vec<f32>,
-    sin: Vec<f32>,
+pub struct Rope {
+    pub(crate) cos: Vec<f32>,
+    pub(crate) sin: Vec<f32>,
     d: usize,
 }
 
@@ -134,7 +134,7 @@ impl Rope {
     /// `LTXVideoRotaryPosEmbed` for an `f x h x w` latent grid at `fps`: per axis `d / 6` frequencies
     /// `theta^(j / (n - 1)) * pi / 2` times `2 * pos - 1`, axes interleaved, each angle repeated for its
     /// (even, odd) pair, `d % 6` leading identity entries.
-    fn new(f: usize, h: usize, w: usize, fps: f64, d: usize) -> Self {
+    pub fn new(f: usize, h: usize, w: usize, fps: f64, d: usize) -> Self {
         let n = d / 6;
         let freqs: Vec<f64> = (0..n)
             .map(|j| ROPE_THETA.powf(j as f64 / (n - 1) as f64) * std::f64::consts::FRAC_PI_2)
@@ -174,7 +174,7 @@ impl Rope {
 }
 
 impl LtxTransformer {
-    pub(crate) fn load(s: &Store) -> Result<Self, String> {
+    pub fn load(s: &Store) -> Result<Self, String> {
         // diffusers renames the original ComfyUI/LTX names.
         let diffusers = s.has("proj_in.weight");
         let nm = |n: &str| {
@@ -258,7 +258,7 @@ impl LtxTransformer {
     }
 
     /// `PixArtAlphaTextProjection`: T5 tokens `[n, 4096]` -> `[n, d]` (linear, tanh-GELU, linear).
-    pub(crate) fn project_text(&self, ctx: &[f32], n: usize) -> Vec<f32> {
+    pub fn project_text(&self, ctx: &[f32], n: usize) -> Vec<f32> {
         let mut h = self.c1.fwd(ctx, n);
         nn::gelu_tanh(&mut h);
         self.c2.fwd(&h, n)
@@ -304,7 +304,7 @@ impl LtxTransformer {
     /// Velocity for latent tokens `x` `[n, 128]` at model timestep `t` (= sigma * 1000) with projected text
     /// `ctx` `[nt, d]`. The first `clean` tokens (an image-conditioned first latent frame) run at timestep 0,
     /// as `LTXImageToVideoPipeline` does with `timestep * (1 - conditioning_mask)`.
-    pub(crate) fn forward(
+    pub fn forward(
         &self,
         x: &[f32],
         n: usize,

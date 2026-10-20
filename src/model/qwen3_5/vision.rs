@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 
 /// `preprocessor_config.json`: pixel budget and normalization.
-pub(super) struct Preprocessor {
+pub struct Preprocessor {
     min_pixels: usize,
     max_pixels: usize,
     mean: [f32; 3],
@@ -24,7 +24,7 @@ pub(super) struct Preprocessor {
 }
 
 impl Preprocessor {
-    pub(super) fn load(path: &Path) -> Result<Self, String> {
+    pub fn load(path: &Path) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         Self::parse(&bytes, &path.display().to_string())
     }
@@ -126,7 +126,7 @@ impl Merger {
     }
 }
 
-pub(super) struct Vision {
+pub struct Vision {
     hidden: usize,
     heads: usize,
     patch: usize,
@@ -209,7 +209,7 @@ fn merger_node(
 }
 
 /// One image through the tower.
-pub(super) struct Encoded {
+pub struct Encoded {
     /// Merged grid (tokens = rows * cols).
     pub rows: usize,
     pub cols: usize,
@@ -219,7 +219,7 @@ pub(super) struct Encoded {
 }
 
 impl Vision {
-    pub(super) fn load(ck: &Weights, c: &Value) -> Result<Self, String> {
+    pub fn load(ck: &Weights, c: &Value) -> Result<Self, String> {
         let get = |k: &str| {
             c[k].as_u64()
                 .map(|v| v as usize)
@@ -475,7 +475,7 @@ impl Vision {
         })
     }
 
-    pub(super) fn encode(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Encoded, String> {
+    pub fn encode(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Encoded, String> {
         let pr = self.prepare(img, pre)?;
         match &self.gpu {
             Some(gpu) => self.encode_gpu(gpu, pr),
@@ -487,7 +487,7 @@ impl Vision {
     /// compiled on first use. The host only does image preprocessing and the index/weight
     /// arithmetic of the position-embedding interpolation; the gather, blend and the whole
     /// network are the program.
-    pub(super) fn on_gpu(mut self, mode: PlacementMode) -> Result<Self, String> {
+    pub fn on_gpu(mut self, mode: PlacementMode) -> Result<Self, String> {
         if !matches!(mode, PlacementMode::Pin(Device::Cpu)) {
             self.gpu = Some(Gpu {
                 mode,

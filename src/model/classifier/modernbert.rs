@@ -80,6 +80,86 @@ pub(super) struct ModernBert {
     pub(super) classifier: Lin,
 }
 
+/// RoPE inverse frequencies `[d / 2]` and the cos/sin scale (YaRN `attention_factor`) of layer
+/// type `ty`: `rope_parameters[ty]` (new configs), else the legacy `rope_scaling` applied to both
+/// types with `global_rope_theta` / `local_rope_theta` (HF defaults 160k / 10k).
+pub(crate) fn rope_inv_freq(cfg: &Value, ty: &str, d: usize) -> Result<(Vec<f32>, f32), String> {
+    let p = match &cfg["rope_parameters"][ty] {
+        Value::Null => &cfg["rope_scaling"],
+        p => p,
+    };
+    let (legacy, default) = if ty == "full_attention" {
+        ("global_rope_theta", 160_000.0)
+    } else {
+        ("local_rope_theta", 10_000.0)
+    };
+    let base = p["rope_theta"]
+        .as_f64()
+        .or_else(|| cfg[legacy].as_f64())
+        .unwrap_or(default);
+    if p["partial_rotary_factor"]
+        .as_f64()
+        .is_some_and(|f| f != 1.0)
+    {
+        return Err("ModernBERT partial_rotary_factor is not supported".into());
+    }
+    let half = d / 2;
+    let pos_freq = |i: usize| (base as f32).powf((2 * i) as f32 / d as f32);
+    let extrapolation: Vec<f32> = (0..half).map(|i| 1.0 / pos_freq(i)).collect();
+    match p["rope_type"].as_str().unwrap_or("default") {
+        "default" => Ok((extrapolation, 1.0)),
+        // transformers `_compute_yarn_parameters`.
+        "yarn" => {
+            let orig = p["original_max_position_embeddings"]
+                .as_f64()
+                .ok_or("YaRN rope has no original_max_position_embeddings")?;
+            let max_pos = cfg["max_position_embeddings"]
+                .as_u64()
+                .ok_or("config.json has no max_position_embeddings")?;
+            let factor = p["factor"].as_f64().unwrap_or(max_pos as f64 / orig);
+            let mscale = |m: f64| {
+                if factor <= 1.0 {
+                    1.0
+                } else {
+                    0.1 * m * factor.ln() + 1.0
+                }
+            };
+            let attention = match (
+                p["attention_factor"].as_f64(),
+                p["mscale"].as_f64().filter(|&m| m != 0.0),
+                p["mscale_all_dim"].as_f64().filter(|&m| m != 0.0),
+            ) {
+                (Some(a), _, _) => a,
+                (None, Some(m), Some(all)) => mscale(m) / mscale(all),
+                _ => mscale(1.0),
+            };
+            let beta_fast = p["beta_fast"].as_f64().unwrap_or(32.0);
+            let beta_slow = p["beta_slow"].as_f64().unwrap_or(1.0);
+            let corr = |rot: f64| {
+                d as f64 * (orig / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln())
+            };
+            let (mut low, mut high) = (corr(beta_fast), corr(beta_slow));
+            if p["truncate"].as_bool().unwrap_or(true) {
+                (low, high) = (low.floor(), high.ceil());
+            }
+            let (low, mut high) = (low.max(0.0) as f32, high.min(d as f64 - 1.0) as f32);
+            if low == high {
+                high += 0.001;
+            }
+            let inv = (0..half)
+                .map(|i| {
+                    let ramp = ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
+                    let extra = 1.0 - ramp;
+                    let inter = 1.0 / (factor as f32 * pos_freq(i));
+                    inter * (1.0 - extra) + extrapolation[i] * extra
+                })
+                .collect();
+            Ok((inv, attention as f32))
+        }
+        other => Err(format!("ModernBERT rope_type {other} is not supported")),
+    }
+}
+
 impl ModernBert {
     pub(super) fn load(cfg: &Value, ckpt: &Checkpoint) -> Result<Self, String> {
         let num = |k: &str| {
@@ -141,85 +221,7 @@ impl ModernBert {
                 types.len()
             ));
         }
-        // `rope_parameters[type]` (new configs), else the legacy `rope_scaling` applied to both
-        // types with `global_rope_theta` / `local_rope_theta` (HF defaults 160k / 10k).
-        // Returns the inverse frequencies and the cos/sin scale (YaRN `attention_factor`).
-        let rope = |ty: &str| -> Result<(Vec<f32>, f32), String> {
-            let p = match &cfg["rope_parameters"][ty] {
-                Value::Null => &cfg["rope_scaling"],
-                p => p,
-            };
-            let (legacy, default) = if ty == "full_attention" {
-                ("global_rope_theta", 160_000.0)
-            } else {
-                ("local_rope_theta", 10_000.0)
-            };
-            let base = p["rope_theta"]
-                .as_f64()
-                .or_else(|| cfg[legacy].as_f64())
-                .unwrap_or(default);
-            if p["partial_rotary_factor"]
-                .as_f64()
-                .is_some_and(|f| f != 1.0)
-            {
-                return Err("ModernBERT partial_rotary_factor is not supported".into());
-            }
-            let half = d / 2;
-            let pos_freq = |i: usize| (base as f32).powf((2 * i) as f32 / d as f32);
-            let extrapolation: Vec<f32> = (0..half).map(|i| 1.0 / pos_freq(i)).collect();
-            match p["rope_type"].as_str().unwrap_or("default") {
-                "default" => Ok((extrapolation, 1.0)),
-                // transformers `_compute_yarn_parameters`.
-                "yarn" => {
-                    let orig = p["original_max_position_embeddings"]
-                        .as_f64()
-                        .ok_or("YaRN rope has no original_max_position_embeddings")?;
-                    let factor = p["factor"]
-                        .as_f64()
-                        .unwrap_or(num("max_position_embeddings")? as f64 / orig);
-                    let mscale = |m: f64| {
-                        if factor <= 1.0 {
-                            1.0
-                        } else {
-                            0.1 * m * factor.ln() + 1.0
-                        }
-                    };
-                    let attention = match (
-                        p["attention_factor"].as_f64(),
-                        p["mscale"].as_f64().filter(|&m| m != 0.0),
-                        p["mscale_all_dim"].as_f64().filter(|&m| m != 0.0),
-                    ) {
-                        (Some(a), _, _) => a,
-                        (None, Some(m), Some(all)) => mscale(m) / mscale(all),
-                        _ => mscale(1.0),
-                    };
-                    let beta_fast = p["beta_fast"].as_f64().unwrap_or(32.0);
-                    let beta_slow = p["beta_slow"].as_f64().unwrap_or(1.0);
-                    let corr = |rot: f64| {
-                        d as f64 * (orig / (rot * 2.0 * std::f64::consts::PI)).ln()
-                            / (2.0 * base.ln())
-                    };
-                    let (mut low, mut high) = (corr(beta_fast), corr(beta_slow));
-                    if p["truncate"].as_bool().unwrap_or(true) {
-                        (low, high) = (low.floor(), high.ceil());
-                    }
-                    let (low, mut high) = (low.max(0.0) as f32, high.min(d as f64 - 1.0) as f32);
-                    if low == high {
-                        high += 0.001;
-                    }
-                    let inv = (0..half)
-                        .map(|i| {
-                            let ramp = ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
-                            let extra = 1.0 - ramp;
-                            let inter = 1.0 / (factor as f32 * pos_freq(i));
-                            inter * (1.0 - extra) + extrapolation[i] * extra
-                        })
-                        .collect();
-                    Ok((inv, attention as f32))
-                }
-                other => Err(format!("ModernBERT rope_type {other} is not supported")),
-            }
-        };
+        let rope = |ty: &str| rope_inv_freq(cfg, ty, d);
         let lin = |name: &str, in_f| ckpt.linear(name, in_f);
         let layers = types
             .iter()

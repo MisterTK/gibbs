@@ -38,7 +38,7 @@ mod setfit;
 mod gguf;
 pub use gguf::GgufClassifier;
 
-mod modernbert;
+pub(crate) mod modernbert;
 
 /// `architectures[0]` values this module runs.
 pub const ARCHITECTURES: &[&str] = &[

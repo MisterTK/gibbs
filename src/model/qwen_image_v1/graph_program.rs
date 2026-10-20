@@ -21,7 +21,7 @@ impl BLin {
 impl Dit {
     /// The velocity for packed latents `lat [ph * pw, in_ch]` given the raw text-encoder
     /// features `txt [n_text, text_width]` at `sigma`, on the GPU.
-    pub(super) fn forward_gpu(
+    pub fn forward_gpu(
         &self,
         cache: &Cache,
         lat: &[f32],

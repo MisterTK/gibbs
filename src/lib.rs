@@ -4,6 +4,9 @@ pub use crate as foundry_engine;
 pub mod backend;
 pub use backend::*;
 
+/// Model architectures as JSON5 specs (`arch/`): registry, expressions, loader, interpreter.
+pub mod arch;
+
 pub mod cluster;
 pub mod graph;
 

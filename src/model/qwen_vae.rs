@@ -359,7 +359,7 @@ impl QwenVae {
         )
     }
 
-    fn open(w: &Weights, mean: Vec<f32>, std: Vec<f32>, base: usize) -> Result<Self, String> {
+    pub fn open(w: &Weights, mean: Vec<f32>, std: Vec<f32>, base: usize) -> Result<Self, String> {
         let net = Net {
             w,
             diffusers: !w.has("decoder.conv1.weight"),
@@ -444,7 +444,7 @@ impl QwenVae {
     }
 
     /// Native CPU decoder over de-normalized latents `z [16, h, w]` -> `[3, 8h, 8w]`.
-    fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
+    pub fn decode_cpu(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
         crate::hardware::cpu_compute::enter("qwen_vae::decode");
         let mut x = self.conv_in.fwd(&self.post.fwd(z, h, w), h, w);
         let (mut h, mut w) = (h, w);
@@ -466,7 +466,7 @@ impl QwenVae {
     }
 
     /// Metal decoder (same outputs as [`Self::decode_cpu`]).
-    fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
+    pub fn decode_gpu(&self, z: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
         let net = self.gpu.get(&[h, w], || {
             let mut b = Gb::new();
             let x = b.input("z", &[Z, h, w]);

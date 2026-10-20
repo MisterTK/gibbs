@@ -165,7 +165,7 @@ struct Block {
     ff_ctx: Option<Ff>,
 }
 
-struct Mmdit {
+pub struct Mmdit {
     d: usize,
     heads: usize,
     patch: usize,
@@ -223,7 +223,7 @@ fn unpatchify(y: &[f32], c: usize, h: usize, w: usize, p: usize) -> Vec<f32> {
 }
 
 impl Mmdit {
-    fn load(dir: &Path) -> Result<Self, String> {
+    pub fn load(dir: &Path) -> Result<Self, String> {
         let cfg = read_config(dir)?;
         let w = component_weights(dir)?;
         let get = |k: &str| {
@@ -301,7 +301,7 @@ impl Mmdit {
     }
 
     /// Velocity for latents [C, h, w] at `timestep` (= sigma * 1000), context [n_ctx, joint_dim], pooled text.
-    fn forward(
+    pub fn forward(
         &self,
         lat: &[f32],
         h: usize,
