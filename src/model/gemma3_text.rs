@@ -671,6 +671,9 @@ mod tests {
             rope_sliding: ((0..hd / 2).map(|i| 1.0 / 1.7f32.powi(i as i32)).collect(), 1.0),
             gpu: None,
         };
+        for n in [1, 7] {
+            crate::graph::shape::assert_shapes(&llm.seqcls_graph(n, &fill(3 * h, 62, 0.5), None));
+        }
         let seqs: [&[u32]; 3] = [&[3, 17, 5], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 70], &[42]];
         let e = parity(&mut llm, &fill(3 * h, 62, 0.5), 3, &seqs);
         eprintln!("gemma3 seq-cls max rel err {e:?}");

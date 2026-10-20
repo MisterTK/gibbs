@@ -2180,6 +2180,8 @@ mod tests {
     /// Per-step logits of the CPU forward vs the Metal programs, teacher-forced on the CPU's
     /// greedy tokens, for sources of a 64-bucket and a full-length-bucket size.
     fn step_parity(family: Family) {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         for src_len in [9usize, 70] {
             let cpu = tiny(5, family, 1);
             let mut gpu = tiny(5, family, 1);
@@ -2226,6 +2228,8 @@ mod tests {
     /// the same hypothesis as the CPU search, and the greedy `forward` path agrees.
     #[test]
     fn beam_search_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         for family in [Family::Marian, Family::Bart, Family::M2m100] {
             let cpu = tiny(11, family, 4);
             let mut gpu = tiny(11, family, 4);

@@ -784,6 +784,8 @@ mod tests {
     /// u8 pixels: allow a 2-level difference from f32 rounding.
     #[test]
     fn generate_gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::with_gpu;
         let pipe = tiny_pipeline().unwrap();
         let req = ImageRequest { prompt: "a lighthouse".into(), seed: 5, ..Default::default() };

@@ -232,6 +232,8 @@ mod tests {
     /// 2 kv heads, text layer groups of 12, 24 text + 36 image tokens).
     #[test]
     fn krea2_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         let path = std::env::temp_dir().join("krea2_graph_tiny.safetensors");
         super::super::tests::write_st(&path, &super::super::tests::tiny_dit());
         let dit = Dit::load(&path, &mut Loras::default(), &Value::Null).expect("tiny load");

@@ -714,7 +714,10 @@ mod tests {
         }
         let _allow = cpu_compute::allow();
         let cpu = tiny_engine(PlacementMode::Pin(Device::Cpu));
-        let gpu = tiny_engine(PlacementMode::Pin(Device::Metal));
+        // The tower + connector and text graphs compiled here reproduce `graph::shape::infer`.
+        let gpu = crate::graph::shape::assert_compiled_shapes(|| {
+            tiny_engine(PlacementMode::Pin(Device::Metal))
+        });
         let Kind::Gpu { vision, text, .. } = &gpu.kind else { panic!("not a GPU engine") };
         assert_eq!(vision.lock().cpu_node_count() + text.lock().cpu_node_count(), 0, "nodes run on the CPU");
         let pixels = crate::model::siglip::tiny::values("pixels", 3 * 16 * 16);

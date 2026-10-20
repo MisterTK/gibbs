@@ -452,6 +452,8 @@ mod tests {
     /// GEMM threshold (16): the epilogue must never be dropped.
     #[test]
     fn linear_activation_epilogues_match_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         for m in [1usize, 15, 16, 64] {
             for act in ["silu", "swiglu", "geglu"] {
                 let (k, n) = (64usize, 96usize);

@@ -314,6 +314,8 @@ mod tests {
     /// Metal program == native CPU forward, per SD3 / SD3.5 variant, at f32 (bf16 weights shared).
     #[test]
     fn sd3_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         for (dual, qk_norm) in [(false, false), (true, true), (true, false), (false, true)] {
             let m = tiny(dual, qk_norm, 1 + dual as u64 * 2 + qk_norm as u64);
             // 12x10 latents -> 6x5 patches = 30 image tokens; 28 text tokens; cropped from an 8x8 table.

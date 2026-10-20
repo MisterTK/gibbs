@@ -595,6 +595,8 @@ mod tests {
     /// Metal program == native CPU forward, per FLUX variant, at f32 (bf16 weights shared).
     #[test]
     fn flux_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         for kind in [Kind::Flux1, Kind::Chroma, Kind::Flux2] {
             let tr = tiny(kind, 1 + kind as u64);
             let (hp, wp, nt) = (6usize, 6usize, 28usize);

@@ -514,6 +514,14 @@ pub mod tiny {
 mod tests {
     use super::target_size;
 
+    /// `graph::shape::infer` reproduces every node of the tiny vision tower graph (two grids).
+    #[test]
+    fn tower_graph_shapes_match_inference() {
+        crate::graph::shape::assert_shapes(&super::tiny::graph().0);
+        let (g, _) = super::tiny::vision().build_graph(2, 6).unwrap();
+        crate::graph::shape::assert_shapes(&g);
+    }
+
     #[test]
     fn target_size_fills_the_budget_on_pool_multiples() {
         // 2520 patches = 280 soft tokens of 3x3 16-px patches.

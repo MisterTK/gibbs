@@ -383,6 +383,8 @@ mod vae_fixture_tests {
     /// of each is still checked for finiteness). The armed run lives in `tests/cpu_free_matrix.rs`.
     #[test]
     fn tiny_vae_fixtures_run() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         super::tiny_vae_on_gpu().unwrap();
     }
 }

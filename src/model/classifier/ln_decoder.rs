@@ -560,4 +560,21 @@ mod tests {
         let e = parity(&mut m, &fill(2 * 16, 32, 0.5), 2, &seqs);
         eprintln!("opt pre-LN erf-gelu max rel err {e:?}");
     }
+
+    /// `graph::shape::infer` reproduces every node of the GPT-2 / OPT seq-cls graphs.
+    #[test]
+    fn seqcls_graph_shapes_match_inference() {
+        for (pre_ln, act, off, proj) in [
+            (true, Act::GeluTanh, 0, false),
+            (false, Act::Relu, 2, true),
+            (true, Act::Gelu, 2, true),
+        ] {
+            let m = tiny(pre_ln, act, off, proj);
+            let labels = 3;
+            let score = fill(labels * m.e, 30, 0.5);
+            for n in [1, 7] {
+                crate::graph::shape::assert_shapes(&m.seqcls_graph(n, &score, None));
+            }
+        }
+    }
 }

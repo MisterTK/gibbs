@@ -1227,6 +1227,8 @@ mod tests {
 
     #[test]
     fn gpu_matches_cpu() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         use crate::model::diff_graph::testutil::{rel_err, synth, Lcg};
         // Mixed widths exercise the 1x1 shortcuts and 1- and 2-head (64 wide) attention.
         let cfg = Cfg { in_ch: 4, block_out: [64, 128, 128, 128], ctx_dim: 96, tin_width: 128 };

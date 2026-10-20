@@ -1381,6 +1381,22 @@ mod tests {
         // Exponent uses the full head_dim, not the rotated width.
         assert!((f[1] - 1e6f64.powf(-2.0 / 512.0) as f32).abs() < 1e-9);
     }
+
+    /// `graph::shape::infer` reproduces every node of the tiny dense and MoE decode, prefill and
+    /// seq-cls graphs.
+    #[test]
+    fn graph_shapes_match_inference() {
+        use crate::graph::shape::assert_shapes;
+        for model in [tiny_model(), tiny_moe_model()] {
+            assert_shapes(&model.to_decode_graph().unwrap().0);
+            assert_shapes(&model.to_prefill_graph(5).unwrap());
+            let h = model.hidden;
+            let (g, _) = model
+                .to_seqcls_graph(16, &vec![1.0; h], 1e-6, &vec![0.1; 3 * h])
+                .unwrap();
+            assert_shapes(&g);
+        }
+    }
     /// The sparse block (router, top-k, banked experts, per-expert scale, both norms) on the Metal
     /// program against the CPU graph executor: the host forward has no sparse block.
     #[test]
@@ -1664,6 +1680,7 @@ mod tests {
             .nodes
             .iter()
             .any(|n| n.name.contains("layers.0.ple")));
+        crate::graph::shape::assert_shapes(&decode_g);
 
         let mut ple_e = vec![0.0f32; pd];
         model
@@ -1894,6 +1911,7 @@ mod tests {
             model.embed_row(t, row);
         }
         let graph = model.to_prefill_graph(ids.len()).unwrap();
+        crate::graph::shape::assert_shapes(&graph);
         let weights = model.to_decode_graph().unwrap().1;
         let mut session = Session::new(Runtime::shared().unwrap(), &weights).unwrap();
         session.set_kv_f16(false);

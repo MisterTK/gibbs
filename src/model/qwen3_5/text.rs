@@ -2298,6 +2298,43 @@ pub fn tiny_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights
 mod tests {
     use super::*;
 
+    /// [`crate::graph::shape::assert_shapes`] except the gated-attention q path of layers that have
+    /// one (a `{p}.self_attn.q_slice` node): its builder declares implicit reshapes the flat CPU
+    /// executor tolerates (the q `Linear` `[n, heads*2*hd]` as `[n*heads, 2*hd]`, the q-norm / gate
+    /// sigmoid over `[n*heads, hd]` operands as `[n, heads*hd]`). Reported, not inferred. Returns
+    /// how many mismatches were excused.
+    fn assert_shapes_but_gated_q(g: &crate::graph::Graph) -> usize {
+        let gated: Vec<String> = g
+            .nodes
+            .iter()
+            .filter_map(|n| n.name.strip_suffix(".self_attn.q_slice"))
+            .flat_map(|p| ["q", "q_norm", "gate_act"].map(|s| format!("node '{p}.self_attn.{s}':")))
+            .collect();
+        let (excused, bad): (Vec<String>, Vec<String>) = crate::graph::shape::shape_mismatches(g)
+            .into_iter()
+            .partition(|m| gated.iter().any(|s| m.starts_with(s.as_str())));
+        assert!(bad.is_empty(), "{} shape mismatches:\n{}", bad.len(), bad.join("\n"));
+        excused.len()
+    }
+
+    /// `graph::shape::infer` reproduces every node of the Qwen3.5 fixture graphs (dense and MoE
+    /// decode, seq-cls, vision tower, MTP head, `.ninfer` decode), but for the gated q path.
+    #[test]
+    fn graph_shapes_match_inference() {
+        let (m, hidden) = tiny_model();
+        assert_shapes_but_gated_q(&m.to_seqcls_graph(&vec![0.1; 3 * hidden]).unwrap().0);
+        // The excused mismatches are real: drop the allowlist when the builder declares them.
+        assert_eq!(assert_shapes_but_gated_q(&tiny_decode_graph().unwrap().0), 3);
+        for g in [
+            tiny_moe_decode_graph(),
+            crate::model::qwen3_5::tiny_vision_tower_graph(),
+            crate::model::qwen3_5::tiny_mtp_graph(),
+            crate::model::qwen3_5::tiny_ninfer_decode_graph(),
+        ] {
+            assert_shapes_but_gated_q(&g.unwrap().0);
+        }
+    }
+
     /// `tile_value_heads` inverts `untile_heads`, and its graph form matches it.
     #[test]
     fn tile_value_heads_inverts_untile_and_matches_graph() {
@@ -2530,6 +2567,7 @@ mod tests {
 
         let text_model = TextModel::load(&weights, &cfg, Arch::Qwen3).unwrap();
         let (decode_g, w) = text_model.to_decode_graph().unwrap();
+        crate::graph::shape::assert_shapes(&decode_g);
 
         let mut cpu_st = text_model.new_state();
         let mut graph_st = crate::graph::StateStore::new();
@@ -2649,6 +2687,7 @@ mod tests {
 
         let text_model = TextModel::load(&weights, &cfg, Arch::HunYuan).unwrap();
         let (decode_g, w) = text_model.to_decode_graph().unwrap();
+        crate::graph::shape::assert_shapes(&decode_g);
 
         let mut cpu_st = text_model.new_state();
         let mut graph_st = crate::graph::StateStore::new();
@@ -2891,6 +2930,7 @@ mod tests {
     /// Metal program: cosine >= 0.999 on every step, and the same arg-max token.
     fn moe_program_matches_host(text_model: &TextModel, hidden: usize, what: &str) {
         let (g, w) = text_model.to_decode_graph().unwrap();
+        assert_shapes_but_gated_q(&g);
         assert!(
             g.nodes
                 .iter()

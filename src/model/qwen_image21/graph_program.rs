@@ -243,6 +243,8 @@ mod tests {
     /// so the centred (negative) height/width positions are asymmetric.
     #[test]
     fn qwen21_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         for fused in [false, true] {
             let dit = tiny(fused);
             let (h, w, nt) = (5usize, 7usize, 21usize);

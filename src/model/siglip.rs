@@ -299,3 +299,12 @@ pub mod tiny {
         vision().into_graph()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// `graph::shape::infer` reproduces every node of the tiny SigLIP tower graph.
+    #[test]
+    fn tower_graph_shapes_match_inference() {
+        crate::graph::shape::assert_shapes(&super::tiny::graph().0);
+    }
+}

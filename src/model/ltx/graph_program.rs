@@ -288,6 +288,8 @@ mod tests {
     /// all-clean split, over a 3x3x4 latent grid (36 tokens).
     #[test]
     fn ltx_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         let tr = tiny(1);
         let (f, h, w, nt) = (3usize, 3usize, 4usize, 24usize);
         let n = f * h * w;

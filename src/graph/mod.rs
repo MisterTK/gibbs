@@ -18,6 +18,7 @@ pub mod pattern;
 pub mod placement;
 pub mod program;
 pub mod search;
+pub mod shape;
 pub mod tune;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
@@ -535,6 +536,29 @@ impl Graph {
             device: Device::Cpu,
         });
         out
+    }
+
+    /// Appends a single-output node whose shape and dtype are inferred from `inputs`
+    /// ([`shape::infer`]).
+    pub fn push(
+        &mut self,
+        name: impl Into<String>,
+        op: Op,
+        inputs: &[ValueId],
+    ) -> Result<ValueId, String> {
+        let name = name.into();
+        let operands = inputs
+            .iter()
+            .map(|v| {
+                let val = self.values.get(v.0 as usize).ok_or_else(|| {
+                    format!("node '{name}': operand {v:?} does not exist yet")
+                })?;
+                Ok((val.shape.as_slice(), val.dtype))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let (shape, dtype) =
+            shape::infer(&op, &operands).map_err(|e| format!("node '{name}': {e}"))?;
+        Ok(self.add(name, op, inputs, shape, dtype))
     }
 
     /// Marks `v` as a graph output; outputs are returned in marking order.

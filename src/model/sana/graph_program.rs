@@ -357,6 +357,8 @@ mod tests {
     /// Metal program == native CPU forward, at two grids (24 and 35 tokens: non-square, odd).
     #[test]
     fn sana_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         let tr = tiny();
         for (h, w, n_cap, t) in [(4usize, 6usize, 7usize, 731.0f32), (5, 7, 21, 40.0)] {
             let lat = rand(C * h * w, 11, 1.0);

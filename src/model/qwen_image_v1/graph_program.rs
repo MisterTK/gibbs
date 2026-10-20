@@ -225,6 +225,8 @@ mod tests {
     /// Metal program == native CPU forward on an odd patch grid (asymmetric centred positions).
     #[test]
     fn qwen1_program_matches_cpu_forward() {
+        // Every graph compiled here reproduces `graph::shape::infer`.
+        let _shapes = crate::graph::shape::CheckCompiled::new();
         let dit = tiny();
         let (ph, pw, nt) = (5usize, 7usize, 21usize);
         let ni = ph * pw;
