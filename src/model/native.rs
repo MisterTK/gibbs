@@ -97,6 +97,24 @@ pub trait NativeLm: Send + Sync {
             .map(crate::graph::Tensor::F32)
     }
 
+    /// The next token of a greedy device decode stream (see
+    /// [`crate::graph::program::GraphProgram::stream_next`]): `last` at `start_pos`, at most
+    /// `max_new` tokens queued. `None` when this model or state cannot stream.
+    fn stream_greedy_token(
+        &self,
+        _last: u32,
+        _start_pos: usize,
+        _max_new: usize,
+        _state: &mut SeqState,
+    ) -> Result<Option<u32>, String> {
+        Ok(None)
+    }
+
+    /// Ends the state's device decode stream, if any.
+    fn stream_end(&self, _state: &mut SeqState) -> Result<(), String> {
+        Ok(())
+    }
+
     // Speculative decoding (see `crate::scheduler::spec`): a model supports it by verifying
     // several positions in one pass and rewinding the ones the target rejects.
 

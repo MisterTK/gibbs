@@ -13,7 +13,7 @@ constant uint ATTN_MAX_PER_LANE = 16;
 constant uint ATTN_MAX_SG = 8;
 
 struct GemmParams { uint m; uint n; uint k; uint has_bias; };
-struct EmbedParams { uint n; uint d; };
+struct EmbedParams { uint n; uint d; uint rows; };
 struct NormParams { uint d; float eps; };
 struct AttnParams { uint nq; uint nk; uint heads; uint head_dim; uint causal; float scale; };
 struct PoolParams { uint n; uint d; };
@@ -229,14 +229,14 @@ GEMM_INSTANCE("gemm_mpp_gelu", gemm_mpp, EPI_GELU)
 GEMM_INSTANCE("gemm_mpp_residual", gemm_mpp, EPI_RESIDUAL)
 #endif
 
-// out[r, :] = table[ids[r], :]; ids are range-checked on the host before dispatch.
+// out[r, :] = table[ids[r], :]; host ids are range-checked before dispatch, device-fed ids clamp.
 kernel void embedding_f32(device const float* table [[buffer(0)]],
                           device const uint* ids [[buffer(1)]],
                           device float* out [[buffer(2)]],
                           constant EmbedParams& p [[buffer(3)]],
                           uint i [[thread_position_in_grid]]) {
     if (i >= p.n * p.d) return;
-    out[i] = table[(ulong)ids[i / p.d] * p.d + i % p.d];
+    out[i] = table[(ulong)min(ids[i / p.d], p.rows - 1) * p.d + i % p.d];
 }
 
 // LayerNorm of one row per threadgroup: mean, then biased variance, like `nn::layer_norm`.

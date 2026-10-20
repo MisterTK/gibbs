@@ -174,9 +174,6 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &ExtStep) -> Resu
 pub(super) struct Enc<'a, 'b> {
     pub enc: &'b Counted<'b>,
     pub loc: &'b dyn Fn(ValueId) -> (&'a Buffer, usize),
-    /// Per-step scratch parameter buffer; slot `step * 64`.
-    pub params: &'b Buffer,
-    pub step: usize,
 }
 
 impl Enc<'_, '_> {
@@ -185,15 +182,10 @@ impl Enc<'_, '_> {
         let (b, off) = (self.loc)(v);
         self.enc.set_buffer(slot, Some(b), off as u64);
     }
-    /// Copies up to 64 bytes of parameters into this step's slice of the params buffer.
+    /// Binds `bytes` of parameters to `slot` inline (no shared buffer a queued run could race on).
     pub fn bind_param(&self, slot: u64, bytes: &[u8]) {
-        // SAFETY: the params buffer holds 64 bytes per step (`params_buffer_size`).
-        unsafe {
-            let dst = (self.params.contents() as *mut u8).add(self.step * 64);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len().min(64));
-        }
         self.enc
-            .set_buffer(slot, Some(self.params), (self.step * 64) as u64);
+            .set_bytes(slot, bytes.len() as u64, bytes.as_ptr() as *const _);
     }
     /// One thread per element, `TG` threads per group.
     pub fn grid1(&self, n: usize) {

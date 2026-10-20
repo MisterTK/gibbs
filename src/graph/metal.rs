@@ -145,6 +145,61 @@ pub fn request_kernel_profile() {
     PROFILE_NEXT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether a one-shot kernel profile is pending (a fed stream yields the next token to it).
+pub(crate) fn profile_requested() -> bool {
+    PROFILE_NEXT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A greedy decode stream ([`Session::submit_fed`]): each token's command buffers are queued before
+/// the previous token is read back, and token ids flow between tokens on the device through `ring`.
+pub struct FedStream {
+    /// Slot `t % 4` (16 bytes at `16 * (t % 4)`) holds token `t`'s `[position, picked token, -, -]`;
+    /// byte 64 holds the stream's first input token.
+    ring: Buffer,
+    state_bufs: Vec<Arc<Buffer>>,
+    inflight: std::collections::VecDeque<InFlight>,
+    /// Tokens submitted so far, at most `budget` (the positions the state buffers were sized for).
+    pub(crate) submitted: usize,
+    pub(crate) budget: usize,
+    pos0: u32,
+    /// The position and input token the caller's next step must pass.
+    pub(crate) next_pos: u32,
+    pub(crate) last: u32,
+    /// When the last [`Session::wait_fed`] returned.
+    last_wait: Option<Instant>,
+}
+
+impl FedStream {
+    pub(crate) fn in_flight(&self) -> usize {
+        self.inflight.len()
+    }
+}
+
+struct InFlight {
+    cbs: Vec<metal::CommandBuffer>,
+    slot: usize,
+    encode_ns: u64,
+    dispatches: u32,
+    started: Instant,
+}
+
+/// A program state's [`FedStream`]. A cloned state starts without one, so clones never share
+/// in-flight work.
+#[derive(Default)]
+pub struct StreamSlot(pub(crate) Option<Box<FedStream>>);
+
+impl Clone for StreamSlot {
+    fn clone(&self) -> Self {
+        StreamSlot(None)
+    }
+}
+
+impl std::fmt::Debug for StreamSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamSlot")
+    }
+}
+
 /// Codec micro-benchmark progress: 0 idle, 1 running, 2 done, 3 failed.
 static CODEC_BENCH_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static CODEC_BENCH_DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -293,7 +348,11 @@ impl WeightFormat {
         }
         if let Some(f) = self.codec_format().filter(|_| generated) {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
-            v.extend(tune::gen64_rows(f).iter().map(|&r| GemvVariant::generated64(r)));
+            v.extend(
+                tune::gen64_rows(f)
+                    .iter()
+                    .map(|&r| GemvVariant::generated64(r)),
+            );
         }
         v
     }
@@ -1552,7 +1611,10 @@ pub struct Session {
     attn_scratch: Mutex<Option<Buffer>>,
     /// Per-threadgroup (value, index) partials of the wide-row argmax (`ext::moe`).
     argmax_scratch: Mutex<Option<Buffer>>,
-    params_buffer: Mutex<Option<Buffer>>,
+    /// Set while [`Self::submit_fed`] encodes: token ids come from the device, not the host.
+    fed_ids: std::sync::atomic::AtomicBool,
+    /// Last command buffer of the newest fed-stream token; host arena writes wait for it.
+    fed_tail: Mutex<Option<metal::CommandBuffer>>,
     gemm: Option<GemmKernel>,
     nvfp4_aux: HashMap<String, (Buffer, f32)>,
     jesse_aux: HashMap<String, (Buffer, usize)>,
@@ -2204,7 +2266,8 @@ impl Session {
             dequant_scratch: Mutex::new(None),
             attn_scratch: Mutex::new(None),
             argmax_scratch: Mutex::new(None),
-            params_buffer: Mutex::new(None),
+            fed_ids: std::sync::atomic::AtomicBool::new(false),
+            fed_tail: Mutex::new(None),
             gemm: None,
             nvfp4_aux,
             jesse_aux,
@@ -2277,14 +2340,15 @@ impl Session {
         cols: usize,
     ) -> Result<(ComputePipelineState, u64, u64), String> {
         use crate::graph::codegen::{gemv_rows_per_tg, gemv_threads};
-        let generated = |q: QuantFormat, v: GemvVariant| -> Result<(ComputePipelineState, u64, u64), String> {
-            let p = v.gen_params();
-            Ok((
-                self.rt.gen_pso(q, p)?,
-                gemv_rows_per_tg(p) as u64,
-                gemv_threads(p) as u64,
-            ))
-        };
+        let generated =
+            |q: QuantFormat, v: GemvVariant| -> Result<(ComputePipelineState, u64, u64), String> {
+                let p = v.gen_params();
+                Ok((
+                    self.rt.gen_pso(q, p)?,
+                    gemv_rows_per_tg(p) as u64,
+                    gemv_threads(p) as u64,
+                ))
+            };
         match (format, variant.kernel) {
             (WeightFormat::Gen(q), GemvKernel::Hand) => generated(q, GemvVariant::generated(2)),
             (_, GemvKernel::Hand) => match format.hand_kernel() {
@@ -2507,13 +2571,25 @@ impl Session {
                     flops_per_run += 2 * (*rows as u64) * (*cols as u64);
                 }
                 Step::GemvPackedPair { cols, legs, .. } => {
-                    flops_per_run +=
-                        2 * ((legs[0].rows + legs[1].rows) as u64) * (*cols as u64);
+                    flops_per_run += 2 * ((legs[0].rows + legs[1].rows) as u64) * (*cols as u64);
                 }
                 _ => {}
             }
         }
-        let params_buffer_size = steps.len() * 64;
+        let mut input_views: Vec<(ValueId, usize, usize)> = graph
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v, i, 0))
+            .collect();
+        for (&v, &(mut root, mut off)) in &aliases {
+            while let Some(&(r, o)) = aliases.get(&root) {
+                (root, off) = (r, off + o);
+            }
+            if let Some(i) = graph.inputs.iter().position(|&x| x == root) {
+                input_views.push((v, i, off));
+            }
+        }
         let mlp_scratch_size = steps
             .iter()
             .filter_map(|s| match s.op {
@@ -2583,7 +2659,7 @@ impl Session {
             weight_bytes,
             state_reads,
             flops_per_run,
-            params_buffer_size,
+            input_views,
             mlp_scratch_size,
             embedding_checks,
             attn_pos_inputs,
@@ -2596,33 +2672,6 @@ impl Session {
     /// Returns the raw pointer to the currently allocated arena buffer contents, if allocated.
     pub fn arena_buffer_ptr(&self) -> Option<*mut std::ffi::c_void> {
         self.arena.lock().as_ref().map(|b| b.contents())
-    }
-
-    /// Returns the raw pointer to the unified params buffer, allocating it if needed.
-    pub fn params_buffer_ptr(&self, size: usize) -> Result<*mut std::ffi::c_void, String> {
-        let mut guard = self.params_buffer.lock();
-        if guard.is_none() || guard.as_ref().unwrap().length() < size as u64 {
-            let aligned = (size + 63) & !63;
-            let buf = self
-                .rt
-                .device
-                .new_buffer(aligned as u64, MTLResourceOptions::StorageModeShared);
-            *guard = Some(buf);
-        }
-        Ok(guard.as_ref().unwrap().contents())
-    }
-
-    pub fn ensure_params_buffer(&self, size: usize) -> Result<Buffer, String> {
-        let mut guard = self.params_buffer.lock();
-        if guard.is_none() || guard.as_ref().unwrap().length() < size as u64 {
-            let aligned = (size.max(64) + 63) & !63;
-            let buf = self
-                .rt
-                .device
-                .new_buffer(aligned as u64, MTLResourceOptions::StorageModeShared);
-            *guard = Some(buf);
-        }
-        Ok(guard.as_ref().unwrap().clone())
     }
 
     /// Runs `graph` with `inputs` bound positionally to `graph.inputs`; returns `graph.outputs`.
@@ -2686,61 +2735,15 @@ impl Session {
         Ok(best)
     }
 
-    /// Runs `graph` using a pre-planned execution schedule.
-    pub fn run_prepared(
+    /// The state buffers of `plan` in `state` (else the session's own), grown to cover `need_rows`
+    /// positions.
+    fn resolve_state_bufs(
         &self,
         graph: &Graph,
         plan: &PreparedPlan,
         mut state: Option<&mut crate::graph::StateStore>,
-        inputs: Vec<Tensor>,
-    ) -> Result<Vec<Tensor>, String> {
-        let run_start = Instant::now();
-        let mut sample: Option<RunSample> = None;
-        if inputs.len() != graph.inputs.len() {
-            return Err(format!(
-                "graph has {} inputs, got {}",
-                graph.inputs.len(),
-                inputs.len()
-            ));
-        }
-        for (&v, t) in graph.inputs.iter().zip(&inputs) {
-            let val = graph.value(v);
-            let ok_type = matches!(
-                (val.dtype, t),
-                (DType::F32, Tensor::F32(_)) | (DType::U32, Tensor::U32(_))
-            );
-            if !ok_type || numel(graph, v)? != t.len() {
-                return Err(format!(
-                    "input '{}' expects {:?} {:?}, got {} elements",
-                    val.name,
-                    val.dtype,
-                    val.shape,
-                    t.len()
-                ));
-            }
-        }
-        let steps = &plan.steps;
-        let offsets = &plan.offsets;
-        for &(pos, rows, ref name) in &plan.embedding_checks {
-            let Tensor::U32(v) = &inputs[pos] else {
-                unreachable!("dtype checked above")
-            };
-            if let Some((r, &id)) = v.iter().enumerate().find(|&(_, &id)| id as usize >= rows) {
-                return Err(format!(
-                    "node '{name}': row {r} id {id} out of range for table of {rows} rows"
-                ));
-            }
-        }
-        // Positions this call touches: 2-D states keep at least 4096 rows and grow in 4096-row steps.
-        let need_rows = plan
-            .attn_pos_inputs
-            .iter()
-            .filter_map(|&(i, m)| match &inputs[i] {
-                Tensor::U32(v) => v.first().map(|&x| x as usize + m),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
+        need_rows: usize,
+    ) -> Result<Vec<Arc<Buffer>>, String> {
         let mut state_bufs: Vec<Arc<Buffer>> = Vec::with_capacity(plan.state_vars.len());
         if let Some(st) = &mut state {
             for &(v, ref name) in &plan.state_vars {
@@ -2799,7 +2802,8 @@ impl Session {
             let mut sbufs = self.state_buffers.lock();
             for &(v, ref name) in &plan.state_vars {
                 let n = state_len(graph, v, need_rows)?;
-                let want = (n * if plan.f16_states.contains(name) { 2 } else { 4 }).max(ARENA_ALIGN);
+                let want =
+                    (n * if plan.f16_states.contains(name) { 2 } else { 4 }).max(ARENA_ALIGN);
                 let have = sbufs.get(name).map_or(0, |b| b.length() as usize);
                 if have < want {
                     let buf = new_shared_buffer(&self.rt.device, want)?;
@@ -2820,6 +2824,69 @@ impl Session {
                 }
             }
         }
+        Ok(state_bufs)
+    }
+
+    /// Runs `graph` using a pre-planned execution schedule.
+    pub fn run_prepared(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
+        state: Option<&mut crate::graph::StateStore>,
+        inputs: Vec<Tensor>,
+    ) -> Result<Vec<Tensor>, String> {
+        let run_start = Instant::now();
+        // A streamed token may still be running on the arena this call writes.
+        if let Some(cb) = self.fed_tail.lock().take() {
+            cb.wait_until_completed();
+        }
+        let mut sample: Option<RunSample> = None;
+        if inputs.len() != graph.inputs.len() {
+            return Err(format!(
+                "graph has {} inputs, got {}",
+                graph.inputs.len(),
+                inputs.len()
+            ));
+        }
+        for (&v, t) in graph.inputs.iter().zip(&inputs) {
+            let val = graph.value(v);
+            let ok_type = matches!(
+                (val.dtype, t),
+                (DType::F32, Tensor::F32(_)) | (DType::U32, Tensor::U32(_))
+            );
+            if !ok_type || numel(graph, v)? != t.len() {
+                return Err(format!(
+                    "input '{}' expects {:?} {:?}, got {} elements",
+                    val.name,
+                    val.dtype,
+                    val.shape,
+                    t.len()
+                ));
+            }
+        }
+        let steps = &plan.steps;
+        let offsets = &plan.offsets;
+        for &(pos, rows, ref name) in &plan.embedding_checks {
+            let Tensor::U32(v) = &inputs[pos] else {
+                unreachable!("dtype checked above")
+            };
+            if let Some((r, &id)) = v.iter().enumerate().find(|&(_, &id)| id as usize >= rows) {
+                return Err(format!(
+                    "node '{name}': row {r} id {id} out of range for table of {rows} rows"
+                ));
+            }
+        }
+        // Positions this call touches: 2-D states keep at least 4096 rows and grow in 4096-row steps.
+        let need_rows = plan
+            .attn_pos_inputs
+            .iter()
+            .filter_map(|&(i, m)| match &inputs[i] {
+                Tensor::U32(v) => v.first().map(|&x| x as usize + m),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let state_bufs = self.resolve_state_bufs(graph, plan, state, need_rows)?;
 
         let size = plan.arena_size;
         let mut arena = self.arena.lock();
@@ -2853,17 +2920,7 @@ impl Session {
                 }
             }
         };
-        let params_buf = self.ensure_params_buffer(plan.params_buffer_size)?;
-        let mlp_scratch_buf = if plan.mlp_scratch_size > 0 {
-            let need = plan.mlp_scratch_size.max(256);
-            let mut guard = self.mlp_scratch.lock();
-            if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
-                *guard = Some(new_shared_buffer(&self.rt.device, need)?);
-            }
-            Some(guard.as_ref().expect("allocated above").clone())
-        } else {
-            None
-        };
+        let mlp_scratch_buf = self.mlp_scratch_for(plan)?;
         metal::objc::rc::autoreleasepool(|| {
             let print_profile = std::env::var_os("GIBBS_PROFILE_KERNELS").is_some();
             // A requested sample is one real decode token; the printing profiler profiles every run.
@@ -2873,7 +2930,7 @@ impl Session {
                 && PROFILE_NEXT.swap(false, std::sync::atomic::Ordering::Relaxed);
             if print_profile || one_shot {
                 let mut timings = Vec::new();
-                for (s_idx, s) in steps.iter().enumerate() {
+                for s in steps {
                     // The printing profiler runs each step twice: pass 0 faults in memory-mapped
                     // weight pages and warms caches, pass 1 is timed. A requested sample runs each
                     // step once, so the token it profiles is still computed exactly once.
@@ -2882,14 +2939,7 @@ impl Session {
                     for _ in 0..if print_profile && !cold { 2 } else { 1 } {
                         let cb = self.rt.queue.new_command_buffer();
                         let enc = cb.new_compute_command_encoder();
-                        self.encode(
-                            &Counted::new(enc),
-                            s,
-                            s_idx,
-                            &params_buf,
-                            mlp_scratch_buf.as_ref(),
-                            &loc,
-                        )?;
+                        self.encode(&Counted::new(enc), s, mlp_scratch_buf.as_ref(), &loc)?;
                         enc.end_encoding();
                         commit_and_wait(cb)?;
                         gpu_s = gpu_seconds(cb);
@@ -2909,67 +2959,8 @@ impl Session {
                 }
                 *LAST_PROFILE.lock() = Some((Instant::now(), rows));
             } else {
-                // The command buffer is cut into chunks, each committed as soon as it is encoded: the GPU
-                // runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
-                // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
-                // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
-                // `GIBBS_CB_CHUNK=0` keeps a single buffer.
-                // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
-                // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
-                let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
-                    cb_chunking()
-                } else {
-                    (usize::MAX, usize::MAX)
-                };
-                let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
-                let mut err = None;
-                let mut dispatches = 0u32;
-                let encode_start = std::time::Instant::now();
-                let mut at = 0;
-                while at < steps.len() && err.is_none() {
-                    let end = if cbs.is_empty() {
-                        first
-                    } else {
-                        at.saturating_add(chunk)
-                    }
-                    .min(steps.len());
-                    let cb = self.rt.queue.new_command_buffer().to_owned();
-                    let enc = cb.new_compute_command_encoder();
-                    let counted = Counted::new(enc);
-                    for (s_idx, s) in steps.iter().enumerate().take(end).skip(at) {
-                        if let Err(e) = self.encode(
-                            &counted,
-                            s,
-                            s_idx,
-                            &params_buf,
-                            mlp_scratch_buf.as_ref(),
-                            &loc,
-                        ) {
-                            err = Some(e);
-                            break;
-                        }
-                    }
-                    enc.end_encoding();
-                    dispatches += counted.dispatches();
-                    if end < steps.len() && err.is_none() {
-                        cb.commit();
-                    }
-                    cbs.push(cb);
-                    at = end;
-                }
-                let encode_dur = encode_start.elapsed();
-                if let Some(e) = err {
-                    // Earlier chunks are already on the GPU: let them finish before reporting.
-                    if cbs.len() > 1 {
-                        cbs[cbs.len() - 2].wait_until_completed();
-                    }
-                    return Err(e);
-                }
-                if cbs.is_empty() {
-                    let cb = self.rt.queue.new_command_buffer().to_owned();
-                    cb.new_compute_command_encoder().end_encoding();
-                    cbs.push(cb);
-                }
+                let (cbs, dispatches, encode_dur) =
+                    self.encode_chunks(steps, &loc, mlp_scratch_buf.as_ref())?;
                 let last = cbs.last().expect("a plan has at least one step");
                 commit_and_wait(last)?;
                 for cb in &cbs[..cbs.len() - 1] {
@@ -3020,6 +3011,253 @@ impl Session {
             push_run_sample(s);
         }
         Ok(outs)
+    }
+
+    /// Whether `plan` (of `graph`) can run as a [`FedStream`]: inputs exactly the `[1]` u32 token id
+    /// and position, every embedding gather reading input 0, attention positions from input 1, and
+    /// one output.
+    pub(crate) fn fed_stream_ok(graph: &Graph, plan: &PreparedPlan) -> bool {
+        let one_u32 = |v: ValueId| {
+            let val = graph.value(v);
+            val.dtype == DType::U32 && val.shape.iter().product::<usize>() == 1
+        };
+        let view_of = |v: ValueId, input: usize| {
+            plan.input_views
+                .iter()
+                .any(|&(x, i, _)| x == v && i == input)
+        };
+        graph.inputs.len() == 2
+            && graph.inputs.iter().all(|&v| one_u32(v))
+            && graph.outputs.len() == 1
+            && plan.attn_pos_inputs.iter().all(|&(i, _)| i == 1)
+            && plan.steps.iter().all(|s| match &s.op {
+                Step::Embedding { ids, .. }
+                | Step::Ext(ext::ExtStep::Experts(ext::moe::Step::Embed { ids, .. })) => {
+                    view_of(*ids, 0)
+                }
+                _ => true,
+            })
+    }
+
+    /// A [`FedStream`] from input token `last` at position `pos`, its state buffers in `state`
+    /// sized for `budget` tokens.
+    pub(crate) fn new_fed_stream(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
+        state: &mut crate::graph::StateStore,
+        last: u32,
+        pos: u32,
+        budget: usize,
+    ) -> Result<FedStream, String> {
+        let ring = new_shared_buffer(&self.rt.device, 128)?;
+        // SAFETY: a fresh 128-byte shared buffer no command buffer uses yet.
+        unsafe { *(ring.contents() as *mut u32).add(16) = last };
+        let state_bufs =
+            self.resolve_state_bufs(graph, plan, Some(state), pos as usize + budget)?;
+        Ok(FedStream {
+            ring,
+            state_bufs,
+            inflight: std::collections::VecDeque::new(),
+            submitted: 0,
+            budget,
+            pos0: pos,
+            next_pos: pos,
+            last,
+            last_wait: None,
+        })
+    }
+
+    /// Encodes and commits the stream's next token: its id is the previous token's device pick
+    /// (the first token's from the ring), its position host-written into its ring slot; a blit
+    /// copies the picked id (output 0) into that slot. Nothing waits.
+    pub(crate) fn submit_fed(
+        &self,
+        graph: &Graph,
+        plan: &PreparedPlan,
+        s: &mut FedStream,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        let t = s.submitted;
+        let slot = t % 4;
+        let ids_at = if t == 0 { 64 } else { 16 * ((t - 1) % 4) + 4 };
+        let out = *graph
+            .outputs
+            .first()
+            .ok_or("a fed stream needs an output")?;
+        // SAFETY: slot `t % 4` last served token t - 4, which completed (at most two tokens are in
+        // flight when one is submitted).
+        unsafe { *(s.ring.contents() as *mut u32).add(4 * slot) = s.pos0 + t as u32 };
+        let (cbs, dispatches, encode_dur) = {
+            let mut arena = self.arena.lock();
+            if arena
+                .as_ref()
+                .is_none_or(|b| (b.length() as usize) < plan.arena_size)
+            {
+                *arena = Some(new_shared_buffer(&self.rt.device, plan.arena_size)?);
+            }
+            let arena = arena.as_ref().expect("allocated above");
+            let mlp_scratch_buf = self.mlp_scratch_for(plan)?;
+            let (ring, state_bufs) = (&s.ring, &s.state_bufs);
+            let loc = |v: ValueId| -> (&Buffer, usize) {
+                if let Some(&(_, i, off)) = plan.input_views.iter().find(|x| x.0 == v) {
+                    return (ring, if i == 0 { ids_at } else { 16 * slot } + off);
+                }
+                match &plan.value_locs[v.0 as usize] {
+                    PlanValueLoc::State(idx) => (&state_bufs[*idx], 0),
+                    PlanValueLoc::Arena(off) => (arena, *off),
+                    PlanValueLoc::Weight(buf, off) => (buf, *off),
+                    PlanValueLoc::Unbound => {
+                        let w = &self.weights[&graph.value(v).name];
+                        (&w.0, w.1)
+                    }
+                }
+            };
+            metal::objc::rc::autoreleasepool(|| {
+                use std::sync::atomic::Ordering::Relaxed;
+                self.fed_ids.store(true, Relaxed);
+                let r = self.encode_chunks(&plan.steps, &loc, mlp_scratch_buf.as_ref());
+                self.fed_ids.store(false, Relaxed);
+                let (cbs, dispatches, encode_dur) = r?;
+                let last = cbs.last().expect("encode_chunks returns a buffer");
+                let (ob, oo) = loc(out);
+                let blit = last.new_blit_command_encoder();
+                blit.copy_from_buffer(ob, oo as u64, ring, (16 * slot + 4) as u64, 4);
+                blit.end_encoding();
+                last.commit();
+                *self.fed_tail.lock() = Some(last.clone());
+                Ok::<_, String>((cbs, dispatches, encode_dur))
+            })?
+        };
+        s.inflight.push_back(InFlight {
+            cbs,
+            slot,
+            encode_ns: encode_dur.as_nanos() as u64,
+            dispatches,
+            started,
+        });
+        s.submitted += 1;
+        Ok(())
+    }
+
+    /// Waits for the stream's oldest in-flight token and returns its picked id.
+    pub(crate) fn wait_fed(&self, s: &mut FedStream) -> Result<u32, String> {
+        let f = s
+            .inflight
+            .pop_front()
+            .ok_or("no streamed token in flight")?;
+        let last = f.cbs.last().expect("a submitted token has a buffer");
+        last.wait_until_completed();
+        if let Some(cb) = f
+            .cbs
+            .iter()
+            .find(|cb| cb.status() != metal::MTLCommandBufferStatus::Completed)
+        {
+            return Err(format!(
+                "Metal command buffer ended with status {:?}",
+                cb.status()
+            ));
+        }
+        // SAFETY: the token's blit wrote this word and its command buffers completed.
+        let tok = unsafe { *(s.ring.contents() as *const u32).add(4 * f.slot + 1) };
+        let span = gpu_span_seconds(&f.cbs[0], last);
+        self.last_gpu_s
+            .store(span.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        let now = Instant::now();
+        push_run_sample(RunSample {
+            gpu_ns: (span * 1e9) as u64,
+            run_ns: (now - s.last_wait.unwrap_or(f.started)).as_nanos() as u64,
+            encode_ns: f.encode_ns,
+            dispatches: f.dispatches,
+        });
+        s.last_wait = Some(now);
+        Ok(tok)
+    }
+
+    /// Waits for every in-flight token of `s` (no samples, ids discarded).
+    pub(crate) fn drain_fed(&self, s: &mut FedStream) {
+        for f in s.inflight.drain(..) {
+            if let Some(cb) = f.cbs.last() {
+                cb.wait_until_completed();
+            }
+        }
+    }
+
+    /// The MLP megakernel scratch `plan` needs, grown to fit.
+    fn mlp_scratch_for(&self, plan: &PreparedPlan) -> Result<Option<Buffer>, String> {
+        if plan.mlp_scratch_size == 0 {
+            return Ok(None);
+        }
+        let need = plan.mlp_scratch_size.max(256);
+        let mut guard = self.mlp_scratch.lock();
+        if guard.as_ref().is_none_or(|b| (b.length() as usize) < need) {
+            *guard = Some(new_shared_buffer(&self.rt.device, need)?);
+        }
+        Ok(guard.clone())
+    }
+
+    /// Encodes `steps` into command buffers cut into chunks, committing every chunk but the last as
+    /// soon as it is encoded; returns the buffers (the last uncommitted), dispatches and encode time.
+    fn encode_chunks<'a>(
+        &self,
+        steps: &[Planned],
+        loc: &dyn Fn(ValueId) -> (&'a Buffer, usize),
+        mlp_scratch: Option<&Buffer>,
+    ) -> Result<(Vec<metal::CommandBuffer>, u32, std::time::Duration), String> {
+        // The GPU runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
+        // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
+        // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
+        // `GIBBS_CB_CHUNK=0` keeps a single buffer.
+        // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
+        // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
+        let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
+            cb_chunking()
+        } else {
+            (usize::MAX, usize::MAX)
+        };
+        let mut cbs: Vec<metal::CommandBuffer> = Vec::new();
+        let mut err = None;
+        let mut dispatches = 0u32;
+        let encode_start = std::time::Instant::now();
+        let mut at = 0;
+        while at < steps.len() && err.is_none() {
+            let end = if cbs.is_empty() {
+                first
+            } else {
+                at.saturating_add(chunk)
+            }
+            .min(steps.len());
+            let cb = self.rt.queue.new_command_buffer().to_owned();
+            let enc = cb.new_compute_command_encoder();
+            let counted = Counted::new(enc);
+            for s in &steps[at..end] {
+                if let Err(e) = self.encode(&counted, s, mlp_scratch, &loc) {
+                    err = Some(e);
+                    break;
+                }
+            }
+            enc.end_encoding();
+            dispatches += counted.dispatches();
+            if end < steps.len() && err.is_none() {
+                cb.commit();
+            }
+            cbs.push(cb);
+            at = end;
+        }
+        let encode_dur = encode_start.elapsed();
+        if let Some(e) = err {
+            // Earlier chunks are already on the GPU: let them finish before reporting.
+            if cbs.len() > 1 {
+                cbs[cbs.len() - 2].wait_until_completed();
+            }
+            return Err(e);
+        }
+        if cbs.is_empty() {
+            let cb = self.rt.queue.new_command_buffer().to_owned();
+            cb.new_compute_command_encoder().end_encoding();
+            cbs.push(cb);
+        }
+        Ok((cbs, dispatches, encode_dur))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3138,8 +3376,6 @@ impl Session {
         &self,
         enc: &Counted,
         s: &Planned,
-        step_idx: usize,
-        params_buf: &Buffer,
         mlp_scratch_buf: Option<&Buffer>,
         loc: &impl Fn(ValueId) -> (&'a Buffer, usize),
     ) -> Result<(), String> {
@@ -3156,12 +3392,7 @@ impl Session {
         };
         match s.op {
             Step::Ext(ref st) => {
-                let e = ext::Enc {
-                    enc,
-                    loc: &loc,
-                    params: params_buf,
-                    step: step_idx,
-                };
+                let e = ext::Enc { enc, loc: &loc };
                 ext::encode(self, &e, s, st)?;
             }
             Step::Linear {
@@ -3188,13 +3419,18 @@ impl Session {
                 )?;
             }
             Step::Embedding {
-                table, ids, n, d, ..
+                table,
+                ids,
+                n,
+                d,
+                rows,
+                ..
             } => {
                 enc.set_compute_pipeline_state(rt.pso("embedding_f32")?);
                 bind(0, table);
                 bind(1, ids);
                 bind(2, s.out);
-                set_bytes(enc, 3, &[u32_of(n)?, u32_of(d)?]);
+                set_bytes(enc, 3, &[u32_of(n)?, u32_of(d)?, u32_of(rows)?]);
                 grid1(n * d);
             }
             Step::LayerNorm {
@@ -3825,7 +4061,8 @@ impl Session {
                 // State buffers are physically capped (4096 rows); never write or read past them.
                 if let Some(ks) = k_state {
                     let (kb, ko) = loc(ks);
-                    let rows = (kb.length() as usize - ko) / (stride * if kv_f16 { 2 } else { 4 }).max(1);
+                    let rows =
+                        (kb.length() as usize - ko) / (stride * if kv_f16 { 2 } else { 4 }).max(1);
                     if start_pos as usize + m > rows {
                         return Err(format!(
                             "KV cache holds {rows} positions on this backend; need {}",
@@ -3932,7 +4169,8 @@ impl Session {
                 } else if kv_f16 {
                     rt.pso(FLASH[1][nj])?
                 } else {
-                    rt.pso(FLASH[0][nj]).or_else(|_| rt.pso("attn_cached_f32"))?
+                    rt.pso(FLASH[0][nj])
+                        .or_else(|_| rt.pso("attn_cached_f32"))?
                 });
                 bind(0, q);
                 bind(1, k_buf_id);
@@ -4602,7 +4840,8 @@ pub struct PreparedPlan {
     pub weight_bytes: u64,
     pub state_reads: Vec<StateRead>,
     pub flops_per_run: u64,
-    pub params_buffer_size: usize,
+    /// Every value viewing a graph input: (value, input index, byte offset into the input).
+    pub(crate) input_views: Vec<(ValueId, usize, usize)>,
     pub(crate) mlp_scratch_size: usize,
     pub(crate) embedding_checks: Vec<(usize, usize, String)>,
     pub(crate) attn_pos_inputs: Vec<(usize, usize)>,
@@ -4649,7 +4888,10 @@ fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
         let before = f16.len();
         for s in steps.iter() {
             if let Some((k, v)) = kv_pair(&s.op) {
-                let (kn, vn) = (name_of(k).unwrap_or_default(), name_of(v).unwrap_or_default());
+                let (kn, vn) = (
+                    name_of(k).unwrap_or_default(),
+                    name_of(v).unwrap_or_default(),
+                );
                 if !(f16.contains(&kn) && f16.contains(&vn)) {
                     f16.remove(&kn);
                     f16.remove(&vn);
@@ -4835,7 +5077,11 @@ fn pair_small_hand_gemvs(
                 && (*f0 == WeightFormat::Q4_K
                     || *f0 == WeightFormat::Q8_0
                     || (*f0 == WeightFormat::Q4_0 && *c0 >= 512 && (*c0 & 255) == 0)));
-        if !fmt_ok || b.reads.iter().any(|&r| r == a.out || root(r) == root(a.out)) {
+        if !fmt_ok
+            || b.reads
+                .iter()
+                .any(|&r| r == a.out || root(r) == root(a.out))
+        {
             return false;
         }
         let (Some(out0_r), Some(out1_r)) = (range_of(a.out), range_of(b.out)) else {
@@ -6264,7 +6510,11 @@ pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
                     let _ = write!(line, " fmt={format:?} variant=unassigned");
                 } else {
                     let d = format.default_variant();
-                    let _ = write!(line, " fmt={format:?} variant={:?}{}", d.kernel, d.rows_per_sg);
+                    let _ = write!(
+                        line,
+                        " fmt={format:?} variant={:?}{}",
+                        d.kernel, d.rows_per_sg
+                    );
                 }
             }
             &Step::CachedAttention {
@@ -6300,7 +6550,11 @@ pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
             match &node.op {
                 Op::Slice { axis, start, end } => {
                     let shape = src(0).unwrap_or_default();
-                    let ax = if *axis < 0 { *axis + shape.len() as isize } else { *axis } as usize;
+                    let ax = if *axis < 0 {
+                        *axis + shape.len() as isize
+                    } else {
+                        *axis
+                    } as usize;
                     let outer: usize = shape.iter().take(ax).product();
                     let _ = write!(
                         line,
@@ -6313,7 +6567,11 @@ pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
                     let _ = write!(line, " concat axis={axis} of {ins:?}");
                 }
                 Op::Transpose { perm } => {
-                    let _ = write!(line, " transpose {perm:?} of {:?}", src(0).unwrap_or_default());
+                    let _ = write!(
+                        line,
+                        " transpose {perm:?} of {:?}",
+                        src(0).unwrap_or_default()
+                    );
                 }
                 _ => {}
             }
@@ -7564,7 +7822,9 @@ mod tests {
             .chain(ext::kernel_names())
             .chain(MPP_KERNELS)
         {
-            let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let f = lib
+                .get_function(name, None)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             let pso = device
                 .new_compute_pipeline_state_with_function(&f)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -7576,7 +7836,9 @@ mod tests {
             let lib = device
                 .new_library_with_source(src, &opts)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            let f = lib.get_function(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let f = lib
+                .get_function(name, None)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             let pso = device
                 .new_compute_pipeline_state_with_function(&f)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -7657,10 +7919,16 @@ mod tests {
             codec::codec(QuantFormat::GGUF_Q4_0).unwrap(),
             codec::codec(QuantFormat::GGUF_Q4_K_M).unwrap(),
         );
-        build(&ext::ple::kernel_src(q4_0, q4_k), &ext::ple::kernel_name(q4_0, q4_k));
+        build(
+            &ext::ple::kernel_src(q4_0, q4_k),
+            &ext::ple::kernel_name(q4_0, q4_k),
+        );
         // TQ2_0's device source is the planar layout, the one codec outside `codec.msl`.
         let tq2 = codec::codec(QuantFormat::GGUF_TQ2_0).unwrap();
-        build(&ext::ple::kernel_src(tq2, q4_k), &ext::ple::kernel_name(tq2, q4_k));
+        build(
+            &ext::ple::kernel_src(tq2, q4_k),
+            &ext::ple::kernel_name(tq2, q4_k),
+        );
         for f in [QuantFormat::BF16, QuantFormat::FP16] {
             let c = ext::ple::codec_of(f).expect("pseudo-codec");
             build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
@@ -7884,7 +8152,11 @@ mod tests {
                 g.output(out);
                 let unfused = g.clone();
                 assert_eq!(
-                    crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp),
+                    crate::graph::egraph::fuse_rule(
+                        &mut g,
+                        None,
+                        crate::graph::egraph::Rule::MegakernelMlp
+                    ),
                     1
                 );
                 let xs: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin()).collect();
@@ -9829,7 +10101,10 @@ mod tests {
                         let got = session.run_with_state(g, Some(ms), inputs).unwrap();
                         let (want, got) = (want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
                         let cos = min_head_cosine(want, got, hd);
-                        assert!(cos >= 0.9999, "f16 KV {kv_f16} at {at} {window:?}: min cosine {cos}");
+                        assert!(
+                            cos >= 0.9999,
+                            "f16 KV {kv_f16} at {at} {window:?}: min cosine {cos}"
+                        );
                         rel_err(want, got)
                     };
                     let e = step(
@@ -9843,7 +10118,10 @@ mod tests {
                     assert!(e < tol, "f16 KV {kv_f16} prefill {window:?}: {e}");
                     let (kbuf, n) = &metal_state.metal_buffers["k_state"];
                     assert_eq!(metal_state.metal_f16.contains("k_state"), kv_f16);
-                    assert_eq!(kbuf.length() as usize, (n * if kv_f16 { 2 } else { 4 }).max(ARENA_ALIGN));
+                    assert_eq!(
+                        kbuf.length() as usize,
+                        (n * if kv_f16 { 2 } else { 4 }).max(ARENA_ALIGN)
+                    );
                     let decode = make(1);
                     // 700..: more than 128 keys visible, so the sliding windows of 300 and 90 straddle the cut-off.
                     for (i, at) in [prefill, prefill + 1, prefill + 40].into_iter().enumerate() {
@@ -10249,7 +10527,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 Tensor::U32((0..m as u32).collect()),
             ];
             session.run_with_state(&g, Some(&mut st), inputs).unwrap();
-            let (ks, vs) = (st.read_metal("k_state").unwrap(), st.read_metal("v_state").unwrap());
+            let (ks, vs) = (
+                st.read_metal("k_state").unwrap(),
+                st.read_metal("v_state").unwrap(),
+            );
             for row in 0..m {
                 let (kr, vr) = (&ks[row * 4..row * 4 + 4], &vs[row * 4..row * 4 + 4]);
                 assert_eq!(kr[..3], [65504.0, -65504.0, 65504.0], "m {m} row {row}");
@@ -10284,14 +10565,26 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let pos = g.input("pos", vec![1], DType::U32);
             let ks = g.state("k_state", vec![max_seq, heads * hd], f);
             let vs = g.state("v_state", vec![max_seq, heads * hd], f);
-            let a = g.add("a", attn(true), &[q, k, v, ks, vs, pos], vec![1, heads * hd], f);
+            let a = g.add(
+                "a",
+                attn(true),
+                &[q, k, v, ks, vs, pos],
+                vec![1, heads * hd],
+                f,
+            );
             g.output(a);
             if shared {
                 let (ks2, vs2) = (
                     g.state("k_state", vec![max_seq, heads * hd], f),
                     g.state("v_state", vec![max_seq, heads * hd], f),
                 );
-                let b = g.add("b", attn(false), &[a, k, v, ks2, vs2, pos], vec![1, heads * hd], f);
+                let b = g.add(
+                    "b",
+                    attn(false),
+                    &[a, k, v, ks2, vs2, pos],
+                    vec![1, heads * hd],
+                    f,
+                );
                 g.output(b);
             }
             if plain_reader {
@@ -10662,7 +10955,13 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 let vw = quant(&mut g, &mut w, "v_w", rows1, cols);
                 let kb = g.weight("k_b", vec![rows0], DType::F32);
                 w.insert("k_b", Tensor::F32(rand(rows0, 11)));
-                let k_out = g.add("k_proj", Op::Linear, &[x, kw, kb], vec![1, rows0], DType::F32);
+                let k_out = g.add(
+                    "k_proj",
+                    Op::Linear,
+                    &[x, kw, kb],
+                    vec![1, rows0],
+                    DType::F32,
+                );
                 let v_out = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
                 g.output(k_out);
                 g.output(v_out);
@@ -10705,9 +11004,21 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             w.insert("v_w", Tensor::BF16(to_bf16(rand(rows1 * cols, 73))));
             w.insert("k_b", Tensor::F32(rand(rows0, 11)));
             w.insert("v_b", Tensor::F32(rand(rows1, 13)));
-            let k_out = g.add("k_proj", Op::Linear, &[x, kw, kb], vec![1, rows0], DType::F32);
+            let k_out = g.add(
+                "k_proj",
+                Op::Linear,
+                &[x, kw, kb],
+                vec![1, rows0],
+                DType::F32,
+            );
             let v_raw = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
-            let v_out = g.add("v_biased", Op::Add, &[v_raw, vb], vec![1, rows1], DType::F32);
+            let v_out = g.add(
+                "v_biased",
+                Op::Add,
+                &[v_raw, vb],
+                vec![1, rows1],
+                DType::F32,
+            );
             g.output(k_out);
             g.output(v_out);
 
@@ -10803,9 +11114,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         for step_pos in 0..3u32 {
             let inp = vec![Tensor::U32(vec![step_pos + 1]), Tensor::U32(vec![step_pos])];
             let want = cpu::run(&g, &w, &mut c_state, inp.clone()).unwrap();
-            let got = s
-                .run_prepared(&g, &plan, Some(&mut m_state), inp)
-                .unwrap();
+            let got = s.run_prepared(&g, &plan, Some(&mut m_state), inp).unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
             assert!(err < 1e-4, "step {step_pos}: rel_err {err}");
         }
@@ -10840,7 +11149,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             d.contains("slice axis=1 [0..4] of [2, 8] contiguous=false"),
             "{d}"
         );
-        assert!(d.contains("plan-dump: 2 steps, 2 dispatches at ctx 1"), "{d}");
+        assert!(
+            d.contains("plan-dump: 2 steps, 2 dispatches at ctx 1"),
+            "{d}"
+        );
     }
 
     #[test]
@@ -10868,11 +11180,23 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let qr = g.add("qr", rope.clone(), &[qn, pos, inv], vec![1, q_dim], f);
 
         let k = g.add("k", Op::Linear, &[x, wk], vec![1, kv_dim], f);
-        let kn = g.add("kn", Op::RmsNorm { eps: 1e-5 }, &[k, gw], vec![1, kv_dim], f);
+        let kn = g.add(
+            "kn",
+            Op::RmsNorm { eps: 1e-5 },
+            &[k, gw],
+            vec![1, kv_dim],
+            f,
+        );
         let kr = g.add("kr", rope, &[kn, pos, inv], vec![1, kv_dim], f);
 
         let v = g.add("v", Op::Linear, &[x, wv], vec![1, kv_dim], f);
-        let vn = g.add("vn", Op::RmsNorm { eps: 1e-6 }, &[v, gw], vec![1, kv_dim], f);
+        let vn = g.add(
+            "vn",
+            Op::RmsNorm { eps: 1e-6 },
+            &[v, gw],
+            vec![1, kv_dim],
+            f,
+        );
 
         let ks = g.state("ks", vec![16, kv_dim], f);
         let vs = g.state("vs", vec![16, kv_dim], f);
@@ -10931,7 +11255,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
 
         let (mut cs, mut ms) = (StateStore::new(), StateStore::new());
         for step in 0..3u32 {
-            let inp = vec![Tensor::F32(rand(h, 10 + step as u64)), Tensor::U32(vec![step])];
+            let inp = vec![
+                Tensor::F32(rand(h, 10 + step as u64)),
+                Tensor::U32(vec![step]),
+            ];
             let want = cpu::run(&g, &w, &mut cs, inp.clone()).unwrap();
             let got = sess.run_prepared(&g, &plan, Some(&mut ms), inp).unwrap();
             let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
@@ -10991,7 +11318,11 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let out = g.add("res", Op::Add, &[x, down], vec![1, h], f);
         g.output(out);
         assert_eq!(
-            crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp),
+            crate::graph::egraph::fuse_rule(
+                &mut g,
+                None,
+                crate::graph::egraph::Rule::MegakernelMlp
+            ),
             1
         );
         let mut w = Weights::new();

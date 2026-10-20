@@ -445,6 +445,118 @@ impl GraphProgram {
         let _ = valid;
         self.run(inputs)
     }
+
+    /// The next token of a greedy decode stream: `last` is the input token at position `pos` (the
+    /// previous call's result after the first), at most `max_new` tokens are queued, and the pick
+    /// is the first largest of the first `valid` logits. Each call keeps the next token's command
+    /// buffers queued on the device (the picked id feeds the next token there), so the host never
+    /// idles the GPU between tokens. `None` when the program cannot stream (then use
+    /// [`Self::run_greedy`]); a pending one-shot kernel profile ends the stream with `None`.
+    /// A stream leaves one speculative token written past the last returned position.
+    #[cfg(target_os = "macos")]
+    pub fn stream_next(
+        &mut self,
+        last: u32,
+        pos: u32,
+        max_new: usize,
+        valid: usize,
+    ) -> Result<Option<u32>, String> {
+        use crate::graph::metal::Session;
+        if crate::graph::metal::profile_requested() {
+            self.stream_end()?;
+            return Ok(None);
+        }
+        let [CompiledSegment::Metal { graph, session, .. }] = self.segments.as_slice() else {
+            return Ok(None);
+        };
+        if let Some(s) = self.state.stream.0.as_deref() {
+            if pos != s.next_pos || last != s.last {
+                return Err("device stream out of sync".into());
+            }
+            if s.submitted == s.budget && s.in_flight() == 0 {
+                self.state.stream.0 = None;
+            }
+        }
+        if self.state.stream.0.is_none() {
+            if graph.outputs.len() != 1
+                || std::env::var_os("GIBBS_PROFILE_KERNELS").is_some()
+                || crate::graph::disabled("pipeline")
+            {
+                return Ok(None);
+            }
+            if self.argmax.as_ref().map(|a| a.0) != Some(valid) {
+                self.argmax = match argmax_head(graph, valid) {
+                    Some(g) => {
+                        let plan = session.prepare_plan(&g)?;
+                        Some((valid, g, plan))
+                    }
+                    None => None,
+                };
+            }
+            let Some((_, g, plan)) = &self.argmax else {
+                return Ok(None);
+            };
+            if !Session::fed_stream_ok(g, plan) {
+                return Ok(None);
+            }
+            // The positions this stream may write without regrowing state buffers: up to the next
+            // 4096-row boundary (the lazy KV growth step), within the declared rows.
+            let declared = plan
+                .state_vars
+                .iter()
+                .filter_map(|&(v, _)| {
+                    let sh = &g.value(v).shape;
+                    (sh.len() == 2).then_some(sh[0])
+                })
+                .max();
+            let next = (pos as usize + 1).next_multiple_of(4096);
+            let cap = declared.map_or(next, |d| d.min(next));
+            let budget = max_new.min(cap.saturating_sub(pos as usize));
+            if budget == 0 {
+                return Ok(None);
+            }
+            let s = session.new_fed_stream(g, plan, &mut self.state, last, pos, budget)?;
+            self.state.stream.0 = Some(Box::new(s));
+        }
+        let (Some((_, g, plan)), Some(s)) = (&self.argmax, self.state.stream.0.as_deref_mut())
+        else {
+            unreachable!("a stream exists only with its argmax plan");
+        };
+        while s.in_flight() < 2 && s.submitted < s.budget {
+            session.submit_fed(g, plan, s)?;
+        }
+        let tok = session.wait_fed(s)?;
+        s.next_pos += 1;
+        s.last = tok;
+        Ok(Some(tok))
+    }
+
+    /// Ends this state's greedy decode stream: waits for its in-flight tokens and drops it.
+    #[cfg(target_os = "macos")]
+    pub fn stream_end(&mut self) -> Result<(), String> {
+        if let Some(mut s) = self.state.stream.0.take() {
+            if let [CompiledSegment::Metal { session, .. }] = self.segments.as_slice() {
+                session.drain_fed(&mut s);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn stream_next(
+        &mut self,
+        _last: u32,
+        _pos: u32,
+        _max_new: usize,
+        _valid: usize,
+    ) -> Result<Option<u32>, String> {
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn stream_end(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Places `graph` (at most one segment) and, on Metal, adapts its dtypes to the Metal kernels.
@@ -800,5 +912,87 @@ mod tests {
         let x = g.input("x", vec![2, 4], DType::F32);
         g.output(x);
         assert!(argmax_head(&g, 0).is_none());
+    }
+
+    /// GPU: a device decode stream returns exactly the per-token greedy tokens, also with two
+    /// streams interleaved on one program and across a budget restart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stream_decode_matches_per_token_greedy() {
+        if !available_devices().contains(&Device::Metal) {
+            return;
+        }
+        let lm = crate::model::classifier::decoder_gpu::tiny_graph_lm(
+            0,
+            crate::hardware::QuantFormat::FP32,
+        );
+        let vocab = lm.config.vocab_size;
+        let (g, w) = lm.to_decode_graph();
+        let mut prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).unwrap();
+        assert!(prog.is_single_metal());
+        let reference = |prog: &mut GraphProgram, first: u32, n: usize| {
+            prog.state = StateStore::new();
+            let (mut tok, mut out) = (first, Vec::new());
+            for pos in 0..n as u32 {
+                let r = prog
+                    .run(vec![Tensor::U32(vec![tok]), Tensor::U32(vec![pos])])
+                    .unwrap();
+                let logits = &r[0].as_f32().unwrap()[..vocab];
+                // First largest, as the device argmax picks it.
+                tok = (0..vocab).fold(0, |b, i| if logits[i] > logits[b] { i } else { b }) as u32;
+                out.push(tok);
+            }
+            out
+        };
+        let (want1, want2) = (reference(&mut prog, 1, 20), reference(&mut prog, 2, 20));
+        assert_ne!(
+            want1, want2,
+            "the fixture should not decode both prompts alike"
+        );
+        let stream = |prog: &mut GraphProgram, last: u32, pos: usize, max_new: usize| {
+            prog.stream_next(last, pos as u32, max_new, vocab)
+                .unwrap()
+                .expect("the decode program streams")
+        };
+        // (a) One stream.
+        prog.state = StateStore::new();
+        let mut got = Vec::new();
+        for pos in 0..20 {
+            let last = if pos == 0 { 1 } else { got[pos - 1] };
+            got.push(stream(&mut prog, last, pos, 20 - pos));
+        }
+        prog.stream_end().unwrap();
+        assert_eq!(got, want1);
+        // (b) Two streams interleaved call by call on one program.
+        let (mut sa, mut sb) = (StateStore::new(), StateStore::new());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for pos in 0..20 {
+            for (st, out, first) in [(&mut sa, &mut a, 1), (&mut sb, &mut b, 2)] {
+                std::mem::swap(&mut prog.state, st);
+                let last = if pos == 0 { first } else { out[pos - 1] };
+                out.push(stream(&mut prog, last, pos, 20 - pos));
+                std::mem::swap(&mut prog.state, st);
+            }
+        }
+        for st in [&mut sa, &mut sb] {
+            std::mem::swap(&mut prog.state, st);
+            prog.stream_end().unwrap();
+            std::mem::swap(&mut prog.state, st);
+        }
+        assert_eq!((a, b), (want1.clone(), want2));
+        // (c) A budget of five, then a restart with three more.
+        prog.state = StateStore::new();
+        let mut got = Vec::new();
+        for pos in 0..8 {
+            let last = if pos == 0 { 1 } else { got[pos - 1] };
+            got.push(stream(
+                &mut prog,
+                last,
+                pos,
+                if pos < 5 { 5 - pos } else { 8 - pos },
+            ));
+        }
+        prog.stream_end().unwrap();
+        assert_eq!(got, want1[..8]);
     }
 }

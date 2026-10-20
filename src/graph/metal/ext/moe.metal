@@ -187,8 +187,8 @@ kernel void moe_gather_cols_f32(device const float* x [[buffer(0)]],
     out[i] = c < p.cols ? x[(p.shared != 0 ? 0 : (ulong)(i / p.k) * p.cols) + c] : NAN;
 }
 
-// out[t, :] = table[ids[t], :]; grid (ceil(d / TG), n). ids are range-checked on the host.
-struct MoeEmbedParams { uint n; uint d; };
+// out[t, :] = table[ids[t], :]; grid (ceil(d / TG), n). Host ids are range-checked, device-fed ids clamp.
+struct MoeEmbedParams { uint n; uint d; uint rows; };
 
 kernel void moe_embed_f16(device const half* table [[buffer(0)]],
                           device const uint* ids [[buffer(1)]],
@@ -196,7 +196,7 @@ kernel void moe_embed_f16(device const half* table [[buffer(0)]],
                           constant MoeEmbedParams& p [[buffer(3)]],
                           uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.d || gid.y >= p.n) return;
-    out[(ulong)gid.y * p.d + gid.x] = float(table[(ulong)ids[gid.y] * p.d + gid.x]);
+    out[(ulong)gid.y * p.d + gid.x] = float(table[(ulong)min(ids[gid.y], p.rows - 1) * p.d + gid.x]);
 }
 
 kernel void moe_embed_bf16(device const ushort* table [[buffer(0)]],
@@ -205,5 +205,5 @@ kernel void moe_embed_bf16(device const ushort* table [[buffer(0)]],
                            constant MoeEmbedParams& p [[buffer(3)]],
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.d || gid.y >= p.n) return;
-    out[(ulong)gid.y * p.d + gid.x] = as_type<float>(uint(table[(ulong)ids[gid.y] * p.d + gid.x]) << 16);
+    out[(ulong)gid.y * p.d + gid.x] = as_type<float>(uint(table[(ulong)min(ids[gid.y], p.rows - 1) * p.d + gid.x]) << 16);
 }

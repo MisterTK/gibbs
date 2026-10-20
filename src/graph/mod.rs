@@ -11,9 +11,9 @@ pub mod avenues;
 pub mod codec;
 pub mod codegen;
 pub mod coreml;
-pub mod egraph;
 pub mod cpu;
 pub mod cuda;
+pub mod egraph;
 pub mod level_zero;
 #[cfg(target_os = "macos")]
 pub mod metal;
@@ -29,7 +29,8 @@ use std::collections::HashMap;
 
 /// Whether `item` is in `GIBBS_DISABLE` (comma list, read once): per-item kill switch next to
 /// `metal::fusion_policy` (here because the e-graph and loaders build without Metal). Items:
-/// `deltanet` and loader items (README). Tests set [`TEST_DISABLE`] per thread.
+/// `deltanet`, `pipeline` (greedy decode streams, `program::GraphProgram::stream_next`) and loader
+/// items (README). Tests set [`TEST_DISABLE`] per thread.
 pub(crate) fn disabled(item: &str) -> bool {
     #[cfg(test)]
     let list = TEST_DISABLE.with(|d| d.get());
@@ -644,6 +645,9 @@ pub struct StateStore {
     /// element count in `metal_buffers` counts elements of either type.
     #[cfg(target_os = "macos")]
     pub metal_f16: std::collections::HashSet<String>,
+    /// The greedy decode stream in flight on this state, if any (a clone starts without one).
+    #[cfg(target_os = "macos")]
+    pub stream: crate::graph::metal::StreamSlot,
 }
 
 impl StateStore {
@@ -736,7 +740,8 @@ impl StateStore {
                     // SAFETY: as in `read_metal`; `v` has v.len() <= n elements.
                     unsafe {
                         if self.metal_f16.contains(&name) {
-                            let dst = std::slice::from_raw_parts_mut(buf.contents() as *mut u16, v.len());
+                            let dst =
+                                std::slice::from_raw_parts_mut(buf.contents() as *mut u16, v.len());
                             for (d, &x) in dst.iter_mut().zip(v) {
                                 *d = crate::model::f32_to_f16(x.clamp(-65504.0, 65504.0));
                             }

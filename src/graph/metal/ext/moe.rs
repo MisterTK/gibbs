@@ -357,7 +357,7 @@ fn quant_embed_src(c: &Codec) -> String {
     let br = block_ref(
         c,
         "table",
-        &format!("(ulong)ids[gid.y] * (d / {be}u) + blk"),
+        &format!("(ulong)min(ids[gid.y], p.z - 1) * (d / {be}u) + blk"),
     );
     let (decl, sub) = (&br.decl, &br.sub);
     format!(
@@ -367,7 +367,7 @@ using namespace metal;
 kernel void embed_quant(device const uchar* table [[buffer(0)]],
                         device const uint* ids [[buffer(1)]],
                         device float* out [[buffer(2)]],
-                        constant uint2& p [[buffer(3)]],
+                        constant uint4& p [[buffer(3)]],
                         uint2 gid [[thread_position_in_grid]]) {{
     uint n = p.x, d = p.y;
     if (gid.x * 8 >= d || gid.y >= n) return;
@@ -448,8 +448,9 @@ fn moe_rows_per_sg(_c: &Codec) -> usize {
     2
 }
 /// Per (device, codec, rows_per_sg, grid binding) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize, Iq2Grid), ComputePipelineState>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static MOE_GEMV: LazyLock<
+    Mutex<HashMap<(u64, QuantFormat, usize, Iq2Grid), ComputePipelineState>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
     #[cfg(test)]
@@ -627,21 +628,28 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             rows,
             src,
         } => {
-            let (ib, io) = (e.loc)(*ids);
-            // SAFETY: `plan` requires `ids` to be a graph input, which the host copies into this shared
-            // buffer (n u32) before any step is encoded.
-            let idv = unsafe {
-                std::slice::from_raw_parts((ib.contents() as *const u8).add(io) as *const u32, *n)
-            };
-            if let Some((r, &id)) = idv
-                .iter()
-                .enumerate()
-                .find(|&(_, &id)| id as usize >= *rows)
-            {
-                return Err(format!(
-                    "node '{}': row {r} id {id} out of range for table of {rows} rows",
-                    s.name
-                ));
+            // Ids the host wrote into the arena are range-checked here; ids a queued token
+            // computes on the device (`Session::submit_fed`) are clamped in the kernels.
+            if !sess.fed_ids.load(std::sync::atomic::Ordering::Relaxed) {
+                let (ib, io) = (e.loc)(*ids);
+                // SAFETY: `plan` requires `ids` to be a graph input, which the host copies into this
+                // shared buffer (n u32) before any step is encoded.
+                let idv = unsafe {
+                    std::slice::from_raw_parts(
+                        (ib.contents() as *const u8).add(io) as *const u32,
+                        *n,
+                    )
+                };
+                if let Some((r, &id)) = idv
+                    .iter()
+                    .enumerate()
+                    .find(|&(_, &id)| id as usize >= *rows)
+                {
+                    return Err(format!(
+                        "node '{}': row {r} id {id} out of range for table of {rows} rows",
+                        s.name
+                    ));
+                }
             }
             let (pso, cols_per_thread) = match src {
                 Table::F16 => (rt.pso("moe_embed_f16")?.clone(), 1),
@@ -652,7 +660,7 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             e.bind(0, *table);
             e.bind(1, *ids);
             e.bind(2, s.out);
-            set_bytes(enc, 3, &[u32_of(*n)?, u32_of(*d)?]);
+            set_bytes(enc, 3, &[u32_of(*n)?, u32_of(*d)?, u32_of(*rows)?, 0]);
             enc.dispatch_thread_groups(
                 MTLSize::new(((*d / cols_per_thread) as u64).div_ceil(TG), *n as u64, 1),
                 MTLSize::new(TG, 1, 1),

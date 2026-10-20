@@ -270,6 +270,51 @@ impl ExecutableModel {
         Ok(self.sample(&logits, recent(all_tokens), temp, top_p))
     }
 
+    /// The next greedy token of a device decode stream ([`GraphProgram::stream_next`]): `last` is
+    /// the newest token, `pos` counts it (as in [`Self::step_token_with_kv`]), and at most
+    /// `max_new` more tokens are queued. `None` when this model or sequence cannot stream (use
+    /// `step_token_with_kv`). A stream keeps one speculative token in flight: end it with
+    /// [`Self::stream_end`] before the sequence state is reused.
+    ///
+    /// [`GraphProgram::stream_next`]: crate::graph::program::GraphProgram::stream_next
+    pub fn stream_greedy_token(
+        &self,
+        last: u32,
+        pos: usize,
+        max_new: usize,
+        kv: &mut Option<SeqKvCache>,
+    ) -> Result<Option<u32>, String> {
+        match (self, kv) {
+            (Self::Program(prog, m), Some(SeqKvCache::Program(state))) => {
+                let mut p = prog.write();
+                let vocab = m.read().tokenizer.vocab_size();
+                std::mem::swap(&mut p.state, state);
+                let out = p.stream_next(last, (pos - 1) as u32, max_new, vocab);
+                std::mem::swap(&mut p.state, state);
+                out
+            }
+            (Self::Native(m), Some(SeqKvCache::Native(state))) => {
+                m.stream_greedy_token(last, pos - 1, max_new, state)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Ends the sequence's device decode stream, if any (waits for its in-flight tokens).
+    pub fn stream_end(&self, kv: &mut Option<SeqKvCache>) -> Result<(), String> {
+        match (self, kv) {
+            (Self::Program(prog, _), Some(SeqKvCache::Program(state))) => {
+                let mut p = prog.write();
+                std::mem::swap(&mut p.state, state);
+                let out = p.stream_end();
+                std::mem::swap(&mut p.state, state);
+                out
+            }
+            (Self::Native(m), Some(SeqKvCache::Native(state))) => m.stream_end(state),
+            _ => Ok(()),
+        }
+    }
+
     /// Evaluates a single decode token returning logits directly without allocations.
     pub fn decode_step_logits(
         &self,
@@ -811,20 +856,34 @@ fn spec_generate(
             }
             None => {
                 let last = all[all.len() - 1];
-                vec![exec.step_token_with_kv(
-                    &all,
-                    last,
-                    all.len(),
-                    temperature,
-                    DEFAULT_TOP_P,
-                    &mut kv,
-                )?]
+                let streamed = if temperature <= 1e-4 {
+                    exec.stream_greedy_token(
+                        last,
+                        all.len(),
+                        (max_new_tokens - out.len()).min(ctx - all.len()),
+                        &mut kv,
+                    )?
+                } else {
+                    None
+                };
+                match streamed {
+                    Some(t) => vec![t],
+                    None => vec![exec.step_token_with_kv(
+                        &all,
+                        last,
+                        all.len(),
+                        temperature,
+                        DEFAULT_TOP_P,
+                        &mut kv,
+                    )?],
+                }
             }
         };
         decode += t0.elapsed();
         // The first token came from prefill: only decode-step tokens belong to `decode`.
         decoded += pending.len();
     }
+    exec.stream_end(&mut kv)?;
     Ok((tok.decode(&out), decoded, decode))
 }
 
@@ -1748,15 +1807,33 @@ impl ContinuousBatchScheduler {
                                 Err(e) => Err(e),
                             }
                         } else {
-                            m.step_token_with_kv(
-                                &all,
-                                last,
-                                all.len(),
-                                temp,
-                                top_p,
-                                &mut seq.kv_cache,
-                            )
-                            .map(|t| vec![t])
+                            let streamed = if temp <= 1e-4 {
+                                m.stream_greedy_token(
+                                    last,
+                                    all.len(),
+                                    seq.params
+                                        .max_new_tokens
+                                        .saturating_sub(seq.output_tokens.len())
+                                        .min(context_len.saturating_sub(all.len())),
+                                    &mut seq.kv_cache,
+                                )
+                            } else {
+                                Ok(None)
+                            };
+                            match streamed {
+                                Ok(Some(t)) => Ok(vec![t]),
+                                Ok(None) => m
+                                    .step_token_with_kv(
+                                        &all,
+                                        last,
+                                        all.len(),
+                                        temp,
+                                        top_p,
+                                        &mut seq.kv_cache,
+                                    )
+                                    .map(|t| vec![t]),
+                                Err(e) => Err(e),
+                            }
                         }
                     }
                 };
@@ -2325,7 +2402,10 @@ mod tests {
                 &mut kv,
             )
             .expect("Metal step_token_with_kv succeeds");
-        tied(next_tok, "Metal Program greedy token must match GraphLm forward");
+        tied(
+            next_tok,
+            "Metal Program greedy token must match GraphLm forward",
+        );
 
         // 2c. Sequential decode step on Metal
         let mut full_prompt = prompt.clone();
