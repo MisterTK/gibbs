@@ -51,6 +51,67 @@ impl LinearCfg {
     }
 }
 
+/// `x` rows of value heads (`block` values each) in transformers' grouped order (`[k_heads, v_per_k]`),
+/// rewritten in GGUF tiled order (`[v_per_k, k_heads]`): the inverse of `untile_heads`.
+fn tile_value_heads(x: &[f32], k_heads: usize, v_heads: usize, block: usize) -> Vec<f32> {
+    let per_k = v_heads / k_heads;
+    let mut out = vec![0.0; x.len()];
+    for (o, row) in out
+        .chunks_exact_mut(v_heads * block)
+        .zip(x.chunks_exact(v_heads * block))
+    {
+        for k in 0..k_heads {
+            for r in 0..per_k {
+                o[(r * k_heads + k) * block..][..block]
+                    .copy_from_slice(&row[(k * per_k + r) * block..][..block]);
+            }
+        }
+    }
+    out
+}
+
+/// [`tile_value_heads`] as graph nodes on `x` `[n, v_heads * dv]`.
+fn add_tile_value_heads(
+    g: &mut crate::graph::Graph,
+    name: &str,
+    x: crate::graph::ValueId,
+    n: usize,
+    kh: usize,
+    vh: usize,
+    dv: usize,
+) -> crate::graph::ValueId {
+    use crate::graph::{DType, Op};
+    let shape = vec![n, kh, vh / kh, dv];
+    let r1 = g.add(
+        format!("{name}.tile_r1"),
+        Op::Reshape {
+            shape: Some(shape.clone()),
+        },
+        &[x],
+        shape,
+        DType::F32,
+    );
+    let t = g.add(
+        format!("{name}.tile_t"),
+        Op::Transpose {
+            perm: vec![0, 2, 1, 3],
+        },
+        &[r1],
+        vec![n, vh / kh, kh, dv],
+        DType::F32,
+    );
+    let flat = vec![n, vh * dv];
+    g.add(
+        format!("{name}.tile_r2"),
+        Op::Reshape {
+            shape: Some(flat.clone()),
+        },
+        &[t],
+        flat,
+        DType::F32,
+    )
+}
+
 /// Gated DeltaNet token mixer.
 pub(crate) struct DeltaNet {
     /// `in_proj_qkv | in_proj_z | in_proj_b | in_proj_a`.
@@ -63,6 +124,8 @@ pub(crate) struct DeltaNet {
     /// Gated RMSNorm weight `[v_dim]` (plain `w`, no offset).
     norm: Vec<f32>,
     out: Linear,
+    /// `out` columns are value heads in GGUF tiled order (`[v_per_k, k_heads]`): its input is tiled first.
+    out_tiled: bool,
 }
 
 /// Full (softmax) attention token mixer.
@@ -348,6 +411,7 @@ impl TextModel {
                 let a = format!("{l}.linear_attn");
                 let names = ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]
                     .map(|n| format!("{a}.{n}"));
+                let tiled = ck.has(&format!("{a}.out_proj_tiled.weight"));
                 Mixer::Delta(DeltaNet {
                     proj: linear(ck, &names.each_ref().map(String::as_str), false)?,
                     conv: ck.vec(&format!("{a}.conv1d.weight"))?,
@@ -362,7 +426,15 @@ impl TextModel {
                     },
                     dt_bias: ck.vec(&format!("{a}.dt_bias"))?,
                     norm: ck.vec(&format!("{a}.norm.weight"))?,
-                    out: linear(ck, &[&format!("{a}.out_proj")], false)?,
+                    out: linear(
+                        ck,
+                        &[&format!(
+                            "{a}.{}",
+                            if tiled { "out_proj_tiled" } else { "out_proj" }
+                        )],
+                        false,
+                    )?,
+                    out_tiled: tiled,
                 })
             };
             let hc = match hc_count {
@@ -1179,6 +1251,11 @@ impl TextModel {
             // k_dim * v_dim = `ss` each); `par_for` re-raises a task's panic before this point.
             unsafe { ckpt.set_len(ckpt.len() + n * ss) };
         }
+        if dn.out_tiled {
+            return dn
+                .out
+                .forward(&tile_value_heads(&core, c.k_heads, c.v_heads, c.v_dim), n);
+        }
         dn.out.forward(&core, n)
     }
 
@@ -1593,11 +1670,24 @@ impl TextModel {
                         DType::F32,
                     );
 
+                    let out_in = if dn.out_tiled {
+                        add_tile_value_heads(
+                            &mut g,
+                            &format!("{p}.mixer.out"),
+                            gated,
+                            n,
+                            kh,
+                            vh,
+                            dv,
+                        )
+                    } else {
+                        gated
+                    };
                     add_linear_part(
                         &mut g,
                         &mut w,
                         &format!("{p}.mixer.out"),
-                        gated,
+                        out_in,
                         &dn.out.parts[0],
                         dn.out.bias.as_deref(),
                         n,
@@ -2207,6 +2297,30 @@ pub fn tiny_decode_graph() -> Result<(crate::graph::Graph, crate::graph::Weights
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tile_value_heads` inverts `untile_heads`, and its graph form matches it.
+    #[test]
+    fn tile_value_heads_inverts_untile_and_matches_graph() {
+        use crate::graph::{DType, Graph, Tensor};
+        let x: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let tiled = tile_value_heads(&x, 2, 6, 2);
+        assert_ne!(tiled, x);
+        let mut t = tiled.clone();
+        crate::model::qwen3_5::untile_heads(&mut t, 2, 2);
+        assert_eq!(t, x);
+        let mut g = Graph::new();
+        let i = g.input("x", vec![1, 12], DType::F32);
+        let o = add_tile_value_heads(&mut g, "t", i, 1, 2, 6, 2);
+        g.output(o);
+        let out = crate::graph::cpu::run(
+            &g,
+            &crate::graph::Weights::new(),
+            &mut crate::graph::StateStore::new(),
+            vec![Tensor::F32(x)],
+        )
+        .unwrap();
+        assert_eq!(out[0].as_f32().unwrap(), &tiled[..]);
+    }
 
     #[test]
     fn test_qwen3_5_to_decode_graph() {

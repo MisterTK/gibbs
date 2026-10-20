@@ -737,19 +737,17 @@ fn gguf_checkpoint(
             && !needs_transform;
         // Value heads tiled across `out_proj` columns: untile whole quant blocks per row when each
         // `vd`-column head is block aligned.
-        // ponytail: unaligned formats still dequantize; permute the input activation instead if one ships.
         if needs_transform
             && !legacy
             && kh != vh
             && hf.ends_with(".linear_attn.out_proj.weight")
             && shape.len() == 2
             && packable(shape[1])
-            && packable(vd)
         {
             let row_bytes = t.quant_format.tensor_bytes(shape[1]);
             let seg = t.quant_format.tensor_bytes(vd);
             let total = shape[0] * row_bytes;
-            if seg * vh == row_bytes && t.byte_offset + total <= data.len() {
+            if packable(vd) && seg * vh == row_bytes && t.byte_offset + total <= data.len() {
                 let permuted: Vec<u8> = data[t.byte_offset..t.byte_offset + total]
                     .chunks_exact(row_bytes)
                     .flat_map(|row| untile_packed_rows(row, seg, 1, kh, vh, 0))
@@ -765,6 +763,14 @@ fn gguf_checkpoint(
                 ));
                 continue;
             }
+            // Value heads split quant blocks: keep the GGUF (tiled) column order; the graph tiles the input instead.
+            packed.push((
+                hf.replace(".out_proj.weight", ".out_proj_tiled.weight"),
+                t.byte_offset,
+                t.quant_format,
+                shape,
+            ));
+            continue;
         }
 
         if can_pack {
