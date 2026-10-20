@@ -8,8 +8,8 @@
 //! RFC 7386 merge patch: objects merge, everything else (arrays included) replaces, `null` deletes.
 
 pub mod expr;
-pub mod names;
 pub mod gen;
+pub mod names;
 
 use serde::Deserialize;
 use serde_json::{Map, Value as J};
@@ -17,6 +17,25 @@ use std::path::Path;
 
 /// Every embedded spec file: (path under `arch/`, contents).
 pub const EMBEDDED: &[(&str, &str)] = &[];
+
+/// Tensor facts the interpreter needs: canonical weights and generated constants.
+pub trait Source {
+    /// Logical shape and graph dtype of a weight/constant.
+    fn tensor(&self, name: &str) -> Option<(Vec<usize>, crate::graph::DType)>;
+    /// The low-rank adapter registered for a `Linear` weight.
+    fn lora(&self, _weight: &str) -> Option<Lora> {
+        None
+    }
+}
+
+/// A LoRA pair: `y += (x · Aᵀ · Bᵀ) · scale (+ bias_delta)`.
+#[derive(Debug, Clone)]
+pub struct Lora {
+    pub a: String,
+    pub b: String,
+    pub scale: f32,
+    pub bias_delta: Option<String>,
+}
 
 /// Which checkpoints a family claims.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -176,6 +195,10 @@ pub struct Spec {
     pub components: Map<String, J>,
     #[serde(default)]
     pub runtime: J,
+    /// Random-init weights for synthetic model ids: name pattern -> `{shape: [expr..], over?:
+    /// {var: list-expr}}`; `over` instantiates `{var}` in the pattern for every list item.
+    #[serde(default)]
+    pub synthetic: Map<String, J>,
 }
 
 impl Spec {

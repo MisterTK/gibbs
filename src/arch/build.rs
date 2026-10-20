@@ -1,0 +1,673 @@
+//! Spec interpreter: runs a component's body with instance variables bound and emits a
+//! `graph::Graph`. Node kinds (one JSON object each, see the README "Model specs"):
+//!
+//! - op:     `{op, args, in, out, name?, when?}`; `args` deserialize into `graph::Op`.
+//! - state:  `{state, shape, dtype?, recurrent?, when?}` declares persistent state.
+//! - use:    `{use, args?, in?, out?, when?}` expands a macro in a fresh value scope.
+//! - repeat: `{repeat: var, count | over, body}` (shares the enclosing value scope).
+//! - block:  `{block: [...], when}` conditional group (shares the enclosing value scope).
+//! - let:    `{let: {var: expr, ...}}` binds expression variables in the current frame.
+//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it.
+//!
+//! Operand refs: `x` (scope value), `v?:x` (scope value, dropped when unbound), `w:name` (weight),
+//! `w?:name` (weight, dropped when absent), `s:name` (state), `c:name` (constant), `i:name` (input).
+//! Every name interpolates `{expr}`.
+
+use super::expr::{eval_json, eval_str, interp, walk, Env, Val};
+use super::{InputDecl, Lora, Network, Source, Spec};
+use crate::graph::{DType, Graph, Op, ValueId};
+use serde_json::{Map, Value as J};
+use std::collections::HashMap;
+
+/// One graph input of an instance, in declaration (= binding) order.
+#[derive(Debug, Clone)]
+pub struct InputPlan {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+    /// Generator (and evaluated args) the runner fills it with; `None` = caller supplies it.
+    pub gen: Option<(String, J)>,
+}
+
+/// A built instance of a component.
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub graph: Graph,
+    pub inputs: Vec<InputPlan>,
+    /// Output names, graph output order (declared outputs, then requested taps).
+    pub outputs: Vec<String>,
+    /// Weights and constants the graph references (bind these).
+    pub weights: Vec<String>,
+    /// States declared `recurrent: true`.
+    pub recurrent: Vec<String>,
+}
+
+impl Instance {
+    pub fn input_index(&self, name: &str) -> Option<usize> {
+        self.inputs.iter().position(|i| i.name == name)
+    }
+    pub fn output_index(&self, name: &str) -> Option<usize> {
+        self.outputs.iter().position(|o| o == name)
+    }
+}
+
+pub fn parse_dtype(s: &str) -> Result<DType, String> {
+    Ok(match s {
+        "f32" => DType::F32,
+        "f16" => DType::F16,
+        "bf16" => DType::BF16,
+        "u32" => DType::U32,
+        other => return Err(format!("unknown dtype `{other}`")),
+    })
+}
+
+/// Builds `component` of `spec` with instance `vars`. `model` resolves config vars and scopes
+/// (`cfg`, `gguf`, `json`, `runtime`) and tensor existence; `src` gives weight shapes/dtypes.
+pub fn build(
+    spec: &Spec,
+    component: &str,
+    model: &dyn Env,
+    src: &dyn Source,
+    vars: &[(&str, Val)],
+) -> Result<Instance, String> {
+    let net = match spec.component(component)? {
+        super::Component::Net(n) => n,
+        super::Component::Ref { family, .. } => {
+            return Err(format!(
+                "{}: component `{component}` is family `{family}`; build it from that spec",
+                spec.family
+            ))
+        }
+    };
+    build_network(spec, &net, model, src, vars)
+        .map_err(|e| format!("{}/{component}: {e}", spec.family))
+}
+
+pub fn build_network(
+    spec: &Spec,
+    net: &Network,
+    model: &dyn Env,
+    src: &dyn Source,
+    vars: &[(&str, Val)],
+) -> Result<Instance, String> {
+    for v in &net.vars {
+        if !vars.iter().any(|(k, _)| k == v) && *v != "taps" {
+            return Err(format!("instance variable `{v}` not given"));
+        }
+    }
+    let mut b = Builder {
+        spec,
+        model,
+        src,
+        g: Graph::new(),
+        frames: vec![vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()],
+        values: vec![HashMap::new()],
+        weights: HashMap::new(),
+        weight_order: Vec::new(),
+        states: HashMap::new(),
+        recurrent: Vec::new(),
+        inputs: HashMap::new(),
+        taps: HashMap::new(),
+        prefix: Vec::new(),
+        depth: 0,
+    };
+    let mut plans = Vec::new();
+    for d in &net.inputs {
+        if let Some(p) = b.input(d)? {
+            plans.push(p);
+        }
+    }
+    b.body(&net.body)?;
+    let mut outputs = Vec::new();
+    for o in &net.outputs {
+        let (name, when) = match o {
+            J::String(s) => (s.clone(), None),
+            J::Object(m) => (
+                m.get("name")
+                    .and_then(J::as_str)
+                    .ok_or("output object needs `name`")?
+                    .to_string(),
+                m.get("when").cloned(),
+            ),
+            _ => return Err(format!("bad output {o}")),
+        };
+        if let Some(w) = when {
+            if !b.eval(&w)?.truthy() {
+                continue;
+            }
+        }
+        let name = b.interp(&name)?;
+        let v = b.value(&name)?;
+        b.g.output(v);
+        outputs.push(name);
+    }
+    let want: Vec<String> = match b.var("taps") {
+        Some(Val::List(l)) => l.iter().map(|t| t.to_string()).collect(),
+        _ => Vec::new(),
+    };
+    for t in want {
+        let v = *b
+            .taps
+            .get(&t)
+            .ok_or_else(|| format!("tap `{t}` is not emitted by this component"))?;
+        b.g.output(v);
+        outputs.push(t);
+    }
+    Ok(Instance {
+        graph: b.g,
+        inputs: plans,
+        outputs,
+        weights: b.weight_order,
+        recurrent: b.recurrent,
+    })
+}
+
+struct Builder<'a> {
+    spec: &'a Spec,
+    model: &'a dyn Env,
+    src: &'a dyn Source,
+    g: Graph,
+    /// Expression variable frames, innermost last.
+    frames: Vec<Vec<(String, Val)>>,
+    /// Value scopes; lookups see only the innermost (macros are isolated).
+    values: Vec<HashMap<String, ValueId>>,
+    weights: HashMap<String, ValueId>,
+    weight_order: Vec<String>,
+    states: HashMap<String, ValueId>,
+    recurrent: Vec<String>,
+    inputs: HashMap<String, ValueId>,
+    taps: HashMap<String, ValueId>,
+    /// Node-name prefixes of the enclosing macro calls.
+    prefix: Vec<String>,
+    depth: usize,
+}
+
+/// The builder's expression environment: frames, then the model env.
+struct BEnv<'b, 'a>(&'b Builder<'a>);
+
+impl Env for BEnv<'_, '_> {
+    fn lookup(&self, root: &str, path: &[Val]) -> Option<Val> {
+        match self.0.var(root) {
+            Some(v) => walk(v, path),
+            None => self.0.model.lookup(root, path),
+        }
+    }
+    fn has(&self, t: &str) -> bool {
+        self.0.src.tensor(t).is_some() || self.0.model.has(t)
+    }
+    fn shape(&self, t: &str) -> Option<Vec<usize>> {
+        if let Some(v) = self.0.values.last().unwrap().get(t) {
+            return Some(self.0.g.value(*v).shape.clone());
+        }
+        self.0
+            .src
+            .tensor(t)
+            .map(|(s, _)| s)
+            .or_else(|| self.0.model.shape(t))
+    }
+}
+
+impl<'a> Builder<'a> {
+    fn var(&self, name: &str) -> Option<Val> {
+        self.frames.iter().rev().find_map(|f| {
+            f.iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        })
+    }
+    fn eval(&self, j: &J) -> Result<Val, String> {
+        eval_json(j, &BEnv(self))
+    }
+    fn eval_s(&self, s: &str) -> Result<Val, String> {
+        eval_str(s, &BEnv(self))
+    }
+    fn interp(&self, s: &str) -> Result<String, String> {
+        interp(s, &BEnv(self))
+    }
+    fn when(&self, node: &Map<String, J>) -> Result<bool, String> {
+        match node.get("when") {
+            None => Ok(true),
+            Some(w) => Ok(self.eval(w)?.truthy()),
+        }
+    }
+    fn shape_of(&self, dims: &[J]) -> Result<Vec<usize>, String> {
+        dims.iter().map(|d| self.eval(d)?.usize()).collect()
+    }
+
+    fn input(&mut self, d: &InputDecl) -> Result<Option<InputPlan>, String> {
+        if let Some(w) = &d.when {
+            if !self.eval_s(w)?.truthy() {
+                return Ok(None);
+            }
+        }
+        let name = self.interp(&d.name)?;
+        let shape = self.shape_of(&d.shape)?;
+        let dtype = parse_dtype(&d.dtype)?;
+        let v = self.g.input(name.clone(), shape.clone(), dtype);
+        self.inputs.insert(name.clone(), v);
+        let gen = match &d.gen {
+            Some(gname) => Some((gname.clone(), self.eval(&d.args)?.to_json())),
+            None => None,
+        };
+        Ok(Some(InputPlan {
+            name,
+            shape,
+            dtype,
+            gen,
+        }))
+    }
+
+    fn body(&mut self, nodes: &[J]) -> Result<(), String> {
+        for n in nodes {
+            let m = n
+                .as_object()
+                .ok_or_else(|| format!("node must be an object: {n}"))?;
+            self.node(m).map_err(|e| {
+                let what = ["op", "use", "state", "repeat", "tap", "block", "let"]
+                    .iter()
+                    .find_map(|k| m.get(*k).map(|v| format!("{k} {v}")))
+                    .unwrap_or_default();
+                let out = m.get("out").map(|o| format!(" -> {o}")).unwrap_or_default();
+                if e.starts_with("  at ") || e.contains("\n  at ") {
+                    format!("{e}\n  at {what}{out}")
+                } else {
+                    format!("{e}\n  at {what}{out}")
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn node(&mut self, m: &Map<String, J>) -> Result<(), String> {
+        if let Some(lets) = m.get("let") {
+            let lets = lets.as_object().ok_or("`let` takes an object")?;
+            for (k, e) in lets {
+                let v = self.eval(e)?;
+                self.frames.last_mut().unwrap().push((k.clone(), v));
+            }
+            return Ok(());
+        }
+        if !self.when(m)? {
+            return Ok(());
+        }
+        if let Some(op) = m.get("op") {
+            return self.op(op.as_str().ok_or("`op` must be a string")?, m);
+        }
+        if let Some(st) = m.get("state") {
+            let name = self.interp(st.as_str().ok_or("`state` must be a string")?)?;
+            let shape = self.shape_of(
+                m.get("shape")
+                    .and_then(J::as_array)
+                    .ok_or("state needs `shape`")?,
+            )?;
+            let dtype = parse_dtype(m.get("dtype").and_then(J::as_str).unwrap_or("f32"))?;
+            if self.states.contains_key(&name) {
+                return Err(format!("state `{name}` declared twice"));
+            }
+            let v = self.g.state(name.clone(), shape, dtype);
+            if m.get("recurrent")
+                .map(|r| self.eval(r))
+                .transpose()?
+                .is_some_and(|r| r.truthy())
+            {
+                self.recurrent.push(name.clone());
+            }
+            self.states.insert(name, v);
+            return Ok(());
+        }
+        if let Some(var) = m.get("repeat") {
+            let var = var.as_str().ok_or("`repeat` names a variable")?.to_string();
+            let items: Vec<Val> = match (m.get("count"), m.get("over")) {
+                (Some(c), None) => (0..self.eval(c)?.usize()?)
+                    .map(|i| Val::Num(i as f64))
+                    .collect(),
+                (None, Some(o)) => self.eval(o)?.list()?.to_vec(),
+                _ => return Err("repeat needs exactly one of `count`, `over`".into()),
+            };
+            let body = m
+                .get("body")
+                .and_then(J::as_array)
+                .ok_or("repeat needs `body`")?;
+            for it in items {
+                self.frames.push(vec![(var.clone(), it)]);
+                let r = self.body(body);
+                self.frames.pop();
+                r?;
+            }
+            return Ok(());
+        }
+        if let Some(b) = m.get("block") {
+            let body = b.as_array().ok_or("`block` takes a node list")?;
+            self.frames.push(Vec::new());
+            let r = self.body(body);
+            self.frames.pop();
+            return r;
+        }
+        if let Some(t) = m.get("tap") {
+            let name = self.interp(t.as_str().ok_or("`tap` must be a string")?)?;
+            let src = m.get("in").and_then(J::as_str).ok_or("tap needs `in`")?;
+            let v = self.value(&self.interp(src)?)?;
+            self.taps.insert(name, v);
+            return Ok(());
+        }
+        if let Some(u) = m.get("use") {
+            return self.use_macro(u.as_str().ok_or("`use` must be a string")?, m);
+        }
+        Err(format!("unknown node kind: {}", J::Object(m.clone())))
+    }
+
+    /// A value in the current scope.
+    fn value(&self, name: &str) -> Result<ValueId, String> {
+        self.values
+            .last()
+            .unwrap()
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("`{name}` is not bound"))
+    }
+
+    fn bind(&mut self, name: String, v: ValueId) {
+        self.values.last_mut().unwrap().insert(name, v);
+    }
+
+    /// Resolves an operand ref; `None` when an optional ref is absent.
+    fn operand(&mut self, r: &str) -> Result<Option<ValueId>, String> {
+        let (kind, name) = match r.split_once(':') {
+            Some((k @ ("w" | "w?" | "s" | "c" | "i" | "v?"), n)) => (k, n),
+            _ => ("", r),
+        };
+        let name = self.interp(name)?;
+        match kind {
+            "" => self.value(&name).map(Some),
+            "v?" => Ok(self.values.last().unwrap().get(&name).copied()),
+            "w" | "c" | "w?" => match self.weight(&name) {
+                Some(v) => Ok(Some(v)),
+                None if kind == "w?" => Ok(None),
+                None => Err(format!(
+                    "{} `{name}` is missing",
+                    if kind == "c" { "constant" } else { "weight" }
+                )),
+            },
+            "s" => self
+                .states
+                .get(&name)
+                .copied()
+                .map(Some)
+                .ok_or_else(|| format!("state `{name}` is not declared")),
+            "i" => self
+                .inputs
+                .get(&name)
+                .copied()
+                .map(Some)
+                .ok_or_else(|| format!("input `{name}` is not declared")),
+            _ => unreachable!(),
+        }
+    }
+
+    fn weight(&mut self, name: &str) -> Option<ValueId> {
+        if let Some(v) = self.weights.get(name) {
+            return Some(*v);
+        }
+        let (shape, dtype) = self.src.tensor(name)?;
+        let v = self.g.weight(name.to_string(), shape, dtype);
+        self.weights.insert(name.to_string(), v);
+        self.weight_order.push(name.to_string());
+        Some(v)
+    }
+
+    fn node_name(&self, m: &Map<String, J>, out: &str) -> Result<String, String> {
+        let base = match m.get("name").and_then(J::as_str) {
+            Some(n) => self.interp(n)?,
+            None => out.to_string(),
+        };
+        Ok(match self.prefix.last() {
+            Some(p) => format!("{p}.{base}"),
+            None => base,
+        })
+    }
+
+    fn op(&mut self, op: &str, m: &Map<String, J>) -> Result<(), String> {
+        let args = match m.get("args") {
+            Some(a) => self.eval(a)?.to_json(),
+            None => J::Object(Map::new()),
+        };
+        let parsed = parse_op(op, args)?;
+        let mut ins = Vec::new();
+        for r in m
+            .get("in")
+            .and_then(J::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            if let Some(v) = self.operand(r.as_str().ok_or("operand refs are strings")?)? {
+                ins.push(v);
+            }
+        }
+        let out = self.interp(m.get("out").and_then(J::as_str).ok_or("op needs `out`")?)?;
+        let name = self.node_name(m, &out)?;
+        let lora = match (&parsed, ins.get(1)) {
+            (Op::Linear, Some(&w)) => self.src.lora(&self.g.value(w).name),
+            _ => None,
+        };
+        let mut v = self.g.push(name.clone(), parsed, &ins)?;
+        if let Some(l) = lora {
+            v = self.lora_branch(&name, ins[0], v, &l)?;
+        }
+        self.bind(out, v);
+        Ok(())
+    }
+
+    /// `y + (x·Aᵀ·Bᵀ)·scale (+ bias delta)`.
+    fn lora_branch(
+        &mut self,
+        name: &str,
+        x: ValueId,
+        y: ValueId,
+        l: &Lora,
+    ) -> Result<ValueId, String> {
+        use crate::graph::{BinaryKind, UnaryKind};
+        let a = self
+            .weight(&l.a)
+            .ok_or_else(|| format!("LoRA weight `{}` missing", l.a))?;
+        let b = self
+            .weight(&l.b)
+            .ok_or_else(|| format!("LoRA weight `{}` missing", l.b))?;
+        let t = self.g.push(format!("{name}.lora_a"), Op::Linear, &[x, a])?;
+        let u = self.g.push(format!("{name}.lora_b"), Op::Linear, &[t, b])?;
+        let s = self.g.push(
+            format!("{name}.lora_scale"),
+            Op::Unary {
+                kind: UnaryKind::Scale(l.scale),
+            },
+            &[u],
+        )?;
+        let mut out = self.g.push(
+            format!("{name}.lora_add"),
+            Op::Binary {
+                kind: BinaryKind::Add,
+            },
+            &[y, s],
+        )?;
+        if let Some(bd) = &l.bias_delta {
+            let d = self
+                .weight(bd)
+                .ok_or_else(|| format!("LoRA bias `{bd}` missing"))?;
+            out = self.g.push(
+                format!("{name}.lora_bias"),
+                Op::Binary {
+                    kind: BinaryKind::Add,
+                },
+                &[out, d],
+            )?;
+        }
+        Ok(out)
+    }
+
+    fn use_macro(&mut self, name: &str, m: &Map<String, J>) -> Result<(), String> {
+        let name = self.interp(name)?;
+        let mac = self.spec.macro_def(&name)?;
+        self.depth += 1;
+        if self.depth > 64 {
+            return Err(format!("macro `{name}`: recursion too deep"));
+        }
+        // Operands resolve in the caller's scope.
+        let mut params = HashMap::new();
+        let ins = m
+            .get("in")
+            .and_then(J::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if ins.len() > mac.params.len() {
+            return Err(format!(
+                "macro `{name}` takes {} operands, got {}",
+                mac.params.len(),
+                ins.len()
+            ));
+        }
+        for (p, r) in mac.params.iter().zip(&ins) {
+            if let Some(v) = self.operand(r.as_str().ok_or("operand refs are strings")?)? {
+                params.insert(p.clone(), v);
+            }
+        }
+        let mut frame = Vec::new();
+        if let Some(a) = m.get("args") {
+            for (k, e) in a.as_object().ok_or("`args` must be an object")? {
+                frame.push((k.clone(), self.eval(e)?));
+            }
+        }
+        let out = m
+            .get("out")
+            .map(|o| self.eval_out(o))
+            .transpose()?
+            .unwrap_or_default();
+        let call_name = match m.get("name").and_then(J::as_str) {
+            Some(n) => self.interp(n)?,
+            None => out.first().cloned().unwrap_or_else(|| name.clone()),
+        };
+        let pfx = match self.prefix.last() {
+            Some(p) => format!("{p}.{call_name}"),
+            None => call_name,
+        };
+        self.frames.push(frame);
+        self.values.push(params);
+        self.prefix.push(pfx);
+        let r = self.body(&mac.body);
+        let returns: Vec<String> = match &mac.returns {
+            J::Null => vec!["out".into()],
+            J::String(s) => vec![s.clone()],
+            J::Array(a) => a
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect(),
+            other => return Err(format!("macro `{name}`: bad `returns` {other}")),
+        };
+        let ret: Result<Vec<Option<ValueId>>, String> = r.and_then(|_| {
+            returns
+                .iter()
+                .map(|n| Ok(self.values.last().unwrap().get(&self.interp(n)?).copied()))
+                .collect()
+        });
+        self.prefix.pop();
+        self.values.pop();
+        self.frames.pop();
+        self.depth -= 1;
+        let ret = ret.map_err(|e| format!("{e}\n  in macro `{name}`"))?;
+        if out.len() > ret.len() {
+            return Err(format!(
+                "macro `{name}` returns {} values, {} requested",
+                ret.len(),
+                out.len()
+            ));
+        }
+        for (o, v) in out.into_iter().zip(ret) {
+            match v {
+                Some(v) => self.bind(o, v),
+                None => {
+                    return Err(format!(
+                        "macro `{name}` did not bind its return value for `{o}`"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn eval_out(&self, o: &J) -> Result<Vec<String>, String> {
+        match o {
+            J::String(s) => Ok(vec![self.interp(s)?]),
+            J::Array(a) => a
+                .iter()
+                .map(|x| self.interp(x.as_str().ok_or("out names are strings")?))
+                .collect(),
+            _ => Err(format!("bad `out` {o}")),
+        }
+    }
+}
+
+/// `graph::Op` from a variant name and its evaluated fields.
+pub fn parse_op(op: &str, args: J) -> Result<Op, String> {
+    let empty = args.as_object().is_some_and(Map::is_empty);
+    if empty {
+        if let Ok(o) = serde_json::from_value::<Op>(J::String(op.to_string())) {
+            return Ok(o);
+        }
+    }
+    let mut m = Map::new();
+    m.insert(op.to_string(), args);
+    serde_json::from_value::<Op>(J::Object(m)).map_err(|e| format!("op `{op}`: {e}"))
+}
+
+/// One cached graph program per component, run for every instance shape: the first instance
+/// compiles; others reuse its weights/session via `GraphProgram::run_reshaped`. Built instances
+/// are kept per var tuple (8, least recently used evicted).
+pub struct ShapeCache {
+    pub component: String,
+    entries: parking_lot::Mutex<Vec<(String, std::sync::Arc<Instance>)>>,
+}
+
+impl ShapeCache {
+    pub const CAP: usize = 8;
+
+    pub fn new(component: &str) -> Self {
+        Self {
+            component: component.to_string(),
+            entries: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Key of an instance var tuple.
+    pub fn key(vars: &[(&str, Val)]) -> String {
+        vars.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The instance for `vars`, building it with `make` on a miss.
+    pub fn get(
+        &self,
+        vars: &[(&str, Val)],
+        make: impl FnOnce() -> Result<Instance, String>,
+    ) -> Result<std::sync::Arc<Instance>, String> {
+        let key = Self::key(vars);
+        let mut e = self.entries.lock();
+        if let Some(i) = e.iter().position(|(k, _)| *k == key) {
+            let hit = e.remove(i);
+            let inst = hit.1.clone();
+            e.push(hit);
+            return Ok(inst);
+        }
+        drop(e);
+        let inst = std::sync::Arc::new(make()?);
+        let mut e = self.entries.lock();
+        if e.len() >= Self::CAP {
+            e.remove(0);
+        }
+        e.push((key, inst.clone()));
+        Ok(inst)
+    }
+}
