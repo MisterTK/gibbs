@@ -52,12 +52,14 @@ pub struct GraphProgram {
 }
 
 /// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
-pub const GPU_ARGMAX_MIN_VOCAB: usize = 150_000;
+pub const GPU_ARGMAX_MIN_VOCAB: usize = 32_768;
 
-/// `GIBBS_GPU_ARGMAX=1`: greedy decode steps pick the token on the device, read once.
+/// Greedy decode steps pick the token on the device, read once; `GIBBS_GPU_ARGMAX=0` reads the
+/// logits row back and picks on the host.
 fn gpu_argmax() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("GIBBS_GPU_ARGMAX").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
+        !std::env::var("GIBBS_GPU_ARGMAX")
+            .is_ok_and(|v| matches!(v.as_str(), "0" | "off" | "false"))
     });
     *ON
 }
@@ -408,7 +410,7 @@ impl GraphProgram {
     }
 
     /// [`Self::run`] for a greedy decode step whose token is the first largest of the first `valid`
-    /// entries of output 0 (0 = all). With `GIBBS_GPU_ARGMAX=1` on a single Metal segment whose
+    /// entries of output 0 (0 = all). Unless `GIBBS_GPU_ARGMAX=0`, on a single Metal segment whose
     /// output 0 is one f32 row of at least [`GPU_ARGMAX_MIN_VOCAB`], the device picks it and output 0
     /// comes back as `U32([token])` (one u32 read back instead of the row); otherwise exactly `run`.
     pub fn run_greedy(&mut self, inputs: Vec<Tensor>, valid: usize) -> Result<Vec<Tensor>, String> {
