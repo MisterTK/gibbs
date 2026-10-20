@@ -32,9 +32,8 @@
 //! The Metal planner's fusions are rules too ([`crate::graph::metal`]'s `fuse` module, and the
 //! `ple`/`deltanet` groups): GEMV epilogues, RmsNorm residual/scale/RoPE, attention q/k RoPE,
 //! horizontal batching, MoE, PLE and DeltaNet chains are extracted from saturated node/step facts
-//! and only lowered by the planner. Allocation-dependent rewrites stay planner post-passes: the
-//! zero-copy views (`views::elide`) and the GEMV pairing (`pair_small_hand_gemvs`, which needs
-//! arena offsets and tuned variants).
+//! and only lowered by the planner. The allocation-dependent GEMV pairing
+//! (`pair_small_hand_gemvs`, which needs arena offsets and tuned variants) stays a planner post-pass.
 
 use crate::graph::passes::{fusion, megakernel};
 use crate::graph::pattern::MatchContext;

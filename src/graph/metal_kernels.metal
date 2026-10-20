@@ -432,8 +432,7 @@ inline void rmsnorm_rope_row(device const float* xr,
 }
 
 // Horizontal batch of up to 4 independent RmsNorm segments (own x, gamma, out, rows, d, eps each);
-// threadgroup `tg` handles one row of the segment its row index falls in. Segment x is rows of
-// `xlen` elements (a multiple of d) `xstride` apart; dense when xlen == xstride.
+// threadgroup `tg` handles one row of the segment its row index falls in.
 struct RmsNormBatchParams {
     uint rows[4];
     uint d[4];
@@ -444,8 +443,6 @@ struct RmsNormBatchParams {
     uint rotary_dim;
     uint pair_stride;
     float mscale;
-    uint xlen[4];
-    uint xstride[4];
 };
 kernel void rmsnorm_batch_f32(device const float* x0 [[buffer(0)]], device const float* g0 [[buffer(1)]], device float* o0 [[buffer(2)]],
                               device const float* x1 [[buffer(3)]], device const float* g1 [[buffer(4)]], device float* o1 [[buffer(5)]],
@@ -469,8 +466,7 @@ kernel void rmsnorm_batch_f32(device const float* x0 [[buffer(0)]], device const
     while (s < p.nseg && row >= p.rows[s]) { row -= p.rows[s]; s++; }
     if (s >= p.nseg) return;
     uint d = p.d[s];
-    uint per = max(p.xlen[s] / max(d, 1u), 1u);
-    device const float* xr = xs[s] + (ulong)(row / per) * p.xstride[s] + (ulong)(row % per) * d;
+    device const float* xr = xs[s] + (ulong)row * d;
     device float* outr = os[s] + (ulong)row * d;
     float sq = 0.0f;
     for (uint i = tid; i < d; i += tpg) {
@@ -1830,14 +1826,13 @@ struct GraphRopeParams2 {
 
 inline void rope_elem(device const float* in, device float* out, device const uint* pos,
                       device const float* inv_freq, uint n_heads, uint head_dim, uint rotary_dim,
-                      uint pair_stride, float mscale, uint in_stride, uint gid) {
+                      uint pair_stride, float mscale, uint gid) {
     uint d = gid % head_dim;
     uint rem = gid / head_dim;
     uint head = rem % n_heads;
     uint seq = rem / n_heads;
 
-    // `in_stride`: elements between sequence rows of `in` (n_heads * head_dim when dense).
-    device const float* in_h = in + (ulong)seq * in_stride + (ulong)head * head_dim;
+    device const float* in_h = in + (ulong)seq * (n_heads * head_dim) + (ulong)head * head_dim;
     device float* out_h = out + (ulong)seq * (n_heads * head_dim) + (ulong)head * head_dim;
 
     if (d < rotary_dim) {
@@ -1875,8 +1870,7 @@ kernel void rope_general_f32(device const float* in [[buffer(0)]],
                              constant GraphRopeParams2& p [[buffer(4)]],
                              uint gid [[thread_position_in_grid]]) {
     if (gid >= p.n_seq * p.n_heads * p.head_dim) return;
-    rope_elem(in, out, pos, inv_freq, p.n_heads, p.head_dim, p.rotary_dim, p.pair_stride, p.mscale,
-              p.n_heads * p.head_dim, gid);
+    rope_elem(in, out, pos, inv_freq, p.n_heads, p.head_dim, p.rotary_dim, p.pair_stride, p.mscale, gid);
 }
 
 // Horizontal batch of up to 4 Rope segments sharing pos/inv_freq/head_dim/rotary_dim/pair_stride/mscale/n_seq;
@@ -1889,7 +1883,6 @@ struct RopeBatchParams {
     uint pair_stride;
     float mscale;
     uint n_seq;
-    uint in_stride[4];
 };
 kernel void rope_batch_f32(device const float* in0 [[buffer(0)]], device float* out0 [[buffer(1)]],
                            device const float* in1 [[buffer(2)]], device float* out1 [[buffer(3)]],
@@ -1906,7 +1899,7 @@ kernel void rope_batch_f32(device const float* in0 [[buffer(0)]], device float* 
         uint total = p.n_seq * p.n_heads[s] * p.head_dim;
         if (g < total) {
             rope_elem(ins[s], outs[s], pos, inv_freq, p.n_heads[s], p.head_dim, p.rotary_dim,
-                      p.pair_stride, p.mscale, p.in_stride[s], g);
+                      p.pair_stride, p.mscale, g);
             return;
         }
         g -= total;

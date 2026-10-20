@@ -384,7 +384,6 @@ mod ext;
 mod fuse;
 #[cfg(test)]
 mod testutil;
-mod views;
 
 const BASE_MSL: &str = include_str!("metal_kernels.metal");
 /// Core kernels plus every lowering group's (`ext`).
@@ -2380,9 +2379,8 @@ impl Session {
 
     /// Prepares the planned steps and activation arena allocation for `graph` once.
     pub fn prepare_plan(&self, graph: &Graph) -> Result<PreparedPlan, String> {
-        let (steps, mut aliases) = plan(graph)?;
+        let (steps, aliases) = plan(graph)?;
         let mut steps = batch_horizontal(steps, &aliases)?;
-        views::elide(graph, &mut steps, &mut aliases);
         if std::env::var_os("GIBBS_DUMP_PLAN").is_some() {
             for (i, s) in steps.iter().enumerate() {
                 eprintln!("{}", plan_line(i, s));
@@ -3710,8 +3708,6 @@ impl Session {
                     rotary_dim: u32,
                     pair_stride: u32,
                     mscale: f32,
-                    xlen: [u32; 4],
-                    xstride: [u32; 4],
                 }
                 let mut p = RmsNormBatchParams {
                     nseg: segs.len() as u32,
@@ -3732,8 +3728,6 @@ impl Session {
                         p.rows[i] = u32_of(sg.rows)?;
                         p.d[i] = u32_of(sg.d)?;
                         p.eps[i] = sg.eps;
-                        p.xlen[i] = u32_of(sg.xv.len)?;
-                        p.xstride[i] = u32_of(sg.xv.stride)?;
                         if sg.has_rope {
                             p.rope_mask |= 1u32 << i;
                         }
@@ -3773,11 +3767,9 @@ impl Session {
                     pair_stride: u32,
                     mscale: f32,
                     n_seq: u32,
-                    in_stride: [u32; 4],
                 }
                 let mut p = RopeBatchParams {
                     n_heads: [0; 4],
-                    in_stride: [0; 4],
                     nseg: segs.len() as u32,
                     head_dim: u32_of(head_dim)?,
                     rotary_dim: u32_of(rotary_dim)?,
@@ -3787,12 +3779,11 @@ impl Session {
                 };
                 let mut total = 0usize;
                 for i in 0..4 {
-                    let (x, out, _, _) = *segs.get(i).unwrap_or(&segs[0]);
+                    let (x, out, _) = *segs.get(i).unwrap_or(&segs[0]);
                     bind(i as u64 * 2, x);
                     bind(i as u64 * 2 + 1, out);
-                    if let Some(&(_, _, heads, xv)) = segs.get(i) {
+                    if let Some(&(_, _, heads)) = segs.get(i) {
                         p.n_heads[i] = u32_of(heads)?;
-                        p.in_stride[i] = u32_of(xv.stride)?;
                         total += n_seq * heads * head_dim;
                     }
                 }
@@ -4483,8 +4474,7 @@ pub enum Step {
         segs: Vec<NormSeg>,
         rope: Option<NormRope>,
     },
-    /// Horizontal batch of up to 4 Rope segments `(x, out, n_heads, x rows)` sharing pos, inv_freq
-    /// and geometry; `x rows` is one sequence row per [`views::Rows`] row.
+    /// Horizontal batch of up to 4 Rope segments `(x, out, n_heads)` sharing pos, inv_freq and geometry.
     RopeBatch {
         pos: ValueId,
         inv_freq: ValueId,
@@ -4493,7 +4483,7 @@ pub enum Step {
         rotary_dim: usize,
         pair_stride: usize,
         mscale: f32,
-        segs: Vec<(ValueId, ValueId, usize, views::Rows)>,
+        segs: Vec<(ValueId, ValueId, usize)>,
     },
     CachedAttention {
         q: ValueId,
@@ -4768,8 +4758,6 @@ pub struct NormSeg {
     pub d: usize,
     pub eps: f32,
     pub has_rope: bool,
-    /// Layout of `x` (row-strided when it is a view; dense `rows * d` otherwise).
-    pub xv: views::Rows,
 }
 
 /// One projection leg of [`Step::GemvPackedPair`].
@@ -5086,7 +5074,6 @@ fn batch_horizontal(
                             d,
                             eps,
                             has_rope: rope.is_some(),
-                            xv: views::Rows::dense(rows * d),
                         },
                         _ => unreachable!("run members share a kind"),
                     })
@@ -5112,9 +5099,7 @@ fn batch_horizontal(
                 segs: run
                     .iter()
                     .map(|s| match s.op {
-                        Step::Rope { x, n_heads, head_dim, .. } => {
-                            (x, s.out, n_heads, views::Rows::dense(n_heads * head_dim))
-                        }
+                        Step::Rope { x, n_heads, .. } => (x, s.out, n_heads),
                         _ => unreachable!("run members share a kind"),
                     })
                     .collect(),
@@ -5980,31 +5965,32 @@ fn fuse_moe_subgraphs(
 }
 
 /// First-fit arena offsets for graph inputs and step outputs; a value's space is reused once its
-/// last reader has run (graph outputs live to the end). An alias has no space of its own: its root
-/// is allocated at the first step that writes the root or any alias of it (destination passing)
-/// and lives until the last step that reads or writes any of them. Returns (offsets, arena bytes).
+/// last reader has run (graph outputs live to the end). Returns (offsets, arena bytes).
 fn allocate(
     g: &Graph,
     steps: &[Planned],
     aliases: &HashMap<ValueId, (ValueId, usize)>,
 ) -> Result<(HashMap<ValueId, usize>, usize), String> {
-    let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let mut last: HashMap<ValueId, usize> = HashMap::new();
     for (s, st) in steps.iter().enumerate() {
-        for &v in st.reads.iter().chain(&st.extra_outs).chain([&st.out]) {
-            last.insert(root(v), s);
+        for &v in &st.reads {
+            last.insert(v, s);
+            if let Some(&(src, _)) = aliases.get(&v) {
+                let prev = last.get(&src).copied().unwrap_or(0);
+                last.insert(src, prev.max(s));
+            }
         }
     }
     for &v in &g.outputs {
-        last.insert(root(v), usize::MAX);
+        last.insert(v, usize::MAX);
+        if let Some(&(src, _)) = aliases.get(&v) {
+            last.insert(src, usize::MAX);
+        }
     }
     let mut live: Vec<(usize, usize, ValueId)> = Vec::new();
     let mut offsets = HashMap::new();
     let mut peak = 0;
     let mut alloc = |v: ValueId, live: &mut Vec<(usize, usize, ValueId)>| -> Result<(), String> {
-        if offsets.contains_key(&v) {
-            return Ok(());
-        }
         let size = (numel(g, v)? * 4).div_ceil(ARENA_ALIGN) * ARENA_ALIGN;
         live.sort_unstable_by_key(|l| l.0);
         let mut off = 0;
@@ -6023,8 +6009,9 @@ fn allocate(
         alloc(v, &mut live)?;
     }
     for (s, st) in steps.iter().enumerate() {
-        for &v in [&st.out].into_iter().chain(&st.extra_outs) {
-            alloc(root(v), &mut live)?;
+        alloc(st.out, &mut live)?;
+        for &v in &st.extra_outs {
+            alloc(v, &mut live)?;
         }
         live.retain(|&(_, _, v)| last.get(&v).is_some_and(|&l| l > s));
     }
@@ -6234,16 +6221,15 @@ fn attn_splits(
 }
 
 /// CPU-only listing of what [`Session::prepare_plan`] schedules for `g`: `plan` (MoE subgraph
-/// fusion included), `batch_horizontal`, `views::elide`, the arena `allocate` and `pair_small_hand_gemvs`, without a
+/// fusion included), `batch_horizontal`, the arena `allocate` and `pair_small_hand_gemvs`, without a
 /// device, weights or the tuner. A GEMV whose variant the tuner picks prints `variant=unassigned`
 /// (pairing is unaffected: without a variant override it pairs only BF16, which has one kernel).
 /// Dispatches per step follow the encoder: attention with `ctx` keys in the cache, and
 /// `MegakernelMlp`'s norm, gate, up, activation, down and optional post-norm.
 pub fn plan_dump(g: &Graph, ctx: usize) -> Result<String, String> {
     use std::fmt::Write;
-    let (steps, mut aliases) = plan(g)?;
+    let (steps, aliases) = plan(g)?;
     let mut steps = batch_horizontal(steps, &aliases)?;
-    views::elide(g, &mut steps, &mut aliases);
     let (offsets, arena) = allocate(g, &steps, &aliases)?;
     pair_small_hand_gemvs(g, &mut steps, &aliases, &offsets, false);
     let mut out = String::new();
@@ -10843,9 +10829,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             end: 4,
         };
         let s = g.add("blk.3.slice", op, &[x], vec![2, 4], DType::F32);
-        // `Binary` takes no row stride, so the non-contiguous slice stays a copy step.
-        let b = g.input("b", vec![2, 4], DType::F32);
-        let y = g.add("blk.3.add", Op::Add, &[s, b], vec![2, 4], DType::F32);
+        let neg = Op::Unary {
+            kind: crate::graph::UnaryKind::Neg,
+        };
+        let y = g.add("blk.3.neg", neg, &[s], vec![2, 4], DType::F32);
         g.output(y);
         let d = plan_dump(&g, 1).unwrap();
         assert!(d.contains("-- layer 3\n"), "{d}");

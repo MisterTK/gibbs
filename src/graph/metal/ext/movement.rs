@@ -37,34 +37,6 @@ pub struct Map {
     obase: u32,
 }
 
-impl Map {
-    fn plain(&self, k: usize) -> bool {
-        self.idiv[k] == 1 && self.imod[k] == u32::MAX
-    }
-
-    /// `(len, stride, in_base)` when the copy reads rows of `len` contiguous elements, `stride`
-    /// apart from element `in_base`, into a dense output (a slice on a non-leading axis).
-    pub(in crate::graph::metal) fn row_gather(&self) -> Option<(usize, usize, usize)> {
-        let (len, stride) = (self.odim[1], self.istride[0]);
-        (self.rank == 2
-            && self.plain(0)
-            && self.plain(1)
-            && self.obase == 0
-            && self.istride[1] == 1
-            && self.ostride[1] == 1
-            && self.ostride[0] == len
-            && stride > len)
-            .then_some((len as usize, stride as usize, self.ibase as usize))
-    }
-
-    /// `(out_base, n)` when the copy reads `n` elements densely from element 0 into one dense run of
-    /// the output starting at `out_base`.
-    pub(in crate::graph::metal) fn dense_run(&self) -> Option<(usize, usize)> {
-        (self.rank == 1 && self.plain(0) && self.ibase == 0 && self.istride[0] == 1 && self.ostride[0] == 1)
-            .then_some((self.obase as usize, self.n as usize))
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GatherP {
