@@ -2,7 +2,7 @@
 
 use crate::util::*;
 use gibbs_engine::hardware::{Device, HardwareCapability, QuantMode};
-use gibbs_engine::model::hf_loader::{load_causal_lm, HuggingFaceModelDir};
+use gibbs_engine::model::hf_loader::load_causal_lm;
 use gibbs_engine::model::nano::{NanoTransformerConfig, NanoTransformerModel};
 use gibbs_engine::model::native::load_native;
 use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig};
@@ -150,20 +150,19 @@ fn argmax(v: &[f32]) -> u32 {
     (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b }) as u32
 }
 
-/// Last-position logits after a 6- and a 20-token prefill, after each of 3 forced decode steps
-/// following the 6-token prefill, and the 8-token greedy continuation of the 6-token prompt.
+/// Last-position logits after a 6- and a 20-token prefill, after each of 3 forced tokens
+/// following the 6-token prompt, and the 8-token greedy continuation of the 6-token prompt.
 fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
     let cpu0 = gibbs_engine::hardware::cpu_compute::entered();
     let mut o = Out::default();
     o.f("prefill6", &m.prompt_logits(PROMPT.to_vec()).unwrap());
     o.f("prefill20", &m.prompt_logits(long_prompt()).unwrap());
-    let mut kv = None;
-    m.step_token_with_kv(&PROMPT, PROMPT[5], PROMPT.len(), 0.0, 1.0, &mut kv)
-        .unwrap();
-    for (i, &t) in DECODE.iter().enumerate() {
-        // `pos` counts the token itself.
+    // Prompts shorter than 16 run token by token through the decode program (KV state carried),
+    // so these are the logits of 3 cached decode steps after the 6-token prompt.
+    let seq = [&PROMPT[..], &DECODE[..]].concat();
+    for i in 0..DECODE.len() {
         let l = m
-            .decode_step_logits(t, PROMPT.len() + i + 1, &mut kv)
+            .prompt_logits(seq[..PROMPT.len() + i + 1].to_vec())
             .unwrap();
         o.f(format!("decode{i}"), &l);
     }
@@ -176,16 +175,13 @@ fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
         ids.push(t);
     }
     // The greedy path (device argmax after the first token) agrees with the logits' argmax.
-    let p6 = &o.floats[0].1;
-    assert_eq!(argmax(p6), ids[PROMPT.len()], "prefill argmax vs greedy");
-    let mut kv = None;
-    m.step_token_with_kv(&PROMPT, PROMPT[5], PROMPT.len(), 0.0, 1.0, &mut kv)
-        .unwrap();
-    for k in 1..8 {
-        let l = m
-            .decode_step_logits(ids[PROMPT.len() + k - 1], PROMPT.len() + k, &mut kv)
-            .unwrap();
-        assert_eq!(argmax(&l), ids[PROMPT.len() + k], "decode argmax vs greedy");
+    for k in 0..8 {
+        let l = m.prompt_logits(ids[..PROMPT.len() + k].to_vec()).unwrap();
+        assert_eq!(
+            argmax(&l),
+            ids[PROMPT.len() + k],
+            "argmax vs greedy step {k}"
+        );
     }
     if dev == Device::Metal {
         // A silent CPU fallback would compare CPU against CPU.
@@ -437,8 +433,32 @@ fn nano() {
                 "intermediate_size": inter, "vocab_size": v}),
     );
     w.write(&dir.join("model.safetensors"));
-    // runner: internal `HuggingFaceModelDir::load_from_dir` + `NanoTransformerModel::forward_token`
-    let model = HuggingFaceModelDir::load_from_dir(&dir).unwrap();
+    // runner: internal `NanoTransformerModel` fields filled from the fixture file (the removed
+    // `HuggingFaceModelDir` loader did the same) + `forward_token` / `forward_logits`
+    let cfg = NanoTransformerConfig {
+        vocab_size: v,
+        hidden_dim: h,
+        intermediate_dim: inter,
+        num_layers: layers,
+        num_heads: 4,
+        head_dim: 16,
+        eps: 1e-5,
+    };
+    let (m, data) =
+        gibbs_engine::model::loaders::read_checkpoint(&dir.join("model.safetensors")).unwrap();
+    let t = |n: &str| m.extract_tensor_f32(&data, n).unwrap();
+    let mut model = NanoTransformerModel::new(cfg.clone());
+    model.embedding_table = t("embedding_table");
+    for l in 0..layers {
+        model.qkv_weights[l] = t(&format!("qkv_weights.{l}"));
+        model.out_weights[l] = t(&format!("out_weights.{l}"));
+        model.mlp_gate_up[l] = t(&format!("mlp_gate_up.{l}"));
+        model.mlp_down[l] = t(&format!("mlp_down.{l}"));
+        model.norm_weights[l] = t(&format!("norm_weights.{l}"));
+    }
+    model.final_norm = t("final_norm");
+    model.lm_head = t("lm_head");
+    model.quantize_model(QuantMode::Uncompressed);
     let trajectory = |m: &NanoTransformerModel| {
         let mut t = 42u32;
         (0..10)
@@ -450,16 +470,7 @@ fn nano() {
     };
     let ids = trajectory(&model);
     // The fixture is exactly Nano's built-in init (nano_model_tests' config).
-    let init = NanoTransformerModel::new(NanoTransformerConfig {
-        vocab_size: v,
-        hidden_dim: h,
-        intermediate_dim: inter,
-        num_layers: layers,
-        num_heads: 4,
-        head_dim: 16,
-        eps: 1e-5,
-    });
-    assert_eq!(ids, trajectory(&init));
+    assert_eq!(ids, trajectory(&NanoTransformerModel::new(cfg)));
     let mut out = Out::default();
     out.ids("greedy10", &ids);
     out.f("final_logits", &model.forward_logits(ids[8]));
