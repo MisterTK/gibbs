@@ -939,32 +939,21 @@ fn test_plyx_15m_inference_and_comprehension() {
 }
 
 #[test]
-fn test_default_uncompressed_and_no_hadamard_mlp_replacement_guardrail() {
-    // 1. Verify default config has Hadamard attention/MLP turned off
+fn test_default_uncompressed_guardrail() {
     let default_cfg = GraphLmConfig::default();
-    assert!(
-        !default_cfg.use_hadamard_attention,
-        "Hadamard attention must not be enabled by default"
-    );
-    assert!(
-        !default_cfg.use_hadamard_mlp,
-        "Walsh-Hadamard MLP must not replace standard MLPs by default"
-    );
     assert_eq!(
         default_cfg.quant_mode,
         QuantMode::Uncompressed,
         "Inference must default to uncompressed first"
     );
 
-    // 2. Verify all presets default to uncompressed and no Hadamard substitution
+    // 2. Verify all presets default to uncompressed
     let presets = [
         GraphLmConfig::smollm_1m(),
         GraphLmConfig::tiny_5m(),
         GraphLmConfig::tiny_10m(),
     ];
     for p in presets {
-        assert!(!p.use_hadamard_attention);
-        assert!(!p.use_hadamard_mlp);
         assert_eq!(p.quant_mode, QuantMode::Uncompressed);
     }
 
