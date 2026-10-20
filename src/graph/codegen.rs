@@ -1084,6 +1084,19 @@ mod tests {
     }
 
     #[test]
+    fn gemv_packed_specializable_reads_shape_from_function_constants() {
+        for f in [QuantFormat::GGUF_TQ2_0, QuantFormat::GGUF_Q4_1, QuantFormat::GGUF_Q6_K] {
+            let (c, p) = (codec(f).unwrap(), GemvParams::default());
+            let s = gemv_packed_specializable(c, p);
+            let kernel = s.split_once("kernel void ").unwrap().1;
+            assert!(!kernel.contains("p.rows ") && !kernel.contains("p.cols /"), "{f:?}");
+            assert!(kernel.contains("const uint n_rows = fc_has_rows ? fc_rows : p.rows;"));
+            assert!(s.contains("[[function_constant(1)]]"));
+            assert!(!gemv_packed(c, p).contains("function_constant"));
+        }
+    }
+
+    #[test]
     fn iq2_grid_rewrites_hit_every_anchor() {
         let c = codec(QuantFormat::GGUF_IQ2_XXS).unwrap();
         for r in [1, 2, 4] {
@@ -1632,6 +1645,25 @@ kernel void {name}(
 "#,
         rows_per_tg = gemv_rows_per_tg(p),
         wide_msl = wide_msl(codec, &dec, true),
+    )
+}
+
+/// Function-constant indices a [`gemv_packed_specializable`] pipeline may be specialized to: `rows` and blocks
+/// per row (`cols / block_elems`).
+pub const FC_ROWS: u64 = 0;
+pub const FC_BLOCKS_PER_ROW: u64 = 1;
+
+/// [`gemv_packed`] reading `rows` and `cols` from function constants [`FC_ROWS`] / [`FC_BLOCKS_PER_ROW`] when
+/// defined (else from `PackedGemvParams`), so loop trip counts and row guards fold at pipeline compile time.
+/// Separate from [`gemv_packed`] so the default (unspecialized) source stays unchanged.
+pub fn gemv_packed_specializable(codec: &Codec, p: GemvParams) -> String {
+    let src = gemv_packed(codec, p);
+    let (head, kernel) = src.split_once("kernel void ").expect("gemv_packed emits a kernel");
+    let kernel = kernel.replace("p.rows", "n_rows").replace("p.cols", "n_cols");
+    let (sig, body) = kernel.split_once(") {\n").expect("kernel body");
+    format!(
+        "{head}constant uint fc_rows [[function_constant({FC_ROWS})]];\nconstant uint fc_bpr [[function_constant({FC_BLOCKS_PER_ROW})]];\nconstant bool fc_has_rows = is_function_constant_defined(fc_rows);\nconstant bool fc_has_bpr = is_function_constant_defined(fc_bpr);\nkernel void {sig}) {{\n    const uint n_rows = fc_has_rows ? fc_rows : p.rows;\n    const uint n_cols = fc_has_bpr ? fc_bpr * {be} : p.cols;\n{body}",
+        be = codec.block_elems
     )
 }
 
