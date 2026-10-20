@@ -159,7 +159,7 @@ impl Qwen35Graph {
 
             x = g.add(
                 format!("{p}.add_att"),
-                Op::Add,
+                Op::Binary { kind: BinaryKind::Add },
                 &[x, o],
                 vec![n, hidden_size],
                 DType::F32,

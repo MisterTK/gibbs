@@ -426,16 +426,16 @@ impl ModernBert {
             };
             let c = gb.add(&format!("{p}.attn"), attn, &[q, k, v], vec![n, h]);
             let o = gb.lin(c, &format!("{p}.Wo"), &layer.wo);
-            x = gb.add(&format!("{p}.res1"), Op::Add, &[x, o], vec![n, h]);
+            x = gb.add(&format!("{p}.res1"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], vec![n, h]);
             let m = gb.ln(x, &format!("{p}.mlp_norm"), &layer.mlp_norm, self.eps);
             let wi = gb.lin(m, &format!("{p}.Wi"), &layer.wi);
             let inter = layer.mlp_wo.in_f;
             let gate = gb.slice(&format!("{p}.gate"), wi, -1, 0, inter);
             let up = gb.slice(&format!("{p}.up"), wi, -1, inter, 2 * inter);
             let gate = gb.act(&format!("{p}.act"), self.act.graph(), gate);
-            let gu = gb.add(&format!("{p}.glu"), Op::Mul, &[gate, up], vec![n, inter]);
+            let gu = gb.add(&format!("{p}.glu"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[gate, up], vec![n, inter]);
             let mo = gb.lin(gu, &format!("{p}.mlp_Wo"), &layer.mlp_wo);
-            x = gb.add(&format!("{p}.res2"), Op::Add, &[x, mo], vec![n, h]);
+            x = gb.add(&format!("{p}.res2"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, mo], vec![n, h]);
         }
         let x = gb.ln(x, "final_norm", &self.final_norm, self.eps);
         let out = head.nodes(gb, x, Some(mask_v))?;

@@ -168,7 +168,7 @@ impl LnDecoder {
         }
         let pos = w(&mut g, "embed_positions".into(), vec![self.pos.len() / h, h], &self.pos);
         let pe = g.add("embed_pos", Op::Embedding, &[pos, positions], vec![n, h], f);
-        x = g.add("embed_sum", Op::Add, &[x, pe], vec![n, h], f);
+        x = g.add("embed_sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, pe], vec![n, h], f);
         for (i, b) in self.blocks.iter().enumerate() {
             let p = format!("blocks.{i}");
             let a_in = if self.pre_ln { norm(&mut g, &mut w, &format!("{p}.ln1"), x, &b.ln1, n) } else { x };
@@ -178,18 +178,18 @@ impl LnDecoder {
             let attn = Op::Attention { heads: self.heads, kv_heads: self.heads, causal: true, window: None, soft_cap: None };
             let a = g.add(format!("{p}.attn"), attn, &[q, k, v], vec![n, h], f);
             let o = lin(&mut g, &mut w, &format!("{p}.out"), a, &b.out);
-            let y = g.add(format!("{p}.res1"), Op::Add, &[o, x], vec![n, h], f);
+            let y = g.add(format!("{p}.res1"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![n, h], f);
             x = if self.pre_ln { y } else { norm(&mut g, &mut w, &format!("{p}.ln1"), y, &b.ln1, n) };
             let m_in = if self.pre_ln { norm(&mut g, &mut w, &format!("{p}.ln2"), x, &b.ln2, n) } else { x };
             let up = lin(&mut g, &mut w, &format!("{p}.fc1"), m_in, &b.fc1);
             let act = match self.act {
-                Act::Gelu => Op::Gelu { tanh: false },
-                Act::GeluTanh => Op::Gelu { tanh: true },
-                Act::Relu => Op::Relu,
+                Act::Gelu => Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
+                Act::GeluTanh => Op::Unary { kind: crate::graph::UnaryKind::GeluTanh },
+                Act::Relu => Op::Unary { kind: crate::graph::UnaryKind::Relu },
             };
             let act = g.add(format!("{p}.act"), act, &[up], vec![n, b.fc1.out_f], f);
             let d = lin(&mut g, &mut w, &format!("{p}.fc2"), act, &b.fc2);
-            let y = g.add(format!("{p}.res2"), Op::Add, &[d, x], vec![n, h], f);
+            let y = g.add(format!("{p}.res2"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[d, x], vec![n, h], f);
             x = if self.pre_ln { y } else { norm(&mut g, &mut w, &format!("{p}.ln2"), y, &b.ln2, n) };
         }
         let slice = Op::Slice { axis: 0, start: n as i64 - 1, end: n as i64 };

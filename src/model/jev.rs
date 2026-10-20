@@ -312,8 +312,8 @@ impl BertEncoder {
         let we = g.add("emb.word", Op::Embedding, &[wt, ids], vec![n, h], f);
         let pe = g.add("emb.position", Op::Embedding, &[pt, pos], vec![n, h], f);
         let te = g.add("emb.type", Op::Embedding, &[tt, types], vec![n, h], f);
-        let wp = g.add("emb.add_position", Op::Add, &[we, pe], vec![n, h], f);
-        let e = g.add("emb.add_type", Op::Add, &[wp, te], vec![n, h], f);
+        let wp = g.add("emb.add_position", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[we, pe], vec![n, h], f);
+        let e = g.add("emb.add_type", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[wp, te], vec![n, h], f);
         let lg = w(&mut g, "embeddings.LayerNorm.weight".into(), vec![h]);
         let lb = w(&mut g, "embeddings.LayerNorm.bias".into(), vec![h]);
         let mut x = g.add("emb.ln", Op::LayerNorm { eps }, &[e, lg, lb], vec![n, h], f);
@@ -346,7 +346,7 @@ impl BertEncoder {
             let o = lin(&mut g, a, "attention.output.dense", h, h);
             let r = g.add(
                 format!("{p}.attention.residual"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[o, x],
                 vec![n, h],
                 f,
@@ -372,7 +372,7 @@ impl BertEncoder {
             let i = lin(&mut g, x, "intermediate.dense", h, inter);
             let i = g.add(
                 format!("{p}.intermediate.gelu"),
-                Op::Gelu { tanh: false },
+                Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
                 &[i],
                 vec![n, inter],
                 f,
@@ -380,7 +380,7 @@ impl BertEncoder {
             let o2 = lin(&mut g, i, "output.dense", inter, h);
             let r2 = g.add(
                 format!("{p}.output.residual"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[o2, x],
                 vec![n, h],
                 f,

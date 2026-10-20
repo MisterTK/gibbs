@@ -444,7 +444,7 @@ impl Moe {
             vec![n * k, 1],
             f,
         );
-        let weighted = g.add(format!("{p}.expert_weighted"), Op::Mul, &[down, w_col], vec![n * k, d], f);
+        let weighted = g.add(format!("{p}.expert_weighted"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[down, w_col], vec![n * k, d], f);
         let grouped = g.add(
             format!("{p}.expert_slots"),
             Op::Reshape { shape: Some(vec![n, k, d]) },
@@ -481,8 +481,8 @@ impl Moe {
             vec![n, 1],
             f,
         );
-        let shared = g.add(format!("{p}.shared_out"), Op::Mul, &[sdown, gate_act], vec![n, d], f);
-        Ok(g.add(format!("{p}.moe_out"), Op::Add, &[routed, shared], vec![n, d], f))
+        let shared = g.add(format!("{p}.shared_out"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[sdown, gate_act], vec![n, d], f);
+        Ok(g.add(format!("{p}.moe_out"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[routed, shared], vec![n, d], f))
     }
 
     pub(super) fn summary(&self) -> String {

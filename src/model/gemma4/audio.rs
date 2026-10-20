@@ -279,8 +279,8 @@ impl Features {
             g.op(name, op, &[spec], vec![t, b])
         };
         let (re, im) = (slice(&mut g, "audio.dft.re", 0), slice(&mut g, "audio.dft.im", b));
-        let re2 = g.op("audio.dft.re2", Op::Mul, &[re, re], vec![t, b]);
-        let im2 = g.op("audio.dft.im2", Op::Mul, &[im, im], vec![t, b]);
+        let re2 = g.op("audio.dft.re2", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[re, re], vec![t, b]);
+        let im2 = g.op("audio.dft.im2", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[im, im], vec![t, b]);
         let sum = g.add("audio.dft.pow", re2, im2, vec![t, b]);
         let mag = g.unary("audio.dft.mag", UnaryKind::Sqrt, sum, vec![t, b]);
         let fw = g.f32w("audio.mel.weight", vec![mel, b], self.filters.clone());
@@ -768,7 +768,7 @@ impl Audio {
             };
             let (ga, gb) = (half(&mut b, "a", 0), half(&mut b, "b", d));
             let gb = b.unary(&format!("{p}.lc_gate"), UnaryKind::Sigmoid, gb, vec![t, d]);
-            let glu = b.op(&format!("{p}.lc_glu"), Op::Mul, &[ga, gb], vec![t, d]);
+            let glu = b.op(&format!("{p}.lc_glu"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[ga, gb], vec![t, d]);
             let gt = b.transpose(&format!("{p}.lc_glu.t"), glu, &[t, d], &[1, 0]);
             let kz = self.kernel;
             let dw = b.f32w(&format!("{p}.lc_dw.weight"), vec![d, 1, kz], l.lc_dw.clone());

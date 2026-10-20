@@ -204,7 +204,7 @@ fn merger_node(
         regroup(g, y)
     };
     let h = mg.fc1.graph_node(g, w, &format!("{name}.fc1"), y, rows);
-    let h = g.add(format!("{name}.gelu"), Op::Gelu { tanh: false }, &[h], vec![rows, mg.fc1.rows], f32s);
+    let h = g.add(format!("{name}.gelu"), Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[h], vec![rows, mg.fc1.rows], f32s);
     mg.fc2.graph_node(g, w, &format!("{name}.fc2"), h, rows)
 }
 
@@ -603,8 +603,8 @@ impl Vision {
             .graph_node(&mut g, &mut w, "patch_embed", patches, n);
         for c in 0..4 {
             let e = g.add(format!("pos_embed_{c}"), Op::Embedding, &[table, idx[c]], vec![n, d], f32s);
-            let s = g.add(format!("pos_scaled_{c}"), Op::Mul, &[e, wts[c]], vec![n, d], f32s);
-            x = g.add(format!("pos_add_{c}"), Op::Add, &[x, s], vec![n, d], f32s);
+            let s = g.add(format!("pos_scaled_{c}"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[e, wts[c]], vec![n, d], f32s);
+            x = g.add(format!("pos_add_{c}"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, s], vec![n, d], f32s);
         }
 
         let mut deepstack = Vec::new();
@@ -632,12 +632,12 @@ impl Vision {
             };
             let a = g.add(format!("{p}.attn"), att, &[q, k, v], vec![n, d], f32s);
             let o = b.proj.graph_node(&mut g, &mut w, &format!("{p}.proj"), a, n);
-            x = g.add(format!("{p}.add_attn"), Op::Add, &[x, o], vec![n, d], f32s);
+            x = g.add(format!("{p}.add_attn"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], vec![n, d], f32s);
             let y = layer_norm_node(&mut g, &mut w, &format!("{p}.norm2"), x, &b.norm2, n, d);
             let h = b.fc1.graph_node(&mut g, &mut w, &format!("{p}.fc1"), y, n);
-            let h = g.add(format!("{p}.gelu"), Op::Gelu { tanh: true }, &[h], vec![n, b.fc1.rows], f32s);
+            let h = g.add(format!("{p}.gelu"), Op::Unary { kind: crate::graph::UnaryKind::GeluTanh }, &[h], vec![n, b.fc1.rows], f32s);
             let h = b.fc2.graph_node(&mut g, &mut w, &format!("{p}.fc2"), h, n);
-            x = g.add(format!("{p}.add_mlp"), Op::Add, &[x, h], vec![n, d], f32s);
+            x = g.add(format!("{p}.add_mlp"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, h], vec![n, d], f32s);
             for (k, (_, mg)) in self.deepstack.iter().enumerate().filter(|(_, (i, _))| *i == bi) {
                 let name = format!("deepstack_merger.{k}");
                 deepstack.push(merger_node(&mut g, &mut w, &name, mg, x, n, d, unit));

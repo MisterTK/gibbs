@@ -1916,7 +1916,7 @@ impl Deberta {
         if let (Some(pos), Some(pv)) = (&self.pos, pos_v) {
             let t = gb.weight("emb.position", vec![pos.len() / h, h], || pos.clone());
             let p = gb.add("emb.position", Op::Embedding, &[t, pv], vec![n, h]);
-            x = gb.add("emb.add_position", Op::Add, &[x, p], vec![n, h]);
+            x = gb.add("emb.add_position", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, p], vec![n, h]);
         }
         x = gb.ln(x, "emb.ln", &self.emb_ln, self.eps);
         let attn = Op::Attention {
@@ -1951,18 +1951,18 @@ impl Deberta {
                 let g = gb.reshape(&format!("{p}.{tag}.bias"), g, vec![heads, n, n]);
                 bias = Some(match bias {
                     None => g,
-                    Some(b) => gb.add(&format!("{p}.bias"), Op::Add, &[b, g], vec![heads, n, n]),
+                    Some(b) => gb.add(&format!("{p}.bias"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[b, g], vec![heads, n, n]),
                 });
             }
             let qs = gb.unary(&format!("{p}.q_scaled"), UnaryKind::Scale(1.0 / 3f32.sqrt()), q);
             let c = gb.add(&format!("{p}.attn"), attn.clone(), &[qs, k, v, bias.expect("two terms")], vec![n, h]);
             let o = gb.lin(c, &format!("{p}.o"), &layer.o);
-            let r = gb.add(&format!("{p}.res1"), Op::Add, &[o, x], vec![n, h]);
+            let r = gb.add(&format!("{p}.res1"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![n, h]);
             let a = gb.ln(r, &format!("{p}.ln1"), &layer.ln1, self.eps);
             let i = gb.lin(a, &format!("{p}.inter"), &layer.inter);
             let i = gb.act(&format!("{p}.act"), Act::Gelu, i);
             let o2 = gb.lin(i, &format!("{p}.out"), &layer.out);
-            let r2 = gb.add(&format!("{p}.res2"), Op::Add, &[o2, a], vec![n, h]);
+            let r2 = gb.add(&format!("{p}.res2"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o2, a], vec![n, h]);
             x = gb.ln(r2, &format!("{p}.ln2"), &layer.ln2, self.eps);
         }
         let out = head.nodes(gb, x, Some(mask_v))?;

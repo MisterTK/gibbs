@@ -398,7 +398,13 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
             seen[out.0 as usize] = true;
             let node = fs.add("Node", (id, list))?;
             fs.union(o, node)?;
-            fs.add("K", (id, n.op.name()))?;
+            let key = match n.op {
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Add,
+                } => "Add",
+                _ => n.op.name(),
+            };
+            fs.add("K", (id, key))?;
             if matches!(n.op, Op::SwiGlu | Op::GeGlu) {
                 fs.add("K", (id, "Glu"))?;
             }
@@ -621,7 +627,7 @@ pub struct Fusion {
     report: Report,
 }
 
-/// Runs the e-graph fusion on `graph` (after canonical/decompose/dtype_adapt), applying the
+/// Runs the e-graph fusion on `graph` (after canonical/dtype_adapt), applying the
 /// extracted fusions in place and updating `weights` like the passes do.
 pub fn fuse(
     graph: &mut Graph,
@@ -1163,13 +1169,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::passes::{canonical, decompose, dtype_adapt};
+    use crate::graph::passes::{canonical, dtype_adapt};
 
     type Gw = (Graph, Weights);
 
     fn prep(g: &mut Graph) {
         canonical::run(g);
-        decompose::run(g);
         dtype_adapt::run(g);
     }
 
@@ -1270,7 +1275,7 @@ mod tests {
         };
         let a = b.op("attn", attn, &[q, k, v], vec![rows, 64]);
         let o = b.lin("o", a, 64);
-        let r1 = b.op("r1", Op::Add, &[o, x], vec![rows, 64]);
+        let r1 = b.op("r1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![rows, 64]);
         let n2 = b.norm("n2", r1);
         let gate = b.lin("gate", n2, 128);
         let up = b.lin("up", n2, 128);
@@ -1281,7 +1286,7 @@ mod tests {
             d = b.norm("post", d);
         }
         let ins = if swap_add { [d, r1] } else { [r1, d] };
-        let r2 = b.op("r2", Op::Add, &ins, vec![rows, 64]);
+        let r2 = b.op("r2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &ins, vec![rows, 64]);
         b.g.output(r2);
         b.done()
     }

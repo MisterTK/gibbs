@@ -289,7 +289,7 @@ mod tests {
             vec![1, 64],
             DType::F32,
         );
-        let final_out = g.add("final_add", Op::Add, &[attn, in_x], vec![1, 64], DType::F32);
+        let final_out = g.add("final_add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[attn, in_x], vec![1, 64], DType::F32);
         g.output(final_out);
 
         // Validate initial SSA

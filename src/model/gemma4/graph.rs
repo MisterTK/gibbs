@@ -191,7 +191,7 @@ impl Gemma4Graph {
             );
             x = g.add(
                 format!("{p}.add_att"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, o],
                 vec![n, hidden],
                 DType::F32,
@@ -275,7 +275,7 @@ impl Gemma4Graph {
             );
             x = g.add(
                 format!("{p}.add_ffn"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, down],
                 vec![n, hidden],
                 DType::F32,

@@ -28,10 +28,6 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::GeGlu
         | Op::Unary { .. }
         | Op::Binary { .. }
-        | Op::Silu
-        | Op::Relu
-        | Op::Mul
-        | Op::Add
         | Op::Rope { .. }
         | Op::CachedAttention { .. }
         | Op::PagedCachedAttention { .. }
@@ -63,7 +59,6 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Tile { .. }
         | Op::Upsample { .. } => true,
         Op::MatMul { .. } => true,
-        Op::Gelu { .. } => true,
     }
 }
 
@@ -410,11 +405,6 @@ pub fn run(
                         }
                         out
                     }
-                    super::MegakernelKind::Attention { .. } => {
-                        return Err(format!(
-                            "node '{name}': CPU Megakernel Attention not implemented"
-                        ));
-                    }
                 }
             }
             Op::RmsNorm { eps } => {
@@ -519,6 +509,11 @@ pub fn run(
                 };
                 let (a_shape, b_shape) = (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape);
                 broadcast_np(a, a_shape, b, b_shape, declared_len(graph, node), op_fn)
+                    .or_else(|| {
+                        (*kind == super::BinaryKind::Mul)
+                            .then(|| row_scale(a, a_shape, b, b_shape))
+                            .flatten()
+                    })
                     .or_else(|| tile_binary(a, b, op_fn))
                     .ok_or_else(|| {
                         format!(
@@ -527,66 +522,6 @@ pub fn run(
                             b.len()
                         )
                     })?
-            }
-            Op::Silu => {
-                let mut x = take0(&bound, &mut slots, ins, name, &last_use, i)?;
-                x.iter_mut().for_each(|v| *v = *v / (1.0 + (-*v).exp()));
-                x
-            }
-            Op::Relu => {
-                let mut x = take0(&bound, &mut slots, ins, name, &last_use, i)?;
-                x.iter_mut().for_each(|v| *v = v.max(0.0));
-                x
-            }
-            Op::Mul => {
-                let a = operand(&bound, &slots, ins, name, 0)?;
-                let b = operand(&bound, &slots, ins, name, 1)?;
-                let a_shape = &graph.value(ins[0]).shape;
-                let b_shape = &graph.value(ins[1]).shape;
-                let mut out = Vec::with_capacity(a.len().max(b.len()));
-                if let Some(o) =
-                    broadcast_np(a, a_shape, b, b_shape, declared_len(graph, node), |x, y| {
-                        x * y
-                    })
-                {
-                    out = o;
-                } else if a.len() == b.len() {
-                    out.extend(a.iter().zip(b).map(|(&x, &y)| x * y));
-                } else if b.len() == 1 {
-                    let y = b[0];
-                    out.extend(a.iter().map(|&x| x * y));
-                } else if a.len() == 1 {
-                    let x = a[0];
-                    out.extend(b.iter().map(|&y| x * y));
-                } else if a_shape.len() >= 2
-                    && b_shape.len() >= 2
-                    && b_shape.last() == Some(&1)
-                    && a_shape[0] == b_shape[0]
-                {
-                    // Row broadcasting: [m, d] * [m, 1]
-                    let d = a.len() / b.len().max(1);
-                    for (r, &scale) in b.iter().enumerate() {
-                        let row = &a[r * d..(r + 1) * d];
-                        out.extend(row.iter().map(|&x| x * scale));
-                    }
-                } else if a_shape.len() >= 2
-                    && b_shape.len() >= 2
-                    && a_shape.last() == Some(&1)
-                    && a_shape[0] == b_shape[0]
-                {
-                    // Row broadcasting: [m, 1] * [m, d]
-                    let d = b.len() / a.len().max(1);
-                    for (r, &scale) in a.iter().enumerate() {
-                        let row = &b[r * d..(r + 1) * d];
-                        out.extend(row.iter().map(|&x| scale * x));
-                    }
-                } else if let Some(o) = tile_binary(a, b, |x, y| x * y) {
-                    // Column broadcasting: [m, d] * [d]
-                    out = o;
-                } else {
-                    return Err(format!("node '{name}': Mul shape mismatch"));
-                }
-                out
             }
             Op::Softmax { axis } => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
@@ -1597,43 +1532,6 @@ pub fn run(
                     )
                 }
             }
-            Op::Gelu { tanh } => {
-                let mut x = take0(&bound, &mut slots, ins, name, &last_use, i)?;
-                if *tanh {
-                    nn::gelu_tanh(&mut x);
-                } else {
-                    nn::gelu(&mut x);
-                }
-                x
-            }
-            Op::Add => {
-                let (a_shape, b_shape) = (&graph.value(ins[0]).shape, &graph.value(ins[1]).shape);
-                let np = broadcast_np(
-                    operand(&bound, &slots, ins, name, 0)?,
-                    a_shape,
-                    operand(&bound, &slots, ins, name, 1)?,
-                    b_shape,
-                    declared_len(graph, node),
-                    |x, y| x + y,
-                );
-                if let Some(o) = np {
-                    o
-                } else if operand(&bound, &slots, ins, name, 0)?.len()
-                    == operand(&bound, &slots, ins, name, 1)?.len()
-                {
-                    let mut a = take0(&bound, &mut slots, ins, name, &last_use, i)?;
-                    nn::add_in_place(&mut a, operand(&bound, &slots, ins, name, 1)?);
-                    a
-                } else {
-                    let (a, b) = (
-                        operand(&bound, &slots, ins, name, 0)?,
-                        operand(&bound, &slots, ins, name, 1)?,
-                    );
-                    tile_binary(a, b, |x, y| x + y).ok_or_else(|| {
-                        format!("node '{name}': Add of {} and {} elements", a.len(), b.len())
-                    })?
-                }
-            }
             Op::MeanPool => {
                 let x = operand(&bound, &slots, ins, name, 0)?;
                 let mask = operand_u32(&bound, &slots, ins, name, 1)?;
@@ -2319,6 +2217,21 @@ fn broadcast_np(
         }
     }
     Some(out)
+}
+
+/// numpy-incompatible `[m, ..] * [m, 1]` (either order): row `r` scaled by the `[m, 1]` operand's `r`.
+fn row_scale(a: &[f32], sa: &[usize], b: &[f32], sb: &[usize]) -> Option<Vec<f32>> {
+    let rows = |x: &[f32], sx: &[usize], s: &[f32], ss: &[usize]| {
+        (sx.len() >= 2 && ss.len() >= 2 && ss.last() == Some(&1) && sx[0] == ss[0] && !s.is_empty())
+            .then(|| {
+                let d = (x.len() / s.len()).max(1);
+                x.chunks(d)
+                    .zip(s)
+                    .flat_map(|(row, &k)| row.iter().map(move |&v| v * k))
+                    .collect()
+            })
+    };
+    rows(a, sa, b, sb).or_else(|| rows(b, sb, a, sa))
 }
 
 /// `f` over equal-length operands, or with the shorter operand tiled over the longer one.

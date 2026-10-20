@@ -1426,13 +1426,6 @@ mod tests {
     }
 }
 
-/// Whether the generated-kernel templates cover `op` at `dtype`. Nothing is covered until the
-/// generated GEMV is wired into `GraphProgram::compile` (G3.2) and the movement/elementwise/reduction
-/// templates exist (G4.1).
-pub fn can_generate(_op: &crate::graph::Op, _dtype: crate::graph::DType) -> bool {
-    false
-}
-
 /// Rows one threadgroup of [`gemv_packed`] covers: `simdgroups` × `rows_per_sg`.
 pub const fn gemv_rows_per_tg(p: GemvParams) -> usize {
     p.simdgroups * p.rows_per_sg

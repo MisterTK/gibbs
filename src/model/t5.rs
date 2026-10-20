@@ -799,10 +799,10 @@ fn ffn(g: &mut Graph, sig: &Sig, c: &Cfg, p: &str, x: ValueId, n: usize) -> Valu
     let a = lin(g, sig, &format!("{p}.wi"), h, n);
     let shape = [n, c.d_ff];
     let act = |g: &mut Graph, a| match c.act {
-        Act::Relu => eg::node(g, format!("{p}.act"), Op::Relu, &[a], &shape),
-        Act::Gelu => eg::node(g, format!("{p}.act"), Op::Gelu { tanh: false }, &[a], &shape),
-        Act::GeluTanh => eg::node(g, format!("{p}.act"), Op::Gelu { tanh: true }, &[a], &shape),
-        Act::Silu => eg::node(g, format!("{p}.act"), Op::Silu, &[a], &shape),
+        Act::Relu => eg::node(g, format!("{p}.act"), Op::Unary { kind: crate::graph::UnaryKind::Relu }, &[a], &shape),
+        Act::Gelu => eg::node(g, format!("{p}.act"), Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[a], &shape),
+        Act::GeluTanh => eg::node(g, format!("{p}.act"), Op::Unary { kind: crate::graph::UnaryKind::GeluTanh }, &[a], &shape),
+        Act::Silu => eg::node(g, format!("{p}.act"), Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[a], &shape),
     };
     let a = if c.gated {
         let gate = lin(g, sig, &format!("{p}.wi1"), h, n);
@@ -811,14 +811,14 @@ fn ffn(g: &mut Graph, sig: &Sig, c: &Cfg, p: &str, x: ValueId, n: usize) -> Valu
             Act::Silu => eg::node(g, format!("{p}.glu"), Op::SwiGlu, &[a, gate], &shape),
             Act::Relu | Act::Gelu => {
                 let a = act(g, a);
-                eg::node(g, format!("{p}.glu"), Op::Mul, &[a, gate], &shape)
+                eg::node(g, format!("{p}.glu"), Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[a, gate], &shape)
             }
         }
     } else {
         act(g, a)
     };
     let o = lin(g, sig, &format!("{p}.wo"), a, n);
-    eg::node(g, format!("{p}.ffn_res"), Op::Add, &[x, o], &[n, c.d_model])
+    eg::node(g, format!("{p}.ffn_res"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], &[n, c.d_model])
 }
 
 /// Unscaled attention (T5 folds 1/sqrt(d_kv) into its weights) as `Attention` (which divides by
@@ -868,7 +868,7 @@ fn rel_bias(
     };
     let shape = [c.heads, nq, nk];
     let b = eg::node(g, format!("{p}.relbias"), op, &[table, q_pos, k_pos], &shape);
-    eg::node(g, format!("{p}.relmask"), Op::Add, &[b, mask], &shape)
+    eg::node(g, format!("{p}.relmask"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[b, mask], &shape)
 }
 
 /// Encoder over `n` (padded) source rows: ids, positions `0..n` and a `[n]` key mask in; the
@@ -896,7 +896,7 @@ fn encoder_graph(c: &Cfg, sig: &Sig, rel: &[bool], n: usize) -> Graph {
         }
         let a = attention(&mut g, c, &p, q, k, v, bias.expect("set above"), n);
         let o = lin(&mut g, sig, &format!("{p}.o"), a, n);
-        x = eg::node(&mut g, format!("{p}.attn_res"), Op::Add, &[x, o], &[n, d]);
+        x = eg::node(&mut g, format!("{p}.attn_res"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], &[n, d]);
         x = ffn(&mut g, sig, c, &p, x, n);
     }
     let h = rms(&mut g, sig, c, "enc.final_norm".into(), x, "enc.final_ln", n);
@@ -953,14 +953,14 @@ fn decoder_graph(c: &Cfg, sig: &Sig, rel: &[bool], dims: &Dims, head: &str, tied
         }
         let a = attention(&mut g, c, &format!("{p}.self"), q, sk, sv, bias.expect("set above"), 1);
         let o = lin(&mut g, sig, &format!("{p}.o"), a, 1);
-        x = eg::node(&mut g, format!("{p}.attn_res"), Op::Add, &[x, o], &[1, d]);
+        x = eg::node(&mut g, format!("{p}.attn_res"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], &[1, d]);
 
         let h = rms(&mut g, sig, c, format!("{p}.cross_norm"), x, &format!("{p}.xln"), 1);
         let q = lin(&mut g, sig, &format!("{p}.xq"), h, 1);
         let (xk, xv) = eg::cross_states(&mut g, i, dims);
         let a = attention(&mut g, c, &format!("{p}.cross"), q, xk, xv, cross_mask, 1);
         let o = lin(&mut g, sig, &format!("{p}.xo"), a, 1);
-        x = eg::node(&mut g, format!("{p}.cross_res"), Op::Add, &[x, o], &[1, d]);
+        x = eg::node(&mut g, format!("{p}.cross_res"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, o], &[1, d]);
         x = ffn(&mut g, sig, c, &p, x, 1);
     }
     let mut h = rms(&mut g, sig, c, "dec.final_norm".into(), x, "dec.final_ln", 1);

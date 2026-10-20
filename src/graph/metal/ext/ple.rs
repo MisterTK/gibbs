@@ -360,7 +360,7 @@ mod tests {
         let mut x = g.input("x", vec![1, h], F);
         let per = g.input("per", vec![1, layers * mid], F);
         let half = g.weight("half", vec![1], F);
-        let side_all = g.add("side_all", Op::Mul, &[per, half], vec![1, layers * mid], F);
+        let side_all = g.add("side_all", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[per, half], vec![1, layers * mid], F);
         for l in 0..layers {
             let (s, e) = ((l * mid) as i64, ((l + 1) * mid) as i64);
             let side = g.add(
@@ -393,7 +393,7 @@ mod tests {
                 vec![1, h],
                 F,
             );
-            x = g.add(format!("l{l}.res"), Op::Add, &[x, norm], vec![1, h], F);
+            x = g.add(format!("l{l}.res"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, norm], vec![1, h], F);
         }
         let fw = g.weight("final.nw", vec![h], F);
         let y = g.add("final", Op::RmsNorm { eps: 1e-6 }, &[x, fw], vec![1, h], F);

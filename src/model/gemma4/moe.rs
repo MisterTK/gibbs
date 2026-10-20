@@ -202,7 +202,7 @@ impl MoeBlock {
         );
         let router_in = g.add(
             format!("{p}.router_in"),
-            Op::Mul,
+            Op::Binary { kind: crate::graph::BinaryKind::Mul },
             &[unit, scale_w],
             vec![n, h],
             f,
@@ -260,7 +260,7 @@ impl MoeBlock {
             );
             weights = g.add(
                 format!("{p}.route_w_scaled"),
-                Op::Mul,
+                Op::Binary { kind: crate::graph::BinaryKind::Mul },
                 &[weights, per_slot],
                 vec![n, k],
                 f,
@@ -340,7 +340,7 @@ impl MoeBlock {
         );
         let weighted = g.add(
             format!("{p}.expert_weighted"),
-            Op::Mul,
+            Op::Binary { kind: crate::graph::BinaryKind::Mul },
             &[down, w_col],
             vec![n * k, h],
             f,
@@ -368,7 +368,7 @@ impl MoeBlock {
         let sparse = norm(g, w, "post_ff_ln_2", routed, &self.post_norm_2);
         g.add(
             format!("{p}.ffn_sum"),
-            Op::Add,
+            Op::Binary { kind: crate::graph::BinaryKind::Add },
             &[dense, sparse],
             vec![n, h],
             f,

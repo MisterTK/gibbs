@@ -530,7 +530,7 @@ mod tests {
         let k = g.add("k", Op::Linear, &[norm, w_k], vec![1, 32], DType::F32);
         let v = g.add("v", Op::Linear, &[norm, w_v], vec![1, 32], DType::F32);
 
-        let out = g.add("out_add", Op::Add, &[k, v], vec![1, 32], DType::F32);
+        let out = g.add("out_add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[k, v], vec![1, 32], DType::F32);
         g.output(q);
         g.output(out);
 

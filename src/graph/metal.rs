@@ -400,24 +400,13 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::Slice { .. }
         | Op::CausalConv1dCached { .. }
         | Op::DeltaRule { .. }
-        | Op::Add
-        | Op::Mul
         | Op::Softmax { .. }
         | Op::MeanPool
         | Op::Conv2d { .. }
         | Op::RelPosBias { .. }
         | Op::StateReorder
         | Op::L2Normalize => dtype == DType::F32,
-        Op::Silu => dtype == DType::F32,
-        Op::Unary { kind } => match kind {
-            crate::graph::UnaryKind::SoftCap(_)
-            | crate::graph::UnaryKind::Sigmoid
-            | crate::graph::UnaryKind::Softplus => dtype == DType::F32,
-            _ => false,
-        },
-        Op::Gelu { .. } => dtype == DType::F32,
-        // The Attention megakernel has no Metal step (`plan` rejects it), so only the MLP kind is lowered.
-        Op::Megakernel(d) if matches!(d.kind, crate::graph::MegakernelKind::Mlp { .. }) => {
+        Op::Megakernel(_) => {
             matches!(
                 dtype,
                 DType::F32
@@ -5925,9 +5914,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                         n,
                     )
                 }
-                crate::graph::MegakernelKind::Attention { .. } => {
-                    return Err("Metal executor: Attention megakernel not supported".into());
-                }
             },
             op => {
                 return Err(format!(
@@ -6735,218 +6721,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Emits a tailored MSL kernel function for a fused Megakernel block based on hardware parameters.
-pub fn generate_megakernel_msl(
-    block: &crate::graph::MegakernelDescriptor,
-    is_bf16: bool,
-    _hw: &crate::hardware::HardwareProfile,
-) -> String {
-    match &block.kind {
-        crate::graph::MegakernelKind::Mlp {
-            hidden_dim,
-            intermediate_dim,
-            eps,
-            is_geglu,
-            has_post_norm,
-        } => {
-            let func_name = block.name.replace('.', "_");
-            let weight_type = if is_bf16 { "ushort" } else { "float" };
-            let load_gate = if is_bf16 {
-                "as_type<float>((uint)gate_w[(ulong)j * HIDDEN + k] << 16)"
-            } else {
-                "gate_w[(ulong)j * HIDDEN + k]"
-            };
-            let load_up = if is_bf16 {
-                "as_type<float>((uint)up_w[(ulong)j * HIDDEN + k] << 16)"
-            } else {
-                "up_w[(ulong)j * HIDDEN + k]"
-            };
-            let load_down = if is_bf16 {
-                "as_type<float>((uint)down_w[(ulong)h_out * INTER + j] << 16)"
-            } else {
-                "down_w[(ulong)h_out * INTER + j]"
-            };
-            let act_code = if *is_geglu {
-                "float act = (0.5f * g_acc * (1.0f + tanh(0.7978845608f * (g_acc + 0.044715f * g_acc * g_acc * g_acc)))) * u_acc;"
-            } else {
-                "float sig = 1.0f / (1.0f + exp(-g_acc));\n            float act = (g_acc * sig) * u_acc;"
-            };
-
-            if *has_post_norm {
-                format!(
-                    r#"#include <metal_stdlib>
-using namespace metal;
-
-kernel void {func_name}(
-    device const float* in_x [[buffer(0)]],
-    device const float* norm_w [[buffer(1)]],
-    device const {weight_type}* gate_w [[buffer(2)]],
-    device const {weight_type}* up_w [[buffer(3)]],
-    device const {weight_type}* down_w [[buffer(4)]],
-    device const float* post_norm_w [[buffer(5)]],
-    device float* out_x [[buffer(6)]],
-    uint tid [[thread_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
-{{
-    constant uint HIDDEN = {hidden_dim}u;
-    constant uint INTER = {intermediate_dim}u;
-    constant float EPS = {eps}f;
-
-    // 1. RMSNorm of in_x
-    float sum_sq = 0.0f;
-    for (uint i = 0; i < HIDDEN; ++i) {{
-        float val = in_x[i];
-        sum_sq += val * val;
-    }}
-    float rsqrt_val = rsqrt(sum_sq / float(HIDDEN) + EPS);
-    threadgroup float act_cache[{hidden_dim}];
-    for (uint i = tid; i < HIDDEN; i += tg_size) {{
-        act_cache[i] = in_x[i] * rsqrt_val * norm_w[i];
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 2. Each thread computes down_acc
-    threadgroup float down_cache[{hidden_dim}];
-    for (uint h_out = tid; h_out < HIDDEN; h_out += tg_size) {{
-        float down_acc = 0.0f;
-        for (uint j = 0; j < INTER; ++j) {{
-            float g_acc = 0.0f;
-            float u_acc = 0.0f;
-            for (uint k = 0; k < HIDDEN; ++k) {{
-                float x_norm = act_cache[k];
-                g_acc += x_norm * {load_gate};
-                u_acc += x_norm * {load_up};
-            }}
-            {act_code}
-            down_acc += act * {load_down};
-        }}
-        down_cache[h_out] = down_acc;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 3. Post-down RMSNorm and residual add
-    float sum_sq_down = 0.0f;
-    for (uint i = 0; i < HIDDEN; ++i) {{
-        float v = down_cache[i];
-        sum_sq_down += v * v;
-    }}
-    float rsqrt_down = rsqrt(sum_sq_down / float(HIDDEN) + EPS);
-    for (uint i = tid; i < HIDDEN; i += tg_size) {{
-        out_x[i] = in_x[i] + down_cache[i] * rsqrt_down * post_norm_w[i];
-    }}
-}}
-"#
-                )
-            } else {
-                format!(
-                    r#"#include <metal_stdlib>
-using namespace metal;
-
-kernel void {func_name}(
-    device const float* in_x [[buffer(0)]],
-    device const float* norm_w [[buffer(1)]],
-    device const {weight_type}* gate_w [[buffer(2)]],
-    device const {weight_type}* up_w [[buffer(3)]],
-    device const {weight_type}* down_w [[buffer(4)]],
-    device float* out_x [[buffer(5)]],
-    uint tid [[thread_position_in_grid]],
-    uint tg_size [[threads_per_threadgroup]])
-{{
-    constant uint HIDDEN = {hidden_dim}u;
-    constant uint INTER = {intermediate_dim}u;
-    constant float EPS = {eps}f;
-
-    // 1. RMSNorm of in_x
-    float sum_sq = 0.0f;
-    for (uint i = 0; i < HIDDEN; ++i) {{
-        float val = in_x[i];
-        sum_sq += val * val;
-    }}
-    float rsqrt_val = rsqrt(sum_sq / float(HIDDEN) + EPS);
-    threadgroup float act_cache[{hidden_dim}];
-    for (uint i = tid; i < HIDDEN; i += tg_size) {{
-        act_cache[i] = in_x[i] * rsqrt_val * norm_w[i];
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 2. Each thread computes a slice of output elements
-    for (uint h_out = tid; h_out < HIDDEN; h_out += tg_size) {{
-        float down_acc = 0.0f;
-        for (uint j = 0; j < INTER; ++j) {{
-            float g_acc = 0.0f;
-            float u_acc = 0.0f;
-            for (uint k = 0; k < HIDDEN; ++k) {{
-                float x_norm = act_cache[k];
-                g_acc += x_norm * {load_gate};
-                u_acc += x_norm * {load_up};
-            }}
-            {act_code}
-            down_acc += act * {load_down};
-        }}
-        out_x[h_out] = in_x[h_out] + down_acc;
-    }}
-}}
-"#
-                )
-            }
-        }
-        crate::graph::MegakernelKind::Attention { hidden_dim, .. } => {
-            let func_name = block.name.replace('.', "_");
-            format!(
-                r#"#include <metal_stdlib>
-using namespace metal;
-
-kernel void {func_name}(
-    device const float* in_x [[buffer(0)]],
-    device const float* norm_w [[buffer(1)]],
-    device const void* o_w [[buffer(2)]],
-    device float* out_x [[buffer(3)]],
-    uint tid [[thread_position_in_grid]])
-{{
-    constant uint HIDDEN = {hidden_dim}u;
-    if (tid < HIDDEN) {{
-        out_x[tid] = in_x[tid];
-    }}
-}}
-"#
-            )
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn get_or_compile_megakernel(
-    device: &metal::DeviceRef,
-    desc: &crate::graph::MegakernelDescriptor,
-    is_bf16: bool,
-    hw: &crate::hardware::HardwareProfile,
-) -> Result<metal::ComputePipelineState, String> {
-    let source = generate_megakernel_msl(desc, is_bf16, hw);
-    let hash = fnv1a(source.as_bytes());
-    let func_name = desc.name.replace('.', "_");
-
-    let cache_dir = crate::hardware::default_cache_dir()
-        .map_err(|e| e.to_string())?
-        .join("kernels");
-    let _ = std::fs::create_dir_all(&cache_dir);
-    let cache_path = cache_dir.join(format!("{hash:016x}.metallib"));
-
-    let opts = metal::CompileOptions::new();
-    opts.set_fast_math_enabled(false);
-    let lib = device
-        .new_library_with_source(&source, &opts)
-        .map_err(|e| format!("MSL megakernel compilation failed: {e}\nSource:\n{source}"))?;
-    let func = lib
-        .get_function(&func_name, None)
-        .map_err(|e| format!("MSL function '{func_name}' not found: {e}"))?;
-    let pso = device
-        .new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| format!("PSO creation failed for '{func_name}': {e}"))?;
-
-    let _ = std::fs::write(&cache_path, source.as_bytes());
-    Ok(pso)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7036,11 +6810,11 @@ mod tests {
                     let lin = g.add("lin", Op::Linear, &ins, vec![m, n], f);
                     let out = match case {
                         0 | 1 => lin,
-                        2 => g.add("gelu", Op::Gelu { tanh: false }, &[lin], vec![m, n], f),
-                        3 => g.add("res", Op::Add, &[r, lin], vec![m, n], f),
+                        2 => g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[lin], vec![m, n], f),
+                        3 => g.add("res", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, lin], vec![m, n], f),
                         _ => {
-                            let a = g.add("gelu", Op::Gelu { tanh: false }, &[lin], vec![m, n], f);
-                            g.add("sum", Op::Add, &[a, lin], vec![m, n], f)
+                            let a = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[lin], vec![m, n], f);
+                            g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, lin], vec![m, n], f)
                         }
                     };
                     g.output(out);
@@ -7070,7 +6844,7 @@ mod tests {
             let x = g.input("x", vec![m, k], f);
             let wv = g.weight("w", vec![n, k], bf);
             let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
-            let silu = g.add("silu", Op::Silu, &[lin], vec![m, n], f);
+            let silu = g.add("silu", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[lin], vec![m, n], f);
             g.output(silu);
 
             w.insert("w", Tensor::BF16(bf_weights.clone()));
@@ -7085,7 +6859,7 @@ mod tests {
             let x = g.input("x", vec![m, k], f);
             let wv = g.weight("w", vec![n, k], bf);
             let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
-            let gelu = g.add("gelu", Op::Gelu { tanh: false }, &[lin], vec![m, n], f);
+            let gelu = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[lin], vec![m, n], f);
             g.output(gelu);
 
             w.insert("w", Tensor::BF16(bf_weights.clone()));
@@ -7124,7 +6898,7 @@ mod tests {
         let w1 = g.weight("w1", vec![n, k], f);
         let w2 = g.weight("w2", vec![k, n], f);
         let l1 = g.add("l1", Op::Linear, &[x, w1], vec![m, n], f);
-        let a1 = g.add("a1", Op::Gelu { tanh: false }, &[l1], vec![m, n], f);
+        let a1 = g.add("a1", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[l1], vec![m, n], f);
         let l2 = g.add("l2", Op::Linear, &[a1, w2], vec![m, k], f);
         g.output(l2);
 
@@ -7178,7 +6952,7 @@ mod tests {
         // GELU over [-8, 8]: the f32 erf fit tracks the CPU's f64 one.
         let mut g = Graph::new();
         let x = g.input("x", vec![1601], f);
-        let y = g.add("gelu", Op::Gelu { tanh: false }, &[x], vec![1601], f);
+        let y = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[x], vec![1601], f);
         g.output(y);
         let xs: Vec<f32> = (0..1601).map(|i| i as f32 / 100.0 - 8.0).collect();
         let (want, got) = both(&g, &Weights::new(), vec![Tensor::F32(xs)], None);
@@ -7238,7 +7012,7 @@ mod tests {
             );
             let e1 = g.add("e1", Op::Embedding, &[t1, ids], vec![5, 6], f);
             let e2 = g.add("e2", Op::Embedding, &[t2, pos], vec![5, 6], f);
-            let s = g.add("sum", Op::Add, &[e1, e2], vec![5, 6], f);
+            let s = g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[e1, e2], vec![5, 6], f);
             let p = g.add("pool", Op::MeanPool, &[s, mv], vec![6], f);
             let o = g.add("l2", Op::L2Normalize, &[p], vec![6], f);
             g.output(o);
@@ -7332,13 +7106,13 @@ mod tests {
         };
         let o = g.add("attn", att, &[q, k, v, ks, vs, pos], vec![1, nh * hd], f);
         let o = g.add("o", Op::Linear, &[o, wo], vec![1, h], f);
-        let x1 = g.add("res1", Op::Add, &[x0, o], vec![1, h], f);
+        let x1 = g.add("res1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x0, o], vec![1, h], f);
         let b = g.add("b", eps, &[x1, g2], vec![1, h], f);
         let gate = g.add("gate", Op::Linear, &[b, wg], vec![1, ff], f);
         let up = g.add("up", Op::Linear, &[b, wu], vec![1, ff], f);
         let act = g.add("act", Op::GeGlu, &[gate, up], vec![1, ff], f);
         let d = g.add("down", Op::Linear, &[act, wd], vec![1, h], f);
-        let out = g.add("res2", Op::Add, &[x1, d], vec![1, h], f);
+        let out = g.add("res2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x1, d], vec![1, h], f);
         g.output(out);
 
         let s = Session::new(rt(), &w).unwrap();
@@ -7378,9 +7152,9 @@ mod tests {
         let x = g.input("x", vec![2, 4], f);
         let gv = g.weight("g", vec![4], f);
         let a = g.add("a", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![2, 4], f);
-        let b = g.add("b", Op::Silu, &[x], vec![2, 4], f);
+        let b = g.add("b", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[x], vec![2, 4], f);
         let c = g.add("c", Op::RmsNorm { eps: 1e-5 }, &[a, gv], vec![2, 4], f);
-        let d = g.add("d", Op::Add, &[b, c], vec![2, 4], f);
+        let d = g.add("d", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[b, c], vec![2, 4], f);
         g.output(d);
         let norm = |x, out, extra_outs: Vec<ValueId>, reads| Planned {
             name: String::new(),
@@ -7571,7 +7345,7 @@ mod tests {
             vec![1, h],
             f,
         );
-        let x = g.add("res_attn", Op::Add, &[res0, attn_norm], vec![1, h], f);
+        let x = g.add("res_attn", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[res0, attn_norm], vec![1, h], f);
         let ff_in = g.add(
             "pre_ff_ln",
             Op::RmsNorm { eps: 1e-6 },
@@ -7590,7 +7364,7 @@ mod tests {
             vec![1, h],
             f,
         );
-        let out = g.add("res_ff", Op::Add, &[x, down_norm], vec![1, h], f);
+        let out = g.add("res_ff", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down_norm], vec![1, h], f);
         g.output(out);
         crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp);
 
@@ -7693,7 +7467,7 @@ mod tests {
         let norm = g.add("norm", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![2, 4], f);
         let swiglu = g.add("swiglu", Op::SwiGlu, &[norm, u_val], vec![2, 4], f);
         let geglu = g.add("geglu", Op::GeGlu, &[norm, u_val], vec![2, 4], f);
-        let out = g.add("sum", Op::Add, &[swiglu, geglu], vec![2, 4], f);
+        let out = g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[swiglu, geglu], vec![2, 4], f);
         g.output(out);
 
         let mut w = Weights::new();
@@ -7716,10 +7490,10 @@ mod tests {
         let r = g.input("r", vec![3, 4], f);
         let gv = g.weight("g", vec![4], f);
         let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![3, 4], f);
-        let s1 = g.add("s1", Op::Add, &[r, n1], vec![3, 4], f);
+        let s1 = g.add("s1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, n1], vec![3, 4], f);
         let n2 = g.add("n2", Op::RmsNorm { eps: 1e-5 }, &[s1, gv], vec![3, 4], f);
-        let s2 = g.add("s2", Op::Add, &[n2, s1], vec![3, 4], f);
-        let o = g.add("o", Op::Mul, &[n2, s2], vec![3, 4], f);
+        let s2 = g.add("s2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[n2, s1], vec![3, 4], f);
+        let o = g.add("o", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[n2, s2], vec![3, 4], f);
         g.output(o);
         let (steps, _) = plan(&g).unwrap();
         // n1+s1 fuse; n2 has two readers (s2 and o), so it and s2 stay separate: norm, norm, add, mul.
@@ -7749,10 +7523,10 @@ mod tests {
         let g2 = g.weight("g2", vec![8], f);
         let sc = g.weight("sc", vec![1], f);
         let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[x, g1], vec![2, 8], f);
-        let a1 = g.add("a1", Op::Add, &[r, n1], vec![2, 8], f);
-        let m1 = g.add("m1", Op::Mul, &[a1, sc], vec![2, 8], f);
+        let a1 = g.add("a1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, n1], vec![2, 8], f);
+        let m1 = g.add("m1", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[a1, sc], vec![2, 8], f);
         let n2 = g.add("n2", Op::RmsNorm { eps: 1e-6 }, &[m1, g2], vec![2, 8], f);
-        let out = g.add("out", Op::Mul, &[m1, n2], vec![2, 8], f);
+        let out = g.add("out", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[m1, n2], vec![2, 8], f);
         g.output(out);
 
         let mut w = Weights::new();
@@ -8148,7 +7922,7 @@ mod tests {
                         DType::F32,
                     );
                 }
-                let out = g.add("add", Op::Add, &[x, down], vec![1, hidden], DType::F32);
+                let out = g.add("add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down], vec![1, hidden], DType::F32);
                 g.output(out);
                 let unfused = g.clone();
                 assert_eq!(
@@ -8367,7 +8141,7 @@ mod tests {
                 let wv = g.weight("w", vec![n, k], DType::BF16);
                 let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], DType::F32);
                 let y = match act {
-                    0 => g.add("a", Op::Silu, &[lin], vec![m, n], DType::F32),
+                    0 => g.add("a", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[lin], vec![m, n], DType::F32),
                     1 => g.add("a", Op::SwiGlu, &[lin, up], vec![m, n], DType::F32),
                     _ => g.add("a", Op::GeGlu, &[lin, up], vec![m, n], DType::F32),
                 };
@@ -8487,7 +8261,7 @@ mod tests {
             vec![m, n],
             DType::F32,
         );
-        let y_res = g.add("res_add", Op::Add, &[y, res_in], vec![m, n], DType::F32);
+        let y_res = g.add("res_add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[y, res_in], vec![m, n], DType::F32);
         g.output(y_res);
 
         let n_blocks = n * (k / 32);
@@ -8996,7 +8770,7 @@ mod tests {
         let y_lin = g.add("lin", Op::Linear, &[x, w], vec![m, out_f], DType::F32);
         let y = g.add(
             "res_add",
-            Op::Add,
+            Op::Binary { kind: crate::graph::BinaryKind::Add },
             &[y_lin, res_in],
             vec![m, out_f],
             DType::F32,
@@ -9394,7 +9168,7 @@ mod tests {
         let f = DType::F32;
         let s = Session::new(rt(), &Weights::new()).unwrap();
         // Relu lowers at F32 only; a u32 value has no kernel.
-        for op in [Op::Relu] {
+        for op in [Op::Unary { kind: crate::graph::UnaryKind::Relu }] {
             let mut g = Graph::new();
             let x = g.input("x", vec![4], DType::U32);
             let y = g.add("act", op, &[x], vec![4], DType::U32);
@@ -9426,7 +9200,7 @@ mod tests {
         let mut g = Graph::new();
         let a = g.input("a", vec![2], DType::U32);
         let b = g.input("b", vec![2], f);
-        let y = g.add("sum", Op::Add, &[a, b], vec![2], f);
+        let y = g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b], vec![2], f);
         g.output(y);
         let err = s
             .run(&g, vec![Tensor::U32(vec![1, 2]), Tensor::F32(vec![0.0; 2])])
@@ -9734,12 +9508,12 @@ mod tests {
         let step1 = g.add("step1", Op::Linear, &[v1, w1], vec![1, 64], DType::F32);
         let step2 = g.add(
             "step2",
-            Op::Gelu { tanh: false },
+            Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
             &[v2],
             vec![1, 64],
             DType::F32,
         );
-        let step3 = g.add("step3", Op::Add, &[step1, step2], vec![1, 64], DType::F32);
+        let step3 = g.add("step3", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[step1, step2], vec![1, 64], DType::F32);
 
         // Later large allocation to exercise arena reuse
         let w_huge = g.weight("w_huge", vec![1024, 64], DType::F32);
@@ -9793,10 +9567,10 @@ mod tests {
         );
 
         // Consume a and b AFTER the inter allocation
-        let add_a = g.add("add_a", Op::Add, &[a, inter_sub], vec![1, 64], DType::F32);
+        let add_a = g.add("add_a", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, inter_sub], vec![1, 64], DType::F32);
         let gelu_b = g.add(
             "gelu_b",
-            Op::Gelu { tanh: false },
+            Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
             &[b],
             vec![1, 64],
             DType::F32,
@@ -10792,7 +10566,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 f,
             );
             let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], f);
-            let weights_v = g.add("weights", Op::Mul, &[probs, sc], vec![m, top_k], f);
+            let weights_v = g.add("weights", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[probs, sc], vec![m, top_k], f);
             let gu = g.add(
                 "gu",
                 Op::MoeLinear { experts, top_k },
@@ -10839,7 +10613,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 vec![m * top_k, 1],
                 f,
             );
-            let weighted = g.add("weighted", Op::Mul, &[down, w_col], vec![m * top_k, h], f);
+            let weighted = g.add("weighted", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[down, w_col], vec![m * top_k, h], f);
             let slots = g.add(
                 "slots",
                 Op::Reshape {
@@ -11014,7 +10788,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let v_raw = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
             let v_out = g.add(
                 "v_biased",
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[v_raw, vb],
                 vec![1, rows1],
                 DType::F32,
@@ -11315,7 +11089,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let up = g.add("up", Op::Linear, &[ff_in, up_w], vec![1, inter], f);
         let act = g.add("act", Op::SwiGlu, &[gate, up], vec![1, inter], f);
         let down = g.add("down", Op::Linear, &[act, down_w], vec![1, h], f);
-        let out = g.add("res", Op::Add, &[x, down], vec![1, h], f);
+        let out = g.add("res", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down], vec![1, h], f);
         g.output(out);
         assert_eq!(
             crate::graph::egraph::fuse_rule(

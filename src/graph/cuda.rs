@@ -251,11 +251,8 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::GatherCols
         | Op::Softmax { .. }
         | Op::Attention { .. }
-        | Op::Add
-        | Op::Mul
-        | Op::Binary {
-            kind: super::BinaryKind::Mul,
-        }
+        | Op::Binary { kind: super::BinaryKind::Add }
+        | Op::Binary { kind: super::BinaryKind::Mul }
         | Op::Slice { .. }
         | Op::Reshape { .. }
         | Op::Reduce {
@@ -264,7 +261,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         }
         | Op::MeanPool
         | Op::L2Normalize => dtype == DType::F32,
-        Op::Gelu { tanh } => !*tanh && dtype == DType::F32,
+        Op::Unary { kind: crate::graph::UnaryKind::GeluErf } => dtype == DType::F32,
         _ => false,
     }
 }
@@ -432,16 +429,10 @@ pub fn plan_graph(g: &Graph) -> Result<Vec<CudaStep>, String> {
                                 if j > i && !fused[j] {
                                     let consumer = &g.nodes[j];
                                     match &consumer.op {
-                                        Op::Gelu { tanh: false }
-                                        | Op::Unary {
-                                            kind: super::UnaryKind::GeluErf,
-                                        } => {
+                                        Op::Unary { kind: super::UnaryKind::GeluErf } => {
                                             epi = CudaEpi::Gelu;
                                         }
-                                        Op::Silu
-                                        | Op::Unary {
-                                            kind: super::UnaryKind::Silu,
-                                        } => {
+                                        Op::Unary { kind: super::UnaryKind::Silu } => {
                                             epi = CudaEpi::Silu;
                                         }
                                         Op::SwiGlu if consumer.inputs.len() == 2 => {
@@ -486,10 +477,9 @@ pub fn plan_graph(g: &Graph) -> Result<Vec<CudaStep>, String> {
                                                 }
                                             }
                                         }
-                                        Op::Add
-                                        | Op::Binary {
-                                            kind: super::BinaryKind::Add,
-                                        } if consumer.inputs.len() == 2 => {
+                                        Op::Binary { kind: super::BinaryKind::Add }
+                                            if consumer.inputs.len() == 2 =>
+                                        {
                                             let r = if consumer.inputs[0] == out {
                                                 consumer.inputs[1]
                                             } else {
@@ -839,10 +829,7 @@ fn fuse_moe_subgraphs(g: &Graph, steps: &mut Vec<CudaStep>) {
                                 out: w_out,
                             } if matches!(
                                 op,
-                                Op::Mul
-                                    | Op::Binary {
-                                        kind: super::BinaryKind::Mul
-                                    }
+                                Op::Binary { kind: super::BinaryKind::Mul }
                             ) && inputs.len() == 2 =>
                             {
                                 let (a, b) = (inputs[0], inputs[1]);
@@ -959,10 +946,7 @@ fn fuse_moe_subgraphs(g: &Graph, steps: &mut Vec<CudaStep>) {
                     out: mul_out,
                 } if matches!(
                     op,
-                    Op::Mul
-                        | Op::Binary {
-                            kind: super::BinaryKind::Mul
-                        }
+                    Op::Binary { kind: super::BinaryKind::Mul }
                 ) && inputs.len() == 2
                     && single_use(mul_out) =>
                 {
@@ -1451,7 +1435,7 @@ mod tests {
         );
         let act_gelu = g.add(
             "act_gelu",
-            Op::Gelu { tanh: false },
+            Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
             &[lin_gelu],
             vec![1, 256],
             DType::F32,
@@ -1466,7 +1450,7 @@ mod tests {
         );
         let out_add = g.add(
             "out_add",
-            Op::Add,
+            Op::Binary { kind: crate::graph::BinaryKind::Add },
             &[lin_add, res_in],
             vec![1, 256],
             DType::F32,
@@ -1820,7 +1804,7 @@ mod tests {
                 let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], f);
                 let weights_v = g.add(
                     "weights",
-                    Op::Mul,
+                    Op::Binary { kind: crate::graph::BinaryKind::Mul },
                     &[probs, sc],
                     if with_w_col_reshape {
                         vec![m, top_k]
@@ -1881,7 +1865,7 @@ mod tests {
                 };
                 let weighted = g.add(
                     "weighted",
-                    Op::Mul,
+                    Op::Binary { kind: crate::graph::BinaryKind::Mul },
                     &[down, w_for_mul],
                     vec![m * top_k, d_in],
                     f,

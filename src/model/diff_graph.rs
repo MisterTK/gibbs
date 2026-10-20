@@ -172,22 +172,23 @@ impl Gb {
 
     pub fn silu(&mut self, x: V) -> V {
         let s = self.shape(x).to_vec();
-        self.op("silu", Op::Silu, &[x], &s)
+        self.op("silu", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[x], &s)
     }
 
     pub fn gelu(&mut self, x: V, tanh: bool) -> V {
         let s = self.shape(x).to_vec();
-        self.op("gelu", Op::Gelu { tanh }, &[x], &s)
+        let kind = if tanh { crate::graph::UnaryKind::GeluTanh } else { crate::graph::UnaryKind::GeluErf };
+        self.op("gelu", Op::Unary { kind }, &[x], &s)
     }
 
     pub fn add(&mut self, a: V, b: V) -> V {
         let s = self.shape(a).to_vec();
-        self.op("add", Op::Add, &[a, b], &s)
+        self.op("add", Op::Binary { kind: BinaryKind::Add }, &[a, b], &s)
     }
 
     pub fn mul(&mut self, a: V, b: V) -> V {
         let s = self.shape(a).to_vec();
-        self.op("mul", Op::Mul, &[a, b], &s)
+        self.op("mul", Op::Binary { kind: BinaryKind::Mul }, &[a, b], &s)
     }
 
     /// `a + b` with `b` broadcast (numpy rules) to `a`'s shape.

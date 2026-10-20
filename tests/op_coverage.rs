@@ -8,12 +8,7 @@ use gibbs_engine::graph::{
 };
 
 /// `(op key, dtype, reason)`; the reason is the avenue verdict text of the first rejected avenue.
-const KNOWN_UNLOWERED: &[(&str, &str, &str)] = &[
-    // The fused-attention megakernel is declared in the IR but the Metal planner has no step for it.
-    ("Megakernel::Attention", "F32", "no Metal kernel for Megakernel at F32"),
-    ("Megakernel::Attention", "F16", "no Metal kernel for Megakernel at F16"),
-    ("Megakernel::Attention", "BF16", "no Metal kernel for Megakernel at BF16"),
-];
+const KNOWN_UNLOWERED: &[(&str, &str, &str)] = &[];
 
 const DTYPES: [(DType, &str); 3] = [(DType::F32, "F32"), (DType::F16, "F16"), (DType::BF16, "BF16")];
 
@@ -44,32 +39,27 @@ fn ordinal(op: &Op) -> usize {
         Op::Upsample { .. } => 21,
         Op::Conv3d { .. } => 22,
         Op::MoeLinear { .. } => 23,
-        Op::Silu => 24,
-        Op::Gelu { .. } => 25,
-        Op::Relu => 26,
-        Op::Softmax { .. } => 27,
-        Op::TopK { .. } => 28,
-        Op::GatherCols => 46,
-        Op::RelPosBias { .. } => 29,
-        Op::StateReorder => 30,
-        Op::Add => 31,
-        Op::Mul => 32,
-        Op::Conv2d { .. } => 33,
-        Op::Conv1d { .. } => 34,
-        Op::Reshape { .. } => 35,
-        Op::Transpose { .. } => 36,
-        Op::Concat { .. } => 37,
-        Op::Slice { .. } => 38,
-        Op::Squeeze { .. } => 39,
-        Op::Unsqueeze { .. } => 40,
-        Op::Tile { .. } => 41,
-        Op::Reduce { .. } => 42,
-        Op::MeanPool => 43,
-        Op::L2Normalize => 44,
-        Op::Megakernel(_) => 45,
+        Op::Softmax { .. } => 24,
+        Op::TopK { .. } => 25,
+        Op::GatherCols => 41,
+        Op::RelPosBias { .. } => 26,
+        Op::StateReorder => 27,
+        Op::Conv2d { .. } => 28,
+        Op::Conv1d { .. } => 29,
+        Op::Reshape { .. } => 30,
+        Op::Transpose { .. } => 31,
+        Op::Concat { .. } => 32,
+        Op::Slice { .. } => 33,
+        Op::Squeeze { .. } => 34,
+        Op::Unsqueeze { .. } => 35,
+        Op::Tile { .. } => 36,
+        Op::Reduce { .. } => 37,
+        Op::MeanPool => 38,
+        Op::L2Normalize => 39,
+        Op::Megakernel(_) => 40,
     }
 }
-const VARIANTS: usize = 47;
+const VARIANTS: usize = 42;
 
 /// Key used in `KNOWN_UNLOWERED`: the op name, plus the kind for ops whose support varies by kind.
 fn key(op: &Op) -> String {
@@ -77,10 +67,8 @@ fn key(op: &Op) -> String {
         Op::Unary { kind } => format!("Unary::{kind:?}"),
         Op::Binary { kind } => format!("Binary::{kind:?}"),
         Op::Reduce { kind, .. } => format!("Reduce::{kind:?}"),
-        Op::Gelu { tanh } => format!("Gelu::{}", if *tanh { "tanh" } else { "erf" }),
         Op::Megakernel(d) => match d.kind {
             MegakernelKind::Mlp { .. } => "Megakernel::Mlp".to_string(),
-            MegakernelKind::Attention { .. } => "Megakernel::Attention".to_string(),
         },
         other => other.name().to_string(),
     }
@@ -124,16 +112,10 @@ fn all_ops() -> Vec<Op> {
         Op::Conv3d { stride: [1, 1, 1], padding: [0, 0, 1, 1, 1, 1], dilation: [1, 1, 1], groups: 1 },
         Op::MoeLinear { experts: 4, top_k: 2 },
         Op::GatherCols,
-        Op::Silu,
-        Op::Gelu { tanh: true },
-        Op::Gelu { tanh: false },
-        Op::Relu,
         Op::Softmax { axis: -1 },
         Op::TopK { k: 2 },
         Op::RelPosBias { buckets: 32, max_distance: 128, bidirectional: true, heads: 2 },
         Op::StateReorder,
-        Op::Add,
-        Op::Mul,
         Op::Conv2d { stride: [1, 1], padding: [1, 1, 1, 1], dilation: [1, 1], groups: 1 },
         Op::Conv1d { stride: 1, padding: [1, 1], dilation: 1, groups: 1 },
         Op::Reshape { shape: Some(vec![2, 2]) },
@@ -166,12 +148,6 @@ fn all_ops() -> Vec<Op> {
     for kind in [ReduceKind::Sum, ReduceKind::Mean, ReduceKind::Max, ReduceKind::Min] {
         ops.push(Op::Reduce { kind, axes: vec![-1], keep_dims: true });
     }
-    ops.push(Op::Megakernel(MegakernelDescriptor {
-        kind: MegakernelKind::Attention {
-            hidden_dim: 64, heads: 2, kv_heads: 2, head_dim: 16, eps: 1e-6, is_delta: false,
-        },
-        name: "attn".into(),
-    }));
     ops
 }
 

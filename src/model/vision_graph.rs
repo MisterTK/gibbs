@@ -76,7 +76,7 @@ impl Gb {
     }
 
     pub fn add(&mut self, name: &str, a: ValueId, b: ValueId, shape: Vec<usize>) -> ValueId {
-        self.op(name, Op::Add, &[a, b], shape)
+        self.op(name, Op::Binary { kind: BinaryKind::Add }, &[a, b], shape)
     }
 
     /// `x [rows, in]` · `w [out, in]`ᵀ (+ `bias`).

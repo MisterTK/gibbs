@@ -1293,7 +1293,7 @@ impl GraphLm {
                 vec![n, h],
                 DType::F32,
             );
-            x = g.add("model.embed", Op::Add, &[x, p], vec![n, h], DType::F32);
+            x = g.add("model.embed", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, p], vec![n, h], DType::F32);
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -1391,7 +1391,7 @@ impl GraphLm {
                 let kernel = taps.len() / h;
                 let bx = g.add(
                     format!("{p}.conv.bx"),
-                    Op::Mul,
+                    Op::Binary { kind: crate::graph::BinaryKind::Mul },
                     &[q, vv],
                     vec![n, h],
                     DType::F32,
@@ -1423,7 +1423,7 @@ impl GraphLm {
                 );
                 g.add(
                     format!("{p}.conv.gate"),
-                    Op::Mul,
+                    Op::Binary { kind: crate::graph::BinaryKind::Mul },
                     &[k, conv],
                     vec![n, h],
                     DType::F32,
@@ -1511,7 +1511,7 @@ impl GraphLm {
             }
             let x_attn = g.add(
                 format!("{p}.residual_1"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x, o],
                 vec![n, h],
                 DType::F32,
@@ -1540,7 +1540,7 @@ impl GraphLm {
             let act = if c.use_gelu_mlp {
                 g.add(
                     format!("{p}.mlp.act"),
-                    Op::Gelu { tanh: true },
+                    Op::Unary { kind: crate::graph::UnaryKind::GeluTanh },
                     &[up],
                     vec![n, inter],
                     DType::F32,
@@ -1582,7 +1582,7 @@ impl GraphLm {
             }
             x = g.add(
                 format!("{p}.residual_2"),
-                Op::Add,
+                Op::Binary { kind: crate::graph::BinaryKind::Add },
                 &[x_attn, d],
                 vec![n, h],
                 DType::F32,
