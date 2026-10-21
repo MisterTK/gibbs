@@ -227,7 +227,7 @@ impl SpecLm {
             }
         }
         let weights = model.store.materialize(&decode.weights)?;
-        let program = GraphProgram::compile(decode.graph.clone(), weights, mode)?;
+        let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
         let streams = recurrent.is_empty()
             && decode.output_index("logits") == Some(0)

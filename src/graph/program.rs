@@ -128,10 +128,28 @@ impl GraphProgram {
     /// `GIBBS_PLAN_DUMP_CPU=<ctx>`: a Metal compile prints [`crate::graph::metal::plan_dump`] at
     /// context length `ctx` (`1` when not a number) to stdout and fails with [`PLAN_DUMPED`]
     /// before any device, weight upload or tuning.
-    pub fn compile(
+    pub fn compile(graph: Graph, weights: Weights, mode: PlacementMode) -> Result<Self, String> {
+        Self::compile_with(graph, weights, mode, false)
+    }
+
+    /// [`Self::compile`] for a network that also runs other instance shapes through
+    /// [`Self::run_reshaped`]: weights the fusion passes fold into fused tensors (q/k/v, gate/up
+    /// concatenations) stay bound beside them, so unfused instances still find them.
+    // ponytail: folded originals stay resident next to their fused copy (only unpacked f32/f16
+    // tensors fold); fuse reshaped instances the same way if that memory matters.
+    pub fn compile_reshapable(
+        graph: Graph,
+        weights: Weights,
+        mode: PlacementMode,
+    ) -> Result<Self, String> {
+        Self::compile_with(graph, weights, mode, true)
+    }
+
+    fn compile_with(
         mut graph: Graph,
         mut weights: Weights,
         mode: PlacementMode,
+        keep_folded: bool,
     ) -> Result<Self, String> {
         let _compiling = CompileGuard::enter();
         #[cfg(test)]
@@ -140,6 +158,7 @@ impl GraphProgram {
         // Phase-4 plan search re-extracts fusions from the graph before fusion.
         #[cfg(target_os = "macos")]
         let search_base = crate::graph::search::enabled().then(|| (graph.clone(), weights.clone()));
+        let unfused = keep_folded.then(|| weights.clone());
         crate::graph::passes::fuse(&mut graph, Some(&mut weights))?;
         let dump: Option<usize> = std::env::var("GIBBS_PLAN_DUMP_CPU")
             .ok()
@@ -156,6 +175,13 @@ impl GraphProgram {
             let rt = crate::graph::metal::Runtime::shared()?;
             if let Some(s) = searched(&rt, base, mode, &available) {
                 (graph, weights, plan) = s;
+            }
+        }
+        if let Some(unfused) = &unfused {
+            for (name, t) in unfused.iter() {
+                if weights.get(name).is_none() {
+                    weights.insert(name, t.clone());
+                }
             }
         }
         let primary_device = plan.primary_device();
@@ -176,8 +202,8 @@ impl GraphProgram {
             #[cfg(target_os = "macos")]
             Device::Metal if !plan.segments.is_empty() => {
                 let rt = crate::graph::metal::Runtime::shared()?;
-                let session =
-                    crate::graph::metal::Session::new_for_graph(rt, &weights, Some(&graph))?;
+                let active = (!keep_folded).then_some(&graph);
+                let session = crate::graph::metal::Session::new_for_graph(rt, &weights, active)?;
                 let prepared_plan = session.prepare_plan(&graph)?;
                 CompiledSegment::Metal {
                     graph,
