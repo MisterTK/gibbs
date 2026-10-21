@@ -2671,7 +2671,7 @@ fn attention_general(
 }
 
 /// HF `_relative_position_bucket` of `rel = key_pos - query_pos` (f32 log with an f64 scale,
-/// truncated), identical to `model::t5` `bucket`. Needs `buckets / 2 >= 2` per direction and
+/// truncated), as transformers' `_relative_position_bucket`. Needs `buckets / 2 >= 2` per direction and
 /// `max_distance > exact` (checked by the caller).
 pub(crate) fn rel_pos_bucket(
     rel: i64,
