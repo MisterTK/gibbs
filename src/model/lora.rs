@@ -304,4 +304,40 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// FLUX LoRA key forms (ported from the deleted `flux.rs` test): PEFT/diffusers keys on
+    /// diffusers names, kohya keys on a BFL-named base (resolved through the `bfl` renames).
+    #[test]
+    fn flux_lora_keys_resolve() {
+        use crate::arch::testing::{artifacts, Weights};
+        use crate::arch::{load, registry, Registry};
+        let dir = std::env::temp_dir().join(format!("gibbs-lora-flux-{}", std::process::id()));
+        let mut w = Weights::new(5);
+        w.w("double_blocks.0.img_attn.qkv.weight", &[6, 2])
+            .w("single_blocks.0.linear1.weight", &[6, 2])
+            .w("single_transformer_blocks.3.proj_mlp.weight", &[4, 2])
+            .w("transformer_blocks.2.ff_context.net.0.proj.weight", &[4, 2]);
+        w.write_checkpoint(&dir.join("base"), &serde_json::json!({"model_type": "toy"}), 4);
+        let mut l = Weights::new(6);
+        for (m, out) in [
+            ("lora_unet_double_blocks_0_img_attn_qkv", 6),
+            ("lora_unet_single_blocks_0_linear1", 6),
+            ("transformer.single_transformer_blocks.3.proj_mlp", 4),
+            ("transformer.transformer_blocks.2.ff_context.net.0.proj", 4),
+        ] {
+            l.w(&format!("{m}.lora_down.weight"), &[1, 2]).w(&format!("{m}.lora_up.weight"), &[out, 1]);
+        }
+        l.write_checkpoint(&dir.join("lora"), &serde_json::json!({}), 4);
+        let bfl = registry().unwrap().name_set("bfl").unwrap();
+        let spec = format!(
+            r#"{{family: "toy", pipeline: "diffusion", match: {{hf_model_type: ["toy"]}}, names: {{rules: {}}}, components: {{}}}}"#,
+            serde_json::to_string(&bfl).unwrap()
+        );
+        let reg = Registry::from_files(&[("families/toy.json5".into(), spec)], &[]).unwrap();
+        let mut m = load::load(&artifacts(&dir.join("base")), &reg, None).unwrap();
+        let f = LoraFile::open(&dir.join("lora/model.safetensors")).unwrap();
+        // `apply` errors on any module that matches no weight: 4 = every key form resolved.
+        assert_eq!(f.apply(Part::Denoiser, &mut m, &reg, 1.0).unwrap(), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }
