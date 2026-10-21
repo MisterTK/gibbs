@@ -169,6 +169,7 @@ pub fn load_for_bench(
             reencode: cfg,
             family: None,
             stage: &|_| {},
+            admit: &|_| Ok(()),
         },
     )?;
     let (policy, saved_bytes) = match &choice {
@@ -493,6 +494,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 reencode: crate::model::weight_format::ReencodeConfig::effective(),
                 family: None,
                 stage: &|_| {},
+                admit: &|_| Ok(()),
             };
             crate::arch::dispatch::load_lm(&artifacts, &opts).map(|(e, _)| match e {
                 crate::scheduler::ExecutableModel::Native(m) => Some(m),

@@ -151,6 +151,7 @@ fn load_lm(dir: &Path, dev: Device) -> ExecutableModel {
             reencode,
             family: None,
             stage: &|_| {},
+            admit: &|_| Ok(()),
         };
         let (m, _) = gibbs_engine::arch::dispatch::load_lm(&a, &opts).unwrap();
         assert!(matches!(m, ExecutableModel::Native(_)), "not a spec LM");

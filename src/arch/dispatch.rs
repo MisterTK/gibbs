@@ -45,6 +45,9 @@ pub struct LoadOpts<'a> {
     pub family: Option<&'a str>,
     /// Receives the stage the load is in, for progress text and failure records.
     pub stage: &'a dyn Fn(&'static str),
+    /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
+    /// adapter (merged into a snapshot of its base): an error refuses the load.
+    pub admit: &'a dyn Fn(bool) -> Result<(), String>,
 }
 
 /// `GIBBS_SPEC_LM=1`: causal LMs a family spec claims load through [`crate::runtime::lm`]
@@ -89,7 +92,8 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
         "downloading"
     });
     // A PEFT LoRA CAUSAL_LM adapter becomes a merged snapshot of its base first.
-    crate::model::peft::prepare_causal_lm(hub, id, o.token)?;
+    let adapter = crate::model::peft::prepare_causal_lm(hub, id, o.token)?;
+    (o.admit)(adapter)?;
     let artifacts = hub.auto_download_and_cache(id, o.token)?;
     (o.stage)("reading weights, choosing weight format");
     // legacy: until Phase 9 (diffusion specs). Image repos are recognised by their files.

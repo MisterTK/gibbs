@@ -424,6 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reencode,
             family: cli.arch.as_deref(),
             stage: &|s| *stage.lock() = s,
+            admit: &|_| Ok(()),
         },
     )
     .map_err(|e| {

@@ -154,6 +154,7 @@ pub trait NativeLm: Send + Sync {
 
 /// `model_type`s [`load_native`] implements. The hub picker lets their repos load whatever their
 /// pipeline tag (`image-text-to-text`, `any-to-any`, ...).
+// legacy: until Phases 5 (qwen), 6 (gemma), 4 (idefics3) and 8 (t5) give these families specs.
 pub const NATIVE_MODEL_TYPES: &[&str] = &[
     "qwen3_5",
     "qwen3_5_text",
@@ -177,6 +178,7 @@ pub const NATIVE_MODEL_TYPES: &[&str] = &[
 /// `hunyuan-dense` / `qwen35` / `qwen35moe` / `qwen4exp` files ([`crate::model::qwen3_5::load_gguf`]),
 /// `gemma4` files with their `mmproj` ([`crate::model::gemma4::load_gguf`]) and candle-style T5
 /// GGUFs ([`crate::model::t5::load`]). The hub picker refuses GGUF repos of the other types.
+// legacy: until Phases 5, 6 and 8 (the same families' specs).
 pub const NATIVE_GGUF_TYPES: &[&str] = &[
     "gemma4",
     "gemma4_unified",

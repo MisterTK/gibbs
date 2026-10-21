@@ -1412,6 +1412,16 @@ impl TuiApp {
                     reencode: reencode_cfg.clone(),
                     family: None,
                     stage: &|s| *stage.lock() = s,
+                    // Only text generators (and PEFT adapters of them) and image models hot-swap.
+                    admit: &|adapter| match adapter
+                        || route_for_model(&id) == Route::Image
+                        || is_chat_model(&id)
+                    {
+                        true => Ok(()),
+                        false => Err(format!(
+                            "only text-generation, text-to-image models and text classifiers hot-swap; relaunch with `--model {id} --tui`"
+                        )),
+                    },
                 };
                 match crate::arch::load_model(&hub, &id, &o)? {
                     Loaded::Classifier(c) => {
