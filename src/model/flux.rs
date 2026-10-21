@@ -239,20 +239,6 @@ impl Store {
             }
         }
     }
-
-    /// `{name}.weight` (+ `{name}.bias` when stored) as one linear.
-    pub(crate) fn lin(&self, name: &str) -> Result<Lin, String> {
-        let w = self.mat(&format!("{name}.weight"))?;
-        let (n, k) = w.dims();
-        let b = format!("{name}.bias");
-        Ok(Lin {
-            bias: self.has(&b).then(|| self.vec(&b)).transpose()?,
-            parts: vec![(0, w)],
-            n,
-            k,
-            loras: Vec::new(),
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +266,6 @@ pub struct Lin {
 }
 
 impl Lin {
-    /// `(out, in)` features.
-    pub(crate) fn dims(&self) -> (usize, usize) {
-        (self.n, self.k)
-    }
-
     /// One stored matrix with its bias and the LoRAs taken for it.
     pub(crate) fn new(w: Wt, bias: Option<Vec<f32>>, loras: Vec<Lora>) -> Self {
         let (n, k) = w.dims();
@@ -295,14 +276,6 @@ impl Lin {
             k,
             loras,
         }
-    }
-
-    pub(crate) fn in_dim(&self) -> usize {
-        self.k
-    }
-
-    pub(crate) fn out_dim(&self) -> usize {
-        self.n
     }
 
     pub fn fwd(&self, x: &[f32], m: usize) -> Vec<f32> {
@@ -428,11 +401,6 @@ impl Loras {
             );
         }
         Ok(())
-    }
-
-    /// The bias delta of `module`, if the LoRA carries one.
-    pub(crate) fn take_bias(&mut self, module: &str) -> Option<Vec<f32>> {
-        self.bias.remove(&Self::key(module))
     }
 
     pub(crate) fn take(
@@ -1343,8 +1311,9 @@ impl FluxPipeline {
         }
         let store = Store::open(&tr_path)?;
         let tr = FluxTransformer::load(&store, &mut lora_set)?;
-        if !lora_set.by_module.is_empty() {
-            let mut left: Vec<&String> = lora_set.by_module.keys().collect();
+        // `diff_b` bias deltas are not applied here either.
+        if !lora_set.by_module.is_empty() || !lora_set.bias.is_empty() {
+            let mut left: Vec<&String> = lora_set.by_module.keys().chain(lora_set.bias.keys()).collect();
             left.sort();
             return Err(format!(
                 "LoRA targets {} modules this FLUX transformer does not have (e.g. {}); text-encoder LoRAs are not supported",

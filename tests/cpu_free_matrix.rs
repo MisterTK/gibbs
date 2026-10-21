@@ -470,7 +470,7 @@ fn gpu_fixture(f: Family) {
             gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
         }
         Family::Vae => {
-            // SD and Qwen-Image (x2) VAEs decode as Metal programs.
+            // The SD VAE decodes as a Metal program (the spec VAEs: the diffusion goldens).
             gibbs_engine::model::diff_fixtures::tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
         }
     }

@@ -409,7 +409,7 @@ fn text_zero_grid3(a: &Args) -> Result<Gen, String> {
 /// `caption_then_grid_padded`: U32 `(frame,row,col)` ids of a padded image grid
 /// (`grid_total` rows, the first `grid_len` real: `(text_total+1, t/grid_w, t%grid_w)`, pads 0)
 /// and padded caption tokens (`text_total` rows `(1+t, 0, 0)`). `part`: `grid`, `text` or `all`
-/// (default: grid then text). Source: `zimage.rs` `token_pos`.
+/// (default: grid then text).
 fn caption_then_grid_padded(a: &Args) -> Result<Gen, String> {
     let (wp, n_img, img_total, cap_total) =
         (a.u("grid_w")?, a.u("grid_len")?, a.u("grid_total")?, a.u("text_total")?);
@@ -432,7 +432,7 @@ fn caption_then_grid_padded(a: &Args) -> Result<Gen, String> {
     u32s(vec![v.len()], v)
 }
 
-/// Each axis shifted so its minimum is `min(0, min)`-based 0 (`qwen_image.rs` `rope_positions`).
+/// Each axis shifted so its minimum is `min(0, min)`-based 0.
 fn shift_nonneg(pos: &[[i32; 3]]) -> Vec<u32> {
     let lo = [0, 1, 2].map(|a| pos.iter().map(|p| p[a]).min().unwrap_or(0).min(0));
     pos.iter().flat_map(|p| [0, 1, 2].map(|a| (p[a] - lo[a]) as u32)).collect()
@@ -445,8 +445,7 @@ fn centered_grid(h: usize, w: usize, frame: i32) -> impl Iterator<Item = [i32; 3
 
 /// `centered_grid_text_after`: U32 `[(text_len + grid_h*grid_w) * 3]`: text `m+t` on all axes
 /// (`m = max(grid_h/2, grid_w/2)`), then the grid at frame 0 centred on zero; each axis shifted
-/// non-negative. Args: `text_len`, `grid_h`, `grid_w`. Source: `qwen_image_v1.rs` `positions` +
-/// `qwen_image.rs` `rope_positions`.
+/// non-negative. Args: `text_len`, `grid_h`, `grid_w`.
 fn centered_grid_text_after(a: &Args) -> Result<Gen, String> {
     let (nt, h, w) = (a.u("text_len")?, a.u("grid_h")?, a.u("grid_w")?);
     let m = (h / 2).max(w / 2) as i32;
@@ -456,7 +455,7 @@ fn centered_grid_text_after(a: &Args) -> Result<Gen, String> {
 }
 
 /// `text_then_centered_grid`: like `centered_grid_text_after` but text `t` on all axes and the
-/// grid at frame `text_len`. Source: `qwen_image21.rs` `t2i_positions` + `rope_positions`.
+/// grid at frame `text_len`.
 fn text_then_centered_grid(a: &Args) -> Result<Gen, String> {
     let (nt, h, w) = (a.u("text_len")?, a.u("grid_h")?, a.u("grid_w")?);
     let pos: Vec<[i32; 3]> = (0..nt as i32).map(|p| [p; 3]).chain(centered_grid(h, w, nt as i32)).collect();
@@ -737,7 +736,7 @@ fn causal_key_mask(a: &Args) -> Result<Gen, String> {
 
 /// `channel_dup_index`: U32 `[channels*4]` gather index of a channel-duplicating 2x upsample:
 /// output `co*4 + k` reads `((co*frames + frames-1)*4 + k) / repeats`. Args: `channels`,
-/// `repeats`, `frames`. Source: `qwen_vae21.rs` `dup_idx`.
+/// `repeats`, `frames`.
 fn channel_dup_index(a: &Args) -> Result<Gen, String> {
     let (c, rep, ft) = (a.u("channels")?, a.u("repeats")?, a.u("frames")?);
     if rep == 0 || ft == 0 {
@@ -1113,24 +1112,23 @@ mod tests {
                 let want = model::dit_graph::positions(&ids, if ax { [1, 2, 3] } else { [0, 1, 2] });
                 assert_eq!(u("text_zero_grid3", json!({"text_len": nt, "grid_h": h, "grid_w": w, "text_axis": ax})), want);
             }
-            for (wp, ni, it, ct) in [(3, 6, 32, 32), (2, 3, 5, 4)] {
-                let (img, cap) = model::zimage::token_pos(wp, ni, it, ct);
-                let fl = |v: &[[usize; 3]]| v.iter().flatten().map(|&x| x as u32).collect::<Vec<_>>();
+            // FNV-1a of the reference layouts' u32 ids (`zimage.rs` `token_pos`, `qwen_image_v1.rs`
+            // `positions` / `qwen_image21.rs` `t2i_positions` through `qwen_image.rs`
+            // `rope_positions`), pinned before their deletion: (all, grid, text) and (v1, 2.1).
+            let fnv_u = |v: &[u32]| v.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x100000001b3));
+            for ((wp, ni, it, ct), pin) in [((3, 6, 32, 32), PIN_CAPTION[0]), ((2, 3, 5, 4), PIN_CAPTION[1])] {
                 let a = json!({"grid_w": wp, "grid_len": ni, "grid_total": it, "text_total": ct});
-                assert_eq!(u("caption_then_grid_padded", a.clone()), fl(&[img.clone(), cap.clone()].concat()));
-                let mut g = a.clone();
-                g["part"] = json!("grid");
-                assert_eq!(u("caption_then_grid_padded", g), fl(&img));
-                let mut t = a;
-                t["part"] = json!("text");
-                assert_eq!(u("caption_then_grid_padded", t), fl(&cap));
+                let part = |p: &str| {
+                    let mut a = a.clone();
+                    a["part"] = json!(p);
+                    fnv_u(&u("caption_then_grid_padded", a))
+                };
+                assert_eq!((fnv_u(&u("caption_then_grid_padded", a.clone())), part("grid"), part("text")), pin);
             }
-            for (nt, h, w) in [(2, 4, 6), (1, 3, 5)] {
+            for ((nt, h, w), pin) in [((2, 4, 6), PIN_QWEN_POS[0]), ((1, 3, 5), PIN_QWEN_POS[1])] {
                 let args = json!({"text_len": nt, "grid_h": h, "grid_w": w});
-                let want = model::qwen_image::rope_positions(&model::qwen_image_v1::positions(nt, h, w));
-                assert_eq!(u("centered_grid_text_after", args.clone()), want);
-                let want = model::qwen_image::rope_positions(&model::qwen_image21::t2i_positions(nt, h, w));
-                assert_eq!(u("text_then_centered_grid", args), want);
+                let got = (fnv_u(&u("centered_grid_text_after", args.clone())), fnv_u(&u("text_then_centered_grid", args)));
+                assert_eq!(got, pin, "{:?}", (nt, h, w));
             }
             // FNV-1a of the `ltx.rs` `Rope::new` tables' bits (cos, sin), pinned before its deletion.
             let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
@@ -1142,6 +1140,11 @@ mod tests {
         }
 
         const PIN_ROPE: [(u64, u64); 2] = [(7060718898465474953, 1236744568232124141), (101182376039508301, 1818247417042637373)];
+        const PIN_CAPTION: [(u64, u64, u64); 2] = [
+            (7733667915075792446, 116880883018788830, 6438117400414473861),
+            (7090311725464082422, 6748965096050418994, 14702106270667000957),
+        ];
+        const PIN_QWEN_POS: [(u64, u64); 2] = [(13971451208107069760, 16328919124472931196), (14750003259182653999, 10763235150658147296)];
 
         #[test]
         fn audio_front_end_matches_sources() {
@@ -1165,11 +1168,12 @@ mod tests {
 
         #[test]
         fn indices_match_sources() {
-            for (c, r, ft) in [(4, 2, 1), (3, 1, 2)] {
-                assert_eq!(
-                    u("channel_dup_index", json!({"channels": c, "repeats": r, "frames": ft})),
-                    model::qwen_vae21::dup_idx(c, r, ft)
-                );
+            // `qwen_vae21.rs` `dup_idx`, pinned before its deletion.
+            for ((c, r, ft), want) in [
+                ((4, 2, 1), vec![0u32, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7]),
+                ((3, 1, 2), vec![4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23]),
+            ] {
+                assert_eq!(u("channel_dup_index", json!({"channels": c, "repeats": r, "frames": ft})), want);
             }
         }
     }

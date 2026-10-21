@@ -8,7 +8,7 @@
 {
   family: "krea2",
   // `bases`: repos whose finetunes, GGUFs and LoRAs load on this pipeline (card `base_model`).
-  match: {diffusers_class: ["Krea2Pipeline", "Krea2Transformer2DModel"],
+  match: {diffusers_class: ["Krea2Pipeline", "Krea2Transformer2DModel"], gguf_arch: ["krea2"],
           denoiser_tensors: [["txtfusion.projector.weight"], ["text_fusion.projector.weight"]],
           bases: ["krea/Krea-2-Raw", "krea/Krea-2-Turbo", "Comfy-Org/Krea-2"]},
   pipeline: "diffusion",

@@ -1788,10 +1788,15 @@ fn image_supported(m: &Value) -> bool {
         || base("base_model:finetune:")
         || base("base_model:quantized:")
         || m["gguf"]["architecture"] == "flux"
-        // Transformer-only GGUFs of a diffusion spec (image-editing GGUFs share architecture names
-        // but are tagged image-to-image).
-        || (m["pipeline_tag"] == "text-to-image"
-            && m["gguf"]["architecture"].as_str().is_some_and(|a| diffusion_gguf_arch(a)))
+        // Transformer-only GGUFs of a diffusion spec, unless derived from a base it does not list
+        // (image-editing variants share the architecture names).
+        || (m["gguf"]["architecture"].as_str().is_some_and(|a| diffusion_gguf_arch(a))
+            && !tags.iter().any(|t| {
+                ["base_model:adapter:", "base_model:finetune:", "base_model:quantized:"]
+                    .iter()
+                    .filter_map(|k| t.strip_prefix(k))
+                    .any(|b| !spec_bases.iter().any(|s| s == b))
+            }))
         || [
             "base_model:adapter:",
             "base_model:finetune:",
@@ -1879,7 +1884,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     }
     if let Some(a) = m["gguf"]["architecture"].as_str().filter(|a| diffusion_gguf_arch(a)) {
         return Some(format!(
-            "{tag} model, GGUF architecture '{a}': image editing (reference-image conditioning) is not implemented; only text-to-image GGUFs of this architecture load"
+            "{tag} model, GGUF architecture '{a}' derived from a base no image spec runs (e.g. image editing, which conditions on reference images and is not implemented); only text-to-image GGUFs of this architecture load"
         ));
     }
     if tag == "text-to-image" {
@@ -2324,13 +2329,12 @@ mod tests {
         // Native GGUF loaders expand to bf16 whatever the file's quantization.
         assert!(blocker("e/q35-27b-gguf").starts_with("needs ~50 GB as bf16; host has 16 GB"));
         // Qwen-Image rows load (2.1 and 1, diffusers and transformer-only GGUFs, a 2.1 finetune
-        // whose GGUF says `qwen_image`), or say why not: Edit conditions on images, LoRAs are not merged.
+        // whose GGUF says `qwen_image`, LoRAs of a base), or say why not: Edit conditions on images.
         assert!(blocker("x/qwen-image").starts_with("needs ~38 GB as bf16; host has 16 GB"));
-        for loadable in ["q/qwen21", "q/qwen21-gguf", "q/qwen21-turbo"] {
+        for loadable in ["q/qwen21", "q/qwen21-gguf", "q/qwen21-turbo", "q/qwen-lora"] {
             assert_eq!(by_id(loadable).blocker, None, "{loadable}");
         }
-        assert!(blocker("q/qwen-edit-gguf").contains("conditions on reference images"));
-        assert!(blocker("q/qwen-lora").contains("not LoRA adapters"));
+        assert!(blocker("q/qwen-edit-gguf").contains("image editing"));
         // GPTQ / AWQ int4 load (repacked to int4 group blocks or expanded to f32).
         for loadable in ["f/awq", "g/gptq"] {
             assert_eq!(by_id(loadable).blocker, None, "{loadable}");

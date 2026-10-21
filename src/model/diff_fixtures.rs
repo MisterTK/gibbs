@@ -178,11 +178,9 @@ pub fn tiny_clip(act: Act, proj: bool) -> ClipTextTransformer {
     ClipTextTransformer::from_parts(&t, "text_model", act, 0, proj.then_some("text_projection.weight"), tk).unwrap()
 }
 
-/// Every legacy non-SD VAE (Qwen-Image, Qwen-Image 2.1) plus the SD VAE decoded as Metal
-/// programs from tiny synthetic checkpoints; the caller arms the CPU tripwire, so any CPU compute panics.
+/// The SD VAE decoded as a Metal program from a tiny synthetic checkpoint; the caller arms the CPU
+/// tripwire, so any CPU compute panics.
 pub fn tiny_vae_on_gpu() -> Result<(), String> {
-    crate::model::qwen_vae::fixture::tiny_on_gpu()?;
-    crate::model::qwen_vae21::fixture::tiny_on_gpu()?;
     let r = synth(&vae_specs(4), 7);
     let vae = SdVae::from_ldm(&Tensors::from_reader(&r)?)?;
     let (h, w) = (6, 5);
