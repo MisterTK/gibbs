@@ -484,7 +484,7 @@ fn mm_from_gguf(name: &str, shape: &[usize], v: &mut [f32]) {
 /// The vision and audio encoders of the `mmproj` GGUF at `path`. A modality the file does not
 /// carry, or whose projector is not implemented, becomes an encoder that says so when a prompt
 /// attaches it.
-fn projectors(
+pub(crate) fn projectors(
     path: &Path,
     mode: crate::hardware::PlacementMode,
 ) -> Result<(Box<dyn Encoder>, Box<dyn Encoder>), String> {

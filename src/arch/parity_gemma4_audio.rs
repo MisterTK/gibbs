@@ -73,7 +73,8 @@ fn check(
                 Some(Tensor::F32(v)) => v,
                 o => panic!("{case}: output {o:?}"),
             };
-            for on_metal in [false, dev == Device::Metal] {
+            let olds: &[bool] = if dev == Device::Metal { &[false, true] } else { &[false] };
+            for &on_metal in olds {
                 let (want, n) = old(clip, on_metal);
                 assert_eq!((p.grid.tokens, got.len()), (n, want.len()), "{case} clip {i}: tokens");
                 let (rel, cos) = compare(&got, &want);
@@ -129,7 +130,8 @@ fn unified_audio_matches_old_embedder() {
 }
 
 /// The real E2B GGUF + `mmproj`: the renamed `gemma4a` conformer builds with every weight present,
-/// reads every audio tensor, and runs a 0.25 s clip on the CPU executor.
+/// reads every audio tensor, and matches the old mmproj loader's host forward on a 0.25 s clip
+/// (CPU executor).
 #[test]
 #[ignore = "reads the 1 GB E2B mmproj"]
 fn e2b_gguf_mmproj_audio_tower_loads() {
@@ -156,12 +158,27 @@ fn e2b_gguf_mmproj_audio_tower_loads() {
     let p = media::preprocess(&audio.preprocess, &tiny::wav()).unwrap();
     let vars: Vec<(&str, Val)> = p.grid.vars.iter().map(|&(k, v)| (k, Val::Num(v as f64))).collect();
     let inst = r.instance("audio", &vars).unwrap();
-    let towers: Vec<_> = r.model.renames.iter().map(|(_, c)| c).filter(|c| c.starts_with("model.audio_tower") || c.starts_with("model.embed_audio")).collect();
-    let unread: Vec<_> = towers.iter().filter(|c| !inst.weights.contains(**c)).collect();
+    // `unconsumed()` skips sidecar (mmproj) tensors: check the canonical names directly. Clamp
+    // scalars are read through `values()` beside their `{stem}.linear.weight`.
+    let read = |c: &str| {
+        inst.weights.iter().any(|w| w == c)
+            || ["input_min", "input_max", "output_min", "output_max"].iter().any(|s| {
+                c.strip_suffix(s).is_some_and(|stem| inst.weights.contains(&format!("{stem}linear.weight")))
+            })
+    };
+    let unread: Vec<_> = r.model.renames.iter().map(|(_, c)| c)
+        .filter(|c| (c.starts_with("model.audio_tower") || c.starts_with("model.embed_audio")) && !read(c)).collect();
     assert!(unread.is_empty(), "audio tensors the tower does not read: {unread:?}");
     let out = r.run("audio", &vars, vec![Tensor::F32(p.data)]).unwrap();
     let Some(Tensor::F32(e)) = out.get("embeds") else { panic!("no embeds") };
     let rms = (e.iter().map(|x| x * x).sum::<f32>() / e.len() as f32).sqrt();
     eprintln!("e2b audio: {} tensors, {} tokens x {}, rms {rms}", inst.weights.len(), p.grid.tokens, e.len() / p.grid.tokens);
     assert!(e.len() % p.grid.tokens == 0 && e.iter().all(|x| x.is_finite()) && rms > 0.0);
+    // The old mmproj loader's host forward on the same clip.
+    let (_, old) = crate::model::gemma4::gguf::projectors(&dir.join("mmproj-F16.gguf"), PlacementMode::Pin(Device::Cpu)).unwrap();
+    let (want, n) = old.encode(&tiny::wav()).unwrap();
+    assert_eq!(n, p.grid.tokens);
+    let (rel, cos) = compare(e, &want);
+    eprintln!("e2b audio vs old gguf host forward: rel {rel:.3e} cos {cos:.7}");
+    assert!(rel < 1e-3 && cos > 0.9999, "rel {rel:e} cos {cos}");
 }

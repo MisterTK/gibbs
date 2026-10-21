@@ -117,6 +117,7 @@ fn unified_vision_matches_old_embedder() {
 /// The real E2B GGUF + `mmproj`: the renamed `gemma4v` tower builds with every weight present,
 /// reads every vision tensor, and runs a 6x6 patch grid on the CPU executor.
 #[test]
+#[ignore = "real E2B GGUF + mmproj, ~18 s in a debug build"]
 fn e2b_gguf_mmproj_vision_tower_loads() {
     let _g = crate::hardware::cpu_compute::allow();
     let dir = Path::new("/Users/keas/code/rust-inference-server/disk/models--unsloth--gemma-4-E2B-it-qat-GGUF/snapshots/main");
@@ -135,13 +136,20 @@ fn e2b_gguf_mmproj_vision_tower_loads() {
     assert_eq!(r.model.spec.family, "gemma4");
     let m = media::resolve(&r.model.spec.runtime["media"], &r.model.env).unwrap();
     eprintln!("e2b image media: {:?}", m["image"]);
+    // No config.json (no `config_path`): the ids come from `token(...)` over the GGUF vocabulary.
+    assert!(r.model.ckpt.cfg.is_null());
+    assert!(matches!(m["image"].expand, Expand::RepeatBetween { placeholder: 258880, open: 255999, close: 258882 }));
     let unmapped: Vec<_> = r.model.renames.iter().filter(|(raw, c)| raw == c && (raw.starts_with("v.") || raw.starts_with("mm.input"))).collect();
     assert!(unmapped.is_empty(), "unmapped mmproj vision tensors {unmapped:?}");
     let vars = [("grid_h", Val::Num(6.0)), ("grid_w", Val::Num(6.0))];
     let inst = r.instance("vision", &vars).unwrap();
     let vision: Vec<_> = r.model.renames.iter().map(|(_, c)| c).filter(|c| c.starts_with("model.vision_tower") || c.starts_with("model.embed_vision")).collect();
-    let unread: Vec<_> = vision.iter().filter(|c| !inst.weights.contains(**c)).collect();
+    // Clamp bounds fold into the graph as constants (`values()`), every other tensor is a weight.
+    let bound = |c: &str| c.ends_with("_min") || c.ends_with("_max");
+    let unread: Vec<_> = vision.iter().filter(|c| !bound(c) && !inst.weights.contains(**c)).collect();
     assert!(unread.is_empty(), "vision tensors the tower does not read: {unread:?}");
+    let clamps = inst.graph.nodes.iter().filter(|n| n.name.ends_with("_clamp")).count();
+    assert_eq!(clamps, 2 * vision.iter().filter(|c| c.ends_with("input_min")).count(), "clamp nodes");
     let v_in = inst.inputs[0].shape[1];
     let pix: Vec<f32> = (0..36 * v_in).map(|i| ((i * 37 % 251) as f32 / 125.0) - 1.0).collect();
     let out = r.run("vision", &vars, vec![Tensor::F32(pix)]).unwrap();
