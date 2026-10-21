@@ -302,6 +302,8 @@ pub struct TextEntry {
     pub mask: J,
     #[serde(default = "keep_all")]
     pub keep: String,
+    /// Rows dropped from every output; expressions over `prefix_len` (tokens of the template before
+    /// `{prompt}`), `prefix_tokens` (tokens of `prefix` alone) and `valid`.
     #[serde(default)]
     pub drop: Option<Range2>,
     #[serde(default)]
@@ -1085,6 +1087,8 @@ impl SpecDiffusion {
             } else {
                 0
             };
+            // Tokens of the `prefix` string alone (a template may put more before `{prompt}`).
+            let prefix_tokens = if e.prefix.is_empty() { 0 } else { tokenize(&t.tok, &e.prefix, e.add_special)?.len() };
             let pv = [("prefix_len", Val::Num(prefix_len as f64))];
             let opt_id = |j: &J| -> Result<Option<u32>, String> {
                 if j.is_null() {
@@ -1150,6 +1154,7 @@ impl SpecDiffusion {
             };
             let dv = [
                 ("prefix_len", Val::Num(prefix_len as f64)),
+                ("prefix_tokens", Val::Num(prefix_tokens as f64)),
                 ("valid", Val::Num(valid as f64)),
             ];
             let drop = match &e.drop {
@@ -1865,6 +1870,9 @@ pub fn load_image(
     let lora = weights.extension().is_some_and(|e| e == "safetensors")
         && crate::model::lora::is_diffusion_lora(names.iter().map(String::as_str));
     let denoiser = if lora { None } else { Some(reg.detect_denoiser(&names)?) };
+    if let Some(r) = denoiser.as_deref().and_then(|d| split_files(&artifacts.model_id, weights, d, hub, mode)) {
+        return Some(r);
+    }
     // `--model org/repo/file.gguf` names one file of the repo.
     let repo = crate::model::hub::split_weight_file(&artifacts.model_id).0;
     let card = dir
@@ -1946,6 +1954,121 @@ pub fn load_image(
         };
         arc(SpecDiffusion::load(&a, hub, mode, Some(&fam), &extra))
     })())
+}
+
+/// `runtime.split`: a split-file distribution (e.g. ComfyUI's `diffusion_models/`, `text_encoders/`,
+/// `vae/` folders) whose denoiser file sits in a folder named `dir`.
+#[derive(Deserialize)]
+struct SplitSpec {
+    dir: String,
+    /// Component -> its sibling folder (the file there whose name contains `prefer`, else the
+    /// first) or, absent, the `repo:path` file fetched.
+    parts: HashMap<String, SplitPart>,
+    /// Pipeline-root files: a `repo:path` string (fetched, copied) or a JSON value (written).
+    #[serde(default)]
+    files: HashMap<String, J>,
+    /// `model_index.json` booleans: true when the denoiser's file or repo name contains (any
+    /// case) one of the substrings.
+    #[serde(default)]
+    name_flags: HashMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SplitPart {
+    dir: String,
+    #[serde(default)]
+    prefer: String,
+    fetch: String,
+}
+
+/// The `repo:path` file of a split layout, fetched.
+fn fetch_ref(hub: &HuggingFaceHub, r: &str) -> Result<std::path::PathBuf, String> {
+    let (repo, path) = r.split_once(':').ok_or_else(|| format!("split file `{r}` is not repo:path"))?;
+    hub.fetch_file(repo, path)
+}
+
+/// A denoiser file of `fam` inside its split layout's `dir` (`runtime.split`): the sibling folders'
+/// components (fetched when missing) around a pipeline root assembled from the spec's `files`.
+/// `None` when `fam` has no split layout or the file is elsewhere.
+fn split_files(
+    id: &str,
+    weights: &Path,
+    fam: &str,
+    hub: &HuggingFaceHub,
+    mode: PlacementMode,
+) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
+    let reg = crate::arch::registry().ok()?;
+    let spec = reg.spec(fam, &Default::default()).ok()?;
+    let rt: Runtime = spec.runtime_as().ok()?;
+    let split: SplitSpec = match rt.other.get("split").map(|j| serde_json::from_value(j.clone())) {
+        None => return None,
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return Some(Err(format!("{fam}: runtime.split: {e}"))),
+    };
+    let folder = weights.parent()?;
+    if folder.file_name()? != split.dir.as_str() {
+        return None;
+    }
+    let base = folder.parent()?;
+    Some((|| {
+        let (root, parts) = split_root(&split, &rt.denoiser.component, base, weights, id, hub)?;
+        let a = ModelArtifacts { model_id: id.to_string(), local_dir: Some(root.clone()), is_cached: true, ..Default::default() };
+        let extra = Extras { weights: parts, ..Default::default() };
+        SpecDiffusion::load(&a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+    })())
+}
+
+/// The pipeline root (`files`, `model_index.json` with `name_flags`) and component weights of a
+/// split layout around denoiser file `weights` (`component`) whose folders sit in `base`.
+fn split_root(
+    split: &SplitSpec,
+    component: &str,
+    base: &Path,
+    weights: &Path,
+    id: &str,
+    hub: &HuggingFaceHub,
+) -> Result<(std::path::PathBuf, Vec<(String, std::path::PathBuf)>), String> {
+    let mut parts = vec![(component.to_string(), weights.to_path_buf())];
+    for (comp, p) in &split.parts {
+        let mut local: Vec<_> = std::fs::read_dir(base.join(&p.dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|f| f.extension().is_some_and(|e| e == "safetensors"))
+            .collect();
+        local.sort();
+        let pick = local.iter().find(|f| f.to_string_lossy().contains(&p.prefer)).or(local.first()).cloned();
+        parts.push((comp.clone(), match pick {
+            Some(f) => f,
+            None => fetch_ref(hub, &p.fetch)?,
+        }));
+    }
+    let root = std::env::temp_dir()
+        .join("gibbs-split")
+        .join(base.to_string_lossy().replace(['/', '\\', ':'], "_"));
+    let write = |rel: &str, bytes: &[u8]| -> Result<(), String> {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let mut index = J::Object(Default::default());
+    for (rel, v) in &split.files {
+        match v {
+            J::String(r) => {
+                let f = fetch_ref(hub, r)?;
+                write(rel, &std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?)?;
+            }
+            v if rel == "model_index.json" => index = v.clone(),
+            v => write(rel, v.to_string().as_bytes())?,
+        }
+    }
+    let name = format!("{id} {}", weights.file_name().unwrap_or_default().to_string_lossy()).to_lowercase();
+    for (k, subs) in &split.name_flags {
+        index[k] = J::Bool(subs.iter().any(|s| name.contains(&s.to_lowercase())));
+    }
+    write("model_index.json", index.to_string().as_bytes())?;
+    Ok((root, parts))
 }
 
 /// A single-file checkpoint of `fam`: the configs of its `runtime.reference` repo (fetched, no
@@ -2054,5 +2177,36 @@ mod tests {
         assert_eq!(at(0.5), want(500.0));
         assert_eq!(at(0.25), want(250.0));
         assert_ne!(at(0.5), at(0.25));
+    }
+
+    /// A split layout's root: preferred sibling files per component, written configs, name flags.
+    #[test]
+    fn split_root_assembles_the_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("snap");
+        for f in ["dm/toy_turbo_bf16.safetensors", "te/a_fp8.safetensors", "te/b_bf16.safetensors", "vae/v.safetensors"] {
+            std::fs::create_dir_all(base.join(f).parent().unwrap()).unwrap();
+            std::fs::write(base.join(f), b"").unwrap();
+        }
+        let split: SplitSpec = serde_json::from_value(serde_json::json!({
+            "dir": "dm",
+            "parts": {"text_encoder": {"dir": "te", "prefer": "bf16", "fetch": "x/y:te.safetensors"},
+                      "vae": {"dir": "vae", "fetch": "x/y:v.safetensors"}},
+            "files": {"model_index.json": {"_class_name": "ToyPipeline"}, "text_encoder/config.json": {"n": 2}},
+            "name_flags": {"is_distilled": ["TURBO"], "is_raw": ["raw"]}
+        }))
+        .unwrap();
+        let w = base.join("dm/toy_turbo_bf16.safetensors");
+        let hub = HuggingFaceHub::with_cache_dir(tmp.path().join("hub"));
+        let (root, mut parts) = split_root(&split, "transformer", &base, &w, "org/toy", &hub).unwrap();
+        parts.sort();
+        assert_eq!(parts, [
+            ("text_encoder".to_string(), base.join("te/b_bf16.safetensors")),
+            ("transformer".to_string(), w.clone()),
+            ("vae".to_string(), base.join("vae/v.safetensors")),
+        ]);
+        let read = |f: &str| -> J { serde_json::from_str(&std::fs::read_to_string(root.join(f)).unwrap()).unwrap() };
+        assert_eq!(read("model_index.json"), serde_json::json!({"_class_name": "ToyPipeline", "is_distilled": true, "is_raw": false}));
+        assert_eq!(read("text_encoder/config.json"), serde_json::json!({"n": 2}));
     }
 }

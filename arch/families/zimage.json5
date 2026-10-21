@@ -5,11 +5,11 @@
 // Latents enter unpacked ([c, h, w]); 2x2 patch rows ((py, px, c) order) are cut in-graph.
 {
   family: "zimage",
-  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
-  // text-encoder specs land and this family is cut over.
-  match: {diffusers_class: ["ZImageTransformer2DModel"]},
+  match: {diffusers_class: ["ZImagePipeline", "ZImageTransformer2DModel"]},
   pipeline: "diffusion",
   config: {
+    // The transformer component (the pipeline root, which loads this spec too, has no tensors).
+    is_denoiser: "has('cap_embedder.1.weight')",
     dim: "cfg.dim",
     heads: "cfg.n_heads",
     head_dim: "dim // heads",
@@ -26,19 +26,21 @@
   },
   checks: [
     {expr: "json.scheduler_config.use_dynamic_shifting == true", error: "Z-Image scheduler with use_dynamic_shifting is not supported"},
-    {expr: "first(cfg.n_kv_heads, heads) != heads", error: "Z-Image: n_kv_heads != n_heads is not supported"},
-    {expr: "patch != 2 || at(cfg.all_f_patch_size, 0) != 1", error: "Z-Image: only patch size [2] / f_patch [1] is supported"},
-    {expr: "cfg.qk_norm != true || has('siglip_embedder.0.weight') || first(cfg.siglip_feat_dim, 0) > 0",
+    {expr: "is_denoiser && (first(cfg.n_kv_heads, heads) != heads)", error: "Z-Image: n_kv_heads != n_heads is not supported"},
+    {expr: "is_denoiser && (patch != 2 || at(cfg.all_f_patch_size, 0) != 1)", error: "Z-Image: only patch size [2] / f_patch [1] is supported"},
+    {expr: "is_denoiser && (cfg.qk_norm != true || has('siglip_embedder.0.weight') || first(cfg.siglip_feat_dim, 0) > 0)",
      error: "Z-Image: only qk_norm=true without SigLIP (Omni) inputs is supported"},
-    {expr: "len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim", error: "Z-Image: axes_dims must be 3 dims summing to head_dim"},
+    {expr: "is_denoiser && (len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim)", error: "Z-Image: axes_dims must be 3 dims summing to head_dim"},
   ],
   transforms: [
     {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
   ],
+  // Read only when the patch / caption counts are not multiples of 32 (unused at some sizes).
+  ignore: ["x_pad_token", "cap_pad_token"],
   constants: {
-    "rope.inv_freq": {gen: "axis_freqs", args: {dims: "axes", theta: "theta"}},
-    one: {gen: "fill", args: {shape: [1], value: 1}},
-    "ones.dim": {gen: "ones", args: {shape: ["dim"]}},
+    "rope.inv_freq": {when: "is_denoiser", gen: "axis_freqs", args: {dims: "axes", theta: "theta"}},
+    one: {when: "is_denoiser", gen: "fill", args: {shape: [1], value: 1}},
+    "ones.dim": {when: "is_denoiser", gen: "ones", args: {shape: ["dim"]}},
   },
   macros: {
     // One S3-DiT block over `x`; `adaln` drives the modulation when `modulated`; `pos` names the
@@ -99,7 +101,7 @@
         {name: "x", dtype: "f32", shape: ["in_ch", "h", "w"]},
         {name: "context", dtype: "f32", shape: ["nt", "cap_dim"]},
         {name: "t_feat", dtype: "f32", shape: [1, 256], gen: "timestep_embedding",
-         args: {t: "'step:(1 - sigma) * first(denoiser.t_scale, 1000)'", dim: 256, precision: "'f32'"}},
+         args: {t: "fmt('step:(1 - sigma) * {t_scale}')", dim: 256, precision: "'f32'"}},
         {name: "pos_img", dtype: "u32", shape: ["((h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32) * 3"], gen: "caption_then_grid_padded",
          args: {grid_w: "w // 2", grid_len: "(h // 2) * (w // 2)", grid_total: "(h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32", text_total: "nt + (32 - nt % 32) % 32", part: "'grid'"}},
         {name: "pos_cap", dtype: "u32", shape: ["(nt + (32 - nt % 32) % 32) * 3"], gen: "caption_then_grid_padded",
@@ -165,7 +167,7 @@
     guidance: {kind: "cfg", gate: "guidance > 0", scale: "guidance + 1"},
     negate_v: true,
     latent: {channels: "denoiser.in_ch", factor: 8, pack: "none", noise_scale: 1},
-    vae: {component: "vae", decode: "decoder", encode: null,
+    vae: {component: "vae", decode: "decoder", encode: "encoder",
           decode_affine: {mul: "1 / vae.cfg.scaling_factor", add: "first(vae.cfg.shift_factor, 0)"}, output: "clamp_pm1"},
     // Turbo settings; ponytail: CPU-sized 512 default, 1024 is native.
     defaults: {width: 512, height: 512, steps: 8, guidance: 0, multiple: 16, max_side: 8192, max_steps: 200},

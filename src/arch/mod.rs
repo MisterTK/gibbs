@@ -184,6 +184,10 @@ pub struct Match {
     /// File extensions `single_file_tensors` applies to (empty: any).
     #[serde(default)]
     pub single_file_ext: Vec<String>,
+    /// Hub repos whose derivatives (finetunes, quantizations, LoRAs whose model card names one as
+    /// `base_model`) this family runs; listings only (loading reads the card).
+    #[serde(default)]
+    pub bases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -743,10 +747,24 @@ impl Registry {
 
     /// The GGUF architectures `causal_lm` families claim.
     pub fn causal_lm_gguf_archs(&self) -> Vec<String> {
+        self.pipeline_gguf_archs(Pipeline::CausalLm)
+    }
+
+    /// The GGUF architectures the families of `pipeline` claim.
+    pub fn pipeline_gguf_archs(&self, pipeline: Pipeline) -> Vec<String> {
         self.matchers()
             .into_iter()
-            .filter(|(_, _, p)| *p == Pipeline::CausalLm)
+            .filter(|(_, _, p)| *p == pipeline)
             .flat_map(|(_, m, _)| m.gguf_arch)
+            .collect()
+    }
+
+    /// The `match.bases` of the families of `pipeline`.
+    pub fn derived_bases(&self, pipeline: Pipeline) -> Vec<String> {
+        self.matchers()
+            .into_iter()
+            .filter(|(_, _, p)| *p == pipeline)
+            .flat_map(|(_, m, _)| m.bases)
             .collect()
     }
 }
@@ -1388,5 +1406,15 @@ mod tests {
             assert_eq!(l.len(), 512);
             assert!(l.iter().all(|x| x.is_finite()) && l.iter().any(|&x| x != 0.0));
         }
+    }
+
+    /// `match.bases` / `gguf_arch` listings by pipeline.
+    #[test]
+    fn listings_by_pipeline() {
+        let spec = r#"{family: "toy", pipeline: "diffusion", match: {gguf_arch: ["toy_dit"], bases: ["org/toy"]}}"#;
+        let r = Registry::from_files(&[("families/toy.json5".into(), spec.into())], &[]).unwrap();
+        assert_eq!(r.derived_bases(Pipeline::Diffusion), ["org/toy"]);
+        assert_eq!(r.pipeline_gguf_archs(Pipeline::Diffusion), ["toy_dit"]);
+        assert!(r.derived_bases(Pipeline::CausalLm).is_empty() && r.causal_lm_gguf_archs().is_empty());
     }
 }

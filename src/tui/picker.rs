@@ -1742,14 +1742,6 @@ const FLUX_BASES: &[&str] = &[
     "black-forest-labs/FLUX.1-dev",
 ];
 
-/// Krea 2 bases whose LoRAs, finetunes and GGUFs [`crate::model::krea2::load_derived`] runs;
-/// `Comfy-Org/Krea-2` is ComfyUI's own split-file distribution of the same weights.
-const KREA_BASES: &[&str] = &[
-    "krea/Krea-2-Raw",
-    "krea/Krea-2-Turbo",
-    crate::model::krea2::COMFY_REPO,
-];
-
 /// Bases whose LoRAs (`lora` tag) and single-file finetunes the SD loader runs, by the repo's
 /// `base_model:adapter:` / `base_model:finetune:` tag.
 const SD_BASES: &[&str] = &[
@@ -1762,6 +1754,11 @@ const SD_BASES: &[&str] = &[
     "stabilityai/stable-diffusion-xl-base-1.0",
     "stabilityai/sdxl-turbo",
 ];
+
+/// A GGUF architecture a diffusion spec's denoiser claims (`match.gguf_arch`).
+fn diffusion_gguf_arch(a: &str) -> bool {
+    crate::arch::registry().is_ok_and(|r| r.pipeline_gguf_archs(crate::arch::Pipeline::Diffusion).iter().any(|g| g == a))
+}
 
 /// Text-to-image repos an image loader runs: a listed diffusers pipeline, or an SD LoRA / single-file
 /// finetune of a listed base.
@@ -1780,29 +1777,21 @@ fn image_supported(m: &Value) -> bool {
             .find_map(|t| t.strip_prefix(kind))
             .is_some_and(|b| SD_BASES.contains(&b))
     };
+    // Derivatives of a diffusion spec's `match.bases` (card `base_model`, [`crate::runtime::diffusion::load_image`]).
+    let spec_bases = crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.derived_bases(crate::arch::Pipeline::Diffusion));
     let derived = |kind: &str| {
         tags.iter()
             .filter_map(|t| t.strip_prefix(kind))
-            .any(|b| FLUX_BASES.contains(&b) || KREA_BASES.contains(&b))
-    };
-    // Qwen-Image transformer-only GGUFs and full-weight finetunes ([`crate::model::qwen_image::load_derived`]);
-    // Qwen-Image-Edit GGUFs share the architecture name but are tagged image-to-image.
-    let qwen = |kind: &str| {
-        tags.iter()
-            .filter_map(|t| t.strip_prefix(kind))
-            .any(|b| crate::model::qwen_image::BASES.contains(&b))
+            .any(|b| FLUX_BASES.contains(&b) || spec_bases.iter().any(|s| s == b))
     };
     (tags.contains(&"lora") && base("base_model:adapter:"))
         || base("base_model:finetune:")
         || base("base_model:quantized:")
         || m["gguf"]["architecture"] == "flux"
-        || m["gguf"]["architecture"] == "krea2"
+        // Transformer-only GGUFs of a diffusion spec (image-editing GGUFs share architecture names
+        // but are tagged image-to-image).
         || (m["pipeline_tag"] == "text-to-image"
-            && crate::model::qwen_image::GGUF_ARCHS
-                .iter()
-                .any(|a| m["gguf"]["architecture"] == *a))
-        || qwen("base_model:finetune:")
-        || qwen("base_model:quantized:")
+            && m["gguf"]["architecture"].as_str().is_some_and(|a| diffusion_gguf_arch(a)))
         || [
             "base_model:adapter:",
             "base_model:finetune:",
@@ -1888,12 +1877,9 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     if let Some(verdict) = crate::model::classifier::hub_verdict(m) {
         return verdict.err();
     }
-    if let Some(a) = m["gguf"]["architecture"]
-        .as_str()
-        .filter(|a| crate::model::qwen_image::GGUF_ARCHS.contains(a))
-    {
+    if let Some(a) = m["gguf"]["architecture"].as_str().filter(|a| diffusion_gguf_arch(a)) {
         return Some(format!(
-            "{tag} model, GGUF architecture '{a}': Qwen-Image-Edit conditions on reference images (VLM vision tokens + VAE latents), which is not implemented; only text-to-image Qwen-Image GGUFs load"
+            "{tag} model, GGUF architecture '{a}': image editing (reference-image conditioning) is not implemented; only text-to-image GGUFs of this architecture load"
         ));
     }
     if tag == "text-to-image" {
@@ -1908,9 +1894,6 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
             .find_map(|k| t.strip_prefix(k))
         });
         return Some(match base {
-            Some(b) if crate::model::qwen_image::BASES.contains(&b) => format!(
-                "derivative of {b}: only its text-to-image GGUFs and full-weight finetunes load, not LoRA adapters"
-            ),
             Some(b) => format!(
                 "derivative of {b}: only SD 1.x/2.x, SDXL and FLUX.1 LoRAs, finetunes and GGUFs load"
             ),
@@ -2496,7 +2479,7 @@ mod tests {
 
     /// The Hub listings of the Qwen-Image 2.1 GGUF repos (FP8 / INT8 / MLX / NVFP4 / LoRA siblings
     /// beside the GGUFs, ComfyUI companion files, a diffusers-less `transformer/`) select a
-    /// transformer GGUF, which [`crate::model::qwen_image::load_derived`] reads.
+    /// transformer GGUF, which [`crate::runtime::diffusion::load_image`] reads.
     #[test]
     fn qwen_image_gguf_repos_select_a_gguf() {
         let pick = |names: &[&str]| {
