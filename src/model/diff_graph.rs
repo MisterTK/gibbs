@@ -405,6 +405,27 @@ pub mod testutil {
         MemReader(m, false)
     }
 
+    /// Writes `r`'s tensors (sorted by name) as an F32 safetensors file.
+    pub fn write_st(path: &std::path::Path, r: &MemReader) {
+        let mut names: Vec<&String> = r.0.keys().collect();
+        names.sort();
+        let (mut header, mut data) = (serde_json::Map::new(), Vec::<u8>::new());
+        for n in names {
+            let (shape, v) = &r.0[n];
+            let start = data.len();
+            v.iter().for_each(|x| data.extend(x.to_le_bytes()));
+            header.insert(
+                n.clone(),
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        }
+        let h = serde_json::to_vec(&header).unwrap();
+        let mut out = (h.len() as u64).to_le_bytes().to_vec();
+        out.extend(h);
+        out.extend(data);
+        std::fs::write(path, out).unwrap();
+    }
+
     /// max |a - b| / max(max |b|, 1e-3).
     pub fn rel_err(a: &[f32], b: &[f32]) -> f32 {
         assert_eq!(a.len(), b.len());

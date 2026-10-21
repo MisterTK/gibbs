@@ -9,14 +9,14 @@ use crate::model::dit::{
     add_gated, component_weights, norm_modulate, read_config, rms_norm, silu_of, timestep_features,
     Lin,
 };
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::image::ImageBuffer;
 use crate::model::loaders::safetensors::SafetensorsWeightReader;
 use crate::model::nn;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
-use crate::model::sd::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::sched::Rng;
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use crate::model::vae::SdVae;
 use crate::model::weights::Weights;
 use std::path::Path;
@@ -519,7 +519,7 @@ impl ImageGenerator for ZImagePipeline {
             "  text encoder: {n_cap} tokens, {:.2}s",
             start.elapsed().as_secs_f64()
         );
-        let sigmas = flow::shifted_sigmas(&flow::linspace_sigmas(steps), self.shift);
+        let sigmas = sched::shifted_sigmas(&sched::linspace_sigmas(steps), self.shift);
         let mut rng = Rng::new(req.seed);
         let mut x: Vec<f32> = (0..self.dit.in_ch * h * w)
             .map(|_| rng.gaussian())
@@ -543,7 +543,7 @@ impl ImageGenerator for ZImagePipeline {
             }
             // The model predicts -velocity.
             v.iter_mut().for_each(|v| *v = -*v);
-            flow::euler_step(&mut x, &v, s[0], s[1]);
+            sched::euler_step(&mut x, &v, s[0], s[1]);
             println!(
                 "  step {}/{steps} (sigma {:.4}): {:.2}s",
                 i + 1,

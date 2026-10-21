@@ -1,10 +1,68 @@
-//! diffusers noise schedulers for the Stable Diffusion pipelines, configured from a repo's
-//! `scheduler/scheduler_config.json`: Euler, Euler ancestral, PNDM (PLMS, `skip_prk_steps`), DDIM
-//! (eta 0), LCM and DPM-Solver++ (multistep, order <= 2, optional Karras sigmas). Formulas follow
-//! diffusers' `scheduling_*.py`; every option outside these is an Err naming it.
+//! Noise schedulers of the diffusion pipelines, named by algorithm:
+//! - discrete-VP schedulers configured from a diffusers `scheduler_config.json` ([`SchedulerConfig`]):
+//!   Euler, Euler ancestral, PNDM (PLMS, `skip_prk_steps`), DDIM (eta 0), LCM and DPM-Solver++
+//!   (multistep, order <= 2, optional Karras sigmas); formulas follow diffusers' `scheduling_*.py`
+//!   and every option outside these is an Err naming it;
+//! - rectified-flow sigma schedules ([`Schedule`]: static / dynamic / empirical / fixed `mu` shift,
+//!   terminal stretch) with the flow Euler step and DPM-Solver++ 2M on flow predictions
+//!   (diffusers `FlowMatchEulerDiscreteScheduler`, `DPMSolverMultistepScheduler(use_flow_sigmas)`);
+//! - the pipelines' seeded Gaussian [`Rng`].
 
-use crate::model::sd::Rng;
 use serde_json::Value;
+
+/// Training timesteps of every schedule here.
+pub const TRAIN_STEPS: usize = 1000;
+
+/// splitmix64 + Box-Muller.
+pub struct Rng {
+    state: u64,
+    spare: Option<f32>,
+}
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self {
+            state: seed,
+            spare: None,
+        }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in (0, 1].
+    pub fn uniform(&mut self) -> f64 {
+        ((self.next_u64() >> 11) + 1) as f64 / (1u64 << 53) as f64
+    }
+
+    pub fn gaussian(&mut self) -> f32 {
+        if let Some(s) = self.spare.take() {
+            return s;
+        }
+        let r = (-2.0 * self.uniform().ln()).sqrt();
+        let th = 2.0 * std::f64::consts::PI * self.uniform();
+        self.spare = Some((r * th.sin()) as f32);
+        (r * th.cos()) as f32
+    }
+}
+
+/// scaled_linear betas 0.00085..0.012 over 1000 steps (SD 2.x and ModelScope share it).
+pub fn alphas_cumprod() -> Vec<f64> {
+    let (a, b) = (0.00085f64.sqrt(), 0.012f64.sqrt());
+    let mut acc = 1.0;
+    (0..TRAIN_STEPS)
+        .map(|i| {
+            let beta = (a + (b - a) * i as f64 / (TRAIN_STEPS - 1) as f64).powi(2);
+            acc *= 1.0 - beta;
+            acc
+        })
+        .collect()
+}
 
 /// What the model predicts.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -370,7 +428,7 @@ pub struct Scheduler {
     /// UNet timesteps in order (PNDM: `steps + 1` of them).
     pub timesteps: Vec<f64>,
     /// Euler / DPM: per-step sigmas with the trailing 0.
-    sigmas: Vec<f64>,
+    pub sigmas: Vec<f64>,
     ets: Vec<Vec<f32>>,
     counter: usize,
     cur_sample: Option<Vec<f32>>,
@@ -636,6 +694,244 @@ impl Scheduler {
     }
 }
 
+// ---- rectified flow ----
+
+/// Static shift `s * sigma / (1 + (s - 1) * sigma)` (`use_dynamic_shifting: false`).
+pub fn shift_sigma(sigma: f64, shift: f64) -> f64 {
+    shift * sigma / (1.0 + (shift - 1.0) * sigma)
+}
+
+/// Exponential time shift with exponent 1: `e^mu / (e^mu + (1/t - 1))` (`use_dynamic_shifting: true`).
+pub fn time_shift(mu: f64, t: f64) -> f64 {
+    mu.exp() / (mu.exp() + (1.0 / t - 1.0))
+}
+
+/// Resolution-dependent `mu`: linear in the image token count through (base_seq, base_shift) and
+/// (max_seq, max_shift); diffusers defaults are 256, 4096, 0.5, 1.15.
+pub fn calculate_shift(
+    seq_len: usize,
+    base_seq: f64,
+    max_seq: f64,
+    base_shift: f64,
+    max_shift: f64,
+) -> f64 {
+    let m = (max_shift - base_shift) / (max_seq - base_seq);
+    seq_len as f64 * m + base_shift - m * base_seq
+}
+
+/// `np.linspace(1, 1/steps, steps)`: the custom sigmas flow pipelines pass to `set_timesteps`.
+pub fn linspace_sigmas(steps: usize) -> Vec<f64> {
+    let end = 1.0 / steps as f64;
+    (0..steps)
+        .map(|i| {
+            if steps == 1 {
+                1.0
+            } else {
+                1.0 + (end - 1.0) * i as f64 / (steps - 1) as f64
+            }
+        })
+        .collect()
+}
+
+/// `set_timesteps(steps)` without custom sigmas and with a static shift (SD3): `linspace(sigma_max,
+/// sigma_min)` of the scheduler's own (already shifted) training sigmas, shifted again, then 0 appended.
+pub fn default_sigmas(steps: usize, shift: f64) -> Vec<f32> {
+    let (hi, lo) = (
+        shift_sigma(1.0, shift),
+        shift_sigma(1.0 / TRAIN_STEPS as f64, shift),
+    );
+    let base: Vec<f64> = (0..steps)
+        .map(|i| {
+            if steps == 1 {
+                hi
+            } else {
+                hi + (lo - hi) * i as f64 / (steps - 1) as f64
+            }
+        })
+        .collect();
+    finish(base.into_iter().map(|s| shift_sigma(s, shift)))
+}
+
+/// `set_timesteps(sigmas = base)` with a static shift (Z-Image), 0 appended.
+pub fn shifted_sigmas(base: &[f64], shift: f64) -> Vec<f32> {
+    finish(base.iter().map(|&s| shift_sigma(s, shift)))
+}
+
+/// `set_timesteps(sigmas = base, mu)` with dynamic shifting, 0 appended.
+pub fn dynamic_sigmas(base: &[f64], mu: f64) -> Vec<f32> {
+    finish(base.iter().map(|&s| time_shift(mu, s)))
+}
+
+/// `stretch_shift_to_terminal` (`shift_terminal`): rescales `1 - sigma` so the last sigma is `terminal`.
+pub fn stretch_to_terminal(sigmas: &mut [f64], terminal: f64) {
+    let Some(&last) = sigmas.last() else { return };
+    let scale = (1.0 - last) / (1.0 - terminal);
+    sigmas
+        .iter_mut()
+        .for_each(|s| *s = 1.0 - (1.0 - *s) / scale);
+}
+
+fn finish(s: impl Iterator<Item = f64>) -> Vec<f32> {
+    s.map(|v| v as f32).chain([0.0]).collect()
+}
+
+/// Model timestep for `sigma`.
+pub fn timestep(sigma: f32) -> f32 {
+    sigma * TRAIN_STEPS as f32
+}
+
+/// Euler step of the flow ODE: `x += (sigma_next - sigma) * v`.
+pub fn euler_step(x: &mut [f32], v: &[f32], sigma: f32, sigma_next: f32) {
+    let dt = sigma_next - sigma;
+    for (x, v) in x.iter_mut().zip(v) {
+        *x += dt * v;
+    }
+}
+
+/// `DPMSolverMultistepScheduler(use_flow_sigmas, flow_shift)` sigmas: `1 - linspace(1, 1/1000, N+1)`
+/// shifted, descending, the last (0) dropped, then the final sigma 0 appended (`final_sigmas_type: zero`).
+/// The model timestep is `floor(sigma * 1000)` (the scheduler stores int64 timesteps).
+pub fn dpm_flow_sigmas(steps: usize, shift: f64) -> Vec<f32> {
+    let n = steps + 1;
+    let alphas = (0..n).map(|i| 1.0 + (1.0 / TRAIN_STEPS as f64 - 1.0) * i as f64 / (n - 1) as f64);
+    let mut s: Vec<f64> = alphas.map(|a| shift_sigma(1.0 - a, shift)).collect();
+    s.reverse();
+    s.pop();
+    finish(s.into_iter())
+}
+
+/// DPM-Solver++ (2M, midpoint) on flow predictions: x0 = x - sigma * v, alpha = 1 - sigma.
+/// First order on the first step and on the final step to sigma 0.
+#[derive(Default)]
+pub struct DpmSolver2 {
+    prev_x0: Option<Vec<f32>>,
+}
+
+impl DpmSolver2 {
+    /// Steps `x` from `sigmas[i]` to `sigmas[i + 1]` given the model's flow prediction `v` at `sigmas[i]`.
+    pub fn step(&mut self, x: &mut [f32], v: &[f32], sigmas: &[f32], i: usize) {
+        let (s0, t) = (sigmas[i] as f64, sigmas[i + 1] as f64);
+        let x0: Vec<f32> = x.iter().zip(v).map(|(x, v)| x - s0 as f32 * v).collect();
+        let lambda = |s: f64| (1.0 - s).ln() - s.ln();
+        if t == 0.0 {
+            x.copy_from_slice(&x0);
+        } else {
+            let h = lambda(t) - lambda(s0);
+            let (a, b) = ((t / s0) as f32, ((1.0 - t) * ((-h).exp() - 1.0)) as f32);
+            match &self.prev_x0 {
+                Some(m1) => {
+                    let r0 = (lambda(s0) - lambda(sigmas[i - 1] as f64)) / h;
+                    let k = (0.5 / r0) as f32;
+                    for ((x, &d0), &m1) in x.iter_mut().zip(&x0).zip(m1) {
+                        *x = a * *x - b * d0 - b * k * (d0 - m1);
+                    }
+                }
+                None => x
+                    .iter_mut()
+                    .zip(&x0)
+                    .for_each(|(x, &d0)| *x = a * *x - b * d0),
+            }
+        }
+        self.prev_x0 = Some(x0);
+    }
+}
+
+/// diffusers `compute_empirical_mu`.
+pub fn empirical_mu(seq: usize, steps: usize) -> f64 {
+    let (a1, b1, a2, b2) = (8.73809524e-05, 1.89833333, 0.00016927, 0.45666666);
+    let seq = seq as f64;
+    if seq > 4300.0 {
+        return a2 * seq + b2;
+    }
+    let (m200, m10) = (a2 * seq + b2, a1 * seq + b1);
+    let a = (m200 - m10) / 190.0;
+    a * steps as f64 + m200 - 200.0 * a
+}
+
+/// How a flow [`Schedule`] shifts its base sigmas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mu {
+    /// `use_dynamic_shifting: false`: the static `shift`.
+    Static,
+    /// `mu = calculate_shift(seq)` through (base_seq, base_shift), (max_seq, max_shift).
+    Dynamic,
+    /// `mu = empirical_mu(seq, steps)`.
+    Empirical,
+    /// A fixed `mu`.
+    Fixed(f64),
+}
+
+/// diffusers `FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas = base, mu)`: base sigmas
+/// shifted (static or exponential `mu`), optionally stretched to end at `terminal`, 0 appended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Schedule {
+    pub shift: f64,
+    pub mu: Mu,
+    pub base_seq: f64,
+    pub max_seq: f64,
+    pub base_shift: f64,
+    pub max_shift: f64,
+    pub terminal: Option<f64>,
+}
+
+impl Schedule {
+    /// From a `scheduler_config.json` (diffusers defaults: shift 1, 256..4096 tokens, 0.5..1.15;
+    /// `shift_terminal` null or <= 0 is off).
+    pub fn from_config(v: &Value) -> Self {
+        let f = |k: &str, d: f64| v[k].as_f64().unwrap_or(d);
+        Self {
+            shift: f("shift", 1.0),
+            mu: if v["use_dynamic_shifting"].as_bool().unwrap_or(false) {
+                Mu::Dynamic
+            } else {
+                Mu::Static
+            },
+            base_seq: f("base_image_seq_len", 256.0),
+            max_seq: f("max_image_seq_len", 4096.0),
+            base_shift: f("base_shift", 0.5),
+            max_shift: f("max_shift", 1.15),
+            terminal: v["shift_terminal"].as_f64().filter(|t| *t > 0.0),
+        }
+    }
+
+    /// Shifted `base` for an image of `seq` latent tokens sampled in `steps` steps, 0 appended.
+    pub fn sigmas(&self, base: &[f64], seq: usize, steps: usize) -> Vec<f32> {
+        let mu = match self.mu {
+            Mu::Static => None,
+            Mu::Dynamic => Some(calculate_shift(
+                seq,
+                self.base_seq,
+                self.max_seq,
+                self.base_shift,
+                self.max_shift,
+            )),
+            Mu::Empirical => Some(empirical_mu(seq, steps)),
+            Mu::Fixed(m) => Some(m),
+        };
+        let mut s: Vec<f64> = base
+            .iter()
+            .map(|&t| match mu {
+                Some(mu) => time_shift(mu, t),
+                None => shift_sigma(t, self.shift),
+            })
+            .collect();
+        if let Some(t) = self.terminal {
+            stretch_to_terminal(&mut s, t);
+        }
+        finish(s.into_iter())
+    }
+}
+
+/// `STEPS, SIGMAS = 6, [1.0, 0.9375, ...]` of a distilled finetune's model card: the raw sigmas
+/// its authors sample with (the card's first `SIGMAS` list of plain numbers).
+pub fn card_sigmas(card: &str) -> Option<Vec<f64>> {
+    let rest = &card[card.find("SIGMAS")?..];
+    let list = &rest[rest.find('[')? + 1..];
+    let list = &list[..list.find(']')?];
+    let v: Option<Vec<f64>> = list.split(',').map(|s| s.trim().parse().ok()).collect();
+    v.filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,5 +1102,185 @@ mod tests {
         let mut c = base;
         c["beta_schedule"] = json!("squaredcos_cap_v2");
         assert!(SchedulerConfig::from_json(&c).is_err());
+    }
+}
+
+#[cfg(test)]
+mod flow_tests {
+    use super::*;
+
+    fn near(a: f32, b: f64) {
+        assert!((a as f64 - b).abs() < 1e-6, "{a} vs {b}");
+    }
+
+    #[test]
+    fn sd3_default_schedule_double_shifts_sigma_min() {
+        // sigma_min = shift(0.001) = 0.002994012; shifted again = 0.008928571.
+        let s = default_sigmas(2, 3.0);
+        assert_eq!(s.len(), 3);
+        near(s[0], 1.0);
+        near(s[1], 3.0 * 0.002994012 / (1.0 + 2.0 * 0.002994012));
+        assert_eq!(s[2], 0.0);
+        // 28 steps: strictly decreasing from 1 to the final 0.
+        let s = default_sigmas(28, 3.0);
+        assert_eq!(s.len(), 29);
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+        near(timestep(s[0]), 1000.0);
+    }
+
+    #[test]
+    fn z_image_schedule_is_shifted_linspace() {
+        let base = linspace_sigmas(8);
+        assert_eq!(base.len(), 8);
+        assert!((base[7] - 0.125).abs() < 1e-12);
+        let s = shifted_sigmas(&base, 3.0);
+        near(s[0], 1.0);
+        near(s[7], 3.0 * 0.125 / (1.0 + 2.0 * 0.125)); // 0.3
+        assert_eq!(s[8], 0.0);
+    }
+
+    #[test]
+    fn flux_mu_and_time_shift() {
+        assert!((calculate_shift(256, 256.0, 4096.0, 0.5, 1.15) - 0.5).abs() < 1e-12);
+        assert!((calculate_shift(4096, 256.0, 4096.0, 0.5, 1.15) - 1.15).abs() < 1e-12);
+        let mu = 1.15f64;
+        let s = dynamic_sigmas(&[1.0, 0.5], mu);
+        near(s[0], 1.0);
+        near(s[1], mu.exp() / (mu.exp() + 1.0));
+    }
+
+    #[test]
+    fn euler_step_reaches_data_from_noise_with_exact_velocity() {
+        // x_sigma = (1 - sigma) x0 + sigma n; v = n - x0. Stepping sigma 1 -> 0 lands on x0.
+        let (x0, n) = ([0.5f32, -2.0], [1.0f32, 0.25]);
+        let v: Vec<f32> = n.iter().zip(&x0).map(|(n, x)| n - x).collect();
+        let mut x = n.to_vec();
+        for w in shifted_sigmas(&linspace_sigmas(4), 3.0).windows(2) {
+            euler_step(&mut x, &v, w[0], w[1]);
+        }
+        assert!(
+            x.iter().zip(&x0).all(|(a, b)| (a - b).abs() < 1e-6),
+            "{x:?}"
+        );
+    }
+
+    #[test]
+    fn sana_dpm_sigmas() {
+        let s = dpm_flow_sigmas(2, 3.0);
+        assert_eq!(s.len(), 3);
+        near(s[0], 3.0 * 0.999 / (1.0 + 2.0 * 0.999));
+        near(s[1], 3.0 * 0.4995 / (1.0 + 2.0 * 0.4995));
+        assert_eq!(s[2], 0.0);
+    }
+
+    #[test]
+    fn dpm_solver_stays_on_the_straight_path() {
+        // Exact flow prediction on x_sigma = (1 - sigma) x0 + sigma n: every DPM-Solver++ step (first
+        // and second order) lands on the path, and the last one on x0.
+        let (x0, n) = ([0.5f32, -2.0], [1.0f32, 0.25]);
+        let v: Vec<f32> = n.iter().zip(&x0).map(|(n, x)| n - x).collect();
+        let sigmas = dpm_flow_sigmas(6, 3.0);
+        let mut x: Vec<f32> = x0
+            .iter()
+            .zip(&n)
+            .map(|(a, b)| (1.0 - sigmas[0]) * a + sigmas[0] * b)
+            .collect();
+        let mut dpm = DpmSolver2::default();
+        for i in 0..6 {
+            dpm.step(&mut x, &v, &sigmas, i);
+            let s = sigmas[i + 1];
+            for k in 0..2 {
+                let want = (1.0 - s) * x0[k] + s * n[k];
+                assert!((x[k] - want).abs() < 1e-5, "step {i}: {} vs {want}", x[k]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn gaussian_moments() {
+        let mut r = Rng::new(42);
+        let n = 100_000;
+        let xs: Vec<f64> = (0..n).map(|_| r.gaussian() as f64).collect();
+        let mean = xs.iter().sum::<f64>() / n as f64;
+        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 0.02 && (var - 1.0).abs() < 0.02, "mean {mean} var {var}");
+    }
+
+    #[test]
+    fn unshifted_linspace_without_dynamic_shifting() {
+        let s = Schedule::from_config(&json!({"shift": 1.0, "use_dynamic_shifting": false}));
+        assert_eq!(s.sigmas(&linspace_sigmas(4), 1024, 4), vec![1.0, 0.75, 0.5, 0.25, 0.0]);
+    }
+
+    #[test]
+    fn dynamic_shift_matches_diffusers() {
+        // FLUX.1-dev scheduler_config.json; 512x512 -> 32x32 packed tokens.
+        let cfg = json!({"base_image_seq_len": 256, "base_shift": 0.5, "max_image_seq_len": 4096,
+            "max_shift": 1.15, "shift": 3.0, "use_dynamic_shifting": true});
+        // mu = 1024 * 0.65/3840 + 0.5 - 256 * 0.65/3840 = 0.63; sigma' = e^mu / (e^mu + 1/sigma - 1).
+        let e = 0.63f64.exp();
+        let want: Vec<f64> = [1.0, 0.75, 0.5, 0.25].iter().map(|s| e / (e + 1.0 / s - 1.0)).collect();
+        let got = Schedule::from_config(&cfg).sigmas(&linspace_sigmas(4), 1024, 4);
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[4], 0.0);
+        for (g, w) in got.iter().zip(&want) {
+            assert!((*g as f64 - w).abs() < 1e-6, "{got:?} vs {want:?}");
+        }
+        assert!((got[2] - 0.652_490).abs() < 1e-5);
+    }
+
+    #[test]
+    fn empirical_mu_matches_diffusers() {
+        // compute_empirical_mu(1024, 4): m200 = 0.62999914, m10 = 1.98781143, a = (m200 - m10) / 190.
+        assert!((empirical_mu(1024, 4) - 2.030_689_7).abs() < 1e-6);
+        // Past 4300 tokens it is the m200 line alone.
+        assert!((empirical_mu(5000, 4) - (0.00016927 * 5000.0 + 0.45666666)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn terminal_stretch_lands_on_shift_terminal_and_keeps_start() {
+        let s = Schedule::from_config(&json!({
+            "use_dynamic_shifting": true, "base_image_seq_len": 256, "max_image_seq_len": 8192,
+            "base_shift": 0.5, "max_shift": 0.9, "shift_terminal": 0.02,
+        }));
+        let sig = s.sigmas(&linspace_sigmas(4), 4096, 4);
+        assert_eq!(sig.len(), 5);
+        assert!((sig[0] - 1.0).abs() < 1e-6, "{sig:?}");
+        assert!((sig[3] - 0.02).abs() < 1e-6, "{sig:?}");
+        assert_eq!(sig[4], 0.0);
+        assert!(sig.windows(2).all(|w| w[0] > w[1]));
+        // LTX-style config: 8 steps over 640 tokens.
+        let s = Schedule::from_config(&json!({"use_dynamic_shifting": true, "base_image_seq_len": 1024,
+            "max_image_seq_len": 4096, "base_shift": 0.95, "max_shift": 2.05, "shift_terminal": 0.1}));
+        let v = s.sigmas(&linspace_sigmas(8), 640, 8);
+        assert_eq!(v.len(), 9);
+        assert!((v[0] - 1.0).abs() < 1e-6 && (v[7] - 0.1).abs() < 1e-5 && v[8] == 0.0, "{v:?}");
+        assert!(v.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn no_terminal_is_plain_exponential_shift() {
+        // Viggle turbo: raw nodes, mu = 0.5 + 0.4 * (4096 - 256) / (8192 - 256), no stretch.
+        let s = Schedule::from_config(&json!({
+            "use_dynamic_shifting": true, "max_image_seq_len": 8192, "max_shift": 0.9, "shift_terminal": null,
+        }));
+        let sig = s.sigmas(&[1.0, 0.5], 4096, 2);
+        let mu: f64 = 0.5 + 0.4 * (4096.0 - 256.0) / (8192.0 - 256.0);
+        let want = mu.exp() / (mu.exp() + 1.0);
+        assert!((sig[1] as f64 - want).abs() < 1e-6 && sig[0] == 1.0, "{sig:?}");
+    }
+
+    #[test]
+    fn card_sigmas_reads_the_first_list() {
+        let card = "x\nSTEPS, SIGMAS = 6, [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]   # pass both\nSIGMAS_9 = [1.0, 1 / 6]";
+        assert_eq!(card_sigmas(card), Some(vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]));
+        assert_eq!(card_sigmas("no sigmas here"), None);
+        assert_eq!(card_sigmas("SIGMAS = [1 / 6]"), None);
     }
 }

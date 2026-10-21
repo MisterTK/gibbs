@@ -1,0 +1,29 @@
+// Chroma (diffusers `ChromaPipeline`): the FLUX `denoiser` (see `flux`) with every modulation row
+// from the `distilled_guidance_layer` approximator (no pooled text, no guidance embedder), T5-XXL
+// text only, true CFG.
+{
+  family: "chroma",
+  extends: "flux",
+  match: {
+    diffusers_class: ["ChromaPipeline", "ChromaTransformer2DModel"],
+  },
+  components: {
+    text_encoder: {family: "t5", dir: "text_encoder"},
+    text_encoder_2: null,
+    transformer: {family: "chroma", dir: "transformer"},
+  },
+  runtime: {
+    text_encoders: [
+      // ids + `</s>` (1) truncated to 512, padded with `<pad>` (0); `valid + 1` rows are kept
+      // (the first pad row too) but only the `valid` rows are keys, as the old Rust pipeline did
+      // (diffusers ChromaPipeline also lets that first pad be a key: `mask: "valid_plus1"`).
+      {name: "t5", component: "text_encoder", net: "encoder", tokenizer: "tokenizer", add_special: false,
+       eos: 1, max_len: 512, pad_to: 512, pad_id: 0, keep: "valid_plus1",
+       outputs: {hidden: "hidden"}},
+    ],
+    pooled: [],
+    guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
+    defaults: {steps: 35, guidance: 5.0},
+    summary: "fmt('Chroma ({denoiser.nd} double + {denoiser.ns} single blocks), T5-XXL + VAE')",
+  },
+}

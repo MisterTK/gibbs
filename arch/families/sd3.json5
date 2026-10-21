@@ -1,0 +1,169 @@
+// Stable Diffusion 3 / 3.5 (diffusers `StableDiffusion3Pipeline`): CLIP-L + CLIP-G (penultimate
+// hidden states + pooled projections) + optional T5-XXL, the `SD3Transformer2DModel` MMDiT (joint
+// image/text attention; SD3.5 MMDiT-X dual attention (`attn2`) and QK RMSNorm when the checkpoint has
+// them; the last block is context-pre-only), FlowMatchEulerDiscrete with a static shift, and the
+// 16-channel AutoencoderKL. The `denoiser` network runs on the `transformer/` subfolder.
+{
+  family: "sd3",
+  match: {
+    diffusers_class: ["StableDiffusion3Pipeline"],
+  },
+  pipeline: "diffusion",
+  use_lib: ["transformer", "diffusion"],
+  config: {
+    heads: "cfg.num_attention_heads",
+    head_dim: "cfg.attention_head_dim",
+    d: "heads * head_dim",
+    layers: "cfg.num_layers",
+    patch: "cfg.patch_size",
+    in_ch: "cfg.in_channels",
+    out_ch: "shape('proj_out.weight')[0] // (patch * patch)",
+    pos_max: "cfg.pos_embed_max_size",
+    joint: "cfg.joint_attention_dim",
+    pooled_dim: "shape('time_text_embed.text_embedder.linear_1.weight')[1]",
+    t_dim: "shape('time_text_embed.timestep_embedder.linear_1.weight')[1]",
+    eps: "1e-6",
+  },
+  checks: [
+    {expr: "first(json.scheduler_config.use_dynamic_shifting, false)", error: "SD3 scheduler with use_dynamic_shifting is not supported"},
+  ],
+  transforms: [
+    // Stored [1, pos_max^2, d]: the [pos_max^2, d] table the crop gathers rows from.
+    {tensor: "pos_embed.pos_embed", op: "reshape", args: {shape: ["pos_max * pos_max", "d"]}},
+  ],
+  constants: {
+    "ln.ones": {gen: "ones", when: "has('proj_out.weight')", args: {shape: ["d"]}},
+  },
+  components: {
+    text_encoder: {family: "clip_text", dir: "text_encoder"},
+    text_encoder_2: {family: "clip_text", dir: "text_encoder_2"},
+    text_encoder_3: {family: "t5", dir: "text_encoder_3"},
+    transformer: {family: "sd3", dir: "transformer"},
+    vae: {family: "sd_vae", dir: "vae"},
+    // Velocity for latents x [in_ch, h, w] at the step's timestep (sigma * 1000), context
+    // [nt, joint], pooled text [1, pooled_dim].
+    denoiser: {
+      vars: ["h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["in_ch", "h", "w"]},
+        {name: "context", dtype: "f32", shape: ["nt", "joint"]},
+        {name: "pooled", dtype: "f32", shape: [1, "pooled_dim"]},
+        {name: "t_feat", dtype: "f32", shape: [1, "t_dim"], gen: "timestep_embedding",
+         args: {t: "step:timestep", dim: "t_dim", flip_sin_to_cos: true, precision: "'f32'"}},
+        {name: "pos_rows", dtype: "u32", shape: ["(h // patch) * (w // patch)"], gen: "centered_crop_rows",
+         args: {pos_max: "pos_max", grid_h: "h // patch", grid_w: "w // patch"}},
+      ],
+      body: [
+        {let: {hp: "h // patch", wp: "w // patch"}},
+        // Patch embedding + the centred crop of the learned position table.
+        {op: "Conv2d", args: {stride: ["patch", "patch"], padding: [0, 0, 0, 0], dilation: [1, 1], groups: 1},
+         in: ["i:x", "w:pos_embed.proj.weight", "w?:pos_embed.proj.bias"], out: "x", name: "patch_embed"},
+        {op: "Reshape", args: {shape: ["d", "hp * wp"]}, in: ["x"], out: "x", name: "patch_flat"},
+        {op: "Transpose", args: {perm: [1, 0]}, in: ["x"], out: "x", name: "patch_rows"},
+        {op: "Embedding", in: ["w:pos_embed.pos_embed", "i:pos_rows"], out: "pe", name: "pos_embed"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "pos_add"},
+        // Conditioning: SiLU(timestep MLP + pooled-text MLP).
+        {use: "timestep_mlp", args: {w: "'time_text_embed.timestep_embedder'"}, in: ["i:t_feat"], out: "t", name: "time"},
+        {use: "timestep_mlp", args: {w: "'time_text_embed.text_embedder'"}, in: ["i:pooled"], out: "y", name: "text"},
+        {op: "Binary", args: {kind: "Add"}, in: ["t", "y"], out: "temb", name: "temb"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["temb"], out: "st", name: "temb_silu"},
+        {op: "Linear", in: ["i:context", "w:context_embedder.weight", "w?:context_embedder.bias"], out: "cx", name: "context_embedder"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('transformer_blocks.{i}')"}},
+          {let: {dual: "has(fmt('{p}.attn2.to_q.weight'))", pre_only: "!has(fmt('{p}.ff_context.net.0.proj.weight'))"}},
+          // Image chunks: shift, scale, gate (msa); shift, scale, gate (mlp); [shift, scale, gate (attn2)].
+          {op: "Linear", in: ["st", "w:{p}.norm1.linear.weight", "w?:{p}.norm1.linear.bias"], out: "e", name: "b{i}.norm1"},
+          {repeat: "k", count: "shape('e')[1] // d", body: [
+            {op: "Slice", args: {axis: -1, start: "k * d", end: "(k + 1) * d"}, in: ["e"], out: "e{k}", name: "b{i}.e{k}"},
+          ]},
+          // Context chunks: AdaLayerNormZero (6), or AdaLayerNormContinuous (scale, shift) when pre-only.
+          {op: "Linear", in: ["st", "w:{p}.norm1_context.linear.weight", "w?:{p}.norm1_context.linear.bias"], out: "ce", name: "b{i}.norm1_ctx"},
+          {repeat: "k", count: "shape('ce')[1] // d", body: [
+            {op: "Slice", args: {axis: -1, start: "k * d", end: "(k + 1) * d"}, in: ["ce"], out: "c{k}", name: "b{i}.c{k}"},
+          ]},
+          {use: "ln_modulate", in: ["x", "e0", "e1"], out: "nx", name: "b{i}.nx"},
+          // MMDiT-X: the second self-attention reads the pre-attention hidden states.
+          {use: "ln_modulate", in: ["x", "e6", "e7"], out: "nx2", name: "b{i}.nx2", when: "dual"},
+          {use: "ln_modulate", in: ["cx", "c0", "c1"], out: "nc", name: "b{i}.nc", when: "!pre_only"},
+          {use: "ln_modulate", in: ["cx", "c1", "c0"], out: "nc", name: "b{i}.nc", when: "pre_only"},
+          {use: "joint_attention", in: ["nx", "nc"], out: ["ia", "ca"], name: "b{i}.attn", args: {
+            wq: "fmt('{p}.attn.to_q')", wk: "fmt('{p}.attn.to_k')", wv: "fmt('{p}.attn.to_v')",
+            q_norm: "fmt('{p}.attn.norm_q')", k_norm: "fmt('{p}.attn.norm_k')",
+            cq: "fmt('{p}.attn.add_q_proj')", ck: "fmt('{p}.attn.add_k_proj')", cv: "fmt('{p}.attn.add_v_proj')",
+            cq_norm: "fmt('{p}.attn.norm_added_q')", ck_norm: "fmt('{p}.attn.norm_added_k')"}},
+          {op: "Linear", in: ["ia", "w:{p}.attn.to_out.0.weight", "w?:{p}.attn.to_out.0.bias"], out: "o", name: "b{i}.attn_out"},
+          {use: "gated_add", in: ["x", "o", "e2"], out: "x", name: "b{i}.res1"},
+          {block: [
+            {use: "qkv", in: ["nx2"], out: ["q", "k", "v"], name: "b{i}.attn2", args: {
+              wq: "fmt('{p}.attn2.to_q')", wk: "fmt('{p}.attn2.to_k')", wv: "fmt('{p}.attn2.to_v')",
+              q_norm: "fmt('{p}.attn2.norm_q')", k_norm: "fmt('{p}.attn2.norm_k')"}},
+            {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "a2", name: "b{i}.attn2.attn"},
+            {op: "Linear", in: ["a2", "w:{p}.attn2.to_out.0.weight", "w?:{p}.attn2.to_out.0.bias"], out: "o", name: "b{i}.attn2.out"},
+            {use: "gated_add", in: ["x", "o", "e8"], out: "x", name: "b{i}.res_a2"},
+          ], when: "dual"},
+          {use: "ln_modulate", in: ["x", "e3", "e4"], out: "nx", name: "b{i}.mlp_in"},
+          {use: "mlp_plain", in: ["nx"], out: "f", name: "b{i}.ff", args: {
+            up: "fmt('{p}.ff.net.0.proj')", down: "fmt('{p}.ff.net.2')", act: "'GeluTanh'"}},
+          {use: "gated_add", in: ["x", "f", "e5"], out: "x", name: "b{i}.res2"},
+          // The pre-only block's context output is discarded.
+          {block: [
+            {op: "Linear", in: ["ca", "w:{p}.attn.to_add_out.weight", "w?:{p}.attn.to_add_out.bias"], out: "o", name: "b{i}.ctx_out"},
+            {use: "gated_add", in: ["cx", "o", "c2"], out: "cx", name: "b{i}.cres1"},
+            {use: "ln_modulate", in: ["cx", "c3", "c4"], out: "nc", name: "b{i}.cmlp_in"},
+            {use: "mlp_plain", in: ["nc"], out: "f", name: "b{i}.ctx_ff", args: {
+              up: "fmt('{p}.ff_context.net.0.proj')", down: "fmt('{p}.ff_context.net.2')", act: "'GeluTanh'"}},
+            {use: "gated_add", in: ["cx", "f", "c5"], out: "cx", name: "b{i}.cres2"},
+          ], when: "!pre_only"},
+        ]},
+        // AdaLayerNormContinuous: chunks (scale, shift); proj_out rows are (py, px, c) patches.
+        {op: "Linear", in: ["st", "w:norm_out.linear.weight", "w?:norm_out.linear.bias"], out: "e", name: "norm_out"},
+        {op: "Slice", args: {axis: -1, start: 0, end: "d"}, in: ["e"], out: "scale", name: "norm_out.scale"},
+        {op: "Slice", args: {axis: -1, start: "d", end: "2 * d"}, in: ["e"], out: "shift", name: "norm_out.shift"},
+        {use: "ln_modulate", in: ["x", "shift", "scale"], out: "x", name: "norm_out.mod"},
+        {op: "Linear", in: ["x", "w:proj_out.weight", "w?:proj_out.bias"], out: "y", name: "proj_out"},
+        {op: "Reshape", args: {shape: ["hp", "wp", "patch", "patch", "out_ch"]}, in: ["y"], out: "y", name: "unpatch_split"},
+        {op: "Transpose", args: {perm: [4, 0, 2, 1, 3]}, in: ["y"], out: "y", name: "unpatch_perm"},
+        {op: "Reshape", args: {shape: ["out_ch", "hp * patch", "wp * patch"]}, in: ["y"], out: "velocity", name: "unpatch"},
+      ],
+      outputs: ["velocity"],
+    },
+  },
+  runtime: {
+    text_encoders: [
+      // The CLIP BPE is the shared openai vocabulary (as `ClipTextTransformer::load_diffusers`);
+      // the pad token comes from each tower's own tokenizer dir.
+      {name: "l", component: "text_encoder", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
+       tokenizer_config: "tokenizer", pad_token: "config",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
+       outputs: {penult: "penult", pooled: "pooled"}},
+      {name: "g", component: "text_encoder_2", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
+       tokenizer_config: "tokenizer_2", pad_token: "config",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
+       outputs: {penult: "penult", pooled: "pooled"}},
+      // T5 framing: ids truncated to 255, `</s>` (1), padded with `<pad>` (0) to 256; diffusers passes
+      // no attention mask, so every row is a key.
+      {name: "t5", component: "text_encoder_3", net: "encoder", tokenizer: "tokenizer_3", optional: true,
+       add_special: false, eos: 1, max_len: 256, pad_to: 256, pad_id: 0, mask: false, outputs: {hidden: "hidden"}},
+    ],
+    context: [
+      {features: ["l.penult", "g.penult"], width: "denoiser.joint"},
+      {features: ["t5.hidden"], width: "denoiser.joint", rows: 256},
+    ],
+    pooled: ["l.pooled", "g.pooled"],
+    negative: {default: "", zeros_for_empty: false},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // Static shift (`sd3` sigmas take no mu).
+    scheduler: {kind: "flow_euler", sigmas: "sd3", shift: "first(json.scheduler_config.shift, 3)"},
+    timestep: "sigma * 1000",
+    // diffusers runs CFG only when guidance_scale > 1.
+    guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
+    latent: {channels: "denoiser.in_ch", factor: 8, pack: "none", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: "encoder",
+          decode_affine: {mul: "1 / vae.cfg.scaling_factor", add: "first(vae.cfg.shift_factor, 0)"},
+          output: "clamp_pm1"},
+    // ponytail: CPU-sized 512 default (the checkpoints' native size is 1024; pass width/height for it).
+    defaults: {width: 512, height: 512, steps: 28, guidance: 7.0, multiple: 16,
+               max_side: "denoiser.pos_max * denoiser.patch * 8", max_steps: 200},
+    summary: "fmt('Stable Diffusion 3 MMDiT ({denoiser.layers} blocks), CLIP-L + CLIP-G (+ T5-XXL) + {denoiser.in_ch}-ch VAE')",
+  },
+}

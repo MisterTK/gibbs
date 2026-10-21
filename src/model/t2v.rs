@@ -6,7 +6,7 @@ use crate::model::clip::{ClipTextTransformer, Tensors};
 use crate::model::hub::{is_synthetic_model_id, HuggingFaceHub};
 use crate::model::image::ImageBuffer;
 use crate::model::loaders::safetensors::SafetensorsWeightReader;
-use crate::model::sd::{alphas_cumprod, Rng, TRAIN_STEPS};
+use crate::runtime::sched::{alphas_cumprod, Rng, TRAIN_STEPS};
 use crate::model::unet3d::Unet3d;
 use crate::model::vae::SdVae;
 use std::io::Write;

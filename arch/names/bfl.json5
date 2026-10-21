@@ -1,0 +1,42 @@
+// Black Forest Labs single-file FLUX names (`flux` repo state dicts, city96-style GGUFs) -> the
+// canonical diffusers names. BFL keeps q/k/v (double blocks) and q/k/v/mlp (single-block
+// `linear1`) fused: they map to diffusers' fused names (`attn.to_qkv`, `attn.to_added_qkv`,
+// `attn.to_qkv_mlp_proj`); specs read either the fused weight or the diffusers parts
+// (`linear_parts`). `final_layer.adaLN_modulation.1` stays: BFL orders its chunks (shift, scale),
+// diffusers' `norm_out.linear` (scale, shift).
+{
+  rules: [
+    ["img_in.{s:*}", "x_embedder.{s}"],
+    ["txt_in.{s:*}", "context_embedder.{s}"],
+    ["time_in.in_layer.{s:*}", "time_text_embed.timestep_embedder.linear_1.{s}"],
+    ["time_in.out_layer.{s:*}", "time_text_embed.timestep_embedder.linear_2.{s}"],
+    ["vector_in.in_layer.{s:*}", "time_text_embed.text_embedder.linear_1.{s}"],
+    ["vector_in.out_layer.{s:*}", "time_text_embed.text_embedder.linear_2.{s}"],
+    ["guidance_in.in_layer.{s:*}", "time_text_embed.guidance_embedder.linear_1.{s}"],
+    ["guidance_in.out_layer.{s:*}", "time_text_embed.guidance_embedder.linear_2.{s}"],
+    ["double_blocks.{i}.img_mod.lin.{s:*}", "transformer_blocks.{i}.norm1.linear.{s}"],
+    ["double_blocks.{i}.txt_mod.lin.{s:*}", "transformer_blocks.{i}.norm1_context.linear.{s}"],
+    ["double_blocks.{i}.img_attn.qkv.{s:*}", "transformer_blocks.{i}.attn.to_qkv.{s}"],
+    ["double_blocks.{i}.txt_attn.qkv.{s:*}", "transformer_blocks.{i}.attn.to_added_qkv.{s}"],
+    ["double_blocks.{i}.img_attn.norm.query_norm.scale", "transformer_blocks.{i}.attn.norm_q.weight"],
+    ["double_blocks.{i}.img_attn.norm.key_norm.scale", "transformer_blocks.{i}.attn.norm_k.weight"],
+    ["double_blocks.{i}.txt_attn.norm.query_norm.scale", "transformer_blocks.{i}.attn.norm_added_q.weight"],
+    ["double_blocks.{i}.txt_attn.norm.key_norm.scale", "transformer_blocks.{i}.attn.norm_added_k.weight"],
+    ["double_blocks.{i}.img_attn.proj.{s:*}", "transformer_blocks.{i}.attn.to_out.0.{s}"],
+    ["double_blocks.{i}.txt_attn.proj.{s:*}", "transformer_blocks.{i}.attn.to_add_out.{s}"],
+    ["double_blocks.{i}.img_mlp.0.{s:*}", "transformer_blocks.{i}.ff.net.0.proj.{s}"],
+    ["double_blocks.{i}.img_mlp.2.{s:*}", "transformer_blocks.{i}.ff.net.2.{s}"],
+    ["double_blocks.{i}.txt_mlp.0.{s:*}", "transformer_blocks.{i}.ff_context.net.0.proj.{s}"],
+    ["double_blocks.{i}.txt_mlp.2.{s:*}", "transformer_blocks.{i}.ff_context.net.2.{s}"],
+    ["single_blocks.{i}.modulation.lin.{s:*}", "single_transformer_blocks.{i}.norm.linear.{s}"],
+    ["single_blocks.{i}.linear1.{s:*}", "single_transformer_blocks.{i}.attn.to_qkv_mlp_proj.{s}"],
+    ["single_blocks.{i}.linear2.{s:*}", "single_transformer_blocks.{i}.proj_out.{s}"],
+    ["single_blocks.{i}.norm.query_norm.scale", "single_transformer_blocks.{i}.attn.norm_q.weight"],
+    ["single_blocks.{i}.norm.key_norm.scale", "single_transformer_blocks.{i}.attn.norm_k.weight"],
+    ["final_layer.linear.{s:*}", "proj_out.{s}"],
+    // Chroma's modulation approximator.
+    ["distilled_guidance_layer.layers.{i}.in_layer.{s:*}", "distilled_guidance_layer.layers.{i}.linear_1.{s}"],
+    ["distilled_guidance_layer.layers.{i}.out_layer.{s:*}", "distilled_guidance_layer.layers.{i}.linear_2.{s}"],
+    ["distilled_guidance_layer.norms.{i}.scale", "distilled_guidance_layer.norms.{i}.weight"],
+  ],
+}

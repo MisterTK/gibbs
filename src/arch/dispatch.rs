@@ -8,11 +8,12 @@ use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::runtime::encoder::system1::JevSystem1Model;
-use crate::model::text_to_image::{load_image_model, ImageGenerator};
+use crate::model::text_to_image::load_image_model;
 use crate::model::weight_format::{
     load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
     ReencodePolicy,
 };
+use crate::runtime::diffusion::{Extras, ImageGenerator, SpecDiffusion};
 use crate::scheduler::ExecutableModel;
 use serde_json::{json, Map, Value as J};
 use std::collections::HashSet;
@@ -109,10 +110,20 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
     (o.admit)(adapter)?;
     let artifacts = hub.auto_download_and_cache(id, o.token)?;
     (o.stage)("reading weights, choosing weight format");
-    // legacy: until Phase 9 (diffusion specs). Image repos are recognised by their files.
-    if o.family.is_none() {
-        if let Some(img) = load_image_model(&artifacts, hub) {
-            return img.map(Loaded::Image);
+    // Image repos are recognised by their files; `--arch` of a diffusion family loads as that one.
+    match o.family {
+        Some(f) if super::registry()?.spec(f, &Default::default()).is_ok_and(|s| s.pipeline == Pipeline::Diffusion) => {
+            let p = SpecDiffusion::load(&artifacts, hub, o.placement, Some(f), &Extras::default())?;
+            return Ok(Loaded::Image(Arc::new(p)));
+        }
+        Some(_) => {}
+        None => {
+            // legacy: until the remaining image families' phases (`load_image_model`).
+            let img = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement)
+                .or_else(|| load_image_model(&artifacts, hub));
+            if let Some(img) = img {
+                return img.map(Loaded::Image);
+            }
         }
     }
     let (model, choice) = load_lm(&artifacts, o)?;

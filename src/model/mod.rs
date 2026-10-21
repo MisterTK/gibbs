@@ -8,7 +8,6 @@
 //!      single-pass SwiGLU, and pre-allocated zero-allocation KV cache.
 //!    - [`crate::runtime::encoder::system1::JevSystem1Model`]: pretrained sentence encoder
 //!      (default all-MiniLM-L6-v2) answering choice/bool questions zero-shot by embedding cosine similarity.
-//!    - [`sd::SdPipeline`]: Stable Diffusion 2.x (CLIP + UNet + VAE) loaded from a real GGUF checkpoint.
 //!    - [`NanoLlm`]: Minimal reference transformer decoder for smoke tests and micro-benchmarking.
 //!
 //! 2. **Universal Quantization & Layer Abstractions**:
@@ -46,7 +45,6 @@
 pub mod audio;
 pub mod classifier;
 pub mod clip;
-pub mod dcae;
 pub mod diff_fixtures;
 pub mod diff_graph;
 pub mod dit;
@@ -54,7 +52,6 @@ pub mod dit_graph;
 pub mod draft;
 pub mod fasttext;
 pub mod fingerprint;
-pub mod flow;
 pub mod flux;
 pub mod gemma3_text;
 pub mod gemma4;
@@ -87,10 +84,6 @@ pub mod qwen_vae21;
 pub mod reencode;
 pub mod variant;
 pub mod repack;
-pub mod sana;
-pub mod sd;
-pub mod sd3;
-pub mod sd_sched;
 pub mod siglip;
 pub mod simd;
 pub mod spm;

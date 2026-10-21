@@ -11,16 +11,16 @@ mod graph_program;
 use crate::model::dit::{
     add_gated, norm_modulate, read_config, read_scheduler, rms_norm, silu_of, timestep_features,
 };
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::flux::Store;
 use crate::model::image::ImageBuffer;
 use crate::model::nn;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
-use crate::model::qwen_image::{QLin, Sched};
+use crate::model::qwen_image::QLin;
 use crate::model::qwen_vae21::QwenVae21;
-use crate::model::sd::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::sched::Rng;
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
@@ -358,7 +358,7 @@ impl Dit21 {
 pub(crate) struct Core {
     dit: Dit21,
     vae: QwenVae21,
-    sched: Sched,
+    sched: sched::Schedule,
     /// Raw sampling sigmas a distilled finetune's card prescribes; `None`: `linspace(1, 1/steps)`.
     sigmas: Option<Vec<f64>>,
 }
@@ -371,7 +371,7 @@ impl Core {
     fn new(
         dit: Dit21,
         vae: QwenVae21,
-        sched: Sched,
+        sched: sched::Schedule,
         sigmas: Option<Vec<f64>>,
         text_width: usize,
     ) -> Result<Self, String> {
@@ -454,9 +454,9 @@ impl Core {
 
         let base: Vec<f64> = match &self.sigmas {
             Some(s) if req.steps.is_none_or(|n| n == s.len()) => s.clone(),
-            _ => flow::linspace_sigmas(steps),
+            _ => sched::linspace_sigmas(steps),
         };
-        let sigmas = self.sched.sigmas(&base, n_img);
+        let sigmas = self.sched.sigmas(&base, n_img, base.len());
         let mut rng = Rng::new(req.seed);
         let noise: Vec<f32> = (0..ch * n_img).map(|_| rng.gaussian()).collect();
         // Channel-first noise `[ch, h*w]` -> tokens `[h*w, ch]` (`_pack_latents`).
@@ -470,7 +470,7 @@ impl Core {
                     .zip(&vn)
                     .for_each(|(v, n)| *v = n + guidance * (*v - n));
             }
-            flow::euler_step(&mut x, &v, s[0], s[1]);
+            sched::euler_step(&mut x, &v, s[0], s[1]);
             println!(
                 "  step {}/{} (sigma {:.4}): {:.2}s",
                 i + 1,
@@ -541,7 +541,7 @@ impl QwenImage21Pipeline {
             dit.dim,
             path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())
         );
-        let sched = Sched::from_config(&scheduler.map_or_else(|| read_scheduler(dir), Ok)?);
+        let sched = sched::Schedule::from_config(&scheduler.map_or_else(|| read_scheduler(dir), Ok)?);
         let width = text["hidden_size"]
             .as_u64()
             .ok_or("text_encoder config: missing text_config.hidden_size")?
@@ -755,7 +755,7 @@ mod tests {
         let core = Core::new(
             dit,
             QwenVae21::load(&vae).unwrap(),
-            Sched::from_config(&sched),
+            sched::Schedule::from_config(&sched),
             sigmas,
             4096,
         )

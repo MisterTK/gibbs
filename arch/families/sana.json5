@@ -1,0 +1,128 @@
+// Sana (diffusers `SanaPipeline`, e.g. Efficient-Large-Model/Sana_600M_512px_diffusers): Gemma 2
+// text encoder behind the "complex human instruction", the `SanaTransformer2DModel` linear DiT
+// (`denoiser`, run on `transformer/`: ReLU linear self-attention, cross-attention to the projected
+// caption, GLU MBConv feed-forward, adaLN-single), DPM-Solver++ 2M on flow sigmas, 32x DC-AE.
+// ponytail: no resolution binning (the pipeline snaps to aspect-ratio bins and resizes back).
+{
+  family: "sana",
+  match: {diffusers_class: ["SanaPipeline"]},
+  pipeline: "diffusion",
+  use_lib: ["diffusion"],
+  config: {
+    heads: "cfg.num_attention_heads",
+    head_dim: "cfg.attention_head_dim",
+    hidden: "heads * head_dim",
+    cross_heads: "cfg.num_cross_attention_heads",
+    layers: "cfg.num_layers",
+    in_ch: "cfg.in_channels",
+    caption_channels: "shape('caption_projection.linear_1.weight')[1]",
+    ts_scale: "first(cfg.timestep_scale, 1)",
+    sched: "json.scheduler_config",
+  },
+  checks: [
+    {expr: "cfg._class_name == 'SanaTransformer2DModel' && (cfg.patch_size != 1 || cfg.guidance_embeds == true || cfg.qk_norm != null || cfg.interpolation_scale != null || first(cfg.out_channels, cfg.in_channels) != cfg.in_channels)",
+     error: "Sana: only patch_size 1 without guidance embeds, qk_norm or positional embeddings (out_channels == in_channels) is supported"},
+    {expr: "sched != null && (sched._class_name != 'DPMSolverMultistepScheduler' || sched.algorithm_type != 'dpmsolver++' || sched.prediction_type != 'flow_prediction' || sched.use_flow_sigmas != true || sched.solver_order != 2 || sched.solver_type != 'midpoint' || sched.final_sigmas_type != 'zero')",
+     error: "Sana: scheduler {sched._class_name} is not the DPM-Solver++ 2M flow configuration this engine runs"},
+  ],
+  transforms: [
+    // 1x1 convs run as Linear on token rows.
+    {tensor: "patch_embed.proj.weight", op: "conv_to_linear"},
+    {tensor: "transformer_blocks.{i}.ff.conv_depth.{n:*}", op: "to_f32"},
+    {tensor: "transformer_blocks.{i}.scale_shift_table", op: "to_f32"},
+    {tensor: "transformer_blocks.{i}.ff.conv_inverted.weight", op: "conv_to_linear"},
+    {tensor: "transformer_blocks.{i}.ff.conv_point.weight", op: "conv_to_linear"},
+    {tensor: "scale_shift_table", op: "to_f32"},
+  ],
+  constants: {
+    "ln.ones": {gen: "ones", when: "cfg._class_name == 'SanaTransformer2DModel'", args: {shape: ["hidden"]}},
+    "la.eps": {gen: "fill", args: {shape: [1], value: 1e-15}},
+  },
+  components: {
+    text_encoder: {family: "gemma2", dir: "text_encoder"},
+    transformer: {family: "sana", dir: "transformer"},
+    vae: {family: "dcae", dir: "vae"},
+    // x [in_ch, h, w] latents, context [nt, caption_channels] raw Gemma states -> velocity [in_ch, h, w].
+    denoiser: {
+      vars: ["h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["in_ch", "h", "w"]},
+        {name: "context", dtype: "f32", shape: ["nt", "caption_channels"]},
+        {name: "tfeat", dtype: "f32", shape: [1, 256], gen: "timestep_embedding",
+         args: {t: "fmt('step:timestep * {ts_scale}')", dim: 256, precision: "'f32'"}},
+      ],
+      body: [
+        {op: "Reshape", args: {shape: ["in_ch", "h * w"]}, in: ["i:x"], out: "x", name: "x.flat"},
+        {op: "Transpose", args: {perm: [1, 0]}, in: ["x"], out: "x", name: "x.rows"},
+        {op: "Linear", in: ["x", "w:patch_embed.proj.weight", "w?:patch_embed.proj.bias"], out: "x", name: "patch"},
+        // adaLN-single: emb [1, d]; tm [1, 6d].
+        {use: "timestep_mlp", args: {w: "'time_embed.emb.timestep_embedder'"}, in: ["i:tfeat"], out: "emb", name: "t_emb"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["emb"], out: "e", name: "t_act"},
+        {op: "Linear", in: ["e", "w:time_embed.linear.weight", "w?:time_embed.linear.bias"], out: "tm", name: "t_mod"},
+        {use: "caption_proj", args: {w: "'caption_projection'", norm: "'caption_norm'"}, in: ["i:context"], out: "cap", name: "caption"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('transformer_blocks.{i}')"}},
+          {op: "Reshape", args: {shape: [1, "6 * hidden"]}, in: ["w:{p}.scale_shift_table"], out: "m", name: "b{i}.sst"},
+          {op: "Binary", args: {kind: "Add"}, in: ["m", "tm"], out: "m", name: "b{i}.mod"},
+          // shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+          {repeat: "k", count: 6, body: [
+            {op: "Slice", args: {axis: 1, start: "k * hidden", end: "(k + 1) * hidden"}, in: ["m"], out: "m{k}", name: "b{i}.mod{k}"},
+          ]},
+          {use: "ln_modulate", in: ["x", "m0", "m1"], out: "nx", name: "b{i}.n1"},
+          {op: "Linear", in: ["nx", "w:{p}.attn1.to_q.weight", "w?:{p}.attn1.to_q.bias"], out: "q", name: "b{i}.q"},
+          {op: "Linear", in: ["nx", "w:{p}.attn1.to_k.weight", "w?:{p}.attn1.to_k.bias"], out: "k", name: "b{i}.k"},
+          {op: "Linear", in: ["nx", "w:{p}.attn1.to_v.weight", "w?:{p}.attn1.to_v.bias"], out: "v", name: "b{i}.v"},
+          {use: "linear_attention", in: ["q", "k", "v"], out: "a", name: "b{i}.la"},
+          {op: "Linear", in: ["a", "w:{p}.attn1.to_out.0.weight", "w?:{p}.attn1.to_out.0.bias"], out: "a", name: "b{i}.o"},
+          {use: "gated_add", in: ["x", "a", "m2"], out: "x", name: "b{i}.x1"},
+          {op: "Linear", in: ["x", "w:{p}.attn2.to_q.weight", "w?:{p}.attn2.to_q.bias"], out: "q", name: "b{i}.cq"},
+          {op: "Linear", in: ["cap", "w:{p}.attn2.to_k.weight", "w?:{p}.attn2.to_k.bias"], out: "k", name: "b{i}.ck"},
+          {op: "Linear", in: ["cap", "w:{p}.attn2.to_v.weight", "w?:{p}.attn2.to_v.bias"], out: "v", name: "b{i}.cv"},
+          {op: "Attention", args: {heads: "cross_heads", kv_heads: "cross_heads", causal: false}, in: ["q", "k", "v"], out: "a", name: "b{i}.xattn"},
+          {op: "Linear", in: ["a", "w:{p}.attn2.to_out.0.weight", "w?:{p}.attn2.to_out.0.bias"], out: "a", name: "b{i}.co"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "b{i}.x2"},
+          {use: "ln_modulate", in: ["x", "m3", "m4"], out: "nx", name: "b{i}.n2"},
+          {use: "glumbconv", args: {p: "fmt('{p}.ff')"}, in: ["nx"], out: "y", name: "b{i}.ff"},
+          {use: "gated_add", in: ["x", "y", "m5"], out: "x", name: "b{i}.x3"},
+        ]},
+        {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["w:scale_shift_table"], out: "shift", name: "sst_out.shift"},
+        {op: "Slice", args: {axis: 0, start: 1, end: 2}, in: ["w:scale_shift_table"], out: "scale", name: "sst_out.scale"},
+        {op: "Binary", args: {kind: "Add"}, in: ["shift", "emb"], out: "shift", name: "final.shift"},
+        {op: "Binary", args: {kind: "Add"}, in: ["scale", "emb"], out: "scale", name: "final.scale"},
+        {use: "ln_modulate", in: ["x", "shift", "scale"], out: "y", name: "final.n"},
+        {op: "Linear", in: ["y", "w:proj_out.weight", "w?:proj_out.bias"], out: "y", name: "proj_out"},
+        {op: "Transpose", args: {perm: [1, 0]}, in: ["y"], out: "y", name: "out.t"},
+        {op: "Reshape", args: {shape: ["in_ch", "h", "w"]}, in: ["y"], out: "velocity", name: "out"},
+      ],
+      outputs: ["velocity"],
+    },
+  },
+  runtime: {
+    text_encoders: [{
+      name: "gemma", component: "text_encoder", net: "text", tokenizer: "tokenizer",
+      // Pipeline default `complex_human_instruction`, newline-joined, before the prompt (positive only).
+      template: "{prefix}{prompt}", negative_template: "{prompt}",
+      prefix: "Given a user prompt, generate an 'Enhanced prompt' that provides detailed visual descriptions suitable for image generation. Evaluate the level of detail in the user prompt:\n- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, and spatial relationships to create vivid and concrete scenes.\n- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.\nHere are examples of how to transform or refine prompts:\n- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled up in a round shape, sleeping peacefully on a warm sunny windowsill, surrounded by pots of blooming red flowers.\n- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps, a diverse crowd of people in colorful clothing, and a double-decker bus passing by towering glass skyscrapers.\nPlease generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:\nUser Prompt: ",
+      lowercase: true, add_special: true,
+      // Pipeline max_sequence_length 300: with the instruction BOS + the last 299 of prefix_len + 298
+      // positions (the instruction's last token onwards); padding is masked out, so only real rows.
+      max_len: "prefix_len > 0 ? prefix_len + 298 : 300",
+      keep: "all",
+      drop: {from: 1, to: "prefix_len - 1"},
+      outputs: {hidden: "hidden"},
+    }],
+    context: [{features: ["gemma.hidden"]}],
+    pooled: [],
+    negative: {default: "", zeros_for_empty: false},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // dpm_flow sigmas read the shift only.
+    scheduler: {kind: "flow_dpm2", sigmas: "dpm_flow", shift: "first(json.scheduler_config.flow_shift, 3)"},
+    timestep: "floor(sigma * 1000)",
+    guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
+    latent: {channels: "vae.latent_channels", factor: "vae.factor", pack: "none", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", decode_affine: {mul: "1 / vae.scaling", add: 0}, output: "clamp_pm1"},
+    defaults: {width: "denoiser.cfg.sample_size * vae.factor", height: "denoiser.cfg.sample_size * vae.factor",
+               steps: 20, guidance: 4.5, multiple: "vae.factor", max_side: 4096, max_steps: 200},
+    summary: "fmt('Sana linear DiT ({denoiser.layers} blocks, dim {denoiser.hidden}), Gemma 2 text encoder + DC-AE f{vae.factor}c{vae.latent_channels}')",
+  },
+}

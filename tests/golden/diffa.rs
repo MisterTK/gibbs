@@ -1,14 +1,11 @@
-//! Diffusion goldens, group A: CLIP text tower, SD UNet, SD3 MMDiT, FLUX transformer, Sana (Gemma 2
-//! encoder + linear DiT), SD VAE, DC-AE and the tiny SD text-to-image pipeline. Every fixture is a
-//! diffusers-layout component directory on disk.
+//! Diffusion goldens, group A, through the family specs (`arch/families`) and `runtime::diffusion`:
+//! CLIP text tower, SD UNet, SD3 MMDiT, FLUX transformer, Sana (Gemma 2 encoder + linear DiT), SD
+//! VAE, DC-AE nets, and the SD / SD3 / Sana / FLUX.1 / Chroma pipelines through the public loader.
+//! Every fixture is a diffusers-layout component directory on disk.
 
 use crate::util::*;
 use gibbs_engine::hardware::Device;
-use gibbs_engine::model::clip::{ClipTextTransformer, Tensors};
-use gibbs_engine::model::diff_graph::with_gpu;
-use gibbs_engine::model::dit_graph::ProgramCache;
 use gibbs_engine::model::hub::HuggingFaceHub;
-use gibbs_engine::model::loaders::SafetensorsWeightReader;
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
@@ -47,19 +44,16 @@ fn write_specs(path: &Path, seed: u64, specs: &[(String, Vec<usize>)], dtype: St
     write_st_as(path, &w.tensors, dtype);
 }
 
-/// Runs `f` on `dev`: Metal programs (thread-local switch) or the native CPU forward. The Metal
-/// leg must not enter any CPU compute entry point (a silent fallback would match by construction).
+/// Runs `f` on `dev` (the spec networks are pinned to it). The Metal leg must not enter any CPU
+/// compute entry point (a silent fallback would match by construction).
 fn on<T>(dev: Device, f: impl FnOnce() -> T) -> T {
     use gibbs_engine::hardware::cpu_compute::entered;
-    match dev {
-        Device::Metal => {
-            let n = entered();
-            let out = with_gpu(f);
-            assert_eq!(entered(), n, "Metal leg ran CPU compute");
-            out
-        }
-        _ => f(),
+    let n = entered();
+    let out = f();
+    if dev == Device::Metal {
+        assert_eq!(entered(), n, "Metal leg ran CPU compute");
     }
+    out
 }
 
 /// Every k-th value so at most 4096 remain.
@@ -74,6 +68,11 @@ fn rand(n: usize, seed: u64) -> Vec<f32> {
 
 fn tol(rel: f64, cos: f64) -> Tol {
     Tol { rel, cos }
+}
+
+/// `Pin(dev)` placement of a spec network.
+fn pin(dev: Device) -> gibbs_engine::hardware::PlacementMode {
+    gibbs_engine::hardware::PlacementMode::Pin(dev)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -122,6 +121,11 @@ fn clip_hub(dir: &Path) -> HuggingFaceHub {
 
 /// diffusers `text_encoder/` (CLIPTextModel[WithProjection], 2 layers, d 64) + `tokenizer/`.
 fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u64) {
+    write_clip_proj(dir, te, tok, quick, if proj { 48 } else { 0 }, seed);
+}
+
+/// [`write_clip`] with a `proj`-wide `text_projection` (0: none).
+fn write_clip_proj(dir: &Path, te: &str, tok: &str, quick: bool, proj: usize, seed: u64) {
     let d = CLIP_D;
     let mut s: Specs = vec![
         ("text_model.embeddings.token_embedding.weight".into(), vec![CLIP_VOCAB, d]),
@@ -138,18 +142,18 @@ fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u6
         nrm(&mut s, &format!("{p}.layer_norm2"), d);
     }
     nrm(&mut s, "text_model.final_layer_norm", d);
-    if proj {
-        s.push(("text_projection.weight".into(), vec![48, d]));
+    if proj > 0 {
+        s.push(("text_projection.weight".into(), vec![proj, d]));
     }
     write_specs(&dir.join(te).join("model.safetensors"), seed, &s, StDtype::F32);
     write_json(
         &dir.join(te).join("config.json"),
         &json!({
-            "architectures": [if proj { "CLIPTextModelWithProjection" } else { "CLIPTextModel" }],
+            "architectures": [if proj > 0 { "CLIPTextModelWithProjection" } else { "CLIPTextModel" }],
             "model_type": "clip_text_model", "hidden_act": if quick { "quick_gelu" } else { "gelu" },
             "hidden_size": d, "intermediate_size": 2 * d, "num_attention_heads": 1,
             "num_hidden_layers": 2, "max_position_embeddings": 77, "vocab_size": CLIP_VOCAB,
-            "layer_norm_eps": 1e-5, "projection_dim": 48
+            "layer_norm_eps": 1e-5, "projection_dim": if proj > 0 { proj } else { 48 }
         }),
     );
     let pad = if quick { "<|endoftext|>" } else { "!" };
@@ -165,22 +169,37 @@ fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u6
 fn clip_case(case: &str, quick: bool, proj: bool) {
     let dir = fixture_dir(case);
     write_clip(&dir, "text_encoder", "tokenizer", quick, proj, 21);
-    let hub = clip_hub(&dir);
-    let clip = ClipTextTransformer::load_diffusers(
-        &hub,
-        &dir.join("text_encoder"),
-        &dir.join("tokenizer"),
-    )
-    .unwrap();
+    // runner: gibbs_engine::runtime::diffusion::Net (`clip_text` spec, network `text`) on
+    // `text_encoder/`, prompts framed as `clip.rs` does: [BOS, ids <= 75, EOS] padded to 77.
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net};
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer/tokenizer.json")).unwrap();
+    let map: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("tokenizer/special_tokens_map.json")).unwrap()).unwrap();
+    let pad = if map["pad_token"] == "!" { 0 } else { 49407 };
     golden(case, TOL, |dev| {
+        let net = Net::open(&dir.join("text_encoder"), "clip_text", "text", pin(dev)).unwrap();
         let mut o = Out::default();
         for (name, prompt) in [("a", "t5 t17 t200 t99"), ("empty", "")] {
-            let p = on(dev, || clip.encode(prompt, true)).unwrap();
-            let l = on(dev, || clip.encode(prompt, false)).unwrap();
-            o.f(format!("{name}.penult"), &stride(&p.hidden))
-                .f(format!("{name}.last"), &stride(&l.hidden))
-                .f(format!("{name}.pooled"), &l.pooled);
+            let ids = tok.encode(prompt, false).unwrap().get_ids().to_vec();
+            let n = ids.len().min(75);
+            let mut framed = vec![pad; 77];
+            framed[0] = 49406;
+            framed[1..=n].copy_from_slice(&ids[..n]);
+            framed[n + 1] = 49407;
+            let given = [
+                ("token_ids", Tensor::U32(framed)),
+                ("positions", Tensor::U32((0..77).collect())),
+                ("last_index", Tensor::U32(vec![n as u32 + 1])),
+            ];
+            let out = on(dev, || net.run(&[("rows", Val::Num(77.0))], &given, &[])).unwrap();
+            let get = |k: &str| out.iter().find(|(n, _)| n == k).unwrap().1.as_f32().unwrap().to_vec();
+            o.f(format!("{name}.penult"), &stride(&get("penult")))
+                .f(format!("{name}.last"), &stride(&get("hidden")))
+                .f(format!("{name}.pooled"), &get("pooled"));
         }
+        assert_eq!(unconsumed(&net.model, &[&net], &[]), Vec::<String>::new());
         o
     });
 }
@@ -283,27 +302,34 @@ fn write_unet(dir: &Path, ctx: usize, add: usize, cond: usize) {
 }
 
 fn unet_case(case: &str, add: usize, cond: usize) {
-    use gibbs_engine::model::unet::{alias_diffusers, Heads, SdUnet};
     let (ctx, h, w, ctx_len) = (48, 8, 12, 5);
     let dir = fixture_dir(case);
     write_unet(&dir, ctx, add, cond);
     let u = dir.join("unet");
-    let cfg: Value =
-        serde_json::from_slice(&std::fs::read(u.join("config.json")).unwrap()).unwrap();
-    let reader = SafetensorsWeightReader::new(u.join("diffusion_pytorch_model.safetensors")).unwrap();
-    let mut t = Tensors::safetensors(&reader).unwrap();
-    alias_diffusers(&mut t, 1).unwrap();
-    // runner: internal gibbs_engine::model::unet::SdUnet::forward
-    let unet = SdUnet::load(&t, "", Heads::from_diffusers(&cfg).unwrap()).unwrap();
     let (x, c) = (rand(4 * h * w, 1), rand(ctx_len * ctx, 2));
     let (a, tc) = (rand(add, 3), rand(cond, 4));
-    let (a, tc) = ((add > 0).then_some(&a[..]), (cond > 0).then_some(&tc[..]));
+    // runner: gibbs_engine::runtime::diffusion::Net (`sd` spec, network `denoiser`) on `unet/`;
+    // the raw add vector goes in as `pooled` (no addition_time_embed_dim), the LCM `t_cond`
+    // replaces its generated guidance embedding.
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net};
+    let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64)), ("nt", Val::Num(ctx_len as f64))];
+    let mut given = vec![("x", Tensor::F32(x.clone())), ("context", Tensor::F32(c.clone()))];
+    if add > 0 {
+        given.push(("pooled", Tensor::F32(a.clone())));
+    }
+    if cond > 0 {
+        given.push(("t_cond", Tensor::F32(tc.clone())));
+    }
     golden(case, TOL, |dev| {
+        let net = Net::open(&u, "sd", "denoiser", pin(dev)).unwrap();
         let mut o = Out::default();
         for t in [301.0f32, 5.0] {
-            let y = on(dev, || unet.forward(&x, h, w, t, &c, ctx_len, a, tc)).unwrap();
+            let y = on(dev, || net.run_one(&vars, &given, &[("timestep", t as f64)], None)).unwrap();
             o.f(format!("t{t}"), &y);
         }
+        assert_eq!(unconsumed(&net.model, &[&net], &[]), Vec::<String>::new());
         o
     });
 }
@@ -322,9 +348,10 @@ fn unet_xl_lcm() {
 // SD3 MMDiT (SD3Transformer2DModel)
 // ---------------------------------------------------------------------------------------------
 
-fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
-    use gibbs_engine::model::sd3::Mmdit;
-    let (d, joint, pooled_dim, pos_max, layers) = (64usize, 48usize, 40usize, 8usize, 3usize);
+/// diffusers `transformer/` (SD3Transformer2DModel: d 64, 1 head, 3 blocks, the last
+/// context-pre-only; `dual`: block 0 has SD3.5 `attn2`; `qk_norm`: RMSNorm q/k gains).
+fn write_sd3(dir: &Path, joint: usize, pooled_dim: usize, dual: bool, qk_norm: bool, seed: u64) {
+    let (d, pos_max, layers) = (64usize, 8usize, 3usize);
     let mut s = Specs::new();
     conv(&mut s, "pos_embed.proj", 4, d, 2);
     s.push(("pos_embed.pos_embed".into(), vec![1, pos_max * pos_max, d]));
@@ -366,7 +393,7 @@ fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
     }
     lin(&mut s, "norm_out.linear", d, 2 * d, true);
     lin(&mut s, "proj_out", d, 4 * 2 * 2, true);
-    let dir = fixture_dir(case).join("transformer");
+    let dir = dir.join("transformer");
     write_specs(&dir.join("diffusion_pytorch_model.safetensors"), seed, &s, StDtype::BF16);
     write_json(
         &dir.join("config.json"),
@@ -379,20 +406,37 @@ fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
             "qk_norm": if qk_norm { json!("rms_norm") } else { Value::Null }
         }),
     );
-    // runner: internal gibbs_engine::model::sd3::Mmdit::{forward, forward_gpu}
-    let m = Mmdit::load(&dir).unwrap();
+}
+
+fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
+    let (joint, pooled_dim) = (48usize, 40usize);
+    let root = fixture_dir(case);
+    write_sd3(&root, joint, pooled_dim, dual, qk_norm, seed);
+    let dir = root.join("transformer");
     // 12x10 latents -> 6x5 patches cropped from the 8x8 table; 12 text tokens.
     let (h, w, n_ctx) = (12usize, 10usize, 12usize);
     let (lat, ctx, pooled) = (rand(4 * h * w, 11), rand(n_ctx * joint, 12), rand(pooled_dim, 13));
+    // runner: gibbs_engine::runtime::diffusion::Net (`sd3` spec, network `denoiser`)
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net, Runtime};
+    // The root pipeline's `runtime` block parses (the integrator runs it end to end).
+    let sig = gibbs_engine::arch::Signals::default();
+    gibbs_engine::arch::registry().unwrap().spec("sd3", &sig).unwrap().runtime_as::<Runtime>().unwrap();
+    let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64)), ("nt", Val::Num(n_ctx as f64))];
+    let given = [
+        ("x", Tensor::F32(lat.clone())),
+        ("context", Tensor::F32(ctx.clone())),
+        ("pooled", Tensor::F32(pooled.clone())),
+    ];
     golden(case, TOL, |dev| {
+        let net = Net::open(&dir, "sd3", "denoiser", pin(dev)).unwrap();
         let mut o = Out::default();
         for t in [700.0f32, 120.0] {
-            let y = match dev {
-                Device::Metal => m.forward_gpu(&lat, h, w, t, &ctx, n_ctx, &pooled).unwrap(),
-                _ => m.forward(&lat, h, w, t, &ctx, n_ctx, &pooled),
-            };
+            let y = on(dev, || net.run_one(&vars, &given, &[("timestep", t as f64)], None)).unwrap();
             o.f(format!("t{t}"), &y);
         }
+        assert_eq!(unconsumed(&net.model, &[&net], &[]), Vec::<String>::new());
         o
     });
 }
@@ -417,6 +461,106 @@ fn sd3_qk() {
     sd3_case("diffa_sd3_qk", false, true, 4);
 }
 
+/// The whole `StableDiffusion3Pipeline`: CLIP-L (quick_gelu, EOS pad) + CLIP-G (gelu, `!` pad),
+/// both with d_model-wide projections (pooled = d_L + d_G, as SD3's checks require), the
+/// dual/qk-norm MMDiT, the 4-channel 8x VAE, 2 flow-Euler steps with CFG; `t5`: a 128-wide T5
+/// encoder as `text_encoder_3` (else its context block is zeros).
+fn sd3_pipeline_case(case: &str, t5: bool) {
+    use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
+    let dir = fixture_dir(case);
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({
+            "_class_name": "StableDiffusion3Pipeline",
+            "text_encoder": ["transformers", "CLIPTextModelWithProjection"],
+            "text_encoder_2": ["transformers", "CLIPTextModelWithProjection"],
+            "tokenizer": ["transformers", "CLIPTokenizer"],
+            "tokenizer_2": ["transformers", "CLIPTokenizer"],
+            "transformer": ["diffusers", "SD3Transformer2DModel"],
+            "vae": ["diffusers", "AutoencoderKL"],
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"]
+        }),
+    );
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000, "shift": 3.0}),
+    );
+    write_clip_proj(&dir, "text_encoder", "tokenizer", true, CLIP_D, 21);
+    write_clip_proj(&dir, "text_encoder_2", "tokenizer_2", false, CLIP_D, 22);
+    if t5 {
+        write_t5(&dir, "text_encoder_3", "tokenizer_3", 2 * CLIP_D, 23);
+    }
+    write_sd3(&dir, 2 * CLIP_D, 2 * CLIP_D, true, true, 5);
+    write_sd_vae(&dir, &[32, 32, 32, 32]);
+    let hub = clip_hub(&dir);
+    let art = artifacts(&dir, "golden/tiny-sd3", "none");
+    // 32x48 -> 4x6 latents -> 2x3 patches cropped from the 8x8 table.
+    let req = ImageRequest {
+        prompt: "t5 t17 t200".into(),
+        width: Some(32),
+        height: Some(48),
+        steps: Some(2),
+        guidance: Some(5.0),
+        seed: 5,
+        ..Default::default()
+    };
+    golden(case, TOL, |dev| {
+        // runner: runtime::diffusion::load_image (the public loader), pinned to `dev`
+        let p = load_image(&art, &hub, pin(dev)).expect("image repo").unwrap();
+        let img = on(dev, || p.text_to_image(&req)).unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 48, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+#[test]
+fn sd3_pipeline() {
+    sd3_pipeline_case("diffa_sd3_pipeline", false);
+}
+
+#[test]
+fn sd3_t5_pipeline() {
+    sd3_pipeline_case("diffa_sd3_t5_pipeline", true);
+}
+
+/// diffusers `T5EncoderModel` at `d` (2 layers, gated-gelu, 2 heads of 16, d_ff 64, 8 buckets,
+/// bf16) as `te/`, with the [`write_tokenizer`] WordLevel vocabulary (64 ids) as `tok/`.
+fn write_t5(dir: &Path, te: &str, tok: &str, d: usize, seed: u64) {
+    let (inner, ff, vocab) = (32usize, 64usize, 64usize);
+    let mut s: Specs = vec![("shared.weight".into(), vec![vocab, d])];
+    for i in 0..2 {
+        let b = format!("encoder.block.{i}.layer");
+        s.push((format!("{b}.0.layer_norm.weight"), vec![d]));
+        for p in ["q", "k", "v"] {
+            s.push((format!("{b}.0.SelfAttention.{p}.weight"), vec![inner, d]));
+        }
+        s.push((format!("{b}.0.SelfAttention.o.weight"), vec![d, inner]));
+        if i == 0 {
+            s.push((format!("{b}.0.SelfAttention.relative_attention_bias.weight"), vec![8, 2]));
+        }
+        s.push((format!("{b}.1.layer_norm.weight"), vec![d]));
+        s.push((format!("{b}.1.DenseReluDense.wi_0.weight"), vec![ff, d]));
+        s.push((format!("{b}.1.DenseReluDense.wi_1.weight"), vec![ff, d]));
+        s.push((format!("{b}.1.DenseReluDense.wo.weight"), vec![d, ff]));
+    }
+    s.push(("encoder.final_layer_norm.weight".into(), vec![d]));
+    let te = dir.join(te);
+    write_specs(&te.join("model.safetensors"), seed, &s, StDtype::BF16);
+    write_json(
+        &te.join("config.json"),
+        &json!({
+            "architectures": ["T5EncoderModel"], "model_type": "t5", "vocab_size": vocab, "d_model": d,
+            "d_kv": 16, "num_heads": 2, "d_ff": ff, "num_layers": 2, "relative_attention_num_buckets": 8,
+            "relative_attention_max_distance": 16, "layer_norm_epsilon": 1e-6,
+            "feed_forward_proj": "gated-gelu", "eos_token_id": 1, "pad_token_id": 0
+        }),
+    );
+    write_tokenizer(&dir.join(tok), vocab);
+}
+
 // ---------------------------------------------------------------------------------------------
 // FLUX transformer (diffusers names): FLUX.1 (guidance-distilled), Chroma, FLUX.2
 // ---------------------------------------------------------------------------------------------
@@ -429,9 +573,9 @@ enum Flux {
 }
 
 /// FLUX.1 / Chroma transformers (diffusers names) at d 128 (one 128-wide head: the engine's fixed
-/// FLUX head dim), 2 double and 2 single blocks, 16-wide packed latents, 24-wide text, 32-wide
-/// pooled text.
-fn write_flux(dir: &Path, kind: Flux, seed: u64) {
+/// FLUX head dim), 2 double and 2 single blocks, 16-wide packed latents, 24-wide text,
+/// `pooled`-wide pooled text.
+fn write_flux(dir: &Path, kind: Flux, seed: u64, pooled: usize) {
     if kind == Flux::Two {
         return write_flux2(dir, seed);
     }
@@ -446,7 +590,7 @@ fn write_flux(dir: &Path, kind: Flux, seed: u64) {
     };
     if kind == Flux::One {
         embed(&mut s, "time_text_embed.timestep_embedder", 256);
-        embed(&mut s, "time_text_embed.text_embedder", 32);
+        embed(&mut s, "time_text_embed.text_embedder", pooled);
         embed(&mut s, "time_text_embed.guidance_embedder", 256);
     } else {
         let p = "distilled_guidance_layer";
@@ -500,7 +644,7 @@ fn write_flux(dir: &Path, kind: Flux, seed: u64) {
         &json!({
             "_class_name": class, "patch_size": 1, "in_channels": 16, "num_layers": 2,
             "num_single_layers": 2, "attention_head_dim": 128, "num_attention_heads": 1,
-            "joint_attention_dim": 24, "pooled_projection_dim": 32, "guidance_embeds": !chroma,
+            "joint_attention_dim": 24, "pooled_projection_dim": pooled, "guidance_embeds": !chroma,
             "axes_dims_rope": [16, 56, 56]
         }),
     );
@@ -552,39 +696,33 @@ fn write_flux2(dir: &Path, seed: u64) {
 }
 
 fn flux_case(case: &str, kind: Flux, seed: u64) {
-    use gibbs_engine::model::flux::{FluxTransformer, Loras, Rope, Store};
     let dir = fixture_dir(case);
-    write_flux(&dir, kind, seed);
-    // runner: internal gibbs_engine::model::flux::FluxTransformer::{forward, forward_gpu}
-    let store = Store::open(&dir.join("transformer/diffusion_pytorch_model.safetensors")).unwrap();
-    let tr = FluxTransformer::load(&store, &mut Loras::default()).unwrap();
-    let two = kind == Flux::Two;
-    let (hp, wp, nt) = (4usize, 4usize, 8usize);
-    let ni = hp * wp;
-    // diffusers position ids: text at the origin (FLUX.2: along the last axis), then the grid.
-    let mut ids: Vec<[usize; 4]> = (0..nt).map(|l| [0, 0, 0, if two { l } else { 0 }]).collect();
-    ids.extend((0..ni).map(|i| [0, i / wp, i % wp, 0]));
-    let (axes, theta) = if two { (vec![32; 4], 2000.0) } else { (vec![16, 56, 56], 10000.0) };
-    let rope = Rope::new(&ids, &axes, theta);
-    let (img, ctx, pooled) = (rand(ni * 16, 11), rand(nt * 24, 12), rand(32, 13));
-    let pooled_in: &[f32] = if kind == Flux::One { &pooled } else { &[] };
-    let cache = ProgramCache::<(usize, usize, bool)>::default();
-    // FLUX: bf16 weights, f32 activations; Metal vs CPU 2e-3 (plan tolerance for FLUX).
+    write_flux(&dir, kind, seed, 32);
+    // runner: gibbs_engine::runtime::diffusion::Net (`flux` spec, network `denoiser`) on the
+    // packed 4x4 grid of an 8x8 latent, 8 text rows; `guided: false` drops the guidance embedding.
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net};
+    let (img, ctx, pooled) = (rand(16 * 16, 11), rand(8 * 24, 12), rand(32, 13));
+    let mut given = vec![("x", Tensor::F32(img)), ("context", Tensor::F32(ctx))];
+    if kind == Flux::One {
+        given.push(("pooled", Tensor::F32(pooled)));
+    }
     golden(case, tol(2e-3, 0.99999), |dev| {
+        let net = Net::open(&dir.join("transformer"), "flux", "denoiser", pin(dev)).unwrap();
         let mut o = Out::default();
         for (t, g) in [(0.7f32, Some(3.5f32)), (0.2, None)] {
-            let y = match dev {
-                Device::Metal => tr
-                    .forward_gpu(&cache, &img, ni, &ctx, nt, pooled_in, t, g, &ids)
-                    .unwrap(),
-                _ => {
-                    let txt = tr.txt_in.fwd(&ctx, nt);
-                    let y = if kind == Flux::One { tr.pooled(&pooled) } else { Vec::new() };
-                    tr.forward(&img, ni, &txt, nt, &y, t, g, &rope)
-                }
-            };
+            let vars = [
+                ("h", Val::Num(8.0)),
+                ("w", Val::Num(8.0)),
+                ("nt", Val::Num(8.0)),
+                ("guided", Val::Bool(g.is_some())),
+            ];
+            let step = [("sigma", t as f64), ("guidance", g.unwrap_or(0.0) as f64)];
+            let y = on(dev, || net.run_one(&vars, &given, &step, None)).unwrap();
             o.f(format!("t{t}"), &y);
         }
+        assert_eq!(unconsumed(&net.model, &[&net], &[]), Vec::<String>::new());
         o
     });
 }
@@ -602,6 +740,62 @@ fn flux_chroma() {
 #[test]
 fn flux2() {
     flux_case("diffa_flux2", Flux::Two, 3);
+}
+
+/// The whole `FluxPipeline` (FLUX.1 dev: CLIP-L pooled + 24-wide T5 padded to 512, guidance
+/// embedded) or `ChromaPipeline` (T5 only, valid + 1 rows, true CFG): the [`write_flux`]
+/// transformer, the 4-channel 8x VAE, 2 dynamic-shift flow-Euler steps.
+fn flux_pipeline_case(case: &str, kind: Flux) {
+    use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
+    let dir = fixture_dir(case);
+    let class = if kind == Flux::Chroma { "ChromaPipeline" } else { "FluxPipeline" };
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": class}));
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
+                "shift": 3.0, "use_dynamic_shifting": true, "base_shift": 0.5, "max_shift": 1.15,
+                "base_image_seq_len": 256, "max_image_seq_len": 4096}),
+    );
+    if kind == Flux::Chroma {
+        write_t5(&dir, "text_encoder", "tokenizer", 24, 31);
+    } else {
+        write_clip(&dir, "text_encoder", "tokenizer", true, false, 21);
+        write_t5(&dir, "text_encoder_2", "tokenizer_2", 24, 31);
+    }
+    write_flux(&dir, kind, 4, CLIP_D);
+    write_sd_vae(&dir, &[32, 32, 32, 32]);
+    let hub = clip_hub(&dir);
+    let art = artifacts(&dir, "golden/tiny-flux", "none");
+    // 32x48 -> 4x6 latents -> 2x3 packed tokens.
+    let req = ImageRequest {
+        prompt: "t5 t17 t30".into(),
+        width: Some(32),
+        height: Some(48),
+        steps: Some(2),
+        guidance: Some(if kind == Flux::Chroma { 4.0 } else { 3.5 }),
+        seed: 7,
+        ..Default::default()
+    };
+    golden(case, tol(2e-3, 0.99999), |dev| {
+        // runner: runtime::diffusion::load_image (the public loader), pinned to `dev`
+        let p = load_image(&art, &hub, pin(dev)).expect("image repo").unwrap();
+        let img = on(dev, || p.text_to_image(&req)).unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 48, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+#[test]
+fn flux1_pipeline() {
+    flux_pipeline_case("diffa_flux1_pipeline", Flux::One);
+}
+
+#[test]
+fn chroma_pipeline() {
+    flux_pipeline_case("diffa_chroma_pipeline", Flux::Chroma);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -688,29 +882,37 @@ fn write_sana_dit(dir: &Path) {
 
 #[test]
 fn sana() {
-    use gibbs_engine::model::sana::{Gemma2, SanaDit};
     let case = "diffa_sana";
     let dir = fixture_dir(case);
     write_gemma2(&dir.join("text_encoder"));
     write_sana_dit(&dir.join("transformer"));
-    // runner: internal gibbs_engine::model::sana::{Gemma2::encode, SanaDit::{forward, forward_gpu}}
-    let enc = Gemma2::load(&dir.join("text_encoder")).unwrap();
-    let dit = SanaDit::load(&dir.join("transformer")).unwrap();
     let ids = [2u32, 17, 33, 200, 5, 9, 255];
-    let cache = ProgramCache::<(usize, usize, usize)>::default();
+    // runner: gibbs_engine::runtime::diffusion::Net (`gemma2` spec network `text` on
+    // `text_encoder/`, `sana` spec network `denoiser` on `transformer/`)
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net};
     golden(case, TOL, |dev| {
+        let te = Net::open(&dir.join("text_encoder"), "gemma2", "text", pin(dev)).unwrap();
+        let dit = Net::open(&dir.join("transformer"), "sana", "denoiser", pin(dev)).unwrap();
         let mut o = Out::default();
-        // The Gemma 2 encoder is host-only on every backend.
-        o.f("gemma2.hidden", &enc.encode(&ids).unwrap());
+        let given = [
+            ("token_ids", Tensor::U32(ids.to_vec())),
+            ("positions", Tensor::U32((0..ids.len() as u32).collect())),
+        ];
+        let rows = [("rows", Val::Num(ids.len() as f64))];
+        o.f("gemma2.hidden", &on(dev, || te.run_one(&rows, &given, &[], Some("hidden"))).unwrap());
         for (h, w, n_cap, t) in [(4usize, 6usize, 7usize, 731.0f32), (5, 7, 21, 40.0)] {
-            let lat = rand(SANA_C * h * w, 11);
-            let e = rand(n_cap * SANA_CAP, 12);
-            let y = match dev {
-                Device::Metal => dit.forward_gpu(&cache, &lat, h, w, t, &e, n_cap).unwrap(),
-                _ => dit.forward(&lat, h, w, t, &dit.caption(&e, n_cap), n_cap),
-            };
+            let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64)), ("nt", Val::Num(n_cap as f64))];
+            let given = [
+                ("x", Tensor::F32(rand(SANA_C * h * w, 11))),
+                ("context", Tensor::F32(rand(n_cap * SANA_CAP, 12))),
+            ];
+            let y = on(dev, || dit.run_one(&vars, &given, &[("timestep", t as f64)], None)).unwrap();
             o.f(format!("dit.{h}x{w}.t{t}"), &y);
         }
+        assert_eq!(unconsumed(&te.model, &[&te], &[]), Vec::<String>::new());
+        assert_eq!(unconsumed(&dit.model, &[&dit], &[]), Vec::<String>::new());
         o
     });
 }
@@ -786,31 +988,32 @@ fn write_sd_vae(dir: &Path, chans: &[usize]) {
 
 #[test]
 fn sd_vae() {
-    use gibbs_engine::model::vae::SdVae;
+    // runner: gibbs_engine::runtime::diffusion::Net (`sd_vae` spec, networks `decoder` / `encoder`):
+    // affine-free networks; the host applies the latent affine around them.
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net};
     let case = "diffa_sd_vae";
     let dir = fixture_dir(case);
     write_sd_vae(&dir, &[32, 64]);
-    let reader =
-        SafetensorsWeightReader::new(dir.join("vae/diffusion_pytorch_model.safetensors")).unwrap();
-    // runner: internal gibbs_engine::model::vae::SdVae::{decode_cpu, decode_gpu, encode_cpu, encode_gpu}
-    let vae = SdVae::from_diffusers(&Tensors::safetensors(&reader).unwrap()).unwrap();
     let (h, w) = (6, 5);
     let z = rand(4 * h * w, 3);
     let img = rand(3 * 16 * 12, 4);
     golden(case, TOL, |dev| {
-        let (dec, enc) = match dev {
-            Device::Metal => (
-                vae.decode_gpu(&z, h, w).unwrap(),
-                vae.encode_gpu(img.clone(), 16, 12).unwrap(),
-            ),
-            _ => (
-                vae.decode_cpu(&z, h, w).unwrap(),
-                vae.encode_cpu(img.clone(), 16, 12).unwrap(),
-            ),
-        };
-        assert_eq!((dec.1, dec.2, enc.1, enc.2), (2 * h, 2 * w, 8, 6));
+        let de = Net::open(&dir.join("vae"), "sd_vae", "decoder", pin(dev)).unwrap();
+        let en = Net::new(de.model.clone(), "encoder", pin(dev));
+        let var = |n: &str| de.model.env.var(n).unwrap().num().unwrap() as f32;
+        let (scale, shift, f) = (var("scaling"), var("shift"), var("factor") as usize);
+        let hw = |h: usize, w: usize| [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+        let zs: Vec<f32> = z.iter().map(|v| v / scale + shift).collect();
+        let x = on(dev, || de.run_one(&hw(h, w), &[("z", Tensor::F32(zs))], &[], None)).unwrap();
+        let (eh, ew) = (16 / f, 12 / f);
+        let m = on(dev, || en.run_one(&hw(eh, ew), &[("image", Tensor::F32(img.clone()))], &[], None)).unwrap();
+        let m: Vec<f32> = m.iter().map(|v| (v - shift) * scale).collect();
+        assert_eq!(unconsumed(&de.model, &[&de, &en], &[]), Vec::<String>::new());
+        assert_eq!((h * f, w * f, eh, ew), (2 * h, 2 * w, 8, 6));
         let mut o = Out::default();
-        o.f("decode", &dec.0).f("encode", &enc.0);
+        o.f("decode", &x).f("encode", &m);
         o
     });
 }
@@ -869,19 +1072,21 @@ fn write_dcae(dir: &Path) {
 
 #[test]
 fn dcae() {
-    use gibbs_engine::model::dcae::DcAeDecoder;
+    // runner: gibbs_engine::runtime::diffusion::Net (`dcae` spec, network `decoder`); `z` is
+    // already latents / scaling_factor.
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::{unconsumed, Net};
     let case = "diffa_dcae";
     let dir = fixture_dir(case).join("vae");
     write_dcae(&dir);
-    // runner: internal gibbs_engine::model::dcae::DcAeDecoder::{decode_cpu, decode_gpu}
-    let dec = DcAeDecoder::load(&dir).unwrap();
     let (h, w) = (2, 3);
-    let z = rand(dec.latent_channels() * h * w, 3);
+    let z = rand(8 * h * w, 3);
     golden(case, TOL, |dev| {
-        let y = match dev {
-            Device::Metal => dec.decode_gpu(&z, h, w).unwrap(),
-            _ => dec.decode_cpu(&z, h, w),
-        };
+        let de = Net::open(&dir, "dcae", "decoder", pin(dev)).unwrap();
+        let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+        let y = on(dev, || de.run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], None)).unwrap();
+        assert_eq!(unconsumed(&de.model, &[&de], &[]), Vec::<String>::new());
         let mut o = Out::default();
         o.f("decode", &y);
         o
@@ -894,7 +1099,7 @@ fn dcae() {
 
 #[test]
 fn tiny_sd() {
-    use gibbs_engine::model::text_to_image::{load_image_model, ImageRequest};
+    use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
     let case = "diffa_tiny_sd";
     let dir = fixture_dir(case);
     write_json(
@@ -921,9 +1126,7 @@ fn tiny_sd() {
     // Real SD geometry: 4 levels, 8x VAE factor.
     write_sd_vae(&dir, &[32, 32, 32, 32]);
     let hub = clip_hub(&dir);
-    let pipe = load_image_model(&artifacts(&dir, "golden/tiny-sd", "none"), &hub)
-        .expect("diffusers image repo")
-        .unwrap();
+    let art = artifacts(&dir, "golden/tiny-sd", "none");
     let req = ImageRequest {
         prompt: "t5 t17 t200".into(),
         width: Some(32),
@@ -934,7 +1137,207 @@ fn tiny_sd() {
         ..Default::default()
     };
     golden(case, TOL, |dev| {
-        let img = on(dev, || pipe.text_to_image(&req)).unwrap();
+        // runner: runtime::diffusion::load_image (the public loader), pinned to `dev`
+        let p = load_image(&art, &hub, pin(dev)).expect("image repo").unwrap();
+        let img = on(dev, || p.text_to_image(&req)).unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 32, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+/// An SD 1.x LDM single-file checkpoint: the CLIP tower of `write_clip` under
+/// `cond_stage_model.transformer.`, a 2-level LDM UNet (layers_per_block 2, as every LDM file)
+/// under `model.diffusion_model.`, a 4-level LDM VAE under `first_stage_model.`; the reference
+/// repo's configs and tokenizer dir sit in the hub cache.
+#[test]
+fn sd_single_file() {
+    use gibbs_engine::model::diff_fixtures::{ldm_unet_specs, ldm_vae_specs};
+    use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
+    let case = "diffa_sd_single_file";
+    let dir = fixture_dir(case);
+    let d = CLIP_D;
+    let te = "cond_stage_model.transformer.text_model";
+    let mut s: Specs = vec![
+        (format!("{te}.embeddings.token_embedding.weight"), vec![CLIP_VOCAB, d]),
+        (format!("{te}.embeddings.position_embedding.weight"), vec![77, d]),
+    ];
+    for l in 0..2 {
+        let p = format!("{te}.encoder.layers.{l}");
+        for n in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            lin(&mut s, &format!("{p}.self_attn.{n}"), d, d, true);
+        }
+        lin(&mut s, &format!("{p}.mlp.fc1"), d, 2 * d, true);
+        lin(&mut s, &format!("{p}.mlp.fc2"), 2 * d, d, true);
+        nrm(&mut s, &format!("{p}.layer_norm1"), d);
+        nrm(&mut s, &format!("{p}.layer_norm2"), d);
+    }
+    nrm(&mut s, &format!("{te}.final_layer_norm"), d);
+    let unet = ldm_unet_specs(32, &[1, 2], 2, &[true, true], d, 4);
+    s.extend(unet.into_iter().map(|(n, sh)| (format!("model.diffusion_model.{n}"), sh)));
+    s.extend(ldm_vae_specs(32, &[1, 1, 1, 1]));
+    write_specs(&dir.join("sd15.safetensors"), 31, &s, StDtype::F32);
+
+    let hub = clip_hub(&dir);
+    let r = dir.join("hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5/snapshots/main");
+    write_json(
+        &r.join("model_index.json"),
+        &json!({
+            "_class_name": "StableDiffusionPipeline",
+            "text_encoder": ["transformers", "CLIPTextModel"], "tokenizer": ["transformers", "CLIPTokenizer"],
+            "unet": ["diffusers", "UNet2DConditionModel"], "vae": ["diffusers", "AutoencoderKL"],
+            "scheduler": ["diffusers", "EulerDiscreteScheduler"]
+        }),
+    );
+    write_json(
+        &r.join("scheduler/scheduler_config.json"),
+        &json!({
+            "_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear",
+            "beta_start": 0.00085, "beta_end": 0.012, "num_train_timesteps": 1000,
+            "prediction_type": "epsilon", "timestep_spacing": "trailing"
+        }),
+    );
+    write_json(
+        &r.join("text_encoder/config.json"),
+        &json!({
+            "architectures": ["CLIPTextModel"], "model_type": "clip_text_model", "hidden_act": "quick_gelu",
+            "hidden_size": d, "intermediate_size": 2 * d, "num_attention_heads": 1,
+            "num_hidden_layers": 2, "max_position_embeddings": 77, "vocab_size": CLIP_VOCAB,
+            "layer_norm_eps": 1e-5
+        }),
+    );
+    write_json(&r.join("tokenizer/tokenizer.json"), &clip_tokenizer_json());
+    let pad = json!({"pad_token": "<|endoftext|>"});
+    write_json(&r.join("tokenizer/special_tokens_map.json"), &pad);
+    write_json(&r.join("tokenizer/tokenizer_config.json"), &pad);
+    write_json(
+        &r.join("unet/config.json"),
+        &json!({
+            "_class_name": "UNet2DConditionModel", "sample_size": 4, "in_channels": 4,
+            "out_channels": 4, "block_out_channels": [32, 64], "layers_per_block": 2,
+            "attention_head_dim": 8, "cross_attention_dim": d, "norm_num_groups": 32,
+            "down_block_types": ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D"],
+            "up_block_types": ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
+            "mid_block_type": "UNetMidBlock2DCrossAttn"
+        }),
+    );
+    write_json(
+        &r.join("vae/config.json"),
+        &json!({
+            "_class_name": "AutoencoderKL", "in_channels": 3, "out_channels": 3,
+            "latent_channels": 4, "block_out_channels": [32, 32, 32, 32], "layers_per_block": 2,
+            "norm_num_groups": 32, "scaling_factor": 0.18215, "sample_size": 32,
+            "down_block_types": vec!["DownEncoderBlock2D"; 4],
+            "up_block_types": vec!["UpDecoderBlock2D"; 4]
+        }),
+    );
+    let art = artifacts(&dir, "golden/sd-single-file", "sd15.safetensors");
+    let req = ImageRequest {
+        prompt: "t5 t17 t200".into(),
+        width: Some(32),
+        height: Some(32),
+        steps: Some(2),
+        guidance: Some(5.0),
+        seed: 5,
+        ..Default::default()
+    };
+    golden(case, TOL, |dev| {
+        // runner: runtime::diffusion::load_image (the public loader), pinned to `dev`
+        let p = load_image(&art, &hub, pin(dev)).expect("image repo").unwrap();
+        let img = on(dev, || p.text_to_image(&req)).unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 32, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+/// A WordLevel stand-in for the Gemma tokenizer: `<pad>` 0, `<eos>` 1, `<bos>` 2 (prepended by
+/// the post-processor), `<unk>` 3 (every instruction word), `tK` = K (4..256).
+fn gemma_tokenizer_json() -> Value {
+    let mut vocab = Map::new();
+    let specials = [("<pad>", 0), ("<eos>", 1), ("<bos>", 2), ("<unk>", 3)];
+    for (s, id) in specials {
+        vocab.insert(s.into(), json!(id));
+    }
+    for i in 4..256 {
+        vocab.insert(format!("t{i}"), json!(i));
+    }
+    let added: Vec<Value> = specials
+        .iter()
+        .map(|(s, id)| {
+            json!({"id": id, "content": s, "single_word": false, "lstrip": false,
+                   "rstrip": false, "normalized": false, "special": true})
+        })
+        .collect();
+    json!({
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+        "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"},
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                     {"Sequence": {"id": "B", "type_id": 0}}],
+            "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}}
+        },
+        "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tiny Sana pipeline (Gemma 2 + linear DiT + DC-AE f4c8) through the public image-model loader
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn sana_pipeline() {
+    use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
+    let case = "diffa_sana_pipeline";
+    let dir = fixture_dir(case);
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({
+            "_class_name": "SanaPipeline",
+            "text_encoder": ["transformers", "Gemma2Model"],
+            "tokenizer": ["transformers", "GemmaTokenizerFast"],
+            "transformer": ["diffusers", "SanaTransformer2DModel"],
+            "vae": ["diffusers", "AutoencoderDC"],
+            "scheduler": ["diffusers", "DPMSolverMultistepScheduler"]
+        }),
+    );
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({
+            "_class_name": "DPMSolverMultistepScheduler", "algorithm_type": "dpmsolver++",
+            "prediction_type": "flow_prediction", "use_flow_sigmas": true, "solver_order": 2,
+            "solver_type": "midpoint", "final_sigmas_type": "zero", "flow_shift": 3.0,
+            "num_train_timesteps": 1000
+        }),
+    );
+    write_json(&dir.join("tokenizer/tokenizer.json"), &gemma_tokenizer_json());
+    write_gemma2(&dir.join("text_encoder"));
+    write_sana_dit(&dir.join("transformer"));
+    // DC-AE f4c8: latent channels == SANA_C.
+    write_dcae(&dir.join("vae"));
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let art = artifacts(&dir, "golden/tiny-sana", "none");
+    // 32x32 = 8x8 latents (the old pipeline's minimum); CFG runs (guidance > 1).
+    let req = ImageRequest {
+        prompt: " T5 t17 t200 ".into(),
+        width: Some(32),
+        height: Some(32),
+        steps: Some(2),
+        guidance: Some(4.5),
+        seed: 5,
+        ..Default::default()
+    };
+    golden(case, TOL, |dev| {
+        // runner: runtime::diffusion::load_image (the public loader), pinned to `dev`
+        let p = load_image(&art, &hub, pin(dev)).expect("image repo").unwrap();
+        let img = on(dev, || p.text_to_image(&req)).unwrap();
         assert_eq!((img.width, img.height, img.channels), (32, 32, 3));
         let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
         let mut o = Out::default();

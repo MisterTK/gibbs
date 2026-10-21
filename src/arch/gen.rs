@@ -342,11 +342,12 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
     out
 }
 
-/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]`.
+/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]`; `t` a list of n values: their
+/// embeddings concatenated, `[n * dim]` (SDXL `add_time_ids`).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
-/// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
-/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults.
+/// diffusers `get_timestep_embedding` (`precision: "f32"` for f32 sources; a guidance embedding
+/// with `flip_sin_to_cos: false, downscale_freq_shift: 1`).
 fn timestep_embedding(a: &Args) -> Result<Gen, String> {
     let dim = a.u("dim")?;
     let f32p = match a.s_or("precision", "f64")? {
@@ -354,16 +355,14 @@ fn timestep_embedding(a: &Args) -> Result<Gen, String> {
         "f32" => true,
         p => return Err(bad("precision", p)),
     };
-    let v = timestep_vec(
-        a.f("t")?,
-        dim,
-        a.b_or("flip_sin_to_cos", true)?,
-        a.f_or("downscale_freq_shift", 0.0)?,
-        a.f_or("scale", 1.0)?,
-        a.f_or("max_period", 10000.0)?,
-        f32p,
-    );
-    f32s(vec![dim], v)
+    let ts = match a.get("t").is_some_and(Value::is_array) {
+        true => a.fs("t")?,
+        false => vec![a.f("t")?],
+    };
+    let (flip, shift) = (a.b_or("flip_sin_to_cos", true)?, a.f_or("downscale_freq_shift", 0.0)?);
+    let (scale, period) = (a.f_or("scale", 1.0)?, a.f_or("max_period", 10000.0)?);
+    let v: Vec<f32> = ts.iter().flat_map(|&t| timestep_vec(t, dim, flip, shift, scale, period, f32p)).collect();
+    f32s(vec![v.len()], v)
 }
 
 /// `modulation_index_rows`: input rows of a distilled modulation-table MLP, F32
@@ -833,6 +832,7 @@ mod tests {
         assert_eq!(rel[1], (2.0 * (-(10000f64.ln())).exp()).sin() as f32);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4})), [1.0, 1.0, 0.0, 0.0]);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4, "flip_sin_to_cos": false})), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(f("timestep_embedding", json!({"t": [0.0, 0.0], "dim": 2})), [1.0, 0.0, 1.0, 0.0]);
         assert_eq!(
             f("modulation_index_rows", json!({"t": 0.0, "rows": 2, "dims": [2, 2, 2], "scale": 1000.0})),
             [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1000f64.cos() as f32, 1000f64.sin() as f32]
@@ -1003,6 +1003,49 @@ mod tests {
                 .flat_map(|i| [s(t as f64 * 1000.0, 16), s(0.0, 16), s(i as f64 * 1000.0, 32)].concat())
                 .collect();
             let got = f("modulation_index_rows", json!({"t": t as f64, "rows": 3, "dims": [16, 16, 32], "scale": 1000.0}));
+            assert_eq!(bits(&got), bits(&want));
+        }
+
+        /// The `sd` spec's generated inputs: the LCM guidance embedding (`sd.rs`
+        /// `guidance_embedding`) and SDXL's 6 time-id embeddings (`unet.rs` `timestep_embedding`
+        /// per id), old formulas inlined.
+        #[test]
+        fn sd_embeddings_match_sources() {
+            // `sd.rs` `guidance_embedding`, verbatim; `black_box` keeps LLVM from folding the
+            // sin/cos of constants at compile time (an ulp off the runtime libm).
+            #[inline(never)]
+            fn guidance_embedding(w: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let w = w * 1000.0;
+                let f = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
+                let mut e: Vec<f32> = (0..half).map(|i| (w * f(i)).sin()).collect();
+                e.extend((0..half).map(|i| (w * f(i)).cos()));
+                e.resize(dim, 0.0);
+                e
+            }
+            let (w, dim) = (6.5f32, 16usize);
+            let want = guidance_embedding(std::hint::black_box(w), dim);
+            let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
+                "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
+            assert_eq!(bits(&got), bits(&want));
+
+            let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
+            // `unet.rs` `timestep_embedding`, verbatim.
+            #[inline(never)]
+            fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let mut emb = vec![0.0f32; dim];
+                for i in 0..half {
+                    let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                    let arg = t * freq;
+                    emb[i] = arg.cos();
+                    emb[half + i] = arg.sin();
+                }
+                emb
+            }
+            let want: Vec<f32> =
+                std::hint::black_box(ids).iter().flat_map(|&t| timestep_embedding(t, 256)).collect();
+            let got = f("timestep_embedding", json!({"t": ids, "dim": 256, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
         }
 

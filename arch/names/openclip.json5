@@ -1,0 +1,20 @@
+// OpenCLIP text tower names (prefix-free: `token_embedding`, `positional_embedding`,
+// `transformer.resblocks.N`, `ln_final`, `text_projection`) -> HF `CLIPTextModel` names. The fused
+// `attn.in_proj_*` lands on `self_attn.in_proj.*` for the family's `split_rows` transform, and
+// `text_projection` ([d, proj], applied as x @ P) on `text_projection.weight` for its transpose.
+// Source: `model/sd.rs` `alias_openclip`.
+{
+  rules: [
+    ["token_embedding.weight", "text_model.embeddings.token_embedding.weight"],
+    ["positional_embedding", "text_model.embeddings.position_embedding.weight"],
+    ["ln_final.{s:*}", "text_model.final_layer_norm.{s}"],
+    ["text_projection", "text_projection.weight"],
+    ["transformer.resblocks.{i}.ln_1.{s:*}", "text_model.encoder.layers.{i}.layer_norm1.{s}"],
+    ["transformer.resblocks.{i}.ln_2.{s:*}", "text_model.encoder.layers.{i}.layer_norm2.{s}"],
+    ["transformer.resblocks.{i}.attn.in_proj_weight", "text_model.encoder.layers.{i}.self_attn.in_proj.weight"],
+    ["transformer.resblocks.{i}.attn.in_proj_bias", "text_model.encoder.layers.{i}.self_attn.in_proj.bias"],
+    ["transformer.resblocks.{i}.attn.out_proj.{s:*}", "text_model.encoder.layers.{i}.self_attn.out_proj.{s}"],
+    ["transformer.resblocks.{i}.mlp.c_fc.{s:*}", "text_model.encoder.layers.{i}.mlp.fc1.{s}"],
+    ["transformer.resblocks.{i}.mlp.c_proj.{s:*}", "text_model.encoder.layers.{i}.mlp.fc2.{s}"],
+  ],
+}

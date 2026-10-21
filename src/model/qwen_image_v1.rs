@@ -12,16 +12,16 @@ mod graph_program;
 use crate::model::dit::{
     add_gated, norm_modulate, read_config, read_scheduler, rms_norm, silu_of, timestep_features,
 };
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::flux::Store;
 use crate::model::image::ImageBuffer;
 use crate::model::nn;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
-use crate::model::qwen_image::{QLin, Sched};
+use crate::model::qwen_image::QLin;
 use crate::model::qwen_vae::QwenVae;
-use crate::model::sd::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::sched::Rng;
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
@@ -475,7 +475,7 @@ fn cfg_rescale(pos: &[f32], neg: &[f32], g: f32, ch: usize) -> Vec<f32> {
 struct Core {
     dit: Dit,
     vae: QwenVae,
-    sched: Sched,
+    sched: sched::Schedule,
 }
 
 /// A prompt's text-encoder features `[n, text_width]` and `n`.
@@ -483,7 +483,7 @@ type Features = (Vec<f32>, usize);
 
 impl Core {
     /// Checks the transformer, VAE and (text width) `text_width` against each other.
-    fn new(dit: Dit, vae: QwenVae, sched: Sched, text_width: usize) -> Result<Self, String> {
+    fn new(dit: Dit, vae: QwenVae, sched: sched::Schedule, text_width: usize) -> Result<Self, String> {
         if dit.in_ch != 4 * Z || dit.proj_out.w.n != dit.in_ch {
             return Err(format!(
                 "Qwen-Image 1: the transformer takes {} and emits {} packed features, the VAE's {Z} channels need {}",
@@ -566,7 +566,7 @@ impl Core {
             .transpose()?;
         println!("  text encoder: {:.2}s", start.elapsed().as_secs_f64());
 
-        let sigmas = self.sched.sigmas(&flow::linspace_sigmas(steps), n_img);
+        let sigmas = self.sched.sigmas(&sched::linspace_sigmas(steps), n_img, steps);
         let mut rng = Rng::new(req.seed);
         let noise: Vec<f32> = (0..Z * h * w).map(|_| rng.gaussian()).collect();
         let mut x = pack(&noise, Z, h, w);
@@ -577,7 +577,7 @@ impl Core {
                 let vn = velocity(neg, &x, s[0])?;
                 v = cfg_rescale(&v, &vn, guidance, ch);
             }
-            flow::euler_step(&mut x, &v, s[0], s[1]);
+            sched::euler_step(&mut x, &v, s[0], s[1]);
             println!(
                 "  step {}/{} (sigma {:.4}): {:.2}s",
                 i + 1,
@@ -721,7 +721,7 @@ impl QwenImagePipeline {
             dit.dim,
             path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())
         );
-        let sched = Sched::from_config(&scheduler.map_or_else(|| read_scheduler(dir), Ok)?);
+        let sched = sched::Schedule::from_config(&scheduler.map_or_else(|| read_scheduler(dir), Ok)?);
         let core = Core::new(dit, QwenVae::load(&dir.join("vae"))?, sched, width)?;
         Ok(Self {
             enc: Qwen3Encoder::open(&te)?,
@@ -998,7 +998,7 @@ mod tests {
         let core = Core::new(
             dit,
             QwenVae::load(&vae).unwrap(),
-            Sched::from_config(&sched),
+            sched::Schedule::from_config(&sched),
             3584,
         )
         .unwrap();
