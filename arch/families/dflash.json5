@@ -266,5 +266,8 @@
     drafter: {kind: "block", component: "block", step: {component: "step", when: "head != 'plain'"}, vocab_map: "d2t"},
     // Drafter repo-name suffixes stripped to guess the target (`z-lab/Qwen3-4B-DFlash-b16`).
     repo_suffixes: ["-dflash", "-dspark", "-speculator", ".dflash", ".dspark"],
+    // GGUF architectures of llama.cpp forks (ik_llama, Lucebox: `dflash-draft`, ...) whose tensor
+    // names and metadata differ from llama.cpp's `dflash`: refused by name in the hub picker.
+    fork_gguf_archs: ["*dflash*", "*dspark*"],
   },
 }

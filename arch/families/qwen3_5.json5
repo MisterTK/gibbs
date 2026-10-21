@@ -138,8 +138,9 @@
     // ViT 2D rotary: a quarter of each head's pairs per axis, rows then columns.
     "vision.rope.inv_freq": {gen: "rope_inv_freq", when: "has_vision", args: {dim: "v_hd // 2", theta: 10000, precision: "'f32'", tile: 2}},
   },
-  // score.weight: a seq-cls head, which runtime::seqcls's caller reads.
-  ignore: ["lm_head.weight", "score.weight"],
+  // score.weight: a seq-cls head, which runtime::seqcls's caller reads. mtp.*: an MTP head the
+  // `mtp` drafter does not run (more than one layer, dedicated embeddings) is skipped, not refused.
+  ignore: ["lm_head.weight", "score.weight", "mtp.*"],
   components: {
     text: {
       vars: ["rows", "head"],

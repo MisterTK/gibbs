@@ -56,8 +56,8 @@ struct Cli {
     #[arg(long)]
     prompt: Option<String>,
 
-    /// Speculative decoding drafter for --model: a DFlash / DFlash2 / DSpark repo trained for it,
-    /// or a small causal LM with the same tokenizer.
+    /// Speculative decoding drafter for --model: a hidden-state drafter repo trained for it (a
+    /// `pipeline: drafter` family spec), or a small causal LM with the same tokenizer.
     #[arg(long)]
     draft: Option<String>,
 

@@ -447,6 +447,22 @@ pub fn is_draft_for(target: &str, active: &str) -> bool {
     name(target) == name(active)
 }
 
+/// Why a GGUF of architecture `arch` cannot attach as a drafter: a drafter family lists it in
+/// `runtime.fork_gguf_archs` (globs) but does not claim it (`None` otherwise).
+pub fn refused_draft_gguf(arch: &str) -> Option<String> {
+    let reg = registry().ok()?;
+    reg.matchers().into_iter().find_map(|(f, m, p)| {
+        let ours = m.gguf_arch.first()?;
+        let forks = reg.base(&f).ok()?["runtime"]["fork_gguf_archs"].clone();
+        let fork = p == Pipeline::Drafter
+            && !m.gguf_arch.iter().any(|g| glob(g, arch))
+            && forks.as_array()?.iter().filter_map(J::as_str).any(|g| glob(g, arch));
+        fork.then(|| {
+            format!("llama.cpp GGUF draft sidecar with fork architecture '{arch}' (tensor names and metadata differ from llama.cpp's '{ours}'; attach a '{ours}' GGUF or the safetensors drafter)")
+        })
+    })
+}
+
 /// Loads `draft` as a drafter for the target loaded from `target`, computing on `mode`: a block
 /// drafter when a `pipeline: drafter` family claims it, else a [`Plain`] causal LM.
 pub fn load_drafter(
@@ -713,24 +729,23 @@ impl Drafter for Block {
             ));
         }
         let m = k.min(self.block - self.first_row);
-        if m == 0 && ext == 0 {
+        // Every pass appends context rows, so the KV states keep one dtype (on Metal a pass without
+        // the context writes would store them as f16); the target runs at least one position
+        // between proposes, so this only skips a call that could not draft from new state.
+        if ext == 0 {
             return Ok(Vec::new());
         }
         let n = self.block;
         let mut ids = vec![self.mask; n];
         ids[0] = anchor;
-        let mut inputs = HashMap::from([
+        let inputs = HashMap::from([
             ("token_ids", Tensor::U32(ids)),
             ("positions", positions(start, n)),
             ("visible_end", Tensor::U32(vec![(start + n) as u32; n])),
+            ("context", Tensor::F32(hidden.to_vec())),
+            ("context_positions", positions(s.len, ext)),
+            ("pos0", Tensor::U32(vec![s.len as u32])),
         ]);
-        if ext > 0 {
-            inputs.extend([
-                ("context", Tensor::F32(hidden.to_vec())),
-                ("context_positions", positions(s.len, ext)),
-                ("pos0", Tensor::U32(vec![s.len as u32])),
-            ]);
-        }
         let out = self
             .comp
             .run(&self.b, &block_vars(ext, n), &mut s.state, inputs)?;

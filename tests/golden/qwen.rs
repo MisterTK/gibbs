@@ -467,6 +467,25 @@ fn qwen3_5_mtp() {
     });
 }
 
+/// An MTP head the `mtp` drafter does not run (here: a config claiming 2 MTP layers) leaves the
+/// target loadable without a shipped drafter.
+#[test]
+fn qwen3_5_unsupported_mtp_head_is_skipped() {
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    let dir = fixture_dir("qwen_qwen3_5_mtp2");
+    let mut w = Weights::new(0x5157_454E_0006);
+    qwen35_text(&mut w, "model", Ffn::Dense, false);
+    mtp(&mut w);
+    let mut cfg = qwen35_config("qwen3_5", "Qwen3_5ForCausalLM");
+    cfg["mtp_num_hidden_layers"] = 2.into();
+    write_ckpt(&dir, &cfg, &w);
+    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let a = artifacts(&dir, "golden/qwen3_5_mtp2", "model.safetensors");
+    let spec = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re).unwrap();
+    let m = gibbs_engine::runtime::lm::SpecLm::new(spec, PlacementMode::Pin(Device::Cpu)).unwrap();
+    assert!(m.drafter().is_none());
+}
+
 /// The ViT alone on two image sizes (the second runs reshaped on the first's program): merged
 /// features and the deepstack feature. Qwen3-VL's spec runs the same tower.
 #[test]
