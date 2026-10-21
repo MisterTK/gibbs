@@ -38,8 +38,6 @@ pub struct Instance {
     pub outputs: Vec<String>,
     /// Weights and constants the graph references (bind these).
     pub weights: Vec<String>,
-    /// States declared `recurrent: true`.
-    pub recurrent: Vec<String>,
 }
 
 impl Instance {
@@ -108,7 +106,6 @@ pub fn build_network(
         weights: HashMap::new(),
         weight_order: Vec::new(),
         states: HashMap::new(),
-        recurrent: Vec::new(),
         inputs: HashMap::new(),
         taps: HashMap::new(),
         prefix: Vec::new(),
@@ -161,7 +158,6 @@ pub fn build_network(
         inputs: plans,
         outputs,
         weights: b.weight_order,
-        recurrent: b.recurrent,
     })
 }
 
@@ -177,7 +173,6 @@ struct Builder<'a> {
     weights: HashMap<String, ValueId>,
     weight_order: Vec<String>,
     states: HashMap<String, ValueId>,
-    recurrent: Vec<String>,
     inputs: HashMap<String, ValueId>,
     taps: HashMap<String, ValueId>,
     /// Node-name prefixes of the enclosing macro calls.
@@ -231,6 +226,7 @@ impl<'a> Builder<'a> {
     fn when(&self, node: &Map<String, J>) -> Result<bool, String> {
         match node.get("when") {
             None => Ok(true),
+            Some(J::String(s)) => Ok(self.eval_s(s)?.truthy()),
             Some(w) => Ok(self.eval(w)?.truthy()),
         }
     }
@@ -267,16 +263,15 @@ impl<'a> Builder<'a> {
                 .as_object()
                 .ok_or_else(|| format!("node must be an object: {n}"))?;
             self.node(m).map_err(|e| {
-                let what = ["op", "use", "state", "repeat", "tap", "block", "let"]
+                let mut what = ["op", "use", "state", "repeat", "tap", "block", "let"]
                     .iter()
                     .find_map(|k| m.get(*k).map(|v| format!("{k} {v}")))
                     .unwrap_or_default();
-                let out = m.get("out").map(|o| format!(" -> {o}")).unwrap_or_default();
-                if e.starts_with("  at ") || e.contains("\n  at ") {
-                    format!("{e}\n  at {what}{out}")
-                } else {
-                    format!("{e}\n  at {what}{out}")
+                if what.len() > 60 {
+                    what = format!("{}…", &what[..what.floor_char_boundary(60)]);
                 }
+                let out = m.get("out").map(|o| format!(" -> {o}")).unwrap_or_default();
+                format!("{e}\n  at {what}{out}")
             })?;
         }
         Ok(())
@@ -314,9 +309,6 @@ impl<'a> Builder<'a> {
                 .transpose()?
                 .is_some_and(|r| r.truthy());
             let v = self.g.state(name.clone(), shape, dtype, recurrent);
-            if recurrent {
-                self.recurrent.push(name.clone());
-            }
             self.states.insert(name, v);
             return Ok(());
         }
@@ -670,5 +662,176 @@ impl ShapeCache {
         }
         e.push((key, inst.clone()));
         Ok(inst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::{Lora, Registry, Signals};
+    use crate::graph::DType;
+
+    /// Weights: `emb [16, 8]`, per layer `l{i}.w [8, 8]`, `norm [8]`; LoRA on `l0.w`.
+    struct Src;
+    impl Source for Src {
+        fn tensor(&self, name: &str) -> Option<(Vec<usize>, DType)> {
+            match name {
+                "emb" => Some((vec![16, 8], DType::F32)),
+                "norm" => Some((vec![8], DType::F32)),
+                "l0.w" | "l1.w" | "l2.w" => Some((vec![8, 8], DType::F32)),
+                "lora.a" => Some((vec![2, 8], DType::F32)),
+                "lora.b" => Some((vec![8, 2], DType::F32)),
+                _ => None,
+            }
+        }
+        fn lora(&self, w: &str) -> Option<Lora> {
+            (w == "l0.w").then(|| Lora {
+                a: "lora.a".into(),
+                b: "lora.b".into(),
+                scale: 0.5,
+                bias_delta: None,
+            })
+        }
+    }
+    struct Cfg;
+    impl Env for Cfg {
+        fn lookup(&self, root: &str, path: &[Val]) -> Option<Val> {
+            let v = match root {
+                "layers" => Val::Num(3.0),
+                "eps" => Val::Num(1e-5),
+                "cfg" => Val::from_json(&serde_json::json!({"skip": [1]})),
+                _ => return None,
+            };
+            walk(v, path)
+        }
+    }
+
+    const SPEC: &str = r#"{
+      family: "toy", pipeline: "causal_lm",
+      macros: {
+        norm_lin: {params: ["x"], returns: "y", body: [
+          {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:norm"], out: "n"},
+          {op: "Linear", in: ["n", "w:{w}", "w?:{w}.bias"], out: "y"},
+        ]},
+      },
+      components: {text: {
+        vars: ["rows"],
+        inputs: [
+          {name: "ids", dtype: "u32", shape: ["rows"]},
+          {name: "mask", dtype: "f32", shape: ["rows", "rows"], when: "rows > 1", gen: "causal_key_mask", args: {n: "rows"}},
+        ],
+        body: [
+          {op: "Embedding", in: ["w:emb", "i:ids"], out: "x"},
+          {state: "kv", shape: [4, 8], recurrent: true},
+          {repeat: "i", count: "layers", body: [
+            {block: [
+              {let: {wname: "fmt('l{i}.w')"}},
+              {use: "norm_lin", args: {w: "wname"}, in: ["x"], out: "h", name: "layer{i}"},
+              {op: "Binary", args: {kind: "Add"}, in: ["x", "h"], out: "x"},
+              {tap: "layer.{i}", in: "x"},
+            ], when: "!contains(cfg.skip, i)"},
+          ]},
+          {repeat: "j", over: "[0, 2]", body: [
+            {op: "Unary", args: {kind: {Scale: 2.0}}, in: ["x"], out: "x", name: "scale{j}"},
+          ]},
+          {op: "Linear", in: ["x", "w:emb"], out: "logits"},
+        ],
+        outputs: ["logits", {name: "x", when: "rows == 99"}],
+      }},
+    }"#;
+
+    fn spec() -> Spec {
+        let r = Registry::from_files(&[("families/toy.json5".into(), SPEC.into())], &[]).unwrap();
+        r.spec("toy", &Signals::default()).unwrap()
+    }
+
+    #[test]
+    fn every_node_kind() {
+        let taps = Val::List(vec![Val::Str("layer.2".into())]);
+        let inst = build(
+            &spec(),
+            "text",
+            &Cfg,
+            &Src,
+            &[("rows", Val::Num(4.0)), ("taps", taps)],
+        )
+        .unwrap();
+        let g = &inst.graph;
+        // Inputs: ids, then the generated mask (rows > 1).
+        assert_eq!(inst.inputs.len(), 2);
+        assert_eq!(inst.inputs[1].gen.as_ref().unwrap().0, "causal_key_mask");
+        assert_eq!(inst.inputs[1].gen.as_ref().unwrap().1["n"], 4);
+        // Layer 1 is skipped by the block's `when`; layer 0 has a LoRA branch.
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"layer0.n")
+                && names.contains(&"layer2.y")
+                && !names.contains(&"layer1.y")
+        );
+        assert!(names.contains(&"layer0.y.lora_add"));
+        assert!(names.contains(&"scale0") && names.contains(&"scale2"));
+        // Outputs: logits [4, 16] then the requested tap; `x` output's `when` is false.
+        assert_eq!(
+            inst.outputs,
+            vec!["logits".to_string(), "layer.2".to_string()]
+        );
+        assert_eq!(g.value(g.outputs[0]).shape, vec![4, 16]);
+        assert_eq!(g.recurrent_states(), vec!["kv".to_string()]);
+        // Weights are declared once each: emb is used twice.
+        let mut w = inst.weights.clone();
+        w.sort();
+        assert_eq!(w, ["emb", "l0.w", "l2.w", "lora.a", "lora.b", "norm"]);
+        let decls = g
+            .values
+            .iter()
+            .filter(|v| v.name == "emb" && v.kind == crate::graph::ValueKind::Weight)
+            .count();
+        assert_eq!(decls, 1);
+        // Single row: the mask input is not declared.
+        let one = build(&spec(), "text", &Cfg, &Src, &[("rows", Val::Num(1.0))]).unwrap();
+        assert_eq!(one.inputs.len(), 1);
+        assert_eq!(one.outputs, vec!["logits".to_string()]);
+    }
+
+    #[test]
+    fn errors_name_the_node() {
+        let mut s = spec();
+        s.components["text"]["body"][0]["in"][0] = serde_json::json!("w:missing");
+        let e = build(&s, "text", &Cfg, &Src, &[("rows", Val::Num(2.0))]).unwrap_err();
+        assert!(
+            e.contains("weight `missing` is missing") && e.contains("op \"Embedding\""),
+            "{e}"
+        );
+        let e = build(&spec(), "text", &Cfg, &Src, &[]).unwrap_err();
+        assert!(e.contains("`rows` not given"), "{e}");
+        let taps = Val::List(vec![Val::Str("layer.1".into())]);
+        let e = build(
+            &spec(),
+            "text",
+            &Cfg,
+            &Src,
+            &[("rows", Val::Num(2.0)), ("taps", taps)],
+        )
+        .unwrap_err();
+        assert!(e.contains("tap `layer.1`"), "{e}");
+    }
+
+    #[test]
+    fn shape_cache_reuses_and_evicts() {
+        let c = ShapeCache::new("text");
+        let s = spec();
+        let s = &s;
+        let mk = |n: usize| move || build(s, "text", &Cfg, &Src, &[("rows", Val::Num(n as f64))]);
+        let a = c.get(&[("rows", Val::Num(1.0))], mk(1)).unwrap();
+        let b = c
+            .get(&[("rows", Val::Num(1.0))], || Err("must hit".into()))
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        for n in 2..=ShapeCache::CAP + 1 {
+            c.get(&[("rows", Val::Num(n as f64))], mk(n)).unwrap();
+        }
+        assert!(c
+            .get(&[("rows", Val::Num(1.0))], || Err("evicted".into()))
+            .is_err());
     }
 }

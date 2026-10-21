@@ -219,10 +219,22 @@ pub fn eval_str(src: &str, env: &dyn Env) -> Result<Val, String> {
 }
 
 /// Evaluates a JSON spec value: strings are expressions, numbers/bools/null literal, arrays and
-/// objects element-wise. A string holding a quoted literal (`"'x'"`) is a string.
+/// objects element-wise. A string holding a quoted literal (`"'x'"`) is a string, and so is a bare
+/// identifier no scope defines (enum variant names: `kind: "Add"`).
 pub fn eval_json(j: &J, env: &dyn Env) -> Result<Val, String> {
     match j {
-        J::String(s) => eval_str(s, env),
+        J::String(s) => match parse(s)? {
+            Expr::Ref(root, segs) if segs.is_empty() && env.lookup(&root, &[]).is_none() => {
+                Ok(Val::Str(root))
+            }
+            e => eval(&e, env).map_err(|err| {
+                if err.contains('`') {
+                    err
+                } else {
+                    format!("`{s}`: {err}")
+                }
+            }),
+        },
         J::Array(a) => Ok(Val::List(
             a.iter()
                 .map(|x| eval_json(x, env))

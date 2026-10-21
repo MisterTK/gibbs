@@ -7,6 +7,7 @@
 //! name order) <- user family file of the same name (replaces) <- matching user overrides. Merging is
 //! RFC 7386 merge patch: objects merge, everything else (arrays included) replaces, `null` deletes.
 
+pub mod build;
 pub mod expr;
 pub mod gen;
 pub mod load;
