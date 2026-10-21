@@ -479,4 +479,44 @@ mod tests {
         );
         assert_eq!(card_base_model("# no front matter"), None);
     }
+
+    /// A matrix target gets the runtime branch (scale alpha/rank · strength); a 1x1 conv kernel has
+    /// `scale · up·down` merged in; kohya keys resolve through `.`-as-`_` names.
+    #[test]
+    fn lora_file_patches_matrices_and_convs() {
+        use crate::arch::testing::{artifacts, Weights};
+        use crate::arch::{load, Registry, Source};
+        let dir = std::env::temp_dir().join(format!("gibbs-lora-{}", std::process::id()));
+        let mut w = Weights::new(3);
+        w.w("blk.lin.weight", &[4, 3]).w("blk.conv.weight", &[4, 3, 1, 1]);
+        w.write_checkpoint(&dir.join("base"), &serde_json::json!({"model_type": "toy"}), 4);
+        let mut l = Weights::new(4);
+        l.w("lora_unet_blk_lin.lora_down.weight", &[2, 3])
+            .w("lora_unet_blk_lin.lora_up.weight", &[4, 2])
+            .put("lora_unet_blk_lin.alpha", &[1], vec![1.0])
+            .w("lora_unet_blk_conv.lora_down.weight", &[2, 3, 1, 1])
+            .w("lora_unet_blk_conv.lora_up.weight", &[4, 2, 1, 1]);
+        l.write_checkpoint(&dir.join("lora"), &serde_json::json!({}), 4);
+        let spec = r#"{family: "toy", pipeline: "diffusion", match: {hf_model_type: ["toy"]}, components: {}}"#;
+        let reg = Registry::from_files(&[("families/toy.json5".into(), spec.into())], &[]).unwrap();
+        let mut m = load::load(&artifacts(&dir.join("base")), &reg, None).unwrap();
+        let base = m.store.materialize(&["blk.conv.weight".into()]).unwrap();
+        let base = base.get("blk.conv.weight").unwrap().as_f32().unwrap().to_vec();
+        let f = LoraFile::open(&dir.join("lora/model.safetensors")).unwrap();
+        assert_eq!(f.targets(Part::Denoiser), 2);
+        assert_eq!(f.apply(Part::Denoiser, &mut m, &reg, 2.0).unwrap(), 2);
+        let br = m.store.lora("blk.lin.weight").expect("runtime branch");
+        assert_eq!(br.scale, 2.0 * 1.0 / 2.0);
+        let merged = m.store.materialize(&["blk.conv.weight".into()]).unwrap();
+        let merged = merged.get("blk.conv.weight").unwrap().as_f32().unwrap().to_vec();
+        let (down, up) = (&l.tensors[3].2, &l.tensors[4].2);
+        for o in 0..4 {
+            for i in 0..3 {
+                let d: f32 = (0..2).map(|r| up[o * 2 + r] * down[r * 3 + i]).sum::<f32>() * 2.0;
+                assert!((merged[o * 3 + i] - base[o * 3 + i] - d).abs() < 1e-5);
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }
