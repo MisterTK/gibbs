@@ -35,3 +35,6 @@ mod diffa;
 
 #[path = "golden/diffb.rs"]
 mod diffb;
+
+#[path = "golden/text_enc.rs"]
+mod text_enc;
