@@ -39,7 +39,6 @@ const VAE_PX: usize = 8;
 /// VAE latent channels.
 const Z: usize = 16;
 /// Qwen2 pre-tokenizer split (GPT-4 style).
-const SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// A Linear layer with bias, weights left in their stored encoding.
 struct BLin {
@@ -590,70 +589,14 @@ impl Core {
     }
 }
 
-/// Qwen2Tokenizer from `<dir>/tokenizer.json`, or built from `vocab.json`, `merges.txt` and
-/// `added_tokens.json` (Qwen-Image's `tokenizer/` ships no tokenizer.json): NFC, GPT-4-style split,
-/// byte-level BPE, added tokens split out of the text at their stored ids.
+/// Qwen2Tokenizer from `<dir>/tokenizer.json`, or built from its vocab/merges files
+/// (Qwen-Image's `tokenizer/` ships no tokenizer.json).
 fn load_tokenizer(dir: &Path) -> Result<tokenizers::Tokenizer, String> {
-    use tokenizers::models::bpe::BPE;
-    use tokenizers::normalizers::NFC;
-    use tokenizers::pre_tokenizers::{
-        byte_level::ByteLevel,
-        sequence::Sequence,
-        split::{Split, SplitPattern},
-        PreTokenizerWrapper,
-    };
-    use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
-    let err = |e: tokenizers::Error| format!("{}: {e}", dir.display());
     let json = dir.join("tokenizer.json");
     if json.is_file() {
-        return Tokenizer::from_file(&json).map_err(|e| format!("{}: {e}", json.display()));
+        return tokenizers::Tokenizer::from_file(&json).map_err(|e| format!("{}: {e}", json.display()));
     }
-    let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
-    let bpe = BPE::from_file(&path("vocab.json"), &path("merges.txt"))
-        .build()
-        .map_err(err)?;
-    let mut tok = Tokenizer::new(bpe);
-    let split = Split::new(
-        SplitPattern::Regex(SPLIT_PATTERN.into()),
-        SplitDelimiterBehavior::Isolated,
-        false,
-    )
-    .map_err(err)?;
-    tok.with_normalizer(Some(NFC));
-    tok.with_pre_tokenizer(Some(Sequence::new(vec![
-        PreTokenizerWrapper::from(split),
-        PreTokenizerWrapper::from(ByteLevel::new(false, false, false)),
-    ])));
-    let added_path = dir.join("added_tokens.json");
-    let raw = std::fs::read_to_string(&added_path)
-        .map_err(|e| format!("{}: {e}", added_path.display()))?;
-    let map: serde_json::Map<String, Value> =
-        serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", added_path.display()))?;
-    let mut added: Vec<(u32, &str)> = Vec::with_capacity(map.len());
-    for (content, id) in &map {
-        let id = id
-            .as_u64()
-            .ok_or_else(|| format!("{}: id of {content} is not a number", added_path.display()))?;
-        added.push((id as u32, content.as_str()));
-    }
-    // Added tokens take consecutive ids after the vocabulary, in the order they are added.
-    added.sort();
-    // ponytail: every added token is registered as special (tokenizer_config.json marks a few, e.g.
-    // `<tool_call>`, non-special); matching in the text is identical, only decoding differs.
-    let tokens: Vec<AddedToken> = added
-        .iter()
-        .map(|(_, c)| AddedToken::from(*c, true))
-        .collect();
-    tok.add_special_tokens(&tokens);
-    for (id, c) in &added {
-        if tok.token_to_id(c) != Some(*id) {
-            return Err(format!(
-                "{}: added token {c} does not land on id {id} (vocab.json has gaps?)",
-                dir.display()
-            ));
-        }
-    }
-    Ok(tok)
+    crate::model::tokenizer::byte_bpe_from_vocab_merges(dir)
 }
 
 pub struct QwenImagePipeline {
@@ -856,26 +799,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tokenizer_is_built_from_vocab_and_merges_and_splits_out_special_tokens() {
-        let dir = std::env::temp_dir().join(format!("gibbs-qwen1-tok-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("vocab.json"), r#"{"h":0,"i":1,"Ġ":2,"hi":3}"#).unwrap();
-        std::fs::write(dir.join("merges.txt"), "#version: 0.2\nh i\n").unwrap();
-        std::fs::write(
-            dir.join("added_tokens.json"),
-            r#"{"<|im_end|>":5,"<|im_start|>":4}"#,
-        )
-        .unwrap();
-        let tok = load_tokenizer(&dir).unwrap();
-        let ids = |s: &str| tok.encode(s, false).unwrap().get_ids().to_vec();
-        assert_eq!(ids("hi"), [3]);
-        assert_eq!(ids("hi hi"), [3, 2, 3]);
-        assert_eq!(ids("<|im_start|>hi<|im_end|>"), [4, 3, 5]);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn env_path(k: &str) -> Option<std::path::PathBuf> {
+        fn env_path(k: &str) -> Option<std::path::PathBuf> {
         std::env::var_os(k).map(Into::into)
     }
 

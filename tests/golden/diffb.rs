@@ -473,10 +473,10 @@ fn krea2_spec() {
     krea2_run(true)
 }
 
-fn krea2_run(spec: bool) {
-    use gibbs_engine::model::krea2::Dit;
+/// The tiny Krea 2 checkpoint `krea2_tiny.safetensors` in fixture dir `case`.
+fn krea2_fixture(case: &str) -> std::path::PathBuf {
     let (dim, hd, kv, mlp, td, tmlp) = (64usize, 16usize, 32usize, 96usize, 32usize, 48usize);
-    let dir = fixture_dir(if spec { "diffb_krea2_spec" } else { "diffb_krea2" });
+    let dir = fixture_dir(case);
     let mut s = Spec::new();
     lin(&mut s, "first", dim, 64, true);
     lin(&mut s, "tmlp.0", dim, 16, true);
@@ -518,6 +518,14 @@ fn krea2_run(spec: bool) {
     }
     let file = dir.join("krea2_tiny.safetensors");
     write_st(&file, &synth(4, &s));
+    dir
+}
+
+fn krea2_run(spec: bool) {
+    use gibbs_engine::model::krea2::Dit;
+    let td = 32usize;
+    let dir = krea2_fixture(if spec { "diffb_krea2_spec" } else { "diffb_krea2" });
+    let file = dir.join("krea2_tiny.safetensors");
     let dit = (!spec).then(|| Dit::load(&file, &mut Loras::default(), &Value::Null).expect("Krea 2 fixture"));
     let n = 24usize;
     let taps: Vec<Vec<f32>> = (0..12).map(|l| rnd(100 + l, n * td, 1.0)).collect();
@@ -1154,4 +1162,47 @@ fn dit_runtimes_parse() {
         spec.runtime_as::<gibbs_engine::runtime::diffusion::Runtime>()
             .unwrap_or_else(|e| panic!("{f}: {e}"));
     }
+}
+
+/// Krea 2 LoRA files through the shared `LoraFile` loader on the spec path (original/ComfyUI key
+/// forms under `diffusion_model.`): a low-rank pair changes the output, a `.diff_b` bias delta
+/// alone (zero up weight) changes it too, and a module naming a block the model lacks is an error.
+#[test]
+fn krea2_spec_lora() {
+    use gibbs_engine::model::lora::{LoraFile, Part};
+    let dir = krea2_fixture("diffb_krea2_lora");
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let (h, w, n) = (12usize, 12usize, 24usize);
+    let lat = pack2x2(&rnd(7, 16 * h * w, 1.0), 16, h, w, false);
+    let ctx = rnd(8, n * 64, 1.0);
+    let lora = |name: &str, t: Vec<T>| {
+        let p = dir.join(name);
+        write_st(&p, &t);
+        LoraFile::open(&p).unwrap()
+    };
+    let pair = |m: &str, up: f32| -> Vec<T> {
+        vec![
+            (format!("diffusion_model.{m}.lora_down.weight"), vec![4, 64], rnd(30, 4 * 64, 0.5)),
+            (format!("diffusion_model.{m}.lora_up.weight"), vec![64, 4], rnd(31, 64 * 4, up)),
+        ]
+    };
+    let forward = |l: Option<&LoraFile>| -> Vec<f32> {
+        let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
+        if let Some(l) = l {
+            assert_eq!(l.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap(), 1);
+        }
+        r.step = vec![("sigma".into(), Val::Num(0.5))];
+        let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
+        run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(ctx.clone())], "out")
+    };
+    let base = forward(None);
+    let changed = |y: &[f32]| y.iter().zip(&base).any(|(a, b)| (a - b).abs() > 1e-4);
+    assert!(changed(&forward(Some(&lora("pair.safetensors", pair("blocks.1.attn.wq", 0.5))))));
+    let mut bias = pair("first", 0.0);
+    bias.push(("diffusion_model.first.diff_b".into(), vec![64], rnd(32, 64, 0.5)));
+    assert!(changed(&forward(Some(&lora("bias.safetensors", bias)))), "diff_b bias delta not applied");
+    let stray = lora("stray.safetensors", pair("blocks.9.attn.wq", 0.5));
+    let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
+    let e = stray.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap_err();
+    assert!(e.contains("matches no weight"), "{e}");
 }

@@ -9,7 +9,7 @@
   family: "krea2",
   match: {diffusers_class: ["Krea2Pipeline", "Krea2Transformer2DModel"]},
   pipeline: "diffusion",
-  use_lib: ["dit_extra"],
+  use_lib: ["diffusion"],
   names: {use: ["comfy"]},
   config: {
     dim: "shape('img_in.weight')[0]",
@@ -96,7 +96,7 @@
       {block: [
         {op: "Slice", args: {axis: 1, start: 0, end: "d"}, in: ["m"], out: "sc", name: "m0"},
         {op: "Slice", args: {axis: 1, start: "d", end: "2 * d"}, in: ["m"], out: "sh", name: "m1"},
-        {use: "modulate", in: ["h", "sh", "sc"], out: "h", name: "premod"},
+        {use: "scale_shift", in: ["h", "sh", "sc"], out: "h", name: "premod"},
       ], when: "modulated"},
       {use: "kattn", in: ["h"], out: "a", name: "attn"},
       {block: [
@@ -108,7 +108,7 @@
       {block: [
         {op: "Slice", args: {axis: 1, start: "3 * d", end: "4 * d"}, in: ["m"], out: "sc", name: "m3"},
         {op: "Slice", args: {axis: 1, start: "4 * d", end: "5 * d"}, in: ["m"], out: "sh", name: "m4"},
-        {use: "modulate", in: ["h", "sh", "sc"], out: "h", name: "postmod"},
+        {use: "scale_shift", in: ["h", "sh", "sc"], out: "h", name: "postmod"},
       ], when: "modulated"},
       {op: "Linear", in: ["h", "w:{p}.ff.gate.weight", "w?:{p}.ff.gate.bias"], out: "fg", name: "mlp.gate"},
       {op: "Linear", in: ["h", "w:{p}.ff.up.weight", "w?:{p}.ff.up.bias"], out: "fu", name: "mlp.up"},
@@ -184,7 +184,7 @@
         {op: "Slice", args: {axis: 0, start: 1, end: 2}, in: ["w:final_layer.scale_shift_table"], out: "sh", name: "last_mod.shift"},
         {op: "Binary", args: {kind: "Add"}, in: ["t", "sc"], out: "sc", name: "final.scale"},
         {op: "Binary", args: {kind: "Add"}, in: ["t", "sh"], out: "sh", name: "final.shift"},
-        {use: "modulate", in: ["y", "sh", "sc"], out: "y", name: "final.mod"},
+        {use: "scale_shift", in: ["y", "sh", "sc"], out: "y", name: "final.mod"},
         {op: "Linear", in: ["y", "w:final_layer.linear.weight", "w?:final_layer.linear.bias"], out: "out", name: "last"},
       ],
       outputs: ["out"],
