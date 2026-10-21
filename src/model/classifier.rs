@@ -285,11 +285,6 @@ pub fn is_generator(arch: &str) -> bool {
         .any(|s| arch.ends_with(s))
 }
 
-/// `model_type`s the LLM loaders run (GraphLm by tensor layout, plus the native models).
-const LLM_MODEL_TYPES: &[&str] = &[
-    "llama", "mistral", "qwen2", "qwen3", "gpt2", "gpt_neo", "gpt_neox",
-];
-
 /// transformers `model_type`s whose base classes (`<Family>Model`, `...ForMaskedLM`) are plain
 /// backbones; another class name over them is the repo's own code.
 const TRANSFORMERS_TYPES: &[&str] = &[
@@ -373,8 +368,9 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
             return Some(Ok(()));
         }
         if is_generator(a) {
+            // The LLM loaders: causal-LM family specs, plus the native models.
             let runs = model_type.is_some_and(|t| {
-                LLM_MODEL_TYPES.contains(&t)
+                crate::arch::registry().is_ok_and(|r| r.runs_model_type(t))
                     || crate::model::native::NATIVE_MODEL_TYPES.contains(&t)
             });
             return (runs && !cfg["auto_map"].is_object()).then_some(Ok(()));

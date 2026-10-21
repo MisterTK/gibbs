@@ -1589,6 +1589,8 @@ pub struct Model {
     pub store: WeightStore,
     pub tokenizer: Option<Tokenizer>,
     pub ckpt: Arc<Checkpoint>,
+    /// (raw checkpoint name, canonical name) of every raw tensor, sorted by raw name.
+    pub renames: Vec<(String, String)>,
 }
 
 /// Opens `artifacts` and loads it as `family` (detected from the checkpoint when `None`), under
@@ -1645,10 +1647,13 @@ fn load_from(
     };
     let spec = reg.spec(&family, &ckpt.sig)?;
     if spec.pipeline == Pipeline::Unsupported {
-        return Err(spec
-            .reason
-            .clone()
-            .unwrap_or_else(|| format!("family `{family}` is not supported")));
+        let sig = &ckpt.sig;
+        let name = sig
+            .hf_model_type
+            .as_deref()
+            .or(sig.gguf_arch.as_deref())
+            .unwrap_or("");
+        return Err(format!("{name}: {}", spec.unsupported_reason(name)));
     }
     let fam = |e: String| format!("{family}: {e}");
 
@@ -1737,12 +1742,18 @@ fn load_from(
         reencode,
         cache: Mutex::new(HashMap::new()),
     };
+    let renames = ckpt
+        .raw
+        .keys()
+        .map(|r| (r.clone(), ren.canonical(r)))
+        .collect();
     Ok(Model {
         spec,
         env,
         store,
         tokenizer,
         ckpt,
+        renames,
     })
 }
 

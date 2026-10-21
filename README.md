@@ -298,6 +298,8 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | `--frames` (default 16), `--guidance` (default 9.0), `--steps` (default 25), `--output <file.mp4>` | Text-to-video options (see [Text-to-video: ModelScope](#text-to-video-modelscope)); LTX-Video has its own defaults, `--image` (first frame) and `--text-encoder`. |
 | `--tui` | Opens the terminal dashboard. |
 | `--hf-token`, `--port`, `--storage` | Hugging Face auth, listen port, and storage backend. |
+| `--arch <family>` | Loads `--model` as this family spec (`arch/families/<family>.json5`, or a user file in `~/.cache/gibbs/arch/families/`, which replaces an embedded family of the same name), skipping detection; the spec's `causal_lm` pipeline runs it (`src/runtime/lm.rs`). User overrides in `~/.cache/gibbs/arch/overrides/` patch matching specs. |
+| `--arch-dump` | Prints `--model`'s merged family spec, its resolved config vars, every checkpoint tensor's canonical name and the tensors no component reads (JSON), then exits. |
 
 ### Environment variables
 
@@ -305,6 +307,7 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | :--- | :--- |
 | `GIBBS_QUANT=<quant>` | Chooses which weight file to fetch: a GGUF quant (`Q4_K_M`, `IQ4_XS`, `FP16`, …) or an ONNX variant (`fp32`, `fp16`, `q4`, `q4f16`, `int8`, `uint8`, `quantized`, `bnb4`). Only a matching file is used. |
 | `GIBBS_SPEC=off` | Disables speculative decoding (built-in MTP heads and `--draft`). |
+| `GIBBS_SPEC_LM=1` | Causal LMs a family spec claims (`arch/families/*.json5`) load through the spec runtime (`src/runtime/lm.rs`) instead of GraphLm; the native loaders keep their models. |
 | `GIBBS_TUNE=off` (also `0`, `false`) | Keeps each weight format's default GEMV variant without running the per-shape tuner or reading the tune cache (`src/graph/tune.rs`). |
 | `GIBBS_TUNE_BUSY_PCT=<n>` | Device-utilization percent above which foreign GPU load is assumed and tuned winners are kept in-memory only instead of persisted (default `20`). |
 | `GIBBS_FUSION=xla` | Restricts the Metal planner to XLA's GPU fusion classes (elementwise chain, reduce-input, dot-epilogue, sibling same-kind), disabling horizontal batching for comparison (`src/graph/metal.rs`). |

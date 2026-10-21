@@ -971,7 +971,7 @@ mod tests {
                         .unwrap()[0]
                         .to_bits();
                     let want =
-                        crate::model::graph_lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0, 1.0);
+                        crate::runtime::lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0, 1.0);
                     assert_eq!(got, want, "head {name} cols={cols} valid={valid}");
                 }
             }

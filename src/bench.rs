@@ -147,42 +147,40 @@ pub fn applied_policy(
     (policy, 0)
 }
 
-/// Loads `artifacts` on Metal under the `reencode` policy name (set as the effective policy so
-/// native loaders honor it too).
+/// Loads `artifacts` on Metal under the `reencode` policy name (the effective policy of every
+/// loader during the load).
 pub fn load_for_bench(
     artifacts: &crate::model::hub::ModelArtifacts,
     reencode: &str,
 ) -> Result<BenchLoad, String> {
-    use crate::model::weight_format::{load_causal_lm_with, set_reencode_override, ReencodeConfig};
-    let cfg = ReencodeConfig {
+    let cfg = crate::model::weight_format::ReencodeConfig {
         policy: reencode.parse()?,
         ..Default::default()
     };
-    let placement = crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal);
-    set_reencode_override(Some(cfg.clone()));
-    let native = crate::model::native::load_native(artifacts, placement);
-    set_reencode_override(None);
-    match native {
-        Some(Ok(m)) => {
-            let (policy, saved_bytes) = applied_policy(None, cfg.policy);
-            return Ok(BenchLoad {
-                exec: crate::scheduler::ExecutableModel::Native(m),
-                policy,
-                saved_bytes,
-            });
-        }
-        Some(Err(e)) => return Err(e),
-        None => {}
-    }
-    let hw = crate::hardware::HardwareCapability::probe_system();
-    let (graph_lm, choice) =
-        load_causal_lm_with(artifacts, crate::hardware::Device::Metal, None, &hw, &cfg)?;
-    let policy = applied_policy(Some(&choice), cfg.policy).0;
-    let exec = crate::scheduler::ExecutableModel::load_graph_lm(graph_lm, placement)?;
+    let policy = cfg.policy;
+    let (exec, choice) = crate::arch::dispatch::load_lm(
+        artifacts,
+        &crate::arch::LoadOpts {
+            placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
+            token: None,
+            quant: None,
+            quant_name: None,
+            hw: &crate::hardware::HardwareCapability::probe_system(),
+            reencode: cfg,
+            family: None,
+            stage: &|_| {},
+            system1_first: false,
+            admit: &|_| Ok(()),
+        },
+    )?;
+    let (policy, saved_bytes) = match &choice {
+        None => applied_policy(None, policy),
+        Some(c) => (applied_policy(Some(c), policy).0, 0),
+    };
     Ok(BenchLoad {
         exec,
         policy,
-        saved_bytes: 0,
+        saved_bytes,
     })
 }
 
@@ -486,20 +484,36 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         // Load Native Metal and CPU models for bit-parity verification
         // The CPU leg is the deliberate reference: only its load and forwards run under `allow`, so the
         // Metal leg stays under the GPU-only tripwire.
-        let metal_loaded = crate::model::native::load_native(
-            &artifacts,
-            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
-        );
-        let cpu_loaded = {
-            let _cpu = crate::hardware::cpu_compute::allow();
-            crate::model::native::load_native(
-                &artifacts,
-                crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
-            )
+        let hw = crate::hardware::HardwareCapability::probe_system();
+        let load = |dev| {
+            let opts = crate::arch::LoadOpts {
+                placement: crate::hardware::PlacementMode::Pin(dev),
+                token: None,
+                quant: None,
+                quant_name: None,
+                hw: &hw,
+                reencode: crate::model::weight_format::ReencodeConfig::effective(),
+                family: None,
+                stage: &|_| {},
+                system1_first: false,
+                admit: &|_| Ok(()),
+            };
+            crate::arch::dispatch::load_lm(&artifacts, &opts).map(|(e, _)| match e {
+                crate::scheduler::ExecutableModel::Native(m) => Some(m),
+                crate::scheduler::ExecutableModel::Program(..) => None,
+            })
         };
-        let (metal_exec, cpu_exec) = match (metal_loaded, cpu_loaded) {
-            (Some(Ok(m)), Some(Ok(c))) => (m, c),
-            (None, _) | (_, None) => {
+        let loaded = load(crate::hardware::Device::Metal).and_then(|m| match m {
+            Some(m) => {
+                let _cpu = crate::hardware::cpu_compute::allow();
+                let c = load(crate::hardware::Device::Cpu)?;
+                Ok(c.map(|c| (m, c)))
+            }
+            None => Ok(None),
+        });
+        let (metal_exec, cpu_exec) = match loaded {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
                 // GraphLm checkpoint: no separate native forward, so compare the Metal decode
                 // program with the CPU graph executor on the very same graph and weights.
                 match graph_lm_parity(&artifacts, &suite, model_cfg) {
@@ -517,7 +531,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                     }
                 }
             }
-            (Some(Err(e)), _) | (_, Some(Err(e))) => {
+            Err(e) => {
                 eprintln!("parity: load error for {}: {e}", model_cfg.id);
                 return Ok(4);
             }

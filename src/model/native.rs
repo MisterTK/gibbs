@@ -154,6 +154,7 @@ pub trait NativeLm: Send + Sync {
 
 /// `model_type`s [`load_native`] implements. The hub picker lets their repos load whatever their
 /// pipeline tag (`image-text-to-text`, `any-to-any`, ...).
+// legacy: until Phases 5 (qwen), 6 (gemma), 4 (idefics3) and 8 (t5) give these families specs.
 pub const NATIVE_MODEL_TYPES: &[&str] = &[
     "qwen3_5",
     "qwen3_5_text",
@@ -177,6 +178,7 @@ pub const NATIVE_MODEL_TYPES: &[&str] = &[
 /// `hunyuan-dense` / `qwen35` / `qwen35moe` / `qwen4exp` files ([`crate::model::qwen3_5::load_gguf`]),
 /// `gemma4` files with their `mmproj` ([`crate::model::gemma4::load_gguf`]) and candle-style T5
 /// GGUFs ([`crate::model::t5::load`]). The hub picker refuses GGUF repos of the other types.
+// legacy: until Phases 5, 6 and 8 (the same families' specs).
 pub const NATIVE_GGUF_TYPES: &[&str] = &[
     "gemma4",
     "gemma4_unified",
@@ -192,31 +194,6 @@ pub const NATIVE_GGUF_TYPES: &[&str] = &[
     "mt5",
     "umt5",
 ];
-
-/// Why no loader here runs `model_type` (a family a Hub repo names that is not implemented), for
-/// the hub picker and [`load_native`] alike; `None` for every other type.
-pub fn unsupported_architecture(model_type: &str) -> Option<&'static str> {
-    if model_type.starts_with("deepseek_v4") {
-        return Some(
-            "DeepSeek-V4 family: needs multi-query attention with q/o low-rank projections and compressed-KV sparse indexing (compress_ratios, index_topk), hyper-connections (hc_mult), 256-384 routed experts with sqrtsoftplus gating and multi-token-prediction heads (V4.1 adds Engram n-gram embeddings); none is implemented, and every real checkpoint exceeds host memory (smallest: 57.8B parameters)",
-        );
-    }
-    if model_type.starts_with("deepseek_v2")
-        || model_type.starts_with("deepseek_v3")
-        || model_type.starts_with("deepseek2")
-    {
-        return Some("architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented");
-    }
-    if model_type.starts_with("glm_moe_dsa") {
-        return Some(
-            "architecture 'glm-dsa' uses Dynamic Sparse Attention (DSA), which is not implemented",
-        );
-    }
-    if model_type.starts_with("wan") {
-        return Some("text-to-video model, architecture 'wan' (not supported)");
-    }
-    None
-}
 
 /// Loads `artifacts` as a [`NativeLm`] when its `config.json` names an architecture implemented
 /// here; `None` sends it down the GraphLm path.
@@ -276,6 +253,6 @@ fn load_native_once(
         "t5" | "mt5" | "umt5" | "UMT5ForConditionalGeneration" => {
             Some(crate::model::t5::load(artifacts, &cfg, mode))
         }
-        t => unsupported_architecture(t).map(|why| Err(format!("{t}: {why}"))),
+        t => crate::arch::unsupported(t).map(|why| Err(format!("{t}: {why}"))),
     }
 }

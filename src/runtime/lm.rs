@@ -1,0 +1,1008 @@
+//! The causal-LM pipeline: [`SpecLm`] runs the `text` component of any `pipeline: causal_lm`
+//! family spec as a [`NativeLm`].
+//!
+//! Instances (`arch::build`) are keyed by the vars `rows` (positions per pass), `head` (`last`:
+//! logits of the last row; `all`: of every row) and `taps` (`layer.{i}` extra outputs). The decode
+//! instance (`rows=1, head=last`) is compiled once; every other instance runs on its weights and
+//! session through `GraphProgram::run_reshaped`. Each sequence owns its `StateStore`, swapped into
+//! the program for each pass.
+//!
+//! Inputs the runner fills: `token_ids`, `positions`, `visible_end` (the end of the bidirectional
+//! block a row sits in, else its position + 1) and every input with a `gen` (`arch::gen`); a gen
+//! input's args may name `pos0`, the position of the pass's first row, which the runner
+//! substitutes.
+//!
+//! `runtime` keys: `prefill_rows` (64) rows per prefill pass; `bidir_media_blocks`: a pass that
+//! would end inside a bidirectional block runs to the block's end (at most 512 rows), and the
+//! block end's logits answer the positions it ran ahead; `media` (preprocessing, not wired yet).
+
+use crate::arch::build::{build, InputPlan, Instance, ShapeCache};
+use crate::arch::expr::Val;
+use crate::arch::gen::{generate, GenData};
+use crate::arch::load::Model;
+use crate::arch::Registry;
+use crate::graph::program::GraphProgram;
+use crate::graph::{StateStore, Tensor};
+use crate::hardware::{Device, PlacementMode};
+use crate::model::hub::ModelArtifacts;
+use crate::model::native::{logits_of, MediaInput, NativeLm, SeqState};
+use crate::model::tokenizer::Tokenizer;
+use parking_lot::Mutex;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::Arc;
+
+/// The component a causal-LM spec runs.
+pub const TEXT: &str = "text";
+/// The most rows one pass grows to when it finishes a bidirectional block.
+pub const MAX_BLOCK_ROWS: usize = 512;
+
+/// The `runtime` keys this pipeline reads (the rest belong to other glue).
+#[derive(Deserialize)]
+struct Runtime {
+    #[serde(default = "prefill_rows")]
+    prefill_rows: usize,
+    #[serde(default)]
+    bidir_media_blocks: bool,
+    #[serde(default)]
+    media: Option<serde_json::Value>,
+}
+
+fn prefill_rows() -> usize {
+    64
+}
+
+/// One sequence's state.
+pub struct Seq {
+    state: StateStore,
+    /// The prepared prompt: the tokens of positions a bidirectional block runs ahead to.
+    prompt: Vec<u32>,
+    /// Positions in `state`.
+    len: usize,
+    /// Positions the caller has run (`< len` while a finished block runs ahead of it).
+    asked: usize,
+    /// Logits after position `len - 1` while `asked < len`.
+    ahead: Vec<f32>,
+    /// Bidirectional media blocks (positions), each attended whole in one pass; media
+    /// preprocessing fills them when the spec sets `runtime.bidir_media_blocks`.
+    pub blocks: Vec<Range<usize>>,
+    taps: Vec<usize>,
+    tapped: Vec<f32>,
+    /// Recurrent-state snapshots after each position from `ckpt_from` (the last `forward_all`).
+    ckpt: Vec<HashMap<String, Tensor>>,
+    ckpt_from: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Last,
+    Greedy,
+    All,
+}
+
+/// A causal LM run from its family spec.
+pub struct SpecLm {
+    model: Model,
+    rt: Runtime,
+    tok: Tokenizer,
+    ctx: usize,
+    shapes: ShapeCache,
+    /// Compiled from the decode instance; every other instance runs reshaped on it.
+    program: Mutex<GraphProgram>,
+    recurrent: Vec<String>,
+    /// The decode instance takes exactly `[token_ids, positions]`, outputs `logits` first and
+    /// holds no recurrent state: greedy decode may stream on the device.
+    streams: bool,
+    weights: usize,
+}
+
+fn vars(rows: usize, head: &str, taps: &[usize]) -> Vec<(&'static str, Val)> {
+    let mut v = vec![
+        ("rows", Val::Num(rows as f64)),
+        ("head", Val::Str(head.to_string())),
+    ];
+    if !taps.is_empty() {
+        let t = taps
+            .iter()
+            .map(|l| Val::Str(format!("layer.{l}")))
+            .collect();
+        v.push(("taps", Val::List(t)));
+    }
+    v
+}
+
+/// The runner-filled value of input `d` for rows `ids` from position `pos0`.
+fn input(
+    d: &InputPlan,
+    ids: &[u32],
+    pos0: usize,
+    blocks: &[Range<usize>],
+) -> Result<Tensor, String> {
+    let n = ids.len();
+    let t = match (&d.gen, d.name.as_str()) {
+        (Some((g, args)), _) => {
+            let mut args = args.clone();
+            if let Some(o) = args.as_object_mut() {
+                for v in o.values_mut().filter(|v| v.as_str() == Some("pos0")) {
+                    *v = pos0.into();
+                }
+            }
+            match generate(g, &args)
+                .map_err(|e| format!("input `{}`: {e}", d.name))?
+                .data
+            {
+                GenData::F32(v) => Tensor::F32(v),
+                GenData::U32(v) => Tensor::U32(v),
+            }
+        }
+        (None, "token_ids") => Tensor::U32(ids.to_vec()),
+        (None, "positions") => Tensor::U32((pos0..pos0 + n).map(|q| q as u32).collect()),
+        (None, "visible_end") => Tensor::U32(
+            (pos0..pos0 + n)
+                .map(|q| blocks.iter().find(|b| b.contains(&q)).map_or(q + 1, |b| b.end) as u32)
+                .collect(),
+        ),
+        (None, other) => {
+            return Err(format!(
+                "input `{other}` has no generator and is none the LM runtime supplies (token_ids, positions, visible_end)"
+            ))
+        }
+    };
+    let (want, got) = (
+        d.shape.iter().product::<usize>(),
+        match &t {
+            Tensor::F32(v) => v.len(),
+            Tensor::U32(v) => v.len(),
+            _ => 0,
+        },
+    );
+    if want != got {
+        return Err(format!(
+            "input `{}`: {got} values for shape {:?}",
+            d.name, d.shape
+        ));
+    }
+    Ok(t)
+}
+
+/// Loads `artifacts` as `family` (detected when `None`) behind the re-encode KL gate.
+pub fn load(
+    artifacts: &ModelArtifacts,
+    reg: &Registry,
+    family: Option<&str>,
+    mode: PlacementMode,
+) -> Result<Arc<dyn NativeLm>, String> {
+    let on_metal = match mode {
+        PlacementMode::Pin(d) => d == Device::Metal,
+        PlacementMode::Auto => crate::hardware::default_device() == Device::Metal,
+    };
+    crate::arch::load::gated(
+        on_metal,
+        || {
+            Some(
+                crate::arch::load::load(artifacts, reg, family)
+                    .and_then(|m| SpecLm::new(m, mode))
+                    .map(|m| Arc::new(m) as Arc<dyn NativeLm>),
+            )
+        },
+        |r, c| crate::model::weight_format::native_kl_gate(&**r, &**c),
+    )
+    .expect("the spec loader answers every attempt")
+}
+
+impl SpecLm {
+    /// Compiles `model`'s decode instance on `mode`.
+    pub fn new(model: Model, mode: PlacementMode) -> Result<Self, String> {
+        crate::arch::load::check(&model)?;
+        let fam = model.spec.family.clone();
+        let rt: Runtime = model.spec.runtime_as()?;
+        let tok = match (&model.tokenizer, model.ckpt.synthetic) {
+            (Some(t), _) => t.clone(),
+            // Synthetic (random-weight) ids ship no tokenizer.
+            (None, true) => Tokenizer::default_bpe(),
+            (None, false) => return Err(format!("{fam}: the checkpoint has no tokenizer")),
+        };
+        let ctx = ["ctx", "max_position_embeddings"]
+            .iter()
+            .find_map(|v| model.env.var(v).ok().filter(|v| !v.is_null()))
+            .ok_or_else(|| {
+                format!("{fam}: config sets neither `ctx` nor `max_position_embeddings`")
+            })?
+            .usize()?;
+        let shapes = ShapeCache::new(TEXT);
+        let v = vars(1, "last", &[]);
+        let decode = shapes.get(&v, || {
+            build(&model.spec, TEXT, &model.env, &model.store, &v)
+        })?;
+        // ponytail: with media the towers' weights count too; Phase 4 adds them to `used`.
+        if rt.media.is_none() {
+            let used: HashSet<String> = decode.weights.iter().cloned().collect();
+            let unused = model.store.unconsumed(&used, &model.spec.ignore);
+            if !unused.is_empty() {
+                return Err(format!(
+                    "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}",
+                    unused.join(", ")
+                ));
+            }
+        }
+        let weights = model.store.materialize(&decode.weights)?;
+        let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
+        let recurrent = program.recurrent_states();
+        let streams = recurrent.is_empty()
+            && decode.output_index("logits") == Some(0)
+            && decode
+                .inputs
+                .iter()
+                .map(|i| i.name.as_str())
+                .eq(["token_ids", "positions"]);
+        Ok(Self {
+            rt,
+            tok,
+            ctx,
+            shapes,
+            program: Mutex::new(program),
+            recurrent,
+            streams,
+            weights: decode.weights.len(),
+            model,
+        })
+    }
+
+    fn seq(state: &mut SeqState) -> Result<&mut Seq, String> {
+        state
+            .downcast_mut::<Seq>()
+            .ok_or_else(|| "sequence state was not built by this model".into())
+    }
+
+    fn instance(&self, rows: usize, head: &str, taps: &[usize]) -> Result<Arc<Instance>, String> {
+        let v = vars(rows, head, taps);
+        let m = &self.model;
+        self.shapes
+            .get(&v, || build(&m.spec, TEXT, &m.env, &m.store, &v))
+    }
+
+    /// Runs `tokens` from `start`; see [`Mode`].
+    fn run(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        state: &mut SeqState,
+        mode: Mode,
+    ) -> Result<Tensor, String> {
+        let seq = Self::seq(state)?;
+        if tokens.is_empty() {
+            return Err("forward needs at least one token".into());
+        }
+        if start != seq.asked {
+            return Err(format!(
+                "forward at position {start}, but the sequence continues at {}",
+                seq.asked
+            ));
+        }
+        let end = start + tokens.len();
+        if end > self.ctx {
+            return Err(format!(
+                "position {} is past the context length {}",
+                end - 1,
+                self.ctx
+            ));
+        }
+        if end <= seq.len {
+            // A block ran ahead: its end's logits answer every position inside it.
+            if mode == Mode::All {
+                return Err("cannot verify tokens inside a bidirectional block".into());
+            }
+            seq.asked = end;
+            return Ok(Tensor::F32(seq.ahead.clone()));
+        }
+        let blocks = if self.rt.bidir_media_blocks {
+            seq.blocks.clone()
+        } else {
+            Vec::new()
+        };
+        let stop = blocks
+            .iter()
+            .find(|b| b.start < end && end < b.end)
+            .map_or(end, |b| b.end);
+        if stop > end && mode == Mode::All {
+            return Err("cannot verify tokens ending inside a bidirectional block".into());
+        }
+        let ckpt = mode == Mode::All && !self.recurrent.is_empty();
+        if !ckpt || seq.ckpt_from + seq.ckpt.len() != seq.len {
+            seq.ckpt.clear();
+            seq.ckpt_from = seq.len;
+        }
+        let ids = (seq.len..stop)
+            .map(|q| match q < end {
+                true => Ok(tokens[q - start]),
+                false => seq.prompt.get(q).copied().ok_or_else(|| {
+                    format!("position {q} of a bidirectional block is past the prepared prompt")
+                }),
+            })
+            .collect::<Result<Vec<u32>, String>>()?;
+        let mut p = self.program.lock();
+        std::mem::swap(&mut p.state, &mut seq.state);
+        let out = self.passes(&mut p, seq, &ids, end, &blocks, mode, ckpt);
+        std::mem::swap(&mut p.state, &mut seq.state);
+        out
+    }
+
+    /// Runs `ids` from `seq.len` (`p.state` is the sequence's) in passes of at most `prefill_rows`
+    /// rows (1 when checkpointing), each grown to the end of a block it would split.
+    #[allow(clippy::too_many_arguments)]
+    fn passes(
+        &self,
+        p: &mut GraphProgram,
+        seq: &mut Seq,
+        ids: &[u32],
+        end: usize,
+        blocks: &[Range<usize>],
+        mode: Mode,
+        ckpt: bool,
+    ) -> Result<Tensor, String> {
+        let (from, cap) = (seq.len, if ckpt { 1 } else { self.rt.prefill_rows.max(1) });
+        let stop = from + ids.len();
+        let refs: Vec<&str> = self.recurrent.iter().map(String::as_str).collect();
+        let head = if mode == Mode::All { "all" } else { "last" };
+        let (mut logits, mut picked) = (Vec::new(), None);
+        let mut at = from;
+        while at < stop {
+            let mut e = (at + cap).min(stop);
+            if let Some(b) = blocks.iter().find(|b| b.start < e && e < b.end) {
+                e = b.end;
+            }
+            let rows = e - at;
+            if rows > cap.max(MAX_BLOCK_ROWS) {
+                return Err(format!(
+                    "a bidirectional block of {rows} rows exceeds the {MAX_BLOCK_ROWS}-row pass"
+                ));
+            }
+            if ckpt && rows > 1 {
+                return Err(
+                    "cannot checkpoint recurrent state inside a bidirectional block".into(),
+                );
+            }
+            let inst = self.instance(rows, head, &seq.taps)?;
+            let li = inst
+                .output_index("logits")
+                .ok_or("the text component has no `logits` output")?;
+            let inputs = inst
+                .inputs
+                .iter()
+                .map(|d| input(d, &ids[at - from..e - from], at, blocks))
+                .collect::<Result<Vec<_>, _>>()?;
+            let greedy = mode == Mode::Greedy && e == stop && stop == end && li == 0;
+            // The compiled program is the decode instance; every other shape runs reshaped.
+            let out = if rows == 1 && head == "last" && seq.taps.is_empty() {
+                match greedy {
+                    true => p.run_greedy(inputs, self.tok.vocab_size())?,
+                    false => p.run(inputs)?,
+                }
+            } else {
+                p.run_reshaped(&inst.graph, inputs)?
+            };
+            match out.get(li) {
+                Some(Tensor::U32(t)) => picked = t.first().copied(),
+                Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(v),
+                Some(Tensor::F32(v)) => logits.clone_from(v),
+                _ => return Err("the text component returned no f32 logits".into()),
+            }
+            if !seq.taps.is_empty() {
+                let taps = seq
+                    .taps
+                    .iter()
+                    .map(|l| {
+                        let i = inst
+                            .output_index(&format!("layer.{l}"))
+                            .ok_or_else(|| format!("tap `layer.{l}` missing"))?;
+                        out[i].as_f32()
+                    })
+                    .collect::<Result<Vec<&[f32]>, String>>()?;
+                for r in 0..rows {
+                    for t in &taps {
+                        let h = t.len() / rows;
+                        seq.tapped.extend_from_slice(&t[r * h..(r + 1) * h]);
+                    }
+                }
+            }
+            if ckpt {
+                seq.ckpt.push(p.state.snapshot(&refs));
+            }
+            seq.len = e;
+            at = e;
+        }
+        seq.asked = end;
+        if stop > end {
+            seq.ahead.clone_from(&logits);
+        }
+        Ok(match picked {
+            Some(t) => Tensor::U32(vec![t]),
+            None => Tensor::F32(logits),
+        })
+    }
+}
+
+impl NativeLm for SpecLm {
+    fn backend_label(&self) -> String {
+        self.program.lock().backend_label()
+    }
+
+    fn device(&self) -> Device {
+        self.program.lock().primary_device()
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} spec: {} weights, context {}",
+            self.model.spec.family, self.weights, self.ctx
+        )
+    }
+
+    fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
+        Some(self.program.lock().placement_summary())
+    }
+
+    fn tokenizer(&self) -> &Tokenizer {
+        &self.tok
+    }
+
+    fn context_len(&self) -> usize {
+        self.ctx
+    }
+
+    fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
+        if !media.is_empty() {
+            return Err(match self.rt.media {
+                Some(_) => format!(
+                    "{}: image/audio input is not wired to the spec runtime yet; send text only",
+                    self.model.spec.family
+                ),
+                None => "this model takes text only (no image or audio input)".into(),
+            });
+        }
+        let seq = Seq {
+            state: StateStore::new(),
+            prompt: ids.clone(),
+            len: 0,
+            asked: 0,
+            ahead: Vec::new(),
+            blocks: Vec::new(),
+            taps: Vec::new(),
+            tapped: Vec::new(),
+            ckpt: Vec::new(),
+            ckpt_from: 0,
+        };
+        Ok((ids, Box::new(seq)))
+    }
+
+    fn forward(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<Vec<f32>, String> {
+        logits_of(self.run(tokens, start_pos, state, Mode::Last)?)
+    }
+
+    fn forward_greedy(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<Tensor, String> {
+        self.run(tokens, start_pos, state, Mode::Greedy)
+    }
+
+    fn stream_greedy_token(
+        &self,
+        last: u32,
+        start_pos: usize,
+        max_new: usize,
+        state: &mut SeqState,
+    ) -> Result<Option<u32>, String> {
+        let seq = Self::seq(state)?;
+        if !self.streams || !seq.taps.is_empty() || start_pos != seq.asked || seq.len != seq.asked {
+            return Ok(None);
+        }
+        let mut p = self.program.lock();
+        std::mem::swap(&mut p.state, &mut seq.state);
+        let out = p.stream_next(last, start_pos as u32, max_new, self.tok.vocab_size());
+        std::mem::swap(&mut p.state, &mut seq.state);
+        if let Ok(Some(_)) = out {
+            (seq.len, seq.asked) = (start_pos + 1, start_pos + 1);
+            seq.ckpt.clear();
+        }
+        out
+    }
+
+    fn stream_end(&self, state: &mut SeqState) -> Result<(), String> {
+        let seq = Self::seq(state)?;
+        let mut p = self.program.lock();
+        std::mem::swap(&mut p.state, &mut seq.state);
+        let out = p.stream_end();
+        std::mem::swap(&mut p.state, &mut seq.state);
+        out
+    }
+
+    fn forward_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut SeqState,
+    ) -> Result<Vec<f32>, String> {
+        logits_of(self.run(tokens, start_pos, state, Mode::All)?)
+    }
+
+    fn truncate(&self, state: &mut SeqState, len: usize) -> Result<(), String> {
+        let seq = Self::seq(state)?;
+        if len > seq.asked {
+            return Err(format!("cannot truncate {} positions to {len}", seq.asked));
+        }
+        if len < seq.len && !self.recurrent.is_empty() {
+            // Attention reads only the rows below its position (later writes overwrite the rest);
+            // recurrent states come back from the snapshot taken after position len - 1.
+            let held = seq.ckpt.len();
+            if len <= seq.ckpt_from || len > seq.ckpt_from + held {
+                return Err(format!(
+                    "recurrent state rewinds only into its last verified span {}..={}, not to {len}",
+                    seq.ckpt_from + 1,
+                    seq.ckpt_from + held
+                ));
+            }
+            let snap = seq.ckpt.swap_remove(len - seq.ckpt_from - 1);
+            seq.state.restore(snap);
+        }
+        seq.ckpt.clear();
+        seq.ahead.clear();
+        (seq.len, seq.asked) = (len, len);
+        Ok(())
+    }
+
+    fn set_taps(&self, state: &mut SeqState, layers: &[usize]) -> Result<(), String> {
+        // Builds (and caches) a tapped instance: an unknown layer fails here, not mid-decode.
+        self.instance(1, "last", layers)?;
+        Self::seq(state)?.taps = layers.to_vec();
+        Ok(())
+    }
+
+    fn take_taps(&self, state: &mut SeqState) -> Vec<f32> {
+        Self::seq(state).map_or_else(|_| Vec::new(), |s| std::mem::take(&mut s.tapped))
+    }
+}
+
+/// Index of the first largest element of `slice` (NaNs never win; 0 when nothing is above -inf).
+/// Two passes with 16 independent running maxima so the max pass vectorises: the single-pass
+/// `if v > best` scan is a loop-carried branch, ~0.12 ms for a 262k vocabulary on the decode path.
+fn argmax_first(slice: &[f32]) -> usize {
+    let mut lanes = [f32::NEG_INFINITY; 16];
+    let chunks = slice.chunks_exact(16);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for (m, &v) in lanes.iter_mut().zip(c) {
+            *m = m.max(v);
+        }
+    }
+    let max = tail
+        .iter()
+        .chain(&lanes)
+        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    slice.iter().position(|&v| v == max).unwrap_or(0)
+}
+
+/// Samples a token id from `slice` (logits over the tokenizer's vocabulary) with repetition
+/// penalty, top-k, and nucleus top-p; `temperature <= 1e-4` is greedy argmax. Shared by every
+/// causal LM the scheduler runs.
+pub fn sample_logits(
+    slice: &[f32],
+    recent_tokens: &[u32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    repetition_penalty: f32,
+) -> u32 {
+    if slice.is_empty() {
+        return 0;
+    }
+    if temperature <= 1e-4 {
+        if repetition_penalty <= 1.0 || recent_tokens.is_empty() {
+            return argmax_first(slice) as u32;
+        }
+
+        // When repetition penalty > 1.0, find global unpenalized argmax first.
+        let best_idx = argmax_first(slice);
+
+        // Penalty strictly decreases/non-increases logits. If the unpenalized max
+        // is not among recent tokens, it is guaranteed to remain the global max.
+        if !recent_tokens.contains(&(best_idx as u32)) {
+            return best_idx as u32;
+        }
+
+        let mut penalized_best_idx = 0;
+        let mut penalized_best_val = f32::NEG_INFINITY;
+        for (i, &raw_val) in slice.iter().enumerate() {
+            let tok_id = i as u32;
+            let count = recent_tokens.iter().filter(|&&t| t == tok_id).count();
+            let val = if count > 0 {
+                let mut v = raw_val;
+                for _ in 0..count {
+                    if v > 0.0 {
+                        v /= repetition_penalty;
+                    } else {
+                        v *= repetition_penalty;
+                    }
+                }
+                v - (count as f32 * 1.5)
+            } else {
+                raw_val
+            };
+            if val > penalized_best_val {
+                penalized_best_val = val;
+                penalized_best_idx = i;
+            }
+        }
+        return penalized_best_idx as u32;
+    }
+
+    let mut working_logits = slice.to_vec();
+    if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
+        for &tok in recent_tokens {
+            let idx = tok as usize;
+            if idx < working_logits.len() {
+                if working_logits[idx] > 0.0 {
+                    working_logits[idx] /= repetition_penalty;
+                } else {
+                    working_logits[idx] *= repetition_penalty;
+                }
+                working_logits[idx] -= 1.5;
+            }
+        }
+    }
+
+    let (active_candidates, active_probs) = nucleus(&working_logits, temperature, top_k, top_p);
+    let active_sum: f32 = active_probs.iter().sum();
+
+    // 3. Step-varying seeded PRNG mixing token history and active distribution
+    let mut hash =
+        0x811c9dc5u32.wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
+    for (pos, &tok) in recent_tokens.iter().enumerate() {
+        hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
+        hash = hash.rotate_left(13).wrapping_mul(0x01000193);
+    }
+    for &(idx, val) in &active_candidates {
+        hash ^= (idx as u32).wrapping_mul(0x27d4eb2d);
+        hash ^= val.to_bits();
+        hash = hash.rotate_left(7).wrapping_mul(0x01000193);
+    }
+    let r = (((hash & 0x007f_ffff) as f32) / 8_388_608.0) * active_sum;
+
+    let mut cum_prob = 0.0f32;
+    for (i, &p) in active_probs.iter().enumerate() {
+        cum_prob += p;
+        if cum_prob >= r || i == active_probs.len() - 1 {
+            return active_candidates[i].0 as u32;
+        }
+    }
+
+    active_candidates[0].0 as u32
+}
+
+/// The candidates [`sample_logits`] draws from at `temperature > 1e-4` (after any penalty):
+/// top-k by logit, softmax at `temperature`, cut at cumulative `top_p`. Returns the kept
+/// `(token, logit)` pairs and their probabilities, which sum to the kept mass.
+pub(crate) fn nucleus(
+    logits: &[f32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+) -> (Vec<(usize, f32)>, Vec<f32>) {
+    let k = top_k.max(1).min(logits.len());
+    let mut indexed_logits: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    // Highest logit first, ties by token id: a stable full sort's order, in O(vocab).
+    let order = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    if k < indexed_logits.len() {
+        indexed_logits.select_nth_unstable_by(k - 1, order);
+    }
+    indexed_logits.truncate(k);
+    indexed_logits.sort_by(order);
+
+    let max_val = indexed_logits
+        .iter()
+        .map(|&(_, val)| val / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp_vals: Vec<f32> = indexed_logits
+        .iter()
+        .map(|&(_, val)| ((val / temperature) - max_val).exp())
+        .collect();
+    let sum_exp: f32 = exp_vals.iter().sum();
+    let mut probs: Vec<f32> = exp_vals.iter().map(|&e| e / sum_exp.max(1e-12)).collect();
+
+    // Nucleus (top-p) cutoff.
+    let p_thresh = top_p.clamp(0.01, 1.0);
+    let mut cum_p = 0.0f32;
+    let mut cutoff_idx = indexed_logits.len();
+    for (i, &p) in probs.iter().enumerate() {
+        cum_p += p;
+        if cum_p >= p_thresh {
+            cutoff_idx = i + 1;
+            break;
+        }
+    }
+    indexed_logits.truncate(cutoff_idx);
+    probs.truncate(cutoff_idx);
+    (indexed_logits, probs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::weight_format::{ReencodeConfig, ReencodePolicy};
+
+    /// The vectorised argmax equals the scalar first-wins scan: ties, NaNs, every length mod 16.
+    #[test]
+    fn argmax_first_matches_the_scalar_scan() {
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        for len in [1usize, 2, 15, 16, 17, 33, 100, 4099] {
+            for _ in 0..20 {
+                let v: Vec<f32> = (0..len)
+                    .map(|_| match next() % 11 {
+                        0 => f32::NAN,
+                        1 => f32::NEG_INFINITY,
+                        r => (r % 4) as f32 - 1.0, // few distinct values: many ties
+                    })
+                    .collect();
+                let (mut best, mut idx) = (f32::NEG_INFINITY, 0);
+                for (i, &x) in v.iter().enumerate() {
+                    if x > best {
+                        best = x;
+                        idx = i;
+                    }
+                }
+                assert_eq!(argmax_first(&v), idx, "{v:?}");
+            }
+        }
+    }
+
+    /// A toy causal LM over synthetic weights: GQA attention with RoPE and a `visible_end` input,
+    /// an optional recurrent causal conv per layer (`$CONV`), a `gen` input reading `pos0`, taps.
+    const SPEC: &str = r#"{
+      family: "toy", pipeline: "causal_lm",
+      config: {vocab: 32, hidden: 16, heads: 2, kv_heads: 1, hd: 8, ctx: 64, layers: [0, 1], conv: $CONV},
+      runtime: {prefill_rows: $ROWS, bidir_media_blocks: true},
+      constants: {
+        inv_freq: {gen: "rope_inv_freq", args: {dim: "hd", theta: 10000}},
+        ones: {gen: "ones", args: {shape: ["hidden"]}},
+      },
+      synthetic: {
+        emb: {shape: ["vocab", "hidden"]},
+        "l{i}.q": {shape: ["heads*hd", "hidden"], over: {i: "layers"}},
+        "l{i}.k": {shape: ["kv_heads*hd", "hidden"], over: {i: "layers"}},
+        "l{i}.v": {shape: ["kv_heads*hd", "hidden"], over: {i: "layers"}},
+        "l{i}.o": {shape: ["hidden", "heads*hd"], over: {i: "layers"}},
+        "l{i}.conv": {shape: ["hidden*3"], over: {i: "layers"}},
+      },
+      components: {text: {
+        vars: ["rows", "head"],
+        inputs: [
+          {name: "token_ids", dtype: "u32", shape: ["rows"]},
+          {name: "positions", dtype: "u32", shape: ["rows"]},
+          {name: "visible_end", dtype: "u32", shape: ["rows"], when: "rows > 1"},
+          {name: "pos_f", dtype: "f32", shape: ["rows", 1], gen: "iota", args: {n: "rows", dtype: "'f32'", start: "pos0"}},
+        ],
+        body: [
+          {op: "Embedding", in: ["w:emb", "i:token_ids"], out: "x"},
+          {op: "Unary", args: {kind: {Scale: 0.01}}, in: ["i:pos_f"], out: "pf"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "pf"], out: "x"},
+          {repeat: "i", over: "layers", body: [
+            {state: "kv.{i}.k", shape: ["ctx", "kv_heads*hd"]},
+            {state: "kv.{i}.v", shape: ["ctx", "kv_heads*hd"]},
+            {op: "RmsNorm", args: {eps: 1e-5}, in: ["x", "c:ones"], out: "n"},
+            {op: "Linear", in: ["n", "w:l{i}.q"], out: "q"},
+            {op: "Linear", in: ["n", "w:l{i}.k"], out: "k"},
+            {op: "Linear", in: ["n", "w:l{i}.v"], out: "v"},
+            {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "HalfSplit", mscale: 1.0}, in: ["q", "i:positions", "c:inv_freq"], out: "q"},
+            {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "HalfSplit", mscale: 1.0}, in: ["k", "i:positions", "c:inv_freq"], out: "k"},
+            {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "hd", v_head_dim: "hd", scale: "1/sqrt(hd)", causal: true, write: true},
+             in: ["q", "k", "v", "s:kv.{i}.k", "s:kv.{i}.v", "i:positions", "i:visible_end"], out: "a", when: "rows > 1"},
+            {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "hd", v_head_dim: "hd", scale: "1/sqrt(hd)", causal: true, write: true},
+             in: ["q", "k", "v", "s:kv.{i}.k", "s:kv.{i}.v", "i:positions"], out: "a", when: "rows == 1"},
+            {op: "Linear", in: ["a", "w:l{i}.o"], out: "a"},
+            {op: "Unary", args: {kind: {Scale: 50.0}}, in: ["a"], out: "a"},
+            {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x"},
+            {block: [
+              {state: "conv.{i}", shape: [2, "hidden"], recurrent: true},
+              {op: "CausalConv1dCached", args: {kernel: 3, dilation: 1}, in: ["x", "w:l{i}.conv", "s:conv.{i}"], out: "c"},
+              {op: "Binary", args: {kind: "Add"}, in: ["x", "c"], out: "x"},
+            ], when: "conv"},
+            {tap: "layer.{i}", in: "x"},
+          ]},
+          {op: "RmsNorm", args: {eps: 1e-5}, in: ["x", "c:ones"], out: "x"},
+          {op: "Slice", args: {axis: 0, start: "rows - 1", end: "rows"}, in: ["x"], out: "x", when: "head == 'last' && rows > 1"},
+          {op: "Linear", in: ["x", "w:emb"], out: "logits"},
+        ],
+        outputs: ["logits"],
+      }},
+    }"#;
+
+    const V: usize = 32;
+    const PROMPT: [u32; 12] = [3, 17, 5, 29, 11, 2, 8, 30, 14, 21, 6, 9];
+
+    fn devices() -> Vec<Device> {
+        let mut d = vec![Device::Cpu];
+        if crate::hardware::available_devices().contains(&Device::Metal) {
+            d.push(Device::Metal);
+        }
+        d
+    }
+
+    fn toy(dev: Device, conv: bool, rows: usize) -> SpecLm {
+        let spec = SPEC
+            .replace("$CONV", if conv { "true" } else { "false" })
+            .replace("$ROWS", &rows.to_string());
+        let reg = Registry::from_files(&[("families/toy.json5".into(), spec)], &[]).unwrap();
+        let a = ModelArtifacts {
+            model_id: "gibbs/toy".into(),
+            ..Default::default()
+        };
+        let exact = ReencodeConfig {
+            policy: ReencodePolicy::BitExact,
+            cache_dir: None,
+            ..Default::default()
+        };
+        let m = crate::arch::load::load_with(&a, &reg, Some("toy"), exact).unwrap();
+        SpecLm::new(m, PlacementMode::Pin(dev)).unwrap()
+    }
+
+    fn fresh(lm: &SpecLm, ids: &[u32]) -> SeqState {
+        lm.prepare(ids.to_vec(), &[]).unwrap().1
+    }
+
+    fn tol(dev: Device) -> f32 {
+        if dev == Device::Metal {
+            3e-3
+        } else {
+            1e-5
+        }
+    }
+
+    #[track_caller]
+    fn close(a: &[f32], b: &[f32], tol: f32) {
+        assert_eq!(a.len(), b.len());
+        let scale = b.iter().fold(1e-3f32, |m, x| m.max(x.abs()));
+        let d = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(d <= tol * scale, "max diff {d} (scale {scale})");
+    }
+
+    /// Logits of `PROMPT` prefilled in 4-row passes equal one 64-row pass; decoding the tail one
+    /// token at a time equals `forward_all`'s rows; the greedy pick is the logits' argmax.
+    #[test]
+    fn chunked_prefill_decode_and_forward_all_agree() {
+        for dev in devices() {
+            let (chunked, oneshot) = (toy(dev, false, 4), toy(dev, false, 64));
+            let mut s = fresh(&chunked, &PROMPT);
+            let a = chunked.forward(&PROMPT, 0, &mut s).unwrap();
+            let mut s = fresh(&oneshot, &PROMPT);
+            let b = oneshot.forward(&PROMPT, 0, &mut s).unwrap();
+            assert_eq!(a.len(), V);
+            close(&a, &b, tol(dev));
+
+            let mut s = fresh(&oneshot, &PROMPT);
+            let all = oneshot.forward_all(&PROMPT, 0, &mut s).unwrap();
+            assert_eq!(all.len(), PROMPT.len() * V);
+            close(&all[(PROMPT.len() - 1) * V..], &b, tol(dev));
+            let mut s = fresh(&chunked, &PROMPT);
+            chunked.forward(&PROMPT[..5], 0, &mut s).unwrap();
+            for q in 5..PROMPT.len() {
+                let l = chunked.forward(&PROMPT[q..q + 1], q, &mut s).unwrap();
+                close(&l, &all[q * V..(q + 1) * V], tol(dev));
+            }
+            let mut s = fresh(&chunked, &PROMPT);
+            chunked.forward(&PROMPT[..11], 0, &mut s).unwrap();
+            let t = match chunked.forward_greedy(&PROMPT[11..], 11, &mut s).unwrap() {
+                Tensor::U32(t) => t[0],
+                t => sample_logits(&logits_of(t).unwrap(), &[], 0.0, 50, 1.0, 1.0),
+            };
+            assert_eq!(t, sample_logits(&b, &[], 0.0, 50, 1.0, 1.0), "{dev:?}");
+            assert!(chunked.forward(&PROMPT[..1], 3, &mut s).is_err());
+        }
+    }
+
+    /// Verify 4 tokens, rewind to 2 of them, run 2 others: equals a fresh run of that sequence,
+    /// with attention only (no snapshot needed) and with a recurrent conv state (snapshots).
+    #[test]
+    fn truncate_then_forward_equals_a_fresh_run() {
+        for dev in devices() {
+            for conv in [false, true] {
+                let lm = toy(dev, conv, 4);
+                let mut s = fresh(&lm, &PROMPT);
+                lm.forward(&PROMPT[..8], 0, &mut s).unwrap();
+                lm.forward_all(&PROMPT[8..12], 8, &mut s).unwrap();
+                lm.truncate(&mut s, 10).unwrap();
+                let other = [1u32, 31];
+                let got = lm.forward(&other, 10, &mut s).unwrap();
+                let seq: Vec<u32> = [&PROMPT[..10], &other[..]].concat();
+                let mut f = fresh(&lm, &seq);
+                let want = lm.forward(&seq, 0, &mut f).unwrap();
+                close(&got, &want, tol(dev));
+                if conv {
+                    // A plain forward drops the snapshots: no rewind into it.
+                    assert!(lm.truncate(&mut s, 11).is_err());
+                    let mut g = fresh(&lm, &PROMPT);
+                    lm.forward_all(&PROMPT[..4], 0, &mut g).unwrap();
+                    assert!(lm.truncate(&mut g, 0).is_err(), "before the verified span");
+                }
+            }
+        }
+    }
+
+    /// Taps record every layer's residual per position, independent of the pass shape.
+    #[test]
+    fn taps_record_each_layer_per_position() {
+        for dev in devices() {
+            let (chunked, oneshot) = (toy(dev, true, 4), toy(dev, true, 64));
+            let mut a = fresh(&chunked, &PROMPT);
+            chunked.set_taps(&mut a, &[0, 1]).unwrap();
+            chunked.forward(&PROMPT, 0, &mut a).unwrap();
+            let ta = chunked.take_taps(&mut a);
+            assert_eq!(ta.len(), PROMPT.len() * 2 * 16);
+            assert!(chunked.take_taps(&mut a).is_empty());
+            let mut b = fresh(&oneshot, &PROMPT);
+            oneshot.set_taps(&mut b, &[0, 1]).unwrap();
+            oneshot.forward(&PROMPT[..7], 0, &mut b).unwrap();
+            oneshot.forward(&PROMPT[7..], 7, &mut b).unwrap();
+            close(&ta, &oneshot.take_taps(&mut b), tol(dev));
+            assert!(chunked.set_taps(&mut a, &[2]).is_err(), "no layer 2");
+        }
+    }
+
+    /// A pass that would end inside a bidirectional block runs to its end and answers the
+    /// positions it ran ahead from cache; the result equals one pass over the whole prompt, and
+    /// the block changes the logits (rows see the whole block).
+    #[test]
+    fn bidirectional_block_extends_its_pass() {
+        for dev in devices() {
+            let (chunked, oneshot) = (toy(dev, false, 4), toy(dev, false, 64));
+            let with_block = |lm: &SpecLm| {
+                let mut s = fresh(lm, &PROMPT);
+                SpecLm::seq(&mut s).unwrap().blocks = vec![3..9];
+                s
+            };
+            let mut s = with_block(&chunked);
+            // 0..6 ends inside 3..9: the pass runs 0..9.
+            let ahead = chunked.forward(&PROMPT[..6], 0, &mut s).unwrap();
+            assert_eq!(SpecLm::seq(&mut s).unwrap().len, 9);
+            assert_eq!(chunked.forward(&PROMPT[6..8], 6, &mut s).unwrap(), ahead);
+            let a = chunked.forward(&PROMPT[8..], 8, &mut s).unwrap();
+            let mut s = with_block(&oneshot);
+            let b = oneshot.forward(&PROMPT, 0, &mut s).unwrap();
+            close(&a, &b, tol(dev));
+            let mut s = with_block(&oneshot);
+            close(
+                &oneshot.forward(&PROMPT[..9], 0, &mut s).unwrap(),
+                &ahead,
+                tol(dev),
+            );
+            if dev == Device::Cpu {
+                let mut s = fresh(&oneshot, &PROMPT);
+                let plain = oneshot.forward(&PROMPT, 0, &mut s).unwrap();
+                let d = plain
+                    .iter()
+                    .zip(&b)
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                let scale = b.iter().fold(0f32, |m, x| m.max(x.abs()));
+                assert!(
+                    d > 1e-2 * scale,
+                    "the block must change the logits ({d} of {scale})"
+                );
+            }
+        }
+    }
+}

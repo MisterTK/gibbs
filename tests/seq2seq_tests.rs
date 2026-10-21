@@ -5,7 +5,7 @@
 use gibbs_engine::hardware::Device;
 use gibbs_engine::model::hub::HuggingFaceHub;
 use gibbs_engine::model::native::{load_native, NativeLm, PrepareCtx};
-use gibbs_engine::model::graph_lm::sample_logits;
+use gibbs_engine::runtime::lm::sample_logits;
 use std::sync::Arc;
 
 fn model(repo: &str) -> Option<Arc<dyn NativeLm>> {

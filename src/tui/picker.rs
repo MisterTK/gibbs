@@ -1864,9 +1864,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
         return verdict.err();
     }
     let model_type = m["config"]["model_type"].as_str();
-    if let Some((t, why)) =
-        model_type.and_then(|t| Some((t, crate::model::native::unsupported_architecture(t)?)))
-    {
+    if let Some((t, why)) = model_type.and_then(|t| Some((t, crate::arch::unsupported(t)?))) {
         return Some(format!("{t}: {why}"));
     }
     let is_split_gguf = m["siblings"].as_array().map_or(false, |a| {
@@ -1879,7 +1877,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
             .as_str()
             .filter(|_| model_type.is_none())
         {
-            if let Some(why) = crate::model::native::unsupported_architecture(a) {
+            if let Some(why) = crate::arch::unsupported(a) {
                 return Some(format!("{a}: {why}"));
             }
         }
@@ -1938,19 +1936,19 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     let decoder_task = matches!(
         tag,
         "translation" | "summarization" | "text2text-generation"
-    ) && model_type.is_some_and(|t| DECODER_LM_TYPES.contains(&t));
+    ) && model_type.is_some_and(|t| crate::arch::registry().is_ok_and(|r| r.runs_model_type(t)));
     // GGUF-only repos carry no config; their llama.cpp architecture names the model.
     let gguf = m["gguf"]["architecture"]
         .as_str()
         .filter(|_| model_type.is_none());
     let text_gen = decoder_task
-        || gguf.is_some_and(|a| GGUF_LM_ARCHS.contains(&a))
+        || gguf.is_some_and(|a| gguf_lm_archs().iter().any(|x| x == a))
         || matches!(tag, "text-generation" | "conversational");
     (!text_gen).then(|| match (model_type, gguf) {
         (Some(t), _) => format!("{tag} model, architecture '{t}' (not supported)"),
         (None, Some(a)) => format!(
             "{tag} model, llama.cpp GGUF architecture '{a}' (not supported; {} GGUFs load)",
-            GGUF_LM_ARCHS.join(", ")
+            gguf_lm_archs().join(", ")
         ),
         (None, None) => match m["library_name"].as_str().filter(|l| *l != "transformers") {
             Some(l) => format!("{tag} model for '{l}' (not a transformers checkpoint)"),
@@ -1975,23 +1973,17 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     })
 }
 
-/// Decoder-only `model_type`s the GraphLm path runs: repos of these tagged for translation or
-/// summarization are prompted text generators.
-const DECODER_LM_TYPES: &[&str] = &["llama", "mistral", "qwen2"];
-
-/// llama.cpp GGUF architectures a generation path reads (GraphLm's llama/qwen2 blocks, the native
+/// llama.cpp GGUF architectures a generation path reads (causal-LM family specs, and the native
 /// qwen3 / hunyuan-dense / qwen35 / qwen35moe / qwen4exp / gemma4 GGUF loaders), whatever task the
 /// repo is tagged with.
-const GGUF_LM_ARCHS: &[&str] = &[
-    "llama",
-    "qwen2",
-    "qwen3",
-    "hunyuan-dense",
-    "qwen35",
-    "gemma4",
-    "qwen35moe",
-    "qwen4exp",
-];
+fn gguf_lm_archs() -> Vec<String> {
+    let mut a = crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs());
+    // legacy: until Phases 5 and 6 give the native loaders' families specs.
+    a.extend(
+        ["qwen3", "hunyuan-dense", "qwen35", "gemma4", "qwen35moe", "qwen4exp"].map(String::from),
+    );
+    a
+}
 
 /// Sparse Gemma 4 GGUFs (`26B-A4B`: an `A<active billions>B` word in the repo id or its base model
 /// tag): the native loader has no router / expert block (it names the tensor it meets).
@@ -2029,12 +2021,12 @@ fn split_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Opt
     let a = m["gguf"]["architecture"].as_str()?;
     (sel.len() > 1
         && sel[0].ends_with(".gguf")
-        && !GGUF_LM_ARCHS.contains(&a)
+        && !gguf_lm_archs().iter().any(|x| x == a)
         && !["flux", "bert", "t5"].contains(&a))
     .then(|| {
         format!(
             "split GGUF of llama.cpp architecture '{a}' (not supported; {} GGUFs load)",
-            GGUF_LM_ARCHS.join(", ")
+            gguf_lm_archs().join(", ")
         )
     })
 }
@@ -2392,7 +2384,10 @@ mod tests {
         );
         assert_eq!(
             blocker("c/mamba-gguf"),
-            "translation model, llama.cpp GGUF architecture 'mamba' (not supported; llama, qwen2, qwen3, hunyuan-dense, qwen35, gemma4, qwen35moe, qwen4exp GGUFs load)"
+            format!(
+                "translation model, llama.cpp GGUF architecture 'mamba' (not supported; {} GGUFs load)",
+                gguf_lm_archs().join(", ")
+            )
         );
         // Gemma 4 GGUFs load (text + mmproj), tagged image-text-to-text or any-to-any; the sparse
         // 26B-A4B and projector-only repos say why not.
@@ -3001,19 +2996,19 @@ mod tests {
         );
         // 4. Architecture refusals
         assert_eq!(
-            crate::model::native::unsupported_architecture("deepseek_v3"),
+            crate::arch::unsupported("deepseek_v3").as_deref(),
             Some("architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented")
         );
         assert_eq!(
-            crate::model::native::unsupported_architecture("deepseek2"),
+            crate::arch::unsupported("deepseek2").as_deref(),
             Some("architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented")
         );
         assert_eq!(
-            crate::model::native::unsupported_architecture("glm_moe_dsa"),
+            crate::arch::unsupported("glm_moe_dsa").as_deref(),
             Some("architecture 'glm-dsa' uses Dynamic Sparse Attention (DSA), which is not implemented")
         );
         assert_eq!(
-            crate::model::native::unsupported_architecture("wan"),
+            crate::arch::unsupported("wan").as_deref(),
             Some("text-to-video model, architecture 'wan' (not supported)")
         );
 
