@@ -16,6 +16,15 @@ pub mod names;
 pub mod templates;
 #[cfg(test)]
 pub mod testing;
+// Parity with the pre-spec implementations (deleted with them).
+#[cfg(test)]
+mod parity_gemma4_text;
+#[cfg(test)]
+mod parity_gemma4_vision;
+#[cfg(test)]
+mod parity_gemma4_audio;
+#[cfg(test)]
+mod parity_gemma3;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -32,6 +41,7 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("names/qwen35.json5", include_str!("../../arch/names/qwen35.json5")),
     ("lib/qwen_vit.json5", include_str!("../../arch/lib/qwen_vit.json5")),
     ("names/llamacpp.json5", include_str!("../../arch/names/llamacpp.json5")),
+    ("families/gemma3.json5", include_str!("../../arch/families/gemma3.json5")),
     ("families/llama.json5", include_str!("../../arch/families/llama.json5")),
     ("families/glm.json5", include_str!("../../arch/families/glm.json5")),
     ("families/granite.json5", include_str!("../../arch/families/granite.json5")),
@@ -46,6 +56,8 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/qwen3_vl.json5", include_str!("../../arch/families/qwen3_vl.json5")),
     ("families/qwen4_exp.json5", include_str!("../../arch/families/qwen4_exp.json5")),
     ("families/dflash.json5", include_str!("../../arch/families/dflash.json5")),
+    ("families/gemma4.json5", include_str!("../../arch/families/gemma4.json5")),
+    ("families/gemma4_unified.json5", include_str!("../../arch/families/gemma4_unified.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 
