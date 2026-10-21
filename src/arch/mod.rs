@@ -9,6 +9,7 @@
 
 pub mod expr;
 pub mod gen;
+pub mod load;
 pub mod names;
 
 use serde::Deserialize;

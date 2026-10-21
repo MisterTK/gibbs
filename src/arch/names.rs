@@ -73,6 +73,12 @@ impl Rule {
         }
         interp(&self.to, &Caps(&caps)).ok()
     }
+
+    /// The captures of `name` under this rule's `from` pattern; `None` when it does not match.
+    pub fn captures(&self, name: &str) -> Option<Vec<(String, Val)>> {
+        let mut caps = Vec::new();
+        matches(&self.from, name, &mut caps).then_some(caps)
+    }
 }
 
 fn matches(parts: &[Part], s: &str, caps: &mut Vec<(String, Val)>) -> bool {
