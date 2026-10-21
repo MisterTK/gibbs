@@ -92,13 +92,14 @@ const SCORE_ERR: &str =
 pub type System1Slot = std::sync::Arc<parking_lot::RwLock<Option<std::sync::Arc<JevSystem1Model>>>>;
 
 /// The family and embedding head of a sentence-encoder `config.json` (not a sequence classifier
-/// or generator): an encoder family claims it and names a System 1 head.
+/// or generator): an encoder family claims its `model_type` and names a System 1 head.
 fn sentence_encoder(cfg: &serde_json::Value) -> Option<(String, String)> {
     let arch = cfg["architectures"][0].as_str();
     if arch.is_some_and(|a| a.ends_with("ForSequenceClassification") || super::is_generator(a)) {
         return None;
     }
-    let (family, rt) = super::family(cfg, arch)?;
+    // By `model_type` alone: a bare class name (`BertModel`) says nothing about the config keys.
+    let (family, rt) = super::family(cfg, None)?;
     Some((family, rt.system1()?.to_string()))
 }
 
