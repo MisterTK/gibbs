@@ -5,7 +5,7 @@
 // Latents enter unpacked ([c, h, w]); 2x2 patch rows ((py, px, c) order) are cut in-graph.
 {
   family: "zimage",
-  match: {diffusers_class: ["ZImageTransformer2DModel"]},
+  match: {diffusers_class: ["ZImagePipeline", "ZImageTransformer2DModel"]},
   pipeline: "diffusion",
   config: {
     dim: "cfg.dim",
@@ -23,6 +23,7 @@
     seq_multi: "32",
   },
   checks: [
+    {expr: "json.scheduler_config.use_dynamic_shifting == true", error: "Z-Image scheduler with use_dynamic_shifting is not supported"},
     {expr: "first(cfg.n_kv_heads, heads) != heads", error: "Z-Image: n_kv_heads != n_heads is not supported"},
     {expr: "patch != 2 || at(cfg.all_f_patch_size, 0) != 1", error: "Z-Image: only patch size [2] / f_patch [1] is supported"},
     {expr: "cfg.qk_norm != true || has('siglip_embedder.0.weight') || first(cfg.siglip_feat_dim, 0) > 0",
@@ -84,6 +85,11 @@
     ]},
   },
   components: {
+    // Pipeline parts (a diffusers `ZImagePipeline` snapshot); `transformer` reruns this spec on its folder.
+    // The Qwen3 text encoder is the `qwen3` family (Phase 5).
+    text_encoder: {family: "qwen3", dir: "text_encoder"},
+    transformer: {family: "zimage", dir: "transformer"},
+    vae: {family: "sd_vae", dir: "vae"},
     // Model output [in_ch, h, w] for a latent [in_ch, h, w] and `nt` caption rows.
     denoiser: {
       vars: ["h", "w", "nt"],
@@ -143,6 +149,24 @@
     },
   },
   runtime: {
-    latent: {pack: "none"},
+    // hidden_states[-2] of the Qwen3 chat rendering (`enable_thinking`: no think block), 512 tokens.
+    text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "tokenizer",
+      template: "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n", max_len: 512,
+      vars: {head: "'hidden'", taps: "[fmt('layer.{te.layers - 2}')]"}, outputs: {hidden: "layer.{te.layers - 2}"}}],
+    context: [{features: ["te.hidden"]}],
+    negative: {default: ""},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // linspace(1, 1/N) with the scheduler's static shift (dynamic shifting is refused below).
+    scheduler: {kind: "flow_euler", sigmas: "linspace", shift: "first(json.scheduler_config.shift, 3)", mu: "'static'"},
+    timestep: "sigma",
+    // pred = pos + g (pos - neg) whenever g > 0; the model predicts -velocity.
+    guidance: {kind: "cfg", gate: "guidance > 0", scale: "guidance + 1"},
+    negate_v: true,
+    latent: {channels: "denoiser.in_ch", factor: 8, pack: "none", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "1 / vae.cfg.scaling_factor", add: "first(vae.cfg.shift_factor, 0)"}, output: "clamp_pm1"},
+    // Turbo settings; ponytail: CPU-sized 512 default, 1024 is native.
+    defaults: {width: 512, height: 512, steps: 8, guidance: 0, multiple: 16, max_side: 8192, max_steps: 200},
+    summary: "fmt('Z-Image S3-DiT ({denoiser.layers} layers, dim {denoiser.dim}), Qwen3 text encoder + 16-ch VAE')",
   },
 }

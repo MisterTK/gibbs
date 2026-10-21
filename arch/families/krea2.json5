@@ -7,7 +7,7 @@
 // (F32 checkpoints are rounded, as the reference).
 {
   family: "krea2",
-  match: {diffusers_class: ["Krea2Transformer2DModel"]},
+  match: {diffusers_class: ["Krea2Pipeline", "Krea2Transformer2DModel"]},
   pipeline: "diffusion",
   use_lib: ["dit_extra"],
   names: {use: ["comfy"]},
@@ -122,6 +122,10 @@
     ]},
   },
   components: {
+    // The Qwen3-VL-4B text encoder is the `qwen3_vl` family (Phase 5).
+    text_encoder: {family: "qwen3_vl", dir: "text_encoder"},
+    transformer: {family: "krea2", dir: "transformer"},
+    vae: {family: "qwen_vae", dir: "vae"},
     // Text features [nt, dim] from the `nl` tapped encoder layers stacked per token
     // (`context` [nt, nl * td], layer-minor). Run once per prompt.
     fuse: {
@@ -187,7 +191,33 @@
     },
   },
   runtime: {
-    latent: {pack: "pack2x2"},
-    context_net: {component: "fuse", net: "fuse"},
+    // hidden_states[2, 5, ..., 35] of the prompt template minus its 34 prefix tokens, stacked per token
+    // and fused by `fuse`. ponytail: the reference cuts the prompt before the suffix (512 + 29
+    // tokens); here the whole rendering is capped at prefix + 512.
+    text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "tokenizer",
+      prefix: "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n",
+      template: "{prefix}{prompt}<|im_end|>\n<|im_start|>assistant\n", max_len: "prefix_len + 512",
+      drop: {from: 0, to: "prefix_len"},
+      vars: {head: "'hidden'", taps: ["layer.1", "layer.4", "layer.7", "layer.10", "layer.13", "layer.16", "layer.19", "layer.22", "layer.25", "layer.28", "layer.31", "layer.34"]},
+      outputs: {l2: "layer.1", l5: "layer.4", l8: "layer.7", l11: "layer.10", l14: "layer.13", l17: "layer.16",
+                l20: "layer.19", l23: "layer.22", l26: "layer.25", l29: "layer.28", l32: "layer.31", l35: "layer.34"}}],
+    context: [{features: ["te.l2", "te.l5", "te.l8", "te.l11", "te.l14", "te.l17", "te.l20", "te.l23", "te.l26", "te.l29", "te.l32", "te.l35"]}],
+    context_net: {component: "transformer", net: "fuse"},
+    negative: {default: ""},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // Turbo (`is_distilled`): mu 1.15; Raw: mu from the image tokens (256..6400 -> 0.5..1.15).
+    scheduler: {kind: "flow_euler", sigmas: "linspace", mu: "json.model_index.is_distilled == true ? 1.15 : 'dynamic'",
+                base_seq: 256, max_seq: 6400, base_shift: 0.5, max_shift: 1.15, seq: "(h // 2) * (w // 2)"},
+    timestep: "sigma",
+    // pred = cond + g (cond - uncond) whenever g > 0.
+    guidance: {kind: "cfg", gate: "guidance > 0", scale: "guidance + 1"},
+    latent: {channels: "denoiser.chan", factor: 8, pack: "pack2x2", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "first(vae.cfg.latents_std, vae.wan_std)", add: "first(vae.cfg.latents_mean, vae.wan_mean)"},
+          output: "clamp_pm1"},
+    // The diffusers examples: Raw 28 steps with guidance 4.5, Turbo 8 without.
+    defaults: {width: 512, height: 512, steps: "json.model_index.is_distilled == true ? 8 : 28",
+               guidance: "json.model_index.is_distilled == true ? 0 : 4.5", multiple: 16, max_side: 8192, max_steps: 200},
+    summary: "fmt('Krea 2 ({denoiser.layers} layers, dim {denoiser.dim}), Qwen3-VL-4B text encoder + Qwen-Image VAE')",
   },
 }

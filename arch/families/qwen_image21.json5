@@ -7,7 +7,7 @@
 // raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
 {
   family: "qwen_image21",
-  match: {diffusers_class: ["QwenImage21Transformer2DModel"]},
+  match: {diffusers_class: ["QwenImage21Pipeline", "QwenImage21Transformer2DModel"], gguf_arch: ["qwen_image", "qwen_image21"]},
   pipeline: "diffusion",
   use_lib: ["dit_extra"],
   names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
@@ -68,6 +68,10 @@
     ]},
   },
   components: {
+    // The Qwen3-VL text encoder is the `qwen3_vl` family (Phase 5).
+    text_encoder: {family: "qwen3_vl", dir: "text_encoder"},
+    transformer: {family: "qwen_image21", dir: "transformer"},
+    vae: {family: "qwen_vae21", dir: "vae"},
     // Velocity [h * w, in_ch] for latent tokens on an h x w grid and `nt` text rows.
     denoiser: {
       vars: ["h", "w", "nt"],
@@ -139,6 +143,25 @@
     },
   },
   runtime: {
-    latent: {pack: "tokens"},
+    // The last decoder layer's output (before the final norm) of the system/user template minus the
+    // system message's tokens.
+    text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "processor",
+      prefix: "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n",
+      template: "{prefix}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
+      drop: {from: 0, to: "prefix_len"},
+      vars: {head: "'hidden'", taps: "[fmt('layer.{te.layers - 1}')]"}, outputs: {hidden: "layer.{te.layers - 1}"}}],
+    context: [{features: ["te.hidden"]}],
+    negative: {default: " "},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // A finetune's model card may list its own sigmas (`card`); else linspace with the config shift.
+    scheduler: {kind: "flow_euler", sigmas: "linspace", mu: "'config'", seq: "(h // 16) * (w // 16)"},
+    timestep: "sigma",
+    guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
+    latent: {channels: "vae.z", factor: 16, pack: "tokens", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "vae.cfg.latents_std", add: "vae.cfg.latents_mean"},
+          output: "rgba_over_white"},
+    defaults: {width: 512, height: 512, steps: 40, guidance: 1, multiple: 32},
+    summary: "fmt('Qwen-Image 2.1 ({denoiser.layers} single-stream blocks, dim {denoiser.dim}), Qwen3-VL text encoder + 64-ch VAE')",
   },
 }

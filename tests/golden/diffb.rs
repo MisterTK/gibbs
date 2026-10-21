@@ -83,7 +83,7 @@ fn denorm(x: &[f32], plane: usize, mean: &[f32], std: &[f32]) -> Vec<f32> {
 
 use gibbs_engine::arch::expr::Val;
 use gibbs_engine::arch::testing::Runner;
-use gibbs_engine::graph::Tensor::{self, F32, U32};
+use gibbs_engine::graph::Tensor::{self, F32};
 
 fn num(n: usize) -> Val {
     Val::Num(n as f64)
@@ -99,7 +99,7 @@ fn spec_runner(dir: &std::path::Path, weights: &str, family: Option<&str>, dev: 
         is_cached: true,
         ..Default::default()
     };
-    Runner::from_artifacts(&a, family, dev, 0).unwrap_or_else(|e| panic!("{e}"))
+    Runner::from_artifacts(&a, family, dev, 64).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// diffusers `_pack_latents`: [c, h, w] -> [(h/2)*(w/2), 4c] in (c, py, px) order (the runtime's
@@ -1047,4 +1047,70 @@ fn qwen_image21_real_gguf_spec() {
     let (e, c) = gibbs_engine::arch::testing::compare(&got, &want);
     eprintln!("qwen_image21 real GGUF spec vs old Metal: rel {e:.3e} cos {c:.7}");
     assert!(e < 1e-3 && c > 0.9999, "rel {e} cos {c}");
+}
+
+/// Qwen2.5-VL text tower (`model.language_model.*`, qkv biases, GQA 4/2 heads of 16, 2 layers) as
+/// Qwen-Image 1's text encoder: the final-normed hidden states of 11 tokens.
+#[test]
+fn qwen2_5_vl_text() {
+    qwen2_5_vl_text_run(false)
+}
+
+/// The `qwen2_5_vl_text` spec's `text` component (head `hidden`) on the same fixture.
+#[test]
+fn qwen2_5_vl_text_spec() {
+    qwen2_5_vl_text_run(true)
+}
+
+fn qwen2_5_vl_text_run(spec: bool) {
+    let (d, ff, v) = (64usize, 128usize, 32usize);
+    let dir = fixture_dir(if spec { "diffb_qwen2_5_vl_text_spec" } else { "diffb_qwen2_5_vl_text" });
+    let mut s = Spec::new();
+    let p = "model.language_model";
+    sp(&mut s, format!("{p}.embed_tokens.weight"), &[v, d]);
+    for i in 0..2 {
+        let l = format!("{p}.layers.{i}");
+        sp(&mut s, format!("{l}.input_layernorm.weight"), &[d]);
+        lin(&mut s, &format!("{l}.self_attn.q_proj"), d, d, true);
+        lin(&mut s, &format!("{l}.self_attn.k_proj"), 32, d, true);
+        lin(&mut s, &format!("{l}.self_attn.v_proj"), 32, d, true);
+        lin(&mut s, &format!("{l}.self_attn.o_proj"), d, d, false);
+        sp(&mut s, format!("{l}.post_attention_layernorm.weight"), &[d]);
+        lin(&mut s, &format!("{l}.mlp.gate_proj"), ff, d, false);
+        lin(&mut s, &format!("{l}.mlp.up_proj"), ff, d, false);
+        lin(&mut s, &format!("{l}.mlp.down_proj"), d, ff, false);
+    }
+    sp(&mut s, format!("{p}.norm.weight"), &[d]);
+    write_st(&dir.join("model.safetensors"), &synth(8, &s));
+    write_json(
+        &dir.join("config.json"),
+        &json!({"model_type": "qwen2_5_vl", "text_config": {"hidden_size": d, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": ff, "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0, "vocab_size": v, "tie_word_embeddings": false}}),
+    );
+    let ids: Vec<u32> = (0..11).map(|i| (i * 7 + 3) % v as u32).collect();
+    // runner: internal gibbs_engine::model::qwen3_5::Qwen3Encoder::hidden_states_normed (CPU only)
+    golden("diffb_qwen2_5_vl_text", TOL, |dev| {
+        let y = if spec {
+            spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev).lm(&ids, 0, "hidden", "hidden", vec![])
+        } else {
+            let _cpu = gibbs_engine::hardware::cpu_compute::allow();
+            gibbs_engine::model::qwen3_5::Qwen3Encoder::open(&dir).unwrap().hidden_states_normed(&ids).unwrap()
+        };
+        let mut o = Out::default();
+        o.f("hidden", &y);
+        o
+    });
+}
+
+/// The pipeline `runtime` sections of the image families deserialize as `runtime::diffusion`
+/// reads them.
+#[test]
+fn dit_runtimes_parse() {
+    let reg = gibbs_engine::arch::registry().unwrap();
+    for f in ["zimage", "qwen_image", "qwen_image21", "krea2"] {
+        let spec = reg.spec(f, &Default::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+        spec.runtime_as::<gibbs_engine::runtime::diffusion::Runtime>()
+            .unwrap_or_else(|e| panic!("{f}: {e}"));
+    }
 }

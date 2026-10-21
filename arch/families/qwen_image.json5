@@ -6,7 +6,7 @@
 // rows and raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
 {
   family: "qwen_image",
-  match: {diffusers_class: ["QwenImageTransformer2DModel"]},
+  match: {diffusers_class: ["QwenImagePipeline", "QwenImageTransformer2DModel"]},
   pipeline: "diffusion",
   use_lib: ["dit_extra"],
   names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
@@ -65,6 +65,9 @@
     ]},
   },
   components: {
+    text_encoder: {family: "qwen2_5_vl_text", dir: "text_encoder"},
+    transformer: {family: "qwen_image", dir: "transformer"},
+    vae: {family: "qwen_vae", dir: "vae"},
     // Velocity [h/2 * w/2, in_ch] for a 2x2-packed latent grid h x w and `nt` text rows.
     denoiser: {
       vars: ["h", "w", "nt"],
@@ -116,6 +119,24 @@
     },
   },
   runtime: {
-    latent: {pack: "pack2x2"},
+    // Last hidden state (final-normed) of the system/user template minus the system head's tokens;
+    // at most 1024 prompt tokens.
+    text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "tokenizer",
+      prefix: "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n",
+      template: "{prefix}{prompt}<|im_end|>\n<|im_start|>assistant\n", max_len: "prefix_len + 1024",
+      drop: {from: 0, to: "prefix_len"}, vars: {head: "'hidden'"}, outputs: {hidden: "hidden"}}],
+    context: [{features: ["te.hidden"]}],
+    negative: {default: " "},
+    denoiser: {component: "transformer", net: "denoiser"},
+    scheduler: {kind: "flow_euler", sigmas: "linspace", mu: "'config'", seq: "(h // 2) * (w // 2)"},
+    timestep: "sigma",
+    // True CFG with the per-token norm rescale, only for guidance > 1.
+    guidance: {kind: "cfg_rescale", gate: "guidance > 1", scale: "guidance"},
+    latent: {channels: 16, factor: 8, pack: "pack2x2", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "first(vae.cfg.latents_std, vae.wan_std)", add: "first(vae.cfg.latents_mean, vae.wan_mean)"},
+          output: "clamp_pm1"},
+    defaults: {width: 512, height: 512, steps: 50, guidance: 4, multiple: 16},
+    summary: "fmt('Qwen-Image 1 ({denoiser.layers} double-stream blocks, dim {denoiser.dim}), Qwen2.5-VL text encoder + 16-ch VAE')",
   },
 }
