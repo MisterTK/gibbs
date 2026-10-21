@@ -51,7 +51,7 @@ pub struct GraphProgram {
     argmax: Option<(usize, Graph, crate::graph::metal::PreparedPlan)>,
     /// [`Self::run_reshaped`]'s plans, keyed by the graph's node count and input shapes.
     #[cfg(target_os = "macos")]
-    reshaped: Vec<(usize, Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
+    reshaped: Vec<((usize, usize), Vec<Vec<usize>>, crate::graph::metal::PreparedPlan)>,
 }
 
 /// Rows narrower than this keep the host argmax in [`GraphProgram::run_greedy`].
@@ -333,7 +333,8 @@ impl GraphProgram {
                     .iter()
                     .map(|&v| graph.value(v).shape.clone())
                     .collect();
-                let n = graph.nodes.len();
+                // Node and output counts: a tapped instance adds outputs, not nodes.
+                let n = (graph.nodes.len(), graph.outputs.len());
                 let hit = self
                     .reshaped
                     .iter()

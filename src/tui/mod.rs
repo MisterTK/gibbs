@@ -1413,6 +1413,7 @@ impl TuiApp {
                     family: None,
                     stage: &|s| *stage.lock() = s,
                     // Only text generators (and PEFT adapters of them) and image models hot-swap.
+                    system1_first: false,
                     admit: &|adapter| match adapter
                         || route_for_model(&id) == Route::Image
                         || is_chat_model(&id)

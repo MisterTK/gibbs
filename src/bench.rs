@@ -169,6 +169,7 @@ pub fn load_for_bench(
             reencode: cfg,
             family: None,
             stage: &|_| {},
+            system1_first: false,
             admit: &|_| Ok(()),
         },
     )?;
@@ -494,6 +495,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 reencode: crate::model::weight_format::ReencodeConfig::effective(),
                 family: None,
                 stage: &|_| {},
+                system1_first: false,
                 admit: &|_| Ok(()),
             };
             crate::arch::dispatch::load_lm(&artifacts, &opts).map(|(e, _)| match e {

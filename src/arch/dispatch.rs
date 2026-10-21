@@ -48,6 +48,10 @@ pub struct LoadOpts<'a> {
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
     /// adapter (merged into a snapshot of its base): an error refuses the load.
     pub admit: &'a dyn Fn(bool) -> Result<(), String>,
+    /// The CLI's legacy order (legacy: until Phase 7): System 1 encoders are detected before
+    /// classifiers and run on Metal wherever it exists; the TUI tries classifiers first and keeps
+    /// System 1 on its own backend.
+    pub system1_first: bool,
 }
 
 /// `GIBBS_SPEC_LM=1`: causal LMs a family spec claims load through [`crate::runtime::lm`]
@@ -68,18 +72,27 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
     (o.stage)("resolving");
     if o.family.is_none() {
         // legacy: until Phase 7 (encoder specs)
-        if classifier::detect(hub, id).is_some() {
-            return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
-        }
-        if crate::model::jev::detect(hub, id) {
-            // The System 1 encoder runs on Metal wherever it exists, even under `--backend cpu`.
+        let system1 = || {
             let dev = match device(o.placement) {
-                Device::Cpu if crate::hardware::available_devices().contains(&Device::Metal) => {
+                // The CLI runs the System 1 encoder on Metal wherever it exists.
+                Device::Cpu
+                    if o.system1_first
+                        && crate::hardware::available_devices().contains(&Device::Metal) =>
+                {
                     Device::Metal
                 }
                 d => d,
             };
-            return JevSystem1Model::load(hub, id, dev).map(Loaded::System1);
+            JevSystem1Model::load(hub, id, dev).map(Loaded::System1)
+        };
+        if o.system1_first && crate::model::jev::detect(hub, id) {
+            return system1();
+        }
+        if classifier::detect(hub, id).is_some() {
+            return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
+        }
+        if !o.system1_first && crate::model::jev::detect(hub, id) {
+            return system1();
         }
         // legacy: until Phase 10 (video specs)
         if let Some(v) = crate::model::t2v::detect(hub, id, o.quant_name) {
@@ -134,16 +147,19 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     if let Some(m) = crate::model::native::load_native(a, o.placement) {
         return Ok((ExecutableModel::Native(m?), None));
     }
-    // Checkpoints the arch reader cannot open stay on the GraphLm path.
-    if let Ok(ck) = super::load::open(a) {
-        let reg = super::registry()?;
-        if let Some(f) = reg.detect(&ck.sig) {
-            match reg.spec(&f, &ck.sig)?.pipeline {
-                Pipeline::Unsupported => return spec(Some(&f)),
-                Pipeline::CausalLm if spec_lm_enabled() => return spec(Some(&f)),
-                _ => {}
-            }
-        }
+    // Checkpoints the arch reader cannot open, and registry errors, leave the GraphLm path as
+    // it was (a spec problem fails only spec loads).
+    let ck = super::load::open(a).ok();
+    let family = ck.as_ref().and_then(|ck| {
+        let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
+        let f = reg.detect(&ck.sig)?;
+        let p = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?.pipeline;
+        Some((f, p))
+    });
+    match family {
+        Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
+        Some((f, Pipeline::CausalLm)) if spec_lm_enabled() => return spec(Some(&f)),
+        _ => {}
     }
     // legacy: until Phase 4 (GraphLm)
     let (lm, choice) = load_causal_lm_with(a, device(o.placement), o.quant, o.hw, &o.reencode)?;
