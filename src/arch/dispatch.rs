@@ -60,22 +60,17 @@ pub fn spec_lm_enabled() -> bool {
     std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1")
 }
 
-/// legacy: until every causal-LM family is cut over (then all run their spec). The families
-/// whose legacy loaders are deleted; every other family keeps its legacy route unless
-/// `GIBBS_SPEC_LM=1`. Each phase adds its families at cutover.
-fn spec_by_default(f: &str) -> bool {
-    ["qwen3", "hunyuan", "qwen3_vl", "qwen3_5", "qwen4_exp"].contains(&f)
-}
-
-/// `model_type` is a causal-LM family's own match (not a fallback) that [`lm`] runs from its spec
-/// by default: the hub picker treats it like the native loaders' types.
+/// `model_type` is a causal-LM family's own match (not a fallback) whose spec sets
+/// `runtime.cutover` ([`lm`] runs it by default): the hub picker treats it like the native
+/// loaders' types.
 pub fn runs_spec_lm(model_type: &str) -> bool {
     super::registry().is_ok_and(|r| {
         r.matchers().iter().any(|(f, m, p)| {
             *p == Pipeline::CausalLm
                 && !m.fallback
-                && spec_by_default(f)
                 && m.hf_model_type.iter().any(|g| super::glob(g, model_type))
+                && r.merged(f, &Default::default())
+                    .is_ok_and(|j| j["runtime"]["cutover"] == J::Bool(true))
         })
     })
 }
@@ -167,9 +162,9 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
         let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
         let s = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?;
-        Some((f, s.pipeline, s.matcher.fallback))
+        Some((f, s.pipeline, s.matcher.fallback, s.runtime["cutover"] == J::Bool(true)))
     });
-    if let Some((f, Pipeline::Encdec, _)) = &family {
+    if let Some((f, Pipeline::Encdec, ..)) = &family {
         let m = crate::runtime::encdec::load(a, super::registry()?, Some(f), o.placement)?;
         return Ok((ExecutableModel::Native(m), None));
     }
@@ -177,14 +172,15 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         return spec(o.family);
     }
     let lm_family = match &family {
-        Some((f, Pipeline::Unsupported, _)) => return spec(Some(f)),
-        Some((f, Pipeline::CausalLm, fallback)) => Some((f.as_str(), *fallback)),
+        Some((f, Pipeline::Unsupported, ..)) => return spec(Some(f)),
+        Some((f, Pipeline::CausalLm, fallback, cut)) => Some((f.as_str(), *fallback, *cut)),
         _ => None,
     };
-    // A fallback match (any causal LM) never pre-empts a legacy loader; a family's own match
-    // does when GIBBS_SPEC_LM=1.
-    if let Some((f, false)) = lm_family {
-        if spec_lm_enabled() {
+    // `runtime.cutover` families (legacy loader deleted) load by default; with GIBBS_SPEC_LM=1
+    // any family's own match does. A fallback match (any causal LM) never pre-empts a legacy
+    // loader.
+    if let Some((f, fallback, cut)) = lm_family {
+        if cut || (spec_lm_enabled() && !fallback) {
             return spec(Some(f));
         }
     }
@@ -192,8 +188,8 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     if let Some(m) = crate::model::native::load_native(a, o.placement) {
         return Ok((ExecutableModel::Native(m?), None));
     }
-    if let Some((f, _)) = lm_family {
-        if spec_lm_enabled() || spec_by_default(f) {
+    if let Some((f, ..)) = lm_family {
+        if spec_lm_enabled() {
             return spec(Some(f));
         }
     }

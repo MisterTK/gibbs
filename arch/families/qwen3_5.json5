@@ -275,7 +275,7 @@
     },
   },
   runtime: {
-    prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"],
+    cutover: true, prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"],
     drafter: {kind: "mtp", component: "mtp", label: "'MTP'", taps: "[layers - 1]",
               when: "has('mtp.fc.weight') && first(tc.mtp_num_hidden_layers, 0) == 1 && tc.mtp_use_dedicated_embeddings != true"},
     // `Qwen2VLImageProcessor`; placeholder expanded to the merged grid with get_rope_index's

@@ -122,5 +122,6 @@
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
     },
   },
-  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"]},
+  // `cutover`: the legacy loader is gone, so this spec (and hunyuan / qwen3_vl) loads by default.
+  runtime: {cutover: true, prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"]},
 }
