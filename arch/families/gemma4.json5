@@ -54,7 +54,9 @@
     ctx: "first(runtime.ctx, has('score.weight') ? min(max_position_embeddings, 4096) : max_position_embeddings)",
     gg: "gguf_arch == 'gemma4'",
     // Vision tower (`gemma4_vision`, or llama.cpp's `gemma4v` mmproj renamed to the HF names).
-    has_vision: "has('model.vision_tower.patch_embedder.input_proj.weight')",
+    // Other mmproj vision projectors (12B's `gemma4uv`) leave vision off, as the old loader did.
+    v_ok: "!gg || first(gguf['clip.vision.projector_type'], '') == 'gemma4v'",
+    has_vision: "v_ok && has('model.vision_tower.patch_embedder.input_proj.weight')",
     v_layers: "first(gguf['clip.vision.block_count'], cfg.vision_config.num_hidden_layers)",
     v_hidden: "shape('model.vision_tower.patch_embedder.input_proj.weight')[0]",
     v_in: "shape('model.vision_tower.patch_embedder.input_proj.weight')[1]",
@@ -68,7 +70,8 @@
     v_max_soft: "first(json.processor_config.image_processor.max_soft_tokens, 280)",
     // Audio conformer (`gemma4_audio`, or llama.cpp's `gemma4a` mmproj renamed to the HF names) and
     // its log-mel front end (`Gemma4AudioFeatureExtractor`; defaults as every gemma-4 processor sets it).
-    has_audio: "has('model.audio_tower.output_proj.weight')",
+    a_ok: "!gg || first(gguf['clip.audio.projector_type'], '') == 'gemma4a'",
+    has_audio: "a_ok && has('model.audio_tower.output_proj.weight')",
     a_fe: "json.processor_config.feature_extractor",
     a_layers: "first(gguf['clip.audio.block_count'], cfg.audio_config.num_hidden_layers)",
     a_hidden: "first(gguf['clip.audio.embedding_length'], cfg.audio_config.hidden_size)",
@@ -214,10 +217,10 @@
       "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[0] * shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[1]",
       "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[2]"]}},
     // mmproj patch embedder: the [out, c, y, x] conv kernel as the HF [out, (y, x, c)] linear.
-    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "conv_to_linear", args: {order: "k_in"}, when: "gg"},
-    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "to_bf16", when: "gg"},
+    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "conv_to_linear", args: {order: "k_in"}, when: "gg && v_ok"},
+    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "to_bf16", when: "gg && v_ok"},
     // Vision position tables [2 (x, y), size, d] as [size, (x, y) d] rows one gather reads.
-    {tensor: "model.vision_tower.patch_embedder.position_embedding_table", op: "transpose", args: {perm: [1, 0, 2]}},
+    {tensor: "model.vision_tower.patch_embedder.position_embedding_table", op: "transpose", args: {perm: [1, 0, 2]}, when: "v_ok"},
     {tensor: "{t:*}.position_embedding_table", op: "reshape", args: {shape: ["shape(fmt('{t}.position_embedding_table'))[0]",
       "shape(fmt('{t}.position_embedding_table'))[1] * shape(fmt('{t}.position_embedding_table'))[2]"]}},
     // gemma4_unified: [size, 2 (x, y), d] already in row order.
