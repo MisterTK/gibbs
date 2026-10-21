@@ -16,10 +16,9 @@
 
 use crate::graph::codec::codec;
 use crate::hardware::QuantFormat as Q;
-use crate::model::layers::{gguf_block_codec, QuantizedLinearLayer, QuantizedWeight};
+use crate::model::layers::{dequantize_gguf_blocks, encode_rows, gguf_block_codec};
 use crate::model::weight_format::ReencodePolicy;
 use crate::model::VirtualTensor;
-use bytes::Bytes;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,7 +44,7 @@ pub fn has_gpu_codec(f: Q) -> bool {
         )
 }
 
-/// Formats [`QuantizedLinearLayer::from_f32`] can produce.
+/// Formats [`encode_rows`] can produce.
 pub fn encodable(f: Q) -> bool {
     is_float(f)
         || matches!(f, Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4)
@@ -146,7 +145,7 @@ pub fn bump(f: Q) -> Option<Q> {
 
 /// `f`, or the next larger format whose blocks tile `cols` (a float dtype when none does).
 pub fn fit(mut f: Q, cols: usize, float: Q) -> Q {
-    // llama.cpp's convention for rows that hold no whole 256-element block: 4-bit K -> block-32 Q4_0.
+    // GGML's convention for rows that hold no whole 256-element block: 4-bit K -> block-32 Q4_0.
     if f == Q::GGUF_Q4_K_M && cols % 256 != 0 && cols % 32 == 0 {
         return Q::GGUF_Q4_0;
     }
@@ -218,85 +217,42 @@ fn rmse_of((num, den): (f64, f64)) -> f64 {
     }
 }
 
-pub fn weight_bytes(w: &QuantizedWeight) -> usize {
-    match w {
-        QuantizedWeight::Uncompressed { data, .. } => data.len() * 4,
-        QuantizedWeight::ZeroCopySlice { data, .. } => data.len(),
-        QuantizedWeight::GgufQuantized { raw_data, .. } => raw_data.len(),
-        other => (other.num_elements() as f32 * other.bits_per_weight() / 8.0) as usize,
-    }
-}
-
 /// Encodes row-major `w` as `f` (a float or an encodable block format whose blocks tile `in_f`),
-/// splitting rows over `threads` workers at utility QoS; row chunks concatenate exactly.
+/// splitting rows over `threads` workers at utility QoS; row chunks concatenate.
 pub(crate) fn encode_weight(
     w: &[f32],
     in_f: usize,
     out_f: usize,
     f: Q,
     threads: usize,
-) -> QuantizedWeight {
-    if f == Q::FP32 {
-        return QuantizedWeight::Uncompressed {
-            data: w.to_vec(),
-            in_features: in_f,
-            out_features: out_f,
-        };
-    }
+) -> Vec<u8> {
     let workers = if w.len() < 1 << 16 {
         1
     } else {
         threads.min(out_f)
     };
     let rows = out_f.div_ceil(workers);
-    let raw = |c: &[f32]| -> Bytes {
-        let l = QuantizedLinearLayer::from_f32("", in_f, c.len() / in_f, c, f)
-            .unwrap_or_else(|e| panic!("cannot encode as {f:?}: {e}"));
-        match l.weight {
-            QuantizedWeight::GgufQuantized { raw_data, .. } => raw_data,
-            QuantizedWeight::ZeroCopySlice { data, .. } => data,
-            _ => unreachable!("{f:?} encodes to blocks or a half float"),
-        }
+    let raw = |c: &[f32]| -> Vec<u8> {
+        encode_rows(c, in_f, f).unwrap_or_else(|e| panic!("cannot encode as {f:?}: {e}"))
     };
-    let parts: Vec<Bytes> = if workers == 1 {
-        vec![raw(w)]
-    } else {
-        std::thread::scope(|s| {
-            let handles: Vec<_> = w
-                .chunks(rows * in_f)
-                .map(|c| {
-                    s.spawn(move || {
-                        crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
-                        raw(c)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("encoder thread panicked"))
-                .collect()
-        })
-    };
-    let bytes = if parts.len() == 1 {
-        parts.into_iter().next().unwrap()
-    } else {
-        Bytes::from(parts.concat())
-    };
-    if matches!(f, Q::FP16 | Q::BF16) {
-        QuantizedWeight::ZeroCopySlice {
-            data: bytes,
-            in_features: in_f,
-            out_features: out_f,
-            format: f,
-        }
-    } else {
-        QuantizedWeight::GgufQuantized {
-            format: f,
-            raw_data: bytes,
-            in_features: in_f,
-            out_features: out_f,
-        }
+    if workers == 1 {
+        return raw(w);
     }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = w
+            .chunks(rows * in_f)
+            .map(|c| {
+                s.spawn(move || {
+                    crate::tui::qos::set_qos(crate::tui::qos::QosClass::Utility);
+                    raw(c)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("encoder thread panicked"))
+            .collect()
+    })
 }
 
 // ---- native loaders -------------------------------------------------------------------------
@@ -461,9 +417,11 @@ fn encode_blocks(
     let mut x = vec![0.0f32; run.min(rows) * cols];
     // `f`'s relative RMSE over the tensor, and with `keep` its blocks (`None`: no block format).
     let mut encode = |f: Q, keep: bool| {
+        if is_float(f) {
+            return (0.0, None);
+        }
         let mut err = (0.0, 0.0);
-        let mut blocks =
-            (keep && !is_float(f)).then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
+        let mut blocks = keep.then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
         for part in raw.chunks(run * row_bytes) {
             let x = &mut x[..part.len() / block_bytes * elems];
             for (b, out) in part
@@ -473,14 +431,10 @@ fn encode_blocks(
                 decode(b, out);
             }
             let w = encode_weight(x, cols, x.len() / cols, f, threads);
-            add_sq_err(&mut err, x, &w.to_f32());
-            blocks = blocks.and_then(|mut b: Vec<u8>| match &w {
-                QuantizedWeight::GgufQuantized { raw_data, .. } => {
-                    b.extend_from_slice(raw_data);
-                    Some(b)
-                }
-                _ => None,
-            });
+            add_sq_err(&mut err, x, &dequantize_gguf_blocks(f, &w).unwrap());
+            if let Some(b) = &mut blocks {
+                b.extend_from_slice(&w);
+            }
         }
         (rmse_of(err), blocks)
     };
@@ -737,15 +691,7 @@ mod tests {
             .collect();
         let one = encode_weight(&w, 512, 160, Q::GGUF_Q5_K_M, 1);
         let many = encode_weight(&w, 512, 160, Q::GGUF_Q5_K_M, 7);
-        assert_eq!(one.to_f32(), many.to_f32());
-        let (
-            QuantizedWeight::GgufQuantized { raw_data: a, .. },
-            QuantizedWeight::GgufQuantized { raw_data: b, .. },
-        ) = (&one, &many)
-        else {
-            panic!()
-        };
-        assert_eq!(a, b);
+        assert_eq!(one, many);
     }
 
     /// The row-run trial picks the same format and blocks as one whole-tensor encode, over a
@@ -763,11 +709,7 @@ mod tests {
                 (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
             })
             .collect();
-        let QuantizedWeight::GgufQuantized { raw_data: raw, .. } =
-            encode_weight(&w, cols, rows, src, 4)
-        else {
-            panic!("Q8_0 encodes to blocks");
-        };
+        let raw = encode_weight(&w, cols, rows, src, 4);
         let cfg = crate::model::weight_format::ReencodeConfig {
             policy: MaxSpeed,
             ..Default::default()
@@ -786,20 +728,23 @@ mod tests {
             {
                 decode(b, o);
             }
-            let (mut f, mut q) = (f, encode_weight(&data, cols, rows, f, 4));
-            while relative_rmse(&data, &q.to_f32()) > TENSOR_RMSE_LIMIT {
+            let mut f = f;
+            let mut q = encode_weight(&data, cols, rows, f, 4);
+            while !is_float(f)
+                && relative_rmse(&data, &dequantize_gguf_blocks(f, &q).unwrap()) > TENSOR_RMSE_LIMIT
+            {
                 let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
                     break;
                 };
-                (f, q) = (next, encode_weight(&data, cols, rows, next, 4));
+                f = next;
+                if !is_float(f) {
+                    q = encode_weight(&data, cols, rows, f, 4);
+                }
             }
-            if !beats_source(f, src, &crate::model::variant::host_gbps) {
+            if is_float(f) || !beats_source(f, src, &crate::model::variant::host_gbps) {
                 return None;
             }
-            let QuantizedWeight::GgufQuantized { raw_data, .. } = q else {
-                return None;
-            };
-            Some((f, raw_data.to_vec()))
+            Some((f, q))
         };
         let want = whole();
         assert!(

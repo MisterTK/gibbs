@@ -252,10 +252,127 @@ mod tests {
         assert_eq!(video_family("StableDiffusionPipeline"), None);
     }
 
-    /// A tiny `LTXPipeline` snapshot in a hub cache (T5 encoder, the tiny LTX transformer and VAE
-    /// of `diff_fixtures`, a flow-match scheduler config).
+    type Specs = Vec<(String, Vec<usize>)>;
+
+    fn write_f32_safetensors(
+        path: &Path,
+        tensors: &[(String, Vec<usize>, Vec<f32>)],
+    ) -> Result<(), String> {
+        let (mut header, mut data) = (serde_json::Map::new(), Vec::<u8>::new());
+        for (name, shape, v) in tensors {
+            let start = data.len();
+            data.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        }
+        let mut h =
+            serde_json::to_vec(&serde_json::Value::Object(header)).map_err(|e| e.to_string())?;
+        h.resize(h.len().next_multiple_of(8), b' ');
+        let mut out = (h.len() as u64).to_le_bytes().to_vec();
+        out.extend(h);
+        out.extend(data);
+        std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    fn values(specs: &Specs, mut s: u64) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        specs
+            .iter()
+            .map(|(n, sh)| {
+                let len: usize = sh.iter().product();
+                let fan: usize = sh[1..].iter().product::<usize>().max(1);
+                let v = match sh.len() {
+                    1 if n.ends_with("weight") => (0..len).map(|_| 1.0 + 0.1 * next()).collect(),
+                    1 => (0..len).map(|_| 0.1 * next()).collect(),
+                    _ => (0..len).map(|_| next() / (fan as f32).sqrt()).collect(),
+                };
+                (n.clone(), sh.clone(), v)
+            })
+            .collect()
+    }
+
+    fn write_tiny_ltx(dir: &Path, ti: usize) -> Result<(), String> {
+        let d = 64;
+        let mut s = Specs::new();
+        let lin = |s: &mut Specs, p: &str, i: usize, o: usize| {
+            s.push((format!("{p}.weight"), vec![o, i]));
+            s.push((format!("{p}.bias"), vec![o]));
+        };
+        for (p, o, i) in [
+            ("proj_in", d, 128),
+            ("time_embed.emb.timestep_embedder.linear_1", d, 256),
+            ("time_embed.emb.timestep_embedder.linear_2", d, d),
+            ("time_embed.linear", 6 * d, d),
+            ("caption_projection.linear_1", d, ti),
+            ("caption_projection.linear_2", d, d),
+            ("proj_out", 128, d),
+        ] {
+            lin(&mut s, p, i, o);
+        }
+        let b = "transformer_blocks.0";
+        for a in ["attn1", "attn2"] {
+            for n in ["to_q", "to_k", "to_v", "to_out.0"] {
+                lin(&mut s, &format!("{b}.{a}.{n}"), d, d);
+            }
+            s.push((format!("{b}.{a}.norm_q.weight"), vec![d]));
+            s.push((format!("{b}.{a}.norm_k.weight"), vec![d]));
+        }
+        lin(&mut s, &format!("{b}.ff.net.0.proj"), d, 4 * d);
+        lin(&mut s, &format!("{b}.ff.net.2"), 4 * d, d);
+        s.push((format!("{b}.scale_shift_table"), vec![6, d]));
+        s.push(("scale_shift_table".into(), vec![2, d]));
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 3))
+    }
+
+    fn write_tiny_ltx_vae(dir: &Path, lat: usize) -> Result<(), String> {
+        let (ch, p) = (8, 2);
+        let mut s = Specs::new();
+        let c3 = |s: &mut Specs, n: &str, ci: usize, co: usize, k: usize| {
+            s.push((format!("{n}.weight"), vec![co, ci, k, k, k]));
+            s.push((format!("{n}.bias"), vec![co]));
+        };
+        let res = |s: &mut Specs, b: &str| {
+            c3(s, &format!("{b}.conv1.conv"), ch, ch, 3);
+            c3(s, &format!("{b}.conv2.conv"), ch, ch, 3);
+        };
+        c3(&mut s, "decoder.conv_in.conv", lat, ch, 3);
+        res(&mut s, "decoder.mid_block.resnets.0");
+        for i in 0..4 {
+            if i == 3 {
+                c3(&mut s, "decoder.up_blocks.3.upsamplers.0.conv.conv", ch, 8 * ch, 3);
+            }
+            res(&mut s, &format!("decoder.up_blocks.{i}.resnets.0"));
+        }
+        c3(&mut s, "decoder.conv_out.conv", ch, 3 * p * p, 3);
+        c3(&mut s, "encoder.conv_in.conv", 3 * p * p, ch, 3);
+        for i in 0..4 {
+            res(&mut s, &format!("encoder.down_blocks.{i}.resnets.0"));
+            if i == 0 {
+                c3(&mut s, "encoder.down_blocks.0.downsamplers.0.conv", ch, ch, 3);
+            }
+        }
+        res(&mut s, "encoder.mid_block.resnets.0");
+        c3(&mut s, "encoder.conv_out.conv", ch, lat + 1, 3);
+        s.push(("latents_mean".into(), vec![lat]));
+        s.push(("latents_std".into(), vec![lat]));
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 9))?;
+        let cfg = serde_json::json!({"_class_name": "AutoencoderKLLTXVideo", "block_out_channels": [ch, ch, ch, ch],
+            "layers_per_block": [1, 1, 1, 1, 1], "spatio_temporal_scaling": [true, false, false, false], "patch_size": p, "latent_channels": lat});
+        std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())
+    }
+
+    /// A tiny `LTXPipeline` snapshot in a hub cache (T5 encoder, tiny LTX transformer and VAE,
+    /// flow-match scheduler config).
     fn tiny_ltx_repo(root: &Path) -> HuggingFaceHub {
-        use crate::model::diff_fixtures::{values, write_f32_safetensors, write_tiny_ltx, write_tiny_ltx_vae};
         use serde_json::json;
         let dir = root.join("hub/models--test--tiny-ltx/snapshots/main");
         let put = |p: &str, v: serde_json::Value| {

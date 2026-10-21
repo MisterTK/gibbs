@@ -78,7 +78,6 @@ fn gemv_codec(st: &Core, cols: usize) -> Option<&'static Codec> {
     let f = match format {
         WeightFormat::BF16 => QuantFormat::BF16,
         WeightFormat::F16 => QuantFormat::FP16,
-        WeightFormat::NvFp4 => return None,
         fmt => fmt.codec_format()?,
     };
     codec_of(f).filter(|c| cols % c.block_elems as usize == 0)
@@ -524,13 +523,11 @@ mod tests {
             );
         }
         let (be, _, _) = crate::model::layers::gguf_block_codec(f).unwrap();
-        Tensor::Quantized(std::sync::Arc::new(
-            crate::model::layers::QuantizedWeight::GgufQuantized {
-                format: f,
-                raw_data: blocks(f, rows * cols / be, seed).into(),
-                in_features: cols,
-                out_features: rows,
-            },
+        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+            f,
+            blocks(f, rows * cols / be, seed),
+            rows,
+            cols,
         ))
     }
 

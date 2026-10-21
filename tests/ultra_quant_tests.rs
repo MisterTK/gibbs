@@ -1,5 +1,3 @@
-use foundry_engine::hardware::QuantFormat;
-use foundry_engine::model::layers::QuantizedLinearLayer;
 use foundry_engine::quant::nvfp4::{
     dequantize_nvfp4_tensor, gemv_nvfp4_f32, quantize_nvfp4_tensor,
 };
@@ -42,41 +40,3 @@ fn test_nvfp4_e2m1_quantization_and_fused_gemv() {
     }
 }
 
-#[test]
-fn test_quantized_linear_layer_cross_format() {
-    let in_feat = 64;
-    let out_feat = 32;
-    let weights: Vec<f32> = (0..(in_feat * out_feat))
-        .map(|i| (i as f32 * 0.05).sin())
-        .collect();
-
-    let x: Vec<f32> = (0..in_feat).map(|i| (i as f32 * 0.02).cos()).collect();
-
-    // 1. Uncompressed
-    let layer_uncomp =
-        QuantizedLinearLayer::from_f32("uncomp", in_feat, out_feat, &weights, QuantFormat::FP32)
-            .unwrap();
-    let mut out_uncomp = vec![0.0f32; out_feat];
-    layer_uncomp.forward(&x, &mut out_uncomp);
-    assert_eq!(layer_uncomp.bits_per_weight(), 32.0); // stored as f32
-
-    // 2. NVFP4
-    let layer_nvfp4 = QuantizedLinearLayer::from_f32(
-        "nvfp4",
-        in_feat,
-        out_feat,
-        &weights,
-        QuantFormat::NVFP4_E2M1,
-    )
-    .unwrap();
-    let mut out_nvfp4 = vec![0.0f32; out_feat];
-    layer_nvfp4.forward(&x, &mut out_nvfp4);
-    assert_eq!(layer_nvfp4.bits_per_weight(), 4.25);
-
-    // Outputs should correlate positively with uncompressed
-    let dot_nvfp4: f32 = out_uncomp.iter().zip(&out_nvfp4).map(|(u, n)| u * n).sum();
-    assert!(
-        dot_nvfp4 > 0.0,
-        "NVFP4 output should positively correlate with reference"
-    );
-}

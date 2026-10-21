@@ -748,7 +748,6 @@ mod tests {
     use super::super::super::Session;
     use crate::graph::{cpu, DType, Graph, Op, StateStore, Tensor, Weights};
     use crate::hardware::QuantFormat as Q;
-    use crate::model::layers::QuantizedWeight;
     use crate::model::{f32_to_bf16, f32_to_f16};
 
     /// Storage format of a test weight.
@@ -860,13 +859,12 @@ mod tests {
                 let be = crate::graph::codec::codec(f).expect("codec").block_elems as usize;
                 assert_eq!(cols % be, 0);
                 let raw = sane_blocks(f, rows * cols / be, seed);
-                let q = QuantizedWeight::GgufQuantized {
-                    format: f,
-                    raw_data: raw.into(),
-                    in_features: cols,
-                    out_features: rows,
-                };
-                (DType::Quant(f), Tensor::Quantized(std::sync::Arc::new(q)))
+                (
+                    DType::Quant(f),
+                    Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                        f, raw, rows, cols,
+                    )),
+                )
             }
         }
     }

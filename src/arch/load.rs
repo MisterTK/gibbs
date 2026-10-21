@@ -86,14 +86,6 @@ fn dtype_of(t: &Tensor) -> DType {
         Tensor::Mat(m) => m
             .packed()
             .map_or(DType::BF16, |p| Kind::of_format(p.format).dtype()),
-        Tensor::Quantized(q) => match q.as_ref() {
-            crate::model::layers::QuantizedWeight::Uncompressed { .. } => DType::F32,
-            crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. }
-            | crate::model::layers::QuantizedWeight::GgufQuantized { format, .. } => {
-                Kind::of_format(*format).dtype()
-            }
-            crate::model::layers::QuantizedWeight::Nvfp4(_) => DType::Quant(Q::NVFP4),
-        },
     }
 }
 
@@ -1048,19 +1040,9 @@ impl WeightStore {
             // `--quant` into a block format.
             Kind::Packed(f) => {
                 let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-                let w =
+                let raw =
                     crate::model::reencode::encode_weight(&self.dense(n)?, cols, rows, f, threads);
-                let crate::model::layers::QuantizedWeight::GgufQuantized { raw_data, .. } = w
-                else {
-                    return Err(format!("{f:?} did not encode to blocks"));
-                };
-                let p = Packed {
-                    map: Arc::new(GgufData::Buf(raw_data.to_vec())),
-                    off: 0,
-                    format: f,
-                    shape: n.shape.clone(),
-                };
-                Tensor::Mat(Mat::from_packed(p, rows, cols))
+                Tensor::Mat(Mat::from_packed_bytes(f, raw, rows, cols))
             }
         })
     }

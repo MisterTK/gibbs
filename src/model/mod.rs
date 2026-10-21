@@ -9,10 +9,9 @@
 //!    - [`crate::runtime::encoder::system1::JevSystem1Model`]: pretrained sentence encoder
 //!      (default all-MiniLM-L6-v2) answering choice/bool questions zero-shot by embedding cosine similarity.
 //!
-//! 2. **Universal Quantization & Layer Abstractions**:
-//!    - [`layers::QuantizedLinearLayer`]: Architectural God Node abstracting FP16, NVFP4 and
-//!      GGUF block weight representations behind a zero-copy forward interface.
-//!    - [`layers::QuantizedWeight`]: Memory-compact packed weight storage.
+//! 2. **Weight Storage & Block Codecs**:
+//!    - [`weights::Mat`]: Memory-mapped or packed weight matrices.
+//!    - [`layers`]: CPU block codecs and encoders.
 //!
 //! 3. **SIMD & Compute Primitives**:
 //!    - [`simd`]: Target-vectorized mathematical kernels (RMSNorm, LayerNorm, single-pass fused SwiGLU,
@@ -43,10 +42,8 @@
 
 pub mod audio;
 pub mod classifier;
-pub mod diff_fixtures;
 
 pub mod fasttext;
-pub mod fingerprint;
 pub mod hf_loader;
 pub mod hub;
 pub mod image;
@@ -72,9 +69,8 @@ pub mod vision_graph;
 pub mod weight_format;
 pub mod weights;
 
-use crate::hardware::{QuantFormat, QuantizationFormat};
+use crate::hardware::QuantFormat;
 use bytes::Bytes;
-pub use fingerprint::*;
 pub use hub::*;
 pub use image::*;
 pub use layers::*;
@@ -84,7 +80,7 @@ pub use tokenizer::*;
 /// Serialization container formats supported by the Universal Model Loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
-    /// llama.cpp unified quantized format with embedded metadata and tensor KV pairs.
+    /// GGML unified quantized format with embedded metadata and tensor KV pairs.
     Gguf,
     /// Hugging Face zero-copy memory-mappable tensor serialization format.
     Safetensors,
@@ -96,44 +92,6 @@ pub enum SourceFormat {
     Ggml,
 }
 
-/// Generic tensor abstraction parameterized over quantization format.
-/// Enables zero-cost abstraction for different dequantization strategies.
-#[derive(Debug, Clone)]
-pub struct Tensor<Q: QuantizationFormat> {
-    /// (rows, cols) shape of the tensor.
-    pub shape: (usize, usize),
-    /// Raw quantized weight bytes.
-    pub data: Vec<u8>,
-    /// Per-block quantization parameters (scales, minimums, etc).
-    pub quant_params: Q::BlockParams,
-}
-
-impl<Q: QuantizationFormat> Tensor<Q> {
-    /// Create a new tensor with the given shape and quantized data.
-    pub fn new(shape: (usize, usize), data: Vec<u8>, quant_params: Q::BlockParams) -> Self {
-        Self {
-            shape,
-            data,
-            quant_params,
-        }
-    }
-
-    /// Dequantize the entire tensor to f32.
-    pub fn dequantize(&self) -> Result<Vec<f32>, String> {
-        let block_size = Q::block_size().0;
-        let bytes_per_block = Q::bytes_per_block();
-        let num_blocks = (self.data.len() + bytes_per_block - 1) / bytes_per_block;
-        let mut out = Vec::with_capacity(num_blocks * block_size);
-        for i in 0..num_blocks {
-            let start = i * bytes_per_block;
-            let end = std::cmp::min(start + bytes_per_block, self.data.len());
-            let block = &self.data[start..end];
-            let dequant = Q::dequantize_block(block, &self.quant_params)?;
-            out.extend(dequant);
-        }
-        Ok(out)
-    }
-}
 /// Zero-copy virtual tensor descriptor pointing to byte offsets in memory-mapped artifacts.
 #[derive(Debug, Clone)]
 pub struct VirtualTensor {
@@ -164,7 +122,7 @@ pub struct ModelManifest {
     pub metadata: HashMap<String, String>,
     /// Total number of shards in multi-part model (1 for single file).
     pub shard_count: usize,
-    /// Fingerprinted model architecture (e.g., "llama-70b", "qwen2-vl").
+    /// Fingerprinted model architecture.
     pub detected_architecture: String,
 }
 
@@ -549,38 +507,38 @@ impl UniversalModelLoader {
     pub fn ggml_type_info(
         raw_type: u32,
     ) -> Result<(QuantFormat, &'static str, usize, usize), String> {
-        Ok(match raw_type {
-            0 => (QuantFormat::FP32, "F32", 1, 4),
-            1 => (QuantFormat::FP16, "F16", 1, 2),
-            2 => (QuantFormat::GGUF_Q4_0, "Q4_0", 32, 18),
-            3 => (QuantFormat::GGUF_Q4_1, "Q4_1", 32, 20),
-            6 => (QuantFormat::GGUF_Q5_0, "Q5_0", 32, 22),
-            7 => (QuantFormat::GGUF_Q5_1, "Q5_1", 32, 24),
-            8 => (QuantFormat::GGUF_Q8_0, "Q8_0", 32, 34),
-            10 => (QuantFormat::GGUF_Q2_K, "Q2_K", 256, 84),
-            11 => (QuantFormat::GGUF_Q3_K, "Q3_K", 256, 110),
-            12 => (QuantFormat::GGUF_Q4_K_M, "Q4_K", 256, 144),
-            13 => (QuantFormat::GGUF_Q5_K_M, "Q5_K", 256, 176),
-            14 => (QuantFormat::GGUF_Q6_K, "Q6_K", 256, 210),
-            16 => (QuantFormat::GGUF_IQ2_XXS, "IQ2_XXS", 256, 66),
-            17 => (QuantFormat::GGUF_IQ2_XS, "IQ2_XS", 256, 74),
-            18 => (QuantFormat::GGUF_IQ3_XXS, "IQ3_XXS", 256, 98),
-            19 => (QuantFormat::GGUF_IQ1_S, "IQ1_S", 256, 50),
-            20 => (QuantFormat::GGUF_IQ4_NL, "IQ4_NL", 32, 18),
-            21 => (QuantFormat::GGUF_IQ3_S, "IQ3_S", 256, 110),
-            22 => (QuantFormat::GGUF_IQ2_S, "IQ2_S", 256, 82),
-            23 => (QuantFormat::GGUF_IQ4_XS, "IQ4_XS", 256, 136),
-            24 => (QuantFormat::FP32, "I8", 1, 1),
-            25 => (QuantFormat::FP32, "I16", 1, 2),
-            26 => (QuantFormat::FP32, "I32", 1, 4),
-            27 => (QuantFormat::FP32, "I64", 1, 8),
-            28 => (QuantFormat::FP32, "F64", 1, 8),
-            29 => (QuantFormat::GGUF_IQ1_M, "IQ1_M", 256, 56),
-            30 => (QuantFormat::BF16, "BF16", 1, 2),
-            34 => (QuantFormat::GGUF_TQ1_0, "TQ1_0", 256, 54),
-            35 => (QuantFormat::GGUF_TQ2_0, "TQ2_0", 256, 66),
-            39 => (QuantFormat::MXFP4, "MXFP4", 32, 17),
-            40 => (QuantFormat::GGUF_NVFP4, "NVFP4", 64, 36),
+        let (fmt, name) = match raw_type {
+            0 => (QuantFormat::FP32, "F32"),
+            1 => (QuantFormat::FP16, "F16"),
+            2 => (QuantFormat::GGUF_Q4_0, "Q4_0"),
+            3 => (QuantFormat::GGUF_Q4_1, "Q4_1"),
+            6 => (QuantFormat::GGUF_Q5_0, "Q5_0"),
+            7 => (QuantFormat::GGUF_Q5_1, "Q5_1"),
+            8 => (QuantFormat::GGUF_Q8_0, "Q8_0"),
+            10 => (QuantFormat::GGUF_Q2_K, "Q2_K"),
+            11 => (QuantFormat::GGUF_Q3_K, "Q3_K"),
+            12 => (QuantFormat::GGUF_Q4_K_M, "Q4_K"),
+            13 => (QuantFormat::GGUF_Q5_K_M, "Q5_K"),
+            14 => (QuantFormat::GGUF_Q6_K, "Q6_K"),
+            16 => (QuantFormat::GGUF_IQ2_XXS, "IQ2_XXS"),
+            17 => (QuantFormat::GGUF_IQ2_XS, "IQ2_XS"),
+            18 => (QuantFormat::GGUF_IQ3_XXS, "IQ3_XXS"),
+            19 => (QuantFormat::GGUF_IQ1_S, "IQ1_S"),
+            20 => (QuantFormat::GGUF_IQ4_NL, "IQ4_NL"),
+            21 => (QuantFormat::GGUF_IQ3_S, "IQ3_S"),
+            22 => (QuantFormat::GGUF_IQ2_S, "IQ2_S"),
+            23 => (QuantFormat::GGUF_IQ4_XS, "IQ4_XS"),
+            24 => return Ok((QuantFormat::FP32, "I8", 1, 1)),
+            25 => return Ok((QuantFormat::FP32, "I16", 1, 2)),
+            26 => return Ok((QuantFormat::FP32, "I32", 1, 4)),
+            27 => return Ok((QuantFormat::FP32, "I64", 1, 8)),
+            28 => return Ok((QuantFormat::FP32, "F64", 1, 8)),
+            29 => (QuantFormat::GGUF_IQ1_M, "IQ1_M"),
+            30 => (QuantFormat::BF16, "BF16"),
+            34 => (QuantFormat::GGUF_TQ1_0, "TQ1_0"),
+            35 => (QuantFormat::GGUF_TQ2_0, "TQ2_0"),
+            39 => (QuantFormat::MXFP4, "MXFP4"),
+            40 => (QuantFormat::GGUF_NVFP4, "NVFP4"),
             t => {
                 let name = match t {
                     9 => "Q8_1",
@@ -593,7 +551,10 @@ impl UniversalModelLoader {
                 };
                 return Err(format!("unsupported GGML type {name} ({t})"));
             }
-        })
+        };
+        let (elems, bytes) = crate::graph::codec::block_geometry(fmt)
+            .expect("GGML type has block geometry");
+        Ok((fmt, name, elems, bytes))
     }
 
     /// Ingests GGUF file buffer format and indexes metadata & tensors

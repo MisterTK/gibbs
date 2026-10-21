@@ -36,6 +36,76 @@ pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
     }
 }
 
+/// `(block_elems, block_bytes)` for `format`, from the registered codec or element width.
+pub fn block_geometry(format: QuantFormat) -> Option<(usize, usize)> {
+    match format {
+        QuantFormat::FP32 => Some((1, 4)),
+        QuantFormat::FP16 | QuantFormat::BF16 => Some((1, 2)),
+        QuantFormat::FP8_E4M3 | QuantFormat::FP8_E5M2 => Some((1, 1)),
+        f => codec(f).map(|c| (c.block_elems as usize, c.block_bytes as usize)),
+    }
+}
+
+/// Effective bits per weight for `format`, derived from [`block_geometry`] where block-encoded.
+pub fn bits_per_weight(format: QuantFormat) -> f32 {
+    match format {
+        QuantFormat::BitNet_B1_58 => 1.58,
+        QuantFormat::KIVI_2Bit => 2.0,
+        QuantFormat::NVFP4 | QuantFormat::NVFP4_E2M1 => 2.25,
+        QuantFormat::TurboQuant => 3.5,
+        QuantFormat::AWQ_W4A16
+        | QuantFormat::GPTQ_W4A16
+        | QuantFormat::BNB_NF4
+        | QuantFormat::BNB_FP4 => 4.5,
+        QuantFormat::MXFP6 => 6.0,
+        QuantFormat::FP32
+        | QuantFormat::FP16
+        | QuantFormat::BF16
+        | QuantFormat::FP8_E4M3
+        | QuantFormat::FP8_E5M2
+        | QuantFormat::FP8_E4M3_B32
+        | QuantFormat::MXFP4
+        | QuantFormat::BNB_NF4_B64
+        | QuantFormat::BNB_NF4_B128
+        | QuantFormat::BNB_NF4_B256
+        | QuantFormat::BNB_FP4_B64
+        | QuantFormat::BNB_FP4_B128
+        | QuantFormat::BNB_FP4_B256
+        | QuantFormat::GGUF_Q4_0
+        | QuantFormat::GGUF_Q4_1
+        | QuantFormat::GGUF_Q5_0
+        | QuantFormat::GGUF_Q5_1
+        | QuantFormat::GGUF_Q8_0
+        | QuantFormat::GGUF_Q2_K
+        | QuantFormat::GGUF_Q3_K
+        | QuantFormat::GGUF_Q4_K_M
+        | QuantFormat::GGUF_Q5_K_M
+        | QuantFormat::GGUF_Q6_K
+        | QuantFormat::GGUF_IQ1_S
+        | QuantFormat::GGUF_IQ1_M
+        | QuantFormat::GGUF_IQ2_XXS
+        | QuantFormat::GGUF_IQ2_XS
+        | QuantFormat::GGUF_IQ2_S
+        | QuantFormat::GGUF_IQ2_M
+        | QuantFormat::GGUF_IQ3_XXS
+        | QuantFormat::GGUF_IQ3_S
+        | QuantFormat::GGUF_IQ4_NL
+        | QuantFormat::GGUF_IQ4_XS
+        | QuantFormat::GGUF_TQ1_0
+        | QuantFormat::GGUF_TQ2_0
+        | QuantFormat::MLX_AFFINE4_G32
+        | QuantFormat::MLX_AFFINE4_G64
+        | QuantFormat::MLX_AFFINE4_G128
+        | QuantFormat::INT4_G32
+        | QuantFormat::INT4_G64
+        | QuantFormat::INT4_G128
+        | QuantFormat::GGUF_NVFP4 => {
+            let (elems, bytes) = block_geometry(format).expect("registered block geometry");
+            (bytes * 8) as f32 / elems as f32
+        }
+    }
+}
+
 /// Optional wide decode for formats whose 8-element sub-blocks share bytes (2-bit planes, K-quant nibble
 /// and high-bit planes: several sub-blocks are bit fields of the same few bytes) and whose elements are
 /// `scale * code + bias` per sub-block. `decode8` re-reads those bytes once per sub-block and applies the
@@ -1129,4 +1199,25 @@ pub fn source_hash() -> u64 {
         }
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_quant_formats_have_consistent_geometry_and_bpw() {
+        let n = 256 * 64;
+        for &f in QuantFormat::ALL {
+            let bpw = f.bits_per_weight();
+            assert!(bpw > 0.0 && bpw <= 32.0, "{f:?}: invalid bpw {bpw}");
+            let bytes = f.tensor_bytes(n);
+            if let Some((elems, blk_bytes)) = block_geometry(f) {
+                assert_eq!(bytes, (n / elems) * blk_bytes, "{f:?}");
+                assert!((bpw - (blk_bytes * 8) as f32 / elems as f32).abs() < 1e-6, "{f:?}");
+            } else {
+                assert_eq!(bytes, (n as f32 * bpw / 8.0).ceil() as usize, "{f:?}");
+            }
+        }
+    }
 }

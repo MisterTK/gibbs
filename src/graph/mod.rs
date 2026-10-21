@@ -6,7 +6,6 @@
 //! outside the graph in [`Weights`], so one graph can be fingerprinted or run.
 
 pub mod avenues;
-#[cfg(target_os = "macos")]
 pub mod codec;
 pub mod codegen;
 pub mod cpu;
@@ -103,7 +102,7 @@ pub enum PairLayout {
 pub enum RopeVariant {
     /// Rotates adjacent pairs `(2i, 2i+1)`.
     Interleaved,
-    /// Rotates `(i, i + rotary_dim/2)` (GPT-NeoX / Qwen layout).
+    /// Rotates `(i, i + rotary_dim/2)` (half-split layout).
     HalfSplit,
     /// Multimodal RoPE with temporal, height, width sections.
     MRope {
@@ -336,7 +335,7 @@ pub enum Op {
     Softmax {
         axis: isize,
     },
-    /// `[table [buckets, heads], q_pos [n] U32, k_pos [m] U32]` → `[heads, n, m]`, the T5 bias added
+    /// `[table [buckets, heads], q_pos [n] U32, k_pos [m] U32]` → `[heads, n, m]`, the relative-position bias added
     /// to attention scores: `table[bucket(k_pos - q_pos)]` with HF `_relative_position_bucket`.
     RelPosBias {
         buckets: usize,
@@ -645,7 +644,6 @@ pub enum Tensor {
     F16(Vec<u16>),
     BF16(Vec<u16>),
     Mat(crate::model::weights::Mat),
-    Quantized(std::sync::Arc<crate::model::layers::QuantizedWeight>),
 }
 
 impl Tensor {
@@ -656,7 +654,6 @@ impl Tensor {
             Tensor::F16(v) => v.len(),
             Tensor::BF16(v) => v.len(),
             Tensor::Mat(m) => m.rows * m.cols,
-            Tensor::Quantized(q) => q.num_elements(),
         }
     }
 
@@ -671,7 +668,6 @@ impl Tensor {
             Tensor::F16(_) => Err("expected an f32 tensor, got f16".into()),
             Tensor::BF16(_) => Err("expected an f32 tensor, got bf16".into()),
             Tensor::Mat(_) => Err("expected an f32 tensor, got Mat".into()),
-            Tensor::Quantized(_) => Err("expected an f32 tensor, got Quantized".into()),
         }
     }
 
@@ -682,7 +678,6 @@ impl Tensor {
             Tensor::F16(v) => v.iter().map(|&x| crate::model::f16_to_f32(x)).collect(),
             Tensor::BF16(v) => v.iter().map(|&x| crate::model::bf16_to_f32(x)).collect(),
             Tensor::Mat(m) => m.to_f32(),
-            Tensor::Quantized(q) => q.to_f32(),
         }
     }
 

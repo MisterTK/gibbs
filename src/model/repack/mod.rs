@@ -4,7 +4,7 @@
 //!
 //! Each family owns three things, one set per [`QuantFormat`] it produces:
 //! * a CPU block dequantizer (`block_codec`), the reference the GPU codec must equal bit-for-bit
-//!   (`tests/codec_parity.rs` style) and what `QuantizedWeight::to_f32` / the CPU GEMV use;
+//!   (`tests/codec_parity.rs` style) and what `Mat::to_f32` / the CPU GEMV use;
 //! * an MSL `decode8` ([`crate::graph::codec::Spec`]) registered through [`crate::graph::codec::codec`];
 //! * `repack`, which turns the checkpoint's own tensors into row-major `[rows, cols]` blocks of that
 //!   format, or `Ok(None)` when the weight is not stored that way (the f32 dequantize path applies).

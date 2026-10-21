@@ -106,6 +106,13 @@ pub fn compiling() -> bool {
     COMPILING.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
+/// Total CPU-segment nodes compiled across all non-`Pin(Cpu)` [`GraphProgram`]s in this process.
+static COMPILED_CPU_NODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn compiled_cpu_nodes() -> usize {
+    COMPILED_CPU_NODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct CompileGuard;
 
 impl CompileGuard {
@@ -217,7 +224,7 @@ impl GraphProgram {
             },
         };
 
-        Ok(Self {
+        let prog = Self {
             segment,
             plan,
             primary_device,
@@ -228,7 +235,14 @@ impl GraphProgram {
             argmax: None,
             #[cfg(target_os = "macos")]
             reshaped: Vec::new(),
-        })
+        };
+        if mode != PlacementMode::Pin(Device::Cpu) {
+            COMPILED_CPU_NODES.fetch_add(
+                prog.cpu_node_count(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(prog)
     }
 
     /// Number of graph nodes the CPU executor runs: 0 for a Metal program.

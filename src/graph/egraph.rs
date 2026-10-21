@@ -329,35 +329,20 @@ impl Report {
 
 /// Concatenation class of weight `w` for the gate/up and QKV rules (`None`: never fused, as
 /// `concat_weight_tensors` / `matches_dtype` would refuse it). Model-loader `Tensor::Mat`s fuse
-/// only as QKV (see `rewrite_gate_up`), so they get no `GluIn` fact.
+/// only as QKV (the Metal planner folds the GLU into the up GEMV epilogue `Epi::UpGeGlu/UpSwiGlu`).
 fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<String> {
     let val = g.value(w);
     if val.kind != ValueKind::Weight || val.shape.len() != 2 {
         return None;
     }
     let cols = val.shape[1];
-    let storage = match weights {
-        None => "",
-        Some(ws) => {
-            let t = ws.get(&val.name)?;
-            if !fusion::matches_dtype(val.dtype, t) {
-                return None;
-            }
-            match t {
-                Tensor::Quantized(q) => match q.as_ref() {
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        in_features, ..
-                    } if *in_features == cols => "gguf",
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        in_features, ..
-                    } if *in_features == cols => "zc",
-                    _ => return None,
-                },
-                _ => "",
-            }
+    if let Some(ws) = weights {
+        let t = ws.get(&val.name)?;
+        if !fusion::matches_dtype(val.dtype, t) {
+            return None;
         }
-    };
-    Some(format!("{:?}/{cols}/{storage}", val.dtype))
+    }
+    Some(format!("{:?}/{cols}", val.dtype))
 }
 
 /// Inserts the facts of `g` into `eg` (schema and rules already declared) through the row API:
@@ -433,6 +418,8 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
                         let mat = weights
                             .and_then(|ws| ws.get(&g.value(*w).name))
                             .is_some_and(|t| matches!(t, Tensor::Mat(_)));
+                        // Separate gate/up lets Metal fold GLU into the up GEMV epilogue (`Epi::UpGeGlu/UpSwiGlu`);
+                        // fusing them costs an extra activation round trip per layer.
                         if !mat {
                             fs.add("GluIn", wt)?;
                         }

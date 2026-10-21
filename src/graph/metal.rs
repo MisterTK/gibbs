@@ -274,7 +274,6 @@ pub enum WeightFormat {
     Q4_K,
     Q2_K,
     IQ3_S,
-    NvFp4,
     /// A format with no hand kernel: read through its [`codec::Codec`] by a generated GEMV.
     Gen(QuantFormat),
 }
@@ -290,7 +289,6 @@ impl WeightFormat {
             QuantFormat::GGUF_Q4_K_M => WeightFormat::Q4_K,
             QuantFormat::GGUF_Q2_K => WeightFormat::Q2_K,
             QuantFormat::GGUF_IQ3_S => WeightFormat::IQ3_S,
-            QuantFormat::NVFP4_E2M1 | QuantFormat::NVFP4 => WeightFormat::NvFp4,
             QuantFormat::BF16 => WeightFormat::BF16,
             QuantFormat::FP16 => WeightFormat::F16,
             f if codec::codec(f).is_some() => WeightFormat::Gen(f),
@@ -385,10 +383,7 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
     match op {
         Op::Linear => match dtype {
             DType::F32 | DType::F16 | DType::BF16 => true,
-            DType::Quant(f) => {
-                crate::graph::codec::codec(f).is_some()
-                    || matches!(f, QuantFormat::NVFP4_E2M1 | QuantFormat::NVFP4)
-            }
+            DType::Quant(f) => crate::graph::codec::codec(f).is_some(),
             DType::U32 => false,
         },
         Op::Embedding => matches!(dtype, DType::F32 | DType::U32),
@@ -423,7 +418,6 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
                     | DType::Quant(QuantFormat::GGUF_Q4_K_M)
                     | DType::Quant(QuantFormat::GGUF_Q2_K)
                     | DType::Quant(QuantFormat::GGUF_IQ3_S)
-                    | DType::Quant(QuantFormat::NVFP4)
             )
         }
         _ => false,
@@ -1088,14 +1082,8 @@ impl Runtime {
         shapes: &[(usize, usize)],
         variants: &[GemvVariant],
     ) -> Result<Vec<(GemvVariant, f64)>, String> {
-        use crate::model::layers::QuantizedWeight;
         let float = matches!(f, QuantFormat::BF16 | QuantFormat::FP16);
-        let (elems, block_bytes) = if float {
-            (1, 2)
-        } else {
-            let c = codec::codec(f).ok_or("no codec")?;
-            (c.block_elems as usize, c.block_bytes as usize)
-        };
+        let (elems, block_bytes) = codec::block_geometry(f).ok_or("no codec")?;
         let mut pattern = vec![0u8; 1 << 20];
         let mut s = 0x9E3779B97F4A7C15u64;
         for b in &mut pattern {
@@ -1115,13 +1103,21 @@ impl Runtime {
             while raw.len() < bytes {
                 raw.extend_from_slice(&pattern[..(bytes - raw.len()).min(pattern.len())]);
             }
-            let raw = bytes::Bytes::from(raw);
             let halves: Vec<u16> = if float {
                 raw.chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             } else {
                 Vec::new()
+            };
+            // `GgufData::Buf` is skipped by `map_buffers` (which only maps `GgufData::Map`),
+            // so `Session::new_for_graph` allocates a distinct `MTLBuffer` per copy via
+            // `new_buffer_with_data` while sharing one host `Vec<u8>`.
+            let packed = crate::model::weights::Packed {
+                map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(raw)),
+                off: 0,
+                format: f,
+                shape: vec![n, k],
             };
             let copies = ((192usize << 20) / bytes).max(1);
             let mut g = Graph::new();
@@ -1133,12 +1129,11 @@ impl Runtime {
                     QuantFormat::FP16 => (DType::F16, Tensor::F16(halves.clone())),
                     _ => (
                         DType::Quant(f),
-                        Tensor::Quantized(Arc::new(QuantizedWeight::GgufQuantized {
-                            format: f,
-                            raw_data: raw.clone(),
-                            in_features: k,
-                            out_features: n,
-                        })),
+                        Tensor::Mat(crate::model::weights::Mat::from_packed(
+                            packed.clone(),
+                            n,
+                            k,
+                        )),
                     ),
                 };
                 let w = g.weight(&name, vec![n, k], dtype);
@@ -1609,7 +1604,6 @@ pub struct Session {
     /// Last command buffer of the newest fed-stream token; host arena writes wait for it.
     fed_tail: Mutex<Option<metal::CommandBuffer>>,
     gemm: Option<GemmKernel>,
-    nvfp4_aux: HashMap<String, (Buffer, f32)>,
     /// Forces every packed GEMV that can run it onto this variant (benchmarks and tests).
     variant_override: Option<GemvVariant>,
     last_gpu_s: std::sync::atomic::AtomicU64,
@@ -1709,89 +1703,24 @@ impl Session {
         let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
         let mut maps = Vec::new();
         let mut bufs = HashMap::new();
-        let mut nvfp4_aux = HashMap::new();
         for (name, t) in weights.iter() {
             if let Some(ref active) = active_names {
                 if !active.contains(name) {
                     continue;
                 }
             }
-            if let Tensor::Quantized(q) = t {
-                if let crate::model::layers::QuantizedWeight::Nvfp4(tensor) = q.as_ref() {
-                    let rows = tensor.rows;
-                    let cols = tensor.cols;
-                    let n_blocks = rows * (cols / 16);
-                    let mut wq = Vec::with_capacity(n_blocks * 8);
-                    for blk in &tensor.blocks {
-                        wq.extend_from_slice(&blk.packed_nibbles);
-                    }
-                    // A checkpoint's own E4M3 block scales and global scale go up verbatim; only a
-                    // tensor quantized from f32 re-derives them (global = max scale / 448).
-                    let (scales_e4m3, global_scale) = match &tensor.source_scales {
-                        Some((bytes, global)) => (bytes.clone(), *global),
-                        None => {
-                            let max_scale =
-                                tensor.blocks.iter().fold(0.0f32, |m, b| m.max(b.scale));
-                            let global = if max_scale > 0.0 {
-                                max_scale / 448.0
-                            } else {
-                                1.0
-                            };
-                            let inv = 1.0 / global;
-                            let bytes = tensor
-                                .blocks
-                                .iter()
-                                .map(|b| crate::model::f32_to_f8_e4m3(b.scale * inv))
-                                .collect();
-                            (bytes, global)
-                        }
-                    };
-                    let scales_buf = rt.device.new_buffer_with_data(
-                        scales_e4m3.as_ptr() as *const c_void,
-                        scales_e4m3.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-                    nvfp4_aux.insert(name.to_string(), (scales_buf, global_scale));
-                    let main_buf = rt.device.new_buffer_with_data(
-                        wq.as_ptr() as *const c_void,
-                        wq.len() as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    );
-                    bufs.insert(
-                        name.to_string(),
-                        (main_buf, 0, rows * cols, WeightFormat::NvFp4),
-                    );
-                    continue;
-                }
-            }
-            if let Some(ref active) = active_names {
-                if !active.contains(name) {
-                    continue;
-                }
-            }
             if let Tensor::Mat(m) = t {
-                if let Some(p) = m.packed() {
+                if let Some(p) = m
+                    .packed()
+                    .filter(|p| matches!(p.map.as_ref(), crate::model::loaders::gguf::GgufData::Map(_)))
+                {
                     let map_ptr = p.map.as_ptr();
                     let map_len = p.map.len();
                     let num_elements = m.rows * m.cols;
-                    let fmt = match p.format {
-                        QuantFormat::GGUF_Q4_0 => Some(WeightFormat::Q4_0),
-                        QuantFormat::GGUF_Q8_0 => Some(WeightFormat::Q8_0),
-                        QuantFormat::GGUF_IQ4_XS => Some(WeightFormat::IQ4_XS),
-                        QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => {
-                            Some(WeightFormat::IQ2_M)
-                        }
-                        QuantFormat::GGUF_Q4_K_M => Some(WeightFormat::Q4_K),
-                        QuantFormat::GGUF_IQ3_S => Some(WeightFormat::IQ3_S),
-                        QuantFormat::BF16 => Some(WeightFormat::BF16),
-                        QuantFormat::FP16 => Some(WeightFormat::F16),
-                        f if crate::graph::codec::codec(f).is_some()
-                            && f != QuantFormat::GGUF_Q2_K
-                            && codec::planar(f).is_none() =>
-                        {
-                            Some(WeightFormat::Gen(f))
-                        }
-                        _ => None,
+                    let fmt = match WeightFormat::of_quant(p.format) {
+                        WeightFormat::F32 | WeightFormat::Q2_K => None,
+                        WeightFormat::Gen(f) if codec::planar(f).is_some() => None,
+                        wfmt => Some(wfmt),
                     };
                     if let Some(fmt) = fmt {
                         if !map_buffers.contains_key(&map_ptr) {
@@ -1845,319 +1774,13 @@ impl Session {
                     v.len() * 2,
                     WeightFormat::F16,
                 ),
-                Tensor::Quantized(q) => match q.as_ref() {
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q4_0 => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::Q4_0,
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q8_0 => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::Q8_0,
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::BF16 => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::BF16,
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::FP16 => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::F16,
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_IQ4_XS => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::IQ4_XS,
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_IQ2_M
-                        || *format == QuantFormat::GGUF_IQ2_S =>
-                    {
-                        (
-                            None,
-                            data.as_ptr() as *const c_void,
-                            in_features * out_features,
-                            data.len(),
-                            WeightFormat::IQ2_M,
-                        )
-                    }
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q4_K_M => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::Q4_K,
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_IQ3_S => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::IQ3_S,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q4_0 => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::Q4_0,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q8_0 => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::Q8_0,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_IQ4_XS => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::IQ4_XS,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_IQ2_M
-                        || *format == QuantFormat::GGUF_IQ2_S =>
-                    {
-                        (
-                            None,
-                            raw_data.as_ptr() as *const c_void,
-                            in_features * out_features,
-                            raw_data.len(),
-                            WeightFormat::IQ2_M,
-                        )
-                    }
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q4_K_M => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::Q4_K,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_Q2_K => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::Q2_K,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if *format == QuantFormat::GGUF_IQ3_S => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::IQ3_S,
-                    ),
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        raw_data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if crate::graph::codec::codec(*format).is_some() => (
-                        None,
-                        raw_data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        raw_data.len(),
-                        WeightFormat::Gen(*format),
-                    ),
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        data,
-                        format,
-                        in_features,
-                        out_features,
-                    } if crate::graph::codec::codec(*format).is_some() => (
-                        None,
-                        data.as_ptr() as *const c_void,
-                        in_features * out_features,
-                        data.len(),
-                        WeightFormat::Gen(*format),
-                    ),
-                    other => {
-                        use crate::model::layers::QuantizedWeight as Q;
-                        let fmt_name = match other {
-                            Q::ZeroCopySlice { format, .. } | Q::GgufQuantized { format, .. } => {
-                                Some(format!("{format:?}"))
-                            }
-                            Q::Nvfp4(_) => Some("NVFP4".to_string()),
-                            Q::Uncompressed { .. } => None,
-                        };
-                        if let Some(fmt_name) = fmt_name {
-                            tracing::info!(
-                                "weight {name}: {fmt_name} has no GPU codec; dequantized to f32 at load (streams f32, not {:.2} bpw)",
-                                other.bits_per_weight()
-                            );
-                        }
-                        let v = t.to_f32();
-                        let ptr = v.as_ptr() as *const c_void;
-                        let len = v.len();
-                        (Some(v), ptr, len, len * 4, WeightFormat::F32)
-                    }
-                },
                 Tensor::Mat(m) => {
                     if let Some(p) = m.packed() {
                         let bytes = &p.map[p.off..];
                         let num_elements = m.rows * m.cols;
-                        match p.format {
-                            QuantFormat::GGUF_Q4_0 => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 32) * 18,
-                                WeightFormat::Q4_0,
-                            ),
-                            QuantFormat::GGUF_Q8_0 => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 32) * 34,
-                                WeightFormat::Q8_0,
-                            ),
-                            QuantFormat::BF16 => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                num_elements * 2,
-                                WeightFormat::BF16,
-                            ),
-                            QuantFormat::FP16 => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                num_elements * 2,
-                                WeightFormat::F16,
-                            ),
-                            QuantFormat::GGUF_IQ4_XS => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 256) * 136,
-                                WeightFormat::IQ4_XS,
-                            ),
-                            QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 256) * 82,
-                                WeightFormat::IQ2_M,
-                            ),
-                            QuantFormat::GGUF_Q4_K_M => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 256) * 144,
-                                WeightFormat::Q4_K,
-                            ),
-                            QuantFormat::GGUF_Q2_K => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 256) * 84,
-                                WeightFormat::Q2_K,
-                            ),
-                            QuantFormat::GGUF_IQ3_S => (
-                                None,
-                                bytes.as_ptr() as *const c_void,
-                                num_elements,
-                                (num_elements / 256) * 110,
-                                WeightFormat::IQ3_S,
-                            ),
-                            f if crate::graph::codec::codec(f).is_some() => {
-                                let c = crate::graph::codec::codec(f).expect("checked");
-                                (
-                                    None,
-                                    bytes.as_ptr() as *const c_void,
-                                    num_elements,
-                                    num_elements / c.block_elems as usize * c.block_bytes as usize,
-                                    WeightFormat::Gen(f),
-                                )
-                            }
-                            fmt => {
+                        match WeightFormat::of_quant(p.format) {
+                            WeightFormat::F32 => {
+                                let fmt = p.format;
                                 tracing::info!(
                                     "weight {name}: {fmt:?} has no GPU codec; dequantized to f32 at load (streams f32, not {:.2} bpw)",
                                     fmt.bits_per_weight()
@@ -2167,6 +1790,13 @@ impl Session {
                                 let len = v.len();
                                 (Some(v), ptr, len, len * 4, WeightFormat::F32)
                             }
+                            wfmt => (
+                                None,
+                                bytes.as_ptr() as *const c_void,
+                                num_elements,
+                                weight_format_bytes(wfmt, num_elements),
+                                wfmt,
+                            ),
                         }
                     } else {
                         let data = m.data();
@@ -2237,7 +1867,6 @@ impl Session {
             fed_ids: std::sync::atomic::AtomicBool::new(false),
             fed_tail: Mutex::new(None),
             gemm: None,
-            nvfp4_aux,
             variant_override: None,
             last_gpu_s: std::sync::atomic::AtomicU64::new(0),
             kv_f16: kv_f16_default(),
@@ -2438,8 +2067,6 @@ impl Session {
                         DType::Quant(QuantFormat::GGUF_Q4_K_M) => WeightFormat::Q4_K,
                         DType::Quant(QuantFormat::GGUF_Q2_K) => WeightFormat::Q2_K,
                         DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
-                        DType::Quant(QuantFormat::NVFP4_E2M1)
-                        | DType::Quant(QuantFormat::NVFP4) => WeightFormat::NvFp4,
                         DType::Quant(f) if crate::graph::codec::codec(f).is_some() => {
                             WeightFormat::Gen(f)
                         }
@@ -3214,7 +2841,7 @@ impl Session {
         // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
         // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
         // `GIBBS_CB_CHUNK=0` keeps a single buffer.
-        // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch Llama-1B
+        // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch 1B-parameter
         // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
         let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
             cb_chunking()
@@ -3302,36 +2929,7 @@ impl Session {
             | WeightFormat::Q4_K
             | WeightFormat::Q2_K
             | WeightFormat::IQ3_S
-            | WeightFormat::NvFp4
             | WeightFormat::Gen(_) => {
-                if format == WeightFormat::NvFp4 {
-                    let (scales_buf, global_scale) = self
-                        .nvfp4_aux
-                        .get(graph_val_name)
-                        .ok_or_else(|| format!("missing NVFP4 scales for '{graph_val_name}'"))?;
-                    enc.set_compute_pipeline_state(self.rt.pso("gemv_nvfp4")?);
-                    enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
-                    enc.set_buffer(1, Some(x.0), x.1 as u64);
-                    enc.set_buffer(2, Some(out.0), out.1 as u64);
-                    #[repr(C)]
-                    struct PackedGemvParams(u32, u32, u32, u32, u32);
-                    let epi_u32 = epi.as_u32();
-                    let p = PackedGemvParams(u32_of(rows)?, u32_of(cols)?, 1, 0, epi_u32);
-                    set_bytes(enc, 3, &p);
-                    enc.set_buffer(4, Some(out.0), out.1 as u64);
-                    if let Some(r) = res {
-                        enc.set_buffer(5, Some(r.0), r.1 as u64);
-                    } else {
-                        enc.set_buffer(5, Some(out.0), out.1 as u64);
-                    }
-                    enc.set_buffer(6, Some(scales_buf), 0);
-                    set_bytes(enc, 7, global_scale);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(16), 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                    return Ok(());
-                }
                 let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 enc.set_buffer(0, Some(w_loc.0), w_loc.1 as u64);
@@ -3541,7 +3139,7 @@ impl Session {
             Step::GemvPacked {
                 x,
                 w,
-                ref weight_name,
+                weight_name: _,
                 bias,
                 res,
                 epi,
@@ -3551,44 +3149,6 @@ impl Session {
                 format,
                 variant,
             } => {
-                if format == WeightFormat::NvFp4 {
-                    let (scales_buf, global_scale) = self
-                        .nvfp4_aux
-                        .get(weight_name)
-                        .ok_or_else(|| format!("missing NVFP4 scales for '{weight_name}'"))?;
-                    enc.set_compute_pipeline_state(rt.pso("gemv_nvfp4")?);
-                    bind(0, w);
-                    bind(1, x);
-                    bind(2, s.out);
-                    #[repr(C)]
-                    struct PackedGemvParams(u32, u32, u32, u32, u32);
-                    let epi_u32 = epi.as_u32();
-                    let p = PackedGemvParams(
-                        u32_of(rows)?,
-                        u32_of(cols)?,
-                        u32_of(m)?,
-                        bias.is_some() as u32,
-                        epi_u32,
-                    );
-                    set_bytes(enc, 3, &p);
-                    if let Some(b) = bias {
-                        bind(4, b);
-                    } else {
-                        bind(4, s.out);
-                    }
-                    if let Some(r) = res {
-                        bind(5, r);
-                    } else {
-                        bind(5, s.out);
-                    }
-                    enc.set_buffer(6, Some(scales_buf), 0);
-                    set_bytes(enc, 7, global_scale);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((rows as u64).div_ceil(16), m as u64, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
-                    return Ok(());
-                }
                 let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
                 bind(0, w);
@@ -5330,7 +4890,7 @@ fn batch_horizontal(
 
 /// The packed format a Linear over the `[n, k]` weight `w` runs in; `None`: the f32 kernels.
 fn linear_format(g: &Graph, w: ValueId) -> Option<WeightFormat> {
-    let &[n, k] = &g.value(w).shape[..] else {
+    let &[_, k] = &g.value(w).shape[..] else {
         return None;
     };
     let format = match g.value(w).dtype {
@@ -5343,26 +4903,14 @@ fn linear_format(g: &Graph, w: ValueId) -> Option<WeightFormat> {
         DType::Quant(QuantFormat::GGUF_Q4_K_M) => WeightFormat::Q4_K,
         DType::Quant(QuantFormat::GGUF_Q2_K) => WeightFormat::Q2_K,
         DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
-        DType::Quant(QuantFormat::NVFP4_E2M1) | DType::Quant(QuantFormat::NVFP4) => {
-            WeightFormat::NvFp4
-        }
         DType::Quant(f) if crate::graph::codec::codec(f).is_some() => WeightFormat::Gen(f),
         DType::BF16 => WeightFormat::BF16,
         DType::F16 => WeightFormat::F16,
         _ => return None,
     };
-    let fits = match format {
-        WeightFormat::Gen(f) => {
-            k % crate::graph::codec::codec(f).expect("checked").block_elems as usize == 0
-        }
-        WeightFormat::Q4_0 | WeightFormat::Q8_0 => k % 32 == 0,
-        WeightFormat::IQ4_XS
-        | WeightFormat::IQ2_M
-        | WeightFormat::Q4_K
-        | WeightFormat::Q2_K
-        | WeightFormat::IQ3_S => k % 256 == 0,
-        WeightFormat::NvFp4 => k % 16 == 0 && n != 0,
-        _ => true,
+    let fits = match format.codec_format() {
+        Some(f) => k % crate::graph::codec::codec(f).expect("checked").block_elems as usize == 0,
+        None => true,
     };
     fits.then_some(format)
 }
@@ -6258,17 +5806,14 @@ fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
     match fmt {
         WeightFormat::F32 | WeightFormat::U32 => n * 4,
         WeightFormat::BF16 | WeightFormat::F16 => n * 2,
-        WeightFormat::Q4_0 => n / 32 * 18,
-        WeightFormat::Q8_0 => n / 32 * 34,
-        WeightFormat::IQ4_XS => n / 256 * 136,
-        WeightFormat::IQ2_M => n / 256 * 82,
-        WeightFormat::Q4_K => n / 256 * 144,
-        WeightFormat::Q2_K => n / 256 * 84,
-        WeightFormat::IQ3_S => n / 256 * 110,
-        WeightFormat::NvFp4 => n / 2 + n / 16,
-        WeightFormat::Gen(f) => crate::graph::codec::codec(f).map_or(n * 4, |c| {
-            n / c.block_elems as usize * c.block_bytes as usize
-        }),
+        WeightFormat::Q4_0
+        | WeightFormat::Q8_0
+        | WeightFormat::IQ4_XS
+        | WeightFormat::IQ2_M
+        | WeightFormat::Q4_K
+        | WeightFormat::Q2_K
+        | WeightFormat::IQ3_S
+        | WeightFormat::Gen(_) => fmt.codec_format().expect("codec format").tensor_bytes(n),
     }
 }
 
@@ -7688,7 +7233,7 @@ mod tests {
     /// (which dequantizes through `dequantize_*_block`), with and without a bias epilogue.
     #[test]
     fn gemv_matches_cpu_for_every_packed_format() {
-        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        use crate::model::layers::gguf_block_codec;
         let formats = [
             QuantFormat::GGUF_Q4_1,
             QuantFormat::GGUF_Q5_0,
@@ -7765,12 +7310,7 @@ mod tests {
             let mut w = Weights::new();
             w.insert(
                 "w",
-                Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                    format: f,
-                    raw_data: raw.into(),
-                    in_features: k,
-                    out_features: n,
-                })),
+                Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(f, raw, n, k)),
             );
             w.insert(
                 "b",
@@ -7812,7 +7352,7 @@ mod tests {
 
     #[test]
     fn megakernel_mlp_matches_cpu_for_every_variant() {
-        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        use crate::model::layers::gguf_block_codec;
         for f in [
             QuantFormat::GGUF_Q4_0,
             QuantFormat::GGUF_Q4_K_M,
@@ -7848,12 +7388,7 @@ mod tests {
                     }
                     w.insert(
                         name,
-                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                            format: f,
-                            raw_data: raw.into(),
-                            in_features: k,
-                            out_features: n,
-                        })),
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(f, raw, n, k)),
                     );
                     g.weight(name, vec![n, k], DType::Quant(f))
                 };
@@ -7939,7 +7474,6 @@ mod tests {
     /// not a multiple of 8.
     #[test]
     fn tq2_0_planar_layout_matches_cpu() {
-        use crate::model::layers::QuantizedWeight;
         let f = QuantFormat::GGUF_TQ2_0;
         let mut seed = 0x2545F4914F6CDD1Du64;
         let mut next = move || {
@@ -7961,12 +7495,7 @@ mod tests {
             let mut w = Weights::new();
             w.insert(
                 "w",
-                Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                    format: f,
-                    raw_data: raw.into(),
-                    in_features: k,
-                    out_features: n,
-                })),
+                Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(f, raw, n, k)),
             );
             for m in [1usize, 20] {
                 let mut g = Graph::new();
@@ -8005,7 +7534,7 @@ mod tests {
     #[test]
     #[ignore = "bandwidth measurement"]
     fn generated_gemv_bandwidth() {
-        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        use crate::model::layers::gguf_block_codec;
         for f in [
             QuantFormat::GGUF_TQ2_0,
             QuantFormat::GGUF_Q4_0,
@@ -8030,12 +7559,7 @@ mod tests {
                 let mut w = Weights::new();
                 w.insert(
                     "w",
-                    Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                        format: f,
-                        raw_data: raw.into(),
-                        in_features: k,
-                        out_features: n,
-                    })),
+                    Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(f, raw, n, k)),
                 );
                 let s = Session::new(rt(), &w).unwrap();
                 let xs = Tensor::F32(vec![0.5; k]);
@@ -8157,14 +7681,16 @@ mod tests {
                 raw.push(q as u8);
             }
         }
-        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-            format: QuantFormat::GGUF_Q8_0,
-            raw_data: bytes::Bytes::from(raw),
-            in_features: k,
-            out_features: n,
-        };
         let mut w = Weights::new();
-        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert(
+            "w",
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                QuantFormat::GGUF_Q8_0,
+                raw,
+                n,
+                k,
+            )),
+        );
         w.insert("b", Tensor::F32(rand(n, 17)));
         let inputs = vec![Tensor::F32(rand(m * k, 42))];
         let (want, got) = both(&g, &w, inputs, None);
@@ -8203,14 +7729,16 @@ mod tests {
                 raw.push((low | (high << 4)) as u8);
             }
         }
-        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-            format: QuantFormat::GGUF_Q4_0,
-            raw_data: bytes::Bytes::from(raw),
-            in_features: k,
-            out_features: n,
-        };
         let mut w = Weights::new();
-        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert(
+            "w",
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                QuantFormat::GGUF_Q4_0,
+                raw,
+                n,
+                k,
+            )),
+        );
         w.insert("b", Tensor::F32(rand(n, 23)));
         let inputs = vec![Tensor::F32(rand(m * k, 99))];
         let (want, got) = both(&g, &w, inputs, None);
@@ -8250,14 +7778,16 @@ mod tests {
                 raw.push((low | (high << 4)) as u8);
             }
         }
-        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-            format: QuantFormat::GGUF_Q4_0,
-            raw_data: bytes::Bytes::from(raw),
-            in_features: k,
-            out_features: n,
-        };
         let mut w = Weights::new();
-        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert(
+            "w",
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                QuantFormat::GGUF_Q4_0,
+                raw,
+                n,
+                k,
+            )),
+        );
         w.insert("b", Tensor::F32(rand(n, 23)));
         let inputs = vec![Tensor::F32(rand(m * k, 99)), Tensor::F32(rand(m * n, 77))];
         let (want, got) = both(&g, &w, inputs, None);
@@ -8301,14 +7831,16 @@ mod tests {
                 raw.push((low | (high << 4)) as u8);
             }
         }
-        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-            format: QuantFormat::GGUF_IQ4_XS,
-            raw_data: bytes::Bytes::from(raw),
-            in_features: k,
-            out_features: n,
-        };
         let mut w = Weights::new();
-        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert(
+            "w",
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                QuantFormat::GGUF_IQ4_XS,
+                raw,
+                n,
+                k,
+            )),
+        );
         w.insert("b", Tensor::F32(rand(n, 19)));
         let inputs = vec![Tensor::F32(rand(m * k, 43))];
         let (want, got) = both(&g, &w, inputs, None);
@@ -8354,14 +7886,16 @@ mod tests {
                 raw.push(((j * 11 + b) % 256) as u8);
             }
         }
-        let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-            format: QuantFormat::GGUF_IQ2_M,
-            raw_data: bytes::Bytes::from(raw),
-            in_features: k,
-            out_features: n,
-        };
         let mut w = Weights::new();
-        w.insert("w", Tensor::Quantized(Arc::new(qw)));
+        w.insert(
+            "w",
+            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                QuantFormat::GGUF_IQ2_M,
+                raw,
+                n,
+                k,
+            )),
+        );
         w.insert("b", Tensor::F32(rand(n, 23)));
         let inputs = vec![Tensor::F32(rand(m * k, 45))];
         let (want, got) = both(&g, &w, inputs, None);
@@ -8485,119 +8019,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_graph_nvfp4_matches_cpu() {
-        if metal::Device::system_default().is_none() {
-            return;
-        }
-        let (rows, cols) = (16usize, 64usize);
-        let weights = rand(rows * cols, 123);
-        let tensor = crate::quant::nvfp4::quantize_nvfp4_tensor(&weights, rows, cols).unwrap();
-
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, cols], DType::F32);
-        let w = g.weight(
-            "w",
-            vec![rows, cols],
-            DType::Quant(crate::hardware::QuantFormat::NVFP4_E2M1),
-        );
-        let y = g.add("lin", Op::Linear, &[x, w], vec![1, rows], DType::F32);
-        g.output(y);
-
-        let mut weights_store = Weights::new();
-        weights_store.insert(
-            "w",
-            Tensor::Quantized(Arc::new(crate::model::layers::QuantizedWeight::Nvfp4(
-                tensor.clone(),
-            ))),
-        );
-
-        let input_data = rand(cols, 456);
-        let inputs = vec![Tensor::F32(input_data.clone())];
-
-        let mut expected = vec![0.0f32; rows];
-        crate::quant::nvfp4::gemv_nvfp4_f32(&tensor, &input_data, &mut expected);
-
-        let session = Session::new(rt(), &weights_store).expect("Metal Session creation");
-        let metal_res = session.run(&g, inputs).expect("Metal run");
-        let metal_y = metal_res[0].as_f32().unwrap();
-
-        assert_eq!(expected.len(), metal_y.len());
-        // NVFP4 block quantization re-quantizes per-block scale through e4m3 on Metal (vs f32 on CPU)
-        for (r, (&e, &m)) in expected.iter().zip(metal_y).enumerate() {
-            assert!(
-                (e - m).abs() < 0.15 || (e - m).abs() / e.abs().max(1.0) < 0.08,
-                "row {r}: expected {e} vs Metal {m}"
-            );
-        }
-    }
-
-    /// A checkpoint's E4M3 block scales and global scale reach the GPU as stored, and the GEMV on them
-    /// agrees with the CPU one.
-    #[test]
-    fn nvfp4_source_scales_upload_verbatim() {
-        use crate::quant::nvfp4::{Nvfp4Block, Nvfp4Tensor};
-        if metal::Device::system_default().is_none() {
-            return;
-        }
-        let (rows, cols, global) = (16usize, 64usize, 0.37f32);
-        let scales: Vec<u8> = (0..rows * cols / 16)
-            .map(|i| 0x30 + (i % 24) as u8)
-            .collect();
-        let blocks = scales
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| Nvfp4Block {
-                packed_nibbles: std::array::from_fn(|j| ((i * 8 + j) * 37 % 256) as u8),
-                scale: crate::model::f8_e4m3_to_f32(s) * global,
-            })
-            .collect();
-        let tensor = Nvfp4Tensor {
-            blocks,
-            rows,
-            cols,
-            source_scales: Some((scales.clone(), global)),
-        };
-
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, cols], DType::F32);
-        let w = g.weight(
-            "w",
-            vec![rows, cols],
-            DType::Quant(crate::hardware::QuantFormat::NVFP4_E2M1),
-        );
-        let y = g.add("lin", Op::Linear, &[x, w], vec![1, rows], DType::F32);
-        g.output(y);
-        let mut store = Weights::new();
-        store.insert(
-            "w",
-            Tensor::Quantized(Arc::new(crate::model::layers::QuantizedWeight::Nvfp4(
-                tensor.clone(),
-            ))),
-        );
-        let session = Session::new(rt(), &store).expect("Metal Session creation");
-
-        let (buf, up_global) = &session.nvfp4_aux["w"];
-        // SAFETY: a shared-storage buffer of `length()` bytes, not written while read.
-        let up = unsafe {
-            std::slice::from_raw_parts(buf.contents() as *const u8, buf.length() as usize)
-        };
-        assert_eq!(up, &scales[..]);
-        assert_eq!(*up_global, global);
-
-        let input = rand(cols, 456);
-        let mut expected = vec![0.0f32; rows];
-        crate::quant::nvfp4::gemv_nvfp4_f32(&tensor, &input, &mut expected);
-        let got = session
-            .run(&g, vec![Tensor::F32(input)])
-            .expect("Metal run");
-        for (r, (&e, &m)) in expected.iter().zip(got[0].as_f32().unwrap()).enumerate() {
-            assert!(
-                (e - m).abs() <= 1e-4 * e.abs().max(1.0),
-                "row {r}: CPU {e} vs Metal {m}"
-            );
-        }
-    }
 
 
     #[test]
@@ -8869,14 +8290,16 @@ mod tests {
                     raw.push(q as u8);
                 }
             }
-            let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-                format: QuantFormat::GGUF_Q8_0,
-                raw_data: bytes::Bytes::from(raw),
-                in_features: k,
-                out_features: n,
-            };
             let mut w = Weights::new();
-            w.insert("w", Tensor::Quantized(Arc::new(qw)));
+            w.insert(
+                "w",
+                Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                    QuantFormat::GGUF_Q8_0,
+                    raw,
+                    n,
+                    k,
+                )),
+            );
             let inputs = vec![Tensor::F32(rand(m * k, 999))];
             let (want, got) = both(&g, &w, inputs, None);
             assert!(rel_err(&want, &got) < 1e-3, "Q8_0 batched mismatch");
@@ -8908,13 +8331,15 @@ mod tests {
                             raw.push(0x88);
                         }
                     }
-                    let qw = crate::model::layers::QuantizedWeight::GgufQuantized {
-                        format: QuantFormat::GGUF_Q4_0,
-                        raw_data: bytes::Bytes::from(raw),
-                        in_features: k,
-                        out_features: n,
-                    };
-                    w.insert("w", Tensor::Quantized(Arc::new(qw)));
+                    w.insert(
+                        "w",
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
+                            QuantFormat::GGUF_Q4_0,
+                            raw,
+                            n,
+                            k,
+                        )),
+                    );
                     DType::Quant(QuantFormat::GGUF_Q4_0)
                 }
                 _ => unreachable!(),
@@ -10482,7 +9907,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
 
     #[test]
     fn gemv_packed_pair_small_rows_matches_cpu() {
-        use crate::model::layers::{gguf_block_codec, QuantizedWeight};
+        use crate::model::layers::gguf_block_codec;
         for f in [
             QuantFormat::GGUF_Q4_K_M,
             QuantFormat::GGUF_Q8_0,
@@ -10517,12 +9942,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                     }
                     w.insert(
                         name,
-                        Tensor::Quantized(std::sync::Arc::new(QuantizedWeight::GgufQuantized {
-                            format: f,
-                            raw_data: raw.into(),
-                            in_features: k,
-                            out_features: n,
-                        })),
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(f, raw, n, k)),
                     );
                     g.weight(name, vec![n, k], DType::Quant(f))
                 };

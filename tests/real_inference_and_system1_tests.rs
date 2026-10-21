@@ -549,7 +549,6 @@ fn gguf_file(tensors: &[(&str, [u64; 2], u32, Vec<u8>)]) -> Vec<u8> {
 /// bytes); GGML types it cannot decode are a load error naming the tensor, not misread bytes.
 #[test]
 fn test_gguf_block_formats_decode_like_ggml() {
-    use foundry_engine::model::layers::dispatch_fused_gemv;
     use foundry_engine::model::UniversalModelLoader;
     // (name, ggml type, block elems, block bytes, W at [0,17,31,32,100,255,256+77], W·x)
     let cases: [(&str, u32, usize, usize, [f32; 7], [f32; 2]); 8] = [
@@ -672,7 +671,8 @@ fn test_gguf_block_formats_decode_like_ggml() {
         let format = manifest.tensors[name].quant_format;
         let raw_data = &tensors.iter().find(|t| t.0 == name).unwrap().3;
         let mut y = [0.0f32; 2];
-        dispatch_fused_gemv(raw_data, format, 256, 2, &x, &mut y, None);
+        foundry_engine::model::weights::Mat::from_packed_bytes(format, raw_data.clone(), 2, 256)
+            .gemv_f32(&x, &mut y);
         for (got, want) in y.iter().zip(want_y) {
             assert!(
                 (got - want).abs() <= 1e-4 * want.abs().max(1.0),

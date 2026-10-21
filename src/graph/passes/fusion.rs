@@ -5,39 +5,45 @@ use crate::graph::{DType, Graph, Op, Tensor, Weights};
 use crate::model::weights::Mat;
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
-/// Supports F32, BF16, F16, GGUF-quantized, and Mat.
-pub fn concat_weight_tensors(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
-    if tensors.is_empty() {
-        return None;
-    }
-    let mats: Vec<&Mat> = tensors
-        .iter()
-        .filter_map(|t| match t {
-            Tensor::Mat(m) => Some(m),
-            _ => None,
-        })
-        .collect();
-    if mats.len() == tensors.len() {
-        return concat_mats(&mats);
-    }
-    // Normalize any Tensor::Mat: if packed GGUF, convert to Tensor::Quantized(ZeroCopySlice);
-    // if uncompressed safetensors, extract as Tensor::BF16.
-    let normalized: Vec<Tensor> = tensors
-        .iter()
-        .map(|&t| match t {
-            Tensor::Mat(m) => {
-                if m.packed().is_some() {
-                    m.to_graph_tensor()
-                } else {
-                    Tensor::BF16(m.data().to_vec())
-                }
+/// Supports F32, BF16, F16, and Mat.
+pub fn concat_weight_tensors(tensors: &[&Tensor]) -> Option<Tensor> {
+    match tensors.first()? {
+        Tensor::Mat(_) => {
+            let ms: Vec<&Mat> = tensors
+                .iter()
+                .map(|t| match t {
+                    Tensor::Mat(m) => Some(m),
+                    _ => None,
+                })
+                .collect::<Option<_>>()?;
+            concat_mats(&ms)
+        }
+        Tensor::F32(_) => {
+            let mut data = Vec::new();
+            for t in tensors {
+                let Tensor::F32(v) = t else { return None };
+                data.extend_from_slice(v);
             }
-            _ => t.clone(),
-        })
-        .collect();
-
-    let norm_refs: Vec<&Tensor> = normalized.iter().collect();
-    concat_weight_tensors_inner(&norm_refs, in_features)
+            Some(Tensor::F32(data))
+        }
+        Tensor::BF16(_) => {
+            let mut data = Vec::new();
+            for t in tensors {
+                let Tensor::BF16(v) = t else { return None };
+                data.extend_from_slice(v);
+            }
+            Some(Tensor::BF16(data))
+        }
+        Tensor::F16(_) => {
+            let mut data = Vec::new();
+            for t in tensors {
+                let Tensor::F16(v) = t else { return None };
+                data.extend_from_slice(v);
+            }
+            Some(Tensor::F16(data))
+        }
+        Tensor::U32(_) => None,
+    }
 }
 
 /// Row-concatenates loader matrices of one storage (all bf16, or all one packed format, whose
@@ -66,166 +72,9 @@ fn concat_mats(ms: &[&Mat]) -> Option<Tensor> {
                 .get(p.off..p.off + m.rows * format.tensor_bytes(cols))?,
         );
     }
-    let p = crate::model::weights::Packed {
-        map: std::sync::Arc::new(crate::model::loaders::gguf::GgufData::Buf(bytes)),
-        off: 0,
-        format,
-        shape: vec![rows, cols],
-    };
-    Some(Tensor::Mat(Mat::from_packed(p, rows, cols)))
+    Some(Tensor::Mat(Mat::from_packed_bytes(format, bytes, rows, cols)))
 }
 
-fn concat_weight_tensors_inner(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
-    if tensors.is_empty() {
-        return None;
-    }
-    match tensors[0] {
-        Tensor::F32(_) => {
-            let mut total_len = 0;
-            for t in tensors {
-                if let Tensor::F32(v) = t {
-                    total_len += v.len();
-                } else {
-                    return None;
-                }
-            }
-            let mut data = Vec::with_capacity(total_len);
-            for t in tensors {
-                if let Tensor::F32(v) = t {
-                    data.extend_from_slice(v);
-                }
-            }
-            Some(Tensor::F32(data))
-        }
-        Tensor::BF16(_) => {
-            let mut total_len = 0;
-            for t in tensors {
-                if let Tensor::BF16(v) = t {
-                    total_len += v.len();
-                } else {
-                    return None;
-                }
-            }
-            let mut data = Vec::with_capacity(total_len);
-            for t in tensors {
-                if let Tensor::BF16(v) = t {
-                    data.extend_from_slice(v);
-                }
-            }
-            Some(Tensor::BF16(data))
-        }
-        Tensor::F16(_) => {
-            let mut total_len = 0;
-            for t in tensors {
-                if let Tensor::F16(v) = t {
-                    total_len += v.len();
-                } else {
-                    return None;
-                }
-            }
-            let mut data = Vec::with_capacity(total_len);
-            for t in tensors {
-                if let Tensor::F16(v) = t {
-                    data.extend_from_slice(v);
-                }
-            }
-            Some(Tensor::F16(data))
-        }
-        Tensor::Quantized(first_q) => match first_q.as_ref() {
-            crate::model::layers::QuantizedWeight::GgufQuantized { format, .. } => {
-                let mut total_bytes = 0;
-                let mut total_out = 0;
-                for t in tensors {
-                    if let Tensor::Quantized(q) = t {
-                        if let crate::model::layers::QuantizedWeight::GgufQuantized {
-                            format: fmt,
-                            raw_data,
-                            in_features: inf,
-                            out_features: outf,
-                        } = q.as_ref()
-                        {
-                            if fmt != format || *inf != in_features {
-                                return None;
-                            }
-                            total_bytes += raw_data.len();
-                            total_out += outf;
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-                let mut raw = Vec::with_capacity(total_bytes);
-                for t in tensors {
-                    if let Tensor::Quantized(q) = t {
-                        if let crate::model::layers::QuantizedWeight::GgufQuantized {
-                            raw_data,
-                            ..
-                        } = q.as_ref()
-                        {
-                            raw.extend_from_slice(raw_data);
-                        }
-                    }
-                }
-                Some(Tensor::Quantized(std::sync::Arc::new(
-                    crate::model::layers::QuantizedWeight::GgufQuantized {
-                        format: *format,
-                        raw_data: bytes::Bytes::from(raw),
-                        in_features,
-                        out_features: total_out,
-                    },
-                )))
-            }
-            crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. } => {
-                let mut total_bytes = 0;
-                let mut total_out = 0;
-                for t in tensors {
-                    if let Tensor::Quantized(q) = t {
-                        if let crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                            format: fmt,
-                            data,
-                            in_features: inf,
-                            out_features: outf,
-                        } = q.as_ref()
-                        {
-                            if fmt != format || *inf != in_features {
-                                return None;
-                            }
-                            total_bytes += data.len();
-                            total_out += outf;
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-                let mut raw = Vec::with_capacity(total_bytes);
-                for t in tensors {
-                    if let Tensor::Quantized(q) = t {
-                        if let crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                            data, ..
-                        } = q.as_ref()
-                        {
-                            raw.extend_from_slice(data);
-                        }
-                    }
-                }
-                Some(Tensor::Quantized(std::sync::Arc::new(
-                    crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                        format: *format,
-                        data: bytes::Bytes::from(raw),
-                        in_features,
-                        out_features: total_out,
-                    },
-                )))
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
 
 /// Name of a fused weight: `<node>_fused_<kind>_w`, or `<weight>_fused_<kind>_w` when another
 /// fusion already took that (nodes need not have unique names; weights do).
@@ -246,11 +95,6 @@ pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
         (DType::F16, Tensor::F16(_)) => true,
         (DType::BF16, Tensor::Mat(m)) => m.packed().is_none(),
         (DType::Quant(fmt), Tensor::Mat(m)) => m.packed().is_some_and(|p| p.format == fmt),
-        (DType::Quant(fmt), Tensor::Quantized(q)) => match q.as_ref() {
-            crate::model::layers::QuantizedWeight::GgufQuantized { format, .. } => *format == fmt,
-            crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. } => *format == fmt,
-            _ => false,
-        },
         _ => false,
     }
 }
@@ -330,13 +174,12 @@ pub(crate) fn rewrite_qkv(
             let q_t = w_store.get(&g.value(q_w_id).name)?;
             let k_t = w_store.get(&g.value(k_w_id).name)?;
             let v_t = w_store.get(&g.value(v_w_id).name)?;
-            let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t], in_features)?;
+            let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t])?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
             // Loader Mats stay bound: a reshaped instance of the same program (other row
             // counts, unfused) still reads them, and mapped ones cost no memory.
-            // ponytail: owned re-encoded Mats are held twice (fused + originals) until Phase 11.
             let old_names = match q_t {
                 Tensor::Mat(_) => Vec::new(),
                 _ => vec![
@@ -490,21 +333,17 @@ pub(crate) fn rewrite_gate_up(
         if let Some(ref w_store) = weights {
             let gate_t = w_store.get(&g.value(gate_w_id).name)?;
             let up_t = w_store.get(&g.value(up_w_id).name)?;
-            // Model-loader Mats stay unfused: the Metal planner folds the GLU into the up GEMV's
-            // epilogue (`Epi::UpGeGlu`/`UpSwiGlu`) when gate and up are separate, while the fused
-            // form plans as one GEMV plus a standalone GLU step: same dispatch count, one more
-            // activation round trip.
-            if matches!(gate_t, Tensor::Mat(_)) || matches!(up_t, Tensor::Mat(_)) {
-                return None;
-            }
-            let fused_tensor = concat_weight_tensors(&[gate_t, up_t], in_features)?;
+            let fused_tensor = concat_weight_tensors(&[gate_t, up_t])?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
-            let old_names = vec![
-                g.value(gate_w_id).name.clone(),
-                g.value(up_w_id).name.clone(),
-            ];
+            let old_names = match gate_t {
+                Tensor::Mat(_) => Vec::new(),
+                _ => vec![
+                    g.value(gate_w_id).name.clone(),
+                    g.value(up_w_id).name.clone(),
+                ],
+            };
             weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
         }
 

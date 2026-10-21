@@ -175,82 +175,23 @@ pub fn run(
                             out.extend_from_slice(&table[id * d..(id + 1) * d]);
                         }
                     }
-                    Tensor::Quantized(q) => {
-                        let rows = q.out_features();
-                        match q.as_ref() {
-                            crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                                data,
-                                format,
-                                in_features,
-                                ..
+                    Tensor::Mat(m) => {
+                        if m.cols != d {
+                            return Err(format!(
+                                "node '{name}': width {d} != table cols {}",
+                                m.cols
+                            ));
+                        }
+                        out.resize(ids.len() * d, 0.0);
+                        for (r, &id) in ids.iter().enumerate() {
+                            let id = id as usize;
+                            if id >= m.rows {
+                                return Err(format!(
+                                    "node '{name}': row {r} id {id} out of range for table of {} rows",
+                                    m.rows
+                                ));
                             }
-                            | crate::model::layers::QuantizedWeight::GgufQuantized {
-                                raw_data: data,
-                                format,
-                                in_features,
-                                ..
-                            } => {
-                                if let Some((block_elems, block_bytes, _)) =
-                                    crate::model::layers::gguf_block_codec(*format)
-                                {
-                                    if *in_features != d || d % block_elems != 0 {
-                                        return Err(format!("node '{name}': width {d} not compatible with {format:?} blocks"));
-                                    }
-                                    let row_bytes = (d / block_elems) * block_bytes;
-                                    for (r, &id) in ids.iter().enumerate() {
-                                        let id = id as usize;
-                                        if id >= rows {
-                                            return Err(format!(
-                                                "node '{name}': row {r} id {id} out of range for table of {rows} rows"
-                                            ));
-                                        }
-                                        let slice = &data[id * row_bytes..(id + 1) * row_bytes];
-                                        let row_f32 = crate::model::layers::dequantize_gguf_blocks(
-                                            *format, slice,
-                                        )
-                                        .ok_or_else(|| {
-                                            format!("node '{name}': failed to dequantize row {id}")
-                                        })?;
-                                        out.extend_from_slice(&row_f32);
-                                    }
-                                } else {
-                                    let full = q.to_f32();
-                                    for (r, &id) in ids.iter().enumerate() {
-                                        let id = id as usize;
-                                        if id >= rows {
-                                            return Err(format!(
-                                                "node '{name}': row {r} id {id} out of range for table of {rows} rows"
-                                            ));
-                                        }
-                                        out.extend_from_slice(&full[id * d..(id + 1) * d]);
-                                    }
-                                }
-                            }
-                            crate::model::layers::QuantizedWeight::Uncompressed {
-                                data, ..
-                            } => {
-                                for (r, &id) in ids.iter().enumerate() {
-                                    let id = id as usize;
-                                    if id >= rows {
-                                        return Err(format!(
-                                            "node '{name}': row {r} id {id} out of range for table of {rows} rows"
-                                        ));
-                                    }
-                                    out.extend_from_slice(&data[id * d..(id + 1) * d]);
-                                }
-                            }
-                            _ => {
-                                let full = q.to_f32();
-                                for (r, &id) in ids.iter().enumerate() {
-                                    let id = id as usize;
-                                    if id >= rows {
-                                        return Err(format!(
-                                            "node '{name}': row {r} id {id} out of range for table of {rows} rows"
-                                        ));
-                                    }
-                                    out.extend_from_slice(&full[id * d..(id + 1) * d]);
-                                }
-                            }
+                            m.decode_row_f32(id, &mut out[r * d..(r + 1) * d]);
                         }
                     }
                     Tensor::BF16(v) => {
@@ -2416,26 +2357,6 @@ fn bank_row(bank: &Tensor, row: usize, out: &mut [f32]) -> Result<(), String> {
                 .for_each(|(o, &b)| *o = crate::model::f16_to_f32(b));
         }
         Tensor::Mat(m) if row < m.rows && m.cols == cols => m.decode_row_f32(row, out),
-        Tensor::Quantized(q) => match q.as_ref() {
-            crate::model::layers::QuantizedWeight::GgufQuantized {
-                raw_data: data,
-                format,
-                ..
-            }
-            | crate::model::layers::QuantizedWeight::ZeroCopySlice { data, format, .. } => {
-                let (be, bb, _) = crate::model::layers::gguf_block_codec(*format)
-                    .ok_or_else(|| format!("no dequantizer for {format:?}"))?;
-                let len = cols / be * bb;
-                let raw = data.get(row * len..(row + 1) * len).ok_or_else(short)?;
-                let v = crate::model::layers::dequantize_gguf_blocks(*format, raw)
-                    .ok_or_else(|| format!("no dequantizer for {format:?}"))?;
-                out.copy_from_slice(&v);
-            }
-            crate::model::layers::QuantizedWeight::Uncompressed { data, .. } => {
-                out.copy_from_slice(data.get(row * cols..(row + 1) * cols).ok_or_else(short)?)
-            }
-            _ => return Err("expert banks must be f32/f16/bf16 or GGUF blocks".into()),
-        },
         _ => return Err("expert banks must be f32/f16/bf16 or GGUF blocks".into()),
     }
     Ok(())
@@ -2501,75 +2422,6 @@ fn dispatch_linear(
                 ));
             }
             Ok(nn::linear(x, rows, w, bias, in_f, out_f))
-        }
-        Tensor::Quantized(q) => {
-            if q.in_features() != in_f || q.out_features() != out_f {
-                return Err(format!(
-                    "node '{name}': quantized weight [{}, {}] != declared [{out_f}, {in_f}]",
-                    q.out_features(),
-                    q.in_features()
-                ));
-            }
-            match q.as_ref() {
-                crate::model::layers::QuantizedWeight::Uncompressed { data, .. } => {
-                    Ok(nn::linear(x, rows, data, bias, in_f, out_f))
-                }
-                crate::model::layers::QuantizedWeight::ZeroCopySlice {
-                    data,
-                    format,
-                    in_features,
-                    out_features,
-                } => {
-                    let mut out = vec![0.0f32; rows * out_f];
-                    for (r, x_row) in x.chunks(in_f).enumerate() {
-                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
-                        crate::model::layers::dispatch_fused_gemv(
-                            data,
-                            *format,
-                            *in_features,
-                            *out_features,
-                            x_row,
-                            out_row,
-                            bias,
-                        );
-                    }
-                    Ok(out)
-                }
-                crate::model::layers::QuantizedWeight::GgufQuantized {
-                    raw_data,
-                    format,
-                    in_features,
-                    out_features,
-                } => {
-                    let mut out = vec![0.0f32; rows * out_f];
-                    for (r, x_row) in x.chunks(in_f).enumerate() {
-                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
-                        crate::model::layers::dispatch_fused_gemv(
-                            raw_data,
-                            *format,
-                            *in_features,
-                            *out_features,
-                            x_row,
-                            out_row,
-                            bias,
-                        );
-                    }
-                    Ok(out)
-                }
-                crate::model::layers::QuantizedWeight::Nvfp4(tensor) => {
-                    let mut out = vec![0.0f32; rows * out_f];
-                    for (r, x_row) in x.chunks(in_f).enumerate() {
-                        let out_row = &mut out[r * out_f..(r + 1) * out_f];
-                        crate::quant::nvfp4::gemv_nvfp4_f32(tensor, x_row, out_row);
-                        if let Some(b) = bias {
-                            for (o, &bi) in out_row.iter_mut().zip(b) {
-                                *o += bi;
-                            }
-                        }
-                    }
-                    Ok(out)
-                }
-            }
         }
         other => {
             let w_f32 = other.to_f32();

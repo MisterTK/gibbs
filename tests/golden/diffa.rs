@@ -1233,13 +1233,139 @@ fn tiny_sd() {
     });
 }
 
+fn ldm_unet_specs(
+    mc: usize,
+    mult: &[usize],
+    nres: usize,
+    attn: &[bool],
+    ctx: usize,
+    ff_mult: usize,
+) -> Specs {
+    let emb = 4 * mc;
+    let mut s = Specs::new();
+    let res = |s: &mut Specs, p: &str, i: usize, o: usize| {
+        nrm(s, &format!("{p}.in_layers.0"), i);
+        conv(s, &format!("{p}.in_layers.2"), i, o, 3);
+        lin(s, &format!("{p}.emb_layers.1"), emb, o, true);
+        nrm(s, &format!("{p}.out_layers.0"), o);
+        conv(s, &format!("{p}.out_layers.3"), o, o, 3);
+        if i != o {
+            conv(s, &format!("{p}.skip_connection"), i, o, 1);
+        }
+    };
+    let trans = |s: &mut Specs, p: &str, c: usize| {
+        trans(s, p, c, ctx);
+        let b = format!("{p}.transformer_blocks.0.ff.net");
+        s.retain(|(n, _)| !n.starts_with(&b));
+        lin(s, &format!("{b}.0.proj"), c, 2 * ff_mult * c, true);
+        lin(s, &format!("{b}.2"), ff_mult * c, c, true);
+    };
+    conv(&mut s, "input_blocks.0.0", 4, mc, 3);
+    let (mut ib, mut ch, mut skips) = (1, mc, vec![mc]);
+    for (l, &m) in mult.iter().enumerate() {
+        for _ in 0..nres {
+            res(&mut s, &format!("input_blocks.{ib}.0"), ch, mc * m);
+            ch = mc * m;
+            if attn[l] {
+                trans(&mut s, &format!("input_blocks.{ib}.1"), ch);
+            }
+            skips.push(ch);
+            ib += 1;
+        }
+        if l + 1 < mult.len() {
+            conv(&mut s, &format!("input_blocks.{ib}.0.op"), ch, ch, 3);
+            skips.push(ch);
+            ib += 1;
+        }
+    }
+    res(&mut s, "middle_block.0", ch, ch);
+    trans(&mut s, "middle_block.1", ch);
+    res(&mut s, "middle_block.2", ch, ch);
+    let mut ob = 0;
+    for (l, &m) in mult.iter().enumerate().rev() {
+        for i in 0..=nres {
+            let skip = skips.pop().unwrap();
+            res(&mut s, &format!("output_blocks.{ob}.0"), ch + skip, mc * m);
+            ch = mc * m;
+            let mut j = 1;
+            if attn[l] {
+                trans(&mut s, &format!("output_blocks.{ob}.1"), ch);
+                j = 2;
+            }
+            if l > 0 && i == nres {
+                conv(&mut s, &format!("output_blocks.{ob}.{j}.conv"), ch, ch, 3);
+            }
+            ob += 1;
+        }
+    }
+    nrm(&mut s, "out.0", mc);
+    conv(&mut s, "out.2", mc, 4, 3);
+    lin(&mut s, "time_embed.0", mc, emb, true);
+    lin(&mut s, "time_embed.2", emb, emb, true);
+    s
+}
+
+fn ldm_vae_specs(ch: usize, mult: &[usize]) -> Specs {
+    let p = |n: &str| format!("first_stage_model.{n}");
+    let mut s = Specs::new();
+    let mut resnet = |s: &mut Specs, n: &str, i: usize, o: usize| {
+        for (k, c) in [("norm1", i), ("norm2", o)] {
+            nrm(s, &p(&format!("{n}.{k}")), c);
+        }
+        conv(s, &p(&format!("{n}.conv1")), i, o, 3);
+        conv(s, &p(&format!("{n}.conv2")), o, o, 3);
+        if i != o {
+            conv(s, &p(&format!("{n}.nin_shortcut")), i, o, 1);
+        }
+    };
+    let top = ch * mult[mult.len() - 1];
+    let mid = |s: &mut Specs, resnet: &mut dyn FnMut(&mut Specs, &str, usize, usize), side: &str| {
+        resnet(s, &format!("{side}.mid.block_1"), top, top);
+        resnet(s, &format!("{side}.mid.block_2"), top, top);
+        nrm(s, &p(&format!("{side}.mid.attn_1.norm")), top);
+        for n in ["q", "k", "v", "proj_out"] {
+            conv(s, &p(&format!("{side}.mid.attn_1.{n}")), top, top, 1);
+        }
+    };
+    conv(&mut s, &p("encoder.conv_in"), 3, ch, 3);
+    let mut c = ch;
+    for (l, &m) in mult.iter().enumerate() {
+        for b in 0..2 {
+            resnet(&mut s, &format!("encoder.down.{l}.block.{b}"), c, ch * m);
+            c = ch * m;
+        }
+        if l + 1 < mult.len() {
+            conv(&mut s, &p(&format!("encoder.down.{l}.downsample.conv")), c, c, 3);
+        }
+    }
+    mid(&mut s, &mut resnet, "encoder");
+    nrm(&mut s, &p("encoder.norm_out"), top);
+    conv(&mut s, &p("encoder.conv_out"), top, 8, 3);
+    conv(&mut s, &p("quant_conv"), 8, 8, 1);
+    conv(&mut s, &p("post_quant_conv"), 4, 4, 1);
+    conv(&mut s, &p("decoder.conv_in"), 4, top, 3);
+    mid(&mut s, &mut resnet, "decoder");
+    let mut c = top;
+    for (l, &m) in mult.iter().enumerate().rev() {
+        for b in 0..3 {
+            resnet(&mut s, &format!("decoder.up.{l}.block.{b}"), c, ch * m);
+            c = ch * m;
+        }
+        if l > 0 {
+            conv(&mut s, &p(&format!("decoder.up.{l}.upsample.conv")), c, c, 3);
+        }
+    }
+    nrm(&mut s, &p("decoder.norm_out"), c);
+    conv(&mut s, &p("decoder.conv_out"), c, 3, 3);
+    s
+}
+
 /// An SD 1.x LDM single-file checkpoint: the CLIP tower of `write_clip` under
 /// `cond_stage_model.transformer.`, a 2-level LDM UNet (layers_per_block 2, as every LDM file)
 /// under `model.diffusion_model.`, a 4-level LDM VAE under `first_stage_model.`; the reference
 /// repo's configs and tokenizer dir sit in the hub cache.
 #[test]
 fn sd_single_file() {
-    use gibbs_engine::model::diff_fixtures::{ldm_unet_specs, ldm_vae_specs};
     use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
     let case = "diffa_sd_single_file";
     let dir = fixture_dir(case);

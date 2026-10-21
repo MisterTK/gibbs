@@ -2,7 +2,7 @@
 //!
 //! Runs in its own process because it arms the global CPU tripwire.
 
-use gibbs_engine::graph::avenues::{explore_node, family_gate, family_status, required_ops, Family, Status};
+use gibbs_engine::arch::{Pipeline, Signals};
 use gibbs_engine::hardware::{available_devices, cpu_compute, Device, PlacementMode};
 use std::sync::Once;
 
@@ -21,6 +21,7 @@ fn classifier_on_gpu(name: &str, (cfg, ts): (serde_json::Value, synth::Ts)) {
     let c = SequenceClassifier::load(&hub, &format!("t/{name}"), Device::Metal)
         .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(c.device(), Device::Metal, "{name}");
+    let before = cpu_compute::entered();
     for pair in [None, Some(synth::PAIR)] {
         for _ in 0..2 {
             let (scores, _) = c.classify(synth::TEXT, pair).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -29,36 +30,116 @@ fn classifier_on_gpu(name: &str, (cfg, ts): (serde_json::Value, synth::Ts)) {
             assert!((sum - 1.0).abs() < 1e-4, "{name}: softmax scores sum to {sum}");
         }
     }
+    assert_eq!(cpu_compute::entered(), before, "{name}: entered CPU compute");
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Ran,
+    Exempt(&'static str),
+}
+
+fn find_fixture(rel: &str) -> std::path::PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let local = root.join("target/golden-fixtures").join(rel);
+    assert!(
+        local.exists(),
+        "golden fixture `{rel}` absent at {}: run `cargo test --release --test golden` first",
+        local.display()
+    );
+    local
 }
 
 /// A `tests/golden` fixture checkpoint (`target/golden-fixtures/<fixture>`, written by the golden
 /// tests) through the spec runtime on Metal: prepare `ids` with `media`, prefill, two decode
 /// steps; the tripwire is armed, so any host compute panics.
-fn spec_fixture_on_gpu(name: &str, fixture: &str, ids: &[u32], media: &[gibbs_engine::model::native::MediaInput]) {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/golden-fixtures").join(fixture);
-    if !dir.join("config.json").exists() {
-        println!("SKIP {name}: {} absent (run `cargo test --test golden gemma` first)", dir.display());
-        return;
-    }
+fn spec_fixture_on_gpu(
+    name: &str,
+    fixture: &str,
+    family: Option<&str>,
+    ids: &[u32],
+    media: &[gibbs_engine::model::native::MediaInput],
+) -> Outcome {
+    let dir = find_fixture(fixture);
     let a = gibbs_engine::model::hub::ModelArtifacts {
         model_id: format!("golden/{fixture}"),
         local_dir: Some(dir.clone()),
         config_path: Some(dir.join("config.json")),
-        tokenizer_path: Some(dir.join("tokenizer.json")),
+        tokenizer_path: Some(dir.join("tokenizer.json")).filter(|p| p.exists()),
         weights_path: Some(dir.join("model.safetensors")),
         is_cached: true,
         ..Default::default()
     };
     let reg = gibbs_engine::arch::registry().unwrap();
-    let lm = gibbs_engine::runtime::lm::load(&a, reg, None, PlacementMode::Pin(Device::Metal))
+    let lm = gibbs_engine::runtime::lm::load(&a, reg, family, PlacementMode::Pin(Device::Metal))
         .unwrap_or_else(|e| panic!("{name}: {e}"));
     assert_eq!(lm.device(), Device::Metal, "{name}");
     let (ids, mut st) = lm.prepare(ids.to_vec(), media).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let before = cpu_compute::entered();
     let mut l = lm.forward(&ids, 0, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
     for q in 0..2 {
         assert!(l.iter().all(|v| v.is_finite()), "{name}: non-finite logits");
         l = lm.forward(&[1], ids.len() + q, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
+    assert_eq!(cpu_compute::entered(), before, "{name}: entered CPU compute");
+    Outcome::Ran
+}
+
+/// Runs component `net_name` of `family` on golden fixture `fixture` pinned to Metal (`Net::open`
+/// fails if any node in the graph cannot lower to Metal).
+fn net_on_gpu(
+    family: &str,
+    fixture: &str,
+    net_name: &str,
+    vars: &[(&str, f64)],
+    step: &[(&str, f64)],
+) -> Outcome {
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::{DType, Tensor};
+    let dir = find_fixture(fixture);
+    let net = gibbs_engine::runtime::diffusion::Net::open(
+        &dir,
+        family,
+        net_name,
+        PlacementMode::Pin(Device::Metal),
+    )
+    .unwrap_or_else(|e| panic!("{family}/{net_name}: {e}"));
+    let mut val_vars: Vec<(&str, Val)> = vars.iter().map(|&(k, v)| (k, Val::Num(v))).collect();
+    val_vars.push(("head", Val::Str("hidden".into())));
+    let inst = net
+        .instance(&val_vars)
+        .unwrap_or_else(|e| panic!("{family}/{net_name} instance: {e}"));
+    let mut r = Lcg(13);
+    let mut given: Vec<(&str, Tensor)> = Vec::new();
+    for p in &inst.inputs {
+        if p.gen.is_some() {
+            continue;
+        }
+        let len: usize = p.shape.iter().product();
+        let t = match p.dtype {
+            DType::U32 if p.name == "positions" => Tensor::U32((0..len as u32).collect()),
+            DType::U32 if p.name == "pos0" => Tensor::U32(vec![0; len]),
+            DType::U32 => Tensor::U32(vec![1; len]),
+            _ => Tensor::F32(r.vec(len, 0.1)),
+        };
+        given.push((p.name.as_str(), t));
+    }
+    let _ = step;
+    let step = [("t", 500.0), ("timestep", 500.0), ("sigma", 0.5), ("guidance", 3.5)];
+    let before = cpu_compute::entered();
+    let out = net
+        .run(&val_vars, &given, &step)
+        .unwrap_or_else(|e| panic!("{family}/{net_name} run: {e}"));
+    assert_eq!(cpu_compute::entered(), before, "{family}/{net_name}: entered CPU compute");
+    for (oname, t) in out {
+        if let Ok(s) = t.as_f32() {
+            assert!(
+                s.iter().all(|v| v.is_finite()),
+                "{family}/{net_name} {oname}: non-finite output"
+            );
+        }
+    }
+    Outcome::Ran
 }
 
 /// 16 kHz mono 16-bit WAV: 0.5 s of a 440 Hz tone.
@@ -399,24 +480,528 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn gpu_fixture(f: Family) {
-    match f {
-        Family::GraphLm => {
-            spec_fixture_on_gpu("llama spec", "lm_graphlm_llama", &[5, 17, 42, 99], &[]);
+type Specs = Vec<(String, Vec<usize>)>;
+
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+    fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| self.next() * scale).collect()
+    }
+}
+
+fn lin(s: &mut Specs, p: &str, i: usize, o: usize, bias: bool) {
+    s.push((format!("{p}.weight"), vec![o, i]));
+    if bias {
+        s.push((format!("{p}.bias"), vec![o]));
+    }
+}
+fn conv(s: &mut Specs, p: &str, i: usize, o: usize, k: usize) {
+    s.push((format!("{p}.weight"), vec![o, i, k, k]));
+    s.push((format!("{p}.bias"), vec![o]));
+}
+fn nrm(s: &mut Specs, p: &str, c: usize) {
+    s.push((format!("{p}.weight"), vec![c]));
+    s.push((format!("{p}.bias"), vec![c]));
+}
+
+fn write_f32_safetensors(
+    path: &std::path::Path,
+    tensors: &[(String, Vec<usize>, Vec<f32>)],
+) -> Result<(), String> {
+    let (mut header, mut data) = (serde_json::Map::new(), Vec::<u8>::new());
+    for (name, shape, v) in tensors {
+        let start = data.len();
+        data.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+        header.insert(
+            name.clone(),
+            serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, data.len()]}),
+        );
+    }
+    let mut h = serde_json::to_vec(&serde_json::Value::Object(header)).map_err(|e| e.to_string())?;
+    h.resize(h.len().next_multiple_of(8), b' ');
+    let mut out = (h.len() as u64).to_le_bytes().to_vec();
+    out.extend(h);
+    out.extend(data);
+    std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn values(specs: &Specs, seed: u64) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+    let mut r = Lcg(seed);
+    specs
+        .iter()
+        .map(|(n, s)| {
+            let len: usize = s.iter().product();
+            let fan: usize = s[1..].iter().product::<usize>().max(1);
+            let v = match s.len() {
+                1 if n.ends_with("weight") => (0..len).map(|_| 1.0 + 0.1 * r.next()).collect(),
+                1 => (0..len).map(|_| 0.1 * r.next()).collect(),
+                _ => (0..len).map(|_| r.next() / (fan as f32).sqrt()).collect(),
+            };
+            (n.clone(), s.clone(), v)
+        })
+        .collect()
+}
+
+fn tiny_vae_on_gpu() -> Result<(), String> {
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    let latent = 4;
+    let mut s = Specs::new();
+    let conv = |s: &mut Specs, p: &str, i: usize, o: usize, k: usize| {
+        s.push((format!("first_stage_model.{p}.weight"), vec![o, i, k, k]));
+        s.push((format!("first_stage_model.{p}.bias"), vec![o]));
+    };
+    let norm = |s: &mut Specs, p: &str, c: usize| {
+        s.push((format!("first_stage_model.{p}.weight"), vec![c]));
+        s.push((format!("first_stage_model.{p}.bias"), vec![c]));
+    };
+    fn resnet(s: &mut Specs, p: &str, i: usize, o: usize) {
+        for (n, c) in [("norm1", i), ("norm2", o)] {
+            s.push((format!("first_stage_model.{p}.{n}.weight"), vec![c]));
+            s.push((format!("first_stage_model.{p}.{n}.bias"), vec![c]));
         }
-        Family::Gemma4 => {
-            spec_fixture_on_gpu("Gemma4", "gemma_gemma4_ple", &[2, 10, 11, 12], &[]);
-            // Sparse layers: router, TopK, GatherCols and the banked expert GEMVs, all on Metal.
-            spec_fixture_on_gpu("Gemma4 MoE", "gemma_gemma4_moe", &[2, 10, 11, 12], &[]);
+        for (n, ci, co, k) in [("conv1", i, o, 3), ("conv2", o, o, 3)] {
+            s.push((format!("first_stage_model.{p}.{n}.weight"), vec![co, ci, k, k]));
+            s.push((format!("first_stage_model.{p}.{n}.bias"), vec![co]));
         }
-        Family::Hybrid => {
-            // Hybrid decoder + MTP drafter, routed experts, image prompt (vision tower), all via
-            // the `qwen3_5` spec (`.ninfer` artifacts load the same spec).
+        if i != o {
+            s.push((format!("first_stage_model.{p}.nin_shortcut.weight"), vec![o, i, 1, 1]));
+            s.push((format!("first_stage_model.{p}.nin_shortcut.bias"), vec![o]));
+        }
+    }
+    let mid = |s: &mut Specs, p: &str, c: usize| {
+        resnet(s, &format!("{p}.mid.block_1"), c, c);
+        resnet(s, &format!("{p}.mid.block_2"), c, c);
+        s.push((format!("first_stage_model.{p}.mid.attn_1.norm.weight"), vec![c]));
+        s.push((format!("first_stage_model.{p}.mid.attn_1.norm.bias"), vec![c]));
+        for n in ["q", "k", "v", "proj_out"] {
+            s.push((format!("first_stage_model.{p}.mid.attn_1.{n}.weight"), vec![c, c, 1, 1]));
+            s.push((format!("first_stage_model.{p}.mid.attn_1.{n}.bias"), vec![c]));
+        }
+    };
+    conv(&mut s, "encoder.conv_in", 3, 32, 3);
+    resnet(&mut s, "encoder.down.0.block.0", 32, 32);
+    conv(&mut s, "encoder.down.0.downsample.conv", 32, 32, 3);
+    resnet(&mut s, "encoder.down.1.block.0", 32, 64);
+    mid(&mut s, "encoder", 64);
+    norm(&mut s, "encoder.norm_out", 64);
+    conv(&mut s, "encoder.conv_out", 64, 2 * latent, 3);
+    conv(&mut s, "quant_conv", 2 * latent, 2 * latent, 1);
+    conv(&mut s, "post_quant_conv", latent, latent, 1);
+    conv(&mut s, "decoder.conv_in", latent, 64, 3);
+    mid(&mut s, "decoder", 64);
+    resnet(&mut s, "decoder.up.1.block.0", 64, 64);
+    resnet(&mut s, "decoder.up.1.block.1", 64, 64);
+    conv(&mut s, "decoder.up.1.upsample.conv", 64, 64, 3);
+    resnet(&mut s, "decoder.up.0.block.0", 64, 32);
+    resnet(&mut s, "decoder.up.0.block.1", 32, 32);
+    norm(&mut s, "decoder.norm_out", 32);
+    conv(&mut s, "decoder.conv_out", 32, 3, 3);
+    let d = std::env::temp_dir().join(format!("gibbs-tiny-vae-{}", std::process::id()));
+    std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    write_f32_safetensors(&d.join("diffusion_pytorch_model.safetensors"), &values(&s, 7))?;
+    let de = gibbs_engine::runtime::diffusion::Net::open(&d, "sd_vae", "decoder", PlacementMode::Pin(Device::Metal))?;
+    let (h, w) = (6, 5);
+    let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+    let img = de.run_one(&vars, &[("z", Tensor::F32(Lcg(3).vec(4 * h * w, 1.0)))], &[], None)?;
+    std::fs::remove_dir_all(&d).ok();
+    if img.len() != 3 * 2 * h * 2 * w {
+        return Err(format!("sd vae: {} values", img.len()));
+    }
+    Ok(())
+}
+
+fn tiny_video_on_gpu() -> Result<(), String> {
+    use gibbs_engine::arch::expr::Val;
+    use gibbs_engine::graph::Tensor;
+    use gibbs_engine::runtime::diffusion::Net;
+    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let num = |v: usize| Val::Num(v as f64);
+
+    let (d, ti) = (64, 32);
+    let mut s = Specs::new();
+    for (p, o, i) in [
+        ("proj_in", d, 128),
+        ("time_embed.emb.timestep_embedder.linear_1", d, 256),
+        ("time_embed.emb.timestep_embedder.linear_2", d, d),
+        ("time_embed.linear", 6 * d, d),
+        ("caption_projection.linear_1", d, ti),
+        ("caption_projection.linear_2", d, d),
+        ("proj_out", 128, d),
+    ] {
+        lin(&mut s, p, i, o, true);
+    }
+    let b = "transformer_blocks.0";
+    for a in ["attn1", "attn2"] {
+        for n in ["to_q", "to_k", "to_v", "to_out.0"] {
+            lin(&mut s, &format!("{b}.{a}.{n}"), d, d, true);
+        }
+        s.push((format!("{b}.{a}.norm_q.weight"), vec![d]));
+        s.push((format!("{b}.{a}.norm_k.weight"), vec![d]));
+    }
+    lin(&mut s, &format!("{b}.ff.net.0.proj"), d, 4 * d, true);
+    lin(&mut s, &format!("{b}.ff.net.2"), 4 * d, d, true);
+    s.push((format!("{b}.scale_shift_table"), vec![6, d]));
+    s.push(("scale_shift_table".into(), vec![2, d]));
+    let dir = tmp.path().join("ltx");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 3))?;
+    let net = Net::open(&dir, "ltx", "denoiser", PlacementMode::Pin(Device::Metal))?;
+    let (f, h, w, nt) = (2, 2, 2, 3);
+    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w)), ("nt", num(nt)), ("clean", num(h * w))];
+    let given = [("x", Tensor::F32(Lcg(4).vec(f * h * w * 128, 1.0))), ("context", Tensor::F32(Lcg(5).vec(nt * ti, 1.0)))];
+    let v = net.run_one(&vars, &given, &[("t", 500.0)], None)?;
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err("non-finite LTX output".into());
+    }
+
+    let (ch, p, lat) = (8, 2, 8);
+    let mut s = Specs::new();
+    let c3 = |s: &mut Specs, n: &str, ci: usize, co: usize, k: usize| {
+        s.push((format!("{n}.weight"), vec![co, ci, k, k, k]));
+        s.push((format!("{n}.bias"), vec![co]));
+    };
+    let res = |s: &mut Specs, b: &str| {
+        c3(s, &format!("{b}.conv1.conv"), ch, ch, 3);
+        c3(s, &format!("{b}.conv2.conv"), ch, ch, 3);
+    };
+    c3(&mut s, "decoder.conv_in.conv", lat, ch, 3);
+    res(&mut s, "decoder.mid_block.resnets.0");
+    for i in 0..4 {
+        if i == 3 {
+            c3(&mut s, "decoder.up_blocks.3.upsamplers.0.conv.conv", ch, 8 * ch, 3);
+        }
+        res(&mut s, &format!("decoder.up_blocks.{i}.resnets.0"));
+    }
+    c3(&mut s, "decoder.conv_out.conv", ch, 3 * p * p, 3);
+    c3(&mut s, "encoder.conv_in.conv", 3 * p * p, ch, 3);
+    for i in 0..4 {
+        res(&mut s, &format!("encoder.down_blocks.{i}.resnets.0"));
+        if i == 0 {
+            c3(&mut s, "encoder.down_blocks.0.downsamplers.0.conv", ch, ch, 3);
+        }
+    }
+    res(&mut s, "encoder.mid_block.resnets.0");
+    c3(&mut s, "encoder.conv_out.conv", ch, lat + 1, 3);
+    s.push(("latents_mean".into(), vec![lat]));
+    s.push(("latents_std".into(), vec![lat]));
+    let dir = tmp.path().join("ltx_vae");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 9))?;
+    let cfg = serde_json::json!({"_class_name": "AutoencoderKLLTXVideo", "block_out_channels": [ch, ch, ch, ch],
+        "layers_per_block": [1, 1, 1, 1, 1], "spatio_temporal_scaling": [true, false, false, false], "patch_size": p, "latent_channels": lat});
+    std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())?;
+    let mode = PlacementMode::Pin(Device::Metal);
+    let dec = Net::open(&dir, "ltx_vae", "decoder", mode)?;
+    let (f, h, w) = (2, 2, 3);
+    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w))];
+    let rgb = dec.run_one(&vars, &[("z", Tensor::F32(Lcg(10).vec(f * lat * h * w, 1.0)))], &[], None)?;
+    if rgb.len() != 3 * 3 * (2 * p * h) * (2 * p * w) || rgb.iter().any(|x| !x.is_finite()) {
+        return Err(format!("LTX VAE decode: {} values", rgb.len()));
+    }
+    let enc = Net::open(&dir, "ltx_vae", "encoder", mode)?;
+    let img = Lcg(11).vec(3 * (2 * p * h) * (2 * p * w), 1.0);
+    let z = enc.run_one(&[("h", num(h)), ("w", num(w))], &[("image", Tensor::F32(img))], &[], None)?;
+    if z.len() != lat * h * w || z.iter().any(|x| !x.is_finite()) {
+        return Err(format!("LTX VAE encode: {} values", z.len()));
+    }
+
+    let (c, ctx) = (32, 24);
+    let mut s = Specs::new();
+    let temporal = |s: &mut Specs, p: &str, c: usize, kv: usize| {
+        nrm(s, &format!("{p}.norm"), c);
+        lin(s, &format!("{p}.proj_in"), c, c, true);
+        lin(s, &format!("{p}.proj_out"), c, c, true);
+        let t = format!("{p}.transformer_blocks.0");
+        for n in ["norm1", "norm2", "norm3"] {
+            nrm(s, &format!("{t}.{n}"), c);
+        }
+        for (a, kv) in [("attn1", c), ("attn2", kv)] {
+            lin(s, &format!("{t}.{a}.to_q"), c, c, false);
+            lin(s, &format!("{t}.{a}.to_k"), kv, c, false);
+            lin(s, &format!("{t}.{a}.to_v"), kv, c, false);
+            lin(s, &format!("{t}.{a}.to_out.0"), c, c, true);
+        }
+        lin(s, &format!("{t}.ff.net.0.proj"), c, 8 * c, true);
+        lin(s, &format!("{t}.ff.net.2"), 4 * c, c, true);
+    };
+    let layer = |s: &mut Specs, base: &str, j: usize, ci: usize, attn: bool| {
+        let r = format!("{base}.resnets.{j}");
+        nrm(s, &format!("{r}.norm1"), ci);
+        conv(s, &format!("{r}.conv1"), ci, c, 3);
+        lin(s, &format!("{r}.time_emb_proj"), 4 * c, c, true);
+        nrm(s, &format!("{r}.norm2"), c);
+        conv(s, &format!("{r}.conv2"), c, c, 3);
+        if ci != c {
+            conv(s, &format!("{r}.conv_shortcut"), ci, c, 1);
+        }
+        for i in 1..=4 {
+            nrm(s, &format!("{base}.temp_convs.{j}.conv{i}.0"), c);
+            let cw = format!("{base}.temp_convs.{j}.conv{i}.{}", if i == 1 { 2 } else { 3 });
+            s.push((format!("{cw}.weight"), vec![c, c, 3, 1, 1]));
+            s.push((format!("{cw}.bias"), vec![c]));
+        }
+        if attn {
+            temporal(s, &format!("{base}.attentions.{j}"), c, ctx);
+            temporal(s, &format!("{base}.temp_attentions.{j}"), c, c);
+        }
+    };
+    lin(&mut s, "time_embedding.linear_1", c, 4 * c, true);
+    lin(&mut s, "time_embedding.linear_2", 4 * c, 4 * c, true);
+    conv(&mut s, "conv_in", 4, c, 3);
+    temporal(&mut s, "transformer_in", c, c);
+    for (i, attn) in [(0, true), (1, false)] {
+        for j in 0..2 {
+            layer(&mut s, &format!("down_blocks.{i}"), j, c, attn);
+        }
+    }
+    conv(&mut s, "down_blocks.0.downsamplers.0.conv", c, c, 3);
+    layer(&mut s, "mid_block", 0, c, false);
+    temporal(&mut s, "mid_block.attentions.0", c, ctx);
+    temporal(&mut s, "mid_block.temp_attentions.0", c, c);
+    layer(&mut s, "mid_block", 1, c, false);
+    for (i, attn) in [(0, false), (1, true)] {
+        for j in 0..3 {
+            layer(&mut s, &format!("up_blocks.{i}"), j, 2 * c, attn);
+        }
+    }
+    conv(&mut s, "up_blocks.0.upsamplers.0.conv", c, c, 3);
+    nrm(&mut s, "conv_norm_out", c);
+    conv(&mut s, "conv_out", c, 4, 3);
+    let dir = tmp.path().join("unet3d");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 6))?;
+    let cfg = serde_json::json!({"_class_name": "UNet3DConditionModel", "in_channels": 4, "block_out_channels": [c, c],
+        "cross_attention_dim": ctx, "attention_head_dim": 32, "layers_per_block": 2, "norm_num_groups": 32});
+    std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())?;
+    let net = Net::open(&dir, "modelscope_t2v", "denoiser", PlacementMode::Pin(Device::Metal))?;
+    let (f, h, w, nt) = (2, 8, 8, 3);
+    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w)), ("nt", num(nt))];
+    let given = [("x", Tensor::F32(Lcg(7).vec(f * 4 * h * w, 1.0))), ("context", Tensor::F32(Lcg(8).vec(nt * ctx, 1.0)))];
+    let e = net.run_one(&vars, &given, &[("t", 900.0)], None)?;
+    if e.len() != f * 4 * h * w || e.iter().any(|x| !x.is_finite()) {
+        return Err("bad UNet3D output".into());
+    }
+    Ok(())
+}
+
+/// Tiny BERT GGUF file run through `SequenceClassifier::from_gguf` on Metal.
+fn bert_gguf_on_gpu() {
+    use gibbs_engine::model::classifier::SequenceClassifier;
+    const H: usize = 16;
+    const INTER: usize = 32;
+    const POS: usize = 16;
+    const TOKENS: [&str; 8] = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "\u{2581}hello", "\u{2581}world", "\u{2581}the", "ing"];
+    let s = |v: &str| {
+        let mut b = (v.len() as u64).to_le_bytes().to_vec();
+        b.extend_from_slice(v.as_bytes());
+        b
+    };
+    let mut r = Lcg(42);
+    let mut ts: Vec<(String, Vec<usize>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, shape: &[usize], gain: bool| {
+        let n: usize = shape.iter().product();
+        let v: Vec<f32> = (0..n).map(|_| if gain { 1.0 + 0.1 * r.next() } else { 0.3 * r.next() }).collect();
+        let dims: Vec<usize> = shape.iter().rev().copied().collect();
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        ts.push((name, dims, 0, bytes));
+    };
+    push("token_embd.weight".into(), &[TOKENS.len(), H], false);
+    push("position_embd.weight".into(), &[POS, H], false);
+    push("token_types.weight".into(), &[2, H], false);
+    push("token_embd_norm.weight".into(), &[H], true);
+    push("token_embd_norm.bias".into(), &[H], false);
+    for (m, o, i) in [("attn_q", H, H), ("attn_k", H, H), ("attn_v", H, H), ("attn_output", H, H), ("ffn_up", INTER, H), ("ffn_down", H, INTER)] {
+        push(format!("blk.0.{m}.weight"), &[o, i], false);
+        push(format!("blk.0.{m}.bias"), &[o], false);
+    }
+    for m in ["attn_output_norm", "layer_output_norm"] {
+        push(format!("blk.0.{m}.weight"), &[H], true);
+        push(format!("blk.0.{m}.bias"), &[H], false);
+    }
+    push("cls.output.weight".into(), &[3, H], false);
+    push("cls.output.bias".into(), &[3], false);
+    let arr = |elem: u32, items: Vec<Vec<u8>>| {
+        let mut b = elem.to_le_bytes().to_vec();
+        b.extend_from_slice(&(items.len() as u64).to_le_bytes());
+        items.into_iter().for_each(|i| b.extend(i));
+        b
+    };
+    let u32b = |v: u32| v.to_le_bytes().to_vec();
+    let kv = [
+        ("general.architecture", 8u32, s("bert")),
+        ("bert.embedding_length", 4, u32b(H as u32)),
+        ("bert.block_count", 4, u32b(1)),
+        ("bert.attention.head_count", 4, u32b(2)),
+        ("bert.feed_forward_length", 4, u32b(INTER as u32)),
+        ("bert.attention.layer_norm_epsilon", 6, 1e-12f32.to_le_bytes().to_vec()),
+        ("tokenizer.ggml.model", 8, s("bert")),
+        ("tokenizer.ggml.tokens", 9, arr(8, TOKENS.iter().map(|t| s(t)).collect())),
+        ("tokenizer.ggml.token_type", 9, arr(5, (0..TOKENS.len()).map(|i| u32b(if i < 4 { 3 } else { 1 })).collect())),
+    ];
+    let mut b = b"GGUF".to_vec();
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&(ts.len() as u64).to_le_bytes());
+    b.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+    for (k, t, payload) in &kv {
+        b.extend_from_slice(&s(k));
+        b.extend_from_slice(&t.to_le_bytes());
+        b.extend_from_slice(payload);
+    }
+    let mut off = 0u64;
+    for (n, dims, ttype, raw) in &ts {
+        b.extend_from_slice(&s(n));
+        b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for &d in dims {
+            b.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+        b.extend_from_slice(&ttype.to_le_bytes());
+        b.extend_from_slice(&off.to_le_bytes());
+        off += (raw.len() as u64).div_ceil(32) * 32;
+    }
+    b.resize(b.len().div_ceil(32) * 32, 0);
+    for (_, _, _, raw) in &ts {
+        b.extend_from_slice(raw);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.gguf");
+    std::fs::write(&path, b).unwrap();
+    let c = SequenceClassifier::from_gguf("t/bert_gguf", &path, Device::Metal)
+        .unwrap_or_else(|e| panic!("bert_gguf: {e}"));
+    assert_eq!(c.device(), Device::Metal, "bert_gguf");
+    let before = cpu_compute::entered();
+    let (scores, _) = c.classify("hello world", None).unwrap_or_else(|e| panic!("bert_gguf: {e}"));
+    assert!(scores.iter().all(|s| s.score.is_finite()), "bert_gguf: non-finite scores");
+    assert_eq!(cpu_compute::entered(), before, "bert_gguf: entered CPU compute");
+}
+
+/// Families that are pure rename-rule or single-file wrappers over already-exercised components.
+const EXEMPT: &[(&str, &str)] = &[
+    ("ldm_clip", "extends clip_text (LDM rename rules)"),
+    ("ldm_openclip", "extends clip_text (OpenCLIP rename rules)"),
+    ("sdxl_clip_l", "extends clip_text (SDXL CLIP-L config)"),
+    ("sdxl_clip_g", "extends clip_text (SDXL CLIP-G config)"),
+    ("ldm_unet", "extends sd (LDM UNet rename rules)"),
+    ("ldm_vae", "extends sd_vae (LDM VAE rename rules)"),
+    ("sd1_file", "single-file wrapper over ldm_clip + ldm_unet + ldm_vae"),
+    ("sd2_file", "single-file wrapper over ldm_openclip + ldm_unet + ldm_vae"),
+    ("sdxl_file", "single-file wrapper over sdxl_clip + ldm_unet + ldm_vae"),
+    ("sd2_gguf", "GGUF wrapper over ldm_openclip + ldm_unet + ldm_vae"),
+    ("fsmt", "extends bart (FSMT config/rename rules)"),
+    ("qwen3_vl", "extends qwen3 (text encoder tested via qwen3_vl_text; vision tower not covered separately)"),
+];
+
+fn gpu_fixture(family: &str) -> Outcome {
+    if let Some(&(_, reason)) = EXEMPT.iter().find(|&&(f, _)| f == family) {
+        return Outcome::Exempt(reason);
+    }
+    match family {
+        "llama" => {
+            classifier_on_gpu("llama-seqcls", synth::llama_seqcls());
+            spec_fixture_on_gpu("llama spec", "lm_graphlm_llama", Some("llama"), &[5, 17, 42, 99], &[])
+        }
+        "glm" => spec_fixture_on_gpu("glm", "lm_graphlm_qk_norm", Some("glm"), &[5, 17, 42, 99], &[]),
+        "granite" => spec_fixture_on_gpu("granite", "lm_graphlm_granite", Some("granite"), &[5, 17, 42, 99], &[]),
+        "bitnet" => spec_fixture_on_gpu("bitnet", "lm_bitnet", Some("bitnet"), &[5, 17, 42, 99], &[]),
+        "gpt_neox" => {
+            classifier_on_gpu("gpt-neox-seqcls", synth::gpt_neox_seqcls());
+            Outcome::Ran
+        }
+        "gpt2" => spec_fixture_on_gpu(
+            "gpt2",
+            "enc_gpt2/models--gibbs-golden--enc_gpt2/snapshots/main",
+            Some("gpt2"),
+            &[2, 5, 7],
+            &[],
+        ),
+        "opt" => spec_fixture_on_gpu(
+            "opt",
+            "enc_opt_post_ln/models--gibbs-golden--enc_opt_post_ln/snapshots/main",
+            Some("opt"),
+            &[2, 5, 7],
+            &[],
+        ),
+        "lfm2" => spec_fixture_on_gpu("lfm2", "lm_graphlm_lfm2", Some("lfm2"), &[5, 17, 42, 99], &[]),
+        "nano" => spec_fixture_on_gpu("nano", "lm_nano", Some("nano"), &[5, 17, 42, 99], &[]),
+        "gemma2" => net_on_gpu("gemma2", "diffa_sana/text_encoder", "text", &[("rows", 4.0)], &[]),
+        "gemma3" => spec_fixture_on_gpu(
+            "gemma3",
+            "gemma_gemma3_seqcls/models--gibbs-golden--gemma3-seqcls-tiny/snapshots/main",
+            Some("gemma3"),
+            &[2, 5, 7],
+            &[],
+        ),
+        "gemma4" => {
+            let r1 = spec_fixture_on_gpu("Gemma4", "gemma_gemma4_ple", Some("gemma4"), &[2, 10, 11, 12], &[]);
+            let _ = spec_fixture_on_gpu("Gemma4 MoE", "gemma_gemma4_moe", Some("gemma4"), &[2, 10, 11, 12], &[]);
+            let img = gibbs_engine::model::image::ImageBuffer::new(32, 24).to_png();
+            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
+            let _ = spec_fixture_on_gpu("Gemma4Media vision", "gemma_gemma4_image_prefill", Some("gemma4"), &[2, 10, 120, 12], &media);
+            let media = [gibbs_engine::model::native::MediaInput::Audio(tone_wav())];
+            let _ = spec_fixture_on_gpu("Audio conformer", "gemma_gemma4_audio", Some("gemma4"), &[2, 10, 121, 12], &media);
+            scatter_fixture("gemma4");
+            r1
+        }
+        "gemma4_unified" => {
+            let img = gibbs_engine::model::image::ImageBuffer::new(32, 24).to_png();
+            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
+            spec_fixture_on_gpu("gemma4_unified", "gemma_gemma4_unified_vision", Some("gemma4_unified"), &[2, 10, 120, 12], &media)
+        }
+        "qwen3" => spec_fixture_on_gpu("qwen3", "qwen_qwen3_decode", Some("qwen3"), &[5, 17, 42, 60], &[]),
+        "hunyuan" => spec_fixture_on_gpu("hunyuan", "qwen_hunyuan_v1_dense_decode", Some("hunyuan"), &[5, 17, 42, 60], &[]),
+        "qwen3_5" => {
             qwen35_on_gpu("qwen3_5", false, false);
             qwen35_on_gpu("qwen3_5_moe", true, false);
             qwen35_on_gpu("qwen3_5_vl", false, true);
+            Outcome::Ran
         }
-        Family::System1 => {
+        "qwen3_vl_text" => net_on_gpu("qwen3_vl_text", "text_enc_qwen3_vl_spec", "text", &[("rows", 4.0)], &[]),
+        "qwen2_5_vl_text" => net_on_gpu("qwen2_5_vl_text", "text_enc_qwen2_5_vl_spec", "text", &[("rows", 4.0)], &[]),
+        "qwen4_exp" => spec_fixture_on_gpu("qwen4_exp", "qwen_qwen4_exp", Some("qwen4_exp"), &[5, 17, 42, 60], &[]),
+        "dflash" => {
+            let dir = find_fixture("qwen_dflash");
+            let d = gibbs_engine::runtime::draft::load_drafter(
+                &artifacts(&dir.join("draft")),
+                &artifacts(&dir.join("target")),
+                PlacementMode::Pin(Device::Metal),
+            )
+            .unwrap_or_else(|e| panic!("dflash: {e}"));
+            let taps = d.tap_layers();
+            let hidden = Lcg(0x7A95).vec(5 * taps.len() * 64, 1.0);
+            let toks = vec![5u32, 17, 33, 48, 71, 12];
+            let mut st = d.new_state();
+            let before = cpu_compute::entered();
+            let ids = d
+                .propose(&mut st, &toks, &hidden, d.max_k(), &mut |_| 5)
+                .unwrap_or_else(|e| panic!("dflash propose: {e}"));
+            assert!(!ids.is_empty(), "dflash produced no drafts");
+            assert_eq!(cpu_compute::entered(), before, "dflash: entered CPU compute");
+            Outcome::Ran
+        }
+        "idefics3" => {
+            let img = gibbs_engine::model::image::ImageBuffer::new(24, 24).to_png();
+            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
+            let r = spec_fixture_on_gpu("idefics3 spec", "enc_smolvlm_grid", Some("idefics3"), &[1, 10, 11, IDEFICS3_IMG, 12, 13], &media);
+            scatter_fixture("idefics3");
+            r
+        }
+        "t5" => {
+            encdec_on_gpu("t5", false);
+            Outcome::Ran
+        }
+        "bart" => {
+            encdec_on_gpu("bart", true);
+            Outcome::Ran
+        }
+        "marian" => net_on_gpu("marian", "encdec_marian", "encoder", &[("rows", 4.0)], &[]),
+        "m2m100" => net_on_gpu("m2m100", "encdec_m2m100", "encoder", &[("rows", 4.0)], &[]),
+        "bert" => {
+            classifier_on_gpu("bert", synth::bert(None));
             use gibbs_engine::model::hub::HuggingFaceHub;
             use gibbs_engine::runtime::encoder::system1::JevSystem1Model;
             let mut ts = synth::Ts::new(3);
@@ -441,115 +1026,103 @@ fn gpu_fixture(f: Family) {
             for _ in 0..3 {
                 assert_eq!(m.embed(synth::TEXT).expect("System 1 runs").len(), 16);
             }
+            Outcome::Ran
         }
-        Family::T5 => encdec_on_gpu("t5", false),
-        Family::Seq2Seq => encdec_on_gpu("bart", true),
-        Family::ClassifierBert => classifier_on_gpu("bert", synth::bert(None)),
-        Family::ClassifierModern => {
+        "bert_gguf" => {
+            bert_gguf_on_gpu();
+            Outcome::Ran
+        }
+        "fasttext" => {
+            let path = find_fixture("enc_fasttext/model.bin");
+            let c = gibbs_engine::model::classifier::SequenceClassifier::from_fasttext("golden/fasttext", &path)
+                .unwrap_or_else(|e| panic!("fasttext: {e}"));
+            assert_eq!(c.device(), Device::Metal, "fasttext");
+            let before = cpu_compute::entered();
+            let (scores, _) = c.classify("the cat sat", None).unwrap_or_else(|e| panic!("fasttext: {e}"));
+            assert!(scores.iter().all(|s| s.score.is_finite()), "fasttext: non-finite scores");
+            assert_eq!(cpu_compute::entered(), before, "fasttext: entered CPU compute");
+            Outcome::Ran
+        }
+        "modernbert" => {
             classifier_on_gpu("modernbert", synth::modernbert("mean", true));
+            Outcome::Ran
+        }
+        "electra" => {
             classifier_on_gpu("electra", synth::electra());
+            Outcome::Ran
+        }
+        "albert" => {
             classifier_on_gpu("albert", synth::albert());
+            Outcome::Ran
+        }
+        "deberta" => {
             classifier_on_gpu("deberta-v2", synth::deberta_v2());
             classifier_on_gpu("deberta-v1", synth::deberta_v1());
+            Outcome::Ran
         }
-        Family::ClassifierDecoder => {
-            classifier_on_gpu("llama-seqcls", synth::llama_seqcls());
-            classifier_on_gpu("gpt-neox-seqcls", synth::gpt_neox_seqcls());
+        "clip_text" => net_on_gpu("clip_text", "diffa_clip_quick_gelu/text_encoder", "text", &[("rows", 77.0)], &[]),
+        "sd" => net_on_gpu("sd", "diffa_unet_sd/unet", "denoiser", &[("b", 1.0), ("h", 8.0), ("w", 8.0), ("nt", 4.0), ("adm", 0.0)], &[("t", 500.0)]),
+        "sdxl" => net_on_gpu("sdxl", "diffa_unet_xl_lcm/unet", "denoiser", &[("b", 1.0), ("h", 8.0), ("w", 8.0), ("nt", 4.0), ("adm", 56.0)], &[("t", 500.0)]),
+        "sd_vae" => {
+            tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
+            Outcome::Ran
         }
-        Family::Idefics3Siglip => {
-            // SigLIP tower over tiles, connector and llama text with the media scatter.
-            let img = gibbs_engine::model::image::ImageBuffer::new(24, 24).to_png();
-            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
-            spec_fixture_on_gpu("idefics3 spec", "enc_smolvlm_grid", &[1, 10, 11, IDEFICS3_IMG, 12, 13], &media);
-            scatter_fixture("Idefics3Siglip");
+        "dcae" => net_on_gpu("dcae", "diffa_dcae/vae", "decoder", &[("h", 2.0), ("w", 2.0)], &[]),
+        "sana" => net_on_gpu("sana", "diffa_sana/transformer", "denoiser", &[("h", 4.0), ("w", 4.0), ("nt", 5.0)], &[("t", 500.0)]),
+        "sd3" => net_on_gpu("sd3", "diffa_sd3_plain/transformer", "denoiser", &[("h", 4.0), ("w", 4.0), ("nt", 5.0)], &[("t", 500.0)]),
+        "flux" => net_on_gpu("flux", "diffa_flux1/transformer", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0), ("g", 3500.0)]),
+        "chroma" => net_on_gpu("chroma", "diffa_flux_chroma/transformer", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
+        "flux2" => net_on_gpu("flux2", "diffa_flux2/transformer", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0), ("g", 3500.0)]),
+        "zimage" => net_on_gpu("zimage", "diffb_zimage", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
+        "qwen_image" => net_on_gpu("qwen_image", "diffb_qwen_image_v1", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
+        "qwen_image21" => net_on_gpu("qwen_image21", "diffb_qwen_image21", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 4.0)], &[("t", 500.0)]),
+        "qwen_vae" => net_on_gpu("qwen_vae", "diffb_qwen_vae", "decoder", &[("h", 2.0), ("w", 2.0)], &[]),
+        "qwen_vae21" => net_on_gpu("qwen_vae21", "diffb_qwen_vae21", "decoder", &[("h", 2.0), ("w", 2.0)], &[]),
+        "krea2" => net_on_gpu("krea2", "diffb_krea2", "denoiser", &[("h", 2.0), ("w", 2.0), ("nt", 6.0)], &[("t", 500.0)]),
+        "ltx" | "ltx_vae" | "modelscope_t2v" => {
+            tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
+            Outcome::Ran
         }
-        Family::Gemma4Media => {
-            let img = gibbs_engine::model::image::ImageBuffer::new(32, 24).to_png();
-            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
-            spec_fixture_on_gpu("Gemma4Media vision", "gemma_gemma4_image_prefill", &[2, 10, 120, 12], &media);
-            scatter_fixture("Gemma4Media");
-        }
-        Family::Audio => {
-            let media = [gibbs_engine::model::native::MediaInput::Audio(tone_wav())];
-            spec_fixture_on_gpu("Audio conformer", "gemma_gemma4_audio", &[2, 10, 121, 12], &media);
-            scatter_fixture("Audio");
-        }
-        // The spec FLUX / FLUX.2 pipelines: golden `diffa::flux1_pipeline` / `diffa::klein_pipeline`
-        // assert their Metal legs enter no CPU compute.
-        Family::DiffusionDit => {}
-        Family::VideoLtx => {
-            // The `ltx` and `modelscope_t2v` spec denoisers on tiny checkpoints, Metal programs.
-            gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
-        }
-        // The spec pipeline (CLIP -> UNet2D x2 CFG steps -> VAE): golden `diffa::tiny_sd` asserts its
-        // Metal leg enters no CPU compute.
-        Family::DiffusionUnet => {}
-        Family::VideoModelScope => {
-            gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
-        }
-        Family::Vae => {
-            // The SD VAE decodes as a Metal program (the spec VAEs: the diffusion goldens).
-            gibbs_engine::model::diff_fixtures::tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
-        }
+        other => panic!("unhandled family `{other}` in cpu_free_matrix: add a GPU fixture or EXEMPT entry"),
     }
 }
 
 #[test]
 fn cpu_free_matrix() {
     INIT.call_once(|| cpu_compute::ban(true));
+    let reg = gibbs_engine::arch::registry().unwrap();
     let mut rows = Vec::new();
-    for f in Family::ALL {
-        let gaps: Vec<String> = required_ops(f)
-            .iter()
-            .filter_map(|(op, dt)| {
-                explore_node("required", op, *dt)
-                    .lowered_by()
-                    .is_none()
-                    .then(|| format!("{} {dt:?}", op.name()))
-            })
-            .collect();
-        let status = family_status(f);
-        // (a) a family is `Gpu` exactly when none of its required ops lacks a lowering; a gate whose
-        // reason starts with `numerics:` (parity unresolved) or `builder:` (every op lowers but the
-        // Metal program is not written yet) may hold a family back although every op lowers.
-        let numerics_gate = matches!(status, Status::Gated(r) if r.starts_with("numerics:"));
-        let builder_gate = matches!(status, Status::Gated(r) if r.starts_with("builder:"));
-        assert!(
-            gaps.is_empty() == matches!(status, Status::Gpu)
-                || (gaps.is_empty() && (numerics_gate || builder_gate)),
-            "{f:?}: status {status:?} disagrees with unlowered ops {gaps:?}"
-        );
-        match status {
-            Status::Gpu => {
-                assert!(family_gate(f, Device::Metal).is_ok(), "{f:?}");
-                if metal_present() {
-                    gpu_fixture(f); // (b)
-                }
-            }
-            Status::Gated(reason) => {
-                if numerics_gate && metal_present() {
-                    gpu_fixture(f); // the tiny fixture lowers and runs; real checkpoints are what diverge
-                }
-                // (c)
-                let err = family_gate(f, Device::Metal).expect_err("gated family must refuse Metal");
-                assert!(err.starts_with("gpu-only:") && err.contains(reason), "{err}");
-                assert!(family_gate(f, Device::Cpu).is_ok(), "{f:?}: --backend cpu must stay open");
-            }
+    for family in reg.family_names() {
+        let spec = reg.spec(family, &Signals::default()).unwrap();
+        if spec.pipeline == Pipeline::Unsupported {
+            continue;
         }
-        let status_cell = match status {
-            Status::Gpu => "GPU".to_string(),
-            Status::Gated(_) => "CPU only: --backend cpu".to_string(),
+        let status = if metal_present() {
+            let before_nodes = gibbs_engine::graph::program::compiled_cpu_nodes();
+            let before_cpu = cpu_compute::entered();
+            let outcome = gpu_fixture(family);
+            assert_eq!(
+                gibbs_engine::graph::program::compiled_cpu_nodes(),
+                before_nodes,
+                "{family}: compiled CPU nodes"
+            );
+            if !spec.components.contains_key("precompute") {
+                assert_eq!(
+                    cpu_compute::entered(),
+                    before_cpu,
+                    "{family}: entered CPU compute"
+                );
+            }
+            match outcome {
+                Outcome::Ran => "ran".to_string(),
+                Outcome::Exempt(why) => format!("exempt: {why}"),
+            }
+        } else {
+            "no Metal device".to_string()
         };
-        let mut uniq = gaps.clone();
-        uniq.sort();
-        uniq.dedup();
-        rows.push(format!(
-            "| {f:?} | {status_cell} | {} |",
-            if uniq.is_empty() { "—".to_string() } else { uniq.join(", ") }
-        ));
+        rows.push(format!("| {family} | {status} |"));
     }
-    // (d) generated matrix
-    println!("\n| family | status | unlowered ops |\n|:---|:---|:---|");
+    println!("\n| family | status |\n|:---|:---|");
     for r in rows {
         println!("{r}");
     }

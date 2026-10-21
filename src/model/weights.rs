@@ -37,6 +37,24 @@ impl Mat {
             cols,
         }
     }
+    /// Owned `bytes` of `format` blocks viewed as `[rows, cols]`.
+    pub fn from_packed_bytes(
+        format: crate::hardware::QuantFormat,
+        bytes: Vec<u8>,
+        rows: usize,
+        cols: usize,
+    ) -> Self {
+        Self::from_packed(
+            Packed {
+                map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(bytes)),
+                off: 0,
+                format,
+                shape: vec![rows, cols],
+            },
+            rows,
+            cols,
+        )
+    }
     pub fn packed(&self) -> Option<&Packed> {
         match &self.buf {
             Buf::Packed(p) => Some(p),
@@ -357,7 +375,7 @@ impl Weights {
     }
 
     /// True for mlx-vlm checkpoints (`language_model.model.*`), whose converter may have rewritten
-    /// values (e.g. Qwen3.5 stores its `1 + w` RMSNorm weights pre-shifted).
+    /// values (e.g. some models store their `1 + w` RMSNorm weights pre-shifted).
     pub fn mlx_vlm(&self) -> bool {
         self.vlm
     }
@@ -569,7 +587,7 @@ impl Weights {
     }
 
     /// mlx-vlm convolutions are channels-last (`[out, *kernel, in]`); HF's are `[out, in, *kernel]`.
-    /// Only convolutions: other 3-D tensors (Gemma 4's `[2, size, hidden]` position table) are
+    /// Only convolutions: other 3-D tensors (e.g. a `[2, size, hidden]` position table) are
     /// stored as HF has them.
     fn channels_last(&self, stored: &str, t: &VirtualTensor) -> bool {
         self.vlm
