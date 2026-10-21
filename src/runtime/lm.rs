@@ -25,7 +25,7 @@
 //! `prepare`, and its placeholder expanded.
 
 use crate::arch::build::{build, InputPlan, Instance, ShapeCache};
-use crate::arch::expr::Val;
+use crate::arch::expr::{Env, Val};
 use crate::arch::gen::{generate, GenData};
 use crate::arch::load::Model;
 use crate::arch::Registry;
@@ -323,7 +323,22 @@ impl SpecLm {
                 if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
             ));
         }
-        let weights = model.store.materialize(&decode.weights)?;
+        // `runtime.seqcls.head` instances run reshaped on this program: their weights (score
+        // head, its norm) are bound with the decode instance's when the checkpoint has them (a
+        // causal-LM checkpoint of the family has no score head).
+        let mut names = decode.weights.clone();
+        if let Some(h) = model.spec.runtime["seqcls"]["head"].as_str() {
+            for head in [h, "hidden"] {
+                let v = vars(1, head, &[], 0);
+                let Ok(i) = shapes.get(&v, || build(&model.spec, TEXT, &model.env, &model.store, &v)) else {
+                    continue;
+                };
+                names.extend(
+                    i.weights.iter().filter(|w| !names.contains(w) && model.env.has(w)).cloned().collect::<Vec<_>>(),
+                );
+            }
+        }
+        let weights = model.store.materialize(&names)?;
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
         let streams = recurrent.is_empty()
