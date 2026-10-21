@@ -1,0 +1,11 @@
+// CLIP text tower of an LDM single-file / SD GGUF checkpoint in HF naming under
+// `cond_stage_model.transformer.` (SD 1.x; the SD 2.x turbo GGUF's converted OpenCLIP-H). Loaded on
+// the whole file: the other components' tensors are ignored here.
+{
+  family: "ldm_clip",
+  extends: "clip_text",
+  names: {strip: ["cond_stage_model.transformer."]},
+  ignore: ["text_model.embeddings.position_ids", "logit_scale", "attn_mask",
+           "model.diffusion_model.*", "first_stage_model.*", "model_ema.*",
+           "alphas_cumprod*", "betas", "log_one_minus_alphas_cumprod", "posterior_*", "sqrt_*", "logvar"],
+}

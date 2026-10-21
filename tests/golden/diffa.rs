@@ -133,6 +133,11 @@ fn clip_hub(dir: &Path) -> HuggingFaceHub {
 
 /// diffusers `text_encoder/` (CLIPTextModel[WithProjection], 2 layers, d 64) + `tokenizer/`.
 fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u64) {
+    write_clip_proj(dir, te, tok, quick, if proj { 48 } else { 0 }, seed);
+}
+
+/// [`write_clip`] with a `proj`-wide `text_projection` (0: none).
+fn write_clip_proj(dir: &Path, te: &str, tok: &str, quick: bool, proj: usize, seed: u64) {
     let d = CLIP_D;
     let mut s: Specs = vec![
         ("text_model.embeddings.token_embedding.weight".into(), vec![CLIP_VOCAB, d]),
@@ -149,18 +154,18 @@ fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u6
         nrm(&mut s, &format!("{p}.layer_norm2"), d);
     }
     nrm(&mut s, "text_model.final_layer_norm", d);
-    if proj {
-        s.push(("text_projection.weight".into(), vec![48, d]));
+    if proj > 0 {
+        s.push(("text_projection.weight".into(), vec![proj, d]));
     }
     write_specs(&dir.join(te).join("model.safetensors"), seed, &s, StDtype::F32);
     write_json(
         &dir.join(te).join("config.json"),
         &json!({
-            "architectures": [if proj { "CLIPTextModelWithProjection" } else { "CLIPTextModel" }],
+            "architectures": [if proj > 0 { "CLIPTextModelWithProjection" } else { "CLIPTextModel" }],
             "model_type": "clip_text_model", "hidden_act": if quick { "quick_gelu" } else { "gelu" },
             "hidden_size": d, "intermediate_size": 2 * d, "num_attention_heads": 1,
             "num_hidden_layers": 2, "max_position_embeddings": 77, "vocab_size": CLIP_VOCAB,
-            "layer_norm_eps": 1e-5, "projection_dim": 48
+            "layer_norm_eps": 1e-5, "projection_dim": if proj > 0 { proj } else { 48 }
         }),
     );
     let pad = if quick { "<|endoftext|>" } else { "!" };
@@ -396,9 +401,10 @@ fn unet_xl_lcm() {
 // SD3 MMDiT (SD3Transformer2DModel)
 // ---------------------------------------------------------------------------------------------
 
-fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
-    use gibbs_engine::model::sd3::Mmdit;
-    let (d, joint, pooled_dim, pos_max, layers) = (64usize, 48usize, 40usize, 8usize, 3usize);
+/// diffusers `transformer/` (SD3Transformer2DModel: d 64, 1 head, 3 blocks, the last
+/// context-pre-only; `dual`: block 0 has SD3.5 `attn2`; `qk_norm`: RMSNorm q/k gains).
+fn write_sd3(dir: &Path, joint: usize, pooled_dim: usize, dual: bool, qk_norm: bool, seed: u64) {
+    let (d, pos_max, layers) = (64usize, 8usize, 3usize);
     let mut s = Specs::new();
     conv(&mut s, "pos_embed.proj", 4, d, 2);
     s.push(("pos_embed.pos_embed".into(), vec![1, pos_max * pos_max, d]));
@@ -440,7 +446,7 @@ fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
     }
     lin(&mut s, "norm_out.linear", d, 2 * d, true);
     lin(&mut s, "proj_out", d, 4 * 2 * 2, true);
-    let dir = fixture_dir(case).join("transformer");
+    let dir = dir.join("transformer");
     write_specs(&dir.join("diffusion_pytorch_model.safetensors"), seed, &s, StDtype::BF16);
     write_json(
         &dir.join("config.json"),
@@ -453,6 +459,14 @@ fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
             "qk_norm": if qk_norm { json!("rms_norm") } else { Value::Null }
         }),
     );
+}
+
+fn sd3_case(case: &str, dual: bool, qk_norm: bool, seed: u64) {
+    use gibbs_engine::model::sd3::Mmdit;
+    let (joint, pooled_dim) = (48usize, 40usize);
+    let root = fixture_dir(case);
+    write_sd3(&root, joint, pooled_dim, dual, qk_norm, seed);
+    let dir = root.join("transformer");
     // 12x10 latents -> 6x5 patches cropped from the 8x8 table; 12 text tokens.
     let (h, w, n_ctx) = (12usize, 10usize, 12usize);
     let (lat, ctx, pooled) = (rand(4 * h * w, 11), rand(n_ctx * joint, 12), rand(pooled_dim, 13));
@@ -515,6 +529,66 @@ fn sd3_dual() {
 #[test]
 fn sd3_qk() {
     sd3_case("diffa_sd3_qk", false, true, 4);
+}
+
+/// The whole `StableDiffusion3Pipeline` (no T5: its context block is zeros): CLIP-L (quick_gelu, EOS
+/// pad) + CLIP-G (gelu, `!` pad), both with d_model-wide projections (pooled = d_L + d_G, as SD3's checks require), the
+/// dual/qk-norm MMDiT, the 4-channel 8x VAE, 2 flow-Euler steps with CFG.
+#[test]
+fn sd3_pipeline() {
+    use gibbs_engine::model::text_to_image::{load_image_model, ImageRequest};
+    let case = "diffa_sd3_pipeline";
+    let dir = fixture_dir(case);
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({
+            "_class_name": "StableDiffusion3Pipeline",
+            "text_encoder": ["transformers", "CLIPTextModelWithProjection"],
+            "text_encoder_2": ["transformers", "CLIPTextModelWithProjection"],
+            "tokenizer": ["transformers", "CLIPTokenizer"],
+            "tokenizer_2": ["transformers", "CLIPTokenizer"],
+            "transformer": ["diffusers", "SD3Transformer2DModel"],
+            "vae": ["diffusers", "AutoencoderKL"],
+            "scheduler": ["diffusers", "FlowMatchEulerDiscreteScheduler"]
+        }),
+    );
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000, "shift": 3.0}),
+    );
+    write_clip_proj(&dir, "text_encoder", "tokenizer", true, CLIP_D, 21);
+    write_clip_proj(&dir, "text_encoder_2", "tokenizer_2", false, CLIP_D, 22);
+    write_sd3(&dir, 2 * CLIP_D, 2 * CLIP_D, true, true, 5);
+    write_sd_vae(&dir, &[32, 32, 32, 32]);
+    let hub = clip_hub(&dir);
+    let art = artifacts(&dir, "golden/tiny-sd3", "none");
+    let pipe = (!spec()).then(|| load_image_model(&art, &hub).expect("diffusers image repo").unwrap());
+    // 32x48 -> 4x6 latents -> 2x3 patches cropped from the 8x8 table.
+    let req = ImageRequest {
+        prompt: "t5 t17 t200".into(),
+        width: Some(32),
+        height: Some(48),
+        steps: Some(2),
+        guidance: Some(5.0),
+        seed: 5,
+        ..Default::default()
+    };
+    golden(case, TOL, |dev| {
+        // runner (spec path): runtime::diffusion::SpecDiffusion, pinned to `dev`
+        let img = if spec() {
+            use gibbs_engine::runtime::diffusion::{Extras, SpecDiffusion};
+            let p = SpecDiffusion::load(&art, &hub, pin(dev), None, &Extras::default()).unwrap();
+            on(dev, || gibbs_engine::model::text_to_image::ImageGenerator::text_to_image(&p, &req))
+        } else {
+            on(dev, || pipe.as_ref().unwrap().text_to_image(&req))
+        }
+        .unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 48, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1132,6 +1206,221 @@ fn tiny_sd() {
             let p = SpecDiffusion::load(&art, &hub, pin(dev), None, &Extras::default()).unwrap();
             on(dev, || gibbs_engine::model::text_to_image::ImageGenerator::text_to_image(&p, &req))
         } else {
+            on(dev, || pipe.as_ref().unwrap().text_to_image(&req))
+        }
+        .unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 32, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+/// An SD 1.x LDM single-file checkpoint: the CLIP tower of `write_clip` under
+/// `cond_stage_model.transformer.`, a 2-level LDM UNet (layers_per_block 2, as every LDM file)
+/// under `model.diffusion_model.`, a 4-level LDM VAE under `first_stage_model.`; the reference
+/// repo's configs and tokenizer dir sit in the hub cache.
+#[test]
+fn sd_single_file() {
+    use gibbs_engine::model::diff_fixtures::{ldm_unet_specs, ldm_vae_specs};
+    use gibbs_engine::model::text_to_image::{load_image_model, ImageRequest};
+    let case = "diffa_sd_single_file";
+    let dir = fixture_dir(case);
+    let d = CLIP_D;
+    let te = "cond_stage_model.transformer.text_model";
+    let mut s: Specs = vec![
+        (format!("{te}.embeddings.token_embedding.weight"), vec![CLIP_VOCAB, d]),
+        (format!("{te}.embeddings.position_embedding.weight"), vec![77, d]),
+    ];
+    for l in 0..2 {
+        let p = format!("{te}.encoder.layers.{l}");
+        for n in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            lin(&mut s, &format!("{p}.self_attn.{n}"), d, d, true);
+        }
+        lin(&mut s, &format!("{p}.mlp.fc1"), d, 2 * d, true);
+        lin(&mut s, &format!("{p}.mlp.fc2"), 2 * d, d, true);
+        nrm(&mut s, &format!("{p}.layer_norm1"), d);
+        nrm(&mut s, &format!("{p}.layer_norm2"), d);
+    }
+    nrm(&mut s, &format!("{te}.final_layer_norm"), d);
+    let unet = ldm_unet_specs(32, &[1, 2], 2, &[true, true], d, 4);
+    s.extend(unet.into_iter().map(|(n, sh)| (format!("model.diffusion_model.{n}"), sh)));
+    s.extend(ldm_vae_specs(32, &[1, 1, 1, 1]));
+    write_specs(&dir.join("sd15.safetensors"), 31, &s, StDtype::F32);
+
+    let hub = clip_hub(&dir);
+    let r = dir.join("hub/models--stable-diffusion-v1-5--stable-diffusion-v1-5/snapshots/main");
+    write_json(
+        &r.join("model_index.json"),
+        &json!({
+            "_class_name": "StableDiffusionPipeline",
+            "text_encoder": ["transformers", "CLIPTextModel"], "tokenizer": ["transformers", "CLIPTokenizer"],
+            "unet": ["diffusers", "UNet2DConditionModel"], "vae": ["diffusers", "AutoencoderKL"],
+            "scheduler": ["diffusers", "EulerDiscreteScheduler"]
+        }),
+    );
+    write_json(
+        &r.join("scheduler/scheduler_config.json"),
+        &json!({
+            "_class_name": "EulerDiscreteScheduler", "beta_schedule": "scaled_linear",
+            "beta_start": 0.00085, "beta_end": 0.012, "num_train_timesteps": 1000,
+            "prediction_type": "epsilon", "timestep_spacing": "trailing"
+        }),
+    );
+    write_json(
+        &r.join("text_encoder/config.json"),
+        &json!({
+            "architectures": ["CLIPTextModel"], "model_type": "clip_text_model", "hidden_act": "quick_gelu",
+            "hidden_size": d, "intermediate_size": 2 * d, "num_attention_heads": 1,
+            "num_hidden_layers": 2, "max_position_embeddings": 77, "vocab_size": CLIP_VOCAB,
+            "layer_norm_eps": 1e-5
+        }),
+    );
+    write_json(&r.join("tokenizer/tokenizer.json"), &clip_tokenizer_json());
+    let pad = json!({"pad_token": "<|endoftext|>"});
+    write_json(&r.join("tokenizer/special_tokens_map.json"), &pad);
+    write_json(&r.join("tokenizer/tokenizer_config.json"), &pad);
+    write_json(
+        &r.join("unet/config.json"),
+        &json!({
+            "_class_name": "UNet2DConditionModel", "sample_size": 4, "in_channels": 4,
+            "out_channels": 4, "block_out_channels": [32, 64], "layers_per_block": 2,
+            "attention_head_dim": 8, "cross_attention_dim": d, "norm_num_groups": 32,
+            "down_block_types": ["CrossAttnDownBlock2D", "CrossAttnDownBlock2D"],
+            "up_block_types": ["CrossAttnUpBlock2D", "CrossAttnUpBlock2D"],
+            "mid_block_type": "UNetMidBlock2DCrossAttn"
+        }),
+    );
+    write_json(
+        &r.join("vae/config.json"),
+        &json!({
+            "_class_name": "AutoencoderKL", "in_channels": 3, "out_channels": 3,
+            "latent_channels": 4, "block_out_channels": [32, 32, 32, 32], "layers_per_block": 2,
+            "norm_num_groups": 32, "scaling_factor": 0.18215, "sample_size": 32,
+            "down_block_types": vec!["DownEncoderBlock2D"; 4],
+            "up_block_types": vec!["UpDecoderBlock2D"; 4]
+        }),
+    );
+    let art = artifacts(&dir, "golden/sd-single-file", "sd15.safetensors");
+    let pipe = (!spec()).then(|| load_image_model(&art, &hub).expect("SD single-file checkpoint").unwrap());
+    let req = ImageRequest {
+        prompt: "t5 t17 t200".into(),
+        width: Some(32),
+        height: Some(32),
+        steps: Some(2),
+        guidance: Some(5.0),
+        seed: 5,
+        ..Default::default()
+    };
+    golden(case, TOL, |dev| {
+        let img = if spec() {
+            // runner (spec path): runtime::diffusion::load_image (single-file detection), pinned to `dev`
+            let p = gibbs_engine::runtime::diffusion::load_image(&art, &hub, pin(dev))
+                .expect("SD single-file checkpoint")
+                .unwrap();
+            on(dev, || p.text_to_image(&req))
+        } else {
+            // runner: internal gibbs_engine::model::sd::SdPipeline::load_single_file
+            on(dev, || pipe.as_ref().unwrap().text_to_image(&req))
+        }
+        .unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 32, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+/// A WordLevel stand-in for the Gemma tokenizer: `<pad>` 0, `<eos>` 1, `<bos>` 2 (prepended by
+/// the post-processor), `<unk>` 3 (every instruction word), `tK` = K (4..256).
+fn gemma_tokenizer_json() -> Value {
+    let mut vocab = Map::new();
+    let specials = [("<pad>", 0), ("<eos>", 1), ("<bos>", 2), ("<unk>", 3)];
+    for (s, id) in specials {
+        vocab.insert(s.into(), json!(id));
+    }
+    for i in 4..256 {
+        vocab.insert(format!("t{i}"), json!(i));
+    }
+    let added: Vec<Value> = specials
+        .iter()
+        .map(|(s, id)| {
+            json!({"id": id, "content": s, "single_word": false, "lstrip": false,
+                   "rstrip": false, "normalized": false, "special": true})
+        })
+        .collect();
+    json!({
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+        "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"},
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                     {"Sequence": {"id": "B", "type_id": 0}}],
+            "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}}
+        },
+        "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tiny Sana pipeline (Gemma 2 + linear DiT + DC-AE f4c8) through the public image-model loader
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn sana_pipeline() {
+    use gibbs_engine::model::text_to_image::{load_image_model, ImageRequest};
+    let case = "diffa_sana_pipeline";
+    let dir = fixture_dir(case);
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({
+            "_class_name": "SanaPipeline",
+            "text_encoder": ["transformers", "Gemma2Model"],
+            "tokenizer": ["transformers", "GemmaTokenizerFast"],
+            "transformer": ["diffusers", "SanaTransformer2DModel"],
+            "vae": ["diffusers", "AutoencoderDC"],
+            "scheduler": ["diffusers", "DPMSolverMultistepScheduler"]
+        }),
+    );
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({
+            "_class_name": "DPMSolverMultistepScheduler", "algorithm_type": "dpmsolver++",
+            "prediction_type": "flow_prediction", "use_flow_sigmas": true, "solver_order": 2,
+            "solver_type": "midpoint", "final_sigmas_type": "zero", "flow_shift": 3.0,
+            "num_train_timesteps": 1000
+        }),
+    );
+    write_json(&dir.join("tokenizer/tokenizer.json"), &gemma_tokenizer_json());
+    write_gemma2(&dir.join("text_encoder"));
+    write_sana_dit(&dir.join("transformer"));
+    // DC-AE f4c8: latent channels == SANA_C.
+    write_dcae(&dir.join("vae"));
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let art = artifacts(&dir, "golden/tiny-sana", "none");
+    let pipe = (!spec()).then(|| load_image_model(&art, &hub).expect("diffusers image repo").unwrap());
+    // 32x32 = 8x8 latents (the old pipeline's minimum); CFG runs (guidance > 1).
+    let req = ImageRequest {
+        prompt: " T5 t17 t200 ".into(),
+        width: Some(32),
+        height: Some(32),
+        steps: Some(2),
+        guidance: Some(4.5),
+        seed: 5,
+        ..Default::default()
+    };
+    golden(case, TOL, |dev| {
+        // runner (spec path): runtime::diffusion::SpecDiffusion, pinned to `dev`
+        let img = if spec() {
+            use gibbs_engine::runtime::diffusion::{Extras, SpecDiffusion};
+            let p = SpecDiffusion::load(&art, &hub, pin(dev), None, &Extras::default()).unwrap();
+            on(dev, || gibbs_engine::model::text_to_image::ImageGenerator::text_to_image(&p, &req))
+        } else {
+            // runner: internal gibbs_engine::model::sana::SanaPipeline
             on(dev, || pipe.as_ref().unwrap().text_to_image(&req))
         }
         .unwrap();

@@ -1,0 +1,171 @@
+// T5 encoder-decoders (transformers `modeling_t5.py` / `modeling_umt5.py`): t5 v1.0 and v1.1 /
+// FLAN / MADLAD, mt5, umt5; llama.cpp / ComfyUI `t5encoder` GGUFs (encoder only, for diffusion
+// text encoders). RMS norms without mean or bias, unscaled attention (`scale: 1`: T5 folds
+// 1/sqrt(d_kv) into its weights) with a bucketed relative-position bias: block 0's table serves
+// every block (umt5: one table per block).
+// `encoder` (vars rows; `cross: true` adds every decoder layer's cross K/V `xk.{l}`/`xv.{l}`, the
+// states the decoder reads); `decoder` one position per pass over the self-attention state
+// `sk/sv.{l}` (a `CachedAttention` writes it, a biased `Attention` scores it with the
+// `self_mask` input) and the cross states masked by `cross_mask`.
+{
+  family: "t5",
+  match: {
+    hf_model_type: ["t5", "mt5", "umt5"],
+    hf_architectures: ["T5ForConditionalGeneration", "MT5ForConditionalGeneration", "UMT5ForConditionalGeneration",
+                       "T5EncoderModel", "UMT5EncoderModel"],
+    gguf_arch: ["t5", "t5encoder"],
+  },
+  pipeline: "encdec",
+  use_lib: ["transformer"],
+  config: {
+    d_model: "cfg.d_model",
+    d_kv: "cfg.d_kv",
+    heads: "cfg.num_heads",
+    kv_heads: "heads",
+    inner: "heads * d_kv",
+    d_ff: "cfg.d_ff",
+    layers: "cfg.num_layers",
+    dec_layers: "first(cfg.num_decoder_layers, layers)",
+    buckets: "first(cfg.relative_attention_num_buckets, 32)",
+    max_distance: "first(cfg.relative_attention_max_distance, 128)",
+    eps: "first(cfg.layer_norm_epsilon, 1e-6)",
+    // HF T5Config: `gated-<act>` is a gated FF; "gated-gelu" means gelu_new (tanh).
+    proj: "first(cfg.feed_forward_proj, 'relu')",
+    gated: "contains(['gated-relu', 'gated-gelu', 'gated-gelu_new', 'gated-gelu_pytorch_tanh', 'gated-silu', 'gated-swish'], proj)",
+    act: "contains(['relu', 'gated-relu'], proj) ? 'Relu' : contains(['gated-gelu', 'gelu_new', 'gelu_pytorch_tanh', 'gated-gelu_new', 'gated-gelu_pytorch_tanh'], proj) ? 'GeluTanh' : proj == 'gelu' ? 'GeluErf' : 'Silu'",
+    tied: "first(cfg.tie_word_embeddings, true)",
+    embed: "first_has('shared.weight', 'encoder.embed_tokens.weight', 'decoder.embed_tokens.weight')",
+    // Relative positions have no hard limit; n_positions is the trained length.
+    ctx: "first(cfg.n_positions, 512)",
+    src_cap: "ctx",
+    self_cap: "ctx",
+    eos: "first(cfg.eos_token_id, 1)",
+    decoder_start: "first(cfg.decoder_start_token_id, 0)",
+  },
+  checks: [
+    {expr: "!contains(['relu', 'gelu', 'gelu_new', 'gelu_pytorch_tanh', 'silu', 'swish', 'gated-relu', 'gated-gelu', 'gated-gelu_new', 'gated-gelu_pytorch_tanh', 'gated-silu', 'gated-swish'], proj)",
+     error: "feed_forward_proj '{proj}' is not supported"},
+  ],
+  names: {rules: [
+    // llama.cpp / ComfyUI `t5encoder` GGUF (gated FF).
+    ["token_embd.weight", "shared.weight"],
+    ["enc.output_norm.weight", "encoder.final_layer_norm.weight"],
+    ["enc.blk.{i}.attn_norm.weight", "encoder.block.{i}.layer.0.layer_norm.weight"],
+    ["enc.blk.{i}.attn_q.weight", "encoder.block.{i}.layer.0.SelfAttention.q.weight"],
+    ["enc.blk.{i}.attn_k.weight", "encoder.block.{i}.layer.0.SelfAttention.k.weight"],
+    ["enc.blk.{i}.attn_v.weight", "encoder.block.{i}.layer.0.SelfAttention.v.weight"],
+    ["enc.blk.{i}.attn_o.weight", "encoder.block.{i}.layer.0.SelfAttention.o.weight"],
+    ["enc.blk.{i}.attn_rel_b.weight", "encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight"],
+    ["enc.blk.{i}.ffn_norm.weight", "encoder.block.{i}.layer.1.layer_norm.weight"],
+    ["enc.blk.{i}.ffn_gate.weight", "encoder.block.{i}.layer.1.DenseReluDense.wi_0.weight"],
+    ["enc.blk.{i}.ffn_up.weight", "encoder.block.{i}.layer.1.DenseReluDense.wi_1.weight"],
+    ["enc.blk.{i}.ffn_down.weight", "encoder.block.{i}.layer.1.DenseReluDense.wo.weight"],
+  ]},
+  transforms: [
+    // RelPosBias reads an f32 `[buckets, heads]` table.
+    {tensor: "{s:*}.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight", op: "to_f32"},
+  ],
+  constants: {
+    // Key positions of the decoder's self-attention state.
+    "decoder.key_positions": {gen: "iota", args: {n: "self_cap"}},
+  },
+  // Tied copies of the shared table (one is read as `embed`); a tied checkpoint's saved head;
+  // the cross-attention bias table t5 v1.0 checkpoints carry and transformers never reads.
+  ignore: ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight", "lm_head.weight",
+           "decoder.block.*.layer.1.EncDecAttention.relative_attention_bias.weight"],
+  macros: {
+    // Pre-norm FF residual of block stem `f` (`...block.{i}.layer.{1|2}`).
+    t5_ffn: {params: ["x"], body: [
+      {use: "rms_norm", args: {w: "fmt('{f}.layer_norm')"}, in: ["x"], out: "h", name: "norm"},
+      {use: "mlp_glu", in: ["h"], out: "m", name: "mlp", when: "gated", args: {
+        gate: "fmt('{f}.DenseReluDense.wi_0')", up: "fmt('{f}.DenseReluDense.wi_1')", down: "fmt('{f}.DenseReluDense.wo')"}},
+      {use: "mlp_plain", in: ["h"], out: "m", name: "mlp", when: "!gated", args: {
+        up: "fmt('{f}.DenseReluDense.wi')", down: "fmt('{f}.DenseReluDense.wo')"}},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "m"], out: "out", name: "res"},
+    ]},
+  },
+  components: {
+    encoder: {
+      vars: ["rows"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "key_mask", dtype: "f32", shape: ["rows"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:{embed}", "i:token_ids"], out: "x", name: "embed"},
+        {repeat: "i", count: "layers", body: [
+          {let: {b: "fmt('encoder.block.{i}.layer')", rel: "fmt('encoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight')"}},
+          {block: [
+            {op: "RelPosBias", args: {buckets: "buckets", max_distance: "max_distance", bidirectional: true, heads: "heads"},
+             in: ["w:{rel}", "i:positions", "i:positions"], out: "rb", name: "enc{i}.relbias"},
+            {op: "Binary", args: {kind: "Add"}, in: ["rb", "i:key_mask"], out: "bias", name: "enc{i}.relmask"},
+          ], when: "has(rel)"},
+          {use: "rms_norm", args: {w: "fmt('{b}.0.layer_norm')"}, in: ["x"], out: "h", name: "enc{i}.ln1"},
+          {use: "attn_full", in: ["h", "bias"], out: "a", name: "enc{i}.attn", args: {
+            wq: "fmt('{b}.0.SelfAttention.q')", wk: "fmt('{b}.0.SelfAttention.k')", wv: "fmt('{b}.0.SelfAttention.v')",
+            wo: "fmt('{b}.0.SelfAttention.o')", qk_norm: "'none'", rotary_dim: 0, causal: false, scale: 1}},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "enc{i}.attn_res"},
+          {use: "t5_ffn", args: {f: "fmt('{b}.1')"}, in: ["x"], out: "x", name: "enc{i}.ffn"},
+        ]},
+        {use: "rms_norm", args: {w: "'encoder.final_layer_norm'"}, in: ["x"], out: "hidden", name: "enc.final_norm"},
+        {repeat: "l", count: "dec_layers", body: [
+          {op: "Linear", in: ["hidden", "w:decoder.block.{l}.layer.1.EncDecAttention.k.weight"], out: "xk.{l}", name: "xk.{l}"},
+          {op: "Linear", in: ["hidden", "w:decoder.block.{l}.layer.1.EncDecAttention.v.weight"], out: "xv.{l}", name: "xv.{l}"},
+        ], when: "first(cross, false)"},
+      ],
+      outputs: ["hidden",
+        {name: "xk.{l}", repeat: "l", count: "dec_layers", when: "first(cross, false)"},
+        {name: "xv.{l}", repeat: "l", count: "dec_layers", when: "first(cross, false)"}],
+    },
+    decoder: {
+      vars: [],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: [1]},
+        {name: "positions", dtype: "u32", shape: [1]},
+        {name: "self_mask", dtype: "f32", shape: ["self_cap"]},
+        {name: "cross_mask", dtype: "f32", shape: ["src_cap"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:{embed}", "i:token_ids"], out: "x", name: "embed"},
+        {repeat: "i", count: "dec_layers", body: [
+          {let: {b: "fmt('decoder.block.{i}.layer')", rel: "fmt('decoder.block.{i}.layer.0.SelfAttention.relative_attention_bias.weight')"}},
+          {use: "rms_norm", args: {w: "fmt('{b}.0.layer_norm')"}, in: ["x"], out: "h", name: "dec{i}.ln1"},
+          {op: "Linear", in: ["h", "w:{b}.0.SelfAttention.q.weight"], out: "q", name: "dec{i}.q"},
+          {op: "Linear", in: ["h", "w:{b}.0.SelfAttention.k.weight"], out: "k", name: "dec{i}.k"},
+          {op: "Linear", in: ["h", "w:{b}.0.SelfAttention.v.weight"], out: "v", name: "dec{i}.v"},
+          {state: "sk.{i}", shape: ["self_cap", "inner"]},
+          {state: "sv.{i}", shape: ["self_cap", "inner"]},
+          // Writes this position's K/V; its own output is unused (RelPosBias needs the biased
+          // `Attention` below, which reads the whole state).
+          {op: "CachedAttention", args: {heads: "heads", kv_heads: "heads", head_dim: "d_kv", v_head_dim: "d_kv", scale: 1,
+             causal: true, window: null, soft_cap: null, write: true},
+           in: ["q", "k", "v", "s:sk.{i}", "s:sv.{i}", "i:positions"], out: "kv_write", name: "dec{i}.kv_write"},
+          {block: [
+            {op: "RelPosBias", args: {buckets: "buckets", max_distance: "max_distance", bidirectional: false, heads: "heads"},
+             in: ["w:{rel}", "i:positions", "c:decoder.key_positions"], out: "rb", name: "dec{i}.relbias"},
+            {op: "Binary", args: {kind: "Add"}, in: ["rb", "i:self_mask"], out: "bias", name: "dec{i}.relmask"},
+          ], when: "has(rel)"},
+          {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false, window: null, soft_cap: null, scale: 1},
+           in: ["q", "s:sk.{i}", "s:sv.{i}", "bias"], out: "a", name: "dec{i}.self"},
+          {op: "Linear", in: ["a", "w:{b}.0.SelfAttention.o.weight"], out: "a", name: "dec{i}.o"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "dec{i}.attn_res"},
+          {use: "rms_norm", args: {w: "fmt('{b}.1.layer_norm')"}, in: ["x"], out: "h", name: "dec{i}.xln"},
+          {op: "Linear", in: ["h", "w:{b}.1.EncDecAttention.q.weight"], out: "q", name: "dec{i}.xq"},
+          {state: "xk.{i}", shape: ["src_cap", "inner"]},
+          {state: "xv.{i}", shape: ["src_cap", "inner"]},
+          {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false, window: null, soft_cap: null, scale: 1},
+           in: ["q", "s:xk.{i}", "s:xv.{i}", "i:cross_mask"], out: "a", name: "dec{i}.cross"},
+          {op: "Linear", in: ["a", "w:{b}.1.EncDecAttention.o.weight"], out: "a", name: "dec{i}.xo"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "dec{i}.cross_res"},
+          {use: "t5_ffn", args: {f: "fmt('{b}.2')"}, in: ["x"], out: "x", name: "dec{i}.ffn"},
+        ]},
+        {use: "rms_norm", args: {w: "'decoder.final_layer_norm'"}, in: ["x"], out: "h", name: "dec.final_norm"},
+        {op: "Unary", args: {kind: {Scale: "d_model ** -0.5"}}, in: ["h"], out: "h", name: "tied_scale", when: "tied"},
+        {op: "Linear", in: ["h", "w:{tied ? embed : 'lm_head.weight'}"], out: "logits", name: "lm_head"},
+      ],
+      outputs: ["logits"],
+    },
+  },
+  runtime: {text: "prompt_eos", encoder_buckets: [64, 256]},
+}

@@ -13,10 +13,12 @@
     shift: "first(cfg.shift_factor, 0)",
     latent_channels: "shape('decoder.conv_in.weight')[1]",
     in_channels: "shape('encoder.conv_in.weight')[1]",
-    up_levels: "count('decoder.up_blocks.{k}.resnets.0.conv1.weight')",
+    // LDM checkpoints keep their reversed decoder level index (`decoder.up_ldm.*`, see ldm_vae).
+    ldm_up: "has('decoder.up_ldm.0.resnets.0.conv1.weight')",
+    up_levels: "count(ldm_up ? 'decoder.up_ldm.{k}.resnets.0.conv1.weight' : 'decoder.up_blocks.{k}.resnets.0.conv1.weight')",
     down_levels: "count('encoder.down_blocks.{k}.resnets.0.conv1.weight')",
-    // Pixels per latent: one 2x upsampler per decoder level but the last.
-    factor: "2 ** count('decoder.up_blocks.{k}.upsamplers.0.conv.weight')",
+    // Pixels per latent: a 2x upsampler on every decoder level but the last.
+    factor: "2 ** (up_levels - 1)",
     groups: "first(cfg.norm_num_groups, 32)",
     eps: "1e-6",
   },
@@ -47,13 +49,14 @@
         {use: "conv", args: {w: "'decoder.conv_in'"}, in: ["i:z"], out: "x", name: "conv_in", when: "!has('post_quant_conv.weight')"},
         {use: "mid", args: {p: "'decoder.mid_block'"}, in: ["x"], out: "x", name: "mid"},
         {repeat: "l", count: "up_levels", body: [
-          {repeat: "j", count: "count('decoder.up_blocks.{l}.resnets.{k}.conv1.weight')", body: [
-            {use: "resnet", args: {p: "fmt('decoder.up_blocks.{l}.resnets.{j}')"}, in: ["x"], out: "x", name: "up{l}.res{j}"},
+          {let: {b: "ldm_up ? fmt('decoder.up_ldm.{up_levels - 1 - l}') : fmt('decoder.up_blocks.{l}')"}},
+          {repeat: "j", count: "count('{b}.resnets.{k}.conv1.weight')", body: [
+            {use: "resnet", args: {p: "fmt('{b}.resnets.{j}')"}, in: ["x"], out: "x", name: "up{l}.res{j}"},
           ]},
           {block: [
             {op: "Upsample", args: {scale: 2, mode: "Nearest"}, in: ["x"], out: "x", name: "up{l}.upsample"},
-            {use: "conv", args: {w: "fmt('decoder.up_blocks.{l}.upsamplers.0.conv')"}, in: ["x"], out: "x", name: "up{l}.upconv"},
-          ], when: "has(fmt('decoder.up_blocks.{l}.upsamplers.0.conv.weight'))"},
+            {use: "conv", args: {w: "fmt('{b}.upsamplers.0.conv')"}, in: ["x"], out: "x", name: "up{l}.upconv"},
+          ], when: "has(fmt('{b}.upsamplers.0.conv.weight'))"},
         ]},
         {use: "tail", args: {p: "'decoder'"}, in: ["x"], out: "image", name: "tail"},
       ],

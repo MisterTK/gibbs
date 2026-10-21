@@ -1,0 +1,22 @@
+// SD 1.x LDM single-file checkpoint (`*.safetensors` with `model.diffusion_model.*`,
+// `first_stage_model.*` and the CLIP-L tower under `cond_stage_model.transformer.`). Scheduler,
+// component configs and tokenizer settings come from the reference diffusers repo, as diffusers'
+// `from_single_file` does (`sd.rs` `load_single_file`).
+{
+  family: "sd1_file",
+  extends: "sd",
+  match: {
+    diffusers_class: [],
+    single_file_tensors: [["cond_stage_model.transformer.text_model.final_layer_norm.weight", "model.diffusion_model.input_blocks.0.0.weight"]],
+    single_file_ext: ["safetensors"],
+  },
+  components: {
+    text_encoder: {family: "ldm_clip", dir: "text_encoder"},
+    unet: {family: "ldm_unet", dir: "unet"},
+    vae: {family: "ldm_vae", dir: "vae"},
+  },
+  runtime: {
+    reference: "'stable-diffusion-v1-5/stable-diffusion-v1-5'",
+    summary: "fmt('SD 1.x single-file checkpoint (CLIP, UNet + VAE), {json.scheduler_config._class_name}')",
+  },
+}

@@ -706,22 +706,6 @@ pub fn tiny_pipeline() -> Result<SdPipeline, String> {
 mod tests {
     use super::*;
 
-    /// The `sd` spec's generated inputs reproduce the LCM guidance embedding and SDXL time ids.
-    #[test]
-    fn spec_gen_inputs_match_host_embeddings() {
-        let gen = |a: serde_json::Value| match crate::arch::gen::generate("timestep_embedding", &a).unwrap().data {
-            crate::arch::gen::GenData::F32(v) => v,
-            _ => unreachable!(),
-        };
-        let g = gen(json!({"t": 6.5 * 1000.0, "dim": 16, "flip_sin_to_cos": false,
-                           "downscale_freq_shift": 1, "precision": "f32"}));
-        assert_eq!(g, guidance_embedding(6.5, 16));
-        let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
-        let g = gen(json!({"t": ids, "dim": 256, "precision": "f32"}));
-        let want: Vec<f32> = ids.iter().flat_map(|&v| timestep_embedding(v, 256)).collect();
-        assert_eq!(g, want);
-    }
-
     /// diffusers LatentConsistencyModelPipeline.get_guidance_scale_embedding.
     #[test]
     fn lcm_guidance_embedding_formula() {

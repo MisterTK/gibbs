@@ -647,9 +647,10 @@ impl SpecDiffusion {
             is_cached: true,
             ..Default::default()
         };
-        // The spec's `checks` refuse component loads (a family may reference itself for its
-        // networks); the root holds no weights or config of its own.
+        // The spec's `checks` run on the root and on every component load (a family may
+        // reference itself for its networks): checks reading tensors or `cfg` guard on them.
         let root = crate::arch::load::load(&root_art, reg, family)?;
+        crate::arch::load::check(&root)?;
         let fam = root.spec.family.clone();
         let rt: Runtime = root.spec.runtime_as()?;
         let err = |e: String| format!("{fam}: {e}");
@@ -1629,13 +1630,16 @@ fn single_file(
             parts.push((name.clone(), weights.to_path_buf()));
         }
     }
-    for e in &rt.text_encoders {
-        for d in [Some(&e.tokenizer), e.tokenizer_config.as_ref()].into_iter().flatten() {
-            if !d.starts_with("hub:") {
-                // Optional files: whichever the tokenizer dir has.
-                for f in ["tokenizer.json", "special_tokens_map.json", "tokenizer_config.json", "spiece.model"] {
-                    let _ = hub.fetch_file(&reference, &format!("{d}/{f}"));
-                }
+    // Only the files each text entry reads (missing ones would be network round trips).
+    for e in rt.text_encoders.iter().filter(|e| !e.tokenizer.starts_with("hub:")) {
+        let d = &e.tokenizer;
+        if hub.fetch_file(&reference, &format!("{d}/tokenizer.json")).is_err() {
+            fetch(&format!("{d}/spiece.model"))?;
+        }
+        if e.pad_token.as_deref() == Some("config") {
+            let d = e.tokenizer_config.as_ref().unwrap_or(d);
+            for f in ["special_tokens_map.json", "tokenizer_config.json"] {
+                let _ = hub.fetch_file(&reference, &format!("{d}/{f}"));
             }
         }
     }

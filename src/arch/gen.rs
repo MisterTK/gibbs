@@ -283,7 +283,8 @@ fn axis_freqs(a: &Args) -> Result<Gen, String> {
 
 /// `sinusoid_table`: sinusoid position table, F32 `[rows, dim]`, `[sin | cos]` halves.
 /// Args: `rows`, `dim`, `kind`, optional `zero_row` (left all-zero: a padding id), `reverse`
-/// (row r holds position `rows-1-r`; default false).
+/// (row r holds position `rows-1-r`; default false), `start` (added to every row's position;
+/// default 0: fairseq tables read from position `2` drop the offset rows).
 /// - `standard`: angle `p / 10000^(2i/dim)` (`seq2seq.rs` `sinusoidal_marian`).
 /// - `tensor2tensor`: angle `p * exp(-i ln(10000) / (dim/2 - 1))` (`seq2seq.rs`
 ///   `sinusoidal_fairseq` with `zero_row: 1`; `gemma4/audio.rs` relative positions
@@ -292,6 +293,7 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
     let (rows, d) = (a.u("rows")?, a.u("dim")?);
     let zero = a.get("zero_row").map(|_| a.u("zero_row")).transpose()?;
     let reverse = a.b_or("reverse", false)?;
+    let start = a.get("start").map(|_| a.u("start")).transpose()?.unwrap_or(0);
     let half = d / 2;
     let kind = a.s_or("kind", "standard")?;
     let step = 10000f64.ln() / (half as f64 - 1.0);
@@ -305,7 +307,7 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
         if zero == Some(r) {
             continue;
         }
-        let p = if reverse { rows - 1 - r } else { r };
+        let p = if reverse { rows - 1 - r } else { r } + start;
         for i in 0..half {
             let x = angle(p, i);
             t[r * d + i] = x.sin() as f32;
@@ -344,9 +346,8 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
 /// embeddings concatenated, `[n * dim]` (SDXL `add_time_ids`).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
-/// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
-/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults, `sd.rs` `guidance_embedding` with
-/// `flip_sin_to_cos: false, downscale_freq_shift: 1`.
+/// diffusers `get_timestep_embedding` (`precision: "f32"` for f32 sources; a guidance embedding
+/// with `flip_sin_to_cos: false, downscale_freq_shift: 1`).
 fn timestep_embedding(a: &Args) -> Result<Gen, String> {
     let dim = a.u("dim")?;
     let f32p = match a.s_or("precision", "f64")? {
@@ -698,7 +699,7 @@ fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
 }
 
 /// `causal_key_mask`: F32 `[cap]`, 0 for keys `j <= pos`, else `masked` (default -inf).
-/// Source: `encdec_gpu.rs` `step`.
+/// Source: the former `encdec_gpu.rs` `step`.
 fn causal_key_mask(a: &Args) -> Result<Gen, String> {
     let (cap, pos) = (a.u("cap")?, a.u("pos")?);
     let m = a.f_or("masked", f64::NEG_INFINITY)? as f32;
@@ -805,6 +806,9 @@ mod tests {
         // gemma4 audio relative positions left..=0 (left = 2): last row is position 0.
         let rel = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 3, "dim": 4, "reverse": true}));
         assert_eq!(rel[8..], [0.0, 0.0, 1.0, 1.0]);
+        let off = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 3, "dim": 4, "start": 2}));
+        let full = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 5, "dim": 4}));
+        assert_eq!(off, full[8..]);
         assert_eq!(rel[0], 2f32.sin());
         assert_eq!(rel[1], (2.0 * (-(10000f64.ln())).exp()).sin() as f32);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4})), [1.0, 1.0, 0.0, 0.0]);
@@ -951,11 +955,31 @@ mod tests {
 
         #[test]
         fn sinusoid_tables_match_sources() {
+            // The former `seq2seq.rs` tables (Marian; fairseq with padding row 1).
+            fn table(rows: usize, d: usize, fairseq: bool) -> Vec<f32> {
+                let mut t = vec![0.0f32; rows * d];
+                let half = d / 2;
+                let step = (10000f64).ln() / (half as f64 - 1.0);
+                for p in 0..rows {
+                    if fairseq && p == 1 {
+                        continue;
+                    }
+                    for i in 0..half {
+                        let a = match fairseq {
+                            true => p as f64 * (-(i as f64) * step).exp(),
+                            false => p as f64 / 10000f64.powf(2.0 * i as f64 / d as f64),
+                        };
+                        t[p * d + i] = a.sin() as f32;
+                        t[p * d + half + i] = a.cos() as f32;
+                    }
+                }
+                t
+            }
             for (rows, d) in [(10, 8), (33, 64)] {
                 let m = f("sinusoid_table", json!({"kind": "standard", "rows": rows, "dim": d}));
-                assert_eq!(bits(&m), bits(&model::seq2seq::sinusoidal_marian(rows, d)));
+                assert_eq!(bits(&m), bits(&table(rows, d, false)));
                 let fs = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": rows, "dim": d, "zero_row": 1}));
-                assert_eq!(bits(&fs), bits(&model::seq2seq::sinusoidal_fairseq(rows, d)));
+                assert_eq!(bits(&fs), bits(&table(rows, d, true)));
             }
         }
 
@@ -977,6 +1001,49 @@ mod tests {
                 .flat_map(|i| [s(t as f64 * 1000.0, 16), s(0.0, 16), s(i as f64 * 1000.0, 32)].concat())
                 .collect();
             let got = f("modulation_index_rows", json!({"t": t as f64, "rows": 3, "dims": [16, 16, 32], "scale": 1000.0}));
+            assert_eq!(bits(&got), bits(&want));
+        }
+
+        /// The `sd` spec's generated inputs: the LCM guidance embedding (`sd.rs`
+        /// `guidance_embedding`) and SDXL's 6 time-id embeddings (`unet.rs` `timestep_embedding`
+        /// per id), old formulas inlined.
+        #[test]
+        fn sd_embeddings_match_sources() {
+            // `sd.rs` `guidance_embedding`, verbatim; `black_box` keeps LLVM from folding the
+            // sin/cos of constants at compile time (an ulp off the runtime libm).
+            #[inline(never)]
+            fn guidance_embedding(w: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let w = w * 1000.0;
+                let f = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
+                let mut e: Vec<f32> = (0..half).map(|i| (w * f(i)).sin()).collect();
+                e.extend((0..half).map(|i| (w * f(i)).cos()));
+                e.resize(dim, 0.0);
+                e
+            }
+            let (w, dim) = (6.5f32, 16usize);
+            let want = guidance_embedding(std::hint::black_box(w), dim);
+            let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
+                "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
+            assert_eq!(bits(&got), bits(&want));
+
+            let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
+            // `unet.rs` `timestep_embedding`, verbatim.
+            #[inline(never)]
+            fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let mut emb = vec![0.0f32; dim];
+                for i in 0..half {
+                    let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                    let arg = t * freq;
+                    emb[i] = arg.cos();
+                    emb[half + i] = arg.sin();
+                }
+                emb
+            }
+            let want: Vec<f32> =
+                std::hint::black_box(ids).iter().flat_map(|&t| timestep_embedding(t, 256)).collect();
+            let got = f("timestep_embedding", json!({"t": ids, "dim": 256, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
         }
 

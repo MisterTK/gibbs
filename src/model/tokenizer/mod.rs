@@ -1,3 +1,4 @@
+pub mod seq2seq;
 use std::collections::HashMap;
 
 /// Byte-level Pair / Byte-level Tokenizer & Detokenizer.

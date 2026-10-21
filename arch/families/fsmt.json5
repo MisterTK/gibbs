@@ -1,0 +1,8 @@
+// FSMT / wmt19 (`modeling_fsmt.py`): BART layout, post-LN, fairseq sinusoid positions from 2,
+// separate source and target vocabularies, untied `output_projection` head.
+{
+  family: "fsmt",
+  extends: "bart",
+  match: {hf_model_type: ["fsmt"], hf_architectures: ["FSMTForConditionalGeneration"]},
+  config: {pre_ln: "false", pos_kind: "'tensor2tensor'", pos_start: "2"},
+}
