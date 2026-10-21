@@ -1934,7 +1934,7 @@ fn g_embed(
 }
 
 fn mha(heads: usize) -> Op {
-    Op::Attention { heads, kv_heads: heads, causal: false, window: None, soft_cap: None }
+    Op::Attention { heads, kv_heads: heads, causal: false, window: None, soft_cap: None, scale: None }
 }
 
 /// Encoder over `n` (padded) source rows: ids, position rows and a `[n]` key mask in; every

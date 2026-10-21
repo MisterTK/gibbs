@@ -64,6 +64,9 @@ fn unary_code(op: &Op) -> Option<(u32, f32, f32)> {
             UnaryKind::Scale(s) => (13, *s, 0.0),
             UnaryKind::Clamp(lo, hi) => (14, *lo, *hi),
             UnaryKind::SoftCap(cap) => (15, *cap, 0.0),
+            UnaryKind::Ln => (16, 0.0, 0.0),
+            UnaryKind::RoundEven => (17, 0.0, 0.0),
+            UnaryKind::Sign => (18, 0.0, 0.0),
         },
         _ => return None,
     })
@@ -412,6 +415,9 @@ mod tests {
             (Clamp(0.0, 6.0), 9.0, false),
             (SoftCap(30.0), 90.0, false),
             (SoftCap(2.0), 9.0, false),
+            (Ln, 10.0, true),
+            (RoundEven, 6.0, false),
+            (Sign, 3.0, false),
         ]
         .into_iter()
         .map(|(k, s, p)| (Op::Unary { kind: k }, s, p))
@@ -482,6 +488,28 @@ mod tests {
             let (want, got) = run1(Op::Unary { kind: kind.clone() }, x.clone());
             close(&want, &got, 1e-5, &format!("{kind:?} edge"));
         }
+    }
+
+    /// `RoundEven` ties go to the even neighbour, `Sign` maps zeros and NaN to 0, `Ln` of 0 is -inf
+    /// and of a negative is NaN: Metal agrees with the CPU exactly.
+    #[test]
+    fn ln_round_even_sign_edges() {
+        use UnaryKind::*;
+        let x = vec![
+            -2.5f32, -1.5, -0.5, 0.5, 1.5, 2.5, 3.49, -3.51, 0.0, -0.0, 1e-30, 7.0, -7.0, f32::NAN,
+        ];
+        let want_round = [-2.0f32, -2.0, -0.0, 0.0, 2.0, 2.0, 3.0, -4.0, 0.0, -0.0, 0.0, 7.0, -7.0];
+        let (cpu, gpu) = run1(Op::Unary { kind: RoundEven }, x.clone());
+        assert_eq!(&cpu[..13], &want_round);
+        assert_eq!(cpu[..13], gpu[..13]);
+        let want_sign = [-1.0f32, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0, -1.0, 0.0];
+        let (cpu, gpu) = run1(Op::Unary { kind: Sign }, x.clone());
+        assert_eq!(cpu, want_sign);
+        assert_eq!(gpu, want_sign);
+        let (cpu, gpu) = run1(Op::Unary { kind: Ln }, vec![0.0, 1e-30, 0.5, 1.0, 2.718_281_8, 1e30, -1.0]);
+        close(&cpu, &gpu, 1e-5, "Ln edges");
+        assert_eq!(cpu[0], f32::NEG_INFINITY);
+        assert!(cpu[6].is_nan());
     }
 
     fn prod(s: &[usize]) -> usize {

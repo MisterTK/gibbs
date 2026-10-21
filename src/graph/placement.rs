@@ -73,7 +73,11 @@ fn node_dtype(graph: &Graph, node: &crate::graph::Node) -> DType {
     let operand = |i: usize| node.inputs.get(i).map(|&v| graph.value(v).dtype);
     match &node.op {
         Op::Linear | Op::MoeLinear { .. } => operand(1),
-        Op::TopK { .. } | Op::GatherCols => operand(0),
+        Op::TopK { .. }
+        | Op::GatherCols
+        | Op::StateWrite
+        | Op::QsaSelect { .. }
+        | Op::QsaBias { .. } => operand(0),
         Op::Embedding => operand(0),
         Op::Megakernel(_) => operand(2),
         _ => node.outputs.first().map(|&v| graph.value(v).dtype),

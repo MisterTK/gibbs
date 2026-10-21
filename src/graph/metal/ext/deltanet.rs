@@ -252,7 +252,7 @@ fn chains(
     {
         return Ok(Vec::new());
     }
-    let is_state = |v: ValueId| matches!(g.value(v).kind, ValueKind::State(_));
+    let is_state = |v: ValueId| matches!(g.value(v).kind, ValueKind::State { .. });
     let len = |v: ValueId| numel(g, v).ok();
     let vi = |v: ValueId| v.0 as i64;
     let (schema, run) = PROGRAM.split_at(PROGRAM.find("(run-schedule").expect("schedule"));
@@ -275,7 +275,7 @@ fn chains(
             if let Some(n) = len(id) {
                 fs.add("Len", (vid as i64, n as i64))?;
             }
-            if matches!(v.kind, ValueKind::State(_)) {
+            if matches!(v.kind, ValueKind::State { .. }) {
                 fs.add("IsSt", vid as i64)?;
             }
         }
@@ -640,8 +640,8 @@ mod tests {
             vec![vd],
             rand(vd, 8).iter().map(|v| 1.0 + 0.2 * v).collect(),
         );
-        let conv_state = g.state("conv_state", vec![kw - 1, cd], f);
-        let ssm_state = g.state("ssm_state", vec![vh * kd * vd], f);
+        let conv_state = g.state("conv_state", vec![kw - 1, cd], f, true);
+        let ssm_state = g.state("ssm_state", vec![vh * kd * vd], f, true);
         let conv = g.add(
             "conv",
             Op::CausalConv1dCached {

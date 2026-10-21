@@ -49,6 +49,9 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Conv3d { .. }
         | Op::RelPosBias { .. }
         | Op::StateReorder
+        | Op::StateWrite
+        | Op::QsaSelect { .. }
+        | Op::QsaBias { .. }
         | Op::Attention { .. }
         | Op::Megakernel(_) => true,
         Op::Reshape { .. }
@@ -112,7 +115,7 @@ pub fn run(
                         .ok_or_else(|| format!("weight '{}' is missing", v.name))?,
                 );
             }
-            ValueKind::State(state_name) => {
+            ValueKind::State { name: state_name, .. } => {
                 if let Some(t) = state.get(state_name) {
                     slots[i] = Some(t.clone());
                 } else {
@@ -493,6 +496,19 @@ pub fn run(
                     super::UnaryKind::SoftCap(cap) => {
                         x.iter_mut().for_each(|v| *v = cap * (*v / cap).tanh())
                     }
+                    super::UnaryKind::Ln => x.iter_mut().for_each(|v| *v = v.ln()),
+                    super::UnaryKind::RoundEven => {
+                        x.iter_mut().for_each(|v| *v = v.round_ties_even())
+                    }
+                    super::UnaryKind::Sign => x.iter_mut().for_each(|v| {
+                        *v = if *v > 0.0 {
+                            1.0
+                        } else if *v < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    }),
                 }
                 x
             }
@@ -807,6 +823,58 @@ pub fn run(
                 }
                 out
             }
+            Op::StateWrite => {
+                let ValueKind::State { name: sname, .. } = &graph.value(ins[0]).kind else {
+                    return Err(format!(
+                        "node '{name}': StateWrite operand 0 must be a graph state"
+                    ));
+                };
+                let w = last_dim(0);
+                let mut buf = operand(&bound, &slots, ins, name, 0)?.to_vec();
+                let rows = operand(&bound, &slots, ins, name, 1)?;
+                let pos0 = operand_u32(&bound, &slots, ins, name, 2)?
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("node '{name}': StateWrite pos0 is empty"))?
+                    as usize;
+                if w == 0 || last_dim(1) != w || rows.len() % w != 0 {
+                    return Err(format!(
+                        "node '{name}': StateWrite rows are not [m, {w}] like the state"
+                    ));
+                }
+                let m = rows.len() / w;
+                if (pos0 + m) * w > buf.len() {
+                    return Err(format!(
+                        "node '{name}': writing rows {pos0}..{} past the state's {} rows",
+                        pos0 + m,
+                        buf.len() / w
+                    ));
+                }
+                buf[pos0 * w..(pos0 + m) * w].copy_from_slice(rows);
+                // Later nodes reading this state (any value id) see the write.
+                for (j, v) in graph.values.iter().enumerate() {
+                    if matches!(&v.kind, ValueKind::State { name: n, .. } if n == sname)
+                        && slots[j].is_some()
+                    {
+                        slots[j] = Some(Tensor::F32(buf.clone()));
+                    }
+                }
+                state.insert(sname, Tensor::F32(buf));
+                out_u32 = Some(vec![(pos0 + m) as u32]);
+                Vec::new()
+            }
+            Op::QsaSelect { ratio, top_blocks } | Op::QsaBias { ratio, top_blocks } => {
+                let score = operand(&bound, &slots, ins, name, 0)?;
+                let pos = operand_u32(&bound, &slots, ins, name, 1)?;
+                let (ids, bias) = qsa_select(score, last_dim(0), pos, *ratio, *top_blocks)
+                    .map_err(|e| format!("node '{name}': {e}"))?;
+                if matches!(node.op, Op::QsaSelect { .. }) {
+                    out_u32 = Some(ids);
+                    Vec::new()
+                } else {
+                    bias
+                }
+            }
             Op::CachedAttention {
                 heads,
                 kv_heads,
@@ -917,12 +985,12 @@ pub fn run(
                 }
                 if *write && ins.len() >= 6 {
                     for (slot_id, buf) in [(ins[3], &k_buf), (ins[4], &v_buf)] {
-                        if let ValueKind::State(sname) = &graph.value(slot_id).kind {
+                        if let ValueKind::State { name: sname, .. } = &graph.value(slot_id).kind {
                             state.insert(sname, Tensor::F32(buf.clone()));
                             // Layers sharing this cache (`write: false`) hold their own value ids
                             // for the same state; they must see this step's write.
                             for (j, v) in graph.values.iter().enumerate() {
-                                if matches!(&v.kind, ValueKind::State(n) if n == sname)
+                                if matches!(&v.kind, ValueKind::State { name: n, .. } if n == sname)
                                     && slots[j].is_some()
                                     && j != slot_id.0 as usize
                                 {
@@ -1068,7 +1136,7 @@ pub fn run(
                 }
                 let new_state = window[n * channels..].to_vec();
                 if ins.len() >= 3 {
-                    if let ValueKind::State(sname) = &graph.value(ins[2]).kind {
+                    if let ValueKind::State { name: sname, .. } = &graph.value(ins[2]).kind {
                         state.insert(sname, Tensor::F32(new_state));
                     }
                 }
@@ -1153,7 +1221,7 @@ pub fn run(
                     }
                 }
                 if ins.len() > 5 {
-                    if let ValueKind::State(sname) = &graph.value(ins[5]).kind {
+                    if let ValueKind::State { name: sname, .. } = &graph.value(ins[5]).kind {
                         state.insert(sname, Tensor::F32(ssm_state));
                     }
                 }
@@ -1488,6 +1556,7 @@ pub fn run(
                 causal,
                 window,
                 soft_cap,
+                scale,
             } => {
                 let (q, k, v) = (
                     operand(&bound, &slots, ins, name, 0)?,
@@ -1524,11 +1593,18 @@ pub fn run(
                         ));
                     }
                 }
-                if kv_heads == heads && window.is_none() && soft_cap.is_none() && bias.is_none() {
+                let scale = scale.unwrap_or(1.0 / (d as f32).sqrt());
+                if kv_heads == heads
+                    && window.is_none()
+                    && soft_cap.is_none()
+                    && bias.is_none()
+                    && scale == 1.0 / (d as f32).sqrt()
+                {
                     nn::attention(q, k, v, nq, nk, *heads, d, *causal)
                 } else {
                     attention_general(
                         q, k, v, bias, nq, nk, *heads, *kv_heads, d, *causal, *window, *soft_cap,
+                        scale,
                     )
                 }
             }
@@ -2273,6 +2349,53 @@ pub(crate) fn topk_row(row: &[f32], k: usize) -> Vec<u32> {
     order
 }
 
+/// `Op::QsaSelect` ids and `Op::QsaBias` bias (`[n, K]` each, `K = top_blocks * ratio + ratio - 1`)
+/// of `score` (`[n, b]`) at `positions` (`[n]`); semantics on [`Op::QsaSelect`].
+pub(crate) fn qsa_select(
+    score: &[f32],
+    b: usize,
+    positions: &[u32],
+    ratio: usize,
+    top_blocks: usize,
+) -> Result<(Vec<u32>, Vec<f32>), String> {
+    let n = positions.len();
+    if ratio == 0 || score.len() != n * b {
+        return Err(format!(
+            "QSA needs ratio >= 1 and score [{n}, B], got ratio {ratio} over {} scores",
+            score.len()
+        ));
+    }
+    let k = top_blocks * ratio + ratio - 1;
+    let (mut ids, mut bias) = (vec![0u32; n * k], vec![f32::NEG_INFINITY; n * k]);
+    for (t, &p) in positions.iter().enumerate() {
+        let visible = p as usize + 1;
+        let blocks = visible / ratio;
+        if blocks > b {
+            return Err(format!(
+                "row {t} at position {p} sees {blocks} complete blocks, score has {b}"
+            ));
+        }
+        let keys: Vec<u32> = if blocks <= top_blocks {
+            (0..visible as u32).collect()
+        } else {
+            let row = &score[t * b..][..blocks];
+            let mut best: Vec<(f32, u32)> = (0..blocks as u32).map(|j| (row[j as usize], j)).collect();
+            best.select_nth_unstable_by(top_blocks.max(1) - 1, |x, y| {
+                y.0.total_cmp(&x.0).then(x.1.cmp(&y.1))
+            });
+            best.truncate(top_blocks);
+            best.sort_unstable_by_key(|s| s.1);
+            best.iter()
+                .flat_map(|&(_, j)| j * ratio as u32..(j + 1) * ratio as u32)
+                .chain((blocks * ratio) as u32..visible as u32)
+                .collect()
+        };
+        ids[t * k..][..keys.len()].copy_from_slice(&keys);
+        bias[t * k..][..keys.len()].fill(0.0);
+    }
+    Ok((ids, bias))
+}
+
 /// Row `row` (of `out.len()` weights) of the expert bank `bank` as f32.
 fn bank_row(bank: &Tensor, row: usize, out: &mut [f32]) -> Result<(), String> {
     let cols = out.len();
@@ -2501,9 +2624,9 @@ fn attention_general(
     causal: bool,
     window: Option<usize>,
     soft_cap: Option<f32>,
+    scale: f32,
 ) -> Vec<f32> {
     let (qw, kw, rep) = (heads * d, kv_heads * d, heads / kv_heads);
-    let scale = 1.0 / (d as f32).sqrt();
     let mut out = vec![0.0f32; nq * qw];
     let mut s = vec![0.0f32; nk];
     for qi in 0..nq {
@@ -2946,8 +3069,8 @@ mod tests {
         let q = g.input("q", vec![1, 4], DType::F32);
         let k = g.input("k", vec![1, 4], DType::F32);
         let v = g.input("v", vec![1, 4], DType::F32);
-        let ks = g.state("k_state", vec![16, 4], DType::F32);
-        let vs = g.state("v_state", vec![16, 4], DType::F32);
+        let ks = g.state("k_state", vec![16, 4], DType::F32, false);
+        let vs = g.state("v_state", vec![16, 4], DType::F32, false);
         let pos = g.input("pos", vec![1], DType::U32);
         let out = g.add(
             "attn",
@@ -3031,7 +3154,7 @@ mod tests {
         let mut g_step = Graph::new();
         let x_step = g_step.input("x", vec![1, 1], DType::F32);
         let w_step = g_step.weight("w", vec![2], DType::F32);
-        let s_step = g_step.state("conv_state", vec![1, 1], DType::F32);
+        let s_step = g_step.state("conv_state", vec![1, 1], DType::F32, true);
         let out_step = g_step.add(
             "conv",
             Op::CausalConv1dCached {
@@ -3101,7 +3224,7 @@ mod tests {
         let v_s = g_step.input("v", vec![1, 2], DType::F32);
         let beta_s = g_step.input("beta", vec![1], DType::F32);
         let ld_s = g_step.input("log_decay", vec![1], DType::F32);
-        let ssm_state = g_step.state("ssm_state", vec![1, 2, 2], DType::F32);
+        let ssm_state = g_step.state("ssm_state", vec![1, 2, 2], DType::F32, true);
         let out_s = g_step.add(
             "delta",
             Op::DeltaRule {

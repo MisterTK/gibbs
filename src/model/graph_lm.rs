@@ -1201,6 +1201,7 @@ impl GraphLm {
             causal: true,
             window: None,
             soft_cap: None,
+            scale: None,
         };
 
         let attn_w = c.attn_dim();
@@ -1356,11 +1357,12 @@ impl GraphLm {
                 }
                 let mut conv_in = vec![bx, taps_w];
                 if cached {
-                    // `conv_state` in the name: `StateStore::truncate` refuses to rewind recurrent state.
+                    // Recurrent: `StateStore::truncate` refuses to rewind it.
                     conv_in.push(g.state(
                         format!("layers.{i}.conv_state"),
                         vec![kernel - 1, h],
                         DType::F32,
+                        true,
                     ));
                 }
                 let op = Op::CausalConv1dCached {
@@ -1386,11 +1388,13 @@ impl GraphLm {
                     format!("kv.{i}.k"),
                     vec![c.max_seq_len, c.num_heads * c.head_dim],
                     DType::F32,
+                    false,
                 );
                 let v_state = g.state(
                     format!("kv.{i}.v"),
                     vec![c.max_seq_len, c.num_heads * c.head_dim],
                     DType::F32,
+                    false,
                 );
                 g.add(
                     format!("{p}.self_attn"),
@@ -4643,7 +4647,10 @@ mod tests {
             crate::graph::Tensor::U32(vec![0]),
         ];
         crate::graph::cpu::run(&g, &w, &mut state, inputs).expect("decode runs");
-        assert!(state.truncate(0).unwrap_err().contains("conv_state"));
+        assert!(state
+            .truncate(0, &g.recurrent_states())
+            .unwrap_err()
+            .contains("conv_state"));
     }
 
     /// `graph::shape::infer` reproduces every node of the GraphLm graphs (prefill, cached and

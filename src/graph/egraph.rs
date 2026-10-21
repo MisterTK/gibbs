@@ -1279,6 +1279,7 @@ mod tests {
             causal: true,
             window: None,
             soft_cap: None,
+            scale: None,
         };
         let a = b.op("attn", attn, &[q, k, v], vec![rows, 64]);
         let o = b.lin("o", a, 64);
@@ -1300,15 +1301,15 @@ mod tests {
 
     #[test]
     fn megakernel_mlp_and_qkv_fuse() {
-        let r = check("layer", &layer(1, false, false, false), 0xf8ece718cf2b91b2);
+        let r = check("layer", &layer(1, false, false, false), 0x8704a1b9129c7244);
         assert_eq!(r.applied, [1, 0, 1, 0]);
         let r = check(
             "post-norm, swapped",
             &layer(1, true, true, false),
-            0x06512cb92e10d33e,
+            0x23b98b5d9122b1c6,
         );
         assert_eq!(r.applied, [1, 0, 1, 0]);
-        let r = check("geglu", &layer(1, false, true, true), 0x2cc601392e956613);
+        let r = check("geglu", &layer(1, false, true, true), 0xac127d60b16a6a85);
         assert_eq!(r.applied, [1, 0, 1, 0]);
     }
 
@@ -1318,7 +1319,7 @@ mod tests {
         let r = check(
             "two rows",
             &layer(2, false, false, false),
-            0x8d3eddb86ea59653,
+            0x5d6a683c206fcc55,
         );
         assert_eq!(r.applied, [0, 1, 1, 0]);
     }
@@ -1449,8 +1450,8 @@ mod tests {
         };
         let qr = b.op("qr", rope.clone(), &[qs, pos], vec![1, 64]);
         let kr = b.op("kr", rope, &[ks, pos], vec![1, 32]);
-        let kst = b.g.state("k_cache", vec![16, 32], DType::F32);
-        let vst = b.g.state("v_cache", vec![16, 32], DType::F32);
+        let kst = b.g.state("k_cache", vec![16, 32], DType::F32, false);
+        let vst = b.g.state("v_cache", vec![16, 32], DType::F32, false);
         let attn = Op::CachedAttention {
             heads: 2,
             kv_heads: 1,
@@ -1468,7 +1469,7 @@ mod tests {
 
         let (got, r) = by_egraph(gw, &[Rule::QkvSlicesAttn], &CostModel::constants());
         assert_eq!(r.applied, [0, 0, 0, 1]);
-        assert_eq!(digest(&got), 0x80577259c0881959, "qkv slices attn: golden");
+        assert_eq!(digest(&got), 0x60b562d4ff6d6669, "qkv slices attn: golden");
     }
 
     #[test]
@@ -1505,12 +1506,12 @@ mod tests {
             ),
         ];
         let want = [
-            ([4, 0, 4, 0], 0xd7511e08af7a8e06),
-            ([0; 4], 0x0c9f89f861991093),
-            ([1, 0, 0, 0], 0xf2c0536e6a69910f),
-            ([0; 4], 0xad1ccf01de308e25),
-            ([2, 0, 0, 0], 0xddacfb31b24a368d),
-            ([0; 4], 0xa518af0687efe3a1),
+            ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
+            ([0; 4], 0x927782df5841c11f),
+            ([1, 0, 0, 0], 0x179d42b51929ff2d),
+            ([0; 4], 0xfd7c1aa58cb7c429),
+            ([2, 0, 0, 0], 0x6b1f0639ee510a71),
+            ([0; 4], 0x210429b4ede3d839),
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);

@@ -148,11 +148,13 @@ impl Gemma4Graph {
                 format!("kv.{l}.k"),
                 vec![8192, kv_heads * head_dim],
                 DType::F32,
+                false,
             );
             let vs = g.state(
                 format!("kv.{l}.v"),
                 vec![8192, kv_heads * head_dim],
                 DType::F32,
+                false,
             );
             let att = g.add(
                 format!("{p}.self_attn.att"),

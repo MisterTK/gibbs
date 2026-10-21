@@ -7,7 +7,7 @@ type Operand<'a> = (&'a [usize], DType);
 
 /// Output `(shape, dtype)` of `op` applied to `inputs` (in operand order). Errors name the op and
 /// the operand shapes. Activations are F32 (weights of any storage, quantized included, yield F32);
-/// `TopK` yields U32 and data-movement ops keep a U32 operand's dtype.
+/// `TopK`, `QsaSelect` and `StateWrite` yield U32 and data-movement ops keep a U32 operand's dtype.
 pub fn infer(op: &Op, inputs: &[Operand]) -> Result<(Vec<usize>, DType), String> {
     let fail = |msg: String| {
         let shapes: Vec<_> = inputs.iter().map(|(s, d)| format!("{s:?} {d:?}")).collect();
@@ -324,6 +324,30 @@ pub fn infer(op: &Op, inputs: &[Operand]) -> Result<(Vec<usize>, DType), String>
         Op::StateReorder => {
             need(2)?;
             f32(s(0).to_vec())
+        }
+        Op::StateWrite => {
+            need(3)?;
+            if s(0).len() != 2 || last(1) != last(0) || numel(2) != 1 || inputs[2].1 != DType::U32 {
+                return Err(fail(format!(
+                    "needs state [cap, w], rows [m, {}] and pos0 [1] U32",
+                    last(0)
+                )));
+            }
+            Ok((vec![1], DType::U32))
+        }
+        Op::QsaSelect { ratio, top_blocks } | Op::QsaBias { ratio, top_blocks } => {
+            need(2)?;
+            if *ratio == 0 || s(0).len() != 2 || numel(1) != s(0)[0] || inputs[1].1 != DType::U32 {
+                return Err(fail(format!(
+                    "needs ratio >= 1 (got {ratio}), score [n, B] and positions [n] U32"
+                )));
+            }
+            let k = top_blocks * ratio + ratio - 1;
+            let dtype = match op {
+                Op::QsaSelect { .. } => DType::U32,
+                _ => DType::F32,
+            };
+            Ok((vec![s(0)[0], k], dtype))
         }
         Op::Reshape { shape } => match shape {
             Some(t) if t.iter().product::<usize>() == numel(0) => Ok((t.clone(), moved(0))),

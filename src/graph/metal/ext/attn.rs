@@ -184,6 +184,7 @@ fn plan_attention(g: &Graph, node: &Node) -> Result<PlanOut<Step>, String> {
         causal,
         window,
         soft_cap,
+        scale,
     } = node.op
     else {
         unreachable!("dispatched on Op::Attention")
@@ -247,7 +248,7 @@ fn plan_attention(g: &Graph, node: &Node) -> Result<PlanOut<Step>, String> {
         flags: causal as u32 | (window.is_some() as u32) << 1 | (soft_cap.is_some() as u32) << 2,
         window: window.map_or(Ok(0), u32_of)?,
         bias_mode,
-        scale: 1.0 / (head_dim as f32).sqrt(),
+        scale: scale.unwrap_or(1.0 / (head_dim as f32).sqrt()),
         soft_cap: soft_cap.unwrap_or(1.0),
     };
     let kernel = match head_dim.div_ceil(32) {
@@ -535,6 +536,7 @@ mod tests {
         causal: bool,
         window: Option<usize>,
         cap: Option<f32>,
+        scale: Option<f32>,
         bias: Bias,
         /// Multiplies q and k so scores are large enough for a soft cap to bite.
         gain: f32,
@@ -551,6 +553,7 @@ mod tests {
                 causal: false,
                 window: None,
                 cap: None,
+                scale: None,
                 bias: Bias::None,
                 gain: 1.0,
             }
@@ -604,6 +607,7 @@ mod tests {
             causal: c.causal,
             window: c.window,
             soft_cap: c.cap,
+            scale: c.scale,
         };
         let a = g.add("attn", op, &ins, vec![c.nq, qw], F);
         g.output(a);
@@ -728,6 +732,30 @@ mod tests {
         }
     }
 
+    /// An explicit `scale` replaces 1/sqrt(head_dim) on both executors (and changes the result).
+    #[test]
+    fn explicit_scale() {
+        for scale in [1.0, 0.05] {
+            for (causal, window, cap) in [(false, None, None), (true, Some(5), Some(8.0))] {
+                let c = Case {
+                    causal,
+                    window,
+                    cap,
+                    scale: Some(scale),
+                    gain: 2.0,
+                    ..Case::new(19, 19, 4, 2, 32)
+                };
+                let (scaled, _) = check_with(&c, None);
+                let (plain, _) = run(&Case { scale: None, ..c.clone() }, None);
+                let diff = scaled
+                    .iter()
+                    .zip(&plain)
+                    .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(diff > 1e-3, "scale {scale} left {c:?} unchanged ({diff:e})");
+            }
+        }
+    }
+
     #[test]
     fn bias_operand_forms() {
         for bias in [Bias::Keys, Bias::Rows, Bias::Heads] {
@@ -847,6 +875,7 @@ mod tests {
                 causal,
                 window: Some(w),
                 soft_cap: None,
+                scale: None,
             };
             let a = g.add("attn", op, &[q, k, v], vec![n, n], F);
             g.output(a);
@@ -891,6 +920,7 @@ mod tests {
                     causal: true,
                     window,
                     soft_cap: cap,
+                    scale: None,
                 };
                 let cached = Op::CachedAttention {
                     heads,
@@ -966,6 +996,7 @@ mod tests {
                 causal,
                 window: None,
                 soft_cap: None,
+                scale: None,
             };
             let a = g.add("attn", op, &[q, k, v, bias], vec![nq, heads * hd], F);
             g.output(a);
@@ -1180,6 +1211,7 @@ mod tests {
             causal: true,
             window,
             soft_cap,
+            scale: None,
         };
         assert!(supports(&attn(4, 2, Some(8), Some(30.0)), F));
         assert!(!supports(&attn(4, 2, None, None), DType::F16));

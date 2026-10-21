@@ -230,7 +230,7 @@ impl Gb {
         let s = self.shape(q).to_vec();
         self.op(
             "attn",
-            Op::Attention { heads, kv_heads: heads, causal: false, window: None, soft_cap: None },
+            Op::Attention { heads, kv_heads: heads, causal: false, window: None, soft_cap: None, scale: None },
             &[q, k, v],
             &s,
         )

@@ -503,7 +503,14 @@ pub(super) fn batches(
                 _ => None,
             };
             let gemv = matches!(s.op, Step::GemvPacked { .. });
-            if kind.is_none() && solo && (gemv || commute) {
+            // A state write orders later readers of that state, which share no value id with it.
+            let writes_state = matches!(
+                s.op,
+                Step::Ext(super::ext::ExtStep::Movement(
+                    super::ext::movement::Step::StateWrite { .. }
+                ))
+            );
+            if kind.is_none() && solo && !writes_state && (gemv || commute) {
                 fs.add("Movable", pi)?;
             }
             if let Some(k) = kind {
@@ -897,8 +904,8 @@ mod tests {
         let v = g.add("v", Op::Linear, &[sc, wv], vec![1, h], F);
         let qr = g.add("qr", rope.clone(), &[q, pos, inv], vec![1, h], F);
         let kr = g.add("kr", rope, &[k, pos, inv], vec![1, h], F);
-        let ks = g.state("ks", vec![8, h], F);
-        let vs = g.state("vs", vec![8, h], F);
+        let ks = g.state("ks", vec![8, h], F, false);
+        let vs = g.state("vs", vec![8, h], F, false);
         let attn = Op::CachedAttention {
             heads: h / hd,
             kv_heads: h / hd,

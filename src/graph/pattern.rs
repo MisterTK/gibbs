@@ -150,7 +150,7 @@ pub fn validate_ssa(graph: &Graph) -> Result<(), String> {
             }
             let val = graph.value(inp);
             match &val.kind {
-                ValueKind::Input | ValueKind::Weight | ValueKind::State(_) => {}
+                ValueKind::Input | ValueKind::Weight | ValueKind::State { .. } => {}
                 ValueKind::Node(prod_nid) => {
                     if prod_nid.0 as usize >= i {
                         return Err(format!(
@@ -284,6 +284,7 @@ mod tests {
                 causal: true,
                 window: None,
                 soft_cap: None,
+                scale: None,
             },
             &[q, k, v],
             vec![1, 64],

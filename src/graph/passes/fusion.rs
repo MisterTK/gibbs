@@ -715,6 +715,7 @@ mod tests {
             causal: true,
             window: None,
             soft_cap: None,
+            scale: None,
         };
         let a = g.add("attn", op, &outs, vec![1, rows[0]], DType::F32);
         g.output(a);

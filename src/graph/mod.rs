@@ -76,7 +76,9 @@ pub enum ValueKind {
     /// Bound by name to [`Weights`] at execution.
     Weight,
     /// Persistent per-sequence buffer (e.g. KV cache slots, Gated DeltaNet recurrent state, causal conv state).
-    State(String),
+    /// `recurrent`: the buffer is a running summary of every position so far (DeltaNet state, conv
+    /// window), so it cannot rewind by position; a KV cache (row per position) can.
+    State { name: String, recurrent: bool },
     Node(NodeId),
 }
 #[derive(Debug, Clone, PartialEq)]
@@ -89,13 +91,13 @@ pub struct Value {
     pub kind: ValueKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PairLayout {
     Adjacent,
     Half,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RopeVariant {
     /// Rotates adjacent pairs `(2i, 2i+1)`.
     Interleaved,
@@ -109,7 +111,7 @@ pub enum RopeVariant {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReduceKind {
     Sum,
     Mean,
@@ -117,7 +119,7 @@ pub enum ReduceKind {
     Min,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryKind {
     Exp,
     Sigmoid,
@@ -135,9 +137,15 @@ pub enum UnaryKind {
     Scale(f32),
     Clamp(f32, f32),
     SoftCap(f32),
+    /// Natural logarithm.
+    Ln,
+    /// Round half to even.
+    RoundEven,
+    /// `1` for positive, `-1` for negative, `0` otherwise (zero, NaN).
+    Sign,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinaryKind {
     Add,
     Sub,
@@ -147,7 +155,7 @@ pub enum BinaryKind {
     Min,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UpsampleMode {
     Nearest,
     Bilinear,
@@ -171,8 +179,9 @@ pub struct MegakernelDescriptor {
     pub name: String,
 }
 
-/// Operations. Operand order is the node's `inputs` order, documented per variant.
-#[derive(Debug, Clone, PartialEq)]
+/// Operations. Operand order is the node's `inputs` order, documented per variant. Serde uses the
+/// externally tagged form (`"Linear"`, `{"RmsNorm": {"eps": 1e-6}}`); optional fields may be omitted.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     /// `[table [rows, d], ids [n] (U32)]` → `[n, d]`.
     Embedding,
@@ -211,7 +220,7 @@ pub enum Op {
     /// `[q [nq, heads*head_dim], k [nk, kv_heads*head_dim], v [nk, kv_heads*head_dim], bias?]` →
     /// `[nq, heads*head_dim]`, with `head_dim` taken from `q`'s shape; query head `h` reads kv head
     /// `h / (heads / kv_heads)`. Cross-attention is this op with `k`/`v` from another sequence.
-    /// Scores are `q·k / sqrt(head_dim)`, then `soft_cap * tanh(s / soft_cap)`, then the optional
+    /// Scores are `q·k * scale` (`scale: None` = `1 / sqrt(head_dim)`), then `soft_cap * tanh(s / soft_cap)`, then the optional
     /// additive `bias` (`[heads, nq, nk]`, `[nq, nk]` or `[nk]`; `-inf` masks, e.g. padding).
     /// `causal`: query `p` sees keys `k <= p` (top-left aligned when `nq != nk`). With `window = Some(w)`:
     /// causal sees `p - w < k <= p` (w keys), non-causal sees `|p - k| <= w / 2`. A query with no
@@ -220,8 +229,12 @@ pub enum Op {
         heads: usize,
         kv_heads: usize,
         causal: bool,
+        #[serde(default)]
         window: Option<usize>,
+        #[serde(default)]
         soft_cap: Option<f32>,
+        #[serde(default)]
+        scale: Option<f32>,
     },
     /// `[gate, up]` → `silu(gate) * up`.
     SwiGlu,
@@ -245,7 +258,9 @@ pub enum Op {
         v_head_dim: usize,
         scale: f32,
         causal: bool,
+        #[serde(default)]
         window: Option<usize>,
+        #[serde(default)]
         soft_cap: Option<f32>,
         write: bool,
     },
@@ -257,7 +272,9 @@ pub enum Op {
         v_head_dim: usize,
         scale: f32,
         causal: bool,
+        #[serde(default)]
         window: Option<usize>,
+        #[serde(default)]
         soft_cap: Option<f32>,
         tokens_per_block: usize,
         max_blocks_per_seq: usize,
@@ -327,6 +344,27 @@ pub enum Op {
     },
     /// `[state, parent [batch] U32]` permuting batch rows in-place.
     StateReorder,
+    /// `[state [cap, w], rows [m, w], pos0 [1] U32]` → `[1]` U32 holding `pos0 + m`. Writes
+    /// `state[pos0..pos0 + m] = rows` in place; `state` must be a graph `State` value, so the rows
+    /// persist into later runs. The write is a side effect (ops are single-output): the returned token
+    /// is what orders it, so a node that must observe the write depends on the token, and dead-node
+    /// elimination keeps every `StateWrite`. Within one graph, nodes after it reading the same state
+    /// see the new rows. Writing past `cap` is an error on both executors (Metal needs `pos0` to be a
+    /// graph input and checks it on the host).
+    StateWrite,
+    /// `[score [n, B] F32, positions [n] U32]` → `[n, K]` U32 key ids with
+    /// `K = top_blocks * ratio + ratio - 1` (sparse block attention key selection). Row `t` sees
+    /// `visible = positions[t] + 1` keys: `blocks = visible / ratio` complete blocks of `ratio` keys
+    /// (`blocks <= B` required; `score[t, b]` for `b >= blocks` is ignored) and an incomplete tail.
+    /// With `blocks <= top_blocks` the ids are every visible key `0..visible`; otherwise the
+    /// `top_blocks` best complete blocks (score descending in `f32::total_cmp` order, equal scores
+    /// lower block first), in ascending block order, each expanded to its `ratio` keys, then the tail
+    /// `blocks * ratio..visible`. Unused trailing slots hold 0. Ops are single-output, so the matching
+    /// mask is the separate [`Op::QsaBias`].
+    QsaSelect { ratio: usize, top_blocks: usize },
+    /// [`Op::QsaSelect`]'s operands → `[n, K]` F32 additive bias for the gathered keys: 0 where
+    /// `QsaSelect`'s slot holds a selected key, `-inf` in unused slots.
+    QsaBias { ratio: usize, top_blocks: usize },
     /// `[x [c_in, h, w], w [c_out, c_in/groups, kh, kw], bias? [c_out]]`; padding is
     /// `[top, left, bottom, right]`.
     Conv2d {
@@ -344,6 +382,7 @@ pub enum Op {
     },
     /// `[x]` with a static target shape, or `[x, shape]` when the shape is a runtime tensor (ONNX).
     Reshape {
+        #[serde(default)]
         shape: Option<Vec<usize>>,
     },
     Transpose {
@@ -398,6 +437,9 @@ impl Op {
             Op::Softmax { .. } => "Softmax",
             Op::RelPosBias { .. } => "RelPosBias",
             Op::StateReorder => "StateReorder",
+            Op::StateWrite => "StateWrite",
+            Op::QsaSelect { .. } => "QsaSelect",
+            Op::QsaBias { .. } => "QsaBias",
             Op::Conv2d { .. } => "Conv2d",
             Op::Conv1d { .. } => "Conv1d",
             Op::Reshape { .. } => "Reshape",
@@ -481,10 +523,39 @@ impl Graph {
         self.push_value(name.into(), shape, dtype, ValueKind::Weight)
     }
 
-    /// Declares a persistent state tensor, bound to [`StateStore`] at execution.
-    pub fn state(&mut self, name: impl Into<String>, shape: Vec<usize>, dtype: DType) -> ValueId {
+    /// Declares a persistent state tensor, bound to [`StateStore`] at execution. `recurrent`: see
+    /// [`ValueKind::State`]; [`program::GraphProgram::recurrent_states`] lists those.
+    pub fn state(
+        &mut self,
+        name: impl Into<String>,
+        shape: Vec<usize>,
+        dtype: DType,
+        recurrent: bool,
+    ) -> ValueId {
         let name = name.into();
-        self.push_value(name.clone(), shape, dtype, ValueKind::State(name))
+        let kind = ValueKind::State {
+            name: name.clone(),
+            recurrent,
+        };
+        self.push_value(name, shape, dtype, kind)
+    }
+
+    /// Names of the graph's recurrent states (sorted, deduplicated).
+    pub fn recurrent_states(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .values
+            .iter()
+            .filter_map(|v| match &v.kind {
+                ValueKind::State {
+                    name,
+                    recurrent: true,
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Appends a single-output node on the CPU and returns its output value.
@@ -661,13 +732,12 @@ impl StateStore {
     }
 
     /// Rewinds to `pos` positions. Full KV states need nothing (attention reads only the rows
-    /// below the position it is given, and later writes overwrite the rest); a recurrent state
-    /// (Gated DeltaNet `ssm_state`, causal-conv `conv_state`) cannot rewind and errs: `restore`
-    /// a [`Self::snapshot`] taken at `pos` instead.
-    pub fn truncate(&mut self, pos: usize) -> Result<(), String> {
-        let recurrent = |n: &String| n.contains("conv_state") || n.contains("ssm_state");
+    /// below the position it is given, and later writes overwrite the rest); a held state named in
+    /// `recurrent` (e.g. [`program::GraphProgram::recurrent_states`]) cannot rewind and errs:
+    /// `restore` a [`Self::snapshot`] taken at `pos` instead.
+    pub fn truncate(&mut self, pos: usize, recurrent: &[String]) -> Result<(), String> {
         let names = self.buffers.keys().chain(self.metal_names());
-        match names.into_iter().find(|n| recurrent(n)) {
+        match names.into_iter().find(|n| recurrent.contains(n)) {
             Some(n) => Err(format!(
                 "cannot rewind recurrent state {n} to position {pos}: restore a snapshot"
             )),
@@ -805,15 +875,24 @@ impl Weights {
 mod state_tests {
     use super::*;
 
-    /// Full KV rewinds by position; a recurrent state refuses and comes back from a snapshot; a
-    /// device-resident state is read from and written back into its buffer.
+    /// Full KV rewinds by position; a recurrent state (by the graph's flag, not its name) refuses
+    /// and comes back from a snapshot; a device-resident state is read from and written back into
+    /// its buffer.
     #[test]
     fn truncate_snapshot_restore() {
+        let mut g = Graph::new();
+        g.state("layers.3.k_cache", vec![4, 2], DType::F32, false);
+        g.state("layers.0.mixer", vec![2], DType::F32, true);
+        g.state("layers.0.mixer", vec![2], DType::F32, true);
+        let recurrent = g.recurrent_states();
+        assert_eq!(recurrent, ["layers.0.mixer"]);
         let mut st = StateStore::new();
         st.insert("layers.3.k_cache", Tensor::F32(vec![1.0; 8]));
-        assert!(st.truncate(2).is_ok());
+        assert!(st.truncate(2, &recurrent).is_ok());
+        st.insert("layers.0.mixer", Tensor::F32(vec![1.0, 2.0]));
+        assert!(st.truncate(2, &recurrent).unwrap_err().contains("mixer"));
+        assert!(st.truncate(2, &[]).is_ok());
         st.insert("layers.0.ssm_state", Tensor::F32(vec![1.0, 2.0]));
-        assert!(st.truncate(2).unwrap_err().contains("ssm_state"));
         let snap = st.snapshot(&["layers.0.ssm_state", "missing"]);
         assert_eq!(snap.len(), 1);
         st.insert("layers.0.ssm_state", Tensor::F32(vec![9.0, 9.0]));
@@ -836,6 +915,88 @@ mod state_tests {
             unsafe { live.write(0.0) };
             st.restore(snap);
             assert_eq!(unsafe { *live }, 5.0);
+        }
+    }
+
+    /// `Op` deserializes from its externally tagged JSON (unit variants as strings, optional fields
+    /// omitted) and every op round-trips.
+    #[test]
+    fn op_serde_round_trips() {
+        use serde_json::json;
+        let parse = |v: serde_json::Value| serde_json::from_value::<Op>(v).unwrap();
+        assert_eq!(parse(json!({"RmsNorm": {"eps": 1e-6}})), Op::RmsNorm { eps: 1e-6 });
+        assert_eq!(parse(json!("Linear")), Op::Linear);
+        assert_eq!(
+            parse(json!({"Attention": {"heads": 8, "kv_heads": 2, "causal": true}})),
+            Op::Attention {
+                heads: 8,
+                kv_heads: 2,
+                causal: true,
+                window: None,
+                soft_cap: None,
+                scale: None,
+            }
+        );
+        assert_eq!(
+            parse(json!({"Unary": {"kind": {"Clamp": [-1.0, 1.0]}}})),
+            Op::Unary {
+                kind: UnaryKind::Clamp(-1.0, 1.0)
+            }
+        );
+        let ops = [
+            Op::Attention {
+                heads: 4,
+                kv_heads: 4,
+                causal: false,
+                window: Some(8),
+                soft_cap: Some(30.0),
+                scale: Some(1.0),
+            },
+            Op::Unary {
+                kind: UnaryKind::RoundEven,
+            },
+            Op::Binary {
+                kind: BinaryKind::Max,
+            },
+            Op::Rope {
+                head_dim: 64,
+                rotary_dim: 32,
+                variant: RopeVariant::MRope {
+                    sections: [8, 4, 4],
+                    interleaved: false,
+                    pairs: PairLayout::Half,
+                },
+                mscale: 1.0,
+            },
+            Op::Reduce {
+                kind: ReduceKind::Mean,
+                axes: vec![-1],
+                keep_dims: true,
+            },
+            Op::Upsample {
+                scale: 2,
+                mode: UpsampleMode::Bilinear,
+            },
+            Op::Reshape { shape: None },
+            Op::StateWrite,
+            Op::QsaSelect {
+                ratio: 4,
+                top_blocks: 2,
+            },
+            Op::Megakernel(MegakernelDescriptor {
+                kind: MegakernelKind::Mlp {
+                    hidden_dim: 8,
+                    intermediate_dim: 16,
+                    eps: 1e-5,
+                    is_geglu: true,
+                    has_post_norm: false,
+                },
+                name: "mlp".into(),
+            }),
+        ];
+        for op in ops {
+            let v = serde_json::to_value(&op).unwrap();
+            assert_eq!(parse(v), op);
         }
     }
 }

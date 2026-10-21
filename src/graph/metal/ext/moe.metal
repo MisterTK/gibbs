@@ -207,3 +207,100 @@ kernel void moe_embed_bf16(device const ushort* table [[buffer(0)]],
     if (gid.x >= p.d || gid.y >= p.n) return;
     out[(ulong)gid.y * p.d + gid.x] = as_type<float>(uint(table[(ulong)min(ids[gid.y], p.rows - 1) * p.d + gid.x]) << 16);
 }
+
+// Sparse block key selection (`Op::QsaSelect` / `Op::QsaBias`; `graph::cpu::qsa_select` is the
+// reference). Row t sees v = pos[t] + 1 keys in nb = v / ratio complete blocks; with nb <= top every
+// visible key is selected, else the `top` best blocks (f32 total order descending, equal scores lower
+// block first), ascending, each expanded to its `ratio` keys, then the tail nb * ratio .. v. Unused
+// slots hold id 0 and bias -inf. nb is clamped to the score width b (the CPU rejects nb > b).
+struct MoeQsaParams { uint n; uint b; uint ratio; uint top; uint k; };
+
+// Rust `f32::total_cmp` order as a signed integer.
+inline int moe_total_key(float v) {
+    const int i = as_type<int>(v);
+    return i ^ int(uint(i >> 31) >> 1);
+}
+
+inline void moe_qsa_pick(thread int& v1, thread uint& i1, int v2, uint i2) {
+    if (i2 == 0xFFFFFFFFu) return;
+    if (i1 == 0xFFFFFFFFu || v2 > v1 || (v2 == v1 && i2 < i1)) { v1 = v2; i1 = i2; }
+}
+
+// One threadgroup of 256 threads per row: round r picks the best block that sorts strictly after
+// round r-1's pick (as `moe_topk_f32`); thread 0 then sorts the picks and expands them in place.
+kernel void moe_qsa_select_f32(device const float* score [[buffer(0)]],
+                               device const uint* pos [[buffer(1)]],
+                               device uint* out [[buffer(2)]],
+                               constant MoeQsaParams& p [[buffer(3)]],
+                               uint row [[threadgroup_position_in_grid]],
+                               uint t [[thread_position_in_threadgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int sv[8];
+    threadgroup uint si[8];
+    threadgroup int prev_v;
+    threadgroup uint prev_i;
+    device uint* o = out + (ulong)row * p.k;
+    const uint v = pos[row] + 1;
+    const uint nb = min(v / p.ratio, p.b);
+    if (nb <= p.top) { // uniform per threadgroup
+        for (uint j = t; j < p.k; j += 256) o[j] = j < v ? j : 0u;
+        return;
+    }
+    device const float* sr = score + (ulong)row * p.b;
+    if (t == 0) { prev_v = 0; prev_i = 0xFFFFFFFFu; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < p.top; ++r) {
+        const int pv = prev_v;
+        const uint pi = prev_i;
+        int bv = 0;
+        uint bi = 0xFFFFFFFFu;
+        for (uint i = t; i < nb; i += 256) {
+            const int kv = moe_total_key(sr[i]);
+            if (pi == 0xFFFFFFFFu || kv < pv || (kv == pv && i > pi)) moe_qsa_pick(bv, bi, kv, i);
+        }
+        for (uint off = 16; off > 0; off >>= 1) {
+            const int ov = simd_shuffle_down(bv, off);
+            const uint oi = simd_shuffle_down(bi, off);
+            moe_qsa_pick(bv, bi, ov, oi);
+        }
+        if (lane == 0) { sv[sg] = bv; si[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t == 0) {
+            int fv = sv[0];
+            uint fi = si[0];
+            for (uint g = 1; g < 8; ++g) moe_qsa_pick(fv, fi, sv[g], si[g]);
+            o[r] = fi;
+            prev_v = fv;
+            prev_i = fi;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t != 0) return;
+    for (uint a = 1; a < p.top; ++a) {
+        const uint x = o[a];
+        uint c = a;
+        for (; c > 0 && o[c - 1] > x; --c) o[c] = o[c - 1];
+        o[c] = x;
+    }
+    // Last block first: block j's keys land at j * ratio >= j, past every unexpanded pick.
+    for (uint j = p.top; j-- > 0;) {
+        const uint blk = o[j];
+        for (uint q = p.ratio; q-- > 0;) o[j * p.ratio + q] = blk * p.ratio + q;
+    }
+    uint c = p.top * p.ratio;
+    for (uint key = nb * p.ratio; key < v && c < p.k; ++key) o[c++] = key;
+    for (; c < p.k; ++c) o[c] = 0u;
+}
+
+kernel void moe_qsa_bias_f32(device const uint* pos [[buffer(0)]],
+                             device float* out [[buffer(1)]],
+                             constant MoeQsaParams& p [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= p.n * p.k) return;
+    const uint row = i / p.k;
+    const uint v = pos[row] + 1;
+    const uint nb = min(v / p.ratio, p.b);
+    const uint cnt = nb <= p.top ? v : p.top * p.ratio + (v - nb * p.ratio);
+    out[i] = i % p.k < cnt ? 0.0f : -INFINITY;
+}

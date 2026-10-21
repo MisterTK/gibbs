@@ -842,6 +842,7 @@ fn attention(
         causal: false,
         window: None,
         soft_cap: None,
+        scale: None,
     };
     eg::node(g, format!("{p}.attn"), op, &[qs, k, v, bias], &shape)
 }

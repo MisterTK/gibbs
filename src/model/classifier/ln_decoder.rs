@@ -175,7 +175,7 @@ impl LnDecoder {
             let q = lin(&mut g, &mut w, &format!("{p}.q"), a_in, &b.q);
             let k = lin(&mut g, &mut w, &format!("{p}.k"), a_in, &b.k);
             let v = lin(&mut g, &mut w, &format!("{p}.v"), a_in, &b.v);
-            let attn = Op::Attention { heads: self.heads, kv_heads: self.heads, causal: true, window: None, soft_cap: None };
+            let attn = Op::Attention { heads: self.heads, kv_heads: self.heads, causal: true, window: None, soft_cap: None, scale: None };
             let a = g.add(format!("{p}.attn"), attn, &[q, k, v], vec![n, h], f);
             let o = lin(&mut g, &mut w, &format!("{p}.out"), a, &b.out);
             let y = g.add(format!("{p}.res1"), Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![n, h], f);

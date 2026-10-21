@@ -629,6 +629,7 @@ impl Vision {
                 causal: false,
                 window: None,
                 soft_cap: None,
+                scale: None,
             };
             let a = g.add(format!("{p}.attn"), att, &[q, k, v], vec![n, d], f32s);
             let o = b.proj.graph_node(&mut g, &mut w, &format!("{p}.proj"), a, n);

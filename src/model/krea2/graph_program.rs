@@ -40,6 +40,7 @@ impl Attn {
                     causal: false,
                     window: None,
                     soft_cap: None,
+                    scale: None,
                 },
                 &[q, k, v],
                 vec![rows, w],

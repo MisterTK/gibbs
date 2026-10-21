@@ -308,12 +308,13 @@ impl<'a> Builder<'a> {
             if self.states.contains_key(&name) {
                 return Err(format!("state `{name}` declared twice"));
             }
-            let v = self.g.state(name.clone(), shape, dtype);
-            if m.get("recurrent")
+            let recurrent = m
+                .get("recurrent")
                 .map(|r| self.eval(r))
                 .transpose()?
-                .is_some_and(|r| r.truthy())
-            {
+                .is_some_and(|r| r.truthy());
+            let v = self.g.state(name.clone(), shape, dtype, recurrent);
+            if recurrent {
                 self.recurrent.push(name.clone());
             }
             self.states.insert(name, v);

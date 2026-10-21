@@ -142,3 +142,20 @@ kernel void mv_upsample(device const float* x [[buffer(0)]],
                 acc += wz[a] * wy[b] * wx[c] * plane[((ulong)iz[a] * p.h + iy[b]) * p.w + ix[c]];
     out[gid] = acc;
 }
+
+// `Op::StateWrite`: rows [m, w] into state row pos0[0] onward (rows at or past `cap`, the rows the
+// state buffer holds, are dropped); token[0] = pos0 + m. One thread per row element (at least one).
+struct MvStateWrite { uint n; uint w; uint cap; };
+
+kernel void mv_state_write(device const float* rows [[buffer(0)]],
+                           device const uint* pos0 [[buffer(1)]],
+                           device float* state [[buffer(2)]],
+                           device uint* token [[buffer(3)]],
+                           constant MvStateWrite& p [[buffer(4)]],
+                           uint i [[thread_position_in_grid]]) {
+    const uint p0 = pos0[0];
+    if (i == 0) token[0] = p0 + p.n / p.w;
+    if (i >= p.n) return;
+    const uint r = p0 + i / p.w;
+    if (r < p.cap) state[(ulong)r * p.w + i % p.w] = rows[i];
+}

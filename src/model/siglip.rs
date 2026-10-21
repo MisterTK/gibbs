@@ -213,6 +213,7 @@ impl SiglipVision {
             causal: false,
             window: None,
             soft_cap: None,
+            scale: None,
         };
         for (i, l) in self.layers.into_iter().enumerate() {
             let p = format!("vision.layers.{i}");

@@ -2,7 +2,8 @@
 //! Kernels live in `moe.metal` (appended to the shared library, names listed in `KERNELS`).
 //! Hooks called from `ext.rs`; every function returns "not mine" for ops it does not claim.
 //!
-//! Owns: `TopK` (row top-k indices), `GatherCols`, `MoeLinear` (expert-indexed GEMV over a stacked
+//! Owns: `TopK` (row top-k indices), `QsaSelect` / `QsaBias` (sparse block key selection and its
+//! mask), `GatherCols`, `MoeLinear` (expert-indexed GEMV over a stacked
 //! weight bank, generated per codec by `codegen::gemv_indexed`, f32/f16/bf16 banks through
 //! pseudo-codecs), `Embedding` over F16/BF16/codec-quantized tables, and shape guards for
 //! `CausalConv1dCached` / `DeltaRule` forms the core kernels would read out of bounds.
@@ -31,6 +32,8 @@ pub(super) const KERNELS: &[&str] = &[
     "moe_gather_cols_f32",
     "moe_embed_f16",
     "moe_embed_bf16",
+    "moe_qsa_select_f32",
+    "moe_qsa_bias_f32",
 ];
 
 /// A single-row `TopK { k: 1 }` at least this wide runs the two-pass argmax (one threadgroup per
@@ -88,6 +91,17 @@ pub enum Step {
         rows: usize,
         src: Table,
     },
+    /// `QsaSelect` (`select`) or `QsaBias` over `score [n, b]` and `pos [n]`; output `[n, k]`.
+    Qsa {
+        score: ValueId,
+        pos: ValueId,
+        select: bool,
+        n: usize,
+        b: usize,
+        ratio: usize,
+        top_blocks: usize,
+        k: usize,
+    },
 }
 
 /// Float banks read through the same `decode8` contract as the quantized codecs: one 8-element block.
@@ -125,7 +139,9 @@ pub(super) fn bank_codec(dtype: DType) -> Option<&'static Codec> {
 /// the bank dtype for `MoeLinear`, the table dtype for `Embedding`.
 pub(super) fn supports(op: &Op, dtype: DType) -> bool {
     match op {
-        Op::TopK { .. } | Op::GatherCols => dtype == DType::F32,
+        Op::TopK { .. } | Op::GatherCols | Op::QsaSelect { .. } | Op::QsaBias { .. } => {
+            dtype == DType::F32
+        }
         Op::MoeLinear { .. } => bank_codec(dtype).is_some(),
         Op::Embedding => match dtype {
             DType::F16 | DType::BF16 => true,
@@ -193,6 +209,23 @@ pub(super) fn plan(
             }
             u32_of(total)?;
             Ok(PlanOut::Step(Step::GatherCols { x, idx, total, cols, k, shared: x_rows == 1 }, total))
+        })()),
+        Op::QsaSelect { ratio, top_blocks } | Op::QsaBias { ratio, top_blocks } => Some((|| {
+            let (score, pos) = (arg(0)?, arg(1)?);
+            let Some([n, b]) = shape2(g, score) else {
+                return Err(format!("node '{name}': QSA score is not [n, B]"));
+            };
+            if *ratio == 0 || numel(g, pos)? != n || g.value(pos).dtype != DType::U32 {
+                return Err(format!(
+                    "node '{name}': QSA needs ratio >= 1 and u32 positions [{n}], got ratio {ratio}"
+                ));
+            }
+            let k = top_blocks * ratio + ratio - 1;
+            u32_of(n * k.max(b))?;
+            let select = matches!(node.op, Op::QsaSelect { .. });
+            let (ratio, top_blocks) = (*ratio, *top_blocks);
+            let step = Step::Qsa { score, pos, select, n, b, ratio, top_blocks, k };
+            Ok(PlanOut::Step(step, n * k))
         })()),
         Op::MoeLinear { experts, top_k } => Some((|| {
             if node.inputs.len() != 3 {
@@ -338,6 +371,7 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
         Step::GatherCols { x, idx, .. } => vec![*x, *idx],
         Step::ExpertLinear { x, bank, ids, .. } => vec![*x, *bank, *ids],
         Step::Embed { table, ids, .. } => vec![*table, *ids],
+        Step::Qsa { score, pos, .. } => vec![*score, *pos],
     }
 }
 
@@ -348,6 +382,7 @@ pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
         Step::GatherCols { idx, .. } => v == *idx,
         Step::ExpertLinear { x, .. } => v != *x,
         Step::Embed { .. } => true,
+        Step::Qsa { pos, .. } => v == *pos,
     }
 }
 
@@ -665,6 +700,43 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 MTLSize::new(((*d / cols_per_thread) as u64).div_ceil(TG), *n as u64, 1),
                 MTLSize::new(TG, 1, 1),
             );
+        }
+        Step::Qsa {
+            score,
+            pos,
+            select,
+            n,
+            b,
+            ratio,
+            top_blocks,
+            k,
+        } => {
+            if *n * *k > 0 {
+                let params = [
+                    u32_of(*n)?,
+                    u32_of(*b)?,
+                    u32_of(*ratio)?,
+                    u32_of(*top_blocks)?,
+                    u32_of(*k)?,
+                ];
+                if *select {
+                    enc.set_compute_pipeline_state(rt.pso("moe_qsa_select_f32")?);
+                    e.bind(0, *score);
+                    e.bind(1, *pos);
+                    e.bind(2, s.out);
+                    set_bytes(enc, 3, &params);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(*n as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                } else {
+                    enc.set_compute_pipeline_state(rt.pso("moe_qsa_bias_f32")?);
+                    e.bind(0, *pos);
+                    e.bind(1, s.out);
+                    set_bytes(enc, 2, &params);
+                    e.grid1(*n * *k);
+                }
+            }
         }
     }
     Ok(())
@@ -1480,7 +1552,7 @@ mod tests {
             let mut g = Graph::new();
             let x = g.input("x", vec![n, ch], DType::F32);
             let wv = g.weight("w", vec![ch, k], DType::F32);
-            let st = g.state("st", vec![(k - 1) * d, ch], DType::F32);
+            let st = g.state("st", vec![(k - 1) * d, ch], DType::F32, true);
             let y = g.add(
                 "conv",
                 Op::CausalConv1dCached {
@@ -1511,7 +1583,7 @@ mod tests {
         let mut g = Graph::new();
         let x = g.input("x", vec![2, 4], DType::F32);
         let wv = g.weight("w", vec![4, 3], DType::F32);
-        let st = g.state("st", vec![2, 4], DType::F32); // dilation 2 needs 4 rows
+        let st = g.state("st", vec![2, 4], DType::F32, true); // dilation 2 needs 4 rows
         let y = g.add(
             "conv",
             Op::CausalConv1dCached {
@@ -1539,7 +1611,7 @@ mod tests {
         let v = g.input("v", vec![n, vh * vd], DType::F32);
         let beta = g.input("beta", vec![beta_len], DType::F32);
         let ld = g.input("ld", vec![n, vh], DType::F32);
-        let st = g.state("ssm", vec![vh * kd * vd], DType::F32);
+        let st = g.state("ssm", vec![vh * kd * vd], DType::F32, true);
         let y = g.add(
             "delta",
             Op::DeltaRule {

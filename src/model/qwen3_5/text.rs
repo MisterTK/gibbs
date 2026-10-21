@@ -1001,24 +1001,6 @@ impl TextModel {
         Ok(())
     }
 
-    /// Names of the decode program's recurrent states (Gated DeltaNet conv window and delta-rule
-    /// state, one pair per linear-attention layer).
-    pub(super) fn recurrent_state_names(&self) -> Vec<String> {
-        let delta = self
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| matches!(l.mixer, Mixer::Delta(_)));
-        delta
-            .flat_map(|(i, _)| {
-                [
-                    format!("layers.{i}.conv_state"),
-                    format!("layers.{i}.ssm_state"),
-                ]
-            })
-            .collect()
-    }
-
     /// Forgets the recurrent checkpoints (the sequence keeps every position it ran).
     pub(super) fn drop_checkpoints(&self, state: &mut [LayerState]) {
         for st in state {
@@ -1510,6 +1492,7 @@ impl TextModel {
                         format!("{p}.conv_state"),
                         vec![c.kernel - 1, cd],
                         DType::F32,
+                        true,
                     );
                     let conv_w = g.weight(
                         format!("{p}.mixer.conv.weight"),
@@ -1616,7 +1599,7 @@ impl TextModel {
 
                     // DeltaRule
                     let ssm_state =
-                        g.state(format!("{p}.ssm_state"), vec![vh * kd * dv], DType::F32);
+                        g.state(format!("{p}.ssm_state"), vec![vh * kd * dv], DType::F32, true);
                     let core = g.add(
                         format!("{p}.mixer.delta"),
                         Op::DeltaRule {
@@ -1908,11 +1891,13 @@ impl TextModel {
                         format!("{p}.k_cache"),
                         vec![max_ctx, self.kv_heads * self.head_dim],
                         DType::F32,
+                        false,
                     );
                     let v_cache = g.state(
                         format!("{p}.v_cache"),
                         vec![max_ctx, self.kv_heads * self.head_dim],
                         DType::F32,
+                        false,
                     );
                     let mut attn_core = g.add(
                         format!("{p}.self_attn.core"),

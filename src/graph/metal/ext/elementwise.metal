@@ -32,6 +32,9 @@ kernel void unary_f32(device const float* x [[buffer(0)]],
         case 13: r = v * p.a; break; // Scale
         case 14: { if (v < p.a) v = p.a; if (v > p.b) v = p.b; r = v; break; } // Clamp, NaN passes through like f32::clamp
         case 15: r = p.a * tanh(v / p.a); break; // SoftCap
+        case 16: r = log(v); break; // Ln
+        case 17: r = rint(v); break; // RoundEven (round-to-nearest-even mode)
+        case 18: r = v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f); break; // Sign; zero and NaN give 0
     }
     out[i] = r;
 }

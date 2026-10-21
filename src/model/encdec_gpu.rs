@@ -281,8 +281,8 @@ impl EncDec {
 pub fn self_states(g: &mut Graph, l: usize, d: &Dims) -> (ValueId, ValueId) {
     let shape = vec![d.self_cap, d.inner];
     (
-        g.state(format!("sk.{l}"), shape.clone(), DType::F32),
-        g.state(format!("sv.{l}"), shape, DType::F32),
+        g.state(format!("sk.{l}"), shape.clone(), DType::F32, false),
+        g.state(format!("sv.{l}"), shape, DType::F32, false),
     )
 }
 
@@ -290,7 +290,7 @@ pub fn self_states(g: &mut Graph, l: usize, d: &Dims) -> (ValueId, ValueId) {
 pub fn cross_states(g: &mut Graph, l: usize, d: &Dims) -> (ValueId, ValueId) {
     let shape = vec![d.enc_cap, d.inner];
     (
-        g.state(format!("xk.{l}"), shape.clone(), DType::F32),
-        g.state(format!("xv.{l}"), shape, DType::F32),
+        g.state(format!("xk.{l}"), shape.clone(), DType::F32, false),
+        g.state(format!("xv.{l}"), shape, DType::F32, false),
     )
 }

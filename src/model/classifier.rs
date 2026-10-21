@@ -1921,6 +1921,7 @@ impl Deberta {
             causal: false,
             window: None,
             soft_cap: None,
+            scale: None,
         };
         for (l, layer) in self.layers.iter().enumerate() {
             let p = format!("layer.{l}");

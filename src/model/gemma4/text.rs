@@ -866,19 +866,21 @@ impl TextModel {
             // KV Cache States
             let kv_width = l.kv_heads * l.head_dim;
             let (k_state, v_state, write) = if li < self.first_shared {
-                let ks = g.state(format!("kv.{li}.k"), vec![max_ctx, kv_width], DType::F32);
-                let vs = g.state(format!("kv.{li}.v"), vec![max_ctx, kv_width], DType::F32);
+                let ks = g.state(format!("kv.{li}.k"), vec![max_ctx, kv_width], DType::F32, false);
+                let vs = g.state(format!("kv.{li}.v"), vec![max_ctx, kv_width], DType::F32, false);
                 (ks, vs, true)
             } else {
                 let ks = g.state(
                     format!("kv.{}.k", l.kv_src),
                     vec![max_ctx, kv_width],
                     DType::F32,
+                    false,
                 );
                 let vs = g.state(
                     format!("kv.{}.v", l.kv_src),
                     vec![max_ctx, kv_width],
                     DType::F32,
+                    false,
                 );
                 (ks, vs, false)
             };
