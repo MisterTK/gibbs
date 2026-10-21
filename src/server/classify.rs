@@ -51,7 +51,7 @@ fn active(state: &AppState) -> Result<Arc<SequenceClassifier>, axum::response::R
 async fn run(
     c: Arc<SequenceClassifier>,
     inputs: Vec<(String, Option<String>)>,
-) -> Result<Vec<(Vec<crate::model::classifier::LabelScore>, usize)>, axum::response::Response> {
+) -> Result<Vec<(Vec<crate::runtime::encoder::LabelScore>, usize)>, axum::response::Response> {
     tokio::task::spawn_blocking(move || {
         inputs
             .iter()

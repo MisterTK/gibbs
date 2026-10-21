@@ -1,0 +1,45 @@
+// Gated DeltaNet linear attention (transformers `Qwen3NextGatedDeltaNet` / Qwen3.5 `linear_attn`).
+// Variables it reads (args or the family config): lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim,
+// lin_kernel, eps. The op chain (projections, conv, SiLU, q/k/v slices, beta, decay, DeltaRule,
+// gated RMSNorm) is what `graph/metal/ext/deltanet.rs` fuses into one step: keep it as it is.
+{
+  macros: {
+    // args: p (stem: `{p}.in_proj_{qkv,z,b,a}`, `{p}.conv1d` [conv_dim, kernel] f32, `{p}.dt_bias`,
+    // `{p}.neg_A` (-exp(A_log)), `{p}.norm` [v_dim], `{p}.out_proj`); layer (index of the recurrent
+    // states `conv.{layer}`, `ssm.{layer}`); sigmoid_gate (output gate sigmoid instead of SiLU);
+    // tiled: `out_proj` columns hold the value heads in llama.cpp's tiled order, so its input is
+    // tiled to match.
+    gated_deltanet: {params: ["x"], body: [
+      {let: {kk: "lin_k_heads * lin_k_dim", vd: "lin_v_heads * lin_v_dim",
+             cd: "2 * lin_k_heads * lin_k_dim + lin_v_heads * lin_v_dim"}},
+      {op: "Linear", in: ["x", "w:{p}.in_proj_qkv.weight"], out: "qkv", name: "proj_qkv"},
+      {op: "Linear", in: ["x", "w:{p}.in_proj_z.weight"], out: "z", name: "proj_z"},
+      {op: "Linear", in: ["x", "w:{p}.in_proj_b.weight"], out: "b", name: "proj_b"},
+      {op: "Linear", in: ["x", "w:{p}.in_proj_a.weight"], out: "a", name: "proj_a"},
+      {state: "conv.{layer}", shape: ["lin_kernel - 1", "cd"], recurrent: true},
+      {op: "CausalConv1dCached", args: {kernel: "lin_kernel", dilation: 1},
+       in: ["qkv", "w:{p}.conv1d.weight", "s:conv.{layer}"], out: "c", name: "conv"},
+      {op: "Unary", args: {kind: "'Silu'"}, in: ["c"], out: "c", name: "silu"},
+      {op: "Slice", args: {axis: -1, start: 0, end: "kk"}, in: ["c"], out: "q", name: "q"},
+      {op: "Slice", args: {axis: -1, start: "kk", end: "2 * kk"}, in: ["c"], out: "k", name: "k"},
+      {op: "Slice", args: {axis: -1, start: "2 * kk", end: "cd"}, in: ["c"], out: "v", name: "v"},
+      {op: "Unary", args: {kind: "'Sigmoid'"}, in: ["b"], out: "beta", name: "beta"},
+      {op: "Binary", args: {kind: "'Add'"}, in: ["a", "w:{p}.dt_bias"], out: "a", name: "a_biased"},
+      {op: "Unary", args: {kind: "'Softplus'"}, in: ["a"], out: "a", name: "a_softplus"},
+      {op: "Binary", args: {kind: "'Mul'"}, in: ["w:{p}.neg_A", "a"], out: "g", name: "log_decay"},
+      {state: "ssm.{layer}", shape: ["lin_v_heads * lin_k_dim * lin_v_dim"], recurrent: true},
+      {op: "DeltaRule", args: {key_heads: "lin_k_heads", val_heads: "lin_v_heads", key_dim: "lin_k_dim", val_dim: "lin_v_dim"},
+       in: ["q", "k", "v", "beta", "g", "s:ssm.{layer}"], out: "o", name: "delta"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["o", "w:{p}.norm.weight"], out: "o", name: "norm"},
+      {op: "Unary", args: {kind: "first(sigmoid_gate, false) ? 'Sigmoid' : 'Silu'"}, in: ["z"], out: "z", name: "z_act"},
+      {op: "Binary", args: {kind: "'Mul'"}, in: ["o", "z"], out: "o", name: "gated"},
+      {block: [
+        {op: "Reshape", args: {shape: ["shape('o')[0]", "lin_k_heads", "lin_v_heads // lin_k_heads", "lin_v_dim"]},
+         in: ["o"], out: "o", name: "tile_r1"},
+        {op: "Transpose", args: {perm: [0, 2, 1, 3]}, in: ["o"], out: "o", name: "tile_t"},
+        {op: "Reshape", args: {shape: ["shape('o')[0]", "vd"]}, in: ["o"], out: "o", name: "tile_r2"},
+      ], when: "first(tiled, false)"},
+      {op: "Linear", in: ["o", "w:{p}.out_proj.weight", "w?:{p}.out_proj.bias"], out: "out", name: "out"},
+    ]},
+  },
+}

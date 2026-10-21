@@ -1,0 +1,43 @@
+// LDM `UNetModel` names (SD single-file / GGUF, `model.diffusion_model.` prefix) -> diffusers
+// `UNet2DConditionModel` names. LDM checkpoints have layers_per_block 2: input block n >= 1 is
+// down block (n - 1) // 3, module (n - 1) % 3 (module 2 = the downsampler at n = 3(i + 1));
+// output block n is up block n // 3, resnet n % 3 (upsampler at module 1 or 2 of its last one).
+// Source: `model/unet.rs` `ldm_unet_name` (its inverse).
+{
+  rules: [
+    ["model.diffusion_model.input_blocks.0.0.{s:*}", "conv_in.{s}"],
+    ["model.diffusion_model.time_embed.0.{s:*}", "time_embedding.linear_1.{s}"],
+    ["model.diffusion_model.time_embed.2.{s:*}", "time_embedding.linear_2.{s}"],
+    ["model.diffusion_model.time_embed.cond_proj.{s:*}", "time_embedding.cond_proj.{s}"],
+    ["model.diffusion_model.label_emb.0.0.{s:*}", "add_embedding.linear_1.{s}"],
+    ["model.diffusion_model.label_emb.0.2.{s:*}", "add_embedding.linear_2.{s}"],
+    ["model.diffusion_model.out.0.{s:*}", "conv_norm_out.{s}"],
+    ["model.diffusion_model.out.2.{s:*}", "conv_out.{s}"],
+
+    ["model.diffusion_model.input_blocks.{n}.0.op.{s:*}", "down_blocks.{n // 3 - 1}.downsamplers.0.conv.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.0.in_layers.0.{s:*}", "down_blocks.{(n - 1) // 3}.resnets.{(n - 1) % 3}.norm1.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.0.in_layers.2.{s:*}", "down_blocks.{(n - 1) // 3}.resnets.{(n - 1) % 3}.conv1.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.0.emb_layers.1.{s:*}", "down_blocks.{(n - 1) // 3}.resnets.{(n - 1) % 3}.time_emb_proj.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.0.out_layers.0.{s:*}", "down_blocks.{(n - 1) // 3}.resnets.{(n - 1) % 3}.norm2.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.0.out_layers.3.{s:*}", "down_blocks.{(n - 1) // 3}.resnets.{(n - 1) % 3}.conv2.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.0.skip_connection.{s:*}", "down_blocks.{(n - 1) // 3}.resnets.{(n - 1) % 3}.conv_shortcut.{s}"],
+    ["model.diffusion_model.input_blocks.{n}.1.{s:*}", "down_blocks.{(n - 1) // 3}.attentions.{(n - 1) % 3}.{s}"],
+
+    ["model.diffusion_model.middle_block.{m}.in_layers.0.{s:*}", "mid_block.resnets.{m // 2}.norm1.{s}"],
+    ["model.diffusion_model.middle_block.{m}.in_layers.2.{s:*}", "mid_block.resnets.{m // 2}.conv1.{s}"],
+    ["model.diffusion_model.middle_block.{m}.emb_layers.1.{s:*}", "mid_block.resnets.{m // 2}.time_emb_proj.{s}"],
+    ["model.diffusion_model.middle_block.{m}.out_layers.0.{s:*}", "mid_block.resnets.{m // 2}.norm2.{s}"],
+    ["model.diffusion_model.middle_block.{m}.out_layers.3.{s:*}", "mid_block.resnets.{m // 2}.conv2.{s}"],
+    ["model.diffusion_model.middle_block.1.{s:*}", "mid_block.attentions.0.{s}"],
+
+    ["model.diffusion_model.output_blocks.{n}.0.in_layers.0.{s:*}", "up_blocks.{n // 3}.resnets.{n % 3}.norm1.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.0.in_layers.2.{s:*}", "up_blocks.{n // 3}.resnets.{n % 3}.conv1.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.0.emb_layers.1.{s:*}", "up_blocks.{n // 3}.resnets.{n % 3}.time_emb_proj.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.0.out_layers.0.{s:*}", "up_blocks.{n // 3}.resnets.{n % 3}.norm2.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.0.out_layers.3.{s:*}", "up_blocks.{n // 3}.resnets.{n % 3}.conv2.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.0.skip_connection.{s:*}", "up_blocks.{n // 3}.resnets.{n % 3}.conv_shortcut.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.1.conv.{s:*}", "up_blocks.{n // 3}.upsamplers.0.conv.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.2.conv.{s:*}", "up_blocks.{n // 3}.upsamplers.0.conv.{s}"],
+    ["model.diffusion_model.output_blocks.{n}.1.{s:*}", "up_blocks.{n // 3}.attentions.{n % 3}.{s}"],
+  ],
+}

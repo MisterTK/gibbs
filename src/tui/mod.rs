@@ -18,18 +18,17 @@ mod widgets;
 use crate::arch::dispatch::Loaded;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
 use crate::kv::PagedKVPool;
-use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore};
+use crate::model::classifier::{self, ClassifierSlot};
+use crate::runtime::encoder::{Activation, LabelScore};
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{
     split_revision, split_weight_file, DownloadProgress, HuggingFaceHub, StorageBackend,
 };
 use crate::model::image::ImageBuffer;
-use crate::model::jev::{ChoiceOption, JevSystem1Model};
-use crate::model::ltx;
+use crate::runtime::encoder::system1::{ChoiceOption, JevSystem1Model};
 use crate::model::native::MediaInput;
 use crate::model::reencode::ReencodeProgress;
-use crate::model::t2v::Video;
-use crate::model::text_to_image::{ImageRequest, ImageSlot};
+use crate::runtime::diffusion::{ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weight_format::{
     reencode_override, set_reencode_override, Choice, ReencodeConfig, ReencodePolicy, VariantPolicy,
@@ -386,11 +385,11 @@ pub struct TuiApp {
     pub scheduler: Option<Arc<ContinuousBatchScheduler>>,
     pub hub: HuggingFaceHub,
     pub hf_token: Option<String>,
-    pub jev_model: crate::model::jev::System1Slot,
+    pub jev_model: crate::runtime::encoder::system1::System1Slot,
     /// Shared with the HTTP server; `Some` makes `/image` and bare prompts generate images.
     pub image_model: ImageSlot,
     /// Set by loading an LTX-Video repo; `/video` and `/i2v` generate clips with it.
-    pub video: ltx::VideoSlot,
+    pub video: crate::model::video_repo::VideoSlot,
     /// Shared with the HTTP server; `Some` is the active model (a text classifier).
     pub classifier: ClassifierSlot,
     /// `--quant`; `None` lets the engine pick each loaded model's weight format.
@@ -501,9 +500,9 @@ impl TuiApp {
             scheduler: None,
             hub,
             hf_token,
-            jev_model: crate::model::jev::System1Slot::default(),
+            jev_model: crate::runtime::encoder::system1::System1Slot::default(),
             image_model: ImageSlot::default(),
-            video: ltx::VideoSlot::default(),
+            video: crate::model::video_repo::VideoSlot::default(),
             classifier: ClassifierSlot::default(),
             quant_override: None,
             weights: None,
@@ -1239,7 +1238,7 @@ impl TuiApp {
             }
             Route::Video { image } => {
                 let model = self.video.read().clone().ok_or(
-                    "no video model loaded; press m and load an LTX-Video repo, e.g. city96/LTX-Video-gguf",
+                    "no video model loaded; press m and load a video repo, e.g. city96/LTX-Video-gguf",
                 )?;
                 let dir = self.scratch_dir.path().to_path_buf();
                 Ok((
@@ -1258,32 +1257,33 @@ impl TuiApp {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_nanos() as u64;
-                            let clip = ltx::Clip::new(seed);
                             let start = Instant::now();
-                            let negative =
-                                "worst quality, inconsistent motion, blurry, jittery, distorted";
-                            let frames = ltx::run(
+                            let req = crate::runtime::diffusion::VideoRequest {
+                                prompt: prompt.trim().to_string(),
+                                seed,
+                                ..Default::default()
+                            };
+                            let (frames, fps, req) = crate::model::video_repo::generate(
                                 &model.0,
                                 &model.1,
-                                prompt.trim(),
-                                negative,
+                                crate::hardware::PlacementMode::Auto,
                                 None,
+                                &req,
                                 init.as_ref(),
-                                &clip,
                                 &|_| {},
                             )?;
                             let path = dir.join(format!("tui_video_{:03}.mp4", idx + 1));
-                            crate::model::t2v::write_mp4(&frames, ltx::FPS, &path)?;
+                            crate::model::image::write_mp4(&frames, fps, &path)?;
                             let bytes = std::fs::metadata(&path)
                                 .map_err(|e| format!("{}: {e}", path.display()))?
                                 .len();
                             let stats = format!(
                                 "{} frames {}x{} · {} steps · cfg {} · {:.0}s · {bytes} bytes · seed {seed}",
                                 frames.len(),
-                                clip.width,
-                                clip.height,
-                                clip.steps,
-                                clip.guidance,
+                                req.width.unwrap_or(0),
+                                req.height.unwrap_or(0),
+                                req.steps.unwrap_or(0),
+                                req.guidance.unwrap_or(0.0),
                                 start.elapsed().as_secs_f64()
                             );
                             Ok((Kind::Text, path.display().to_string(), stats))
@@ -1413,7 +1413,7 @@ impl TuiApp {
                     family: None,
                     stage: &|s| *stage.lock() = s,
                     // Only text generators (and PEFT adapters of them) and image models hot-swap.
-                    cli_routes: false,
+                    system1_first: false,
                     admit: &|adapter| match adapter
                         || route_for_model(&id) == Route::Image
                         || is_chat_model(&id)
@@ -1440,16 +1440,13 @@ impl TuiApp {
                         *video.write() = None;
                         Ok((None, shape))
                     }
-                    Loaded::Video(Video::Ltx(plan)) => {
-                        let shape = format!("LTX-Video {}; /video <prompt> and /i2v <image> <prompt> write .mp4 clips (CPU, minutes)", plan.label());
+                    Loaded::Video(plan) => {
+                        let shape = format!("{}; /video <prompt> (and /i2v <image> <prompt> where the pipeline takes an image) write .mp4 clips", plan.label());
                         *video.write() = Some(Arc::new((hub.clone(), plan)));
                         *jev_slot.write() = None;
                         *images.write() = None;
                         *slot.write() = None;
                         Ok((None, shape))
-                    }
-                    Loaded::Video(Video::ModelScope) => {
-                        unreachable!("the TUI does not take the ModelScope video route")
                     }
                     Loaded::Image(g) => {
                         let d = g.defaults();
@@ -1549,7 +1546,7 @@ impl TuiApp {
             let attach = || -> Result<String, String> {
                 let da = hub.auto_download_and_cache(&id, token.as_deref())?;
                 let d =
-                    crate::model::draft::load_drafter(&da, &hub.locate_model(&target), placement)?;
+                    crate::runtime::draft::load_drafter(&da, &hub.locate_model(&target), placement)?;
                 // ponytail: check-then-set; a model swap landing in between keeps this drafter
                 // until the swap resets it. Add a guarded set if loads race in practice.
                 if sched.model_id() != target {

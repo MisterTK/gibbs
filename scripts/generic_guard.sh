@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# No model-specific identifiers in lines the last commit adds to the generic compiler/runtime
-# (src/graph, src/hardware, src/scheduler), ignoring everything from `#[cfg(test)]` to end of file.
+# No model-specific identifiers in non-test lines added to the generic code (src/graph, src/hardware,
+# src/scheduler, src/arch, src/runtime), ignoring everything from `#[cfg(test)]` to end of file.
+#   scripts/generic_guard.sh [BASE]   lines added since BASE (default HEAD~1; use the merge base for a branch)
 set -u
 cd "$(dirname "$0")/.."
-exec python3 - <<'PY'
+exec python3 - "${1:-HEAD~1}" <<'PY'
 import re, subprocess, sys
+base = sys.argv[1]
 pat = re.compile(r"gemma|qwen|llama|mistral|smollm|granite|deepseek|gpt-oss|nemotron|\b(phi|bert|sana|ltx|flux|lfm|glm|t5)(\b|[_\d-])", re.I)
-diff = subprocess.run(["git", "diff", "HEAD~1", "-U0", "--", "src/graph", "src/hardware", "src/scheduler"],
+diff = subprocess.run(["git", "diff", base, "-U0", "--", "src/graph", "src/hardware", "src/scheduler", "src/arch", "src/runtime"],
                       capture_output=True, text=True, check=True).stdout
 bad, path, lineno, test_from = [], None, 0, {}
 def first_test_line(p):
+    # Whole-file test modules (`#[cfg(test)] mod tests_x;` in the parent).
+    if re.search(r"(^|/)(tests?(_[^/]*)?|testing)\.rs$", p):
+        return 0
     try:
         for i, l in enumerate(open(p), 1):
             if l.strip() == "#[cfg(test)]":

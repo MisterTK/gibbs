@@ -2995,7 +2995,11 @@ impl Session {
                         n,
                     )
                 };
-                Ok(Tensor::F32(s.to_vec()))
+                // u32 values (ids, tokens) are stored as their bits.
+                Ok(match graph.value(v).dtype {
+                    DType::U32 => Tensor::U32(s.iter().map(|x| x.to_bits()).collect()),
+                    _ => Tensor::F32(s.to_vec()),
+                })
             })
             .collect::<Result<Vec<_>, String>>()?;
         if let Some(mut s) = sample {
@@ -10889,8 +10893,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         assert_eq!(plan.mlp_scratch_size, h * 4 + 2 * inter * 4);
     }
 
-    /// Bits of a graph output: u32 ids as themselves, f32 as `to_bits` (Metal returns u32 outputs as
-    /// f32 slots holding the bits).
+    /// Bits of a graph output: u32 ids as themselves, f32 as `to_bits`.
     fn out_bits(t: &Tensor) -> Vec<u32> {
         match t {
             Tensor::U32(v) => v.clone(),

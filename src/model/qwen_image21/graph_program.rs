@@ -293,6 +293,9 @@ mod real_tests {
             .forward_gpu(&dit.gpu, &lat, &txt, h, w, 0.7)
             .expect("metal program");
         eprintln!("metal (compile + run): {:.2}s", t.elapsed().as_secs_f64());
+        if let Ok(p) = std::env::var("GIBBS_QWEN21_DUMP") {
+            std::fs::write(p, serde_json::to_string(&got).unwrap()).unwrap();
+        }
         let t = Instant::now();
         let want = {
             let _cpu = crate::hardware::cpu_compute::allow();

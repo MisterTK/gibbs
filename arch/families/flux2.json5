@@ -1,0 +1,40 @@
+// FLUX.2 klein (diffusers `Flux2KleinPipeline`): the FLUX `denoiser` (see `flux`) with shared
+// per-stream modulations, SwiGLU feed-forwards and 4-axis RoPE; Qwen3 hidden states after layers
+// 9, 18 and 27 (transformers `hidden_states` indices) concatenated per token as the text; the
+// 32-channel VAE whose BatchNorm statistics denormalize the packed latents.
+{
+  family: "flux2",
+  extends: "flux",
+  match: {
+    // Not `Flux2KleinPipeline` yet: its Qwen3 text encoder needs `qwen3.json5`; until then the
+    // legacy loader (`model::flux`) runs klein repos.
+    diffusers_class: ["Flux2Transformer2DModel"],
+  },
+  components: {
+    text_encoder: {family: "qwen3", dir: "text_encoder"},
+    text_encoder_2: null,
+    transformer: {family: "flux2", dir: "transformer"},
+  },
+  runtime: {
+    text_encoders: [
+      // The non-thinking chat prompt, truncated and padded with `<|endoftext|>` (151643, the Qwen2/3
+      // BPE's) to 512; padding masked as keys (`masked`), every row kept. Taps are 0-based layer
+      // outputs (`layer.8` = transformers hidden_states[9]).
+      {name: "qwen", component: "text_encoder", net: "text", tokenizer: "tokenizer", template: "chat",
+       add_special: false, max_len: 512, pad_to: 512, pad_id: 151643, keep: "all",
+       vars: {masked: "true", taps: "['layer.8', 'layer.17', 'layer.26']"},
+       outputs: {h9: "layer.8", h18: "layer.17", h27: "layer.26"}},
+    ],
+    context: [{features: ["qwen.h9", "qwen.h18", "qwen.h27"]}],
+    pooled: [],
+    // Flux2KleinPipeline: `use_dynamic_shifting` -> mu = compute_empirical_mu(image tokens, steps).
+    scheduler: {mu: "first(json.scheduler_config.use_dynamic_shifting, false) ? 'empirical' : 'static'"},
+    // CFG unless step-distilled (`model_index.json` `is_distilled`).
+    guidance: {kind: "cfg", gate: "guidance > 1 && !first(json.model_index.is_distilled, false)", scale: "guidance"},
+    vae: {decode_affine: {mul: 1, add: 0},
+          bn_denorm: {mean: "bn.running_mean", var: "bn.running_var", eps: "first(vae.cfg.batch_norm_eps, 1e-4)"}},
+    defaults: {steps: "first(json.model_index.is_distilled, false) ? 4 : 50",
+               guidance: "first(json.model_index.is_distilled, false) ? 1 : 4"},
+    summary: "fmt('FLUX.2 klein ({denoiser.nd} double + {denoiser.ns} single blocks), Qwen3 + VAE')",
+  },
+}

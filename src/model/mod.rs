@@ -6,9 +6,8 @@
 //! 1. **Model Execution Interfaces**:
 //!    - [`GraphLm`]: High-throughput autoregressive transformer decoder with fused RoPE,
 //!      single-pass SwiGLU, and pre-allocated zero-allocation KV cache.
-//!    - [`JevSystem1Model`]: pretrained BERT sentence encoder (default all-MiniLM-L6-v2) answering
-//!      choice/bool questions zero-shot by embedding cosine similarity.
-//!    - [`sd::SdPipeline`]: Stable Diffusion 2.x (CLIP + UNet + VAE) loaded from a real GGUF checkpoint.
+//!    - [`crate::runtime::encoder::system1::JevSystem1Model`]: pretrained sentence encoder
+//!      (default all-MiniLM-L6-v2) answering choice/bool questions zero-shot by embedding cosine similarity.
 //!    - [`NanoLlm`]: Minimal reference transformer decoder for smoke tests and micro-benchmarking.
 //!
 //! 2. **Universal Quantization & Layer Abstractions**:
@@ -46,16 +45,12 @@
 pub mod audio;
 pub mod classifier;
 pub mod clip;
-pub mod dcae;
 pub mod diff_fixtures;
 pub mod diff_graph;
 pub mod dit;
 pub mod dit_graph;
-pub mod draft;
-pub mod encdec_gpu;
 pub mod fasttext;
 pub mod fingerprint;
-pub mod flow;
 pub mod flux;
 pub mod gemma3_text;
 pub mod gemma4;
@@ -64,14 +59,12 @@ pub mod hf_loader;
 pub mod hub;
 pub mod idefics3;
 pub mod image;
-pub mod jev;
+pub mod gguf_meta;
 pub mod krea2;
 pub mod layers;
 pub mod load_log;
 pub mod loaders;
 pub mod lora;
-pub mod ltx;
-pub mod ltx_vae;
 pub mod nano;
 pub mod native;
 pub mod ninfer;
@@ -87,21 +80,15 @@ pub mod qwen_vae;
 pub mod qwen_vae21;
 pub mod reencode;
 pub mod variant;
+pub mod video_repo;
 pub mod repack;
-pub mod sana;
-pub mod sd;
-pub mod sd3;
-pub mod sd_sched;
-pub mod seq2seq;
 pub mod siglip;
 pub mod simd;
 pub mod spm;
-pub mod t2v;
 pub mod t5;
 pub mod text_to_image;
 pub mod tokenizer;
 pub mod unet;
-pub mod unet3d;
 pub mod vae;
 pub mod vision_graph;
 pub mod weight_format;
@@ -115,7 +102,6 @@ pub use fingerprint::*;
 pub use graph_lm::*;
 pub use hub::*;
 pub use image::*;
-pub use jev::*;
 pub use layers::*;
 pub use simd::*;
 use std::collections::HashMap;

@@ -1,22 +1,34 @@
 //! Qwen3.5-0.8B (hybrid Gated DeltaNet decoder + ViT) end to end on real weights from the shared
-//! `disk/` cache: the model's own chat template, `prepare` with images, greedy decode.
+//! `disk/` cache: the model's own chat template, `prepare` with images, greedy decode. Without it,
+//! the text checks run on the cached text-only Qwen3.5-2B GGUF (no vision tower).
 
-use gibbs_engine::hardware::Device;
+use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::hf_loader::ChatMessage;
 use gibbs_engine::model::hub::HuggingFaceHub;
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::native::{load_native, MediaInput, NativeLm};
+use gibbs_engine::model::native::{MediaInput, NativeLm};
 use std::sync::Arc;
 
 const REPO: &str = "Qwen/Qwen3.5-0.8B";
+const TEXT_ONLY: &str = "unsloth/Qwen3.5-2B-GGUF";
 
-fn model() -> Option<Arc<dyn NativeLm>> {
-    let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(REPO);
-    if art.weights_path.is_none() {
-        println!("SKIP: {REPO} not in disk/ (gibbs --model {REPO} --storage disk)");
+/// The first cached of [`REPO`], [`TEXT_ONLY`], and whether it has the vision tower.
+fn model() -> Option<(Arc<dyn NativeLm>, bool)> {
+    let hub = HuggingFaceHub::with_cache_dir("disk".into());
+    let Some((repo, art)) = [REPO, TEXT_ONLY]
+        .into_iter()
+        .map(|r| (r, hub.locate_model(r)))
+        .find(|(_, a)| a.weights_path.is_some())
+    else {
+        println!(
+            "SKIP: neither {REPO} nor {TEXT_ONLY} in disk/ (gibbs --model {REPO} --storage disk)"
+        );
         return None;
-    }
-    Some(load_native(&art, Device::Cpu)?.expect("Qwen3.5-0.8B loads"))
+    };
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let m = gibbs_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Cpu))
+        .unwrap_or_else(|e| panic!("{repo} loads: {e}"));
+    Some((m, repo == REPO))
 }
 
 /// Greedy answer to one user turn of `text` after `images`, prefilling in uneven chunks so
@@ -61,40 +73,49 @@ fn ask(m: &dyn NativeLm, text: &str, images: Vec<Vec<u8>>, max: usize) -> String
 
 #[test]
 fn qwen3_5_answers_text_and_image_and_refuses_bad_input() {
-    let Some(m) = model() else { return };
+    let Some((m, vision)) = model() else { return };
     let text = ask(m.as_ref(), "What is the capital of France?", vec![], 30);
     assert!(text.contains("Paris"), "factual answer: {text:?}");
 
-    // A solid colour exercises the image processor, vision tower, placeholder expansion and
-    // M-RoPE positions; a broken path answers with something other than the colour.
-    let mut img = ImageBuffer::new(224, 160);
-    for y in 0..160 {
-        for x in 0..224 {
-            img.set_pixel(x, y, 220, 20, 20);
-        }
-    }
-    let answer = ask(
-        m.as_ref(),
-        "What color is this image? Answer with one word.",
-        vec![img.to_png()],
-        8,
-    );
-    assert!(
-        answer.to_lowercase().contains("red"),
-        "image answer: {answer:?}"
-    );
-
-    // Contract errors: placeholder/media mismatch, audio, and rewinding the recurrent state.
     let tok = m.tokenizer();
     let ids = tok.encode("<|vision_start|><|image_pad|><|vision_end|>hi");
-    assert!(
-        m.prepare(ids.clone(), &[]).is_err(),
-        "placeholder without an image"
-    );
-    assert!(
-        m.prepare(ids, &[MediaInput::Audio(vec![0; 4])]).is_err(),
-        "audio is not an input"
-    );
+    if !vision {
+        println!("SKIP: image checks ({TEXT_ONLY} has no vision tower; needs {REPO})");
+        // The spec refuses every media input on a text-only checkpoint.
+        assert!(
+            m.prepare(ids, &[MediaInput::Image(vec![0; 4])]).is_err(),
+            "image on a text-only model"
+        );
+    } else {
+        // A solid colour exercises the image processor, vision tower, placeholder expansion and
+        // M-RoPE positions; a broken path answers with something other than the colour.
+        let mut img = ImageBuffer::new(224, 160);
+        for y in 0..160 {
+            for x in 0..224 {
+                img.set_pixel(x, y, 220, 20, 20);
+            }
+        }
+        let answer = ask(
+            m.as_ref(),
+            "What color is this image? Answer with one word.",
+            vec![img.to_png()],
+            8,
+        );
+        assert!(
+            answer.to_lowercase().contains("red"),
+            "image answer: {answer:?}"
+        );
+        // Contract errors: placeholder/media mismatch and audio.
+        assert!(
+            m.prepare(ids.clone(), &[]).is_err(),
+            "placeholder without an image"
+        );
+        assert!(
+            m.prepare(ids, &[MediaInput::Audio(vec![0; 4])]).is_err(),
+            "audio is not an input"
+        );
+    }
+    // The recurrent state cannot rewind.
     let (ids, mut st) = m.prepare(tok.encode("hello"), &[]).unwrap();
     m.forward(&ids, 0, &mut st).unwrap();
     assert!(

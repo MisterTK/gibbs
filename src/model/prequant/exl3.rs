@@ -380,7 +380,7 @@ mod tests {
         }
     }
 
-    /// Greedy completion through a native loader (Qwen3.5 reads bf16 `Weights::mat`) on MUL1 weights.
+    /// Greedy completion through the qwen3_5 spec (MUL1 weights dequantized by `Weights::mat`).
     #[test]
     fn qwen3_5_exl3_answers_paris() {
         let id = format!("{QWEN35}-4.0bpw");
@@ -389,9 +389,9 @@ mod tests {
             return;
         }
         let _guard = HEAVY.lock();
-        let lm = crate::model::native::load_native(&artifacts(&id), crate::hardware::Device::Cpu)
-            .unwrap()
-            .unwrap();
+        let reg = crate::arch::registry().unwrap();
+        let cpu = crate::hardware::Device::Cpu.into();
+        let lm = crate::runtime::lm::load(&artifacts(&id), reg, None, cpu).unwrap();
         let tok = lm.tokenizer();
         // The bf16 original answers the raw "The capital of France is" with prose too; ask in chat.
         let prompt = tok

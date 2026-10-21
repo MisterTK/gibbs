@@ -797,7 +797,7 @@ mod tests {
 
     /// mlx-community Qwen3.5 checkpoints (mlx-vlm names, packed language model, channels-last
     /// patch embed, pre-shifted norms) read under HF names vs Qwen/Qwen3.5-0.8B: cosine of every
-    /// packed tensor, exact vision weights, then a greedy completion through the native loader.
+    /// packed tensor, exact vision weights, then a greedy completion through the qwen3_5 spec.
     #[test]
     fn mlx_qwen3_5_matches_hf_original() {
         let orig = snapshot("Qwen/Qwen3.5-0.8B").join("model.safetensors.index.json");
@@ -874,6 +874,7 @@ mod tests {
 
         let dir = snapshot("mlx-community/Qwen3.5-0.8B-4bit");
         if !dir.join("model.safetensors").exists() {
+            eprintln!("SKIP: mlx-community/Qwen3.5-0.8B-4bit not in disk/");
             return;
         }
         let artifacts = crate::model::hub::ModelArtifacts {
@@ -883,9 +884,9 @@ mod tests {
             weights_path: Some(dir.join("model.safetensors")),
             ..Default::default()
         };
-        let lm = crate::model::native::load_native(&artifacts, crate::hardware::Device::Cpu)
-            .unwrap()
-            .unwrap();
+        let reg = crate::arch::registry().unwrap();
+        let cpu = crate::hardware::Device::Cpu.into();
+        let lm = crate::runtime::lm::load(&artifacts, reg, None, cpu).unwrap();
         let ids = lm.tokenizer().encode("The capital of France is");
         let (mut ids, mut state) = lm.prepare(ids, &[]).unwrap();
         let mut pos = 0;

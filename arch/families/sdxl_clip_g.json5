@@ -1,0 +1,10 @@
+// OpenCLIP-G text tower of an SDXL LDM single-file checkpoint (`conditioner.embedders.1.model.*`,
+// OpenCLIP naming, all blocks); the rest of the file is ignored.
+{
+  family: "sdxl_clip_g",
+  extends: "clip_text",
+  names: {strip: ["conditioner.embedders.1.model."]},
+  ignore: ["text_model.embeddings.position_ids", "logit_scale", "attn_mask",
+           "conditioner.embedders.0.*", "model.diffusion_model.*", "first_stage_model.*", "model_ema.*",
+           "alphas_cumprod*", "betas", "log_one_minus_alphas_cumprod", "posterior_*", "sqrt_*", "logvar", "denoiser.*"],
+}

@@ -8,11 +8,11 @@
 use crate::graph::ValueId;
 use crate::model::dit_graph::Gb;
 use crate::model::weights::{Mat, Packed};
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::flux::{Store, Wt};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::model::nn;
-use crate::model::text_to_image::{pipeline_class, ImageGenerator};
+use crate::runtime::diffusion::{pipeline_class, ImageGenerator};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -156,70 +156,6 @@ pub(crate) fn rope_positions(pos: &[[i32; 3]]) -> Vec<u32> {
         .collect()
 }
 
-/// diffusers `FlowMatchEulerDiscreteScheduler` as Qwen-Image configures it: resolution-dependent
-/// exponential shift of the requested sigmas, optionally stretched to end at `shift_terminal`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Sched {
-    dynamic: bool,
-    shift: f64,
-    base_seq: f64,
-    max_seq: f64,
-    base_shift: f64,
-    max_shift: f64,
-    terminal: Option<f64>,
-}
-
-impl Sched {
-    pub(crate) fn from_config(v: &Value) -> Self {
-        let f = |k: &str, d: f64| v[k].as_f64().unwrap_or(d);
-        Self {
-            dynamic: v["use_dynamic_shifting"].as_bool().unwrap_or(false),
-            shift: f("shift", 1.0),
-            base_seq: f("base_image_seq_len", 256.0),
-            max_seq: f("max_image_seq_len", 4096.0),
-            base_shift: f("base_shift", 0.5),
-            max_shift: f("max_shift", 1.15),
-            // diffusers tests `if self.config.shift_terminal`: null and 0 both mean off.
-            terminal: v["shift_terminal"].as_f64().filter(|t| *t != 0.0),
-        }
-    }
-
-    /// `set_timesteps(sigmas = base, mu)` for an image of `tokens` latent tokens, 0 appended.
-    pub(crate) fn sigmas(&self, base: &[f64], tokens: usize) -> Vec<f32> {
-        let mu = flow::calculate_shift(
-            tokens,
-            self.base_seq,
-            self.max_seq,
-            self.base_shift,
-            self.max_shift,
-        );
-        let mut s: Vec<f64> = base
-            .iter()
-            .map(|&t| {
-                if self.dynamic {
-                    flow::time_shift(mu, t)
-                } else {
-                    flow::shift_sigma(t, self.shift)
-                }
-            })
-            .collect();
-        if let Some(t) = self.terminal {
-            flow::stretch_to_terminal(&mut s, t);
-        }
-        s.into_iter().map(|v| v as f32).chain([0.0]).collect()
-    }
-}
-
-/// `STEPS, SIGMAS = 6, [1.0, 0.9375, ...]` of a distilled finetune's model card: the raw sigmas
-/// its authors sample with (the card's first `SIGMAS` list of plain numbers).
-pub(crate) fn card_sigmas(card: &str) -> Option<Vec<f64>> {
-    let rest = &card[card.find("SIGMAS")?..];
-    let list = &rest[rest.find('[')? + 1..];
-    let list = &list[..list.find(']')?];
-    let v: Option<Vec<f64>> = list.split(',').map(|s| s.trim().parse().ok()).collect();
-    v.filter(|v| !v.is_empty())
-}
-
 /// Tensor names of a GGUF / safetensors file (headers only).
 fn tensor_names(path: &Path) -> Option<Vec<String>> {
     crate::model::flux::tensor_names(path)
@@ -315,7 +251,7 @@ pub fn load_derived(
                 &dir,
                 Some(weights),
                 sched,
-                card_sigmas(&card),
+                sched::card_sigmas(&card),
             )?),
             Gen::V1 => Arc::new(crate::model::qwen_image_v1::QwenImagePipeline::load_with(
                 &dir,
@@ -330,46 +266,6 @@ pub fn load_derived(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn terminal_stretch_lands_on_shift_terminal_and_keeps_start() {
-        let s = Sched::from_config(&serde_json::json!({
-            "use_dynamic_shifting": true, "base_image_seq_len": 256, "max_image_seq_len": 8192,
-            "base_shift": 0.5, "max_shift": 0.9, "shift_terminal": 0.02,
-        }));
-        let sig = s.sigmas(&flow::linspace_sigmas(4), 4096);
-        assert_eq!(sig.len(), 5);
-        assert!((sig[0] - 1.0).abs() < 1e-6, "{sig:?}");
-        assert!((sig[3] - 0.02).abs() < 1e-6, "{sig:?}");
-        assert_eq!(sig[4], 0.0);
-        assert!(sig.windows(2).all(|w| w[0] > w[1]));
-    }
-
-    #[test]
-    fn no_terminal_is_plain_exponential_shift() {
-        // Viggle turbo: raw nodes, mu = 0.5 + 0.4 * (4096 - 256) / (8192 - 256), no stretch.
-        let s = Sched::from_config(&serde_json::json!({
-            "use_dynamic_shifting": true, "max_image_seq_len": 8192, "max_shift": 0.9, "shift_terminal": null,
-        }));
-        let sig = s.sigmas(&[1.0, 0.5], 4096);
-        let mu: f64 = 0.5 + 0.4 * (4096.0 - 256.0) / (8192.0 - 256.0);
-        let want = mu.exp() / (mu.exp() + 1.0);
-        assert!(
-            (sig[1] as f64 - want).abs() < 1e-6 && sig[0] == 1.0,
-            "{sig:?}"
-        );
-    }
-
-    #[test]
-    fn card_sigmas_reads_the_first_list() {
-        let card = "x\nSTEPS, SIGMAS = 6, [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]   # pass both\nSIGMAS_9 = [1.0, 1 / 6]";
-        assert_eq!(
-            card_sigmas(card),
-            Some(vec![1.0, 0.9375, 0.875, 0.75, 0.5, 0.25])
-        );
-        assert_eq!(card_sigmas("no sigmas here"), None);
-        assert_eq!(card_sigmas("SIGMAS = [1 / 6]"), None);
-    }
 
     #[test]
     fn generation_follows_tensor_names() {

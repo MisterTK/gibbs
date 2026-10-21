@@ -1,13 +1,15 @@
 //! BitNet b1.58: the three published encodings of microsoft/bitnet-b1.58-2B-4T (packed 2-bit
 //! safetensors, bf16 master weights ternarized at load, bitnet.cpp I2_S GGUF) must decode to the same
-//! ternary weights (up to bf16 master-weight ties, below), BitLinear activation quant must round
-//! like torch, and the packed 2B-4T and 1bitLLM's `llama`-typed checkpoint must answer coherently.
+//! ternary weights (up to bf16 master-weight ties, below), and the packed 2B-4T and 1bitLLM's
+//! `llama`-typed checkpoint must answer coherently through the family spec (`runtime::lm::SpecLm`).
+//! BitLinear activation quant rounding: `arch::build` `act_quant_rounds_half_to_even_and_clamps_like_torch`.
 
-use gibbs_engine::hardware::QuantMode;
-use gibbs_engine::model::hf_loader::load_causal_lm;
+use gibbs_engine::arch::load::ternarize;
+use gibbs_engine::hardware::PlacementMode;
 use gibbs_engine::model::hub::ModelArtifacts;
 use gibbs_engine::model::loaders::{SafetensorsWeightReader, WeightReader};
-use gibbs_engine::model::graph_lm::{act_quant, ternarize, GraphLm};
+use gibbs_engine::model::tokenizer::Tokenizer;
+use gibbs_engine::scheduler::ExecutableModel;
 use gibbs_engine::model::{bf16_to_f32, f32_to_bf16, UniversalModelLoader};
 use std::path::PathBuf;
 
@@ -50,9 +52,9 @@ fn bf16(x: f32) -> f32 {
 /// Serializes the real-weight checks: each holds GBs of weights.
 static HEAVY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// Greedy completion of `prompt` by `repo` loaded through the normal loader in `mode`; `None` (after
-/// printing SKIP) when the checkpoint is not downloaded.
-fn complete(repo: &str, mode: QuantMode, prompt: impl Fn(&GraphLm) -> String) -> Option<String> {
+/// Greedy completion of `prompt` by `repo` loaded through the spec loader (detected family, re-encode
+/// gate); `None` (after printing SKIP) when the checkpoint is not downloaded.
+fn complete(repo: &str, prompt: impl Fn(&Tokenizer) -> String) -> Option<String> {
     let Some(weights) = snapshot_file(repo, "model.safetensors") else {
         println!("SKIP: {repo} not downloaded");
         return None;
@@ -61,13 +63,18 @@ fn complete(repo: &str, mode: QuantMode, prompt: impl Fn(&GraphLm) -> String) ->
     let dir = weights.parent().unwrap().to_path_buf();
     let artifacts = ModelArtifacts {
         model_id: repo.into(),
+        local_dir: Some(dir.clone()),
         config_path: Some(dir.join("config.json")),
         tokenizer_path: Some(dir.join("tokenizer.json")),
         weights_path: Some(weights),
         ..Default::default()
     };
-    let llm = load_causal_lm(&artifacts, mode).unwrap();
-    let out = llm.generate_text(&prompt(&llm), 12, 0.0);
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let lm = gibbs_engine::runtime::lm::load(&artifacts, reg, None, PlacementMode::Auto).unwrap();
+    let m = ExecutableModel::Native(lm);
+    let (out, _, _) = m
+        .generate_text_measured_plain(&prompt(&m.tokenizer()), 12, 0.0)
+        .unwrap();
     println!("{repo}: {out:?}");
     Some(out)
 }
@@ -75,9 +82,8 @@ fn complete(repo: &str, mode: QuantMode, prompt: impl Fn(&GraphLm) -> String) ->
 /// Packed 2B-4T through the loader: unpacking, relu² MLP, sub-norms and activation quant together.
 #[test]
 fn bitnet_2b4t_packed_answers_capital_of_france() {
-    let Some(out) = complete("microsoft/bitnet-b1.58-2B-4T", QuantMode::Q8_0, |llm| {
-        llm.tokenizer
-            .apply_chat_template(&[("user", "What is the capital of France?")])
+    let Some(out) = complete("microsoft/bitnet-b1.58-2B-4T", |t| {
+        t.apply_chat_template(&[("user", "What is the capital of France?")])
     }) else {
         return;
     };
@@ -88,26 +94,12 @@ fn bitnet_2b4t_packed_answers_capital_of_france() {
 /// ternarization, int8 activations) and the checkpoint's `inner_attn_ln` / `ffn_layernorm` norms.
 #[test]
 fn bitnet_1bitllm_large_continues_prefix() {
-    let Some(out) = complete(
-        "1bitLLM/bitnet_b1_58-large",
-        QuantMode::Uncompressed,
-        |_| "The capital of France is".into(),
-    ) else {
+    let Some(out) = complete("1bitLLM/bitnet_b1_58-large", |_| {
+        "The capital of France is".into()
+    }) else {
         return;
     };
     assert!(out.contains("Paris"), "{out:?}");
-}
-
-#[test]
-fn act_quant_rounds_half_to_even_and_clamps_like_torch() {
-    // absmax 127 → scale 1: 0.5 and 2.5 tie (torch.round → 0 and 2), -127 stays in [-128, 127].
-    let mut x = [127.0, 0.5, 2.5, -1.5, -127.0];
-    act_quant(&mut x, 8);
-    assert_eq!(x, [127.0, 0.0, 2.0, -2.0, -127.0]);
-    // An all-zero row keeps its zeros (scale clamps at 1e-5 instead of dividing by zero).
-    let mut z = [0.0f32; 4];
-    act_quant(&mut z, 8);
-    assert_eq!(z, [0.0; 4]);
 }
 
 /// The packed checkpoint was ternarized from f32 master weights; the bf16 repo stores those masters

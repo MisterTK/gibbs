@@ -1,0 +1,104 @@
+// diffusers AutoencoderKL (SD 1.x/2.x/XL/3, FLUX `vae/`): GroupNorm ResNet levels with a
+// self-attention mid block. LDM single-file names (`first_stage_model.*`) via `ldm_vae`, the
+// pre-0.15 diffusers attention names (query/key/value/proj_attn) via the rules below.
+// Networks are affine-free: model latents are `(z - shift) * scaling`, so a pipeline decodes
+// `z = latents / scaling + shift` and encodes `latents = (mean - shift) * scaling`.
+{
+  family: "sd_vae",
+  match: {diffusers_class: ["AutoencoderKL"]},
+  pipeline: "diffusion",
+  use_lib: ["vae"],
+  config: {
+    scaling: "first(cfg.scaling_factor, 0.18215)",
+    shift: "first(cfg.shift_factor, 0)",
+    latent_channels: "shape('decoder.conv_in.weight')[1]",
+    in_channels: "shape('encoder.conv_in.weight')[1]",
+    // LDM checkpoints keep their reversed decoder level index (`decoder.up_ldm.*`, see ldm_vae).
+    ldm_up: "has('decoder.up_ldm.0.resnets.0.conv1.weight')",
+    up_levels: "count(ldm_up ? 'decoder.up_ldm.{k}.resnets.0.conv1.weight' : 'decoder.up_blocks.{k}.resnets.0.conv1.weight')",
+    down_levels: "count('encoder.down_blocks.{k}.resnets.0.conv1.weight')",
+    // Pixels per latent: a 2x upsampler on every decoder level but the last.
+    factor: "2 ** (up_levels - 1)",
+    groups: "first(cfg.norm_num_groups, 32)",
+    eps: "1e-6",
+  },
+  names: {
+    use: ["ldm_vae"],
+    rules: [
+      ["{c:*}.mid_block.attentions.0.query.{t:*}", "{c}.mid_block.attentions.0.to_q.{t}"],
+      ["{c:*}.mid_block.attentions.0.key.{t:*}", "{c}.mid_block.attentions.0.to_k.{t}"],
+      ["{c:*}.mid_block.attentions.0.value.{t:*}", "{c}.mid_block.attentions.0.to_v.{t}"],
+      ["{c:*}.mid_block.attentions.0.proj_attn.{t:*}", "{c}.mid_block.attentions.0.to_out.0.{t}"],
+    ],
+  },
+  transforms: [
+    // LDM 1x1-conv attention projections.
+    {tensor: "{c:*}.mid_block.attentions.0.{n:*}.weight", op: "conv_to_linear",
+     when: "len(shape(fmt('{c}.mid_block.attentions.0.{n}.weight'))) == 4"},
+  ],
+  components: {
+    // z [latent_channels, h, w] (already latents / scaling + shift) -> image [3, h*f, w*f] in [-1, 1].
+    decoder: {
+      vars: ["h", "w"],
+      inputs: [{name: "z", dtype: "f32", shape: ["latent_channels", "h", "w"]}],
+      body: [
+        {block: [
+          {use: "conv", args: {w: "'post_quant_conv'"}, in: ["i:z"], out: "z", name: "post_quant_conv"},
+          {use: "conv", args: {w: "'decoder.conv_in'"}, in: ["z"], out: "x", name: "conv_in"},
+        ], when: "has('post_quant_conv.weight')"},
+        {use: "conv", args: {w: "'decoder.conv_in'"}, in: ["i:z"], out: "x", name: "conv_in", when: "!has('post_quant_conv.weight')"},
+        {use: "mid", args: {p: "'decoder.mid_block'"}, in: ["x"], out: "x", name: "mid"},
+        {repeat: "l", count: "up_levels", body: [
+          {let: {b: "ldm_up ? fmt('decoder.up_ldm.{up_levels - 1 - l}') : fmt('decoder.up_blocks.{l}')"}},
+          {repeat: "j", count: "count('{b}.resnets.{k}.conv1.weight')", body: [
+            {use: "resnet", args: {p: "fmt('{b}.resnets.{j}')"}, in: ["x"], out: "x", name: "up{l}.res{j}"},
+          ]},
+          {block: [
+            {op: "Upsample", args: {scale: 2, mode: "Nearest"}, in: ["x"], out: "x", name: "up{l}.upsample"},
+            {use: "conv", args: {w: "fmt('{b}.upsamplers.0.conv')"}, in: ["x"], out: "x", name: "up{l}.upconv"},
+          ], when: "has(fmt('{b}.upsamplers.0.conv.weight'))"},
+        ]},
+        {use: "tail", args: {p: "'decoder'"}, in: ["x"], out: "image", name: "tail"},
+      ],
+      outputs: ["image"],
+    },
+    // image [in_channels, h*f, w*f] in [-1, 1] -> posterior mean [latent_channels, h, w] (unscaled).
+    encoder: {
+      vars: ["h", "w"],
+      inputs: [{name: "image", dtype: "f32", shape: ["in_channels", "h * factor", "w * factor"]}],
+      body: [
+        {use: "conv", args: {w: "'encoder.conv_in'"}, in: ["i:image"], out: "x", name: "conv_in"},
+        {repeat: "l", count: "down_levels", body: [
+          {repeat: "j", count: "count('encoder.down_blocks.{l}.resnets.{k}.conv1.weight')", body: [
+            {use: "resnet", args: {p: "fmt('encoder.down_blocks.{l}.resnets.{j}')"}, in: ["x"], out: "x", name: "down{l}.res{j}"},
+          ]},
+          // diffusers pads (0, 1, 0, 1) = right/bottom before the stride-2 valid conv.
+          {op: "Conv2d", args: {stride: [2, 2], padding: [0, 0, 1, 1], dilation: [1, 1], groups: 1},
+           in: ["x", "w:encoder.down_blocks.{l}.downsamplers.0.conv.weight", "w?:encoder.down_blocks.{l}.downsamplers.0.conv.bias"],
+           out: "x", name: "down{l}.downsample", when: "has(fmt('encoder.down_blocks.{l}.downsamplers.0.conv.weight'))"},
+        ]},
+        {use: "mid", args: {p: "'encoder.mid_block'"}, in: ["x"], out: "x", name: "mid"},
+        {use: "tail", args: {p: "'encoder'"}, in: ["x"], out: "x", name: "tail"},
+        {use: "conv", args: {w: "'quant_conv'"}, in: ["x"], out: "x", name: "quant_conv", when: "has('quant_conv.weight')"},
+        // Moments are [mean; logvar].
+        {op: "Slice", args: {axis: 0, start: 0, end: "latent_channels"}, in: ["x"], out: "mean", name: "mean"},
+      ],
+      outputs: ["mean"],
+    },
+  },
+  macros: {
+    // Mid block `{p}`: resnet, self-attention (absent with `mid_block_add_attention: false`), resnet.
+    mid: {params: ["x"], body: [
+      {use: "resnet", args: {p: "fmt('{p}.resnets.0')"}, in: ["x"], out: "x", name: "res0"},
+      {use: "spatial_self_attention", args: {p: "fmt('{p}.attentions.0')"}, in: ["x"], out: "x", name: "attn",
+       when: "has(fmt('{p}.attentions.0.to_q.weight'))"},
+      {use: "resnet", args: {p: "fmt('{p}.resnets.1')"}, in: ["x"], out: "out", name: "res1"},
+    ]},
+    // conv_out(silu(conv_norm_out(x))) of `{p}`.
+    tail: {params: ["x"], body: [
+      {use: "group_norm", args: {w: "fmt('{p}.conv_norm_out')"}, in: ["x"], out: "t", name: "norm_out"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "act"},
+      {use: "conv", args: {w: "fmt('{p}.conv_out')"}, in: ["t"], out: "out", name: "conv_out"},
+    ]},
+  },
+}

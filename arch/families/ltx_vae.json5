@@ -1,0 +1,188 @@
+// LTX-Video causal-3D VAE (`AutoencoderKLLTXVideo`, v0.9.0 layout: no timestep conditioning).
+// Diffusers names, or the original `{en,de}coder.{down,up}_blocks.IDX` ones (running index over
+// the stages' optional channel resnet / resampler and their resnets; `res_blocks`, `norm3.norm`,
+// unwrapped `conv_shortcut`). Values are channel-major `[c, frames, h, w]`. The decoder takes
+// pipeline latents `z [frames, c, h, w]` (`z * latents_std + latents_mean` in graph) and returns RGB
+// frames `rgb [frames', 3, H, W]` (plus the patchified `y`); the encoder takes one RGB image
+// `[3, H, W]` in [-1, 1] and returns its normalised posterior mode `z [c, h, w]`.
+{
+  family: "ltx_vae",
+  match: {diffusers_class: ["AutoencoderKLLTXVideo"]},
+  pipeline: "video",
+  use_lib: ["video"],
+  config: {
+    orig: "!has('decoder.mid_block.resnets.0.conv1.conv.weight')",
+    ch: "first(cfg.block_out_channels, [128, 256, 512, 512])",
+    layers: "first(cfg.layers_per_block, [4, 3, 3, 3, 4])",
+    up: "first(cfg.spatio_temporal_scaling, [true, true, true, false])",
+    patch: "first(cfg.patch_size, 4)",
+    latent: "first(cfg.latent_channels, 128)",
+    // Decoder stages run the widths reversed; stage i reads `dcin[i]` channels.
+    rc: "[at(ch, 3), at(ch, 2), at(ch, 1), at(ch, 0)]",
+    rl: "[at(layers, 4), at(layers, 3), at(layers, 2), at(layers, 1), at(layers, 0)]",
+    ru: "[at(up, 3), at(up, 2), at(up, 1), at(up, 0)]",
+    dcin: "[at(rc, 0), at(rc, 0), at(rc, 1), at(rc, 2)]",
+    // Original-name modules per decoder stage: [channel resnet?] [upsampler?] resnets.
+    dn: "[(at(dcin, 0) != at(rc, 0) ? 1 : 0) + (at(ru, 0) ? 1 : 0) + 1, (at(dcin, 1) != at(rc, 1) ? 1 : 0) + (at(ru, 1) ? 1 : 0) + 1, (at(dcin, 2) != at(rc, 2) ? 1 : 0) + (at(ru, 2) ? 1 : 0) + 1, (at(dcin, 3) != at(rc, 3) ? 1 : 0) + (at(ru, 3) ? 1 : 0) + 1]",
+    dstart: "[1, 1 + at(dn, 0), 1 + at(dn, 0) + at(dn, 1), 1 + at(dn, 0) + at(dn, 1) + at(dn, 2)]",
+    // Encoder stage i: resnets at ch[i], [downsampler?], [channel resnet to ch[i+1]?]; mid last.
+    ecout: "[at(ch, 1), at(ch, 2), at(ch, 3), at(ch, 3)]",
+    en: "[1 + (at(up, 0) ? 1 : 0) + (at(ch, 0) != at(ecout, 0) ? 1 : 0), 1 + (at(up, 1) ? 1 : 0) + (at(ch, 1) != at(ecout, 1) ? 1 : 0), 1 + (at(up, 2) ? 1 : 0) + (at(ch, 2) != at(ecout, 2) ? 1 : 0), 1 + (at(up, 3) ? 1 : 0) + (at(ch, 3) != at(ecout, 3) ? 1 : 0)]",
+    estart: "[0, at(en, 0), at(en, 0) + at(en, 1), at(en, 0) + at(en, 1) + at(en, 2), at(en, 0) + at(en, 1) + at(en, 2) + at(en, 3)]",
+    list: "orig ? 'res_blocks' : 'resnets'",
+    // Spatial downscale of the encoder/decoder stages (times `patch` in pixels).
+    sscale: "(at(up, 0) ? 2 : 1) * (at(up, 1) ? 2 : 1) * (at(up, 2) ? 2 : 1) * (at(up, 3) ? 2 : 1)",
+  },
+  checks: [
+    {expr: "!has('decoder.conv_in.conv.weight')", error: "not an LTX-Video VAE (no decoder.conv_in)"},
+    {expr: "has('decoder.time_embedder.timestep_embedder.linear_1.weight') || has('decoder.last_time_embedder.timestep_embedder.linear_1.weight')",
+     error: "only the v0.9.0 LTX-Video VAE (no timestep conditioning) is implemented"},
+    {expr: "len(ch) != 4 || len(layers) != 5", error: "LTX-Video VAE: expected 4 block widths and 5 layer counts"},
+  ],
+  names: {rules: [
+    ["per_channel_statistics.mean-of-means", "latents_mean"],
+    ["per_channel_statistics.std-of-means", "latents_std"],
+  ]},
+  macros: {
+    // `[c, t, h, w]` -> tokens `[t*h*w, c]` and back.
+    tok: {params: ["x"], body: [
+      {op: "Reshape", args: {shape: ["shape('x')[0]", "shape('x')[1] * shape('x')[2] * shape('x')[3]"]}, in: ["x"], out: "f", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["f"], out: "out", name: "t"},
+    ]},
+    untok: {params: ["t"], body: [
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "y", name: "t"},
+      {op: "Reshape", args: {shape: "like"}, in: ["y"], out: "out", name: "shape"},
+    ]},
+    // Gain-less RMSNorm over channels of `[c, t, h, w]`, then SiLU.
+    rms_silu: {params: ["x"], body: [
+      {let: {like: "shape('x')"}},
+      {use: "tok", in: ["x"], out: "t", name: "tok"},
+      {op: "RmsNorm", args: {eps: 1e-8}, in: ["t"], out: "t", name: "rms"},
+      {use: "untok", in: ["t"], out: "y", name: "untok"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["y"], out: "out", name: "silu"},
+    ]},
+    // Replicate-padded temporal conv (`causal`: k-1 first-frame copies on the left, else one copy
+    // of each end for k = 3) + Conv3d with spatial zero padding k/2; weight `{w}.weight` raw.
+    causal_conv3d: {params: ["x"], body: [
+      {let: {k: "shape(fmt('{w}.weight'))[2]", t: "shape('x')[1]"}},
+      {let: {pad: "k // 2"}},
+      {block: [
+        {op: "Slice", args: {axis: 1, start: 0, end: 1}, in: ["x"], out: "first", name: "first"},
+        {op: "Slice", args: {axis: 1, start: "t - 1", end: "t"}, in: ["x"], out: "last", name: "last", when: "!causal && t > 1"},
+        {op: "Concat", args: {axis: 1}, in: ["first", "first", "x"], out: "x", name: "pad", when: "causal"},
+        {op: "Concat", args: {axis: 1}, in: ["first", "x", "last"], out: "x", name: "pad", when: "!causal && t > 1"},
+        {op: "Concat", args: {axis: 1}, in: ["first", "x", "first"], out: "x", name: "pad", when: "!causal && t == 1"},
+      ], when: "k == 3"},
+      {op: "Conv3d", args: {stride: ["stride", "stride", "stride"], padding: [0, "pad", "pad", 0, "pad", "pad"], dilation: [1, 1, 1], groups: 1},
+       in: ["x", "w:{w}.weight", "w:{w}.bias"], out: "out", name: "conv3d"},
+    ]},
+    // `LTXVideoResnetBlock3d` at stem `b` (`ci` -> `co` channels).
+    res: {params: ["x"], body: [
+      {let: {like: "shape('x')"}},
+      {use: "tok", in: ["x"], out: "t", name: "tok"},
+      {op: "RmsNorm", args: {eps: 1e-8}, in: ["t"], out: "h", name: "rms1"},
+      {use: "untok", in: ["h"], out: "h", name: "untok1"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["h"], out: "h", name: "silu1"},
+      {use: "causal_conv3d", args: {w: "fmt('{b}.conv1.conv')", stride: 1}, in: ["h"], out: "h", name: "conv1"},
+      {use: "rms_silu", in: ["h"], out: "h", name: "n2"},
+      {use: "causal_conv3d", args: {w: "fmt('{b}.conv2.conv')", stride: 1}, in: ["h"], out: "h", name: "conv2"},
+      {block: [
+        {let: {n3: "orig ? fmt('{b}.norm3.norm') : fmt('{b}.norm3')"}},
+        {op: "LayerNorm", args: {eps: 1e-6}, in: ["t", "w:{n3}.weight", "w:{n3}.bias"], out: "s", name: "norm3"},
+        {use: "untok", in: ["s"], out: "s", name: "untok3"},
+        {use: "causal_conv3d", args: {w: "orig ? fmt('{b}.conv_shortcut') : fmt('{b}.conv_shortcut.conv')", stride: 1}, in: ["s"], out: "x", name: "shortcut"},
+      ], when: "ci != co"},
+      {op: "Binary", args: {kind: "Add"}, in: ["h", "x"], out: "out", name: "add"},
+    ]},
+    // `[c*8, f, h, w]` -> `[c, 2f-1, 2h, 2w]`: channel `(c*2 + a)*4 + b*2 + d` is frame offset a,
+    // row offset b, column offset d; the first output frame is dropped.
+    depth_to_space3d: {params: ["x"], body: [
+      {let: {c: "shape('x')[0] // 8", f: "shape('x')[1]", h: "shape('x')[2]", w: "shape('x')[3]"}},
+      {op: "Reshape", args: {shape: ["c", 2, 2, 2, "f", "h", "w"]}, in: ["x"], out: "r", name: "split"},
+      {op: "Transpose", args: {perm: [0, 4, 1, 2, 3, 5, 6]}, in: ["r"], out: "r", name: "t1"},
+      {op: "Transpose", args: {perm: [0, 1, 2, 5, 3, 6, 4]}, in: ["r"], out: "r", name: "t2"},
+      {op: "Reshape", args: {shape: ["c", "2 * f", "2 * h", "2 * w"]}, in: ["r"], out: "r", name: "merge"},
+      {op: "Slice", args: {axis: 1, start: 1, end: "2 * f"}, in: ["r"], out: "out", name: "drop"},
+    ]},
+  },
+  components: {
+    decoder: {
+      vars: ["frames", "h", "w"],
+      inputs: [{name: "z", dtype: "f32", shape: ["frames", "latent", "h", "w"]}],
+      body: [
+        {let: {causal: false}},
+        {op: "Reshape", args: {shape: [1, "latent", 1, 1]}, in: ["w:latents_std"], out: "sd", name: "std"},
+        {op: "Reshape", args: {shape: [1, "latent", 1, 1]}, in: ["w:latents_mean"], out: "mu", name: "mean"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["i:z", "sd"], out: "x", name: "denorm.mul"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "mu"], out: "x", name: "denorm.add"},
+        {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["x"], out: "x", name: "in"},
+        {use: "causal_conv3d", args: {w: "'decoder.conv_in.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_in"},
+        {repeat: "j", count: "at(rl, 0)", body: [
+          {use: "res", args: {b: "orig ? fmt('decoder.up_blocks.0.res_blocks.{j}') : fmt('decoder.mid_block.resnets.{j}')", ci: "at(rc, 0)", co: "at(rc, 0)"},
+           in: ["x"], out: "x", name: "mid.{j}"},
+        ]},
+        {repeat: "i", count: 4, body: [
+          {let: {cin: "at(dcin, i)", cout: "at(rc, i)", s0: "at(dstart, i)"}},
+          {let: {ci_n: "cin != cout ? 1 : 0", up_n: "at(ru, i) ? 1 : 0"}},
+          {use: "res", args: {b: "orig ? fmt('decoder.up_blocks.{s0}') : fmt('decoder.up_blocks.{i}.conv_in')", ci: "cin", co: "cout"},
+           in: ["x"], out: "x", name: "up{i}.conv_in", when: "cin != cout"},
+          {block: [
+            {use: "causal_conv3d", args: {w: "orig ? fmt('decoder.up_blocks.{s0 + ci_n}.conv.conv') : fmt('decoder.up_blocks.{i}.upsamplers.0.conv.conv')", stride: 1},
+             in: ["x"], out: "x", name: "up{i}.up"},
+            {use: "depth_to_space3d", in: ["x"], out: "x", name: "up{i}.d2s"},
+          ], when: "at(ru, i)"},
+          {repeat: "j", count: "at(rl, i + 1)", body: [
+            {use: "res", args: {b: "orig ? fmt('decoder.up_blocks.{s0 + ci_n + up_n}.res_blocks.{j}') : fmt('decoder.up_blocks.{i}.resnets.{j}')", ci: "cout", co: "cout"},
+             in: ["x"], out: "x", name: "up{i}.res{j}"},
+          ]},
+        ]},
+        {use: "rms_silu", in: ["x"], out: "x", name: "norm_out"},
+        {use: "causal_conv3d", args: {w: "'decoder.conv_out.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_out"},
+        {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["x"], out: "y", name: "out"},
+        // Unpatchify: channel `(c * p + px) * p + py` is pixel (row * p + py, col * p + px).
+        {let: {fo: "shape('y')[0]", hp: "shape('y')[2]", wp: "shape('y')[3]"}},
+        {op: "Reshape", args: {shape: ["fo", 3, "patch", "patch", "hp", "wp"]}, in: ["y"], out: "r", name: "unpatch.split"},
+        {op: "Transpose", args: {perm: [0, 1, 4, 3, 5, 2]}, in: ["r"], out: "r", name: "unpatch.t"},
+        {op: "Reshape", args: {shape: ["fo", 3, "hp * patch", "wp * patch"]}, in: ["r"], out: "rgb", name: "unpatch"},
+      ],
+      outputs: ["rgb", "y"],
+    },
+    // Causal encoder: one RGB image `[3, H, W]` (H = h * sscale * patch) -> normalised means.
+    encoder: {
+      vars: ["h", "w"],
+      inputs: [{name: "image", dtype: "f32", shape: [3, "h * sscale * patch", "w * sscale * patch"]}],
+      body: [
+        {let: {causal: true, hp: "h * sscale", wp: "w * sscale"}},
+        // Patchify (the decoder's unpatchify inverted), one frame: `[3 * p^2, 1, hp, wp]`.
+        {op: "Reshape", args: {shape: [3, "hp", "patch", "wp", "patch"]}, in: ["i:image"], out: "x", name: "patch.split"},
+        {op: "Transpose", args: {perm: [0, 4, 2, 1, 3]}, in: ["x"], out: "x", name: "patch.t"},
+        {op: "Reshape", args: {shape: ["3 * patch * patch", 1, "hp", "wp"]}, in: ["x"], out: "x", name: "patch"},
+        {use: "causal_conv3d", args: {w: "'encoder.conv_in.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_in"},
+        {repeat: "i", count: 4, body: [
+          {let: {cin: "at(ch, i)", cout: "at(ecout, i)", s0: "at(estart, i)", up_n: "at(up, i) ? 1 : 0"}},
+          {repeat: "j", count: "at(layers, i)", body: [
+            {use: "res", args: {b: "orig ? fmt('encoder.down_blocks.{s0}.res_blocks.{j}') : fmt('encoder.down_blocks.{i}.resnets.{j}')", ci: "cin", co: "cin"},
+             in: ["x"], out: "x", name: "down{i}.res{j}"},
+          ]},
+          {use: "causal_conv3d", args: {w: "orig ? fmt('encoder.down_blocks.{s0 + 1}.conv') : fmt('encoder.down_blocks.{i}.downsamplers.0.conv')", stride: 2},
+           in: ["x"], out: "x", name: "down{i}.down", when: "at(up, i)"},
+          {use: "res", args: {b: "orig ? fmt('encoder.down_blocks.{s0 + 1 + up_n}') : fmt('encoder.down_blocks.{i}.conv_out')", ci: "cin", co: "cout"},
+           in: ["x"], out: "x", name: "down{i}.conv_out", when: "cin != cout"},
+        ]},
+        {repeat: "j", count: "at(layers, 4)", body: [
+          {use: "res", args: {b: "orig ? fmt('encoder.down_blocks.{at(estart, 4)}.res_blocks.{j}') : fmt('encoder.mid_block.resnets.{j}')", ci: "at(ch, 3)", co: "at(ch, 3)"},
+           in: ["x"], out: "x", name: "mid.{j}"},
+        ]},
+        {use: "rms_silu", in: ["x"], out: "x", name: "norm_out"},
+        {use: "causal_conv3d", args: {w: "'encoder.conv_out.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_out"},
+        {op: "Slice", args: {axis: 0, start: 0, end: "latent"}, in: ["x"], out: "x", name: "means"},
+        {op: "Reshape", args: {shape: ["latent", 1, 1, 1]}, in: ["w:latents_std"], out: "sd", name: "std"},
+        {op: "Reshape", args: {shape: ["latent", 1, 1, 1]}, in: ["w:latents_mean"], out: "mu", name: "mean"},
+        {op: "Binary", args: {kind: "Sub"}, in: ["x", "mu"], out: "x", name: "norm.sub"},
+        {op: "Binary", args: {kind: "Div"}, in: ["x", "sd"], out: "x", name: "norm.div"},
+        {op: "Reshape", args: {shape: ["latent", "h", "w"]}, in: ["x"], out: "z", name: "out"},
+      ],
+      outputs: ["z"],
+    },
+  },
+}

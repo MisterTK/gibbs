@@ -1,0 +1,222 @@
+// vae building blocks (see arch/lib/transformer.json5 for the macro conventions). Activations
+// are `[c, h, w]`. Leaf stems are `w` (canonical names without `.weight` / `.bias`, biases
+// optional), block stems `p`. Variables read from the family: eps (norms), groups (GroupNorm),
+// head_dim (`evit`).
+{
+  macros: {
+    // Square "same" conv `{w}`: stride 1, zero pad k/2, `groups` (default 1).
+    conv: {params: ["x"], body: [
+      {let: {pad: "shape(fmt('{w}.weight'))[2] // 2"}},
+      {op: "Conv2d", args: {stride: [1, 1], padding: ["pad", "pad", "pad", "pad"], dilation: [1, 1], groups: "first(groups_, 1)"},
+       in: ["x", "w:{w}.weight", "w?:{w}.bias"], out: "out"},
+    ]},
+    // Depthwise "same" conv `{w}` (weight [c, 1, k, k]).
+    dwconv: {params: ["x"], body: [
+      {use: "conv", args: {w: "w", groups_: "shape('x')[0]"}, in: ["x"], out: "out", name: "dw"},
+    ]},
+    // 1x1 map of x [c, h, w] by a 2-D weight `{w}` ([c_out, c]) over channel-last tokens.
+    pointwise: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {op: "Reshape", args: {shape: ["s[0]", "s[1] * s[2]"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "tok"},
+      {op: "Linear", in: ["t", "w:{w}.weight", "w?:{w}.bias"], out: "t", name: "lin"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "chan"},
+      {op: "Reshape", args: {shape: ["shape('t')[0]", "s[1]", "s[2]"]}, in: ["t"], out: "out", name: "unflat"},
+    ]},
+    // GroupNorm `{w}` (`groups`, `eps`).
+    group_norm: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {op: "Reshape", args: {shape: ["s[0]", "s[1] * s[2]"]}, in: ["x"], out: "f", name: "flat"},
+      {op: "GroupNorm", args: {groups: "groups", eps: "eps"}, in: ["f", "w:{w}.weight", "w:{w}.bias"], out: "f", name: "gn"},
+      {op: "Reshape", args: {shape: "s"}, in: ["f"], out: "out", name: "unflat"},
+    ]},
+    // RMSNorm over channels per pixel with gain `{w}.weight` and bias `{w}.bias` (DC-AE).
+    channel_rms_norm: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {op: "Reshape", args: {shape: ["s[0]", "s[1] * s[2]"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "tok"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["t", "w:{w}.weight"], out: "t", name: "rms"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "w:{w}.bias"], out: "t", name: "bias"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "chan"},
+      {op: "Reshape", args: {shape: "s"}, in: ["t"], out: "out", name: "unflat"},
+    ]},
+
+    // Residual block `{p}`. kind 'gn' (default; diffusers ResnetBlock2D without time embedding):
+    // conv2(silu(gn2(conv1(silu(gn1(x)))))) + shortcut(x), 1x1 `conv_shortcut` when present.
+    // kind 'rms' (DC-AE ResBlock): rms(norm, conv2(silu(conv1(x)))) + x.
+    resnet: {params: ["x"], body: [
+      {block: [
+        {use: "group_norm", args: {w: "fmt('{p}.norm1')"}, in: ["x"], out: "t", name: "norm1"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "act1"},
+        {use: "conv", args: {w: "fmt('{p}.conv1')"}, in: ["t"], out: "t", name: "conv1"},
+        {use: "group_norm", args: {w: "fmt('{p}.norm2')"}, in: ["t"], out: "t", name: "norm2"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "act2"},
+        {use: "conv", args: {w: "fmt('{p}.conv2')"}, in: ["t"], out: "t", name: "conv2"},
+        {use: "conv", args: {w: "fmt('{p}.conv_shortcut')"}, in: ["x"], out: "x", name: "shortcut",
+         when: "has(fmt('{p}.conv_shortcut.weight'))"},
+      ], when: "first(kind, 'gn') == 'gn'"},
+      {block: [
+        {use: "conv", args: {w: "fmt('{p}.conv1')"}, in: ["x"], out: "t", name: "conv1"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "act"},
+        {use: "conv", args: {w: "fmt('{p}.conv2')"}, in: ["t"], out: "t", name: "conv2"},
+        {use: "channel_rms_norm", args: {w: "fmt('{p}.norm')"}, in: ["t"], out: "t", name: "norm"},
+      ], when: "kind == 'rms'"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "x"], out: "out", name: "res"},
+    ]},
+
+    // Single-head self-attention over the pixels of x (diffusers VAE mid-block `Attention`,
+    // stem `p`: group_norm, to_q, to_k, to_v, to_out.0 as [c, c] linears) plus the residual.
+    spatial_self_attention: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {use: "group_norm", args: {w: "fmt('{p}.group_norm')"}, in: ["x"], out: "t", name: "norm"},
+      {op: "Reshape", args: {shape: ["s[0]", "s[1] * s[2]"]}, in: ["t"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "tok"},
+      {op: "Linear", in: ["t", "w:{p}.to_q.weight", "w?:{p}.to_q.bias"], out: "q", name: "q"},
+      {op: "Linear", in: ["t", "w:{p}.to_k.weight", "w?:{p}.to_k.bias"], out: "k", name: "k"},
+      {op: "Linear", in: ["t", "w:{p}.to_v.weight", "w?:{p}.to_v.bias"], out: "v", name: "v"},
+      {op: "Attention", args: {heads: 1, kv_heads: 1, causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{p}.to_out.0.weight", "w?:{p}.to_out.0.bias"], out: "a", name: "o"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["a"], out: "a", name: "chan"},
+      {op: "Reshape", args: {shape: "s"}, in: ["a"], out: "a", name: "unflat"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "out", name: "res"},
+    ]},
+
+    // [c*r*r, h, w] -> [c, r*h, r*w] (torch pixel_shuffle; r default 2).
+    pixel_shuffle: {params: ["x"], body: [
+      {let: {s: "shape('x')", f: "first(r, 2)"}},
+      {op: "Reshape", args: {shape: ["s[0] // (f * f)", "f", "f", "s[1]", "s[2]"]}, in: ["x"], out: "t", name: "split"},
+      {op: "Transpose", args: {perm: [0, 3, 1, 4, 2]}, in: ["t"], out: "t", name: "interleave"},
+      {op: "Reshape", args: {shape: ["s[0] // (f * f)", "s[1] * f", "s[2] * f"]}, in: ["t"], out: "out", name: "merge"},
+    ]},
+    // Every channel of x [c, h, w] repeated `r` times consecutively (torch repeat_interleave, dim 0).
+    repeat_channels: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {op: "Reshape", args: {shape: ["s[0]", 1, "s[1] * s[2]"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "Tile", args: {reps: [1, "r", 1]}, in: ["t"], out: "t", name: "tile", when: "r > 1"},
+      {op: "Reshape", args: {shape: ["s[0] * r", "s[1]", "s[2]"]}, in: ["t"], out: "out", name: "unflat"},
+    ]},
+    // DC-AE interpolate up block `{p}`: conv(nearest2x(x)) + pixel_shuffle(repeat_channels(x)).
+    dup_up: {params: ["x"], body: [
+      {let: {c: "shape('x')[0]", c_out: "shape(fmt('{p}.conv.weight'))[0]"}},
+      {op: "Upsample", args: {scale: 2, mode: "Nearest"}, in: ["x"], out: "u", name: "up"},
+      {use: "conv", args: {w: "fmt('{p}.conv')"}, in: ["u"], out: "u", name: "conv"},
+      {use: "repeat_channels", args: {r: "c_out * 4 // c"}, in: ["x"], out: "sc", name: "rep"},
+      {use: "pixel_shuffle", args: {r: 2}, in: ["sc"], out: "sc", name: "shuffle"},
+      {op: "Binary", args: {kind: "Add"}, in: ["u", "sc"], out: "out", name: "res"},
+    ]},
+
+    // EfficientViT block `{p}` (DC-AE): multi-scale ReLU linear attention (`{p}.attn`: to_q/k/v
+    // [inner, c], every `to_qkv_multiscale.{k}` depthwise proj_in + grouped proj_out, to_out,
+    // norm_out) + residual, then GLU MBConv (`{p}.conv_out`) + residual. Heads are `head_dim`
+    // wide; needs the constant `linear_attn.eps` ([1], the denominator epsilon).
+    evit: {params: ["x"], body: [
+      {let: {s: "shape('x')", a: "fmt('{p}.attn')", g: "fmt('{p}.conv_out')"}},
+      {op: "Reshape", args: {shape: ["s[0]", "s[1] * s[2]"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "tok"},
+      {op: "Linear", in: ["t", "w:{a}.to_q.weight"], out: "q", name: "q"},
+      {op: "Linear", in: ["t", "w:{a}.to_k.weight"], out: "k", name: "k"},
+      {op: "Linear", in: ["t", "w:{a}.to_v.weight"], out: "v", name: "v"},
+      {op: "Concat", args: {axis: 1}, in: ["q", "k", "v"], out: "qkv", name: "qkv"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["qkv"], out: "qkv", name: "qkv_chan"},
+      {op: "Reshape", args: {shape: ["shape('qkv')[0]", "s[1]", "s[2]"]}, in: ["qkv"], out: "qkv", name: "qkv_unflat"},
+      {let: {c3: "shape('qkv')[0]", nms: "count('{a}.to_qkv_multiscale.{k}.proj_in.weight')"}},
+      // all = [qkv; ms_0(qkv); ms_1(qkv); ...] along channels.
+      {repeat: "m", count: "nms", body: [
+        {let: {ms: "fmt('{a}.to_qkv_multiscale.{m}')"}},
+        {use: "dwconv", args: {w: "fmt('{ms}.proj_in')"}, in: ["qkv"], out: "t", name: "ms{m}.in"},
+        {op: "Conv2d", args: {stride: [1, 1], padding: [0, 0, 0, 0], dilation: [1, 1], groups: "c3 // head_dim"},
+         in: ["t", "w:{ms}.proj_out.weight"], out: "t", name: "ms{m}.out"},
+        {op: "Concat", args: {axis: 0}, in: ["qkv", "t"], out: "all", name: "ms{m}.cat", when: "m == 0"},
+        {op: "Concat", args: {axis: 0}, in: ["all", "t"], out: "all", name: "ms{m}.cat", when: "m > 0"},
+      ]},
+      {let: {heads: "(nms + 1) * c3 // (3 * head_dim)", hw: "s[1] * s[2]"}},
+      {op: "Reshape", args: {shape: ["heads", 3, "head_dim", "hw"]}, in: ["all"], out: "all", name: "heads", when: "nms > 0"},
+      {op: "Reshape", args: {shape: ["heads", 3, "head_dim", "hw"]}, in: ["qkv"], out: "all", name: "heads", when: "nms == 0"},
+      {op: "Slice", args: {axis: 1, start: 0, end: 1}, in: ["all"], out: "q", name: "hq"},
+      {op: "Slice", args: {axis: 1, start: 1, end: 2}, in: ["all"], out: "k", name: "hk"},
+      {op: "Slice", args: {axis: 1, start: 2, end: 3}, in: ["all"], out: "v", name: "hv"},
+      {op: "Reshape", args: {shape: ["heads", "head_dim", "hw"]}, in: ["q"], out: "q", name: "q3"},
+      {op: "Reshape", args: {shape: ["heads", "head_dim", "hw"]}, in: ["k"], out: "k", name: "k3"},
+      {op: "Reshape", args: {shape: ["heads", "head_dim", "hw"]}, in: ["v"], out: "v", name: "v3"},
+      {op: "Unary", args: {kind: "Relu"}, in: ["q"], out: "q", name: "relu_q"},
+      {op: "Unary", args: {kind: "Relu"}, in: ["k"], out: "k", name: "relu_k"},
+      // kv[c][d] = sum_j v[c][j] k[d][j]; ksum[d] = sum_j k[d][j]; out = (kv q) / (ksum . q + eps).
+      {op: "MatMul", args: {transpose_a: false, transpose_b: true}, in: ["v", "k"], out: "kv", name: "kv"},
+      {op: "Reduce", args: {kind: "Sum", axes: [2], keep_dims: true}, in: ["k"], out: "ksum", name: "ksum"},
+      {op: "MatMul", args: {transpose_a: false, transpose_b: false}, in: ["kv", "q"], out: "num", name: "num"},
+      {op: "MatMul", args: {transpose_a: true, transpose_b: false}, in: ["ksum", "q"], out: "den", name: "den"},
+      {op: "Binary", args: {kind: "Add"}, in: ["den", "c:linear_attn.eps"], out: "den", name: "den_eps"},
+      {op: "Binary", args: {kind: "Div"}, in: ["num", "den"], out: "o", name: "att"},
+      {op: "Reshape", args: {shape: ["heads * head_dim", "s[1]", "s[2]"]}, in: ["o"], out: "o", name: "att_unflat"},
+      {use: "pointwise", args: {w: "fmt('{a}.to_out')"}, in: ["o"], out: "o", name: "to_out"},
+      {use: "channel_rms_norm", args: {w: "fmt('{a}.norm_out')"}, in: ["o"], out: "o", name: "norm_out"},
+      {op: "Binary", args: {kind: "Add"}, in: ["o", "x"], out: "y", name: "attn_res"},
+      // GLU MBConv: point(a * silu(gate)), [a; gate] = dw(silu(inverted(y))).
+      {use: "conv", args: {w: "fmt('{g}.conv_inverted')"}, in: ["y"], out: "t", name: "inverted"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "inverted_act"},
+      {use: "dwconv", args: {w: "fmt('{g}.conv_depth')"}, in: ["t"], out: "t", name: "depth"},
+      {let: {c2: "shape('t')[0]"}},
+      {op: "Slice", args: {axis: 0, start: 0, end: "c2 // 2"}, in: ["t"], out: "u", name: "glu_a"},
+      {op: "Slice", args: {axis: 0, start: "c2 // 2", end: "c2"}, in: ["t"], out: "gt", name: "glu_gate"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["gt"], out: "gt", name: "glu_act"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["u", "gt"], out: "u", name: "glu"},
+      {use: "pointwise", args: {w: "fmt('{g}.conv_point')"}, in: ["u"], out: "u", name: "point"},
+      {use: "channel_rms_norm", args: {w: "fmt('{g}.norm')"}, in: ["u"], out: "u", name: "norm"},
+      {op: "Binary", args: {kind: "Add"}, in: ["u", "y"], out: "out", name: "glu_res"},
+    ]},
+
+    // x * mul + add, operands broadcast (e.g. per-channel [c, 1, 1] latent statistics).
+    latent_affine: {params: ["x", "mul", "add"], body: [
+      {op: "Binary", args: {kind: "Mul"}, in: ["x", "mul"], out: "t", name: "mul"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "add"], out: "out", name: "add"},
+    ]},
+
+    // Causal 3-D conv `{w}` on x [c, t, h, w]: k_t - 1 frames of front zero padding in time,
+    // "same" zero padding in space, stride 1.
+    causal_conv3d: {params: ["x"], body: [
+      {let: {ks: "shape(fmt('{w}.weight'))"}},
+      {op: "Conv3d", args: {stride: [1, 1, 1], padding: ["ks[2] - 1", "ks[3] // 2", "ks[4] // 2", 0, "ks[3] // 2", "ks[4] // 2"],
+         dilation: [1, 1, 1], groups: 1}, in: ["x", "w:{w}.weight", "w?:{w}.bias"], out: "out"},
+    ]},
+    // ---- Wan / Qwen-Image VAE (channel L2-RMS with `.gamma` gains, eps 1e-12) ----
+    // Channel RMS norm of `x` [c, h, w] with gain `{g}`: x / ||x||_c * sqrt(c) * g per pixel
+    // (RmsNorm over channels moved last).
+    wan_rms: {params: ["x"], body: [
+      {let: {c: "shape('x')[0]", hh: "shape('x')[1]", ww: "shape('x')[2]"}},
+      {op: "Reshape", args: {shape: ["c", "hh * ww"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "t"},
+      {op: "RmsNorm", args: {eps: 1e-12}, in: ["t", "w:{g}"], out: "t", name: "rms"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "tb"},
+      {op: "Reshape", args: {shape: ["c", "hh", "ww"]}, in: ["t"], out: "out", name: "unflat"},
+    ]},
+    // Residual block `{p}`: conv2(silu(rms(conv1(silu(rms(x)))))) + (conv_shortcut(x) | x).
+    wan_res: {params: ["x"], body: [
+      {use: "conv", args: {w: "fmt('{p}.conv_shortcut')"}, in: ["x"], out: "skip", name: "shortcut", when: "has(fmt('{p}.conv_shortcut.weight'))"},
+      {use: "wan_rms", args: {g: "fmt('{p}.norm1.gamma')"}, in: ["x"], out: "y", name: "norm1"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["y"], out: "y", name: "silu1"},
+      {use: "conv", args: {w: "fmt('{p}.conv1')"}, in: ["y"], out: "y", name: "conv1"},
+      {use: "wan_rms", args: {g: "fmt('{p}.norm2.gamma')"}, in: ["y"], out: "y", name: "norm2"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["y"], out: "y", name: "silu2"},
+      {use: "conv", args: {w: "fmt('{p}.conv2')"}, in: ["y"], out: "y", name: "conv2"},
+      {op: "Binary", args: {kind: "Add"}, in: ["y", "v?:skip"], out: "out", name: "add", when: "has(fmt('{p}.conv_shortcut.weight'))"},
+      {op: "Binary", args: {kind: "Add"}, in: ["y", "x"], out: "out", name: "add", when: "!has(fmt('{p}.conv_shortcut.weight'))"},
+    ]},
+    // Single-head self-attention `{p}` over all pixels of `x` [c, h, w] (1x1 `to_qkv` / `proj`
+    // kernels as linears), residual.
+    wan_attn: {params: ["x"], body: [
+      {let: {c: "shape('x')[0]", hh: "shape('x')[1]", ww: "shape('x')[2]"}},
+      {use: "wan_rms", args: {g: "fmt('{p}.norm.gamma')"}, in: ["x"], out: "y", name: "norm"},
+      {op: "Reshape", args: {shape: ["c", "hh * ww"]}, in: ["y"], out: "y", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["y"], out: "y", name: "tok"},
+      {op: "Linear", in: ["y", "w:{p}.to_qkv.weight", "w?:{p}.to_qkv.bias"], out: "qkv", name: "qkv"},
+      {op: "Slice", args: {axis: 1, start: 0, end: "c"}, in: ["qkv"], out: "q", name: "q"},
+      {op: "Slice", args: {axis: 1, start: "c", end: "2 * c"}, in: ["qkv"], out: "k", name: "k"},
+      {op: "Slice", args: {axis: 1, start: "2 * c", end: "3 * c"}, in: ["qkv"], out: "v", name: "v"},
+      {op: "Attention", args: {heads: 1, kv_heads: 1, causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{p}.proj.weight", "w?:{p}.proj.bias"], out: "o", name: "proj"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["o"], out: "o", name: "tb"},
+      {op: "Reshape", args: {shape: ["c", "hh", "ww"]}, in: ["o"], out: "o", name: "unflat"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "o"], out: "out", name: "add"},
+    ]},
+  },
+}

@@ -1,0 +1,55 @@
+// Nano: the toy position-independent decoder (no attention mixing). Weights are `[in, out]`
+// row-major under their own names: per layer x += out(q(rms(x))) (k and v of `qkv_weights` unused),
+// then x += down(silu(gate) * up) on the un-normed residual; final RMSNorm, `lm_head` [h, v].
+// No match: forced only (`--arch nano`).
+{
+  family: "nano",
+  match: {},
+  pipeline: "causal_lm",
+  config: {
+    hidden: "shape('embedding_table')[1]",
+    vocab: "shape('embedding_table')[0]",
+    layers: "count('norm_weights.{k}')",
+    inter: "shape('mlp_down.0')[0]",
+    eps: "1e-5",
+    ctx: "first(runtime.ctx, 64)",
+  },
+  transforms: [
+    {tensor: "qkv_weights.{i}", op: "transpose"},
+    {tensor: "qkv_weights.{i}", op: "split_rows", args: {parts: [
+      ["nano.{i}.q", "hidden"], ["nano.{i}.k", "hidden"], ["nano.{i}.v", "hidden"]]}},
+    {tensor: "out_weights.{i}", op: "transpose"},
+    {tensor: "mlp_gate_up.{i}", op: "transpose"},
+    {tensor: "mlp_gate_up.{i}", op: "split_rows", args: {parts: [["nano.{i}.gate", "inter"], ["nano.{i}.up", "inter"]]}},
+    {tensor: "mlp_down.{i}", op: "transpose"},
+    {tensor: "lm_head", op: "transpose"},
+  ],
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:embedding_table", "i:token_ids"], out: "x", name: "embed"},
+        {repeat: "i", count: "layers", body: [
+          {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:norm_weights.{i}"], out: "h", name: "l{i}.ln"},
+          {op: "Linear", in: ["h", "w:nano.{i}.q"], out: "q", name: "l{i}.q"},
+          {op: "Linear", in: ["q", "w:out_weights.{i}"], out: "a", name: "l{i}.o"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "l{i}.res1"},
+          {op: "Linear", in: ["x", "w:nano.{i}.gate"], out: "g", name: "l{i}.gate"},
+          {op: "Linear", in: ["x", "w:nano.{i}.up"], out: "u", name: "l{i}.up"},
+          {op: "SwiGlu", in: ["g", "u"], out: "m", name: "l{i}.act"},
+          {op: "Linear", in: ["m", "w:mlp_down.{i}"], out: "m", name: "l{i}.down"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "m"], out: "x", name: "l{i}.res2"},
+        ]},
+        {op: "Slice", args: {axis: 0, start: "shape('x')[0] - 1", end: "shape('x')[0]"}, in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:final_norm"], out: "hidden", name: "final_norm"},
+        {op: "Linear", in: ["hidden", "w:lm_head"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {prefill_rows: 64},
+}

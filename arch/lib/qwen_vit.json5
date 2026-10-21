@@ -1,0 +1,47 @@
+// The Qwen3.5 / Qwen3-VL vision transformer (`model.visual.*`): pre-norm blocks with biased
+// LayerNorms, fused qkv, 2D rotary (grid row, grid column) and attention over the whole image,
+// GELU-tanh MLP; 2x2 patch mergers to the text width. Variables: v_hidden, v_heads, v_hd, v_merge;
+// constant `vision.rope.inv_freq` ([v_hd / 2]: the row then the column frequencies); input
+// `rope_positions` ([3 * patches]: row, col, 0).
+{
+  macros: {
+    // Block stem `p` on `x` [patches, v_hidden].
+    qwen_vit_block: {params: ["x"], body: [
+      {op: "LayerNorm", args: {eps: 1e-6}, in: ["x", "w:{p}.norm1.weight", "w?:{p}.norm1.bias"], out: "h", name: "norm1"},
+      {op: "Linear", in: ["h", "w:{p}.attn.qkv.weight", "w?:{p}.attn.qkv.bias"], out: "qkv", name: "qkv"},
+      {op: "Slice", args: {axis: -1, start: 0, end: "v_hidden"}, in: ["qkv"], out: "q", name: "q"},
+      {op: "Slice", args: {axis: -1, start: "v_hidden", end: "2 * v_hidden"}, in: ["qkv"], out: "k", name: "k"},
+      {op: "Slice", args: {axis: -1, start: "2 * v_hidden", end: "3 * v_hidden"}, in: ["qkv"], out: "v", name: "v"},
+      {let: {rv: {MRope: {sections: ["v_hd // 4", "v_hd // 4", 0], interleaved: false, pairs: "'Half'"}}}},
+      {op: "Rope", args: {head_dim: "v_hd", rotary_dim: "v_hd", variant: "rv", mscale: 1},
+       in: ["q", "i:rope_positions", "c:vision.rope.inv_freq"], out: "q", name: "q_rope"},
+      {op: "Rope", args: {head_dim: "v_hd", rotary_dim: "v_hd", variant: "rv", mscale: 1},
+       in: ["k", "i:rope_positions", "c:vision.rope.inv_freq"], out: "k", name: "k_rope"},
+      {op: "Attention", args: {heads: "v_heads", kv_heads: "v_heads", causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{p}.attn.proj.weight", "w?:{p}.attn.proj.bias"], out: "o", name: "proj"},
+      {op: "Binary", args: {kind: "'Add'"}, in: ["x", "o"], out: "x", name: "add_attn"},
+      {op: "LayerNorm", args: {eps: 1e-6}, in: ["x", "w:{p}.norm2.weight", "w?:{p}.norm2.bias"], out: "h", name: "norm2"},
+      {op: "Linear", in: ["h", "w:{p}.mlp.linear_fc1.weight", "w?:{p}.mlp.linear_fc1.bias"], out: "h", name: "fc1"},
+      {op: "Unary", args: {kind: "'GeluTanh'"}, in: ["h"], out: "h", name: "gelu"},
+      {op: "Linear", in: ["h", "w:{p}.mlp.linear_fc2.weight", "w?:{p}.mlp.linear_fc2.bias"], out: "h", name: "fc2"},
+      {op: "Binary", args: {kind: "'Add'"}, in: ["x", "h"], out: "out", name: "add_mlp"},
+    ]},
+    // Patch merger stem `m` on `x` [patches, d] in 2x2 merge-block order -> [patches / 4, out]:
+    // LayerNorm (after the regroup to [patches / 4, 4d] when `post`, the deepstack mergers' order),
+    // fc1, GELU, fc2.
+    qwen_vit_merger: {params: ["x"], body: [
+      {let: {rows: "shape('x')[0] // (v_merge * v_merge)", wide: "shape('x')[1] * v_merge * v_merge"}},
+      {block: [
+        {op: "Reshape", args: {shape: ["rows", "wide"]}, in: ["x"], out: "y", name: "regroup"},
+        {op: "LayerNorm", args: {eps: 1e-6}, in: ["y", "w:{m}.norm.weight", "w?:{m}.norm.bias"], out: "y", name: "norm"},
+      ], when: "post"},
+      {block: [
+        {op: "LayerNorm", args: {eps: 1e-6}, in: ["x", "w:{m}.norm.weight", "w?:{m}.norm.bias"], out: "y", name: "norm"},
+        {op: "Reshape", args: {shape: ["rows", "wide"]}, in: ["y"], out: "y", name: "regroup"},
+      ], when: "!post"},
+      {op: "Linear", in: ["y", "w:{m}.linear_fc1.weight", "w?:{m}.linear_fc1.bias"], out: "h", name: "fc1"},
+      {op: "Unary", args: {kind: "'GeluErf'"}, in: ["h"], out: "h", name: "gelu"},
+      {op: "Linear", in: ["h", "w:{m}.linear_fc2.weight", "w?:{m}.linear_fc2.bias"], out: "out", name: "fc2"},
+    ]},
+  },
+}

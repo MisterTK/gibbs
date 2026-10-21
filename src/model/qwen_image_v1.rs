@@ -12,16 +12,16 @@ mod graph_program;
 use crate::model::dit::{
     add_gated, norm_modulate, read_config, read_scheduler, rms_norm, silu_of, timestep_features,
 };
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::flux::Store;
 use crate::model::image::ImageBuffer;
 use crate::model::nn;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
-use crate::model::qwen_image::{QLin, Sched};
+use crate::model::qwen_image::QLin;
 use crate::model::qwen_vae::QwenVae;
-use crate::model::sd::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::sched::Rng;
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;
@@ -39,7 +39,6 @@ const VAE_PX: usize = 8;
 /// VAE latent channels.
 const Z: usize = 16;
 /// Qwen2 pre-tokenizer split (GPT-4 style).
-const SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// A Linear layer with bias, weights left in their stored encoding.
 struct BLin {
@@ -475,7 +474,7 @@ fn cfg_rescale(pos: &[f32], neg: &[f32], g: f32, ch: usize) -> Vec<f32> {
 struct Core {
     dit: Dit,
     vae: QwenVae,
-    sched: Sched,
+    sched: sched::Schedule,
 }
 
 /// A prompt's text-encoder features `[n, text_width]` and `n`.
@@ -483,7 +482,7 @@ type Features = (Vec<f32>, usize);
 
 impl Core {
     /// Checks the transformer, VAE and (text width) `text_width` against each other.
-    fn new(dit: Dit, vae: QwenVae, sched: Sched, text_width: usize) -> Result<Self, String> {
+    fn new(dit: Dit, vae: QwenVae, sched: sched::Schedule, text_width: usize) -> Result<Self, String> {
         if dit.in_ch != 4 * Z || dit.proj_out.w.n != dit.in_ch {
             return Err(format!(
                 "Qwen-Image 1: the transformer takes {} and emits {} packed features, the VAE's {Z} channels need {}",
@@ -566,7 +565,7 @@ impl Core {
             .transpose()?;
         println!("  text encoder: {:.2}s", start.elapsed().as_secs_f64());
 
-        let sigmas = self.sched.sigmas(&flow::linspace_sigmas(steps), n_img);
+        let sigmas = self.sched.sigmas(&sched::linspace_sigmas(steps), n_img, steps);
         let mut rng = Rng::new(req.seed);
         let noise: Vec<f32> = (0..Z * h * w).map(|_| rng.gaussian()).collect();
         let mut x = pack(&noise, Z, h, w);
@@ -577,7 +576,7 @@ impl Core {
                 let vn = velocity(neg, &x, s[0])?;
                 v = cfg_rescale(&v, &vn, guidance, ch);
             }
-            flow::euler_step(&mut x, &v, s[0], s[1]);
+            sched::euler_step(&mut x, &v, s[0], s[1]);
             println!(
                 "  step {}/{} (sigma {:.4}): {:.2}s",
                 i + 1,
@@ -590,70 +589,14 @@ impl Core {
     }
 }
 
-/// Qwen2Tokenizer from `<dir>/tokenizer.json`, or built from `vocab.json`, `merges.txt` and
-/// `added_tokens.json` (Qwen-Image's `tokenizer/` ships no tokenizer.json): NFC, GPT-4-style split,
-/// byte-level BPE, added tokens split out of the text at their stored ids.
+/// Qwen2Tokenizer from `<dir>/tokenizer.json`, or built from its vocab/merges files
+/// (Qwen-Image's `tokenizer/` ships no tokenizer.json).
 fn load_tokenizer(dir: &Path) -> Result<tokenizers::Tokenizer, String> {
-    use tokenizers::models::bpe::BPE;
-    use tokenizers::normalizers::NFC;
-    use tokenizers::pre_tokenizers::{
-        byte_level::ByteLevel,
-        sequence::Sequence,
-        split::{Split, SplitPattern},
-        PreTokenizerWrapper,
-    };
-    use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
-    let err = |e: tokenizers::Error| format!("{}: {e}", dir.display());
     let json = dir.join("tokenizer.json");
     if json.is_file() {
-        return Tokenizer::from_file(&json).map_err(|e| format!("{}: {e}", json.display()));
+        return tokenizers::Tokenizer::from_file(&json).map_err(|e| format!("{}: {e}", json.display()));
     }
-    let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
-    let bpe = BPE::from_file(&path("vocab.json"), &path("merges.txt"))
-        .build()
-        .map_err(err)?;
-    let mut tok = Tokenizer::new(bpe);
-    let split = Split::new(
-        SplitPattern::Regex(SPLIT_PATTERN.into()),
-        SplitDelimiterBehavior::Isolated,
-        false,
-    )
-    .map_err(err)?;
-    tok.with_normalizer(Some(NFC));
-    tok.with_pre_tokenizer(Some(Sequence::new(vec![
-        PreTokenizerWrapper::from(split),
-        PreTokenizerWrapper::from(ByteLevel::new(false, false, false)),
-    ])));
-    let added_path = dir.join("added_tokens.json");
-    let raw = std::fs::read_to_string(&added_path)
-        .map_err(|e| format!("{}: {e}", added_path.display()))?;
-    let map: serde_json::Map<String, Value> =
-        serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", added_path.display()))?;
-    let mut added: Vec<(u32, &str)> = Vec::with_capacity(map.len());
-    for (content, id) in &map {
-        let id = id
-            .as_u64()
-            .ok_or_else(|| format!("{}: id of {content} is not a number", added_path.display()))?;
-        added.push((id as u32, content.as_str()));
-    }
-    // Added tokens take consecutive ids after the vocabulary, in the order they are added.
-    added.sort();
-    // ponytail: every added token is registered as special (tokenizer_config.json marks a few, e.g.
-    // `<tool_call>`, non-special); matching in the text is identical, only decoding differs.
-    let tokens: Vec<AddedToken> = added
-        .iter()
-        .map(|(_, c)| AddedToken::from(*c, true))
-        .collect();
-    tok.add_special_tokens(&tokens);
-    for (id, c) in &added {
-        if tok.token_to_id(c) != Some(*id) {
-            return Err(format!(
-                "{}: added token {c} does not land on id {id} (vocab.json has gaps?)",
-                dir.display()
-            ));
-        }
-    }
-    Ok(tok)
+    crate::model::tokenizer::byte_bpe_from_vocab_merges(dir)
 }
 
 pub struct QwenImagePipeline {
@@ -721,7 +664,7 @@ impl QwenImagePipeline {
             dit.dim,
             path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())
         );
-        let sched = Sched::from_config(&scheduler.map_or_else(|| read_scheduler(dir), Ok)?);
+        let sched = sched::Schedule::from_config(&scheduler.map_or_else(|| read_scheduler(dir), Ok)?);
         let core = Core::new(dit, QwenVae::load(&dir.join("vae"))?, sched, width)?;
         Ok(Self {
             enc: Qwen3Encoder::open(&te)?,
@@ -856,54 +799,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tokenizer_is_built_from_vocab_and_merges_and_splits_out_special_tokens() {
-        let dir = std::env::temp_dir().join(format!("gibbs-qwen1-tok-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("vocab.json"), r#"{"h":0,"i":1,"Ġ":2,"hi":3}"#).unwrap();
-        std::fs::write(dir.join("merges.txt"), "#version: 0.2\nh i\n").unwrap();
-        std::fs::write(
-            dir.join("added_tokens.json"),
-            r#"{"<|im_end|>":5,"<|im_start|>":4}"#,
-        )
-        .unwrap();
-        let tok = load_tokenizer(&dir).unwrap();
-        let ids = |s: &str| tok.encode(s, false).unwrap().get_ids().to_vec();
-        assert_eq!(ids("hi"), [3]);
-        assert_eq!(ids("hi hi"), [3, 2, 3]);
-        assert_eq!(ids("<|im_start|>hi<|im_end|>"), [4, 3, 5]);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     fn env_path(k: &str) -> Option<std::path::PathBuf> {
         std::env::var_os(k).map(Into::into)
     }
 
-    /// `GIBBS_QWEN1_TOKENIZER`: Qwen-Image's `tokenizer/` files (vocab.json, merges.txt,
-    /// added_tokens.json) next to `ref_tokenizer.json` (Qwen2.5-VL's tokenizer.json): the tokenizer
-    /// built from the former must give the latter's ids, and the template head must be `DROP` tokens.
-    #[test]
-    fn real_tokenizer_matches_the_reference_tokenizer_json() {
-        let Some(dir) = env_path("GIBBS_QWEN1_TOKENIZER") else {
-            eprintln!("SKIP: GIBBS_QWEN1_TOKENIZER not set");
-            return;
-        };
-        let built = load_tokenizer(&dir).unwrap();
-        let reference = tokenizers::Tokenizer::from_file(dir.join("ref_tokenizer.json")).unwrap();
-        let ids =
-            |t: &tokenizers::Tokenizer, s: &str| t.encode(s, false).unwrap().get_ids().to_vec();
-        for s in [
-            TEMPLATE_HEAD,
-            "A cat 🐱 on 123456 books, 日本語のテキスト \n\n  indented\ttabs  ",
-            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
-            "don't won't I'LL we've; \"quoted\" (x) [y] ...",
-            "<|endoftext|>x<|vision_start|><|image_pad|>",
-            " ",
-        ] {
-            assert_eq!(ids(&built, s), ids(&reference, s), "{s:?}");
-        }
-        assert_eq!(ids(&built, TEMPLATE_HEAD).len(), DROP);
-    }
 
     /// `GIBBS_QWEN2_DIR` (Qwen2.5-0.5B-Instruct: config.json, model.safetensors, tokenizer.json): the
     /// Qwen2 decoder (qkv bias, no qk-norm) the v1 text encoder shares with it must continue "The
@@ -998,7 +897,7 @@ mod tests {
         let core = Core::new(
             dit,
             QwenVae::load(&vae).unwrap(),
-            Sched::from_config(&sched),
+            sched::Schedule::from_config(&sched),
             3584,
         )
         .unwrap();

@@ -1,0 +1,25 @@
+// Qwen3.5-style decoders: multimodal / mlx-vlm nesting, and llama.cpp `qwen35*` tensor names
+// (DeltaNet `ssm_*`, MoE banks) -> transformers names. Put before `llamacpp` (its `attn_qkv`
+// is the fused attention projection there).
+{
+  rules: [
+    ["model.language_model.{r:*}", "model.{r}"],
+    ["language_model.model.{r:*}", "model.{r}"],
+    ["language_model.lm_head.weight", "lm_head.weight"],
+    ["blk.{i}.post_attention_norm.weight", "model.layers.{i}.post_attention_layernorm.weight"],
+    ["blk.{i}.attn_qkv.weight", "model.layers.{i}.linear_attn.in_proj_qkv.weight"],
+    ["blk.{i}.attn_gate.weight", "model.layers.{i}.linear_attn.in_proj_z.weight"],
+    ["blk.{i}.ssm_beta.weight", "model.layers.{i}.linear_attn.in_proj_b.weight"],
+    ["blk.{i}.ssm_alpha.weight", "model.layers.{i}.linear_attn.in_proj_a.weight"],
+    ["blk.{i}.ssm_a", "model.layers.{i}.linear_attn.neg_A"],
+    ["blk.{i}.ssm_dt.bias", "model.layers.{i}.linear_attn.dt_bias"],
+    ["blk.{i}.ssm_conv1d.weight", "model.layers.{i}.linear_attn.conv1d.weight"],
+    ["blk.{i}.ssm_norm.weight", "model.layers.{i}.linear_attn.norm.weight"],
+    ["blk.{i}.ssm_out.weight", "model.layers.{i}.linear_attn.out_proj.weight"],
+    ["blk.{i}.ffn_gate_inp.weight", "model.layers.{i}.mlp.gate.weight"],
+    ["blk.{i}.ffn_gate_inp_shexp.weight", "model.layers.{i}.mlp.shared_expert_gate.weight"],
+    ["blk.{i}.ffn_{n:*}_shexp.weight", "model.layers.{i}.mlp.shared_expert.{n}_proj.weight"],
+    ["blk.{i}.ffn_gate_up_exps.weight", "model.layers.{i}.mlp.experts.gate_up_proj"],
+    ["blk.{i}.ffn_{n:*}_exps.weight", "model.layers.{i}.mlp.experts.{n}_proj.weight"],
+  ],
+}

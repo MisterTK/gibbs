@@ -2,9 +2,9 @@
 //! path (the latest message is the encoder input as is). Each test prints `SKIP` when its
 //! checkpoint is not in the repo's `disk/` hub cache (or `GIBBS_T5_STORAGE`).
 
-use gibbs_engine::hardware::Device;
+use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::hub::ModelArtifacts;
-use gibbs_engine::model::native::{load_native, NativeLm};
+use gibbs_engine::model::native::NativeLm;
 use gibbs_engine::model::t5::T5Encoder;
 use gibbs_engine::model::weights::Weights;
 use std::path::PathBuf;
@@ -35,9 +35,9 @@ fn load_on(repo: &str, weights: &str, device: Device) -> Option<Arc<dyn NativeLm
         is_cached: true,
         ..Default::default()
     };
+    let reg = gibbs_engine::arch::registry().expect("registry");
     Some(
-        load_native(&artifacts, device)
-            .expect("T5 types are native")
+        gibbs_engine::runtime::encdec::load(&artifacts, reg, None, PlacementMode::Pin(device))
             .expect("T5 checkpoint loads"),
     )
 }

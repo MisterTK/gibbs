@@ -128,6 +128,7 @@ pub fn generate(name: &str, args: &Value) -> Result<Gen, String> {
         "zeros" => fill_with(a, 0.0),
         "fill" => a.f("value").and_then(|v| fill_with(a, v)),
         "iota" => iota(a),
+        "ngram_hash_rows" => ngram_hash_rows(a),
         _ => return Err(format!("unknown generator `{name}`")),
     };
     r.map_err(|e| format!("generator `{name}`: {e}"))
@@ -147,6 +148,9 @@ pub fn generate(name: &str, args: &Value) -> Result<Gen, String> {
 /// - `yarn`: `factor`, `original_max_position_embeddings`, `beta_fast` (32), `beta_slow` (1),
 ///   `truncate` (true). Zero betas are NOT mapped to the defaults (Gemma3's loader does that; its
 ///   spec must). The cos/sin scale comes from `yarn_attention_factor`.
+///
+/// `tile` (default 1): the table repeated that many times, F32 `[tile * dim / 2]` (a 2D ViT
+/// rotary rotates by grid row with one copy and by grid column with the next).
 ///
 /// Sources: `gemma3_text.rs` `inv_freq`, `classifier/modernbert.rs` `rope_inv_freq`,
 /// `gemma4/text.rs` `inv_freq`, `qwen3_5/text.rs` (default / HunYuan alpha),
@@ -247,7 +251,8 @@ fn rope_inv_freq(a: &Args) -> Result<Gen, String> {
         (_, "f64" | "f32") => return Err(bad("kind", format!("{kind} ({precision})"))),
         (_, p) => return Err(bad("precision", p)),
     };
-    f32s(vec![half], inv)
+    let tile = a.u_or("tile", 1)?;
+    f32s(vec![tile * half], inv.repeat(tile))
 }
 
 /// `yarn_attention_factor`: YaRN cos/sin scale, F32 `[1]`. Args: `factor`, optional
@@ -283,7 +288,8 @@ fn axis_freqs(a: &Args) -> Result<Gen, String> {
 
 /// `sinusoid_table`: sinusoid position table, F32 `[rows, dim]`, `[sin | cos]` halves.
 /// Args: `rows`, `dim`, `kind`, optional `zero_row` (left all-zero: a padding id), `reverse`
-/// (row r holds position `rows-1-r`; default false).
+/// (row r holds position `rows-1-r`; default false), `start` (added to every row's position;
+/// default 0: fairseq tables read from position `2` drop the offset rows).
 /// - `standard`: angle `p / 10000^(2i/dim)` (`seq2seq.rs` `sinusoidal_marian`).
 /// - `tensor2tensor`: angle `p * exp(-i ln(10000) / (dim/2 - 1))` (`seq2seq.rs`
 ///   `sinusoidal_fairseq` with `zero_row: 1`; `gemma4/audio.rs` relative positions
@@ -292,6 +298,7 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
     let (rows, d) = (a.u("rows")?, a.u("dim")?);
     let zero = a.get("zero_row").map(|_| a.u("zero_row")).transpose()?;
     let reverse = a.b_or("reverse", false)?;
+    let start = a.get("start").map(|_| a.u("start")).transpose()?.unwrap_or(0);
     let half = d / 2;
     let kind = a.s_or("kind", "standard")?;
     let step = 10000f64.ln() / (half as f64 - 1.0);
@@ -305,7 +312,7 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
         if zero == Some(r) {
             continue;
         }
-        let p = if reverse { rows - 1 - r } else { r };
+        let p = if reverse { rows - 1 - r } else { r } + start;
         for i in 0..half {
             let x = angle(p, i);
             t[r * d + i] = x.sin() as f32;
@@ -340,11 +347,12 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
     out
 }
 
-/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]`.
+/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]`; `t` a list of n values: their
+/// embeddings concatenated, `[n * dim]` (SDXL `add_time_ids`).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
-/// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
-/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults.
+/// diffusers `get_timestep_embedding` (`precision: "f32"` for f32 sources; a guidance embedding
+/// with `flip_sin_to_cos: false, downscale_freq_shift: 1`).
 fn timestep_embedding(a: &Args) -> Result<Gen, String> {
     let dim = a.u("dim")?;
     let f32p = match a.s_or("precision", "f64")? {
@@ -352,16 +360,14 @@ fn timestep_embedding(a: &Args) -> Result<Gen, String> {
         "f32" => true,
         p => return Err(bad("precision", p)),
     };
-    let v = timestep_vec(
-        a.f("t")?,
-        dim,
-        a.b_or("flip_sin_to_cos", true)?,
-        a.f_or("downscale_freq_shift", 0.0)?,
-        a.f_or("scale", 1.0)?,
-        a.f_or("max_period", 10000.0)?,
-        f32p,
-    );
-    f32s(vec![dim], v)
+    let ts = match a.get("t").is_some_and(Value::is_array) {
+        true => a.fs("t")?,
+        false => vec![a.f("t")?],
+    };
+    let (flip, shift) = (a.b_or("flip_sin_to_cos", true)?, a.f_or("downscale_freq_shift", 0.0)?);
+    let (scale, period) = (a.f_or("scale", 1.0)?, a.f_or("max_period", 10000.0)?);
+    let v: Vec<f32> = ts.iter().flat_map(|&t| timestep_vec(t, dim, flip, shift, scale, period, f32p)).collect();
+    f32s(vec![v.len()], v)
 }
 
 /// `modulation_index_rows`: input rows of a distilled modulation-table MLP, F32
@@ -462,7 +468,10 @@ fn text_then_centered_grid(a: &Args) -> Result<Gen, String> {
 /// (`output`: `cos` or `sin`). Per axis `dim/6` freqs `theta^(j/(n-1)) * pi/2` times
 /// `2 * pos * axis_scale / base - 1`, axes interleaved, each angle twice, `dim % 6` leading
 /// identity entries. Args: `frames`, `grid_h`, `grid_w`, `fps`, `dim`, `theta` (10000),
-/// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32).
+/// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32),
+/// `pair_sign` (false; true negates the even entry of every pair: `[-sin, +sin]` for a
+/// `x*cos + swap(x)*sin` rotation in graph).
+///
 /// Source: `ltx.rs` `Rope::new`.
 fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
     let (f, h, w, d) = (a.u("frames")?, a.u("grid_h")?, a.u("grid_w")?, a.u("dim")?);
@@ -481,6 +490,7 @@ fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
         "sin" => false,
         o => return Err(bad("output", o)),
     };
+    let sign = a.b_or("pair_sign", false)? && !cos;
     let n = d / 6;
     let freqs: Vec<f64> = (0..n).map(|j| theta.powf(j as f64 / (n - 1) as f64) * std::f64::consts::FRAC_PI_2).collect();
     let scale = [ts / fps, ss, ss];
@@ -492,7 +502,8 @@ fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
             for axis in 0..3 {
                 let g = pos[axis] as f64 * scale[axis] / base[axis];
                 let x = fr * (g * 2.0 - 1.0);
-                v.extend([(if cos { x.cos() } else { x.sin() }) as f32; 2]);
+                let v0 = if cos { x.cos() } else { x.sin() } as f32;
+                v.extend([if sign { -v0 } else { v0 }, v0]);
             }
         }
     }
@@ -671,7 +682,10 @@ fn validity_mask(a: &Args) -> Result<Gen, String> {
 /// `log_bucket_rel_index`: U32 `[rows, cols]` index into `2*span` relative embeddings for query
 /// `i`, key `j` (transformers `make_log_bucket_position` in f32 when `buckets > 0`, then `+span`
 /// clamped to `[0, 2*span)`). Args: `rows`, `cols` (default rows), `buckets`, `max_relative`,
-/// `span`. Source: `classifier.rs` DeBERTa `rel_index`.
+/// `span`. With `heads`: U32 `[heads, rows, cols]` flat gather index into a `[heads, rows | cols,
+/// 2*span]` score table instead, pair `(i, j)` of head h reading `(h*rows + i)*2*span + r`
+/// (`by: "query"`, default: DeBERTa c2p) or `(h*cols + j)*2*span + r` (`by: "key"`: p2c).
+/// Source: `classifier.rs` DeBERTa `rel_index` / `graph`.
 fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
     let (rows, buckets, span) = (a.u("rows")?, a.u("buckets")?, a.u("span")? as i64);
     let cols = a.u_or("cols", rows)?;
@@ -694,11 +708,27 @@ fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
             v.push((bucket + span).clamp(0, 2 * span - 1) as u32);
         }
     }
-    u32s(vec![rows, cols], v)
+    let Some(heads) = a.get("heads").map(|_| a.u("heads")).transpose()? else {
+        return u32s(vec![rows, cols], v);
+    };
+    let by_key = match a.s_or("by", "query")? {
+        "query" => false,
+        "key" => true,
+        b => return Err(bad("by", b)),
+    };
+    let span2 = 2 * span as u32;
+    let mut idx = Vec::with_capacity(heads * v.len());
+    for h in 0..heads {
+        for (t, &r) in v.iter().enumerate() {
+            let row = if by_key { h * cols + t % cols } else { h * rows + t / cols };
+            idx.push(row as u32 * span2 + r);
+        }
+    }
+    u32s(vec![heads, rows, cols], idx)
 }
 
 /// `causal_key_mask`: F32 `[cap]`, 0 for keys `j <= pos`, else `masked` (default -inf).
-/// Source: `encdec_gpu.rs` `step`.
+/// Source: the former `encdec_gpu.rs` `step`.
 fn causal_key_mask(a: &Args) -> Result<Gen, String> {
     let (cap, pos) = (a.u("cap")?, a.u("pos")?);
     let m = a.f_or("masked", f64::NEG_INFINITY)? as f32;
@@ -740,6 +770,52 @@ fn iota(a: &Args) -> Result<Gen, String> {
     }
 }
 
+/// `ngram_hash_rows`: U32 `[rows * (ngram - 1) * per_gram]` table rows of hashed n-gram
+/// embeddings. `ids` holds up to `ngram - 1` tokens of left context, then the `rows` tokens; missing
+/// context (sequence start) is `eos`. Row `t`'s context `c[0..ngram]` is the token and its
+/// predecessors, every one at or before an `eos` predecessor replaced by `eos`; n-gram `g` in
+/// `2..=ngram` hashes `h = c[0]*m[0] ^ .. ^ c[g-1]*m[g-1]` (u64 wrapping), and its `per_gram` heads
+/// `j = (g-2)*per_gram + k` read row `h % vocab_sizes[j] + offsets[j]`. Args: `ids`, `rows`,
+/// `ngram`, `per_gram`, `multipliers`, `offsets`, `vocab_sizes`, `eos`.
+fn ngram_hash_rows(a: &Args) -> Result<Gen, String> {
+    let (rows, ngram, per, eos) = (a.u("rows")?, a.u("ngram")?, a.u("per_gram")?, a.u("eos")? as u64);
+    let (mult, off, voc) = (a.us("multipliers")?, a.us("offsets")?, a.us("vocab_sizes")?);
+    let ids = a.us("ids")?;
+    let heads = ngram.saturating_sub(1) * per;
+    if ngram < 2 || mult.len() < ngram || off.len() < heads || voc.len() < heads || voc[..heads].contains(&0) {
+        return Err("hash constants do not fit ngram / per_gram".into());
+    }
+    if ids.len() < rows {
+        return Err(format!("{} ids for {rows} rows", ids.len()));
+    }
+    let back = ngram - 1;
+    let pad = back.saturating_sub(ids.len() - rows);
+    let chain: Vec<u64> = std::iter::repeat_n(eos, pad)
+        .chain(ids[ids.len() - rows - (back - pad)..].iter().map(|&x| x as u64))
+        .collect();
+    let mut out = Vec::with_capacity(rows * heads);
+    let mut ctx = vec![0u64; ngram];
+    for t in 0..rows {
+        ctx[0] = chain[back + t];
+        let mut cut = false;
+        for s in 1..ngram {
+            let p = chain[back + t - s];
+            cut |= p == eos;
+            ctx[s] = if cut { eos } else { p };
+        }
+        for g in 2..=ngram {
+            let h = (1..g).fold(ctx[0].wrapping_mul(mult[0] as u64), |h, j| {
+                h ^ ctx[j].wrapping_mul(mult[j] as u64)
+            });
+            for k in 0..per {
+                let j = (g - 2) * per + k;
+                out.push((h % voc[j] as u64 + off[j] as u64) as u32);
+            }
+        }
+    }
+    u32s(vec![rows * heads], out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +855,7 @@ mod tests {
         let r = |k: Value| f("rope_inv_freq", k);
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0})), [1.0, 0.01]);
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "precision": "f32"})), [1.0, 0.01]);
+        assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "precision": "f32", "tile": 2})), [1.0, 0.01, 1.0, 0.01]);
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "kind": "linear", "factor": 2.0})), [0.5, 0.005]);
         // HunYuan alpha: 10000 * 2^(4/2) = 40000.
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "kind": "ntk_alpha", "alpha": 2.0})), [1.0, 0.005]);
@@ -805,10 +882,14 @@ mod tests {
         // gemma4 audio relative positions left..=0 (left = 2): last row is position 0.
         let rel = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 3, "dim": 4, "reverse": true}));
         assert_eq!(rel[8..], [0.0, 0.0, 1.0, 1.0]);
+        let off = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 3, "dim": 4, "start": 2}));
+        let full = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 5, "dim": 4}));
+        assert_eq!(off, full[8..]);
         assert_eq!(rel[0], 2f32.sin());
         assert_eq!(rel[1], (2.0 * (-(10000f64.ln())).exp()).sin() as f32);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4})), [1.0, 1.0, 0.0, 0.0]);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4, "flip_sin_to_cos": false})), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(f("timestep_embedding", json!({"t": [0.0, 0.0], "dim": 2})), [1.0, 0.0, 1.0, 0.0]);
         assert_eq!(
             f("modulation_index_rows", json!({"t": 0.0, "rows": 2, "dims": [2, 2, 2], "scale": 1000.0})),
             [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1000f64.cos() as f32, 1000f64.sin() as f32]
@@ -865,6 +946,9 @@ mod tests {
             u("log_bucket_rel_index", json!({"rows": 6, "cols": 1, "buckets": 4, "max_relative": 8, "span": 8})),
             [8, 9, 10, 11, 11, 11]
         );
+        let rel = |by| u("log_bucket_rel_index", json!({"rows": 2, "buckets": 0, "span": 2, "heads": 2, "by": by}));
+        assert_eq!(rel("query"), [2, 1, 7, 6, 10, 9, 15, 14]);
+        assert_eq!(rel("key"), [2, 5, 3, 6, 10, 13, 11, 14]);
         assert_eq!(f("causal_key_mask", json!({"cap": 3, "pos": 1})), [0.0, 0.0, f32::NEG_INFINITY]);
         assert_eq!(u("channel_dup_index", json!({"channels": 2, "repeats": 2, "frames": 1})), [0, 0, 1, 1, 2, 2, 3, 3]);
         assert_eq!(f("ones", json!({"shape": [2]})), [1.0, 1.0]);
@@ -901,26 +985,6 @@ mod tests {
                     assert_eq!(f("yarn_attention_factor", args)[0].to_bits(), attn.to_bits());
                 }
             }
-            // ModernBERT (f32): default and yarn.
-            for (cfg, d) in [
-                (json!({"global_rope_theta": 160000.0}), 64),
-                (json!({"max_position_embeddings": 8192, "rope_scaling": {"rope_type": "yarn", "rope_theta": 160000.0,
-                        "original_max_position_embeddings": 1024.0, "mscale": 1.0, "mscale_all_dim": 0.5}}), 64),
-            ] {
-                let (want, attn) = model::classifier::modernbert::rope_inv_freq(&cfg, "full_attention", d).unwrap();
-                let yarn = !cfg["rope_scaling"].is_null();
-                let args = if yarn {
-                    json!({"dim": d, "theta": 160000.0, "kind": "yarn", "precision": "f32", "factor": 8.0,
-                           "original_max_position_embeddings": 1024.0})
-                } else {
-                    json!({"dim": d, "theta": 160000.0, "precision": "f32"})
-                };
-                assert_eq!(bits(&f("rope_inv_freq", args)), bits(&want), "{cfg}");
-                if yarn {
-                    let a = f("yarn_attention_factor", json!({"factor": 8.0, "mscale": 1.0, "mscale_all_dim": 0.5}));
-                    assert_eq!(a[0].to_bits(), attn.to_bits());
-                }
-            }
             // gemma4: default (with factor) and proportional.
             for p in [
                 json!({"rope_theta": 1e4, "factor": 2.0}),
@@ -950,11 +1014,31 @@ mod tests {
 
         #[test]
         fn sinusoid_tables_match_sources() {
+            // The former `seq2seq.rs` tables (Marian; fairseq with padding row 1).
+            fn table(rows: usize, d: usize, fairseq: bool) -> Vec<f32> {
+                let mut t = vec![0.0f32; rows * d];
+                let half = d / 2;
+                let step = (10000f64).ln() / (half as f64 - 1.0);
+                for p in 0..rows {
+                    if fairseq && p == 1 {
+                        continue;
+                    }
+                    for i in 0..half {
+                        let a = match fairseq {
+                            true => p as f64 * (-(i as f64) * step).exp(),
+                            false => p as f64 / 10000f64.powf(2.0 * i as f64 / d as f64),
+                        };
+                        t[p * d + i] = a.sin() as f32;
+                        t[p * d + half + i] = a.cos() as f32;
+                    }
+                }
+                t
+            }
             for (rows, d) in [(10, 8), (33, 64)] {
                 let m = f("sinusoid_table", json!({"kind": "standard", "rows": rows, "dim": d}));
-                assert_eq!(bits(&m), bits(&model::seq2seq::sinusoidal_marian(rows, d)));
+                assert_eq!(bits(&m), bits(&table(rows, d, false)));
                 let fs = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": rows, "dim": d, "zero_row": 1}));
-                assert_eq!(bits(&fs), bits(&model::seq2seq::sinusoidal_fairseq(rows, d)));
+                assert_eq!(bits(&fs), bits(&table(rows, d, true)));
             }
         }
 
@@ -976,6 +1060,49 @@ mod tests {
                 .flat_map(|i| [s(t as f64 * 1000.0, 16), s(0.0, 16), s(i as f64 * 1000.0, 32)].concat())
                 .collect();
             let got = f("modulation_index_rows", json!({"t": t as f64, "rows": 3, "dims": [16, 16, 32], "scale": 1000.0}));
+            assert_eq!(bits(&got), bits(&want));
+        }
+
+        /// The `sd` spec's generated inputs: the LCM guidance embedding (`sd.rs`
+        /// `guidance_embedding`) and SDXL's 6 time-id embeddings (`unet.rs` `timestep_embedding`
+        /// per id), old formulas inlined.
+        #[test]
+        fn sd_embeddings_match_sources() {
+            // `sd.rs` `guidance_embedding`, verbatim; `black_box` keeps LLVM from folding the
+            // sin/cos of constants at compile time (an ulp off the runtime libm).
+            #[inline(never)]
+            fn guidance_embedding(w: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let w = w * 1000.0;
+                let f = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
+                let mut e: Vec<f32> = (0..half).map(|i| (w * f(i)).sin()).collect();
+                e.extend((0..half).map(|i| (w * f(i)).cos()));
+                e.resize(dim, 0.0);
+                e
+            }
+            let (w, dim) = (6.5f32, 16usize);
+            let want = guidance_embedding(std::hint::black_box(w), dim);
+            let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
+                "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
+            assert_eq!(bits(&got), bits(&want));
+
+            let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
+            // `unet.rs` `timestep_embedding`, verbatim.
+            #[inline(never)]
+            fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let mut emb = vec![0.0f32; dim];
+                for i in 0..half {
+                    let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                    let arg = t * freq;
+                    emb[i] = arg.cos();
+                    emb[half + i] = arg.sin();
+                }
+                emb
+            }
+            let want: Vec<f32> =
+                std::hint::black_box(ids).iter().flat_map(|&t| timestep_embedding(t, 256)).collect();
+            let got = f("timestep_embedding", json!({"t": ids, "dim": 256, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
         }
 
@@ -1005,13 +1132,16 @@ mod tests {
                 let want = model::qwen_image::rope_positions(&model::qwen_image21::t2i_positions(nt, h, w));
                 assert_eq!(u("text_then_centered_grid", args), want);
             }
-            for (fr, h, w, fps, d) in [(2, 3, 4, 25.0, 14), (1, 2, 2, 24.0, 12)] {
-                let r = model::ltx::Rope::new(fr, h, w, fps, d);
+            // FNV-1a of the `ltx.rs` `Rope::new` tables' bits (cos, sin), pinned before its deletion.
+            let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+            for ((fr, h, w, fps, d), pin) in [((2, 3, 4, 25.0, 14), PIN_ROPE[0]), ((1, 2, 2, 24.0, 12), PIN_ROPE[1])] {
                 let a = |o: &str| json!({"frames": fr, "grid_h": h, "grid_w": w, "fps": fps, "dim": d, "output": o});
-                assert_eq!(bits(&f("video_rope_cos_sin", a("cos"))), bits(&r.cos));
-                assert_eq!(bits(&f("video_rope_cos_sin", a("sin"))), bits(&r.sin));
+                let got = (fnv(&f("video_rope_cos_sin", a("cos"))), fnv(&f("video_rope_cos_sin", a("sin"))));
+                assert_eq!(got, pin, "{:?}", (fr, h, w));
             }
         }
+
+        const PIN_ROPE: [(u64, u64); 2] = [(7060718898465474953, 1236744568232124141), (101182376039508301, 1818247417042637373)];
 
         #[test]
         fn audio_front_end_matches_sources() {
@@ -1042,5 +1172,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Hand-computed: m = [3, 5, 7], eos 2 cuts the context, missing context is eos.
+    #[test]
+    fn ngram_hash_rows_cuts_at_eos_and_pads_the_start() {
+        let hash = |ids: &[u32]| {
+            u("ngram_hash_rows", json!({"ids": ids, "rows": 2, "ngram": 3, "per_gram": 1, "eos": 2,
+                "multipliers": [3, 5, 7], "offsets": [0, 10], "vocab_sizes": [7, 11]}))
+        };
+        assert_eq!(hash(&[9, 4]), [3, 19, 5, 13]);
+        assert_eq!(hash(&[7, 2, 9, 4]), [3, 19, 5, 13]);
+        assert_eq!(hash(&[6, 9, 4]), [5, 10, 5, 10]);
     }
 }

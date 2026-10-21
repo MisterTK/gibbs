@@ -1503,22 +1503,12 @@ mod tests {
                 "gemma4 tiny moe",
                 crate::model::gemma4::tiny_moe_decode_graph().unwrap(),
             ),
-            (
-                "qwen3.5 tiny",
-                crate::model::qwen3_5::tiny_decode_graph().unwrap(),
-            ),
-            (
-                "qwen3.5 tiny moe",
-                crate::model::qwen3_5::tiny_moe_decode_graph().unwrap(),
-            ),
         ];
         let want = [
             ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
             ([0; 4], 0x927782df5841c11f),
             ([1, 0, 1, 0], 0x3d671d0c32f3a78e), // packed-Mat QKV fuses (concatenated blocks)
             ([0, 0, 2, 0], 0x2dcb16b780f9a345), // packed-Mat QKV fuses
-            ([2, 0, 2, 0], 0x1bb42ad2954e0f54), // packed-Mat QKV fuses
-            ([0, 0, 4, 0], 0x405dc7b59fa3fd71), // packed-Mat QKV fuses
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);
@@ -1551,8 +1541,24 @@ mod tests {
                     let (g, w, _) = crate::model::gemma4::gguf_decode_fixture(&p).unwrap();
                     (g, w)
                 }
+                // Spec families: the decode instance (one row, last-row head).
                 "qwen3" | "qwen3moe" | "hunyuan-dense" | "qwen35" | "qwen35moe" | "qwen4exp" => {
-                    crate::model::qwen3_5::gguf_decode_graph(&p).unwrap()
+                    use crate::arch::expr::Val;
+                    let a = crate::model::hub::ModelArtifacts {
+                        model_id: "egraph/real".into(),
+                        weights_path: Some(p.clone()),
+                        ..Default::default()
+                    };
+                    let mut r = crate::arch::testing::Runner::from_artifacts(
+                        &a,
+                        None,
+                        crate::hardware::Device::Cpu,
+                        4096,
+                    )
+                    .unwrap();
+                    let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
+                    let i = r.instance("text", &vars).unwrap();
+                    (i.graph, r.model.store.materialize(&i.weights).unwrap())
                 }
                 _ => crate::model::graph_lm::GraphLm::from_gguf_data(
                     crate::model::graph_lm::GraphLmConfig::default(),

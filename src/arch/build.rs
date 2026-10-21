@@ -2,12 +2,13 @@
 //! `graph::Graph`. Node kinds (one JSON object each, see the README "Model specs"):
 //!
 //! - op:     `{op, args, in, out, name?, when?}`; `args` deserialize into `graph::Op`.
-//! - state:  `{state, shape, dtype?, recurrent?, when?}` declares persistent state.
+//! - state:  `{state, shape, dtype?, recurrent?, reread?, when?}` declares persistent state;
+//!   `reread: true` re-reads one declared earlier (its value after the earlier writes).
 //! - use:    `{use, args?, in?, out?, when?}` expands a macro in a fresh value scope.
 //! - repeat: `{repeat: var, count | over, body}` (shares the enclosing value scope).
 //! - block:  `{block: [...], when}` conditional group (shares the enclosing value scope).
 //! - let:    `{let: {var: expr, ...}}` binds expression variables in the current frame.
-//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it.
+//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it (`"*"`: all).
 //!
 //! Operand refs: `x` (scope value), `v?:x` (scope value, dropped when unbound), `w:name` (weight),
 //! `w?:name` (weight, dropped when absent), `s:name` (state), `c:name` (constant), `i:name` (input).
@@ -141,16 +142,46 @@ pub fn build_network(
                 continue;
             }
         }
-        let name = b.interp(&name)?;
-        let v = b.value(&match value {
-            Some(s) => b.interp(s)?,
-            None => name.clone(),
-        })?;
-        b.g.output(v);
-        outputs.push(name);
+        // `{repeat: var, count: expr, name: "x.{var}"}`: one output per index.
+        let rep = match o.get("repeat").and_then(J::as_str) {
+            Some(var) => {
+                let n = b.eval(o.get("count").ok_or("output `repeat` needs `count`")?)?.usize()?;
+                Some((var.to_string(), n))
+            }
+            None => None,
+        };
+        let idx: Vec<Option<usize>> = match &rep {
+            Some((_, n)) => (0..*n).map(Some).collect(),
+            None => vec![None],
+        };
+        for i in idx {
+            if let (Some((var, _)), Some(i)) = (&rep, i) {
+                b.frames.push(vec![(var.clone(), Val::Num(i as f64))]);
+            }
+            let r = (|| {
+                let name = b.interp(&name)?;
+                let v = b.value(&match value {
+                    Some(s) => b.interp(s)?,
+                    None => name.clone(),
+                })?;
+                Ok::<_, String>((name, v))
+            })();
+            if rep.is_some() {
+                b.frames.pop();
+            }
+            let (name, v) = r?;
+            b.g.output(v);
+            outputs.push(name);
+        }
     }
     let want: Vec<String> = match b.var("taps") {
         Some(Val::List(l)) => l.iter().map(|t| t.to_string()).collect(),
+        // Every emitted tap, by name (the `precompute` component's weights).
+        Some(Val::Str(s)) if s == "*" => {
+            let mut t: Vec<String> = b.taps.keys().cloned().collect();
+            t.sort();
+            t
+        }
         _ => Vec::new(),
     };
     for t in want {
@@ -213,6 +244,21 @@ impl Env for BEnv<'_, '_> {
             .map(|(s, _)| s)
             .or_else(|| self.0.model.shape(t))
     }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.0.model.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.0.model.raw_has(p)
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.0.model.values(t)
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.0.model.dtype(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.0.model.token(s)
+    }
 }
 
 impl<'a> Builder<'a> {
@@ -256,7 +302,7 @@ impl<'a> Builder<'a> {
         let v = self.g.input(name.clone(), shape.clone(), dtype);
         self.inputs.insert(name.clone(), v);
         let gen = match &d.gen {
-            Some(gname) => Some((gname.clone(), self.eval(&d.args)?.to_json())),
+            Some(gname) => Some((gname.clone(), self.gen_args(&d.args)?)),
             None => None,
         };
         Ok(Some(InputPlan {
@@ -265,6 +311,20 @@ impl<'a> Builder<'a> {
             dtype,
             gen,
         }))
+    }
+
+    /// Evaluated gen-input args; strings `"step:<expr>"` stay verbatim for the runner to evaluate
+    /// per run (`runtime::diffusion`).
+    fn gen_args(&self, j: &J) -> Result<J, String> {
+        Ok(match j {
+            J::String(s) if s.starts_with("step:") => j.clone(),
+            J::Object(o) => J::Object(
+                o.iter()
+                    .map(|(k, v)| Ok((k.clone(), self.gen_args(v)?)))
+                    .collect::<Result<_, String>>()?,
+            ),
+            _ => self.eval(j)?.to_json(),
+        })
     }
 
     fn body(&mut self, nodes: &[J]) -> Result<(), String> {
@@ -310,8 +370,16 @@ impl<'a> Builder<'a> {
                     .ok_or("state needs `shape`")?,
             )?;
             let dtype = parse_dtype(m.get("dtype").and_then(J::as_str).unwrap_or("f32"))?;
-            if self.states.contains_key(&name) {
-                return Err(format!("state `{name}` declared twice"));
+            // `reread: true`: a second value of a state declared earlier in this graph, read after
+            // the earlier nodes' writes (shared KV caches); later `s:` refs use it.
+            let reread = m.get("reread").and_then(J::as_bool).unwrap_or(false);
+            match (self.states.get(&name), reread) {
+                (Some(_), false) => return Err(format!("state `{name}` declared twice")),
+                (None, true) => return Err(format!("state `{name}` is reread before it is declared")),
+                (Some(&v), true) if self.g.value(v).shape != shape => {
+                    return Err(format!("state `{name}` reread with shape {shape:?}"))
+                }
+                _ => {}
             }
             let recurrent = m
                 .get("recurrent")
@@ -763,7 +831,7 @@ mod tests {
           ]},
           {op: "Linear", in: ["x", "w:emb"], out: "logits"},
         ],
-        outputs: ["logits", {name: "x", when: "rows == 99"}],
+        outputs: ["logits", {name: "x", when: "rows == 99"}, {name: "rep.{k}", value: "logits", repeat: "k", count: "layers - 1", when: "rows == 3"}],
       }},
     }"#;
 
@@ -821,6 +889,13 @@ mod tests {
     }
 
     #[test]
+    fn repeated_outputs() {
+        let i = build(&spec(), "text", &Cfg, &Src, &[("rows", Val::Num(3.0))]).unwrap();
+        assert_eq!(i.outputs, ["logits", "rep.0", "rep.1"]);
+        assert_eq!(i.graph.outputs.len(), 3);
+    }
+
+    #[test]
     fn errors_name_the_node() {
         let mut s = spec();
         s.components["text"]["body"][0]["in"][0] = serde_json::json!("w:missing");
@@ -860,5 +935,35 @@ mod tests {
         assert!(c
             .get(&[("rows", Val::Num(1.0))], || Err("evicted".into()))
             .is_err());
+    }
+
+    /// `act_quant` (transformer lib, BitNet BitLinear) on the CPU graph: ties round half to even
+    /// like torch.round, -127 stays in [-128, 127], an all-zero row keeps its zeros (absmax clamps
+    /// at 1e-5 instead of dividing by zero).
+    #[test]
+    fn act_quant_rounds_half_to_even_and_clamps_like_torch() {
+        struct Qp;
+        impl Source for Qp {
+            fn tensor(&self, name: &str) -> Option<(Vec<usize>, DType)> {
+                (name == "act_quant.qp").then(|| (vec![1], DType::F32))
+            }
+        }
+        let spec = r#"{family: "aq", pipeline: "causal_lm", use_lib: ["transformer"], components: {t: {
+          vars: ["rows"], inputs: [{name: "x", dtype: "f32", shape: ["rows", 5]}],
+          body: [{use: "act_quant", args: {bits: 8}, in: ["i:x"], out: "y"}], outputs: ["y"]}}}"#;
+        let files: Vec<(String, String)> = crate::arch::EMBEDDED
+            .iter()
+            .filter(|(p, _)| p.starts_with("lib/"))
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .chain([("families/aq.json5".into(), spec.into())])
+            .collect();
+        let s = Registry::from_files(&files, &[]).unwrap().spec("aq", &Signals::default()).unwrap();
+        let inst = build(&s, "t", &Cfg, &Qp, &[("rows", Val::Num(2.0))]).unwrap();
+        let mut w = crate::graph::Weights::new();
+        w.insert("act_quant.qp", crate::graph::Tensor::F32(vec![127.0]));
+        let x = vec![127.0, 0.5, 2.5, -1.5, -127.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let out = crate::graph::cpu::run_stateless(&inst.graph, &w, vec![crate::graph::Tensor::F32(x)]).unwrap();
+        let crate::graph::Tensor::F32(y) = &out[0] else { panic!("dtype") };
+        assert_eq!(y, &[127.0, 0.0, 2.0, -2.0, -127.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     }
 }

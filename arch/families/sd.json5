@@ -1,0 +1,162 @@
+// Stable Diffusion 1.x / 2.x and LCM (diffusers `StableDiffusionPipeline` /
+// `LatentConsistencyModelPipeline`): CLIP text tower, the `UNet2DConditionModel` (`denoiser` on the
+// `unet/` subfolder; LDM single-file / GGUF names via `ldm`), discrete diffusers scheduler, 4-channel
+// AutoencoderKL. SDXL (`sdxl`) extends this spec. Topology comes from the tensors: down/up block
+// counts, resnets per block, which modules carry a spatial transformer / down- / upsampler.
+// SDXL's text_time `add_embedding` takes `[pooled, emb(H), emb(W), emb(0), emb(0), emb(H), emb(W)]`
+// (pixel sizes, 8x the latent `h`, `w`); LCM's `time_cond_proj` takes the guidance embedding of
+// (guidance - 1) * 1000. Source: `model/unet.rs`, `model/sd.rs`.
+{
+  family: "sd",
+  match: {
+    diffusers_class: ["StableDiffusionPipeline", "LatentConsistencyModelPipeline", "UNet2DConditionModel"],
+  },
+  pipeline: "diffusion",
+  use_lib: ["unet"],
+  config: {
+    mc: "shape('conv_in.weight')[0]",
+    in_ch: "shape('conv_in.weight')[1]",
+    nd: "count('down_blocks.{k}.resnets.0.conv1.weight')",
+    nu: "count('up_blocks.{k}.resnets.0.conv1.weight')",
+    lpb: "count('down_blocks.0.resnets.{k}.conv1.weight')",
+    ctx_dim: "first(cfg.cross_attention_dim, shape('mid_block.attentions.0.transformer_blocks.0.attn2.to_k.weight')[1])",
+    add_in: "has('add_embedding.linear_1.weight') ? shape('add_embedding.linear_1.weight')[1] : 0",
+    // Width of each of the 6 time-id embeddings: the config's `addition_time_embed_dim`; LDM
+    // checkpoints (no config) 256; a diffusers config without it feeds `pooled` as the whole input.
+    time_id_dim: "add_in == 0 ? 0 : first(cfg.addition_time_embed_dim, cfg.projection_class_embeddings_input_dim != null ? 0 : 256)",
+    pooled_dim: "add_in - 6 * time_id_dim",
+    cond_dim: "has('time_embedding.cond_proj.weight') ? shape('time_embedding.cond_proj.weight')[1] : 0",
+    // diffusers reads a scalar `num_attention_heads` / legacy `attention_head_dim` as a head count,
+    // a per-block list as heads over `block_out_channels` (fixed head width); LDM checkpoints: SD 1.x
+    // (768-wide context) 8 heads, SD 2.x / SDXL 64-wide heads.
+    heads_cfg: "first(cfg.num_attention_heads, cfg.attention_head_dim)",
+    head_count: "at(heads_cfg, 0) != null ? 0 : first(heads_cfg, ctx_dim == 768 ? 8 : 0)",
+    head_dim: "head_count > 0 ? 0 : at(heads_cfg, 0) != null ? cfg.block_out_channels[0] // at(heads_cfg, 0) : 64",
+    downscale: "2 ** (nd - 1)",
+  },
+  // Checks read the UNet's tensors: the pipeline root (repo dir, no tensors) skips them.
+  checks: [
+    {expr: "has('conv_in.weight') && in_ch != 4", error: "UNet takes {in_ch} input channels: an inpainting / instruct-pix2pix UNet (needs a mask or image latents), not text-to-image"},
+    {expr: "has('conv_in.weight') && (nd == 0 || nu != nd)", error: "UNet has {nd} down blocks and {nu} up blocks"},
+    {expr: "has('conv_in.weight') && count('up_blocks.0.resnets.{k}.conv1.weight') != lpb + 1", error: "UNet up blocks do not have layers_per_block + 1 = {lpb + 1} resnets"},
+    {expr: "has('conv_in.weight') && !has('mid_block.resnets.1.conv1.weight')", error: "UNet has no mid block"},
+    {expr: "has('conv_in.weight') && pooled_dim < 0", error: "UNet add_embedding input {add_in} is smaller than 6 x {time_id_dim} time ids"},
+  ],
+  names: {use: ["ldm"]},
+  transforms: [
+    // SD 1.x / 2.0 spatial transformers project with 1x1 convs.
+    {tensor: "{s:*}.proj_{io:*}.weight", op: "conv_to_linear", when: "len(shape(fmt('{s}.proj_{io}.weight'))) == 4"},
+  ],
+  components: {
+    text_encoder: {family: "clip_text", dir: "text_encoder"},
+    unet: {family: "sd", dir: "unet"},
+    vae: {family: "sd_vae", dir: "vae"},
+    // Model prediction (eps or v) for latents x [in_ch, h, w] at the step's `timestep`, context
+    // [nt, ctx_dim]; SDXL `pooled` [1, pooled_dim] (+ time ids), LCM guidance embedding.
+    denoiser: {
+      vars: ["h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["in_ch", "h", "w"]},
+        {name: "context", dtype: "f32", shape: ["nt", "ctx_dim"]},
+        {name: "t_emb", dtype: "f32", shape: [1, "mc"], gen: "timestep_embedding", args: {t: "step:timestep", dim: "mc",
+          flip_sin_to_cos: "first(cfg.flip_sin_to_cos, true)", downscale_freq_shift: "first(cfg.freq_shift, 0)", precision: "f32"}},
+        {name: "pooled", dtype: "f32", shape: [1, "pooled_dim"], when: "add_in > 0"},
+        {name: "add_time", dtype: "f32", shape: [1, "6 * time_id_dim"], when: "time_id_dim > 0", gen: "timestep_embedding",
+         args: {t: ["8 * h", "8 * w", 0, 0, "8 * h", "8 * w"], dim: "time_id_dim",
+          flip_sin_to_cos: "first(cfg.flip_sin_to_cos, true)", downscale_freq_shift: "first(cfg.freq_shift, 0)", precision: "f32"}},
+        {name: "t_cond", dtype: "f32", shape: [1, "cond_dim"], when: "cond_dim > 0", gen: "timestep_embedding",
+         args: {t: "step:(guidance - 1) * 1000", dim: "cond_dim", flip_sin_to_cos: false, downscale_freq_shift: 1, precision: "f32"}},
+      ],
+      body: [
+        // Time embedding (+ LCM guidance), + SDXL added conditioning; SiLU once for every resnet.
+        {block: [
+          {op: "Linear", in: ["i:t_cond", "w:time_embedding.cond_proj.weight", "w?:time_embedding.cond_proj.bias"], out: "tc", name: "cond_proj"},
+          {op: "Binary", args: {kind: "Add"}, in: ["i:t_emb", "tc"], out: "tc", name: "add_cond"},
+          {op: "Linear", in: ["tc", "w:time_embedding.linear_1.weight", "w?:time_embedding.linear_1.bias"], out: "e", name: "time_linear_1"},
+        ], when: "cond_dim > 0"},
+        {op: "Linear", in: ["i:t_emb", "w:time_embedding.linear_1.weight", "w?:time_embedding.linear_1.bias"], out: "e", name: "time_linear_1",
+         when: "cond_dim == 0"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["e"], out: "e", name: "time_act"},
+        {op: "Linear", in: ["e", "w:time_embedding.linear_2.weight", "w?:time_embedding.linear_2.bias"], out: "emb", name: "time_linear_2"},
+        {block: [
+          {op: "Concat", args: {axis: -1}, in: ["i:pooled", "i:add_time"], out: "a", name: "add_cat"},
+          {op: "Linear", in: ["a", "w:add_embedding.linear_1.weight", "w?:add_embedding.linear_1.bias"], out: "a", name: "add_linear_1"},
+        ], when: "time_id_dim > 0"},
+        {op: "Linear", in: ["i:pooled", "w:add_embedding.linear_1.weight", "w?:add_embedding.linear_1.bias"], out: "a", name: "add_linear_1",
+         when: "add_in > 0 && time_id_dim == 0"},
+        {block: [
+          {op: "Unary", args: {kind: "Silu"}, in: ["a"], out: "a", name: "add_act"},
+          {op: "Linear", in: ["a", "w:add_embedding.linear_2.weight", "w?:add_embedding.linear_2.bias"], out: "a", name: "add_linear_2"},
+          {op: "Binary", args: {kind: "Add"}, in: ["emb", "a"], out: "emb", name: "add_emb"},
+        ], when: "add_in > 0"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["emb"], out: "emb", name: "emb_act"},
+
+        // Down path. Every module output is a skip, numbered in push order: conv_in 0, block i
+        // module j at 1 + i * (lpb + 1) + j (the downsampler is module lpb), so each module reads
+        // the previous number.
+        {use: "conv2d", args: {w: "'conv_in'"}, in: ["i:x"], out: "skip0", name: "conv_in"},
+        {repeat: "i", count: "nd", body: [
+          {repeat: "j", count: "lpb", body: [
+            {let: {pos: "1 + i * (lpb + 1) + j"}},
+            {use: "res_attn", args: {p: "fmt('down_blocks.{i}')", j: "j"}, in: ["skip{pos - 1}", "emb", "i:context"],
+             out: "skip{pos}", name: "down{i}.{j}"},
+          ]},
+          {use: "conv2d", args: {w: "fmt('down_blocks.{i}.downsamplers.0.conv')", stride: 2},
+           in: ["skip{(i + 1) * (lpb + 1) - 1}"], out: "skip{(i + 1) * (lpb + 1)}", name: "down{i}.downsample",
+           when: "has(fmt('down_blocks.{i}.downsamplers.0.conv.weight'))"},
+        ]},
+
+        {let: {top: "nd * (lpb + 1) - 1"}},
+        {use: "resnet2d", args: {p: "'mid_block.resnets.0'"}, in: ["skip{top}", "emb"], out: "x", name: "mid.res0"},
+        {use: "spatial_transformer", args: {p: "'mid_block.attentions.0'"}, in: ["x", "i:context"], out: "x", name: "mid.attn",
+         when: "has('mid_block.attentions.0.proj_in.weight')"},
+        {use: "resnet2d", args: {p: "'mid_block.resnets.1'"}, in: ["x", "emb"], out: "x", name: "mid.res1"},
+
+        // Up path: every resnet takes [x; skip] (channels), skips popped in reverse push order.
+        {repeat: "i", count: "nu", body: [
+          {repeat: "j", count: "lpb + 1", body: [
+            {op: "Concat", args: {axis: 0}, in: ["x", "skip{top - i * (lpb + 1) - j}"], out: "x", name: "up{i}.cat{j}"},
+            {use: "res_attn", args: {p: "fmt('up_blocks.{i}')", j: "j"}, in: ["x", "emb", "i:context"], out: "x", name: "up{i}.{j}"},
+          ]},
+          {block: [
+            {op: "Upsample", args: {scale: 2, mode: "Nearest"}, in: ["x"], out: "x", name: "up{i}.upsample"},
+            {use: "conv2d", args: {w: "fmt('up_blocks.{i}.upsamplers.0.conv')"}, in: ["x"], out: "x", name: "up{i}.upsample_conv"},
+          ], when: "has(fmt('up_blocks.{i}.upsamplers.0.conv.weight'))"},
+        ]},
+
+        {use: "group_norm", args: {w: "'conv_norm_out'", eps: 1e-5}, in: ["x"], out: "x", name: "norm_out"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["x"], out: "x", name: "act_out"},
+        {use: "conv2d", args: {w: "'conv_out'"}, in: ["x"], out: "out", name: "conv_out"},
+      ],
+      outputs: ["out"],
+    },
+  },
+  runtime: {
+    text_encoders: [
+      // The CLIP BPE is the shared openai vocabulary; the pad token comes from the tokenizer dir
+      // (SD 2.x OpenCLIP pads with "!", SD 1.x with EOS).
+      {name: "clip", component: "text_encoder", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
+       tokenizer_config: "tokenizer", pad_token: "config",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
+       outputs: {hidden: "hidden"}},
+    ],
+    context: [{features: ["clip.hidden"]}],
+    pooled: [],
+    negative: {default: "", zeros_for_empty: "first(json.model_index.force_zeros_for_empty_prompt, false)"},
+    denoiser: {component: "unet", net: "denoiser"},
+    scheduler: {kind: "discrete"},
+    timestep: "t",
+    // LCM's guidance is embedded (time_cond_proj): no CFG.
+    guidance: {kind: "cfg", gate: "guidance > 1 && denoiser.cond_dim == 0", scale: "guidance"},
+    latent: {channels: "denoiser.in_ch", factor: 8, pack: "none", noise_scale: "init_sigma"},
+    vae: {component: "vae", decode: "decoder", encode: "encoder",
+          decode_affine: {mul: "1 / first(vae.cfg.scaling_factor, 0.18215)", add: 0},
+          output: "clamp_pm1"},
+    defaults: {width: "8 * first(denoiser.cfg.sample_size, 64)", height: "8 * first(denoiser.cfg.sample_size, 64)",
+               // LCM: embedded guidance (time_cond_proj) or the LCM scheduler.
+               steps: "(denoiser.cond_dim > 0 || json.scheduler_config._class_name == 'LCMScheduler') ? 4 : 25",
+               guidance: "(denoiser.cond_dim > 0 || json.scheduler_config._class_name == 'LCMScheduler') ? 8.5 : 7.5",
+               multiple: "8 * denoiser.downscale", max_side: 2048, max_steps: 100},
+    summary: "fmt('{json.model_index._class_name} (CLIP, UNet + VAE), {json.scheduler_config._class_name}')",
+  },
+}

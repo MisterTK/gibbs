@@ -9,7 +9,7 @@
 //! GGUF blocks) and are decoded per GEMM panel, as for FLUX.
 
 use crate::model::dit::{add_gated, read_config, rms_norm, timestep_features};
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::flux::{Lin, Loras, Store};
 use crate::model::hub::{component_weights, HuggingFaceHub, ModelArtifacts};
 use crate::model::image::ImageBuffer;
@@ -17,8 +17,8 @@ use crate::model::nn;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
 use crate::model::qwen_vae::QwenVae;
-use crate::model::sd::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::sched::Rng;
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -500,7 +500,7 @@ impl Dit {
         let patches = self.patchify(lat, h, w);
         let mut t = self
             .tmlp0
-            .fwd(&timestep_features(flow::timestep(sigma), self.tdim), 1);
+            .fwd(&timestep_features(sched::timestep(sigma), self.tdim), 1);
         nn::gelu_tanh(&mut t);
         let t = self.tmlp2.fwd(&t, 1);
         let mut tg = t.clone();
@@ -782,9 +782,9 @@ impl ImageGenerator for Krea2Pipeline {
         let mu = if self.distilled {
             1.15
         } else {
-            flow::calculate_shift((h / 2) * (w / 2), 256.0, 6400.0, 0.5, 1.15)
+            sched::calculate_shift((h / 2) * (w / 2), 256.0, 6400.0, 0.5, 1.15)
         };
-        let sigmas = flow::dynamic_sigmas(&flow::linspace_sigmas(steps), mu);
+        let sigmas = sched::dynamic_sigmas(&sched::linspace_sigmas(steps), mu);
         let mut rng = Rng::new(req.seed);
         let mut x: Vec<f32> = (0..self.dit.chan * h * w).map(|_| rng.gaussian()).collect();
         for i in 0..steps {
@@ -796,7 +796,7 @@ impl ImageGenerator for Krea2Pipeline {
                     .zip(&vu)
                     .for_each(|(v, u)| *v += guidance * (*v - u));
             }
-            flow::euler_step(&mut x, &v, sigmas[i], sigmas[i + 1]);
+            sched::euler_step(&mut x, &v, sigmas[i], sigmas[i + 1]);
             tracing::info!(
                 "Krea 2 step {}/{steps} (sigma {:.4}): {:.1}s",
                 i + 1,

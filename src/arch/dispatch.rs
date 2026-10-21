@@ -7,12 +7,13 @@ use super::Pipeline;
 use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
-use crate::model::jev::JevSystem1Model;
-use crate::model::text_to_image::{load_image_model, ImageGenerator};
+use crate::runtime::encoder::system1::JevSystem1Model;
+use crate::model::text_to_image::load_image_model;
 use crate::model::weight_format::{
     load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
     ReencodePolicy,
 };
+use crate::runtime::diffusion::{Extras, ImageGenerator, SpecDiffusion};
 use crate::scheduler::ExecutableModel;
 use serde_json::{json, Map, Value as J};
 use std::collections::HashSet;
@@ -28,7 +29,8 @@ pub enum Loaded {
     Classifier(SequenceClassifier),
     System1(JevSystem1Model),
     Image(Arc<dyn ImageGenerator>),
-    Video(crate::model::t2v::Video),
+    /// A text-to-video plan, loaded per generation ([`crate::model::video_repo::load`]).
+    Video(crate::model::video_repo::Plan),
 }
 
 pub struct LoadOpts<'a> {
@@ -36,7 +38,7 @@ pub struct LoadOpts<'a> {
     pub token: Option<&'a str>,
     /// `--quant` as the GraphLm loader reads it (legacy: until Phase 4).
     pub quant: Option<QuantMode>,
-    /// `--quant` verbatim: the GGUF pick of a video repo (legacy: until Phase 10).
+    /// `--quant` verbatim: the GGUF pick of a video repo.
     pub quant_name: Option<&'a str>,
     pub hw: &'a HardwareCapability,
     /// The re-encode configuration every loader runs under.
@@ -48,17 +50,31 @@ pub struct LoadOpts<'a> {
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
     /// adapter (merged into a snapshot of its base): an error refuses the load.
     pub admit: &'a dyn Fn(bool) -> Result<(), String>,
-    /// The CLI's legacy routes (legacy: until Phases 7 and 10): System 1 encoders are detected
-    /// before classifiers and run on Metal wherever it exists, and ModelScope text-to-video repos
-    /// route to video. The TUI tries classifiers first, keeps System 1 on its own backend and
-    /// takes ModelScope repos down the LM path as before.
-    pub cli_routes: bool,
+    /// The CLI's order: System 1 encoders are detected before
+    /// classifiers and run on Metal wherever it exists; the TUI tries classifiers first and keeps
+    /// System 1 on its own backend.
+    pub system1_first: bool,
 }
 
 /// `GIBBS_SPEC_LM=1`: causal LMs a family spec claims load through [`crate::runtime::lm`]
-/// instead of GraphLm.
+/// instead of their legacy loader (GraphLm, the native loaders).
 pub fn spec_lm_enabled() -> bool {
     std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1")
+}
+
+/// `model_type` is a causal-LM family's own match (not a fallback) whose spec sets
+/// `runtime.cutover` ([`lm`] runs it by default): the hub picker treats it like the native
+/// loaders' types.
+pub fn runs_spec_lm(model_type: &str) -> bool {
+    super::registry().is_ok_and(|r| {
+        r.matchers().iter().any(|(f, m, p)| {
+            *p == Pipeline::CausalLm
+                && !m.fallback
+                && m.hf_model_type.iter().any(|g| super::glob(g, model_type))
+                && r.merged(f, &Default::default())
+                    .is_ok_and(|j| j["runtime"]["cutover"] == J::Bool(true))
+        })
+    })
 }
 
 fn device(p: PlacementMode) -> Device {
@@ -72,12 +88,12 @@ fn device(p: PlacementMode) -> Device {
 pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded, String> {
     (o.stage)("resolving");
     if o.family.is_none() {
-        // legacy: until Phase 7 (encoder specs)
+        // Encoders: System 1 and sequence classifiers run their family specs (`runtime::encoder`).
         let system1 = || {
             let dev = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.
                 Device::Cpu
-                    if o.cli_routes
+                    if o.system1_first
                         && crate::hardware::available_devices().contains(&Device::Metal) =>
                 {
                     Device::Metal
@@ -86,17 +102,16 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             };
             JevSystem1Model::load(hub, id, dev).map(Loaded::System1)
         };
-        if o.cli_routes && crate::model::jev::detect(hub, id) {
+        if o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
         if classifier::detect(hub, id).is_some() {
             return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
         }
-        if !o.cli_routes && crate::model::jev::detect(hub, id) {
+        if !o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
-        // legacy: until Phase 10 (video specs)
-        if let Some(v) = crate::model::t2v::detect(hub, id, o.quant_name, o.cli_routes) {
+        if let Some(v) = crate::model::video_repo::detect(hub, id, o.quant_name) {
             return v.map(Loaded::Video);
         }
     }
@@ -110,10 +125,20 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
     (o.admit)(adapter)?;
     let artifacts = hub.auto_download_and_cache(id, o.token)?;
     (o.stage)("reading weights, choosing weight format");
-    // legacy: until Phase 9 (diffusion specs). Image repos are recognised by their files.
-    if o.family.is_none() {
-        if let Some(img) = load_image_model(&artifacts, hub) {
-            return img.map(Loaded::Image);
+    // Image repos are recognised by their files; `--arch` of a diffusion family loads as that one.
+    match o.family {
+        Some(f) if super::registry()?.spec(f, &Default::default()).is_ok_and(|s| s.pipeline == Pipeline::Diffusion) => {
+            let p = SpecDiffusion::load(&artifacts, hub, o.placement, Some(f), &Extras::default())?;
+            return Ok(Loaded::Image(Arc::new(p)));
+        }
+        Some(_) => {}
+        None => {
+            // legacy: until the remaining image families' phases (`load_image_model`).
+            let img = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement)
+                .or_else(|| load_image_model(&artifacts, hub));
+            if let Some(img) = img {
+                return img.map(Loaded::Image);
+            }
         }
     }
     let (model, choice) = load_lm(&artifacts, o)?;
@@ -141,26 +166,43 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         let m = crate::runtime::lm::load(a, super::registry()?, family, o.placement)?;
         Ok((ExecutableModel::Native(m), None))
     };
-    if o.family.is_some() {
-        return spec(o.family);
-    }
-    // legacy: until Phases 5, 6 and 8 (the native loaders' families)
-    if let Some(m) = crate::model::native::load_native(a, o.placement) {
-        return Ok((ExecutableModel::Native(m?), None));
-    }
-    // Checkpoints the arch reader cannot open, and registry errors, leave the GraphLm path as
-    // it was (a spec problem fails only spec loads).
+    // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
+    // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
-        let f = reg.detect(&ck.sig)?;
-        let p = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?.pipeline;
-        Some((f, p))
+        let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
+        let s = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?;
+        Some((f, s.pipeline, s.matcher.fallback, s.runtime["cutover"] == J::Bool(true)))
     });
-    match family {
-        Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
-        Some((f, Pipeline::CausalLm)) if spec_lm_enabled() => return spec(Some(&f)),
-        _ => {}
+    if let Some((f, Pipeline::Encdec, ..)) = &family {
+        let m = crate::runtime::encdec::load(a, super::registry()?, Some(f), o.placement)?;
+        return Ok((ExecutableModel::Native(m), None));
+    }
+    if o.family.is_some() {
+        return spec(o.family);
+    }
+    let lm_family = match &family {
+        Some((f, Pipeline::Unsupported, ..)) => return spec(Some(f)),
+        Some((f, Pipeline::CausalLm, fallback, cut)) => Some((f.as_str(), *fallback, *cut)),
+        _ => None,
+    };
+    // `runtime.cutover` families (legacy loader deleted) load by default; with GIBBS_SPEC_LM=1
+    // any family's own match does. A fallback match (any causal LM) never pre-empts a legacy
+    // loader.
+    if let Some((f, fallback, cut)) = lm_family {
+        if cut || (spec_lm_enabled() && !fallback) {
+            return spec(Some(f));
+        }
+    }
+    // legacy: until Phase 6 (the native loaders' families)
+    if let Some(m) = crate::model::native::load_native(a, o.placement) {
+        return Ok((ExecutableModel::Native(m?), None));
+    }
+    if let Some((f, ..)) = lm_family {
+        if spec_lm_enabled() {
+            return spec(Some(f));
+        }
     }
     // legacy: until Phase 4 (GraphLm)
     let (lm, choice) = load_causal_lm_with(a, device(o.placement), o.quant, o.hw, &o.reencode)?;

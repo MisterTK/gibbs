@@ -124,6 +124,26 @@ pub trait Env {
     fn shape(&self, _tensor: &str) -> Option<Vec<usize>> {
         None
     }
+    /// Elements per stored quantization block of a source tensor (1 for plain floats).
+    fn block(&self, _tensor: &str) -> Option<usize> {
+        None
+    }
+    /// Whether any raw (pre-rename) checkpoint tensor name matches glob `pat`.
+    fn raw_has(&self, _pat: &str) -> bool {
+        false
+    }
+    /// Values of a small source tensor (canonical name), for `values(name)`.
+    fn values(&self, _tensor: &str) -> Option<Vec<f32>> {
+        None
+    }
+    /// Stored dtype of a source tensor (`f32`, `f16`, `bf16`, `u32`, `quant`), for `dtype(name)`.
+    fn dtype(&self, _tensor: &str) -> Option<&'static str> {
+        None
+    }
+    /// Vocabulary id of a token string, for `token(s)`.
+    fn token(&self, _s: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// Follows `path` (object keys / list indices) into `v`.
@@ -166,6 +186,21 @@ impl Env for Bind<'_> {
     }
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.parent.shape(t)
+    }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.parent.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.parent.raw_has(p)
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.parent.values(t)
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.parent.dtype(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.parent.token(s)
     }
 }
 
@@ -767,6 +802,11 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
             Some(s) => Val::List(s.into_iter().map(|d| Val::Num(d as f64)).collect()),
             None => Val::Null,
         },
+        "block" => match env.block(arg(0)?.str()?) {
+            Some(b) => Val::Num(b as f64),
+            None => Val::Null,
+        },
+        "raw_has" => Val::Bool(env.raw_has(arg(0)?.str()?)),
         "first_has" => {
             for x in &v {
                 if env.has(x.str()?) {
@@ -778,10 +818,33 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
         "fmt" => Val::Str(interp(arg(0)?.str()?, env)?),
         "str" => Val::Str(arg(0)?.to_string()),
         "int" => Val::Num(arg(0)?.num()?.trunc()),
+        // The value rounded to bf16 (round-to-nearest-even), e.g. a bf16 checkpoint's in-graph constant.
+        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(arg(0)?.num()? as f32)) as f64),
         "list" => {
             // list(n, x): n copies of x.
             let n = arg(0)?.usize()?;
             Val::List(vec![arg(1)?.clone(); n])
+        }
+        // values(name): the values of a small source tensor (null when absent).
+        "values" => match env.values(arg(0)?.str()?) {
+            Some(v) => Val::List(v.into_iter().map(|x| Val::Num(x as f64)).collect()),
+            None => Val::Null,
+        },
+        // dtype(name): the stored dtype of a source tensor (null when absent).
+        "dtype" => env.dtype(arg(0)?.str()?).map_or(Val::Null, |d| Val::Str(d.into())),
+        // token(s): the vocabulary id of token string `s` (null when absent).
+        "token" => env.token(arg(0)?.str()?).map_or(Val::Null, |t| Val::Num(t as f64)),
+        // bf16(x): x rounded to the nearest bfloat16 (through f32).
+        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(arg(0)?.num()? as f32)) as f64),
+        // rfind(list, x, end): the last index below `end` (default len) holding x, else -1.
+        "rfind" => {
+            let l = arg(0)?.list()?;
+            let end = match v.get(2) {
+                Some(e) => e.usize()?.min(l.len()),
+                None => l.len(),
+            };
+            let x = arg(1)?;
+            Val::Num(l[..end].iter().rposition(|y| eq(y, x)).map_or(-1.0, |i| i as f64))
         }
         _ => return Err(format!("unknown function `{f}`")),
     })
@@ -802,6 +865,12 @@ mod tests {
         }
         fn shape(&self, t: &str) -> Option<Vec<usize>> {
             self.has(t).then(|| vec![4, 8])
+        }
+        fn values(&self, t: &str) -> Option<Vec<f32>> {
+            (t == "x.w").then(|| vec![0.5, 1.0])
+        }
+        fn dtype(&self, t: &str) -> Option<&'static str> {
+            (t == "x.w").then_some("bf16")
         }
     }
     fn env() -> E {
@@ -856,10 +925,15 @@ mod tests {
         assert_eq!(ev("first_has('y.w', 'x.w')"), Val::Str("x.w".into()));
         assert_eq!(ev("fmt('l{n * 2}')"), Val::Str("l6".into()));
         assert_eq!(ev("sqrt(16) + ceil(1.2) + floor(1.8)"), Val::Num(7.0));
+        assert_eq!(ev("bf16(sqrt(3584))"), Val::Num(59.75));
         assert_eq!(
             ev("range(3)"),
             Val::List(vec![Val::Num(0.0), Val::Num(1.0), Val::Num(2.0)])
         );
+        assert_eq!(ev("at(values('x.w'), 1) + len(values('y.w'))"), Val::Num(1.0));
+        assert_eq!(ev("dtype('x.w') == 'bf16' && dtype('y.w') == null"), Val::Bool(true));
+        assert_eq!(ev("bf16(sqrt(1536))"), Val::Num(39.25));
+        assert_eq!(ev("rfind([1, 0, 1, 1, 0], 1, 3) + rfind([1, 0], 0) + rfind(cfg.layer_types, 'x')"), Val::Num(2.0));
     }
 
     #[test]

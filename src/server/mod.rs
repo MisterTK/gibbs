@@ -8,7 +8,7 @@ mod openai;
 mod responses;
 pub mod tools;
 
-use crate::model::jev::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
+use crate::runtime::encoder::system1::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
 use crate::scheduler::ContinuousBatchScheduler;
 use crate::telemetry::EngineTelemetry;
 use axum::{
@@ -27,9 +27,9 @@ use std::time::Instant;
 pub struct AppState {
     pub scheduler: Arc<ContinuousBatchScheduler>,
     pub telemetry: Arc<EngineTelemetry>,
-    pub jev_model: crate::model::jev::System1Slot,
+    pub jev_model: crate::runtime::encoder::system1::System1Slot,
     /// Active image model (shared with the TUI, hot-swapped by its picker).
-    pub image_model: crate::model::text_to_image::ImageSlot,
+    pub image_model: crate::runtime::diffusion::ImageSlot,
     /// Active sequence classifier (shared with the TUI); while set, text generation answers 400.
     pub classifier: crate::model::classifier::ClassifierSlot,
 }
@@ -470,7 +470,7 @@ fn parse_size(size_str: Option<&str>) -> Result<Option<(usize, usize)>, String> 
     }
 }
 
-type ImageModel = Arc<dyn crate::model::text_to_image::ImageGenerator>;
+type ImageModel = Arc<dyn crate::runtime::diffusion::ImageGenerator>;
 
 /// Validation shared by both image endpoints: returns (pipeline, n, base seed).
 fn image_request_common(
@@ -523,9 +523,9 @@ fn image_request(
     size: Option<&str>,
     steps: Option<usize>,
     guidance: Option<f32>,
-) -> Result<crate::model::text_to_image::ImageRequest, axum::response::Response> {
+) -> Result<crate::runtime::diffusion::ImageRequest, axum::response::Response> {
     let size = parse_size(size).map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
-    Ok(crate::model::text_to_image::ImageRequest {
+    Ok(crate::runtime::diffusion::ImageRequest {
         prompt,
         negative_prompt,
         width: size.map(|s| s.0),
@@ -596,7 +596,7 @@ async fn handle_image_generations(
         payload.guidance,
     )?;
     run_image_jobs(n, seed, move |s| {
-        let req = crate::model::text_to_image::ImageRequest {
+        let req = crate::runtime::diffusion::ImageRequest {
             seed: s,
             ..req.clone()
         };
@@ -663,7 +663,7 @@ async fn handle_image_edits(
     }
     req.steps = Some(steps);
     run_image_jobs(n, seed, move |s| {
-        let req = crate::model::text_to_image::ImageRequest {
+        let req = crate::runtime::diffusion::ImageRequest {
             seed: s,
             ..req.clone()
         };

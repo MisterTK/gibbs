@@ -183,7 +183,7 @@ impl Dit {
             Tensor::F32(self.patchify(lat, h, w)),
             Tensor::F32(ctx.to_vec()),
             Tensor::U32(dg::positions(&ids, [0, 1, 2])),
-            Tensor::F32(timestep_features(flow::timestep(sigma), self.tdim)),
+            Tensor::F32(timestep_features(sched::timestep(sigma), self.tdim)),
         ];
         let mut out = cache.run((n_img, n_txt), || self.build(n_img, n_txt), inputs)?;
         Ok(self.unpatchify(&out.remove(0), h, w))

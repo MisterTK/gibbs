@@ -153,47 +153,16 @@ pub trait NativeLm: Send + Sync {
 }
 
 /// `model_type`s [`load_native`] implements. The hub picker lets their repos load whatever their
-/// pipeline tag (`image-text-to-text`, `any-to-any`, ...).
-// legacy: until Phases 5 (qwen), 6 (gemma), 4 (idefics3) and 8 (t5) give these families specs.
-pub const NATIVE_MODEL_TYPES: &[&str] = &[
-    "qwen3_5",
-    "qwen3_5_text",
-    "qwen3_5_moe",
-    "qwen3_5_moe_text",
-    "qwen4_exp",
-    "qwen4_exp_text",
-    "qwen3_vl",
-    "gemma4",
-    "gemma4_unified",
-    "idefics3",
-    "smolvlm",
-    "qwen3",
-    "hunyuan_v1_dense",
-    "t5",
-    "mt5",
-    "umt5",
-];
+/// pipeline tag (`image-text-to-text`, `any-to-any`, ...), as it does for spec-run families
+/// ([`crate::arch::dispatch::runs_spec_lm`]).
+// legacy: until Phases 6 (gemma) and 4 (idefics3) give these families specs.
+pub const NATIVE_MODEL_TYPES: &[&str] = &["gemma4", "gemma4_unified", "idefics3", "smolvlm"];
 
-/// [`NATIVE_MODEL_TYPES`] whose loaders also read GGUF weights: llama.cpp `qwen3` /
-/// `hunyuan-dense` / `qwen35` / `qwen35moe` / `qwen4exp` files ([`crate::model::qwen3_5::load_gguf`]),
-/// `gemma4` files with their `mmproj` ([`crate::model::gemma4::load_gguf`]) and candle-style T5
-/// GGUFs ([`crate::model::t5::load`]). The hub picker refuses GGUF repos of the other types.
-// legacy: until Phases 5, 6 and 8 (the same families' specs).
-pub const NATIVE_GGUF_TYPES: &[&str] = &[
-    "gemma4",
-    "gemma4_unified",
-    "qwen3",
-    "qwen3_5",
-    "qwen3_5_text",
-    "qwen3_5_moe",
-    "qwen3_5_moe_text",
-    "qwen4_exp",
-    "qwen4_exp_text",
-    "hunyuan_v1_dense",
-    "t5",
-    "mt5",
-    "umt5",
-];
+/// [`NATIVE_MODEL_TYPES`] whose loaders also read GGUF weights: `gemma4` files with their
+/// `mmproj` ([`crate::model::gemma4::load_gguf`]). The hub picker refuses GGUF repos of the other
+/// types.
+// legacy: until Phase 6 (the same family's spec).
+pub const NATIVE_GGUF_TYPES: &[&str] = &["gemma4", "gemma4_unified"];
 
 /// Loads `artifacts` as a [`NativeLm`] when its `config.json` names an architecture implemented
 /// here; `None` sends it down the GraphLm path.
@@ -223,35 +192,16 @@ fn load_native_once(
     artifacts: &ModelArtifacts,
     mode: PlacementMode,
 ) -> Option<Result<Arc<dyn NativeLm>, String>> {
-    if let Some(r) = crate::model::qwen3_5::load_gguf(artifacts, mode)
-        .or_else(|| crate::model::qwen3_5::load_ninfer(artifacts, mode))
-    {
-        return Some(r);
-    }
     if let Some(r) = crate::model::gemma4::load_gguf(artifacts, mode) {
         return Some(r);
     }
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(artifacts.config_path.as_ref()?).ok()?).ok()?;
-    if crate::model::seq2seq::ARCHITECTURES
-        .contains(&cfg["architectures"][0].as_str().unwrap_or(""))
-    {
-        return Some(crate::model::seq2seq::load(artifacts, &cfg, mode));
-    }
-    // google/umt5-* configs name only the architecture.
-    match cfg["model_type"]
-        .as_str()
-        .or(cfg["architectures"][0].as_str())?
-    {
-        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen4_exp"
-        | "qwen4_exp_text" | "qwen3_vl" => Some(crate::model::qwen3_5::load(artifacts, &cfg, mode)),
-        "qwen3" | "hunyuan_v1_dense" => {
-            Some(crate::model::qwen3_5::load_dense(artifacts, &cfg, mode))
-        }
+    match cfg["model_type"].as_str()? {
         "gemma4" | "gemma4_unified" => Some(crate::model::gemma4::load(artifacts, &cfg, mode)),
-        "idefics3" | "smolvlm" => Some(crate::model::idefics3::load(artifacts, &cfg, mode)),
-        "t5" | "mt5" | "umt5" | "UMT5ForConditionalGeneration" => {
-            Some(crate::model::t5::load(artifacts, &cfg, mode))
+        // `GIBBS_SPEC_LM=1`: the `idefics3` spec (`runtime::lm::SpecLm` + media) instead.
+        "idefics3" | "smolvlm" if !crate::arch::dispatch::spec_lm_enabled() => {
+            Some(crate::model::idefics3::load(artifacts, &cfg, mode))
         }
         t => crate::arch::unsupported(t).map(|why| Err(format!("{t}: {why}"))),
     }

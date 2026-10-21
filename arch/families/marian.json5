@@ -1,0 +1,8 @@
+// Marian / opus-mt (`modeling_marian.py`): BART layout, post-LN, no `layernorm_embedding`,
+// sinusoid positions from 0 (`[sin | cos]`, angle p / 10000^(2i/d)).
+{
+  family: "marian",
+  extends: "bart",
+  match: {hf_model_type: ["marian"], hf_architectures: ["MarianMTModel"]},
+  config: {pre_ln: "false", pos_kind: "'standard'", pos_start: "0"},
+}

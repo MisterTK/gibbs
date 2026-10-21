@@ -1,0 +1,90 @@
+// CLIP text tower (HF `CLIPTextModel` / `CLIPTextModelWithProjection`; OpenCLIP towers via the
+// `openclip` names): OpenAI CLIP (quick_gelu) and OpenCLIP (gelu), causal self-attention with
+// 64-wide heads, final LayerNorm, pooled = final-normed row `last_index` (the EOS) through the
+// optional `text_projection`. Source: `model/clip.rs`. A text-encoder component of diffusion specs.
+{
+  family: "clip_text",
+  match: {
+    hf_model_type: ["clip_text_model"],
+    hf_architectures: ["CLIPTextModel", "CLIPTextModelWithProjection"],
+  },
+  pipeline: "encoder",
+  use_lib: ["transformer"],
+  config: {
+    hidden: "shape('text_model.embeddings.token_embedding.weight')[1]",
+    layers: "count('text_model.encoder.layers.{k}.layer_norm1.weight')",
+    heads: "hidden // 64",
+    kv_heads: "heads",
+    eps: "first(cfg.layer_norm_eps, 1e-5)",
+    // OpenCLIP checkpoints carry no config: gelu.
+    act: "first(cfg.hidden_act, 'gelu')",
+  },
+  checks: [
+    {expr: "layers == 0", error: "no CLIP encoder layers (text_model.encoder.layers.*)"},
+    {expr: "hidden % 64 != 0", error: "CLIP width {hidden} is not a multiple of head_dim 64"},
+    {expr: "act != 'gelu' && act != 'quick_gelu'", error: "unsupported CLIP hidden_act `{act}`"},
+  ],
+  names: {use: ["openclip"]},
+  transforms: [
+    // OpenCLIP (fused in_proj present): [d, proj] -> [proj, d]. Before the split, which keeps it.
+    {tensor: "text_projection.weight", op: "transpose",
+     when: "has('text_model.encoder.layers.0.self_attn.in_proj.weight')"},
+    {tensor: "text_model.encoder.layers.{i}.self_attn.in_proj.weight", op: "split_rows", args: {parts: [
+      ["text_model.encoder.layers.{i}.self_attn.q_proj.weight", "hidden"],
+      ["text_model.encoder.layers.{i}.self_attn.k_proj.weight", "hidden"],
+      ["text_model.encoder.layers.{i}.self_attn.v_proj.weight", "hidden"]]}},
+    {tensor: "text_model.encoder.layers.{i}.self_attn.in_proj.bias", op: "split_rows", args: {parts: [
+      ["text_model.encoder.layers.{i}.self_attn.q_proj.bias", "hidden"],
+      ["text_model.encoder.layers.{i}.self_attn.k_proj.bias", "hidden"],
+      ["text_model.encoder.layers.{i}.self_attn.v_proj.bias", "hidden"]]}},
+  ],
+  // Buffers, not weights: HF position ids, OpenCLIP's contrastive temperature and causal mask.
+  ignore: ["text_model.embeddings.position_ids", "logit_scale", "attn_mask"],
+  macros: {
+    // Encoder layer `i`: pre-LN causal self-attention, pre-LN MLP (fc1, act, fc2).
+    clip_layer: {params: ["x"], body: [
+      {let: {p: "fmt('text_model.encoder.layers.{i}')"}},
+      {use: "layer_norm", args: {w: "fmt('{p}.layer_norm1')"}, in: ["x"], out: "h", name: "ln1"},
+      {use: "attn_full", args: {wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
+         wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.out_proj')", causal: true}, in: ["h"], out: "a", name: "attn"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "res1"},
+      {use: "layer_norm", args: {w: "fmt('{p}.layer_norm2')"}, in: ["x"], out: "h", name: "ln2"},
+      {op: "Linear", in: ["h", "w:{p}.mlp.fc1.weight", "w?:{p}.mlp.fc1.bias"], out: "m", name: "fc1"},
+      {op: "Unary", args: {kind: "GeluErf"}, in: ["m"], out: "m", name: "gelu", when: "act == 'gelu'"},
+      // quick_gelu: x * sigmoid(1.702 x).
+      {block: [
+        {op: "Unary", args: {kind: {Scale: 1.702}}, in: ["m"], out: "s", name: "qg_scale"},
+        {op: "Unary", args: {kind: "Sigmoid"}, in: ["s"], out: "s", name: "qg_sigmoid"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["m", "s"], out: "m", name: "qg_mul"},
+      ], when: "act == 'quick_gelu'"},
+      {op: "Linear", in: ["m", "w:{p}.mlp.fc2.weight", "w?:{p}.mlp.fc2.bias"], out: "f", name: "fc2"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "f"], out: "out", name: "res2"},
+    ]},
+  },
+  components: {
+    // Outputs: `hidden` (final-normed last layer), `penult` (input of the last layer, no final
+    // norm), `pooled` ([1, d] or [1, proj]).
+    text: {
+      vars: ["rows"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "last_index", dtype: "u32", shape: [1]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:text_model.embeddings.token_embedding.weight", "i:token_ids"], out: "x", name: "tok_embed"},
+        {op: "Embedding", in: ["w:text_model.embeddings.position_embedding.weight", "i:positions"], out: "pe", name: "pos_embed"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "embed"},
+        {repeat: "i", count: "layers - 1", body: [
+          {use: "clip_layer", args: {i: "i"}, in: ["x"], out: "x", name: "l{i}"},
+        ]},
+        {use: "clip_layer", args: {i: "layers - 1"}, in: ["x"], out: "y", name: "l{layers - 1}"},
+        {use: "layer_norm", args: {w: "'text_model.final_layer_norm'"}, in: ["y"], out: "hidden", name: "final_norm"},
+        {op: "Gather", args: {axis: 0}, in: ["hidden", "i:last_index"], out: "pooled", name: "pool"},
+        {op: "Linear", in: ["pooled", "w:text_projection.weight"], out: "pooled", name: "text_projection",
+         when: "has('text_projection.weight')"},
+      ],
+      outputs: ["hidden", {name: "penult", value: "x"}, "pooled"],
+    },
+  },
+}

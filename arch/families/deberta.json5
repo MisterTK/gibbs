@@ -1,0 +1,150 @@
+// DeBERTa v1 (`DebertaModel`) and v2/v3 (`DebertaV2Model`): word (+ v1 absolute position)
+// embeddings + LayerNorm, post-LN layers whose attention adds content->position (c2p) and
+// position->content (p2c) terms over (v2: log-bucketed) relative positions:
+// scores = (q·k + q·pos_k[r(i,j)] + k_j·pos_q[r(i,j)]) / sqrt(3 * head_dim).
+// v1 `in_proj` holds per-head interleaved q/k/v rows and `q_bias`/`v_bias`; they load as the v2
+// `query_proj`/`key_proj`/`value_proj` names. `precompute` projects the (v2 `norm_rel_ebd`:
+// LayerNorm'd) relative embeddings once per layer (v1: `pos_q_proj`/`pos_proj`; v2: the shared
+// query/key layers), pre-scaled, as `deberta.encoder.layer.{i}.pos_{q,k}` [heads, 2*span, head_dim].
+// Classification (ContextPooler): token 0 -> `pooler.dense` -> GELU -> `classifier`.
+{
+  family: "deberta",
+  match: {hf_architectures: ["DebertaForSequenceClassification", "DebertaV2ForSequenceClassification", "DebertaModel", "DebertaV2Model"]},
+  pipeline: "encoder",
+  use_lib: ["transformer"],
+  names: {rules: [
+    ["{pre:*}layer.{i}.attention.self.q_bias", "deberta.encoder.layer.{i}.attention.self.query_proj.bias"],
+    ["{pre:*}layer.{i}.attention.self.v_bias", "deberta.encoder.layer.{i}.attention.self.value_proj.bias"],
+    // Bare `DebertaModel` / `DebertaV2Model` checkpoints.
+    ["embeddings.{r:*}", "deberta.embeddings.{r}"], ["encoder.{r:*}", "deberta.encoder.{r}"],
+  ]},
+  config: {
+    hidden: "cfg.hidden_size",
+    layers: "cfg.num_hidden_layers",
+    heads: "cfg.num_attention_heads",
+    kv_heads: "heads",
+    head_dim: "hidden // heads",
+    eps: "first(cfg.layer_norm_eps, 1e-7)",
+    max_position_embeddings: "cfg.max_position_embeddings",
+    labels: "shape('classifier.weight')[0]",
+    v1: "has('deberta.encoder.layer.0.attention.self.in_proj.weight')",
+    biased: "first(cfg.position_biased_input, true)",
+    max_rel: "first(cfg.max_relative_positions, -1) < 1 ? max_position_embeddings : cfg.max_relative_positions",
+    buckets: "max(first(cfg.position_buckets, -1), 0)",
+    // Relative positions clamp to [-span, span).
+    span: "buckets > 0 ? buckets : max_rel",
+    norm_rel: "contains(first(cfg.norm_rel_ebd, 'none'), 'layer_norm')",
+    rel_scale: "1 / sqrt(3 * head_dim)",
+    pos_att: "first(cfg.pos_att_type, '')",
+  },
+  checks: [
+    {expr: "first(cfg.relative_attention, false) != true || !contains(pos_att, 'c2p') || !contains(pos_att, 'p2c') || contains(pos_att, 'p2p')",
+     error: "only DeBERTa relative attention over c2p + p2c is supported"},
+    {expr: "!v1 && (first(cfg.share_att_key, false) != true || biased)", error: "DeBERTa v2/v3 needs share_att_key and no absolute positions"},
+    {expr: "first(cfg.talking_head, false) == true", error: "talking heads are not supported"},
+    {expr: "first(cfg.z_steps, 0) > 1", error: "z_steps > 1 is not supported"},
+    {expr: "first(cfg.conv_kernel_size, 0) != 0", error: "the convolution layer is not supported"},
+    {expr: "first(cfg.type_vocab_size, 0) != 0", error: "token type embeddings are not supported"},
+    {expr: "first(cfg.embedding_size, hidden) != hidden", error: "an embedding projection is not supported"},
+    {expr: "first(cfg.hidden_act, 'gelu') != 'gelu'", error: "hidden_act {cfg.hidden_act} is not supported"},
+    {expr: "first(cfg.pooler_hidden_act, 'gelu') != 'gelu'", error: "pooler_hidden_act {cfg.pooler_hidden_act} is not supported"},
+    {expr: "hidden % heads != 0", error: "hidden size {hidden} is not a multiple of {heads} heads"},
+    {expr: "shape('deberta.encoder.rel_embeddings.weight')[0] != 2 * span", error: "rel_embeddings must have 2 * {span} rows"},
+  ],
+  transforms: [
+    // transpose_for_scores(in_proj(x)).chunk(3): head h's rows are its q, k, v.
+    {tensor: "deberta.encoder.layer.{i}.attention.self.in_proj.weight", op: "deinterleave_heads", args: {heads: "heads", parts: [
+      ["deberta.encoder.layer.{i}.attention.self.query_proj.weight", "head_dim"],
+      ["deberta.encoder.layer.{i}.attention.self.key_proj.weight", "head_dim"],
+      ["deberta.encoder.layer.{i}.attention.self.value_proj.weight", "head_dim"],
+    ]}},
+  ],
+  // Saved buffers of older exports.
+  ignore: ["*.position_ids"],
+  macros: {
+    // [rows, heads*head_dim] -> [heads, rows, head_dim].
+    split_heads: {params: ["x"], body: [
+      {op: "Reshape", args: {shape: ["shape('x')[0]", "heads", "head_dim"]}, in: ["x"], out: "r", name: "rows"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["r"], out: "out", name: "t"},
+    ]},
+    // Projection `{w}` of `rel` ([2*span, hidden]) scaled by rel_scale, per head.
+    rel_proj: {params: ["rel"], body: [
+      {op: "Linear", in: ["rel", "w:{w}.weight", "w?:{w}.bias"], out: "y", name: "linear"},
+      {op: "Unary", args: {kind: {Scale: "rel_scale"}}, in: ["y"], out: "y", name: "scale"},
+      {use: "split_heads", in: ["y"], out: "out", name: "heads"},
+    ]},
+    // side [heads, n, head_dim] · pos [heads, 2*span, head_dim]ᵀ, gathered by the flat
+    // `log_bucket_rel_index` table idx -> [heads, n, n].
+    rel_term: {params: ["side", "pos", "idx"], body: [
+      {op: "MatMul", args: {transpose_a: false, transpose_b: true}, in: ["side", "pos"], out: "s", name: "scores"},
+      {op: "Reshape", args: {shape: ["shape('s')[0] * shape('s')[1] * shape('s')[2]"]}, in: ["s"], out: "s", name: "flat"},
+      {op: "Gather", args: {axis: 0}, in: ["s", "idx"], out: "out", name: "gather"},
+    ]},
+  },
+  components: {
+    precompute: {body: [
+      {op: "Unary", args: {kind: {Scale: 1}}, in: ["w:deberta.encoder.rel_embeddings.weight"], out: "rel", name: "rel", when: "!norm_rel"},
+      {use: "layer_norm", args: {w: "'deberta.encoder.LayerNorm'"}, in: ["w:deberta.encoder.rel_embeddings.weight"], out: "rel",
+       name: "rel_ln", when: "norm_rel"},
+      {repeat: "i", count: "layers", body: [
+        {let: {p: "fmt('deberta.encoder.layer.{i}.attention.self')"}},
+        {use: "rel_proj", args: {w: "fmt(v1 ? '{p}.pos_q_proj' : '{p}.query_proj')"}, in: ["rel"], out: "pq", name: "l{i}.pos_q"},
+        {use: "rel_proj", args: {w: "fmt(v1 ? '{p}.pos_proj' : '{p}.key_proj')"}, in: ["rel"], out: "pk", name: "l{i}.pos_k"},
+        {tap: "deberta.encoder.layer.{i}.pos_q", in: "pq"},
+        {tap: "deberta.encoder.layer.{i}.pos_k", in: "pk"},
+      ]},
+    ]},
+    encoder: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"], when: "biased"},
+        {name: "c2p_index", dtype: "u32", shape: ["heads", "rows", "rows"], gen: "log_bucket_rel_index",
+         args: {rows: "rows", buckets: "buckets", max_relative: "max_rel", span: "span", heads: "heads", by: "'query'"}},
+        {name: "p2c_index", dtype: "u32", shape: ["heads", "rows", "rows"], gen: "log_bucket_rel_index",
+         args: {rows: "rows", buckets: "buckets", max_relative: "max_rel", span: "span", heads: "heads", by: "'key'"}},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:deberta.embeddings.word_embeddings.weight", "i:token_ids"], out: "x", name: "emb.word"},
+        {block: [
+          {op: "Embedding", in: ["w:deberta.embeddings.position_embeddings.weight", "i:positions"], out: "pe", name: "emb.pos"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "emb.add_pos"},
+        ], when: "biased"},
+        {use: "layer_norm", args: {w: "'deberta.embeddings.LayerNorm'"}, in: ["x"], out: "x", name: "emb.ln"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('deberta.encoder.layer.{i}')"}},
+          {let: {a: "fmt('{p}.attention.self')"}},
+          {op: "Linear", in: ["x", "w:{a}.query_proj.weight", "w?:{a}.query_proj.bias"], out: "q", name: "l{i}.q"},
+          {op: "Linear", in: ["x", "w:{a}.key_proj.weight", "w?:{a}.key_proj.bias"], out: "k", name: "l{i}.k"},
+          {op: "Linear", in: ["x", "w:{a}.value_proj.weight", "w?:{a}.value_proj.bias"], out: "v", name: "l{i}.v"},
+          {use: "split_heads", in: ["q"], out: "qh", name: "l{i}.qh"},
+          {use: "split_heads", in: ["k"], out: "kh", name: "l{i}.kh"},
+          {use: "rel_term", in: ["qh", "w:{p}.pos_k", "i:c2p_index"], out: "c2p", name: "l{i}.c2p"},
+          {use: "rel_term", in: ["kh", "w:{p}.pos_q", "i:p2c_index"], out: "p2c", name: "l{i}.p2c"},
+          {op: "Binary", args: {kind: "Add"}, in: ["c2p", "p2c"], out: "bias", name: "l{i}.bias"},
+          {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false, scale: "rel_scale"},
+           in: ["q", "k", "v", "bias"], out: "y", name: "l{i}.attn"},
+          {op: "Linear", in: ["y", "w:{p}.attention.output.dense.weight", "w?:{p}.attention.output.dense.bias"], out: "y", name: "l{i}.o"},
+          {use: "residual", in: ["y", "x"], out: "x", name: "l{i}.res1"},
+          {use: "layer_norm", args: {w: "fmt('{p}.attention.output.LayerNorm')"}, in: ["x"], out: "x", name: "l{i}.ln1"},
+          {use: "mlp_plain", in: ["x"], out: "m", name: "l{i}.mlp", args: {act: "'GeluErf'",
+            up: "fmt('{p}.intermediate.dense')", down: "fmt('{p}.output.dense')"}},
+          {use: "residual", in: ["m", "x"], out: "x", name: "l{i}.res2"},
+          {use: "layer_norm", args: {w: "fmt('{p}.output.LayerNorm')"}, in: ["x"], out: "x", name: "l{i}.ln2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["x"], out: "c", name: "cls", when: "head == 'classify'"},
+        {op: "Linear", in: ["c", "w:pooler.dense.weight", "w?:pooler.dense.bias"], out: "c", name: "pool.dense", when: "head == 'classify'"},
+        {op: "Unary", args: {kind: "GeluErf"}, in: ["c"], out: "c", name: "pool.act", when: "head == 'classify'"},
+        {op: "Linear", in: ["c", "w:classifier.weight", "w?:classifier.bias"], out: "logits", name: "cls.out", when: "head == 'classify'"},
+        {op: "Unary", args: {kind: {Scale: 1}}, in: ["x"], out: "hidden", name: "hidden", when: "head == 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  // DebertaConverter (v1 only; v2 needs its tokenizer.json): `[CLS] A [SEP] B [SEP]`.
+  runtime: {tokenizer: [
+    {when: "v1", kind: "byte_bpe", vocab: "vocab.json", merges: "merges.txt", cls: "[CLS]", sep: "[SEP]",
+      post: "cls_sep", specials: ["[PAD]", "[CLS]", "[SEP]", "[UNK]", "[MASK]"]},
+  ]},
+}

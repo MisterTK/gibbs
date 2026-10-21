@@ -27,20 +27,39 @@
 //! } }
 //! ```
 
-use crate::arch::expr::{eval_json, Env};
+use crate::arch::build::{build, Instance, ShapeCache};
+use crate::arch::expr::{eval_json, Env, Val};
+use crate::arch::gen::{generate, GenData};
+use crate::arch::load::Model;
+use crate::graph::program::GraphProgram;
+use crate::graph::Tensor;
+use crate::hardware::PlacementMode;
 use crate::model::audio::{read_wav, resample, resampled_len};
 use crate::model::image::ImageBuffer;
+use parking_lot::Mutex;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::sync::Arc;
 
 /// `runtime.media`: modality name (`image`, `audio`, …) → its spec.
 pub type Media = BTreeMap<String, MediaSpec>;
 
 /// Evaluates the raw `runtime.media` object against the model `env` (strings are expressions:
 /// `cfg.*`, `json.*`, config vars; bare undefined identifiers are strings) and deserializes it.
+/// A modality whose `when` expression is false or undefined is dropped first.
 pub fn resolve(raw: &serde_json::Value, env: &dyn Env) -> Result<Media, String> {
-    serde_json::from_value(eval_json(raw, env)?.to_json())
+    let mut kept = serde_json::Map::new();
+    for (name, m) in raw.as_object().into_iter().flatten() {
+        let mut m = m.clone();
+        if let Some(w) = m.as_object_mut().and_then(|o| o.remove("when")) {
+            if !eval_json(&w, env)?.truthy() {
+                continue;
+            }
+        }
+        kept.insert(name.clone(), m);
+    }
+    serde_json::from_value(eval_json(&serde_json::Value::Object(kept), env)?.to_json())
         .map_err(|e| format!("runtime.media: {e}"))
 }
 
@@ -262,6 +281,108 @@ pub fn preprocess(p: &Preprocess, bytes: &[u8]) -> Result<Prepared, String> {
             audio_input(p, &pcm, rate)
         }
         _ => image_input(p, &ImageBuffer::decode(bytes)?),
+    }
+}
+
+/// A small synthetic item of `p`'s kind (64 x 64 grey image; silence: one frame for raw frames,
+/// 1 s at 16 kHz for log-mel): what a tower is probed with at load (its weights, whether it
+/// builds).
+pub fn probe_item(p: &Preprocess) -> Vec<u8> {
+    let (rate, n) = match *p {
+        Preprocess::RawFrames { sampling_rate, frame, .. } => (sampling_rate, frame as u32),
+        Preprocess::LogMel { .. } => (16_000, 16_000),
+        _ => {
+            let mut img = ImageBuffer::new(64, 64);
+            img.data.fill(128);
+            return img.to_png();
+        }
+    };
+    let mut b = b"RIFF".to_vec();
+    b.extend((36 + 2 * n).to_le_bytes());
+    b.extend(b"WAVEfmt ");
+    b.extend(16u32.to_le_bytes());
+    b.extend([1, 0, 1, 0]);
+    b.extend(rate.to_le_bytes());
+    b.extend((2 * rate).to_le_bytes());
+    b.extend([2, 0, 16, 0]);
+    b.extend(b"data");
+    b.extend((2 * n).to_le_bytes());
+    b.resize(b.len() + 2 * n as usize, 0);
+    b
+}
+
+
+/// Media tower components run on one device: per component, one program compiled from its first
+/// instance, every other item shape run reshaped on it.
+pub struct Towers {
+    mode: PlacementMode,
+    towers: Mutex<HashMap<String, Tower>>,
+}
+
+struct Tower {
+    shapes: Arc<ShapeCache>,
+    /// The compiled program and the instance key it was compiled for.
+    program: Option<(String, GraphProgram)>,
+}
+
+impl Towers {
+    pub fn new(mode: PlacementMode) -> Self {
+        Self { mode, towers: Mutex::new(HashMap::new()) }
+    }
+
+    /// `component` of `m` built for `grid` (its vars are the instance vars).
+    pub fn instance(&self, m: &Model, component: &str, grid: &Grid) -> Result<Arc<Instance>, String> {
+        let vars: Vec<(&str, Val)> = grid.vars.iter().map(|&(k, v)| (k, Val::Num(v as f64))).collect();
+        let shapes = self
+            .towers
+            .lock()
+            .entry(component.to_string())
+            .or_insert_with(|| Tower { shapes: Arc::new(ShapeCache::new(component)), program: None })
+            .shapes
+            .clone();
+        shapes.get(&vars, || build(&m.spec, component, &m.env, &m.store, &vars))
+    }
+
+    /// Runs `component` of `m` on one preprocessed item: input 0 is `item.data`, every other input
+    /// is generated. Returns the outputs by name, in declaration order.
+    pub fn run(&self, m: &Model, component: &str, item: &Prepared) -> Result<Vec<(String, Vec<f32>)>, String> {
+        let inst = self.instance(m, component, &item.grid)?;
+        let mut inputs = Vec::with_capacity(inst.inputs.len());
+        for (i, d) in inst.inputs.iter().enumerate() {
+            let want = d.shape.iter().product::<usize>();
+            let t = match (&d.gen, i) {
+                (None, 0) if item.data.len() == want => Tensor::F32(item.data.clone()),
+                (None, 0) => {
+                    return Err(format!(
+                        "{component}: input `{}` {:?} does not hold the item's {:?}",
+                        d.name, d.shape, item.shape
+                    ))
+                }
+                (None, _) => return Err(format!("{component}: input `{}` needs a `gen`", d.name)),
+                (Some((g, args)), _) => match generate(g, args).map_err(|e| format!("{component}: input `{}`: {e}", d.name))?.data {
+                    GenData::F32(v) => Tensor::F32(v),
+                    GenData::U32(v) => Tensor::U32(v),
+                },
+            };
+            inputs.push(t);
+        }
+        let key = ShapeCache::key(&item.grid.vars.iter().map(|&(k, v)| (k, Val::Num(v as f64))).collect::<Vec<_>>());
+        let mut towers = self.towers.lock();
+        let tower = towers.get_mut(component).expect("instance() registered the tower");
+        if tower.program.is_none() {
+            let w = m.store.materialize(&inst.weights)?;
+            let p = GraphProgram::compile_reshapable(inst.graph.clone(), w, self.mode)
+                .map_err(|e| format!("{component}: {e}"))?;
+            tower.program = Some((key.clone(), p));
+        }
+        let (k, p) = tower.program.as_mut().unwrap();
+        let out = if *k == key { p.run(inputs)? } else { p.run_reshaped(&inst.graph, inputs)? };
+        inst.outputs
+            .iter()
+            .cloned()
+            .zip(out)
+            .map(|(n, t)| Ok((n, t.into_f32()?)))
+            .collect()
     }
 }
 
@@ -880,23 +1001,6 @@ mod tests {
         assert!(measure(&smart(), &png(1, 300)).unwrap_err().contains("aspect"));
     }
 
-    // parity with original (delete with the original)
-    #[test]
-    fn smart_resize_matches_original() {
-        use crate::model::qwen3_5::vision::{Preprocessor, Vision};
-        let (ck, cfg) = crate::model::qwen3_5::fixture::checkpoint(true, false);
-        let vision = Vision::load(&ck, &cfg["vision_config"]).unwrap();
-        let pre = Preprocessor::parse(crate::model::qwen3_5::gpu_tests::PRE.as_bytes(), "test").unwrap();
-        for (w, h) in [(16, 24), (30, 50), (400, 300)] {
-            let bytes = png(w, h);
-            let want = vision.prepare(&ImageBuffer::decode(&bytes).unwrap(), &pre).unwrap();
-            let p = preprocess(&smart(), &bytes).unwrap();
-            assert_eq!((p.grid.var("grid_h"), p.grid.var("grid_w")), (Some(want.gh), Some(want.gw)));
-            let d = max_diff(&p.data, &want.patches);
-            assert!(d < 1e-6, "{w}x{h}: max |d| {d}");
-        }
-    }
-
     fn budget() -> Preprocess {
         Preprocess::SoftTokenBudget { patch: 4, pool: 2, max_soft_tokens: 4, norm: half_norm() }
     }
@@ -1169,34 +1273,6 @@ mod tests {
         // Text-only prompts still get positions.
         let e = expand(&[3, 4], &mrope(), &[], &no_text).unwrap();
         assert_eq!((e.pos3, e.delta), (vec![[0; 3], [1; 3]], 0));
-    }
-
-    // parity with original (delete with the original)
-    #[test]
-    fn merged_grid_matches_original() {
-        use crate::model::native::MediaInput;
-        use crate::model::qwen3_5::{fixture::IMAGE_TOKEN, gpu_tests, Seq, TEXT_ROW};
-        let _g = crate::hardware::cpu_compute::allow();
-        let model = gpu_tests::model(true, false, crate::hardware::Device::Cpu);
-        let m = mrope();
-        let (a, b) = (gpu_tests::png(16, 24), gpu_tests::png(30, 50));
-        let cases: [(Vec<u32>, Vec<&Vec<u8>>); 2] = [
-            (vec![3, 7, IMAGE_TOKEN, 11, 5, 9], vec![&a]),
-            (vec![IMAGE_TOKEN, 4, IMAGE_TOKEN, 8], vec![&a, &b]),
-        ];
-        for (ids, imgs) in cases {
-            let media: Vec<MediaInput> = imgs.iter().map(|b| MediaInput::Image((*b).clone())).collect();
-            let (want, state) = model.prepare(ids.clone(), &media).unwrap();
-            let seq = state.downcast_ref::<Seq>().unwrap();
-            let grids: Vec<Grid> = imgs.iter().map(|b| measure(&m["image"].preprocess, b).unwrap()).collect();
-            let refs: Vec<(&str, &Grid)> = grids.iter().map(|g| ("image", g)).collect();
-            let e = expand(&ids, &m, &refs, &no_text).unwrap();
-            assert_eq!(e.ids, want);
-            assert_eq!(e.pos3, seq.pos3);
-            assert_eq!(e.delta, seq.delta);
-            let rows: Vec<u32> = (0..want.len() as u32).filter(|&i| seq.feat_row[i as usize] != TEXT_ROW).collect();
-            assert_eq!(e.media_index, rows);
-        }
     }
 
     /// Token ids and sizes come from the model scope; quoted strings stay literal.

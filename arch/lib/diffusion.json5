@@ -1,0 +1,161 @@
+// diffusion building blocks (see arch/lib/transformer.json5 for the macro conventions).
+{
+  macros: {
+    // Affine-free LayerNorm (gain: the family's ones constant `ones`, default 'ln.ones', [d])
+    // then AdaLN: n * (1 + scale) + shift; shift/scale broadcast ([1, d] or [n, d]). eps default 1e-6.
+    ln_modulate: {params: ["x", "shift", "scale"], body: [
+      {let: {ln_ones: "first(ones, 'ln.ones')"}},
+      {op: "LayerNorm", args: {eps: "first(eps, 1e-6)"}, in: ["x", "c:{ln_ones}"], out: "n", name: "ln"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["n", "scale"], out: "s", name: "scale"},
+      {op: "Binary", args: {kind: "Add"}, in: ["n", "s"], out: "s", name: "one_plus"},
+      {op: "Binary", args: {kind: "Add"}, in: ["s", "shift"], out: "out", name: "shift"},
+    ]},
+    // x + y * gate.
+    gated_add: {params: ["x", "y", "gate"], body: [
+      {op: "Binary", args: {kind: "Mul"}, in: ["y", "gate"], out: "g", name: "gate"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "g"], out: "out", name: "add"},
+    ]},
+    // Timestep MLP `{w}.linear_2(act(`{w}.linear_1(t)))`; act default Silu.
+    timestep_mlp: {params: ["t"], body: [
+      {op: "Linear", in: ["t", "w:{w}.linear_1.weight", "w?:{w}.linear_1.bias"], out: "h", name: "linear_1"},
+      {op: "Unary", args: {kind: "first(act, 'Silu')"}, in: ["h"], out: "h", name: "act"},
+      {op: "Linear", in: ["h", "w:{w}.linear_2.weight", "w?:{w}.linear_2.bias"], out: "out", name: "linear_2"},
+    ]},
+    // PixArt caption projection `{w}`: linear_2(gelu_tanh(linear_1(x))); `norm`: optional RMSNorm
+    // gain stem after it (eps `norm_eps`, default 1e-5).
+    caption_proj: {params: ["x"], body: [
+      {use: "timestep_mlp", args: {w: "w", act: "'GeluTanh'"}, in: ["x"], out: "out", name: "mlp"},
+      {op: "RmsNorm", args: {eps: "first(norm_eps, 1e-5)"}, in: ["out", "w:{norm}.weight"], out: "out", name: "norm",
+       when: "first(norm, '') != ''"},
+    ]},
+    // ReLU linear attention per head (Sana): out_i = (sum_j v_j relu(k_j)^T) relu(q_i) /
+    // (sum_j relu(k_j) . relu(q_i) + eps); q/k/v [n, heads*hd]. Needs constant `{eps_c}` (default
+    // 'la.eps', [1] = 1e-15).
+    linear_attention: {params: ["q", "k", "v"], body: [
+      {let: {n: "shape('q')[0]", hd: "shape('q')[1] // heads", la_eps: "first(eps_c, 'la.eps')"}},
+      {op: "Unary", args: {kind: "Relu"}, in: ["q"], out: "q", name: "q_relu"},
+      {op: "Unary", args: {kind: "Relu"}, in: ["k"], out: "k", name: "k_relu"},
+      {op: "Reshape", args: {shape: ["n", "heads", "hd"]}, in: ["q"], out: "q", name: "q_split"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["q"], out: "q", name: "q_heads"},
+      {op: "Reshape", args: {shape: ["n", "heads", "hd"]}, in: ["k"], out: "k", name: "k_split"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["k"], out: "k", name: "k_heads"},
+      {op: "Reshape", args: {shape: ["n", "heads", "hd"]}, in: ["v"], out: "v", name: "v_split"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["v"], out: "v", name: "v_heads"},
+      // kv[h, c, d] = sum_j v[j, c] k[j, d]; num[h, i, c] = sum_d q[i, d] kv[c, d].
+      {op: "MatMul", args: {transpose_a: true, transpose_b: false}, in: ["v", "k"], out: "kv", name: "kv"},
+      {op: "MatMul", args: {transpose_a: false, transpose_b: true}, in: ["q", "kv"], out: "num", name: "num"},
+      {op: "Reduce", args: {kind: "Sum", axes: [1], keep_dims: true}, in: ["k"], out: "ks", name: "ks"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["q", "ks"], out: "qk", name: "qk"},
+      {op: "Reduce", args: {kind: "Sum", axes: [2], keep_dims: true}, in: ["qk"], out: "den", name: "den0"},
+      {op: "Binary", args: {kind: "Add"}, in: ["den", "c:{la_eps}"], out: "den", name: "den"},
+      {op: "Binary", args: {kind: "Div"}, in: ["num", "den"], out: "o", name: "div"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["o"], out: "o", name: "merge"},
+      {op: "Reshape", args: {shape: ["n", "heads * hd"]}, in: ["o"], out: "out", name: "flat"},
+    ]},
+    // GLU MBConv on token rows x [h*w, d] (Sana `ff`, stem `{p}`): conv_inverted (1x1, as Linear)
+    // -> SiLU -> depthwise 3x3 conv_depth on [c, h, w] -> a * silu(gate) (channel halves) ->
+    // conv_point (1x1, as Linear). Reads instance vars h, w.
+    glumbconv: {params: ["x"], body: [
+      {op: "Linear", in: ["x", "w:{p}.conv_inverted.weight", "w?:{p}.conv_inverted.bias"], out: "t", name: "inverted"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "inverted_act"},
+      {let: {c2: "shape('t')[1]"}},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "to_chw"},
+      {op: "Reshape", args: {shape: ["c2", "h", "w"]}, in: ["t"], out: "t", name: "img"},
+      {op: "Conv2d", args: {stride: [1, 1], padding: [1, 1, 1, 1], dilation: [1, 1], groups: "c2"},
+       in: ["t", "w:{p}.conv_depth.weight", "w?:{p}.conv_depth.bias"], out: "t", name: "depth"},
+      {op: "Reshape", args: {shape: ["c2", "h * w"]}, in: ["t"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "to_rows"},
+      {op: "Slice", args: {axis: -1, start: 0, end: "c2 // 2"}, in: ["t"], out: "a", name: "a"},
+      {op: "Slice", args: {axis: -1, start: "c2 // 2", end: "c2"}, in: ["t"], out: "g", name: "g"},
+      {op: "SwiGlu", in: ["g", "a"], out: "t", name: "glu"},
+      {op: "Linear", in: ["t", "w:{p}.conv_point.weight", "w?:{p}.conv_point.bias"], out: "out", name: "point"},
+    ]},
+    // q/k/v projections `{wq}`, `{wk}`, `{wv}` of x, then per-head RMSNorm (eps, default 1e-6) with
+    // gains `{q_norm}.weight` / `{k_norm}.weight` where those tensors exist.
+    qkv: {params: ["x"], returns: ["q", "k", "v"], body: [
+      {op: "Linear", in: ["x", "w:{wq}.weight", "w?:{wq}.bias"], out: "q", name: "q"},
+      {op: "Linear", in: ["x", "w:{wk}.weight", "w?:{wk}.bias"], out: "k", name: "k"},
+      {op: "Linear", in: ["x", "w:{wv}.weight", "w?:{wv}.bias"], out: "v", name: "v"},
+      {op: "RmsNorm", args: {eps: "first(eps, 1e-6)"}, in: ["q", "w:{q_norm}.weight"], out: "q", name: "q_norm",
+       when: "has(fmt('{q_norm}.weight'))"},
+      {op: "RmsNorm", args: {eps: "first(eps, 1e-6)"}, in: ["k", "w:{k_norm}.weight"], out: "k", name: "k_norm",
+       when: "has(fmt('{k_norm}.weight'))"},
+    ]},
+    // Joint (MMDiT) attention of two streams: `qkv` of x (args wq, wk, wv, q_norm, k_norm) and of c
+    // (cq, ck, cv, cq_norm, ck_norm), one non-causal `heads`-head Attention over the rows [x; c],
+    // split back into xa [n_x, d] and ca [n_c, d] (no output projections). Text-first models pass
+    // (c, x).
+    joint_attention: {params: ["x", "c"], returns: ["xa", "ca"], body: [
+      {use: "qkv", args: {wq: "wq", wk: "wk", wv: "wv", q_norm: "q_norm", k_norm: "k_norm"}, in: ["x"], out: ["q1", "k1", "v1"], name: "x"},
+      {use: "qkv", args: {wq: "cq", wk: "ck", wv: "cv", q_norm: "cq_norm", k_norm: "ck_norm"}, in: ["c"], out: ["q2", "k2", "v2"], name: "c"},
+      {op: "Concat", args: {axis: 0}, in: ["q1", "q2"], out: "q", name: "q"},
+      {op: "Concat", args: {axis: 0}, in: ["k1", "k2"], out: "k", name: "k"},
+      {op: "Concat", args: {axis: 0}, in: ["v1", "v2"], out: "v", name: "v"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {let: {nx: "shape('x')[0]", nall: "shape('a')[0]"}},
+      {op: "Slice", args: {axis: 0, start: 0, end: "nx"}, in: ["a"], out: "xa", name: "xa"},
+      {op: "Slice", args: {axis: 0, start: "nx", end: "nall"}, in: ["a"], out: "ca", name: "ca"},
+    ]},
+    // One logical linear `x -> [n, sum(rows)]` stored fused as `{w}` (BFL q/k/v) or as the row
+    // blocks `parts` (list of stems, diffusers to_q/to_k/to_v; at most 6) concatenated along the
+    // output. Biases optional per stored tensor.
+    linear_parts: {params: ["x"], body: [
+      {op: "Linear", in: ["x", "w:{w}.weight", "w?:{w}.bias"], out: "out", name: "fused", when: "has(fmt('{w}.weight'))"},
+      {block: [
+        {repeat: "j", count: "len(parts)", body: [
+          {op: "Linear", in: ["x", "w:{parts[j]}.weight", "w?:{parts[j]}.bias"], out: "p{j}", name: "p{j}"},
+        ]},
+        {op: "Concat", args: {axis: -1}, in: ["p0", "v?:p1", "v?:p2", "v?:p3", "v?:p4", "v?:p5"], out: "out", name: "cat"},
+      ], when: "!has(fmt('{w}.weight'))"},
+    ]},
+    // Multi-axis RoPE (MRope, `sections` pairs per position slot, adjacent pairs; positions
+    // `i:positions` [n*3] U32, frequencies constant `{inv_freq}`, default 'rope.inv_freq') on q and k,
+    // then non-causal `heads`-head Attention. q/k/v [n, heads*head_dim].
+    mrope_attention: {params: ["q", "k", "v"], body: [
+      {let: {rope_c: "first(inv_freq, 'rope.inv_freq')"}},
+      {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "head_dim", mscale: 1,
+         variant: {MRope: {sections: "sections", interleaved: false, pairs: "'Adjacent'"}}},
+       in: ["q", "i:positions", "c:{rope_c}"], out: "q", name: "rope_q"},
+      {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "head_dim", mscale: 1,
+         variant: {MRope: {sections: "sections", interleaved: false, pairs: "'Adjacent'"}}},
+       in: ["k", "i:positions", "c:{rope_c}"], out: "k", name: "rope_k"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "out", name: "attn"},
+    ]},
+    // Parallel attention + MLP block (FLUX single stream): h = ln_modulate(x, shift, scale);
+    // [q | k | v | m] = linear_parts(h) (args w, parts); per-head RMSNorm `{q_norm}` / `{k_norm}`;
+    // mrope_attention; m -> SwiGLU of its halves (`glu`) or tanh-GELU; x + gate * `{out_w}`([attn | m]).
+    single_stream_fused: {params: ["x", "shift", "scale", "gate"], body: [
+      {let: {dm: "shape('x')[1]"}},
+      {use: "ln_modulate", in: ["x", "shift", "scale"], out: "h", name: "norm"},
+      {use: "linear_parts", args: {w: "w", parts: "parts"}, in: ["h"], out: "f", name: "linear1"},
+      {let: {fw: "shape('f')[1]"}},
+      {op: "Slice", args: {axis: -1, start: 0, end: "dm"}, in: ["f"], out: "q", name: "q"},
+      {op: "Slice", args: {axis: -1, start: "dm", end: "2 * dm"}, in: ["f"], out: "k", name: "k"},
+      {op: "Slice", args: {axis: -1, start: "2 * dm", end: "3 * dm"}, in: ["f"], out: "v", name: "v"},
+      {op: "Slice", args: {axis: -1, start: "3 * dm", end: "fw"}, in: ["f"], out: "m", name: "mlp"},
+      {block: [
+        {let: {half: "(fw - 3 * dm) // 2"}},
+        {op: "Slice", args: {axis: -1, start: 0, end: "half"}, in: ["m"], out: "mg", name: "mlp_gate"},
+        {op: "Slice", args: {axis: -1, start: "half", end: "2 * half"}, in: ["m"], out: "mu", name: "mlp_up"},
+        {op: "SwiGlu", in: ["mg", "mu"], out: "m", name: "swiglu"},
+      ], when: "glu"},
+      {op: "Unary", args: {kind: "GeluTanh"}, in: ["m"], out: "m", name: "gelu", when: "!glu"},
+      {op: "RmsNorm", args: {eps: "first(eps, 1e-6)"}, in: ["q", "w:{q_norm}.weight"], out: "q", name: "q_norm"},
+      {op: "RmsNorm", args: {eps: "first(eps, 1e-6)"}, in: ["k", "w:{k_norm}.weight"], out: "k", name: "k_norm"},
+      {use: "mrope_attention", in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Concat", args: {axis: -1}, in: ["a", "m"], out: "c", name: "cat"},
+      {op: "Linear", in: ["c", "w:{out_w}.weight", "w?:{out_w}.bias"], out: "o", name: "linear2"},
+      {use: "gated_add", in: ["x", "o", "gate"], out: "out", name: "res"},
+    ]},
+    // x * (1 + scale) + shift (no norm); needs the constant `one` ([1] = 1).
+    scale_shift: {params: ["x", "shift", "scale"], body: [
+      {op: "Binary", args: {kind: "Add"}, in: ["scale", "c:one"], out: "s", name: "1p"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["x", "s"], out: "x", name: "mul"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "shift"], out: "out", name: "shift"},
+    ]},
+    // Chunk `i` ([1, dim]) of a modulation row `m` [1, k*dim].
+    chunk: {params: ["m"], body: [
+      {op: "Slice", args: {axis: 1, start: "i * dim", end: "(i + 1) * dim"}, in: ["m"], out: "out", name: "c{i}"},
+    ]},
+  },
+}

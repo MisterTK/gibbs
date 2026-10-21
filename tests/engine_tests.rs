@@ -319,9 +319,8 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
 
 #[test]
 fn test_real_qwen35_9b_decode_and_roofline_on_disk() {
-    use foundry_engine::hardware::Device;
+    use foundry_engine::hardware::{Device, PlacementMode};
     use foundry_engine::model::hub::HuggingFaceHub;
-    use foundry_engine::model::native::load_native;
     use std::time::Instant;
 
     let repo = "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF";
@@ -331,11 +330,9 @@ fn test_real_qwen35_9b_decode_and_roofline_on_disk() {
         return;
     }
 
-    let lm = match load_native(&art, Device::Metal) {
-        Some(Ok(m)) => m,
-        Some(Err(e)) => panic!("Failed to load {repo}: {e}"),
-        None => panic!("load_native returned None for {repo}"),
-    };
+    let reg = foundry_engine::arch::registry().unwrap();
+    let lm = foundry_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Metal))
+        .unwrap_or_else(|e| panic!("Failed to load {repo}: {e}"));
 
     let tok = lm.tokenizer();
     let prompt = "The capital of France is";

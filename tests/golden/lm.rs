@@ -4,8 +4,6 @@ use crate::util::*;
 use gibbs_engine::arch::LoadOpts;
 use gibbs_engine::graph::Tensor;
 use gibbs_engine::hardware::{Device, HardwareCapability, QuantMode};
-use gibbs_engine::model::hf_loader::load_causal_lm;
-use gibbs_engine::model::nano::{NanoTransformerConfig, NanoTransformerModel};
 use gibbs_engine::model::native::{load_native, logits_of};
 use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig, ReencodePolicy};
 use gibbs_engine::scheduler::ExecutableModel;
@@ -134,9 +132,15 @@ fn fixture(case: &str, cfg: &Value, w: &Weights) -> PathBuf {
 /// `ExecutableModel::load_graph_lm` on `dev`. `GIBBS_SPEC_LM=1`: `arch::dispatch::load_lm`
 /// (bit-exact weights) routes the family spec through `runtime::lm::SpecLm` instead.
 fn load_lm(dir: &Path, dev: Device) -> ExecutableModel {
+    let spec = std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1");
+    load_lm_as(dir, dev, spec, None)
+}
+
+/// [`load_lm`]; `spec` forces `runtime::lm::SpecLm` (family `family` when given).
+fn load_lm_as(dir: &Path, dev: Device, spec: bool, family: Option<&str>) -> ExecutableModel {
     let a = artifacts(dir, "golden/lm", "model.safetensors");
     assert!(load_native(&a, dev).is_none(), "routed to a native loader");
-    let m = if std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1") {
+    let m = if spec {
         let reencode = ReencodeConfig {
             policy: ReencodePolicy::BitExact,
             cache_dir: None,
@@ -149,9 +153,9 @@ fn load_lm(dir: &Path, dev: Device) -> ExecutableModel {
             quant_name: None,
             hw: &HardwareCapability::default(),
             reencode,
-            family: None,
+            family,
             stage: &|_| {},
-            cli_routes: false,
+            system1_first: false,
             admit: &|_| Ok(()),
         };
         let (m, _) = gibbs_engine::arch::dispatch::load_lm(&a, &opts).unwrap();
@@ -410,32 +414,16 @@ fn bitnet() {
         ..Default::default()
     };
     let dir = fixture(case, &cfg, &llama_weights(16, &d, o));
-    // runner: internal GraphLm host forward (`load_causal_lm` + `GraphLm::forward`/`generate_step`)
-    let llm = load_causal_lm(
-        &artifacts(&dir, "golden/lm", "model.safetensors"),
-        QuantMode::Uncompressed,
-    )
-    .unwrap();
-    let c = &llm.config;
-    assert_eq!(
-        (c.act_quant_bits, c.use_relu2_mlp, c.ternarize_weights),
-        (8, true, true)
-    );
-    let mut out = Out::default();
-    out.f("prefill6", &llm.forward(&PROMPT));
-    let seq = [&PROMPT[..], &DECODE[..]].concat();
-    for i in 0..DECODE.len() {
-        out.f(
-            format!("decode{i}"),
-            &llm.forward(&seq[..PROMPT.len() + i + 1]),
-        );
+    // The reference (GraphLm's host forward) is deleted: the golden is frozen.
+    if writing() {
+        return;
     }
-    let mut ids = PROMPT.to_vec();
-    for _ in 0..8 {
-        ids.push(llm.generate_step(&ids, 0.0));
-    }
-    out.ids("greedy8", &ids[PROMPT.len()..]);
-    check(case, Device::Cpu, &out, TOL);
+    // runner: `bitnet.json5` through `runtime::lm::SpecLm` (prefill, cached decode, greedy).
+    golden(case, TOL, |dev| {
+        let mut o = run_lm(&load_lm_as(&dir, dev, true, Some("bitnet")), dev);
+        o.floats.retain(|(k, _)| k != "prefill20");
+        o
+    });
 }
 
 /// Nano (host-only toy decoder, no attention mixing): its closed-form init weights written under
@@ -478,46 +466,26 @@ fn nano() {
                 "intermediate_size": inter, "vocab_size": v}),
     );
     w.write(&dir.join("model.safetensors"));
-    // runner: internal `NanoTransformerModel` fields filled from the fixture file (the removed
-    // `HuggingFaceModelDir` loader did the same) + `forward_token` / `forward_logits`
-    let cfg = NanoTransformerConfig {
-        vocab_size: v,
-        hidden_dim: h,
-        intermediate_dim: inter,
-        num_layers: layers,
-        num_heads: 4,
-        head_dim: 16,
-        eps: 1e-5,
-    };
-    let (m, data) =
-        gibbs_engine::model::loaders::read_checkpoint(&dir.join("model.safetensors")).unwrap();
-    let t = |n: &str| m.extract_tensor_f32(&data, n).unwrap();
-    let mut model = NanoTransformerModel::new(cfg.clone());
-    model.embedding_table = t("embedding_table");
-    for l in 0..layers {
-        model.qkv_weights[l] = t(&format!("qkv_weights.{l}"));
-        model.out_weights[l] = t(&format!("out_weights.{l}"));
-        model.mlp_gate_up[l] = t(&format!("mlp_gate_up.{l}"));
-        model.mlp_down[l] = t(&format!("mlp_down.{l}"));
-        model.norm_weights[l] = t(&format!("norm_weights.{l}"));
+    write_tokenizer(&dir, v);
+    // The reference (host `NanoTransformerModel`) is deleted: the golden is frozen.
+    if writing() {
+        return;
     }
-    model.final_norm = t("final_norm");
-    model.lm_head = t("lm_head");
-    model.quantize_model(QuantMode::Uncompressed);
-    let trajectory = |m: &NanoTransformerModel| {
+    // runner: `nano.json5` (forced family) through `runtime::lm::SpecLm`; position-independent,
+    // so each step is a 1-token prompt.
+    golden(case, TOL, |dev| {
+        let m = load_lm_as(&dir, dev, true, Some("nano"));
+        let logits = |t: u32| m.prompt_logits(vec![t]).unwrap();
         let mut t = 42u32;
-        (0..10)
-            .map(|pos| {
-                t = m.forward_token(t, pos);
+        let ids: Vec<u32> = (0..10)
+            .map(|_| {
+                t = argmax(&logits(t));
                 t
             })
-            .collect::<Vec<u32>>()
-    };
-    let ids = trajectory(&model);
-    // The fixture is exactly Nano's built-in init (nano_model_tests' config).
-    assert_eq!(ids, trajectory(&NanoTransformerModel::new(cfg)));
-    let mut out = Out::default();
-    out.ids("greedy10", &ids);
-    out.f("final_logits", &model.forward_logits(ids[8]));
-    check(case, Device::Cpu, &out, TOL);
+            .collect();
+        let mut out = Out::default();
+        out.ids("greedy10", &ids);
+        out.f("final_logits", &logits(ids[8]));
+        out
+    })
 }
