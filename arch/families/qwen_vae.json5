@@ -1,0 +1,82 @@
+// Qwen-Image / Wan 2.1 VAE decoder (diffusers `AutoencoderKLQwenImage`, 8x spatial) for one still
+// frame: causal 3-D convolutions keep only their last temporal tap, so every layer is 2-D and the
+// temporal upsamplers are skipped. Original/ComfyUI names (`decoder.upsamples.N.residual.K`) map to
+// diffusers'. Channel widths come from the tensors. The encoder is not implemented (ignored).
+{
+  family: "qwen_vae",
+  match: {diffusers_class: ["AutoencoderKLQwenImage"]},
+  pipeline: "diffusion",
+  use_lib: ["dit_extra"],
+  config: {
+    z: "shape('post_quant_conv.weight')[0]",
+    levels: "count('decoder.up_blocks.{k}.resnets.0.conv1.weight')",
+    blocks: "count('decoder.up_blocks.0.resnets.{k}.conv1.weight')",
+  },
+  checks: [
+    {expr: "cfg.is_residual == true", error: "Qwen VAE: the residual (2.1) variant is the `qwen_vae21` family"},
+    {expr: "len(first(cfg.attn_scales, [])) > 0", error: "Qwen VAE: attention at other scales is not implemented"},
+  ],
+  names: {rules: [
+    ["conv1.{r:*}", "quant_conv.{r}"],
+    ["conv2.{r:*}", "post_quant_conv.{r}"],
+    ["decoder.conv1.{r:*}", "decoder.conv_in.{r}"],
+    ["decoder.head.0.{r:*}", "decoder.norm_out.{r}"],
+    ["decoder.head.2.{r:*}", "decoder.conv_out.{r}"],
+    ["encoder.conv1.{r:*}", "encoder.conv_in.{r}"],
+    ["encoder.head.0.{r:*}", "encoder.norm_out.{r}"],
+    ["encoder.head.2.{r:*}", "encoder.conv_out.{r}"],
+    ["{s:*}.middle.1.{r:*}", "{s}.mid_block.attentions.0.{r}"],
+    ["{s:*}.middle.{i}.residual.0.{r:*}", "{s}.mid_block.resnets.{i // 2}.norm1.{r}"],
+    ["{s:*}.middle.{i}.residual.2.{r:*}", "{s}.mid_block.resnets.{i // 2}.conv1.{r}"],
+    ["{s:*}.middle.{i}.residual.3.{r:*}", "{s}.mid_block.resnets.{i // 2}.norm2.{r}"],
+    ["{s:*}.middle.{i}.residual.6.{r:*}", "{s}.mid_block.resnets.{i // 2}.conv2.{r}"],
+    ["{s:*}.middle.{i}.shortcut.{r:*}", "{s}.mid_block.resnets.{i // 2}.conv_shortcut.{r}"],
+    ["decoder.upsamples.{i}.residual.0.{r:*}", "decoder.up_blocks.{i // 4}.resnets.{i % 4}.norm1.{r}"],
+    ["decoder.upsamples.{i}.residual.2.{r:*}", "decoder.up_blocks.{i // 4}.resnets.{i % 4}.conv1.{r}"],
+    ["decoder.upsamples.{i}.residual.3.{r:*}", "decoder.up_blocks.{i // 4}.resnets.{i % 4}.norm2.{r}"],
+    ["decoder.upsamples.{i}.residual.6.{r:*}", "decoder.up_blocks.{i // 4}.resnets.{i % 4}.conv2.{r}"],
+    ["decoder.upsamples.{i}.shortcut.{r:*}", "decoder.up_blocks.{i // 4}.resnets.{i % 4}.conv_shortcut.{r}"],
+    ["decoder.upsamples.{i}.{r:*}", "decoder.up_blocks.{i // 4}.upsamplers.0.{r}"],
+    ["encoder.downsamples.{i}.residual.0.{r:*}", "encoder.down_blocks.{i}.norm1.{r}"],
+    ["encoder.downsamples.{i}.residual.2.{r:*}", "encoder.down_blocks.{i}.conv1.{r}"],
+    ["encoder.downsamples.{i}.residual.3.{r:*}", "encoder.down_blocks.{i}.norm2.{r}"],
+    ["encoder.downsamples.{i}.residual.6.{r:*}", "encoder.down_blocks.{i}.conv2.{r}"],
+    ["encoder.downsamples.{i}.shortcut.{r:*}", "encoder.down_blocks.{i}.conv_shortcut.{r}"],
+    ["encoder.downsamples.{i}.{r:*}", "encoder.down_blocks.{i}.{r}"],
+  ]},
+  transforms: [
+    // One frame: a causal 3-D kernel's current-frame tap is its last.
+    {tensor: "{n:*}.weight", op: "last_temporal_tap", when: "len(shape(fmt('{n}.weight'))) == 5"},
+    {tensor: "{n:*}.weight", op: "to_f32", when: "len(shape(fmt('{n}.weight'))) == 4"},
+    {tensor: "{n:*}.to_qkv.weight", op: "conv_to_linear"},
+    {tensor: "{n:*}.proj.weight", op: "conv_to_linear"},
+  ],
+  ignore: ["encoder.*", "quant_conv.*"],
+  components: {
+    // De-normalised latents z [z, h, w] -> RGB [3, 8h, 8w] in [-1, 1].
+    decoder: {
+      vars: ["h", "w"],
+      inputs: [{name: "z", dtype: "f32", shape: ["z", "h", "w"]}],
+      body: [
+        {use: "vae_conv", args: {p: "'post_quant_conv'"}, in: ["i:z"], out: "x", name: "post"},
+        {use: "vae_conv", args: {p: "'decoder.conv_in'"}, in: ["x"], out: "x", name: "conv_in"},
+        {use: "vae_res", args: {p: "'decoder.mid_block.resnets.0'"}, in: ["x"], out: "x", name: "mid0"},
+        {use: "vae_attn", args: {p: "'decoder.mid_block.attentions.0'"}, in: ["x"], out: "x", name: "mid_attn"},
+        {use: "vae_res", args: {p: "'decoder.mid_block.resnets.1'"}, in: ["x"], out: "x", name: "mid1"},
+        {repeat: "i", count: "levels", body: [
+          {repeat: "j", count: "blocks", body: [
+            {use: "vae_res", args: {p: "fmt('decoder.up_blocks.{i}.resnets.{j}')"}, in: ["x"], out: "x", name: "up{i}.res{j}"},
+          ]},
+          {block: [
+            {op: "Upsample", args: {scale: 2, mode: "'Nearest'"}, in: ["x"], out: "x", name: "up{i}.up"},
+            {use: "vae_conv", args: {p: "fmt('decoder.up_blocks.{i}.upsamplers.0.resample.1')"}, in: ["x"], out: "x", name: "up{i}.conv"},
+          ], when: "has(fmt('decoder.up_blocks.{i}.upsamplers.0.resample.1.weight'))"},
+        ]},
+        {use: "rms_channels", args: {g: "'decoder.norm_out.gamma'"}, in: ["x"], out: "x", name: "norm_out"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["x"], out: "x", name: "silu_out"},
+        {use: "vae_conv", args: {p: "'decoder.conv_out'"}, in: ["x"], out: "image", name: "conv_out"},
+      ],
+      outputs: ["image"],
+    },
+  },
+}

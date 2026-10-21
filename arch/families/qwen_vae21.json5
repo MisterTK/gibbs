@@ -1,0 +1,81 @@
+// Qwen-Image 2.1 VAE decoder (diffusers `AutoencoderKLQwenImage` with `is_residual`, Wan 2.2 style)
+// for one frame: 64-channel latents to RGBA. Upsampling blocks add a `DupUp3D` shortcut (channels
+// repeated, regrouped to (c_out, factor_t, 2, 2), unfolded into 2x2 pixels, last of the factor_t
+// frames kept); the first-frame temporal conv is skipped. Widths come from the tensors; the
+// decoder's temporal factors are `temperal_downsample` reversed. Referenced by `{family, dir}` (its
+// diffusers class is shared with `qwen_vae`).
+{
+  family: "qwen_vae21",
+  pipeline: "diffusion",
+  use_lib: ["dit_extra"],
+  config: {
+    z: "shape('post_quant_conv.weight')[0]",
+    levels: "count('decoder.up_blocks.{k}.resnets.0.conv1.weight')",
+    blocks: "count('decoder.up_blocks.0.resnets.{k}.conv1.weight')",
+    temporal: "cfg.temperal_downsample",
+  },
+  checks: [
+    {expr: "cfg.is_residual != true || cfg.patch_size != null", error: "Qwen-Image 2.1 VAE: only the residual, unpatched variant is supported"},
+    {expr: "len(temporal) + 1 != levels", error: "vae config: temperal_downsample does not match the decoder levels"},
+  ],
+  transforms: [
+    {tensor: "{n:*}.weight", op: "last_temporal_tap", when: "len(shape(fmt('{n}.weight'))) == 5"},
+    {tensor: "{n:*}.weight", op: "to_f32", when: "len(shape(fmt('{n}.weight'))) == 4"},
+    {tensor: "{n:*}.to_qkv.weight", op: "conv_to_linear"},
+    {tensor: "{n:*}.proj.weight", op: "conv_to_linear"},
+  ],
+  ignore: ["encoder.*", "quant_conv.*", "decoder.up_blocks.*.upsampler.time_conv.*"],
+  macros: {
+    // DupUp3D(first_chunk) of `x` [c_in, h, w] to [c_out, 2h, 2w] with temporal factor `ft`.
+    dup_up: {params: ["x"], body: [
+      {let: {ci: "shape('x')[0]", hh: "shape('x')[1]", ww: "shape('x')[2]"}},
+      {let: {rep: "c_out * ft * 4 // ci"}},
+      {op: "Reshape", args: {shape: ["ci", 1, "hh", "ww"]}, in: ["x"], out: "t", name: "r"},
+      {op: "Tile", args: {reps: [1, "rep", 1, 1]}, in: ["t"], out: "t", name: "repeat"},
+      {op: "Reshape", args: {shape: ["c_out", "ft", 4, "hh", "ww"]}, in: ["t"], out: "t", name: "frames"},
+      {op: "Slice", args: {axis: 1, start: "ft - 1", end: "ft"}, in: ["t"], out: "t", name: "last"},
+      {op: "Reshape", args: {shape: ["c_out", 2, 2, "hh", "ww"]}, in: ["t"], out: "t", name: "px"},
+      {op: "Transpose", args: {perm: [0, 3, 1, 4, 2]}, in: ["t"], out: "t", name: "unfold"},
+      {op: "Reshape", args: {shape: ["c_out", "2 * hh", "2 * ww"]}, in: ["t"], out: "out", name: "join"},
+    ]},
+    // Up block `i` of `x`: residual blocks, then (when it upsamples) nearest 2x + conv plus the
+    // DupUp3D shortcut of the block input.
+    up_level: {params: ["x"], body: [
+      {let: {up: "fmt('decoder.up_blocks.{i}.upsampler.resample.1')"}},
+      {let: {upsamples: "has(fmt('{up}.weight'))"}},
+      {use: "vae_res", args: {p: "fmt('decoder.up_blocks.{i}.resnets.0')"}, in: ["x"], out: "y", name: "res0"},
+      {repeat: "j", count: "blocks - 1", body: [
+        {use: "vae_res", args: {p: "fmt('decoder.up_blocks.{i}.resnets.{j + 1}')"}, in: ["y"], out: "y", name: "res{j + 1}"},
+      ]},
+      {block: [
+        {op: "Upsample", args: {scale: 2, mode: "'Nearest'"}, in: ["y"], out: "u", name: "up"},
+        {use: "vae_conv", args: {p: "up"}, in: ["u"], out: "u", name: "conv"},
+        {use: "dup_up", args: {c_out: "shape(fmt('{up}.weight'))[0]", ft: "at(temporal, levels - 2 - i) ? 2 : 1"},
+         in: ["x"], out: "d", name: "dup"},
+        {op: "Binary", args: {kind: "Add"}, in: ["u", "d"], out: "sum", name: "add"},
+      ], when: "upsamples"},
+      {let: {ret: "upsamples ? 'sum' : 'y'"}},
+    ], returns: "{ret}"},
+  },
+  components: {
+    // De-normalised latents z [z, h, w] -> RGBA [4, H, W] in [-1, 1] (2x per upsampling level).
+    decoder: {
+      vars: ["h", "w"],
+      inputs: [{name: "z", dtype: "f32", shape: ["z", "h", "w"]}],
+      body: [
+        {use: "vae_conv", args: {p: "'post_quant_conv'"}, in: ["i:z"], out: "x", name: "post"},
+        {use: "vae_conv", args: {p: "'decoder.conv_in'"}, in: ["x"], out: "x", name: "conv_in"},
+        {use: "vae_res", args: {p: "'decoder.mid_block.resnets.0'"}, in: ["x"], out: "x", name: "mid0"},
+        {use: "vae_attn", args: {p: "'decoder.mid_block.attentions.0'"}, in: ["x"], out: "x", name: "mid_attn"},
+        {use: "vae_res", args: {p: "'decoder.mid_block.resnets.1'"}, in: ["x"], out: "x", name: "mid1"},
+        {repeat: "i", count: "levels", body: [
+          {use: "up_level", in: ["x"], out: "x", name: "up{i}"},
+        ]},
+        {use: "rms_channels", args: {g: "'decoder.norm_out.gamma'"}, in: ["x"], out: "x", name: "norm_out"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["x"], out: "x", name: "silu_out"},
+        {use: "vae_conv", args: {p: "'decoder.conv_out'"}, in: ["x"], out: "image", name: "conv_out"},
+      ],
+      outputs: ["image"],
+    },
+  },
+}

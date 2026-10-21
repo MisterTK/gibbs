@@ -599,10 +599,20 @@ fn ltx() {
 /// 16 latent channels: `latents * std + mean` of a 3x2 latent -> `[3, 24, 16]` before clamping.
 #[test]
 fn qwen_vae() {
+    qwen_vae_run(false)
+}
+
+/// The `qwen_vae` spec's `decoder` on the same fixture.
+#[test]
+fn qwen_vae_spec() {
+    qwen_vae_run(true)
+}
+
+fn qwen_vae_run(spec: bool) {
     use gibbs_engine::model::qwen_vae::QwenVae;
     const Z: usize = 16;
     let (base, mult) = (4usize, [1usize, 2, 4, 4]);
-    let dir = fixture_dir("diffb_qwen_vae");
+    let dir = fixture_dir(if spec { "diffb_qwen_vae_spec" } else { "diffb_qwen_vae" });
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -656,15 +666,21 @@ fn qwen_vae() {
     );
     // runner: internal gibbs_engine::model::qwen_vae::QwenVae::{open, decode_cpu, decode_gpu}
     // (`QwenVae::load` only accepts the 96-wide production config).
-    let vae = QwenVae::open(&Mw::open(&file).unwrap(), mean.clone(), std.clone(), base)
-        .expect("Qwen VAE fixture");
+    let vae = (!spec).then(|| {
+        QwenVae::open(&Mw::open(&file).unwrap(), mean.clone(), std.clone(), base).expect("Qwen VAE fixture")
+    });
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(13, Z * h * w, 1.0), h * w, &mean, &std);
     golden("diffb_qwen_vae", TOL, |dev| {
-        let y = if metal(dev) {
+        let vae = vae.as_ref();
+        let y = if spec {
+            let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
+            run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image")
+        } else if metal(dev) {
+            let vae = vae.unwrap();
             vae.decode_gpu(&z, h, w).unwrap()
         } else {
-            vae.decode_cpu(&z, h, w)
+            vae.unwrap().decode_cpu(&z, h, w)
         };
         let mut o = Out::default();
         o.f("decode_3x2", &sub(&y));
@@ -676,9 +692,19 @@ fn qwen_vae() {
 /// 6 latent channels, temporal flags [true, false, true]: a 3x2 latent -> RGBA `[4, 24, 16]`.
 #[test]
 fn qwen_vae21() {
+    qwen_vae21_run(false)
+}
+
+/// The `qwen_vae21` spec's `decoder` on the same fixture.
+#[test]
+fn qwen_vae21_spec() {
+    qwen_vae21_run(true)
+}
+
+fn qwen_vae21_run(spec: bool) {
     use gibbs_engine::model::qwen_vae21::QwenVae21;
     let (mult, base, zc) = ([1usize, 2, 2, 4], 4usize, 6usize);
-    let dir = fixture_dir("diffb_qwen_vae21");
+    let dir = fixture_dir(if spec { "diffb_qwen_vae21_spec" } else { "diffb_qwen_vae21" });
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -728,15 +754,21 @@ fn qwen_vae21() {
             "latents_mean": mean, "latents_std": std
         }),
     );
-    let vae = QwenVae21::load(&dir).expect("Qwen VAE 2.1 fixture");
+    let vae = (!spec).then(|| QwenVae21::load(&dir).expect("Qwen VAE 2.1 fixture"));
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(14, zc * h * w, 1.0), h * w, &mean, &std);
     // runner: internal gibbs_engine::model::qwen_vae21::QwenVae21::{decode_cpu, decode_gpu}
     golden("diffb_qwen_vae21", TOL, |dev| {
-        let (y, oh, ow) = if metal(dev) {
-            vae.decode_gpu(&z, h, w).unwrap()
+        let (y, oh, ow) = if spec {
+            let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
+            let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+            let n = y.len() / 4;
+            let s = ((n / (h * w)) as f64).sqrt() as usize;
+            (y, s * h, s * w)
+        } else if metal(dev) {
+            vae.as_ref().unwrap().decode_gpu(&z, h, w).unwrap()
         } else {
-            vae.decode_cpu(&z, h, w)
+            vae.as_ref().unwrap().decode_cpu(&z, h, w)
         };
         assert_eq!((oh, ow), (8 * h, 8 * w)); // 3 upsamplers in this tiny config
         let mut o = Out::default();
