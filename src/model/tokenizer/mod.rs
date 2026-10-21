@@ -1451,4 +1451,36 @@ mod byte_bpe_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+
+    /// `GIBBS_QWEN1_TOKENIZER`: Qwen-Image's `tokenizer/` files (vocab.json, merges.txt,
+    /// added_tokens.json) next to `ref_tokenizer.json` (Qwen2.5-VL's tokenizer.json): the tokenizer
+    /// built from the former must give the latter's ids, and the template head must be 34 tokens.
+    #[test]
+    fn real_tokenizer_matches_the_reference_tokenizer_json() {
+        let Some(dir) = std::env::var_os("GIBBS_QWEN1_TOKENIZER").map(std::path::PathBuf::from) else {
+            eprintln!("SKIP: GIBBS_QWEN1_TOKENIZER not set");
+            return;
+        };
+        let built = byte_bpe_from_vocab_merges(&dir).unwrap();
+        let reference = tokenizers::Tokenizer::from_file(dir.join("ref_tokenizer.json")).unwrap();
+        let rt = crate::model::hf_loader::tokenizer_from_files(&built.to_string(false).unwrap(), &|n| {
+            std::fs::read(dir.join(n)).ok()
+        })
+        .unwrap();
+        let ids =
+            |t: &tokenizers::Tokenizer, s: &str| t.encode(s, false).unwrap().get_ids().to_vec();
+        for s in [
+            "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n",
+            "A cat 🐱 on 123456 books, 日本語のテキスト \n\n  indented\ttabs  ",
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
+            "don't won't I'LL we've; \"quoted\" (x) [y] ...",
+            "<|endoftext|>x<|vision_start|><|image_pad|>",
+            " ",
+        ] {
+            assert_eq!(ids(&built, s), ids(&reference, s), "{s:?}");
+            // The form the diffusion runtime loads: serialized, read back as the crate tokenizer.
+            assert_eq!(rt.encode(s), ids(&reference, s), "runtime form: {s:?}");
+        }
+        assert_eq!(ids(&built, "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n").len(),  34);
+    }
 }
