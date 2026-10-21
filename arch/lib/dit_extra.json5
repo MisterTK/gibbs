@@ -1,0 +1,28 @@
+// DiT building blocks shared by the single/double-stream image transformers. Constants a family
+// must declare: `one` ([1] = 1), `ones.dim` ([dim] = 1).
+{
+  macros: {
+    // LayerNorm(x) (affine-free, `eps`) * (1 + scale) + shift; scale/shift [1, dim].
+    ln_mod: {params: ["x", "shift", "scale"], body: [
+      {op: "LayerNorm", args: {eps: "eps"}, in: ["x", "c:ones.dim"], out: "h", name: "ln"},
+      {op: "Binary", args: {kind: "Add"}, in: ["scale", "c:one"], out: "s", name: "1p"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["h", "s"], out: "h", name: "mul"},
+      {op: "Binary", args: {kind: "Add"}, in: ["h", "shift"], out: "out", name: "shift"},
+    ]},
+    // x * (1 + scale) + shift.
+    modulate: {params: ["x", "shift", "scale"], body: [
+      {op: "Binary", args: {kind: "Add"}, in: ["scale", "c:one"], out: "s", name: "1p"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["x", "s"], out: "x", name: "mul"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "shift"], out: "out", name: "shift"},
+    ]},
+    // x + y * gate.
+    gated_add: {params: ["x", "y", "gate"], body: [
+      {op: "Binary", args: {kind: "Mul"}, in: ["y", "gate"], out: "y", name: "gate"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "y"], out: "out", name: "add"},
+    ]},
+    // Chunk `i` ([1, dim]) of a modulation row `m` [1, k*dim].
+    chunk: {params: ["m"], body: [
+      {op: "Slice", args: {axis: 1, start: "i * dim", end: "(i + 1) * dim"}, in: ["m"], out: "out", name: "c{i}"},
+    ]},
+  },
+}

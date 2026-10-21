@@ -2,8 +2,7 @@
 // tokens, context refiners over the padded caption, then joint layers over [image; caption]; 3-axis
 // RoPE on adjacent pairs, sandwich RMSNorm, tanh-gated adaLN. Sequences pad to a multiple of 32 with
 // learned pad rows. Linear weights run in bf16 (the F32 checkpoint is rounded, as the reference).
-// The runner supplies patch rows ((py, px, c) order), raw caption features and the timestep
-// features `timestep_embedding(t = (1 - sigma) * t_scale, 256, f32)`.
+// Latents enter unpacked ([c, h, w]); 2x2 patch rows ((py, px, c) order) are cut in-graph.
 {
   family: "zimage",
   match: {diffusers_class: ["ZImageTransformer2DModel"]},
@@ -85,36 +84,41 @@
     ]},
   },
   components: {
-    // Model output rows [n_img, patch*patch*in_ch] for `n_img` patches on a grid `grid_w` wide and
-    // `n_cap` caption rows.
+    // Model output [in_ch, h, w] for a latent [in_ch, h, w] and `nt` caption rows.
     denoiser: {
-      vars: ["n_img", "n_cap", "grid_w"],
+      vars: ["h", "w", "nt"],
       inputs: [
-        {name: "patches", dtype: "f32", shape: ["n_img", "patch * patch * in_ch"]},
-        {name: "cap", dtype: "f32", shape: ["n_cap", "cap_dim"]},
-        {name: "t_feat", dtype: "f32", shape: [1, 256]},
-        {name: "pos_img", dtype: "u32", shape: ["(n_img + (32 - n_img % 32) % 32) * 3"], gen: "caption_then_grid_padded",
-         args: {grid_w: "grid_w", grid_len: "n_img", grid_total: "n_img + (32 - n_img % 32) % 32", text_total: "n_cap + (32 - n_cap % 32) % 32", part: "'grid'"}},
-        {name: "pos_cap", dtype: "u32", shape: ["(n_cap + (32 - n_cap % 32) % 32) * 3"], gen: "caption_then_grid_padded",
-         args: {grid_w: "grid_w", grid_len: "n_img", grid_total: "n_img + (32 - n_img % 32) % 32", text_total: "n_cap + (32 - n_cap % 32) % 32", part: "'text'"}},
-        {name: "pos_all", dtype: "u32", shape: ["(n_img + (32 - n_img % 32) % 32 + n_cap + (32 - n_cap % 32) % 32) * 3"], gen: "caption_then_grid_padded",
-         args: {grid_w: "grid_w", grid_len: "n_img", grid_total: "n_img + (32 - n_img % 32) % 32", text_total: "n_cap + (32 - n_cap % 32) % 32", part: "'all'"}},
-        {name: "img_pad_idx", dtype: "u32", shape: ["(32 - n_img % 32) % 32"], gen: "iota", args: {n: "(32 - n_img % 32) % 32", step: 0},
-         when: "n_img % 32 != 0"},
-        {name: "cap_pad_idx", dtype: "u32", shape: ["(32 - n_cap % 32) % 32"], gen: "iota", args: {n: "(32 - n_cap % 32) % 32", step: 0},
-         when: "n_cap % 32 != 0"},
+        {name: "x", dtype: "f32", shape: ["in_ch", "h", "w"]},
+        {name: "context", dtype: "f32", shape: ["nt", "cap_dim"]},
+        {name: "t_feat", dtype: "f32", shape: [1, 256], gen: "timestep_embedding",
+         args: {t: "'step:(1 - sigma) * first(denoiser.t_scale, 1000)'", dim: 256, precision: "'f32'"}},
+        {name: "pos_img", dtype: "u32", shape: ["((h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32) * 3"], gen: "caption_then_grid_padded",
+         args: {grid_w: "w // 2", grid_len: "(h // 2) * (w // 2)", grid_total: "(h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32", text_total: "nt + (32 - nt % 32) % 32", part: "'grid'"}},
+        {name: "pos_cap", dtype: "u32", shape: ["(nt + (32 - nt % 32) % 32) * 3"], gen: "caption_then_grid_padded",
+         args: {grid_w: "w // 2", grid_len: "(h // 2) * (w // 2)", grid_total: "(h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32", text_total: "nt + (32 - nt % 32) % 32", part: "'text'"}},
+        {name: "pos_all", dtype: "u32", shape: ["((h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32 + nt + (32 - nt % 32) % 32) * 3"], gen: "caption_then_grid_padded",
+         args: {grid_w: "w // 2", grid_len: "(h // 2) * (w // 2)", grid_total: "(h // 2) * (w // 2) + (32 - (h // 2) * (w // 2) % 32) % 32", text_total: "nt + (32 - nt % 32) % 32", part: "'all'"}},
+        {name: "img_pad_idx", dtype: "u32", shape: ["(32 - (h // 2) * (w // 2) % 32) % 32"], gen: "iota", args: {n: "(32 - (h // 2) * (w // 2) % 32) % 32", step: 0},
+         when: "(h // 2) * (w // 2) % 32 != 0"},
+        {name: "cap_pad_idx", dtype: "u32", shape: ["(32 - nt % 32) % 32"], gen: "iota", args: {n: "(32 - nt % 32) % 32", step: 0},
+         when: "nt % 32 != 0"},
       ],
       body: [
         {op: "Linear", in: ["i:t_feat", "w:t_embedder.mlp.0.weight", "w?:t_embedder.mlp.0.bias"], out: "t", name: "t_mlp0"},
         {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "t_silu"},
         {op: "Linear", in: ["t", "w:t_embedder.mlp.2.weight", "w?:t_embedder.mlp.2.bias"], out: "adaln", name: "t_mlp2"},
 
-        {op: "Linear", in: ["i:patches", "w:all_x_embedder.2-1.weight", "w?:all_x_embedder.2-1.bias"], out: "x", name: "x_embedder"},
+        {let: {hp: "h // 2", wp: "w // 2", n_img: "(h // 2) * (w // 2)", n_cap: "nt"}},
+        // Patch rows [(hp, wp), (py, px, c)] of the [c, h, w] latent.
+        {op: "Reshape", args: {shape: ["in_ch", "hp", 2, "wp", 2]}, in: ["i:x"], out: "p", name: "patch.split"},
+        {op: "Transpose", args: {perm: [1, 3, 2, 4, 0]}, in: ["p"], out: "p", name: "patch.perm"},
+        {op: "Reshape", args: {shape: ["n_img", "4 * in_ch"]}, in: ["p"], out: "p", name: "patch.rows"},
+        {op: "Linear", in: ["p", "w:all_x_embedder.2-1.weight", "w?:all_x_embedder.2-1.bias"], out: "x", name: "x_embedder"},
         {use: "pad_rows", args: {pad: "'x_pad_token'"}, in: ["x", "i:img_pad_idx"], out: "x", name: "x_pad", when: "n_img % 32 != 0"},
         {repeat: "i", count: "refiners", body: [
           {use: "zblock", args: {p: "fmt('noise_refiner.{i}')", modulated: true, pos: "'pos_img'"}, in: ["x", "adaln"], out: "x", name: "nr.{i}"},
         ]},
-        {op: "RmsNorm", args: {eps: "eps"}, in: ["i:cap", "w:cap_embedder.0.weight"], out: "c", name: "cap_normed"},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["i:context", "w:cap_embedder.0.weight"], out: "c", name: "cap_normed"},
         {op: "Linear", in: ["c", "w:cap_embedder.1.weight", "w?:cap_embedder.1.bias"], out: "c", name: "cap_lin"},
         {use: "pad_rows", args: {pad: "'cap_pad_token'"}, in: ["c", "i:cap_pad_idx"], out: "c", name: "cap_pad", when: "n_cap % 32 != 0"},
         {repeat: "i", count: "refiners", body: [
@@ -130,14 +134,15 @@
         {op: "Slice", args: {axis: 0, start: 0, end: "n_img"}, in: ["u"], out: "h", name: "final.img"},
         {op: "LayerNorm", args: {eps: 1e-6}, in: ["h", "c:ones.dim"], out: "h", name: "final.ln"},
         {op: "Binary", args: {kind: "Mul"}, in: ["h", "s"], out: "h", name: "final.mod"},
-        {op: "Linear", in: ["h", "w:all_final_layer.2-1.linear.weight", "w?:all_final_layer.2-1.linear.bias"], out: "out", name: "final_lin"},
+        {op: "Linear", in: ["h", "w:all_final_layer.2-1.linear.weight", "w?:all_final_layer.2-1.linear.bias"], out: "y", name: "final_lin"},
+        {op: "Reshape", args: {shape: ["hp", "wp", 2, 2, "in_ch"]}, in: ["y"], out: "y", name: "unpatch.split"},
+        {op: "Transpose", args: {perm: [4, 0, 2, 1, 3]}, in: ["y"], out: "y", name: "unpatch.perm"},
+        {op: "Reshape", args: {shape: ["in_ch", "h", "w"]}, in: ["y"], out: "out", name: "unpatch"},
       ],
       outputs: ["out"],
     },
   },
   runtime: {
-    // ponytail: runtime keys are provisional until the diffusion runtime contract lands.
-    patch: 2,
-    timestep: {kind: "one_minus_sigma_scaled", scale: "t_scale", dim: 256, precision: "f32"},
+    latent: {pack: "none"},
   },
 }
