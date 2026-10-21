@@ -14,10 +14,11 @@
   },
   runtime: {
     text_encoders: [
-      // ids + `</s>` (1) truncated to 512, padded with `<pad>` (0); like ChromaPipeline the first pad
-      // is a key too and only those `valid + 1` rows are kept (masked text reaches nothing).
+      // ids + `</s>` (1) truncated to 512, padded with `<pad>` (0); `valid + 1` rows are kept
+      // (the first pad row too) but only the `valid` rows are keys, as the old Rust pipeline did
+      // (diffusers ChromaPipeline also lets that first pad be a key: `mask: "valid_plus1"`).
       {name: "t5", component: "text_encoder", net: "encoder", tokenizer: "tokenizer", add_special: false,
-       eos: 1, max_len: 512, pad_to: 512, pad_id: 0, mask: "valid_plus1", keep: "valid_plus1",
+       eos: 1, max_len: 512, pad_to: 512, pad_id: 0, keep: "valid_plus1",
        outputs: {hidden: "hidden"}},
     ],
     pooled: [],
