@@ -467,46 +467,35 @@ fn qwen3_5_mtp() {
     });
 }
 
-/// The ViT alone on two image sizes: merged features and the deepstack feature.
+/// The ViT alone on two image sizes (the second runs reshaped on the first's program): merged
+/// features and the deepstack feature. Qwen3-VL's spec runs the same tower.
 #[test]
 fn qwen3_5_vision_tower() {
-    use gibbs_engine::arch::{build::build, expr::Val, gen, load, Registry};
-    use gibbs_engine::graph::{program::GraphProgram, Tensor};
+    use gibbs_engine::arch::{load, Registry};
     use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
-    use gibbs_engine::runtime::media;
+    use gibbs_engine::runtime::media::{self, Towers};
     let dir = fixture_dir("qwen_qwen3_5_vision_tower");
     qwen35_vl_ckpt(&dir);
-    golden("qwen_qwen3_5_vision_tower", TOL, |dev| {
-        // SCRATCH runner: spec vision component, compiled directly.
-        let reg = Registry::load(None).unwrap();
+    // runner: arch::load::load_with (bit-exact) -> runtime::media::{preprocess, Towers::run}.
+    let run = |family: &str, dev: Device| {
         let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
-        let m = load::load_with(&artifacts(&dir, "golden/qwen3_5_vl", "model.safetensors"), &reg, Some("qwen3_5"), re).unwrap();
+        let a = artifacts(&dir, "golden/qwen3_5_vl", "model.safetensors");
+        let m = load::load_with(&a, &Registry::load(None).unwrap(), Some(family), re).unwrap();
         load::check(&m).unwrap();
         let spec = media::resolve(&m.spec.runtime["media"], &m.env).unwrap().remove("image").unwrap();
+        let towers = Towers::new(PlacementMode::Pin(dev));
         let mut out = Out::default();
         for (w, h) in [(16, 24), (24, 8)] {
             let p = media::preprocess(&spec.preprocess, &png(w, h)).unwrap();
-            let vars: Vec<(&str, Val)> = p.grid.vars.iter().map(|&(k, v)| (k, Val::Num(v as f64))).collect();
-            let inst = build(&m.spec, "vision", &m.env, &m.store, &vars).unwrap();
-            let mut given = Some(Tensor::F32(p.data.clone()));
-            let ins = inst.inputs.iter().map(|i| match &i.gen {
-                Some((g, a)) => match gen::generate(g, a).unwrap().data {
-                    gen::GenData::F32(v) => Tensor::F32(v),
-                    gen::GenData::U32(v) => Tensor::U32(v),
-                },
-                None => given.take().unwrap(),
-            }).collect();
-            let wts = m.store.materialize(&inst.weights).unwrap();
-            let mut prog = GraphProgram::compile(inst.graph.clone(), wts, PlacementMode::Pin(dev)).unwrap();
-            assert!(dev == Device::Cpu || prog.cpu_node_count() == 0);
-            let o: std::collections::HashMap<_, _> = inst.outputs.iter().cloned().zip(prog.run(ins).unwrap()).collect();
-            let f = |k: &str| match &o[k] { Tensor::F32(v) => v.clone(), t => panic!("{k}: {t:?}") };
+            let o: std::collections::HashMap<_, _> = towers.run(&m, &spec.component, &p).unwrap().into_iter().collect();
             out.ids(format!("grid_{w}x{h}"), &[p.grid.rows as u32, p.grid.cols as u32])
-                .f(format!("embeds_{w}x{h}"), &f("media"))
-                .f(format!("deepstack0_{w}x{h}"), &f("deepstack.0"));
+                .f(format!("embeds_{w}x{h}"), &o["media"])
+                .f(format!("deepstack0_{w}x{h}"), &o["deepstack.0"]);
         }
         out
-    });
+    };
+    golden("qwen_qwen3_5_vision_tower", TOL, |dev| run("qwen3_5", dev));
+    golden("qwen_qwen3_5_vision_tower", TOL, |dev| run("qwen3_vl", dev));
 }
 
 /// Image prompt through `prepare` (placeholder expanded to the merged grid, M-RoPE positions,
