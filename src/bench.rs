@@ -697,7 +697,9 @@ pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
     let artifacts =
         crate::model::hub::HuggingFaceHub::new().auto_download_and_cache(model_id, None)?;
     let _lock = crate::hardware::gpu_lock()?;
-    let exec = load_for_bench(&artifacts, "max-speed")?.exec;
+    // The effective policy (settings, `--reencode`): a capture and its check load the same weights.
+    let policy = crate::model::weight_format::ReencodeConfig::effective().policy;
+    let exec = load_for_bench(&artifacts, policy.name())?.exec;
     let ids = exec.tokenizer().encode(prompt);
     let logits = exec.prompt_logits(ids.clone())?;
     let vocab = exec.tokenizer().vocab_size();
