@@ -443,7 +443,7 @@ impl SequenceClassifier {
                     "{repo_id}: custom architecture '{arch}' (remote code)"
                 ));
             }
-            let mut all = encoder::classifier_architectures();
+            let mut all = encoder::classifier_architectures().to_vec();
             all.extend(DECODER_ARCHITECTURES.iter().map(|a| a.to_string()));
             return Err(format!("{repo_id}: {arch} is not supported (supported: {})", all.join(", ")));
         }

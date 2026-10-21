@@ -319,17 +319,21 @@ fn encoder_family(reg: &crate::arch::Registry, sig: &Signals) -> Option<(String,
     Some((f, rt))
 }
 
-/// Every `*ForSequenceClassification` class an encoder family claims.
-pub fn classifier_architectures() -> Vec<String> {
-    let Ok(reg) = crate::arch::registry() else {
-        return Vec::new();
-    };
-    reg.matchers()
-        .into_iter()
-        .filter(|(_, _, p)| *p == Pipeline::Encoder)
-        .flat_map(|(_, m, _)| m.hf_architectures)
-        .filter(|a| a.ends_with("ForSequenceClassification"))
-        .collect()
+/// Every `*ForSequenceClassification` class an encoder family claims (the registry is static,
+/// so computed once).
+pub fn classifier_architectures() -> &'static [String] {
+    static ARCHS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let Ok(reg) = crate::arch::registry() else {
+            return Vec::new();
+        };
+        reg.matchers()
+            .into_iter()
+            .filter(|(_, _, p)| *p == Pipeline::Encoder)
+            .flat_map(|(_, m, _)| m.hf_architectures)
+            .filter(|a| a.ends_with("ForSequenceClassification"))
+            .collect()
+    });
+    &ARCHS
 }
 
 /// Text generators: `*ForCausalLM`, `*ForConditionalGeneration`, `*LMHeadModel`.
