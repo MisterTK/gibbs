@@ -2,12 +2,23 @@
 
 use crate::graph::pattern::{GraphRewriter, MatchContext};
 use crate::graph::{DType, Graph, Op, Tensor, Weights};
+use crate::model::weights::Mat;
 
 /// Concatenates 2D weight tensors along axis 0 (rows).
 /// Supports F32, BF16, F16, GGUF-quantized, and Mat.
 pub fn concat_weight_tensors(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
     if tensors.is_empty() {
         return None;
+    }
+    let mats: Vec<&Mat> = tensors
+        .iter()
+        .filter_map(|t| match t {
+            Tensor::Mat(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    if mats.len() == tensors.len() {
+        return concat_mats(&mats);
     }
     // Normalize any Tensor::Mat: if packed GGUF, convert to Tensor::Quantized(ZeroCopySlice);
     // if uncompressed safetensors, extract as Tensor::BF16.
@@ -27,6 +38,41 @@ pub fn concat_weight_tensors(tensors: &[&Tensor], in_features: usize) -> Option<
 
     let norm_refs: Vec<&Tensor> = normalized.iter().collect();
     concat_weight_tensors_inner(&norm_refs, in_features)
+}
+
+/// Row-concatenates loader matrices of one storage (all bf16, or all one packed format, whose
+/// rows are whole blocks so rows concatenate as bytes); `None` when the storages differ.
+fn concat_mats(ms: &[&Mat]) -> Option<Tensor> {
+    let cols = ms[0].cols;
+    let rows = ms.iter().map(|m| m.rows).sum();
+    if ms.iter().any(|m| m.cols != cols) {
+        return None;
+    }
+    let Some(format) = ms[0].packed().map(|p| p.format) else {
+        let mut v = Vec::with_capacity(rows * cols);
+        for m in ms {
+            if m.packed().is_some() {
+                return None;
+            }
+            v.extend_from_slice(m.data());
+        }
+        return Some(Tensor::Mat(Mat::from_bf16(v, rows, cols)));
+    };
+    let mut bytes = Vec::with_capacity(rows * format.tensor_bytes(cols));
+    for m in ms {
+        let p = m.packed().filter(|p| p.format == format)?;
+        bytes.extend_from_slice(
+            p.map
+                .get(p.off..p.off + m.rows * format.tensor_bytes(cols))?,
+        );
+    }
+    let p = crate::model::weights::Packed {
+        map: std::sync::Arc::new(crate::model::loaders::gguf::GgufData::Buf(bytes)),
+        off: 0,
+        format,
+        shape: vec![rows, cols],
+    };
+    Some(Tensor::Mat(Mat::from_packed(p, rows, cols)))
 }
 
 fn concat_weight_tensors_inner(tensors: &[&Tensor], in_features: usize) -> Option<Tensor> {
@@ -181,12 +227,25 @@ fn concat_weight_tensors_inner(tensors: &[&Tensor], in_features: usize) -> Optio
     }
 }
 
+/// Name of a fused weight: `<node>_fused_<kind>_w`, or `<weight>_fused_<kind>_w` when another
+/// fusion already took that (nodes need not have unique names; weights do).
+fn fused_name(g: &Graph, node: &str, weight: &str, kind: &str) -> String {
+    let n = format!("{node}_fused_{kind}_w");
+    if g.values.iter().any(|v| v.name == n) {
+        format!("{weight}_fused_{kind}_w")
+    } else {
+        n
+    }
+}
+
 /// Validates that `tensor` matches the declared graph `dtype`.
 pub(crate) fn matches_dtype(dtype: DType, tensor: &Tensor) -> bool {
     match (dtype, tensor) {
         (DType::F32, Tensor::F32(_)) => true,
         (DType::BF16, Tensor::BF16(_)) => true,
         (DType::F16, Tensor::F16(_)) => true,
+        (DType::BF16, Tensor::Mat(m)) => m.packed().is_none(),
+        (DType::Quant(fmt), Tensor::Mat(m)) => m.packed().is_some_and(|p| p.format == fmt),
         (DType::Quant(fmt), Tensor::Quantized(q)) => match q.as_ref() {
             crate::model::layers::QuantizedWeight::GgufQuantized { format, .. } => *format == fmt,
             crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. } => *format == fmt,
@@ -264,28 +323,28 @@ pub(crate) fn rewrite_qkv(
         let k_out_shape = g.value(g.node(k_id).outputs[0]).shape.clone();
         let v_out_shape = g.value(g.node(v_id).outputs[0]).shape.clone();
 
-        let fused_w_name = format!("{}_fused_qkv_w", q_name);
+        let fused_w_name = fused_name(g, &q_name, &g.value(q_w_id).name, "qkv");
 
         // If weights are provided, we MUST be able to fuse the weight tensors
         if let Some(ref w_store) = weights {
             let q_t = w_store.get(&g.value(q_w_id).name)?;
             let k_t = w_store.get(&g.value(k_w_id).name)?;
             let v_t = w_store.get(&g.value(v_w_id).name)?;
-            if matches!(q_t, Tensor::Mat(_))
-                || matches!(k_t, Tensor::Mat(_))
-                || matches!(v_t, Tensor::Mat(_))
-            {
-                return None;
-            }
             let fused_tensor = concat_weight_tensors(&[q_t, k_t, v_t], in_features)?;
             if !matches_dtype(dtype, &fused_tensor) {
                 return None;
             }
-            let old_names = vec![
-                g.value(q_w_id).name.clone(),
-                g.value(k_w_id).name.clone(),
-                g.value(v_w_id).name.clone(),
-            ];
+            // Loader Mats stay bound: a reshaped instance of the same program (other row
+            // counts, unfused) still reads them, and mapped ones cost no memory.
+            // ponytail: owned re-encoded Mats are held twice (fused + originals) until Phase 11.
+            let old_names = match q_t {
+                Tensor::Mat(_) => Vec::new(),
+                _ => vec![
+                    g.value(q_w_id).name.clone(),
+                    g.value(k_w_id).name.clone(),
+                    g.value(v_w_id).name.clone(),
+                ],
+            };
             weight_updates.push((fused_w_name.clone(), fused_tensor, old_names));
         }
 
@@ -425,7 +484,7 @@ pub(crate) fn rewrite_gate_up(
         let gate_out_shape = g.value(g.node(gate_id).outputs[0]).shape.clone();
         let up_out_shape = g.value(g.node(up_id).outputs[0]).shape.clone();
 
-        let fused_w_name = format!("{}_fused_gate_up_w", gate_name);
+        let fused_w_name = fused_name(g, &gate_name, &g.value(gate_w_id).name, "gate_up");
 
         // If weights are provided, we MUST be able to fuse the weight tensors
         if let Some(ref w_store) = weights {
@@ -783,13 +842,18 @@ mod tests {
     }
 
     #[test]
-    fn fuse_qkv_pass_leaves_mixed_formats_and_mats_unfused() {
-        use crate::hardware::QuantFormat as Q;
-        let (h, f, q4) = (DType::F16, DType::F32, DType::Quant(Q::GGUF_Q4_0));
-        for dts in [[h, h, f], [f, h, h], [q4, q4, q4]] {
+    fn fuse_qkv_pass_leaves_mixed_formats_unfused() {
+        let (h, f) = (DType::F16, DType::F32);
+        for dts in [[h, h, f], [f, h, h]] {
             let (mut g, mut w, _) = qkv_graph(dts);
             assert_eq!(fuse_rule(&mut g, Some(&mut w), Rule::Qkv), 0, "{dts:?}");
         }
+    }
+
+    #[test]
+    fn fuse_qkv_pass_concatenates_packed_mats() {
+        let q4 = DType::Quant(crate::hardware::QuantFormat::GGUF_Q4_0);
+        assert_eq!(fuse_and_check([q4, q4, q4]), ["q.fused_qkv"]);
     }
 
     #[test]

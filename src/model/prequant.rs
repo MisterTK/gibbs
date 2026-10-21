@@ -187,8 +187,14 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
 
 /// A safetensors checkpoint as [`Weights`] for the bf16 native models: memory-mapped when
 /// `config.json` names no `quantization_config` or a scheme [`Weights`] decodes per tensor itself
-/// (MLX, EXL3), else every tensor expanded through [`dequantize`] and held as bf16.
-pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weights, String> {
+/// (MLX, EXL3), else every tensor expanded through [`dequantize`] and held as bf16. With `repack`,
+/// weights [`crate::model::repack`] turns into a GPU codec layout stay packed
+/// ([`Weights::packed_gguf`]) instead.
+pub fn open_weights(
+    weights: &Path,
+    config_path: Option<&Path>,
+    repack: bool,
+) -> Result<Weights, String> {
     let cfg = config_path
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -205,13 +211,34 @@ pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weight
     }
     let (mut m, data) = crate::model::UniversalModelLoader::read_safetensors(weights)?;
     annotate(&mut m, config_path)?;
-    let specs = m
-        .tensors
-        .iter()
-        .filter(|(n, _)| !crate::model::repack::bnb::is_companion(n) && !crate::model::repack::gptq::is_companion(&m, n))
-        .map(|(n, t)| (n.clone(), t.shape.clone()))
-        .collect();
-    Weights::from_f32(specs, |n| m.extract_tensor_f32(&data, n))
+    let mut packed = Vec::new();
+    let mut specs = Vec::new();
+    for (n, t) in &m.tensors {
+        if crate::model::repack::bnb::is_companion(n)
+            || crate::model::repack::gptq::is_companion(&m, n)
+        {
+            continue;
+        }
+        match repack
+            .then(|| crate::model::repack::repack(&m, &data, n))
+            .transpose()?
+            .flatten()
+        {
+            Some(r) => packed.push((n.clone(), r)),
+            None => specs.push((n.clone(), t.shape.clone())),
+        }
+    }
+    let mut w = Weights::from_f32(specs, |n| m.extract_tensor_f32(&data, n))?;
+    for (n, r) in packed {
+        let p = crate::model::weights::Packed {
+            map: std::sync::Arc::new(crate::model::loaders::gguf::GgufData::Buf(r.bytes)),
+            off: 0,
+            format: r.format,
+            shape: vec![r.rows, r.cols],
+        };
+        w.insert_packed(n, p);
+    }
+    Ok(w)
 }
 
 /// Exposes compressed-tensors `X.weight_packed` as `X.weight` with its logical `[out, in]` shape, and
@@ -626,7 +653,7 @@ mod tests {
         std::fs::write(&p, st).unwrap();
         std::fs::write(&c, serde_json::json!({"model_type": "bitnet", "quantization_config":
             {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "online"}}).to_string()).unwrap();
-        let w = super::open_weights(&p, Some(&c)).unwrap();
+        let w = super::open_weights(&p, Some(&c), false).unwrap();
         assert_eq!(w.stored_dtype("w"), Some("F32"));
     }
 

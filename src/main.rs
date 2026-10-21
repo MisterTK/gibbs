@@ -424,7 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reencode,
             family: cli.arch.as_deref(),
             stage: &|s| *stage.lock() = s,
-            system1_first: true,
+            cli_routes: true,
             admit: &|_| Ok(()),
         },
     )

@@ -48,10 +48,11 @@ pub struct LoadOpts<'a> {
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
     /// adapter (merged into a snapshot of its base): an error refuses the load.
     pub admit: &'a dyn Fn(bool) -> Result<(), String>,
-    /// The CLI's legacy order (legacy: until Phase 7): System 1 encoders are detected before
-    /// classifiers and run on Metal wherever it exists; the TUI tries classifiers first and keeps
-    /// System 1 on its own backend.
-    pub system1_first: bool,
+    /// The CLI's legacy routes (legacy: until Phases 7 and 10): System 1 encoders are detected
+    /// before classifiers and run on Metal wherever it exists, and ModelScope text-to-video repos
+    /// route to video. The TUI tries classifiers first, keeps System 1 on its own backend and
+    /// takes ModelScope repos down the LM path as before.
+    pub cli_routes: bool,
 }
 
 /// `GIBBS_SPEC_LM=1`: causal LMs a family spec claims load through [`crate::runtime::lm`]
@@ -76,7 +77,7 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             let dev = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.
                 Device::Cpu
-                    if o.system1_first
+                    if o.cli_routes
                         && crate::hardware::available_devices().contains(&Device::Metal) =>
                 {
                     Device::Metal
@@ -85,17 +86,17 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             };
             JevSystem1Model::load(hub, id, dev).map(Loaded::System1)
         };
-        if o.system1_first && crate::model::jev::detect(hub, id) {
+        if o.cli_routes && crate::model::jev::detect(hub, id) {
             return system1();
         }
         if classifier::detect(hub, id).is_some() {
             return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
         }
-        if !o.system1_first && crate::model::jev::detect(hub, id) {
+        if !o.cli_routes && crate::model::jev::detect(hub, id) {
             return system1();
         }
         // legacy: until Phase 10 (video specs)
-        if let Some(v) = crate::model::t2v::detect(hub, id, o.quant_name) {
+        if let Some(v) = crate::model::t2v::detect(hub, id, o.quant_name, o.cli_routes) {
             return v.map(Loaded::Video);
         }
     }

@@ -15,9 +15,12 @@
 
 use super::expr::{eval_json, eval_str, interp, walk, Env, Val};
 use super::{InputDecl, Lora, Network, Source, Spec};
-use crate::graph::{DType, Graph, Op, ValueId};
+use crate::graph::{DType, Graph, Op, ValueId, ValueKind};
 use serde_json::{Map, Value as J};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Name suffix of a weight's projection copy (see `Builder::projection`).
+pub const LINEAR_COPY: &str = "#linear";
 
 /// One graph input of an instance, in declaration (= binding) order.
 #[derive(Debug, Clone)]
@@ -105,6 +108,7 @@ pub fn build_network(
         values: vec![HashMap::new()],
         weights: HashMap::new(),
         weight_order: Vec::new(),
+        gathered: HashSet::new(),
         states: HashMap::new(),
         inputs: HashMap::new(),
         taps: HashMap::new(),
@@ -176,6 +180,8 @@ struct Builder<'a> {
     values: Vec<HashMap<String, ValueId>>,
     weights: HashMap<String, ValueId>,
     weight_order: Vec<String>,
+    /// Values some non-`Linear` op reads.
+    gathered: HashSet<ValueId>,
     states: HashMap<String, ValueId>,
     inputs: HashMap<String, ValueId>,
     taps: HashMap<String, ValueId>,
@@ -416,6 +422,18 @@ impl<'a> Builder<'a> {
         Some(v)
     }
 
+    /// The weight a `Linear` reads for `w`: `w` itself, or when another op (a tied embedding
+    /// gather) already reads `w`, its projection copy `<name>#linear`, which the loader may
+    /// re-encode for streaming while the gather keeps the table's own encoding.
+    // ponytail: only a gather built before the Linear is seen (embedding first, tied head last).
+    fn projection(&mut self, w: ValueId) -> ValueId {
+        let name = self.g.value(w).name.clone();
+        if !self.gathered.contains(&w) || self.g.value(w).kind != ValueKind::Weight {
+            return w;
+        }
+        self.weight(&format!("{name}{LINEAR_COPY}")).unwrap_or(w)
+    }
+
     fn node_name(&self, m: &Map<String, J>, out: &str) -> Result<String, String> {
         let base = match m.get("name").and_then(J::as_str) {
             Some(n) => self.interp(n)?,
@@ -443,6 +461,11 @@ impl<'a> Builder<'a> {
             if let Some(v) = self.operand(r.as_str().ok_or("operand refs are strings")?)? {
                 ins.push(v);
             }
+        }
+        if let (Op::Linear, Some(w)) = (&parsed, ins.get_mut(1)) {
+            *w = self.projection(*w);
+        } else {
+            self.gathered.extend(ins.iter().copied());
         }
         let out = self.interp(m.get("out").and_then(J::as_str).ok_or("op needs `out`")?)?;
         let name = self.node_name(m, &out)?;

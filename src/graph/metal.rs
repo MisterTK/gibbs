@@ -1580,6 +1580,9 @@ impl Runtime {
 /// Graph weights on the GPU plus a reusable activation arena; runs are serialized.
 pub struct Session {
     rt: Arc<Runtime>,
+    /// Owners of the host memory the no-copy weight buffers wrap (a packed weight built at
+    /// compile time, e.g. a fused QKV, has no other owner once compilation returns).
+    _maps: Vec<Arc<crate::model::loaders::gguf::GgufData>>,
     /// Buffer, byte offset, element count, and weight storage format.
     weights: HashMap<String, (Buffer, usize, usize, WeightFormat)>,
     arena: Mutex<Option<Buffer>>,
@@ -1694,6 +1697,7 @@ impl Session {
                 .collect()
         });
         let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
+        let mut maps = Vec::new();
         let mut bufs = HashMap::new();
         let mut nvfp4_aux = HashMap::new();
         for (name, t) in weights.iter() {
@@ -1789,6 +1793,7 @@ impl Session {
                             );
                             if !buf.contents().is_null() {
                                 map_buffers.insert(map_ptr, buf);
+                                maps.push(p.map.clone());
                             }
                         }
                         if let Some(map_buf) = map_buffers.get(&map_ptr) {
@@ -2211,6 +2216,7 @@ impl Session {
         }
         Ok(Self {
             rt,
+            _maps: maps,
             weights: bufs,
             arena: Mutex::new(None),
             state_buffers: Mutex::new(HashMap::new()),

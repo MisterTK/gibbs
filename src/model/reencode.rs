@@ -624,9 +624,10 @@ fn is_ffn_name(name: &str) -> bool {
 /// Gather tables (token / per-layer embeddings, which a tied head shares) keep their source blocks:
 /// a gathered row's precision is not a streaming cost.
 fn is_gather_table(name: &str) -> bool {
-    ["embed", "token_embd", "ple"]
-        .iter()
-        .any(|s| name.contains(s))
+    !name.ends_with(crate::arch::build::LINEAR_COPY)
+        && ["embed", "token_embd", "ple"]
+            .iter()
+            .any(|s| name.contains(s))
 }
 
 /// Whether `f` still reads faster than the stored `src` by the rule's margin under `rate`; without
@@ -650,6 +651,33 @@ pub fn reencode_native(
     cols: usize,
     raw: &[u8],
 ) -> Option<(Q, Vec<u8>)> {
+    reencode_values(cfg, name, src, rows, cols, || {
+        // The source's own decoder, so the values are exactly what the GPU would have read.
+        let (elems, block_bytes, decode) = gguf_block_codec(src)?;
+        if cols % elems != 0 || raw.len() != rows * cols / elems * block_bytes {
+            return None;
+        }
+        let mut data = vec![0.0f32; rows * cols];
+        for (b, out) in raw
+            .chunks_exact(block_bytes)
+            .zip(data.chunks_exact_mut(elems))
+        {
+            decode(b, out);
+        }
+        Some(data)
+    })
+}
+
+/// [`reencode_native`] for a projection stored as `src` (any format, floats included) whose
+/// values `data` yields on demand (only when the policy re-encodes it).
+pub fn reencode_values(
+    cfg: &crate::model::weight_format::ReencodeConfig,
+    name: &str,
+    src: Q,
+    rows: usize,
+    cols: usize,
+    data: impl FnOnce() -> Option<Vec<f32>>,
+) -> Option<(Q, Vec<u8>)> {
     let ffn = match &cfg.ffn_weights {
         Some(pats) => pats.iter().any(|p| crate::arch::glob(p, name)),
         None => is_ffn_name(name),
@@ -667,18 +695,7 @@ pub fn reencode_native(
     if f == src || !encodable(f) {
         return None;
     }
-    // The source's own decoder, so the values are exactly what the GPU would have read.
-    let (elems, block_bytes, decode) = gguf_block_codec(src)?;
-    if cols % elems != 0 || raw.len() != rows * cols / elems * block_bytes {
-        return None;
-    }
-    let mut data = vec![0.0f32; rows * cols];
-    for (b, out) in raw
-        .chunks_exact(block_bytes)
-        .zip(data.chunks_exact_mut(elems))
-    {
-        decode(b, out);
-    }
+    let data = data()?;
     let threads = std::thread::available_parallelism()
         .map_or(2, |n| n.get())
         .saturating_sub(1)
@@ -703,7 +720,7 @@ pub fn reencode_native(
     let mut stats = NATIVE_STATS.lock();
     stats.reencoded += 1;
     (stats.bytes_before, stats.bytes_after) = (
-        stats.bytes_before + raw.len() as u64,
+        stats.bytes_before + (rows * src.tensor_bytes(cols)) as u64,
         stats.bytes_after + raw_data.len() as u64,
     );
     tracing::debug!("reencode {name} {rows}x{cols}: {src:?} -> {f:?} (rmse {rmse:.4})");

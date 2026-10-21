@@ -1413,7 +1413,7 @@ impl TuiApp {
                     family: None,
                     stage: &|s| *stage.lock() = s,
                     // Only text generators (and PEFT adapters of them) and image models hot-swap.
-                    system1_first: false,
+                    cli_routes: false,
                     admit: &|adapter| match adapter
                         || route_for_model(&id) == Route::Image
                         || is_chat_model(&id)
@@ -1448,9 +1448,9 @@ impl TuiApp {
                         *slot.write() = None;
                         Ok((None, shape))
                     }
-                    Loaded::Video(Video::ModelScope) => Err(format!(
-                        "text-to-video models other than LTX-Video run one generation per launch: `--model {id} --prompt \"...\" --output clip.mp4`"
-                    )),
+                    Loaded::Video(Video::ModelScope) => {
+                        unreachable!("the TUI does not take the ModelScope video route")
+                    }
                     Loaded::Image(g) => {
                         let d = g.defaults();
                         let shape = format!(

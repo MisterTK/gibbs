@@ -59,7 +59,7 @@ fn open_checkpoint(
     }
     crate::model::prequant::check(artifacts.config_path.as_deref(), dir)?;
     let config = artifacts.config_path.as_deref();
-    let ck = crate::model::prequant::open_weights(weights, config)?;
+    let ck = crate::model::prequant::open_weights(weights, config, false)?;
     Ok((ck, dir.to_path_buf()))
 }
 

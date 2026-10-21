@@ -33,16 +33,18 @@ pub enum Video {
     ModelScope,
 }
 
-/// The video route of `repo_id`, if it is a text-to-video repo; `quant` picks an LTX GGUF.
+/// The video route of `repo_id`, if it is a text-to-video repo; `quant` picks an LTX GGUF;
+/// ModelScope repos only when `modelscope`.
 pub fn detect(
     hub: &HuggingFaceHub,
     repo_id: &str,
     quant: Option<&str>,
+    modelscope: bool,
 ) -> Option<Result<Video, String>> {
     if let Some(plan) = crate::model::ltx::resolve(hub, repo_id, quant) {
         return Some(plan.map(Video::Ltx));
     }
-    TextToVideoPipeline::is_t2v_repo(hub, repo_id).then_some(Ok(Video::ModelScope))
+    (modelscope && TextToVideoPipeline::is_t2v_repo(hub, repo_id)).then_some(Ok(Video::ModelScope))
 }
 
 pub struct TextToVideoPipeline {
