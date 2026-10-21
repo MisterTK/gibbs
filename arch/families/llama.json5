@@ -1,0 +1,146 @@
+// Llama-style decoders (HF `model.layers.{i}.self_attn.*` names; llama.cpp GGUF via `llamacpp`):
+// llama, mistral, qwen2, smollm, ernie4_5, phi3 (fused qkv / gate_up split at load). Also the
+// fallback for causal LMs no other family claims. Real GQA: kv states are kv_heads wide.
+// BitNet b1.58 masters (`quant_method: bitnet`, 1bitLLM `weight_bits: 1`) get activation quant,
+// online ternarization and sub-norms here; `bitnet` adds its own names and match.
+{
+  family: "llama",
+  match: {
+    hf_model_type: ["llama", "mistral", "qwen2", "smollm", "smollm2", "ernie4_5", "phi3"],
+    hf_architectures: ["LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "Ernie4_5ForCausalLM",
+                       "Phi3ForCausalLM"],
+    gguf_arch: ["llama", "qwen2", "ernie4_5"],
+    fallback: true,
+  },
+  pipeline: "causal_lm",
+  use_lib: ["transformer"],
+  config: {
+    gguf_arch: "first(gguf['general.architecture'], '')",
+    hidden: "first(cfg.hidden_size, cfg.n_embd, cfg.d_model, gguf.embedding_length)",
+    layers: "first(cfg.num_hidden_layers, cfg.n_layer, cfg.n_layers, gguf.block_count)",
+    heads: "first(cfg.num_attention_heads, cfg.num_heads, cfg.n_heads, cfg.n_head, gguf['attention.head_count'])",
+    kv_heads: "first(cfg.num_key_value_heads, cfg.n_kv_heads, gguf['attention.head_count_kv'], heads)",
+    head_dim: "first(cfg.head_dim, gguf['attention.key_length'], hidden // heads)",
+    vocab: "first(shape('model.embed_tokens.weight')[0], cfg.vocab_size, gguf.vocab_size)",
+    inter: "first(cfg.intermediate_size, gguf.feed_forward_length, 4 * hidden)",
+    eps: "first(cfg.rms_norm_eps, cfg.layer_norm_eps, cfg.layer_norm_epsilon, cfg.norm_eps, gguf['attention.layer_norm_rms_epsilon'], gguf['attention.layer_norm_epsilon'], 1e-5)",
+    norm_kind: "'rms'",
+    // HF `hidden_act` -> UnaryKind (gated MLP; silu -> SwiGlu).
+    act: "first(cfg.hidden_act, 'silu') == 'relu2' ? 'Relu2' : first(cfg.hidden_act, 'silu') == 'gelu' ? 'GeluErf' : contains(['gelu_new', 'gelu_fast', 'gelu_pytorch_tanh'], cfg.hidden_act) ? 'GeluTanh' : first(cfg.hidden_act, 'silu') == 'relu' ? 'Relu' : 'Silu'",
+    theta: "first(cfg.rope_theta, cfg.rope_parameters.rope_theta, gguf['rope.freq_base'], 10000)",
+    rotary_pct: "cfg.position_embedding_type == 'nope' ? 0 : first(cfg.rotary_pct, cfg.partial_rotary_factor, first(gguf['rope.dimension_count'], head_dim) / head_dim)",
+    rotary_dim: "int(head_dim * rotary_pct)",
+    // llama.cpp's LLAMA_ROPE_TYPE_NORM archs rotate adjacent pairs (convert_hf_to_gguf permutes
+    // llama q/k rows into that layout); HF checkpoints rotate halves.
+    rope_variant: "contains(['llama', 'llada', 'llama4', 'deci', 'baichuan', 'starcoder', 'internlm2', 'minicpm', 'xverse', 'command-r', 'cohere2', 'olmo', 'arctic', 'deepseek', 'deepseek2', 'plm', 'chatglm', 'glm4', 'granite', 'granitemoe', 'granitehybrid', 'chameleon', 'bailingmoe', 'neo-bert', 'smollm3', 'arcee', 'ernie4_5', 'ernie4_5-moe'], gguf_arch) ? 'Interleaved' : 'HalfSplit'",
+    rope_type: "first(cfg.rope_scaling.rope_type, cfg.rope_scaling.type, 'default')",
+    rope_kind: "rope_type == 'llama3' ? 'wavelen_band' : rope_type == 'linear' ? 'linear' : 'default'",
+    qk_norm: "has('model.layers.0.self_attn.q_norm.weight') ? 'before' : 'none'",
+    attn_scale: "1 / sqrt(head_dim)",
+    embed_mult: "1",
+    residual_mult: "1",
+    logit_scale: "1",
+    head_w: "has('lm_head.weight') ? 'lm_head' : 'model.embed_tokens'",
+    // Context the KV states hold: the runner's, else the model's capped at 4096.
+    ctx: "first(runtime.ctx, min(first(cfg.max_position_embeddings, gguf.context_length, 2048), 4096))",
+    // BitNet b1.58 BitLinear (hf_loader `HfConfigJson::bitnet`): int8 activations; online masters
+    // ternarize at load.
+    aq_bits: "cfg.quantization_config.quant_method == 'bitnet' ? 8 : first(cfg.weight_bits, 0) == 1 ? first(cfg.input_bits, 8) : 0",
+    ternarize: "aq_bits > 0 && (cfg.quantization_config.quantization_mode == 'online' || first(cfg.weight_bits, 0) == 1)",
+  },
+  checks: [
+    {expr: "cfg.model_type == 'olmo' || gguf_arch == 'olmo'", error: "OLMo (non-parametric LayerNorm) is not implemented"},
+    {expr: "cfg.model_type == 'gemma3' || cfg.model_type == 'exaone4' || gguf_arch == 'gemma3' || gguf_arch == 'exaone4' || (has('model.layers.0.pre_feedforward_layernorm.weight') && has('model.layers.0.self_attn.q_norm.weight'))",
+     error: "architecture '{first(cfg.model_type, gguf_arch)}' (sliding-window layers, per-layer RoPE, scaled embeddings) is not implemented by the llama spec"},
+    {expr: "has('model.layers.0.block_sparse_moe.gate.weight') || first(cfg.num_local_experts, 0) > 0", error: "expert (MoE) layers are not implemented by the llama spec"},
+    {expr: "has('model.layers.0.self_attn.query_layernorm.weight') || has('model.layers.0.self_attn.key_layernorm.weight')", error: "q/k norm after RoPE (query_layernorm) is not implemented by the llama spec"},
+    {expr: "has('model.layers.0.self_attn.q_norm.weight') != has('model.layers.0.self_attn.k_norm.weight')", error: "q and k norm gains must come as a pair"},
+    {expr: "has('model.layers.0.self_attn.q_norm.weight') && shape('model.layers.0.self_attn.q_norm.weight')[0] != head_dim",
+     error: "q/k norm of {shape('model.layers.0.self_attn.q_norm.weight')[0]} gains, expected head_dim {head_dim} (full-width q/k norm is not implemented)"},
+    {expr: "aq_bits > 0 && !(has('model.layers.0.self_attn.attn_sub_norm.weight') && has('model.layers.0.mlp.ffn_sub_norm.weight'))",
+     error: "BitNet: missing attention/MLP sub-norm (attn_sub_norm, ffn_sub_norm, inner_attn_ln or ffn_layernorm)"},
+    {expr: "rotary_dim % 2 != 0", error: "rotary dim {rotary_dim} is odd"},
+  ],
+  names: {
+    use: ["llamacpp"],
+    rules: [
+      // 1bitLLM BitNet sub-norms.
+      ["model.layers.{i}.self_attn.inner_attn_ln.weight", "model.layers.{i}.self_attn.attn_sub_norm.weight"],
+      ["model.layers.{i}.mlp.ffn_layernorm.weight", "model.layers.{i}.mlp.ffn_sub_norm.weight"],
+    ],
+  },
+  transforms: [
+    // Phi-3 / GGUF fused projections.
+    {tensor: "model.layers.{i}.self_attn.qkv_proj.weight", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.self_attn.q_proj.weight", "heads * head_dim"],
+      ["model.layers.{i}.self_attn.k_proj.weight", "kv_heads * head_dim"],
+      ["model.layers.{i}.self_attn.v_proj.weight", "kv_heads * head_dim"]]}},
+    {tensor: "model.layers.{i}.self_attn.qkv_proj.bias", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.self_attn.q_proj.bias", "heads * head_dim"],
+      ["model.layers.{i}.self_attn.k_proj.bias", "kv_heads * head_dim"],
+      ["model.layers.{i}.self_attn.v_proj.bias", "kv_heads * head_dim"]]}},
+    // GLM / Phi-3 fused [gate; up] rows.
+    {tensor: "model.layers.{i}.mlp.gate_up_proj.weight", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.mlp.gate_proj.weight", "inter"], ["model.layers.{i}.mlp.up_proj.weight", "inter"]]}},
+    // BitNet online weight quant: every BitLinear projection on its own 1 / mean |W| scale.
+    {tensor: "model.layers.{i}.{n:*}_proj.weight", op: "ternarize", when: "ternarize"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "rope_inv_freq", when: "rotary_dim > 0", args: {
+      dim: "rotary_dim", theta: "theta", kind: "rope_kind", precision: "rope_kind == 'default' ? 'f32' : 'f64'",
+      factor: "cfg.rope_scaling.factor", low_freq_factor: "cfg.rope_scaling.low_freq_factor",
+      high_freq_factor: "cfg.rope_scaling.high_freq_factor",
+      original_max_position_embeddings: "cfg.rope_scaling.original_max_position_embeddings"}},
+    "act_quant.qp": {gen: "fill", when: "aq_bits > 0", args: {shape: [1], value: "2 ** (aq_bits - 1) - 1"}},
+  },
+  // ponytail: llama.cpp's llama-3 `rope_freqs` factors are ignored (GGUF carries no rope_scaling
+  // parameters to regenerate them); divide inv_freq by them in-graph when long contexts matter.
+  ignore: ["rope_freqs.weight", "model.layers.*.self_attn.rotary_emb.inv_freq"],
+  synthetic: {
+    "model.embed_tokens.weight": {shape: ["vocab", "hidden"]},
+    "model.norm.weight": {shape: ["hidden"]},
+    "model.layers.{l}.input_layernorm.weight": {shape: ["hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.post_attention_layernorm.weight": {shape: ["hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.self_attn.q_proj.weight": {shape: ["heads * head_dim", "hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.self_attn.k_proj.weight": {shape: ["kv_heads * head_dim", "hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.self_attn.v_proj.weight": {shape: ["kv_heads * head_dim", "hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.self_attn.o_proj.weight": {shape: ["hidden", "heads * head_dim"], over: {l: "range(layers)"}},
+    "model.layers.{l}.mlp.gate_proj.weight": {shape: ["inter", "hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.mlp.up_proj.weight": {shape: ["inter", "hidden"], over: {l: "range(layers)"}},
+    "model.layers.{l}.mlp.down_proj.weight": {shape: ["hidden", "inter"], over: {l: "range(layers)"}},
+  },
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Unary", args: {kind: {Scale: "embed_mult"}}, in: ["x"], out: "x", name: "embed_scale", when: "embed_mult != 1"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')"}},
+          {use: "norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "attn_cached", in: ["h"], out: "a", name: "l{i}.attn", args: {
+            layer: "i", wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
+            wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.o_proj')",
+            q_norm: "fmt('{p}.self_attn.q_norm')", k_norm: "fmt('{p}.self_attn.k_norm')",
+            sub_norm: "aq_bits > 0 ? fmt('{p}.self_attn.attn_sub_norm') : ''", aq_bits: "aq_bits"}},
+          {use: "residual", args: {scale: "residual_mult"}, in: ["x", "a"], out: "x", name: "l{i}.res1"},
+          {use: "norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
+            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')",
+            sub_norm: "aq_bits > 0 ? fmt('{p}.mlp.ffn_sub_norm') : ''", aq_bits: "aq_bits"}},
+          {use: "residual", args: {scale: "residual_mult"}, in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "lm_head", args: {w: "head_w", logit_scale: "logit_scale"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"]},
+}

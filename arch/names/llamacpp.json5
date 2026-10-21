@@ -1,0 +1,32 @@
+// llama.cpp GGUF tensor names -> Hugging Face llama-style names (llama.cpp `LLM_TENSOR_NAMES`).
+// Families with other HF names put their own rules first (family rules win).
+{
+  rules: [
+    ["token_embd.weight", "model.embed_tokens.weight"],
+    ["output_norm.weight", "model.norm.weight"],
+    ["output_norm.bias", "model.norm.bias"],
+    ["output.weight", "lm_head.weight"],
+    ["blk.{i}.attn_norm.weight", "model.layers.{i}.input_layernorm.weight"],
+    ["blk.{i}.attn_norm.bias", "model.layers.{i}.input_layernorm.bias"],
+    ["blk.{i}.attn_q.weight", "model.layers.{i}.self_attn.q_proj.weight"],
+    ["blk.{i}.attn_q.bias", "model.layers.{i}.self_attn.q_proj.bias"],
+    ["blk.{i}.attn_k.weight", "model.layers.{i}.self_attn.k_proj.weight"],
+    ["blk.{i}.attn_k.bias", "model.layers.{i}.self_attn.k_proj.bias"],
+    ["blk.{i}.attn_v.weight", "model.layers.{i}.self_attn.v_proj.weight"],
+    ["blk.{i}.attn_v.bias", "model.layers.{i}.self_attn.v_proj.bias"],
+    ["blk.{i}.attn_qkv.weight", "model.layers.{i}.self_attn.qkv_proj.weight"],
+    ["blk.{i}.attn_qkv.bias", "model.layers.{i}.self_attn.qkv_proj.bias"],
+    ["blk.{i}.attn_output.weight", "model.layers.{i}.self_attn.o_proj.weight"],
+    ["blk.{i}.attn_output.bias", "model.layers.{i}.self_attn.o_proj.bias"],
+    ["blk.{i}.attn_q_norm.weight", "model.layers.{i}.self_attn.q_norm.weight"],
+    ["blk.{i}.attn_k_norm.weight", "model.layers.{i}.self_attn.k_norm.weight"],
+    ["blk.{i}.ffn_norm.weight", "model.layers.{i}.post_attention_layernorm.weight"],
+    ["blk.{i}.ffn_norm.bias", "model.layers.{i}.post_attention_layernorm.bias"],
+    ["blk.{i}.ffn_gate.weight", "model.layers.{i}.mlp.gate_proj.weight"],
+    ["blk.{i}.ffn_up.weight", "model.layers.{i}.mlp.up_proj.weight"],
+    ["blk.{i}.ffn_gate_up.weight", "model.layers.{i}.mlp.gate_up_proj.weight"],
+    ["blk.{i}.ffn_down.weight", "model.layers.{i}.mlp.down_proj.weight"],
+    ["blk.{i}.attn_sub_norm.weight", "model.layers.{i}.self_attn.attn_sub_norm.weight"],
+    ["blk.{i}.ffn_sub_norm.weight", "model.layers.{i}.mlp.ffn_sub_norm.weight"],
+  ],
+}

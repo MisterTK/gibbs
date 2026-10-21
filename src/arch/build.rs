@@ -120,13 +120,14 @@ pub fn build_network(
     b.body(&net.body)?;
     let mut outputs = Vec::new();
     for o in &net.outputs {
-        let (name, when) = match o {
-            J::String(s) => (s.clone(), None),
+        let (name, value, when) = match o {
+            J::String(s) => (s.clone(), None, None),
             J::Object(m) => (
                 m.get("name")
                     .and_then(J::as_str)
                     .ok_or("output object needs `name`")?
                     .to_string(),
+                m.get("value").and_then(J::as_str),
                 m.get("when").cloned(),
             ),
             _ => return Err(format!("bad output {o}")),
@@ -137,7 +138,10 @@ pub fn build_network(
             }
         }
         let name = b.interp(&name)?;
-        let v = b.value(&name)?;
+        let v = b.value(&match value {
+            Some(s) => b.interp(s)?,
+            None => name.clone(),
+        })?;
         b.g.output(v);
         outputs.push(name);
     }

@@ -13,13 +13,26 @@ pub mod gen;
 pub mod load;
 pub mod names;
 pub mod templates;
+#[cfg(test)]
+pub mod testing;
 
 use serde::Deserialize;
 use serde_json::{Map, Value as J};
 use std::path::Path;
 
 /// Every embedded spec file: (path under `arch/`, contents).
-pub const EMBEDDED: &[(&str, &str)] = &[];
+pub const EMBEDDED: &[(&str, &str)] = &[
+    ("lib/transformer.json5", include_str!("../../arch/lib/transformer.json5")),
+    ("names/llamacpp.json5", include_str!("../../arch/names/llamacpp.json5")),
+    ("families/llama.json5", include_str!("../../arch/families/llama.json5")),
+    ("families/glm.json5", include_str!("../../arch/families/glm.json5")),
+    ("families/granite.json5", include_str!("../../arch/families/granite.json5")),
+    ("families/bitnet.json5", include_str!("../../arch/families/bitnet.json5")),
+    ("families/gpt_neox.json5", include_str!("../../arch/families/gpt_neox.json5")),
+    ("families/gpt2.json5", include_str!("../../arch/families/gpt2.json5")),
+    ("families/opt.json5", include_str!("../../arch/families/opt.json5")),
+    ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
+];
 
 /// Tensor facts the interpreter needs: canonical weights and generated constants.
 pub trait Source {
@@ -148,7 +161,7 @@ pub struct Network {
     #[serde(default)]
     pub inputs: Vec<InputDecl>,
     pub body: Vec<J>,
-    /// Names, or `{name, when}` objects.
+    /// Names, or `{name, value?, when?}` objects (`value`: the scope value output as `name`).
     #[serde(default)]
     pub outputs: Vec<J>,
 }
@@ -631,5 +644,415 @@ mod tests {
         assert!(glob("org/*-GGUF", "org/model-GGUF"));
         assert!(glob("*.gguf", "a.Q4_0.gguf"));
         assert!(!glob("org/?", "org/ab"));
+    }
+
+    // ---- LM family specs vs GraphLm / LnDecoder (fixtures as in `tests/golden/lm.rs`, `enc.rs`) ----
+
+    use super::testing::{compare, Runner, Weights};
+    use crate::hardware::Device;
+    use serde_json::{json, Value as J};
+    use std::path::Path;
+
+    const V: usize = 256;
+    const PROMPT: [u32; 6] = [5, 17, 42, 99, 133, 200];
+    const DECODE: [u32; 3] = [7, 64, 250];
+
+    struct Dims {
+        h: usize,
+        heads: usize,
+        kv: usize,
+        hd: usize,
+        inter: usize,
+        layers: usize,
+    }
+
+    fn lm_config(model_type: &str, arch: &str, d: &Dims, extra: J) -> J {
+        let mut c = json!({
+            "model_type": model_type, "architectures": [arch], "vocab_size": V,
+            "hidden_size": d.h, "num_hidden_layers": d.layers, "num_attention_heads": d.heads,
+            "num_key_value_heads": d.kv, "head_dim": d.hd, "intermediate_size": d.inter,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "hidden_act": "silu",
+            "max_position_embeddings": 128, "bos_token_id": 1, "eos_token_id": 2,
+            "tie_word_embeddings": true,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        c
+    }
+
+    /// `tests/golden/lm.rs` `llama_weights` (HF llama names).
+    fn llama_weights(seed: u64, d: &Dims, qk_norm: bool, shared_mlp: bool, bitnet: bool, untied: bool) -> Weights {
+        let mut w = Weights::new(seed);
+        w.s("model.embed_tokens.weight", &[V, d.h], 0.05);
+        w.norm("model.norm.weight", d.h, 1.0);
+        if untied {
+            w.w("lm_head.weight", &[V, d.h]);
+        }
+        let (a, kvd) = (d.heads * d.hd, d.kv * d.hd);
+        let proj = |w: &mut Weights, name: String, shape: [usize; 2]| {
+            if !bitnet {
+                w.w(name, &shape);
+                return;
+            }
+            let s = 1.0 / (shape[1] as f32).sqrt();
+            let v = (0..shape[0] * shape[1]).map(|_| s * ((w.rng.next_u64() % 3) as f32 - 1.0)).collect();
+            w.put(name, &shape, v);
+        };
+        for l in 0..d.layers {
+            let p = format!("model.layers.{l}");
+            w.norm(format!("{p}.input_layernorm.weight"), d.h, 1.0);
+            w.norm(format!("{p}.post_attention_layernorm.weight"), d.h, 1.0);
+            for (n, shape) in [("q_proj", [a, d.h]), ("k_proj", [kvd, d.h]), ("v_proj", [kvd, d.h]), ("o_proj", [d.h, a])] {
+                proj(&mut w, format!("{p}.self_attn.{n}.weight"), shape);
+            }
+            if qk_norm {
+                w.norm(format!("{p}.self_attn.q_norm.weight"), d.hd, 1.0);
+                w.norm(format!("{p}.self_attn.k_norm.weight"), d.hd, 1.0);
+            }
+            if shared_mlp {
+                w.w(format!("{p}.shared_mlp.input_linear.weight"), &[2 * d.inter, d.h]);
+                w.w(format!("{p}.shared_mlp.output_linear.weight"), &[d.h, d.inter]);
+            } else {
+                for (n, shape) in [("gate_proj", [d.inter, d.h]), ("up_proj", [d.inter, d.h]), ("down_proj", [d.h, d.inter])] {
+                    proj(&mut w, format!("{p}.mlp.{n}.weight"), shape);
+                }
+            }
+            if bitnet {
+                w.norm(format!("{p}.self_attn.attn_sub_norm.weight"), a, 1.0);
+                w.norm(format!("{p}.mlp.ffn_sub_norm.weight"), d.inter, 1.0);
+            }
+        }
+        w
+    }
+
+    fn lfm2_fixture() -> (J, Weights) {
+        let d = Dims { h: 32, heads: 4, kv: 2, hd: 8, inter: 64, layers: 3 };
+        let (conv, k) = ([true, false, true], 3);
+        let cfg = lm_config("lfm2", "Lfm2ForCausalLM", &d, json!({
+            "norm_eps": 1e-5, "conv_L_cache": k, "conv_bias": false,
+            "block_auto_adjust_ff_dim": false, "rope_theta": 1000000.0,
+            "layer_types": ["conv", "full_attention", "conv"]}));
+        let mut w = Weights::new(13);
+        w.s("model.embed_tokens.weight", &[V, d.h], 0.05);
+        w.norm("model.embedding_norm.weight", d.h, 1.0);
+        for (l, &is_conv) in conv.iter().enumerate() {
+            let p = format!("model.layers.{l}");
+            w.norm(format!("{p}.operator_norm.weight"), d.h, 1.0);
+            w.norm(format!("{p}.ffn_norm.weight"), d.h, 1.0);
+            if is_conv {
+                w.w(format!("{p}.conv.in_proj.weight"), &[3 * d.h, d.h]);
+                w.w(format!("{p}.conv.conv.weight"), &[d.h, 1, k]);
+                w.w(format!("{p}.conv.out_proj.weight"), &[d.h, d.h]);
+            } else {
+                let (a, kvd) = (d.heads * d.hd, d.kv * d.hd);
+                w.w(format!("{p}.self_attn.q_proj.weight"), &[a, d.h]);
+                w.w(format!("{p}.self_attn.k_proj.weight"), &[kvd, d.h]);
+                w.w(format!("{p}.self_attn.v_proj.weight"), &[kvd, d.h]);
+                w.w(format!("{p}.self_attn.out_proj.weight"), &[d.h, a]);
+                w.norm(format!("{p}.self_attn.q_layernorm.weight"), d.hd, 1.0);
+                w.norm(format!("{p}.self_attn.k_layernorm.weight"), d.hd, 1.0);
+            }
+            w.w(format!("{p}.feed_forward.w1.weight"), &[d.inter, d.h]);
+            w.w(format!("{p}.feed_forward.w3.weight"), &[d.inter, d.h]);
+            w.w(format!("{p}.feed_forward.w2.weight"), &[d.h, d.inter]);
+        }
+        (cfg, w)
+    }
+
+    /// GPT-NeoX: fused per-head query_key_value, partial RoPE (rotary_pct 0.25), parallel residual.
+    fn neox_fixture() -> (J, Weights) {
+        let (h, heads, inter, layers) = (32, 2, 64, 2);
+        let cfg = json!({"model_type": "gpt_neox", "architectures": ["GPTNeoXForCausalLM"], "vocab_size": V,
+            "hidden_size": h, "num_hidden_layers": layers, "num_attention_heads": heads, "intermediate_size": inter,
+            "rotary_pct": 0.25, "rope_theta": 10000.0, "layer_norm_eps": 1e-5, "hidden_act": "gelu_new",
+            "use_parallel_residual": true, "max_position_embeddings": 128, "tie_word_embeddings": false});
+        let mut w = Weights::new(17);
+        w.s("gpt_neox.embed_in.weight", &[V, h], 0.05);
+        let ln = |w: &mut Weights, n: String| {
+            w.norm(format!("{n}.weight"), h, 1.0);
+            w.s(format!("{n}.bias"), &[h], 0.1);
+        };
+        let lin = |w: &mut Weights, n: String, out: usize, inp: usize| {
+            w.w(format!("{n}.weight"), &[out, inp]);
+            w.s(format!("{n}.bias"), &[out], 0.1);
+        };
+        for l in 0..layers {
+            let p = format!("gpt_neox.layers.{l}");
+            ln(&mut w, format!("{p}.input_layernorm"));
+            lin(&mut w, format!("{p}.attention.query_key_value"), 3 * h, h);
+            lin(&mut w, format!("{p}.attention.dense"), h, h);
+            ln(&mut w, format!("{p}.post_attention_layernorm"));
+            lin(&mut w, format!("{p}.mlp.dense_h_to_4h"), inter, h);
+            lin(&mut w, format!("{p}.mlp.dense_4h_to_h"), h, inter);
+        }
+        ln(&mut w, "gpt_neox.final_layer_norm".into());
+        w.w("embed_out.weight", &[V, h]);
+        (cfg, w)
+    }
+
+    /// GPT-Neo (`transformer.h.{l}.attn.attention.*`, Linear MLP, learned positions), which GraphLm
+    /// loads. GraphLm scales scores by 1/sqrt(head_dim); `attention_multiplier: 1.0` makes it use
+    /// GPT-Neo's unscaled scores, and the local layer's window (256) covers the 9 tokens.
+    fn neo_fixture() -> (J, Weights) {
+        let (h, inter) = (32, 64);
+        let cfg = json!({"model_type": "gpt_neo", "architectures": ["GPTNeoForCausalLM"], "vocab_size": V,
+            "hidden_size": h, "num_layers": 2, "num_heads": 2, "intermediate_size": inter,
+            "max_position_embeddings": 32, "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5,
+            "attention_layers": ["global", "local"], "window_size": 256, "attention_multiplier": 1.0});
+        let mut w = Weights::new(18);
+        w.s("transformer.wte.weight", &[V, h], 0.05);
+        w.s("transformer.wpe.weight", &[32, h], 0.3);
+        let ln = |w: &mut Weights, n: String| {
+            w.norm(format!("{n}.weight"), h, 1.0);
+            w.s(format!("{n}.bias"), &[h], 0.1);
+        };
+        for l in 0..2 {
+            let p = format!("transformer.h.{l}");
+            ln(&mut w, format!("{p}.ln_1"));
+            for s in ["q_proj", "k_proj", "v_proj"] {
+                w.w(format!("{p}.attn.attention.{s}.weight"), &[h, h]);
+            }
+            w.w(format!("{p}.attn.attention.out_proj.weight"), &[h, h]);
+            w.s(format!("{p}.attn.attention.out_proj.bias"), &[h], 0.1);
+            ln(&mut w, format!("{p}.ln_2"));
+            w.w(format!("{p}.mlp.c_fc.weight"), &[inter, h]);
+            w.s(format!("{p}.mlp.c_fc.bias"), &[inter], 0.1);
+            w.w(format!("{p}.mlp.c_proj.weight"), &[h, inter]);
+            w.s(format!("{p}.mlp.c_proj.bias"), &[h], 0.1);
+        }
+        ln(&mut w, "transformer.ln_f".into());
+        (cfg, w)
+    }
+
+    const DEC_VOCAB: usize = 64;
+
+    /// `tests/golden/enc.rs` `gpt2`: pre-LN, tanh GELU, Conv1D weights, `transformer.` prefix.
+    fn gpt2_fixture() -> (J, Weights) {
+        let (h, ffn, ctx) = (32, 64, 32);
+        let mut w = Weights::new(0xEB);
+        w.s("transformer.wte.weight", &[DEC_VOCAB, h], 0.5);
+        w.s("transformer.wpe.weight", &[ctx, h], 0.3);
+        let ln = |w: &mut Weights, n: String| {
+            w.norm(format!("{n}.weight"), h, 1.0);
+            w.s(format!("{n}.bias"), &[h], 0.1);
+        };
+        let conv1d = |w: &mut Weights, n: String, inp: usize, out: usize| {
+            w.s(format!("{n}.weight"), &[inp, out], 1.0 / (inp as f32).sqrt());
+            w.s(format!("{n}.bias"), &[out], 0.1);
+        };
+        for l in 0..2 {
+            let p = format!("transformer.h.{l}");
+            ln(&mut w, format!("{p}.ln_1"));
+            conv1d(&mut w, format!("{p}.attn.c_attn"), h, 3 * h);
+            conv1d(&mut w, format!("{p}.attn.c_proj"), h, h);
+            ln(&mut w, format!("{p}.ln_2"));
+            conv1d(&mut w, format!("{p}.mlp.c_fc"), h, ffn);
+            conv1d(&mut w, format!("{p}.mlp.c_proj"), ffn, h);
+        }
+        ln(&mut w, "transformer.ln_f".into());
+        w.s("score.weight", &[3, h], 0.3);
+        let cfg = json!({"architectures": ["GPT2ForSequenceClassification"], "model_type": "gpt2",
+            "n_layer": 2, "n_head": 2, "n_embd": h, "n_positions": ctx, "n_ctx": ctx, "vocab_size": DEC_VOCAB,
+            "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5, "pad_token_id": 0});
+        (cfg, w)
+    }
+
+    /// `tests/golden/enc.rs` `opt`: project_in/out (embeddings 16, hidden 32), positions offset 2.
+    fn opt_fixture(pre_ln: bool, act: &str, seed: u64) -> (J, Weights) {
+        let (h, e, ffn, ctx) = (32, 16, 64, 32);
+        let p = "model.decoder";
+        let mut w = Weights::new(seed);
+        let ln = |w: &mut Weights, n: String| {
+            w.norm(format!("{n}.weight"), h, 1.0);
+            w.s(format!("{n}.bias"), &[h], 0.1);
+        };
+        let lin = |w: &mut Weights, n: String, out: usize, inp: usize| {
+            w.w(format!("{n}.weight"), &[out, inp]);
+            w.s(format!("{n}.bias"), &[out], 0.1);
+        };
+        w.s(format!("{p}.embed_tokens.weight"), &[DEC_VOCAB, e], 0.5);
+        w.s(format!("{p}.embed_positions.weight"), &[ctx + 2, h], 0.3);
+        w.w(format!("{p}.project_in.weight"), &[h, e]);
+        w.w(format!("{p}.project_out.weight"), &[e, h]);
+        for l in 0..2 {
+            let b = format!("{p}.layers.{l}");
+            ln(&mut w, format!("{b}.self_attn_layer_norm"));
+            for s in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                lin(&mut w, format!("{b}.self_attn.{s}"), h, h);
+            }
+            ln(&mut w, format!("{b}.final_layer_norm"));
+            lin(&mut w, format!("{b}.fc1"), ffn, h);
+            lin(&mut w, format!("{b}.fc2"), h, ffn);
+        }
+        if pre_ln {
+            ln(&mut w, format!("{p}.final_layer_norm"));
+        }
+        w.s("score.weight", &[3, e], 1.0);
+        let cfg = json!({"architectures": ["OPTForSequenceClassification"], "model_type": "opt",
+            "hidden_size": h, "ffn_dim": ffn, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "word_embed_proj_dim": e, "max_position_embeddings": ctx, "vocab_size": DEC_VOCAB,
+            "do_layer_norm_before": pre_ln, "activation_function": act, "enable_bias": true,
+            "layer_norm_elementwise_affine": true, "pad_token_id": 0});
+        (cfg, w)
+    }
+
+    fn devices() -> Vec<Device> {
+        let mut d = vec![Device::Cpu];
+        if crate::hardware::available_devices().contains(&Device::Metal) {
+            d.push(Device::Metal);
+        }
+        d
+    }
+
+    fn close(bad: &mut Vec<String>, what: &str, got: &[f32], want: &[f32]) {
+        let (rel, cos) = compare(got, want);
+        eprintln!("{what}: rel {rel:.3e} cos {cos:.6}");
+        if !(rel < 1e-3 && cos > 0.9999) {
+            bad.push(format!("{what}: rel {rel:.3e} cos {cos:.6}"));
+        }
+    }
+
+    /// The spec's `out` after a 6-row prefill of `prompt` (head `head`), then after each of 3
+    /// one-row decode steps with the KV state carried, and the runner.
+    fn spec_steps(dir: &Path, family: &str, dev: Device, prompt: &[u32], decode: &[u32], head: &str, out: &str) -> (Vec<Vec<f32>>, Runner) {
+        let mut r = Runner::load(dir, None, dev, 64).unwrap_or_else(|e| panic!("{family}: {e}"));
+        assert_eq!(r.model.spec.family, family, "detected family");
+        let mut o = vec![r.lm(prompt, 0, head, out, vec![])];
+        for (i, &t) in decode.iter().enumerate() {
+            o.push(r.lm(&[t], prompt.len() + i, head, out, vec![]));
+        }
+        (o, r)
+    }
+
+    /// Every checkpoint tensor is read by some instance `r` built.
+    fn all_read(r: &Runner, case: &str) {
+        assert_eq!(r.unconsumed(), Vec::<String>::new(), "{case}: unconsumed checkpoint tensors");
+    }
+
+    /// Each GraphLm fixture family against GraphLm (`hf_loader::load_causal_lm` +
+    /// `ExecutableModel::load_graph_lm`) on the same device; GPT-2 / OPT (which GraphLm does not
+    /// load) against their `LnDecoder` host forward; BitNet against `tests/golden/lm_bitnet.json`
+    /// (GraphLm's BitNet graph is wrong). Prefill 6 rows, then 3 cached decode steps.
+    #[test]
+    fn llama_family_matches_graph_lm() {
+        use crate::hardware::QuantMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bad = Vec::new();
+        let seq: Vec<u32> = PROMPT.iter().chain(&DECODE).copied().collect();
+        let d = |h, heads, kv, hd, inter, layers| Dims { h, heads, kv, hd, inter, layers };
+        let smol = d(64, 4, 2, 16, 128, 2);
+        let granite_cfg = lm_config("granitemoehybrid", "GraniteMoeHybridForCausalLM", &smol, json!({
+            "attention_multiplier": 0.1, "embedding_multiplier": 3.0, "residual_multiplier": 0.5,
+            "logits_scaling": 4.0, "shared_intermediate_size": 128, "num_local_experts": 0,
+            "layer_types": ["attention", "attention"], "position_embedding_type": "rope",
+            "tie_word_embeddings": false}));
+        let (qk, wide) = (d(32, 2, 2, 16, 64, 2), d(32, 4, 2, 16, 64, 2));
+        let graph_lm: Vec<(&str, &str, J, Weights)> = vec![
+            ("smollm", "llama", lm_config("llama", "LlamaForCausalLM", &smol, json!({})),
+             llama_weights(11, &smol, false, false, false, false)),
+            ("granite", "granite", granite_cfg, llama_weights(12, &smol, false, true, false, true)),
+            ("lfm2", "lfm2", lfm2_fixture().0, lfm2_fixture().1),
+            ("qk_norm", "llama", lm_config("llama", "LlamaForCausalLM", &qk, json!({})),
+             llama_weights(14, &qk, true, false, false, false)),
+            ("gqa_wide", "llama", lm_config("llama", "LlamaForCausalLM", &wide, json!({})),
+             llama_weights(15, &wide, false, false, false, false)),
+            ("gpt_neox", "gpt_neox", neox_fixture().0, neox_fixture().1),
+            ("gpt_neo", "gpt2", neo_fixture().0, neo_fixture().1),
+        ];
+        for (case, family, cfg, w) in &graph_lm {
+            let dir = tmp.path().join(case);
+            w.write_checkpoint(&dir, cfg, V);
+            for dev in devices() {
+                let llm = crate::model::hf_loader::load_causal_lm(&super::testing::artifacts(&dir), QuantMode::Uncompressed)
+                    .unwrap_or_else(|e| panic!("{case}: GraphLm: {e}"));
+                let m = crate::scheduler::ExecutableModel::load_graph_lm(llm, dev).unwrap();
+                let (got, r) = spec_steps(&dir, family, dev, &PROMPT, &DECODE, "last", "logits");
+                all_read(&r, case);
+                for (i, g) in got.iter().enumerate() {
+                    let want = m.prompt_logits(seq[..PROMPT.len() + i].to_vec()).unwrap();
+                    close(&mut bad, &format!("{case} {dev:?} step {i}"), g, &want);
+                }
+            }
+        }
+
+        // GPT-2 / OPT: last-row final hidden (after ln_f / project_out) and the score head.
+        use crate::model::classifier::DecoderBackbone;
+        let dec_seq: Vec<u32> = seq.iter().map(|t| t % DEC_VOCAB as u32).collect();
+        let (dp, dd) = dec_seq.split_at(PROMPT.len());
+        let decoders: Vec<(&str, &str, (J, Weights))> = vec![
+            ("gpt2", "gpt2", gpt2_fixture()),
+            ("opt_post_ln", "opt", opt_fixture(false, "relu", 0xEC)),
+            ("opt_pre_ln", "opt", opt_fixture(true, "gelu", 0xED)),
+        ];
+        for (case, family, (cfg, w)) in &decoders {
+            let root = tmp.path().join(case);
+            let dir = root.join(format!("models--gibbs-test--{case}/snapshots/main"));
+            w.write_checkpoint(&dir, cfg, DEC_VOCAB);
+            let hub = crate::model::hub::HuggingFaceHub::with_cache_dir(root.clone());
+            let host = crate::model::classifier::ln_decoder::LnDecoder::load(&hub, &format!("gibbs-test/{case}"), cfg)
+                .unwrap_or_else(|e| panic!("{case}: LnDecoder: {e}"));
+            let score = &w.tensors.iter().find(|t| t.0 == "score.weight").unwrap().2;
+            for dev in devices() {
+                let (got, mut r) = spec_steps(&dir, family, dev, dp, dd, "hidden", "hidden");
+                for (i, g) in got.iter().enumerate() {
+                    let want = host.last_hidden(&dec_seq[..PROMPT.len() + i]).unwrap();
+                    close(&mut bad, &format!("{case} {dev:?} step {i}"), &g[g.len() - want.len()..], &want);
+                }
+                // Seq-cls: row `last_index` of the 6-row prompt (rewrites the same KV rows).
+                let last = crate::graph::Tensor::U32(vec![PROMPT.len() as u32 - 1]);
+                let logits = r.lm(dp, 0, "score", "logits", vec![last]);
+                let h = host.last_hidden(dp).unwrap();
+                let want: Vec<f32> = score.chunks(h.len()).map(|row| row.iter().zip(&h).map(|(a, b)| a * b).sum()).collect();
+                close(&mut bad, &format!("{case} {dev:?} score"), &logits, &want);
+                all_read(&r, case);
+            }
+        }
+
+        // BitNet: online-ternarized masters, int8 activations, sub-norms, relu².
+        let bit = d(64, 4, 2, 16, 128, 2);
+        let cfg = lm_config("bitnet", "BitNetForCausalLM", &bit, json!({"hidden_act": "relu2",
+            "quantization_config": {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "online"}}));
+        let dir = tmp.path().join("bitnet");
+        llama_weights(16, &bit, false, false, true, false).write_checkpoint(&dir, &cfg, V);
+        let golden: J = serde_json::from_slice(
+            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_bitnet.json")).unwrap(),
+        )
+        .unwrap();
+        for dev in devices() {
+            let (got, r) = spec_steps(&dir, "bitnet", dev, &PROMPT, &DECODE, "last", "logits");
+            all_read(&r, "bitnet");
+            for (i, g) in got.iter().enumerate() {
+                let key = if i == 0 { "prefill6".to_string() } else { format!("decode{}", i - 1) };
+                let want: Vec<f32> = golden["f32"][&key].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+                close(&mut bad, &format!("bitnet {dev:?} {key}"), g, &want);
+            }
+        }
+        assert!(bad.is_empty(), "mismatches:\n  {}", bad.join("\n  "));
+    }
+
+    /// A synthetic `gibbs/*` id (hub.rs writes a `LlamaForCausalLM` config, no weights) random-inits
+    /// every weight the llama text instances read.
+    #[test]
+    fn llama_synthetic_id_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = json!({"architectures": ["LlamaForCausalLM"], "model_type": "qwen2", "hidden_size": 128,
+            "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 256,
+            "vocab_size": 512, "max_position_embeddings": 2048, "rms_norm_eps": 1e-6});
+        let p = tmp.path().join("config.json");
+        std::fs::write(&p, cfg.to_string()).unwrap();
+        let a = crate::model::hub::ModelArtifacts {
+            model_id: "gibbs/tiny-1m".into(),
+            local_dir: Some(tmp.path().to_path_buf()),
+            config_path: Some(p),
+            ..Default::default()
+        };
+        let mut r = super::testing::Runner::from_artifacts(&a, None, Device::Cpu, 16).unwrap();
+        assert_eq!(r.model.spec.family, "llama");
+        for (ids, pos) in [(&[1u32, 2, 3][..], 0), (&[4][..], 3)] {
+            let l = r.lm(ids, pos, "last", "logits", vec![]);
+            assert_eq!(l.len(), 512);
+            assert!(l.iter().all(|x| x.is_finite()) && l.iter().any(|&x| x != 0.0));
+        }
     }
 }

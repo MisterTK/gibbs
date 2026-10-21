@@ -1,0 +1,188 @@
+// Transformer building blocks. A macro reads its variables from its own args first, then from the
+// enclosing frames (loop vars, `let`s) and the family's `config`; the ones it expects there:
+//   eps, heads, kv_heads, head_dim, rotary_dim, rope_variant, attn_scale, ctx.
+// Weight stems (`w`, `wq`, `gate`, ...) are canonical tensor names without `.weight` / `.bias`;
+// every bias is optional (`w?:`). Activation names (`act`) are `graph::UnaryKind` variants.
+{
+  macros: {
+    // RMSNorm with gain `{w}.weight`.
+    rms_norm: {params: ["x"], body: [
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{w}.weight"], out: "out"},
+    ]},
+    // LayerNorm with gain `{w}.weight` and optional `{w}.bias`.
+    layer_norm: {params: ["x"], body: [
+      {op: "LayerNorm", args: {eps: "eps"}, in: ["x", "w:{w}.weight", "w?:{w}.bias"], out: "out"},
+    ]},
+    // `norm_kind` 'rms' or 'layer'.
+    norm: {params: ["x"], body: [
+      {use: "rms_norm", in: ["x"], out: "out", name: "rms", when: "norm_kind == 'rms'"},
+      {use: "layer_norm", in: ["x"], out: "out", name: "ln", when: "norm_kind == 'layer'"},
+    ]},
+    // RMSNorm of every head of `x` ([n, heads*head_dim]) with a `head_dim` gain `{w}.weight`.
+    per_head_norm: {params: ["x"], body: [
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{w}.weight"], out: "out"},
+    ]},
+
+    // BitNet BitLinear activation fake-quant to signed `bits`-bit integers on the row absmax:
+    // s = qp / max(absmax, 1e-5); out = clamp(round_even(x * s), -qp - 1, qp) / s, qp = 2^(bits-1) - 1.
+    // Needs the constant `act_quant.qp` ([1], qp).
+    act_quant: {params: ["x"], body: [
+      {op: "Unary", args: {kind: "Abs"}, in: ["x"], out: "a"},
+      {op: "Reduce", args: {kind: "Max", axes: [-1], keep_dims: true}, in: ["a"], out: "m"},
+      {op: "Unary", args: {kind: {Clamp: [1e-5, 3.0e38]}}, in: ["m"], out: "m", name: "absmax"},
+      {op: "Binary", args: {kind: "Div"}, in: ["c:act_quant.qp", "m"], out: "s"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["x", "s"], out: "y"},
+      {op: "Unary", args: {kind: "RoundEven"}, in: ["y"], out: "y", name: "round"},
+      {op: "Unary", args: {kind: {Clamp: ["-(2 ** (bits - 1))", "2 ** (bits - 1) - 1"]}}, in: ["y"], out: "y", name: "clamp"},
+      {op: "Binary", args: {kind: "Div"}, in: ["y", "s"], out: "out"},
+    ]},
+
+    // Causal self-attention over the KV cache `kv.{layer}.{k,v}` ([ctx, kv_heads*head_dim]).
+    // args: layer; wq, wk, wv, wo; qk_norm 'before' | 'after' (RoPE) with q_norm, k_norm stems;
+    // inv_freq (constant, default `rope.inv_freq`; RoPE runs when rotary_dim > 0); window, soft_cap,
+    // scale (default attn_scale), v_head_dim; write: false reads layer `kv`'s cache (shared KV) and
+    // projects no k/v; gate: stem of a sigmoid output gate; sub_norm: RMSNorm stem on the attention
+    // output; aq_bits > 0: act_quant on the projection inputs.
+    attn_cached: {params: ["x"], body: [
+      {let: {kv_layer: "first(kv, layer)", do_write: "first(write, true)", vhd: "first(v_head_dim, head_dim)",
+             sc: "first(scale, attn_scale)", rope_c: "first(inv_freq, 'rope.inv_freq')"}},
+      {use: "act_quant", args: {bits: "aq_bits"}, in: ["x"], out: "x", name: "aq_in", when: "first(aq_bits, 0) > 0"},
+      {op: "Linear", in: ["x", "w:{wq}.weight", "w?:{wq}.bias"], out: "q"},
+      {block: [
+        {op: "Linear", in: ["x", "w:{wk}.weight", "w?:{wk}.bias"], out: "k"},
+        {op: "Linear", in: ["x", "w:{wv}.weight", "w?:{wv}.bias"], out: "v"},
+      ], when: "do_write"},
+      {block: [
+        {use: "per_head_norm", args: {w: "q_norm"}, in: ["q"], out: "q", name: "q_norm"},
+        {use: "per_head_norm", args: {w: "k_norm"}, in: ["k"], out: "k", name: "k_norm", when: "do_write"},
+      ], when: "qk_norm == 'before'"},
+      {block: [
+        {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: "first(rope_mscale, 1)"},
+         in: ["q", "i:positions", "c:{rope_c}"], out: "q", name: "rope_q"},
+        {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: "first(rope_mscale, 1)"},
+         in: ["k", "i:positions", "c:{rope_c}"], out: "k", name: "rope_k", when: "do_write"},
+      ], when: "rotary_dim > 0"},
+      {block: [
+        {use: "per_head_norm", args: {w: "q_norm"}, in: ["q"], out: "q", name: "q_norm"},
+        {use: "per_head_norm", args: {w: "k_norm"}, in: ["k"], out: "k", name: "k_norm", when: "do_write"},
+      ], when: "qk_norm == 'after'"},
+      {block: [
+        {state: "kv.{layer}.k", shape: ["ctx", "kv_heads * head_dim"]},
+        {state: "kv.{layer}.v", shape: ["ctx", "kv_heads * vhd"]},
+        {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "head_dim", v_head_dim: "vhd",
+           scale: "sc", causal: true, window: "first(window)", soft_cap: "first(soft_cap)", write: true},
+         in: ["q", "k", "v", "s:kv.{layer}.k", "s:kv.{layer}.v", "i:positions"], out: "a", name: "attn"},
+      ], when: "do_write"},
+      {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "head_dim", v_head_dim: "vhd",
+         scale: "sc", causal: true, window: "first(window)", soft_cap: "first(soft_cap)", write: false},
+       in: ["q", "q", "q", "s:kv.{kv_layer}.k", "s:kv.{kv_layer}.v", "i:positions"], out: "a", name: "attn", when: "!do_write"},
+      {block: [
+        {op: "Linear", in: ["x", "w:{gate}.weight", "w?:{gate}.bias"], out: "g", name: "gate"},
+        {op: "Unary", args: {kind: "Sigmoid"}, in: ["g"], out: "g", name: "gate_act"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["a", "g"], out: "a", name: "gated"},
+      ], when: "first(gate, '') != ''"},
+      {use: "rms_norm", args: {w: "sub_norm"}, in: ["a"], out: "a", name: "sub_norm", when: "first(sub_norm, '') != ''"},
+      {use: "act_quant", args: {bits: "aq_bits"}, in: ["a"], out: "a", name: "aq_out", when: "first(aq_bits, 0) > 0"},
+      {op: "Linear", in: ["a", "w:{wo}.weight", "w?:{wo}.bias"], out: "out", name: "o"},
+    ]},
+
+    // Uncached self-attention (`Attention`): args as `attn_cached` (no cache, no gate) plus causal
+    // (default true); operand `bias` is an optional additive score bias.
+    attn_full: {params: ["x", "bias"], body: [
+      {let: {rope_c: "first(inv_freq, 'rope.inv_freq')"}},
+      {op: "Linear", in: ["x", "w:{wq}.weight", "w?:{wq}.bias"], out: "q"},
+      {op: "Linear", in: ["x", "w:{wk}.weight", "w?:{wk}.bias"], out: "k"},
+      {op: "Linear", in: ["x", "w:{wv}.weight", "w?:{wv}.bias"], out: "v"},
+      {block: [
+        {use: "per_head_norm", args: {w: "q_norm"}, in: ["q"], out: "q", name: "q_norm"},
+        {use: "per_head_norm", args: {w: "k_norm"}, in: ["k"], out: "k", name: "k_norm"},
+      ], when: "qk_norm == 'before'"},
+      {block: [
+        {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: "first(rope_mscale, 1)"},
+         in: ["q", "i:positions", "c:{rope_c}"], out: "q", name: "rope_q"},
+        {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: "first(rope_mscale, 1)"},
+         in: ["k", "i:positions", "c:{rope_c}"], out: "k", name: "rope_k"},
+      ], when: "first(rotary_dim, 0) > 0"},
+      {block: [
+        {use: "per_head_norm", args: {w: "q_norm"}, in: ["q"], out: "q", name: "q_norm"},
+        {use: "per_head_norm", args: {w: "k_norm"}, in: ["k"], out: "k", name: "k_norm"},
+      ], when: "qk_norm == 'after'"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "kv_heads", causal: "first(causal, true)", window: "first(window)",
+         soft_cap: "first(soft_cap)", scale: "first(scale)"}, in: ["q", "k", "v", "v?:bias"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{wo}.weight", "w?:{wo}.bias"], out: "out", name: "o"},
+    ]},
+
+    // Gated MLP: down(act(gate(x)) * up(x)). act 'Silu' -> SwiGlu, 'GeluTanh' -> GeGlu, other kinds
+    // Unary + Mul. sub_norm / aq_bits as in `attn_cached` (on the gated activation).
+    mlp_glu: {params: ["x"], body: [
+      {use: "act_quant", args: {bits: "aq_bits"}, in: ["x"], out: "x", name: "aq_in", when: "first(aq_bits, 0) > 0"},
+      {op: "Linear", in: ["x", "w:{gate}.weight", "w?:{gate}.bias"], out: "g", name: "gate"},
+      {op: "Linear", in: ["x", "w:{up}.weight", "w?:{up}.bias"], out: "u", name: "up"},
+      {op: "SwiGlu", in: ["g", "u"], out: "h", name: "act", when: "act == 'Silu'"},
+      {op: "GeGlu", in: ["g", "u"], out: "h", name: "act", when: "act == 'GeluTanh'"},
+      {block: [
+        {op: "Unary", args: {kind: "act"}, in: ["g"], out: "g", name: "act"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["g", "u"], out: "h", name: "glu"},
+      ], when: "act != 'Silu' && act != 'GeluTanh'"},
+      {use: "rms_norm", args: {w: "sub_norm"}, in: ["h"], out: "h", name: "sub_norm", when: "first(sub_norm, '') != ''"},
+      {use: "act_quant", args: {bits: "aq_bits"}, in: ["h"], out: "h", name: "aq_out", when: "first(aq_bits, 0) > 0"},
+      {op: "Linear", in: ["h", "w:{down}.weight", "w?:{down}.bias"], out: "out", name: "down"},
+    ]},
+    // Plain MLP: down(act(up(x))).
+    mlp_plain: {params: ["x"], body: [
+      {op: "Linear", in: ["x", "w:{up}.weight", "w?:{up}.bias"], out: "u", name: "up"},
+      {op: "Unary", args: {kind: "act"}, in: ["u"], out: "h", name: "act"},
+      {op: "Linear", in: ["h", "w:{down}.weight", "w?:{down}.bias"], out: "out", name: "down"},
+    ]},
+
+    // LFM2 gated short conv, stem `p`: [B; C; x] = in_proj(x); out_proj(C * conv(B * x)) with the
+    // depthwise causal conv `{p}.conv.weight` ([width, kernel]) over recurrent state `conv.{layer}`.
+    short_conv: {params: ["x"], body: [
+      {op: "Linear", in: ["x", "w:{p}.in_proj.weight", "w?:{p}.in_proj.bias"], out: "bcx", name: "in_proj"},
+      {let: {cw: "shape('bcx')[1] // 3", kernel: "shape(fmt('{p}.conv.weight'))[1]"}},
+      {op: "Slice", args: {axis: -1, start: 0, end: "cw"}, in: ["bcx"], out: "b", name: "b"},
+      {op: "Slice", args: {axis: -1, start: "cw", end: "2 * cw"}, in: ["bcx"], out: "c", name: "c"},
+      {op: "Slice", args: {axis: -1, start: "2 * cw", end: "3 * cw"}, in: ["bcx"], out: "xs", name: "x"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["b", "xs"], out: "bx", name: "bx"},
+      {state: "conv.{layer}", shape: ["kernel - 1", "cw"], recurrent: true},
+      {op: "CausalConv1dCached", args: {kernel: "kernel", dilation: 1}, in: ["bx", "w:{p}.conv.weight", "s:conv.{layer}"], out: "cv", name: "conv"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["c", "cv"], out: "y", name: "gate"},
+      {op: "Linear", in: ["y", "w:{p}.out_proj.weight", "w?:{p}.out_proj.bias"], out: "out", name: "out_proj"},
+    ]},
+
+    // x + y * scale (scale default 1: no multiply).
+    residual: {params: ["x", "y"], body: [
+      {op: "Unary", args: {kind: {Scale: "scale"}}, in: ["y"], out: "y", name: "scale", when: "first(scale, 1) != 1"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "y"], out: "out", name: "add"},
+    ]},
+    // x + rms_norm(y, w) * scale: a post-norm on the branch before the residual add.
+    sandwich: {params: ["x", "y"], body: [
+      {use: "rms_norm", in: ["y"], out: "y", name: "post_norm"},
+      {use: "residual", in: ["x", "y"], out: "out", name: "res"},
+    ]},
+    // (x + a) + m: attention and MLP both read the block input.
+    parallel_residual: {params: ["x", "a", "m"], body: [
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "y", name: "add_attn"},
+      {op: "Binary", args: {kind: "Add"}, in: ["y", "m"], out: "out", name: "add_mlp"},
+    ]},
+
+    // Logits: Linear over `{w}` (`{embed}` when tied), divided by logit_scale, then soft-capped.
+    lm_head: {params: ["x"], body: [
+      {let: {hw: "first(tied, false) ? embed : w"}},
+      {op: "Linear", in: ["x", "w:{hw}.weight", "w?:{hw}.bias"], out: "out", name: "linear"},
+      {op: "Unary", args: {kind: {Scale: "1 / logit_scale"}}, in: ["out"], out: "out", name: "logit_scale", when: "first(logit_scale, 1) != 1"},
+      {op: "Unary", args: {kind: {SoftCap: "softcap"}}, in: ["out"], out: "out", name: "softcap", when: "first(softcap, 0) > 0"},
+    ]},
+    // One row of `x`: row `idx` ([1] u32 operand) when `index`, else the last row.
+    last_row: {params: ["x", "idx"], body: [
+      {op: "Gather", args: {axis: 0}, in: ["x", "idx"], out: "out", name: "gather", when: "first(index, false)"},
+      {op: "Slice", args: {axis: 0, start: "shape('x')[0] - 1", end: "shape('x')[0]"}, in: ["x"], out: "out", name: "slice",
+       when: "!first(index, false)"},
+    ]},
+    // Sequence-classification head `{w}` (default `score`).
+    score_head: {params: ["x"], body: [
+      {let: {sw: "first(w, 'score')"}},
+      {op: "Linear", in: ["x", "w:{sw}.weight", "w?:{sw}.bias"], out: "out", name: "score"},
+    ]},
+  },
+}
