@@ -70,7 +70,7 @@ pub use onnx::OnnxWeightReader;
 ///
 /// # Supported Formats
 /// - `.safetensors`: Hugging Face zero-copy memory-mapped format.
-/// - `.gguf`: llama.cpp quantized format.
+/// - `.gguf`: GGUF quantized format.
 ///
 /// # Example
 /// ```ignore
@@ -193,7 +193,7 @@ pub fn read_checkpoint(path: &Path) -> Result<(crate::model::ModelManifest, Vec<
         "msgpack" => flax::read,
         "npz" | "npy" => numpy::read,
         "ot" => {
-            return Err("rust-bert/tch `.ot` files are TorchScript archives; not supported".into())
+            return Err("TorchScript/tch `.ot` files are not supported".into())
         }
         "h5" | "tflite" | "mlmodel" | "mlpackage" => {
             return Err(format!(

@@ -1,4 +1,4 @@
-// Generated from ggml/src/ggml-common.h (llama.cpp master) by a throwaway Bun script; do not edit.
+// Generated from ggml/src/ggml-common.h by a throwaway Bun script; do not edit.
 pub(crate) const KSIGNS_IQ2XS: [u8; 128] = [
     0, 129, 130, 3, 132, 5, 6, 135,
     136, 9, 10, 139, 12, 141, 142, 15,

@@ -803,7 +803,7 @@ impl UniversalModelLoader {
         Self::parse_gguf(data)
     }
 
-    /// Extracts the embedded tokenizer from GGUF metadata. Vocabularies whose llama.cpp tokenizer
+    /// Extracts the embedded tokenizer from GGUF metadata. Vocabularies whose GGUF tokenizer
     /// can be mirrored exactly (see [`gguf_tokenizer_json`]) run through the HF `tokenizers`
     /// backend; others fall back to greedy vocab matching.
     pub fn extract_gguf_tokenizer(
@@ -930,13 +930,16 @@ impl UniversalModelLoader {
         let Some(tokens) = tokens else {
             return Err("No 'tokenizer.ggml.tokens' found in GGUF metadata".into());
         };
-        // Declared flags, with llama.cpp's defaults when absent: SentencePiece ("llama")
-        // vocabs add BOS and a dummy '▁' prefix; BPE ("gpt2") vocabs add neither.
+        // Declared flags, with GGUF defaults when absent: SentencePiece vocabs add BOS and a
+        // dummy '▁' prefix; BPE vocabs add neither.
         let md = Self::parse_gguf(data)?.metadata;
         let flag = |k: &str| md.get(k).map(|v| v != "0");
         let id = |k: &str| md.get(k).and_then(|s| s.parse::<usize>().ok());
         let model = md.get("tokenizer.ggml.model").map(String::as_str);
-        let spm = matches!(model, Some("llama" | "gemma4"));
+        let spm = matches!(
+            model.and_then(crate::arch::gguf_tokenizer_model),
+            Some("spm_scores" | "spm_merges")
+        );
         let add_space_prefix = spm && flag("tokenizer.ggml.add_space_prefix").unwrap_or(true);
         let pre = md.get("tokenizer.ggml.pre").map(String::as_str);
         let json = model.and_then(|m| {
@@ -1087,11 +1090,12 @@ fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, String> {
     Ok(val)
 }
 
-/// HF `tokenizer.json` equivalent of a GGUF vocabulary, mirroring llama.cpp's tokenizer for its
-/// `tokenizer.ggml.model` / `.pre` (same construction as HF's own GGUF / SentencePiece converters):
-/// - "llama": SentencePiece BPE; merges derived from `scores` like HF `SentencePieceExtractor`,
-///   '▁' for spaces (+ dummy prefix after each special token, as llama.cpp), `<0xXX>` byte fallback.
-/// - "gpt2": byte-level BPE from `tokenizer.ggml.merges`, for the pre-tokenizer regexes below.
+/// HF `tokenizer.json` equivalent of a GGUF vocabulary, mirroring the GGUF tokenizer for its
+/// `tokenizer.ggml.model` / `.pre` (mapped via `arch/lib/compat.json5`):
+/// - `spm_scores`: SentencePiece BPE; merges derived from `scores` like HF `SentencePieceExtractor`,
+///   '▁' for spaces (+ dummy prefix after each special token), `<0xXX>` byte fallback.
+/// - `byte_bpe`: byte-level BPE from `tokenizer.ggml.merges`, for the pre-tokenizer regexes.
+/// - `spm_merges`: SPM-style BPE with raw-text merges.
 /// `None` for anything else (callers fall back to greedy vocab matching).
 #[allow(clippy::too_many_arguments)]
 fn gguf_tokenizer_json(
@@ -1106,54 +1110,23 @@ fn gguf_tokenizer_json(
 ) -> Option<serde_json::Value> {
     use serde_json::json;
     let byte_level = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true});
-    let (merges, normalizer, pre_tokenizer, decoder, unk, spm) = match model {
-        "gpt2" => {
-            let pre_tokenizer = match pre? {
-                // llama.cpp LLAMA_VOCAB_PRE_TYPE_GPT2: the GPT-2 regex alone.
-                "gpt-2" => byte_level.clone(),
-                // "\p{N}" split, then the GPT-2 regex (llama.cpp groups these pre types).
-                "smollm" | "starcoder" | "refact" | "command-r" | "codeshell" | "exaone"
-                | "minerva-7b" => json!({"type": "Sequence", "pretokenizers": [
-                    {"type": "Digits", "individual_digits": true}, byte_level.clone()]}),
-                // Qwen2/Qwen3 tokenizer.json: the Qwen split regex, then byte-level, NFC.
-                "qwen2" => json!({"type": "Sequence", "pretokenizers": [
-                    {"type": "Split", "pattern": {"Regex": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"},
-                     "behavior": "Isolated", "invert": false},
-                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}]}),
-                // Qwen3.5 tokenizer.json: the Qwen split with combining marks (\p{M}) kept in words.
-                "qwen35" => json!({"type": "Sequence", "pretokenizers": [
-                    {"type": "Split", "pattern": {"Regex": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"},
-                     "behavior": "Isolated", "invert": false},
-                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}]}),
-                // HunYuan dense tokenizer.json (llama.cpp's DEEPSEEK3_LLM regexes): digit runs of
-                // up to 3, CJK and kana runs, then words and punctuation, each split in turn.
-                "hunyuan-dense" => {
-                    let split = |re: &str| json!({"type": "Split", "pattern": {"Regex": re}, "behavior": "Isolated", "invert": false});
-                    json!({"type": "Sequence", "pretokenizers": [
-                        split(r"\p{N}{1,3}"),
-                        split("[\u{4E00}-\u{9FA5}\u{3040}-\u{309F}\u{30A0}-\u{30FF}]+"),
-                        split(r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##),
-                        {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false}]})
-                }
-                _ => return None,
-            };
-            let normalizer = if matches!(pre, Some("qwen2" | "qwen35")) {
-                json!({"type": "NFC"})
-            } else {
-                json!(null)
-            };
-            let merges: Vec<_> = merges.iter().filter_map(|m| m.split_once(' ')).collect();
-            let decoder = json!({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true});
-            (
-                json!(merges),
-                normalizer,
-                pre_tokenizer,
-                decoder,
-                json!(null),
-                false,
-            )
-        }
-        "llama" if scores.len() == tokens.len() => {
+    let (merges, normalizer, pre_tokenizer, decoder, unk, spm) =
+        match crate::arch::gguf_tokenizer_model(model)? {
+            "byte_bpe" => {
+                let (normalizer, pre_tokenizer) =
+                    crate::arch::gguf_pre_tokenizer(pre?, &byte_level)?;
+                let merges: Vec<_> = merges.iter().filter_map(|m| m.split_once(' ')).collect();
+                let decoder = json!({"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true});
+                (
+                    json!(merges),
+                    normalizer,
+                    pre_tokenizer,
+                    decoder,
+                    json!(null),
+                    false,
+                )
+            }
+            "spm_scores" if scores.len() == tokens.len() => {
             let ids: HashMap<&str, usize> = tokens
                 .iter()
                 .enumerate()
@@ -1196,10 +1169,9 @@ fn gguf_tokenizer_json(
             let unk = json!(tokens.get(unk_id.unwrap_or(0)));
             (json!(merges), normalizer, json!(null), decoder, unk, true)
         }
-        // llama.cpp `gemma4` (tokenizer.json of google/gemma-4-*): SPM-style BPE, spaces become '▁'
-        // and the merges run over the raw text (llama.cpp's merge words split at the first
-        // space after their first character).
-        "gemma4" => {
+            // SPM-style BPE: spaces become '▁' and merges run over raw text (merge words split at
+            // the first space after their first character).
+            "spm_merges" => {
             let pairs: Vec<_> = merges
                 .iter()
                 .filter_map(|m| {
@@ -1223,7 +1195,7 @@ fn gguf_tokenizer_json(
         .enumerate()
         .map(|(i, t)| (t.clone(), json!(i)))
         .collect();
-    // llama.cpp token types: 2 unknown, 3 control (special), 4 user-defined (split out, not special).
+    // GGUF token types: 2 unknown, 3 control (special), 4 user-defined (split out, not special).
     let added_tokens: Vec<_> = token_types
         .iter()
         .enumerate()

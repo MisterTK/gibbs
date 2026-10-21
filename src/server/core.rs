@@ -57,7 +57,7 @@ pub enum Prompt {
         /// Extra chat-template variables (OpenAI `chat_template_kwargs`, e.g. `enable_thinking`).
         template_kwargs: Value,
     },
-    /// Tokenized as is (`/v1/completions`, Ollama `raw`).
+    /// Tokenized as is (`/v1/completions`, `/api/generate` `raw`).
     Raw(String),
 }
 
@@ -719,7 +719,7 @@ pub enum Framing {
     SseDone,
     /// `event: <type>` + `data: {json}` (Anthropic, OpenAI Responses).
     SseNamed,
-    /// One JSON object per line (Ollama).
+    /// One JSON object per line (`/api/*`).
     Ndjson,
 }
 

@@ -1,6 +1,6 @@
 //! Source and target text of the encoder-decoder translation / summarization models (Marian /
 //! opus-mt, M2M100 + NLLB, MBart-50, FSMT / wmt19, BART / distilbart) and of prompt-in /
-//! text-out ones (T5): [`EncDecText`] turns what the scheduler tokenized into encoder ids and the
+//! text-out encoder-decoders: [`EncDecText`] turns what the scheduler tokenized into encoder ids and the
 //! decoder prompt, and shapes the output ids for display.
 //!
 //! Translation prompt convention: the text is the source. Language-coded models take a leading
@@ -265,7 +265,7 @@ pub enum EncDecText {
 }
 
 impl EncDecText {
-    /// `kind` `prompt_eos` (T5) or `translation` over the checkpoint directory `dir`;
+    /// `kind` `prompt_eos` or `translation` over the checkpoint directory `dir`;
     /// `vocab` is the decoder's vocabulary (special ids must lie inside it).
     pub fn load(kind: &str, dir: &Path, cfg: &Value, vocab: usize) -> Result<Self, String> {
         match kind {
@@ -297,7 +297,7 @@ impl EncDecText {
     pub fn source(&self, ids: &[u32]) -> Result<(Vec<u32>, Vec<u32>), String> {
         match self {
             Self::Prompt { eos, decoder_start, .. } => {
-                // HF's T5 tokenizer ends the encoder input with </s>.
+                // Prompt-EOS encoder-decoders end the encoder input with </s>.
                 let mut ids = ids.to_vec();
                 if ids.last() != Some(eos) {
                     ids.push(*eos);
@@ -856,7 +856,7 @@ fn decode_tokenizer(
                 bos_token: String::new(),
                 eos_token: String::new(),
             }),
-            // Encoder-decoders decode greedily unless a request sets temperature/top_p (as T5 does).
+            // Encoder-decoders decode greedily unless a request sets temperature/top_p.
             sampling_defaults: Some((0.0, 1.0)),
             ..Tokenizer::from_tokens(Vec::new())
         },

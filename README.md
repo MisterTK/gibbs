@@ -123,8 +123,8 @@ The design describes every model once in a shared graph IR (`src/graph`) and has
 | `--backend` | What runs there |
 | :--- | :--- |
 | `auto` (default) | Resolves to Metal on Apple Silicon; to the CPU executor only on a host with no Metal device. |
-| `metal` | The default compute path. Every model family (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the avenues tried per node (Metal kernel, dtype adapt), or with a family-gate error. A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
-| `cpu` | Explicit opt-in to the native CPU executor (NEON SIMD). It is where the CPU weight-format measure/choose path runs. |
+| `metal` | The default compute path. Every model family (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the avenues tried per node (Metal kernel, dtype adapt). A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
+| `cpu` | Explicit opt-in to the native CPU graph executor (NEON SIMD), which runs the exact same `graph::Graph` built from the family spec. |
 
 Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
 
@@ -133,7 +133,7 @@ Startup prints the detected host (CPU, core counts, memory, GPU, and CPU feature
 | Box | Status |
 | :--- | :--- |
 | Graph IR, CPU executor | Built. System 1 runs on it. During the cutover its embeddings matched the old hand-written encoder's saved output bit-for-bit (4 texts); the old encoder is gone, so that check cannot be re-run. |
-| Graph builders | Causal LMs are JSON5 family specs (`arch/families/*.json5`) built into graphs by `src/arch` and run by `src/runtime/lm.rs`; System 1 and the other families in the [GPU coverage](#gpu-coverage) table run from their graph on Metal. `--backend cpu` runs the same graphs on the CPU executor. |
+| Graph builders | Every model family is a JSON5 spec (`arch/families/*.json5`) built into a `graph::Graph` by `src/arch` and driven by the generic pipelines in `src/runtime/` (`causal_lm`, `encoder`, `encdec`, `diffusion`, `video`, `drafter`, `bag_classifier`; see [GPU coverage](#gpu-coverage) and [Supported models](#supported-models)). `--backend cpu` runs the same graphs on the CPU executor. |
 | Fingerprint pass | Built, on the IR. |
 | Host profile | Static detection (the startup banner), plus measured Metal micro-benchmarks run once per GPU and OS build and cached in `~/.cache/gibbs/host/`: MPP `matmul2d` checked against the CPU, dispatch cost, and GEMM timings that pick the GEMM kernel per shape. |
 | Weight-format selection | **Metal:** the re-encode policy (`--reencode`, see [Weight formats](#weight-formats)) picks each streamed matrix's format from the weight header (`src/model/reencode.rs`, `weight_format.rs`); a re-encode is accepted only if the GPU KL gate passes. Variant ranking in the model picker uses a predicted decode tok/s from the GGUF/safetensors header and measured codec efficiencies (`src/model/variant.rs`, policies `fastest`, `fastest-4bit`, `best-quality`). `--quant` replaces the policy with one format for every weight matrix. |
@@ -183,6 +183,77 @@ Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter
 | UX | Built-in TUI with roofline telemetry, a CLI, and a local model picker. | Server-first, with an OpenAI-compatible API and no TUI. |
 
 ## Models
+
+### Supported models
+
+<details><summary>52 model family specs (`arch/families/*.json5`)</summary>
+
+| Family | Pipeline | Matches |
+|:---|:---|:---|
+| `gemma3` | `causal_lm` | model_type: `gemma3_text`, `gemma3`; arch: `Gemma3ForCausalLM`, `Gemma3TextForSequenceClassification`, `Gemma3ForConditionalGeneration`; gguf: `gemma3` |
+| `llama` | `causal_lm` | model_type: `llama`, `mistral`, `qwen2`, `smollm`, `smollm2`, `ernie4_5`, `phi3`; arch: `LlamaForCausalLM`, `MistralForCausalLM`, `Qwen2ForCausalLM`, `Ernie4_5ForCausalLM`, `Phi3ForCausalLM`, `LlamaForSequenceClassification`, `Qwen2ForSequenceClassification`; gguf: `llama`, `qwen2`, `ernie4_5`; fallback |
+| `glm` | `causal_lm` | model_type: `glm`; arch: `GlmForCausalLM` |
+| `granite` | `causal_lm` | model_type: `granite`, `granitemoehybrid`, `granitemoe`; arch: `GraniteForCausalLM`, `GraniteMoeHybridForCausalLM`, `GraniteMoeForCausalLM`; gguf: `granite`, `granitehybrid`, `granitemoe` |
+| `bitnet` | `causal_lm` | model_type: `bitnet`; arch: `BitNetForCausalLM`, `BitnetForCausalLM`; gguf: `bitnet-b1.58`, `bitnet` |
+| `gpt_neox` | `causal_lm` | model_type: `gpt_neox`; arch: `GPTNeoXForCausalLM`, `GPTNeoXForSequenceClassification` |
+| `gpt2` | `causal_lm` | model_type: `gpt2`, `gpt_neo`; arch: `GPT2LMHeadModel`, `GPT2ForSequenceClassification`, `GPTNeoForCausalLM` |
+| `opt` | `causal_lm` | model_type: `opt`; arch: `OPTForCausalLM`, `OPTForSequenceClassification` |
+| `lfm2` | `causal_lm` | model_type: `lfm2`; arch: `Lfm2ForCausalLM`; gguf: `lfm2` |
+| `krea2` | `diffusion` | gguf: `krea2`; diffusers: `Krea2Pipeline`, `Krea2Transformer2DModel` |
+| `qwen_image` | `diffusion` | diffusers: `QwenImagePipeline`, `QwenImageTransformer2DModel` |
+| `qwen_image21` | `diffusion` | gguf: `qwen_image`, `qwen_image21`; diffusers: `QwenImage21Pipeline`, `QwenImage21Transformer2DModel` |
+| `qwen_vae` | `diffusion` | diffusers: `AutoencoderKLQwenImage` |
+| `zimage` | `diffusion` | diffusers: `ZImagePipeline`, `ZImageTransformer2DModel` |
+| `sd3` | `diffusion` | diffusers: `StableDiffusion3Pipeline` |
+| `gemma2` | `encoder` | model_type: `gemma2`; arch: `Gemma2Model` |
+| `sana` | `diffusion` | diffusers: `SanaPipeline` |
+| `sd_vae` | `diffusion` | diffusers: `AutoencoderKL` |
+| `dcae` | `diffusion` | diffusers: `AutoencoderDC` |
+| `flux` | `diffusion` | diffusers: `FluxPipeline`, `FluxTransformer2DModel` |
+| `chroma` | `diffusion` | diffusers: `ChromaPipeline`, `ChromaTransformer2DModel` |
+| `flux2` | `diffusion` | diffusers: `Flux2KleinPipeline`, `Flux2Transformer2DModel` |
+| `clip_text` | `encoder` | model_type: `clip_text_model`; arch: `CLIPTextModel`, `CLIPTextModelWithProjection` |
+| `sd` | `diffusion` | diffusers: `StableDiffusionPipeline`, `LatentConsistencyModelPipeline`, `UNet2DConditionModel` |
+| `sdxl` | `diffusion` | diffusers: `StableDiffusionXLPipeline` |
+| `sd1_file` | `diffusion` | single-file |
+| `sd2_file` | `diffusion` | single-file |
+| `sdxl_file` | `diffusion` | single-file |
+| `sd2_gguf` | `diffusion` | single-file |
+| `idefics3` | `causal_lm` | model_type: `idefics3`, `smolvlm`; arch: `Idefics3ForConditionalGeneration` |
+| `dflash` | `drafter` | arch: `DFlashDraftModel`, `DFlash2DraftModel`, `DSparkDraftModel`, `Qwen3DSparkModel`; gguf: `dflash` |
+| `qwen3_5` | `causal_lm` | model_type: `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text`; arch: `Qwen3_5ForSequenceClassification`, `Qwen3_5TextForSequenceClassification`; gguf: `qwen35`, `qwen35moe` |
+| `qwen3` | `causal_lm` | model_type: `qwen3`, `qwen3_moe`; arch: `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`, `Qwen3ForSequenceClassification`; gguf: `qwen3`, `qwen3moe` |
+| `hunyuan` | `causal_lm` | model_type: `hunyuan_v1_dense`; arch: `HunYuanDenseV1ForCausalLM`; gguf: `hunyuan-dense` |
+| `qwen3_vl` | `causal_lm` | model_type: `qwen3_vl`; arch: `Qwen3VLForConditionalGeneration`; gguf: `qwen3vl` |
+| `qwen4_exp` | `causal_lm` | model_type: `qwen4_exp`, `qwen4_exp_text`; arch: `Qwen4ExpForCausalLM`; gguf: `qwen4exp` |
+| `gemma4` | `causal_lm` | model_type: `gemma4`, `gemma4_text`; arch: `Gemma4ForConditionalGeneration`, `Gemma4ForCausalLM`, `Gemma4ForSequenceClassification`; gguf: `gemma4` |
+| `gemma4_unified` | `causal_lm` | model_type: `gemma4_unified`; arch: `Gemma4UnifiedForConditionalGeneration` |
+| `t5` | `encdec` | model_type: `t5`, `mt5`, `umt5`; arch: `T5ForConditionalGeneration`, `MT5ForConditionalGeneration`, `UMT5ForConditionalGeneration`, `T5EncoderModel`, `UMT5EncoderModel`; gguf: `t5`, `t5encoder` |
+| `bart` | `encdec` | model_type: `bart`, `mbart`; arch: `BartForConditionalGeneration`, `MBartForConditionalGeneration` |
+| `marian` | `encdec` | model_type: `marian`; arch: `MarianMTModel` |
+| `m2m100` | `encdec` | model_type: `m2m_100`; arch: `M2M100ForConditionalGeneration` |
+| `fsmt` | `encdec` | model_type: `fsmt`; arch: `FSMTForConditionalGeneration` |
+| `electra` | `encoder` | model_type: `electra`; arch: `ElectraForSequenceClassification`, `ElectraModel` |
+| `albert` | `encoder` | model_type: `albert`; arch: `AlbertForSequenceClassification`, `AlbertModel` |
+| `bert` | `encoder` | model_type: `bert`; arch: `BertForSequenceClassification`, `RobertaForSequenceClassification`, `XLMRobertaForSequenceClassification`, `CamembertForSequenceClassification`, `DistilBertForSequenceClassification`, `BertModel` |
+| `modernbert` | `encoder` | model_type: `modernbert`; arch: `ModernBertForSequenceClassification`, `ModernBertModel` |
+| `bert_gguf` | `encoder` | gguf: `bert` |
+| `deberta` | `encoder` | arch: `DebertaForSequenceClassification`, `DebertaV2ForSequenceClassification`, `DebertaModel`, `DebertaV2Model` |
+| `ltx` | `video` | diffusers: `LTXPipeline`, `LTXImageToVideoPipeline`, `LTXVideoTransformer3DModel` |
+| `ltx_vae` | `video` | diffusers: `AutoencoderKLLTXVideo` |
+| `modelscope_t2v` | `video` | diffusers: `TextToVideoSDPipeline`, `UNet3DConditionModel` |
+
+Generated from `arch/families/*.json5` (`Registry::supported_models_markdown`).
+
+</details>
+
+### Model specs and overrides
+
+Every model family is defined as a JSON5 spec in `arch/families/<family>.json5` (with shared macro libraries in `arch/lib/*.json5` and tensor-name rules in `arch/names/*.json5`). A spec declares:
+- `family`, optional `extends` (parent family merged first via RFC 7386 merge patch; `key+` appends arrays), `match` (`hf_model_type`, `hf_architectures`, `gguf_arch`, `diffusers_class`, `file_ext`, `fallback`), and `pipeline` (`causal_lm`, `encoder`, `encdec`, `diffusion`, `video`, `drafter`, `bag_classifier`, `unsupported`).
+- `config` expressions (`cfg.*`, `gguf.*`, `json.*`, `shape()`, `has()`, `count()`), load-time `checks`, `names` rename rules, `transforms`, generated `constants`, `ignore` globs, `macros`, `components` networks (`vars`, `inputs`, `body`, `outputs`), and pipeline `runtime` metadata.
+
+User files under `~/.cache/gibbs/arch/families/*.json5` replace an embedded family of the same name or add a new family; user override files under `~/.cache/gibbs/arch/overrides/*.json5` (`{applies_to: {hub_id, family, model_type, gguf_arch, file_name}, patch: {...}}`) patch matching checkpoints after embedded overrides. `--arch <family>` forces a specific family spec, and `--arch-dump` prints the merged spec, resolved config variables, canonical tensor renames, and unconsumed tensors as JSON and exits.
 
 ### Verified on Metal
 
@@ -280,9 +351,9 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 
 | Flag | Meaning |
 | :--- | :--- |
-| `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path. The kind of model comes from its files: a diffusers `model_index.json` (text-to-image or text-to-video), an SD/FLUX GGUF or single-file checkpoint or LoRA, a classifier `architectures` entry, a System 1 BERT sentence encoder (`sentence-transformers/all-MiniLM-L6-v2`), a native `model_type` (Qwen3.5/Qwen3-VL, Qwen3, HunYuan dense, Gemma 4, T5/mT5/UMT5, Marian/M2M100/NLLB/MBart/FSMT/BART, Idefics3/SmolVLM), else the `llama` family spec (the causal-LM fallback). |
-| `--backend auto\|metal\|cpu` | The compute backend (default `auto`, which is Metal on Apple Silicon; see [Backends](#backends)). `cpu` is the only CPU opt-in. A model or op with no Metal lowering fails at load with a `gpu-only:` report. The Metal pipeline cache and host profile go to `~/.cache/gibbs/`. |
-| `--quant <format>` | Stores every weight matrix in one format instead of its checkpoint encoding: `uncompressed` (f32), `f16`, `bf16`, `q8_0`, `q4_0`, `q4_k_m`, `q5_k_m`, `q6_k`, or `nvfp4` (llama.cpp `GGUF_NVFP4` blocks). A format no encoder exists for is an error. Without it, weights keep their encoding or follow the re-encode policy (`--reencode`). |
+| `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path, matched against `arch/families/*.json5` (see [Supported models](#supported-models)). |
+| `--backend auto\|metal\|cpu` | Compute backend (default `auto`: Metal on Apple Silicon, CPU only where no Metal device exists; see [Backends](#backends)). `cpu` is the explicit opt-in to the CPU graph executor. |
+| `--quant <format>` | Forces every streamed weight matrix to one format (`ReencodeConfig.force`): `uncompressed` (`f32`), `f16`, `bf16`, `q8_0`, `q4_0`, `q4_k_m`, `q5_k_m`, `q6_k`, or `nvfp4` (`GGUF_NVFP4`). A format no encoder exists for is an error. Without it, weights keep their checkpoint encoding or follow `--reencode`. |
 | `--reencode max-speed\|low-bit-native\|bit-exact`, `--reencode-max-kl <nats>` | Metal weight re-encode policy and the mean-KL limit of its GPU gate; they override `reencode` / `reencode_max_kl` in `~/.cache/gibbs/settings.json` (see [Weight formats](#weight-formats)). |
 | `--variant fastest\|fastest-4bit\|best-quality` | Which variant of a multi-file GGUF/safetensors repo to pick (default `fastest`), ranked by predicted decode tok/s from the file header and measured codec efficiencies. |
 | `--max-tokens <n>`, `--ctx <n>` (default 8192) | Generation length for `--prompt`, and the context length. |
@@ -294,8 +365,8 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | `--frames` (default 16), `--guidance` (default 9.0), `--steps` (default 25), `--output <file.mp4>` | Text-to-video options (see [Text-to-video: ModelScope](#text-to-video-modelscope)); LTX-Video has its own defaults, `--image` (first frame) and `--text-encoder`. |
 | `--tui` | Opens the terminal dashboard. |
 | `--hf-token`, `--port`, `--storage` | Hugging Face auth, listen port, and storage backend. |
-| `--arch <family>` | Loads `--model` as this family spec (`arch/families/<family>.json5`, or a user file in `~/.cache/gibbs/arch/families/`, which replaces an embedded family of the same name), skipping detection; the spec's `causal_lm` pipeline runs it (`src/runtime/lm.rs`). User overrides in `~/.cache/gibbs/arch/overrides/` patch matching specs. |
-| `--arch-dump` | Prints `--model`'s merged family spec, its resolved config vars, every checkpoint tensor's canonical name and the tensors no component reads (JSON), then exits. |
+| `--arch <family>` | Forces `--model` to load with `arch/families/<family>.json5` (or `~/.cache/gibbs/arch/families/<family>.json5`), skipping detection. |
+| `--arch-dump` | Prints `--model`'s merged family spec, resolved config vars, canonical tensor map and unconsumed tensors (JSON), then exits. |
 
 ### Environment variables
 
@@ -383,7 +454,7 @@ Engine failures return HTTP 500 with an error body in the schema's shape. With s
 ### Chat, completions and tool calls
 See [Connect a coding agent](#connect-a-coding-agent) for client setup across OpenAI, OpenAI Responses, Anthropic and Ollama endpoints.
 
-Tools reach the model's own chat template, and the model's tool-call output (Hermes/Qwen2.5 `<tool_call>`, Qwen3-Coder/Qwen3.5 XML, Llama-3.x JSON, Mistral `[TOOL_CALLS]`) comes back as structured calls in each schema's shape, streamed or not. `tool_choice` none/auto/required/named is honored: forced calls are prefixed into the assistant turn and validated, never invented. Client-side built-in tools the model cannot run (Codex `web_search`/`local_shell`, Anthropic server tools without `input_schema`) are left out of the prompt and named in the log; a `tool_choice` naming one is a 400, as is JSON mode (`response_format`, Ollama `format`). `stop`, `top_p`, `max_tokens`/`max_completion_tokens`/`max_output_tokens`/`num_predict`, and `stream_options.include_usage` are passed through.
+Tools reach the model's own chat template, and the model's tool-call output (`ToolCallJson` `<tool_call>` JSON, `XmlFunction` `<tool_call><function=...>`, `HeaderJson` bare JSON, `BracketJson` `[TOOL_CALLS]`) comes back as structured calls in each schema's shape, streamed or not. `tool_choice` none/auto/required/named is honored: forced calls are prefixed into the assistant turn and validated, never invented. Client-side built-in tools the model cannot run (Codex `web_search`/`local_shell`, Anthropic server tools without `input_schema`) are left out of the prompt and named in the log; a `tool_choice` naming one is a 400, as is JSON mode (`response_format`, Ollama `format`). `stop`, `top_p`, `max_tokens`/`max_completion_tokens`/`max_output_tokens`/`num_predict`, and `stream_options.include_usage` are passed through.
 ```bash
 curl -N http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \

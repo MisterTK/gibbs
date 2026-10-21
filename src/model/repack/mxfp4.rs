@@ -5,7 +5,7 @@
 //! Layouts read (both put the even element in the low nibble of each byte):
 //! * compressed-tensors `mxfp4-pack-quantized` and Quark MX fp4: `X.weight_packed` / `X.weight`
 //!   `[rows, cols / 2]` U8 beside `X.weight_scale` `[rows, cols / 32]` U8;
-//! * gpt-oss `X_blocks` `[..., rows, cols / 32, 16]` + `X_scales` `[..., rows, cols / 32]`, exposed by
+//! * `X_blocks` `[..., rows, cols / 32, 16]` + `X_scales` `[..., rows, cols / 32]`, exposed by
 //!   [`alias`] as one `X` of `[prod(leading) * rows, cols]` (an expert bank is a row concatenation).
 //!
 //! Value = `E2M1[nibble] * 2^(scale - 127)`, which is what the registered MXFP4 codec decodes.
@@ -24,7 +24,7 @@ pub fn is_mx(m: &ModelManifest, stem: &str, rows: usize, cols: usize) -> bool {
         && get("weight_scale_2").is_none()
 }
 
-/// Gives every gpt-oss `X_blocks` / `X_scales` pair a 2-D `X` tagged MXFP4 over the blocks' bytes.
+/// Gives every `X_blocks` / `X_scales` pair a 2-D `X` tagged MXFP4 over the blocks' bytes.
 pub fn alias(m: &mut ModelManifest) {
     let mut add = Vec::new();
     for (name, t) in &m.tensors {

@@ -458,7 +458,7 @@ pub fn refused_draft_gguf(arch: &str) -> Option<String> {
             && !m.gguf_arch.iter().any(|g| glob(g, arch))
             && forks.as_array()?.iter().filter_map(J::as_str).any(|g| glob(g, arch));
         fork.then(|| {
-            format!("llama.cpp GGUF draft sidecar with fork architecture '{arch}' (tensor names and metadata differ from llama.cpp's '{ours}'; attach a '{ours}' GGUF or the safetensors drafter)")
+            format!("GGUF draft sidecar with fork architecture '{arch}' (tensor names and metadata differ from '{ours}'; attach a '{ours}' GGUF or the safetensors drafter)")
         })
     })
 }

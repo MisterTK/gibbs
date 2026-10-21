@@ -1,0 +1,87 @@
+// Protocol and format metadata shared by GGUF tokenizers, Hub picker, TUI, and the NDJSON API.
+{
+  gguf_tokenizers: {
+    models: {
+      llama: "spm_scores",
+      gpt2: "byte_bpe",
+      gemma4: "spm_merges",
+      bert: "wordpiece",
+      t5: "unigram",
+    },
+    pre: {
+      "gpt-2": {
+        pre_tokenizer: {type: "ByteLevel", add_prefix_space: false, trim_offsets: true, use_regex: true},
+      },
+      smollm: {digits_byte_level: true},
+      starcoder: {digits_byte_level: true},
+      refact: {digits_byte_level: true},
+      "command-r": {digits_byte_level: true},
+      codeshell: {digits_byte_level: true},
+      exaone: {digits_byte_level: true},
+      "minerva-7b": {digits_byte_level: true},
+      qwen2: {
+        normalizer: {type: "NFC"},
+        pre_tokenizer: {type: "Sequence", pretokenizers: [
+          {type: "Split", pattern: {Regex: "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, behavior: "Isolated", invert: false},
+          {type: "ByteLevel", add_prefix_space: false, trim_offsets: false, use_regex: false},
+        ]},
+      },
+      qwen35: {
+        normalizer: {type: "NFC"},
+        pre_tokenizer: {type: "Sequence", pretokenizers: [
+          {type: "Split", pattern: {Regex: "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, behavior: "Isolated", invert: false},
+          {type: "ByteLevel", add_prefix_space: false, trim_offsets: false, use_regex: false},
+        ]},
+      },
+      "hunyuan-dense": {
+        pre_tokenizer: {type: "Sequence", pretokenizers: [
+          {type: "Split", pattern: {Regex: "\\p{N}{1,3}"}, behavior: "Isolated", invert: false},
+          {type: "Split", pattern: {Regex: "[\\u4E00-\\u9FA5\\u3040-\\u309F\\u30A0-\\u30FF]+"}, behavior: "Isolated", invert: false},
+          {type: "Split", pattern: {Regex: "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\\r\\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, behavior: "Isolated", invert: false},
+          {type: "ByteLevel", add_prefix_space: false, trim_offsets: true, use_regex: false},
+        ]},
+      },
+    },
+  },
+  ndjson_api: {
+    label: "ollama",
+    root_banner: "Ollama is running",
+    host_env: "OLLAMA_HOST",
+    client_name: "Ollama",
+  },
+  picker: {
+    image_derivative: "only SD 1.x/2.x, SDXL and FLUX.1 LoRAs, finetunes and GGUFs load",
+    gguf_source: "llama.cpp",
+    diffusion_gguf_arch: "flux",
+    split_gguf_allowed: ["flux", "bert", "t5"],
+  },
+  video_gguf: {
+    architecture: "ltxv",
+    skip_substrings: ["vae", "t5"],
+    refused_diffusers_classes: [
+      ["LTXConditionPipeline", "diffusers LTXConditionPipeline: needs LTX-Video v0.9.5+ parts (timestep-conditioned VAE decoder, per-token conditioning, latent upsampler), which are not implemented; only v0.9.0 LTXPipeline loads"],
+      ["LTXLatentUpsamplePipeline", "diffusers LTXLatentUpsamplePipeline: needs LTX-Video v0.9.5+ parts (timestep-conditioned VAE decoder, per-token conditioning, latent upsampler), which are not implemented; only v0.9.0 LTXPipeline loads"],
+    ],
+  },
+  classifier: {
+    transformers_types: [
+      "bert", "roberta", "xlm-roberta", "distilbert", "deberta", "deberta-v2", "modernbert",
+      "electra", "albert", "camembert", "mpnet", "t5", "llama", "qwen2", "qwen3", "qwen3_5",
+      "qwen3_5_text", "gemma", "gemma2", "gemma3_text", "gemma4", "eurobert",
+    ],
+    refused_seqcls_prefix: "Qwen3Moe",
+  },
+  tui: {
+    pinned_models: [
+      "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "unsloth/SmolLM2-135M-Instruct-GGUF",
+      "THUDM/glm-edge-1.5b-chat",
+      "Qwen/Qwen2.5-0.5B-Instruct",
+      "roneneldan/TinyStories-Instruct-8M",
+      "EleutherAI/pythia-14m",
+      "sentence-transformers/all-MiniLM-L6-v2",
+    ],
+    decide_keywords: ["bert", "jev", "system1", "decision"],
+    no_video_message: "no video model loaded; press m and load a video repo, e.g. city96/LTX-Video-gguf",
+  },
+}

@@ -1,5 +1,5 @@
-//! EXL3 (ExLlamaV3, `quant_method: "exl3"`) linear layers, decoded to f32 exactly as the reference
-//! `LinearEXL3.get_weight_tensor` (exllamav3/modules/quant/exl3.py) does:
+//! EXL3 (`quant_method: "exl3"`) linear layers, decoded to f32 as the reference
+//! `LinearEXL3.get_weight_tensor` (`modules/quant/exl3.py`) does:
 //!
 //! `W[in, out] = diag(suh) · H · Ŵ · H · diag(svh)`, H = block-diagonal 128×128 Sylvester Hadamard / √128.
 //!

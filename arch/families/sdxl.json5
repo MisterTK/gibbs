@@ -7,6 +7,10 @@
   extends: "sd",
   match: {
     diffusers_class: ["StableDiffusionXLPipeline"],
+    bases: [
+      "stabilityai/stable-diffusion-xl-base-1.0",
+      "stabilityai/sdxl-turbo",
+    ],
   },
   components: {
     text_encoder_2: {family: "clip_text", dir: "text_encoder_2"},

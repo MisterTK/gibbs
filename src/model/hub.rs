@@ -90,7 +90,7 @@ fn gguf_file_quant(stem: &str) -> Option<QuantFormat> {
 pub fn detect_quant_format(path: &Path) -> Option<QuantFormat> {
     let filename = path.file_name().and_then(|s| s.to_str())?.to_lowercase();
     if let Some(stem) = filename.strip_suffix(".gguf") {
-        // Split sets are often foldered by quant (`IQ2_S/GLM-00001-of-00003.gguf`); the file's own tag wins.
+        // Split sets are often foldered by quant (`IQ2_S/M-00001-of-00003.gguf`); the file's own tag wins.
         let dir = path
             .parent()
             .and_then(|d| d.file_name())
@@ -439,7 +439,7 @@ const METADATA_FILES: &[&str] = &[
     "processor_config.json",
     // GLQ e8_shell lattice codebook (its row order isn't reproducible from the enumeration).
     "e8_codebook.pt",
-    // Encoder-decoder tokenizers: Marian, M2M100/MBart/NLLB (SentencePiece), T5, FSMT, BART.
+    // Encoder-decoder tokenizers (SentencePiece, Unigram, BPE).
     "source.spm",
     "target.spm",
     "vocab.json",
@@ -767,7 +767,7 @@ pub fn select_weight_files(
         let root = !p.contains('/');
         if lower.ends_with(".gguf") {
             // `mmproj-*` files are vision projectors, `imatrix*.gguf` importance matrices and `mtp-*`
-            // (llama.cpp MTP drafters) sidecars, not the language model.
+            // (MTP drafter) sidecars, not the language model.
             let name = lower.rsplit('/').next().unwrap_or(&lower);
             if is_mmproj(name)
                 || name.starts_with("imatrix")
@@ -819,7 +819,7 @@ pub fn select_weight_files(
         } else if root
             && lower.ends_with(".safetensors")
             && !lower.starts_with("adapter_")
-            // Mistral-native names (`layers.0.attention.wq`) beside the HF-format shards.
+            // Original-format names (`layers.0.attention.wq`) beside the HF-format shards.
             && !lower.starts_with("consolidated")
             && shard_of(p, ".safetensors").is_none()
             && !comfy
@@ -850,7 +850,7 @@ pub fn select_weight_files(
                 .iter()
                 .filter_map(|s| {
                     let (pre, n, total, w) = shard_of(&s.path, ext)?;
-                    // Qwen3.5 repos name shards `model.safetensors-00001-of-00001.safetensors`.
+                    // Some repos name shards `model.safetensors-00001-of-00001.safetensors`.
                     let pre = pre.strip_suffix(ext).unwrap_or(pre);
                     (pre == prefix).then_some((n, total, w, s.path.as_str()))
                 })
@@ -959,7 +959,7 @@ pub fn select_weight_files(
 pub const MMPROJ_ONLY: &str =
     "vision projector only (mmproj); load the language-model repo, it fetches this projector";
 
-/// llama.cpp vision/audio projector GGUFs (`mmproj-*.gguf`, `*-mmproj.gguf`): not language models.
+/// Vision/audio projector GGUFs (`mmproj-*.gguf`, `*-mmproj.gguf`): not language models.
 fn is_mmproj(path: &str) -> bool {
     let p = path.to_lowercase();
     p.ends_with(".gguf") && p.rsplit('/').next().is_some_and(|n| n.contains("mmproj"))
@@ -1289,12 +1289,17 @@ impl HuggingFaceDownloader {
                 }
             })?,
         };
-        // ponytail: only the Gemma 4 GGUF loader runs the repo's vision/audio projector beside the
-        // language model; other architectures' projectors are not read, so they are not fetched.
-        let gemma4_gguf = weights[0].ends_with(".gguf")
+        // ponytail: only GGUF families with `runtime.mmproj` run the repo's vision/audio projector
+        // beside the language model; other architectures' projectors are not fetched.
+        let wants_mmproj = weights[0].ends_with(".gguf")
             && hub_json(&format!("https://huggingface.co/api/models/{repo}"), token)
-                .is_ok_and(|m| m["gguf"]["architecture"] == "gemma4");
-        if gemma4_gguf {
+                .ok()
+                .and_then(|m| {
+                    let a = m["gguf"]["architecture"].as_str()?;
+                    crate::arch::registry().ok().map(|r| r.gguf_uses_mmproj(a))
+                })
+                .unwrap_or(false);
+        if wants_mmproj {
             weights.extend(select_mmproj(&files, &weights[0]));
         }
         let mut pending: Vec<&RepoFile> = files
@@ -1693,7 +1698,7 @@ impl HuggingFaceHub {
     pub fn validate_budget(&self, artifacts: &ModelArtifacts) -> Result<(), String> {
         if artifacts.estimated_params > self.max_param_budget {
             Err(format!(
-                "Model '{}' exceeds parameter budget: estimated {} params exceeds maximum budget of {} params (10M ceiling safeguard). Suggested tiny models: 'gibbs/tiny-5m', 'gibbs/smollm-10m', 'gibbs/jev-decision-3m', 'foundry/tiny-5m'",
+                "Model '{}' exceeds parameter budget: estimated {} params exceeds maximum budget of {} params (10M ceiling safeguard). Suggested tiny models: 'gibbs/tiny-5m', 'gibbs/tiny-10m', 'gibbs/jev-decision-3m', 'foundry/tiny-5m'",
                 artifacts.model_id, artifacts.estimated_params, self.max_param_budget
             ))
         } else {
@@ -1717,7 +1722,7 @@ impl HuggingFaceHub {
         // If not cached, first enforce parameter budget on known non-tiny model names
         if artifacts.estimated_params > self.max_param_budget {
             return Err(format!(
-                "Model '{}' exceeds parameter budget: estimated {} params exceeds maximum budget of {} params (10M ceiling safeguard). Suggested tiny models: 'gibbs/tiny-5m', 'gibbs/smollm-10m', 'gibbs/jev-decision-3m', 'foundry/tiny-5m'",
+                "Model '{}' exceeds parameter budget: estimated {} params exceeds maximum budget of {} params (10M ceiling safeguard). Suggested tiny models: 'gibbs/tiny-5m', 'gibbs/tiny-10m', 'gibbs/jev-decision-3m', 'foundry/tiny-5m'",
                 artifacts.model_id, artifacts.estimated_params, self.max_param_budget
             ));
         }
@@ -1746,6 +1751,20 @@ impl HuggingFaceHub {
 
         let config_path = tiny_dir.join("config.json");
         if !config_path.exists() {
+            let rt = crate::arch::registry()
+                .ok()
+                .and_then(|r| r.fallback_runtime())
+                .unwrap_or_default();
+            let preset = rt["synthetic_presets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(|p| {
+                    let pat = p[0].as_str()?;
+                    crate::arch::glob(pat, &clean_name).then(|| p[1].clone())
+                })
+                .unwrap_or_default();
+            let u = |i: usize, d: usize| preset[i].as_u64().map_or(d, |n| n as usize);
             let (
                 num_params,
                 hidden_dim,
@@ -1754,212 +1773,20 @@ impl HuggingFaceHub {
                 num_kv_heads,
                 intermediate_dim,
                 vocab_size,
-                model_type,
-            ): (usize, usize, usize, usize, usize, usize, usize, &str) =
-                if clean_name.contains("gemma") {
-                    let is_tiny = clean_name.contains("tiny") || clean_name.contains("mini");
-                    (
-                        2_000_000_000usize,
-                        if is_tiny { 256 } else { 2304 },
-                        if is_tiny { 6 } else { 26 },
-                        if is_tiny { 4 } else { 8 },
-                        if is_tiny { 2 } else { 4 },
-                        if is_tiny { 768 } else { 9216 },
-                        256000,
-                        "gemma2",
-                    )
-                } else if clean_name.contains("qwen") {
-                    let is_tiny = clean_name.contains("tiny")
-                        || clean_name.contains("mini")
-                        || clean_name.contains("5m")
-                        || clean_name.contains("10m");
-                    let is_half_b = clean_name.contains("0.5b") || clean_name.contains("500m");
-                    (
-                        if is_half_b {
-                            500_000_000usize
-                        } else {
-                            1_500_000_000usize
-                        },
-                        if is_tiny {
-                            256
-                        } else if is_half_b {
-                            896
-                        } else {
-                            1536
-                        },
-                        if is_tiny {
-                            6
-                        } else if is_half_b {
-                            24
-                        } else {
-                            28
-                        },
-                        if is_tiny {
-                            4
-                        } else if is_half_b {
-                            14
-                        } else {
-                            12
-                        },
-                        2,
-                        if is_tiny {
-                            768
-                        } else if is_half_b {
-                            4864
-                        } else {
-                            8960
-                        },
-                        151936,
-                        "qwen2",
-                    )
-                } else if clean_name.contains("glm") {
-                    let is_tiny = clean_name.contains("tiny") || clean_name.contains("mini");
-                    (
-                        1_500_000_000usize,
-                        if is_tiny { 256 } else { 2048 },
-                        if is_tiny { 6 } else { 28 },
-                        if is_tiny { 4 } else { 16 },
-                        2,
-                        if is_tiny { 768 } else { 5460 },
-                        151552,
-                        "chatglm",
-                    )
-                } else if clean_name.contains("kimi") || clean_name.contains("moonshot") {
-                    let is_tiny = clean_name.contains("tiny") || clean_name.contains("mini");
-                    (
-                        3_000_000_000usize,
-                        if is_tiny { 256 } else { 2048 },
-                        if is_tiny { 6 } else { 28 },
-                        if is_tiny { 4 } else { 16 },
-                        4,
-                        if is_tiny { 768 } else { 5632 },
-                        151936,
-                        "kimi",
-                    )
-                } else if clean_name.contains("minicpm") {
-                    let is_tiny = clean_name.contains("tiny") || clean_name.contains("mini");
-                    let is_4b = clean_name.contains("4b");
-                    (
-                        if is_4b {
-                            4_000_000_000usize
-                        } else {
-                            2_400_000_000usize
-                        },
-                        if is_tiny {
-                            256
-                        } else if is_4b {
-                            2560
-                        } else {
-                            2304
-                        },
-                        if is_tiny {
-                            6
-                        } else if is_4b {
-                            62
-                        } else {
-                            40
-                        },
-                        if is_tiny {
-                            4
-                        } else if is_4b {
-                            20
-                        } else {
-                            36
-                        },
-                        if is_tiny {
-                            4
-                        } else if is_4b {
-                            20
-                        } else {
-                            36
-                        },
-                        if is_tiny {
-                            768
-                        } else if is_4b {
-                            6400
-                        } else {
-                            5760
-                        },
-                        122753,
-                        "minicpm",
-                    )
-                } else if clean_name.contains("smollm") {
-                    let is_tiny = clean_name.contains("tiny")
-                        || clean_name.contains("mini")
-                        || clean_name.contains("10m");
-                    let is_135m = clean_name.contains("135m");
-                    let is_360m = clean_name.contains("360m");
-                    (
-                        if is_135m {
-                            135_000_000usize
-                        } else if is_360m {
-                            360_000_000usize
-                        } else if is_tiny {
-                            10_000_000usize
-                        } else {
-                            1_700_000_000usize
-                        },
-                        if is_tiny {
-                            320
-                        } else if is_135m {
-                            576
-                        } else if is_360m {
-                            960
-                        } else {
-                            2048
-                        },
-                        if is_tiny {
-                            6
-                        } else if is_135m {
-                            30
-                        } else if is_360m {
-                            32
-                        } else {
-                            24
-                        },
-                        if is_tiny {
-                            5
-                        } else if is_135m {
-                            9
-                        } else if is_360m {
-                            15
-                        } else {
-                            32
-                        },
-                        if is_tiny {
-                            5
-                        } else if is_135m {
-                            3
-                        } else if is_360m {
-                            5
-                        } else {
-                            32
-                        },
-                        if is_tiny {
-                            896
-                        } else if is_135m {
-                            1536
-                        } else if is_360m {
-                            2560
-                        } else {
-                            8192
-                        },
-                        49152,
-                        "llama",
-                    )
-                } else if clean_name.contains("5m") {
-                    (5_000_000usize, 256, 6, 4, 2, 768, 2048, "qwen2")
-                } else if clean_name.contains("10m") {
-                    (10_000_000usize, 320, 6, 5, 2, 896, 2048, "qwen2")
-                } else if clean_name.contains("3m") {
-                    (3_000_000usize, 192, 5, 4, 2, 512, 1024, "qwen2")
-                } else {
-                    (1_000_000usize, 128, 2, 4, 2, 256, 512, "qwen2")
-                };
-
-            // Every synthetic id runs the llama-style decoder; `model_type` only labels the size preset.
+            ) = (
+                u(0, 1_000_000),
+                u(1, 128),
+                u(2, 2),
+                u(3, 4),
+                u(4, 2),
+                u(5, 256),
+                u(6, 512),
+            );
+            let model_type = preset[7].as_str().unwrap_or("default");
+            let synth_arch = rt["synthetic_architecture"].as_str().unwrap_or_default();
+            // Every synthetic id runs the fallback decoder; `model_type` only labels the size preset.
             let config_json = serde_json::json!({
-                "architectures": ["LlamaForCausalLM"],
+                "architectures": [synth_arch],
                 "model_type": model_type,
                 "num_parameters": num_params,
                 "hidden_size": hidden_dim,
@@ -2167,20 +1994,28 @@ fn estimate_params_from_config(config_path: &Path) -> Option<usize> {
         .or_else(|| num(&["intermediate_dim"]))
         .unwrap_or((hidden_size * 8) / 3);
 
-    // Embeddings: input, plus lm_head unless tied. PretrainedConfig defaults to tied; the
-    // Llama/Qwen2/Mistral configs default to untied.
-    let untied_default = matches!(
-        v["model_type"].as_str(),
-        Some("llama" | "qwen2" | "mistral")
-    );
+    // Embeddings: input, plus lm_head unless tied. PretrainedConfig defaults to tied; families
+    // in `runtime.untied_default_types` default to untied.
+    let untied_default = v["model_type"].as_str().is_some_and(|mt| {
+        crate::arch::registry()
+            .ok()
+            .and_then(|r| r.fallback_runtime())
+            .and_then(|rt| {
+                rt["untied_default_types"]
+                    .as_array()?
+                    .iter()
+                    .find_map(|t| (t.as_str() == Some(mt)).then_some(true))
+            })
+            .unwrap_or(false)
+    });
     let tied = v["tie_word_embeddings"]
         .as_bool()
         .unwrap_or(!untied_default);
     let embedding_params = if tied { 1 } else { 2 } * vocab_size * hidden_size;
 
     // Per-layer transformer params:
-    // Attention: Q/O are hidden × heads·head_dim, K/V hidden × kv_heads·head_dim (`head_dim` is
-    // explicit in Qwen3/Gemma configs and need not equal hidden / heads).
+    // Attention: Q/O are hidden × heads·head_dim, K/V hidden × kv_heads·head_dim (`head_dim` may be
+    // explicit in config and need not equal hidden / heads).
     // MLP (SwiGLU): gate + up + down -> 3 * hidden * intermediate
     // Layer norms: ~2 * hidden
     let heads = num(&["num_attention_heads", "n_heads", "n_head"])
@@ -2279,69 +2114,20 @@ pub fn is_synthetic_model_id(model_id: &str) -> bool {
 fn estimate_params_from_id(model_id: &str) -> usize {
     let lower = model_id.to_lowercase();
 
-    // Known synthetic and headliner models
-    if lower.contains("tiny-llama-5m") {
-        return 5_000_000;
-    }
-    if lower.contains("smollm-10m") {
-        return 10_000_000;
-    }
-    if lower.contains("jev-decision-3m") {
-        return 3_000_000;
-    }
-    if lower.contains("smollm2-135m") || lower.contains("smollm-135m") {
-        return 135_000_000;
-    }
-    if lower.contains("smollm2-360m") || lower.contains("smollm-360m") {
-        return 360_000_000;
-    }
-    if lower.contains("smollm2-1.7b") || lower.contains("smollm-1.7b") {
-        return 1_700_000_000;
-    }
-    if lower.contains("qwen-3.8b") || lower.contains("qwen3.8") {
-        return 3_800_000_000;
-    }
-    if lower.contains("qwen2.5-3b") {
-        return 3_000_000_000;
-    }
-    if lower.contains("qwen2.5-coder-1.5b")
-        || lower.contains("qwen2.5-1.5b")
-        || lower.contains("qwen2-1.5b")
-        || lower.contains("qwen-1.5b")
+    if let Some(params) = crate::arch::registry()
+        .ok()
+        .and_then(|r| r.fallback_runtime())
+        .and_then(|rt| {
+            rt["id_param_hints"]
+                .as_array()?
+                .iter()
+                .find_map(|h| {
+                    let pat = h[0].as_str()?;
+                    crate::arch::glob(pat, &lower).then(|| h[1].as_u64()).flatten()
+                })
+        })
     {
-        return 1_500_000_000;
-    }
-    if lower.contains("qwen2.5-coder-0.5b")
-        || lower.contains("qwen2.5-0.5b")
-        || lower.contains("qwen2-0.5b")
-        || lower.contains("qwen-0.5b")
-    {
-        return 500_000_000;
-    }
-    if lower.contains("gemma-4-2b")
-        || lower.contains("gemma-2-2b")
-        || lower.contains("gemma2-2b")
-        || lower.contains("gemma-2b")
-    {
-        return 2_000_000_000;
-    }
-    if lower.contains("gemma-4-4b") || lower.contains("gemma-4") {
-        return 4_000_000_000;
-    }
-    if lower.contains("glm-edge-4b") {
-        return 4_000_000_000;
-    }
-    if lower.contains("glm-edge-1.5b") {
-        return 1_500_000_000;
-    }
-    if lower.contains("kimi-chat-sub4b") || lower.contains("kimi") || lower.contains("moonshot") {
-        return 3_000_000_000;
-    }
-    if lower.contains("minicpm3-4b") || lower.contains("minicpm-4b") {
-        return 4_000_000_000;
-    }
-    if lower.contains("minicpm-2b") {
-        return 2_000_000_000;
+        return params as usize;
     }
     // Parse heuristics like "10m", "5m", "3m", "7b", "70b", "8b", "1.5b", "0.5b"
     for part in lower.split(|c: char| !c.is_alphanumeric() && c != '.') {

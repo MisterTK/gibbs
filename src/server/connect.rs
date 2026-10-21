@@ -83,14 +83,16 @@ opencode / Continue / any OpenAI client (/v1/chat/completions): base URL http://
 aider:
   {aider}
 
-Ollama clients (/api/chat, /api/generate):
-  OLLAMA_HOST={a}
+{compat_client} clients (/api/chat, /api/generate):
+  {compat_env}={a}
 
 Launch one in a new window: /agent {agents}",
         claude = cmd("claude"),
         opencode = cmd("opencode"),
         aider = cmd("aider"),
         agents = AGENTS.join("|"),
+        compat_client = crate::arch::compat()["ndjson_api"]["client_name"].as_str().expect("compat.ndjson_api.client_name"),
+        compat_env = crate::arch::compat()["ndjson_api"]["host_env"].as_str().expect("compat.ndjson_api.host_env"),
     )
 }
 

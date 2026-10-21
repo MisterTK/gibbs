@@ -31,98 +31,12 @@ mod tests_encoders_deberta;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as J};
 use std::path::Path;
 
 /// Every embedded spec file: (path under `arch/`, contents).
-pub const EMBEDDED: &[(&str, &str)] = &[
-    ("lib/transformer.json5", include_str!("../../arch/lib/transformer.json5")),
-    ("lib/diffusion.json5", include_str!("../../arch/lib/diffusion.json5")),
-    ("lib/unet.json5", include_str!("../../arch/lib/unet.json5")),
-    ("lib/vae.json5", include_str!("../../arch/lib/vae.json5")),
-    ("names/llamacpp.json5", include_str!("../../arch/names/llamacpp.json5")),
-    ("names/ldm_vae.json5", include_str!("../../arch/names/ldm_vae.json5")),
-    ("names/bfl.json5", include_str!("../../arch/names/bfl.json5")),
-    ("names/openclip.json5", include_str!("../../arch/names/openclip.json5")),
-    ("names/ldm.json5", include_str!("../../arch/names/ldm.json5")),
-    ("lib/qwen.json5", include_str!("../../arch/lib/qwen.json5")),
-    ("lib/deltanet.json5", include_str!("../../arch/lib/deltanet.json5")),
-    ("lib/moe.json5", include_str!("../../arch/lib/moe.json5")),
-    ("names/qwen35.json5", include_str!("../../arch/names/qwen35.json5")),
-    ("lib/qwen_vit.json5", include_str!("../../arch/lib/qwen_vit.json5")),
-    ("families/gemma3.json5", include_str!("../../arch/families/gemma3.json5")),
-    ("families/llama.json5", include_str!("../../arch/families/llama.json5")),
-    ("families/glm.json5", include_str!("../../arch/families/glm.json5")),
-    ("families/granite.json5", include_str!("../../arch/families/granite.json5")),
-    ("families/bitnet.json5", include_str!("../../arch/families/bitnet.json5")),
-    ("families/gpt_neox.json5", include_str!("../../arch/families/gpt_neox.json5")),
-    ("families/gpt2.json5", include_str!("../../arch/families/gpt2.json5")),
-    ("families/opt.json5", include_str!("../../arch/families/opt.json5")),
-    ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
-    ("names/comfy.json5", include_str!("../../arch/names/comfy.json5")),
-    ("families/krea2.json5", include_str!("../../arch/families/krea2.json5")),
-    ("families/qwen_image.json5", include_str!("../../arch/families/qwen_image.json5")),
-    ("families/qwen_image21.json5", include_str!("../../arch/families/qwen_image21.json5")),
-    ("families/qwen_vae.json5", include_str!("../../arch/families/qwen_vae.json5")),
-    ("families/qwen_vae21.json5", include_str!("../../arch/families/qwen_vae21.json5")),
-    ("families/qwen3_vl_text.json5", include_str!("../../arch/families/qwen3_vl_text.json5")),
-    ("families/qwen2_5_vl_text.json5", include_str!("../../arch/families/qwen2_5_vl_text.json5")),
-    ("families/zimage.json5", include_str!("../../arch/families/zimage.json5")),
-    ("families/sd3.json5", include_str!("../../arch/families/sd3.json5")),
-    ("families/gemma2.json5", include_str!("../../arch/families/gemma2.json5")),
-    ("families/sana.json5", include_str!("../../arch/families/sana.json5")),
-    ("families/sd_vae.json5", include_str!("../../arch/families/sd_vae.json5")),
-    ("families/dcae.json5", include_str!("../../arch/families/dcae.json5")),
-    ("families/flux.json5", include_str!("../../arch/families/flux.json5")),
-    ("families/chroma.json5", include_str!("../../arch/families/chroma.json5")),
-    ("families/flux2.json5", include_str!("../../arch/families/flux2.json5")),
-    ("families/clip_text.json5", include_str!("../../arch/families/clip_text.json5")),
-    ("families/sd.json5", include_str!("../../arch/families/sd.json5")),
-    ("families/sdxl.json5", include_str!("../../arch/families/sdxl.json5")),
-    ("overrides/sd_turbo.json5", include_str!("../../arch/overrides/sd_turbo.json5")),
-    ("overrides/sdxl_turbo.json5", include_str!("../../arch/overrides/sdxl_turbo.json5")),
-    ("families/ldm_clip.json5", include_str!("../../arch/families/ldm_clip.json5")),
-    ("families/ldm_openclip.json5", include_str!("../../arch/families/ldm_openclip.json5")),
-    ("families/sdxl_clip_l.json5", include_str!("../../arch/families/sdxl_clip_l.json5")),
-    ("families/sdxl_clip_g.json5", include_str!("../../arch/families/sdxl_clip_g.json5")),
-    ("families/ldm_unet.json5", include_str!("../../arch/families/ldm_unet.json5")),
-    ("families/ldm_vae.json5", include_str!("../../arch/families/ldm_vae.json5")),
-    ("families/sd1_file.json5", include_str!("../../arch/families/sd1_file.json5")),
-    ("families/sd2_file.json5", include_str!("../../arch/families/sd2_file.json5")),
-    ("families/sdxl_file.json5", include_str!("../../arch/families/sdxl_file.json5")),
-    ("families/sd2_gguf.json5", include_str!("../../arch/families/sd2_gguf.json5")),
-    ("overrides/sd1_file_turbo.json5", include_str!("../../arch/overrides/sd1_file_turbo.json5")),
-    ("overrides/sd2_file_turbo.json5", include_str!("../../arch/overrides/sd2_file_turbo.json5")),
-    ("overrides/sdxl_file_turbo.json5", include_str!("../../arch/overrides/sdxl_file_turbo.json5")),
-    ("families/nano.json5", include_str!("../../arch/families/nano.json5")),
-    ("families/idefics3.json5", include_str!("../../arch/families/idefics3.json5")),
-    ("families/dflash.json5", include_str!("../../arch/families/dflash.json5")),
-    ("families/qwen3_5.json5", include_str!("../../arch/families/qwen3_5.json5")),
-    ("families/qwen3.json5", include_str!("../../arch/families/qwen3.json5")),
-    ("families/hunyuan.json5", include_str!("../../arch/families/hunyuan.json5")),
-    ("families/qwen3_vl.json5", include_str!("../../arch/families/qwen3_vl.json5")),
-    ("families/qwen4_exp.json5", include_str!("../../arch/families/qwen4_exp.json5")),
-    ("families/gemma4.json5", include_str!("../../arch/families/gemma4.json5")),
-    ("families/gemma4_unified.json5", include_str!("../../arch/families/gemma4_unified.json5")),
-    ("families/t5.json5", include_str!("../../arch/families/t5.json5")),
-    ("families/bart.json5", include_str!("../../arch/families/bart.json5")),
-    ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
-    ("families/m2m100.json5", include_str!("../../arch/families/m2m100.json5")),
-    ("families/fsmt.json5", include_str!("../../arch/families/fsmt.json5")),
-    ("families/electra.json5", include_str!("../../arch/families/electra.json5")),
-    ("families/albert.json5", include_str!("../../arch/families/albert.json5")),
-    ("families/bert.json5", include_str!("../../arch/families/bert.json5")),
-    ("families/modernbert.json5", include_str!("../../arch/families/modernbert.json5")),
-    ("families/bert_gguf.json5", include_str!("../../arch/families/bert_gguf.json5")),
-    ("families/fasttext.json5", include_str!("../../arch/families/fasttext.json5")),
-    ("families/deberta.json5", include_str!("../../arch/families/deberta.json5")),
-    ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
-    ("lib/video.json5", include_str!("../../arch/lib/video.json5")),
-    ("families/ltx.json5", include_str!("../../arch/families/ltx.json5")),
-    ("families/ltx_vae.json5", include_str!("../../arch/families/ltx_vae.json5")),
-    ("families/modelscope_t2v.json5", include_str!("../../arch/families/modelscope_t2v.json5")),
-];
+pub const EMBEDDED: &[(&str, &str)] = &include!("../../arch/index.rs");
 
 /// Tensor facts the interpreter needs: canonical weights and generated constants.
 pub trait Source {
@@ -179,7 +93,7 @@ pub struct Match {
     pub bases: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pipeline {
     CausalLm,
@@ -374,7 +288,7 @@ impl Spec {
             .into_iter()
             .flatten()
             .find_map(|r| match (r[0].as_str(), r[1].as_str()) {
-                (Some(g), Some(why)) if glob(g, name) => Some(why.to_string()),
+                (Some(g), Some(why)) if glob(g, name) => Some(why.replace("{name}", name)),
                 _ => None,
             })
             .or_else(|| self.reason.clone())
@@ -731,6 +645,7 @@ impl Registry {
                 .hf_model_type
                 .iter()
                 .chain(&m.gguf_arch)
+                .chain(&m.diffusers_class)
                 .any(|p| glob(p, name));
             let spec = self.spec(f, &Signals::default()).ok()?;
             (hit && spec.pipeline == Pipeline::Unsupported).then(|| spec.unsupported_reason(name))
@@ -766,6 +681,119 @@ impl Registry {
             .flat_map(|(_, m, _)| m.bases)
             .collect()
     }
+
+    /// Whether any non-unsupported, non-drafter family claims `arch` in `gguf_arch`.
+    pub fn runs_gguf_arch(&self, arch: &str) -> bool {
+        self.matchers().iter().any(|(_, m, p)| {
+            !matches!(p, Pipeline::Unsupported | Pipeline::Drafter)
+                && m.gguf_arch.iter().any(|g| glob(g, arch))
+        })
+    }
+
+    /// The first `gguf_arch` of the fallback causal-LM family.
+    pub fn fallback_gguf_arch(&self) -> Option<String> {
+        self.matchers()
+            .into_iter()
+            .find(|(_, m, p)| *p == Pipeline::CausalLm && m.fallback)
+            .and_then(|(_, mut m, _)| (!m.gguf_arch.is_empty()).then(|| m.gguf_arch.swap_remove(0)))
+    }
+
+    /// `runtime` of the fallback causal-LM family.
+    pub fn fallback_runtime(&self) -> Option<J> {
+        let (f, _, _) = self
+            .matchers()
+            .into_iter()
+            .find(|(_, m, p)| *p == Pipeline::CausalLm && m.fallback)?;
+        Some(self.base(&f).ok()?["runtime"].clone())
+    }
+
+    /// `runtime.ninfer` of the family defining it.
+    pub fn ninfer_runtime(&self) -> Option<J> {
+        self.families.iter().find_map(|(f, _)| {
+            let v = &self.base(f).ok()?["runtime"]["ninfer"];
+            (!v.is_null()).then(|| v.clone())
+        })
+    }
+
+    /// Whether a family claiming `gguf_arch == arch` sets `runtime.mmproj: true`.
+    pub fn gguf_uses_mmproj(&self, arch: &str) -> bool {
+        self.matchers().into_iter().any(|(f, m, _)| {
+            m.gguf_arch.iter().any(|g| glob(g, arch))
+                && self.base(&f).ok().is_some_and(|b| b["runtime"]["mmproj"] == true)
+        })
+    }
+
+    /// `runtime.gguf_moe_blocker` of the family claiming `gguf_arch == arch`.
+    pub fn gguf_moe_blocker(&self, arch: &str) -> Option<String> {
+        self.matchers().into_iter().find_map(|(f, m, _)| {
+            m.gguf_arch
+                .iter()
+                .any(|g| glob(g, arch))
+                .then(|| self.base(&f).ok()?["runtime"]["gguf_moe_blocker"].as_str().map(String::from))
+                .flatten()
+        })
+    }
+
+    /// Whether an encoder family with `runtime.system1` claims `model_type`.
+    pub fn runs_system1(&self, model_type: &str) -> bool {
+        self.matchers().into_iter().any(|(f, m, p)| {
+            p == Pipeline::Encoder
+                && m.hf_model_type.iter().any(|g| glob(g, model_type))
+                && self.base(&f).ok().is_some_and(|b| !b["runtime"]["system1"].is_null())
+        })
+    }
+
+    /// Decoder `*ForSequenceClassification` architectures claimed by `causal_lm` families.
+    pub fn decoder_seqcls_architectures(&self) -> Vec<String> {
+        self.matchers()
+            .into_iter()
+            .filter(|(_, _, p)| *p == Pipeline::CausalLm)
+            .flat_map(|(_, m, _)| m.hf_architectures)
+            .filter(|a| a.ends_with("ForSequenceClassification"))
+            .collect()
+    }
+
+    /// Shared protocol/tokenizer/picker metadata (`arch/lib/compat.json5`).
+    pub fn compat(&self) -> Option<&J> {
+        self.lib.iter().find(|(n, _)| n == "compat").map(|(_, j)| j)
+    }
+
+    /// Markdown table of supported model families generated from `arch/families/*.json5` matches.
+    pub fn supported_models_markdown(&self) -> String {
+        let mut rows = vec![
+            "| Family | Pipeline | Matches |".to_string(),
+            "|:---|:---|:---|".to_string(),
+        ];
+        for (f, m, p) in self.matchers() {
+            if p == Pipeline::Unsupported {
+                continue;
+            }
+            let mut parts = Vec::new();
+            let fmt_list = |label: &str, items: &[String]| {
+                (!items.is_empty()).then(|| format!("{label}: `{}`", items.join("`, `")))
+            };
+            parts.extend(fmt_list("model_type", &m.hf_model_type));
+            parts.extend(fmt_list("arch", &m.hf_architectures));
+            parts.extend(fmt_list("gguf", &m.gguf_arch));
+            parts.extend(fmt_list("diffusers", &m.diffusers_class));
+            parts.extend(fmt_list("ext", &m.file_ext));
+            if !m.single_file_tensors.is_empty() {
+                parts.push("single-file".into());
+            }
+            if m.fallback {
+                parts.push("fallback".into());
+            }
+            if parts.is_empty() {
+                continue;
+            }
+            let pipe = serde_json::to_value(p)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            rows.push(format!("| `{f}` | `{pipe}` | {} |", parts.join("; ")));
+        }
+        rows.join("\n")
+    }
 }
 
 fn applies(a: &AppliesTo, family: &str, sig: &Signals) -> bool {
@@ -794,6 +822,37 @@ pub fn registry() -> Result<&'static Registry, String> {
 /// [`Registry::unsupported`] over [`registry`].
 pub fn unsupported(name: &str) -> Option<String> {
     registry().ok()?.unsupported(name)
+}
+
+/// Shared protocol/tokenizer/picker metadata (`arch/lib/compat.json5`).
+pub fn compat() -> &'static J {
+    static C: std::sync::LazyLock<J> = std::sync::LazyLock::new(|| {
+        registry()
+            .ok()
+            .and_then(|r| r.compat().cloned())
+            .unwrap_or(J::Null)
+    });
+    &C
+}
+
+/// Generic GGUF `tokenizer.ggml.model` kind from `arch/lib/compat.json5`.
+pub fn gguf_tokenizer_model(model: &str) -> Option<&'static str> {
+    compat()["gguf_tokenizers"]["models"][model].as_str()
+}
+
+/// `(normalizer, pre_tokenizer)` JSON of GGUF `tokenizer.ggml.pre` from `arch/lib/compat.json5`.
+pub fn gguf_pre_tokenizer(pre: &str, byte_level: &J) -> Option<(J, J)> {
+    let p = compat()["gguf_tokenizers"]["pre"].get(pre)?;
+    let pre_tok = if p["digits_byte_level"] == true {
+        serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [{"type": "Digits", "individual_digits": true}, byte_level.clone()],
+        })
+    } else {
+        p.get("pre_tokenizer")?.clone()
+    };
+    let norm = p.get("normalizer").cloned().unwrap_or(J::Null);
+    Some((norm, pre_tok))
 }
 
 #[cfg(test)]
@@ -1428,5 +1487,15 @@ mod tests {
         assert_eq!(r.derived_bases(Pipeline::Diffusion), ["org/toy"]);
         assert_eq!(r.pipeline_gguf_archs(Pipeline::Diffusion), ["toy_dit"]);
         assert!(r.derived_bases(Pipeline::CausalLm).is_empty() && r.causal_lm_gguf_archs().is_empty());
+    }
+
+    #[test]
+    fn supported_models_table_in_readme_matches_registry() {
+        let table = Registry::load(None).unwrap().supported_models_markdown();
+        let readme = include_str!("../../README.md");
+        assert!(
+            readme.contains(&table),
+            "README.md Supported models table is out of sync with arch/families:\n{table}"
+        );
     }
 }

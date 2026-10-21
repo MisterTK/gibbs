@@ -155,7 +155,7 @@ impl ReencodeConfig {
 }
 
 /// `--quant` spellings: the format every spec-loaded weight matrix is stored as
-/// ([`ReencodeConfig::force`]). `nvfp4` is llama.cpp's `GGUF_NVFP4` block codec.
+/// ([`ReencodeConfig::force`]). `nvfp4` is the `GGUF_NVFP4` block codec.
 pub fn parse_quant(s: &str) -> Result<crate::hardware::QuantFormat, String> {
     use crate::hardware::QuantFormat as Q;
     let f = match s.to_lowercase().as_str() {

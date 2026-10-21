@@ -2,7 +2,7 @@
 //! the server and the TUI. Encoders (every family whose spec has `pipeline: encoder`, SetFit and
 //! GGUF classifier exports) run on `runtime::encoder`; fastText models on `runtime::bag`;
 //! decoder `*ForSequenceClassification` bodies are scored on their last non-pad token
-//! (`runtime::seqcls` over the family spec; Gemma 3/4 legacy: until Phase 6).
+//! (`runtime::seqcls` over the family spec).
 
 #[cfg(test)]
 mod gpu_tests;
@@ -21,22 +21,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Decoder `architectures[0]` values loaded as seq-cls bodies.
-const DECODER_ARCHITECTURES: &[&str] = &[
-    "LlamaForSequenceClassification",
-    "Qwen2ForSequenceClassification",
-    "GPT2ForSequenceClassification",
-    "OPTForSequenceClassification",
-    "GPTNeoXForSequenceClassification",
-    "Qwen3ForSequenceClassification",
-    "Qwen3_5ForSequenceClassification",
-    "Qwen3_5TextForSequenceClassification",
-    "Gemma4ForSequenceClassification",
-    "Gemma3TextForSequenceClassification",
-];
+fn decoder_architectures() -> Vec<String> {
+    crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.decoder_seqcls_architectures())
+}
 
 /// Whether `arch` (`architectures[0]`) loads as a sequence classifier.
 pub fn runs_architecture(arch: &str) -> bool {
-    DECODER_ARCHITECTURES.contains(&arch) || encoder::classifier_architectures().iter().any(|a| a == arch)
+    decoder_architectures().iter().any(|a| a == arch)
+        || encoder::classifier_architectures().iter().any(|a| a == arch)
 }
 
 /// The classifier the engine serves, shared by the HTTP server and the TUI. `Some` makes it the
@@ -193,30 +185,14 @@ pub fn detect(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
 
 /// transformers `model_type`s whose base classes (`<Family>Model`, `...ForMaskedLM`) are plain
 /// backbones; another class name over them is the repo's own code.
-const TRANSFORMERS_TYPES: &[&str] = &[
-    "bert",
-    "roberta",
-    "xlm-roberta",
-    "distilbert",
-    "deberta",
-    "deberta-v2",
-    "modernbert",
-    "electra",
-    "albert",
-    "camembert",
-    "mpnet",
-    "t5",
-    "llama",
-    "qwen2",
-    "qwen3",
-    "qwen3_5",
-    "qwen3_5_text",
-    "gemma",
-    "gemma2",
-    "gemma3_text",
-    "gemma4",
-    "eurobert",
-];
+fn transformers_types() -> Vec<&'static str> {
+    crate::arch::compat()["classifier"]["transformers_types"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
 
 /// Picker verdict for a Hub search result `m` (`/api/models` JSON with config, library_name,
 /// tags, siblings, gguf) that a classifier or a decoder tagged for classification decides:
@@ -295,7 +271,7 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
         let fold = |s: &str| s.to_lowercase().replace(['-', '_'], "");
         let seq_cls = a.ends_with("ForSequenceClassification");
         let named = model_type.is_some_and(|t| {
-            fold(a).starts_with(&fold(t)) && (seq_cls || TRANSFORMERS_TYPES.contains(&t))
+            fold(a).starts_with(&fold(t)) && (seq_cls || transformers_types().contains(&t))
         });
         return Some(Err(if !named {
             format!("custom architecture '{a}' (remote code)")
@@ -321,17 +297,18 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
             .all(|f| f.starts_with("loras/") || f.contains("lora"))
         {
             Err("GGUF LoRA adapter (needs its base model)".into())
-        } else if let Some(a) = m["gguf"]["architecture"]
-            .as_str()
-            .filter(|a| a.contains("bert") && *a != "bert")
-        {
-            // ponytail: GGUF classifiers load for llama.cpp's `bert` arch (BERT/RoBERTa/XLM-R);
-            // ModernBERT/Nomic/Jina encoders need their own graphs.
+        } else if let Some((a, only)) = m["gguf"]["architecture"].as_str().and_then(|a| {
+            let enc = crate::arch::registry()
+                .ok()?
+                .pipeline_gguf_archs(crate::arch::Pipeline::Encoder);
+            let only = enc.iter().find(|o| a.contains(o.as_str()) && a != o.as_str())?.clone();
+            Some((a, only))
+        }) {
             Err(format!(
-                "GGUF encoder architecture '{a}' (only 'bert' classifiers load)"
+                "GGUF encoder architecture '{a}' (only '{only}' classifiers load)"
             ))
         } else {
-            // A decoder GGUF generates; a `bert` GGUF classifier loads in the classifier.
+            // A decoder GGUF generates; a supported GGUF classifier loads in the classifier.
             Ok(())
         }
     } else if lib == "fasttext" || tags.contains(&"fasttext") {
@@ -409,19 +386,23 @@ impl SequenceClassifier {
             return Ok(Self::encoder(repo_id, m, c));
         }
         let (cfg, arch, peft) = (r.cfg, r.arch, r.peft);
-        if arch.starts_with("Qwen3Moe") {
+        if crate::arch::compat()["classifier"]["refused_seqcls_prefix"]
+            .as_str()
+            .is_some_and(|p| arch.starts_with(p))
+        {
             return Err(format!(
                 "{repo_id}: {arch} is not supported: mixture-of-experts decoder layers (routed expert MLPs) are not implemented"
             ));
         }
-        if !DECODER_ARCHITECTURES.contains(&arch.as_str()) {
+        let dec_archs = decoder_architectures();
+        if !dec_archs.iter().any(|a| a == &arch) {
             if !cfg["auto_map"].is_null() {
                 return Err(format!(
                     "{repo_id}: custom architecture '{arch}' (remote code)"
                 ));
             }
             let mut all = encoder::classifier_architectures().to_vec();
-            all.extend(DECODER_ARCHITECTURES.iter().map(|a| a.to_string()));
+            all.extend(dec_archs);
             return Err(format!("{repo_id}: {arch} is not supported (supported: {})", all.join(", ")));
         }
         let pad_id = cfg["pad_token_id"].as_u64().map(|v| v as u32);

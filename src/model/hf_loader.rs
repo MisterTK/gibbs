@@ -4,7 +4,7 @@ use std::path::Path;
 
 /// Reads `tokenizer.json` with the chat template and bos/eos strings beside it
 /// (`tokenizer_config.json`, `chat_template.jinja`; both optional). With no template in either,
-/// the `chat_template` field of a processor's `chat_template.json` (Qwen3-VL, SmolVLM) is used.
+/// the `chat_template` field of a processor's `chat_template.json` is used.
 pub fn load_json_tokenizer(p: &Path) -> Result<Tokenizer, String> {
     let json = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
     tokenizer_from_files(&json, &|n| fs::read(p.with_file_name(n)).ok())
@@ -42,7 +42,7 @@ pub fn tokenizer_from_files(
 
 /// Applies `generation_config.json`: its `eos_token_id`(s) end generation, and requests that leave
 /// temperature/top_p unset get its sampling settings: greedy for `do_sample: false`, else its
-/// temperature/top_p when it sets either (as vLLM does). A config silent on both (SmolLM2) keeps
+/// temperature/top_p when it sets either (as vLLM does). A config silent on both keeps
 /// the engine's defaults; encoder-decoders set greedy themselves. A missing file leaves
 /// everything as is.
 pub fn apply_generation_config(tok: &mut Tokenizer, path: &Path) {

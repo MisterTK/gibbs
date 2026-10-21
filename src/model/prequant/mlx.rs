@@ -229,7 +229,7 @@ impl<'a> Packed<'a> {
     }
 
     /// [`Self::decode`] rounded to bf16 (mlx's output dtype for bf16 scales), a block of rows at a
-    /// time so no whole-matrix f32 copy exists (Gemma 4's per-layer embedding is 2.3G values).
+    /// time so no whole-matrix f32 copy exists (a per-layer embedding table can exceed 2G values).
     pub(crate) fn decode_bf16(&self) -> Result<Vec<u16>, String> {
         const BLOCK: usize = 1024;
         let mut out = Vec::with_capacity(self.rows * self.cols);

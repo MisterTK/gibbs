@@ -1599,7 +1599,7 @@ fn parse_hub_rows(
                 })
                 .unwrap_or_default();
             let selection = select_weight_files(&files, None);
-            // ponytail: hub `total` counts packed words inconsistently (mlx-community Qwen3.5-0.8B-4bit
+            // ponytail: hub `total` counts packed words inconsistently (some 4-bit repos
             // reports logical U32 counts, -mxfp4 raw words), so packed repos may be under-counted.
             let ninfer = selection
                 .as_ref()
@@ -1643,15 +1643,15 @@ fn parse_hub_rows(
                 .map_or(Vec::new(), |t| t.iter().filter_map(Value::as_str).collect());
             let gguf_arch = m["gguf"]["architecture"].as_str();
             let draft_for = draft_target(&id, &m["config"], &tags, gguf_arch);
-            // GGUF draft sidecars attach like safetensors drafters; llama.cpp forks' own
+            // GGUF draft sidecars attach like safetensors drafters; fork
             // architectures (another tensor layout) are refused by name.
             let gguf_draft = gguf_arch.and_then(crate::runtime::draft::refused_draft_gguf);
-            // llama.cpp `mmproj` repos (arch `clip`): projectors of a language-model repo.
+            // GGUF `mmproj` repos (arch `clip`): projectors of a language-model repo.
             let gguf_projector = (m["gguf"]["architecture"] == "clip")
                 .then(|| crate::model::hub::MMPROJ_ONLY.to_string());
             let blocker = gguf_draft
                 .or(gguf_projector)
-                .or_else(|| gemma4_moe_blocker(m, &id, &tags))
+                .or_else(|| gguf_moe_blocker(m, &id, &tags))
                 .or_else(|| pipeline_blocker(m).filter(|_| draft_for.is_none()))
                 .or_else(|| quant_blocker(m))
                 .or_else(|| split_gguf_blocker(m, &selection))
@@ -1713,52 +1713,26 @@ fn parse_hub_rows(
         .collect())
 }
 
-/// diffusers pipelines (`config.diffusers._class_name`) an image loader runs.
-const IMAGE_PIPELINES: &[&str] = &[
-    "StableDiffusionPipeline",
-    "StableDiffusionXLPipeline",
-    "LatentConsistencyModelPipeline",
-    "StableDiffusion3Pipeline",
-    "ZImagePipeline",
-    "SanaPipeline",
-    "FluxPipeline",
-    "ChromaPipeline",
-    "Flux2KleinPipeline",
-    "Krea2Pipeline",
-    "QwenImage21Pipeline",
-    "QwenImagePipeline",
-];
-
-/// FLUX.1 bases whose LoRAs, single-file finetunes and transformer-only GGUFs
-/// [`crate::runtime::diffusion::load_image`] runs on top of the base repo.
-const FLUX_BASES: &[&str] = &[
-    "black-forest-labs/FLUX.1-schnell",
-    "black-forest-labs/FLUX.1-dev",
-];
-
-/// Bases whose LoRAs (`lora` tag) and single-file finetunes the SD loader runs, by the repo's
-/// `base_model:adapter:` / `base_model:finetune:` tag.
-const SD_BASES: &[&str] = &[
-    "stable-diffusion-v1-5/stable-diffusion-v1-5",
-    "runwayml/stable-diffusion-v1-5",
-    "CompVis/stable-diffusion-v1-4",
-    "stabilityai/stable-diffusion-2-1",
-    "stabilityai/stable-diffusion-2-1-base",
-    "stabilityai/sd-turbo",
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    "stabilityai/sdxl-turbo",
-];
-
 /// A GGUF architecture a diffusion spec's denoiser claims (`match.gguf_arch`).
 fn diffusion_gguf_arch(a: &str) -> bool {
-    crate::arch::registry().is_ok_and(|r| r.pipeline_gguf_archs(crate::arch::Pipeline::Diffusion).iter().any(|g| g == a))
+    crate::arch::registry().is_ok_and(|r| {
+        r.pipeline_gguf_archs(crate::arch::Pipeline::Diffusion)
+            .iter()
+            .any(|g| g == a)
+    })
 }
 
-/// Text-to-image repos an image loader runs: a listed diffusers pipeline, or an SD LoRA / single-file
-/// finetune of a listed base.
+/// Text-to-image repos an image loader runs: a diffusion family's diffusers pipeline, or a
+/// derivative / GGUF of a listed base (`match.bases`).
 fn image_supported(m: &Value) -> bool {
     if let Some(c) = m["config"]["diffusers"]["_class_name"].as_str() {
-        return IMAGE_PIPELINES.contains(&c);
+        return c.ends_with("Pipeline")
+            && crate::arch::registry().is_ok_and(|r| {
+                r.matchers().iter().any(|(_, m, p)| {
+                    *p == crate::arch::Pipeline::Diffusion
+                        && m.diffusers_class.iter().any(|d| d == c)
+                })
+            });
     }
     let tags: Vec<&str> = m["tags"]
         .as_array()
@@ -1766,25 +1740,20 @@ fn image_supported(m: &Value) -> bool {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
-    let base = |kind: &str| {
-        tags.iter()
-            .find_map(|t| t.strip_prefix(kind))
-            .is_some_and(|b| SD_BASES.contains(&b))
-    };
     // Derivatives of a diffusion spec's `match.bases` (card `base_model`, [`crate::runtime::diffusion::load_image`]).
-    let spec_bases = crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.derived_bases(crate::arch::Pipeline::Diffusion));
+    let spec_bases = crate::arch::registry()
+        .map_or_else(|_| Vec::new(), |r| r.derived_bases(crate::arch::Pipeline::Diffusion));
     let derived = |kind: &str| {
         tags.iter()
             .filter_map(|t| t.strip_prefix(kind))
-            .any(|b| FLUX_BASES.contains(&b) || spec_bases.iter().any(|s| s == b))
+            .any(|b| spec_bases.iter().any(|s| s == b))
     };
-    (tags.contains(&"lora") && base("base_model:adapter:"))
-        || base("base_model:finetune:")
-        || base("base_model:quantized:")
-        || m["gguf"]["architecture"] == "flux"
-        // Transformer-only GGUFs of a diffusion spec, unless derived from a base it does not list
-        // (image-editing variants share the architecture names).
-        || (m["gguf"]["architecture"].as_str().is_some_and(|a| diffusion_gguf_arch(a))
+    crate::arch::compat()["picker"]["diffusion_gguf_arch"]
+        .as_str()
+        .is_some_and(|a| m["gguf"]["architecture"] == a)
+        || (m["gguf"]["architecture"]
+            .as_str()
+            .is_some_and(diffusion_gguf_arch)
             && !tags.iter().any(|t| {
                 ["base_model:adapter:", "base_model:finetune:", "base_model:quantized:"]
                     .iter()
@@ -1800,10 +1769,15 @@ fn image_supported(m: &Value) -> bool {
         .any(|k| derived(k))
 }
 
-/// LTX-Video repos: the loader's own file rule ([`crate::model::video_repo::pick_gguf`]) for `ltxv` GGUF repos,
-/// the pipeline class for diffusers ones; `None` when `m` is not LTX-Video.
-fn ltx_verdict(m: &Value) -> Option<Result<(), String>> {
-    if m["gguf"]["architecture"] == "ltxv" {
+/// Video repos: the loader's own file rule ([`crate::model::video_repo::pick_gguf`]) for video GGUF
+/// repos, or the pipeline class for diffusers ones; `None` when `m` is not a video repo.
+fn video_verdict(m: &Value) -> Option<Result<(), String>> {
+    let reg = crate::arch::registry().ok()?;
+    let vg = &crate::arch::compat()["video_gguf"];
+    if vg["architecture"]
+        .as_str()
+        .is_some_and(|a| m["gguf"]["architecture"] == a)
+    {
         let files: Vec<RepoFile> = m["siblings"]
             .as_array()
             .into_iter()
@@ -1816,13 +1790,20 @@ fn ltx_verdict(m: &Value) -> Option<Result<(), String>> {
             .collect();
         return Some(crate::model::video_repo::pick_gguf(&files, None).map(|_| ()));
     }
-    match m["config"]["diffusers"]["_class_name"].as_str()? {
-        "LTXPipeline" | "LTXImageToVideoPipeline" => Some(Ok(())),
-        c @ ("LTXConditionPipeline" | "LTXLatentUpsamplePipeline") => Some(Err(format!(
-            "diffusers {c}: needs LTX-Video v0.9.5+ parts (timestep-conditioned VAE decoder, per-token conditioning, latent upsampler), which are not implemented; only v0.9.0 LTXPipeline loads"
-        ))),
-        _ => None,
+    let c = m["config"]["diffusers"]["_class_name"].as_str()?;
+    if let Some(why) = vg["refused_diffusers_classes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|r| (r[0].as_str() == Some(c)).then(|| r[1].as_str().map(String::from)).flatten())
+    {
+        return Some(Err(why));
     }
+    (c.ends_with("Pipeline")
+        && reg.matchers().iter().any(|(_, m, p)| {
+            *p == crate::arch::Pipeline::Video && m.diffusers_class.iter().any(|d| d == c)
+        }))
+    .then_some(Ok(()))
 }
 
 /// Repos tagged for a task the engine does not run. Untagged repos, the classifier verdict
@@ -1834,7 +1815,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     if image_supported(m) {
         return None;
     }
-    if let Some(verdict) = ltx_verdict(m) {
+    if let Some(verdict) = video_verdict(m) {
         return verdict.err();
     }
     if let Some(c) = m["config"]["diffusers"]["_class_name"].as_str() {
@@ -1869,7 +1850,14 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     let tag = m["pipeline_tag"].as_str()?;
     if matches!(tag, "feature-extraction" | "sentence-similarity") {
         let gguf = m["gguf"]["architecture"].as_str();
-        if model_type == Some("bert") || gguf == Some("bert") {
+        if crate::arch::registry().is_ok_and(|r| {
+            model_type.is_some_and(|t| r.runs_system1(t))
+                || gguf.is_some_and(|a| {
+                    r.pipeline_gguf_archs(crate::arch::Pipeline::Encoder)
+                        .iter()
+                        .any(|g| g == a)
+                })
+        }) {
             return None;
         }
     }
@@ -1894,7 +1882,10 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
         });
         return Some(match base {
             Some(b) => format!(
-                "derivative of {b}: only SD 1.x/2.x, SDXL and FLUX.1 LoRAs, finetunes and GGUFs load"
+                "derivative of {b}: {}",
+                crate::arch::compat()["picker"]["image_derivative"]
+                    .as_str()
+                    .expect("compat.picker.image_derivative")
             ),
             None => "text-to-image repo without a diffusers pipeline (model_index.json) or base model tag".into(),
         });
@@ -1906,7 +1897,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
         tag,
         "translation" | "summarization" | "text2text-generation"
     ) && model_type.is_some_and(|t| crate::arch::registry().is_ok_and(|r| r.runs_model_type(t)));
-    // GGUF-only repos carry no config; their llama.cpp architecture names the model.
+    // GGUF-only repos carry no config; their GGUF architecture names the model.
     let gguf = m["gguf"]["architecture"]
         .as_str()
         .filter(|_| model_type.is_none());
@@ -1916,7 +1907,10 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     (!text_gen).then(|| match (model_type, gguf) {
         (Some(t), _) => format!("{tag} model, architecture '{t}' (not supported)"),
         (None, Some(a)) => format!(
-            "{tag} model, llama.cpp GGUF architecture '{a}' (not supported; {} GGUFs load)",
+            "{tag} model, {} GGUF architecture '{a}' (not supported; {} GGUFs load)",
+            crate::arch::compat()["picker"]["gguf_source"]
+                .as_str()
+                .expect("compat.picker.gguf_source"),
             gguf_lm_archs().join(", ")
         ),
         (None, None) => match m["library_name"].as_str().filter(|l| *l != "transformers") {
@@ -1942,19 +1936,16 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     })
 }
 
-/// llama.cpp GGUF architectures a generation path reads (causal-LM family specs, and the native
-/// gemma4 GGUF loader), whatever task the repo is tagged with.
+/// GGUF architectures a generation path reads, whatever task the repo is tagged with.
 fn gguf_lm_archs() -> Vec<String> {
-    let mut a = crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs());
-    // legacy: until Phase 6 gives gemma4 a spec.
-    a.push("gemma4".into());
-    a
+    crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs())
 }
 
-/// Sparse Gemma 4 GGUFs (`26B-A4B`: an `A<active billions>B` word in the repo id or its base model
-/// tag): the native loader has no router / expert block (it names the tensor it meets).
-fn gemma4_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
+/// Sparse MoE GGUFs whose family spec declares `runtime.gguf_moe_blocker`.
+fn gguf_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
     // ponytail: a naming convention; the hub's metadata carries no expert count.
+    let a = m["gguf"]["architecture"].as_str()?;
+    let msg = crate::arch::registry().ok()?.gguf_moe_blocker(a)?;
     let active = |s: &str| {
         s.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
             w.strip_prefix(['A', 'a'])
@@ -1962,11 +1953,7 @@ fn gemma4_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
                 .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
         })
     };
-    (m["gguf"]["architecture"] == "gemma4"
-        && (active(id) || tags.iter().any(|t| t.starts_with("base_model:") && active(t))))
-    .then(|| {
-        "Gemma 4 MoE GGUF (26B-A4B: router and expert blocks) is not implemented; the dense E2B, E4B, 12B and 31B GGUFs load".to_string()
-    })
+    (active(id) || tags.iter().any(|t| t.starts_with("base_model:") && active(t))).then_some(msg)
 }
 
 /// Split GGUF sets (`-00001-of-00003.gguf`, read as one weight set by every GGUF loader) of an
@@ -1974,13 +1961,19 @@ fn gemma4_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
 fn split_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
     let sel = selection.as_ref().ok()?;
     let a = m["gguf"]["architecture"].as_str()?;
+    let allowed = crate::arch::compat()["picker"]["split_gguf_allowed"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(a)));
     (sel.len() > 1
         && sel[0].ends_with(".gguf")
         && !gguf_lm_archs().iter().any(|x| x == a)
-        && !["flux", "bert", "t5"].contains(&a))
+        && !allowed)
     .then(|| {
         format!(
-            "split GGUF of llama.cpp architecture '{a}' (not supported; {} GGUFs load)",
+            "split GGUF of {} architecture '{a}' (not supported; {} GGUFs load)",
+            crate::arch::compat()["picker"]["gguf_source"]
+                .as_str()
+                .expect("compat.picker.gguf_source"),
             gguf_lm_archs().join(", ")
         )
     })

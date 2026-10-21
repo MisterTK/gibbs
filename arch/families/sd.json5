@@ -10,6 +10,14 @@
   family: "sd",
   match: {
     diffusers_class: ["StableDiffusionPipeline", "LatentConsistencyModelPipeline", "UNet2DConditionModel"],
+    bases: [
+      "stable-diffusion-v1-5/stable-diffusion-v1-5",
+      "runwayml/stable-diffusion-v1-5",
+      "CompVis/stable-diffusion-v1-4",
+      "stabilityai/stable-diffusion-2-1",
+      "stabilityai/stable-diffusion-2-1-base",
+      "stabilityai/sd-turbo",
+    ],
   },
   pipeline: "diffusion",
   use_lib: ["unet"],

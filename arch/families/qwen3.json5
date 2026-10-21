@@ -5,7 +5,7 @@
   family: "qwen3",
   match: {
     hf_model_type: ["qwen3", "qwen3_moe"],
-    hf_architectures: ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"],
+    hf_architectures: ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen3ForSequenceClassification"],
     gguf_arch: ["qwen3", "qwen3moe"],
   },
   pipeline: "causal_lm",

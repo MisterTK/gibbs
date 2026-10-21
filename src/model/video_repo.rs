@@ -1,7 +1,7 @@
 //! Where the parts of a text-to-video generation come from: a diffusers video pipeline repo
-//! (`model_index.json` class of a `pipeline: video` family spec), or an LTX-Video GGUF repo (hub
-//! arch `ltxv`) whose card names such a base, its transformer (and VAE, when the repo carries one)
-//! replacing the base's, with a `t5encoder` GGUF text encoder by default.
+//! (`model_index.json` class of a `pipeline: video` family spec), or a video GGUF repo whose card
+//! names such a base, its transformer (and VAE, when the repo carries one) replacing the base's,
+//! with the family spec's `runtime.default_text_encoder_gguf` text encoder by default.
 
 use crate::hardware::PlacementMode;
 use crate::model::hub::{
@@ -12,14 +12,10 @@ use crate::model::image::ImageBuffer;
 use crate::runtime::diffusion::{Extras, SpecDiffusion, VideoRequest};
 use std::path::Path;
 
-/// T5-XXL `t5encoder` GGUF used with GGUF transformers unless the caller names another text encoder.
-// ponytail: Q4_K_M is a fixed quality/size pick; `text_encoder` overrides it with another T5 GGUF quant.
-const DEFAULT_T5_GGUF: &str = "city96/t5-v1_1-xxl-encoder-gguf/t5-v1_1-xxl-encoder-Q4_K_M.gguf";
-
-/// Whether a repo file name belongs to the LTX-Video v0.9.0 generation (`ltx-video-2b-v0.9-*.gguf`,
-/// `ltxv_0.9_vae_*`): later versions (`v0.9.1`, `0.9.6`, `13b-0.9.7`, ...) pair with other VAE decoders
+/// Whether a repo file name belongs to the v0.9.0 video generation (`*-2b-v0.9-*.gguf`,
+/// `*_0.9_vae_*`): later versions (`v0.9.1`, `0.9.6`, `13b-0.9.7`, ...) pair with other VAE decoders
 /// (timestep conditioning, noise injection, wider blocks) that are not implemented. Transformer GGUFs
-/// (`marker`) must carry the version; the original VAE files (`LTX-Video-VAE-*`) have none.
+/// (`marker`) must carry the version; the original VAE files have none.
 fn is_v090(name: &str, marker: bool) -> bool {
     let n = name.to_lowercase();
     match n.find("0.9") {
@@ -28,7 +24,7 @@ fn is_v090(name: &str, marker: bool) -> bool {
     }
 }
 
-/// Files of an LTX-Video GGUF repo: the transformer GGUF (the hub's usual quant choice among the v0.9.0
+/// Files of a video GGUF repo: the transformer GGUF (the hub's usual quant choice among the v0.9.0
 /// ones) and, when the repo carries its own, the matching VAE. `Err` carries the reason a repo is refused.
 pub struct RepoPick {
     pub transformer: String,
@@ -37,21 +33,27 @@ pub struct RepoPick {
 
 pub fn pick_gguf(files: &[RepoFile], quant: Option<&str>) -> Result<RepoPick, String> {
     let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_lowercase();
+    let skip: Vec<&str> = crate::arch::compat()["video_gguf"]["skip_substrings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
     let ggufs: Vec<&RepoFile> = files
         .iter()
         .filter(|f| {
             let b = base(&f.path);
-            b.ends_with(".gguf") && !b.contains("vae") && !b.contains("t5")
+            b.ends_with(".gguf") && !skip.iter().any(|s| b.contains(s))
         })
         .collect();
     if ggufs.is_empty() {
-        return Err("no LTX-Video transformer GGUF in the repo".into());
+        return Err("no video transformer GGUF in the repo".into());
     }
     let ok: Vec<RepoFile> = ggufs.iter().filter(|f| is_v090(&base(&f.path), true)).map(|f| (*f).clone()).collect();
     if ok.is_empty() {
         let names: Vec<String> = ggufs.iter().take(3).map(|f| f.path.clone()).collect();
         return Err(format!(
-            "LTX-Video GGUF without a v0.9.0 transformer (found {}): v0.9.1+ need their own VAE decoder \
+            "video GGUF without a v0.9.0 transformer (found {}): v0.9.1+ need their own VAE decoder \
              (timestep conditioning, noise injection), which is not implemented; only v0.9.0 loads",
             names.join(", ")
         ));
@@ -112,7 +114,7 @@ fn class_of(hub: &HuggingFaceHub, repo: &str) -> Option<String> {
     crate::runtime::diffusion::pipeline_class(index.parent()?)
 }
 
-/// `Some` when `model_id` names a video repo; `quant` picks an LTX-Video GGUF.
+/// `Some` when `model_id` names a video repo; `quant` picks a video GGUF.
 pub fn detect(hub: &HuggingFaceHub, model_id: &str, quant: Option<&str>) -> Option<Result<Plan, String>> {
     let (repo, file) = split_weight_file(model_id);
     if repo.split('/').count() != 2 || is_synthetic_model_id(repo) || Path::new(model_id).exists() {
@@ -125,7 +127,11 @@ pub fn detect(hub: &HuggingFaceHub, model_id: &str, quant: Option<&str>) -> Opti
     }
     let token = std::env::var("HF_TOKEN").ok();
     let info = hub_json(&format!("https://huggingface.co/api/models/{repo}"), token.as_deref()).ok()?;
-    if info["gguf"]["architecture"] != "ltxv" {
+    let reg = crate::arch::registry().ok()?;
+    if crate::arch::compat()["video_gguf"]["architecture"]
+        .as_str()
+        .is_none_or(|a| info["gguf"]["architecture"] != a)
+    {
         return None;
     }
     Some((|| {
@@ -136,14 +142,14 @@ pub fn detect(hub: &HuggingFaceHub, model_id: &str, quant: Option<&str>) -> Opti
                 return Err(format!("{repo} has no file {f}"));
             }
             if !is_v090(f, true) {
-                return Err(format!("{f}: only v0.9.0 LTX-Video GGUFs load (later versions need other VAE decoders)"));
+                return Err(format!("{f}: only v0.9.0 video GGUFs load (later versions need other VAE decoders)"));
             }
             pick.transformer = f.to_string();
         }
         let card = hub.fetch_file(repo, "README.md")?;
         let card = std::fs::read_to_string(&card).map_err(|e| format!("{}: {e}", card.display()))?;
         let base = crate::model::lora::card_base_model(&card)
-            .ok_or_else(|| format!("{repo}: LTX-Video GGUF whose model card names no base_model"))?;
+            .ok_or_else(|| format!("{repo}: video GGUF whose model card names no base_model"))?;
         let family = class_of(hub, &base)
             .as_deref()
             .and_then(video_family)
@@ -152,9 +158,14 @@ pub fn detect(hub: &HuggingFaceHub, model_id: &str, quant: Option<&str>) -> Opti
         if let Some(v) = pick.vae {
             weights.push(("vae".into(), repo.into(), v));
         }
-        // A quantized transformer defaults to the quantized T5 (2.9 GB) rather than the base's 19 GB fp32 shards.
-        let (t5_repo, t5_file) = split_weight_file(DEFAULT_T5_GGUF);
-        weights.push(("text_encoder".into(), t5_repo.into(), t5_file.unwrap_or_default().into()));
+        if let Some(te) = reg
+            .spec(&family, &Default::default())
+            .ok()
+            .and_then(|s| s.runtime["default_text_encoder_gguf"].as_str().map(String::from))
+        {
+            let (te_repo, te_file) = split_weight_file(&te);
+            weights.push(("text_encoder".into(), te_repo.into(), te_file.unwrap_or_default().into()));
+        }
         Ok(Plan { family, label: format!("{repo}/{}", pick.transformer), base, weights })
     })())
 }

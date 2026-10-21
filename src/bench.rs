@@ -566,7 +566,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
 }
 
 /// `--probe-top5`: raw (no chat template) prompt logits of `model_id` on Metal, as one JSON line
-/// `{"model", "ids", "top5": [[id, logit], ...]}`; the llama.cpp oracle compares against it.
+/// `{"model", "ids", "top5": [[id, logit], ...]}`; the reference oracle compares against it.
 pub fn probe_top5(model_id: &str, prompt: &str) -> Result<(), String> {
     let artifacts =
         crate::model::hub::HuggingFaceHub::new().auto_download_and_cache(model_id, None)?;
