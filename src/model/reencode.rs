@@ -595,6 +595,13 @@ pub fn native_stats() -> NativeStats {
     *NATIVE_STATS.lock()
 }
 
+/// Test hook: pretend the current load re-encoded `n` tensors.
+#[cfg(test)]
+pub(crate) fn fake_native_reencoded(n: usize) {
+    let mut s = NATIVE_STATS.lock();
+    (s.tensors, s.reencoded) = (n, n);
+}
+
 static NATIVE_APPLIED: Mutex<Option<(ReencodePolicy, u64)>> = Mutex::new(None);
 
 /// Records the policy the last native load ended up with and the bytes per token it saved.

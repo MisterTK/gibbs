@@ -86,8 +86,14 @@ fn dtype_of(t: &Tensor) -> DType {
         Tensor::Mat(m) => m
             .packed()
             .map_or(DType::BF16, |p| Kind::of_format(p.format).dtype()),
-        // Never produced by the store (`build` yields only the variants above).
-        Tensor::Quantized(_) => DType::F32,
+        Tensor::Quantized(q) => match q.as_ref() {
+            crate::model::layers::QuantizedWeight::Uncompressed { .. } => DType::F32,
+            crate::model::layers::QuantizedWeight::ZeroCopySlice { format, .. }
+            | crate::model::layers::QuantizedWeight::GgufQuantized { format, .. } => {
+                Kind::of_format(*format).dtype()
+            }
+            crate::model::layers::QuantizedWeight::Nvfp4(_) => DType::Quant(Q::NVFP4),
+        },
     }
 }
 
@@ -536,12 +542,105 @@ pub struct ModelEnv {
     runtime: RwLock<J>,
     ckpt: Arc<Checkpoint>,
     table: Table,
+    /// Successfully evaluated config vars.
     memo: Mutex<HashMap<String, Val>>,
-    busy: Mutex<Vec<String>>,
-    /// First error hit inside `lookup` (which can only answer `None`), reported by the entry points.
-    // ponytail: one slot per env; concurrent evaluations on one model would mix their errors.
-    err: Mutex<Option<String>>,
     files: Mutex<HashMap<String, Option<J>>>,
+}
+
+/// One evaluation over a [`ModelEnv`]: the vars being evaluated (cycle detection) and the first
+/// error hit inside `lookup` (which can only answer `None`), reported by the entry points.
+/// Per evaluation, so concurrent evaluations on one model never see each other's state.
+struct Eval<'a> {
+    m: &'a ModelEnv,
+    busy: std::cell::RefCell<Vec<String>>,
+    err: std::cell::RefCell<Option<String>>,
+}
+
+impl<'a> Eval<'a> {
+    fn new(m: &'a ModelEnv) -> Self {
+        Self {
+            m,
+            busy: Default::default(),
+            err: Default::default(),
+        }
+    }
+
+    fn run<R>(m: &ModelEnv, f: impl FnOnce(&Eval) -> Result<R, String>) -> Result<R, String> {
+        let e = Eval::new(m);
+        let r = f(&e);
+        match e.err.into_inner() {
+            Some(err) => Err(err),
+            None => r,
+        }
+    }
+
+    fn record(&self, e: String) {
+        self.err.borrow_mut().get_or_insert(e);
+    }
+
+    fn var(&self, name: &str) -> Option<Val> {
+        if let Some(v) = self.m.memo.lock().get(name) {
+            return Some(v.clone());
+        }
+        if self.busy.borrow().iter().any(|b| b == name) {
+            let chain = self.busy.borrow().join(" -> ");
+            self.record(format!("config var cycle: {chain} -> {name}"));
+            return None;
+        }
+        self.busy.borrow_mut().push(name.to_string());
+        let clean = self.err.borrow().is_none();
+        let r = eval_json(&self.m.config[name], self);
+        self.busy.borrow_mut().pop();
+        match r {
+            Ok(v) => {
+                if clean && self.err.borrow().is_none() {
+                    self.m.memo.lock().insert(name.to_string(), v.clone());
+                }
+                Some(v)
+            }
+            Err(e) => {
+                self.record(format!("config `{name}`: {e}"));
+                None
+            }
+        }
+    }
+}
+
+impl Env for Eval<'_> {
+    fn lookup(&self, root: &str, path: &[Val]) -> Option<Val> {
+        let m = self.m;
+        if m.config.contains_key(root) {
+            return walk(self.var(root)?, path);
+        }
+        match root {
+            "cfg" => walk_json(&m.ckpt.cfg, path),
+            "gguf" => {
+                let g = m.ckpt.gguf.as_ref()?;
+                let Val::Str(k) = path.first()? else {
+                    return None;
+                };
+                let arch = g.get("general.architecture").and_then(J::as_str);
+                let j = arch
+                    .and_then(|a| g.get(&format!("{a}.{k}")))
+                    .or_else(|| g.get(k))?;
+                walk_json(j, &path[1..])
+            }
+            "json" => {
+                let Val::Str(f) = path.first()? else {
+                    return None;
+                };
+                walk_json(&m.file(f)?, &path[1..])
+            }
+            "runtime" => walk_json(&m.runtime.read(), path),
+            _ => None,
+        }
+    }
+    fn has(&self, t: &str) -> bool {
+        self.m.has(t)
+    }
+    fn shape(&self, t: &str) -> Option<Vec<usize>> {
+        self.m.shape(t)
+    }
 }
 
 impl ModelEnv {
@@ -556,33 +655,18 @@ impl ModelEnv {
             ckpt,
             table,
             memo: Mutex::new(HashMap::new()),
-            busy: Mutex::new(Vec::new()),
-            err: Mutex::new(None),
             files: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn record(&self, e: String) {
-        self.err.lock().get_or_insert(e);
-    }
-
-    fn guard<R>(&self, f: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
-        *self.err.lock() = None;
-        let r = f();
-        match self.err.lock().take() {
-            Some(e) => Err(e),
-            None => r,
         }
     }
 
     /// Evaluates a spec value (strings are expressions).
     pub fn eval(&self, j: &J) -> Result<Val, String> {
-        self.guard(|| eval_json(j, self))
+        Eval::run(self, |e| eval_json(j, e))
     }
 
     /// [`Self::eval`] with extra variables bound.
     pub fn eval_with(&self, vars: &[(String, Val)], j: &J) -> Result<Val, String> {
-        self.guard(|| eval_json(j, &Vars { parent: self, vars }))
+        Eval::run(self, |e| eval_json(j, &Vars { parent: e, vars }))
     }
 
     /// `{expr}` interpolation of `s`.
@@ -591,7 +675,7 @@ impl ModelEnv {
     }
 
     pub fn interp_with(&self, vars: &[(String, Val)], s: &str) -> Result<String, String> {
-        self.guard(|| interp(s, &Vars { parent: self, vars }))
+        Eval::run(self, |e| interp(s, &Vars { parent: e, vars }))
     }
 
     /// Config variable `name`.
@@ -599,44 +683,13 @@ impl ModelEnv {
         if !self.config.contains_key(name) {
             return Err(format!("no config var `{name}`"));
         }
-        self.guard(|| Ok(self.var_inner(name).unwrap_or(Val::Null)))
+        Eval::run(self, |e| Ok(e.var(name).unwrap_or(Val::Null)))
     }
 
     /// Sets `runtime.ctx` (the context length the caller runs with); memoized vars are recomputed.
     pub fn set_ctx(&self, ctx: J) {
         self.runtime.write()["ctx"] = ctx;
         self.memo.lock().clear();
-    }
-
-    fn var_inner(&self, name: &str) -> Option<Val> {
-        if let Some(v) = self.memo.lock().get(name) {
-            return Some(v.clone());
-        }
-        {
-            let mut busy = self.busy.lock();
-            if busy.iter().any(|b| b == name) {
-                let chain = busy.join(" -> ");
-                drop(busy);
-                self.record(format!("config var cycle: {chain} -> {name}"));
-                return None;
-            }
-            busy.push(name.to_string());
-        }
-        let clean = self.err.lock().is_none();
-        let r = eval_json(&self.config[name], self);
-        self.busy.lock().retain(|b| b != name);
-        match r {
-            Ok(v) => {
-                if clean && self.err.lock().is_none() {
-                    self.memo.lock().insert(name.to_string(), v.clone());
-                }
-                Some(v)
-            }
-            Err(e) => {
-                self.record(format!("config `{name}`: {e}"));
-                None
-            }
-        }
     }
 
     /// `json.<file>`: the source's own document, else `<dir>/<file>.json`, else `<dir>/*/<file>.json`.
@@ -672,33 +725,11 @@ impl ModelEnv {
     }
 }
 
+/// As `&dyn Env` (the interpreter's model scope) each lookup is its own evaluation: a failing
+/// config var reads as undefined there; [`ModelEnv::var`] / [`ModelEnv::eval`] report why.
 impl Env for ModelEnv {
     fn lookup(&self, root: &str, path: &[Val]) -> Option<Val> {
-        if self.config.contains_key(root) {
-            return walk(self.var_inner(root)?, path);
-        }
-        match root {
-            "cfg" => walk_json(&self.ckpt.cfg, path),
-            "gguf" => {
-                let g = self.ckpt.gguf.as_ref()?;
-                let Val::Str(k) = path.first()? else {
-                    return None;
-                };
-                let arch = g.get("general.architecture").and_then(J::as_str);
-                let j = arch
-                    .and_then(|a| g.get(&format!("{a}.{k}")))
-                    .or_else(|| g.get(k))?;
-                walk_json(j, &path[1..])
-            }
-            "json" => {
-                let Val::Str(f) = path.first()? else {
-                    return None;
-                };
-                walk_json(&self.file(f)?, &path[1..])
-            }
-            "runtime" => walk_json(&self.runtime.read(), path),
-            _ => None,
-        }
+        Eval::new(self).lookup(root, path)
     }
     fn has(&self, t: &str) -> bool {
         self.table.read().contains_key(t)
@@ -1152,7 +1183,38 @@ fn xf_shapes(
     let same = || Ok(vec![(None, s.to_vec())]);
     match op {
         "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16"
-        | "ternarize" | "untile_heads" | "untile_packed_rows" => same(),
+        | "ternarize" => same(),
+        "untile_packed_rows" => {
+            let u = Untile::from(a)?;
+            let rows = s.first().copied().unwrap_or(1);
+            if u.k_heads == 0
+                || u.v_heads % u.k_heads != 0
+                || u.prefix_rows + u.v_heads * u.rows_per_block != rows
+            {
+                return Err(format!(
+                    "{} prefix rows + {} heads x {} rows (over {} key heads) do not tile {s:?}",
+                    u.prefix_rows, u.v_heads, u.rows_per_block, u.k_heads
+                ));
+            }
+            same()
+        }
+        "untile_heads" => {
+            let (kh, block) = (arg_u(a, "k_heads")?, arg_u(a, "block")?);
+            let prefix = arg_u_or(a, "prefix", 0)?;
+            let chunk = arg_u_or(a, "chunk", numel)?;
+            let ok = kh > 0
+                && block > 0
+                && chunk > 0
+                && numel % chunk == 0
+                && prefix <= chunk
+                && (chunk - prefix) % (block * kh) == 0;
+            if !ok {
+                return Err(format!(
+                    "k_heads {kh} x block {block} (prefix {prefix}, chunk {chunk}) do not tile {s:?}"
+                ));
+            }
+            same()
+        }
         "permute_head_dims" => {
             let hd = arg_us(a, "perm")?.len();
             if hd == 0 || s.first().is_none_or(|r| r % hd != 0) {
@@ -1738,7 +1800,9 @@ type Adapters = (HashMap<String, Lora>, Option<Arc<(ModelManifest, Vec<u8>)>>);
 
 /// A PEFT LoRA adapter beside the checkpoint (`adapter_config.json` + `adapter_model.*`): each
 /// `lora_A`/`lora_B` pair registers on its target's canonical weight; `modules_to_save` tensors
-/// replace theirs.
+/// replace theirs. Skipped when the checkpoint is not the adapter's base: an adapter repo
+/// snapshot holding the weights `peft::prepare_causal_lm` merged (marked since this loader, or
+/// named after the adapter repo, not its `base_model_name_or_path`).
 fn adapters(ckpt: &Checkpoint, ren: &Renamer, table: &Table) -> Result<Adapters, String> {
     let Some(dir) = &ckpt.dir else {
         return Ok(Default::default());
@@ -1752,7 +1816,14 @@ fn adapters(ckpt: &Checkpoint, ren: &Renamer, table: &Table) -> Result<Adapters,
         .map(|f| dir.join(f))
         .find(|p| p.is_file())
         .ok_or("adapter_config.json without adapter_model.safetensors / .bin")?;
-    let scale = crate::model::peft::lora_scale(&read_json(&cfg)?)?;
+    let ad = read_json(&cfg)?;
+    if let Some(base) = ad["base_model_name_or_path"].as_str() {
+        let is_dir = Path::new(base).canonicalize().ok() == dir.canonicalize().ok();
+        if base != ckpt.sig.hub_id && !is_dir {
+            return Ok(Default::default());
+        }
+    }
+    let scale = crate::model::peft::lora_scale(&ad)?;
     let (am, data) = crate::model::loaders::read_checkpoint(&file)?;
     let adapter = Arc::new((am, data));
     let am = &adapter.0;
@@ -2434,6 +2505,18 @@ mod tests {
         .err()
         .unwrap();
         assert!(e.contains("reshape") && e.contains("`a`"), "{e}");
+        let fresh = tempfile::tempdir().unwrap();
+        let e = toy(
+            fresh.path(),
+            &[("u", "F32", &[4, 1], f32b(&iota(4)))],
+            r#"transforms: [{tensor: "u", op: "untile_packed_rows", args: {k_heads: 2, v_heads: 3, rows_per_block: 1}}]"#,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            e.contains("untile_packed_rows") && e.contains("do not tile"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -2583,7 +2666,8 @@ mod tests {
                 ),
             ],
         );
-        let base: &[St] = &[("model.q.weight", "F32", &[4, 3], f32b(&iota(12)))];
+        let base_v: Vec<St> = vec![("model.q.weight", "F32", &[4, 3], f32b(&iota(12)))];
+        let base: &[St] = &base_v;
         let m = toy(
             d.path(),
             base,
@@ -2612,6 +2696,23 @@ mod tests {
         let spec = r#"{family: "toy", match: {file_ext: ["safetensors"]}, pipeline: "causal_lm"}"#;
         let merged = load_with(&a, &registry(&[spec]), None, exact()).unwrap();
         assert!(merged.store.lora("model.q.weight").is_none());
+        drop(merged);
+        // An adapter naming another base (an adapter repo snapshot holding merged weights from
+        // before the marker) is skipped; naming this checkpoint, it registers.
+        for (owner, registered) in [("other/base", false), ("test/toy", true)] {
+            std::fs::write(
+                d.path().join("adapter_config.json"),
+                json!({"peft_type": "LORA", "r": 2, "lora_alpha": 4, "base_model_name_or_path": owner})
+                    .to_string(),
+            )
+            .unwrap();
+            let m = toy(d.path(), base, "").unwrap();
+            assert_eq!(
+                m.store.lora("model.q.weight").is_some(),
+                registered,
+                "{owner}"
+            );
+        }
     }
 
     #[test]
@@ -2657,5 +2758,68 @@ mod tests {
                 "{f:?}"
             );
         }
+    }
+
+    /// The re-encode ladder with fake loads: every lossy candidate "re-encodes" one tensor.
+    #[test]
+    #[ignore = "sets the process-global re-encode override and native stats; run alone with --ignored"]
+    fn gate_ladder_order_and_fallbacks() {
+        use crate::model::weight_format::{reencode_override, set_reencode_override};
+        use ReencodePolicy::{BitExact as BE, LowBitNative as LB, MaxSpeed as MS};
+        let previous = reencode_override();
+        set_reencode_override(Some(ReencodeConfig {
+            policy: MS,
+            cache_dir: None,
+            ..Default::default()
+        }));
+        let seen = Mutex::new(Vec::new());
+        let load = || {
+            let c = ReencodeConfig::effective();
+            crate::model::reencode::fake_native_reencoded(usize::from(c.policy != BE));
+            let mut s = seen.lock();
+            s.push((c.policy, c.ffn_only));
+            Some(Ok(s.len()))
+        };
+        let report = |kl: f64| GateReport {
+            mean_kl: kl,
+            top1: 1.0,
+            tokens: 8,
+        };
+        let take = || std::mem::take(&mut *seen.lock());
+        // Every gate rejects: max-speed, (bit-exact reference), FFN-only, low-bit, bit-exact.
+        let r = gated(true, load, |_, _| Ok(report(1e9)));
+        assert_eq!(r, Some(Ok(5)));
+        assert_eq!(
+            take(),
+            [
+                (MS, false),
+                (BE, false),
+                (MS, true),
+                (LB, false),
+                (BE, false)
+            ]
+        );
+        // The first candidate passes.
+        assert_eq!(gated(true, load, |_, _| Ok(report(0.0))), Some(Ok(1)));
+        assert_eq!(take(), [(MS, false), (BE, false)]);
+        // The gate cannot run: one more bit-exact load.
+        assert_eq!(gated(true, load, |_, _| Err("no gpu".into())), Some(Ok(3)));
+        assert_eq!(take(), [(MS, false), (BE, false), (BE, false)]);
+        // Off Metal: bit-exact only.
+        assert_eq!(gated(false, load, |_, _| unreachable!()), Some(Ok(1)));
+        assert_eq!(take(), [(BE, false)]);
+        // Not this loader's architecture.
+        let none = gated(
+            true,
+            || None::<Result<usize, String>>,
+            |_, _| unreachable!(),
+        );
+        assert!(none.is_none());
+        assert_eq!(
+            reencode_override().map(|c| c.policy),
+            Some(MS),
+            "override restored"
+        );
+        set_reencode_override(previous);
     }
 }
