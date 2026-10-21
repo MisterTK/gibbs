@@ -960,7 +960,48 @@ mod tests {
     // parity with original (delete with the original)
     mod parity {
         use super::*;
-        use crate::model;
+
+        // The deleted `model::dit_graph` / `model::dit` / `model::unet` oracles, verbatim.
+        mod model {
+            pub mod dit_graph {
+                pub fn axis_freqs(dims: &[usize], theta: f64) -> (Vec<f32>, [u32; 3]) {
+                    let mut f = Vec::new();
+                    let mut sec = [0u32; 3];
+                    for (a, &dim) in dims.iter().enumerate() {
+                        sec[a] = (dim / 2) as u32;
+                        for i in 0..dim / 2 {
+                            f.push(theta.powf(-((2 * i) as f64) / dim as f64) as f32);
+                        }
+                    }
+                    (f, sec)
+                }
+                pub fn positions(ids: &[Vec<usize>], use_axes: [usize; 3]) -> Vec<u32> {
+                    ids.iter().flat_map(|id| use_axes.map(|a| id.get(a).copied().unwrap_or(0) as u32)).collect()
+                }
+            }
+            pub mod dit {
+                #[inline(never)]
+                pub fn timestep_features(t: f32, dim: usize) -> Vec<f32> {
+                    let (t, half) = (std::hint::black_box(t), dim / 2);
+                    let args: Vec<f32> = (0..half).map(|i| t * (-(10000f32.ln()) * i as f32 / half as f32).exp()).collect();
+                    args.iter().map(|a| a.cos()).chain(args.iter().map(|a| a.sin())).collect()
+                }
+            }
+            pub mod unet {
+                #[inline(never)]
+                pub fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                    let (t, half) = (std::hint::black_box(t), dim / 2);
+                    let mut emb = vec![0.0f32; dim];
+                    for i in 0..half {
+                        let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                        let arg = t * freq;
+                        emb[i] = arg.cos();
+                        emb[half + i] = arg.sin();
+                    }
+                    emb
+                }
+            }
+        }
 
         #[test]
         fn axis_freqs_match_sources() {
@@ -1017,9 +1058,17 @@ mod tests {
             }
             for (t, dim) in [(999.0f32, 320), (0.37, 256), (1.0, 7)] {
                 let f32a = json!({"t": t, "dim": dim, "precision": "f32"});
-                assert_eq!(bits(&f("timestep_embedding", f32a.clone())), bits(&model::unet::timestep_embedding(t, dim)));
+                // Within 1 ulp of the f32 sources run on a runtime `t` (`black_box`): their
+                // `10000f32.ln()` and the generator's `max_period.ln() as f32` may round apart.
+                let ulp1 = |a: &[f32], b: &[f32]| {
+                    assert_eq!(a.len(), b.len());
+                    for (x, y) in a.iter().zip(b) {
+                        assert!((x.to_bits() as i64 - y.to_bits() as i64).abs() <= 1, "{x} vs {y} (t {t}, dim {dim})");
+                    }
+                };
+                ulp1(&f("timestep_embedding", f32a.clone()), &model::unet::timestep_embedding(t, dim));
                 let want = model::dit::timestep_features(t, dim);
-                assert_eq!(bits(&f("timestep_embedding", f32a)[..want.len()]), bits(&want));
+                ulp1(&f("timestep_embedding", f32a)[..want.len()], &want);
                 let want = sinusoid(t as f64 * 1000.0, dim);
                 let got = f("timestep_embedding", json!({"t": t as f64 * 1000.0, "dim": dim}));
                 assert_eq!(bits(&got[..want.len()]), bits(&want));

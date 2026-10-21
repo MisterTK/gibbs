@@ -44,11 +44,7 @@
 
 pub mod audio;
 pub mod classifier;
-pub mod clip;
 pub mod diff_fixtures;
-pub mod diff_graph;
-pub mod dit;
-pub mod dit_graph;
 
 pub mod fasttext;
 pub mod fingerprint;
@@ -77,15 +73,12 @@ pub mod siglip;
 pub mod simd;
 pub mod spm;
 pub mod tokenizer;
-pub mod unet;
-pub mod vae;
 pub mod vision_graph;
 pub mod weight_format;
 pub mod weights;
 
 use crate::hardware::{QuantFormat, QuantizationFormat};
 use bytes::Bytes;
-pub use clip::*;
 pub use fingerprint::*;
 pub use graph_lm::*;
 pub use hub::*;
@@ -94,7 +87,6 @@ pub use layers::*;
 pub use simd::*;
 use std::collections::HashMap;
 pub use tokenizer::*;
-pub use vae::*;
 /// Serialization container formats supported by the Universal Model Loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
