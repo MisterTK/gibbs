@@ -551,13 +551,9 @@ impl SequenceClassifier {
                 "GPT2ForSequenceClassification" | "OPTForSequenceClassification" => {
                     Box::new(ln_decoder::LnDecoder::load(hub, repo_id, &cfg)?)
                 }
-                "Gemma4ForSequenceClassification" => Box::new(
-                    crate::model::gemma4::seqcls::Gemma4Seq::load(&artifacts, &cfg)?,
-                ),
-                "Gemma3TextForSequenceClassification" => Box::new(
-                    crate::model::gemma3_text::Gemma3Text::load(&artifacts, &cfg)?,
-                ),
-                "Qwen3ForSequenceClassification"
+                "Gemma4ForSequenceClassification"
+                | "Gemma3TextForSequenceClassification"
+                | "Qwen3ForSequenceClassification"
                 | "Qwen3_5ForSequenceClassification"
                 | "Qwen3_5TextForSequenceClassification" => {
                     Box::new(crate::runtime::seqcls::SpecBackbone::load(&artifacts, device)?)

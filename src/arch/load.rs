@@ -1020,15 +1020,6 @@ impl WeightStore {
                 })
             }
             Src::Xf { op, ins, .. } if op == "to_bf16" => self.packed(&ins[0]),
-            Src::Xf { op, ins, .. } if op == "reshape" => {
-                if ins[0].shape.last() != n.shape.last() {
-                    return Err(format!(
-                        "reshape {:?} -> {:?} of packed blocks must keep the row width",
-                        ins[0].shape, n.shape
-                    ));
-                }
-                Ok(Packed { shape: n.shape.clone(), ..self.packed(&ins[0])? })
-            }
             Src::Xf { op, ins, .. } if op == "stack_experts" => {
                 let mut bytes = Vec::new();
                 for i in ins {
@@ -1458,8 +1449,7 @@ fn xf_kind(op: &str, ins: &[Arc<Node>], out: &[usize]) -> Kind {
         // matrices); packed blocks stay as stored.
         "to_bf16" if matches!(k, Kind::Packed(_)) => k,
         "to_bf16" => Kind::Bf16,
-        // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
-        "untile_packed_rows" | "reshape" => k,
+        "untile_packed_rows" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         "reshape"
             if rows_of_blocks(ins[0].shape.last().copied().unwrap_or(0))

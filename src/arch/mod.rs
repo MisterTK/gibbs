@@ -16,15 +16,6 @@ pub mod names;
 pub mod templates;
 #[cfg(test)]
 pub mod testing;
-// Parity with the pre-spec implementations (deleted with them).
-#[cfg(test)]
-mod parity_gemma4_text;
-#[cfg(test)]
-mod parity_gemma4_vision;
-#[cfg(test)]
-mod parity_gemma4_audio;
-#[cfg(test)]
-mod parity_gemma3;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 

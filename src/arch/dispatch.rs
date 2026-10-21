@@ -135,6 +135,14 @@ pub fn load_lm(
     r
 }
 
+/// Causal-LM families whose old loaders still serve default (non-`GIBBS_SPEC_LM`) loads; every
+/// other `causal_lm` family loads from its spec.
+// legacy: until Phase 4 (GraphLm: llama … bitnet) and Phase 5 (native qwen loaders).
+const LEGACY_LM: &[&str] = &[
+    "llama", "glm", "granite", "gpt_neox", "gpt2", "opt", "lfm2", "bitnet", "qwen3", "hunyuan",
+    "qwen3_5", "qwen3_vl", "qwen4_exp",
+];
+
 fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choice>), String> {
     let spec = |family: Option<&str>| -> Result<(ExecutableModel, Option<Choice>), String> {
         let m = crate::runtime::lm::load(a, super::registry()?, family, o.placement)?;
@@ -154,7 +162,9 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     });
     match family {
         Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
-        Some((f, Pipeline::CausalLm)) if spec_lm_enabled() => return spec(Some(&f)),
+        Some((f, Pipeline::CausalLm)) if spec_lm_enabled() || !LEGACY_LM.contains(&f.as_str()) => {
+            return spec(Some(&f))
+        }
         _ => {}
     }
     // legacy: until Phases 5, 6 and 8 (the native loaders' families)

@@ -1036,21 +1036,6 @@ mod tests {
         assert_eq!((g.rows, g.cols, g.tokens), (PIN_REAL.0, PIN_REAL.1, PIN_REAL.0 * PIN_REAL.1));
     }
 
-    // parity with original (delete with the original)
-    #[test]
-    fn soft_token_budget_matches_original() {
-        let vision = crate::model::gemma4::vision::tiny::vision();
-        for (w, h) in [(40, 30), (13, 50), (8, 8)] {
-            let bytes = png(w, h);
-            let (pix, ph, pw) = vision.preprocess(&bytes).unwrap();
-            let p = preprocess(&budget(), &bytes).unwrap();
-            assert_eq!((p.grid.var("grid_h"), p.grid.var("grid_w")), (Some(ph), Some(pw)));
-            assert_eq!(p.grid.tokens, crate::model::gemma4::vision::soft_tokens(&bytes, 4, 4, 2).unwrap());
-            let d = max_diff(&p.data, &pix);
-            assert!(d < 1e-6, "{w}x{h}: max |d| {d}");
-        }
-    }
-
     fn patch_grid() -> Preprocess {
         Preprocess::PatchGrid {
             patch: 16,
@@ -1077,23 +1062,6 @@ mod tests {
         assert!(measure(&tight, &png(200, 150)).unwrap_err().contains("position embeddings"));
     }
 
-    // parity with original (delete with the original)
-    #[test]
-    fn patch_grid_matches_original() {
-        use crate::model::gemma4::unified::{tests::tiny_weights, VisionEmbedder};
-        let vc = json!({"patch_size": 16, "pooling_kernel_size": 3, "model_patch_size": 48});
-        let processor = json!({"image_processor": {"max_soft_tokens": 280}});
-        let v = VisionEmbedder::load(&tiny_weights(), &vc, &processor).unwrap();
-        for (w, h) in [(200, 150), (90, 300), (768, 768)] {
-            let bytes = png(w, h);
-            let (pix, n, gw) = v.patches(&bytes).unwrap();
-            let p = preprocess(&patch_grid(), &bytes).unwrap();
-            assert_eq!((p.grid.tokens, p.grid.cols), (n, gw));
-            let d = max_diff(&p.data, &pix);
-            assert!(d < 1e-6, "{w}x{h}: max |d| {d}");
-        }
-    }
-
     fn mel(frame_length: usize, hop_length: usize) -> Preprocess {
         Preprocess::LogMel {
             sampling_rate: 16000,
@@ -1117,30 +1085,6 @@ mod tests {
         assert_eq!(measure(&mel(320, 160), &wav(22050, 30000)).unwrap().tokens, PIN_MEL_TOKENS);
         let err = measure(&mel(320, 160), &wav(8000, 31 * 8000)).unwrap_err();
         assert!(err.contains("at most 30 s"), "{err}");
-    }
-
-    // parity with original (delete with the original)
-    #[test]
-    fn log_mel_matches_original() {
-        use crate::model::gemma4::audio::{tiny, Features};
-        let fe = json!({"sampling_rate": 16000, "frame_length": 32, "fft_length": 64,
-            "feature_size": 16, "hop_length": 16, "mel_floor": 1e-3});
-        let cases = [
-            (Features::new(&fe).unwrap(), mel(32, 16), tiny::wav()),
-            (Features::new(&fe).unwrap(), mel(32, 16), wav(22050, 3000)),
-            (Features::new(&json!({})).unwrap(), mel(320, 160), wav(22050, 30000)),
-        ];
-        let audio = tiny::audio();
-        for (i, (f, spec, clip)) in cases.iter().enumerate() {
-            let (frames, mask) = f.frames(clip).unwrap();
-            let p = preprocess(spec, clip).unwrap();
-            assert_eq!(p.data, frames, "case {i}");
-            assert_eq!(p.grid.var("frames"), Some(mask.len()));
-            assert_eq!(p.grid.var("valid_frames"), Some(mask.iter().filter(|&&m| m).count()));
-            if i < 2 {
-                assert_eq!(p.grid.tokens, audio.count(clip).unwrap(), "case {i}");
-            }
-        }
     }
 
     #[test]
@@ -1181,35 +1125,6 @@ mod tests {
         let err = expand(&[60, 61], &m, &[("audio", &clip), ("image", &img)], &no_text).unwrap_err();
         assert!(err.contains("placeholder is `image`"), "{err}");
         assert!(expand(&[60], &m, &[], &no_text).unwrap_err().contains("1 media placeholder"));
-    }
-
-    // parity with original (delete with the original)
-    #[test]
-    fn repeat_between_matches_original() {
-        use crate::model::gemma4::unified::tests::{photo, tiny, wav};
-        use crate::model::native::{MediaInput, NativeLm};
-        let _g = crate::hardware::cpu_compute::allow();
-        let (model, m) = (tiny(), gemma_like());
-        let (img, clip) = (photo(), wav(22_050, 30_000));
-        let cases: [(Vec<u32>, Vec<(&str, &Vec<u8>)>); 3] = [
-            (vec![2, 60, 5, 61, 7], vec![("image", &img), ("audio", &clip)]),
-            (vec![2, 5, 60, 6, 7, 8, 9, 10], vec![("image", &img)]),
-            (vec![61, 3, 60, 60], vec![("audio", &clip), ("image", &img), ("image", &img)]),
-        ];
-        for (ids, items) in cases {
-            let media: Vec<MediaInput> = items
-                .iter()
-                .map(|(k, b)| if *k == "image" { MediaInput::Image((*b).clone()) } else { MediaInput::Audio((*b).clone()) })
-                .collect();
-            let (want, state) = model.prepare(ids.clone(), &media).unwrap();
-            let st = state.downcast_ref::<crate::model::gemma4::State>().unwrap();
-            let grids: Vec<Grid> = items.iter().map(|(k, b)| measure(&m[*k].preprocess, b).unwrap()).collect();
-            let refs: Vec<(&str, &Grid)> = items.iter().zip(&grids).map(|((k, _), g)| (*k, g)).collect();
-            let e = expand(&ids, &m, &refs, &no_text).unwrap();
-            assert_eq!(e.ids, want);
-            assert_eq!(e.media_index, st.media_pos.iter().map(|&p| p as u32).collect::<Vec<_>>());
-            assert_eq!(e.blocks, st.blocks);
-        }
     }
 
     const IMG: u32 = 5;

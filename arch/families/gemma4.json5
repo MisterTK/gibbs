@@ -11,7 +11,7 @@
   family: "gemma4",
   match: {
     hf_model_type: ["gemma4", "gemma4_text"],
-    hf_architectures: ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"],
+    hf_architectures: ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM", "Gemma4ForSequenceClassification"],
     gguf_arch: ["gemma4"],
   },
   pipeline: "causal_lm",
@@ -50,7 +50,8 @@
     top_k: "first(gguf.expert_used_count, tc.top_k_experts)",
     bidir_vision: "tc.use_bidirectional_attention == 'vision'",
     max_position_embeddings: "first(gguf.context_length, tc.max_position_embeddings)",
-    ctx: "first(runtime.ctx, max_position_embeddings)",
+    // Sequence classifiers keep a 4096-position cache (max_position_embeddings is 128k+).
+    ctx: "first(runtime.ctx, has('score.weight') ? min(max_position_embeddings, 4096) : max_position_embeddings)",
     gg: "gguf_arch == 'gemma4'",
     // Vision tower (`gemma4_vision`, or llama.cpp's `gemma4v` mmproj renamed to the HF names).
     has_vision: "has('model.vision_tower.patch_embedder.input_proj.weight')",
@@ -256,7 +257,9 @@
   // KV-shared layers read an earlier layer's cache: their own k/v (HF keeps them) are never read.
   ignore: ["rope_freqs.weight", "model.language_model.layers.*.self_attn.k_proj.weight",
            "model.language_model.layers.*.self_attn.v_proj.weight",
-           "model.language_model.layers.*.self_attn.k_norm.weight"],
+           "model.language_model.layers.*.self_attn.k_norm.weight",
+           // The seq-cls head: read by the `head: 'score'` instance only.
+           "score.weight", "norm.weight"],
   macros: {
     // `[x]` unchanged under another name.
     alias: {params: ["x"], body: [], returns: "x"},
@@ -614,6 +617,7 @@
     },
   },
   runtime: {prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+    seqcls: {head: "score", pooling: "last_nonpad"},
     media: {
       image: {
         // The old loader left vision off for towers with `std_bias`/`std_scale` (26B-A4B).

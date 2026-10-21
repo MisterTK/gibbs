@@ -240,7 +240,10 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
 fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
     use foundry_engine::hardware::Device;
     use foundry_engine::model::hub::HuggingFaceHub;
-    use foundry_engine::model::native::load_native;
+    let load_native = |a: &foundry_engine::model::hub::ModelArtifacts, d: Device| {
+        let reg = foundry_engine::arch::registry().expect("registry");
+        Some(foundry_engine::runtime::lm::load(a, reg, None, foundry_engine::hardware::PlacementMode::Pin(d)))
+    };
     use std::time::Instant;
 
     let repos = [

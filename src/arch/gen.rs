@@ -933,26 +933,6 @@ mod tests {
 
         #[test]
         fn rope_inv_freq_matches_sources() {
-            // gemma3: default, linear, yarn (truncate on/off, explicit factor).
-            for (p, dim, truncate) in [
-                (json!({"rope_theta": 1e6}), 256, true),
-                (json!({"rope_theta": 1e4, "rope_type": "linear", "factor": 8.0}), 128, true),
-                (json!({"rope_theta": 1e6, "rope_type": "yarn", "factor": 8.0, "original_max_position_embeddings": 8192.0}), 128, true),
-                (json!({"rope_theta": 5e5, "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 4096.0, "beta_fast": 16.0, "beta_slow": 2.0}), 64, false),
-            ] {
-                let (want, attn) = model::gemma3_text::inv_freq(p.as_object().unwrap(), dim, 0, truncate).unwrap();
-                let kind = p.get("rope_type").cloned().unwrap_or(json!("default"));
-                let mut args = json!({"dim": dim, "theta": p["rope_theta"], "kind": kind, "truncate": truncate});
-                for k in ["factor", "original_max_position_embeddings", "beta_fast", "beta_slow"] {
-                    if let Some(v) = p.get(k) {
-                        args[k] = v.clone();
-                    }
-                }
-                assert_eq!(bits(&f("rope_inv_freq", args.clone())), bits(&want), "{p}");
-                if kind == "yarn" {
-                    assert_eq!(f("yarn_attention_factor", args)[0].to_bits(), attn.to_bits());
-                }
-            }
             // ModernBERT (f32): default and yarn.
             for (cfg, d) in [
                 (json!({"global_rope_theta": 160000.0}), 64),
@@ -972,20 +952,6 @@ mod tests {
                     let a = f("yarn_attention_factor", json!({"factor": 8.0, "mscale": 1.0, "mscale_all_dim": 0.5}));
                     assert_eq!(a[0].to_bits(), attn.to_bits());
                 }
-            }
-            // gemma4: default (with factor) and proportional.
-            for p in [
-                json!({"rope_theta": 1e4, "factor": 2.0}),
-                json!({"rope_theta": 1e6, "rope_type": "proportional", "partial_rotary_factor": 0.25}),
-            ] {
-                let want = model::gemma4::text::inv_freq(&p, 512).unwrap();
-                let mut args = json!({"dim": 512, "theta": p["rope_theta"], "kind": "proportional"});
-                for k in ["factor", "partial_rotary_factor"] {
-                    if let Some(v) = p.get(k) {
-                        args[k] = v.clone();
-                    }
-                }
-                assert_eq!(bits(&f("rope_inv_freq", args)), bits(&want), "{p}");
             }
         }
 
@@ -1062,26 +1028,6 @@ mod tests {
                 let a = |o: &str| json!({"frames": fr, "grid_h": h, "grid_w": w, "fps": fps, "dim": d, "output": o});
                 assert_eq!(bits(&f("video_rope_cos_sin", a("cos"))), bits(&r.cos));
                 assert_eq!(bits(&f("video_rope_cos_sin", a("sin"))), bits(&r.sin));
-            }
-        }
-
-        #[test]
-        fn audio_front_end_matches_sources() {
-            for fe in [
-                json!({}),
-                json!({"frame_length": 8, "fft_length": 16, "feature_size": 4, "sampling_rate": 8000, "max_frequency": 4000.0, "min_frequency": 20.0}),
-            ] {
-                let src = model::gemma4::audio::Features::new(&fe).unwrap();
-                let g = |k: &str, d: f64| fe.get(k).cloned().unwrap_or(json!(d));
-                let dft = f("dft_matrix", json!({"frame_length": g("frame_length", 320.0), "fft_length": g("fft_length", 512.0)}));
-                assert_eq!(bits(&dft), bits(&src.dft));
-                let mel = f(
-                    "mel_filters_htk",
-                    json!({"fft_length": g("fft_length", 512.0), "mel_bins": g("feature_size", 128.0),
-                           "sampling_rate": g("sampling_rate", 16000.0), "min_frequency": g("min_frequency", 0.0),
-                           "max_frequency": g("max_frequency", 8000.0)}),
-                );
-                assert_eq!(bits(&mel), bits(&src.filters));
             }
         }
 

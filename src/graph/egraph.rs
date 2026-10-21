@@ -1375,8 +1375,7 @@ mod tests {
 
     #[test]
     fn choices_share_patterns_across_layers_and_flips_resolve() {
-        let (g, w) =
-            crate::model::gemma4::graph::Gemma4Graph::build_synthetic_graph(4, 64, 128, 4, 2, 16);
+        let (g, w) = crate::graph::synth_decoder::synthetic_decoder(4, 64, 128, 4, 2, 16);
         let mut g = g;
         prep(&mut g);
         let f = Fusion::new(
@@ -1477,9 +1476,7 @@ mod tests {
         let models: Vec<(&str, Gw)> = vec![
             (
                 "dense decoder (4 layers)",
-                crate::model::gemma4::graph::Gemma4Graph::build_synthetic_graph(
-                    4, 64, 128, 4, 2, 16,
-                ),
+                crate::graph::synth_decoder::synthetic_decoder(4, 64, 128, 4, 2, 16),
             ),
             (
                 "GraphLm 1M",
@@ -1487,14 +1484,6 @@ mod tests {
                     crate::model::graph_lm::GraphLmConfig::smollm_1m(),
                 )
                 .to_decode_graph(),
-            ),
-            (
-                "gemma4 tiny",
-                crate::model::gemma4::tiny_decode_graph().unwrap(),
-            ),
-            (
-                "gemma4 tiny moe",
-                crate::model::gemma4::tiny_moe_decode_graph().unwrap(),
             ),
             (
                 "qwen3.5 tiny",
@@ -1508,8 +1497,6 @@ mod tests {
         let want = [
             ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
             ([0; 4], 0x927782df5841c11f),
-            ([1, 0, 0, 0], 0x179d42b51929ff2d),
-            ([0; 4], 0xfd7c1aa58cb7c429),
             ([2, 0, 0, 0], 0x6b1f0639ee510a71),
             ([0; 4], 0x210429b4ede3d839),
         ];
@@ -1540,10 +1527,6 @@ mod tests {
             }
             let arch = crate::model::loaders::gguf::architecture(&p).unwrap_or_default();
             let gw: Gw = match arch.as_str() {
-                "gemma4" => {
-                    let (g, w, _) = crate::model::gemma4::gguf_decode_fixture(&p).unwrap();
-                    (g, w)
-                }
                 "qwen3" | "qwen3moe" | "hunyuan-dense" | "qwen35" | "qwen35moe" | "qwen4exp" => {
                     crate::model::qwen3_5::gguf_decode_graph(&p).unwrap()
                 }

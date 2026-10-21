@@ -7,7 +7,13 @@
 use gibbs_engine::hardware::Device;
 use gibbs_engine::model::hf_loader::ChatMessage;
 use gibbs_engine::model::hub::ModelArtifacts;
-use gibbs_engine::model::native::{load_native, MediaInput, NativeLm};
+use gibbs_engine::model::native::{MediaInput, NativeLm};
+
+/// The checkpoint under its family spec (`runtime::lm`).
+fn load_native(a: &ModelArtifacts, d: Device) -> Option<Result<Arc<dyn NativeLm>, String>> {
+    let reg = gibbs_engine::arch::registry().expect("registry");
+    Some(gibbs_engine::runtime::lm::load(a, reg, None, gibbs_engine::hardware::PlacementMode::Pin(d)))
+}
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;

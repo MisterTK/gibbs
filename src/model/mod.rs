@@ -56,8 +56,6 @@ pub mod fasttext;
 pub mod fingerprint;
 pub mod flow;
 pub mod flux;
-pub mod gemma3_text;
-pub mod gemma4;
 pub mod graph_lm;
 pub mod hf_loader;
 pub mod hub;

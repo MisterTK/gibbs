@@ -176,7 +176,7 @@ pub const NATIVE_MODEL_TYPES: &[&str] = &[
 
 /// [`NATIVE_MODEL_TYPES`] whose loaders also read GGUF weights: llama.cpp `qwen3` /
 /// `hunyuan-dense` / `qwen35` / `qwen35moe` / `qwen4exp` files ([`crate::model::qwen3_5::load_gguf`]),
-/// `gemma4` files with their `mmproj` ([`crate::model::gemma4::load_gguf`]) and candle-style T5
+/// `gemma4` files with their `mmproj` (the `gemma4` spec) and candle-style T5
 /// GGUFs ([`crate::model::t5::load`]). The hub picker refuses GGUF repos of the other types.
 // legacy: until Phases 5, 6 and 8 (the same families' specs).
 pub const NATIVE_GGUF_TYPES: &[&str] = &[
@@ -228,9 +228,6 @@ fn load_native_once(
     {
         return Some(r);
     }
-    if let Some(r) = crate::model::gemma4::load_gguf(artifacts, mode) {
-        return Some(r);
-    }
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(artifacts.config_path.as_ref()?).ok()?).ok()?;
     if crate::model::seq2seq::ARCHITECTURES
@@ -248,7 +245,6 @@ fn load_native_once(
         "qwen3" | "hunyuan_v1_dense" => {
             Some(crate::model::qwen3_5::load_dense(artifacts, &cfg, mode))
         }
-        "gemma4" | "gemma4_unified" => Some(crate::model::gemma4::load(artifacts, &cfg, mode)),
         "idefics3" | "smolvlm" => Some(crate::model::idefics3::load(artifacts, &cfg, mode)),
         "t5" | "mt5" | "umt5" | "UMT5ForConditionalGeneration" => {
             Some(crate::model::t5::load(artifacts, &cfg, mode))
