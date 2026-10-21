@@ -35,15 +35,8 @@
     // transformers stores the n-gram table per layer, llama.cpp as one global tensor.
     ple_table: "first_has(fmt('model.layers.{ple_layer}.ple.ple_embedding.table'), 'per_layer_token_embd.weight')",
   },
-  checks: [
-    {expr: "experts > 0 && (len(first(tc.mlp_only_layers, [])) > 0 || first(tc.decoder_sparse_step, 1) != 1)",
-     error: "MoE configs with dense layers (mlp_only_layers, decoder_sparse_step) are not implemented"},
-    {expr: "gguf_arch == '' && rope.mrope_interleaved != true",
-     error: "only interleaved M-RoPE (`mrope_interleaved: true`) is implemented"},
-    {expr: "len(mrope_section) != 3 || at(mrope_section, 0) + at(mrope_section, 1) + at(mrope_section, 2) != rotary_dim // 2",
-     error: "mrope_section {mrope_section} does not cover rotary dim {rotary_dim}"},
-    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
-    {expr: "layer_types != null && len(layer_types) != layers", error: "layer_types length != num_hidden_layers"},
+  // `k+` appends to qwen3_5's list (src/arch/mod.rs merge_patch); `names.use` is inherited.
+  "checks+": [
     {expr: "gguf_arch == 'qwen4exp' && !has('model.layers.0.attn_hyper_connection.hc_norm.weight')",
      error: "this qwen4exp file is a detached MTP head (no trunk tensors); load the trunk GGUF"},
     {expr: "indexer_kv_heads != 1", error: "QSA indexers with several key heads are not implemented"},
@@ -56,8 +49,6 @@
     // ponytail: spec values are f64; read the constants as integers if a checkpoint needs bigger ones.
     {expr: "ple_layer >= 0 && max(ple_mult) >= 2 ** 53", error: "PLE hash multipliers above 2^53 are not representable"},
   ],
-  // `checks` and `transforms` replace qwen3_5's lists (merge patch replaces arrays), so each repeats
-  // qwen3_5's entries first; `names.use` (the `qwen35` set) is inherited.
   names: {
     rules: [
       ["output_hc_norm.weight", "model.hyper_connection_mixer.hc_norm.weight"],
@@ -76,43 +67,8 @@
       ["blk.{i}.ple_conv1d.weight", "model.layers.{i}.ple.conv1d.weight"],
     ],
   },
-  transforms: [
-    {tensor: "model.layers.{i}.{n:*}layernorm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
-    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
-    {tensor: "model.norm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
-    {tensor: "model.layers.{i}.linear_attn.A_log", op: "split_rows", args: {parts: [["model.layers.{i}.linear_attn.neg_A", "lin_v_heads"]]}},
-    {tensor: "model.layers.{i}.linear_attn.neg_A", op: "neg_exp", when: "gguf_arch == ''"},
-    {tensor: "model.layers.{i}.linear_attn.conv1d.weight", op: "reshape",
-     args: {shape: ["2 * lin_k_heads * lin_k_dim + lin_v_heads * lin_v_dim", "lin_kernel"]}},
-    {tensor: "model.layers.{i}.linear_attn.conv1d.weight", op: "to_f32"},
-    {tensor: "model.layers.{i}.linear_attn.in_proj_qkv.weight", op: "untile_packed_rows", when: "tiled_heads",
-     args: {k_heads: "lin_k_heads", v_heads: "lin_v_heads", rows_per_block: "lin_v_dim", prefix_rows: "2 * lin_k_heads * lin_k_dim"}},
-    {tensor: "model.layers.{i}.linear_attn.in_proj_z.weight", op: "untile_packed_rows", when: "tiled_heads",
-     args: {k_heads: "lin_k_heads", v_heads: "lin_v_heads", rows_per_block: "lin_v_dim"}},
-    {tensor: "model.layers.{i}.linear_attn.conv1d.weight", op: "untile_heads", when: "tiled_heads",
-     args: {k_heads: "lin_k_heads", block: "lin_v_dim * lin_kernel", prefix: "2 * lin_k_heads * lin_k_dim * lin_kernel"}},
-    {tensor: "model.layers.{i}.linear_attn.in_proj_{n:*}.weight", op: "untile_heads", when: "tiled_heads && (n == 'a' || n == 'b')",
-     args: {k_heads: "lin_k_heads", block: "hidden"}},
-    {tensor: "model.layers.{i}.linear_attn.neg_A", op: "untile_heads", when: "tiled_heads", args: {k_heads: "lin_k_heads", block: 1}},
-    {tensor: "model.layers.{i}.linear_attn.dt_bias", op: "untile_heads", when: "tiled_heads", args: {k_heads: "lin_k_heads", block: 1}},
-    {tensor: "model.layers.{i}.linear_attn.out_proj.weight", op: "reshape", when: "tiled_heads && !out_tiled",
-     args: {shape: ["hidden * lin_v_heads", "lin_v_dim"]}},
-    {tensor: "model.layers.{i}.linear_attn.out_proj.weight", op: "untile_packed_rows", when: "tiled_heads && !out_tiled",
-     args: {k_heads: "lin_k_heads", v_heads: "lin_v_heads", rows_per_block: 1, chunk_rows: "lin_v_heads"}},
-    {tensor: "model.layers.{i}.linear_attn.out_proj.weight", op: "reshape", when: "tiled_heads && !out_tiled",
-     args: {shape: ["hidden", "lin_v_heads * lin_v_dim"]}},
-    {tensor: "model.layers.{i}.mlp.experts.gate_up_proj", op: "reshape", args: {shape: ["experts * 2 * moe_inter", "hidden"]}},
-    {tensor: "model.layers.{i}.mlp.experts.gate_up_proj", op: "deinterleave_heads", args: {heads: "experts", parts: [
-      ["model.layers.{i}.mlp.experts.gate_proj.weight", "moe_inter"], ["model.layers.{i}.mlp.experts.up_proj.weight", "moe_inter"]]}},
-    {tensor: "model.layers.{i}.mlp.experts.down_proj", op: "reshape", args: {shape: ["experts * hidden", "moe_inter"]}},
-    {tensor: "model.layers.{i}.mlp.experts.down_proj", op: "split_rows", args: {parts: [
-      ["model.layers.{i}.mlp.experts.down_proj.weight", "experts * hidden"]]}},
-    {tensor: "model.layers.{i}.mlp.experts.{n:*}_proj.weight", op: "reshape",
-     when: "len(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight'))) == 3",
-     args: {shape: ["experts * at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 1)", "at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 2)"]}},
-    {tensor: "model.layers.{i}.mlp.shared_expert_gate.weight", op: "reshape", when: "len(shape(fmt('model.layers.{i}.mlp.shared_expert_gate.weight'))) == 1",
-     args: {shape: [1, "hidden"]}},
-    // Qwen4-Exp `1 + w` gains (the indexer's `*_layernorm` take the layernorm rule above).
+  "transforms+": [
+    // Qwen4-Exp `1 + w` gains (the indexer's `*_layernorm` take qwen3_5's layernorm rule).
     {tensor: "model.{s:*}hc_norm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
     {tensor: "model.layers.{i}.ple.norm_{n:*}.weight", op: "add", args: {value: 1}, when: "norm_offset"},
     {tensor: "model.layers.{i}.self_attn.indexer.index_qk_proj.weight", op: "split_rows", args: {parts: [

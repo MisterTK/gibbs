@@ -335,7 +335,9 @@ impl Signals {
     }
 }
 
-/// RFC 7386 merge patch of `patch` into `target`.
+/// RFC 7386 merge patch of `patch` into `target`, plus one extension: a key `k+` whose value is
+/// an array appends it to the target's array `k` (so a child spec adds checks / transforms /
+/// rules to its parent's instead of repeating them).
 pub fn merge_patch(target: &mut J, patch: &J) {
     let J::Object(p) = patch else {
         *target = patch.clone();
@@ -346,7 +348,12 @@ pub fn merge_patch(target: &mut J, patch: &J) {
     }
     let t = target.as_object_mut().unwrap();
     for (k, v) in p {
-        if v.is_null() {
+        if let (Some(base), J::Array(more)) = (k.strip_suffix('+'), v) {
+            match t.entry(base.to_string()).or_insert(J::Array(Vec::new())) {
+                J::Array(a) => a.extend(more.iter().cloned()),
+                other => *other = v.clone(),
+            }
+        } else if v.is_null() {
             t.remove(k);
         } else {
             merge_patch(t.entry(k.clone()).or_insert(J::Null), v);
@@ -665,6 +672,19 @@ mod tests {
     const CHILD: &str = r#"{family: "child", extends: "base", match: {hf_model_type: ["child"]},
         config: {b: "3", c: "4"}, runtime: {list: [9]}}"#;
     const FALLBACK: &str = r#"{family: "fb", match: {fallback: true}, pipeline: "causal_lm"}"#;
+
+    #[test]
+    fn plus_key_appends_to_parent_array() {
+        let mut t = serde_json::json!({"checks": [1, 2], "names": {"use": ["s"], "rules": [3]}});
+        merge_patch(
+            &mut t,
+            &serde_json::json!({"checks+": [4], "names": {"rules+": [5]}, "new+": [6]}),
+        );
+        assert_eq!(
+            t,
+            serde_json::json!({"checks": [1, 2, 4], "names": {"use": ["s"], "rules": [3, 5]}, "new": [6]})
+        );
+    }
 
     #[test]
     fn extends_overrides_and_user_dir_merge_in_order() {

@@ -27,9 +27,9 @@
     {expr: "tc.mlp_bias == true", error: "HunYuan `mlp_bias: true` is not implemented"},
     {expr: "tc.use_qk_norm == false", error: "HunYuan `use_qk_norm: false` is not implemented"},
   ],
+  // Appended to qwen3's rules (`k+`, src/arch/mod.rs merge_patch); `use` is inherited.
   names: {
-    use: ["llamacpp"],
-    rules: [
+    "rules+": [
       ["blk.{i}.attn_q_norm.weight", "model.layers.{i}.self_attn.query_layernorm.weight"],
       ["blk.{i}.attn_k_norm.weight", "model.layers.{i}.self_attn.key_layernorm.weight"],
     ],
