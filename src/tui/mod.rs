@@ -29,7 +29,7 @@ use crate::model::ltx;
 use crate::model::native::MediaInput;
 use crate::model::reencode::ReencodeProgress;
 use crate::model::t2v::Video;
-use crate::model::text_to_image::{ImageRequest, ImageSlot};
+use crate::runtime::diffusion::{ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weight_format::{
     reencode_override, set_reencode_override, Choice, ReencodeConfig, ReencodePolicy, VariantPolicy,

@@ -9,7 +9,7 @@ use gibbs_engine::model::load_log;
 use gibbs_engine::model::ltx;
 use gibbs_engine::model::t2v::Video;
 use gibbs_engine::model::t2v::{write_mp4, TextToVideoPipeline};
-use gibbs_engine::model::text_to_image::{ImageGenerator, ImageRequest, ImageSlot};
+use gibbs_engine::runtime::diffusion::{ImageGenerator, ImageRequest, ImageSlot};
 use gibbs_engine::model::weight_format::ReencodeConfig;
 use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler, ExecutableModel};
 use gibbs_engine::server::{create_router, AppState};

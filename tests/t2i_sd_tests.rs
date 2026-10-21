@@ -1,9 +1,10 @@
 //! Stable Diffusion on real weights (stabilityai/sd-turbo diffusers fp16 in disk/): prompts steer the
 //! image, image-to-image keeps the input's layout. Prints SKIP when the repo is not downloaded.
 
+use gibbs_engine::hardware::PlacementMode;
 use gibbs_engine::model::hub::HuggingFaceHub;
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::text_to_image::{load_image_model, ImageRequest};
+use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
 use std::path::PathBuf;
 
 const REPO: &str = "stabilityai/sd-turbo";
@@ -31,7 +32,7 @@ fn sd_turbo_follows_prompt_and_img2img_strength() {
         eprintln!("SKIP: {REPO} not downloaded");
         return;
     }
-    let sd = load_image_model(&art, &hub)
+    let sd = load_image(&art, &hub, PlacementMode::Auto)
         .expect("sd-turbo is an image repo")
         .unwrap();
     let gen = |prompt: &str| {

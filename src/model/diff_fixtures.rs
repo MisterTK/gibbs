@@ -178,24 +178,12 @@ pub fn tiny_clip(act: Act, proj: bool) -> ClipTextTransformer {
     ClipTextTransformer::from_parts(&t, "text_model", act, 0, proj.then_some("text_projection.weight"), tk).unwrap()
 }
 
-
-
-/// The tiny SD pipeline (`sd::tiny_pipeline`) generating an image: CLIP, CFG UNet and VAE as Metal
-/// programs; the caller arms the CPU tripwire, so any CPU compute panics. Returns the image size.
-pub fn tiny_sd_on_gpu() -> Result<(usize, usize), String> {
-    let pipe = crate::model::sd::tiny_pipeline()?;
-    let req = crate::model::text_to_image::ImageRequest { prompt: "a lighthouse".into(), seed: 5, ..Default::default() };
-    let img = pipe.generate(&req, None)?;
-    Ok((img.width, img.height))
-}
-
-/// Every non-SD VAE (Qwen-Image, Qwen-Image 2.1, LTX-Video, DC-AE) plus the SD VAE decoded as Metal
+/// Every legacy non-SD VAE (Qwen-Image, Qwen-Image 2.1, LTX-Video) plus the SD VAE decoded as Metal
 /// programs from tiny synthetic checkpoints; the caller arms the CPU tripwire, so any CPU compute panics.
 pub fn tiny_vae_on_gpu() -> Result<(), String> {
     crate::model::qwen_vae::fixture::tiny_on_gpu()?;
     crate::model::qwen_vae21::fixture::tiny_on_gpu()?;
     crate::model::ltx_vae::fixture::tiny_on_gpu()?;
-    crate::model::dcae::fixture::tiny_on_gpu()?;
     let r = synth(&vae_specs(4), 7);
     let vae = SdVae::from_ldm(&Tensors::from_reader(&r)?)?;
     let (h, w) = (6, 5);

@@ -18,7 +18,7 @@ use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
 use crate::runtime::sched::Rng;
 use crate::model::t5::T5Encoder;
-use crate::model::text_to_image::{pipeline_class, ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::diffusion::{pipeline_class, ImageDefaults, ImageGenerator, ImageRequest};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::vae::SdVae;
 use crate::model::weights::{Mat, Weights};

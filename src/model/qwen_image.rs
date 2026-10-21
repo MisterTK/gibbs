@@ -12,7 +12,7 @@ use crate::runtime::sched;
 use crate::model::flux::{Store, Wt};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::model::nn;
-use crate::model::text_to_image::{pipeline_class, ImageGenerator};
+use crate::runtime::diffusion::{pipeline_class, ImageGenerator};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;

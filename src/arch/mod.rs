@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn flux_families_runtime_keys_and_pipeline_claims() {
         let r = registry().unwrap();
-        for (fam, class) in [("flux", "FluxPipeline"), ("chroma", "ChromaPipeline"), ("flux2", "Flux2KleinPipeline")] {
+        for (fam, class) in [("flux", "FluxPipeline"), ("chroma", "ChromaPipeline"), ("flux2", "Flux2Transformer2DModel")] {
             let s = r.spec(fam, &Signals::default()).unwrap();
             let rt: crate::runtime::diffusion::Runtime = s.runtime_as().unwrap();
             assert!(rt.other.is_empty(), "{fam}: unknown runtime keys {:?}", rt.other.keys());

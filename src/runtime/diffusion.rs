@@ -11,17 +11,59 @@ use crate::hardware::PlacementMode;
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::model::image::ImageBuffer;
 use crate::model::lora::Part as LoraPart;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
 use crate::runtime::sched::{
     card_sigmas, default_sigmas, dpm_flow_sigmas, euler_step, linspace_sigmas, DpmSolver2, Mu, Rng,
     Schedule, Scheduler, SchedulerConfig, TRAIN_STEPS,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::Value as J;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+
+/// One generation. `None` fields take the pipeline's [`ImageDefaults`].
+#[derive(Debug, Clone, Default)]
+pub struct ImageRequest {
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub steps: Option<usize>,
+    /// Classifier-free guidance scale; distilled/turbo models ignore it.
+    pub guidance: Option<f32>,
+    pub seed: u64,
+}
+
+/// What a pipeline runs when the request leaves a field unset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageDefaults {
+    pub width: usize,
+    pub height: usize,
+    pub steps: usize,
+    pub guidance: f32,
+    /// Pixel sides must be multiples of this.
+    pub multiple: usize,
+}
+
+/// A text-to-image pipeline, as the server, the TUI and the CLI drive it.
+pub trait ImageGenerator: Send + Sync {
+    /// Architecture and weights, for logs and the TUI.
+    fn summary(&self) -> String;
+    /// Repo id it was loaded as, when known (listed by `/v1/models` and the TUI after a hot swap).
+    fn model_id(&self) -> Option<String> {
+        None
+    }
+    fn defaults(&self) -> ImageDefaults;
+    fn text_to_image(&self, req: &ImageRequest) -> Result<ImageBuffer, String>;
+    /// Denoises from `init` noised to `strength` (0..=1).
+    fn image_to_image(&self, _req: &ImageRequest, _init: &ImageBuffer, _strength: f32) -> Result<ImageBuffer, String> {
+        Err(format!("{} does not support image-to-image", self.summary()))
+    }
+}
+
+/// The active image model, shared by the HTTP server and the TUI (hot-swapped by the picker).
+pub type ImageSlot = Arc<RwLock<Option<Arc<dyn ImageGenerator>>>>;
 
 /// Artifacts of a component directory (its `config.json` + weights).
 pub fn dir_artifacts(dir: &Path) -> ModelArtifacts {
@@ -1551,13 +1593,8 @@ pub fn load_image(
     };
     let fam = class.as_deref().and_then(family_of_class);
     match (&fam, &denoiser) {
-        (None, _) if lora => return None,
-        (None, _) => {
-            return Some(Err(format!(
-                "{repo}: {what}, but its base_model {base} is {}",
-                class.as_deref().unwrap_or("not a diffusers pipeline")
-            )))
-        }
+        // A base no diffusion spec runs: other loaders may (denoiser tensor names are shared).
+        (None, _) => return None,
         (Some(f), Some(d)) if !related(reg, f, d) && !related(reg, d, f) => {
             return Some(Err(format!("{repo}: {d} denoiser weights, but its base_model {base} is a {f} pipeline")))
         }

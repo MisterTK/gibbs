@@ -17,14 +17,13 @@ use tokenizers::Tokenizer;
 /// Tensor source with PyTorch-order shapes over a GGUF file (which stores GGML-order, i.e. reversed,
 /// dims) or a safetensors file (PyTorch order). Data is the same row-major PyTorch layout in both.
 /// Aliases expose a tensor under another name (diffusers -> LDM, OpenCLIP -> HF), optionally as a row
-/// range and/or transposed; LoRA deltas registered by [`Tensors::add_delta`] are merged on load.
+/// range and/or transposed.
 pub struct Tensors<'a> {
     reader: &'a dyn WeightReader,
     shapes: HashMap<String, Vec<usize>>,
     /// safetensors dtype per stored name (`F16`, `BF16`, `F32`, ...); empty for GGUF.
     dtypes: HashMap<String, String>,
     alias: HashMap<String, Alias>,
-    deltas: HashMap<String, Vec<Delta>>,
 }
 
 struct Alias {
@@ -33,21 +32,13 @@ struct Alias {
     transpose: bool,
 }
 
-/// `scale * up [out, r] . down [r, in*k*k]`, added to a weight on load.
-pub struct Delta {
-    pub up: Vec<f32>,
-    pub down: Vec<f32>,
-    pub rank: usize,
-    pub scale: f32,
-}
-
 impl<'a> Tensors<'a> {
     pub fn gguf(r: &'a GgufWeightReader) -> Self {
         let shapes = r
             .tensor_names()
             .filter_map(|n| Some((n.clone(), r.get_tensor_shape(n)?.iter().rev().copied().collect())))
             .collect();
-        Self { reader: r, shapes, dtypes: HashMap::new(), alias: HashMap::new(), deltas: HashMap::new() }
+        Self { reader: r, shapes, dtypes: HashMap::new(), alias: HashMap::new() }
     }
 
     pub fn safetensors(r: &'a SafetensorsWeightReader) -> Result<Self, String> {
@@ -61,7 +52,7 @@ impl<'a> Tensors<'a> {
             dtypes.insert(m.name.clone(), m.dtype);
             shapes.insert(m.name, m.shape);
         }
-        Ok(Self { reader: r, shapes, dtypes, alias: HashMap::new(), deltas: HashMap::new() })
+        Ok(Self { reader: r, shapes, dtypes, alias: HashMap::new() })
     }
 
     /// PyTorch-order shape of `name`, `None` if absent.
@@ -91,26 +82,10 @@ impl<'a> Tensors<'a> {
         Ok(())
     }
 
-    /// Adds a LoRA delta to weight `name` (checked against its shape).
-    pub fn add_delta(&mut self, name: &str, d: Delta) -> Result<(), String> {
-        let shape = self.shape(name).ok_or_else(|| format!("LoRA targets missing tensor '{name}'"))?;
-        let (out, inner) = (shape[0], shape[1..].iter().product::<usize>());
-        if d.up.len() != out * d.rank || d.down.len() != d.rank * inner {
-            return Err(format!(
-                "LoRA for '{name}' {shape:?}: up {} / down {} values do not fit rank {}",
-                d.up.len(),
-                d.down.len(),
-                d.rank
-            ));
-        }
-        self.deltas.entry(name.to_string()).or_default().push(d);
-        Ok(())
-    }
-
-    /// `name` as f32 (dequantized/upcast, aliases resolved, LoRA merged); a missing tensor is an Err naming it.
+    /// `name` as f32 (dequantized/upcast, aliases resolved); a missing tensor is an Err naming it.
     pub fn load(&self, name: &str) -> Result<Vec<f32>, String> {
         let shape = self.shape(name).ok_or_else(|| format!("tensor '{name}' missing"))?.to_vec();
-        let mut v = match self.alias.get(name) {
+        Ok(match self.alias.get(name) {
             None => self.reader.load_tensor(name).map_err(|e| format!("tensor '{name}': {e}"))?,
             Some(a) => {
                 let mut v = self.reader.load_tensor(&a.src).map_err(|e| format!("tensor '{}': {e}", a.src))?;
@@ -123,28 +98,11 @@ impl<'a> Tensors<'a> {
                 }
                 v
             }
-        };
-        if let Some(ds) = self.deltas_for(name) {
-            let inner = shape[1..].iter().product::<usize>();
-            for d in ds {
-                let down_t = nn::transpose(&d.down, d.rank, inner);
-                let delta = nn::linear(&d.up, shape[0], &down_t, None, d.rank, inner);
-                v.iter_mut().zip(&delta).for_each(|(w, x)| *w += d.scale * x);
-            }
-        }
-        Ok(v)
-    }
-
-    /// LoRA deltas of `name`, also when registered under the stored name of a plain alias.
-    fn deltas_for(&self, name: &str) -> Option<&Vec<Delta>> {
-        self.deltas.get(name).or_else(|| {
-            let a = self.alias.get(name).filter(|a| a.rows.is_none() && !a.transpose)?;
-            self.deltas.get(&a.src)
         })
     }
 
-    /// `name` in its stored precision: f16/bf16 safetensors tensors stay 16-bit (merged LoRA deltas
-    /// are re-encoded); everything else is f32.
+    /// `name` in its stored precision: f16/bf16 safetensors tensors stay 16-bit; everything else is
+    /// f32.
     pub fn load_wt(&self, name: &str) -> Result<nn::Wt, String> {
         let alias = self.alias.get(name);
         let stored = alias.map_or(name, |a| a.src.as_str());
@@ -154,7 +112,7 @@ impl<'a> Tensors<'a> {
             _ => return self.load(name).map(nn::Wt::F32),
         };
         let plain = alias.is_none_or(|a| a.rows.is_none() && !a.transpose);
-        if !plain || self.deltas_for(name).is_some() {
+        if !plain {
             return Ok(half.like(self.load(name)?));
         }
         let raw = self.reader.load_tensor_quantized(stored).map_err(|e| format!("tensor '{stored}': {e}"))?;
