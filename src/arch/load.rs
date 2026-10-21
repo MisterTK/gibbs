@@ -1095,8 +1095,8 @@ fn untile_heads(x: &mut [f32], k_heads: usize, block: usize) {
     }
 }
 
-/// Port of `graph_lm.rs` `ternarize`: {-1, 0, 1} on 1 / mean |W|, divided back and cast.
-fn ternarize(w: &mut [f32], cast: impl Fn(f32) -> f32) {
+/// BitNet online weight quant: {-1, 0, 1} on 1 / mean |W|, divided back and cast.
+pub fn ternarize(w: &mut [f32], cast: impl Fn(f32) -> f32) {
     let mean = (w.iter().map(|v| v.abs() as f64).sum::<f64>() / w.len().max(1) as f64) as f32;
     let scale = 1.0 / mean.max(1e-5);
     let step = cast(1.0 / scale);

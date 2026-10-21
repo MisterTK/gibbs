@@ -875,4 +875,34 @@ mod tests {
             .get(&[("rows", Val::Num(1.0))], || Err("evicted".into()))
             .is_err());
     }
+
+    /// `act_quant` (transformer lib, BitNet BitLinear) on the CPU graph: ties round half to even
+    /// like torch.round, -127 stays in [-128, 127], an all-zero row keeps its zeros (absmax clamps
+    /// at 1e-5 instead of dividing by zero).
+    #[test]
+    fn act_quant_rounds_half_to_even_and_clamps_like_torch() {
+        struct Qp;
+        impl Source for Qp {
+            fn tensor(&self, name: &str) -> Option<(Vec<usize>, DType)> {
+                (name == "act_quant.qp").then(|| (vec![1], DType::F32))
+            }
+        }
+        let spec = r#"{family: "aq", pipeline: "causal_lm", use_lib: ["transformer"], components: {t: {
+          vars: ["rows"], inputs: [{name: "x", dtype: "f32", shape: ["rows", 5]}],
+          body: [{use: "act_quant", args: {bits: 8}, in: ["i:x"], out: "y"}], outputs: ["y"]}}}"#;
+        let files: Vec<(String, String)> = crate::arch::EMBEDDED
+            .iter()
+            .filter(|(p, _)| p.starts_with("lib/"))
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .chain([("families/aq.json5".into(), spec.into())])
+            .collect();
+        let s = Registry::from_files(&files, &[]).unwrap().spec("aq", &Signals::default()).unwrap();
+        let inst = build(&s, "t", &Cfg, &Qp, &[("rows", Val::Num(2.0))]).unwrap();
+        let mut w = crate::graph::Weights::new();
+        w.insert("act_quant.qp", crate::graph::Tensor::F32(vec![127.0]));
+        let x = vec![127.0, 0.5, 2.5, -1.5, -127.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let out = crate::graph::cpu::run_stateless(&inst.graph, &w, vec![crate::graph::Tensor::F32(x)]).unwrap();
+        let crate::graph::Tensor::F32(y) = &out[0] else { panic!("dtype") };
+        assert_eq!(y, &[127.0, 0.0, 2.0, -2.0, -127.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
 }
