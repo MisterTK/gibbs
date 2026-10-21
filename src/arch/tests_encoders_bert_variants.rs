@@ -75,8 +75,10 @@ fn bert_variants_match_old_classifier() {
         let hub = HuggingFaceHub::with_cache_dir(write_repo(&name, cfg, &ts));
         for &dev in &devs {
             let c = SequenceClassifier::load(&hub, &format!("t/{name}"), dev).unwrap_or_else(|e| panic!("{fixture}: {e}"));
+            assert_eq!(c.device(), dev, "{fixture}");
             for pair in [false, true] {
                 let (mut l, _) = c.classify(TEXT, pair.then_some(PAIR)).unwrap();
+                assert_eq!(l.len(), 3, "{fixture}");
                 l.sort_by(|a, b| a.label.cmp(&b.label));
                 let got: Vec<f32> = l.iter().map(|x| x.score).collect();
                 let want = PINNED.iter().find(|p| p.0 == fixture && p.1 == pair).unwrap().2;
