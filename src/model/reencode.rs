@@ -47,7 +47,9 @@ pub fn has_gpu_codec(f: Q) -> bool {
 
 /// Formats [`QuantizedLinearLayer::from_f32`] can produce.
 pub fn encodable(f: Q) -> bool {
-    is_float(f) || matches!(f, Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4) || LADDER[..3].contains(&f)
+    is_float(f)
+        || matches!(f, Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4)
+        || LADDER[..3].contains(&f)
 }
 
 fn block_elems(f: Q) -> usize {
@@ -368,7 +370,7 @@ fn beats_source(f: Q, src: Q, rate: &dyn Fn(Q) -> Option<f64>) -> bool {
     let time = |q: Q| rate(q).map(|g| q.bits_per_weight() as f64 / g);
     match (time(f), time(src)) {
         (Some(a), Some(b)) => a < b * TIME_MARGIN,
-        _ => f.bits_per_weight() < src.bits_per_weight(),
+        _ => f64::from(f.bits_per_weight()) < f64::from(src.bits_per_weight()) * TIME_MARGIN,
     }
 }
 
@@ -398,14 +400,28 @@ pub fn reencode_values(
     cols: usize,
     data: impl FnOnce() -> Option<Vec<f32>>,
 ) -> Option<(Q, Vec<u8>)> {
-    let f = target(cfg, name, src, cols, true)?;
-    let raw: Vec<u8> = data()?.iter().flat_map(|x| x.to_le_bytes()).collect();
-    fn f32_block(b: &[u8], out: &mut [f32]) {
-        for (o, c) in out.iter_mut().zip(b.chunks_exact(4)) {
-            *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-        }
+    let mut f = target(cfg, name, src, cols, true)?;
+    if cfg.policy == ReencodePolicy::MaxSpeed && f == Q::GGUF_Q4_K_M && cols % 32 == 0 {
+        f = Q::GGUF_Q4_0;
     }
-    encode_blocks(name, src, f, rows, cols, &raw, (32, 128, f32_block))
+    let vals = data()?;
+    let threads = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .saturating_sub(1)
+        .max(1);
+    let QuantizedWeight::GgufQuantized { raw_data, .. } =
+        encode_weight(&vals, cols, rows, f, threads)
+    else {
+        return None;
+    };
+    let blocks = raw_data.to_vec();
+    let mut stats = NATIVE_STATS.lock();
+    stats.reencoded += 1;
+    (stats.bytes_before, stats.bytes_after) = (
+        stats.bytes_before + (rows * src.tensor_bytes(cols)) as u64,
+        stats.bytes_after + blocks.len() as u64,
+    );
+    Some((f, blocks))
 }
 
 /// The format the policy re-stores `name` (stored as `src`, `cols` wide) in, if any.
