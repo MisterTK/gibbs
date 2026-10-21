@@ -76,6 +76,135 @@ fn scatter_fixture(name: &str) {
     assert!(out[8..16].iter().chain(&out[24..]).all(|&v| v == -1.0), "{name}");
 }
 
+/// A tiny random T5 (gated) or BART (3-beam search, forking beam state) through
+/// `runtime::encdec` on Metal: encoder, search and decoder steps all on the GPU.
+fn encdec_on_gpu(name: &str, bart: bool) {
+    use gibbs_engine::model::hub::ModelArtifacts;
+    use serde_json::json;
+    /// Deterministic f32 tensors written as a safetensors checkpoint.
+    struct Weights(u64, Vec<(String, Vec<usize>, Vec<f32>)>);
+    impl Weights {
+        fn new(seed: u64) -> Self {
+            Self(seed, Vec::new())
+        }
+        fn s(&mut self, n: impl Into<String>, shape: &[usize], scale: f32) -> &mut Self {
+            let v = (0..shape.iter().product::<usize>())
+                .map(|_| {
+                    self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+                })
+                .collect();
+            self.1.push((n.into(), shape.to_vec(), v));
+            self
+        }
+        fn w(&mut self, n: impl Into<String>, shape: &[usize]) -> &mut Self {
+            self.s(n, shape, 1.0 / (shape[1] as f32).sqrt())
+        }
+        fn norm(&mut self, n: impl Into<String>, d: usize, _c: f32) -> &mut Self {
+            self.1.push((n.into(), vec![d], vec![1.0; d]));
+            self
+        }
+        fn write_checkpoint(&self, dir: &std::path::Path, cfg: &serde_json::Value, vocab: usize) {
+            std::fs::create_dir_all(dir).unwrap();
+            let (mut h, mut data) = (serde_json::Map::new(), Vec::<u8>::new());
+            for (n, shape, v) in &self.1 {
+                let a = data.len();
+                data.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+                h.insert(n.clone(), json!({"dtype": "F32", "shape": shape, "data_offsets": [a, data.len()]}));
+            }
+            let mut hb = serde_json::to_vec(&h).unwrap();
+            hb.resize(hb.len().next_multiple_of(8), b' ');
+            let mut out = (hb.len() as u64).to_le_bytes().to_vec();
+            out.extend(hb);
+            out.extend(data);
+            std::fs::write(dir.join("model.safetensors"), out).unwrap();
+            std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+            let vm: serde_json::Map<String, serde_json::Value> = (0..vocab).map(|i| (format!("t{i}"), json!(i))).collect();
+            let tok = json!({"version": "1.0", "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {"type": "WhitespaceSplit"}, "post_processor": null, "decoder": null,
+                "model": {"type": "WordLevel", "vocab": vm, "unk_token": "t0"}});
+            std::fs::write(dir.join("tokenizer.json"), tok.to_string()).unwrap();
+        }
+    }
+    let artifacts = |dir: &std::path::Path| ModelArtifacts {
+        model_id: "test/encdec".into(),
+        local_dir: Some(dir.to_path_buf()),
+        config_path: Some(dir.join("config.json")),
+        tokenizer_path: Some(dir.join("tokenizer.json")),
+        weights_path: Some(dir.join("model.safetensors")),
+        is_cached: true,
+        ..Default::default()
+    };
+    use gibbs_engine::runtime::encdec::SpecEncDec;
+    use gibbs_engine::model::native::NativeLm;
+    let (v, d) = (40, 32);
+    let dir = std::env::temp_dir().join(format!("gibbs-matrix-encdec-{name}"));
+    let mut w = Weights::new(7);
+    let cfg = if bart {
+        w.s("model.shared.weight", &[v, d], 0.3);
+        for side in ["encoder", "decoder"] {
+            let p = format!("model.{side}");
+            w.s(format!("{p}.embed_positions.weight"), &[66, d], 0.3);
+            w.norm(format!("{p}.layernorm_embedding.weight"), d, 1.0).s(format!("{p}.layernorm_embedding.bias"), &[d], 0.1);
+            let mut attns = vec!["self_attn"];
+            if side == "decoder" {
+                attns.push("encoder_attn");
+            }
+            for a in attns {
+                for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                    w.w(format!("{p}.layers.0.{a}.{proj}.weight"), &[d, d]).s(format!("{p}.layers.0.{a}.{proj}.bias"), &[d], 0.1);
+                }
+                w.norm(format!("{p}.layers.0.{a}_layer_norm.weight"), d, 1.0).s(format!("{p}.layers.0.{a}_layer_norm.bias"), &[d], 0.1);
+            }
+            w.w(format!("{p}.layers.0.fc1.weight"), &[64, d]).s(format!("{p}.layers.0.fc1.bias"), &[64], 0.1);
+            w.w(format!("{p}.layers.0.fc2.weight"), &[d, 64]).s(format!("{p}.layers.0.fc2.bias"), &[d], 0.1);
+            w.norm(format!("{p}.layers.0.final_layer_norm.weight"), d, 1.0).s(format!("{p}.layers.0.final_layer_norm.bias"), &[d], 0.1);
+        }
+        json!({"architectures": ["BartForConditionalGeneration"], "model_type": "bart", "vocab_size": v,
+            "d_model": d, "max_position_embeddings": 64, "encoder_layers": 1, "decoder_layers": 1,
+            "encoder_attention_heads": 4, "decoder_attention_heads": 4, "activation_function": "gelu",
+            "bos_token_id": 0, "pad_token_id": 1, "eos_token_id": 2, "decoder_start_token_id": 2,
+            "num_beams": 3, "max_length": 8})
+    } else {
+        w.s("shared.weight", &[v, d], 1.0);
+        for stack in ["encoder", "decoder"] {
+            let b = format!("{stack}.block.0.layer");
+            let mut subs = vec![(0, "SelfAttention")];
+            if stack == "decoder" {
+                subs.push((1, "EncDecAttention"));
+            }
+            for (l, m) in subs {
+                w.norm(format!("{b}.{l}.layer_norm.weight"), d, 1.0);
+                for p in ["q", "k", "v", "o"] {
+                    w.w(format!("{b}.{l}.{m}.{p}.weight"), &[d, d]);
+                }
+            }
+            w.s(format!("{b}.0.SelfAttention.relative_attention_bias.weight"), &[8, 4], 1.0);
+            let f = if stack == "decoder" { 2 } else { 1 };
+            w.norm(format!("{b}.{f}.layer_norm.weight"), d, 1.0);
+            w.w(format!("{b}.{f}.DenseReluDense.wi_0.weight"), &[48, d]).w(format!("{b}.{f}.DenseReluDense.wi_1.weight"), &[48, d]);
+            w.w(format!("{b}.{f}.DenseReluDense.wo.weight"), &[d, 48]);
+            w.norm(format!("{stack}.final_layer_norm.weight"), d, 1.0);
+        }
+        json!({"architectures": ["T5ForConditionalGeneration"], "model_type": "t5", "vocab_size": v,
+            "d_model": d, "d_kv": 8, "num_heads": 4, "d_ff": 48, "num_layers": 1, "relative_attention_num_buckets": 8,
+            "relative_attention_max_distance": 16, "feed_forward_proj": "gated-gelu", "n_positions": 64})
+    };
+    w.write_checkpoint(&dir, &cfg, v);
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let m = gibbs_engine::arch::load::load(&artifacts(&dir), reg, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let lm = SpecEncDec::new(m, PlacementMode::Pin(Device::Metal)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(lm.device(), Device::Metal, "{name}");
+    let src = if bart { b"t3 t5 t7".iter().map(|&b| b as u32).collect() } else { vec![3u32, 5, 7] };
+    let (prompt, mut st) = lm.prepare(src, &[]).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut l = lm.forward(&prompt, 0, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+    for pos in prompt.len()..prompt.len() + 2 {
+        let t = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
+        l = lm.forward(&[t], pos, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    assert_eq!(lm.cpu_node_count(), 0, "{name}: nodes run on the CPU");
+}
+
 fn gpu_fixture(f: Family) {
     match f {
         Family::GraphLm => {
@@ -129,8 +258,8 @@ fn gpu_fixture(f: Family) {
                 assert_eq!(out.len(), 16);
             }
         }
-        Family::T5 => gibbs_engine::model::t5::run_tiny_gpu_fixture(),
-        Family::Seq2Seq => gibbs_engine::model::seq2seq::run_tiny_gpu_fixture(),
+        Family::T5 => encdec_on_gpu("t5", false),
+        Family::Seq2Seq => encdec_on_gpu("bart", true),
         Family::ClassifierBert => classifier_on_gpu("bert", synth::bert(None)),
         Family::ClassifierModern => {
             classifier_on_gpu("modernbert", synth::modernbert("mean", true));

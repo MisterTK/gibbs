@@ -55,6 +55,11 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/sdxl.json5", include_str!("../../arch/families/sdxl.json5")),
     ("overrides/sd_turbo.json5", include_str!("../../arch/overrides/sd_turbo.json5")),
     ("overrides/sdxl_turbo.json5", include_str!("../../arch/overrides/sdxl_turbo.json5")),
+    ("families/t5.json5", include_str!("../../arch/families/t5.json5")),
+    ("families/bart.json5", include_str!("../../arch/families/bart.json5")),
+    ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
+    ("families/m2m100.json5", include_str!("../../arch/families/m2m100.json5")),
+    ("families/fsmt.json5", include_str!("../../arch/families/fsmt.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
     ("lib/video.json5", include_str!("../../arch/lib/video.json5")),
     ("families/ltx.json5", include_str!("../../arch/families/ltx.json5")),
@@ -625,7 +630,7 @@ impl Registry {
     /// Whether a `causal_lm` family lists `model_type` (glob) in its `hf_model_type`.
     pub fn runs_model_type(&self, model_type: &str) -> bool {
         self.matchers().iter().any(|(_, m, p)| {
-            *p == Pipeline::CausalLm && m.hf_model_type.iter().any(|g| glob(g, model_type))
+            matches!(p, Pipeline::CausalLm | Pipeline::Encdec) && m.hf_model_type.iter().any(|g| glob(g, model_type))
         })
     }
 
