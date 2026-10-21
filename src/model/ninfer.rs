@@ -1,7 +1,7 @@
 //! NInfer (`.ninfer`, github.com/Neroued/ninfer) artifacts of the dense Qwen3.5 family (Qwen3.5,
 //! Qwen3.6, Qwen3.8 and their finetunes): one file (or a file plus `.part-NNNN` volumes) of a JSON
 //! catalog and 256-byte-aligned encoded objects, read back as the transformers tensors
-//! [`crate::model::qwen3_5`] loads. The container is v2 (`NINFER\0\x02`: named objects, geometry
+//! the `qwen3_5` family spec loads. The container is v2 (`NINFER\0\x02`: named objects, geometry
 //! implied by the tensors) or v3 (`NINFER\0\x03`: `components.text.config`, logical `bindings`
 //! over object element ranges). v1, MoE / Qwen4Exp / speech architectures and the codecs outside
 //! [`Codec`] are refused with their name.
@@ -97,7 +97,7 @@ struct Geometry {
     taps: usize,
 }
 
-/// `config.json` for [`crate::model::qwen3_5`], its dimensions, and every transformers tensor with
+/// `config.json` for the `qwen3_5` family spec, its dimensions, and every transformers tensor with
 /// its assembly recipe.
 struct Plan {
     cfg: Value,
@@ -1469,16 +1469,26 @@ mod tests {
         (dir, path, off)
     }
 
-    /// The artifact's checkpoint runs through the Qwen3.5 Metal program like the host forward:
-    /// prefill 5 tokens and decode 3 (the `.ninfer` loader's `assemble`, minus its tokenizer
-    /// resource).
+    /// The artifact loads through the `qwen3_5` spec (detected from its catalog) and its Metal
+    /// program matches the CPU one: prefill 5 tokens and decode 3 (the tiny artifact ships no
+    /// tokenizer resource).
     #[test]
     fn v3_artifact_metal_program_matches_host() {
         use crate::hardware::{cpu_compute, Device, PlacementMode};
+        use crate::model::native::NativeLm;
         let _g = cpu_compute::allow();
         let (_dir, path, _) = write_tiny();
-        let (ck, cfg) = Artifact::open(&path).unwrap().checkpoint().unwrap();
-        let m = |d| crate::model::qwen3_5::from_checkpoint(&ck, &cfg, PlacementMode::Pin(d)).unwrap();
+        let a = ModelArtifacts {
+            model_id: "x/tiny".into(),
+            weights_path: Some(path),
+            ..Default::default()
+        };
+        let m = |d| {
+            let mut s = crate::arch::load::load(&a, crate::arch::registry().unwrap(), None).unwrap();
+            assert_eq!(s.spec.family, "qwen3_5");
+            s.tokenizer = Some(crate::model::tokenizer::Tokenizer::default_bpe());
+            crate::runtime::lm::SpecLm::new(s, PlacementMode::Pin(d)).unwrap()
+        };
         let (cpu, gpu) = (m(Device::Cpu), m(Device::Metal));
         assert_eq!(gpu.device(), Device::Metal);
         let prompt = vec![1u32, 5, 9, 13, 2];
@@ -1620,9 +1630,13 @@ mod tests {
             weights_path: Some(path),
             ..Default::default()
         };
-        let m = crate::model::qwen3_5::load_ninfer(&artifacts, crate::hardware::Device::Cpu)
-            .unwrap()
-            .unwrap();
+        let m = crate::runtime::lm::load(
+            &artifacts,
+            crate::arch::registry().unwrap(),
+            Some("qwen3_5"),
+            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
+        )
+        .unwrap();
         println!("loaded {} with its vision tower", artifacts.model_id);
         drop(m);
     }

@@ -1961,14 +1961,11 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
 }
 
 /// llama.cpp GGUF architectures a generation path reads (causal-LM family specs, and the native
-/// qwen3 / hunyuan-dense / qwen35 / qwen35moe / qwen4exp / gemma4 GGUF loaders), whatever task the
-/// repo is tagged with.
+/// gemma4 GGUF loader), whatever task the repo is tagged with.
 fn gguf_lm_archs() -> Vec<String> {
     let mut a = crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs());
-    // legacy: until Phases 5 and 6 give the native loaders' families specs.
-    a.extend(
-        ["qwen3", "hunyuan-dense", "qwen35", "gemma4", "qwen35moe", "qwen4exp"].map(String::from),
-    );
+    // legacy: until Phase 6 gives gemma4 a spec.
+    a.push("gemma4".into());
     a
 }
 
@@ -1995,7 +1992,7 @@ fn gemma4_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
 fn native_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
     let t = m["config"]["model_type"]
         .as_str()
-        .filter(|_| native_type(m))?;
+        .filter(|t| crate::model::native::NATIVE_MODEL_TYPES.contains(t))?;
     let gguf = selection.as_ref().ok()?.first()?.ends_with(".gguf");
     (gguf && !crate::model::native::NATIVE_GGUF_TYPES.contains(&t))
         .then(|| format!("'{t}' loads from safetensors only; this repo's weights are GGUF"))
@@ -2024,11 +2021,12 @@ fn quant_blocker(m: &Value) -> Option<String> {
     crate::model::prequant::scheme_blocker(&m["config"], None)
 }
 
-/// `model_type` runs natively ([`crate::model::native`]: bf16 weights, mapped, not expanded).
+/// `model_type` runs natively ([`crate::model::native`]) or from its family spec
+/// ([`crate::arch::dispatch::runs_spec_lm`]): weights mapped as stored, not expanded.
 fn native_type(m: &Value) -> bool {
-    m["config"]["model_type"]
-        .as_str()
-        .is_some_and(|t| crate::model::native::NATIVE_MODEL_TYPES.contains(&t))
+    m["config"]["model_type"].as_str().is_some_and(|t| {
+        crate::model::native::NATIVE_MODEL_TYPES.contains(&t) || crate::arch::dispatch::runs_spec_lm(t)
+    })
 }
 
 /// GGUF architectures whose expert banks stay packed in the file data (never expanded).

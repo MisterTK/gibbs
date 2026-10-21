@@ -1001,23 +1001,6 @@ mod tests {
         assert!(measure(&smart(), &png(1, 300)).unwrap_err().contains("aspect"));
     }
 
-    // parity with original (delete with the original)
-    #[test]
-    fn smart_resize_matches_original() {
-        use crate::model::qwen3_5::vision::{Preprocessor, Vision};
-        let (ck, cfg) = crate::model::qwen3_5::fixture::checkpoint(true, false);
-        let vision = Vision::load(&ck, &cfg["vision_config"]).unwrap();
-        let pre = Preprocessor::parse(crate::model::qwen3_5::gpu_tests::PRE.as_bytes(), "test").unwrap();
-        for (w, h) in [(16, 24), (30, 50), (400, 300)] {
-            let bytes = png(w, h);
-            let want = vision.prepare(&ImageBuffer::decode(&bytes).unwrap(), &pre).unwrap();
-            let p = preprocess(&smart(), &bytes).unwrap();
-            assert_eq!((p.grid.var("grid_h"), p.grid.var("grid_w")), (Some(want.gh), Some(want.gw)));
-            let d = max_diff(&p.data, &want.patches);
-            assert!(d < 1e-6, "{w}x{h}: max |d| {d}");
-        }
-    }
-
     fn budget() -> Preprocess {
         Preprocess::SoftTokenBudget { patch: 4, pool: 2, max_soft_tokens: 4, norm: half_norm() }
     }
@@ -1290,34 +1273,6 @@ mod tests {
         // Text-only prompts still get positions.
         let e = expand(&[3, 4], &mrope(), &[], &no_text).unwrap();
         assert_eq!((e.pos3, e.delta), (vec![[0; 3], [1; 3]], 0));
-    }
-
-    // parity with original (delete with the original)
-    #[test]
-    fn merged_grid_matches_original() {
-        use crate::model::native::MediaInput;
-        use crate::model::qwen3_5::{fixture::IMAGE_TOKEN, gpu_tests, Seq, TEXT_ROW};
-        let _g = crate::hardware::cpu_compute::allow();
-        let model = gpu_tests::model(true, false, crate::hardware::Device::Cpu);
-        let m = mrope();
-        let (a, b) = (gpu_tests::png(16, 24), gpu_tests::png(30, 50));
-        let cases: [(Vec<u32>, Vec<&Vec<u8>>); 2] = [
-            (vec![3, 7, IMAGE_TOKEN, 11, 5, 9], vec![&a]),
-            (vec![IMAGE_TOKEN, 4, IMAGE_TOKEN, 8], vec![&a, &b]),
-        ];
-        for (ids, imgs) in cases {
-            let media: Vec<MediaInput> = imgs.iter().map(|b| MediaInput::Image((*b).clone())).collect();
-            let (want, state) = model.prepare(ids.clone(), &media).unwrap();
-            let seq = state.downcast_ref::<Seq>().unwrap();
-            let grids: Vec<Grid> = imgs.iter().map(|b| measure(&m["image"].preprocess, b).unwrap()).collect();
-            let refs: Vec<(&str, &Grid)> = grids.iter().map(|g| ("image", g)).collect();
-            let e = expand(&ids, &m, &refs, &no_text).unwrap();
-            assert_eq!(e.ids, want);
-            assert_eq!(e.pos3, seq.pos3);
-            assert_eq!(e.delta, seq.delta);
-            let rows: Vec<u32> = (0..want.len() as u32).filter(|&i| seq.feat_row[i as usize] != TEXT_ROW).collect();
-            assert_eq!(e.media_index, rows);
-        }
     }
 
     /// Token ids and sizes come from the model scope; quoted strings stay literal.

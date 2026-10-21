@@ -66,6 +66,19 @@ fn graph_lm_family(f: &str) -> bool {
     ["llama", "glm", "granite", "bitnet", "gpt_neox", "gpt2", "opt", "lfm2"].contains(&f)
 }
 
+/// `model_type` is a causal-LM family's own match (not a fallback) that [`lm`] runs from its spec
+/// by default: the hub picker treats it like the native loaders' types.
+pub fn runs_spec_lm(model_type: &str) -> bool {
+    super::registry().is_ok_and(|r| {
+        r.matchers().iter().any(|(f, m, p)| {
+            *p == Pipeline::CausalLm
+                && !m.fallback
+                && !graph_lm_family(f)
+                && m.hf_model_type.iter().any(|g| super::glob(g, model_type))
+        })
+    })
+}
+
 fn device(p: PlacementMode) -> Device {
     match p {
         PlacementMode::Pin(d) => d,

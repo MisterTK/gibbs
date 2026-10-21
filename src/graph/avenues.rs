@@ -138,11 +138,10 @@ pub fn explore_node(name: &str, op: &Op, dtype: DType) -> NodeReport {
 pub enum Family {
     GraphLm,
     Gemma4,
-    Qwen35,
+    /// Hybrid recurrent / attention decoders (DeltaNet + gated attention, routed experts), their
+    /// vision tower, MTP head and block drafters.
+    Hybrid,
     Gemma4Media,
-    Qwen35Vision,
-    DraftersMtp,
-    Ninfer,
     T5,
     Seq2Seq,
     Idefics3Siglip,
@@ -159,14 +158,11 @@ pub enum Family {
 }
 
 impl Family {
-    pub const ALL: [Family; 20] = [
+    pub const ALL: [Family; 17] = [
         Family::GraphLm,
         Family::Gemma4,
-        Family::Qwen35,
+        Family::Hybrid,
         Family::Gemma4Media,
-        Family::Qwen35Vision,
-        Family::DraftersMtp,
-        Family::Ninfer,
         Family::T5,
         Family::Seq2Seq,
         Family::Idefics3Siglip,
@@ -190,14 +186,9 @@ pub enum Status {
 }
 
 /// Observed status. A family becomes `Gpu` only in the commit that makes its fixture test in
-/// `tests/cpu_free_matrix.rs` pass.
-pub fn family_status(f: Family) -> Status {
-    use Family::*;
-    match f {
-        GraphLm | Gemma4 | Qwen35 | System1 | T5 | Seq2Seq | Qwen35Vision | DraftersMtp | Ninfer
-        | ClassifierBert | ClassifierModern | ClassifierDecoder | Gemma4Media | Idefics3Siglip
-        | Audio | DiffusionUnet | DiffusionDit | Vae | VideoLtx | VideoModelScope => Status::Gpu,
-    }
+/// `tests/cpu_free_matrix.rs` pass; every family has.
+pub fn family_status(_: Family) -> Status {
+    Status::Gpu
 }
 
 /// `Ok` when `backend` is the explicit CPU opt-in or the family has a Metal program.
@@ -342,7 +333,8 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 (Op::MoeLinear { experts: 128, top_k: 8 }, q4),
             ]);
         }
-        Family::Qwen35 | Family::Ninfer => {
+        // `.ninfer` artifacts load the same spec.
+        Family::Hybrid => {
             decoder(&mut ops);
             // Routed experts of the MoE checkpoints.
             ops.extend([
@@ -373,6 +365,38 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                 (unary(UnaryKind::Sigmoid), F32),
                 (unary(UnaryKind::Softplus), F32),
                 (Op::L2Normalize, F32),
+            ]);
+            // The tower: patch-embed Linear, position-embedding gather/blend, 2D rotary as a
+            // non-interleaved MRope, bidirectional attention, LayerNorm, merger Reshape.
+            ops.extend([
+                (Op::Linear, F32),
+                (Op::Linear, BF16),
+                (Op::Embedding, F32),
+                (Op::Binary { kind: BinaryKind::Add }, F32),
+                (reshape(), F32),
+                (slice(), F32),
+                (
+                    rope(RopeVariant::MRope {
+                        sections: [4, 4, 0],
+                        interleaved: false,
+                        pairs: PairLayout::Half,
+                    }),
+                    F32,
+                ),
+                (
+                    rope(RopeVariant::MRope {
+                        sections: [8, 4, 4],
+                        interleaved: true,
+                        pairs: PairLayout::Half,
+                    }),
+                    F32,
+                ),
+                (attn(), F32),
+                (ln(), F32),
+                (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
+                (Op::Unary { kind: UnaryKind::GeluErf }, F32),
+                // MTP head: embed-norm and hidden-norm rows concatenated into its fc.
+                (Op::Concat { axis: -1 }, F32),
             ]);
         }
         Family::System1 => ops.extend([
@@ -405,43 +429,6 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             (unary(UnaryKind::Scale(2.0)), F32),
             (Op::Scatter { axis: 0 }, F32),
         ]),
-        // The tower: patch-embed Linear, position-embedding gather/blend, 2D rotary as a
-        // non-interleaved MRope, bidirectional attention, LayerNorm, merger Reshape.
-        Family::Qwen35Vision => ops.extend([
-            (Op::Linear, F32),
-            (Op::Linear, BF16),
-            (Op::Embedding, F32),
-            (Op::Binary { kind: BinaryKind::Mul }, F32),
-            (Op::Binary { kind: BinaryKind::Add }, F32),
-            (reshape(), F32),
-            (slice(), F32),
-            (
-                rope(RopeVariant::MRope {
-                    sections: [4, 4, 0],
-                    interleaved: false,
-                    pairs: PairLayout::Half,
-                }),
-                F32,
-            ),
-            (
-                rope(RopeVariant::MRope {
-                    sections: [8, 4, 4],
-                    interleaved: true,
-                    pairs: PairLayout::Half,
-                }),
-                F32,
-            ),
-            (attn(), F32),
-            (ln(), F32),
-            (Op::Unary { kind: UnaryKind::GeluTanh }, F32),
-            (Op::Unary { kind: UnaryKind::GeluErf }, F32),
-        ]),
-        // The MTP head (embed-norm, hidden-norm, concat, fc, one gated attention layer) and the
-        // plain draft models' decode graphs.
-        Family::DraftersMtp => {
-            decoder(&mut ops);
-            ops.extend([(Op::Concat { axis: -1 }, F32), (Op::Binary { kind: BinaryKind::Mul }, F32), (Op::Unary { kind: UnaryKind::Silu }, F32)]);
-        }
         Family::T5 => ops.extend([
             (Op::Embedding, F32),
             (rms(), F32),

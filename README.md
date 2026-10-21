@@ -142,17 +142,14 @@ Startup prints the detected host (CPU, core counts, memory, GPU, and CPU feature
 
 ### GPU coverage
 
-<details><summary>21 model families: 20 on Metal, block drafters CPU-only</summary>
+<details><summary>17 model families, all on Metal</summary>
 
 | family | status | unlowered ops |
 |:---|:---|:---|
 | GraphLm | GPU | — |
 | Gemma4 | GPU | — |
-| Qwen35 | GPU | — |
+| Hybrid | GPU | — |
 | Gemma4Media | GPU | — |
-| Qwen35Vision | GPU | — |
-| DraftersMtp | GPU | — |
-| Ninfer | GPU | — |
 | T5 | GPU | — |
 | Seq2Seq | GPU | — |
 | Idefics3Siglip | GPU | — |
@@ -539,7 +536,7 @@ cargo test --release
 scripts/loop_guard.sh
 python3 scripts/ab_screen.py <base-bin> <cand-bin> --rounds 3 --models 0
 ```
-Real-weight tests read models from `disk/` and print `SKIP: <reason>` when one is missing. Some take their inputs from the environment: `GIBBS_VLM_IMAGES=<dir>` (photos named cat/dog/eiffel/banana for `tests/vlm_tests.rs` and `tests/image_decode_tests.rs`), `GIBBS_GEMMA4_DIR` / `GIBBS_GEMMA4_GGUF_DIR` / `GIBBS_SMOLVLM_DIR` (checkpoint directories), `GIBBS_TEST_STORAGE=<cache>` (a second `--storage` cache the Qwen3/HunYuan/Qwen3.5 GGUF tests in `src/model/qwen3_5.rs` also search), and the BitNet tests also look in `/tmp/gibbs-models`.
+Real-weight tests read models from `disk/` and print `SKIP: <reason>` when one is missing. Some take their inputs from the environment: `GIBBS_VLM_IMAGES=<dir>` (photos named cat/dog/eiffel/banana for `tests/vlm_tests.rs` and `tests/image_decode_tests.rs`), `GIBBS_GEMMA4_DIR` / `GIBBS_GEMMA4_GGUF_DIR` / `GIBBS_SMOLVLM_DIR` (checkpoint directories), `GIBBS_TEST_STORAGE=<cache>` (a second `--storage` cache), and the BitNet tests also look in `/tmp/gibbs-models`.
 
 The optimization log is `autoresearch/roofline-loop.tsv` with notes in `autoresearch/roofline-loop-notes.md`.
 
