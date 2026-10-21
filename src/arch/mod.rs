@@ -19,6 +19,8 @@ pub mod testing;
 #[cfg(test)]
 mod tests_encoders_bert;
 #[cfg(test)]
+mod tests_encoders_bert_variants;
+#[cfg(test)]
 mod tests_encoders_factorized;
 #[cfg(test)]
 mod tests_encoders_modernbert;
