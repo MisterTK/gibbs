@@ -1,0 +1,144 @@
+// Qwen-Image 1 double-stream MMDiT (diffusers `QwenImageTransformer2DModel`): per-stream adaLN
+// (shift, scale, gate x2) from silu(timestep MLP), QK-RMSNorm, joint attention over [text; image]
+// with 3-axis RoPE on adjacent pairs (`centered_grid_text_after` ids), GELU-tanh MLPs and an
+// AdaLayerNormContinuous head. Sizes come from the tensors (GGUFs carry no config). Linear weights
+// run in bf16 (F32 checkpoints are rounded, as the reference). The runner supplies 2x2-packed latent
+// rows and raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
+{
+  family: "qwen_image",
+  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
+  // text-encoder specs land and this family is cut over.
+  match: {diffusers_class: ["QwenImageTransformer2DModel"]},
+  pipeline: "diffusion",
+  use_lib: ["diffusion"],
+  names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
+  config: {
+    dim: "shape('img_in.weight')[0]",
+    in_ch: "shape('img_in.weight')[1]",
+    head_dim: "shape('transformer_blocks.0.attn.norm_q.weight')[0]",
+    heads: "dim // head_dim",
+    text_width: "shape('txt_norm.weight')[0]",
+    layers: "count('transformer_blocks.{k}.attn.to_q.weight')",
+    axes: "first(cfg.axes_dims_rope, [16, 56, 56])",
+    eps: "1e-6",
+  },
+  checks: [
+    {expr: "cfg.guidance_embeds == true || cfg.zero_cond_t == true || cfg.use_additional_t_cond == true || cfg.use_layer3d_rope == true",
+     error: "Qwen-Image 1: guidance_embeds / zero_cond_t / use_additional_t_cond / use_layer3d_rope are not implemented"},
+    {expr: "first(cfg.patch_size, 2) != 2", error: "Qwen-Image 1: only patch_size 2 is supported"},
+    {expr: "has('time_text_embed.guidance_embedder.linear_1.weight') || has('time_text_embed.addition_t_embedding.weight')",
+     error: "Qwen-Image 1: guidance / additional-t embedders are not implemented"},
+    {expr: "layers == 0", error: "Qwen-Image 1 transformer: no transformer_blocks"},
+    {expr: "len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim", error: "Qwen-Image 1: axes_dims_rope must be 3 sizes summing to head_dim"},
+  ],
+  transforms: [
+    {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
+    one: {gen: "fill", args: {shape: [1], value: 1}},
+    "ones.dim": {gen: "ones", args: {shape: ["dim"]}},
+  },
+  macros: {
+    // One stream's modulated, QK-normed projections: returns q, k, v.
+    qkv: {params: ["x", "m"], body: [
+      {use: "chunk", args: {i: 0}, in: ["m"], out: "sh", name: "m"},
+      {use: "chunk", args: {i: 1}, in: ["m"], out: "sc", name: "m"},
+      {use: "ln_modulate", args: {ones: "'ones.dim'"}, in: ["x", "sh", "sc"], out: "h", name: "in"},
+      {op: "Linear", in: ["h", "w:{p}.{wq}.weight", "w?:{p}.{wq}.bias"], out: "q"},
+      {op: "Linear", in: ["h", "w:{p}.{wk}.weight", "w?:{p}.{wk}.bias"], out: "k"},
+      {op: "Linear", in: ["h", "w:{p}.{wv}.weight", "w?:{p}.{wv}.bias"], out: "v"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{p}.{nq}.weight"], out: "q", name: "qn"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{p}.{nk}.weight"], out: "k", name: "kn"},
+    ], returns: ["q", "k", "v"]},
+    // Attention output `ao` of one stream back into its residual `x`, then the gated MLP.
+    post: {params: ["x", "ao", "m"], body: [
+      {op: "Linear", in: ["ao", "w:{p}.{wo}.weight", "w?:{p}.{wo}.bias"], out: "o"},
+      {use: "chunk", args: {i: 2}, in: ["m"], out: "g1", name: "g1"},
+      {use: "gated_add", in: ["x", "o", "g1"], out: "x", name: "res1"},
+      {use: "chunk", args: {i: 3}, in: ["m"], out: "sh", name: "m2"},
+      {use: "chunk", args: {i: 4}, in: ["m"], out: "sc", name: "m2"},
+      {use: "chunk", args: {i: 5}, in: ["m"], out: "g2", name: "m2"},
+      {use: "ln_modulate", args: {ones: "'ones.dim'"}, in: ["x", "sh", "sc"], out: "h", name: "mlpin"},
+      {op: "Linear", in: ["h", "w:{p}.{mlp}.net.0.proj.weight", "w?:{p}.{mlp}.net.0.proj.bias"], out: "h", name: "mlp_in"},
+      {op: "Unary", args: {kind: "GeluTanh"}, in: ["h"], out: "h", name: "gelu"},
+      {op: "Linear", in: ["h", "w:{p}.{mlp}.net.2.weight", "w?:{p}.{mlp}.net.2.bias"], out: "h", name: "mlp_out"},
+      {use: "gated_add", in: ["x", "h", "g2"], out: "out", name: "res2"},
+    ]},
+  },
+  components: {
+    text_encoder: {family: "qwen2_5_vl_text", dir: "text_encoder"},
+    transformer: {family: "qwen_image", dir: "transformer"},
+    vae: {family: "qwen_vae", dir: "vae"},
+    // Velocity [h/2 * w/2, in_ch] for a 2x2-packed latent grid h x w and `nt` text rows.
+    denoiser: {
+      vars: ["h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["(h // 2) * (w // 2)", "in_ch"]},
+        {name: "context", dtype: "f32", shape: ["nt", "text_width"]},
+        {name: "pos", dtype: "u32", shape: ["(nt + (h // 2) * (w // 2)) * 3"], gen: "centered_grid_text_after",
+         args: {text_len: "nt", grid_h: "h // 2", grid_w: "w // 2"}},
+        {name: "t_feat", dtype: "f32", shape: [1, 256], gen: "timestep_embedding",
+         args: {t: "'step:1000 * sigma'", dim: 256, precision: "'f32'"}},
+      ],
+      body: [
+        {let: {n: "nt + (h // 2) * (w // 2)",
+               rope: {MRope: {sections: ["at(axes, 0) // 2", "at(axes, 1) // 2", "at(axes, 2) // 2"], interleaved: false, pairs: "'Adjacent'"}}}},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["i:context", "w:txt_norm.weight"], out: "xt", name: "txt_norm.rms"},
+        {op: "Linear", in: ["xt", "w:txt_in.weight", "w?:txt_in.bias"], out: "xt", name: "txt_in"},
+        {op: "Linear", in: ["i:x", "w:img_in.weight", "w?:img_in.bias"], out: "xi", name: "img_in"},
+        {op: "Linear", in: ["i:t_feat", "w:time_text_embed.timestep_embedder.linear_1.weight", "w?:time_text_embed.timestep_embedder.linear_1.bias"], out: "t", name: "t_lin1"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "temb.act"},
+        {op: "Linear", in: ["t", "w:time_text_embed.timestep_embedder.linear_2.weight", "w?:time_text_embed.timestep_embedder.linear_2.bias"], out: "t", name: "t_lin2"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "cond", name: "cond"},
+        {repeat: "b", count: "layers", body: [
+          {let: {p: "fmt('transformer_blocks.{b}')"}},
+          {op: "Linear", in: ["cond", "w:{p}.img_mod.1.weight", "w?:{p}.img_mod.1.bias"], out: "mi", name: "blk{b}.img.mod"},
+          {op: "Linear", in: ["cond", "w:{p}.txt_mod.1.weight", "w?:{p}.txt_mod.1.bias"], out: "mt", name: "blk{b}.txt.mod"},
+          {use: "qkv", args: {wq: "'attn.to_q'", wk: "'attn.to_k'", wv: "'attn.to_v'", nq: "'attn.norm_q'", nk: "'attn.norm_k'"},
+           in: ["xi", "mi"], out: ["iq", "ik", "iv"], name: "blk{b}.img"},
+          {use: "qkv", args: {wq: "'attn.add_q_proj'", wk: "'attn.add_k_proj'", wv: "'attn.add_v_proj'", nq: "'attn.norm_added_q'", nk: "'attn.norm_added_k'"},
+           in: ["xt", "mt"], out: ["tq", "tk", "tv"], name: "blk{b}.txt"},
+          {op: "Concat", args: {axis: 0}, in: ["tq", "iq"], out: "q", name: "blk{b}.q"},
+          {op: "Concat", args: {axis: 0}, in: ["tk", "ik"], out: "k", name: "blk{b}.k"},
+          {op: "Concat", args: {axis: 0}, in: ["tv", "iv"], out: "v", name: "blk{b}.v"},
+          {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "head_dim", variant: "rope", mscale: 1}, in: ["q", "i:pos", "c:rope.inv_freq"], out: "q", name: "blk{b}.rq"},
+          {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "head_dim", variant: "rope", mscale: 1}, in: ["k", "i:pos", "c:rope.inv_freq"], out: "k", name: "blk{b}.rk"},
+          {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "a", name: "blk{b}.attn"},
+          {op: "Slice", args: {axis: 0, start: 0, end: "nt"}, in: ["a"], out: "ta", name: "blk{b}.ta"},
+          {op: "Slice", args: {axis: 0, start: "nt", end: "n"}, in: ["a"], out: "ia", name: "blk{b}.ia"},
+          {use: "post", args: {wo: "'attn.to_out.0'", mlp: "'img_mlp'"}, in: ["xi", "ia", "mi"], out: "xi", name: "blk{b}.img"},
+          {use: "post", args: {wo: "'attn.to_add_out'", mlp: "'txt_mlp'"}, in: ["xt", "ta", "mt"], out: "xt", name: "blk{b}.txt"},
+        ]},
+        // AdaLayerNormContinuous: emb = [scale | shift].
+        {op: "Linear", in: ["cond", "w:norm_out.linear.weight", "w?:norm_out.linear.bias"], out: "emb", name: "norm_out"},
+        {use: "chunk", args: {i: 0}, in: ["emb"], out: "sc", name: "final.m"},
+        {use: "chunk", args: {i: 1}, in: ["emb"], out: "sh", name: "final.m"},
+        {use: "ln_modulate", args: {ones: "'ones.dim'"}, in: ["xi", "sh", "sc"], out: "y", name: "final.in"},
+        {op: "Linear", in: ["y", "w:proj_out.weight", "w?:proj_out.bias"], out: "out", name: "proj_out"},
+      ],
+      outputs: ["out"],
+    },
+  },
+  runtime: {
+    // Last hidden state (final-normed) of the system/user template minus the system head's tokens;
+    // at most 1024 prompt tokens.
+    text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "tokenizer",
+      prefix: "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n",
+      template: "{prefix}{prompt}<|im_end|>\n<|im_start|>assistant\n", max_len: "prefix_len + 1024",
+      drop: {from: 0, to: "prefix_len"}, vars: {head: "'hidden'"}, outputs: {hidden: "hidden"}}],
+    context: [{features: ["te.hidden"]}],
+    negative: {default: " "},
+    denoiser: {component: "transformer", net: "denoiser"},
+    scheduler: {kind: "flow_euler", sigmas: "linspace", mu: "'config'", seq: "(h // 2) * (w // 2)"},
+    timestep: "sigma",
+    // True CFG with the per-token norm rescale, only for guidance > 1.
+    guidance: {kind: "cfg_rescale", gate: "guidance > 1", scale: "guidance"},
+    latent: {channels: 16, factor: 8, pack: "pack2x2", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "first(vae.cfg.latents_std, vae.wan_std)", add: "first(vae.cfg.latents_mean, vae.wan_mean)"},
+          output: "clamp_pm1"},
+    defaults: {width: 512, height: 512, steps: 50, guidance: 4, multiple: 16},
+    summary: "fmt('Qwen-Image 1 ({denoiser.layers} double-stream blocks, dim {denoiser.dim}), Qwen2.5-VL text encoder + 16-ch VAE')",
+  },
+}

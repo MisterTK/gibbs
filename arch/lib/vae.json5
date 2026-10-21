@@ -178,5 +178,45 @@
       {op: "Conv3d", args: {stride: [1, 1, 1], padding: ["ks[2] - 1", "ks[3] // 2", "ks[4] // 2", 0, "ks[3] // 2", "ks[4] // 2"],
          dilation: [1, 1, 1], groups: 1}, in: ["x", "w:{w}.weight", "w?:{w}.bias"], out: "out"},
     ]},
+    // ---- Wan / Qwen-Image VAE (channel L2-RMS with `.gamma` gains, eps 1e-12) ----
+    // Channel RMS norm of `x` [c, h, w] with gain `{g}`: x / ||x||_c * sqrt(c) * g per pixel
+    // (RmsNorm over channels moved last).
+    wan_rms: {params: ["x"], body: [
+      {let: {c: "shape('x')[0]", hh: "shape('x')[1]", ww: "shape('x')[2]"}},
+      {op: "Reshape", args: {shape: ["c", "hh * ww"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "t"},
+      {op: "RmsNorm", args: {eps: 1e-12}, in: ["t", "w:{g}"], out: "t", name: "rms"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "tb"},
+      {op: "Reshape", args: {shape: ["c", "hh", "ww"]}, in: ["t"], out: "out", name: "unflat"},
+    ]},
+    // Residual block `{p}`: conv2(silu(rms(conv1(silu(rms(x)))))) + (conv_shortcut(x) | x).
+    wan_res: {params: ["x"], body: [
+      {use: "conv", args: {w: "fmt('{p}.conv_shortcut')"}, in: ["x"], out: "skip", name: "shortcut", when: "has(fmt('{p}.conv_shortcut.weight'))"},
+      {use: "wan_rms", args: {g: "fmt('{p}.norm1.gamma')"}, in: ["x"], out: "y", name: "norm1"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["y"], out: "y", name: "silu1"},
+      {use: "conv", args: {w: "fmt('{p}.conv1')"}, in: ["y"], out: "y", name: "conv1"},
+      {use: "wan_rms", args: {g: "fmt('{p}.norm2.gamma')"}, in: ["y"], out: "y", name: "norm2"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["y"], out: "y", name: "silu2"},
+      {use: "conv", args: {w: "fmt('{p}.conv2')"}, in: ["y"], out: "y", name: "conv2"},
+      {op: "Binary", args: {kind: "Add"}, in: ["y", "v?:skip"], out: "out", name: "add", when: "has(fmt('{p}.conv_shortcut.weight'))"},
+      {op: "Binary", args: {kind: "Add"}, in: ["y", "x"], out: "out", name: "add", when: "!has(fmt('{p}.conv_shortcut.weight'))"},
+    ]},
+    // Single-head self-attention `{p}` over all pixels of `x` [c, h, w] (1x1 `to_qkv` / `proj`
+    // kernels as linears), residual.
+    wan_attn: {params: ["x"], body: [
+      {let: {c: "shape('x')[0]", hh: "shape('x')[1]", ww: "shape('x')[2]"}},
+      {use: "wan_rms", args: {g: "fmt('{p}.norm.gamma')"}, in: ["x"], out: "y", name: "norm"},
+      {op: "Reshape", args: {shape: ["c", "hh * ww"]}, in: ["y"], out: "y", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["y"], out: "y", name: "tok"},
+      {op: "Linear", in: ["y", "w:{p}.to_qkv.weight", "w?:{p}.to_qkv.bias"], out: "qkv", name: "qkv"},
+      {op: "Slice", args: {axis: 1, start: 0, end: "c"}, in: ["qkv"], out: "q", name: "q"},
+      {op: "Slice", args: {axis: 1, start: "c", end: "2 * c"}, in: ["qkv"], out: "k", name: "k"},
+      {op: "Slice", args: {axis: 1, start: "2 * c", end: "3 * c"}, in: ["qkv"], out: "v", name: "v"},
+      {op: "Attention", args: {heads: 1, kv_heads: 1, causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{p}.proj.weight", "w?:{p}.proj.bias"], out: "o", name: "proj"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["o"], out: "o", name: "tb"},
+      {op: "Reshape", args: {shape: ["c", "hh", "ww"]}, in: ["o"], out: "o", name: "unflat"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "o"], out: "out", name: "add"},
+    ]},
   },
 }

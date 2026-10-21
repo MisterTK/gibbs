@@ -14,7 +14,7 @@ pub mod gen;
 pub mod load;
 pub mod names;
 pub mod templates;
-#[cfg(test)]
+#[doc(hidden)]
 pub mod testing;
 #[cfg(test)]
 mod tests_encoders_bert;
@@ -54,6 +54,14 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/gpt2.json5", include_str!("../../arch/families/gpt2.json5")),
     ("families/opt.json5", include_str!("../../arch/families/opt.json5")),
     ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
+    ("names/comfy.json5", include_str!("../../arch/names/comfy.json5")),
+    ("families/krea2.json5", include_str!("../../arch/families/krea2.json5")),
+    ("families/qwen_image.json5", include_str!("../../arch/families/qwen_image.json5")),
+    ("families/qwen_image21.json5", include_str!("../../arch/families/qwen_image21.json5")),
+    ("families/qwen_vae.json5", include_str!("../../arch/families/qwen_vae.json5")),
+    ("families/qwen_vae21.json5", include_str!("../../arch/families/qwen_vae21.json5")),
+    ("families/qwen2_5_vl_text.json5", include_str!("../../arch/families/qwen2_5_vl_text.json5")),
+    ("families/zimage.json5", include_str!("../../arch/families/zimage.json5")),
     ("families/sd3.json5", include_str!("../../arch/families/sd3.json5")),
     ("families/gemma2.json5", include_str!("../../arch/families/gemma2.json5")),
     ("families/sana.json5", include_str!("../../arch/families/sana.json5")),

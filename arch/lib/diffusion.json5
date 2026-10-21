@@ -147,5 +147,15 @@
       {op: "Linear", in: ["c", "w:{out_w}.weight", "w?:{out_w}.bias"], out: "o", name: "linear2"},
       {use: "gated_add", in: ["x", "o", "gate"], out: "out", name: "res"},
     ]},
+    // x * (1 + scale) + shift (no norm); needs the constant `one` ([1] = 1).
+    scale_shift: {params: ["x", "shift", "scale"], body: [
+      {op: "Binary", args: {kind: "Add"}, in: ["scale", "c:one"], out: "s", name: "1p"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["x", "s"], out: "x", name: "mul"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "shift"], out: "out", name: "shift"},
+    ]},
+    // Chunk `i` ([1, dim]) of a modulation row `m` [1, k*dim].
+    chunk: {params: ["m"], body: [
+      {op: "Slice", args: {axis: 1, start: "i * dim", end: "(i + 1) * dim"}, in: ["m"], out: "out", name: "c{i}"},
+    ]},
   },
 }

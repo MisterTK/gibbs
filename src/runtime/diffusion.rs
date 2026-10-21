@@ -752,6 +752,11 @@ impl SpecDiffusion {
                     let j = d.join("tokenizer.json");
                     if j.is_file() {
                         crate::model::hf_loader::load_json_tokenizer(&j)?
+                    } else if d.join("vocab.json").is_file() && d.join("merges.txt").is_file() {
+                        // A byte-level BPE folder without tokenizer.json (Qwen-Image's `tokenizer/`).
+                        let built = crate::model::tokenizer::byte_bpe_from_vocab_merges(&d)?;
+                        let json = built.to_string(false).map_err(|e| format!("{}: {e}", d.display()))?;
+                        crate::model::hf_loader::tokenizer_from_files(&json, &|n| std::fs::read(d.join(n)).ok())?
                     } else {
                         crate::model::spm::load(&d.join("spiece.model"))?
                     }

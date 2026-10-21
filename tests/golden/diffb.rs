@@ -79,19 +79,77 @@ fn denorm(x: &[f32], plane: usize, mean: &[f32], std: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+// ---- spec-path helpers ------------------------------------------------------------------------
+
+use gibbs_engine::arch::expr::Val;
+use gibbs_engine::arch::testing::Runner;
+use gibbs_engine::graph::Tensor::{self, F32};
+
+fn num(n: usize) -> Val {
+    Val::Num(n as f64)
+}
+
+/// A spec runner over a fixture directory whose weights are `weights`.
+fn spec_runner(dir: &std::path::Path, weights: &str, family: Option<&str>, dev: Device) -> Runner {
+    let a = gibbs_engine::model::hub::ModelArtifacts {
+        model_id: "test/diffb".into(),
+        local_dir: Some(dir.to_path_buf()),
+        config_path: Some(dir.join("config.json")).filter(|p| p.is_file()),
+        weights_path: Some(dir.join(weights)),
+        is_cached: true,
+        ..Default::default()
+    };
+    Runner::from_artifacts(&a, family, dev, 64).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// diffusers `_pack_latents`: [c, h, w] -> [(h/2)*(w/2), 4c] in (c, py, px) order (the runtime's
+/// `pack2x2`); `unpack` inverts it.
+fn pack2x2(lat: &[f32], c: usize, h: usize, w: usize, unpack: bool) -> Vec<f32> {
+    let mut out = vec![0.0f32; lat.len()];
+    for i in 0..h / 2 {
+        for j in 0..w / 2 {
+            for ch in 0..c {
+                for py in 0..2 {
+                    for px in 0..2 {
+                        let p = ((i * (w / 2) + j) * c + ch) * 4 + py * 2 + px;
+                        let u = (ch * h + 2 * i + py) * w + 2 * j + px;
+                        if unpack { out[u] = lat[p] } else { out[p] = lat[u] }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every checkpoint tensor was read by some instance (or is `ignore`d).
+fn assert_consumed(r: &Runner) {
+    let left = r.unconsumed();
+    assert!(left.is_empty(), "unconsumed tensors: {left:?}");
+}
+
+/// Output `out` of `component` (f32).
+fn run1(r: &mut Runner, component: &str, vars: &[(&str, Val)], ins: Vec<Tensor>, out: &str) -> Vec<f32> {
+    let mut o = r.run(component, vars, ins).unwrap_or_else(|e| panic!("{e}"));
+    match o.remove(out) {
+        Some(F32(v)) => v,
+        other => panic!("output `{out}`: {other:?}"),
+    }
+}
+
 /// Z-Image S3-DiT (`ZImageTransformer2DModel`): 2 noise refiners, 2 context refiners, 2 layers,
 /// dim 64 / 2 heads, axes [8, 12, 12]; one forward with caption/image padding (21 -> 32 caption,
 /// 36 -> 64 patches) and one without.
-#[test]
-fn zimage() {
-    use gibbs_engine::model::zimage::ZDit;
+const ZIMAGE_CASES: [(usize, usize, usize, f32); 2] = [(12, 12, 21, 0.7), (16, 16, 32, 0.25)];
+
+fn zimage_fixture(case: &str) -> std::path::PathBuf {
     const DIM: usize = 64;
     const HD: usize = 32;
     const CAP: usize = 48;
     const IN: usize = 4;
     const ADA: usize = 64;
     const FF: usize = 128;
-    let dir = fixture_dir("diffb_zimage");
+    let dir = fixture_dir(case);
     let mut s = Spec::new();
     for (fam, modulated) in [
         ("noise_refiner", true),
@@ -141,14 +199,19 @@ fn zimage() {
             "rope_theta": 256.0
         }),
     );
-    let dit = ZDit::load(&dir).expect("Z-Image fixture");
+    dir
+}
+
+#[test]
+fn zimage() {
+    use gibbs_engine::model::zimage::ZDit;
+    const CAP: usize = 48;
+    const IN: usize = 4;
+    let dit = ZDit::load(&zimage_fixture("diffb_zimage")).expect("Z-Image fixture");
     // runner: internal gibbs_engine::model::zimage::ZDit::{forward, forward_gpu}
     golden("diffb_zimage", TOL, |dev| {
         let mut o = Out::default();
-        for (k, (h, w, n_cap, sigma)) in [(12usize, 12usize, 21usize, 0.7f32), (16, 16, 32, 0.25)]
-            .into_iter()
-            .enumerate()
-        {
+        for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
             let lat = rnd(10 + k as u64, IN * h * w, 1.0);
             let cap = rnd(20 + k as u64, n_cap * CAP, 1.0);
             let y = if metal(dev) {
@@ -162,17 +225,55 @@ fn zimage() {
     });
 }
 
+/// The `zimage` spec's `denoiser` on the same fixture.
+#[test]
+fn zimage_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    const CAP: usize = 48;
+    const IN: usize = 4;
+    let dir = zimage_fixture("diffb_zimage_spec");
+    golden("diffb_zimage", TOL, |dev| {
+        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev);
+        let mut o = Out::default();
+        for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
+            let lat = rnd(10 + k as u64, IN * h * w, 1.0);
+            let cap = rnd(20 + k as u64, n_cap * CAP, 1.0);
+            r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+            let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n_cap))];
+            let y = run1(&mut r, "denoiser", &vars, vec![F32(lat), F32(cap)], "out");
+            o.f(format!("out_{h}x{w}_cap{n_cap}_s{sigma}"), &y);
+        }
+        assert_consumed(&r);
+        o
+    });
+}
+
 /// Qwen-Image 1 double-stream MMDiT (`QwenImageTransformer2DModel`): 2 blocks, dim 64 / 2 heads,
 /// axes [8, 12, 12], 64 packed latent features, text width 48; an odd 5x7 patch grid, 21 tokens.
 #[test]
 fn qwen_image_v1() {
+    qwen_image_v1_run(false)
+}
+
+/// The `qwen_image` spec's `denoiser` on the same fixture.
+#[test]
+fn qwen_image_v1_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    qwen_image_v1_run(true)
+}
+
+fn qwen_image_v1_run(spec: bool) {
     use gibbs_engine::model::qwen_image_v1::{positions, Dit, Rope};
     const D: usize = 64;
     const HD: usize = 32;
     const FF: usize = 128;
     const TW: usize = 48;
     const IN: usize = 64;
-    let dir = fixture_dir("diffb_qwen_image_v1");
+    let dir = fixture_dir(if spec { "diffb_qwen_image_v1_spec" } else { "diffb_qwen_image_v1" });
     let mut s = Spec::new();
     lin(&mut s, "img_in", D, IN, true);
     sp(&mut s, "txt_norm.weight", &[TW]);
@@ -211,21 +312,31 @@ fn qwen_image_v1() {
         "joint_attention_dim": TW, "guidance_embeds": false, "axes_dims_rope": [8, 12, 12]
     });
     write_json(&dir.join("config.json"), &cfg);
-    let dit = Dit::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 1 fixture");
+    let dit = (!spec).then(|| Dit::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 1 fixture"));
     let (ph, pw, nt) = (5usize, 7usize, 21usize);
     let lat = rnd(11, ph * pw * IN, 1.0);
     let txt = rnd(12, nt * TW, 1.0);
     // runner: internal gibbs_engine::model::qwen_image_v1::Dit::{project_text, forward, forward_gpu}
     golden("diffb_qwen_image_v1", TOL, |dev| {
         let mut o = Out::default();
+        let mut r = spec.then(|| spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev));
         for sigma in [0.8f32, 0.15] {
-            let y = if metal(dev) {
+            let y = if let Some(r) = &mut r {
+                r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+                let vars = [("h", num(2 * ph)), ("w", num(2 * pw)), ("nt", num(nt))];
+                run1(r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out")
+            } else if metal(dev) {
+                let dit = dit.as_ref().unwrap();
                 dit.forward_gpu(&dit.gpu, &lat, &txt, ph, pw, sigma).unwrap()
             } else {
+                let dit = dit.as_ref().unwrap();
                 let rope = Rope::new(&positions(nt, ph, pw), &dit.axes);
                 dit.forward(&lat, &dit.project_text(&txt, nt), &rope, sigma)
             };
             o.f(format!("out_s{sigma}"), &y);
+        }
+        if let Some(r) = &r {
+            assert_consumed(r);
         }
         o
     });
@@ -236,6 +347,19 @@ fn qwen_image_v1() {
 /// with the SwiGLU's gate/up fused (`img_mlp.gate_up`, as some GGUFs store them) give `fused_*`.
 #[test]
 fn qwen_image21() {
+    qwen_image21_run(false)
+}
+
+/// The `qwen_image21` spec's `denoiser` on the same fixtures (split and fused).
+#[test]
+fn qwen_image21_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    qwen_image21_run(true)
+}
+
+fn qwen_image21_run(spec: bool) {
     use gibbs_engine::model::qwen_image21::{t2i_positions, Dit21, Rope};
     const D: usize = 64;
     const HD: usize = 32;
@@ -289,12 +413,14 @@ fn qwen_image21() {
         "num_layers": 2, "attention_head_dim": HD, "num_attention_heads": 2,
         "joint_attention_dim": TW, "causal_condition": true, "axes_dims_rope": [8, 12, 12]
     });
+    let sfx = if spec { "_spec" } else { "" };
     let load = |case: &str, t: &[T]| {
-        let dir = fixture_dir(case);
+        let dir = fixture_dir(&format!("{case}{sfx}"));
         let file = dir.join("diffusion_pytorch_model.safetensors");
         write_st(&file, t);
         write_json(&dir.join("config.json"), &cfg);
-        Dit21::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 2.1 fixture")
+        let dit = (!spec).then(|| Dit21::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 2.1 fixture"));
+        (dir, dit)
     };
     let dits = [
         ("split", load("diffb_qwen_image21", &split)),
@@ -306,15 +432,25 @@ fn qwen_image21() {
     // runner: internal gibbs_engine::model::qwen_image21::Dit21::{project_text, forward, forward_gpu}
     golden("diffb_qwen_image21", TOL, |dev| {
         let mut o = Out::default();
-        for (name, dit) in &dits {
+        for (name, (dir, dit)) in &dits {
+            let mut r = spec.then(|| spec_runner(dir, "diffusion_pytorch_model.safetensors", None, dev));
             for sigma in [0.8f32, 0.15] {
-                let y = if metal(dev) {
+                let y = if let Some(r) = &mut r {
+                    r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+                    let vars = [("h", num(h)), ("w", num(w)), ("nt", num(nt))];
+                    run1(r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out")
+                } else if metal(dev) {
+                    let dit = dit.as_ref().unwrap();
                     dit.forward_gpu(&dit.gpu, &lat, &txt, h, w, sigma).unwrap()
                 } else {
+                    let dit = dit.as_ref().unwrap();
                     let rope = Rope::new(&t2i_positions(nt, h, w), &dit.axes);
                     dit.forward(&lat, &dit.project_text(&txt, nt), &rope, sigma)
                 };
                 o.f(format!("{name}_s{sigma}"), &y);
+            }
+            if let Some(r) = &r {
+                assert_consumed(r);
             }
         }
         o
@@ -325,9 +461,22 @@ fn qwen_image21() {
 /// taps of width 32) and the 2-block DiT (dim 64, 4 query / 2 kv heads of 16, 16 latent channels).
 #[test]
 fn krea2() {
-    use gibbs_engine::model::krea2::Dit;
+    krea2_run(false)
+}
+
+/// The `krea2` spec's `fuse` + `denoiser` on the same fixture.
+#[test]
+fn krea2_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    krea2_run(true)
+}
+
+/// The tiny Krea 2 checkpoint `krea2_tiny.safetensors` in fixture dir `case`.
+fn krea2_fixture(case: &str) -> std::path::PathBuf {
     let (dim, hd, kv, mlp, td, tmlp) = (64usize, 16usize, 32usize, 96usize, 32usize, 48usize);
-    let dir = fixture_dir("diffb_krea2");
+    let dir = fixture_dir(case);
     let mut s = Spec::new();
     lin(&mut s, "first", dim, 64, true);
     lin(&mut s, "tmlp.0", dim, 16, true);
@@ -369,7 +518,15 @@ fn krea2() {
     }
     let file = dir.join("krea2_tiny.safetensors");
     write_st(&file, &synth(4, &s));
-    let dit = Dit::load(&file, &mut Loras::default(), &Value::Null).expect("Krea 2 fixture");
+    dir
+}
+
+fn krea2_run(spec: bool) {
+    use gibbs_engine::model::krea2::Dit;
+    let td = 32usize;
+    let dir = krea2_fixture(if spec { "diffb_krea2_spec" } else { "diffb_krea2" });
+    let file = dir.join("krea2_tiny.safetensors");
+    let dit = (!spec).then(|| Dit::load(&file, &mut Loras::default(), &Value::Null).expect("Krea 2 fixture"));
     let n = 24usize;
     let taps: Vec<Vec<f32>> = (0..12).map(|l| rnd(100 + l, n * td, 1.0)).collect();
     let (h, w) = (12usize, 12usize);
@@ -377,6 +534,22 @@ fn krea2() {
     // runner: internal gibbs_engine::model::krea2::Dit::{fuse, forward, fuse_gpu, forward_gpu}
     golden("diffb_krea2", TOL, |dev| {
         let mut o = Out::default();
+        if spec {
+            let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), dev);
+            // Taps stacked per token, layer-minor (the runtime's context layout).
+            let stacked: Vec<f32> = (0..n).flat_map(|t| taps.iter().flat_map(move |l| l[t * td..][..td].iter().copied())).collect();
+            let ctx = run1(&mut r, "fuse", &[("nt", num(n))], vec![F32(stacked)], "out");
+            o.f("fuse", &ctx);
+            for sigma in [0.8f32, 0.3] {
+                r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+                let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
+                let y = run1(&mut r, "denoiser", &vars, vec![F32(pack2x2(&lat, 16, h, w, false)), F32(ctx.clone())], "out");
+                o.f(format!("forward_s{sigma}"), &pack2x2(&y, 16, h, w, true));
+            }
+            assert_consumed(&r);
+            return o;
+        }
+        let dit = dit.as_ref().unwrap();
         let ctx = if metal(dev) {
             dit.fuse_gpu(&dit.gpu_fuse, &taps, n).unwrap()
         } else {
@@ -460,10 +633,23 @@ fn ltx() {
 /// 16 latent channels: `latents * std + mean` of a 3x2 latent -> `[3, 24, 16]` before clamping.
 #[test]
 fn qwen_vae() {
+    qwen_vae_run(false)
+}
+
+/// The `qwen_vae` spec's `decoder` on the same fixture.
+#[test]
+fn qwen_vae_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    qwen_vae_run(true)
+}
+
+fn qwen_vae_run(spec: bool) {
     use gibbs_engine::model::qwen_vae::QwenVae;
     const Z: usize = 16;
     let (base, mult) = (4usize, [1usize, 2, 4, 4]);
-    let dir = fixture_dir("diffb_qwen_vae");
+    let dir = fixture_dir(if spec { "diffb_qwen_vae_spec" } else { "diffb_qwen_vae" });
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -517,15 +703,23 @@ fn qwen_vae() {
     );
     // runner: internal gibbs_engine::model::qwen_vae::QwenVae::{open, decode_cpu, decode_gpu}
     // (`QwenVae::load` only accepts the 96-wide production config).
-    let vae = QwenVae::open(&Mw::open(&file).unwrap(), mean.clone(), std.clone(), base)
-        .expect("Qwen VAE fixture");
+    let vae = (!spec).then(|| {
+        QwenVae::open(&Mw::open(&file).unwrap(), mean.clone(), std.clone(), base).expect("Qwen VAE fixture")
+    });
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(13, Z * h * w, 1.0), h * w, &mean, &std);
     golden("diffb_qwen_vae", TOL, |dev| {
-        let y = if metal(dev) {
+        let vae = vae.as_ref();
+        let y = if spec {
+            let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
+            let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+            assert_consumed(&r);
+            y
+        } else if metal(dev) {
+            let vae = vae.unwrap();
             vae.decode_gpu(&z, h, w).unwrap()
         } else {
-            vae.decode_cpu(&z, h, w)
+            vae.unwrap().decode_cpu(&z, h, w)
         };
         let mut o = Out::default();
         o.f("decode_3x2", &sub(&y));
@@ -537,9 +731,22 @@ fn qwen_vae() {
 /// 6 latent channels, temporal flags [true, false, true]: a 3x2 latent -> RGBA `[4, 24, 16]`.
 #[test]
 fn qwen_vae21() {
+    qwen_vae21_run(false)
+}
+
+/// The `qwen_vae21` spec's `decoder` on the same fixture.
+#[test]
+fn qwen_vae21_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    qwen_vae21_run(true)
+}
+
+fn qwen_vae21_run(spec: bool) {
     use gibbs_engine::model::qwen_vae21::QwenVae21;
     let (mult, base, zc) = ([1usize, 2, 2, 4], 4usize, 6usize);
-    let dir = fixture_dir("diffb_qwen_vae21");
+    let dir = fixture_dir(if spec { "diffb_qwen_vae21_spec" } else { "diffb_qwen_vae21" });
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -589,15 +796,22 @@ fn qwen_vae21() {
             "latents_mean": mean, "latents_std": std
         }),
     );
-    let vae = QwenVae21::load(&dir).expect("Qwen VAE 2.1 fixture");
+    let vae = (!spec).then(|| QwenVae21::load(&dir).expect("Qwen VAE 2.1 fixture"));
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(14, zc * h * w, 1.0), h * w, &mean, &std);
     // runner: internal gibbs_engine::model::qwen_vae21::QwenVae21::{decode_cpu, decode_gpu}
     golden("diffb_qwen_vae21", TOL, |dev| {
-        let (y, oh, ow) = if metal(dev) {
-            vae.decode_gpu(&z, h, w).unwrap()
+        let (y, oh, ow) = if spec {
+            let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
+            let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+            assert_consumed(&r);
+            let n = y.len() / 4;
+            let s = ((n / (h * w)) as f64).sqrt() as usize;
+            (y, s * h, s * w)
+        } else if metal(dev) {
+            vae.as_ref().unwrap().decode_gpu(&z, h, w).unwrap()
         } else {
-            vae.decode_cpu(&z, h, w)
+            vae.as_ref().unwrap().decode_cpu(&z, h, w)
         };
         assert_eq!((oh, ow), (8 * h, 8 * w)); // 3 upsamplers in this tiny config
         let mut o = Out::default();
@@ -834,4 +1048,173 @@ fn unet3d() {
         }
         o
     });
+}
+
+/// The `qwen_image21` spec on the real Qwen-Image 2.1 Q4_0 GGUF (one denoiser step, 4x4 latent
+/// grid, 12 text rows) against the old `Dit21::forward_gpu` output captured before its deletion
+/// (`diffb_qwen_image21_real.json`, from `real_gguf_step_matches_cpu`). Needs the ~4 GB file.
+#[test]
+#[ignore]
+fn qwen_image21_real_gguf_spec() {
+    // `dit_graph::fixture::rand`, the old test's inputs.
+    fn rand(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+            })
+            .collect()
+    }
+    let path = std::path::PathBuf::from(std::env::var("GIBBS_QWEN21_TRANSFORMER").unwrap_or_else(|_| {
+        "/Users/keas/code/rust-inference-server/disk/models--abenzerps--Qwen-Image-2.1-Uncensored-GGUF/snapshots/main/qwen-image-2.1-UC-Q4_0.gguf".into()
+    }));
+    let want: Vec<f32> = serde_json::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/diffb_qwen_image21_real.json")).unwrap(),
+    )
+    .unwrap();
+    let mut r = spec_runner(path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap(), Some("qwen_image21"), Device::Metal);
+    let var = |r: &Runner, k: &str| r.model.env.var(k).unwrap().usize().unwrap();
+    let (in_ch, tw) = (var(&r, "in_ch"), var(&r, "text_width"));
+    let (h, w, nt) = (4usize, 4usize, 12usize);
+    r.step = vec![("sigma".into(), Val::Num(0.7f32 as f64))];
+    let got = run1(
+        &mut r,
+        "denoiser",
+        &[("h", num(h)), ("w", num(w)), ("nt", num(nt))],
+        vec![F32(rand(h * w * in_ch, 21, 1.0)), F32(rand(nt * tw, 22, 1.0))],
+        "out",
+    );
+    let (e, c) = gibbs_engine::arch::testing::compare(&got, &want);
+    eprintln!("qwen_image21 real GGUF spec vs old Metal: rel {e:.3e} cos {c:.7}");
+    assert!(e < 1e-3 && c > 0.9999, "rel {e} cos {c}");
+}
+
+/// Qwen2.5-VL text tower (`model.language_model.*`, qkv biases, GQA 4/2 heads of 16, 2 layers) as
+/// Qwen-Image 1's text encoder: the final-normed hidden states of 11 tokens.
+#[test]
+fn qwen2_5_vl_text() {
+    qwen2_5_vl_text_run(false)
+}
+
+/// The `qwen2_5_vl_text` spec's `text` component (head `hidden`) on the same fixture.
+#[test]
+fn qwen2_5_vl_text_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
+    qwen2_5_vl_text_run(true)
+}
+
+fn qwen2_5_vl_text_run(spec: bool) {
+    let (d, ff, v) = (64usize, 128usize, 32usize);
+    let dir = fixture_dir(if spec { "diffb_qwen2_5_vl_text_spec" } else { "diffb_qwen2_5_vl_text" });
+    let mut s = Spec::new();
+    let p = "model.language_model";
+    sp(&mut s, format!("{p}.embed_tokens.weight"), &[v, d]);
+    for i in 0..2 {
+        let l = format!("{p}.layers.{i}");
+        sp(&mut s, format!("{l}.input_layernorm.weight"), &[d]);
+        lin(&mut s, &format!("{l}.self_attn.q_proj"), d, d, true);
+        lin(&mut s, &format!("{l}.self_attn.k_proj"), 32, d, true);
+        lin(&mut s, &format!("{l}.self_attn.v_proj"), 32, d, true);
+        lin(&mut s, &format!("{l}.self_attn.o_proj"), d, d, false);
+        sp(&mut s, format!("{l}.post_attention_layernorm.weight"), &[d]);
+        lin(&mut s, &format!("{l}.mlp.gate_proj"), ff, d, false);
+        lin(&mut s, &format!("{l}.mlp.up_proj"), ff, d, false);
+        lin(&mut s, &format!("{l}.mlp.down_proj"), d, ff, false);
+    }
+    sp(&mut s, format!("{p}.norm.weight"), &[d]);
+    write_st(&dir.join("model.safetensors"), &synth(8, &s));
+    write_json(
+        &dir.join("config.json"),
+        &json!({"model_type": "qwen2_5_vl", "text_config": {"hidden_size": d, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": ff, "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0, "vocab_size": v, "tie_word_embeddings": false}}),
+    );
+    let ids: Vec<u32> = (0..11).map(|i| (i * 7 + 3) % v as u32).collect();
+    // runner: internal gibbs_engine::model::qwen3_5::Qwen3Encoder::hidden_states_normed (CPU only)
+    golden("diffb_qwen2_5_vl_text", TOL, |dev| {
+        let y = if spec {
+            let mut r = spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev);
+            let y = r.lm(&ids, 0, "hidden", "hidden", vec![]);
+            assert_consumed(&r);
+            y
+        } else {
+            let _cpu = gibbs_engine::hardware::cpu_compute::allow();
+            gibbs_engine::model::qwen3_5::Qwen3Encoder::open(&dir).unwrap().hidden_states_normed(&ids).unwrap()
+        };
+        let mut o = Out::default();
+        o.f("hidden", &y);
+        o
+    });
+}
+
+/// The pipeline `runtime` sections of the image families deserialize as `runtime::diffusion`
+/// reads them.
+#[test]
+fn dit_runtimes_parse() {
+    let reg = gibbs_engine::arch::registry().unwrap();
+    for f in ["zimage", "qwen_image", "qwen_image21", "krea2"] {
+        let spec = reg.spec(f, &Default::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+        spec.runtime_as::<gibbs_engine::runtime::diffusion::Runtime>()
+            .unwrap_or_else(|e| panic!("{f}: {e}"));
+    }
+}
+
+/// Old `krea2::Dit` + `Loras` output on the `pair` LoRA (spec matched it at rel 1.95e-7 before
+/// the old code was deleted): every 64th of `sub(out)`.
+#[rustfmt::skip]
+const KREA2_LORA_PIN: [f32; 36] = [0.6458024, -0.68495977, 1.2038748, 0.78530777, -0.8388921, -0.30057698, -0.5283634, -1.3309352, -0.6637603, 0.857429, 1.5352197, -1.841813, -0.32170674, 0.8646051, 1.4135798, -1.467209, -0.14866997, -0.3009609, 0.8847723, -0.25245777, -0.008546151, 0.94894725, -0.026348034, -0.5299631, 0.60384136, -0.54123783, 0.68916553, -0.18912089, -0.037548088, -0.48464662, 0.20832507, 0.7079825, 0.28712678, 1.2895193, -0.23603027, 0.6485835];
+
+/// Krea 2 LoRA files through the shared `LoraFile` loader on the spec path (original/ComfyUI key
+/// forms under `diffusion_model.`): a low-rank pair changes the output, a `.diff_b` bias delta
+/// alone (zero up weight) changes it too, and a module naming a block the model lacks is an error.
+#[test]
+fn krea2_spec_lora() {
+    use gibbs_engine::model::lora::{LoraFile, Part};
+    let dir = krea2_fixture("diffb_krea2_lora");
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let (h, w, n) = (12usize, 12usize, 24usize);
+    let lat = pack2x2(&rnd(7, 16 * h * w, 1.0), 16, h, w, false);
+    let ctx = rnd(8, n * 64, 1.0);
+    let lora = |name: &str, t: Vec<T>| {
+        let p = dir.join(name);
+        write_st(&p, &t);
+        LoraFile::open(&p).unwrap()
+    };
+    let pair = |m: &str, up: f32| -> Vec<T> {
+        vec![
+            (format!("diffusion_model.{m}.lora_down.weight"), vec![4, 64], rnd(30, 4 * 64, 0.5)),
+            (format!("diffusion_model.{m}.lora_up.weight"), vec![64, 4], rnd(31, 64 * 4, up)),
+        ]
+    };
+    let forward = |l: Option<&LoraFile>| -> Vec<f32> {
+        let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
+        if let Some(l) = l {
+            assert_eq!(l.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap(), 1);
+        }
+        r.step = vec![("sigma".into(), Val::Num(0.5))];
+        let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
+        run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(ctx.clone())], "out")
+    };
+    let base = forward(None);
+    // Parity of the low-rank pair against the old Krea 2 LoRA loader (pinned: subsampled output of
+    // `krea2::Dit::load` + `Loras::add_file` on this fixture, captured before its deletion).
+    let pair_file = lora("pair.safetensors", pair("blocks.1.attn.wq", 0.5));
+    let got = forward(Some(&pair_file));
+    let pin = sub(&got).iter().step_by(64).copied().collect::<Vec<f32>>();
+    let (e, c) = gibbs_engine::arch::testing::compare(&pin, &KREA2_LORA_PIN);
+    assert!(e < 1e-3 && c > 0.9999, "LoRA vs pinned old output: rel {e} cos {c}");
+    let changed = |y: &[f32]| y.iter().zip(&base).any(|(a, b)| (a - b).abs() > 1e-4);
+    assert!(changed(&got));
+    let mut bias = pair("first", 0.0);
+    bias.push(("diffusion_model.first.diff_b".into(), vec![64], rnd(32, 64, 0.5)));
+    assert!(changed(&forward(Some(&lora("bias.safetensors", bias)))), "diff_b bias delta not applied");
+    let stray = lora("stray.safetensors", pair("blocks.9.attn.wq", 0.5));
+    let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
+    let e = stray.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap_err();
+    assert!(e.contains("matches no weight"), "{e}");
 }
