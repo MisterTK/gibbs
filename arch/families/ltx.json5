@@ -1,0 +1,140 @@
+// LTX-Video transformer (`LTXVideoTransformer3DModel`; original LTX/ComfyUI names renamed to
+// diffusers). One forward per (latent grid, text tokens, clean tokens): the first `clean` tokens
+// (image conditioning) run at timestep 0, the rest at t, so adaLN modulation is applied per span.
+// Caller inputs: `x [rows, 128]` latent tokens, `context [nt, caption width]` raw T5 tokens and
+// `t_feat [spans, 256]` timestep sinusoids (flip_sin_to_cos, one row per span: clean span t=0
+// first, then t); the 3-axis RoPE tables are generated.
+{
+  family: "ltx",
+  match: {diffusers_class: ["LTXVideoTransformer3DModel"]},
+  pipeline: "video",
+  use_lib: ["video"],
+  config: {
+    d: "shape('proj_in.weight')[0]",
+    latent: "shape('proj_in.weight')[1]",
+    heads: "32",
+    layers: "count('transformer_blocks.{k}.attn1.to_q.weight')",
+    fps: "25",
+  },
+  checks: [
+    {expr: "latent != 128 || d % heads != 0", error: "LTX-Video transformer: proj_in is {d}x{latent}, expected d x 128"},
+    {expr: "layers == 0", error: "LTX-Video transformer: no transformer blocks"},
+  ],
+  names: {rules: [
+    ["patchify_proj.{s:*}", "proj_in.{s}"],
+    ["adaln_single.{s:*}", "time_embed.{s}"],
+    ["transformer_blocks.{i}.{a:*}.q_norm.weight", "transformer_blocks.{i}.{a}.norm_q.weight"],
+    ["transformer_blocks.{i}.{a:*}.k_norm.weight", "transformer_blocks.{i}.{a}.norm_k.weight"],
+  ]},
+  transforms: [
+    // Linear weights are bf16 (f32 checkpoints rounded, as the reference loader stores them).
+    {tensor: "{n:*}.weight", op: "round_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
+    {tensor: "transformer_blocks.{i}.scale_shift_table", op: "to_f32"},
+    {tensor: "transformer_blocks.{i}.scale_shift_table", op: "reshape", args: {shape: [1, "6 * d"]}},
+    {tensor: "scale_shift_table", op: "to_f32"},
+  ],
+  constants: {
+    one: {gen: "ones", args: {shape: [1]}},
+    ones: {gen: "ones", args: {shape: ["d"]}},
+  },
+  macros: {
+    // `norm(x) * (1 + scale) + shift` per span, shift/scale = chunks `i`/`j` of the `[spans, 6d]` table.
+    span_mod: {params: ["x", "m"], body: [
+      {op: "Slice", args: {axis: 1, start: "i * d", end: "(i + 1) * d"}, in: ["m"], out: "sh", name: "sh"},
+      {op: "Slice", args: {axis: 1, start: "j * d", end: "(j + 1) * d"}, in: ["m"], out: "sc", name: "sc"},
+      {use: "modulate", in: ["x", "sh", "sc"], out: "out", name: "m0", when: "ns == 1"},
+      {block: [
+        {repeat: "s", count: 2, body: [
+          {op: "Slice", args: {axis: 0, start: "s == 0 ? 0 : clean", end: "s == 0 ? clean : rows"}, in: ["x"], out: "x{s}", name: "rows{s}"},
+          {op: "Slice", args: {axis: 0, start: "s", end: "s + 1"}, in: ["sh"], out: "sh{s}", name: "sh{s}"},
+          {op: "Slice", args: {axis: 0, start: "s", end: "s + 1"}, in: ["sc"], out: "sc{s}", name: "sc{s}"},
+          {use: "modulate", in: ["x{s}", "sh{s}", "sc{s}"], out: "y{s}", name: "m{s}"},
+        ]},
+        {op: "Concat", args: {axis: 0}, in: ["y0", "y1"], out: "out", name: "cat"},
+      ], when: "ns == 2"},
+    ]},
+    // `x + gate * y` per span, gate = chunk `i` of the table.
+    span_gate: {params: ["x", "y", "m"], body: [
+      {op: "Slice", args: {axis: 1, start: "i * d", end: "(i + 1) * d"}, in: ["m"], out: "g", name: "g"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["y", "g"], out: "gy", name: "gm0", when: "ns == 1"},
+      {block: [
+        {repeat: "s", count: 2, body: [
+          {op: "Slice", args: {axis: 0, start: "s == 0 ? 0 : clean", end: "s == 0 ? clean : rows"}, in: ["y"], out: "y{s}", name: "rows{s}"},
+          {op: "Slice", args: {axis: 0, start: "s", end: "s + 1"}, in: ["g"], out: "g{s}", name: "g{s}"},
+          {op: "Binary", args: {kind: "Mul"}, in: ["y{s}", "g{s}"], out: "gy{s}", name: "gm{s}"},
+        ]},
+        {op: "Concat", args: {axis: 0}, in: ["gy0", "gy1"], out: "gy", name: "gy"},
+      ], when: "ns == 2"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "gy"], out: "out", name: "add"},
+    ]},
+    // q/k/v (q/k RMS-normed, optionally rotated), attention, out projection.
+    attn: {params: ["h", "kv", "cos", "sin"], body: [
+      {use: "lin", args: {w: "fmt('{a}.to_q')"}, in: ["h"], out: "q", name: "q"},
+      {use: "lin", args: {w: "fmt('{a}.to_k')"}, in: ["kv"], out: "k", name: "k"},
+      {use: "lin", args: {w: "fmt('{a}.to_v')"}, in: ["kv"], out: "v", name: "v"},
+      {op: "RmsNorm", args: {eps: 1e-5}, in: ["q", "w:{a}.norm_q.weight"], out: "q", name: "qnorm"},
+      {op: "RmsNorm", args: {eps: 1e-5}, in: ["k", "w:{a}.norm_k.weight"], out: "k", name: "knorm"},
+      {use: "pair_rope", in: ["q", "cos", "sin"], out: "q", name: "rq", when: "rot"},
+      {use: "pair_rope", in: ["k", "cos", "sin"], out: "k", name: "rk", when: "rot"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "o", name: "attn"},
+      {use: "lin", args: {w: "fmt('{a}.to_out.0')"}, in: ["o"], out: "out", name: "o"},
+    ]},
+  },
+  components: {
+    denoiser: {
+      vars: ["frames", "h", "w", "nt", "clean"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["frames * h * w", "latent"]},
+        {name: "context", dtype: "f32", shape: ["nt", "shape('caption_projection.linear_1.weight')[1]"]},
+        {name: "rope.cos", dtype: "f32", shape: ["frames * h * w", "d"], gen: "video_rope_cos_sin",
+         args: {frames: "frames", grid_h: "h", grid_w: "w", fps: "fps", dim: "d", output: "'cos'"}},
+        {name: "rope.sin", dtype: "f32", shape: ["frames * h * w", "d"], gen: "video_rope_cos_sin",
+         args: {frames: "frames", grid_h: "h", grid_w: "w", fps: "fps", dim: "d", output: "'sin'", pair_sign: true}},
+        {name: "t_feat", dtype: "f32", shape: ["clean > 0 && clean < frames * h * w ? 2 : 1", 256]},
+      ],
+      body: [
+        {let: {rows: "frames * h * w"}},
+        {let: {ns: "clean > 0 && clean < rows ? 2 : 1"}},
+        // PixArtAlphaTextProjection: linear, tanh-GELU, linear.
+        {use: "lin", args: {w: "'caption_projection.linear_1'"}, in: ["i:context"], out: "c", name: "caption.1"},
+        {op: "Unary", args: {kind: "GeluTanh"}, in: ["c"], out: "c", name: "caption.act"},
+        {use: "lin", args: {w: "'caption_projection.linear_2'"}, in: ["c"], out: "ctx", name: "caption.2"},
+        // AdaLayerNormSingle: emb [spans, d], temb [spans, 6d].
+        {use: "lin", args: {w: "'time_embed.emb.timestep_embedder.linear_1'"}, in: ["i:t_feat"], out: "e", name: "time.1"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["e"], out: "e", name: "time.act"},
+        {use: "lin", args: {w: "'time_embed.emb.timestep_embedder.linear_2'"}, in: ["e"], out: "emb", name: "time.2"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["emb"], out: "e", name: "time.silu"},
+        {use: "lin", args: {w: "'time_embed.linear'"}, in: ["e"], out: "temb", name: "time.ada"},
+        {use: "lin", args: {w: "'proj_in'"}, in: ["i:x"], out: "x", name: "proj_in"},
+        {repeat: "l", count: "layers", body: [
+          {let: {b: "fmt('transformer_blocks.{l}')"}},
+          {op: "Binary", args: {kind: "Add"}, in: ["w:{b}.scale_shift_table", "temb"], out: "m", name: "blk{l}.m"},
+          {op: "RmsNorm", args: {eps: 1e-6}, in: ["x", "c:ones"], out: "h", name: "blk{l}.n1.rms"},
+          {use: "span_mod", args: {i: 0, j: 1}, in: ["h", "m"], out: "h", name: "blk{l}.n1"},
+          {use: "attn", args: {a: "fmt('{b}.attn1')", rot: true}, in: ["h", "h", "i:rope.cos", "i:rope.sin"], out: "a", name: "blk{l}.a1"},
+          {use: "span_gate", args: {i: 2}, in: ["x", "a", "m"], out: "x", name: "blk{l}.r1"},
+          // Cross-attention reads the raw residual stream and is added ungated.
+          {use: "attn", args: {a: "fmt('{b}.attn2')", rot: false}, in: ["x", "ctx"], out: "y", name: "blk{l}.a2"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "y"], out: "x", name: "blk{l}.r2"},
+          {op: "RmsNorm", args: {eps: 1e-6}, in: ["x", "c:ones"], out: "h", name: "blk{l}.n2.rms"},
+          {use: "span_mod", args: {i: 3, j: 4}, in: ["h", "m"], out: "h", name: "blk{l}.n2"},
+          {use: "lin", args: {w: "fmt('{b}.ff.net.0.proj')"}, in: ["h"], out: "f", name: "blk{l}.ff1"},
+          {op: "Unary", args: {kind: "GeluTanh"}, in: ["f"], out: "f", name: "blk{l}.gelu"},
+          {use: "lin", args: {w: "fmt('{b}.ff.net.2')"}, in: ["f"], out: "f", name: "blk{l}.ff2"},
+          {use: "span_gate", args: {i: 5}, in: ["x", "f", "m"], out: "x", name: "blk{l}.r3"},
+        ]},
+        // Output shift/scale: scale_shift_table[0|1] + emb.
+        {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["w:scale_shift_table"], out: "r0", name: "out.sst0"},
+        {op: "Slice", args: {axis: 0, start: 1, end: 2}, in: ["w:scale_shift_table"], out: "r1", name: "out.sst1"},
+        {op: "Binary", args: {kind: "Add"}, in: ["r0", "emb"], out: "sh", name: "out.shift"},
+        {op: "Binary", args: {kind: "Add"}, in: ["r1", "emb"], out: "sc", name: "out.scale"},
+        {op: "Concat", args: {axis: 1}, in: ["sh", "sc"], out: "om", name: "out.m"},
+        {op: "LayerNorm", args: {eps: 1e-6}, in: ["x", "c:ones"], out: "h", name: "out.ln"},
+        {use: "span_mod", args: {i: 0, j: 1}, in: ["h", "om"], out: "h", name: "out"},
+        {use: "lin", args: {w: "'proj_out'"}, in: ["h"], out: "v", name: "proj_out"},
+      ],
+      outputs: ["v"],
+    },
+  },
+  runtime: {fps: 25},
+}

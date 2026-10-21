@@ -462,7 +462,10 @@ fn text_then_centered_grid(a: &Args) -> Result<Gen, String> {
 /// (`output`: `cos` or `sin`). Per axis `dim/6` freqs `theta^(j/(n-1)) * pi/2` times
 /// `2 * pos * axis_scale / base - 1`, axes interleaved, each angle twice, `dim % 6` leading
 /// identity entries. Args: `frames`, `grid_h`, `grid_w`, `fps`, `dim`, `theta` (10000),
-/// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32).
+/// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32),
+/// `pair_sign` (false; true negates the even entry of every pair: `[-sin, +sin]` for a
+/// `x*cos + swap(x)*sin` rotation in graph).
+///
 /// Source: `ltx.rs` `Rope::new`.
 fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
     let (f, h, w, d) = (a.u("frames")?, a.u("grid_h")?, a.u("grid_w")?, a.u("dim")?);
@@ -481,6 +484,7 @@ fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
         "sin" => false,
         o => return Err(bad("output", o)),
     };
+    let sign = a.b_or("pair_sign", false)? && !cos;
     let n = d / 6;
     let freqs: Vec<f64> = (0..n).map(|j| theta.powf(j as f64 / (n - 1) as f64) * std::f64::consts::FRAC_PI_2).collect();
     let scale = [ts / fps, ss, ss];
@@ -492,7 +496,8 @@ fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
             for axis in 0..3 {
                 let g = pos[axis] as f64 * scale[axis] / base[axis];
                 let x = fr * (g * 2.0 - 1.0);
-                v.extend([(if cos { x.cos() } else { x.sin() }) as f32; 2]);
+                let v0 = if cos { x.cos() } else { x.sin() } as f32;
+                v.extend([if sign { -v0 } else { v0 }, v0]);
             }
         }
     }

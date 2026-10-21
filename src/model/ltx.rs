@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 mod graph_program;
+#[cfg(test)]
+mod spec_parity;
 
 /// A tiny random-weight LTX transformer forward as a graph (the GPU-only matrix fixture).
 pub fn tiny_dit_graph() -> Result<(crate::graph::Graph, crate::graph::Weights), String> {
