@@ -3,7 +3,7 @@
 //! ([`mlx`]), EXL3 ([`exl3`]) and bitsandbytes 4-bit ([`crate::model::repack::bnb`]).
 //!
 //! [`check`] rejects schemes we can't decode before any weight is read, [`alias_packed`] exposes packed
-//! weights under the `X.weight` names `GraphLm::from_manifest` reads, and [`dequantize`] expands one such
+//! weights under the `X.weight` names the family specs read, and [`dequantize`] expands one such
 //! weight to f32 when it is extracted (one tensor at a time, no full-model copy).
 
 use crate::hardware::QuantFormat;
@@ -633,7 +633,6 @@ pub(crate) fn bytes<'a>(data: &'a [u8], t: &VirtualTensor) -> Result<&'a [u8], S
 
 #[cfg(test)]
 mod tests {
-    use crate::hardware::QuantMode;
     use crate::model::hub::ModelArtifacts;
     use crate::model::loaders::{SafetensorsWeightReader, WeightReader};
     use std::path::PathBuf;
@@ -724,9 +723,7 @@ mod tests {
             weights_path: Some(q.join("model.safetensors")),
             ..Default::default()
         };
-        let llm =
-            crate::model::hf_loader::load_causal_lm(&artifacts, QuantMode::Uncompressed).unwrap();
-        let out = llm.generate_text("The capital of France is", 8, 0.0);
+        let out = crate::arch::testing::greedy_text(&artifacts, "The capital of France is", 8);
         println!("{repo}: {out:?}");
         assert!(out.contains("Paris"), "{repo}: {out:?}");
     }

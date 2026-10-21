@@ -624,11 +624,8 @@ mod tests {
 
     #[test]
     fn llm_acts_as_system1_model() {
-        use crate::model::graph_lm::{GraphLm, GraphLmConfig};
-        use crate::scheduler::ExecutableModel;
-
-        let llm = ExecutableModel::load_graph_lm(GraphLm::new(GraphLmConfig::smollm_1m()), crate::hardware::Device::Cpu)
-            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let llm = crate::arch::testing::synthetic_lm(dir.path(), serde_json::json!({}), crate::hardware::Device::Cpu);
         let s1 = JevSystem1Model::from_llm("foundry/smollm-1m", llm);
         assert!(s1.is_llm());
         assert!(s1.token_count("reactor overheating").unwrap() >= 1);

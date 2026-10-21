@@ -4,11 +4,10 @@
 //! of FOUNDRY's **Data Plane**. It establishes pragmatic architectural boundaries between:
 //!
 //! 1. **Model Execution Interfaces**:
-//!    - [`GraphLm`]: High-throughput autoregressive transformer decoder with fused RoPE,
-//!      single-pass SwiGLU, and pre-allocated zero-allocation KV cache.
+//!    - [`native::NativeLm`]: the causal-LM interface; every decoder is a family spec run by
+//!      [`crate::runtime::lm`] (weights loaded by [`crate::arch::load`]).
 //!    - [`crate::runtime::encoder::system1::JevSystem1Model`]: pretrained sentence encoder
 //!      (default all-MiniLM-L6-v2) answering choice/bool questions zero-shot by embedding cosine similarity.
-//!    - [`NanoLlm`]: Minimal reference transformer decoder for smoke tests and micro-benchmarking.
 //!
 //! 2. **Universal Quantization & Layer Abstractions**:
 //!    - [`layers::QuantizedLinearLayer`]: Architectural God Node abstracting FP16, NVFP4 and
@@ -33,7 +32,7 @@
 //!
 //! - **Data Plane Peers**:
 //!   - `crate::hardware`: Supplies target architecture detection, device buffer allocations, and
-//!     runtime quantization modes ([`crate::hardware::QuantMode`]).
+//!     weight formats ([`crate::hardware::QuantFormat`]).
 //! - **Control Plane Boundaries**:
 //!   - `crate::server` and `crate::tui`: Exercise model execution via stateless forward passes,
 //!     consuming tokens through streaming channels and monitoring KV cache saturation without
@@ -48,17 +47,14 @@ pub mod diff_fixtures;
 
 pub mod fasttext;
 pub mod fingerprint;
-pub mod graph_lm;
 pub mod hf_loader;
 pub mod hub;
-pub mod idefics3;
 pub mod image;
 pub mod gguf_meta;
 pub mod layers;
 pub mod load_log;
 pub mod loaders;
 pub mod lora;
-pub mod nano;
 pub mod native;
 pub mod ninfer;
 pub mod nn;
@@ -69,7 +65,6 @@ pub mod reencode;
 pub mod variant;
 pub mod video_repo;
 pub mod repack;
-pub mod siglip;
 pub mod simd;
 pub mod spm;
 pub mod tokenizer;
@@ -80,7 +75,6 @@ pub mod weights;
 use crate::hardware::{QuantFormat, QuantizationFormat};
 use bytes::Bytes;
 pub use fingerprint::*;
-pub use graph_lm::*;
 pub use hub::*;
 pub use image::*;
 pub use layers::*;

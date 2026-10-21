@@ -253,6 +253,17 @@ impl WeightHeader {
             .sum()
     }
 
+    /// [`Self::streamed_bytes_per_token`] with every streamed matrix stored as `f` (`--quant`;
+    /// rows `f` cannot tile take the next larger format, as the loader does).
+    pub fn streamed_bytes_forced(&self, f: Q) -> u64 {
+        self.streamed()
+            .map(|t| {
+                let g = reencode::fit(f, t.cols as usize, Q::FP16);
+                (g.tensor_bytes(t.numel as usize) as f64 * self.scale(t)) as u64
+            })
+            .sum()
+    }
+
     /// Bytes in memory once loaded under `policy` (gathered tables keep their source format).
     pub fn resident_bytes(&self, policy: ReencodePolicy) -> u64 {
         let streamed: std::collections::HashSet<*const HeaderTensor> =

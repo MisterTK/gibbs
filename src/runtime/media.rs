@@ -895,11 +895,6 @@ mod tests {
         v.iter().enumerate().map(|(i, &x)| x as f64 * (i % 7 + 1) as f64).sum()
     }
 
-    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
-        assert_eq!(a.len(), b.len());
-        a.iter().zip(b).fold(0.0, |m, (x, y)| m.max((x - y).abs()))
-    }
-
     /// Position-weighted sum (relative 1e-9) and exact elements at `len/3 + 1`, `len/2`, `len - 1`.
     fn pinned(v: &[f32], (want_sum, want_at): (f64, [f32; 3])) {
         let got = sum(v);
@@ -944,34 +939,6 @@ mod tests {
         assert_eq!(measure(&tile(true), &png(100, 700)).unwrap().tokens, 16);
         let one = preprocess(&tile(false), &png(300, 200)).unwrap();
         assert_eq!((one.grid.rows, one.grid.tokens, one.shape[0]), (0, 4, 1));
-    }
-
-    // parity with original (delete with the original)
-    #[test]
-    fn tile_longest_edge_matches_original() {
-        use crate::model::idefics3::Preprocess as Orig;
-        for split in [true, false] {
-            let orig = Orig {
-                longest_edge: 96,
-                tile: 32,
-                split,
-                lanczos: true,
-                rescale: 1.0 / 255.0,
-                mean: [0.5; 3],
-                std: [0.5; 3],
-            };
-            for (w, h) in [(300, 200), (100, 700), (20, 20)] {
-                let bytes = png(w, h);
-                let img = ImageBuffer::decode(&bytes).unwrap();
-                let (r, c, tiles) = orig.tiles(&img);
-                let want: Vec<f32> = tiles.iter().flat_map(|t| orig.pixels(t)).collect();
-                let p = preprocess(&tile(split), &bytes).unwrap();
-                assert_eq!((p.grid.rows, p.grid.cols), (r, c), "{w}x{h}");
-                assert_eq!((p.grid.rows, p.grid.cols), orig.grid(w, h));
-                assert_eq!(p.grid.tokens, tiles.len() * 4);
-                assert_eq!(p.data, want, "{w}x{h} split {split}");
-            }
-        }
     }
 
     fn smart() -> Preprocess {
@@ -1153,16 +1120,6 @@ mod tests {
         let e = expand(&[IMG], &tiled(), &[("image", &single)], &tokenize).unwrap();
         assert_eq!(e.ids, vec![3, 4, 5, 5, 3]);
         assert_eq!(e.media_index, vec![2, 3]);
-    }
-
-    // parity with original (delete with the original)
-    #[test]
-    fn grid_text_matches_original() {
-        use crate::model::idefics3::placeholder;
-        let around = "<fake_token_around_image>";
-        for (r, c, n) in [(0, 0, 2), (1, 2, 1), (3, 4, 5)] {
-            assert_eq!(grid_text(around, "<row_{r}_col_{c}>", "<global-img>", "<image>", r, c, n), placeholder(r, c, n));
-        }
     }
 
     fn mrope() -> Media {

@@ -790,10 +790,9 @@ fn smolvlm(case: &str, width: usize, height: usize) {
         return;
     }
     // Pin the bit-exact load: the settings-file re-encode policy (and its cache) must not change
-    // the Metal weights. ponytail: process-global, set (never cleared) by every load_native case.
+    // the Metal weights. ponytail: process-global, set (never cleared) by every spec-load case.
     set_reencode_override(Some(ReencodeConfig {
         policy: ReencodePolicy::BitExact,
-        cache_dir: None,
         ..Default::default()
     }));
     golden(case, TOL, |dev| {

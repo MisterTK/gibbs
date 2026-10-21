@@ -8,7 +8,8 @@
 //! [`NativeLm::forward_all`]: crate::model::native::NativeLm::forward_all
 //! [`NativeLm::truncate`]: crate::model::native::NativeLm::truncate
 
-use super::{recent, ExecutableModel, SeqKvCache, WRONG_KV};
+use super::{recent, ExecutableModel, NO_STATE};
+use crate::model::native::SeqState;
 use crate::runtime::sched::Rng;
 use crate::runtime::lm::nucleus;
 use std::any::Any;
@@ -64,7 +65,7 @@ impl SpecSeq {
     pub(super) fn start(
         m: &ExecutableModel,
         drafter: Arc<dyn Drafter>,
-        kv: &mut Option<SeqKvCache>,
+        kv: &mut Option<SeqState>,
         seed: u64,
     ) -> Result<Self, String> {
         m.set_taps(kv, &drafter.tap_layers())?;
@@ -102,61 +103,22 @@ impl ExecutableModel {
         &self,
         tokens: &[u32],
         start: usize,
-        kv: &mut Option<SeqKvCache>,
+        kv: &mut Option<SeqState>,
     ) -> Result<Vec<f32>, String> {
-        match (self, kv) {
-            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.forward_all(tokens, start, st),
-            (Self::Program(prog, _), Some(SeqKvCache::Program(state))) => {
-                use crate::graph::Tensor;
-                let mut p = prog.write();
-                std::mem::swap(&mut p.state, state);
-                let mut out = Vec::new();
-                let mut res = Ok(());
-                for (i, &t) in tokens.iter().enumerate() {
-                    let step = p.run(vec![Tensor::U32(vec![t]), Tensor::U32(vec![(start + i) as u32])]);
-                    match step.map(|o| o.into_iter().next()) {
-                        Ok(Some(Tensor::F32(v))) => out.extend(v),
-                        Ok(_) => res = Err("GraphProgram did not return F32 logits".to_string()),
-                        Err(e) => res = Err(e),
-                    }
-                    if res.is_err() {
-                        break;
-                    }
-                }
-                std::mem::swap(&mut p.state, state);
-                res.map(|()| out)
-            }
-            (Self::Native(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
-        }
+        self.0.forward_all(tokens, start, kv.as_mut().ok_or(NO_STATE)?)
     }
 
     /// Rewinds the sequence to `len` positions.
-    fn truncate(&self, kv: &mut Option<SeqKvCache>, len: usize) -> Result<(), String> {
-        match (self, kv) {
-            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.truncate(st, len),
-            // The decode graph's KV rows are indexed by position: rewinding is writing from `len`.
-            (Self::Program(..), Some(SeqKvCache::Program(_))) => Ok(()),
-            (Self::Native(_) | Self::Program(..), _) => Err(WRONG_KV.into()),
-        }
+    fn truncate(&self, kv: &mut Option<SeqState>, len: usize) -> Result<(), String> {
+        self.0.truncate(kv.as_mut().ok_or(NO_STATE)?, len)
     }
 
-    fn set_taps(&self, kv: &mut Option<SeqKvCache>, layers: &[usize]) -> Result<(), String> {
-        match (self, kv) {
-            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.set_taps(st, layers),
-            (Self::Program(..), _) if layers.is_empty() => Ok(()),
-            (Self::Program(..), _) => Err(
-                "hidden-state drafters read tapped layers, which the GraphLm Metal program does not expose"
-                    .into(),
-            ),
-            (Self::Native(_), _) => Err(WRONG_KV.into()),
-        }
+    fn set_taps(&self, kv: &mut Option<SeqState>, layers: &[usize]) -> Result<(), String> {
+        self.0.set_taps(kv.as_mut().ok_or(NO_STATE)?, layers)
     }
 
-    fn take_taps(&self, kv: &mut Option<SeqKvCache>) -> Vec<f32> {
-        match (self, kv) {
-            (Self::Native(m), Some(SeqKvCache::Native(st))) => m.take_taps(st),
-            _ => Vec::new(),
-        }
+    fn take_taps(&self, kv: &mut Option<SeqState>) -> Vec<f32> {
+        kv.as_mut().map_or_else(Vec::new, |st| self.0.take_taps(st))
     }
 }
 
@@ -168,7 +130,7 @@ pub(super) fn decode(
     m: &ExecutableModel,
     spec: &mut SpecSeq,
     all: &[u32],
-    kv: &mut Option<SeqKvCache>,
+    kv: &mut Option<SeqState>,
     temp: f32,
     top_p: f32,
     vocab: usize,

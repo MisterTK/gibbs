@@ -1,8 +1,9 @@
 //! # ONNX loader (rten-onnx backend)
 //!
 //! - `OnnxWeightReader`: initializers as tensors ([`WeightReader`]).
-//! - [`load_causal_lm`]: decoder-only LLM exports → HF-named f32 weights for `GraphLm`, resolved
-//!   through the graph (MatMul/Gemm, MatMulNBits, MatMulBnb4, MatMulInteger, DequantizeLinear).
+//! - [`extract_hf_tensors`]: decoder-only LLM exports → HF-named f32 weights (the spec loader's
+//!   `.onnx` source), resolved through the graph (MatMul/Gemm, MatMulNBits, MatMulBnb4,
+//!   MatMulInteger, DequantizeLinear).
 
 use std::collections::HashMap;
 use std::fs;
@@ -11,8 +12,7 @@ use std::path::{Component, Path};
 use rten_onnx::onnx::{AttributeProto, DataLocation, DataType, ModelProto, NodeProto, TensorProto};
 
 use crate::model::loaders::{TensorMetadata, WeightReader};
-use crate::model::graph_lm::{GraphLm, GraphLmConfig};
-use crate::model::{bf16_to_f32, f16_to_f32, ModelManifest, SourceFormat};
+use crate::model::{bf16_to_f32, f16_to_f32};
 use crate::model::{QuantFormat, VirtualTensor};
 
 /// ONNX weight reader: maps tensor names to Gibbs Tensor objects
@@ -263,38 +263,6 @@ struct Const {
     dims: Vec<usize>,
     vals: Vec<f32>,
     int: bool,
-}
-
-/// Loads a decoder-only LLM ONNX export (optimum / onnxruntime-genai / transformers.js) by pulling
-/// its weights out of the graph into the HF tensor names [`GraphLm::from_manifest`] reads.
-/// The graph is never executed; external data files are resolved beside `path`.
-pub fn load_causal_lm(cfg: GraphLmConfig, path: &Path) -> Result<GraphLm, String> {
-    let tensors = extract_hf_tensors(path, cfg.num_heads * cfg.head_dim)?;
-    // ponytail: materializes every weight as f32 (4 B/param on top of the source file); stream
-    // tensors into from_manifest if RAM for multi-B-param ONNX exports matters.
-    let mut data = Vec::with_capacity(tensors.values().map(|t| t.1.len() * 4).sum());
-    let mut manifest = ModelManifest {
-        format: SourceFormat::Onnx,
-        tensors: HashMap::new(),
-        metadata: HashMap::new(),
-        shard_count: 1,
-        detected_architecture: String::new(),
-    };
-    for (name, (shape, vals)) in tensors {
-        let byte_offset = data.len();
-        data.extend(vals.iter().flat_map(|v| v.to_le_bytes()));
-        let vt = VirtualTensor {
-            name: name.clone(),
-            shape,
-            quant_format: QuantFormat::FP32,
-            byte_offset,
-            byte_len: vals.len() * 4,
-            dtype: "F32".into(),
-            shard_index: 0,
-        };
-        manifest.tensors.insert(name, vt);
-    }
-    GraphLm::from_manifest(cfg, &manifest, &data)
 }
 
 /// HF tensor name → (HF shape, f32 values). `q_dim` (= heads × head_dim) splits fused `qkv_proj`.
@@ -1151,7 +1119,7 @@ mod tests {
         artifacts.local_dir = artifacts.config_path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf);
         let reg = crate::arch::registry().unwrap();
         let mode = crate::hardware::PlacementMode::Auto;
-        crate::scheduler::ExecutableModel::Native(crate::runtime::lm::load(&artifacts, reg, None, mode).unwrap())
+        crate::scheduler::ExecutableModel::new(crate::runtime::lm::load(&artifacts, reg, None, mode).unwrap())
     }
 
     /// The f32 ONNX export and its safetensors original produce the same greedy tokens through

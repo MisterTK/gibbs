@@ -1,10 +1,8 @@
-//! Causal LMs implemented outside [`GraphLm`](crate::model::graph_lm::GraphLm): architectures it does
-//! not express (hybrid linear attention, per-layer embeddings, ...) and multimodal models whose
-//! prompts carry images or audio. The scheduler drives them through [`NativeLm`]; [`load_native`]
-//! picks the implementation from `config.json`.
+//! The causal-LM interface the scheduler drives ([`NativeLm`]): text and multimodal prompts,
+//! per-sequence state, speculative-decoding hooks. Implementations: `runtime::lm::SpecLm` (every
+//! decoder family spec) and `runtime::encdec::SpecEncDec`.
 
-use crate::hardware::{Device, PlacementMode};
-use crate::model::hub::ModelArtifacts;
+use crate::hardware::Device;
 use crate::model::tokenizer::Tokenizer;
 use crate::scheduler::spec::Drafter;
 use std::any::Any;
@@ -149,52 +147,5 @@ pub trait NativeLm: Send + Sync {
     /// The drafter the checkpoint ships (e.g. multi-token-prediction heads).
     fn drafter(&self) -> Option<Arc<dyn Drafter>> {
         None
-    }
-}
-
-/// `model_type`s [`load_native`] implements. The hub picker lets their repos load whatever their
-/// pipeline tag (`image-text-to-text`, `any-to-any`, ...), as it does for spec-run families
-/// ([`crate::arch::dispatch::runs_spec_lm`]).
-// legacy: until Phases 6 (gemma) and 4 (idefics3) give these families specs.
-pub const NATIVE_MODEL_TYPES: &[&str] = &["idefics3", "smolvlm"];
-
-pub const NATIVE_GGUF_TYPES: &[&str] = &[];
-
-/// Loads `artifacts` as a [`NativeLm`] when its `config.json` names an architecture implemented
-/// here; `None` sends it down the GraphLm path.
-///
-/// On Metal the effective re-encode policy (`ReencodeConfig::effective`) applies to the model's
-/// GGUF projections, behind the whole-model KL gate of [`crate::arch::load::gated`].
-pub fn load_native(
-    artifacts: &ModelArtifacts,
-    mode: impl Into<PlacementMode>,
-) -> Option<Result<Arc<dyn NativeLm>, String>> {
-    let mode: PlacementMode = mode.into();
-    let on_metal = match mode {
-        PlacementMode::Pin(d) => d == Device::Metal,
-        PlacementMode::Auto => crate::hardware::default_device() == Device::Metal,
-    };
-    crate::arch::load::gated(
-        on_metal,
-        || load_native_once(artifacts, mode),
-        |reference, candidate| {
-            crate::model::weight_format::native_kl_gate(&**reference, &**candidate)
-        },
-    )
-}
-
-/// One load of a native model under whatever re-encode configuration is currently in effect.
-fn load_native_once(
-    artifacts: &ModelArtifacts,
-    mode: PlacementMode,
-) -> Option<Result<Arc<dyn NativeLm>, String>> {
-    let cfg: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(artifacts.config_path.as_ref()?).ok()?).ok()?;
-    match cfg["model_type"].as_str()? {
-        // `GIBBS_SPEC_LM=1`: the `idefics3` spec (`runtime::lm::SpecLm` + media) instead.
-        "idefics3" | "smolvlm" if !crate::arch::dispatch::spec_lm_enabled() => {
-            Some(crate::model::idefics3::load(artifacts, &cfg, mode))
-        }
-        t => crate::arch::unsupported(t).map(|why| Err(format!("{t}: {why}"))),
     }
 }

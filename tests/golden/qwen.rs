@@ -293,7 +293,7 @@ fn dense_config(model_type: &str, arch: &str) -> Value {
 /// runner: arch::load::load_with (bit-exact) of the detected family spec -> runtime::lm::SpecLm.
 fn load(dir: &Path, id: &str, dev: Device) -> Arc<dyn NativeLm> {
     use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
-    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
     let a = artifacts(dir, id, "model.safetensors");
     let m = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re)
         .and_then(|s| gibbs_engine::runtime::lm::SpecLm::new(s, PlacementMode::Pin(dev)))
@@ -428,7 +428,7 @@ fn qwen3_5_mtp() {
         // runner: arch::load::load_with (bit-exact) of the `qwen3_5` spec -> runtime::lm::SpecLm
         // on `dev`; its drafter is the spec's `mtp` component (runtime::draft).
         use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
-        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
         let a = artifacts(&dir, "golden/qwen3_5_mtp", "model.safetensors");
         let spec = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re).unwrap();
         assert_eq!(spec.spec.family, "qwen3_5");
@@ -479,7 +479,7 @@ fn qwen3_5_unsupported_mtp_head_is_skipped() {
     let mut cfg = qwen35_config("qwen3_5", "Qwen3_5ForCausalLM");
     cfg["mtp_num_hidden_layers"] = 2.into();
     write_ckpt(&dir, &cfg, &w);
-    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
     let a = artifacts(&dir, "golden/qwen3_5_mtp2", "model.safetensors");
     let spec = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re).unwrap();
     let m = gibbs_engine::runtime::lm::SpecLm::new(spec, PlacementMode::Pin(Device::Cpu)).unwrap();
@@ -497,7 +497,7 @@ fn qwen3_5_vision_tower() {
     qwen35_vl_ckpt(&dir);
     // runner: arch::load::load_with (bit-exact) -> runtime::media::{preprocess, Towers::run}.
     let run = |family: &str, dev: Device| {
-        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
         let a = artifacts(&dir, "golden/qwen3_5_vl", "model.safetensors");
         let m = load::load_with(&a, &Registry::load(None).unwrap(), Some(family), re).unwrap();
         load::check(&m).unwrap();

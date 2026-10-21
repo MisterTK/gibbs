@@ -107,6 +107,69 @@ pub fn artifacts(dir: &Path) -> ModelArtifacts {
     }
 }
 
+/// A synthetic `gibbs/*` llama checkpoint in `dir` (random-init weights, fixed seed: every load is
+/// identical): `config.json` = `cfg` over hidden 64, 2 layers, GQA 4/2, intermediate 128, vocab 256,
+/// 512 positions; a tokenizer without special ids: printable ASCII characters are one token each
+/// (id = code point), every other id is `w{i}`.
+pub fn synthetic_llama(dir: &Path, cfg: J) -> ModelArtifacts {
+    let mut c = json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama", "hidden_size": 64,
+        "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 128,
+        "vocab_size": 256, "max_position_embeddings": 512, "rms_norm_eps": 1e-5});
+    for (k, v) in cfg.as_object().into_iter().flatten() {
+        c[k] = v.clone();
+    }
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("config.json"), c.to_string()).unwrap();
+    let vocab: Map<String, J> = (0..c["vocab_size"].as_u64().unwrap())
+        .map(|i| match char::from_u32(i as u32).filter(|c| c.is_ascii_graphic()) {
+            Some(ch) => (ch.to_string(), json!(i)),
+            None => (format!("w{i}"), json!(i)),
+        })
+        .collect();
+    let tok = json!({"version": "1.0", "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [{"type": "WhitespaceSplit"},
+            {"type": "Split", "pattern": {"Regex": "."}, "behavior": "Isolated", "invert": false}]},
+        "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "w0"}});
+    std::fs::write(dir.join("tokenizer.json"), tok.to_string()).unwrap();
+    ModelArtifacts {
+        model_id: "gibbs/test-llama".into(),
+        local_dir: Some(dir.to_path_buf()),
+        config_path: Some(dir.join("config.json")),
+        tokenizer_path: Some(dir.join("tokenizer.json")),
+        ..Default::default()
+    }
+}
+
+/// [`synthetic_llama`] loaded as a causal LM ([`crate::runtime::lm::SpecLm`]) on `dev` with
+/// bit-exact weights (no host re-encode policy: CPU and Metal hold the same values).
+pub fn synthetic_lm(dir: &Path, cfg: J, dev: Device) -> crate::scheduler::ExecutableModel {
+    let a = synthetic_llama(dir, cfg);
+    let exact = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
+    let m = load::load_with(&a, super::registry().unwrap(), Some("llama"), exact).unwrap();
+    let lm = crate::runtime::lm::SpecLm::new(m, PlacementMode::Pin(dev))
+        .unwrap_or_else(|e| panic!("synthetic llama: {e}"));
+    assert_eq!(crate::model::native::NativeLm::device(&lm), dev);
+    crate::scheduler::ExecutableModel::new(std::sync::Arc::new(lm))
+}
+
+/// `n` greedy tokens after `prompt` (raw text, no chat template) from `artifacts` loaded on the CPU
+/// through [`crate::runtime::lm`] (detected family), decoded.
+pub fn greedy_text(artifacts: &ModelArtifacts, prompt: &str, n: usize) -> String {
+    let cpu = PlacementMode::Pin(Device::Cpu);
+    let lm = crate::runtime::lm::load(artifacts, super::registry().unwrap(), None, cpu)
+        .unwrap_or_else(|e| panic!("{}: {e}", artifacts.model_id));
+    let (ids, mut st) = lm.prepare(lm.tokenizer().encode(prompt), &[]).unwrap();
+    let mut logits = lm.forward(&ids, 0, &mut st).unwrap();
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let t = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
+        out.push(t);
+        logits = lm.forward(&[t], ids.len() + out.len() - 1, &mut st).unwrap();
+    }
+    lm.tokenizer().decode(&out)
+}
+
 /// A loaded model run instance by instance on one device, all instances sharing one state.
 pub struct Runner {
     pub model: Model,
@@ -129,7 +192,6 @@ impl Runner {
     pub fn from_artifacts(a: &ModelArtifacts, family: Option<&str>, dev: Device, ctx: usize) -> Result<Self, String> {
         let reencode = ReencodeConfig {
             policy: ReencodePolicy::BitExact,
-            cache_dir: None,
             ..Default::default()
         };
         let model = load::load_with(a, &Registry::load(None)?, family, reencode)?;

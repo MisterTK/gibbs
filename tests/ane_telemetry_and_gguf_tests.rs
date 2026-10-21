@@ -1,5 +1,4 @@
 use foundry_engine::model::hub::HuggingFaceHub;
-use foundry_engine::model::graph_lm::{GraphLm, GraphLmConfig};
 use foundry_engine::model::tokenizer::Tokenizer;
 use foundry_engine::model::UniversalModelLoader;
 use foundry_engine::telemetry::EngineTelemetry;
@@ -388,26 +387,6 @@ fn test_sub_2b_headliner_gguf_loading_and_architecture_support() {
     assert_eq!(qwen_tok.decode_token(3), "hello");
     assert_eq!(qwen_tok.decode_token(4), "world");
 
-    let qwen_cfg = GraphLmConfig {
-        vocab_size: 5,
-        hidden_dim: 64,
-        intermediate_dim: 128,
-        num_layers: 1,
-        num_heads: 4,
-        head_dim: 16,
-        max_seq_len: 256,
-        ..Default::default()
-    };
-    let qwen_model = GraphLm::from_gguf_data(qwen_cfg.clone(), &qwen_bytes)
-        .expect("Failed to construct GraphLm from Qwen2 GGUF");
-    assert!(
-        qwen_model.layers[0].qkv_proj.bias.is_some(),
-        "Qwen2 model layer must have QKV bias populated"
-    );
-    let qwen_logits = qwen_model.forward(&[0, 1]);
-    assert_eq!(qwen_logits.len(), 5);
-    assert!(!qwen_logits[0].is_nan());
-
     // 2. Verify Gemma2 GGUF loading, metadata parsing, and post-attention/post-ffw norms
     let gemma_bytes = build_synthetic_gguf_bytes("gemma2", true);
     let gemma_manifest = UniversalModelLoader::parse_gguf(&gemma_bytes)
@@ -425,30 +404,6 @@ fn test_sub_2b_headliner_gguf_loading_and_architecture_support() {
     assert!(gemma_manifest
         .tensors
         .contains_key("blk.0.post_ffw_norm.weight"));
-
-    let gemma_cfg = GraphLmConfig {
-        vocab_size: 5,
-        hidden_dim: 64,
-        intermediate_dim: 128,
-        num_layers: 1,
-        num_heads: 4,
-        head_dim: 16,
-        max_seq_len: 256,
-        ..Default::default()
-    };
-    let gemma_model = GraphLm::from_gguf_data(gemma_cfg, &gemma_bytes)
-        .expect("Failed to construct GraphLm from Gemma2 GGUF");
-    assert!(
-        gemma_model.layers[0].post_attention_norm.is_some(),
-        "Gemma2 model layer must have post_attention_norm populated"
-    );
-    assert!(
-        gemma_model.layers[0].post_ffw_norm.is_some(),
-        "Gemma2 model layer must have post_ffw_norm populated"
-    );
-    let gemma_logits = gemma_model.forward(&[2, 3]);
-    assert_eq!(gemma_logits.len(), 5);
-    assert!(!gemma_logits[0].is_nan());
 
     // 3. Verify sub-2B headliner candidate generation & parameter estimation in HuggingFaceHub
     let hub = HuggingFaceHub::new().with_budget(usize::MAX);

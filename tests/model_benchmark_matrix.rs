@@ -1,18 +1,16 @@
 //! Special Model Evaluation & Comparative Benchmark Suite
 //!
 //! Evaluates all models against 10 dynamically generated random prompts across
-//! every QuantMode configuration (Uncompressed, F16, BF16, Q8_0, NVFP4Ultra).
+//! every `--quant` format (FP32, F16, BF16, Q8_0, NVFP4).
 //!
 //! Marked `#[ignore]` so it is NOT run alongside unit tests.
 //! Run with: `cargo test --release --test model_benchmark_matrix -- --nocapture --ignored`
 
-use gibbs_engine::hardware::QuantMode;
-use gibbs_engine::model::graph_lm::{GraphLm, GraphLmConfig};
-use gibbs_engine::model::hf_loader::HfConfigJson;
-use gibbs_engine::model::tokenizer::Tokenizer;
-use gibbs_engine::model::UniversalModelLoader;
-use std::path::Path;
-use std::time::Instant;
+use gibbs_engine::hardware::{Device, PlacementMode, QuantFormat};
+use gibbs_engine::model::hub::ModelArtifacts;
+use gibbs_engine::model::weight_format::{reencode_override, set_reencode_override, ReencodeConfig};
+use gibbs_engine::scheduler::ExecutableModel;
+use std::path::{Path, PathBuf};
 
 /// Deterministic Pseudo-Random Prompt Generator for Dynamic Evaluation.
 ///
@@ -72,30 +70,17 @@ impl DynamicPromptGenerator {
     }
 }
 
-const ALL_QUANT_MODES: [QuantMode; 5] = [
-    QuantMode::Uncompressed,
-    QuantMode::F16,
-    QuantMode::BF16,
-    QuantMode::Q8_0,
-    QuantMode::NVFP4Ultra,
+const ALL_QUANT_FORMATS: [QuantFormat; 5] = [
+    QuantFormat::FP32,
+    QuantFormat::FP16,
+    QuantFormat::BF16,
+    QuantFormat::GGUF_Q8_0,
+    QuantFormat::GGUF_NVFP4,
 ];
 
-fn quant_mode_name(mode: QuantMode) -> &'static str {
-    match mode {
-        QuantMode::Uncompressed => "Uncompressed (FP32)",
-        QuantMode::F16 => "F16",
-        QuantMode::BF16 => "BF16",
-        QuantMode::Q8_0 => "Q8_0 (8.5b)",
-        QuantMode::NVFP4Ultra => "NVFP4Ultra (E2M1)",
-    }
-}
-
-#[allow(dead_code)]
 struct EvalResult {
-    quant_mode: QuantMode,
-    bpw: f32,
+    format: QuantFormat,
     avg_tok_s: f64,
-    total_tokens: usize,
     sample_excerpt: String,
     zero_leakage: bool,
 }
@@ -118,7 +103,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     println!("────────────────────────────────────────────────────────────────────────────────────────────────────\n");
 
     // 1. TinyStories-1M
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "TinyStories-1M",
         "disk/models--roneneldan--TinyStories-1M/snapshots/main",
         &dynamic_prompts,
@@ -126,7 +111,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 2. TinyStories-3M
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "TinyStories-3M",
         "disk/models--roneneldan--TinyStories-3M/snapshots/main",
         &dynamic_prompts,
@@ -134,7 +119,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 3. TinyStories-8M
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "TinyStories-8M",
         "disk/models--roneneldan--TinyStories-8M/snapshots/main",
         &dynamic_prompts,
@@ -142,7 +127,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 4. TinyStories-Instruct-8M
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "TinyStories-Instruct-8M",
         "disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main",
         &dynamic_prompts,
@@ -150,7 +135,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 5. EleutherAI/pythia-14m
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "EleutherAI/pythia-14m",
         "disk/models--EleutherAI--pythia-14m/snapshots/main",
         &dynamic_prompts,
@@ -158,7 +143,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 6. GODELEV/Ant-5M
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "GODELEV/Ant-5M",
         "disk/models--GODELEV--Ant-5M/snapshots/main",
         &dynamic_prompts,
@@ -166,7 +151,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 7. MultivexAI/Plyx-15M
-    eval_safetensors_causal_model(
+    eval_snapshot_dir(
         "MultivexAI/Plyx-15M",
         "disk/models--MultivexAI--Plyx-15M/snapshots/main",
         &dynamic_prompts,
@@ -174,7 +159,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 8. unsloth/SmolLM2-135M-Instruct-GGUF
-    eval_gguf_causal_model(
+    eval_gguf(
         "SmolLM2-135M-Instruct-GGUF",
         "disk/models--unsloth--SmolLM2-135M-Instruct-GGUF/snapshots/main/SmolLM2-135M-Instruct-Q4_K_M.gguf",
         &dynamic_prompts,
@@ -182,7 +167,7 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     );
 
     // 9. ggml-org/tiny-llamas (stories15M.gguf)
-    eval_gguf_stories_model(
+    eval_gguf(
         "tiny-llamas/stories15M.gguf",
         "disk/models--ggml-org--tiny-llamas/snapshots/main/stories15M.gguf",
         &dynamic_prompts,
@@ -195,256 +180,80 @@ fn test_model_benchmark_matrix_all_models_all_quant_modes() {
     println!("╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
 }
 
-fn eval_safetensors_causal_model(
-    model_name: &str,
-    dir_path: &str,
-    prompts: &[String],
-    tokens_per_prompt: usize,
-) {
+fn eval_snapshot_dir(model_name: &str, dir_path: &str, prompts: &[String], tokens_per_prompt: usize) {
     let p = Path::new(dir_path);
-    if !p.exists() {
-        println!(
-            "⚠️ Skipping {}: directory '{}' not found",
-            model_name, dir_path
-        );
+    let (cfg, tok, st) = (p.join("config.json"), p.join("tokenizer.json"), p.join("model.safetensors"));
+    if !cfg.exists() || !tok.exists() || !st.exists() {
+        println!("⚠️ Skipping {model_name}: required files missing in '{dir_path}'");
         return;
     }
-
-    let tok_file = p.join("tokenizer.json");
-    let cfg_file = p.join("config.json");
-    let st_file = p.join("model.safetensors");
-
-    if !tok_file.exists() || !st_file.exists() {
-        println!(
-            "⚠️ Skipping {}: required files missing in '{}'",
-            model_name, dir_path
-        );
-        return;
-    }
-
-    let tokenizer = Tokenizer::from_json_str(&std::fs::read_to_string(&tok_file).unwrap()).unwrap();
-    let hf_cfg: HfConfigJson = serde_json::from_slice(&std::fs::read(&cfg_file).unwrap()).unwrap();
-    let st_bytes = std::fs::read(&st_file).unwrap();
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: if cfg!(debug_assertions) {
-            4.min(hf_cfg.num_layers)
-        } else {
-            hf_cfg.num_layers
-        },
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_standard_layernorm: hf_cfg.resolved_use_standard_layernorm(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
+    let art = ModelArtifacts {
+        model_id: model_name.to_string(),
+        config_path: Some(cfg),
+        tokenizer_path: Some(tok),
+        weights_path: Some(st),
+        local_dir: Some(p.to_path_buf()),
         ..Default::default()
     };
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes).unwrap();
-    model.set_tokenizer(tokenizer);
-
-    let mut results = Vec::new();
-
-    for &mode in &ALL_QUANT_MODES {
-        model.quantize(mode);
-        let mut total_tokens = 0;
-        let mut sample_excerpt = String::new();
-        let mut zero_leakage = true;
-
-        let start = Instant::now();
-        for (idx, prompt) in prompts.iter().enumerate() {
-            let out = model.generate_text(prompt, tokens_per_prompt, 0.0);
-            total_tokens += tokens_per_prompt;
-
-            if idx == 0 {
-                let tail = out.trim_start_matches(prompt).trim();
-                sample_excerpt = if tail.len() > 38 {
-                    format!("{}...", &tail[..38])
-                } else if !tail.is_empty() {
-                    tail.to_string()
-                } else {
-                    out.chars().take(38).collect()
-                };
-            }
-
-            if out.contains("<0x") || out.contains("Ġ") || out.contains("Ċ") {
-                zero_leakage = false;
-            }
-        }
-        let elapsed = start.elapsed().as_secs_f64().max(0.0001);
-        let avg_tok_s = (total_tokens as f64) / elapsed;
-
-        results.push(EvalResult {
-            quant_mode: mode,
-            bpw: mode.bits_per_weight(),
-            avg_tok_s,
-            total_tokens,
-            sample_excerpt: sample_excerpt.replace('\n', " "),
-            zero_leakage,
-        });
-    }
-
-    print_comparison_table(model_name, &results);
+    eval_model(model_name, &art, prompts, tokens_per_prompt);
 }
 
-fn eval_gguf_causal_model(
-    model_name: &str,
-    gguf_path: &str,
-    prompts: &[String],
-    tokens_per_prompt: usize,
-) {
-    let p = Path::new(gguf_path);
-    if !p.exists() {
-        println!(
-            "⚠️ Skipping {}: GGUF file '{}' not found",
-            model_name, gguf_path
-        );
+fn eval_gguf(model_name: &str, gguf_path: &str, prompts: &[String], tokens_per_prompt: usize) {
+    if !Path::new(gguf_path).exists() {
+        println!("⚠️ Skipping {model_name}: GGUF file '{gguf_path}' not found");
         return;
     }
-
-    let bytes = std::fs::read(p).unwrap();
-    let tokenizer = UniversalModelLoader::extract_gguf_tokenizer(&bytes)
-        .unwrap_or_else(|_| Tokenizer::default_bpe());
-
-    let cfg = GraphLmConfig {
-        vocab_size: tokenizer.vocab_size().max(49152),
-        hidden_dim: 576,
-        intermediate_dim: 1536,
-        num_layers: 4,
-        num_heads: 9,
-        head_dim: 64,
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
+    let art = ModelArtifacts {
+        model_id: model_name.to_string(),
+        weights_path: Some(PathBuf::from(gguf_path)),
         ..Default::default()
     };
-
-    let mut model = GraphLm::from_gguf_data(cfg, &bytes).unwrap();
-    model.set_tokenizer(tokenizer);
-
-    let mut results = Vec::new();
-    for &mode in &ALL_QUANT_MODES {
-        model.quantize(mode);
-        let mut total_tokens = 0;
-        let mut sample_excerpt = String::new();
-        let mut zero_leakage = true;
-
-        let start = Instant::now();
-        for (idx, prompt) in prompts.iter().enumerate() {
-            let out = model.generate_text(prompt, tokens_per_prompt, 0.0);
-            total_tokens += tokens_per_prompt;
-
-            if idx == 0 {
-                let tail = out.trim_start_matches(prompt).trim();
-                sample_excerpt = if tail.len() > 38 {
-                    format!("{}...", &tail[..38])
-                } else if !tail.is_empty() {
-                    tail.to_string()
-                } else {
-                    out.chars().take(38).collect()
-                };
-            }
-
-            if out.contains("<0x") {
-                zero_leakage = false;
-            }
-        }
-        let elapsed = start.elapsed().as_secs_f64().max(0.0001);
-        let avg_tok_s = (total_tokens as f64) / elapsed;
-
-        results.push(EvalResult {
-            quant_mode: mode,
-            bpw: mode.bits_per_weight(),
-            avg_tok_s,
-            total_tokens,
-            sample_excerpt: sample_excerpt.replace('\n', " "),
-            zero_leakage,
-        });
-    }
-
-    print_comparison_table(model_name, &results);
+    eval_model(model_name, &art, prompts, tokens_per_prompt);
 }
 
-fn eval_gguf_stories_model(
-    model_name: &str,
-    gguf_path: &str,
-    prompts: &[String],
-    tokens_per_prompt: usize,
-) {
-    let p = Path::new(gguf_path);
-    if !p.exists() {
-        println!(
-            "⚠️ Skipping {}: GGUF file '{}' not found",
-            model_name, gguf_path
-        );
-        return;
-    }
-
-    let bytes = std::fs::read(p).unwrap();
-    let tokenizer = UniversalModelLoader::extract_gguf_tokenizer(&bytes)
-        .unwrap_or_else(|_| Tokenizer::default_bpe());
-
-    let cfg = GraphLmConfig {
-        vocab_size: 32000,
-        hidden_dim: 288,
-        intermediate_dim: 768,
-        num_layers: 6,
-        num_heads: 6,
-        head_dim: 48,
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        ..Default::default()
-    };
-
-    let mut model = GraphLm::from_gguf_data(cfg, &bytes).unwrap();
-    model.set_tokenizer(tokenizer);
-
+/// Loads `art` once per `--quant` format (CPU, family detected) and greedy-decodes every prompt.
+fn eval_model(model_name: &str, art: &ModelArtifacts, prompts: &[String], tokens_per_prompt: usize) {
+    let prev = reencode_override();
     let mut results = Vec::new();
-    for &mode in &ALL_QUANT_MODES {
-        model.quantize(mode);
-        let mut total_tokens = 0;
+    for &format in &ALL_QUANT_FORMATS {
+        set_reencode_override(Some(ReencodeConfig {
+            force: Some(format),
+            ..ReencodeConfig::from_settings()
+        }));
+        let loaded = gibbs_engine::runtime::lm::load(
+            art,
+            gibbs_engine::arch::registry().expect("registry"),
+            None,
+            PlacementMode::Pin(Device::Cpu),
+        );
+        set_reencode_override(prev.clone());
+        let model = ExecutableModel::new(
+            loaded.unwrap_or_else(|e| panic!("{model_name} --quant {}: {e}", format.name())),
+        );
+
+        let (mut tokens, mut secs) = (0usize, 0f64);
         let mut sample_excerpt = String::new();
         let mut zero_leakage = true;
-
-        let start = Instant::now();
         for (idx, prompt) in prompts.iter().enumerate() {
-            let out = model.generate_text(prompt, tokens_per_prompt, 0.0);
-            total_tokens += tokens_per_prompt;
-
+            let (out, n, dt) = model
+                .generate_text_measured_plain(prompt, tokens_per_prompt, 0.0)
+                .unwrap_or_else(|e| panic!("{model_name} --quant {}: {e}", format.name()));
+            tokens += n;
+            secs += dt.as_secs_f64();
             if idx == 0 {
-                let tail = out.trim_start_matches(prompt).trim();
-                sample_excerpt = if tail.len() > 38 {
-                    format!("{}...", &tail[..38])
-                } else if !tail.is_empty() {
-                    tail.to_string()
-                } else {
-                    out.chars().take(38).collect()
-                };
+                sample_excerpt = out.trim().chars().take(38).collect::<String>().replace('\n', " ");
             }
-
-            if out.contains("<0x") {
+            if out.contains("<0x") || out.contains('Ġ') || out.contains('Ċ') {
                 zero_leakage = false;
             }
         }
-        let elapsed = start.elapsed().as_secs_f64().max(0.0001);
-        let avg_tok_s = (total_tokens as f64) / elapsed;
-
         results.push(EvalResult {
-            quant_mode: mode,
-            bpw: mode.bits_per_weight(),
-            avg_tok_s,
-            total_tokens,
-            sample_excerpt: sample_excerpt.replace('\n', " "),
+            format,
+            avg_tok_s: tokens as f64 / secs.max(1e-4),
+            sample_excerpt,
             zero_leakage,
         });
     }
-
     print_comparison_table(model_name, &results);
 }
 
@@ -463,8 +272,8 @@ fn print_comparison_table(model_name: &str, results: &[EvalResult]) {
         };
         println!(
             "│ {:<23} │ {:>5.2} b │ {:>8.1} tok/s│ {:<36} │ {:<12} │",
-            quant_mode_name(r.quant_mode),
-            r.bpw,
+            r.format.name(),
+            r.format.bits_per_weight(),
             r.avg_tok_s,
             r.sample_excerpt,
             leak_str

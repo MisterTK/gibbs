@@ -9399,12 +9399,17 @@ mod tests {
         }
     }
     #[test]
-    fn test_measure_graph_lm_dispatches_per_layer() {
-        use crate::model::graph_lm::{GraphLm, GraphLmConfig};
-        let cfg = GraphLmConfig::smollm_1m();
-        let num_layers = cfg.num_layers;
-        let model = GraphLm::new(cfg);
-        let (decode_g, weights) = model.to_decode_graph();
+    fn test_measure_llama_decode_dispatches_per_layer() {
+        use crate::arch::expr::Val;
+        // The llama spec's decode instance on a synthetic 4-layer checkpoint.
+        let num_layers = 4;
+        let dir = tempfile::tempdir().unwrap();
+        let a = crate::arch::testing::synthetic_llama(dir.path(), serde_json::json!({"num_hidden_layers": num_layers}));
+        let mut r = crate::arch::testing::Runner::from_artifacts(&a, Some("llama"), crate::hardware::Device::Metal, 512).unwrap();
+        let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
+        let inst = r.instance("text", &vars).unwrap();
+        let weights = r.model.store.materialize(&inst.weights).unwrap();
+        let decode_g = inst.graph;
 
         let s = Session::new(rt(), &weights).unwrap();
         let plan = s.prepare_plan(&decode_g).unwrap();
@@ -9414,7 +9419,7 @@ mod tests {
         let layer_steps = total_steps.saturating_sub(non_layer_steps);
         let steps_per_layer = layer_steps as f64 / num_layers as f64;
 
-        println!("=== GraphLm Decode Dispatch Count ===");
+        println!("=== llama spec decode dispatch count ===");
         println!("Total graph nodes: {}", decode_g.nodes.len());
         println!("Total GPU dispatches: {}", total_steps);
         println!(

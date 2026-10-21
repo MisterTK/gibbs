@@ -808,12 +808,7 @@ mod tests {
             weights_path: Some(q.join("model.safetensors")),
             ..Default::default()
         };
-        let llm = crate::model::hf_loader::load_causal_lm(
-            &artifacts,
-            crate::hardware::QuantMode::Uncompressed,
-        )
-        .unwrap();
-        let out = llm.generate_text("The capital of France is", 12, 0.0);
+        let out = crate::arch::testing::greedy_text(&artifacts, "The capital of France is", 12);
         println!("{repo}: {out:?}");
         assert!(out.contains(" Paris") && !out.contains('Ġ'), "{repo}: {out:?}");
     }

@@ -1,6 +1,5 @@
-use foundry_engine::hardware::{QuantFormat, QuantMode};
+use foundry_engine::hardware::QuantFormat;
 use foundry_engine::model::layers::QuantizedLinearLayer;
-use foundry_engine::model::nano::{NanoTransformerConfig, NanoTransformerModel};
 use foundry_engine::quant::nvfp4::{
     dequantize_nvfp4_tensor, gemv_nvfp4_f32, quantize_nvfp4_tensor,
 };
@@ -80,33 +79,4 @@ fn test_quantized_linear_layer_cross_format() {
         dot_nvfp4 > 0.0,
         "NVFP4 output should positively correlate with reference"
     );
-}
-
-#[test]
-fn test_nano_model_all_quant_modes_forward() {
-    let cfg = NanoTransformerConfig {
-        vocab_size: 256,
-        hidden_dim: 64,
-        intermediate_dim: 128,
-        num_layers: 2,
-        num_heads: 4,
-        head_dim: 16,
-        eps: 1e-5,
-    };
-
-    let mut model = NanoTransformerModel::new(cfg);
-
-    for mode in [
-        QuantMode::Uncompressed,
-        QuantMode::NVFP4Ultra,
-    ] {
-        model.quantize_model(mode);
-        let tok = model.forward_token(42, 0);
-        assert!(
-            tok < 256,
-            "Mode {:?} produced out of bounds token {}",
-            mode,
-            tok
-        );
-    }
 }

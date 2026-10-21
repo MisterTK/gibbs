@@ -3,10 +3,7 @@
 //! Runs in its own process because it arms the global CPU tripwire.
 
 use gibbs_engine::graph::avenues::{explore_node, family_gate, family_status, required_ops, Family, Status};
-use gibbs_engine::graph::program::GraphProgram;
-use gibbs_engine::graph::{DType, Graph, Tensor, Weights};
 use gibbs_engine::hardware::{available_devices, cpu_compute, Device, PlacementMode};
-use gibbs_engine::model::graph_lm::{GraphLm, GraphLmConfig};
 use std::sync::Once;
 
 static INIT: Once = Once::new();
@@ -87,34 +84,8 @@ fn metal_present() -> bool {
     available_devices().contains(&Device::Metal)
 }
 
-/// Compiles on `Auto`, asserts nothing runs on the CPU, then runs one prefill token and two decode steps.
-fn run_on_gpu(name: &str, graph: Graph, weights: Weights) {
-    let inputs: Vec<(String, DType, usize)> = graph
-        .inputs
-        .iter()
-        .map(|&id| {
-            let v = graph.value(id);
-            (v.name.clone(), v.dtype, v.shape.iter().product::<usize>().max(1))
-        })
-        .collect();
-    let mut prog = GraphProgram::compile(graph, weights, PlacementMode::Auto)
-        .unwrap_or_else(|e| panic!("{name}: {e}"));
-    assert_eq!(prog.cpu_node_count(), 0, "{name}: nodes run on the CPU");
-    assert_eq!(prog.primary_device(), Device::Metal, "{name}");
-    for pos in 0..3u32 {
-        let feed = inputs
-            .iter()
-            .map(|(n, dt, len)| match dt {
-                DType::U32 if n.contains("pos") => Tensor::U32(vec![pos; *len]),
-                DType::U32 => Tensor::U32(vec![1; *len]),
-                _ => Tensor::F32(vec![0.01; *len]),
-            })
-            .collect();
-        let out = prog.run(feed).unwrap_or_else(|e| panic!("{name} step {pos}: {e}"));
-        let logits = out[0].as_f32().expect("f32 logits");
-        assert!(logits.iter().all(|x| x.is_finite()), "{name} step {pos}: non-finite logits");
-    }
-}
+/// The `<image>` id of the golden `enc_smolvlm_*` fixtures.
+const IDEFICS3_IMG: u32 = 120;
 
 /// Media soft tokens placed over prompt rows by the GPU `Scatter`.
 fn scatter_fixture(name: &str) {
@@ -431,8 +402,7 @@ fn qwen35_on_gpu(name: &str, moe: bool, vl: bool) {
 fn gpu_fixture(f: Family) {
     match f {
         Family::GraphLm => {
-            let (g, w) = GraphLm::new(GraphLmConfig::smollm_1m()).to_decode_graph();
-            run_on_gpu("GraphLm", g, w);
+            spec_fixture_on_gpu("llama spec", "lm_graphlm_llama", &[5, 17, 42, 99], &[]);
         }
         Family::Gemma4 => {
             spec_fixture_on_gpu("Gemma4", "gemma_gemma4_ple", &[2, 10, 11, 12], &[]);
@@ -487,10 +457,10 @@ fn gpu_fixture(f: Family) {
             classifier_on_gpu("gpt-neox-seqcls", synth::gpt_neox_seqcls());
         }
         Family::Idefics3Siglip => {
-            let (g, w) = gibbs_engine::model::siglip::tiny::graph();
-            run_on_gpu("Idefics3Siglip tower", g, w);
-            let (g, w) = GraphLm::new(GraphLmConfig::smollm_1m()).to_decode_graph_embeds();
-            run_on_gpu("Idefics3Siglip text", g, w);
+            // SigLIP tower over tiles, connector and llama text with the media scatter.
+            let img = gibbs_engine::model::image::ImageBuffer::new(24, 24).to_png();
+            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
+            spec_fixture_on_gpu("idefics3 spec", "enc_smolvlm_grid", &[1, 10, 11, IDEFICS3_IMG, 12, 13], &media);
             scatter_fixture("Idefics3Siglip");
         }
         Family::Gemma4Media => {

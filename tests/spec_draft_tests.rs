@@ -34,7 +34,7 @@ fn generate(
     let cpu = PlacementMode::Pin(Device::Cpu);
     let reg = gibbs_engine::arch::registry().unwrap();
     let model =
-        ExecutableModel::Native(gibbs_engine::runtime::lm::load(target, reg, None, cpu).unwrap());
+        ExecutableModel::new(gibbs_engine::runtime::lm::load(target, reg, None, cpu).unwrap());
     let telemetry = EngineTelemetry::new();
     let sched = ContinuousBatchScheduler::with_telemetry(
         target.model_id.clone(),

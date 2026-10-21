@@ -1,16 +1,14 @@
-//! The one model-load dispatch: a `--model` id to a loaded model of whatever kind. Families with a
-//! spec load through [`crate::arch`]; the others keep their loaders here, one arm each (marked
-//! `legacy: until <phase>`), until their phase ports them.
+//! The one model-load dispatch: a `--model` id to a loaded model of whatever kind, through its
+//! family spec ([`crate::arch`]).
 
 use super::expr::Val;
 use super::Pipeline;
-use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
+use crate::hardware::{Device, HardwareCapability, PlacementMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::runtime::encoder::system1::JevSystem1Model;
 use crate::model::weight_format::{
-    load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
-    ReencodePolicy,
+    reencode_override, set_reencode_override, ReencodeConfig, ReencodePolicy,
 };
 use crate::runtime::diffusion::{Extras, ImageGenerator, SpecDiffusion};
 use crate::scheduler::ExecutableModel;
@@ -19,10 +17,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 pub enum Loaded {
-    /// A causal LM; `choice` is the GraphLm weight-format decision (legacy: until Phase 4).
+    /// A causal LM (or encoder-decoder).
     Lm {
         model: ExecutableModel,
-        choice: Option<Choice>,
         artifacts: ModelArtifacts,
     },
     Classifier(SequenceClassifier),
@@ -35,8 +32,6 @@ pub enum Loaded {
 pub struct LoadOpts<'a> {
     pub placement: PlacementMode,
     pub token: Option<&'a str>,
-    /// `--quant` as the GraphLm loader reads it (legacy: until Phase 4).
-    pub quant: Option<QuantMode>,
     /// `--quant` verbatim: the GGUF pick of a video repo.
     pub quant_name: Option<&'a str>,
     pub hw: &'a HardwareCapability,
@@ -55,23 +50,23 @@ pub struct LoadOpts<'a> {
     pub system1_first: bool,
 }
 
-/// `GIBBS_SPEC_LM=1`: causal LMs a family spec claims load through [`crate::runtime::lm`]
-/// instead of their legacy loader (GraphLm, the native loaders).
-pub fn spec_lm_enabled() -> bool {
-    std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1")
-}
-
-/// `model_type` is a causal-LM family's own match (not a fallback) whose spec sets
-/// `runtime.cutover` ([`lm`] runs it by default): the hub picker treats it like the native
-/// loaders' types.
+/// `model_type` is a causal-LM family's own match (not the decoder fallback): the hub picker loads
+/// such repos whatever their pipeline tag (`image-text-to-text`, `any-to-any`, ...).
 pub fn runs_spec_lm(model_type: &str) -> bool {
     super::registry().is_ok_and(|r| {
-        r.matchers().iter().any(|(f, m, p)| {
+        r.matchers().iter().any(|(_, m, p)| {
             *p == Pipeline::CausalLm
                 && !m.fallback
                 && m.hf_model_type.iter().any(|g| super::glob(g, model_type))
-                && r.merged(f, &Default::default())
-                    .is_ok_and(|j| j["runtime"]["cutover"] == J::Bool(true))
+        })
+    })
+}
+
+/// GGUF `general.architecture` a causal-LM family spec matches: its blocks load as stored.
+pub fn runs_spec_lm_gguf(arch: &str) -> bool {
+    super::registry().is_ok_and(|r| {
+        r.matchers().iter().any(|(_, m, p)| {
+            *p == Pipeline::CausalLm && m.gguf_arch.iter().any(|g| super::glob(g, arch))
         })
     })
 }
@@ -137,19 +132,12 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             }
         }
     }
-    let (model, choice) = load_lm(&artifacts, o)?;
-    Ok(Loaded::Lm {
-        model,
-        choice,
-        artifacts,
-    })
+    let model = load_lm(&artifacts, o)?;
+    Ok(Loaded::Lm { model, artifacts })
 }
 
-/// Loads `artifacts` as a causal LM under `o.reencode`.
-pub fn load_lm(
-    a: &ModelArtifacts,
-    o: &LoadOpts,
-) -> Result<(ExecutableModel, Option<Choice>), String> {
+/// Loads `artifacts` as a causal LM (or encoder-decoder) under `o.reencode`.
+pub fn load_lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<ExecutableModel, String> {
     let previous = reencode_override();
     set_reencode_override(Some(o.reencode.clone()));
     let r = lm(a, o);
@@ -157,58 +145,21 @@ pub fn load_lm(
     r
 }
 
-fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choice>), String> {
-    let spec = |family: Option<&str>| -> Result<(ExecutableModel, Option<Choice>), String> {
-        let m = crate::runtime::lm::load(a, super::registry()?, family, o.placement)?;
-        Ok((ExecutableModel::Native(m), None))
+fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<ExecutableModel, String> {
+    let reg = super::registry()?;
+    let ck = super::load::open(a)?;
+    let family = match o.family {
+        Some(f) => f.to_string(),
+        None => reg.detect(&ck.sig).ok_or_else(|| {
+            format!("{}: no architecture spec matches this checkpoint", a.model_id)
+        })?,
     };
-    // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
-    // they were (a spec problem fails only spec loads).
-    let ck = super::load::open(a).ok();
-    // `runtime.cutover: true` (legacy: until every causal-LM phase lands): the family's old
-    // loader is gone, so its spec serves default loads, not only `GIBBS_SPEC_LM=1` ones.
-    let family = ck.as_ref().and_then(|ck| {
-        let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
-        let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
-        let s = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?;
-        Some((f, s.pipeline, s.matcher.fallback, s.runtime["cutover"] == J::Bool(true)))
-    });
-    if let Some((f, Pipeline::Encdec, ..)) = &family {
-        let m = crate::runtime::encdec::load(a, super::registry()?, Some(f), o.placement)?;
-        return Ok((ExecutableModel::Native(m), None));
-    }
-    if o.family.is_some() {
-        return spec(o.family);
-    }
-    let lm_family = match &family {
-        Some((f, Pipeline::Unsupported, ..)) => return spec(Some(f)),
-        Some((f, Pipeline::CausalLm, fallback, cut)) => Some((f.as_str(), *fallback, *cut)),
-        _ => None,
-    };
-    // `runtime.cutover` families (legacy loader deleted) load by default; with GIBBS_SPEC_LM=1
-    // any family's own match does. A fallback match (any causal LM) never pre-empts a legacy
-    // loader.
-    if let Some((f, fallback, cut)) = lm_family {
-        if cut || (spec_lm_enabled() && !fallback) {
-            return spec(Some(f));
-        }
-    }
-    // legacy: until Phase 6 (the native loaders' families)
-    if let Some(m) = crate::model::native::load_native(a, o.placement) {
-        return Ok((ExecutableModel::Native(m?), None));
-    }
-    if let Some((f, ..)) = lm_family {
-        if spec_lm_enabled() {
-            return spec(Some(f));
-        }
-    }
-    // legacy: until Phase 4 (GraphLm)
-    let (lm, choice) = load_causal_lm_with(a, device(o.placement), o.quant, o.hw, &o.reencode)?;
     (o.stage)("compiling + tuning kernels");
-    Ok((
-        ExecutableModel::load_graph_lm(lm, o.placement)?,
-        Some(choice),
-    ))
+    let m = match reg.spec(&family, &ck.sig)?.pipeline {
+        Pipeline::Encdec => crate::runtime::encdec::load(a, reg, Some(&family), o.placement)?,
+        _ => crate::runtime::lm::load(a, reg, Some(&family), o.placement)?,
+    };
+    Ok(ExecutableModel::new(m))
 }
 
 /// `--arch-dump`: the merged spec, the resolved config vars, every raw tensor's canonical name

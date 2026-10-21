@@ -244,7 +244,6 @@ pub(crate) fn dequantize(get: Lookup, stem: &str) -> Result<Vec<f32>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::QuantMode;
     use crate::model::hub::{split_revision, ModelArtifacts};
     use crate::model::{ModelManifest, UniversalModelLoader};
     use std::path::PathBuf;
@@ -355,7 +354,7 @@ mod tests {
         }
     }
 
-    /// Greedy completion through the llama-style loader (GraphLm, f32): Llama at 4 and 2.5 bpw,
+    /// Greedy completion through the detected family spec (CPU): Llama at 4 and 2.5 bpw,
     /// Qwen2.5 (q/k/v biases beside the trellis) at 4 and 3 bpw.
     #[test]
     fn tinyllm_exl3_answers_paris() {
@@ -371,10 +370,8 @@ mod tests {
                 continue;
             }
             let _guard = HEAVY.lock();
-            let llm =
-                crate::model::hf_loader::load_causal_lm(&artifacts(&id), QuantMode::Uncompressed)
-                    .unwrap();
-            let out = llm.generate_text("The capital of France is", 8, 0.0);
+            let out =
+                crate::arch::testing::greedy_text(&artifacts(&id), "The capital of France is", 8);
             eprintln!("{id}: {out:?}");
             assert!(out.contains("Paris"), "{id}: {out:?}");
         }

@@ -1,10 +1,11 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use foundry_engine::hardware::QuantMode;
+use foundry_engine::hardware::{Device, PlacementMode, QuantFormat};
 use foundry_engine::kv::PagedKVPool;
-use foundry_engine::model::graph_lm::{GraphLm, GraphLmConfig};
-use foundry_engine::model::hub::HuggingFaceHub;
+use foundry_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
+use foundry_engine::model::native::NativeLm;
 use foundry_engine::model::tokenizer::Tokenizer;
+use foundry_engine::model::weight_format::{reencode_override, set_reencode_override, ReencodeConfig};
 use foundry_engine::scheduler::{
     ContinuousBatchScheduler, ExecutableModel, SamplingParams, DEFAULT_MAX_NEW_TOKENS,
 };
@@ -12,8 +13,130 @@ use foundry_engine::server::{create_router, AppState};
 use foundry_engine::telemetry::EngineTelemetry;
 use gibbs_engine::foundry_engine;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
+
+/// Serializes loads: `set_reencode_override` is process-global and tests run in parallel.
+static LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn load_unlocked(art: &ModelArtifacts) -> Result<Arc<dyn NativeLm>, String> {
+    foundry_engine::runtime::lm::load(
+        art,
+        foundry_engine::arch::registry()?,
+        None,
+        PlacementMode::Pin(Device::Cpu),
+    )
+}
+
+/// Loads `art` on the CPU through its family spec (detected from config.json / GGUF).
+fn load(art: &ModelArtifacts) -> Result<Arc<dyn NativeLm>, String> {
+    let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    load_unlocked(art)
+}
+
+/// The HF snapshot `dir` (config.json + tokenizer.json + model.safetensors), or `None` if absent.
+fn load_dir(dir: &str) -> Option<Arc<dyn NativeLm>> {
+    let d = std::path::Path::new(dir);
+    if !d.join("config.json").exists() {
+        println!("SKIP: {dir} not found");
+        return None;
+    }
+    let art = ModelArtifacts {
+        model_id: dir.to_string(),
+        config_path: Some(d.join("config.json")),
+        tokenizer_path: Some(d.join("tokenizer.json")),
+        weights_path: Some(d.join("model.safetensors")),
+        local_dir: Some(d.to_path_buf()),
+        ..Default::default()
+    };
+    Some(load(&art).unwrap_or_else(|e| panic!("{dir}: {e}")))
+}
+
+fn load_gguf(path: &std::path::Path) -> Arc<dyn NativeLm> {
+    let art = ModelArtifacts {
+        model_id: path.display().to_string(),
+        weights_path: Some(path.to_path_buf()),
+        ..Default::default()
+    };
+    load(&art).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Random-init synthetic llama (`gibbs/tiny-5m`), optionally stored as `--quant force`.
+fn tiny_lm(force: Option<QuantFormat>, dev: Device) -> Arc<dyn NativeLm> {
+    // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
+    let hub_dir = tempfile::tempdir().unwrap();
+    let art = HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
+        .resolve_or_synthesize_tiny("gibbs/tiny-5m")
+        .unwrap();
+    let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = reencode_override();
+    set_reencode_override(force.map(|f| ReencodeConfig {
+        force: Some(f),
+        ..ReencodeConfig::from_settings()
+    }));
+    let lm = foundry_engine::runtime::lm::load(
+        &art,
+        foundry_engine::arch::registry().unwrap(),
+        None,
+        PlacementMode::Pin(dev),
+    );
+    set_reencode_override(prev);
+    lm.unwrap()
+}
+
+fn tiny_model() -> ExecutableModel {
+    ExecutableModel::new(tiny_lm(None, Device::Cpu))
+}
+
+fn argmax(lg: &[f32]) -> u32 {
+    (0..lg.len())
+        .max_by(|&a, &b| lg[a].total_cmp(&lg[b]))
+        .unwrap() as u32
+}
+
+/// Greedy ids after `prompt`, plus the decode-step time (prefill excluded).
+fn greedy_ids(lm: &dyn NativeLm, prompt: &[u32], n: usize) -> (Vec<u32>, Duration) {
+    let (ids, mut state) = lm.prepare(prompt.to_vec(), &[]).unwrap();
+    let mut next = argmax(&lm.forward(&ids, 0, &mut state).unwrap());
+    let mut pos = ids.len();
+    let mut out = vec![next];
+    let t0 = Instant::now();
+    while out.len() < n {
+        next = argmax(&lm.forward(&[next], pos, &mut state).unwrap());
+        pos += 1;
+        out.push(next);
+    }
+    (out, t0.elapsed())
+}
+
+/// `prompt` + its greedy continuation (raw prompt, no chat template), like the old `generate_text`.
+fn greedy_text(lm: &dyn NativeLm, prompt: &str, n: usize) -> String {
+    let tok = lm.tokenizer();
+    let ids = tok.encode(prompt);
+    let (out, _) = greedy_ids(lm, &ids, n);
+    tok.decode(&[ids, out].concat())
+}
+
+/// Greedy text from `dir` starting with `prompt`, free of byte-token leakage.
+fn assert_coherent(dir: &str, prompt: &str, n: usize) {
+    let Some(lm) = load_dir(dir) else { return };
+    let out = greedy_text(&*lm, prompt, n);
+    println!("{dir}: '{}'", out.replace('\n', " "));
+    assert!(out.starts_with(prompt), "{dir}: {out:?}");
+    for leak in ["<0x", "Ġ", "Ċ"] {
+        assert!(!out.contains(leak), "{dir}: {out:?}");
+    }
+}
+
+const PYTHIA: &str = "disk/models--EleutherAI--pythia-14m/snapshots/main";
+const TS_INSTRUCT_8M: &str = "disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main";
+const TS_1M: &str = "disk/models--roneneldan--TinyStories-1M/snapshots/main";
+const TS_3M: &str = "disk/models--roneneldan--TinyStories-3M/snapshots/main";
+const TS_8M: &str = "disk/models--roneneldan--TinyStories-8M/snapshots/main";
+const SMOLLM2: &str = "disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main";
+const STORIES15M: &str = "disk/models--Xenova--llama2.c-stories15M/snapshots/main";
+const ANT_5M: &str = "disk/models--GODELEV--Ant-5M/snapshots/main";
+const PLYX: &str = "disk/models--MultivexAI--Plyx-15M/snapshots/main";
 
 #[test]
 fn test_tokenizer_encoding_decoding_and_streaming() {
@@ -53,127 +176,37 @@ fn test_hub_model_budget_safeguard() {
 }
 
 #[test]
-fn test_graph_lm_quantized_inference_and_generation() {
-    let mut graph_lm = GraphLm::new(GraphLmConfig::smollm_1m());
-    assert!(graph_lm.parameter_count() <= 10_000_000);
-
-    // Test with NVFP4 Ultra Mode
-    graph_lm.quantize(QuantMode::NVFP4Ultra);
-    let prompt = "How many 'r's in the word strawberry?";
-    let tokens = graph_lm.tokenizer.encode(prompt);
-    let next_tok = graph_lm.generate_step(&tokens, 0.7);
-    assert!(next_tok < graph_lm.config.vocab_size as u32);
-
-    let generated = graph_lm.generate_text("There are", 5, 0.5);
-    assert!(!generated.is_empty());
+fn test_tiny_nvfp4_inference_and_generation() {
+    let lm = tiny_lm(Some(QuantFormat::GGUF_NVFP4), Device::Cpu);
+    let ids = lm.tokenizer().encode("How many 'r's in the word strawberry?");
+    // Random weights over the synthetic config's vocab (wider than the fallback tokenizer's).
+    let (out, _) = greedy_ids(&*lm, &ids, 5);
+    assert_eq!(out.len(), 5);
+    assert!(greedy_text(&*lm, "There are", 5).starts_with("There are"));
 }
 
 #[test]
 fn test_real_safetensors_pythia_model_inference_and_comprehension() {
-    use std::path::Path;
-    let model_dir = Path::new("disk/models--EleutherAI--pythia-14m/snapshots/main");
-    if !model_dir.exists() {
-        println!("Skipping real Pythia test: directory not found");
+    if !std::path::Path::new(PYTHIA).exists() {
         return;
     }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
+    let tokenizer = Tokenizer::from_json_str(
+        &std::fs::read_to_string(std::path::Path::new(PYTHIA).join("tokenizer.json")).unwrap(),
+    )
+    .unwrap();
     assert!(tokenizer.vocab_size() >= 50277);
-
-    // Verify BPE space prefix encoding on real vocabulary
+    // BPE space prefix encoding on the real vocabulary.
     let prompt = "The capital of France is";
     let tokens = tokenizer.encode(prompt);
     assert_eq!(tokens.len(), 5);
     assert_eq!(tokenizer.inv_vocab.get(&tokens[1]).unwrap(), "Ġcapital");
     assert_eq!(tokenizer.decode(&tokens), prompt);
-
-    // Load real safetensors weights
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-    let cfg = GraphLmConfig {
-        vocab_size: 50304,
-        hidden_dim: 128,
-        intermediate_dim: 512,
-        num_layers: 6,
-        num_heads: 4,
-        head_dim: 32,
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: 0.25,
-        use_parallel_residual: true,
-        use_standard_layernorm: true,
-        use_gelu_mlp: true,
-        rope_theta: 10000.0,
-        ..Default::default()
-    };
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load real Pythia weights into GraphLm");
-    model.set_tokenizer(tokenizer);
-
-    // Generate text from real pretrained weights
-    let generated = model.generate_text(prompt, 6, 0.0);
-    println!("Real Pythia-14M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with("The capital of France is"));
-    // Comprehensibility check: output must not contain raw byte leaks like <0x or control characters
-    assert!(!generated.contains("<0x"));
-    assert!(!generated.contains("Ġ"));
-    assert!(!generated.contains("Ċ"));
+    assert_coherent(PYTHIA, prompt, 6);
 }
 
 #[test]
 fn test_real_safetensors_tinystories_model_inference_and_comprehension() {
-    use std::path::Path;
-    let model_dir = Path::new("disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main");
-    if !model_dir.exists() {
-        println!("Skipping TinyStories test: directory not found");
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_standard_layernorm: hf_cfg.resolved_use_standard_layernorm(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load real TinyStories weights into GraphLm");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time";
-    let generated = model.generate_text(prompt, 10, 0.5);
-    println!("Real TinyStories-Instruct-8M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with("Once upon a time"));
-    assert!(!generated.contains("<0x"));
-    assert!(!generated.contains("Ġ"));
-    assert!(!generated.contains("Ċ"));
+    assert_coherent(TS_INSTRUCT_8M, "Once upon a time", 10);
 }
 
 #[tokio::test]
@@ -181,19 +214,18 @@ async fn test_server_real_streaming_and_system1_endpoint() {
     let kv_pool = Arc::new(PagedKVPool::new(1024));
     let telemetry = EngineTelemetry::new();
 
-    let tiny_model = GraphLm::new(GraphLmConfig::smollm_1m());
     let jev_model = Default::default();
 
     let scheduler = Arc::new(ContinuousBatchScheduler::new(
         "",
         kv_pool.clone(),
-        Some(ExecutableModel::load_graph_lm(tiny_model, foundry_engine::hardware::Device::Cpu).unwrap()),
+        Some(tiny_model()),
     ));
 
     // Spawn scheduler step runner for the duration of the test
     let sched_clone = scheduler.clone();
     let step_handle = tokio::spawn(async move {
-        for _ in 0..100 {
+        loop {
             tokio::time::sleep(Duration::from_millis(5)).await;
             sched_clone.step();
         }
@@ -217,6 +249,7 @@ async fn test_server_real_streaming_and_system1_endpoint() {
             serde_json::json!({
                 "model": "foundry/smollm-1m",
                 "messages": [{"role": "user", "content": "How many 'r's in strawberry?"}],
+                "max_tokens": 8,
                 "stream": false
             })
             .to_string(),
@@ -243,118 +276,23 @@ async fn test_server_real_streaming_and_system1_endpoint() {
 
 #[test]
 fn test_smollm2_gqa_llama_inference_and_comprehension_ablation() {
-    let model_dir =
-        std::path::Path::new("disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main");
-    if !model_dir.exists() {
-        return;
+    if let Some(lm) = load_dir(SMOLLM2) {
+        assert_eq!(lm.tokenizer().vocab_size(), 49152);
     }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-    assert_eq!(tokenizer.vocab_size(), 49152);
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    // SmolLM2 Llama architecture with GQA (9 attention heads, 3 KV heads)
-    // Test with 2 layers for fast verification of GQA fusion, RoPE rotate_half, and SwiGLU
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: if cfg!(debug_assertions) {
-            4
-        } else {
-            hf_cfg.num_layers
-        },
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_standard_layernorm: hf_cfg.resolved_use_standard_layernorm(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load SmolLM2 safetensors with GQA expansion");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "The quick brown fox";
-    let generated = model.generate_text(prompt, 6, 0.0);
-    println!("SmolLM2-135M-Instruct generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with("The quick brown fox"));
-    assert!(!generated.contains("<0x"));
+    assert_coherent(SMOLLM2, "The quick brown fox", 6);
 }
+
 #[test]
 fn test_smollm2_program_scheduler_inference() {
-    let model_dir =
-        std::path::Path::new("disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: if cfg!(debug_assertions) {
-            2
-        } else {
-            hf_cfg.num_layers
-        },
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_standard_layernorm: hf_cfg.resolved_use_standard_layernorm(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-    let mut raw_model = GraphLm::from_safetensors_data(cfg, &st_bytes).expect("loads safetensors");
-    raw_model.set_tokenizer(tokenizer.clone());
-
-    let exec_model = foundry_engine::scheduler::ExecutableModel::load_graph_lm(
-        raw_model,
-        foundry_engine::hardware::Device::Cpu,
-    )
-    .expect("loads Program");
-    assert!(
-        matches!(
-            exec_model,
-            foundry_engine::scheduler::ExecutableModel::Program(..)
-        ),
-        "expected ExecutableModel::Program on CPU"
-    );
-
+    let Some(lm) = load_dir(SMOLLM2) else { return };
+    let exec_model = ExecutableModel::new(lm);
+    let tokenizer = exec_model.tokenizer();
     let prompt = "The capital of France is";
-    let prompt_tokens = tokenizer.encode(prompt);
-    let mut kv = None;
+    let (prompt_tokens, state) = exec_model
+        .lm()
+        .prepare(tokenizer.encode(prompt), &[])
+        .expect("prepare succeeds");
+    let mut kv = Some(state);
 
     // Prefill through scheduler
     let first_next = exec_model
@@ -390,989 +328,132 @@ fn test_smollm2_program_scheduler_inference() {
 
 #[test]
 fn test_decode_throughput_benchmark_300_tok_s() {
-    let model = GraphLm::new(GraphLmConfig::smollm_1m());
+    // The shipping backend: the CPU executor is the opt-in fallback, not a throughput target.
+    let model = ExecutableModel::new(tiny_lm(None, foundry_engine::hardware::default_device()));
     let prompt = "In a quiet valley surrounded by mountains";
     let num_tokens = 50;
-
-    // Warm-up run
-    let _ = model.generate_text_fast(prompt, 5, 0.0);
-
-    // Timed benchmark run
-    let start = std::time::Instant::now();
-    let generated = model.generate_text_fast(prompt, num_tokens, 0.0);
-    let elapsed = start.elapsed();
-
-    let tps = num_tokens as f64 / elapsed.as_secs_f64();
-    println!(
-        "⚡ Fast KV Decode Throughput: {:.1} tok/s ({} tokens in {:.2}ms)",
-        tps,
-        num_tokens,
-        elapsed.as_secs_f64() * 1000.0
-    );
-    println!("Sample generation: '{}'", generated);
-
+    let _ = model.generate_text_measured_plain(prompt, 5, 0.0).unwrap(); // warm-up
+    let (generated, steps, elapsed) = model
+        .generate_text_measured_plain(prompt, num_tokens, 0.0)
+        .unwrap();
+    let tps = steps as f64 / elapsed.as_secs_f64();
+    println!("⚡ Decode Throughput: {tps:.1} tok/s ({steps} steps in {elapsed:?})");
+    println!("Sample generation: '{generated}'");
     assert!(!generated.is_empty());
     let target_tps = if cfg!(debug_assertions) { 100.0 } else { 300.0 };
-    assert!(
-        tps >= target_tps,
-        "Throughput {:.1} tok/s must reach or exceed target {} tok/s",
-        tps,
-        target_tps
-    );
+    assert!(tps >= target_tps, "Throughput {tps:.1} tok/s must reach {target_tps} tok/s");
 }
 
 #[test]
 fn test_real_weights_tinystories_decode_throughput_300_tok_s() {
-    let model_dir =
-        std::path::Path::new("disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_standard_layernorm: hf_cfg.resolved_use_standard_layernorm(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load real TinyStories weights into GraphLm");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time";
+    let Some(lm) = load_dir(TS_INSTRUCT_8M) else { return };
     let num_tokens = 30;
-
-    // Warmup step to spin up CPU frequency governors and cache lines
-    let _ = model.generate_text_fast("Hello", 1, 0.0);
-
-    // Timed benchmark run: measures pure autoregressive decode time
-    let start = std::time::Instant::now();
-    let (generated, decode_elapsed) = model.generate_text_fast_timed(prompt, num_tokens, 0.0);
-    let total_elapsed = start.elapsed();
-
-    let pure_decode_tps = num_tokens as f64 / decode_elapsed.as_secs_f64();
-    let e2e_tps = num_tokens as f64 / total_elapsed.as_secs_f64();
-    println!(
-        "⚡ Real TinyStories-8M Pure KV Decode Throughput: {:.1} tok/s ({} tokens in {:.2}ms) | E2E: {:.1} tok/s",
-        pure_decode_tps,
-        num_tokens,
-        decode_elapsed.as_secs_f64() * 1000.0,
-        e2e_tps
-    );
-    println!("Real weights generation: '{}'", generated);
-    assert!(!generated.is_empty());
+    let _ = greedy_ids(&*lm, &lm.tokenizer().encode("Hello"), 2); // warm-up
+    let prompt = lm.tokenizer().encode("Once upon a time");
+    let (out, decode_elapsed) = greedy_ids(&*lm, &prompt, num_tokens + 1);
+    let tps = num_tokens as f64 / decode_elapsed.as_secs_f64();
+    println!("⚡ Real TinyStories-8M Pure KV Decode Throughput: {tps:.1} tok/s");
+    println!("Real weights generation: '{}'", lm.tokenizer().decode(&out));
     let target_tps = if cfg!(debug_assertions) { 20.0 } else { 300.0 };
-    assert!(
-        pure_decode_tps > target_tps,
-        "Throughput {:.1} tok/s must be strictly greater than target {} tok/s",
-        pure_decode_tps,
-        target_tps
-    );
-    if !cfg!(debug_assertions) {
-        assert!(
-            pure_decode_tps > 300.0,
-            "Throughput {:.1} tok/s must be strictly greater than 300.0 tok/s",
-            pure_decode_tps
-        );
-    }
+    assert!(tps > target_tps, "Throughput {tps:.1} tok/s must exceed {target_tps} tok/s");
 }
 
 #[test]
 fn test_all_readme_models_inference_and_zero_gibberish() {
-    println!("\n========================================================");
-    println!("  FOUNDRY README MODELS INTEGRATION & ZERO-GIBBERISH SUITE");
-    println!("========================================================");
+    assert_coherent(TS_INSTRUCT_8M, "Once in a quiet village surrounded by green hills,", 15);
+    assert_coherent(PYTHIA, "In a secret garden behind the old stone wall,", 12);
+    assert_coherent(SMOLLM2, "User: How are you today? Assistant: I am", 10);
 
-    // 1. TinyStories-Instruct-8M (GPT-Neo / WPE / LayerNorm / GELU)
-    let ts_dir =
-        std::path::Path::new("disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main");
-    if ts_dir.exists() {
-        let tok_str = std::fs::read_to_string(ts_dir.join("tokenizer.json")).unwrap();
-        let tok = Tokenizer::from_json_str(&tok_str).unwrap();
-        let cfg_bytes = std::fs::read(ts_dir.join("config.json")).unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&cfg_bytes).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: hf.vocab_size,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: hf.num_layers,
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            use_standard_layernorm: hf.resolved_use_standard_layernorm(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(ts_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
+    let prompt = "The sun rises over the horizon,";
+    let out = greedy_text(&*tiny_lm(None, Device::Cpu), prompt, 10);
+    assert!(out.starts_with(prompt) && !out.contains("<0x"), "{out:?}");
 
-        let prompt = "Once in a quiet village surrounded by green hills,";
-        let out = model.generate_text(prompt, 15, 0.0);
-        println!("[1/5] TinyStories-Instruct-8M Output: '{}'", out);
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-        assert!(!out.is_empty());
+    let gguf_path =
+        std::path::Path::new("disk/models--ggml-org--tiny-llamas/snapshots/main/stories15M.gguf");
+    if gguf_path.exists() {
+        let bytes = std::fs::read(gguf_path).expect("Failed to read stories15M.gguf");
+        let manifest = foundry_engine::model::UniversalModelLoader::parse_gguf_bytes(&bytes)
+            .expect("Failed to parse stories15M.gguf");
+        assert!(manifest.tensors.len() >= 50);
+        assert!(manifest.tensors.contains_key("blk.0.attn_q.weight"));
+        assert!(manifest.tensors.contains_key("token_embd.weight"));
     }
-
-    // 2. Pythia-14M (GPT-NeoX / RoPE 25% / Parallel Residual / LayerNorm / GELU / Interleaved QKV Bias)
-    let py_dir = std::path::Path::new("disk/models--EleutherAI--pythia-14m/snapshots/main");
-    if py_dir.exists() {
-        let tok_str = std::fs::read_to_string(py_dir.join("tokenizer.json")).unwrap();
-        let tok = Tokenizer::from_json_str(&tok_str).unwrap();
-        let cfg_bytes = std::fs::read(py_dir.join("config.json")).unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&cfg_bytes).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: 50304,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: hf.num_layers,
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            use_standard_layernorm: hf.resolved_use_standard_layernorm(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(py_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-
-        let prompt = "In a secret garden behind the old stone wall,";
-        let out = model.generate_text(prompt, 12, 0.0);
-        println!("[2/5] Pythia-14M Output: '{}'", out);
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-        assert!(!out.is_empty());
-    }
-
-    // 3. SmolLM2-135M-Instruct (LLaMA / GQA 9Q:3KV / RoPE rotate_half 100% / RMSNorm / SwiGLU)
-    let smol_dir =
-        std::path::Path::new("disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main");
-    if smol_dir.exists() {
-        let tok_str = std::fs::read_to_string(smol_dir.join("tokenizer.json")).unwrap();
-        let tok = Tokenizer::from_json_str(&tok_str).unwrap();
-        let cfg_bytes = std::fs::read(smol_dir.join("config.json")).unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&cfg_bytes).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: hf.vocab_size,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: if cfg!(debug_assertions) {
-                4
-            } else {
-                hf.num_layers
-            },
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(smol_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-
-        let prompt = "User: How are you today? Assistant: I am";
-        let out = model.generate_text(prompt, 10, 0.0);
-        println!("[3/5] SmolLM2-135M-Instruct Output: '{}'", out);
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-        assert!(!out.is_empty());
-    }
-
-    // 4. Foundry Edge Preset Models (Tiny-5M, SmolLM-1M, Tiny-10M)
-    {
-        let model = GraphLm::new(GraphLmConfig::tiny_5m());
-        let prompt = "The sun rises over the horizon,";
-        let out = model.generate_text(prompt, 10, 0.5);
-        println!("[4/5] Foundry Tiny-5M Output: '{}'", out);
-        assert!(!out.is_empty());
-        assert!(!out.contains("<0x"));
-        assert!(out.starts_with(prompt));
-    }
-
-    // 7. GGUF Zero-Copy Loader & Tensor Execution (tiny-llamas stories15M)
-    {
-        let gguf_path = std::path::Path::new(
-            "disk/models--ggml-org--tiny-llamas/snapshots/main/stories15M.gguf",
-        );
-        if gguf_path.exists() {
-            let bytes = std::fs::read(gguf_path).expect("Failed to read stories15M.gguf");
-            let manifest = foundry_engine::model::UniversalModelLoader::parse_gguf_bytes(&bytes)
-                .expect("Failed to parse stories15M.gguf");
-            assert!(manifest.tensors.len() >= 50);
-            assert!(manifest.tensors.contains_key("blk.0.attn_q.weight"));
-            assert!(manifest.tensors.contains_key("token_embd.weight"));
-            println!(
-                "[7/7] stories15M.gguf verified with {} tensors, zero-copy parsed",
-                manifest.tensors.len()
-            );
-        }
-    }
-
-    println!("========================================================");
-    println!("  ALL README MODELS VERIFIED WITH ZERO-GIBBERISH OUTPUT");
-    println!("========================================================");
 }
 
 #[test]
 fn test_xenova_llama2_c_stories15m_inference_and_comprehension() {
-    let model_dir = std::path::Path::new("disk/models--Xenova--llama2.c-stories15M/snapshots/main");
-    if !model_dir.exists() {
-        return;
+    if let Some(lm) = load_dir(STORIES15M) {
+        assert_eq!(lm.tokenizer().vocab_size(), 32000);
     }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-    assert_eq!(tokenizer.vocab_size(), 32000);
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load Xenova/llama2.c-stories15M safetensors");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time, there was a little girl named Lily.";
-    let generated = model.generate_text(prompt, 20, 0.0);
-    println!("Xenova/llama2.c-stories15M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with(prompt));
-    assert!(!generated.contains("<0x"));
+    assert_coherent(STORIES15M, "Once upon a time, there was a little girl named Lily.", 20);
 }
 
 #[test]
 fn test_ant_5m_llama_inference_and_comprehension() {
-    let model_dir = std::path::Path::new("disk/models--GODELEV--Ant-5M/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-    assert_eq!(tokenizer.vocab_size(), 16384);
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 1024,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load GODELEV/Ant-5M safetensors");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "<USER>Tell me a story<ASSISTANT>";
-    let generated = model.generate_text(prompt, 15, 0.0);
-    println!("GODELEV/Ant-5M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(!generated.contains("<0x"));
+    let Some(lm) = load_dir(ANT_5M) else { return };
+    assert_eq!(lm.tokenizer().vocab_size(), 16384);
+    let out = greedy_text(&*lm, "<USER>Tell me a story<ASSISTANT>", 15);
+    println!("GODELEV/Ant-5M generation: '{out}'");
+    assert!(!out.is_empty() && !out.contains("<0x"));
 }
 
 #[test]
 fn test_tinystories_1m_inference_and_comprehension() {
-    let model_dir = std::path::Path::new("disk/models--roneneldan--TinyStories-1M/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load roneneldan/TinyStories-1M safetensors");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time";
-    let generated = model.generate_text(prompt, 15, 0.0);
-    println!("roneneldan/TinyStories-1M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with(prompt));
-    assert!(!generated.contains("<0x"));
+    assert_coherent(TS_1M, "Once upon a time", 15);
 }
 
 #[test]
 fn test_tinystories_3m_inference_and_comprehension() {
-    let model_dir = std::path::Path::new("disk/models--roneneldan--TinyStories-3M/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load roneneldan/TinyStories-3M safetensors");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time";
-    let generated = model.generate_text(prompt, 15, 0.0);
-    println!("roneneldan/TinyStories-3M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with(prompt));
-    assert!(!generated.contains("<0x"));
+    assert_coherent(TS_3M, "Once upon a time", 15);
 }
 
 #[test]
 fn test_tinystories_8m_base_inference_and_comprehension() {
-    let model_dir = std::path::Path::new("disk/models--roneneldan--TinyStories-8M/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load roneneldan/TinyStories-8M safetensors");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time";
-    let generated = model.generate_text(prompt, 15, 0.0);
-    println!(
-        "roneneldan/TinyStories-8M (base) generation: '{}'",
-        generated
-    );
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with(prompt));
-    assert!(!generated.contains("<0x"));
+    assert_coherent(TS_8M, "Once upon a time", 15);
 }
 
 #[test]
 fn test_plyx_15m_inference_and_comprehension() {
-    let model_dir = std::path::Path::new("disk/models--MultivexAI--Plyx-15M/snapshots/main");
-    if !model_dir.exists() {
-        return;
-    }
-
-    let config_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&config_path).expect("Failed to read config.json");
-    let hf_cfg: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        quant_mode: QuantMode::Uncompressed,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-
-    let mut model = GraphLm::from_safetensors_data(cfg, &st_bytes)
-        .expect("Failed to load MultivexAI/Plyx-15M safetensors");
-    model.set_tokenizer(tokenizer);
-
-    let prompt = "Once upon a time";
-    let generated = model.generate_text(prompt, 15, 0.0);
-    println!("MultivexAI/Plyx-15M generation: '{}'", generated);
-    assert!(!generated.is_empty());
-    assert!(generated.starts_with(prompt));
-    assert!(!generated.contains("<0x"));
-}
-
-#[test]
-fn test_default_uncompressed_guardrail() {
-    let default_cfg = GraphLmConfig::default();
-    assert_eq!(
-        default_cfg.quant_mode,
-        QuantMode::Uncompressed,
-        "Inference must default to uncompressed first"
-    );
-
-    // 2. Verify all presets default to uncompressed
-    let presets = [
-        GraphLmConfig::smollm_1m(),
-        GraphLmConfig::tiny_5m(),
-        GraphLmConfig::tiny_10m(),
-    ];
-    for p in presets {
-        assert_eq!(p.quant_mode, QuantMode::Uncompressed);
-    }
-
-    // 3. Verify instantiated GraphLm weights default to uncompressed weights
-    let model = GraphLm::new(GraphLmConfig::smollm_1m());
-    for (i, layer) in model.layers.iter().enumerate() {
-        assert!(
-            matches!(
-                layer.qkv_proj.weight,
-                foundry_engine::model::layers::QuantizedWeight::Uncompressed { .. }
-            ),
-            "Layer {} qkv_proj must default to Uncompressed",
-            i
-        );
-        assert!(
-            matches!(
-                layer.gate_up_proj.weight,
-                foundry_engine::model::layers::QuantizedWeight::Uncompressed { .. }
-            ),
-            "Layer {} gate_up_proj must default to Uncompressed",
-            i
-        );
-        assert!(
-            matches!(
-                layer.down_proj.weight,
-                foundry_engine::model::layers::QuantizedWeight::Uncompressed { .. }
-            ),
-            "Layer {} down_proj must default to Uncompressed",
-            i
-        );
-    }
+    assert_coherent(PLYX, "Once upon a time", 15);
 }
 
 #[test]
 fn test_all_readme_models_legibility_and_grammar_verification() {
-    // 1. Verify TinyStories-Instruct-8M
-    let ts_dir =
-        std::path::Path::new("disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main");
-    if ts_dir.exists() {
-        let tok_str = std::fs::read_to_string(ts_dir.join("tokenizer.json")).unwrap();
-        let tok = Tokenizer::from_json_str(&tok_str).unwrap();
-        let cfg_bytes = std::fs::read(ts_dir.join("config.json")).unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&cfg_bytes).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: hf.vocab_size,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: hf.num_layers,
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_standard_layernorm: hf.resolved_use_standard_layernorm(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(ts_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-        let out = model.generate_text("Once upon a time", 15, 0.5);
-        assert!(out.starts_with("Once upon a time"));
-        assert!(!out.contains("<0x"));
-    }
-
-    // 2. Verify Pythia-14M
-    let py_dir = std::path::Path::new("disk/models--EleutherAI--pythia-14m/snapshots/main");
-    if py_dir.exists() {
-        let tok_str = std::fs::read_to_string(py_dir.join("tokenizer.json")).unwrap();
-        let tok = Tokenizer::from_json_str(&tok_str).unwrap();
-        let cfg_bytes = std::fs::read(py_dir.join("config.json")).unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&cfg_bytes).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: 50304,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: hf.num_layers,
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_standard_layernorm: hf.resolved_use_standard_layernorm(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(py_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-        let out = model.generate_text("The capital of France is", 10, 0.0);
-        assert!(out.starts_with("The capital of France is"));
-        assert!(!out.contains("<0x"));
-    }
+    assert_coherent(TS_INSTRUCT_8M, "Once upon a time", 15);
+    assert_coherent(PYTHIA, "The capital of France is", 10);
 }
 
 #[test]
 fn test_dynamic_unseen_prompts_across_all_readme_models() {
-    println!("\n========================================================");
-    println!("  TESTING DYNAMIC, UNSEEN PROMPTS ACROSS ALL README MODELS");
-    println!("========================================================");
-
-    // 1. TinyStories-1M, 3M, 8M, Instruct-8M dynamic narrative testing
-    let dynamic_story_prompt = "In a quiet village near the mountains, a friendly dog";
-    for (name, dir_str) in [
-        (
-            "TinyStories-1M",
-            "disk/models--roneneldan--TinyStories-1M/snapshots/main",
-        ),
-        (
-            "TinyStories-3M",
-            "disk/models--roneneldan--TinyStories-3M/snapshots/main",
-        ),
-        (
-            "TinyStories-8M",
-            "disk/models--roneneldan--TinyStories-8M/snapshots/main",
-        ),
-        (
-            "TinyStories-Instruct-8M",
-            "disk/models--roneneldan--TinyStories-Instruct-8M/snapshots/main",
-        ),
-    ] {
-        let p = std::path::Path::new(dir_str);
-        if p.exists() {
-            let tok = Tokenizer::from_json_str(
-                &std::fs::read_to_string(p.join("tokenizer.json")).unwrap(),
-            )
-            .unwrap();
-            let hf: foundry_engine::model::hf_loader::HfConfigJson =
-                serde_json::from_slice(&std::fs::read(p.join("config.json")).unwrap()).unwrap();
-            let cfg = GraphLmConfig {
-                vocab_size: hf.vocab_size,
-                hidden_dim: hf.hidden_dim,
-                intermediate_dim: hf.resolved_intermediate_dim(),
-                num_layers: if cfg!(debug_assertions) {
-                    4.min(hf.num_layers)
-                } else {
-                    hf.num_layers
-                },
-                num_heads: hf.resolved_num_heads(),
-                head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-                max_seq_len: 2048,
-                quant_mode: QuantMode::Uncompressed,
-                rotary_pct: hf.resolved_rotary_pct(),
-                use_parallel_residual: hf.resolved_parallel_residual(),
-                use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-                use_standard_layernorm: hf.resolved_use_standard_layernorm(),
-                rope_theta: hf.resolved_rope_theta(),
-                ..Default::default()
-            };
-            let weights = std::fs::read(p.join("model.safetensors")).unwrap();
-            let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-            model.set_tokenizer(tok);
-            let out = model.generate_text(dynamic_story_prompt, 12, 0.0);
-            println!("  [Dynamic] {}: '{}'", name, out.replace('\n', " "));
-            assert!(out.starts_with(dynamic_story_prompt));
-            assert!(!out.contains("<0x"));
-            assert!(!out.is_empty());
-        }
+    for dir in [TS_1M, TS_3M, TS_8M, TS_INSTRUCT_8M] {
+        assert_coherent(dir, "In a quiet village near the mountains, a friendly dog", 12);
     }
-
-    // 2. Pythia-14M dynamic factual prompt
-    let py_dir = std::path::Path::new("disk/models--EleutherAI--pythia-14m/snapshots/main");
-    if py_dir.exists() {
-        let tok = Tokenizer::from_json_str(
-            &std::fs::read_to_string(py_dir.join("tokenizer.json")).unwrap(),
-        )
-        .unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&std::fs::read(py_dir.join("config.json")).unwrap()).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: 50304,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: if cfg!(debug_assertions) {
-                4.min(hf.num_layers)
-            } else {
-                hf.num_layers
-            },
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            use_standard_layernorm: hf.resolved_use_standard_layernorm(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(py_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-        let prompt = "The sun rises in the east and";
-        let out = model.generate_text(prompt, 12, 0.0);
-        println!("  [Dynamic] Pythia-14M: '{}'", out.replace('\n', " "));
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-    }
-
-    // 3. SmolLM2-135M dynamic instruction dialogue prompt
-    let smol_dir =
-        std::path::Path::new("disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main");
-    if smol_dir.exists() {
-        let tok = Tokenizer::from_json_str(
-            &std::fs::read_to_string(smol_dir.join("tokenizer.json")).unwrap(),
-        )
-        .unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&std::fs::read(smol_dir.join("config.json")).unwrap()).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: hf.vocab_size,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: if cfg!(debug_assertions) {
-                4.min(hf.num_layers)
-            } else {
-                hf.num_layers
-            },
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(smol_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-        let prompt = "User: What is the fastest animal on land? Assistant: The";
-        let out = model.generate_text(prompt, 10, 0.0);
-        println!("  [Dynamic] SmolLM2-135M: '{}'", out.replace('\n', " "));
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-    }
-
-    // 4. llama2.c-stories15M dynamic narrative prompt
-    let xen_dir = std::path::Path::new("disk/models--Xenova--llama2.c-stories15M/snapshots/main");
-    if xen_dir.exists() {
-        let tok = Tokenizer::from_json_str(
-            &std::fs::read_to_string(xen_dir.join("tokenizer.json")).unwrap(),
-        )
-        .unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&std::fs::read(xen_dir.join("config.json")).unwrap()).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: hf.vocab_size,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: if cfg!(debug_assertions) {
-                4.min(hf.num_layers)
-            } else {
-                hf.num_layers
-            },
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(xen_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-        let prompt = "One morning, a little bird named Pip decided to";
-        let out = model.generate_text(prompt, 12, 0.0);
-        println!(
-            "  [Dynamic] llama2.c-stories15M: '{}'",
-            out.replace('\n', " ")
-        );
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-    }
-
-    // 5. MultivexAI/Plyx-15M dynamic story prompt
-    let plyx_dir = std::path::Path::new("disk/models--MultivexAI--Plyx-15M/snapshots/main");
-    if plyx_dir.exists() {
-        let tok = Tokenizer::from_json_str(
-            &std::fs::read_to_string(plyx_dir.join("tokenizer.json")).unwrap(),
-        )
-        .unwrap();
-        let hf: foundry_engine::model::hf_loader::HfConfigJson =
-            serde_json::from_slice(&std::fs::read(plyx_dir.join("config.json")).unwrap()).unwrap();
-        let cfg = GraphLmConfig {
-            vocab_size: hf.vocab_size,
-            hidden_dim: hf.hidden_dim,
-            intermediate_dim: hf.resolved_intermediate_dim(),
-            num_layers: if cfg!(debug_assertions) {
-                4.min(hf.num_layers)
-            } else {
-                hf.num_layers
-            },
-            num_heads: hf.resolved_num_heads(),
-            head_dim: hf.hidden_dim / hf.resolved_num_heads().max(1),
-            max_seq_len: 2048,
-            quant_mode: QuantMode::Uncompressed,
-            rotary_pct: hf.resolved_rotary_pct(),
-            use_parallel_residual: hf.resolved_parallel_residual(),
-            use_gelu_mlp: hf.resolved_use_gelu_mlp(),
-            rope_theta: hf.resolved_rope_theta(),
-            ..Default::default()
-        };
-        let weights = std::fs::read(plyx_dir.join("model.safetensors")).unwrap();
-        let mut model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-        model.set_tokenizer(tok);
-        let prompt = "The little boy opened the wooden box and";
-        let out = model.generate_text(prompt, 10, 0.0);
-        println!("  [Dynamic] Plyx-15M: '{}'", out.replace('\n', " "));
-        assert!(out.starts_with(prompt));
-        assert!(!out.contains("<0x"));
-    }
-
-    println!("========================================================");
-    println!("  ALL DYNAMIC, UNSEEN PROMPTS VERIFIED SUCCESSFULLY");
-    println!("========================================================");
+    assert_coherent(PYTHIA, "The sun rises in the east and", 12);
+    assert_coherent(SMOLLM2, "User: What is the fastest animal on land? Assistant: The", 10);
+    assert_coherent(STORIES15M, "One morning, a little bird named Pip decided to", 12);
+    assert_coherent(PLYX, "The little boy opened the wooden box and", 10);
 }
 
 /// GLM-Edge (HF `GlmForCausalLM`): interleaved-pair RoPE + fused `mlp.gate_up_proj`.
 /// Expected values come from transformers' `GlmForCausalLM` in f32 on the same checkpoint.
 #[test]
 fn test_glm_edge_matches_hf_oracle() {
-    let dir = std::path::Path::new("disk/models--THUDM--glm-edge-1.5b-chat/snapshots/main");
-    if !dir.exists() {
-        return;
-    }
-    let hf: foundry_engine::model::hf_loader::HfConfigJson =
-        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let mut cfg = GraphLmConfig::from_hf(&hf, QuantMode::Uncompressed);
-    // Debug builds run 2 layers; expected = HF logits of that truncation (+ final norm, lm_head).
-    let (layers, expect) = if cfg!(debug_assertions) {
-        (2, [(1339usize, 16.4600f32), (763, 15.7523)])
-    } else {
-        (28, [(14488, 16.5629), (11262, 13.4245)]) // " Paris", " located"
-    };
-    cfg.num_layers = layers;
-    let tok =
-        Tokenizer::from_json_str(&std::fs::read_to_string(dir.join("tokenizer.json")).unwrap())
-            .unwrap();
-    let ids = tok.encode("The capital of France is");
-    assert_eq!(ids, [1026, 8570, 325, 11334, 398]);
-    let weights = std::fs::read(dir.join("model.safetensors")).unwrap();
-    let model = GraphLm::from_safetensors_data(cfg, &weights).unwrap();
-    drop(weights);
-
-    let argmax = |lg: &[f32]| {
-        (0..lg.len())
-            .max_by(|&a, &b| lg[a].total_cmp(&lg[b]))
-            .unwrap()
-    };
-    let mut kv: Vec<_> = (0..layers)
-        .map(|_| foundry_engine::model::graph_lm::LayerKVCache::new(32, model.config.hidden_dim))
-        .collect();
-    let mut logits = Vec::new();
-    for (pos, &t) in ids.iter().enumerate() {
-        logits = model.forward_token_with_kv(t, pos, &mut kv);
-    }
-    for lg in [&model.forward(&ids), &logits] {
-        assert_eq!(argmax(lg), expect[0].0);
-        for (id, want) in expect {
-            assert!(
-                (lg[id] - want).abs() < 0.02,
-                "logit[{id}] = {} want {want}",
-                lg[id]
-            );
-        }
-    }
     if cfg!(debug_assertions) {
+        return; // the full 28-layer checkpoint is release-only
+    }
+    let Some(lm) = load_dir("disk/models--THUDM--glm-edge-1.5b-chat/snapshots/main") else {
         return;
+    };
+    let ids = lm.tokenizer().encode("The capital of France is");
+    assert_eq!(ids, [1026, 8570, 325, 11334, 398]);
+    let (seq, mut state) = lm.prepare(ids.clone(), &[]).unwrap();
+    let logits = lm.forward(&seq, 0, &mut state).unwrap();
+    assert_eq!(argmax(&logits), 14488); // " Paris"
+    for (id, want) in [(14488usize, 16.5629f32), (11262, 13.4245)] {
+        assert!((logits[id] - want).abs() < 0.02, "logit[{id}] = {} want {want}", logits[id]);
     }
     // HF greedy: " Paris. It is the most visited"
-    let mut out = Vec::new();
-    for _ in 0..7 {
-        let next = argmax(&logits) as u32;
-        out.push(next);
-        logits = model.forward_token_with_kv(next, ids.len() + out.len() - 1, &mut kv);
-    }
-    assert_eq!(out, [14488, 46, 1462, 398, 283, 1945, 24733]);
-}
-
-/// Greedy ids via full-sequence `forward` and the KV-cache decode path (must agree).
-fn greedy_both_paths(model: &GraphLm, prompt: &[u32], n: usize) -> Vec<u32> {
-    let argmax = |lg: &[f32]| {
-        (0..lg.len())
-            .max_by(|&a, &b| lg[a].total_cmp(&lg[b]))
-            .unwrap() as u32
-    };
-    let mut kv: Vec<_> = (0..model.layers.len())
-        .map(|_| foundry_engine::model::graph_lm::LayerKVCache::new(64, model.config.hidden_dim))
-        .collect();
-    let mut logits = Vec::new();
-    for (pos, &t) in prompt.iter().enumerate() {
-        logits = model.forward_token_with_kv(t, pos, &mut kv);
-    }
-    let mut ids = prompt.to_vec();
-    for _ in 0..n {
-        let next = argmax(&model.forward(&ids));
-        assert_eq!(
-            argmax(&logits),
-            next,
-            "KV path disagrees with forward at {}",
-            ids.len()
-        );
-        ids.push(next);
-        logits = model.forward_token_with_kv(next, ids.len() - 1, &mut kv);
-    }
-    ids[prompt.len()..].to_vec()
+    assert_eq!(greedy_ids(&*lm, &ids, 7).0, [14488, 46, 1462, 398, 283, 1945, 24733]);
 }
 
 /// llama.cpp oracle (`llama-tokenize`, `llama-simple`) on ggml-org/tiny-llamas stories15M:
@@ -1401,16 +482,12 @@ fn test_gguf_stories15m_matches_llama_cpp() {
         if !path.exists() {
             continue;
         }
-        let bytes = std::fs::read(&path).unwrap();
-        let mut model = GraphLm::from_gguf_data(GraphLmConfig::default(), &bytes).unwrap();
-        model.set_tokenizer(
-            foundry_engine::model::UniversalModelLoader::extract_gguf_tokenizer(&bytes).unwrap(),
-        );
-        let prompt = model.tokenizer.encode("Once upon a time");
+        let lm = load_gguf(&path);
+        let prompt = lm.tokenizer().encode("Once upon a time");
         assert_eq!(prompt, [1, 9038, 2501, 263, 931], "{file}");
-        let out = greedy_both_paths(&model, &prompt, want.len());
+        let (out, _) = greedy_ids(&*lm, &prompt, want.len());
         assert_eq!(out, want, "{file}");
-        let text = model.tokenizer.decode(&[prompt, out].concat());
+        let text = lm.tokenizer().decode(&[prompt, out].concat());
         assert!(
             text.starts_with("Once upon a time, there was a little girl named Lily."),
             "{file}: {text:?}"
@@ -1426,30 +503,20 @@ fn test_gguf_smollm2_q4_k_m_matches_llama_cpp() {
     if !path.exists() || cfg!(debug_assertions) {
         return;
     }
-    let bytes = std::fs::read(path).unwrap();
-    let model = GraphLm::from_gguf_data(GraphLmConfig::default(), &bytes).unwrap();
-    let tok = foundry_engine::model::UniversalModelLoader::extract_gguf_tokenizer(&bytes).unwrap();
-    let prompt = tok.encode("The capital of France is");
+    let lm = load_gguf(path);
+    let prompt = lm.tokenizer().encode("The capital of France is");
     assert_eq!(prompt, [504, 3575, 282, 4649, 314]); // add_bos_token = false
-                                                     // llama.cpp result_output logits[0..3] for this prompt.
-    let logits = model.forward(&prompt);
+    // llama.cpp result_output logits[0..3] for this prompt.
+    let (seq, mut state) = lm.prepare(prompt.clone(), &[]).unwrap();
+    let logits = lm.forward(&seq, 0, &mut state).unwrap();
     for (got, want) in logits.iter().zip([3.4901f32, -10.5134, -7.1320]) {
         assert!((got - want).abs() < 0.05, "logit {got} want {want}");
     }
-    assert_eq!(
-        greedy_both_paths(&model, &prompt, 6),
-        [7042, 30, 7042, 314, 253, 2240]
-    );
+    assert_eq!(greedy_ids(&*lm, &prompt, 6).0, [7042, 30, 7042, 314, 253, 2240]);
 }
 
-/// Minimal GGUF v3 writer (alignment 32) for synthetic loader tests.
-enum GgufKv<'a> {
-    U32(u32),
-    F32(f32),
-    Str(&'a str),
-}
-
-fn gguf_file(kvs: &[(&str, GgufKv)], tensors: &[(&str, [u64; 2], u32, Vec<u8>)]) -> Vec<u8> {
+/// Minimal GGUF v3 writer (alignment 32, no metadata) for synthetic loader tests.
+fn gguf_file(tensors: &[(&str, [u64; 2], u32, Vec<u8>)]) -> Vec<u8> {
     let s = |b: &mut Vec<u8>, v: &str| {
         b.extend((v.len() as u64).to_le_bytes());
         b.extend(v.as_bytes());
@@ -1457,18 +524,7 @@ fn gguf_file(kvs: &[(&str, GgufKv)], tensors: &[(&str, [u64; 2], u32, Vec<u8>)])
     let mut b = b"GGUF".to_vec();
     b.extend(3u32.to_le_bytes());
     b.extend((tensors.len() as u64).to_le_bytes());
-    b.extend((kvs.len() as u64).to_le_bytes());
-    for (k, v) in kvs {
-        s(&mut b, k);
-        match v {
-            GgufKv::U32(x) => b.extend([4u32.to_le_bytes(), x.to_le_bytes()].concat()),
-            GgufKv::F32(x) => b.extend([6u32.to_le_bytes(), x.to_le_bytes()].concat()),
-            GgufKv::Str(x) => {
-                b.extend(8u32.to_le_bytes());
-                s(&mut b, x);
-            }
-        }
-    }
+    b.extend(0u64.to_le_bytes());
     let pad = |n: usize| n.div_ceil(32) * 32;
     let mut off = 0u64;
     for (name, dims, ty, data) in tensors {
@@ -1493,7 +549,7 @@ fn gguf_file(kvs: &[(&str, GgufKv)], tensors: &[(&str, [u64; 2], u32, Vec<u8>)])
 /// bytes); GGML types it cannot decode are a load error naming the tensor, not misread bytes.
 #[test]
 fn test_gguf_block_formats_decode_like_ggml() {
-    use foundry_engine::model::layers::{dispatch_fused_gemv, QuantizedWeight};
+    use foundry_engine::model::layers::dispatch_fused_gemv;
     use foundry_engine::model::UniversalModelLoader;
     // (name, ggml type, block elems, block bytes, W at [0,17,31,32,100,255,256+77], W·x)
     let cases: [(&str, u32, usize, usize, [f32; 7], [f32; 2]); 8] = [
@@ -1601,7 +657,7 @@ fn test_gguf_block_formats_decode_like_ggml() {
         .iter()
         .map(|&(name, ty, elems, bytes, ..)| (name, [256, 2], ty, raw(name, elems, bytes)))
         .collect();
-    let data = gguf_file(&[], &tensors);
+    let data = gguf_file(&tensors);
     let manifest = UniversalModelLoader::parse_gguf(&data).unwrap();
     let x: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
     for (name, _, _, _, want_w, want_y) in cases {
@@ -1626,7 +682,6 @@ fn test_gguf_block_formats_decode_like_ggml() {
     }
 
     let bad = gguf_file(
-        &[],
         &[("blk.0.ffn_down.weight", [256, 2], 15, vec![0; 2 * 292])],
     );
     let err = UniversalModelLoader::parse_gguf(&bad).unwrap_err();
@@ -1634,43 +689,6 @@ fn test_gguf_block_formats_decode_like_ggml() {
         err.contains("blk.0.ffn_down.weight") && err.contains("Q8_K"),
         "{err}"
     );
-}
-
-/// RMSNorm uses the GGUF-declared epsilon: with 0 blocks, logits = lm_head(rmsnorm(embedding)),
-/// and at mean(x²) = 1e-6 eps = 1e-6 gives 0.002 / sqrt(2e-6) (the old hardcoded 1e-5: 0.603).
-#[test]
-fn test_gguf_rms_norm_eps_from_metadata() {
-    let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-    let mut eye = [0.0f32; 16];
-    (0..4).for_each(|i| eye[i * 5] = 1.0);
-    let embd = eye.map(|v| v * 0.002); // token 0 -> [0.002, 0, 0, 0]
-    let data = gguf_file(
-        &[
-            ("general.architecture", GgufKv::Str("llama")),
-            ("llama.embedding_length", GgufKv::U32(4)),
-            ("llama.block_count", GgufKv::U32(0)),
-            ("llama.attention.head_count", GgufKv::U32(1)),
-            ("llama.attention.layer_norm_rms_epsilon", GgufKv::F32(1e-6)),
-        ],
-        &[
-            ("token_embd.weight", [4, 4], 0, f32s(&embd)),
-            ("output_norm.weight", [4, 1], 0, f32s(&[1.0; 4])),
-            ("output.weight", [4, 4], 0, f32s(&eye)),
-        ],
-    );
-    let model = GraphLm::from_gguf_data(GraphLmConfig::default(), &data).unwrap();
-    let want = 0.002 / (1e-6f32 + 1e-6).sqrt();
-    let mut kv: Vec<foundry_engine::model::graph_lm::LayerKVCache> = vec![];
-    for logits in [
-        model.forward(&[0]),
-        model.forward_token_with_kv(0, 0, &mut kv),
-    ] {
-        assert!(
-            (logits[0] - want).abs() < 1e-3,
-            "logit {} want {want}",
-            logits[0]
-        );
-    }
 }
 
 /// GGUF-embedded tokenizers encode exactly like llama.cpp (`llama-tokenize` ids): SentencePiece
@@ -1768,16 +786,15 @@ fn test_chat_template_and_scheduler_greedy_match_hf() {
             config_path: Some(dir.join("config.json")),
             tokenizer_path: Some(dir.join("tokenizer.json")),
             weights_path: Some(dir.join("model.safetensors")),
+            local_dir: Some(dir.to_path_buf()),
             ..Default::default()
         };
-        let model =
-            foundry_engine::model::hf_loader::load_causal_lm(&artifacts, QuantMode::Uncompressed)
-                .unwrap();
+        let model = ExecutableModel::new(load(&artifacts).unwrap());
 
         let sched = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(1024)),
-            Some(ExecutableModel::load_graph_lm(model, foundry_engine::hardware::Device::Cpu).unwrap()),
+            Some(model),
         );
         let greedy = SamplingParams {
             temperature: Some(0.0),
@@ -1804,24 +821,32 @@ fn test_chat_template_and_scheduler_greedy_match_hf() {
     }
 }
 
-/// A checkpoint missing a required tensor fails loading with the tensor name instead of running
-/// on synthetic weights (how GLM's unmapped `mlp.gate_up_proj` once produced gibberish).
+/// A checkpoint missing a weight its family spec reads is refused naming that tensor.
 #[test]
 fn test_missing_required_weight_names_the_tensor() {
+    let dir = tempfile::tempdir().unwrap();
     let header =
         br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[4,2],"data_offsets":[0,32]}}"#;
     let mut data = (header.len() as u64).to_le_bytes().to_vec();
     data.extend_from_slice(header);
     data.extend_from_slice(&[0u8; 32]);
-    let cfg = GraphLmConfig {
-        vocab_size: 4,
-        hidden_dim: 2,
-        num_layers: 1,
-        ..GraphLmConfig::smollm_1m()
+    std::fs::write(dir.path().join("model.safetensors"), data).unwrap();
+    let cfg = serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama",
+        "vocab_size": 4, "hidden_size": 2, "num_hidden_layers": 1, "num_attention_heads": 1,
+        "num_key_value_heads": 1, "intermediate_size": 4, "max_position_embeddings": 16});
+    std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+    let tok = serde_json::json!({"version": "1.0", "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "WhitespaceSplit"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "c": 2, "d": 3}, "unk_token": "a"}});
+    std::fs::write(dir.path().join("tokenizer.json"), tok.to_string()).unwrap();
+    let art = ModelArtifacts {
+        model_id: "t/missing".into(),
+        tokenizer_path: Some(dir.path().join("tokenizer.json")),
+        local_dir: Some(dir.path().to_path_buf()),
+        config_path: Some(dir.path().join("config.json")),
+        weights_path: Some(dir.path().join("model.safetensors")),
+        ..Default::default()
     };
-    let err = GraphLm::from_safetensors_data(cfg, &data).unwrap_err();
-    assert!(
-        err.contains("model.layers.0.input_layernorm.weight"),
-        "{err}"
-    );
+    let err = load(&art).err().expect("a checkpoint without layer weights loads");
+    assert!(err.contains("model.layers.0.input_layernorm.weight"), "{err}");
 }

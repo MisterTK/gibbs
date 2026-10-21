@@ -5,7 +5,7 @@ use gibbs_engine::hardware::Device;
 use gibbs_engine::model::hf_loader::ChatMessage;
 use gibbs_engine::model::hub::ModelArtifacts;
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::native::{load_native, MediaInput, NativeLm};
+use gibbs_engine::model::native::{MediaInput, NativeLm};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,9 +27,13 @@ fn model() -> Option<Arc<dyn NativeLm>> {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, Device::Cpu)
-            .expect("idefics3 is native")
-            .expect("loads"),
+        gibbs_engine::runtime::lm::load(
+            &artifacts,
+            gibbs_engine::arch::registry().expect("registry"),
+            None,
+            gibbs_engine::hardware::PlacementMode::Pin(Device::Cpu),
+        )
+        .expect("loads"),
     )
 }
 
