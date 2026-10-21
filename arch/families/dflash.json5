@@ -1,0 +1,270 @@
+// Block drafters for speculative decoding, conditioned on target hidden states (run by
+// `runtime::draft`): z-lab `DFlashDraftModel` / `DFlash2DraftModel`, the vLLM speculators
+// `dflash` / `dflash2` / `dspark` formats, `DSparkDraftModel`, dense `Qwen3DSparkModel` and
+// llama.cpp `dflash` GGUF sidecars. One non-causal pass of a few Qwen3 layers over
+// `[anchor, mask, ...]`, whose keys/values also cover every committed position (projected from
+// the target's tapped hidden states by `fc` + `hidden_norm`), predicts a whole block. DFlash2 adds
+// grouped dynamic convolutions around each sublayer and a top-k candidate selector walked left
+// to right; DSpark a low-rank Markov bias on the previous token (and an own, possibly pruned,
+// head with its `d2t` map to target ids). Token embeddings and the LM head are the target's
+// (`runtime.shared_from_target`, names `target.*`).
+//
+// References: github.com/z-lab/dflash `dflash/model.py`; vllm-project/speculators
+// `models/{dflash,dflash2,dspark}`; vLLM `model_executor/models/qwen3_dspark.py`.
+{
+  family: "dflash",
+  match: {
+    hf_architectures: ["DFlashDraftModel", "DFlash2DraftModel", "DSparkDraftModel", "Qwen3DSparkModel"],
+    gguf_arch: ["dflash"],
+  },
+  pipeline: "drafter",
+  use_lib: ["transformer"],
+  config: {
+    gguf_arch: "first(gguf['general.architecture'], '')",
+    // speculators checkpoints nest the Qwen3 layer config and count taps as "input of layer i"
+    // (llama.cpp's `dflash.target_layers` too).
+    speculators: "first(cfg.speculators_model_type, '') != ''",
+    lc: "first(cfg.transformer_layer_config, cfg)",
+    dc: "first(cfg.dflash_config, cfg)",
+    arch: "first(at(cfg.architectures, 0), '')",
+    hidden: "first(lc.hidden_size, gguf.embedding_length)",
+    layers: "first(lc.num_hidden_layers, gguf.block_count)",
+    heads: "first(lc.num_attention_heads, gguf['attention.head_count'])",
+    kv_heads: "first(lc.num_key_value_heads, gguf['attention.head_count_kv'])",
+    head_dim: "first(lc.head_dim, gguf['attention.key_length'], hidden // heads)",
+    inter: "first(lc.intermediate_size, gguf.feed_forward_length)",
+    eps: "first(lc.rms_norm_eps, gguf['attention.layer_norm_rms_epsilon'], 1e-6)",
+    rope: "first(lc.rope_parameters, lc.rope_scaling)",
+    rope_type: "first(rope.rope_type, rope.type, 'default')",
+    theta: "first(rope.rope_theta, lc.rope_theta, gguf['rope.freq_base'])",
+    rotary_pct: "first(rope.partial_rotary_factor, first(gguf['rope.dimension_count'], head_dim) / head_dim)",
+    rotary_dim: "head_dim",
+    rope_variant: "'HalfSplit'",
+    attn_scale: "1 / sqrt(head_dim)",
+    norm_kind: "'rms'",
+    act: "'Silu'",
+    window: "first(lc.sliding_window, gguf['attention.sliding_window'], 0)",
+    layer_types: "first(lc.layer_types, [])",
+    sliding_pattern: "first(gguf['attention.sliding_window_pattern'], [])",
+    // Per-layer causality: z-lab `is_causal` (llama.cpp `attention.causal`) overrides; otherwise
+    // sliding layers are causal (speculators: unless `sliding_window_non_causal`), full layers
+    // see the whole block.
+    causal_override: "speculators ? -1 : first(cfg.is_causal, gguf['attention.causal'], -1)",
+    non_causal_sliding: "speculators && cfg.sliding_window_non_causal == true",
+    block: "first(dc.block_size, cfg.block_size, gguf.block_size)",
+    mask_token: "first(dc.mask_token_id, cfg.mask_token_id, gguf['tokenizer.ggml.mask_token_id'])",
+    taps: "speculators ? cfg.aux_hidden_state_layer_ids : first(dc.target_layer_ids, cfg.target_layer_ids, gguf.target_layers)",
+    tap_shift: "speculators || gguf_arch != '' ? 1 : 0",
+    head: "has('candidate_selector.predecessor_codebook') ? 'selector' : has('markov_head.markov_w1.weight') ? 'markov' : 'plain'",
+    // DSpark `sample_from_anchor`: every block row predicts the token after it; else the anchor
+    // row is context and mask rows predict their own position.
+    from_anchor: "first(dc.sample_from_anchor, cfg.sample_from_anchor, gguf.sample_from_anchor, first(cfg.speculators_model_type, '') == 'dspark' || contains(arch, 'DSpark') || (gguf_arch != '' && head == 'markov')) == true || first(gguf.sample_from_anchor, 0) == 1",
+    first_row: "from_anchor ? 0 : 1",
+    group: "first(dc.conv_group_size, cfg.conv_group_size, gguf.conv_group_size)",
+    top_k: "first(dc.selector_top_k, cfg.selector_top_k, gguf.selector_top_k)",
+    label: "head == 'selector' ? 'DFlash2' : head == 'markov' ? 'DSpark' : 'DFlash'",
+    ctx: "first(runtime.ctx, lc.max_position_embeddings, 4096)",
+  },
+  checks: [
+    {expr: "taps == null", error: "drafter config has no target_layer_ids"},
+    {expr: "block == null || mask_token == null", error: "drafter config has no block_size / mask_token_id"},
+    {expr: "block < 2", error: "block_size {block} drafts nothing"},
+    {expr: "first(dc.output_multiplier, cfg.output_multiplier, gguf.logit_scale, 1) != 1", error: "drafter config sets output_multiplier, which is not implemented"},
+    {expr: "first(dc.final_logit_softcapping, cfg.final_logit_softcapping, gguf.final_logit_softcapping, 1) != 1", error: "drafter config sets final_logit_softcapping, which is not implemented"},
+    {expr: "first(dc.input_embedding_scale, cfg.input_embedding_scale, gguf.embedding_scale, 1) != 1", error: "drafter config sets input_embedding_scale, which is not implemented"},
+    {expr: "first(gguf['attention.value_scale'], 1) != 1 || first(gguf['attention.scale'], 1) != 1", error: "drafter GGUF sets an attention scale, which is not implemented"},
+    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "drafter RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
+    {expr: "!contains(['default', 'llama3'], rope_type) || rotary_pct != 1", error: "drafter rope {rope} is not implemented"},
+    {expr: "has('layers.0.attention_conv.base_kernel') && group == null", error: "DFlash2 drafter has no conv_group_size"},
+    {expr: "head == 'selector' && top_k == null", error: "DFlash2 drafter has no selector_top_k"},
+    {expr: "head == 'markov' && first(dc.markov_head_type, cfg.markov_head_type, 'vanilla') != 'vanilla'",
+     error: "DSpark markov_head_type {first(dc.markov_head_type, cfg.markov_head_type)} is not implemented (vanilla only)"},
+  ],
+  names: {
+    // llama.cpp `dflash` sidecars (convert_hf_to_gguf `DFlashModel` / `DSparkModel`).
+    rules: [
+      ["enc.output_norm.weight", "hidden_norm.weight"],
+      ["output_norm.weight", "norm.weight"],
+      ["output.weight", "lm_head.weight"],
+      ["markov_w{n:*}.weight", "markov_head.markov_w{n}.weight"],
+      ["selector_predecessor.weight", "candidate_selector.predecessor_codebook"],
+      ["selector_successor.weight", "candidate_selector.successor_codebook"],
+      ["selector_hidden.weight", "candidate_selector.hidden_projection.weight"],
+      ["blk.{i}.attn_norm.weight", "layers.{i}.input_layernorm.weight"],
+      ["blk.{i}.ffn_norm.weight", "layers.{i}.post_attention_layernorm.weight"],
+      ["blk.{i}.attn_q.weight", "layers.{i}.self_attn.q_proj.weight"],
+      ["blk.{i}.attn_k.weight", "layers.{i}.self_attn.k_proj.weight"],
+      ["blk.{i}.attn_v.weight", "layers.{i}.self_attn.v_proj.weight"],
+      ["blk.{i}.attn_output.weight", "layers.{i}.self_attn.o_proj.weight"],
+      ["blk.{i}.attn_q_norm.weight", "layers.{i}.self_attn.q_norm.weight"],
+      ["blk.{i}.attn_k_norm.weight", "layers.{i}.self_attn.k_norm.weight"],
+      ["blk.{i}.ffn_gate.weight", "layers.{i}.mlp.gate_proj.weight"],
+      ["blk.{i}.ffn_up.weight", "layers.{i}.mlp.up_proj.weight"],
+      ["blk.{i}.ffn_down.weight", "layers.{i}.mlp.down_proj.weight"],
+      ["blk.{i}.attn_conv_base", "layers.{i}.attention_conv.base_kernel"],
+      ["blk.{i}.attn_conv_proj.weight", "layers.{i}.attention_conv.kernel_projection.weight"],
+      ["blk.{i}.ffn_conv_base", "layers.{i}.mlp_conv.base_kernel"],
+      ["blk.{i}.ffn_conv_proj.weight", "layers.{i}.mlp_conv.kernel_projection.weight"],
+    ],
+  },
+  transforms: [
+    // DFlash2 base kernels [2, kernel, hidden] (input side, output side) as f32 rows.
+    {tensor: "layers.{i}.{c:*}_conv.base_kernel", op: "reshape",
+     args: {shape: ["2 * at(shape(fmt('layers.{i}.{c}_conv.base_kernel')), 1)", "hidden"]}},
+    {tensor: "layers.{i}.{c:*}_conv.base_kernel", op: "to_f32"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "rope_inv_freq", args: {
+      dim: "rotary_dim", theta: "theta", kind: "rope_type == 'llama3' ? 'wavelen_band' : 'default'", precision: "'f64'",
+      factor: "rope.factor", low_freq_factor: "rope.low_freq_factor", high_freq_factor: "rope.high_freq_factor",
+      original_max_position_embeddings: "rope.original_max_position_embeddings"}},
+  },
+  // The DSpark confidence head only gates llama.cpp's own drafting; speculators' `t2d` mask is
+  // the inverse of `d2t` (which the runtime reads).
+  ignore: ["conf_proj.*", "t2d"],
+  macros: {
+    // Grouped dynamic causal convolution within the block (DFlash2): out[i] = sum_t x[i - t] *
+    // (base[side * kernel + t] + delta[i][side][t][c / group]). `delta` [n, 2 * kernel * groups]
+    // is the kernel projection of the sublayer input; w: the base kernel rows [2 * kernel, d].
+    dyn_conv: {params: ["x", "delta"], body: [
+      {let: {n: "shape('x')[0]", d: "shape('x')[1]", kernel: "shape(w)[0] // 2"}},
+      {let: {g: "d // group"}},
+      {repeat: "t", count: "kernel", body: [
+        {let: {r: "side * kernel + t"}},
+        {op: "Pad", args: {padding: ["t", 0, 0, 0], value: 0}, in: ["x"], out: "xs", name: "shift{t}", when: "t > 0"},
+        {op: "Slice", args: {axis: 0, start: 0, end: "n"}, in: ["xs"], out: "xs", name: "rows{t}", when: "t > 0"},
+        {op: "Slice", args: {axis: -1, start: "r * g", end: "(r + 1) * g"}, in: ["delta"], out: "dt", name: "delta{t}"},
+        {op: "Reshape", args: {shape: ["n", "g", 1]}, in: ["dt"], out: "dt", name: "delta{t}.groups"},
+        {op: "Tile", args: {reps: [1, 1, "group"]}, in: ["dt"], out: "dt", name: "delta{t}.tile"},
+        {op: "Reshape", args: {shape: ["n", "d"]}, in: ["dt"], out: "dt", name: "delta{t}.rows"},
+        {op: "Slice", args: {axis: 0, start: "r", end: "r + 1"}, in: ["w:{w}"], out: "b", name: "base{t}"},
+        {op: "Binary", args: {kind: "Add"}, in: ["dt", "b"], out: "k", name: "kernel{t}"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["x", "k"], out: "out", name: "tap{t}", when: "t == 0"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["xs", "k"], out: "y", name: "tap{t}", when: "t > 0"},
+        {op: "Binary", args: {kind: "Add"}, in: ["out", "y"], out: "out", name: "sum{t}", when: "t > 0"},
+      ]},
+    ]},
+  },
+  components: {
+    // One draft pass: appends `ext` committed context rows (tapped target hidden states
+    // [ext, taps * target hidden], positions `pos0..`) to every layer's keys/values, then runs the
+    // block (`rows` ids at `positions`, mask rows seeing keys below `visible_end`). Outputs the
+    // final-normed rows from `first_row` through the head: `logits` (plain / selector unary /
+    // markov base) and the selector's hidden projection `sel`.
+    block: {
+      vars: ["ext", "rows"],
+      inputs: [
+        {name: "context", dtype: "f32", shape: ["ext", "shape('fc.weight')[1]"], when: "ext > 0"},
+        {name: "context_positions", dtype: "u32", shape: ["ext"], when: "ext > 0"},
+        {name: "pos0", dtype: "u32", shape: [1], when: "ext > 0"},
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "visible_end", dtype: "u32", shape: ["rows"]},
+      ],
+      body: [
+        {repeat: "l", count: "layers", body: [
+          {state: "kv.{l}.k", shape: ["ctx", "kv_heads * head_dim"]},
+          {state: "kv.{l}.v", shape: ["ctx", "kv_heads * head_dim"]},
+        ]},
+        {block: [
+          {op: "Linear", in: ["i:context", "w:fc.weight"], out: "c", name: "fc"},
+          {use: "rms_norm", args: {w: "'hidden_norm'"}, in: ["c"], out: "c", name: "hidden_norm"},
+          {repeat: "l", count: "layers", body: [
+            {let: {a: "fmt('layers.{l}.self_attn')"}},
+            {op: "Linear", in: ["c", "w:{a}.k_proj.weight"], out: "k", name: "ctx{l}.k"},
+            {op: "Linear", in: ["c", "w:{a}.v_proj.weight"], out: "v", name: "ctx{l}.v"},
+            {use: "per_head_norm", args: {w: "fmt('{a}.k_norm')"}, in: ["k"], out: "k", name: "ctx{l}.k_norm"},
+            {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: 1},
+             in: ["k", "i:context_positions", "c:rope.inv_freq"], out: "k", name: "ctx{l}.rope"},
+            {op: "StateWrite", in: ["s:kv.{l}.k", "k", "i:pos0"], out: "wk", name: "ctx{l}.write_k"},
+            {op: "StateWrite", in: ["s:kv.{l}.v", "v", "i:pos0"], out: "wv", name: "ctx{l}.write_v"},
+          ]},
+        ], when: "ext > 0"},
+        {op: "Embedding", in: ["w:target.embed.weight", "i:token_ids"], out: "h", name: "embed"},
+        {repeat: "l", count: "layers", body: [
+          {let: {p: "fmt('layers.{l}')", conv: "has(fmt('layers.{l}.attention_conv.base_kernel'))",
+                 sliding: "at(layer_types, l) == 'sliding_attention' || (window > 0 && at(sliding_pattern, l) == 1)"}},
+          {let: {causal: "causal_override == -1 ? sliding && !non_causal_sliding : causal_override == true || causal_override == 1"}},
+          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["h"], out: "x", name: "l{l}.ln1"},
+          {block: [
+            {op: "Linear", in: ["x", "w:{p}.attention_conv.kernel_projection.weight"], out: "dl", name: "l{l}.attn_conv.proj"},
+            {use: "dyn_conv", args: {w: "fmt('{p}.attention_conv.base_kernel')", side: 0}, in: ["x", "dl"], out: "x", name: "l{l}.attn_conv.in"},
+          ], when: "conv"},
+          {op: "Linear", in: ["x", "w:{p}.self_attn.q_proj.weight"], out: "q", name: "l{l}.q"},
+          {op: "Linear", in: ["x", "w:{p}.self_attn.k_proj.weight"], out: "k", name: "l{l}.k"},
+          {op: "Linear", in: ["x", "w:{p}.self_attn.v_proj.weight"], out: "v", name: "l{l}.v"},
+          {use: "per_head_norm", args: {w: "fmt('{p}.self_attn.q_norm')"}, in: ["q"], out: "q", name: "l{l}.q_norm"},
+          {use: "per_head_norm", args: {w: "fmt('{p}.self_attn.k_norm')"}, in: ["k"], out: "k", name: "l{l}.k_norm"},
+          {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: 1},
+           in: ["q", "i:positions", "c:rope.inv_freq"], out: "q", name: "l{l}.rope_q"},
+          {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rope_variant", mscale: 1},
+           in: ["k", "i:positions", "c:rope.inv_freq"], out: "k", name: "l{l}.rope_k"},
+          // ponytail: a non-causal sliding layer also drops block keys `window` or more ahead;
+          // here it sees the whole block (blocks are far shorter than windows).
+          {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "head_dim", v_head_dim: "head_dim",
+             scale: "attn_scale", causal: true, window: "sliding && window > 0 ? window : null", soft_cap: null, write: true},
+           in: ["q", "k", "v", "s:kv.{l}.k", "s:kv.{l}.v", "i:positions"], out: "a", name: "l{l}.attn", when: "causal"},
+          {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "head_dim", v_head_dim: "head_dim",
+             scale: "attn_scale", causal: true, window: "sliding && window > 0 ? window : null", soft_cap: null, write: true},
+           in: ["q", "k", "v", "s:kv.{l}.k", "s:kv.{l}.v", "i:positions", "i:visible_end"], out: "a", name: "l{l}.attn", when: "!causal"},
+          {op: "Linear", in: ["a", "w:{p}.self_attn.o_proj.weight"], out: "a", name: "l{l}.o"},
+          {use: "dyn_conv", args: {w: "fmt('{p}.attention_conv.base_kernel')", side: 1}, in: ["a", "dl"], out: "a", name: "l{l}.attn_conv.out", when: "conv"},
+          {op: "Binary", args: {kind: "Add"}, in: ["h", "a"], out: "h", name: "l{l}.res1"},
+          {use: "rms_norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["h"], out: "x", name: "l{l}.ln2"},
+          {block: [
+            {op: "Linear", in: ["x", "w:{p}.mlp_conv.kernel_projection.weight"], out: "dm", name: "l{l}.mlp_conv.proj"},
+            {use: "dyn_conv", args: {w: "fmt('{p}.mlp_conv.base_kernel')", side: 0}, in: ["x", "dm"], out: "x", name: "l{l}.mlp_conv.in"},
+          ], when: "conv"},
+          {use: "mlp_glu", in: ["x"], out: "m", name: "l{l}.mlp", args: {
+            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
+          {use: "dyn_conv", args: {w: "fmt('{p}.mlp_conv.base_kernel')", side: 1}, in: ["m", "dm"], out: "m", name: "l{l}.mlp_conv.out", when: "conv"},
+          {op: "Binary", args: {kind: "Add"}, in: ["h", "m"], out: "h", name: "l{l}.res2"},
+        ]},
+        {use: "rms_norm", args: {w: "'norm'"}, in: ["h"], out: "h", name: "norm"},
+        {op: "Slice", args: {axis: 0, start: "first_row", end: "rows"}, in: ["h"], out: "h", name: "draft_rows", when: "first_row > 0"},
+        {op: "Linear", in: ["h", "w:target.lm_head.weight"], out: "logits", name: "lm_head",
+         when: "head != 'markov' || !has('lm_head.weight')"},
+        {op: "Linear", in: ["h", "w:lm_head.weight"], out: "logits", name: "lm_head", when: "head == 'markov' && has('lm_head.weight')"},
+        {op: "Linear", in: ["h", "w:candidate_selector.hidden_projection.weight"], out: "sel", name: "selector.hidden", when: "head == 'selector'"},
+      ],
+      outputs: ["logits", {name: "sel", when: "head == 'selector'"}],
+    },
+    // One pick step after the block pass (`runtime.drafter.step`): row i of the block's `logits`
+    // (and `sel`) with the previously picked token `prev`. Selector: the top-k unary candidates
+    // rescored by (pred[prev] * sel) . succ[candidate], as `logits` at target ids `ids`. Markov:
+    // logits + w2 . w1[prev].
+    step: {
+      inputs: [
+        {name: "prev", dtype: "u32", shape: [1]},
+        {name: "logits", dtype: "f32", shape: [1, "head == 'markov' && has('lm_head.weight') ? shape('lm_head.weight')[0] : shape('target.lm_head.weight')[0]"]},
+        {name: "sel", dtype: "f32", shape: [1, "shape('candidate_selector.hidden_projection.weight')[0]"], when: "head == 'selector'"},
+      ],
+      body: [
+        {block: [
+          {op: "Embedding", in: ["w:candidate_selector.predecessor_codebook", "i:prev"], out: "pe", name: "selector.pred"},
+          {op: "Binary", args: {kind: "Mul"}, in: ["pe", "i:sel"], out: "c", name: "selector.query"},
+          {op: "Linear", in: ["c", "w:candidate_selector.successor_codebook"], out: "bil", name: "selector.succ"},
+          {op: "TopK", args: {k: "top_k"}, in: ["i:logits"], out: "ids", name: "selector.top_k"},
+          {op: "Binary", args: {kind: "Add"}, in: ["i:logits", "bil"], out: "full", name: "selector.score"},
+          {op: "GatherCols", in: ["full", "ids"], out: "logits", name: "selector.pick"},
+        ], when: "head == 'selector'"},
+        {block: [
+          {op: "Embedding", in: ["w:markov_head.markov_w1.weight", "i:prev"], out: "e", name: "markov.w1"},
+          {op: "Linear", in: ["e", "w:markov_head.markov_w2.weight"], out: "bias", name: "markov.w2"},
+          {op: "Binary", args: {kind: "Add"}, in: ["i:logits", "bias"], out: "logits", name: "markov.add"},
+        ], when: "head == 'markov'"},
+      ],
+      outputs: ["logits", {name: "ids", when: "head == 'selector'"}],
+    },
+  },
+  runtime: {
+    // Target tensors the drafter reads, as `target.*`: the first target name present.
+    shared_from_target: {
+      "target.embed.weight": ["model.embed_tokens.weight"],
+      "target.lm_head.weight": ["lm_head.weight", "model.embed_tokens.weight"],
+    },
+    drafter: {kind: "block", component: "block", step: {component: "step", when: "head != 'plain'"}, vocab_map: "d2t"},
+    // Drafter repo-name suffixes stripped to guess the target (`z-lab/Qwen3-4B-DFlash-b16`).
+    repo_suffixes: ["-dflash", "-dspark", "-speculator", ".dflash", ".dspark"],
+  },
+}

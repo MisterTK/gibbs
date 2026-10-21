@@ -2,7 +2,7 @@
 
 use super::theme::{theme, Token};
 use super::widgets::instrument;
-use crate::model::draft::{draft_target, is_draft_for};
+use crate::runtime::draft::{draft_target, is_draft_for};
 use crate::model::hub::{
     branch_models, detect_quant_format, is_metadata_file, list_repo_files, select_weight_files,
     split_revision, split_weight_file, HuggingFaceHub, RepoFile,

@@ -290,22 +290,17 @@ fn dense_config(model_type: &str, arch: &str) -> Value {
 // Runners
 // ---------------------------------------------------------------------------------------------
 
+/// runner: arch::load::load_with (bit-exact) of the detected family spec -> runtime::lm::SpecLm.
 fn load(dir: &Path, id: &str, dev: Device) -> Arc<dyn NativeLm> {
-    let m = load_native(&artifacts(dir, id, "model.safetensors"), dev)
-        .expect("a native architecture")
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let a = artifacts(dir, id, "model.safetensors");
+    let m = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re)
+        .and_then(|s| gibbs_engine::runtime::lm::SpecLm::new(s, PlacementMode::Pin(dev)))
         .unwrap_or_else(|e| panic!("{id} on {dev:?}: {e}"));
     // Catches a silent CPU fallback of a Metal load.
     assert_eq!(m.device(), dev, "{id}");
-    m
-}
-
-/// Cases with no Metal path: checked on the CPU only, and (check mode) the Metal load must still
-/// be refused, so a new Metal path shows up instead of going unchecked.
-fn host_only(case: &str, run: impl Fn() -> Out, metal_refused: impl Fn() -> bool) {
-    check(case, Device::Cpu, &run(), TOL);
-    if !writing() && metal_present() {
-        assert!(metal_refused(), "{case}: the Metal load now succeeds; check it on Metal too");
-    }
+    Arc::new(m)
 }
 
 fn fwd(m: &dyn NativeLm, toks: &[u32], pos: usize, st: &mut SeqState) -> Vec<f32> {
@@ -430,7 +425,15 @@ fn qwen3_5_mtp() {
     let dir = fixture_dir("qwen_qwen3_5_mtp");
     qwen35_ckpt(&dir, 0x5157_454E_0006, true);
     golden("qwen_qwen3_5_mtp", TOL, |dev| {
-        let m = load(&dir, "golden/qwen3_5_mtp", dev);
+        // runner: arch::load::load_with (bit-exact) of the `qwen3_5` spec -> runtime::lm::SpecLm
+        // on `dev`; its drafter is the spec's `mtp` component (runtime::draft).
+        use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let a = artifacts(&dir, "golden/qwen3_5_mtp", "model.safetensors");
+        let spec = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re).unwrap();
+        assert_eq!(spec.spec.family, "qwen3_5");
+        let m = gibbs_engine::runtime::lm::SpecLm::new(spec, PlacementMode::Pin(dev)).unwrap();
+        assert_eq!(m.device(), dev);
         let d = m.drafter().expect("shipped MTP drafter");
         let mut out = Out::default();
         out.ids("taps", &d.tap_layers().iter().map(|&t| t as u32).collect::<Vec<_>>());
@@ -467,29 +470,112 @@ fn qwen3_5_mtp() {
 /// The ViT alone on two image sizes: merged features and the deepstack feature.
 #[test]
 fn qwen3_5_vision_tower() {
-    use gibbs_engine::model::qwen3_5::vision::{Preprocessor, Vision};
+    use gibbs_engine::arch::{build::build, expr::Val, gen, load, Registry};
+    use gibbs_engine::graph::{program::GraphProgram, Tensor};
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    use gibbs_engine::runtime::media;
     let dir = fixture_dir("qwen_qwen3_5_vision_tower");
     qwen35_vl_ckpt(&dir);
     golden("qwen_qwen3_5_vision_tower", TOL, |dev| {
-        // runner: internal gibbs_engine::model::qwen3_5::vision::Vision
-        let ck = gibbs_engine::model::weights::Weights::open(&dir.join("model.safetensors")).unwrap();
-        let cfg: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let pre = Preprocessor::load(&dir.join("preprocessor_config.json")).unwrap();
-        let v = Vision::load(&ck, &cfg["vision_config"])
-            .unwrap()
-            .on_gpu(PlacementMode::Pin(dev))
-            .unwrap();
+        // SCRATCH runner: spec vision component, compiled directly.
+        let reg = Registry::load(None).unwrap();
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let m = load::load_with(&artifacts(&dir, "golden/qwen3_5_vl", "model.safetensors"), &reg, Some("qwen3_5"), re).unwrap();
+        load::check(&m).unwrap();
+        let spec = media::resolve(&m.spec.runtime["media"], &m.env).unwrap().remove("image").unwrap();
         let mut out = Out::default();
         for (w, h) in [(16, 24), (24, 8)] {
-            let img = ImageBuffer::decode(&png(w, h)).unwrap();
-            let e = v.encode(&img, &pre).unwrap();
-            out.ids(format!("grid_{w}x{h}"), &[e.rows as u32, e.cols as u32])
-                .f(format!("embeds_{w}x{h}"), &e.embeds)
-                .f(format!("deepstack0_{w}x{h}"), &e.deepstack[0]);
+            let p = media::preprocess(&spec.preprocess, &png(w, h)).unwrap();
+            let vars: Vec<(&str, Val)> = p.grid.vars.iter().map(|&(k, v)| (k, Val::Num(v as f64))).collect();
+            let inst = build(&m.spec, "vision", &m.env, &m.store, &vars).unwrap();
+            let mut given = Some(Tensor::F32(p.data.clone()));
+            let ins = inst.inputs.iter().map(|i| match &i.gen {
+                Some((g, a)) => match gen::generate(g, a).unwrap().data {
+                    gen::GenData::F32(v) => Tensor::F32(v),
+                    gen::GenData::U32(v) => Tensor::U32(v),
+                },
+                None => given.take().unwrap(),
+            }).collect();
+            let wts = m.store.materialize(&inst.weights).unwrap();
+            let mut prog = GraphProgram::compile(inst.graph.clone(), wts, PlacementMode::Pin(dev)).unwrap();
+            assert!(dev == Device::Cpu || prog.cpu_node_count() == 0);
+            let o: std::collections::HashMap<_, _> = inst.outputs.iter().cloned().zip(prog.run(ins).unwrap()).collect();
+            let f = |k: &str| match &o[k] { Tensor::F32(v) => v.clone(), t => panic!("{k}: {t:?}") };
+            out.ids(format!("grid_{w}x{h}"), &[p.grid.rows as u32, p.grid.cols as u32])
+                .f(format!("embeds_{w}x{h}"), &f("media"))
+                .f(format!("deepstack0_{w}x{h}"), &f("deepstack.0"));
         }
         out
     });
+}
+
+/// SCRATCH (not committed): component `c` built with `vars`, caller inputs `given` in order,
+/// generated ones filled, run on `dev` over `state`.
+fn qv_run(
+    m: &gibbs_engine::arch::load::Model,
+    c: &str,
+    vars: &[(&str, gibbs_engine::arch::expr::Val)],
+    given: Vec<gibbs_engine::graph::Tensor>,
+    dev: Device,
+    state: &mut gibbs_engine::graph::StateStore,
+) -> std::collections::HashMap<String, Vec<f32>> {
+    use gibbs_engine::arch::{build::build, gen};
+    use gibbs_engine::graph::{program::GraphProgram, Tensor};
+    let inst = build(&m.spec, c, &m.env, &m.store, vars).unwrap();
+    let mut given = given.into_iter();
+    let ins = inst.inputs.iter().map(|i| match &i.gen {
+        Some((g, a)) => match gen::generate(g, a).unwrap().data {
+            gen::GenData::F32(v) => Tensor::F32(v),
+            gen::GenData::U32(v) => Tensor::U32(v),
+        },
+        None => given.next().unwrap_or_else(|| panic!("input {}", i.name)),
+    }).collect();
+    let wts = m.store.materialize(&inst.weights).unwrap();
+    let mut prog = GraphProgram::compile(inst.graph.clone(), wts, PlacementMode::Pin(dev)).unwrap();
+    assert!(dev == Device::Cpu || prog.cpu_node_count() == 0, "{c}: CPU nodes");
+    std::mem::swap(&mut prog.state, state);
+    let out = prog.run(ins).unwrap();
+    std::mem::swap(&mut prog.state, state);
+    inst.outputs.iter().cloned().zip(out).map(|(k, t)| match t { Tensor::F32(v) => (k, v), t => panic!("{k}: {t:?}") }).collect()
+}
+
+#[test]
+fn qv_scratch_image_prompt() {
+    use gibbs_engine::arch::{expr::Val, load, Registry};
+    use gibbs_engine::graph::{StateStore, Tensor};
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    use gibbs_engine::runtime::media;
+    let dir = fixture_dir("qv_scratch_image_prompt");
+    qwen35_vl_ckpt(&dir);
+    let want: Value = serde_json::from_slice(&std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/qwen_qwen3_5_image_prompt.json")).unwrap()).unwrap();
+    let wf = |k: &str| want["f32"][k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect::<Vec<_>>();
+    for dev in [Device::Cpu, Device::Metal] {
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let m = load::load_with(&artifacts(&dir, "golden/qwen3_5_vl", "model.safetensors"), &Registry::load(None).unwrap(), None, re).unwrap();
+        load::check(&m).unwrap();
+        m.env.set_ctx(json!(128));
+        let mm = media::resolve(&m.spec.runtime["media"], &m.env).unwrap();
+        let p = media::preprocess(&mm["image"].preprocess, &png(16, 24)).unwrap();
+        let vars: Vec<(&str, Val)> = p.grid.vars.iter().map(|&(k, v)| (k, Val::Num(v as f64))).collect();
+        let mut st = StateStore::new();
+        let tower = qv_run(&m, "vision", &vars, vec![Tensor::F32(p.data.clone())], dev, &mut st);
+        let e = media::expand(&[3, 7, IMAGE_TOKEN, 11, 5, 9], &mm, &[("image", &p.grid)], &|_| unreachable!()).unwrap();
+        assert_eq!(serde_json::to_value(&e.ids).unwrap(), want["ids"]["prepared_ids"]);
+        let n = e.ids.len();
+        let tv = |rows: usize, media: usize| vec![("rows", Val::Num(rows as f64)), ("head", Val::Str("last".into())), ("media", Val::Num(media as f64))];
+        let mut st = StateStore::new();
+        let o = qv_run(&m, "text", &tv(n, p.grid.tokens), vec![
+            Tensor::U32(e.ids.clone()), Tensor::U32((0..n as u32).collect()),
+            Tensor::U32(e.pos3.iter().flatten().copied().collect()),
+            Tensor::F32(tower["media"].clone()), Tensor::U32(e.media_index.clone()), Tensor::F32(tower["deepstack.0"].clone()),
+        ], dev, &mut st);
+        let rel = |a: &[f32], b: &[f32]| (a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum::<f64>() / b.iter().map(|y| (*y as f64).powi(2)).sum::<f64>()).sqrt();
+        println!("{dev:?} prefill rel {:e}", rel(&o["logits"], &wf("prefill")));
+        let tok = argmax(&o["logits"]);
+        let p3 = (n as i64 + e.delta) as u32;
+        let o = qv_run(&m, "text", &tv(1, 0), vec![Tensor::U32(vec![tok]), Tensor::U32(vec![n as u32]), Tensor::U32(vec![p3; 3])], dev, &mut st);
+        println!("{dev:?} decode0 rel {:e} tok {tok}", rel(&o["logits"], &wf("decode0")));
+    }
 }
 
 /// Image prompt through `prepare` (placeholder expanded to the merged grid, M-RoPE positions,
@@ -557,10 +643,11 @@ fn qwen4_exp() {
     }
     write_ckpt(&dir, &cfg, &w);
     let prompt = [5u32, 17, 2, 40, 63, 9, 88];
-    // runner: host forward only: the Qwen4-Exp decode graph refuses hyper-connections
-    // (qwen3_5/text.rs to_decode_graph_with), so a Metal load errs.
-    host_only("qwen_qwen4_exp", || {
-        let m = load(&dir, "golden/qwen4_exp", Device::Cpu);
+    golden("qwen_qwen4_exp", TOL, |dev| {
+        let m = load(&dir, "golden/qwen4_exp", dev);
+        let host: Vec<String> = m.placement_summary().unwrap().iter()
+            .filter(|r| dev == Device::Metal && r.device == Device::Cpu).map(|r| r.op.clone()).collect();
+        assert!(host.is_empty(), "CPU nodes in the Metal program: {host:?}");
         let mut out = Out::default();
         let (_, mut st) = m.prepare(prompt.to_vec(), &[]).unwrap();
         out.f("chunk3", &fwd(&*m, &prompt[..3], 0, &mut st));
@@ -573,6 +660,13 @@ fn qwen4_exp() {
             logits = fwd(&*m, &[tok], prompt.len() + i, &mut st);
         }
         out.ids("decode_ids", &steps).f("decode_last", &logits);
+        // Rewind into a verified span: the PLE n-gram history and conv ring rewind with it.
+        let at = prompt.len() + 4;
+        let both = m.forward_all(&[30, 31], at, &mut st).unwrap();
+        m.truncate(&mut st, at + 1).unwrap();
+        let again = fwd(&*m, &[31], at + 1, &mut st);
+        let d = again.iter().zip(&both[V..]).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+        assert!(d < 1e-3, "{dev:?}: rewound row differs by {d}");
         let (_, mut st) = m.prepare(prompt.to_vec(), &[]).unwrap();
         let mut inc = Vec::new();
         for (i, &t) in prompt.iter().enumerate() {
@@ -580,9 +674,6 @@ fn qwen4_exp() {
         }
         out.f("incremental", &inc);
         out
-    }, || {
-        load_native(&artifacts(&dir, "golden/qwen4_exp", "model.safetensors"), Device::Metal)
-            .is_some_and(|r| r.is_err())
     });
 }
 
@@ -630,7 +721,7 @@ fn drafter_config(arch: &str, layers: usize) -> Value {
 }
 
 /// Loads the drafter in `dir/draft` against the Qwen3.5 target in `dir/target` through
-/// `model::draft::load_drafter`, feeds it 5 fixed tapped rows (6-token sequence), then 2 more
+/// `runtime::draft::load_drafter`, feeds it 5 fixed tapped rows (6-token sequence), then 2 more
 /// (catch-up after accepting one draft), recording drafted ids and every pick row's logits.
 fn drafter_case(case: &str, cfg: Value, w: Weights) {
     let dir = fixture_dir(case);
@@ -638,16 +729,13 @@ fn drafter_case(case: &str, cfg: Value, w: Weights) {
     qwen35_ckpt(&td, 0x5157_454E_0010, false);
     write_json(&dd.join("config.json"), &cfg);
     write_st_as(&dd.join("model.safetensors"), &w.tensors, StDtype::BF16);
-    // runner: CPU only: block drafters are host Rust; avenues gates them off Metal.
-    let load = |mode| {
-        gibbs_engine::model::draft::load_drafter(
+    golden(case, TOL, |dev| {
+        let d: Arc<dyn Drafter> = gibbs_engine::runtime::draft::load_drafter(
             &artifacts(&dd, "golden/drafter", "model.safetensors"),
             &artifacts(&td, "golden/qwen3_5", "model.safetensors"),
-            mode,
+            PlacementMode::Pin(dev),
         )
-    };
-    host_only(case, || {
-        let d: Arc<dyn Drafter> = load(PlacementMode::Pin(Device::Cpu)).unwrap();
+        .unwrap_or_else(|e| panic!("{case} on {dev:?}: {e}"));
         let taps = d.tap_layers();
         let mut out = Out::default();
         out.ids("taps", &taps.iter().map(|&t| t as u32).collect::<Vec<_>>());
@@ -674,7 +762,7 @@ fn drafter_case(case: &str, cfg: Value, w: Weights) {
             toks.extend([ids[0], 60]);
         }
         out
-    }, || load(PlacementMode::Pin(Device::Metal)).is_err());
+    });
 }
 
 #[test]

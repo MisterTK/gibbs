@@ -1,14 +1,13 @@
 //! Draft-model speculative decoding on real weights from the shared `disk/` cache: hidden-state
 //! drafters (DFlash, DFlash2, DSpark) and a plain same-tokenizer draft model keep greedy output
-//! token-identical to plain decoding and get their drafts accepted, on a native target
-//! (Qwen3.5-2B) and a GraphLm one (Llama-3.2-1B-Instruct); mismatched pairs are refused at attach.
+//! token-identical to plain decoding and get their drafts accepted, on a Qwen3.5-2B target and a
+//! spec-run Llama-3.2-1B-Instruct one; mismatched pairs are refused at attach.
 
-use gibbs_engine::hardware::{Device, PlacementMode, QuantMode};
+use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::kv::PagedKVPool;
-use gibbs_engine::model::draft::load_drafter;
-use gibbs_engine::model::hf_loader::load_causal_lm;
 use gibbs_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
 use gibbs_engine::model::native::load_native;
+use gibbs_engine::runtime::draft::load_drafter;
 use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel, SamplingParams};
 use gibbs_engine::telemetry::EngineTelemetry;
 use std::sync::Arc;
@@ -32,14 +31,12 @@ fn generate(
     prompt: &str,
     n: usize,
 ) -> (Vec<u32>, u64, u64) {
-    let model = match load_native(target, Device::Cpu) {
-        Some(m) => ExecutableModel::Native(m.unwrap()),
-        None => ExecutableModel::load_graph_lm(
-            load_causal_lm(target, QuantMode::Uncompressed).unwrap(),
-            Device::Cpu,
-        )
-        .unwrap(),
-    };
+    let cpu = PlacementMode::Pin(Device::Cpu);
+    let model = ExecutableModel::Native(match load_native(target, Device::Cpu) {
+        Some(m) => m.unwrap(),
+        None => gibbs_engine::runtime::lm::load(target, gibbs_engine::arch::registry().unwrap(), None, cpu)
+            .unwrap(),
+    });
     let telemetry = EngineTelemetry::new();
     let sched = ContinuousBatchScheduler::with_telemetry(
         target.model_id.clone(),

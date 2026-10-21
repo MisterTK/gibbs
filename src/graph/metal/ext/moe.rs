@@ -892,11 +892,9 @@ mod tests {
             .run(&g, inputs)
             .unwrap()
             .remove(0)
-            .into_f32()
+            .as_u32()
             .unwrap()
-            .iter()
-            .map(|v| v.to_bits())
-            .collect();
+            .to_vec();
         (want, got)
     }
 
@@ -967,9 +965,8 @@ mod tests {
                         .run(&head, vec![Tensor::F32(x.clone())])
                         .unwrap()
                         .remove(0)
-                        .into_f32()
-                        .unwrap()[0]
-                        .to_bits();
+                        .as_u32()
+                        .unwrap()[0];
                     let want =
                         crate::runtime::lm::sample_logits(&x[..valid], &[], 0.0, 50, 1.0, 1.0);
                     assert_eq!(got, want, "head {name} cols={cols} valid={valid}");

@@ -143,12 +143,8 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     if o.family.is_some() {
         return spec(o.family);
     }
-    // legacy: until Phases 5, 6 and 8 (the native loaders' families)
-    if let Some(m) = crate::model::native::load_native(a, o.placement) {
-        return Ok((ExecutableModel::Native(m?), None));
-    }
-    // Checkpoints the arch reader cannot open, and registry errors, leave the GraphLm path as
-    // it was (a spec problem fails only spec loads).
+    // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
+    // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
@@ -160,6 +156,10 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
         Some((f, Pipeline::CausalLm)) if spec_lm_enabled() => return spec(Some(&f)),
         _ => {}
+    }
+    // legacy: until Phases 5, 6 and 8 (the native loaders' families)
+    if let Some(m) = crate::model::native::load_native(a, o.placement) {
+        return Ok((ExecutableModel::Native(m?), None));
     }
     // legacy: until Phase 4 (GraphLm)
     let (lm, choice) = load_causal_lm_with(a, device(o.placement), o.quant, o.hw, &o.reencode)?;

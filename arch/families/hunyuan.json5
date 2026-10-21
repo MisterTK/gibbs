@@ -1,0 +1,37 @@
+// HunYuan dense v1 (transformers `hunyuan_v1_dense`, llama.cpp `hunyuan-dense`): Qwen3 layers with
+// the per-head q/k RMSNorm (`query_layernorm` / `key_layernorm`) after RoPE and dynamic-NTK alpha
+// RoPE (base = theta * alpha^(d / (d - 2))). llama.cpp bakes alpha into `rope.freq_base` and only
+// stores `rope.scaling.alpha` when it scales once more.
+{
+  family: "hunyuan",
+  extends: "qwen3",
+  match: {
+    hf_model_type: ["hunyuan_v1_dense"],
+    hf_architectures: ["HunYuanDenseV1ForCausalLM"],
+    gguf_arch: ["hunyuan-dense"],
+  },
+  config: {
+    rope_alpha: "first(rope.alpha, first(gguf['rope.scaling.alpha'], 0) > 0 ? gguf['rope.scaling.alpha'] : null, 1)",
+    rope_kind: "rope_alpha != 1 ? 'ntk_alpha' : 'default'",
+    qk_norm: "'after'",
+    q_norm_name: "'query_layernorm'",
+    k_norm_name: "'key_layernorm'",
+  },
+  checks: [
+    {expr: "first(rope.rope_type, rope.type, 'default') == 'dynamic' && rope.alpha == null",
+     error: "HunYuan dynamic RoPE without `alpha` is not implemented"},
+    {expr: "!contains(['default', 'dynamic'], first(rope.rope_type, rope.type, 'default'))",
+     error: "rope type '{first(rope.rope_type, rope.type)}' is not implemented"},
+    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
+    {expr: "tc.use_cla == true", error: "HunYuan `use_cla: true` is not implemented"},
+    {expr: "tc.mlp_bias == true", error: "HunYuan `mlp_bias: true` is not implemented"},
+    {expr: "tc.use_qk_norm == false", error: "HunYuan `use_qk_norm: false` is not implemented"},
+  ],
+  names: {
+    use: ["llamacpp"],
+    rules: [
+      ["blk.{i}.attn_q_norm.weight", "model.layers.{i}.self_attn.query_layernorm.weight"],
+      ["blk.{i}.attn_k_norm.weight", "model.layers.{i}.self_attn.key_layernorm.weight"],
+    ],
+  },
+}

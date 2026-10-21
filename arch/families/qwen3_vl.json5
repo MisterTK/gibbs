@@ -1,0 +1,115 @@
+// Qwen3-VL (transformers `qwen3_vl`, llama.cpp `qwen3vl` text tower): the Qwen3 decoder under
+// `model.language_model` with interleaved M-RoPE and the vision tower's deepstack features added
+// after the first decoder layers. Text-only positions put every M-RoPE axis at the sequence
+// index, so text-only checkpoints rotate as plain RoPE.
+{
+  family: "qwen3_vl",
+  extends: "qwen3",
+  match: {
+    hf_model_type: ["qwen3_vl"],
+    hf_architectures: ["Qwen3VLForConditionalGeneration"],
+    gguf_arch: ["qwen3vl"],
+  },
+  use_lib: ["transformer", "qwen", "moe", "qwen_vit"],
+  config: {
+    mrope_section: "first(rope.mrope_section, [rotary_dim // 2, 0, 0])",
+    // ---- vision tower (as `qwen3_5`); GGUF mmproj towers are not read ----
+    has_vision: "has('model.visual.patch_embed.proj.weight')",
+    // With a tower the decoder always rotates by `rope_positions` ([t, h, w] per row; text rows
+    // put all three at the sequence position, so text-only prompts rotate as plain RoPE).
+    mrope_variant: {MRope: {sections: "mrope_section", interleaved: true, pairs: "'Half'"}},
+    v_hidden: "cfg.vision_config.hidden_size",
+    v_heads: "cfg.vision_config.num_heads",
+    v_hd: "v_hidden // v_heads",
+    v_depth: "cfg.vision_config.depth",
+    v_side: "int(sqrt(cfg.vision_config.num_position_embeddings))",
+    v_patch: "cfg.vision_config.patch_size",
+    v_temporal: "cfg.vision_config.temporal_patch_size",
+    v_merge: "cfg.vision_config.spatial_merge_size",
+    // Vision block each deepstack merger k reads; the decoder adds feature k after its layer k.
+    deepstack_idx: "cfg.vision_config.deepstack_visual_indexes",
+    deepstack_layers: "has_vision ? len(deepstack_idx) : 0",
+  },
+  checks: [
+    {expr: "gguf_arch == '' && rope.mrope_interleaved != true",
+     error: "only interleaved M-RoPE (`mrope_interleaved: true`) is implemented"},
+    {expr: "len(mrope_section) != 3 || at(mrope_section, 0) + at(mrope_section, 1) + at(mrope_section, 2) != rotary_dim // 2",
+     error: "mrope_section {mrope_section} does not cover rotary dim {rotary_dim}"},
+    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
+    {expr: "has_vision && cfg.vision_config.hidden_act != 'gelu_pytorch_tanh'", error: "vision hidden_act {cfg.vision_config.hidden_act} is not gelu_pytorch_tanh"},
+    {expr: "has_vision && v_side * v_side != cfg.vision_config.num_position_embeddings",
+     error: "num_position_embeddings {cfg.vision_config.num_position_embeddings} is not a square"},
+    {expr: "has_vision && deepstack_layers > 3", error: "{deepstack_layers} deepstack layers; the spec wires at most 3"},
+    {expr: "has_vision && deepstack_layers > 0 && max(deepstack_idx) >= v_depth",
+     error: "deepstack index {max(deepstack_idx)} is past the {v_depth} vision blocks"},
+  ],
+  constants: {
+    // ViT 2D rotary: a quarter of each head's pairs per axis, rows then columns.
+    "vision.rope.inv_freq": {gen: "rope_inv_freq", when: "has_vision", args: {dim: "v_hd // 2", theta: 10000, precision: "'f32'", tile: 2}},
+  },
+  components: {
+    // The ViT on one image's `grid_h x grid_w` patch grid (`smart_resize` patches, 2x2 merge-block
+    // order): output `media` [patches / 4, hidden], then `deepstack.{k}` (same shape).
+    vision: {
+      vars: ["grid_h", "grid_w"],
+      inputs: [
+        {name: "patches", dtype: "f32", shape: ["grid_h * grid_w", "3 * v_temporal * v_patch * v_patch"]},
+        // Bilinear (align-corners) taps of the `v_side`^2 learned position grid: rows, weights.
+        {name: "pos_idx_0", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 0, output: "'index'"}},
+        {name: "pos_idx_1", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 1, output: "'index'"}},
+        {name: "pos_idx_2", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 2, output: "'index'"}},
+        {name: "pos_idx_3", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 3, output: "'index'"}},
+        {name: "pos_w_0", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 0, output: "'weight'"}},
+        {name: "pos_w_1", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 1, output: "'weight'"}},
+        {name: "pos_w_2", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 2, output: "'weight'"}},
+        {name: "pos_w_3", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 3, output: "'weight'"}},
+        {name: "rope_positions", dtype: "u32", shape: ["3 * grid_h * grid_w"], gen: "vision_rope_positions",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge"}},
+      ],
+      body: [
+        {op: "Linear", in: ["i:patches", "w:model.visual.patch_embed.proj.weight", "w?:model.visual.patch_embed.proj.bias"], out: "x", name: "patch_embed"},
+        {repeat: "c", count: 4, body: [
+          {op: "Embedding", in: ["w:model.visual.pos_embed.weight", "i:pos_idx_{c}"], out: "e", name: "pos_embed_{c}"},
+          {op: "Binary", args: {kind: "'Mul'"}, in: ["e", "i:pos_w_{c}"], out: "e", name: "pos_scaled_{c}"},
+          {op: "Binary", args: {kind: "'Add'"}, in: ["x", "e"], out: "x", name: "pos_add_{c}"},
+        ]},
+        {repeat: "b", count: "v_depth", body: [
+          {use: "qwen_vit_block", args: {p: "fmt('model.visual.blocks.{b}')"}, in: ["x"], out: "x", name: "blocks.{b}"},
+          {repeat: "k", count: "deepstack_layers", body: [
+            {use: "qwen_vit_merger", args: {m: "fmt('model.visual.deepstack_merger_list.{k}')", post: true}, in: ["x"],
+             out: "deepstack.{k}", name: "deepstack_merger.{k}", when: "at(deepstack_idx, k) == b"},
+          ]},
+        ]},
+        {use: "qwen_vit_merger", args: {m: "'model.visual.merger'", post: false}, in: ["x"], out: "media", name: "merger"},
+      ],
+      outputs: [
+        "media",
+        {name: "deepstack.0", when: "deepstack_layers > 0"},
+        {name: "deepstack.1", when: "deepstack_layers > 1"},
+        {name: "deepstack.2", when: "deepstack_layers > 2"},
+      ],
+    },
+  },
+  runtime: {
+    // `Qwen2VLImageProcessor`; placeholder expanded to the merged grid with get_rope_index's
+    // [t, h, w] positions.
+    media: {image: {
+      when: "has_vision",
+      component: "'vision'",
+      preprocess: {kind: "'smart_resize'", patch: "v_patch", merge: "v_merge", temporal: "v_temporal",
+                   min_pixels: "first(json.preprocessor_config.size.shortest_edge, json.preprocessor_config.min_pixels)",
+                   max_pixels: "first(json.preprocessor_config.size.longest_edge, json.preprocessor_config.max_pixels)",
+                   norm: {mean: "json.preprocessor_config.image_mean", std: "json.preprocessor_config.image_std"}},
+      expand: {kind: "'merged_grid'", placeholder: "cfg.image_token_id"},
+      positions: "'mrope_grid'",
+    }},
+  },
+}

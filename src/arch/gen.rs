@@ -128,6 +128,7 @@ pub fn generate(name: &str, args: &Value) -> Result<Gen, String> {
         "zeros" => fill_with(a, 0.0),
         "fill" => a.f("value").and_then(|v| fill_with(a, v)),
         "iota" => iota(a),
+        "ngram_hash_rows" => ngram_hash_rows(a),
         _ => return Err(format!("unknown generator `{name}`")),
     };
     r.map_err(|e| format!("generator `{name}`: {e}"))
@@ -147,6 +148,9 @@ pub fn generate(name: &str, args: &Value) -> Result<Gen, String> {
 /// - `yarn`: `factor`, `original_max_position_embeddings`, `beta_fast` (32), `beta_slow` (1),
 ///   `truncate` (true). Zero betas are NOT mapped to the defaults (Gemma3's loader does that; its
 ///   spec must). The cos/sin scale comes from `yarn_attention_factor`.
+///
+/// `tile` (default 1): the table repeated that many times, F32 `[tile * dim / 2]` (a 2D ViT
+/// rotary rotates by grid row with one copy and by grid column with the next).
 ///
 /// Sources: `gemma3_text.rs` `inv_freq`, `classifier/modernbert.rs` `rope_inv_freq`,
 /// `gemma4/text.rs` `inv_freq`, `qwen3_5/text.rs` (default / HunYuan alpha),
@@ -247,7 +251,8 @@ fn rope_inv_freq(a: &Args) -> Result<Gen, String> {
         (_, "f64" | "f32") => return Err(bad("kind", format!("{kind} ({precision})"))),
         (_, p) => return Err(bad("precision", p)),
     };
-    f32s(vec![half], inv)
+    let tile = a.u_or("tile", 1)?;
+    f32s(vec![tile * half], inv.repeat(tile))
 }
 
 /// `yarn_attention_factor`: YaRN cos/sin scale, F32 `[1]`. Args: `factor`, optional
@@ -740,6 +745,52 @@ fn iota(a: &Args) -> Result<Gen, String> {
     }
 }
 
+/// `ngram_hash_rows`: U32 `[rows * (ngram - 1) * per_gram]` table rows of hashed n-gram
+/// embeddings. `ids` holds up to `ngram - 1` tokens of left context, then the `rows` tokens; missing
+/// context (sequence start) is `eos`. Row `t`'s context `c[0..ngram]` is the token and its
+/// predecessors, every one at or before an `eos` predecessor replaced by `eos`; n-gram `g` in
+/// `2..=ngram` hashes `h = c[0]*m[0] ^ .. ^ c[g-1]*m[g-1]` (u64 wrapping), and its `per_gram` heads
+/// `j = (g-2)*per_gram + k` read row `h % vocab_sizes[j] + offsets[j]`. Args: `ids`, `rows`,
+/// `ngram`, `per_gram`, `multipliers`, `offsets`, `vocab_sizes`, `eos`.
+fn ngram_hash_rows(a: &Args) -> Result<Gen, String> {
+    let (rows, ngram, per, eos) = (a.u("rows")?, a.u("ngram")?, a.u("per_gram")?, a.u("eos")? as u64);
+    let (mult, off, voc) = (a.us("multipliers")?, a.us("offsets")?, a.us("vocab_sizes")?);
+    let ids = a.us("ids")?;
+    let heads = ngram.saturating_sub(1) * per;
+    if ngram < 2 || mult.len() < ngram || off.len() < heads || voc.len() < heads || voc[..heads].contains(&0) {
+        return Err("hash constants do not fit ngram / per_gram".into());
+    }
+    if ids.len() < rows {
+        return Err(format!("{} ids for {rows} rows", ids.len()));
+    }
+    let back = ngram - 1;
+    let pad = back.saturating_sub(ids.len() - rows);
+    let chain: Vec<u64> = std::iter::repeat_n(eos, pad)
+        .chain(ids[ids.len() - rows - (back - pad)..].iter().map(|&x| x as u64))
+        .collect();
+    let mut out = Vec::with_capacity(rows * heads);
+    let mut ctx = vec![0u64; ngram];
+    for t in 0..rows {
+        ctx[0] = chain[back + t];
+        let mut cut = false;
+        for s in 1..ngram {
+            let p = chain[back + t - s];
+            cut |= p == eos;
+            ctx[s] = if cut { eos } else { p };
+        }
+        for g in 2..=ngram {
+            let h = (1..g).fold(ctx[0].wrapping_mul(mult[0] as u64), |h, j| {
+                h ^ ctx[j].wrapping_mul(mult[j] as u64)
+            });
+            for k in 0..per {
+                let j = (g - 2) * per + k;
+                out.push((h % voc[j] as u64 + off[j] as u64) as u32);
+            }
+        }
+    }
+    u32s(vec![rows * heads], out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,6 +830,7 @@ mod tests {
         let r = |k: Value| f("rope_inv_freq", k);
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0})), [1.0, 0.01]);
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "precision": "f32"})), [1.0, 0.01]);
+        assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "precision": "f32", "tile": 2})), [1.0, 0.01, 1.0, 0.01]);
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "kind": "linear", "factor": 2.0})), [0.5, 0.005]);
         // HunYuan alpha: 10000 * 2^(4/2) = 40000.
         assert_eq!(r(json!({"dim": 4, "theta": 10000.0, "kind": "ntk_alpha", "alpha": 2.0})), [1.0, 0.005]);
@@ -1042,5 +1094,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Hand-computed: m = [3, 5, 7], eos 2 cuts the context, missing context is eos.
+    #[test]
+    fn ngram_hash_rows_cuts_at_eos_and_pads_the_start() {
+        let hash = |ids: &[u32]| {
+            u("ngram_hash_rows", json!({"ids": ids, "rows": 2, "ngram": 3, "per_gram": 1, "eos": 2,
+                "multipliers": [3, 5, 7], "offsets": [0, 10], "vocab_sizes": [7, 11]}))
+        };
+        assert_eq!(hash(&[9, 4]), [3, 19, 5, 13]);
+        assert_eq!(hash(&[7, 2, 9, 4]), [3, 19, 5, 13]);
+        assert_eq!(hash(&[6, 9, 4]), [5, 10, 5, 13]);
     }
 }

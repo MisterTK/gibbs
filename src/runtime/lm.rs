@@ -9,8 +9,9 @@
 //!
 //! Inputs the runner fills: `token_ids`, `positions`, `visible_end` (the end of the bidirectional
 //! block a row sits in, else its position + 1) and every input with a `gen` (`arch::gen`); a gen
-//! input's args may name `pos0`, the position of the pass's first row, which the runner
-//! substitutes.
+//! input's args may name `pos0`, the position of the pass's first row, and `ids`, the token ids of
+//! positions `pos0 - back .. pos0 + rows` (`back`: the gen's own numeric arg, default 0, clipped at
+//! the sequence start), which the runner substitutes.
 //!
 //! `runtime` keys: `prefill_rows` (64) rows per prefill pass; `bidir_media_blocks`: a pass that
 //! would end inside a bidirectional block runs to the block's end (at most 512 rows), and the
@@ -60,6 +61,8 @@ pub struct Seq {
     prompt: Vec<u32>,
     /// Positions in `state`.
     len: usize,
+    /// Token ids of positions `0..len` (gen inputs read them as `ids`).
+    ids: Vec<u32>,
     /// Positions the caller has run (`< len` while a finished block runs ahead of it).
     asked: usize,
     /// Logits after position `len - 1` while `asked < len`.
@@ -83,7 +86,7 @@ enum Mode {
 
 /// A causal LM run from its family spec.
 pub struct SpecLm {
-    model: Model,
+    model: Arc<Model>,
     rt: Runtime,
     tok: Tokenizer,
     ctx: usize,
@@ -95,6 +98,9 @@ pub struct SpecLm {
     /// holds no recurrent state: greedy decode may stream on the device.
     streams: bool,
     weights: usize,
+    mode: PlacementMode,
+    /// The spec's own drafter (`runtime.drafter`), compiled at the first ask.
+    drafter: std::sync::OnceLock<Option<Arc<dyn crate::scheduler::spec::Drafter>>>,
 }
 
 fn vars(rows: usize, head: &str, taps: &[usize]) -> Vec<(&'static str, Val)> {
@@ -112,20 +118,27 @@ fn vars(rows: usize, head: &str, taps: &[usize]) -> Vec<(&'static str, Val)> {
     v
 }
 
-/// The runner-filled value of input `d` for rows `ids` from position `pos0`.
+/// The runner-filled value of input `d` for the rows `pos0..hist.len()`; `hist` holds the token ids
+/// of every position up to the pass end.
 fn input(
     d: &InputPlan,
-    ids: &[u32],
+    hist: &[u32],
     pos0: usize,
     blocks: &[Range<usize>],
 ) -> Result<Tensor, String> {
+    let ids = &hist[pos0..];
     let n = ids.len();
     let t = match (&d.gen, d.name.as_str()) {
         (Some((g, args)), _) => {
             let mut args = args.clone();
             if let Some(o) = args.as_object_mut() {
-                for v in o.values_mut().filter(|v| v.as_str() == Some("pos0")) {
-                    *v = pos0.into();
+                let back = o.get("back").and_then(|b| b.as_f64()).unwrap_or(0.0) as usize;
+                for v in o.values_mut() {
+                    match v.as_str() {
+                        Some("pos0") => *v = pos0.into(),
+                        Some("ids") => *v = hist[pos0.saturating_sub(back)..].into(),
+                        _ => {}
+                    }
                 }
             }
             match generate(g, &args)
@@ -217,7 +230,8 @@ impl SpecLm {
         })?;
         // ponytail: with media the towers' weights count too; Phase 4 adds them to `used`.
         if rt.media.is_none() {
-            let used: HashSet<String> = decode.weights.iter().cloned().collect();
+            let mut used: HashSet<String> = decode.weights.iter().cloned().collect();
+            used.extend(crate::runtime::draft::drafter_weights(&model)?);
             let unused = model.store.unconsumed(&used, &model.spec.ignore);
             if !unused.is_empty() {
                 return Err(format!(
@@ -245,7 +259,9 @@ impl SpecLm {
             recurrent,
             streams,
             weights: decode.weights.len(),
-            model,
+            mode,
+            drafter: Default::default(),
+            model: Arc::new(model),
         })
     }
 
@@ -343,6 +359,8 @@ impl SpecLm {
     ) -> Result<Tensor, String> {
         let (from, cap) = (seq.len, if ckpt { 1 } else { self.rt.prefill_rows.max(1) });
         let stop = from + ids.len();
+        seq.ids.truncate(from);
+        seq.ids.extend_from_slice(ids);
         let refs: Vec<&str> = self.recurrent.iter().map(String::as_str).collect();
         let head = if mode == Mode::All { "all" } else { "last" };
         let (mut logits, mut picked) = (Vec::new(), None);
@@ -370,7 +388,7 @@ impl SpecLm {
             let inputs = inst
                 .inputs
                 .iter()
-                .map(|d| input(d, &ids[at - from..e - from], at, blocks))
+                .map(|d| input(d, &seq.ids[..e], at, blocks))
                 .collect::<Result<Vec<_>, _>>()?;
             let greedy = mode == Mode::Greedy && e == stop && stop == end && li == 0;
             // The compiled program is the decode instance; every other shape runs reshaped.
@@ -423,6 +441,64 @@ impl SpecLm {
     }
 }
 
+impl SpecLm {
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    /// `ids` from position 0 on a fresh state, in passes of `prefill_rows` rows (instance head
+    /// `hidden` before the last pass, `head` for it); output `out` of the last pass. `extra`
+    /// fills inputs by name for the last pass (a row index there is relative to that pass: see
+    /// [`Self::last_pass_start`]).
+    pub fn run_head(
+        &self,
+        ids: &[u32],
+        head: &str,
+        out: &str,
+        extra: &[(&str, Tensor)],
+    ) -> Result<Vec<f32>, String> {
+        if ids.is_empty() || ids.len() > self.ctx {
+            return Err(format!("{} tokens: the context holds 1..={}", ids.len(), self.ctx));
+        }
+        let cap = self.rt.prefill_rows.max(1);
+        let mut p = self.program.lock();
+        let saved = std::mem::replace(&mut p.state, StateStore::new());
+        let mut run = || -> Result<Vec<f32>, String> {
+            let mut at = 0;
+            loop {
+                let e = (at + cap).min(ids.len());
+                let last = e == ids.len();
+                let inst = self.instance(e - at, if last { head } else { "hidden" }, &[])?;
+                let inputs = inst
+                    .inputs
+                    .iter()
+                    .map(|d| match extra.iter().find(|x| x.0 == d.name) {
+                        Some((_, t)) if last => Ok(t.clone()),
+                        _ => input(d, &ids[..e], at, &[]),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let res = p.run_reshaped(&inst.graph, inputs)?;
+                if e == ids.len() {
+                    let i = inst
+                        .output_index(out)
+                        .ok_or_else(|| format!("the `{head}` instance has no output `{out}`"))?;
+                    return res[i].as_f32().map(<[f32]>::to_vec);
+                }
+                at = e;
+            }
+        };
+        let r = run();
+        p.state = saved;
+        r
+    }
+
+    /// Start position of the last pass [`Self::run_head`] makes over `n` ids.
+    pub fn last_pass_start(&self, n: usize) -> usize {
+        let cap = self.rt.prefill_rows.max(1);
+        (n.max(1) - 1) / cap * cap
+    }
+}
+
 impl NativeLm for SpecLm {
     fn backend_label(&self) -> String {
         self.program.lock().backend_label()
@@ -465,6 +541,7 @@ impl NativeLm for SpecLm {
             state: StateStore::new(),
             prompt: ids.clone(),
             len: 0,
+            ids: Vec::new(),
             asked: 0,
             ahead: Vec::new(),
             blocks: Vec::new(),
@@ -511,6 +588,8 @@ impl NativeLm for SpecLm {
         std::mem::swap(&mut p.state, &mut seq.state);
         if let Ok(Some(_)) = out {
             (seq.len, seq.asked) = (start_pos + 1, start_pos + 1);
+            seq.ids.truncate(start_pos);
+            seq.ids.push(last);
             seq.ckpt.clear();
         }
         out
@@ -556,6 +635,7 @@ impl NativeLm for SpecLm {
         seq.ckpt.clear();
         seq.ahead.clear();
         (seq.len, seq.asked) = (len, len);
+        seq.ids.truncate(len);
         Ok(())
     }
 
@@ -568,6 +648,17 @@ impl NativeLm for SpecLm {
 
     fn take_taps(&self, state: &mut SeqState) -> Vec<f32> {
         Self::seq(state).map_or_else(|_| Vec::new(), |s| std::mem::take(&mut s.tapped))
+    }
+
+    fn drafter(&self) -> Option<Arc<dyn crate::scheduler::spec::Drafter>> {
+        self.drafter
+            .get_or_init(|| {
+                crate::runtime::draft::spec_drafter(&self.model, self.mode)
+                    .map_err(|e| tracing::warn!("drafter: {e}"))
+                    .ok()
+                    .flatten()
+            })
+            .clone()
     }
 }
 
