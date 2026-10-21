@@ -87,6 +87,9 @@
         {name: "deepstack.0", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 0"},
         {name: "deepstack.1", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 1"},
         {name: "deepstack.2", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 2"},
+        // Instance var `masked`: one uncached pass over a right-padded encoder prompt, `key_mask`
+        // 0 on real tokens and -inf on padding (transformers' attention mask).
+        {name: "key_mask", dtype: "f32", shape: ["rows"], when: "first(masked, false)"},
       ],
       body: [
         {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
@@ -96,7 +99,8 @@
           {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.input_layernorm"},
           {use: "qwen_attn", in: ["h"], out: "a", name: "layers.{i}.self_attn",
            args: {p: "fmt('{p}.self_attn')", layer: "i", q_norm_name: "first(q_norm_name)", k_norm_name: "first(k_norm_name)",
-                  rope_pos: "has_vision ? 'rope_positions' : 'positions'", rope_variant: "mrope_variant"}},
+                  rope_pos: "has_vision ? 'rope_positions' : 'positions'", rope_variant: "mrope_variant",
+                  key_mask: "first(masked, false) ? 'key_mask' : ''"}},
           {op: "Binary", args: {kind: "'Add'"}, in: ["x", "a"], out: "x", name: "layers.{i}.add_mixer"},
           {use: "rms_norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.post_attention_layernorm"},
           {use: "mlp_glu", in: ["h"], out: "m", name: "layers.{i}.mlp", when: "experts == 0",
