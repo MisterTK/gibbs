@@ -26,6 +26,9 @@ use std::path::Path;
 /// Every embedded spec file: (path under `arch/`, contents).
 pub const EMBEDDED: &[(&str, &str)] = &[
     ("lib/transformer.json5", include_str!("../../arch/lib/transformer.json5")),
+    ("lib/diffusion.json5", include_str!("../../arch/lib/diffusion.json5")),
+    ("lib/unet.json5", include_str!("../../arch/lib/unet.json5")),
+    ("lib/vae.json5", include_str!("../../arch/lib/vae.json5")),
     ("names/llamacpp.json5", include_str!("../../arch/names/llamacpp.json5")),
     ("families/llama.json5", include_str!("../../arch/families/llama.json5")),
     ("families/glm.json5", include_str!("../../arch/families/glm.json5")),
