@@ -888,9 +888,14 @@ impl ContinuousBatchScheduler {
     /// the newest GPU run sample. Nothing is recorded without one (CPU, or a profiled token).
     #[cfg(target_os = "macos")]
     fn record_gap(&self, itl: Duration) {
-        let Some(run) = crate::graph::metal::take_run_samples().last().copied() else {
+        // ponytail: one process-wide cursor; per-scheduler if two schedulers decode at once.
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some((seq, run)) = crate::graph::metal::last_run_sample() else {
             return;
         };
+        if SEEN.swap(seq, std::sync::atomic::Ordering::Relaxed) == seq {
+            return;
+        }
         let ceiling = crate::model::variant::host_ceiling_gbps();
         let weights_ms = if ceiling > 0.0 {
             self.telemetry.bytes_per_token() as f64 / 1e9 / ceiling * 1e3

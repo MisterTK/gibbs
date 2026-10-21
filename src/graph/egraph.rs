@@ -66,6 +66,7 @@ const SCHEMA: &str = r#"
 (function wrows (W) i64 :no-merge)
 (function wkey (W) String :no-merge)
 (relation QkvIn (W))
+(relation GluIn (W))
 (relation MlpDown (E E E i64 E E))
 (relation MlpGate (E E E E E i64 E E))
 (relation MlpUp (E E E E E i64 E E E))
@@ -147,7 +148,7 @@ impl Rule {
             Rule::GateUp => {
                 r#"
 (rule ((= s (Node lid (Cons g (Cons u (Nil))))) (K lid "Glu")
-       (= g (Lin gk x wg)) (= u (Lin uk x wu)) (!= gk uk)
+       (= g (Lin gk x wg)) (= u (Lin uk x wu)) (!= gk uk) (GluIn wg) (GluIn wu)
        (= key (wkey wg)) (= key (wkey wu)) (= rg (wrows wg)) (= ru (wrows wu)))
       ((let w (Cat2 wg wu))
        (set (wrows w) (+ rg ru)) (set (wkey w) key) (QkvIn w)
@@ -326,8 +327,8 @@ impl Report {
 }
 
 /// Concatenation class of weight `w` for the gate/up and QKV rules (`None`: never fused, as
-/// `concat_weight_tensors` / `matches_dtype` would refuse it, including every model-loader
-/// `Tensor::Mat`).
+/// `concat_weight_tensors` / `matches_dtype` would refuse it). Model-loader `Tensor::Mat`s fuse
+/// only as QKV (see `rewrite_gate_up`), so they get no `GluIn` fact.
 fn cat_key(g: &Graph, w: ValueId, weights: Option<&Weights>) -> Option<String> {
     let val = g.value(w);
     if val.kind != ValueKind::Weight || val.shape.len() != 2 {
@@ -428,6 +429,12 @@ fn encode(eg: &mut EGraph, g: &Graph, weights: Option<&Weights>) -> Result<(), S
                         fs.set("wrows", wt, g.value(*w).shape[0] as i64)?;
                         fs.set("wkey", wt, key)?;
                         fs.add("QkvIn", wt)?;
+                        let mat = weights
+                            .and_then(|ws| ws.get(&g.value(*w).name))
+                            .is_some_and(|t| matches!(t, Tensor::Mat(_)));
+                        if !mat {
+                            fs.add("GluIn", wt)?;
+                        }
                     }
                     let lin = fs.add("Lin", (id, args[0], wt))?;
                     fs.union(o, lin)?;
@@ -1489,6 +1496,7 @@ mod tests {
         let want = [
             ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
             ([0; 4], 0x927782df5841c11f),
+
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);

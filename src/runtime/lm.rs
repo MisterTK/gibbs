@@ -571,7 +571,7 @@ impl SpecLm {
                 .collect::<Result<Vec<_>, _>>()?;
             let greedy = mode == Mode::Greedy && e == stop && stop == end && li == 0;
             // The compiled program is the decode instance; every other shape runs reshaped.
-            let out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
+            let mut out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
                 match greedy {
                     true => p.run_greedy(inputs, self.tok.vocab_size())?,
                     false => p.run(inputs)?,
@@ -579,10 +579,11 @@ impl SpecLm {
             } else {
                 p.run_reshaped(&inst.graph, inputs)?
             };
-            match out.get(li) {
+            // Moved out, not copied: a vocabulary row per decode token.
+            match out.get_mut(li).map(|t| std::mem::replace(t, Tensor::U32(Vec::new()))) {
                 Some(Tensor::U32(t)) => picked = t.first().copied(),
-                Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(v),
-                Some(Tensor::F32(v)) => logits.clone_from(v),
+                Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(&v),
+                Some(Tensor::F32(v)) => logits = v,
                 _ => return Err("the text component returned no f32 logits".into()),
             }
             if !seq.taps.is_empty() {

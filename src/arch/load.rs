@@ -370,7 +370,7 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
         let dir = p.parent().unwrap_or(Path::new("."));
         crate::model::prequant::check(config, dir)?;
         ck.lora_merged = peft_merged(p);
-        index_weights(ck, crate::model::prequant::open_weights(p, config)?);
+        index_weights(ck, crate::model::prequant::open_weights(p, config, true)?);
         return Ok(());
     }
     let (m, data) = crate::model::loaders::read_checkpoint(p)?;
@@ -885,6 +885,9 @@ pub struct WeightStore {
 
 impl WeightStore {
     fn node(&self, name: &str) -> Option<Arc<Node>> {
+        let name = name
+            .strip_suffix(crate::arch::build::LINEAR_COPY)
+            .unwrap_or(name);
         self.table.read().get(name).cloned()
     }
 
@@ -930,16 +933,57 @@ impl WeightStore {
         let t = self
             .build(name, &n, k)
             .map_err(|e| format!("tensor `{name}`: {e}"))?;
-        let passthrough =
-            matches!(n.src, Src::Raw(_)) && k == n.kind && !matches!(k, Kind::Packed(_));
+        let passthrough = matches!(n.src, Src::Raw(_))
+            && k == n.kind
+            && !matches!(k, Kind::Packed(_))
+            && !matches!(&t, Tensor::Mat(m) if m.packed().is_some());
         if !passthrough {
             self.cache.lock().insert(name.to_string(), t.clone());
         }
         Ok(t)
     }
 
+    /// Whether the re-encode policy decides the stored format of `n` (as `k`): matrices of blocks
+    /// and float weight matrices (not generated constants or convolution kernels).
+    fn reencodable(&self, n: &Node, k: Kind) -> bool {
+        n.shape.len() == 2
+            && self.reencode.force.is_none()
+            && match k {
+                Kind::Packed(_) => n.kind == k,
+                Kind::F32 | Kind::F16 | Kind::Bf16 => !n.conv && !matches!(n.src, Src::Gen(_)),
+                Kind::U32 => false,
+            }
+    }
+
     fn build(&self, name: &str, n: &Node, k: Kind) -> Result<Tensor, String> {
         let (rows, cols) = rows_cols(&n.shape);
+        let float = match k {
+            Kind::F32 => Some(Q::FP32),
+            Kind::F16 => Some(Q::FP16),
+            Kind::Bf16 => Some(Q::BF16),
+            _ => None,
+        };
+        // Bit-exact keeps float matrices as stored (its rule would block-encode codec-less sources).
+        let lossy = self.reencode.policy != ReencodePolicy::BitExact;
+        if let (Some(src), true) = (float, lossy && self.reencodable(n, k)) {
+            let r = crate::model::reencode::reencode_values(
+                &self.reencode,
+                name,
+                src,
+                rows,
+                cols,
+                || self.dense(n).ok(),
+            );
+            if let Some((f, blocks)) = r {
+                let p = Packed {
+                    map: Arc::new(GgufData::Buf(blocks)),
+                    off: 0,
+                    format: f,
+                    shape: n.shape.clone(),
+                };
+                return Ok(Tensor::Mat(Mat::from_packed(p, rows, cols)));
+            }
+        }
         Ok(match k {
             Kind::U32 => match &n.src {
                 Src::Gen(g) => match &g.data {
@@ -1109,6 +1153,7 @@ impl WeightStore {
         let table = self.table.read();
         let mut fed = HashSet::new();
         for u in used {
+            let u = u.strip_suffix(crate::arch::build::LINEAR_COPY).unwrap_or(u);
             if let Some(n) = table.get(u) {
                 leaves(n, &mut fed);
             }
@@ -1239,12 +1284,7 @@ impl Source for WeightStore {
         let n = self.node(name)?;
         let k = self.final_kind(&n);
         // A re-encode policy picks the stored format from the data: decide it now (cached).
-        if matches!(k, Kind::Packed(_))
-            && n.kind == k
-            && n.shape.len() == 2
-            && self.reencode.force.is_none()
-            && self.reencode.policy != ReencodePolicy::BitExact
-        {
+        if self.reencodable(&n, k) && self.reencode.policy != ReencodePolicy::BitExact {
             match self.get(name) {
                 Ok(t) => return Some((n.shape.clone(), dtype_of(&t))),
                 Err(e) => tracing::warn!("{e}"),
@@ -2553,6 +2593,53 @@ mod tests {
             r#"{{family: "toy", match: {{hf_model_type: ["toy"]}}, pipeline: "causal_lm", {body}}}"#
         );
         load_with(&a, &registry(&[&spec]), None, exact())
+    }
+
+    #[test]
+    fn projection_copy_reencodes_and_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let (rows, cols) = (64, 256);
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 40.0)
+            .collect();
+        write_st(
+            &d.path().join("model.safetensors"),
+            None,
+            &[("embed", "BF16", &[rows, cols], bf16b(&v))],
+        );
+        let a = artifacts(
+            d.path(),
+            Some("model.safetensors"),
+            Some(json!({"model_type": "toy"})),
+        );
+        let spec = r#"{family: "toy", match: {hf_model_type: ["toy"]}, pipeline: "causal_lm"}"#;
+        let cfg = ReencodeConfig {
+            policy: ReencodePolicy::MaxSpeed,
+            ..exact()
+        };
+        let m = load_with(&a, &registry(&[spec]), None, cfg).unwrap();
+        let name = format!("embed{}", crate::arch::build::LINEAR_COPY);
+        let (_, dtype) = m.store.tensor(&name).unwrap();
+        let t = get(&m, &name);
+        assert_eq!(dtype_of(&t), dtype);
+        let Tensor::Mat(mat) = &t else {
+            panic!("not a Mat")
+        };
+        let p = mat
+            .packed()
+            .expect("max-speed re-encodes the projection copy");
+        let (elems, bytes, dec) = crate::model::layers::gguf_block_codec(p.format).unwrap();
+        let mut got = vec![0.0f32; rows * cols];
+        for (b, o) in p.map[p.off..]
+            .chunks_exact(bytes)
+            .zip(got.chunks_exact_mut(elems))
+        {
+            dec(b, o);
+        }
+        let ref_v: Vec<f32> = v.iter().map(|&x| bf16_to_f32(f32_to_bf16(x))).collect();
+        assert!(crate::model::reencode::relative_rmse(&ref_v, &got) < 0.1);
+        // The gather table itself keeps its encoding.
+        assert!(matches!(get(&m, "embed"), Tensor::Mat(m) if m.packed().is_none()));
     }
 
     fn get(m: &Model, n: &str) -> Tensor {
