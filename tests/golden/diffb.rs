@@ -8,6 +8,8 @@ use gibbs_engine::hardware::Device;
 use gibbs_engine::model::flux::{Loras, Store};
 use gibbs_engine::model::weights::Weights as Mw;
 use serde_json::{json, Value};
+use gibbs_engine::arch::{expr::Val, testing::Runner};
+use gibbs_engine::graph::Tensor;
 
 type Spec = Vec<(String, Vec<usize>)>;
 
@@ -454,6 +456,22 @@ fn ltx() {
         }
         o
     });
+    // The `ltx` spec against the same recording (`t_feat` rows per span, clean first).
+    for dev in devices().into_iter().filter(|_| !writing()) {
+        let mut r = spec_runner(&dir, "ltxv_tiny.safetensors", "ltx", dev);
+        let mut o = Out::default();
+        for (t, clean) in [(700.0f32, 0usize), (350.0, 5), (700.0, n)] {
+            let vars = [("frames", f), ("h", h), ("w", w), ("nt", nt), ("clean", clean)].map(|(k, v)| (k, Val::Num(v as f64)));
+            let feat: Vec<f32> = [(clean > 0, 0.0), (clean < n, t as f64)]
+                .into_iter()
+                .filter(|s| s.0)
+                .flat_map(|s| temb(s.1, 256, "f64"))
+                .collect();
+            let ins = vec![Tensor::F32(x.clone()), Tensor::F32(raw.clone()), Tensor::F32(feat)];
+            o.f(format!("t{t}_clean{clean}"), &sub(&r.run("denoiser", &vars, ins).unwrap()["v"].clone().into_f32().unwrap()));
+        }
+        check("diffb_ltx", dev, &o, TOL);
+    }
 }
 
 /// Qwen-Image VAE decoder (ComfyUI `qwen_image_vae.safetensors` names), base 4, mult [1, 2, 4, 4],
@@ -698,6 +716,15 @@ fn ltx_vae() {
         o.f("decode_2x2x3", &sub(&y.d));
         o
     });
+    // The `ltx_vae` spec against the same recording.
+    for dev in devices().into_iter().filter(|_| !writing()) {
+        let num = |v: usize| Val::Num(v as f64);
+        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", "ltx_vae", dev);
+        let y = r.run("decoder", &[("frames", num(f)), ("h", num(h)), ("w", num(w))], vec![Tensor::F32(d.clone())]).unwrap();
+        let mut o = Out::default();
+        o.f("decode_2x2x3", &sub(&y["y"].clone().into_f32().unwrap()));
+        check("diffb_ltx_vae", dev, &o, TOL);
+    }
 }
 
 /// ModelScope text-to-video `UNet3DConditionModel`: block widths [64, 128, 128, 128] (heads of 64),
@@ -834,4 +861,30 @@ fn unet3d() {
         }
         o
     });
+    // The `modelscope_t2v` spec against the same recording.
+    for dev in devices().into_iter().filter(|_| !writing()) {
+        let num = |v: usize| Val::Num(v as f64);
+        let vars = [("frames", num(frames)), ("h", num(h)), ("w", num(w)), ("nt", num(ctx_len))];
+        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", "modelscope_t2v", dev);
+        let mut o = Out::default();
+        for t in [900.0f32, 400.0] {
+            let ins = vec![Tensor::F32(x.clone()), Tensor::F32(temb(t as f64, cfg.block_out[0], "f32")), Tensor::F32(ctx.clone())];
+            o.f(format!("eps_t{t}"), &r.run("denoiser", &vars, ins).unwrap()["eps"].clone().into_f32().unwrap());
+        }
+        check("diffb_unet3d", dev, &o, TOL);
+    }
+}
+
+/// Cos-first sinusoidal timestep features (`timestep_embedding` generator).
+fn temb(t: f64, dim: usize, precision: &str) -> Vec<f32> {
+    let g = gibbs_engine::arch::gen::generate("timestep_embedding", &json!({"t": t, "dim": dim, "precision": precision}))
+        .unwrap();
+    match g.data {
+        gibbs_engine::arch::gen::GenData::F32(v) => v,
+        _ => unreachable!(),
+    }
+}
+
+fn spec_runner(dir: &std::path::Path, weights: &str, family: &str, dev: Device) -> Runner {
+    Runner::from_artifacts(&artifacts(dir, "test/spec", weights), Some(family), dev, 0).expect(family)
 }

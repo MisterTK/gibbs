@@ -1,0 +1,243 @@
+// ModelScope text-to-video `UNet3DConditionModel` (diffusers names), epsilon prediction.
+// Clip activations are `[frames, c, h, w]`: Conv2d / GroupNorm take frames as the batch dim; the
+// temporal convs (Conv3d (3,1,1), weight kept raw) and temporal attention re-view the clip as
+// `[c, frames, ..]` with clip-wide GroupNorm statistics. Topology from `unet/config.json` and the
+// tensors present (attention / resampler per block). Caller inputs: `x`, `t_emb [1, c0]`
+// (cos-first f32 timestep sinusoid), `context [nt, cross_attention_dim]` shared by every frame.
+{
+  family: "modelscope_t2v",
+  match: {diffusers_class: ["UNet3DConditionModel"]},
+  pipeline: "video",
+  use_lib: ["video"],
+  config: {
+    bo: "cfg.block_out_channels",
+    c0: "at(bo, 0)",
+    stages: "len(bo)",
+    top: "len(bo) - 1",
+    layers: "first(cfg.layers_per_block, 2)",
+    in_ch: "first(cfg.in_channels, 4)",
+    ctx_dim: "cfg.cross_attention_dim",
+    head_dim: "first(cfg.attention_head_dim, 64)",
+    groups: "first(cfg.norm_num_groups, 32)",
+    // Skip activations pushed on the way down: conv_in, every down layer, every downsampler.
+    nskips: "1 + top * (layers + 1) + layers",
+  },
+  checks: [
+    {expr: "!has('conv_in.weight') || !has('transformer_in.proj_in.weight')", error: "not a ModelScope UNet3D (no conv_in / transformer_in)"},
+  ],
+  macros: {
+    // Binds another name to `x` (no node).
+    alias: {params: ["x"], body: [], returns: "x"},
+    conv2d: {params: ["x"], body: [
+      {let: {k: "shape(fmt('{w}.weight'))[2]"}},
+      {op: "Conv2d", args: {stride: ["stride", "stride"], padding: ["k // 2", "k // 2", "k // 2", "k // 2"], dilation: [1, 1], groups: 1},
+       in: ["x", "w:{w}.weight", "w:{w}.bias"], out: "out", name: "conv2d"},
+    ]},
+    // GroupNorm with per-frame statistics over `x [frames, c, ..]`.
+    gn_frames: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {op: "Reshape", args: {shape: ["at(s, 0)", "at(s, 1)", "at(s, 2) * at(s, 3)"]}, in: ["x"], out: "f", name: "flat"},
+      {op: "GroupNorm", args: {groups: "groups", eps: "eps"}, in: ["f", "w:{w}.weight", "w:{w}.bias"], out: "y", name: "gn"},
+      {op: "Reshape", args: {shape: "s"}, in: ["y"], out: "out", name: "shape"},
+    ]},
+    // diffusers `ResnetBlock2D`, `emb [1, 4*c0]` (SiLU'd time embedding).
+    res: {params: ["x", "emb"], body: [
+      {let: {co: "shape(fmt('{b}.conv1.weight'))[0]"}},
+      {use: "gn_frames", args: {w: "fmt('{b}.norm1')", eps: 1e-5}, in: ["x"], out: "t", name: "norm1"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "silu1"},
+      {use: "conv2d", args: {w: "fmt('{b}.conv1')", stride: 1}, in: ["t"], out: "t", name: "conv1"},
+      {use: "lin", args: {w: "fmt('{b}.time_emb_proj')"}, in: ["emb"], out: "e", name: "emb"},
+      {op: "Reshape", args: {shape: [1, "co", 1, 1]}, in: ["e"], out: "e", name: "emb4"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "e"], out: "t", name: "addb"},
+      {use: "gn_frames", args: {w: "fmt('{b}.norm2')", eps: 1e-5}, in: ["t"], out: "t", name: "norm2"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "silu2"},
+      {use: "conv2d", args: {w: "fmt('{b}.conv2')", stride: 1}, in: ["t"], out: "t", name: "conv2"},
+      {use: "conv2d", args: {w: "fmt('{b}.conv_shortcut')", stride: 1}, in: ["x"], out: "x", name: "skip", when: "has(fmt('{b}.conv_shortcut.weight'))"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "x"], out: "out", name: "add"},
+    ]},
+    // `TemporalConvLayer`: four GroupNorm (clip-wide) -> SiLU -> Conv3d (3,1,1) blocks + identity.
+    temp_conv: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {let: {fr: "at(s, 0)", c: "at(s, 1)", hw: "at(s, 2) * at(s, 3)"}},
+      {op: "Reshape", args: {shape: ["fr", "c", "hw"]}, in: ["x"], out: "x", name: "flat"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["x"], out: "id", name: "cf"},
+      {op: "Reshape", args: {shape: ["c", "fr * hw"]}, in: ["id"], out: "h", name: "h0"},
+      {repeat: "q", count: 4, body: [
+        {op: "GroupNorm", args: {groups: "groups", eps: 1e-5}, in: ["h", "w:{b}.conv{q + 1}.0.weight", "w:{b}.conv{q + 1}.0.bias"], out: "t", name: "gn{q}"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "silu{q}"},
+        {op: "Reshape", args: {shape: ["c", "fr", 1, "hw"]}, in: ["t"], out: "t", name: "v{q}"},
+        {let: {cw: "fmt('{b}.conv{q + 1}.{q == 0 ? 2 : 3}')"}},
+        {op: "Conv3d", args: {stride: [1, 1, 1], padding: [1, 0, 0, 1, 0, 0], dilation: [1, 1, 1], groups: 1},
+         in: ["t", "w:{cw}.weight", "w:{cw}.bias"], out: "t", name: "conv{q}"},
+        {op: "Reshape", args: {shape: ["c", "fr * hw"]}, in: ["t"], out: "h", name: "o{q}"},
+      ]},
+      {op: "Reshape", args: {shape: ["c", "fr", "hw"]}, in: ["h"], out: "h", name: "h3"},
+      {op: "Binary", args: {kind: "Add"}, in: ["h", "id"], out: "h", name: "add"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["h"], out: "h", name: "fc"},
+      {op: "Reshape", args: {shape: "s"}, in: ["h"], out: "out", name: "shape"},
+    ]},
+    // Self-attention of `x [frames*n, width]` within each frame (frames become extra heads).
+    attn_per_frame: {params: ["x"], body: [
+      {use: "lin", args: {w: "fmt('{a}.to_q')"}, in: ["x"], out: "q", name: "q"},
+      {use: "lin", args: {w: "fmt('{a}.to_k')"}, in: ["x"], out: "k", name: "k"},
+      {use: "lin", args: {w: "fmt('{a}.to_v')"}, in: ["x"], out: "v", name: "v"},
+      {let: {wd: "shape('q')[1]"}},
+      {repeat: "p", over: "['q', 'k', 'v']", body: [
+        {op: "Reshape", args: {shape: ["fr", "n", "wd"]}, in: ["{p}"], out: "{p}", name: "{p}.r"},
+        {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["{p}"], out: "{p}", name: "{p}.t"},
+        {op: "Reshape", args: {shape: ["n", "fr * wd"]}, in: ["{p}"], out: "{p}", name: "{p}.p"},
+      ]},
+      {op: "Attention", args: {heads: "fr * wd / head_dim", kv_heads: "fr * wd / head_dim", causal: false}, in: ["q", "k", "v"], out: "o", name: "attn"},
+      {op: "Reshape", args: {shape: ["n", "fr", "wd"]}, in: ["o"], out: "o", name: "o.r"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["o"], out: "o", name: "o.t"},
+      {op: "Reshape", args: {shape: ["fr * n", "wd"]}, in: ["o"], out: "o", name: "o.p"},
+      {use: "lin", args: {w: "fmt('{a}.to_out.0')"}, in: ["o"], out: "out", name: "out"},
+    ]},
+    // Self-attention of `x [frames*n, width]` along frames: every (position, head) is a head.
+    attn_across_frames: {params: ["x"], body: [
+      {use: "lin", args: {w: "fmt('{a}.to_q')"}, in: ["x"], out: "q", name: "q"},
+      {use: "lin", args: {w: "fmt('{a}.to_k')"}, in: ["x"], out: "k", name: "k"},
+      {use: "lin", args: {w: "fmt('{a}.to_v')"}, in: ["x"], out: "v", name: "v"},
+      {let: {wd: "shape('q')[1]"}},
+      {repeat: "p", over: "['q', 'k', 'v']", body: [
+        {op: "Reshape", args: {shape: ["fr", "n * wd"]}, in: ["{p}"], out: "{p}", name: "{p}.r"},
+      ]},
+      {op: "Attention", args: {heads: "n * wd / head_dim", kv_heads: "n * wd / head_dim", causal: false}, in: ["q", "k", "v"], out: "o", name: "attn"},
+      {op: "Reshape", args: {shape: ["fr * n", "wd"]}, in: ["o"], out: "o", name: "o.r"},
+      {use: "lin", args: {w: "fmt('{a}.to_out.0')"}, in: ["o"], out: "out", name: "out"},
+    ]},
+    // Cross-attention of every row of `x` to `ctx`.
+    attn_cross: {params: ["x", "ctx"], body: [
+      {use: "lin", args: {w: "fmt('{a}.to_q')"}, in: ["x"], out: "q", name: "q"},
+      {use: "lin", args: {w: "fmt('{a}.to_k')"}, in: ["ctx"], out: "k", name: "k"},
+      {use: "lin", args: {w: "fmt('{a}.to_v')"}, in: ["ctx"], out: "v", name: "v"},
+      {op: "Attention", args: {heads: "shape('q')[1] / head_dim", kv_heads: "shape('q')[1] / head_dim", causal: false}, in: ["q", "k", "v"], out: "o", name: "attn"},
+      {use: "lin", args: {w: "fmt('{a}.to_out.0')"}, in: ["o"], out: "out", name: "out"},
+    ]},
+    // BasicTransformerBlocks over `tok [frames*n, width]`: spatial (`ctx` given: attn1 within frames,
+    // attn2 cross) or temporal (attn1 and attn2 along frames). GEGLU feed-forward (value, gelu(gate)).
+    tblocks: {params: ["tok", "ctx"], body: [
+      {repeat: "bi", count: "count(fmt('{t}.transformer_blocks.{{k}}.norm1.weight'))", body: [
+        {let: {p: "fmt('{t}.transformer_blocks.{bi}')"}},
+        {op: "LayerNorm", args: {eps: 1e-5}, in: ["tok", "w:{p}.norm1.weight", "w:{p}.norm1.bias"], out: "h", name: "b{bi}.norm1"},
+        {use: "attn_per_frame", args: {a: "fmt('{p}.attn1')"}, in: ["h"], out: "y", name: "b{bi}.attn1", when: "spatial"},
+        {use: "attn_across_frames", args: {a: "fmt('{p}.attn1')"}, in: ["h"], out: "y", name: "b{bi}.attn1", when: "!spatial"},
+        {op: "Binary", args: {kind: "Add"}, in: ["tok", "y"], out: "tok", name: "b{bi}.r1"},
+        {op: "LayerNorm", args: {eps: 1e-5}, in: ["tok", "w:{p}.norm2.weight", "w:{p}.norm2.bias"], out: "h", name: "b{bi}.norm2"},
+        {use: "attn_cross", args: {a: "fmt('{p}.attn2')"}, in: ["h", "ctx"], out: "y", name: "b{bi}.attn2", when: "spatial"},
+        {use: "attn_across_frames", args: {a: "fmt('{p}.attn2')"}, in: ["h"], out: "y", name: "b{bi}.attn2", when: "!spatial"},
+        {op: "Binary", args: {kind: "Add"}, in: ["tok", "y"], out: "tok", name: "b{bi}.r2"},
+        {op: "LayerNorm", args: {eps: 1e-5}, in: ["tok", "w:{p}.norm3.weight", "w:{p}.norm3.bias"], out: "h", name: "b{bi}.norm3"},
+        {use: "lin", args: {w: "fmt('{p}.ff.net.0.proj')"}, in: ["h"], out: "g", name: "b{bi}.ff_in"},
+        {let: {inner: "shape(fmt('{p}.ff.net.0.proj.weight'))[0] // 2"}},
+        {op: "Slice", args: {axis: 1, start: 0, end: "inner"}, in: ["g"], out: "a", name: "b{bi}.value"},
+        {op: "Slice", args: {axis: 1, start: "inner", end: "2 * inner"}, in: ["g"], out: "gt", name: "b{bi}.gate"},
+        {op: "Unary", args: {kind: "GeluErf"}, in: ["gt"], out: "gt", name: "b{bi}.gelu"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["a", "gt"], out: "g", name: "b{bi}.geglu"},
+        {use: "lin", args: {w: "fmt('{p}.ff.net.2')"}, in: ["g"], out: "f", name: "b{bi}.ff_out"},
+        {op: "Binary", args: {kind: "Add"}, in: ["tok", "f"], out: "tok", name: "b{bi}.r3"},
+      ]},
+    ], returns: "tok"},
+    // Spatial transformer over `x [frames, c, h, w]` (per-frame GroupNorm, shared context).
+    spatial: {params: ["x", "ctx"], body: [
+      {let: {s: "shape('x')"}},
+      {let: {fr: "at(s, 0)", c: "at(s, 1)", n: "at(s, 2) * at(s, 3)", spatial: true}},
+      {use: "gn_frames", args: {w: "fmt('{t}.norm')", eps: 1e-6}, in: ["x"], out: "h", name: "norm"},
+      {op: "Reshape", args: {shape: ["fr", "c", "n"]}, in: ["h"], out: "h", name: "r"},
+      {op: "Transpose", args: {perm: [0, 2, 1]}, in: ["h"], out: "h", name: "t"},
+      {op: "Reshape", args: {shape: ["fr * n", "c"]}, in: ["h"], out: "h", name: "tok"},
+      {use: "lin", args: {w: "fmt('{t}.proj_in')"}, in: ["h"], out: "tok", name: "proj_in"},
+      {use: "tblocks", in: ["tok", "ctx"], out: "tok", name: "blocks"},
+      {use: "lin", args: {w: "fmt('{t}.proj_out')"}, in: ["tok"], out: "o", name: "proj_out"},
+      {op: "Reshape", args: {shape: ["fr", "n", "c"]}, in: ["o"], out: "o", name: "o.r"},
+      {op: "Transpose", args: {perm: [0, 2, 1]}, in: ["o"], out: "o", name: "o.t"},
+      {op: "Reshape", args: {shape: "s"}, in: ["o"], out: "o", name: "o.s"},
+      {op: "Binary", args: {kind: "Add"}, in: ["o", "x"], out: "out", name: "add"},
+    ]},
+    // `TransformerTemporalModel` over `x [frames, c, h, w]`: clip-wide GroupNorm, attention along frames.
+    temporal: {params: ["x"], body: [
+      {let: {s: "shape('x')"}},
+      {let: {fr: "at(s, 0)", c: "at(s, 1)", n: "at(s, 2) * at(s, 3)", spatial: false}},
+      {op: "Reshape", args: {shape: ["fr", "c", "n"]}, in: ["x"], out: "x3", name: "x3"},
+      {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["x3"], out: "h", name: "cf"},
+      {op: "Reshape", args: {shape: ["c", "fr * n"]}, in: ["h"], out: "h", name: "cf2"},
+      {op: "GroupNorm", args: {groups: "groups", eps: 1e-6}, in: ["h", "w:{t}.norm.weight", "w:{t}.norm.bias"], out: "h", name: "norm"},
+      {op: "Reshape", args: {shape: ["c", "fr", "n"]}, in: ["h"], out: "h", name: "cf3"},
+      {op: "Transpose", args: {perm: [1, 2, 0]}, in: ["h"], out: "h", name: "t"},
+      {op: "Reshape", args: {shape: ["fr * n", "c"]}, in: ["h"], out: "h", name: "tok"},
+      {use: "lin", args: {w: "fmt('{t}.proj_in')"}, in: ["h"], out: "tok", name: "proj_in"},
+      {use: "tblocks", in: ["tok"], out: "tok", name: "blocks"},
+      {use: "lin", args: {w: "fmt('{t}.proj_out')"}, in: ["tok"], out: "o", name: "proj_out"},
+      {op: "Reshape", args: {shape: ["fr", "n", "c"]}, in: ["o"], out: "o", name: "o.r"},
+      {op: "Transpose", args: {perm: [0, 2, 1]}, in: ["o"], out: "o", name: "o.t"},
+      {op: "Binary", args: {kind: "Add"}, in: ["o", "x3"], out: "o", name: "add"},
+      {op: "Reshape", args: {shape: "s"}, in: ["o"], out: "out", name: "o.s"},
+    ]},
+    // One resnet -> temp_conv (-> spatial + temporal attention) step of block `base`, layer `j`.
+    layer3: {params: ["x", "emb", "ctx"], body: [
+      {use: "res", args: {b: "fmt('{base}.resnets.{j}')"}, in: ["x", "emb"], out: "x", name: "res"},
+      {use: "temp_conv", args: {b: "fmt('{base}.temp_convs.{j}')"}, in: ["x"], out: "x", name: "temp_conv"},
+      {block: [
+        {use: "spatial", args: {t: "fmt('{base}.attentions.{j}')"}, in: ["x", "ctx"], out: "x", name: "attn"},
+        {use: "temporal", args: {t: "fmt('{base}.temp_attentions.{j}')"}, in: ["x"], out: "x", name: "temp_attn"},
+      ], when: "attn"},
+    ], returns: "x"},
+  },
+  components: {
+    denoiser: {
+      vars: ["frames", "h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["frames", "in_ch", "h", "w"]},
+        {name: "t_emb", dtype: "f32", shape: [1, "c0"]},
+        {name: "context", dtype: "f32", shape: ["nt", "ctx_dim"]},
+      ],
+      body: [
+        {use: "lin", args: {w: "'time_embedding.linear_1'"}, in: ["i:t_emb"], out: "e", name: "time1"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["e"], out: "e", name: "time.silu1"},
+        {use: "lin", args: {w: "'time_embedding.linear_2'"}, in: ["e"], out: "e", name: "time2"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["e"], out: "emb", name: "time.silu2"},
+        {use: "conv2d", args: {w: "'conv_in'", stride: 1}, in: ["i:x"], out: "x", name: "conv_in"},
+        {use: "temporal", args: {t: "'transformer_in'"}, in: ["x"], out: "x", name: "transformer_in"},
+        {use: "alias", in: ["x"], out: "skip0"},
+        {repeat: "i", count: "stages", body: [
+          {let: {base: "fmt('down_blocks.{i}')"}},
+          {let: {attn: "has(fmt('{base}.attentions.0.proj_in.weight'))"}},
+          {repeat: "j", count: "layers", body: [
+            {use: "layer3", in: ["x", "emb", "i:context"], out: "x", name: "down{i}.{j}"},
+            {use: "alias", in: ["x"], out: "skip{1 + i * (layers + 1) + j}"},
+          ]},
+          {block: [
+            {use: "conv2d", args: {w: "fmt('{base}.downsamplers.0.conv')", stride: 2}, in: ["x"], out: "x", name: "down{i}.resample"},
+            {use: "alias", in: ["x"], out: "skip{1 + i * (layers + 1) + layers}"},
+          ], when: "has(fmt('{base}.downsamplers.0.conv.weight'))"},
+        ]},
+        {block: [
+          {let: {base: "'mid_block'", attn: false}},
+          {let: {j: 0}},
+          {use: "layer3", in: ["x", "emb", "i:context"], out: "x", name: "mid.0"},
+          {use: "spatial", args: {t: "'mid_block.attentions.0'"}, in: ["x", "i:context"], out: "x", name: "mid.attn"},
+          {use: "temporal", args: {t: "'mid_block.temp_attentions.0'"}, in: ["x"], out: "x", name: "mid.temp_attn"},
+          {let: {j: 1}},
+          {use: "layer3", in: ["x", "emb", "i:context"], out: "x", name: "mid.1"},
+        ]},
+        {repeat: "i", count: "stages", body: [
+          {let: {base: "fmt('up_blocks.{i}')"}},
+          {let: {attn: "has(fmt('{base}.attentions.0.proj_in.weight'))"}},
+          {repeat: "j", count: "layers + 1", body: [
+            {let: {sk: "nskips - 1 - (i * (layers + 1) + j)"}},
+            {op: "Concat", args: {axis: 1}, in: ["x", "skip{sk}"], out: "x", name: "up{i}.{j}.cat"},
+            {use: "layer3", in: ["x", "emb", "i:context"], out: "x", name: "up{i}.{j}"},
+          ]},
+          {block: [
+            {op: "Upsample", args: {scale: 2, mode: "Nearest"}, in: ["x"], out: "x", name: "up{i}.upsample"},
+            {use: "conv2d", args: {w: "fmt('{base}.upsamplers.0.conv')", stride: 1}, in: ["x"], out: "x", name: "up{i}.resample"},
+          ], when: "has(fmt('{base}.upsamplers.0.conv.weight'))"},
+        ]},
+        {use: "gn_frames", args: {w: "'conv_norm_out'", eps: 1e-5}, in: ["x"], out: "x", name: "norm_out"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["x"], out: "x", name: "silu_out"},
+        {use: "conv2d", args: {w: "'conv_out'", stride: 1}, in: ["x"], out: "eps", name: "conv_out"},
+      ],
+      outputs: ["eps"],
+    },
+  },
+}

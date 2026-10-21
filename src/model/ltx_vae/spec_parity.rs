@@ -13,7 +13,7 @@ const CFG: Cfg = Cfg { ch: [4, 8, 16, 16], layers: [2, 1, 1, 1, 2], up: [true, t
 /// Diffusers-named tensors and their original names.
 fn tensors() -> Vec<(String, String, Vec<usize>)> {
     let mut t = Vec::new();
-    let mut conv = |t: &mut Vec<_>, d: &str, o: &str, ci: usize, co: usize, k: usize| {
+    let conv = |t: &mut Vec<_>, d: &str, o: &str, ci: usize, co: usize, k: usize| {
         t.push((format!("{d}.weight"), format!("{o}.weight"), vec![co, ci, k, k, k]));
         t.push((format!("{d}.bias"), format!("{o}.bias"), vec![co]));
     };

@@ -902,6 +902,8 @@ pub mod fixture {
     }
 }
 
+#[cfg(test)]
+mod spec_parity;
 
 #[cfg(test)]
 mod tests {
