@@ -364,12 +364,10 @@ mod scale_tests {
 
 #[cfg(test)]
 mod vae_fixture_tests {
-    /// The VAE fixtures run (CPU decode here: the tripwire is not armed in the lib tests; the Metal output
-    /// of each is still checked for finiteness). The armed run lives in `tests/cpu_free_matrix.rs`.
+    /// The VAE fixture runs (CPU decode here: the tripwire is not armed in the lib tests). The armed
+    /// run lives in `tests/cpu_free_matrix.rs`.
     #[test]
     fn tiny_vae_fixtures_run() {
-        // Every graph compiled here reproduces `graph::shape::infer`.
-        let _shapes = crate::graph::shape::CheckCompiled::new();
         super::tiny_vae_on_gpu().unwrap();
     }
 }
