@@ -111,6 +111,9 @@ fn bert_gguf_spec_matches_old_classifier() {
             let n = ids.len();
             for &dev in &devs {
                 let mut r = Runner::from_artifacts(&a, Some("bert_gguf"), dev, 64).unwrap_or_else(|e| panic!("{name}: {e}"));
+                // The host reads these; `labels` must see the reshaped 1-label head.
+                assert_eq!(r.model.env.var("labels"), Ok(Val::Num(labels as f64)), "{name}: labels");
+                assert_eq!(r.model.env.var("max_position_embeddings"), Ok(Val::Num(POS as f64)), "{name}: positions");
                 let vars = [("rows", Val::Num(n as f64)), ("head", Val::Str("classify".into()))];
                 let mut ins = vec![Tensor::U32(ids.clone()), Tensor::U32((0..n as u32).collect())];
                 if types > 1 {
