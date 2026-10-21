@@ -7,7 +7,7 @@
 //! - repeat: `{repeat: var, count | over, body}` (shares the enclosing value scope).
 //! - block:  `{block: [...], when}` conditional group (shares the enclosing value scope).
 //! - let:    `{let: {var: expr, ...}}` binds expression variables in the current frame.
-//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it.
+//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it (`"*"`: all).
 //!
 //! Operand refs: `x` (scope value), `v?:x` (scope value, dropped when unbound), `w:name` (weight),
 //! `w?:name` (weight, dropped when absent), `s:name` (state), `c:name` (constant), `i:name` (input).
@@ -137,16 +137,46 @@ pub fn build_network(
                 continue;
             }
         }
-        let name = b.interp(&name)?;
-        let v = b.value(&match value {
-            Some(s) => b.interp(s)?,
-            None => name.clone(),
-        })?;
-        b.g.output(v);
-        outputs.push(name);
+        // `{repeat: var, count: expr, name: "x.{var}"}`: one output per index.
+        let rep = match o.get("repeat").and_then(J::as_str) {
+            Some(var) => {
+                let n = b.eval(o.get("count").ok_or("output `repeat` needs `count`")?)?.usize()?;
+                Some((var.to_string(), n))
+            }
+            None => None,
+        };
+        let idx: Vec<Option<usize>> = match &rep {
+            Some((_, n)) => (0..*n).map(Some).collect(),
+            None => vec![None],
+        };
+        for i in idx {
+            if let (Some((var, _)), Some(i)) = (&rep, i) {
+                b.frames.push(vec![(var.clone(), Val::Num(i as f64))]);
+            }
+            let r = (|| {
+                let name = b.interp(&name)?;
+                let v = b.value(&match value {
+                    Some(s) => b.interp(s)?,
+                    None => name.clone(),
+                })?;
+                Ok::<_, String>((name, v))
+            })();
+            if rep.is_some() {
+                b.frames.pop();
+            }
+            let (name, v) = r?;
+            b.g.output(v);
+            outputs.push(name);
+        }
     }
     let want: Vec<String> = match b.var("taps") {
         Some(Val::List(l)) => l.iter().map(|t| t.to_string()).collect(),
+        // Every emitted tap, by name (the `precompute` component's weights).
+        Some(Val::Str(s)) if s == "*" => {
+            let mut t: Vec<String> = b.taps.keys().cloned().collect();
+            t.sort();
+            t
+        }
         _ => Vec::new(),
     };
     for t in want {
@@ -755,7 +785,7 @@ mod tests {
           ]},
           {op: "Linear", in: ["x", "w:emb"], out: "logits"},
         ],
-        outputs: ["logits", {name: "x", when: "rows == 99"}],
+        outputs: ["logits", {name: "x", when: "rows == 99"}, {name: "rep.{k}", value: "logits", repeat: "k", count: "layers - 1", when: "rows == 3"}],
       }},
     }"#;
 
@@ -810,6 +840,13 @@ mod tests {
         let one = build(&spec(), "text", &Cfg, &Src, &[("rows", Val::Num(1.0))]).unwrap();
         assert_eq!(one.inputs.len(), 1);
         assert_eq!(one.outputs, vec!["logits".to_string()]);
+    }
+
+    #[test]
+    fn repeated_outputs() {
+        let i = build(&spec(), "text", &Cfg, &Src, &[("rows", Val::Num(3.0))]).unwrap();
+        assert_eq!(i.outputs, ["logits", "rep.0", "rep.1"]);
+        assert_eq!(i.graph.outputs.len(), 3);
     }
 
     #[test]

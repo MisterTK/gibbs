@@ -1,0 +1,157 @@
+// BART-family encoder-decoders (transformers `modeling_bart.py` and its copies): BART /
+// distilbart, MBart (pre-LN with a final `layer_norm` per stack) via `when`; Marian, M2M100 /
+// NLLB and FSMT extend this spec. Biased Linear/LayerNorm blocks, post-LN (`pre_ln` false) or
+// pre-LN; scaled token embedding (`scale_embedding`) plus a position row: learned tables offset by
+// two rows (dropped at load), or generated sinusoids (`pos_kind` `standard`: Marian, from
+// position 0; `tensor2tensor`: fairseq, from position 2), `layernorm_embedding` when present.
+// Components as in `t5.json5`: `encoder` (rows; `cross: true` adds the cross K/V `xk/xv.{l}`) and
+// a one-position `decoder` over the `sk/sv.{l}` and `xk/xv.{l}` states.
+{
+  family: "bart",
+  match: {
+    hf_model_type: ["bart", "mbart"],
+    hf_architectures: ["BartForConditionalGeneration", "MBartForConditionalGeneration"],
+  },
+  pipeline: "encdec",
+  use_lib: ["transformer"],
+  config: {
+    d: "cfg.d_model",
+    max_pos: "cfg.max_position_embeddings",
+    enc_layers: "cfg.encoder_layers",
+    dec_layers: "cfg.decoder_layers",
+    enc_heads: "cfg.encoder_attention_heads",
+    dec_heads: "cfg.decoder_attention_heads",
+    activation: "first(cfg.activation_function, 'gelu')",
+    act: "activation == 'relu' ? 'Relu' : activation == 'gelu' ? 'GeluErf' : contains(['gelu_new', 'gelu_pytorch_tanh'], activation) ? 'GeluTanh' : 'Silu'",
+    pre_ln: "cfg.model_type == 'mbart'",
+    // `learned`, or a `sinusoid_table` kind.
+    pos_kind: "'learned'",
+    pos_start: "2",
+    embed_scale: "cfg.scale_embedding == true ? sqrt(d) : 1",
+    eps: "1e-5",
+    // Checkpoints drop tied copies (wmt19-en-de keeps only the encoder table, bart-large-cnn's
+    // safetensors only the decoder's): the first table present.
+    enc_embed: "first_has('model.shared.weight', 'model.encoder.embed_tokens.weight', 'model.decoder.embed_tokens.weight')",
+    dec_embed: "cfg.share_encoder_decoder_embeddings == false ? 'model.decoder.embed_tokens.weight' : first_has('model.shared.weight', 'model.decoder.embed_tokens.weight', 'model.encoder.embed_tokens.weight')",
+    tied: "cfg.tie_word_embeddings != false",
+    head: "tied ? dec_embed : first_has('lm_head.weight', 'model.decoder.output_projection.weight')",
+    vocab: "shape(dec_embed)[0]",
+    src_cap: "max_pos",
+    self_cap: "max(min(first(json.generation_config.max_length, cfg.max_length, max_pos), max_pos), 2)",
+  },
+  checks: [
+    {expr: "!contains(['relu', 'gelu', 'gelu_new', 'gelu_pytorch_tanh', 'swish', 'silu'], activation)", error: "activation '{activation}' is not supported"},
+    {expr: "cfg.tgt_vocab_size != null && cfg.tgt_vocab_size != vocab", error: "decoder embedding has {vocab} rows; config tgt_vocab_size disagrees"},
+  ],
+  transforms: [
+    // Learned positions: position p reads row p + 2.
+    {tensor: "model.{s:*}coder.embed_positions.weight", op: "split_rows", when: "pos_kind == 'learned'", args: {parts: [
+      ["model.{s}coder.embed_positions.offset", 2], ["model.{s}coder.positions.weight", "max_pos"]]}},
+    {tensor: "final_logits_bias", op: "reshape", args: {shape: ["vocab"]}},
+  ],
+  constants: {
+    "positions.sinusoid": {gen: "sinusoid_table", when: "pos_kind != 'learned'",
+                           args: {kind: "pos_kind", rows: "max_pos", dim: "d", start: "pos_start"}},
+  },
+  // Tied / static copies: sinusoid tables some checkpoints save, the unused embedding copies.
+  ignore: ["model.encoder.embed_positions.weight", "model.decoder.embed_positions.weight", "model.shared.weight",
+           "model.encoder.embed_tokens.weight", "model.decoder.embed_tokens.weight", "lm_head.weight",
+           "model.encoder.embed_positions.offset", "model.decoder.embed_positions.offset"],
+  macros: {
+    // Token row (scaled) + position row (+ `layernorm_embedding`) of side `side`.
+    s2s_embed: {params: ["ids", "pos"], body: [
+      {op: "Embedding", in: ["w:{table}", "ids"], out: "e", name: "tok"},
+      {op: "Unary", args: {kind: {Scale: "embed_scale"}}, in: ["e"], out: "e", name: "tok_scaled", when: "embed_scale != 1"},
+      {op: "Embedding", in: ["w:{pos_table}", "pos"], out: "pe", name: "posrow"},
+      {op: "Binary", args: {kind: "Add"}, in: ["e", "pe"], out: "out", name: "embed"},
+      {use: "layer_norm", args: {w: "fmt('model.{side}.layernorm_embedding')"}, in: ["out"], out: "out", name: "lnemb",
+       when: "has(fmt('model.{side}.layernorm_embedding.weight'))"},
+    ]},
+    // FF residual of layer stem `l`: `x + f(norm(x))` (pre-LN) or `norm(x + f(x))`.
+    s2s_ffn: {params: ["x"], body: [
+      {use: "layer_norm", args: {w: "fmt('{l}.final_layer_norm')"}, in: ["x"], out: "h", name: "ln", when: "pre_ln"},
+      {use: "mlp_plain", args: {up: "fmt('{l}.fc1')", down: "fmt('{l}.fc2')"}, in: ["{pre_ln ? 'h' : 'x'}"], out: "m", name: "mlp"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "m"], out: "out", name: "res"},
+      {use: "layer_norm", args: {w: "fmt('{l}.final_layer_norm')"}, in: ["out"], out: "out", name: "ln", when: "!pre_ln"},
+    ]},
+  },
+  components: {
+    encoder: {
+      vars: ["rows"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "key_mask", dtype: "f32", shape: ["rows"]},
+      ],
+      body: [
+        {let: {heads: "enc_heads", kv_heads: "enc_heads"}},
+        {use: "s2s_embed", in: ["i:token_ids", "i:positions"], out: "x", name: "enc", args: {
+          side: "'encoder'", table: "enc_embed",
+          pos_table: "pos_kind == 'learned' ? 'model.encoder.positions.weight' : 'positions.sinusoid'"}},
+        {repeat: "i", count: "enc_layers", body: [
+          {let: {l: "fmt('model.encoder.layers.{i}')"}},
+          {use: "layer_norm", args: {w: "fmt('{l}.self_attn_layer_norm')"}, in: ["x"], out: "h", name: "enc{i}.ln1", when: "pre_ln"},
+          {use: "attn_full", in: ["{pre_ln ? 'h' : 'x'}", "i:key_mask"], out: "a", name: "enc{i}.attn", args: {
+            wq: "fmt('{l}.self_attn.q_proj')", wk: "fmt('{l}.self_attn.k_proj')", wv: "fmt('{l}.self_attn.v_proj')",
+            wo: "fmt('{l}.self_attn.out_proj')", qk_norm: "'none'", rotary_dim: 0, causal: false}},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "enc{i}.res1"},
+          {use: "layer_norm", args: {w: "fmt('{l}.self_attn_layer_norm')"}, in: ["x"], out: "x", name: "enc{i}.ln1", when: "!pre_ln"},
+          {use: "s2s_ffn", in: ["x"], out: "x", name: "enc{i}.ffn"},
+        ]},
+        {use: "layer_norm", args: {w: "'model.encoder.layer_norm'"}, in: ["x"], out: "x", name: "enc.final_ln", when: "pre_ln"},
+        {repeat: "l", count: "dec_layers", body: [
+          {let: {a: "fmt('model.decoder.layers.{l}.encoder_attn')"}},
+          {op: "Linear", in: ["x", "w:{a}.k_proj.weight", "w?:{a}.k_proj.bias"], out: "xk.{l}", name: "xk.{l}"},
+          {op: "Linear", in: ["x", "w:{a}.v_proj.weight", "w?:{a}.v_proj.bias"], out: "xv.{l}", name: "xv.{l}"},
+        ], when: "first(cross, false)"},
+      ],
+      outputs: [{name: "hidden", value: "x"},
+        {name: "xk.{l}", repeat: "l", count: "dec_layers", when: "first(cross, false)"},
+        {name: "xv.{l}", repeat: "l", count: "dec_layers", when: "first(cross, false)"}],
+    },
+    decoder: {
+      vars: [],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: [1]},
+        {name: "positions", dtype: "u32", shape: [1]},
+        {name: "cross_mask", dtype: "f32", shape: ["src_cap"]},
+      ],
+      body: [
+        {let: {heads: "dec_heads", kv_heads: "dec_heads", hd: "d // dec_heads"}},
+        {use: "s2s_embed", in: ["i:token_ids", "i:positions"], out: "x", name: "dec", args: {
+          side: "'decoder'", table: "dec_embed",
+          pos_table: "pos_kind == 'learned' ? 'model.decoder.positions.weight' : 'positions.sinusoid'"}},
+        {repeat: "i", count: "dec_layers", body: [
+          {let: {l: "fmt('model.decoder.layers.{i}')"}},
+          {use: "layer_norm", args: {w: "fmt('{l}.self_attn_layer_norm')"}, in: ["x"], out: "h", name: "dec{i}.ln1", when: "pre_ln"},
+          {let: {hin: "pre_ln ? 'h' : 'x'"}},
+          {op: "Linear", in: ["{hin}", "w:{l}.self_attn.q_proj.weight", "w?:{l}.self_attn.q_proj.bias"], out: "q", name: "dec{i}.q"},
+          {op: "Linear", in: ["{hin}", "w:{l}.self_attn.k_proj.weight", "w?:{l}.self_attn.k_proj.bias"], out: "k", name: "dec{i}.k"},
+          {op: "Linear", in: ["{hin}", "w:{l}.self_attn.v_proj.weight", "w?:{l}.self_attn.v_proj.bias"], out: "v", name: "dec{i}.v"},
+          {state: "sk.{i}", shape: ["self_cap", "d"]},
+          {state: "sv.{i}", shape: ["self_cap", "d"]},
+          {op: "CachedAttention", args: {heads: "dec_heads", kv_heads: "dec_heads", head_dim: "hd", v_head_dim: "hd",
+             scale: "1 / sqrt(hd)", causal: true, window: null, soft_cap: null, write: true},
+           in: ["q", "k", "v", "s:sk.{i}", "s:sv.{i}", "i:positions"], out: "a", name: "dec{i}.self"},
+          {op: "Linear", in: ["a", "w:{l}.self_attn.out_proj.weight", "w?:{l}.self_attn.out_proj.bias"], out: "a", name: "dec{i}.o"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "dec{i}.res1"},
+          {use: "layer_norm", args: {w: "fmt('{l}.self_attn_layer_norm')"}, in: ["x"], out: "x", name: "dec{i}.ln1", when: "!pre_ln"},
+          {use: "layer_norm", args: {w: "fmt('{l}.encoder_attn_layer_norm')"}, in: ["x"], out: "h", name: "dec{i}.ln2", when: "pre_ln"},
+          {op: "Linear", in: ["{hin}", "w:{l}.encoder_attn.q_proj.weight", "w?:{l}.encoder_attn.q_proj.bias"], out: "q", name: "dec{i}.xq"},
+          {state: "xk.{i}", shape: ["src_cap", "d"]},
+          {state: "xv.{i}", shape: ["src_cap", "d"]},
+          {op: "Attention", args: {heads: "dec_heads", kv_heads: "dec_heads", causal: false, window: null, soft_cap: null, scale: null},
+           in: ["q", "s:xk.{i}", "s:xv.{i}", "i:cross_mask"], out: "a", name: "dec{i}.cross"},
+          {op: "Linear", in: ["a", "w:{l}.encoder_attn.out_proj.weight", "w?:{l}.encoder_attn.out_proj.bias"], out: "a", name: "dec{i}.xo"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "dec{i}.res2"},
+          {use: "layer_norm", args: {w: "fmt('{l}.encoder_attn_layer_norm')"}, in: ["x"], out: "x", name: "dec{i}.ln2", when: "!pre_ln"},
+          {use: "s2s_ffn", in: ["x"], out: "x", name: "dec{i}.ffn"},
+        ]},
+        {use: "layer_norm", args: {w: "'model.decoder.layer_norm'"}, in: ["x"], out: "x", name: "dec.final_ln", when: "pre_ln"},
+        {op: "Linear", in: ["x", "w:{head}", "w?:final_logits_bias"], out: "logits", name: "logits"},
+      ],
+      outputs: ["logits"],
+    },
+  },
+  runtime: {text: "translation", encoder_buckets: [64, 256]},
+}

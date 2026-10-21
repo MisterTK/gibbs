@@ -16,6 +16,18 @@ pub mod names;
 pub mod templates;
 #[cfg(test)]
 pub mod testing;
+#[cfg(test)]
+mod tests_encoders_bert;
+#[cfg(test)]
+mod tests_encoders_bert_variants;
+#[cfg(test)]
+mod tests_encoders_factorized;
+#[cfg(test)]
+mod tests_encoders_modernbert;
+#[cfg(test)]
+mod tests_encoders_bert_gguf;
+#[cfg(test)]
+mod tests_encoders_deberta;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -49,6 +61,18 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/qwen4_exp.json5", include_str!("../../arch/families/qwen4_exp.json5")),
     ("families/gemma4.json5", include_str!("../../arch/families/gemma4.json5")),
     ("families/gemma4_unified.json5", include_str!("../../arch/families/gemma4_unified.json5")),
+    ("families/t5.json5", include_str!("../../arch/families/t5.json5")),
+    ("families/bart.json5", include_str!("../../arch/families/bart.json5")),
+    ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
+    ("families/m2m100.json5", include_str!("../../arch/families/m2m100.json5")),
+    ("families/fsmt.json5", include_str!("../../arch/families/fsmt.json5")),
+    ("families/electra.json5", include_str!("../../arch/families/electra.json5")),
+    ("families/albert.json5", include_str!("../../arch/families/albert.json5")),
+    ("families/bert.json5", include_str!("../../arch/families/bert.json5")),
+    ("families/modernbert.json5", include_str!("../../arch/families/modernbert.json5")),
+    ("families/bert_gguf.json5", include_str!("../../arch/families/bert_gguf.json5")),
+    ("families/fasttext.json5", include_str!("../../arch/families/fasttext.json5")),
+    ("families/deberta.json5", include_str!("../../arch/families/deberta.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 
@@ -594,7 +618,7 @@ impl Registry {
     /// Whether a `causal_lm` family lists `model_type` (glob) in its `hf_model_type`.
     pub fn runs_model_type(&self, model_type: &str) -> bool {
         self.matchers().iter().any(|(_, m, p)| {
-            *p == Pipeline::CausalLm && m.hf_model_type.iter().any(|g| glob(g, model_type))
+            matches!(p, Pipeline::CausalLm | Pipeline::Encdec) && m.hf_model_type.iter().any(|g| glob(g, model_type))
         })
     }
 

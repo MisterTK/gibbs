@@ -987,8 +987,8 @@ pub fn run(
                     for (slot_id, buf) in [(ins[3], &k_buf), (ins[4], &v_buf)] {
                         if let ValueKind::State { name: sname, .. } = &graph.value(slot_id).kind {
                             state.insert(sname, Tensor::F32(buf.clone()));
-                            // Every value of this state (the writer's own, and those of layers
-                            // sharing the cache with `write: false`) sees this step's write.
+                            // Later readers of this state (an `Attention` over the whole cache,
+                            // `write: false` layers with their own value ids) see this step's write.
                             for (j, v) in graph.values.iter().enumerate() {
                                 if matches!(&v.kind, ValueKind::State { name: n, .. } if n == sname)
                                     && slots[j].is_some()
@@ -2671,7 +2671,7 @@ fn attention_general(
 }
 
 /// HF `_relative_position_bucket` of `rel = key_pos - query_pos` (f32 log with an f64 scale,
-/// truncated), identical to `model::t5::bucket`. Needs `buckets / 2 >= 2` per direction and
+/// truncated), as transformers' `_relative_position_bucket`. Needs `buckets / 2 >= 2` per direction and
 /// `max_distance > exact` (checked by the caller).
 pub(crate) fn rel_pos_bucket(
     rel: i64,

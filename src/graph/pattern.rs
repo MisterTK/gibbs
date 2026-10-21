@@ -208,6 +208,21 @@ fn compact_graph(graph: &mut Graph, eliminated: &HashSet<NodeId>) {
         }
     }
 
+    // Nodes touching one state keep their order (a `CachedAttention` write before an `Attention`
+    // that reads the whole cache has no value edge between them).
+    // Keyed by state name: one state may have several value ids.
+    let mut last_user: HashMap<&str, usize> = HashMap::new();
+    for (idx, node) in remaining.iter().enumerate() {
+        for &inp in &node.inputs {
+            if let ValueKind::State { name, .. } = &graph.value(inp).kind {
+                if let Some(prev) = last_user.insert(name.as_str(), idx).filter(|&p| p != idx) {
+                    adj[prev].push(idx);
+                    in_degree[idx] += 1;
+                }
+            }
+        }
+    }
+
     // Kahn's algorithm
     let mut queue = std::collections::VecDeque::new();
     for (i, &deg) in in_degree.iter().enumerate() {
@@ -255,6 +270,37 @@ fn compact_graph(graph: &mut Graph, eliminated: &HashSet<NodeId>) {
 mod tests {
     use super::*;
     use crate::graph::{DType, Op};
+
+    /// A `CachedAttention` writing a state and an `Attention` reading the whole state share no value
+    /// edge; re-sorting keeps the write first, and the CPU reader sees the written row.
+    #[test]
+    fn state_users_keep_their_order() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 2], DType::F32);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let w = g.weight("w", vec![2, 2], DType::F32);
+        let sk = g.state("sk", vec![2, 2], DType::F32, false);
+        let sv = g.state("sv", vec![2, 2], DType::F32, false);
+        let k = g.add("k", Op::Linear, &[x, w], vec![1, 2], DType::F32);
+        let write = Op::CachedAttention {
+            heads: 1, kv_heads: 1, head_dim: 2, v_head_dim: 2, scale: 1.0, causal: true,
+            window: None, soft_cap: None, write: true,
+        };
+        g.add("write", write, &[k, k, k, sk, sv, pos], vec![1, 2], DType::F32);
+        let attn = Op::Attention { heads: 1, kv_heads: 1, causal: false, window: None, soft_cap: None, scale: None };
+        let a = g.add("read", attn, &[x, sk, sv], vec![1, 2], DType::F32);
+        g.output(a);
+        compact_graph(&mut g, &HashSet::new());
+        let names: Vec<&str> = g.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["k", "write", "read"]);
+        let mut wts = crate::graph::Weights::new();
+        wts.insert("w", crate::graph::Tensor::F32(vec![1.0, 0.0, 0.0, 1.0]));
+        let ins = vec![crate::graph::Tensor::F32(vec![3.0, 4.0]), crate::graph::Tensor::U32(vec![1])];
+        let out = crate::graph::cpu::run(&g, &wts, &mut crate::graph::StateStore::new(), ins).unwrap();
+        // Keys 0 (zeros) and 1 ([3, 4]); the read mixes values [0, 0] and [3, 4].
+        let o = out[0].as_f32().unwrap();
+        assert!(o[0] > 2.9 && o[1] > 3.9, "{o:?}");
+    }
 
     #[test]
     fn graph_rewriter_replaces_captured_nodes() {

@@ -523,19 +523,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
         Loaded::System1(jev) => {
-            if let Some(enc) = jev.bert() {
-                if let Some(report) = enc.executor_report() {
-                    telemetry.log_info(&format!("Metal: {report}"));
-                }
+            if jev.encoder().is_some() {
                 telemetry.log_info(&format!(
-                    "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",
+                    "System 1 encoder '{}' ready, loaded in {:.2}s (zero-shot cosine decisions): {}",
                     jev.repo_id,
-                    enc.device(),
-                    enc.dims.num_layers,
-                    enc.dims.hidden_size,
-                    enc.dims.num_heads,
-                    enc.parameter_count() as f64 / 1e6,
-                    t0.elapsed().as_secs_f64()
+                    t0.elapsed().as_secs_f64(),
+                    jev.summary()
                 ));
             }
             if let Some(prompt) = &cli.prompt {

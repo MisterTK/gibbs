@@ -48,7 +48,7 @@ pub struct LoadOpts<'a> {
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
     /// adapter (merged into a snapshot of its base): an error refuses the load.
     pub admit: &'a dyn Fn(bool) -> Result<(), String>,
-    /// The CLI's legacy order (legacy: until Phase 7): System 1 encoders are detected before
+    /// The CLI's order: System 1 encoders are detected before
     /// classifiers and run on Metal wherever it exists; the TUI tries classifiers first and keeps
     /// System 1 on its own backend.
     pub system1_first: bool,
@@ -71,7 +71,7 @@ fn device(p: PlacementMode) -> Device {
 pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded, String> {
     (o.stage)("resolving");
     if o.family.is_none() {
-        // legacy: until Phase 7 (encoder specs)
+        // Encoders: System 1 and sequence classifiers run their family specs (`runtime::encoder`).
         let system1 = || {
             let dev = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.
@@ -148,18 +148,22 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         let m = crate::runtime::lm::load(a, super::registry()?, family, o.placement)?;
         Ok((ExecutableModel::Native(m), None))
     };
-    if o.family.is_some() {
-        return spec(o.family);
-    }
     // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
     // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
-        let f = reg.detect(&ck.sig)?;
+        let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
         let p = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?.pipeline;
         Some((f, p))
     });
+    if let Some((f, Pipeline::Encdec)) = &family {
+        let m = crate::runtime::encdec::load(a, super::registry()?, Some(f), o.placement)?;
+        return Ok((ExecutableModel::Native(m), None));
+    }
+    if o.family.is_some() {
+        return spec(o.family);
+    }
     match family {
         Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
         Some((f, Pipeline::CausalLm)) if spec_lm_enabled() || !LEGACY_LM.contains(&f.as_str()) => {
@@ -167,7 +171,7 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         }
         _ => {}
     }
-    // legacy: until Phases 5, 6 and 8 (the native loaders' families)
+    // legacy: until Phase 5 (the native loaders' families)
     if let Some(m) = crate::model::native::load_native(a, o.placement) {
         return Ok((ExecutableModel::Native(m?), None));
     }
