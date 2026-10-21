@@ -9,9 +9,9 @@
 //! and the `Qwen2VLImageProcessor` the VL models share.
 
 mod draft;
-mod fixture;
+pub(crate) mod fixture;
 #[cfg(test)]
-mod gpu_tests;
+pub(crate) mod gpu_tests;
 mod text;
 pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
 pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
@@ -1276,20 +1276,20 @@ struct Qwen35 {
 }
 
 /// No image feature at this prompt position.
-const TEXT_ROW: u32 = u32::MAX;
+pub(crate) const TEXT_ROW: u32 = u32::MAX;
 
 /// One sequence: decoder state plus the prompt's image features and M-RoPE positions.
-struct Seq {
+pub(crate) struct Seq {
     layers: Vec<LayerState>,
     program_state: crate::graph::StateStore,
     /// Positions already run.
     len: usize,
     /// (t, h, w) rotary positions of the prompt; empty for text-only prompts (all three = index).
-    pos3: Vec<[u32; 3]>,
+    pub(crate) pos3: Vec<[u32; 3]>,
     /// Position offset for tokens past the prompt (`get_rope_index`'s `mrope_position_deltas`).
-    delta: i64,
+    pub(crate) delta: i64,
     /// Per prompt position: row of `feats` replacing the token embedding, or [`TEXT_ROW`].
-    feat_row: Vec<u32>,
+    pub(crate) feat_row: Vec<u32>,
     /// Merged image features `[rows, hidden]`, all images in prompt order.
     feats: Vec<f32>,
     /// Qwen3-VL deepstack features, one `[rows, hidden]` buffer per injected decoder layer.

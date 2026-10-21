@@ -176,7 +176,7 @@ impl Preprocess {
     }
 
     /// RGB8 tile → rescaled, normalized `[3, h, w]`.
-    fn pixels(&self, img: &ImageBuffer) -> Vec<f32> {
+    pub(crate) fn pixels(&self, img: &ImageBuffer) -> Vec<f32> {
         let n = img.width * img.height;
         let mut out = vec![0.0; 3 * n];
         for (i, px) in img.data.chunks_exact(3).enumerate() {
