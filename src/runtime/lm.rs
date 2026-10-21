@@ -131,7 +131,7 @@ pub struct SpecLm {
     towers: Towers,
     /// Modalities whose tower failed to build at load, with why (said when a prompt attaches one).
     off: HashMap<String, String>,
-    tok: Tokenizer,
+    tok: Arc<Tokenizer>,
     ctx: usize,
     shapes: ShapeCache,
     /// Compiled from the decode instance; every other instance runs reshaped on it.
@@ -277,7 +277,7 @@ impl SpecLm {
         let tok = match (&model.tokenizer, model.ckpt.synthetic) {
             (Some(t), _) => t.clone(),
             // Synthetic (random-weight) ids ship no tokenizer.
-            (None, true) => Tokenizer::default_bpe(),
+            (None, true) => Arc::new(Tokenizer::default_bpe()),
             (None, false) => return Err(format!("{fam}: the checkpoint has no tokenizer")),
         };
         let ctx = ["ctx", "max_position_embeddings"]

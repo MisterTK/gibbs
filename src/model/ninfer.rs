@@ -1486,7 +1486,7 @@ mod tests {
         let m = |d| {
             let mut s = crate::arch::load::load(&a, crate::arch::registry().unwrap(), None).unwrap();
             assert_eq!(s.spec.family, "qwen3_5");
-            s.tokenizer = Some(crate::model::tokenizer::Tokenizer::default_bpe());
+            s.tokenizer = Some(std::sync::Arc::new(crate::model::tokenizer::Tokenizer::default_bpe()));
             crate::runtime::lm::SpecLm::new(s, PlacementMode::Pin(d)).unwrap()
         };
         let (cpu, gpu) = (m(Device::Cpu), m(Device::Metal));
