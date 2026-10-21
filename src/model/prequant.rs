@@ -194,10 +194,12 @@ pub fn open_weights(weights: &Path, config_path: Option<&Path>) -> Result<Weight
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .unwrap_or_default();
     let qc = &cfg["quantization_config"];
-    // MLX, EXL3 and GLQ: [`Weights::open`] decodes those tensors to bf16 one at a time.
+    // MLX, EXL3 and GLQ: [`Weights::open`] decodes those tensors to bf16 one at a time. BitNet
+    // `online` checkpoints hold plain master weights (ternarized by the model at load).
     let self_decoding = !cfg["quantization"].is_null()
         || qc["quant_method"] == "exl3"
-        || qc["quant_method"] == "glq";
+        || qc["quant_method"] == "glq"
+        || (qc["quant_method"] == "bitnet" && qc["quantization_mode"] == "online");
     if qc.is_null() || self_decoding {
         return Weights::open(weights);
     }

@@ -120,12 +120,17 @@ impl Runner {
     /// Loads `dir` (the embedded registry, `family` or detected; bit-exact weights) and checks the
     /// spec's refusals; KV states hold `ctx` positions.
     pub fn load(dir: &Path, family: Option<&str>, dev: Device, ctx: usize) -> Result<Self, String> {
+        Self::from_artifacts(&artifacts(dir), family, dev, ctx)
+    }
+
+    /// [`Self::load`] of any artifacts (synthetic ids included).
+    pub fn from_artifacts(a: &ModelArtifacts, family: Option<&str>, dev: Device, ctx: usize) -> Result<Self, String> {
         let reencode = ReencodeConfig {
             policy: ReencodePolicy::BitExact,
             cache_dir: None,
             ..Default::default()
         };
-        let model = load::load_with(&artifacts(dir), &Registry::load(None)?, family, reencode)?;
+        let model = load::load_with(a, &Registry::load(None)?, family, reencode)?;
         load::check(&model)?;
         model.env.set_ctx(json!(ctx));
         Ok(Self {
