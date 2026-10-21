@@ -299,9 +299,12 @@ impl SpecLm {
         }
         let unused = model.store.unconsumed(&used, &model.spec.ignore);
         if !unused.is_empty() {
+            // A failed tower's weights stay unread: its probe error is the real cause.
+            let why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
             return Err(format!(
-                "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}",
-                unused.join(", ")
+                "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}{}",
+                unused.join(", "),
+                if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
             ));
         }
         let weights = model.store.materialize(&decode.weights)?;
