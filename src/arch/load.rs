@@ -1086,13 +1086,15 @@ impl WeightStore {
                 leaves(n, &mut fed);
             }
         }
-        let canonical: HashMap<&str, &str> = table
-            .iter()
-            .filter_map(|(c, n)| match &n.src {
-                Src::Raw(r) => Some((r.as_str(), c.as_str())),
-                _ => None,
-            })
-            .collect();
+        // Raw name → the canonical names it feeds (through transforms too).
+        let mut canonical: HashMap<String, Vec<&str>> = HashMap::new();
+        for (c, n) in table.iter() {
+            let mut raws = HashSet::new();
+            leaves(n, &mut raws);
+            for r in raws {
+                canonical.entry(r).or_default().push(c.as_str());
+            }
+        }
         // ponytail: any sibling of a consumed `X.weight` but `X.bias` counts as its companion;
         // ask the source for real companion lists if this hides an unused tensor.
         let companion = |r: &str| {
@@ -1110,7 +1112,7 @@ impl WeightStore {
             .filter(|r| {
                 !ignore
                     .iter()
-                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|c| glob(g, c)))
+                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|cs| cs.iter().any(|c| glob(g, c))))
             })
             .cloned()
             .collect()
