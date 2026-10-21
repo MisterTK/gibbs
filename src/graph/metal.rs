@@ -9584,7 +9584,10 @@ mod tests {
     fn min_head_cosine(want: &[f32], got: &[f32], hd: usize) -> f32 {
         want.chunks(hd)
             .zip(got.chunks(hd))
-            .map(|(a, b)| crate::model::dit_graph::fixture::cosine(a, b))
+            .map(|(a, b)| {
+                let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(&p, &q)| (p * q) as f64).sum::<f64>();
+                (dot(a, b) / (dot(a, a).sqrt() * dot(b, b).sqrt()).max(1e-30)) as f32
+            })
             .fold(1.0, f32::min)
     }
 

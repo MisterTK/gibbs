@@ -960,7 +960,46 @@ mod tests {
     // parity with original (delete with the original)
     mod parity {
         use super::*;
-        use crate::model;
+
+        // The deleted `model::dit_graph` / `model::dit` / `model::unet` oracles, verbatim.
+        mod model {
+            pub mod dit_graph {
+                pub fn axis_freqs(dims: &[usize], theta: f64) -> (Vec<f32>, [u32; 3]) {
+                    let mut f = Vec::new();
+                    let mut sec = [0u32; 3];
+                    for (a, &dim) in dims.iter().enumerate() {
+                        sec[a] = (dim / 2) as u32;
+                        for i in 0..dim / 2 {
+                            f.push(theta.powf(-((2 * i) as f64) / dim as f64) as f32);
+                        }
+                    }
+                    (f, sec)
+                }
+                pub fn positions(ids: &[Vec<usize>], use_axes: [usize; 3]) -> Vec<u32> {
+                    ids.iter().flat_map(|id| use_axes.map(|a| id.get(a).copied().unwrap_or(0) as u32)).collect()
+                }
+            }
+            pub mod dit {
+                pub fn timestep_features(t: f32, dim: usize) -> Vec<f32> {
+                    let half = dim / 2;
+                    let args: Vec<f32> = (0..half).map(|i| t * (-(10000f32.ln()) * i as f32 / half as f32).exp()).collect();
+                    args.iter().map(|a| a.cos()).chain(args.iter().map(|a| a.sin())).collect()
+                }
+            }
+            pub mod unet {
+                pub fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                    let half = dim / 2;
+                    let mut emb = vec![0.0f32; dim];
+                    for i in 0..half {
+                        let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                        let arg = t * freq;
+                        emb[i] = arg.cos();
+                        emb[half + i] = arg.sin();
+                    }
+                    emb
+                }
+            }
+        }
 
         #[test]
         fn axis_freqs_match_sources() {

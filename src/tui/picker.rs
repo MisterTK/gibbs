@@ -1648,9 +1648,6 @@ fn parse_hub_rows(
             // GGUF draft sidecars attach like safetensors drafters; llama.cpp forks' own
             // architectures (another tensor layout) are refused by name.
             let gguf_draft = gguf_arch.and_then(crate::runtime::draft::refused_draft_gguf);
-            let dit = m["config"]["diffusers"]["_class_name"]
-                .as_str()
-                .is_some_and(|c| crate::model::dit::PIPELINES.contains(&c));
             // llama.cpp `mmproj` repos (arch `clip`): projectors of a language-model repo.
             let gguf_projector = (m["gguf"]["architecture"] == "clip")
                 .then(|| crate::model::hub::MMPROJ_ONLY.to_string());
@@ -1664,7 +1661,7 @@ fn parse_hub_rows(
                 .or_else(|| selection.err().filter(|_| !own_files))
                 .or_else(|| match PACKED_MOE_GGUF.contains(&gguf_arch.unwrap_or("")) {
                     true => packed_memory_blocker(size, total_memory),
-                    false => memory_blocker(params, total_memory, native_type(m) || native_gguf_arch(m) || dit || ninfer || image_supported(m)),
+                    false => memory_blocker(params, total_memory, native_type(m) || native_gguf_arch(m) || ninfer || image_supported(m)),
                 });
             let gguf_total = m["gguf"]["total"].as_u64();
             let mut variants: Vec<Entry> = files

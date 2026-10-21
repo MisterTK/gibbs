@@ -1,10 +1,17 @@
-//! Tiny synthetic checkpoints and GPU-only fixtures for the diffusion networks (SD UNet2D, VAE, CLIP):
-//! shared by the lib parity tests and `tests/cpu_free_matrix.rs`.
+//! Tiny synthetic diffusion checkpoints (LDM UNet / VAE names, LTX) and GPU-only fixtures, shared
+//! by the lib tests, the goldens and `tests/cpu_free_matrix.rs`.
 
-use crate::model::clip::{Act, ClipTextTransformer};
-use crate::model::clip::Tensors;
-use crate::model::diff_graph::testutil::{synth, Lcg};
-use crate::model::vae::SdVae;
+/// Deterministic uniform [-1, 1) stream.
+pub(crate) struct Lcg(pub u64);
+impl Lcg {
+    pub fn next(&mut self) -> f32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+    pub fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
+        (0..n).map(|_| self.next() * scale).collect()
+    }
+}
 
 type Specs = Vec<(String, Vec<usize>)>;
 
@@ -50,44 +57,7 @@ pub fn trans(s: &mut Specs, p: &str, c: usize, ctx: usize) {
     lin(s, &format!("{p}.proj_out"), c, c, true);
 }
 
-/// A 2-level LDM UNet (SD layout, 1 ResBlock per level); `add` > 0 adds the SDXL `label_emb`, `cond` > 0 the
-/// LCM `cond_proj`.
-pub fn unet_specs(ctx: usize, add: usize, cond: usize) -> Specs {
-    let (mc, emb) = (32, 128);
-    let mut s = Specs::new();
-    conv(&mut s, "input_blocks.0.0", 4, mc, 3);
-    res(&mut s, "input_blocks.1.0", mc, mc, emb);
-    trans(&mut s, "input_blocks.1.1", mc, ctx);
-    conv(&mut s, "input_blocks.2.0.op", mc, mc, 3);
-    res(&mut s, "input_blocks.3.0", mc, 64, emb);
-    trans(&mut s, "input_blocks.3.1", 64, ctx);
-    res(&mut s, "middle_block.0", 64, 64, emb);
-    trans(&mut s, "middle_block.1", 64, ctx);
-    res(&mut s, "middle_block.2", 64, 64, emb);
-    // (skip channels popped, res in, res out, transformer width, upsample)
-    let outs = [(64, 128, 64, 64, false), (32, 96, 64, 64, true), (32, 96, 32, 32, false), (32, 64, 32, 32, false)];
-    for (i, (_, cin, cout, tc, up)) in outs.into_iter().enumerate() {
-        res(&mut s, &format!("output_blocks.{i}.0"), cin, cout, emb);
-        trans(&mut s, &format!("output_blocks.{i}.1"), tc, ctx);
-        if up {
-            conv(&mut s, &format!("output_blocks.{i}.2.conv"), cout, cout, 3);
-        }
-    }
-    nrm(&mut s, "out.0", 32);
-    conv(&mut s, "out.2", 32, 4, 3);
-    lin(&mut s, "time_embed.0", mc, emb, true);
-    lin(&mut s, "time_embed.2", emb, emb, true);
-    if cond > 0 {
-        lin(&mut s, "time_embed.cond_proj", cond, mc, false);
-    }
-    if add > 0 {
-        lin(&mut s, "label_emb.0.0", add, emb, true);
-        lin(&mut s, "label_emb.0.2", emb, emb, true);
-    }
-    s
-}
-
-
+/// A 2-level SD VAE in LDM (`first_stage_model.`) names with `latent` channels.
 pub fn vae_specs(latent: usize) -> Vec<(String, Vec<usize>)> {
     let mut s: Vec<(String, Vec<usize>)> = Vec::new();
     let conv = |s: &mut Vec<_>, p: &str, i: usize, o: usize, k: usize| {
@@ -145,48 +115,22 @@ pub fn vae_specs(latent: usize) -> Vec<(String, Vec<usize>)> {
 }
 
 
-pub fn tiny_clip(act: Act, proj: bool) -> ClipTextTransformer {
-    use crate::model::diff_graph::testutil::synth;
-    let (d, inter, vocab) = (128, 256, 49408);
-    let mut s: Vec<(String, Vec<usize>)> = vec![
-        ("text_model.embeddings.token_embedding.weight".into(), vec![vocab, d]),
-        ("text_model.embeddings.position_embedding.weight".into(), vec![77, d]),
-    ];
-    let mut lin = |p: String, i: usize, o: usize| {
-        s.push((format!("{p}.weight"), vec![o, i]));
-        s.push((format!("{p}.bias"), vec![o]));
-    };
-    for l in 0..2 {
-        let p = format!("text_model.encoder.layers.{l}");
-        for n in ["q_proj", "k_proj", "v_proj", "out_proj"] {
-            lin(format!("{p}.self_attn.{n}"), d, d);
-        }
-        lin(format!("{p}.mlp.fc1"), d, inter);
-        lin(format!("{p}.mlp.fc2"), inter, d);
-    }
-    for n in ["text_model.encoder.layers.0.layer_norm1", "text_model.encoder.layers.0.layer_norm2",
-        "text_model.encoder.layers.1.layer_norm1", "text_model.encoder.layers.1.layer_norm2", "text_model.final_layer_norm"] {
-        s.push((format!("{n}.weight"), vec![d]));
-        s.push((format!("{n}.bias"), vec![d]));
-    }
-    if proj {
-        s.push(("text_projection.weight".into(), vec![96, d]));
-    }
-    let r = synth(&s, 21);
-    let t = Tensors::from_reader(&r).unwrap();
-    let tk = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
-    ClipTextTransformer::from_parts(&t, "text_model", act, 0, proj.then_some("text_projection.weight"), tk).unwrap()
-}
-
 /// The SD VAE decoded as a Metal program from a tiny synthetic checkpoint; the caller arms the CPU
 /// tripwire, so any CPU compute panics.
 pub fn tiny_vae_on_gpu() -> Result<(), String> {
-    let r = synth(&vae_specs(4), 7);
-    let vae = SdVae::from_ldm(&Tensors::from_reader(&r)?)?;
+    use crate::arch::expr::Val;
+    use crate::graph::Tensor;
+    use crate::hardware::{Device, PlacementMode};
+    let d = std::env::temp_dir().join(format!("gibbs-tiny-vae-{}", std::process::id()));
+    std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    write_f32_safetensors(&d.join("diffusion_pytorch_model.safetensors"), &values(&vae_specs(4), 7))?;
+    let de = crate::runtime::diffusion::Net::open(&d, "sd_vae", "decoder", PlacementMode::Pin(Device::Metal))?;
     let (h, w) = (6, 5);
-    let img = vae.decode(&Lcg(3).vec(4 * h * w, 1.0), h, w)?;
-    if img.width != 2 * w || img.height != 2 * h {
-        return Err(format!("sd vae: {}x{} image", img.width, img.height));
+    let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+    let img = de.run_one(&vars, &[("z", Tensor::F32(Lcg(3).vec(4 * h * w, 1.0)))], &[], None)?;
+    std::fs::remove_dir_all(&d).ok();
+    if img.len() != 3 * 2 * h * 2 * w {
+        return Err(format!("sd vae: {} values", img.len()));
     }
     Ok(())
 }
@@ -305,61 +249,6 @@ pub fn ldm_vae_specs(ch: usize, mult: &[usize]) -> Specs {
     nrm(&mut s, &p("decoder.norm_out"), c);
     conv(&mut s, &p("decoder.conv_out"), c, 3, 3);
     s
-}
-
-#[cfg(test)]
-mod scale_tests {
-    use super::*;
-    use crate::model::unet::{Heads, SdUnet};
-    use crate::model::diff_graph::testutil::rel_err;
-
-    /// SD 1.5-sized UNet + VAE with random weights: CPU-vs-Metal parity at a small latent, then Metal
-    /// timings at 512x512 (64x64 latent). `cargo test --release --lib sd15_scale -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn sd15_scale_gpu_vs_cpu_and_speed() {
-        use std::time::Instant;
-        let ctx = 768;
-        let ur = synth(&ldm_unet_specs(320, &[1, 2, 4, 4], 2, &[true, true, true, false], ctx, 4), 5);
-        let unet = SdUnet::load(&Tensors::from_reader(&ur).unwrap(), "", Heads::Count(8)).unwrap();
-        drop(ur);
-        let vr = synth(&ldm_vae_specs(128, &[1, 2, 4, 4]), 6);
-        let vae = SdVae::from_ldm(&Tensors::from_reader(&vr).unwrap()).unwrap();
-        drop(vr);
-        let mut rng = Lcg(9);
-        let c = rng.vec(77 * ctx, 1.0);
-        let (h, w) = (16, 16);
-        let x = rng.vec(4 * h * w, 1.0);
-        let t0 = Instant::now();
-        let cpu = unet.forward_cpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
-        let t_cpu = t0.elapsed();
-        let gpu = unet.forward_gpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
-        eprintln!("UNet 16x16: cpu {t_cpu:?}, rel err {:.2e}", rel_err(&gpu, &cpu));
-        assert!(rel_err(&gpu, &cpu) < 1e-3);
-        let z = rng.vec(4 * 16 * 16, 1.0);
-        let (cpu, ..) = vae.decode_cpu(&z, 16, 16).unwrap();
-        let (gpu, ..) = vae.decode_gpu(&z, 16, 16).unwrap();
-        eprintln!("VAE 16x16 -> 128x128: rel err {:.2e}", rel_err(&gpu, &cpu));
-        assert!(rel_err(&gpu, &cpu) < 1e-3);
-
-        let (h, w) = (64, 64);
-        let x = rng.vec(4 * h * w, 1.0);
-        let t0 = Instant::now();
-        unet.forward_gpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
-        eprintln!("UNet 64x64 first call (compile + run) {:?}", t0.elapsed());
-        let t0 = Instant::now();
-        for _ in 0..3 {
-            unet.forward_gpu(&x, h, w, 500.0, &c, 77, None, None).unwrap();
-        }
-        eprintln!("UNet 64x64 steady: {:?} / eval", t0.elapsed() / 3);
-        let z = rng.vec(4 * 64 * 64, 1.0);
-        let t0 = Instant::now();
-        vae.decode_gpu(&z, 64, 64).unwrap();
-        eprintln!("VAE decode 512x512 first call {:?}", t0.elapsed());
-        let t0 = Instant::now();
-        vae.decode_gpu(&z, 64, 64).unwrap();
-        eprintln!("VAE decode 512x512 steady {:?}", t0.elapsed());
-    }
 }
 
 #[cfg(test)]
