@@ -6,8 +6,8 @@ use gibbs_engine::model::classifier::{self, ClassifierSlot};
 use gibbs_engine::model::hub::{is_synthetic_model_id, HuggingFaceHub, StorageBackend};
 use gibbs_engine::model::image::ImageBuffer;
 use gibbs_engine::model::load_log;
-use gibbs_engine::runtime::diffusion::{ImageGenerator, ImageRequest, ImageSlot};
 use gibbs_engine::model::weight_format::ReencodeConfig;
+use gibbs_engine::runtime::diffusion::{ImageGenerator, ImageRequest, ImageSlot};
 use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler};
 use gibbs_engine::server::{create_router, AppState};
 use gibbs_engine::telemetry::EngineTelemetry;
@@ -148,7 +148,6 @@ struct Cli {
     arch_dump: bool,
 }
 
-
 fn clock_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -156,7 +155,12 @@ fn clock_seed() -> u64 {
 }
 
 /// One CLI text-to-video (with `--image`, image-to-video) generation of a video pipeline plan.
-fn run_video(cli: &Cli, hub: &HuggingFaceHub, plan: &gibbs_engine::model::video_repo::Plan, backend: Device) -> Result<(), String> {
+fn run_video(
+    cli: &Cli,
+    hub: &HuggingFaceHub,
+    plan: &gibbs_engine::model::video_repo::Plan,
+    backend: Device,
+) -> Result<(), String> {
     let model = &cli.model;
     let Some(prompt) = cli.prompt.as_deref() else {
         return Err(format!(
@@ -169,7 +173,11 @@ fn run_video(cli: &Cli, hub: &HuggingFaceHub, plan: &gibbs_engine::model::video_
         .as_deref()
         .filter(|o| o.ends_with(".mp4"))
         .ok_or("text-to-video needs --output <file.mp4>")?;
-    let image = cli.image.as_deref().map(ImageBuffer::from_base64_or_path).transpose()?;
+    let image = cli
+        .image
+        .as_deref()
+        .map(ImageBuffer::from_base64_or_path)
+        .transpose()?;
     let req = gibbs_engine::runtime::diffusion::VideoRequest {
         prompt: prompt.to_string(),
         negative_prompt: cli.negative_prompt.clone(),
@@ -202,8 +210,14 @@ fn run_video(cli: &Cli, hub: &HuggingFaceHub, plan: &gibbs_engine::model::video_
         req.height.unwrap_or(0)
     );
     gibbs_engine::model::image::write_mp4(&frames, fps, Path::new(output))?;
-    let bytes = std::fs::metadata(output).map_err(|e| format!("{output}: {e}"))?.len();
-    println!("Generated {} frames in {:.2}s", frames.len(), start.elapsed().as_secs_f64());
+    let bytes = std::fs::metadata(output)
+        .map_err(|e| format!("{output}: {e}"))?
+        .len();
+    println!(
+        "Generated {} frames in {:.2}s",
+        frames.len(),
+        start.elapsed().as_secs_f64()
+    );
     println!("Saved {output} ({bytes} bytes, {fps} fps)");
     Ok(())
 }
@@ -250,6 +264,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let hub = HuggingFaceHub::new().with_storage(StorageBackend::from_uri(&cli.storage)?);
         let code = gibbs_engine::bench::explain_placement(&hub, &cli.model)?;
         std::process::exit(code);
+    }
+    if cli.arch_dump {
+        let hub = HuggingFaceHub::new()
+            .with_storage(StorageBackend::from_uri(&cli.storage)?)
+            .with_budget(usize::MAX);
+        let token = cli
+            .hf_token
+            .clone()
+            .or_else(|| std::env::var("HF_TOKEN").ok());
+        let a = hub.auto_download_and_cache(&cli.model, token.as_deref())?;
+        println!(
+            "{}",
+            gibbs_engine::arch::dispatch::dump(&a, cli.arch.as_deref())?
+        );
+        return Ok(());
     }
     let telemetry = EngineTelemetry::new();
     #[cfg(target_os = "macos")]
@@ -309,7 +338,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
 
     // 2. Initialize Memory Hierarchy and KV Pool
-    let kv_pool = Arc::new(PagedKVPool::new(gibbs_engine::scheduler::ONE_SHOT_POOL_BLOCKS));
+    let kv_pool = Arc::new(PagedKVPool::new(
+        gibbs_engine::scheduler::ONE_SHOT_POOL_BLOCKS,
+    ));
 
     // 4. Model Resolution & Cache Inspection (Auto-Download & Cloud Storage)
     let storage_backend = StorageBackend::from_uri(&cli.storage)?;
@@ -321,14 +352,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .hf_token
         .clone()
         .or_else(|| std::env::var("HF_TOKEN").ok());
-    if cli.arch_dump {
-        let a = hub.auto_download_and_cache(&cli.model, token.as_deref())?;
-        println!(
-            "{}",
-            gibbs_engine::arch::dispatch::dump(&a, cli.arch.as_deref())?
-        );
-        return Ok(());
-    }
     telemetry.log_info(&format!(
         "Checking model source: '{}' (storage: {:?})",
         cli.model, hub.storage
@@ -463,7 +486,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|s| gibbs_engine::runtime::encoder::system1::ChoiceOption::new(s, None::<String>))
+                        .map(|s| {
+                            gibbs_engine::runtime::encoder::system1::ChoiceOption::new(
+                                s,
+                                None::<String>,
+                            )
+                        })
                         .collect();
                     let decision = jev
                         .embed(query)
@@ -550,8 +578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // The roofline basis follows the policy the load applied (the gate may have fallen back).
             let applied = gibbs_engine::bench::applied_policy();
-            if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, &applied)
-            {
+            if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, &applied) {
                 telemetry.set_model_size_bytes(b);
             }
             telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
