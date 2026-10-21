@@ -11,7 +11,7 @@ pub mod head;
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]
-mod synth;
+pub(crate) mod synth;
 pub mod ln_decoder;
 pub(crate) mod decoder_gpu;
 pub use decoder_gpu::gpu_fixture;
