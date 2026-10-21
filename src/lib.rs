@@ -20,10 +20,11 @@ pub mod kv;
 pub mod model;
 pub use model::*;
 
+/// Model-agnostic pipelines that drive spec-built graphs (media preprocessing and expansion, …).
+pub mod runtime;
+
 pub mod bench;
 pub mod quant;
-/// Model-agnostic pipelines driving spec instances (`arch`).
-pub mod runtime;
 pub mod scheduler;
 pub mod server;
 pub mod telemetry;

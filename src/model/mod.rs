@@ -43,6 +43,7 @@
 //!   - Interacts with remote and local persistent storage exclusively through [`hub::StorageBackend`]
 //!     and memory-mapped zero-copy file slices.
 
+pub mod audio;
 pub mod classifier;
 pub mod clip;
 pub mod dcae;

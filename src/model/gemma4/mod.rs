@@ -14,8 +14,8 @@ pub mod text;
 pub use audio::tiny::{graph as tiny_audio_graph, wav_graph as tiny_audio_wav_graph};
 pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 pub use vision::tiny::graph as tiny_vision_graph;
-mod unified;
-mod vision;
+pub(crate) mod unified;
+pub(crate) mod vision;
 
 pub use gguf::{gguf_decode_fixture, load_gguf};
 
@@ -85,15 +85,15 @@ pub struct Gemma4 {
 }
 /// Per-sequence state: the decoder caches plus the media soft tokens, already projected to the
 /// text width, for the placeholder positions `prepare` laid out.
-struct State {
+pub(crate) struct State {
     cache: TextCache,
     program_state: crate::graph::StateStore,
     /// Positions of media soft tokens, ascending; row `i` of `media` fills `media_pos[i]`.
-    media_pos: Vec<usize>,
+    pub(crate) media_pos: Vec<usize>,
     media: Vec<f32>,
     /// Image soft-token position ranges attended bidirectionally (empty unless the text model is
     /// `bidir_vision`).
-    blocks: Vec<Range<usize>>,
+    pub(crate) blocks: Vec<Range<usize>>,
     /// End of the positions `forward` was asked for, and of those already run: a chunk ending
     /// inside an image block runs on to the block's end (its rows are all media), and `logits`
     /// holds the result for the chunks it covered.

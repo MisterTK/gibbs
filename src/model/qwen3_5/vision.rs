@@ -30,7 +30,7 @@ impl Preprocessor {
     }
 
     /// `preprocessor_config.json` contents; `what` names their source in errors.
-    pub(super) fn parse(bytes: &[u8], what: &str) -> Result<Self, String> {
+    pub(crate) fn parse(bytes: &[u8], what: &str) -> Result<Self, String> {
         let v: Value = serde_json::from_slice(bytes).map_err(|e| format!("{what}: {e}"))?;
         let px = |a: &str, b: &str| {
             v["size"][a]
@@ -148,12 +148,12 @@ pub struct Vision {
 
 
 /// An image's patches as [`Vision::prepare`] leaves them.
-struct Prepared {
+pub(crate) struct Prepared {
     /// `[gh * gw, 3 * temporal * patch * patch]`.
-    patches: Vec<f32>,
+    pub(crate) patches: Vec<f32>,
     coords: Vec<(usize, usize)>,
-    gh: usize,
-    gw: usize,
+    pub(crate) gh: usize,
+    pub(crate) gw: usize,
 }
 
 /// Placement and the compiled tower programs by patch grid.
@@ -333,7 +333,7 @@ impl Vision {
     }
 
     /// The resized, normalized patches in merge-block order and their (row, col) grid cells.
-    fn prepare(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Prepared, String> {
+    pub(crate) fn prepare(&self, img: &ImageBuffer, pre: &Preprocessor) -> Result<Prepared, String> {
         let (p, m) = (self.patch, self.merge);
         // ponytail: pixel budget comes from preprocessor_config.json (Qwen ships 16M px max), so a large photo costs O(patches^2) attention; cap max_pixels if latency matters.
         let (rh, rw) = smart_resize(img.height, img.width, p * m, pre.min_pixels, pre.max_pixels)?;
