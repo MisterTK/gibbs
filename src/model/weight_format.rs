@@ -216,6 +216,12 @@ pub struct ReencodeConfig {
     pub log: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     /// Native loaders: only feed-forward projections are re-encoded (the second gate attempt).
     pub ffn_only: bool,
+    /// The feed-forward weights `ffn_only` keeps (`arch::glob` patterns over canonical names),
+    /// from an active spec's `runtime.ffn_weights`; `None` = the built-in name test.
+    pub ffn_weights: Option<Arc<Vec<String>>>,
+    /// `--quant <fmt>`: every spec-loaded weight matrix is stored as this format (f32/f16/bf16
+    /// or an encodable `graph::codec` block format) instead of its checkpoint encoding.
+    pub force: Option<crate::hardware::QuantFormat>,
 }
 
 impl Default for ReencodeConfig {
@@ -227,6 +233,8 @@ impl Default for ReencodeConfig {
             progress: None,
             log: None,
             ffn_only: false,
+            ffn_weights: None,
+            force: None,
         }
     }
 }
@@ -1114,7 +1122,7 @@ mod tests {
             cache_dir: Some(tmp.path().to_path_buf()),
             progress: Some(progress.clone()),
             log: None,
-            ffn_only: false,
+            ..Default::default()
         };
         let artifacts = ModelArtifacts {
             model_id: "gibbs/smollm-1m".into(),
@@ -1236,7 +1244,7 @@ mod tests {
             cache_dir: Some(tmp.path().to_path_buf()),
             progress: None,
             log: None,
-            ffn_only: false,
+            ..Default::default()
         };
         let hw = HardwareCapability::probe_system();
         let (first, c1) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();
@@ -1285,7 +1293,7 @@ mod tests {
             cache_dir: None,
             progress: None,
             log: None,
-            ffn_only: false,
+            ..Default::default()
         };
         let hw = HardwareCapability::probe_system();
         let (_, c) = load_causal_lm_with(&artifacts, Device::Metal, None, &hw, &cfg).unwrap();

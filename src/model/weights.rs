@@ -43,6 +43,18 @@ impl Mat {
             _ => None,
         }
     }
+    /// Owned bf16 values viewed as `[rows, cols]`.
+    pub fn from_bf16(v: Vec<u16>, rows: usize, cols: usize) -> Self {
+        Self {
+            buf: Buf::Owned(v.into()),
+            rows,
+            cols,
+        }
+    }
+    /// Whether the Metal executor gathers rows of this table on device (`Op::Embedding`).
+    pub fn gathers_on_device(&self) -> bool {
+        self.packed().is_none_or(|p| gathers_on_device(p.format))
+    }
     pub fn to_graph_tensor(&self) -> crate::graph::Tensor {
         crate::graph::Tensor::Mat(self.clone())
     }
@@ -205,6 +217,13 @@ impl std::fmt::Debug for Mat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Mat({}x{})", self.rows, self.cols)
     }
+}
+
+/// Whether the Metal executor gathers `Op::Embedding` rows from a table stored as `f`: the core
+/// f32 kernel, the half-float and `graph::codec` gathers of `metal/ext/moe.rs`.
+pub fn gathers_on_device(f: crate::hardware::QuantFormat) -> bool {
+    use crate::hardware::QuantFormat as Q;
+    matches!(f, Q::FP32 | Q::FP16 | Q::BF16) || crate::graph::codec::codec(f).is_some()
 }
 
 /// A GGUF tensor served straight from the file data (the mapped file, or a split set's buffer), still in its block format: mixture-of-
@@ -501,6 +520,32 @@ impl Weights {
 
     pub fn has(&self, name: &str) -> bool {
         self.resolve(name).is_some() || self.gguf_packed.contains_key(name)
+    }
+    /// Every stored tensor name (checkpoint names, before any alias), packed GGUF banks included.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors
+            .keys()
+            .chain(self.gguf_packed.keys())
+            .map(String::as_str)
+    }
+
+    /// The stored dtype of `name` (`BF16`, `F32`, `U32`, ...).
+    pub fn stored_dtype(&self, name: &str) -> Option<&str> {
+        self.resolve(name).map(|(_, (_, t))| t.dtype.as_str())
+    }
+
+    /// Whether [`Self::mat`] serves `name` as bf16 by decoding (MLX-packed, GLQ, EXL3 trellis)
+    /// or straight from the mapping (plain bf16), rather than refusing a non-float dtype.
+    pub fn decodes_to_bf16(&self, name: &str) -> bool {
+        let Some((stored, (s, t))) = self.resolve(name) else {
+            return false;
+        };
+        t.dtype == "BF16"
+            || self.packed.contains_key(&stored)
+            || self.glq_of(&stored, *s).is_some()
+            || name
+                .strip_suffix(".weight")
+                .is_some_and(|s| t.dtype == "I16" && self.has(&format!("{s}.trellis")))
     }
 
     /// Whether `name` is stored as plain bf16, which [`Self::mat`] serves without rounding.
