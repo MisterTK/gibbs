@@ -313,7 +313,7 @@ impl SpecLm {
                 }
             }
         }
-        let unused = model.store.unconsumed(&used, &model.spec.ignore);
+        let unused = model.store.unconsumed(&used, &model.ignore);
         if !unused.is_empty() {
             // A failed tower's weights stay unread: its probe error is the real cause.
             let why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();

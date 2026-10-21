@@ -245,8 +245,10 @@ pub struct Spec {
     pub transforms: Vec<Transform>,
     #[serde(default)]
     pub constants: Map<String, J>,
+    /// Checkpoint tensors deliberately left unread: globs, or `{glob, when}` (only when the `when`
+    /// expression holds; resolved into [`load::Model::ignore`] at load).
     #[serde(default)]
-    pub ignore: Vec<String>,
+    pub ignore: Vec<Ignore>,
     #[serde(default)]
     pub macros: Map<String, J>,
     #[serde(default)]
@@ -257,6 +259,14 @@ pub struct Spec {
     /// {var: list-expr}}`; `over` instantiates `{var}` in the pattern for every list item.
     #[serde(default)]
     pub synthetic: Map<String, J>,
+}
+
+/// A `Spec::ignore` entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Ignore {
+    Glob(String),
+    When { glob: String, when: String },
 }
 
 impl Spec {

@@ -57,6 +57,8 @@
     // Other mmproj vision projectors (12B's `gemma4uv`) leave vision off, as the old loader did.
     v_ok: "!gg || first(gguf['clip.vision.projector_type'], '') == 'gemma4v'",
     has_vision: "v_ok && has('model.vision_tower.patch_embedder.input_proj.weight')",
+    // The old loader left vision off for towers with `std_bias`/`std_scale` (26B-A4B).
+    vision_on: "has_vision && !has('model.vision_tower.std_bias')",
     v_layers: "first(gguf['clip.vision.block_count'], cfg.vision_config.num_hidden_layers)",
     v_hidden: "shape('model.vision_tower.patch_embedder.input_proj.weight')[0]",
     v_in: "shape('model.vision_tower.patch_embedder.input_proj.weight')[1]",
@@ -262,7 +264,10 @@
            "model.language_model.layers.*.self_attn.v_proj.weight",
            "model.language_model.layers.*.self_attn.k_norm.weight",
            // The seq-cls head: read by the `head: 'score'` instance only.
-           "score.weight", "norm.weight"],
+           "score.weight", "norm.weight",
+           // A vision tower left off (`vision_on`): its weights go unread.
+           {glob: "model.vision_tower.*", when: "has_vision && !vision_on"},
+           {glob: "model.embed_vision.*", when: "has_vision && !vision_on"}],
   macros: {
     // `[x]` unchanged under another name.
     alias: {params: ["x"], body: [], returns: "x"},
@@ -620,11 +625,13 @@
     },
   },
   runtime: {cutover: true, prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
-    seqcls: {head: "score", pooling: "last_nonpad"},
+    // gevva cross-encoders (`tokenize_nli_pair_safe`): `<bos>Premise: {text}\nHypothesis: {pair}\nPrediction:`.
+    seqcls: {head: "score", pooling: "last_nonpad",
+      pair: {bos: "tc.bos_token_id", parts: ["Premise: ", "{text}", "\nHypothesis: ", "{pair}", "\nPrediction:"],
+             strip: ["<|image|>", "<image|>", "<|image_pad|>", "<|vision_start|>", "<|vision_end|>"]}},
     media: {
       image: {
-        // The old loader left vision off for towers with `std_bias`/`std_scale` (26B-A4B).
-        when: "has_vision && !has('model.vision_tower.std_bias')",
+        when: "vision_on",
         component: "vision",
         // Pixels 2 * (v / 255 - 0.5).
         preprocess: {kind: "soft_token_budget", patch: "v_patch", pool: "v_pool", max_soft_tokens: "v_max_soft",

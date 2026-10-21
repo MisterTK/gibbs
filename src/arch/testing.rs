@@ -209,7 +209,7 @@ impl Runner {
 
     /// Checkpoint tensors no instance built so far reads (and `ignore` does not list).
     pub fn unconsumed(&self) -> Vec<String> {
-        self.model.store.unconsumed(&self.used, &self.model.spec.ignore)
+        self.model.store.unconsumed(&self.used, &self.model.ignore)
     }
 }
 

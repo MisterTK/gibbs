@@ -215,7 +215,7 @@ pub fn dump(artifacts: &ModelArtifacts, family: Option<&str>) -> Result<String, 
         "spec": reg.merged(&m.spec.family, &m.ckpt.sig)?,
         "config": config,
         "tensors": m.renames,
-        "unconsumed": m.store.unconsumed(&used, &m.spec.ignore),
+        "unconsumed": m.store.unconsumed(&used, &m.ignore),
         "unbuilt_components": unbuilt,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())

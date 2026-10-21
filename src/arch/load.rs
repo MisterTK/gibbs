@@ -21,7 +21,7 @@ use super::expr::{eval_json, interp, walk, Env, Val};
 use super::gen::{self, Gen, GenData};
 use super::names::{Renamer, Rule};
 use super::{
-    glob, Component, Constant, Lora, Pipeline, Registry, Signals, Source, Spec, Transform,
+    glob, Component, Constant, Ignore, Lora, Pipeline, Registry, Signals, Source, Spec, Transform,
 };
 use crate::graph::{self, DType, Tensor};
 use crate::hardware::QuantFormat as Q;
@@ -1761,6 +1761,8 @@ pub struct Model {
     pub ckpt: Arc<Checkpoint>,
     /// (raw checkpoint name, canonical name) of every raw tensor, sorted by raw name.
     pub renames: Vec<(String, String)>,
+    /// `spec.ignore` globs whose `when` holds (for [`WeightStore::unconsumed`]).
+    pub ignore: Vec<String>,
 }
 
 /// Opens `artifacts` and loads it as `family` (detected from the checkpoint when `None`), under
@@ -1921,6 +1923,17 @@ fn load_from(
         .keys()
         .map(|r| (r.clone(), ren.canonical(r)))
         .collect();
+    let mut ignore = Vec::new();
+    for i in &spec.ignore {
+        match i {
+            Ignore::Glob(g) => ignore.push(g.clone()),
+            Ignore::When { glob, when } => {
+                if env.eval(&J::String(when.clone())).map_err(|e| fam(format!("ignore `{glob}`: {e}")))?.truthy() {
+                    ignore.push(glob.clone());
+                }
+            }
+        }
+    }
     Ok(Model {
         spec,
         env,
@@ -1928,6 +1941,7 @@ fn load_from(
         tokenizer,
         ckpt,
         renames,
+        ignore,
     })
 }
 
@@ -2797,21 +2811,25 @@ mod tests {
                 ("skip.me", "F32", &[1], one()),
                 ("raw.thing", "F32", &[1], one()),
                 ("src.w", "F32", &[1], one()),
+                ("maybe.a", "F32", &[1], one()),
+                ("maybe.b", "F32", &[1], one()),
             ],
-            r#"ignore: ["skip.*", "canon.*"],
+            // `{glob, when}`: ignored only when `when` holds.
+            r#"ignore: ["skip.*", "canon.*", {glob: "maybe.a", when: "has('skip.me')"},
+                     {glob: "maybe.b", when: "has('nope')"}],
             names: {rules: [["raw.thing", "canon.thing"]]},
             transforms: [{tensor: "src.w", op: "scale", args: {value: 2}}]"#,
         )
         .unwrap();
         let used: HashSet<String> = ["used.weight", "src.w"].map(String::from).into();
-        let ignore = m.spec.ignore.clone();
+        let ignore = m.ignore.clone();
         assert_eq!(
             m.store.unconsumed(&used, &ignore),
-            ["unused.weight", "used.bias"]
+            ["maybe.b", "unused.weight", "used.bias"]
         );
         // A `values(name)` read (a build-time constant) consumes the tensor.
         assert_eq!(m.env.values("used.bias"), Some(vec![1.0]));
-        assert_eq!(m.store.unconsumed(&used, &ignore), ["unused.weight"]);
+        assert_eq!(m.store.unconsumed(&used, &ignore), ["maybe.b", "unused.weight"]);
     }
 
     #[test]
