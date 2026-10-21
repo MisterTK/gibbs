@@ -115,6 +115,8 @@ struct RawTensor {
     /// Logical row-major shape (GGUF/ggml dims already reversed).
     shape: Vec<usize>,
     kind: Kind,
+    /// From the multimodal projector beside the weights ([`index_sidecar`]).
+    sidecar: bool,
 }
 
 /// An opened checkpoint: signals for matching, scopes for expressions, raw tensors.
@@ -264,7 +266,14 @@ pub fn open(artifacts: &ModelArtifacts) -> Result<Checkpoint, String> {
     };
     match &weights {
         None => ck.synthetic = crate::model::hub::is_synthetic_model_id(&artifacts.model_id),
-        Some(p) => open_weights(&mut ck, p, config)?,
+        Some(p) => {
+            open_weights(&mut ck, p, config)?;
+            if ck.container.is_some() {
+                if let Some(mm) = crate::model::hub::local_mmproj(p) {
+                    index_sidecar(&mut ck, &mm)?;
+                }
+            }
+        }
     }
     let cfg = &ck.cfg;
     let architectures: Vec<String> = cfg["architectures"]
@@ -320,11 +329,11 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
     let format = UniversalModelLoader::detect_format(&head[..n]).ok();
     if format == Some(SourceFormat::Gguf) {
         let (m, data) = crate::model::loaders::gguf::open(p)?;
-        return Ok(index_buf(ck, m, data));
+        return Ok(index_buf(ck, m, data, false));
     }
     if format == Some(SourceFormat::Ggml) {
         let (m, data) = crate::model::loaders::ggml::open(p)?;
-        return Ok(index_buf(ck, m, GgufData::Buf(data)));
+        return Ok(index_buf(ck, m, GgufData::Buf(data), false));
     }
     if name.ends_with(".ninfer") {
         let (w, cfg) = crate::model::ninfer::Artifact::open(p)?.checkpoint()?;
@@ -349,7 +358,7 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
             let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
             buf.push(n, shape, "F32", &bytes)?;
         }
-        return Ok(index_buf(ck, buf.manifest, GgufData::Buf(buf.data)));
+        return Ok(index_buf(ck, buf.manifest, GgufData::Buf(buf.data), false));
     }
     if name.ends_with(".safetensors") || name.contains(".safetensors.index") {
         let dir = p.parent().unwrap_or(Path::new("."));
@@ -359,7 +368,7 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
         return Ok(());
     }
     let (m, data) = crate::model::loaders::read_checkpoint(p)?;
-    Ok(index_buf(ck, m, GgufData::Buf(data)))
+    Ok(index_buf(ck, m, GgufData::Buf(data), false))
 }
 
 /// Whether the safetensors header at `p` carries `peft::prepare_causal_lm`'s merge marker.
@@ -380,17 +389,19 @@ fn peft_merged(p: &Path) -> bool {
 
 /// The GGUF / ggml / read-buffer source adapter. GGUF and ggml list dims fastest first: this is
 /// the one place they are reversed to row-major.
-fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData) {
+fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData, sidecar: bool) {
     let container = matches!(m.format, SourceFormat::Gguf | SourceFormat::Ggml);
     let data = Arc::new(data);
     if container {
-        ck.gguf = Some(
-            m.metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), meta_json(v)))
-                .collect(),
-        );
-        ck.container = Some(data.clone());
+        let meta = ck.gguf.get_or_insert_with(Map::new);
+        for (k, v) in &m.metadata {
+            if !sidecar || !meta.contains_key(k) {
+                meta.insert(k.clone(), meta_json(v));
+            }
+        }
+        if !sidecar {
+            ck.container = Some(data.clone());
+        }
     }
     let man = Arc::new(m);
     for (name, vt) in &man.tensors {
@@ -420,9 +431,22 @@ fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData) {
                 },
                 shape,
                 kind,
+                sidecar,
             },
         );
     }
+}
+
+/// llama.cpp's multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
+/// join the raw tensors, seen only by specs with `runtime.media`, and its metadata keys the
+/// `gguf` scope (the weights file's own keys win, `general.architecture` among them).
+fn index_sidecar(ck: &mut Checkpoint, p: &Path) -> Result<(), String> {
+    let (m, data) = crate::model::loaders::gguf::open(p)?;
+    if let Some(dup) = m.tensors.keys().find(|n| ck.raw.contains_key(*n)) {
+        return Err(format!("{}: tensor `{dup}` is also in the weights file", p.display()));
+    }
+    index_buf(ck, m, data, true);
+    Ok(())
 }
 
 fn index_weights(ck: &mut Checkpoint, w: Weights) {
@@ -449,6 +473,7 @@ fn index_weights(ck: &mut Checkpoint, w: Weights) {
                 store: Store::St(w.clone()),
                 shape,
                 kind,
+                sidecar: false,
             },
         );
     }
@@ -512,6 +537,12 @@ impl Env for Vars<'_> {
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.parent.shape(t)
     }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.parent.values(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.parent.token(s)
+    }
 }
 
 /// Follows `path` into `j` without cloning what it skips.
@@ -536,12 +567,14 @@ fn walk_json(mut j: &J, path: &[Val]) -> Option<Val> {
 
 /// The expression scope of a loaded model (see the module docs of `expr`): spec `config` vars
 /// (lazy, memoized; a cycle is an error), `cfg.<path>`, `gguf.<key>` (`<general.architecture>.<key>`
-/// first), `json.<file>.<path>`, `runtime.<path>`; `has`/`shape` see canonical tensors.
+/// first), `json.<file>.<path>`, `runtime.<path>`; `has`/`shape`/`values` see canonical tensors,
+/// `token` the tokenizer's vocabulary.
 pub struct ModelEnv {
     config: Map<String, J>,
     runtime: RwLock<J>,
     ckpt: Arc<Checkpoint>,
     table: Table,
+    tok: Option<Arc<Tokenizer>>,
     /// Successfully evaluated config vars.
     memo: Mutex<HashMap<String, Val>>,
     files: Mutex<HashMap<String, Option<J>>>,
@@ -641,10 +674,16 @@ impl Env for Eval<'_> {
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.m.shape(t)
     }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.m.values(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.m.token(s)
+    }
 }
 
 impl ModelEnv {
-    fn new(spec: &Spec, ckpt: Arc<Checkpoint>, table: Table) -> Self {
+    fn new(spec: &Spec, ckpt: Arc<Checkpoint>, table: Table, tok: Option<Arc<Tokenizer>>) -> Self {
         Self {
             config: spec.config.clone(),
             runtime: RwLock::new(if spec.runtime.is_null() {
@@ -654,6 +693,7 @@ impl ModelEnv {
             }),
             ckpt,
             table,
+            tok,
             memo: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
         }
@@ -736,6 +776,35 @@ impl Env for ModelEnv {
     }
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.table.read().get(t).map(|n| n.shape.clone())
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        let n = self.table.read().get(t).cloned()?;
+        (n.shape.iter().product::<usize>() <= SMALL_VALUES)
+            .then(|| node_values(&self.ckpt, &n))
+            .flatten()
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.tok.as_ref()?.vocab.get(s).copied()
+    }
+}
+
+/// The most elements `values(name)` reads.
+const SMALL_VALUES: usize = 1 << 16;
+
+/// `n` as f32 values from checkpoint data, generators and transforms (`None` for adapter and
+/// synthetic tensors, which exist only once the store is built).
+fn node_values(ckpt: &Checkpoint, n: &Node) -> Option<Vec<f32>> {
+    match &n.src {
+        Src::Raw(r) => ckpt.raw_f32(r).ok(),
+        Src::Gen(g) => Some(match &g.data {
+            GenData::F32(v) => v.clone(),
+            GenData::U32(v) => v.iter().map(|&x| x as f32).collect(),
+        }),
+        Src::Xf { op, args, ins, part } => {
+            let vals = ins.iter().map(|i| node_values(ckpt, i)).collect::<Option<Vec<_>>>()?;
+            xf_dense(op, args, ins, vals, *part).ok()
+        }
+        Src::Adapter(_) | Src::Synth(_) => None,
     }
 }
 
@@ -830,7 +899,9 @@ impl WeightStore {
             },
             Kind::Packed(f) if n.kind == Kind::Packed(f) => {
                 let mut p = self.packed(n)?;
-                if n.shape.len() == 2 && self.reencode.force.is_none() {
+                // Rank-3 banks regrouped to rows (`reshape`) stay as stored, as their rank-3 raws.
+                let regrouped = matches!(&n.src, Src::Xf { op, .. } if op == "reshape");
+                if n.shape.len() == 2 && self.reencode.force.is_none() && !regrouped {
                     if let Some(pr) = &self.reencode.progress {
                         pr.total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -901,6 +972,16 @@ impl WeightStore {
                     format: f,
                     shape: n.shape.clone(),
                 })
+            }
+            Src::Xf { op, ins, .. } if op == "to_bf16" => self.packed(&ins[0]),
+            Src::Xf { op, ins, .. } if op == "reshape" => {
+                if ins[0].shape.last() != n.shape.last() {
+                    return Err(format!(
+                        "reshape {:?} -> {:?} of packed blocks must keep the row width",
+                        ins[0].shape, n.shape
+                    ));
+                }
+                Ok(Packed { shape: n.shape.clone(), ..self.packed(&ins[0])? })
             }
             Src::Xf { op, ins, .. } if op == "stack_experts" => {
                 let mut bytes = Vec::new();
@@ -979,7 +1060,10 @@ impl WeightStore {
         };
         self.ckpt
             .raw
-            .keys()
+            .iter()
+            // Projector sidecars are optional: a tower that cannot read one leaves its modality off.
+            .filter(|(_, t)| !t.sidecar)
+            .map(|(r, _)| r)
             .filter(|r| !fed.contains(*r) && !companion(r))
             .filter(|r| {
                 !ignore
@@ -1182,7 +1266,7 @@ fn xf_shapes(
     let numel: usize = s.iter().product();
     let same = || Ok(vec![(None, s.to_vec())]);
     match op {
-        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16"
+        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "to_bf16" | "round_bf16"
         | "ternarize" => same(),
         "untile_packed_rows" => {
             let u = Untile::from(a)?;
@@ -1296,7 +1380,12 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
     let k = ins[0].kind;
     match op {
         "to_f32" => Kind::F32,
-        "untile_packed_rows" => k,
+        // Float tensors become bf16 `Mat`s (what `Weights::from_gguf` made of GGUF float
+        // matrices); packed blocks stay as stored.
+        "to_bf16" if matches!(k, Kind::Packed(_)) => k,
+        "to_bf16" => Kind::Bf16,
+        // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
+        "untile_packed_rows" | "reshape" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
     }
@@ -1332,7 +1421,7 @@ fn xf_dense(
             }
         }),
         "neg_exp" => map(&mut v, &|x| -x.exp()),
-        "to_f32" | "reshape" => {}
+        "to_f32" | "to_bf16" | "reshape" => {}
         "round_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
         "ternarize" => match ins[0].kind {
             Kind::Bf16 | Kind::Packed(_) => ternarize(&mut v, |x| bf16_to_f32(f32_to_bf16(x))),
@@ -1666,7 +1755,8 @@ fn load_from(
     {
         let mut t = table.write();
         let mut from: HashMap<String, &str> = HashMap::new();
-        for (raw, r) in &ckpt.raw {
+        let media = spec.runtime.get("media").is_some_and(|m| !m.is_null());
+        for (raw, r) in ckpt.raw.iter().filter(|(_, r)| media || !r.sidecar) {
             let c = ren.canonical(raw);
             if let Some(prev) = from.insert(c.clone(), raw) {
                 return Err(fam(format!(
@@ -1684,7 +1774,7 @@ fn load_from(
             );
         }
     }
-    let env = ModelEnv::new(&spec, ckpt.clone(), table.clone());
+    let env = ModelEnv::new(&spec, ckpt.clone(), table.clone(), tokenizer.clone().map(Arc::new));
     if ckpt.synthetic {
         synthesize(&spec, &env, &table).map_err(fam)?;
     }

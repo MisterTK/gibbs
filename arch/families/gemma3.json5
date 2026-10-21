@@ -1,0 +1,142 @@
+// Gemma 3 text (`gemma3_text`; `gemma3` keeps it under `text_config`, vision tower ignored;
+// llama.cpp `gemma3` GGUFs): sqrt(hidden)-scaled embeddings, `(1 + w)` RMSNorm gains (GGUF stores
+// them shifted already), sandwich norms around attention and the GeGLU (gelu_pytorch_tanh) MLP,
+// q/k RMSNorm, `query_pre_attn_scalar^-0.5` scores with an optional soft cap, sliding-window and
+// global layers with their own RoPE (default / linear / yarn on the global ones), tied LM head
+// with an optional final soft cap. Sequence classification (`Gemma3TextForSequenceClassification`):
+// `head: 'score'` reads row `last_index` after the final norm.
+{
+  family: "gemma3",
+  match: {
+    hf_model_type: ["gemma3_text", "gemma3"],
+    hf_architectures: ["Gemma3ForCausalLM", "Gemma3TextForSequenceClassification", "Gemma3ForConditionalGeneration"],
+    gguf_arch: ["gemma3"],
+  },
+  pipeline: "causal_lm",
+  use_lib: ["transformer"],
+  config: {
+    tc: "first(cfg.text_config, cfg)",
+    gguf_arch: "first(gguf['general.architecture'], '')",
+    gg: "gguf_arch == 'gemma3'",
+    hidden: "shape('model.embed_tokens.weight')[1]",
+    vocab: "shape('model.embed_tokens.weight')[0]",
+    layers: "first(gguf.block_count, tc.num_hidden_layers)",
+    head_dim: "shape('model.layers.0.self_attn.q_norm.weight')[0]",
+    heads: "shape('model.layers.0.self_attn.q_proj.weight')[0] // head_dim",
+    kv_heads: "shape('model.layers.0.self_attn.k_proj.weight')[0] // head_dim",
+    rotary_dim: "head_dim",
+    rope_variant: "'HalfSplit'",
+    eps: "first(gguf['attention.layer_norm_rms_epsilon'], tc.rms_norm_eps, 1e-6)",
+    act: "'GeluTanh'",
+    // Without `layer_types` every `sliding_window_pattern`-th layer is global (llama.cpp: 6).
+    pattern: "max(first(tc.sliding_window_pattern, 6), 1)",
+    sliding_window: "first(gguf['attention.sliding_window'], tc.sliding_window, 4096)",
+    // llama.cpp: 27B (62 layers) scales by hidden / heads, the others by head_dim.
+    attn_scale: "(gg ? (layers == 62 ? hidden / heads : head_dim) : first(tc.query_pre_attn_scalar, 256)) ** -0.5",
+    attn_softcap: "first(tc.attn_logit_softcapping, 0)",
+    softcap: "first(gguf.final_logit_softcapping, tc.final_logit_softcapping, 0)",
+    // transformers casts sqrt(hidden) to the (bf16) embedding dtype; llama.cpp scales in f32.
+    // ponytail: f32 HF checkpoints also get the bf16 scale; add a dtype() expr if one shows up.
+    embed_scale: "gg ? sqrt(hidden) : bf16(sqrt(hidden))",
+    max_position_embeddings: "first(gguf.context_length, tc.max_position_embeddings, 131072)",
+    ctx: "first(runtime.ctx, min(max_position_embeddings, 4096))",
+    labels: "has('score.weight') ? shape('score.weight')[0] : 0",
+    head_w: "has('lm_head.weight') ? 'lm_head' : 'model.embed_tokens'",
+    // RoPE per layer type (transformers' legacy fill-ins): `rope_scaling` merges into the global
+    // entry; thetas default to rope_theta (1e6) / rope_local_base_freq (1e4).
+    rp_full: "tc.rope_parameters.full_attention",
+    rp_sl: "tc.rope_parameters.sliding_attention",
+    rs: "tc.rope_scaling",
+    theta_full: "first(gguf['rope.freq_base'], rp_full.rope_theta, tc.rope_theta, 1e6)",
+    theta_sl: "first(rp_sl.rope_theta, tc.rope_local_base_freq, 1e4)",
+    type_full: "first(gguf['rope.scaling.type'], rs.rope_type, rs.type, rp_full.rope_type, rp_full.type, 'default')",
+    type_sl: "first(rp_sl.rope_type, rp_sl.type, 'default')",
+    factor_full: "first(gguf['rope.scaling.factor'], rs.factor, rp_full.factor)",
+    orig_full: "first(rs.original_max_position_embeddings, rp_full.original_max_position_embeddings)",
+    // Zero betas mean the defaults (gemma3_text loader).
+    bf_full: "first(rs.beta_fast, rp_full.beta_fast, 0) != 0 ? first(rs.beta_fast, rp_full.beta_fast) : null",
+    bs_full: "first(rs.beta_slow, rp_full.beta_slow, 0) != 0 ? first(rs.beta_slow, rp_full.beta_slow) : null",
+    truncate: "first(tc.rope_parameters.truncate, true)",
+  },
+  checks: [
+    {expr: "tc.use_bidirectional_attention == true", error: "Gemma 3 with use_bidirectional_attention is not supported"},
+    {expr: "tc.attention_bias == true", error: "Gemma 3 with attention_bias is not supported"},
+    {expr: "first(tc.hidden_activation, 'gelu_pytorch_tanh') != 'gelu_pytorch_tanh'", error: "hidden_activation {tc.hidden_activation} is not supported"},
+    {expr: "!contains(['default', 'linear', 'yarn'], type_full) || type_sl != 'default'", error: "rope_type '{type_full}' / '{type_sl}' is not supported"},
+    {expr: "first(rs.partial_rotary_factor, rp_full.partial_rotary_factor, 1) != 1", error: "partial_rotary_factor is not supported"},
+    {expr: "tc.layer_types != null && len(tc.layer_types) != layers", error: "{len(tc.layer_types)} layer types for {layers} layers"},
+  ],
+  names: {
+    use: ["llamacpp"],
+    rules: [
+      // Gemma3ForConditionalGeneration: the text model only.
+      ["language_model.model.{r:*}", "model.{r}"],
+      ["model.language_model.{r:*}", "model.{r}"],
+      ["language_model.lm_head.weight", "lm_head.weight"],
+      ["blk.{i}.post_attention_norm.weight", "model.layers.{i}.post_attention_layernorm.weight"],
+      ["blk.{i}.ffn_norm.weight", "model.layers.{i}.pre_feedforward_layernorm.weight"],
+      ["blk.{i}.post_ffw_norm.weight", "model.layers.{i}.post_feedforward_layernorm.weight"],
+    ],
+  },
+  transforms: [
+    // `(1 + w)` gains in f32 (llama.cpp's converter already added the 1).
+    {tensor: "model.norm.weight", op: "to_f32", when: "!gg"},
+    {tensor: "model.norm.weight", op: "add", args: {value: 1}, when: "!gg"},
+    {tensor: "model.layers.{i}.{n:*}_layernorm.weight", op: "to_f32", when: "!gg"},
+    {tensor: "model.layers.{i}.{n:*}_layernorm.weight", op: "add", args: {value: 1}, when: "!gg"},
+    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "to_f32", when: "!gg"},
+    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "add", args: {value: 1}, when: "!gg"},
+  ],
+  constants: {
+    "rope.full": {gen: "rope_inv_freq", args: {dim: "head_dim", theta: "theta_full", kind: "type_full",
+      factor: "type_full == 'yarn' ? first(factor_full, max_position_embeddings / orig_full) : factor_full",
+      original_max_position_embeddings: "orig_full", beta_fast: "bf_full", beta_slow: "bs_full", truncate: "truncate"}},
+    "rope.full_mscale": {gen: "yarn_attention_factor", when: "type_full == 'yarn'", args: {
+      factor: "first(factor_full, max_position_embeddings / orig_full)",
+      attention_factor: "first(rs.attention_factor, rp_full.attention_factor)",
+      mscale: "first(rs.mscale, rp_full.mscale)", mscale_all_dim: "first(rs.mscale_all_dim, rp_full.mscale_all_dim)"}},
+    "rope.sliding": {gen: "rope_inv_freq", args: {dim: "head_dim", theta: "theta_sl"}},
+  },
+  ignore: ["rope_freqs.weight", "vision_tower.*", "multi_modal_projector.*", "model.vision_tower.*",
+           "model.multi_modal_projector.*", "score.weight"],
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "last_index", dtype: "u32", shape: [1], when: "head == 'score'"},
+      ],
+      body: [
+        {let: {mscale_full: "type_full == 'yarn' ? at(values('rope.full_mscale'), 0) : 1"}},
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Unary", args: {kind: {Scale: "embed_scale"}}, in: ["x"], out: "x", name: "embed_scale"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')",
+                 sl: "tc.layer_types != null ? at(tc.layer_types, i) == 'sliding_attention' : (i + 1) % pattern != 0"}},
+          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "attn_cached", in: ["h"], out: "a", name: "l{i}.attn", args: {
+            layer: "i", wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
+            wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.o_proj')",
+            qk_norm: "'before'", q_norm: "fmt('{p}.self_attn.q_norm')", k_norm: "fmt('{p}.self_attn.k_norm')",
+            inv_freq: "sl ? 'rope.sliding' : 'rope.full'", rope_mscale: "sl ? 1 : mscale_full",
+            window: "sl ? sliding_window : null", soft_cap: "attn_softcap > 0 ? attn_softcap : null"}},
+          {use: "sandwich", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x", "a"], out: "x", name: "l{i}.res1"},
+          {use: "rms_norm", args: {w: "fmt('{p}.pre_feedforward_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
+            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
+          {use: "sandwich", args: {w: "fmt('{p}.post_feedforward_layernorm')"}, in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last' && rows > 1"},
+        {use: "last_row", args: {index: true}, in: ["x", "i:last_index"], out: "x", name: "last", when: "head == 'score'"},
+        {use: "rms_norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "score_head", in: ["hidden"], out: "logits", name: "score", when: "head == 'score'"},
+        {use: "lm_head", args: {w: "head_w", softcap: "softcap"}, in: ["hidden"], out: "logits", name: "lm_head",
+         when: "head == 'last' || head == 'all'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"], seqcls: {head: "score", pooling: "last_nonpad"}},
+}

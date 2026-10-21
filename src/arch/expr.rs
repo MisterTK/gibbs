@@ -124,6 +124,14 @@ pub trait Env {
     fn shape(&self, _tensor: &str) -> Option<Vec<usize>> {
         None
     }
+    /// Values of a small source tensor (canonical name), for `values(name)`.
+    fn values(&self, _tensor: &str) -> Option<Vec<f32>> {
+        None
+    }
+    /// Vocabulary id of a token string, for `token(s)`.
+    fn token(&self, _s: &str) -> Option<u32> {
+        None
+    }
 }
 
 /// Follows `path` (object keys / list indices) into `v`.
@@ -166,6 +174,12 @@ impl Env for Bind<'_> {
     }
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.parent.shape(t)
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.parent.values(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.parent.token(s)
     }
 }
 
@@ -783,6 +797,25 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
             let n = arg(0)?.usize()?;
             Val::List(vec![arg(1)?.clone(); n])
         }
+        // values(name): the values of a small source tensor (null when absent).
+        "values" => match env.values(arg(0)?.str()?) {
+            Some(v) => Val::List(v.into_iter().map(|x| Val::Num(x as f64)).collect()),
+            None => Val::Null,
+        },
+        // token(s): the vocabulary id of token string `s` (null when absent).
+        "token" => env.token(arg(0)?.str()?).map_or(Val::Null, |t| Val::Num(t as f64)),
+        // bf16(x): x rounded to the nearest bfloat16 (through f32).
+        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(arg(0)?.num()? as f32)) as f64),
+        // rfind(list, x, end): the last index below `end` (default len) holding x, else -1.
+        "rfind" => {
+            let l = arg(0)?.list()?;
+            let end = match v.get(2) {
+                Some(e) => e.usize()?.min(l.len()),
+                None => l.len(),
+            };
+            let x = arg(1)?;
+            Val::Num(l[..end].iter().rposition(|y| eq(y, x)).map_or(-1.0, |i| i as f64))
+        }
         _ => return Err(format!("unknown function `{f}`")),
     })
 }
@@ -802,6 +835,9 @@ mod tests {
         }
         fn shape(&self, t: &str) -> Option<Vec<usize>> {
             self.has(t).then(|| vec![4, 8])
+        }
+        fn values(&self, t: &str) -> Option<Vec<f32>> {
+            (t == "x.w").then(|| vec![0.5, 1.0])
         }
     }
     fn env() -> E {
@@ -860,6 +896,9 @@ mod tests {
             ev("range(3)"),
             Val::List(vec![Val::Num(0.0), Val::Num(1.0), Val::Num(2.0)])
         );
+        assert_eq!(ev("at(values('x.w'), 1) + len(values('y.w'))"), Val::Num(1.0));
+        assert_eq!(ev("bf16(sqrt(1536))"), Val::Num(39.25));
+        assert_eq!(ev("rfind([1, 0, 1, 1, 0], 1, 3) + rfind([1, 0], 0) + rfind(cfg.layer_types, 'x')"), Val::Num(2.0));
     }
 
     #[test]
