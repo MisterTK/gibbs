@@ -405,8 +405,6 @@
              in: ["q", "kn", "v", "s:kv.{i}.k", "s:kv.{i}.v", "i:positions", "v?:ve.{i}"], out: "att", name: "{n}.attn"},
           ], when: "i < first_shared"},
           {block: [
-            {state: "kv.{src}.k", shape: ["ctx", "kvh * hd"], reread: true},
-            {state: "kv.{src}.v", shape: ["ctx", "kvh * hd"], reread: true},
             {op: "CachedAttention", args: {heads: "heads", kv_heads: "kvh", head_dim: "hd", v_head_dim: "hd", scale: 1,
                causal: true, window: "win", write: false},
              in: ["q", "q", "q", "s:kv.{src}.k", "s:kv.{src}.v", "i:positions", "v?:ve.{i}"], out: "att", name: "{n}.attn"},
@@ -506,11 +504,6 @@
         {op: "Unary", args: {kind: {Scale: "sqrt(d)"}}, in: ["t"], out: "t", name: "vision.pool.scale"},
         {op: "Reshape", args: {shape: ["d", "(grid_h // k) * (grid_w // k)"]}, in: ["t"], out: "t", name: "vision.pool.flat"},
         {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "x", name: "vision.pool.rows"},
-        // llama.cpp gemma4v: (x - std_bias) * std_scale (26B-A4B tower).
-        {block: [
-          {op: "Binary", args: {kind: "Sub"}, in: ["x", "w:{vp}.std_bias"], out: "x", name: "vision.std_bias"},
-          {op: "Binary", args: {kind: "Mul"}, in: ["x", "w:{vp}.std_scale"], out: "x", name: "vision.std_scale"},
-        ], when: "has(vp + '.std_bias')"},
         {op: "RmsNorm", args: {eps: "v_eps"}, in: ["x", "c:vision.ones"], out: "x", name: "vision.embed_norm"},
         {op: "Linear", in: ["x", "w:model.embed_vision.embedding_projection.weight"], out: "embeds", name: "vision.embed"},
       ],
@@ -623,7 +616,8 @@
   runtime: {prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
     media: {
       image: {
-        when: "has_vision",
+        // The old loader left vision off for towers with `std_bias`/`std_scale` (26B-A4B).
+        when: "has_vision && !has('model.vision_tower.std_bias')",
         component: "vision",
         // Pixels 2 * (v / 255 - 0.5).
         preprocess: {kind: "soft_token_budget", patch: "v_patch", pool: "v_pool", max_soft_tokens: "v_max_soft",
