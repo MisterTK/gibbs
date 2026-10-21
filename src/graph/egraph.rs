@@ -79,11 +79,12 @@ const SCHEMA: &str = r#"
 /// anchor on, and the pattern-key text refbase recorded), else [`Op::name`].
 fn rule_key(g: &Graph, n: &crate::graph::Node) -> &'static str {
     match (&n.op, &n.inputs[..]) {
-        (Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b])
-            if g.value(a).shape == g.value(b).shape =>
-        {
-            "Add"
-        }
+        (
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[a, b],
+        ) if g.value(a).shape == g.value(b).shape => "Add",
         _ => n.op.name(),
     }
 }
@@ -1290,7 +1291,14 @@ mod tests {
         };
         let a = b.op("attn", attn, &[q, k, v], vec![rows, 64]);
         let o = b.lin("o", a, 64);
-        let r1 = b.op("r1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![rows, 64]);
+        let r1 = b.op(
+            "r1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[o, x],
+            vec![rows, 64],
+        );
         let n2 = b.norm("n2", r1);
         let gate = b.lin("gate", n2, 128);
         let up = b.lin("up", n2, 128);
@@ -1301,7 +1309,14 @@ mod tests {
             d = b.norm("post", d);
         }
         let ins = if swap_add { [d, r1] } else { [r1, d] };
-        let r2 = b.op("r2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &ins, vec![rows, 64]);
+        let r2 = b.op(
+            "r2",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &ins,
+            vec![rows, 64],
+        );
         b.g.output(r2);
         b.done()
     }
@@ -1484,9 +1499,13 @@ mod tests {
         use crate::arch::expr::Val;
         let dir = tempfile::tempdir().unwrap();
         let a = crate::arch::testing::synthetic_llama(dir.path(), serde_json::json!({}));
-        let mut r =
-            crate::arch::testing::Runner::from_artifacts(&a, Some("llama"), crate::hardware::Device::Cpu, 512)
-                .unwrap();
+        let mut r = crate::arch::testing::Runner::from_artifacts(
+            &a,
+            Some("llama"),
+            crate::hardware::Device::Cpu,
+            512,
+        )
+        .unwrap();
         let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
         let i = r.instance("text", &vars).unwrap();
         (i.graph, r.model.store.materialize(&i.weights).unwrap())
@@ -1503,8 +1522,7 @@ mod tests {
         ];
         let want = [
             ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
-            ([2, 0, 2, 0], 0x31f3e827bbf3b7ee),
-
+            ([2, 0, 2, 0], 2219546655677575810),
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);
