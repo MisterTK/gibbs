@@ -1,0 +1,35 @@
+// Granite / Granite-4 dense: llama with attention, embedding, residual multipliers and a logit
+// divisor; Granite-4 (`granitemoehybrid`) names its MLP `shared_mlp` with fused [gate; up] rows.
+// Mamba and expert layers are refused.
+{
+  family: "granite",
+  extends: "llama",
+  match: {
+    hf_model_type: ["granite", "granitemoehybrid", "granitemoe"],
+    hf_architectures: ["GraniteForCausalLM", "GraniteMoeHybridForCausalLM", "GraniteMoeForCausalLM"],
+    gguf_arch: ["granite", "granitehybrid", "granitemoe"],
+  },
+  config: {
+    inter: "first(cfg.shared_intermediate_size, cfg.intermediate_size, gguf.feed_forward_length, 4 * hidden)",
+    attn_scale: "first(cfg.attention_multiplier, gguf['attention.scale'], 1 / sqrt(head_dim))",
+    embed_mult: "first(cfg.embedding_multiplier, gguf.embedding_scale, 1)",
+    residual_mult: "first(cfg.residual_multiplier, gguf.residual_scale, 1)",
+    logit_scale: "first(cfg.logits_scaling, gguf.logit_scale, 1)",
+  },
+  checks: [
+    {expr: "gguf_arch == 'granitehybrid' || gguf_arch == 'granitemoe'", error: "architecture '{gguf_arch}' (Mamba / expert layers) is not implemented"},
+    {expr: "contains(first(cfg.layer_types, []), 'mamba')", error: "Granite Mamba layers are not implemented"},
+    {expr: "first(cfg.num_local_experts, 0) > 0 || has('model.layers.0.block_sparse_moe.router.layer.weight')", error: "Granite expert (MoE) layers are not implemented"},
+    {expr: "has('model.layers.0.self_attn.q_norm.weight')", error: "q/k norm is not implemented by the granite spec"},
+  ],
+  names: {
+    rules: [["model.layers.{i}.shared_mlp.output_linear.weight", "model.layers.{i}.mlp.down_proj.weight"]],
+  },
+  transforms: [
+    {tensor: "model.layers.{i}.shared_mlp.input_linear.weight", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.mlp.gate_proj.weight", "inter"], ["model.layers.{i}.mlp.up_proj.weight", "inter"]]}},
+    {tensor: "model.layers.{i}.mlp.gate_up_proj.weight", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.mlp.gate_proj.weight", "inter"], ["model.layers.{i}.mlp.up_proj.weight", "inter"]]}},
+  ],
+  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*", "model.layers.*.shared_mlp.*"]},
+}

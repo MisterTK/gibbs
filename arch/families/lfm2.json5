@@ -1,0 +1,100 @@
+// LFM2 hybrid: gated short-conv layers (`conv.*`) and GQA attention layers with q/k layernorms
+// before RoPE; SwiGLU `feed_forward.w1/w3/w2`; the final norm is `embedding_norm`. A layer is a
+// conv layer when it has `conv.in_proj`.
+{
+  family: "lfm2",
+  match: {hf_model_type: ["lfm2"], hf_architectures: ["Lfm2ForCausalLM"], gguf_arch: ["lfm2"]},
+  pipeline: "causal_lm",
+  use_lib: ["transformer"],
+  names: {
+    use: ["llamacpp"],
+    rules: [
+      ["blk.{i}.shortconv.conv.weight", "model.layers.{i}.conv.conv.weight"],
+      ["blk.{i}.shortconv.conv.bias", "model.layers.{i}.conv.conv.bias"],
+      ["blk.{i}.shortconv.in_proj.weight", "model.layers.{i}.conv.in_proj.weight"],
+      ["blk.{i}.shortconv.out_proj.weight", "model.layers.{i}.conv.out_proj.weight"],
+      ["blk.{i}.attn_norm.weight", "model.layers.{i}.operator_norm.weight"],
+      ["blk.{i}.ffn_norm.weight", "model.layers.{i}.ffn_norm.weight"],
+      ["blk.{i}.attn_q_norm.weight", "model.layers.{i}.self_attn.q_layernorm.weight"],
+      ["blk.{i}.attn_k_norm.weight", "model.layers.{i}.self_attn.k_layernorm.weight"],
+      ["blk.{i}.attn_output.weight", "model.layers.{i}.self_attn.out_proj.weight"],
+      ["blk.{i}.ffn_gate.weight", "model.layers.{i}.feed_forward.w1.weight"],
+      ["blk.{i}.ffn_up.weight", "model.layers.{i}.feed_forward.w3.weight"],
+      ["blk.{i}.ffn_down.weight", "model.layers.{i}.feed_forward.w2.weight"],
+      ["token_embd_norm.weight", "model.embedding_norm.weight"],
+    ],
+  },
+  config: {
+    gguf_arch: "first(gguf['general.architecture'], '')",
+    hidden: "first(cfg.hidden_size, gguf.embedding_length)",
+    layers: "first(cfg.num_hidden_layers, gguf.block_count)",
+    heads: "first(cfg.num_attention_heads, cfg.num_heads, gguf['attention.head_count'])",
+    // GGUF lists per-layer kv heads (0 on conv layers): the attention layers' count.
+    kv_heads: "first(cfg.num_key_value_heads, max(first(gguf['attention.head_count_kv'], heads)), heads)",
+    head_dim: "first(cfg.head_dim, hidden // heads)",
+    vocab: "first(shape('model.embed_tokens.weight')[0], cfg.vocab_size)",
+    // hf_loader `resolved_intermediate_dim`: auto-adjusted widths shrink to 2/3 and round up to
+    // `block_multiple_of` when a multiplier is given.
+    ff_raw: "first(cfg.intermediate_size, cfg.block_ff_dim, gguf.feed_forward_length, 4 * hidden)",
+    ff_23: "ff_raw * 2 // 3",
+    ff_multiple: "first(cfg.block_multiple_of, 256)",
+    inter: "cfg.block_auto_adjust_ff_dim == true ? (first(cfg.block_ffn_dim_multiplier, 0) > 0 ? ff_multiple * ceil(int(cfg.block_ffn_dim_multiplier * ff_23) / ff_multiple) : ff_23) : ff_raw",
+    eps: "first(cfg.norm_eps, cfg.rms_norm_eps, gguf['attention.layer_norm_rms_epsilon'], 1e-5)",
+    norm_kind: "'rms'",
+    act: "'Silu'",
+    theta: "first(cfg.rope_theta, cfg.rope_parameters.rope_theta, gguf['rope.freq_base'], 10000)",
+    rotary_dim: "head_dim",
+    rope_variant: "'HalfSplit'",
+    attn_scale: "1 / sqrt(head_dim)",
+    conv_k: "first(cfg.conv_L_cache, gguf['shortconv.l_cache'])",
+    ctx: "first(runtime.ctx, min(first(cfg.max_position_embeddings, gguf.context_length, 2048), 4096))",
+  },
+  checks: [
+    {expr: "cfg.conv_bias == true || has('model.layers.0.conv.conv.bias')", error: "LFM2 conv bias is not implemented"},
+    {expr: "first(conv_k, 0) < 2", error: "LFM2 short-conv kernel (conv_L_cache) {conv_k} must be >= 2"},
+    {expr: "has('model.layers.0.feed_forward.w1.weight') && shape('model.layers.0.feed_forward.w1.weight')[0] != inter",
+     error: "LFM2 MLP width {shape('model.layers.0.feed_forward.w1.weight')[0]} != configured {inter}"},
+  ],
+  transforms: [
+    // HF [width, 1, kernel] / GGUF [width, kernel] taps as [width, kernel]; a kernel that is not
+    // conv_L_cache fails the reshape.
+    {tensor: "model.layers.{i}.conv.conv.weight", op: "reshape", args: {shape: ["hidden", "conv_k"]}},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "rope_inv_freq", args: {dim: "rotary_dim", theta: "theta", precision: "'f32'"}},
+  },
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')"}},
+          {use: "rms_norm", args: {w: "fmt('{p}.operator_norm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "short_conv", args: {p: "fmt('{p}.conv')", layer: "i"}, in: ["h"], out: "a", name: "l{i}.conv",
+           when: "has(fmt('{p}.conv.in_proj.weight'))"},
+          {use: "attn_cached", in: ["h"], out: "a", name: "l{i}.attn", when: "!has(fmt('{p}.conv.in_proj.weight'))", args: {
+            layer: "i", wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
+            wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.out_proj')", qk_norm: "'before'",
+            q_norm: "fmt('{p}.self_attn.q_layernorm')", k_norm: "fmt('{p}.self_attn.k_layernorm')"}},
+          {use: "residual", in: ["x", "a"], out: "x", name: "l{i}.res1"},
+          {use: "rms_norm", args: {w: "fmt('{p}.ffn_norm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
+            gate: "fmt('{p}.feed_forward.w1')", up: "fmt('{p}.feed_forward.w3')", down: "fmt('{p}.feed_forward.w2')"}},
+          {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "rms_norm", args: {w: "'model.embedding_norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "lm_head", args: {w: "has('lm_head.weight') ? 'lm_head' : 'model.embed_tokens'"}, in: ["hidden"], out: "logits",
+         name: "lm_head", when: "head != 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.feed_forward.*"]},
+}

@@ -1,0 +1,89 @@
+// OPT (`model.decoder.*`, transformers `modeling_opt.py`): learned positions offset by 2 rows
+// (dropped at load), optional project_in/project_out around the blocks, biased LayerNorm blocks
+// pre- or post-LN (`do_layer_norm_before`), plain MLP (fc1/fc2), head tied to `embed_tokens`.
+// Sequence classification: `head: 'score'` reads row `last_index`.
+{
+  family: "opt",
+  match: {hf_model_type: ["opt"], hf_architectures: ["OPTForCausalLM", "OPTForSequenceClassification"]},
+  pipeline: "causal_lm",
+  use_lib: ["transformer"],
+  names: {rules: [["decoder.{r:*}", "model.decoder.{r}"]]},
+  config: {
+    hidden: "cfg.hidden_size",
+    layers: "cfg.num_hidden_layers",
+    heads: "cfg.num_attention_heads",
+    kv_heads: "heads",
+    head_dim: "hidden // heads",
+    ffn: "cfg.ffn_dim",
+    vocab: "shape('model.decoder.embed_tokens.weight')[0]",
+    positions: "shape('model.decoder.embed_positions.weight')[0] - 2",
+    pre_ln: "first(cfg.do_layer_norm_before, true)",
+    final_ln: "pre_ln && cfg['_remove_final_layer_norm'] != true",
+    eps: "1e-5",
+    act: "first(cfg.activation_function, 'relu') == 'relu' ? 'Relu' : cfg.activation_function == 'gelu' ? 'GeluErf' : contains(['gelu_new', 'gelu_fast', 'gelu_pytorch_tanh'], cfg.activation_function) ? 'GeluTanh' : 'Silu'",
+    rotary_dim: "0",
+    attn_scale: "1 / sqrt(head_dim)",
+    ctx: "min(first(runtime.ctx, 4096), positions)",
+  },
+  checks: [
+    {expr: "cfg.enable_bias == false || cfg.layer_norm_elementwise_affine == false", error: "OPT without biases or LayerNorm affine weights is not supported"},
+    {expr: "!has('model.decoder.project_in.weight') && shape('model.decoder.embed_tokens.weight')[1] != hidden",
+     error: "no project_in for embeddings of {shape('model.decoder.embed_tokens.weight')[1]} into hidden {hidden}"},
+    {expr: "!contains(['relu', 'gelu', 'gelu_new', 'gelu_fast', 'gelu_pytorch_tanh'], first(cfg.activation_function, 'relu'))",
+     error: "activation_function {cfg.activation_function} is not supported"},
+  ],
+  transforms: [
+    // OPTLearnedPositionalEmbedding: position p reads row p + 2.
+    {tensor: "model.decoder.embed_positions.weight", op: "split_rows", args: {parts: [
+      ["model.decoder.embed_positions.offset", 2], ["model.decoder.positions.weight", "positions"]]}},
+  ],
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "last_index", dtype: "u32", shape: [1], when: "head == 'score'"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.decoder.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Linear", in: ["x", "w:model.decoder.project_in.weight", "w?:model.decoder.project_in.bias"], out: "x", name: "project_in",
+         when: "has('model.decoder.project_in.weight')"},
+        {op: "Embedding", in: ["w:model.decoder.positions.weight", "i:positions"], out: "pe", name: "embed_pos"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "embed_sum"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.decoder.layers.{i}')"}},
+          {block: [
+            {use: "layer_norm", args: {w: "fmt('{p}.self_attn_layer_norm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+            {use: "attn_cached", in: ["h"], out: "y", name: "l{i}.attn", args: {layer: "i", wq: "fmt('{p}.self_attn.q_proj')",
+              wk: "fmt('{p}.self_attn.k_proj')", wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.out_proj')"}},
+            {use: "residual", in: ["x", "y"], out: "x", name: "l{i}.res1"},
+            {use: "layer_norm", args: {w: "fmt('{p}.final_layer_norm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+            {use: "mlp_plain", args: {up: "fmt('{p}.fc1')", down: "fmt('{p}.fc2')"}, in: ["h"], out: "m", name: "l{i}.mlp"},
+            {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          ], when: "pre_ln"},
+          {block: [
+            {use: "attn_cached", in: ["x"], out: "y", name: "l{i}.attn", args: {layer: "i", wq: "fmt('{p}.self_attn.q_proj')",
+              wk: "fmt('{p}.self_attn.k_proj')", wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.out_proj')"}},
+            {use: "residual", in: ["x", "y"], out: "x", name: "l{i}.res1"},
+            {use: "layer_norm", args: {w: "fmt('{p}.self_attn_layer_norm')"}, in: ["x"], out: "x", name: "l{i}.ln1"},
+            {use: "mlp_plain", args: {up: "fmt('{p}.fc1')", down: "fmt('{p}.fc2')"}, in: ["x"], out: "m", name: "l{i}.mlp"},
+            {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
+            {use: "layer_norm", args: {w: "fmt('{p}.final_layer_norm')"}, in: ["x"], out: "x", name: "l{i}.ln2"},
+          ], when: "!pre_ln"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "last_row", args: {index: true}, in: ["x", "i:last_index"], out: "x", name: "last", when: "head == 'score'"},
+        {use: "layer_norm", args: {w: "'model.decoder.final_layer_norm'"}, in: ["x"], out: "x", name: "final_norm", when: "final_ln"},
+        {op: "Linear", in: ["x", "w:model.decoder.project_out.weight", "w?:model.decoder.project_out.bias"], out: "x", name: "project_out",
+         when: "has('model.decoder.project_out.weight')"},
+        {use: "score_head", in: ["x"], out: "logits", name: "score", when: "head == 'score'"},
+        {use: "lm_head", args: {w: "has('lm_head.weight') ? 'lm_head' : 'model.decoder.embed_tokens'"}, in: ["x"], out: "logits",
+         name: "lm_head", when: "head == 'last' || head == 'all'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {prefill_rows: 64, ffn_weights: ["model.decoder.layers.*.fc*"], seqcls: {head: "score", pooling: "last_nonpad"}},
+}
