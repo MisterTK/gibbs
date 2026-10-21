@@ -198,3 +198,54 @@ pub fn unconsumed(model: &Model, nets: &[&Net], extra: &[&str]) -> Vec<String> {
     used.extend(extra.iter().map(|s| s.to_string()));
     model.store.unconsumed(&used, &model.spec.ignore)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::{Registry, Signals, Source};
+    use crate::graph::DType;
+
+    struct NoWeights;
+    impl Source for NoWeights {
+        fn tensor(&self, _: &str) -> Option<(Vec<usize>, DType)> {
+            None
+        }
+    }
+    struct NoEnv;
+    impl Env for NoEnv {
+        fn lookup(&self, _: &str, _: &[Val]) -> Option<Val> {
+            None
+        }
+    }
+
+    /// A gen input's `step:` arg survives the build verbatim (quoted or not) and evaluates per step.
+    #[test]
+    fn step_args_evaluate_per_step() {
+        let spec = r#"{family: "toy", pipeline: "diffusion", components: {n: {
+          vars: ["d"],
+          inputs: [{name: "t_emb", dtype: "f32", shape: ["d"], gen: "timestep_embedding",
+                    args: {t: "step:sigma * 1000", dim: "d", scale: "'step:guidance'"}}],
+          body: [{op: "Unary", args: {kind: "Neg"}, in: ["i:t_emb"], out: "y"}],
+          outputs: ["y"]}}}"#;
+        let r = Registry::from_files(&[("families/toy.json5".into(), spec.into())], &[]).unwrap();
+        let s = r.spec("toy", &Signals::default()).unwrap();
+        let inst = build(&s, "n", &NoEnv, &NoWeights, &[("d", Val::Num(8.0))]).unwrap();
+        let (g, args) = inst.inputs[0].gen.clone().unwrap();
+        assert_eq!(args["t"], "step:sigma * 1000");
+        assert_eq!(args["scale"], "step:guidance");
+        let at = |sigma: f64| match gen_tensor(&g, &step_args(&args, &[("sigma", sigma), ("guidance", 2.0)]).unwrap()).unwrap() {
+            Tensor::F32(v) => v,
+            _ => unreachable!(),
+        };
+        let want = |t: f64| {
+            let a = serde_json::json!({"t": t, "dim": 8, "scale": 2.0});
+            match gen_tensor("timestep_embedding", &a).unwrap() {
+                Tensor::F32(v) => v,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(at(0.5), want(500.0));
+        assert_eq!(at(0.25), want(250.0));
+        assert_ne!(at(0.5), at(0.25));
+    }
+}

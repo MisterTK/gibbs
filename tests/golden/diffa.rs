@@ -76,6 +76,17 @@ fn tol(rel: f64, cos: f64) -> Tol {
     Tol { rel, cos }
 }
 
+/// `GIBBS_SPEC_DIFFUSION=1`: the runners take the spec path (`arch` family specs through
+/// `runtime::diffusion`) instead of the per-family modules.
+fn spec() -> bool {
+    std::env::var("GIBBS_SPEC_DIFFUSION").is_ok_and(|v| v == "1")
+}
+
+/// `Pin(dev)` placement of a spec network.
+fn pin(dev: Device) -> gibbs_engine::hardware::PlacementMode {
+    gibbs_engine::hardware::PlacementMode::Pin(dev)
+}
+
 // ---------------------------------------------------------------------------------------------
 // CLIP
 // ---------------------------------------------------------------------------------------------
