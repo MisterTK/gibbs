@@ -99,7 +99,7 @@
           {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.input_layernorm"},
           {use: "qwen_attn", in: ["h"], out: "a", name: "layers.{i}.self_attn",
            args: {p: "fmt('{p}.self_attn')", layer: "i", q_norm_name: "first(q_norm_name)", k_norm_name: "first(k_norm_name)",
-                  rope_pos: "has_vision ? 'rope_positions' : 'positions'", rope_variant: "mrope_variant",
+                  rope_pos: "has_vision ? 'rope_positions' : 'positions'", rope_variant: "has_vision ? mrope_variant : 'HalfSplit'",
                   key_mask: "first(masked, false) ? 'key_mask' : ''"}},
           {op: "Binary", args: {kind: "'Add'"}, in: ["x", "a"], out: "x", name: "layers.{i}.add_mixer"},
           {use: "rms_norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.post_attention_layernorm"},
