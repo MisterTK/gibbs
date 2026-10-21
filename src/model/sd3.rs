@@ -8,12 +8,12 @@ use crate::model::clip::{ClipTextTransformer, Tensors};
 use crate::model::dit::{
     add_gated, component_weights, norm_modulate, read_config, rms_norm, silu_of, timestep_features,
 };
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::hub::HuggingFaceHub;
 use crate::model::image::ImageBuffer;
 use crate::model::loaders::safetensors::SafetensorsWeightReader;
 use crate::model::nn;
-use crate::model::sd::Rng;
+use crate::runtime::sched::Rng;
 use crate::model::t5::T5Encoder;
 use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
 use crate::model::vae::SdVae;
@@ -579,14 +579,14 @@ impl ImageGenerator for Sd3Pipeline {
         } else {
             None
         };
-        let sigmas = flow::default_sigmas(steps, self.shift);
+        let sigmas = sched::default_sigmas(steps, self.shift);
         let mut rng = Rng::new(req.seed);
         let mut x: Vec<f32> = (0..self.mmdit.in_ch * h * w)
             .map(|_| rng.gaussian())
             .collect();
         for (i, s) in sigmas.windows(2).enumerate() {
             let start = Instant::now();
-            let t = flow::timestep(s[0]);
+            let t = sched::timestep(s[0]);
             let run = |c: &Cond| -> Result<Vec<f32>, String> {
                 if crate::model::dit_graph::use_metal() {
                     self.mmdit
@@ -602,7 +602,7 @@ impl ImageGenerator for Sd3Pipeline {
                     .zip(&vu)
                     .for_each(|(c, u)| *c = u + guidance * (*c - u));
             }
-            flow::euler_step(&mut x, &v, s[0], s[1]);
+            sched::euler_step(&mut x, &v, s[0], s[1]);
             println!(
                 "  step {}/{steps} (sigma {:.4}): {:.2}s",
                 i + 1,

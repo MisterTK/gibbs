@@ -9,7 +9,7 @@
 //! [`NativeLm::truncate`]: crate::model::native::NativeLm::truncate
 
 use super::{recent, ExecutableModel, SeqKvCache, WRONG_KV};
-use crate::model::sd::Rng;
+use crate::runtime::sched::Rng;
 use crate::runtime::lm::nucleus;
 use std::any::Any;
 use std::sync::Arc;
