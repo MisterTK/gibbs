@@ -350,7 +350,8 @@ impl LoraFile {
         }
         let ren = crate::arch::names::Renamer::from_pairs(
             &pairs.iter().map(|(a, b)| (us(a), us(b))).collect::<Vec<_>>(),
-        )?;
+        )?
+        .with_strip(model.spec.names.strip.iter().map(|p| us(p)).collect());
         let canon: HashMap<String, String> = names
             .iter()
             .map(|c| (us(c), c.clone()))

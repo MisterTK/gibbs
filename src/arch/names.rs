@@ -112,23 +112,38 @@ fn matches(parts: &[Part], s: &str, caps: &mut Vec<(String, Val)>) -> bool {
     }
 }
 
-/// An ordered rule list.
+/// An ordered rule list, after stripping the first matching `strip` prefix.
 #[derive(Debug, Clone, Default)]
-pub struct Renamer(pub Vec<Rule>);
+pub struct Renamer {
+    pub rules: Vec<Rule>,
+    /// Prefixes removed before the rules run (e.g. ComfyUI's `model.diffusion_model.`).
+    pub strip: Vec<String>,
+}
 
 impl Renamer {
     pub fn from_pairs(pairs: &[(String, String)]) -> Result<Self, String> {
-        Ok(Self(
-            pairs
+        Ok(Self {
+            rules: pairs
                 .iter()
                 .map(|(f, t)| Rule::new(f, t))
                 .collect::<Result<_, _>>()?,
-        ))
+            strip: Vec::new(),
+        })
+    }
+
+    pub fn with_strip(mut self, strip: Vec<String>) -> Self {
+        self.strip = strip;
+        self
     }
 
     /// Canonical name of `name`: the first matching rule's output, else `name` unchanged.
     pub fn canonical(&self, name: &str) -> String {
-        self.0
+        let name = self
+            .strip
+            .iter()
+            .find_map(|p| name.strip_prefix(p.as_str()))
+            .unwrap_or(name);
+        self.rules
             .iter()
             .find_map(|r| r.apply(name))
             .unwrap_or_else(|| name.to_string())
@@ -245,5 +260,13 @@ mod tests {
         ] {
             assert_eq!(rn.canonical(o), h);
         }
+    }
+
+    #[test]
+    fn strip_prefix_then_rules() {
+        let r = r(&[("a.{i}.w", "b.{i}.w")]).with_strip(vec!["model.diffusion_model.".into()]);
+        assert_eq!(r.canonical("model.diffusion_model.a.3.w"), "b.3.w");
+        assert_eq!(r.canonical("a.3.w"), "b.3.w");
+        assert_eq!(r.canonical("model.x"), "model.x");
     }
 }

@@ -254,9 +254,10 @@ pub struct TextEntry {
     /// Pad token text (`"config"`: read from `tokenizer_config`), looked up in the vocabulary.
     #[serde(default)]
     pub pad_token: Option<String>,
-    /// `key_mask` masks the padding (default); `false`: every row is a key (all 0).
+    /// `key_mask`: `true` (default) masks the padding; `false`: every row is a key (all 0);
+    /// `"valid_plus1"`: the first pad row is a key too.
     #[serde(default = "yes")]
-    pub mask: bool,
+    pub mask: J,
     #[serde(default = "keep_all")]
     pub keep: String,
     #[serde(default)]
@@ -276,8 +277,8 @@ pub struct Range2 {
 fn prompt_template() -> String {
     "{prompt}".into()
 }
-fn yes() -> bool {
-    true
+fn yes() -> J {
+    J::Bool(true)
 }
 fn keep_all() -> String {
     "all".into()
@@ -430,6 +431,10 @@ pub struct Runtime {
     pub defaults: DefaultsSpec,
     #[serde(default)]
     pub summary: Option<String>,
+    /// Single-file checkpoints (`match.single_file_tensors`): the diffusers repo (expression)
+    /// whose configs, scheduler and tokenizer files the file's components load under.
+    #[serde(default)]
+    pub reference: Option<J>,
     /// Keys other pipelines read (e.g. the video pipeline's).
     #[serde(flatten)]
     pub other: serde_json::Map<String, J>,
@@ -1048,7 +1053,15 @@ impl SpecDiffusion {
             }
             let rows = ids.len();
             let key_mask: Vec<f32> =
-                (0..rows).map(|i| if i < valid || !e.mask { 0.0 } else { f32::NEG_INFINITY }).collect();
+                {
+                let keys = match &e.mask {
+                    J::Bool(true) => valid,
+                    J::Bool(false) => rows,
+                    J::String(k) if k == "valid_plus1" => valid + 1,
+                    m => return Err(format!("{}: mask {m} (true, false, \"valid_plus1\")", e.name)),
+                };
+                (0..rows).map(|i| if i < keys { 0.0 } else { f32::NEG_INFINITY }).collect()
+            };
             let given = [
                 ("token_ids", Tensor::U32(ids.clone())),
                 ("positions", Tensor::U32((0..rows as u32).collect())),
@@ -1472,6 +1485,9 @@ pub fn load_image(
     let weights = artifacts.weights_path.as_deref()?;
     let names = weight_names(weights)?;
     let reg = crate::arch::registry().ok()?;
+    if let Some(fam) = reg.detect_single_file(&names) {
+        return Some(single_file(&artifacts.model_id, weights, &fam, hub, mode, Vec::new()));
+    }
     let lora = weights.extension().is_some_and(|e| e == "safetensors")
         && crate::model::lora::is_diffusion_lora(names.iter().map(String::as_str));
     let denoiser = if lora { None } else { Some(reg.detect_denoiser(&names)?) };
@@ -1504,7 +1520,16 @@ pub fn load_image(
     };
     let class = match hub.fetch_file(&base, "model_index.json").map_err(gated) {
         Ok(p) => p.parent().and_then(pipeline_class),
-        Err(e) => return if lora { None } else { Some(Err(e)) },
+        // A LoRA on a single-file checkpoint repo.
+        Err(_) if lora => {
+            let token = std::env::var("HF_TOKEN").ok();
+            let b = hub.auto_download_and_cache(&base, token.as_deref()).ok()?;
+            let w = b.weights_path?;
+            let fam = reg.detect_single_file(&weight_names(&w)?)?;
+            let id = format!("{} on {base}", artifacts.model_id);
+            return Some(single_file(&id, &w, &fam, hub, mode, vec![(weights.to_path_buf(), 1.0)]));
+        }
+        Err(e) => return Some(Err(e)),
     };
     let fam = class.as_deref().and_then(family_of_class);
     match (&fam, &denoiser) {
@@ -1545,6 +1570,61 @@ pub fn load_image(
         };
         arc(SpecDiffusion::load(&a, hub, mode, Some(&fam), &extra))
     })())
+}
+
+/// A single-file checkpoint of `fam`: the configs of its `runtime.reference` repo (fetched, no
+/// weights), every `{family, dir}` component's weights read from `weights`.
+fn single_file(
+    id: &str,
+    weights: &Path,
+    fam: &str,
+    hub: &HuggingFaceHub,
+    mode: PlacementMode,
+    loras: Vec<(std::path::PathBuf, f32)>,
+) -> Result<Arc<dyn ImageGenerator>, String> {
+    let reg = crate::arch::registry()?;
+    let sig = crate::arch::Signals {
+        hub_id: id.to_string(),
+        file_name: weights.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        ..Default::default()
+    };
+    let spec = reg.spec(fam, &sig)?;
+    let rt: Runtime = spec.runtime_as()?;
+    let reference = match &rt.reference {
+        Some(J::String(r)) => r.trim_matches('\'').to_string(),
+        _ => return Err(format!("{fam}: single-file checkpoints need `runtime.reference`")),
+    };
+    let fetch = |f: &str| hub.fetch_file(&reference, f).map_err(|e| format!("{fam} reference {reference}: {e}"));
+    let root = fetch("model_index.json")?
+        .parent()
+        .ok_or("reference snapshot has no directory")?
+        .to_path_buf();
+    fetch("scheduler/scheduler_config.json")?;
+    let mut parts = Vec::new();
+    for (name, c) in &spec.components {
+        if let Ok(crate::arch::Component::Ref { dir: Some(d), .. }) = serde_json::from_value(c.clone()) {
+            fetch(&format!("{d}/config.json"))?;
+            parts.push((name.clone(), weights.to_path_buf()));
+        }
+    }
+    for e in &rt.text_encoders {
+        for d in [Some(&e.tokenizer), e.tokenizer_config.as_ref()].into_iter().flatten() {
+            if !d.starts_with("hub:") {
+                // Optional files: whichever the tokenizer dir has.
+                for f in ["tokenizer.json", "special_tokens_map.json", "tokenizer_config.json", "spiece.model"] {
+                    let _ = hub.fetch_file(&reference, &format!("{d}/{f}"));
+                }
+            }
+        }
+    }
+    let a = ModelArtifacts {
+        model_id: id.to_string(),
+        local_dir: Some(root),
+        is_cached: true,
+        ..Default::default()
+    };
+    let extra = Extras { loras, weights: parts };
+    SpecDiffusion::load(&a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
 }
 
 #[cfg(test)]

@@ -99,6 +99,11 @@ pub struct Match {
     /// transformer-only finetune or quantization whose model card names the base pipeline).
     #[serde(default)]
     pub denoiser_tensors: Vec<Vec<String>>,
+    /// Tensor-name groups of a single-file pipeline checkpoint (every component's weights in one
+    /// file, e.g. LDM / ComfyUI checkpoints): its configs come from the spec's
+    /// `runtime.reference` repo.
+    #[serde(default)]
+    pub single_file_tensors: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -130,6 +135,9 @@ pub struct Names {
     pub use_sets: Vec<String>,
     #[serde(default)]
     pub rules: Vec<(String, String)>,
+    /// Checkpoint-name prefixes removed before any rule (e.g. `model.diffusion_model.`).
+    #[serde(default)]
+    pub strip: Vec<String>,
 }
 
 /// A load-time value transform on a canonical tensor (`tensor` may hold `{i}` captures).
@@ -574,14 +582,28 @@ impl Registry {
 
     /// The family whose `match.denoiser_tensors` claims a weights file with tensor `names`.
     pub fn detect_denoiser(&self, names: &[String]) -> Option<String> {
+        self.detect_tensors(names, |m| &m.denoiser_tensors, true)
+    }
+
+    /// The family whose `match.single_file_tensors` claims a weights file with tensor `names`.
+    pub fn detect_single_file(&self, names: &[String]) -> Option<String> {
+        self.detect_tensors(names, |m| &m.single_file_tensors, false)
+    }
+
+    fn detect_tensors(
+        &self,
+        names: &[String],
+        groups: impl Fn(&Match) -> &Vec<Vec<String>>,
+        unprefixed: bool,
+    ) -> Option<String> {
         let has = |n: &str| {
-            names
-                .iter()
-                .any(|x| x == n || x.strip_prefix("model.diffusion_model.") == Some(n))
+            names.iter().any(|x| {
+                x == n || (unprefixed && x.strip_prefix("model.diffusion_model.") == Some(n))
+            })
         };
         self.families.iter().find_map(|(f, j)| {
             let m: Match = serde_json::from_value(j.get("match")?.clone()).ok()?;
-            m.denoiser_tensors
+            groups(&m)
                 .iter()
                 .any(|g| !g.is_empty() && g.iter().all(|n| has(n)))
                 .then(|| f.clone())
@@ -688,6 +710,10 @@ mod tests {
         assert_eq!(r.detect_denoiser(&n(&["model.diffusion_model.img_in.weight"])).as_deref(), Some("toy"));
         assert_eq!(r.detect_denoiser(&n(&["x.weight", "y.weight", "z"])).as_deref(), Some("toy"));
         assert_eq!(r.detect_denoiser(&n(&["x.weight"])), None);
+        let single = r#"{family: "one", pipeline: "diffusion", match: {single_file_tensors: [["a.w", "b.w"]]}}"#;
+        let r = Registry::from_files(&files(&[("families/one.json5", single)]), &[]).unwrap();
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"])).as_deref(), Some("one"));
+        assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"])), None);
     }
 
     #[test]
