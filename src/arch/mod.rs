@@ -104,6 +104,9 @@ pub struct Match {
     /// `runtime.reference` repo.
     #[serde(default)]
     pub single_file_tensors: Vec<Vec<String>>,
+    /// File extensions `single_file_tensors` applies to (empty: any).
+    #[serde(default)]
+    pub single_file_ext: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -585,15 +588,22 @@ impl Registry {
         self.detect_tensors(names, |m| &m.denoiser_tensors, true)
     }
 
-    /// The family whose `match.single_file_tensors` claims a weights file with tensor `names`.
-    pub fn detect_single_file(&self, names: &[String]) -> Option<String> {
-        self.detect_tensors(names, |m| &m.single_file_tensors, false)
+    /// The family whose `match.single_file_tensors` (and `single_file_ext`) claim a weights file
+    /// with extension `ext` and tensor `names`.
+    pub fn detect_single_file(&self, names: &[String], ext: &str) -> Option<String> {
+        self.detect_tensors(names, |m| {
+            if m.single_file_ext.is_empty() || m.single_file_ext.iter().any(|e| e == ext) {
+                &m.single_file_tensors
+            } else {
+                &m.denoiser_tensors[..0]
+            }
+        }, false)
     }
 
     fn detect_tensors(
         &self,
         names: &[String],
-        groups: impl Fn(&Match) -> &Vec<Vec<String>>,
+        groups: impl Fn(&Match) -> &[Vec<String>],
         unprefixed: bool,
     ) -> Option<String> {
         let has = |n: &str| {
@@ -710,19 +720,20 @@ mod tests {
         assert_eq!(r.detect_denoiser(&n(&["model.diffusion_model.img_in.weight"])).as_deref(), Some("toy"));
         assert_eq!(r.detect_denoiser(&n(&["x.weight", "y.weight", "z"])).as_deref(), Some("toy"));
         assert_eq!(r.detect_denoiser(&n(&["x.weight"])), None);
-        let single = r#"{family: "one", pipeline: "diffusion", match: {single_file_tensors: [["a.w", "b.w"]]}}"#;
+        let single = r#"{family: "one", pipeline: "diffusion", match: {single_file_tensors: [["a.w", "b.w"]], single_file_ext: ["gguf"]}}"#;
         let r = Registry::from_files(&files(&[("families/one.json5", single)]), &[]).unwrap();
-        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"])).as_deref(), Some("one"));
-        assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"])), None);
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "gguf").as_deref(), Some("one"));
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "safetensors"), None);
+        assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"]), "gguf"), None);
     }
 
     #[test]
     fn ldm_vae_names_map_to_diffusers() {
         let r = names::Renamer::from_pairs(&registry().unwrap().name_set("ldm_vae").unwrap()).unwrap();
         let d = |n: &str| r.canonical(&format!("first_stage_model.{n}"));
-        assert_eq!(d("decoder.up.3.block.0.conv1.weight"), "decoder.up_blocks.0.resnets.0.conv1.weight");
-        assert_eq!(d("decoder.up.0.block.0.nin_shortcut.bias"), "decoder.up_blocks.3.resnets.0.conv_shortcut.bias");
-        assert_eq!(d("decoder.up.2.upsample.conv.weight"), "decoder.up_blocks.1.upsamplers.0.conv.weight");
+        assert_eq!(d("decoder.up.3.block.0.conv1.weight"), "decoder.up_ldm.3.resnets.0.conv1.weight");
+        assert_eq!(d("decoder.up.0.block.0.nin_shortcut.bias"), "decoder.up_ldm.0.resnets.0.conv_shortcut.bias");
+        assert_eq!(d("decoder.up.2.upsample.conv.weight"), "decoder.up_ldm.2.upsamplers.0.conv.weight");
         assert_eq!(d("decoder.mid.block_2.norm1.weight"), "decoder.mid_block.resnets.1.norm1.weight");
         assert_eq!(d("decoder.mid.attn_1.norm.bias"), "decoder.mid_block.attentions.0.group_norm.bias");
         assert_eq!(d("encoder.mid.attn_1.proj_out.weight"), "encoder.mid_block.attentions.0.to_out.0.weight");

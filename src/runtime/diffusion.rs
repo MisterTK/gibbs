@@ -1440,6 +1440,23 @@ pub fn weight_names(path: &Path) -> Option<Vec<String>> {
     })
 }
 
+fn ext_of(p: &Path) -> String {
+    p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Whether family `a` is `b` or extends it (directly or through its parents).
+fn related(reg: &crate::arch::Registry, a: &str, b: &str) -> bool {
+    let mut f = Some(a.to_string());
+    for _ in 0..16 {
+        match f {
+            Some(ref x) if x == b => return true,
+            Some(x) => f = reg.spec(&x, &Default::default()).ok().and_then(|s| s.extends),
+            None => return false,
+        }
+    }
+    false
+}
+
 /// The pipeline class of a diffusers snapshot (`model_index.json` `_class_name`).
 pub fn pipeline_class(dir: &Path) -> Option<String> {
     let s = std::fs::read_to_string(dir.join("model_index.json")).ok()?;
@@ -1485,7 +1502,7 @@ pub fn load_image(
     let weights = artifacts.weights_path.as_deref()?;
     let names = weight_names(weights)?;
     let reg = crate::arch::registry().ok()?;
-    if let Some(fam) = reg.detect_single_file(&names) {
+    if let Some(fam) = reg.detect_single_file(&names, &ext_of(weights)) {
         return Some(single_file(&artifacts.model_id, weights, &fam, hub, mode, Vec::new()));
     }
     let lora = weights.extension().is_some_and(|e| e == "safetensors")
@@ -1525,7 +1542,7 @@ pub fn load_image(
             let token = std::env::var("HF_TOKEN").ok();
             let b = hub.auto_download_and_cache(&base, token.as_deref()).ok()?;
             let w = b.weights_path?;
-            let fam = reg.detect_single_file(&weight_names(&w)?)?;
+            let fam = reg.detect_single_file(&weight_names(&w)?, &ext_of(&w))?;
             let id = format!("{} on {base}", artifacts.model_id);
             return Some(single_file(&id, &w, &fam, hub, mode, vec![(weights.to_path_buf(), 1.0)]));
         }
@@ -1540,7 +1557,7 @@ pub fn load_image(
                 class.as_deref().unwrap_or("not a diffusers pipeline")
             )))
         }
-        (Some(f), Some(d)) if f != d => {
+        (Some(f), Some(d)) if !related(reg, f, d) && !related(reg, d, f) => {
             return Some(Err(format!("{repo}: {d} denoiser weights, but its base_model {base} is a {f} pipeline")))
         }
         _ => {}
