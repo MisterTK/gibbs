@@ -110,12 +110,12 @@ fn prepare(
     let adapter = hub
         .fetch_file(repo_id, "adapter_model.safetensors")
         .or_else(|_| hub.fetch_file(repo_id, "adapter_model.bin"))?;
-    let (am, ad_data) = read_checkpoint(&adapter)?;
+    let (mut am, ad_data) = read_checkpoint(&adapter)?;
     let dir = adapter.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let listed: Vec<String> = list_repo_files(repo_id, token)?
-        .into_iter()
-        .map(|f| f.path)
-        .collect();
+    // Offline (a cached adapter): the snapshot's own files stand in for the listing.
+    let listed: Vec<String> = list_repo_files(repo_id, token)
+        .map(|l| l.into_iter().map(|f| f.path).collect())
+        .unwrap_or_default();
     for f in METADATA {
         if listed.iter().any(|p| p == f) {
             hub.fetch_file(repo_id, f)?;
@@ -133,6 +133,8 @@ fn prepare(
         dtype: String,
         shape: Vec<usize>,
         range: (usize, usize),
+        /// A `modules_to_save` tensor the base lacks (a SEQ_CLS head): written from the adapter.
+        new: Option<String>,
     }
     let mut maps = Vec::new();
     let mut entries = Vec::new();
@@ -151,8 +153,6 @@ fn prepare(
                 continue;
             }
             let at = |i: usize| 8 + n + info["data_offsets"][i].as_u64().unwrap_or(0) as usize;
-            let (saved, a_name) = adapter_names(&am, &name);
-            used.extend(saved.into_iter().chain(a_name));
             entries.push(Entry {
                 shard: maps.len(),
                 dtype: info["dtype"].as_str().unwrap_or("").to_string(),
@@ -166,9 +166,56 @@ fn prepare(
                     .unwrap_or_default(),
                 range: (at(0), at(1)),
                 name,
+                new: None,
             });
         }
         maps.push(map);
+    }
+    if task == "SEQ_CLS" {
+        // A classifier adapter names its base under the task model (`bert.encoder...`); a bare
+        // base (`BertModel`) lacks that prefix: drop it where only the stripped name exists.
+        let names: BTreeSet<String> = entries.iter().map(|e| e.name.clone()).collect();
+        let module = |r: &str| r.replace(".lora_A.weight", ".weight").replace(".lora_B.weight", ".weight");
+        let renames: Vec<(String, String)> = am
+            .tensors
+            .keys()
+            .filter_map(|k| {
+                let r = k.strip_prefix("base_model.model.")?;
+                let (_, rest) = r.split_once('.')?;
+                (!names.contains(&module(r)) && names.contains(&module(rest)))
+                    .then(|| (k.clone(), format!("base_model.model.{rest}")))
+            })
+            .collect();
+        for (from, to) in renames {
+            let t = am.tensors.remove(&from).expect("listed key");
+            am.tensors.insert(to, t);
+        }
+    }
+    for e in &entries {
+        let (saved, a_name) = adapter_names(&am, &e.name);
+        used.extend(saved.into_iter().chain(a_name));
+    }
+    if task == "SEQ_CLS" {
+        // The new classification head (`modules_to_save` with no base tensor) joins the weights.
+        let mut heads: Vec<String> = am
+            .tensors
+            .keys()
+            .filter(|k| !k.contains(".lora_") && !used.contains(*k) && k.starts_with("base_model.model."))
+            .cloned()
+            .collect();
+        heads.sort();
+        for k in heads {
+            let t = &am.tensors[&k];
+            entries.push(Entry {
+                shard: 0,
+                name: k["base_model.model.".len()..].to_string(),
+                dtype: t.dtype.clone(),
+                shape: t.shape.clone(),
+                range: (0, 0),
+                new: Some(k.clone()),
+            });
+            used.insert(k);
+        }
     }
     if let Some(stray) = am
         .tensors
@@ -187,7 +234,10 @@ fn prepare(
     );
     let mut off = 0usize;
     for e in &entries {
-        let len = e.range.1 - e.range.0;
+        let len = match &e.new {
+            Some(_) => e.shape.iter().product::<usize>() * dtype_bytes(&e.dtype, &e.name)?,
+            None => e.range.1 - e.range.0,
+        };
         header.insert(
             e.name.clone(),
             serde_json::json!({"dtype": e.dtype, "shape": e.shape, "data_offsets": [off, off + len]}),
@@ -209,6 +259,11 @@ fn prepare(
         .map_err(io)?;
     out.write_all(&header).map_err(io)?;
     for e in &entries {
+        if let Some(k) = &e.new {
+            let v = UniversalModelLoader::extract_tensor_from_manifest(&am, &ad_data, k)?;
+            out.write_all(&encode(&v, &e.dtype, &e.name)?).map_err(io)?;
+            continue;
+        }
         let raw = &maps[e.shard][e.range.0..e.range.1];
         let (saved, a_name) = adapter_names(&am, &e.name);
         if let Some(saved) = saved {
@@ -261,6 +316,15 @@ fn prepare(
     std::fs::rename(&tmp, dir.join("model.safetensors"))
         .map_err(|e| format!("{}: {e}", tmp.display()))?;
     Ok(true)
+}
+
+/// Bytes per element of a dtype [`encode`] writes.
+fn dtype_bytes(dtype: &str, name: &str) -> Result<usize, String> {
+    match dtype {
+        "BF16" | "F16" => Ok(2),
+        "F32" => Ok(4),
+        other => Err(format!("adapter tensor {name} has dtype {other}; merges need BF16/F16/F32")),
+    }
 }
 
 /// The `scale` of a plain LoRA `adapter_config.json` (`lora_alpha / r`, rsLoRA `lora_alpha / √r`);

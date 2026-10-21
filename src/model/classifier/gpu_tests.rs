@@ -3,6 +3,7 @@
 //! spec instance compiled for each device. f32 vs f32, so the bound is a relative 1e-3 of the
 //! largest score; per-architecture errors are printed.
 
+use serde_json::json;
 use super::*;
 use crate::hardware::{available_devices, cpu_compute};
 
@@ -105,4 +106,81 @@ fn deberta_v2_log_buckets_on_metal() {
 fn deberta_v1_absolute_positions_on_metal() {
     let (cfg, ts) = deberta_v1();
     parity("deberta-v1", cfg, ts);
+}
+
+/// A PEFT LoRA SEQ_CLS adapter (q/v LoRA under the task prefix `bert.`, a `modules_to_save`
+/// classifier) on a bare `BertModel` base, merged by `peft::prepare_seq_cls`, scores like a plain
+/// classifier repo holding the merged weights. CPU, and Metal when present.
+#[test]
+fn peft_seq_cls_adapter_on_bare_base_matches_merged_repo() {
+    let (_, full) = bert(None);
+    let bare = |n: &str| n.strip_prefix("bert.").map(str::to_string);
+    let mut base = Ts::new(0);
+    base.t = full.t.iter().filter_map(|(n, s, v)| Some((bare(n)?, s.clone(), v.clone()))).collect();
+    let mut ad = Ts::new(9);
+    let (r, alpha, h) = (2usize, 4.0f32, 16usize);
+    let mut merged = full.t.clone();
+    for l in 0..2 {
+        for m in ["query", "value"] {
+            let p = format!("bert.encoder.layer.{l}.attention.self.{m}");
+            ad.w(&format!("base_model.model.{p}.lora_A.weight"), &[r, h]);
+            ad.w(&format!("base_model.model.{p}.lora_B.weight"), &[h, r]);
+            let (a, b) = (&ad.t[ad.t.len() - 2].2, &ad.t[ad.t.len() - 1].2);
+            let w = &mut merged.iter_mut().find(|t| t.0 == format!("{p}.weight")).unwrap().2;
+            for o in 0..h {
+                for i in 0..h {
+                    w[o * h + i] += alpha / r as f32 * (0..r).map(|k| b[o * r + k] * a[k * h + i]).sum::<f32>();
+                }
+            }
+        }
+    }
+    ad.lin("base_model.model.classifier", 3, h);
+    for (n, s, v) in &ad.t[ad.t.len() - 2..] {
+        let n = n.strip_prefix("base_model.model.").unwrap().to_string();
+        match merged.iter_mut().find(|t| t.0 == n) {
+            Some(t) => t.2 = v.clone(),
+            None => merged.push((n, s.clone(), v.clone())),
+        }
+    }
+    let mut reference = Ts::new(0);
+    reference.t = merged;
+
+    let base_cfg = json!({"architectures": ["BertModel"], "hidden_size": 16, "num_hidden_layers": 2,
+        "num_attention_heads": 2, "intermediate_size": 24, "max_position_embeddings": 32, "type_vocab_size": 2});
+    let cache = write_repo("peft-base", base_cfg.clone(), &base);
+    let mut ref_cfg = base_cfg.clone();
+    ref_cfg["architectures"] = json!(["BertForSequenceClassification"]);
+    let ref_hub = repo("peft-ref", ref_cfg, &reference);
+    // The adapter repo: its config names no architecture (labels only), so the base resolves it.
+    let tmp = write_repo("peft-ad", json!({}), &ad);
+    let (from, to) = (tmp.join("models--t--peft-ad"), cache.join("models--t--peft-ad"));
+    let _ = std::fs::remove_dir_all(&to);
+    std::fs::rename(&from, &to).unwrap();
+    let snap = to.join("snapshots/main");
+    std::fs::rename(snap.join("model.safetensors"), snap.join("adapter_model.safetensors")).unwrap();
+    std::fs::write(
+        snap.join("adapter_config.json"),
+        json!({"peft_type": "LORA", "task_type": "SEQ_CLS", "r": r, "lora_alpha": alpha,
+            "base_model_name_or_path": "t/peft-base"}).to_string(),
+    )
+    .unwrap();
+    let hub = HuggingFaceHub::with_cache_dir(cache);
+    let _g = cpu_compute::allow();
+    let mut devs = vec![Device::Cpu];
+    if available_devices().contains(&Device::Metal) {
+        devs.push(Device::Metal);
+    }
+    for dev in devs {
+        let want = SequenceClassifier::load(&ref_hub, "t/peft-ref", dev).unwrap();
+        let got = SequenceClassifier::load(&hub, "t/peft-ad", dev).unwrap_or_else(|e| panic!("{dev:?}: {e}"));
+        assert_eq!(got.architecture, "BertForSequenceClassification");
+        for pair in [None, Some(PAIR)] {
+            let (a, _) = want.classify(TEXT, pair).unwrap();
+            let (b, _) = got.classify(TEXT, pair).unwrap();
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.label, y.label, "{dev:?}");
+                assert!((x.score - y.score).abs() < 1e-5, "{dev:?}: {a:?} vs {b:?}");
+            }
+        }
+    }
 }

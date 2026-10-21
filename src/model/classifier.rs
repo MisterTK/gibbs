@@ -565,7 +565,7 @@ impl SequenceClassifier {
                 .map(|p| read_json(&p))
                 .transpose()?
                 .unwrap_or(Value::Null);
-            let enc = spec_encoder(hub, repo_id, &cfg, peft.is_some(), device)?;
+            let enc = spec_encoder(hub, repo_id, &cfg, &arch, peft.is_some(), device)?;
             let tok = load_tokenizer(hub, tok_repo, &arch, &tok_cfg, enc.capacity()?)?;
             Body::Spec { enc, tok }
         };
@@ -752,6 +752,7 @@ fn spec_encoder(
     hub: &HuggingFaceHub,
     repo_id: &str,
     cfg: &Value,
+    arch: &str,
     peft: bool,
     device: Device,
 ) -> Result<SpecEncoder, String> {
@@ -761,8 +762,16 @@ fn spec_encoder(
     }
     let mut a = hub.auto_download_and_cache(repo_id, token.as_deref())?;
     if peft {
-        let dir = a.local_dir.clone().ok_or_else(|| format!("{repo_id}: no snapshot dir"))?;
+        let dir = a
+            .weights_path
+            .as_deref()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("{repo_id}: no merged snapshot"))?;
         let path = dir.join("config.json");
+        let mut cfg = cfg.clone();
+        // The base names its own class (`BertModel`, `...ForMaskedLM`); the spec matches the
+        // classification architecture.
+        cfg["architectures"] = serde_json::json!([arch]);
         std::fs::write(&path, cfg.to_string()).map_err(|e| format!("{}: {e}", path.display()))?;
         a.config_path = Some(path);
     }

@@ -51,7 +51,8 @@
      error: "only GELU encoders with absolute positions are supported"},
   ],
   // Buffers and the pooler of bare encoders (read only by the 'classify' head of BERT).
-  ignore: ["embeddings.position_ids", "embeddings.token_type_ids", "pooler.*"],
+  // MLM heads of `...ForMaskedLM` bases a classifier adapter was trained on.
+  ignore: ["embeddings.position_ids", "embeddings.token_type_ids", "pooler.*", "cls.predictions.*", "lm_head.*"],
   components: {
     encoder: {
       vars: ["rows", "head"],
