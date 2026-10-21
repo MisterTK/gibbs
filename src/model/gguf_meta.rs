@@ -132,9 +132,8 @@ impl GgufMeta {
     }
 }
 
-/// Rebuilds the HF tokenizer from `tokenizer.ggml.*`: `bert` → WordPiece (llama.cpp's WPM
-/// lowercases and splits like BertNormalizer/BertPreTokenizer), `t5` → SentencePiece Unigram with
-/// the precompiled charsmap (XLM-R `tokenizer.json`: Precompiled + collapse spaces, Metaspace).
+/// Rebuilds the HF tokenizer from `tokenizer.ggml.*` (`wordpiece` or `unigram` via
+/// `arch/lib/compat.json5`).
 fn tokenizer(kv: &HashMap<String, Kv>, max_len: usize) -> Result<tokenizers::Tokenizer, String> {
     let model = kv
         .get("tokenizer.ggml.model")
@@ -168,8 +167,8 @@ fn tokenizer(kv: &HashMap<String, Kv>, max_len: usize) -> Result<tokenizers::Tok
                    "normalized": t == 4, "special": t != 4})
         })
         .collect();
-    let spec = match model {
-        "t5" => {
+    let spec = match crate::arch::gguf_tokenizer_model(model) {
+        Some("unigram") => {
             let scores = kv
                 .get("tokenizer.ggml.scores")
                 .and_then(Kv::arr)
@@ -207,7 +206,7 @@ fn tokenizer(kv: &HashMap<String, Kv>, max_len: usize) -> Result<tokenizers::Tok
                 "decoder": null,
             })
         }
-        "bert" => {
+        Some("wordpiece") => {
             // The converter writes word starts as "▁w", continuations as "w", controls verbatim.
             let vocab: serde_json::Map<String, Value> = tokens
                 .iter()
@@ -237,9 +236,9 @@ fn tokenizer(kv: &HashMap<String, Kv>, max_len: usize) -> Result<tokenizers::Tok
                 "decoder": null,
             })
         }
-        m => {
+        _ => {
             return Err(format!(
-                "GGUF tokenizer model {m:?} is not supported (bert, t5)"
+                "GGUF tokenizer model {model:?} is not supported"
             ))
         }
     };

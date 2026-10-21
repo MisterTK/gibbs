@@ -608,9 +608,9 @@ impl Tokenizer {
             return Err("No vocabulary found in JSON".to_string());
         }
 
-        // 5. SentencePiece-style BPE (Llama): '▁' vocab; dummy prefix declared by the normalizer
+        // 5. SentencePiece-style BPE: '▁' vocab; dummy prefix declared by the normalizer
         //    (`Prepend "▁"`) or a Metaspace pre-tokenizer. A ByteLevel decoder is GPT-2 style even
-        //    when added tokens carry '▁' (xv0y5ncu/SmolLM2-135M-Instruct-GLQ-4bpw's "▁<EOT>").
+        //    when added tokens carry '▁' (e.g. "▁<EOT>").
         let byte_level = std::iter::once(&val["decoder"])
             .chain(val["decoder"]["decoders"].as_array().into_iter().flatten())
             .any(|d| d["type"] == "ByteLevel");
@@ -674,7 +674,7 @@ impl Tokenizer {
             inv_vocab,
             special_tokens,
             spm,
-            // llama.cpp default for SentencePiece vocabs; GGUF metadata may override.
+            // Default for SentencePiece vocabs; GGUF metadata may override.
             add_space_prefix: spm,
             bos: None,
             hf: None,
@@ -740,7 +740,7 @@ impl Tokenizer {
 
     /// Greedy longest-match encoding against vocabulary, falling back to raw byte tokens
     /// (GGUF / synthetic vocabs). SentencePiece vocabs see spaces as '▁' (plus the declared
-    /// dummy prefix), like llama.cpp / HF `Metaspace`.
+    /// dummy prefix), like HF `Metaspace`.
     fn encode_greedy(&self, text: &str) -> Vec<u32> {
         let mut tokens: Vec<u32> = Vec::new();
         let spm_text;
@@ -939,7 +939,7 @@ impl Tokenizer {
 
     /// Maps tokens to strings and concatenates them into clean human-readable text.
     /// A full SentencePiece sequence (starting at BOS) drops its dummy-prefix space, like HF /
-    /// llama.cpp detokenizers; continuation slices keep leading spaces, matching `decode_token`.
+    /// Metaspace detokenizers; continuation slices keep leading spaces, matching `decode_token`.
     pub fn decode(&self, tokens: &[u32]) -> String {
         // First try collective byte-level decoding across all tokens
         let mut byte_stream = Vec::with_capacity(tokens.len() * 4);

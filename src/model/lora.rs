@@ -203,7 +203,7 @@ impl LoraFile {
     }
 }
 
-/// Whether a LoRA file's tensor names patch a diffusion denoiser (SD UNet blocks, FLUX / DiT
+/// Whether a LoRA file's tensor names patch a diffusion denoiser (UNet blocks, DiT
 /// blocks) or CLIP text encoders, rather than an LLM.
 pub fn is_diffusion_lora<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
     const BLOCKS: [&str; 13] = [

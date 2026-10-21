@@ -123,9 +123,9 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
                 )),
             }
         }
-        // ponytail: transformers' default `bitlinear` class divides by `weight_scale` (HF1BitLLM
-        // Llama3-8B-1.58); only `autobitlinear` (multiplies) decodes. Add the divide in
-        // `dequantize` once a loadable-size bitlinear checkpoint can verify it.
+        // ponytail: transformers' default `bitlinear` class divides by `weight_scale`; only
+        // `autobitlinear` (multiplies) decodes. Add the divide in `dequantize` once a
+        // loadable-size bitlinear checkpoint can verify it.
         Some("bitnet") => {
             let q = qc.unwrap_or(&Value::Null);
             let class = q["linear_class"]
@@ -148,8 +148,8 @@ pub fn scheme_blocker(cfg: &Value, hf_quant: Option<&Value>) -> Option<String> {
             }
         }
         Some("quark") => quark::blocker(qc.unwrap_or(&Value::Null)),
-        // vLLM `fp8` serialization (amd/Llama-3.2-1B-Instruct-FP8-KV): F8 weights, one `weight_scale` each.
-        // `weight_block_size` (DeepSeek / Qwen3-FP8): 2-D `weight_scale_inv` grid, read by [`dequantize`],
+        // vLLM `fp8` serialization: F8 weights, one `weight_scale` each.
+        // `weight_block_size`: 2-D `weight_scale_inv` grid, read by [`dequantize`],
         // whose grid inference ([`block`]) only knows 128-blocks.
         Some("fp8") => qc.and_then(|q| {
             let b = &q["weight_block_size"];
@@ -332,7 +332,7 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
         return Ok(Some(w));
     }
     let Some(stem) = name.strip_suffix(".weight") else {
-        // gpt-oss `X_blocks` / `X_scales` are exposed as a bare `X`.
+        // MXFP4 `X_blocks` / `X_scales` are exposed as a bare `X`.
         return mxfp4::dequantize(m, data, name);
     };
     if let Some(w) = quark::dequantize(m, data, name)? {

@@ -6,6 +6,7 @@
   match: {
     hf_model_type: ["deepseek_v4*", "deepseek_v2*", "deepseek_v3*", "deepseek2*", "glm_moe_dsa*", "wan*"],
     gguf_arch: ["deepseek2*"],
+    diffusers_class: ["LTXConditionPipeline", "LTXLatentUpsamplePipeline"],
   },
   runtime: {
     reasons: [
@@ -13,6 +14,7 @@
       ["deepseek*", "architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented"],
       ["glm_moe_dsa*", "architecture 'glm-dsa' uses Dynamic Sparse Attention (DSA), which is not implemented"],
       ["wan*", "text-to-video model, architecture 'wan' (not supported)"],
+      ["LTX*Pipeline", "diffusers {name}: needs LTX-Video v0.9.5+ parts (timestep-conditioned VAE decoder, per-token conditioning, latent upsampler), which are not implemented; only v0.9.0 LTXPipeline loads"],
     ],
   },
 }

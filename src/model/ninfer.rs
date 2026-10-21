@@ -1,17 +1,15 @@
-//! NInfer (`.ninfer`, github.com/Neroued/ninfer) artifacts of the dense Qwen3.5 family (Qwen3.5,
-//! Qwen3.6, Qwen3.8 and their finetunes): one file (or a file plus `.part-NNNN` volumes) of a JSON
-//! catalog and 256-byte-aligned encoded objects, read back as the transformers tensors
-//! the `qwen3_5` family spec loads. The container is v2 (`NINFER\0\x02`: named objects, geometry
-//! implied by the tensors) or v3 (`NINFER\0\x03`: `components.text.config`, logical `bindings`
-//! over object element ranges). v1, MoE / Qwen4Exp / speech architectures and the codecs outside
-//! [`Codec`] are refused with their name.
+//! NInfer (`.ninfer`, github.com/Neroued/ninfer) artifacts of dense gated-delta-net hybrid causal
+//! LMs: one file (or a file plus `.part-NNNN` volumes) of a JSON catalog and 256-byte-aligned
+//! encoded objects, read back as the transformers tensors the matching family spec loads. The
+//! container is v2 (`NINFER\0\x02`: named objects, geometry implied by the tensors) or v3
+//! (`NINFER\0\x03`: `components.text.config`, logical `bindings` over object element ranges). v1,
+//! MoE / speech architectures and the codecs outside [`Codec`] are refused with their name.
 //!
 //! [`Catalog`] is everything but the payload: the loader ([`Artifact`]) and the hub picker
 //! ([`hub_verdict`], over the catalog it fetches with two Range requests) run the same
 //! [`Catalog::plan`], so a row the picker shows as loadable parses at load.
 //!
-//! Spec: ninfer `docs/maintainer/{artifact-container,storage-layouts,tensor-formats}.md`; the
-//! tensor mapping follows its `tools/convert/qwen3_5.py`.
+//! Spec: ninfer `docs/maintainer/{artifact-container,storage-layouts,tensor-formats}.md`.
 
 use crate::hardware::QuantFormat;
 use crate::model::par::par_rows;
@@ -42,7 +40,7 @@ enum Codec {
     Nvfp4,
     /// `row_scale_v1`: E4M3FN codes, one bf16 multiplier per row.
     Fp8Row,
-    /// `gguf_blocks_v1`: ggml blocks of a llama.cpp type, rows back to back.
+    /// `gguf_blocks_v1`: ggml quantized blocks, rows back to back.
     Gguf(QuantFormat),
 }
 
@@ -97,8 +95,8 @@ struct Geometry {
     taps: usize,
 }
 
-/// `config.json` for the `qwen3_5` family spec, its dimensions, and every transformers tensor with
-/// its assembly recipe.
+/// `config.json` for the hybrid causal-LM family spec, its dimensions, and every transformers
+/// tensor with its assembly recipe.
 struct Plan {
     cfg: Value,
     geo: Geometry,
@@ -260,21 +258,29 @@ impl Catalog {
     }
 
     /// `config.json` and dimensions of the text model. v3 carries the text config; for v2 it is
-    /// read off the tensor shapes with the fixed Qwen3.5 constants (GDN heads are 128 wide, RoPE
+    /// read off the tensor shapes with the fixed hybrid constants (GDN heads are 128 wide, RoPE
     /// 25 % interleaved M-RoPE `[11, 11, 10]` at theta 1e7, eps 1e-6).
     fn config(&self) -> Result<(Value, Geometry), String> {
+        let ns = crate::arch::registry()?.ninfer_runtime().unwrap_or_default();
+        let want_arch = ns["architecture"].as_str().unwrap_or_default();
         let mut cfg = if self.v3 {
             let c = &self.root["components"]["text"]["config"];
             match c["architectures"][0].as_str() {
-                Some("Qwen3_5ForCausalLM") => c.clone(),
-                Some(a @ ("Qwen3_5MoeForCausalLM" | "Qwen4ExpForCausalLM")) => {
+                Some(a) if a == want_arch => c.clone(),
+                Some(a)
+                    if ns["refused_architectures"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|r| r.as_str() == Some(a)) =>
+                {
                     return Err(format!(
-                        "NInfer architecture {a}: only the dense Qwen3_5ForCausalLM text model is implemented (no expert-routed MLP)"
+                        "NInfer architecture {a}: only the dense {want_arch} text model is implemented (no expert-routed MLP)"
                     ))
                 }
                 a => {
                     return Err(format!(
-                        "NInfer architecture {a:?} is not a Qwen3.5 text model"
+                        "NInfer architecture {a:?} is not a supported text model"
                     ))
                 }
             }
@@ -309,6 +315,9 @@ impl Catalog {
     }
 
     fn v2_config(&self) -> Result<Value, String> {
+        let ns = crate::arch::registry()?.ninfer_runtime().unwrap_or_default();
+        let want_arch = ns["architecture"].as_str().unwrap_or_default();
+        let model_type = ns["model_type"].as_str().unwrap_or_default();
         let id = self.root["identity"]["model_id"].as_str().unwrap_or("?");
         let shape = |o: &str| {
             self.objects
@@ -328,7 +337,7 @@ impl Catalog {
             let t = format!("text/layers/{i}");
             if !self.objects.contains_key(&format!("{t}/mlp/gate_up")) {
                 return Err(format!(
-                    "NInfer '{id}' has no dense MLP objects (a mixture-of-experts model: only dense Qwen3.5 text models are implemented)"
+                    "NInfer '{id}' has no dense MLP objects (a mixture-of-experts model: only dense {want_arch} text models are implemented)"
                 ));
             }
             if self
@@ -343,7 +352,7 @@ impl Catalog {
             }
         }
         let mut cfg = json!({
-            "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text",
+            "architectures": [want_arch], "model_type": model_type,
             "hidden_size": emb[1], "vocab_size": emb[0], "num_hidden_layers": layers,
             "intermediate_size": shape("text/layers/0/mlp/gate_up")?[0] / 2,
             "max_position_embeddings": 262144, "rms_norm_eps": 1e-6, "layer_types": kinds,
@@ -369,7 +378,7 @@ impl Catalog {
     }
 
     /// Every transformers tensor of the text model with its recipe, after checking that the
-    /// artifact is a dense Qwen3.5 text model whose parts all have a decodable codec and add up to
+    /// artifact is a dense text model whose parts all have a decodable codec and add up to
     /// the tensor's shape. Errs with the reason otherwise.
     fn plan(&self) -> Result<Plan, String> {
         let (mut cfg, geo) = self.config()?;
@@ -850,7 +859,7 @@ impl Artifact {
 
     /// The model as transformers tensors (text, plus the vision tower when the artifact has one)
     /// and its `config.json` equivalent. Errs with the reason for any artifact outside the dense
-    /// Qwen3.5 family or a codec we can't decode.
+    /// supported family or a codec we can't decode.
     pub fn checkpoint(&self) -> Result<(Weights, Value), String> {
         let Plan {
             mut cfg,
@@ -1107,8 +1116,16 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    Some(match ["a3b", "flash-next", "-moe", "qwen4"].iter().find(|k| hay.contains(*k)) {
-        Some(k) => Err(format!("NInfer artifact of a mixture-of-experts model ('{k}'): only dense Qwen3.5 text models are implemented (no expert-routed MLP)")),
+    let ns = crate::arch::registry().ok()?.ninfer_runtime()?;
+    let want_arch = ns["architecture"].as_str().unwrap_or_default();
+    let hit = ns["hub_moe_keywords"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|k| hay.contains(*k));
+    Some(match hit {
+        Some(k) => Err(format!("NInfer artifact of a mixture-of-experts model ('{k}'): only dense {want_arch} text models are implemented (no expert-routed MLP)")),
         None => Ok(()),
     })
 }
@@ -1122,6 +1139,13 @@ pub fn hub_params(m: &Value) -> Option<u64> {
 pub fn hub_size(m: &Value) -> Option<u64> {
     hub_catalog(m)?.ok().map(|c| c.stored_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::hub::ModelArtifacts;
+    use crate::model::loaders::{SafetensorsWeightReader, WeightReader};
+    use std::path::PathBuf;
 
     /// One dense gated-delta-net layer (hidden 64) as a v3 catalog: every parameter its own bf16
     /// object, `mlp/down` stored as `down_format`.
@@ -1202,12 +1226,6 @@ pub fn write_tiny_artifact(path: &Path) -> Result<HashMap<String, usize>, String
     std::fs::write(path, file).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(off)
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::hub::ModelArtifacts;
-    use crate::model::loaders::{SafetensorsWeightReader, WeightReader};
-    use std::path::PathBuf;
 
     fn snapshot(repo: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(

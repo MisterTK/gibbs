@@ -1,4 +1,4 @@
-//! Graph-building helpers shared by the vision/audio towers (SigLIP, Gemma 4 vision and audio) and
+//! Graph-building helpers shared by vision/audio towers and
 //! the GPU placement of their output rows into the text model's `inputs_embeds`.
 
 use crate::graph::program::GraphProgram;

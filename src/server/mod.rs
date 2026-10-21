@@ -3,7 +3,7 @@ mod classify;
 mod anthropic;
 pub mod connect;
 pub mod core;
-mod ollama;
+mod ndjson_api;
 mod openai;
 mod responses;
 pub mod tools;
@@ -139,13 +139,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/responses", post(responses::responses))
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
-        .route("/api/chat", post(ollama::chat))
-        .route("/api/generate", post(ollama::generate))
-        .route("/api/tags", get(ollama::tags))
-        .route("/api/show", post(ollama::show))
-        .route("/api/ps", get(ollama::ps))
-        .route("/api/version", get(ollama::version))
-        .route("/", get(ollama::root))
+        .route("/api/chat", post(ndjson_api::chat))
+        .route("/api/generate", post(ndjson_api::generate))
+        .route("/api/tags", get(ndjson_api::tags))
+        .route("/api/show", post(ndjson_api::show))
+        .route("/api/ps", get(ndjson_api::ps))
+        .route("/api/version", get(ndjson_api::version))
+        .route("/", get(ndjson_api::root))
         .route("/v1/models", get(handle_list_models))
         .route("/v1/system1/judge", post(handle_system1_judge))
         .route("/v1/decisions", post(handle_decisions))

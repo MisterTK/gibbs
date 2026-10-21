@@ -1,5 +1,5 @@
-//! Ollama API (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`,
-//! `/api/version`, `/`) on the shared core, so `OLLAMA_HOST` clients talk to the loaded model.
+//! NDJSON local-agent API (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`,
+//! `/api/version`, `/`) on the shared core.
 
 use super::core::{
     self, collect, label, prepare_messages, stream_response, ApiError, Event, Finish, Framing,
@@ -16,26 +16,26 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Instant;
 
-/// Ollama API level this server mirrors (clients gate features on it).
-const OLLAMA_VERSION: &str = "0.35.1";
+/// API level this server mirrors (clients gate features on it).
+const COMPAT_VERSION: &str = "0.35.1";
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
-    pub messages: Vec<OllamaMessage>,
+    pub messages: Vec<ChatTurn>,
     #[serde(default)]
     pub tools: Vec<Value>,
     pub stream: Option<bool>,
     pub format: Option<Value>,
     #[serde(default)]
     pub options: Options,
-    /// `false` renders the template with `enable_thinking: false` (Qwen3 and alike).
+    /// `false` renders the template with `enable_thinking: false`.
     pub think: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OllamaMessage {
+pub struct ChatTurn {
     pub role: String,
     #[serde(default)]
     pub content: String,
@@ -49,7 +49,7 @@ pub struct OllamaMessage {
 pub struct Options {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
-    /// Tokens to generate; negative or unset = until the model stops (Ollama's default).
+    /// Tokens to generate; negative or unset = until the model stops.
     pub num_predict: Option<i64>,
     pub stop: Option<Vec<String>>,
 }
@@ -76,14 +76,14 @@ fn error(e: ApiError) -> Response {
     (e.status, Json(json!({ "error": e.message }))).into_response()
 }
 
-/// Ollama accepts a JSON body whatever its `Content-Type` (its docs use bare `curl -d`).
+/// Accepts a JSON body whatever its `Content-Type` (clients may use bare `curl -d`).
 fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|e| ApiError::bad(format!("invalid JSON body: {e}")))
 }
 
 impl Options {
     fn params(&self) -> SamplingParams {
-        // Negative `num_predict` (Ollama's "unlimited") is the same as unset.
+        // Negative `num_predict` ("unlimited") is the same as unset.
         let max = self.num_predict.and_then(|n| usize::try_from(n).ok());
         SamplingParams {
             top_p: self.top_p,
@@ -102,7 +102,7 @@ fn no_format(format: &Option<Value>) -> Result<(), ApiError> {
     }
 }
 
-/// A user/assistant turn with Ollama base64 `images` as image parts ahead of the text.
+/// A user/assistant turn with base64 `images` as image parts ahead of the text.
 fn with_images(role: String, text: String, images: &[String]) -> ChatMessage {
     let mut m = ChatMessage::new(role, text);
     if !images.is_empty() {
@@ -116,7 +116,7 @@ fn with_images(role: String, text: String, images: &[String]) -> ChatMessage {
     m
 }
 
-fn chat_messages(messages: Vec<OllamaMessage>) -> Result<Vec<ChatMessage>, ApiError> {
+fn chat_messages(messages: Vec<ChatTurn>) -> Result<Vec<ChatMessage>, ApiError> {
     messages
         .into_iter()
         .map(|m| {
@@ -171,7 +171,7 @@ fn model_name(state: &AppState, requested: Option<String>) -> String {
         .unwrap_or_else(|| state.scheduler.model_id())
 }
 
-/// Reply to a request with nothing to generate: Ollama clients send these to preload a model.
+/// Reply to a request with nothing to generate: clients send these to preload a model.
 fn load_reply(model: &str, key: &str) -> Response {
     let mut v = json!({"model": model, "created_at": now(), "done": true, "done_reason": "load"});
     v[key] = if key == "message" {
@@ -213,11 +213,16 @@ pub async fn chat(
                 media,
                 params: req.options.params(),
                 stop: req.options.stop.clone().unwrap_or_default(),
-                label: label("ollama", &headers),
+                label: label(
+                    crate::arch::compat()["ndjson_api"]["label"]
+                        .as_str()
+                        .unwrap_or("ndjson"),
+                    &headers,
+                ),
             },
         )
         .await?;
-        let mut wire = OllamaWire::new(model, "message", gen.prompt_tokens);
+        let mut wire = NdjsonWire::new(model, "message", gen.prompt_tokens);
         if req.stream.unwrap_or(true) {
             return Ok(stream_response(gen, wire, Framing::Ndjson));
         }
@@ -272,11 +277,16 @@ pub async fn generate(
                 media,
                 params: req.options.params(),
                 stop: req.options.stop.clone().unwrap_or_default(),
-                label: label("ollama", &headers),
+                label: label(
+                    crate::arch::compat()["ndjson_api"]["label"]
+                        .as_str()
+                        .unwrap_or("ndjson"),
+                    &headers,
+                ),
             },
         )
         .await?;
-        let mut wire = OllamaWire::new(model, "response", gen.prompt_tokens);
+        let mut wire = NdjsonWire::new(model, "response", gen.prompt_tokens);
         if req.stream.unwrap_or(true) {
             return Ok(stream_response(gen, wire, Framing::Ndjson));
         }
@@ -294,7 +304,7 @@ fn call_json(c: &ToolCall) -> Value {
     json!({"function": {"name": c.name, "arguments": args}})
 }
 
-pub struct OllamaWire {
+pub struct NdjsonWire {
     model: String,
     /// `message` (`/api/chat`) or `response` (`/api/generate`).
     key: &'static str,
@@ -302,7 +312,7 @@ pub struct OllamaWire {
     started: Instant,
 }
 
-impl OllamaWire {
+impl NdjsonWire {
     pub fn new(model: String, key: &'static str, prompt_tokens: usize) -> Self {
         Self {
             model,
@@ -338,7 +348,7 @@ impl OllamaWire {
     }
 }
 
-impl Wire for OllamaWire {
+impl Wire for NdjsonWire {
     fn on(&mut self, ev: Event) -> Vec<Value> {
         match ev {
             Event::Text(t) => vec![self.chunk(&t)],
@@ -360,7 +370,7 @@ impl Wire for OllamaWire {
     }
 }
 
-/// The loaded model as an Ollama model entry (`/api/tags`, `/api/ps`).
+/// The loaded model as a model entry (`/api/tags`, `/api/ps`).
 fn model_entry(state: &AppState) -> Value {
     let id = state.scheduler.model_id();
     let family = id
@@ -433,11 +443,13 @@ pub async fn show(State(state): State<AppState>) -> Response {
 }
 
 pub async fn version() -> Json<Value> {
-    Json(json!({ "version": OLLAMA_VERSION }))
+    Json(json!({ "version": COMPAT_VERSION }))
 }
 
 pub async fn root() -> &'static str {
-    "Ollama is running"
+    crate::arch::compat()["ndjson_api"]["root_banner"]
+        .as_str()
+        .unwrap_or("running")
 }
 
 #[cfg(test)]
@@ -446,7 +458,7 @@ mod tests {
 
     #[test]
     fn ndjson_chat_order_text_call_done() {
-        let mut w = OllamaWire::new("m".into(), "message", 4);
+        let mut w = NdjsonWire::new("m".into(), "message", 4);
         let evs: Vec<Value> = [
             Event::Text("ok".into()),
             Event::Call(ToolCall {
@@ -485,7 +497,7 @@ mod tests {
             ),
             (Some(4), Some(9))
         );
-        let mut g = OllamaWire::new("m".into(), "response", 1);
+        let mut g = NdjsonWire::new("m".into(), "response", 1);
         let done = g.on(Event::Done {
             finish: Finish::Length,
             completion_tokens: 2,
@@ -501,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn images_and_tool_turns_convert() {
-        let msgs: Vec<OllamaMessage> = serde_json::from_value(json!([
+        let msgs: Vec<ChatTurn> = serde_json::from_value(json!([
             {"role": "user", "content": "what is this?", "images": ["AAEC"]},
             {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "f", "arguments": {"x": 1}}}]},
             {"role": "tool", "content": "42", "tool_name": "f"}
@@ -516,7 +528,7 @@ mod tests {
         assert_eq!(m[1].tool_calls.as_ref().unwrap()[0]["type"], "function");
         assert_eq!(m[2].name.as_deref(), Some("f"));
         // A non-object tool call is a 400, not a panic.
-        let bad: Vec<OllamaMessage> = serde_json::from_value(json!([
+        let bad: Vec<ChatTurn> = serde_json::from_value(json!([
             {"role": "assistant", "content": "", "tool_calls": [1]}
         ]))
         .unwrap();

@@ -77,7 +77,7 @@ struct Cli {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Text-to-video: number of frames (ModelScope 16..=24, default 16; LTX-Video 8k+1, default 25).
+    /// Text-to-video: number of frames (16..=24 or 8k+1 depending on the video pipeline).
     #[arg(long)]
     frames: Option<usize>,
 
@@ -89,8 +89,8 @@ struct Cli {
     #[arg(long)]
     negative_prompt: Option<String>,
 
-    /// Video pipelines with a T5 text encoder (LTX-Video): its weights (GGUF (`org/repo` or `org/repo/file.gguf`); GGUF transformers default to
-    /// city96/t5-v1_1-xxl-encoder-gguf Q4_K_M, diffusers repos to their own 19 GB `text_encoder/`.
+    /// Video pipelines with a separate text encoder: its weights (`org/repo` or
+    /// `org/repo/file.gguf`); GGUF transformers default to a Q4_K_M encoder, diffusers repos to `text_encoder/`.
     #[arg(long)]
     text_encoder: Option<String>,
 
@@ -588,7 +588,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("💬 Generating from prompt: \"{}\"", prompt);
         let cap = model.lm().default_max_new_tokens();
         let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
-        // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
+        // Models that declare greedy decoding (encoder-decoders: transformers' default) are not sampled.
         let temperature = match scheduler.tokenizer().sampling_defaults {
             Some((t, _)) if t <= 1e-4 => 0.0,
             _ => 0.7,
@@ -655,9 +655,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(|e| format!("Cannot listen on {addr}: {e}"))?;
     println!("🚀 Gibbs HTTP/SSE Server listening on http://{}", addr);
-    println!("   Endpoints: /v1/chat/completions, /v1/completions, /v1/responses (OpenAI), /v1/messages (Anthropic), /api/chat, /api/generate (Ollama), /v1/images/generations, /v1/images/edits, /v1/embeddings, /v1/decisions, /v1/classify, /v1/rerank, /v1/models, /health");
+    let compat_client = gibbs_engine::arch::compat()["ndjson_api"]["client_name"]
+        .as_str()
+        .unwrap_or("Local");
+    let compat_env = gibbs_engine::arch::compat()["ndjson_api"]["host_env"]
+        .as_str()
+        .unwrap_or("HOST");
+    println!("   Endpoints: /v1/chat/completions, /v1/completions, /v1/responses (OpenAI), /v1/messages (Anthropic), /api/chat, /api/generate ({compat_client}), /v1/images/generations, /v1/images/edits, /v1/embeddings, /v1/decisions, /v1/classify, /v1/rerank, /v1/models, /health");
     println!(
-        "   Agents: {}  ·  OLLAMA_HOST={}  ·  TUI: /connect",
+        "   Agents: {}  ·  {compat_env}={}  ·  TUI: /connect",
         gibbs_engine::server::connect::agent_command("claude", addr, &scheduler.model_id())?,
         gibbs_engine::server::connect::client_addr(addr)
     );

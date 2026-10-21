@@ -5,51 +5,51 @@ use serde_json::{Map, Value};
 
 const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
-const MISTRAL: &str = "[TOOL_CALLS]";
+const BRACKET: &str = "[TOOL_CALLS]";
 const PYTHON_TAG: &str = "<|python_tag|>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFormat {
-    /// Hermes / Qwen2.5: `<tool_call>{"name": .., "arguments": {..}}</tool_call>`.
-    Hermes,
-    /// Qwen3-Coder / Qwen3.5: `<tool_call><function=NAME><parameter=P>V</parameter></function></tool_call>`.
-    QwenXml,
-    /// Llama 3.x: the whole reply is `{"name": .., "parameters": {..}}` (optionally after
+    /// `<tool_call>{"name": .., "arguments": {..}}</tool_call>`.
+    ToolCallJson,
+    /// `<tool_call><function=NAME><parameter=P>V</parameter></function></tool_call>`.
+    XmlFunction,
+    /// Whole reply is `{"name": .., "parameters": {..}}` (optionally after
     /// `<|python_tag|>`, several separated by `;`).
-    Llama,
-    /// Mistral: `[TOOL_CALLS][{"name": .., "arguments": {..}}]`, or v11+ `[TOOL_CALLS]NAME[ARGS]{..}`.
-    Mistral,
+    HeaderJson,
+    /// `[TOOL_CALLS][{"name": .., "arguments": {..}}]`, or v11+ `[TOOL_CALLS]NAME[ARGS]{..}`.
+    BracketJson,
 }
 
 impl ToolFormat {
     /// The tool-call format a chat template renders; `None` when it has no tool support.
     pub fn detect(template: &str) -> Option<Self> {
         if template.contains("<function=") {
-            Some(Self::QwenXml)
+            Some(Self::XmlFunction)
         } else if template.contains(OPEN) {
-            Some(Self::Hermes)
-        } else if template.contains(MISTRAL) {
-            Some(Self::Mistral)
+            Some(Self::ToolCallJson)
+        } else if template.contains(BRACKET) {
+            Some(Self::BracketJson)
         } else if template.contains("<|start_header_id|>") && template.contains("parameters") {
-            Some(Self::Llama)
+            Some(Self::HeaderJson)
         } else {
             None
         }
     }
 
-    /// Assistant-turn text that commits the model to a tool call (`name`: to that tool). Mistral
+    /// Assistant-turn text that commits the model to a tool call (`name`: to that tool). Bracket
     /// names are checked after generation instead (the call syntax depends on the tokenizer version).
     pub fn forced_prefix(self, name: Option<&str>) -> String {
         let quoted = |n: &str| Value::String(n.to_string()).to_string();
         match (self, name) {
-            (Self::Hermes | Self::QwenXml, None) => format!("{OPEN}\n"),
-            (Self::Hermes, Some(n)) => {
+            (Self::ToolCallJson | Self::XmlFunction, None) => format!("{OPEN}\n"),
+            (Self::ToolCallJson, Some(n)) => {
                 format!("{OPEN}\n{{\"name\": {}, \"arguments\": ", quoted(n))
             }
-            (Self::QwenXml, Some(n)) => format!("{OPEN}\n<function={n}>\n"),
-            (Self::Llama, None) => "{\"name\": \"".to_string(),
-            (Self::Llama, Some(n)) => format!("{{\"name\": {}, \"parameters\": ", quoted(n)),
-            (Self::Mistral, _) => MISTRAL.to_string(),
+            (Self::XmlFunction, Some(n)) => format!("{OPEN}\n<function={n}>\n"),
+            (Self::HeaderJson, None) => "{\"name\": \"".to_string(),
+            (Self::HeaderJson, Some(n)) => format!("{{\"name\": {}, \"parameters\": ", quoted(n)),
+            (Self::BracketJson, _) => BRACKET.to_string(),
         }
     }
 }
@@ -73,11 +73,11 @@ pub enum Piece {
 /// opener is held until it resolves. Malformed calls come back as the text the model wrote.
 pub struct ToolParser {
     format: ToolFormat,
-    /// The request's tools (OpenAI shape): QwenXml parameter values are typed by their schema.
+    /// The request's tools (OpenAI shape): XmlFunction parameter values are typed by their schema.
     tools: Vec<Value>,
     buf: String,
     in_call: bool,
-    /// Llama: a call must open the reply, so the decision falls at its first non-blank text.
+    /// HeaderJson: a call must open the reply, so the decision falls at its first non-blank text.
     decided: bool,
 }
 
@@ -97,7 +97,7 @@ impl ToolParser {
         let mut out = Vec::new();
         loop {
             if self.in_call {
-                // Llama and Mistral calls run to the end of the reply.
+                // HeaderJson and BracketJson calls run to the end of the reply.
                 let Some(end) = self.buf.find(CLOSE).filter(|_| self.tag_delimited()) else {
                     break;
                 };
@@ -107,9 +107,9 @@ impl ToolParser {
                 continue;
             }
             let open = match self.format {
-                ToolFormat::Hermes | ToolFormat::QwenXml => OPEN,
-                ToolFormat::Mistral => MISTRAL,
-                ToolFormat::Llama => {
+                ToolFormat::ToolCallJson | ToolFormat::XmlFunction => OPEN,
+                ToolFormat::BracketJson => BRACKET,
+                ToolFormat::HeaderJson => {
                     if !self.decided {
                         let t = self.buf.trim_start();
                         if t.is_empty() {
@@ -153,14 +153,14 @@ impl ToolParser {
             self.block(&rest, false)
         } else {
             let calls = match self.format {
-                ToolFormat::Llama => parse_llama(&rest, &self.tools),
-                _ => parse_mistral(&rest, &self.tools),
+                ToolFormat::HeaderJson => parse_header_json(&rest, &self.tools),
+                _ => parse_bracket_json(&rest, &self.tools),
             };
             self.in_call = false;
             return match calls {
                 Some(calls) => calls.into_iter().map(Piece::Call).collect(),
-                None if self.format == ToolFormat::Mistral => {
-                    vec![Piece::Text(MISTRAL.to_string() + &rest)]
+                None if self.format == ToolFormat::BracketJson => {
+                    vec![Piece::Text(BRACKET.to_string() + &rest)]
                 }
                 None => vec![Piece::Text(rest)],
             };
@@ -173,13 +173,13 @@ impl ToolParser {
     }
 
     fn tag_delimited(&self) -> bool {
-        matches!(self.format, ToolFormat::Hermes | ToolFormat::QwenXml)
+        matches!(self.format, ToolFormat::ToolCallJson | ToolFormat::XmlFunction)
     }
 
     /// One `<tool_call>` body as a call, or the original text when it does not parse.
     fn block(&self, body: &str, closed: bool) -> Piece {
         let call = match self.format {
-            ToolFormat::QwenXml => self.parse_xml(body),
+            ToolFormat::XmlFunction => self.parse_xml(body),
             _ => serde_json::from_str::<Value>(body.trim())
                 .ok()
                 .and_then(|v| object_call(&v)),
@@ -210,8 +210,7 @@ impl ToolParser {
         (!name.is_empty()).then(|| call(name, Value::Object(args).to_string()))
     }
 
-    /// Like vLLM's qwen3_coder parser: string (or unknown) parameters stay text; other schema
-    /// types parse as JSON when they can.
+    /// String (or unknown) parameters stay text; other schema types parse as JSON when they can.
     fn typed(&self, tool: &str, param: &str, raw: &str) -> Value {
         let ty = self
             .tools
@@ -268,7 +267,7 @@ fn known(tools: &[Value], name: &Value) -> bool {
 
 /// Bare JSON has no delimiter vouching for it: an object counts as a call only when it names
 /// one of the request's tools and carries `parameters`/`arguments`, so JSON answers stay text.
-fn parse_llama(text: &str, tools: &[Value]) -> Option<Vec<ToolCall>> {
+fn parse_header_json(text: &str, tools: &[Value]) -> Option<Vec<ToolCall>> {
     let t = text.trim_start();
     let mut rest = t.strip_prefix(PYTHON_TAG).unwrap_or(t);
     let mut calls = Vec::new();
@@ -290,9 +289,9 @@ fn parse_llama(text: &str, tools: &[Value]) -> Option<Vec<ToolCall>> {
     (!calls.is_empty()).then_some(calls)
 }
 
-fn parse_mistral(text: &str, tools: &[Value]) -> Option<Vec<ToolCall>> {
+fn parse_bracket_json(text: &str, tools: &[Value]) -> Option<Vec<ToolCall>> {
     let mut calls = Vec::new();
-    for seg in text.split(MISTRAL).map(str::trim).filter(|s| !s.is_empty()) {
+    for seg in text.split(BRACKET).map(str::trim).filter(|s| !s.is_empty()) {
         if seg.starts_with('[') {
             for v in serde_json::from_str::<Vec<Value>>(seg).ok()? {
                 calls.push(object_call(&v).filter(|_| known(tools, &v["name"]))?);
@@ -367,16 +366,16 @@ mod tests {
         let f = ToolFormat::detect;
         assert_eq!(
             f("{{'<tool_call>\\n<function=' + name}}"),
-            Some(ToolFormat::QwenXml)
+            Some(ToolFormat::XmlFunction)
         );
         assert_eq!(
             f("<tool_call>\\n{\"name\": ...</tool_call>"),
-            Some(ToolFormat::Hermes)
+            Some(ToolFormat::ToolCallJson)
         );
-        assert_eq!(f("{{ '[TOOL_CALLS]' }}"), Some(ToolFormat::Mistral));
+        assert_eq!(f("{{ '[TOOL_CALLS]' }}"), Some(ToolFormat::BracketJson));
         assert_eq!(
             f("<|start_header_id|>{\"name\": function name, \"parameters\": ...}"),
-            Some(ToolFormat::Llama)
+            Some(ToolFormat::HeaderJson)
         );
         assert_eq!(f("<|im_start|>{{ message.content }}"), None);
     }
@@ -385,7 +384,7 @@ mod tests {
     fn hermes_calls_with_surrounding_text_at_every_chunk_boundary() {
         let s = "Checking.<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n<tool_call>{\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}</tool_call> done";
         assert_eq!(
-            same_at_every_split(ToolFormat::Hermes, s),
+            same_at_every_split(ToolFormat::ToolCallJson, s),
             vec![
                 text("Checking."),
                 weather(json!({"city": "Paris"})),
@@ -399,70 +398,70 @@ mod tests {
     #[test]
     fn hermes_malformed_and_unterminated() {
         let bad = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": </tool_call>";
-        assert_eq!(run(ToolFormat::Hermes, &[bad]), vec![text(bad)]);
+        assert_eq!(run(ToolFormat::ToolCallJson, &[bad]), vec![text(bad)]);
         // EOS right after a complete body still yields the call.
         let eos = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {}}";
-        assert_eq!(run(ToolFormat::Hermes, &[eos]), vec![weather(json!({}))]);
+        assert_eq!(run(ToolFormat::ToolCallJson, &[eos]), vec![weather(json!({}))]);
         // A held partial opener is plain text when the reply ends.
         assert_eq!(
-            run(ToolFormat::Hermes, &["a <tool_"]),
+            run(ToolFormat::ToolCallJson, &["a <tool_"]),
             vec![text("a <tool_")]
         );
-        assert_eq!(run(ToolFormat::Hermes, &["x < y"]), vec![text("x < y")]);
+        assert_eq!(run(ToolFormat::ToolCallJson, &["x < y"]), vec![text("x < y")]);
     }
 
     #[test]
     fn qwen_xml_types_parameters_by_schema() {
         let s = "Sure.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nNew York\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
         assert_eq!(
-            same_at_every_split(ToolFormat::QwenXml, s),
+            same_at_every_split(ToolFormat::XmlFunction, s),
             vec![
                 text("Sure.\n"),
                 weather(json!({"city": "New York", "days": 3}))
             ]
         );
         let no_fn = "<tool_call>\n<parameter=city>x</parameter></tool_call>";
-        assert_eq!(run(ToolFormat::QwenXml, &[no_fn]), vec![text(no_fn)]);
+        assert_eq!(run(ToolFormat::XmlFunction, &[no_fn]), vec![text(no_fn)]);
     }
 
     #[test]
     fn llama_json_reply_and_plain_text() {
         let s = " {\"name\": \"get_weather\", \"parameters\": {\"city\": \"Rome\"}}; {\"name\": \"get_weather\", \"parameters\": {\"city\": \"Bern\"}}";
         assert_eq!(
-            same_at_every_split(ToolFormat::Llama, s),
+            same_at_every_split(ToolFormat::HeaderJson, s),
             vec![
                 weather(json!({"city": "Rome"})),
                 weather(json!({"city": "Bern"}))
             ]
         );
         let tagged = "<|python_tag|>{\"name\": \"get_weather\", \"parameters\": {}}";
-        assert_eq!(run(ToolFormat::Llama, &[tagged]), vec![weather(json!({}))]);
+        assert_eq!(run(ToolFormat::HeaderJson, &[tagged]), vec![weather(json!({}))]);
         // JSON that is not a call, and calls not opening the reply, stay text.
         // A JSON answer with a "name" field is not a call to a tool named after its value.
         let bob = "{\"name\": \"Bob\", \"age\": 3}";
-        assert_eq!(run(ToolFormat::Llama, &[bob]), vec![text(bob)]);
+        assert_eq!(run(ToolFormat::HeaderJson, &[bob]), vec![text(bob)]);
         let no_args = "{\"name\": \"get_weather\"}";
-        assert_eq!(run(ToolFormat::Llama, &[no_args]), vec![text(no_args)]);
+        assert_eq!(run(ToolFormat::HeaderJson, &[no_args]), vec![text(no_args)]);
         let unknown = "[TOOL_CALLS][{\"name\": \"rm_rf\", \"arguments\": {}}]";
-        assert_eq!(run(ToolFormat::Mistral, &[unknown]), vec![text(unknown)]);
+        assert_eq!(run(ToolFormat::BracketJson, &[unknown]), vec![text(unknown)]);
         assert_eq!(
-            run(ToolFormat::Llama, &["{\"a\": 1}"]),
+            run(ToolFormat::HeaderJson, &["{\"a\": 1}"]),
             vec![text("{\"a\": 1}")]
         );
         let late = "Use {\"name\": \"get_weather\", \"parameters\": {}}";
-        assert_eq!(run(ToolFormat::Llama, &[late]), vec![text(late)]);
+        assert_eq!(run(ToolFormat::HeaderJson, &[late]), vec![text(late)]);
     }
 
     #[test]
     fn mistral_array_and_v11_syntax() {
         let v3 = "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Lyon\"}}]";
         assert_eq!(
-            same_at_every_split(ToolFormat::Mistral, v3),
+            same_at_every_split(ToolFormat::BracketJson, v3),
             vec![weather(json!({"city": "Lyon"}))]
         );
         let v11 = "Let me check.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Nice\"}[TOOL_CALLS]get_weather[CALL_ID]abc123def[ARGS]{}";
         assert_eq!(
-            run(ToolFormat::Mistral, &[v11]),
+            run(ToolFormat::BracketJson, &[v11]),
             vec![
                 text("Let me check."),
                 weather(json!({"city": "Nice"})),
@@ -470,18 +469,18 @@ mod tests {
             ]
         );
         let bad = "[TOOL_CALLS][{\"name\": \"get_weather\"";
-        assert_eq!(run(ToolFormat::Mistral, &[bad]), vec![text(bad)]);
+        assert_eq!(run(ToolFormat::BracketJson, &[bad]), vec![text(bad)]);
     }
 
     #[test]
     fn forced_prefix_parses_with_the_generated_rest() {
         for (format, rest) in [
-            (ToolFormat::Hermes, "{\"city\": \"Paris\"}}\n</tool_call>"),
+            (ToolFormat::ToolCallJson, "{\"city\": \"Paris\"}}\n</tool_call>"),
             (
-                ToolFormat::QwenXml,
+                ToolFormat::XmlFunction,
                 "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
             ),
-            (ToolFormat::Llama, "{\"city\": \"Paris\"}}"),
+            (ToolFormat::HeaderJson, "{\"city\": \"Paris\"}}"),
         ] {
             let prefix = format.forced_prefix(Some("get_weather"));
             assert_eq!(

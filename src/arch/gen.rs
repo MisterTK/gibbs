@@ -94,7 +94,7 @@ pub fn generate(name: &str, args: &Value) -> Result<Gen, String> {
         "axis_freqs" => axis_freqs(a),
         "sinusoid_table" => sinusoid_table(a),
         // `sinusoid_table{kind: tensor2tensor, rows: left+1, reverse: true}`; args `left`, `dim`
-        // (`gemma4/audio.rs` relative positions `left..=0`).
+        // (relative positions `left..=0`).
         "rel_pos_sinusoid" => sinusoid_table(&Args(&serde_json::json!({
             "kind": "tensor2tensor", "rows": a.u("left").map_err(|e| format!("generator `{name}`: {e}"))? + 1,
             "dim": a.0.get("dim"), "reverse": true}))),
@@ -142,19 +142,15 @@ pub fn generate(name: &str, args: &Value) -> Result<Gen, String> {
 /// - `ntk_alpha`: `default` with `theta * alpha^(dim / (dim - 2))` (`alpha`; `dim` = head dim).
 /// - `proportional`: the first `floor(partial_rotary_factor * dim / 2)` pairs get
 ///   `1 / theta^(2i/dim) / factor`, the rest 0 (`partial_rotary_factor`, `factor`, both default 1).
-/// - `wavelen_band` (transformers `llama3` rope_type): `factor`, `low_freq_factor`,
-///   `high_freq_factor`, `original_max_position_embeddings`
-///   (each default 1).
-/// - `yarn`: `factor`, `original_max_position_embeddings`, `beta_fast` (32), `beta_slow` (1),
-///   `truncate` (true). Zero betas are NOT mapped to the defaults (Gemma3's loader does that; its
-///   spec must). The cos/sin scale comes from `yarn_attention_factor`.
-///
-/// `tile` (default 1): the table repeated that many times, F32 `[tile * dim / 2]` (a 2D ViT
-/// rotary rotates by grid row with one copy and by grid column with the next).
-///
-/// Sources: `gemma3_text.rs` `inv_freq`, `classifier/modernbert.rs` `rope_inv_freq`,
-/// `gemma4/text.rs` `inv_freq`, `qwen3_5/text.rs` (default / HunYuan alpha),
-/// `qwen3_5/draft.rs` (wavelen_band), `graph_lm.rs` (f32 default).
+    /// - `wavelen_band` (wavelength-band RoPE scaling): `factor`, `low_freq_factor`,
+    ///   `high_freq_factor`, `original_max_position_embeddings`
+    ///   (each default 1).
+    /// - `yarn`: `factor`, `original_max_position_embeddings`, `beta_fast` (32), `beta_slow` (1),
+    ///   `truncate` (true). Zero betas are NOT mapped to the defaults (the family spec maps them).
+    ///   The cos/sin scale comes from `yarn_attention_factor`.
+    ///
+    /// `tile` (default 1): the table repeated that many times, F32 `[tile * dim / 2]` (a 2D ViT
+    /// rotary rotates by grid row with one copy and by grid column with the next).
 fn rope_inv_freq(a: &Args) -> Result<Gen, String> {
     let (dim, theta) = (a.u("dim")?, a.f("theta")?);
     let half = dim / 2;
@@ -257,7 +253,6 @@ fn rope_inv_freq(a: &Args) -> Result<Gen, String> {
 
 /// `yarn_attention_factor`: YaRN cos/sin scale, F32 `[1]`. Args: `factor`, optional
 /// `attention_factor` (wins), `mscale` + `mscale_all_dim` (used when both are non-zero).
-/// Source: `gemma3_text.rs` `inv_freq` / `modernbert.rs` `rope_inv_freq` (second result).
 fn yarn_attention_factor(a: &Args) -> Result<Gen, String> {
     let factor = a.f("factor")?;
     let ms = |m: f64| if factor <= 1.0 { 1.0 } else { 0.1 * m * factor.ln() + 1.0 };
@@ -273,8 +268,8 @@ fn yarn_attention_factor(a: &Args) -> Result<Gen, String> {
 /// `axis_freqs`: per-pair frequencies of a multi-axis RoPE, F32 `[sum(dims) / 2]`: axis `a`
 /// contributes `theta^(-2i/dims[a])`, or zeros (identity rotation) when `a` is in
 /// `identity_axes` (default `[]`). Args: `dims` (each even), `theta`, `identity_axes`.
-/// FLUX.2's 4-axis table is `dims: [t, h, w, l], identity_axes: [0]` with MRope sections
-/// `[(t+h)/2, w/2, l/2]`. Sources: `dit_graph.rs` `axis_freqs`, `flux/graph_program.rs` `rope_tables`.
+/// A 4-axis table uses `dims: [t, h, w, l], identity_axes: [0]` with MRope sections
+/// `[(t+h)/2, w/2, l/2]`.
 fn axis_freqs(a: &Args) -> Result<Gen, String> {
     let (dims, theta, id) = (a.us("dims")?, a.f("theta")?, a.us_or("identity_axes")?);
     let mut f = Vec::new();
@@ -291,9 +286,8 @@ fn axis_freqs(a: &Args) -> Result<Gen, String> {
 /// (row r holds position `rows-1-r`; default false), `start` (added to every row's position;
 /// default 0: fairseq tables read from position `2` drop the offset rows).
 /// - `standard`: angle `p / 10000^(2i/dim)` (`seq2seq.rs` `sinusoidal_marian`).
-/// - `tensor2tensor`: angle `p * exp(-i ln(10000) / (dim/2 - 1))` (`seq2seq.rs`
-///   `sinusoidal_fairseq` with `zero_row: 1`; `gemma4/audio.rs` relative positions
-///   `left..=0` with `rows: left + 1, reverse: true`).
+/// - `tensor2tensor`: angle `p * exp(-i ln(10000) / (dim/2 - 1))` (with `zero_row: 1` for
+///   fairseq tables; relative positions `left..=0` use `rows: left + 1, reverse: true`).
 fn sinusoid_table(a: &Args) -> Result<Gen, String> {
     let (rows, d) = (a.u("rows")?, a.u("dim")?);
     let zero = a.get("zero_row").map(|_| a.u("zero_row")).transpose()?;
@@ -323,8 +317,8 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
 }
 
 /// One timestep feature vector (diffusers `get_timestep_embedding`), `dim` long (odd: last 0).
-/// Shaped like `dit.rs` / `flux.rs` (collect angles, then map cos / sin): codegen of the f32
-/// `exp`/`cos`/`sin` calls depends on loop shape and can differ by an ulp from other shapes.
+/// Collects angles, then maps cos / sin: codegen of the f32 `exp`/`cos`/`sin` calls depends on
+/// loop shape and can differ by an ulp from other shapes.
 fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_period: f64, f32p: bool) -> Vec<f32> {
     let half = dim / 2;
     let (cos, sin): (Vec<f32>, Vec<f32>) = if f32p {
@@ -373,7 +367,6 @@ fn timestep_embedding(a: &Args) -> Result<Gen, String> {
 /// `modulation_index_rows`: input rows of a distilled modulation-table MLP, F32
 /// `[rows, sum(dims)]`: row i = `[emb(t*scale, dims[0]), emb(0, dims[1]), emb(i*scale, dims[2])]`,
 /// `emb` = f64 cos-first `timestep_embedding`. Args: `t`, `rows`, `dims` (3), `scale`.
-/// Source: `flux/graph_program.rs` `Approx::input_rows` (`dims: [16, 16, 32], scale: 1000`).
 fn modulation_index_rows(a: &Args) -> Result<Gen, String> {
     let (t, rows, scale, dims) = (a.f("t")?, a.u("rows")?, a.f("scale")?, a.us("dims")?);
     let [dt, dg, di] = dims[..] else { return Err(bad("dims", format!("{dims:?}"))) };
@@ -389,10 +382,9 @@ fn modulation_index_rows(a: &Args) -> Result<Gen, String> {
 }
 
 /// `text_zero_grid3`: U32 `[(text_len + grid_h*grid_w) * 3]`: text tokens then the row-major
-/// grid. `text_axis: false` (default): text `(0,0,0)`, grid `(0,row,col)` (FLUX.1, Krea2);
-/// `text_axis: true`: the FLUX.2 4-axis ids `(t,h,w,l)` read on axes `(h,w,l)`: text `(0,0,l)`,
-/// grid `(row,col,0)`. Sources: `flux.rs` `position_ids` + `dit_graph::positions`,
-/// `krea2/graph_program.rs` `forward_gpu`.
+/// grid. `text_axis: false` (default): text `(0,0,0)`, grid `(0,row,col)`;
+/// `text_axis: true`: 4-axis ids `(t,h,w,l)` read on axes `(h,w,l)`: text `(0,0,l)`,
+/// grid `(row,col,0)`.
 fn text_zero_grid3(a: &Args) -> Result<Gen, String> {
     let (nt, h, w, axis) = (a.u("text_len")?, a.u("grid_h")?, a.u("grid_w")?, a.b_or("text_axis", false)?);
     let mut v = Vec::with_capacity(3 * (nt + h * w));
@@ -470,8 +462,6 @@ fn text_then_centered_grid(a: &Args) -> Result<Gen, String> {
 /// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32),
 /// `pair_sign` (false; true negates the even entry of every pair: `[-sin, +sin]` for a
 /// `x*cos + swap(x)*sin` rotation in graph).
-///
-/// Source: `ltx.rs` `Rope::new`.
 fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
     let (f, h, w, d) = (a.u("frames")?, a.u("grid_h")?, a.u("grid_w")?, a.u("dim")?);
     let fps = a.f("fps")?;
@@ -523,8 +513,7 @@ fn centered_crop_rows(a: &Args) -> Result<Gen, String> {
 
 /// `grid_xy`: U32 `[grid_h*grid_w*repeat]`: per row-major patch (each repeated `repeat` times,
 /// default 1, e.g. once per head) its column (`axis: 0`) or row (`axis: 1`). `repeat: 1` gives
-/// the gather rows of per-axis learned position tables. Source: `gemma4/vision.rs`
-/// `pos_rows` (table rows `gx` / `gy`) and `forward_gpu` `rope_pos`.
+/// the gather rows of per-axis learned position tables.
 fn grid_xy(a: &Args) -> Result<Gen, String> {
     let (h, w, axis, rep) = (a.u("grid_h")?, a.u("grid_w")?, a.u("axis")?, a.u_or("repeat", 1)?);
     if axis > 1 || rep == 0 {
@@ -536,7 +525,7 @@ fn grid_xy(a: &Args) -> Result<Gen, String> {
     u32s(vec![v.len()], v)
 }
 
-/// Patch coordinates in merge-block order (`qwen3_5/vision.rs` `prepare`).
+/// Patch coordinates in merge-block order.
 fn merge_coords(a: &Args) -> Result<(usize, usize, Vec<(usize, usize)>), String> {
     let (gh, gw, m) = (a.u("grid_h")?, a.u("grid_w")?, a.u("merge")?);
     if m == 0 || gh % m != 0 || gw % m != 0 {
@@ -559,7 +548,6 @@ fn merge_coords(a: &Args) -> Result<(usize, usize, Vec<(usize, usize)>), String>
 /// learned position grid onto the `grid_h x grid_w` patch grid, patches in `merge`-block order:
 /// `[n]` U32 table rows (`output: "index"`) or F32 weights (`output: "weight"`).
 /// `corner`: 0 = (lo,lo), 1 = (lo,hi), 2 = (hi,lo), 3 = (hi,hi) as (row, col).
-/// Source: `qwen3_5/vision.rs` `pos_taps` + `encode_gpu`.
 fn bilinear_pos_taps(a: &Args) -> Result<Gen, String> {
     let (gh, gw, coords) = merge_coords(a)?;
     let (side, corner) = (a.u("side")?, a.u("corner")?);
@@ -590,7 +578,7 @@ fn bilinear_pos_taps(a: &Args) -> Result<Gen, String> {
 }
 
 /// `vision_rope_positions`: U32 `[grid_h*grid_w*3]` `(row, col, 0)` per patch in `merge`-block
-/// order. Source: `qwen3_5/vision.rs` `encode_gpu` (`rpos`).
+/// order.
 fn vision_rope_positions(a: &Args) -> Result<Gen, String> {
     let (_, _, coords) = merge_coords(a)?;
     let v: Vec<u32> = coords.iter().flat_map(|&(r, c)| [r as u32, c as u32, 0]).collect();
@@ -598,7 +586,7 @@ fn vision_rope_positions(a: &Args) -> Result<Gen, String> {
 }
 
 /// `dft_matrix`: periodic-Hann-windowed real DFT, F32 `[2*bins, frame_length]`
-/// (`bins = fft_length/2 + 1`): cos rows then sin rows. Source: `gemma4/audio.rs` `Features::new`.
+/// (`bins = fft_length/2 + 1`): cos rows then sin rows.
 fn dft_matrix(a: &Args) -> Result<Gen, String> {
     let (frame, fft) = (a.u("frame_length")?, a.u("fft_length")?);
     let bins = fft / 2 + 1;
@@ -617,7 +605,7 @@ fn dft_matrix(a: &Args) -> Result<Gen, String> {
 
 /// `mel_filters_htk`: unnormalised HTK triangular mel filters, F32 `[mel_bins, fft_length/2+1]`.
 /// Args: `fft_length`, `mel_bins`, `sampling_rate` (integer Hz), `min_frequency` (0),
-/// `max_frequency` (8000). Source: `gemma4/audio.rs` `Features::new`.
+/// `max_frequency` (8000).
 fn mel_filters_htk(a: &Args) -> Result<Gen, String> {
     let (fft, mel, rate) = (a.u("fft_length")?, a.u("mel_bins")?, a.u("sampling_rate")?);
     let (fmin, fmax) = (a.f_or("min_frequency", 0.0)?, a.f_or("max_frequency", 8000.0)?);
@@ -646,7 +634,7 @@ fn local_pairs(t: usize, left: usize, valid: usize) -> impl Iterator<Item = (usi
 }
 
 /// `local_window_bias`: F32 `[t, t]` additive bias, 0 on local pairs, else `masked` (-1e30).
-/// Args: `t`, `left`, `valid` (valid frames form a prefix). Source: `gemma4/audio.rs` `encode_gpu`.
+/// Args: `t`, `left`, `valid` (valid frames form a prefix).
 fn local_window_bias(a: &Args) -> Result<Gen, String> {
     let (t, left, valid) = (a.u("t")?, a.u("left")?, a.u("valid")?);
     let mut bias = vec![a.f_or("masked", -1e30)? as f32; t * t];
@@ -658,7 +646,7 @@ fn local_window_bias(a: &Args) -> Result<Gen, String> {
 
 /// `rel_score_index`: U32 `[heads, t, t]` gather index into the flattened `[heads, t, left+1]`
 /// relative score table: local pair `(i, j)` of head h reads `(h*t + i)*(left+1) + left-(i-j)`,
-/// other pairs 0. Args as `local_window_bias` plus `heads`. Source: `gemma4/audio.rs` `encode_gpu`.
+/// other pairs 0. Args as `local_window_bias` plus `heads`.
 fn rel_score_index(a: &Args) -> Result<Gen, String> {
     let (nh, t, left, valid) = (a.u("heads")?, a.u("t")?, a.u("left")?, a.u("valid")?);
     let mut idx = vec![0u32; nh * t * t];
@@ -671,7 +659,7 @@ fn rel_score_index(a: &Args) -> Result<Gen, String> {
 }
 
 /// `validity_mask`: F32 `[rows, cols]`, 1 on the first `valid_rows` rows, else 0.
-/// Source: `gemma4/audio.rs` `encode_gpu` (`mask_plane`; the frame mask is a prefix).
+/// First `valid_rows` rows are 1, else 0.
 fn validity_mask(a: &Args) -> Result<Gen, String> {
     let (rows, cols, valid) = (a.u("rows")?, a.u("cols")?, a.u("valid_rows")?);
     let v = (0..rows * cols).map(|i| (i / cols.max(1) < valid) as u8 as f32).collect();

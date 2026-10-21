@@ -258,7 +258,7 @@ impl SpmModel {
     }
 }
 
-/// A SentencePiece model as a [`Tokenizer`] whose ids are spm's own (e.g. T5's `spiece.model`).
+/// A SentencePiece model as a [`Tokenizer`] whose ids are spm's own (e.g. `spiece.model`).
 /// `encode` adds no BOS/EOS; control and unknown pieces count as special.
 pub fn load(path: &Path) -> Result<Tokenizer, String> {
     let m = SpmModel::open(path)?;

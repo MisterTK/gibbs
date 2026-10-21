@@ -7,6 +7,7 @@
   family: "qwen3_5",
   match: {
     hf_model_type: ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"],
+    hf_architectures: ["Qwen3_5ForSequenceClassification", "Qwen3_5TextForSequenceClassification"],
     gguf_arch: ["qwen35", "qwen35moe"],
   },
   pipeline: "causal_lm",
@@ -276,6 +277,12 @@
   },
   runtime: {
     prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"],
+    ninfer: {
+      architecture: "Qwen3_5ForCausalLM",
+      model_type: "qwen3_5_text",
+      refused_architectures: ["Qwen3_5MoeForCausalLM", "Qwen4ExpForCausalLM"],
+      hub_moe_keywords: ["a3b", "flash-next", "-moe", "qwen4"],
+    },
     drafter: {kind: "mtp", component: "mtp", label: "'MTP'", taps: "[layers - 1]",
               when: "has('mtp.fc.weight') && first(tc.mtp_num_hidden_layers, 0) == 1 && tc.mtp_use_dedicated_embeddings != true"},
     // `Qwen2VLImageProcessor`; placeholder expanded to the merged grid with get_rope_index's

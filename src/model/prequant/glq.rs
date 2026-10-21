@@ -94,7 +94,7 @@ pub fn prepare(m: &mut ModelManifest, config: Option<&Path>) -> Result<(), Strin
         .zip(hd)
         .map(|(a, b)| a * b);
     let inter = get("intermediate_size");
-    // Gemma-4 per-layer embeddings: `[vocab, num_layers · hidden_size_per_layer_input]`.
+    // Per-layer embeddings: `[vocab, num_layers · hidden_size_per_layer_input]`.
     let ple = get("hidden_size_per_layer_input")
         .zip(get("num_hidden_layers"))
         .map(|(a, b)| a * b);
@@ -155,7 +155,7 @@ pub fn dequantize(m: &ModelManifest, data: &[u8], name: &str) -> Result<Option<V
 }
 
 /// [`dequantize`] straight to bf16, for the native loaders' owned [`crate::model::weights::Mat`]s
-/// (a Gemma-4 per-layer embedding table is 5.6 GB as bf16, 11 GB as f32).
+/// (a per-layer embedding table can be 5.6 GB as bf16, 11 GB as f32).
 pub fn dequantize_bf16(
     m: &ModelManifest,
     data: &[u8],
@@ -188,7 +188,7 @@ fn decode<T: Copy + Default + Send + Sync>(
     };
     let sv = get("SV")?.ok_or_else(|| err("missing SV".into()))?;
     let wscale = get("Wscale")?.ok_or_else(|| err("missing Wscale".into()))?;
-    // E8RHTEmbedding (Gemma-4 PLE): per-row Wscale and a right-side-only RHT (`SU` unused).
+    // E8RHTEmbedding (PLE): per-row Wscale and a right-side-only RHT (`SU` unused).
     let emb = wscale.len() > 1;
     let su = if emb {
         Vec::new()

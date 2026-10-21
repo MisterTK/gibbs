@@ -1,6 +1,6 @@
 //! Legacy GGML container format loader (`ggml`, `ggmf`, `ggjt`).
 //!
-//! Parses original llama.cpp binary formats with magic numbers `0x67676d6c` (`ggml`),
+//! Parses original GGML binary formats with magic numbers `0x67676d6c` (`ggml`),
 //! `0x67676d66` (`ggmf`), and `0x67676a74` (`ggjt` v1/v2/v3).
 
 use crate::model::loaders::{TensorMetadata, WeightReader};
@@ -47,8 +47,12 @@ pub fn parse_ggml(data: &[u8]) -> Result<ModelManifest, String> {
     let n_rot = read_i32_le(data, &mut cursor)?;
     let ftype = read_i32_le(data, &mut cursor)?;
 
+    let arch = crate::arch::registry()
+        .ok()
+        .and_then(|r| r.fallback_gguf_arch())
+        .unwrap_or_default();
     let mut metadata = HashMap::new();
-    metadata.insert("general.architecture".into(), "llama".into());
+    metadata.insert("general.architecture".into(), arch.clone());
     metadata.insert("format".into(), "ggml".into());
     metadata.insert("version".into(), version.to_string());
     metadata.insert("n_vocab".into(), n_vocab.to_string());
@@ -60,10 +64,10 @@ pub fn parse_ggml(data: &[u8]) -> Result<ModelManifest, String> {
     metadata.insert("ftype".into(), ftype.to_string());
 
     // Map to the GGUF architecture keys the family specs read
-    metadata.insert("llama.embedding_length".into(), n_embd.to_string());
-    metadata.insert("llama.block_count".into(), n_layer.to_string());
-    metadata.insert("llama.attention.head_count".into(), n_head.to_string());
-    metadata.insert("llama.rope.dimension_count".into(), n_rot.to_string());
+    metadata.insert(format!("{arch}.embedding_length"), n_embd.to_string());
+    metadata.insert(format!("{arch}.block_count"), n_layer.to_string());
+    metadata.insert(format!("{arch}.attention.head_count"), n_head.to_string());
+    metadata.insert(format!("{arch}.rope.dimension_count"), n_rot.to_string());
 
     if n_vocab < 0 || n_vocab > 1_000_000 {
         return Err(format!("Unreasonable vocab size: {n_vocab}"));
@@ -162,7 +166,7 @@ pub fn parse_ggml(data: &[u8]) -> Result<ModelManifest, String> {
         tensors,
         metadata,
         shard_count: 1,
-        detected_architecture: "llama".into(),
+        detected_architecture: arch,
     })
 }
 

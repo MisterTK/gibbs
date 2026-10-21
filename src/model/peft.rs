@@ -172,8 +172,8 @@ fn prepare(
         maps.push(map);
     }
     if task == "SEQ_CLS" {
-        // A classifier adapter names its base under the task model (`bert.encoder...`); a bare
-        // base (`BertModel`) lacks that prefix: drop it where only the stripped name exists.
+        // A classifier adapter names its base under the task model (`<family>.encoder...`); a bare
+        // base lacks that prefix: drop it where only the stripped name exists.
         let names: BTreeSet<String> = entries.iter().map(|e| e.name.clone()).collect();
         let module = |r: &str| r.replace(".lora_A.weight", ".weight").replace(".lora_B.weight", ".weight");
         let renames: Vec<(String, String)> = am

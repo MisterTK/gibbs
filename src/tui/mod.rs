@@ -51,15 +51,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Offered in the picker even when not cached: the models verified to load and generate.
-const PINNED_MODELS: &[&str] = &[
-    "HuggingFaceTB/SmolLM2-135M-Instruct",
-    "unsloth/SmolLM2-135M-Instruct-GGUF",
-    "THUDM/glm-edge-1.5b-chat",
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    "roneneldan/TinyStories-Instruct-8M",
-    "EleutherAI/pythia-14m",
-    "sentence-transformers/all-MiniLM-L6-v2",
-];
+fn pinned_models() -> &'static [&'static str] {
+    static P: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        crate::arch::compat()["tui"]["pinned_models"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect()
+    });
+    &P
+}
 /// Redraw interval locked to 60 FPS tick (16.6 ms) without frame drops.
 const REFRESH: Duration = Duration::from_nanos(16_666_667);
 /// Poll interval while output streams or a model loads (60 FPS tick).
@@ -143,7 +145,7 @@ enum Route {
     Decide,
     Embed,
     Classify,
-    /// LTX-Video clip; `image`: the text starts with the first frame's path (`/i2v`).
+    /// Video clip; `image`: the text starts with the first frame's path (`/i2v`).
     Video {
         image: bool,
     },
@@ -156,10 +158,12 @@ fn route_for_model(model_id: &str) -> Route {
         Route::Image
     } else if m.contains("minilm") || m.contains("embed") || m.contains("sentence-transformers") {
         Route::Embed
-    } else if m.contains("bert")
-        || m.contains("jev")
-        || m.contains("system1")
-        || m.contains("decision")
+    } else if crate::arch::compat()["tui"]["decide_keywords"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|k| m.contains(k))
     {
         Route::Decide
     } else {
@@ -388,7 +392,7 @@ pub struct TuiApp {
     pub jev_model: crate::runtime::encoder::system1::System1Slot,
     /// Shared with the HTTP server; `Some` makes `/image` and bare prompts generate images.
     pub image_model: ImageSlot,
-    /// Set by loading an LTX-Video repo; `/video` and `/i2v` generate clips with it.
+    /// Set by loading a video repo; `/video` and `/i2v` generate clips with it.
     pub video: crate::model::video_repo::VideoSlot,
     /// Shared with the HTTP server; `Some` is the active model (a text classifier).
     pub classifier: ClassifierSlot,
@@ -465,7 +469,7 @@ impl TuiApp {
         let picker = Picker::new(
             hub.clone(),
             hf_token.clone(),
-            PINNED_MODELS,
+            pinned_models(),
             hw.total_memory_bytes,
         );
         let (updates_tx, updates_rx) = mpsc::channel();
@@ -559,7 +563,7 @@ impl TuiApp {
         self.picker = Picker::new(
             hub.clone(),
             hf_token.clone(),
-            PINNED_MODELS,
+            pinned_models(),
             self.hw.total_memory_bytes,
         );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1232,9 +1236,12 @@ impl TuiApp {
                 ))
             }
             Route::Video { image } => {
-                let model = self.video.read().clone().ok_or(
-                    "no video model loaded; press m and load a video repo, e.g. city96/LTX-Video-gguf",
-                )?;
+                let model = self.video.read().clone().ok_or_else(|| {
+                    crate::arch::compat()["tui"]["no_video_message"]
+                        .as_str()
+                        .unwrap_or("no video model loaded")
+                        .to_string()
+                })?;
                 let dir = self.scratch_dir.path().to_path_buf();
                 Ok((
                     Box::new(move |idx, tx| {
@@ -1666,7 +1673,7 @@ impl TuiApp {
     /// Removes `<cache>/models--<org>--<repo>` of `id` (never the active or loading model).
     fn delete_cached(&mut self, id: &str) {
         // Ids may name one file (`org/repo/x-Q4_K_M.gguf`); the cache dir is per repo. Hub ids
-        // and the default macOS filesystem are case-insensitive, so `Qwen/X` is `qwen/x`.
+        // and the default macOS filesystem are case-insensitive (`Org/X` is `org/x`).
         // Deleting a bare `org/repo` removes every revision, so `org/repo@<rev>` counts as it.
         let same_repo = |other: &str| {
             let repo = split_weight_file(other).0;

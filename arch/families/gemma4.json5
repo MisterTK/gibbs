@@ -625,6 +625,8 @@
     },
   },
   runtime: {prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+    mmproj: true,
+    gguf_moe_blocker: "Gemma 4 MoE GGUF (26B-A4B: router and expert blocks) is not implemented; the dense E2B, E4B, 12B and 31B GGUFs load",
     // gevva cross-encoders (`tokenize_nli_pair_safe`): `<bos>Premise: {text}\nHypothesis: {pair}\nPrediction:`.
     seqcls: {head: "score", pooling: "last_nonpad",
       pair: {bos: "tc.bos_token_id", parts: ["Premise: ", "{text}", "\nHypothesis: ", "{pair}", "\nPrediction:"],

@@ -206,7 +206,7 @@ pub fn architecture(path: &Path) -> Option<String> {
     manifest.metadata.get("general.architecture").cloned()
 }
 
-/// A GGUF checkpoint's bytes: the mapped file, or a llama.cpp split set read into one buffer.
+/// A GGUF checkpoint's bytes: the mapped file, or a split set read into one buffer.
 pub enum GgufData {
     Map(memmap2::Mmap),
     Buf(Vec<u8>),
@@ -235,7 +235,7 @@ pub fn shard_paths(path: &Path) -> Option<Vec<PathBuf>> {
     )
 }
 
-/// Opens a GGUF checkpoint as one weight set. A single file is mapped; a llama.cpp split set
+/// Opens a GGUF checkpoint as one weight set. A single file is mapped; a split set
 /// (`gguf-split`: first shard carries the KV metadata, tensors are spread over the shards, each
 /// shard's `split.no` / `split.count` / `split.tensors.count` KVs say where it sits) is read into
 /// one contiguous buffer with every tensor offset shifted past the shards before it, so callers
