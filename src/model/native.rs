@@ -154,7 +154,7 @@ pub trait NativeLm: Send + Sync {
 
 /// `model_type`s [`load_native`] implements. The hub picker lets their repos load whatever their
 /// pipeline tag (`image-text-to-text`, `any-to-any`, ...).
-// legacy: until Phases 5 (qwen), 6 (gemma), 4 (idefics3) and 8 (t5) give these families specs.
+// legacy: until Phases 5 (qwen), 6 (gemma) and 4 (idefics3) give these families specs.
 pub const NATIVE_MODEL_TYPES: &[&str] = &[
     "qwen3_5",
     "qwen3_5_text",
@@ -169,16 +169,13 @@ pub const NATIVE_MODEL_TYPES: &[&str] = &[
     "smolvlm",
     "qwen3",
     "hunyuan_v1_dense",
-    "t5",
-    "mt5",
-    "umt5",
 ];
 
 /// [`NATIVE_MODEL_TYPES`] whose loaders also read GGUF weights: llama.cpp `qwen3` /
 /// `hunyuan-dense` / `qwen35` / `qwen35moe` / `qwen4exp` files ([`crate::model::qwen3_5::load_gguf`]),
-/// `gemma4` files with their `mmproj` ([`crate::model::gemma4::load_gguf`]) and candle-style T5
-/// GGUFs ([`crate::model::t5::load`]). The hub picker refuses GGUF repos of the other types.
-// legacy: until Phases 5, 6 and 8 (the same families' specs).
+/// and `gemma4` files with their `mmproj` ([`crate::model::gemma4::load_gguf`]). The hub picker
+/// refuses GGUF repos of the other types.
+// legacy: until Phases 5 and 6 (the same families' specs).
 pub const NATIVE_GGUF_TYPES: &[&str] = &[
     "gemma4",
     "gemma4_unified",
@@ -190,9 +187,6 @@ pub const NATIVE_GGUF_TYPES: &[&str] = &[
     "qwen4_exp",
     "qwen4_exp_text",
     "hunyuan_v1_dense",
-    "t5",
-    "mt5",
-    "umt5",
 ];
 
 /// Loads `artifacts` as a [`NativeLm`] when its `config.json` names an architecture implemented
@@ -233,16 +227,7 @@ fn load_native_once(
     }
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(artifacts.config_path.as_ref()?).ok()?).ok()?;
-    if crate::model::seq2seq::ARCHITECTURES
-        .contains(&cfg["architectures"][0].as_str().unwrap_or(""))
-    {
-        return Some(crate::model::seq2seq::load(artifacts, &cfg, mode));
-    }
-    // google/umt5-* configs name only the architecture.
-    match cfg["model_type"]
-        .as_str()
-        .or(cfg["architectures"][0].as_str())?
-    {
+    match cfg["model_type"].as_str()? {
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen4_exp"
         | "qwen4_exp_text" | "qwen3_vl" => Some(crate::model::qwen3_5::load(artifacts, &cfg, mode)),
         "qwen3" | "hunyuan_v1_dense" => {
@@ -250,9 +235,6 @@ fn load_native_once(
         }
         "gemma4" | "gemma4_unified" => Some(crate::model::gemma4::load(artifacts, &cfg, mode)),
         "idefics3" | "smolvlm" => Some(crate::model::idefics3::load(artifacts, &cfg, mode)),
-        "t5" | "mt5" | "umt5" | "UMT5ForConditionalGeneration" => {
-            Some(crate::model::t5::load(artifacts, &cfg, mode))
-        }
         t => crate::arch::unsupported(t).map(|why| Err(format!("{t}: {why}"))),
     }
 }

@@ -283,7 +283,8 @@ fn axis_freqs(a: &Args) -> Result<Gen, String> {
 
 /// `sinusoid_table`: sinusoid position table, F32 `[rows, dim]`, `[sin | cos]` halves.
 /// Args: `rows`, `dim`, `kind`, optional `zero_row` (left all-zero: a padding id), `reverse`
-/// (row r holds position `rows-1-r`; default false).
+/// (row r holds position `rows-1-r`; default false), `start` (added to every row's position;
+/// default 0: fairseq tables read from position `2` drop the offset rows).
 /// - `standard`: angle `p / 10000^(2i/dim)` (`seq2seq.rs` `sinusoidal_marian`).
 /// - `tensor2tensor`: angle `p * exp(-i ln(10000) / (dim/2 - 1))` (`seq2seq.rs`
 ///   `sinusoidal_fairseq` with `zero_row: 1`; `gemma4/audio.rs` relative positions
@@ -292,6 +293,7 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
     let (rows, d) = (a.u("rows")?, a.u("dim")?);
     let zero = a.get("zero_row").map(|_| a.u("zero_row")).transpose()?;
     let reverse = a.b_or("reverse", false)?;
+    let start = a.get("start").map(|_| a.u("start")).transpose()?.unwrap_or(0);
     let half = d / 2;
     let kind = a.s_or("kind", "standard")?;
     let step = 10000f64.ln() / (half as f64 - 1.0);
@@ -305,7 +307,7 @@ fn sinusoid_table(a: &Args) -> Result<Gen, String> {
         if zero == Some(r) {
             continue;
         }
-        let p = if reverse { rows - 1 - r } else { r };
+        let p = if reverse { rows - 1 - r } else { r } + start;
         for i in 0..half {
             let x = angle(p, i);
             t[r * d + i] = x.sin() as f32;
@@ -697,7 +699,7 @@ fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
 }
 
 /// `causal_key_mask`: F32 `[cap]`, 0 for keys `j <= pos`, else `masked` (default -inf).
-/// Source: `encdec_gpu.rs` `step`.
+/// Source: the former `encdec_gpu.rs` `step`.
 fn causal_key_mask(a: &Args) -> Result<Gen, String> {
     let (cap, pos) = (a.u("cap")?, a.u("pos")?);
     let m = a.f_or("masked", f64::NEG_INFINITY)? as f32;
@@ -804,6 +806,9 @@ mod tests {
         // gemma4 audio relative positions left..=0 (left = 2): last row is position 0.
         let rel = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 3, "dim": 4, "reverse": true}));
         assert_eq!(rel[8..], [0.0, 0.0, 1.0, 1.0]);
+        let off = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 3, "dim": 4, "start": 2}));
+        let full = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": 5, "dim": 4}));
+        assert_eq!(off, full[8..]);
         assert_eq!(rel[0], 2f32.sin());
         assert_eq!(rel[1], (2.0 * (-(10000f64.ln())).exp()).sin() as f32);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4})), [1.0, 1.0, 0.0, 0.0]);
@@ -950,11 +955,31 @@ mod tests {
 
         #[test]
         fn sinusoid_tables_match_sources() {
+            // The former `seq2seq.rs` tables (Marian; fairseq with padding row 1).
+            fn table(rows: usize, d: usize, fairseq: bool) -> Vec<f32> {
+                let mut t = vec![0.0f32; rows * d];
+                let half = d / 2;
+                let step = (10000f64).ln() / (half as f64 - 1.0);
+                for p in 0..rows {
+                    if fairseq && p == 1 {
+                        continue;
+                    }
+                    for i in 0..half {
+                        let a = match fairseq {
+                            true => p as f64 * (-(i as f64) * step).exp(),
+                            false => p as f64 / 10000f64.powf(2.0 * i as f64 / d as f64),
+                        };
+                        t[p * d + i] = a.sin() as f32;
+                        t[p * d + half + i] = a.cos() as f32;
+                    }
+                }
+                t
+            }
             for (rows, d) in [(10, 8), (33, 64)] {
                 let m = f("sinusoid_table", json!({"kind": "standard", "rows": rows, "dim": d}));
-                assert_eq!(bits(&m), bits(&model::seq2seq::sinusoidal_marian(rows, d)));
+                assert_eq!(bits(&m), bits(&table(rows, d, false)));
                 let fs = f("sinusoid_table", json!({"kind": "tensor2tensor", "rows": rows, "dim": d, "zero_row": 1}));
-                assert_eq!(bits(&fs), bits(&model::seq2seq::sinusoidal_fairseq(rows, d)));
+                assert_eq!(bits(&fs), bits(&table(rows, d, true)));
             }
         }
 

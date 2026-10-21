@@ -1,19 +1,20 @@
-//! Encoder-decoder goldens: T5 (`model::t5`) and the BART-family seq2seq models
-//! (`model::seq2seq`: Marian, BART, M2M100, MBart-50), each loaded from an on-disk HF checkpoint
-//! (config.json, generation_config.json, model.safetensors and the family's own tokenizer files)
-//! through `load_native`.
+//! Encoder-decoder goldens: T5 (`arch/families/t5.json5`) and the BART-family seq2seq models
+//! (`bart.json5`, `marian.json5`, `m2m100.json5`: Marian, BART, M2M100, MBart-50), each loaded
+//! from an on-disk HF checkpoint (config.json, generation_config.json, model.safetensors and the
+//! family's own tokenizer files) through `runtime::encdec`. Recorded from the former `model::t5`
+//! / `model::seq2seq` implementations.
 
 use crate::util::*;
-use gibbs_engine::hardware::Device;
-use gibbs_engine::model::native::{load_native, NativeLm};
+use gibbs_engine::hardware::{Device, PlacementMode};
+use gibbs_engine::model::native::NativeLm;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
 fn load(dir: &Path, dev: Device) -> Arc<dyn NativeLm> {
     let a = artifacts(dir, "golden/encdec", "model.safetensors");
-    load_native(&a, dev)
-        .expect("config.json names a native architecture")
+    let reg = gibbs_engine::arch::registry().expect("registry");
+    gibbs_engine::runtime::encdec::load(&a, reg, None, PlacementMode::Pin(dev))
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
 }
 
