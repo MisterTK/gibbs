@@ -13,6 +13,17 @@ use gibbs_engine::runtime::diffusion::{unconsumed, Net};
 
 type Spec = Vec<(String, Vec<usize>)>;
 
+/// [`golden`] for cases whose JSON was written by an implementation since deleted (the legacy
+/// Z-Image / Qwen-Image / Krea 2 / Qwen VAE code): checked, never rewritten (`GIBBS_GOLDEN_WRITE`
+/// skips them).
+fn frozen(case: &str, tol: Tol, run: impl Fn(Device) -> Out) {
+    if writing() {
+        eprintln!("golden: {case} is frozen (its oracle implementation is deleted); not rewritten");
+        return;
+    }
+    golden(case, tol, run);
+}
+
 fn sp(s: &mut Spec, name: impl Into<String>, shape: &[usize]) {
     s.push((name.into(), shape.to_vec()));
 }
@@ -205,7 +216,7 @@ fn zimage() {
     const IN: usize = 4;
     let dir = zimage_fixture("diffb_zimage");
     // runner: arch::testing::Runner, spec `zimage` component `denoiser`
-    golden("diffb_zimage", TOL, |dev| {
+    frozen("diffb_zimage", TOL, |dev| {
         let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev);
         let mut o = Out::default();
         for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
@@ -286,7 +297,7 @@ fn qwen_image_v1_run() {
     let lat = rnd(11, ph * pw * IN, 1.0);
     let txt = rnd(12, nt * TW, 1.0);
     // runner: arch::testing::Runner, spec `qwen_image` component `denoiser`
-    golden("diffb_qwen_image_v1", TOL, |dev| {
+    frozen("diffb_qwen_image_v1", TOL, |dev| {
         let mut o = Out::default();
         let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev);
         for sigma in [0.8f32, 0.15] {
@@ -381,7 +392,7 @@ fn qwen_image21_run() {
     let lat = rnd(11, h * w * IN, 1.0);
     let txt = rnd(12, nt * TW, 1.0);
     // runner: arch::testing::Runner, spec `qwen_image21` component `denoiser`
-    golden("diffb_qwen_image21", TOL, |dev| {
+    frozen("diffb_qwen_image21", TOL, |dev| {
         let mut o = Out::default();
         for (name, dir) in &dirs {
             let mut r = spec_runner(dir, "diffusion_pytorch_model.safetensors", None, dev);
@@ -460,7 +471,7 @@ fn krea2_run() {
     let (h, w) = (12usize, 12usize);
     let lat = rnd(7, 16 * h * w, 1.0);
     // runner: arch::testing::Runner, spec `krea2` components `fuse` + `denoiser` (2x2-packed latents)
-    golden("diffb_krea2", TOL, |dev| {
+    frozen("diffb_krea2", TOL, |dev| {
         let mut o = Out::default();
         let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), dev);
         // Taps stacked per token, layer-minor (the runtime's context layout).
@@ -607,7 +618,7 @@ fn qwen_vae_run() {
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(13, Z * h * w, 1.0), h * w, &mean, &std);
     // runner: arch::testing::Runner, spec `qwen_vae` component `decoder`
-    golden("diffb_qwen_vae", TOL, |dev| {
+    frozen("diffb_qwen_vae", TOL, |dev| {
         let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
         let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
         assert_consumed(&r);
@@ -687,7 +698,7 @@ fn qwen_vae21_run() {
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(14, zc * h * w, 1.0), h * w, &mean, &std);
     // runner: arch::testing::Runner, spec `qwen_vae21` component `decoder`
-    golden("diffb_qwen_vae21", TOL, |dev| {
+    frozen("diffb_qwen_vae21", TOL, |dev| {
         let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
         let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
         assert_consumed(&r);
@@ -1079,7 +1090,7 @@ fn qwen2_5_vl_text_run() {
     );
     let ids: Vec<u32> = (0..11).map(|i| (i * 7 + 3) % v as u32).collect();
     // runner: arch::testing::Runner, spec `qwen2_5_vl_text` component `text` (head `hidden`)
-    golden("diffb_qwen2_5_vl_text", TOL, |dev| {
+    frozen("diffb_qwen2_5_vl_text", TOL, |dev| {
         let mut r = spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev);
         let y = r.lm(&ids, 0, "hidden", "hidden", vec![]);
         assert_consumed(&r);
@@ -1267,7 +1278,7 @@ fn pipeline_golden(case: &str, dir: &std::path::Path, req: gibbs_engine::runtime
     let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
     let art = artifacts(dir, &format!("golden/{case}"), "none");
     let (w, h) = (req.width.unwrap(), req.height.unwrap());
-    golden(case, Tol { rel: 2e-3, cos: 0.99999 }, |dev| {
+    frozen(case, Tol { rel: 2e-3, cos: 0.99999 }, |dev| {
         // runner: runtime::diffusion::load_image (the public image loader), pinned to `dev`
         let p = gibbs_engine::runtime::diffusion::load_image(&art, &hub, pin(dev))
             .expect("image repo")
@@ -1329,16 +1340,21 @@ fn qwen_image_v1_pipeline() {
 fn qwen_image21_pipeline() {
     let case = "diffb_qwen_image21_pipeline";
     let dir = fixture_dir(case);
+    write_qwen21_pipeline(&dir);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 2.0, 11));
+}
+
+/// The tiny Qwen-Image 2.1 diffusers pipeline in `dir`.
+fn write_qwen21_pipeline(dir: &std::path::Path) {
     write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImage21Pipeline"}));
-    flow_scheduler(&dir, true);
+    flow_scheduler(dir, true);
     write_json(&dir.join("processor/tokenizer.json"), &qwen_tokenizer_json());
     write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 48, 3, 0x5A03);
     let (split, _, cfg) = qwen_image21_fixture();
-    let t = fixture_dir(&format!("{case}/transformer"));
+    let t = dir.join("transformer");
     write_st(&t.join("diffusion_pytorch_model.safetensors"), &split);
     write_json(&t.join("config.json"), &cfg);
-    write_qwen_vae21(&fixture_dir(&format!("{case}/vae")), &[1, 1, 1, 1, 1], 4, 64, &[false, true, false, false]);
-    pipeline_golden(case, &dir, request("t3 t7 t11", 2.0, 11));
+    write_qwen_vae21(&dir.join("vae"), &[1, 1, 1, 1, 1], 4, 64, &[false, true, false, false]);
 }
 
 /// Krea 2 (Raw): 12 taps of a 36-layer Qwen3-VL tower fused in-model, the 2-block DiT on 2x2-packed
@@ -1354,4 +1370,115 @@ fn krea2_pipeline() {
     krea2_fixture(&format!("{case}/transformer"));
     write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
     pipeline_golden(case, &dir, request("t3 t7 t11", 4.5, 12));
+}
+
+fn pixels(img: gibbs_engine::model::image::ImageBuffer) -> Vec<f32> {
+    img.data.iter().map(|&v| v as f32).collect()
+}
+
+/// A derived Qwen-Image 2.1 repo (a transformer file, a card naming its base, its own scheduler
+/// config and card SIGMAS) through `load_image`: it runs as the base pipeline with that transformer,
+/// the repo's scheduler config and the card's sigmas (steps default to their count), unlike the
+/// base's own schedule.
+#[test]
+fn qwen_image21_derived_repo() {
+    use crate::diffa::{on, pin};
+    use gibbs_engine::arch::testing::compare;
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    use gibbs_engine::runtime::diffusion::{load_image, Extras, SpecDiffusion};
+    let dir = fixture_dir("diffb_qwen_image21_derived");
+    let base = dir.join("hub/models--golden--qwen21-base/snapshots/main");
+    write_qwen21_pipeline(&base);
+    let ft = dir.join("ft");
+    std::fs::create_dir_all(&ft).unwrap();
+    let file = ft.join("qwen21-ft.safetensors");
+    let (split, _, _) = qwen_image21_fixture();
+    // A "finetune": the base transformer, every weight scaled.
+    let tuned: Vec<T> = split.iter().map(|(n, s, v)| (n.clone(), s.clone(), v.iter().map(|x| x * 0.9).collect())).collect();
+    write_st(&file, &tuned);
+    let card = "---\nbase_model: golden/qwen21-base\n---\nSTEPS, SIGMAS = 3, [1.0, 0.7, 0.3]\n";
+    std::fs::write(ft.join("README.md"), card).unwrap();
+    let sched = json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000, "shift": 1.0,
+                       "use_dynamic_shifting": false});
+    write_json(&ft.join("scheduler/scheduler_config.json"), &sched);
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let derived = artifacts(&ft, "golden/qwen21-ft", "qwen21-ft.safetensors");
+    let base_art = artifacts(&base, "golden/qwen21-base", "none");
+    for dev in devices() {
+        let p = load_image(&derived, &hub, pin(dev)).expect("derived repo").unwrap();
+        let extra = Extras {
+            weights: vec![("transformer".into(), file.clone())],
+            scheduler: Some(sched.clone()),
+            card: Some(card.into()),
+            ..Default::default()
+        };
+        let want = SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &extra).unwrap();
+        let plain = SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &Extras {
+            weights: vec![("transformer".into(), file.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut req = request("t3 t7 t11", 0.0, 4);
+        req.steps = None;
+        let got = pixels(on(dev, || p.text_to_image(&req)).unwrap());
+        req.steps = Some(3);
+        let (e, c) = compare(&got, &pixels(on(dev, || want.text_to_image(&req)).unwrap()));
+        assert!(e < 1e-6 && c > 0.999999, "{dev:?}: derived vs base + repo schedule: rel {e} cos {c}");
+        let (e, _) = compare(&got, &pixels(on(dev, || plain.text_to_image(&req)).unwrap()));
+        assert!(e > 1e-3, "{dev:?}: the repo schedule changed nothing (rel {e})");
+    }
+}
+
+/// ComfyUI's split Krea 2 files (`diffusion_models/`, `text_encoders/`, `vae/`, no configs; the
+/// spec's `runtime.split` supplies them, here patched to the tiny text tower) load through
+/// `load_image` and render what the same weights do as a diffusers pipeline; the bf16 text encoder
+/// file is preferred over a sibling, and `turbo` in the file name selects the distilled defaults.
+#[test]
+fn krea2_split_files() {
+    use crate::diffa::{on, pin};
+    use gibbs_engine::arch::testing::compare;
+    use gibbs_engine::arch::{Registry, EMBEDDED};
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    use gibbs_engine::runtime::diffusion::load_image_in;
+    let case = "diffb_krea2_split";
+    let dir = fixture_dir(case);
+    let twin = dir.join("diffusers");
+    write_json(&twin.join("model_index.json"), &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}));
+    write_json(&twin.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&twin.join("text_encoder"), "qwen3_vl", 32, 36, 0x5A04);
+    krea2_fixture(&format!("{case}/diffusers/transformer"));
+    write_qwen_vae(&twin.join("vae"), 4, [1, 2, 4, 4], 16);
+    // Split VAE files carry no config: both layouts use the default latent statistics.
+    std::fs::remove_file(twin.join("vae/config.json")).unwrap();
+    let split = dir.join("split");
+    let cp = |from: &str, to: &str| {
+        std::fs::create_dir_all(split.join(to).parent().unwrap()).unwrap();
+        std::fs::copy(twin.join(from), split.join(to)).unwrap();
+    };
+    cp("transformer/krea2_tiny.safetensors", "diffusion_models/krea2_raw_bf16.safetensors");
+    cp("transformer/krea2_tiny.safetensors", "diffusion_models/krea2_turbo_bf16.safetensors");
+    // Sorts first; would fail to load as the text encoder.
+    cp("vae/qwen_image_vae.safetensors", "text_encoders/a_fp8.safetensors");
+    cp("text_encoder/model.safetensors", "text_encoders/qwen3vl_tiny_bf16.safetensors");
+    cp("vae/qwen_image_vae.safetensors", "vae/qwen_image_vae.safetensors");
+    write_json(&dir.join("hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/main/tokenizer.json"), &qwen_tokenizer_json());
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let mut files: Vec<(String, String)> = EMBEDDED.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect();
+    files.push(("overrides/tiny_krea2_split.json5".into(), r#"{applies_to: {family: "krea2"}, patch: {runtime: {split: {files: {
+        "text_encoder/config.json": {text_config: {hidden_size: 32, intermediate_size: 64, num_hidden_layers: 36,
+          num_attention_heads: 4, num_key_value_heads: 2, head_dim: 16, rms_norm_eps: 1e-6, rope_theta: 10000,
+          rope_scaling: {mrope_interleaved: true, mrope_section: [4, 2, 2], rope_type: "default"}}}}}}}}"#.into()));
+    let reg = Registry::from_files(&files, &[]).unwrap();
+    let raw = artifacts(&split, "golden/krea-split", "diffusion_models/krea2_raw_bf16.safetensors");
+    let turbo = artifacts(&split, "golden/krea-split", "diffusion_models/krea2_turbo_bf16.safetensors");
+    let twin_art = artifacts(&twin, "golden/krea-diffusers", "none");
+    let req = request("t3 t7 t11", 4.5, 12);
+    for dev in devices() {
+        let load = |a| load_image_in(&reg, a, &hub, pin(dev)).expect("image repo").unwrap_or_else(|e| panic!("{e}"));
+        let (p, t, w) = (load(&raw), load(&turbo), load(&twin_art));
+        assert_eq!((p.defaults().steps, t.defaults().steps), (28, 8), "raw / turbo defaults");
+        let got = pixels(on(dev, || p.text_to_image(&req)).unwrap());
+        let (e, c) = compare(&got, &pixels(on(dev, || w.text_to_image(&req)).unwrap()));
+        assert!(e < 1e-6 && c > 0.999999, "{dev:?}: split vs diffusers: rel {e} cos {c}");
+    }
 }

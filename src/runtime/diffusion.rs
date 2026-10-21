@@ -679,8 +679,19 @@ impl SpecDiffusion {
         family: Option<&str>,
         extra: &Extras,
     ) -> Result<Self, String> {
+        Self::load_in(crate::arch::registry()?, artifacts, hub, mode, family, extra)
+    }
+
+    /// [`Self::load`] from the specs of `reg`.
+    pub fn load_in(
+        reg: &crate::arch::Registry,
+        artifacts: &ModelArtifacts,
+        hub: &HuggingFaceHub,
+        mode: PlacementMode,
+        family: Option<&str>,
+        extra: &Extras,
+    ) -> Result<Self, String> {
         let loras = &extra.loras;
-        let reg = crate::arch::registry()?;
         let lora_files = loras
             .iter()
             .map(|(p, s)| Ok((crate::model::lora::LoraFile::open(p)?, *s)))
@@ -1827,8 +1838,7 @@ pub fn pipeline_class(dir: &Path) -> Option<String> {
 }
 
 /// The diffusion family of a diffusers pipeline class (`None`: no `pipeline: diffusion` spec).
-fn family_of_class(class: &str) -> Option<String> {
-    let reg = crate::arch::registry().ok()?;
+fn family_of_class(reg: &crate::arch::Registry, class: &str) -> Option<String> {
     let sig = crate::arch::Signals { diffusers_class: Some(class.to_string()), ..Default::default() };
     let f = reg.detect(&sig)?;
     (reg.spec(&f, &sig).ok()?.pipeline == crate::arch::Pipeline::Diffusion).then_some(f)
@@ -1843,11 +1853,21 @@ pub fn load_image(
     hub: &HuggingFaceHub,
     mode: PlacementMode,
 ) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
+    load_image_in(crate::arch::registry().ok()?, artifacts, hub, mode)
+}
+
+/// [`load_image`] from the specs of `reg`.
+pub fn load_image_in(
+    reg: &crate::arch::Registry,
+    artifacts: &ModelArtifacts,
+    hub: &HuggingFaceHub,
+    mode: PlacementMode,
+) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
     let arc = |r: Result<SpecDiffusion, String>| r.map(|p| Arc::new(p) as Arc<dyn ImageGenerator>);
     let dir = artifacts.local_dir.as_deref()?;
     if let Some(class) = pipeline_class(dir) {
-        if family_of_class(&class).is_some() {
-            return Some(arc(SpecDiffusion::load(artifacts, hub, mode, None, &Extras::default())));
+        if family_of_class(reg, &class).is_some() {
+            return Some(arc(SpecDiffusion::load_in(reg, artifacts, hub, mode, None, &Extras::default())));
         }
         if class.contains("Inpaint") {
             return Some(Err(format!(
@@ -1863,14 +1883,13 @@ pub fn load_image(
     }
     let weights = artifacts.weights_path.as_deref()?;
     let names = weight_names(weights)?;
-    let reg = crate::arch::registry().ok()?;
     if let Some(fam) = reg.detect_single_file(&names, &ext_of(weights)) {
-        return Some(single_file(&artifacts.model_id, weights, &fam, hub, mode, Vec::new()));
+        return Some(single_file(reg, &artifacts.model_id, weights, &fam, hub, mode, Vec::new()));
     }
     let lora = weights.extension().is_some_and(|e| e == "safetensors")
         && crate::model::lora::is_diffusion_lora(names.iter().map(String::as_str));
     let denoiser = if lora { None } else { Some(reg.detect_denoiser(&names)?) };
-    if let Some(r) = denoiser.as_deref().and_then(|d| split_files(&artifacts.model_id, weights, d, hub, mode)) {
+    if let Some(r) = denoiser.as_deref().and_then(|d| split_files(reg, &artifacts.model_id, weights, d, hub, mode)) {
         return Some(r);
     }
     // `--model org/repo/file.gguf` names one file of the repo.
@@ -1910,11 +1929,11 @@ pub fn load_image(
             let w = b.weights_path?;
             let fam = reg.detect_single_file(&weight_names(&w)?, &ext_of(&w))?;
             let id = format!("{} on {base}", artifacts.model_id);
-            return Some(single_file(&id, &w, &fam, hub, mode, vec![(weights.to_path_buf(), 1.0)]));
+            return Some(single_file(reg, &id, &w, &fam, hub, mode, vec![(weights.to_path_buf(), 1.0)]));
         }
         Err(e) => return Some(Err(e)),
     };
-    let fam = class.as_deref().and_then(family_of_class);
+    let fam = class.as_deref().and_then(|c| family_of_class(reg, c));
     match (&fam, &denoiser) {
         // A base no diffusion spec runs: other loaders may (denoiser tensor names are shared).
         (None, _) => return None,
@@ -1946,13 +1965,14 @@ pub fn load_image(
                 None => Vec::new(),
             },
             // A distilled finetune ships its own schedule: its `scheduler/` and its card's sigmas.
-            scheduler: hub
-                .fetch_file(repo, "scheduler/scheduler_config.json")
+            scheduler: Some(dir.join("scheduler/scheduler_config.json"))
+                .filter(|p| p.is_file())
+                .map_or_else(|| hub.fetch_file(repo, "scheduler/scheduler_config.json"), Ok)
                 .ok()
                 .and_then(|p| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()),
             card: card_text.clone(),
         };
-        arc(SpecDiffusion::load(&a, hub, mode, Some(&fam), &extra))
+        arc(SpecDiffusion::load_in(reg, &a, hub, mode, Some(&fam), &extra))
     })())
 }
 
@@ -1991,13 +2011,13 @@ fn fetch_ref(hub: &HuggingFaceHub, r: &str) -> Result<std::path::PathBuf, String
 /// components (fetched when missing) around a pipeline root assembled from the spec's `files`.
 /// `None` when `fam` has no split layout or the file is elsewhere.
 fn split_files(
+    reg: &crate::arch::Registry,
     id: &str,
     weights: &Path,
     fam: &str,
     hub: &HuggingFaceHub,
     mode: PlacementMode,
 ) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
-    let reg = crate::arch::registry().ok()?;
     let spec = reg.spec(fam, &Default::default()).ok()?;
     let rt: Runtime = spec.runtime_as().ok()?;
     let split: SplitSpec = match rt.other.get("split").map(|j| serde_json::from_value(j.clone())) {
@@ -2014,7 +2034,7 @@ fn split_files(
         let (root, parts) = split_root(&split, &rt.denoiser.component, base, weights, id, hub)?;
         let a = ModelArtifacts { model_id: id.to_string(), local_dir: Some(root.clone()), is_cached: true, ..Default::default() };
         let extra = Extras { weights: parts, ..Default::default() };
-        SpecDiffusion::load(&a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+        SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
     })())
 }
 
@@ -2046,7 +2066,8 @@ fn split_root(
     }
     let root = std::env::temp_dir()
         .join("gibbs-split")
-        .join(base.to_string_lossy().replace(['/', '\\', ':'], "_"));
+        // One root per denoiser file (its name flags differ from its siblings').
+        .join(weights.to_string_lossy().replace(['/', '\\', ':'], "_"));
     let write = |rel: &str, bytes: &[u8]| -> Result<(), String> {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -2074,6 +2095,7 @@ fn split_root(
 /// A single-file checkpoint of `fam`: the configs of its `runtime.reference` repo (fetched, no
 /// weights), every `{family, dir}` component's weights read from `weights`.
 fn single_file(
+    reg: &crate::arch::Registry,
     id: &str,
     weights: &Path,
     fam: &str,
@@ -2081,7 +2103,6 @@ fn single_file(
     mode: PlacementMode,
     loras: Vec<(std::path::PathBuf, f32)>,
 ) -> Result<Arc<dyn ImageGenerator>, String> {
-    let reg = crate::arch::registry()?;
     let sig = crate::arch::Signals {
         hub_id: id.to_string(),
         file_name: weights.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
@@ -2126,7 +2147,7 @@ fn single_file(
         ..Default::default()
     };
     let extra = Extras { loras, weights: parts, ..Default::default() };
-    SpecDiffusion::load(&a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+    SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
 }
 
 #[cfg(test)]
