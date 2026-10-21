@@ -305,14 +305,19 @@ impl SpecLm {
         // `*ForSequenceClassification` export) reads them through that instance, which runs on
         // this program (`run_head`), so they load with it; plain LM exports do not build it.
         let mut program_weights = decode.weights.clone();
+        let mut seqcls_err = None;
         if let Some(head) = model.spec.runtime["seqcls"]["head"].as_str() {
             let hv = vars(1, head, &[], 0);
-            if let Ok(i) = build(&model.spec, TEXT, &model.env, &model.store, &hv) {
-                for w in i.weights {
-                    if used.insert(w.clone()) {
-                        program_weights.push(w);
+            match build(&model.spec, TEXT, &model.env, &model.store, &hv) {
+                Ok(i) => {
+                    for w in i.weights {
+                        if used.insert(w.clone()) {
+                            program_weights.push(w);
+                        }
                     }
                 }
+                // Named with the unread-tensor error below when the checkpoint has a head.
+                Err(e) => seqcls_err = Some(e),
             }
         }
         let mut off = HashMap::new();
@@ -330,7 +335,8 @@ impl SpecLm {
         let unused = model.store.unconsumed(&used, &model.spec.ignore);
         if !unused.is_empty() {
             // A failed tower's weights stay unread: its probe error is the real cause.
-            let why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
+            let mut why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
+            why.extend(seqcls_err.map(|e| format!("seqcls head: {e}")));
             return Err(format!(
                 "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}{}",
                 unused.join(", "),

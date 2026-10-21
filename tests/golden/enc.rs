@@ -497,6 +497,10 @@ fn gpt2() {
         "n_layer": 2, "n_head": 2, "n_embd": h, "n_positions": ctx, "n_ctx": ctx,
         "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5});
     let hub = decoder_repo("enc_gpt2", cfg, &w);
+    // The reference (`ln_decoder.rs` host forward) is deleted: the golden is frozen.
+    if writing() {
+        return;
+    }
     classify_golden("enc_gpt2", &hub, TEXT_AND_PAIR, TOL);
 }
 
@@ -529,6 +533,10 @@ fn opt(case: &str, pre_ln: bool, act: &str, seed: u64) {
         "do_layer_norm_before": pre_ln, "activation_function": act, "enable_bias": true,
         "layer_norm_elementwise_affine": true});
     let hub = decoder_repo(case, cfg, &w);
+    // The reference (`ln_decoder.rs` host forward) is deleted: the golden is frozen.
+    if writing() {
+        return;
+    }
     classify_golden(case, &hub, TEXT_AND_PAIR, TOL);
 }
 
