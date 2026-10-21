@@ -1,15 +1,17 @@
 //! Speculative decoding with Qwen3.5-0.8B's multi-token-prediction head on real weights from the
 //! shared `disk/` cache: the Gated DeltaNet / conv state rewinds exactly, and greedy output through
-//! the scheduler (concurrent sequences) is token for token the same with and without MTP.
+//! the scheduler (concurrent sequences) is token for token the same with and without MTP. Without
+//! it, the rollback check runs on the cached Qwen3.5-2B GGUF (which ships no MTP head).
 
-use gibbs_engine::hardware::Device;
+use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::hub::HuggingFaceHub;
-use gibbs_engine::model::native::{load_native, NativeLm};
+use gibbs_engine::model::native::NativeLm;
 use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel, SamplingParams};
 use std::sync::Arc;
 
 const REPO: &str = "Qwen/Qwen3.5-0.8B";
+const NO_MTP: &str = "unsloth/Qwen3.5-2B-GGUF";
 
 /// `GIBBS_TEST_BACKEND=metal` runs the whole file on the Metal program (needs the weights in disk/).
 fn backend() -> Device {
@@ -19,13 +21,34 @@ fn backend() -> Device {
     }
 }
 
-fn model() -> Option<Arc<dyn NativeLm>> {
-    let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(REPO);
-    if art.weights_path.is_none() {
-        eprintln!("SKIP: {REPO} not in disk/ (gibbs --model {REPO} --storage disk)");
+/// The first cached of [`REPO`], [`NO_MTP`], and which one it is.
+fn model() -> Option<(Arc<dyn NativeLm>, &'static str)> {
+    let hub = HuggingFaceHub::with_cache_dir("disk".into());
+    let Some((repo, art)) = [REPO, NO_MTP]
+        .into_iter()
+        .map(|r| (r, hub.locate_model(r)))
+        .find(|(_, a)| a.weights_path.is_some())
+    else {
+        eprintln!(
+            "SKIP: neither {REPO} nor {NO_MTP} in disk/ (gibbs --model {REPO} --storage disk)"
+        );
+        return None;
+    };
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let m = gibbs_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(backend()))
+        .unwrap_or_else(|e| panic!("{repo} loads: {e}"));
+    Some((m, repo))
+}
+
+/// [`model`] when it ships the MTP drafter; on [`REPO`] a missing drafter is a failure.
+fn mtp_model() -> Option<Arc<dyn NativeLm>> {
+    let (m, repo) = model()?;
+    if repo == NO_MTP {
+        eprintln!("SKIP: {NO_MTP} has no MTP head (mtp.fc.weight); needs {REPO}");
         return None;
     }
-    Some(load_native(&art, backend())?.expect("Qwen3.5-0.8B loads"))
+    m.drafter().expect("Qwen3.5-0.8B ships an MTP head");
+    Some(m)
 }
 
 /// Verifying four positions, rewinding to two, and continuing gives bit-identical logits to
@@ -33,7 +56,7 @@ fn model() -> Option<Arc<dyn NativeLm>> {
 /// caches are restored exactly. Rewinding outside the verified span errs.
 #[test]
 fn deltanet_rollback_is_exact() {
-    let Some(m) = model() else { return };
+    let Some((m, _)) = model() else { return };
     let tok = m.tokenizer();
     let prompt = tok.encode("The quick brown fox jumps over the lazy dog, and then");
     let t = tok.encode(" it ran into the forest to hide");
@@ -48,8 +71,10 @@ fn deltanet_rollback_is_exact() {
 
     let (_, mut b) = m.prepare(prompt.clone(), &[]).unwrap();
     m.forward(&prompt, 0, &mut b).unwrap();
-    m.forward(&[t[0]], n, &mut b).unwrap();
-    m.forward(&[t[1]], n + 1, &mut b).unwrap();
+    // One token at a time through the verify program (`forward_all`) too: on Metal the decode
+    // program (`forward`) differs from it by ~5e-6 in the logits, which is not the rewind.
+    m.forward_all(&[t[0]], n, &mut b).unwrap();
+    m.forward_all(&[t[1]], n + 1, &mut b).unwrap();
     let want = m.forward_all(&[t[2], t[3]], n + 2, &mut b).unwrap();
     assert!(got == want, "rewound state diverges from the plain run");
 
@@ -97,7 +122,7 @@ fn run(m: &Arc<dyn NativeLm>, spec: bool, prompts: &[&str], max: usize) -> (Vec<
 
 #[test]
 fn mtp_greedy_matches_plain_decoding() {
-    let Some(m) = model() else { return };
+    let Some(m) = mtp_model() else { return };
     let prompts = [
         "Write a long story about a dragon.",
         "Explain how hash maps work.",
@@ -148,7 +173,7 @@ fn target_dist(logits: &[f32], temp: f32) -> Vec<(u32, f32)> {
 /// speculative step emits through rejection sampling, follows the target's own distribution.
 #[test]
 fn mtp_sampling_keeps_target_distribution() {
-    let Some(m) = model() else { return };
+    let Some(m) = mtp_model() else { return };
     let ids = m.tokenizer().encode("My favourite colour is");
     // Room for one speculative step (k = 1) after the first token.
     let params = SamplingParams {

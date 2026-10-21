@@ -1,0 +1,127 @@
+// Qwen3 dense and MoE decoders (transformers `qwen3`, `qwen3_moe`; llama.cpp `qwen3`, `qwen3moe`):
+// llama-style layers with per-head q/k RMSNorm before RoPE; MoE layers route top-k of the
+// `mlp.experts.{e}` SwiGLU experts (no shared expert). `hunyuan` and `qwen3_vl` extend this.
+{
+  family: "qwen3",
+  match: {
+    hf_model_type: ["qwen3", "qwen3_moe"],
+    hf_architectures: ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"],
+    gguf_arch: ["qwen3", "qwen3moe"],
+  },
+  pipeline: "causal_lm",
+  use_lib: ["transformer", "qwen", "moe"],
+  config: {
+    gguf_arch: "first(gguf['general.architecture'], '')",
+    tc: "first(cfg.text_config, cfg)",
+    rope: "first(tc.rope_parameters, tc.rope_scaling)",
+    hidden: "first(tc.hidden_size, gguf.embedding_length)",
+    layers: "first(tc.num_hidden_layers, gguf.block_count)",
+    heads: "first(tc.num_attention_heads, gguf['attention.head_count'])",
+    kv_heads: "first(tc.num_key_value_heads, gguf['attention.head_count_kv'])",
+    head_dim: "first(tc.head_dim, gguf['attention.key_length'], hidden // heads)",
+    vocab: "shape('model.embed_tokens.weight')[0]",
+    eps: "first(tc.rms_norm_eps, gguf['attention.layer_norm_rms_epsilon'], 1e-6)",
+    theta: "first(rope.rope_theta, tc.rope_theta, gguf['rope.freq_base'])",
+    rope_type: "first(rope.rope_type, rope.type, 'default')",
+    rotary_dim: "2 * (int(head_dim * first(rope.partial_rotary_factor, 1)) // 2)",
+    rope_kind: "'default'",
+    experts: "first(tc.num_experts, gguf.expert_count, 0)",
+    top_k: "first(tc.num_experts_per_tok, gguf.expert_used_count, 0)",
+    norm_topk: "first(tc.norm_topk_prob, true) != false",
+    attn_gate: "false",
+    qk_norm: "has('model.layers.0.self_attn.q_norm.weight') ? 'before' : 'none'",
+    act: "'Silu'",
+    // Tied embeddings win over a stored lm_head (transformers ties them).
+    head_w: "has('lm_head.weight') && tc.tie_word_embeddings != true ? 'lm_head' : 'model.embed_tokens'",
+    ctx: "first(runtime.ctx, min(first(tc.max_position_embeddings, gguf.context_length, 32768), 4096))",
+    // Vision tower wiring (`qwen3_vl` sets these; plain Qwen3 / HunYuan build the text-only graph).
+    has_vision: "false",
+    mrope_variant: "'HalfSplit'",
+    deepstack_layers: "0",
+  },
+  checks: [
+    {expr: "rope_type != 'default'", error: "rope type '{rope_type}' is not implemented"},
+    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
+    {expr: "experts > 0 && (len(first(tc.mlp_only_layers, [])) > 0 || first(tc.decoder_sparse_step, 1) != 1)",
+     error: "MoE configs with dense layers (mlp_only_layers, decoder_sparse_step) are not implemented"},
+  ],
+  names: {
+    use: ["llamacpp"],
+    rules: [
+      ["model.language_model.{r:*}", "model.{r}"],
+      // Bare `Qwen3Model` exports (diffusers text encoders).
+      ["layers.{r:*}", "model.layers.{r}"],
+      ["embed_tokens.weight", "model.embed_tokens.weight"],
+      ["norm.weight", "model.norm.weight"],
+      ["blk.{i}.ffn_gate_inp.weight", "model.layers.{i}.mlp.gate.weight"],
+      ["blk.{i}.ffn_{n:*}_exps.weight", "model.layers.{i}.mlp.experts.{n}_proj.weight"],
+    ],
+  },
+  transforms: [
+    // HF per-expert matrices -> [experts, rows, cols] banks.
+    {tensor: "model.layers.{l}.mlp.experts.{e}.{n:*}_proj.weight", op: "stack_experts",
+     args: {out: "model.layers.{l}.mlp.experts.{n}_proj.weight"}},
+    {tensor: "model.layers.{i}.mlp.experts.{n:*}_proj.weight", op: "reshape",
+     when: "len(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight'))) == 3",
+     args: {shape: ["experts * at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 1)", "at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 2)"]}},
+    // `qwen3_vl` ViT (lib `qwen_vit`): Conv3d patch embed as a Linear, f32 position table.
+    {tensor: "model.visual.patch_embed.proj.weight", op: "conv_to_linear", when: "has_vision"},
+    {tensor: "model.visual.pos_embed.weight", op: "to_f32", when: "has_vision"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "rope_inv_freq", args: {dim: "rotary_dim", theta: "theta", kind: "rope_kind", alpha: "first(rope_alpha, 1)", precision: "'f64'"}},
+  },
+  // score.weight: a seq-cls head, which runtime::seqcls's caller reads.
+  ignore: ["lm_head.weight", "score.weight", "model.layers.*.self_attn.rotary_emb.inv_freq"],
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        // With a vision tower: M-RoPE positions, media rows (tower `media`, deepstack features)
+        // and the rows they fill (`media` = SpecLm's instance var, 0 / absent on text passes).
+        {name: "rope_positions", dtype: "u32", shape: ["3 * rows"], when: "has_vision"},
+        {name: "media_rows", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
+        {name: "media_index", dtype: "u32", shape: ["media"], when: "first(media, 0) > 0"},
+        {name: "deepstack.0", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 0"},
+        {name: "deepstack.1", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 1"},
+        {name: "deepstack.2", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 2"},
+        // Instance var `masked`: one uncached pass over a right-padded encoder prompt, `key_mask`
+        // 0 on real tokens and -inf on padding (transformers' attention mask).
+        {name: "key_mask", dtype: "f32", shape: ["rows"], when: "first(masked, false)"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", name: "media_scatter", when: "first(media, 0) > 0"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')"}},
+          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.input_layernorm"},
+          {use: "qwen_attn", in: ["h"], out: "a", name: "layers.{i}.self_attn",
+           args: {p: "fmt('{p}.self_attn')", layer: "i", q_norm_name: "first(q_norm_name)", k_norm_name: "first(k_norm_name)",
+                  rope_pos: "has_vision ? 'rope_positions' : 'positions'", rope_variant: "has_vision ? mrope_variant : 'HalfSplit'",
+                  key_mask: "first(masked, false) ? 'key_mask' : ''"}},
+          {op: "Binary", args: {kind: "'Add'"}, in: ["x", "a"], out: "x", name: "layers.{i}.add_mixer"},
+          {use: "rms_norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.post_attention_layernorm"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "layers.{i}.mlp", when: "experts == 0",
+           args: {gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
+          {use: "moe_shared", in: ["h"], out: "m", name: "layers.{i}.mlp", when: "experts > 0", args: {p: "fmt('{p}.mlp')"}},
+          {op: "Binary", args: {kind: "'Add'"}, in: ["x", "m"], out: "x", name: "layers.{i}.add_ffn"},
+          // Deepstack: feature i added to the media rows after decoder layer i.
+          {block: [
+            {op: "Gather", args: {axis: 0}, in: ["x", "i:media_index"], out: "dr", name: "layers.{i}.deepstack_rows"},
+            {op: "Binary", args: {kind: "'Add'"}, in: ["dr", "i:deepstack.{i}"], out: "dr", name: "layers.{i}.deepstack_add"},
+            {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "dr"], out: "x", name: "layers.{i}.deepstack"},
+          ], when: "first(media, 0) > 0 && i < deepstack_layers"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "rms_norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "lm_head", args: {w: "head_w"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  // `cutover`: the legacy loader is gone, so this spec (and hunyuan / qwen3_vl) loads by default.
+  runtime: {cutover: true, prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"]},
+}

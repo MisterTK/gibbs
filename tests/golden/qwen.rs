@@ -1,12 +1,12 @@
 //! Qwen family goldens: Qwen3.5 (DeltaNet + gated attention, dense and MoE), Qwen3, HunYuan dense,
 //! the Qwen3.5 MTP head, vision tower and image prompts, Qwen4-Exp (hyper-connections, QSA, PLE)
 //! and the DFlash / DFlash2 / DSpark block drafters, on tiny bf16 safetensors checkpoints.
-//! Shapes follow `src/model/qwen3_5/fixture.rs`, `text.rs` and `draft.rs` test fixtures.
+//! Shapes follow the (deleted) native Qwen3.5 loader's test fixtures; the JSON is the oracle.
 
 use crate::util::*;
 use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::native::{load_native, MediaInput, NativeLm, SeqState};
+use gibbs_engine::model::native::{MediaInput, NativeLm, SeqState};
 use gibbs_engine::scheduler::spec::Drafter;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -290,22 +290,17 @@ fn dense_config(model_type: &str, arch: &str) -> Value {
 // Runners
 // ---------------------------------------------------------------------------------------------
 
+/// runner: arch::load::load_with (bit-exact) of the detected family spec -> runtime::lm::SpecLm.
 fn load(dir: &Path, id: &str, dev: Device) -> Arc<dyn NativeLm> {
-    let m = load_native(&artifacts(dir, id, "model.safetensors"), dev)
-        .expect("a native architecture")
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let a = artifacts(dir, id, "model.safetensors");
+    let m = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re)
+        .and_then(|s| gibbs_engine::runtime::lm::SpecLm::new(s, PlacementMode::Pin(dev)))
         .unwrap_or_else(|e| panic!("{id} on {dev:?}: {e}"));
     // Catches a silent CPU fallback of a Metal load.
     assert_eq!(m.device(), dev, "{id}");
-    m
-}
-
-/// Cases with no Metal path: checked on the CPU only, and (check mode) the Metal load must still
-/// be refused, so a new Metal path shows up instead of going unchecked.
-fn host_only(case: &str, run: impl Fn() -> Out, metal_refused: impl Fn() -> bool) {
-    check(case, Device::Cpu, &run(), TOL);
-    if !writing() && metal_present() {
-        assert!(metal_refused(), "{case}: the Metal load now succeeds; check it on Metal too");
-    }
+    Arc::new(m)
 }
 
 fn fwd(m: &dyn NativeLm, toks: &[u32], pos: usize, st: &mut SeqState) -> Vec<f32> {
@@ -430,7 +425,15 @@ fn qwen3_5_mtp() {
     let dir = fixture_dir("qwen_qwen3_5_mtp");
     qwen35_ckpt(&dir, 0x5157_454E_0006, true);
     golden("qwen_qwen3_5_mtp", TOL, |dev| {
-        let m = load(&dir, "golden/qwen3_5_mtp", dev);
+        // runner: arch::load::load_with (bit-exact) of the `qwen3_5` spec -> runtime::lm::SpecLm
+        // on `dev`; its drafter is the spec's `mtp` component (runtime::draft).
+        use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let a = artifacts(&dir, "golden/qwen3_5_mtp", "model.safetensors");
+        let spec = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re).unwrap();
+        assert_eq!(spec.spec.family, "qwen3_5");
+        let m = gibbs_engine::runtime::lm::SpecLm::new(spec, PlacementMode::Pin(dev)).unwrap();
+        assert_eq!(m.device(), dev);
         let d = m.drafter().expect("shipped MTP drafter");
         let mut out = Out::default();
         out.ids("taps", &d.tap_layers().iter().map(|&t| t as u32).collect::<Vec<_>>());
@@ -464,32 +467,54 @@ fn qwen3_5_mtp() {
     });
 }
 
-/// The ViT alone on two image sizes: merged features and the deepstack feature.
+/// An MTP head the `mtp` drafter does not run (here: a config claiming 2 MTP layers) leaves the
+/// target loadable without a shipped drafter.
+#[test]
+fn qwen3_5_unsupported_mtp_head_is_skipped() {
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    let dir = fixture_dir("qwen_qwen3_5_mtp2");
+    let mut w = Weights::new(0x5157_454E_0006);
+    qwen35_text(&mut w, "model", Ffn::Dense, false);
+    mtp(&mut w);
+    let mut cfg = qwen35_config("qwen3_5", "Qwen3_5ForCausalLM");
+    cfg["mtp_num_hidden_layers"] = 2.into();
+    write_ckpt(&dir, &cfg, &w);
+    let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let a = artifacts(&dir, "golden/qwen3_5_mtp2", "model.safetensors");
+    let spec = gibbs_engine::arch::load::load_with(&a, gibbs_engine::arch::registry().unwrap(), None, re).unwrap();
+    let m = gibbs_engine::runtime::lm::SpecLm::new(spec, PlacementMode::Pin(Device::Cpu)).unwrap();
+    assert!(m.drafter().is_none());
+}
+
+/// The ViT alone on two image sizes (the second runs reshaped on the first's program): merged
+/// features and the deepstack feature. Qwen3-VL's spec runs the same tower.
 #[test]
 fn qwen3_5_vision_tower() {
-    use gibbs_engine::model::qwen3_5::vision::{Preprocessor, Vision};
+    use gibbs_engine::arch::{load, Registry};
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    use gibbs_engine::runtime::media::{self, Towers};
     let dir = fixture_dir("qwen_qwen3_5_vision_tower");
     qwen35_vl_ckpt(&dir);
-    golden("qwen_qwen3_5_vision_tower", TOL, |dev| {
-        // runner: internal gibbs_engine::model::qwen3_5::vision::Vision
-        let ck = gibbs_engine::model::weights::Weights::open(&dir.join("model.safetensors")).unwrap();
-        let cfg: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let pre = Preprocessor::load(&dir.join("preprocessor_config.json")).unwrap();
-        let v = Vision::load(&ck, &cfg["vision_config"])
-            .unwrap()
-            .on_gpu(PlacementMode::Pin(dev))
-            .unwrap();
+    // runner: arch::load::load_with (bit-exact) -> runtime::media::{preprocess, Towers::run}.
+    let run = |family: &str, dev: Device| {
+        let re = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let a = artifacts(&dir, "golden/qwen3_5_vl", "model.safetensors");
+        let m = load::load_with(&a, &Registry::load(None).unwrap(), Some(family), re).unwrap();
+        load::check(&m).unwrap();
+        let spec = media::resolve(&m.spec.runtime["media"], &m.env).unwrap().remove("image").unwrap();
+        let towers = Towers::new(PlacementMode::Pin(dev));
         let mut out = Out::default();
         for (w, h) in [(16, 24), (24, 8)] {
-            let img = ImageBuffer::decode(&png(w, h)).unwrap();
-            let e = v.encode(&img, &pre).unwrap();
-            out.ids(format!("grid_{w}x{h}"), &[e.rows as u32, e.cols as u32])
-                .f(format!("embeds_{w}x{h}"), &e.embeds)
-                .f(format!("deepstack0_{w}x{h}"), &e.deepstack[0]);
+            let p = media::preprocess(&spec.preprocess, &png(w, h)).unwrap();
+            let o: std::collections::HashMap<_, _> = towers.run(&m, &spec.component, &p).unwrap().into_iter().collect();
+            out.ids(format!("grid_{w}x{h}"), &[p.grid.rows as u32, p.grid.cols as u32])
+                .f(format!("embeds_{w}x{h}"), &o["media"])
+                .f(format!("deepstack0_{w}x{h}"), &o["deepstack.0"]);
         }
         out
-    });
+    };
+    golden("qwen_qwen3_5_vision_tower", TOL, |dev| run("qwen3_5", dev));
+    golden("qwen_qwen3_5_vision_tower", TOL, |dev| run("qwen3_vl", dev));
 }
 
 /// Image prompt through `prepare` (placeholder expanded to the merged grid, M-RoPE positions,
@@ -557,10 +582,11 @@ fn qwen4_exp() {
     }
     write_ckpt(&dir, &cfg, &w);
     let prompt = [5u32, 17, 2, 40, 63, 9, 88];
-    // runner: host forward only: the Qwen4-Exp decode graph refuses hyper-connections
-    // (qwen3_5/text.rs to_decode_graph_with), so a Metal load errs.
-    host_only("qwen_qwen4_exp", || {
-        let m = load(&dir, "golden/qwen4_exp", Device::Cpu);
+    golden("qwen_qwen4_exp", TOL, |dev| {
+        let m = load(&dir, "golden/qwen4_exp", dev);
+        let host: Vec<String> = m.placement_summary().unwrap().iter()
+            .filter(|r| dev == Device::Metal && r.device == Device::Cpu).map(|r| r.op.clone()).collect();
+        assert!(host.is_empty(), "CPU nodes in the Metal program: {host:?}");
         let mut out = Out::default();
         let (_, mut st) = m.prepare(prompt.to_vec(), &[]).unwrap();
         out.f("chunk3", &fwd(&*m, &prompt[..3], 0, &mut st));
@@ -573,6 +599,13 @@ fn qwen4_exp() {
             logits = fwd(&*m, &[tok], prompt.len() + i, &mut st);
         }
         out.ids("decode_ids", &steps).f("decode_last", &logits);
+        // Rewind into a verified span: the PLE n-gram history and conv ring rewind with it.
+        let at = prompt.len() + 4;
+        let both = m.forward_all(&[30, 31], at, &mut st).unwrap();
+        m.truncate(&mut st, at + 1).unwrap();
+        let again = fwd(&*m, &[31], at + 1, &mut st);
+        let d = again.iter().zip(&both[V..]).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+        assert!(d < 1e-3, "{dev:?}: rewound row differs by {d}");
         let (_, mut st) = m.prepare(prompt.to_vec(), &[]).unwrap();
         let mut inc = Vec::new();
         for (i, &t) in prompt.iter().enumerate() {
@@ -580,9 +613,6 @@ fn qwen4_exp() {
         }
         out.f("incremental", &inc);
         out
-    }, || {
-        load_native(&artifacts(&dir, "golden/qwen4_exp", "model.safetensors"), Device::Metal)
-            .is_some_and(|r| r.is_err())
     });
 }
 
@@ -630,7 +660,7 @@ fn drafter_config(arch: &str, layers: usize) -> Value {
 }
 
 /// Loads the drafter in `dir/draft` against the Qwen3.5 target in `dir/target` through
-/// `model::draft::load_drafter`, feeds it 5 fixed tapped rows (6-token sequence), then 2 more
+/// `runtime::draft::load_drafter`, feeds it 5 fixed tapped rows (6-token sequence), then 2 more
 /// (catch-up after accepting one draft), recording drafted ids and every pick row's logits.
 fn drafter_case(case: &str, cfg: Value, w: Weights) {
     let dir = fixture_dir(case);
@@ -638,16 +668,13 @@ fn drafter_case(case: &str, cfg: Value, w: Weights) {
     qwen35_ckpt(&td, 0x5157_454E_0010, false);
     write_json(&dd.join("config.json"), &cfg);
     write_st_as(&dd.join("model.safetensors"), &w.tensors, StDtype::BF16);
-    // runner: CPU only: block drafters are host Rust; avenues gates them off Metal.
-    let load = |mode| {
-        gibbs_engine::model::draft::load_drafter(
+    golden(case, TOL, |dev| {
+        let d: Arc<dyn Drafter> = gibbs_engine::runtime::draft::load_drafter(
             &artifacts(&dd, "golden/drafter", "model.safetensors"),
             &artifacts(&td, "golden/qwen3_5", "model.safetensors"),
-            mode,
+            PlacementMode::Pin(dev),
         )
-    };
-    host_only(case, || {
-        let d: Arc<dyn Drafter> = load(PlacementMode::Pin(Device::Cpu)).unwrap();
+        .unwrap_or_else(|e| panic!("{case} on {dev:?}: {e}"));
         let taps = d.tap_layers();
         let mut out = Out::default();
         out.ids("taps", &taps.iter().map(|&t| t as u32).collect::<Vec<_>>());
@@ -674,7 +701,7 @@ fn drafter_case(case: &str, cfg: Value, w: Weights) {
             toks.extend([ids[0], 60]);
         }
         out
-    }, || load(PlacementMode::Pin(Device::Metal)).is_err());
+    });
 }
 
 #[test]

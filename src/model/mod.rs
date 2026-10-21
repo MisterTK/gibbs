@@ -49,7 +49,6 @@ pub mod diff_fixtures;
 pub mod diff_graph;
 pub mod dit;
 pub mod dit_graph;
-pub mod draft;
 pub mod fasttext;
 pub mod fingerprint;
 pub mod flux;

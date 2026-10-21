@@ -1,0 +1,77 @@
+// Gemma 4 unified (`gemma4_unified`, `Gemma4UnifiedForConditionalGeneration`: gemma-4-12B): the
+// `gemma4` text decoder with encoder-free media embedders. Images become `patch * pool` px model
+// patches through LayerNorm -> Dense -> LayerNorm, plus factorized 2-D position embeddings and a
+// LayerNorm, then the shared `embed_vision` (unit-gain RMSNorm + projection).
+{
+  family: "gemma4_unified",
+  extends: "gemma4",
+  match: {
+    hf_model_type: ["gemma4_unified"],
+    hf_architectures: ["Gemma4UnifiedForConditionalGeneration"],
+  },
+  config: {
+    has_vision: "has('model.vision_embedder.patch_dense.weight')",
+    v_hidden: "shape('model.vision_embedder.patch_dense.weight')[0]",
+    v_max_soft: "first(json.processor_config.image_processor.max_soft_tokens, cfg.vision_config.num_soft_tokens, 280)",
+  },
+  // The gemma4 tower's RoPE / head-norm constants (the embedder has neither).
+  constants: {"vision.rope": null, "vision.ones_hd": null},
+  components: {
+    // Vars: the token grid (one model patch per token). Input 0: `[n, (patch * pool)^2 * 3]`
+    // raster patches, `(y, x, c)` inside, in [0, 1].
+    vision: {
+      vars: ["grid_h", "grid_w"],
+      inputs: [
+        {name: "patches", dtype: "f32", shape: ["grid_h * grid_w", "shape('model.vision_embedder.patch_dense.weight')[1]"]},
+        {name: "pos_x", dtype: "u32", shape: ["grid_h * grid_w"], gen: "grid_xy", args: {grid_h: "grid_h", grid_w: "grid_w", axis: 0}},
+        {name: "pos_y", dtype: "u32", shape: ["grid_h * grid_w"], gen: "grid_xy", args: {grid_h: "grid_h", grid_w: "grid_w", axis: 1}},
+      ],
+      body: [
+        {let: {e: "'model.vision_embedder'", d: "v_hidden"}},
+        // nn.LayerNorm default eps.
+        {op: "LayerNorm", args: {eps: 1e-5}, in: ["i:patches", "w:{e}.patch_ln1.weight", "w:{e}.patch_ln1.bias"], out: "x", name: "vision.patch_ln1"},
+        {op: "Linear", in: ["x", "w:{e}.patch_dense.weight", "w:{e}.patch_dense.bias"], out: "x", name: "vision.patch_dense"},
+        {op: "LayerNorm", args: {eps: 1e-5}, in: ["x", "w:{e}.patch_ln2.weight", "w:{e}.patch_ln2.bias"], out: "x", name: "vision.patch_ln2"},
+        {op: "Embedding", in: ["w:{e}.pos_embedding", "i:pos_x"], out: "px", name: "vision.pos_x.rows"},
+        {op: "Slice", args: {axis: 1, start: 0, end: "d"}, in: ["px"], out: "px", name: "vision.pos_x.table"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "px"], out: "x", name: "vision.pos_x"},
+        {op: "Embedding", in: ["w:{e}.pos_embedding", "i:pos_y"], out: "py", name: "vision.pos_y.rows"},
+        {op: "Slice", args: {axis: 1, start: "d", end: "2 * d"}, in: ["py"], out: "py", name: "vision.pos_y.table"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "py"], out: "x", name: "vision.pos_y"},
+        {op: "LayerNorm", args: {eps: 1e-5}, in: ["x", "w:{e}.pos_norm.weight", "w:{e}.pos_norm.bias"], out: "x", name: "vision.pos_norm"},
+        {op: "RmsNorm", args: {eps: "v_eps"}, in: ["x", "c:vision.ones"], out: "x", name: "vision.embed_norm"},
+        {op: "Linear", in: ["x", "w:model.embed_vision.embedding_projection.weight"], out: "embeds", name: "vision.embed"},
+      ],
+      outputs: ["embeds"],
+    },
+    // Raw `[tokens, samples_per_token]` 16 kHz sample frames through the shared `embed_audio`
+    // (unit-gain RMSNorm + projection); the projection width is the frame length.
+    audio: {
+      vars: ["tokens"],
+      inputs: [{name: "samples", dtype: "f32", shape: ["tokens", "shape('model.embed_audio.embedding_projection.weight')[1]"]}],
+      body: [
+        {op: "RmsNorm", args: {eps: "a_eps"}, in: ["i:samples"], out: "x", name: "audio.embed_norm"},
+        {op: "Linear", in: ["x", "w:model.embed_audio.embedding_projection.weight"], out: "embeds", name: "audio.embed"},
+      ],
+      outputs: ["embeds"],
+    },
+  },
+  runtime: {
+    media: {
+      image: {
+        preprocess: {kind: "patch_grid", patch: "v_patch", pool: "v_pool", max_soft_tokens: "v_max_soft",
+                     max_grid: "shape('model.vision_embedder.pos_embedding')[0]",
+                     // Pixels v / 255.
+                     norm: {mean: [0, 0, 0], std: [1, 1, 1]}},
+      },
+      // Placeholder / open / close ids as in `gemma4`; the log_mel framing keys are dropped.
+      audio: {
+        when: "has('model.embed_audio.embedding_projection.weight')",
+        preprocess: {kind: "raw_frames", sampling_rate: "a_rate",
+                     frame: "shape('model.embed_audio.embedding_projection.weight')[1]",
+                     max_tokens: "first(json.processor_config.audio_seq_length, 750)",
+                     frame_length: null, hop_length: null, pad_multiple: null, max_samples: null, token_stride: null},
+      },
+    },
+  },
+}

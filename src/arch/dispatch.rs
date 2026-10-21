@@ -57,9 +57,24 @@ pub struct LoadOpts<'a> {
 }
 
 /// `GIBBS_SPEC_LM=1`: causal LMs a family spec claims load through [`crate::runtime::lm`]
-/// instead of GraphLm.
+/// instead of their legacy loader (GraphLm, the native loaders).
 pub fn spec_lm_enabled() -> bool {
     std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1")
+}
+
+/// `model_type` is a causal-LM family's own match (not a fallback) whose spec sets
+/// `runtime.cutover` ([`lm`] runs it by default): the hub picker treats it like the native
+/// loaders' types.
+pub fn runs_spec_lm(model_type: &str) -> bool {
+    super::registry().is_ok_and(|r| {
+        r.matchers().iter().any(|(f, m, p)| {
+            *p == Pipeline::CausalLm
+                && !m.fallback
+                && m.hf_model_type.iter().any(|g| super::glob(g, model_type))
+                && r.merged(f, &Default::default())
+                    .is_ok_and(|j| j["runtime"]["cutover"] == J::Bool(true))
+        })
+    })
 }
 
 fn device(p: PlacementMode) -> Device {
@@ -151,30 +166,43 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         let m = crate::runtime::lm::load(a, super::registry()?, family, o.placement)?;
         Ok((ExecutableModel::Native(m), None))
     };
-    // Checkpoints the arch reader cannot open, and registry errors, leave the GraphLm path as
-    // it was (a spec problem fails only spec loads).
+    // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
+    // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
         let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
-        let p = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?.pipeline;
-        Some((f, p))
+        let s = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?;
+        Some((f, s.pipeline, s.matcher.fallback, s.runtime["cutover"] == J::Bool(true)))
     });
-    if let Some((f, Pipeline::Encdec)) = &family {
+    if let Some((f, Pipeline::Encdec, ..)) = &family {
         let m = crate::runtime::encdec::load(a, super::registry()?, Some(f), o.placement)?;
         return Ok((ExecutableModel::Native(m), None));
     }
     if o.family.is_some() {
         return spec(o.family);
     }
-    // legacy: until Phases 5 and 6 (the native loaders' families)
+    let lm_family = match &family {
+        Some((f, Pipeline::Unsupported, ..)) => return spec(Some(f)),
+        Some((f, Pipeline::CausalLm, fallback, cut)) => Some((f.as_str(), *fallback, *cut)),
+        _ => None,
+    };
+    // `runtime.cutover` families (legacy loader deleted) load by default; with GIBBS_SPEC_LM=1
+    // any family's own match does. A fallback match (any causal LM) never pre-empts a legacy
+    // loader.
+    if let Some((f, fallback, cut)) = lm_family {
+        if cut || (spec_lm_enabled() && !fallback) {
+            return spec(Some(f));
+        }
+    }
+    // legacy: until Phase 6 (the native loaders' families)
     if let Some(m) = crate::model::native::load_native(a, o.placement) {
         return Ok((ExecutableModel::Native(m?), None));
     }
-    match family {
-        Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
-        Some((f, Pipeline::CausalLm)) if spec_lm_enabled() => return spec(Some(&f)),
-        _ => {}
+    if let Some((f, ..)) = lm_family {
+        if spec_lm_enabled() {
+            return spec(Some(f));
+        }
     }
     // legacy: until Phase 4 (GraphLm)
     let (lm, choice) = load_causal_lm_with(a, device(o.placement), o.quant, o.hw, &o.reencode)?;

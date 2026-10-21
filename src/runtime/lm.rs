@@ -2,25 +2,34 @@
 //! family spec as a [`NativeLm`].
 //!
 //! Instances (`arch::build`) are keyed by the vars `rows` (positions per pass), `head` (`last`:
-//! logits of the last row; `all`: of every row) and `taps` (`layer.{i}` extra outputs). The decode
-//! instance (`rows=1, head=last`) is compiled once; every other instance runs on its weights and
-//! session through `GraphProgram::run_reshaped`. Each sequence owns its `StateStore`, swapped into
-//! the program for each pass.
+//! logits of the last row; `all`: of every row), `taps` (`layer.{i}` extra outputs) and `media`
+//! (media rows in the pass; absent when 0). The decode instance (`rows=1, head=last`) is compiled
+//! once; every other instance runs on its weights and session through
+//! `GraphProgram::run_reshaped`. Each sequence owns its `StateStore`, swapped into the program for
+//! each pass.
 //!
 //! Inputs the runner fills: `token_ids`, `positions`, `visible_end` (the end of the bidirectional
-//! block a row sits in, else its position + 1) and every input with a `gen` (`arch::gen`); a gen
-//! input's args may name `pos0`, the position of the pass's first row, which the runner
-//! substitutes.
+//! block a row sits in, else its position + 1), every input with a `gen` (`arch::gen`; a gen
+//! input's args may name `pos0`, the position of the pass's first row, and `ids`, the token ids of
+//! positions `pos0 - back .. pos0 + rows` (`back`: the gen's own numeric arg, default 0, clipped at
+//! the sequence start), which the runner substitutes) and the media inputs: `media_rows` (the
+//! media tower's output 0 for the pass's media rows, in prompt order), `media_index` (their rows
+//! within the pass), any other input named like a tower output (that output's rows for the same
+//! media rows) and `rope_positions` (`[t, h, w]` per row from `positions: mrope_grid`; text rows
+//! `p` repeated, rows past the prompt shifted by its delta).
 //!
 //! `runtime` keys: `prefill_rows` (64) rows per prefill pass; `bidir_media_blocks`: a pass that
 //! would end inside a bidirectional block runs to the block's end (at most 512 rows), and the
-//! block end's logits answer the positions it ran ahead; `media` (preprocessing, not wired yet).
+//! block end's logits answer the positions it ran ahead; `media` ([`crate::runtime::media`]):
+//! each attached item is preprocessed, run through its modality's tower component once at
+//! `prepare`, and its placeholder expanded.
 
 use crate::arch::build::{build, InputPlan, Instance, ShapeCache};
 use crate::arch::expr::Val;
 use crate::arch::gen::{generate, GenData};
 use crate::arch::load::Model;
 use crate::arch::Registry;
+use crate::runtime::media::{self, Expanded, Grid, Media, Towers};
 use crate::graph::program::GraphProgram;
 use crate::graph::{StateStore, Tensor};
 use crate::hardware::{Device, PlacementMode};
@@ -60,6 +69,8 @@ pub struct Seq {
     prompt: Vec<u32>,
     /// Positions in `state`.
     len: usize,
+    /// Token ids of positions `0..len` (gen inputs read them as `ids`).
+    ids: Vec<u32>,
     /// Positions the caller has run (`< len` while a finished block runs ahead of it).
     asked: usize,
     /// Logits after position `len - 1` while `asked < len`.
@@ -67,11 +78,42 @@ pub struct Seq {
     /// Bidirectional media blocks (positions), each attended whole in one pass; media
     /// preprocessing fills them when the spec sets `runtime.bidir_media_blocks`.
     pub blocks: Vec<Range<usize>>,
+    /// The expanded prompt's media rows and rotary positions.
+    media: Expanded,
+    /// The tower outputs of every media row (`media.media_index` order): (text input name, row
+    /// width, rows). Output 0 of a tower feeds `media_rows`.
+    rows: Vec<(String, usize, Vec<f32>)>,
     taps: Vec<usize>,
     tapped: Vec<f32>,
     /// Recurrent-state snapshots after each position from `ckpt_from` (the last `forward_all`).
     ckpt: Vec<HashMap<String, Tensor>>,
     ckpt_from: usize,
+}
+
+impl Seq {
+    fn new(prompt: Vec<u32>, media: Expanded, rows: Vec<(String, usize, Vec<f32>)>) -> Self {
+        Seq {
+            state: StateStore::new(),
+            prompt,
+            len: 0,
+            ids: Vec::new(),
+            asked: 0,
+            ahead: Vec::new(),
+            blocks: media.blocks.clone(),
+            media,
+            rows,
+            taps: Vec::new(),
+            tapped: Vec::new(),
+            ckpt: Vec::new(),
+            ckpt_from: 0,
+        }
+    }
+
+    /// Media rows (indices into `media.media_index`) at positions `at..end`.
+    fn media_in(&self, at: usize, end: usize) -> Range<usize> {
+        let idx = &self.media.media_index;
+        idx.partition_point(|&q| (q as usize) < at)..idx.partition_point(|&q| (q as usize) < end)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,9 +125,13 @@ enum Mode {
 
 /// A causal LM run from its family spec.
 pub struct SpecLm {
-    model: Model,
+    model: Arc<Model>,
     rt: Runtime,
-    tok: Tokenizer,
+    media: Media,
+    towers: Towers,
+    /// Modalities whose tower failed to build at load, with why (said when a prompt attaches one).
+    off: HashMap<String, String>,
+    tok: Arc<Tokenizer>,
     ctx: usize,
     shapes: ShapeCache,
     /// Compiled from the decode instance; every other instance runs reshaped on it.
@@ -95,9 +141,12 @@ pub struct SpecLm {
     /// holds no recurrent state: greedy decode may stream on the device.
     streams: bool,
     weights: usize,
+    mode: PlacementMode,
+    /// The spec's own drafter (`runtime.drafter`), compiled at the first ask.
+    drafter: std::sync::OnceLock<Option<Arc<dyn crate::scheduler::spec::Drafter>>>,
 }
 
-fn vars(rows: usize, head: &str, taps: &[usize]) -> Vec<(&'static str, Val)> {
+fn vars(rows: usize, head: &str, taps: &[usize], media: usize) -> Vec<(&'static str, Val)> {
     let mut v = vec![
         ("rows", Val::Num(rows as f64)),
         ("head", Val::Str(head.to_string())),
@@ -109,23 +158,39 @@ fn vars(rows: usize, head: &str, taps: &[usize]) -> Vec<(&'static str, Val)> {
             .collect();
         v.push(("taps", Val::List(t)));
     }
+    if media > 0 {
+        v.push(("media", Val::Num(media as f64)));
+    }
     v
 }
 
-/// The runner-filled value of input `d` for rows `ids` from position `pos0`.
-fn input(
-    d: &InputPlan,
-    ids: &[u32],
+/// One pass: rows `hist[pos0..]` of `seq`; `hist` holds the token ids of every position up to the
+/// pass end.
+struct Pass<'a> {
+    hist: &'a [u32],
     pos0: usize,
-    blocks: &[Range<usize>],
-) -> Result<Tensor, String> {
+    blocks: &'a [Range<usize>],
+    seq: &'a Seq,
+}
+
+/// The runner-filled value of input `d` for pass `p`.
+fn input(d: &InputPlan, p: &Pass) -> Result<Tensor, String> {
+    let (hist, pos0, blocks) = (p.hist, p.pos0, p.blocks);
+    let ids = &hist[pos0..];
     let n = ids.len();
+    let ks = p.seq.media_in(pos0, pos0 + n);
+    let m = &p.seq.media;
     let t = match (&d.gen, d.name.as_str()) {
         (Some((g, args)), _) => {
             let mut args = args.clone();
             if let Some(o) = args.as_object_mut() {
-                for v in o.values_mut().filter(|v| v.as_str() == Some("pos0")) {
-                    *v = pos0.into();
+                let back = o.get("back").and_then(|b| b.as_f64()).unwrap_or(0.0) as usize;
+                for v in o.values_mut() {
+                    match v.as_str() {
+                        Some("pos0") => *v = pos0.into(),
+                        Some("ids") => *v = hist[pos0.saturating_sub(back)..].into(),
+                        _ => {}
+                    }
                 }
             }
             match generate(g, &args)
@@ -143,11 +208,23 @@ fn input(
                 .map(|q| blocks.iter().find(|b| b.contains(&q)).map_or(q + 1, |b| b.end) as u32)
                 .collect(),
         ),
-        (None, other) => {
-            return Err(format!(
-                "input `{other}` has no generator and is none the LM runtime supplies (token_ids, positions, visible_end)"
-            ))
-        }
+        (None, "media_index") => Tensor::U32(m.media_index[ks].iter().map(|&q| q - pos0 as u32).collect()),
+        (None, "rope_positions") => Tensor::U32(
+            (pos0..pos0 + n)
+                .flat_map(|q| match m.pos3.get(q) {
+                    Some(p) => *p,
+                    None => [(q as i64 + m.delta) as u32; 3],
+                })
+                .collect(),
+        ),
+        (None, name) => match p.seq.rows.iter().find(|(n, _, _)| n == name) {
+            Some((_, w, rows)) => Tensor::F32(rows[ks.start * w..ks.end * w].to_vec()),
+            None => {
+                return Err(format!(
+                    "input `{name}` has no generator and is none the LM runtime supplies (token_ids, positions, visible_end, media_rows, media_index, rope_positions, tower outputs)"
+                ))
+            }
+        },
     };
     let (want, got) = (
         d.shape.iter().product::<usize>(),
@@ -200,7 +277,7 @@ impl SpecLm {
         let tok = match (&model.tokenizer, model.ckpt.synthetic) {
             (Some(t), _) => t.clone(),
             // Synthetic (random-weight) ids ship no tokenizer.
-            (None, true) => Tokenizer::default_bpe(),
+            (None, true) => Arc::new(Tokenizer::default_bpe()),
             (None, false) => return Err(format!("{fam}: the checkpoint has no tokenizer")),
         };
         let ctx = ["ctx", "max_position_embeddings"]
@@ -211,20 +288,40 @@ impl SpecLm {
             })?
             .usize()?;
         let shapes = ShapeCache::new(TEXT);
-        let v = vars(1, "last", &[]);
+        let v = vars(1, "last", &[], 0);
         let decode = shapes.get(&v, || {
             build(&model.spec, TEXT, &model.env, &model.store, &v)
         })?;
-        // ponytail: with media the towers' weights count too; Phase 4 adds them to `used`.
-        if rt.media.is_none() {
-            let used: HashSet<String> = decode.weights.iter().cloned().collect();
-            let unused = model.store.unconsumed(&used, &model.spec.ignore);
-            if !unused.is_empty() {
-                return Err(format!(
-                    "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}",
-                    unused.join(", ")
-                ));
+        let media = match &rt.media {
+            Some(raw) => media::resolve(raw, &model.env).map_err(|e| format!("{fam}: {e}"))?,
+            None => Media::new(),
+        };
+        // Each tower is probed with a synthetic item: its weights count as read, and a tower that
+        // does not build leaves its modality off (said when a prompt attaches one).
+        let towers = Towers::new(mode);
+        let mut used: HashSet<String> = decode.weights.iter().cloned().collect();
+        used.extend(crate::runtime::draft::drafter_weights(&model)?);
+        let mut off = HashMap::new();
+        for (name, s) in &media {
+            let probe = media::measure(&s.preprocess, &media::probe_item(&s.preprocess))
+                .and_then(|g| towers.instance(&model, &s.component, &g));
+            match probe {
+                Ok(i) => used.extend(i.weights.iter().cloned()),
+                Err(e) => {
+                    tracing::warn!("{fam}: {name} input is off: {e}");
+                    off.insert(name.clone(), e);
+                }
             }
+        }
+        let unused = model.store.unconsumed(&used, &model.spec.ignore);
+        if !unused.is_empty() {
+            // A failed tower's weights stay unread: its probe error is the real cause.
+            let why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
+            return Err(format!(
+                "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}{}",
+                unused.join(", "),
+                if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
+            ));
         }
         let weights = model.store.materialize(&decode.weights)?;
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
@@ -238,6 +335,9 @@ impl SpecLm {
                 .eq(["token_ids", "positions"]);
         Ok(Self {
             rt,
+            media,
+            towers,
+            off,
             tok,
             ctx,
             shapes,
@@ -245,7 +345,9 @@ impl SpecLm {
             recurrent,
             streams,
             weights: decode.weights.len(),
-            model,
+            mode,
+            drafter: Default::default(),
+            model: Arc::new(model),
         })
     }
 
@@ -255,11 +357,79 @@ impl SpecLm {
             .ok_or_else(|| "sequence state was not built by this model".into())
     }
 
-    fn instance(&self, rows: usize, head: &str, taps: &[usize]) -> Result<Arc<Instance>, String> {
-        let v = vars(rows, head, taps);
+    fn instance(&self, rows: usize, head: &str, taps: &[usize], media: usize) -> Result<Arc<Instance>, String> {
+        let v = vars(rows, head, taps, media);
         let m = &self.model;
         self.shapes
             .get(&v, || build(&m.spec, TEXT, &m.env, &m.store, &v))
+    }
+
+    /// `ids` with `media` laid out by the spec: each item measured (`encode`: also preprocessed
+    /// and run through its tower), placeholders expanded.
+    fn layout(
+        &self,
+        ids: &[u32],
+        items: &[MediaInput],
+        encode: bool,
+    ) -> Result<(Expanded, Vec<(String, usize, Vec<f32>)>), String> {
+        let mut grids: Vec<(&str, Grid, &[u8])> = Vec::with_capacity(items.len());
+        for it in items {
+            let (kind, bytes) = match it {
+                MediaInput::Image(b) => ("image", b),
+                MediaInput::Audio(b) => ("audio", b),
+            };
+            let Some((name, s)) = self.media.get_key_value(kind) else {
+                return Err(format!("this model takes no {kind} input"));
+            };
+            if let Some(e) = self.off.get(kind) {
+                return Err(format!("{kind} input is unavailable: {e}"));
+            }
+            let g = media::measure(&s.preprocess, bytes).map_err(|e| format!("{kind}: {e}"))?;
+            grids.push((name.as_str(), g, bytes));
+        }
+        let refs: Vec<(&str, &Grid)> = grids.iter().map(|(k, g, _)| (*k, g)).collect();
+        // Expansion text sits inside the prompt: no BOS of its own.
+        let tok = |s: &str| {
+            let v = self.tok.encode(s);
+            Ok(match self.tok.bos {
+                Some(b) if v.first() == Some(&b) => v[1..].to_vec(),
+                _ => v,
+            })
+        };
+        let e = media::expand(ids, &self.media, &refs, &tok)?;
+        if e.ids.len() >= self.ctx {
+            return Err(format!(
+                "prompt with its media is {} tokens; the context holds {}",
+                e.ids.len(),
+                self.ctx
+            ));
+        }
+        let mut rows: Vec<(String, usize, Vec<f32>)> = Vec::new();
+        if encode {
+            for (kind, g, bytes) in &grids {
+                let s = &self.media[*kind];
+                let item = media::preprocess(&s.preprocess, bytes).map_err(|e| format!("{kind}: {e}"))?;
+                let out = self.towers.run(&self.model, &s.component, &item)?;
+                for (i, (name, v)) in out.into_iter().enumerate() {
+                    let name = if i == 0 { "media_rows".to_string() } else { name };
+                    if v.len() % g.tokens != 0 {
+                        return Err(format!("{kind}: tower output `{name}` of {} values is not {} rows", v.len(), g.tokens));
+                    }
+                    let w = v.len() / g.tokens;
+                    match rows.iter_mut().find(|(n, _, _)| *n == name) {
+                        Some((_, rw, r)) if *rw == w => r.extend(v),
+                        Some((_, rw, _)) => return Err(format!("tower output `{name}` is {w} wide, earlier items {rw}")),
+                        None => rows.push((name, w, v)),
+                    }
+                }
+            }
+            if let Some((_, w, r)) = rows.first() {
+                if r.len() / w != e.media_index.len() {
+                    return Err(format!("towers returned {} media rows for {}", r.len() / w, e.media_index.len()));
+                }
+            }
+        }
+        Ok((e, rows))
     }
 
     /// Runs `tokens` from `start`; see [`Mode`].
@@ -343,6 +513,8 @@ impl SpecLm {
     ) -> Result<Tensor, String> {
         let (from, cap) = (seq.len, if ckpt { 1 } else { self.rt.prefill_rows.max(1) });
         let stop = from + ids.len();
+        seq.ids.truncate(from);
+        seq.ids.extend_from_slice(ids);
         let refs: Vec<&str> = self.recurrent.iter().map(String::as_str).collect();
         let head = if mode == Mode::All { "all" } else { "last" };
         let (mut logits, mut picked) = (Vec::new(), None);
@@ -363,18 +535,20 @@ impl SpecLm {
                     "cannot checkpoint recurrent state inside a bidirectional block".into(),
                 );
             }
-            let inst = self.instance(rows, head, &seq.taps)?;
+            let nm = seq.media_in(at, e).len();
+            let inst = self.instance(rows, head, &seq.taps, nm)?;
             let li = inst
                 .output_index("logits")
                 .ok_or("the text component has no `logits` output")?;
+            let pass = Pass { hist: &seq.ids[..e], pos0: at, blocks, seq };
             let inputs = inst
                 .inputs
                 .iter()
-                .map(|d| input(d, &ids[at - from..e - from], at, blocks))
+                .map(|d| input(d, &pass))
                 .collect::<Result<Vec<_>, _>>()?;
             let greedy = mode == Mode::Greedy && e == stop && stop == end && li == 0;
             // The compiled program is the decode instance; every other shape runs reshaped.
-            let out = if rows == 1 && head == "last" && seq.taps.is_empty() {
+            let out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
                 match greedy {
                     true => p.run_greedy(inputs, self.tok.vocab_size())?,
                     false => p.run(inputs)?,
@@ -423,6 +597,65 @@ impl SpecLm {
     }
 }
 
+impl SpecLm {
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    /// `ids` from position 0 on a fresh state, in passes of `prefill_rows` rows (instance head
+    /// `hidden` before the last pass, `head` for it); output `out` of the last pass. `extra`
+    /// fills inputs by name for the last pass (a row index there is relative to that pass: see
+    /// [`Self::last_pass_start`]).
+    pub fn run_head(
+        &self,
+        ids: &[u32],
+        head: &str,
+        out: &str,
+        extra: &[(&str, Tensor)],
+    ) -> Result<Vec<f32>, String> {
+        if ids.is_empty() || ids.len() > self.ctx {
+            return Err(format!("{} tokens: the context holds 1..={}", ids.len(), self.ctx));
+        }
+        let cap = self.rt.prefill_rows.max(1);
+        let mut p = self.program.lock();
+        let saved = std::mem::replace(&mut p.state, StateStore::new());
+        let seq = Seq::new(Vec::new(), Expanded::default(), Vec::new());
+        let mut run = || -> Result<Vec<f32>, String> {
+            let mut at = 0;
+            loop {
+                let e = (at + cap).min(ids.len());
+                let last = e == ids.len();
+                let inst = self.instance(e - at, if last { head } else { "hidden" }, &[], 0)?;
+                let inputs = inst
+                    .inputs
+                    .iter()
+                    .map(|d| match extra.iter().find(|x| x.0 == d.name) {
+                        Some((_, t)) if last => Ok(t.clone()),
+                        _ => input(d, &Pass { hist: &ids[..e], pos0: at, blocks: &[], seq: &seq }),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let res = p.run_reshaped(&inst.graph, inputs)?;
+                if e == ids.len() {
+                    let i = inst
+                        .output_index(out)
+                        .ok_or_else(|| format!("the `{head}` instance has no output `{out}`"))?;
+                    return res[i].as_f32().map(<[f32]>::to_vec);
+                }
+                at = e;
+            }
+        };
+        let r = run();
+        p.state = saved;
+        r
+    }
+
+    /// Start position of the last pass [`Self::run_head`] makes over `n` ids.
+    pub fn last_pass_start(&self, n: usize) -> usize {
+        let cap = self.rt.prefill_rows.max(1);
+        (n.max(1) - 1) / cap * cap
+    }
+}
+
 impl NativeLm for SpecLm {
     fn backend_label(&self) -> String {
         self.program.lock().backend_label()
@@ -451,29 +684,23 @@ impl NativeLm for SpecLm {
         self.ctx
     }
 
-    fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
-        if !media.is_empty() {
-            return Err(match self.rt.media {
-                Some(_) => format!(
-                    "{}: image/audio input is not wired to the spec runtime yet; send text only",
-                    self.model.spec.family
-                ),
-                None => "this model takes text only (no image or audio input)".into(),
-            });
+    fn prompt_len(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<usize, String> {
+        if media.is_empty() && self.media.is_empty() {
+            return Ok(ids.len());
         }
-        let seq = Seq {
-            state: StateStore::new(),
-            prompt: ids.clone(),
-            len: 0,
-            asked: 0,
-            ahead: Vec::new(),
-            blocks: Vec::new(),
-            taps: Vec::new(),
-            tapped: Vec::new(),
-            ckpt: Vec::new(),
-            ckpt_from: 0,
-        };
-        Ok((ids, Box::new(seq)))
+        Ok(self.layout(&ids, media, false)?.0.ids.len())
+    }
+
+    fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
+        if media.is_empty() && self.media.is_empty() {
+            return Ok((ids.clone(), Box::new(Seq::new(ids, Expanded::default(), Vec::new()))));
+        }
+        if self.media.is_empty() {
+            return Err("this model takes text only (no image or audio input)".into());
+        }
+        let (mut e, rows) = self.layout(&ids, media, true)?;
+        let ids = std::mem::take(&mut e.ids);
+        Ok((ids.clone(), Box::new(Seq::new(ids, e, rows))))
     }
 
     fn forward(
@@ -511,6 +738,8 @@ impl NativeLm for SpecLm {
         std::mem::swap(&mut p.state, &mut seq.state);
         if let Ok(Some(_)) = out {
             (seq.len, seq.asked) = (start_pos + 1, start_pos + 1);
+            seq.ids.truncate(start_pos);
+            seq.ids.push(last);
             seq.ckpt.clear();
         }
         out
@@ -556,18 +785,30 @@ impl NativeLm for SpecLm {
         seq.ckpt.clear();
         seq.ahead.clear();
         (seq.len, seq.asked) = (len, len);
+        seq.ids.truncate(len);
         Ok(())
     }
 
     fn set_taps(&self, state: &mut SeqState, layers: &[usize]) -> Result<(), String> {
         // Builds (and caches) a tapped instance: an unknown layer fails here, not mid-decode.
-        self.instance(1, "last", layers)?;
+        self.instance(1, "last", layers, 0)?;
         Self::seq(state)?.taps = layers.to_vec();
         Ok(())
     }
 
     fn take_taps(&self, state: &mut SeqState) -> Vec<f32> {
         Self::seq(state).map_or_else(|_| Vec::new(), |s| std::mem::take(&mut s.tapped))
+    }
+
+    fn drafter(&self) -> Option<Arc<dyn crate::scheduler::spec::Drafter>> {
+        self.drafter
+            .get_or_init(|| {
+                crate::runtime::draft::spec_drafter(&self.model, self.mode)
+                    .map_err(|e| tracing::warn!("drafter: {e}"))
+                    .ok()
+                    .flatten()
+            })
+            .clone()
     }
 }
 
@@ -1002,6 +1243,130 @@ mod tests {
                     d > 1e-2 * scale,
                     "the block must change the logits ({d} of {scale})"
                 );
+            }
+        }
+    }
+
+    /// A toy LM with an audio modality: raw 4-sample frames through a linear tower (output 0 the
+    /// soft rows, output `extra` added after attention), rows scattered after the embedding, the
+    /// item one bidirectional block; an `image` modality switched off by `when`.
+    const MEDIA_SPEC: &str = r#"{
+      family: "toym", pipeline: "causal_lm",
+      config: {vocab: 32, hidden: 16, heads: 2, kv_heads: 1, hd: 8, ctx: 64},
+      runtime: {prefill_rows: $ROWS, bidir_media_blocks: true, media: {
+        audio: {component: "tower", preprocess: {kind: "raw_frames", sampling_rate: 16000, frame: 4, max_tokens: 16},
+                expand: {kind: "repeat_between", placeholder: 31, open: 29, close: 30}, bidirectional: true},
+        image: {when: "false", component: "nope", preprocess: {kind: "raw_frames", sampling_rate: 1, frame: 1, max_tokens: 1},
+                expand: {kind: "repeat_between", placeholder: 28, open: 27, close: 26}},
+      }},
+      constants: {
+        inv_freq: {gen: "rope_inv_freq", args: {dim: "hd", theta: 10000}},
+        ones: {gen: "ones", args: {shape: ["hidden"]}},
+      },
+      synthetic: {
+        emb: {shape: ["vocab", "hidden"]},
+        tw: {shape: ["hidden", 4]}, tx: {shape: ["hidden", 4]},
+        q: {shape: ["heads*hd", "hidden"]}, k: {shape: ["kv_heads*hd", "hidden"]},
+        v: {shape: ["kv_heads*hd", "hidden"]}, o: {shape: ["hidden", "heads*hd"]},
+      },
+      components: {
+        tower: {vars: ["tokens"], inputs: [{name: "frames", dtype: "f32", shape: ["tokens", 4]}],
+          body: [{op: "Linear", in: ["i:frames", "w:tw"], out: "rows"}, {op: "Linear", in: ["i:frames", "w:tx"], out: "extra"}],
+          outputs: ["rows", "extra"]},
+        text: {
+          vars: ["rows", "head"],
+          inputs: [
+            {name: "token_ids", dtype: "u32", shape: ["rows"]},
+            {name: "positions", dtype: "u32", shape: ["rows"]},
+            {name: "visible_end", dtype: "u32", shape: ["rows"], when: "rows > 1"},
+            {name: "media_rows", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
+            {name: "media_index", dtype: "u32", shape: ["media"], when: "first(media, 0) > 0"},
+            {name: "extra", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
+          ],
+          body: [
+            {op: "Embedding", in: ["w:emb", "i:token_ids"], out: "x"},
+            {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", when: "first(media, 0) > 0"},
+            {state: "kv.k", shape: ["ctx", "kv_heads*hd"]},
+            {state: "kv.v", shape: ["ctx", "kv_heads*hd"]},
+            {op: "RmsNorm", args: {eps: 1e-5}, in: ["x", "c:ones"], out: "n"},
+            {op: "Linear", in: ["n", "w:q"], out: "q"},
+            {op: "Linear", in: ["n", "w:k"], out: "k"},
+            {op: "Linear", in: ["n", "w:v"], out: "v"},
+            {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "HalfSplit", mscale: 1.0}, in: ["q", "i:positions", "c:inv_freq"], out: "q"},
+            {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "HalfSplit", mscale: 1.0}, in: ["k", "i:positions", "c:inv_freq"], out: "k"},
+            {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "hd", v_head_dim: "hd", scale: "1/sqrt(hd)", causal: true, write: true},
+             in: ["q", "k", "v", "s:kv.k", "s:kv.v", "i:positions", "i:visible_end"], out: "a", when: "rows > 1"},
+            {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "hd", v_head_dim: "hd", scale: "1/sqrt(hd)", causal: true, write: true},
+             in: ["q", "k", "v", "s:kv.k", "s:kv.v", "i:positions"], out: "a", when: "rows == 1"},
+            {op: "Linear", in: ["a", "w:o"], out: "a"},
+            {op: "Unary", args: {kind: {Scale: 50.0}}, in: ["a"], out: "a"},
+            {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x"},
+            {block: [
+              {op: "Unary", args: {kind: {Scale: 0.0}}, in: ["x"], out: "z"},
+              {op: "Scatter", args: {axis: 0}, in: ["z", "i:media_index", "i:extra"], out: "z"},
+              {op: "Binary", args: {kind: "Add"}, in: ["x", "z"], out: "x"},
+            ], when: "first(media, 0) > 0"},
+            {op: "Slice", args: {axis: 0, start: "rows - 1", end: "rows"}, in: ["x"], out: "x", when: "head == 'last' && rows > 1"},
+            {op: "Linear", in: ["x", "w:emb"], out: "logits"},
+          ],
+          outputs: ["logits"],
+        },
+      },
+    }"#;
+
+    fn toy_media(dev: Device, rows: usize) -> SpecLm {
+        let spec = MEDIA_SPEC.replace("$ROWS", &rows.to_string());
+        let reg = Registry::from_files(&[("families/toym.json5".into(), spec)], &[]).unwrap();
+        let a = ModelArtifacts { model_id: "gibbs/toym".into(), ..Default::default() };
+        let exact = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let m = crate::arch::load::load_with(&a, &reg, Some("toym"), exact).unwrap();
+        SpecLm::new(m, PlacementMode::Pin(dev)).unwrap()
+    }
+
+    /// 16 kHz mono 16-bit WAV of `n` non-silent samples.
+    fn wav(n: usize) -> Vec<u8> {
+        let pcm: Vec<u8> = (0..n).flat_map(|i| (((i * 7919) % 2000) as i16 - 1000).to_le_bytes()).collect();
+        let mut b = b"RIFF".to_vec();
+        b.extend((36 + pcm.len() as u32).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend([1, 0, 1, 0]);
+        b.extend(16_000u32.to_le_bytes());
+        b.extend(32_000u32.to_le_bytes());
+        b.extend([2, 0, 16, 0]);
+        b.extend(b"data");
+        b.extend((pcm.len() as u32).to_le_bytes());
+        b.extend(pcm);
+        b
+    }
+
+    /// Media rows and a tower's extra output land on their rows whatever the pass split (the
+    /// block runs whole), change the logits, and decode continues after them.
+    #[test]
+    fn media_rows_scatter_into_any_pass_split() {
+        for dev in devices() {
+            let (chunked, oneshot) = (toy_media(dev, 3), toy_media(dev, 64));
+            let prompt = [3u32, 17, 31, 5, 9];
+            let clip = [MediaInput::Audio(wav(22))]; // 6 frames of 4 (the last zero-padded)
+            assert!(chunked.prepare(prompt.to_vec(), &[MediaInput::Image(vec![1])]).is_err(), "image is off");
+            let (ids, mut a) = chunked.prepare(prompt.to_vec(), &clip).unwrap();
+            assert_eq!(ids, vec![3, 17, 29, 31, 31, 31, 31, 31, 31, 30, 5, 9]);
+            assert_eq!(chunked.prompt_len(prompt.to_vec(), &clip).unwrap(), ids.len());
+            assert_eq!(SpecLm::seq(&mut a).unwrap().blocks, vec![3..9]);
+            // 0..4 ends inside the block 3..9: the pass runs to 9.
+            let ahead = chunked.forward(&ids[..4], 0, &mut a).unwrap();
+            assert_eq!(chunked.forward(&ids[4..8], 4, &mut a).unwrap(), ahead);
+            let la = chunked.forward(&ids[8..], 8, &mut a).unwrap();
+            let (_, mut b) = oneshot.prepare(prompt.to_vec(), &clip).unwrap();
+            let lb = oneshot.forward(&ids, 0, &mut b).unwrap();
+            close(&la, &lb, tol(dev));
+            let da = chunked.forward(&[7], ids.len(), &mut a).unwrap();
+            close(&da, &oneshot.forward(&[7], ids.len(), &mut b).unwrap(), tol(dev));
+            if dev == Device::Cpu {
+                let mut t: SeqState = Box::new(Seq::new(ids.clone(), Expanded::default(), Vec::new()));
+                SpecLm::seq(&mut t).unwrap().blocks = vec![3..9];
+                let plain = oneshot.forward(&ids, 0, &mut t).unwrap();
+                assert!(plain.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "media rows must matter");
             }
         }
     }

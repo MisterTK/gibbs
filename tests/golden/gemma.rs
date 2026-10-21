@@ -1,7 +1,6 @@
 use crate::util::*;
-use gibbs_engine::graph::Tensor;
 use gibbs_engine::hardware::{Device, PlacementMode};
-use gibbs_engine::model::native::{load_native, MediaInput, NativeLm};
+use gibbs_engine::model::native::{MediaInput, NativeLm};
 use gibbs_engine::model::weight_format::{set_reencode_override, ReencodeConfig, ReencodePolicy};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -100,6 +99,7 @@ fn wav() -> Vec<u8> {
 }
 
 /// Bit-exact weights on every device: the golden must not depend on the user's re-encode settings.
+/// runner: `runtime::lm::load` (the `gemma4` family spec on `runtime::lm::SpecLm`).
 fn load(dir: &Path, dev: Device) -> Arc<dyn NativeLm> {
     set_reencode_override(Some(ReencodeConfig {
         policy: ReencodePolicy::BitExact,
@@ -107,8 +107,8 @@ fn load(dir: &Path, dev: Device) -> Arc<dyn NativeLm> {
         ..Default::default()
     }));
     let art = artifacts(dir, "golden/gemma4", "model.safetensors");
-    let m = load_native(&art, PlacementMode::Pin(dev))
-        .expect("gemma4 is a native architecture")
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let m = gibbs_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(dev))
         .unwrap_or_else(|e| panic!("load {}: {e}", dir.display()));
     // No silent host fallback: a Metal pin must run the Metal program.
     assert_eq!(m.device(), dev, "{}: {}", dir.display(), m.backend_label());
@@ -443,40 +443,15 @@ fn gemma4_ple() {
     text_case("gemma_gemma4_ple", G4 { ple: true, ..G4::default() });
 }
 
-/// The MoE block has no host forward: the CPU reference is the decode graph (built from the same
-/// checkpoint) on the CPU graph executor, stepped token by token; Metal is the `load_native` model.
+/// The MoE block on the CPU graph executor and Metal.
 #[test]
 fn gemma4_moe() {
-    use gibbs_engine::model::gemma4::text::TextModel;
     let case = "gemma_gemma4_moe";
     let dir = gemma4_fixture(case, G4 { moe: true, ..G4::default() });
     golden(case, TOL, |dev| {
-        if dev != Device::Cpu {
-            let m = load(&dir, dev);
-            let (ids, mut st) = m.prepare(PROMPT.to_vec(), &[]).unwrap();
-            return decode_run(|t, p| m.forward(t, p, &mut st).unwrap(), &ids);
-        }
-        // runner: internal gemma4::text::TextModel::load + to_decode_graph + graph::cpu::run
-        let cfg: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let w = gibbs_engine::model::weights::Weights::open(&dir.join("model.safetensors")).unwrap();
-        let tm = TextModel::load(&w, &cfg["text_config"]).unwrap();
-        let (g, gw) = tm.to_decode_graph().unwrap();
-        let mut state = gibbs_engine::graph::StateStore::new();
-        decode_run(
-            |toks, pos| {
-                let mut last = Vec::new();
-                for (i, &t) in toks.iter().enumerate() {
-                    let mut e = vec![0.0f32; tm.hidden];
-                    tm.embed_row(t, &mut e);
-                    let inputs = vec![Tensor::F32(e), Tensor::U32(vec![(pos + i) as u32])];
-                    let r = gibbs_engine::graph::cpu::run(&g, &gw, &mut state, inputs).unwrap();
-                    last = r[0].as_f32().unwrap().to_vec();
-                }
-                last
-            },
-            &PROMPT,
-        )
+        let m = load(&dir, dev);
+        let (ids, mut st) = m.prepare(PROMPT.to_vec(), &[]).unwrap();
+        decode_run(|t, p| m.forward(t, p, &mut st).unwrap(), &ids)
     });
 }
 

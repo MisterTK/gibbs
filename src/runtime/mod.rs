@@ -1,7 +1,9 @@
 pub mod diffusion;
+pub mod draft;
 pub mod encdec;
 pub mod bag;
 pub mod lm;
 pub mod media;
 pub mod encoder;
 pub mod sched;
+pub mod seqcls;

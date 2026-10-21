@@ -2,7 +2,7 @@
 
 use super::theme::{theme, Token};
 use super::widgets::instrument;
-use crate::model::draft::{draft_target, is_draft_for};
+use crate::runtime::draft::{draft_target, is_draft_for};
 use crate::model::hub::{
     branch_models, detect_quant_format, is_metadata_file, list_repo_files, select_weight_files,
     split_revision, split_weight_file, HuggingFaceHub, RepoFile,
@@ -1645,13 +1645,9 @@ fn parse_hub_rows(
                 .map_or(Vec::new(), |t| t.iter().filter_map(Value::as_str).collect());
             let gguf_arch = m["gguf"]["architecture"].as_str();
             let draft_for = draft_target(&id, &m["config"], &tags, gguf_arch);
-            // llama.cpp `dflash` GGUFs (DFlash / DFlash2 / DSpark sidecars) attach like safetensors
-            // drafters; the ik_llama / Lucebox forks name their own arch with another tensor layout.
-            let gguf_draft = gguf_arch
-                .filter(|a| *a != "dflash" && (a.contains("dflash") || a.contains("dspark")))
-                .map(|a| {
-                    format!("llama.cpp GGUF draft sidecar with fork architecture '{a}' (tensor names and metadata differ from llama.cpp's 'dflash'; attach a 'dflash' GGUF or the safetensors drafter)")
-                });
+            // GGUF draft sidecars attach like safetensors drafters; llama.cpp forks' own
+            // architectures (another tensor layout) are refused by name.
+            let gguf_draft = gguf_arch.and_then(crate::runtime::draft::refused_draft_gguf);
             let dit = m["config"]["diffusers"]["_class_name"]
                 .as_str()
                 .is_some_and(|c| crate::model::dit::PIPELINES.contains(&c));
@@ -1965,14 +1961,11 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
 }
 
 /// llama.cpp GGUF architectures a generation path reads (causal-LM family specs, and the native
-/// qwen3 / hunyuan-dense / qwen35 / qwen35moe / qwen4exp / gemma4 GGUF loaders), whatever task the
-/// repo is tagged with.
+/// gemma4 GGUF loader), whatever task the repo is tagged with.
 fn gguf_lm_archs() -> Vec<String> {
     let mut a = crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs());
-    // legacy: until Phases 5 and 6 give the native loaders' families specs.
-    a.extend(
-        ["qwen3", "hunyuan-dense", "qwen35", "gemma4", "qwen35moe", "qwen4exp"].map(String::from),
-    );
+    // legacy: until Phase 6 gives gemma4 a spec.
+    a.push("gemma4".into());
     a
 }
 
@@ -1999,7 +1992,7 @@ fn gemma4_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
 fn native_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
     let t = m["config"]["model_type"]
         .as_str()
-        .filter(|_| native_type(m))?;
+        .filter(|t| crate::model::native::NATIVE_MODEL_TYPES.contains(t))?;
     let gguf = selection.as_ref().ok()?.first()?.ends_with(".gguf");
     (gguf && !crate::model::native::NATIVE_GGUF_TYPES.contains(&t))
         .then(|| format!("'{t}' loads from safetensors only; this repo's weights are GGUF"))
@@ -2028,11 +2021,12 @@ fn quant_blocker(m: &Value) -> Option<String> {
     crate::model::prequant::scheme_blocker(&m["config"], None)
 }
 
-/// `model_type` runs natively ([`crate::model::native`]: bf16 weights, mapped, not expanded).
+/// `model_type` runs natively ([`crate::model::native`]) or from its family spec
+/// ([`crate::arch::dispatch::runs_spec_lm`]): weights mapped as stored, not expanded.
 fn native_type(m: &Value) -> bool {
-    m["config"]["model_type"]
-        .as_str()
-        .is_some_and(|t| crate::model::native::NATIVE_MODEL_TYPES.contains(&t))
+    m["config"]["model_type"].as_str().is_some_and(|t| {
+        crate::model::native::NATIVE_MODEL_TYPES.contains(&t) || crate::arch::dispatch::runs_spec_lm(t)
+    })
 }
 
 /// GGUF architectures whose expert banks stay packed in the file data (never expanded).

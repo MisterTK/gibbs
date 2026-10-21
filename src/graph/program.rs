@@ -410,10 +410,7 @@ impl GraphProgram {
                         inputs.len()
                     ));
                 }
-                let mut out = session.run_prepared(g, plan, Some(&mut self.state), inputs)?;
-                // Outputs come back as f32 slots; output 0 holds the u32 index's bits.
-                out[0] = Tensor::U32(out[0].as_f32()?.iter().map(|v| v.to_bits()).collect());
-                return Ok(out);
+                return session.run_prepared(g, plan, Some(&mut self.state), inputs);
             }
         }
         let _ = valid;

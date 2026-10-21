@@ -30,6 +30,15 @@ mod tests_encoders_bert_gguf;
 mod tests_encoders_deberta;
 #[cfg(test)]
 mod tests_idefics3;
+// Parity with the pre-spec implementations (deleted with them).
+#[cfg(test)]
+mod parity_gemma4_text;
+#[cfg(test)]
+mod parity_gemma4_vision;
+#[cfg(test)]
+mod parity_gemma4_audio;
+#[cfg(test)]
+mod parity_gemma3;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -48,6 +57,12 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("names/bfl.json5", include_str!("../../arch/names/bfl.json5")),
     ("names/openclip.json5", include_str!("../../arch/names/openclip.json5")),
     ("names/ldm.json5", include_str!("../../arch/names/ldm.json5")),
+    ("lib/qwen.json5", include_str!("../../arch/lib/qwen.json5")),
+    ("lib/deltanet.json5", include_str!("../../arch/lib/deltanet.json5")),
+    ("lib/moe.json5", include_str!("../../arch/lib/moe.json5")),
+    ("names/qwen35.json5", include_str!("../../arch/names/qwen35.json5")),
+    ("lib/qwen_vit.json5", include_str!("../../arch/lib/qwen_vit.json5")),
+    ("families/gemma3.json5", include_str!("../../arch/families/gemma3.json5")),
     ("families/llama.json5", include_str!("../../arch/families/llama.json5")),
     ("families/glm.json5", include_str!("../../arch/families/glm.json5")),
     ("families/granite.json5", include_str!("../../arch/families/granite.json5")),
@@ -92,6 +107,14 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("overrides/sdxl_file_turbo.json5", include_str!("../../arch/overrides/sdxl_file_turbo.json5")),
     ("families/nano.json5", include_str!("../../arch/families/nano.json5")),
     ("families/idefics3.json5", include_str!("../../arch/families/idefics3.json5")),
+    ("families/dflash.json5", include_str!("../../arch/families/dflash.json5")),
+    ("families/qwen3_5.json5", include_str!("../../arch/families/qwen3_5.json5")),
+    ("families/qwen3.json5", include_str!("../../arch/families/qwen3.json5")),
+    ("families/hunyuan.json5", include_str!("../../arch/families/hunyuan.json5")),
+    ("families/qwen3_vl.json5", include_str!("../../arch/families/qwen3_vl.json5")),
+    ("families/qwen4_exp.json5", include_str!("../../arch/families/qwen4_exp.json5")),
+    ("families/gemma4.json5", include_str!("../../arch/families/gemma4.json5")),
+    ("families/gemma4_unified.json5", include_str!("../../arch/families/gemma4_unified.json5")),
     ("families/t5.json5", include_str!("../../arch/families/t5.json5")),
     ("families/bart.json5", include_str!("../../arch/families/bart.json5")),
     ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
@@ -396,7 +419,9 @@ impl Signals {
     }
 }
 
-/// RFC 7386 merge patch of `patch` into `target`.
+/// RFC 7386 merge patch of `patch` into `target`, plus one extension: a key `k+` whose value is
+/// an array appends it to the target's array `k` (so a child spec adds checks / transforms /
+/// rules to its parent's instead of repeating them).
 pub fn merge_patch(target: &mut J, patch: &J) {
     let J::Object(p) = patch else {
         *target = patch.clone();
@@ -407,7 +432,12 @@ pub fn merge_patch(target: &mut J, patch: &J) {
     }
     let t = target.as_object_mut().unwrap();
     for (k, v) in p {
-        if v.is_null() {
+        if let (Some(base), J::Array(more)) = (k.strip_suffix('+'), v) {
+            match t.entry(base.to_string()).or_insert(J::Array(Vec::new())) {
+                J::Array(a) => a.extend(more.iter().cloned()),
+                other => *other = v.clone(),
+            }
+        } else if v.is_null() {
             t.remove(k);
         } else {
             merge_patch(t.entry(k.clone()).or_insert(J::Null), v);
@@ -856,6 +886,19 @@ mod tests {
         let names = names::Renamer::from_pairs(&r.name_set("bfl").unwrap()).unwrap();
         assert_eq!(names.canonical("double_blocks.3.txt_attn.qkv.bias"), "transformer_blocks.3.attn.to_added_qkv.bias");
         assert_eq!(names.canonical("single_blocks.0.norm.key_norm.scale"), "single_transformer_blocks.0.attn.norm_k.weight");
+    }
+
+    #[test]
+    fn plus_key_appends_to_parent_array() {
+        let mut t = serde_json::json!({"checks": [1, 2], "names": {"use": ["s"], "rules": [3]}});
+        merge_patch(
+            &mut t,
+            &serde_json::json!({"checks+": [4], "names": {"rules+": [5]}, "new+": [6]}),
+        );
+        assert_eq!(
+            t,
+            serde_json::json!({"checks": [1, 2, 4], "names": {"use": ["s"], "rules": [3, 5]}, "new": [6]})
+        );
     }
 
     #[test]

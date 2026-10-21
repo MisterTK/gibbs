@@ -115,6 +115,8 @@ struct RawTensor {
     /// Logical row-major shape (GGUF/ggml dims already reversed).
     shape: Vec<usize>,
     kind: Kind,
+    /// From the multimodal projector beside the weights ([`index_sidecar`]).
+    sidecar: bool,
 }
 
 /// An opened checkpoint: signals for matching, scopes for expressions, raw tensors.
@@ -134,6 +136,9 @@ pub struct Checkpoint {
     container: Option<Arc<GgufData>>,
     /// Safetensors written by `peft::prepare_causal_lm` (the adapter beside it is merged already).
     lora_merged: bool,
+    /// Canonical tensors read through `values(name)` (folded into the graph as constants, e.g.
+    /// clamp bounds): consumed like graph weights.
+    values_read: Mutex<HashSet<String>>,
 }
 
 impl Checkpoint {
@@ -261,10 +266,18 @@ pub fn open(artifacts: &ModelArtifacts) -> Result<Checkpoint, String> {
         raw: BTreeMap::new(),
         container: None,
         lora_merged: false,
+        values_read: Mutex::default(),
     };
     match &weights {
         None => ck.synthetic = crate::model::hub::is_synthetic_model_id(&artifacts.model_id),
-        Some(p) => open_weights(&mut ck, p, config)?,
+        Some(p) => {
+            open_weights(&mut ck, p, config)?;
+            if ck.container.is_some() {
+                if let Some(mm) = crate::model::hub::local_mmproj(p) {
+                    index_sidecar(&mut ck, &mm)?;
+                }
+            }
+        }
     }
     let cfg = &ck.cfg;
     let architectures: Vec<String> = cfg["architectures"]
@@ -322,11 +335,11 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
     let format = UniversalModelLoader::detect_format(&head[..n]).ok();
     if format == Some(SourceFormat::Gguf) {
         let (m, data) = crate::model::loaders::gguf::open(p)?;
-        return Ok(index_buf(ck, m, data));
+        return Ok(index_buf(ck, m, data, false));
     }
     if format == Some(SourceFormat::Ggml) {
         let (m, data) = crate::model::loaders::ggml::open(p)?;
-        return Ok(index_buf(ck, m, GgufData::Buf(data)));
+        return Ok(index_buf(ck, m, GgufData::Buf(data), false));
     }
     if name.ends_with(".ninfer") {
         let (w, cfg) = crate::model::ninfer::Artifact::open(p)?.checkpoint()?;
@@ -351,7 +364,7 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
             let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
             buf.push(n, shape, "F32", &bytes)?;
         }
-        return Ok(index_buf(ck, buf.manifest, GgufData::Buf(buf.data)));
+        return Ok(index_buf(ck, buf.manifest, GgufData::Buf(buf.data), false));
     }
     if name.ends_with(".safetensors") || name.contains(".safetensors.index") {
         let dir = p.parent().unwrap_or(Path::new("."));
@@ -361,7 +374,7 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
         return Ok(());
     }
     let (m, data) = crate::model::loaders::read_checkpoint(p)?;
-    Ok(index_buf(ck, m, GgufData::Buf(data)))
+    Ok(index_buf(ck, m, GgufData::Buf(data), false))
 }
 
 /// Whether the safetensors header at `p` carries `peft::prepare_causal_lm`'s merge marker.
@@ -382,17 +395,19 @@ fn peft_merged(p: &Path) -> bool {
 
 /// The GGUF / ggml / read-buffer source adapter. GGUF and ggml list dims fastest first: this is
 /// the one place they are reversed to row-major.
-fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData) {
+fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData, sidecar: bool) {
     let container = matches!(m.format, SourceFormat::Gguf | SourceFormat::Ggml);
     let data = Arc::new(data);
     if container {
-        ck.gguf = Some(
-            m.metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), meta_json(v)))
-                .collect(),
-        );
-        ck.container = Some(data.clone());
+        let meta = ck.gguf.get_or_insert_with(Map::new);
+        for (k, v) in &m.metadata {
+            if !sidecar || !meta.contains_key(k) {
+                meta.insert(k.clone(), meta_json(v));
+            }
+        }
+        if !sidecar {
+            ck.container = Some(data.clone());
+        }
     }
     let man = Arc::new(m);
     for (name, vt) in &man.tensors {
@@ -422,9 +437,25 @@ fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData) {
                 },
                 shape,
                 kind,
+                sidecar,
             },
         );
     }
+}
+
+/// llama.cpp's multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
+/// join the raw tensors, seen only by specs with `runtime.media`, and its metadata keys the
+/// `gguf` scope (the weights file's own keys win, `general.architecture` among them).
+fn index_sidecar(ck: &mut Checkpoint, p: &Path) -> Result<(), String> {
+    let (m, data) = crate::model::loaders::gguf::open(p)?;
+    if let Some(dup) = m.tensors.keys().find(|n| ck.raw.contains_key(*n)) {
+        return Err(format!(
+            "{}: tensor `{dup}` is also in the weights file",
+            p.display()
+        ));
+    }
+    index_buf(ck, m, data, true);
+    Ok(())
 }
 
 fn index_weights(ck: &mut Checkpoint, w: Weights) {
@@ -451,6 +482,7 @@ fn index_weights(ck: &mut Checkpoint, w: Weights) {
                 store: Store::St(w.clone()),
                 shape,
                 kind,
+                sidecar: false,
             },
         );
     }
@@ -519,6 +551,21 @@ impl Env for Vars<'_> {
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.parent.shape(t)
     }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.parent.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.parent.raw_has(p)
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.parent.values(t)
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.parent.dtype(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.parent.token(s)
+    }
 }
 
 /// Follows `path` into `j` without cloning what it skips.
@@ -543,12 +590,14 @@ fn walk_json(mut j: &J, path: &[Val]) -> Option<Val> {
 
 /// The expression scope of a loaded model (see the module docs of `expr`): spec `config` vars
 /// (lazy, memoized; a cycle is an error), `cfg.<path>`, `gguf.<key>` (`<general.architecture>.<key>`
-/// first), `json.<file>.<path>`, `runtime.<path>`; `has`/`shape` see canonical tensors.
+/// first), `json.<file>.<path>`, `runtime.<path>`; `has`/`shape`/`values` see canonical tensors,
+/// `token` the tokenizer's vocabulary.
 pub struct ModelEnv {
     config: Map<String, J>,
     runtime: RwLock<J>,
     ckpt: Arc<Checkpoint>,
     table: Table,
+    tok: Option<Arc<Tokenizer>>,
     /// Successfully evaluated config vars.
     memo: Mutex<HashMap<String, Val>>,
     files: Mutex<HashMap<String, Option<J>>>,
@@ -648,10 +697,25 @@ impl Env for Eval<'_> {
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.m.shape(t)
     }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.m.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.m.raw_has(p)
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        self.m.values(t)
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.m.dtype(t)
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.m.token(s)
+    }
 }
 
 impl ModelEnv {
-    fn new(spec: &Spec, ckpt: Arc<Checkpoint>, table: Table) -> Self {
+    fn new(spec: &Spec, ckpt: Arc<Checkpoint>, table: Table, tok: Option<Arc<Tokenizer>>) -> Self {
         Self {
             config: spec.config.clone(),
             runtime: RwLock::new(if spec.runtime.is_null() {
@@ -661,6 +725,7 @@ impl ModelEnv {
             }),
             ckpt,
             table,
+            tok,
             memo: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
         }
@@ -743,6 +808,64 @@ impl Env for ModelEnv {
     }
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.table.read().get(t).map(|n| n.shape.clone())
+    }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.table.read().get(t).map(|n| match n.kind {
+            Kind::Packed(f) => crate::model::layers::gguf_block_codec(f).map_or(1, |b| b.0),
+            _ => 1,
+        })
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.ckpt.raw.keys().any(|r| glob(p, r))
+    }
+    fn values(&self, t: &str) -> Option<Vec<f32>> {
+        let n = self.table.read().get(t).cloned()?;
+        let v = (n.shape.iter().product::<usize>() <= SMALL_VALUES)
+            .then(|| node_values(&self.ckpt, &n))
+            .flatten()?;
+        self.ckpt.values_read.lock().insert(t.to_string());
+        Some(v)
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        Some(match self.table.read().get(t)?.kind {
+            Kind::F32 => "f32",
+            Kind::F16 => "f16",
+            Kind::Bf16 => "bf16",
+            Kind::U32 => "u32",
+            Kind::Packed(_) => "quant",
+        })
+    }
+    fn token(&self, s: &str) -> Option<u32> {
+        self.tok.as_ref()?.vocab.get(s).copied()
+    }
+}
+
+/// The most elements `values(name)` reads.
+const SMALL_VALUES: usize = 1 << 16;
+
+/// `n` as f32 values from checkpoint data, generators and transforms (`None` for adapter and
+/// synthetic tensors, which exist only once the store is built).
+fn node_values(ckpt: &Checkpoint, n: &Node) -> Option<Vec<f32>> {
+    match &n.src {
+        Src::Raw(r) => ckpt.raw_f32(r).ok(),
+        Src::Gen(g) => Some(match &g.data {
+            GenData::F32(v) => v.clone(),
+            GenData::U32(v) => v.iter().map(|&x| x as f32).collect(),
+        }),
+        Src::Xf {
+            op,
+            args,
+            ins,
+            part,
+        } => {
+            let vals = ins
+                .iter()
+                .map(|i| node_values(ckpt, i))
+                .collect::<Option<Vec<_>>>()?;
+            xf_dense(op, args, ins, vals, *part).ok()
+        }
+        Src::Pre { data, .. } => Some(data.clone()),
+        Src::Adapter(_) | Src::Synth(_) => None,
     }
 }
 
@@ -837,7 +960,9 @@ impl WeightStore {
             },
             Kind::Packed(f) if n.kind == Kind::Packed(f) => {
                 let mut p = self.packed(n)?;
-                if n.shape.len() == 2 && self.reencode.force.is_none() {
+                // Rank-3 banks regrouped to rows (`reshape`) stay as stored, as their rank-3 raws.
+                let regrouped = matches!(&n.src, Src::Xf { op, .. } if op == "reshape");
+                if n.shape.len() == 2 && self.reencode.force.is_none() && !regrouped {
                     if let Some(pr) = &self.reencode.progress {
                         pr.total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -893,6 +1018,10 @@ impl WeightStore {
         };
         match &n.src {
             Src::Raw(r) => self.ckpt.raw_packed(r),
+            Src::Xf { op, ins, .. } if op == "reshape" => Ok(Packed {
+                shape: n.shape.clone(),
+                ..self.packed(&ins[0])?
+            }),
             Src::Xf { op, args, ins, .. } if op == "untile_packed_rows" => {
                 let p = self.packed(&ins[0])?;
                 let (rows, cols) = rows_cols(&n.shape);
@@ -907,6 +1036,19 @@ impl WeightStore {
                     off: 0,
                     format: f,
                     shape: n.shape.clone(),
+                })
+            }
+            Src::Xf { op, ins, .. } if op == "to_bf16" => self.packed(&ins[0]),
+            Src::Xf { op, ins, .. } if op == "reshape" => {
+                if ins[0].shape.last() != n.shape.last() {
+                    return Err(format!(
+                        "reshape {:?} -> {:?} of packed blocks must keep the row width",
+                        ins[0].shape, n.shape
+                    ));
+                }
+                Ok(Packed {
+                    shape: n.shape.clone(),
+                    ..self.packed(&ins[0])?
                 })
             }
             Src::Xf { op, ins, .. } if op == "stack_experts" => {
@@ -971,6 +1113,11 @@ impl WeightStore {
                 leaves(n, &mut fed);
             }
         }
+        for u in self.ckpt.values_read.lock().iter() {
+            if let Some(n) = table.get(u) {
+                leaves(n, &mut fed);
+            }
+        }
         let canonical: HashMap<&str, &str> = table
             .iter()
             .filter_map(|(c, n)| match &n.src {
@@ -987,7 +1134,10 @@ impl WeightStore {
         };
         self.ckpt
             .raw
-            .keys()
+            .iter()
+            // Projector sidecars are optional: a tower that cannot read one leaves its modality off.
+            .filter(|(_, t)| !t.sidecar)
+            .map(|(r, _)| r)
             .filter(|r| !fed.contains(*r) && !companion(r))
             .filter(|r| {
                 !ignore
@@ -1019,18 +1169,19 @@ impl WeightStore {
             shape: shape.clone(),
             kind: Kind::F32,
             conv: false,
-            src: Src::Gen(Arc::new(Gen { shape, data: GenData::F32(v) })),
+            src: Src::Gen(Arc::new(Gen {
+                shape,
+                data: GenData::F32(v),
+            })),
         };
         let (na, nb) = (format!("{target}.lora_A"), format!("{target}.lora_B"));
         // Validates the factor shapes against the base.
-        xf_shapes(
-            "lora_merge",
-            &J::Null,
-            &[&base.shape, &a.0, &b.0],
-        )
-        .map_err(|e| format!("LoRA on `{target}`: {e}"))?;
-        insert_new(&self.table, na.clone(), gen(a)).map_err(|e| format!("LoRA on `{target}`: {e}"))?;
-        insert_new(&self.table, nb.clone(), gen(b)).map_err(|e| format!("LoRA on `{target}`: {e}"))?;
+        xf_shapes("lora_merge", &J::Null, &[&base.shape, &a.0, &b.0])
+            .map_err(|e| format!("LoRA on `{target}`: {e}"))?;
+        insert_new(&self.table, na.clone(), gen(a))
+            .map_err(|e| format!("LoRA on `{target}`: {e}"))?;
+        insert_new(&self.table, nb.clone(), gen(b))
+            .map_err(|e| format!("LoRA on `{target}`: {e}"))?;
         if base.shape.len() == 2 {
             let bias_delta = match bias {
                 Some(v) => {
@@ -1040,13 +1191,27 @@ impl WeightStore {
                 }
                 None => None,
             };
-            self.lora.insert(target.to_string(), Lora { a: na, b: nb, scale, bias_delta });
+            self.lora.insert(
+                target.to_string(),
+                Lora {
+                    a: na,
+                    b: nb,
+                    scale,
+                    bias_delta,
+                },
+            );
             return Ok(());
         }
         if bias.is_some() {
-            return Err(format!("LoRA on `{target}`: bias deltas on non-matrix weights are not supported"));
+            return Err(format!(
+                "LoRA on `{target}`: bias deltas on non-matrix weights are not supported"
+            ));
         }
-        let ins = vec![base.clone(), self.node(&na).unwrap(), self.node(&nb).unwrap()];
+        let ins = vec![
+            base.clone(),
+            self.node(&na).unwrap(),
+            self.node(&nb).unwrap(),
+        ];
         let kind = xf_kind("lora_merge", &ins);
         let merged = Node {
             shape: base.shape.clone(),
@@ -1059,7 +1224,9 @@ impl WeightStore {
                 part: 0,
             },
         };
-        self.table.write().insert(target.to_string(), Arc::new(merged));
+        self.table
+            .write()
+            .insert(target.to_string(), Arc::new(merged));
         self.cache.lock().remove(target);
         Ok(())
     }
@@ -1110,12 +1277,15 @@ fn fnv1a(s: &str) -> u64 {
 // ---- transforms -------------------------------------------------------------------------------
 
 /// `untile_packed_rows` args: row blocks of `v_heads` heads in tiled order
-/// (`[v_per_k, k_heads]`) after `prefix_rows` leading rows, rewritten grouped by key head.
+/// (`[v_per_k, k_heads]`) after `prefix_rows` leading rows, rewritten grouped by key head; with
+/// `chunk_rows`, independently within every run of that many rows (a reshaped matrix's columns).
 struct Untile {
     k_heads: usize,
     v_heads: usize,
     rows_per_block: usize,
     prefix_rows: usize,
+    /// 0: one run over all rows.
+    chunk_rows: usize,
 }
 
 impl Untile {
@@ -1125,18 +1295,32 @@ impl Untile {
             v_heads: arg_u(a, "v_heads")?,
             rows_per_block: arg_u(a, "rows_per_block")?,
             prefix_rows: arg_u_or(a, "prefix_rows", 0)?,
+            chunk_rows: arg_u_or(a, "chunk_rows", 0)?,
         })
     }
 }
 
 /// The tiled -> grouped head-block reorder of [`Untile`] over rows of `row_len` elements.
 fn untile_rows<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
+    let chunk = match u.chunk_rows {
+        0 => data.len().max(1),
+        c => c * row_len,
+    };
+    // One exact-size copy, reordered in place (a collected iterator over-allocates).
     let mut out = data.to_vec();
+    for (src, dst) in data.chunks(chunk).zip(out.chunks_mut(chunk)) {
+        untile_run(src, dst, row_len, u);
+    }
+    out
+}
+
+/// Rewrites `out` (a copy of `data`) with `data`'s tiled head blocks grouped.
+fn untile_run<T: Copy>(data: &[T], out: &mut [T], row_len: usize, u: &Untile) {
     let per_k = u.v_heads / u.k_heads.max(1);
     let block = u.rows_per_block * row_len;
     let prefix = u.prefix_rows * row_len;
     if prefix >= data.len() {
-        return out;
+        return;
     }
     let (tiled, dest) = (&data[prefix..], &mut out[prefix..]);
     for k in 0..u.k_heads {
@@ -1147,7 +1331,6 @@ fn untile_rows<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
             }
         }
     }
-    out
 }
 
 /// Value heads of `block` values each in tiled order
@@ -1256,14 +1439,20 @@ fn xf_shapes(
     let numel: usize = s.iter().product();
     let same = || Ok(vec![(None, s.to_vec())]);
     match op {
-        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16" | "to_bf16"
-        | "ternarize" => same(),
+        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "to_bf16"
+        | "round_bf16" | "ternarize" => same(),
         "untile_packed_rows" => {
             let u = Untile::from(a)?;
             let rows = s.first().copied().unwrap_or(1);
+            let run = if u.chunk_rows == 0 {
+                rows
+            } else {
+                u.chunk_rows
+            };
             if u.k_heads == 0
                 || u.v_heads % u.k_heads != 0
-                || u.prefix_rows + u.v_heads * u.rows_per_block != rows
+                || rows % run.max(1) != 0
+                || u.prefix_rows + u.v_heads * u.rows_per_block != run
             {
                 return Err(format!(
                     "{} prefix rows + {} heads x {} rows (over {} key heads) do not tile {s:?}",
@@ -1379,8 +1568,12 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
     let k = ins[0].kind;
     match op {
         "to_f32" => Kind::F32,
+        // Float tensors become bf16 `Mat`s (what `Weights::from_gguf` made of GGUF float
+        // matrices); packed blocks stay as stored.
+        "to_bf16" if matches!(k, Kind::Packed(_)) => k,
         "to_bf16" => Kind::Bf16,
-        "untile_packed_rows" => k,
+        // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
+        "untile_packed_rows" | "reshape" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
     }
@@ -1416,8 +1609,8 @@ fn xf_dense(
             }
         }),
         "neg_exp" => map(&mut v, &|x| -x.exp()),
-        "to_f32" | "reshape" => {}
-        "round_bf16" | "to_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
+        "to_f32" | "to_bf16" | "reshape" => {}
+        "round_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
         "ternarize" => match ins[0].kind {
             Kind::Bf16 | Kind::Packed(_) => ternarize(&mut v, |x| bf16_to_f32(f32_to_bf16(x))),
             Kind::F16 => ternarize(&mut v, |x| f16_to_f32(f32_to_f16(x))),
@@ -1647,12 +1840,12 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
         }
         let shapes: Vec<&[usize]> = ins.iter().map(|n| n.shape.as_slice()).collect();
         let outs = xf_shapes(&t.op, &args, &shapes).map_err(|e| format!("`{name}`: {e}"))?;
-        let kind = xf_kind(&t.op, &ins);
+        let kinds: Vec<Kind> = outs.iter().map(|_| xf_kind(&t.op, &ins)).collect();
         let conv = t.op == "to_f32" || (ins[0].conv && t.op != "conv_to_linear");
         for (part, (new, shape)) in outs.into_iter().enumerate() {
             let node = Node {
                 shape,
-                kind,
+                kind: kinds[part],
                 conv,
                 src: Src::Xf {
                     op: t.op.clone(),
@@ -1679,7 +1872,8 @@ pub struct Model {
     pub spec: Spec,
     pub env: ModelEnv,
     pub store: WeightStore,
-    pub tokenizer: Option<Tokenizer>,
+    /// Shared with `env` and the runtime that serves the model (one copy of the vocab maps).
+    pub tokenizer: Option<Arc<Tokenizer>>,
     pub ckpt: Arc<Checkpoint>,
     /// (raw checkpoint name, canonical name) of every raw tensor, sorted by raw name.
     pub renames: Vec<(String, String)>,
@@ -1703,7 +1897,7 @@ pub fn load_with(
     reencode: ReencodeConfig,
 ) -> Result<Model, String> {
     let ckpt = Arc::new(open(artifacts)?);
-    let tokenizer = tokenizer(artifacts, &ckpt)?;
+    let tokenizer = tokenizer(artifacts, &ckpt)?.map(Arc::new);
     load_from(ckpt, reg, family, tokenizer, reencode)
 }
 
@@ -1728,7 +1922,7 @@ fn load_from(
     ckpt: Arc<Checkpoint>,
     reg: &Registry,
     family: Option<&str>,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<Arc<Tokenizer>>,
     mut reencode: ReencodeConfig,
 ) -> Result<Model, String> {
     let family = match family {
@@ -1753,12 +1947,15 @@ fn load_from(
     for set in &spec.names.use_sets {
         pairs.extend(reg.name_set(set)?);
     }
-    let ren = Renamer::from_pairs(&pairs).map_err(fam)?.with_strip(spec.names.strip.clone());
+    let ren = Renamer::from_pairs(&pairs)
+        .map_err(fam)?
+        .with_strip(spec.names.strip.clone());
     let table: Table = Arc::new(RwLock::new(BTreeMap::new()));
     {
         let mut t = table.write();
         let mut from: HashMap<String, &str> = HashMap::new();
-        for (raw, r) in &ckpt.raw {
+        let media = spec.runtime.get("media").is_some_and(|m| !m.is_null());
+        for (raw, r) in ckpt.raw.iter().filter(|(_, r)| media || !r.sidecar) {
             let c = ren.canonical(raw);
             if let Some(prev) = from.insert(c.clone(), raw) {
                 return Err(fam(format!(
@@ -1776,7 +1973,7 @@ fn load_from(
             );
         }
     }
-    let env = ModelEnv::new(&spec, ckpt.clone(), table.clone());
+    let env = ModelEnv::new(&spec, ckpt.clone(), table.clone(), tokenizer.clone());
     if ckpt.synthetic {
         synthesize(&spec, &env, &table).map_err(fam)?;
     }
@@ -1854,16 +2051,34 @@ fn load_from(
 
 /// Runs the spec's `precompute` component once on the CPU (no instance vars, no inputs): its
 /// declared outputs and every tap it emits become F32 weights under their names.
-fn precompute(spec: &Spec, env: &ModelEnv, store: &WeightStore, table: &Table) -> Result<(), String> {
-    let inst = super::build::build(spec, "precompute", env, store, &[("taps", Val::Str("*".into()))])?;
+fn precompute(
+    spec: &Spec,
+    env: &ModelEnv,
+    store: &WeightStore,
+    table: &Table,
+) -> Result<(), String> {
+    let inst = super::build::build(
+        spec,
+        "precompute",
+        env,
+        store,
+        &[("taps", Val::Str("*".into()))],
+    )?;
     if !inst.inputs.is_empty() {
         return Err("`precompute` takes no inputs".into());
     }
     let g = &inst.graph;
-    let shapes: Vec<Vec<usize>> = g.outputs.iter().map(|&v| g.value(v).shape.clone()).collect();
+    let shapes: Vec<Vec<usize>> = g
+        .outputs
+        .iter()
+        .map(|&v| g.value(v).shape.clone())
+        .collect();
     let ins: Vec<Arc<Node>> = {
         let t = table.read();
-        inst.weights.iter().filter_map(|w| t.get(w).cloned()).collect()
+        inst.weights
+            .iter()
+            .filter_map(|w| t.get(w).cloned())
+            .collect()
     };
     let w = store.materialize(&inst.weights)?;
     // A load-time weight transform like `transforms`, not inference: allowed under the GPU-only
@@ -1883,7 +2098,16 @@ fn precompute(spec: &Spec, env: &ModelEnv, store: &WeightStore, table: &Table) -
             data,
             ins: ins.clone(),
         };
-        insert_new(table, name, Node { shape, kind: Kind::F32, conv: false, src })?;
+        insert_new(
+            table,
+            name,
+            Node {
+                shape,
+                kind: Kind::F32,
+                conv: false,
+                src,
+            },
+        )?;
     }
     Ok(())
 }
@@ -2384,7 +2608,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let m = toy(
             d.path(),
-            &[("w32", "F32", &[2, 3], f32b(&iota(6))), ("x", "F32", &[2], f32b(&[5.0, 6.0]))],
+            &[
+                ("w32", "F32", &[2, 3], f32b(&iota(6))),
+                ("x", "F32", &[2], f32b(&[5.0, 6.0])),
+            ],
             r#"components: {precompute: {body: [
                 {repeat: "i", count: 2, body: [
                   {op: "Unary", args: {kind: {Scale: "i + 1"}}, in: ["w:w32"], out: "y"},
@@ -2396,10 +2623,15 @@ mod tests {
         assert!(m.env.has("scaled.0") && m.env.has("scaled.1"));
         assert_eq!(m.env.shape("t"), Some(vec![3, 2]));
         assert_eq!(m.store.tensor("scaled.1"), Some((vec![2, 3], DType::F32)));
-        assert!(matches!(get(&m, "scaled.1"), Tensor::F32(v) if v == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]));
+        assert!(
+            matches!(get(&m, "scaled.1"), Tensor::F32(v) if v == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0])
+        );
         assert!(matches!(get(&m, "t"), Tensor::F32(v) if v == [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]));
         // A precomputed weight consumes the checkpoint tensors precompute read.
-        assert_eq!(m.store.unconsumed(&HashSet::from(["t".to_string()]), &[]), ["x"]);
+        assert_eq!(
+            m.store.unconsumed(&HashSet::from(["t".to_string()]), &[]),
+            ["x"]
+        );
     }
 
     fn kv_str(k: &str, v: &str) -> (String, u32, Vec<u8>) {
@@ -2531,10 +2763,24 @@ mod tests {
     #[test]
     fn diffusers_class_from_model_index_else_config() {
         let d = tempfile::tempdir().unwrap();
-        let a = artifacts(d.path(), None, Some(json!({"_class_name": "AutoencoderKL"})));
-        assert_eq!(open(&a).unwrap().sig.diffusers_class.as_deref(), Some("AutoencoderKL"));
-        std::fs::write(d.path().join("model_index.json"), r#"{"_class_name": "StableDiffusionPipeline"}"#).unwrap();
-        assert_eq!(open(&a).unwrap().sig.diffusers_class.as_deref(), Some("StableDiffusionPipeline"));
+        let a = artifacts(
+            d.path(),
+            None,
+            Some(json!({"_class_name": "AutoencoderKL"})),
+        );
+        assert_eq!(
+            open(&a).unwrap().sig.diffusers_class.as_deref(),
+            Some("AutoencoderKL")
+        );
+        std::fs::write(
+            d.path().join("model_index.json"),
+            r#"{"_class_name": "StableDiffusionPipeline"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            open(&a).unwrap().sig.diffusers_class.as_deref(),
+            Some("StableDiffusionPipeline")
+        );
     }
 
     #[test]
@@ -2743,6 +2989,9 @@ mod tests {
             m.store.unconsumed(&used, &ignore),
             ["unused.weight", "used.bias"]
         );
+        // A `values(name)` read (a build-time constant) consumes the tensor.
+        assert_eq!(m.env.values("used.bias"), Some(vec![1.0]));
+        assert_eq!(m.store.unconsumed(&used, &ignore), ["unused.weight"]);
     }
 
     #[test]
