@@ -251,4 +251,88 @@ mod tests {
         assert_eq!(video_family("TextToVideoSDPipeline").as_deref(), Some("modelscope_t2v"));
         assert_eq!(video_family("StableDiffusionPipeline"), None);
     }
+
+    /// A tiny `LTXPipeline` snapshot in a hub cache (T5 encoder, the tiny LTX transformer and VAE
+    /// of `diff_fixtures`, a flow-match scheduler config).
+    fn tiny_ltx_repo(root: &Path) -> HuggingFaceHub {
+        use crate::model::diff_fixtures::{values, write_f32_safetensors, write_tiny_ltx, write_tiny_ltx_vae};
+        use serde_json::json;
+        let dir = root.join("hub/models--test--tiny-ltx/snapshots/main");
+        let put = |p: &str, v: serde_json::Value| {
+            let p = dir.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, v.to_string()).unwrap();
+        };
+        put("model_index.json", json!({"_class_name": "LTXPipeline"}));
+        put("scheduler/scheduler_config.json", json!({"_class_name": "FlowMatchEulerDiscreteScheduler",
+            "use_dynamic_shifting": true, "base_image_seq_len": 1024, "max_image_seq_len": 4096,
+            "base_shift": 0.95, "max_shift": 2.05, "shift_terminal": 0.1, "num_train_timesteps": 1000}));
+        let (vocab, d, ff) = (40, 32, 48);
+        put("text_encoder/config.json", json!({"architectures": ["T5EncoderModel"], "model_type": "t5",
+            "vocab_size": vocab, "d_model": d, "d_kv": 8, "num_heads": 4, "d_ff": ff, "num_layers": 2,
+            "relative_attention_num_buckets": 8, "relative_attention_max_distance": 16,
+            "layer_norm_epsilon": 1e-6, "feed_forward_proj": "gated-gelu"}));
+        let mut t5: Vec<(String, Vec<usize>)> = vec![("shared.weight".into(), vec![vocab, d]),
+            ("encoder.final_layer_norm.weight".into(), vec![d]),
+            ("encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight".into(), vec![8, 4])];
+        for i in 0..2 {
+            let b = format!("encoder.block.{i}.layer");
+            for n in ["q", "k", "v", "o"] {
+                t5.push((format!("{b}.0.SelfAttention.{n}.weight"), vec![d, d]));
+            }
+            t5.push((format!("{b}.0.layer_norm.weight"), vec![d]));
+            t5.push((format!("{b}.1.layer_norm.weight"), vec![d]));
+            t5.push((format!("{b}.1.DenseReluDense.wi_0.weight"), vec![ff, d]));
+            t5.push((format!("{b}.1.DenseReluDense.wi_1.weight"), vec![ff, d]));
+            t5.push((format!("{b}.1.DenseReluDense.wo.weight"), vec![d, ff]));
+        }
+        write_f32_safetensors(&dir.join("text_encoder/model.safetensors"), &values(&t5, 21)).unwrap();
+        let vocab_map: serde_json::Map<String, serde_json::Value> = (0..vocab).map(|i| (format!("t{i}"), json!(i))).collect();
+        put("tokenizer/tokenizer.json", json!({"version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {"type": "WhitespaceSplit"}, "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "vocab": vocab_map, "unk_token": "t0"}}));
+        write_tiny_ltx(&dir.join("transformer"), d).unwrap();
+        put("transformer/config.json", json!({"_class_name": "LTXVideoTransformer3DModel"}));
+        write_tiny_ltx_vae(&dir.join("vae"), 128).unwrap();
+        HuggingFaceHub::with_cache_dir(root.join("hub"))
+    }
+
+    /// Text- and image-to-video through detection + `generate_video` on the tiny LTX snapshot: 5
+    /// frames of 12x8 (3 latent frames of 2x3 tokens), 2 flow steps, CFG. The image-conditioned
+    /// first latent frame is bit-identical across seeds and step counts (never stepped).
+    #[test]
+    fn tiny_ltx_text_and_image_to_video() {
+        use crate::hardware::Device;
+        let _cpu = crate::hardware::cpu_compute::allow();
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tiny_ltx_repo(tmp.path());
+        let plan = detect(&hub, "test/tiny-ltx", None).expect("a video repo").unwrap();
+        assert_eq!(plan.family, "ltx");
+        let req = VideoRequest {
+            prompt: "t3 t5 t7".into(),
+            frames: Some(5),
+            width: Some(12),
+            height: Some(8),
+            steps: Some(2),
+            guidance: Some(3.0),
+            seed: 1,
+            ..Default::default()
+        };
+        let mut img = ImageBuffer::new(12, 8);
+        img.data.iter_mut().enumerate().for_each(|(i, v)| *v = (i * 37 % 251) as u8);
+        for dev in crate::hardware::available_devices().into_iter().filter(|d| matches!(d, Device::Cpu | Device::Metal)) {
+            let p = load(&hub, &plan, PlacementMode::Pin(dev), None).unwrap();
+            let frames = p.generate_video(&req, None, &|_| {}).unwrap();
+            assert_eq!(frames.len(), 5, "{dev:?}");
+            assert!(frames.iter().all(|f| (f.width, f.height) == (12, 8)));
+            let a = p.video_latents(&req, Some(&img), &|_| {}).unwrap();
+            let b = p.video_latents(&VideoRequest { seed: 9, steps: Some(3), ..req.clone() }, Some(&img), &|_| {}).unwrap();
+            assert_eq!((a.frames, a.h, a.w, a.held), (3, 2, 3, 2 * 3 * 128));
+            assert_eq!(a.x[..a.held], b.x[..b.held], "{dev:?}: the clean first frame moved");
+            assert!(a.x[a.held..].iter().zip(&b.x[b.held..]).any(|(x, y)| x != y));
+            assert!(a.x.iter().all(|v| v.is_finite()));
+            let e = p.generate_video(&VideoRequest { frames: Some(6), ..req.clone() }, None, &|_| {}).unwrap_err();
+            assert!(e.contains("k+1"), "{e}");
+        }
+    }
 }

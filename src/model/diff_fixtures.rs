@@ -389,7 +389,7 @@ mod vae_fixture_tests {
 }
 
 /// `(name, shape, values)` tensors as an F32 safetensors file.
-fn write_f32_safetensors(path: &std::path::Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> Result<(), String> {
+pub(crate) fn write_f32_safetensors(path: &std::path::Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) -> Result<(), String> {
     let (mut header, mut data) = (serde_json::Map::new(), Vec::<u8>::new());
     for (name, shape, v) in tensors {
         let start = data.len();
@@ -405,7 +405,7 @@ fn write_f32_safetensors(path: &std::path::Path, tensors: &[(String, Vec<usize>,
 }
 
 /// Random values for `specs`: norm gains near 1, other rank-1 tensors near 0, matrices by fan-in.
-fn values(specs: &Specs, seed: u64) -> Vec<(String, Vec<usize>, Vec<f32>)> {
+pub(crate) fn values(specs: &Specs, seed: u64) -> Vec<(String, Vec<usize>, Vec<f32>)> {
     let mut r = Lcg(seed);
     specs
         .iter()
@@ -422,18 +422,10 @@ fn values(specs: &Specs, seed: u64) -> Vec<(String, Vec<usize>, Vec<f32>)> {
         .collect()
 }
 
-/// Tiny LTX-Video transformer (1 block, d 64), LTX VAE (decoder + encoder) and ModelScope UNet3D (widths [32, 32]) checkpoints,
-/// each run once through its family spec's `denoiser` as a Metal program (two frames, a clean
-/// first-frame span for LTX); the caller arms the CPU tripwire.
-pub fn tiny_video_on_gpu() -> Result<(), String> {
-    use crate::arch::expr::Val;
-    use crate::graph::Tensor;
-    use crate::hardware::{Device, PlacementMode};
-    use crate::runtime::diffusion::Net;
-    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let num = |v: usize| Val::Num(v as f64);
-
-    let (d, ti) = (64, 32);
+/// A tiny LTX-Video transformer `dir/diffusion_pytorch_model.safetensors` (1 block, d 64, 128
+/// latent channels, caption width `ti`).
+pub(crate) fn write_tiny_ltx(dir: &std::path::Path, ti: usize) -> Result<(), String> {
+    let d = 64;
     let mut s = Specs::new();
     for (p, o, i) in [("proj_in", d, 128), ("time_embed.emb.timestep_embedder.linear_1", d, 256),
         ("time_embed.emb.timestep_embedder.linear_2", d, d), ("time_embed.linear", 6 * d, d),
@@ -452,21 +444,15 @@ pub fn tiny_video_on_gpu() -> Result<(), String> {
     lin(&mut s, &format!("{b}.ff.net.2"), 4 * d, d, true);
     s.push((format!("{b}.scale_shift_table"), vec![6, d]));
     s.push(("scale_shift_table".into(), vec![2, d]));
-    let dir = tmp.path().join("ltx");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 3))?;
-    let net = Net::open(&dir, "ltx", "denoiser", PlacementMode::Pin(Device::Metal))?;
-    let (f, h, w, nt) = (2, 2, 2, 3);
-    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w)), ("nt", num(nt)), ("clean", num(h * w))];
-    let given = [("x", Tensor::F32(Lcg(4).vec(f * h * w * 128, 1.0))), ("context", Tensor::F32(Lcg(5).vec(nt * ti, 1.0)))];
-    let v = net.run_one(&vars, &given, &[("t", 500.0)], None)?;
-    if v.iter().any(|x| !x.is_finite()) {
-        return Err("non-finite LTX output".into());
-    }
+    Ok(())
+}
 
-    // LTX causal-3D VAE: widths [8, 8, 8, 8], one up/down stage, patch 2, 8 latents; decode a
-    // 2-frame clip, encode one image.
-    let (ch, lat, p) = (8, 8, 2);
+/// A tiny LTX-Video VAE `dir/` (widths 8, one spatio-temporal stage, patch 2, `lat` latent
+/// channels; decoder and encoder, diffusers names, `config.json`).
+pub(crate) fn write_tiny_ltx_vae(dir: &std::path::Path, lat: usize) -> Result<(), String> {
+    let (ch, p) = (8, 2);
     let mut s = Specs::new();
     let c3 = |s: &mut Specs, n: &str, ci: usize, co: usize, k: usize| {
         s.push((format!("{n}.weight"), vec![co, ci, k, k, k]));
@@ -496,12 +482,42 @@ pub fn tiny_video_on_gpu() -> Result<(), String> {
     c3(&mut s, "encoder.conv_out.conv", ch, lat + 1, 3);
     s.push(("latents_mean".into(), vec![lat]));
     s.push(("latents_std".into(), vec![lat]));
-    let dir = tmp.path().join("ltx_vae");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 9))?;
     let cfg = serde_json::json!({"_class_name": "AutoencoderKLLTXVideo", "block_out_channels": [ch, ch, ch, ch],
         "layers_per_block": [1, 1, 1, 1, 1], "spatio_temporal_scaling": [true, false, false, false], "patch_size": p, "latent_channels": lat});
     std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Tiny LTX-Video transformer (1 block, d 64), LTX VAE (decoder + encoder) and ModelScope UNet3D (widths [32, 32]) checkpoints,
+/// each run once through its family spec's `denoiser` as a Metal program (two frames, a clean
+/// first-frame span for LTX); the caller arms the CPU tripwire.
+pub fn tiny_video_on_gpu() -> Result<(), String> {
+    use crate::arch::expr::Val;
+    use crate::graph::Tensor;
+    use crate::hardware::{Device, PlacementMode};
+    use crate::runtime::diffusion::Net;
+    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let num = |v: usize| Val::Num(v as f64);
+
+    let ti = 32;
+    let dir = tmp.path().join("ltx");
+    write_tiny_ltx(&dir, ti)?;
+    let net = Net::open(&dir, "ltx", "denoiser", PlacementMode::Pin(Device::Metal))?;
+    let (f, h, w, nt) = (2, 2, 2, 3);
+    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w)), ("nt", num(nt)), ("clean", num(h * w))];
+    let given = [("x", Tensor::F32(Lcg(4).vec(f * h * w * 128, 1.0))), ("context", Tensor::F32(Lcg(5).vec(nt * ti, 1.0)))];
+    let v = net.run_one(&vars, &given, &[("t", 500.0)], None)?;
+    if v.iter().any(|x| !x.is_finite()) {
+        return Err("non-finite LTX output".into());
+    }
+
+    // LTX causal-3D VAE: widths [8, 8, 8, 8], one up/down stage, patch 2, 8 latents; decode a
+    // 2-frame clip, encode one image.
+    let (lat, p) = (8, 2);
+    let dir = tmp.path().join("ltx_vae");
+    write_tiny_ltx_vae(&dir, lat)?;
     let mode = PlacementMode::Pin(Device::Metal);
     let dec = Net::open(&dir, "ltx_vae", "decoder", mode)?;
     let (f, h, w) = (2, 2, 3);

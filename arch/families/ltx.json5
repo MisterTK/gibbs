@@ -157,12 +157,13 @@
     scheduler: {kind: "flow_euler", sigmas: "linspace", seq: "frames * h * w"},
     timestep: "t",
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
-    latent: {channels: 128, factor: 32, pack: "tokens", noise_scale: 1},
+    latent: {channels: "vae.latent", factor: "vae.patch * vae.sscale", pack: "tokens", noise_scale: 1},
     // The VAE nets apply the latent statistics themselves.
     vae: {component: "vae", decode: "decoder", encode: "encoder", output: "clamp_pm1"},
-    defaults: {width: 512, height: 320, steps: 30, guidance: 3, multiple: 32, max_side: 2048, max_steps: 200},
-    video: {frames: 25, latent_frames: "(frames - 1) // 8 + 1",
-            frames_ok: "frames > 0 && (frames - 1) % 8 == 0", frames_error: "frames must be 8k+1 (9, 17, 25, ...)",
+    defaults: {width: 512, height: 320, steps: 30, guidance: 3, multiple: "vae.patch * vae.sscale", max_side: 2048, max_steps: 200},
+    // The VAE scales time as much as space (spatio-temporal stages): 8k+1 frames for v0.9.0.
+    video: {frames: 25, latent_frames: "(frames - 1) // vae.sscale + 1",
+            frames_ok: "frames > 0 && (frames - 1) % vae.sscale == 0", frames_error: "frames must be 8k+1 (9, 17, 25, ...)",
             fps: "fps", decode: "clip", image: "clean_first_frame"},
     summary: "fmt('LTX-Video ({json.model_index._class_name})')",
   },

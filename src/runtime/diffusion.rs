@@ -1421,6 +1421,17 @@ pub struct VideoRequest {
     pub seed: u64,
 }
 
+/// Denoised video latents in the denoiser's layout; the first `held` values are the clean
+/// (image-conditioned) frame, never stepped.
+pub(crate) struct VideoLatents {
+    pub x: Vec<f32>,
+    pub frames: usize,
+    pub h: usize,
+    pub w: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub held: usize,
+}
+
 /// A video pipeline's defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct VideoDefaults {
@@ -1496,6 +1507,12 @@ impl SpecDiffusion {
 
     /// One clip of RGB frames; `image` (pipelines with `video.image`) conditions its first frame.
     pub fn generate_video(&self, req: &VideoRequest, image: Option<&ImageBuffer>, log: &dyn Fn(&str)) -> Result<Vec<ImageBuffer>, String> {
+        let l = self.video_latents(req, image, log)?;
+        self.decode_video(&l, log)
+    }
+
+    /// The denoised latents of [`Self::generate_video`].
+    pub(crate) fn video_latents(&self, req: &VideoRequest, image: Option<&ImageBuffer>, log: &dyn Fn(&str)) -> Result<VideoLatents, String> {
         let v = self.video.as_ref().ok_or_else(|| format!("{} is not a video pipeline", self.summary))?;
         let vd = self.video_defaults().expect("video pipeline")?;
         let d = self.defaults;
@@ -1545,7 +1562,6 @@ impl SpecDiffusion {
         let mut run = self.schedule(steps, &vars, lf * hw_n)?;
         // One latent frame `[c, h*w]` <-> the denoiser's per-frame layout (frames stay outermost).
         let to_layout = |z: &[f32]| if tokens { transpose(z, c, hw_n) } else { z.to_vec() };
-        let from_layout = |x: &[f32]| if tokens { transpose(x, hw_n, c) } else { x.to_vec() };
         let mut rng = Rng::new(req.seed);
         let s = match (&self.rt.latent.noise_scale, &run) {
             (J::String(k), Run::Discrete(s)) if k == "init_sigma" => s.init_sigma() as f32,
@@ -1616,7 +1632,18 @@ impl SpecDiffusion {
             run.advance(i, &out[held..], &mut x[held..], &mut rng);
             log(&format!("  step {}/{} (t={t:.1}): {:.2}s", i + 1, run.steps(), st.elapsed().as_secs_f64()));
         }
+        Ok(VideoLatents { x, frames: lf, h, w, held })
+    }
 
+    /// RGB frames of denoised latents.
+    fn decode_video(&self, l: &VideoLatents, log: &dyn Fn(&str)) -> Result<Vec<ImageBuffer>, String> {
+        let v = self.video.as_ref().ok_or_else(|| format!("{} is not a video pipeline", self.summary))?;
+        let (c, f, h, w) = (self.channels, self.factor, l.h, l.w);
+        let hw_n = h * w;
+        let tokens = self.rt.latent.pack == "tokens";
+        let from_layout = |x: &[f32]| if tokens { transpose(x, hw_n, c) } else { x.to_vec() };
+        let vars = [("frames", Val::Num(l.frames as f64)), ("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+        let x = &l.x;
         // Latent frames `[c, h*w]`, decode affine applied.
         let t = std::time::Instant::now();
         let fl = c * hw_n;
