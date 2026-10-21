@@ -106,6 +106,7 @@ static RUN_SAMPLES: Mutex<std::collections::VecDeque<RunSample>> =
 
 fn push_run_sample(s: RunSample) {
     let mut q = RUN_SAMPLES.lock();
+    RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if q.len() >= RUN_SAMPLE_CAP {
         q.pop_front();
     }
@@ -116,6 +117,15 @@ fn push_run_sample(s: RunSample) {
 pub fn take_run_samples() -> Vec<RunSample> {
     RUN_SAMPLES.lock().drain(..).collect()
 }
+
+/// The newest run sample and how many samples were pushed before it, without draining the ring
+/// (the scheduler's telemetry reads every token; a bench drains its own window).
+pub fn last_run_sample() -> Option<(u64, RunSample)> {
+    let q = RUN_SAMPLES.lock();
+    q.back().map(|s| (RUN_SEQ.load(std::sync::atomic::Ordering::Relaxed), *s))
+}
+
+static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GEMV shapes resolved by the tuner this process, and how many came from the persisted cache.
 static TUNE_SHAPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
