@@ -365,39 +365,22 @@ impl TuiApp {
         );
         f.render_widget(Clear, popup);
         let block = instrument("Chat Template & System Prompt (F2)", None, true, th);
-        let templates = [
-            (
-                "0",
-                "Model Default",
-                "Declared in tokenizer_config.json or GGUF metadata",
-            ),
-            (
-                "1",
-                "ChatML",
-                "<|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n{prompt}<|im_end|>",
-            ),
-            (
-                "2",
-                "Llama-3",
-                "<|start_header_id|>system<|end_header_id|>\\n{system}<|eot_id|>",
-            ),
-            (
-                "3",
-                "Gemma",
-                "<start_of_turn>user\\n{prompt}<end_of_turn>\\n<start_of_turn>model\\n",
-            ),
-            ("4", "Raw / Passthrough", "{prompt}"),
-        ];
+        let names = crate::arch::templates::names();
         let bold = th.fg(Token::Parchment).add_modifier(Modifier::BOLD);
         let mut lines = vec![
             Line::from(Span::styled(
-                " Select Template (1-4 / ↑↓, Enter/Esc to confirm):",
+                format!(
+                    " Select Template (0-{} / ↑↓, Enter/Esc to confirm):",
+                    names.len()
+                ),
                 bold,
             )),
             Line::default(),
         ];
-        for (i, (num, name, preview)) in templates.iter().enumerate() {
-            let active = i == self.active_template;
+        let entries = std::iter::once(("Model Default", "tokenizer_config.json / GGUF metadata"))
+            .chain(names.iter().map(|n| (*n, "arch/templates/*.jinja")));
+        for (num, (name, preview)) in entries.enumerate() {
+            let active = num == self.active_template;
             let marker = if active { " [*] " } else { " [ ] " };
             let style = if active {
                 th.fg(Token::Brass).add_modifier(Modifier::BOLD)
@@ -406,7 +389,7 @@ impl TuiApp {
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("{marker}{num}. {name}: "), style),
-                Span::styled(*preview, th.fg(Token::Dim)),
+                Span::styled(preview, th.fg(Token::Dim)),
             ]));
         }
         lines.push(Line::default());

@@ -1,0 +1,3 @@
+{% set names = {"user": "User", "assistant": "Assistant", "system": "System"} %}
+{% for m in messages %}{{ names[m.role|lower] or m.role }}: {{ m.content }}
+{% endfor %}Assistant: {% if false %}{% endif %}

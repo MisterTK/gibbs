@@ -1,0 +1,3 @@
+{% for m in messages %}<start_of_turn>{{ "model" if m.role|lower == "assistant" else m.role }}
+{{ m.content }}<end_of_turn>
+{% endfor %}<start_of_turn>model{{ "\n" }}

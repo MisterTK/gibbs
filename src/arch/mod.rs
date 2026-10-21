@@ -12,6 +12,7 @@ pub mod expr;
 pub mod gen;
 pub mod load;
 pub mod names;
+pub mod templates;
 
 use serde::Deserialize;
 use serde_json::{Map, Value as J};

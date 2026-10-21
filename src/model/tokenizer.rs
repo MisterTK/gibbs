@@ -170,95 +170,6 @@ fn template_bos(pp: Option<&serde_json::Value>, vocab: &HashMap<String, u32>) ->
     }
 }
 
-/// Supported Chat Template styles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ChatTemplate {
-    #[default]
-    ChatML,
-    Llama3,
-    Gemma,
-    Standard,
-    Plain,
-}
-
-impl ChatTemplate {
-    /// Formats role/content message pairs according to the template style.
-    pub fn format(&self, messages: &[(&str, &str)]) -> String {
-        match self {
-            Self::ChatML => {
-                let mut prompt = String::new();
-                for (role, content) in messages {
-                    prompt.push_str("<|im_start|>");
-                    prompt.push_str(role);
-                    prompt.push('\n');
-                    prompt.push_str(content);
-                    prompt.push_str("<|im_end|>\n");
-                }
-                prompt.push_str("<|im_start|>assistant\n");
-                prompt
-            }
-            Self::Llama3 => {
-                let mut prompt = String::new();
-                for (role, content) in messages {
-                    prompt.push_str("<|start_header_id|>");
-                    prompt.push_str(role);
-                    prompt.push_str("<|end_header_id|>\n\n");
-                    prompt.push_str(content);
-                    prompt.push_str("<|eot_id|>");
-                }
-                prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-                prompt
-            }
-            Self::Gemma => {
-                let mut prompt = String::new();
-                for (role, content) in messages {
-                    let r = if role.eq_ignore_ascii_case("assistant") {
-                        "model"
-                    } else {
-                        *role
-                    };
-                    prompt.push_str("<start_of_turn>");
-                    prompt.push_str(r);
-                    prompt.push('\n');
-                    prompt.push_str(content);
-                    prompt.push_str("<end_of_turn>\n");
-                }
-                prompt.push_str("<start_of_turn>model\n");
-                prompt
-            }
-            Self::Standard => {
-                let mut prompt = String::new();
-                for (role, content) in messages {
-                    let formatted_role = if role.eq_ignore_ascii_case("user") {
-                        "User"
-                    } else if role.eq_ignore_ascii_case("assistant") {
-                        "Assistant"
-                    } else if role.eq_ignore_ascii_case("system") {
-                        "System"
-                    } else {
-                        role
-                    };
-                    prompt.push_str(formatted_role);
-                    prompt.push_str(": ");
-                    prompt.push_str(content);
-                    prompt.push('\n');
-                }
-                prompt.push_str("Assistant: ");
-                prompt
-            }
-            Self::Plain => {
-                let mut prompt = String::new();
-                for (_role, content) in messages {
-                    if !prompt.is_empty() {
-                        prompt.push('\n');
-                    }
-                    prompt.push_str(content);
-                }
-                prompt
-            }
-        }
-    }
-}
 impl Default for Tokenizer {
     fn default() -> Self {
         Self::default_bpe()
@@ -1053,19 +964,33 @@ impl Tokenizer {
         out
     }
 
-    /// Formats role/content pairs into standard chat prompt using the specified template style.
-    pub fn apply_chat_template_with_style(
-        &self,
-        messages: &[(&str, &str)],
-        template: ChatTemplate,
-    ) -> String {
-        template.format(messages)
+    /// Formats role/content pairs with fallback chat template `name` ([`crate::arch::templates`]).
+    pub fn apply_chat_template_with_style(&self, messages: &[(&str, &str)], name: &str) -> String {
+        let messages: Vec<_> = messages
+            .iter()
+            .map(|(role, content)| crate::model::hf_loader::ChatMessage::new(*role, *content))
+            .collect();
+        render_fallback(&messages, name)
+    }
+
+    /// The fallback template for a tokenizer without its own, detected by vocabulary: `chatml`
+    /// if `<|im_start|>`, `header` if `<|start_header_id|>`, `turn` if `<start_of_turn>`, else
+    /// `plain`.
+    pub fn fallback_template(&self) -> &'static str {
+        if self.vocab.contains_key("<|im_start|>") {
+            "chatml"
+        } else if self.vocab.contains_key("<|start_header_id|>") {
+            "header"
+        } else if self.vocab.contains_key("<start_of_turn>") {
+            "turn"
+        } else {
+            "plain"
+        }
     }
 
     /// Formats role/content pairs with the model's own chat template (HF
-    /// `apply_chat_template(add_generation_prompt=True)`). Models without one fall back to a
-    /// built-in style detected by vocabulary: ChatML if `<|im_start|>`, Llama3 if
-    /// `<|start_header_id|>`, Gemma if `<start_of_turn>`, else Plain.
+    /// `apply_chat_template(add_generation_prompt=True)`). Models without one fall back to
+    /// [`Self::fallback_template`].
     pub fn apply_chat_template(&self, messages: &[(&str, &str)]) -> String {
         let messages: Vec<_> = messages
             .iter()
@@ -1121,23 +1046,25 @@ impl Tokenizer {
                 Err(e) => tracing::warn!("model chat_template failed ({e}); built-in template"),
             }
         }
-        let texts: Vec<String> = messages.iter().map(|m| m.text()).collect();
-        let pairs: Vec<(&str, &str)> = messages
+        let texts: Vec<_> = messages
             .iter()
-            .zip(&texts)
-            .map(|(m, t)| (m.role.as_str(), t.as_str()))
+            .map(|m| crate::model::hf_loader::ChatMessage::new(m.role.as_str(), m.text()))
             .collect();
-        let style = if self.vocab.contains_key("<|im_start|>") {
-            ChatTemplate::ChatML
-        } else if self.vocab.contains_key("<|start_header_id|>") {
-            ChatTemplate::Llama3
-        } else if self.vocab.contains_key("<start_of_turn>") {
-            ChatTemplate::Gemma
-        } else {
-            ChatTemplate::Plain
-        };
-        self.apply_chat_template_with_style(&pairs, style)
+        render_fallback(&texts, self.fallback_template())
     }
+}
+
+/// Renders `messages` with embedded fallback template `name` (`arch/templates/<name>.jinja`).
+fn render_fallback(messages: &[crate::model::hf_loader::ChatMessage], name: &str) -> String {
+    let template = crate::arch::templates::template(name)
+        .unwrap_or_else(|| panic!("no fallback chat template '{name}'"));
+    ChatTemplateSpec {
+        template: template.into(),
+        bos_token: String::new(),
+        eos_token: String::new(),
+    }
+    .render(messages, None, true, &serde_json::Value::Null)
+    .expect("embedded fallback chat templates render")
 }
 
 #[cfg(test)]
@@ -1346,7 +1273,7 @@ mod tests {
         let messages = [("system", "You are an assistant."), ("user", "Hello!")];
 
         // ChatML
-        let chatml = tokenizer.apply_chat_template_with_style(&messages, ChatTemplate::ChatML);
+        let chatml = tokenizer.apply_chat_template_with_style(&messages, "chatml");
         assert_eq!(
             chatml,
             "<|im_start|>system\nYou are an assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
@@ -1355,21 +1282,21 @@ mod tests {
         assert_eq!(tokenizer.apply_chat_template(&messages), chatml);
 
         // Llama 3
-        let llama3 = tokenizer.apply_chat_template_with_style(&messages, ChatTemplate::Llama3);
+        let llama3 = tokenizer.apply_chat_template_with_style(&messages, "header");
         assert_eq!(
             llama3,
             "<|start_header_id|>system<|end_header_id|>\n\nYou are an assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
 
         // Standard
-        let standard = tokenizer.apply_chat_template_with_style(&messages, ChatTemplate::Standard);
+        let standard = tokenizer.apply_chat_template_with_style(&messages, "inst");
         assert_eq!(
             standard,
             "System: You are an assistant.\nUser: Hello!\nAssistant: "
         );
 
         // Gemma
-        let gemma = tokenizer.apply_chat_template_with_style(&messages, ChatTemplate::Gemma);
+        let gemma = tokenizer.apply_chat_template_with_style(&messages, "turn");
         assert_eq!(
             gemma,
             "<start_of_turn>system\nYou are an assistant.<end_of_turn>\n<start_of_turn>user\nHello!<end_of_turn>\n<start_of_turn>model\n"
@@ -1404,5 +1331,29 @@ mod tests {
         );
         let both = spec("{% for message in messages %}{% if message['content'] is string %}{{ message['content'] }}{% else %}{% for p in message['content'] %}[{{ p['text'] }}]{% endfor %}{% endif %}{% endfor %}");
         assert_eq!(both.render(&msgs, None, true, &null).unwrap(), "Hi there");
+    }
+
+    /// Edge cases of the fallback templates (case-insensitive roles, empty content, template
+    /// syntax in content); outputs are those of the hand-written formatter the files replaced.
+    #[test]
+    fn fallback_template_edge_cases() {
+        let tok = Tokenizer::default_bpe();
+        let m = [("tool", "x {{ y }} %}"), ("ASSISTANT", ""), ("System", "s")];
+        let cases = [
+            ("chatml", "<|im_start|>tool\nx {{ y }} %}<|im_end|>\n<|im_start|>ASSISTANT\n<|im_end|>\n<|im_start|>System\ns<|im_end|>\n<|im_start|>assistant\n"),
+            ("header", "<|start_header_id|>tool<|end_header_id|>\n\nx {{ y }} %}<|eot_id|><|start_header_id|>ASSISTANT<|end_header_id|>\n\n<|eot_id|><|start_header_id|>System<|end_header_id|>\n\ns<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"),
+            ("turn", "<start_of_turn>tool\nx {{ y }} %}<end_of_turn>\n<start_of_turn>model\n<end_of_turn>\n<start_of_turn>System\ns<end_of_turn>\n<start_of_turn>model\n"),
+            ("inst", "tool: x {{ y }} %}\nAssistant: \nSystem: s\nAssistant: "),
+            ("plain", "x {{ y }} %}\n\ns"),
+        ];
+        for (name, want) in cases {
+            assert_eq!(tok.apply_chat_template_with_style(&m, name), want, "{name}");
+        }
+        let empty_first = [("user", ""), ("user", "a"), ("user", "b")];
+        assert_eq!(
+            tok.apply_chat_template_with_style(&empty_first, "plain"),
+            "a\nb"
+        );
+        assert_eq!(tok.apply_chat_template_with_style(&[], "plain"), "");
     }
 }
