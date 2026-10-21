@@ -115,7 +115,8 @@
     pooled: [],
     negative: {default: "", zeros_for_empty: false},
     denoiser: {component: "transformer", net: "denoiser"},
-    scheduler: {kind: "flow_dpm2", sigmas: "dpm_flow", shift: "first(json.scheduler_config.flow_shift, 3)", mu: "fixed"},
+    // dpm_flow sigmas read the shift only.
+    scheduler: {kind: "flow_dpm2", sigmas: "dpm_flow", shift: "first(json.scheduler_config.flow_shift, 3)"},
     timestep: "floor(sigma * 1000)",
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
     latent: {channels: "vae.latent_channels", factor: "vae.factor", pack: "none", noise_scale: 1},

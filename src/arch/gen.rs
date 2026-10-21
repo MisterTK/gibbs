@@ -980,6 +980,36 @@ mod tests {
             assert_eq!(bits(&got), bits(&want));
         }
 
+        /// The `sd` spec's generated inputs: the LCM guidance embedding (`sd.rs`
+        /// `guidance_embedding`) and SDXL's 6 time-id embeddings (`unet.rs` `timestep_embedding`
+        /// per id), old formulas inlined.
+        #[test]
+        fn sd_embeddings_match_sources() {
+            let (w, dim) = (6.5f32, 16usize);
+            let half = dim / 2;
+            let fq = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
+            let mut want: Vec<f32> = (0..half).map(|i| (w * 1000.0 * fq(i)).sin()).collect();
+            want.extend((0..half).map(|i| (w * 1000.0 * fq(i)).cos()));
+            let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
+                "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
+            assert_eq!(bits(&got), bits(&want));
+
+            let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
+            let emb = |t: f32| {
+                let half = 128;
+                let mut e = vec![0.0f32; 256];
+                for i in 0..half {
+                    let arg = t * (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                    e[i] = arg.cos();
+                    e[half + i] = arg.sin();
+                }
+                e
+            };
+            let want: Vec<f32> = ids.iter().flat_map(|&t| emb(t)).collect();
+            let got = f("timestep_embedding", json!({"t": ids, "dim": 256, "precision": "f32"}));
+            assert_eq!(bits(&got), bits(&want));
+        }
+
         #[test]
         fn positions_match_sources() {
             for (nt, h, w, ax) in [(3, 2, 3, false), (2, 4, 1, true)] {

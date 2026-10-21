@@ -12,6 +12,9 @@
   family: "flux",
   match: {
     diffusers_class: ["FluxPipeline", "FluxTransformer2DModel"],
+    // Transformer-only files (city96 GGUFs, single-file finetunes; BFL or diffusers names) whose
+    // card names a FLUX.1 / Chroma base pipeline.
+    denoiser_tensors: [["img_in.weight"], ["x_embedder.weight", "single_transformer_blocks.0.proj_out.weight"]],
   },
   pipeline: "diffusion",
   use_lib: ["transformer", "diffusion"],
@@ -44,6 +47,8 @@
   ],
   names: {
     use: ["bfl"],
+    // ComfyUI single files.
+    strip: ["model.diffusion_model."],
     // diffusers FLUX.2 -> the FLUX.1 diffusers names the network reads.
     rules: [
       ["time_guidance_embed.{s:*}", "time_text_embed.{s}"],
@@ -136,7 +141,8 @@
     // raw text-encoder states context [nt, joint] (txt_in runs here) and, for FLUX.1, the raw CLIP
     // pooled vector (vector_in runs here). Timestep features from the step's sigma (BFL
     // timestep_embedding(sigma * 1000, 256)); guidance features from the request's guidance when the
-    // model embeds it (instance var `guided: false` drops them).
+    // model embeds it (instance var `guided: false` drops them; a `Net` compiles its first instance's
+    // weights, so run a guided instance first).
     denoiser: {
       vars: ["h", "w", "nt"],
       inputs: [
@@ -234,7 +240,7 @@
       // (schnell, its model card), every token attended (no key mask).
       {name: "t5", component: "text_encoder_2", net: "encoder", tokenizer: "tokenizer_2", add_special: false,
        eos: 1, max_len: "denoiser.guidance_embeds ? 512 : 256", pad_to: "denoiser.guidance_embeds ? 512 : 256",
-       pad_id: 0, outputs: {hidden: "hidden"}},
+       pad_id: 0, mask: false, outputs: {hidden: "hidden"}},
     ],
     context: [{features: ["t5.hidden"]}],
     pooled: ["clip.pooled"],
@@ -248,7 +254,7 @@
     // Guidance is embedded (`g_feat`), never CFG.
     guidance: {kind: "none"},
     latent: {channels: "vae.cfg.latent_channels", factor: 8, pack: "pack2x2", noise_scale: 1},
-    vae: {component: "vae", decode: "decoder", encode: null,
+    vae: {component: "vae", decode: "decoder", encode: "encoder",
           decode_affine: {mul: "1 / first(vae.cfg.scaling_factor, 0.3611)", add: "first(vae.cfg.shift_factor, 0.1159)"},
           output: "clamp_pm1"},
     // schnell: its model card's 4 steps, no guidance; dev: diffusers' 28 / 3.5.

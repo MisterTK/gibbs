@@ -157,7 +157,7 @@
     // diffusers runs CFG only when guidance_scale > 1.
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
     latent: {channels: "denoiser.in_ch", factor: 8, pack: "none", noise_scale: 1},
-    vae: {component: "vae", decode: "decoder", encode: null,
+    vae: {component: "vae", decode: "decoder", encode: "encoder",
           decode_affine: {mul: "1 / vae.cfg.scaling_factor", add: "first(vae.cfg.shift_factor, 0)"},
           output: "clamp_pm1"},
     // ponytail: CPU-sized 512 default (the checkpoints' native size is 1024; pass width/height for it).

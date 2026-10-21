@@ -16,11 +16,11 @@
   runtime: {
     text_encoders: [
       // The non-thinking chat prompt, truncated and padded with `<|endoftext|>` (151643, the Qwen2/3
-      // BPE's) to 512; padding masked as keys, every row kept. Taps are 0-based layer outputs
-      // (`layer.8` = transformers hidden_states[9]).
+      // BPE's) to 512; padding masked as keys (`masked`), every row kept. Taps are 0-based layer
+      // outputs (`layer.8` = transformers hidden_states[9]).
       {name: "qwen", component: "text_encoder", net: "text", tokenizer: "tokenizer", template: "chat",
        add_special: false, max_len: 512, pad_to: 512, pad_id: 151643, keep: "all",
-       vars: {taps: ["layer.8", "layer.17", "layer.26"]},
+       vars: {masked: "true", taps: "['layer.8', 'layer.17', 'layer.26']"},
        outputs: {h9: "layer.8", h18: "layer.17", h27: "layer.26"}},
     ],
     context: [{features: ["qwen.h9", "qwen.h18", "qwen.h27"]}],

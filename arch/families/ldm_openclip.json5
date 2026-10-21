@@ -1,0 +1,13 @@
+// OpenCLIP-H text tower of an SD 2.x LDM single-file checkpoint (`cond_stage_model.model.*`).
+// diffusers' SD 2.x text encoder is that tower minus its last block (`sd.rs` `alias_openclip`
+// drop_last): `hidden` is the final-normed output of block 22; block 23 is left unread.
+{
+  family: "ldm_openclip",
+  extends: "clip_text",
+  config: {layers: "count('text_model.encoder.layers.{k}.layer_norm1.weight') - 1"},
+  names: {strip: ["cond_stage_model.model."]},
+  ignore: ["text_model.embeddings.position_ids", "logit_scale", "attn_mask",
+           "cond_stage_model.model.transformer.resblocks.23.*",
+           "model.diffusion_model.*", "first_stage_model.*", "model_ema.*",
+           "alphas_cumprod*", "betas", "log_one_minus_alphas_cumprod", "posterior_*", "sqrt_*", "logvar"],
+}

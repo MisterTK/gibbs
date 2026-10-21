@@ -611,6 +611,14 @@ pub mod fixture {
     use crate::model::diff_graph::testutil::{synth, Lcg};
 
     pub fn tiny() -> DcAeDecoder {
+        let (cfg, s) = tiny_specs();
+        let r = synth(&s, 41);
+        let w = Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap();
+        DcAeDecoder::open(&w, &cfg).unwrap()
+    }
+
+    /// `tiny`'s config and tensor specs (weights: `synth(.., 41)`).
+    pub fn tiny_specs() -> (serde_json::Value, Vec<(String, Vec<usize>)>) {
         let (chans, hd, latent, ms_k) = ([8usize, 16, 32], 4usize, 8usize, 5usize);
         let cfg = serde_json::json!({
             "decoder_block_out_channels": chans, "decoder_layers_per_block": [1, 1, 1],
@@ -665,9 +673,7 @@ pub mod fixture {
         }
         norm(&mut s, "decoder.norm_out", chans[0]);
         conv(&mut s, "decoder.conv_out", chans[0], 3, 3, true);
-        let r = synth(&s, 41);
-        let w = Weights::from_f32(s, |n| Ok(r.0[n].1.clone())).unwrap();
-        DcAeDecoder::open(&w, &cfg).unwrap()
+        (cfg, s)
     }
 
     /// Public `decode` of the tiny net (Metal when the CPU tripwire is armed) plus a finiteness check of the
@@ -735,5 +741,35 @@ mod tests {
         assert!(e < 1e-3, "decode rel err {e}");
         let net = dec.gpu.get(&[h, wd], || Err("cached".into())).unwrap();
         assert_eq!(net.cpu_node_count(), 0);
+    }
+
+    /// The `dcae` spec on the tiny decoder, with GLU MBConv `conv_point` stored as diffusers does
+    /// (a [c, c2/2, 1, 1] conv kernel), matches the native CPU decoder.
+    #[test]
+    fn spec_matches_native_with_conv_point_kernels() {
+        use crate::arch::expr::Val;
+        use crate::graph::Tensor;
+        use crate::hardware::{Device, PlacementMode};
+        use crate::model::diff_graph::testutil::{rel_err, synth, write_st, Lcg};
+        use crate::runtime::diffusion::{unconsumed, Net};
+        let (cfg, s) = fixture::tiny_specs();
+        let mut r = synth(&s, 41);
+        for (n, (shape, _)) in r.0.iter_mut() {
+            if n.ends_with("conv_point.weight") {
+                shape.extend([1, 1]);
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        write_st(&d.path().join("diffusion_pytorch_model.safetensors"), &r);
+        std::fs::write(d.path().join("config.json"), cfg.to_string()).unwrap();
+        let dec = fixture::tiny();
+        let net = Net::open(d.path(), "dcae", "decoder", PlacementMode::Pin(Device::Cpu)).unwrap();
+        let (h, wd) = (2, 3);
+        let z = Lcg(3).vec(dec.latent_channels() * h * wd, 1.0);
+        let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(wd as f64))];
+        let got = net.run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], None).unwrap();
+        let e = rel_err(&got, &dec.decode_cpu(&z, h, wd));
+        assert!(e < 1e-4, "decode rel err {e}");
+        assert_eq!(unconsumed(&net.model, &[&net], &[]), Vec::<String>::new());
     }
 }

@@ -25,6 +25,11 @@
      error: "DC-AE: only interpolate upsampling, rms_norm and silu decoders are implemented (config: {first(cfg.upsample_block_type, 'none')}, {first(cfg.decoder_norm_types, 'none')}, {first(cfg.decoder_act_fns, 'none')})"},
     {expr: "cfg.scaling_factor == null", error: "DC-AE config: missing scaling_factor"},
   ],
+  transforms: [
+    // GLU MBConv point conv: nn.Conv2d(hidden, out, 1) kernels [c, c2/2, 1, 1] -> linear.
+    {tensor: "{p:*}.conv_out.conv_point.weight", op: "conv_to_linear",
+     when: "len(shape(fmt('{p}.conv_out.conv_point.weight'))) == 4"},
+  ],
   constants: {
     "linear_attn.eps": {gen: "fill", args: {shape: [1], value: 1e-15}},
   },

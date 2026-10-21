@@ -1,0 +1,20 @@
+// SD 2.x LDM single-file checkpoint: OpenCLIP-H under `cond_stage_model.model.` (its last block
+// dropped, as diffusers' SD 2.x text encoder), configs from the SD 2.1 reference repo.
+{
+  family: "sd2_file",
+  extends: "sd",
+  match: {
+    diffusers_class: [],
+    single_file_tensors: [["cond_stage_model.model.ln_final.weight", "model.diffusion_model.input_blocks.0.0.weight"]],
+    single_file_ext: ["safetensors"],
+  },
+  components: {
+    text_encoder: {family: "ldm_openclip", dir: "text_encoder"},
+    unet: {family: "ldm_unet", dir: "unet"},
+    vae: {family: "ldm_vae", dir: "vae"},
+  },
+  runtime: {
+    reference: "'stabilityai/stable-diffusion-2-1'",
+    summary: "fmt('SD 2.x single-file checkpoint (OpenCLIP, UNet + VAE), {json.scheduler_config._class_name}')",
+  },
+}

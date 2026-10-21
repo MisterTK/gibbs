@@ -14,10 +14,11 @@
   },
   runtime: {
     text_encoders: [
-      // ids + `</s>` (1) truncated to 512; padding masked as keys except the first pad, and only the
-      // `valid + 1` unmasked rows are kept (masked text never reaches another token or the output).
+      // ids + `</s>` (1) truncated to 512, padded with `<pad>` (0); like ChromaPipeline the first pad
+      // is a key too and only those `valid + 1` rows are kept (masked text reaches nothing).
       {name: "t5", component: "text_encoder", net: "encoder", tokenizer: "tokenizer", add_special: false,
-       eos: 1, max_len: 512, pad_to: 512, pad_id: 0, keep: "valid_plus1", outputs: {hidden: "hidden"}},
+       eos: 1, max_len: 512, pad_to: 512, pad_id: 0, mask: "valid_plus1", keep: "valid_plus1",
+       outputs: {hidden: "hidden"}},
     ],
     pooled: [],
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},

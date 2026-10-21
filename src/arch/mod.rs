@@ -55,6 +55,19 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/sdxl.json5", include_str!("../../arch/families/sdxl.json5")),
     ("overrides/sd_turbo.json5", include_str!("../../arch/overrides/sd_turbo.json5")),
     ("overrides/sdxl_turbo.json5", include_str!("../../arch/overrides/sdxl_turbo.json5")),
+    ("families/ldm_clip.json5", include_str!("../../arch/families/ldm_clip.json5")),
+    ("families/ldm_openclip.json5", include_str!("../../arch/families/ldm_openclip.json5")),
+    ("families/sdxl_clip_l.json5", include_str!("../../arch/families/sdxl_clip_l.json5")),
+    ("families/sdxl_clip_g.json5", include_str!("../../arch/families/sdxl_clip_g.json5")),
+    ("families/ldm_unet.json5", include_str!("../../arch/families/ldm_unet.json5")),
+    ("families/ldm_vae.json5", include_str!("../../arch/families/ldm_vae.json5")),
+    ("families/sd1_file.json5", include_str!("../../arch/families/sd1_file.json5")),
+    ("families/sd2_file.json5", include_str!("../../arch/families/sd2_file.json5")),
+    ("families/sdxl_file.json5", include_str!("../../arch/families/sdxl_file.json5")),
+    ("families/sd2_gguf.json5", include_str!("../../arch/families/sd2_gguf.json5")),
+    ("overrides/sd1_file_turbo.json5", include_str!("../../arch/overrides/sd1_file_turbo.json5")),
+    ("overrides/sd2_file_turbo.json5", include_str!("../../arch/overrides/sd2_file_turbo.json5")),
+    ("overrides/sdxl_file_turbo.json5", include_str!("../../arch/overrides/sdxl_file_turbo.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 
@@ -725,6 +738,31 @@ mod tests {
         assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "gguf").as_deref(), Some("one"));
         assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "safetensors"), None);
         assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"]), "gguf"), None);
+    }
+
+    /// SD single-file checkpoints claim their pipeline family by tensor names and extension; every
+    /// SD pipeline / component family merges; turbo repo ids get 1-step defaults.
+    #[test]
+    fn sd_single_file_families() {
+        let r = Registry::load(None).unwrap();
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let unet = "model.diffusion_model.input_blocks.0.0.weight";
+        let sd1 = n(&["cond_stage_model.transformer.text_model.final_layer_norm.weight", unet]);
+        assert_eq!(r.detect_single_file(&sd1, "safetensors").as_deref(), Some("sd1_file"));
+        assert_eq!(r.detect_single_file(&sd1, "gguf").as_deref(), Some("sd2_gguf"));
+        let sd2 = n(&["cond_stage_model.model.ln_final.weight", unet]);
+        assert_eq!(r.detect_single_file(&sd2, "safetensors").as_deref(), Some("sd2_file"));
+        let xl = n(&["conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
+                     "conditioner.embedders.1.model.ln_final.weight", unet]);
+        assert_eq!(r.detect_single_file(&xl, "safetensors").as_deref(), Some("sdxl_file"));
+        for f in ["sd", "sdxl", "sd1_file", "sd2_file", "sdxl_file", "sd2_gguf", "ldm_clip", "ldm_openclip",
+                  "sdxl_clip_l", "sdxl_clip_g", "ldm_unet", "ldm_vae"] {
+            r.spec(f, &Signals::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+        }
+        let turbo = Signals { hub_id: "stabilityai/sdxl-turbo".into(), ..Default::default() };
+        let s = r.spec("sdxl_file", &turbo).unwrap();
+        assert_eq!((s.runtime["defaults"]["steps"].as_u64(), s.runtime["defaults"]["guidance"].as_u64()), (Some(1), Some(0)));
+        assert_eq!(s.runtime["reference"], "'stabilityai/stable-diffusion-xl-base-1.0'");
     }
 
     #[test]

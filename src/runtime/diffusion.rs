@@ -647,9 +647,10 @@ impl SpecDiffusion {
             is_cached: true,
             ..Default::default()
         };
-        // The spec's `checks` refuse component loads (a family may reference itself for its
-        // networks); the root holds no weights or config of its own.
+        // The spec's `checks` run on the root and on every component load (a family may
+        // reference itself for its networks): checks reading tensors or `cfg` guard on them.
         let root = crate::arch::load::load(&root_art, reg, family)?;
+        crate::arch::load::check(&root)?;
         let fam = root.spec.family.clone();
         let rt: Runtime = root.spec.runtime_as()?;
         let err = |e: String| format!("{fam}: {e}");
