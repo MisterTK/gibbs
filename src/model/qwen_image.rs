@@ -71,7 +71,7 @@ impl QLin {
     }
 
     /// The whole stored matrix as a graph weight, still in its stored encoding (bf16 or packed
-    /// GGUF blocks). ponytail: same conversion as `flux::graph_program::wt_mat`; dedupe when a
+    /// GGUF blocks). ponytail: same conversion as `flux::wt_mat`; dedupe when a
     /// third family needs it.
     fn stored(&self) -> Mat {
         match &*self.w {

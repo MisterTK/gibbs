@@ -8,8 +8,8 @@ use gibbs_engine::hardware::Device;
 use gibbs_engine::model::qwen3_5::Qwen3Encoder;
 use serde_json::{json, Value};
 
-const H: usize = 64;
-const V: usize = 64;
+pub(crate) const H: usize = 64;
+pub(crate) const V: usize = 64;
 const HEADS: usize = 4;
 const KV: usize = 2;
 const HD: usize = 16;
@@ -17,11 +17,12 @@ const INTER: usize = 96;
 const LAYERS: usize = 3;
 const IDS: [u32; 7] = [5, 17, 33, 48, 2, 12, 60];
 
-/// Dense decoder under prefix `p`: `qk_norm` (qwen3 / Qwen3-VL) or qkv biases (Qwen2.5-VL).
-fn weights(seed: u64, p: &str, qk_norm: bool) -> Weights {
+/// Dense decoder under prefix `p` with `layers` layers: `qk_norm` (qwen3 / Qwen3-VL) or qkv
+/// biases (Qwen2.5-VL).
+pub(crate) fn weights(seed: u64, p: &str, qk_norm: bool, layers: usize) -> Weights {
     let mut w = Weights::new(seed);
     w.w(format!("{p}.embed_tokens.weight"), &[V, H]);
-    for l in 0..LAYERS {
+    for l in 0..layers {
         let lp = format!("{p}.layers.{l}");
         let a = format!("{lp}.self_attn");
         w.norm(format!("{lp}.input_layernorm.weight"), H, 1.0)
@@ -46,9 +47,9 @@ fn weights(seed: u64, p: &str, qk_norm: bool) -> Weights {
     w
 }
 
-fn text_config(model_type: &str) -> Value {
+pub(crate) fn text_config(model_type: &str, layers: usize) -> Value {
     json!({
-        "model_type": model_type, "hidden_size": H, "vocab_size": V, "num_hidden_layers": LAYERS,
+        "model_type": model_type, "hidden_size": H, "vocab_size": V, "num_hidden_layers": layers,
         "num_attention_heads": HEADS, "num_key_value_heads": KV, "head_dim": HD,
         "intermediate_size": INTER, "max_position_embeddings": 128, "rms_norm_eps": 1e-6,
         "rope_theta": 10000.0, "tie_word_embeddings": true
@@ -72,25 +73,25 @@ fn run(case: &str, cfg: &Value, w: &Weights) {
 
 #[test]
 fn qwen3_encoder() {
-    let mut cfg = text_config("qwen3");
+    let mut cfg = text_config("qwen3", LAYERS);
     cfg["architectures"] = json!(["Qwen3ForCausalLM"]);
-    run("text_enc_qwen3", &cfg, &weights(0x5157_454E_0E01, "model", true));
+    run("text_enc_qwen3", &cfg, &weights(0x5157_454E_0E01, "model", true, LAYERS));
 }
 
 /// Nested `text_config` with interleaved M-RoPE sections, decoder under `model.language_model`.
 #[test]
 fn qwen3_vl_encoder() {
-    let mut text = text_config("qwen3_vl_text");
+    let mut text = text_config("qwen3_vl_text", LAYERS);
     text["rope_scaling"] = json!({"rope_type": "default", "mrope_interleaved": true, "mrope_section": [4, 2, 2]});
     let cfg = json!({"model_type": "qwen3_vl", "architectures": ["Qwen3VLForConditionalGeneration"], "text_config": text});
-    run("text_enc_qwen3_vl", &cfg, &weights(0x5157_454E_0E02, "model.language_model", true));
+    run("text_enc_qwen3_vl", &cfg, &weights(0x5157_454E_0E02, "model.language_model", true, LAYERS));
 }
 
 /// Qwen2.5-VL text tower: qkv biases, no q/k norm, `mrope` rope type (text positions: plain RoPE).
 #[test]
 fn qwen2_5_vl_encoder() {
-    let mut cfg = text_config("qwen2_5_vl");
+    let mut cfg = text_config("qwen2_5_vl", LAYERS);
     cfg["architectures"] = json!(["Qwen2_5_VLForConditionalGeneration"]);
     cfg["rope_scaling"] = json!({"type": "mrope", "mrope_section": [4, 2, 2]});
-    run("text_enc_qwen2_5_vl", &cfg, &weights(0x5157_454E_0E03, "model", false));
+    run("text_enc_qwen2_5_vl", &cfg, &weights(0x5157_454E_0E03, "model", false, LAYERS));
 }

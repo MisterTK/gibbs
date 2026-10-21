@@ -85,7 +85,6 @@ pub mod repack;
 pub mod siglip;
 pub mod simd;
 pub mod spm;
-pub mod t5;
 pub mod text_to_image;
 pub mod tokenizer;
 pub mod unet;
