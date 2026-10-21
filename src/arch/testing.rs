@@ -176,8 +176,13 @@ impl Runner {
         if !self.progs.contains_key(&key) {
             let w = self.model.store.materialize(&inst.weights)?;
             let p = GraphProgram::compile(inst.graph.clone(), w, PlacementMode::Pin(self.dev))?;
-            if p.primary_device() != self.dev {
-                return Err(format!("compiled for {:?}, wanted {:?}", p.primary_device(), self.dev));
+            if p.primary_device() != self.dev || (self.dev == Device::Metal && p.cpu_node_count() > 0) {
+                return Err(format!(
+                    "compiled for {:?} with {} CPU nodes, wanted all on {:?}",
+                    p.primary_device(),
+                    p.cpu_node_count(),
+                    self.dev
+                ));
             }
             self.progs.insert(key.clone(), p);
         }

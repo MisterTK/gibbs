@@ -611,6 +611,25 @@ mod tests {
     use crate::model::loaders::{SafetensorsWeightReader, WeightReader};
     use std::path::PathBuf;
 
+    /// BitNet `online` checkpoints are plain masters: mapped as stored, not dequantized to bf16.
+    #[test]
+    fn online_bitnet_masters_keep_their_dtype() {
+        let d = tempfile::tempdir().unwrap();
+        let v: Vec<u8> = [0.1f32, -0.2, 0.3, 0.4].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut h = serde_json::to_vec(&serde_json::json!(
+            {"w": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]}})).unwrap();
+        h.resize(h.len().next_multiple_of(8), b' ');
+        let mut st = (h.len() as u64).to_le_bytes().to_vec();
+        st.extend(h);
+        st.extend(v);
+        let (p, c) = (d.path().join("model.safetensors"), d.path().join("config.json"));
+        std::fs::write(&p, st).unwrap();
+        std::fs::write(&c, serde_json::json!({"model_type": "bitnet", "quantization_config":
+            {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "online"}}).to_string()).unwrap();
+        let w = super::open_weights(&p, Some(&c)).unwrap();
+        assert_eq!(w.stored_dtype("w"), Some("F32"));
+    }
+
     /// Serializes the real-weight checks: each holds a full f32 model in memory.
     pub(super) static HEAVY: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
