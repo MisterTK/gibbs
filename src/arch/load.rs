@@ -136,6 +136,9 @@ pub struct Checkpoint {
     container: Option<Arc<GgufData>>,
     /// Safetensors written by `peft::prepare_causal_lm` (the adapter beside it is merged already).
     lora_merged: bool,
+    /// Canonical tensors read through `values(name)` (folded into the graph as constants, e.g.
+    /// clamp bounds): consumed like graph weights.
+    values_read: Mutex<HashSet<String>>,
 }
 
 impl Checkpoint {
@@ -263,6 +266,7 @@ pub fn open(artifacts: &ModelArtifacts) -> Result<Checkpoint, String> {
         raw: BTreeMap::new(),
         container: None,
         lora_merged: false,
+        values_read: Mutex::default(),
     };
     match &weights {
         None => ck.synthetic = crate::model::hub::is_synthetic_model_id(&artifacts.model_id),
@@ -540,6 +544,9 @@ impl Env for Vars<'_> {
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.parent.values(t)
     }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.parent.dtype(t)
+    }
     fn token(&self, s: &str) -> Option<u32> {
         self.parent.token(s)
     }
@@ -677,6 +684,9 @@ impl Env for Eval<'_> {
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.m.values(t)
     }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.m.dtype(t)
+    }
     fn token(&self, s: &str) -> Option<u32> {
         self.m.token(s)
     }
@@ -779,9 +789,19 @@ impl Env for ModelEnv {
     }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         let n = self.table.read().get(t).cloned()?;
+        self.ckpt.values_read.lock().insert(t.to_string());
         (n.shape.iter().product::<usize>() <= SMALL_VALUES)
             .then(|| node_values(&self.ckpt, &n))
             .flatten()
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        Some(match self.table.read().get(t)?.kind {
+            Kind::F32 => "f32",
+            Kind::F16 => "f16",
+            Kind::Bf16 => "bf16",
+            Kind::U32 => "u32",
+            Kind::Packed(_) => "quant",
+        })
     }
     fn token(&self, s: &str) -> Option<u32> {
         self.tok.as_ref()?.vocab.get(s).copied()
@@ -1040,6 +1060,11 @@ impl WeightStore {
         let table = self.table.read();
         let mut fed = HashSet::new();
         for u in used {
+            if let Some(n) = table.get(u) {
+                leaves(n, &mut fed);
+            }
+        }
+        for u in self.ckpt.values_read.lock().iter() {
             if let Some(n) = table.get(u) {
                 leaves(n, &mut fed);
             }
@@ -2666,6 +2691,9 @@ mod tests {
             m.store.unconsumed(&used, &ignore),
             ["unused.weight", "used.bias"]
         );
+        // A `values(name)` read (a build-time constant) consumes the tensor.
+        assert_eq!(m.env.values("used.bias"), Some(vec![1.0]));
+        assert_eq!(m.store.unconsumed(&used, &ignore), ["unused.weight"]);
     }
 
     #[test]

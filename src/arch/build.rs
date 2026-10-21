@@ -211,6 +211,9 @@ impl Env for BEnv<'_, '_> {
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.0.model.values(t)
     }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.0.model.dtype(t)
+    }
     fn token(&self, s: &str) -> Option<u32> {
         self.0.model.token(s)
     }

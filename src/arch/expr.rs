@@ -128,6 +128,10 @@ pub trait Env {
     fn values(&self, _tensor: &str) -> Option<Vec<f32>> {
         None
     }
+    /// Stored dtype of a source tensor (`f32`, `f16`, `bf16`, `u32`, `quant`), for `dtype(name)`.
+    fn dtype(&self, _tensor: &str) -> Option<&'static str> {
+        None
+    }
     /// Vocabulary id of a token string, for `token(s)`.
     fn token(&self, _s: &str) -> Option<u32> {
         None
@@ -177,6 +181,9 @@ impl Env for Bind<'_> {
     }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.parent.values(t)
+    }
+    fn dtype(&self, t: &str) -> Option<&'static str> {
+        self.parent.dtype(t)
     }
     fn token(&self, s: &str) -> Option<u32> {
         self.parent.token(s)
@@ -802,6 +809,8 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
             Some(v) => Val::List(v.into_iter().map(|x| Val::Num(x as f64)).collect()),
             None => Val::Null,
         },
+        // dtype(name): the stored dtype of a source tensor (null when absent).
+        "dtype" => env.dtype(arg(0)?.str()?).map_or(Val::Null, |d| Val::Str(d.into())),
         // token(s): the vocabulary id of token string `s` (null when absent).
         "token" => env.token(arg(0)?.str()?).map_or(Val::Null, |t| Val::Num(t as f64)),
         // bf16(x): x rounded to the nearest bfloat16 (through f32).
@@ -838,6 +847,9 @@ mod tests {
         }
         fn values(&self, t: &str) -> Option<Vec<f32>> {
             (t == "x.w").then(|| vec![0.5, 1.0])
+        }
+        fn dtype(&self, t: &str) -> Option<&'static str> {
+            (t == "x.w").then_some("bf16")
         }
     }
     fn env() -> E {
@@ -897,6 +909,7 @@ mod tests {
             Val::List(vec![Val::Num(0.0), Val::Num(1.0), Val::Num(2.0)])
         );
         assert_eq!(ev("at(values('x.w'), 1) + len(values('y.w'))"), Val::Num(1.0));
+        assert_eq!(ev("dtype('x.w') == 'bf16' && dtype('y.w') == null"), Val::Bool(true));
         assert_eq!(ev("bf16(sqrt(1536))"), Val::Num(39.25));
         assert_eq!(ev("rfind([1, 0, 1, 1, 0], 1, 3) + rfind([1, 0], 0) + rfind(cfg.layer_types, 'x')"), Val::Num(2.0));
     }

@@ -35,9 +35,8 @@
     attn_scale: "(gg ? (layers == 62 ? hidden / heads : head_dim) : first(tc.query_pre_attn_scalar, 256)) ** -0.5",
     attn_softcap: "first(tc.attn_logit_softcapping, 0)",
     softcap: "first(gguf.final_logit_softcapping, tc.final_logit_softcapping, 0)",
-    // transformers casts sqrt(hidden) to the (bf16) embedding dtype; llama.cpp scales in f32.
-    // ponytail: f32 HF checkpoints also get the bf16 scale; add a dtype() expr if one shows up.
-    embed_scale: "gg ? sqrt(hidden) : bf16(sqrt(hidden))",
+    // transformers casts sqrt(hidden) to the embedding dtype; llama.cpp scales in f32.
+    embed_scale: "!gg && dtype('model.embed_tokens.weight') == 'bf16' ? bf16(sqrt(hidden)) : sqrt(hidden)",
     max_position_embeddings: "first(gguf.context_length, tc.max_position_embeddings, 131072)",
     ctx: "first(runtime.ctx, min(max_position_embeddings, 4096))",
     labels: "has('score.weight') ? shape('score.weight')[0] : 0",
