@@ -1625,13 +1625,16 @@ fn single_file(
             parts.push((name.clone(), weights.to_path_buf()));
         }
     }
-    for e in &rt.text_encoders {
-        for d in [Some(&e.tokenizer), e.tokenizer_config.as_ref()].into_iter().flatten() {
-            if !d.starts_with("hub:") {
-                // Optional files: whichever the tokenizer dir has.
-                for f in ["tokenizer.json", "special_tokens_map.json", "tokenizer_config.json", "spiece.model"] {
-                    let _ = hub.fetch_file(&reference, &format!("{d}/{f}"));
-                }
+    // Only the files each text entry reads (missing ones would be network round trips).
+    for e in rt.text_encoders.iter().filter(|e| !e.tokenizer.starts_with("hub:")) {
+        let d = &e.tokenizer;
+        if hub.fetch_file(&reference, &format!("{d}/tokenizer.json")).is_err() {
+            fetch(&format!("{d}/spiece.model"))?;
+        }
+        if e.pad_token.as_deref() == Some("config") {
+            let d = e.tokenizer_config.as_ref().unwrap_or(d);
+            for f in ["special_tokens_map.json", "tokenizer_config.json"] {
+                let _ = hub.fetch_file(&reference, &format!("{d}/{f}"));
             }
         }
     }

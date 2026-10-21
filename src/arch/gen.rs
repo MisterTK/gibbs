@@ -985,11 +985,18 @@ mod tests {
         /// per id), old formulas inlined.
         #[test]
         fn sd_embeddings_match_sources() {
+            // `sd.rs` `guidance_embedding`, verbatim (f32 sin/cos codegen depends on loop shape).
+            fn guidance_embedding(w: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let w = w * 1000.0;
+                let f = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
+                let mut e: Vec<f32> = (0..half).map(|i| (w * f(i)).sin()).collect();
+                e.extend((0..half).map(|i| (w * f(i)).cos()));
+                e.resize(dim, 0.0);
+                e
+            }
             let (w, dim) = (6.5f32, 16usize);
-            let half = dim / 2;
-            let fq = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
-            let mut want: Vec<f32> = (0..half).map(|i| (w * 1000.0 * fq(i)).sin()).collect();
-            want.extend((0..half).map(|i| (w * 1000.0 * fq(i)).cos()));
+            let want = guidance_embedding(w, dim);
             let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
                 "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
