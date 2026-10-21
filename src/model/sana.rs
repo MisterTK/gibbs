@@ -11,11 +11,11 @@ use crate::model::dit::{
     add_gated, component_weights, norm_modulate, read_config, rms_norm, silu_of, timestep_features,
     Lin,
 };
-use crate::model::flow::{self, DpmSolver2};
+use crate::runtime::sched::{self, DpmSolver2};
 use crate::model::image::ImageBuffer;
 use crate::model::nn;
 use crate::model::par::{par_for, par_rows, OutPtr};
-use crate::model::sd::Rng;
+use crate::runtime::sched::Rng;
 use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
 use crate::model::weights::{Mat, Weights};
 use std::path::Path;
@@ -643,7 +643,7 @@ impl ImageGenerator for SanaPipeline {
             "  text encoder: {n_cap} caption tokens, {:.2}s",
             start.elapsed().as_secs_f64()
         );
-        let sigmas = flow::dpm_flow_sigmas(steps, self.flow_shift);
+        let sigmas = sched::dpm_flow_sigmas(steps, self.flow_shift);
         let mut rng = Rng::new(req.seed);
         let mut x: Vec<f32> = (0..self.dit.in_ch * h * w)
             .map(|_| rng.gaussian())
@@ -651,7 +651,7 @@ impl ImageGenerator for SanaPipeline {
         let mut dpm = DpmSolver2::default();
         for i in 0..steps {
             let start = Instant::now();
-            let t = flow::timestep(sigmas[i]).floor();
+            let t = sched::timestep(sigmas[i]).floor();
             let fwd = |x: &[f32], cap: &[f32], n: usize| {
                 if gpu {
                     self.dit.forward_gpu(&self.dit.gpu, x, h, w, t, cap, n)
