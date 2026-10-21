@@ -778,6 +778,8 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
         "fmt" => Val::Str(interp(arg(0)?.str()?, env)?),
         "str" => Val::Str(arg(0)?.to_string()),
         "int" => Val::Num(arg(0)?.num()?.trunc()),
+        // The value rounded to bf16 (round-to-nearest-even), e.g. a bf16 checkpoint's in-graph constant.
+        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(arg(0)?.num()? as f32)) as f64),
         "list" => {
             // list(n, x): n copies of x.
             let n = arg(0)?.usize()?;
@@ -856,6 +858,7 @@ mod tests {
         assert_eq!(ev("first_has('y.w', 'x.w')"), Val::Str("x.w".into()));
         assert_eq!(ev("fmt('l{n * 2}')"), Val::Str("l6".into()));
         assert_eq!(ev("sqrt(16) + ceil(1.2) + floor(1.8)"), Val::Num(7.0));
+        assert_eq!(ev("bf16(sqrt(3584))"), Val::Num(59.75));
         assert_eq!(
             ev("range(3)"),
             Val::List(vec![Val::Num(0.0), Val::Num(1.0), Val::Num(2.0)])

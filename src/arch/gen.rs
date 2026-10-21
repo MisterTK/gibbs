@@ -340,12 +340,13 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
     out
 }
 
-/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]` (`[2, dim]` with
-/// `prepend_zero: true`: rows `emb(0)`, `emb(t)`, e.g. a clean span ahead of a noisy one).
+/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]`; `t` a list of n values: their
+/// embeddings concatenated, `[n * dim]` (SDXL `add_time_ids`).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
 /// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
-/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults.
+/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults, `sd.rs` `guidance_embedding` with
+/// `flip_sin_to_cos: false, downscale_freq_shift: 1`.
 fn timestep_embedding(a: &Args) -> Result<Gen, String> {
     let dim = a.u("dim")?;
     let f32p = match a.s_or("precision", "f64")? {
@@ -353,20 +354,14 @@ fn timestep_embedding(a: &Args) -> Result<Gen, String> {
         "f32" => true,
         p => return Err(bad("precision", p)),
     };
-    let v = timestep_vec(
-        a.f("t")?,
-        dim,
-        a.b_or("flip_sin_to_cos", true)?,
-        a.f_or("downscale_freq_shift", 0.0)?,
-        a.f_or("scale", 1.0)?,
-        a.f_or("max_period", 10000.0)?,
-        f32p,
-    );
-    if a.b_or("prepend_zero", false)? {
-        let z = timestep_vec(0.0, dim, a.b_or("flip_sin_to_cos", true)?, a.f_or("downscale_freq_shift", 0.0)?, a.f_or("scale", 1.0)?, a.f_or("max_period", 10000.0)?, f32p);
-        return f32s(vec![2, dim], [z, v].concat());
-    }
-    f32s(vec![dim], v)
+    let ts = match a.get("t").is_some_and(Value::is_array) {
+        true => a.fs("t")?,
+        false => vec![a.f("t")?],
+    };
+    let (flip, shift) = (a.b_or("flip_sin_to_cos", true)?, a.f_or("downscale_freq_shift", 0.0)?);
+    let (scale, period) = (a.f_or("scale", 1.0)?, a.f_or("max_period", 10000.0)?);
+    let v: Vec<f32> = ts.iter().flat_map(|&t| timestep_vec(t, dim, flip, shift, scale, period, f32p)).collect();
+    f32s(vec![v.len()], v)
 }
 
 /// `modulation_index_rows`: input rows of a distilled modulation-table MLP, F32
@@ -819,6 +814,7 @@ mod tests {
         assert_eq!(rel[1], (2.0 * (-(10000f64.ln())).exp()).sin() as f32);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4})), [1.0, 1.0, 0.0, 0.0]);
         assert_eq!(f("timestep_embedding", json!({"t": 0.0, "dim": 4, "flip_sin_to_cos": false})), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(f("timestep_embedding", json!({"t": [0.0, 0.0], "dim": 2})), [1.0, 0.0, 1.0, 0.0]);
         assert_eq!(
             f("modulation_index_rows", json!({"t": 0.0, "rows": 2, "dims": [2, 2, 2], "scale": 1000.0})),
             [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1000f64.cos() as f32, 1000f64.sin() as f32]
@@ -1022,12 +1018,6 @@ mod tests {
                 let got = (fnv(&f("video_rope_cos_sin", a("cos"))), fnv(&f("video_rope_cos_sin", a("sin"))));
                 assert_eq!(got, pin, "{:?}", (fr, h, w));
             }
-            let a = json!({"t": 700.0, "dim": 8});
-            let mut z = a.clone();
-            z["prepend_zero"] = json!(true);
-            let mut zero = a.clone();
-            zero["t"] = json!(0.0);
-            assert_eq!(f("timestep_embedding", z), [f("timestep_embedding", zero), f("timestep_embedding", a)].concat());
         }
 
         const PIN_ROPE: [(u64, u64); 2] = [(7060718898465474953, 1236744568232124141), (101182376039508301, 1818247417042637373)];

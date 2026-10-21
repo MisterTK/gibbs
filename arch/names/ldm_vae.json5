@@ -1,0 +1,24 @@
+// LDM AutoencoderKL names (SD single-file / GGUF `first_stage_model.*`) -> diffusers
+// AutoencoderKL names. LDM decoder `up.i` is diffusers `up_blocks.(levels-1-i)`; the mid-block
+// attention q/k/v/proj_out stay [C, C, 1, 1] convs (the family flattens them to linears).
+// ponytail: decoder levels fixed at 4 (every SD 1.x/2.x/XL/3 and FLUX VAE); a 5-level LDM VAE
+// leaves `up_blocks.-1.*` unconsumed (strict load error), pass the level count to `to` if one appears.
+{
+  rules: [
+    ["first_stage_model.{c:*}.down.{i}.block.{j}.nin_shortcut.{t:*}", "{c}.down_blocks.{i}.resnets.{j}.conv_shortcut.{t}"],
+    ["first_stage_model.{c:*}.down.{i}.block.{j}.{t:*}", "{c}.down_blocks.{i}.resnets.{j}.{t}"],
+    ["first_stage_model.{c:*}.down.{i}.downsample.{t:*}", "{c}.down_blocks.{i}.downsamplers.0.{t}"],
+    ["first_stage_model.{c:*}.up.{i}.block.{j}.nin_shortcut.{t:*}", "{c}.up_blocks.{3 - i}.resnets.{j}.conv_shortcut.{t}"],
+    ["first_stage_model.{c:*}.up.{i}.block.{j}.{t:*}", "{c}.up_blocks.{3 - i}.resnets.{j}.{t}"],
+    ["first_stage_model.{c:*}.up.{i}.upsample.{t:*}", "{c}.up_blocks.{3 - i}.upsamplers.0.{t}"],
+    ["first_stage_model.{c:*}.mid.block_1.{t:*}", "{c}.mid_block.resnets.0.{t}"],
+    ["first_stage_model.{c:*}.mid.block_2.{t:*}", "{c}.mid_block.resnets.1.{t}"],
+    ["first_stage_model.{c:*}.mid.attn_1.norm.{t:*}", "{c}.mid_block.attentions.0.group_norm.{t}"],
+    ["first_stage_model.{c:*}.mid.attn_1.q.{t:*}", "{c}.mid_block.attentions.0.to_q.{t}"],
+    ["first_stage_model.{c:*}.mid.attn_1.k.{t:*}", "{c}.mid_block.attentions.0.to_k.{t}"],
+    ["first_stage_model.{c:*}.mid.attn_1.v.{t:*}", "{c}.mid_block.attentions.0.to_v.{t}"],
+    ["first_stage_model.{c:*}.mid.attn_1.proj_out.{t:*}", "{c}.mid_block.attentions.0.to_out.0.{t}"],
+    ["first_stage_model.{c:*}.norm_out.{t:*}", "{c}.conv_norm_out.{t}"],
+    ["first_stage_model.{rest:*}", "{rest}"],
+  ],
+}

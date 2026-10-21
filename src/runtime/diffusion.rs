@@ -2,7 +2,7 @@
 //! (one compiled program per network; other shapes run reshaped on its weights).
 
 use crate::arch::build::{build, Instance, ShapeCache};
-use crate::arch::expr::{eval_json, eval_str, walk, Env, Val};
+use crate::arch::expr::{eval_json, eval_str, interp, walk, Env, Val};
 use crate::arch::gen::{generate, GenData};
 use crate::arch::load::Model;
 use crate::graph::program::GraphProgram;
@@ -254,6 +254,9 @@ pub struct TextEntry {
     /// Pad token text (`"config"`: read from `tokenizer_config`), looked up in the vocabulary.
     #[serde(default)]
     pub pad_token: Option<String>,
+    /// `key_mask` masks the padding (default); `false`: every row is a key (all 0).
+    #[serde(default = "yes")]
+    pub mask: bool,
     #[serde(default = "keep_all")]
     pub keep: String,
     #[serde(default)]
@@ -272,6 +275,9 @@ pub struct Range2 {
 
 fn prompt_template() -> String {
     "{prompt}".into()
+}
+fn yes() -> bool {
+    true
 }
 fn keep_all() -> String {
     "all".into()
@@ -476,6 +482,16 @@ enum Sampler {
     },
 }
 
+/// What a pipeline loads beyond its own snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct Extras {
+    /// LoRA files and their strengths.
+    pub loras: Vec<(std::path::PathBuf, f32)>,
+    /// (component, weights file) replacing the snapshot's weights of that component (a derived
+    /// finetune / quantization, e.g. a GGUF from another repo); config stays the snapshot's.
+    pub weights: Vec<(String, std::path::PathBuf)>,
+}
+
 /// A text-to-image (and image-to-image) pipeline run from its family spec.
 pub struct SpecDiffusion {
     id: String,
@@ -606,8 +622,9 @@ impl SpecDiffusion {
         hub: &HuggingFaceHub,
         mode: PlacementMode,
         family: Option<&str>,
-        loras: &[(std::path::PathBuf, f32)],
+        extra: &Extras,
     ) -> Result<Self, String> {
+        let loras = &extra.loras;
         let reg = crate::arch::registry()?;
         let lora_files = loras
             .iter()
@@ -625,8 +642,9 @@ impl SpecDiffusion {
             is_cached: true,
             ..Default::default()
         };
+        // The spec's `checks` refuse component loads (a family may reference itself for its
+        // networks); the root holds no weights or config of its own.
         let root = crate::arch::load::load(&root_art, reg, family)?;
-        crate::arch::load::check(&root)?;
         let fam = root.spec.family.clone();
         let rt: Runtime = root.spec.runtime_as()?;
         let err = |e: String| format!("{fam}: {e}");
@@ -638,7 +656,19 @@ impl SpecDiffusion {
             if let Some(m) = by_comp.get(name) {
                 return Ok(m.clone());
             }
-            let mut m = root.component(reg, name)?;
+            let mut m = match extra.weights.iter().find(|(c, _)| c == name).map(|(_, w)| w) {
+                // Substituted weights under the base's component config.
+                Some(w) => {
+                    let crate::arch::Component::Ref { family, dir: Some(d) } = root.spec.component(name)? else {
+                        return Err(format!("component `{name}` is not a {{family, dir}} reference"));
+                    };
+                    let mut a = dir_artifacts(&dir.join(&d));
+                    a.weights_path = Some(w.clone());
+                    a.model_id = w.display().to_string();
+                    crate::arch::load::load(&a, reg, Some(&family))?
+                }
+                _ => root.component(reg, name)?,
+            };
             crate::arch::load::check(&m)?;
             if let Some(part) = part {
                 for (f, strength) in &lora_files {
@@ -872,7 +902,7 @@ impl SpecDiffusion {
         let (h, w) = (d.height / self.factor, d.width / self.factor);
         for t in self.text.iter().flatten() {
             let rows = self.eval_n(&t.e.pad_to, &[]).unwrap_or(8.0).max(1.0) as usize;
-            t.net.instance(&t.vars(rows)?)?;
+            t.net.instance(&self.text_vars(t, rows)?)?;
         }
         let nt = 8;
         self.denoiser.instance(&self.den_vars(h, w, nt))?;
@@ -923,6 +953,16 @@ impl SpecDiffusion {
             return Err("unset".into());
         }
         self.eval(j, vars)?.num()
+    }
+
+    /// Instance vars of a text encoder: `rows`, then the entry's `vars` (expressions over the
+    /// runtime scope, e.g. `te.layers` of the encoder's own config).
+    fn text_vars<'a>(&self, t: &'a TextEnc, rows: usize) -> Result<Vec<(&'a str, Val)>, String> {
+        let mut v = vec![("rows", Val::Num(rows as f64))];
+        for (k, j) in &t.e.vars {
+            v.push((k.as_str(), self.eval(j, &[]).map_err(|e| format!("{}: vars.{k}: {e}", t.e.name))?));
+        }
+        Ok(v)
     }
 
     fn den_vars(&self, h: usize, w: usize, nt: usize) -> Vec<(&'static str, Val)> {
@@ -1008,14 +1048,14 @@ impl SpecDiffusion {
             }
             let rows = ids.len();
             let key_mask: Vec<f32> =
-                (0..rows).map(|i| if i < valid { 0.0 } else { f32::NEG_INFINITY }).collect();
+                (0..rows).map(|i| if i < valid || !e.mask { 0.0 } else { f32::NEG_INFINITY }).collect();
             let given = [
                 ("token_ids", Tensor::U32(ids.clone())),
                 ("positions", Tensor::U32((0..rows as u32).collect())),
                 ("key_mask", Tensor::F32(key_mask)),
                 ("last_index", Tensor::U32(vec![valid.saturating_sub(1) as u32])),
             ];
-            let res = t.net.run(&t.vars(rows)?, &given, &[])?;
+            let res = t.net.run(&self.text_vars(t, rows)?, &given, &[])?;
             let keep = match e.keep.as_str() {
                 "all" => rows,
                 "valid" => valid,
@@ -1034,7 +1074,8 @@ impl SpecDiffusion {
                 None => 0..0,
             };
             for (key, oname) in &e.outputs {
-                let oname = oname.as_str().ok_or("text encoder outputs are names")?;
+                let oname = interp(oname.as_str().ok_or("text encoder outputs are names")?, &self.env(&[]))?;
+                let oname = oname.as_str();
                 let v = res
                     .iter()
                     .find(|(n, _)| n == oname)
@@ -1337,20 +1378,6 @@ impl SpecDiffusion {
     }
 }
 
-impl TextEnc {
-    fn vars(&self, rows: usize) -> Result<Vec<(&'static str, Val)>, String> {
-        let mut v = vec![("rows", Val::Num(rows as f64))];
-        for (k, j) in &self.e.vars {
-            let k: &'static str = match k.as_str() {
-                "taps" => "taps",
-                other => return Err(format!("{}: unsupported instance var `{other}`", self.e.name)),
-            };
-            v.push((k, Val::from_json(j)));
-        }
-        Ok(v)
-    }
-}
-
 impl ImageGenerator for SpecDiffusion {
     fn summary(&self) -> String {
         self.summary.clone()
@@ -1371,6 +1398,153 @@ impl ImageGenerator for SpecDiffusion {
     fn image_to_image(&self, req: &ImageRequest, init: &ImageBuffer, strength: f32) -> Result<ImageBuffer, String> {
         self.generate(req, Some((init, strength)))
     }
+}
+
+// ---- discovery ---------------------------------------------------------------------------------
+
+/// Tensor names of a GGUF or safetensors file (headers only); `None` for any other file and for a
+/// GGUF split set that is not a diffusion model (large LMs: only the first shard's header is read).
+pub fn weight_names(path: &Path) -> Option<Vec<String>> {
+    Some(match path.extension()?.to_str()? {
+        "gguf" => {
+            let reg = crate::arch::registry().ok()?;
+            if crate::model::loaders::gguf::shard_paths(path).is_some() {
+                let arch = crate::model::loaders::gguf::architecture(path)?;
+                let fam = reg.detect(&crate::arch::Signals { gguf_arch: Some(arch), ..Default::default() })?;
+                if !matches!(reg.spec(&fam, &Default::default()).ok()?.pipeline, crate::arch::Pipeline::Diffusion) {
+                    return None;
+                }
+            }
+            crate::model::loaders::gguf::open(path).ok()?.0.tensors.into_keys().collect()
+        }
+        "safetensors" => {
+            let file = std::fs::File::open(path).ok()?;
+            // SAFETY: read-only mapping of a cache file, dropped before returning.
+            let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+            crate::model::UniversalModelLoader::parse_safetensors(&map).ok()?.tensors.into_keys().collect()
+        }
+        _ => return None,
+    })
+}
+
+/// The pipeline class of a diffusers snapshot (`model_index.json` `_class_name`).
+pub fn pipeline_class(dir: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join("model_index.json")).ok()?;
+    let v: J = serde_json::from_str(&s).ok()?;
+    v["_class_name"].as_str().map(str::to_string)
+}
+
+/// The diffusion family of a diffusers pipeline class (`None`: no `pipeline: diffusion` spec).
+fn family_of_class(class: &str) -> Option<String> {
+    let reg = crate::arch::registry().ok()?;
+    let sig = crate::arch::Signals { diffusers_class: Some(class.to_string()), ..Default::default() };
+    let f = reg.detect(&sig)?;
+    (reg.spec(&f, &sig).ok()?.pipeline == crate::arch::Pipeline::Diffusion).then_some(f)
+}
+
+/// Loads `artifacts` as an image pipeline; `None`: not an image model of a ported family (other
+/// loaders try). A diffusers snapshot loads by its `model_index.json` class. A weights file that is
+/// a diffusion LoRA, or the denoiser of a family (`match.denoiser_tensors`), loads on the base
+/// pipeline its model card's `base_model` names (fetched; the denoiser's own files skipped).
+pub fn load_image(
+    artifacts: &ModelArtifacts,
+    hub: &HuggingFaceHub,
+    mode: PlacementMode,
+) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
+    let arc = |r: Result<SpecDiffusion, String>| r.map(|p| Arc::new(p) as Arc<dyn ImageGenerator>);
+    let dir = artifacts.local_dir.as_deref()?;
+    if let Some(class) = pipeline_class(dir) {
+        if family_of_class(&class).is_some() {
+            return Some(arc(SpecDiffusion::load(artifacts, hub, mode, None, &Extras::default())));
+        }
+        if class.contains("Inpaint") {
+            return Some(Err(format!(
+                "{class} is an inpainting pipeline: it needs a mask, which no endpoint takes (use a text-to-image repo)"
+            )));
+        }
+        if class.contains("Img2Img") || class.contains("Refiner") {
+            return Some(Err(format!(
+                "{class} is an image-to-image-only pipeline; load its text-to-image base repo and use /v1/images/edits"
+            )));
+        }
+        return None;
+    }
+    let weights = artifacts.weights_path.as_deref()?;
+    let names = weight_names(weights)?;
+    let reg = crate::arch::registry().ok()?;
+    let lora = weights.extension().is_some_and(|e| e == "safetensors")
+        && crate::model::lora::is_diffusion_lora(names.iter().map(String::as_str));
+    let denoiser = if lora { None } else { Some(reg.detect_denoiser(&names)?) };
+    // `--model org/repo/file.gguf` names one file of the repo.
+    let repo = crate::model::hub::split_weight_file(&artifacts.model_id).0;
+    let card = dir
+        .join("README.md")
+        .is_file()
+        .then(|| dir.join("README.md"))
+        .map_or_else(|| hub.fetch_file(repo, "README.md"), Ok)
+        .and_then(|p| std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display())));
+    let what = if lora { "diffusion LoRA" } else { "denoiser weights" };
+    let base = match card.map(|c| crate::model::lora::card_base_model(&c)) {
+        Ok(Some(b)) => b,
+        // A LoRA without a card base may belong to another kind of model.
+        Ok(None) if lora => return None,
+        Ok(None) => return Some(Err(format!("{repo}: {what}, but the model card names no base_model"))),
+        Err(_) if lora => return None,
+        Err(e) => return Some(Err(format!("{repo}: {what}, model card unreadable: {e}"))),
+    };
+    // diffusers' official mirror of the SD 1.5 repo that LoRA cards still name.
+    let base = match base.as_str() {
+        "runwayml/stable-diffusion-v1-5" => "stable-diffusion-v1-5/stable-diffusion-v1-5".to_string(),
+        _ => base,
+    };
+    let gated = |e: String| {
+        format!(
+            "base model {base} could not be fetched ({e}); if it is gated, accept its license at https://huggingface.co/{base} with the HF_TOKEN account"
+        )
+    };
+    let class = match hub.fetch_file(&base, "model_index.json").map_err(gated) {
+        Ok(p) => p.parent().and_then(pipeline_class),
+        Err(e) => return if lora { None } else { Some(Err(e)) },
+    };
+    let fam = class.as_deref().and_then(family_of_class);
+    match (&fam, &denoiser) {
+        (None, _) if lora => return None,
+        (None, _) => {
+            return Some(Err(format!(
+                "{repo}: {what}, but its base_model {base} is {}",
+                class.as_deref().unwrap_or("not a diffusers pipeline")
+            )))
+        }
+        (Some(f), Some(d)) if f != d => {
+            return Some(Err(format!("{repo}: {d} denoiser weights, but its base_model {base} is a {f} pipeline")))
+        }
+        _ => {}
+    }
+    let fam = fam.unwrap();
+    Some((|| {
+        let spec = reg.spec(&fam, &Default::default())?;
+        let rt: Runtime = spec.runtime_as()?;
+        let skip = match (&denoiser, spec.component(&rt.denoiser.component)?) {
+            (Some(_), crate::arch::Component::Ref { dir: Some(d), .. }) => vec![d],
+            _ => Vec::new(),
+        };
+        let skip: Vec<&str> = skip.iter().map(String::as_str).collect();
+        let base_dir = hub.fetch_diffusers(&base, &skip).map_err(gated)?;
+        let a = ModelArtifacts {
+            model_id: format!("{} on {base}", artifacts.model_id),
+            local_dir: Some(base_dir),
+            is_cached: true,
+            ..Default::default()
+        };
+        let extra = Extras {
+            loras: if lora { vec![(weights.to_path_buf(), 1.0)] } else { Vec::new() },
+            weights: match denoiser {
+                Some(_) => vec![(rt.denoiser.component.clone(), weights.to_path_buf())],
+                None => Vec::new(),
+            },
+        };
+        arc(SpecDiffusion::load(&a, hub, mode, Some(&fam), &extra))
+    })())
 }
 
 #[cfg(test)]
