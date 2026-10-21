@@ -7,7 +7,7 @@
 // timestep sinusoids and the 3-axis RoPE tables are generated.
 {
   family: "ltx",
-  match: {diffusers_class: ["LTXPipeline", "LTXImageToVideoPipeline", "LTXVideoTransformer3DModel"], gguf_arch: ["ltxv"]},
+  match: {diffusers_class: ["LTXPipeline", "LTXImageToVideoPipeline", "LTXVideoTransformer3DModel"]},
   pipeline: "video",
   use_lib: ["video"],
   config: {

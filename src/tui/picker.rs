@@ -1748,15 +1748,18 @@ fn image_supported(m: &Value) -> bool {
             .filter_map(|t| t.strip_prefix(kind))
             .any(|b| spec_bases.iter().any(|s| s == b))
     };
-    (m["gguf"]["architecture"]
+    crate::arch::compat()["picker"]["diffusion_gguf_arch"]
         .as_str()
-        .is_some_and(diffusion_gguf_arch)
-        && !tags.iter().any(|t| {
-            ["base_model:adapter:", "base_model:finetune:", "base_model:quantized:"]
-                .iter()
-                .filter_map(|k| t.strip_prefix(k))
-                .any(|b| !spec_bases.iter().any(|s| s == b))
-        }))
+        .is_some_and(|a| m["gguf"]["architecture"] == a)
+        || (m["gguf"]["architecture"]
+            .as_str()
+            .is_some_and(diffusion_gguf_arch)
+            && !tags.iter().any(|t| {
+                ["base_model:adapter:", "base_model:finetune:", "base_model:quantized:"]
+                    .iter()
+                    .filter_map(|k| t.strip_prefix(k))
+                    .any(|b| !spec_bases.iter().any(|s| s == b))
+            }))
         || [
             "base_model:adapter:",
             "base_model:finetune:",
@@ -1770,11 +1773,11 @@ fn image_supported(m: &Value) -> bool {
 /// repos, or the pipeline class for diffusers ones; `None` when `m` is not a video repo.
 fn video_verdict(m: &Value) -> Option<Result<(), String>> {
     let reg = crate::arch::registry().ok()?;
-    if m["gguf"]["architecture"].as_str().is_some_and(|a| {
-        reg.pipeline_gguf_archs(crate::arch::Pipeline::Video)
-            .iter()
-            .any(|g| g == a)
-    }) {
+    let vg = &crate::arch::compat()["video_gguf"];
+    if vg["architecture"]
+        .as_str()
+        .is_some_and(|a| m["gguf"]["architecture"] == a)
+    {
         let files: Vec<RepoFile> = m["siblings"]
             .as_array()
             .into_iter()
@@ -1788,7 +1791,12 @@ fn video_verdict(m: &Value) -> Option<Result<(), String>> {
         return Some(crate::model::video_repo::pick_gguf(&files, None).map(|_| ()));
     }
     let c = m["config"]["diffusers"]["_class_name"].as_str()?;
-    if let Some(why) = reg.unsupported(c) {
+    if let Some(why) = vg["refused_diffusers_classes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|r| (r[0].as_str() == Some(c)).then(|| r[1].as_str().map(String::from)).flatten())
+    {
         return Some(Err(why));
     }
     (c.ends_with("Pipeline")
@@ -1877,7 +1885,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
                 "derivative of {b}: {}",
                 crate::arch::compat()["picker"]["image_derivative"]
                     .as_str()
-                    .unwrap_or("unsupported base model")
+                    .expect("compat.picker.image_derivative")
             ),
             None => "text-to-image repo without a diffusers pipeline (model_index.json) or base model tag".into(),
         });
@@ -1900,7 +1908,9 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
         (Some(t), _) => format!("{tag} model, architecture '{t}' (not supported)"),
         (None, Some(a)) => format!(
             "{tag} model, {} GGUF architecture '{a}' (not supported; {} GGUFs load)",
-            crate::arch::compat()["picker"]["gguf_source"].as_str().unwrap_or("GGUF"),
+            crate::arch::compat()["picker"]["gguf_source"]
+                .as_str()
+                .expect("compat.picker.gguf_source"),
             gguf_lm_archs().join(", ")
         ),
         (None, None) => match m["library_name"].as_str().filter(|l| *l != "transformers") {
@@ -1951,13 +1961,19 @@ fn gguf_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
 fn split_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
     let sel = selection.as_ref().ok()?;
     let a = m["gguf"]["architecture"].as_str()?;
+    let allowed = crate::arch::compat()["picker"]["split_gguf_allowed"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(a)));
     (sel.len() > 1
         && sel[0].ends_with(".gguf")
-        && !crate::arch::registry().is_ok_and(|r| r.runs_gguf_arch(a)))
+        && !gguf_lm_archs().iter().any(|x| x == a)
+        && !allowed)
     .then(|| {
         format!(
             "split GGUF of {} architecture '{a}' (not supported; {} GGUFs load)",
-            crate::arch::compat()["picker"]["gguf_source"].as_str().unwrap_or("GGUF"),
+            crate::arch::compat()["picker"]["gguf_source"]
+                .as_str()
+                .expect("compat.picker.gguf_source"),
             gguf_lm_archs().join(", ")
         )
     })

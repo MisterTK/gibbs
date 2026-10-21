@@ -657,10 +657,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Gibbs HTTP/SSE Server listening on http://{}", addr);
     let compat_client = gibbs_engine::arch::compat()["ndjson_api"]["client_name"]
         .as_str()
-        .unwrap_or("Local");
+        .expect("compat.ndjson_api.client_name");
     let compat_env = gibbs_engine::arch::compat()["ndjson_api"]["host_env"]
         .as_str()
-        .unwrap_or("HOST");
+        .expect("compat.ndjson_api.host_env");
     println!("   Endpoints: /v1/chat/completions, /v1/completions, /v1/responses (OpenAI), /v1/messages (Anthropic), /api/chat, /api/generate ({compat_client}), /v1/images/generations, /v1/images/edits, /v1/embeddings, /v1/decisions, /v1/classify, /v1/rerank, /v1/models, /health");
     println!(
         "   Agents: {}  ·  {compat_env}={}  ·  TUI: /connect",

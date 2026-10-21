@@ -301,8 +301,8 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
             let enc = crate::arch::registry()
                 .ok()?
                 .pipeline_gguf_archs(crate::arch::Pipeline::Encoder);
-            let only = enc.first()?.clone();
-            (a.contains(&only) && a != only).then_some((a, only))
+            let only = enc.iter().find(|o| a.contains(o.as_str()) && a != o.as_str())?.clone();
+            Some((a, only))
         }) {
             Err(format!(
                 "GGUF encoder architecture '{a}' (only '{only}' classifiers load)"

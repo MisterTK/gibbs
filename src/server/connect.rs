@@ -91,8 +91,8 @@ Launch one in a new window: /agent {agents}",
         opencode = cmd("opencode"),
         aider = cmd("aider"),
         agents = AGENTS.join("|"),
-        compat_client = crate::arch::compat()["ndjson_api"]["client_name"].as_str().unwrap_or("Local"),
-        compat_env = crate::arch::compat()["ndjson_api"]["host_env"].as_str().unwrap_or("HOST"),
+        compat_client = crate::arch::compat()["ndjson_api"]["client_name"].as_str().expect("compat.ndjson_api.client_name"),
+        compat_env = crate::arch::compat()["ndjson_api"]["host_env"].as_str().expect("compat.ndjson_api.host_env"),
     )
 }
 

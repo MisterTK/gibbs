@@ -675,7 +675,7 @@ impl QuantizationFormat for Q4_K_M {
         let mut out = vec![0.0f32; 256];
         let scales = &block[4..16];
         let qs = &block[16..144];
-        // Simplified dequantization; full implementation follows GGML k_scale_min
+        // Simplified dequantization; full implementation follows llama.cpp k_scale_min
         for j in 0..8 {
             let scale_idx = j;
             let min_idx = 8 + j;

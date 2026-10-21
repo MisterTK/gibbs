@@ -216,7 +216,7 @@ pub async fn chat(
                 label: label(
                     crate::arch::compat()["ndjson_api"]["label"]
                         .as_str()
-                        .unwrap_or("ndjson"),
+                        .expect("compat.ndjson_api.label"),
                     &headers,
                 ),
             },
@@ -280,7 +280,7 @@ pub async fn generate(
                 label: label(
                     crate::arch::compat()["ndjson_api"]["label"]
                         .as_str()
-                        .unwrap_or("ndjson"),
+                        .expect("compat.ndjson_api.label"),
                     &headers,
                 ),
             },
@@ -449,7 +449,7 @@ pub async fn version() -> Json<Value> {
 pub async fn root() -> &'static str {
     crate::arch::compat()["ndjson_api"]["root_banner"]
         .as_str()
-        .unwrap_or("running")
+        .expect("compat.ndjson_api.root_banner")
 }
 
 #[cfg(test)]
@@ -548,5 +548,23 @@ mod tests {
         ] {
             assert!(check_generate(&req(bad.clone())).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn ndjson_compat_wire_strings_pinned() {
+        assert_eq!(root().await, "Ollama is running");
+        assert_eq!(COMPAT_VERSION, "0.35.1");
+        assert_eq!(
+            crate::arch::compat()["ndjson_api"]["host_env"].as_str(),
+            Some("OLLAMA_HOST")
+        );
+        assert_eq!(
+            crate::arch::compat()["ndjson_api"]["client_name"].as_str(),
+            Some("Ollama")
+        );
+        assert_eq!(
+            crate::arch::compat()["ndjson_api"]["label"].as_str(),
+            Some("ollama")
+        );
     }
 }

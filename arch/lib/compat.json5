@@ -52,9 +52,16 @@
   picker: {
     image_derivative: "only SD 1.x/2.x, SDXL and FLUX.1 LoRAs, finetunes and GGUFs load",
     gguf_source: "llama.cpp",
+    diffusion_gguf_arch: "flux",
+    split_gguf_allowed: ["flux", "bert", "t5"],
   },
   video_gguf: {
+    architecture: "ltxv",
     skip_substrings: ["vae", "t5"],
+    refused_diffusers_classes: [
+      ["LTXConditionPipeline", "diffusers LTXConditionPipeline: needs LTX-Video v0.9.5+ parts (timestep-conditioned VAE decoder, per-token conditioning, latent upsampler), which are not implemented; only v0.9.0 LTXPipeline loads"],
+      ["LTXLatentUpsamplePipeline", "diffusers LTXLatentUpsamplePipeline: needs LTX-Video v0.9.5+ parts (timestep-conditioned VAE decoder, per-token conditioning, latent upsampler), which are not implemented; only v0.9.0 LTXPipeline loads"],
+    ],
   },
   classifier: {
     transformers_types: [

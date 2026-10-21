@@ -123,7 +123,7 @@ The design describes every model once in a shared graph IR (`src/graph`) and has
 | `--backend` | What runs there |
 | :--- | :--- |
 | `auto` (default) | Resolves to Metal on Apple Silicon; to the CPU executor only on a host with no Metal device. |
-| `metal` | The default compute path. Every model family (see [Supported models](#supported-models)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the avenues tried per node (Metal kernel, dtype adapt). A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
+| `metal` | The default compute path. Every model family (see [GPU coverage](#gpu-coverage)) loads a Metal program. All graph ops lower on Metal (`tests/op_coverage.rs` has an empty known-unlowered list); the GPU computes at F32, so F16/BF16 operands are cast to F32. There is no silent CPU fallback: a model or op without a Metal lowering fails at load with a `gpu-only:` report that lists the avenues tried per node (Metal kernel, dtype adapt). A tripwire (`src/hardware/cpu_compute.rs`) panics if CPU compute runs while a Metal backend is active. |
 | `cpu` | Explicit opt-in to the native CPU graph executor (NEON SIMD), which runs the exact same `graph::Graph` built from the family spec. |
 
 Startup prints the detected host (CPU, core counts, memory, GPU, and CPU features such as SME2 and I8MM); nothing in it is assumed.
@@ -133,16 +133,60 @@ Startup prints the detected host (CPU, core counts, memory, GPU, and CPU feature
 | Box | Status |
 | :--- | :--- |
 | Graph IR, CPU executor | Built. System 1 runs on it. During the cutover its embeddings matched the old hand-written encoder's saved output bit-for-bit (4 texts); the old encoder is gone, so that check cannot be re-run. |
-| Graph builders | Every model family is a JSON5 spec (`arch/families/*.json5`) built into a `graph::Graph` by `src/arch` and driven by the generic pipelines in `src/runtime/` (`causal_lm`, `encoder`, `encdec`, `diffusion`, `video`, `drafter`, `bag_classifier`). `--backend cpu` runs the same graphs on the CPU executor. |
+| Graph builders | Every model family is a JSON5 spec (`arch/families/*.json5`) built into a `graph::Graph` by `src/arch` and driven by the generic pipelines in `src/runtime/` (`causal_lm`, `encoder`, `encdec`, `diffusion`, `video`, `drafter`, `bag_classifier`; see [GPU coverage](#gpu-coverage) and [Supported models](#supported-models)). `--backend cpu` runs the same graphs on the CPU executor. |
 | Fingerprint pass | Built, on the IR. |
 | Host profile | Static detection (the startup banner), plus measured Metal micro-benchmarks run once per GPU and OS build and cached in `~/.cache/gibbs/host/`: MPP `matmul2d` checked against the CPU, dispatch cost, and GEMM timings that pick the GEMM kernel per shape. |
 | Weight-format selection | **Metal:** the re-encode policy (`--reencode`, see [Weight formats](#weight-formats)) picks each streamed matrix's format from the weight header (`src/model/reencode.rs`, `weight_format.rs`); a re-encode is accepted only if the GPU KL gate passes. Variant ranking in the model picker uses a predicted decode tok/s from the GGUF/safetensors header and measured codec efficiencies (`src/model/variant.rs`, policies `fastest`, `fastest-4bit`, `best-quality`). `--quant` replaces the policy with one format for every weight matrix. |
 | Metal executor | `src/graph/metal.rs` and `src/graph/metal/ext/`: the forward pass in command buffers, activations in one arena planned from value lifetimes, three GEMM kernels (MetalPerformancePrimitives `matmul2d`, `simdgroup_matrix`, and one simdgroup per output column for few rows), online-softmax attention, pipelines cached in an `MTLBinaryArchive` under `~/.cache/gibbs/metal/`. 23 GGUF block formats decode on the GPU through MSL GEMV generated in `src/graph/codegen.rs` and `codec.rs` (bit-exact against the CPU dequantizer in `tests/codec_parity.rs`), plus hand kernels for Q4_0, Q8_0, IQ4_XS, IQ2_M, Q4_K, Q2_K, IQ3_S, repacked bitsandbytes NF4/FP4, FP8, MLX affine-4, int4 and NVFP4. A weight whose format has no GPU codec is dequantized to f32 at load (logged per tensor) and the load fails with `gpu-only:` if that tensor would exceed 2 GiB; the re-encode policy may re-encode such weights instead. A decode indirect-command-buffer variant was measured (encoding is 2–3% of GPU time) and not adopted. A per-shape tuner (`src/graph/tune.rs`) times hand and generated GEMV variants and caches winners in `~/.cache/gibbs/host/tune-<device>.json`; winners measured under foreign GPU load are not persisted. |
 | Fusion | Every fusion is an egglog rule; extraction picks the set. Graph level (`src/graph/egraph.rs`, cost-model extraction over the tune cache's GEMV rates): MLP megakernel (RmsNorm → gate/up → SwiGLU/GeGLU → down → residual in one step), gate/up and QKV weight concatenation. Metal planner (`src/graph/metal/fuse.rs`, `ext/ple.rs`, `ext/deltanet.rs`, rules over node and step facts that `plan` lowers 1:1): GEMV epilogues, RmsNorm residual/scale/RoPE, attention q/k RoPE, horizontal batching of up to four independent RmsNorm/Rope steps, MoE router/GLU/weighted-sum steps, the opt-in PLE chain, and a decode-time gated delta-rule chain (conv step, SiLU, gates, state update, readout, gated RmsNorm) in one dispatch. Zero-copy views and small-GEMV pairing stay allocation-time post-passes (they need arena offsets and tuned variants). `GIBBS_FUSION=xla` restricts planning to XLA's fusion classes for comparison. |
 
+### GPU coverage
+
+<details><summary>17 model families, all on Metal</summary>
+
+| family | status | unlowered ops |
+|:---|:---|:---|
+| GraphLm | GPU | — |
+| Gemma4 | GPU | — |
+| Hybrid | GPU | — |
+| Gemma4Media | GPU | — |
+| T5 | GPU | — |
+| Seq2Seq | GPU | — |
+| Idefics3Siglip | GPU | — |
+| ClassifierBert | GPU | — |
+| ClassifierModern | GPU | — |
+| ClassifierDecoder | GPU | — |
+| System1 | GPU | — |
+| DiffusionUnet | GPU | — |
+| DiffusionDit | GPU | — |
+| Vae | GPU | — |
+| VideoLtx | GPU | — |
+| VideoModelScope | GPU | — |
+| Audio | GPU | — |
+
+Generated by `cargo test --release --test cpu_free_matrix -- --nocapture`. `GPU` means two things only: the family's tiny synthetic fixture matches the native CPU forward on Metal (relative error 1e-7..1e-5) and the loader uses the Metal program. Spec-run block drafters (DFlash, DFlash2, DSpark) are checked on Metal by their goldens (`tests/golden/qwen.rs`). Real-checkpoint verification on Metal exists only for the models listed under [Verified on Metal](#verified-on-metal); every other family (classifiers, Marian/BART/NLLB, SigLIP/Idefics3, Qwen3-VL vision, MTP and block drafters, `.ninfer`, UNet/VAE/UNet3D, FLUX/SD3/Krea/Z-Image/Sana DiTs, LTX DiT, the audio conformer on other checkpoints) is verified on tiny synthetic fixtures only, because no real checkpoint was cached. Known refusal on Metal: fastText classifiers fail at load with a `gpu-only:` error (the `gemma4_unified` image/audio embedders and bidirectional image blocks run as Metal programs).
+
+</details>
+
+### Compared with vLLM and SGLang
+
+Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter NVIDIA throughput, and Gibbs targets any machine latency.
+
+|  | Gibbs | vLLM / SGLang |
+| --- | --- | --- |
+| Language and stack | Rust. One graph IR (`graph::Graph`, `GraphProgram`, built from JSON5 family specs) lowers to Metal kernels, with a CPU executor as an explicit opt-in. | Python on top of CUDA/Triton kernels. ROCm and others are secondary. |
+| Primary hardware | Apple Silicon, unified memory (Metal default). | NVIDIA GPUs, multi-GPU with tensor and pipeline parallelism. |
+| Optimization goal | Single-stream decode against a measured memory-bandwidth roofline (`--bench`, `geomean_roofline_pct`). Tuning is mostly GEMV kernels and dispatch overhead. | Aggregate throughput under many concurrent requests: continuous batching, paged KV cache (vLLM PagedAttention), prefix sharing (SGLang RadixAttention). |
+| Quantization | Reads numerous formats directly (Q4_0, Q8_0, K-quants, IQ, TQ2_0 and others) through a codec layer, with per-model re-encode policy. | Mostly GPTQ, AWQ, FP8 and similar server formats. GGUF support is limited. |
+| Model breadth | Text LLMs, plus T5, classifiers, diffusion, video and audio families. | Mainly LLMs and VLMs. Diffusion and video are largely outside scope. |
+| Scheduler | Has a scheduler, KV blocks and an HTTP API. Concurrency is also at its design centre. | Core feature, and where most of their engineering goes. |
+| UX | Built-in TUI with roofline telemetry, a CLI, and a local model picker. | Server-first, with an OpenAI-compatible API and no TUI. |
+
+## Models
+
 ### Supported models
 
-<details><summary>52 model family specs, all on Metal</summary>
+<details><summary>52 model family specs (`arch/families/*.json5`)</summary>
 
 | Family | Pipeline | Matches |
 |:---|:---|:---|
@@ -165,7 +209,7 @@ Startup prints the detected host (CPU, core counts, memory, GPU, and CPU feature
 | `sana` | `diffusion` | diffusers: `SanaPipeline` |
 | `sd_vae` | `diffusion` | diffusers: `AutoencoderKL` |
 | `dcae` | `diffusion` | diffusers: `AutoencoderDC` |
-| `flux` | `diffusion` | gguf: `flux`; diffusers: `FluxPipeline`, `FluxTransformer2DModel` |
+| `flux` | `diffusion` | diffusers: `FluxPipeline`, `FluxTransformer2DModel` |
 | `chroma` | `diffusion` | diffusers: `ChromaPipeline`, `ChromaTransformer2DModel` |
 | `flux2` | `diffusion` | diffusers: `Flux2KleinPipeline`, `Flux2Transformer2DModel` |
 | `clip_text` | `encoder` | model_type: `clip_text_model`; arch: `CLIPTextModel`, `CLIPTextModelWithProjection` |
@@ -195,11 +239,11 @@ Startup prints the detected host (CPU, core counts, memory, GPU, and CPU feature
 | `modernbert` | `encoder` | model_type: `modernbert`; arch: `ModernBertForSequenceClassification`, `ModernBertModel` |
 | `bert_gguf` | `encoder` | gguf: `bert` |
 | `deberta` | `encoder` | arch: `DebertaForSequenceClassification`, `DebertaV2ForSequenceClassification`, `DebertaModel`, `DebertaV2Model` |
-| `ltx` | `video` | gguf: `ltxv`; diffusers: `LTXPipeline`, `LTXImageToVideoPipeline`, `LTXVideoTransformer3DModel` |
+| `ltx` | `video` | diffusers: `LTXPipeline`, `LTXImageToVideoPipeline`, `LTXVideoTransformer3DModel` |
 | `ltx_vae` | `video` | diffusers: `AutoencoderKLLTXVideo` |
 | `modelscope_t2v` | `video` | diffusers: `TextToVideoSDPipeline`, `UNet3DConditionModel` |
 
-Generated from `arch/families/*.json5` (`Registry::supported_models_markdown`) and verified on Metal by `cargo test --release --test cpu_free_matrix -- --nocapture` (zero CPU nodes) and `cargo test --release --test golden`. Real-checkpoint verification on Metal exists for the models listed under [Verified on Metal](#verified-on-metal); other families are verified on deterministic tiny fixtures.
+Generated from `arch/families/*.json5` (`Registry::supported_models_markdown`).
 
 </details>
 
@@ -210,22 +254,6 @@ Every model family is defined as a JSON5 spec in `arch/families/<family>.json5` 
 - `config` expressions (`cfg.*`, `gguf.*`, `json.*`, `shape()`, `has()`, `count()`), load-time `checks`, `names` rename rules, `transforms`, generated `constants`, `ignore` globs, `macros`, `components` networks (`vars`, `inputs`, `body`, `outputs`), and pipeline `runtime` metadata.
 
 User files under `~/.cache/gibbs/arch/families/*.json5` replace an embedded family of the same name or add a new family; user override files under `~/.cache/gibbs/arch/overrides/*.json5` (`{applies_to: {hub_id, family, model_type, gguf_arch, file_name}, patch: {...}}`) patch matching checkpoints after embedded overrides. `--arch <family>` forces a specific family spec, and `--arch-dump` prints the merged spec, resolved config variables, canonical tensor renames, and unconsumed tensors as JSON and exits.
-
-### Compared with vLLM and SGLang
-
-Gibbs is a different kind of engine from vLLM and SGLang. They target datacenter NVIDIA throughput, and Gibbs targets any machine latency.
-
-|  | Gibbs | vLLM / SGLang |
-| --- | --- | --- |
-| Language and stack | Rust. One graph IR (`graph::Graph`, `GraphProgram`, built from JSON5 family specs) lowers to Metal kernels, with a CPU executor as an explicit opt-in. | Python on top of CUDA/Triton kernels. ROCm and others are secondary. |
-| Primary hardware | Apple Silicon, unified memory (Metal default). | NVIDIA GPUs, multi-GPU with tensor and pipeline parallelism. |
-| Optimization goal | Single-stream decode against a measured memory-bandwidth roofline (`--bench`, `geomean_roofline_pct`). Tuning is mostly GEMV kernels and dispatch overhead. | Aggregate throughput under many concurrent requests: continuous batching, paged KV cache (vLLM PagedAttention), prefix sharing (SGLang RadixAttention). |
-| Quantization | Reads numerous formats directly (Q4_0, Q8_0, K-quants, IQ, TQ2_0 and others) through a codec layer, with per-model re-encode policy. | Mostly GPTQ, AWQ, FP8 and similar server formats. GGUF support is limited. |
-| Model breadth | Text LLMs, plus T5, classifiers, diffusion, video and audio families. | Mainly LLMs and VLMs. Diffusion and video are largely outside scope. |
-| Scheduler | Has a scheduler, KV blocks and an HTTP API. Concurrency is also at its design centre. | Core feature, and where most of their engineering goes. |
-| UX | Built-in TUI with roofline telemetry, a CLI, and a local model picker. | Server-first, with an OpenAI-compatible API and no TUI. |
-
-## Models
 
 ### Verified on Metal
 
@@ -325,7 +353,7 @@ Which files are downloaded: the hub lists the repo (Hugging Face tree API), fetc
 | :--- | :--- |
 | `--model <id or path>` | A Hugging Face repo, `org/repo@<branch>`, or a local path, matched against `arch/families/*.json5` (see [Supported models](#supported-models)). |
 | `--backend auto\|metal\|cpu` | Compute backend (default `auto`: Metal on Apple Silicon, CPU only where no Metal device exists; see [Backends](#backends)). `cpu` is the explicit opt-in to the CPU graph executor. |
-| `--quant <format>` | Forces every streamed weight matrix to one format (`ReencodeConfig.force`): `uncompressed` (`f32`), `f16`, `bf16`, `q8_0`, `q4_0`, `q4_k_m`, `q5_k_m`, `q6_k`, `nvfp4` (`GGUF_NVFP4`), or any registered `graph::codec` format. Without it, weights keep their checkpoint encoding or follow `--reencode`. |
+| `--quant <format>` | Forces every streamed weight matrix to one format (`ReencodeConfig.force`): `uncompressed` (`f32`), `f16`, `bf16`, `q8_0`, `q4_0`, `q4_k_m`, `q5_k_m`, `q6_k`, or `nvfp4` (`GGUF_NVFP4`). A format no encoder exists for is an error. Without it, weights keep their checkpoint encoding or follow `--reencode`. |
 | `--reencode max-speed\|low-bit-native\|bit-exact`, `--reencode-max-kl <nats>` | Metal weight re-encode policy and the mean-KL limit of its GPU gate; they override `reencode` / `reencode_max_kl` in `~/.cache/gibbs/settings.json` (see [Weight formats](#weight-formats)). |
 | `--variant fastest\|fastest-4bit\|best-quality` | Which variant of a multi-file GGUF/safetensors repo to pick (default `fastest`), ranked by predicted decode tok/s from the file header and measured codec efficiencies. |
 | `--max-tokens <n>`, `--ctx <n>` (default 8192) | Generation length for `--prompt`, and the context length. |

@@ -128,9 +128,9 @@ pub fn detect(hub: &HuggingFaceHub, model_id: &str, quant: Option<&str>) -> Opti
     let token = std::env::var("HF_TOKEN").ok();
     let info = hub_json(&format!("https://huggingface.co/api/models/{repo}"), token.as_deref()).ok()?;
     let reg = crate::arch::registry().ok()?;
-    if !info["gguf"]["architecture"]
+    if crate::arch::compat()["video_gguf"]["architecture"]
         .as_str()
-        .is_some_and(|a| reg.pipeline_gguf_archs(crate::arch::Pipeline::Video).iter().any(|g| g == a))
+        .is_none_or(|a| info["gguf"]["architecture"] != a)
     {
         return None;
     }
