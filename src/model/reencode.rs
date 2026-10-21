@@ -425,7 +425,7 @@ pub fn weight_bytes(w: &QuantizedWeight) -> usize {
 
 /// Encodes row-major `w` as `f` (a float or an encodable block format whose blocks tile `in_f`),
 /// splitting rows over `threads` workers at utility QoS; row chunks concatenate exactly.
-fn encode_weight(w: &[f32], in_f: usize, out_f: usize, f: Q, threads: usize) -> QuantizedWeight {
+pub(crate) fn encode_weight(w: &[f32], in_f: usize, out_f: usize, f: Q, threads: usize) -> QuantizedWeight {
     if f == Q::FP32 {
         return QuantizedWeight::Uncompressed {
             data: w.to_vec(),
@@ -595,6 +595,13 @@ pub fn native_stats() -> NativeStats {
     *NATIVE_STATS.lock()
 }
 
+/// Test hook: pretend the current load re-encoded `n` tensors.
+#[cfg(test)]
+pub(crate) fn fake_native_reencoded(n: usize) {
+    let mut s = NATIVE_STATS.lock();
+    (s.tensors, s.reencoded) = (n, n);
+}
+
 static NATIVE_APPLIED: Mutex<Option<(ReencodePolicy, u64)>> = Mutex::new(None);
 
 /// Records the policy the last native load ended up with and the bytes per token it saved.
@@ -643,7 +650,11 @@ pub fn reencode_native(
     cols: usize,
     raw: &[u8],
 ) -> Option<(Q, Vec<u8>)> {
-    if is_gather_table(name) || (cfg.ffn_only && !is_ffn_name(name)) {
+    let ffn = match &cfg.ffn_weights {
+        Some(pats) => pats.iter().any(|p| crate::arch::glob(p, name)),
+        None => is_ffn_name(name),
+    };
+    if is_gather_table(name) || (cfg.ffn_only && !ffn) {
         return None;
     }
     let mut stats = NATIVE_STATS.lock();

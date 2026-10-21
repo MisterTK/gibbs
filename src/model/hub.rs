@@ -1957,8 +1957,9 @@ impl HuggingFaceHub {
                     (1_000_000usize, 128, 2, 4, 2, 256, 512, "qwen2")
                 };
 
+            // Every synthetic id runs the llama-style decoder; `model_type` only labels the size preset.
             let config_json = serde_json::json!({
-                "architectures": ["NanoTransformerForCausalLM"],
+                "architectures": ["LlamaForCausalLM"],
                 "model_type": model_type,
                 "num_parameters": num_params,
                 "hidden_size": hidden_dim,

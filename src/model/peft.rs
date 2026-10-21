@@ -56,21 +56,7 @@ pub fn prepare_causal_lm(
     if ad["task_type"] != "CAUSAL_LM" {
         return Ok(false);
     }
-    if ad["peft_type"] != "LORA"
-        || ad["use_dora"] == true
-        || ad["fan_in_fan_out"] == true
-        || ad["rank_pattern"]
-            .as_object()
-            .is_some_and(|m| !m.is_empty())
-        || ad["alpha_pattern"]
-            .as_object()
-            .is_some_and(|m| !m.is_empty())
-    {
-        return Err(format!(
-            "{repo_id}: only plain LoRA adapters merge (not {}, DoRA, fan_in_fan_out or per-module rank/alpha)",
-            ad["peft_type"]
-        ));
-    }
+    let scale = lora_scale(&ad).map_err(|e| format!("{repo_id}: {e}"))?;
     let base = ad["base_model_name_or_path"]
         .as_str()
         .filter(|b| b.split('/').count() == 2 && !b.starts_with('.') && !b.starts_with('/'))
@@ -80,13 +66,6 @@ pub fn prepare_causal_lm(
                 ad["base_model_name_or_path"]
             )
         })?;
-    let r = ad["r"].as_f64().ok_or("adapter_config.json has no r")?;
-    let alpha = ad["lora_alpha"].as_f64().unwrap_or(r);
-    let scale = if ad["use_rslora"] == true {
-        alpha / r.sqrt()
-    } else {
-        alpha / r
-    } as f32;
 
     let base_art = hub.auto_download_and_cache(base, token)?;
     let weights = base_art
@@ -183,6 +162,11 @@ pub fn prepare_causal_lm(
         ));
     }
     let mut header = serde_json::Map::new();
+    // Marks the snapshot as merged, so a loader that applies adapters at run time skips this one.
+    header.insert(
+        "__metadata__".into(),
+        serde_json::json!({"peft_merged": "adapter_model"}),
+    );
     let mut off = 0usize;
     for e in &entries {
         let len = e.range.1 - e.range.0;
@@ -261,10 +245,40 @@ pub fn prepare_causal_lm(
     Ok(true)
 }
 
+/// The `scale` of a plain LoRA `adapter_config.json` (`lora_alpha / r`, rsLoRA `lora_alpha / √r`);
+/// errs for adapter kinds a `W + scale · B·A` update cannot express.
+pub fn lora_scale(ad: &Value) -> Result<f32, String> {
+    if ad["peft_type"] != "LORA"
+        || ad["use_dora"] == true
+        || ad["fan_in_fan_out"] == true
+        || ad["rank_pattern"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty())
+        || ad["alpha_pattern"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty())
+    {
+        return Err(format!(
+            "only plain LoRA adapters merge (not {}, DoRA, fan_in_fan_out or per-module rank/alpha)",
+            ad["peft_type"]
+        ));
+    }
+    let r = ad["r"].as_f64().ok_or("adapter_config.json has no r")?;
+    let alpha = ad["lora_alpha"].as_f64().unwrap_or(r);
+    Ok(if ad["use_rslora"] == true {
+        alpha / r.sqrt()
+    } else {
+        alpha / r
+    } as f32)
+}
+
 /// The adapter tensors that replace (`modules_to_save`) or update (`lora_A`) base tensor
 /// `name`. A multimodal base keeps the text model under `model.language_model.`; an adapter
 /// trained on its text-only causal LM names it `model.`.
-fn adapter_names(am: &crate::model::ModelManifest, name: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn adapter_names(
+    am: &crate::model::ModelManifest,
+    name: &str,
+) -> (Option<String>, Option<String>) {
     let text = name.replacen("model.language_model.", "model.", 1);
     let find = |f: &dyn Fn(&str) -> String| {
         [name, text.as_str()]
