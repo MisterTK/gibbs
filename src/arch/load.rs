@@ -1445,15 +1445,8 @@ fn xf_shapes(
     }
 }
 
-fn xf_kind(op: &str, ins: &[Arc<Node>], out: &[usize]) -> Kind {
+fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
     let k = ins[0].kind;
-    // Packed blocks are whole rows of blocks: a reshape whose old and new rows are whole blocks
-    // keeps the bytes as they are.
-    let rows_of_blocks = |cols: usize| match k {
-        Kind::Packed(f) => crate::model::layers::gguf_block_codec(f)
-            .is_some_and(|(elems, _, _)| cols % elems == 0),
-        _ => false,
-    };
     match op {
         "to_f32" => Kind::F32,
         // Float tensors become bf16 `Mat`s (what `Weights::from_gguf` made of GGUF float
@@ -1463,12 +1456,6 @@ fn xf_kind(op: &str, ins: &[Arc<Node>], out: &[usize]) -> Kind {
         // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
         "untile_packed_rows" | "reshape" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
-        "reshape"
-            if rows_of_blocks(ins[0].shape.last().copied().unwrap_or(0))
-                && rows_of_blocks(out.last().copied().unwrap_or(0)) =>
-        {
-            k
-        }
         _ => k.dense(),
     }
 }
@@ -1687,7 +1674,7 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
             };
             let shapes: Vec<&[usize]> = ins.iter().map(|n| n.shape.as_slice()).collect();
             let shape = xf_shapes(&t.op, &args, &shapes)?.remove(0).1;
-            let kind = xf_kind(&t.op, &ins, &shape);
+            let kind = xf_kind(&t.op, &ins);
             insert_new(
                 table,
                 out,
@@ -1726,7 +1713,7 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
         }
         let shapes: Vec<&[usize]> = ins.iter().map(|n| n.shape.as_slice()).collect();
         let outs = xf_shapes(&t.op, &args, &shapes).map_err(|e| format!("`{name}`: {e}"))?;
-        let kinds: Vec<Kind> = outs.iter().map(|o| xf_kind(&t.op, &ins, &o.1)).collect();
+        let kinds: Vec<Kind> = outs.iter().map(|_| xf_kind(&t.op, &ins)).collect();
         let conv = t.op == "to_f32" || (ins[0].conv && t.op != "conv_to_linear");
         for (part, (new, shape)) in outs.into_iter().enumerate() {
             let node = Node {

@@ -60,10 +60,11 @@ pub fn spec_lm_enabled() -> bool {
     std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1")
 }
 
-/// legacy: until Phase 4. Families GraphLm still loads by default; every other causal-LM
-/// family no native loader claims runs its spec.
-fn graph_lm_family(f: &str) -> bool {
-    ["llama", "glm", "granite", "bitnet", "gpt_neox", "gpt2", "opt", "lfm2"].contains(&f)
+/// legacy: until every causal-LM family is cut over (then all run their spec). The families
+/// whose legacy loaders are deleted; every other family keeps its legacy route unless
+/// `GIBBS_SPEC_LM=1`. Each phase adds its families at cutover.
+fn spec_by_default(f: &str) -> bool {
+    ["qwen3", "hunyuan", "qwen3_vl", "qwen3_5", "qwen4_exp"].contains(&f)
 }
 
 /// `model_type` is a causal-LM family's own match (not a fallback) that [`lm`] runs from its spec
@@ -73,7 +74,7 @@ pub fn runs_spec_lm(model_type: &str) -> bool {
         r.matchers().iter().any(|(f, m, p)| {
             *p == Pipeline::CausalLm
                 && !m.fallback
-                && !graph_lm_family(f)
+                && spec_by_default(f)
                 && m.hf_model_type.iter().any(|g| super::glob(g, model_type))
         })
     })
@@ -183,7 +184,7 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     // A fallback match (any causal LM) never pre-empts a legacy loader; a family's own match
     // does when GIBBS_SPEC_LM=1.
     if let Some((f, false)) = lm_family {
-        if spec_lm_enabled() && !graph_lm_family(f) {
+        if spec_lm_enabled() {
             return spec(Some(f));
         }
     }
@@ -192,7 +193,7 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         return Ok((ExecutableModel::Native(m?), None));
     }
     if let Some((f, _)) = lm_family {
-        if spec_lm_enabled() || !graph_lm_family(f) {
+        if spec_lm_enabled() || spec_by_default(f) {
             return spec(Some(f));
         }
     }
