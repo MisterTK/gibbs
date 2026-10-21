@@ -719,7 +719,7 @@ pub fn calculate_shift(
     seq_len as f64 * m + base_shift - m * base_seq
 }
 
-/// `np.linspace(1, 1/steps, steps)`: the custom sigmas FLUX and Z-Image pass to `set_timesteps`.
+/// `np.linspace(1, 1/steps, steps)`: the custom sigmas flow pipelines pass to `set_timesteps`.
 pub fn linspace_sigmas(steps: usize) -> Vec<f64> {
     let end = 1.0 / steps as f64;
     (0..steps)
@@ -757,7 +757,7 @@ pub fn shifted_sigmas(base: &[f64], shift: f64) -> Vec<f32> {
     finish(base.iter().map(|&s| shift_sigma(s, shift)))
 }
 
-/// `set_timesteps(sigmas = base, mu)` with dynamic shifting (FLUX), 0 appended.
+/// `set_timesteps(sigmas = base, mu)` with dynamic shifting, 0 appended.
 pub fn dynamic_sigmas(base: &[f64], mu: f64) -> Vec<f32> {
     finish(base.iter().map(|&s| time_shift(mu, s)))
 }
@@ -836,7 +836,7 @@ impl DpmSolver2 {
     }
 }
 
-/// diffusers `compute_empirical_mu` (Flux2Pipeline / Flux2KleinPipeline).
+/// diffusers `compute_empirical_mu`.
 pub fn empirical_mu(seq: usize, steps: usize) -> f64 {
     let (a1, b1, a2, b2) = (8.73809524e-05, 1.89833333, 0.00016927, 0.45666666);
     let seq = seq as f64;

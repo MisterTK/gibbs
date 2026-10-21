@@ -344,9 +344,8 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
 /// embeddings concatenated, `[n * dim]` (SDXL `add_time_ids`).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
-/// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
-/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults, `sd.rs` `guidance_embedding` with
-/// `flip_sin_to_cos: false, downscale_freq_shift: 1`.
+/// diffusers `get_timestep_embedding` (`precision: "f32"` for f32 sources; a guidance embedding
+/// with `flip_sin_to_cos: false, downscale_freq_shift: 1`).
 fn timestep_embedding(a: &Args) -> Result<Gen, String> {
     let dim = a.u("dim")?;
     let f32p = match a.s_or("precision", "f64")? {
