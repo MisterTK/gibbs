@@ -340,7 +340,8 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
     out
 }
 
-/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]`.
+/// `timestep_embedding`: sinusoidal timestep features, F32 `[dim]` (`[2, dim]` with
+/// `prepend_zero: true`: rows `emb(0)`, `emb(t)`, e.g. a clean span ahead of a noisy one).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
 /// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
@@ -361,6 +362,10 @@ fn timestep_embedding(a: &Args) -> Result<Gen, String> {
         a.f_or("max_period", 10000.0)?,
         f32p,
     );
+    if a.b_or("prepend_zero", false)? {
+        let z = timestep_vec(0.0, dim, a.b_or("flip_sin_to_cos", true)?, a.f_or("downscale_freq_shift", 0.0)?, a.f_or("scale", 1.0)?, a.f_or("max_period", 10000.0)?, f32p);
+        return f32s(vec![2, dim], [z, v].concat());
+    }
     f32s(vec![dim], v)
 }
 
@@ -1010,12 +1015,23 @@ mod tests {
                 let want = model::qwen_image::rope_positions(&model::qwen_image21::t2i_positions(nt, h, w));
                 assert_eq!(u("text_then_centered_grid", args), want);
             }
-            for (fr, h, w, fps, d) in [(2, 3, 4, 25.0, 14), (1, 2, 2, 24.0, 12)] {
-                let r = model::ltx::Rope::new(fr, h, w, fps, d);
+            // FNV-1a of the `ltx.rs` `Rope::new` tables' bits (cos, sin), pinned before its deletion.
+            let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+            for ((fr, h, w, fps, d), pin) in [((2, 3, 4, 25.0, 14), PIN_ROPE[0]), ((1, 2, 2, 24.0, 12), PIN_ROPE[1])] {
                 let a = |o: &str| json!({"frames": fr, "grid_h": h, "grid_w": w, "fps": fps, "dim": d, "output": o});
-                assert_eq!(bits(&f("video_rope_cos_sin", a("cos"))), bits(&r.cos));
-                assert_eq!(bits(&f("video_rope_cos_sin", a("sin"))), bits(&r.sin));
+                let got = (fnv(&f("video_rope_cos_sin", a("cos"))), fnv(&f("video_rope_cos_sin", a("sin"))));
+                assert_eq!(got, pin, "{:?}", (fr, h, w));
             }
+            let a = json!({"t": 700.0, "dim": 8});
+            let mut z = a.clone();
+            z["prepend_zero"] = json!(true);
+            let mut zero = a.clone();
+            zero["t"] = json!(0.0);
+            assert_eq!(f("timestep_embedding", z), [f("timestep_embedding", zero), f("timestep_embedding", a)].concat());
+        }
+
+        const PIN_ROPE: [(u64, u64); 2] = [(7060718898465474953, 1236744568232124141), (101182376039508301, 1818247417042637373)];
+
         }
 
         #[test]
