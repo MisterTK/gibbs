@@ -6,13 +6,13 @@
 use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
-use gibbs_engine::model::native::load_native;
 use gibbs_engine::runtime::draft::load_drafter;
 use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel, SamplingParams};
 use gibbs_engine::telemetry::EngineTelemetry;
 use std::sync::Arc;
 
-const TARGET: &str = "Qwen/Qwen3.5-2B";
+/// The Qwen3.5-2B target: the HF original, else the cached GGUF.
+const TARGET: [&str; 2] = ["Qwen/Qwen3.5-2B", "unsloth/Qwen3.5-2B-GGUF"];
 const PROMPT: &str = "Write a Python function that returns the n-th Fibonacci number iteratively.";
 
 fn located(repo: &str) -> Option<ModelArtifacts> {
@@ -32,11 +32,9 @@ fn generate(
     n: usize,
 ) -> (Vec<u32>, u64, u64) {
     let cpu = PlacementMode::Pin(Device::Cpu);
-    let model = ExecutableModel::Native(match load_native(target, Device::Cpu) {
-        Some(m) => m.unwrap(),
-        None => gibbs_engine::runtime::lm::load(target, gibbs_engine::arch::registry().unwrap(), None, cpu)
-            .unwrap(),
-    });
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let model =
+        ExecutableModel::Native(gibbs_engine::runtime::lm::load(target, reg, None, cpu).unwrap());
     let telemetry = EngineTelemetry::new();
     let sched = ContinuousBatchScheduler::with_telemetry(
         target.model_id.clone(),
@@ -45,7 +43,7 @@ fn generate(
         telemetry.clone(),
     );
     // The checkpoint's own MTP head stays off: the baseline is plain decoding.
-    sched.set_drafter(draft.map(|d| load_drafter(d, target, PlacementMode::Pin(Device::Cpu)).unwrap()));
+    sched.set_drafter(draft.map(|d| load_drafter(d, target, cpu).unwrap()));
     let params = SamplingParams {
         temperature: Some(0.0),
         top_p: None,
@@ -71,9 +69,10 @@ fn generate(
     }
 }
 
-/// Every drafter in `drafts` (repo, least acceptance rate) keeps `target`'s greedy output.
-fn check(target: &str, drafts: &[(&str, f64)]) {
-    let Some(target) = located(target) else {
+/// Every drafter in `drafts` (repo, least acceptance rate) keeps the greedy output of the first
+/// cached of `targets`.
+fn check(targets: &[&str], drafts: &[(&str, f64)]) {
+    let Some(target) = targets.iter().find_map(|t| located(t)) else {
         return;
     };
     let (plain, drafted, _) = generate(&target, None, PROMPT, 32);
@@ -97,7 +96,7 @@ fn check(target: &str, drafts: &[(&str, f64)]) {
 #[test]
 fn qwen3_5_drafters_keep_greedy_output_and_get_accepted() {
     check(
-        TARGET,
+        &TARGET,
         &[
             ("taobao-mnn/Qwen3.5-2B-Dflash", 0.4),
             ("rasyosef/Qwen3.5-2B-DSpark", 0.4),
@@ -112,7 +111,7 @@ fn qwen3_5_drafters_keep_greedy_output_and_get_accepted() {
 #[test]
 fn llama_dspark_keeps_greedy_output_and_gets_accepted() {
     check(
-        "unsloth/Llama-3.2-1B-Instruct",
+        &["unsloth/Llama-3.2-1B-Instruct"],
         &[("rasyosef/Llama-3.2-1B-Instruct-DSpark", 0.4)],
     );
 }

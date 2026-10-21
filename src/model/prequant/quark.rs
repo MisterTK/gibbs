@@ -572,11 +572,15 @@ mod tests {
             ..Default::default()
         };
         let prompt = "The capital of France is";
-        // Native architectures (qwen3, ...) go through `load_native`, the rest through GraphLm.
-        let out = match crate::model::native::load_native(&artifacts, crate::hardware::Device::Cpu)
-        {
-            Some(lm) => {
-                let lm = lm.unwrap();
+        // Spec families (qwen3, ...) go through `runtime::lm`, llama through GraphLm (as dispatch).
+        let reg = crate::arch::registry().unwrap();
+        let family = crate::arch::load::open(&artifacts)
+            .ok()
+            .and_then(|ck| reg.detect(&ck.sig));
+        let out = match family.as_deref() {
+            Some(f) if f != "llama" => {
+                let cpu = crate::hardware::Device::Cpu.into();
+                let lm = crate::runtime::lm::load(&artifacts, reg, Some(f), cpu).unwrap();
                 let (ids, mut st) = lm.prepare(lm.tokenizer().encode(prompt), &[]).unwrap();
                 let mut logits = lm.forward(&ids, 0, &mut st).unwrap();
                 let mut out = Vec::new();
@@ -591,7 +595,7 @@ mod tests {
                 }
                 lm.tokenizer().decode(&out)
             }
-            None => crate::model::hf_loader::load_causal_lm(&artifacts, QuantMode::Uncompressed)
+            _ => crate::model::hf_loader::load_causal_lm(&artifacts, QuantMode::Uncompressed)
                 .unwrap()
                 .generate_text(prompt, 8, 0.0),
         };

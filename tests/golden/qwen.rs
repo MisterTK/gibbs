@@ -1,12 +1,12 @@
 //! Qwen family goldens: Qwen3.5 (DeltaNet + gated attention, dense and MoE), Qwen3, HunYuan dense,
 //! the Qwen3.5 MTP head, vision tower and image prompts, Qwen4-Exp (hyper-connections, QSA, PLE)
 //! and the DFlash / DFlash2 / DSpark block drafters, on tiny bf16 safetensors checkpoints.
-//! Shapes follow `src/model/qwen3_5/fixture.rs`, `text.rs` and `draft.rs` test fixtures.
+//! Shapes follow the (deleted) native Qwen3.5 loader's test fixtures; the JSON is the oracle.
 
 use crate::util::*;
 use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::native::{load_native, MediaInput, NativeLm, SeqState};
+use gibbs_engine::model::native::{MediaInput, NativeLm, SeqState};
 use gibbs_engine::scheduler::spec::Drafter;
 use serde_json::{json, Value};
 use std::path::Path;
