@@ -8,7 +8,7 @@ use gibbs_engine::hardware::Device;
 use gibbs_engine::model::flux::{Loras, Store};
 use gibbs_engine::model::weights::Weights as Mw;
 use serde_json::{json, Value};
-use gibbs_engine::arch::{expr::Val, testing::Runner};
+use gibbs_engine::arch::expr::Val;
 use gibbs_engine::graph::Tensor;
 
 type Spec = Vec<(String, Vec<usize>)>;
@@ -885,6 +885,36 @@ fn temb(t: f64, dim: usize, precision: &str) -> Vec<f32> {
     }
 }
 
+/// A spec family loaded (bit-exact) from a fixture and run per instance on one device.
+struct Runner(gibbs_engine::arch::load::Model, Device);
+
+impl Runner {
+    fn run(&mut self, component: &str, vars: &[(&str, Val)], inputs: Vec<Tensor>) -> Result<std::collections::HashMap<String, Tensor>, String> {
+        use gibbs_engine::arch::gen::{generate, GenData};
+        let m = &self.0;
+        let inst = gibbs_engine::arch::build::build(&m.spec, component, &m.env, &m.store, vars)?;
+        let mut given = inputs.into_iter();
+        let mut ins = Vec::new();
+        for p in &inst.inputs {
+            ins.push(match &p.gen {
+                Some((g, a)) => match generate(g, a)?.data {
+                    GenData::F32(v) => Tensor::F32(v),
+                    GenData::U32(v) => Tensor::U32(v),
+                },
+                None => given.next().ok_or("input not given")?,
+            });
+        }
+        let w = m.store.materialize(&inst.weights)?;
+        let mut p = gibbs_engine::graph::program::GraphProgram::compile(inst.graph.clone(), w, gibbs_engine::hardware::PlacementMode::Pin(self.1))?;
+        Ok(inst.outputs.iter().cloned().zip(p.run(ins)?).collect())
+    }
+}
+
 fn spec_runner(dir: &std::path::Path, weights: &str, family: &str, dev: Device) -> Runner {
-    Runner::from_artifacts(&artifacts(dir, "test/spec", weights), Some(family), dev, 0).expect(family)
+    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
+    let reencode = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let reg = gibbs_engine::arch::Registry::load(None).unwrap();
+    let m = gibbs_engine::arch::load::load_with(&artifacts(dir, "test/spec", weights), &reg, Some(family), reencode).expect(family);
+    gibbs_engine::arch::load::check(&m).unwrap();
+    Runner(m, dev)
 }
