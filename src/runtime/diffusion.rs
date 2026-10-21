@@ -561,6 +561,8 @@ pub struct SpecDiffusion {
     max_side: usize,
     max_steps: usize,
     summary: String,
+    /// `runtime.video` (video pipelines).
+    video: Option<VideoSpec>,
 }
 
 fn num(v: Val, what: &str) -> Result<f64, String> {
@@ -921,6 +923,10 @@ impl SpecDiffusion {
             }
             k => return Err(err(format!("runtime.scheduler.kind `{k}` (discrete, flow_euler, flow_dpm2)"))),
         };
+        let video = match rt.other.get("video") {
+            Some(v) => Some(serde_json::from_value::<VideoSpec>(v.clone()).map_err(|e| err(format!("runtime.video: {e}")))?),
+            None => None,
+        };
         let summary = match &rt.summary {
             Some(s) => ev(&J::String(s.clone()), "summary")?.to_string(),
             None => format!("{fam} ({})", artifacts.model_id),
@@ -944,6 +950,7 @@ impl SpecDiffusion {
             max_side,
             max_steps,
             summary,
+            video,
         };
         p.check_consumed(&extra_used)?;
         Ok(p)
@@ -958,12 +965,24 @@ impl SpecDiffusion {
             t.net.instance(&self.text_vars(t, rows)?)?;
         }
         let nt = 8;
-        self.denoiser.instance(&self.den_vars(h, w, nt))?;
+        // Video pipelines build at the default clip length (no clean tokens).
+        let mut vid: Vec<(&str, Val)> = Vec::new();
+        if let Some(v) = &self.video {
+            let frames = self.eval_n(&v.frames, &[])?;
+            let lf = self.eval_n(&v.latent_frames, &[("frames", Val::Num(frames))])?;
+            vid = vec![("frames", Val::Num(lf)), ("clean", Val::Num(0.0))];
+        }
+        let mut den = self.den_vars(h, w, nt);
+        den.extend(vid.iter().cloned());
+        self.denoiser.instance(&den)?;
         if let Some(c) = &self.context_net {
             c.instance(&[("nt", Val::Num(nt as f64))])?;
         }
         let hw = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
-        self.decoder.instance(&hw)?;
+        match &self.video {
+            Some(v) if v.decode == "clip" => self.decoder.instance(&[hw[0].clone(), hw[1].clone(), vid[0].clone()])?,
+            _ => self.decoder.instance(&hw)?,
+        };
         if let Some(e) = &self.encoder {
             e.instance(&hw)?;
         }
@@ -1266,38 +1285,12 @@ impl SpecDiffusion {
 
         // Schedule.
         let hw = [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
-        enum Run {
-            Discrete(Scheduler),
-            Flow(Vec<f32>, Option<DpmSolver2>),
-        }
-        let mut run = match &self.sampler {
-            Sampler::Discrete(cfg) => Run::Discrete(cfg.build(steps)?),
-            Sampler::Flow { schedule, base, card, dpm, seq } => {
-                let seq = if seq.is_null() {
-                    match pack {
-                        "pack2x2" => (h / 2) * (w / 2),
-                        _ => h * w,
-                    }
-                } else {
-                    self.eval_n(seq, &hw)? as usize
-                };
-                let sig = match base.as_str() {
-                    "sd3" => default_sigmas(steps, schedule.shift),
-                    "dpm_flow" => dpm_flow_sigmas(steps, schedule.shift),
-                    "card" => match card {
-                        Some(c) if c.len() == steps => schedule.sigmas(c, seq, steps),
-                        _ => schedule.sigmas(&linspace_sigmas(steps), seq, steps),
-                    },
-                    "linspace" => schedule.sigmas(&linspace_sigmas(steps), seq, steps),
-                    b => return Err(format!("scheduler.sigmas `{b}` (linspace, sd3, dpm_flow, card)")),
-                };
-                Run::Flow(sig, dpm.then(DpmSolver2::default))
-            }
+        let default_seq = match pack {
+            "pack2x2" => (h / 2) * (w / 2),
+            _ => h * w,
         };
-        let n_steps = match &run {
-            Run::Discrete(s) => s.timesteps.len(),
-            Run::Flow(s, _) => s.len() - 1,
-        };
+        let mut run = self.schedule(steps, &hw, default_seq)?;
+        let n_steps = run.steps();
 
         // Latents in the denoiser's layout.
         let to_layout = |z: Vec<f32>| -> Vec<f32> {
@@ -1351,10 +1344,7 @@ impl SpecDiffusion {
         let gt = Tensor::F32(vec![guidance]);
         let t2 = std::time::Instant::now();
         for i in start..n_steps {
-            let (t, sigma, k) = match &run {
-                Run::Discrete(s) => (s.timesteps[i], s.sigmas.get(i).copied().unwrap_or(0.0), s.input_scale(i) as f32),
-                Run::Flow(s, _) => (s[i] as f64 * TRAIN_STEPS as f64, s[i] as f64, 1.0),
-            };
+            let (t, sigma, k) = run.at(i);
             let sv = [("t", Val::Num(t)), ("sigma", Val::Num(sigma))];
             let ts = self.eval_n(&J::String(self.rt.timestep.clone()), &sv)?;
             let step = [("t", t), ("sigma", sigma), ("timestep", ts), ("guidance", guidance as f64)];
@@ -1374,24 +1364,7 @@ impl SpecDiffusion {
             let mut out = eval_once(&ctx_t, nt, &pooled_t)?;
             if let Some((uc, un, up)) = &neg_t {
                 let u = eval_once(uc, *un, up)?;
-                match g.kind.as_str() {
-                    "cfg" => out.iter_mut().zip(&u).for_each(|(o, u)| *o = u + scale * (*o - u)),
-                    "cfg_rescale" => {
-                        let rw = match pack {
-                            "pack2x2" => 4 * c,
-                            "tokens" => c,
-                            _ => out.len(),
-                        };
-                        for (o, u) in out.chunks_exact_mut(rw).zip(u.chunks_exact(rw)) {
-                            let pn = o.iter().map(|v| v * v).sum::<f32>().sqrt();
-                            o.iter_mut().zip(u).for_each(|(o, u)| *o = u + scale * (*o - u));
-                            let cn = o.iter().map(|v| v * v).sum::<f32>().sqrt();
-                            let r = if cn > 0.0 { pn / cn } else { 1.0 };
-                            o.iter_mut().for_each(|v| *v *= r);
-                        }
-                    }
-                    k => return Err(format!("guidance.kind `{k}` (none, cfg, cfg_rescale)")),
-                }
+                self.guide(&mut out, &u, scale)?;
             }
             if out.len() != x.len() {
                 return Err(format!("denoiser returned {} values, expected {}", out.len(), x.len()));
@@ -1399,11 +1372,7 @@ impl SpecDiffusion {
             if self.rt.negate_v {
                 out.iter_mut().for_each(|v| *v = -*v);
             }
-            match &mut run {
-                Run::Discrete(s) => s.step(i, &out, &mut x, &mut rng),
-                Run::Flow(s, None) => euler_step(&mut x, &out, s[i], s[i + 1]),
-                Run::Flow(s, Some(dpm)) => dpm.step(&mut x, &out, s, i),
-            }
+            run.advance(i, &out, &mut x, &mut rng);
         }
         let t3 = std::time::Instant::now();
         if let Some((mean, std)) = &self.bn {
@@ -1436,6 +1405,340 @@ impl SpecDiffusion {
             t3.elapsed().as_secs_f64()
         );
         Ok(img)
+    }
+}
+
+/// A built schedule: discrete (diffusers schedulers) or flow-matching sigmas.
+enum Run {
+    Discrete(Scheduler),
+    Flow(Vec<f32>, Option<DpmSolver2>),
+}
+
+impl Run {
+    fn steps(&self) -> usize {
+        match self {
+            Run::Discrete(s) => s.timesteps.len(),
+            Run::Flow(s, _) => s.len() - 1,
+        }
+    }
+
+    /// (timestep t, sigma, input scale) of step `i`.
+    fn at(&self, i: usize) -> (f64, f64, f32) {
+        match self {
+            Run::Discrete(s) => (s.timesteps[i], s.sigmas.get(i).copied().unwrap_or(0.0), s.input_scale(i) as f32),
+            Run::Flow(s, _) => (s[i] as f64 * TRAIN_STEPS as f64, s[i] as f64, 1.0),
+        }
+    }
+
+    /// Step `i` of `x` with the model output `out`.
+    fn advance(&mut self, i: usize, out: &[f32], x: &mut [f32], rng: &mut Rng) {
+        match self {
+            Run::Discrete(s) => {
+                // ponytail: the discrete step replaces a Vec; one copy per step keeps `x` a slice.
+                let mut v = x.to_vec();
+                s.step(i, out, &mut v, rng);
+                x.copy_from_slice(&v);
+            }
+            Run::Flow(s, None) => euler_step(x, out, s[i], s[i + 1]),
+            Run::Flow(s, Some(dpm)) => dpm.step(x, out, s, i),
+        }
+    }
+}
+
+/// `runtime.video`: the clip-length rule, frame rate, decode mode and image conditioning of a
+/// video pipeline (the rest of `runtime` is the diffusion pipeline's).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoSpec {
+    /// Default output frames (expr).
+    pub frames: J,
+    /// Latent frames for `frames` output frames (expr over `frames`).
+    pub latent_frames: J,
+    /// Accepted `frames` (expr over `frames`) and the refusal text.
+    #[serde(default)]
+    pub frames_ok: J,
+    #[serde(default)]
+    pub frames_error: Option<String>,
+    pub fps: J,
+    /// `clip`: the decoder takes the whole clip (vars `frames, h, w`; `z [frames, c, h, w]`; first
+    /// output `[frames', 3, H, W]`); `per_frame`: the image decoder runs on every latent frame.
+    pub decode: String,
+    /// `clean_first_frame`: an input image's encoded latent is latent frame 0, held clean (its
+    /// tokens run at timestep 0: denoiser var `clean`) while the rest is denoised.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// One video generation; `None` fields take the pipeline defaults.
+#[derive(Debug, Clone, Default)]
+pub struct VideoRequest {
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    pub frames: Option<usize>,
+    pub width: Option<usize>,
+    pub height: Option<usize>,
+    pub steps: Option<usize>,
+    pub guidance: Option<f32>,
+    pub seed: u64,
+}
+
+/// Denoised video latents in the denoiser's layout; the first `held` values are the clean
+/// (image-conditioned) frame, never stepped.
+pub(crate) struct VideoLatents {
+    pub x: Vec<f32>,
+    pub frames: usize,
+    pub h: usize,
+    pub w: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub held: usize,
+}
+
+/// A video pipeline's defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoDefaults {
+    pub frames: usize,
+    pub width: usize,
+    pub height: usize,
+    pub steps: usize,
+    pub guidance: f32,
+    pub fps: u32,
+}
+
+impl SpecDiffusion {
+    /// The schedule of `steps` steps; `seq` (latent tokens for a dynamic mu) is `scheduler.seq`
+    /// evaluated over `vars`, else `default_seq`.
+    fn schedule(&self, steps: usize, vars: &[(&str, Val)], default_seq: usize) -> Result<Run, String> {
+        Ok(match &self.sampler {
+            Sampler::Discrete(cfg) => Run::Discrete(cfg.build(steps)?),
+            Sampler::Flow { schedule, base, card, dpm, seq } => {
+                let seq = if seq.is_null() { default_seq } else { self.eval_n(seq, vars)? as usize };
+                let sig = match base.as_str() {
+                    "sd3" => default_sigmas(steps, schedule.shift),
+                    "dpm_flow" => dpm_flow_sigmas(steps, schedule.shift),
+                    "card" => match card {
+                        Some(c) if c.len() == steps => schedule.sigmas(c, seq, steps),
+                        _ => schedule.sigmas(&linspace_sigmas(steps), seq, steps),
+                    },
+                    "linspace" => schedule.sigmas(&linspace_sigmas(steps), seq, steps),
+                    b => return Err(format!("scheduler.sigmas `{b}` (linspace, sd3, dpm_flow, card)")),
+                };
+                Run::Flow(sig, dpm.then(DpmSolver2::default))
+            }
+        })
+    }
+
+    /// `out = u + scale * (out - u)` per `runtime.guidance.kind`.
+    fn guide(&self, out: &mut [f32], u: &[f32], scale: f32) -> Result<(), String> {
+        match self.rt.guidance.kind.as_str() {
+            "cfg" => out.iter_mut().zip(u).for_each(|(o, u)| *o = u + scale * (*o - u)),
+            "cfg_rescale" => {
+                let rw = match self.rt.latent.pack.as_str() {
+                    "pack2x2" => 4 * self.channels,
+                    "tokens" => self.channels,
+                    _ => out.len(),
+                };
+                for (o, u) in out.chunks_exact_mut(rw).zip(u.chunks_exact(rw)) {
+                    let pn = o.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    o.iter_mut().zip(u).for_each(|(o, u)| *o = u + scale * (*o - u));
+                    let cn = o.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    let r = if cn > 0.0 { pn / cn } else { 1.0 };
+                    o.iter_mut().for_each(|v| *v *= r);
+                }
+            }
+            k => return Err(format!("guidance.kind `{k}` (none, cfg, cfg_rescale)")),
+        }
+        Ok(())
+    }
+
+    /// `Some` for a video pipeline (`runtime.video`).
+    pub fn video_defaults(&self) -> Option<Result<VideoDefaults, String>> {
+        let v = self.video.as_ref()?;
+        let d = self.defaults;
+        Some((|| {
+            Ok(VideoDefaults {
+                frames: self.eval_n(&v.frames, &[])? as usize,
+                width: d.width,
+                height: d.height,
+                steps: d.steps,
+                guidance: d.guidance,
+                fps: self.eval_n(&v.fps, &[])? as u32,
+            })
+        })())
+    }
+
+    /// One clip of RGB frames; `image` (pipelines with `video.image`) conditions its first frame.
+    pub fn generate_video(&self, req: &VideoRequest, image: Option<&ImageBuffer>, log: &dyn Fn(&str)) -> Result<Vec<ImageBuffer>, String> {
+        let l = self.video_latents(req, image, log)?;
+        self.decode_video(&l, log)
+    }
+
+    /// The denoised latents of [`Self::generate_video`].
+    pub(crate) fn video_latents(&self, req: &VideoRequest, image: Option<&ImageBuffer>, log: &dyn Fn(&str)) -> Result<VideoLatents, String> {
+        let v = self.video.as_ref().ok_or_else(|| format!("{} is not a video pipeline", self.summary))?;
+        let vd = self.video_defaults().expect("video pipeline")?;
+        let d = self.defaults;
+        let (width, height) = (req.width.unwrap_or(d.width), req.height.unwrap_or(d.height));
+        if width == 0 || height == 0 || width % d.multiple != 0 || height % d.multiple != 0 || width.max(height) > self.max_side {
+            return Err(format!(
+                "width/height must be non-zero multiples of {} up to {}, got {width}x{height}",
+                d.multiple, self.max_side
+            ));
+        }
+        let frames = req.frames.unwrap_or(vd.frames);
+        let fv = [("frames", Val::Num(frames as f64))];
+        if !v.frames_ok.is_null() && !self.eval(&v.frames_ok, &fv)?.truthy() {
+            return Err(format!("--frames {frames}: {}", v.frames_error.as_deref().unwrap_or("not accepted")));
+        }
+        let lf = self.eval_n(&v.latent_frames, &fv)? as usize;
+        let steps = req.steps.unwrap_or(d.steps);
+        if !(1..=self.max_steps).contains(&steps) {
+            return Err(format!("steps must be in 1..={}, got {steps}", self.max_steps));
+        }
+        let guidance = req.guidance.unwrap_or(d.guidance);
+        let gv = [("guidance", Val::Num(guidance as f64))];
+        let g = &self.rt.guidance;
+        let cfg = g.kind != "none" && (g.gate.is_null() || self.eval(&g.gate, &gv)?.truthy());
+        let scale = if g.scale.is_null() { guidance } else { self.eval_n(&g.scale, &gv)? as f32 };
+        let (c, f) = (self.channels, self.factor);
+        let (h, w) = (height / f, width / f);
+        let hw_n = h * w;
+        let tokens = match self.rt.latent.pack.as_str() {
+            "tokens" => true,
+            "none" => false,
+            p => return Err(format!("video latents: pack `{p}` (none, tokens)")),
+        };
+
+        let t0 = std::time::Instant::now();
+        let (ctx, nt, pooled) = self.conditioning(&req.prompt, false)?;
+        let neg = match cfg {
+            true => {
+                let n = req.negative_prompt.clone().unwrap_or_else(|| self.rt.negative.default.clone());
+                Some(self.conditioning(&n, true)?)
+            }
+            false => None,
+        };
+        log(&format!("  prompt encoded: {:.2}s", t0.elapsed().as_secs_f64()));
+
+        let vars = [("frames", Val::Num(lf as f64)), ("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+        let mut run = self.schedule(steps, &vars, lf * hw_n)?;
+        // One latent frame `[c, h*w]` <-> the denoiser's per-frame layout (frames stay outermost).
+        let to_layout = |z: &[f32]| if tokens { transpose(z, c, hw_n) } else { z.to_vec() };
+        let mut rng = Rng::new(req.seed);
+        let s = match (&self.rt.latent.noise_scale, &run) {
+            (J::String(k), Run::Discrete(s)) if k == "init_sigma" => s.init_sigma() as f32,
+            (J::Null, _) => 1.0,
+            (J::String(k), _) if k == "init_sigma" => 1.0,
+            (j, _) => self.eval_n(j, &[])? as f32,
+        };
+        // Noise drawn directly in the denoiser's layout.
+        let mut x: Vec<f32> = (0..lf * c * hw_n).map(|_| rng.gaussian() * s).collect();
+        let clean = match image {
+            None => 0,
+            Some(img) => {
+                if v.image.as_deref() != Some("clean_first_frame") || !tokens || !matches!(run, Run::Flow(..)) {
+                    return Err(format!("{} does not take an input image", self.summary));
+                }
+                let enc = self.encoder.as_ref().ok_or_else(|| format!("{} has no VAE encoder", self.summary))?;
+                let t = std::time::Instant::now();
+                let img = if (img.width, img.height) == (width, height) { img.clone() } else { img.resize_lanczos(width, height) };
+                let hw = [vars[1].clone(), vars[2].clone()];
+                let m = enc.run_one(&hw, &[("image", Tensor::F32(from_image(&img)))], &[], None)?;
+                let z: Vec<f32> = m
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (v - self.affine.1[i / hw_n]) / self.affine.0[i / hw_n])
+                    .collect();
+                x[..c * hw_n].copy_from_slice(&to_layout(&z));
+                log(&format!("  image encoded: {:.2}s", t.elapsed().as_secs_f64()));
+                hw_n
+            }
+        };
+        let held = clean * c;
+
+        let ctx_t = Tensor::F32(ctx);
+        let pooled_t = Tensor::F32(pooled);
+        let neg_t = neg.map(|(c, n, p)| (Tensor::F32(c), n, Tensor::F32(p)));
+        let gt = Tensor::F32(vec![guidance]);
+        for i in 0..run.steps() {
+            let st = std::time::Instant::now();
+            let (t, sigma, k) = run.at(i);
+            let sv = [("t", Val::Num(t)), ("sigma", Val::Num(sigma))];
+            let ts = self.eval_n(&J::String(self.rt.timestep.clone()), &sv)?;
+            let step = [("t", t), ("sigma", sigma), ("timestep", ts), ("guidance", guidance as f64)];
+            let xin = Tensor::F32(if k == 1.0 { x.clone() } else { x.iter().map(|v| v * k).collect() });
+            let tst = Tensor::F32(vec![ts as f32]);
+            let eval_once = |ctx: &Tensor, nt: usize, pooled: &Tensor| -> Result<Vec<f32>, String> {
+                let mut dv = self.den_vars(h, w, nt);
+                dv.extend([("frames", Val::Num(lf as f64)), ("clean", Val::Num(clean as f64))]);
+                let given = [
+                    ("x", xin.clone()),
+                    ("context", ctx.clone()),
+                    ("pooled", pooled.clone()),
+                    ("timestep", tst.clone()),
+                    ("guidance", gt.clone()),
+                ];
+                self.denoiser.run_one(&dv, &given, &step, None)
+            };
+            let mut out = eval_once(&ctx_t, nt, &pooled_t)?;
+            if let Some((uc, un, up)) = &neg_t {
+                let u = eval_once(uc, *un, up)?;
+                self.guide(&mut out, &u, scale)?;
+            }
+            if out.len() != x.len() {
+                return Err(format!("denoiser returned {} values, expected {}", out.len(), x.len()));
+            }
+            if self.rt.negate_v {
+                out.iter_mut().for_each(|v| *v = -*v);
+            }
+            run.advance(i, &out[held..], &mut x[held..], &mut rng);
+            log(&format!("  step {}/{} (t={t:.1}): {:.2}s", i + 1, run.steps(), st.elapsed().as_secs_f64()));
+        }
+        Ok(VideoLatents { x, frames: lf, h, w, held })
+    }
+
+    /// RGB frames of denoised latents.
+    fn decode_video(&self, l: &VideoLatents, log: &dyn Fn(&str)) -> Result<Vec<ImageBuffer>, String> {
+        let v = self.video.as_ref().ok_or_else(|| format!("{} is not a video pipeline", self.summary))?;
+        let (c, f, h, w) = (self.channels, self.factor, l.h, l.w);
+        let hw_n = h * w;
+        let tokens = self.rt.latent.pack == "tokens";
+        let from_layout = |x: &[f32]| if tokens { transpose(x, hw_n, c) } else { x.to_vec() };
+        let vars = [("frames", Val::Num(l.frames as f64)), ("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+        let x = &l.x;
+        // Latent frames `[c, h*w]`, decode affine applied.
+        let t = std::time::Instant::now();
+        let fl = c * hw_n;
+        let frames_z: Vec<Vec<f32>> = x
+            .chunks_exact(fl)
+            .map(|fr| from_layout(fr).iter().enumerate().map(|(i, v)| v * self.affine.0[i / hw_n] + self.affine.1[i / hw_n]).collect())
+            .collect();
+        let over_white = self.rt.vae.output == "rgba_over_white";
+        let out = match v.decode.as_str() {
+            "clip" => {
+                let px = self.decoder.run_one(&vars, &[("z", Tensor::F32(frames_z.concat()))], &[], None)?;
+                let (oh, ow) = (h * f, w * f);
+                let n = px.len() / (3 * oh * ow).max(1);
+                if n * 3 * oh * ow != px.len() {
+                    return Err(format!("VAE decoder returned {} values for {ow}x{oh} RGB frames", px.len()));
+                }
+                px.chunks_exact(3 * oh * ow).map(|p| to_image(p, 3, oh, ow, false)).collect()
+            }
+            "per_frame" => {
+                let hw = [vars[1].clone(), vars[2].clone()];
+                let (oh, ow) = (h * f, w * f);
+                frames_z
+                    .into_iter()
+                    .map(|z| {
+                        let px = self.decoder.run_one(&hw, &[("z", Tensor::F32(z))], &[], None)?;
+                        let oc = px.len() / (oh * ow).max(1);
+                        Ok(to_image(&px, oc, oh, ow, over_white))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            }
+            m => return Err(format!("video.decode `{m}` (clip, per_frame)")),
+        };
+        log(&format!("  VAE decode: {:.2}s", t.elapsed().as_secs_f64()));
+        Ok(out)
     }
 }
 

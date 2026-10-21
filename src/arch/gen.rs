@@ -463,7 +463,10 @@ fn text_then_centered_grid(a: &Args) -> Result<Gen, String> {
 /// (`output`: `cos` or `sin`). Per axis `dim/6` freqs `theta^(j/(n-1)) * pi/2` times
 /// `2 * pos * axis_scale / base - 1`, axes interleaved, each angle twice, `dim % 6` leading
 /// identity entries. Args: `frames`, `grid_h`, `grid_w`, `fps`, `dim`, `theta` (10000),
-/// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32).
+/// `base` (`[20, 2048, 2048]`), `temporal_scale` (8; divided by `fps`), `spatial_scale` (32),
+/// `pair_sign` (false; true negates the even entry of every pair: `[-sin, +sin]` for a
+/// `x*cos + swap(x)*sin` rotation in graph).
+///
 /// Source: `ltx.rs` `Rope::new`.
 fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
     let (f, h, w, d) = (a.u("frames")?, a.u("grid_h")?, a.u("grid_w")?, a.u("dim")?);
@@ -482,6 +485,7 @@ fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
         "sin" => false,
         o => return Err(bad("output", o)),
     };
+    let sign = a.b_or("pair_sign", false)? && !cos;
     let n = d / 6;
     let freqs: Vec<f64> = (0..n).map(|j| theta.powf(j as f64 / (n - 1) as f64) * std::f64::consts::FRAC_PI_2).collect();
     let scale = [ts / fps, ss, ss];
@@ -493,7 +497,8 @@ fn video_rope_cos_sin(a: &Args) -> Result<Gen, String> {
             for axis in 0..3 {
                 let g = pos[axis] as f64 * scale[axis] / base[axis];
                 let x = fr * (g * 2.0 - 1.0);
-                v.extend([(if cos { x.cos() } else { x.sin() }) as f32; 2]);
+                let v0 = if cos { x.cos() } else { x.sin() } as f32;
+                v.extend([if sign { -v0 } else { v0 }, v0]);
             }
         }
     }
@@ -1075,13 +1080,16 @@ mod tests {
                 let want = model::qwen_image::rope_positions(&model::qwen_image21::t2i_positions(nt, h, w));
                 assert_eq!(u("text_then_centered_grid", args), want);
             }
-            for (fr, h, w, fps, d) in [(2, 3, 4, 25.0, 14), (1, 2, 2, 24.0, 12)] {
-                let r = model::ltx::Rope::new(fr, h, w, fps, d);
+            // FNV-1a of the `ltx.rs` `Rope::new` tables' bits (cos, sin), pinned before its deletion.
+            let fnv = |v: &[f32]| v.iter().fold(0xcbf29ce484222325u64, |h, x| (h ^ x.to_bits() as u64).wrapping_mul(0x100000001b3));
+            for ((fr, h, w, fps, d), pin) in [((2, 3, 4, 25.0, 14), PIN_ROPE[0]), ((1, 2, 2, 24.0, 12), PIN_ROPE[1])] {
                 let a = |o: &str| json!({"frames": fr, "grid_h": h, "grid_w": w, "fps": fps, "dim": d, "output": o});
-                assert_eq!(bits(&f("video_rope_cos_sin", a("cos"))), bits(&r.cos));
-                assert_eq!(bits(&f("video_rope_cos_sin", a("sin"))), bits(&r.sin));
+                let got = (fnv(&f("video_rope_cos_sin", a("cos"))), fnv(&f("video_rope_cos_sin", a("sin"))));
+                assert_eq!(got, pin, "{:?}", (fr, h, w));
             }
         }
+
+        const PIN_ROPE: [(u64, u64); 2] = [(7060718898465474953, 1236744568232124141), (101182376039508301, 1818247417042637373)];
 
         #[test]
         fn audio_front_end_matches_sources() {

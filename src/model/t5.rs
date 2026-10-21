@@ -5,7 +5,7 @@
 //! Reference: transformers `models/t5/modeling_t5.py` and `models/umt5/modeling_umt5.py`.
 // legacy: until the diffusion phases move sd3/flux/ltx text encoding onto the `t5` spec.
 
-use crate::model::flux::{Store, Wt};
+
 use crate::model::par::{par_for, par_rows, threads, OutPtr};
 use crate::model::simd::{vector_dot_product as dot, vector_fused_scale_add, vector_softmax};
 use crate::model::weights::{Mat, Weights};
@@ -24,8 +24,6 @@ enum Lin {
         rows: usize,
         cols: usize,
     },
-    /// A llama.cpp / ComfyUI `t5encoder` GGUF matrix, decoded per GEMM panel.
-    Gguf(Wt),
 }
 
 /// Input rows at or above which an f32 linear runs the packed GEMM instead of row dot products.
@@ -36,14 +34,6 @@ impl Lin {
     fn forward(&self, x: &[f32], n: usize) -> Vec<f32> {
         let (w, rows, cols) = match self {
             Lin::Bf16(m) => return crate::model::gemma4::ops::linear(x, n, m),
-            Lin::Gguf(w) => {
-                let (rows, cols) = w.dims();
-                let mut out = vec![0.0f32; n * rows];
-                nn::matmul_rows(x, n, cols, rows, None, &mut out, &|j, k0, d| {
-                    w.decode(j, k0, d)
-                });
-                return out;
-            }
             Lin::F32 { w, rows, cols } => (w, *rows, *cols),
         };
         if n >= GEMM_ROWS {
@@ -73,66 +63,27 @@ impl Lin {
                 .iter()
                 .map(|&b| crate::model::bf16_to_f32(b))
                 .collect(),
-            Lin::Gguf(w) => {
-                let mut row = vec![0.0; w.dims().1];
-                w.decode(r, 0, &mut row);
-                row
-            }
             Lin::F32 { w, cols, .. } => w[r * cols..(r + 1) * cols].to_vec(),
         }
     }
 }
 
 /// Where tensors come from: a mapped safetensors checkpoint (`true`: every matrix as bf16, f32/f16
-/// rounded into an anonymous map; `false`: only bf16 ones, the rest f32), or a llama.cpp
-/// `t5encoder` GGUF left mapped (names translated by [`ggml_name`]).
+/// rounded into an anonymous map; `false`: only bf16 ones, the rest f32).
 enum Src<'a> {
     Map(&'a Weights, bool),
-    Gguf(&'a Store),
-}
-
-/// The llama.cpp / ComfyUI `t5encoder` name of an HF encoder tensor (`enc.blk.N.attn_q.weight`).
-fn ggml_name(n: &str) -> String {
-    let block = |rest: &str| -> Option<String> {
-        let (i, tail) = rest.split_once(".layer.")?;
-        let (l, t) = tail.split_once('.')?;
-        let t = match (l, t) {
-            ("0", "layer_norm.weight") => "attn_norm.weight",
-            ("0", "SelfAttention.q.weight") => "attn_q.weight",
-            ("0", "SelfAttention.k.weight") => "attn_k.weight",
-            ("0", "SelfAttention.v.weight") => "attn_v.weight",
-            ("0", "SelfAttention.o.weight") => "attn_o.weight",
-            ("0", "SelfAttention.relative_attention_bias.weight") => "attn_rel_b.weight",
-            ("1", "layer_norm.weight") => "ffn_norm.weight",
-            ("1", "DenseReluDense.wi_0.weight") => "ffn_gate.weight",
-            ("1", "DenseReluDense.wi_1.weight") => "ffn_up.weight",
-            ("1", "DenseReluDense.wo.weight") => "ffn_down.weight",
-            _ => return None,
-        };
-        Some(format!("enc.blk.{i}.{t}"))
-    };
-    match n {
-        "shared.weight" | "encoder.embed_tokens.weight" => "token_embd.weight".into(),
-        "encoder.final_layer_norm.weight" => "enc.output_norm.weight".into(),
-        _ => n
-            .strip_prefix("encoder.block.")
-            .and_then(block)
-            .unwrap_or_else(|| n.into()),
-    }
 }
 
 impl Src<'_> {
     fn has(&self, name: &str) -> bool {
         match self {
             Src::Map(w, _) => w.has(name),
-            Src::Gguf(s) => s.has(&ggml_name(name)),
         }
     }
 
     fn vec_n(&self, name: &str, n: usize) -> Result<Vec<f32>, String> {
         let v = match self {
             Src::Map(w, _) => w.vec(name)?,
-            Src::Gguf(s) => s.vec(&ggml_name(name))?,
         };
         if v.len() != n {
             return Err(format!(
@@ -145,30 +96,13 @@ impl Src<'_> {
 
     /// `name` as a `[rows, cols]` weight; mapped bf16 stays bf16.
     fn lin(&self, name: &str, rows: usize, cols: usize) -> Result<Lin, String> {
-        if let Src::Gguf(s) = self {
-            let w = s.mat(&ggml_name(name))?;
-            if w.dims() != (rows, cols) {
-                return Err(format!(
-                    "tensor '{name}' is {:?}, expected [{rows}, {cols}]",
-                    w.dims()
-                ));
+        let Src::Map(w, to_bf16) = self;
+        // `mat` rounds f16/f32 to bf16; without `to_bf16` only stored bf16 is taken as is.
+        if let Some(m) = (*to_bf16 || w.is_bf16(name)).then(|| w.mat(name)).and_then(Result::ok) {
+            if (m.rows, m.cols) != (rows, cols) {
+                return Err(format!("tensor '{name}' is [{}, {}], expected [{rows}, {cols}]", m.rows, m.cols));
             }
-            return Ok(Lin::Gguf(w));
-        }
-        if let Src::Map(w, to_bf16) = self {
-            // `mat` rounds f16/f32 to bf16; without `to_bf16` only stored bf16 is taken as is.
-            if let Some(m) = (*to_bf16 || w.is_bf16(name))
-                .then(|| w.mat(name))
-                .and_then(Result::ok)
-            {
-                if (m.rows, m.cols) != (rows, cols) {
-                    return Err(format!(
-                        "tensor '{name}' is [{}, {}], expected [{rows}, {cols}]",
-                        m.rows, m.cols
-                    ));
-                }
-                return Ok(Lin::Bf16(m));
-            }
+            return Ok(Lin::Bf16(m));
         }
         Ok(Lin::F32 {
             w: self.vec_n(name, rows * cols)?,
@@ -468,12 +402,6 @@ impl T5Encoder {
     /// mapped; f32/f16 ones are rounded to bf16 (half their f32 size, resident).
     pub fn load(w: &Weights, cfg: &Value, prefix: &str) -> Result<Self, String> {
         Self::from_src(&Src::Map(w, true), Cfg::parse(cfg)?, prefix)
-    }
-
-    /// Loads the encoder of a llama.cpp / ComfyUI `t5encoder` GGUF (`enc.blk.N.*`); `cfg` is the
-    /// model's HF `config.json`. Quantized matrices stay mapped and are decoded per GEMM panel.
-    pub(crate) fn load_gguf(store: &Store, cfg: &Value) -> Result<Self, String> {
-        Self::from_src(&Src::Gguf(store), Cfg::parse(cfg)?, "")
     }
 
     fn from_src(src: &Src, c: Cfg, prefix: &str) -> Result<Self, String> {

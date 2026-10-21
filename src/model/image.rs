@@ -5,6 +5,7 @@
 //! Diffusion pipelines live in `crate::runtime::diffusion`.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 
 /// Standard RFC 4648 Base64 character table
@@ -1557,6 +1558,67 @@ fn upsample(
         }
     }
     out
+}
+
+/// Encodes `frames` (same size, even dims) to H.264 `path` by piping rgb24 into the `ffmpeg` binary.
+pub fn write_mp4(frames: &[ImageBuffer], fps: u32, path: &Path) -> Result<(), String> {
+    let first = frames.first().ok_or("write_mp4: no frames")?;
+    let (w, h) = (first.width, first.height);
+    if frames
+        .iter()
+        .any(|f| f.width != w || f.height != h || f.data.len() != w * h * 3)
+    {
+        return Err(format!("write_mp4: frames must all be RGB {w}x{h}"));
+    }
+    let mut child = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+        ])
+        .arg(format!("{w}x{h}"))
+        .arg("-r")
+        .arg(fps.to_string())
+        .args(["-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                "ffmpeg not found on PATH; install ffmpeg (with libx264) to write .mp4 video"
+                    .to_string()
+            }
+            _ => format!("failed to start ffmpeg: {e}"),
+        })?;
+    let mut stdin = child.stdin.take().ok_or("ffmpeg stdin unavailable")?;
+    // A write error means ffmpeg exited early; its stderr below says why.
+    let write_err = frames
+        .iter()
+        .try_for_each(|f| stdin.write_all(&f.data))
+        .err();
+    drop(stdin);
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    if !out.status.success() || write_err.is_some() {
+        return Err(format!(
+            "ffmpeg failed ({}): {}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+            write_err
+                .map(|e| format!(" (pipe: {e})"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

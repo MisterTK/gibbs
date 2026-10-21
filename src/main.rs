@@ -6,9 +6,6 @@ use gibbs_engine::model::classifier::{self, ClassifierSlot};
 use gibbs_engine::model::hub::{is_synthetic_model_id, HuggingFaceHub, StorageBackend};
 use gibbs_engine::model::image::ImageBuffer;
 use gibbs_engine::model::load_log;
-use gibbs_engine::model::ltx;
-use gibbs_engine::model::t2v::Video;
-use gibbs_engine::model::t2v::{write_mp4, TextToVideoPipeline};
 use gibbs_engine::runtime::diffusion::{ImageGenerator, ImageRequest, ImageSlot};
 use gibbs_engine::model::weight_format::ReencodeConfig;
 use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler, ExecutableModel};
@@ -91,7 +88,7 @@ struct Cli {
     #[arg(long)]
     negative_prompt: Option<String>,
 
-    /// LTX-Video: T5-XXL text encoder GGUF (`org/repo` or `org/repo/file.gguf`); GGUF transformers default to
+    /// Video pipelines with a T5 text encoder (LTX-Video): its weights (GGUF (`org/repo` or `org/repo/file.gguf`); GGUF transformers default to
     /// city96/t5-v1_1-xxl-encoder-gguf Q4_K_M, diffusers repos to their own 19 GB `text_encoder/`.
     #[arg(long)]
     text_encoder: Option<String>,
@@ -150,8 +147,6 @@ struct Cli {
     arch_dump: bool,
 }
 
-const VIDEO_SIZE: usize = 256;
-const VIDEO_FPS: u32 = 8;
 
 fn clock_seed() -> u64 {
     std::time::SystemTime::now()
@@ -171,12 +166,12 @@ fn parse_quant(s: &str) -> Result<QuantMode, String> {
     })
 }
 
-/// One CLI text-to-video generation with an LTX-Video pipeline (diffusers repo or `ltxv` GGUF).
-fn run_ltx(cli: &Cli, hub: &HuggingFaceHub, plan: &ltx::Plan) -> Result<(), String> {
+/// One CLI text-to-video (with `--image`, image-to-video) generation of a video pipeline plan.
+fn run_video(cli: &Cli, hub: &HuggingFaceHub, plan: &gibbs_engine::model::video_repo::Plan, backend: Device) -> Result<(), String> {
     let model = &cli.model;
     let Some(prompt) = cli.prompt.as_deref() else {
         return Err(format!(
-            "'{model}' is a text-to-video model; the HTTP server, daemon and TUI have no video endpoint. \
+            "'{model}' is a text-to-video model; the HTTP server and daemon have no video endpoint. \
              Run one generation instead: gibbs --model {model} --prompt \"...\" --output clip.mp4"
         ));
     };
@@ -185,104 +180,42 @@ fn run_ltx(cli: &Cli, hub: &HuggingFaceHub, plan: &ltx::Plan) -> Result<(), Stri
         .as_deref()
         .filter(|o| o.ends_with(".mp4"))
         .ok_or("text-to-video needs --output <file.mp4>")?;
-    let d = ltx::Clip::new(cli.seed.unwrap_or_else(clock_seed));
-    let clip = ltx::Clip {
-        frames: cli.frames.unwrap_or(d.frames),
-        width: cli.width.unwrap_or(d.width),
-        height: cli.height.unwrap_or(d.height),
-        steps: cli.steps.unwrap_or(d.steps),
-        guidance: cli.guidance.unwrap_or(d.guidance),
-        ..d
+    let image = cli.image.as_deref().map(ImageBuffer::from_base64_or_path).transpose()?;
+    let req = gibbs_engine::runtime::diffusion::VideoRequest {
+        prompt: prompt.to_string(),
+        negative_prompt: cli.negative_prompt.clone(),
+        frames: cli.frames,
+        width: cli.width,
+        height: cli.height,
+        steps: cli.steps,
+        guidance: cli.guidance,
+        seed: cli.seed.unwrap_or_else(clock_seed),
     };
     println!("Prompt: {prompt:?}");
-    println!(
-        "Seed: {}  Steps: {}  Frames: {}  Guidance: {}  Size: {}x{}",
-        clip.seed, clip.steps, clip.frames, clip.guidance, clip.width, clip.height
-    );
     let start = Instant::now();
-    let negative = cli.negative_prompt.as_deref().unwrap_or("");
-    let image = cli
-        .image
-        .as_deref()
-        .map(ImageBuffer::from_base64_or_path)
-        .transpose()?;
     let log = |s: &str| println!("{s}");
-    let frames = ltx::run(
+    let (frames, fps, req) = gibbs_engine::model::video_repo::generate(
         hub,
         plan,
-        prompt,
-        negative,
+        gibbs_engine::hardware::PlacementMode::Pin(backend),
         cli.text_encoder.as_deref(),
+        &req,
         image.as_ref(),
-        &clip,
         &log,
     )?;
-    write_mp4(&frames, ltx::FPS, Path::new(output))?;
-    let bytes = std::fs::metadata(output)
-        .map_err(|e| format!("{output}: {e}"))?
-        .len();
     println!(
-        "Generated {} frames in {:.2}s",
+        "Seed: {}  Steps: {}  Frames: {}  Guidance: {}  Size: {}x{}",
+        req.seed,
+        req.steps.unwrap_or(0),
         frames.len(),
-        start.elapsed().as_secs_f64()
+        req.guidance.unwrap_or(0.0),
+        req.width.unwrap_or(0),
+        req.height.unwrap_or(0)
     );
-    println!("Saved {output} ({bytes} bytes, {} fps)", ltx::FPS);
-    Ok(())
-}
-
-/// One CLI text-to-video generation (ModelScope TextToVideoSDPipeline checkpoints).
-fn run_text_to_video(cli: &Cli, hub: &HuggingFaceHub, backend: Device) -> Result<(), String> {
-    let model = &cli.model;
-    gibbs_engine::graph::avenues::family_gate(
-        gibbs_engine::graph::avenues::Family::VideoModelScope,
-        backend,
-    )?;
-    let Some(prompt) = cli.prompt.as_deref() else {
-        return Err(format!(
-            "'{model}' is a text-to-video model; the HTTP server, daemon and TUI have no video endpoint. \
-             Run one generation instead: gibbs --model {model} --prompt \"...\" --output clip.mp4"
-        ));
-    };
-    if cli.image.is_some() {
-        return Err(format!(
-            "--image is not supported with the text-to-video model '{model}'"
-        ));
-    }
-    let output = cli
-        .output
-        .as_deref()
-        .filter(|o| o.ends_with(".mp4"))
-        .ok_or("text-to-video needs --output <file.mp4>")?;
-    let steps = cli.steps.unwrap_or(25);
-    let seed = cli.seed.unwrap_or_else(clock_seed);
-
-    let t0 = Instant::now();
-    let t2v = TextToVideoPipeline::load(hub, model)?;
-    println!(
-        "Text-to-video pipeline (CLIP + UNet3D + VAE) loaded in {:.2}s",
-        t0.elapsed().as_secs_f64()
-    );
-    println!("Prompt: {prompt:?}");
-    let guidance = cli.guidance.unwrap_or(9.0);
-    let frames = cli.frames.unwrap_or(16);
-    println!(
-        "Seed: {seed}  Steps: {steps}  Frames: {frames}  Guidance: {guidance}  Size: {VIDEO_SIZE}x{VIDEO_SIZE}"
-    );
-    let start = Instant::now();
-    let frames = t2v.generate(
-        prompt, frames, VIDEO_SIZE, VIDEO_SIZE, steps, guidance, seed,
-    )?;
-    let total = start.elapsed().as_secs_f64();
-    write_mp4(&frames, VIDEO_FPS, Path::new(output))?;
-    let bytes = std::fs::metadata(output)
-        .map_err(|e| format!("{output}: {e}"))?
-        .len();
-    println!(
-        "Generated {} frames in {total:.2}s ({:.2}s/step average, VAE decode included)",
-        frames.len(),
-        total / steps as f64
-    );
-    println!("Saved {output} ({bytes} bytes, {VIDEO_FPS} fps)");
+    gibbs_engine::model::image::write_mp4(&frames, fps, Path::new(output))?;
+    let bytes = std::fs::metadata(output).map_err(|e| format!("{output}: {e}"))?.len();
+    println!("Generated {} frames in {:.2}s", frames.len(), start.elapsed().as_secs_f64());
+    println!("Saved {output} ({bytes} bytes, {fps} fps)");
     Ok(())
 }
 
@@ -456,10 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let classifier_slot = ClassifierSlot::default();
     let jev_slot = gibbs_engine::runtime::encoder::system1::System1Slot::default();
     let model_exec = match loaded {
-        Loaded::Video(Video::Ltx(plan)) => return run_ltx(&cli, &hub, &plan).map_err(Into::into),
-        Loaded::Video(Video::ModelScope) => {
-            return run_text_to_video(&cli, &hub, backend).map_err(Into::into)
-        }
+        Loaded::Video(plan) => return run_video(&cli, &hub, &plan, backend).map_err(Into::into),
         Loaded::Image(g) => {
             let d = g.defaults();
             telemetry.log_info(&format!(

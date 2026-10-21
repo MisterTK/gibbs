@@ -105,6 +105,10 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/fasttext.json5", include_str!("../../arch/families/fasttext.json5")),
     ("families/deberta.json5", include_str!("../../arch/families/deberta.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
+    ("lib/video.json5", include_str!("../../arch/lib/video.json5")),
+    ("families/ltx.json5", include_str!("../../arch/families/ltx.json5")),
+    ("families/ltx_vae.json5", include_str!("../../arch/families/ltx_vae.json5")),
+    ("families/modelscope_t2v.json5", include_str!("../../arch/families/modelscope_t2v.json5")),
 ];
 
 /// Tensor facts the interpreter needs: canonical weights and generated constants.

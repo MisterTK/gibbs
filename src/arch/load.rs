@@ -1641,6 +1641,10 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
                 );
             }
         }
+        // Rounding to bf16 only changes f32 values; bf16/f16/packed stay in their stored encoding.
+        if t.op == "round_bf16" && ins[0].kind != Kind::F32 {
+            continue;
+        }
         let shapes: Vec<&[usize]> = ins.iter().map(|n| n.shape.as_slice()).collect();
         let outs = xf_shapes(&t.op, &args, &shapes).map_err(|e| format!("`{name}`: {e}"))?;
         let kind = xf_kind(&t.op, &ins);
@@ -2575,6 +2579,7 @@ mod tests {
                 ("rs", "F32", &[2, 3], f32b(&iota(6))),
                 ("conv", "BF16", &[2, 1, 3], bf16b(&iota(6))),
                 ("rb", "F32", &[1], f32b(&[1.0 + 1.0 / 1024.0])),
+                ("rb16", "F16", &[1], f16b(&[1.0 + 1.0 / 1024.0])),
                 ("qkv", "F32", &[4, 2], f32b(&iota(8))),
                 ("fused", "F32", &[6, 1], f32b(&iota(6))),
                 ("ut", "F32", &[6], f32b(&iota(6))),
@@ -2604,6 +2609,7 @@ mod tests {
               {tensor: "rs", op: "reshape", args: {shape: [3, 2]}},
               {tensor: "conv", op: "to_f32"},
               {tensor: "rb", op: "round_bf16"},
+              {tensor: "rb16", op: "round_bf16"},
               {tensor: "qkv", op: "split_rows", args: {parts: [["q", 2], ["k", 1], ["v", "bump"]]}},
               {tensor: "fused", op: "deinterleave_heads", args: {heads: 2, parts: [["x", 1], ["y", 2]]}},
               {tensor: "ut", op: "untile_heads", args: {k_heads: 2, block: 1}},
@@ -2645,6 +2651,8 @@ mod tests {
         assert_eq!(s.tensor("conv"), Some((vec![2, 1, 3], DType::F32)));
         assert!(matches!(get(&m, "conv"), Tensor::F32(x) if x == iota(6)));
         assert_eq!(v("rb"), [1.0]);
+        // round_bf16 leaves non-f32 tensors in their stored encoding (f16 here, packed blocks alike).
+        assert_eq!(v("rb16"), [1.0 + 1.0 / 1024.0]);
         assert_eq!(
             (v("q"), v("k"), v("v")),
             (vec![0.0, 1.0, 2.0, 3.0], vec![4.0, 5.0], vec![6.0, 7.0])

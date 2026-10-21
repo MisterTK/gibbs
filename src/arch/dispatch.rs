@@ -29,7 +29,8 @@ pub enum Loaded {
     Classifier(SequenceClassifier),
     System1(JevSystem1Model),
     Image(Arc<dyn ImageGenerator>),
-    Video(crate::model::t2v::Video),
+    /// A text-to-video plan, loaded per generation ([`crate::model::video_repo::load`]).
+    Video(crate::model::video_repo::Plan),
 }
 
 pub struct LoadOpts<'a> {
@@ -37,7 +38,7 @@ pub struct LoadOpts<'a> {
     pub token: Option<&'a str>,
     /// `--quant` as the GraphLm loader reads it (legacy: until Phase 4).
     pub quant: Option<QuantMode>,
-    /// `--quant` verbatim: the GGUF pick of a video repo (legacy: until Phase 10).
+    /// `--quant` verbatim: the GGUF pick of a video repo.
     pub quant_name: Option<&'a str>,
     pub hw: &'a HardwareCapability,
     /// The re-encode configuration every loader runs under.
@@ -95,8 +96,7 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
         if !o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
-        // legacy: until Phase 10 (video specs)
-        if let Some(v) = crate::model::t2v::detect(hub, id, o.quant_name) {
+        if let Some(v) = crate::model::video_repo::detect(hub, id, o.quant_name) {
             return v.map(Loaded::Video);
         }
     }

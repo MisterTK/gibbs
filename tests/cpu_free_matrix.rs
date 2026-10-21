@@ -297,17 +297,17 @@ fn gpu_fixture(f: Family) {
             run_on_gpu("DiffusionDit", g, w);
         }
         Family::VideoLtx => {
-            let (g, w) = gibbs_engine::model::ltx::tiny_dit_graph().expect("tiny LTX DiT graph");
-            run_on_gpu("VideoLtx", g, w);
+            // The `ltx` and `modelscope_t2v` spec denoisers on tiny checkpoints, Metal programs.
+            gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
         }
         // The spec pipeline (CLIP -> UNet2D x2 CFG steps -> VAE): golden `diffa::tiny_sd` asserts its
         // Metal leg enters no CPU compute.
         Family::DiffusionUnet => {}
         Family::VideoModelScope => {
-            gibbs_engine::model::unet3d::fixture::tiny_on_gpu().expect("tiny UNet3D runs on Metal");
+            gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
         }
         Family::Vae => {
-            // SD, Qwen-Image (x2) and LTX VAEs decode (and LTX encodes) as Metal programs.
+            // SD and Qwen-Image (x2) VAEs decode as Metal programs.
             gibbs_engine::model::diff_fixtures::tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
         }
         other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
