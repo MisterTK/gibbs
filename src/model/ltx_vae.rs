@@ -14,6 +14,9 @@ use crate::model::nn;
 use crate::model::weights::Weights;
 use std::path::Path;
 
+#[cfg(test)]
+mod spec_parity;
+
 /// `[frames][channels][h * w]`.
 pub struct Vid {
     pub d: Vec<f32>,
