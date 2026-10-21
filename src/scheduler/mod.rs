@@ -120,7 +120,8 @@ impl ExecutableModel {
         }
     }
     /// Decodes `last_token` against the sequence's KV cache (prefilling `all_tokens` first when the
-    /// sequence has none) and samples the next token.
+    /// sequence has none) and samples the next token. `logprobs: Some(k)` also reports the chosen
+    /// token's probability, the top `k` candidates and the entropy.
     pub fn step_token_with_kv(
         &self,
         all_tokens: &[u32],
@@ -128,16 +129,18 @@ impl ExecutableModel {
         pos: usize,
         temp: f32,
         top_p: f32,
+        logprobs: Option<usize>,
         kv_cache: &mut Option<SeqKvCache>,
-    ) -> Result<u32, String> {
-        // Greedy (as `sample_logits` decides it): programs may pick the token on the device.
-        let greedy = temp <= 1e-4;
+    ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
+        // Greedy (as `sample_logits` decides it) without logprobs: programs may pick the token on
+        // the device.
+        let device_pick = temp <= 1e-4 && logprobs.is_none();
         let logits = match self {
             // `pos` counts `last_token` itself.
             Self::Native(m) => match kv_cache {
-                Some(SeqKvCache::Native(state)) if greedy => {
+                Some(SeqKvCache::Native(state)) if device_pick => {
                     match m.forward_greedy(&[last_token], pos - 1, state)? {
-                        crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok(t[0]),
+                        crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok((t[0], None)),
                         t => crate::model::native::logits_of(t)?,
                     }
                 }
@@ -146,8 +149,7 @@ impl ExecutableModel {
             },
             Self::Program(prog, m) => {
                 let mut p = prog.write();
-                let model = m.read();
-                let logits = match kv_cache {
+                match kv_cache {
                     Some(SeqKvCache::Program(state)) => {
                         std::mem::swap(&mut p.state, state);
                         let actual_pos = (pos - 1) as u32;
@@ -155,8 +157,8 @@ impl ExecutableModel {
                             crate::graph::Tensor::U32(vec![last_token]),
                             crate::graph::Tensor::U32(vec![actual_pos]),
                         ];
-                        let out = if greedy {
-                            p.run_greedy(inputs, model.tokenizer.vocab_size())
+                        let out = if device_pick {
+                            p.run_greedy(inputs, m.read().tokenizer.vocab_size())
                         } else {
                             p.run(inputs)
                         };
@@ -164,7 +166,9 @@ impl ExecutableModel {
                         let out = out?;
                         match out.into_iter().next() {
                             Some(crate::graph::Tensor::F32(v)) => v,
-                            Some(crate::graph::Tensor::U32(t)) if t.len() == 1 => return Ok(t[0]),
+                            Some(crate::graph::Tensor::U32(t)) if t.len() == 1 => {
+                                return Ok((t[0], None))
+                            }
                             _ => return Err("GraphProgram did not return F32 logits".into()),
                         }
                     }
@@ -186,18 +190,11 @@ impl ExecutableModel {
                         last_logits
                     }
                     _ => return Err(WRONG_KV.into()),
-                };
-                return Ok(model.sample_next_token_with_penalty(
-                    &logits,
-                    recent(all_tokens),
-                    temp,
-                    50,
-                    top_p,
-                    1.0,
-                ));
+                }
             }
         };
-        Ok(self.sample(&logits, recent(all_tokens), temp, top_p))
+        let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
+        Ok((chosen, logprobs.map(|k| logprob_info(&logits, chosen, k))))
     }
 
     /// The next greedy token of a device decode stream ([`GraphProgram::stream_next`]): `last` is
@@ -245,116 +242,6 @@ impl ExecutableModel {
         }
     }
 
-    pub fn step_token_with_kv_and_logprobs(
-        &self,
-        all_tokens: &[u32],
-        last_token: u32,
-        pos: usize,
-        temp: f32,
-        top_p: f32,
-        top_k: usize,
-        kv_cache: &mut Option<SeqKvCache>,
-    ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
-        let logits = match self {
-            Self::Native(m) => match kv_cache {
-                Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
-                _ => return Err(WRONG_KV.into()),
-            },
-            Self::Program(prog, m) => {
-                let mut p = prog.write();
-                let _model = m.read();
-                match kv_cache {
-                    Some(SeqKvCache::Program(state)) => {
-                        std::mem::swap(&mut p.state, state);
-                        let actual_pos = (pos - 1) as u32;
-                        let inputs = vec![
-                            crate::graph::Tensor::U32(vec![last_token]),
-                            crate::graph::Tensor::U32(vec![actual_pos]),
-                        ];
-                        let out = p.run(inputs);
-                        std::mem::swap(&mut p.state, state);
-                        let out = out?;
-                        match out.into_iter().next() {
-                            Some(crate::graph::Tensor::F32(v)) => v,
-                            _ => return Err("GraphProgram did not return F32 logits".into()),
-                        }
-                    }
-                    None => {
-                        p.state = crate::graph::StateStore::new();
-                        let mut last_logits = Vec::new();
-                        for (i, &tok) in all_tokens.iter().enumerate() {
-                            let inputs = vec![
-                                crate::graph::Tensor::U32(vec![tok]),
-                                crate::graph::Tensor::U32(vec![i as u32]),
-                            ];
-                            let out = p.run(inputs)?;
-                            match out.into_iter().next() {
-                                Some(crate::graph::Tensor::F32(v)) => last_logits = v,
-                                _ => return Err("GraphProgram did not return F32 logits".into()),
-                            }
-                        }
-                        *kv_cache = Some(SeqKvCache::Program(p.state.clone()));
-                        last_logits
-                    }
-                    _ => return Err(WRONG_KV.into()),
-                }
-            }
-        };
-
-        let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
-
-        let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum_exp: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
-        let lse = max_l + sum_exp.ln();
-
-        // Exact Shannon entropy computed over full vocabulary in a single pass:
-        let entropy = -logits
-            .iter()
-            .map(|&l| {
-                let p = (l - lse).exp();
-                if p > 1e-12 {
-                    p * (l - lse)
-                } else {
-                    0.0
-                }
-            })
-            .sum::<f32>();
-
-        // Top k selection using select_nth_unstable_by in O(V + k log k) time:
-        let mut indexed: Vec<(u32, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &l)| (i as u32, l))
-            .collect();
-        let k_take = top_k.min(indexed.len()).max(1);
-        if k_take < indexed.len() {
-            indexed.select_nth_unstable_by(k_take - 1, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        let top_slice = &mut indexed[..k_take];
-        top_slice
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let top_candidates: Vec<(u32, f32)> = top_slice
-            .iter()
-            .map(|&(tok, l)| (tok, (l - lse).exp()))
-            .collect();
-
-        let chosen_prob = (logits.get(chosen as usize).copied().unwrap_or(max_l) - lse)
-            .exp()
-            .min(1.0);
-
-        Ok((
-            chosen,
-            Some(TokenLogprobInfo {
-                chosen_id: chosen,
-                chosen_prob,
-                top_candidates,
-                entropy,
-            }),
-        ))
-    }
     /// Evaluates a chunk of prompt tokens. If this chunk completes the prompt,
     /// returns `Some(next_token)`. If more prompt tokens remain, returns `None`.
     pub fn step_prefill_chunk(
@@ -486,8 +373,8 @@ impl ExecutableModel {
         }
     }
 
-    /// One-shot generation for the CLI `--prompt` path: (text, decode forward passes, decode time).
-    /// `drafter` speculates; native models otherwise use the drafter they ship.
+    /// One-shot generation through a private [`ContinuousBatchScheduler`]: (text, decode-step
+    /// tokens, decode time). `drafter` speculates; native models otherwise use the drafter they ship.
     pub fn generate_text_measured(
         &self,
         prompt: &str,
@@ -495,16 +382,13 @@ impl ExecutableModel {
         temperature: f32,
         drafter: Option<Arc<dyn Drafter>>,
     ) -> Result<(String, usize, std::time::Duration), String> {
-        match (self, drafter) {
-            (Self::Native(_), None) => spec_generate(
-                self,
-                builtin_drafter(Some(self)),
-                prompt,
-                max_new_tokens,
-                temperature,
-            ),
-            (_, d) => spec_generate(self, d, prompt, max_new_tokens, temperature),
+        let s =
+            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(self.clone()));
+        if drafter.is_some() {
+            s.set_drafter(drafter);
         }
+        let g = s.generate(prompt, max_new_tokens, temperature)?;
+        Ok((g.text, g.decode.1, g.decode.0))
     }
 
     /// [`Self::generate_text_measured`] with drafters off: one forward pass per generated token,
@@ -515,7 +399,11 @@ impl ExecutableModel {
         max_new_tokens: usize,
         temperature: f32,
     ) -> Result<(String, usize, std::time::Duration), String> {
-        spec_generate(self, None, prompt, max_new_tokens, temperature)
+        let s =
+            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(self.clone()));
+        s.set_drafter(None);
+        let g = s.generate(prompt, max_new_tokens, temperature)?;
+        Ok((g.text, g.decode.1, g.decode.0))
     }
 
     pub fn tokenizer(&self) -> Tokenizer {
@@ -570,120 +458,58 @@ impl ExecutableModel {
     }
 }
 
-/// CLI `--prompt` generation for a CPU model, speculative with `drafter`:
-/// (text, tokens from decode steps, decode time).
-fn spec_generate(
-    exec: &ExecutableModel,
-    drafter: Option<Arc<dyn Drafter>>,
-    prompt: &str,
-    max_new_tokens: usize,
-    temperature: f32,
-) -> Result<(String, usize, Duration), String> {
-    let tok = exec.tokenizer();
-    let ctx = exec.context_len().unwrap_or(usize::MAX);
-    let prep = PrepareCtx {
-        max_new_tokens,
-        cancel: None,
-    };
-    let formatted_prompt = if prompt.contains("<|im_start|>")
-        || prompt.contains("<start_of_turn>")
-        || prompt.contains("[INST]")
-        || prompt.contains("<|user|>")
-        || tok.chat_template.is_none()
-    {
-        prompt.to_string()
-    } else {
-        tok.apply_chat_template(&[("user", prompt)])
-    };
-    let (ids, mut kv) = exec.prepare(tok.encode(&formatted_prompt), &[], &prep)?;
-    if ids.is_empty() {
-        return Err("the prompt encodes to no tokens".into());
+/// `chosen`'s probability, the top `top_k` candidates and the exact entropy of `logits`.
+fn logprob_info(logits: &[f32], chosen: u32, top_k: usize) -> TokenLogprobInfo {
+    let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f32 = logits.iter().map(|&l| (l - max_l).exp()).sum();
+    let lse = max_l + sum_exp.ln();
+    let entropy = -logits
+        .iter()
+        .map(|&l| {
+            let p = (l - lse).exp();
+            if p > 1e-12 {
+                p * (l - lse)
+            } else {
+                0.0
+            }
+        })
+        .sum::<f32>();
+    // Top k in O(V + k log k).
+    let mut indexed: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i as u32, l))
+        .collect();
+    let k_take = top_k.min(indexed.len()).max(1);
+    if k_take < indexed.len() {
+        indexed.select_nth_unstable_by(k_take - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
-    let mut spec = match drafter {
-        Some(d) => Some(SpecSeq::start(exec, d, &mut kv, 0x5EED)?),
-        None => None,
-    };
-    let t_prefill = Instant::now();
-    let first =
-        exec.step_prefill_chunk(&ids, 0, true, &ids, temperature, DEFAULT_TOP_P, &mut kv)?;
-    let prefill_dur = t_prefill.elapsed();
-    let prefill_tok_s = ids.len() as f64 / prefill_dur.as_secs_f64().max(1e-9);
-    if !crate::telemetry::TUI_OWNS_TERMINAL.load(std::sync::atomic::Ordering::Relaxed) {
-        println!(
-            "⚡ Prefill: {} tokens in {:.2}ms ({:.1} tok/s)",
-            ids.len(),
-            prefill_dur.as_secs_f64() * 1000.0,
-            prefill_tok_s
-        );
+    let top_slice = &mut indexed[..k_take];
+    top_slice.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_candidates = top_slice
+        .iter()
+        .map(|&(tok, l)| (tok, (l - lse).exp()))
+        .collect();
+    let chosen_prob = (logits.get(chosen as usize).copied().unwrap_or(max_l) - lse)
+        .exp()
+        .min(1.0);
+    TokenLogprobInfo {
+        chosen_id: chosen,
+        chosen_prob,
+        top_candidates,
+        entropy,
     }
-    let (mut pending, mut out) = (first.into_iter().collect::<Vec<_>>(), Vec::new());
-    let (mut all, mut decode, mut tuner) = (ids, Duration::ZERO, KTuner::default());
-    let mut decoded = 0usize;
-    'gen: loop {
-        for t in pending.drain(..) {
-            if tok.ends_generation(t) {
-                break 'gen;
-            }
-            out.push(t);
-            all.push(t);
-            if out.len() >= max_new_tokens || all.len() >= ctx {
-                break 'gen;
-            }
-        }
-        let t0 = Instant::now();
-        pending = match &mut spec {
-            Some(sp) => {
-                let k = tuner
-                    .choose(sp.max_k())
-                    .min(max_new_tokens - out.len() - 1)
-                    .min(ctx - all.len());
-                let vocab = tok.vocab_size();
-                let s = spec::decode(
-                    exec,
-                    sp,
-                    &all,
-                    &mut kv,
-                    temperature,
-                    DEFAULT_TOP_P,
-                    vocab,
-                    k,
-                )?;
-                if s.synced {
-                    tuner.record(k, s.tokens.len(), t0.elapsed());
-                }
-                s.tokens
-            }
-            None => {
-                let last = all[all.len() - 1];
-                let streamed = if temperature <= 1e-4 {
-                    exec.stream_greedy_token(
-                        last,
-                        all.len(),
-                        (max_new_tokens - out.len()).min(ctx - all.len()),
-                        &mut kv,
-                    )?
-                } else {
-                    None
-                };
-                match streamed {
-                    Some(t) => vec![t],
-                    None => vec![exec.step_token_with_kv(
-                        &all,
-                        last,
-                        all.len(),
-                        temperature,
-                        DEFAULT_TOP_P,
-                        &mut kv,
-                    )?],
-                }
-            }
-        };
-        decode += t0.elapsed();
-        // The first token came from prefill: only decode-step tokens belong to `decode`.
-        decoded += pending.len();
-    }
-    exec.stream_end(&mut kv)?;
-    Ok((tok.decode(&out), decoded, decode))
+}
+
+/// What [`ContinuousBatchScheduler::generate`] produced and what it cost.
+pub struct Generation {
+    pub text: String,
+    /// (time, prompt tokens) of prefill.
+    pub prefill: (Duration, usize),
+    /// (time, tokens emitted by decode steps); the first token comes from prefill.
+    pub decode: (Duration, usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -894,6 +720,10 @@ impl Sequence {
 pub struct BatchStepOutput {
     pub tokens_generated: usize,
     pub active_sequences_count: usize,
+    /// (time, prompt tokens) this step prefilled.
+    pub prefill: (Duration, usize),
+    /// (time, tokens emitted) of this step's decode work.
+    pub decode: (Duration, usize),
 }
 
 /// One admitted sequence, as of the end of the last step.
@@ -1323,6 +1153,56 @@ impl ContinuousBatchScheduler {
         (id, rx)
     }
 
+    /// Runs one request to completion on this thread (CLI `--prompt`, bench): the prompt goes
+    /// through the tokenizer's chat template when it declares one, sampling uses `temperature`
+    /// and [`DEFAULT_TOP_P`]. Prints the prefill line unless the TUI owns the terminal.
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        temperature: f32,
+    ) -> Result<Generation, String> {
+        let params = SamplingParams {
+            temperature: Some(temperature),
+            top_p: Some(DEFAULT_TOP_P),
+            max_new_tokens,
+            top_logprobs: None,
+        };
+        let (_, mut rx, tok, _, finish) =
+            self.submit_with_media(params, &[], |t| match &t.chat_template {
+                Some(_) => t.encode(&t.apply_chat_template(&[("user", prompt)])),
+                None => t.encode(prompt),
+            })?;
+        let (mut prefill, mut decode) = ((Duration::ZERO, 0), (Duration::ZERO, 0));
+        let mut out = Vec::new();
+        'run: loop {
+            let s = self.step();
+            prefill = (prefill.0 + s.prefill.0, prefill.1 + s.prefill.1);
+            decode = (decode.0 + s.decode.0, decode.1 + s.decode.1);
+            loop {
+                match rx.try_recv() {
+                    Ok(t) => out.push(t),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break 'run,
+                }
+            }
+        }
+        finish_outcome(&finish)?;
+        if !crate::telemetry::TUI_OWNS_TERMINAL.load(Ordering::Relaxed) {
+            println!(
+                "⚡ Prefill: {} tokens in {:.2}ms ({:.1} tok/s)",
+                prefill.1,
+                prefill.0.as_secs_f64() * 1000.0,
+                prefill.1 as f64 / prefill.0.as_secs_f64().max(1e-9)
+            );
+        }
+        Ok(Generation {
+            text: tok.decode(&out),
+            prefill,
+            decode,
+        })
+    }
+
     pub fn step(&self) -> BatchStepOutput {
         let step_started = Instant::now();
         // Lock order (active, waiting, model) matches `swap_model`, so a step never mixes models.
@@ -1404,7 +1284,7 @@ impl ContinuousBatchScheduler {
 
         let mut prefill_budget_left = prefill_budget;
         let (mut prefill_time, mut prefill_tokens) = (Duration::ZERO, 0);
-        let (mut decode_time, mut decoded) = (Duration::ZERO, 0);
+        let (mut decode_time, mut decoded, mut decode_emitted) = (Duration::ZERO, 0, 0);
 
         for seq in active.iter_mut() {
             if seq.state == SequenceState::Finished {
@@ -1578,54 +1458,41 @@ impl ContinuousBatchScheduler {
                     }
                     _ => {
                         let last = all.last().copied().unwrap_or(1);
-                        if let Some(top_k) = seq.params.top_logprobs {
-                            match m.step_token_with_kv_and_logprobs(
-                                &all,
+                        let logprobs = seq.params.top_logprobs;
+                        let streamed = if temp <= 1e-4 && logprobs.is_none() {
+                            m.stream_greedy_token(
                                 last,
                                 all.len(),
-                                temp,
-                                top_p,
-                                top_k,
+                                seq.params
+                                    .max_new_tokens
+                                    .saturating_sub(seq.output_tokens.len())
+                                    .min(context_len.saturating_sub(all.len())),
                                 &mut seq.kv_cache,
-                            ) {
-                                Ok((tok, info_opt)) => {
-                                    if let Some(info) = info_opt {
-                                        if let Some(tx) = self.logprob_tx.read().as_ref() {
-                                            let _ = tx.send(info);
-                                        }
-                                    }
-                                    Ok(vec![tok])
-                                }
-                                Err(e) => Err(e),
-                            }
+                            )
                         } else {
-                            let streamed = if temp <= 1e-4 {
-                                m.stream_greedy_token(
+                            Ok(None)
+                        };
+                        match streamed {
+                            Ok(Some(t)) => Ok(vec![t]),
+                            Ok(None) => m
+                                .step_token_with_kv(
+                                    &all,
                                     last,
                                     all.len(),
-                                    seq.params
-                                        .max_new_tokens
-                                        .saturating_sub(seq.output_tokens.len())
-                                        .min(context_len.saturating_sub(all.len())),
+                                    temp,
+                                    top_p,
+                                    logprobs,
                                     &mut seq.kv_cache,
                                 )
-                            } else {
-                                Ok(None)
-                            };
-                            match streamed {
-                                Ok(Some(t)) => Ok(vec![t]),
-                                Ok(None) => m
-                                    .step_token_with_kv(
-                                        &all,
-                                        last,
-                                        all.len(),
-                                        temp,
-                                        top_p,
-                                        &mut seq.kv_cache,
-                                    )
-                                    .map(|t| vec![t]),
-                                Err(e) => Err(e),
-                            }
+                                .map(|(tok, info)| {
+                                    if let (Some(info), Some(tx)) =
+                                        (info, self.logprob_tx.read().as_ref())
+                                    {
+                                        let _ = tx.send(info);
+                                    }
+                                    vec![tok]
+                                }),
+                            Err(e) => Err(e),
                         }
                     }
                 };
@@ -1655,6 +1522,7 @@ impl ContinuousBatchScheduler {
                 if n > 0 {
                     let itl = seq.emit(&tokens[..n], &self.telemetry);
                     tokens_gen += n;
+                    decode_emitted += n;
                     // A plain decode token (no drafter, one forward) against the run behind it.
                     if let (Some(itl), None, 1) = (itl, spec_k, n) {
                         self.record_gap(itl);
@@ -1696,6 +1564,8 @@ impl ContinuousBatchScheduler {
         BatchStepOutput {
             tokens_generated: tokens_gen,
             active_sequences_count: active.len(),
+            prefill: (prefill_time, prefill_tokens),
+            decode: (decode_time, decode_emitted),
         }
     }
 
@@ -1997,8 +1867,11 @@ mod tests {
     fn test_generation_stops_at_model_context_length() {
         let model = never_eos_model();
         let ctx = model.config.max_seq_len;
-        let scheduler =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(cpu_exec(model)));
+        let scheduler = ContinuousBatchScheduler::new(
+            "",
+            Arc::new(PagedKVPool::new(512)),
+            Some(cpu_exec(model)),
+        );
         // Unclamped submit path: only the step's context check can stop this sequence.
         let (_, rx) = scheduler.submit_request_stream(vec![7u32; ctx - 12]);
         assert_eq!(run_to_completion(&scheduler, rx).len(), 12);
@@ -2034,8 +1907,11 @@ mod tests {
             )
             .0 as u32;
 
-        let scheduler =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(cpu_exec(model)));
+        let scheduler = ContinuousBatchScheduler::new(
+            "",
+            Arc::new(PagedKVPool::new(512)),
+            Some(cpu_exec(model)),
+        );
         let params = SamplingParams {
             temperature: Some(0.0),
             top_p: None,
@@ -2111,8 +1987,10 @@ mod tests {
                 prompt.len(),
                 0.0,
                 1.0,
+                None,
                 &mut kv,
             )
+            .map(|(t, _)| t)
             .expect("step_token_with_kv succeeds");
 
         assert!(
@@ -2128,7 +2006,16 @@ mod tests {
         let mut full_prompt = prompt.clone();
         full_prompt.push(next_tok);
         let dec_tok = exec_model
-            .step_token_with_kv(&full_prompt, next_tok, full_prompt.len(), 0.0, 1.0, &mut kv)
+            .step_token_with_kv(
+                &full_prompt,
+                next_tok,
+                full_prompt.len(),
+                0.0,
+                1.0,
+                None,
+                &mut kv,
+            )
+            .map(|(t, _)| t)
             .expect("decode step succeeds");
         assert!((dec_tok as usize) < vocab, "decode token must be < vocab");
         // Compare next token generated by Program against forward_token_with_kv
@@ -2203,8 +2090,10 @@ mod tests {
                 prompt.len(),
                 0.0,
                 1.0,
+                None,
                 &mut kv,
             )
+            .map(|(t, _)| t)
             .expect("Metal step_token_with_kv succeeds");
         tied(
             next_tok,
@@ -2215,7 +2104,16 @@ mod tests {
         let mut full_prompt = prompt.clone();
         full_prompt.push(next_tok);
         let dec_tok = exec_model
-            .step_token_with_kv(&full_prompt, next_tok, full_prompt.len(), 0.0, 1.0, &mut kv)
+            .step_token_with_kv(
+                &full_prompt,
+                next_tok,
+                full_prompt.len(),
+                0.0,
+                1.0,
+                None,
+                &mut kv,
+            )
+            .map(|(t, _)| t)
             .expect("Metal decode step succeeds");
         assert!((dec_tok as usize) < vocab);
 
@@ -2298,8 +2196,10 @@ mod tests {
                 full_long.len(),
                 0.0,
                 1.0,
+                None,
                 &mut batched_kv,
             )
+            .map(|(t, _)| t)
             .expect("Decode step after batched prefill succeeds");
         assert!((dec_b_tok as usize) < vocab);
     }

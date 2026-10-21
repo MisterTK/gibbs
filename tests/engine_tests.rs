@@ -212,8 +212,10 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
                 generated.len(),
                 0.0,
                 1.0,
+                None,
                 &mut kv,
             )
+            .map(|(t, _)| t)
             .expect("decode step succeeds");
         generated.push(tok);
     }
