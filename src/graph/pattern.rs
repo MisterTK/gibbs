@@ -210,11 +210,12 @@ fn compact_graph(graph: &mut Graph, eliminated: &HashSet<NodeId>) {
 
     // Nodes touching one state keep their order (a `CachedAttention` write before an `Attention`
     // that reads the whole cache has no value edge between them).
-    let mut last_user: HashMap<ValueId, usize> = HashMap::new();
+    // Keyed by state name: one state may have several value ids.
+    let mut last_user: HashMap<&str, usize> = HashMap::new();
     for (idx, node) in remaining.iter().enumerate() {
         for &inp in &node.inputs {
-            if matches!(graph.value(inp).kind, ValueKind::State { .. }) {
-                if let Some(prev) = last_user.insert(inp, idx).filter(|&p| p != idx) {
+            if let ValueKind::State { name, .. } = &graph.value(inp).kind {
+                if let Some(prev) = last_user.insert(name.as_str(), idx).filter(|&p| p != idx) {
                     adj[prev].push(idx);
                     in_degree[idx] += 1;
                 }

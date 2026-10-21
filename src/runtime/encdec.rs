@@ -368,8 +368,8 @@ impl SpecEncDec {
                 // ponytail: host memcpy of the filled rows (unified memory) instead of a blit.
                 let eb = if b.state.metal_f16.contains(name) { 2 } else { 4 };
                 let fresh = crate::graph::metal::new_shared_buffer(&device, *n * eb)?;
-                let rows = self.states.get(name).map_or(1, |d| d.rows);
-                let filled = (*n / rows.max(1) * b.len).min(*n);
+                // Row width from the declaration: device buffers may be smaller than declared.
+                let filled = self.states.get(name).map_or(*n, |d| (d.numel / d.rows.max(1) * b.len).min(*n));
                 // SAFETY: both buffers are shared-storage with at least `filled` elements of `eb`
                 // bytes; programs run synchronously, so no GPU work is in flight.
                 unsafe {
