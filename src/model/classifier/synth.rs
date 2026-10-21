@@ -241,3 +241,54 @@ pub fn deberta_v1() -> (Value, Ts) {
     deberta_layers(&mut ts, h, 24, 2, true);
     (cfg, ts)
 }
+
+/// `LlamaForSequenceClassification`: GQA (4 heads, 2 KV), RoPE, SwiGLU, no `lm_head`, a bias-free
+/// `score` head on the last non-pad token (`pad_token_id` 0).
+pub fn llama_seqcls() -> (Value, Ts) {
+    let (h, kv, inter) = (32, 16, 48);
+    let cfg = json!({"architectures": ["LlamaForSequenceClassification"], "model_type": "llama",
+        "hidden_size": h, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "intermediate_size": inter, "max_position_embeddings": 64, "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0, "pad_token_id": 0});
+    let mut ts = Ts::new(7);
+    ts.w("model.embed_tokens.weight", &[VOCAB, h]);
+    for l in 0..2 {
+        let p = format!("model.layers.{l}");
+        ts.gamma(&format!("{p}.input_layernorm"), h);
+        ts.w(&format!("{p}.self_attn.q_proj.weight"), &[h, h]);
+        ts.w(&format!("{p}.self_attn.k_proj.weight"), &[kv, h]);
+        ts.w(&format!("{p}.self_attn.v_proj.weight"), &[kv, h]);
+        ts.w(&format!("{p}.self_attn.o_proj.weight"), &[h, h]);
+        ts.gamma(&format!("{p}.post_attention_layernorm"), h);
+        ts.w(&format!("{p}.mlp.gate_proj.weight"), &[inter, h]);
+        ts.w(&format!("{p}.mlp.up_proj.weight"), &[inter, h]);
+        ts.w(&format!("{p}.mlp.down_proj.weight"), &[h, inter]);
+    }
+    ts.gamma("model.norm", h);
+    ts.w("score.weight", &[3, h]);
+    (cfg, ts)
+}
+
+/// `GPTNeoXForSequenceClassification`: fused per-head q/k/v, 25% RoPE, parallel residual, no
+/// `embed_out`, a bias-free `score` head.
+pub fn gpt_neox_seqcls() -> (Value, Ts) {
+    let (h, inter) = (32, 64);
+    let cfg = json!({"architectures": ["GPTNeoXForSequenceClassification"], "model_type": "gpt_neox",
+        "hidden_size": h, "num_hidden_layers": 2, "num_attention_heads": 2, "intermediate_size": inter,
+        "max_position_embeddings": 64, "rotary_pct": 0.25, "layer_norm_eps": 1e-5, "hidden_act": "gelu",
+        "use_parallel_residual": true, "pad_token_id": 0});
+    let mut ts = Ts::new(8);
+    ts.w("gpt_neox.embed_in.weight", &[VOCAB, h]);
+    for l in 0..2 {
+        let p = format!("gpt_neox.layers.{l}");
+        ts.ln(&format!("{p}.input_layernorm"), h);
+        ts.lin(&format!("{p}.attention.query_key_value"), 3 * h, h);
+        ts.lin(&format!("{p}.attention.dense"), h, h);
+        ts.ln(&format!("{p}.post_attention_layernorm"), h);
+        ts.lin(&format!("{p}.mlp.dense_h_to_4h"), inter, h);
+        ts.lin(&format!("{p}.mlp.dense_4h_to_h"), h, inter);
+    }
+    ts.ln("gpt_neox.final_layer_norm", h);
+    ts.w("score.weight", &[3, h]);
+    (cfg, ts)
+}

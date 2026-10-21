@@ -939,6 +939,42 @@ impl Wt {
     }
 }
 
+/// x `[rows, w.cols]` . w^T -> `[rows, w.rows]` (PyTorch `nn.Linear` layout, no bias) over a
+/// mapped bf16 / packed [`crate::model::weights::Mat`]: below 8 rows each row streams the bf16
+/// weight (memory-bound decode); at 8 or more the direct bf16 GEMM runs.
+pub fn linear_mat(x: &[f32], rows: usize, w: &crate::model::weights::Mat) -> Vec<f32> {
+    use crate::model::par::{dot_bf16, par_for, threads, OutPtr};
+    let (k, n) = (w.cols, w.rows);
+    assert_eq!(x.len(), rows * k, "linear: input is not rows x {k}");
+    let mut out = vec![0.0f32; rows * n];
+    if rows == 1 && w.packed().is_some() {
+        w.gemv_f32(x, &mut out);
+        return out;
+    }
+    if w.packed().is_some() {
+        matmul_nt(x, &w.to_f32(), None, rows, k, n, &mut out);
+        return out;
+    }
+    if rows >= 8 {
+        linear_bf16_direct(x, w.data(), rows, k, n, &mut out);
+        return out;
+    }
+    let per = n.div_ceil(threads() * 4).max(16);
+    let o = OutPtr::new(&mut out);
+    par_for(n.div_ceil(per), &|t| {
+        let (j0, j1) = (t * per, ((t + 1) * per).min(n));
+        for r in 0..rows {
+            let xr = &x[r * k..(r + 1) * k];
+            // SAFETY: columns j0..j1 of row r belong to task t.
+            let dst = unsafe { o.slice(r * n + j0, j1 - j0) };
+            for (d, j) in dst.iter_mut().zip(j0..j1) {
+                *d = dot_bf16(w.row(j), xr);
+            }
+        }
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

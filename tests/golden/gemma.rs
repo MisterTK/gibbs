@@ -120,13 +120,14 @@ struct G4 {
     ple: bool,
     moe: bool,
     bidir: bool,
+    /// 26B-A4B's vision `std_bias`/`std_scale` (the tower then stays off).
+    std: bool,
 }
 
-/// `Gemma4ForConditionalGeneration` checkpoint (E2B layout at toy size): text decoder (sliding +
-/// full layers with per-type head dims, proportional rope, KV sharing on the last 2 layers with
-/// double-wide MLPs; or 2 MoE layers), the `gemma4_vision` tower and the `gemma4_audio` conformer.
-fn gemma4_fixture(case: &str, o: G4) -> PathBuf {
-    let dir = fixture_dir(case);
+/// The Gemma 4 text decoder at toy size (hidden 64) into `w`: sliding + full layers with per-type
+/// head dims, proportional rope, KV sharing on the last 2 layers with double-wide MLPs; or 2 MoE
+/// layers. Returns its `text_config`.
+fn gemma4_text(w: &mut Weights, o: G4) -> Value {
     let (h, nh, kvh, hd, ghd, inter, pd) = (64, 2, 1, 16, 32, 96, 8);
     let (types, shared): (&[&str], usize) = if o.moe {
         (&["sliding_attention", "full_attention"], 0)
@@ -137,7 +138,6 @@ fn gemma4_fixture(case: &str, o: G4) -> PathBuf {
         )
     };
     let (nl, (experts, top_k, ff)) = (types.len(), (8, 2, 32));
-    let mut w = Weights::new(0x6e6d_6134 + o.ple as u64 * 2 + o.moe as u64 * 3 + o.bidir as u64 * 5);
     let p = "model.language_model";
     w.w(format!("{p}.embed_tokens.weight"), &[V, h]);
     w.norm(format!("{p}.norm.weight"), h, 1.0);
@@ -181,6 +181,38 @@ fn gemma4_fixture(case: &str, o: G4) -> PathBuf {
             w.w(format!("{l}.mlp.experts.down_proj"), &[experts, h, ff]);
         }
     }
+    let mut text = json!({
+        "model_type": "gemma4_text", "hidden_size": h, "num_hidden_layers": nl,
+        "num_attention_heads": nh, "num_key_value_heads": kvh, "head_dim": hd,
+        "global_head_dim": ghd, "num_global_key_value_heads": kvh, "intermediate_size": inter,
+        "num_kv_shared_layers": shared, "hidden_size_per_layer_input": if o.ple { pd } else { 0 },
+        "layer_types": types, "sliding_window": 4, "max_position_embeddings": 512,
+        "rms_norm_eps": 1e-6, "final_logit_softcapping": 30.0, "pad_token_id": 0,
+        "vocab_size": V, "hidden_activation": "gelu_pytorch_tanh",
+        "rope_parameters": {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+            "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1e6},
+        },
+    });
+    if o.bidir {
+        text["use_bidirectional_attention"] = json!("vision");
+    }
+    if o.moe {
+        text["enable_moe_block"] = json!(true);
+        text["num_experts"] = json!(experts);
+        text["top_k_experts"] = json!(top_k);
+        text["moe_intermediate_size"] = json!(ff);
+    }
+    text
+}
+
+/// `Gemma4ForConditionalGeneration` checkpoint (E2B layout at toy size): [`gemma4_text`], the
+/// `gemma4_vision` tower and the `gemma4_audio` conformer.
+fn gemma4_fixture(case: &str, o: G4) -> PathBuf {
+    let dir = fixture_dir(case);
+    let h = 64;
+    let mut w = Weights::new(0x6e6d_6134 + o.ple as u64 * 2 + o.moe as u64 * 3 + o.bidir as u64 * 5);
+    let text = gemma4_text(&mut w, o);
     // Vision tower: hidden 16, 2 layers, 4 px patches, 2x2 pooling.
     let (vd, vi, vhd, pos) = (16, 32, 8, 8);
     let vp = "model.vision_tower";
@@ -210,6 +242,10 @@ fn gemma4_fixture(case: &str, o: G4) -> PathBuf {
         for n in ["input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm"] {
             w.norm(format!("{l}.{n}.weight"), vd, 1.0);
         }
+    }
+    if o.std {
+        w.norm(format!("{vp}.std_bias"), vd, 0.0);
+        w.norm(format!("{vp}.std_scale"), vd, 1.0);
     }
     // Audio conformer: hidden 16, 2 layers, 16 mel bins.
     let (ad, ap) = (16, "model.audio_tower");
@@ -247,28 +283,6 @@ fn gemma4_fixture(case: &str, o: G4) -> PathBuf {
     }
     write_st_as(&dir.join("model.safetensors"), &w.tensors, StDtype::BF16);
 
-    let mut text = json!({
-        "model_type": "gemma4_text", "hidden_size": h, "num_hidden_layers": nl,
-        "num_attention_heads": nh, "num_key_value_heads": kvh, "head_dim": hd,
-        "global_head_dim": ghd, "num_global_key_value_heads": kvh, "intermediate_size": inter,
-        "num_kv_shared_layers": shared, "hidden_size_per_layer_input": if o.ple { pd } else { 0 },
-        "layer_types": types, "sliding_window": 4, "max_position_embeddings": 512,
-        "rms_norm_eps": 1e-6, "final_logit_softcapping": 30.0, "pad_token_id": 0,
-        "vocab_size": V, "hidden_activation": "gelu_pytorch_tanh",
-        "rope_parameters": {
-            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
-            "full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25, "rope_theta": 1e6},
-        },
-    });
-    if o.bidir {
-        text["use_bidirectional_attention"] = json!("vision");
-    }
-    if o.moe {
-        text["enable_moe_block"] = json!(true);
-        text["num_experts"] = json!(experts);
-        text["top_k_experts"] = json!(top_k);
-        text["moe_intermediate_size"] = json!(ff);
-    }
     write_json(
         &dir.join("config.json"),
         &json!({
@@ -577,4 +591,66 @@ fn gemma3_seqcls() {
         }
         out
     });
+}
+
+/// `Gemma4ForSequenceClassification` (gevva NLI cross-encoder) hub snapshot: the PLE text decoder
+/// of [`gemma4_text`], the head's own RMSNorm `norm.weight` and a 3-label `score`; (premise,
+/// hypothesis) pairs in gevva's prompt layout, the second over 64 tokens.
+#[test]
+fn gemma4_seqcls() {
+    use gibbs_engine::model::classifier::SequenceClassifier;
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    let case = "gemma_gemma4_seqcls";
+    let root = fixture_dir(case);
+    let dir = root.join("models--gibbs-golden--gemma4-seqcls-tiny/snapshots/main");
+    let mut w = Weights::new(0x6e6d_6173);
+    let mut text = gemma4_text(&mut w, G4 { ple: true, ..G4::default() });
+    text["bos_token_id"] = json!(2);
+    w.norm("norm.weight", 64, 1.0);
+    w.w("score.weight", &[3, 64]);
+    write_st_as(&dir.join("model.safetensors"), &w.tensors, StDtype::BF16);
+    write_json(
+        &dir.join("config.json"),
+        &json!({
+            "architectures": ["Gemma4ForSequenceClassification"], "model_type": "gemma4",
+            "text_config": text, "pad_token_id": 0,
+            "id2label": {"0": "entailment", "1": "neutral", "2": "contradiction"},
+            "label2id": {"entailment": 0, "neutral": 1, "contradiction": 2},
+        }),
+    );
+    // The template's words get their own ids, so the golden pins the template text.
+    tokenizer(&dir, V, &[(114, "Premise:"), (115, "Hypothesis:"), (116, "Prediction:")]);
+    let long: Vec<String> = (0..60).map(|i| format!("t{}", 4 + (i * 37) % 110)).collect();
+    let long = long.join(" ");
+    let pairs = [("t5 t17 t9", "t40 t8"), (long.as_str(), "t11 t23 t77 t31")];
+    golden(case, TOL, |dev| {
+        let hub = HuggingFaceHub::with_cache_dir(root.clone());
+        let c = SequenceClassifier::load(&hub, "gibbs-golden/gemma4-seqcls-tiny", dev)
+            .unwrap_or_else(|e| panic!("gemma4 seq-cls load: {e}"));
+        assert_eq!(c.device(), dev, "gemma4 seq-cls body fell back");
+        let mut out = Out::default();
+        for (i, (t, p)) in pairs.iter().enumerate() {
+            let (scores, _) = c.classify(t, Some(p)).unwrap();
+            let by_label: Vec<f32> = c
+                .labels
+                .iter()
+                .map(|l| scores.iter().find(|s| &s.label == l).unwrap().score)
+                .collect();
+            out.f(format!("scores_{i}"), &by_label);
+        }
+        out
+    });
+}
+
+/// A safetensors checkpoint whose vision tower has 26B-A4B's `std_bias`/`std_scale` loads with
+/// vision off (its tower tensors are deliberately unread) and refuses an image.
+#[test]
+fn gemma4_std_bias_vision_off() {
+    let dir = gemma4_fixture("gemma_gemma4_std_bias", G4 { std: true, ..G4::default() });
+    let m = load(&dir, Device::Cpu);
+    let prompt = [2, 10, IMG, 12];
+    let e = m.prepare(prompt.to_vec(), &[MediaInput::Image(png(32, 24))]).err().expect("image is off");
+    assert!(e.contains("no image input"), "{e}");
+    let (ids, mut st) = m.prepare(PROMPT.to_vec(), &[]).unwrap();
+    assert!(m.forward(&ids, 0, &mut st).unwrap().iter().all(|v| v.is_finite()));
 }

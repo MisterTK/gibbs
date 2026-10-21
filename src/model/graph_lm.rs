@@ -4477,8 +4477,7 @@ mod tests {
             GraphLmConfig {
                 use_parallel_residual: true,
                 use_standard_layernorm: true,
-                // GELU MLPs need an up-only `gate_up_proj` (random init makes it gate+up): the
-                // `decoder_gpu::tiny_graph_lm` variants cover them.
+                // GELU MLPs need an up-only `gate_up_proj` (random init makes it gate+up).
                 rotary_pct: 0.5,
                 ..base()
             },

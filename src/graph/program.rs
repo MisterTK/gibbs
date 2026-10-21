@@ -924,13 +924,26 @@ mod tests {
         if !available_devices().contains(&Device::Metal) {
             return;
         }
-        let lm = crate::model::classifier::decoder_gpu::tiny_graph_lm(
-            0,
-            crate::hardware::QuantFormat::FP32,
-        );
-        let vocab = lm.config.vocab_size;
-        let (g, w) = lm.to_decode_graph();
-        let mut prog = GraphProgram::compile(g, w, PlacementMode::Pin(Device::Metal)).unwrap();
+        // The llama spec's decode instance on a synthetic (random-init) checkpoint.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama",
+            "hidden_size": 32, "num_hidden_layers": 2, "num_attention_heads": 2, "intermediate_size": 64,
+            "vocab_size": 64, "max_position_embeddings": 48, "rms_norm_eps": 1e-5});
+        std::fs::write(tmp.path().join("config.json"), cfg.to_string()).unwrap();
+        let a = crate::model::hub::ModelArtifacts {
+            model_id: "gibbs/stream-test".into(),
+            local_dir: Some(tmp.path().to_path_buf()),
+            config_path: Some(tmp.path().join("config.json")),
+            ..Default::default()
+        };
+        let m = crate::arch::load::load(&a, crate::arch::registry().unwrap(), Some("llama")).unwrap();
+        use crate::arch::expr::Val;
+        let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
+        let inst = crate::arch::build::build(&m.spec, "text", &m.env, &m.store, &vars).unwrap();
+        let w = m.store.materialize(&inst.weights).unwrap();
+        let vocab = 64;
+        let mut prog =
+            GraphProgram::compile(inst.graph, w, PlacementMode::Pin(Device::Metal)).unwrap();
         assert!(prog.is_single_metal());
         let reference = |prog: &mut GraphProgram, first: u32, n: usize| {
             prog.state = StateStore::new();

@@ -1,10 +1,10 @@
 //! Encoder goldens: the sequence classifiers (`model::classifier`: BERT, ModernBERT, ELECTRA,
 //! ALBERT, DeBERTa v1/v2, SetFit, GPT-2/OPT decoder seq-cls, fastText), System 1
-//! (`runtime::encoder::system1`) and Idefics3/SmolVLM (`model::idefics3` + `model::siglip`). Every case writes a
+//! (`runtime::encoder::system1`) and Idefics3/SmolVLM (the `idefics3` spec through `runtime::lm`). Every case writes a
 //! Hugging Face cache snapshot (`models--gibbs-golden--<case>/snapshots/main`) or a checkpoint
 //! directory and loads it through the public loader (`SequenceClassifier::load`,
-//! `JevSystem1Model::load`, `load_native`). Shapes follow `classifier/synth.rs`,
-//! `ln_decoder.rs` `tiny` and `idefics3.rs` `tiny_engine`.
+//! `JevSystem1Model::load`, `runtime::lm::load`). Shapes follow `classifier/synth.rs`,
+//! the deleted `ln_decoder.rs` `tiny` and `idefics3.rs` `tiny_engine`.
 
 use crate::util::*;
 use gibbs_engine::model::classifier::SequenceClassifier;
@@ -13,7 +13,7 @@ use gibbs_engine::model::weight_format::{set_reencode_override, ReencodeConfig, 
 use gibbs_engine::model::hub::HuggingFaceHub;
 use gibbs_engine::model::image::ImageBuffer;
 use gibbs_engine::runtime::encoder::system1::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
-use gibbs_engine::model::native::{load_native, MediaInput};
+use gibbs_engine::model::native::MediaInput;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -451,7 +451,7 @@ fn setfit() {
 }
 
 // ---------------------------------------------------------------------------
-// GPT-2 / OPT decoder seq-cls (`ln_decoder.rs` `tiny`: 2 blocks, 2 heads, hidden 32, ffn 64)
+// GPT-2 / OPT decoder seq-cls (old `ln_decoder.rs` `tiny`: 2 blocks, 2 heads, hidden 32, ffn 64)
 // ---------------------------------------------------------------------------
 
 const DEC_VOCAB: usize = 64;
@@ -497,6 +497,10 @@ fn gpt2() {
         "n_layer": 2, "n_head": 2, "n_embd": h, "n_positions": ctx, "n_ctx": ctx,
         "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5});
     let hub = decoder_repo("enc_gpt2", cfg, &w);
+    // The reference (`ln_decoder.rs` host forward) is deleted: the golden is frozen.
+    if writing() {
+        return;
+    }
     classify_golden("enc_gpt2", &hub, TEXT_AND_PAIR, TOL);
 }
 
@@ -529,6 +533,10 @@ fn opt(case: &str, pre_ln: bool, act: &str, seed: u64) {
         "do_layer_norm_before": pre_ln, "activation_function": act, "enable_bias": true,
         "layer_norm_elementwise_affine": true});
     let hub = decoder_repo(case, cfg, &w);
+    // The reference (`ln_decoder.rs` host forward) is deleted: the golden is frozen.
+    if writing() {
+        return;
+    }
     classify_golden(case, &hub, TEXT_AND_PAIR, TOL);
 }
 
@@ -768,14 +776,19 @@ fn smolvlm_checkpoint(dir: &Path) {
     w.write(&dir.join("model.safetensors"));
 }
 
-/// One `<image>` prompt through `load_native` → `prepare` (tiles, SigLIP, connector,
-/// placeholder expansion) → prefill logits, then three teacher-forced decode steps.
+/// One `<image>` prompt through the `idefics3` spec (`runtime::lm::load`) → `prepare` (tiles,
+/// SigLIP tower, connector, placeholder expansion) → prefill logits, then three teacher-forced
+/// decode steps. runner: the golden was written by the deleted-path `model::idefics3` engine.
 fn smolvlm(case: &str, width: usize, height: usize) {
     let dir = fixture_dir(case);
     smolvlm_checkpoint(&dir);
     let data = (0..width * height * 3).map(|i| (i * 37 % 251) as u8).collect();
     let png = ImageBuffer::from_rgb(width, height, data).unwrap().to_png();
     let art = artifacts(&dir, "gibbs-golden/smolvlm", "model.safetensors");
+    // The reference (the old Idefics3 engine) is deleted from this path: the golden is frozen.
+    if writing() {
+        return;
+    }
     // Pin the bit-exact load: the settings-file re-encode policy (and its cache) must not change
     // the Metal weights. ponytail: process-global, set (never cleared) by every load_native case.
     set_reencode_override(Some(ReencodeConfig {
@@ -784,8 +797,8 @@ fn smolvlm(case: &str, width: usize, height: usize) {
         ..Default::default()
     }));
     golden(case, TOL, |dev| {
-        let m = load_native(&art, dev)
-            .expect("idefics3 is a native architecture")
+        let reg = gibbs_engine::arch::registry().unwrap();
+        let m = gibbs_engine::runtime::lm::load(&art, reg, Some("idefics3"), dev.into())
             .unwrap_or_else(|e| panic!("{case}: {e}"));
         assert_eq!(m.device(), dev, "{case}");
         let (ids, mut st) = m

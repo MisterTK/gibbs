@@ -25,7 +25,7 @@
 //! `prepare`, and its placeholder expanded.
 
 use crate::arch::build::{build, InputPlan, Instance, ShapeCache};
-use crate::arch::expr::Val;
+use crate::arch::expr::{Env, Val};
 use crate::arch::gen::{generate, GenData};
 use crate::arch::load::Model;
 use crate::arch::Registry;
@@ -301,6 +301,28 @@ impl SpecLm {
         let towers = Towers::new(mode);
         let mut used: HashSet<String> = decode.weights.iter().cloned().collect();
         used.extend(crate::runtime::draft::drafter_weights(&model)?);
+        // `runtime.seqcls.head`: a checkpoint with the score head's weights (a
+        // `*ForSequenceClassification` export) reads them through that instance, which runs on
+        // this program (`run_head`), so they load with it; plain LM exports do not build it.
+        let mut program_weights = decode.weights.clone();
+        let mut seqcls_err = None;
+        if let Some(h) = model.spec.runtime["seqcls"]["head"].as_str() {
+            for head in [h, "hidden"] {
+                let hv = vars(1, head, &[], 0);
+                match shapes.get(&hv, || build(&model.spec, TEXT, &model.env, &model.store, &hv)) {
+                    Ok(i) => {
+                        for w in &i.weights {
+                            if model.env.has(w) && used.insert(w.clone()) {
+                                program_weights.push(w.clone());
+                            }
+                        }
+                    }
+                    // Named with the unread-tensor error below when the checkpoint has a head.
+                    Err(e) if head == h => seqcls_err = Some(e),
+                    Err(_) => {}
+                }
+            }
+        }
         let mut off = HashMap::new();
         for (name, s) in &media {
             let probe = media::measure(&s.preprocess, &media::probe_item(&s.preprocess))
@@ -313,17 +335,18 @@ impl SpecLm {
                 }
             }
         }
-        let unused = model.store.unconsumed(&used, &model.spec.ignore);
+        let unused = model.store.unconsumed(&used, &model.ignore);
         if !unused.is_empty() {
             // A failed tower's weights stay unread: its probe error is the real cause.
-            let why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
+            let mut why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
+            why.extend(seqcls_err.map(|e| format!("seqcls head: {e}")));
             return Err(format!(
                 "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}{}",
                 unused.join(", "),
                 if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
             ));
         }
-        let weights = model.store.materialize(&decode.weights)?;
+        let weights = model.store.materialize(&program_weights)?;
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
         let streams = recurrent.is_empty()
@@ -548,7 +571,7 @@ impl SpecLm {
                 .collect::<Result<Vec<_>, _>>()?;
             let greedy = mode == Mode::Greedy && e == stop && stop == end && li == 0;
             // The compiled program is the decode instance; every other shape runs reshaped.
-            let out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
+            let mut out = if rows == 1 && head == "last" && seq.taps.is_empty() && nm == 0 {
                 match greedy {
                     true => p.run_greedy(inputs, self.tok.vocab_size())?,
                     false => p.run(inputs)?,
@@ -556,10 +579,11 @@ impl SpecLm {
             } else {
                 p.run_reshaped(&inst.graph, inputs)?
             };
-            match out.get(li) {
+            // Moved out, not copied: a vocabulary row per decode token.
+            match out.get_mut(li).map(|t| std::mem::replace(t, Tensor::U32(Vec::new()))) {
                 Some(Tensor::U32(t)) => picked = t.first().copied(),
-                Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(v),
-                Some(Tensor::F32(v)) => logits.clone_from(v),
+                Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(&v),
+                Some(Tensor::F32(v)) => logits = v,
                 _ => return Err("the text component returned no f32 logits".into()),
             }
             if !seq.taps.is_empty() {
@@ -647,6 +671,16 @@ impl SpecLm {
         let r = run();
         p.state = saved;
         r
+    }
+
+    /// Row width of output `out` of the one-row `head` instance.
+    pub fn output_width(&self, head: &str, out: &str) -> Result<usize, String> {
+        let inst = self.instance(1, head, &[], 0)?;
+        let i = inst
+            .output_index(out)
+            .ok_or_else(|| format!("the `{head}` instance has no output `{out}`"))?;
+        let v = &inst.graph.values[inst.graph.outputs[i].0 as usize];
+        v.shape.last().copied().ok_or_else(|| format!("output `{out}` has no shape"))
     }
 
     /// Start position of the last pass [`Self::run_head`] makes over `n` ids.
@@ -1248,7 +1282,7 @@ mod tests {
     }
 
     /// A toy LM with an audio modality: raw 4-sample frames through a linear tower (output 0 the
-    /// soft rows, output `extra` added after attention), rows scattered after the embedding, the
+    /// soft rows, output `extra` added to them before attention), rows scattered after the embedding, the
     /// item one bidirectional block; an `image` modality switched off by `when`.
     const MEDIA_SPEC: &str = r#"{
       family: "toym", pipeline: "causal_lm",
@@ -1286,6 +1320,11 @@ mod tests {
           body: [
             {op: "Embedding", in: ["w:emb", "i:token_ids"], out: "x"},
             {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", when: "first(media, 0) > 0"},
+            {block: [
+              {op: "Unary", args: {kind: {Scale: 0.0}}, in: ["x"], out: "z"},
+              {op: "Scatter", args: {axis: 0}, in: ["z", "i:media_index", "i:extra"], out: "z"},
+              {op: "Binary", args: {kind: "Add"}, in: ["x", "z"], out: "x"},
+            ], when: "first(media, 0) > 0"},
             {state: "kv.k", shape: ["ctx", "kv_heads*hd"]},
             {state: "kv.v", shape: ["ctx", "kv_heads*hd"]},
             {op: "RmsNorm", args: {eps: 1e-5}, in: ["x", "c:ones"], out: "n"},
@@ -1301,11 +1340,6 @@ mod tests {
             {op: "Linear", in: ["a", "w:o"], out: "a"},
             {op: "Unary", args: {kind: {Scale: 50.0}}, in: ["a"], out: "a"},
             {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x"},
-            {block: [
-              {op: "Unary", args: {kind: {Scale: 0.0}}, in: ["x"], out: "z"},
-              {op: "Scatter", args: {axis: 0}, in: ["z", "i:media_index", "i:extra"], out: "z"},
-              {op: "Binary", args: {kind: "Add"}, in: ["x", "z"], out: "x"},
-            ], when: "first(media, 0) > 0"},
             {op: "Slice", args: {axis: 0, start: "rows - 1", end: "rows"}, in: ["x"], out: "x", when: "head == 'last' && rows > 1"},
             {op: "Linear", in: ["x", "w:emb"], out: "logits"},
           ],
@@ -1323,9 +1357,9 @@ mod tests {
         SpecLm::new(m, PlacementMode::Pin(dev)).unwrap()
     }
 
-    /// 16 kHz mono 16-bit WAV of `n` non-silent samples.
+    /// 16 kHz mono 16-bit WAV of `n` loud (near full-scale) samples.
     fn wav(n: usize) -> Vec<u8> {
-        let pcm: Vec<u8> = (0..n).flat_map(|i| (((i * 7919) % 2000) as i16 - 1000).to_le_bytes()).collect();
+        let pcm: Vec<u8> = (0..n).flat_map(|i| (((i * 7919) % 60000) as i32 - 30000).to_le_bytes()[..2].to_vec()).collect();
         let mut b = b"RIFF".to_vec();
         b.extend((36 + pcm.len() as u32).to_le_bytes());
         b.extend(b"WAVEfmt ");
@@ -1367,6 +1401,13 @@ mod tests {
                 SpecLm::seq(&mut t).unwrap().blocks = vec![3..9];
                 let plain = oneshot.forward(&ids, 0, &mut t).unwrap();
                 assert!(plain.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "media rows must matter");
+                // The tower's second output reaches the logits through its rows.
+                let (_, mut z) = oneshot.prepare(prompt.to_vec(), &clip).unwrap();
+                let s = SpecLm::seq(&mut z).unwrap();
+                let extra = s.rows.iter_mut().find(|(n, _, _)| n == "extra").expect("extra rows");
+                extra.2.fill(0.0);
+                let lz = oneshot.forward(&ids, 0, &mut z).unwrap();
+                assert!(lz.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "the extra output must matter");
             }
         }
     }

@@ -34,6 +34,55 @@ fn classifier_on_gpu(name: &str, (cfg, ts): (serde_json::Value, synth::Ts)) {
     }
 }
 
+/// A `tests/golden` fixture checkpoint (`target/golden-fixtures/<fixture>`, written by the golden
+/// tests) through the spec runtime on Metal: prepare `ids` with `media`, prefill, two decode
+/// steps; the tripwire is armed, so any host compute panics.
+fn spec_fixture_on_gpu(name: &str, fixture: &str, ids: &[u32], media: &[gibbs_engine::model::native::MediaInput]) {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/golden-fixtures").join(fixture);
+    if !dir.join("config.json").exists() {
+        println!("SKIP {name}: {} absent (run `cargo test --test golden gemma` first)", dir.display());
+        return;
+    }
+    let a = gibbs_engine::model::hub::ModelArtifacts {
+        model_id: format!("golden/{fixture}"),
+        local_dir: Some(dir.clone()),
+        config_path: Some(dir.join("config.json")),
+        tokenizer_path: Some(dir.join("tokenizer.json")),
+        weights_path: Some(dir.join("model.safetensors")),
+        is_cached: true,
+        ..Default::default()
+    };
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let lm = gibbs_engine::runtime::lm::load(&a, reg, None, PlacementMode::Pin(Device::Metal))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(lm.device(), Device::Metal, "{name}");
+    let (ids, mut st) = lm.prepare(ids.to_vec(), media).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut l = lm.forward(&ids, 0, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+    for q in 0..2 {
+        assert!(l.iter().all(|v| v.is_finite()), "{name}: non-finite logits");
+        l = lm.forward(&[1], ids.len() + q, &mut st).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}
+
+/// 16 kHz mono 16-bit WAV: 0.5 s of a 440 Hz tone.
+fn tone_wav() -> Vec<u8> {
+    let pcm: Vec<u8> = (0..8000)
+        .flat_map(|i| (((i as f32 / 16000.0 * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16).to_le_bytes())
+        .collect();
+    let mut b = b"RIFF".to_vec();
+    b.extend((36 + pcm.len() as u32).to_le_bytes());
+    b.extend(b"WAVEfmt ");
+    b.extend(16u32.to_le_bytes());
+    b.extend([1, 0, 1, 0]);
+    b.extend(16_000u32.to_le_bytes());
+    b.extend(32_000u32.to_le_bytes());
+    b.extend([2, 0, 16, 0]);
+    b.extend(b"data");
+    b.extend((pcm.len() as u32).to_le_bytes());
+    b.extend(pcm);
+    b
+}
+
 fn metal_present() -> bool {
     available_devices().contains(&Device::Metal)
 }
@@ -386,11 +435,9 @@ fn gpu_fixture(f: Family) {
             run_on_gpu("GraphLm", g, w);
         }
         Family::Gemma4 => {
-            let (g, w) = gibbs_engine::model::gemma4::tiny_decode_graph().expect("tiny gemma4 graph");
-            run_on_gpu("Gemma4", g, w);
+            spec_fixture_on_gpu("Gemma4", "gemma_gemma4_ple", &[2, 10, 11, 12], &[]);
             // Sparse layers: router, TopK, GatherCols and the banked expert GEMVs, all on Metal.
-            let (g, w) = gibbs_engine::model::gemma4::tiny_moe_decode_graph().expect("tiny gemma4 MoE graph");
-            run_on_gpu("Gemma4 MoE", g, w);
+            spec_fixture_on_gpu("Gemma4 MoE", "gemma_gemma4_moe", &[2, 10, 11, 12], &[]);
         }
         Family::Hybrid => {
             // Hybrid decoder + MTP drafter, routed experts, image prompt (vision tower), all via
@@ -436,7 +483,8 @@ fn gpu_fixture(f: Family) {
             classifier_on_gpu("deberta-v1", synth::deberta_v1());
         }
         Family::ClassifierDecoder => {
-            gibbs_engine::model::classifier::gpu_fixture().expect("decoder seq-cls fixture")
+            classifier_on_gpu("llama-seqcls", synth::llama_seqcls());
+            classifier_on_gpu("gpt-neox-seqcls", synth::gpt_neox_seqcls());
         }
         Family::Idefics3Siglip => {
             let (g, w) = gibbs_engine::model::siglip::tiny::graph();
@@ -446,13 +494,14 @@ fn gpu_fixture(f: Family) {
             scatter_fixture("Idefics3Siglip");
         }
         Family::Gemma4Media => {
-            let (g, w) = gibbs_engine::model::gemma4::tiny_vision_graph();
-            run_on_gpu("Gemma4Media vision", g, w);
+            let img = gibbs_engine::model::image::ImageBuffer::new(32, 24).to_png();
+            let media = [gibbs_engine::model::native::MediaInput::Image(img)];
+            spec_fixture_on_gpu("Gemma4Media vision", "gemma_gemma4_image_prefill", &[2, 10, 120, 12], &media);
             scatter_fixture("Gemma4Media");
         }
         Family::Audio => {
-            let (g, w) = gibbs_engine::model::gemma4::tiny_audio_wav_graph();
-            run_on_gpu("Audio conformer", g, w);
+            let media = [gibbs_engine::model::native::MediaInput::Audio(tone_wav())];
+            spec_fixture_on_gpu("Audio conformer", "gemma_gemma4_audio", &[2, 10, 121, 12], &media);
             scatter_fixture("Audio");
         }
         // The spec FLUX / FLUX.2 pipelines: golden `diffa::flux1_pipeline` / `diffa::klein_pipeline`
@@ -469,7 +518,7 @@ fn gpu_fixture(f: Family) {
             gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
         }
         Family::Vae => {
-            // SD and Qwen-Image (x2) VAEs decode as Metal programs.
+            // The SD VAE decodes as a Metal program (the spec VAEs: the diffusion goldens).
             gibbs_engine::model::diff_fixtures::tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
         }
     }

@@ -8,7 +8,6 @@ use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::runtime::encoder::system1::JevSystem1Model;
-use crate::model::text_to_image::load_image_model;
 use crate::model::weight_format::{
     load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
     ReencodePolicy,
@@ -133,10 +132,7 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
         }
         Some(_) => {}
         None => {
-            // legacy: until the remaining image families' phases (`load_image_model`).
-            let img = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement)
-                .or_else(|| load_image_model(&artifacts, hub));
-            if let Some(img) = img {
+            if let Some(img) = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement) {
                 return img.map(Loaded::Image);
             }
         }
@@ -169,6 +165,8 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
     // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
+    // `runtime.cutover: true` (legacy: until every causal-LM phase lands): the family's old
+    // loader is gone, so its spec serves default loads, not only `GIBBS_SPEC_LM=1` ones.
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
         let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
@@ -249,7 +247,7 @@ pub fn dump(artifacts: &ModelArtifacts, family: Option<&str>) -> Result<String, 
         "spec": reg.merged(&m.spec.family, &m.ckpt.sig)?,
         "config": config,
         "tensors": m.renames,
-        "unconsumed": m.store.unconsumed(&used, &m.spec.ignore),
+        "unconsumed": m.store.unconsumed(&used, &m.ignore),
         "unbuilt_components": unbuilt,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())

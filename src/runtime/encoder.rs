@@ -107,7 +107,7 @@ impl SpecEncoder {
         let v = vars(1, head);
         let first = shapes.get(&v, || build(&model.spec, COMPONENT, &model.env, &model.store, &v))?;
         let used: HashSet<String> = first.weights.iter().cloned().collect();
-        let unused = model.store.unconsumed(&used, &model.spec.ignore);
+        let unused = model.store.unconsumed(&used, &model.ignore);
         if !unused.is_empty() {
             return Err(format!(
                 "{fam}: checkpoint tensors the `{head}` encoder never reads (list deliberate ones in `ignore`): {}",

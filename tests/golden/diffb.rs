@@ -1,18 +1,28 @@
 //! Diffusion/video goldens, group B: Z-Image, Qwen-Image 1 / 2.1, Krea 2, LTX-Video transformers,
 //! the Qwen-Image / Qwen-Image 2.1 / LTX VAE decoders and the ModelScope UNet3D. Each case writes a
-//! tiny random checkpoint, loads it with the family's loader and records one forward: the host
-//! forward on `Device::Cpu`, the Metal graph program on `Device::Metal`.
+//! tiny random checkpoint, runs its family spec's networks (or the whole pipeline through the
+//! public image loaders) and records the outputs: the graph CPU executor on `Device::Cpu`, the
+//! Metal program on `Device::Metal`.
 
 use crate::util::*;
 use gibbs_engine::hardware::Device;
-use gibbs_engine::model::flux::{Loras, Store};
-use gibbs_engine::model::weights::Weights as Mw;
 use serde_json::{json, Value};
 use gibbs_engine::arch::expr::Val;
 use gibbs_engine::graph::Tensor;
 use gibbs_engine::runtime::diffusion::{unconsumed, Net};
 
 type Spec = Vec<(String, Vec<usize>)>;
+
+/// [`golden`] for cases whose JSON was written by an implementation since deleted (the legacy
+/// Z-Image / Qwen-Image / Krea 2 / Qwen VAE code): checked, never rewritten (`GIBBS_GOLDEN_WRITE`
+/// skips them).
+fn frozen(case: &str, tol: Tol, run: impl Fn(Device) -> Out) {
+    if writing() {
+        eprintln!("golden: {case} is frozen (its oracle implementation is deleted); not rewritten");
+        return;
+    }
+    golden(case, tol, run);
+}
 
 fn sp(s: &mut Spec, name: impl Into<String>, shape: &[usize]) {
     s.push((name.into(), shape.to_vec()));
@@ -60,10 +70,6 @@ fn rnd(seed: u64, n: usize, scale: f32) -> Vec<f32> {
 /// Every k-th value, at most 4096.
 fn sub(v: &[f32]) -> Vec<f32> {
     v.iter().step_by(v.len().div_ceil(4096)).copied().collect()
-}
-
-fn metal(d: Device) -> bool {
-    matches!(d, Device::Metal)
 }
 
 /// Per-channel latent statistics `(mean, std)`.
@@ -206,37 +212,11 @@ fn zimage_fixture(case: &str) -> std::path::PathBuf {
 
 #[test]
 fn zimage() {
-    use gibbs_engine::model::zimage::ZDit;
     const CAP: usize = 48;
     const IN: usize = 4;
-    let dit = ZDit::load(&zimage_fixture("diffb_zimage")).expect("Z-Image fixture");
-    // runner: internal gibbs_engine::model::zimage::ZDit::{forward, forward_gpu}
-    golden("diffb_zimage", TOL, |dev| {
-        let mut o = Out::default();
-        for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
-            let lat = rnd(10 + k as u64, IN * h * w, 1.0);
-            let cap = rnd(20 + k as u64, n_cap * CAP, 1.0);
-            let y = if metal(dev) {
-                dit.forward_gpu(&lat, h, w, sigma, &cap, n_cap).unwrap()
-            } else {
-                dit.forward(&lat, h, w, sigma, &cap, n_cap)
-            };
-            o.f(format!("out_{h}x{w}_cap{n_cap}_s{sigma}"), &y);
-        }
-        o
-    });
-}
-
-/// The `zimage` spec's `denoiser` on the same fixture.
-#[test]
-fn zimage_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    const CAP: usize = 48;
-    const IN: usize = 4;
-    let dir = zimage_fixture("diffb_zimage_spec");
-    golden("diffb_zimage", TOL, |dev| {
+    let dir = zimage_fixture("diffb_zimage");
+    // runner: arch::testing::Runner, spec `zimage` component `denoiser`
+    frozen("diffb_zimage", TOL, |dev| {
         let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev);
         let mut o = Out::default();
         for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
@@ -256,26 +236,17 @@ fn zimage_spec() {
 /// axes [8, 12, 12], 64 packed latent features, text width 48; an odd 5x7 patch grid, 21 tokens.
 #[test]
 fn qwen_image_v1() {
-    qwen_image_v1_run(false)
+    qwen_image_v1_run()
 }
 
-/// The `qwen_image` spec's `denoiser` on the same fixture.
-#[test]
-fn qwen_image_v1_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    qwen_image_v1_run(true)
-}
-
-fn qwen_image_v1_run(spec: bool) {
-    use gibbs_engine::model::qwen_image_v1::{positions, Dit, Rope};
+/// Qwen-Image 1 MMDiT `diffusion_pytorch_model.safetensors` + config in `dir`: 2 blocks, dim 64 / 2
+/// heads, 64 packed latent features, text width 48.
+fn write_qwen_image_v1(dir: &std::path::Path) -> Value {
     const D: usize = 64;
     const HD: usize = 32;
     const FF: usize = 128;
     const TW: usize = 48;
     const IN: usize = 64;
-    let dir = fixture_dir(if spec { "diffb_qwen_image_v1_spec" } else { "diffb_qwen_image_v1" });
     let mut s = Spec::new();
     lin(&mut s, "img_in", D, IN, true);
     sp(&mut s, "txt_norm.weight", &[TW]);
@@ -314,32 +285,28 @@ fn qwen_image_v1_run(spec: bool) {
         "joint_attention_dim": TW, "guidance_embeds": false, "axes_dims_rope": [8, 12, 12]
     });
     write_json(&dir.join("config.json"), &cfg);
-    let dit = (!spec).then(|| Dit::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 1 fixture"));
+    cfg
+}
+
+fn qwen_image_v1_run() {
+    const TW: usize = 48;
+    const IN: usize = 64;
+    let dir = fixture_dir("diffb_qwen_image_v1");
+    write_qwen_image_v1(&dir);
     let (ph, pw, nt) = (5usize, 7usize, 21usize);
     let lat = rnd(11, ph * pw * IN, 1.0);
     let txt = rnd(12, nt * TW, 1.0);
-    // runner: internal gibbs_engine::model::qwen_image_v1::Dit::{project_text, forward, forward_gpu}
-    golden("diffb_qwen_image_v1", TOL, |dev| {
+    // runner: arch::testing::Runner, spec `qwen_image` component `denoiser`
+    frozen("diffb_qwen_image_v1", TOL, |dev| {
         let mut o = Out::default();
-        let mut r = spec.then(|| spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev));
+        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", None, dev);
         for sigma in [0.8f32, 0.15] {
-            let y = if let Some(r) = &mut r {
-                r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
-                let vars = [("h", num(2 * ph)), ("w", num(2 * pw)), ("nt", num(nt))];
-                run1(r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out")
-            } else if metal(dev) {
-                let dit = dit.as_ref().unwrap();
-                dit.forward_gpu(&dit.gpu, &lat, &txt, ph, pw, sigma).unwrap()
-            } else {
-                let dit = dit.as_ref().unwrap();
-                let rope = Rope::new(&positions(nt, ph, pw), &dit.axes);
-                dit.forward(&lat, &dit.project_text(&txt, nt), &rope, sigma)
-            };
+            r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+            let vars = [("h", num(2 * ph)), ("w", num(2 * pw)), ("nt", num(nt))];
+            let y = run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out");
             o.f(format!("out_s{sigma}"), &y);
         }
-        if let Some(r) = &r {
-            assert_consumed(r);
-        }
+        assert_consumed(&r);
         o
     });
 }
@@ -349,20 +316,12 @@ fn qwen_image_v1_run(spec: bool) {
 /// with the SwiGLU's gate/up fused (`img_mlp.gate_up`, as some GGUFs store them) give `fused_*`.
 #[test]
 fn qwen_image21() {
-    qwen_image21_run(false)
+    qwen_image21_run()
 }
 
-/// The `qwen_image21` spec's `denoiser` on the same fixtures (split and fused).
-#[test]
-fn qwen_image21_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    qwen_image21_run(true)
-}
-
-fn qwen_image21_run(spec: bool) {
-    use gibbs_engine::model::qwen_image21::{t2i_positions, Dit21, Rope};
+/// Qwen-Image 2.1 single-stream DiT tensors (split and gate/up-fused) and config: 2 blocks, dim 64 /
+/// 2 heads, 64 latent features, text width 48.
+fn qwen_image21_fixture() -> (Vec<T>, Vec<T>, Value) {
     const D: usize = 64;
     const HD: usize = 32;
     const FF: usize = 128;
@@ -415,45 +374,35 @@ fn qwen_image21_run(spec: bool) {
         "num_layers": 2, "attention_head_dim": HD, "num_attention_heads": 2,
         "joint_attention_dim": TW, "causal_condition": true, "axes_dims_rope": [8, 12, 12]
     });
-    let sfx = if spec { "_spec" } else { "" };
+    (split, fused, cfg)
+}
+
+fn qwen_image21_run() {
+    const TW: usize = 48;
+    const IN: usize = 64;
+    let (split, fused, cfg) = qwen_image21_fixture();
     let load = |case: &str, t: &[T]| {
-        let dir = fixture_dir(&format!("{case}{sfx}"));
-        let file = dir.join("diffusion_pytorch_model.safetensors");
-        write_st(&file, t);
+        let dir = fixture_dir(case);
+        write_st(&dir.join("diffusion_pytorch_model.safetensors"), t);
         write_json(&dir.join("config.json"), &cfg);
-        let dit = (!spec).then(|| Dit21::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 2.1 fixture"));
-        (dir, dit)
+        dir
     };
-    let dits = [
-        ("split", load("diffb_qwen_image21", &split)),
-        ("fused", load("diffb_qwen_image21_fused", &fused)),
-    ];
+    let dirs = [("split", load("diffb_qwen_image21", &split)), ("fused", load("diffb_qwen_image21_fused", &fused))];
     let (h, w, nt) = (5usize, 7usize, 21usize);
     let lat = rnd(11, h * w * IN, 1.0);
     let txt = rnd(12, nt * TW, 1.0);
-    // runner: internal gibbs_engine::model::qwen_image21::Dit21::{project_text, forward, forward_gpu}
-    golden("diffb_qwen_image21", TOL, |dev| {
+    // runner: arch::testing::Runner, spec `qwen_image21` component `denoiser`
+    frozen("diffb_qwen_image21", TOL, |dev| {
         let mut o = Out::default();
-        for (name, (dir, dit)) in &dits {
-            let mut r = spec.then(|| spec_runner(dir, "diffusion_pytorch_model.safetensors", None, dev));
+        for (name, dir) in &dirs {
+            let mut r = spec_runner(dir, "diffusion_pytorch_model.safetensors", None, dev);
             for sigma in [0.8f32, 0.15] {
-                let y = if let Some(r) = &mut r {
-                    r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
-                    let vars = [("h", num(h)), ("w", num(w)), ("nt", num(nt))];
-                    run1(r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out")
-                } else if metal(dev) {
-                    let dit = dit.as_ref().unwrap();
-                    dit.forward_gpu(&dit.gpu, &lat, &txt, h, w, sigma).unwrap()
-                } else {
-                    let dit = dit.as_ref().unwrap();
-                    let rope = Rope::new(&t2i_positions(nt, h, w), &dit.axes);
-                    dit.forward(&lat, &dit.project_text(&txt, nt), &rope, sigma)
-                };
+                r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+                let vars = [("h", num(h)), ("w", num(w)), ("nt", num(nt))];
+                let y = run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(txt.clone())], "out");
                 o.f(format!("{name}_s{sigma}"), &y);
             }
-            if let Some(r) = &r {
-                assert_consumed(r);
-            }
+            assert_consumed(&r);
         }
         o
     });
@@ -463,16 +412,7 @@ fn qwen_image21_run(spec: bool) {
 /// taps of width 32) and the 2-block DiT (dim 64, 4 query / 2 kv heads of 16, 16 latent channels).
 #[test]
 fn krea2() {
-    krea2_run(false)
-}
-
-/// The `krea2` spec's `fuse` + `denoiser` on the same fixture.
-#[test]
-fn krea2_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    krea2_run(true)
+    krea2_run()
 }
 
 /// The tiny Krea 2 checkpoint `krea2_tiny.safetensors` in fixture dir `case`.
@@ -523,49 +463,28 @@ fn krea2_fixture(case: &str) -> std::path::PathBuf {
     dir
 }
 
-fn krea2_run(spec: bool) {
-    use gibbs_engine::model::krea2::Dit;
+fn krea2_run() {
     let td = 32usize;
-    let dir = krea2_fixture(if spec { "diffb_krea2_spec" } else { "diffb_krea2" });
-    let file = dir.join("krea2_tiny.safetensors");
-    let dit = (!spec).then(|| Dit::load(&file, &mut Loras::default(), &Value::Null).expect("Krea 2 fixture"));
+    let dir = krea2_fixture("diffb_krea2");
     let n = 24usize;
     let taps: Vec<Vec<f32>> = (0..12).map(|l| rnd(100 + l, n * td, 1.0)).collect();
     let (h, w) = (12usize, 12usize);
     let lat = rnd(7, 16 * h * w, 1.0);
-    // runner: internal gibbs_engine::model::krea2::Dit::{fuse, forward, fuse_gpu, forward_gpu}
-    golden("diffb_krea2", TOL, |dev| {
+    // runner: arch::testing::Runner, spec `krea2` components `fuse` + `denoiser` (2x2-packed latents)
+    frozen("diffb_krea2", TOL, |dev| {
         let mut o = Out::default();
-        if spec {
-            let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), dev);
-            // Taps stacked per token, layer-minor (the runtime's context layout).
-            let stacked: Vec<f32> = (0..n).flat_map(|t| taps.iter().flat_map(move |l| l[t * td..][..td].iter().copied())).collect();
-            let ctx = run1(&mut r, "fuse", &[("nt", num(n))], vec![F32(stacked)], "out");
-            o.f("fuse", &ctx);
-            for sigma in [0.8f32, 0.3] {
-                r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
-                let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
-                let y = run1(&mut r, "denoiser", &vars, vec![F32(pack2x2(&lat, 16, h, w, false)), F32(ctx.clone())], "out");
-                o.f(format!("forward_s{sigma}"), &pack2x2(&y, 16, h, w, true));
-            }
-            assert_consumed(&r);
-            return o;
-        }
-        let dit = dit.as_ref().unwrap();
-        let ctx = if metal(dev) {
-            dit.fuse_gpu(&dit.gpu_fuse, &taps, n).unwrap()
-        } else {
-            dit.fuse(&taps, n)
-        };
+        let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), dev);
+        // Taps stacked per token, layer-minor (the runtime's context layout).
+        let stacked: Vec<f32> = (0..n).flat_map(|t| taps.iter().flat_map(move |l| l[t * td..][..td].iter().copied())).collect();
+        let ctx = run1(&mut r, "fuse", &[("nt", num(n))], vec![F32(stacked)], "out");
         o.f("fuse", &ctx);
         for sigma in [0.8f32, 0.3] {
-            let y = if metal(dev) {
-                dit.forward_gpu(&dit.gpu, &lat, h, w, sigma, &ctx).unwrap()
-            } else {
-                dit.forward(&lat, h, w, sigma, &ctx)
-            };
-            o.f(format!("forward_s{sigma}"), &y);
+            r.step = vec![("sigma".into(), Val::Num(sigma as f64))];
+            let vars = [("h", num(h)), ("w", num(w)), ("nt", num(n))];
+            let y = run1(&mut r, "denoiser", &vars, vec![F32(pack2x2(&lat, 16, h, w, false)), F32(ctx.clone())], "out");
+            o.f(format!("forward_s{sigma}"), &pack2x2(&y, 16, h, w, true));
         }
+        assert_consumed(&r);
         o
     });
 }
@@ -631,23 +550,12 @@ fn ltx() {
 /// 16 latent channels: `latents * std + mean` of a 3x2 latent -> `[3, 24, 16]` before clamping.
 #[test]
 fn qwen_vae() {
-    qwen_vae_run(false)
+    qwen_vae_run()
 }
 
-/// The `qwen_vae` spec's `decoder` on the same fixture.
-#[test]
-fn qwen_vae_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    qwen_vae_run(true)
-}
-
-fn qwen_vae_run(spec: bool) {
-    use gibbs_engine::model::qwen_vae::QwenVae;
-    const Z: usize = 16;
-    let (base, mult) = (4usize, [1usize, 2, 4, 4]);
-    let dir = fixture_dir(if spec { "diffb_qwen_vae_spec" } else { "diffb_qwen_vae" });
+/// Qwen-Image VAE decoder (original Wan names) `qwen_image_vae.safetensors` + config in `dir`, widths
+/// `base * mult`, `z` latent channels; returns the latent (mean, std).
+fn write_qwen_vae(dir: &std::path::Path, base: usize, mult: [usize; 4], z: usize) -> (Vec<f32>, Vec<f32>) {
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -667,8 +575,8 @@ fn qwen_vae_run(spec: bool) {
         .map(|m| base * m)
         .collect();
     let mut s = Spec::new();
-    conv(&mut s, "conv2", Z, Z, 1);
-    conv(&mut s, "decoder.conv1", Z, dims[0], 3);
+    conv(&mut s, "conv2", z, z, 1);
+    conv(&mut s, "decoder.conv1", z, dims[0], 3);
     res(&mut s, "decoder.middle.0", dims[0], dims[0]);
     let c = dims[0];
     sp(&mut s, "decoder.middle.1.norm.gamma", &[c]);
@@ -686,39 +594,34 @@ fn qwen_vae_run(spec: bool) {
             conv(&mut s, &p, cout, cout / 2, 3);
         }
     }
-    sp(&mut s, "decoder.head.0.gamma", &[dims[4]]);
-    conv(&mut s, "decoder.head.2", dims[4], 3, 3);
+    sp(&mut s, "decoder.head.0.gamma", &[dims[mult.len()]]);
+    conv(&mut s, "decoder.head.2", dims[mult.len()], 3, 3);
     let file = dir.join("qwen_image_vae.safetensors");
     write_st(&file, &synth(6, &s));
-    let (mean, std) = stats(60, Z);
+    let (mean, std) = stats(60, z);
     write_json(
         &dir.join("config.json"),
         &json!({
-            "_class_name": "AutoencoderKLQwenImage", "base_dim": base, "z_dim": Z,
+            "_class_name": "AutoencoderKLQwenImage", "base_dim": base, "z_dim": z,
             "dim_mult": mult, "num_res_blocks": 2, "attn_scales": [],
             "latents_mean": mean, "latents_std": std
         }),
     );
-    // runner: internal gibbs_engine::model::qwen_vae::QwenVae::{open, decode_cpu, decode_gpu}
-    // (`QwenVae::load` only accepts the 96-wide production config).
-    let vae = (!spec).then(|| {
-        QwenVae::open(&Mw::open(&file).unwrap(), mean.clone(), std.clone(), base).expect("Qwen VAE fixture")
-    });
+    (mean, std)
+}
+
+fn qwen_vae_run() {
+    const Z: usize = 16;
+    let (base, mult) = (4usize, [1usize, 2, 4, 4]);
+    let dir = fixture_dir("diffb_qwen_vae");
+    let (mean, std) = write_qwen_vae(&dir, base, mult, Z);
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(13, Z * h * w, 1.0), h * w, &mean, &std);
-    golden("diffb_qwen_vae", TOL, |dev| {
-        let vae = vae.as_ref();
-        let y = if spec {
-            let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
-            let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
-            assert_consumed(&r);
-            y
-        } else if metal(dev) {
-            let vae = vae.unwrap();
-            vae.decode_gpu(&z, h, w).unwrap()
-        } else {
-            vae.unwrap().decode_cpu(&z, h, w)
-        };
+    // runner: arch::testing::Runner, spec `qwen_vae` component `decoder`
+    frozen("diffb_qwen_vae", TOL, |dev| {
+        let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
+        let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+        assert_consumed(&r);
         let mut o = Out::default();
         o.f("decode_3x2", &sub(&y));
         o
@@ -729,22 +632,13 @@ fn qwen_vae_run(spec: bool) {
 /// 6 latent channels, temporal flags [true, false, true]: a 3x2 latent -> RGBA `[4, 24, 16]`.
 #[test]
 fn qwen_vae21() {
-    qwen_vae21_run(false)
+    qwen_vae21_run()
 }
 
-/// The `qwen_vae21` spec's `decoder` on the same fixture.
-#[test]
-fn qwen_vae21_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    qwen_vae21_run(true)
-}
-
-fn qwen_vae21_run(spec: bool) {
-    use gibbs_engine::model::qwen_vae21::QwenVae21;
-    let (mult, base, zc) = ([1usize, 2, 2, 4], 4usize, 6usize);
-    let dir = fixture_dir(if spec { "diffb_qwen_vae21_spec" } else { "diffb_qwen_vae21" });
+/// Qwen-Image 2.1 VAE decoder (diffusers names, residual, unpatched) in `dir`: widths
+/// `base * mult`, `zc` latent channels, `temporal` flags (one per downsampling level); returns the
+/// latent (mean, std).
+fn write_qwen_vae21(dir: &std::path::Path, mult: &[usize], base: usize, zc: usize, temporal: &[bool]) -> (Vec<f32>, Vec<f32>) {
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -758,7 +652,7 @@ fn qwen_vae21_run(spec: bool) {
             conv(s, &format!("{p}.conv_shortcut"), i, o, 1);
         }
     };
-    let dims: Vec<usize> = std::iter::once(mult[3])
+    let dims: Vec<usize> = std::iter::once(mult[mult.len() - 1])
         .chain(mult.iter().rev().copied())
         .map(|m| m * base)
         .collect();
@@ -781,8 +675,8 @@ fn qwen_vae21_run(spec: bool) {
             conv(&mut s, &format!("{p}.upsampler.resample.1"), io[1], io[1], 3);
         }
     }
-    sp(&mut s, "decoder.norm_out.gamma", &[dims[4]]);
-    conv(&mut s, "decoder.conv_out", dims[4], 4, 3);
+    sp(&mut s, "decoder.norm_out.gamma", &[dims[mult.len()]]);
+    conv(&mut s, "decoder.conv_out", dims[mult.len()], 4, 3);
     write_st(&dir.join("diffusion_pytorch_model.safetensors"), &synth(7, &s));
     let (mean, std) = stats(70, zc);
     write_json(
@@ -790,28 +684,25 @@ fn qwen_vae21_run(spec: bool) {
         &json!({
             "_class_name": "AutoencoderKLQwenImage", "is_residual": true, "base_dim": base,
             "z_dim": zc, "dim_mult": mult, "num_res_blocks": 2,
-            "temperal_downsample": [true, false, true], "attn_scales": [],
+            "temperal_downsample": temporal, "attn_scales": [],
             "latents_mean": mean, "latents_std": std
         }),
     );
-    let vae = (!spec).then(|| QwenVae21::load(&dir).expect("Qwen VAE 2.1 fixture"));
+    (mean, std)
+}
+
+fn qwen_vae21_run() {
+    let (mult, base, zc) = ([1usize, 2, 2, 4], 4usize, 6usize);
+    let dir = fixture_dir("diffb_qwen_vae21");
+    let (mean, std) = write_qwen_vae21(&dir, &mult, base, zc, &[true, false, true]);
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(14, zc * h * w, 1.0), h * w, &mean, &std);
-    // runner: internal gibbs_engine::model::qwen_vae21::QwenVae21::{decode_cpu, decode_gpu}
-    golden("diffb_qwen_vae21", TOL, |dev| {
-        let (y, oh, ow) = if spec {
-            let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
-            let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
-            assert_consumed(&r);
-            let n = y.len() / 4;
-            let s = ((n / (h * w)) as f64).sqrt() as usize;
-            (y, s * h, s * w)
-        } else if metal(dev) {
-            vae.as_ref().unwrap().decode_gpu(&z, h, w).unwrap()
-        } else {
-            vae.as_ref().unwrap().decode_cpu(&z, h, w)
-        };
-        assert_eq!((oh, ow), (8 * h, 8 * w)); // 3 upsamplers in this tiny config
+    // runner: arch::testing::Runner, spec `qwen_vae21` component `decoder`
+    frozen("diffb_qwen_vae21", TOL, |dev| {
+        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
+        let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+        assert_consumed(&r);
+        assert_eq!(y.len(), 4 * (8 * h) * (8 * w)); // RGBA; 3 upsamplers in this tiny config
         let mut o = Out::default();
         o.f("decode_3x2", &sub(&y));
         o
@@ -1168,21 +1059,12 @@ fn qwen_image21_real_gguf_spec() {
 /// Qwen-Image 1's text encoder: the final-normed hidden states of 11 tokens.
 #[test]
 fn qwen2_5_vl_text() {
-    qwen2_5_vl_text_run(false)
+    qwen2_5_vl_text_run()
 }
 
-/// The `qwen2_5_vl_text` spec's `text` component (head `hidden`) on the same fixture.
-#[test]
-fn qwen2_5_vl_text_spec() {
-    if writing() {
-        return; // the old runner owns the JSON
-    }
-    qwen2_5_vl_text_run(true)
-}
-
-fn qwen2_5_vl_text_run(spec: bool) {
+fn qwen2_5_vl_text_run() {
     let (d, ff, v) = (64usize, 128usize, 32usize);
-    let dir = fixture_dir(if spec { "diffb_qwen2_5_vl_text_spec" } else { "diffb_qwen2_5_vl_text" });
+    let dir = fixture_dir("diffb_qwen2_5_vl_text");
     let mut s = Spec::new();
     let p = "model.language_model";
     sp(&mut s, format!("{p}.embed_tokens.weight"), &[v, d]);
@@ -1207,17 +1089,11 @@ fn qwen2_5_vl_text_run(spec: bool) {
             "rope_theta": 1000000.0, "vocab_size": v, "tie_word_embeddings": false}}),
     );
     let ids: Vec<u32> = (0..11).map(|i| (i * 7 + 3) % v as u32).collect();
-    // runner: internal gibbs_engine::model::qwen3_5::Qwen3Encoder::hidden_states_normed (CPU only)
-    golden("diffb_qwen2_5_vl_text", TOL, |dev| {
-        let y = if spec {
-            let mut r = spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev);
-            let y = r.lm(&ids, 0, "hidden", "hidden", vec![]);
-            assert_consumed(&r);
-            y
-        } else {
-            let _cpu = gibbs_engine::hardware::cpu_compute::allow();
-            gibbs_engine::model::qwen3_5::Qwen3Encoder::open(&dir).unwrap().hidden_states_normed(&ids).unwrap()
-        };
+    // runner: arch::testing::Runner, spec `qwen2_5_vl_text` component `text` (head `hidden`)
+    frozen("diffb_qwen2_5_vl_text", TOL, |dev| {
+        let mut r = spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev);
+        let y = r.lm(&ids, 0, "hidden", "hidden", vec![]);
+        assert_consumed(&r);
         let mut o = Out::default();
         o.f("hidden", &y);
         o
@@ -1289,4 +1165,320 @@ fn krea2_spec_lora() {
     let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
     let e = stray.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap_err();
     assert!(e.contains("matches no weight"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tiny text-to-image pipelines (tokenizer + Qwen text tower + DiT + VAE) through the public image
+// loader: prompt template, prefix drop, schedule, guidance, latent packing and VAE affine.
+// ---------------------------------------------------------------------------------------------
+
+/// A WordLevel stand-in for the Qwen BPE: `<|im_start|>` / `<|im_end|>` special, words and every
+/// punctuation mark / newline one token (so the Qwen-Image system head is 34 tokens, like the real
+/// tokenizer), `tK` = prompt words.
+fn qwen_tokenizer_json() -> Value {
+    let words = "system user assistant Describe the image by detailing color shape size texture quantity text spatial relationships of objects and background Comprehend analyze provided prompt";
+    let mut vocab = serde_json::Map::new();
+    for (i, w) in ["<|im_start|>", "<|im_end|>", "<unk>", "\n", ",", ":", ".", "<|endoftext|>"]
+        .into_iter()
+        .chain(words.split(' '))
+        .enumerate()
+    {
+        vocab.insert(w.into(), json!(i));
+    }
+    let n = vocab.len();
+    for k in 0..32 {
+        vocab.insert(format!("t{k}"), json!(n + k));
+    }
+    let added: Vec<Value> = [("<|im_start|>", 0), ("<|im_end|>", 1), ("<|endoftext|>", 7)]
+        .iter()
+        .map(|(s, id)| {
+            json!({"id": id, "content": s, "single_word": false, "lstrip": false,
+                   "rstrip": false, "normalized": false, "special": true})
+        })
+        .collect();
+    json!({
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"String": " "}, "behavior": "Removed", "invert": false},
+            {"type": "Split", "pattern": {"Regex": "[^\\w\\s]|\\n"}, "behavior": "Isolated", "invert": false}
+        ]},
+        "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    })
+}
+
+/// A dense Qwen text tower in `dir` (bf16): `kind` `qwen3` (q/k norm), `qwen3_vl` (nested
+/// `text_config`, interleaved M-RoPE, `model.language_model.`) or `qwen2_5_vl` (qkv biases).
+fn write_qwen_te(dir: &std::path::Path, kind: &str, hidden: usize, layers: usize, seed: u64) {
+    let (heads, kv, hd, inter, vocab) = (4usize, 2usize, 16usize, 64usize, 96usize);
+    let p = if kind == "qwen3_vl" { "model.language_model" } else { "model" };
+    let mut w = Weights::new(seed);
+    w.w(format!("{p}.embed_tokens.weight"), &[vocab, hidden]);
+    for l in 0..layers {
+        let lp = format!("{p}.layers.{l}");
+        let a = format!("{lp}.self_attn");
+        w.norm(format!("{lp}.input_layernorm.weight"), hidden, 1.0)
+            .norm(format!("{lp}.post_attention_layernorm.weight"), hidden, 1.0)
+            .w(format!("{a}.q_proj.weight"), &[heads * hd, hidden])
+            .w(format!("{a}.k_proj.weight"), &[kv * hd, hidden])
+            .w(format!("{a}.v_proj.weight"), &[kv * hd, hidden])
+            .w(format!("{a}.o_proj.weight"), &[hidden, heads * hd]);
+        if kind == "qwen2_5_vl" {
+            w.s(format!("{a}.q_proj.bias"), &[heads * hd], 0.2)
+                .s(format!("{a}.k_proj.bias"), &[kv * hd], 0.2)
+                .s(format!("{a}.v_proj.bias"), &[kv * hd], 0.2);
+        } else {
+            w.norm(format!("{a}.q_norm.weight"), hd, 1.0).norm(format!("{a}.k_norm.weight"), hd, 1.0);
+        }
+        w.w(format!("{lp}.mlp.gate_proj.weight"), &[inter, hidden])
+            .w(format!("{lp}.mlp.up_proj.weight"), &[inter, hidden])
+            .w(format!("{lp}.mlp.down_proj.weight"), &[hidden, inter]);
+    }
+    w.norm(format!("{p}.norm.weight"), hidden, 1.0);
+    write_st_as(&dir.join("model.safetensors"), &w.tensors, StDtype::BF16);
+    let mut text = json!({
+        "model_type": kind, "hidden_size": hidden, "vocab_size": vocab, "num_hidden_layers": layers,
+        "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+        "intermediate_size": inter, "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0, "tie_word_embeddings": true
+    });
+    let cfg = match kind {
+        "qwen3_vl" => {
+            text["model_type"] = json!("qwen3_vl_text");
+            text["rope_scaling"] = json!({"rope_type": "default", "mrope_interleaved": true, "mrope_section": [4, 2, 2]});
+            json!({"model_type": "qwen3_vl", "architectures": ["Qwen3VLForConditionalGeneration"], "text_config": text})
+        }
+        "qwen2_5_vl" => {
+            text["architectures"] = json!(["Qwen2_5_VLForConditionalGeneration"]);
+            text["rope_scaling"] = json!({"type": "mrope", "mrope_section": [4, 2, 2]});
+            text
+        }
+        _ => {
+            text["architectures"] = json!(["Qwen3Model"]);
+            text
+        }
+    };
+    write_json(&dir.join("config.json"), &cfg);
+}
+
+fn flow_scheduler(dir: &std::path::Path, dynamic: bool) {
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
+                "shift": 3.0, "use_dynamic_shifting": dynamic, "base_shift": 0.5, "max_shift": 0.9,
+                "base_image_seq_len": 256, "max_image_seq_len": 8192, "shift_terminal": if dynamic { json!(0.02) } else { Value::Null }}),
+    );
+}
+
+/// Runs `req` through the public image loader on every device; pixels every k-th value.
+fn pipeline_golden(case: &str, dir: &std::path::Path, req: gibbs_engine::runtime::diffusion::ImageRequest) {
+    use crate::diffa::{on, pin, stride};
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let art = artifacts(dir, &format!("golden/{case}"), "none");
+    let (w, h) = (req.width.unwrap(), req.height.unwrap());
+    frozen(case, Tol { rel: 2e-3, cos: 0.99999 }, |dev| {
+        // runner: runtime::diffusion::load_image (the public image loader), pinned to `dev`
+        let p = gibbs_engine::runtime::diffusion::load_image(&art, &hub, pin(dev))
+            .expect("image repo")
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let img = on(dev, || p.text_to_image(&req)).unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert_eq!((img.width, img.height), (w, h));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+fn request(prompt: &str, guidance: f32, seed: u64) -> gibbs_engine::runtime::diffusion::ImageRequest {
+    gibbs_engine::runtime::diffusion::ImageRequest {
+        prompt: prompt.into(),
+        width: Some(32),
+        height: Some(32),
+        steps: Some(2),
+        guidance: Some(guidance),
+        seed,
+        ..Default::default()
+    }
+}
+
+/// Z-Image: Qwen3 tower (second-to-last layer), S3-DiT with in-graph patchify, SD VAE (4 latent
+/// channels); CFG with `guidance + 1` and the negated velocity.
+#[test]
+fn zimage_pipeline() {
+    let case = "diffb_zimage_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "ZImagePipeline"}));
+    flow_scheduler(&dir, false);
+    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen3", 48, 3, 0x5A01);
+    zimage_fixture(&format!("{case}/transformer"));
+    crate::diffa::write_sd_vae(&dir, &[32, 32, 32, 32]);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 0.5, 9));
+}
+
+/// Qwen-Image 1: Qwen2.5-VL tower (final-normed, 34-token head dropped), MMDiT on 2x2-packed
+/// latents, rescaled CFG, dynamic shift with a terminal, Qwen VAE.
+#[test]
+fn qwen_image_v1_pipeline() {
+    let case = "diffb_qwen_image_v1_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImagePipeline"}));
+    flow_scheduler(&dir, true);
+    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen2_5_vl", 48, 3, 0x5A02);
+    write_qwen_image_v1(&fixture_dir(&format!("{case}/transformer")));
+    write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 4.0, 10));
+}
+
+/// Qwen-Image 2.1: Qwen3-VL tower (last layer before its norm, system turn dropped), single-stream
+/// DiT on token latents, CFG, 64-channel residual VAE (16x), RGBA over white.
+#[test]
+fn qwen_image21_pipeline() {
+    let case = "diffb_qwen_image21_pipeline";
+    let dir = fixture_dir(case);
+    write_qwen21_pipeline(&dir);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 2.0, 11));
+}
+
+/// The tiny Qwen-Image 2.1 diffusers pipeline in `dir`.
+fn write_qwen21_pipeline(dir: &std::path::Path) {
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImage21Pipeline"}));
+    flow_scheduler(dir, true);
+    write_json(&dir.join("processor/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 48, 3, 0x5A03);
+    let (split, _, cfg) = qwen_image21_fixture();
+    let t = dir.join("transformer");
+    write_st(&t.join("diffusion_pytorch_model.safetensors"), &split);
+    write_json(&t.join("config.json"), &cfg);
+    write_qwen_vae21(&dir.join("vae"), &[1, 1, 1, 1, 1], 4, 64, &[false, true, false, false]);
+}
+
+/// Krea 2 (Raw): 12 taps of a 36-layer Qwen3-VL tower fused in-model, the 2-block DiT on 2x2-packed
+/// latents, CFG with `guidance + 1`, dynamic mu, Qwen VAE.
+#[test]
+fn krea2_pipeline() {
+    let case = "diffb_krea2_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}));
+    flow_scheduler(&dir, true);
+    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 32, 36, 0x5A04);
+    krea2_fixture(&format!("{case}/transformer"));
+    write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 4.5, 12));
+}
+
+fn pixels(img: gibbs_engine::model::image::ImageBuffer) -> Vec<f32> {
+    img.data.iter().map(|&v| v as f32).collect()
+}
+
+/// A derived Qwen-Image 2.1 repo (a transformer file, a card naming its base, its own scheduler
+/// config and card SIGMAS) through `load_image`: it runs as the base pipeline with that transformer,
+/// the repo's scheduler config and the card's sigmas (steps default to their count), unlike the
+/// base's own schedule.
+#[test]
+fn qwen_image21_derived_repo() {
+    use crate::diffa::{on, pin};
+    use gibbs_engine::arch::testing::compare;
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    use gibbs_engine::runtime::diffusion::{load_image, Extras, ImageGenerator, SpecDiffusion};
+    let dir = fixture_dir("diffb_qwen_image21_derived");
+    let base = dir.join("hub/models--golden--qwen21-base/snapshots/main");
+    write_qwen21_pipeline(&base);
+    let ft = dir.join("ft");
+    std::fs::create_dir_all(&ft).unwrap();
+    let file = ft.join("qwen21-ft.safetensors");
+    let (split, _, _) = qwen_image21_fixture();
+    // A "finetune": the base transformer, every weight scaled.
+    let tuned: Vec<T> = split.iter().map(|(n, s, v)| (n.clone(), s.clone(), v.iter().map(|x| x * 0.9).collect())).collect();
+    write_st(&file, &tuned);
+    let card = "---\nbase_model: golden/qwen21-base\n---\nSTEPS, SIGMAS = 3, [1.0, 0.7, 0.3]\n";
+    std::fs::write(ft.join("README.md"), card).unwrap();
+    let sched = json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000, "shift": 1.0,
+                       "use_dynamic_shifting": false});
+    write_json(&ft.join("scheduler/scheduler_config.json"), &sched);
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let derived = artifacts(&ft, "golden/qwen21-ft", "qwen21-ft.safetensors");
+    let base_art = artifacts(&base, "golden/qwen21-base", "none");
+    for dev in devices() {
+        let p = load_image(&derived, &hub, pin(dev)).expect("derived repo").unwrap();
+        let extra = Extras {
+            weights: vec![("transformer".into(), file.clone())],
+            scheduler: Some(sched.clone()),
+            card: Some(card.into()),
+            ..Default::default()
+        };
+        let want = SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &extra).unwrap();
+        let plain = SpecDiffusion::load(&base_art, &hub, pin(dev), Some("qwen_image21"), &Extras {
+            weights: vec![("transformer".into(), file.clone())],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut req = request("t3 t7 t11", 0.0, 4);
+        req.steps = None;
+        let got = pixels(on(dev, || p.text_to_image(&req)).unwrap());
+        req.steps = Some(3);
+        let (e, c) = compare(&got, &pixels(on(dev, || want.text_to_image(&req)).unwrap()));
+        assert!(e < 1e-6 && c > 0.999999, "{dev:?}: derived vs base + repo schedule: rel {e} cos {c}");
+        let (e, _) = compare(&got, &pixels(on(dev, || plain.text_to_image(&req)).unwrap()));
+        assert!(e > 1e-3, "{dev:?}: the repo schedule changed nothing (rel {e})");
+    }
+}
+
+/// ComfyUI's split Krea 2 files (`diffusion_models/`, `text_encoders/`, `vae/`, no configs; the
+/// spec's `runtime.split` supplies them, here patched to the tiny text tower) load through
+/// `load_image` and render what the same weights do as a diffusers pipeline; the bf16 text encoder
+/// file is preferred over a sibling, and `turbo` in the file name selects the distilled defaults.
+#[test]
+fn krea2_split_files() {
+    use crate::diffa::{on, pin};
+    use gibbs_engine::arch::testing::compare;
+    use gibbs_engine::arch::{Registry, EMBEDDED};
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    use gibbs_engine::runtime::diffusion::load_image_in;
+    let case = "diffb_krea2_split";
+    let dir = fixture_dir(case);
+    let twin = dir.join("diffusers");
+    write_json(&twin.join("model_index.json"), &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}));
+    write_json(&twin.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&twin.join("text_encoder"), "qwen3_vl", 32, 36, 0x5A04);
+    krea2_fixture(&format!("{case}/diffusers/transformer"));
+    write_qwen_vae(&twin.join("vae"), 4, [1, 2, 4, 4], 16);
+    // Split VAE files carry no config: both layouts use the default latent statistics.
+    std::fs::remove_file(twin.join("vae/config.json")).unwrap();
+    let split = dir.join("split");
+    let cp = |from: &str, to: &str| {
+        std::fs::create_dir_all(split.join(to).parent().unwrap()).unwrap();
+        std::fs::copy(twin.join(from), split.join(to)).unwrap();
+    };
+    cp("transformer/krea2_tiny.safetensors", "diffusion_models/krea2_raw_bf16.safetensors");
+    cp("transformer/krea2_tiny.safetensors", "diffusion_models/krea2_turbo_bf16.safetensors");
+    // Sorts first; would fail to load as the text encoder.
+    cp("vae/qwen_image_vae.safetensors", "text_encoders/a_fp8.safetensors");
+    cp("text_encoder/model.safetensors", "text_encoders/qwen3vl_tiny_bf16.safetensors");
+    cp("vae/qwen_image_vae.safetensors", "vae/qwen_image_vae.safetensors");
+    write_json(&dir.join("hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/main/tokenizer.json"), &qwen_tokenizer_json());
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let mut files: Vec<(String, String)> = EMBEDDED.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect();
+    files.push(("overrides/tiny_krea2_split.json5".into(), r#"{applies_to: {family: "krea2"}, patch: {runtime: {split: {files: {
+        "text_encoder/config.json": {text_config: {hidden_size: 32, intermediate_size: 64, num_hidden_layers: 36,
+          num_attention_heads: 4, num_key_value_heads: 2, head_dim: 16, rms_norm_eps: 1e-6, rope_theta: 10000,
+          rope_scaling: {mrope_interleaved: true, mrope_section: [4, 2, 2], rope_type: "default"}}}}}}}}"#.into()));
+    let reg = Registry::from_files(&files, &[]).unwrap();
+    let raw = artifacts(&split, "golden/krea-split", "diffusion_models/krea2_raw_bf16.safetensors");
+    let turbo = artifacts(&split, "golden/krea-split", "diffusion_models/krea2_turbo_bf16.safetensors");
+    let twin_art = artifacts(&twin, "golden/krea-diffusers", "none");
+    let req = request("t3 t7 t11", 4.5, 12);
+    for dev in devices() {
+        let load = |a| load_image_in(&reg, a, &hub, pin(dev)).expect("image repo").unwrap_or_else(|e| panic!("{e}"));
+        let (p, t, w) = (load(&raw), load(&turbo), load(&twin_art));
+        assert_eq!((p.defaults().steps, t.defaults().steps), (28, 8), "raw / turbo defaults");
+        let got = pixels(on(dev, || p.text_to_image(&req)).unwrap());
+        let (e, c) = compare(&got, &pixels(on(dev, || w.text_to_image(&req)).unwrap()));
+        assert!(e < 1e-6 && c > 0.999999, "{dev:?}: split vs diffusers: rel {e} cos {c}");
+    }
 }

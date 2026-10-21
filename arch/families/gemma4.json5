@@ -11,7 +11,7 @@
   family: "gemma4",
   match: {
     hf_model_type: ["gemma4", "gemma4_text"],
-    hf_architectures: ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM"],
+    hf_architectures: ["Gemma4ForConditionalGeneration", "Gemma4ForCausalLM", "Gemma4ForSequenceClassification"],
     gguf_arch: ["gemma4"],
   },
   pipeline: "causal_lm",
@@ -50,10 +50,15 @@
     top_k: "first(gguf.expert_used_count, tc.top_k_experts)",
     bidir_vision: "tc.use_bidirectional_attention == 'vision'",
     max_position_embeddings: "first(gguf.context_length, tc.max_position_embeddings)",
-    ctx: "first(runtime.ctx, max_position_embeddings)",
+    // Sequence classifiers keep a 4096-position cache (max_position_embeddings is 128k+).
+    ctx: "first(runtime.ctx, has('score.weight') ? min(max_position_embeddings, 4096) : max_position_embeddings)",
     gg: "gguf_arch == 'gemma4'",
     // Vision tower (`gemma4_vision`, or llama.cpp's `gemma4v` mmproj renamed to the HF names).
-    has_vision: "has('model.vision_tower.patch_embedder.input_proj.weight')",
+    // Other mmproj vision projectors (12B's `gemma4uv`) leave vision off, as the old loader did.
+    v_ok: "!gg || first(gguf['clip.vision.projector_type'], '') == 'gemma4v'",
+    has_vision: "v_ok && has('model.vision_tower.patch_embedder.input_proj.weight')",
+    // The old loader left vision off for towers with `std_bias`/`std_scale` (26B-A4B).
+    vision_on: "has_vision && !has('model.vision_tower.std_bias')",
     v_layers: "first(gguf['clip.vision.block_count'], cfg.vision_config.num_hidden_layers)",
     v_hidden: "shape('model.vision_tower.patch_embedder.input_proj.weight')[0]",
     v_in: "shape('model.vision_tower.patch_embedder.input_proj.weight')[1]",
@@ -67,7 +72,8 @@
     v_max_soft: "first(json.processor_config.image_processor.max_soft_tokens, 280)",
     // Audio conformer (`gemma4_audio`, or llama.cpp's `gemma4a` mmproj renamed to the HF names) and
     // its log-mel front end (`Gemma4AudioFeatureExtractor`; defaults as every gemma-4 processor sets it).
-    has_audio: "has('model.audio_tower.output_proj.weight')",
+    a_ok: "!gg || first(gguf['clip.audio.projector_type'], '') == 'gemma4a'",
+    has_audio: "a_ok && has('model.audio_tower.output_proj.weight')",
     a_fe: "json.processor_config.feature_extractor",
     a_layers: "first(gguf['clip.audio.block_count'], cfg.audio_config.num_hidden_layers)",
     a_hidden: "first(gguf['clip.audio.embedding_length'], cfg.audio_config.hidden_size)",
@@ -213,10 +219,10 @@
       "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[0] * shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[1]",
       "shape(fmt('model.language_model.layers.{i}.mlp.experts.{n}'))[2]"]}},
     // mmproj patch embedder: the [out, c, y, x] conv kernel as the HF [out, (y, x, c)] linear.
-    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "conv_to_linear", args: {order: "k_in"}, when: "gg"},
-    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "to_bf16", when: "gg"},
+    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "conv_to_linear", args: {order: "k_in"}, when: "gg && v_ok"},
+    {tensor: "model.vision_tower.patch_embedder.input_proj.weight", op: "to_bf16", when: "gg && v_ok"},
     // Vision position tables [2 (x, y), size, d] as [size, (x, y) d] rows one gather reads.
-    {tensor: "model.vision_tower.patch_embedder.position_embedding_table", op: "transpose", args: {perm: [1, 0, 2]}},
+    {tensor: "model.vision_tower.patch_embedder.position_embedding_table", op: "transpose", args: {perm: [1, 0, 2]}, when: "v_ok"},
     {tensor: "{t:*}.position_embedding_table", op: "reshape", args: {shape: ["shape(fmt('{t}.position_embedding_table'))[0]",
       "shape(fmt('{t}.position_embedding_table'))[1] * shape(fmt('{t}.position_embedding_table'))[2]"]}},
     // gemma4_unified: [size, 2 (x, y), d] already in row order.
@@ -256,7 +262,12 @@
   // KV-shared layers read an earlier layer's cache: their own k/v (HF keeps them) are never read.
   ignore: ["rope_freqs.weight", "model.language_model.layers.*.self_attn.k_proj.weight",
            "model.language_model.layers.*.self_attn.v_proj.weight",
-           "model.language_model.layers.*.self_attn.k_norm.weight"],
+           "model.language_model.layers.*.self_attn.k_norm.weight",
+           // The seq-cls head: read by the `head: 'score'` instance only.
+           "score.weight", "norm.weight",
+           // A vision tower left off (`vision_on`): its weights go unread.
+           {glob: "model.vision_tower.*", when: "has_vision && !vision_on"},
+           {glob: "model.embed_vision.*", when: "has_vision && !vision_on"}],
   macros: {
     // `[x]` unchanged under another name.
     alias: {params: ["x"], body: [], returns: "x"},
@@ -405,8 +416,6 @@
              in: ["q", "kn", "v", "s:kv.{i}.k", "s:kv.{i}.v", "i:positions", "v?:ve.{i}"], out: "att", name: "{n}.attn"},
           ], when: "i < first_shared"},
           {block: [
-            {state: "kv.{src}.k", shape: ["ctx", "kvh * hd"], reread: true},
-            {state: "kv.{src}.v", shape: ["ctx", "kvh * hd"], reread: true},
             {op: "CachedAttention", args: {heads: "heads", kv_heads: "kvh", head_dim: "hd", v_head_dim: "hd", scale: 1,
                causal: true, window: "win", write: false},
              in: ["q", "q", "q", "s:kv.{src}.k", "s:kv.{src}.v", "i:positions", "v?:ve.{i}"], out: "att", name: "{n}.attn"},
@@ -506,11 +515,6 @@
         {op: "Unary", args: {kind: {Scale: "sqrt(d)"}}, in: ["t"], out: "t", name: "vision.pool.scale"},
         {op: "Reshape", args: {shape: ["d", "(grid_h // k) * (grid_w // k)"]}, in: ["t"], out: "t", name: "vision.pool.flat"},
         {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "x", name: "vision.pool.rows"},
-        // llama.cpp gemma4v: (x - std_bias) * std_scale (26B-A4B tower).
-        {block: [
-          {op: "Binary", args: {kind: "Sub"}, in: ["x", "w:{vp}.std_bias"], out: "x", name: "vision.std_bias"},
-          {op: "Binary", args: {kind: "Mul"}, in: ["x", "w:{vp}.std_scale"], out: "x", name: "vision.std_scale"},
-        ], when: "has(vp + '.std_bias')"},
         {op: "RmsNorm", args: {eps: "v_eps"}, in: ["x", "c:vision.ones"], out: "x", name: "vision.embed_norm"},
         {op: "Linear", in: ["x", "w:model.embed_vision.embedding_projection.weight"], out: "embeds", name: "vision.embed"},
       ],
@@ -620,10 +624,14 @@
       outputs: ["embeds"],
     },
   },
-  runtime: {prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+  runtime: {cutover: true, prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+    // gevva cross-encoders (`tokenize_nli_pair_safe`): `<bos>Premise: {text}\nHypothesis: {pair}\nPrediction:`.
+    seqcls: {head: "score", pooling: "last_nonpad",
+      pair: {bos: "tc.bos_token_id", parts: ["Premise: ", "{text}", "\nHypothesis: ", "{pair}", "\nPrediction:"],
+             strip: ["<|image|>", "<image|>", "<|image_pad|>", "<|vision_start|>", "<|vision_end|>"]}},
     media: {
       image: {
-        when: "has_vision",
+        when: "vision_on",
         component: "vision",
         // Pixels 2 * (v / 255 - 0.5).
         preprocess: {kind: "soft_token_budget", patch: "v_patch", pool: "v_pool", max_soft_tokens: "v_max_soft",

@@ -106,6 +106,7 @@ static RUN_SAMPLES: Mutex<std::collections::VecDeque<RunSample>> =
 
 fn push_run_sample(s: RunSample) {
     let mut q = RUN_SAMPLES.lock();
+    RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if q.len() >= RUN_SAMPLE_CAP {
         q.pop_front();
     }
@@ -116,6 +117,15 @@ fn push_run_sample(s: RunSample) {
 pub fn take_run_samples() -> Vec<RunSample> {
     RUN_SAMPLES.lock().drain(..).collect()
 }
+
+/// The newest run sample and how many samples were pushed before it, without draining the ring
+/// (the scheduler's telemetry reads every token; a bench drains its own window).
+pub fn last_run_sample() -> Option<(u64, RunSample)> {
+    let q = RUN_SAMPLES.lock();
+    q.back().map(|s| (RUN_SEQ.load(std::sync::atomic::Ordering::Relaxed), *s))
+}
+
+static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GEMV shapes resolved by the tuner this process, and how many came from the persisted cache.
 static TUNE_SHAPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1580,6 +1590,9 @@ impl Runtime {
 /// Graph weights on the GPU plus a reusable activation arena; runs are serialized.
 pub struct Session {
     rt: Arc<Runtime>,
+    /// Owners of the host memory the no-copy weight buffers wrap (a packed weight built at
+    /// compile time, e.g. a fused QKV, has no other owner once compilation returns).
+    _maps: Vec<Arc<crate::model::loaders::gguf::GgufData>>,
     /// Buffer, byte offset, element count, and weight storage format.
     weights: HashMap<String, (Buffer, usize, usize, WeightFormat)>,
     arena: Mutex<Option<Buffer>>,
@@ -1694,6 +1707,7 @@ impl Session {
                 .collect()
         });
         let mut map_buffers: HashMap<*const u8, Buffer> = HashMap::new();
+        let mut maps = Vec::new();
         let mut bufs = HashMap::new();
         let mut nvfp4_aux = HashMap::new();
         for (name, t) in weights.iter() {
@@ -1789,6 +1803,7 @@ impl Session {
                             );
                             if !buf.contents().is_null() {
                                 map_buffers.insert(map_ptr, buf);
+                                maps.push(p.map.clone());
                             }
                         }
                         if let Some(map_buf) = map_buffers.get(&map_ptr) {
@@ -2211,6 +2226,7 @@ impl Session {
         }
         Ok(Self {
             rt,
+            _maps: maps,
             weights: bufs,
             arena: Mutex::new(None),
             state_buffers: Mutex::new(HashMap::new()),

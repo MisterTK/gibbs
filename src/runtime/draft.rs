@@ -612,7 +612,7 @@ fn load_block(
         }
         _ => None,
     };
-    let unused = dm.store.unconsumed(&used, &dm.spec.ignore);
+    let unused = dm.store.unconsumed(&used, &dm.ignore);
     if !unused.is_empty() {
         return Err(format!(
             "{fam}: drafter tensors the drafter graph does not run: {}",

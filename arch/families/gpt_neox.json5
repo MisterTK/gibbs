@@ -1,9 +1,10 @@
 // GPT-NeoX (Pythia, ...): biased LayerNorms, fused per-head-interleaved query_key_value (split at
 // load), partial half-split RoPE (rotary_pct, default 0.25), plain GELU MLP, parallel residual
-// (default) and an untied `embed_out` head.
+// (default) and an untied `embed_out` head (`*ForSequenceClassification` checkpoints have none: their
+// unused decode logits tie to `embed_in`; runtime::seqcls reads the `score` instance).
 {
   family: "gpt_neox",
-  match: {hf_model_type: ["gpt_neox"], hf_architectures: ["GPTNeoXForCausalLM"]},
+  match: {hf_model_type: ["gpt_neox"], hf_architectures: ["GPTNeoXForCausalLM", "GPTNeoXForSequenceClassification"]},
   pipeline: "causal_lm",
   use_lib: ["transformer"],
   config: {
@@ -49,6 +50,7 @@
       inputs: [
         {name: "token_ids", dtype: "u32", shape: ["rows"]},
         {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "last_index", dtype: "u32", shape: [1], when: "head == 'score'"},
       ],
       body: [
         {op: "Embedding", in: ["w:gpt_neox.embed_in.weight", "i:token_ids"], out: "x", name: "embed"},
@@ -72,11 +74,13 @@
           {tap: "layer.{i}", in: "x"},
         ]},
         {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "last_row", args: {index: true}, in: ["x", "i:last_index"], out: "x", name: "last", when: "head == 'score'"},
         {use: "layer_norm", args: {w: "'gpt_neox.final_layer_norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
-        {use: "lm_head", args: {w: "'embed_out'"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+        {use: "score_head", in: ["hidden"], out: "logits", name: "score", when: "head == 'score'"},
+        {use: "lm_head", args: {w: "has('embed_out.weight') ? 'embed_out' : 'gpt_neox.embed_in'"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head == 'last' || head == 'all'"},
       ],
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
     },
   },
-  runtime: {prefill_rows: 64, ffn_weights: ["gpt_neox.layers.*.mlp.*"]},
+  runtime: {prefill_rows: 64, ffn_weights: ["gpt_neox.layers.*.mlp.*"], seqcls: {head: "score", pooling: "last_nonpad"}},
 }

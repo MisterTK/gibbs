@@ -2,8 +2,7 @@
 //! `graph::Graph`. Node kinds (one JSON object each, see the README "Model specs"):
 //!
 //! - op:     `{op, args, in, out, name?, when?}`; `args` deserialize into `graph::Op`.
-//! - state:  `{state, shape, dtype?, recurrent?, reread?, when?}` declares persistent state;
-//!   `reread: true` re-reads one declared earlier (its value after the earlier writes).
+//! - state:  `{state, shape, dtype?, recurrent?, when?}` declares persistent state.
 //! - use:    `{use, args?, in?, out?, when?}` expands a macro in a fresh value scope.
 //! - repeat: `{repeat: var, count | over, body}` (shares the enclosing value scope).
 //! - block:  `{block: [...], when}` conditional group (shares the enclosing value scope).
@@ -16,9 +15,12 @@
 
 use super::expr::{eval_json, eval_str, interp, walk, Env, Val};
 use super::{InputDecl, Lora, Network, Source, Spec};
-use crate::graph::{DType, Graph, Op, ValueId};
+use crate::graph::{DType, Graph, Op, ValueId, ValueKind};
 use serde_json::{Map, Value as J};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Name suffix of a weight's projection copy (see `Builder::projection`).
+pub const LINEAR_COPY: &str = "#linear";
 
 /// One graph input of an instance, in declaration (= binding) order.
 #[derive(Debug, Clone)]
@@ -106,6 +108,7 @@ pub fn build_network(
         values: vec![HashMap::new()],
         weights: HashMap::new(),
         weight_order: Vec::new(),
+        gathered: HashSet::new(),
         states: HashMap::new(),
         inputs: HashMap::new(),
         taps: HashMap::new(),
@@ -207,6 +210,8 @@ struct Builder<'a> {
     values: Vec<HashMap<String, ValueId>>,
     weights: HashMap<String, ValueId>,
     weight_order: Vec<String>,
+    /// Values some non-`Linear` op reads.
+    gathered: HashSet<ValueId>,
     states: HashMap<String, ValueId>,
     inputs: HashMap<String, ValueId>,
     taps: HashMap<String, ValueId>,
@@ -364,16 +369,8 @@ impl<'a> Builder<'a> {
                     .ok_or("state needs `shape`")?,
             )?;
             let dtype = parse_dtype(m.get("dtype").and_then(J::as_str).unwrap_or("f32"))?;
-            // `reread: true`: a second value of a state declared earlier in this graph, read after
-            // the earlier nodes' writes (shared KV caches); later `s:` refs use it.
-            let reread = m.get("reread").and_then(J::as_bool).unwrap_or(false);
-            match (self.states.get(&name), reread) {
-                (Some(_), false) => return Err(format!("state `{name}` declared twice")),
-                (None, true) => return Err(format!("state `{name}` is reread before it is declared")),
-                (Some(&v), true) if self.g.value(v).shape != shape => {
-                    return Err(format!("state `{name}` reread with shape {shape:?}"))
-                }
-                _ => {}
+            if self.states.contains_key(&name) {
+                return Err(format!("state `{name}` declared twice"));
             }
             let recurrent = m
                 .get("recurrent")
@@ -484,6 +481,18 @@ impl<'a> Builder<'a> {
         Some(v)
     }
 
+    /// The weight a `Linear` reads for `w`: `w` itself, or when another op (a tied embedding
+    /// gather) already reads `w`, its projection copy `<name>#linear`, which the loader may
+    /// re-encode for streaming while the gather keeps the table's own encoding.
+    // ponytail: only a gather built before the Linear is seen (embedding first, tied head last).
+    fn projection(&mut self, w: ValueId) -> ValueId {
+        let name = self.g.value(w).name.clone();
+        if !self.gathered.contains(&w) || self.g.value(w).kind != ValueKind::Weight {
+            return w;
+        }
+        self.weight(&format!("{name}{LINEAR_COPY}")).unwrap_or(w)
+    }
+
     fn node_name(&self, m: &Map<String, J>, out: &str) -> Result<String, String> {
         let base = match m.get("name").and_then(J::as_str) {
             Some(n) => self.interp(n)?,
@@ -511,6 +520,11 @@ impl<'a> Builder<'a> {
             if let Some(v) = self.operand(r.as_str().ok_or("operand refs are strings")?)? {
                 ins.push(v);
             }
+        }
+        if let (Op::Linear, Some(w)) = (&parsed, ins.get_mut(1)) {
+            *w = self.projection(*w);
+        } else {
+            self.gathered.extend(ins.iter().copied());
         }
         let out = self.interp(m.get("out").and_then(J::as_str).ok_or("op needs `out`")?)?;
         let name = self.node_name(m, &out)?;

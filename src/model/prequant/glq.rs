@@ -768,7 +768,8 @@ mod tests {
             crate::model::loaders::read_checkpoint(&r.join("model.safetensors")).unwrap();
         // The native loaders' view: mmap + owned bf16 per `mat` (`prequant::open_weights`).
         let nw =
-            crate::model::prequant::open_weights(&q.join("model.safetensors"), Some(&cfg)).unwrap();
+            crate::model::prequant::open_weights(&q.join("model.safetensors"), Some(&cfg), false)
+                .unwrap();
         let mut names: Vec<&String> = qm
             .tensors
             .keys()

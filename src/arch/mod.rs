@@ -30,15 +30,6 @@ mod tests_encoders_bert_gguf;
 mod tests_encoders_deberta;
 #[cfg(test)]
 mod tests_idefics3;
-// Parity with the pre-spec implementations (deleted with them).
-#[cfg(test)]
-mod parity_gemma4_text;
-#[cfg(test)]
-mod parity_gemma4_vision;
-#[cfg(test)]
-mod parity_gemma4_audio;
-#[cfg(test)]
-mod parity_gemma3;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -77,6 +68,7 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/qwen_image21.json5", include_str!("../../arch/families/qwen_image21.json5")),
     ("families/qwen_vae.json5", include_str!("../../arch/families/qwen_vae.json5")),
     ("families/qwen_vae21.json5", include_str!("../../arch/families/qwen_vae21.json5")),
+    ("families/qwen3_vl_text.json5", include_str!("../../arch/families/qwen3_vl_text.json5")),
     ("families/qwen2_5_vl_text.json5", include_str!("../../arch/families/qwen2_5_vl_text.json5")),
     ("families/zimage.json5", include_str!("../../arch/families/zimage.json5")),
     ("families/sd3.json5", include_str!("../../arch/families/sd3.json5")),
@@ -183,6 +175,10 @@ pub struct Match {
     /// File extensions `single_file_tensors` applies to (empty: any).
     #[serde(default)]
     pub single_file_ext: Vec<String>,
+    /// Hub repos whose derivatives (finetunes, quantizations, LoRAs whose model card names one as
+    /// `base_model`) this family runs; listings only (loading reads the card).
+    #[serde(default)]
+    pub bases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -319,8 +315,10 @@ pub struct Spec {
     pub transforms: Vec<Transform>,
     #[serde(default)]
     pub constants: Map<String, J>,
+    /// Checkpoint tensors deliberately left unread: globs, or `{glob, when}` (only when the `when`
+    /// expression holds; resolved into [`load::Model::ignore`] at load).
     #[serde(default)]
-    pub ignore: Vec<String>,
+    pub ignore: Vec<Ignore>,
     #[serde(default)]
     pub macros: Map<String, J>,
     #[serde(default)]
@@ -331,6 +329,14 @@ pub struct Spec {
     /// {var: list-expr}}`; `over` instantiates `{var}` in the pattern for every list item.
     #[serde(default)]
     pub synthetic: Map<String, J>,
+}
+
+/// A `Spec::ignore` entry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Ignore {
+    Glob(String),
+    When { glob: String, when: String },
 }
 
 impl Spec {
@@ -742,10 +748,24 @@ impl Registry {
 
     /// The GGUF architectures `causal_lm` families claim.
     pub fn causal_lm_gguf_archs(&self) -> Vec<String> {
+        self.pipeline_gguf_archs(Pipeline::CausalLm)
+    }
+
+    /// The GGUF architectures the families of `pipeline` claim.
+    pub fn pipeline_gguf_archs(&self, pipeline: Pipeline) -> Vec<String> {
         self.matchers()
             .into_iter()
-            .filter(|(_, _, p)| *p == Pipeline::CausalLm)
+            .filter(|(_, _, p)| *p == pipeline)
             .flat_map(|(_, m, _)| m.gguf_arch)
+            .collect()
+    }
+
+    /// The `match.bases` of the families of `pipeline`.
+    pub fn derived_bases(&self, pipeline: Pipeline) -> Vec<String> {
+        self.matchers()
+            .into_iter()
+            .filter(|(_, _, p)| *p == pipeline)
+            .flat_map(|(_, m, _)| m.bases)
             .collect()
     }
 }
@@ -1265,7 +1285,8 @@ mod tests {
 
     /// Each GraphLm fixture family against GraphLm (`hf_loader::load_causal_lm` +
     /// `ExecutableModel::load_graph_lm`) on the same device; GPT-2 / OPT (which GraphLm does not
-    /// load) against their `LnDecoder` host forward; BitNet against `tests/golden/lm_bitnet.json`
+    /// load) against the frozen `LnDecoder` hidden states (`tests/golden/lm_ln_decoder_hidden.json`);
+    /// BitNet against `tests/golden/lm_bitnet.json`
     /// (GraphLm's BitNet graph is wrong). Prefill 6 rows, then 3 cached decode steps.
     #[test]
     fn llama_family_matches_graph_lm() {
@@ -1309,8 +1330,14 @@ mod tests {
             }
         }
 
-        // GPT-2 / OPT: last-row final hidden (after ln_f / project_out) and the score head.
-        use crate::model::classifier::DecoderBackbone;
+        // GPT-2 / OPT: last-row final hidden (after ln_f / project_out) of the 6-row prefill and 3
+        // cached decode steps against the deleted `LnDecoder` host forward
+        // (`tests/golden/lm_ln_decoder_hidden.json`, written by it at b73c897), and the score
+        // instance against `score · hidden`.
+        let ln_ref: J = serde_json::from_slice(
+            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_ln_decoder_hidden.json")).unwrap(),
+        )
+        .unwrap();
         let dec_seq: Vec<u32> = seq.iter().map(|t| t % DEC_VOCAB as u32).collect();
         let (dp, dd) = dec_seq.split_at(PROMPT.len());
         let decoders: Vec<(&str, &str, (J, Weights))> = vec![
@@ -1319,23 +1346,22 @@ mod tests {
             ("opt_pre_ln", "opt", opt_fixture(true, "gelu", 0xED)),
         ];
         for (case, family, (cfg, w)) in &decoders {
-            let root = tmp.path().join(case);
-            let dir = root.join(format!("models--gibbs-test--{case}/snapshots/main"));
+            let dir = tmp.path().join(case);
             w.write_checkpoint(&dir, cfg, DEC_VOCAB);
-            let hub = crate::model::hub::HuggingFaceHub::with_cache_dir(root.clone());
-            let host = crate::model::classifier::ln_decoder::LnDecoder::load(&hub, &format!("gibbs-test/{case}"), cfg)
-                .unwrap_or_else(|e| panic!("{case}: LnDecoder: {e}"));
             let score = &w.tensors.iter().find(|t| t.0 == "score.weight").unwrap().2;
+            let want = |i: usize| -> Vec<f32> {
+                ln_ref["f32"][format!("{case}.step{i}")].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+            };
             for dev in devices() {
                 let (got, mut r) = spec_steps(&dir, family, dev, dp, dd, "hidden", "hidden");
                 for (i, g) in got.iter().enumerate() {
-                    let want = host.last_hidden(&dec_seq[..PROMPT.len() + i]).unwrap();
-                    close(&mut bad, &format!("{case} {dev:?} step {i}"), &g[g.len() - want.len()..], &want);
+                    let w = want(i);
+                    close(&mut bad, &format!("{case} {dev:?} step {i}"), &g[g.len() - w.len()..], &w);
                 }
                 // Seq-cls: row `last_index` of the 6-row prompt (rewrites the same KV rows).
-                let last = crate::graph::Tensor::U32(vec![PROMPT.len() as u32 - 1]);
-                let logits = r.lm(dp, 0, "score", "logits", vec![last]);
-                let h = host.last_hidden(dp).unwrap();
+                let idx = crate::graph::Tensor::U32(vec![PROMPT.len() as u32 - 1]);
+                let logits = r.lm(dp, 0, "score", "logits", vec![idx]);
+                let h = want(0);
                 let want: Vec<f32> = score.chunks(h.len()).map(|row| row.iter().zip(&h).map(|(a, b)| a * b).sum()).collect();
                 close(&mut bad, &format!("{case} {dev:?} score"), &logits, &want);
                 all_read(&r, case);
@@ -1387,5 +1413,15 @@ mod tests {
             assert_eq!(l.len(), 512);
             assert!(l.iter().all(|x| x.is_finite()) && l.iter().any(|&x| x != 0.0));
         }
+    }
+
+    /// `match.bases` / `gguf_arch` listings by pipeline.
+    #[test]
+    fn listings_by_pipeline() {
+        let spec = r#"{family: "toy", pipeline: "diffusion", match: {gguf_arch: ["toy_dit"], bases: ["org/toy"]}}"#;
+        let r = Registry::from_files(&[("families/toy.json5".into(), spec.into())], &[]).unwrap();
+        assert_eq!(r.derived_bases(Pipeline::Diffusion), ["org/toy"]);
+        assert_eq!(r.pipeline_gguf_archs(Pipeline::Diffusion), ["toy_dit"]);
+        assert!(r.derived_bases(Pipeline::CausalLm).is_empty() && r.causal_lm_gguf_archs().is_empty());
     }
 }

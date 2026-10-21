@@ -115,6 +115,7 @@
       inputs: [
         {name: "token_ids", dtype: "u32", shape: ["rows"]},
         {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "last_index", dtype: "u32", shape: [1], when: "head == 'score'"},
       ],
       body: [
         {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
@@ -136,11 +137,13 @@
           {tap: "layer.{i}", in: "x"},
         ]},
         {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "last_row", args: {index: true}, in: ["x", "i:last_index"], out: "x", name: "last", when: "head == 'score'"},
         {use: "norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
-        {use: "lm_head", args: {w: "head_w", logit_scale: "logit_scale"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+        {use: "score_head", in: ["hidden"], out: "logits", name: "score", when: "head == 'score'"},
+        {use: "lm_head", args: {w: "head_w", logit_scale: "logit_scale"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head == 'last' || head == 'all'"},
       ],
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
     },
   },
-  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"]},
+  runtime: {prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"], seqcls: {head: "score", pooling: "last_nonpad"}},
 }

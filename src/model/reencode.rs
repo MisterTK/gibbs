@@ -635,9 +635,10 @@ fn is_ffn_name(name: &str) -> bool {
 /// Gather tables (token / per-layer embeddings, which a tied head shares) keep their source blocks:
 /// a gathered row's precision is not a streaming cost.
 fn is_gather_table(name: &str) -> bool {
-    ["embed", "token_embd", "ple"]
-        .iter()
-        .any(|s| name.contains(s))
+    !name.ends_with(crate::arch::build::LINEAR_COPY)
+        && ["embed", "token_embd", "ple"]
+            .iter()
+            .any(|s| name.contains(s))
 }
 
 /// Whether `f` still reads faster than the stored `src` by the rule's margin under `rate`; without
@@ -661,6 +662,38 @@ pub fn reencode_native(
     cols: usize,
     raw: &[u8],
 ) -> Option<(Q, Vec<u8>)> {
+    let f = target(cfg, name, src, cols)?;
+    // The source's own decoder, so the values are exactly what the GPU would have read.
+    encode_blocks(name, src, f, rows, cols, raw, gguf_block_codec(src)?)
+}
+
+/// [`reencode_native`] for a projection stored as `src` (any format, floats included) whose
+/// values `data` yields on demand (only when the policy re-encodes it).
+pub fn reencode_values(
+    cfg: &crate::model::weight_format::ReencodeConfig,
+    name: &str,
+    src: Q,
+    rows: usize,
+    cols: usize,
+    data: impl FnOnce() -> Option<Vec<f32>>,
+) -> Option<(Q, Vec<u8>)> {
+    let f = target(cfg, name, src, cols)?;
+    let raw: Vec<u8> = data()?.iter().flat_map(|x| x.to_le_bytes()).collect();
+    fn f32_block(b: &[u8], out: &mut [f32]) {
+        for (o, c) in out.iter_mut().zip(b.chunks_exact(4)) {
+            *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
+    }
+    encode_blocks(name, src, f, rows, cols, &raw, (32, 128, f32_block))
+}
+
+/// The format the policy re-stores `name` (stored as `src`, `cols` wide) in, if any.
+fn target(
+    cfg: &crate::model::weight_format::ReencodeConfig,
+    name: &str,
+    src: Q,
+    cols: usize,
+) -> Option<Q> {
     let ffn = match &cfg.ffn_weights {
         Some(pats) => pats.iter().any(|p| crate::arch::glob(p, name)),
         None => is_ffn_name(name),
@@ -675,11 +708,20 @@ pub fn reencode_native(
         return None;
     };
     let f = fit(f, cols, Q::FP32);
-    if f == src || !encodable(f) {
-        return None;
-    }
-    // The source's own decoder, so the values are exactly what the GPU would have read.
-    let (elems, block_bytes, decode) = gguf_block_codec(src)?;
+    (f != src && encodable(f)).then_some(f)
+}
+
+/// Re-encodes `raw` (`src`'s `rows x cols` weights as `(elems, block_bytes, decode)` blocks) into
+/// `f`, bumped until the per-tensor RMSE gate holds; `None` when that no longer beats `src`.
+fn encode_blocks(
+    name: &str,
+    src: Q,
+    f: Q,
+    rows: usize,
+    cols: usize,
+    raw: &[u8],
+    (elems, block_bytes, decode): (usize, usize, crate::model::layers::GgufBlockFn),
+) -> Option<(Q, Vec<u8>)> {
     let row_bytes = cols / elems * block_bytes;
     if cols % elems != 0 || raw.len() != rows * row_bytes {
         return None;
@@ -731,7 +773,7 @@ pub fn reencode_native(
     let mut stats = NATIVE_STATS.lock();
     stats.reencoded += 1;
     (stats.bytes_before, stats.bytes_after) = (
-        stats.bytes_before + raw.len() as u64,
+        stats.bytes_before + (rows * src.tensor_bytes(cols)) as u64,
         stats.bytes_after + blocks.len() as u64,
     );
     tracing::debug!("reencode {name} {rows}x{cols}: {src:?} -> {f:?} (rmse {rmse:.4})");

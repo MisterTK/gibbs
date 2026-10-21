@@ -21,7 +21,7 @@ use super::expr::{eval_json, interp, walk, Env, Val};
 use super::gen::{self, Gen, GenData};
 use super::names::{Renamer, Rule};
 use super::{
-    glob, Component, Constant, Lora, Pipeline, Registry, Signals, Source, Spec, Transform,
+    glob, Component, Constant, Ignore, Lora, Pipeline, Registry, Signals, Source, Spec, Transform,
 };
 use crate::graph::{self, DType, Tensor};
 use crate::hardware::QuantFormat as Q;
@@ -370,7 +370,7 @@ fn open_weights(ck: &mut Checkpoint, p: &Path, config: Option<&Path>) -> Result<
         let dir = p.parent().unwrap_or(Path::new("."));
         crate::model::prequant::check(config, dir)?;
         ck.lora_merged = peft_merged(p);
-        index_weights(ck, crate::model::prequant::open_weights(p, config)?);
+        index_weights(ck, crate::model::prequant::open_weights(p, config, true)?);
         return Ok(());
     }
     let (m, data) = crate::model::loaders::read_checkpoint(p)?;
@@ -443,7 +443,7 @@ fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData, sidecar: boo
     }
 }
 
-/// llama.cpp's multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
+/// The multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
 /// join the raw tensors, seen only by specs with `runtime.media`, and its metadata keys the
 /// `gguf` scope (the weights file's own keys win, `general.architecture` among them).
 fn index_sidecar(ck: &mut Checkpoint, p: &Path) -> Result<(), String> {
@@ -843,8 +843,8 @@ impl Env for ModelEnv {
 /// The most elements `values(name)` reads.
 const SMALL_VALUES: usize = 1 << 16;
 
-/// `n` as f32 values from checkpoint data, generators and transforms (`None` for adapter and
-/// synthetic tensors, which exist only once the store is built).
+/// `n` as f32 values from checkpoint data, generators and transforms (`None` for adapter,
+/// synthetic and precomputed tensors, which exist only once the store is built).
 fn node_values(ckpt: &Checkpoint, n: &Node) -> Option<Vec<f32>> {
     match &n.src {
         Src::Raw(r) => ckpt.raw_f32(r).ok(),
@@ -885,6 +885,9 @@ pub struct WeightStore {
 
 impl WeightStore {
     fn node(&self, name: &str) -> Option<Arc<Node>> {
+        let name = name
+            .strip_suffix(crate::arch::build::LINEAR_COPY)
+            .unwrap_or(name);
         self.table.read().get(name).cloned()
     }
 
@@ -930,16 +933,57 @@ impl WeightStore {
         let t = self
             .build(name, &n, k)
             .map_err(|e| format!("tensor `{name}`: {e}"))?;
-        let passthrough =
-            matches!(n.src, Src::Raw(_)) && k == n.kind && !matches!(k, Kind::Packed(_));
+        let passthrough = matches!(n.src, Src::Raw(_))
+            && k == n.kind
+            && !matches!(k, Kind::Packed(_))
+            && !matches!(&t, Tensor::Mat(m) if m.packed().is_some());
         if !passthrough {
             self.cache.lock().insert(name.to_string(), t.clone());
         }
         Ok(t)
     }
 
+    /// Whether the re-encode policy decides the stored format of `n` (as `k`): matrices of blocks
+    /// and float weight matrices (not generated constants or convolution kernels).
+    fn reencodable(&self, n: &Node, k: Kind) -> bool {
+        n.shape.len() == 2
+            && self.reencode.force.is_none()
+            && match k {
+                Kind::Packed(_) => n.kind == k,
+                Kind::F32 | Kind::F16 | Kind::Bf16 => !n.conv && !matches!(n.src, Src::Gen(_)),
+                Kind::U32 => false,
+            }
+    }
+
     fn build(&self, name: &str, n: &Node, k: Kind) -> Result<Tensor, String> {
         let (rows, cols) = rows_cols(&n.shape);
+        let float = match k {
+            Kind::F32 => Some(Q::FP32),
+            Kind::F16 => Some(Q::FP16),
+            Kind::Bf16 => Some(Q::BF16),
+            _ => None,
+        };
+        // Bit-exact keeps float matrices as stored (its rule would block-encode codec-less sources).
+        let lossy = self.reencode.policy != ReencodePolicy::BitExact;
+        if let (Some(src), true) = (float, lossy && self.reencodable(n, k)) {
+            let r = crate::model::reencode::reencode_values(
+                &self.reencode,
+                name,
+                src,
+                rows,
+                cols,
+                || self.dense(n).ok(),
+            );
+            if let Some((f, blocks)) = r {
+                let p = Packed {
+                    map: Arc::new(GgufData::Buf(blocks)),
+                    off: 0,
+                    format: f,
+                    shape: n.shape.clone(),
+                };
+                return Ok(Tensor::Mat(Mat::from_packed(p, rows, cols)));
+            }
+        }
         Ok(match k {
             Kind::U32 => match &n.src {
                 Src::Gen(g) => match &g.data {
@@ -1109,6 +1153,7 @@ impl WeightStore {
         let table = self.table.read();
         let mut fed = HashSet::new();
         for u in used {
+            let u = u.strip_suffix(crate::arch::build::LINEAR_COPY).unwrap_or(u);
             if let Some(n) = table.get(u) {
                 leaves(n, &mut fed);
             }
@@ -1118,13 +1163,15 @@ impl WeightStore {
                 leaves(n, &mut fed);
             }
         }
-        let canonical: HashMap<&str, &str> = table
-            .iter()
-            .filter_map(|(c, n)| match &n.src {
-                Src::Raw(r) => Some((r.as_str(), c.as_str())),
-                _ => None,
-            })
-            .collect();
+        // Raw name → the canonical names it feeds (through transforms too).
+        let mut canonical: HashMap<String, Vec<&str>> = HashMap::new();
+        for (c, n) in table.iter() {
+            let mut raws = HashSet::new();
+            leaves(n, &mut raws);
+            for r in raws {
+                canonical.entry(r).or_default().push(c.as_str());
+            }
+        }
         // ponytail: any sibling of a consumed `X.weight` but `X.bias` counts as its companion;
         // ask the source for real companion lists if this hides an unused tensor.
         let companion = |r: &str| {
@@ -1142,7 +1189,7 @@ impl WeightStore {
             .filter(|r| {
                 !ignore
                     .iter()
-                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|c| glob(g, c)))
+                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|cs| cs.iter().any(|c| glob(g, c))))
             })
             .cloned()
             .collect()
@@ -1237,12 +1284,7 @@ impl Source for WeightStore {
         let n = self.node(name)?;
         let k = self.final_kind(&n);
         // A re-encode policy picks the stored format from the data: decide it now (cached).
-        if matches!(k, Kind::Packed(_))
-            && n.kind == k
-            && n.shape.len() == 2
-            && self.reencode.force.is_none()
-            && self.reencode.policy != ReencodePolicy::BitExact
-        {
+        if self.reencodable(&n, k) && self.reencode.policy != ReencodePolicy::BitExact {
             match self.get(name) {
                 Ok(t) => return Some((n.shape.clone(), dtype_of(&t))),
                 Err(e) => tracing::warn!("{e}"),
@@ -1572,8 +1614,7 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
         // matrices); packed blocks stay as stored.
         "to_bf16" if matches!(k, Kind::Packed(_)) => k,
         "to_bf16" => Kind::Bf16,
-        // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
-        "untile_packed_rows" | "reshape" => k,
+        "untile_packed_rows" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
     }
@@ -1877,6 +1918,8 @@ pub struct Model {
     pub ckpt: Arc<Checkpoint>,
     /// (raw checkpoint name, canonical name) of every raw tensor, sorted by raw name.
     pub renames: Vec<(String, String)>,
+    /// `spec.ignore` globs whose `when` holds (for [`WeightStore::unconsumed`]).
+    pub ignore: Vec<String>,
 }
 
 /// Opens `artifacts` and loads it as `family` (detected from the checkpoint when `None`), under
@@ -2039,6 +2082,17 @@ fn load_from(
         .keys()
         .map(|r| (r.clone(), ren.canonical(r)))
         .collect();
+    let mut ignore = Vec::new();
+    for i in &spec.ignore {
+        match i {
+            Ignore::Glob(g) => ignore.push(g.clone()),
+            Ignore::When { glob, when } => {
+                if env.eval(&J::String(when.clone())).map_err(|e| fam(format!("ignore `{glob}`: {e}")))?.truthy() {
+                    ignore.push(glob.clone());
+                }
+            }
+        }
+    }
     Ok(Model {
         spec,
         env,
@@ -2046,6 +2100,7 @@ fn load_from(
         tokenizer,
         ckpt,
         renames,
+        ignore,
     })
 }
 
@@ -2540,6 +2595,53 @@ mod tests {
         load_with(&a, &registry(&[&spec]), None, exact())
     }
 
+    #[test]
+    fn projection_copy_reencodes_and_round_trips() {
+        let d = tempfile::tempdir().unwrap();
+        let (rows, cols) = (64, 256);
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 40.0)
+            .collect();
+        write_st(
+            &d.path().join("model.safetensors"),
+            None,
+            &[("embed", "BF16", &[rows, cols], bf16b(&v))],
+        );
+        let a = artifacts(
+            d.path(),
+            Some("model.safetensors"),
+            Some(json!({"model_type": "toy"})),
+        );
+        let spec = r#"{family: "toy", match: {hf_model_type: ["toy"]}, pipeline: "causal_lm"}"#;
+        let cfg = ReencodeConfig {
+            policy: ReencodePolicy::MaxSpeed,
+            ..exact()
+        };
+        let m = load_with(&a, &registry(&[spec]), None, cfg).unwrap();
+        let name = format!("embed{}", crate::arch::build::LINEAR_COPY);
+        let (_, dtype) = m.store.tensor(&name).unwrap();
+        let t = get(&m, &name);
+        assert_eq!(dtype_of(&t), dtype);
+        let Tensor::Mat(mat) = &t else {
+            panic!("not a Mat")
+        };
+        let p = mat
+            .packed()
+            .expect("max-speed re-encodes the projection copy");
+        let (elems, bytes, dec) = crate::model::layers::gguf_block_codec(p.format).unwrap();
+        let mut got = vec![0.0f32; rows * cols];
+        for (b, o) in p.map[p.off..]
+            .chunks_exact(bytes)
+            .zip(got.chunks_exact_mut(elems))
+        {
+            dec(b, o);
+        }
+        let ref_v: Vec<f32> = v.iter().map(|&x| bf16_to_f32(f32_to_bf16(x))).collect();
+        assert!(crate::model::reencode::relative_rmse(&ref_v, &got) < 0.1);
+        // The gather table itself keeps its encoding.
+        assert!(matches!(get(&m, "embed"), Tensor::Mat(m) if m.packed().is_none()));
+    }
+
     fn get(m: &Model, n: &str) -> Tensor {
         m.store
             .materialize(&[n.to_string()])
@@ -2977,21 +3079,25 @@ mod tests {
                 ("skip.me", "F32", &[1], one()),
                 ("raw.thing", "F32", &[1], one()),
                 ("src.w", "F32", &[1], one()),
+                ("maybe.a", "F32", &[1], one()),
+                ("maybe.b", "F32", &[1], one()),
             ],
-            r#"ignore: ["skip.*", "canon.*"],
+            // `{glob, when}`: ignored only when `when` holds.
+            r#"ignore: ["skip.*", "canon.*", {glob: "maybe.a", when: "has('skip.me')"},
+                     {glob: "maybe.b", when: "has('nope')"}],
             names: {rules: [["raw.thing", "canon.thing"]]},
             transforms: [{tensor: "src.w", op: "scale", args: {value: 2}}]"#,
         )
         .unwrap();
         let used: HashSet<String> = ["used.weight", "src.w"].map(String::from).into();
-        let ignore = m.spec.ignore.clone();
+        let ignore = m.ignore.clone();
         assert_eq!(
             m.store.unconsumed(&used, &ignore),
-            ["unused.weight", "used.bias"]
+            ["maybe.b", "unused.weight", "used.bias"]
         );
         // A `values(name)` read (a build-time constant) consumes the tensor.
         assert_eq!(m.env.values("used.bias"), Some(vec![1.0]));
-        assert_eq!(m.store.unconsumed(&used, &ignore), ["unused.weight"]);
+        assert_eq!(m.store.unconsumed(&used, &ignore), ["maybe.b", "unused.weight"]);
     }
 
     #[test]
