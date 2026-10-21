@@ -32,7 +32,7 @@ fn nrm(s: &mut Specs, p: &str, c: usize) {
 fn write_specs(path: &Path, seed: u64, specs: &[(String, Vec<usize>)], dtype: StDtype) {
     let mut w = Weights::new(seed);
     for (n, s) in specs {
-        if s.len() == 1 && (n.ends_with("weight") || n.ends_with("scale")) {
+        if s.len() == 1 && (n.ends_with("weight") || n.ends_with("scale") || n.ends_with("running_var")) {
             w.norm(n.clone(), s[0], 1.0);
         } else if s.len() == 1 || n.ends_with("bias") {
             w.s(n.clone(), s, 0.1);
@@ -577,7 +577,7 @@ enum Flux {
 /// `pooled`-wide pooled text.
 fn write_flux(dir: &Path, kind: Flux, seed: u64, pooled: usize) {
     if kind == Flux::Two {
-        return write_flux2(dir, seed);
+        return write_flux2(dir, seed, 24);
     }
     let d = 128;
     let chroma = kind == Flux::Chroma;
@@ -652,12 +652,13 @@ fn write_flux(dir: &Path, kind: Flux, seed: u64, pooled: usize) {
 
 /// FLUX.2 in BFL (single-file) names: the current loader detects diffusers FLUX.2 single blocks
 /// only via `attn.to_q`, which the fused diffusers `to_qkv_mlp_proj` layout lacks. Shared
-/// modulations, SwiGLU feed-forwards (double 192, single 160 hidden), fused qkv/linear1.
-fn write_flux2(dir: &Path, seed: u64) {
+/// modulations, SwiGLU feed-forwards (double 192, single 160 hidden), fused qkv/linear1,
+/// `joint`-wide text.
+fn write_flux2(dir: &Path, seed: u64, joint: usize) {
     let d = 128;
     let mut s = Specs::new();
     lin(&mut s, "img_in", 16, d, true);
-    lin(&mut s, "txt_in", 24, d, true);
+    lin(&mut s, "txt_in", joint, d, true);
     lin(&mut s, "time_in.in_layer", 256, d, true);
     lin(&mut s, "time_in.out_layer", d, d, true);
     lin(&mut s, "double_stream_modulation_img.linear", d, 6 * d, true);
@@ -690,7 +691,7 @@ fn write_flux2(dir: &Path, seed: u64) {
         &json!({
             "_class_name": "Flux2Transformer2DModel", "patch_size": 1, "in_channels": 16,
             "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 128,
-            "num_attention_heads": 1, "joint_attention_dim": 24, "axes_dims_rope": [32, 32, 32, 32]
+            "num_attention_heads": 1, "joint_attention_dim": joint, "axes_dims_rope": [32, 32, 32, 32]
         }),
     );
 }
@@ -796,6 +797,80 @@ fn flux1_pipeline() {
 #[test]
 fn chroma_pipeline() {
     flux_pipeline_case("diffa_chroma_pipeline", Flux::Chroma);
+}
+
+/// The whole `Flux2KleinPipeline` (undistilled: true CFG on the empty negative prompt): a 28-layer
+/// Qwen3 text encoder (64 wide; layers 8 / 17 / 26 concatenated = the transformer's 192-wide
+/// text) on the chat-templated prompt padded with `<|endoftext|>` to 512, the [`write_flux2`]
+/// transformer, the 4-channel 8x VAE with BatchNorm stats, 2 empirical-mu flow-Euler steps.
+#[test]
+fn klein_pipeline() {
+    use crate::text_enc::{text_config, weights, H, V};
+    use gibbs_engine::runtime::diffusion::{load_image, ImageRequest};
+    let dir = fixture_dir("diffa_klein_pipeline");
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "Flux2KleinPipeline", "is_distilled": false}));
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
+                "shift": 3.0, "use_dynamic_shifting": true, "base_shift": 0.5, "max_shift": 1.15,
+                "base_image_seq_len": 256, "max_image_seq_len": 4096}),
+    );
+    let te = dir.join("text_encoder");
+    let mut cfg = text_config("qwen3", 28);
+    cfg["architectures"] = json!(["Qwen3ForCausalLM"]);
+    cfg["max_position_embeddings"] = json!(1024);
+    write_json(&te.join("config.json"), &cfg);
+    write_st_as(&te.join("model.safetensors"), &weights(41, "model", true, 28).tensors, StDtype::BF16);
+    // WordLevel `t4 .. t{V-4}` + the Qwen chat specials; `<|endoftext|>` pads.
+    let specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"];
+    let mut vocab = Map::new();
+    vocab.insert("<unk>".into(), json!(0));
+    for i in 4..V - 3 {
+        vocab.insert(format!("t{i}"), json!(i));
+    }
+    let added: Vec<Value> = specials
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            vocab.insert(s.to_string(), json!(V - 3 + i));
+            json!({"id": V - 3 + i, "content": s, "single_word": false, "lstrip": false,
+                   "rstrip": false, "normalized": false, "special": true})
+        })
+        .collect();
+    let tok = dir.join("tokenizer");
+    write_json(
+        &tok.join("tokenizer.json"),
+        &json!({"version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+                "normalizer": null, "pre_tokenizer": {"type": "WhitespaceSplit"}, "post_processor": null,
+                "decoder": null, "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}}),
+    );
+    write_json(
+        &tok.join("tokenizer_config.json"),
+        &json!({"chat_template": "{% for m in messages %}<|im_start|> {{ m.role }} {{ m.content }} <|im_end|> {% endfor %}{% if add_generation_prompt %}<|im_start|> assistant {% endif %}"}),
+    );
+    write_flux2(&dir, 5, 3 * H);
+    write_vae(&dir, &[32, 32, 32, 32], true);
+    let hub = clip_hub(&dir);
+    let art = artifacts(&dir, "golden/tiny-klein", "none");
+    let req = ImageRequest {
+        prompt: "t5 t17 t30".into(),
+        width: Some(32),
+        height: Some(48),
+        steps: Some(2),
+        guidance: Some(4.0),
+        seed: 7,
+        ..Default::default()
+    };
+    golden("diffa_klein_pipeline", tol(2e-3, 0.99999), |dev| {
+        // runner: runtime::diffusion::load_image (the public loader), pinned to `dev`
+        let p = load_image(&art, &hub, pin(dev)).expect("image repo").unwrap();
+        let img = on(dev, || p.text_to_image(&req)).unwrap();
+        assert_eq!((img.width, img.height, img.channels), (32, 48, 3));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -943,6 +1018,12 @@ fn vae_mid(s: &mut Specs, p: &str, c: usize) {
 /// diffusers AutoencoderKL `vae/` with `chans` block_out_channels, 4 latent channels, 1 encoder /
 /// 2 decoder ResBlocks per level, a 2x down/upsample between levels.
 pub(crate) fn write_sd_vae(dir: &Path, chans: &[usize]) {
+    write_vae(dir, chans, false)
+}
+
+/// [`write_sd_vae`]; `bn`: plus the FLUX.2 VAE's BatchNorm stats over the 2x2-packed latent
+/// channels (`bn.running_mean` / `bn.running_var`, 16 wide).
+fn write_vae(dir: &Path, chans: &[usize], bn: bool) {
     let (n, c0, top) = (chans.len(), chans[0], chans[chans.len() - 1]);
     let mut s = Specs::new();
     conv(&mut s, "encoder.conv_in", 3, c0, 3);
@@ -972,6 +1053,10 @@ pub(crate) fn write_sd_vae(dir: &Path, chans: &[usize]) {
     }
     nrm(&mut s, "decoder.conv_norm_out", c0);
     conv(&mut s, "decoder.conv_out", c0, 3, 3);
+    if bn {
+        s.push(("bn.running_mean".into(), vec![16]));
+        s.push(("bn.running_var".into(), vec![16]));
+    }
     let v = dir.join("vae");
     write_specs(&v.join("diffusion_pytorch_model.safetensors"), 7, &s, StDtype::F32);
     write_json(
@@ -979,7 +1064,7 @@ pub(crate) fn write_sd_vae(dir: &Path, chans: &[usize]) {
         &json!({
             "_class_name": "AutoencoderKL", "in_channels": 3, "out_channels": 3,
             "latent_channels": 4, "block_out_channels": chans, "layers_per_block": 1,
-            "norm_num_groups": 32, "scaling_factor": 0.18215, "sample_size": 16,
+            "norm_num_groups": 32, "scaling_factor": 0.18215, "sample_size": 16, "batch_norm_eps": 1e-4,
             "down_block_types": vec!["DownEncoderBlock2D"; n],
             "up_block_types": vec!["UpDecoderBlock2D"; n]
         }),

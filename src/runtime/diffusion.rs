@@ -1879,7 +1879,12 @@ pub fn load_image_in(
                 "{class} is an image-to-image-only pipeline; load its text-to-image base repo and use /v1/images/edits"
             )));
         }
-        return None;
+        // Another kind of pipeline a spec runs (video) loads elsewhere.
+        let sig = crate::arch::Signals { diffusers_class: Some(class.clone()), ..Default::default() };
+        if reg.detect(&sig).is_some() {
+            return None;
+        }
+        return Some(Err(format!("diffusers pipeline {class} is not supported")));
     }
     let weights = artifacts.weights_path.as_deref()?;
     let names = weight_names(weights)?;

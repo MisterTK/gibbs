@@ -1385,7 +1385,7 @@ fn qwen_image21_derived_repo() {
     use crate::diffa::{on, pin};
     use gibbs_engine::arch::testing::compare;
     use gibbs_engine::model::hub::HuggingFaceHub;
-    use gibbs_engine::runtime::diffusion::{load_image, Extras, SpecDiffusion};
+    use gibbs_engine::runtime::diffusion::{load_image, Extras, ImageGenerator, SpecDiffusion};
     let dir = fixture_dir("diffb_qwen_image21_derived");
     let base = dir.join("hub/models--golden--qwen21-base/snapshots/main");
     write_qwen21_pipeline(&base);

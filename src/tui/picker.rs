@@ -1736,7 +1736,7 @@ const IMAGE_PIPELINES: &[&str] = &[
 ];
 
 /// FLUX.1 bases whose LoRAs, single-file finetunes and transformer-only GGUFs
-/// [`crate::model::flux::load_derived`] runs on top of the base repo.
+/// [`crate::runtime::diffusion::load_image`] runs on top of the base repo.
 const FLUX_BASES: &[&str] = &[
     "black-forest-labs/FLUX.1-schnell",
     "black-forest-labs/FLUX.1-dev",

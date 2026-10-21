@@ -1006,7 +1006,11 @@ mod tests {
                 let (want, _) = model::dit_graph::axis_freqs(&dims, 10000.0);
                 assert_eq!(bits(&f("axis_freqs", json!({"dims": dims, "theta": 10000.0}))), bits(&want));
             }
-            let (want, _, _) = model::flux::graph_program::rope_tables(&[32, 32, 32, 32], 2000.0);
+            // The former `flux::graph_program::rope_tables` for FLUX.2's (t, h, w, l) axes: t
+            // shares h's section at zero frequency.
+            let (mut want, _) = model::dit_graph::axis_freqs(&[64, 32, 32], 2000.0);
+            let (h, _) = model::dit_graph::axis_freqs(&[32], 2000.0);
+            want.splice(0..32, std::iter::repeat_n(0.0, 16).chain(h));
             let got = f("axis_freqs", json!({"dims": [32, 32, 32, 32], "theta": 2000.0, "identity_axes": [0]}));
             assert_eq!(bits(&got), bits(&want));
         }
@@ -1043,18 +1047,24 @@ mod tests {
 
         #[test]
         fn timestep_embedding_matches_sources() {
+            // The former `flux::sinusoid`, verbatim.
+            fn sinusoid(x: f64, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let args: Vec<f64> = (0..half).map(|i| x * (-(10000f64.ln()) * i as f64 / half as f64).exp()).collect();
+                args.iter().map(|a| a.cos() as f32).chain(args.iter().map(|a| a.sin() as f32)).collect()
+            }
             for (t, dim) in [(999.0f32, 320), (0.37, 256), (1.0, 7)] {
                 let f32a = json!({"t": t, "dim": dim, "precision": "f32"});
                 assert_eq!(bits(&f("timestep_embedding", f32a.clone())), bits(&model::unet::timestep_embedding(t, dim)));
                 let want = model::dit::timestep_features(t, dim);
                 assert_eq!(bits(&f("timestep_embedding", f32a)[..want.len()]), bits(&want));
-                let want = model::flux::sinusoid(t as f64 * 1000.0, dim);
+                let want = sinusoid(t as f64 * 1000.0, dim);
                 let got = f("timestep_embedding", json!({"t": t as f64 * 1000.0, "dim": dim}));
                 assert_eq!(bits(&got[..want.len()]), bits(&want));
             }
             // modulation_index_rows == Approx::input_rows composition.
             let t = 0.3f32;
-            let s = model::flux::sinusoid;
+            let s = sinusoid;
             let want: Vec<f32> = (0..3)
                 .flat_map(|i| [s(t as f64 * 1000.0, 16), s(0.0, 16), s(i as f64 * 1000.0, 32)].concat())
                 .collect();
@@ -1108,7 +1118,9 @@ mod tests {
         #[test]
         fn positions_match_sources() {
             for (nt, h, w, ax) in [(3, 2, 3, false), (2, 4, 1, true)] {
-                let ids: Vec<Vec<usize>> = model::flux::position_ids(nt, h, w, ax).iter().map(|i| i.to_vec()).collect();
+                // The former `flux::position_ids`: text tokens, then the packed grid row-major.
+                let mut ids: Vec<Vec<usize>> = (0..nt).map(|l| vec![0, 0, 0, if ax { l } else { 0 }]).collect();
+                ids.extend((0..h * w).map(|i| vec![0, i / w, i % w, 0]));
                 let want = model::dit_graph::positions(&ids, if ax { [1, 2, 3] } else { [0, 1, 2] });
                 assert_eq!(u("text_zero_grid3", json!({"text_len": nt, "grid_h": h, "grid_w": w, "text_axis": ax})), want);
             }

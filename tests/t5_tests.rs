@@ -5,8 +5,6 @@
 use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::hub::ModelArtifacts;
 use gibbs_engine::model::native::NativeLm;
-use gibbs_engine::model::t5::T5Encoder;
-use gibbs_engine::model::weights::Weights;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -171,47 +169,6 @@ fn mt5_summarizes() {
         misinformation about Covid vaccines.";
     let s = reply(m.as_ref(), article, 64).to_lowercase();
     assert!(s.contains("youtube") && s.contains("vaccine"), "{s}");
-}
-
-/// A diffusers T5-XXL text encoder (`text_encoder_2` of a FLUX repo, bf16 shards; set
-/// `GIBBS_T5XXL_DIR` to it, `tokenizer_2/` beside it) through [`T5Encoder`]: finite, normed
-/// states whose mean-pooled embeddings put a cat nearer a kitten than a tax report.
-#[test]
-fn t5_xxl_text_encoder_embeds_meaningfully() {
-    let Ok(dir) = std::env::var("GIBBS_T5XXL_DIR").map(PathBuf::from) else {
-        eprintln!("SKIP: GIBBS_T5XXL_DIR is not set");
-        return;
-    };
-    let w = Weights::open(&dir.join("model.safetensors.index.json")).expect("shards open");
-    let cfg: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let enc = T5Encoder::load(&w, &cfg, "").expect("encoder loads");
-    let tok = gibbs_engine::model::hf_loader::load_json_tokenizer(
-        &dir.join("../tokenizer_2/tokenizer.json"),
-    )
-    .expect("tokenizer_2");
-    let d = enc.d_model();
-    let embed = |text: &str| {
-        let mut ids = tok.encode(text);
-        ids.push(1); // </s>
-        let h = enc.encode(&ids);
-        assert!(h.iter().all(|v| v.is_finite()), "{text}");
-        let mut mean = vec![0.0f32; d];
-        for row in h.chunks_exact(d) {
-            mean.iter_mut().zip(row).for_each(|(m, v)| *m += v);
-        }
-        let n = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
-        mean.iter().map(|v| v / n).collect::<Vec<f32>>()
-    };
-    let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
-    let (cat, kitten, tax) = (
-        embed("a photo of a cat sitting on a sofa"),
-        embed("a picture of a kitten resting on a couch"),
-        embed("quarterly corporate tax report spreadsheet"),
-    );
-    let (near, far) = (cos(&cat, &kitten), cos(&cat, &tax));
-    eprintln!("cos(cat, kitten) = {near:.4}, cos(cat, tax) = {far:.4}");
-    assert!(near > far + 0.05, "{near} vs {far}");
 }
 
 /// Mesh-TF score `-sum log p(target | input)` with teacher forcing, as transformers'

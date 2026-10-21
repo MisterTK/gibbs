@@ -8,7 +8,6 @@ use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::runtime::encoder::system1::JevSystem1Model;
-use crate::model::text_to_image::load_image_model;
 use crate::model::weight_format::{
     load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
     ReencodePolicy,
@@ -133,10 +132,7 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
         }
         Some(_) => {}
         None => {
-            // legacy: until the remaining image families' phases (`load_image_model`).
-            let img = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement)
-                .or_else(|| load_image_model(&artifacts, hub));
-            if let Some(img) = img {
+            if let Some(img) = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement) {
                 return img.map(Loaded::Image);
             }
         }

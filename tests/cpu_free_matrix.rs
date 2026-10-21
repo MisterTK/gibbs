@@ -455,10 +455,9 @@ fn gpu_fixture(f: Family) {
             run_on_gpu("Audio conformer", g, w);
             scatter_fixture("Audio");
         }
-        Family::DiffusionDit => {
-            let (g, w) = gibbs_engine::model::flux::tiny_dit_graph().expect("tiny FLUX DiT graph");
-            run_on_gpu("DiffusionDit", g, w);
-        }
+        // The spec FLUX / FLUX.2 pipelines: golden `diffa::flux1_pipeline` / `diffa::klein_pipeline`
+        // assert their Metal legs enter no CPU compute.
+        Family::DiffusionDit => {}
         Family::VideoLtx => {
             // The `ltx` and `modelscope_t2v` spec denoisers on tiny checkpoints, Metal programs.
             gibbs_engine::model::diff_fixtures::tiny_video_on_gpu().expect("tiny video denoisers run on Metal");
