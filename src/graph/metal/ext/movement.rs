@@ -1,5 +1,5 @@
 //! Metal lowering group `movement`: Reshape/Squeeze/Unsqueeze (aliases), Slice, Concat, Transpose,
-//! Pad, Tile, Gather, Scatter, Upsample. Kernels live in `movement.metal`.
+//! Pad, Tile, Gather, Scatter, Upsample, StateWrite. Kernels live in `movement.metal`.
 //!
 //! Most ops are one generic strided copy (`mv_strided`, see [`Map`]); views that keep the memory
 //! layout alias their operand instead of copying.
@@ -17,6 +17,7 @@ pub(super) const KERNELS: &[&str] = &[
     "mv_gather",
     "mv_scatter",
     "mv_upsample",
+    "mv_state_write",
 ];
 
 const MAX_RANK: usize = 6;
@@ -86,6 +87,15 @@ pub enum Step {
         p: ScatterP,
     },
     Upsample { x: ValueId, p: UpP },
+    /// Write `m` rows of width `w` into the `[cap, w]` state at row `pos0[0]`; the output is the token.
+    StateWrite {
+        state: ValueId,
+        rows: ValueId,
+        pos0: ValueId,
+        m: usize,
+        w: usize,
+        cap: usize,
+    },
 }
 
 /// Whether the Metal executor lowers `op` for `dtype` (the weight/output dtype the placer passes).
@@ -104,6 +114,7 @@ pub(super) fn supports(op: &Op, dtype: DType) -> bool {
                 | Op::Gather { .. }
                 | Op::Scatter { .. }
                 | Op::Upsample { .. }
+                | Op::StateWrite
         )
 }
 
@@ -422,6 +433,23 @@ fn plan_op(
             };
             Ok(PlanOut::Step(Step::Upsample { x, p }, out_n))
         }
+        Op::StateWrite => {
+            let (state, rows, pos0) = (arg(0)?, arg(1)?, arg(2)?);
+            if !matches!(g.value(state).kind, ValueKind::State { .. }) {
+                return Err(format!("node '{name}': StateWrite operand 0 must be a graph state"));
+            }
+            let &[cap, w] = shape_of(g, state)? else {
+                return Err(format!("node '{name}': StateWrite state is not [cap, w]"));
+            };
+            let rn: usize = shape_of(g, rows)?.iter().product();
+            if w == 0 || rn % w != 0 || g.value(pos0).dtype != DType::U32 {
+                return Err(format!(
+                    "node '{name}': StateWrite needs rows [m, {w}] and a u32 pos0"
+                ));
+            }
+            u32_of(cap * w)?;
+            Ok(PlanOut::Step(Step::StateWrite { state, rows, pos0, m: rn / w, w, cap }, 1))
+        }
         _ => Err(format!("node '{name}': movement group does not own {}", node.op.name())),
     }
 }
@@ -433,6 +461,7 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
         Step::Gather { x, idx, .. } => vec![*x, *idx],
         Step::Scatter { base, idx, upd, .. } => vec![*base, *idx, *upd],
         Step::Upsample { x, .. } => vec![*x],
+        Step::StateWrite { state, rows, pos0, .. } => vec![*state, *rows, *pos0],
     }
 }
 
@@ -440,6 +469,7 @@ pub(super) fn reads(st: &Step) -> Vec<ValueId> {
 pub(super) fn allows_non_f32(st: &Step, v: ValueId) -> bool {
     match st {
         Step::Gather { idx, .. } | Step::Scatter { idx, .. } => v == *idx,
+        Step::StateWrite { pos0, .. } => v == *pos0,
         _ => false,
     }
 }
@@ -502,6 +532,18 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                 set_bytes(e.enc, 2, p);
                 e.grid1(p.n as usize);
             }
+        }
+        Step::StateWrite { state, rows, pos0, m, w, cap } => {
+            // The state buffer may hold fewer rows than declared (lazy growth): never write past it.
+            let (buf, off) = (e.loc)(*state);
+            let held = (buf.length() as usize).saturating_sub(off) / (w * 4);
+            e.enc.set_compute_pipeline_state(sess.rt.pso("mv_state_write")?);
+            e.bind(0, *rows);
+            e.bind(1, *pos0);
+            e.bind(2, *state);
+            e.bind(3, s.out);
+            set_bytes(e.enc, 4, &[u32_of(m * w)?, u32_of(*w)?, u32_of(held.min(*cap))?]);
+            e.grid1((m * w).max(1));
         }
     }
     Ok(())

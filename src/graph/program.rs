@@ -214,6 +214,12 @@ impl GraphProgram {
         }
     }
 
+    /// Names of the program's recurrent states (`Graph::state(.., recurrent: true)`): those
+    /// [`StateStore::truncate`] refuses to rewind.
+    pub fn recurrent_states(&self) -> Vec<String> {
+        self.segment.graph().recurrent_states()
+    }
+
     /// The program's graph nodes grouped by op kind, device and avenue, most numerous first.
     pub fn placement_summary(&self) -> Vec<PlacementRow> {
         let mut rows: Vec<PlacementRow> = Vec::new();
@@ -273,7 +279,7 @@ impl GraphProgram {
         (bytes, ceiling_gbps, roofline_tok_s)
     }
 
-    /// Whether the program is exactly one Metal segment (the shape [`Self::run_reshaped`] needs).
+    /// Whether the program is exactly one Metal segment.
     pub fn is_single_metal(&self) -> bool {
         #[cfg(target_os = "macos")]
         return matches!(self.segment, CompiledSegment::Metal { .. });
@@ -281,9 +287,10 @@ impl GraphProgram {
         false
     }
 
-    /// Runs `graph` on the program's Metal segment inside the program's state: another row count of the
-    /// compiled network (same weight and state names), e.g. a batched prefill pass. Plans are cached by
-    /// the graph's node count and input shapes, which identify such a graph (prefill chunks repeat).
+    /// Runs `graph` with the program's weights inside the program's state: another instance shape of
+    /// the compiled network (same weight and state names), e.g. a batched prefill pass. On Metal, plans
+    /// are cached by the graph's node count and input shapes, which identify such a graph (prefill
+    /// chunks repeat); on the CPU the graph runs directly.
     pub fn run_reshaped(
         &mut self,
         graph: &Graph,
@@ -291,36 +298,37 @@ impl GraphProgram {
     ) -> Result<Vec<Tensor>, String> {
         #[cfg(test)]
         crate::graph::shape::note(graph);
-        #[cfg(target_os = "macos")]
-        if let CompiledSegment::Metal { session, .. } = &self.segment {
-            let shapes: Vec<Vec<usize>> = graph
-                .inputs
-                .iter()
-                .map(|&v| graph.value(v).shape.clone())
-                .collect();
-            let n = graph.nodes.len();
-            let hit = self
-                .reshaped
-                .iter()
-                .position(|(c, s, _)| *c == n && *s == shapes);
-            // Least recently used first: a varying tail chunk must not evict the full chunk's plan.
-            let entry = match hit {
-                Some(i) => self.reshaped.remove(i),
-                None => {
-                    // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
-                    // their row counts more.
-                    if self.reshaped.len() == 4 {
-                        self.reshaped.remove(0);
+        match &self.segment {
+            CompiledSegment::Cpu { weights, .. } => cpu::run(graph, weights, &mut self.state, inputs),
+            #[cfg(target_os = "macos")]
+            CompiledSegment::Metal { session, .. } => {
+                let shapes: Vec<Vec<usize>> = graph
+                    .inputs
+                    .iter()
+                    .map(|&v| graph.value(v).shape.clone())
+                    .collect();
+                let n = graph.nodes.len();
+                let hit = self
+                    .reshaped
+                    .iter()
+                    .position(|(c, s, _)| *c == n && *s == shapes);
+                // Least recently used first: a varying tail chunk must not evict the full chunk's plan.
+                let entry = match hit {
+                    Some(i) => self.reshaped.remove(i),
+                    None => {
+                        // ponytail: 4 shapes (full chunk, tails, image blocks); more if callers vary
+                        // their row counts more.
+                        if self.reshaped.len() == 4 {
+                            self.reshaped.remove(0);
+                        }
+                        (n, shapes, session.prepare_plan(graph)?)
                     }
-                    (n, shapes, session.prepare_plan(graph)?)
-                }
-            };
-            self.reshaped.push(entry);
-            let plan = &self.reshaped[self.reshaped.len() - 1].2;
-            return session.run_prepared(graph, plan, Some(&mut self.state), inputs);
+                };
+                self.reshaped.push(entry);
+                let plan = &self.reshaped[self.reshaped.len() - 1].2;
+                session.run_prepared(graph, plan, Some(&mut self.state), inputs)
+            }
         }
-        let _ = (graph, inputs);
-        Err("run_reshaped: the program is not a single Metal segment".into())
     }
 
     /// Executes the graph program with given inputs.
@@ -771,6 +779,45 @@ mod tests {
         }
         prog.run_reshaped(&rows(3), x(3)).unwrap();
         assert_eq!(prog.reshaped.len(), 2);
+    }
+
+    /// One CPU program runs its graph at two instance shapes (1 row, then 3 rows), sharing its weights
+    /// and the conv state across them, exactly like running both graphs on the CPU executor in turn.
+    #[test]
+    fn run_reshaped_serves_cpu_programs() {
+        let rows = |n: usize| {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![n, 4], DType::F32);
+            let w = g.weight("w", vec![3, 4], DType::F32);
+            let taps = g.weight("taps", vec![3, 2], DType::F32);
+            let st = g.state("conv", vec![1, 3], DType::F32, true);
+            let a = g.push("lin", Op::Linear, &[x, w]).unwrap();
+            let conv = Op::CausalConv1dCached {
+                kernel: 2,
+                dilation: 1,
+            };
+            let c = g.push("conv", conv, &[a, taps, st]).unwrap();
+            g.output(c);
+            g
+        };
+        let mut weights = Weights::new();
+        weights.insert("w", Tensor::F32((0..12).map(|i| i as f32 * 0.1 - 0.5).collect()));
+        weights.insert("taps", Tensor::F32(vec![0.5, 1.0, -1.0, 2.0, 0.25, 0.75]));
+        let x = |n: usize, s: f32| Tensor::F32((0..n * 4).map(|i| (i as f32 + s).sin()).collect());
+        let mut prog =
+            GraphProgram::compile(rows(1), weights.clone(), PlacementMode::Pin(Device::Cpu))
+                .unwrap();
+        assert_eq!(prog.primary_device(), Device::Cpu);
+        assert_eq!(prog.recurrent_states(), ["conv"]);
+        let got1 = prog.run(vec![x(1, 0.0)]).unwrap();
+        let got3 = prog.run_reshaped(&rows(3), vec![x(3, 1.0)]).unwrap();
+        let mut st = StateStore::new();
+        let want1 = cpu::run(&rows(1), &weights, &mut st, vec![x(1, 0.0)]).unwrap();
+        let want3 = cpu::run(&rows(3), &weights, &mut st, vec![x(3, 1.0)]).unwrap();
+        assert_eq!(got1, want1);
+        assert_eq!(got3, want3);
+        assert_eq!(got3[0].len(), 9);
+        assert_eq!(prog.state.get("conv"), st.get("conv"));
     }
 
     #[test]

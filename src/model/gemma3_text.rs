@@ -451,6 +451,7 @@ impl Gemma3Text {
                 causal: true,
                 window: l.sliding.then_some(self.window),
                 soft_cap: self.attn_softcap,
+                scale: None,
             };
             let a = b.g.add(format!("{p}.attn"), attn, &[q, k, v], vec![n, nh * hd], f);
             let o = lin(&mut b, &format!("{p}.o"), a, &l.o);

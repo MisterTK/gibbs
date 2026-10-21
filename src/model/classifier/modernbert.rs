@@ -425,6 +425,7 @@ impl ModernBert {
                 causal: false,
                 window: layer.window.map(|half| 2 * half),
                 soft_cap: None,
+                scale: None,
             };
             let c = gb.add(&format!("{p}.attn"), attn, &[q, k, v], vec![n, h]);
             let o = gb.lin(c, &format!("{p}.Wo"), &layer.wo);

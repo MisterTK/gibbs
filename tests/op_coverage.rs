@@ -57,9 +57,12 @@ fn ordinal(op: &Op) -> usize {
         Op::MeanPool => 38,
         Op::L2Normalize => 39,
         Op::Megakernel(_) => 40,
+        Op::StateWrite => 42,
+        Op::QsaSelect { .. } => 43,
+        Op::QsaBias { .. } => 44,
     }
 }
-const VARIANTS: usize = 42;
+const VARIANTS: usize = 45;
 
 /// Key used in `KNOWN_UNLOWERED`: the op name, plus the kind for ops whose support varies by kind.
 fn key(op: &Op) -> String {
@@ -91,7 +94,7 @@ fn all_ops() -> Vec<Op> {
             variant: RopeVariant::MRope { sections: [8, 4, 4], interleaved: true, pairs: PairLayout::Half },
             mscale: 1.0,
         },
-        Op::Attention { heads: 2, kv_heads: 2, causal: true, window: None, soft_cap: None },
+        Op::Attention { heads: 2, kv_heads: 2, causal: true, window: None, soft_cap: None, scale: None },
         Op::SwiGlu,
         Op::GeGlu,
         Op::CachedAttention {
@@ -116,6 +119,9 @@ fn all_ops() -> Vec<Op> {
         Op::TopK { k: 2 },
         Op::RelPosBias { buckets: 32, max_distance: 128, bidirectional: true, heads: 2 },
         Op::StateReorder,
+        Op::StateWrite,
+        Op::QsaSelect { ratio: 4, top_blocks: 2 },
+        Op::QsaBias { ratio: 4, top_blocks: 2 },
         Op::Conv2d { stride: [1, 1], padding: [1, 1, 1, 1], dilation: [1, 1], groups: 1 },
         Op::Conv1d { stride: 1, padding: [1, 1], dilation: 1, groups: 1 },
         Op::Reshape { shape: Some(vec![2, 2]) },
@@ -138,7 +144,8 @@ fn all_ops() -> Vec<Op> {
         UnaryKind::Exp, UnaryKind::Sigmoid, UnaryKind::Tanh, UnaryKind::Softplus, UnaryKind::Neg,
         UnaryKind::Sqrt, UnaryKind::Rsqrt, UnaryKind::Abs, UnaryKind::Relu, UnaryKind::Relu2,
         UnaryKind::Silu, UnaryKind::GeluErf, UnaryKind::GeluTanh, UnaryKind::Scale(0.5),
-        UnaryKind::Clamp(-1.0, 1.0), UnaryKind::SoftCap(30.0),
+        UnaryKind::Clamp(-1.0, 1.0), UnaryKind::SoftCap(30.0), UnaryKind::Ln, UnaryKind::RoundEven,
+        UnaryKind::Sign,
     ] {
         ops.push(Op::Unary { kind });
     }

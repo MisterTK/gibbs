@@ -143,6 +143,7 @@ impl Dit21 {
                     causal: true,
                     window: None,
                     soft_cap: None,
+                    scale: None,
                 },
                 &[qt, kt, vt],
                 vec![nt, d],

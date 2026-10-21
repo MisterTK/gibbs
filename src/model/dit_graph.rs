@@ -313,6 +313,7 @@ impl Gb {
                 causal: false,
                 window: None,
                 soft_cap: None,
+                scale: None,
             },
             &[q, k, v],
             s,

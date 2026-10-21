@@ -2550,6 +2550,7 @@ impl Session {
             .unwrap_or(0);
         let mut embedding_checks = Vec::new();
         let mut attn_pos_inputs = Vec::new();
+        let mut state_write_checks = Vec::new();
         let mut state_vars: Vec<(ValueId, String)> = Vec::new();
         let mut state_idx_map: HashMap<String, usize> = HashMap::new();
         for s in &steps {
@@ -2559,10 +2560,30 @@ impl Session {
                 })?;
                 embedding_checks.push((pos, rows, s.name.clone()));
             }
-            if let Step::CachedAttention {
-                pos: Some(p), m, ..
-            } = s.op
+            // `StateWrite` positions are host-checked against the declared rows (as on the CPU).
+            if let Step::Ext(ext::ExtStep::Movement(ext::movement::Step::StateWrite {
+                pos0,
+                m,
+                cap,
+                ..
+            })) = s.op
             {
+                let i = graph.inputs.iter().position(|&x| x == pos0).ok_or_else(|| {
+                    format!("node '{}': Metal StateWrite pos0 must be a graph input (range-checked on the host)", s.name)
+                })?;
+                state_write_checks.push((i, m, cap, s.name.clone()));
+            }
+            // Positions this step writes from a graph input: the state buffers grow to hold them.
+            let pos_rows = match &s.op {
+                Step::CachedAttention {
+                    pos: Some(p), m, ..
+                } => Some((*p, *m)),
+                Step::Ext(ext::ExtStep::Movement(ext::movement::Step::StateWrite {
+                    pos0, m, ..
+                })) => Some((*pos0, *m)),
+                _ => None,
+            };
+            if let Some((p, m)) = pos_rows {
                 if let Some(i) = graph.inputs.iter().position(|&x| x == p) {
                     if !attn_pos_inputs.contains(&(i, m)) {
                         attn_pos_inputs.push((i, m));
@@ -2570,7 +2591,7 @@ impl Session {
                 }
             }
             for &v in &s.reads {
-                if let ValueKind::State(name) = &graph.value(v).kind {
+                if let ValueKind::State { name, .. } = &graph.value(v).kind {
                     if !state_idx_map.contains_key(name) {
                         let idx = state_vars.len();
                         state_idx_map.insert(name.clone(), idx);
@@ -2582,7 +2603,7 @@ impl Session {
         let mut value_locs = Vec::with_capacity(graph.values.len());
         for (idx, val) in graph.values.iter().enumerate() {
             let v = ValueId(idx as u32);
-            let loc = if let ValueKind::State(name) = &val.kind {
+            let loc = if let ValueKind::State { name, .. } = &val.kind {
                 if let Some(&state_idx) = state_idx_map.get(name) {
                     PlanValueLoc::State(state_idx)
                 } else {
@@ -2611,6 +2632,7 @@ impl Session {
             flops_per_run,
             input_views,
             mlp_scratch_size,
+            state_write_checks,
             embedding_checks,
             attn_pos_inputs,
             state_vars,
@@ -2654,7 +2676,7 @@ impl Session {
         let pos = graph
             .values
             .iter()
-            .filter(|v| matches!(v.kind, ValueKind::State(_)))
+            .filter(|v| matches!(v.kind, ValueKind::State { .. }))
             .filter_map(|v| v.shape.first().copied())
             .filter(|&r| r > 16)
             .min()
@@ -2825,6 +2847,18 @@ impl Session {
             if let Some((r, &id)) = v.iter().enumerate().find(|&(_, &id)| id as usize >= rows) {
                 return Err(format!(
                     "node '{name}': row {r} id {id} out of range for table of {rows} rows"
+                ));
+            }
+        }
+        for &(pos, m, cap, ref name) in &plan.state_write_checks {
+            let Tensor::U32(v) = &inputs[pos] else {
+                unreachable!("dtype checked above")
+            };
+            let p0 = v.first().map_or(0, |&p| p as usize);
+            if p0 + m > cap {
+                return Err(format!(
+                    "node '{name}': writing rows {p0}..{} past the state's {cap} rows",
+                    p0 + m
                 ));
             }
         }
@@ -4753,6 +4787,8 @@ pub struct PreparedPlan {
     pub(crate) input_views: Vec<(ValueId, usize, usize)>,
     pub(crate) mlp_scratch_size: usize,
     pub(crate) embedding_checks: Vec<(usize, usize, String)>,
+    /// `StateWrite` (pos0 input index, rows written, declared state rows, node name).
+    pub(crate) state_write_checks: Vec<(usize, usize, usize, String)>,
     pub(crate) attn_pos_inputs: Vec<(usize, usize)>,
     pub(crate) state_vars: Vec<(ValueId, String)>,
     pub(crate) value_locs: Vec<PlanValueLoc>,
@@ -4767,7 +4803,7 @@ pub struct PreparedPlan {
 /// state names.
 fn assign_kv_dtypes(graph: &Graph, steps: &mut [Planned]) -> HashSet<String> {
     let name_of = |v: ValueId| match &graph.value(v).kind {
-        ValueKind::State(n) => Some(n.clone()),
+        ValueKind::State { name: n, .. } => Some(n.clone()),
         _ => None,
     };
     let kv_pair = |op: &Step| match op {
@@ -6899,6 +6935,7 @@ mod tests {
                 causal,
                 window: None,
                 soft_cap: None,
+                scale: None,
             };
             let a = g.add("attn", op, &[q, k, v], vec![nq, w], f);
             g.output(a);
@@ -6968,8 +7005,8 @@ mod tests {
         };
         let x0 = g.input("x", vec![1, h], f);
         let pos = g.input("pos", vec![1], DType::U32);
-        let ks = g.state("k_state", vec![t, hd], f);
-        let vs = g.state("v_state", vec![t, hd], f);
+        let ks = g.state("k_state", vec![t, hd], f, false);
+        let vs = g.state("v_state", vec![t, hd], f, false);
         let (wq, wk, wv) = (
             dense(&mut g, "wq", nh * hd, h, 1),
             dense(&mut g, "wk", hd, h, 2),
@@ -7155,8 +7192,8 @@ mod tests {
         );
         let qr = g1.add("qr", rope.clone(), &[qn, pos, inv], vec![1, q_dim], f);
         let kr = g1.add("kr", rope.clone(), &[kn, pos, inv], vec![1, kv_dim], f);
-        let ks = g1.state("ks", vec![16, kv_dim], f);
-        let vs = g1.state("vs", vec![16, kv_dim], f);
+        let ks = g1.state("ks", vec![16, kv_dim], f, false);
+        let vs = g1.state("vs", vec![16, kv_dim], f, false);
         let att = Op::CachedAttention {
             heads,
             kv_heads,
@@ -7200,8 +7237,8 @@ mod tests {
         let inv2 = g2.weight("inv", vec![hd / 2], f);
         let qr2 = g2.add("qr", rope.clone(), &[q2, pos2, inv2], vec![1, q_dim], f);
         let kr2 = g2.add("kr", rope, &[k2, pos2, inv2], vec![1, kv_dim], f);
-        let ks2 = g2.state("ks", vec![16, kv_dim], f);
-        let vs2 = g2.state("vs", vec![16, kv_dim], f);
+        let ks2 = g2.state("ks", vec![16, kv_dim], f, false);
+        let vs2 = g2.state("vs", vec![16, kv_dim], f, false);
         let out2 = g2.add(
             "att",
             att,
@@ -9393,8 +9430,8 @@ mod tests {
             let q = g.input("q", vec![m, q_dim], DType::F32);
             let k = g.input("k", vec![m, kv_dim], DType::F32);
             let v = g.input("v", vec![m, kv_dim], DType::F32);
-            let k_state = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
-            let v_state = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+            let k_state = g.state("k_state", vec![max_seq, kv_dim], DType::F32, false);
+            let v_state = g.state("v_state", vec![max_seq, kv_dim], DType::F32, false);
             let pos = g.input("pos", vec![m], DType::U32);
             let out = g.add(
                 "cached_attn",
@@ -9569,8 +9606,8 @@ mod tests {
                         let q = g.input("q", vec![m, q_dim], DType::F32);
                         let k = g.input("k", vec![m, kv_dim], DType::F32);
                         let v = g.input("v", vec![m, kv_dim], DType::F32);
-                        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
-                        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+                        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32, false);
+                        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32, false);
                         let pos = g.input("pos", vec![m], DType::U32);
                         let out = g.add(
                             "attn",
@@ -9824,8 +9861,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let q = g.input("q", vec![1, q_dim], DType::F32);
             let k = g.input("k", vec![1, kv_dim], DType::F32);
             let v = g.input("v", vec![1, kv_dim], DType::F32);
-            let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
-            let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+            let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32, false);
+            let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32, false);
             let pos = g.input("pos", vec![1], DType::U32);
             let out = g.add(
                 "attn",
@@ -9882,8 +9919,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let q = g.input("q", vec![m, q_dim], DType::F32);
         let k = g.input("k", vec![m, kv_dim], DType::F32);
         let v = g.input("v", vec![m, kv_dim], DType::F32);
-        let ks = g.state("k_state", vec![16, kv_dim], DType::F32);
-        let vs = g.state("v_state", vec![16, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![16, kv_dim], DType::F32, false);
+        let vs = g.state("v_state", vec![16, kv_dim], DType::F32, false);
         let pos = g.input("pos", vec![m], DType::U32);
         let vis = g.input("vis", vec![m], DType::U32);
         let out = g.add(
@@ -9937,8 +9974,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let q = g.input("q", vec![m, q_dim], DType::F32);
         let k = g.input("k", vec![m, kv_dim], DType::F32);
         let v = g.input("v", vec![m, kv_dim], DType::F32);
-        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32);
-        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![max_seq, kv_dim], DType::F32, false);
+        let vs = g.state("v_state", vec![max_seq, kv_dim], DType::F32, false);
         let pos = g.input("pos", vec![m], DType::U32);
         let out = g.add(
             "attn",
@@ -10073,8 +10110,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let k = g.input("k", vec![1, heads * hd], f);
             let v = g.input("v", vec![1, heads * hd], f);
             let pos = g.input("pos", vec![1], DType::U32);
-            let ks = g.state("k_state", vec![max_seq, heads * hd], f);
-            let vs = g.state("v_state", vec![max_seq, heads * hd], f);
+            let ks = g.state("k_state", vec![max_seq, heads * hd], f, false);
+            let vs = g.state("v_state", vec![max_seq, heads * hd], f, false);
             let a = g.add(
                 "a",
                 attn(true),
@@ -10085,8 +10122,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             g.output(a);
             if shared {
                 let (ks2, vs2) = (
-                    g.state("k_state", vec![max_seq, heads * hd], f),
-                    g.state("v_state", vec![max_seq, heads * hd], f),
+                    g.state("k_state", vec![max_seq, heads * hd], f, false),
+                    g.state("v_state", vec![max_seq, heads * hd], f, false),
                 );
                 let b = g.add(
                     "b",
@@ -10104,6 +10141,7 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                     causal: false,
                     window: None,
                     soft_cap: None,
+                    scale: None,
                 };
                 let c = g.add("c", plain, &[q, ks, vs], vec![1, heads * hd], f);
                 g.output(c);
@@ -10168,8 +10206,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let q = g.input("q", vec![1, q_dim], DType::F32);
         let k = g.input("k", vec![1, kv_dim], DType::F32);
         let v = g.input("v", vec![1, kv_dim], DType::F32);
-        let ks = g.state("k_state", vec![16, kv_dim], DType::F32);
-        let vs = g.state("v_state", vec![16, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![16, kv_dim], DType::F32, false);
+        let vs = g.state("v_state", vec![16, kv_dim], DType::F32, false);
         let pos = g.input("pos", vec![1], DType::U32);
         let out = g.add(
             "cached_attn",
@@ -10565,8 +10603,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let q = g.add("q", Op::Linear, &[x, wq], vec![1, 4], f);
         let k = g.add("k", Op::Linear, &[x, wk], vec![1, 4], f);
         let v = g.add("v", Op::Linear, &[x, wv], vec![1, 4], f);
-        let ks = g.state("k_cache", vec![16, 4], f);
-        let vs = g.state("v_cache", vec![16, 4], f);
+        let ks = g.state("k_cache", vec![16, 4], f, false);
+        let vs = g.state("v_cache", vec![16, 4], f, false);
         let attn = g.add(
             "attn",
             Op::CachedAttention {
@@ -10708,8 +10746,8 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             f,
         );
 
-        let ks = g.state("ks", vec![16, kv_dim], f);
-        let vs = g.state("vs", vec![16, kv_dim], f);
+        let ks = g.state("ks", vec![16, kv_dim], f, false);
+        let vs = g.state("vs", vec![16, kv_dim], f, false);
         let att = g.add(
             "att",
             Op::CachedAttention {
@@ -10843,5 +10881,222 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let s = Session::new(rt(), &w).unwrap();
         let plan = s.prepare_plan(&g).unwrap();
         assert_eq!(plan.mlp_scratch_size, h * 4 + 2 * inter * 4);
+    }
+
+    /// Bits of a graph output: u32 ids as themselves, f32 as `to_bits` (Metal returns u32 outputs as
+    /// f32 slots holding the bits).
+    fn out_bits(t: &Tensor) -> Vec<u32> {
+        match t {
+            Tensor::U32(v) => v.clone(),
+            Tensor::F32(v) => v.iter().map(|x| x.to_bits()).collect(),
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    /// Runs `g` on the CPU executor and on Metal, each from the states `init`, once per input set in
+    /// `runs` (state persisting between runs); returns every run's (CPU, Metal) outputs and the final
+    /// (CPU, Metal) value of each state in `init`.
+    #[allow(clippy::type_complexity)]
+    fn both_stateful(
+        g: &Graph,
+        w: &Weights,
+        init: &[(&str, Vec<f32>)],
+        runs: Vec<Vec<Tensor>>,
+    ) -> (Vec<(Vec<Tensor>, Vec<Tensor>)>, Vec<(Vec<f32>, Vec<f32>)>) {
+        let (mut cs, mut gs) = (StateStore::new(), StateStore::new());
+        for (name, v) in init {
+            cs.insert(*name, Tensor::F32(v.clone()));
+            gs.insert(*name, Tensor::F32(v.clone()));
+        }
+        let s = Session::new(rt(), w).unwrap();
+        let outs = runs
+            .into_iter()
+            .map(|inputs| {
+                let c = cpu::run(g, w, &mut cs, inputs.clone()).unwrap();
+                let m = s.run_with_state(g, Some(&mut gs), inputs).unwrap();
+                (c, m)
+            })
+            .collect();
+        let states = init
+            .iter()
+            .map(|(name, _)| {
+                let c = cs.get(name).unwrap().as_f32().unwrap().to_vec();
+                (c, gs.read_metal(name).unwrap())
+            })
+            .collect();
+        (outs, states)
+    }
+
+    /// `StateWrite` writes rows into a persistent state at `pos0` on both executors: the token is
+    /// `pos0 + m`, a later node of the same graph reads the new rows, and the state carries into the
+    /// next run.
+    #[test]
+    fn state_write_matches_cpu() {
+        let (cap, w, m) = (6, 3, 2);
+        let mut g = Graph::new();
+        let st = g.state("cache", vec![cap, w], DType::F32, false);
+        let rows = g.input("rows", vec![m, w], DType::F32);
+        let pos0 = g.input("pos0", vec![1], DType::U32);
+        let all = g.input("all", vec![cap], DType::U32);
+        let token = g.push("write", Op::StateWrite, &[st, rows, pos0]).unwrap();
+        let read = g.push("read", Op::Gather { axis: 0 }, &[st, all]).unwrap();
+        g.output(token);
+        g.output(read);
+        let init = rand(cap * w, 3);
+        let run = |p: u32, seed| {
+            vec![
+                Tensor::F32(rand(m * w, seed)),
+                Tensor::U32(vec![p]),
+                Tensor::U32((0..cap as u32).collect()),
+            ]
+        };
+        let (outs, states) = both_stateful(
+            &g,
+            &Weights::new(),
+            &[("cache", init.clone())],
+            vec![run(3, 4), run(0, 5), run(4, 6)],
+        );
+        let mut want = init;
+        for ((c, gpu), (p, seed)) in outs.iter().zip([(3usize, 4u64), (0, 5), (4, 6)]) {
+            want[p * w..(p + m) * w].copy_from_slice(&rand(m * w, seed));
+            assert_eq!(c[0], Tensor::U32(vec![(p + m) as u32]));
+            assert_eq!(out_bits(&gpu[0]), [(p + m) as u32]);
+            assert_eq!(c[1], Tensor::F32(want.clone()), "CPU reads the write");
+            assert_eq!(gpu[1], Tensor::F32(want.clone()), "Metal reads the write");
+        }
+        assert_eq!(states[0].0, want);
+        assert_eq!(states[0].1, want);
+        // Dead-node elimination keeps the write even when nothing reads its token.
+        let mut g2 = Graph::new();
+        let st = g2.state("cache", vec![cap, w], DType::F32, false);
+        let rows = g2.input("rows", vec![m, w], DType::F32);
+        let pos0 = g2.input("pos0", vec![1], DType::U32);
+        g2.push("write", Op::StateWrite, &[st, rows, pos0]).unwrap();
+        let out = g2.push("other", Op::Unary { kind: crate::graph::UnaryKind::Neg }, &[rows]).unwrap();
+        g2.output(out);
+        crate::graph::passes::canonical::eliminate_dead_nodes(&mut g2);
+        assert!(g2.nodes.iter().any(|n| n.op == Op::StateWrite));
+        // Writing past the declared rows is the same error on both executors.
+        let past = || vec![Tensor::F32(rand(m * w, 1)), Tensor::U32(vec![5]), Tensor::U32((0..cap as u32).collect())];
+        let mut st = StateStore::new();
+        let ce = cpu::run(&g, &Weights::new(), &mut st, past()).unwrap_err();
+        let me = Session::new(rt(), &Weights::new()).unwrap().run(&g, past()).unwrap_err();
+        assert!(ce.contains("past the state's 6 rows"), "{ce}");
+        assert_eq!(ce, me);
+    }
+
+    /// `QsaSelect` / `QsaBias` on Metal equal the CPU executor bit for bit: random scores with ties,
+    /// signed zeros, infinities and NaN, rows below and above `top_blocks` complete blocks, and a
+    /// score width past one threadgroup.
+    #[test]
+    fn qsa_select_and_bias_match_cpu() {
+        for (n, b, ratio, top) in [
+            (7usize, 9usize, 4usize, 2usize),
+            (5, 700, 2, 37),
+            (9, 300, 1, 1),
+            (4, 64, 8, 0),
+            (3, 33, 3, 32),
+        ] {
+            let mut score: Vec<f32> = rand(n * b, n as u64 + b as u64)
+                .into_iter()
+                .map(|v| (v * 4.0).round() * 0.5)
+                .collect();
+            for (i, special) in [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN]
+                .into_iter()
+                .enumerate()
+            {
+                score[(i * 7) % (n * b)] = special;
+            }
+            let pos: Vec<u32> = rand(n, 9)
+                .into_iter()
+                .map(|v| ((v + 1.0) * 0.5 * (b * ratio) as f32) as u32 % (b * ratio) as u32)
+                .collect();
+            for select in [true, false] {
+                let mut g = Graph::new();
+                let sc = g.input("score", vec![n, b], DType::F32);
+                let p = g.input("pos", vec![n], DType::U32);
+                let op = if select {
+                    Op::QsaSelect { ratio, top_blocks: top }
+                } else {
+                    Op::QsaBias { ratio, top_blocks: top }
+                };
+                let y = g.push("qsa", op, &[sc, p]).unwrap();
+                g.output(y);
+                let inputs = vec![Tensor::F32(score.clone()), Tensor::U32(pos.clone())];
+                let want = cpu::run_stateless(&g, &Weights::new(), inputs.clone()).unwrap();
+                let got = Session::new(rt(), &Weights::new()).unwrap().run(&g, inputs).unwrap();
+                assert_eq!(
+                    out_bits(&want[0]),
+                    out_bits(&got[0]),
+                    "n {n} B {b} ratio {ratio} top {top} select {select}"
+                );
+            }
+        }
+    }
+
+    /// `DeltaRule` and `CausalConv1dCached` with state over n = 5 rows in one call, starting from a
+    /// non-zero state: Metal matches the CPU executor in every output row and in the final state, over
+    /// two consecutive calls.
+    #[test]
+    fn multi_row_recurrent_ops_with_state_match_cpu() {
+        let n = 5;
+        for (kh, vh, kd, vd) in [(1usize, 1usize, 4usize, 4usize), (2, 4, 16, 32), (2, 2, 128, 128)] {
+            let mut g = Graph::new();
+            let f = DType::F32;
+            let q = g.input("q", vec![n, kh * kd], f);
+            let k = g.input("k", vec![n, kh * kd], f);
+            let v = g.input("v", vec![n, vh * vd], f);
+            let beta = g.input("beta", vec![n, vh], f);
+            let ld = g.input("log_decay", vec![n, vh], f);
+            let st = g.state("ssm", vec![vh * kd * vd], f, true);
+            let op = Op::DeltaRule {
+                key_heads: kh,
+                val_heads: vh,
+                key_dim: kd,
+                val_dim: vd,
+            };
+            let y = g.push("delta", op, &[q, k, v, beta, ld, st]).unwrap();
+            g.output(y);
+            let run = |seed: u64| {
+                vec![
+                    Tensor::F32(rand(n * kh * kd, seed)),
+                    Tensor::F32(rand(n * kh * kd, seed + 1)),
+                    Tensor::F32(rand(n * vh * vd, seed + 2)),
+                    Tensor::F32(rand(n * vh, seed + 3).iter().map(|x| 0.5 + 0.4 * x).collect()),
+                    Tensor::F32(rand(n * vh, seed + 4).iter().map(|x| -0.3 + 0.2 * x).collect()),
+                ]
+            };
+            let init = rand(vh * kd * vd, 7);
+            let (outs, states) =
+                both_stateful(&g, &Weights::new(), &[("ssm", init.clone())], vec![run(10), run(20)]);
+            for (c, gpu) in &outs {
+                let (c, gpu) = (c[0].as_f32().unwrap(), gpu[0].as_f32().unwrap());
+                assert_eq!(c.len(), n * vh * vd);
+                assert!(rel_err(c, gpu) < 1e-4, "DeltaRule {kh}/{vh}/{kd}/{vd} rows");
+            }
+            assert!(rel_err(&states[0].0, &states[0].1) < 1e-4, "DeltaRule state");
+            assert!(max_abs_diff(&states[0].0, &init) > 1e-3, "the state moved");
+        }
+        for (ch, kernel, dilation) in [(7usize, 4usize, 1usize), (33, 3, 2), (1, 2, 1)] {
+            let mut g = Graph::new();
+            let x = g.input("x", vec![n, ch], DType::F32);
+            let wv = g.weight("w", vec![ch, kernel], DType::F32);
+            let hist = (kernel - 1) * dilation;
+            let st = g.state("conv", vec![hist, ch], DType::F32, true);
+            let op = Op::CausalConv1dCached { kernel, dilation };
+            let y = g.push("conv", op, &[x, wv, st]).unwrap();
+            g.output(y);
+            let mut w = Weights::new();
+            w.insert("w", Tensor::F32(rand(ch * kernel, 3)));
+            let init = rand(hist * ch, 5);
+            let runs = vec![vec![Tensor::F32(rand(n * ch, 1))], vec![Tensor::F32(rand(n * ch, 2))]];
+            let (outs, states) = both_stateful(&g, &w, &[("conv", init)], runs);
+            for (c, gpu) in &outs {
+                let (c, gpu) = (c[0].as_f32().unwrap(), gpu[0].as_f32().unwrap());
+                assert_eq!(c.len(), n * ch);
+                assert!(rel_err(c, gpu) < 1e-5, "conv {ch}/{kernel}/{dilation} rows");
+            }
+            assert!(rel_err(&states[0].0, &states[0].1) < 1e-6, "conv state");
+        }
     }
 }

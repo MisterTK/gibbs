@@ -1453,7 +1453,11 @@ impl NativeLm for Qwen35 {
         if len == seq.len {
             self.text.drop_checkpoints(&mut seq.layers);
             seq.ckpt.clear();
-        } else if self.program.is_some() && self.text.recurrent_state_names().is_empty() {
+        } else if self
+            .program
+            .as_ref()
+            .is_some_and(|p| p.lock().recurrent_states().is_empty())
+        {
             seq.len = len; // attention-only: KV rows past `len` are overwritten
         } else if self.program.is_some() {
             // Full KV needs nothing (attention reads only the rows below the position it is
@@ -1615,14 +1619,14 @@ impl Qwen35 {
         }
         if let Some(prog) = &self.program {
             // ponytail: one token per program step (prefill included); an n-row prefill graph is the upgrade.
-            let names = self.text.recurrent_state_names();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             // Consecutive checkpointing forwards extend one span; anything else starts over.
             if !all || seq.ckpt.is_empty() || seq.ckpt_from + seq.ckpt.len() != start_pos {
                 seq.ckpt.clear();
                 seq.ckpt_from = start_pos;
             }
             let mut p = prog.lock();
+            let names = p.recurrent_states();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             std::mem::swap(&mut p.state, &mut seq.program_state);
             let out = self.program_steps(&mut p, seq, tokens, start_pos, all, greedy, &refs);
             std::mem::swap(&mut p.state, &mut seq.program_state);

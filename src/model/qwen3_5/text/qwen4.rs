@@ -260,7 +260,7 @@ impl Indexer {
                     return None;
                 }
                 let qt = &q[t * self.heads * dim..][..self.heads * dim];
-                let mut score: Vec<(f32, u32)> = (0..blocks)
+                let score: Vec<(f32, u32)> = (0..blocks)
                     .map(|b| {
                         let kb = &st.pooled[b * dim..][..dim];
                         let s: f32 = qt
@@ -270,22 +270,33 @@ impl Indexer {
                         (s * scale, b as u32)
                     })
                     .collect();
-                score.select_nth_unstable_by(self.top_blocks - 1, |a, b| {
-                    b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
-                });
-                score.truncate(self.top_blocks);
-                score.sort_unstable_by_key(|s| s.1);
-                let mut keys: Vec<u32> = score
-                    .iter()
-                    .flat_map(|&(_, b)| {
-                        (b as usize * ratio..(b as usize + 1) * ratio).map(|j| j as u32)
-                    })
-                    .collect();
-                keys.extend((blocks * ratio..visible).map(|j| j as u32));
-                Some(keys)
+                Some(block_keys(score, visible, ratio, self.top_blocks))
             })
             .collect()
     }
+}
+
+/// The keys a row with `visible` keys reads, given `(score, block)` of its complete blocks (more
+/// than `top_blocks` of them): the `top_blocks` best blocks (score descending, then block
+/// ascending) in ascending order, each expanded to its `ratio` keys, then the incomplete tail.
+fn block_keys(
+    mut score: Vec<(f32, u32)>,
+    visible: usize,
+    ratio: usize,
+    top_blocks: usize,
+) -> Vec<u32> {
+    let blocks = score.len();
+    score.select_nth_unstable_by(top_blocks - 1, |a, b| {
+        b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
+    });
+    score.truncate(top_blocks);
+    score.sort_unstable_by_key(|s| s.1);
+    let mut keys: Vec<u32> = score
+        .iter()
+        .flat_map(|&(_, b)| (b as usize * ratio..(b as usize + 1) * ratio).map(|j| j as u32))
+        .collect();
+    keys.extend((blocks * ratio..visible).map(|j| j as u32));
+    keys
 }
 
 /// PLE: hashed n-gram embeddings of the token and its predecessors, gated per stream by the
@@ -551,5 +562,74 @@ impl TextModel {
         let (x, inj) = lhc.ffn.mix(h, n, self.eps);
         let y = self.ffn_forward(&layer.ffn, &x, n);
         combine(h, &y, &inj, count, d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::block_keys;
+    use crate::graph::{cpu, DType, Graph, Op, Tensor, Weights};
+
+    /// `Op::QsaSelect` / `Op::QsaBias` reproduce the indexer's host key choice (`select`: every visible
+    /// key while at most `top_blocks` blocks are complete, else `block_keys`) on random scores with
+    /// ties, on the CPU executor (Metal equals it bit for bit: `qsa_select_and_bias_match_cpu`).
+    #[test]
+    fn graph_qsa_matches_host_selection() {
+        let mut s = 0x9e37_79b9u32;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        };
+        let (n, b) = (11usize, 40usize);
+        for (ratio, top) in [(1usize, 1usize), (4, 2), (3, 5), (16, 3), (2, 39)] {
+            // Few levels so equal scores happen; positions keep every row within the B blocks.
+            let score: Vec<f32> = (0..n * b).map(|_| (next() % 7) as f32 * 0.5 - 1.0).collect();
+            let pos: Vec<u32> = (0..n).map(|_| next() % (b * ratio) as u32).collect();
+            let k = top * ratio + ratio - 1;
+            let (mut ids, mut bias) = (vec![0u32; n * k], vec![f32::NEG_INFINITY; n * k]);
+            for t in 0..n {
+                let visible = pos[t] as usize + 1;
+                let blocks = visible / ratio;
+                let keys: Vec<u32> = if blocks <= top {
+                    (0..visible as u32).collect()
+                } else {
+                    let row = (0..blocks).map(|j| (score[t * b + j], j as u32)).collect();
+                    block_keys(row, visible, ratio, top)
+                };
+                ids[t * k..][..keys.len()].copy_from_slice(&keys);
+                bias[t * k..][..keys.len()].fill(0.0);
+            }
+            for select in [true, false] {
+                let mut g = Graph::new();
+                let sc = g.input("score", vec![n, b], DType::F32);
+                let p = g.input("pos", vec![n], DType::U32);
+                let op = if select {
+                    Op::QsaSelect { ratio, top_blocks: top }
+                } else {
+                    Op::QsaBias { ratio, top_blocks: top }
+                };
+                let y = g.push("qsa", op, &[sc, p]).unwrap();
+                g.output(y);
+                let inputs = vec![Tensor::F32(score.clone()), Tensor::U32(pos.clone())];
+                let got = cpu::run_stateless(&g, &Weights::new(), inputs).unwrap();
+                let what = format!("ratio {ratio} top {top} select {select}");
+                // Bits: ids as u32, the bias as f32 (0 / -inf compare exactly).
+                let bits = |t: &Tensor| -> Vec<u32> {
+                    match t {
+                        Tensor::U32(v) => v.clone(),
+                        Tensor::F32(v) => v.iter().map(|x| x.to_bits()).collect(),
+                        other => panic!("unexpected {other:?}"),
+                    }
+                };
+                let want: Vec<u32> = if select {
+                    ids.clone()
+                } else {
+                    bias.iter().map(|x| x.to_bits()).collect()
+                };
+                assert_eq!(bits(&got[0]), want, "CPU {what}");
+            }
+        }
     }
 }

@@ -363,7 +363,7 @@ impl Vision {
         let h1 = b.add("vision.pos_x", h0, xe, vec![np, d]);
         let mut h = b.add("vision.pos_y", h1, ye, vec![np, d]);
         let sq = (hd as f32).sqrt();
-        let attn = Op::Attention { heads: nh, kv_heads: nh, causal: false, window: None, soft_cap: None };
+        let attn = Op::Attention { heads: nh, kv_heads: nh, causal: false, window: None, soft_cap: None, scale: None };
         for (i, l) in self.layers.iter().enumerate() {
             let p = format!("vision.layers.{i}");
             let a = b.rms(&format!("{p}.input_ln"), h, l.input_ln.clone(), eps, vec![np, d]);

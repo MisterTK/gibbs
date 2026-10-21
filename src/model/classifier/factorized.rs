@@ -234,6 +234,7 @@ impl Factorized {
             causal: false,
             window: None,
             soft_cap: None,
+            scale: None,
         };
         for (step, &l) in self.schedule.iter().enumerate() {
             gb.scope = format!("s{step}.");

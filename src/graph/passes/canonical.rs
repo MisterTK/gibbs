@@ -44,15 +44,19 @@ pub fn eliminate_common_subexpressions(g: &mut Graph) {
 
 /// Retains only nodes that transitively contribute to graph outputs, or write persistent state
 /// (a `write: true` `CachedAttention` appends to its K/V state even when nothing reads its output:
-/// T5's biased self-attention takes the state write from it and the scores from `Attention`).
+/// a biased self-attention can take the state write from it and the scores from `Attention`; a
+/// `StateWrite` exists for its write).
 pub fn eliminate_dead_nodes(g: &mut Graph) {
     let mut live_values: HashSet<ValueId> = g.outputs.iter().copied().collect();
     for node in &g.nodes {
-        let writes_state = matches!(node.op, Op::CachedAttention { write: true, .. })
-            && node
+        let writes_state = match node.op {
+            Op::CachedAttention { write: true, .. } => node
                 .inputs
                 .get(3)
-                .is_some_and(|&s| matches!(g.value(s).kind, ValueKind::State(_)));
+                .is_some_and(|&s| matches!(g.value(s).kind, ValueKind::State { .. })),
+            Op::StateWrite => true,
+            _ => false,
+        };
         if writes_state {
             live_values.extend(node.outputs.iter().copied());
         }

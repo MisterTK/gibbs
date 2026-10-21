@@ -324,6 +324,7 @@ impl BertEncoder {
                 causal: false,
                 window: None,
                 soft_cap: None,
+                scale: None,
             };
             let a = g.add(format!("{p}.attention"), attn, &[q, k, v], vec![n, h], f);
             let o = lin(&mut g, a, "attention.output.dense", h, h);

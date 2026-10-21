@@ -261,6 +261,7 @@ fn attn() -> Op {
         causal: false,
         window: None,
         soft_cap: None,
+        scale: None,
     }
 }
 fn cached_attn() -> Op {
@@ -555,6 +556,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                     causal: false,
                     window: Some(4),
                     soft_cap: None,
+                    scale: None,
                 },
                 F32,
             ),
@@ -587,6 +589,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
                     causal: true,
                     window: Some(4),
                     soft_cap: None,
+                    scale: None,
                 },
                 F32,
             ),
@@ -612,7 +615,7 @@ pub fn required_ops(f: Family) -> Vec<(Op, DType)> {
             ),
             (Op::Concat { axis: 0 }, F32),
             (attn(), F32),
-            (Op::Attention { heads: 2, kv_heads: 2, causal: true, window: None, soft_cap: None }, F32),
+            (Op::Attention { heads: 2, kv_heads: 2, causal: true, window: None, soft_cap: None, scale: None }, F32),
             (Op::Linear, F32),
             (Op::Linear, DType::F16),
             (Op::Linear, BF16),

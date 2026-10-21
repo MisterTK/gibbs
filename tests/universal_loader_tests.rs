@@ -196,6 +196,7 @@ fn attn(heads: usize, window: Option<usize>, soft_cap: Option<f32>) -> Op {
         causal: true,
         window,
         soft_cap,
+        scale: None,
     }
 }
 

@@ -70,6 +70,7 @@ mod tests {
                 causal: true,
                 window: None,
                 soft_cap: None,
+                scale: None,
             },
             &[q, k, v],
             vec![1, 64],

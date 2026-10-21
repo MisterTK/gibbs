@@ -179,6 +179,7 @@ mod tests {
             causal: true,
             window,
             soft_cap,
+            scale: None,
         }
     }
 

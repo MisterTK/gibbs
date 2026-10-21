@@ -495,7 +495,7 @@ impl ClipTextTransformer {
             let (q, k, v) = (lin(&mut b, x, &l.q_proj), lin(&mut b, x, &l.k_proj), lin(&mut b, x, &l.v_proj));
             let a = b.op(
                 "attn",
-                Op::Attention { heads: d / HEAD_DIM, kv_heads: d / HEAD_DIM, causal: true, window: None, soft_cap: None },
+                Op::Attention { heads: d / HEAD_DIM, kv_heads: d / HEAD_DIM, causal: true, window: None, soft_cap: None, scale: None },
                 &[q, k, v],
                 &[SEQ_LEN, d],
             );
