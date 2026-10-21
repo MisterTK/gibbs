@@ -18,6 +18,8 @@ pub mod templates;
 pub mod testing;
 #[cfg(test)]
 mod tests_encoders_factorized;
+#[cfg(test)]
+mod tests_encoders_bert_gguf;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -39,6 +41,7 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
     ("families/electra.json5", include_str!("../../arch/families/electra.json5")),
     ("families/albert.json5", include_str!("../../arch/families/albert.json5")),
+    ("families/bert_gguf.json5", include_str!("../../arch/families/bert_gguf.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 
