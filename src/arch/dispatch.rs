@@ -62,6 +62,15 @@ pub fn runs_spec_lm(model_type: &str) -> bool {
     })
 }
 
+/// GGUF `general.architecture` a causal-LM family spec matches: its blocks load as stored.
+pub fn runs_spec_lm_gguf(arch: &str) -> bool {
+    super::registry().is_ok_and(|r| {
+        r.matchers().iter().any(|(_, m, p)| {
+            *p == Pipeline::CausalLm && m.gguf_arch.iter().any(|g| super::glob(g, arch))
+        })
+    })
+}
+
 fn device(p: PlacementMode) -> Device {
     match p {
         PlacementMode::Pin(d) => d,

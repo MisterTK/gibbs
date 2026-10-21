@@ -103,7 +103,6 @@ fn wav() -> Vec<u8> {
 fn load(dir: &Path, dev: Device) -> Arc<dyn NativeLm> {
     set_reencode_override(Some(ReencodeConfig {
         policy: ReencodePolicy::BitExact,
-        cache_dir: None,
         ..Default::default()
     }));
     let art = artifacts(dir, "golden/gemma4", "model.safetensors");

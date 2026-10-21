@@ -66,7 +66,7 @@ fn write_safetensors(path: &Path, tensors: &[(&str, Vec<usize>, Vec<f32>)]) {
 fn run(dir: &Path, dev: Device) -> Vec<f32> {
     let (c, side, nt) = (4usize, 8usize, 3usize);
     let reg = Registry::from_files(&[("families/toy_diffusion.json5".into(), SPEC.into())], &[]).unwrap();
-    let reencode = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+    let reencode = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
     let m = Arc::new(load::load_with(&dir_artifacts(dir), &reg, None, reencode).unwrap());
     let den = Net::new(m.clone(), "denoiser", PlacementMode::Pin(dev));
     let dec = Net::new(m.clone(), "decoder", PlacementMode::Pin(dev));

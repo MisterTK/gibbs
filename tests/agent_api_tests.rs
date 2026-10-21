@@ -39,8 +39,10 @@ async fn media_for_a_text_only_model_is_a_400() {
             "tiny",
             Arc::new(PagedKVPool::new(64)),
             Some({
-            let a = gibbs_engine::model::hub::HuggingFaceHub::new()
-                .resolve_or_synthesize_tiny("gibbs/smollm-1m")
+            // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
+            let hub_dir = tempfile::tempdir().unwrap();
+            let a = gibbs_engine::model::hub::HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
+                .resolve_or_synthesize_tiny("gibbs/tiny-5m")
                 .unwrap();
             let reg = gibbs_engine::arch::registry().unwrap();
             let cpu = gibbs_engine::hardware::Device::Cpu.into();

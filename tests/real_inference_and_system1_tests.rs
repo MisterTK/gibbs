@@ -62,8 +62,10 @@ fn load_gguf(path: &std::path::Path) -> Arc<dyn NativeLm> {
 }
 
 /// Random-init synthetic llama (`gibbs/tiny-5m`), optionally stored as `--quant force`.
-fn tiny_lm(force: Option<QuantFormat>) -> Arc<dyn NativeLm> {
-    let art = HuggingFaceHub::new()
+fn tiny_lm(force: Option<QuantFormat>, dev: Device) -> Arc<dyn NativeLm> {
+    // A fresh hub dir: a synthetic repo left in the user's cache would be reused as is.
+    let hub_dir = tempfile::tempdir().unwrap();
+    let art = HuggingFaceHub::with_cache_dir(hub_dir.path().to_path_buf())
         .resolve_or_synthesize_tiny("gibbs/tiny-5m")
         .unwrap();
     let _g = LOAD.lock().unwrap_or_else(|e| e.into_inner());
@@ -72,13 +74,18 @@ fn tiny_lm(force: Option<QuantFormat>) -> Arc<dyn NativeLm> {
         force: Some(f),
         ..ReencodeConfig::from_settings()
     }));
-    let lm = load_unlocked(&art);
+    let lm = foundry_engine::runtime::lm::load(
+        &art,
+        foundry_engine::arch::registry().unwrap(),
+        None,
+        PlacementMode::Pin(dev),
+    );
     set_reencode_override(prev);
     lm.unwrap()
 }
 
 fn tiny_model() -> ExecutableModel {
-    ExecutableModel::new(tiny_lm(None))
+    ExecutableModel::new(tiny_lm(None, Device::Cpu))
 }
 
 fn argmax(lg: &[f32]) -> u32 {
@@ -170,11 +177,11 @@ fn test_hub_model_budget_safeguard() {
 
 #[test]
 fn test_tiny_nvfp4_inference_and_generation() {
-    let lm = tiny_lm(Some(QuantFormat::GGUF_NVFP4));
-    let vocab = lm.tokenizer().vocab_size() as u32;
+    let lm = tiny_lm(Some(QuantFormat::GGUF_NVFP4), Device::Cpu);
     let ids = lm.tokenizer().encode("How many 'r's in the word strawberry?");
+    // Random weights over the synthetic config's vocab (wider than the fallback tokenizer's).
     let (out, _) = greedy_ids(&*lm, &ids, 5);
-    assert!(out.iter().all(|&t| t < vocab));
+    assert_eq!(out.len(), 5);
     assert!(greedy_text(&*lm, "There are", 5).starts_with("There are"));
 }
 
@@ -218,7 +225,7 @@ async fn test_server_real_streaming_and_system1_endpoint() {
     // Spawn scheduler step runner for the duration of the test
     let sched_clone = scheduler.clone();
     let step_handle = tokio::spawn(async move {
-        for _ in 0..100 {
+        loop {
             tokio::time::sleep(Duration::from_millis(5)).await;
             sched_clone.step();
         }
@@ -242,6 +249,7 @@ async fn test_server_real_streaming_and_system1_endpoint() {
             serde_json::json!({
                 "model": "foundry/smollm-1m",
                 "messages": [{"role": "user", "content": "How many 'r's in strawberry?"}],
+                "max_tokens": 8,
                 "stream": false
             })
             .to_string(),
@@ -280,8 +288,11 @@ fn test_smollm2_program_scheduler_inference() {
     let exec_model = ExecutableModel::new(lm);
     let tokenizer = exec_model.tokenizer();
     let prompt = "The capital of France is";
-    let prompt_tokens = tokenizer.encode(prompt);
-    let mut kv = None;
+    let (prompt_tokens, state) = exec_model
+        .lm()
+        .prepare(tokenizer.encode(prompt), &[])
+        .expect("prepare succeeds");
+    let mut kv = Some(state);
 
     // Prefill through scheduler
     let first_next = exec_model
@@ -317,7 +328,8 @@ fn test_smollm2_program_scheduler_inference() {
 
 #[test]
 fn test_decode_throughput_benchmark_300_tok_s() {
-    let model = tiny_model();
+    // The shipping backend: the CPU executor is the opt-in fallback, not a throughput target.
+    let model = ExecutableModel::new(tiny_lm(None, foundry_engine::hardware::default_device()));
     let prompt = "In a quiet valley surrounded by mountains";
     let num_tokens = 50;
     let _ = model.generate_text_measured_plain(prompt, 5, 0.0).unwrap(); // warm-up
@@ -353,7 +365,7 @@ fn test_all_readme_models_inference_and_zero_gibberish() {
     assert_coherent(SMOLLM2, "User: How are you today? Assistant: I am", 10);
 
     let prompt = "The sun rises over the horizon,";
-    let out = greedy_text(&*tiny_lm(None), prompt, 10);
+    let out = greedy_text(&*tiny_lm(None, Device::Cpu), prompt, 10);
     assert!(out.starts_with(prompt) && !out.contains("<0x"), "{out:?}");
 
     let gguf_path =
@@ -807,4 +819,34 @@ fn test_chat_template_and_scheduler_greedy_match_hf() {
         }
         assert_eq!(answer, want_answer, "{}", dir.display());
     }
+}
+
+/// A checkpoint missing a weight its family spec reads is refused naming that tensor.
+#[test]
+fn test_missing_required_weight_names_the_tensor() {
+    let dir = tempfile::tempdir().unwrap();
+    let header =
+        br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[4,2],"data_offsets":[0,32]}}"#;
+    let mut data = (header.len() as u64).to_le_bytes().to_vec();
+    data.extend_from_slice(header);
+    data.extend_from_slice(&[0u8; 32]);
+    std::fs::write(dir.path().join("model.safetensors"), data).unwrap();
+    let cfg = serde_json::json!({"architectures": ["LlamaForCausalLM"], "model_type": "llama",
+        "vocab_size": 4, "hidden_size": 2, "num_hidden_layers": 1, "num_attention_heads": 1,
+        "num_key_value_heads": 1, "intermediate_size": 4, "max_position_embeddings": 16});
+    std::fs::write(dir.path().join("config.json"), cfg.to_string()).unwrap();
+    let tok = serde_json::json!({"version": "1.0", "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "WhitespaceSplit"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "c": 2, "d": 3}, "unk_token": "a"}});
+    std::fs::write(dir.path().join("tokenizer.json"), tok.to_string()).unwrap();
+    let art = ModelArtifacts {
+        model_id: "t/missing".into(),
+        tokenizer_path: Some(dir.path().join("tokenizer.json")),
+        local_dir: Some(dir.path().to_path_buf()),
+        config_path: Some(dir.path().join("config.json")),
+        weights_path: Some(dir.path().join("model.safetensors")),
+        ..Default::default()
+    };
+    let err = load(&art).err().expect("a checkpoint without layer weights loads");
+    assert!(err.contains("model.layers.0.input_layernorm.weight"), "{err}");
 }

@@ -1103,7 +1103,7 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
                 cached: true,
                 blocker: match gguf_arch
                     .as_deref()
-                    .is_some_and(|a| PACKED_MOE_GGUF.contains(&a))
+                    .is_some_and(crate::arch::dispatch::runs_spec_lm_gguf)
                 {
                     true => packed_memory_blocker(
                         art.weights_path
@@ -1656,7 +1656,7 @@ fn parse_hub_rows(
                 .or_else(|| quant_blocker(m))
                 .or_else(|| split_gguf_blocker(m, &selection))
                 .or_else(|| selection.err().filter(|_| !own_files))
-                .or_else(|| match PACKED_MOE_GGUF.contains(&gguf_arch.unwrap_or("")) {
+                .or_else(|| match gguf_arch.is_some_and(crate::arch::dispatch::runs_spec_lm_gguf) {
                     true => packed_memory_blocker(size, total_memory),
                     false => memory_blocker(params, total_memory),
                 });
@@ -2000,10 +2000,9 @@ fn spec_lm_type(m: &Value) -> bool {
 }
 
 /// GGUF architectures whose expert banks stay packed in the file data (never expanded).
-const PACKED_MOE_GGUF: &[&str] = &["qwen35moe", "qwen4exp"];
-
-/// A packed-MoE GGUF row is sized by its weight file (`gguf.total` counts every expert; a 14B-A3B
-/// MXFP4 file ran at 13 GB RSS for its 8.8 GB): file bytes + ~10% for the caches and activations.
+/// A causal-LM GGUF row (its family spec keeps the blocks packed) is sized by its weight file
+/// (`gguf.total` counts every expert; a 14B-A3B MXFP4 file ran at 13 GB RSS for its 8.8 GB): file
+/// bytes + ~10% for the caches and activations.
 // ponytail: a flat 1.1 over the file; decode scratch and KV grow with context.
 fn packed_memory_blocker(file_bytes: Option<u64>, total_memory: Option<u64>) -> Option<String> {
     let (bytes, total) = (file_bytes?, total_memory?);
@@ -2011,7 +2010,7 @@ fn packed_memory_blocker(file_bytes: Option<u64>, total_memory: Option<u64>) -> 
     let need = bytes as f64 * 1.1;
     (need > total as f64).then(|| {
         format!(
-            "needs ~{:.0} GB (experts stay packed in the {:.0} GB GGUF); host has {:.0} GB",
+            "needs ~{:.0} GB (weights stay packed in the {:.0} GB GGUF); host has {:.0} GB",
             gb(need),
             gb(bytes as f64),
             gb(total as f64)
@@ -2019,8 +2018,8 @@ fn packed_memory_blocker(file_bytes: Option<u64>, total_memory: Option<u64>) -> 
     })
 }
 
-/// Spec-loaded models map their weights as stored (16-bit floats, or packed blocks no larger):
-/// 2 bytes per parameter bounds them.
+/// Rows without a packed-GGUF size (safetensors LMs, image pipelines) are bounded by 16-bit
+/// weights: 2 bytes per parameter.
 fn memory_blocker(params: Option<u64>, total_memory: Option<u64>) -> Option<String> {
     let (params, total) = (params?, total_memory?);
     let gb = |b: f64| b / (1u64 << 30) as f64;
@@ -2288,8 +2287,8 @@ mod tests {
         // 25B parameters are 47 GB as bf16: they fit 48 GB.
         assert!(memory_blocker(Some(25_000_000_000), Some(48 << 30)).is_none());
         assert!(blocker("r/qwen3-big").starts_with("needs ~26 GB as bf16; host has 16 GB"));
-        // Native GGUF loaders expand to bf16 whatever the file's quantization.
-        assert!(blocker("e/q35-27b-gguf").starts_with("needs ~50 GB as bf16; host has 16 GB"));
+        // Spec LMs keep GGUF blocks packed: a 27B Q4_K_M is sized by its ~15 GB file (fits 16 GB).
+        assert_eq!(blocker("e/q35-27b-gguf"), "");
         // Qwen-Image rows load (2.1 and 1, diffusers and transformer-only GGUFs, a 2.1 finetune
         // whose GGUF says `qwen_image`, LoRAs of a base), or say why not: Edit conditions on images.
         assert!(blocker("x/qwen-image").starts_with("needs ~38 GB as bf16; host has 16 GB"));
@@ -2313,7 +2312,7 @@ mod tests {
         // A 35B-A3B Q4_K_M (experts packed) is sized by its file, not params x 2.
         let b = blocker("c/q35moe-gguf");
         assert!(
-            b.contains("experts stay packed") && b.ends_with("host has 16 GB"),
+            b.contains("weights stay packed") && b.ends_with("host has 16 GB"),
             "{b}"
         );
         assert_eq!(

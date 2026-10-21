@@ -141,13 +141,16 @@ pub fn synthetic_llama(dir: &Path, cfg: J) -> ModelArtifacts {
     }
 }
 
-/// [`synthetic_llama`] loaded as a causal LM ([`crate::runtime::lm`]) on `dev`.
+/// [`synthetic_llama`] loaded as a causal LM ([`crate::runtime::lm::SpecLm`]) on `dev` with
+/// bit-exact weights (no host re-encode policy: CPU and Metal hold the same values).
 pub fn synthetic_lm(dir: &Path, cfg: J, dev: Device) -> crate::scheduler::ExecutableModel {
     let a = synthetic_llama(dir, cfg);
-    let lm = crate::runtime::lm::load(&a, super::registry().unwrap(), Some("llama"), PlacementMode::Pin(dev))
+    let exact = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
+    let m = load::load_with(&a, super::registry().unwrap(), Some("llama"), exact).unwrap();
+    let lm = crate::runtime::lm::SpecLm::new(m, PlacementMode::Pin(dev))
         .unwrap_or_else(|e| panic!("synthetic llama: {e}"));
-    assert_eq!(lm.device(), dev);
-    crate::scheduler::ExecutableModel::new(lm)
+    assert_eq!(crate::model::native::NativeLm::device(&lm), dev);
+    crate::scheduler::ExecutableModel::new(std::sync::Arc::new(lm))
 }
 
 /// `n` greedy tokens after `prompt` (raw text, no chat template) from `artifacts` loaded on the CPU
@@ -189,7 +192,6 @@ impl Runner {
     pub fn from_artifacts(a: &ModelArtifacts, family: Option<&str>, dev: Device, ctx: usize) -> Result<Self, String> {
         let reencode = ReencodeConfig {
             policy: ReencodePolicy::BitExact,
-            cache_dir: None,
             ..Default::default()
         };
         let model = load::load_with(a, &Registry::load(None)?, family, reencode)?;

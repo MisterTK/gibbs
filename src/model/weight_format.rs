@@ -3,10 +3,8 @@
 //! [`ReencodeConfig::force`]); a re-encoded model must stay within the policy's KL limit of the
 //! source model over a probe text ([`native_kl_gate`]), else the load retries more exactly.
 
-use crate::hardware::default_cache_dir;
 use crate::model::reencode::ReencodeProgress;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Quality floor: largest mean KL divergence (nats) of a format's next-token distribution from
@@ -94,13 +92,11 @@ const PROBE_TEXT: &str = "The engine measures each weight format on this machine
     a format that is fast but wrong does not help anyone who reads the answers it writes.";
 
 /// How a GPU load re-encodes its weights (S3.5).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ReencodeConfig {
     pub policy: ReencodePolicy,
     /// Overrides the KL limit of the whole-model gate.
     pub max_kl: Option<f64>,
-    /// Cache root (entries live in `<dir>/reencoded/`); `None` disables the cache.
-    pub cache_dir: Option<PathBuf>,
     /// Filled while tensors are re-encoded, for the load-stage text.
     pub progress: Option<Arc<ReencodeProgress>>,
     /// Receives every `reencode: ...` log line (the CLI routes it to its telemetry log).
@@ -113,21 +109,6 @@ pub struct ReencodeConfig {
     /// `--quant <fmt>`: every spec-loaded weight matrix is stored as this format (f32/f16/bf16
     /// or an encodable `graph::codec` block format) instead of its checkpoint encoding.
     pub force: Option<crate::hardware::QuantFormat>,
-}
-
-impl Default for ReencodeConfig {
-    fn default() -> Self {
-        Self {
-            policy: ReencodePolicy::default(),
-            max_kl: None,
-            cache_dir: default_cache_dir().ok(),
-            progress: None,
-            log: None,
-            ffn_only: false,
-            ffn_weights: None,
-            force: None,
-        }
-    }
 }
 
 /// The configuration loaders use instead of the settings file when set ([`set_reencode_override`]).

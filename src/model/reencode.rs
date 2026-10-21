@@ -326,15 +326,17 @@ pub(crate) fn fake_native_reencoded(n: usize) {
     (s.tensors, s.reencoded) = (n, n);
 }
 
-static NATIVE_APPLIED: Mutex<Option<(ReencodePolicy, u64)>> = Mutex::new(None);
+static NATIVE_APPLIED: Mutex<Option<(ReencodePolicy, u64, Option<Q>)>> = Mutex::new(None);
 
-/// Records the policy the last native load ended up with and the bytes per token it saved.
-pub fn set_native_applied(policy: ReencodePolicy, saved_bytes: u64) {
-    *NATIVE_APPLIED.lock() = Some((policy, saved_bytes));
+/// Records the policy the last native load ended up with, the bytes per token it saved and the
+/// `--quant` format every matrix was forced into (which bypasses the policy).
+pub fn set_native_applied(policy: ReencodePolicy, saved_bytes: u64, force: Option<Q>) {
+    *NATIVE_APPLIED.lock() = Some((policy, saved_bytes, force));
 }
 
-/// `(policy, bytes saved over the source blocks)` of the last native load that reached the gate.
-pub fn native_applied() -> Option<(ReencodePolicy, u64)> {
+/// `(policy, bytes saved over the source blocks, forced format)` of the last native load that
+/// reached the gate.
+pub fn native_applied() -> Option<(ReencodePolicy, u64, Option<Q>)> {
     *NATIVE_APPLIED.lock()
 }
 
@@ -726,7 +728,6 @@ mod tests {
         };
         let cfg = crate::model::weight_format::ReencodeConfig {
             policy: MaxSpeed,
-            cache_dir: None,
             ..Default::default()
         };
         // The whole-tensor procedure the row runs replace.

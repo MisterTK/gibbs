@@ -83,7 +83,6 @@ impl SpecEncoder {
     ) -> Result<Self, String> {
         let reencode = ReencodeConfig {
             policy: ReencodePolicy::BitExact,
-            cache_dir: None,
             ..Default::default()
         };
         let model = load::load_with(artifacts, crate::arch::registry()?, family, reencode)?;

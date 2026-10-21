@@ -108,24 +108,32 @@ fn median(v: &mut [f64]) -> Option<f64> {
 /// A model loaded for measurement and what its decode step streams.
 pub struct BenchLoad {
     pub exec: crate::scheduler::ExecutableModel,
-    /// The re-encode policy whose formats the model's projections ended up in: what the KL
-    /// fallback chain applied.
-    pub policy: crate::model::weight_format::ReencodePolicy,
-    /// Bytes per token the loader saved against the source blocks under `policy` (those are
-    /// counted from the header with [`ReencodePolicy::BitExact`]).
-    pub saved_bytes: u64,
+    pub applied: Applied,
 }
 
-/// `(policy, saved bytes per token)` a finished load applied: the roofline basis of
-/// [`roofline_bytes`], from the loader's record: tensors keep their source formats (bit-exact)
-/// minus the bytes it saved, which are counted from the header with [`ReencodePolicy::BitExact`].
-///
-/// [`ReencodePolicy::BitExact`]: crate::model::weight_format::ReencodePolicy::BitExact
-pub fn applied_policy() -> (crate::model::weight_format::ReencodePolicy, u64) {
+/// What a finished load applied to its weight matrices: the roofline basis of [`roofline_bytes`].
+#[derive(Clone, Copy, Debug)]
+pub struct Applied {
+    /// The re-encode policy whose formats the projections ended up in (what the KL fallback
+    /// chain applied).
+    pub policy: crate::model::weight_format::ReencodePolicy,
+    /// Bytes per token saved against the source blocks; those are then counted from the header
+    /// with [`ReencodePolicy::BitExact`](crate::model::weight_format::ReencodePolicy::BitExact).
+    pub saved_bytes: u64,
+    /// `--quant`: every streamed matrix stored in this format instead.
+    pub force: Option<crate::hardware::QuantFormat>,
+}
+
+/// The loader's record of the last load ([`Applied`]).
+pub fn applied_policy() -> Applied {
     use crate::model::weight_format::ReencodePolicy;
-    let (policy, saved) =
-        crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0));
-    (if saved > 0 { ReencodePolicy::BitExact } else { policy }, saved)
+    let (policy, saved_bytes, force) =
+        crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0, None));
+    Applied {
+        policy: if saved_bytes > 0 { ReencodePolicy::BitExact } else { policy },
+        saved_bytes,
+        force,
+    }
 }
 
 /// Loads `artifacts` on Metal under the `reencode` policy name (the effective policy of every
@@ -152,11 +160,9 @@ pub fn load_for_bench(
             admit: &|_| Ok(()),
         },
     )?;
-    let (policy, saved_bytes) = applied_policy();
     Ok(BenchLoad {
         exec,
-        policy,
-        saved_bytes,
+        applied: applied_policy(),
     })
 }
 
@@ -165,16 +171,17 @@ pub fn load_for_bench(
 /// and `"file"` when no header can be read.
 pub fn roofline_bytes(
     artifacts: &crate::model::hub::ModelArtifacts,
-    policy: crate::model::weight_format::ReencodePolicy,
-    saved_bytes: u64,
+    applied: &Applied,
 ) -> (u64, &'static str) {
     let streamed = artifacts
         .weights_path
         .as_ref()
         .and_then(|p| crate::model::variant::read_local_header(p).ok())
-        .map(|h| {
-            h.streamed_bytes_per_token(policy)
-                .saturating_sub(saved_bytes)
+        .map(|h| match applied.force {
+            Some(f) => h.streamed_bytes_forced(f),
+            None => h
+                .streamed_bytes_per_token(applied.policy)
+                .saturating_sub(applied.saved_bytes),
         })
         .filter(|&b| b > 0);
     match streamed {
@@ -367,7 +374,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
         };
         let model_exec = load.exec;
         let (bytes_per_token, bytes_basis) =
-            roofline_bytes(&artifacts, load.policy, load.saved_bytes);
+            roofline_bytes(&artifacts, &load.applied);
         let mut res = match measure_loaded(
             &model_exec,
             &prompt,

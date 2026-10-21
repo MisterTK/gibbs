@@ -2445,6 +2445,7 @@ pub fn gated<T>(
                     policy
                 },
                 saved,
+                user.force,
             );
             if stats.reencoded > 0 || user.policy != BitExact {
                 log(format!(
@@ -2463,7 +2464,7 @@ pub fn gated<T>(
                         "reencode: no bit-exact reference to gate against ({}); using bit-exact",
                         other.and_then(Result::err).unwrap_or_default()
                     ));
-                    result = other_exact(&load_as);
+                    result = other_exact(&load_as, user.force);
                     break;
                 }
             }
@@ -2476,7 +2477,7 @@ pub fn gated<T>(
                     "reencode: {label} accepted (mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
                     r.mean_kl, r.top1 * 100.0, stats.reencoded, saved as f64 / 1e6
                 ));
-                set_native_applied(policy, saved);
+                set_native_applied(policy, saved, user.force);
                 result = Some(Ok(cand));
                 break;
             }
@@ -2487,7 +2488,7 @@ pub fn gated<T>(
             )),
             Err(e) => {
                 log(format!("reencode: gate unavailable ({e}); using bit-exact"));
-                result = other_exact(&load_as);
+                result = other_exact(&load_as, user.force);
                 break;
             }
         }
@@ -2496,12 +2497,13 @@ pub fn gated<T>(
     result
 }
 
-/// The bit-exact load, as the last resort when the gate cannot run.
+/// The bit-exact load (still under `--quant`'s `force`), as the last resort when the gate cannot run.
 fn other_exact<T>(
     load_as: &dyn Fn(ReencodePolicy, bool) -> Option<Result<T, String>>,
+    force: Option<crate::hardware::QuantFormat>,
 ) -> Option<Result<T, String>> {
     let r = load_as(ReencodePolicy::BitExact, false);
-    crate::model::reencode::set_native_applied(ReencodePolicy::BitExact, 0);
+    crate::model::reencode::set_native_applied(ReencodePolicy::BitExact, 0, force);
     r
 }
 
@@ -2563,7 +2565,6 @@ mod tests {
     fn exact() -> ReencodeConfig {
         ReencodeConfig {
             policy: ReencodePolicy::BitExact,
-            cache_dir: None,
             ..Default::default()
         }
     }
@@ -3302,7 +3303,6 @@ mod tests {
         let previous = reencode_override();
         set_reencode_override(Some(ReencodeConfig {
             policy: MS,
-            cache_dir: None,
             ..Default::default()
         }));
         let seen = Mutex::new(Vec::new());

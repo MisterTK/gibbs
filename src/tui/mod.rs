@@ -904,9 +904,8 @@ impl TuiApp {
             .model()
             .ok_or("no text model loaded; press m to load one")?;
         let id = sched.model_id();
-        let (policy, saved) = crate::bench::applied_policy();
-        let (bytes, basis) =
-            crate::bench::roofline_bytes(&self.hub.locate_model(&id), policy, saved);
+        let applied = crate::bench::applied_policy();
+        let (bytes, basis) = crate::bench::roofline_bytes(&self.hub.locate_model(&id), &applied);
         let ceiling = match crate::model::variant::host_ceiling_gbps() {
             c if c > 0.0 => c,
             _ => f64::from(self.telemetry.get_summary().memory_bandwidth_gbps),
@@ -1467,9 +1466,9 @@ impl TuiApp {
                             crate::model::variant::decode_bytes_per_token(p, reencode_cfg.policy)
                         });
                         sched.telemetry.set_model_size_bytes(model_size);
-                        let (applied, saved) = crate::bench::applied_policy();
+                        let applied = crate::bench::applied_policy();
                         if let (b, "streamed") =
-                            crate::bench::roofline_bytes(&artifacts, applied, saved)
+                            crate::bench::roofline_bytes(&artifacts, &applied)
                         {
                             sched.telemetry.set_model_size_bytes(b);
                         }

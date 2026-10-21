@@ -549,8 +549,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             }
             // The roofline basis follows the policy the load applied (the gate may have fallen back).
-            let (applied, saved) = gibbs_engine::bench::applied_policy();
-            if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, applied, saved)
+            let applied = gibbs_engine::bench::applied_policy();
+            if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, &applied)
             {
                 telemetry.set_model_size_bytes(b);
             }

@@ -1129,7 +1129,6 @@ mod tests {
         };
         let exact = ReencodeConfig {
             policy: ReencodePolicy::BitExact,
-            cache_dir: None,
             ..Default::default()
         };
         let m = crate::arch::load::load_with(&a, &reg, Some("toy"), exact).unwrap();
@@ -1352,7 +1351,7 @@ mod tests {
         let spec = MEDIA_SPEC.replace("$ROWS", &rows.to_string());
         let reg = Registry::from_files(&[("families/toym.json5".into(), spec)], &[]).unwrap();
         let a = ModelArtifacts { model_id: "gibbs/toym".into(), ..Default::default() };
-        let exact = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
+        let exact = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
         let m = crate::arch::load::load_with(&a, &reg, Some("toym"), exact).unwrap();
         SpecLm::new(m, PlacementMode::Pin(dev)).unwrap()
     }

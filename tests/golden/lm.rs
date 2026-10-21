@@ -134,7 +134,6 @@ fn load_lm(dir: &Path, dev: Device, family: Option<&str>) -> ExecutableModel {
     let a = artifacts(dir, "golden/lm", "model.safetensors");
     let reencode = ReencodeConfig {
         policy: ReencodePolicy::BitExact,
-        cache_dir: None,
         ..Default::default()
     };
     let opts = LoadOpts {

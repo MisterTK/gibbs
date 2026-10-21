@@ -1350,10 +1350,6 @@ fn fused_gemv_gguf_blocks(
     }
 }
 
-/// Quantize an f32 weight slice into GGUF Q4_0 format (18 bytes per 32 elements), as ggml's
-/// `quantize_row_q4_0_ref`: `d = max/-8` for the signed element of largest magnitude, so
-/// re-encoding a dequantized block made by that reference quantizer reproduces it (imatrix-tuned
-/// blocks may differ; loaders carry raw blocks where they can).
 /// The UE4M3 scale byte's value as [`dequantize_nvfp4_block`] reads it (`0` and `0x7F`: 0).
 fn nvfp4_scale(x: u32) -> f32 {
     let (e, m) = ((x >> 3) & 0xF, x & 7);
@@ -1399,6 +1395,10 @@ pub fn quantize_f32_to_gguf_nvfp4(weights: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Quantize an f32 weight slice into GGUF Q4_0 format (18 bytes per 32 elements), as ggml's
+/// `quantize_row_q4_0_ref`: `d = max/-8` for the signed element of largest magnitude, so
+/// re-encoding a dequantized block made by that reference quantizer reproduces it (imatrix-tuned
+/// blocks may differ; loaders carry raw blocks where they can).
 pub fn quantize_f32_to_q4_0(weights: &[f32]) -> Vec<u8> {
     let num_blocks = (weights.len() + 31) / 32;
     let mut out = Vec::with_capacity(num_blocks * 18);
@@ -2198,6 +2198,31 @@ mod tests {
                 assert!(*x == 0.0 || z.signum() == x.signum() || *z == 0.0, "sub {sub}: sign of {x} -> {z}");
             }
         }
+    }
+
+    /// Through `QuantizedLinearLayer::from_f32`: values on the grid (E2M1 entry × a representable
+    /// scale) round-trip exactly, an all-zero sub-block encodes scale 0, and sub-blocks beyond the
+    /// largest scale clamp to code 0x7E (never 0x7F, which decodes to 0) without NaN.
+    #[test]
+    fn gguf_nvfp4_from_f32_edges() {
+        let d = nvfp4_scale(0x3A);
+        let mut w: Vec<f32> = (0..64).map(|i| KVALUES_FP4[i % 16] as f32 * d).collect();
+        w[0] = 12.0 * d; // every sub-block's amax is 12·d
+        for i in [16, 32] {
+            w[i] = -12.0 * d;
+        }
+        w.extend(std::iter::repeat_n(0.0, 64));
+        w.extend((0..64).map(|i| if i % 2 == 0 { 1e6 } else { -3e5 }));
+        let l = QuantizedLinearLayer::from_f32("t", 192, 1, &w, QuantFormat::GGUF_NVFP4).unwrap();
+        let QuantizedWeight::GgufQuantized { raw_data, .. } = &l.weight else { panic!("not blocks") };
+        let mut y = vec![0.0f32; 192];
+        for (b, out) in raw_data.chunks(36).zip(y.chunks_mut(64)) {
+            dequantize_nvfp4_block(b, out);
+        }
+        assert_eq!(&y[..64], &w[..64], "on-grid values");
+        assert!(raw_data[36..40].iter().all(|&c| c == 0) && y[64..128].iter().all(|&v| v == 0.0));
+        assert!(raw_data[72..76].iter().all(|&c| c == 0x7E), "{:x?}", &raw_data[72..76]);
+        assert!(y[128..].iter().all(|v| v.is_finite() && *v != 0.0));
     }
     use crate::hardware::QuantFormat;
 

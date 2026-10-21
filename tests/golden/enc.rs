@@ -793,7 +793,6 @@ fn smolvlm(case: &str, width: usize, height: usize) {
     // the Metal weights. ponytail: process-global, set (never cleared) by every spec-load case.
     set_reencode_override(Some(ReencodeConfig {
         policy: ReencodePolicy::BitExact,
-        cache_dir: None,
         ..Default::default()
     }));
     golden(case, TOL, |dev| {

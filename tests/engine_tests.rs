@@ -166,8 +166,11 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
     );
     let tokenizer = exec_model.tokenizer();
     let prompt = "The capital of France is";
-    let prompt_tokens = tokenizer.encode(prompt);
-    let mut kv = None;
+    let (prompt_tokens, state) = exec_model
+        .lm()
+        .prepare(tokenizer.encode(prompt), &[])
+        .expect("prepare succeeds");
+    let mut kv = Some(state);
 
     let first_next = exec_model
         .step_prefill_chunk(&prompt_tokens, 0, true, &prompt_tokens, 0.0, 1.0, &mut kv)
