@@ -198,6 +198,229 @@ impl Lora {
     }
 }
 
+/// Which network of a pipeline a LoRA module patches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Part {
+    Denoiser,
+    /// The n-th text encoder.
+    TextEncoder(usize),
+}
+
+/// One low-rank module of a LoRA file.
+#[derive(Debug, Clone, Default)]
+struct Pair {
+    down: Option<String>,
+    up: Option<String>,
+    alpha: Option<String>,
+    bias: Option<String>,
+}
+
+/// A LoRA file (safetensors / any `read_checkpoint` format): kohya / sd-scripts (`lora_unet_*`,
+/// `lora_te{,1,2}_*`, `lora_transformer_*`, `.alpha`), diffusers / PEFT (`unet.` / `transformer.` /
+/// `text_encoder{,_2}.` + `lora.down` / `lora_A`, `processor.to_q_lora`) and ComfyUI `.diff_b` bias
+/// deltas. Each module adds `strength · alpha/rank · up·down` (scale 1 without alpha) to the
+/// weight its key names, through `arch::load::WeightStore::add_lora`; LoHa / LoKr / DoRA are Errs.
+pub struct LoraFile {
+    path: std::path::PathBuf,
+    manifest: crate::model::ModelManifest,
+    data: Vec<u8>,
+    /// (part, module key: trainer prefix stripped, `.` as `_`) -> tensors.
+    modules: BTreeMap<(Part, String), Pair>,
+    /// PEFT `lora_alpha` from `adapter_config.json`, when present.
+    peft_alpha: Option<f32>,
+}
+
+impl LoraFile {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let (manifest, data) = crate::model::loaders::read_checkpoint(path)
+            .map_err(|e| format!("LoRA {}: {e}", path.display()))?;
+        let mut modules: BTreeMap<(Part, String), Pair> = BTreeMap::new();
+        for n in manifest.tensors.keys() {
+            let (module, slot) = [
+                (".lora_down.weight", 0),
+                (".lora.down.weight", 0),
+                ("_lora.down.weight", 0),
+                (".lora_A.weight", 0),
+                (".lora_up.weight", 1),
+                (".lora.up.weight", 1),
+                ("_lora.up.weight", 1),
+                (".lora_B.weight", 1),
+                (".alpha", 2),
+                (".diff_b", 3),
+            ]
+            .iter()
+            .find_map(|(s, p)| Some((n.strip_suffix(s)?, *p)))
+            .ok_or_else(|| {
+                format!("LoRA tensor '{n}' is not a low-rank up/down/alpha weight (LoHa/LoKr/DoRA are not supported)")
+            })?;
+            let (part, path) = [
+                ("lora_unet_", Part::Denoiser),
+                ("lora_transformer_", Part::Denoiser),
+                ("lora_te1_", Part::TextEncoder(0)),
+                ("lora_te2_", Part::TextEncoder(1)),
+                ("lora_te_", Part::TextEncoder(0)),
+                ("unet.", Part::Denoiser),
+                ("transformer.", Part::Denoiser),
+                ("diffusion_model.", Part::Denoiser),
+                ("base_model.model.", Part::Denoiser),
+                ("text_encoder_2.", Part::TextEncoder(1)),
+                ("text_encoder.", Part::TextEncoder(0)),
+            ]
+            .iter()
+            .find_map(|(p, t)| Some((*t, module.strip_prefix(p)?)))
+            .unwrap_or((Part::Denoiser, module));
+            let mut key = path.replace(".processor.", ".").replace('.', "_");
+            // Old diffusers attention processors name `to_out.0` as `to_out_lora`.
+            if key.ends_with("_to_out") {
+                key.push_str("_0");
+            }
+            let m = modules.entry((part, key)).or_default();
+            let slot = match slot {
+                0 => &mut m.down,
+                1 => &mut m.up,
+                2 => &mut m.alpha,
+                _ => &mut m.bias,
+            };
+            *slot = Some(n.clone());
+        }
+        if let Some(((_, k), _)) = modules
+            .iter()
+            .find(|(_, m)| m.up.is_none() != m.down.is_none() || (m.up.is_none() && m.bias.is_none()))
+        {
+            return Err(format!("LoRA module '{k}' lacks its up or down weight"));
+        }
+        if modules.is_empty() {
+            return Err(format!("{} has no LoRA tensors", path.display()));
+        }
+        let peft_alpha = path
+            .parent()
+            .and_then(|d| std::fs::read_to_string(d.join("adapter_config.json")).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|c| c["lora_alpha"].as_f64())
+            .map(|a| a as f32);
+        Ok(Self { path: path.to_path_buf(), manifest, data, modules, peft_alpha })
+    }
+
+    /// Every module.
+    pub fn modules(&self) -> usize {
+        self.modules.len()
+    }
+
+    /// Modules patching `part`.
+    pub fn targets(&self, part: Part) -> usize {
+        self.modules.keys().filter(|(p, _)| *p == part).count()
+    }
+
+    fn tensor(&self, n: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        let t = &self.manifest.tensors[n];
+        let v = crate::model::decode_dtype(&self.data[t.byte_offset..t.byte_offset + t.byte_len], &t.dtype)
+            .map_err(|e| format!("LoRA {}: '{n}': {e}", self.path.display()))?;
+        Ok((t.shape.clone(), v))
+    }
+
+    /// Registers every `part` module on `model` at `strength`. A module key names a weight by its
+    /// canonical name, its checkpoint name, or a name the family's rename rules map to a canonical
+    /// one (`.` as `_`, e.g. kohya LDM keys on a diffusers checkpoint). Returns the modules applied.
+    pub fn apply(
+        &self,
+        part: Part,
+        model: &mut crate::arch::load::Model,
+        reg: &crate::arch::Registry,
+        strength: f32,
+    ) -> Result<usize, String> {
+        let us = |s: &str| s.replace('.', "_");
+        let names = model.store.names();
+        let mut index: HashMap<String, String> = HashMap::new();
+        for c in &names {
+            let stem = c.strip_suffix(".weight").unwrap_or(c);
+            index.insert(us(stem), c.clone());
+            if let Some(i) = stem.find("text_model.") {
+                index.entry(us(&stem[i + "text_model.".len()..])).or_insert_with(|| c.clone());
+                index.entry(us(&stem[i..])).or_insert_with(|| c.clone());
+            }
+        }
+        for (raw, c) in &model.renames {
+            let stem = raw.strip_suffix(".weight").unwrap_or(raw);
+            index.entry(us(stem)).or_insert_with(|| c.clone());
+        }
+        // The rename rules over `_`-joined names.
+        let mut pairs = model.spec.names.rules.clone();
+        for set in &model.spec.names.use_sets {
+            pairs.extend(reg.name_set(set)?);
+        }
+        let ren = crate::arch::names::Renamer::from_pairs(
+            &pairs.iter().map(|(a, b)| (us(a), us(b))).collect::<Vec<_>>(),
+        )?;
+        let canon: HashMap<String, String> = names
+            .iter()
+            .map(|c| (us(c), c.clone()))
+            .collect();
+        let resolve = |key: &str| -> Option<String> {
+            if let Some(c) = index.get(key) {
+                return Some(c.clone());
+            }
+            ["", "model_diffusion_model_"].iter().find_map(|p| {
+                let r = ren.canonical(&format!("{p}{key}_weight"));
+                canon.get(&r).cloned()
+            })
+        };
+        let mut done = 0;
+        for ((p, key), m) in &self.modules {
+            if *p != part {
+                continue;
+            }
+            let target = resolve(key).ok_or_else(|| {
+                format!("LoRA module '{key}' ({part:?}) matches no weight of {}", model.spec.family)
+            })?;
+            let bias = match &m.bias {
+                Some(b) => Some(self.tensor(b)?.1.into_iter().map(|v| v * strength).collect()),
+                None => None,
+            };
+            let (Some(down), Some(up)) = (&m.down, &m.up) else {
+                return Err(format!("LoRA module '{key}': a bias delta without its low-rank pair"));
+            };
+            let (a, b) = (self.tensor(down)?, self.tensor(up)?);
+            let rank = a.0[0];
+            let alpha = match &m.alpha {
+                Some(n) => Some(*self.tensor(n)?.1.first().ok_or("empty LoRA alpha")?),
+                None => self.peft_alpha,
+            };
+            let scale = alpha.map_or(1.0, |al| al / rank as f32) * strength;
+            model
+                .store
+                .add_lora(&target, a, b, scale, bias)
+                .map_err(|e| format!("{e} (module '{key}')"))?;
+            done += 1;
+        }
+        Ok(done)
+    }
+}
+
+/// Whether a LoRA file's tensor names patch a diffusion denoiser (SD UNet blocks, FLUX / DiT
+/// blocks) or CLIP text encoders, rather than an LLM.
+pub fn is_diffusion_lora<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    const BLOCKS: [&str; 13] = [
+        "down_blocks",
+        "up_blocks",
+        "mid_block",
+        "input_blocks",
+        "output_blocks",
+        "middle_block",
+        "lora_te",
+        "text_encoder",
+        "text_model",
+        "double_blocks",
+        "single_blocks",
+        "single_transformer_blocks",
+        "transformer_blocks",
+    ];
+    names.any(|n| {
+        (n.ends_with(".lora_down.weight") || n.ends_with(".lora.down.weight") || n.ends_with(".lora_A.weight"))
+            && BLOCKS.iter().any(|k| n.contains(k))
+            && !n.contains("model.layers.")
+    })
+}
+
 /// `base_model` of a model card (`README.md` YAML front matter): `base_model: x` or a list.
 pub fn card_base_model(readme: &str) -> Option<String> {
     let front = readme.strip_prefix("---")?.split("\n---").next()?;

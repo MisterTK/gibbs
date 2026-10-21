@@ -10,6 +10,7 @@ use crate::graph::Tensor;
 use crate::hardware::PlacementMode;
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::model::image::ImageBuffer;
+use crate::model::lora::Part as LoraPart;
 use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
 use crate::runtime::sched::{
     card_sigmas, default_sigmas, dpm_flow_sigmas, euler_step, linspace_sigmas, DpmSolver2, Mu, Rng,
@@ -605,8 +606,14 @@ impl SpecDiffusion {
         hub: &HuggingFaceHub,
         mode: PlacementMode,
         family: Option<&str>,
+        loras: &[(std::path::PathBuf, f32)],
     ) -> Result<Self, String> {
         let reg = crate::arch::registry()?;
+        let lora_files = loras
+            .iter()
+            .map(|(p, s)| Ok((crate::model::lora::LoraFile::open(p)?, *s)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut lora_applied = 0usize;
         // The root is the pipeline directory: its components carry the weights.
         let dir = artifacts
             .local_dir
@@ -627,12 +634,18 @@ impl SpecDiffusion {
         // Every component once (several nets may share one).
         let mut parts: Vec<(String, Arc<Model>)> = Vec::new();
         let mut by_comp: HashMap<String, Arc<Model>> = HashMap::new();
-        let mut comp = |name: &str| -> Result<Arc<Model>, String> {
+        let mut comp = |name: &str, part: Option<LoraPart>| -> Result<Arc<Model>, String> {
             if let Some(m) = by_comp.get(name) {
                 return Ok(m.clone());
             }
-            let m = Arc::new(root.component(reg, name)?);
+            let mut m = root.component(reg, name)?;
             crate::arch::load::check(&m)?;
+            if let Some(part) = part {
+                for (f, strength) in &lora_files {
+                    lora_applied += f.apply(part, &mut m, reg, *strength)?;
+                }
+            }
+            let m = Arc::new(m);
             by_comp.insert(name.to_string(), m.clone());
             Ok(m)
         };
@@ -644,12 +657,12 @@ impl SpecDiffusion {
         };
 
         let mut text = Vec::new();
-        for e in &rt.text_encoders {
+        for (ti, e) in rt.text_encoders.iter().enumerate() {
             if e.optional && !comp_dir_exists(&e.component) {
                 text.push(None);
                 continue;
             }
-            let m = comp(&e.component).map_err(err)?;
+            let m = comp(&e.component, Some(LoraPart::TextEncoder(ti))).map_err(err)?;
             parts.push((e.name.clone(), m.clone()));
             let tok = match e.tokenizer.strip_prefix("hub:") {
                 Some(repo) => {
@@ -694,14 +707,25 @@ impl SpecDiffusion {
             let net = Net::new(m, e.net.as_deref().unwrap_or("text"), mode);
             text.push(Some(TextEnc { e: e.clone(), net, tok, pad }));
         }
-        let den_m = comp(&rt.denoiser.component).map_err(err)?;
+        let den_m = comp(&rt.denoiser.component, Some(LoraPart::Denoiser)).map_err(err)?;
         parts.push(("denoiser".into(), den_m.clone()));
         let denoiser = Net::new(den_m, rt.denoiser.net.as_deref().unwrap_or("denoiser"), mode);
         let context_net = match &rt.context_net {
-            Some(p) => Some(Net::new(comp(&p.component).map_err(err)?, p.net.as_deref().unwrap_or("context"), mode)),
+            Some(p) => Some(Net::new(comp(&p.component, None).map_err(err)?, p.net.as_deref().unwrap_or("context"), mode)),
             None => None,
         };
-        let vae_m = comp(&rt.vae.component).map_err(err)?;
+        let vae_m = comp(&rt.vae.component, None).map_err(err)?;
+        drop(comp);
+        let lora_total: usize = lora_files
+            .iter()
+            .map(|(f, _)| (0..rt.text_encoders.len()).map(|i| f.targets(LoraPart::TextEncoder(i))).sum::<usize>() + f.targets(LoraPart::Denoiser))
+            .sum();
+        let lora_all: usize = lora_files.iter().map(|(f, _)| f.modules()).sum();
+        if lora_applied != lora_total || lora_total != lora_all {
+            return Err(err(format!(
+                "LoRA patches {lora_all} modules, {lora_applied} of them on networks this pipeline has"
+            )));
+        }
         parts.push(("vae".into(), vae_m.clone()));
         let decoder = Net::new(vae_m.clone(), rt.vae.decode.as_deref().unwrap_or("decoder"), mode);
         let encoder = rt.vae.encode.as_deref().map(|n| Net::new(vae_m.clone(), n, mode));
