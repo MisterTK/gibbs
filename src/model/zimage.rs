@@ -16,7 +16,7 @@ use crate::model::nn;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
 use crate::runtime::sched::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use crate::model::vae::SdVae;
 use crate::model::weights::Weights;
 use std::path::Path;

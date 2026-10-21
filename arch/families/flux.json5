@@ -234,7 +234,8 @@
     text_encoders: [
       // CLIP-L pooled (final-normed EOS row); the CLIP BPE is the shared openai vocabulary.
       {name: "clip", component: "text_encoder", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
-       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77, pad_id: "clip.pad_id",
+       tokenizer_config: "tokenizer", pad_token: "config",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
        outputs: {pooled: "pooled"}},
       // T5-XXL: ids + `</s>` (1) padded with `<pad>` (0) to 512 (dev, guidance-distilled) / 256
       // (schnell, its model card), every token attended (no key mask).

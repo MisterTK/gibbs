@@ -20,7 +20,7 @@ use crate::model::qwen3_5::Qwen3Encoder;
 use crate::model::qwen_image::QLin;
 use crate::model::qwen_vae21::QwenVae21;
 use crate::runtime::sched::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Instant;

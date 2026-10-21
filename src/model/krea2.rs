@@ -18,7 +18,7 @@ use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
 use crate::model::qwen_vae::QwenVae;
 use crate::runtime::sched::Rng;
-use crate::model::text_to_image::{ImageDefaults, ImageGenerator, ImageRequest};
+use crate::runtime::diffusion::{ImageDefaults, ImageGenerator, ImageRequest};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -6,7 +6,9 @@
   family: "flux2",
   extends: "flux",
   match: {
-    diffusers_class: ["Flux2KleinPipeline", "Flux2Transformer2DModel"],
+    // Not `Flux2KleinPipeline` yet: its Qwen3 text encoder needs `qwen3.json5`; until then the
+    // legacy loader (`model::flux`) runs klein repos.
+    diffusers_class: ["Flux2Transformer2DModel"],
   },
   components: {
     text_encoder: {family: "qwen3", dir: "text_encoder"},
