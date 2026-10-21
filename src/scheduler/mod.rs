@@ -382,8 +382,7 @@ impl ExecutableModel {
         temperature: f32,
         drafter: Option<Arc<dyn Drafter>>,
     ) -> Result<(String, usize, std::time::Duration), String> {
-        let s =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(self.clone()));
+        let s = self.one_shot_scheduler();
         if drafter.is_some() {
             s.set_drafter(drafter);
         }
@@ -399,11 +398,23 @@ impl ExecutableModel {
         max_new_tokens: usize,
         temperature: f32,
     ) -> Result<(String, usize, std::time::Duration), String> {
-        let s =
-            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(self.clone()));
+        let s = self.one_shot_scheduler();
         s.set_drafter(None);
         let g = s.generate(prompt, max_new_tokens, temperature)?;
         Ok((g.text, g.decode.1, g.decode.0))
+    }
+
+    /// A private scheduler for one-shot generation: its KV pool holds the model's whole context
+    /// (at least [`ONE_SHOT_POOL_BLOCKS`]).
+    fn one_shot_scheduler(&self) -> ContinuousBatchScheduler {
+        // ponytail: block ids are bookkeeping only; the 4M-token cap bounds that list.
+        let blocks = self
+            .context_len()
+            .unwrap_or(0)
+            .min(1 << 22)
+            .div_ceil(TOKENS_PER_BLOCK)
+            .max(ONE_SHOT_POOL_BLOCKS);
+        ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(blocks)), Some(self.clone()))
     }
 
     pub fn tokenizer(&self) -> Tokenizer {
@@ -528,6 +539,8 @@ pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 pub const DEFAULT_TOP_P: f32 = 0.9;
 /// Most prompt tokens one scheduler step prefills, across all sequences.
 pub const MAX_PREFILL_CHUNK: usize = 2048;
+/// KV blocks of the server's pool, and the least a one-shot generation's private pool gets.
+pub const ONE_SHOT_POOL_BLOCKS: usize = 16384;
 /// Prefill budget before the first prefill has been timed.
 const INITIAL_PREFILL_CHUNK: usize = 64;
 /// With nothing decoding, a step's prefill is sized to take about this long, so a request that
@@ -548,10 +561,16 @@ struct PrefillTuner {
     prefill_ns_per_token: f64,
     /// EWMA of one step's decode work over all decoding sequences (ns); 0 until measured.
     decode_round_ns: f64,
+    /// Prefill each prompt in one call (one-shot generation: matches a lone prefill's logits
+    /// and timing).
+    whole_prompt: bool,
 }
 
 impl PrefillTuner {
     fn budget(&self, decoding: bool) -> usize {
+        if self.whole_prompt {
+            return usize::MAX;
+        }
         if self.prefill_ns_per_token == 0.0 {
             return INITIAL_PREFILL_CHUNK;
         }
@@ -1155,13 +1174,15 @@ impl ContinuousBatchScheduler {
 
     /// Runs one request to completion on this thread (CLI `--prompt`, bench): the prompt goes
     /// through the tokenizer's chat template when it declares one, sampling uses `temperature`
-    /// and [`DEFAULT_TOP_P`]. Prints the prefill line unless the TUI owns the terminal.
+    /// and [`DEFAULT_TOP_P`]. The prompt is prefilled in one call (the scheduler stays in that
+    /// mode). Prints the prefill line unless the TUI owns the terminal.
     pub fn generate(
         &self,
         prompt: &str,
         max_new_tokens: usize,
         temperature: f32,
     ) -> Result<Generation, String> {
+        self.prefill_tuner.lock().whole_prompt = true;
         let params = SamplingParams {
             temperature: Some(temperature),
             top_p: Some(DEFAULT_TOP_P),

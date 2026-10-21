@@ -375,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quant_override = cli.quant.as_deref().map(parse_quant).transpose()?;
 
     // 2. Initialize Memory Hierarchy and KV Pool
-    let kv_pool = Arc::new(PagedKVPool::new(16384));
+    let kv_pool = Arc::new(PagedKVPool::new(gibbs_engine::scheduler::ONE_SHOT_POOL_BLOCKS));
 
     // 4. Model Resolution & Cache Inspection (Auto-Download & Cloud Storage)
     let storage_backend = StorageBackend::from_uri(&cli.storage)?;
