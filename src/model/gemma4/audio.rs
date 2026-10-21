@@ -11,7 +11,7 @@ use crate::model::par::{par_for, OutPtr};
 use crate::model::weights::{Mat, Weights};
 use serde_json::Value;
 
-pub use crate::model::audio::{read_wav, resample, resampled_len};
+use crate::model::audio::{read_wav, resample, resampled_len};
 
 // ---------------------------------------------------------------------------
 // Feature extractor

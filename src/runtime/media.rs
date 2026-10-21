@@ -779,8 +779,12 @@ mod tests {
         a.iter().zip(b).fold(0.0, |m, (x, y)| m.max((x - y).abs()))
     }
 
-    fn pinned(got: f64, want: f64) {
-        assert!((got - want).abs() <= 1e-3 * want.abs().max(1.0), "fingerprint {got} != {want}");
+    /// Position-weighted sum (relative 1e-9) and exact elements at `len/3 + 1`, `len/2`, `len - 1`.
+    fn pinned(v: &[f32], (want_sum, want_at): (f64, [f32; 3])) {
+        let got = sum(v);
+        let at = [v[v.len() / 3 + 1], v[v.len() / 2], v[v.len() - 1]];
+        assert!((got - want_sum).abs() <= 1e-9 * want_sum.abs().max(1.0), "fingerprint {got} != {want_sum}");
+        assert_eq!(at, want_at);
     }
 
     fn spec(j: serde_json::Value) -> MediaSpec {
@@ -814,7 +818,7 @@ mod tests {
         assert_eq!((p.grid.rows, p.grid.cols, p.grid.tokens), (2, 3, 28));
         assert_eq!(p.grid.vars, vec![("tiles", 7)]);
         assert_eq!(p.shape, vec![7, 3, 32, 32]);
-        pinned(sum(&p.data), PIN_TILE);
+        pinned(&p.data, PIN_TILE);
         // Portrait 100x700 → 14x96 → 32x96: 3 x 1 + global; unsplit: one view.
         assert_eq!(measure(&tile(true), &png(100, 700)).unwrap().tokens, 16);
         let one = preprocess(&tile(false), &png(300, 200)).unwrap();
@@ -867,7 +871,7 @@ mod tests {
         assert_eq!((p.grid.rows, p.grid.cols, p.grid.tokens), (6, 4, 24));
         assert_eq!(p.grid.vars, vec![("grid_h", 12), ("grid_w", 8)]);
         assert_eq!(p.shape, vec![96, 24]);
-        pinned(sum(&p.data), PIN_SMART);
+        pinned(&p.data, PIN_SMART);
         // Over the pixel budget: 400x300 shrinks to 364x272 (multiples of 4).
         let g = measure(&smart(), &png(400, 300)).unwrap();
         assert_eq!((g.var("grid_h"), g.var("grid_w")), (Some(136), Some(182)));
@@ -904,7 +908,7 @@ mod tests {
         assert_eq!((p.grid.rows, p.grid.cols, p.grid.tokens), (1, 2, 2));
         assert_eq!(p.grid.vars, vec![("grid_h", 2), ("grid_w", 4)]);
         assert_eq!(p.shape, vec![8, 48]);
-        pinned(sum(&p.data), PIN_BUDGET);
+        pinned(&p.data, PIN_BUDGET);
         // Real-size budget: 280 tokens of 3x3 16-px patches.
         let real = Preprocess::SoftTokenBudget { patch: 16, pool: 3, max_soft_tokens: 280, norm: half_norm() };
         let g = measure(&real, &png(640, 480)).unwrap();
@@ -941,7 +945,7 @@ mod tests {
         let p = preprocess(&patch_grid(), &png(200, 150)).unwrap();
         assert_eq!((p.grid.rows, p.grid.cols, p.grid.tokens), (PIN_GRID.0, PIN_GRID.1, PIN_GRID.0 * PIN_GRID.1));
         assert_eq!(p.shape, vec![p.grid.tokens, 48 * 48 * 3]);
-        pinned(sum(&p.data), PIN_PATCH);
+        pinned(&p.data, PIN_PATCH);
         let tight = Preprocess::PatchGrid {
             patch: 16,
             pool: 3,
@@ -987,7 +991,7 @@ mod tests {
         let p = preprocess(&mel(320, 160), &wav(16000, 8000)).unwrap();
         assert_eq!(p.grid.vars, vec![("frames", 50), ("valid_frames", 49), ("tokens", 13)]);
         assert_eq!(p.shape, vec![50, 320]);
-        pinned(sum(&p.data), PIN_MEL);
+        pinned(&p.data, PIN_MEL);
         // A 22.05 kHz clip is resampled first.
         assert_eq!(measure(&mel(320, 160), &wav(22050, 30000)).unwrap().tokens, PIN_MEL_TOKENS);
         let err = measure(&mel(320, 160), &wav(8000, 31 * 8000)).unwrap_err();
@@ -1223,12 +1227,12 @@ mod tests {
         assert_eq!((s.positions, s.bidirectional), (Positions::MropeGrid, true));
     }
 
-    const PIN_TILE: f64 = -1685.3751647472382;
-    const PIN_SMART: f64 = -164.63871252536774;
-    const PIN_BUDGET: f64 = -30.058731615543365;
+    const PIN_TILE: (f64, [f32; 3]) = (-1685.3751647472382, [-0.07450974, -0.09803915, -0.0666666]);
+    const PIN_SMART: (f64, [f32; 3]) = (-164.63871252536774, [-0.09803915, -0.011764646, 0.68627465]);
+    const PIN_BUDGET: (f64, [f32; 3]) = (-30.058731615543365, [0.17647064, -0.003921509, -0.18431365]);
     const PIN_REAL: (usize, usize) = (14, 19);
     const PIN_GRID: (usize, usize) = (14, 19);
-    const PIN_PATCH: f64 = 3605089.2276314674;
-    const PIN_MEL: f64 = 12.474334716796875;
+    const PIN_PATCH: (f64, [f32; 3]) = (3605089.2276314674, [0.23137257, 0.427451, 0.19607845]);
+    const PIN_MEL: (f64, [f32; 3]) = (12.474334716796875, [-0.24215698, -0.21524048, -0.062927246]);
     const PIN_MEL_TOKENS: usize = 34;
 }

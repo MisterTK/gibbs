@@ -3,8 +3,7 @@
 //! position embeddings and a LayerNorm; audio becomes raw 40 ms frames of 16 kHz samples. Both end
 //! in the shared `RMSNorm (no scale) -> Linear` projection into the text width.
 
-use super::audio::resampled_len;
-use super::audio::{read_wav, resample};
+use crate::model::audio::{read_wav, resample, resampled_len};
 use super::ops::{linear, rms_norm};
 use super::vision::{soft_tokens, target_size};
 use super::Encoder;
