@@ -1,0 +1,28 @@
+// fastText supervised classifiers (`.bin` / `.ftz` read by src/model/fasttext.rs, run by
+// src/runtime/bag.rs, which hashes a line into input-row ids, decodes product-quantized rows and
+// walks hierarchical-softmax trees): the mean of the line's input rows through the output layer,
+// then a softmax (softmax loss) or a sigmoid per output row (one-vs-all and negative-sampling
+// labels, hierarchical-softmax tree nodes). No `match`: the classifier loader picks this family.
+// `cfg`: {dim, quantized (input rows arrive decoded as `vectors`), softmax}.
+{
+  family: "fasttext",
+  pipeline: "bag_classifier",
+  components: {
+    classify: {
+      vars: ["rows"],
+      inputs: [
+        {name: "ids", dtype: "u32", shape: ["rows"], when: "!cfg.quantized"},
+        {name: "vectors", dtype: "f32", shape: ["rows", "cfg.dim"], when: "cfg.quantized"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:input", "i:ids"], out: "x", name: "input", when: "!cfg.quantized"},
+        {op: "Reduce", args: {kind: "Mean", axes: [0], keep_dims: true}, in: ["x"], out: "h", name: "mean", when: "!cfg.quantized"},
+        {op: "Reduce", args: {kind: "Mean", axes: [0], keep_dims: true}, in: ["i:vectors"], out: "h", name: "mean", when: "cfg.quantized"},
+        {op: "Linear", in: ["h", "w:output"], out: "y", name: "output"},
+        {op: "Softmax", args: {axis: -1}, in: ["y"], out: "scores", name: "softmax", when: "cfg.softmax"},
+        {op: "Unary", args: {kind: "Sigmoid"}, in: ["y"], out: "scores", name: "sigmoid", when: "!cfg.softmax"},
+      ],
+      outputs: ["scores"],
+    },
+  },
+}

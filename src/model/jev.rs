@@ -2,9 +2,8 @@
 //! (default sentence-transformers/all-MiniLM-L6-v2) answering structured questions
 //! zero-shot by cosine similarity between embeddings, in a single forward pass.
 
-use crate::graph::{DType, Graph, Op, Tensor, Weights};
 use crate::hardware::Device;
-use crate::model::classifier::head::{Gb, HeadGraph};
+use crate::runtime::encoder::SpecEncoder;
 use crate::model::hub::HuggingFaceHub;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -88,378 +87,6 @@ const BOOL_CRITERIA_ERR: &str =
 const SCORE_ERR: &str =
     "score questions need a trained head; not supported by the zero-shot encoder";
 
-#[derive(Deserialize)]
-struct BertConfig {
-    hidden_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    intermediate_size: usize,
-    max_position_embeddings: usize,
-    vocab_size: usize,
-    #[serde(default = "default_type_vocab")]
-    type_vocab_size: usize,
-    #[serde(default = "default_ln_eps")]
-    layer_norm_eps: f32,
-}
-
-fn default_type_vocab() -> usize {
-    2
-}
-fn default_ln_eps() -> f32 {
-    1e-12
-}
-
-/// Dimensions of a post-LN BERT encoder (BERT/MiniLM, and RoBERTa/XLM-R/DistilBERT once their
-/// tensors are mapped to BERT names).
-#[derive(Debug, Clone, Copy)]
-pub struct BertDims {
-    pub hidden_size: usize,
-    pub num_layers: usize,
-    pub num_heads: usize,
-    pub intermediate_size: usize,
-    pub max_positions: usize,
-    pub vocab_size: usize,
-    pub type_vocab_size: usize,
-    pub layer_norm_eps: f32,
-}
-
-/// A post-LN BERT encoder graph on the CPU or Metal. System 1 mean-pools it into
-/// sentence embeddings; the sequence classifiers read its last hidden states.
-pub struct BertEncoder {
-    pub dims: BertDims,
-    /// Every encoder tensor under its BERT name (`embeddings.*`, `encoder.layer.N.*`), plus the
-    /// `head.*` tensors of a classification head.
-    weights: Weights,
-    executor: Executor,
-    /// A classification head compiled into the graph ([`BertEncoder::run_head`]).
-    head: Option<HeadGraph>,
-}
-
-/// Where the encoder graph runs.
-enum Executor {
-    Cpu,
-    #[cfg(target_os = "macos")]
-    Metal(crate::graph::metal::Session),
-}
-
-impl BertEncoder {
-    /// Builds the encoder on `device` (CPU, or Metal on macOS; anything else is an error).
-    /// `tensor(name, shape)` returns each tensor under its BERT name.
-    pub fn load(
-        dims: BertDims,
-        device: Device,
-        tensor: impl FnMut(&str, &[usize]) -> Result<Vec<f32>, String>,
-    ) -> Result<Self, String> {
-        Self::load_with_head(dims, device, tensor, None)
-    }
-
-    /// [`BertEncoder::load`] with a classification head built into the graph.
-    pub fn load_with_head(
-        dims: BertDims,
-        device: Device,
-        mut tensor: impl FnMut(&str, &[usize]) -> Result<Vec<f32>, String>,
-        head: Option<HeadGraph>,
-    ) -> Result<Self, String> {
-        if dims.num_heads == 0 || dims.hidden_size % dims.num_heads != 0 {
-            return Err(format!(
-                "config.json: hidden_size {} not divisible by num_attention_heads {}",
-                dims.hidden_size, dims.num_heads
-            ));
-        }
-        let (h, inter) = (dims.hidden_size, dims.intermediate_size);
-        let mut shapes = vec![
-            (
-                "embeddings.word_embeddings.weight".to_string(),
-                vec![dims.vocab_size, h],
-            ),
-            (
-                "embeddings.position_embeddings.weight".to_string(),
-                vec![dims.max_positions, h],
-            ),
-            (
-                "embeddings.token_type_embeddings.weight".to_string(),
-                vec![dims.type_vocab_size, h],
-            ),
-            ("embeddings.LayerNorm.weight".to_string(), vec![h]),
-            ("embeddings.LayerNorm.bias".to_string(), vec![h]),
-        ];
-        for l in 0..dims.num_layers {
-            let p = format!("encoder.layer.{l}");
-            for (s, shape) in [
-                ("attention.self.query.weight", vec![h, h]),
-                ("attention.self.query.bias", vec![h]),
-                ("attention.self.key.weight", vec![h, h]),
-                ("attention.self.key.bias", vec![h]),
-                ("attention.self.value.weight", vec![h, h]),
-                ("attention.self.value.bias", vec![h]),
-                ("attention.output.dense.weight", vec![h, h]),
-                ("attention.output.dense.bias", vec![h]),
-                ("attention.output.LayerNorm.weight", vec![h]),
-                ("attention.output.LayerNorm.bias", vec![h]),
-                ("intermediate.dense.weight", vec![inter, h]),
-                ("intermediate.dense.bias", vec![inter]),
-                ("output.dense.weight", vec![h, inter]),
-                ("output.dense.bias", vec![h]),
-                ("output.LayerNorm.weight", vec![h]),
-                ("output.LayerNorm.bias", vec![h]),
-            ] {
-                shapes.push((format!("{p}.{s}"), shape));
-            }
-        }
-        let mut weights = Weights::new();
-        for (name, shape) in shapes {
-            let v = tensor(&name, &shape)?;
-            if v.len() != shape.iter().product::<usize>() {
-                return Err(format!(
-                    "tensor {name} has {} values, expected shape {shape:?}",
-                    v.len()
-                ));
-            }
-            weights.insert(name, Tensor::F32(v));
-        }
-        if let Some(hd) = &head {
-            for (name, t) in hd.weights(h).iter() {
-                weights.insert(name, t.clone());
-            }
-        }
-
-        let executor = match device {
-            Device::Cpu => Executor::Cpu,
-            #[cfg(target_os = "macos")]
-            Device::Metal => {
-                let rt = crate::graph::metal::Runtime::shared()?;
-                Executor::Metal(crate::graph::metal::Session::new(rt, &weights)?)
-            }
-            #[cfg(not(target_os = "macos"))]
-            d => return Err(format!("the BERT encoder has no {d} executor")),
-        };
-        Ok(Self {
-            dims,
-            weights,
-            executor,
-            head,
-        })
-    }
-
-    /// The device the encoder graph runs on.
-    pub fn device(&self) -> Device {
-        match self.executor {
-            Executor::Cpu => Device::Cpu,
-            #[cfg(target_os = "macos")]
-            Executor::Metal(_) => Device::Metal,
-        }
-    }
-
-    /// Load summary for the Metal runtime; `None` on the CPU.
-    pub fn executor_report(&self) -> Option<String> {
-        match &self.executor {
-            Executor::Cpu => None,
-            #[cfg(target_os = "macos")]
-            Executor::Metal(s) => Some(s.runtime().report.clone()),
-        }
-    }
-
-    /// Total weight count of the loaded encoder.
-    pub fn parameter_count(&self) -> usize {
-        self.weights.parameter_count()
-    }
-
-    /// The encoder graph for `n` tokens: embeddings, BERT layers, then mean pooling and L2
-    /// normalisation when `pooled` (else the last hidden states `[n, h]`).
-    fn graph(&self, n: usize, pooled: bool, head: bool) -> Graph {
-        let d = &self.dims;
-        let (h, inter, eps) = (d.hidden_size, d.intermediate_size, d.layer_norm_eps);
-        let mut g = Graph::new();
-        let ids = g.input("input_ids", vec![n], DType::U32);
-        let pos = g.input("position_ids", vec![n], DType::U32);
-        let types = g.input("token_type_ids", vec![n], DType::U32);
-        let mask = g.input("attention_mask", vec![n], DType::U32);
-        let w = |g: &mut Graph, name: String, shape: Vec<usize>| g.weight(name, shape, DType::F32);
-        let f = DType::F32;
-
-        let wt = w(
-            &mut g,
-            "embeddings.word_embeddings.weight".into(),
-            vec![d.vocab_size, h],
-        );
-        let pt = w(
-            &mut g,
-            "embeddings.position_embeddings.weight".into(),
-            vec![d.max_positions, h],
-        );
-        let tt = w(
-            &mut g,
-            "embeddings.token_type_embeddings.weight".into(),
-            vec![d.type_vocab_size, h],
-        );
-        let we = g.add("emb.word", Op::Embedding, &[wt, ids], vec![n, h], f);
-        let pe = g.add("emb.position", Op::Embedding, &[pt, pos], vec![n, h], f);
-        let te = g.add("emb.type", Op::Embedding, &[tt, types], vec![n, h], f);
-        let wp = g.add("emb.add_position", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[we, pe], vec![n, h], f);
-        let e = g.add("emb.add_type", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[wp, te], vec![n, h], f);
-        let lg = w(&mut g, "embeddings.LayerNorm.weight".into(), vec![h]);
-        let lb = w(&mut g, "embeddings.LayerNorm.bias".into(), vec![h]);
-        let mut x = g.add("emb.ln", Op::LayerNorm { eps }, &[e, lg, lb], vec![n, h], f);
-
-        for l in 0..d.num_layers {
-            let p = format!("encoder.layer.{l}");
-            let lin = |g: &mut Graph, x, s: &str, in_f: usize, out_f: usize| {
-                let wv = w(g, format!("{p}.{s}.weight"), vec![out_f, in_f]);
-                let bv = w(g, format!("{p}.{s}.bias"), vec![out_f]);
-                g.add(
-                    format!("{p}.{s}"),
-                    Op::Linear,
-                    &[x, wv, bv],
-                    vec![n, out_f],
-                    f,
-                )
-            };
-            let q = lin(&mut g, x, "attention.self.query", h, h);
-            let k = lin(&mut g, x, "attention.self.key", h, h);
-            let v = lin(&mut g, x, "attention.self.value", h, h);
-            let heads = d.num_heads;
-            let attn = Op::Attention {
-                heads,
-                kv_heads: heads,
-                causal: false,
-                window: None,
-                soft_cap: None,
-                scale: None,
-            };
-            let a = g.add(format!("{p}.attention"), attn, &[q, k, v], vec![n, h], f);
-            let o = lin(&mut g, a, "attention.output.dense", h, h);
-            let r = g.add(
-                format!("{p}.attention.residual"),
-                Op::Binary { kind: crate::graph::BinaryKind::Add },
-                &[o, x],
-                vec![n, h],
-                f,
-            );
-            let lg = w(
-                &mut g,
-                format!("{p}.attention.output.LayerNorm.weight"),
-                vec![h],
-            );
-            let lb = w(
-                &mut g,
-                format!("{p}.attention.output.LayerNorm.bias"),
-                vec![h],
-            );
-            x = g.add(
-                format!("{p}.attention.output.LayerNorm"),
-                Op::LayerNorm { eps },
-                &[r, lg, lb],
-                vec![n, h],
-                f,
-            );
-
-            let i = lin(&mut g, x, "intermediate.dense", h, inter);
-            let i = g.add(
-                format!("{p}.intermediate.gelu"),
-                Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
-                &[i],
-                vec![n, inter],
-                f,
-            );
-            let o2 = lin(&mut g, i, "output.dense", inter, h);
-            let r2 = g.add(
-                format!("{p}.output.residual"),
-                Op::Binary { kind: crate::graph::BinaryKind::Add },
-                &[o2, x],
-                vec![n, h],
-                f,
-            );
-            let lg = w(&mut g, format!("{p}.output.LayerNorm.weight"), vec![h]);
-            let lb = w(&mut g, format!("{p}.output.LayerNorm.bias"), vec![h]);
-            x = g.add(
-                format!("{p}.output.LayerNorm"),
-                Op::LayerNorm { eps },
-                &[r2, lg, lb],
-                vec![n, h],
-                f,
-            );
-        }
-
-        if head {
-            let hd = self.head.as_ref().expect("a head graph needs a head");
-            let mut gb = Gb::from_graph(g, false);
-            x = hd.nodes(&mut gb, x, Some(mask)).expect("mask supplied");
-            g = gb.g;
-        } else if pooled {
-            let pooled = g.add("mean_pool", Op::MeanPool, &[x, mask], vec![h], f);
-            x = g.add("l2_normalize", Op::L2Normalize, &[pooled], vec![h], f);
-        }
-        g.output(x);
-        g
-    }
-
-    /// Scores `[labels]` of one unpadded sequence: the encoder, then the head built at load.
-    pub fn run_head(
-        &self,
-        ids: &[u32],
-        positions: &[u32],
-        types: &[u32],
-    ) -> Result<Vec<f32>, String> {
-        if self.head.is_none() {
-            return Err("this encoder was loaded without a classification head".into());
-        }
-        self.exec(ids, positions, types, false, true)
-    }
-
-    /// Runs one unpadded sequence: the mean-pooled, L2-normalised embedding `[h]` when `pooled`,
-    /// else the last hidden states `[n, h]`.
-    pub fn run(
-        &self,
-        ids: &[u32],
-        positions: &[u32],
-        types: &[u32],
-        pooled: bool,
-    ) -> Result<Vec<f32>, String> {
-        self.exec(ids, positions, types, pooled, false)
-    }
-
-    fn exec(
-        &self,
-        ids: &[u32],
-        positions: &[u32],
-        types: &[u32],
-        pooled: bool,
-        head: bool,
-    ) -> Result<Vec<f32>, String> {
-        let n = ids.len();
-        if n == 0 {
-            return Err("tokenizer produced no tokens".into());
-        }
-        if n > self.dims.max_positions {
-            return Err(format!(
-                "{n} tokens exceed {} positions",
-                self.dims.max_positions
-            ));
-        }
-        let inputs = vec![
-            Tensor::U32(ids.to_vec()),
-            Tensor::U32(positions.to_vec()),
-            Tensor::U32(types.to_vec()),
-            Tensor::U32(vec![1; n]),
-        ];
-        let graph = self.graph(n, pooled, head);
-        match &self.executor {
-            Executor::Cpu => {
-                let mut out = crate::graph::cpu::run_stateless(&graph, &self.weights, inputs)?;
-                out.pop()
-                    .ok_or_else(|| "encoder graph produced no output".to_string())?
-                    .into_f32()
-            }
-            #[cfg(target_os = "macos")]
-            Executor::Metal(s) => {
-                let mut out = s.run(&graph, inputs)?;
-                out.pop()
-                    .ok_or_else(|| "encoder graph produced no output".to_string())?
-                    .into_f32()
-            }
-        }
-    }
-}
 
 /// Shared, hot-swappable System 1 model slot (native BERT encoder or any LLM).
 pub type System1Slot = std::sync::Arc<parking_lot::RwLock<Option<std::sync::Arc<JevSystem1Model>>>>;
@@ -544,9 +171,10 @@ fn llm_embed_from_logits(logits: &[f32]) -> Vec<f32> {
 
 /// Backing model for System 1 embeddings and zero-shot decisions.
 pub enum System1Backend {
-    Bert {
+    /// A sentence-encoder spec (`bert`), mean-pooled and L2-normalised in its graph.
+    Encoder {
         tokenizer: tokenizers::Tokenizer,
-        encoder: BertEncoder,
+        encoder: SpecEncoder,
     },
     Llm(crate::scheduler::ExecutableModel),
 }
@@ -561,65 +189,35 @@ pub struct JevSystem1Model {
 }
 impl JevSystem1Model {
     /// Fetches config.json, tokenizer.json and model.safetensors from `repo_id` and builds the
-    /// encoder on `device` (CPU, or Metal on macOS; anything else is an error).
+    /// encoder spec on `device`.
     pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
         let config_path = hub.fetch_file(repo_id, "config.json")?;
         let tok_path = hub.fetch_file(repo_id, "tokenizer.json")?;
         let st_path = hub.fetch_file(repo_id, "model.safetensors")?;
-
-        let cfg: BertConfig = serde_json::from_slice(
-            &std::fs::read(&config_path)
-                .map_err(|e| format!("read {}: {e}", config_path.display()))?,
-        )
-        .map_err(|e| format!("parse {}: {e}", config_path.display()))?;
-
+        let artifacts = crate::model::hub::ModelArtifacts {
+            model_id: repo_id.to_string(),
+            local_dir: st_path.parent().map(Into::into),
+            config_path: Some(config_path),
+            tokenizer_path: Some(tok_path.clone()),
+            weights_path: Some(st_path),
+            is_cached: true,
+            ..Default::default()
+        };
+        let encoder = SpecEncoder::load(&artifacts, Some("bert"), device, "mean_l2")
+            .map_err(|e| format!("{repo_id}: {e}"))?;
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| format!("load {}: {e}", tok_path.display()))?;
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: cfg.max_position_embeddings,
+                max_length: encoder.capacity()?,
                 ..Default::default()
             }))
             .map_err(|e| format!("tokenizer truncation: {e}"))?;
         tokenizer.with_padding(None);
-
-        let data =
-            std::fs::read(&st_path).map_err(|e| format!("read {}: {e}", st_path.display()))?;
-        let manifest = crate::model::UniversalModelLoader::parse_safetensors(&data)?;
-        let t = |name: &str, shape: &[usize]| -> Result<Vec<f32>, String> {
-            let prefixed = format!("bert.{name}");
-            let key = if manifest.tensors.contains_key(name) {
-                name
-            } else if manifest.tensors.contains_key(&prefixed) {
-                prefixed.as_str()
-            } else {
-                return Err(format!("{repo_id}: missing tensor {name}"));
-            };
-            let got = &manifest.tensors[key].shape;
-            if got.as_slice() != shape {
-                return Err(format!(
-                    "{repo_id}: tensor {key} has shape {got:?}, expected {shape:?}"
-                ));
-            }
-            manifest.extract_tensor_f32(&data, key)
-        };
-        let dims = BertDims {
-            hidden_size: cfg.hidden_size,
-            num_layers: cfg.num_hidden_layers,
-            num_heads: cfg.num_attention_heads,
-            intermediate_size: cfg.intermediate_size,
-            max_positions: cfg.max_position_embeddings,
-            vocab_size: cfg.vocab_size,
-            type_vocab_size: cfg.type_vocab_size,
-            layer_norm_eps: cfg.layer_norm_eps,
-        };
         Ok(Self {
             repo_id: repo_id.to_string(),
             temperature: 0.05,
-            backend: System1Backend::Bert {
-                tokenizer,
-                encoder: BertEncoder::load(dims, device, t)?,
-            },
+            backend: System1Backend::Encoder { tokenizer, encoder },
         })
     }
 
@@ -632,10 +230,10 @@ impl JevSystem1Model {
         }
     }
 
-    /// The underlying BERT encoder when backed by BERT, or `None` when backed by an LLM.
-    pub fn bert(&self) -> Option<&BertEncoder> {
+    /// The sentence encoder, or `None` when backed by an LLM.
+    pub fn encoder(&self) -> Option<&SpecEncoder> {
         match &self.backend {
-            System1Backend::Bert { encoder, .. } => Some(encoder),
+            System1Backend::Encoder { encoder, .. } => Some(encoder),
             System1Backend::Llm(_) => None,
         }
     }
@@ -648,13 +246,14 @@ impl JevSystem1Model {
     /// Human-readable summary for the TUI and startup logs.
     pub fn summary(&self) -> String {
         match &self.backend {
-            System1Backend::Bert { encoder, .. } => format!(
-                "System 1 BERT encoder ({} layers, hidden {}, {} heads, {:.1}M params) on {:?}; /decide <state> | <opt1>, <opt2> or /embed <text>",
-                encoder.dims.num_layers,
-                encoder.dims.hidden_size,
-                encoder.dims.num_heads,
-                encoder.parameter_count() as f64 / 1e6,
-                encoder.device()
+            System1Backend::Encoder { encoder: e, .. } => format!(
+                "System 1 {} encoder ({} layers, hidden {}, {} heads, {:.1}M params) on {:?}; /decide <state> | <opt1>, <opt2> or /embed <text>",
+                e.model.spec.family,
+                e.var("layers").unwrap_or(0),
+                e.var("hidden").unwrap_or(0),
+                e.var("heads").unwrap_or(0),
+                e.parameter_count() as f64 / 1e6,
+                e.device()
             ),
             System1Backend::Llm(llm) => format!(
                 "System 1 LLM encoder on {}; /decide <state> | <opt1>, <opt2> or /embed <text> (/system1 off for chat)",
@@ -666,7 +265,7 @@ impl JevSystem1Model {
     /// Number of tokens the model sees for `text`.
     pub fn token_count(&self, text: &str) -> Result<usize, String> {
         match &self.backend {
-            System1Backend::Bert { tokenizer, .. } => {
+            System1Backend::Encoder { tokenizer, .. } => {
                 let enc = tokenizer
                     .encode(text, true)
                     .map_err(|e| format!("tokenize: {e}"))?;
@@ -679,12 +278,11 @@ impl JevSystem1Model {
     /// Sentence embedding: L2-normalized vector (BERT mean-pooled hidden state or 384-d LLM logit sketch).
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
         match &self.backend {
-            System1Backend::Bert { tokenizer, encoder } => {
+            System1Backend::Encoder { tokenizer, encoder } => {
                 let enc = tokenizer
                     .encode(text, true)
                     .map_err(|e| format!("tokenize: {e}"))?;
-                let positions: Vec<u32> = (0..enc.get_ids().len() as u32).collect();
-                encoder.run(enc.get_ids(), &positions, enc.get_type_ids(), true)
+                encoder.run(enc.get_ids(), enc.get_type_ids())
             }
             System1Backend::Llm(llm) => {
                 let mut ids = llm.tokenizer().encode(text);
@@ -901,7 +499,7 @@ mod tests {
         assert_eq!(m.token_count("").unwrap(), 2);
         assert_eq!(
             m.token_count(&long).unwrap(),
-            m.bert().unwrap().dims.max_positions
+            m.encoder().unwrap().capacity().unwrap()
         );
         // FNV-1a over every output bit: stable across Rust releases, unlike DefaultHasher.
         let mut h: u64 = 0xcbf29ce484222325;
@@ -963,7 +561,7 @@ mod tests {
         else {
             return;
         };
-        assert_eq!(gpu.bert().unwrap().device(), Device::Metal);
+        assert_eq!(gpu.encoder().unwrap().device(), Device::Metal);
         for t in edge_texts() {
             let (a, b) = (cpu.embed(&t).unwrap(), gpu.embed(&t).unwrap());
             let cos = dot(&a, &b) / (dot(&a, &a) * dot(&b, &b)).sqrt();

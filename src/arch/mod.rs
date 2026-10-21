@@ -16,6 +16,18 @@ pub mod names;
 pub mod templates;
 #[cfg(test)]
 pub mod testing;
+#[cfg(test)]
+mod tests_encoders_bert;
+#[cfg(test)]
+mod tests_encoders_bert_variants;
+#[cfg(test)]
+mod tests_encoders_factorized;
+#[cfg(test)]
+mod tests_encoders_modernbert;
+#[cfg(test)]
+mod tests_encoders_bert_gguf;
+#[cfg(test)]
+mod tests_encoders_deberta;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -40,6 +52,13 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
     ("families/m2m100.json5", include_str!("../../arch/families/m2m100.json5")),
     ("families/fsmt.json5", include_str!("../../arch/families/fsmt.json5")),
+    ("families/electra.json5", include_str!("../../arch/families/electra.json5")),
+    ("families/albert.json5", include_str!("../../arch/families/albert.json5")),
+    ("families/bert.json5", include_str!("../../arch/families/bert.json5")),
+    ("families/modernbert.json5", include_str!("../../arch/families/modernbert.json5")),
+    ("families/bert_gguf.json5", include_str!("../../arch/families/bert_gguf.json5")),
+    ("families/fasttext.json5", include_str!("../../arch/families/fasttext.json5")),
+    ("families/deberta.json5", include_str!("../../arch/families/deberta.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 

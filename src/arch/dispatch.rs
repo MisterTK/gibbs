@@ -48,7 +48,7 @@ pub struct LoadOpts<'a> {
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
     /// adapter (merged into a snapshot of its base): an error refuses the load.
     pub admit: &'a dyn Fn(bool) -> Result<(), String>,
-    /// The CLI's legacy order (legacy: until Phase 7): System 1 encoders are detected before
+    /// The CLI's order: System 1 encoders are detected before
     /// classifiers and run on Metal wherever it exists; the TUI tries classifiers first and keeps
     /// System 1 on its own backend.
     pub system1_first: bool,
@@ -71,7 +71,7 @@ fn device(p: PlacementMode) -> Device {
 pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded, String> {
     (o.stage)("resolving");
     if o.family.is_none() {
-        // legacy: until Phase 7 (encoder specs)
+        // Encoders: System 1 and sequence classifiers run their family specs (`runtime::encoder`).
         let system1 = || {
             let dev = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.

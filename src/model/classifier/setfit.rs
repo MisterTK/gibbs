@@ -2,28 +2,19 @@
 //! `1_Pooling/config.json` → optional `Normalize`) feeding the scikit-learn `LogisticRegression`
 //! head pickled by joblib in `model_head.pkl`. Scores are sklearn `predict_proba`.
 
-use super::head::{HeadGraph, HeadLin, HeadPool, HeadPost};
-use super::{load_tokenizer, read_json, Activation, Body, Checkpoint, SequenceClassifier};
+use super::{load_tokenizer, read_json, Activation, Body, SequenceClassifier};
 use crate::hardware::Device;
 use crate::model::hub::HuggingFaceHub;
-use crate::model::jev::{BertDims, BertEncoder};
+use crate::runtime::encoder::SpecEncoder;
 use serde_json::Value;
 
 const LOGISTIC: &str = "sklearn.linear_model._logistic.LogisticRegression";
 
 pub(super) struct SetFit {
-    enc: BertEncoder,
+    /// The body pooled (and normalised) in its graph: `embedding` [h].
+    enc: SpecEncoder,
     tok: tokenizers::Tokenizer,
-    pool: Pool,
-    normalize: bool,
     head: Logistic,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Pool {
-    Mean,
-    Cls,
-    Max,
 }
 
 /// sklearn `LogisticRegression` as `predict_proba` evaluates it.
@@ -36,30 +27,6 @@ pub(super) struct Logistic {
     pub(super) ovr: bool,
 }
 
-
-impl Logistic {
-    /// The pooling, normalisation and `predict_proba` as graph nodes (Metal; f64 coefficients
-    /// become f32).
-    pub(super) fn graph(&self, pool: Pool, normalize: bool) -> HeadGraph {
-        HeadGraph {
-            pool: match pool {
-                Pool::Mean => HeadPool::Mean,
-                Pool::Cls => HeadPool::First,
-                Pool::Max => HeadPool::Max,
-            },
-            normalize,
-            dense: None,
-            norm: None,
-            out: HeadLin {
-                w: self.coef.iter().map(|&v| v as f32).collect(),
-                b: Some(self.intercept.iter().map(|&v| v as f32).collect()),
-                in_f: self.features,
-                out_f: self.intercept.len(),
-            },
-            post: HeadPost::Logistic { ovr: self.ovr },
-        }
-    }
-}
 impl Logistic {
     pub(super) fn proba(&self, x: &[f32]) -> Vec<f32> {
         let d: Vec<f64> = self
@@ -138,10 +105,9 @@ impl SequenceClassifier {
         }
         let pool_dir = pool_dir.ok_or_else(|| err("modules.json has no Pooling module".into()))?;
         let pc = read_json(&hub.fetch_file(repo_id, &format!("{pool_dir}/config.json"))?)?;
+        // The encoder spec's pooling head: `mean` | `cls` | `max`, `_l2` when normalised.
         let pool = match pc["pooling_mode"].as_str() {
-            Some("mean") => Pool::Mean,
-            Some("cls") => Pool::Cls,
-            Some("max") => Pool::Max,
+            Some(m @ ("mean" | "cls" | "max")) => m,
             Some(other) => return Err(err(format!("pooling_mode '{other}' is not supported"))),
             None => {
                 let on = |k: &str| pc[k].as_bool() == Some(true);
@@ -154,49 +120,29 @@ impl SequenceClassifier {
                     "pooling_mode_lasttoken",
                 ];
                 match modes.map(on) {
-                    [true, false, false, false, false, false] => Pool::Cls,
-                    [false, true, false, false, false, false] => Pool::Mean,
-                    [false, false, true, false, false, false] => Pool::Max,
+                    [true, false, false, false, false, false] => "cls",
+                    [false, true, false, false, false, false] => "mean",
+                    [false, false, true, false, false, false] => "max",
                     _ => return Err(err(format!("pooling config {pc} is not supported"))),
                 }
             }
         };
+        let head_kind = if normalize { format!("{pool}_l2") } else { pool.to_string() };
+        let token = std::env::var("HF_TOKEN").ok();
+        let art = hub.auto_download_and_cache(repo_id, token.as_deref())?;
+        let enc = SpecEncoder::load(&art, Some("bert"), device, &head_kind).map_err(err)?;
+        let hidden = enc.var("hidden")?;
 
-        let usize_of = |k: &str| {
-            cfg[k]
-                .as_u64()
-                .map(|v| v as usize)
-                .ok_or_else(|| err(format!("config.json has no {k}")))
-        };
-        if cfg["hidden_act"].as_str().unwrap_or("gelu") != "gelu"
-            || cfg["position_embedding_type"]
-                .as_str()
-                .unwrap_or("absolute")
-                != "absolute"
-        {
-            return Err(err(
-                "only GELU encoders with absolute positions are supported".into(),
-            ));
-        }
-        let dims = BertDims {
-            hidden_size: usize_of("hidden_size")?,
-            num_layers: usize_of("num_hidden_layers")?,
-            num_heads: usize_of("num_attention_heads")?,
-            intermediate_size: usize_of("intermediate_size")?,
-            max_positions: usize_of("max_position_embeddings")?,
-            vocab_size: usize_of("vocab_size")?,
-            type_vocab_size: cfg["type_vocab_size"].as_u64().unwrap_or(2) as usize,
-            layer_norm_eps: cfg["layer_norm_eps"].as_f64().unwrap_or(1e-12) as f32,
-        };
         let sbert = hub
             .fetch_file(repo_id, "sentence_bert_config.json")
             .ok()
             .map(|p| read_json(&p))
             .transpose()?
             .unwrap_or(Value::Null);
+        let max = enc.capacity()?;
         let capacity = sbert["max_seq_length"]
             .as_u64()
-            .map_or(dims.max_positions, |m| (m as usize).min(dims.max_positions));
+            .map_or(max, |m| (m as usize).min(max));
         let tok_cfg = hub
             .fetch_file(repo_id, "tokenizer_config.json")
             .ok()
@@ -207,7 +153,7 @@ impl SequenceClassifier {
 
         let pkl = std::fs::read(hub.fetch_file(repo_id, "model_head.pkl")?)
             .map_err(|e| err(format!("model_head.pkl: {e}")))?;
-        let (head, classes) = read_head(&pkl, dims.hidden_size).map_err(err)?;
+        let (head, classes) = read_head(&pkl, hidden).map_err(err)?;
         let names: Vec<String> = setfit["labels"]
             .as_array()
             .map(|a| {
@@ -228,32 +174,12 @@ impl SequenceClassifier {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let ckpt = Checkpoint::open(hub, repo_id)?;
-        let graph_head = (device != Device::Cpu).then(|| head.graph(pool, normalize));
-        let enc = BertEncoder::load_with_head(
-            dims,
-            device,
-            |name, shape| {
-                let bare = ckpt.get(name, shape);
-                if bare.is_ok() || ckpt.has(name) {
-                    return bare;
-                }
-                ckpt.get(&format!("bert.{name}"), shape)
-            },
-            graph_head,
-        )?;
         Ok(Self {
             repo_id: repo_id.to_string(),
             architecture: format!("SetFit ({arch} + LogisticRegression)"),
             labels,
             activation: Activation::Identity,
-            body: Body::SetFit(SetFit {
-                enc,
-                tok,
-                pool,
-                normalize,
-                head,
-            }),
+            body: Body::SetFit(SetFit { enc, tok, head }),
         })
     }
 }
@@ -266,43 +192,9 @@ impl SetFit {
     /// sklearn `predict_proba` of the sentence embedding of `text`, in `classes_` order.
     pub(super) fn proba(&self, text: &str) -> Result<(Vec<f32>, usize), String> {
         let e = super::encode(&self.tok, text, None)?;
-        let ids = e.get_ids();
-        let positions: Vec<u32> = (0..ids.len() as u32).collect();
-        if self.enc.device() != Device::Cpu {
-            return Ok((self.enc.run_head(ids, &positions, e.get_type_ids())?, ids.len()));
-        }
-        let hidden = self.enc.run(ids, &positions, e.get_type_ids(), false)?;
-        let emb = pool(
-            &hidden,
-            self.enc.dims.hidden_size,
-            self.pool,
-            self.normalize,
-        );
-        Ok((self.head.proba(&emb), ids.len()))
+        let emb = self.enc.run(e.get_ids(), e.get_type_ids())?;
+        Ok((self.head.proba(&emb), e.get_ids().len()))
     }
-}
-
-/// Pools last hidden states `[n, h]` (no padding: every token is attended) into `[h]`.
-pub(super) fn pool(hidden: &[f32], h: usize, mode: Pool, normalize: bool) -> Vec<f32> {
-    let rows = hidden.chunks_exact(h);
-    let n = rows.len() as f32;
-    let mut v = match mode {
-        Pool::Cls => hidden[..h].to_vec(),
-        Pool::Mean => rows.fold(vec![0.0; h], |mut a, r| {
-            a.iter_mut().zip(r).for_each(|(a, r)| *a += r / n);
-            a
-        }),
-        Pool::Max => rows.fold(vec![f32::NEG_INFINITY; h], |mut a, r| {
-            a.iter_mut().zip(r).for_each(|(a, r)| *a = a.max(*r));
-            a
-        }),
-    };
-    if normalize {
-        // torch F.normalize: x / max(||x||, 1e-12).
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
-        v.iter_mut().for_each(|x| *x /= norm);
-    }
-    v
 }
 
 enum Class {
@@ -790,18 +682,5 @@ impl<'a> Pickle<'a> {
             return Err("Fortran-ordered arrays above 2-D are not supported".into());
         }
         Ok(Arr { shape, data })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn pool_modes() {
-        use super::{pool, Pool};
-        let h = [1.0, -2.0, 3.0, 4.0];
-        assert_eq!(pool(&h, 2, Pool::Mean, false), vec![2.0, 1.0]);
-        assert_eq!(pool(&h, 2, Pool::Cls, false), vec![1.0, -2.0]);
-        assert_eq!(pool(&h, 2, Pool::Max, false), vec![3.0, 4.0]);
-        assert_eq!(pool(&[3.0, 4.0], 2, Pool::Mean, true), vec![0.6, 0.8]);
     }
 }

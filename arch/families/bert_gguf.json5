@@ -1,0 +1,82 @@
+// llama.cpp BERT-architecture GGUF (`convert_hf_to_gguf.py` BertModel / XLMRobertaModel) with a
+// classification / reranker head: llama.cpp names renamed to HF BERT names, post-LN BERT layers,
+// head `cls.output` on token 0 (LLAMA_POOLING_TYPE_RANK), behind `cls` + tanh when the export
+// kept the pooler (XLM-R). The converter drops RoBERTa's pad + 1 position rows: positions count
+// from 0. A 1-row token-type table (XLM-R) is added to every row, segment ids unused. The llama.cpp
+// writer drops trailing unit dims (ggml_n_dims): 1-label heads come in as [in], reshaped back.
+{
+  family: "bert_gguf",
+  match: {gguf_arch: ["bert"]},
+  pipeline: "encoder",
+  use_lib: ["transformer"],
+  names: {rules: [
+    ["token_embd.weight", "embeddings.word_embeddings.weight"],
+    ["position_embd.weight", "embeddings.position_embeddings.weight"],
+    ["token_types.weight", "embeddings.token_type_embeddings.weight"],
+    ["token_embd_norm.{r:*}", "embeddings.LayerNorm.{r}"],
+    ["blk.{i}.attn_q.{r:*}", "encoder.layer.{i}.attention.self.query.{r}"],
+    ["blk.{i}.attn_k.{r:*}", "encoder.layer.{i}.attention.self.key.{r}"],
+    ["blk.{i}.attn_v.{r:*}", "encoder.layer.{i}.attention.self.value.{r}"],
+    ["blk.{i}.attn_output.{r:*}", "encoder.layer.{i}.attention.output.dense.{r}"],
+    ["blk.{i}.attn_output_norm.{r:*}", "encoder.layer.{i}.attention.output.LayerNorm.{r}"],
+    ["blk.{i}.ffn_up.{r:*}", "encoder.layer.{i}.intermediate.dense.{r}"],
+    ["blk.{i}.ffn_down.{r:*}", "encoder.layer.{i}.output.dense.{r}"],
+    ["blk.{i}.layer_output_norm.{r:*}", "encoder.layer.{i}.output.LayerNorm.{r}"],
+  ]},
+  config: {
+    hidden: "gguf.embedding_length",
+    layers: "gguf.block_count",
+    heads: "gguf['attention.head_count']",
+    kv_heads: "heads",
+    head_dim: "hidden // heads",
+    eps: "gguf['attention.layer_norm_epsilon']",
+    types: "len(shape('embeddings.token_type_embeddings.weight')) == 1 ? 1 : shape('embeddings.token_type_embeddings.weight')[0]",
+    labels: "shape('cls.output.weight')[0]",
+    max_position_embeddings: "shape('embeddings.position_embeddings.weight')[0]",
+  },
+  transforms: [
+    {tensor: "cls.output.weight", op: "reshape", args: {shape: [1, "shape('cls.output.weight')[0]"]},
+     when: "has('cls.output.weight') && len(shape('cls.output.weight')) == 1"},
+  ],
+  components: {
+    encoder: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "token_types", dtype: "u32", shape: ["rows"], when: "types > 1"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:embeddings.word_embeddings.weight", "i:token_ids"], out: "x", name: "emb.word"},
+        {op: "Embedding", in: ["w:embeddings.position_embeddings.weight", "i:positions"], out: "pe", name: "emb.pos"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "emb.add_pos"},
+        {op: "Embedding", in: ["w:embeddings.token_type_embeddings.weight", "i:token_types"], out: "te", name: "emb.type", when: "types > 1"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "te"], out: "x", name: "emb.add_type", when: "types > 1"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "w:embeddings.token_type_embeddings.weight"], out: "x", name: "emb.add_type", when: "types == 1"},
+        {use: "layer_norm", args: {w: "'embeddings.LayerNorm'"}, in: ["x"], out: "x", name: "emb.ln"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('encoder.layer.{i}')"}},
+          {use: "attn_full", in: ["x"], out: "y", name: "l{i}.attn", args: {causal: false,
+            wq: "fmt('{p}.attention.self.query')", wk: "fmt('{p}.attention.self.key')",
+            wv: "fmt('{p}.attention.self.value')", wo: "fmt('{p}.attention.output.dense')"}},
+          {use: "residual", in: ["y", "x"], out: "x", name: "l{i}.res1"},
+          {use: "layer_norm", args: {w: "fmt('{p}.attention.output.LayerNorm')"}, in: ["x"], out: "x", name: "l{i}.ln1"},
+          {use: "mlp_plain", in: ["x"], out: "m", name: "l{i}.mlp", args: {act: "'GeluErf'",
+            up: "fmt('{p}.intermediate.dense')", down: "fmt('{p}.output.dense')"}},
+          {use: "residual", in: ["m", "x"], out: "x", name: "l{i}.res2"},
+          {use: "layer_norm", args: {w: "fmt('{p}.output.LayerNorm')"}, in: ["x"], out: "x", name: "l{i}.ln2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {block: [
+          {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["x"], out: "c", name: "cls.first"},
+          {block: [
+            {op: "Linear", in: ["c", "w:cls.weight", "w?:cls.bias"], out: "c", name: "cls.dense"},
+            {op: "Unary", args: {kind: "Tanh"}, in: ["c"], out: "c", name: "cls.act"},
+          ], when: "has('cls.weight')"},
+          {op: "Linear", in: ["c", "w:cls.output.weight", "w?:cls.output.bias"], out: "logits", name: "cls.out"},
+        ], when: "head == 'classify'"},
+      ],
+      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
+    },
+  },
+}

@@ -629,7 +629,7 @@ fn system1() {
     let id = format!("{ORG}/{case}");
     golden(case, TOL, |dev| {
         let m = JevSystem1Model::load(&hub, &id, dev).unwrap_or_else(|e| panic!("{case}: {e}"));
-        assert_eq!(m.bert().map(|b| b.device()), Some(dev));
+        assert_eq!(m.encoder().map(|b| b.device()), Some(dev));
         let mut out = Out::default();
         let options = ["t20 t22", "t24 t26", "t28 t30"];
         let choice = JevQuestion::Choice {

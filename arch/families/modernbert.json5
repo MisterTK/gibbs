@@ -1,0 +1,118 @@
+// ModernBERT (transformers `modeling_modernbert.py`): pre-LN encoder (layer 0 has no attn_norm),
+// fused Wqkv, RoPE per layer type (global / local theta, optional YaRN), global or sliding-window
+// non-causal attention, GLU MLP from a fused Wi = [gate; up], final norm. Classification head:
+// CLS or mean pooling -> head.dense -> act -> head.norm -> classifier.
+{
+  family: "modernbert",
+  match: {hf_model_type: ["modernbert"], hf_architectures: ["ModernBertForSequenceClassification", "ModernBertModel"]},
+  pipeline: "encoder",
+  use_lib: ["transformer"],
+  names: {rules: [
+    // Bare `ModernBertModel` checkpoints.
+    ["embeddings.{r:*}", "model.embeddings.{r}"], ["layers.{i}.{r:*}", "model.layers.{i}.{r}"],
+    ["final_norm.{r:*}", "model.final_norm.{r}"],
+  ]},
+  config: {
+    hidden: "cfg.hidden_size",
+    layers: "cfg.num_hidden_layers",
+    heads: "cfg.num_attention_heads",
+    kv_heads: "heads",
+    head_dim: "hidden // heads",
+    inter: "cfg.intermediate_size",
+    eps: "first(cfg.norm_eps, 1e-5)",
+    rotary_dim: "head_dim",
+    rope_variant: "'HalfSplit'",
+    act: "first(cfg.hidden_activation, 'gelu') == 'gelu' ? 'GeluErf' : contains(['gelu_pytorch_tanh', 'gelu_new'], cfg.hidden_activation) ? 'GeluTanh' : contains(['silu', 'swish'], cfg.hidden_activation) ? 'Silu' : 'Relu'",
+    head_act: "first(cfg.classifier_activation, 'gelu') == 'gelu' ? 'GeluErf' : contains(['gelu_pytorch_tanh', 'gelu_new'], cfg.classifier_activation) ? 'GeluTanh' : contains(['silu', 'swish'], cfg.classifier_activation) ? 'Silu' : 'Relu'",
+    pooling: "first(cfg.classifier_pooling, 'cls')",
+    labels: "shape('classifier.weight')[0]",
+    max_position_embeddings: "cfg.max_position_embeddings",
+    // `|i - j| <= local_attention // 2` = the non-causal Attention window `2 * half`.
+    window: "2 * (first(cfg.local_attention, 128) // 2)",
+    every: "max(first(cfg.global_attn_every_n_layers, 3), 1)",
+    // RoPE parameters of each layer type: `rope_parameters[type]`, else the legacy `rope_scaling`
+    // with `global_rope_theta` / `local_rope_theta` (HF defaults 160k / 10k).
+    rp_g: "first(cfg.rope_parameters.full_attention, cfg.rope_scaling)",
+    rp_l: "first(cfg.rope_parameters.sliding_attention, cfg.rope_scaling)",
+    theta_g: "first(at(rp_g, 'rope_theta'), cfg.global_rope_theta, 160000)",
+    theta_l: "first(at(rp_l, 'rope_theta'), cfg.local_rope_theta, 10000)",
+    kind_g: "first(at(rp_g, 'rope_type'), 'default')",
+    kind_l: "first(at(rp_l, 'rope_type'), 'default')",
+    factor_g: "kind_g == 'yarn' ? first(at(rp_g, 'factor'), cfg.max_position_embeddings / at(rp_g, 'original_max_position_embeddings')) : 1",
+    factor_l: "kind_l == 'yarn' ? first(at(rp_l, 'factor'), cfg.max_position_embeddings / at(rp_l, 'original_max_position_embeddings')) : 1",
+    // YaRN attention factor (transformers `_compute_yarn_parameters`): scales cos/sin.
+    ms_g: "first(at(rp_g, 'attention_factor'), first(at(rp_g, 'mscale'), 0) != 0 && first(at(rp_g, 'mscale_all_dim'), 0) != 0 ? (factor_g <= 1 ? 1 : 0.1 * at(rp_g, 'mscale') * ln(factor_g) + 1) / (factor_g <= 1 ? 1 : 0.1 * at(rp_g, 'mscale_all_dim') * ln(factor_g) + 1) : factor_g <= 1 ? 1 : 0.1 * ln(factor_g) + 1)",
+    ms_l: "first(at(rp_l, 'attention_factor'), first(at(rp_l, 'mscale'), 0) != 0 && first(at(rp_l, 'mscale_all_dim'), 0) != 0 ? (factor_l <= 1 ? 1 : 0.1 * at(rp_l, 'mscale') * ln(factor_l) + 1) / (factor_l <= 1 ? 1 : 0.1 * at(rp_l, 'mscale_all_dim') * ln(factor_l) + 1) : factor_l <= 1 ? 1 : 0.1 * ln(factor_l) + 1)",
+  },
+  checks: [
+    {expr: "hidden % heads != 0", error: "hidden_size {hidden} is not a multiple of {heads} heads"},
+    {expr: "!contains(['default', 'yarn'], kind_g) || !contains(['default', 'yarn'], kind_l)", error: "ModernBERT rope_type {kind_g} / {kind_l} is not supported"},
+    {expr: "first(at(rp_g, 'partial_rotary_factor'), 1) != 1 || first(at(rp_l, 'partial_rotary_factor'), 1) != 1", error: "ModernBERT partial_rotary_factor is not supported"},
+    {expr: "!contains(['gelu', 'gelu_pytorch_tanh', 'gelu_new', 'silu', 'swish', 'relu'], first(cfg.hidden_activation, 'gelu'))", error: "ModernBERT activation {cfg.hidden_activation} is not supported"},
+    {expr: "!contains(['gelu', 'gelu_pytorch_tanh', 'gelu_new', 'silu', 'swish', 'relu'], first(cfg.classifier_activation, 'gelu'))", error: "ModernBERT activation {cfg.classifier_activation} is not supported"},
+    {expr: "!contains(['cls', 'mean'], pooling)", error: "classifier_pooling {pooling} is not supported"},
+    {expr: "cfg.layer_types != null && len(cfg.layer_types) != layers", error: "config.json layer_types does not list {layers} layers"},
+  ],
+  transforms: [
+    {tensor: "model.layers.{i}.attn.Wqkv.weight", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.attn.q.weight", "hidden"], ["model.layers.{i}.attn.k.weight", "hidden"], ["model.layers.{i}.attn.v.weight", "hidden"]]}},
+    {tensor: "model.layers.{i}.attn.Wqkv.bias", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.attn.q.bias", "hidden"], ["model.layers.{i}.attn.k.bias", "hidden"], ["model.layers.{i}.attn.v.bias", "hidden"]]}},
+    {tensor: "model.layers.{i}.mlp.Wi.weight", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.mlp.gate.weight", "inter"], ["model.layers.{i}.mlp.up.weight", "inter"]]}},
+    {tensor: "model.layers.{i}.mlp.Wi.bias", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.mlp.gate.bias", "inter"], ["model.layers.{i}.mlp.up.bias", "inter"]]}},
+  ],
+  constants: {
+    "rope.global.inv_freq": {gen: "rope_inv_freq", args: {dim: "head_dim", theta: "theta_g", kind: "kind_g", precision: "'f32'",
+      factor: "factor_g", original_max_position_embeddings: "at(rp_g, 'original_max_position_embeddings')",
+      beta_fast: "at(rp_g, 'beta_fast')", beta_slow: "at(rp_g, 'beta_slow')", truncate: "at(rp_g, 'truncate')"}},
+    "rope.local.inv_freq": {gen: "rope_inv_freq", args: {dim: "head_dim", theta: "theta_l", kind: "kind_l", precision: "'f32'",
+      factor: "factor_l", original_max_position_embeddings: "at(rp_l, 'original_max_position_embeddings')",
+      beta_fast: "at(rp_l, 'beta_fast')", beta_slow: "at(rp_l, 'beta_slow')", truncate: "at(rp_l, 'truncate')"}},
+  },
+  components: {
+    encoder: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "attention_mask", dtype: "u32", shape: ["rows"], when: "head == 'classify' && pooling == 'mean'"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embeddings.tok_embeddings.weight", "i:token_ids"], out: "x", name: "tok"},
+        {use: "layer_norm", args: {w: "'model.embeddings.norm'"}, in: ["x"], out: "x", name: "emb_norm"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')",
+                 glob: "first(at(cfg.layer_types, i), i % every == 0 ? 'full_attention' : 'sliding_attention') == 'full_attention'"}},
+          {use: "layer_norm", args: {w: "fmt('{p}.attn_norm')"}, in: ["x"], out: "h", name: "l{i}.attn_norm", when: "i > 0"},
+          {use: "attn_full", in: ["h"], out: "y", name: "l{i}.attn", when: "i > 0", args: {
+            wq: "fmt('{p}.attn.q')", wk: "fmt('{p}.attn.k')", wv: "fmt('{p}.attn.v')", wo: "fmt('{p}.attn.Wo')", causal: false,
+            window: "glob ? null : window", inv_freq: "glob ? 'rope.global.inv_freq' : 'rope.local.inv_freq'", rope_mscale: "glob ? ms_g : ms_l"}},
+          {use: "attn_full", in: ["x"], out: "y", name: "l{i}.attn", when: "i == 0", args: {
+            wq: "fmt('{p}.attn.q')", wk: "fmt('{p}.attn.k')", wv: "fmt('{p}.attn.v')", wo: "fmt('{p}.attn.Wo')", causal: false,
+            window: "glob ? null : window", inv_freq: "glob ? 'rope.global.inv_freq' : 'rope.local.inv_freq'", rope_mscale: "glob ? ms_g : ms_l"}},
+          {use: "residual", in: ["x", "y"], out: "x", name: "l{i}.res1"},
+          {use: "layer_norm", args: {w: "fmt('{p}.mlp_norm')"}, in: ["x"], out: "h", name: "l{i}.mlp_norm"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {gate: "fmt('{p}.mlp.gate')", up: "fmt('{p}.mlp.up')", down: "fmt('{p}.mlp.Wo')"}},
+          {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "layer_norm", args: {w: "'model.final_norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {block: [
+          {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["hidden"], out: "pooled", name: "cls", when: "pooling == 'cls'"},
+          {block: [
+            {op: "MeanPool", in: ["hidden", "i:attention_mask"], out: "pooled", name: "mean"},
+            {op: "Reshape", args: {shape: [1, "hidden"]}, in: ["pooled"], out: "pooled", name: "mean_row"},
+          ], when: "pooling == 'mean'"},
+          {op: "Linear", in: ["pooled", "w:head.dense.weight", "w?:head.dense.bias"], out: "y", name: "head_dense"},
+          {op: "Unary", args: {kind: "head_act"}, in: ["y"], out: "y", name: "head_act"},
+          {use: "layer_norm", args: {w: "'head.norm'"}, in: ["y"], out: "y", name: "head_norm"},
+          {op: "Linear", in: ["y", "w:classifier.weight", "w?:classifier.bias"], out: "y", name: "classifier"},
+          {op: "Reshape", args: {shape: ["labels"]}, in: ["y"], out: "logits", name: "logits"},
+        ], when: "head == 'classify'"},
+      ],
+      outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+}
