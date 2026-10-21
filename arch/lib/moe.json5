@@ -1,0 +1,45 @@
+// Sparse mixture-of-experts feed-forward: softmax router, top-k SwiGLU experts, routing-weighted
+// sum, optional sigmoid-gated shared expert (transformers `Qwen3_5MoeSparseMoeBlock`,
+// `Qwen3MoeSparseMoeBlock`; llama.cpp `build_moe_ffn`). Variables: experts, top_k, norm_topk
+// (renormalize the picked weights: softmax over the picked logits).
+{
+  macros: {
+    // args: p (stem): `{p}.gate` router [experts, hidden]; banks `{p}.experts.{gate,up,down}_proj`
+    // [experts * rows, cols]; shared expert `{p}.shared_expert.{gate,up,down}_proj` and its gate
+    // `{p}.shared_expert_gate` [1, hidden], when present.
+    moe_shared: {params: ["x"], body: [
+      {let: {nr: "shape('x')[0]", d: "shape('x')[1]"}},
+      {op: "Linear", in: ["x", "w:{p}.gate.weight"], out: "logits", name: "router"},
+      {op: "TopK", args: {k: "top_k"}, in: ["logits"], out: "ids", name: "topk"},
+      {block: [
+        {op: "GatherCols", in: ["logits", "ids"], out: "picked", name: "picked"},
+        {op: "Softmax", args: {axis: -1}, in: ["picked"], out: "rw", name: "route_w"},
+      ], when: "norm_topk"},
+      {block: [
+        {op: "Softmax", args: {axis: -1}, in: ["logits"], out: "probs", name: "router_probs"},
+        {op: "GatherCols", in: ["probs", "ids"], out: "rw", name: "route_w"},
+      ], when: "!norm_topk"},
+      {op: "MoeLinear", args: {experts: "experts", top_k: "top_k"},
+       in: ["x", "w:{p}.experts.gate_proj.weight", "ids"], out: "eg", name: "expert_gate"},
+      {op: "MoeLinear", args: {experts: "experts", top_k: "top_k"},
+       in: ["x", "w:{p}.experts.up_proj.weight", "ids"], out: "eu", name: "expert_up"},
+      {op: "SwiGlu", in: ["eg", "eu"], out: "ea", name: "expert_swiglu"},
+      {op: "MoeLinear", args: {experts: "experts", top_k: "top_k"},
+       in: ["ea", "w:{p}.experts.down_proj.weight", "ids"], out: "ed", name: "expert_down"},
+      {op: "Reshape", args: {shape: ["nr * top_k", 1]}, in: ["rw"], out: "wc", name: "route_w_col"},
+      {op: "Binary", args: {kind: "'Mul'"}, in: ["ed", "wc"], out: "ew", name: "expert_weighted"},
+      {op: "Reshape", args: {shape: ["nr", "top_k", "d"]}, in: ["ew"], out: "es", name: "expert_slots"},
+      {op: "Reduce", args: {kind: "'Sum'", axes: [1], keep_dims: false}, in: ["es"], out: "out", name: "routed"},
+      {block: [
+        {op: "Linear", in: ["x", "w:{p}.shared_expert.gate_proj.weight"], out: "sg", name: "shared_gate"},
+        {op: "Linear", in: ["x", "w:{p}.shared_expert.up_proj.weight"], out: "su", name: "shared_up"},
+        {op: "SwiGlu", in: ["sg", "su"], out: "sa", name: "shared_swiglu"},
+        {op: "Linear", in: ["sa", "w:{p}.shared_expert.down_proj.weight"], out: "sd", name: "shared_down"},
+        {op: "Linear", in: ["x", "w:{p}.shared_expert_gate.weight"], out: "gl", name: "shared_gate_logit"},
+        {op: "Unary", args: {kind: "'Sigmoid'"}, in: ["gl"], out: "gl", name: "shared_gate_act"},
+        {op: "Binary", args: {kind: "'Mul'"}, in: ["sd", "gl"], out: "sh", name: "shared_out"},
+        {op: "Binary", args: {kind: "'Add'"}, in: ["out", "sh"], out: "out", name: "moe_out"},
+      ], when: "has(fmt('{p}.shared_expert.gate_proj.weight'))"},
+    ]},
+  },
+}

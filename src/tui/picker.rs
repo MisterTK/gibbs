@@ -2,7 +2,7 @@
 
 use super::theme::{theme, Token};
 use super::widgets::instrument;
-use crate::model::draft::{draft_target, is_draft_for};
+use crate::runtime::draft::{draft_target, is_draft_for};
 use crate::model::hub::{
     branch_models, detect_quant_format, is_metadata_file, list_repo_files, select_weight_files,
     split_revision, split_weight_file, HuggingFaceHub, RepoFile,
@@ -1645,13 +1645,9 @@ fn parse_hub_rows(
                 .map_or(Vec::new(), |t| t.iter().filter_map(Value::as_str).collect());
             let gguf_arch = m["gguf"]["architecture"].as_str();
             let draft_for = draft_target(&id, &m["config"], &tags, gguf_arch);
-            // llama.cpp `dflash` GGUFs (DFlash / DFlash2 / DSpark sidecars) attach like safetensors
-            // drafters; the ik_llama / Lucebox forks name their own arch with another tensor layout.
-            let gguf_draft = gguf_arch
-                .filter(|a| *a != "dflash" && (a.contains("dflash") || a.contains("dspark")))
-                .map(|a| {
-                    format!("llama.cpp GGUF draft sidecar with fork architecture '{a}' (tensor names and metadata differ from llama.cpp's 'dflash'; attach a 'dflash' GGUF or the safetensors drafter)")
-                });
+            // GGUF draft sidecars attach like safetensors drafters; llama.cpp forks' own
+            // architectures (another tensor layout) are refused by name.
+            let gguf_draft = gguf_arch.and_then(crate::runtime::draft::refused_draft_gguf);
             let dit = m["config"]["diffusers"]["_class_name"]
                 .as_str()
                 .is_some_and(|c| crate::model::dit::PIPELINES.contains(&c));

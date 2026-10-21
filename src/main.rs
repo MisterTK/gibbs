@@ -56,8 +56,8 @@ struct Cli {
     #[arg(long)]
     prompt: Option<String>,
 
-    /// Speculative decoding drafter for --model: a DFlash / DFlash2 / DSpark repo trained for it,
-    /// or a small causal LM with the same tokenizer.
+    /// Speculative decoding drafter for --model: a hidden-state drafter repo trained for it (a
+    /// `pipeline: drafter` family spec), or a small causal LM with the same tokenizer.
     #[arg(long)]
     draft: Option<String>,
 
@@ -653,7 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
             if let Some(d) = &cli.draft {
                 let da = hub.auto_download_and_cache(d, token.as_deref())?;
-                let dr = gibbs_engine::model::draft::load_drafter(&da, artifacts, placement)
+                let dr = gibbs_engine::runtime::draft::load_drafter(&da, artifacts, placement)
                     .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?;
                 telemetry.log_info(&format!("Speculative decoding drafter: {}", dr.label()));
                 drafter = Some(dr);

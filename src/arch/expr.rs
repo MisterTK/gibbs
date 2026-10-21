@@ -124,6 +124,14 @@ pub trait Env {
     fn shape(&self, _tensor: &str) -> Option<Vec<usize>> {
         None
     }
+    /// Elements per stored quantization block of a source tensor (1 for plain floats).
+    fn block(&self, _tensor: &str) -> Option<usize> {
+        None
+    }
+    /// Whether any raw (pre-rename) checkpoint tensor name matches glob `pat`.
+    fn raw_has(&self, _pat: &str) -> bool {
+        false
+    }
     /// Values of a small source tensor (canonical name), for `values(name)`.
     fn values(&self, _tensor: &str) -> Option<Vec<f32>> {
         None
@@ -178,6 +186,12 @@ impl Env for Bind<'_> {
     }
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.parent.shape(t)
+    }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.parent.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.parent.raw_has(p)
     }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.parent.values(t)
@@ -788,6 +802,11 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
             Some(s) => Val::List(s.into_iter().map(|d| Val::Num(d as f64)).collect()),
             None => Val::Null,
         },
+        "block" => match env.block(arg(0)?.str()?) {
+            Some(b) => Val::Num(b as f64),
+            None => Val::Null,
+        },
+        "raw_has" => Val::Bool(env.raw_has(arg(0)?.str()?)),
         "first_has" => {
             for x in &v {
                 if env.has(x.str()?) {

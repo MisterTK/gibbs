@@ -1,0 +1,63 @@
+// Full attention of the Qwen decoders over the KV cache `kv.{layer}.{k,v}`: q/k/v projections
+// (optional bias), per-head q/k RMSNorm before or after RoPE (`qk_norm`), and with `attn_gate` an
+// output gate interleaved with q per head in `q_proj` ([q; gate] per head), applied as a sigmoid
+// after attention. Variables: heads, kv_heads, head_dim, rotary_dim, eps, ctx, qk_norm
+// ('before' | 'after' | 'none'), attn_gate.
+{
+  macros: {
+    // args: p (stem: `{p}.{q,k,v,o}_proj`, `{p}.{qn,kn}` norms, default q_norm / k_norm); layer
+    // (cache index); rope_pos (input, default `positions`), rope_variant (graph RopeVariant,
+    // default 'HalfSplit'); inv_freq (constant, default `rope.inv_freq`); key_mask (input name of
+    // an additive [rows] key bias, 0 / -inf: uncached causal attention over this pass only, the
+    // transformers attention mask of right-padded encoder prompts; default '' = the KV cache).
+    qwen_attn: {params: ["x"], body: [
+      {let: {rp: "first(rope_pos, 'positions')", rv: "first(rope_variant, 'HalfSplit')",
+             rc: "first(inv_freq, 'rope.inv_freq')", qn: "first(q_norm_name, 'q_norm')",
+             kn: "first(k_norm_name, 'k_norm')", nr: "shape('x')[0]"}},
+      {block: [
+        {op: "Linear", in: ["x", "w:{p}.q_proj.weight", "w?:{p}.q_proj.bias"], out: "qg", name: "q"},
+        {op: "Reshape", args: {shape: ["nr * heads", "2 * head_dim"]}, in: ["qg"], out: "qg", name: "q_heads"},
+        {op: "Slice", args: {axis: -1, start: 0, end: "head_dim"}, in: ["qg"], out: "q", name: "q_slice"},
+        {op: "Slice", args: {axis: -1, start: "head_dim", end: "2 * head_dim"}, in: ["qg"], out: "g", name: "gate_slice"},
+        {op: "Reshape", args: {shape: ["nr", "heads * head_dim"]}, in: ["q"], out: "q", name: "q_rows"},
+      ], when: "attn_gate"},
+      {op: "Linear", in: ["x", "w:{p}.q_proj.weight", "w?:{p}.q_proj.bias"], out: "q", name: "q", when: "!attn_gate"},
+      {op: "Linear", in: ["x", "w:{p}.k_proj.weight", "w?:{p}.k_proj.bias"], out: "k", name: "k"},
+      {op: "Linear", in: ["x", "w:{p}.v_proj.weight", "w?:{p}.v_proj.bias"], out: "v", name: "v"},
+      // The Metal planner orders steps by dependency depth: with the q head split's two reshapes
+      // (aliases, no step) q_norm sits two levels deeper than in a reshape-free graph, so k takes
+      // the same two alias levels and the q/k norms stay adjacent (one batched norm dispatch).
+      {block: [
+        {op: "Reshape", args: {shape: ["nr * kv_heads", "head_dim"]}, in: ["k"], out: "k", name: "k_heads"},
+        {op: "Reshape", args: {shape: ["nr", "kv_heads * head_dim"]}, in: ["k"], out: "k", name: "k_rows"},
+      ], when: "attn_gate && qk_norm == 'before'"},
+      {block: [
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{p}.{qn}.weight"], out: "q", name: "q_norm"},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{p}.{kn}.weight"], out: "k", name: "k_norm"},
+      ], when: "qk_norm == 'before'"},
+      {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rv", mscale: 1},
+       in: ["q", "i:{rp}", "c:{rc}"], out: "q", name: "q_rope"},
+      {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "rotary_dim", variant: "rv", mscale: 1},
+       in: ["k", "i:{rp}", "c:{rc}"], out: "k", name: "k_rope"},
+      {block: [
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{p}.{qn}.weight"], out: "q", name: "q_norm_post"},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{p}.{kn}.weight"], out: "k", name: "k_norm_post"},
+      ], when: "qk_norm == 'after'"},
+      {block: [
+        {state: "kv.{layer}.k", shape: ["ctx", "kv_heads * head_dim"]},
+        {state: "kv.{layer}.v", shape: ["ctx", "kv_heads * head_dim"]},
+        {op: "CachedAttention", args: {heads: "heads", kv_heads: "kv_heads", head_dim: "head_dim", v_head_dim: "head_dim",
+           scale: "1 / sqrt(head_dim)", causal: true, window: null, soft_cap: null, write: true},
+         in: ["q", "k", "v", "s:kv.{layer}.k", "s:kv.{layer}.v", "i:positions"], out: "a", name: "core"},
+      ], when: "first(key_mask, '') == ''"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "kv_heads", causal: true, scale: "1 / sqrt(head_dim)"},
+       in: ["q", "k", "v", "i:{key_mask}"], out: "a", name: "core", when: "first(key_mask, '') != ''"},
+      {block: [
+        {op: "Reshape", args: {shape: ["nr", "heads * head_dim"]}, in: ["g"], out: "g", name: "gate_rows"},
+        {op: "Unary", args: {kind: "'Sigmoid'"}, in: ["g"], out: "g", name: "gate_act"},
+        {op: "Binary", args: {kind: "'Mul'"}, in: ["a", "g"], out: "a", name: "gated_core"},
+      ], when: "attn_gate"},
+      {op: "Linear", in: ["a", "w:{p}.o_proj.weight", "w?:{p}.o_proj.bias"], out: "out", name: "o"},
+    ]},
+  },
+}

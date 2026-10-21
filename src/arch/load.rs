@@ -541,6 +541,12 @@ impl Env for Vars<'_> {
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.parent.shape(t)
     }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.parent.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.parent.raw_has(p)
+    }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.parent.values(t)
     }
@@ -681,6 +687,12 @@ impl Env for Eval<'_> {
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.m.shape(t)
     }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.m.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.m.raw_has(p)
+    }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.m.values(t)
     }
@@ -786,6 +798,15 @@ impl Env for ModelEnv {
     }
     fn shape(&self, t: &str) -> Option<Vec<usize>> {
         self.table.read().get(t).map(|n| n.shape.clone())
+    }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.table.read().get(t).map(|n| match n.kind {
+            Kind::Packed(f) => crate::model::layers::gguf_block_codec(f).map_or(1, |b| b.0),
+            _ => 1,
+        })
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.ckpt.raw.keys().any(|r| glob(p, r))
     }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         let n = self.table.read().get(t).cloned()?;
@@ -978,6 +999,10 @@ impl WeightStore {
         };
         match &n.src {
             Src::Raw(r) => self.ckpt.raw_packed(r),
+            Src::Xf { op, ins, .. } if op == "reshape" => Ok(Packed {
+                shape: n.shape.clone(),
+                ..self.packed(&ins[0])?
+            }),
             Src::Xf { op, args, ins, .. } if op == "untile_packed_rows" => {
                 let p = self.packed(&ins[0])?;
                 let (rows, cols) = rows_cols(&n.shape);
@@ -1146,12 +1171,15 @@ fn fnv1a(s: &str) -> u64 {
 // ---- transforms -------------------------------------------------------------------------------
 
 /// `untile_packed_rows` args: row blocks of `v_heads` heads in tiled order
-/// (`[v_per_k, k_heads]`) after `prefix_rows` leading rows, rewritten grouped by key head.
+/// (`[v_per_k, k_heads]`) after `prefix_rows` leading rows, rewritten grouped by key head; with
+/// `chunk_rows`, independently within every run of that many rows (a reshaped matrix's columns).
 struct Untile {
     k_heads: usize,
     v_heads: usize,
     rows_per_block: usize,
     prefix_rows: usize,
+    /// 0: one run over all rows.
+    chunk_rows: usize,
 }
 
 impl Untile {
@@ -1161,12 +1189,23 @@ impl Untile {
             v_heads: arg_u(a, "v_heads")?,
             rows_per_block: arg_u(a, "rows_per_block")?,
             prefix_rows: arg_u_or(a, "prefix_rows", 0)?,
+            chunk_rows: arg_u_or(a, "chunk_rows", 0)?,
         })
     }
 }
 
 /// The tiled -> grouped head-block reorder of [`Untile`] over rows of `row_len` elements.
 fn untile_rows<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
+    let chunk = match u.chunk_rows {
+        0 => data.len().max(1),
+        c => c * row_len,
+    };
+    data.chunks(chunk)
+        .flat_map(|c| untile_run(c, row_len, u))
+        .collect()
+}
+
+fn untile_run<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
     let mut out = data.to_vec();
     let per_k = u.v_heads / u.k_heads.max(1);
     let block = u.rows_per_block * row_len;
@@ -1297,9 +1336,11 @@ fn xf_shapes(
         "untile_packed_rows" => {
             let u = Untile::from(a)?;
             let rows = s.first().copied().unwrap_or(1);
+            let run = if u.chunk_rows == 0 { rows } else { u.chunk_rows };
             if u.k_heads == 0
                 || u.v_heads % u.k_heads != 0
-                || u.prefix_rows + u.v_heads * u.rows_per_block != rows
+                || rows % run.max(1) != 0
+                || u.prefix_rows + u.v_heads * u.rows_per_block != run
             {
                 return Err(format!(
                     "{} prefix rows + {} heads x {} rows (over {} key heads) do not tile {s:?}",
@@ -1402,8 +1443,15 @@ fn xf_shapes(
     }
 }
 
-fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
+fn xf_kind(op: &str, ins: &[Arc<Node>], out: &[usize]) -> Kind {
     let k = ins[0].kind;
+    // Packed blocks are whole rows of blocks: a reshape whose old and new rows are whole blocks
+    // keeps the bytes as they are.
+    let rows_of_blocks = |cols: usize| match k {
+        Kind::Packed(f) => crate::model::layers::gguf_block_codec(f)
+            .is_some_and(|(elems, _, _)| cols % elems == 0),
+        _ => false,
+    };
     match op {
         "to_f32" => Kind::F32,
         // Float tensors become bf16 `Mat`s (what `Weights::from_gguf` made of GGUF float
@@ -1413,6 +1461,12 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
         // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
         "untile_packed_rows" | "reshape" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
+        "reshape"
+            if rows_of_blocks(ins[0].shape.last().copied().unwrap_or(0))
+                && rows_of_blocks(out.last().copied().unwrap_or(0)) =>
+        {
+            k
+        }
         _ => k.dense(),
     }
 }
@@ -1631,7 +1685,7 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
             };
             let shapes: Vec<&[usize]> = ins.iter().map(|n| n.shape.as_slice()).collect();
             let shape = xf_shapes(&t.op, &args, &shapes)?.remove(0).1;
-            let kind = xf_kind(&t.op, &ins);
+            let kind = xf_kind(&t.op, &ins, &shape);
             insert_new(
                 table,
                 out,
@@ -1670,12 +1724,12 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
         }
         let shapes: Vec<&[usize]> = ins.iter().map(|n| n.shape.as_slice()).collect();
         let outs = xf_shapes(&t.op, &args, &shapes).map_err(|e| format!("`{name}`: {e}"))?;
-        let kind = xf_kind(&t.op, &ins);
+        let kinds: Vec<Kind> = outs.iter().map(|o| xf_kind(&t.op, &ins, &o.1)).collect();
         let conv = t.op == "to_f32" || (ins[0].conv && t.op != "conv_to_linear");
         for (part, (new, shape)) in outs.into_iter().enumerate() {
             let node = Node {
                 shape,
-                kind,
+                kind: kinds[part],
                 conv,
                 src: Src::Xf {
                     op: t.op.clone(),

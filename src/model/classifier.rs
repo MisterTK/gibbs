@@ -560,7 +560,7 @@ impl SequenceClassifier {
                 "Qwen3ForSequenceClassification"
                 | "Qwen3_5ForSequenceClassification"
                 | "Qwen3_5TextForSequenceClassification" => {
-                    crate::model::qwen3_5::backbone(&artifacts, &cfg)?
+                    Box::new(crate::runtime::seqcls::SpecBackbone::load(&artifacts, device)?)
                 }
                 _ => {
                     let mut llm = crate::model::hf_loader::load_causal_lm(

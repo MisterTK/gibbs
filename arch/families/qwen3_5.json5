@@ -1,0 +1,294 @@
+// Qwen3.5 (transformers `qwen3_5`, `qwen3_5_moe`, their `_text` exports; llama.cpp `qwen35`,
+// `qwen35moe`): a hybrid stack of Gated DeltaNet linear attention and output-gated full
+// attention (`layer_types`), `1 + w` RMSNorms, interleaved M-RoPE, dense SwiGLU or a routed MoE
+// with a sigmoid-gated shared expert. Multimodal checkpoints nest the decoder under
+// `model.language_model` (renamed to `model.`), mlx-vlm ones under `language_model.model`.
+{
+  family: "qwen3_5",
+  match: {
+    hf_model_type: ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"],
+    gguf_arch: ["qwen35", "qwen35moe"],
+  },
+  pipeline: "causal_lm",
+  use_lib: ["transformer", "qwen", "deltanet", "moe", "qwen_vit"],
+  config: {
+    gguf_arch: "first(gguf['general.architecture'], '')",
+    // HF text config (nested `text_config` for the multimodal configs); null for GGUF files.
+    tc: "first(cfg.text_config, cfg)",
+    rope: "first(tc.rope_parameters, tc.rope_scaling)",
+    hidden: "first(tc.hidden_size, gguf.embedding_length)",
+    // llama.cpp appends the MTP (`nextn`) blocks after the decoder's.
+    nextn: "first(gguf.nextn_predict_layers, 0)",
+    layers: "first(tc.num_hidden_layers, gguf.block_count - nextn)",
+    layer_types: "tc.layer_types",
+    heads: "first(tc.num_attention_heads, gguf['attention.head_count'])",
+    kv_heads: "first(tc.num_key_value_heads, gguf['attention.head_count_kv'])",
+    head_dim: "first(tc.head_dim, gguf['attention.key_length'], hidden // heads)",
+    vocab: "shape('model.embed_tokens.weight')[0]",
+    inter: "first(tc.intermediate_size, gguf.feed_forward_length, 0)",
+    eps: "first(tc.rms_norm_eps, gguf['attention.layer_norm_rms_epsilon'], 1e-6)",
+    theta: "first(rope.rope_theta, tc.rope_theta, gguf['rope.freq_base'])",
+    rotary_dim: "first(gguf['rope.dimension_count'], 2 * (int(head_dim * first(rope.partial_rotary_factor, 1)) // 2))",
+    mrope_section: "first(rope.mrope_section, [rotary_dim // 2, 0, 0])",
+    lin_k_heads: "first(tc.linear_num_key_heads, gguf['ssm.group_count'])",
+    lin_v_heads: "first(tc.linear_num_value_heads, gguf['ssm.time_step_rank'])",
+    lin_k_dim: "first(tc.linear_key_head_dim, gguf['ssm.state_size'])",
+    lin_v_dim: "first(tc.linear_value_head_dim, gguf['ssm.inner_size'] // lin_v_heads)",
+    lin_kernel: "first(tc.linear_conv_kernel_dim, gguf['ssm.conv_kernel'])",
+    // GGUF value heads come tiled (`[v_per_k, k_heads]`); untiled at load, except `out_proj`
+    // columns that split quantization blocks, whose input is tiled in the graph instead.
+    tiled_heads: "gguf_arch != '' && lin_k_heads != lin_v_heads",
+    out_tiled: "tiled_heads && lin_v_dim % block('model.layers.0.linear_attn.out_proj.weight') != 0",
+    experts: "first(tc.num_experts, gguf.expert_count, 0)",
+    top_k: "first(tc.num_experts_per_tok, gguf.expert_used_count, 0)",
+    norm_topk: "first(tc.norm_topk_prob, true) != false",
+    moe_inter: "first(tc.moe_intermediate_size, gguf.expert_feed_forward_length, 0)",
+    attn_gate: "first(tc.attn_output_gate, gguf_arch != '')",
+    qk_norm: "'before'",
+    act: "'Silu'",
+    // transformers' `1 + w` RMSNorm gains (llama.cpp stores them shifted, mlx-vlm too).
+    norm_offset: "gguf_arch == '' && !raw_has('language_model.model.*')",
+    head_w: "has('lm_head.weight') && tc.tie_word_embeddings != true ? 'lm_head' : 'model.embed_tokens'",
+    ctx: "first(runtime.ctx, min(first(tc.max_position_embeddings, gguf.context_length, 32768), 4096))",
+    // ---- vision tower (`model.visual.*`, `vision_config`); GGUF mmproj towers are not read ----
+    has_vision: "has('model.visual.patch_embed.proj.weight')",
+    // With a tower the decoder always rotates by `rope_positions` ([t, h, w] per row; text rows
+    // put all three at the sequence position, so text-only prompts rotate as plain RoPE).
+    mrope_variant: {MRope: {sections: "mrope_section", interleaved: true, pairs: "'Half'"}},
+    v_hidden: "cfg.vision_config.hidden_size",
+    v_heads: "cfg.vision_config.num_heads",
+    v_hd: "v_hidden // v_heads",
+    v_depth: "cfg.vision_config.depth",
+    v_side: "int(sqrt(cfg.vision_config.num_position_embeddings))",
+    v_patch: "cfg.vision_config.patch_size",
+    v_temporal: "cfg.vision_config.temporal_patch_size",
+    v_merge: "cfg.vision_config.spatial_merge_size",
+    // Vision block each deepstack merger k reads; the decoder adds feature k after its layer k.
+    deepstack_idx: "cfg.vision_config.deepstack_visual_indexes",
+    deepstack_layers: "has_vision ? len(deepstack_idx) : 0",
+  },
+  checks: [
+    {expr: "experts > 0 && (len(first(tc.mlp_only_layers, [])) > 0 || first(tc.decoder_sparse_step, 1) != 1)",
+     error: "MoE configs with dense layers (mlp_only_layers, decoder_sparse_step) are not implemented"},
+    {expr: "gguf_arch == '' && rope.mrope_interleaved != true",
+     error: "only interleaved M-RoPE (`mrope_interleaved: true`) is implemented"},
+    {expr: "len(mrope_section) != 3 || at(mrope_section, 0) + at(mrope_section, 1) + at(mrope_section, 2) != rotary_dim // 2",
+     error: "mrope_section {mrope_section} does not cover rotary dim {rotary_dim}"},
+    {expr: "first(gguf['rope.scaling.type'], 'none') != 'none'", error: "{gguf_arch} RoPE scaling '{gguf['rope.scaling.type']}' is not implemented"},
+    {expr: "layer_types != null && len(layer_types) != layers", error: "layer_types length != num_hidden_layers"},
+    {expr: "has_vision && cfg.vision_config.hidden_act != 'gelu_pytorch_tanh'", error: "vision hidden_act {cfg.vision_config.hidden_act} is not gelu_pytorch_tanh"},
+    {expr: "has_vision && v_side * v_side != cfg.vision_config.num_position_embeddings",
+     error: "num_position_embeddings {cfg.vision_config.num_position_embeddings} is not a square"},
+    {expr: "has_vision && deepstack_layers > 3", error: "{deepstack_layers} deepstack layers; the spec wires at most 3"},
+    {expr: "has_vision && deepstack_layers > 0 && max(deepstack_idx) >= v_depth",
+     error: "deepstack index {max(deepstack_idx)} is past the {v_depth} vision blocks"},
+  ],
+  names: {use: ["qwen35", "llamacpp"]},
+  transforms: [
+    {tensor: "model.layers.{i}.{n:*}layernorm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
+    {tensor: "model.layers.{i}.self_attn.{n:*}_norm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
+    {tensor: "model.norm.weight", op: "add", args: {value: 1}, when: "norm_offset"},
+    {tensor: "mtp.pre_fc_norm_{n:*}.weight", op: "add", args: {value: 1}, when: "gguf_arch == ''"},
+    {tensor: "mtp.norm.weight", op: "add", args: {value: 1}, when: "gguf_arch == ''"},
+    {tensor: "mtp.layers.{i}.{n:*}layernorm.weight", op: "add", args: {value: 1}, when: "gguf_arch == ''"},
+    {tensor: "mtp.layers.{i}.self_attn.{n:*}_norm.weight", op: "add", args: {value: 1}, when: "gguf_arch == ''"},
+    {tensor: "model.layers.{i}.linear_attn.A_log", op: "split_rows", args: {parts: [["model.layers.{i}.linear_attn.neg_A", "lin_v_heads"]]}},
+    {tensor: "model.layers.{i}.linear_attn.neg_A", op: "neg_exp", when: "gguf_arch == ''"},
+    // Depthwise conv [conv_dim, 1, kernel] (HF) / [conv_dim, kernel] (GGUF) -> f32 [conv_dim, kernel].
+    {tensor: "model.layers.{i}.linear_attn.conv1d.weight", op: "reshape",
+     args: {shape: ["2 * lin_k_heads * lin_k_dim + lin_v_heads * lin_v_dim", "lin_kernel"]}},
+    {tensor: "model.layers.{i}.linear_attn.conv1d.weight", op: "to_f32"},
+    // llama.cpp's tiled value heads back to transformers' grouped order.
+    {tensor: "model.layers.{i}.linear_attn.in_proj_qkv.weight", op: "untile_packed_rows", when: "tiled_heads",
+     args: {k_heads: "lin_k_heads", v_heads: "lin_v_heads", rows_per_block: "lin_v_dim", prefix_rows: "2 * lin_k_heads * lin_k_dim"}},
+    {tensor: "model.layers.{i}.linear_attn.in_proj_z.weight", op: "untile_packed_rows", when: "tiled_heads",
+     args: {k_heads: "lin_k_heads", v_heads: "lin_v_heads", rows_per_block: "lin_v_dim"}},
+    {tensor: "model.layers.{i}.linear_attn.conv1d.weight", op: "untile_heads", when: "tiled_heads",
+     args: {k_heads: "lin_k_heads", block: "lin_v_dim * lin_kernel", prefix: "2 * lin_k_heads * lin_k_dim * lin_kernel"}},
+    {tensor: "model.layers.{i}.linear_attn.in_proj_{n:*}.weight", op: "untile_heads", when: "tiled_heads && (n == 'a' || n == 'b')",
+     args: {k_heads: "lin_k_heads", block: "hidden"}},
+    {tensor: "model.layers.{i}.linear_attn.neg_A", op: "untile_heads", when: "tiled_heads", args: {k_heads: "lin_k_heads", block: 1}},
+    {tensor: "model.layers.{i}.linear_attn.dt_bias", op: "untile_heads", when: "tiled_heads", args: {k_heads: "lin_k_heads", block: 1}},
+    // out_proj columns: one value head per row block of the [rows * v_heads, v_dim] view.
+    {tensor: "model.layers.{i}.linear_attn.out_proj.weight", op: "reshape", when: "tiled_heads && !out_tiled",
+     args: {shape: ["hidden * lin_v_heads", "lin_v_dim"]}},
+    {tensor: "model.layers.{i}.linear_attn.out_proj.weight", op: "untile_packed_rows", when: "tiled_heads && !out_tiled",
+     args: {k_heads: "lin_k_heads", v_heads: "lin_v_heads", rows_per_block: 1, chunk_rows: "lin_v_heads"}},
+    {tensor: "model.layers.{i}.linear_attn.out_proj.weight", op: "reshape", when: "tiled_heads && !out_tiled",
+     args: {shape: ["hidden", "lin_v_heads * lin_v_dim"]}},
+    // Expert banks as [experts * rows, cols]: HF fused gate_up / down, GGUF [experts, rows, cols].
+    {tensor: "model.layers.{i}.mlp.experts.gate_up_proj", op: "reshape", args: {shape: ["experts * 2 * moe_inter", "hidden"]}},
+    {tensor: "model.layers.{i}.mlp.experts.gate_up_proj", op: "deinterleave_heads", args: {heads: "experts", parts: [
+      ["model.layers.{i}.mlp.experts.gate_proj.weight", "moe_inter"], ["model.layers.{i}.mlp.experts.up_proj.weight", "moe_inter"]]}},
+    {tensor: "model.layers.{i}.mlp.experts.down_proj", op: "reshape", args: {shape: ["experts * hidden", "moe_inter"]}},
+    {tensor: "model.layers.{i}.mlp.experts.down_proj", op: "split_rows", args: {parts: [
+      ["model.layers.{i}.mlp.experts.down_proj.weight", "experts * hidden"]]}},
+    {tensor: "model.layers.{i}.mlp.experts.{n:*}_proj.weight", op: "reshape",
+     when: "len(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight'))) == 3",
+     args: {shape: ["experts * at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 1)", "at(shape(fmt('model.layers.{i}.mlp.experts.{n}_proj.weight')), 2)"]}},
+    {tensor: "model.layers.{i}.mlp.shared_expert_gate.weight", op: "reshape", when: "len(shape(fmt('model.layers.{i}.mlp.shared_expert_gate.weight'))) == 1",
+     args: {shape: [1, "hidden"]}},
+    // ViT Conv3d [d, 3, t, p, p] as a Linear over flattened [c, t, y, x] patches; the learned
+    // position table gathers in f32 (the old tower's `Embedding` kernel, not the bf16 `Embed`).
+    {tensor: "model.visual.patch_embed.proj.weight", op: "conv_to_linear"},
+    {tensor: "model.visual.pos_embed.weight", op: "to_f32"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "rope_inv_freq", args: {dim: "rotary_dim", theta: "theta", kind: "'default'", precision: "'f64'"}},
+    // ViT 2D rotary: a quarter of each head's pairs per axis, rows then columns.
+    "vision.rope.inv_freq": {gen: "rope_inv_freq", when: "has_vision", args: {dim: "v_hd // 2", theta: 10000, precision: "'f32'", tile: 2}},
+  },
+  // score.weight: a seq-cls head, which runtime::seqcls's caller reads. mtp.*: an MTP head the
+  // `mtp` drafter does not run (more than one layer, dedicated embeddings) is skipped, not refused.
+  ignore: ["lm_head.weight", "score.weight", "mtp.*"],
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "rope_positions", dtype: "u32", shape: ["3 * rows"], when: "has_vision"},
+        // Media rows (tower output `media`, then the deepstack features) and the rows they fill;
+        // `media` = SpecLm's instance var (media rows this pass, 0 / absent on text passes).
+        {name: "media_rows", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
+        {name: "media_index", dtype: "u32", shape: ["media"], when: "first(media, 0) > 0"},
+        {name: "deepstack.0", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 0"},
+        {name: "deepstack.1", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 1"},
+        {name: "deepstack.2", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0 && deepstack_layers > 2"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", name: "media_scatter", when: "first(media, 0) > 0"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')"}},
+          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.input_layernorm"},
+          {use: "gated_deltanet", in: ["h"], out: "a", name: "layers.{i}.mixer", when: "has(fmt('{p}.linear_attn.in_proj_qkv.weight'))",
+           args: {p: "fmt('{p}.linear_attn')", layer: "i", tiled: "out_tiled"}},
+          {use: "qwen_attn", in: ["h"], out: "a", name: "layers.{i}.self_attn", when: "!has(fmt('{p}.linear_attn.in_proj_qkv.weight'))",
+           args: {p: "fmt('{p}.self_attn')", layer: "i", rope_pos: "has_vision ? 'rope_positions' : 'positions'",
+                  rope_variant: "has_vision ? mrope_variant : 'HalfSplit'"}},
+          {op: "Binary", args: {kind: "'Add'"}, in: ["x", "a"], out: "x", name: "layers.{i}.add_mixer"},
+          {use: "rms_norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "layers.{i}.post_attention_layernorm"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "layers.{i}.mlp", when: "experts == 0",
+           args: {gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
+          {use: "moe_shared", in: ["h"], out: "m", name: "layers.{i}.mlp", when: "experts > 0", args: {p: "fmt('{p}.mlp')"}},
+          {op: "Binary", args: {kind: "'Add'"}, in: ["x", "m"], out: "x", name: "layers.{i}.add_ffn"},
+          // Deepstack: feature i added to the media rows after decoder layer i.
+          {block: [
+            {op: "Gather", args: {axis: 0}, in: ["x", "i:media_index"], out: "dr", name: "layers.{i}.deepstack_rows"},
+            {op: "Binary", args: {kind: "'Add'"}, in: ["dr", "i:deepstack.{i}"], out: "dr", name: "layers.{i}.deepstack_add"},
+            {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "dr"], out: "x", name: "layers.{i}.deepstack"},
+          ], when: "first(media, 0) > 0 && i < deepstack_layers"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "rms_norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "lm_head", args: {w: "head_w"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+    // The ViT on one image's `grid_h x grid_w` patch grid (`smart_resize` patches, 2x2 merge-block
+    // order): output `media` [patches / 4, hidden], then `deepstack.{k}` (same shape).
+    vision: {
+      vars: ["grid_h", "grid_w"],
+      inputs: [
+        {name: "patches", dtype: "f32", shape: ["grid_h * grid_w", "3 * v_temporal * v_patch * v_patch"]},
+        // Bilinear (align-corners) taps of the `v_side`^2 learned position grid: rows, weights.
+        {name: "pos_idx_0", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 0, output: "'index'"}},
+        {name: "pos_idx_1", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 1, output: "'index'"}},
+        {name: "pos_idx_2", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 2, output: "'index'"}},
+        {name: "pos_idx_3", dtype: "u32", shape: ["grid_h * grid_w"], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 3, output: "'index'"}},
+        {name: "pos_w_0", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 0, output: "'weight'"}},
+        {name: "pos_w_1", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 1, output: "'weight'"}},
+        {name: "pos_w_2", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 2, output: "'weight'"}},
+        {name: "pos_w_3", dtype: "f32", shape: ["grid_h * grid_w", 1], gen: "bilinear_pos_taps",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge", side: "v_side", corner: 3, output: "'weight'"}},
+        {name: "rope_positions", dtype: "u32", shape: ["3 * grid_h * grid_w"], gen: "vision_rope_positions",
+         args: {grid_h: "grid_h", grid_w: "grid_w", merge: "v_merge"}},
+      ],
+      body: [
+        {op: "Linear", in: ["i:patches", "w:model.visual.patch_embed.proj.weight", "w?:model.visual.patch_embed.proj.bias"], out: "x", name: "patch_embed"},
+        {repeat: "c", count: 4, body: [
+          {op: "Embedding", in: ["w:model.visual.pos_embed.weight", "i:pos_idx_{c}"], out: "e", name: "pos_embed_{c}"},
+          {op: "Binary", args: {kind: "'Mul'"}, in: ["e", "i:pos_w_{c}"], out: "e", name: "pos_scaled_{c}"},
+          {op: "Binary", args: {kind: "'Add'"}, in: ["x", "e"], out: "x", name: "pos_add_{c}"},
+        ]},
+        {repeat: "b", count: "v_depth", body: [
+          {use: "qwen_vit_block", args: {p: "fmt('model.visual.blocks.{b}')"}, in: ["x"], out: "x", name: "blocks.{b}"},
+          {repeat: "k", count: "deepstack_layers", body: [
+            {use: "qwen_vit_merger", args: {m: "fmt('model.visual.deepstack_merger_list.{k}')", post: true}, in: ["x"],
+             out: "deepstack.{k}", name: "deepstack_merger.{k}", when: "at(deepstack_idx, k) == b"},
+          ]},
+        ]},
+        {use: "qwen_vit_merger", args: {m: "'model.visual.merger'", post: false}, in: ["x"], out: "media", name: "merger"},
+      ],
+      outputs: [
+        "media",
+        {name: "deepstack.0", when: "deepstack_layers > 0"},
+        {name: "deepstack.1", when: "deepstack_layers > 1"},
+        {name: "deepstack.2", when: "deepstack_layers > 2"},
+      ],
+    },
+    // Multi-token prediction head (`mtp.*`, vLLM `Qwen3_5MultiTokenPredictor`) as the shipped
+    // drafter: rows pair a token with the hidden state of the position before it,
+    // fc([norm_e(embed(t)); norm_h(h)]), one gated full-attention layer over its own cache, then
+    // `mtp.norm`; the shared LM head turns the last row into draft logits, and `hidden` (that row,
+    // normed) stands in for the next position's hidden state. `src`: 'tap' = `hidden` is the
+    // target's last-layer residual (final-normed here), 'draft' = a previous `hidden` output.
+    // ponytail: one MTP layer (every released Qwen3.5); vLLM cycles `step % layers` for more.
+    mtp: {
+      vars: ["rows", "src"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "hidden", dtype: "f32", shape: ["rows", "hidden"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "e", name: "mtp.embed"},
+        {use: "rms_norm", args: {w: "'mtp.pre_fc_norm_embedding'"}, in: ["e"], out: "e", name: "mtp.norm_embed"},
+        {block: [
+          {use: "rms_norm", args: {w: "'model.norm'"}, in: ["i:hidden"], out: "h", name: "mtp.target_norm"},
+          {use: "rms_norm", args: {w: "'mtp.pre_fc_norm_hidden'"}, in: ["h"], out: "h", name: "mtp.norm_hidden"},
+        ], when: "src == 'tap'"},
+        {use: "rms_norm", args: {w: "'mtp.pre_fc_norm_hidden'"}, in: ["i:hidden"], out: "h", name: "mtp.norm_hidden", when: "src != 'tap'"},
+        {op: "Concat", args: {axis: -1}, in: ["e", "h"], out: "x", name: "mtp.concat"},
+        {op: "Linear", in: ["x", "w:mtp.fc.weight"], out: "x", name: "mtp.fc"},
+        {use: "rms_norm", args: {w: "'mtp.layers.0.input_layernorm'"}, in: ["x"], out: "h", name: "mtp.layers.0.input_layernorm"},
+        {use: "qwen_attn", in: ["h"], out: "a", name: "mtp.layers.0.self_attn", args: {p: "'mtp.layers.0.self_attn'", layer: "'mtp'"}},
+        {op: "Binary", args: {kind: "'Add'"}, in: ["x", "a"], out: "x", name: "mtp.layers.0.add_mixer"},
+        {use: "rms_norm", args: {w: "'mtp.layers.0.post_attention_layernorm'"}, in: ["x"], out: "h", name: "mtp.layers.0.post_attention_layernorm"},
+        {use: "mlp_glu", in: ["h"], out: "m", name: "mtp.layers.0.mlp",
+         args: {gate: "'mtp.layers.0.mlp.gate_proj'", up: "'mtp.layers.0.mlp.up_proj'", down: "'mtp.layers.0.mlp.down_proj'"}},
+        {op: "Binary", args: {kind: "'Add'"}, in: ["x", "m"], out: "x", name: "mtp.layers.0.add_ffn"},
+        {use: "last_row", in: ["x"], out: "x", name: "mtp.last"},
+        {use: "rms_norm", args: {w: "'mtp.norm'"}, in: ["x"], out: "hidden", name: "mtp.norm"},
+        {use: "lm_head", args: {w: "head_w"}, in: ["hidden"], out: "logits", name: "mtp.lm_head"},
+      ],
+      outputs: ["logits", "hidden"],
+    },
+  },
+  runtime: {
+    prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"],
+    drafter: {kind: "mtp", component: "mtp", label: "'MTP'", taps: "[layers - 1]",
+              when: "has('mtp.fc.weight') && first(tc.mtp_num_hidden_layers, 0) == 1 && tc.mtp_use_dedicated_embeddings != true"},
+    // `Qwen2VLImageProcessor`; placeholder expanded to the merged grid with get_rope_index's
+    // [t, h, w] positions.
+    media: {image: {
+      when: "has_vision",
+      component: "'vision'",
+      preprocess: {kind: "'smart_resize'", patch: "v_patch", merge: "v_merge", temporal: "v_temporal",
+                   min_pixels: "first(json.preprocessor_config.size.shortest_edge, json.preprocessor_config.min_pixels)",
+                   max_pixels: "first(json.preprocessor_config.size.longest_edge, json.preprocessor_config.max_pixels)",
+                   norm: {mean: "json.preprocessor_config.image_mean", std: "json.preprocessor_config.image_std"}},
+      expand: {kind: "'merged_grid'", placeholder: "cfg.image_token_id"},
+      positions: "'mrope_grid'",
+    }},
+  },
+}

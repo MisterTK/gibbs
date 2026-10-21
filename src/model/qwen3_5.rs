@@ -8,7 +8,6 @@
 //! `models/qwen3/modeling_qwen3.py`, `models/hunyuan_v1_dense/modeling_hunyuan_v1_dense.py`
 //! and the `Qwen2VLImageProcessor` the VL models share.
 
-mod draft;
 pub(crate) mod fixture;
 #[cfg(test)]
 pub(crate) mod gpu_tests;
@@ -16,10 +15,6 @@ mod text;
 pub use fixture::{tiny_mtp_graph, tiny_ninfer_decode_graph, tiny_vision_tower_graph};
 pub use text::{tiny_decode_graph, tiny_moe_decode_graph};
 pub mod vision;
-
-pub use draft::{
-    gguf_checkpoint as gguf_drafter, load as load_drafter, ARCHITECTURES as DRAFT_ARCHITECTURES,
-};
 
 use crate::hardware::Device;
 use crate::model::classifier::DecoderBackbone;

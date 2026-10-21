@@ -207,6 +207,12 @@ impl Env for BEnv<'_, '_> {
             .map(|(s, _)| s)
             .or_else(|| self.0.model.shape(t))
     }
+    fn block(&self, t: &str) -> Option<usize> {
+        self.0.model.block(t)
+    }
+    fn raw_has(&self, p: &str) -> bool {
+        self.0.model.raw_has(p)
+    }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         self.0.model.values(t)
     }
