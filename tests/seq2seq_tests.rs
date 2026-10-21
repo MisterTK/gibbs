@@ -2,9 +2,9 @@
 //! scheduler drives a native model: chat template (last user message), byte encode, `prepare`,
 //! then `forward` + sampling until the tokenizer says the generation ended.
 
-use gibbs_engine::hardware::Device;
+use gibbs_engine::hardware::{Device, PlacementMode};
 use gibbs_engine::model::hub::HuggingFaceHub;
-use gibbs_engine::model::native::{load_native, NativeLm, PrepareCtx};
+use gibbs_engine::model::native::{NativeLm, PrepareCtx};
 use gibbs_engine::runtime::lm::sample_logits;
 use std::sync::Arc;
 
@@ -14,7 +14,8 @@ fn model(repo: &str) -> Option<Arc<dyn NativeLm>> {
         eprintln!("SKIP: {repo} not in disk/ (gibbs --model {repo} --storage disk)");
         return None;
     }
-    Some(load_native(&art, Device::Cpu)?.expect("seq2seq model loads"))
+    let reg = gibbs_engine::arch::registry().expect("registry");
+    Some(gibbs_engine::runtime::encdec::load(&art, reg, None, PlacementMode::Pin(Device::Cpu)).expect("seq2seq model loads"))
 }
 
 /// The reply to one chat turn at temperature 0 (beam models replay their search whatever the

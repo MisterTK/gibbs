@@ -1920,15 +1920,6 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
     if native_type(m) {
         return None;
     }
-    let arch = m["config"]["architectures"][0].as_str();
-    if arch.is_some_and(|a| crate::model::seq2seq::ARCHITECTURES.contains(&a))
-        && matches!(
-            tag,
-            "translation" | "summarization" | "text2text-generation"
-        )
-    {
-        return None;
-    }
     let decoder_task = matches!(
         tag,
         "translation" | "summarization" | "text2text-generation"

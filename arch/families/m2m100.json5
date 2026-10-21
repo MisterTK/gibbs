@@ -1,0 +1,8 @@
+// M2M100 / NLLB (`modeling_m2m_100.py`): BART layout, pre-LN with a final `layer_norm`, fairseq
+// sinusoid positions read from position 2.
+{
+  family: "m2m100",
+  extends: "bart",
+  match: {hf_model_type: ["m2m_100"], hf_architectures: ["M2M100ForConditionalGeneration"]},
+  config: {pre_ln: "true", pos_kind: "'tensor2tensor'", pos_start: "2"},
+}
