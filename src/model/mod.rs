@@ -84,7 +84,7 @@ pub use tokenizer::*;
 /// Serialization container formats supported by the Universal Model Loader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFormat {
-    /// llama.cpp unified quantized format with embedded metadata and tensor KV pairs.
+    /// GGML unified quantized format with embedded metadata and tensor KV pairs.
     Gguf,
     /// Hugging Face zero-copy memory-mappable tensor serialization format.
     Safetensors,
@@ -164,7 +164,7 @@ pub struct ModelManifest {
     pub metadata: HashMap<String, String>,
     /// Total number of shards in multi-part model (1 for single file).
     pub shard_count: usize,
-    /// Fingerprinted model architecture (e.g., "llama-70b", "qwen2-vl").
+    /// Fingerprinted model architecture.
     pub detected_architecture: String,
 }
 
