@@ -21,8 +21,8 @@ fn backend() -> Device {
     }
 }
 
-/// The first cached of [`REPO`], [`NO_MTP`].
-fn model() -> Option<Arc<dyn NativeLm>> {
+/// The first cached of [`REPO`], [`NO_MTP`], and which one it is.
+fn model() -> Option<(Arc<dyn NativeLm>, &'static str)> {
     let hub = HuggingFaceHub::with_cache_dir("disk".into());
     let Some((repo, art)) = [REPO, NO_MTP]
         .into_iter()
@@ -37,16 +37,17 @@ fn model() -> Option<Arc<dyn NativeLm>> {
     let reg = gibbs_engine::arch::registry().unwrap();
     let m = gibbs_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(backend()))
         .unwrap_or_else(|e| panic!("{repo} loads: {e}"));
-    Some(m)
+    Some((m, repo))
 }
 
-/// [`model`] when it ships the MTP drafter.
+/// [`model`] when it ships the MTP drafter; on [`REPO`] a missing drafter is a failure.
 fn mtp_model() -> Option<Arc<dyn NativeLm>> {
-    let m = model()?;
-    if m.drafter().is_none() {
-        eprintln!("SKIP: cached checkpoint has no MTP head (mtp.fc.weight); needs {REPO}");
+    let (m, repo) = model()?;
+    if repo == NO_MTP {
+        eprintln!("SKIP: {NO_MTP} has no MTP head (mtp.fc.weight); needs {REPO}");
         return None;
     }
+    m.drafter().expect("Qwen3.5-0.8B ships an MTP head");
     Some(m)
 }
 
@@ -55,7 +56,7 @@ fn mtp_model() -> Option<Arc<dyn NativeLm>> {
 /// caches are restored exactly. Rewinding outside the verified span errs.
 #[test]
 fn deltanet_rollback_is_exact() {
-    let Some(m) = model() else { return };
+    let Some((m, _)) = model() else { return };
     let tok = m.tokenizer();
     let prompt = tok.encode("The quick brown fox jumps over the lazy dog, and then");
     let t = tok.encode(" it ran into the forest to hide");
