@@ -1,19 +1,17 @@
 //! fastText supervised models (`.bin` / quantized `.ftz`), read from the binary format of
-//! facebookresearch/fastText (fasttext.cc `loadModel`) and scored exactly like
-//! `model.predict(text, k=-1)`: `getLine` tokens + `</s>`, word/char n-gram hashing, averaged
-//! input rows, then softmax / hierarchical softmax / one-vs-all sigmoid.
+//! facebookresearch/fastText (fasttext.cc `loadModel`) into a [`BagModel`]; scoring (hashing,
+//! averaged input rows, softmax / hierarchical softmax / one-vs-all sigmoid) is
+//! [`crate::runtime::bag`] over the `fasttext` family spec.
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::runtime::bag::{BagModel, Head, Pq, QuantRows, Rows, Vocab};
 use memmap2::Mmap;
 
 const MAGIC: i32 = 793712314;
 const VERSION: i32 = 12;
-const EOS: &[u8] = b"</s>";
 const LABEL: &[u8] = b"__label__";
-/// Bytes `Dictionary::readWord` splits on.
-const SPACES: &[u8] = b" \n\r\t\x0b\x0c\0";
 
 struct Reader<'a> {
     b: &'a [u8],
@@ -41,68 +39,34 @@ impl Reader<'_> {
     fn f32s(&mut self, n: usize) -> Result<Vec<f32>, String> {
         Ok(f32s(self.take(n * 4)?))
     }
-}
 
-fn f32s(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-        .collect()
-}
-
-/// `ProductQuantizer`: 256 centroids per sub-quantizer; the last one spans `lastdsub` dims.
-struct Pq {
-    nsubq: usize,
-    dsub: usize,
-    lastdsub: usize,
-    centroids: Vec<f32>,
-}
-
-impl Pq {
-    fn load(r: &mut Reader) -> Result<Self, String> {
-        let dim = r.i32()? as usize;
-        let (nsubq, dsub, lastdsub) = (r.i32()? as usize, r.i32()? as usize, r.i32()? as usize);
-        Ok(Self {
+    /// `ProductQuantizer::load`.
+    fn pq(&mut self) -> Result<Pq, String> {
+        let dim = self.i32()? as usize;
+        let (nsubq, dsub, lastdsub) = (
+            self.i32()? as usize,
+            self.i32()? as usize,
+            self.i32()? as usize,
+        );
+        Ok(Pq {
             nsubq,
             dsub,
             lastdsub,
-            centroids: r.f32s(dim * 256)?,
+            centroids: self.f32s(dim * 256)?,
         })
     }
-    fn centroid(&self, m: usize, i: u8) -> &[f32] {
-        let i = i as usize;
-        if m == self.nsubq - 1 {
-            &self.centroids[m * 256 * self.dsub + i * self.lastdsub..][..self.lastdsub]
-        } else {
-            &self.centroids[(m * 256 + i) * self.dsub..][..self.dsub]
-        }
-    }
-}
 
-enum Matrix {
-    /// Row-major `[rows, dim]` f32 at a byte offset into the mapped file.
-    Dense { off: usize, rows: usize },
-    Quant {
-        rows: usize,
-        /// `nsubq` codes per row, at a byte offset into the mapped file.
-        codes: usize,
-        pq: Pq,
-        /// `qnorm`: one norm code per row and its 1-d quantizer.
-        norm: Option<(Vec<u8>, Pq)>,
-    },
-}
-
-impl Matrix {
-    fn load(r: &mut Reader, quant: bool, dim: usize) -> Result<Self, String> {
+    /// A `DenseMatrix` / `QuantMatrix` of width `dim`.
+    fn matrix(&mut self, quant: bool, dim: usize) -> Result<Rows, String> {
         if quant {
-            let qnorm = r.u8()? != 0;
-            let (rows, n) = (r.i64()? as usize, r.i64()? as usize);
-            let codesize = r.i32()? as usize;
-            let codes = r.p;
-            r.take(codesize)?;
-            let pq = Pq::load(r)?;
+            let qnorm = self.u8()? != 0;
+            let (rows, n) = (self.i64()? as usize, self.i64()? as usize);
+            let codesize = self.i32()? as usize;
+            let codes = self.take(codesize)?.to_vec();
+            let pq = self.pq()?;
             let norm = if qnorm {
-                let c = r.take(rows)?.to_vec();
-                Some((c, Pq::load(r)?))
+                let c = self.take(rows)?.to_vec();
+                Some((c, self.pq()?))
             } else {
                 None
             };
@@ -111,566 +75,316 @@ impl Matrix {
                     "fastText: bad quantized matrix {rows}x{n}, {codesize} codes"
                 ));
             }
-            Ok(Self::Quant {
-                rows,
-                codes,
-                pq,
-                norm,
-            })
+            Ok(Rows::Quant(QuantRows { codes, pq, norm }))
         } else {
-            let (rows, n) = (r.i64()? as usize, r.i64()? as usize);
+            let (rows, n) = (self.i64()? as usize, self.i64()? as usize);
             if n != dim {
                 return Err(format!("fastText: matrix width {n} != dim {dim}"));
             }
-            let off = r.p;
-            r.take(rows * n * 4)?;
-            Ok(Self::Dense { off, rows })
-        }
-    }
-
-    fn rows(&self) -> usize {
-        match self {
-            Self::Dense { rows, .. } | Self::Quant { rows, .. } => *rows,
-        }
-    }
-
-    /// Visits row `i` as (column offset, values, scale) segments.
-    fn row(&self, map: &[u8], dim: usize, i: usize, mut f: impl FnMut(usize, &[f32], f32)) {
-        match self {
-            Self::Dense { off, .. } => f(0, &f32s(&map[off + i * dim * 4..][..dim * 4]), 1.0),
-            Self::Quant {
-                codes, pq, norm, ..
-            } => {
-                let scale = norm
-                    .as_ref()
-                    .map_or(1.0, |(c, npq)| npq.centroid(0, c[i])[0]);
-                let code = &map[codes + i * pq.nsubq..][..pq.nsubq];
-                for (m, &c) in code.iter().enumerate() {
-                    f(m * pq.dsub, pq.centroid(m, c), scale);
-                }
-            }
-        }
-    }
-
-    /// `x += row(i)` (`addRowToVector`).
-    fn add_row(&self, map: &[u8], x: &mut [f32], i: usize) {
-        self.row(map, x.len(), i, |o, v, a| {
-            for (x, v) in x[o..].iter_mut().zip(v) {
-                *x += a * v;
-            }
-        });
-    }
-
-    /// `row(i) · x` (`dotRow` / `mulcode`).
-    fn dot(&self, map: &[u8], x: &[f32], i: usize) -> f32 {
-        let mut d = 0f32;
-        let mut scale = 1.0;
-        self.row(map, x.len(), i, |o, v, a| {
-            d += x[o..].iter().zip(v).map(|(x, v)| x * v).sum::<f32>();
-            scale = a;
-        });
-        d * scale
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Loss {
-    Hs,
-    Ns,
-    Softmax,
-    Ova,
-}
-
-/// Model bytes: the mapped `.bin`/`.ftz`, or the tensors read from a PyTorch re-export.
-enum Bytes {
-    Map(Mmap),
-    Owned(Vec<u8>),
-}
-
-impl std::ops::Deref for Bytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Map(m) => m,
-            Self::Owned(v) => v,
+            Ok(Rows::Dense(self.f32s(rows * n)?))
         }
     }
 }
 
-pub struct FastText {
-    map: Bytes,
-    dim: usize,
-    bucket: u32,
-    minn: usize,
-    maxn: usize,
-    word_ngrams: usize,
-    loss: Loss,
-    /// `args.label` (always the default `__label__` for `.bin`: it is not saved).
-    label: Vec<u8>,
-    nwords: usize,
-    word2int: HashMap<Vec<u8>, i32>,
-    words: Vec<Vec<u8>>,
-    is_label: Vec<bool>,
-    /// `pruneidx` (`None` = not pruned: `pruneidx_size == -1`).
-    prune: Option<HashMap<i32, i32>>,
-    labels: Vec<String>,
-    input: Matrix,
-    output: Matrix,
-    /// Hierarchical softmax: per label, root-first (output row, code) pairs; code 1 takes
-    /// `sigmoid(row · h)`, code 0 its complement.
-    paths: Vec<Vec<(usize, bool)>>,
-    quant: bool,
+fn f32s(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
-/// FNV-1a with the int8 sign extension of `Dictionary::hash`.
-fn hash(s: &[u8]) -> u32 {
-    s.iter().fold(2166136261u32, |h, &c| {
-        (h ^ (c as i8 as i32 as u32)).wrapping_mul(16777619)
-    })
+fn rows(m: &Rows, dim: usize) -> usize {
+    match m {
+        Rows::Dense(v) => v.len() / dim,
+        Rows::Quant(q) => q.rows(),
+    }
 }
 
-impl FastText {
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        // SAFETY: read-only map of a model file nobody rewrites while it is loaded.
-        let map =
-            Bytes::Map(unsafe { Mmap::map(&f) }.map_err(|e| format!("{}: {e}", path.display()))?);
-        let mut r = Reader { b: &map, p: 0 };
-        if r.i32()? != MAGIC {
-            return Err(format!("{} is not a fastText model", path.display()));
-        }
-        let version = r.i32()?;
-        if version > VERSION {
-            return Err(format!("fastText model version {version} > {VERSION}"));
-        }
-        // Args::load
-        let dim = r.i32()? as usize;
-        let (_ws, _epoch, _min_count, _neg) = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
-        let word_ngrams = r.i32()?.max(1) as usize;
-        let loss = match r.i32()? {
-            1 => Loss::Hs,
-            2 => Loss::Ns,
-            3 => Loss::Softmax,
-            4 => Loss::Ova,
-            l => return Err(format!("fastText: unknown loss {l}")),
+/// Reads a `.bin`/`.ftz` supervised model.
+pub fn load(path: &Path) -> Result<BagModel, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: read-only map of a model file nobody rewrites while it is loaded.
+    let map = unsafe { Mmap::map(&f) }.map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut r = Reader { b: &map, p: 0 };
+    if r.i32()? != MAGIC {
+        return Err(format!("{} is not a fastText model", path.display()));
+    }
+    let version = r.i32()?;
+    if version > VERSION {
+        return Err(format!("fastText model version {version} > {VERSION}"));
+    }
+    // Args::load
+    let dim = r.i32()? as usize;
+    let (_ws, _epoch, _min_count, _neg) = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
+    let word_ngrams = r.i32()?.max(1) as usize;
+    // 1 hs, 2 ns, 3 softmax, 4 ova.
+    let loss = r.i32()?;
+    if !(1..=4).contains(&loss) {
+        return Err(format!("fastText: unknown loss {loss}"));
+    }
+    let model = r.i32()?;
+    let bucket = r.i32()?;
+    let (minn, mut maxn) = (r.i32()?, r.i32()?);
+    let (_lr_update, _t) = (r.i32()?, r.i64()?);
+    if model != 3 {
+        let name = match model {
+            1 => "cbow",
+            2 => "skipgram",
+            _ => "unknown",
         };
-        let model = r.i32()?;
-        let bucket = r.i32()?;
-        let (minn, mut maxn) = (r.i32()?, r.i32()?);
-        let (_lr_update, _t) = (r.i32()?, r.i64()?);
-        if model != 3 {
-            let name = match model {
-                1 => "cbow",
-                2 => "skipgram",
-                _ => "unknown",
-            };
-            return Err(format!(
-                "fastText model is not a classifier (model: {name})"
-            ));
-        }
-        if version == 11 {
-            maxn = 0; // old supervised models do not use char n-grams
-        }
-        // Dictionary::load
-        let size = r.i32()? as usize;
-        let nwords = r.i32()? as usize;
-        let nlabels = r.i32()? as usize;
-        let _ntokens = r.i64()?;
-        let prune_size = r.i64()?;
-        let mut words = Vec::with_capacity(size);
-        let mut counts = Vec::with_capacity(size);
-        let mut is_label = Vec::with_capacity(size);
-        let mut word2int = HashMap::with_capacity(size);
-        for i in 0..size {
-            let len = r.b[r.p..]
-                .iter()
-                .position(|&c| c == 0)
-                .ok_or("truncated fastText dictionary")?;
-            let w = r.take(len + 1)?[..len].to_vec();
-            counts.push(r.i64()?);
-            is_label.push(r.u8()? == 1);
-            word2int.entry(w.clone()).or_insert(i as i32);
-            words.push(w);
-        }
-        if nwords + nlabels != size || nlabels == 0 {
-            return Err(format!(
-                "fastText dictionary: {nwords} words + {nlabels} labels != {size}"
-            ));
-        }
-        let prune = if prune_size < 0 {
-            None
-        } else {
-            let mut m = HashMap::with_capacity(prune_size as usize);
-            for _ in 0..prune_size {
-                let (a, b) = (r.i32()?, r.i32()?);
-                m.insert(a, b);
-            }
-            Some(m)
-        };
-        let quant = r.u8()? != 0;
-        let input = Matrix::load(&mut r, quant, dim)?;
-        if !quant && prune.is_some() {
-            return Err("fastText: pruned dictionary with a dense input matrix".into());
-        }
-        let qout = r.u8()? != 0;
-        let output = Matrix::load(&mut r, quant && qout, dim)?;
-        let osz = output.rows();
-        // Every loss allocates `nlabels` output rows (hierarchical softmax uses the first n-1).
-        if osz != nlabels || (!quant && input.rows() != nwords + bucket as usize) {
-            return Err(format!(
-                "fastText: matrix shapes (input {}, output {osz}) do not match {nwords} words, {nlabels} labels, {bucket} buckets",
-                input.rows()
-            ));
-        }
-        // HierarchicalSoftmaxLoss::buildTree on the label counts, then each leaf's path.
-        let mut paths = Vec::new();
-        if loss == Loss::Hs {
-            let n = nlabels;
-            let mut count: Vec<i64> = vec![1_000_000_000_000_000; 2 * n - 1];
-            count[..n].copy_from_slice(&counts[nwords..]);
-            let mut parent = vec![usize::MAX; 2 * n - 1];
-            let mut binary = vec![false; 2 * n - 1];
-            let (mut leaf, mut node) = (n as i64 - 1, n);
-            for i in n..2 * n - 1 {
-                let mut mini = [0usize; 2];
-                for m in &mut mini {
-                    if leaf >= 0 && count[leaf as usize] < count[node] {
-                        *m = leaf as usize;
-                        leaf -= 1;
-                    } else {
-                        *m = node;
-                        node += 1;
-                    }
-                }
-                count[i] = count[mini[0]] + count[mini[1]];
-                parent[mini[0]] = i;
-                parent[mini[1]] = i;
-                binary[mini[1]] = true;
-            }
-            paths = (0..n)
-                .map(|mut node| {
-                    let mut p = Vec::new();
-                    while parent[node] != usize::MAX {
-                        p.push((parent[node] - n, binary[node]));
-                        node = parent[node];
-                    }
-                    p.reverse();
-                    p
-                })
-                .collect();
-        }
-        let labels = words[nwords..]
+        return Err(format!(
+            "fastText model is not a classifier (model: {name})"
+        ));
+    }
+    if version == 11 {
+        maxn = 0; // old supervised models do not use char n-grams
+    }
+    // Dictionary::load
+    let size = r.i32()? as usize;
+    let nwords = r.i32()? as usize;
+    let nlabels = r.i32()? as usize;
+    let _ntokens = r.i64()?;
+    let prune_size = r.i64()?;
+    let mut words = Vec::with_capacity(size);
+    let mut counts = Vec::with_capacity(size);
+    let mut is_label = Vec::with_capacity(size);
+    let mut word2int = HashMap::with_capacity(size);
+    for i in 0..size {
+        let len = r.b[r.p..]
             .iter()
-            .map(|w| String::from_utf8_lossy(w.strip_prefix(LABEL).unwrap_or(w)).into_owned())
-            .collect();
-        drop(r);
-        Ok(Self {
-            dim,
+            .position(|&c| c == 0)
+            .ok_or("truncated fastText dictionary")?;
+        let w = r.take(len + 1)?[..len].to_vec();
+        counts.push(r.i64()?);
+        is_label.push(r.u8()? == 1);
+        word2int.entry(w.clone()).or_insert(i as i32);
+        words.push(w);
+    }
+    if nwords + nlabels != size || nlabels == 0 {
+        return Err(format!(
+            "fastText dictionary: {nwords} words + {nlabels} labels != {size}"
+        ));
+    }
+    let prune = if prune_size < 0 {
+        None
+    } else {
+        let mut m = HashMap::with_capacity(prune_size as usize);
+        for _ in 0..prune_size {
+            let (a, b) = (r.i32()?, r.i32()?);
+            m.insert(a, b);
+        }
+        Some(m)
+    };
+    let quant = r.u8()? != 0;
+    let input = r.matrix(quant, dim)?;
+    if !quant && prune.is_some() {
+        return Err("fastText: pruned dictionary with a dense input matrix".into());
+    }
+    let qout = r.u8()? != 0;
+    let output = r.matrix(quant && qout, dim)?;
+    let osz = rows(&output, dim);
+    // Every loss allocates `nlabels` output rows (hierarchical softmax uses the first n-1).
+    if osz != nlabels || (!quant && rows(&input, dim) != nwords + bucket as usize) {
+        return Err(format!(
+            "fastText: matrix shapes (input {}, output {osz}) do not match {nwords} words, {nlabels} labels, {bucket} buckets",
+            rows(&input, dim)
+        ));
+    }
+    let output = match output {
+        Rows::Dense(v) => v,
+        Rows::Quant(q) => {
+            let mut v = vec![0f32; osz * dim];
+            for (i, row) in v.chunks_exact_mut(dim).enumerate() {
+                q.decode(i, row);
+            }
+            v
+        }
+    };
+    let head = match loss {
+        1 => Head::Tree(tree_paths(&counts[nwords..])),
+        3 => Head::Softmax,
+        _ => Head::Sigmoid,
+    };
+    let labels = words[nwords..]
+        .iter()
+        .map(|w| String::from_utf8_lossy(w.strip_prefix(LABEL).unwrap_or(w)).into_owned())
+        .collect();
+    Ok(BagModel {
+        vocab: Vocab {
+            nwords,
             bucket: bucket as u32,
             minn: minn as usize,
             maxn: maxn.max(0) as usize,
             word_ngrams,
-            loss,
             label: LABEL.to_vec(),
-            nwords,
             word2int,
             words,
             is_label,
             prune,
-            labels,
-            input,
-            output,
-            paths,
-            quant,
-            map,
-        })
-    }
+        },
+        dim,
+        input,
+        output,
+        head,
+        labels,
+    })
+}
 
-    /// A hierarchical-softmax model re-exported as `config.json` (args, labels, per-label
-    /// leaf-to-root `paths`/`codes`) + `vocab.json` (words in dictionary order) + `weights.pt`
-    /// (`input` `[nwords + bucket, dim]`, `output` rows): the script-langid leaf-surgery repos.
-    pub fn load_export(dir: &Path) -> Result<Self, String> {
-        let json = |f: &str| -> Result<serde_json::Value, String> {
-            let p = dir.join(f);
-            let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))
-        };
-        let cfg = json("config.json")?;
-        if cfg["architecture"] != "fasttext_hierarchical_softmax" {
+/// `HierarchicalSoftmaxLoss::buildTree` on the label counts, then each leaf's root-first path.
+fn tree_paths(counts: &[i64]) -> Vec<Vec<(usize, bool)>> {
+    let n = counts.len();
+    let mut count: Vec<i64> = vec![1_000_000_000_000_000; 2 * n - 1];
+    count[..n].copy_from_slice(counts);
+    let mut parent = vec![usize::MAX; 2 * n - 1];
+    let mut binary = vec![false; 2 * n - 1];
+    let (mut leaf, mut node) = (n as i64 - 1, n);
+    for i in n..2 * n - 1 {
+        let mut mini = [0usize; 2];
+        for m in &mut mini {
+            if leaf >= 0 && count[leaf as usize] < count[node] {
+                *m = leaf as usize;
+                leaf -= 1;
+            } else {
+                *m = node;
+                node += 1;
+            }
+        }
+        count[i] = count[mini[0]] + count[mini[1]];
+        parent[mini[0]] = i;
+        parent[mini[1]] = i;
+        binary[mini[1]] = true;
+    }
+    (0..n)
+        .map(|mut node| {
+            let mut p = Vec::new();
+            while parent[node] != usize::MAX {
+                p.push((parent[node] - n, binary[node]));
+                node = parent[node];
+            }
+            p.reverse();
+            p
+        })
+        .collect()
+}
+
+/// A hierarchical-softmax model re-exported as `config.json` (args, labels, per-label
+/// leaf-to-root `paths`/`codes`) + `vocab.json` (words in dictionary order) + `weights.pt`
+/// (`input` `[nwords + bucket, dim]`, `output` rows): the script-langid leaf-surgery repos.
+pub fn load_export(dir: &Path) -> Result<BagModel, String> {
+    let json = |f: &str| -> Result<serde_json::Value, String> {
+        let p = dir.join(f);
+        let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let cfg = json("config.json")?;
+    if cfg["architecture"] != "fasttext_hierarchical_softmax" {
+        return Err(format!(
+            "unsupported fastText export architecture {}",
+            cfg["architecture"]
+        ));
+    }
+    let a = &cfg["args"];
+    let int = |k: &str| {
+        a[k].as_u64()
+            .map(|v| v as usize)
+            .ok_or(format!("config.json: args.{k} missing"))
+    };
+    let (dim, minn, maxn, bucket, word_ngrams) = (
+        int("dim")?,
+        int("minn")?,
+        int("maxn")?,
+        int("bucket")?,
+        int("wordNgrams")?.max(1),
+    );
+    let strs = |v: &serde_json::Value, what: &str| -> Result<Vec<String>, String> {
+        v.as_array()
+            .ok_or(format!("{what} missing"))?
+            .iter()
+            .map(|s| {
+                s.as_str()
+                    .map(str::to_string)
+                    .ok_or(format!("{what}: not a string"))
+            })
+            .collect()
+    };
+    let labels = strs(&cfg["labels"], "config.json labels")?;
+    let words: Vec<Vec<u8>> = strs(&json("vocab.json")?, "vocab.json")?
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    let ints = |v: &serde_json::Value| -> Option<Vec<u64>> {
+        v.as_array()?.iter().map(|x| x.as_u64()).collect()
+    };
+    let (pa, co) = (cfg["paths"].as_array(), cfg["codes"].as_array());
+    let paths: Vec<Vec<(usize, bool)>> = match (pa, co) {
+        (Some(pa), Some(co)) if pa.len() == labels.len() && co.len() == labels.len() => pa
+            .iter()
+            .zip(co)
+            .map(|(p, c)| {
+                let (p, c) = (ints(p)?, ints(c)?);
+                // Stored leaf to root (fastText `paths_`); scored root first.
+                (p.len() == c.len()).then(|| {
+                    p.iter()
+                        .zip(&c)
+                        .rev()
+                        .map(|(&r, &c)| (r as usize, c == 1))
+                        .collect()
+                })
+            })
+            .collect::<Option<_>>()
+            .ok_or("config.json: malformed paths/codes")?,
+        _ => return Err("config.json: paths/codes must list one path per label".into()),
+    };
+    let (manifest, data) = crate::model::loaders::read_checkpoint(&dir.join("weights.pt"))?;
+    let tensor = |name: &str, rows: usize| -> Result<Vec<f32>, String> {
+        let t = manifest
+            .tensors
+            .get(name)
+            .ok_or(format!("weights.pt: no `{name}` tensor"))?;
+        if t.dtype != "F32" || t.shape.len() != 2 || t.shape[1] != dim || t.shape[0] < rows {
             return Err(format!(
-                "unsupported fastText export architecture {}",
-                cfg["architecture"]
+                "weights.pt: `{name}` is {} {:?}, expected F32 [{rows}, {dim}]",
+                t.dtype, t.shape
             ));
         }
-        let a = &cfg["args"];
-        let int = |k: &str| {
-            a[k].as_u64()
-                .map(|v| v as usize)
-                .ok_or(format!("config.json: args.{k} missing"))
-        };
-        let (dim, minn, maxn, bucket, word_ngrams) = (
-            int("dim")?,
-            int("minn")?,
-            int("maxn")?,
-            int("bucket")?,
-            int("wordNgrams")?.max(1),
-        );
-        let strs = |v: &serde_json::Value, what: &str| -> Result<Vec<String>, String> {
-            v.as_array()
-                .ok_or(format!("{what} missing"))?
-                .iter()
-                .map(|s| {
-                    s.as_str()
-                        .map(str::to_string)
-                        .ok_or(format!("{what}: not a string"))
-                })
-                .collect()
-        };
-        let labels = strs(&cfg["labels"], "config.json labels")?;
-        let words: Vec<Vec<u8>> = strs(&json("vocab.json")?, "vocab.json")?
-            .into_iter()
-            .map(String::into_bytes)
-            .collect();
-        let ints = |v: &serde_json::Value| -> Option<Vec<u64>> {
-            v.as_array()?.iter().map(|x| x.as_u64()).collect()
-        };
-        let (pa, co) = (cfg["paths"].as_array(), cfg["codes"].as_array());
-        let paths: Vec<Vec<(usize, bool)>> = match (pa, co) {
-            (Some(pa), Some(co)) if pa.len() == labels.len() && co.len() == labels.len() => pa
-                .iter()
-                .zip(co)
-                .map(|(p, c)| {
-                    let (p, c) = (ints(p)?, ints(c)?);
-                    // Stored leaf to root (fastText `paths_`); scored root first.
-                    (p.len() == c.len()).then(|| {
-                        p.iter()
-                            .zip(&c)
-                            .rev()
-                            .map(|(&r, &c)| (r as usize, c == 1))
-                            .collect()
-                    })
-                })
-                .collect::<Option<_>>()
-                .ok_or("config.json: malformed paths/codes")?,
-            _ => return Err("config.json: paths/codes must list one path per label".into()),
-        };
-        let (manifest, data) = crate::model::loaders::read_checkpoint(&dir.join("weights.pt"))?;
-        let tensor = |name: &str, rows: usize| -> Result<Matrix, String> {
-            let t = manifest
-                .tensors
-                .get(name)
-                .ok_or(format!("weights.pt: no `{name}` tensor"))?;
-            if t.dtype != "F32" || t.shape.len() != 2 || t.shape[1] != dim || t.shape[0] < rows {
-                return Err(format!(
-                    "weights.pt: `{name}` is {} {:?}, expected F32 [{rows}, {dim}]",
-                    t.dtype, t.shape
-                ));
-            }
-            Ok(Matrix::Dense {
-                off: t.byte_offset,
-                rows: t.shape[0],
-            })
-        };
-        let out_rows = paths
-            .iter()
-            .flatten()
-            .map(|&(r, _)| r + 1)
-            .max()
-            .unwrap_or(0);
-        let input = tensor("input", words.len() + bucket)?;
-        let output = tensor("output", out_rows)?;
-        let label = a["label"]
-            .as_str()
-            .unwrap_or("__label__")
-            .as_bytes()
-            .to_vec();
-        let word2int = words
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (w.clone(), i as i32))
-            .collect();
-        Ok(Self {
-            map: Bytes::Owned(data),
-            dim,
+        Ok(f32s(&data[t.byte_offset..][..t.shape[0] * dim * 4]))
+    };
+    let out_rows = paths
+        .iter()
+        .flatten()
+        .map(|&(r, _)| r + 1)
+        .max()
+        .unwrap_or(0);
+    let input = tensor("input", words.len() + bucket)?;
+    let output = tensor("output", out_rows)?;
+    let label = a["label"]
+        .as_str()
+        .unwrap_or("__label__")
+        .as_bytes()
+        .to_vec();
+    let word2int = words
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.clone(), i as i32))
+        .collect();
+    Ok(BagModel {
+        vocab: Vocab {
+            nwords: words.len(),
             bucket: bucket as u32,
             minn,
             maxn,
             word_ngrams,
-            loss: Loss::Hs,
             label,
-            nwords: words.len(),
             word2int,
             is_label: vec![false; words.len()],
             words,
             prune: None,
-            labels,
-            input,
-            output,
-            paths,
-            quant: false,
-        })
-    }
-
-    /// Label names without the `__label__` prefix, in output order.
-    pub fn labels(&self) -> &[String] {
-        &self.labels
-    }
-
-    pub fn summary(&self) -> String {
-        format!(
-            "fastText, {} labels, dim {}, loss {:?}{}",
-            self.labels.len(),
-            self.dim,
-            self.loss,
-            if self.quant { ", quantized" } else { "" }
-        )
-    }
-
-    /// `Dictionary::pushHash`.
-    fn push_hash(&self, line: &mut Vec<usize>, id: i32) {
-        let id = match &self.prune {
-            None => id,
-            Some(p) => match p.get(&id) {
-                Some(&j) => j,
-                None => return,
-            },
-        };
-        if id >= 0 {
-            line.push(self.nwords + id as usize);
-        }
-    }
-
-    /// `Dictionary::computeSubwords` over `<word>` (UTF-8 aware char n-grams).
-    fn subwords(&self, token: &[u8], line: &mut Vec<usize>) {
-        let w = [b"<", token, b">"].concat();
-        for i in 0..w.len() {
-            if w[i] & 0xC0 == 0x80 {
-                continue;
-            }
-            let (mut j, mut n) = (i, 1);
-            while j < w.len() && n <= self.maxn {
-                j += 1;
-                while j < w.len() && w[j] & 0xC0 == 0x80 {
-                    j += 1;
-                }
-                if n >= self.minn && !(n == 1 && (i == 0 || j == w.len())) {
-                    self.push_hash(line, (hash(&w[i..j]) % self.bucket) as i32);
-                }
-                n += 1;
-            }
-        }
-    }
-
-    /// Probability of every label (in `labels()` order) and the number of tokens read, as
-    /// `fasttext.predict(text, k=-1)` reports them: `p + 1e-5` (its `exp(log(p + 1e-5))`); labels
-    /// below its implicit threshold (hierarchical-softmax paths under 1e-5) are 0.
-    pub fn predict(&self, text: &str) -> Result<(Vec<f32>, usize), String> {
-        crate::hardware::cpu_compute::enter("fasttext::predict");
-        if text.contains('\n') {
-            return Err("fastText predicts one line at a time (remove '\\n')".into());
-        }
-        // getLine: whitespace tokens, then the `</s>` the trailing newline produces.
-        let tokens = text
-            .as_bytes()
-            .split(|c| SPACES.contains(c))
-            .filter(|t| !t.is_empty())
-            .chain([EOS]);
-        let (mut line, mut hashes, mut ntokens) = (Vec::new(), Vec::new(), 0);
-        for t in tokens {
-            ntokens += 1;
-            let h = hash(t);
-            let wid = self.word2int.get(t).copied();
-            let label = wid.map_or(t.starts_with(&self.label), |w| self.is_label[w as usize]);
-            if label {
-                continue;
-            }
-            match wid {
-                Some(w) => {
-                    line.push(w as usize);
-                    if self.maxn > 0 && t != EOS {
-                        self.subwords(&self.words[w as usize], &mut line);
-                    }
-                }
-                None if t != EOS => self.subwords(t, &mut line),
-                None => {}
-            }
-            hashes.push(h as i32);
-        }
-        // addWordNgrams: int32 hashes widen (sign-extended) to uint64.
-        for i in 0..hashes.len() {
-            let mut h = hashes[i] as i64 as u64;
-            for &hj in hashes.iter().take(i + self.word_ngrams).skip(i + 1) {
-                h = h.wrapping_mul(116049371).wrapping_add(hj as i64 as u64);
-                self.push_hash(&mut line, (h % self.bucket as u64) as i32);
-            }
-        }
-        if line.is_empty() {
-            return Err("fastText: the input has no known word or n-gram".into());
-        }
-        let mut hidden = vec![0f32; self.dim];
-        for &i in &line {
-            self.input.add_row(&self.map, &mut hidden, i);
-        }
-        let inv = (1.0 / line.len() as f64) as f32;
-        hidden.iter_mut().for_each(|v| *v *= inv);
-
-        let probs = match self.loss {
-            Loss::Hs => {
-                // HierarchicalSoftmaxLoss::dfs from the root with threshold 0: a branch whose
-                // log score falls under log(1e-5) is pruned (label absent → 0).
-                let floor = 1e-5f32.ln();
-                let mut sig = vec![None; self.output.rows()];
-                self.paths
-                    .iter()
-                    .map(|path| {
-                        let mut score = 0f32;
-                        for &(row, code) in path {
-                            if score < floor {
-                                return 0.0;
-                            }
-                            let f = *sig[row].get_or_insert_with(|| {
-                                1.0 / (1.0 + (-self.output.dot(&self.map, &hidden, row)).exp())
-                            });
-                            score += (if code { f } else { 1.0 - f } + 1e-5).ln();
-                        }
-                        if score < floor {
-                            0.0
-                        } else {
-                            score.exp()
-                        }
-                    })
-                    .collect()
-            }
-            loss => {
-                let mut out: Vec<f32> = (0..self.labels.len())
-                    .map(|i| self.output.dot(&self.map, &hidden, i))
-                    .collect();
-                if loss == Loss::Softmax {
-                    let m = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    out.iter_mut().for_each(|v| *v = (*v - m).exp());
-                    let z: f32 = out.iter().sum();
-                    out.iter_mut().for_each(|v| *v /= z);
-                } else {
-                    out.iter_mut().for_each(|v| *v = 1.0 / (1.0 + (-*v).exp()));
-                }
-                out.into_iter().map(|p| (p + 1e-5).ln().exp()).collect()
-            }
-        };
-        Ok((probs, ntokens))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fnv_sign_extension() {
-        // ASCII is plain FNV-1a; bytes >= 0x80 xor in a sign-extended int8.
-        assert_eq!(super::hash(b"a"), 0xe40c292c);
-        assert_eq!(
-            super::hash(&[0xc3]),
-            (2166136261u32 ^ 0xffff_ffc3).wrapping_mul(16777619)
-        );
-    }
+        },
+        dim,
+        input: Rows::Dense(input),
+        output,
+        head: Head::Tree(paths),
+        labels,
+    })
 }
 
 /// The fastText model file of `repo_id` (a repo without config.json): a cached `.bin`/`.ftz`
@@ -718,4 +432,115 @@ pub fn hub_file(hub: &crate::model::hub::HuggingFaceHub, repo_id: &str) -> Optio
         .find(|f| files.contains(f))
         .or_else(|| (files.len() == 1).then(|| files[0]))
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::hardware::{cpu_compute, Device};
+    use crate::runtime::bag::BagClassifier;
+
+    /// A version-12 supervised `.bin`: 5 words, 4 labels (counts 50/30/15/5 shape the tree), word
+    /// bigrams, char 2-3-grams, 64 buckets, dim 8; `quant` writes product-quantized input (with
+    /// norms) and output matrices (3 sub-quantizers of 3+3+2 dims).
+    fn write_bin(path: &std::path::Path, loss: i32, quant: bool) {
+        let (dim, bucket) = (8usize, 64i32);
+        let words = ["</s>", "the", "cat", "sat", "dog"];
+        let labels = ["__label__a", "__label__b", "__label__c", "__label__d"];
+        let counts = [20i64, 19, 18, 17, 16, 50, 30, 15, 5];
+        let mut b = Vec::new();
+        let i32s = |b: &mut Vec<u8>, v: &[i32]| v.iter().for_each(|x| b.extend(x.to_le_bytes()));
+        i32s(&mut b, &[super::MAGIC, 12]);
+        // dim ws epoch minCount neg wordNgrams loss model(sup) bucket minn maxn lrUpdateRate
+        i32s(&mut b, &[dim as i32, 5, 5, 1, 5, 2, loss, 3, bucket, 2, 3, 100]);
+        b.extend(1e-4f64.to_le_bytes());
+        let size = (words.len() + labels.len()) as i32;
+        i32s(&mut b, &[size, words.len() as i32, labels.len() as i32]);
+        b.extend(100i64.to_le_bytes()); // ntokens
+        b.extend((-1i64).to_le_bytes()); // pruneidx_size: not pruned
+        for (i, w) in words.iter().chain(&labels).enumerate() {
+            b.extend_from_slice(w.as_bytes());
+            b.push(0);
+            b.extend(counts[i].to_le_bytes());
+            b.push((i >= words.len()) as u8);
+        }
+        let mut rng = crate::arch::testing::Rng(0xEE ^ loss as u64);
+        let mut f32s = |b: &mut Vec<u8>, n: usize, scale: f32| {
+            (0..n).for_each(|_| b.extend((rng.unit() * scale).to_le_bytes()))
+        };
+        let mut bytes = crate::arch::testing::Rng(0xC0DE);
+        let mut matrix = |b: &mut Vec<u8>, rows: usize, scale: f32, qnorm: bool| {
+            b.push(quant as u8);
+            if !quant {
+                b.extend((rows as i64).to_le_bytes());
+                b.extend((dim as i64).to_le_bytes());
+                f32s(b, rows * dim, scale);
+                return;
+            }
+            b.push(qnorm as u8);
+            b.extend((rows as i64).to_le_bytes());
+            b.extend((dim as i64).to_le_bytes());
+            i32s(b, &[rows as i32 * 3]);
+            (0..rows * 3).for_each(|_| b.push(bytes.next_u64() as u8));
+            i32s(b, &[dim as i32, 3, 3, 2]);
+            f32s(b, dim * 256, scale);
+            if qnorm {
+                (0..rows).for_each(|_| b.push(bytes.next_u64() as u8));
+                i32s(b, &[1, 1, 1, 1]);
+                f32s(b, 256, 1.0);
+            }
+        };
+        matrix(&mut b, words.len() + bucket as usize, 1.0, true);
+        matrix(&mut b, labels.len(), 2.0, false);
+        std::fs::write(path, b).unwrap();
+    }
+
+    /// (loss, quantized) cases: hierarchical softmax dense / quantized, one-vs-all quantized,
+    /// negative sampling dense.
+    const CASES: [(i32, bool); 4] = [(1, false), (1, true), (4, true), (2, false)];
+    const TEXTS: [&str; 2] = ["the cat sat", "a dog sat on the mat"];
+
+    /// `FastText::predict` of the pre-spec host implementation (commit 251be4c) on [`write_bin`]
+    /// fixtures, per case then text: (token count, probabilities).
+    const OLD: [[(usize, [f32; 4]); 2]; 4] = [
+        [(4, [0.42800388, 0.16871147, 0.18828341, 0.2150408]), (7, [0.40358174, 0.20235285, 0.20580043, 0.18830487])],
+        [(4, [0.5223296, 0.26141247, 0.08643455, 0.12985727]), (7, [0.48707005, 0.25290027, 0.1278607, 0.1322044])],
+        [(4, [0.46248654, 0.4656299, 0.52239984, 0.48894987]), (7, [0.46962076, 0.49344978, 0.46248892, 0.49561393])],
+        [(4, [0.6089103, 0.44071913, 0.3434737, 0.61539763]), (7, [0.4875182, 0.5094922, 0.41907105, 0.69172555])],
+    ];
+
+    /// Hierarchical softmax (dense, quantized), one-vs-all (quantized input and output) and
+    /// negative sampling read from `.bin` files and run on the bag runtime match the old host
+    /// scores on every device; the Metal leg enters no CPU compute.
+    #[test]
+    fn bag_runtime_matches_old_host_scores() {
+        let dir = std::env::temp_dir().join(format!("gibbs_ft_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut devs = vec![Device::Cpu];
+        if crate::hardware::available_devices().contains(&Device::Metal) {
+            devs.push(Device::Metal);
+        }
+        for dev in devs {
+            for ((loss, quant), old) in CASES.into_iter().zip(OLD) {
+                let p = dir.join(format!("m{loss}{quant}.bin"));
+                write_bin(&p, loss, quant);
+                let c = BagClassifier::new("fasttext", super::load(&p).unwrap(), dev).unwrap();
+                assert_eq!(c.labels(), ["a", "b", "c", "d"]);
+                for (t, (n_old, p_old)) in TEXTS.into_iter().zip(old) {
+                    let entered = cpu_compute::entered();
+                    let (p, n) = c.predict(t).unwrap();
+                    if dev == Device::Metal {
+                        assert_eq!(cpu_compute::entered(), entered, "Metal leg ran CPU compute");
+                    }
+                    assert_eq!(n, n_old);
+                    for (g, w) in p.iter().zip(p_old) {
+                        assert!(
+                            (g - w).abs() <= 1e-4 * w.abs() + 1e-6,
+                            "{dev:?} loss {loss} quant {quant} {t:?}: {p:?} vs {p_old:?}"
+                        );
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

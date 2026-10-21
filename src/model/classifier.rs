@@ -153,8 +153,8 @@ enum Body {
     SetFit(setfit::SetFit),
     /// llama.cpp BERT-family GGUF with a `cls.output` head.
     Gguf(GgufClassifier),
-    /// fastText supervised model: `predict` already returns probabilities.
-    FastText(crate::model::fasttext::FastText),
+    /// fastText supervised model on the bag runtime: `predict` already returns probabilities.
+    FastText(crate::runtime::bag::BagClassifier),
 }
 
 /// A decoder body for `*ForSequenceClassification`: HF scores the final-norm hidden state of the
@@ -814,15 +814,18 @@ impl SequenceClassifier {
     /// A fastText `.bin`/`.ftz` classifier, or (when `path` is a directory) a fastText
     /// hierarchical-softmax re-export (`config.json` + `vocab.json` + `weights.pt`).
     pub fn from_fasttext(repo_id: &str, path: &Path) -> Result<Self, String> {
-        // fastText is host-only (hashed n-gram bag + tree softmax): refuse once the GPU-only tripwire is armed.
-        if crate::hardware::cpu_compute::banned() {
-            return Err("gpu-only: fastText classifiers have no Metal program; run with --backend cpu".into());
-        }
-        let ft = if path.is_dir() {
-            crate::model::fasttext::FastText::load_export(path)?
+        // The graph runs on the CPU, or on Metal once the GPU-only tripwire is armed.
+        let dev = if crate::hardware::cpu_compute::banned() {
+            Device::Metal
         } else {
-            crate::model::fasttext::FastText::load(path)?
+            Device::Cpu
         };
+        let m = if path.is_dir() {
+            crate::model::fasttext::load_export(path)?
+        } else {
+            crate::model::fasttext::load(path)?
+        };
+        let ft = crate::runtime::bag::BagClassifier::new("fasttext", m, dev)?;
         Ok(Self {
             repo_id: repo_id.to_string(),
             architecture: "fastText".into(),
@@ -856,6 +859,7 @@ impl SequenceClassifier {
             Body::SetFit(s) => s.device(),
             Body::Gguf(g) => g.device(),
             Body::Gpu { .. } => Device::Metal,
+            Body::FastText(b) => b.device(),
             Body::Decoder { gpu: true, .. } => Device::Metal,
             _ => Device::Cpu,
         }
