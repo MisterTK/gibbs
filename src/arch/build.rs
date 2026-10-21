@@ -144,7 +144,9 @@ pub fn build_network(
         // `{repeat: var, count: expr, name: "x.{var}"}`: one output per index.
         let rep = match o.get("repeat").and_then(J::as_str) {
             Some(var) => {
-                let n = b.eval(o.get("count").ok_or("output `repeat` needs `count`")?)?.usize()?;
+                let n = b
+                    .eval(o.get("count").ok_or("output `repeat` needs `count`")?)?
+                    .usize()?;
                 Some((var.to_string(), n))
             }
             None => None,
@@ -490,7 +492,15 @@ impl<'a> Builder<'a> {
         if !self.gathered.contains(&w) || self.g.value(w).kind != ValueKind::Weight {
             return w;
         }
-        self.weight(&format!("{name}{LINEAR_COPY}")).unwrap_or(w)
+        let copy = format!("{name}{LINEAR_COPY}");
+        if self
+            .src
+            .tensor(&copy)
+            .is_none_or(|(_, dt)| dt == self.g.value(w).dtype)
+        {
+            return w;
+        }
+        self.weight(&copy).unwrap_or(w)
     }
 
     fn node_name(&self, m: &Map<String, J>, out: &str) -> Result<String, String> {
@@ -948,13 +958,20 @@ mod tests {
             .map(|(p, s)| (p.to_string(), s.to_string()))
             .chain([("families/aq.json5".into(), spec.into())])
             .collect();
-        let s = Registry::from_files(&files, &[]).unwrap().spec("aq", &Signals::default()).unwrap();
+        let s = Registry::from_files(&files, &[])
+            .unwrap()
+            .spec("aq", &Signals::default())
+            .unwrap();
         let inst = build(&s, "t", &Cfg, &Qp, &[("rows", Val::Num(2.0))]).unwrap();
         let mut w = crate::graph::Weights::new();
         w.insert("act_quant.qp", crate::graph::Tensor::F32(vec![127.0]));
         let x = vec![127.0, 0.5, 2.5, -1.5, -127.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let out = crate::graph::cpu::run_stateless(&inst.graph, &w, vec![crate::graph::Tensor::F32(x)]).unwrap();
-        let crate::graph::Tensor::F32(y) = &out[0] else { panic!("dtype") };
+        let out =
+            crate::graph::cpu::run_stateless(&inst.graph, &w, vec![crate::graph::Tensor::F32(x)])
+                .unwrap();
+        let crate::graph::Tensor::F32(y) = &out[0] else {
+            panic!("dtype")
+        };
         assert_eq!(y, &[127.0, 0.0, 2.0, -2.0, -127.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     }
 }

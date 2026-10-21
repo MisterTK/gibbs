@@ -117,6 +117,8 @@ struct RawTensor {
     kind: Kind,
     /// From the multimodal projector beside the weights ([`index_sidecar`]).
     sidecar: bool,
+    /// Stored as IEEE/bf16 floats (not GGUF blocks or MLX/EXL3/GLQ packed integer tensors).
+    raw_float: bool,
 }
 
 /// An opened checkpoint: signals for matching, scopes for expressions, raw tensors.
@@ -438,6 +440,7 @@ fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData, sidecar: boo
                 shape,
                 kind,
                 sidecar,
+                raw_float: !container,
             },
         );
     }
@@ -462,6 +465,8 @@ fn index_weights(ck: &mut Checkpoint, w: Weights) {
     let w = Arc::new(w);
     let names: Vec<String> = w.names().map(String::from).collect();
     for name in names {
+        let raw_float = w.packed_gguf(&name).is_none()
+            && matches!(w.stored_dtype(&name), Some("F32" | "F16" | "BF16"));
         let (shape, kind) = match w.packed_gguf(&name) {
             Some(p) if gathers_on_device(p.format) => (p.shape.clone(), Kind::of_format(p.format)),
             Some(p) => (p.shape.clone(), Kind::F16),
@@ -483,6 +488,7 @@ fn index_weights(ck: &mut Checkpoint, w: Weights) {
                 shape,
                 kind,
                 sidecar: false,
+                raw_float,
             },
         );
     }
@@ -948,9 +954,13 @@ impl WeightStore {
     fn reencodable(&self, n: &Node, k: Kind) -> bool {
         n.shape.len() == 2
             && self.reencode.force.is_none()
+            && n.kind == k
             && match k {
-                Kind::Packed(_) => n.kind == k,
-                Kind::F32 | Kind::F16 | Kind::Bf16 => !n.conv && !matches!(n.src, Src::Gen(_)),
+                Kind::Packed(_) => true,
+                Kind::F32 | Kind::F16 | Kind::Bf16 => {
+                    !n.conv
+                        && matches!(&n.src, Src::Raw(r) if self.ckpt.raw.get(r).is_some_and(|t| t.raw_float))
+                }
                 Kind::U32 => false,
             }
     }
@@ -1062,10 +1072,6 @@ impl WeightStore {
         };
         match &n.src {
             Src::Raw(r) => self.ckpt.raw_packed(r),
-            Src::Xf { op, ins, .. } if op == "reshape" => Ok(Packed {
-                shape: n.shape.clone(),
-                ..self.packed(&ins[0])?
-            }),
             Src::Xf { op, args, ins, .. } if op == "untile_packed_rows" => {
                 let p = self.packed(&ins[0])?;
                 let (rows, cols) = rows_cols(&n.shape);
@@ -1187,9 +1193,12 @@ impl WeightStore {
             .map(|(r, _)| r)
             .filter(|r| !fed.contains(*r) && !companion(r))
             .filter(|r| {
-                !ignore
-                    .iter()
-                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|cs| cs.iter().any(|c| glob(g, c))))
+                !ignore.iter().any(|g| {
+                    glob(g, r)
+                        || canonical
+                            .get(r.as_str())
+                            .is_some_and(|cs| cs.iter().any(|c| glob(g, c)))
+                })
             })
             .cloned()
             .collect()
@@ -1614,7 +1623,7 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
         // matrices); packed blocks stay as stored.
         "to_bf16" if matches!(k, Kind::Packed(_)) => k,
         "to_bf16" => Kind::Bf16,
-        "untile_packed_rows" => k,
+        "untile_packed_rows" | "reshape" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
     }
@@ -2087,7 +2096,11 @@ fn load_from(
         match i {
             Ignore::Glob(g) => ignore.push(g.clone()),
             Ignore::When { glob, when } => {
-                if env.eval(&J::String(when.clone())).map_err(|e| fam(format!("ignore `{glob}`: {e}")))?.truthy() {
+                if env
+                    .eval(&J::String(when.clone()))
+                    .map_err(|e| fam(format!("ignore `{glob}`: {e}")))?
+                    .truthy()
+                {
                     ignore.push(glob.clone());
                 }
             }
@@ -3097,7 +3110,10 @@ mod tests {
         );
         // A `values(name)` read (a build-time constant) consumes the tensor.
         assert_eq!(m.env.values("used.bias"), Some(vec![1.0]));
-        assert_eq!(m.store.unconsumed(&used, &ignore), ["maybe.b", "unused.weight"]);
+        assert_eq!(
+            m.store.unconsumed(&used, &ignore),
+            ["maybe.b", "unused.weight"]
+        );
     }
 
     #[test]

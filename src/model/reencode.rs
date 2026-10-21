@@ -436,7 +436,13 @@ pub fn weight_bytes(w: &QuantizedWeight) -> usize {
 
 /// Encodes row-major `w` as `f` (a float or an encodable block format whose blocks tile `in_f`),
 /// splitting rows over `threads` workers at utility QoS; row chunks concatenate exactly.
-pub(crate) fn encode_weight(w: &[f32], in_f: usize, out_f: usize, f: Q, threads: usize) -> QuantizedWeight {
+pub(crate) fn encode_weight(
+    w: &[f32],
+    in_f: usize,
+    out_f: usize,
+    f: Q,
+    threads: usize,
+) -> QuantizedWeight {
     if f == Q::FP32 {
         return QuantizedWeight::Uncompressed {
             data: w.to_vec(),
@@ -634,8 +640,8 @@ fn is_ffn_name(name: &str) -> bool {
 
 /// Gather tables (token / per-layer embeddings, which a tied head shares) keep their source blocks:
 /// a gathered row's precision is not a streaming cost.
-fn is_gather_table(name: &str) -> bool {
-    !name.ends_with(crate::arch::build::LINEAR_COPY)
+fn is_gather_table(name: &str, float_src: bool) -> bool {
+    (!float_src || !name.ends_with(crate::arch::build::LINEAR_COPY))
         && ["embed", "token_embd", "ple"]
             .iter()
             .any(|s| name.contains(s))
@@ -662,7 +668,7 @@ pub fn reencode_native(
     cols: usize,
     raw: &[u8],
 ) -> Option<(Q, Vec<u8>)> {
-    let f = target(cfg, name, src, cols)?;
+    let f = target(cfg, name, src, cols, false)?;
     // The source's own decoder, so the values are exactly what the GPU would have read.
     encode_blocks(name, src, f, rows, cols, raw, gguf_block_codec(src)?)
 }
@@ -677,7 +683,7 @@ pub fn reencode_values(
     cols: usize,
     data: impl FnOnce() -> Option<Vec<f32>>,
 ) -> Option<(Q, Vec<u8>)> {
-    let f = target(cfg, name, src, cols)?;
+    let f = target(cfg, name, src, cols, true)?;
     let raw: Vec<u8> = data()?.iter().flat_map(|x| x.to_le_bytes()).collect();
     fn f32_block(b: &[u8], out: &mut [f32]) {
         for (o, c) in out.iter_mut().zip(b.chunks_exact(4)) {
@@ -693,12 +699,13 @@ fn target(
     name: &str,
     src: Q,
     cols: usize,
+    float_src: bool,
 ) -> Option<Q> {
     let ffn = match &cfg.ffn_weights {
         Some(pats) => pats.iter().any(|p| crate::arch::glob(p, name)),
         None => is_ffn_name(name),
     };
-    if is_gather_table(name) || (cfg.ffn_only && !ffn) {
+    if is_gather_table(name, float_src) || (cfg.ffn_only && !ffn) {
         return None;
     }
     let mut stats = NATIVE_STATS.lock();
@@ -738,10 +745,14 @@ fn encode_blocks(
     // `f`'s relative RMSE over the tensor, and with `keep` its blocks (`None`: no block format).
     let mut encode = |f: Q, keep: bool| {
         let mut err = (0.0, 0.0);
-        let mut blocks = (keep && !is_float(f)).then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
+        let mut blocks =
+            (keep && !is_float(f)).then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
         for part in raw.chunks(run * row_bytes) {
             let x = &mut x[..part.len() / block_bytes * elems];
-            for (b, out) in part.chunks_exact(block_bytes).zip(x.chunks_exact_mut(elems)) {
+            for (b, out) in part
+                .chunks_exact(block_bytes)
+                .zip(x.chunks_exact_mut(elems))
+            {
                 decode(b, out);
             }
             let w = encode_weight(x, cols, x.len() / cols, f, threads);
@@ -1036,14 +1047,35 @@ mod tests {
     /// Smaller is not faster: slow Q4_K (4.5/100) loses to the larger Q5_K (5.5/240); once Q4_K is fast it wins back.
     #[test]
     fn max_speed_picks_min_bytes_over_gbps_not_min_bytes() {
-        let slow_q4k = |f: Q| if f == Q::GGUF_Q4_K_M { Some(100.0) } else { rates(f) };
+        let slow_q4k = |f: Q| {
+            if f == Q::GGUF_Q4_K_M {
+                Some(100.0)
+            } else {
+                rates(f)
+            }
+        };
         // Q4_K 4.5/100 = .045; Q8_0 8.5/380 = .0224; Q4_0 4.5/300 = .015 is best of all.
-        assert_eq!(rule_with(MaxSpeed, Q::BF16, &slow_q4k), Target::Encode(Q::GGUF_Q4_0));
+        assert_eq!(
+            rule_with(MaxSpeed, Q::BF16, &slow_q4k),
+            Target::Encode(Q::GGUF_Q4_0)
+        );
         // Without Q4_0: Q5_K (5.5/240) beats slow Q4_K; Q8_0 (8.5/380) is inside the noise margin of it.
         let no_q4_0 = |f: Q| if f == Q::GGUF_Q4_0 { None } else { slow_q4k(f) };
-        assert_eq!(rule_with(MaxSpeed, Q::BF16, &no_q4_0), Target::Encode(Q::GGUF_Q5_K_M));
-        let fast_q4k = |f: Q| if f == Q::GGUF_Q4_K_M { Some(400.0) } else { no_q4_0(f) };
-        assert_eq!(rule_with(MaxSpeed, Q::BF16, &fast_q4k), Target::Encode(Q::GGUF_Q4_K_M));
+        assert_eq!(
+            rule_with(MaxSpeed, Q::BF16, &no_q4_0),
+            Target::Encode(Q::GGUF_Q5_K_M)
+        );
+        let fast_q4k = |f: Q| {
+            if f == Q::GGUF_Q4_K_M {
+                Some(400.0)
+            } else {
+                no_q4_0(f)
+            }
+        };
+        assert_eq!(
+            rule_with(MaxSpeed, Q::BF16, &fast_q4k),
+            Target::Encode(Q::GGUF_Q4_K_M)
+        );
     }
 
     #[test]
@@ -1180,7 +1212,10 @@ mod tests {
             ] {
                 assert_eq!(rule(MaxSpeed, src), Target::Native, "{src:?}");
             }
-            assert_eq!(rule(MaxSpeed, Q::TurboQuant), Target::Encode(Q::GGUF_Q4_K_M));
+            assert_eq!(
+                rule(MaxSpeed, Q::TurboQuant),
+                Target::Encode(Q::GGUF_Q4_K_M)
+            );
             // LowBitNative: float -> Q8_0; codec-less -> smallest ladder format >= source bpw.
             for src in [Q::BF16, Q::FP16, Q::FP32] {
                 assert_eq!(rule(LowBitNative, src), Target::Encode(Q::GGUF_Q8_0));
@@ -1194,7 +1229,10 @@ mod tests {
             for src in [Q::BF16, Q::FP32, Q::GGUF_Q8_0, Q::GGUF_Q4_0] {
                 assert_eq!(rule(BitExact, src), Target::Native);
             }
-            assert_eq!(rule(BitExact, Q::TurboQuant), Target::Encode(Q::GGUF_Q4_K_M));
+            assert_eq!(
+                rule(BitExact, Q::TurboQuant),
+                Target::Encode(Q::GGUF_Q4_K_M)
+            );
         });
     }
 
@@ -1504,7 +1542,9 @@ mod tests {
                 (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
             })
             .collect();
-        let QuantizedWeight::GgufQuantized { raw_data: raw, .. } = encode_weight(&w, cols, rows, src, 4) else {
+        let QuantizedWeight::GgufQuantized { raw_data: raw, .. } =
+            encode_weight(&w, cols, rows, src, 4)
+        else {
             panic!("Q8_0 encodes to blocks");
         };
         let cfg = crate::model::weight_format::ReencodeConfig {
@@ -1514,26 +1554,41 @@ mod tests {
         };
         // The whole-tensor procedure the row runs replace.
         let whole = || -> Option<(Q, Vec<u8>)> {
-            let Target::Encode(f) = rule(cfg.policy, src) else { return None };
+            let Target::Encode(f) = rule(cfg.policy, src) else {
+                return None;
+            };
             let f = fit(f, cols, Q::FP32);
             let (elems, block_bytes, decode) = gguf_block_codec(src)?;
             let mut data = vec![0.0f32; rows * cols];
-            for (b, o) in raw.chunks_exact(block_bytes).zip(data.chunks_exact_mut(elems)) {
+            for (b, o) in raw
+                .chunks_exact(block_bytes)
+                .zip(data.chunks_exact_mut(elems))
+            {
                 decode(b, o);
             }
             let (mut f, mut q) = (f, encode_weight(&data, cols, rows, f, 4));
             while relative_rmse(&data, &q.to_f32()) > TENSOR_RMSE_LIMIT {
-                let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else { break };
+                let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
+                    break;
+                };
                 (f, q) = (next, encode_weight(&data, cols, rows, next, 4));
             }
             if !beats_source(f, src, &crate::model::variant::host_gbps) {
                 return None;
             }
-            let QuantizedWeight::GgufQuantized { raw_data, .. } = q else { return None };
+            let QuantizedWeight::GgufQuantized { raw_data, .. } = q else {
+                return None;
+            };
             Some((f, raw_data.to_vec()))
         };
         let want = whole();
-        assert!(want.is_some(), "MaxSpeed re-stores Q8_0 here: the test compares blocks");
-        assert_eq!(reencode_native(&cfg, "layers.0.mlp.up.weight", src, rows, cols, &raw), want);
+        assert!(
+            want.is_some(),
+            "MaxSpeed re-stores Q8_0 here: the test compares blocks"
+        );
+        assert_eq!(
+            reencode_native(&cfg, "layers.0.mlp.up.weight", src, rows, cols, &raw),
+            want
+        );
     }
 }
