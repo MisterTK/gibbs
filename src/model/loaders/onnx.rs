@@ -933,7 +933,6 @@ pub(crate) const FP4_LUT: [f32; 16] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::QuantMode;
     use crate::model::hub::ModelArtifacts;
     use crate::model::UniversalModelLoader;
     use std::path::PathBuf;
@@ -1147,8 +1146,16 @@ mod tests {
         }
     }
 
+    /// `artifacts` through the family-spec loader (`runtime::lm::SpecLm`, detected family).
+    fn spec_lm(mut artifacts: ModelArtifacts) -> crate::scheduler::ExecutableModel {
+        artifacts.local_dir = artifacts.config_path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf);
+        let reg = crate::arch::registry().unwrap();
+        let mode = crate::hardware::PlacementMode::Auto;
+        crate::scheduler::ExecutableModel::Native(crate::runtime::lm::load(&artifacts, reg, None, mode).unwrap())
+    }
+
     /// The f32 ONNX export and its safetensors original produce the same greedy tokens through
-    /// `hf_loader::load_causal_lm` (each repo with its own config.json / tokenizer.json).
+    /// the spec loader (each repo with its own config.json / tokenizer.json).
     #[test]
     fn onnx_f32_greedy_matches_safetensors_original() {
         let pairs = [(
@@ -1164,7 +1171,7 @@ mod tests {
                 weights_path: Some(dir.join(weights)),
                 ..Default::default()
             };
-            crate::model::hf_loader::load_causal_lm(&artifacts, QuantMode::Uncompressed).unwrap()
+            spec_lm(artifacts)
         };
         for (orig, repo) in pairs {
             let onnx = PathBuf::from(repo).join("onnx/model.onnx");
@@ -1181,14 +1188,11 @@ mod tests {
                 load(orig, "model.safetensors"),
                 load(repo, "onnx/model.onnx"),
             ] {
-                let prompt = llm.tokenizer.apply_chat_template(&msg);
-                let ids = llm.tokenizer.encode(&prompt);
-                let answer = llm.generate_text(&prompt, 24, 0.0);
-                println!(
-                    "{}: {} prompt tokens -> {answer:?}",
-                    llm.tokenizer.vocab_size(),
-                    ids.len()
-                );
+                let tok = llm.tokenizer();
+                let prompt = tok.apply_chat_template(&msg);
+                let ids = tok.encode(&prompt);
+                let answer = llm.generate_text_measured_plain(&prompt, 24, 0.0).unwrap().0;
+                println!("{}: {} prompt tokens -> {answer:?}", tok.vocab_size(), ids.len());
                 outs.push((ids, answer));
             }
             assert_eq!(outs[0].0, outs[1].0, "{repo}: prompt tokens differ");
@@ -1196,7 +1200,7 @@ mod tests {
         }
     }
 
-    /// Greedy chat through the normal loader (`hf_loader::load_causal_lm`, weights = .onnx).
+    /// Greedy chat through the spec loader (weights = .onnx).
     #[test]
     fn onnx_greedy_chat_is_coherent() {
         let cases = [
@@ -1221,12 +1225,11 @@ mod tests {
                 weights_path: Some(weights),
                 ..Default::default()
             };
-            let llm = crate::model::hf_loader::load_causal_lm(&artifacts, QuantMode::Uncompressed)
-                .unwrap();
+            let llm = spec_lm(artifacts);
             let prompt = llm
-                .tokenizer
+                .tokenizer()
                 .apply_chat_template(&[("user", "What is the capital of France?")]);
-            let answer = llm.generate_text(&prompt, 16, 0.0);
+            let answer = llm.generate_text_measured_plain(&prompt, 16, 0.0).unwrap().0;
             println!("{repo} {variant}: {answer:?}");
             assert!(answer.contains(want), "{variant}: {answer:?}");
         }

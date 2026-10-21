@@ -234,7 +234,10 @@ fn load_native_once(
             Some(crate::model::qwen3_5::load_dense(artifacts, &cfg, mode))
         }
         "gemma4" | "gemma4_unified" => Some(crate::model::gemma4::load(artifacts, &cfg, mode)),
-        "idefics3" | "smolvlm" => Some(crate::model::idefics3::load(artifacts, &cfg, mode)),
+        // `GIBBS_SPEC_LM=1`: the `idefics3` spec (`runtime::lm::SpecLm` + media) instead.
+        "idefics3" | "smolvlm" if !crate::arch::dispatch::spec_lm_enabled() => {
+            Some(crate::model::idefics3::load(artifacts, &cfg, mode))
+        }
         t => crate::arch::unsupported(t).map(|why| Err(format!("{t}: {why}"))),
     }
 }

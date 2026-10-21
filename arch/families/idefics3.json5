@@ -1,0 +1,156 @@
+// Idefics3 / SmolVLM: SigLIP vision tower + pixel-shuffle connector + llama text model
+// (`model.text_model.*`, renamed onto llama's `model.*`). Images are resized to a longest edge,
+// cut into `max_image_size` tiles plus a global view (`tile_longest_edge`), and each tile's
+// `(grid / scale)^2` connector rows replace the `<image>` tokens of the tiled prompt text
+// (`grid_text`).
+{
+  family: "idefics3",
+  extends: "llama",
+  match: {hf_model_type: ["idefics3", "smolvlm"], hf_architectures: ["Idefics3ForConditionalGeneration"], gguf_arch: [], fallback: false},
+  names: {use: [], rules: [["model.text_model.{r:*}", "model.{r}"]]},
+  config: {
+    // Text (`text_config`).
+    hidden: "cfg.text_config.hidden_size",
+    layers: "cfg.text_config.num_hidden_layers",
+    heads: "cfg.text_config.num_attention_heads",
+    kv_heads: "first(cfg.text_config.num_key_value_heads, heads)",
+    head_dim: "first(cfg.text_config.head_dim, hidden // heads)",
+    inter: "cfg.text_config.intermediate_size",
+    eps: "first(cfg.text_config.rms_norm_eps, 1e-5)",
+    act: "first(cfg.text_config.hidden_act, 'silu') == 'silu' ? 'Silu' : 'GeluTanh'",
+    theta: "first(cfg.text_config.rope_theta, 10000)",
+    rotary_pct: "1",
+    rope_type: "first(cfg.text_config.rope_scaling.rope_type, cfg.text_config.rope_scaling.type, 'default')",
+    ctx: "first(runtime.ctx, min(first(cfg.text_config.max_position_embeddings, 2048), 4096))",
+    aq_bits: "0",
+    ternarize: "false",
+    // Vision (`vision_config` stores only fields that differ from `Idefics3VisionConfig`).
+    v_hidden: "first(cfg.vision_config.hidden_size, 1152)",
+    v_inter: "first(cfg.vision_config.intermediate_size, 3072)",
+    v_layers: "first(cfg.vision_config.num_hidden_layers, 12)",
+    v_heads: "first(cfg.vision_config.num_attention_heads, 16)",
+    v_size: "first(cfg.vision_config.image_size, 224)",
+    v_patch: "first(cfg.vision_config.patch_size, 32)",
+    v_eps: "first(cfg.vision_config.layer_norm_eps, 1e-6)",
+    v_grid: "v_size // v_patch",
+    v_n: "v_grid * v_grid",
+    shuffle: "first(cfg.scale_factor, 2)",
+    tokens_per_tile: "v_n // (shuffle * shuffle)",
+  },
+  checks: [
+    {expr: "first(cfg.vision_config.hidden_act, 'gelu_pytorch_tanh') != 'gelu_pytorch_tanh'", error: "SigLIP hidden_act {cfg.vision_config.hidden_act} is not supported"},
+    {expr: "v_size % v_patch != 0 || v_grid % shuffle != 0", error: "scale_factor {shuffle} does not divide the {v_grid}-patch grid"},
+    {expr: "json.preprocessor_config.max_image_size.longest_edge != v_size", error: "max_image_size {json.preprocessor_config.max_image_size.longest_edge} differs from the vision encoder's image_size {v_size}"},
+    {expr: "!contains([1, 3], first(json.preprocessor_config.resample, 1))", error: "preprocessor_config.json: resample {json.preprocessor_config.resample} unsupported (1 LANCZOS, 3 BICUBIC)"},
+  ],
+  components: {
+    // `[tiles, 3, S, S]` normalized tiles → `[tiles * tokens_per_tile, hidden]` text-space rows.
+    vision: {
+      vars: ["tiles"],
+      inputs: [
+        {name: "pixels", dtype: "f32", shape: ["tiles", 3, "v_size", "v_size"]},
+        {name: "pos_ids", dtype: "u32", shape: ["v_n"], gen: "iota", args: {n: "v_n"}},
+      ],
+      body: [
+        {let: {v: "'model.vision_model'"}},
+        {op: "Embedding", in: ["w:{v}.embeddings.position_embedding.weight", "i:pos_ids"], out: "pe", name: "vision.pos"},
+        // Patch embedding per tile (Conv2d is unbatched), tiles stacked as rows.
+        {repeat: "t", count: "tiles", body: [
+          {op: "Slice", args: {axis: 0, start: "t", end: "t + 1"}, in: ["i:pixels"], out: "px", name: "vision.tile{t}"},
+          {op: "Reshape", args: {shape: [3, "v_size", "v_size"]}, in: ["px"], out: "px", name: "vision.tile{t}.chw"},
+          {op: "Conv2d", args: {stride: ["v_patch", "v_patch"], padding: [0, 0, 0, 0], dilation: [1, 1], groups: 1},
+           in: ["px", "w:{v}.embeddings.patch_embedding.weight", "w:{v}.embeddings.patch_embedding.bias"], out: "e", name: "vision.tile{t}.patch"},
+          {op: "Reshape", args: {shape: ["v_hidden", "v_n"]}, in: ["e"], out: "e", name: "vision.tile{t}.flat"},
+          {op: "Transpose", args: {perm: [1, 0]}, in: ["e"], out: "e", name: "vision.tile{t}.rows"},
+          {op: "Binary", args: {kind: "Add"}, in: ["e", "pe"], out: "x", name: "vision.tile{t}.embed", when: "t == 0"},
+          {block: [
+            {op: "Binary", args: {kind: "Add"}, in: ["e", "pe"], out: "e", name: "vision.tile{t}.embed"},
+            {op: "Concat", args: {axis: 0}, in: ["x", "e"], out: "x", name: "vision.tile{t}.stack"},
+          ], when: "t > 0"},
+        ]},
+        {repeat: "i", count: "v_layers", body: [
+          {let: {p: "fmt('{v}.encoder.layers.{i}')"}},
+          {op: "LayerNorm", args: {eps: "v_eps"}, in: ["x", "w:{p}.layer_norm1.weight", "w:{p}.layer_norm1.bias"], out: "h", name: "vision.l{i}.ln1"},
+          {op: "Linear", in: ["h", "w:{p}.self_attn.q_proj.weight", "w:{p}.self_attn.q_proj.bias"], out: "q", name: "vision.l{i}.q"},
+          {op: "Linear", in: ["h", "w:{p}.self_attn.k_proj.weight", "w:{p}.self_attn.k_proj.bias"], out: "k", name: "vision.l{i}.k"},
+          {op: "Linear", in: ["h", "w:{p}.self_attn.v_proj.weight", "w:{p}.self_attn.v_proj.bias"], out: "vv", name: "vision.l{i}.v"},
+          // Tiles attend only themselves: [tiles*n, d] -> [n, tiles*d], every (tile, head) one
+          // attention head over the tile's n patches.
+          {repeat: "nm", over: "['q', 'k', 'vv']", body: [
+            {op: "Reshape", args: {shape: ["tiles", "v_n", "v_hidden"]}, in: ["{nm}"], out: "{nm}", name: "vision.l{i}.{nm}.split"},
+            {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["{nm}"], out: "{nm}", name: "vision.l{i}.{nm}.by_patch"},
+            {op: "Reshape", args: {shape: ["v_n", "tiles * v_hidden"]}, in: ["{nm}"], out: "{nm}", name: "vision.l{i}.{nm}.heads"},
+          ]},
+          {op: "Attention", args: {heads: "tiles * v_heads", kv_heads: "tiles * v_heads", causal: false, window: null, soft_cap: null, scale: null},
+           in: ["q", "k", "vv"], out: "a", name: "vision.l{i}.attn"},
+          {op: "Reshape", args: {shape: ["v_n", "tiles", "v_hidden"]}, in: ["a"], out: "a", name: "vision.l{i}.attn.split"},
+          {op: "Transpose", args: {perm: [1, 0, 2]}, in: ["a"], out: "a", name: "vision.l{i}.attn.by_tile"},
+          {op: "Reshape", args: {shape: ["tiles * v_n", "v_hidden"]}, in: ["a"], out: "a", name: "vision.l{i}.attn.rows"},
+          {op: "Linear", in: ["a", "w:{p}.self_attn.out_proj.weight", "w:{p}.self_attn.out_proj.bias"], out: "a", name: "vision.l{i}.o"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "vision.l{i}.res1"},
+          {op: "LayerNorm", args: {eps: "v_eps"}, in: ["x", "w:{p}.layer_norm2.weight", "w:{p}.layer_norm2.bias"], out: "h", name: "vision.l{i}.ln2"},
+          {op: "Linear", in: ["h", "w:{p}.mlp.fc1.weight", "w:{p}.mlp.fc1.bias"], out: "m", name: "vision.l{i}.fc1"},
+          {op: "Unary", args: {kind: "GeluTanh"}, in: ["m"], out: "m", name: "vision.l{i}.act"},
+          {op: "Linear", in: ["m", "w:{p}.mlp.fc2.weight", "w:{p}.mlp.fc2.bias"], out: "m", name: "vision.l{i}.fc2"},
+          {op: "Binary", args: {kind: "Add"}, in: ["x", "m"], out: "x", name: "vision.l{i}.res2"},
+        ]},
+        {op: "LayerNorm", args: {eps: "v_eps"}, in: ["x", "w:{v}.post_layernorm.weight", "w:{v}.post_layernorm.bias"], out: "x", name: "vision.post"},
+        // Pixel shuffle (`Idefics3Connector.pixel_shuffle`): each shuffle x shuffle patch block becomes
+        // one row, features ordered (block row, block col, channel).
+        {op: "Reshape", args: {shape: ["tiles * v_grid // shuffle", "shuffle", "v_grid // shuffle", "shuffle * v_hidden"]}, in: ["x"], out: "x", name: "connector.split"},
+        {op: "Transpose", args: {perm: [0, 2, 1, 3]}, in: ["x"], out: "x", name: "connector.shuffle"},
+        {op: "Reshape", args: {shape: ["tiles * tokens_per_tile", "shuffle * shuffle * v_hidden"]}, in: ["x"], out: "x", name: "connector.rows"},
+        {op: "Linear", in: ["x", "w:model.connector.modality_projection.proj.weight"], out: "rows", name: "connector.proj"},
+      ],
+      outputs: ["rows"],
+    },
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "media_rows", dtype: "f32", shape: ["media", "hidden"], when: "first(media, 0) > 0"},
+        {name: "media_index", dtype: "u32", shape: ["media"], when: "first(media, 0) > 0"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", name: "media", when: "first(media, 0) > 0"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')"}},
+          {use: "norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "attn_cached", in: ["h"], out: "a", name: "l{i}.attn", args: {
+            layer: "i", wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
+            wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.o_proj')",
+            q_norm: "fmt('{p}.self_attn.q_norm')", k_norm: "fmt('{p}.self_attn.k_norm')"}},
+          {use: "residual", in: ["x", "a"], out: "x", name: "l{i}.res1"},
+          {use: "norm", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
+            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
+          {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "lm_head", args: {w: "head_w", logit_scale: "1"}, in: ["hidden"], out: "logits", name: "lm_head", when: "head != 'hidden'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {
+    prefill_rows: 64,
+    ffn_weights: ["model.layers.*.mlp.*"],
+    media: {image: {
+      component: "vision",
+      preprocess: {kind: "tile_longest_edge",
+        longest_edge: "json.preprocessor_config.size.longest_edge",
+        tile: "json.preprocessor_config.max_image_size.longest_edge",
+        max_side: 4096, tokens_per_tile: "tokens_per_tile",
+        split: "first(json.preprocessor_config.do_image_splitting, true)",
+        filter: "first(json.preprocessor_config.resample, 1) == 3 ? 'bicubic' : 'lanczos'",
+        norm: {rescale: "first(json.preprocessor_config.rescale_factor, 1 / 255)",
+               mean: "json.preprocessor_config.image_mean", std: "json.preprocessor_config.image_std"}},
+      expand: {kind: "grid_text", placeholder: "cfg.image_token_id", around: "'<fake_token_around_image>'",
+               cell: "'<row_{r}_col_{c}>'", global: "'<global-img>'", token: "'<image>'"},
+    }},
+  },
+}

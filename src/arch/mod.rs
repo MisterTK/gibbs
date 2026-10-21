@@ -28,6 +28,8 @@ mod tests_encoders_modernbert;
 mod tests_encoders_bert_gguf;
 #[cfg(test)]
 mod tests_encoders_deberta;
+#[cfg(test)]
+mod tests_idefics3;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -88,6 +90,8 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("overrides/sd1_file_turbo.json5", include_str!("../../arch/overrides/sd1_file_turbo.json5")),
     ("overrides/sd2_file_turbo.json5", include_str!("../../arch/overrides/sd2_file_turbo.json5")),
     ("overrides/sdxl_file_turbo.json5", include_str!("../../arch/overrides/sdxl_file_turbo.json5")),
+    ("families/nano.json5", include_str!("../../arch/families/nano.json5")),
+    ("families/idefics3.json5", include_str!("../../arch/families/idefics3.json5")),
     ("families/t5.json5", include_str!("../../arch/families/t5.json5")),
     ("families/bart.json5", include_str!("../../arch/families/bart.json5")),
     ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
