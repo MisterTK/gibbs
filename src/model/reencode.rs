@@ -400,28 +400,14 @@ pub fn reencode_values(
     cols: usize,
     data: impl FnOnce() -> Option<Vec<f32>>,
 ) -> Option<(Q, Vec<u8>)> {
-    let mut f = target(cfg, name, src, cols, true)?;
-    if cfg.policy == ReencodePolicy::MaxSpeed && f == Q::GGUF_Q4_K_M && cols % 32 == 0 {
-        f = Q::GGUF_Q4_0;
+    let f = target(cfg, name, src, cols, true)?;
+    let raw: Vec<u8> = data()?.iter().flat_map(|x| x.to_le_bytes()).collect();
+    fn f32_block(b: &[u8], out: &mut [f32]) {
+        for (o, c) in out.iter_mut().zip(b.chunks_exact(4)) {
+            *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        }
     }
-    let vals = data()?;
-    let threads = std::thread::available_parallelism()
-        .map_or(2, |n| n.get())
-        .saturating_sub(1)
-        .max(1);
-    let QuantizedWeight::GgufQuantized { raw_data, .. } =
-        encode_weight(&vals, cols, rows, f, threads)
-    else {
-        return None;
-    };
-    let blocks = raw_data.to_vec();
-    let mut stats = NATIVE_STATS.lock();
-    stats.reencoded += 1;
-    (stats.bytes_before, stats.bytes_after) = (
-        stats.bytes_before + (rows * src.tensor_bytes(cols)) as u64,
-        stats.bytes_after + blocks.len() as u64,
-    );
-    Some((f, blocks))
+    encode_blocks(name, src, f, rows, cols, &raw, (32, 128, f32_block))
 }
 
 /// The format the policy re-stores `name` (stored as `src`, `cols` wide) in, if any.
