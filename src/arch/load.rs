@@ -1199,18 +1199,21 @@ fn untile_rows<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
         0 => data.len().max(1),
         c => c * row_len,
     };
-    data.chunks(chunk)
-        .flat_map(|c| untile_run(c, row_len, u))
-        .collect()
+    // One exact-size copy, reordered in place (a collected iterator over-allocates).
+    let mut out = data.to_vec();
+    for (src, dst) in data.chunks(chunk).zip(out.chunks_mut(chunk)) {
+        untile_run(src, dst, row_len, u);
+    }
+    out
 }
 
-fn untile_run<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
-    let mut out = data.to_vec();
+/// Rewrites `out` (a copy of `data`) with `data`'s tiled head blocks grouped.
+fn untile_run<T: Copy>(data: &[T], out: &mut [T], row_len: usize, u: &Untile) {
     let per_k = u.v_heads / u.k_heads.max(1);
     let block = u.rows_per_block * row_len;
     let prefix = u.prefix_rows * row_len;
     if prefix >= data.len() {
-        return out;
+        return;
     }
     let (tiled, dest) = (&data[prefix..], &mut out[prefix..]);
     for k in 0..u.k_heads {
@@ -1221,7 +1224,6 @@ fn untile_run<T: Copy>(data: &[T], row_len: usize, u: &Untile) -> Vec<T> {
             }
         }
     }
-    out
 }
 
 /// Value heads of `block` values each in tiled order
@@ -1754,7 +1756,8 @@ pub struct Model {
     pub spec: Spec,
     pub env: ModelEnv,
     pub store: WeightStore,
-    pub tokenizer: Option<Tokenizer>,
+    /// Shared with `env` and the runtime that serves the model (one copy of the vocab maps).
+    pub tokenizer: Option<Arc<Tokenizer>>,
     pub ckpt: Arc<Checkpoint>,
     /// (raw checkpoint name, canonical name) of every raw tensor, sorted by raw name.
     pub renames: Vec<(String, String)>,
@@ -1778,7 +1781,7 @@ pub fn load_with(
     reencode: ReencodeConfig,
 ) -> Result<Model, String> {
     let ckpt = Arc::new(open(artifacts)?);
-    let tokenizer = tokenizer(artifacts, &ckpt)?;
+    let tokenizer = tokenizer(artifacts, &ckpt)?.map(Arc::new);
     load_from(ckpt, reg, family, tokenizer, reencode)
 }
 
@@ -1803,7 +1806,7 @@ fn load_from(
     ckpt: Arc<Checkpoint>,
     reg: &Registry,
     family: Option<&str>,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<Arc<Tokenizer>>,
     mut reencode: ReencodeConfig,
 ) -> Result<Model, String> {
     let family = match family {
@@ -1852,7 +1855,7 @@ fn load_from(
             );
         }
     }
-    let env = ModelEnv::new(&spec, ckpt.clone(), table.clone(), tokenizer.clone().map(Arc::new));
+    let env = ModelEnv::new(&spec, ckpt.clone(), table.clone(), tokenizer.clone());
     if ckpt.synthetic {
         synthesize(&spec, &env, &table).map_err(fam)?;
     }
