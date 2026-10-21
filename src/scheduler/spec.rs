@@ -212,7 +212,9 @@ pub(super) fn decode(
     };
     if drafts.is_empty() {
         // Plain decode (no checkpoints); the drafter catches up on these taps next time.
-        let t = m.step_token_with_kv(all, last, all.len(), temp, top_p, kv)?;
+        let t = m
+            .step_token_with_kv(all, last, all.len(), temp, top_p, None, kv)
+            .map(|(t, _)| t)?;
         spec.pending.extend(m.take_taps(kv));
         spec.synced = false;
         return Ok(Step {

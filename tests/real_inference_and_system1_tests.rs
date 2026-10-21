@@ -372,8 +372,10 @@ fn test_smollm2_program_scheduler_inference() {
                 generated_tokens.len(),
                 0.0,
                 1.0,
+                None,
                 &mut kv,
             )
+            .map(|(t, _)| t)
             .expect("decode step succeeds");
         generated_tokens.push(tok);
     }

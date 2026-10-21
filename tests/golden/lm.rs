@@ -211,7 +211,8 @@ fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
             for _ in 0..8 {
                 let n = ids.len();
                 let t = m
-                    .step_token_with_kv(&ids, ids[n - 1], n, 0.0, 1.0, &mut kv)
+                    .step_token_with_kv(&ids, ids[n - 1], n, 0.0, 1.0, None, &mut kv)
+                    .map(|(t, _)| t)
                     .unwrap();
                 ids.push(t);
             }

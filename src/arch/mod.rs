@@ -13,6 +13,7 @@ pub mod expr;
 pub mod gen;
 pub mod load;
 pub mod names;
+pub mod templates;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 

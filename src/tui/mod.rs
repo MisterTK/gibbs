@@ -1934,10 +1934,13 @@ impl TuiApp {
             match key.code {
                 KeyCode::Esc | KeyCode::F(2) => self.show_template_modal = false,
                 KeyCode::Up => self.active_template = self.active_template.saturating_sub(1),
-                KeyCode::Down => self.active_template = (self.active_template + 1).min(4),
+                KeyCode::Down => {
+                    self.active_template =
+                        (self.active_template + 1).min(crate::arch::templates::names().len())
+                }
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     let d = c.to_digit(10).unwrap_or(0) as usize;
-                    if d <= 4 {
+                    if d <= crate::arch::templates::names().len() {
                         self.active_template = d;
                     }
                 }
@@ -2145,9 +2148,10 @@ impl TuiApp {
             }
         }
     }
-    /// Updates the active chat template (0: default, 1: ChatML, 2: Llama3, 3: Gemma, 4: Plain).
+    /// Updates the active chat template: 0 is the model's own, `i` is
+    /// `arch::templates::names()[i - 1]`.
     pub fn set_chat_template(&mut self, template_idx: usize) {
-        self.active_template = template_idx.min(4);
+        self.active_template = template_idx.min(crate::arch::templates::names().len());
     }
 
     /// Updates the system prompt prepended to chat requests.
@@ -2172,24 +2176,12 @@ impl TuiApp {
             msgs.push(("system", system_prompt));
         }
         msgs.push(("user", user_prompt));
-        match active_template {
-            1 => tok.apply_chat_template_with_style(
-                &msgs,
-                crate::model::tokenizer::ChatTemplate::ChatML,
-            ),
-            2 => tok.apply_chat_template_with_style(
-                &msgs,
-                crate::model::tokenizer::ChatTemplate::Llama3,
-            ),
-            3 => tok.apply_chat_template_with_style(
-                &msgs,
-                crate::model::tokenizer::ChatTemplate::Gemma,
-            ),
-            4 => tok.apply_chat_template_with_style(
-                &msgs,
-                crate::model::tokenizer::ChatTemplate::Plain,
-            ),
-            _ => tok.apply_chat_template(&msgs),
+        match active_template
+            .checked_sub(1)
+            .and_then(|i| crate::arch::templates::names().get(i))
+        {
+            Some(name) => tok.apply_chat_template_with_style(&msgs, name),
+            None => tok.apply_chat_template(&msgs),
         }
     }
 }
@@ -3490,8 +3482,11 @@ mod tests {
         use crate::model::graph_lm::{GraphLm, GraphLmConfig};
 
         let kv = Arc::new(PagedKVPool::new(64));
-        let llm = ExecutableModel::load_graph_lm(GraphLm::new(GraphLmConfig::smollm_1m()), crate::hardware::Device::Cpu)
-            .unwrap();
+        let llm = ExecutableModel::load_graph_lm(
+            GraphLm::new(GraphLmConfig::smollm_1m()),
+            crate::hardware::Device::Cpu,
+        )
+        .unwrap();
         let sched = Arc::new(ContinuousBatchScheduler::new(
             "foundry/smollm-1m",
             kv.clone(),

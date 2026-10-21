@@ -383,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let quant_override = cli.quant.as_deref().map(parse_quant).transpose()?;
 
     // 2. Initialize Memory Hierarchy and KV Pool
-    let kv_pool = Arc::new(PagedKVPool::new(16384));
+    let kv_pool = Arc::new(PagedKVPool::new(gibbs_engine::scheduler::ONE_SHOT_POOL_BLOCKS));
 
     // 4. Model Resolution & Cache Inspection (Auto-Download & Cloud Storage)
     let storage_backend = StorageBackend::from_uri(&cli.storage)?;
@@ -658,46 +658,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drafter = Some(dr);
             }
 
-            if let Some(prompt) = &cli.prompt {
-                println!("💬 Generating from prompt: \"{}\"", prompt);
-                let cap = match &model_exec {
-                    ExecutableModel::Native(m) => m.default_max_new_tokens(),
-                    _ => None,
-                };
-                let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
-                // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
-                let temperature = match model_exec.tokenizer().sampling_defaults {
-                    Some((t, _)) if t <= 1e-4 => 0.0,
-                    _ => 0.7,
-                };
-                let (output, passes, decode) = model_exec.generate_text_measured(
-                    prompt,
-                    max_toks,
-                    temperature,
-                    drafter.clone(),
-                )?;
-                println!("✨ Output:\n{}", output);
-                let tok_s = passes as f64 / decode.as_secs_f64().max(1e-9);
-                println!(
-                    "⚡ Decode: {passes} tokens in {:.2}ms ({:.1} tok/s) on {}",
-                    decode.as_secs_f64() * 1000.0,
-                    tok_s,
-                    model_exec.backend_label()
-                );
-
-                // Roofline reporting
-                let bytes_per_token = telemetry.bytes_per_token();
-                let ceiling_gbps = telemetry.get_summary().memory_bandwidth_gbps as f64;
-                if bytes_per_token > 0 && ceiling_gbps > 0.0 {
-                    let roofline_tok_s = ceiling_gbps / (bytes_per_token as f64 / 1e9);
-                    let pct = (tok_s / roofline_tok_s) * 100.0;
-                    println!(
-                    "📈 Roofline: {pct:.1}% of {roofline_tok_s:.1} tok/s ({bytes_per_token} B/token at {ceiling_gbps:.1} GB/s)"
-                );
-                }
-                return Ok(());
-            }
-
             Some(model_exec)
         }
     };
@@ -717,6 +677,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("--draft: speculative decoding is disabled (GIBBS_SPEC=off)".into());
         }
         scheduler.set_drafter(drafter);
+    }
+
+    if let (Some(prompt), Some(model)) = (&cli.prompt, scheduler.model()) {
+        println!("💬 Generating from prompt: \"{}\"", prompt);
+        let cap = match &model {
+            ExecutableModel::Native(m) => m.default_max_new_tokens(),
+            _ => None,
+        };
+        let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
+        // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
+        let temperature = match scheduler.tokenizer().sampling_defaults {
+            Some((t, _)) if t <= 1e-4 => 0.0,
+            _ => 0.7,
+        };
+        let g = scheduler.generate(prompt, max_toks, temperature)?;
+        println!("✨ Output:\n{}", g.text);
+        let (decode, passes) = g.decode;
+        let tok_s = passes as f64 / decode.as_secs_f64().max(1e-9);
+        println!(
+            "⚡ Decode: {passes} tokens in {:.2}ms ({:.1} tok/s) on {}",
+            decode.as_secs_f64() * 1000.0,
+            tok_s,
+            model.backend_label()
+        );
+
+        // Roofline reporting
+        let bytes_per_token = telemetry.bytes_per_token();
+        let ceiling_gbps = telemetry.get_summary().memory_bandwidth_gbps as f64;
+        if bytes_per_token > 0 && ceiling_gbps > 0.0 {
+            let roofline_tok_s = ceiling_gbps / (bytes_per_token as f64 / 1e9);
+            let pct = (tok_s / roofline_tok_s) * 100.0;
+            println!(
+                "📈 Roofline: {pct:.1}% of {roofline_tok_s:.1} tok/s ({bytes_per_token} B/token at {ceiling_gbps:.1} GB/s)"
+            );
+        }
+        return Ok(());
     }
 
     // 6. Continuous batching loop on its own thread: a step is blocking compute, and on a tokio
