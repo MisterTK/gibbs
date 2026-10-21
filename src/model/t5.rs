@@ -35,12 +35,7 @@ impl Lin {
     /// x `[n, cols]` -> `[n, rows]`.
     fn forward(&self, x: &[f32], n: usize) -> Vec<f32> {
         let (w, rows, cols) = match self {
-            Lin::Bf16(m) => {
-                // ponytail: decodes the matrix per call; t5.rs is replaced by its spec in Phase 8.
-                let mut out = vec![0.0f32; n * m.rows];
-                nn::matmul_nt(x, &m.to_f32(), None, n, m.cols, m.rows, &mut out);
-                return out;
-            }
+            Lin::Bf16(m) => return nn::linear_mat(x, n, m),
             Lin::Gguf(w) => {
                 let (rows, cols) = w.dims();
                 let mut out = vec![0.0f32; n * rows];
