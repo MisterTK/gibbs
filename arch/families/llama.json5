@@ -1,15 +1,15 @@
 // Llama-style decoders (HF `model.layers.{i}.self_attn.*` names; llama.cpp GGUF via `llamacpp`):
-// llama, mistral, qwen2, smollm, ernie4_5, olmo, phi3 (fused qkv / gate_up split at load). Also the
+// llama, mistral, qwen2, smollm, ernie4_5, phi3 (fused qkv / gate_up split at load). Also the
 // fallback for causal LMs no other family claims. Real GQA: kv states are kv_heads wide.
 // BitNet b1.58 masters (`quant_method: bitnet`, 1bitLLM `weight_bits: 1`) get activation quant,
 // online ternarization and sub-norms here; `bitnet` adds its own names and match.
 {
   family: "llama",
   match: {
-    hf_model_type: ["llama", "mistral", "qwen2", "smollm", "smollm2", "ernie4_5", "olmo", "phi3"],
+    hf_model_type: ["llama", "mistral", "qwen2", "smollm", "smollm2", "ernie4_5", "phi3"],
     hf_architectures: ["LlamaForCausalLM", "MistralForCausalLM", "Qwen2ForCausalLM", "Ernie4_5ForCausalLM",
-                       "OlmoForCausalLM", "Phi3ForCausalLM"],
-    gguf_arch: ["llama", "qwen2", "ernie4_5", "olmo"],
+                       "Phi3ForCausalLM"],
+    gguf_arch: ["llama", "qwen2", "ernie4_5"],
     fallback: true,
   },
   pipeline: "causal_lm",
@@ -49,6 +49,7 @@
     ternarize: "aq_bits > 0 && (cfg.quantization_config.quantization_mode == 'online' || first(cfg.weight_bits, 0) == 1)",
   },
   checks: [
+    {expr: "cfg.model_type == 'olmo' || gguf_arch == 'olmo'", error: "OLMo (non-parametric LayerNorm) is not implemented"},
     {expr: "cfg.model_type == 'gemma3' || cfg.model_type == 'exaone4' || gguf_arch == 'gemma3' || gguf_arch == 'exaone4' || (has('model.layers.0.pre_feedforward_layernorm.weight') && has('model.layers.0.self_attn.q_norm.weight'))",
      error: "architecture '{first(cfg.model_type, gguf_arch)}' (sliding-window layers, per-layer RoPE, scaled embeddings) is not implemented by the llama spec"},
     {expr: "has('model.layers.0.block_sparse_moe.gate.weight') || first(cfg.num_local_experts, 0) > 0", error: "expert (MoE) layers are not implemented by the llama spec"},

@@ -861,6 +861,40 @@ mod tests {
         (cfg, w)
     }
 
+    /// GPT-Neo (`transformer.h.{l}.attn.attention.*`, Linear MLP, learned positions), which GraphLm
+    /// loads. GraphLm scales scores by 1/sqrt(head_dim); `attention_multiplier: 1.0` makes it use
+    /// GPT-Neo's unscaled scores, and the local layer's window (256) covers the 9 tokens.
+    fn neo_fixture() -> (J, Weights) {
+        let (h, inter) = (32, 64);
+        let cfg = json!({"model_type": "gpt_neo", "architectures": ["GPTNeoForCausalLM"], "vocab_size": V,
+            "hidden_size": h, "num_layers": 2, "num_heads": 2, "intermediate_size": inter,
+            "max_position_embeddings": 32, "activation_function": "gelu_new", "layer_norm_epsilon": 1e-5,
+            "attention_layers": ["global", "local"], "window_size": 256, "attention_multiplier": 1.0});
+        let mut w = Weights::new(18);
+        w.s("transformer.wte.weight", &[V, h], 0.05);
+        w.s("transformer.wpe.weight", &[32, h], 0.3);
+        let ln = |w: &mut Weights, n: String| {
+            w.norm(format!("{n}.weight"), h, 1.0);
+            w.s(format!("{n}.bias"), &[h], 0.1);
+        };
+        for l in 0..2 {
+            let p = format!("transformer.h.{l}");
+            ln(&mut w, format!("{p}.ln_1"));
+            for s in ["q_proj", "k_proj", "v_proj"] {
+                w.w(format!("{p}.attn.attention.{s}.weight"), &[h, h]);
+            }
+            w.w(format!("{p}.attn.attention.out_proj.weight"), &[h, h]);
+            w.s(format!("{p}.attn.attention.out_proj.bias"), &[h], 0.1);
+            ln(&mut w, format!("{p}.ln_2"));
+            w.w(format!("{p}.mlp.c_fc.weight"), &[inter, h]);
+            w.s(format!("{p}.mlp.c_fc.bias"), &[inter], 0.1);
+            w.w(format!("{p}.mlp.c_proj.weight"), &[h, inter]);
+            w.s(format!("{p}.mlp.c_proj.bias"), &[h], 0.1);
+        }
+        ln(&mut w, "transformer.ln_f".into());
+        (cfg, w)
+    }
+
     const DEC_VOCAB: usize = 64;
 
     /// `tests/golden/enc.rs` `gpt2`: pre-LN, tanh GELU, Conv1D weights, `transformer.` prefix.
@@ -994,6 +1028,7 @@ mod tests {
             ("gqa_wide", "llama", lm_config("llama", "LlamaForCausalLM", &wide, json!({})),
              llama_weights(15, &wide, false, false, false, false)),
             ("gpt_neox", "gpt_neox", neox_fixture().0, neox_fixture().1),
+            ("gpt_neo", "gpt2", neo_fixture().0, neo_fixture().1),
         ];
         for (case, family, cfg, w) in &graph_lm {
             let dir = tmp.path().join(case);
