@@ -789,10 +789,11 @@ impl Env for ModelEnv {
     }
     fn values(&self, t: &str) -> Option<Vec<f32>> {
         let n = self.table.read().get(t).cloned()?;
-        self.ckpt.values_read.lock().insert(t.to_string());
-        (n.shape.iter().product::<usize>() <= SMALL_VALUES)
+        let v = (n.shape.iter().product::<usize>() <= SMALL_VALUES)
             .then(|| node_values(&self.ckpt, &n))
-            .flatten()
+            .flatten()?;
+        self.ckpt.values_read.lock().insert(t.to_string());
+        Some(v)
     }
     fn dtype(&self, t: &str) -> Option<&'static str> {
         Some(match self.table.read().get(t)?.kind {

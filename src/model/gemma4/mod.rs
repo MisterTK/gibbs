@@ -5,7 +5,7 @@
 //! `gemma4` GGUF and its `mmproj` ([`load_gguf`]).
 
 pub(crate) mod audio;
-mod gguf;
+pub(crate) mod gguf;
 pub mod graph;
 mod moe;
 pub(crate) mod ops;
@@ -32,7 +32,7 @@ use text::{TextCache, TextModel};
 use vision::Vision;
 
 /// A media encoder: file bytes -> `[n, text_hidden]` soft tokens and `n`.
-trait Encoder: Send + Sync {
+pub(crate) trait Encoder: Send + Sync {
     fn encode(&self, bytes: &[u8]) -> Result<(Vec<f32>, usize), String>;
     /// The `n` [`Self::encode`] returns, from the file's decode alone (no model compute).
     fn count(&self, bytes: &[u8]) -> Result<usize, String>;

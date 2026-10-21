@@ -170,7 +170,7 @@ impl VisionEmbedder {
     }
 
     /// Runs the embedder as a Metal program (compiled once per patch count).
-    fn forward_gpu(&self, gpu: &ProgramCache, pix: &[f32], n: usize, gw: usize) -> Result<Vec<f32>, String> {
+    pub(crate) fn forward_gpu(&self, gpu: &ProgramCache, pix: &[f32], n: usize, gw: usize) -> Result<Vec<f32>, String> {
         let prog = gpu
             .get(&[n], || Ok(self.build_graph(n)))
             .map_err(|e| format!("vision: {e}"))?;
