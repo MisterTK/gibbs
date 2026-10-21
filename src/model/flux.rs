@@ -8,7 +8,7 @@
 
 use crate::hardware::QuantFormat;
 use crate::model::clip::{ClipTextTransformer, Tensors};
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::hub::{component_weights, HuggingFaceHub, ModelArtifacts};
 use crate::model::image::ImageBuffer;
 use crate::model::layers::gguf_block_codec;
@@ -16,7 +16,7 @@ use crate::model::loaders::gguf::GgufData;
 use crate::model::loaders::safetensors::SafetensorsWeightReader;
 use crate::model::par::par_rows;
 use crate::model::qwen3_5::Qwen3Encoder;
-use crate::model::sd::Rng;
+use crate::runtime::sched::Rng;
 use crate::model::t5::T5Encoder;
 use crate::model::text_to_image::{pipeline_class, ImageDefaults, ImageGenerator, ImageRequest};
 use crate::model::tokenizer::Tokenizer;
@@ -1239,65 +1239,6 @@ fn unpack(p: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
 // Flow-matching schedule (diffusers FlowMatchEulerDiscreteScheduler as FluxPipeline drives it)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
-struct Sched {
-    shift: f64,
-    dynamic: bool,
-    base_seq: f64,
-    max_seq: f64,
-    base_shift: f64,
-    max_shift: f64,
-    /// FLUX.2 pipelines pick `mu` with `compute_empirical_mu(image tokens, steps)`.
-    empirical_mu: bool,
-}
-
-/// diffusers `compute_empirical_mu` (Flux2Pipeline / Flux2KleinPipeline).
-fn empirical_mu(seq: usize, steps: usize) -> f64 {
-    let (a1, b1, a2, b2) = (8.73809524e-05, 1.89833333, 0.00016927, 0.45666666);
-    let seq = seq as f64;
-    if seq > 4300.0 {
-        return a2 * seq + b2;
-    }
-    let (m200, m10) = (a2 * seq + b2, a1 * seq + b1);
-    let a = (m200 - m10) / 190.0;
-    a * steps as f64 + m200 - 200.0 * a
-}
-
-impl Sched {
-    fn from_config(v: &Value, empirical_mu: bool) -> Self {
-        let f = |k: &str, d: f64| v[k].as_f64().unwrap_or(d);
-        Self {
-            shift: f("shift", 1.0),
-            dynamic: v["use_dynamic_shifting"].as_bool().unwrap_or(false),
-            base_seq: f("base_image_seq_len", 256.0),
-            max_seq: f("max_image_seq_len", 4096.0),
-            base_shift: f("base_shift", 0.5),
-            max_shift: f("max_shift", 1.15),
-            empirical_mu,
-        }
-    }
-
-    /// FluxPipeline: `sigmas = linspace(1, 1/steps, steps)`, `mu = calculate_shift(image tokens)`,
-    /// shifted by the scheduler config, 0 appended.
-    fn sigmas(&self, steps: usize, seq: usize) -> Vec<f32> {
-        let base = flow::linspace_sigmas(steps);
-        if !self.dynamic {
-            return flow::shifted_sigmas(&base, self.shift);
-        }
-        let mu = if self.empirical_mu {
-            empirical_mu(seq, steps)
-        } else {
-            flow::calculate_shift(
-                seq,
-                self.base_seq,
-                self.max_seq,
-                self.base_shift,
-                self.max_shift,
-            )
-        };
-        flow::dynamic_sigmas(&base, mu)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -1330,7 +1271,7 @@ pub struct FluxPipeline {
     text: TextEnc,
     tr: FluxTransformer,
     vae: SdVae,
-    sched: Sched,
+    sched: sched::Schedule,
     /// VAE latent channels (16; FLUX.2: 32, normalised by the VAE's BatchNorm stats `bn`
     /// (mean, std) over the 2x2-patchified channels).
     latent_ch: usize,
@@ -1503,10 +1444,11 @@ impl FluxPipeline {
             ));
         }
         let index = read_json(&base.join("model_index.json")).unwrap_or(Value::Null);
-        let sched = Sched::from_config(
-            &read_json(&base.join("scheduler/scheduler_config.json"))?,
-            flux2,
-        );
+        let mut sched =
+            sched::Schedule::from_config(&read_json(&base.join("scheduler/scheduler_config.json"))?);
+        if flux2 && sched.mu == sched::Mu::Dynamic {
+            sched.mu = sched::Mu::Empirical;
+        }
         let label = format!(
             "{name} ({}{}), {} + VAE",
             tr.label,
@@ -1801,7 +1743,7 @@ impl ImageGenerator for FluxPipeline {
         };
         let rope = rope_for(nt);
         let neg_rope = neg.as_ref().map(|(_, n)| rope_for(*n));
-        let sigmas = self.sched.sigmas(steps, ni);
+        let sigmas = self.sched.sigmas(&sched::linspace_sigmas(steps), ni, steps);
         let g_in = self.tr.guidance_embeds().then_some(guidance);
         for i in 0..steps {
             let t = Instant::now();
@@ -1821,7 +1763,7 @@ impl ImageGenerator for FluxPipeline {
                     .zip(&vn)
                     .for_each(|(v, n)| *v = n + guidance * (*v - n));
             }
-            flow::euler_step(&mut x, &v, sigmas[i], sigmas[i + 1]);
+            sched::euler_step(&mut x, &v, sigmas[i], sigmas[i + 1]);
             tracing::info!(
                 "FLUX step {}/{steps}: {:.1}s",
                 i + 1,
@@ -1843,42 +1785,6 @@ impl ImageGenerator for FluxPipeline {
 mod tests {
     use super::*;
 
-    #[test]
-    fn schnell_schedule_is_unshifted_linspace() {
-        let cfg = serde_json::json!({"shift": 1.0, "use_dynamic_shifting": false});
-        assert_eq!(
-            Sched::from_config(&cfg, false).sigmas(4, 1024),
-            vec![1.0, 0.75, 0.5, 0.25, 0.0]
-        );
-    }
-
-    #[test]
-    fn dev_schedule_matches_diffusers_dynamic_shift() {
-        // FLUX.1-dev scheduler_config.json; 512x512 -> 32x32 packed tokens.
-        let cfg = serde_json::json!({"base_image_seq_len": 256, "base_shift": 0.5, "max_image_seq_len": 4096,
-            "max_shift": 1.15, "shift": 3.0, "use_dynamic_shifting": true});
-        // mu = 1024 * 0.65/3840 + 0.5 - 256 * 0.65/3840 = 0.63; sigma' = e^mu / (e^mu + 1/sigma - 1).
-        let e = 0.63f64.exp();
-        let want: Vec<f64> = [1.0, 0.75, 0.5, 0.25]
-            .iter()
-            .map(|s| e / (e + 1.0 / s - 1.0))
-            .collect();
-        let got = Sched::from_config(&cfg, false).sigmas(4, 1024);
-        assert_eq!(got.len(), 5);
-        assert_eq!(got[4], 0.0);
-        for (g, w) in got.iter().zip(&want) {
-            assert!((*g as f64 - w).abs() < 1e-6, "{got:?} vs {want:?}");
-        }
-        assert!((got[2] - 0.652_490).abs() < 1e-5);
-    }
-
-    #[test]
-    fn flux2_empirical_mu_matches_diffusers() {
-        // compute_empirical_mu(1024, 4): m200 = 0.62999914, m10 = 1.98781143, a = (m200 - m10) / 190.
-        assert!((empirical_mu(1024, 4) - 2.030_689_7).abs() < 1e-6);
-        // Past 4300 tokens it is the m200 line alone.
-        assert!((empirical_mu(5000, 4) - (0.00016927 * 5000.0 + 0.45666666)).abs() < 1e-12);
-    }
     #[test]
     fn test_flux_wt_decode_non_f32() {
         let f64_vals: Vec<f64> = vec![1.5, -2.5, 3.25, 4.75];

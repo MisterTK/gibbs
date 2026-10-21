@@ -2,7 +2,7 @@
 //! embeddings and `add_time_ids`), LCM (guidance embedding) and turbo models, from a diffusers repo
 //! (`model_index.json` + components), an LDM single-file checkpoint, or the SD 2.1 turbo GGUF; any
 //! of them optionally with a LoRA merged in. Sampling uses the repo's declared scheduler
-//! ([`crate::model::sd_sched`]) with classifier-free guidance against the negative prompt.
+//! ([`crate::runtime::sched`]) with classifier-free guidance against the negative prompt.
 
 use crate::model::clip::{Act, ClipTextTransformer, Tensors};
 use crate::model::hub::{component_weights, HuggingFaceHub};
@@ -10,14 +10,13 @@ use crate::model::image::ImageBuffer;
 use crate::model::loaders::gguf::GgufWeightReader;
 use crate::model::loaders::SafetensorsWeightReader;
 use crate::model::lora::{Lora, Target};
-use crate::model::sd_sched::{Kind, SchedulerConfig};
+use crate::runtime::sched::{Kind, Rng, SchedulerConfig};
 use crate::model::text_to_image::{ImageDefaults, ImageRequest};
 use crate::model::unet::{alias_diffusers, timestep_embedding, Heads, SdUnet};
 use crate::model::vae::SdVae;
 use serde_json::{json, Value};
 use std::path::Path;
 
-pub(crate) const TRAIN_STEPS: usize = 1000;
 const CONTEXT_LEN: usize = 77;
 /// SD 1.x / 2.x VAE `scaling_factor` (SDXL's config says 0.13025).
 const VAE_SCALE: f32 = 0.18215;
@@ -675,57 +674,6 @@ pub fn alias_openclip(
     Ok(())
 }
 
-/// splitmix64 + Box-Muller.
-pub(crate) struct Rng {
-    state: u64,
-    spare: Option<f32>,
-}
-
-impl Rng {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self {
-            state: seed,
-            spare: None,
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform in (0, 1].
-    pub(crate) fn uniform(&mut self) -> f64 {
-        ((self.next_u64() >> 11) + 1) as f64 / (1u64 << 53) as f64
-    }
-
-    pub(crate) fn gaussian(&mut self) -> f32 {
-        if let Some(s) = self.spare.take() {
-            return s;
-        }
-        let r = (-2.0 * self.uniform().ln()).sqrt();
-        let th = 2.0 * std::f64::consts::PI * self.uniform();
-        self.spare = Some((r * th.sin()) as f32);
-        (r * th.cos()) as f32
-    }
-}
-
-/// scaled_linear betas 0.00085..0.012 over 1000 steps (SD 2.x and ModelScope share it).
-pub(crate) fn alphas_cumprod() -> Vec<f64> {
-    let (a, b) = (0.00085f64.sqrt(), 0.012f64.sqrt());
-    let mut acc = 1.0;
-    (0..TRAIN_STEPS)
-        .map(|i| {
-            let beta = (a + (b - a) * i as f64 / (TRAIN_STEPS - 1) as f64).powi(2);
-            acc *= 1.0 - beta;
-            acc
-        })
-        .collect()
-}
-
 /// A tiny SD 1.x-style pipeline (CLIP + 2-level UNet + 2-level VAE, synthetic weights, Euler, CFG) for
 /// the parity test and the GPU-only matrix fixture.
 pub fn tiny_pipeline() -> Result<SdPipeline, String> {
@@ -757,19 +705,6 @@ pub fn tiny_pipeline() -> Result<SdPipeline, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gaussian_moments() {
-        let mut r = Rng::new(42);
-        let n = 100_000;
-        let xs: Vec<f64> = (0..n).map(|_| r.gaussian() as f64).collect();
-        let mean = xs.iter().sum::<f64>() / n as f64;
-        let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
-        assert!(
-            mean.abs() < 0.02 && (var - 1.0).abs() < 0.02,
-            "mean {mean} var {var}"
-        );
-    }
 
     /// diffusers LatentConsistencyModelPipeline.get_guidance_scale_embedding.
     #[test]

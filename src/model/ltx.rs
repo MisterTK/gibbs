@@ -10,7 +10,7 @@
 //!
 //! Reference: diffusers `models/transformers/transformer_ltx.py`, `pipelines/ltx/pipeline_ltx.py`.
 
-use crate::model::flow;
+use crate::runtime::sched;
 use crate::model::flux::{read_json, t5_ids, t5_tokenizer, Lin, Store};
 use crate::model::hub::{
     component_weights, hub_json, is_synthetic_model_id, list_repo_files, select_weight_files,
@@ -20,7 +20,7 @@ use crate::model::image::ImageBuffer;
 use crate::model::ltx_vae::LtxVae;
 use crate::model::nn;
 use crate::model::par::par_rows;
-use crate::model::sd::Rng;
+use crate::runtime::sched::Rng;
 use crate::model::t5::T5Encoder;
 use crate::model::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};
@@ -389,50 +389,6 @@ impl LtxTransformer {
 // Scheduler
 // ---------------------------------------------------------------------------
 
-/// `FlowMatchEulerDiscreteScheduler` as `LTXPipeline` drives it: `sigmas = linspace(1, 1/steps)`,
-/// `mu = calculate_shift(latent tokens)`, dynamic shift, `shift_terminal` stretch, 0 appended.
-struct Sched {
-    base_seq: f64,
-    max_seq: f64,
-    base_shift: f64,
-    max_shift: f64,
-    terminal: Option<f64>,
-}
-
-impl Sched {
-    fn from_config(v: &serde_json::Value) -> Result<Self, String> {
-        if v["use_dynamic_shifting"].as_bool() != Some(true) {
-            return Err("LTX-Video scheduler_config.json: expected use_dynamic_shifting".into());
-        }
-        let f = |k: &str, d: f64| v[k].as_f64().unwrap_or(d);
-        Ok(Self {
-            base_seq: f("base_image_seq_len", 256.0),
-            max_seq: f("max_image_seq_len", 4096.0),
-            base_shift: f("base_shift", 0.5),
-            max_shift: f("max_shift", 1.15),
-            terminal: v["shift_terminal"].as_f64().filter(|t| *t > 0.0),
-        })
-    }
-
-    fn sigmas(&self, steps: usize, tokens: usize) -> Vec<f32> {
-        let mu = flow::calculate_shift(
-            tokens,
-            self.base_seq,
-            self.max_seq,
-            self.base_shift,
-            self.max_shift,
-        );
-        let mut s: Vec<f64> = flow::linspace_sigmas(steps)
-            .iter()
-            .map(|&x| flow::time_shift(mu, x))
-            .collect();
-        if let Some(term) = self.terminal {
-            let scale = (1.0 - s[s.len() - 1]) / (1.0 - term);
-            s.iter_mut().for_each(|v| *v = 1.0 - (1.0 - *v) / scale);
-        }
-        s.iter().map(|&v| v as f32).chain([0.0]).collect()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Text
@@ -486,7 +442,7 @@ impl LtxText {
 pub struct LtxPipeline {
     tr: LtxTransformer,
     vae: LtxVae,
-    sched: Sched,
+    sched: sched::Schedule,
 }
 
 pub struct Clip {
@@ -523,7 +479,13 @@ impl LtxPipeline {
         Ok(Self {
             tr: LtxTransformer::load(&Store::open(transformer)?)?,
             vae: LtxVae::load(vae, encoder)?,
-            sched: Sched::from_config(&read_json(scheduler_config)?)?,
+            sched: {
+                let s = sched::Schedule::from_config(&read_json(scheduler_config)?);
+                if s.mu != sched::Mu::Dynamic {
+                    return Err("LTX-Video scheduler_config.json: expected use_dynamic_shifting".into());
+                }
+                s
+            },
         })
     }
 
@@ -563,7 +525,7 @@ impl LtxPipeline {
     ) -> Result<Vec<ImageBuffer>, String> {
         let (f, h, w) = Self::grid(c)?;
         let n = f * h * w;
-        let sigmas = self.sched.sigmas(c.steps, n);
+        let sigmas = self.sched.sigmas(&sched::linspace_sigmas(c.steps), n, c.steps);
         let rope = Rope::new(f, h, w, FPS as f64, self.tr.d);
         // The GPU program runs the caption projection itself and takes the raw T5 tokens.
         let gpu = crate::model::dit_graph::use_metal();
@@ -593,7 +555,7 @@ impl LtxPipeline {
         };
         for i in 0..c.steps {
             let start = Instant::now();
-            let t = flow::timestep(sigmas[i]);
+            let t = sched::timestep(sigmas[i]);
             let vel = |ctx: &[f32], nt: usize| {
                 if gpu {
                     self.tr.forward_gpu(&x, n, ctx, nt, t, clean, &rope)
@@ -609,7 +571,7 @@ impl LtxPipeline {
                 }
             }
             let k = clean * LATENT;
-            flow::euler_step(&mut x[k..], &v[k..], sigmas[i], sigmas[i + 1]);
+            sched::euler_step(&mut x[k..], &v[k..], sigmas[i], sigmas[i + 1]);
             log(&format!(
                 "  step {}/{} (sigma {:.3}): {:.2}s",
                 i + 1,
@@ -911,24 +873,6 @@ mod tests {
         .err()
         .unwrap();
         assert!(e.contains("13b-0.9.7") && e.contains("v0.9.0"), "{e}");
-    }
-
-    #[test]
-    fn terminal_stretch_ends_at_shift_terminal() {
-        let s = Sched {
-            base_seq: 1024.0,
-            max_seq: 4096.0,
-            base_shift: 0.95,
-            max_shift: 2.05,
-            terminal: Some(0.1),
-        };
-        let v = s.sigmas(8, 640);
-        assert_eq!(v.len(), 9);
-        assert!(
-            (v[0] - 1.0).abs() < 1e-6 && (v[7] - 0.1).abs() < 1e-5 && v[8] == 0.0,
-            "{v:?}"
-        );
-        assert!(v.windows(2).all(|w| w[0] > w[1]));
     }
 
     #[test]

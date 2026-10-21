@@ -283,7 +283,9 @@ pub fn open(artifacts: &ModelArtifacts) -> Result<Checkpoint, String> {
         .map(|d| d.join("model_index.json"))
         .filter(|p| p.is_file())
         .and_then(|p| read_json(&p).ok())
-        .and_then(|j| j["_class_name"].as_str().map(String::from));
+        .and_then(|j| j["_class_name"].as_str().map(String::from))
+        // A diffusers component directory (vae/, unet/, ...) names its class in config.json.
+        .or_else(|| cfg["_class_name"].as_str().map(String::from));
     ck.sig = Signals {
         hub_id: artifacts.model_id.clone(),
         file_name: weights
@@ -991,6 +993,72 @@ impl WeightStore {
     }
 }
 
+impl WeightStore {
+    /// Registers a low-rank adapter `y += scale · (x·Aᵀ)·Bᵀ (+ bias)` from an external file on
+    /// canonical weight `target` (A `[r, in...]`, B `[out, r, (1, 1)]`): a matrix gets the
+    /// interpreter's LoRA branch ([`Source::lora`]); any other weight (a convolution kernel) has
+    /// `scale · B·A` merged in at load (`lora_merge`), where a bias delta is refused.
+    pub fn add_lora(
+        &mut self,
+        target: &str,
+        a: (Vec<usize>, Vec<f32>),
+        b: (Vec<usize>, Vec<f32>),
+        scale: f32,
+        bias: Option<Vec<f32>>,
+    ) -> Result<(), String> {
+        let base = self
+            .node(target)
+            .ok_or_else(|| format!("LoRA target `{target}` is not a weight of this model"))?;
+        let gen = |(shape, v): (Vec<usize>, Vec<f32>)| Node {
+            shape: shape.clone(),
+            kind: Kind::F32,
+            conv: false,
+            src: Src::Gen(Arc::new(Gen { shape, data: GenData::F32(v) })),
+        };
+        let (na, nb) = (format!("{target}.lora_A"), format!("{target}.lora_B"));
+        // Validates the factor shapes against the base.
+        xf_shapes(
+            "lora_merge",
+            &J::Null,
+            &[&base.shape, &a.0, &b.0],
+        )
+        .map_err(|e| format!("LoRA on `{target}`: {e}"))?;
+        insert_new(&self.table, na.clone(), gen(a)).map_err(|e| format!("LoRA on `{target}`: {e}"))?;
+        insert_new(&self.table, nb.clone(), gen(b)).map_err(|e| format!("LoRA on `{target}`: {e}"))?;
+        if base.shape.len() == 2 {
+            let bias_delta = match bias {
+                Some(v) => {
+                    let n = format!("{target}.lora_bias");
+                    insert_new(&self.table, n.clone(), gen((vec![v.len()], v)))?;
+                    Some(n)
+                }
+                None => None,
+            };
+            self.lora.insert(target.to_string(), Lora { a: na, b: nb, scale, bias_delta });
+            return Ok(());
+        }
+        if bias.is_some() {
+            return Err(format!("LoRA on `{target}`: bias deltas on non-matrix weights are not supported"));
+        }
+        let ins = vec![base.clone(), self.node(&na).unwrap(), self.node(&nb).unwrap()];
+        let kind = xf_kind("lora_merge", &ins);
+        let merged = Node {
+            shape: base.shape.clone(),
+            kind,
+            conv: base.conv,
+            src: Src::Xf {
+                op: "lora_merge".into(),
+                args: serde_json::json!({"scale": scale}),
+                ins,
+                part: 0,
+            },
+        };
+        self.table.write().insert(target.to_string(), Arc::new(merged));
+        self.cache.lock().remove(target);
+        Ok(())
+    }
+}
+
 impl Source for WeightStore {
     fn tensor(&self, name: &str) -> Option<(Vec<usize>, DType)> {
         let n = self.node(name)?;
@@ -1271,8 +1339,17 @@ fn xf_shapes(
             o.remove(2);
             Ok(vec![(None, o)])
         }
+        // Base `[o, ...]` (a convolution kernel flattens its trailing dims), A `[r, ...]`, B `[o, r, ...]`.
         "lora_merge" => match (s, ins.get(1).copied(), ins.get(2).copied()) {
-            ([o, i], Some([r, i2]), Some([o2, r2])) if i == i2 && o == o2 && r == r2 => same(),
+            ([o, rest @ ..], Some([r, ra @ ..]), Some([o2, r2, rb @ ..]))
+                if !rest.is_empty()
+                    && rest.iter().product::<usize>() == ra.iter().product::<usize>()
+                    && o == o2
+                    && r == r2
+                    && rb.iter().product::<usize>() == 1 =>
+            {
+                same()
+            }
             _ => Err(format!(
                 "LoRA factors {:?} / {:?} do not fit {s:?}",
                 ins.get(1),
@@ -1401,7 +1478,7 @@ fn xf_dense(
                 .collect();
         }
         "lora_merge" => {
-            let (o, i, r) = (s[0], s[1], ins[1].shape[0]);
+            let (o, i, r) = (s[0], s[1..].iter().product::<usize>(), ins[1].shape[0]);
             let scale = arg_f(a, "scale")? as f32;
             let (aa, bb) = (&vals[1], &vals[2]);
             for oi in 0..o {
@@ -2376,6 +2453,15 @@ mod tests {
             Some((vec![2, 1, 32], DType::Quant(Q::GGUF_Q8_0)))
         );
         assert_eq!(get(&m, "exp.weight").to_f32(), [e0v.clone(), e0v].concat());
+    }
+
+    #[test]
+    fn diffusers_class_from_model_index_else_config() {
+        let d = tempfile::tempdir().unwrap();
+        let a = artifacts(d.path(), None, Some(json!({"_class_name": "AutoencoderKL"})));
+        assert_eq!(open(&a).unwrap().sig.diffusers_class.as_deref(), Some("AutoencoderKL"));
+        std::fs::write(d.path().join("model_index.json"), r#"{"_class_name": "StableDiffusionPipeline"}"#).unwrap();
+        assert_eq!(open(&a).unwrap().sig.diffusers_class.as_deref(), Some("StableDiffusionPipeline"));
     }
 
     #[test]

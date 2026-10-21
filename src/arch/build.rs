@@ -250,7 +250,7 @@ impl<'a> Builder<'a> {
         let v = self.g.input(name.clone(), shape.clone(), dtype);
         self.inputs.insert(name.clone(), v);
         let gen = match &d.gen {
-            Some(gname) => Some((gname.clone(), self.eval(&d.args)?.to_json())),
+            Some(gname) => Some((gname.clone(), self.gen_args(&d.args)?)),
             None => None,
         };
         Ok(Some(InputPlan {
@@ -259,6 +259,20 @@ impl<'a> Builder<'a> {
             dtype,
             gen,
         }))
+    }
+
+    /// Evaluated gen-input args; strings `"step:<expr>"` stay verbatim for the runner to evaluate
+    /// per run (`runtime::diffusion`).
+    fn gen_args(&self, j: &J) -> Result<J, String> {
+        Ok(match j {
+            J::String(s) if s.starts_with("step:") => j.clone(),
+            J::Object(o) => J::Object(
+                o.iter()
+                    .map(|(k, v)| Ok((k.clone(), self.gen_args(v)?)))
+                    .collect::<Result<_, String>>()?,
+            ),
+            _ => self.eval(j)?.to_json(),
+        })
     }
 
     fn body(&mut self, nodes: &[J]) -> Result<(), String> {
