@@ -537,6 +537,10 @@ pub struct Extras {
     /// (component, weights file) replacing the snapshot's weights of that component (a derived
     /// finetune / quantization, e.g. a GGUF from another repo); config stays the snapshot's.
     pub weights: Vec<(String, std::path::PathBuf)>,
+    /// A derived repo's own `scheduler/scheduler_config.json`, replacing the snapshot's.
+    pub scheduler: Option<J>,
+    /// A derived repo's model card, read by `scheduler.sigmas: "card"` instead of the snapshot's.
+    pub card: Option<String>,
 }
 
 /// A text-to-image (and image-to-image) pipeline run from its family spec.
@@ -865,7 +869,9 @@ impl SpecDiffusion {
         let max_steps = if d.max_steps.is_null() { 100 } else { evn(&d.max_steps, "defaults.max_steps")? as usize };
 
         let s = &rt.scheduler;
-        let sched_cfg = if s.config.is_null() {
+        let sched_cfg = if let Some(c) = &extra.scheduler {
+            c.clone()
+        } else if s.config.is_null() {
             ev(&J::String("json.scheduler_config".into()), "scheduler.config")
                 .ok()
                 .filter(|v| !v.is_null())
@@ -910,7 +916,7 @@ impl SpecDiffusion {
                 }
                 let base = s.sigmas.clone().unwrap_or_else(|| "linspace".into());
                 let card = (base == "card")
-                    .then(|| std::fs::read_to_string(dir.join("README.md")).ok())
+                    .then(|| extra.card.clone().or_else(|| std::fs::read_to_string(dir.join("README.md")).ok()))
                     .flatten()
                     .and_then(|c| card_sigmas(&c));
                 Sampler::Flow {
@@ -1868,6 +1874,7 @@ pub fn load_image(
         .map_or_else(|| hub.fetch_file(repo, "README.md"), Ok)
         .and_then(|p| std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display())));
     let what = if lora { "diffusion LoRA" } else { "denoiser weights" };
+    let card_text = card.as_ref().ok().cloned();
     let base = match card.map(|c| crate::model::lora::card_base_model(&c)) {
         Ok(Some(b)) => b,
         // A LoRA without a card base may belong to another kind of model.
@@ -1930,6 +1937,12 @@ pub fn load_image(
                 Some(_) => vec![(rt.denoiser.component.clone(), weights.to_path_buf())],
                 None => Vec::new(),
             },
+            // A distilled finetune ships its own schedule: its `scheduler/` and its card's sigmas.
+            scheduler: hub
+                .fetch_file(repo, "scheduler/scheduler_config.json")
+                .ok()
+                .and_then(|p| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()),
+            card: card_text.clone(),
         };
         arc(SpecDiffusion::load(&a, hub, mode, Some(&fam), &extra))
     })())
@@ -1989,7 +2002,7 @@ fn single_file(
         is_cached: true,
         ..Default::default()
     };
-    let extra = Extras { loras, weights: parts };
+    let extra = Extras { loras, weights: parts, ..Default::default() };
     SpecDiffusion::load(&a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
 }
 

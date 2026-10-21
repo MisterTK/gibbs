@@ -181,7 +181,7 @@ pub fn load(hub: &HuggingFaceHub, plan: &Plan, mode: PlacementMode, text_encoder
         files.push((comp.clone(), hub.fetch_file(repo, file).map_err(|e| format!("{repo}/{file}: {e}"))?));
     }
     let a = ModelArtifacts { model_id: plan.label.clone(), local_dir: Some(dir), is_cached: true, ..Default::default() };
-    SpecDiffusion::load(&a, hub, mode, Some(&plan.family), &Extras { loras: Vec::new(), weights: files })
+    SpecDiffusion::load(&a, hub, mode, Some(&plan.family), &Extras { weights: files, ..Default::default() })
 }
 
 /// The loaded video plan the TUI's `/video` and `/i2v` generate with.

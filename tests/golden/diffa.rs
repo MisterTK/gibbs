@@ -46,7 +46,7 @@ fn write_specs(path: &Path, seed: u64, specs: &[(String, Vec<usize>)], dtype: St
 
 /// Runs `f` on `dev` (the spec networks are pinned to it). The Metal leg must not enter any CPU
 /// compute entry point (a silent fallback would match by construction).
-fn on<T>(dev: Device, f: impl FnOnce() -> T) -> T {
+pub(crate) fn on<T>(dev: Device, f: impl FnOnce() -> T) -> T {
     use gibbs_engine::hardware::cpu_compute::entered;
     let n = entered();
     let out = f();
@@ -57,7 +57,7 @@ fn on<T>(dev: Device, f: impl FnOnce() -> T) -> T {
 }
 
 /// Every k-th value so at most 4096 remain.
-fn stride(v: &[f32]) -> Vec<f32> {
+pub(crate) fn stride(v: &[f32]) -> Vec<f32> {
     let k = v.len().div_ceil(4096).max(1);
     v.iter().step_by(k).copied().collect()
 }
@@ -71,7 +71,7 @@ fn tol(rel: f64, cos: f64) -> Tol {
 }
 
 /// `Pin(dev)` placement of a spec network.
-fn pin(dev: Device) -> gibbs_engine::hardware::PlacementMode {
+pub(crate) fn pin(dev: Device) -> gibbs_engine::hardware::PlacementMode {
     gibbs_engine::hardware::PlacementMode::Pin(dev)
 }
 

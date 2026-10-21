@@ -268,14 +268,14 @@ fn qwen_image_v1_spec() {
     qwen_image_v1_run(true)
 }
 
-fn qwen_image_v1_run(spec: bool) {
-    use gibbs_engine::model::qwen_image_v1::{positions, Dit, Rope};
+/// Qwen-Image 1 MMDiT `diffusion_pytorch_model.safetensors` + config in `dir`: 2 blocks, dim 64 / 2
+/// heads, 64 packed latent features, text width 48.
+fn write_qwen_image_v1(dir: &std::path::Path) -> Value {
     const D: usize = 64;
     const HD: usize = 32;
     const FF: usize = 128;
     const TW: usize = 48;
     const IN: usize = 64;
-    let dir = fixture_dir(if spec { "diffb_qwen_image_v1_spec" } else { "diffb_qwen_image_v1" });
     let mut s = Spec::new();
     lin(&mut s, "img_in", D, IN, true);
     sp(&mut s, "txt_norm.weight", &[TW]);
@@ -314,6 +314,16 @@ fn qwen_image_v1_run(spec: bool) {
         "joint_attention_dim": TW, "guidance_embeds": false, "axes_dims_rope": [8, 12, 12]
     });
     write_json(&dir.join("config.json"), &cfg);
+    cfg
+}
+
+fn qwen_image_v1_run(spec: bool) {
+    use gibbs_engine::model::qwen_image_v1::{positions, Dit, Rope};
+    const TW: usize = 48;
+    const IN: usize = 64;
+    let dir = fixture_dir(if spec { "diffb_qwen_image_v1_spec" } else { "diffb_qwen_image_v1" });
+    let cfg = write_qwen_image_v1(&dir);
+    let file = dir.join("diffusion_pytorch_model.safetensors");
     let dit = (!spec).then(|| Dit::load(&Store::open(&file).unwrap(), Some(&cfg)).expect("Qwen-Image 1 fixture"));
     let (ph, pw, nt) = (5usize, 7usize, 21usize);
     let lat = rnd(11, ph * pw * IN, 1.0);
@@ -361,8 +371,9 @@ fn qwen_image21_spec() {
     qwen_image21_run(true)
 }
 
-fn qwen_image21_run(spec: bool) {
-    use gibbs_engine::model::qwen_image21::{t2i_positions, Dit21, Rope};
+/// Qwen-Image 2.1 single-stream DiT tensors (split and gate/up-fused) and config: 2 blocks, dim 64 /
+/// 2 heads, 64 latent features, text width 48.
+fn qwen_image21_fixture() -> (Vec<T>, Vec<T>, Value) {
     const D: usize = 64;
     const HD: usize = 32;
     const FF: usize = 128;
@@ -415,6 +426,14 @@ fn qwen_image21_run(spec: bool) {
         "num_layers": 2, "attention_head_dim": HD, "num_attention_heads": 2,
         "joint_attention_dim": TW, "causal_condition": true, "axes_dims_rope": [8, 12, 12]
     });
+    (split, fused, cfg)
+}
+
+fn qwen_image21_run(spec: bool) {
+    use gibbs_engine::model::qwen_image21::{t2i_positions, Dit21, Rope};
+    const TW: usize = 48;
+    const IN: usize = 64;
+    let (split, fused, cfg) = qwen_image21_fixture();
     let sfx = if spec { "_spec" } else { "" };
     let load = |case: &str, t: &[T]| {
         let dir = fixture_dir(&format!("{case}{sfx}"));
@@ -643,11 +662,9 @@ fn qwen_vae_spec() {
     qwen_vae_run(true)
 }
 
-fn qwen_vae_run(spec: bool) {
-    use gibbs_engine::model::qwen_vae::QwenVae;
-    const Z: usize = 16;
-    let (base, mult) = (4usize, [1usize, 2, 4, 4]);
-    let dir = fixture_dir(if spec { "diffb_qwen_vae_spec" } else { "diffb_qwen_vae" });
+/// Qwen-Image VAE decoder (original Wan names) `qwen_image_vae.safetensors` + config in `dir`, widths
+/// `base * mult`, `z` latent channels; returns the latent (mean, std).
+fn write_qwen_vae(dir: &std::path::Path, base: usize, mult: [usize; 4], z: usize) -> (Vec<f32>, Vec<f32>) {
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -667,8 +684,8 @@ fn qwen_vae_run(spec: bool) {
         .map(|m| base * m)
         .collect();
     let mut s = Spec::new();
-    conv(&mut s, "conv2", Z, Z, 1);
-    conv(&mut s, "decoder.conv1", Z, dims[0], 3);
+    conv(&mut s, "conv2", z, z, 1);
+    conv(&mut s, "decoder.conv1", z, dims[0], 3);
     res(&mut s, "decoder.middle.0", dims[0], dims[0]);
     let c = dims[0];
     sp(&mut s, "decoder.middle.1.norm.gamma", &[c]);
@@ -686,19 +703,29 @@ fn qwen_vae_run(spec: bool) {
             conv(&mut s, &p, cout, cout / 2, 3);
         }
     }
-    sp(&mut s, "decoder.head.0.gamma", &[dims[4]]);
-    conv(&mut s, "decoder.head.2", dims[4], 3, 3);
+    sp(&mut s, "decoder.head.0.gamma", &[dims[mult.len()]]);
+    conv(&mut s, "decoder.head.2", dims[mult.len()], 3, 3);
     let file = dir.join("qwen_image_vae.safetensors");
     write_st(&file, &synth(6, &s));
-    let (mean, std) = stats(60, Z);
+    let (mean, std) = stats(60, z);
     write_json(
         &dir.join("config.json"),
         &json!({
-            "_class_name": "AutoencoderKLQwenImage", "base_dim": base, "z_dim": Z,
+            "_class_name": "AutoencoderKLQwenImage", "base_dim": base, "z_dim": z,
             "dim_mult": mult, "num_res_blocks": 2, "attn_scales": [],
             "latents_mean": mean, "latents_std": std
         }),
     );
+    (mean, std)
+}
+
+fn qwen_vae_run(spec: bool) {
+    use gibbs_engine::model::qwen_vae::QwenVae;
+    const Z: usize = 16;
+    let (base, mult) = (4usize, [1usize, 2, 4, 4]);
+    let dir = fixture_dir(if spec { "diffb_qwen_vae_spec" } else { "diffb_qwen_vae" });
+    let (mean, std) = write_qwen_vae(&dir, base, mult, Z);
+    let file = dir.join("qwen_image_vae.safetensors");
     // runner: internal gibbs_engine::model::qwen_vae::QwenVae::{open, decode_cpu, decode_gpu}
     // (`QwenVae::load` only accepts the 96-wide production config).
     let vae = (!spec).then(|| {
@@ -741,10 +768,10 @@ fn qwen_vae21_spec() {
     qwen_vae21_run(true)
 }
 
-fn qwen_vae21_run(spec: bool) {
-    use gibbs_engine::model::qwen_vae21::QwenVae21;
-    let (mult, base, zc) = ([1usize, 2, 2, 4], 4usize, 6usize);
-    let dir = fixture_dir(if spec { "diffb_qwen_vae21_spec" } else { "diffb_qwen_vae21" });
+/// Qwen-Image 2.1 VAE decoder (diffusers names, residual, unpatched) in `dir`: widths
+/// `base * mult`, `zc` latent channels, `temporal` flags (one per downsampling level); returns the
+/// latent (mean, std).
+fn write_qwen_vae21(dir: &std::path::Path, mult: &[usize], base: usize, zc: usize, temporal: &[bool]) -> (Vec<f32>, Vec<f32>) {
     let conv = |s: &mut Spec, p: &str, i: usize, o: usize, k: usize| {
         sp(s, format!("{p}.weight"), &[o, i, k, k]);
         sp(s, format!("{p}.bias"), &[o]);
@@ -758,7 +785,7 @@ fn qwen_vae21_run(spec: bool) {
             conv(s, &format!("{p}.conv_shortcut"), i, o, 1);
         }
     };
-    let dims: Vec<usize> = std::iter::once(mult[3])
+    let dims: Vec<usize> = std::iter::once(mult[mult.len() - 1])
         .chain(mult.iter().rev().copied())
         .map(|m| m * base)
         .collect();
@@ -781,8 +808,8 @@ fn qwen_vae21_run(spec: bool) {
             conv(&mut s, &format!("{p}.upsampler.resample.1"), io[1], io[1], 3);
         }
     }
-    sp(&mut s, "decoder.norm_out.gamma", &[dims[4]]);
-    conv(&mut s, "decoder.conv_out", dims[4], 4, 3);
+    sp(&mut s, "decoder.norm_out.gamma", &[dims[mult.len()]]);
+    conv(&mut s, "decoder.conv_out", dims[mult.len()], 4, 3);
     write_st(&dir.join("diffusion_pytorch_model.safetensors"), &synth(7, &s));
     let (mean, std) = stats(70, zc);
     write_json(
@@ -790,10 +817,18 @@ fn qwen_vae21_run(spec: bool) {
         &json!({
             "_class_name": "AutoencoderKLQwenImage", "is_residual": true, "base_dim": base,
             "z_dim": zc, "dim_mult": mult, "num_res_blocks": 2,
-            "temperal_downsample": [true, false, true], "attn_scales": [],
+            "temperal_downsample": temporal, "attn_scales": [],
             "latents_mean": mean, "latents_std": std
         }),
     );
+    (mean, std)
+}
+
+fn qwen_vae21_run(spec: bool) {
+    use gibbs_engine::model::qwen_vae21::QwenVae21;
+    let (mult, base, zc) = ([1usize, 2, 2, 4], 4usize, 6usize);
+    let dir = fixture_dir(if spec { "diffb_qwen_vae21_spec" } else { "diffb_qwen_vae21" });
+    let (mean, std) = write_qwen_vae21(&dir, &mult, base, zc, &[true, false, true]);
     let vae = (!spec).then(|| QwenVae21::load(&dir).expect("Qwen VAE 2.1 fixture"));
     let (h, w) = (3usize, 2usize);
     let z = denorm(&rnd(14, zc * h * w, 1.0), h * w, &mean, &std);
@@ -1289,4 +1324,207 @@ fn krea2_spec_lora() {
     let mut r = spec_runner(&dir, "krea2_tiny.safetensors", Some("krea2"), Device::Cpu);
     let e = stray.apply(Part::Denoiser, &mut r.model, reg, 1.0).unwrap_err();
     assert!(e.contains("matches no weight"), "{e}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tiny text-to-image pipelines (tokenizer + Qwen text tower + DiT + VAE) through the public image
+// loaders: prompt template, prefix drop, schedule, guidance, latent packing and VAE affine.
+// ---------------------------------------------------------------------------------------------
+
+/// A WordLevel stand-in for the Qwen BPE: `<|im_start|>` / `<|im_end|>` special, words and every
+/// punctuation mark / newline one token (so the Qwen-Image system head is 34 tokens, like the real
+/// tokenizer), `tK` = prompt words.
+fn qwen_tokenizer_json() -> Value {
+    let words = "system user assistant Describe the image by detailing color shape size texture quantity text spatial relationships of objects and background Comprehend analyze provided prompt";
+    let mut vocab = serde_json::Map::new();
+    for (i, w) in ["<|im_start|>", "<|im_end|>", "<unk>", "\n", ",", ":", ".", "<|endoftext|>"]
+        .into_iter()
+        .chain(words.split(' '))
+        .enumerate()
+    {
+        vocab.insert(w.into(), json!(i));
+    }
+    let n = vocab.len();
+    for k in 0..32 {
+        vocab.insert(format!("t{k}"), json!(n + k));
+    }
+    let added: Vec<Value> = [("<|im_start|>", 0), ("<|im_end|>", 1), ("<|endoftext|>", 7)]
+        .iter()
+        .map(|(s, id)| {
+            json!({"id": id, "content": s, "single_word": false, "lstrip": false,
+                   "rstrip": false, "normalized": false, "special": true})
+        })
+        .collect();
+    json!({
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+            {"type": "Split", "pattern": {"String": " "}, "behavior": "Removed", "invert": false},
+            {"type": "Split", "pattern": {"Regex": "[^\\w\\s]|\\n"}, "behavior": "Isolated", "invert": false}
+        ]},
+        "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": vocab, "unk_token": "<unk>"}
+    })
+}
+
+/// A dense Qwen text tower in `dir` (bf16): `kind` `qwen3` (q/k norm), `qwen3_vl` (nested
+/// `text_config`, interleaved M-RoPE, `model.language_model.`) or `qwen2_5_vl` (qkv biases).
+fn write_qwen_te(dir: &std::path::Path, kind: &str, hidden: usize, layers: usize, seed: u64) {
+    let (heads, kv, hd, inter, vocab) = (4usize, 2usize, 16usize, 64usize, 96usize);
+    let p = if kind == "qwen3_vl" { "model.language_model" } else { "model" };
+    let mut w = Weights::new(seed);
+    w.w(format!("{p}.embed_tokens.weight"), &[vocab, hidden]);
+    for l in 0..layers {
+        let lp = format!("{p}.layers.{l}");
+        let a = format!("{lp}.self_attn");
+        w.norm(format!("{lp}.input_layernorm.weight"), hidden, 1.0)
+            .norm(format!("{lp}.post_attention_layernorm.weight"), hidden, 1.0)
+            .w(format!("{a}.q_proj.weight"), &[heads * hd, hidden])
+            .w(format!("{a}.k_proj.weight"), &[kv * hd, hidden])
+            .w(format!("{a}.v_proj.weight"), &[kv * hd, hidden])
+            .w(format!("{a}.o_proj.weight"), &[hidden, heads * hd]);
+        if kind == "qwen2_5_vl" {
+            w.s(format!("{a}.q_proj.bias"), &[heads * hd], 0.2)
+                .s(format!("{a}.k_proj.bias"), &[kv * hd], 0.2)
+                .s(format!("{a}.v_proj.bias"), &[kv * hd], 0.2);
+        } else {
+            w.norm(format!("{a}.q_norm.weight"), hd, 1.0).norm(format!("{a}.k_norm.weight"), hd, 1.0);
+        }
+        w.w(format!("{lp}.mlp.gate_proj.weight"), &[inter, hidden])
+            .w(format!("{lp}.mlp.up_proj.weight"), &[inter, hidden])
+            .w(format!("{lp}.mlp.down_proj.weight"), &[hidden, inter]);
+    }
+    w.norm(format!("{p}.norm.weight"), hidden, 1.0);
+    write_st_as(&dir.join("model.safetensors"), &w.tensors, StDtype::BF16);
+    let mut text = json!({
+        "model_type": kind, "hidden_size": hidden, "vocab_size": vocab, "num_hidden_layers": layers,
+        "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+        "intermediate_size": inter, "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0, "tie_word_embeddings": true
+    });
+    let cfg = match kind {
+        "qwen3_vl" => {
+            text["model_type"] = json!("qwen3_vl_text");
+            text["rope_scaling"] = json!({"rope_type": "default", "mrope_interleaved": true, "mrope_section": [4, 2, 2]});
+            json!({"model_type": "qwen3_vl", "architectures": ["Qwen3VLForConditionalGeneration"], "text_config": text})
+        }
+        "qwen2_5_vl" => {
+            text["architectures"] = json!(["Qwen2_5_VLForConditionalGeneration"]);
+            text["rope_scaling"] = json!({"type": "mrope", "mrope_section": [4, 2, 2]});
+            text
+        }
+        _ => {
+            text["architectures"] = json!(["Qwen3Model"]);
+            text
+        }
+    };
+    write_json(&dir.join("config.json"), &cfg);
+}
+
+fn flow_scheduler(dir: &std::path::Path, dynamic: bool) {
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
+                "shift": 3.0, "use_dynamic_shifting": dynamic, "base_shift": 0.5, "max_shift": 0.9,
+                "base_image_seq_len": 256, "max_image_seq_len": 8192, "shift_terminal": if dynamic { json!(0.02) } else { Value::Null }}),
+    );
+}
+
+/// Runs `req` through the public image loaders (spec families first, then the legacy ones) on
+/// every device; pixels every k-th value.
+fn pipeline_golden(case: &str, dir: &std::path::Path, req: gibbs_engine::runtime::diffusion::ImageRequest) {
+    use crate::diffa::{on, pin, stride};
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    let hub = HuggingFaceHub::with_cache_dir(dir.join("hub"));
+    let art = artifacts(dir, &format!("golden/{case}"), "none");
+    let (w, h) = (req.width.unwrap(), req.height.unwrap());
+    golden(case, Tol { rel: 2e-3, cos: 0.99999 }, |dev| {
+        // runner: runtime::diffusion::load_image, then model::text_to_image::load_image_model
+        // (the image-repo chain of `arch::load_model`), pinned to `dev`
+        let p = gibbs_engine::runtime::diffusion::load_image(&art, &hub, pin(dev))
+            .or_else(|| gibbs_engine::model::text_to_image::load_image_model(&art, &hub))
+            .expect("image repo")
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let img = on(dev, || p.text_to_image(&req)).unwrap_or_else(|e| panic!("{case}: {e}"));
+        assert_eq!((img.width, img.height), (w, h));
+        let px: Vec<f32> = img.data.iter().map(|&v| v as f32).collect();
+        let mut o = Out::default();
+        o.f("pixels", &stride(&px));
+        o
+    });
+}
+
+fn request(prompt: &str, guidance: f32, seed: u64) -> gibbs_engine::runtime::diffusion::ImageRequest {
+    gibbs_engine::runtime::diffusion::ImageRequest {
+        prompt: prompt.into(),
+        width: Some(32),
+        height: Some(32),
+        steps: Some(2),
+        guidance: Some(guidance),
+        seed,
+        ..Default::default()
+    }
+}
+
+/// Z-Image: Qwen3 tower (second-to-last layer), S3-DiT with in-graph patchify, SD VAE (4 latent
+/// channels); CFG with `guidance + 1` and the negated velocity.
+#[test]
+fn zimage_pipeline() {
+    let case = "diffb_zimage_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "ZImagePipeline"}));
+    flow_scheduler(&dir, false);
+    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen3", 48, 3, 0x5A01);
+    zimage_fixture(&format!("{case}/transformer"));
+    crate::diffa::write_sd_vae(&dir, &[32, 32, 32, 32]);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 0.5, 9));
+}
+
+/// Qwen-Image 1: Qwen2.5-VL tower (final-normed, 34-token head dropped), MMDiT on 2x2-packed
+/// latents, rescaled CFG, dynamic shift with a terminal, Qwen VAE.
+#[test]
+fn qwen_image_v1_pipeline() {
+    let case = "diffb_qwen_image_v1_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImagePipeline"}));
+    flow_scheduler(&dir, true);
+    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen2_5_vl", 48, 3, 0x5A02);
+    write_qwen_image_v1(&fixture_dir(&format!("{case}/transformer")));
+    write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 4.0, 10));
+}
+
+/// Qwen-Image 2.1: Qwen3-VL tower (last layer before its norm, system turn dropped), single-stream
+/// DiT on token latents, CFG, 64-channel residual VAE (16x), RGBA over white.
+#[test]
+fn qwen_image21_pipeline() {
+    let case = "diffb_qwen_image21_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "QwenImage21Pipeline"}));
+    flow_scheduler(&dir, true);
+    write_json(&dir.join("processor/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 48, 3, 0x5A03);
+    let (split, _, cfg) = qwen_image21_fixture();
+    let t = fixture_dir(&format!("{case}/transformer"));
+    write_st(&t.join("diffusion_pytorch_model.safetensors"), &split);
+    write_json(&t.join("config.json"), &cfg);
+    write_qwen_vae21(&fixture_dir(&format!("{case}/vae")), &[1, 1, 1, 1, 1], 4, 64, &[false, true, false, false]);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 2.0, 11));
+}
+
+/// Krea 2 (Raw): 12 taps of a 36-layer Qwen3-VL tower fused in-model, the 2-block DiT on 2x2-packed
+/// latents, CFG with `guidance + 1`, dynamic mu, Qwen VAE.
+#[test]
+fn krea2_pipeline() {
+    let case = "diffb_krea2_pipeline";
+    let dir = fixture_dir(case);
+    write_json(&dir.join("model_index.json"), &json!({"_class_name": "Krea2Pipeline", "is_distilled": false}));
+    flow_scheduler(&dir, true);
+    write_json(&dir.join("tokenizer/tokenizer.json"), &qwen_tokenizer_json());
+    write_qwen_te(&dir.join("text_encoder"), "qwen3_vl", 32, 36, 0x5A04);
+    krea2_fixture(&format!("{case}/transformer"));
+    write_qwen_vae(&fixture_dir(&format!("{case}/vae")), 4, [1, 2, 4, 4], 16);
+    pipeline_golden(case, &dir, request("t3 t7 t11", 4.5, 12));
 }

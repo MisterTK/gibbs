@@ -327,8 +327,7 @@ impl QwenVae {
     pub fn load(dir: &Path) -> Result<Self, String> {
         let cfg = crate::model::dit::read_config(dir).unwrap_or(Value::Null);
         if !cfg.is_null() {
-            let ok = cfg["base_dim"].as_u64().unwrap_or(BASE as u64) == BASE as u64
-                && cfg["z_dim"].as_u64().unwrap_or(Z as u64) == Z as u64
+            let ok = cfg["z_dim"].as_u64().unwrap_or(Z as u64) == Z as u64
                 && cfg["dim_mult"].as_array().is_none_or(|m| {
                     m.iter()
                         .filter_map(Value::as_u64)
@@ -355,7 +354,7 @@ impl QwenVae {
             &Weights::open(&crate::model::hub::component_weights(dir)?)?,
             stats("latents_mean", &MEAN),
             stats("latents_std", &STD),
-            BASE,
+            cfg["base_dim"].as_u64().map_or(BASE, |b| b as usize),
         )
     }
 
