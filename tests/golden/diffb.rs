@@ -122,6 +122,12 @@ fn pack2x2(lat: &[f32], c: usize, h: usize, w: usize, unpack: bool) -> Vec<f32> 
     out
 }
 
+/// Every checkpoint tensor was read by some instance (or is `ignore`d).
+fn assert_consumed(r: &Runner) {
+    let left = r.unconsumed();
+    assert!(left.is_empty(), "unconsumed tensors: {left:?}");
+}
+
 /// Output `out` of `component` (f32).
 fn run1(r: &mut Runner, component: &str, vars: &[(&str, Val)], ins: Vec<Tensor>, out: &str) -> Vec<f32> {
     let mut o = r.run(component, vars, ins).unwrap_or_else(|e| panic!("{e}"));
@@ -222,6 +228,9 @@ fn zimage() {
 /// The `zimage` spec's `denoiser` on the same fixture.
 #[test]
 fn zimage_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     const CAP: usize = 48;
     const IN: usize = 4;
     let dir = zimage_fixture("diffb_zimage_spec");
@@ -236,6 +245,7 @@ fn zimage_spec() {
             let y = run1(&mut r, "denoiser", &vars, vec![F32(lat), F32(cap)], "out");
             o.f(format!("out_{h}x{w}_cap{n_cap}_s{sigma}"), &y);
         }
+        assert_consumed(&r);
         o
     });
 }
@@ -250,6 +260,9 @@ fn qwen_image_v1() {
 /// The `qwen_image` spec's `denoiser` on the same fixture.
 #[test]
 fn qwen_image_v1_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     qwen_image_v1_run(true)
 }
 
@@ -322,6 +335,9 @@ fn qwen_image_v1_run(spec: bool) {
             };
             o.f(format!("out_s{sigma}"), &y);
         }
+        if let Some(r) = &r {
+            assert_consumed(r);
+        }
         o
     });
 }
@@ -337,6 +353,9 @@ fn qwen_image21() {
 /// The `qwen_image21` spec's `denoiser` on the same fixtures (split and fused).
 #[test]
 fn qwen_image21_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     qwen_image21_run(true)
 }
 
@@ -430,6 +449,9 @@ fn qwen_image21_run(spec: bool) {
                 };
                 o.f(format!("{name}_s{sigma}"), &y);
             }
+            if let Some(r) = &r {
+                assert_consumed(r);
+            }
         }
         o
     });
@@ -445,6 +467,9 @@ fn krea2() {
 /// The `krea2` spec's `fuse` + `denoiser` on the same fixture.
 #[test]
 fn krea2_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     krea2_run(true)
 }
 
@@ -513,6 +538,7 @@ fn krea2_run(spec: bool) {
                 let y = run1(&mut r, "denoiser", &vars, vec![F32(pack2x2(&lat, 16, h, w, false)), F32(ctx.clone())], "out");
                 o.f(format!("forward_s{sigma}"), &pack2x2(&y, 16, h, w, true));
             }
+            assert_consumed(&r);
             return o;
         }
         let dit = dit.as_ref().unwrap();
@@ -605,6 +631,9 @@ fn qwen_vae() {
 /// The `qwen_vae` spec's `decoder` on the same fixture.
 #[test]
 fn qwen_vae_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     qwen_vae_run(true)
 }
 
@@ -675,7 +704,9 @@ fn qwen_vae_run(spec: bool) {
         let vae = vae.as_ref();
         let y = if spec {
             let mut r = spec_runner(&dir, "qwen_image_vae.safetensors", None, dev);
-            run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image")
+            let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+            assert_consumed(&r);
+            y
         } else if metal(dev) {
             let vae = vae.unwrap();
             vae.decode_gpu(&z, h, w).unwrap()
@@ -698,6 +729,9 @@ fn qwen_vae21() {
 /// The `qwen_vae21` spec's `decoder` on the same fixture.
 #[test]
 fn qwen_vae21_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     qwen_vae21_run(true)
 }
 
@@ -762,6 +796,7 @@ fn qwen_vae21_run(spec: bool) {
         let (y, oh, ow) = if spec {
             let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", Some("qwen_vae21"), dev);
             let y = run1(&mut r, "decoder", &[("h", num(h)), ("w", num(w))], vec![F32(z.clone())], "image");
+            assert_consumed(&r);
             let n = y.len() / 4;
             let s = ((n / (h * w)) as f64).sqrt() as usize;
             (y, s * h, s * w)
@@ -1059,6 +1094,9 @@ fn qwen2_5_vl_text() {
 /// The `qwen2_5_vl_text` spec's `text` component (head `hidden`) on the same fixture.
 #[test]
 fn qwen2_5_vl_text_spec() {
+    if writing() {
+        return; // the old runner owns the JSON
+    }
     qwen2_5_vl_text_run(true)
 }
 
@@ -1092,7 +1130,10 @@ fn qwen2_5_vl_text_run(spec: bool) {
     // runner: internal gibbs_engine::model::qwen3_5::Qwen3Encoder::hidden_states_normed (CPU only)
     golden("diffb_qwen2_5_vl_text", TOL, |dev| {
         let y = if spec {
-            spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev).lm(&ids, 0, "hidden", "hidden", vec![])
+            let mut r = spec_runner(&dir, "model.safetensors", Some("qwen2_5_vl_text"), dev);
+            let y = r.lm(&ids, 0, "hidden", "hidden", vec![]);
+            assert_consumed(&r);
+            y
         } else {
             let _cpu = gibbs_engine::hardware::cpu_compute::allow();
             gibbs_engine::model::qwen3_5::Qwen3Encoder::open(&dir).unwrap().hidden_states_normed(&ids).unwrap()
