@@ -16,7 +16,7 @@ const KV_HEADS: usize = 1;
 const INTER: usize = 96;
 /// DeltaNet: 1 key head, 2 value heads, 16-wide, conv kernel 4 -> conv dim 64.
 const CD: usize = 64;
-pub(super) const IMAGE_TOKEN: u32 = 90;
+pub(crate) const IMAGE_TOKEN: u32 = 90;
 
 fn values(name: &str, n: usize) -> Vec<f32> {
     let seed: usize = name.bytes().enumerate().map(|(i, b)| (i + 1) * b as usize).sum();
@@ -112,7 +112,7 @@ fn mtp_specs(specs: &mut Vec<(String, Vec<usize>)>) {
 
 /// Layers: DeltaNet, DeltaNet, gated attention (so deepstack layer 0 is recurrent); optional
 /// vision tower and MTP head. `cfg` is the whole `config.json`.
-pub(super) fn checkpoint(vision: bool, mtp: bool) -> (Weights, Value) {
+pub(crate) fn checkpoint(vision: bool, mtp: bool) -> (Weights, Value) {
     let mut specs: Vec<(String, Vec<usize>)> = vec![
         ("model.embed_tokens.weight".into(), vec![V, H]),
         ("model.norm.weight".into(), vec![H]),

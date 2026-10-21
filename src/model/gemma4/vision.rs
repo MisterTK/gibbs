@@ -184,7 +184,7 @@ impl Vision {
 
     /// Decodes and resizes the image to its [`target_size`], then cuts `[np, p·p·3]` patches
     /// (`(py, px, c)` inside each patch, rescaled to `[-1, 1]`); returns them with the patch grid.
-    fn preprocess(&self, bytes: &[u8]) -> Result<(Vec<f32>, usize, usize), String> {
+    pub(crate) fn preprocess(&self, bytes: &[u8]) -> Result<(Vec<f32>, usize, usize), String> {
         let img = ImageBuffer::decode(bytes)?;
         let (p, k) = (self.patch, self.pool);
         let (th, tw) = target_size(img.height, img.width, p, self.max_soft * k * k, k)?;

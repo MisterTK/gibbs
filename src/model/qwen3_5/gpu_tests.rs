@@ -9,25 +9,24 @@ use super::*;
 use crate::hardware::{cpu_compute, PlacementMode};
 use crate::model::native::MediaInput;
 
-const PRE: &str = r#"{"size":{"shortest_edge":64,"longest_edge":100000},
+pub(crate) const PRE: &str = r#"{"size":{"shortest_edge":64,"longest_edge":100000},
     "image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]}"#;
 
 fn tokenizer() -> Tokenizer {
     Tokenizer::from_tokens((0..V).map(|i| format!("t{i}")).collect())
 }
 
+/// The tiny checkpoint as a model on `mode`.
+pub(crate) fn model(vision: bool, mtp: bool, mode: Device) -> Arc<dyn NativeLm> {
+    let (ck, cfg) = checkpoint(vision, mtp);
+    let text = Arc::new(TextModel::load(&ck, text_config(&cfg), Arch::Qwen35).unwrap());
+    let vis = load_vision(&ck, &cfg, &text, || Preprocessor::parse(PRE.as_bytes(), "test")).unwrap();
+    assemble(tokenizer(), text, vis, PlacementMode::Pin(mode)).unwrap()
+}
+
 /// Host and Metal models over one checkpoint.
 fn pair(vision: bool, mtp: bool) -> (Arc<dyn NativeLm>, Arc<dyn NativeLm>) {
-    let (ck, cfg) = checkpoint(vision, mtp);
-    let build = |mode: Device| {
-        let text = Arc::new(TextModel::load(&ck, text_config(&cfg), Arch::Qwen35).unwrap());
-        let vis = load_vision(&ck, &cfg, &text, || {
-            Preprocessor::parse(PRE.as_bytes(), "test")
-        })
-        .unwrap();
-        assemble(tokenizer(), text, vis, PlacementMode::Pin(mode)).unwrap()
-    };
-    (build(Device::Cpu), build(Device::Metal))
+    (model(vision, mtp, Device::Cpu), model(vision, mtp, Device::Metal))
 }
 
 fn rel(a: &[f32], b: &[f32]) -> f32 {
@@ -47,7 +46,7 @@ fn argmax(v: &[f32]) -> u32 {
         .0 as u32
 }
 
-fn png(w: usize, h: usize) -> Vec<u8> {
+pub(crate) fn png(w: usize, h: usize) -> Vec<u8> {
     let mut img = ImageBuffer::new(w, h);
     for (i, px) in img.data.iter_mut().enumerate() {
         *px = ((i * 37 + (i / 7) * 11) % 251) as u8;

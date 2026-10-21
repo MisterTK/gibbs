@@ -181,14 +181,10 @@ impl VisionEmbedder {
             .run(vec![Tensor::F32(pix.to_vec()), Tensor::F32(xs), Tensor::F32(ys)])?;
         out.into_iter().next().ok_or("vision program returned nothing")?.into_f32()
     }
-}
 
-impl Encoder for VisionEmbedder {
-    fn count(&self, bytes: &[u8]) -> Result<usize, String> {
-        soft_tokens(bytes, self.patch, self.max_soft, self.pool)
-    }
-
-    fn encode(&self, bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
+    /// Decodes and resizes the image to its [`target_size`], then cuts model patches in raster
+    /// order, each its (row, col, rgb) pixels rescaled to [0, 1]: `[n, patch px]`, `n`, grid width.
+    pub(crate) fn patches(&self, bytes: &[u8]) -> Result<(Vec<f32>, usize, usize), String> {
         let img = ImageBuffer::decode(bytes)?;
         let (k, mp) = (self.pool, self.patch * self.pool);
         let (th, tw) = target_size(img.height, img.width, self.patch, self.max_soft * k * k, k)?;
@@ -205,7 +201,6 @@ impl Encoder for VisionEmbedder {
                 self.pos.rows
             ));
         }
-        // Model patches in raster order, each its (row, col, rgb) pixels rescaled to [0, 1].
         let pd = mp * mp * 3;
         let mut pix = vec![0.0f32; n * pd];
         for (i, patch) in pix.chunks_exact_mut(pd).enumerate() {
@@ -220,6 +215,17 @@ impl Encoder for VisionEmbedder {
                 }
             }
         }
+        Ok((pix, n, gw))
+    }
+}
+
+impl Encoder for VisionEmbedder {
+    fn count(&self, bytes: &[u8]) -> Result<usize, String> {
+        soft_tokens(bytes, self.patch, self.max_soft, self.pool)
+    }
+
+    fn encode(&self, bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
+        let (pix, n, gw) = self.patches(bytes)?;
         let rows = match &self.gpu {
             Some(gpu) => self.forward_gpu(gpu, &pix, n, gw)?,
             None => self.forward_cpu(&pix, n, gw),
@@ -323,7 +329,7 @@ impl Encoder for AudioEmbedder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::text::TextModel;
     use super::super::{Gemma4, State};
     use super::*;
@@ -334,7 +340,7 @@ mod tests {
     /// A 2-layer `gemma4_unified` (sliding + full attention with `attention_k_eq_v`, image blocks
     /// bidirectional) with pseudo-random weights: the real checkpoint's layout and code paths at
     /// toy size.
-    fn tiny_weights() -> Weights {
+    pub(crate) fn tiny_weights() -> Weights {
         let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
         let mut t = |n: &str, s: &[usize]| specs.push((n.to_string(), s.to_vec()));
         let p = "model.language_model";
@@ -395,7 +401,7 @@ mod tests {
         .unwrap()
     }
 
-    fn tiny() -> Gemma4 {
+    pub(crate) fn tiny() -> Gemma4 {
         let w = tiny_weights();
         let tc = serde_json::json!({
             "hidden_size": H, "num_hidden_layers": 2, "num_attention_heads": 2,
@@ -429,7 +435,7 @@ mod tests {
     }
 
     /// 16-bit mono PCM WAV of a 440 Hz tone.
-    fn wav(rate: u32, samples: usize) -> Vec<u8> {
+    pub(crate) fn wav(rate: u32, samples: usize) -> Vec<u8> {
         let mut b = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
         b.extend(16u32.to_le_bytes());
         b.extend([1u16, 1].iter().flat_map(|v| v.to_le_bytes()));
@@ -445,7 +451,7 @@ mod tests {
         b
     }
 
-    fn photo() -> Vec<u8> {
+    pub(crate) fn photo() -> Vec<u8> {
         std::fs::read("/tmp/gibbs-testimg/cat.jpg").unwrap_or_else(|_| {
             let mut img = ImageBuffer::new(200, 150);
             (0..200 * 150).for_each(|i| img.set_pixel(i % 200, i / 200, i as u8, 90, 200));
