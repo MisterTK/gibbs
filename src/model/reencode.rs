@@ -696,7 +696,7 @@ pub fn reencode_native(
     // `f`'s relative RMSE over the tensor, and with `keep` its blocks (`None`: no block format).
     let mut encode = |f: Q, keep: bool| {
         let mut err = (0.0, 0.0);
-        let mut blocks = keep.then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
+        let mut blocks = (keep && !is_float(f)).then(|| Vec::with_capacity(rows * f.tensor_bytes(cols)));
         for part in raw.chunks(run * row_bytes) {
             let x = &mut x[..part.len() / block_bytes * elems];
             for (b, out) in part.chunks_exact(block_bytes).zip(x.chunks_exact_mut(elems)) {
@@ -1445,5 +1445,53 @@ mod tests {
         std::fs::write(&bin, b"short").unwrap();
         assert!(CacheReader::open(dir.path(), 7).is_none());
         assert!(!bin.exists() && !json.exists());
+    }
+
+    /// The row-run trial picks the same format and blocks as one whole-tensor encode, over a
+    /// tensor spanning several runs with a short last one.
+    #[test]
+    fn native_trial_in_row_runs_matches_whole_tensor() {
+        let (cols, src) = (256, Q::GGUF_Q8_0);
+        let rows = 2 * (TRIAL_VALUES / cols) + 5;
+        let mut s = 0x9e3779b97f4a7c15u64;
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let QuantizedWeight::GgufQuantized { raw_data: raw, .. } = encode_weight(&w, cols, rows, src, 4) else {
+            panic!("Q8_0 encodes to blocks");
+        };
+        let cfg = crate::model::weight_format::ReencodeConfig {
+            policy: MaxSpeed,
+            cache_dir: None,
+            ..Default::default()
+        };
+        // The whole-tensor procedure the row runs replace.
+        let whole = || -> Option<(Q, Vec<u8>)> {
+            let Target::Encode(f) = rule(cfg.policy, src) else { return None };
+            let f = fit(f, cols, Q::FP32);
+            let (elems, block_bytes, decode) = gguf_block_codec(src)?;
+            let mut data = vec![0.0f32; rows * cols];
+            for (b, o) in raw.chunks_exact(block_bytes).zip(data.chunks_exact_mut(elems)) {
+                decode(b, o);
+            }
+            let (mut f, mut q) = (f, encode_weight(&data, cols, rows, f, 4));
+            while relative_rmse(&data, &q.to_f32()) > TENSOR_RMSE_LIMIT {
+                let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else { break };
+                (f, q) = (next, encode_weight(&data, cols, rows, next, 4));
+            }
+            if !beats_source(f, src, &crate::model::variant::host_gbps) {
+                return None;
+            }
+            let QuantizedWeight::GgufQuantized { raw_data, .. } = q else { return None };
+            Some((f, raw_data.to_vec()))
+        };
+        let want = whole();
+        assert!(want.is_some(), "MaxSpeed re-stores Q8_0 here: the test compares blocks");
+        assert_eq!(reencode_native(&cfg, "layers.0.mlp.up.weight", src, rows, cols, &raw), want);
     }
 }
