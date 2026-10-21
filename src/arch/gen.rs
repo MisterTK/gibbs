@@ -985,7 +985,9 @@ mod tests {
         /// per id), old formulas inlined.
         #[test]
         fn sd_embeddings_match_sources() {
-            // `sd.rs` `guidance_embedding`, verbatim (f32 sin/cos codegen depends on loop shape).
+            // `sd.rs` `guidance_embedding`, verbatim; `black_box` keeps LLVM from folding the
+            // sin/cos of constants at compile time (an ulp off the runtime libm).
+            #[inline(never)]
             fn guidance_embedding(w: f32, dim: usize) -> Vec<f32> {
                 let half = dim / 2;
                 let w = w * 1000.0;
@@ -996,23 +998,27 @@ mod tests {
                 e
             }
             let (w, dim) = (6.5f32, 16usize);
-            let want = guidance_embedding(w, dim);
+            let want = guidance_embedding(std::hint::black_box(w), dim);
             let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
                 "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
 
             let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
-            let emb = |t: f32| {
-                let half = 128;
-                let mut e = vec![0.0f32; 256];
+            // `unet.rs` `timestep_embedding`, verbatim.
+            #[inline(never)]
+            fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let mut emb = vec![0.0f32; dim];
                 for i in 0..half {
-                    let arg = t * (-(10000f32.ln()) * i as f32 / half as f32).exp();
-                    e[i] = arg.cos();
-                    e[half + i] = arg.sin();
+                    let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                    let arg = t * freq;
+                    emb[i] = arg.cos();
+                    emb[half + i] = arg.sin();
                 }
-                e
-            };
-            let want: Vec<f32> = ids.iter().flat_map(|&t| emb(t)).collect();
+                emb
+            }
+            let want: Vec<f32> =
+                std::hint::black_box(ids).iter().flat_map(|&t| timestep_embedding(t, 256)).collect();
             let got = f("timestep_embedding", json!({"t": ids, "dim": 256, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
         }

@@ -105,9 +105,15 @@ fn toy_spec_denoising_loop_and_vae_decode() {
     std::fs::write(dir.join("config.json"), r#"{"model_type": "toy_diffusion"}"#).unwrap();
     let cpu = run(&dir, Device::Cpu);
     assert!(cpu.iter().all(|v| v.is_finite()));
+    // On macOS the Metal leg is required (no silent CPU-only pass).
+    assert!(
+        !cfg!(target_os = "macos") || available_devices().contains(&Device::Metal),
+        "no Metal device on macOS"
+    );
     if available_devices().contains(&Device::Metal) {
         let gpu = run(&dir, Device::Metal);
         let worst = cpu.iter().zip(&gpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        println!("Metal vs CPU max diff {worst}");
         assert!(worst < 1e-4, "Metal vs CPU max diff {worst}");
     }
     std::fs::remove_dir_all(&dir).ok();

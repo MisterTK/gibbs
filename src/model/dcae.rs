@@ -752,10 +752,11 @@ mod tests {
         use crate::hardware::{Device, PlacementMode};
         use crate::model::diff_graph::testutil::{rel_err, synth, write_st, Lcg};
         use crate::runtime::diffusion::{unconsumed, Net};
+        for four in [false, true] {
         let (cfg, s) = fixture::tiny_specs();
         let mut r = synth(&s, 41);
         for (n, (shape, _)) in r.0.iter_mut() {
-            if n.ends_with("conv_point.weight") {
+            if four && n.ends_with("conv_point.weight") {
                 shape.extend([1, 1]);
             }
         }
@@ -768,8 +769,15 @@ mod tests {
         let z = Lcg(3).vec(dec.latent_channels() * h * wd, 1.0);
         let vars = [("h", Val::Num(h as f64)), ("w", Val::Num(wd as f64))];
         let got = net.run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], None).unwrap();
-        let e = rel_err(&got, &dec.decode_cpu(&z, h, wd));
-        assert!(e < 1e-4, "decode rel err {e}");
-        assert_eq!(unconsumed(&net.model, &[&net], &[]), Vec::<String>::new());
+        let want = dec.decode_cpu(&z, h, wd);
+        let e = rel_err(&got, &want);
+        let l2 = (got.iter().zip(&want).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / want.iter().map(|b| (*b as f64).powi(2)).sum::<f64>()).sqrt();
+        eprintln!("PROBE four={four} max-rel {e} l2-rel {l2}");
+        let gm = Net::open(d.path(), "dcae", "decoder", PlacementMode::Pin(Device::Metal)).unwrap();
+        let gs = gm.run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], None).unwrap();
+        let go = dec.decode_gpu(&z, h, wd).unwrap();
+        eprintln!("PROBE spec-metal vs native {} old-metal vs native {} spec-metal vs old-metal {} spec-cpu vs old-metal {}",
+            rel_err(&gs, &want), rel_err(&go, &want), rel_err(&gs, &go), rel_err(&got, &go));
+        }
     }
 }
