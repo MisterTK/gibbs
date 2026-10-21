@@ -1,0 +1,86 @@
+// GPT-2 and GPT-Neo (`transformer.h.*`): learned absolute positions, biased pre-LN blocks, plain
+// MLP, head tied to `wte`. GPT-2 stores Conv1D `[in, out]` weights (transposed at load) and a
+// fused c_attn (split at load); GPT-Neo has separate q/k/v, unscaled attention scores and local
+// (windowed) layers. Sequence classification: `head: 'score'` reads row `last_index`.
+{
+  family: "gpt2",
+  match: {hf_model_type: ["gpt2", "gpt_neo"], hf_architectures: ["GPT2LMHeadModel", "GPT2ForSequenceClassification", "GPTNeoForCausalLM"]},
+  pipeline: "causal_lm",
+  use_lib: ["transformer"],
+  names: {rules: [
+    // Bare `GPT2Model` checkpoints.
+    ["wte.weight", "transformer.wte.weight"], ["wpe.weight", "transformer.wpe.weight"],
+    ["h.{i}.{r:*}", "transformer.h.{i}.{r}"], ["ln_f.{r:*}", "transformer.ln_f.{r}"],
+  ]},
+  config: {
+    neo: "cfg.model_type == 'gpt_neo'",
+    hidden: "first(cfg.n_embd, cfg.hidden_size)",
+    layers: "first(cfg.n_layer, cfg.num_layers)",
+    heads: "first(cfg.n_head, cfg.num_heads)",
+    kv_heads: "heads",
+    head_dim: "hidden // heads",
+    vocab: "first(shape('transformer.wte.weight')[0], cfg.vocab_size)",
+    positions: "shape('transformer.wpe.weight')[0]",
+    eps: "first(cfg.layer_norm_epsilon, 1e-5)",
+    act: "first(cfg.activation_function, 'gelu_new') == 'gelu' ? 'GeluErf' : contains(['gelu_new', 'gelu_fast', 'gelu_pytorch_tanh'], first(cfg.activation_function, 'gelu_new')) ? 'GeluTanh' : cfg.activation_function == 'relu' ? 'Relu' : 'Silu'",
+    rotary_dim: "0",
+    // GPT-Neo does not scale attention scores.
+    attn_scale: "neo ? 1 : 1 / sqrt(head_dim)",
+    ctx: "min(first(runtime.ctx, 4096), positions)",
+  },
+  checks: [
+    {expr: "cfg.scale_attn_by_inverse_layer_idx == true || cfg.scale_attn_weights == false", error: "only 1/sqrt(head_dim) attention scaling is supported"},
+    {expr: "!contains(['gelu', 'gelu_new', 'gelu_fast', 'gelu_pytorch_tanh', 'relu'], first(cfg.activation_function, 'gelu_new'))",
+     error: "activation_function {cfg.activation_function} is not supported"},
+  ],
+  transforms: [
+    // Conv1D [in, out] -> [out, in].
+    {tensor: "transformer.h.{i}.attn.c_attn.weight", op: "transpose", when: "!neo"},
+    {tensor: "transformer.h.{i}.attn.c_proj.weight", op: "transpose", when: "!neo"},
+    {tensor: "transformer.h.{i}.mlp.c_fc.weight", op: "transpose", when: "!neo"},
+    {tensor: "transformer.h.{i}.mlp.c_proj.weight", op: "transpose", when: "!neo"},
+    {tensor: "transformer.h.{i}.attn.c_attn.weight", op: "split_rows", args: {parts: [
+      ["transformer.h.{i}.attn.q.weight", "hidden"], ["transformer.h.{i}.attn.k.weight", "hidden"], ["transformer.h.{i}.attn.v.weight", "hidden"]]}},
+    {tensor: "transformer.h.{i}.attn.c_attn.bias", op: "split_rows", args: {parts: [
+      ["transformer.h.{i}.attn.q.bias", "hidden"], ["transformer.h.{i}.attn.k.bias", "hidden"], ["transformer.h.{i}.attn.v.bias", "hidden"]]}},
+  ],
+  // Causal-mask buffers of old checkpoints.
+  ignore: ["transformer.h.*.attn.bias", "transformer.h.*.attn.masked_bias", "transformer.h.*.attn.attention.bias", "transformer.h.*.attn.attention.masked_bias"],
+  components: {
+    text: {
+      vars: ["rows", "head"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+        {name: "last_index", dtype: "u32", shape: [1], when: "head == 'score'"},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:transformer.wte.weight", "i:token_ids"], out: "x", name: "wte"},
+        {op: "Embedding", in: ["w:transformer.wpe.weight", "i:positions"], out: "pe", name: "wpe"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "pe"], out: "x", name: "embed"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('transformer.h.{i}')"}},
+          {let: {a: "neo ? fmt('{p}.attn.attention') : fmt('{p}.attn')"}},
+          {use: "layer_norm", args: {w: "fmt('{p}.ln_1')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "attn_cached", in: ["h"], out: "y", name: "l{i}.attn", args: {
+            layer: "i", wq: "neo ? fmt('{a}.q_proj') : fmt('{a}.q')", wk: "neo ? fmt('{a}.k_proj') : fmt('{a}.k')",
+            wv: "neo ? fmt('{a}.v_proj') : fmt('{a}.v')", wo: "neo ? fmt('{a}.out_proj') : fmt('{a}.c_proj')",
+            window: "neo && at(first(cfg.attention_layers, []), i) == 'local' ? cfg.window_size : null"}},
+          {use: "residual", in: ["x", "y"], out: "x", name: "l{i}.res1"},
+          {use: "layer_norm", args: {w: "fmt('{p}.ln_2')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "mlp_plain", in: ["h"], out: "m", name: "l{i}.mlp", args: {up: "fmt('{p}.mlp.c_fc')", down: "fmt('{p}.mlp.c_proj')"}},
+          {use: "residual", in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "last_row", in: ["x"], out: "x", name: "last", when: "head == 'last'"},
+        {use: "last_row", args: {index: true}, in: ["x", "i:last_index"], out: "x", name: "last", when: "head == 'score'"},
+        {use: "layer_norm", args: {w: "'transformer.ln_f'"}, in: ["x"], out: "hidden", name: "final_norm"},
+        {use: "score_head", in: ["hidden"], out: "logits", name: "score", when: "head == 'score'"},
+        {use: "lm_head", args: {w: "has('lm_head.weight') ? 'lm_head' : 'transformer.wte'"}, in: ["hidden"], out: "logits",
+         name: "lm_head", when: "head == 'last' || head == 'all'"},
+      ],
+      outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
+    },
+  },
+  runtime: {prefill_rows: 64, ffn_weights: ["transformer.h.*.mlp.*"], seqcls: {head: "score", pooling: "last_nonpad"}},
+}

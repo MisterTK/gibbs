@@ -1,0 +1,11 @@
+// GLM (HF `GlmForCausalLM`): llama names with fused [gate; up] rows, adjacent-pair (interleaved)
+// partial RoPE (default half the head).
+{
+  family: "glm",
+  extends: "llama",
+  match: {hf_model_type: ["glm"], hf_architectures: ["GlmForCausalLM"]},
+  config: {
+    rope_variant: "'Interleaved'",
+    rotary_pct: "first(cfg.partial_rotary_factor, 0.5)",
+  },
+}

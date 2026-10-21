@@ -1,0 +1,17 @@
+// BitNet b1.58 (transformers `BitNetForCausalLM`, bitnet.cpp `bitnet-b1.58` GGUF): llama with int8
+// BitLinear activations (`act_quant`), attention/MLP sub-norms, relu² MLP, online ternarization of
+// master weights (`quantization_mode: online`). I2_S GGUF weights come unpacked by the prequant
+// source path.
+{
+  family: "bitnet",
+  extends: "llama",
+  match: {
+    hf_model_type: ["bitnet"],
+    hf_architectures: ["BitNetForCausalLM", "BitnetForCausalLM"],
+    gguf_arch: ["bitnet-b1.58", "bitnet"],
+  },
+  config: {
+    aq_bits: "gguf_arch != '' ? 8 : cfg.quantization_config.quant_method == 'bitnet' ? 8 : first(cfg.weight_bits, 0) == 1 ? first(cfg.input_bits, 8) : 0",
+    act: "gguf_arch != '' || first(cfg.hidden_act, 'relu2') == 'relu2' ? 'Relu2' : 'Silu'",
+  },
+}
