@@ -1816,7 +1816,7 @@ fn image_supported(m: &Value) -> bool {
         .any(|k| derived(k))
 }
 
-/// LTX-Video repos: the loader's own file rule ([`crate::model::ltx::pick_gguf`]) for `ltxv` GGUF repos,
+/// LTX-Video repos: the loader's own file rule ([`crate::model::video_repo::pick_gguf`]) for `ltxv` GGUF repos,
 /// the pipeline class for diffusers ones; `None` when `m` is not LTX-Video.
 fn ltx_verdict(m: &Value) -> Option<Result<(), String>> {
     if m["gguf"]["architecture"] == "ltxv" {
@@ -1830,7 +1830,7 @@ fn ltx_verdict(m: &Value) -> Option<Result<(), String>> {
                 size: None,
             })
             .collect();
-        return Some(crate::model::ltx::pick_gguf(&files, None).map(|_| ()));
+        return Some(crate::model::video_repo::pick_gguf(&files, None).map(|_| ()));
     }
     match m["config"]["diffusers"]["_class_name"].as_str()? {
         "LTXPipeline" | "LTXImageToVideoPipeline" => Some(Ok(())),

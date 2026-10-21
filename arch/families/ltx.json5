@@ -1,24 +1,25 @@
-// LTX-Video transformer (`LTXVideoTransformer3DModel`; original LTX/ComfyUI names renamed to
-// diffusers). One forward per (latent grid, text tokens, clean tokens): the first `clean` tokens
-// (image conditioning) run at timestep 0, the rest at t, so adaLN modulation is applied per span.
-// Caller inputs: `x [rows, 128]` latent tokens, `context [nt, caption width]` raw T5 tokens and
-// `t_feat [spans, 256]` timestep sinusoids (flip_sin_to_cos, one row per span: clean span t=0
-// first, then t); the 3-axis RoPE tables are generated.
+// LTX-Video (`LTXPipeline` / `LTXImageToVideoPipeline`, v0.9.0): T5 text encoder, the
+// `LTXVideoTransformer3DModel` below (component `transformer`, this spec on `transformer/`) and the
+// `ltx_vae` causal-3D VAE. Transformer: original LTX/ComfyUI names renamed to diffusers; one
+// forward per (latent grid, text tokens, clean tokens): the first `clean` tokens (image
+// conditioning) run at timestep 0, the rest at t, so adaLN modulation is applied per span. Inputs
+// `x [rows, 128]` latent tokens and `context [nt, caption width]` raw T5 rows; the per-span
+// timestep sinusoids and the 3-axis RoPE tables are generated.
 {
   family: "ltx",
-  match: {diffusers_class: ["LTXVideoTransformer3DModel"]},
+  match: {diffusers_class: ["LTXPipeline", "LTXImageToVideoPipeline", "LTXVideoTransformer3DModel"]},
   pipeline: "video",
   use_lib: ["video"],
   config: {
-    d: "shape('proj_in.weight')[0]",
-    latent: "shape('proj_in.weight')[1]",
+    d: "first(shape('proj_in.weight')[0], 0)",
+    latent: "first(shape('proj_in.weight')[1], 0)",
     heads: "32",
     layers: "count('transformer_blocks.{k}.attn1.to_q.weight')",
     fps: "25",
   },
   checks: [
-    {expr: "latent != 128 || d % heads != 0", error: "LTX-Video transformer: proj_in is {d}x{latent}, expected d x 128"},
-    {expr: "layers == 0", error: "LTX-Video transformer: no transformer blocks"},
+    {expr: "has('proj_in.weight') && (latent != 128 || d % heads != 0)", error: "LTX-Video transformer: proj_in is {d}x{latent}, expected d x 128"},
+    {expr: "has('proj_in.weight') && layers == 0", error: "LTX-Video transformer: no transformer blocks"},
   ],
   names: {rules: [
     ["patchify_proj.{s:*}", "proj_in.{s}"],
@@ -34,8 +35,8 @@
     {tensor: "scale_shift_table", op: "to_f32"},
   ],
   constants: {
-    one: {gen: "ones", args: {shape: [1]}},
-    ones: {gen: "ones", args: {shape: ["d"]}},
+    one: {gen: "ones", args: {shape: [1]}, when: "d > 0"},
+    ones: {gen: "ones", args: {shape: ["d"]}, when: "d > 0"},
   },
   macros: {
     // `norm(x) * (1 + scale) + shift` per span, shift/scale = chunks `i`/`j` of the `[spans, 6d]` table.
@@ -81,6 +82,9 @@
     ]},
   },
   components: {
+    text_encoder: {family: "t5", dir: "text_encoder"},
+    transformer: {family: "ltx", dir: "transformer"},
+    vae: {family: "ltx_vae", dir: "vae"},
     denoiser: {
       vars: ["frames", "h", "w", "nt", "clean"],
       inputs: [
@@ -90,7 +94,9 @@
          args: {frames: "frames", grid_h: "h", grid_w: "w", fps: "fps", dim: "d", output: "'cos'"}},
         {name: "rope.sin", dtype: "f32", shape: ["frames * h * w", "d"], gen: "video_rope_cos_sin",
          args: {frames: "frames", grid_h: "h", grid_w: "w", fps: "fps", dim: "d", output: "'sin'", pair_sign: true}},
-        {name: "t_feat", dtype: "f32", shape: ["clean > 0 && clean < frames * h * w ? 2 : 1", 256]},
+        // One cos-first sinusoid row per span: the clean span at t = 0 first, then the noisy one.
+        {name: "t_feat", dtype: "f32", shape: ["clean > 0 && clean < frames * h * w ? 2 : 1", 256], gen: "timestep_embedding",
+         args: {t: "clean == 0 ? ['step:t'] : clean < frames * h * w ? [0, 'step:t'] : [0]", dim: 256}},
       ],
       body: [
         {let: {rows: "frames * h * w"}},
@@ -136,5 +142,28 @@
       outputs: ["v"],
     },
   },
-  runtime: {fps: 25},
+  runtime: {
+    // `_get_t5_prompt_embeds`: ids + `</s>` padded with 0 to 128, encoded unmasked, real rows kept.
+    text_encoders: [
+      {name: "t5", component: "text_encoder", net: "encoder", tokenizer: "tokenizer",
+       add_special: false, eos: 1, max_len: 128, pad_to: 128, pad_id: 0, mask: false, keep: "valid",
+       outputs: {hidden: "hidden"}},
+    ],
+    context: [{features: ["t5.hidden"]}],
+    negative: {default: "worst quality, inconsistent motion, blurry, jittery, distorted"},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // FlowMatchEulerDiscreteScheduler: linspace(1, 1/steps), dynamic mu over the latent tokens,
+    // shift_terminal stretch (all from scheduler_config.json).
+    scheduler: {kind: "flow_euler", sigmas: "linspace", seq: "frames * h * w"},
+    timestep: "t",
+    guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
+    latent: {channels: 128, factor: 32, pack: "tokens", noise_scale: 1},
+    // The VAE nets apply the latent statistics themselves.
+    vae: {component: "vae", decode: "decoder", encode: "encoder", output: "clamp_pm1"},
+    defaults: {width: 512, height: 320, steps: 30, guidance: 3, multiple: 32, max_side: 2048, max_steps: 200},
+    video: {frames: 25, latent_frames: "(frames - 1) // 8 + 1",
+            frames_ok: "frames > 0 && (frames - 1) % 8 == 0", frames_error: "frames must be 8k+1 (9, 17, 25, ...)",
+            fps: "fps", decode: "clip", image: "clean_first_frame"},
+    summary: "fmt('LTX-Video ({json.model_index._class_name})')",
+  },
 }

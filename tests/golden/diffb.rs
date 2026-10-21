@@ -10,6 +10,7 @@ use gibbs_engine::model::weights::Weights as Mw;
 use serde_json::{json, Value};
 use gibbs_engine::arch::expr::Val;
 use gibbs_engine::graph::Tensor;
+use gibbs_engine::runtime::diffusion::{unconsumed, Net};
 
 type Spec = Vec<(String, Vec<usize>)>;
 
@@ -402,7 +403,6 @@ fn krea2() {
 /// splits (none, the first 5 tokens clean, all clean).
 #[test]
 fn ltx() {
-    use gibbs_engine::model::ltx::{LtxTransformer, Rope, FPS};
     const D: usize = 128;
     const LATENT: usize = 128;
     const TI: usize = 48;
@@ -437,41 +437,22 @@ fn ltx() {
     }
     let file = dir.join("ltxv_tiny.safetensors");
     write_st(&file, &t);
-    let tr = LtxTransformer::load(&Store::open(&file).unwrap()).expect("LTX fixture");
     let (f, h, w, nt) = (3usize, 3usize, 4usize, 24usize);
     let n = f * h * w;
     let x = rnd(11, n * LATENT, 1.0);
     let raw = rnd(12, nt * TI, 1.0);
-    let rope = Rope::new(f, h, w, FPS as f64, D);
-    // runner: internal gibbs_engine::model::ltx::LtxTransformer::{project_text, forward, forward_gpu}
+    // runner: gibbs_engine::runtime::diffusion::Net (spec `ltx`, net `denoiser`; timestep features per step).
     golden("diffb_ltx", TOL, |dev| {
-        let mut o = Out::default();
-        for (t, clean) in [(700.0f32, 0usize), (350.0, 5), (700.0, n)] {
-            let y = if metal(dev) {
-                tr.forward_gpu(&x, n, &raw, nt, t, clean, &rope).unwrap()
-            } else {
-                tr.forward(&x, n, &tr.project_text(&raw, nt), nt, t, clean, &rope)
-            };
-            o.f(format!("t{t}_clean{clean}"), &sub(&y));
-        }
-        o
-    });
-    // The `ltx` spec against the same recording (`t_feat` rows per span, clean first).
-    for dev in devices().into_iter().filter(|_| !writing()) {
-        let mut r = spec_runner(&dir, "ltxv_tiny.safetensors", "ltx", dev);
+        let net = spec_net(&dir, "ltxv_tiny.safetensors", "ltx", "denoiser", dev);
         let mut o = Out::default();
         for (t, clean) in [(700.0f32, 0usize), (350.0, 5), (700.0, n)] {
             let vars = [("frames", f), ("h", h), ("w", w), ("nt", nt), ("clean", clean)].map(|(k, v)| (k, Val::Num(v as f64)));
-            let feat: Vec<f32> = [(clean > 0, 0.0), (clean < n, t as f64)]
-                .into_iter()
-                .filter(|s| s.0)
-                .flat_map(|s| temb(s.1, 256, "f64"))
-                .collect();
-            let ins = vec![Tensor::F32(x.clone()), Tensor::F32(raw.clone()), Tensor::F32(feat)];
-            o.f(format!("t{t}_clean{clean}"), &sub(&r.run("denoiser", &vars, ins).unwrap()["v"].clone().into_f32().unwrap()));
+            let given = [("x", Tensor::F32(x.clone())), ("context", Tensor::F32(raw.clone()))];
+            o.f(format!("t{t}_clean{clean}"), &sub(&net.run_one(&vars, &given, &[("t", t as f64)], None).unwrap()));
         }
-        check("diffb_ltx", dev, &o, TOL);
-    }
+        assert!(unconsumed(&net.model, &[&net], &[]).is_empty());
+        o
+    });
 }
 
 /// Qwen-Image VAE decoder (ComfyUI `qwen_image_vae.safetensors` names), base 4, mult [1, 2, 4, 4],
@@ -629,7 +610,13 @@ fn qwen_vae21() {
 /// clip (`tokens * std + mean`) -> 9 frames of `[12, 16, 24]` (patchified RGB) before clamping.
 #[test]
 fn ltx_vae() {
-    use gibbs_engine::model::ltx_vae::{Cfg, LtxVae, Names, Vid};
+    struct Cfg {
+        ch: [usize; 4],
+        layers: [usize; 5],
+        up: [bool; 4],
+        patch: usize,
+        latent: usize,
+    }
     let cfg = Cfg {
         ch: [4, 8, 16, 16],
         layers: [2, 1, 1, 1, 2],
@@ -691,55 +678,44 @@ fn ltx_vae() {
             "decoder_causal": false, "scaling_factor": 1.0
         }),
     );
-    // runner: internal gibbs_engine::model::ltx_vae::LtxVae::{open, dec.fwd, decode_gpu}
-    // (`LtxVae::load` only accepts the 512-wide v0.9.0 production widths).
-    let vae = LtxVae::open(&Mw::open(&file).unwrap(), Names { diffusers: true }, false, cfg)
-        .expect("LTX VAE fixture");
     let (f, h, w, lat) = (2usize, 2usize, 3usize, cfg.latent);
     let hw = h * w;
     let tokens = rnd(15, f * hw * lat, 1.0);
-    let mut d = vec![0.0f32; tokens.len()];
+    // Pipeline latents `[f, c, h*w]`; the decoder applies `* std + mean` itself.
+    let mut z = vec![0.0f32; tokens.len()];
     for (i, tok) in tokens.chunks_exact(lat).enumerate() {
         for (c, v) in tok.iter().enumerate() {
-            d[((i / hw) * lat + c) * hw + i % hw] = v * std[c] + mean[c];
+            z[((i / hw) * lat + c) * hw + i % hw] = *v;
         }
     }
+    let _ = (&mean, &std);
+    // runner: gibbs_engine::runtime::diffusion::Net (spec `ltx_vae`, net `decoder`, patchified output `y`).
     golden("diffb_ltx_vae", TOL, |dev| {
-        let z = Vid { d: d.clone(), c: lat, f, h, w };
-        let y = if metal(dev) {
-            vae.decode_gpu(z).unwrap()
-        } else {
-            vae.dec.fwd(z)
-        };
-        assert_eq!((y.f, y.c, y.h, y.w), (9, 12, 8 * h, 8 * w));
+        let net = spec_net(&dir, "diffusion_pytorch_model.safetensors", "ltx_vae", "decoder", dev);
+        let num = |v: usize| Val::Num(v as f64);
+        let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w))];
+        let y = net.run_one(&vars, &[("z", Tensor::F32(z.clone()))], &[], Some("y")).unwrap();
+        assert_eq!(y.len(), 9 * 12 * 8 * h * 8 * w);
         let mut o = Out::default();
-        o.f("decode_2x2x3", &sub(&y.d));
+        o.f("decode_2x2x3", &sub(&y));
         o
     });
-    // The `ltx_vae` spec against the same recording.
-    for dev in devices().into_iter().filter(|_| !writing()) {
-        let num = |v: usize| Val::Num(v as f64);
-        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", "ltx_vae", dev);
-        let y = r.run("decoder", &[("frames", num(f)), ("h", num(h)), ("w", num(w))], vec![Tensor::F32(d.clone())]).unwrap();
-        let mut o = Out::default();
-        o.f("decode_2x2x3", &sub(&y["y"].clone().into_f32().unwrap()));
-        check("diffb_ltx_vae", dev, &o, TOL);
-    }
 }
 
-/// ModelScope text-to-video `UNet3DConditionModel`: block widths [64, 128, 128, 128] (heads of 64),
-/// cross-attention width 96, `transformer_in` width 128 (2 heads; the production model has 8);
-/// 2 frames of 8x8 latents, 3 context tokens, two timesteps.
-#[test]
-fn unet3d() {
-    use gibbs_engine::model::unet3d::{Cfg, St, Unet3d};
+/// The `diffb_unet3d` UNet3D checkpoint (`diffusion_pytorch_model.safetensors` + `config.json`) in `dir`.
+fn write_unet3d(dir: &std::path::Path, ctx_dim: usize) {
+    struct Cfg {
+        in_ch: usize,
+        block_out: [usize; 4],
+        ctx_dim: usize,
+        tin_width: usize,
+    }
     let cfg = Cfg {
         in_ch: 4,
         block_out: [64, 128, 128, 128],
-        ctx_dim: 96,
+        ctx_dim,
         tin_width: 128,
     };
-    let dir = fixture_dir("diffb_unet3d");
     // Arguments are (in, out), as in the in-crate fixture.
     let s_lin = |s: &mut Spec, base: &str, i: usize, o: usize, bias: bool| lin(s, base, o, i, bias);
     let s_norm = |s: &mut Spec, base: &str, c: usize| {
@@ -843,78 +819,89 @@ fn unet3d() {
                                "CrossAttnUpBlock3D"]
         }),
     );
-    // runner: internal gibbs_engine::model::unet3d::{St::open, Unet3d::from_st, forward_cpu, forward_gpu}
-    // (`Unet3d::load` is fixed to the production widths).
-    let m = Unet3d::from_st(St::open(&file, cfg).unwrap()).expect("UNet3D fixture");
+}
+
+/// ModelScope text-to-video `UNet3DConditionModel`: block widths [64, 128, 128, 128] (heads of 64),
+/// cross-attention width 96, `transformer_in` width 128 (2 heads; the production model has 8);
+/// 2 frames of 8x8 latents, 3 context tokens, two timesteps.
+#[test]
+fn unet3d() {
+    let dir = fixture_dir("diffb_unet3d");
+    write_unet3d(&dir, 96);
+    let (in_ch, ctx_dim) = (4, 96);
     let (frames, h, w, ctx_len) = (2usize, 8usize, 8usize, 3usize);
-    let x = rnd(16, frames * cfg.in_ch * h * w, 1.0);
-    let ctx = rnd(17, ctx_len * cfg.ctx_dim, 1.0);
+    let x = rnd(16, frames * in_ch * h * w, 1.0);
+    let ctx = rnd(17, ctx_len * ctx_dim, 1.0);
+    // runner: gibbs_engine::runtime::diffusion::Net (spec `modelscope_t2v`, net `denoiser`).
     golden("diffb_unet3d", TOL, |dev| {
-        let mut o = Out::default();
-        for t in [900.0f32, 400.0] {
-            let y = if metal(dev) {
-                m.forward_gpu(&x, frames, h, w, t, &ctx, ctx_len).unwrap()
-            } else {
-                m.forward_cpu(&x, frames, h, w, t, &ctx, ctx_len).unwrap()
-            };
-            o.f(format!("eps_t{t}"), &y);
-        }
-        o
-    });
-    // The `modelscope_t2v` spec against the same recording.
-    for dev in devices().into_iter().filter(|_| !writing()) {
+        let net = spec_net(&dir, "diffusion_pytorch_model.safetensors", "modelscope_t2v", "denoiser", dev);
         let num = |v: usize| Val::Num(v as f64);
         let vars = [("frames", num(frames)), ("h", num(h)), ("w", num(w)), ("nt", num(ctx_len))];
-        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", "modelscope_t2v", dev);
         let mut o = Out::default();
         for t in [900.0f32, 400.0] {
-            let ins = vec![Tensor::F32(x.clone()), Tensor::F32(temb(t as f64, cfg.block_out[0], "f32")), Tensor::F32(ctx.clone())];
-            o.f(format!("eps_t{t}"), &r.run("denoiser", &vars, ins).unwrap()["eps"].clone().into_f32().unwrap());
+            let given = [("x", Tensor::F32(x.clone())), ("context", Tensor::F32(ctx.clone()))];
+            o.f(format!("eps_t{t}"), &net.run_one(&vars, &given, &[("t", t as f64)], None).unwrap());
         }
-        check("diffb_unet3d", dev, &o, TOL);
-    }
+        assert!(unconsumed(&net.model, &[&net], &[]).is_empty());
+        o
+    });
 }
 
-/// Cos-first sinusoidal timestep features (`timestep_embedding` generator).
-fn temb(t: f64, dim: usize, precision: &str) -> Vec<f32> {
-    let g = gibbs_engine::arch::gen::generate("timestep_embedding", &json!({"t": t, "dim": dim, "precision": precision}))
-        .unwrap();
-    match g.data {
-        gibbs_engine::arch::gen::GenData::F32(v) => v,
-        _ => unreachable!(),
-    }
-}
-
-/// A spec family loaded (bit-exact) from a fixture and run per instance on one device.
-struct Runner(gibbs_engine::arch::load::Model, Device);
-
-impl Runner {
-    fn run(&mut self, component: &str, vars: &[(&str, Val)], inputs: Vec<Tensor>) -> Result<std::collections::HashMap<String, Tensor>, String> {
-        use gibbs_engine::arch::gen::{generate, GenData};
-        let m = &self.0;
-        let inst = gibbs_engine::arch::build::build(&m.spec, component, &m.env, &m.store, vars)?;
-        let mut given = inputs.into_iter();
-        let mut ins = Vec::new();
-        for p in &inst.inputs {
-            ins.push(match &p.gen {
-                Some((g, a)) => match generate(g, a)?.data {
-                    GenData::F32(v) => Tensor::F32(v),
-                    GenData::U32(v) => Tensor::U32(v),
-                },
-                None => given.next().ok_or("input not given")?,
-            });
-        }
-        let w = m.store.materialize(&inst.weights)?;
-        let mut p = gibbs_engine::graph::program::GraphProgram::compile(inst.graph.clone(), w, gibbs_engine::hardware::PlacementMode::Pin(self.1))?;
-        Ok(inst.outputs.iter().cloned().zip(p.run(ins)?).collect())
-    }
-}
-
-fn spec_runner(dir: &std::path::Path, weights: &str, family: &str, dev: Device) -> Runner {
-    use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
-    let reencode = ReencodeConfig { policy: ReencodePolicy::BitExact, cache_dir: None, ..Default::default() };
-    let reg = gibbs_engine::arch::Registry::load(None).unwrap();
-    let m = gibbs_engine::arch::load::load_with(&artifacts(dir, "test/spec", weights), &reg, Some(family), reencode).expect(family);
+/// Network `net` of `family` loaded from fixture `dir` (weights `weights`), placed on `dev`.
+fn spec_net(dir: &std::path::Path, weights: &str, family: &str, net: &str, dev: Device) -> Net {
+    let m = gibbs_engine::arch::load::load(&artifacts(dir, "test/spec", weights), gibbs_engine::arch::registry().unwrap(), Some(family))
+        .expect(family);
     gibbs_engine::arch::load::check(&m).unwrap();
-    Runner(m, dev)
+    Net::new(std::sync::Arc::new(m), net, gibbs_engine::hardware::PlacementMode::Pin(dev))
+}
+
+/// ModelScope text-to-video through the public video pipeline (`SpecDiffusion::generate_video`): a
+/// tiny `TextToVideoSDPipeline` snapshot (2-layer CLIP, the `diffb_unet3d` UNet3D with cross width
+/// 64, a 4-level SD VAE decoding every frame), 16 frames of 64x64, 2 DDIM steps; the frames rule
+/// refuses 8 frames. Shape/sanity checks only (no recorded golden).
+#[test]
+fn modelscope_pipeline() {
+    use gibbs_engine::runtime::diffusion::{Extras, SpecDiffusion, VideoRequest};
+    let dir = fixture_dir("diffb_modelscope_pipeline");
+    write_json(
+        &dir.join("model_index.json"),
+        &json!({"_class_name": "TextToVideoSDPipeline", "text_encoder": ["transformers", "CLIPTextModel"],
+                "tokenizer": ["transformers", "CLIPTokenizer"], "unet": ["diffusers", "UNet3DConditionModel"],
+                "vae": ["diffusers", "AutoencoderKL"], "scheduler": ["diffusers", "DDIMScheduler"]}),
+    );
+    write_json(
+        &dir.join("scheduler/scheduler_config.json"),
+        &json!({"_class_name": "DDIMScheduler", "beta_schedule": "scaled_linear", "beta_start": 0.00085,
+                "beta_end": 0.012, "num_train_timesteps": 1000, "steps_offset": 1, "clip_sample": false,
+                "set_alpha_to_one": false, "prediction_type": "epsilon"}),
+    );
+    crate::diffa::write_clip(&dir, "text_encoder", "tokenizer", true, false, 21);
+    write_unet3d(&dir.join("unet"), 64);
+    crate::diffa::write_sd_vae(&dir, &[32, 32, 32, 32]);
+    let hub = crate::diffa::clip_hub(&dir);
+    let art = artifacts(&dir, "golden/tiny-t2v", "none");
+    for dev in devices() {
+        let mode = gibbs_engine::hardware::PlacementMode::Pin(dev);
+        let p = SpecDiffusion::load(&art, &hub, mode, Some("modelscope_t2v"), &Extras::default()).expect("tiny ModelScope");
+        let d = p.video_defaults().expect("video pipeline").unwrap();
+        assert_eq!((d.frames, d.fps), (16, 8));
+        let req = VideoRequest {
+            prompt: "t5 t17 t200".into(),
+            frames: Some(16),
+            width: Some(64),
+            height: Some(64),
+            steps: Some(2),
+            guidance: Some(5.0),
+            seed: 3,
+            ..Default::default()
+        };
+        let frames = p.generate_video(&req, None, &|_| {}).unwrap();
+        assert_eq!(frames.len(), 16);
+        assert!(frames.iter().all(|f| (f.width, f.height, f.data.len()) == (64, 64, 64 * 64 * 3)));
+        assert!(frames[0].data.iter().any(|&v| v != frames[0].data[0]), "{dev:?}: flat frame");
+        let e = p.generate_video(&VideoRequest { frames: Some(8), ..req.clone() }, None, &|_| {}).unwrap_err();
+        assert!(e.contains("16..=24"), "{e}");
+        let e = p.generate_video(&req, Some(&frames[0]), &|_| {}).unwrap_err();
+        assert!(e.contains("does not take an input image"), "{e}");
+    }
 }

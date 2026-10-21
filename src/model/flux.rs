@@ -239,20 +239,6 @@ impl Store {
             }
         }
     }
-
-    /// `{name}.weight` (+ `{name}.bias` when stored) as one linear.
-    pub(crate) fn lin(&self, name: &str) -> Result<Lin, String> {
-        let w = self.mat(&format!("{name}.weight"))?;
-        let (n, k) = w.dims();
-        let b = format!("{name}.bias");
-        Ok(Lin {
-            bias: self.has(&b).then(|| self.vec(&b)).transpose()?,
-            parts: vec![(0, w)],
-            n,
-            k,
-            loras: Vec::new(),
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +266,6 @@ pub struct Lin {
 }
 
 impl Lin {
-    /// `(out, in)` features.
-    pub(crate) fn dims(&self) -> (usize, usize) {
-        (self.n, self.k)
-    }
-
     /// One stored matrix with its bias and the LoRAs taken for it.
     pub(crate) fn new(w: Wt, bias: Option<Vec<f32>>, loras: Vec<Lora>) -> Self {
         let (n, k) = w.dims();

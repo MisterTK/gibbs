@@ -1022,8 +1022,6 @@ mod tests {
 
         const PIN_ROPE: [(u64, u64); 2] = [(7060718898465474953, 1236744568232124141), (101182376039508301, 1818247417042637373)];
 
-        }
-
         #[test]
         fn audio_front_end_matches_sources() {
             for fe in [

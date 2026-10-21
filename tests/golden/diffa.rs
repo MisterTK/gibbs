@@ -122,7 +122,7 @@ fn clip_tokenizer_json() -> Value {
 }
 
 /// The hub cache the CLIP loader fetches `openai/clip-vit-large-patch14/tokenizer.json` from.
-fn clip_hub(dir: &Path) -> HuggingFaceHub {
+pub(crate) fn clip_hub(dir: &Path) -> HuggingFaceHub {
     let root = dir.join("hub");
     write_json(
         &root.join("models--openai--clip-vit-large-patch14/snapshots/main/tokenizer.json"),
@@ -132,7 +132,7 @@ fn clip_hub(dir: &Path) -> HuggingFaceHub {
 }
 
 /// diffusers `text_encoder/` (CLIPTextModel[WithProjection], 2 layers, d 64) + `tokenizer/`.
-fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u64) {
+pub(crate) fn write_clip(dir: &Path, te: &str, tok: &str, quick: bool, proj: bool, seed: u64) {
     let d = CLIP_D;
     let mut s: Specs = vec![
         ("text_model.embeddings.token_embedding.weight".into(), vec![CLIP_VOCAB, d]),
@@ -901,7 +901,7 @@ fn vae_mid(s: &mut Specs, p: &str, c: usize) {
 
 /// diffusers AutoencoderKL `vae/` with `chans` block_out_channels, 4 latent channels, 1 encoder /
 /// 2 decoder ResBlocks per level, a 2x down/upsample between levels.
-fn write_sd_vae(dir: &Path, chans: &[usize]) {
+pub(crate) fn write_sd_vae(dir: &Path, chans: &[usize]) {
     let (n, c0, top) = (chans.len(), chans[0], chans[chans.len() - 1]);
     let mut s = Specs::new();
     conv(&mut s, "encoder.conv_in", 3, c0, 3);

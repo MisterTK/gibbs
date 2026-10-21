@@ -1,8 +1,10 @@
 // LTX-Video causal-3D VAE (`AutoencoderKLLTXVideo`, v0.9.0 layout: no timestep conditioning).
 // Diffusers names, or the original `{en,de}coder.{down,up}_blocks.IDX` ones (running index over
 // the stages' optional channel resnet / resampler and their resnets; `res_blocks`, `norm3.norm`,
-// unwrapped `conv_shortcut`). Values are channel-major `[c, frames, h, w]`; inputs/outputs are
-// frame-major `[frames, c, h, w]`. `latents_mean` / `latents_std` are read by the runtime.
+// unwrapped `conv_shortcut`). Values are channel-major `[c, frames, h, w]`. The decoder takes
+// pipeline latents `z [frames, c, h, w]` (`z * latents_std + latents_mean` in graph) and returns RGB
+// frames `rgb [frames', 3, H, W]` (plus the patchified `y`); the encoder takes one RGB image
+// `[3, H, W]` in [-1, 1] and returns its normalised posterior mode `z [c, h, w]`.
 {
   family: "ltx_vae",
   match: {diffusers_class: ["AutoencoderKLLTXVideo"]},
@@ -28,6 +30,8 @@
     en: "[1 + (at(up, 0) ? 1 : 0) + (at(ch, 0) != at(ecout, 0) ? 1 : 0), 1 + (at(up, 1) ? 1 : 0) + (at(ch, 1) != at(ecout, 1) ? 1 : 0), 1 + (at(up, 2) ? 1 : 0) + (at(ch, 2) != at(ecout, 2) ? 1 : 0), 1 + (at(up, 3) ? 1 : 0) + (at(ch, 3) != at(ecout, 3) ? 1 : 0)]",
     estart: "[0, at(en, 0), at(en, 0) + at(en, 1), at(en, 0) + at(en, 1) + at(en, 2), at(en, 0) + at(en, 1) + at(en, 2) + at(en, 3)]",
     list: "orig ? 'res_blocks' : 'resnets'",
+    // Spatial downscale of the encoder/decoder stages (times `patch` in pixels).
+    sscale: "(at(up, 0) ? 2 : 1) * (at(up, 1) ? 2 : 1) * (at(up, 2) ? 2 : 1) * (at(up, 3) ? 2 : 1)",
   },
   checks: [
     {expr: "!has('decoder.conv_in.conv.weight')", error: "not an LTX-Video VAE (no decoder.conv_in)"},
@@ -39,7 +43,6 @@
     ["per_channel_statistics.mean-of-means", "latents_mean"],
     ["per_channel_statistics.std-of-means", "latents_std"],
   ]},
-  ignore: ["latents_mean", "latents_std", "per_channel_statistics.*"],
   macros: {
     // `[c, t, h, w]` -> tokens `[t*h*w, c]` and back.
     tok: {params: ["x"], body: [
@@ -108,7 +111,11 @@
       inputs: [{name: "z", dtype: "f32", shape: ["frames", "latent", "h", "w"]}],
       body: [
         {let: {causal: false}},
-        {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["i:z"], out: "x", name: "in"},
+        {op: "Reshape", args: {shape: [1, "latent", 1, 1]}, in: ["w:latents_std"], out: "sd", name: "std"},
+        {op: "Reshape", args: {shape: [1, "latent", 1, 1]}, in: ["w:latents_mean"], out: "mu", name: "mean"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["i:z", "sd"], out: "x", name: "denorm.mul"},
+        {op: "Binary", args: {kind: "Add"}, in: ["x", "mu"], out: "x", name: "denorm.add"},
+        {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["x"], out: "x", name: "in"},
         {use: "causal_conv3d", args: {w: "'decoder.conv_in.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_in"},
         {repeat: "j", count: "at(rl, 0)", body: [
           {use: "res", args: {b: "orig ? fmt('decoder.up_blocks.0.res_blocks.{j}') : fmt('decoder.mid_block.resnets.{j}')", ci: "at(rc, 0)", co: "at(rc, 0)"},
@@ -132,16 +139,24 @@
         {use: "rms_silu", in: ["x"], out: "x", name: "norm_out"},
         {use: "causal_conv3d", args: {w: "'decoder.conv_out.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_out"},
         {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["x"], out: "y", name: "out"},
+        // Unpatchify: channel `(c * p + px) * p + py` is pixel (row * p + py, col * p + px).
+        {let: {fo: "shape('y')[0]", hp: "shape('y')[2]", wp: "shape('y')[3]"}},
+        {op: "Reshape", args: {shape: ["fo", 3, "patch", "patch", "hp", "wp"]}, in: ["y"], out: "r", name: "unpatch.split"},
+        {op: "Transpose", args: {perm: [0, 1, 4, 3, 5, 2]}, in: ["r"], out: "r", name: "unpatch.t"},
+        {op: "Reshape", args: {shape: ["fo", 3, "hp * patch", "wp * patch"]}, in: ["r"], out: "rgb", name: "unpatch"},
       ],
-      outputs: ["y"],
+      outputs: ["rgb", "y"],
     },
-    // Causal encoder: patchified frames `[frames, 3*patch^2, h, w]` -> posterior means.
+    // Causal encoder: one RGB image `[3, H, W]` (H = h * sscale * patch) -> normalised means.
     encoder: {
-      vars: ["frames", "h", "w"],
-      inputs: [{name: "x", dtype: "f32", shape: ["frames", "3 * patch * patch", "h", "w"]}],
+      vars: ["h", "w"],
+      inputs: [{name: "image", dtype: "f32", shape: [3, "h * sscale * patch", "w * sscale * patch"]}],
       body: [
-        {let: {causal: true}},
-        {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["i:x"], out: "x", name: "in"},
+        {let: {causal: true, hp: "h * sscale", wp: "w * sscale"}},
+        // Patchify (the decoder's unpatchify inverted), one frame: `[3 * p^2, 1, hp, wp]`.
+        {op: "Reshape", args: {shape: [3, "hp", "patch", "wp", "patch"]}, in: ["i:image"], out: "x", name: "patch.split"},
+        {op: "Transpose", args: {perm: [0, 4, 2, 1, 3]}, in: ["x"], out: "x", name: "patch.t"},
+        {op: "Reshape", args: {shape: ["3 * patch * patch", 1, "hp", "wp"]}, in: ["x"], out: "x", name: "patch"},
         {use: "causal_conv3d", args: {w: "'encoder.conv_in.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_in"},
         {repeat: "i", count: 4, body: [
           {let: {cin: "at(ch, i)", cout: "at(ecout, i)", s0: "at(estart, i)", up_n: "at(up, i) ? 1 : 0"}},
@@ -161,7 +176,11 @@
         {use: "rms_silu", in: ["x"], out: "x", name: "norm_out"},
         {use: "causal_conv3d", args: {w: "'encoder.conv_out.conv'", stride: 1}, in: ["x"], out: "x", name: "conv_out"},
         {op: "Slice", args: {axis: 0, start: 0, end: "latent"}, in: ["x"], out: "x", name: "means"},
-        {op: "Transpose", args: {perm: [1, 0, 2, 3]}, in: ["x"], out: "z", name: "out"},
+        {op: "Reshape", args: {shape: ["latent", 1, 1, 1]}, in: ["w:latents_std"], out: "sd", name: "std"},
+        {op: "Reshape", args: {shape: ["latent", 1, 1, 1]}, in: ["w:latents_mean"], out: "mu", name: "mean"},
+        {op: "Binary", args: {kind: "Sub"}, in: ["x", "mu"], out: "x", name: "norm.sub"},
+        {op: "Binary", args: {kind: "Div"}, in: ["x", "sd"], out: "x", name: "norm.div"},
+        {op: "Reshape", args: {shape: ["latent", "h", "w"]}, in: ["x"], out: "z", name: "out"},
       ],
       outputs: ["z"],
     },
