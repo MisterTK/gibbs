@@ -875,7 +875,7 @@ mod tests {
                     let out = cpu::run_stateless(&head, &Weights::new(), inputs).unwrap();
                     let v = if valid == 0 { n } else { valid.min(n) };
                     let want =
-                        crate::model::graph_lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
+                        crate::runtime::lm::sample_logits(&row[..v], &[], 0.0, 50, 1.0, 1.0);
                     assert_eq!(
                         out[0],
                         Tensor::U32(vec![want]),

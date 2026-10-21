@@ -15,9 +15,10 @@ pub mod settings;
 mod snapshot;
 pub mod theme;
 mod widgets;
+use crate::arch::dispatch::Loaded;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
 use crate::kv::PagedKVPool;
-use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore, SequenceClassifier};
+use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore};
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{
     split_revision, split_weight_file, DownloadProgress, HuggingFaceHub, StorageBackend,
@@ -25,13 +26,13 @@ use crate::model::hub::{
 use crate::model::image::ImageBuffer;
 use crate::model::jev::{ChoiceOption, JevSystem1Model};
 use crate::model::ltx;
-use crate::model::native::{load_native, MediaInput};
+use crate::model::native::MediaInput;
 use crate::model::reencode::ReencodeProgress;
-use crate::model::text_to_image::{load_image_model, ImageRequest, ImageSlot};
+use crate::model::t2v::Video;
+use crate::model::text_to_image::{ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weight_format::{
-    load_causal_lm_for, reencode_override, set_reencode_override, Choice, ReencodeConfig,
-    ReencodePolicy, VariantPolicy,
+    reencode_override, set_reencode_override, Choice, ReencodeConfig, ReencodePolicy, VariantPolicy,
 };
 use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, ExecutableModel, SamplingParams};
 use crate::telemetry::{EngineTelemetry, KernelRow};
@@ -1402,101 +1403,99 @@ impl TuiApp {
                     PlacementMode::Pin(d) => d,
                     PlacementMode::Auto => crate::hardware::default_device(),
                 };
-                let effective_placement = PlacementMode::Pin(backend);
-                *stage.lock() = if hub.locate_model(&id).weights_path.is_some() {
-                    "reading cached files"
-                } else {
-                    "downloading"
+                let o = crate::arch::LoadOpts {
+                    placement: PlacementMode::Pin(backend),
+                    token: token.as_deref(),
+                    quant: quant_override,
+                    quant_name: None,
+                    hw: &hw,
+                    reencode: reencode_cfg.clone(),
+                    family: None,
+                    stage: &|s| *stage.lock() = s,
                 };
-                if classifier::detect(&hub, &id).is_some() {
-                    let c = SequenceClassifier::load(&hub, &id, backend)?;
-                    let shape = c.summary();
-                    *slot.write() = Some(Arc::new(c));
-                    *jev_slot.write() = None;
-                    *images.write() = None;
-                    return Ok((None, shape));
-                }
-                if crate::model::jev::detect(&hub, &id) {
-                    let jev = JevSystem1Model::load(&hub, &id, backend)?;
-                    let shape = jev.summary();
-                    *jev_slot.write() = Some(Arc::new(jev));
-                    *slot.write() = None;
-                    *images.write() = None;
-                    *video.write() = None;
-                    return Ok((None, shape));
-                }
-                if let Some(plan) = crate::model::ltx::resolve(&hub, &id, None) {
-                    let plan = plan?;
-                    let shape = format!("LTX-Video {}; /video <prompt> and /i2v <image> <prompt> write .mp4 clips (CPU, minutes)", plan.label());
-                    *video.write() = Some(Arc::new((hub.clone(), plan)));
-                    *jev_slot.write() = None;
-                    *images.write() = None;
-                    *slot.write() = None;
-                    return Ok((None, shape));
-                }
-                // Image repos are recognised by their files (model_index.json, SD single-file, LoRA).
-                let image = route_for_model(&id) == Route::Image;
-                let adapter = !image
-                    && crate::model::peft::prepare_causal_lm(&hub, &id, token.as_deref())?;
-                if !adapter && !image && !is_chat_model(&id) {
-                    return Err(format!(
-                        "only text-generation, text-to-image models and text classifiers hot-swap; relaunch with `--model {id} --tui`"
-                    ));
-                }
-                let artifacts = hub.auto_download_and_cache(&id, token.as_deref())?;
-                let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
-                    crate::model::variant::decode_bytes_per_token(p, reencode_cfg.policy)
-                });
-                sched.telemetry.set_model_size_bytes(model_size);
-                // What the load applied (its gate may fall back) sets the roofline's bytes per token.
-                let refine = |choice: Option<&Choice>| {
-                    let (applied, saved) = crate::bench::applied_policy(choice, reencode_cfg.policy);
-                    if let (b, "streamed") = crate::bench::roofline_bytes(&artifacts, applied, saved) {
-                        sched.telemetry.set_model_size_bytes(b);
+                match crate::arch::load_model(&hub, &id, &o)? {
+                    Loaded::Classifier(c) => {
+                        let shape = c.summary();
+                        *slot.write() = Some(Arc::new(c));
+                        *jev_slot.write() = None;
+                        *images.write() = None;
+                        Ok((None, shape))
                     }
-                };
-                *stage.lock() = "reading weights, choosing weight format";
-                if let Some(img) = load_image_model(&artifacts, &hub) {
-                    let g = img?;
-                    let d = g.defaults();
-                    let shape = format!(
-                        "{} · default {}x{}, {} steps, cfg {}; prompts now generate images",
-                        g.summary(),
-                        d.width,
-                        d.height,
-                        d.steps,
-                        d.guidance
-                    );
-                    *images.write() = Some(g);
-                    *jev_slot.write() = None;
-                    *slot.write() = None;
-                    return Ok((None, shape));
+                    Loaded::System1(jev) => {
+                        let shape = jev.summary();
+                        *jev_slot.write() = Some(Arc::new(jev));
+                        *slot.write() = None;
+                        *images.write() = None;
+                        *video.write() = None;
+                        Ok((None, shape))
+                    }
+                    Loaded::Video(Video::Ltx(plan)) => {
+                        let shape = format!("LTX-Video {}; /video <prompt> and /i2v <image> <prompt> write .mp4 clips (CPU, minutes)", plan.label());
+                        *video.write() = Some(Arc::new((hub.clone(), plan)));
+                        *jev_slot.write() = None;
+                        *images.write() = None;
+                        *slot.write() = None;
+                        Ok((None, shape))
+                    }
+                    Loaded::Video(Video::ModelScope) => Err(format!(
+                        "text-to-video models other than LTX-Video run one generation per launch: `--model {id} --prompt \"...\" --output clip.mp4`"
+                    )),
+                    Loaded::Image(g) => {
+                        let d = g.defaults();
+                        let shape = format!(
+                            "{} · default {}x{}, {} steps, cfg {}; prompts now generate images",
+                            g.summary(),
+                            d.width,
+                            d.height,
+                            d.steps,
+                            d.guidance
+                        );
+                        *images.write() = Some(g);
+                        *jev_slot.write() = None;
+                        *slot.write() = None;
+                        Ok((None, shape))
+                    }
+                    Loaded::Lm {
+                        model,
+                        choice,
+                        artifacts,
+                    } => {
+                        let shape = match &model {
+                            ExecutableModel::Native(m) => {
+                                format!("{}, on {}", m.summary(), m.backend_label())
+                            }
+                            ExecutableModel::Program(_, lm) => {
+                                let c = &lm.read().config;
+                                format!(
+                                    "{} layers, hidden {}, vocab {}",
+                                    c.num_layers, c.hidden_dim, c.vocab_size
+                                )
+                            }
+                        };
+                        let program = matches!(model, ExecutableModel::Program(..));
+                        sched.swap_model(&id, model);
+                        // What the load applied (its gate may fall back) sets the roofline's bytes per token.
+                        let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
+                            crate::model::variant::decode_bytes_per_token(p, reencode_cfg.policy)
+                        });
+                        sched.telemetry.set_model_size_bytes(model_size);
+                        let (applied, saved) =
+                            crate::bench::applied_policy(choice.as_ref(), reencode_cfg.policy);
+                        if let (b, "streamed") =
+                            crate::bench::roofline_bytes(&artifacts, applied, saved)
+                        {
+                            sched.telemetry.set_model_size_bytes(b);
+                        }
+                        *jev_slot.write() = None;
+                        *slot.write() = None;
+                        *images.write() = None;
+                        let shape = match program {
+                            true => format!("{shape}, on {}", sched.backend_label()),
+                            false => shape,
+                        };
+                        Ok((choice, shape))
+                    }
                 }
-                if let Some(native) = load_native(&artifacts, effective_placement) {
-                    let m = native?;
-                    let shape = format!("{}, on {}", m.summary(), m.backend_label());
-                    sched.swap_model(&id, ExecutableModel::Native(m));
-                    refine(None);
-                    *jev_slot.write() = None;
-                    *slot.write() = None;
-                    *images.write() = None;
-                    return Ok((None, shape));
-                }
-                let (llm, choice) = load_causal_lm_for(&artifacts, backend, quant_override, &hw)?;
-                let shape = format!(
-                    "{} layers, hidden {}, vocab {}",
-                    llm.config.num_layers, llm.config.hidden_dim, llm.config.vocab_size
-                );
-                *stage.lock() = "compiling + tuning kernels";
-                sched.swap_model(&id, ExecutableModel::load_graph_lm(llm, placement)?);
-                refine(Some(&choice));
-                *jev_slot.write() = None;
-                *slot.write() = None;
-                *images.write() = None;
-                Ok((
-                    Some(choice),
-                    format!("{shape}, on {}", sched.backend_label()),
-                ))
             }))
             .unwrap_or_else(|p| {
                 let msg = p

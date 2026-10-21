@@ -22,6 +22,8 @@ pub use model::*;
 
 pub mod bench;
 pub mod quant;
+/// Model-agnostic pipelines driving spec instances (`arch`).
+pub mod runtime;
 pub mod scheduler;
 pub mod server;
 pub mod telemetry;

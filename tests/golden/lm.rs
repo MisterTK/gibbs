@@ -1,11 +1,13 @@
 //! GraphLm decoders (llama, granite, LFM2, q/k-norm, wide GQA), BitNet and Nano.
 
 use crate::util::*;
+use gibbs_engine::arch::LoadOpts;
+use gibbs_engine::graph::Tensor;
 use gibbs_engine::hardware::{Device, HardwareCapability, QuantMode};
 use gibbs_engine::model::hf_loader::load_causal_lm;
 use gibbs_engine::model::nano::{NanoTransformerConfig, NanoTransformerModel};
-use gibbs_engine::model::native::load_native;
-use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig};
+use gibbs_engine::model::native::{load_native, logits_of};
+use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig, ReencodePolicy};
 use gibbs_engine::scheduler::ExecutableModel;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -129,19 +131,41 @@ fn fixture(case: &str, cfg: &Value, w: &Weights) -> PathBuf {
 
 /// runner: the CLI load dispatch (`main.rs`): `load_native` declines GraphLm families, then
 /// `load_causal_lm_with` (`--quant` f32: no host-dependent format pick or re-encode) and
-/// `ExecutableModel::load_graph_lm` on `dev`.
+/// `ExecutableModel::load_graph_lm` on `dev`. `GIBBS_SPEC_LM=1`: `arch::dispatch::load_lm`
+/// (bit-exact weights) routes the family spec through `runtime::lm::SpecLm` instead.
 fn load_lm(dir: &Path, dev: Device) -> ExecutableModel {
     let a = artifacts(dir, "golden/lm", "model.safetensors");
     assert!(load_native(&a, dev).is_none(), "routed to a native loader");
-    let (llm, _) = load_causal_lm_with(
-        &a,
-        dev,
-        Some(QuantMode::Uncompressed),
-        &HardwareCapability::default(),
-        &ReencodeConfig::default(),
-    )
-    .unwrap();
-    let m = ExecutableModel::load_graph_lm(llm, dev).unwrap();
+    let m = if std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1") {
+        let reencode = ReencodeConfig {
+            policy: ReencodePolicy::BitExact,
+            cache_dir: None,
+            ..Default::default()
+        };
+        let opts = LoadOpts {
+            placement: dev.into(),
+            token: None,
+            quant: None,
+            quant_name: None,
+            hw: &HardwareCapability::default(),
+            reencode,
+            family: None,
+            stage: &|_| {},
+        };
+        let (m, _) = gibbs_engine::arch::dispatch::load_lm(&a, &opts).unwrap();
+        assert!(matches!(m, ExecutableModel::Native(_)), "not a spec LM");
+        m
+    } else {
+        let (llm, _) = load_causal_lm_with(
+            &a,
+            dev,
+            Some(QuantMode::Uncompressed),
+            &HardwareCapability::default(),
+            &ReencodeConfig::default(),
+        )
+        .unwrap();
+        ExecutableModel::load_graph_lm(llm, dev).unwrap()
+    };
     assert_eq!(m.llm_backend(), dev, "{}", m.backend_label());
     m
 }
@@ -166,13 +190,31 @@ fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
             .unwrap();
         o.f(format!("decode{i}"), &l);
     }
-    let (mut ids, mut kv) = (PROMPT.to_vec(), None);
-    for _ in 0..8 {
-        let n = ids.len();
-        let t = m
-            .step_token_with_kv(&ids, ids[n - 1], n, 0.0, 1.0, &mut kv)
-            .unwrap();
-        ids.push(t);
+    let mut ids = PROMPT.to_vec();
+    match m {
+        // A native model prefills through its sequence state, then steps greedily.
+        ExecutableModel::Native(lm) => {
+            let (_, mut st) = lm.prepare(ids.clone(), &[]).unwrap();
+            lm.forward(&ids[..ids.len() - 1], 0, &mut st).unwrap();
+            for _ in 0..8 {
+                let n = ids.len();
+                let t = match lm.forward_greedy(&ids[n - 1..], n - 1, &mut st).unwrap() {
+                    Tensor::U32(t) => t[0],
+                    t => argmax(&logits_of(t).unwrap()[..V]),
+                };
+                ids.push(t);
+            }
+        }
+        _ => {
+            let mut kv = None;
+            for _ in 0..8 {
+                let n = ids.len();
+                let t = m
+                    .step_token_with_kv(&ids, ids[n - 1], n, 0.0, 1.0, &mut kv)
+                    .unwrap();
+                ids.push(t);
+            }
+        }
     }
     // The greedy path (device argmax after the first token) agrees with the logits' argmax.
     for k in 0..8 {

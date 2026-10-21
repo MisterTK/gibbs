@@ -1,18 +1,16 @@
 use clap::Parser;
+use gibbs_engine::arch::dispatch::{LoadOpts, Loaded};
 use gibbs_engine::hardware::{Device, HardwareCapability, QuantMode};
 use gibbs_engine::kv::PagedKVPool;
-use gibbs_engine::model::classifier::{self, ClassifierSlot, SequenceClassifier};
+use gibbs_engine::model::classifier::{self, ClassifierSlot};
 use gibbs_engine::model::hub::{is_synthetic_model_id, HuggingFaceHub, StorageBackend};
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::jev::JevSystem1Model;
 use gibbs_engine::model::load_log;
 use gibbs_engine::model::ltx;
-use gibbs_engine::model::native::load_native;
+use gibbs_engine::model::t2v::Video;
 use gibbs_engine::model::t2v::{write_mp4, TextToVideoPipeline};
-use gibbs_engine::model::text_to_image::{
-    load_image_model, ImageGenerator, ImageRequest, ImageSlot,
-};
-use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig};
+use gibbs_engine::model::text_to_image::{ImageGenerator, ImageRequest, ImageSlot};
+use gibbs_engine::model::weight_format::ReencodeConfig;
 use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler, ExecutableModel};
 use gibbs_engine::server::{create_router, AppState};
 use gibbs_engine::telemetry::EngineTelemetry;
@@ -140,6 +138,16 @@ struct Cli {
 
     #[arg(long)]
     tui_frame_log: Option<String>,
+
+    /// Load --model as this family spec (`arch/families/<family>.json5`, or a user file in
+    /// `~/.cache/gibbs/arch/families/`), skipping architecture detection.
+    #[arg(long)]
+    arch: Option<String>,
+
+    /// Print --model's merged family spec, resolved config vars, raw -> canonical tensor names and
+    /// unconsumed tensors (JSON), then exit.
+    #[arg(long, default_value_t = false)]
+    arch_dump: bool,
 }
 
 const VIDEO_SIZE: usize = 256;
@@ -383,58 +391,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_storage(storage_backend)
         .with_budget(usize::MAX);
 
-    // Text-to-video is chosen by the checkpoint's model_index.json / hub GGUF architecture, never by the model id.
-    let is_system1 = gibbs_engine::model::jev::detect(&hub, &cli.model);
-    if !is_system1 {
-        if let Some(plan) = ltx::resolve(&hub, &cli.model, cli.quant.as_deref()) {
-            return run_ltx(&cli, &hub, &plan?).map_err(Into::into);
+    let token = cli
+        .hf_token
+        .clone()
+        .or_else(|| std::env::var("HF_TOKEN").ok());
+    if cli.arch_dump {
+        let a = hub.auto_download_and_cache(&cli.model, token.as_deref())?;
+        println!(
+            "{}",
+            gibbs_engine::arch::dispatch::dump(&a, cli.arch.as_deref())?
+        );
+        return Ok(());
+    }
+    telemetry.log_info(&format!(
+        "Checking model source: '{}' (storage: {:?})",
+        cli.model, hub.storage
+    ));
+    let mut reencode = ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
+    let t = telemetry.clone();
+    reencode.log = Some(Arc::new(move |m: &str| t.log_info(m)));
+    let stage = parking_lot::Mutex::new("resolving");
+    let t0 = Instant::now();
+    let loaded = gibbs_engine::arch::load_model(
+        &hub,
+        &cli.model,
+        &LoadOpts {
+            placement,
+            token: token.as_deref(),
+            quant: quant_override,
+            quant_name: cli.quant.as_deref(),
+            hw: &hw,
+            reencode,
+            family: cli.arch.as_deref(),
+            stage: &|s| *stage.lock() = s,
+        },
+    )
+    .map_err(|e| {
+        let stage = *stage.lock();
+        format!(
+            "Cannot load '{}': {}",
+            cli.model,
+            load_log::record(&hub, &cli.model, stage, &e)
+        )
+    })?;
+    let is_image = matches!(loaded, Loaded::Image(_));
+    if !matches!(loaded, Loaded::Video(_)) {
+        if cli.image.is_some() && !is_image {
+            return Err(format!(
+                "--image requires a text-to-image model; '{}' is not one",
+                cli.model
+            )
+            .into());
+        }
+        if cli.image.is_some() && cli.prompt.is_none() {
+            return Err("--image requires --prompt".into());
         }
     }
-    if !is_system1 && TextToVideoPipeline::is_t2v_repo(&hub, &cli.model) {
-        return run_text_to_video(&cli, &hub, backend).map_err(Into::into);
-    }
-    let token = cli.hf_token.or_else(|| std::env::var("HF_TOKEN").ok());
 
-    // A `*ForSequenceClassification` config.json makes `--model` a classifier (/v1/classify).
-    let classifier_arch = if is_system1 {
-        None
-    } else {
-        classifier::detect(&hub, &cli.model)
-    };
-    let artifacts = if is_system1 || classifier_arch.is_some() {
-        None
-    } else {
-        telemetry.log_info(&format!(
-            "Checking model source: '{}' (storage: {:?})",
-            cli.model, hub.storage
-        ));
-        // A PEFT LoRA CAUSAL_LM adapter becomes a merged snapshot of its base first.
-        gibbs_engine::model::peft::prepare_causal_lm(&hub, &cli.model, token.as_deref())?;
-        let a = hub
-            .auto_download_and_cache(&cli.model, token.as_deref())
-            .map_err(|e| load_log::record(&hub, &cli.model, "downloading", &e))?;
-        telemetry.log_info(&format!(
-            "Model Artifacts Resolved: cached={}, local_dir={:?}, weights={:?}",
-            a.is_cached, a.local_dir, a.weights_path
-        ));
-        Some(a)
-    };
-
-    // Image vs LLM is decided by the resolved files (model_index.json, SD single-file, LoRA, SD GGUF),
-    // never by the model id.
-    let image_model: Option<Arc<dyn ImageGenerator>> = match artifacts
-        .as_ref()
-        .map(|a| (a, Instant::now()))
-        .and_then(|(a, t0)| Some((load_image_model(a, &hub)?, t0)))
-    {
-        Some((r, t0)) => {
-            let g = r.map_err(|e| {
-                format!(
-                    "Cannot load image model '{}': {}",
-                    cli.model,
-                    load_log::record(&hub, &cli.model, "loading image model", &e)
-                )
-            })?;
+    let mut image_model: Option<Arc<dyn ImageGenerator>> = None;
+    let mut weights = None;
+    let mut drafter = None;
+    let classifier_slot = ClassifierSlot::default();
+    let jev_slot = gibbs_engine::model::jev::System1Slot::default();
+    let model_exec = match loaded {
+        Loaded::Video(Video::Ltx(plan)) => return run_ltx(&cli, &hub, &plan).map_err(Into::into),
+        Loaded::Video(Video::ModelScope) => {
+            return run_text_to_video(&cli, &hub, backend).map_err(Into::into)
+        }
+        Loaded::Image(g) => {
             let d = g.defaults();
             telemetry.log_info(&format!(
                 "Image model: {} loaded in {:.2}s (default {}x{}, {} steps, guidance {})",
@@ -445,296 +469,236 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 d.steps,
                 d.guidance
             ));
-            Some(g)
-        }
-        None => None,
-    };
-    let is_image = image_model.is_some();
-    // Check memory requirements of the LLM and warn if it exceeds physical memory.
-    // Skipped for image models (real checkpoint size is logged at load) and System 1 (no LLM).
-    if let (Some(a), Some(system_mem)) = (
-        artifacts.as_ref().filter(|_| !is_image),
-        hw.total_memory_bytes,
-    ) {
-        // Weights are read into f32 before any re-encoding.
-        let estimated_weight_bytes = a.estimated_params as u64 * 4;
-        if estimated_weight_bytes > system_mem {
-            telemetry.log_warn(&format!(
-                "Model '{}' (~{} params, {:.2} GB in f32) exceeds physical system memory ({:.2} GB). Offloading will be active.",
-                cli.model,
-                a.estimated_params,
-                estimated_weight_bytes as f64 / 1e9,
-                system_mem as f64 / 1e9
-            ));
-        } else {
-            telemetry.log_info(&format!(
-                "Model '{}' resolved (~{} params, {:.2} MB in f32, system memory {:.2} GB)",
-                cli.model,
-                a.estimated_params,
-                estimated_weight_bytes as f64 / 1e6,
-                system_mem as f64 / 1e9
-            ));
-        }
-    }
-    if cli.image.is_some() && !is_image {
-        return Err(format!(
-            "--image requires a text-to-image model; '{}' is not one",
-            cli.model
-        )
-        .into());
-    }
-    if cli.image.is_some() && cli.prompt.is_none() {
-        return Err("--image requires --prompt".into());
-    }
-
-    if let (Some(sd), Some(prompt)) = (&image_model, &cli.prompt) {
-        let req = ImageRequest {
-            prompt: prompt.clone(),
-            negative_prompt: cli.negative_prompt.clone(),
-            width: cli.width,
-            height: cli.height,
-            steps: cli.steps,
-            guidance: cli.guidance,
-            seed: cli.seed.unwrap_or_else(clock_seed),
-        };
-        let d = sd.defaults();
-        let steps = req.steps.unwrap_or(d.steps);
-        println!("Prompt: {prompt:?}");
-        println!(
-            "Seed: {}  Steps: {steps}  Guidance: {}  Negative: {:?}",
-            req.seed,
-            req.guidance.unwrap_or(d.guidance),
-            req.negative_prompt.as_deref().unwrap_or("")
-        );
-        let start = Instant::now();
-        let img = if let Some(init_path) = &cli.image {
-            let init = gibbs_engine::model::image::ImageBuffer::from_base64_or_path(init_path)
-                .map_err(|e| format!("Cannot read --image {init_path}: {e}"))?;
-            println!(
-                "Mode: image-to-image from {init_path} ({}x{}), strength {:.2}",
-                init.width, init.height, cli.strength
-            );
-            sd.image_to_image(&req, &init, cli.strength)?
-        } else {
-            println!(
-                "Mode: text-to-image {}x{}",
-                req.width.unwrap_or(d.width),
-                req.height.unwrap_or(d.height)
-            );
-            sd.text_to_image(&req)?
-        };
-        let gen_secs = start.elapsed().as_secs_f64();
-        let png_bytes = img.to_png();
-        let output = cli.output.as_deref().unwrap_or("output.png");
-        std::fs::write(output, &png_bytes)?;
-        println!(
-            "Generated {}x{} in {gen_secs:.2}s ({:.2}s/step incl. text encoding and VAE)",
-            img.width,
-            img.height,
-            gen_secs / steps as f64
-        );
-        println!("Saved {output} ({} bytes)", png_bytes.len());
-        return Ok(());
-    }
-
-    let mut weights = None;
-    let mut drafter = None;
-    let classifier_slot = ClassifierSlot::default();
-    let jev_slot = gibbs_engine::model::jev::System1Slot::default();
-    let model_exec = if is_image {
-        None
-    } else if is_system1 {
-        telemetry.log_info(&format!(
-            "Loading System 1 sentence encoder '{}'",
-            cli.model
-        ));
-        let t0 = std::time::Instant::now();
-        let jev_backend = if backend == Device::Cpu
-            && gibbs_engine::hardware::available_devices().contains(&Device::Metal)
-        {
-            Device::Metal
-        } else {
-            backend
-        };
-        let jev = JevSystem1Model::load(&hub, &cli.model, jev_backend)
-            .map_err(|e| format!("Cannot load System 1 encoder '{}': {e}", cli.model))?;
-        if let Some(enc) = jev.bert() {
-            if let Some(report) = enc.executor_report() {
-                telemetry.log_info(&format!("Metal: {report}"));
+            if let Some(prompt) = &cli.prompt {
+                let req = ImageRequest {
+                    prompt: prompt.clone(),
+                    negative_prompt: cli.negative_prompt.clone(),
+                    width: cli.width,
+                    height: cli.height,
+                    steps: cli.steps,
+                    guidance: cli.guidance,
+                    seed: cli.seed.unwrap_or_else(clock_seed),
+                };
+                let steps = req.steps.unwrap_or(d.steps);
+                println!("Prompt: {prompt:?}");
+                println!(
+                    "Seed: {}  Steps: {steps}  Guidance: {}  Negative: {:?}",
+                    req.seed,
+                    req.guidance.unwrap_or(d.guidance),
+                    req.negative_prompt.as_deref().unwrap_or("")
+                );
+                let start = Instant::now();
+                let img = if let Some(init_path) = &cli.image {
+                    let init = ImageBuffer::from_base64_or_path(init_path)
+                        .map_err(|e| format!("Cannot read --image {init_path}: {e}"))?;
+                    println!(
+                        "Mode: image-to-image from {init_path} ({}x{}), strength {:.2}",
+                        init.width, init.height, cli.strength
+                    );
+                    g.image_to_image(&req, &init, cli.strength)?
+                } else {
+                    println!(
+                        "Mode: text-to-image {}x{}",
+                        req.width.unwrap_or(d.width),
+                        req.height.unwrap_or(d.height)
+                    );
+                    g.text_to_image(&req)?
+                };
+                let gen_secs = start.elapsed().as_secs_f64();
+                let png_bytes = img.to_png();
+                let output = cli.output.as_deref().unwrap_or("output.png");
+                std::fs::write(output, &png_bytes)?;
+                println!(
+                    "Generated {}x{} in {gen_secs:.2}s ({:.2}s/step incl. text encoding and VAE)",
+                    img.width,
+                    img.height,
+                    gen_secs / steps as f64
+                );
+                println!("Saved {output} ({} bytes)", png_bytes.len());
+                return Ok(());
             }
+            image_model = Some(g);
+            None
+        }
+        Loaded::System1(jev) => {
+            if let Some(enc) = jev.bert() {
+                if let Some(report) = enc.executor_report() {
+                    telemetry.log_info(&format!("Metal: {report}"));
+                }
+                telemetry.log_info(&format!(
+                    "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",
+                    jev.repo_id,
+                    enc.device(),
+                    enc.dims.num_layers,
+                    enc.dims.hidden_size,
+                    enc.dims.num_heads,
+                    enc.parameter_count() as f64 / 1e6,
+                    t0.elapsed().as_secs_f64()
+                ));
+            }
+            if let Some(prompt) = &cli.prompt {
+                if prompt.contains('|') {
+                    let (query, opts) = prompt
+                        .split_once('|')
+                        .map(|(q, o)| (q.trim(), o))
+                        .unwrap_or((prompt.as_str(), ""));
+                    let options: Vec<gibbs_engine::model::jev::ChoiceOption> = opts
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| gibbs_engine::model::jev::ChoiceOption::new(s, None::<String>))
+                        .collect();
+                    let decision = jev
+                        .embed(query)
+                        .and_then(|s| jev.evaluate_choice_embedded(&s, &options))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "query": query,
+                            "model": jev.repo_id,
+                            "decision": decision,
+                        }))?
+                    );
+                } else {
+                    let v = jev.embed(prompt)?;
+                    println!("{} dimensions · head={:?}", v.len(), &v[..v.len().min(8)]);
+                }
+                return Ok(());
+            }
+            *jev_slot.write() = Some(Arc::new(jev));
+            None
+        }
+        Loaded::Classifier(c) => {
             telemetry.log_info(&format!(
-                "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",
-                jev.repo_id,
-                enc.device(),
-                enc.dims.num_layers,
-                enc.dims.hidden_size,
-                enc.dims.num_heads,
-                enc.parameter_count() as f64 / 1e6,
+                "Classifier '{}' ready: {}, loaded in {:.2}s",
+                cli.model,
+                c.summary(),
                 t0.elapsed().as_secs_f64()
             ));
-        }
-        if let Some(prompt) = &cli.prompt {
-            if prompt.contains('|') {
-                let (query, opts) = prompt
-                    .split_once('|')
-                    .map(|(q, o)| (q.trim(), o))
-                    .unwrap_or((prompt.as_str(), ""));
-                let options: Vec<gibbs_engine::model::jev::ChoiceOption> = opts
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| gibbs_engine::model::jev::ChoiceOption::new(s, None::<String>))
-                    .collect();
-                let decision = jev
-                    .embed(query)
-                    .and_then(|s| jev.evaluate_choice_embedded(&s, &options))?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "query": query,
-                        "model": jev.repo_id,
-                        "decision": decision,
-                    }))?
-                );
-            } else {
-                let v = jev.embed(prompt)?;
-                println!("{} dimensions · head={:?}", v.len(), &v[..v.len().min(8)]);
+            if let Some(prompt) = &cli.prompt {
+                let (text, pair) = classifier::split_pair(prompt);
+                let (labels, tokens) = c.classify(text, pair)?;
+                println!("{tokens} tokens");
+                for l in labels {
+                    println!("{:>10.6}  {}", l.score, l.label);
+                }
+                return Ok(());
             }
-            return Ok(());
+            *classifier_slot.write() = Some(Arc::new(c));
+            None
         }
-        *jev_slot.write() = Some(Arc::new(jev));
-        None
-    } else if classifier_arch.is_some() {
-        let t0 = Instant::now();
-        let c = SequenceClassifier::load(&hub, &cli.model, backend)
-            .map_err(|e| format!("Cannot load classifier '{}': {e}", cli.model))?;
-        telemetry.log_info(&format!(
-            "Classifier '{}' ready: {}, loaded in {:.2}s",
-            cli.model,
-            c.summary(),
-            t0.elapsed().as_secs_f64()
-        ));
-        if let Some(prompt) = &cli.prompt {
-            let (text, pair) = classifier::split_pair(prompt);
-            let (labels, tokens) = c.classify(text, pair)?;
-            println!("{tokens} tokens");
-            for l in labels {
-                println!("{:>10.6}  {}", l.score, l.label);
-            }
-            return Ok(());
-        }
-        *classifier_slot.write() = Some(Arc::new(c));
-        None
-    } else {
-        let artifacts = artifacts
-            .as_ref()
-            .expect("artifacts are resolved unless --system1 or a classifier");
-        let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
-            gibbs_engine::model::variant::decode_bytes_per_token(
-                p,
-                gibbs_engine::model::variant::reencode_policy(),
-            )
-        });
-        telemetry.set_model_size_bytes(model_size);
-        let model_exec = match load_native(artifacts, placement) {
-            Some(native) => {
-                let m = native.map_err(|e| {
-                    format!(
-                        "Cannot load '{}': {}",
-                        cli.model,
-                        load_log::record(&hub, &cli.model, "loading native model", &e)
-                    )
-                })?;
-                telemetry.log_info(&format!("Model: {}", m.summary()));
-                ExecutableModel::Native(m)
-            }
-            None => {
-                let (graph_lm, choice) =
-                    load_causal_lm_with(artifacts, backend, quant_override, &hw, &{
-                        let mut cfg =
-                            ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
-                        let t = telemetry.clone();
-                        cfg.log = Some(Arc::new(move |m: &str| t.log_info(m)));
-                        cfg
-                    })
-                    .map_err(|e| {
-                        format!(
-                            "Cannot load '{}': {}",
-                            cli.model,
-                            load_log::record(&hub, &cli.model, "loading weights", &e)
-                        )
-                    })?;
-                if is_synthetic_model_id(&cli.model) {
+        Loaded::Lm {
+            model: model_exec,
+            choice,
+            artifacts,
+        } => {
+            let artifacts = &artifacts;
+            telemetry.log_info(&format!(
+                "Model Artifacts Resolved: cached={}, local_dir={:?}, weights={:?}",
+                artifacts.is_cached, artifacts.local_dir, artifacts.weights_path
+            ));
+            if let Some(system_mem) = hw.total_memory_bytes {
+                // Weights are read into f32 before any re-encoding.
+                let estimated_weight_bytes = artifacts.estimated_params as u64 * 4;
+                if estimated_weight_bytes > system_mem {
                     telemetry.log_warn(&format!(
-                        "'{}' is a synthetic random-weight model for kernel benchmarking: its text output is noise",
-                        cli.model
+                    "Model '{}' (~{} params, {:.2} GB in f32) exceeds physical system memory ({:.2} GB). Offloading will be active.",
+                    cli.model,
+                    artifacts.estimated_params,
+                    estimated_weight_bytes as f64 / 1e9,
+                    system_mem as f64 / 1e9
+                ));
+                } else {
+                    telemetry.log_info(&format!(
+                        "Model '{}' resolved (~{} params, {:.2} MB in f32, system memory {:.2} GB)",
+                        cli.model,
+                        artifacts.estimated_params,
+                        estimated_weight_bytes as f64 / 1e6,
+                        system_mem as f64 / 1e9
                     ));
                 }
-                let model_exec = ExecutableModel::load_graph_lm(graph_lm, placement)
-                    .map_err(|e| format!("Cannot run '{}' on {backend_label}: {e}", cli.model))?;
-                telemetry.log_info(&format!("Weight format: {}", choice.summary()));
-                weights = Some(choice);
-                model_exec
             }
-        };
-        // The roofline basis follows the policy the load applied (the gate may have fallen back).
-        let (applied, saved) = gibbs_engine::bench::applied_policy(
-            weights.as_ref(),
-            ReencodeConfig::effective().policy,
-        );
-        if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, applied, saved) {
-            telemetry.set_model_size_bytes(b);
-        }
-        telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
-        if let Some(d) = &cli.draft {
-            let da = hub.auto_download_and_cache(d, token.as_deref())?;
-            let dr = gibbs_engine::model::draft::load_drafter(&da, artifacts, placement)
-                .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?;
-            telemetry.log_info(&format!("Speculative decoding drafter: {}", dr.label()));
-            drafter = Some(dr);
-        }
-
-        if let Some(prompt) = &cli.prompt {
-            println!("💬 Generating from prompt: \"{}\"", prompt);
-            let cap = match &model_exec {
-                ExecutableModel::Native(m) => m.default_max_new_tokens(),
-                _ => None,
-            };
-            let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
-            // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
-            let temperature = match model_exec.tokenizer().sampling_defaults {
-                Some((t, _)) if t <= 1e-4 => 0.0,
-                _ => 0.7,
-            };
-            let (output, passes, decode) = model_exec.generate_text_measured(
-                prompt,
-                max_toks,
-                temperature,
-                drafter.clone(),
-            )?;
-            println!("✨ Output:\n{}", output);
-            let tok_s = passes as f64 / decode.as_secs_f64().max(1e-9);
-            println!(
-                "⚡ Decode: {passes} tokens in {:.2}ms ({:.1} tok/s) on {}",
-                decode.as_secs_f64() * 1000.0,
-                tok_s,
-                model_exec.backend_label()
+            let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
+                gibbs_engine::model::variant::decode_bytes_per_token(
+                    p,
+                    gibbs_engine::model::variant::reencode_policy(),
+                )
+            });
+            telemetry.set_model_size_bytes(model_size);
+            match (&model_exec, &choice) {
+                (ExecutableModel::Native(m), _) => {
+                    telemetry.log_info(&format!("Model: {}", m.summary()))
+                }
+                (_, Some(c)) => telemetry.log_info(&format!("Weight format: {}", c.summary())),
+                _ => {}
+            }
+            if is_synthetic_model_id(&cli.model) {
+                telemetry.log_warn(&format!(
+                "'{}' is a synthetic random-weight model for kernel benchmarking: its text output is noise",
+                cli.model
+            ));
+            }
+            weights = choice;
+            // The roofline basis follows the policy the load applied (the gate may have fallen back).
+            let (applied, saved) = gibbs_engine::bench::applied_policy(
+                weights.as_ref(),
+                ReencodeConfig::effective().policy,
             );
+            if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, applied, saved)
+            {
+                telemetry.set_model_size_bytes(b);
+            }
+            telemetry.log_info(&format!("Compute backend: {}", model_exec.backend_label()));
+            if let Some(d) = &cli.draft {
+                let da = hub.auto_download_and_cache(d, token.as_deref())?;
+                let dr = gibbs_engine::model::draft::load_drafter(&da, artifacts, placement)
+                    .map_err(|e| format!("Cannot load drafter '{d}': {e}"))?;
+                telemetry.log_info(&format!("Speculative decoding drafter: {}", dr.label()));
+                drafter = Some(dr);
+            }
 
-            // Roofline reporting
-            let bytes_per_token = telemetry.bytes_per_token();
-            let ceiling_gbps = telemetry.get_summary().memory_bandwidth_gbps as f64;
-            if bytes_per_token > 0 && ceiling_gbps > 0.0 {
-                let roofline_tok_s = ceiling_gbps / (bytes_per_token as f64 / 1e9);
-                let pct = (tok_s / roofline_tok_s) * 100.0;
+            if let Some(prompt) = &cli.prompt {
+                println!("💬 Generating from prompt: \"{}\"", prompt);
+                let cap = match &model_exec {
+                    ExecutableModel::Native(m) => m.default_max_new_tokens(),
+                    _ => None,
+                };
+                let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
+                // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
+                let temperature = match model_exec.tokenizer().sampling_defaults {
+                    Some((t, _)) if t <= 1e-4 => 0.0,
+                    _ => 0.7,
+                };
+                let (output, passes, decode) = model_exec.generate_text_measured(
+                    prompt,
+                    max_toks,
+                    temperature,
+                    drafter.clone(),
+                )?;
+                println!("✨ Output:\n{}", output);
+                let tok_s = passes as f64 / decode.as_secs_f64().max(1e-9);
                 println!(
+                    "⚡ Decode: {passes} tokens in {:.2}ms ({:.1} tok/s) on {}",
+                    decode.as_secs_f64() * 1000.0,
+                    tok_s,
+                    model_exec.backend_label()
+                );
+
+                // Roofline reporting
+                let bytes_per_token = telemetry.bytes_per_token();
+                let ceiling_gbps = telemetry.get_summary().memory_bandwidth_gbps as f64;
+                if bytes_per_token > 0 && ceiling_gbps > 0.0 {
+                    let roofline_tok_s = ceiling_gbps / (bytes_per_token as f64 / 1e9);
+                    let pct = (tok_s / roofline_tok_s) * 100.0;
+                    println!(
                     "📈 Roofline: {pct:.1}% of {roofline_tok_s:.1} tok/s ({bytes_per_token} B/token at {ceiling_gbps:.1} GB/s)"
                 );
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
 
-        Some(model_exec)
+            Some(model_exec)
+        }
     };
 
     // 5. Initialize Continuous Batch Scheduler with Real Streaming Channel & Telemetry

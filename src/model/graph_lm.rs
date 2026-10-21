@@ -8,6 +8,7 @@ use crate::hardware::{QuantFormat, QuantMode};
 use crate::model::layers::{gguf_block_codec, QuantizedLinearLayer};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::{ModelManifest, UniversalModelLoader};
+use crate::runtime::lm::sample_logits;
 use serde::{Deserialize, Serialize};
 
 fn default_rotary_pct() -> f32 {
@@ -3308,172 +3309,6 @@ impl GraphLm {
     }
 }
 
-/// Index of the first largest element of `slice` (NaNs never win; 0 when nothing is above -inf).
-/// Two passes with 16 independent running maxima so the max pass vectorises: the single-pass
-/// `if v > best` scan is a loop-carried branch, ~0.12 ms for a 262k vocabulary on the decode path.
-fn argmax_first(slice: &[f32]) -> usize {
-    let mut lanes = [f32::NEG_INFINITY; 16];
-    let chunks = slice.chunks_exact(16);
-    let tail = chunks.remainder();
-    for c in chunks {
-        for (m, &v) in lanes.iter_mut().zip(c) {
-            *m = m.max(v);
-        }
-    }
-    let max = tail
-        .iter()
-        .chain(&lanes)
-        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    slice.iter().position(|&v| v == max).unwrap_or(0)
-}
-
-/// Samples a token id from `slice` (logits over the tokenizer's vocabulary) with repetition
-/// penalty, top-k, and nucleus top-p; `temperature <= 1e-4` is greedy argmax. Shared by every
-/// causal LM the scheduler runs.
-pub fn sample_logits(
-    slice: &[f32],
-    recent_tokens: &[u32],
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    repetition_penalty: f32,
-) -> u32 {
-    if slice.is_empty() {
-        return 0;
-    }
-    if temperature <= 1e-4 {
-        if repetition_penalty <= 1.0 || recent_tokens.is_empty() {
-            return argmax_first(slice) as u32;
-        }
-
-        // When repetition penalty > 1.0, find global unpenalized argmax first.
-        let best_idx = argmax_first(slice);
-
-        // Penalty strictly decreases/non-increases logits. If the unpenalized max
-        // is not among recent tokens, it is guaranteed to remain the global max.
-        if !recent_tokens.contains(&(best_idx as u32)) {
-            return best_idx as u32;
-        }
-
-        let mut penalized_best_idx = 0;
-        let mut penalized_best_val = f32::NEG_INFINITY;
-        for (i, &raw_val) in slice.iter().enumerate() {
-            let tok_id = i as u32;
-            let count = recent_tokens.iter().filter(|&&t| t == tok_id).count();
-            let val = if count > 0 {
-                let mut v = raw_val;
-                for _ in 0..count {
-                    if v > 0.0 {
-                        v /= repetition_penalty;
-                    } else {
-                        v *= repetition_penalty;
-                    }
-                }
-                v - (count as f32 * 1.5)
-            } else {
-                raw_val
-            };
-            if val > penalized_best_val {
-                penalized_best_val = val;
-                penalized_best_idx = i;
-            }
-        }
-        return penalized_best_idx as u32;
-    }
-
-    let mut working_logits = slice.to_vec();
-    if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
-        for &tok in recent_tokens {
-            let idx = tok as usize;
-            if idx < working_logits.len() {
-                if working_logits[idx] > 0.0 {
-                    working_logits[idx] /= repetition_penalty;
-                } else {
-                    working_logits[idx] *= repetition_penalty;
-                }
-                working_logits[idx] -= 1.5;
-            }
-        }
-    }
-
-    let (active_candidates, active_probs) = nucleus(&working_logits, temperature, top_k, top_p);
-    let active_sum: f32 = active_probs.iter().sum();
-
-    // 3. Step-varying seeded PRNG mixing token history and active distribution
-    let mut hash =
-        0x811c9dc5u32.wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
-    for (pos, &tok) in recent_tokens.iter().enumerate() {
-        hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
-        hash = hash.rotate_left(13).wrapping_mul(0x01000193);
-    }
-    for &(idx, val) in &active_candidates {
-        hash ^= (idx as u32).wrapping_mul(0x27d4eb2d);
-        hash ^= val.to_bits();
-        hash = hash.rotate_left(7).wrapping_mul(0x01000193);
-    }
-    let r = (((hash & 0x007f_ffff) as f32) / 8_388_608.0) * active_sum;
-
-    let mut cum_prob = 0.0f32;
-    for (i, &p) in active_probs.iter().enumerate() {
-        cum_prob += p;
-        if cum_prob >= r || i == active_probs.len() - 1 {
-            return active_candidates[i].0 as u32;
-        }
-    }
-
-    active_candidates[0].0 as u32
-}
-
-/// The candidates [`sample_logits`] draws from at `temperature > 1e-4` (after any penalty):
-/// top-k by logit, softmax at `temperature`, cut at cumulative `top_p`. Returns the kept
-/// `(token, logit)` pairs and their probabilities, which sum to the kept mass.
-pub(crate) fn nucleus(
-    logits: &[f32],
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-) -> (Vec<(usize, f32)>, Vec<f32>) {
-    let k = top_k.max(1).min(logits.len());
-    let mut indexed_logits: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    // Highest logit first, ties by token id: a stable full sort's order, in O(vocab).
-    let order = |a: &(usize, f32), b: &(usize, f32)| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    };
-    if k < indexed_logits.len() {
-        indexed_logits.select_nth_unstable_by(k - 1, order);
-    }
-    indexed_logits.truncate(k);
-    indexed_logits.sort_by(order);
-
-    let max_val = indexed_logits
-        .iter()
-        .map(|&(_, val)| val / temperature)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let exp_vals: Vec<f32> = indexed_logits
-        .iter()
-        .map(|&(_, val)| ((val / temperature) - max_val).exp())
-        .collect();
-    let sum_exp: f32 = exp_vals.iter().sum();
-    let mut probs: Vec<f32> = exp_vals.iter().map(|&e| e / sum_exp.max(1e-12)).collect();
-
-    // Nucleus (top-p) cutoff.
-    let p_thresh = top_p.clamp(0.01, 1.0);
-    let mut cum_p = 0.0f32;
-    let mut cutoff_idx = indexed_logits.len();
-    for (i, &p) in probs.iter().enumerate() {
-        cum_p += p;
-        if cum_p >= p_thresh {
-            cutoff_idx = i + 1;
-            break;
-        }
-    }
-    indexed_logits.truncate(cutoff_idx);
-    probs.truncate(cutoff_idx);
-    (indexed_logits, probs)
-}
-
 impl GraphLm {
     /// Samples the next token ID from logits.
     pub fn sample_next_token(&self, logits: &[f32], temperature: f32, top_k: usize) -> u32 {
@@ -3675,35 +3510,6 @@ mod tests {
         assert_eq!(with.attn_scale(), 0.0078125);
         let without = GraphLmConfig::from_gguf(&manifest(None), base);
         assert_eq!(without.attn_scale(), 1.0 / (128f32).sqrt());
-    }
-
-    /// The vectorised argmax equals the scalar first-wins scan: ties, NaNs, every length mod 16.
-    #[test]
-    fn argmax_first_matches_the_scalar_scan() {
-        let mut seed = 0x9E37_79B9u32;
-        let mut next = || {
-            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            seed >> 8
-        };
-        for len in [1usize, 2, 15, 16, 17, 33, 100, 4099] {
-            for _ in 0..20 {
-                let v: Vec<f32> = (0..len)
-                    .map(|_| match next() % 11 {
-                        0 => f32::NAN,
-                        1 => f32::NEG_INFINITY,
-                        r => (r % 4) as f32 - 1.0, // few distinct values: many ties
-                    })
-                    .collect();
-                let (mut best, mut idx) = (f32::NEG_INFINITY, 0);
-                for (i, &x) in v.iter().enumerate() {
-                    if x > best {
-                        best = x;
-                        idx = i;
-                    }
-                }
-                assert_eq!(argmax_first(&v), idx, "{v:?}");
-            }
-        }
     }
 
     fn granite_manifest(arch: &str, extra: &[(&str, &str)]) -> ModelManifest {

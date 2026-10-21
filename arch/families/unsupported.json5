@@ -1,0 +1,18 @@
+// Architectures Hub repos name that no spec implements: loads and the hub picker refuse them
+// with the reason of the first matching `runtime.reasons` glob.
+{
+  family: "unsupported",
+  pipeline: "unsupported",
+  match: {
+    hf_model_type: ["deepseek_v4*", "deepseek_v2*", "deepseek_v3*", "deepseek2*", "glm_moe_dsa*", "wan*"],
+    gguf_arch: ["deepseek2*"],
+  },
+  runtime: {
+    reasons: [
+      ["deepseek_v4*", "DeepSeek-V4 family: needs multi-query attention with q/o low-rank projections and compressed-KV sparse indexing (compress_ratios, index_topk), hyper-connections (hc_mult), 256-384 routed experts with sqrtsoftplus gating and multi-token-prediction heads (V4.1 adds Engram n-gram embeddings); none is implemented, and every real checkpoint exceeds host memory (smallest: 57.8B parameters)"],
+      ["deepseek*", "architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented"],
+      ["glm_moe_dsa*", "architecture 'glm-dsa' uses Dynamic Sparse Attention (DSA), which is not implemented"],
+      ["wan*", "text-to-video model, architecture 'wan' (not supported)"],
+    ],
+  },
+}

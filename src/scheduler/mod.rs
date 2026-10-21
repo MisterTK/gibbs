@@ -2,9 +2,10 @@ pub mod spec;
 
 use crate::hardware::{Device, QuantMode};
 use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
-use crate::model::graph_lm::{sample_logits, GraphLm};
+use crate::model::graph_lm::GraphLm;
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
+use crate::runtime::lm::sample_logits;
 use crate::telemetry::{EngineTelemetry, GapSample};
 use parking_lot::{Mutex, RwLock};
 use spec::{Drafter, KTuner, SpecSeq};

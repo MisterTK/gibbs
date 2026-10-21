@@ -25,6 +25,26 @@ const TEXT_ENCODER: &str = "text_encoder/model.fp16.safetensors";
 const UNET: &str = "unet/diffusion_pytorch_model.fp16.safetensors";
 const VAE: &str = "vae/diffusion_pytorch_model.fp16.safetensors";
 
+/// A text-to-video repo, as `arch::load_model` routes it (legacy: until Phase 10 video specs).
+pub enum Video {
+    /// An LTX-Video generation plan (diffusers repo or `ltxv` GGUF).
+    Ltx(crate::model::ltx::Plan),
+    /// A ModelScope `TextToVideoSDPipeline` repo ([`TextToVideoPipeline`]).
+    ModelScope,
+}
+
+/// The video route of `repo_id`, if it is a text-to-video repo; `quant` picks an LTX GGUF.
+pub fn detect(
+    hub: &HuggingFaceHub,
+    repo_id: &str,
+    quant: Option<&str>,
+) -> Option<Result<Video, String>> {
+    if let Some(plan) = crate::model::ltx::resolve(hub, repo_id, quant) {
+        return Some(plan.map(Video::Ltx));
+    }
+    TextToVideoPipeline::is_t2v_repo(hub, repo_id).then_some(Ok(Video::ModelScope))
+}
+
 pub struct TextToVideoPipeline {
     clip: ClipTextTransformer,
     unet: Unet3d,

@@ -10,7 +10,7 @@
 
 use super::{recent, ExecutableModel, SeqKvCache, WRONG_KV};
 use crate::model::sd::Rng;
-use crate::model::graph_lm::nucleus;
+use crate::runtime::lm::nucleus;
 use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;

@@ -8,17 +8,23 @@
 //! RFC 7386 merge patch: objects merge, everything else (arrays included) replaces, `null` deletes.
 
 pub mod build;
+pub mod dispatch;
 pub mod expr;
 pub mod gen;
 pub mod load;
 pub mod names;
+
+pub use dispatch::{load_model, LoadOpts, Loaded};
 
 use serde::Deserialize;
 use serde_json::{Map, Value as J};
 use std::path::Path;
 
 /// Every embedded spec file: (path under `arch/`, contents).
-pub const EMBEDDED: &[(&str, &str)] = &[];
+pub const EMBEDDED: &[(&str, &str)] = &[(
+    "families/unsupported.json5",
+    include_str!("../../arch/families/unsupported.json5"),
+)];
 
 /// Tensor facts the interpreter needs: canonical weights and generated constants.
 pub trait Source {
@@ -231,6 +237,21 @@ impl Spec {
         };
         serde_json::from_value(rt).map_err(|e| format!("{}: runtime: {e}", self.family))
     }
+
+    /// An `unsupported` family's reason for `name`: the first `runtime.reasons` `[glob, reason]`
+    /// pair matching it, else `reason`.
+    pub fn unsupported_reason(&self, name: &str) -> String {
+        self.runtime["reasons"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|r| match (r[0].as_str(), r[1].as_str()) {
+                (Some(g), Some(why)) if glob(g, name) => Some(why.to_string()),
+                _ => None,
+            })
+            .or_else(|| self.reason.clone())
+            .unwrap_or_else(|| format!("family `{}` is not supported", self.family))
+    }
 }
 
 /// An override file: a partial spec applied to checkpoints it names.
@@ -433,6 +454,12 @@ impl Registry {
 
     /// The merged spec of `family` for checkpoint `sig`: base + every applicable override.
     pub fn spec(&self, family: &str, sig: &Signals) -> Result<Spec, String> {
+        serde_json::from_value(self.merged(family, sig)?)
+            .map_err(|e| format!("family `{family}`: {e}"))
+    }
+
+    /// [`Self::spec`] as JSON (what `--arch-dump` prints).
+    pub fn merged(&self, family: &str, sig: &Signals) -> Result<J, String> {
         let mut j = self.base(family)?;
         for (_, ov) in &self.overrides {
             if applies(&ov.applies_to, family, sig) {
@@ -456,7 +483,7 @@ impl Registry {
             macros.extend(m.clone());
         }
         j["macros"] = J::Object(macros);
-        serde_json::from_value(j).map_err(|e| format!("family `{family}`: {e}"))
+        Ok(j)
     }
 
     /// Rename rules of a shared set.
@@ -481,22 +508,20 @@ impl Registry {
                 ))
             })
             .collect();
+        let any = |pats: &[String], s: &str| pats.iter().any(|p| glob(p, s));
         let hit = |m: &Match| {
             sig.hf_model_type
                 .as_ref()
-                .is_some_and(|t| m.hf_model_type.contains(t))
+                .is_some_and(|t| any(&m.hf_model_type, t))
                 || sig
                     .hf_architectures
                     .iter()
-                    .any(|a| m.hf_architectures.contains(a))
-                || sig
-                    .gguf_arch
-                    .as_ref()
-                    .is_some_and(|a| m.gguf_arch.contains(a))
+                    .any(|a| any(&m.hf_architectures, a))
+                || sig.gguf_arch.as_ref().is_some_and(|a| any(&m.gguf_arch, a))
                 || sig
                     .diffusers_class
                     .as_ref()
-                    .is_some_and(|c| m.diffusers_class.contains(c))
+                    .is_some_and(|c| any(&m.diffusers_class, c))
                 || (!sig.ext().is_empty() && m.file_ext.iter().any(|e| e == sig.ext()))
         };
         matchers
@@ -524,6 +549,37 @@ impl Registry {
             })
             .collect()
     }
+
+    /// Why `name` (a `model_type` or GGUF architecture) is refused: the reason of the first
+    /// `unsupported` family whose `hf_model_type` / `gguf_arch` globs match it.
+    pub fn unsupported(&self, name: &str) -> Option<String> {
+        self.families.iter().find_map(|(f, j)| {
+            let m: Match = serde_json::from_value(j.get("match")?.clone()).ok()?;
+            let hit = m
+                .hf_model_type
+                .iter()
+                .chain(&m.gguf_arch)
+                .any(|p| glob(p, name));
+            let spec = self.spec(f, &Signals::default()).ok()?;
+            (hit && spec.pipeline == Pipeline::Unsupported).then(|| spec.unsupported_reason(name))
+        })
+    }
+
+    /// Whether a `causal_lm` family lists `model_type` (glob) in its `hf_model_type`.
+    pub fn runs_model_type(&self, model_type: &str) -> bool {
+        self.matchers().iter().any(|(_, m, p)| {
+            *p == Pipeline::CausalLm && m.hf_model_type.iter().any(|g| glob(g, model_type))
+        })
+    }
+
+    /// The GGUF architectures `causal_lm` families claim.
+    pub fn causal_lm_gguf_archs(&self) -> Vec<String> {
+        self.matchers()
+            .into_iter()
+            .filter(|(_, _, p)| *p == Pipeline::CausalLm)
+            .flat_map(|(_, m, _)| m.gguf_arch)
+            .collect()
+    }
 }
 
 fn applies(a: &AppliesTo, family: &str, sig: &Signals) -> bool {
@@ -536,6 +592,22 @@ fn applies(a: &AppliesTo, family: &str, sig: &Signals) -> bool {
             .as_deref()
             .is_none_or(|t| sig.gguf_arch.as_deref() == Some(t))
         && (a.file_name.is_empty() || a.file_name.iter().any(|g| glob(g, &sig.file_name)))
+}
+
+/// The embedded specs plus the user's `<cache>/arch/{families,overrides}`, read once per process.
+pub fn registry() -> Result<&'static Registry, String> {
+    static REG: std::sync::LazyLock<Result<Registry, String>> = std::sync::LazyLock::new(|| {
+        let user = crate::hardware::default_cache_dir()
+            .ok()
+            .map(|d| d.join("arch"));
+        Registry::load(user.as_deref())
+    });
+    REG.as_ref().map_err(Clone::clone)
+}
+
+/// [`Registry::unsupported`] over [`registry`].
+pub fn unsupported(name: &str) -> Option<String> {
+    registry().ok()?.unsupported(name)
 }
 
 #[cfg(test)]

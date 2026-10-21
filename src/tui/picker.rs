@@ -1864,9 +1864,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
         return verdict.err();
     }
     let model_type = m["config"]["model_type"].as_str();
-    if let Some((t, why)) =
-        model_type.and_then(|t| Some((t, crate::model::native::unsupported_architecture(t)?)))
-    {
+    if let Some((t, why)) = model_type.and_then(|t| Some((t, crate::arch::unsupported(t)?))) {
         return Some(format!("{t}: {why}"));
     }
     let is_split_gguf = m["siblings"].as_array().map_or(false, |a| {
@@ -1879,7 +1877,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
             .as_str()
             .filter(|_| model_type.is_none())
         {
-            if let Some(why) = crate::model::native::unsupported_architecture(a) {
+            if let Some(why) = crate::arch::unsupported(a) {
                 return Some(format!("{a}: {why}"));
             }
         }
@@ -3001,19 +2999,19 @@ mod tests {
         );
         // 4. Architecture refusals
         assert_eq!(
-            crate::model::native::unsupported_architecture("deepseek_v3"),
+            crate::arch::unsupported("deepseek_v3").as_deref(),
             Some("architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented")
         );
         assert_eq!(
-            crate::model::native::unsupported_architecture("deepseek2"),
+            crate::arch::unsupported("deepseek2").as_deref(),
             Some("architecture 'deepseek' uses Multi-Head Latent Attention (MLA), which is not implemented")
         );
         assert_eq!(
-            crate::model::native::unsupported_architecture("glm_moe_dsa"),
+            crate::arch::unsupported("glm_moe_dsa").as_deref(),
             Some("architecture 'glm-dsa' uses Dynamic Sparse Attention (DSA), which is not implemented")
         );
         assert_eq!(
-            crate::model::native::unsupported_architecture("wan"),
+            crate::arch::unsupported("wan").as_deref(),
             Some("text-to-video model, architecture 'wan' (not supported)")
         );
 
