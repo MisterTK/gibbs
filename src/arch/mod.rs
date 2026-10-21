@@ -1066,45 +1066,28 @@ mod tests {
         assert!(bad.is_empty(), "mismatches:\n  {}", bad.join("\n  "));
     }
 
+    /// A synthetic `gibbs/*` id (hub.rs writes a `LlamaForCausalLM` config, no weights) random-inits
+    /// every weight the llama text instances read.
     #[test]
-    fn zz_debug_bitnet() {
-        let d = Dims { h: 64, heads: 4, kv: 2, hd: 16, inter: 128, layers: 2 };
-        let cfg = lm_config("bitnet", "BitNetForCausalLM", &d, json!({"hidden_act": "relu2",
-            "quantization_config": {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "online"}}));
+    fn llama_synthetic_id_runs() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("bitnet");
-        llama_weights(16, &d, false, false, true, false).write_checkpoint(&dir, &cfg, V);
-        let mut r = Runner::load(&dir, None, Device::Cpu, 64).unwrap();
-        use super::expr::Val;
-        let inst = r.instance("text", &[("rows", Val::Num(6.0)), ("head", Val::Str("last".into()))]).unwrap();
-        let w = r.model.store.materialize(&inst.weights).unwrap();
-        let ins = vec![crate::graph::Tensor::U32(PROMPT.to_vec()), crate::graph::Tensor::U32((0..6).collect())];
-        let mut st = crate::graph::StateStore::new();
-        let raw = crate::graph::cpu::run(&inst.graph, &w, &mut st, ins.clone()).unwrap();
-        let viaprog = r.lm(&PROMPT, 0, "last", "logits", vec![]);
-        let raw = raw[0].as_f32().unwrap().to_vec();
-        eprintln!("raw vs prog {:?}", compare(&raw, &viaprog));
-        let llm = crate::model::hf_loader::load_causal_lm(&super::testing::artifacts(&dir), crate::hardware::QuantMode::Uncompressed).unwrap();
-        let host = llm.forward(&PROMPT);
-        eprintln!("raw vs host {:?}", compare(&raw, &host));
-        let golden: J = serde_json::from_slice(&std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_bitnet.json")).unwrap()).unwrap();
-        let g: Vec<f32> = golden["f32"]["prefill6"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
-        eprintln!("host vs golden {:?}", compare(&host, &g));
-        for n in 1..=3 {
-            let mut r2 = Runner::load(&dir, None, Device::Cpu, 64).unwrap();
-            let s = r2.lm(&PROMPT[..n], 0, "last", "logits", vec![]);
-            let hh = r2.lm(&PROMPT[..n], 0, "hidden", "hidden", vec![]);
-            let hh = &hh[hh.len() - 64..];
-            eprintln!("n={n} logits {:?} hidden {:?}", compare(&s, &llm.forward(&PROMPT[..n])), compare(hh, &llm.final_hidden(&PROMPT[..n])));
+        let cfg = json!({"architectures": ["LlamaForCausalLM"], "model_type": "qwen2", "hidden_size": 128,
+            "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 256,
+            "vocab_size": 512, "max_position_embeddings": 2048, "rms_norm_eps": 1e-6});
+        let p = tmp.path().join("config.json");
+        std::fs::write(&p, cfg.to_string()).unwrap();
+        let a = crate::model::hub::ModelArtifacts {
+            model_id: "gibbs/tiny-1m".into(),
+            local_dir: Some(tmp.path().to_path_buf()),
+            config_path: Some(p),
+            ..Default::default()
+        };
+        let mut r = super::testing::Runner::from_artifacts(&a, None, Device::Cpu, 16).unwrap();
+        assert_eq!(r.model.spec.family, "llama");
+        for (ids, pos) in [(&[1u32, 2, 3][..], 0), (&[4][..], 3)] {
+            let l = r.lm(ids, pos, "last", "logits", vec![]);
+            assert_eq!(l.len(), 512);
+            assert!(l.iter().all(|x| x.is_finite()) && l.iter().any(|&x| x != 0.0));
         }
-        let wq = r.model.store.materialize(&["model.layers.0.self_attn.q_proj.weight".to_string(), "model.layers.0.mlp.down_proj.weight".to_string()]).unwrap();
-        let sq = wq.get("model.layers.0.self_attn.q_proj.weight").unwrap();
-        let sd = wq.get("model.layers.0.mlp.down_proj.weight").unwrap();
-        let f = |t: &crate::graph::Tensor| match t { crate::graph::Tensor::F32(v) => v.clone(), o => panic!("{:?}", std::mem::discriminant(o)) };
-        let hq = match &llm.layers[0].qkv_proj.weight { crate::model::layers::QuantizedWeight::Uncompressed { data, .. } => data.clone(), _ => panic!() };
-        let hd = match &llm.layers[0].down_proj.weight { crate::model::layers::QuantizedWeight::Uncompressed { data, .. } => data.clone(), _ => panic!() };
-        let (sq, sd) = (f(sq), f(sd));
-        eprintln!("q {:?} {:?} vs {:?}", compare(&sq, &hq[..sq.len()]), &sq[..4], &hq[..4]);
-        eprintln!("down {:?} {:?} vs {:?}", compare(&sd, &hd), &sd[..4], &hd[..4]);
     }
 }
