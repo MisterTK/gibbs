@@ -394,7 +394,7 @@ fn drafter_family(reg: &Registry, sig: &Signals) -> Option<String> {
 /// The target a drafter repo pairs with (`None` when no drafter family claims its config
 /// `architectures` or GGUF architecture `gguf_arch`): the verifier its config names, a
 /// `base_model:` hub tag, else the repo name minus a drafter suffix of its family
-/// (`runtime.repo_suffixes`; `z-lab/Qwen3-4B-DFlash-b16` -> `Qwen3-4B`).
+/// (`runtime.repo_suffixes`; `org/Model-4B-Draft-b16` with suffix `-draft` -> `Model-4B`).
 pub fn draft_target(id: &str, cfg: &J, tags: &[&str], gguf_arch: Option<&str>) -> Option<String> {
     let reg = registry().ok()?;
     let sig = Signals {
@@ -1056,5 +1056,53 @@ mod tests {
         std::fs::write(gd.join("dflash.gguf"), crate::model::loaders::gguf::test_gguf_file(&kv, &extra)).unwrap();
         let err = load_drafter(&artifacts(&gd, "dflash.gguf"), &target, cpu).err().unwrap();
         assert!(err.contains("blk.0.attn_post_norm.weight"), "{err}");
+    }
+
+    /// A plain drafter that is the target itself drafts the target's greedy continuation, also
+    /// after a partial accept (rewind) and a rejected draft.
+    #[test]
+    fn plain_self_drafter_drafts_the_greedy_continuation() {
+        let _g = crate::hardware::cpu_compute::allow();
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = W::new(7);
+        w.w("model.embed_tokens.weight", &[V, H]).norm("model.norm.weight", H, 1.0);
+        let p = "model.layers.0";
+        w.norm(format!("{p}.input_layernorm.weight"), H, 1.0)
+            .norm(format!("{p}.post_attention_layernorm.weight"), H, 1.0)
+            .w(format!("{p}.self_attn.q_proj.weight"), &[H, H])
+            .w(format!("{p}.self_attn.k_proj.weight"), &[4, H])
+            .w(format!("{p}.self_attn.v_proj.weight"), &[4, H])
+            .w(format!("{p}.self_attn.o_proj.weight"), &[H, H])
+            .w(format!("{p}.mlp.gate_proj.weight"), &[16, H])
+            .w(format!("{p}.mlp.up_proj.weight"), &[16, H])
+            .w(format!("{p}.mlp.down_proj.weight"), &[H, 16])
+            .s("lm_head.weight", &[V, H], 2.0);
+        w.write_checkpoint(dir.path(), &json!({"model_type": "llama", "architectures": ["LlamaForCausalLM"],
+            "hidden_size": H, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
+            "intermediate_size": 16, "vocab_size": V, "max_position_embeddings": 64}), V);
+        let a = artifacts(dir.path(), "model.safetensors");
+        let lm: Arc<dyn NativeLm> =
+            crate::runtime::lm::load(&a, registry().unwrap(), None, PlacementMode::Pin(Device::Cpu)).unwrap();
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        // The model's own greedy continuation of `toks`, `n` tokens.
+        let greedy = |toks: &[u32], n: usize| {
+            let (_, mut s) = lm.prepare(toks.to_vec(), &[]).unwrap();
+            let mut out = vec![argmax(&lm.forward(toks, 0, &mut s).unwrap())];
+            while out.len() < n {
+                let l = lm.forward(&out[out.len() - 1..], toks.len() + out.len() - 1, &mut s).unwrap();
+                out.push(argmax(&l));
+            }
+            out
+        };
+        let d = Plain { label: "self".into(), lm: lm.clone() };
+        let mut st = d.new_state();
+        let mut toks = vec![5u32, 9, 14, 3];
+        for round in 0..3 {
+            let got = d.propose(&mut st, &toks, &[], 3, &mut |l| argmax(l)).unwrap();
+            assert_eq!(got, greedy(&toks, 3), "round {round}");
+            // Accept the first draft, reject the second.
+            toks.push(got[0]);
+            toks.push((got[1] + 1) % V as u32);
+        }
     }
 }

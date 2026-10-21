@@ -107,7 +107,8 @@ fn qwen3_5_drafters_keep_greedy_output_and_get_accepted() {
     );
 }
 
-/// Taps from GraphLm (llama) feed a DSpark drafter with llama3 rope and a pruned draft vocab.
+/// Taps from the spec-run llama decoder feed a DSpark drafter with llama3 rope and a pruned draft
+/// vocab.
 #[test]
 fn llama_dspark_keeps_greedy_output_and_gets_accepted() {
     check(
