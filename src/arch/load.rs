@@ -2798,6 +2798,7 @@ mod tests {
               {tensor: "model.layers.0.q.weight", op: "split_rows",
                args: {parts: [["q0.a", 1], ["q0.b", 1]]}},
               {tensor: "blk.{e}.exp.weight", op: "stack_experts", args: {out: "exp.weight", count: 2}},
+              {tensor: "exp.weight", op: "reshape", args: {shape: [2, 32]}},
             ]}"#;
         let a = artifacts(d.path(), Some("toy.gguf"), None);
         let m = load_with(&a, &registry(&[spec]), None, exact()).unwrap();
@@ -2850,12 +2851,16 @@ mod tests {
             panic!()
         };
         assert!(b.packed().is_none() && close(&b.to_f32(), &q8v[32..]));
-        // Stacked packed experts stay packed.
+        // Stacked and reshaped ([2, 1, 32] -> [2, 32]) packed experts stay packed.
         assert_eq!(
             s.tensor("exp.weight"),
-            Some((vec![2, 1, 32], DType::Quant(Q::GGUF_Q8_0)))
+            Some((vec![2, 32], DType::Quant(Q::GGUF_Q8_0)))
         );
-        assert_eq!(get(&m, "exp.weight").to_f32(), [e0v.clone(), e0v].concat());
+        let Tensor::Mat(exp) = get(&m, "exp.weight") else {
+            panic!()
+        };
+        assert!(exp.packed().is_some());
+        assert_eq!(exp.to_f32(), [e0v.clone(), e0v].concat());
     }
 
     #[test]
