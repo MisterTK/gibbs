@@ -6,13 +6,15 @@
 // rows and raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
 {
   family: "qwen_image",
-  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
-  // text-encoder specs land and this family is cut over.
-  match: {diffusers_class: ["QwenImageTransformer2DModel"]},
+  match: {diffusers_class: ["QwenImagePipeline", "QwenImageTransformer2DModel"],
+          denoiser_tensors: [["transformer_blocks.0.img_mod.1.weight", "txt_norm.weight"]],
+          bases: ["Qwen/Qwen-Image"]},
   pipeline: "diffusion",
   use_lib: ["diffusion"],
   names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
   config: {
+    // The transformer component (the pipeline root, which loads this spec too, has no tensors).
+    is_denoiser: "has('img_in.weight')",
     dim: "shape('img_in.weight')[0]",
     in_ch: "shape('img_in.weight')[1]",
     head_dim: "shape('transformer_blocks.0.attn.norm_q.weight')[0]",
@@ -23,21 +25,21 @@
     eps: "1e-6",
   },
   checks: [
-    {expr: "cfg.guidance_embeds == true || cfg.zero_cond_t == true || cfg.use_additional_t_cond == true || cfg.use_layer3d_rope == true",
+    {expr: "is_denoiser && (cfg.guidance_embeds == true || cfg.zero_cond_t == true || cfg.use_additional_t_cond == true || cfg.use_layer3d_rope == true)",
      error: "Qwen-Image 1: guidance_embeds / zero_cond_t / use_additional_t_cond / use_layer3d_rope are not implemented"},
-    {expr: "first(cfg.patch_size, 2) != 2", error: "Qwen-Image 1: only patch_size 2 is supported"},
-    {expr: "has('time_text_embed.guidance_embedder.linear_1.weight') || has('time_text_embed.addition_t_embedding.weight')",
+    {expr: "is_denoiser && (first(cfg.patch_size, 2) != 2)", error: "Qwen-Image 1: only patch_size 2 is supported"},
+    {expr: "is_denoiser && (has('time_text_embed.guidance_embedder.linear_1.weight') || has('time_text_embed.addition_t_embedding.weight'))",
      error: "Qwen-Image 1: guidance / additional-t embedders are not implemented"},
-    {expr: "layers == 0", error: "Qwen-Image 1 transformer: no transformer_blocks"},
-    {expr: "len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim", error: "Qwen-Image 1: axes_dims_rope must be 3 sizes summing to head_dim"},
+    {expr: "is_denoiser && (layers == 0)", error: "Qwen-Image 1 transformer: no transformer_blocks"},
+    {expr: "is_denoiser && (len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim)", error: "Qwen-Image 1: axes_dims_rope must be 3 sizes summing to head_dim"},
   ],
   transforms: [
     {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
   ],
   constants: {
-    "rope.inv_freq": {gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
-    one: {gen: "fill", args: {shape: [1], value: 1}},
-    "ones.dim": {gen: "ones", args: {shape: ["dim"]}},
+    "rope.inv_freq": {when: "is_denoiser", gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
+    one: {when: "is_denoiser", gen: "fill", args: {shape: [1], value: 1}},
+    "ones.dim": {when: "is_denoiser", gen: "ones", args: {shape: ["dim"]}},
   },
   macros: {
     // One stream's modulated, QK-normed projections: returns q, k, v.

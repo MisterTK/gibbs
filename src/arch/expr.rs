@@ -834,8 +834,6 @@ fn call(f: &str, args: &[Expr], env: &dyn Env) -> Result<Val, String> {
         "dtype" => env.dtype(arg(0)?.str()?).map_or(Val::Null, |d| Val::Str(d.into())),
         // token(s): the vocabulary id of token string `s` (null when absent).
         "token" => env.token(arg(0)?.str()?).map_or(Val::Null, |t| Val::Num(t as f64)),
-        // bf16(x): x rounded to the nearest bfloat16 (through f32).
-        "bf16" => Val::Num(crate::model::bf16_to_f32(crate::model::f32_to_bf16(arg(0)?.num()? as f32)) as f64),
         // rfind(list, x, end): the last index below `end` (default len) holding x, else -1.
         "rfind" => {
             let l = arg(0)?.list()?;

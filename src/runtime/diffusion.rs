@@ -315,6 +315,8 @@ pub struct TextEntry {
     pub mask: J,
     #[serde(default = "keep_all")]
     pub keep: String,
+    /// Rows dropped from every output; expressions over `prefix_len` (tokens of the template before
+    /// `{prompt}`), `prefix_tokens` (tokens of `prefix` alone) and `valid`.
     #[serde(default)]
     pub drop: Option<Range2>,
     #[serde(default)]
@@ -550,6 +552,10 @@ pub struct Extras {
     /// (component, weights file) replacing the snapshot's weights of that component (a derived
     /// finetune / quantization, e.g. a GGUF from another repo); config stays the snapshot's.
     pub weights: Vec<(String, std::path::PathBuf)>,
+    /// A derived repo's own `scheduler/scheduler_config.json`, replacing the snapshot's.
+    pub scheduler: Option<J>,
+    /// A derived repo's model card, read by `scheduler.sigmas: "card"` instead of the snapshot's.
+    pub card: Option<String>,
 }
 
 /// A text-to-image (and image-to-image) pipeline run from its family spec.
@@ -690,8 +696,19 @@ impl SpecDiffusion {
         family: Option<&str>,
         extra: &Extras,
     ) -> Result<Self, String> {
+        Self::load_in(crate::arch::registry()?, artifacts, hub, mode, family, extra)
+    }
+
+    /// [`Self::load`] from the specs of `reg`.
+    pub fn load_in(
+        reg: &crate::arch::Registry,
+        artifacts: &ModelArtifacts,
+        hub: &HuggingFaceHub,
+        mode: PlacementMode,
+        family: Option<&str>,
+        extra: &Extras,
+    ) -> Result<Self, String> {
         let loras = &extra.loras;
-        let reg = crate::arch::registry()?;
         let lora_files = loras
             .iter()
             .map(|(p, s)| Ok((crate::model::lora::LoraFile::open(p)?, *s)))
@@ -955,19 +972,18 @@ impl SpecDiffusion {
         };
 
         let s = &rt.scheduler;
-        let sched_cfg = if s.config.is_null() {
-            ev(
-                &J::String("json.scheduler_config".into()),
-                "scheduler.config",
-            )
-            .ok()
-            .filter(|v| !v.is_null())
-            .map(|v| v.to_json())
-            .or_else(|| {
-                let p = dir.join("scheduler/scheduler_config.json");
-                serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
-            })
-            .unwrap_or(J::Null)
+        let sched_cfg = if let Some(c) = &extra.scheduler {
+            c.clone()
+        } else if s.config.is_null() {
+            ev(&J::String("json.scheduler_config".into()), "scheduler.config")
+                .ok()
+                .filter(|v| !v.is_null())
+                .map(|v| v.to_json())
+                .or_else(|| {
+                    let p = dir.join("scheduler/scheduler_config.json");
+                    serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+                })
+                .unwrap_or(J::Null)
         } else {
             ev(&s.config, "scheduler.config")?.to_json()
         };
@@ -1003,7 +1019,7 @@ impl SpecDiffusion {
                 }
                 let base = s.sigmas.clone().unwrap_or_else(|| "linspace".into());
                 let card = (base == "card")
-                    .then(|| std::fs::read_to_string(dir.join("README.md")).ok())
+                    .then(|| extra.card.clone().or_else(|| std::fs::read_to_string(dir.join("README.md")).ok()))
                     .flatten()
                     .and_then(|c| card_sigmas(&c));
                 Sampler::Flow {
@@ -1206,6 +1222,8 @@ impl SpecDiffusion {
             } else {
                 0
             };
+            // Tokens of the `prefix` string alone (a template may put more before `{prompt}`).
+            let prefix_tokens = if e.prefix.is_empty() { 0 } else { tokenize(&t.tok, &e.prefix, e.add_special)?.len() };
             let pv = [("prefix_len", Val::Num(prefix_len as f64))];
             let opt_id = |j: &J| -> Result<Option<u32>, String> {
                 if j.is_null() {
@@ -1280,6 +1298,7 @@ impl SpecDiffusion {
             };
             let dv = [
                 ("prefix_len", Val::Num(prefix_len as f64)),
+                ("prefix_tokens", Val::Num(prefix_tokens as f64)),
                 ("valid", Val::Num(valid as f64)),
             ];
             let drop = match &e.drop {
@@ -2203,12 +2222,8 @@ pub fn pipeline_class(dir: &Path) -> Option<String> {
 }
 
 /// The diffusion family of a diffusers pipeline class (`None`: no `pipeline: diffusion` spec).
-fn family_of_class(class: &str) -> Option<String> {
-    let reg = crate::arch::registry().ok()?;
-    let sig = crate::arch::Signals {
-        diffusers_class: Some(class.to_string()),
-        ..Default::default()
-    };
+fn family_of_class(reg: &crate::arch::Registry, class: &str) -> Option<String> {
+    let sig = crate::arch::Signals { diffusers_class: Some(class.to_string()), ..Default::default() };
     let f = reg.detect(&sig)?;
     (reg.spec(&f, &sig).ok()?.pipeline == crate::arch::Pipeline::Diffusion).then_some(f)
 }
@@ -2222,17 +2237,21 @@ pub fn load_image(
     hub: &HuggingFaceHub,
     mode: PlacementMode,
 ) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
+    load_image_in(crate::arch::registry().ok()?, artifacts, hub, mode)
+}
+
+/// [`load_image`] from the specs of `reg`.
+pub fn load_image_in(
+    reg: &crate::arch::Registry,
+    artifacts: &ModelArtifacts,
+    hub: &HuggingFaceHub,
+    mode: PlacementMode,
+) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
     let arc = |r: Result<SpecDiffusion, String>| r.map(|p| Arc::new(p) as Arc<dyn ImageGenerator>);
     let dir = artifacts.local_dir.as_deref()?;
     if let Some(class) = pipeline_class(dir) {
-        if family_of_class(&class).is_some() {
-            return Some(arc(SpecDiffusion::load(
-                artifacts,
-                hub,
-                mode,
-                None,
-                &Extras::default(),
-            )));
+        if family_of_class(reg, &class).is_some() {
+            return Some(arc(SpecDiffusion::load_in(reg, artifacts, hub, mode, None, &Extras::default())));
         }
         if class.contains("Inpaint") {
             return Some(Err(format!(
@@ -2244,28 +2263,24 @@ pub fn load_image(
                 "{class} is an image-to-image-only pipeline; load its text-to-image base repo and use /v1/images/edits"
             )));
         }
-        return None;
+        // Another kind of pipeline a spec runs (video) loads elsewhere.
+        let sig = crate::arch::Signals { diffusers_class: Some(class.clone()), ..Default::default() };
+        if reg.detect(&sig).is_some() {
+            return None;
+        }
+        return Some(Err(format!("diffusers pipeline {class} is not supported")));
     }
     let weights = artifacts.weights_path.as_deref()?;
     let names = weight_names(weights)?;
-    let reg = crate::arch::registry().ok()?;
     if let Some(fam) = reg.detect_single_file(&names, &ext_of(weights)) {
-        return Some(single_file(
-            &artifacts.model_id,
-            weights,
-            &fam,
-            hub,
-            mode,
-            Vec::new(),
-        ));
+        return Some(single_file(reg, &artifacts.model_id, weights, &fam, hub, mode, Vec::new()));
     }
     let lora = weights.extension().is_some_and(|e| e == "safetensors")
         && crate::model::lora::is_diffusion_lora(names.iter().map(String::as_str));
-    let denoiser = if lora {
-        None
-    } else {
-        Some(reg.detect_denoiser(&names)?)
-    };
+    let denoiser = if lora { None } else { Some(reg.detect_denoiser(&names)?) };
+    if let Some(r) = denoiser.as_deref().and_then(|d| split_files(reg, &artifacts.model_id, weights, d, hub, mode)) {
+        return Some(r);
+    }
     // `--model org/repo/file.gguf` names one file of the repo.
     let repo = crate::model::hub::split_weight_file(&artifacts.model_id).0;
     let card = dir
@@ -2274,11 +2289,8 @@ pub fn load_image(
         .then(|| dir.join("README.md"))
         .map_or_else(|| hub.fetch_file(repo, "README.md"), Ok)
         .and_then(|p| std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display())));
-    let what = if lora {
-        "diffusion LoRA"
-    } else {
-        "denoiser weights"
-    };
+    let what = if lora { "diffusion LoRA" } else { "denoiser weights" };
+    let card_text = card.as_ref().ok().cloned();
     let base = match card.map(|c| crate::model::lora::card_base_model(&c)) {
         Ok(Some(b)) => b,
         // A LoRA without a card base may belong to another kind of model.
@@ -2312,18 +2324,11 @@ pub fn load_image(
             let w = b.weights_path?;
             let fam = reg.detect_single_file(&weight_names(&w)?, &ext_of(&w))?;
             let id = format!("{} on {base}", artifacts.model_id);
-            return Some(single_file(
-                &id,
-                &w,
-                &fam,
-                hub,
-                mode,
-                vec![(weights.to_path_buf(), 1.0)],
-            ));
+            return Some(single_file(reg, &id, &w, &fam, hub, mode, vec![(weights.to_path_buf(), 1.0)]));
         }
         Err(e) => return Some(Err(e)),
     };
-    let fam = class.as_deref().and_then(family_of_class);
+    let fam = class.as_deref().and_then(|c| family_of_class(reg, c));
     match (&fam, &denoiser) {
         // A base no diffusion spec runs: other loaders may (denoiser tensor names are shared).
         (None, _) => return None,
@@ -2360,14 +2365,138 @@ pub fn load_image(
                 Some(_) => vec![(rt.denoiser.component.clone(), weights.to_path_buf())],
                 None => Vec::new(),
             },
+            // A distilled finetune ships its own schedule: its `scheduler/` and its card's sigmas.
+            scheduler: Some(dir.join("scheduler/scheduler_config.json"))
+                .filter(|p| p.is_file())
+                .map_or_else(|| hub.fetch_file(repo, "scheduler/scheduler_config.json"), Ok)
+                .ok()
+                .and_then(|p| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()),
+            card: card_text.clone(),
         };
-        arc(SpecDiffusion::load(&a, hub, mode, Some(&fam), &extra))
+        arc(SpecDiffusion::load_in(reg, &a, hub, mode, Some(&fam), &extra))
     })())
+}
+
+/// `runtime.split`: a split-file distribution (e.g. ComfyUI's `diffusion_models/`, `text_encoders/`,
+/// `vae/` folders) whose denoiser file sits in a folder named `dir`.
+#[derive(Deserialize)]
+struct SplitSpec {
+    dir: String,
+    /// Component -> its sibling folder (the file there whose name contains `prefer`, else the
+    /// first) or, absent, the `repo:path` file fetched.
+    parts: HashMap<String, SplitPart>,
+    /// Pipeline-root files: a `repo:path` string (fetched, copied) or a JSON value (written).
+    #[serde(default)]
+    files: HashMap<String, J>,
+    /// `model_index.json` booleans: true when the denoiser's file or repo name contains (any
+    /// case) one of the substrings.
+    #[serde(default)]
+    name_flags: HashMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SplitPart {
+    dir: String,
+    #[serde(default)]
+    prefer: String,
+    fetch: String,
+}
+
+/// The `repo:path` file of a split layout, fetched.
+fn fetch_ref(hub: &HuggingFaceHub, r: &str) -> Result<std::path::PathBuf, String> {
+    let (repo, path) = r.split_once(':').ok_or_else(|| format!("split file `{r}` is not repo:path"))?;
+    hub.fetch_file(repo, path)
+}
+
+/// A denoiser file of `fam` inside its split layout's `dir` (`runtime.split`): the sibling folders'
+/// components (fetched when missing) around a pipeline root assembled from the spec's `files`.
+/// `None` when `fam` has no split layout or the file is elsewhere.
+fn split_files(
+    reg: &crate::arch::Registry,
+    id: &str,
+    weights: &Path,
+    fam: &str,
+    hub: &HuggingFaceHub,
+    mode: PlacementMode,
+) -> Option<Result<Arc<dyn ImageGenerator>, String>> {
+    let spec = reg.spec(fam, &Default::default()).ok()?;
+    let rt: Runtime = spec.runtime_as().ok()?;
+    let split: SplitSpec = match rt.other.get("split").map(|j| serde_json::from_value(j.clone())) {
+        None => return None,
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return Some(Err(format!("{fam}: runtime.split: {e}"))),
+    };
+    let folder = weights.parent()?;
+    if folder.file_name()? != split.dir.as_str() {
+        return None;
+    }
+    let base = folder.parent()?;
+    Some((|| {
+        let (root, parts) = split_root(&split, &rt.denoiser.component, base, weights, id, hub)?;
+        let a = ModelArtifacts { model_id: id.to_string(), local_dir: Some(root.clone()), is_cached: true, ..Default::default() };
+        let extra = Extras { weights: parts, ..Default::default() };
+        SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+    })())
+}
+
+/// The pipeline root (`files`, `model_index.json` with `name_flags`) and component weights of a
+/// split layout around denoiser file `weights` (`component`) whose folders sit in `base`.
+fn split_root(
+    split: &SplitSpec,
+    component: &str,
+    base: &Path,
+    weights: &Path,
+    id: &str,
+    hub: &HuggingFaceHub,
+) -> Result<(std::path::PathBuf, Vec<(String, std::path::PathBuf)>), String> {
+    let mut parts = vec![(component.to_string(), weights.to_path_buf())];
+    for (comp, p) in &split.parts {
+        let mut local: Vec<_> = std::fs::read_dir(base.join(&p.dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|f| f.extension().is_some_and(|e| e == "safetensors"))
+            .collect();
+        local.sort();
+        let pick = local.iter().find(|f| f.to_string_lossy().contains(&p.prefer)).or(local.first()).cloned();
+        parts.push((comp.clone(), match pick {
+            Some(f) => f,
+            None => fetch_ref(hub, &p.fetch)?,
+        }));
+    }
+    let root = std::env::temp_dir()
+        .join("gibbs-split")
+        // One root per denoiser file (its name flags differ from its siblings').
+        .join(weights.to_string_lossy().replace(['/', '\\', ':'], "_"));
+    let write = |rel: &str, bytes: &[u8]| -> Result<(), String> {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(&p, bytes).map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let mut index = J::Object(Default::default());
+    for (rel, v) in &split.files {
+        match v {
+            J::String(r) => {
+                let f = fetch_ref(hub, r)?;
+                write(rel, &std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?)?;
+            }
+            v if rel == "model_index.json" => index = v.clone(),
+            v => write(rel, v.to_string().as_bytes())?,
+        }
+    }
+    let name = format!("{id} {}", weights.file_name().unwrap_or_default().to_string_lossy()).to_lowercase();
+    for (k, subs) in &split.name_flags {
+        index[k] = J::Bool(subs.iter().any(|s| name.contains(&s.to_lowercase())));
+    }
+    write("model_index.json", index.to_string().as_bytes())?;
+    Ok((root, parts))
 }
 
 /// A single-file checkpoint of `fam`: the configs of its `runtime.reference` repo (fetched, no
 /// weights), every `{family, dir}` component's weights read from `weights`.
 fn single_file(
+    reg: &crate::arch::Registry,
     id: &str,
     weights: &Path,
     fam: &str,
@@ -2375,7 +2504,6 @@ fn single_file(
     mode: PlacementMode,
     loras: Vec<(std::path::PathBuf, f32)>,
 ) -> Result<Arc<dyn ImageGenerator>, String> {
-    let reg = crate::arch::registry()?;
     let sig = crate::arch::Signals {
         hub_id: id.to_string(),
         file_name: weights
@@ -2438,12 +2566,8 @@ fn single_file(
         is_cached: true,
         ..Default::default()
     };
-    let extra = Extras {
-        loras,
-        weights: parts,
-    };
-    SpecDiffusion::load(&a, hub, mode, Some(fam), &extra)
-        .map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
+    let extra = Extras { loras, weights: parts, ..Default::default() };
+    SpecDiffusion::load_in(reg, &a, hub, mode, Some(fam), &extra).map(|p| Arc::new(p) as Arc<dyn ImageGenerator>)
 }
 
 #[cfg(test)]
@@ -2499,5 +2623,36 @@ mod tests {
         assert_eq!(at(0.5), want(500.0));
         assert_eq!(at(0.25), want(250.0));
         assert_ne!(at(0.5), at(0.25));
+    }
+
+    /// A split layout's root: preferred sibling files per component, written configs, name flags.
+    #[test]
+    fn split_root_assembles_the_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("snap");
+        for f in ["dm/toy_turbo_bf16.safetensors", "te/a_fp8.safetensors", "te/b_bf16.safetensors", "vae/v.safetensors"] {
+            std::fs::create_dir_all(base.join(f).parent().unwrap()).unwrap();
+            std::fs::write(base.join(f), b"").unwrap();
+        }
+        let split: SplitSpec = serde_json::from_value(serde_json::json!({
+            "dir": "dm",
+            "parts": {"text_encoder": {"dir": "te", "prefer": "bf16", "fetch": "x/y:te.safetensors"},
+                      "vae": {"dir": "vae", "fetch": "x/y:v.safetensors"}},
+            "files": {"model_index.json": {"_class_name": "ToyPipeline"}, "text_encoder/config.json": {"n": 2}},
+            "name_flags": {"is_distilled": ["TURBO"], "is_raw": ["raw"]}
+        }))
+        .unwrap();
+        let w = base.join("dm/toy_turbo_bf16.safetensors");
+        let hub = HuggingFaceHub::with_cache_dir(tmp.path().join("hub"));
+        let (root, mut parts) = split_root(&split, "transformer", &base, &w, "org/toy", &hub).unwrap();
+        parts.sort();
+        assert_eq!(parts, [
+            ("text_encoder".to_string(), base.join("te/b_bf16.safetensors")),
+            ("transformer".to_string(), w.clone()),
+            ("vae".to_string(), base.join("vae/v.safetensors")),
+        ]);
+        let read = |f: &str| -> J { serde_json::from_str(&std::fs::read_to_string(root.join(f)).unwrap()).unwrap() };
+        assert_eq!(read("model_index.json"), serde_json::json!({"_class_name": "ToyPipeline", "is_distilled": true, "is_raw": false}));
+        assert_eq!(read("text_encoder/config.json"), serde_json::json!({"n": 2}));
     }
 }

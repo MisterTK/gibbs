@@ -7,13 +7,17 @@
 // raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
 {
   family: "qwen_image21",
-  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
-  // text-encoder specs land and this family is cut over.
-  match: {diffusers_class: ["QwenImage21Transformer2DModel"]},
+  // Transformer-only GGUFs say either llama.cpp architecture.
+  match: {diffusers_class: ["QwenImage21Pipeline", "QwenImage21Transformer2DModel"],
+          gguf_arch: ["qwen_image", "qwen_image21"],
+          denoiser_tensors: [["modulation.1.weight", "txt_in.in_layer.weight"]],
+          bases: ["Qwen/Qwen-Image-2.1"]},
   pipeline: "diffusion",
   use_lib: ["diffusion"],
   names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
   config: {
+    // The transformer component (the pipeline root, which loads this spec too, has no tensors).
+    is_denoiser: "has('img_in.weight')",
     dim: "shape('img_in.weight')[0]",
     in_ch: "shape('img_in.weight')[1]",
     head_dim: "shape('transformer_blocks.0.attn.norm_q.weight')[0]",
@@ -25,10 +29,10 @@
     eps: "1e-6",
   },
   checks: [
-    {expr: "cfg.causal_condition == false || first(cfg.patch_size, 1) != 1",
+    {expr: "is_denoiser && (cfg.causal_condition == false || first(cfg.patch_size, 1) != 1)",
      error: "Qwen-Image 2.1: only causal_condition=true with patch_size 1 is supported"},
-    {expr: "layers == 0", error: "Qwen-Image 2.1 transformer: no transformer_blocks"},
-    {expr: "len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim", error: "Qwen-Image 2.1: axes_dims_rope must be 3 sizes summing to head_dim"},
+    {expr: "is_denoiser && (layers == 0)", error: "Qwen-Image 2.1 transformer: no transformer_blocks"},
+    {expr: "is_denoiser && (len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim)", error: "Qwen-Image 2.1: axes_dims_rope must be 3 sizes summing to head_dim"},
   ],
   transforms: [
     // The checkpoint stores the zero-centred text norm scale.
@@ -36,10 +40,10 @@
     {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
   ],
   constants: {
-    "rope.inv_freq": {gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
-    one: {gen: "fill", args: {shape: [1], value: 1}},
-    "ones.dim": {gen: "ones", args: {shape: ["dim"]}},
-    t0_feat: {gen: "timestep_embedding", args: {t: 0, dim: 256, precision: "'f32'"}},
+    "rope.inv_freq": {when: "is_denoiser", gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
+    one: {when: "is_denoiser", gen: "fill", args: {shape: [1], value: 1}},
+    "ones.dim": {when: "is_denoiser", gen: "ones", args: {shape: ["dim"]}},
+    t0_feat: {when: "is_denoiser", gen: "timestep_embedding", args: {t: 0, dim: 256, precision: "'f32'"}},
   },
   macros: {
     // silu(timestep MLP(feat)) -> modulation [1, 4*dim] -> s1, g1, s2, g2 (gates tanh).
@@ -71,7 +75,7 @@
   },
   components: {
     // The Qwen3-VL text encoder is the `qwen3_vl` family (Phase 5).
-    text_encoder: {family: "qwen3_vl", dir: "text_encoder"},
+    text_encoder: {family: "qwen3_vl_text", dir: "text_encoder"},
     transformer: {family: "qwen_image21", dir: "transformer"},
     vae: {family: "qwen_vae21", dir: "vae"},
     // Velocity [h * w, in_ch] for latent tokens on an h x w grid and `nt` text rows.
@@ -150,13 +154,13 @@
     text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "processor",
       prefix: "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n",
       template: "{prefix}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
-      drop: {from: 0, to: "prefix_len"},
+      drop: {from: 0, to: "prefix_tokens"},
       vars: {head: "'hidden'", taps: "[fmt('layer.{te.layers - 1}')]"}, outputs: {hidden: "layer.{te.layers - 1}"}}],
     context: [{features: ["te.hidden"]}],
     negative: {default: " "},
     denoiser: {component: "transformer", net: "denoiser"},
     // A finetune's model card may list its own sigmas (`card`); else linspace with the config shift.
-    scheduler: {kind: "flow_euler", sigmas: "linspace", mu: "'config'", seq: "(h // 16) * (w // 16)"},
+    scheduler: {kind: "flow_euler", sigmas: "card", mu: "'config'"},
     timestep: "sigma",
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
     latent: {channels: "vae.z", factor: 16, pack: "tokens", noise_scale: 1},
