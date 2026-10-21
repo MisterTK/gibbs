@@ -122,7 +122,8 @@ pub fn take_run_samples() -> Vec<RunSample> {
 /// (the scheduler's telemetry reads every token; a bench drains its own window).
 pub fn last_run_sample() -> Option<(u64, RunSample)> {
     let q = RUN_SAMPLES.lock();
-    q.back().map(|s| (RUN_SEQ.load(std::sync::atomic::Ordering::Relaxed), *s))
+    q.back()
+        .map(|s| (RUN_SEQ.load(std::sync::atomic::Ordering::Relaxed), *s))
 }
 
 static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1099,27 +1100,20 @@ impl Runtime {
                 continue;
             }
             let bytes = n * (k / elems) * block_bytes;
-            let mut raw = Vec::with_capacity(bytes);
-            while raw.len() < bytes {
-                raw.extend_from_slice(&pattern[..(bytes - raw.len()).min(pattern.len())]);
+            let copies = ((192usize << 20) / bytes).max(1);
+            let mut raw = Vec::with_capacity(copies * bytes);
+            while raw.len() < copies * bytes {
+                raw.extend_from_slice(&pattern[..(copies * bytes - raw.len()).min(pattern.len())]);
             }
             let halves: Vec<u16> = if float {
-                raw.chunks_exact(2)
+                raw[..bytes]
+                    .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect()
             } else {
                 Vec::new()
             };
-            // `GgufData::Buf` is skipped by `map_buffers` (which only maps `GgufData::Map`),
-            // so `Session::new_for_graph` allocates a distinct `MTLBuffer` per copy via
-            // `new_buffer_with_data` while sharing one host `Vec<u8>`.
-            let packed = crate::model::weights::Packed {
-                map: Arc::new(crate::model::loaders::gguf::GgufData::Buf(raw)),
-                off: 0,
-                format: f,
-                shape: vec![n, k],
-            };
-            let copies = ((192usize << 20) / bytes).max(1);
+            let map = Arc::new(crate::model::loaders::gguf::GgufData::Buf(raw));
             let mut g = Graph::new();
             let x = g.input("x", vec![1, k], DType::F32);
             for c in 0..copies {
@@ -1127,14 +1121,18 @@ impl Runtime {
                 let (dtype, t) = match f {
                     QuantFormat::BF16 => (DType::BF16, Tensor::BF16(halves.clone())),
                     QuantFormat::FP16 => (DType::F16, Tensor::F16(halves.clone())),
-                    _ => (
-                        DType::Quant(f),
-                        Tensor::Mat(crate::model::weights::Mat::from_packed(
-                            packed.clone(),
-                            n,
-                            k,
-                        )),
-                    ),
+                    _ => {
+                        let p = crate::model::weights::Packed {
+                            map: map.clone(),
+                            off: c * bytes,
+                            format: f,
+                            shape: vec![n, k],
+                        };
+                        (
+                            DType::Quant(f),
+                            Tensor::Mat(crate::model::weights::Mat::from_packed(p, n, k)),
+                        )
+                    }
                 };
                 let w = g.weight(&name, vec![n, k], dtype);
                 let y = g.add(
@@ -1710,10 +1708,7 @@ impl Session {
                 }
             }
             if let Tensor::Mat(m) = t {
-                if let Some(p) = m
-                    .packed()
-                    .filter(|p| matches!(p.map.as_ref(), crate::model::loaders::gguf::GgufData::Map(_)))
-                {
+                if let Some(p) = m.packed() {
                     let map_ptr = p.map.as_ptr();
                     let map_len = p.map.len();
                     let num_elements = m.rows * m.cols;
@@ -2222,7 +2217,9 @@ impl Session {
                     pos: Some(p), m, ..
                 } => Some((*p, *m)),
                 Step::Ext(ext::ExtStep::Movement(ext::movement::Step::StateWrite {
-                    pos0, m, ..
+                    pos0,
+                    m,
+                    ..
                 })) => Some((*pos0, *m)),
                 _ => None,
             };
@@ -6329,11 +6326,43 @@ mod tests {
                     let lin = g.add("lin", Op::Linear, &ins, vec![m, n], f);
                     let out = match case {
                         0 | 1 => lin,
-                        2 => g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[lin], vec![m, n], f),
-                        3 => g.add("res", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, lin], vec![m, n], f),
+                        2 => g.add(
+                            "gelu",
+                            Op::Unary {
+                                kind: crate::graph::UnaryKind::GeluErf,
+                            },
+                            &[lin],
+                            vec![m, n],
+                            f,
+                        ),
+                        3 => g.add(
+                            "res",
+                            Op::Binary {
+                                kind: crate::graph::BinaryKind::Add,
+                            },
+                            &[r, lin],
+                            vec![m, n],
+                            f,
+                        ),
                         _ => {
-                            let a = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[lin], vec![m, n], f);
-                            g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, lin], vec![m, n], f)
+                            let a = g.add(
+                                "gelu",
+                                Op::Unary {
+                                    kind: crate::graph::UnaryKind::GeluErf,
+                                },
+                                &[lin],
+                                vec![m, n],
+                                f,
+                            );
+                            g.add(
+                                "sum",
+                                Op::Binary {
+                                    kind: crate::graph::BinaryKind::Add,
+                                },
+                                &[a, lin],
+                                vec![m, n],
+                                f,
+                            )
                         }
                     };
                     g.output(out);
@@ -6363,7 +6392,15 @@ mod tests {
             let x = g.input("x", vec![m, k], f);
             let wv = g.weight("w", vec![n, k], bf);
             let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
-            let silu = g.add("silu", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[lin], vec![m, n], f);
+            let silu = g.add(
+                "silu",
+                Op::Unary {
+                    kind: crate::graph::UnaryKind::Silu,
+                },
+                &[lin],
+                vec![m, n],
+                f,
+            );
             g.output(silu);
 
             w.insert("w", Tensor::BF16(bf_weights.clone()));
@@ -6378,7 +6415,15 @@ mod tests {
             let x = g.input("x", vec![m, k], f);
             let wv = g.weight("w", vec![n, k], bf);
             let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], f);
-            let gelu = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[lin], vec![m, n], f);
+            let gelu = g.add(
+                "gelu",
+                Op::Unary {
+                    kind: crate::graph::UnaryKind::GeluErf,
+                },
+                &[lin],
+                vec![m, n],
+                f,
+            );
             g.output(gelu);
 
             w.insert("w", Tensor::BF16(bf_weights.clone()));
@@ -6417,7 +6462,15 @@ mod tests {
         let w1 = g.weight("w1", vec![n, k], f);
         let w2 = g.weight("w2", vec![k, n], f);
         let l1 = g.add("l1", Op::Linear, &[x, w1], vec![m, n], f);
-        let a1 = g.add("a1", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[l1], vec![m, n], f);
+        let a1 = g.add(
+            "a1",
+            Op::Unary {
+                kind: crate::graph::UnaryKind::GeluErf,
+            },
+            &[l1],
+            vec![m, n],
+            f,
+        );
         let l2 = g.add("l2", Op::Linear, &[a1, w2], vec![m, k], f);
         g.output(l2);
 
@@ -6471,7 +6524,15 @@ mod tests {
         // GELU over [-8, 8]: the f32 erf fit tracks the CPU's f64 one.
         let mut g = Graph::new();
         let x = g.input("x", vec![1601], f);
-        let y = g.add("gelu", Op::Unary { kind: crate::graph::UnaryKind::GeluErf }, &[x], vec![1601], f);
+        let y = g.add(
+            "gelu",
+            Op::Unary {
+                kind: crate::graph::UnaryKind::GeluErf,
+            },
+            &[x],
+            vec![1601],
+            f,
+        );
         g.output(y);
         let xs: Vec<f32> = (0..1601).map(|i| i as f32 / 100.0 - 8.0).collect();
         let (want, got) = both(&g, &Weights::new(), vec![Tensor::F32(xs)], None);
@@ -6532,7 +6593,15 @@ mod tests {
             );
             let e1 = g.add("e1", Op::Embedding, &[t1, ids], vec![5, 6], f);
             let e2 = g.add("e2", Op::Embedding, &[t2, pos], vec![5, 6], f);
-            let s = g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[e1, e2], vec![5, 6], f);
+            let s = g.add(
+                "sum",
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Add,
+                },
+                &[e1, e2],
+                vec![5, 6],
+                f,
+            );
             let p = g.add("pool", Op::MeanPool, &[s, mv], vec![6], f);
             let o = g.add("l2", Op::L2Normalize, &[p], vec![6], f);
             g.output(o);
@@ -6626,13 +6695,29 @@ mod tests {
         };
         let o = g.add("attn", att, &[q, k, v, ks, vs, pos], vec![1, nh * hd], f);
         let o = g.add("o", Op::Linear, &[o, wo], vec![1, h], f);
-        let x1 = g.add("res1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x0, o], vec![1, h], f);
+        let x1 = g.add(
+            "res1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x0, o],
+            vec![1, h],
+            f,
+        );
         let b = g.add("b", eps, &[x1, g2], vec![1, h], f);
         let gate = g.add("gate", Op::Linear, &[b, wg], vec![1, ff], f);
         let up = g.add("up", Op::Linear, &[b, wu], vec![1, ff], f);
         let act = g.add("act", Op::GeGlu, &[gate, up], vec![1, ff], f);
         let d = g.add("down", Op::Linear, &[act, wd], vec![1, h], f);
-        let out = g.add("res2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x1, d], vec![1, h], f);
+        let out = g.add(
+            "res2",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x1, d],
+            vec![1, h],
+            f,
+        );
         g.output(out);
 
         let s = Session::new(rt(), &w).unwrap();
@@ -6672,9 +6757,25 @@ mod tests {
         let x = g.input("x", vec![2, 4], f);
         let gv = g.weight("g", vec![4], f);
         let a = g.add("a", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![2, 4], f);
-        let b = g.add("b", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[x], vec![2, 4], f);
+        let b = g.add(
+            "b",
+            Op::Unary {
+                kind: crate::graph::UnaryKind::Silu,
+            },
+            &[x],
+            vec![2, 4],
+            f,
+        );
         let c = g.add("c", Op::RmsNorm { eps: 1e-5 }, &[a, gv], vec![2, 4], f);
-        let d = g.add("d", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[b, c], vec![2, 4], f);
+        let d = g.add(
+            "d",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[b, c],
+            vec![2, 4],
+            f,
+        );
         g.output(d);
         let norm = |x, out, extra_outs: Vec<ValueId>, reads| Planned {
             name: String::new(),
@@ -6865,7 +6966,15 @@ mod tests {
             vec![1, h],
             f,
         );
-        let x = g.add("res_attn", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[res0, attn_norm], vec![1, h], f);
+        let x = g.add(
+            "res_attn",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[res0, attn_norm],
+            vec![1, h],
+            f,
+        );
         let ff_in = g.add(
             "pre_ff_ln",
             Op::RmsNorm { eps: 1e-6 },
@@ -6884,7 +6993,15 @@ mod tests {
             vec![1, h],
             f,
         );
-        let out = g.add("res_ff", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down_norm], vec![1, h], f);
+        let out = g.add(
+            "res_ff",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x, down_norm],
+            vec![1, h],
+            f,
+        );
         g.output(out);
         crate::graph::egraph::fuse_rule(&mut g, None, crate::graph::egraph::Rule::MegakernelMlp);
 
@@ -6987,7 +7104,15 @@ mod tests {
         let norm = g.add("norm", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![2, 4], f);
         let swiglu = g.add("swiglu", Op::SwiGlu, &[norm, u_val], vec![2, 4], f);
         let geglu = g.add("geglu", Op::GeGlu, &[norm, u_val], vec![2, 4], f);
-        let out = g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[swiglu, geglu], vec![2, 4], f);
+        let out = g.add(
+            "sum",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[swiglu, geglu],
+            vec![2, 4],
+            f,
+        );
         g.output(out);
 
         let mut w = Weights::new();
@@ -7010,10 +7135,34 @@ mod tests {
         let r = g.input("r", vec![3, 4], f);
         let gv = g.weight("g", vec![4], f);
         let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[x, gv], vec![3, 4], f);
-        let s1 = g.add("s1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, n1], vec![3, 4], f);
+        let s1 = g.add(
+            "s1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[r, n1],
+            vec![3, 4],
+            f,
+        );
         let n2 = g.add("n2", Op::RmsNorm { eps: 1e-5 }, &[s1, gv], vec![3, 4], f);
-        let s2 = g.add("s2", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[n2, s1], vec![3, 4], f);
-        let o = g.add("o", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[n2, s2], vec![3, 4], f);
+        let s2 = g.add(
+            "s2",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[n2, s1],
+            vec![3, 4],
+            f,
+        );
+        let o = g.add(
+            "o",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Mul,
+            },
+            &[n2, s2],
+            vec![3, 4],
+            f,
+        );
         g.output(o);
         let (steps, _) = plan(&g).unwrap();
         // n1+s1 fuse; n2 has two readers (s2 and o), so it and s2 stay separate: norm, norm, add, mul.
@@ -7043,10 +7192,34 @@ mod tests {
         let g2 = g.weight("g2", vec![8], f);
         let sc = g.weight("sc", vec![1], f);
         let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[x, g1], vec![2, 8], f);
-        let a1 = g.add("a1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, n1], vec![2, 8], f);
-        let m1 = g.add("m1", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[a1, sc], vec![2, 8], f);
+        let a1 = g.add(
+            "a1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[r, n1],
+            vec![2, 8],
+            f,
+        );
+        let m1 = g.add(
+            "m1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Mul,
+            },
+            &[a1, sc],
+            vec![2, 8],
+            f,
+        );
         let n2 = g.add("n2", Op::RmsNorm { eps: 1e-6 }, &[m1, g2], vec![2, 8], f);
-        let out = g.add("out", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[m1, n2], vec![2, 8], f);
+        let out = g.add(
+            "out",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Mul,
+            },
+            &[m1, n2],
+            vec![2, 8],
+            f,
+        );
         g.output(out);
 
         let mut w = Weights::new();
@@ -7432,7 +7605,15 @@ mod tests {
                         DType::F32,
                     );
                 }
-                let out = g.add("add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down], vec![1, hidden], DType::F32);
+                let out = g.add(
+                    "add",
+                    Op::Binary {
+                        kind: crate::graph::BinaryKind::Add,
+                    },
+                    &[x, down],
+                    vec![1, hidden],
+                    DType::F32,
+                );
                 g.output(out);
                 let unfused = g.clone();
                 assert_eq!(
@@ -7640,7 +7821,15 @@ mod tests {
                 let wv = g.weight("w", vec![n, k], DType::BF16);
                 let lin = g.add("lin", Op::Linear, &[x, wv], vec![m, n], DType::F32);
                 let y = match act {
-                    0 => g.add("a", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[lin], vec![m, n], DType::F32),
+                    0 => g.add(
+                        "a",
+                        Op::Unary {
+                            kind: crate::graph::UnaryKind::Silu,
+                        },
+                        &[lin],
+                        vec![m, n],
+                        DType::F32,
+                    ),
                     1 => g.add("a", Op::SwiGlu, &[lin, up], vec![m, n], DType::F32),
                     _ => g.add("a", Op::GeGlu, &[lin, up], vec![m, n], DType::F32),
                 };
@@ -7764,7 +7953,15 @@ mod tests {
             vec![m, n],
             DType::F32,
         );
-        let y_res = g.add("res_add", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[y, res_in], vec![m, n], DType::F32);
+        let y_res = g.add(
+            "res_add",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[y, res_in],
+            vec![m, n],
+            DType::F32,
+        );
         g.output(y_res);
 
         let n_blocks = n * (k / 32);
@@ -8018,8 +8215,6 @@ mod tests {
             );
         }
     }
-
-
 
     #[test]
     fn gemv_bf16_matches_cpu() {
@@ -8386,7 +8581,9 @@ mod tests {
         let f = DType::F32;
         let s = Session::new(rt(), &Weights::new()).unwrap();
         // Relu lowers at F32 only; a u32 value has no kernel.
-        for op in [Op::Unary { kind: crate::graph::UnaryKind::Relu }] {
+        for op in [Op::Unary {
+            kind: crate::graph::UnaryKind::Relu,
+        }] {
             let mut g = Graph::new();
             let x = g.input("x", vec![4], DType::U32);
             let y = g.add("act", op, &[x], vec![4], DType::U32);
@@ -8418,7 +8615,15 @@ mod tests {
         let mut g = Graph::new();
         let a = g.input("a", vec![2], DType::U32);
         let b = g.input("b", vec![2], f);
-        let y = g.add("sum", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, b], vec![2], f);
+        let y = g.add(
+            "sum",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[a, b],
+            vec![2],
+            f,
+        );
         g.output(y);
         let err = s
             .run(&g, vec![Tensor::U32(vec![1, 2]), Tensor::F32(vec![0.0; 2])])
@@ -8726,12 +8931,22 @@ mod tests {
         let step1 = g.add("step1", Op::Linear, &[v1, w1], vec![1, 64], DType::F32);
         let step2 = g.add(
             "step2",
-            Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
+            Op::Unary {
+                kind: crate::graph::UnaryKind::GeluErf,
+            },
             &[v2],
             vec![1, 64],
             DType::F32,
         );
-        let step3 = g.add("step3", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[step1, step2], vec![1, 64], DType::F32);
+        let step3 = g.add(
+            "step3",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[step1, step2],
+            vec![1, 64],
+            DType::F32,
+        );
 
         // Later large allocation to exercise arena reuse
         let w_huge = g.weight("w_huge", vec![1024, 64], DType::F32);
@@ -8785,10 +9000,20 @@ mod tests {
         );
 
         // Consume a and b AFTER the inter allocation
-        let add_a = g.add("add_a", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[a, inter_sub], vec![1, 64], DType::F32);
+        let add_a = g.add(
+            "add_a",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[a, inter_sub],
+            vec![1, 64],
+            DType::F32,
+        );
         let gelu_b = g.add(
             "gelu_b",
-            Op::Unary { kind: crate::graph::UnaryKind::GeluErf },
+            Op::Unary {
+                kind: crate::graph::UnaryKind::GeluErf,
+            },
             &[b],
             vec![1, 64],
             DType::F32,
@@ -8829,8 +9054,17 @@ mod tests {
         // The llama spec's decode instance on a synthetic 4-layer checkpoint.
         let num_layers = 4;
         let dir = tempfile::tempdir().unwrap();
-        let a = crate::arch::testing::synthetic_llama(dir.path(), serde_json::json!({"num_hidden_layers": num_layers}));
-        let mut r = crate::arch::testing::Runner::from_artifacts(&a, Some("llama"), crate::hardware::Device::Metal, 512).unwrap();
+        let a = crate::arch::testing::synthetic_llama(
+            dir.path(),
+            serde_json::json!({"num_hidden_layers": num_layers}),
+        );
+        let mut r = crate::arch::testing::Runner::from_artifacts(
+            &a,
+            Some("llama"),
+            crate::hardware::Device::Metal,
+            512,
+        )
+        .unwrap();
         let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
         let inst = r.instance("text", &vars).unwrap();
         let weights = r.model.store.materialize(&inst.weights).unwrap();
@@ -9015,7 +9249,9 @@ mod tests {
         want.chunks(hd)
             .zip(got.chunks(hd))
             .map(|(a, b)| {
-                let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(&p, &q)| (p * q) as f64).sum::<f64>();
+                let dot = |x: &[f32], y: &[f32]| {
+                    x.iter().zip(y).map(|(&p, &q)| (p * q) as f64).sum::<f64>()
+                };
                 (dot(a, b) / (dot(a, a).sqrt() * dot(b, b).sqrt()).max(1e-30)) as f32
             })
             .fold(1.0, f32::min)
@@ -9793,7 +10029,15 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 f,
             );
             let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], f);
-            let weights_v = g.add("weights", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[probs, sc], vec![m, top_k], f);
+            let weights_v = g.add(
+                "weights",
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Mul,
+                },
+                &[probs, sc],
+                vec![m, top_k],
+                f,
+            );
             let gu = g.add(
                 "gu",
                 Op::MoeLinear { experts, top_k },
@@ -9840,7 +10084,15 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 vec![m * top_k, 1],
                 f,
             );
-            let weighted = g.add("weighted", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[down, w_col], vec![m * top_k, h], f);
+            let weighted = g.add(
+                "weighted",
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Mul,
+                },
+                &[down, w_col],
+                vec![m * top_k, h],
+                f,
+            );
             let slots = g.add(
                 "slots",
                 Op::Reshape {
@@ -10010,7 +10262,9 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let v_raw = g.add("v_proj", Op::Linear, &[x, vw], vec![1, rows1], DType::F32);
             let v_out = g.add(
                 "v_biased",
-                Op::Binary { kind: crate::graph::BinaryKind::Add },
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Add,
+                },
                 &[v_raw, vb],
                 vec![1, rows1],
                 DType::F32,
@@ -10311,7 +10565,15 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let up = g.add("up", Op::Linear, &[ff_in, up_w], vec![1, inter], f);
         let act = g.add("act", Op::SwiGlu, &[gate, up], vec![1, inter], f);
         let down = g.add("down", Op::Linear, &[act, down_w], vec![1, h], f);
-        let out = g.add("res", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[x, down], vec![1, h], f);
+        let out = g.add(
+            "res",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[x, down],
+            vec![1, h],
+            f,
+        );
         g.output(out);
         assert_eq!(
             crate::graph::egraph::fuse_rule(
@@ -10419,15 +10681,32 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         let rows = g2.input("rows", vec![m, w], DType::F32);
         let pos0 = g2.input("pos0", vec![1], DType::U32);
         g2.push("write", Op::StateWrite, &[st, rows, pos0]).unwrap();
-        let out = g2.push("other", Op::Unary { kind: crate::graph::UnaryKind::Neg }, &[rows]).unwrap();
+        let out = g2
+            .push(
+                "other",
+                Op::Unary {
+                    kind: crate::graph::UnaryKind::Neg,
+                },
+                &[rows],
+            )
+            .unwrap();
         g2.output(out);
         crate::graph::passes::canonical::eliminate_dead_nodes(&mut g2);
         assert!(g2.nodes.iter().any(|n| n.op == Op::StateWrite));
         // Writing past the declared rows is the same error on both executors.
-        let past = || vec![Tensor::F32(rand(m * w, 1)), Tensor::U32(vec![5]), Tensor::U32((0..cap as u32).collect())];
+        let past = || {
+            vec![
+                Tensor::F32(rand(m * w, 1)),
+                Tensor::U32(vec![5]),
+                Tensor::U32((0..cap as u32).collect()),
+            ]
+        };
         let mut st = StateStore::new();
         let ce = cpu::run(&g, &Weights::new(), &mut st, past()).unwrap_err();
-        let me = Session::new(rt(), &Weights::new()).unwrap().run(&g, past()).unwrap_err();
+        let me = Session::new(rt(), &Weights::new())
+            .unwrap()
+            .run(&g, past())
+            .unwrap_err();
         assert!(ce.contains("past the state's 6 rows"), "{ce}");
         assert_eq!(ce, me);
     }
@@ -10448,9 +10727,16 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 .into_iter()
                 .map(|v| (v * 4.0).round() * 0.5)
                 .collect();
-            for (i, special) in [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -f32::NAN]
-                .into_iter()
-                .enumerate()
+            for (i, special) in [
+                0.0,
+                -0.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+                -f32::NAN,
+            ]
+            .into_iter()
+            .enumerate()
             {
                 score[(i * 7) % (n * b)] = special;
             }
@@ -10463,15 +10749,24 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                 let sc = g.input("score", vec![n, b], DType::F32);
                 let p = g.input("pos", vec![n], DType::U32);
                 let op = if select {
-                    Op::QsaSelect { ratio, top_blocks: top }
+                    Op::QsaSelect {
+                        ratio,
+                        top_blocks: top,
+                    }
                 } else {
-                    Op::QsaBias { ratio, top_blocks: top }
+                    Op::QsaBias {
+                        ratio,
+                        top_blocks: top,
+                    }
                 };
                 let y = g.push("qsa", op, &[sc, p]).unwrap();
                 g.output(y);
                 let inputs = vec![Tensor::F32(score.clone()), Tensor::U32(pos.clone())];
                 let want = cpu::run_stateless(&g, &Weights::new(), inputs.clone()).unwrap();
-                let got = Session::new(rt(), &Weights::new()).unwrap().run(&g, inputs).unwrap();
+                let got = Session::new(rt(), &Weights::new())
+                    .unwrap()
+                    .run(&g, inputs)
+                    .unwrap();
                 assert_eq!(
                     out_bits(&want[0]),
                     out_bits(&got[0]),
@@ -10487,7 +10782,11 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
     #[test]
     fn multi_row_recurrent_ops_with_state_match_cpu() {
         let n = 5;
-        for (kh, vh, kd, vd) in [(1usize, 1usize, 4usize, 4usize), (2, 4, 16, 32), (2, 2, 128, 128)] {
+        for (kh, vh, kd, vd) in [
+            (1usize, 1usize, 4usize, 4usize),
+            (2, 4, 16, 32),
+            (2, 2, 128, 128),
+        ] {
             let mut g = Graph::new();
             let f = DType::F32;
             let q = g.input("q", vec![n, kh * kd], f);
@@ -10509,19 +10808,36 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
                     Tensor::F32(rand(n * kh * kd, seed)),
                     Tensor::F32(rand(n * kh * kd, seed + 1)),
                     Tensor::F32(rand(n * vh * vd, seed + 2)),
-                    Tensor::F32(rand(n * vh, seed + 3).iter().map(|x| 0.5 + 0.4 * x).collect()),
-                    Tensor::F32(rand(n * vh, seed + 4).iter().map(|x| -0.3 + 0.2 * x).collect()),
+                    Tensor::F32(
+                        rand(n * vh, seed + 3)
+                            .iter()
+                            .map(|x| 0.5 + 0.4 * x)
+                            .collect(),
+                    ),
+                    Tensor::F32(
+                        rand(n * vh, seed + 4)
+                            .iter()
+                            .map(|x| -0.3 + 0.2 * x)
+                            .collect(),
+                    ),
                 ]
             };
             let init = rand(vh * kd * vd, 7);
-            let (outs, states) =
-                both_stateful(&g, &Weights::new(), &[("ssm", init.clone())], vec![run(10), run(20)]);
+            let (outs, states) = both_stateful(
+                &g,
+                &Weights::new(),
+                &[("ssm", init.clone())],
+                vec![run(10), run(20)],
+            );
             for (c, gpu) in &outs {
                 let (c, gpu) = (c[0].as_f32().unwrap(), gpu[0].as_f32().unwrap());
                 assert_eq!(c.len(), n * vh * vd);
                 assert!(rel_err(c, gpu) < 1e-4, "DeltaRule {kh}/{vh}/{kd}/{vd} rows");
             }
-            assert!(rel_err(&states[0].0, &states[0].1) < 1e-4, "DeltaRule state");
+            assert!(
+                rel_err(&states[0].0, &states[0].1) < 1e-4,
+                "DeltaRule state"
+            );
             assert!(max_abs_diff(&states[0].0, &init) > 1e-3, "the state moved");
         }
         for (ch, kernel, dilation) in [(7usize, 4usize, 1usize), (33, 3, 2), (1, 2, 1)] {
@@ -10536,7 +10852,10 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
             let mut w = Weights::new();
             w.insert("w", Tensor::F32(rand(ch * kernel, 3)));
             let init = rand(hist * ch, 5);
-            let runs = vec![vec![Tensor::F32(rand(n * ch, 1))], vec![Tensor::F32(rand(n * ch, 2))]];
+            let runs = vec![
+                vec![Tensor::F32(rand(n * ch, 1))],
+                vec![Tensor::F32(rand(n * ch, 2))],
+            ];
             let (outs, states) = both_stateful(&g, &w, &[("conv", init)], runs);
             for (c, gpu) in &outs {
                 let (c, gpu) = (c[0].as_f32().unwrap(), gpu[0].as_f32().unwrap());
