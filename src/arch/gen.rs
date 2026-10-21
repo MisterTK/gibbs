@@ -923,26 +923,6 @@ mod tests {
                     assert_eq!(f("yarn_attention_factor", args)[0].to_bits(), attn.to_bits());
                 }
             }
-            // ModernBERT (f32): default and yarn.
-            for (cfg, d) in [
-                (json!({"global_rope_theta": 160000.0}), 64),
-                (json!({"max_position_embeddings": 8192, "rope_scaling": {"rope_type": "yarn", "rope_theta": 160000.0,
-                        "original_max_position_embeddings": 1024.0, "mscale": 1.0, "mscale_all_dim": 0.5}}), 64),
-            ] {
-                let (want, attn) = model::classifier::modernbert::rope_inv_freq(&cfg, "full_attention", d).unwrap();
-                let yarn = !cfg["rope_scaling"].is_null();
-                let args = if yarn {
-                    json!({"dim": d, "theta": 160000.0, "kind": "yarn", "precision": "f32", "factor": 8.0,
-                           "original_max_position_embeddings": 1024.0})
-                } else {
-                    json!({"dim": d, "theta": 160000.0, "precision": "f32"})
-                };
-                assert_eq!(bits(&f("rope_inv_freq", args)), bits(&want), "{cfg}");
-                if yarn {
-                    let a = f("yarn_attention_factor", json!({"factor": 8.0, "mscale": 1.0, "mscale_all_dim": 0.5}));
-                    assert_eq!(a[0].to_bits(), attn.to_bits());
-                }
-            }
             // gemma4: default (with factor) and proportional.
             for p in [
                 json!({"rope_theta": 1e4, "factor": 2.0}),

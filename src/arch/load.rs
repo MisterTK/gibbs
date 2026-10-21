@@ -1780,6 +1780,9 @@ fn precompute(spec: &Spec, env: &ModelEnv, store: &WeightStore, table: &Table) -
         inst.weights.iter().filter_map(|w| t.get(w).cloned()).collect()
     };
     let w = store.materialize(&inst.weights)?;
+    // A load-time weight transform like `transforms`, not inference: allowed under the GPU-only
+    // tripwire.
+    let _load_time = crate::hardware::cpu_compute::allow();
     let mut p = crate::graph::program::GraphProgram::compile(
         inst.graph,
         w,

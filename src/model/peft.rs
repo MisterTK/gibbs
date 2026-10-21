@@ -39,6 +39,24 @@ pub fn prepare_causal_lm(
     repo_id: &str,
     token: Option<&str>,
 ) -> Result<bool, String> {
+    prepare(hub, repo_id, token, "CAUSAL_LM")
+}
+
+/// [`prepare_causal_lm`] for `SEQ_CLS` adapters (sequence classifiers).
+pub fn prepare_seq_cls(
+    hub: &HuggingFaceHub,
+    repo_id: &str,
+    token: Option<&str>,
+) -> Result<bool, String> {
+    prepare(hub, repo_id, token, "SEQ_CLS")
+}
+
+fn prepare(
+    hub: &HuggingFaceHub,
+    repo_id: &str,
+    token: Option<&str>,
+    task: &str,
+) -> Result<bool, String> {
     if is_synthetic_model_id(repo_id)
         || split_weight_file(repo_id).1.is_some()
         || Path::new(repo_id).is_dir()
@@ -53,7 +71,7 @@ pub fn prepare_causal_lm(
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
         .map_err(|e| format!("{}: {e}", ad_path.display()))?;
-    if ad["task_type"] != "CAUSAL_LM" {
+    if ad["task_type"] != task {
         return Ok(false);
     }
     let scale = lora_scale(&ad).map_err(|e| format!("{repo_id}: {e}"))?;

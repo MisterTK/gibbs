@@ -108,25 +108,29 @@ fn gpu_fixture(f: Family) {
             run_on_gpu("Ninfer", g, w);
         }
         Family::System1 => {
-            use gibbs_engine::model::jev::{BertDims, BertEncoder};
-            let dims = BertDims {
-                hidden_size: 16,
-                num_layers: 1,
-                num_heads: 2,
-                intermediate_size: 32,
-                max_positions: 32,
-                vocab_size: 64,
-                type_vocab_size: 2,
-                layer_norm_eps: 1e-5,
-            };
-            let enc = BertEncoder::load(dims, Device::Metal, |_, shape| {
-                Ok(vec![0.05f32; shape.iter().product()])
-            })
-            .expect("System 1 loads on Metal");
-            assert_eq!(enc.device(), Device::Metal);
+            use gibbs_engine::model::hub::HuggingFaceHub;
+            use gibbs_engine::model::jev::JevSystem1Model;
+            let mut ts = synth::Ts::new(3);
+            ts.w("embeddings.word_embeddings.weight", &[synth::VOCAB, 16]);
+            ts.w("embeddings.position_embeddings.weight", &[32, 16]);
+            ts.w("embeddings.token_type_embeddings.weight", &[2, 16]);
+            ts.ln("embeddings.LayerNorm", 16);
+            let p = "encoder.layer.0";
+            for s in ["attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense"] {
+                ts.lin(&format!("{p}.{s}"), 16, 16);
+            }
+            ts.ln(&format!("{p}.attention.output.LayerNorm"), 16);
+            ts.lin(&format!("{p}.intermediate.dense"), 32, 16);
+            ts.lin(&format!("{p}.output.dense"), 16, 32);
+            ts.ln(&format!("{p}.output.LayerNorm"), 16);
+            let cfg = serde_json::json!({"architectures": ["BertModel"], "model_type": "bert", "hidden_size": 16,
+                "num_hidden_layers": 1, "num_attention_heads": 2, "intermediate_size": 32,
+                "max_position_embeddings": 32, "type_vocab_size": 2, "layer_norm_eps": 1e-5});
+            let hub = HuggingFaceHub::with_cache_dir(synth::write_repo("system1", cfg, &ts));
+            let m = JevSystem1Model::load(&hub, "t/system1", Device::Metal).expect("System 1 loads on Metal");
+            assert_eq!(m.encoder().map(|e| e.device()), Some(Device::Metal));
             for _ in 0..3 {
-                let out = enc.run(&[1, 10, 25, 4], &[0, 1, 2, 3], &[0, 0, 0, 0], true).expect("System 1 runs");
-                assert_eq!(out.len(), 16);
+                assert_eq!(m.embed(synth::TEXT).expect("System 1 runs").len(), 16);
             }
         }
         Family::T5 => gibbs_engine::model::t5::run_tiny_gpu_fixture(),

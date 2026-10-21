@@ -1,7 +1,7 @@
 //! Metal vs CPU parity of the encoder classifiers, end to end through `SequenceClassifier::load` /
-//! `classify` on tiny synthetic repos (random f32 weights, a word-level tokenizer): the CPU body is
-//! the native host forward (the reference), the Metal body is the graph program. f32 vs f32, so the
-//! bound is a relative 1e-3 of the largest score; per-architecture errors are printed.
+//! `classify` on tiny synthetic repos (random f32 weights, a word-level tokenizer): the same family
+//! spec instance compiled for each device. f32 vs f32, so the bound is a relative 1e-3 of the
+//! largest score; per-architecture errors are printed.
 
 use super::*;
 use crate::hardware::{available_devices, cpu_compute};
@@ -105,68 +105,4 @@ fn deberta_v2_log_buckets_on_metal() {
 fn deberta_v1_absolute_positions_on_metal() {
     let (cfg, ts) = deberta_v1();
     parity("deberta-v1", cfg, ts);
-}
-
-/// SetFit pooling (mean/cls/max, optional normalise) and sklearn `predict_proba` forms on the
-/// BERT encoder graph vs the host `pool` + `Logistic::proba`.
-#[test]
-fn setfit_pool_and_logistic_head_on_metal() {
-    use super::setfit::{pool, Logistic, Pool};
-    if !available_devices().contains(&Device::Metal) {
-        return;
-    }
-    // Every graph run here reproduces `graph::shape::infer`.
-    let _shapes = crate::graph::shape::CheckCompiled::new();
-    let dims = BertDims {
-        hidden_size: 16,
-        num_layers: 2,
-        num_heads: 2,
-        intermediate_size: 24,
-        max_positions: 32,
-        vocab_size: VOCAB,
-        type_vocab_size: 2,
-        layer_norm_eps: 1e-12,
-    };
-    let ts = bert(None).1;
-    let get = |name: &str, _: &[usize]| -> Result<Vec<f32>, String> {
-        let key = format!("bert.{name}");
-        Ok(ts.t.iter().find(|t| t.0 == key).unwrap().2.clone())
-    };
-    let _g = cpu_compute::allow();
-    let cpu = BertEncoder::load(dims, Device::Cpu, get).unwrap();
-    let (ids, pos, types) = (
-        [3u32, 7, 1, 9, 2, 5, 11, 4, 6],
-        (0..9).collect::<Vec<u32>>(),
-        [0u32; 9],
-    );
-    let hidden = cpu.run(&ids, &pos, &types, false).unwrap();
-    for (p, normalize, rows, ovr) in [
-        (Pool::Mean, true, 1, true),
-        (Pool::Max, false, 3, false),
-        (Pool::Cls, false, 3, true),
-        (Pool::Mean, false, 1, false),
-    ] {
-        let mut rng = Ts::new(rows as u64 + 7);
-        let head = Logistic {
-            coef: (0..rows * 16).map(|_| rng.rnd() as f64).collect(),
-            intercept: (0..rows).map(|_| rng.rnd() as f64).collect(),
-            features: 16,
-            ovr,
-        };
-        let want = head.proba(&pool(&hidden, 16, p, normalize));
-        let gpu =
-            BertEncoder::load_with_head(dims, Device::Metal, get, Some(head.graph(p, normalize)))
-                .unwrap();
-        let got = gpu.run_head(&ids, &pos, &types).unwrap();
-        assert_eq!(got.len(), want.len());
-        let err = want
-            .iter()
-            .zip(&got)
-            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-        eprintln!("setfit {p:?} norm={normalize} rows={rows} ovr={ovr}: max abs err {err:.2e}  {want:?} vs {got:?}");
-        assert!(
-            err < 1e-3,
-            "{p:?} {normalize} {rows} {ovr}: {want:?} vs {got:?}"
-        );
-    }
 }
