@@ -671,7 +671,10 @@ fn validity_mask(a: &Args) -> Result<Gen, String> {
 /// `log_bucket_rel_index`: U32 `[rows, cols]` index into `2*span` relative embeddings for query
 /// `i`, key `j` (transformers `make_log_bucket_position` in f32 when `buckets > 0`, then `+span`
 /// clamped to `[0, 2*span)`). Args: `rows`, `cols` (default rows), `buckets`, `max_relative`,
-/// `span`. Source: `classifier.rs` DeBERTa `rel_index`.
+/// `span`. With `heads`: U32 `[heads, rows, cols]` flat gather index into a `[heads, rows | cols,
+/// 2*span]` score table instead, pair `(i, j)` of head h reading `(h*rows + i)*2*span + r`
+/// (`by: "query"`, default: DeBERTa c2p) or `(h*cols + j)*2*span + r` (`by: "key"`: p2c).
+/// Source: `classifier.rs` DeBERTa `rel_index` / `graph`.
 fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
     let (rows, buckets, span) = (a.u("rows")?, a.u("buckets")?, a.u("span")? as i64);
     let cols = a.u_or("cols", rows)?;
@@ -694,7 +697,23 @@ fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
             v.push((bucket + span).clamp(0, 2 * span - 1) as u32);
         }
     }
-    u32s(vec![rows, cols], v)
+    let Some(heads) = a.get("heads").map(|_| a.u("heads")).transpose()? else {
+        return u32s(vec![rows, cols], v);
+    };
+    let by_key = match a.s_or("by", "query")? {
+        "query" => false,
+        "key" => true,
+        b => return Err(bad("by", b)),
+    };
+    let span2 = 2 * span as u32;
+    let mut idx = Vec::with_capacity(heads * v.len());
+    for h in 0..heads {
+        for (t, &r) in v.iter().enumerate() {
+            let row = if by_key { h * cols + t % cols } else { h * rows + t / cols };
+            idx.push(row as u32 * span2 + r);
+        }
+    }
+    u32s(vec![heads, rows, cols], idx)
 }
 
 /// `causal_key_mask`: F32 `[cap]`, 0 for keys `j <= pos`, else `masked` (default -inf).
@@ -865,6 +884,9 @@ mod tests {
             u("log_bucket_rel_index", json!({"rows": 6, "cols": 1, "buckets": 4, "max_relative": 8, "span": 8})),
             [8, 9, 10, 11, 11, 11]
         );
+        let rel = |by| u("log_bucket_rel_index", json!({"rows": 2, "buckets": 0, "span": 2, "heads": 2, "by": by}));
+        assert_eq!(rel("query"), [2, 1, 7, 6, 10, 9, 15, 14]);
+        assert_eq!(rel("key"), [2, 5, 3, 6, 10, 13, 11, 14]);
         assert_eq!(f("causal_key_mask", json!({"cap": 3, "pos": 1})), [0.0, 0.0, f32::NEG_INFINITY]);
         assert_eq!(u("channel_dup_index", json!({"channels": 2, "repeats": 2, "frames": 1})), [0, 0, 1, 1, 2, 2, 3, 3]);
         assert_eq!(f("ones", json!({"shape": [2]})), [1.0, 1.0]);
