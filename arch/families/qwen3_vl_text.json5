@@ -1,0 +1,12 @@
+// The text decoder of a Qwen3-VL checkpoint used as a text encoder (Qwen-Image 2.1, Krea 2): the
+// `qwen3_vl` decoder with the vision tower left unread, so text rows rotate as plain RoPE (every
+// M-RoPE axis at the sequence index). Referenced by `{family, dir}`.
+{
+  family: "qwen3_vl_text",
+  extends: "qwen3_vl",
+  match: {hf_model_type: [], hf_architectures: [], gguf_arch: []},
+  config: {
+    has_vision: "false",
+  },
+  ignore: ["lm_head.weight", "score.weight", "model.layers.*.self_attn.rotary_emb.inv_freq", "model.visual.*", "visual.*"],
+}
