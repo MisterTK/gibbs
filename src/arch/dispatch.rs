@@ -169,6 +169,8 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
     // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
+    // `runtime.cutover: true` (legacy: until every causal-LM phase lands): the family's old
+    // loader is gone, so its spec serves default loads, not only `GIBBS_SPEC_LM=1` ones.
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
         let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
@@ -249,7 +251,7 @@ pub fn dump(artifacts: &ModelArtifacts, family: Option<&str>) -> Result<String, 
         "spec": reg.merged(&m.spec.family, &m.ckpt.sig)?,
         "config": config,
         "tensors": m.renames,
-        "unconsumed": m.store.unconsumed(&used, &m.spec.ignore),
+        "unconsumed": m.store.unconsumed(&used, &m.ignore),
         "unbuilt_components": unbuilt,
     });
     serde_json::to_string_pretty(&out).map_err(|e| e.to_string())

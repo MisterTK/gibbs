@@ -21,7 +21,7 @@ use super::expr::{eval_json, interp, walk, Env, Val};
 use super::gen::{self, Gen, GenData};
 use super::names::{Renamer, Rule};
 use super::{
-    glob, Component, Constant, Lora, Pipeline, Registry, Signals, Source, Spec, Transform,
+    glob, Component, Constant, Ignore, Lora, Pipeline, Registry, Signals, Source, Spec, Transform,
 };
 use crate::graph::{self, DType, Tensor};
 use crate::hardware::QuantFormat as Q;
@@ -443,7 +443,7 @@ fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData, sidecar: boo
     }
 }
 
-/// llama.cpp's multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
+/// The multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
 /// join the raw tensors, seen only by specs with `runtime.media`, and its metadata keys the
 /// `gguf` scope (the weights file's own keys win, `general.architecture` among them).
 fn index_sidecar(ck: &mut Checkpoint, p: &Path) -> Result<(), String> {
@@ -843,8 +843,8 @@ impl Env for ModelEnv {
 /// The most elements `values(name)` reads.
 const SMALL_VALUES: usize = 1 << 16;
 
-/// `n` as f32 values from checkpoint data, generators and transforms (`None` for adapter and
-/// synthetic tensors, which exist only once the store is built).
+/// `n` as f32 values from checkpoint data, generators and transforms (`None` for adapter,
+/// synthetic and precomputed tensors, which exist only once the store is built).
 fn node_values(ckpt: &Checkpoint, n: &Node) -> Option<Vec<f32>> {
     match &n.src {
         Src::Raw(r) => ckpt.raw_f32(r).ok(),
@@ -1118,13 +1118,15 @@ impl WeightStore {
                 leaves(n, &mut fed);
             }
         }
-        let canonical: HashMap<&str, &str> = table
-            .iter()
-            .filter_map(|(c, n)| match &n.src {
-                Src::Raw(r) => Some((r.as_str(), c.as_str())),
-                _ => None,
-            })
-            .collect();
+        // Raw name → the canonical names it feeds (through transforms too).
+        let mut canonical: HashMap<String, Vec<&str>> = HashMap::new();
+        for (c, n) in table.iter() {
+            let mut raws = HashSet::new();
+            leaves(n, &mut raws);
+            for r in raws {
+                canonical.entry(r).or_default().push(c.as_str());
+            }
+        }
         // ponytail: any sibling of a consumed `X.weight` but `X.bias` counts as its companion;
         // ask the source for real companion lists if this hides an unused tensor.
         let companion = |r: &str| {
@@ -1142,7 +1144,7 @@ impl WeightStore {
             .filter(|r| {
                 !ignore
                     .iter()
-                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|c| glob(g, c)))
+                    .any(|g| glob(g, r) || canonical.get(r.as_str()).is_some_and(|cs| cs.iter().any(|c| glob(g, c))))
             })
             .cloned()
             .collect()
@@ -1572,8 +1574,7 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
         // matrices); packed blocks stay as stored.
         "to_bf16" if matches!(k, Kind::Packed(_)) => k,
         "to_bf16" => Kind::Bf16,
-        // Leading dims of packed blocks regroup without decoding (`packed` checks the row width).
-        "untile_packed_rows" | "reshape" => k,
+        "untile_packed_rows" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
     }
@@ -1877,6 +1878,8 @@ pub struct Model {
     pub ckpt: Arc<Checkpoint>,
     /// (raw checkpoint name, canonical name) of every raw tensor, sorted by raw name.
     pub renames: Vec<(String, String)>,
+    /// `spec.ignore` globs whose `when` holds (for [`WeightStore::unconsumed`]).
+    pub ignore: Vec<String>,
 }
 
 /// Opens `artifacts` and loads it as `family` (detected from the checkpoint when `None`), under
@@ -2039,6 +2042,17 @@ fn load_from(
         .keys()
         .map(|r| (r.clone(), ren.canonical(r)))
         .collect();
+    let mut ignore = Vec::new();
+    for i in &spec.ignore {
+        match i {
+            Ignore::Glob(g) => ignore.push(g.clone()),
+            Ignore::When { glob, when } => {
+                if env.eval(&J::String(when.clone())).map_err(|e| fam(format!("ignore `{glob}`: {e}")))?.truthy() {
+                    ignore.push(glob.clone());
+                }
+            }
+        }
+    }
     Ok(Model {
         spec,
         env,
@@ -2046,6 +2060,7 @@ fn load_from(
         tokenizer,
         ckpt,
         renames,
+        ignore,
     })
 }
 
@@ -2977,21 +2992,25 @@ mod tests {
                 ("skip.me", "F32", &[1], one()),
                 ("raw.thing", "F32", &[1], one()),
                 ("src.w", "F32", &[1], one()),
+                ("maybe.a", "F32", &[1], one()),
+                ("maybe.b", "F32", &[1], one()),
             ],
-            r#"ignore: ["skip.*", "canon.*"],
+            // `{glob, when}`: ignored only when `when` holds.
+            r#"ignore: ["skip.*", "canon.*", {glob: "maybe.a", when: "has('skip.me')"},
+                     {glob: "maybe.b", when: "has('nope')"}],
             names: {rules: [["raw.thing", "canon.thing"]]},
             transforms: [{tensor: "src.w", op: "scale", args: {value: 2}}]"#,
         )
         .unwrap();
         let used: HashSet<String> = ["used.weight", "src.w"].map(String::from).into();
-        let ignore = m.spec.ignore.clone();
+        let ignore = m.ignore.clone();
         assert_eq!(
             m.store.unconsumed(&used, &ignore),
-            ["unused.weight", "used.bias"]
+            ["maybe.b", "unused.weight", "used.bias"]
         );
         // A `values(name)` read (a build-time constant) consumes the tensor.
         assert_eq!(m.env.values("used.bias"), Some(vec![1.0]));
-        assert_eq!(m.store.unconsumed(&used, &ignore), ["unused.weight"]);
+        assert_eq!(m.store.unconsumed(&used, &ignore), ["maybe.b", "unused.weight"]);
     }
 
     #[test]

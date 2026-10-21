@@ -19,6 +19,8 @@ pub mod placement;
 pub mod program;
 pub mod search;
 pub mod shape;
+#[cfg(test)]
+pub(crate) mod synth_decoder;
 pub mod tune;
 use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;

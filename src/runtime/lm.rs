@@ -25,7 +25,7 @@
 //! `prepare`, and its placeholder expanded.
 
 use crate::arch::build::{build, InputPlan, Instance, ShapeCache};
-use crate::arch::expr::Val;
+use crate::arch::expr::{Env, Val};
 use crate::arch::gen::{generate, GenData};
 use crate::arch::load::Model;
 use crate::arch::Registry;
@@ -306,18 +306,21 @@ impl SpecLm {
         // this program (`run_head`), so they load with it; plain LM exports do not build it.
         let mut program_weights = decode.weights.clone();
         let mut seqcls_err = None;
-        if let Some(head) = model.spec.runtime["seqcls"]["head"].as_str() {
-            let hv = vars(1, head, &[], 0);
-            match build(&model.spec, TEXT, &model.env, &model.store, &hv) {
-                Ok(i) => {
-                    for w in i.weights {
-                        if used.insert(w.clone()) {
-                            program_weights.push(w);
+        if let Some(h) = model.spec.runtime["seqcls"]["head"].as_str() {
+            for head in [h, "hidden"] {
+                let hv = vars(1, head, &[], 0);
+                match shapes.get(&hv, || build(&model.spec, TEXT, &model.env, &model.store, &hv)) {
+                    Ok(i) => {
+                        for w in &i.weights {
+                            if model.env.has(w) && used.insert(w.clone()) {
+                                program_weights.push(w.clone());
+                            }
                         }
                     }
+                    // Named with the unread-tensor error below when the checkpoint has a head.
+                    Err(e) if head == h => seqcls_err = Some(e),
+                    Err(_) => {}
                 }
-                // Named with the unread-tensor error below when the checkpoint has a head.
-                Err(e) => seqcls_err = Some(e),
             }
         }
         let mut off = HashMap::new();
@@ -332,7 +335,7 @@ impl SpecLm {
                 }
             }
         }
-        let unused = model.store.unconsumed(&used, &model.spec.ignore);
+        let unused = model.store.unconsumed(&used, &model.ignore);
         if !unused.is_empty() {
             // A failed tower's weights stay unread: its probe error is the real cause.
             let mut why: Vec<String> = off.iter().map(|(m, e)| format!("{m} tower: {e}")).collect();
@@ -1278,7 +1281,7 @@ mod tests {
     }
 
     /// A toy LM with an audio modality: raw 4-sample frames through a linear tower (output 0 the
-    /// soft rows, output `extra` added after attention), rows scattered after the embedding, the
+    /// soft rows, output `extra` added to them before attention), rows scattered after the embedding, the
     /// item one bidirectional block; an `image` modality switched off by `when`.
     const MEDIA_SPEC: &str = r#"{
       family: "toym", pipeline: "causal_lm",
@@ -1316,6 +1319,11 @@ mod tests {
           body: [
             {op: "Embedding", in: ["w:emb", "i:token_ids"], out: "x"},
             {op: "Scatter", args: {axis: 0}, in: ["x", "i:media_index", "i:media_rows"], out: "x", when: "first(media, 0) > 0"},
+            {block: [
+              {op: "Unary", args: {kind: {Scale: 0.0}}, in: ["x"], out: "z"},
+              {op: "Scatter", args: {axis: 0}, in: ["z", "i:media_index", "i:extra"], out: "z"},
+              {op: "Binary", args: {kind: "Add"}, in: ["x", "z"], out: "x"},
+            ], when: "first(media, 0) > 0"},
             {state: "kv.k", shape: ["ctx", "kv_heads*hd"]},
             {state: "kv.v", shape: ["ctx", "kv_heads*hd"]},
             {op: "RmsNorm", args: {eps: 1e-5}, in: ["x", "c:ones"], out: "n"},
@@ -1331,11 +1339,6 @@ mod tests {
             {op: "Linear", in: ["a", "w:o"], out: "a"},
             {op: "Unary", args: {kind: {Scale: 50.0}}, in: ["a"], out: "a"},
             {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x"},
-            {block: [
-              {op: "Unary", args: {kind: {Scale: 0.0}}, in: ["x"], out: "z"},
-              {op: "Scatter", args: {axis: 0}, in: ["z", "i:media_index", "i:extra"], out: "z"},
-              {op: "Binary", args: {kind: "Add"}, in: ["x", "z"], out: "x"},
-            ], when: "first(media, 0) > 0"},
             {op: "Slice", args: {axis: 0, start: "rows - 1", end: "rows"}, in: ["x"], out: "x", when: "head == 'last' && rows > 1"},
             {op: "Linear", in: ["x", "w:emb"], out: "logits"},
           ],
@@ -1353,9 +1356,9 @@ mod tests {
         SpecLm::new(m, PlacementMode::Pin(dev)).unwrap()
     }
 
-    /// 16 kHz mono 16-bit WAV of `n` non-silent samples.
+    /// 16 kHz mono 16-bit WAV of `n` loud (near full-scale) samples.
     fn wav(n: usize) -> Vec<u8> {
-        let pcm: Vec<u8> = (0..n).flat_map(|i| (((i * 7919) % 2000) as i16 - 1000).to_le_bytes()).collect();
+        let pcm: Vec<u8> = (0..n).flat_map(|i| (((i * 7919) % 60000) as i32 - 30000).to_le_bytes()[..2].to_vec()).collect();
         let mut b = b"RIFF".to_vec();
         b.extend((36 + pcm.len() as u32).to_le_bytes());
         b.extend(b"WAVEfmt ");
@@ -1397,6 +1400,13 @@ mod tests {
                 SpecLm::seq(&mut t).unwrap().blocks = vec![3..9];
                 let plain = oneshot.forward(&ids, 0, &mut t).unwrap();
                 assert!(plain.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "media rows must matter");
+                // The tower's second output reaches the logits through its rows.
+                let (_, mut z) = oneshot.prepare(prompt.to_vec(), &clip).unwrap();
+                let s = SpecLm::seq(&mut z).unwrap();
+                let extra = s.rows.iter_mut().find(|(n, _, _)| n == "extra").expect("extra rows");
+                extra.2.fill(0.0);
+                let lz = oneshot.forward(&ids, 0, &mut z).unwrap();
+                assert!(lz.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "the extra output must matter");
             }
         }
     }

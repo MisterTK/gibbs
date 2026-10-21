@@ -193,7 +193,7 @@ impl SpecEncDec {
         let enc_vars = Self::enc_vars(b0);
         let enc_probe = build(&m.spec, ENCODER, &m.env, &m.store, &enc_vars)?;
         let used: HashSet<String> = dec_inst.weights.iter().chain(&enc_probe.weights).cloned().collect();
-        let unused = m.store.unconsumed(&used, &m.spec.ignore);
+        let unused = m.store.unconsumed(&used, &m.ignore);
         if !unused.is_empty() {
             return Err(format!(
                 "{fam}: checkpoint tensors no instance reads (list deliberate ones in `ignore`): {}",

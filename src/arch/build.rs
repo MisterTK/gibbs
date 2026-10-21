@@ -2,8 +2,7 @@
 //! `graph::Graph`. Node kinds (one JSON object each, see the README "Model specs"):
 //!
 //! - op:     `{op, args, in, out, name?, when?}`; `args` deserialize into `graph::Op`.
-//! - state:  `{state, shape, dtype?, recurrent?, reread?, when?}` declares persistent state;
-//!   `reread: true` re-reads one declared earlier (its value after the earlier writes).
+//! - state:  `{state, shape, dtype?, recurrent?, when?}` declares persistent state.
 //! - use:    `{use, args?, in?, out?, when?}` expands a macro in a fresh value scope.
 //! - repeat: `{repeat: var, count | over, body}` (shares the enclosing value scope).
 //! - block:  `{block: [...], when}` conditional group (shares the enclosing value scope).
@@ -364,16 +363,8 @@ impl<'a> Builder<'a> {
                     .ok_or("state needs `shape`")?,
             )?;
             let dtype = parse_dtype(m.get("dtype").and_then(J::as_str).unwrap_or("f32"))?;
-            // `reread: true`: a second value of a state declared earlier in this graph, read after
-            // the earlier nodes' writes (shared KV caches); later `s:` refs use it.
-            let reread = m.get("reread").and_then(J::as_bool).unwrap_or(false);
-            match (self.states.get(&name), reread) {
-                (Some(_), false) => return Err(format!("state `{name}` declared twice")),
-                (None, true) => return Err(format!("state `{name}` is reread before it is declared")),
-                (Some(&v), true) if self.g.value(v).shape != shape => {
-                    return Err(format!("state `{name}` reread with shape {shape:?}"))
-                }
-                _ => {}
+            if self.states.contains_key(&name) {
+                return Err(format!("state `{name}` declared twice"));
             }
             let recurrent = m
                 .get("recurrent")

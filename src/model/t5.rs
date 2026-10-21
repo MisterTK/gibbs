@@ -5,11 +5,10 @@
 //! Reference: transformers `models/t5/modeling_t5.py` and `models/umt5/modeling_umt5.py`.
 // legacy: until the diffusion phases move sd3/flux/ltx text encoding onto the `t5` spec.
 
-
+use crate::model::nn;
 use crate::model::par::{par_for, par_rows, threads, OutPtr};
 use crate::model::simd::{vector_dot_product as dot, vector_fused_scale_add, vector_softmax};
 use crate::model::weights::{Mat, Weights};
-use crate::model::nn;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -33,7 +32,7 @@ impl Lin {
     /// x `[n, cols]` -> `[n, rows]`.
     fn forward(&self, x: &[f32], n: usize) -> Vec<f32> {
         let (w, rows, cols) = match self {
-            Lin::Bf16(m) => return crate::model::gemma4::ops::linear(x, n, m),
+            Lin::Bf16(m) => return nn::linear_mat(x, n, m),
             Lin::F32 { w, rows, cols } => (w, *rows, *cols),
         };
         if n >= GEMM_ROWS {
@@ -98,9 +97,15 @@ impl Src<'_> {
     fn lin(&self, name: &str, rows: usize, cols: usize) -> Result<Lin, String> {
         let Src::Map(w, to_bf16) = self;
         // `mat` rounds f16/f32 to bf16; without `to_bf16` only stored bf16 is taken as is.
-        if let Some(m) = (*to_bf16 || w.is_bf16(name)).then(|| w.mat(name)).and_then(Result::ok) {
+        if let Some(m) = (*to_bf16 || w.is_bf16(name))
+            .then(|| w.mat(name))
+            .and_then(Result::ok)
+        {
             if (m.rows, m.cols) != (rows, cols) {
-                return Err(format!("tensor '{name}' is [{}, {}], expected [{rows}, {cols}]", m.rows, m.cols));
+                return Err(format!(
+                    "tensor '{name}' is [{}, {}], expected [{rows}, {cols}]",
+                    m.rows, m.cols
+                ));
             }
             return Ok(Lin::Bf16(m));
         }

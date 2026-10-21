@@ -156,13 +156,9 @@ pub trait NativeLm: Send + Sync {
 /// pipeline tag (`image-text-to-text`, `any-to-any`, ...), as it does for spec-run families
 /// ([`crate::arch::dispatch::runs_spec_lm`]).
 // legacy: until Phases 6 (gemma) and 4 (idefics3) give these families specs.
-pub const NATIVE_MODEL_TYPES: &[&str] = &["gemma4", "gemma4_unified", "idefics3", "smolvlm"];
+pub const NATIVE_MODEL_TYPES: &[&str] = &["idefics3", "smolvlm"];
 
-/// [`NATIVE_MODEL_TYPES`] whose loaders also read GGUF weights: `gemma4` files with their
-/// `mmproj` ([`crate::model::gemma4::load_gguf`]). The hub picker refuses GGUF repos of the other
-/// types.
-// legacy: until Phase 6 (the same family's spec).
-pub const NATIVE_GGUF_TYPES: &[&str] = &["gemma4", "gemma4_unified"];
+pub const NATIVE_GGUF_TYPES: &[&str] = &[];
 
 /// Loads `artifacts` as a [`NativeLm`] when its `config.json` names an architecture implemented
 /// here; `None` sends it down the GraphLm path.
@@ -192,13 +188,9 @@ fn load_native_once(
     artifacts: &ModelArtifacts,
     mode: PlacementMode,
 ) -> Option<Result<Arc<dyn NativeLm>, String>> {
-    if let Some(r) = crate::model::gemma4::load_gguf(artifacts, mode) {
-        return Some(r);
-    }
     let cfg: serde_json::Value =
         serde_json::from_slice(&std::fs::read(artifacts.config_path.as_ref()?).ok()?).ok()?;
     match cfg["model_type"].as_str()? {
-        "gemma4" | "gemma4_unified" => Some(crate::model::gemma4::load(artifacts, &cfg, mode)),
         // `GIBBS_SPEC_LM=1`: the `idefics3` spec (`runtime::lm::SpecLm` + media) instead.
         "idefics3" | "smolvlm" if !crate::arch::dispatch::spec_lm_enabled() => {
             Some(crate::model::idefics3::load(artifacts, &cfg, mode))

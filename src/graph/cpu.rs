@@ -3125,6 +3125,48 @@ mod tests {
         assert!(o1[0] > 1.0);
     }
 
+    /// A `write: false` reader of the same state value, after the writer, sees the writer's row.
+    #[test]
+    fn test_cpu_shared_kv_reader_sees_the_write() {
+        let mut g = Graph::new();
+        let q = g.input("q", vec![1, 4], DType::F32);
+        let k = g.input("k", vec![1, 4], DType::F32);
+        let v = g.input("v", vec![1, 4], DType::F32);
+        let ks = g.state("k_state", vec![16, 4], DType::F32, false);
+        let vs = g.state("v_state", vec![16, 4], DType::F32, false);
+        let pos = g.input("pos", vec![1], DType::U32);
+        let attn = |write| Op::CachedAttention {
+            heads: 1,
+            kv_heads: 1,
+            head_dim: 4,
+            v_head_dim: 4,
+            scale: 0.5,
+            causal: true,
+            window: None,
+            soft_cap: None,
+            write,
+        };
+        let a = g.add("writer", attn(true), &[q, k, v, ks, vs, pos], vec![1, 4], DType::F32);
+        let b = g.add("reader", attn(false), &[q, q, q, ks, vs, pos], vec![1, 4], DType::F32);
+        g.output(a);
+        g.output(b);
+        let mut state = StateStore::new();
+        let r = run(
+            &g,
+            &Weights::new(),
+            &mut state,
+            vec![
+                Tensor::F32(vec![1.0, 0.0, 0.0, 0.0]),
+                Tensor::F32(vec![1.0, 0.0, 0.0, 0.0]),
+                Tensor::F32(vec![1.0, 2.0, 3.0, 4.0]),
+                Tensor::U32(vec![0]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(r[1].as_f32().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(r[0].as_f32().unwrap(), r[1].as_f32().unwrap());
+    }
+
     #[test]
     fn test_cpu_causal_conv1d_step_by_step_matches_prefill() {
         let mut g_prefill = Graph::new();

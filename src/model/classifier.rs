@@ -445,12 +445,6 @@ impl SequenceClassifier {
                 .as_deref()
                 .ok_or_else(|| format!("{repo_id}: no weight file"))?;
             let llm: Box<dyn DecoderBackbone> = match arch.as_str() {
-                "Gemma4ForSequenceClassification" => Box::new(
-                    crate::model::gemma4::seqcls::Gemma4Seq::load(&artifacts, &cfg)?,
-                ),
-                "Gemma3TextForSequenceClassification" => Box::new(
-                    crate::model::gemma3_text::Gemma3Text::load(&artifacts, &cfg)?,
-                ),
                 _ => Box::new(crate::runtime::seqcls::SpecBackbone::load(&artifacts, device)?),
             };
             let h = llm.hidden();
