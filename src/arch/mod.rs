@@ -44,7 +44,6 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
     ("names/comfy.json5", include_str!("../../arch/names/comfy.json5")),
     ("families/krea2.json5", include_str!("../../arch/families/krea2.json5")),
-    ("lib/dit_extra.json5", include_str!("../../arch/lib/dit_extra.json5")),
     ("families/qwen_image.json5", include_str!("../../arch/families/qwen_image.json5")),
     ("families/qwen_image21.json5", include_str!("../../arch/families/qwen_image21.json5")),
     ("families/qwen_vae.json5", include_str!("../../arch/families/qwen_vae.json5")),

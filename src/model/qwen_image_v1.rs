@@ -814,6 +814,10 @@ mod tests {
         };
         let built = load_tokenizer(&dir).unwrap();
         let reference = tokenizers::Tokenizer::from_file(dir.join("ref_tokenizer.json")).unwrap();
+        let rt = crate::model::hf_loader::tokenizer_from_files(&built.to_string(false).unwrap(), &|n| {
+            std::fs::read(dir.join(n)).ok()
+        })
+        .unwrap();
         let ids =
             |t: &tokenizers::Tokenizer, s: &str| t.encode(s, false).unwrap().get_ids().to_vec();
         for s in [
@@ -825,6 +829,8 @@ mod tests {
             " ",
         ] {
             assert_eq!(ids(&built, s), ids(&reference, s), "{s:?}");
+            // The form the diffusion runtime loads: serialized, read back as the crate tokenizer.
+            assert_eq!(rt.encode(s), ids(&reference, s), "runtime form: {s:?}");
         }
         assert_eq!(ids(&built, TEMPLATE_HEAD).len(), DROP);
     }

@@ -1164,6 +1164,11 @@ fn dit_runtimes_parse() {
     }
 }
 
+/// Old `krea2::Dit` + `Loras` output on the `pair` LoRA (spec matched it at rel 1.95e-7 before
+/// the old code was deleted): every 64th of `sub(out)`.
+#[rustfmt::skip]
+const KREA2_LORA_PIN: [f32; 36] = [0.6458024, -0.68495977, 1.2038748, 0.78530777, -0.8388921, -0.30057698, -0.5283634, -1.3309352, -0.6637603, 0.857429, 1.5352197, -1.841813, -0.32170674, 0.8646051, 1.4135798, -1.467209, -0.14866997, -0.3009609, 0.8847723, -0.25245777, -0.008546151, 0.94894725, -0.026348034, -0.5299631, 0.60384136, -0.54123783, 0.68916553, -0.18912089, -0.037548088, -0.48464662, 0.20832507, 0.7079825, 0.28712678, 1.2895193, -0.23603027, 0.6485835];
+
 /// Krea 2 LoRA files through the shared `LoraFile` loader on the spec path (original/ComfyUI key
 /// forms under `diffusion_model.`): a low-rank pair changes the output, a `.diff_b` bias delta
 /// alone (zero up weight) changes it too, and a module naming a block the model lacks is an error.
@@ -1196,8 +1201,15 @@ fn krea2_spec_lora() {
         run1(&mut r, "denoiser", &vars, vec![F32(lat.clone()), F32(ctx.clone())], "out")
     };
     let base = forward(None);
+    // Parity of the low-rank pair against the old Krea 2 LoRA loader (pinned: subsampled output of
+    // `krea2::Dit::load` + `Loras::add_file` on this fixture, captured before its deletion).
+    let pair_file = lora("pair.safetensors", pair("blocks.1.attn.wq", 0.5));
+    let got = forward(Some(&pair_file));
+    let pin = sub(&got).iter().step_by(64).copied().collect::<Vec<f32>>();
+    let (e, c) = gibbs_engine::arch::testing::compare(&pin, &KREA2_LORA_PIN);
+    assert!(e < 1e-3 && c > 0.9999, "LoRA vs pinned old output: rel {e} cos {c}");
     let changed = |y: &[f32]| y.iter().zip(&base).any(|(a, b)| (a - b).abs() > 1e-4);
-    assert!(changed(&forward(Some(&lora("pair.safetensors", pair("blocks.1.attn.wq", 0.5))))));
+    assert!(changed(&got));
     let mut bias = pair("first", 0.0);
     bias.push(("diffusion_model.first.diff_b".into(), vec![64], rnd(32, 64, 0.5)));
     assert!(changed(&forward(Some(&lora("bias.safetensors", bias)))), "diff_b bias delta not applied");

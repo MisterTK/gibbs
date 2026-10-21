@@ -5,7 +5,9 @@
 // Latents enter unpacked ([c, h, w]); 2x2 patch rows ((py, px, c) order) are cut in-graph.
 {
   family: "zimage",
-  match: {diffusers_class: ["ZImagePipeline", "ZImageTransformer2DModel"]},
+  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
+  // text-encoder specs land and this family is cut over.
+  match: {diffusers_class: ["ZImageTransformer2DModel"]},
   pipeline: "diffusion",
   config: {
     dim: "cfg.dim",

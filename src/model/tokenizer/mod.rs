@@ -1447,7 +1447,7 @@ mod byte_bpe_tests {
         // As the diffusion runtime loads it: serialized, then read as a tokenizer.json.
         let json = tok.to_string(false).unwrap();
         let t = crate::model::hf_loader::tokenizer_from_files(&json, &|n| std::fs::read(dir.join(n)).ok()).unwrap();
-        assert_eq!(t.hf.as_ref().unwrap().encode("<|im_start|>hi hi<|im_end|>", false).unwrap().get_ids(), [4, 3, 2, 3, 5]);
+        assert_eq!(t.encode("<|im_start|>hi hi<|im_end|>"), [4, 3, 2, 3, 5]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

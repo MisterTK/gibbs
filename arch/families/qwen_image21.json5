@@ -7,7 +7,9 @@
 // raw text-encoder features; timestep features `timestep_embedding(1000 * sigma)` are generated.
 {
   family: "qwen_image21",
-  match: {diffusers_class: ["QwenImage21Pipeline", "QwenImage21Transformer2DModel"], gguf_arch: ["qwen_image", "qwen_image21"]},
+  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
+  // text-encoder specs land and this family is cut over.
+  match: {diffusers_class: ["QwenImage21Transformer2DModel"]},
   pipeline: "diffusion",
   use_lib: ["diffusion"],
   names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},

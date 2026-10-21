@@ -7,7 +7,9 @@
 // (F32 checkpoints are rounded, as the reference).
 {
   family: "krea2",
-  match: {diffusers_class: ["Krea2Pipeline", "Krea2Transformer2DModel"]},
+  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
+  // text-encoder specs land and this family is cut over.
+  match: {diffusers_class: ["Krea2Transformer2DModel"]},
   pipeline: "diffusion",
   use_lib: ["diffusion"],
   names: {use: ["comfy"]},
