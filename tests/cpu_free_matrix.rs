@@ -471,7 +471,6 @@ fn gpu_fixture(f: Family) {
             // SD, Qwen-Image (x2), LTX and DC-AE VAEs decode (and LTX encodes) as Metal programs.
             gibbs_engine::model::diff_fixtures::tiny_vae_on_gpu().expect("tiny VAEs run on Metal");
         }
-        other => panic!("{other:?} is marked Gpu but has no fixture in this test"),
     }
 }
 
