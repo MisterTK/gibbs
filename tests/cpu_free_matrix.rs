@@ -238,7 +238,7 @@ fn gpu_fixture(f: Family) {
         }
         Family::System1 => {
             use gibbs_engine::model::hub::HuggingFaceHub;
-            use gibbs_engine::model::jev::JevSystem1Model;
+            use gibbs_engine::runtime::encoder::system1::JevSystem1Model;
             let mut ts = synth::Ts::new(3);
             ts.w("embeddings.word_embeddings.weight", &[synth::VOCAB, 16]);
             ts.w("embeddings.position_embeddings.weight", &[32, 16]);

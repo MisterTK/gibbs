@@ -1,9 +1,10 @@
-//! "System 1" decision engine: a real pretrained BERT sentence encoder
-//! (default sentence-transformers/all-MiniLM-L6-v2) answering structured questions
-//! zero-shot by cosine similarity between embeddings, in a single forward pass.
+//! "System 1" decision engine: a pretrained sentence encoder (default
+//! sentence-transformers/all-MiniLM-L6-v2: any encoder family whose spec names a `runtime.system1`
+//! pooling head), or any LLM, answering structured questions zero-shot by cosine similarity
+//! between embeddings, in a single forward pass.
 
+use super::SpecEncoder;
 use crate::hardware::Device;
-use crate::runtime::encoder::SpecEncoder;
 use crate::model::hub::HuggingFaceHub;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -87,29 +88,26 @@ const BOOL_CRITERIA_ERR: &str =
 const SCORE_ERR: &str =
     "score questions need a trained head; not supported by the zero-shot encoder";
 
-
-/// Shared, hot-swappable System 1 model slot (native BERT encoder or any LLM).
+/// Shared, hot-swappable System 1 model slot (sentence encoder or any LLM).
 pub type System1Slot = std::sync::Arc<parking_lot::RwLock<Option<std::sync::Arc<JevSystem1Model>>>>;
 
-/// True when `cfg` is a BERT encoder `config.json` (not a sequence classifier or generator).
-pub fn is_bert_encoder_config(cfg: &serde_json::Value) -> bool {
-    if cfg["model_type"].as_str() != Some("bert")
-        || !cfg["hidden_size"].is_u64()
-        || !cfg["num_hidden_layers"].is_u64()
-    {
-        return false;
+/// The family and embedding head of a sentence-encoder `config.json` (not a sequence classifier
+/// or generator): an encoder family claims it and names a System 1 head.
+fn sentence_encoder(cfg: &serde_json::Value) -> Option<(String, String)> {
+    let arch = cfg["architectures"][0].as_str();
+    if arch.is_some_and(|a| a.ends_with("ForSequenceClassification") || super::is_generator(a)) {
+        return None;
     }
-    match cfg["architectures"][0].as_str() {
-        Some(a) => {
-            !a.ends_with("ForSequenceClassification")
-                && !crate::model::classifier::is_generator(a)
-                && !crate::model::classifier::ARCHITECTURES.contains(&a)
-        }
-        None => true,
-    }
+    let (family, rt) = super::family(cfg, arch)?;
+    Some((family, rt.system1()?.to_string()))
 }
 
-/// True when `repo_id` is a BERT sentence encoder checkpoint (`sentence-transformers/all-MiniLM-L6-v2`, etc.).
+/// True when `cfg` is a sentence-encoder `config.json` System 1 runs.
+pub fn is_sentence_encoder_config(cfg: &serde_json::Value) -> bool {
+    sentence_encoder(cfg).is_some()
+}
+
+/// True when `repo_id` is a sentence-encoder checkpoint (`sentence-transformers/all-MiniLM-L6-v2`, etc.).
 pub fn detect(hub: &HuggingFaceHub, repo_id: &str) -> bool {
     if crate::model::hub::is_synthetic_model_id(repo_id)
         || crate::model::hub::split_weight_file(repo_id).1.is_some()
@@ -132,7 +130,7 @@ pub fn detect(hub: &HuggingFaceHub, repo_id: &str) -> bool {
     let Ok(cfg) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return false;
     };
-    is_bert_encoder_config(&cfg)
+    is_sentence_encoder_config(&cfg)
 }
 
 const LLM_EMBED_DIM: usize = 384;
@@ -171,7 +169,7 @@ fn llm_embed_from_logits(logits: &[f32]) -> Vec<f32> {
 
 /// Backing model for System 1 embeddings and zero-shot decisions.
 pub enum System1Backend {
-    /// A sentence-encoder spec (`bert`), mean-pooled and L2-normalised in its graph.
+    /// An encoder spec pooled (and normalized) by its `runtime.system1` head in its graph.
     Encoder {
         tokenizer: tokenizers::Tokenizer,
         encoder: SpecEncoder,
@@ -179,7 +177,7 @@ pub enum System1Backend {
     Llm(crate::scheduler::ExecutableModel),
 }
 
-/// Pretrained BERT sentence encoder or LLM used zero-shot for System 1 decisions.
+/// Pretrained sentence encoder or LLM used zero-shot for System 1 decisions.
 pub struct JevSystem1Model {
     pub repo_id: String,
     /// Softmax temperature over cosine similarities.
@@ -194,6 +192,9 @@ impl JevSystem1Model {
         let config_path = hub.fetch_file(repo_id, "config.json")?;
         let tok_path = hub.fetch_file(repo_id, "tokenizer.json")?;
         let st_path = hub.fetch_file(repo_id, "model.safetensors")?;
+        let cfg = super::read_json(&config_path)?;
+        let (family, head) = sentence_encoder(&cfg)
+            .ok_or_else(|| format!("{repo_id}: no encoder family with a System 1 head claims its config.json"))?;
         let artifacts = crate::model::hub::ModelArtifacts {
             model_id: repo_id.to_string(),
             local_dir: st_path.parent().map(Into::into),
@@ -203,7 +204,7 @@ impl JevSystem1Model {
             is_cached: true,
             ..Default::default()
         };
-        let encoder = SpecEncoder::load(&artifacts, Some("bert"), device, "mean_l2")
+        let encoder = SpecEncoder::load(&artifacts, Some(&family), device, &head)
             .map_err(|e| format!("{repo_id}: {e}"))?;
         let mut tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
             .map_err(|e| format!("load {}: {e}", tok_path.display()))?;
@@ -238,7 +239,7 @@ impl JevSystem1Model {
         }
     }
 
-    /// True when this System 1 model wraps an LLM rather than a dedicated BERT encoder.
+    /// True when this System 1 model wraps an LLM rather than a dedicated sentence encoder.
     pub fn is_llm(&self) -> bool {
         matches!(self.backend, System1Backend::Llm(_))
     }
@@ -275,7 +276,7 @@ impl JevSystem1Model {
         }
     }
 
-    /// Sentence embedding: L2-normalized vector (BERT mean-pooled hidden state or 384-d LLM logit sketch).
+    /// Sentence embedding: L2-normalized vector (the encoder's pooled head or 384-d LLM logit sketch).
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
         match &self.backend {
             System1Backend::Encoder { tokenizer, encoder } => {

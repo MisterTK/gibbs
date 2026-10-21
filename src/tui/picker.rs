@@ -1044,7 +1044,7 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
                 .config_path
                 .as_deref()
                 .and_then(crate::model::classifier::architecture_in)
-                .is_some_and(|a| crate::model::classifier::ARCHITECTURES.contains(&a.as_str()));
+                .is_some_and(|a| crate::model::classifier::runs_architecture(&a));
             let cfg: Option<Value> = art
                 .config_path
                 .as_deref()
@@ -1062,7 +1062,7 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
             );
             let system1 = cfg
                 .as_ref()
-                .is_some_and(crate::model::jev::is_bert_encoder_config);
+                .is_some_and(crate::runtime::encoder::system1::is_sentence_encoder_config);
             // Same test as hub rows ([`native_type`]): native models keep bf16 weights.
             let bf16 = cfg.is_some_and(|c| native_type(&serde_json::json!({ "config": c })));
             let runnable =

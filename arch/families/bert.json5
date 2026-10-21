@@ -6,6 +6,7 @@
 {
   family: "bert",
   match: {
+    hf_model_type: ["bert"],
     hf_architectures: ["BertForSequenceClassification", "RobertaForSequenceClassification",
       "XLMRobertaForSequenceClassification", "CamembertForSequenceClassification",
       "DistilBertForSequenceClassification", "BertModel"],
@@ -31,6 +32,8 @@
     hidden: "first(cfg.hidden_size, cfg.dim)",
     // RoBERTa-style positions: from pad_id + 1 (`runtime.position_ids`).
     pad_positions: "contains(['RobertaForSequenceClassification', 'XLMRobertaForSequenceClassification', 'CamembertForSequenceClassification'], arch)",
+    // A fairseq SentencePiece vocabulary (`runtime.tokenizer`).
+    fairseq_vocab: "arch == 'CamembertForSequenceClassification'",
     labels: "shape(fmt('{head_out}.weight'))[0]",
     layers: "first(cfg.num_hidden_layers, cfg.n_layers)",
     heads: "first(cfg.num_attention_heads, cfg.n_heads)",
@@ -111,6 +114,19 @@
       ],
     },
   },
-  // An expression over the config (`absolute` | `pad_offset`).
-  runtime: {position_ids: "pad_positions ? 'pad_offset' : 'absolute'"},
+  runtime: {
+    // An expression over the config (`absolute` | `pad_offset`).
+    position_ids: "pad_positions ? 'pad_offset' : 'absolute'",
+    // System 1 sentence embeddings: mean-pooled, L2-normalised.
+    system1: "mean_l2",
+    // Fast tokenizers HF converts the slow-tokenizer files to, when a repo has no tokenizer.json.
+    tokenizer: [
+      {when: "!pad_positions", kind: "wordpiece", vocab: "vocab.txt", unk: "[UNK]", cls: "[CLS]", sep: "[SEP]",
+        specials: ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]},
+      {when: "fairseq_vocab", kind: "unigram", model: "sentencepiece.bpe.model", vocab: "fairseq",
+        cls: "<s>", sep: "</s>", pair: "{cls} $A {sep} {sep} $B {sep}"},
+      {when: "pad_positions", kind: "byte_bpe", vocab: "vocab.json", merges: "merges.txt", cls: "<s>", sep: "</s>",
+        post: "roberta", specials: ["<s>", "<pad>", "</s>", "<unk>", "<mask>"]},
+    ],
+  },
 }

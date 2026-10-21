@@ -1,17 +1,18 @@
 //! Encoder goldens: the sequence classifiers (`model::classifier`: BERT, ModernBERT, ELECTRA,
 //! ALBERT, DeBERTa v1/v2, SetFit, GPT-2/OPT decoder seq-cls, fastText), System 1
-//! (`model::jev`) and Idefics3/SmolVLM (`model::idefics3` + `model::siglip`). Every case writes a
+//! (`runtime::encoder::system1`) and Idefics3/SmolVLM (`model::idefics3` + `model::siglip`). Every case writes a
 //! Hugging Face cache snapshot (`models--gibbs-golden--<case>/snapshots/main`) or a checkpoint
 //! directory and loads it through the public loader (`SequenceClassifier::load`,
 //! `JevSystem1Model::load`, `load_native`). Shapes follow `classifier/synth.rs`,
 //! `ln_decoder.rs` `tiny` and `idefics3.rs` `tiny_engine`.
 
 use crate::util::*;
-use gibbs_engine::model::classifier::{LabelScore, SequenceClassifier};
+use gibbs_engine::model::classifier::SequenceClassifier;
+use gibbs_engine::runtime::encoder::LabelScore;
 use gibbs_engine::model::weight_format::{set_reencode_override, ReencodeConfig, ReencodePolicy};
 use gibbs_engine::model::hub::HuggingFaceHub;
 use gibbs_engine::model::image::ImageBuffer;
-use gibbs_engine::model::jev::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
+use gibbs_engine::runtime::encoder::system1::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
 use gibbs_engine::model::native::{load_native, MediaInput};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};

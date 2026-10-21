@@ -1,12 +1,8 @@
-//! BERT-family sequence classifiers and rerankers exported to GGUF by llama.cpp
-//! (`convert_hf_to_gguf.py` BertModel / XLMRobertaModel): the encoder under llama.cpp tensor
-//! names, the head as `cls.*` / `cls.output.*`, and the tokenizer as `tokenizer.ggml.*`.
+//! GGUF key-value metadata read with arrays (the shared header reader skips them): the
+//! architecture, string lists (a classifier's `<arch>.classifier.output_labels`) and the HF
+//! tokenizer rebuilt from `tokenizer.ggml.*`.
 
-use super::encode;
-use crate::hardware::Device;
-use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
-use crate::model::loaders::GgufWeightReader;
-use crate::runtime::encoder::SpecEncoder;
+use crate::model::hub::HuggingFaceHub;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -102,62 +98,37 @@ fn read_kv(d: &[u8]) -> Result<HashMap<String, Kv>, String> {
     Ok(kv)
 }
 
-/// A llama.cpp BERT-architecture GGUF with a classification head (the `bert_gguf` spec).
-pub struct GgufClassifier {
-    pub labels: Vec<String>,
-    enc: SpecEncoder,
-    tok: tokenizers::Tokenizer,
-}
+/// A GGUF file's metadata.
+pub struct GgufMeta(HashMap<String, Kv>);
 
-impl GgufClassifier {
-    pub fn load(path: &Path, device: Device) -> Result<Self, String> {
-        let reader = GgufWeightReader::open(path)?;
-        let kv = read_kv(reader.bytes())?;
-        let arch = kv
-            .get("general.architecture")
-            .and_then(Kv::str)
-            .unwrap_or("")
-            .to_string();
-        if !reader.tensor_names().any(|n| n == "cls.output.weight") {
-            return Err("GGUF has no classification head".into());
-        }
-        if arch != "bert" {
-            return Err(format!(
-                "GGUF classifier architecture {arch} is not supported (only bert)"
-            ));
-        }
-        drop(reader);
-        let artifacts = ModelArtifacts {
-            model_id: path.display().to_string(),
-            local_dir: path.parent().map(Into::into),
-            weights_path: Some(path.to_path_buf()),
-            is_cached: true,
-            ..Default::default()
-        };
-        let enc = SpecEncoder::load(&artifacts, Some("bert_gguf"), device, "classify")?;
-        let n = enc.var("labels")?;
-        let labels = match kv
-            .get(&format!("{arch}.classifier.output_labels"))
-            .and_then(Kv::arr)
-        {
-            Some(l) if l.len() == n => l
+impl GgufMeta {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // SAFETY: read-only mapping of a cache file; only the header is read.
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{}: {e}", path.display()))?;
+        read_kv(&map).map(Self)
+    }
+
+    /// `general.architecture`.
+    pub fn arch(&self) -> Option<String> {
+        self.0.get("general.architecture").and_then(Kv::str).map(str::to_string)
+    }
+
+    /// The string array under `key`.
+    pub fn strings(&self, key: &str) -> Option<Vec<String>> {
+        Some(
+            self.0
+                .get(key)
+                .and_then(Kv::arr)?
                 .iter()
                 .map(|v| v.str().unwrap_or("").to_string())
                 .collect(),
-            _ => (0..n).map(|i| format!("LABEL_{i}")).collect(),
-        };
-        let tok = tokenizer(&kv, enc.capacity()?)?;
-        Ok(Self { labels, enc, tok })
+        )
     }
 
-    /// Head logits for `text` (and `pair` as the second segment), plus the token count.
-    pub fn logits(&self, text: &str, pair: Option<&str>) -> Result<(Vec<f32>, usize), String> {
-        let e = encode(&self.tok, text, pair)?;
-        Ok((self.enc.run(e.get_ids(), e.get_type_ids())?, e.get_ids().len()))
-    }
-
-    pub fn device(&self) -> Device {
-        self.enc.device()
+    /// The HF tokenizer of `tokenizer.ggml.*`, truncating at `max_len`.
+    pub fn tokenizer(&self, max_len: usize) -> Result<tokenizers::Tokenizer, String> {
+        tokenizer(&self.0, max_len)
     }
 }
 
@@ -291,7 +262,7 @@ fn tokenizer(kv: &HashMap<String, Kv>, max_len: usize) -> Result<tokenizers::Tok
 
 /// `general.architecture` of `repo_id`'s GGUF weights: the cached file's header, else the Hub's
 /// `gguf` metadata. `None` when the repo has no GGUF.
-pub(super) fn hub_gguf_arch(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
+pub fn hub_arch(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
     if let Some(p) = hub
         .locate_model(repo_id)
         .weights_path

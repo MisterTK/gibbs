@@ -1,21 +1,7 @@
-//! SetFit repos (`config_setfit.json`): a sentence-transformers body (BERT encoder → pooling per
-//! `1_Pooling/config.json` → optional `Normalize`) feeding the scikit-learn `LogisticRegression`
-//! head pickled by joblib in `model_head.pkl`. Scores are sklearn `predict_proba`.
-
-use super::{load_tokenizer, read_json, Activation, Body, SequenceClassifier};
-use crate::hardware::Device;
-use crate::model::hub::HuggingFaceHub;
-use crate::runtime::encoder::SpecEncoder;
-use serde_json::Value;
+//! The scikit-learn `LogisticRegression` head a SetFit repo pickles with joblib in
+//! `model_head.pkl`, read by a minimal pickle VM and evaluated as its `predict_proba`.
 
 const LOGISTIC: &str = "sklearn.linear_model._logistic.LogisticRegression";
-
-pub(super) struct SetFit {
-    /// The body pooled (and normalised) in its graph: `embedding` [h].
-    enc: SpecEncoder,
-    tok: tokenizers::Tokenizer,
-    head: Logistic,
-}
 
 /// sklearn `LogisticRegression` as `predict_proba` evaluates it.
 pub(super) struct Logistic {
@@ -64,146 +50,13 @@ impl Logistic {
     }
 }
 
-impl SequenceClassifier {
-    /// Loads a SetFit repo (BERT-family body + sklearn LogisticRegression head) on `device`.
-    pub fn from_setfit(
-        hub: &HuggingFaceHub,
-        repo_id: &str,
-        device: Device,
-    ) -> Result<Self, String> {
-        let err = |e: String| format!("{repo_id}: {e}");
-        let setfit = read_json(&hub.fetch_file(repo_id, "config_setfit.json")?)?;
-        let cfg = read_json(&hub.fetch_file(repo_id, "config.json")?)?;
-        let arch = cfg["architectures"][0].as_str().unwrap_or("").to_string();
-        if arch != "BertModel" {
-            return Err(err(format!(
-                "SetFit body '{arch}' is not supported (supported: BertModel)"
-            )));
-        }
-
-        // modules.json: Transformer, Pooling, optional Normalize; nothing else.
-        let modules = read_json(&hub.fetch_file(repo_id, "modules.json")?)?;
-        let mut pool_dir = None;
-        let mut normalize = setfit["normalize_embeddings"].as_bool().unwrap_or(false);
-        for (i, m) in modules
-            .as_array()
-            .ok_or("modules.json is not a list")?
-            .iter()
-            .enumerate()
-        {
-            let ty = m["type"].as_str().unwrap_or("");
-            match (i, ty.rsplit('.').next().unwrap_or("")) {
-                (0, "Transformer") if m["path"].as_str().unwrap_or("").is_empty() => {}
-                (1, "Pooling") => pool_dir = m["path"].as_str().map(str::to_string),
-                (2, "Normalize") => normalize = true,
-                _ => {
-                    return Err(err(format!(
-                        "sentence-transformers module {i} '{ty}' is not supported"
-                    )))
-                }
-            }
-        }
-        let pool_dir = pool_dir.ok_or_else(|| err("modules.json has no Pooling module".into()))?;
-        let pc = read_json(&hub.fetch_file(repo_id, &format!("{pool_dir}/config.json"))?)?;
-        // The encoder spec's pooling head: `mean` | `cls` | `max`, `_l2` when normalised.
-        let pool = match pc["pooling_mode"].as_str() {
-            Some(m @ ("mean" | "cls" | "max")) => m,
-            Some(other) => return Err(err(format!("pooling_mode '{other}' is not supported"))),
-            None => {
-                let on = |k: &str| pc[k].as_bool() == Some(true);
-                let modes = [
-                    "pooling_mode_cls_token",
-                    "pooling_mode_mean_tokens",
-                    "pooling_mode_max_tokens",
-                    "pooling_mode_mean_sqrt_len_tokens",
-                    "pooling_mode_weightedmean_tokens",
-                    "pooling_mode_lasttoken",
-                ];
-                match modes.map(on) {
-                    [true, false, false, false, false, false] => "cls",
-                    [false, true, false, false, false, false] => "mean",
-                    [false, false, true, false, false, false] => "max",
-                    _ => return Err(err(format!("pooling config {pc} is not supported"))),
-                }
-            }
-        };
-        let head_kind = if normalize { format!("{pool}_l2") } else { pool.to_string() };
-        let token = std::env::var("HF_TOKEN").ok();
-        let art = hub.auto_download_and_cache(repo_id, token.as_deref())?;
-        let enc = SpecEncoder::load(&art, Some("bert"), device, &head_kind).map_err(err)?;
-        let hidden = enc.var("hidden")?;
-
-        let sbert = hub
-            .fetch_file(repo_id, "sentence_bert_config.json")
-            .ok()
-            .map(|p| read_json(&p))
-            .transpose()?
-            .unwrap_or(Value::Null);
-        let max = enc.capacity()?;
-        let capacity = sbert["max_seq_length"]
-            .as_u64()
-            .map_or(max, |m| (m as usize).min(max));
-        let tok_cfg = hub
-            .fetch_file(repo_id, "tokenizer_config.json")
-            .ok()
-            .map(|p| read_json(&p))
-            .transpose()?
-            .unwrap_or(Value::Null);
-        let tok = load_tokenizer(hub, repo_id, &arch, &tok_cfg, capacity)?;
-
-        let pkl = std::fs::read(hub.fetch_file(repo_id, "model_head.pkl")?)
-            .map_err(|e| err(format!("model_head.pkl: {e}")))?;
-        let (head, classes) = read_head(&pkl, hidden).map_err(err)?;
-        let names: Vec<String> = setfit["labels"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let labels = classes
-            .into_iter()
-            .map(|c| match c {
-                Class::Int(i) if !names.is_empty() => names
-                    .get(i as usize)
-                    .cloned()
-                    .ok_or_else(|| err(format!("class {i} has no entry in config_setfit labels"))),
-                Class::Int(i) => Ok(i.to_string()),
-                Class::Str(s) => Ok(s),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(Self {
-            repo_id: repo_id.to_string(),
-            architecture: format!("SetFit ({arch} + LogisticRegression)"),
-            labels,
-            activation: Activation::Identity,
-            body: Body::SetFit(SetFit { enc, tok, head }),
-        })
-    }
-}
-
-impl SetFit {
-    pub(super) fn device(&self) -> Device {
-        self.enc.device()
-    }
-
-    /// sklearn `predict_proba` of the sentence embedding of `text`, in `classes_` order.
-    pub(super) fn proba(&self, text: &str) -> Result<(Vec<f32>, usize), String> {
-        let e = super::encode(&self.tok, text, None)?;
-        let emb = self.enc.run(e.get_ids(), e.get_type_ids())?;
-        Ok((self.head.proba(&emb), e.get_ids().len()))
-    }
-}
-
-enum Class {
+pub(super) enum Class {
     Int(i64),
     Str(String),
 }
 
 /// The LogisticRegression in a joblib `model_head.pkl` and its `classes_`.
-fn read_head(pkl: &[u8], features: usize) -> Result<(Logistic, Vec<Class>), String> {
+pub(super) fn read_head(pkl: &[u8], features: usize) -> Result<(Logistic, Vec<Class>), String> {
     let mut p = Pickle::new(pkl);
     let loaded = p.load();
     // The first global a pickle names is the class of the pickled head.

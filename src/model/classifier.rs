@@ -1,9 +1,8 @@
-//! Hugging Face sequence classifiers (`text-classification` / `text-ranking` repos). Encoders
-//! (BERT, RoBERTa, XLM-RoBERTa, CamemBERT, DistilBERT, ELECTRA, ALBERT, DeBERTa v1/v2/v3,
-//! ModernBERT, llama.cpp BERT GGUFs, SetFit bodies) run their family spec through
-//! `runtime::encoder`; Llama/Qwen2/GPT-NeoX (GraphLm body), Qwen3/Qwen3.5, Gemma 3/Gemma 4 and
-//! GPT-2/OPT (`ln_decoder`) decoders are scored on their last non-pad token. One forward pass
-//! per input; scores follow `config.json` (`problem_type`, `id2label`).
+//! Hugging Face sequence classifiers (`text-classification` / `text-ranking` repos), one type for
+//! the server and the TUI. Encoders (every family whose spec has `pipeline: encoder`, SetFit and
+//! GGUF classifier exports) run on `runtime::encoder`; fastText models on `runtime::bag`;
+//! decoder `*ForSequenceClassification` bodies (legacy: until Phases 4-6) are scored on their last
+//! non-pad token.
 
 #[cfg(test)]
 mod gpu_tests;
@@ -12,7 +11,6 @@ pub(crate) mod synth;
 pub mod ln_decoder;
 pub(crate) mod decoder_gpu;
 pub use decoder_gpu::gpu_fixture;
-mod spm;
 
 use crate::hardware::{Device, QuantFormat, QuantMode};
 use crate::model::hf_loader::ChatMessage;
@@ -22,30 +20,15 @@ use crate::model::loaders::{read_checkpoint, SafetensorsWeightReader, WeightRead
 use crate::model::nn;
 use crate::model::graph_lm::GraphLm;
 use crate::model::{ModelManifest, UniversalModelLoader};
+use crate::runtime::encoder::{self, is_generator, read_json, Activation, LabelScore};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
-use crate::runtime::encoder::SpecEncoder;
 
-mod setfit;
-
-mod gguf;
-pub use gguf::GgufClassifier;
-
-/// `architectures[0]` values this module runs.
-pub const ARCHITECTURES: &[&str] = &[
-    "BertForSequenceClassification",
-    "RobertaForSequenceClassification",
-    "XLMRobertaForSequenceClassification",
-    "CamembertForSequenceClassification",
-    "DistilBertForSequenceClassification",
-    "ElectraForSequenceClassification",
-    "AlbertForSequenceClassification",
-    "DebertaForSequenceClassification",
-    "DebertaV2ForSequenceClassification",
+/// Decoder `architectures[0]` values the legacy decoder bodies run (legacy: until Phases 4-6).
+const DECODER_ARCHITECTURES: &[&str] = &[
     "LlamaForSequenceClassification",
     "Qwen2ForSequenceClassification",
-    "ModernBertForSequenceClassification",
     "GPT2ForSequenceClassification",
     "OPTForSequenceClassification",
     "GPTNeoXForSequenceClassification",
@@ -55,6 +38,11 @@ pub const ARCHITECTURES: &[&str] = &[
     "Gemma4ForSequenceClassification",
     "Gemma3TextForSequenceClassification",
 ];
+
+/// Whether `arch` (`architectures[0]`) loads as a sequence classifier.
+pub fn runs_architecture(arch: &str) -> bool {
+    DECODER_ARCHITECTURES.contains(&arch) || encoder::classifier_architectures().iter().any(|a| a == arch)
+}
 
 /// The classifier the engine serves, shared by the HTTP server and the TUI. `Some` makes it the
 /// active model: text generation answers 400 until an LLM is loaded again.
@@ -71,24 +59,6 @@ pub fn split_pair(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// How logits become scores (the HF `problem_type`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Activation {
-    /// single_label_classification: probabilities over the labels.
-    Softmax,
-    /// multi_label_classification: an independent probability per label.
-    Sigmoid,
-    /// regression, or one label without a problem_type (rerankers, reward models): raw logits.
-    Identity,
-}
-
-/// One label and its score.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LabelScore {
-    pub label: String,
-    pub score: f32,
-}
-
 /// A loaded sequence classifier.
 pub struct SequenceClassifier {
     pub repo_id: String,
@@ -99,11 +69,8 @@ pub struct SequenceClassifier {
 }
 
 enum Body {
-    /// An encoder family spec (`runtime::encoder`): `classify` logits of one sequence.
-    Spec {
-        enc: SpecEncoder,
-        tok: tokenizers::Tokenizer,
-    },
+    /// An encoder family spec (`runtime::encoder`).
+    Encoder(encoder::Classifier),
     /// Causal LM scored by `score` on the final hidden state of its last non-pad token.
     Decoder {
         llm: Box<dyn DecoderBackbone>,
@@ -115,10 +82,6 @@ enum Body {
         /// Metal: `llm` scores on the GPU (`score_gpu`); `score` stays for the label count.
         gpu: bool,
     },
-    /// SetFit: sentence embedding → sklearn LogisticRegression (`predict_proba` scores).
-    SetFit(setfit::SetFit),
-    /// llama.cpp BERT-family GGUF with a `cls.output` head.
-    Gguf(GgufClassifier),
     /// fastText supervised model on the bag runtime: `predict` already returns probabilities.
     FastText(crate::runtime::bag::BagClassifier),
 }
@@ -226,9 +189,14 @@ pub fn detect(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
     if arch.is_some_and(is_generator) {
         return None;
     }
-    // No config.json: a llama.cpp BERT-family GGUF classifier/reranker export, or a fastText model.
-    if config.is_none() && gguf::hub_gguf_arch(hub, repo_id).as_deref() == Some("bert") {
-        return Some("GGUF bert classifier".into());
+    // No config.json: a GGUF classifier/reranker export an encoder family claims, or fastText.
+    if let Some(a) = config
+        .is_none()
+        .then(|| crate::model::gguf_meta::hub_arch(hub, repo_id))
+        .flatten()
+        .filter(|a| encoder::gguf_family(a).is_some())
+    {
+        return Some(format!("GGUF {a} classifier"));
     }
     if cfg
         .as_ref()
@@ -242,13 +210,6 @@ pub fn detect(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
     }
     let adapter = read_json(&hub.fetch_file(repo_id, "adapter_config.json").ok()?).ok()?;
     (adapter["task_type"] == "SEQ_CLS").then(|| "PEFT LoRA (SEQ_CLS)".to_string())
-}
-
-/// Text generators: `*ForCausalLM`, `*ForConditionalGeneration`, `*LMHeadModel`.
-pub fn is_generator(arch: &str) -> bool {
-    ["ForCausalLM", "ForConditionalGeneration", "LMHeadModel"]
-        .iter()
-        .any(|s| arch.ends_with(s))
 }
 
 /// transformers `model_type`s whose base classes (`<Family>Model`, `...ForMaskedLM`) are plain
@@ -330,7 +291,7 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
         });
     }
     if let Some(a) = arch {
-        if ARCHITECTURES.contains(&a) || files.contains(&"config_setfit.json") {
+        if runs_architecture(a) || files.contains(&"config_setfit.json") {
             return Some(Ok(()));
         }
         if is_generator(a) {
@@ -435,15 +396,16 @@ pub fn architecture_in(path: &Path) -> Option<String> {
 
 impl SequenceClassifier {
     /// Fetches config.json, the tokenizer files, and the weights of `repo_id`, and builds the
-    /// classifier on `device`. BERT-family encoders run on the CPU or Metal; DeBERTa and decoder
-    /// classifiers on the CPU only.
+    /// classifier on `device`.
     pub fn load(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
-        let resolved = resolve_config(hub, repo_id);
-        // SetFit: a sentence-transformers body (`BertModel`) + a scikit-learn head.
+        let resolved = encoder::resolve_config(hub, repo_id);
+        // SetFit: a sentence-transformers body + a scikit-learn head.
         if resolved.is_err() && hub.fetch_file(repo_id, "config_setfit.json").is_ok() {
             return Self::from_setfit(hub, repo_id, device);
         }
-        if resolved.is_err() && gguf::hub_gguf_arch(hub, repo_id).as_deref() == Some("bert") {
+        if resolved.is_err()
+            && crate::model::gguf_meta::hub_arch(hub, repo_id).is_some_and(|a| encoder::gguf_family(&a).is_some())
+        {
             let token = std::env::var("HF_TOKEN").ok();
             let art = hub.auto_download_and_cache(repo_id, token.as_deref())?;
             let path = art
@@ -464,32 +426,32 @@ impl SequenceClassifier {
                 return Self::from_fasttext(repo_id, &hub.fetch_file(repo_id, &file)?);
             }
         }
-        let (cfg, arch, peft) = resolved?;
+        let r = resolved?;
+        if encoder::family(&r.cfg, Some(&r.arch)).is_some() {
+            let (m, c) = encoder::Classifier::from_hf(hub, repo_id, r, device)?;
+            return Ok(Self::encoder(repo_id, m, c));
+        }
+        let (cfg, arch, peft) = (r.cfg, r.arch, r.peft);
         if arch.starts_with("Qwen3Moe") {
             return Err(format!(
                 "{repo_id}: {arch} is not supported: mixture-of-experts decoder layers (routed expert MLPs) are not implemented"
             ));
         }
-        if !ARCHITECTURES.contains(&arch.as_str()) {
+        if !DECODER_ARCHITECTURES.contains(&arch.as_str()) {
             if !cfg["auto_map"].is_null() {
                 return Err(format!(
                     "{repo_id}: custom architecture '{arch}' (remote code)"
                 ));
             }
-            return Err(format!(
-                "{repo_id}: {arch} is not supported (supported: {})",
-                ARCHITECTURES.join(", ")
-            ));
+            let mut all = encoder::classifier_architectures();
+            all.extend(DECODER_ARCHITECTURES.iter().map(|a| a.to_string()));
+            return Err(format!("{repo_id}: {arch} is not supported (supported: {})", all.join(", ")));
         }
-        // A PEFT adapter reads its base model's tokenizer unless it ships one.
-        let tok_repo = match &peft {
-            Some((base, _)) if hub.fetch_file(repo_id, "tokenizer.json").is_err() => base.as_str(),
-            _ => repo_id,
-        };
         let pad_id = cfg["pad_token_id"].as_u64().map(|v| v as u32);
 
-        let body = if is_decoder(&arch) {
-            // No `cpu_only` gate: Metal gets the GPU seq-cls program (`decoder_gpu`).
+        let body = {
+            // Decoders read their own checkpoint formats; no `cpu_only` gate: Metal gets the GPU
+            // seq-cls program (`decoder_gpu`).
             if peft.is_some() {
                 // ponytail: LoRA merges into the f32 encoder checkpoints only; decoder bodies load
                 // through their own readers (merge there when a decoder SEQ_CLS adapter matters).
@@ -558,24 +520,10 @@ impl SequenceClassifier {
                 concat_pair: cfg["sentence_transformers"].is_object(),
                 gpu,
             }
-        } else {
-            let tok_cfg = hub
-                .fetch_file(tok_repo, "tokenizer_config.json")
-                .ok()
-                .map(|p| read_json(&p))
-                .transpose()?
-                .unwrap_or(Value::Null);
-            let enc = spec_encoder(hub, repo_id, &cfg, &arch, peft.is_some(), device)?;
-            let tok = load_tokenizer(hub, tok_repo, &arch, &tok_cfg, enc.capacity()?)?;
-            Body::Spec { enc, tok }
         };
-
         let n = match &body {
-            Body::Spec { enc, .. } => enc.var("labels")?,
             Body::Decoder { score, .. } => score.out_f,
-            Body::SetFit(_) | Body::Gguf(_) | Body::FastText(_) => {
-                unreachable!("SetFit, GGUF and fastText repos load through their constructors")
-            }
+            Body::Encoder(_) | Body::FastText(_) => unreachable!("encoder and fastText repos load above"),
         };
         let labels = (0..n)
             .map(|i| {
@@ -584,14 +532,29 @@ impl SequenceClassifier {
                     .map_or_else(|| format!("LABEL_{i}"), str::to_string)
             })
             .collect();
-        let activation = activation_of(&cfg, n);
         Ok(Self {
             repo_id: repo_id.to_string(),
             architecture: arch,
             labels,
-            activation,
+            activation: Activation::of(&cfg, n),
             body,
         })
+    }
+
+    fn encoder(repo_id: &str, m: encoder::Meta, c: encoder::Classifier) -> Self {
+        Self {
+            repo_id: repo_id.to_string(),
+            architecture: m.architecture,
+            labels: m.labels,
+            activation: m.activation,
+            body: Body::Encoder(c),
+        }
+    }
+
+    /// A SetFit repo: a sentence-transformers encoder body + a scikit-learn LogisticRegression.
+    pub fn from_setfit(hub: &HuggingFaceHub, repo_id: &str, device: Device) -> Result<Self, String> {
+        let (m, c) = encoder::Classifier::from_sentence_transformers(hub, repo_id, device)?;
+        Ok(Self::encoder(repo_id, m, c))
     }
 
     /// A fastText `.bin`/`.ftz` classifier, or (when `path` is a directory) a fastText
@@ -618,32 +581,19 @@ impl SequenceClassifier {
         })
     }
 
-    /// A llama.cpp BERT/XLM-R classifier or reranker GGUF at `path`: labels from
-    /// `<arch>.classifier.output_labels`; one logit is a raw score, more are softmaxed.
+    /// A GGUF classifier or reranker export at `path`.
     pub fn from_gguf(repo_id: &str, path: &Path, device: Device) -> Result<Self, String> {
-        let g = GgufClassifier::load(path, device)?;
-        Ok(Self {
-            repo_id: repo_id.to_string(),
-            architecture: "GGUF bert classifier".into(),
-            labels: g.labels.clone(),
-            activation: if g.labels.len() == 1 {
-                Activation::Identity
-            } else {
-                Activation::Softmax
-            },
-            body: Body::Gguf(g),
-        })
+        let (m, c) = encoder::Classifier::from_gguf(path, device)?;
+        Ok(Self::encoder(repo_id, m, c))
     }
 
     /// Where the body runs.
     pub fn device(&self) -> Device {
         match &self.body {
-            Body::Spec { enc, .. } => enc.device(),
-            Body::SetFit(s) => s.device(),
-            Body::Gguf(g) => g.device(),
+            Body::Encoder(c) => c.device(),
             Body::FastText(b) => b.device(),
             Body::Decoder { gpu: true, .. } => Device::Metal,
-            _ => Device::Cpu,
+            Body::Decoder { .. } => Device::Cpu,
         }
     }
 
@@ -672,11 +622,7 @@ impl SequenceClassifier {
         pair: Option<&str>,
     ) -> Result<(Vec<LabelScore>, usize), String> {
         let (logits, n) = match &self.body {
-            Body::Spec { enc, tok } => {
-                let e = encode(tok, text, pair)?;
-                (enc.run(e.get_ids(), e.get_type_ids())?, e.get_ids().len())
-            }
-            Body::Gguf(g) => g.logits(text, pair)?,
+            Body::Encoder(c) => c.logits(text, pair)?,
             Body::FastText(_) if pair.is_some() => {
                 return Err("fastText classifiers take a single text, not a pair".into())
             }
@@ -716,192 +662,9 @@ impl SequenceClassifier {
                 };
                 (logits, ids.len())
             }
-            Body::SetFit(_) if pair.is_some() => {
-                return Err("SetFit classifiers take a single text, not a pair".into())
-            }
-            Body::SetFit(s) => s.proba(text)?,
         };
-        let scores = match self.activation {
-            Activation::Softmax => {
-                let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let e: Vec<f32> = logits.iter().map(|v| (v - m).exp()).collect();
-                let s: f32 = e.iter().sum();
-                e.into_iter().map(|v| v / s).collect()
-            }
-            Activation::Sigmoid => logits.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect(),
-            Activation::Identity => logits,
-        };
-        let mut out: Vec<LabelScore> = self
-            .labels
-            .iter()
-            .zip(scores)
-            .map(|(l, score)| LabelScore {
-                label: l.clone(),
-                score,
-            })
-            .collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score));
-        Ok((out, n))
+        Ok((encoder::label_scores(&self.labels, self.activation, logits), n))
     }
-}
-
-/// The encoder spec of classifier `repo_id` on `device`. A PEFT adapter is merged into its base
-/// once (`peft::prepare_seq_cls`) and its resolved `cfg` (classification architecture, labels)
-/// written beside the merged weights.
-fn spec_encoder(
-    hub: &HuggingFaceHub,
-    repo_id: &str,
-    cfg: &Value,
-    arch: &str,
-    peft: bool,
-    device: Device,
-) -> Result<SpecEncoder, String> {
-    let token = std::env::var("HF_TOKEN").ok();
-    if peft {
-        crate::model::peft::prepare_seq_cls(hub, repo_id, token.as_deref())?;
-    }
-    let mut a = hub.auto_download_and_cache(repo_id, token.as_deref())?;
-    if peft {
-        let dir = a
-            .weights_path
-            .as_deref()
-            .and_then(Path::parent)
-            .ok_or_else(|| format!("{repo_id}: no merged snapshot"))?;
-        let path = dir.join("config.json");
-        let mut cfg = cfg.clone();
-        // The base names its own class (`BertModel`, `...ForMaskedLM`); the spec matches the
-        // classification architecture.
-        cfg["architectures"] = serde_json::json!([arch]);
-        std::fs::write(&path, cfg.to_string()).map_err(|e| format!("{}: {e}", path.display()))?;
-        a.config_path = Some(path);
-    }
-    SpecEncoder::load(&a, None, device, "classify").map_err(|e| format!("{repo_id}: {e}"))
-}
-
-/// config.json and the `*ForSequenceClassification` architecture to build. A PEFT LoRA adapter
-/// repo (`adapter_config.json`, task `SEQ_CLS`) resolves to its base model's config with the
-/// adapter repo's labels, and returns (base repo, adapter config).
-fn resolve_config(
-    hub: &HuggingFaceHub,
-    repo_id: &str,
-) -> Result<(Value, String, Option<(String, Value)>), String> {
-    let own = hub
-        .fetch_file(repo_id, "config.json")
-        .and_then(|p| read_json(&p));
-    let own_arch = own
-        .as_ref()
-        .ok()
-        .and_then(|c| c["architectures"][0].as_str())
-        .map(str::to_string);
-    if let (Ok(cfg), Some(a)) = (&own, &own_arch) {
-        if a.ends_with("ForSequenceClassification") {
-            return Ok((cfg.clone(), a.clone(), None));
-        }
-    }
-    let Ok(ad) = hub
-        .fetch_file(repo_id, "adapter_config.json")
-        .and_then(|p| read_json(&p))
-    else {
-        return match own {
-            Err(e) => Err(e),
-            Ok(cfg) => Err(match (&own_arch, cfg["auto_map"].is_null()) {
-                (Some(a), false) => format!("{repo_id}: custom architecture '{a}' (remote code)"),
-                (Some(a), true) => format!("{repo_id}: {a} has no sequence-classification head"),
-                (None, _) => format!("{repo_id}: config.json names no architecture"),
-            }),
-        };
-    };
-    let task = ad["task_type"].as_str().unwrap_or("none");
-    let kind = ad["peft_type"].as_str().unwrap_or("none");
-    if kind != "LORA" || task != "SEQ_CLS" {
-        return Err(format!(
-            "{repo_id}: PEFT {kind} adapter for task {task}; only LORA SEQ_CLS adapters classify"
-        ));
-    }
-    if ad["use_dora"] == true
-        || ad["fan_in_fan_out"] == true
-        || ad["rank_pattern"]
-            .as_object()
-            .is_some_and(|m| !m.is_empty())
-        || ad["alpha_pattern"]
-            .as_object()
-            .is_some_and(|m| !m.is_empty())
-    {
-        return Err(format!(
-            "{repo_id}: LoRA variant not supported (DoRA, fan_in_fan_out or per-module rank/alpha)"
-        ));
-    }
-    let base = ad["base_model_name_or_path"]
-        .as_str()
-        .filter(|b| b.split('/').count() == 2 && !b.starts_with('.'))
-        .ok_or_else(|| {
-            format!(
-                "{repo_id}: adapter base_model_name_or_path {} is not a Hub repo",
-                ad["base_model_name_or_path"]
-            )
-        })?
-        .to_string();
-    let mut cfg = read_json(&hub.fetch_file(&base, "config.json")?)?;
-    let base_arch = cfg["architectures"][0]
-        .as_str()
-        .ok_or_else(|| format!("{base}: config.json names no architecture"))?;
-    let family = [
-        "ForSequenceClassification",
-        "ForMaskedLM",
-        "ForPreTraining",
-        "ForCausalLM",
-        "Model",
-    ]
-    .iter()
-    .find_map(|s| base_arch.strip_suffix(s))
-    .unwrap_or(base_arch);
-    let arch = format!("{family}ForSequenceClassification");
-    // Labels and scoring of the fine-tune live in the adapter repo's config.json, when it has one.
-    if let Ok(own) = &own {
-        for k in ["id2label", "label2id", "problem_type"] {
-            if !own[k].is_null() {
-                cfg[k] = own[k].clone();
-            }
-        }
-    }
-    Ok((cfg, arch, Some((base, ad))))
-}
-
-/// Decoder `*ForSequenceClassification` architectures (scored on the last non-pad token).
-fn is_decoder(arch: &str) -> bool {
-    [
-        "Llama",
-        "Qwen2",
-        "Qwen3",
-        "GPT2",
-        "OPT",
-        "GPTNeoX",
-        "Gemma4",
-        "Gemma3Text",
-    ]
-    .iter()
-    .any(|p| arch.starts_with(p))
-}
-
-fn read_json(p: &Path) -> Result<Value, String> {
-    let bytes = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", p.display()))
-}
-
-fn encode(
-    tok: &tokenizers::Tokenizer,
-    text: &str,
-    pair: Option<&str>,
-) -> Result<tokenizers::Encoding, String> {
-    let e = match pair {
-        Some(p) => tok.encode((text, p), true),
-        None => tok.encode(text, true),
-    }
-    .map_err(|e| format!("tokenize: {e}"))?;
-    if e.get_ids().is_empty() {
-        return Err("tokenizer produced no tokens".into());
-    }
-    Ok(e)
 }
 
 /// `score.weight` of a decoder checkpoint, read while the f32 body is already resident, so only
@@ -992,134 +755,6 @@ impl Checkpoint {
     }
 }
 
-/// tokenizer.json, else the slow-tokenizer files (BERT `vocab.txt`, RoBERTa / DeBERTa v1
-/// `vocab.json` + `merges.txt`, ALBERT / CamemBERT SentencePiece models) rebuilt as the fast
-/// tokenizer HF converts them to. Truncates to `tokenizer_config.json`'s `model_max_length`, at
-/// most `capacity` tokens; never pads.
-fn load_tokenizer(
-    hub: &HuggingFaceHub,
-    repo_id: &str,
-    arch: &str,
-    tok_cfg: &Value,
-    capacity: usize,
-) -> Result<tokenizers::Tokenizer, String> {
-    use tokenizers::AddedToken;
-    let mut tok = match hub.fetch_file(repo_id, "tokenizer.json") {
-        Ok(p) => tokenizers::Tokenizer::from_file(&p)
-            .map_err(|e| format!("load {}: {e}", p.display()))?,
-        Err(json_err) if arch.starts_with("Bert") || arch.starts_with("DistilBert") => {
-            let vocab = hub.fetch_file(repo_id, "vocab.txt").map_err(|e| {
-                format!("{repo_id}: no tokenizer.json ({json_err}) or vocab.txt ({e})")
-            })?;
-            let wp = tokenizers::models::wordpiece::WordPiece::from_file(&vocab.to_string_lossy())
-                .unk_token("[UNK]".into())
-                .build()
-                .map_err(|e| format!("{}: {e}", vocab.display()))?;
-            let mut t = tokenizers::Tokenizer::new(wp);
-            let lower = tok_cfg["do_lower_case"].as_bool().unwrap_or(true);
-            t.with_normalizer(Some(tokenizers::normalizers::BertNormalizer::new(
-                true, true, None, lower,
-            )));
-            t.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::bert::BertPreTokenizer));
-            let id = |s: &str| {
-                t.token_to_id(s)
-                    .ok_or_else(|| format!("{repo_id}: vocab.txt has no {s}"))
-            };
-            let (cls, sep) = (id("[CLS]")?, id("[SEP]")?);
-            t.with_post_processor(Some(tokenizers::processors::bert::BertProcessing::new(
-                ("[SEP]".into(), sep),
-                ("[CLS]".into(), cls),
-            )));
-            let specials: Vec<AddedToken> = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
-                .iter()
-                .map(|s| AddedToken::from(*s, true))
-                .collect();
-            t.add_special_tokens(&specials);
-            t
-        }
-        Err(json_err) if arch.starts_with("Albert") || arch.starts_with("Camembert") => {
-            let file = if arch.starts_with("Albert") {
-                "spiece.model"
-            } else {
-                "sentencepiece.bpe.model"
-            };
-            let model = hub.fetch_file(repo_id, file).map_err(|e| {
-                format!("{repo_id}: no tokenizer.json ({json_err}) or {file} ({e})")
-            })?;
-            spm::tokenizer(&model, arch, tok_cfg)?
-        }
-        Err(json_err) if arch.contains("Roberta") || arch.starts_with("DebertaFor") => {
-            let deberta = arch.starts_with("DebertaFor");
-            let missing = |f: &str, e: String| {
-                format!("{repo_id}: no tokenizer.json ({json_err}) or {f} ({e})")
-            };
-            let vocab = hub
-                .fetch_file(repo_id, "vocab.json")
-                .map_err(|e| missing("vocab.json", e))?;
-            let merges = hub
-                .fetch_file(repo_id, "merges.txt")
-                .map_err(|e| missing("merges.txt", e))?;
-            let bpe = tokenizers::models::bpe::BPE::from_file(
-                &vocab.to_string_lossy(),
-                &merges.to_string_lossy(),
-            )
-            .build()
-            .map_err(|e| format!("{}: {e}", vocab.display()))?;
-            let mut t = tokenizers::Tokenizer::new(bpe);
-            let prefix = tok_cfg["add_prefix_space"].as_bool().unwrap_or(false);
-            t.with_pre_tokenizer(Some(
-                tokenizers::pre_tokenizers::byte_level::ByteLevel::new(prefix, true, true),
-            ));
-            let id = |s: &str| {
-                t.token_to_id(s)
-                    .ok_or_else(|| format!("{repo_id}: vocab.json has no {s}"))
-            };
-            let (cls_s, sep_s, specials) = if deberta {
-                (
-                    "[CLS]",
-                    "[SEP]",
-                    ["[PAD]", "[CLS]", "[SEP]", "[UNK]", "[MASK]"],
-                )
-            } else {
-                ("<s>", "</s>", ["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
-            };
-            let (cls, sep) = (id(cls_s)?, id(sep_s)?);
-            if deberta {
-                // DebertaConverter: `[CLS] A [SEP] B [SEP]` with segment ids 0/1.
-                t.with_post_processor(Some(tokenizers::processors::bert::BertProcessing::new(
-                    (sep_s.into(), sep),
-                    (cls_s.into(), cls),
-                )));
-            } else {
-                t.with_post_processor(Some(
-                    tokenizers::processors::roberta::RobertaProcessing::new(
-                        (sep_s.into(), sep),
-                        (cls_s.into(), cls),
-                    )
-                    .add_prefix_space(prefix),
-                ));
-            }
-            let specials: Vec<AddedToken> = specials
-                .iter()
-                .map(|s| AddedToken::from(*s, true))
-                .collect();
-            t.add_special_tokens(&specials);
-            t
-        }
-        Err(e) => return Err(format!("{repo_id}: no tokenizer.json ({e})")),
-    };
-    let max_length = tok_cfg["model_max_length"]
-        .as_f64()
-        .map_or(capacity, |m| (m as usize).min(capacity));
-    tok.with_truncation(Some(tokenizers::TruncationParams {
-        max_length,
-        ..Default::default()
-    }))
-    .map_err(|e| format!("tokenizer truncation: {e}"))?;
-    tok.with_padding(None);
-    Ok(tok)
-}
-
 /// A linear layer in PyTorch layout `[out_f, in_f]`.
 struct Lin {
     w: Vec<f32>,
@@ -1133,19 +768,3 @@ impl Lin {
         nn::linear(x, rows, &self.w, self.b.as_deref(), self.in_f, self.out_f)
     }
 }
-
-/// How `config.json` (`problem_type`, label count) turns logits into scores.
-fn activation_of(cfg: &Value, n: usize) -> Activation {
-    match cfg["problem_type"].as_str() {
-        Some("multi_label_classification") => Activation::Sigmoid,
-        Some("regression") => Activation::Identity,
-        Some("single_label_classification") => Activation::Softmax,
-        _ if n == 1 => Activation::Identity,
-        _ => Activation::Softmax,
-    }
-}
-
-
-
-
-

@@ -454,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut weights = None;
     let mut drafter = None;
     let classifier_slot = ClassifierSlot::default();
-    let jev_slot = gibbs_engine::model::jev::System1Slot::default();
+    let jev_slot = gibbs_engine::runtime::encoder::system1::System1Slot::default();
     let model_exec = match loaded {
         Loaded::Video(Video::Ltx(plan)) => return run_ltx(&cli, &hub, &plan).map_err(Into::into),
         Loaded::Video(Video::ModelScope) => {
@@ -537,11 +537,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .split_once('|')
                         .map(|(q, o)| (q.trim(), o))
                         .unwrap_or((prompt.as_str(), ""));
-                    let options: Vec<gibbs_engine::model::jev::ChoiceOption> = opts
+                    let options: Vec<gibbs_engine::runtime::encoder::system1::ChoiceOption> = opts
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|s| gibbs_engine::model::jev::ChoiceOption::new(s, None::<String>))
+                        .map(|s| gibbs_engine::runtime::encoder::system1::ChoiceOption::new(s, None::<String>))
                         .collect();
                     let decision = jev
                         .embed(query)

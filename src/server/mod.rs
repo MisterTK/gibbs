@@ -8,7 +8,7 @@ mod openai;
 mod responses;
 pub mod tools;
 
-use crate::model::jev::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
+use crate::runtime::encoder::system1::{ChoiceOption, JevDecision, JevQuestion, JevSystem1Model};
 use crate::scheduler::ContinuousBatchScheduler;
 use crate::telemetry::EngineTelemetry;
 use axum::{
@@ -27,7 +27,7 @@ use std::time::Instant;
 pub struct AppState {
     pub scheduler: Arc<ContinuousBatchScheduler>,
     pub telemetry: Arc<EngineTelemetry>,
-    pub jev_model: crate::model::jev::System1Slot,
+    pub jev_model: crate::runtime::encoder::system1::System1Slot,
     /// Active image model (shared with the TUI, hot-swapped by its picker).
     pub image_model: crate::model::text_to_image::ImageSlot,
     /// Active sequence classifier (shared with the TUI); while set, text generation answers 400.

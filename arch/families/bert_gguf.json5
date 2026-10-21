@@ -31,9 +31,10 @@
     head_dim: "hidden // heads",
     eps: "gguf['attention.layer_norm_epsilon']",
     types: "len(shape('embeddings.token_type_embeddings.weight')) == 1 ? 1 : shape('embeddings.token_type_embeddings.weight')[0]",
-    labels: "shape('cls.output.weight')[0]",
+    labels: "has('cls.output.weight') ? shape('cls.output.weight')[0] : 0",
     max_position_embeddings: "shape('embeddings.position_embeddings.weight')[0]",
   },
+  checks: [{expr: "!has('cls.output.weight')", error: "GGUF has no classification head"}],
   transforms: [
     {tensor: "cls.output.weight", op: "reshape", args: {shape: [1, "shape('cls.output.weight')[0]"]},
      when: "has('cls.output.weight') && len(shape('cls.output.weight')) == 1"},

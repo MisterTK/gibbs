@@ -68,4 +68,9 @@
       outputs: [{name: "logits", when: "head == 'classify'"}, {name: "hidden", when: "head == 'hidden'"}],
     },
   },
+  // AlbertConverter, when a repo has no tokenizer.json.
+  runtime: {tokenizer: [
+    {kind: "unigram", model: "spiece.model", demote_number_comma: true, replace_quotes: true, strip_accents: true,
+      lowercase: true, cls: "[CLS]", sep: "[SEP]", pair: "{cls} $A {sep} $B:1 {sep}:1"},
+  ]},
 }

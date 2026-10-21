@@ -7,7 +7,7 @@ use super::Pipeline;
 use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
-use crate::model::jev::JevSystem1Model;
+use crate::runtime::encoder::system1::JevSystem1Model;
 use crate::model::text_to_image::{load_image_model, ImageGenerator};
 use crate::model::weight_format::{
     load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
@@ -85,13 +85,13 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             };
             JevSystem1Model::load(hub, id, dev).map(Loaded::System1)
         };
-        if o.system1_first && crate::model::jev::detect(hub, id) {
+        if o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
         if classifier::detect(hub, id).is_some() {
             return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
         }
-        if !o.system1_first && crate::model::jev::detect(hub, id) {
+        if !o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
         // legacy: until Phase 10 (video specs)
