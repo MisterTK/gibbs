@@ -1,6 +1,6 @@
 use clap::Parser;
 use gibbs_engine::arch::dispatch::{LoadOpts, Loaded};
-use gibbs_engine::hardware::{Device, HardwareCapability, QuantMode};
+use gibbs_engine::hardware::{Device, HardwareCapability};
 use gibbs_engine::kv::PagedKVPool;
 use gibbs_engine::model::classifier::{self, ClassifierSlot};
 use gibbs_engine::model::hub::{is_synthetic_model_id, HuggingFaceHub, StorageBackend};
@@ -8,7 +8,7 @@ use gibbs_engine::model::image::ImageBuffer;
 use gibbs_engine::model::load_log;
 use gibbs_engine::runtime::diffusion::{ImageGenerator, ImageRequest, ImageSlot};
 use gibbs_engine::model::weight_format::ReencodeConfig;
-use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler, ExecutableModel};
+use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler};
 use gibbs_engine::server::{create_router, AppState};
 use gibbs_engine::telemetry::EngineTelemetry;
 use gibbs_engine::tui::TuiApp;
@@ -34,8 +34,9 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     tui: bool,
 
-    /// Weight format override (uncompressed, f16, bf16, q8_0, nvfp4). Without it the engine measures the formats its kernels support on this host and
-    /// picks the fastest one that stays within its quality floor.
+    /// Store every weight matrix in this format (uncompressed, f16, bf16, q8_0, q4_0, q4_k_m,
+    /// q5_k_m, q6_k, nvfp4 = GGUF_NVFP4) instead of its checkpoint encoding. Without it weights
+    /// keep their checkpoint encoding or follow the re-encode policy (`--reencode`).
     #[arg(long)]
     quant: Option<String>,
 
@@ -152,18 +153,6 @@ fn clock_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64)
-}
-
-/// `--quant` spellings.
-fn parse_quant(s: &str) -> Result<QuantMode, String> {
-    Ok(match s.to_lowercase().as_str() {
-        "uncompressed" | "none" | "f32" | "fp32" => QuantMode::Uncompressed,
-        "f16" | "fp16" => QuantMode::F16,
-        "bf16" => QuantMode::BF16,
-        "q8_0" | "q8" | "int8" => QuantMode::Q8_0,
-        "nvfp4" | "nvfp4-ultra" | "fp4" => QuantMode::NVFP4Ultra,
-        other => return Err(format!("Unknown --quant '{other}'")),
-    })
 }
 
 /// One CLI text-to-video (with `--image`, image-to-video) generation of a video pipeline plan.
@@ -313,7 +302,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{line}");
     }
 
-    let quant_override = cli.quant.as_deref().map(parse_quant).transpose()?;
+    let quant_override = cli
+        .quant
+        .as_deref()
+        .map(gibbs_engine::model::weight_format::parse_quant)
+        .transpose()?;
 
     // 2. Initialize Memory Hierarchy and KV Pool
     let kv_pool = Arc::new(PagedKVPool::new(gibbs_engine::scheduler::ONE_SHOT_POOL_BLOCKS));
@@ -341,6 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.model, hub.storage
     ));
     let mut reencode = ReencodeConfig::resolve(cli.reencode.as_deref(), cli.reencode_max_kl)?;
+    reencode.force = quant_override;
     let t = telemetry.clone();
     reencode.log = Some(Arc::new(move |m: &str| t.log_info(m)));
     let stage = parking_lot::Mutex::new("resolving");
@@ -351,7 +345,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &LoadOpts {
             placement,
             token: token.as_deref(),
-            quant: quant_override,
             quant_name: cli.quant.as_deref(),
             hw: &hw,
             reencode,
@@ -384,7 +377,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut image_model: Option<Arc<dyn ImageGenerator>> = None;
-    let mut weights = None;
     let mut drafter = None;
     let classifier_slot = ClassifierSlot::default();
     let jev_slot = gibbs_engine::runtime::encoder::system1::System1Slot::default();
@@ -514,7 +506,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Loaded::Lm {
             model: model_exec,
-            choice,
             artifacts,
         } => {
             let artifacts = &artifacts;
@@ -550,25 +541,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             });
             telemetry.set_model_size_bytes(model_size);
-            match (&model_exec, &choice) {
-                (ExecutableModel::Native(m), _) => {
-                    telemetry.log_info(&format!("Model: {}", m.summary()))
-                }
-                (_, Some(c)) => telemetry.log_info(&format!("Weight format: {}", c.summary())),
-                _ => {}
-            }
+            telemetry.log_info(&format!("Model: {}", model_exec.lm().summary()));
             if is_synthetic_model_id(&cli.model) {
                 telemetry.log_warn(&format!(
                 "'{}' is a synthetic random-weight model for kernel benchmarking: its text output is noise",
                 cli.model
             ));
             }
-            weights = choice;
             // The roofline basis follows the policy the load applied (the gate may have fallen back).
-            let (applied, saved) = gibbs_engine::bench::applied_policy(
-                weights.as_ref(),
-                ReencodeConfig::effective().policy,
-            );
+            let (applied, saved) = gibbs_engine::bench::applied_policy();
             if let (b, "streamed") = gibbs_engine::bench::roofline_bytes(artifacts, applied, saved)
             {
                 telemetry.set_model_size_bytes(b);
@@ -605,10 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let (Some(prompt), Some(model)) = (&cli.prompt, scheduler.model()) {
         println!("💬 Generating from prompt: \"{}\"", prompt);
-        let cap = match &model {
-            ExecutableModel::Native(m) => m.default_max_new_tokens(),
-            _ => None,
-        };
+        let cap = model.lm().default_max_new_tokens();
         let max_toks = cli.max_tokens.or(cap).unwrap_or(64);
         // Models that declare greedy decoding (T5, seq2seq: transformers' default) are not sampled.
         let temperature = match scheduler.tokenizer().sampling_defaults {
@@ -694,7 +672,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tui_app =
             TuiApp::new(telemetry, kv_pool).with_runtime(scheduler, hub, token, None, image_slot);
         tui_app.quant_override = quant_override;
-        tui_app.weights = weights;
         tui_app.frame_log_path = cli.tui_frame_log;
         tui_app.classifier = classifier_slot;
         tui_app.jev_model = jev_slot;

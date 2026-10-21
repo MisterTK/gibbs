@@ -16,7 +16,7 @@ mod snapshot;
 pub mod theme;
 mod widgets;
 use crate::arch::dispatch::Loaded;
-use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
+use crate::hardware::{HardwareCapability, PlacementMode, QuantFormat};
 use crate::kv::PagedKVPool;
 use crate::model::classifier::{self, ClassifierSlot};
 use crate::runtime::encoder::{Activation, LabelScore};
@@ -31,9 +31,9 @@ use crate::model::reencode::ReencodeProgress;
 use crate::runtime::diffusion::{ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weight_format::{
-    reencode_override, set_reencode_override, Choice, ReencodeConfig, ReencodePolicy, VariantPolicy,
+    reencode_override, set_reencode_override, ReencodeConfig, ReencodePolicy, VariantPolicy,
 };
-use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, ExecutableModel, SamplingParams};
+use crate::scheduler::{finish_outcome, ContinuousBatchScheduler, SamplingParams};
 use crate::telemetry::{EngineTelemetry, KernelRow};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -286,8 +286,8 @@ enum Update {
     Loaded {
         idx: usize,
         id: String,
-        /// (GraphLm weight-format choice, `None` for native models; shape and backend).
-        result: Result<(Option<Choice>, String), String>,
+        /// The loaded model's shape and backend.
+        result: Result<String, String>,
     },
     Probe(Result<String, String>),
     /// A `/bench` run on the loaded model.
@@ -315,7 +315,7 @@ pub(crate) struct Load {
     /// (when, bytes done) of the last rate sample, and the bytes/s since the one before.
     pub(crate) sample: (Instant, u64),
     pub(crate) rate: f64,
-    /// Tensors re-encoded so far and in total (GraphLm and native loaders alike).
+    /// Tensors re-encoded so far and in total.
     pub(crate) reencode: Arc<ReencodeProgress>,
     /// (when, tensors done) the first time the re-encode counter moved: the ETA's baseline.
     reencode_seen: Option<(Instant, usize)>,
@@ -392,10 +392,8 @@ pub struct TuiApp {
     pub video: crate::model::video_repo::VideoSlot,
     /// Shared with the HTTP server; `Some` is the active model (a text classifier).
     pub classifier: ClassifierSlot,
-    /// `--quant`; `None` lets the engine pick each loaded model's weight format.
-    pub quant_override: Option<QuantMode>,
-    /// Weight format of the served LLM and how it was picked.
-    pub weights: Option<Choice>,
+    /// `--quant` ([`ReencodeConfig::force`]); `None` keeps checkpoint encodings / the policy.
+    pub quant_override: Option<QuantFormat>,
     pub http_addr: Option<SocketAddr>,
     pub placement: PlacementMode,
     pub scratch_dir: tempfile::TempDir,
@@ -505,7 +503,6 @@ impl TuiApp {
             video: crate::model::video_repo::VideoSlot::default(),
             classifier: ClassifierSlot::default(),
             quant_override: None,
-            weights: None,
             http_addr: None,
             placement: PlacementMode::Auto,
             scratch_dir: tempfile::tempdir().expect("scratch directory for TUI images"),
@@ -907,8 +904,7 @@ impl TuiApp {
             .model()
             .ok_or("no text model loaded; press m to load one")?;
         let id = sched.model_id();
-        let (policy, saved) =
-            crate::bench::applied_policy(self.weights.as_ref(), self.reencode_policy);
+        let (policy, saved) = crate::bench::applied_policy();
         let (bytes, basis) =
             crate::bench::roofline_bytes(&self.hub.locate_model(&id), policy, saved);
         let ceiling = match crate::model::variant::host_ceiling_gbps() {
@@ -1383,9 +1379,10 @@ impl TuiApp {
             id.to_string(),
             self.placement,
         );
-        // Both GraphLm and native loaders read this through `ReencodeConfig::effective()`: the
-        // saved policy, with the load panel's tensor counter and the telemetry log attached.
+        // Spec loaders read this through `ReencodeConfig::effective()`: the saved policy (and
+        // `--quant`), with the load panel's tensor counter and the telemetry log attached.
         let reencode_cfg = ReencodeConfig {
+            force: quant_override,
             progress: Some(reencode),
             log: Some({
                 let telemetry = self.telemetry.clone();
@@ -1406,7 +1403,6 @@ impl TuiApp {
                 let o = crate::arch::LoadOpts {
                     placement: PlacementMode::Pin(backend),
                     token: token.as_deref(),
-                    quant: quant_override,
                     quant_name: None,
                     hw: &hw,
                     reencode: reencode_cfg.clone(),
@@ -1430,7 +1426,7 @@ impl TuiApp {
                         *slot.write() = Some(Arc::new(c));
                         *jev_slot.write() = None;
                         *images.write() = None;
-                        Ok((None, shape))
+                        Ok(shape)
                     }
                     Loaded::System1(jev) => {
                         let shape = jev.summary();
@@ -1438,7 +1434,7 @@ impl TuiApp {
                         *slot.write() = None;
                         *images.write() = None;
                         *video.write() = None;
-                        Ok((None, shape))
+                        Ok(shape)
                     }
                     Loaded::Video(plan) => {
                         let shape = format!("{}; /video <prompt> (and /i2v <image> <prompt> where the pipeline takes an image) write .mp4 clips", plan.label());
@@ -1446,7 +1442,7 @@ impl TuiApp {
                         *jev_slot.write() = None;
                         *images.write() = None;
                         *slot.write() = None;
-                        Ok((None, shape))
+                        Ok(shape)
                     }
                     Loaded::Image(g) => {
                         let d = g.defaults();
@@ -1461,34 +1457,17 @@ impl TuiApp {
                         *images.write() = Some(g);
                         *jev_slot.write() = None;
                         *slot.write() = None;
-                        Ok((None, shape))
+                        Ok(shape)
                     }
-                    Loaded::Lm {
-                        model,
-                        choice,
-                        artifacts,
-                    } => {
-                        let shape = match &model {
-                            ExecutableModel::Native(m) => {
-                                format!("{}, on {}", m.summary(), m.backend_label())
-                            }
-                            ExecutableModel::Program(_, lm) => {
-                                let c = &lm.read().config;
-                                format!(
-                                    "{} layers, hidden {}, vocab {}",
-                                    c.num_layers, c.hidden_dim, c.vocab_size
-                                )
-                            }
-                        };
-                        let program = matches!(model, ExecutableModel::Program(..));
+                    Loaded::Lm { model, artifacts } => {
+                        let shape = format!("{}, on {}", model.lm().summary(), model.backend_label());
                         sched.swap_model(&id, model);
                         // What the load applied (its gate may fall back) sets the roofline's bytes per token.
                         let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
                             crate::model::variant::decode_bytes_per_token(p, reencode_cfg.policy)
                         });
                         sched.telemetry.set_model_size_bytes(model_size);
-                        let (applied, saved) =
-                            crate::bench::applied_policy(choice.as_ref(), reencode_cfg.policy);
+                        let (applied, saved) = crate::bench::applied_policy();
                         if let (b, "streamed") =
                             crate::bench::roofline_bytes(&artifacts, applied, saved)
                         {
@@ -1497,11 +1476,7 @@ impl TuiApp {
                         *jev_slot.write() = None;
                         *slot.write() = None;
                         *images.write() = None;
-                        let shape = match program {
-                            true => format!("{shape}, on {}", sched.backend_label()),
-                            false => shape,
-                        };
-                        Ok((choice, shape))
+                        Ok(shape)
                     }
                 }
             }))
@@ -1605,25 +1580,11 @@ impl TuiApp {
                         "cached".to_string()
                     };
                     match result {
-                        Ok((choice, shape)) => {
-                            let weights = choice.as_ref().map_or(String::new(), |c| {
-                                format!(
-                                    "\nweights: {:?} ({:.2} bpw), {}",
-                                    c.mode,
-                                    c.mode.effective_bits_per_weight(),
-                                    c.origin()
-                                )
-                            });
-                            self.telemetry.log_info(&format!(
-                                "TUI: loaded '{id}' in {secs:.1}s ({source}): {shape}{}",
-                                choice.as_ref().map_or(String::new(), |c| format!(
-                                    "; weights {}",
-                                    c.summary()
-                                ))
-                            ));
-                            self.weights = choice;
+                        Ok(shape) => {
+                            self.telemetry
+                                .log_info(&format!("TUI: loaded '{id}' in {secs:.1}s ({source}): {shape}"));
                             self.picker.mark_cached(&id);
-                            self.finish(idx, Kind::Text, format!("{shape}{weights}"), source);
+                            self.finish(idx, Kind::Text, shape, source);
                         }
                         Err(e) => {
                             self.telemetry
@@ -2403,7 +2364,6 @@ mod tests {
         assert_eq!(e.kind, Kind::Text, "{}", e.output);
         assert_eq!(sched.model_id(), "gibbs/tiny-5m");
         assert!(!Arc::ptr_eq(&before_tok, &sched.tokenizer()));
-        assert!(app.weights.is_some());
 
         // Ctrl-J submits like Enter; Esc with a chat running cancels it (focus stays), then leaves.
         app.focus = Focus::Prompt;
@@ -3477,14 +3437,9 @@ mod tests {
 
     #[test]
     fn llm_can_be_used_and_toggled_as_system1_in_tui() {
-        use crate::model::graph_lm::{GraphLm, GraphLmConfig};
-
         let kv = Arc::new(PagedKVPool::new(64));
-        let llm = ExecutableModel::load_graph_lm(
-            GraphLm::new(GraphLmConfig::smollm_1m()),
-            crate::hardware::Device::Cpu,
-        )
-        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let llm = crate::arch::testing::synthetic_lm(dir.path(), serde_json::json!({}), crate::hardware::Device::Cpu);
         let sched = Arc::new(ContinuousBatchScheduler::new(
             "foundry/smollm-1m",
             kv.clone(),

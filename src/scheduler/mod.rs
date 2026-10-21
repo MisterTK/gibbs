@@ -1,8 +1,7 @@
 pub mod spec;
 
-use crate::hardware::{Device, QuantMode};
+use crate::hardware::Device;
 use crate::kv::{BlockId, PagedKVPool, TOKENS_PER_BLOCK};
-use crate::model::graph_lm::GraphLm;
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::runtime::lm::sample_logits;
@@ -25,104 +24,45 @@ pub fn cpu_backend_label() -> String {
     format!("CPU (NEON SIMD), {threads} threads")
 }
 
-/// Per-sequence KV state, owned by the backend that produced it.
-pub enum SeqKvCache {
-    /// StateStore for GraphProgram execution
-    Program(crate::graph::StateStore),
-    /// Built by [`NativeLm::prepare`] at submission.
-    Native(SeqState),
-}
+/// A loaded causal LM: any [`NativeLm`] (family specs through [`crate::runtime::lm`], the
+/// encoder-decoder pipeline). Each sequence carries the [`SeqState`] its `prepare` built.
 #[derive(Clone)]
-pub enum ExecutableModel {
-    /// Multi-segment GraphProgram execution.
-    Program(
-        Arc<parking_lot::RwLock<crate::graph::program::GraphProgram>>,
-        Arc<parking_lot::RwLock<GraphLm>>,
-    ),
-    /// A causal LM outside GraphLm (new architectures, multimodal); see [`crate::model::native`].
-    Native(Arc<dyn NativeLm>),
-}
+pub struct ExecutableModel(pub Arc<dyn NativeLm>);
 
 /// Last 64 tokens: the window the sampler sees.
 fn recent(tokens: &[u32]) -> &[u32] {
     &tokens[tokens.len().saturating_sub(64)..]
 }
 
-const WRONG_KV: &str = "sequence KV cache belongs to a different compute backend";
+const NO_STATE: &str = "sequence has no model state (it was not prepared by this model)";
 
 impl ExecutableModel {
-    /// Places a loaded GraphLm on `mode` (Metal uploads the weights and compiles the kernels).
-    pub fn load_graph_lm(
-        model: GraphLm,
-        mode: impl Into<crate::hardware::PlacementMode>,
-    ) -> Result<Self, String> {
-        let mode = mode.into();
-        let target_device = match mode {
-            crate::hardware::PlacementMode::Pin(d) => d,
-            crate::hardware::PlacementMode::Auto => crate::hardware::default_device(),
-        };
-        tracing::info!(
-            "Model 'GraphLm ({} layers, {} hidden)' placed on {target_device}",
-            model.config.num_layers,
-            model.config.hidden_dim,
-        );
+    pub fn new(lm: Arc<dyn NativeLm>) -> Self {
+        Self(lm)
+    }
 
-        match target_device {
-            Device::Cpu => {
-                let (decode_g, weights) = model.to_decode_graph();
-                let prog = crate::graph::program::GraphProgram::compile(
-                    decode_g,
-                    weights,
-                    crate::hardware::PlacementMode::Pin(Device::Cpu),
-                )?;
-                Ok(Self::Program(
-                    Arc::new(parking_lot::RwLock::new(prog)),
-                    Arc::new(parking_lot::RwLock::new(model)),
-                ))
-            }
-            #[cfg(target_os = "macos")]
-            Device::Metal => {
-                let (decode_g, weights) = model.to_decode_graph();
-                let prog = crate::graph::program::GraphProgram::compile(
-                    decode_g,
-                    weights,
-                    crate::hardware::PlacementMode::Pin(Device::Metal),
-                )?;
-                Ok(Self::Program(
-                    Arc::new(parking_lot::RwLock::new(prog)),
-                    Arc::new(parking_lot::RwLock::new(model)),
-                ))
-            }
-            #[cfg(not(target_os = "macos"))]
-            Device::Metal => Err("the Metal backend requires macOS".into()),
-        }
+    /// The model behind this handle.
+    pub fn lm(&self) -> &Arc<dyn NativeLm> {
+        &self.0
     }
 
     pub fn llm_backend(&self) -> Device {
-        match self {
-            Self::Program(prog, _) => prog.read().primary_device(),
-            Self::Native(m) => m.device(),
-        }
+        self.0.device()
     }
 
     /// e.g. `CPU (NEON SIMD), 14 threads` or `Metal (Apple M5 Pro)` (device name from the Metal API).
     pub fn backend_label(&self) -> String {
-        match self {
-            Self::Program(prog, _) => prog.read().backend_label(),
-            Self::Native(m) => m.backend_label(),
-        }
+        self.0.backend_label()
     }
     /// Graph nodes by op kind, device and avenue; `None` for models that do not run a graph
-    /// program (CPU executors, seq2seq, vision models).
+    /// program.
     pub fn placement_summary(&self) -> Option<Vec<crate::graph::placement::PlacementRow>> {
-        match self {
-            Self::Program(prog, _) => Some(prog.read().placement_summary()),
-            Self::Native(m) => m.placement_summary(),
-        }
+        self.0.placement_summary()
     }
-    /// Decodes `last_token` against the sequence's KV cache (prefilling `all_tokens` first when the
-    /// sequence has none) and samples the next token. `logprobs: Some(k)` also reports the chosen
-    /// token's probability, the top `k` candidates and the entropy.
+    /// Decodes `last_token` against the sequence's state and samples the next token.
+    /// `logprobs: Some(k)` also reports the chosen token's probability, the top `k` candidates
+    /// and the entropy.
+    #[allow(clippy::too_many_arguments)]
     pub fn step_token_with_kv(
         &self,
         all_tokens: &[u32],
@@ -131,120 +71,52 @@ impl ExecutableModel {
         temp: f32,
         top_p: f32,
         logprobs: Option<usize>,
-        kv_cache: &mut Option<SeqKvCache>,
+        state: &mut Option<SeqState>,
     ) -> Result<(u32, Option<TokenLogprobInfo>), String> {
-        // Greedy (as `sample_logits` decides it) without logprobs: programs may pick the token on
-        // the device.
-        let device_pick = temp <= 1e-4 && logprobs.is_none();
-        let logits = match self {
-            // `pos` counts `last_token` itself.
-            Self::Native(m) => match kv_cache {
-                Some(SeqKvCache::Native(state)) if device_pick => {
-                    match m.forward_greedy(&[last_token], pos - 1, state)? {
-                        crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok((t[0], None)),
-                        t => crate::model::native::logits_of(t)?,
-                    }
-                }
-                Some(SeqKvCache::Native(state)) => m.forward(&[last_token], pos - 1, state)?,
-                _ => return Err(WRONG_KV.into()),
-            },
-            Self::Program(prog, m) => {
-                let mut p = prog.write();
-                match kv_cache {
-                    Some(SeqKvCache::Program(state)) => {
-                        std::mem::swap(&mut p.state, state);
-                        let actual_pos = (pos - 1) as u32;
-                        let inputs = vec![
-                            crate::graph::Tensor::U32(vec![last_token]),
-                            crate::graph::Tensor::U32(vec![actual_pos]),
-                        ];
-                        let out = if device_pick {
-                            p.run_greedy(inputs, m.read().tokenizer.vocab_size())
-                        } else {
-                            p.run(inputs)
-                        };
-                        std::mem::swap(&mut p.state, state);
-                        let out = out?;
-                        match out.into_iter().next() {
-                            Some(crate::graph::Tensor::F32(v)) => v,
-                            Some(crate::graph::Tensor::U32(t)) if t.len() == 1 => {
-                                return Ok((t[0], None))
-                            }
-                            _ => return Err("GraphProgram did not return F32 logits".into()),
-                        }
-                    }
-                    None => {
-                        p.state = crate::graph::StateStore::new();
-                        let mut last_logits = Vec::new();
-                        for (i, &tok) in all_tokens.iter().enumerate() {
-                            let inputs = vec![
-                                crate::graph::Tensor::U32(vec![tok]),
-                                crate::graph::Tensor::U32(vec![i as u32]),
-                            ];
-                            let out = p.run(inputs)?;
-                            match out.into_iter().next() {
-                                Some(crate::graph::Tensor::F32(v)) => last_logits = v,
-                                _ => return Err("GraphProgram did not return F32 logits".into()),
-                            }
-                        }
-                        *kv_cache = Some(SeqKvCache::Program(p.state.clone()));
-                        last_logits
-                    }
-                    _ => return Err(WRONG_KV.into()),
-                }
+        let state = state.as_mut().ok_or(NO_STATE)?;
+        // Greedy (as `sample_logits` decides it) without logprobs: the model may pick the token
+        // on the device. `pos` counts `last_token` itself.
+        let logits = if temp <= 1e-4 && logprobs.is_none() {
+            match self.0.forward_greedy(&[last_token], pos - 1, state)? {
+                crate::graph::Tensor::U32(t) if t.len() == 1 => return Ok((t[0], None)),
+                t => crate::model::native::logits_of(t)?,
             }
+        } else {
+            self.0.forward(&[last_token], pos - 1, state)?
         };
         let chosen = self.sample(&logits, recent(all_tokens), temp, top_p);
         Ok((chosen, logprobs.map(|k| logprob_info(&logits, chosen, k))))
     }
 
-    /// The next greedy token of a device decode stream ([`GraphProgram::stream_next`]): `last` is
-    /// the newest token, `pos` counts it (as in [`Self::step_token_with_kv`]), and at most
+    /// The next greedy token of a device decode stream ([`NativeLm::stream_greedy_token`]): `last`
+    /// is the newest token, `pos` counts it (as in [`Self::step_token_with_kv`]), and at most
     /// `max_new` more tokens are queued. `None` when this model or sequence cannot stream (use
     /// `step_token_with_kv`). A stream keeps one speculative token in flight: end it with
     /// [`Self::stream_end`] before the sequence state is reused.
-    ///
-    /// [`GraphProgram::stream_next`]: crate::graph::program::GraphProgram::stream_next
     pub fn stream_greedy_token(
         &self,
         last: u32,
         pos: usize,
         max_new: usize,
-        kv: &mut Option<SeqKvCache>,
+        state: &mut Option<SeqState>,
     ) -> Result<Option<u32>, String> {
-        match (self, kv) {
-            (Self::Program(prog, m), Some(SeqKvCache::Program(state))) => {
-                let mut p = prog.write();
-                let vocab = m.read().tokenizer.vocab_size();
-                std::mem::swap(&mut p.state, state);
-                let out = p.stream_next(last, (pos - 1) as u32, max_new, vocab);
-                std::mem::swap(&mut p.state, state);
-                out
-            }
-            (Self::Native(m), Some(SeqKvCache::Native(state))) => {
-                m.stream_greedy_token(last, pos - 1, max_new, state)
-            }
-            _ => Ok(None),
+        match state {
+            Some(st) => self.0.stream_greedy_token(last, pos - 1, max_new, st),
+            None => Ok(None),
         }
     }
 
     /// Ends the sequence's device decode stream, if any (waits for its in-flight tokens).
-    pub fn stream_end(&self, kv: &mut Option<SeqKvCache>) -> Result<(), String> {
-        match (self, kv) {
-            (Self::Program(prog, _), Some(SeqKvCache::Program(state))) => {
-                let mut p = prog.write();
-                std::mem::swap(&mut p.state, state);
-                let out = p.stream_end();
-                std::mem::swap(&mut p.state, state);
-                out
-            }
-            (Self::Native(m), Some(SeqKvCache::Native(state))) => m.stream_end(state),
-            _ => Ok(()),
+    pub fn stream_end(&self, state: &mut Option<SeqState>) -> Result<(), String> {
+        match state {
+            Some(st) => self.0.stream_end(st),
+            None => Ok(()),
         }
     }
 
     /// Evaluates a chunk of prompt tokens. If this chunk completes the prompt,
     /// returns `Some(next_token)`. If more prompt tokens remain, returns `None`.
+    #[allow(clippy::too_many_arguments)]
     pub fn step_prefill_chunk(
         &self,
         chunk_tokens: &[u32],
@@ -253,129 +125,48 @@ impl ExecutableModel {
         all_prompt_tokens: &[u32],
         temp: f32,
         top_p: f32,
-        kv_cache: &mut Option<SeqKvCache>,
+        state: &mut Option<SeqState>,
     ) -> Result<Option<u32>, String> {
         if chunk_tokens.is_empty() {
             return Ok(None);
         }
-        let logits = self.prefill_logits(chunk_tokens, start_pos, kv_cache)?;
+        let logits = self.prefill_logits(chunk_tokens, start_pos, state)?;
         Ok(is_last_chunk.then(|| self.sample(&logits, recent(all_prompt_tokens), temp, top_p)))
     }
 
-    /// Logits at the last position of `chunk_tokens` (non-empty), advancing `kv_cache`.
+    /// Logits at the last position of `chunk_tokens` (non-empty), advancing `state`.
     pub(crate) fn prefill_logits(
         &self,
         chunk_tokens: &[u32],
         start_pos: usize,
-        kv_cache: &mut Option<SeqKvCache>,
+        state: &mut Option<SeqState>,
     ) -> Result<Vec<f32>, String> {
-        Ok(match self {
-            Self::Native(m) => match kv_cache {
-                Some(SeqKvCache::Native(state)) => m.forward(chunk_tokens, start_pos, state)?,
-                _ => return Err(WRONG_KV.into()),
-            },
-            Self::Program(prog, m) => {
-                let mut p = prog.write();
-                let seq_state = match kv_cache
-                    .get_or_insert_with(|| SeqKvCache::Program(crate::graph::StateStore::new()))
-                {
-                    SeqKvCache::Program(s) => s,
-                    _ => return Err(WRONG_KV.into()),
-                };
-                std::mem::swap(&mut p.state, seq_state);
-                let chunk_len = chunk_tokens.len();
-                let is_metal = p.is_single_metal();
-
-                let last_logits = if chunk_len >= 16 && is_metal {
-                    let model = m.read();
-                    let prefill_g = model.to_prefill_graph_structure(chunk_len);
-                    let pos_vec: Vec<u32> =
-                        (0..chunk_len).map(|i| (start_pos + i) as u32).collect();
-                    let inputs = vec![
-                        crate::graph::Tensor::U32(chunk_tokens.to_vec()),
-                        crate::graph::Tensor::U32(pos_vec),
-                    ];
-                    // `run_reshaped` caches the plan per chunk shape (an uncached plan costs ~6 ms).
-                    let res = p.run_reshaped(&prefill_g, inputs).and_then(|out| {
-                        match out.into_iter().next() {
-                            Some(crate::graph::Tensor::F32(v)) => {
-                                let v_size = model.config.vocab_size;
-                                Ok(v[(chunk_len - 1) * v_size..chunk_len * v_size].to_vec())
-                            }
-                            _ => Err("GraphProgram did not return F32 logits".to_string()),
-                        }
-                    });
-                    match res {
-                        Ok(l) => l,
-                        Err(e) => {
-                            std::mem::swap(&mut p.state, seq_state);
-                            return Err(e);
-                        }
-                    }
-                } else {
-                    let mut last = Vec::new();
-                    let mut err = None;
-                    for (i, &tok) in chunk_tokens.iter().enumerate() {
-                        let inputs = vec![
-                            crate::graph::Tensor::U32(vec![tok]),
-                            crate::graph::Tensor::U32(vec![(start_pos + i) as u32]),
-                        ];
-                        match p.run(inputs) {
-                            Ok(out) => match out.into_iter().next() {
-                                Some(crate::graph::Tensor::F32(v)) => last = v,
-                                _ => {
-                                    err =
-                                        Some("GraphProgram did not return F32 logits".to_string());
-                                    break;
-                                }
-                            },
-                            Err(e) => {
-                                err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(e) = err {
-                        std::mem::swap(&mut p.state, seq_state);
-                        return Err(e);
-                    }
-                    last
-                };
-                std::mem::swap(&mut p.state, seq_state);
-                last_logits
-            }
-        })
+        let st = state.as_mut().ok_or(NO_STATE)?;
+        self.0.forward(chunk_tokens, start_pos, st)
     }
 
     /// Last-position logits for a text prompt (already tokenized, template applied by the caller).
     pub fn prompt_logits(&self, ids: Vec<u32>) -> Result<Vec<f32>, String> {
-        let (ids, mut kv) = self.prepare(ids, &[], &PrepareCtx::default())?;
+        let (ids, mut st) = self.prepare(ids, &[], &PrepareCtx::default())?;
         if ids.is_empty() {
             return Err("the prompt encodes to no tokens".into());
         }
-        self.prefill_logits(&ids, 0, &mut kv)
+        self.prefill_logits(&ids, 0, &mut st)
     }
 
     /// Top-k 50 / top-p sampling without repetition penalty; `temp <= 0` is greedy argmax.
     fn sample(&self, logits: &[f32], recent: &[u32], temp: f32, top_p: f32) -> u32 {
-        match self {
-            Self::Program(_, m) => m
-                .read()
-                .sample_next_token_with_penalty(logits, recent, temp, 50, top_p, 1.0),
-            Self::Native(m) => {
-                let vocab = m.tokenizer().vocab_size();
-                let valid = if vocab > 0 {
-                    logits.len().min(vocab)
-                } else {
-                    logits.len()
-                };
-                sample_logits(&logits[..valid], recent, temp, 50, top_p, 1.0)
-            }
-        }
+        let vocab = self.0.tokenizer().vocab_size();
+        let valid = if vocab > 0 {
+            logits.len().min(vocab)
+        } else {
+            logits.len()
+        };
+        sample_logits(&logits[..valid], recent, temp, 50, top_p, 1.0)
     }
 
     /// One-shot generation through a private [`ContinuousBatchScheduler`]: (text, decode-step
-    /// tokens, decode time). `drafter` speculates; native models otherwise use the drafter they ship.
+    /// tokens, decode time). `drafter` speculates; models otherwise use the drafter they ship.
     pub fn generate_text_measured(
         &self,
         prompt: &str,
@@ -419,54 +210,29 @@ impl ExecutableModel {
     }
 
     pub fn tokenizer(&self) -> Tokenizer {
-        match self {
-            Self::Program(_, m) => m.read().tokenizer.clone(),
-            Self::Native(m) => m.tokenizer().clone(),
-        }
+        self.0.tokenizer().clone()
     }
 
-    /// GraphLm weight format; `None` for native models, which keep their own representation.
-    pub fn current_quant_mode(&self) -> Option<QuantMode> {
-        match self {
-            Self::Program(_, m) => Some(m.read().current_quant_mode()),
-            Self::Native(_) => None,
-        }
-    }
-
-    /// Maximum positions the model's KV cache holds; `None` when the model has no fixed window.
+    /// Maximum positions the model's state holds.
     pub fn context_len(&self) -> Option<usize> {
-        match self {
-            Self::Program(_, m) => Some(m.read().config.max_seq_len.max(1)),
-            Self::Native(m) => Some(m.context_len().max(1)),
-        }
+        Some(self.0.context_len().max(1))
     }
 
-    /// Expands `ids` for the model and builds the sequence's initial state: native models
-    /// [`NativeLm::prepare`] (media allowed); every other model takes text only.
+    /// Expands `ids` for the model ([`NativeLm::prepare_ctx`], media allowed) and builds the
+    /// sequence's initial state.
     fn prepare(
         &self,
         ids: Vec<u32>,
         media: &[MediaInput],
         ctx: &PrepareCtx,
-    ) -> Result<(Vec<u32>, Option<SeqKvCache>), String> {
-        match self {
-            Self::Native(m) => {
-                let (ids, state) = m.prepare_ctx(ids, media, ctx)?;
-                Ok((ids, Some(SeqKvCache::Native(state))))
-            }
-            _ if media.is_empty() => Ok((ids, None)),
-            _ => Err("this model takes text only (no image or audio input)".into()),
-        }
+    ) -> Result<(Vec<u32>, Option<SeqState>), String> {
+        let (ids, state) = self.0.prepare_ctx(ids, media, ctx)?;
+        Ok((ids, Some(state)))
     }
 
     /// [`Self::prepare`]'s id count without building state ([`NativeLm::prompt_len`]).
     fn prompt_len(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<usize, String> {
-        match self {
-            Self::Native(m) => m.prompt_len(ids, media),
-            _ => self
-                .prepare(ids, media, &PrepareCtx::default())
-                .map(|(ids, _)| ids.len()),
-        }
+        self.0.prompt_len(ids, media)
     }
 }
 
@@ -680,7 +446,7 @@ pub struct Sequence {
     /// When the last output token was sent; `None` before the first.
     pub last_emit: Option<Instant>,
     pub token_sender: Option<UnboundedSender<u32>>,
-    pub kv_cache: Option<SeqKvCache>,
+    pub kv_cache: Option<SeqState>,
     pub prefilled_tokens: usize,
     pub finish: FinishSignal,
     /// Speculative decoding state; set when the sequence starts prefill with a drafter.
@@ -801,9 +567,11 @@ pub struct ContinuousBatchScheduler {
 
 /// The drafter `model` ships, unless `GIBBS_SPEC=off`.
 fn builtin_drafter(model: Option<&ExecutableModel>) -> Option<Arc<dyn Drafter>> {
-    match model? {
-        ExecutableModel::Native(m) if spec_enabled() => m.drafter(),
-        _ => None,
+    let m = model?;
+    if spec_enabled() {
+        m.0.drafter()
+    } else {
+        None
     }
 }
 
@@ -943,14 +711,6 @@ impl ContinuousBatchScheduler {
     /// Sequences, queue, and step timing as of the end of the last step.
     pub fn view(&self) -> SchedulerView {
         self.view.lock().clone()
-    }
-
-    /// Weight format of the loaded LLM; `None` when no LLM is loaded.
-    pub fn quant_mode(&self) -> Option<QuantMode> {
-        self.model
-            .read()
-            .as_ref()
-            .and_then(ExecutableModel::current_quant_mode)
     }
 
     /// Replaces the executing model and its tokenizer. In-flight sequences are aborted
@@ -1151,7 +911,7 @@ impl ContinuousBatchScheduler {
             Arc<Tokenizer>,
             Option<ExecutableModel>,
             Vec<u32>,
-            Option<SeqKvCache>,
+            Option<SeqState>,
         ),
         String,
     > {
@@ -1169,7 +929,20 @@ impl ContinuousBatchScheduler {
     pub fn submit_request_stream(&self, prompt_tokens: Vec<u32>) -> (u64, UnboundedReceiver<u32>) {
         let id = self.next_seq_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = unbounded_channel();
-        let mut seq = Sequence::new(id, prompt_tokens);
+        // The loaded model builds the sequence state; a refusal leaves none, so the sequence
+        // aborts in prefill with the reason logged here.
+        let (ids, kv_cache) = match self.model() {
+            Some(m) => match m.prepare(prompt_tokens.clone(), &[], &PrepareCtx::default()) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.telemetry.log_warn(&format!("sequence {id}: cannot prepare the prompt: {e}"));
+                    (prompt_tokens, None)
+                }
+            },
+            None => (prompt_tokens, None),
+        };
+        let mut seq = Sequence::new(id, ids);
+        seq.kv_cache = kv_cache;
         seq.token_sender = Some(tx);
         seq.state = SequenceState::Waiting;
         let mut waiting = self.waiting_queue.write();
@@ -1624,29 +1397,26 @@ impl ContinuousBatchScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::graph_lm::{GraphLmConfig, LayerKVCache};
 
-    /// Host-forward KV cache: the reference the program-path tests compare against.
-    fn new_cpu_kv(model: &GraphLm) -> Vec<LayerKVCache> {
-        let max_seq_len = model.config.max_seq_len.max(1);
-        (0..model.layers.len())
-            .map(|_| LayerKVCache::new(max_seq_len, model.config.hidden_dim))
-            .collect()
+    /// The synthetic llama of [`crate::arch::testing::synthetic_llama`] (vocab 256, a tokenizer
+    /// without special ids: generation stops only on `max_new_tokens` or the context) with
+    /// context `ctx`, on `dev`.
+    fn spec_model(ctx: usize, dev: Device) -> ExecutableModel {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = serde_json::json!({"max_position_embeddings": ctx});
+        crate::arch::testing::synthetic_lm(dir.path(), cfg, dev)
     }
 
-    fn cpu_exec(model: GraphLm) -> ExecutableModel {
-        ExecutableModel::load_graph_lm(model, Device::Cpu).unwrap()
+    fn cpu_exec(ctx: usize) -> ExecutableModel {
+        spec_model(ctx, Device::Cpu)
     }
 
-    /// smollm_1m with room for prompts spanning several prefill budgets; never emits EOS.
-    fn long_context_model() -> GraphLm {
-        let mut model = GraphLm::new(GraphLmConfig {
-            max_seq_len: 4096,
-            ..GraphLmConfig::smollm_1m()
-        });
-        model.tokenizer.special_tokens.clear();
-        model.tokenizer.inv_vocab.clear();
-        model
+    /// Room for prompts spanning several prefill budgets.
+    const LONG: usize = 4096;
+    const SHORT: usize = 512;
+
+    fn argmax(v: &[f32]) -> u32 {
+        (0..v.len()).fold(0, |b, i| if v[i] > v[b] { i } else { b }) as u32
     }
 
     /// While a sequence decodes, prompt prefill is cut to a measured budget (and the decoding
@@ -1656,7 +1426,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(long_context_model())),
+            Some(cpu_exec(LONG)),
         );
         let greedy = |n| SamplingParams {
             temperature: Some(0.0),
@@ -1701,7 +1471,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(long_context_model())),
+            Some(cpu_exec(LONG)),
         );
         let greedy = SamplingParams {
             temperature: Some(0.0),
@@ -1724,7 +1494,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(long_context_model())),
+            Some(cpu_exec(LONG)),
         );
         let greedy = SamplingParams {
             temperature: Some(0.0),
@@ -1762,7 +1532,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(never_eos_model())),
+            Some(cpu_exec(SHORT)),
         );
         let params = SamplingParams {
             temperature: Some(0.0),
@@ -1784,7 +1554,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(never_eos_model())),
+            Some(cpu_exec(SHORT)),
         );
         assert_eq!(s.prompt_len(&[], |_| vec![1, 2, 3]).unwrap(), 3);
         assert!(s.waiting_queue.read().is_empty());
@@ -1799,7 +1569,7 @@ mod tests {
         let s = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(never_eos_model())),
+            Some(cpu_exec(SHORT)),
         );
         let params = SamplingParams {
             temperature: Some(0.0),
@@ -1810,7 +1580,7 @@ mod tests {
         let (_, _rx, _, _, running) = s.submit_with_params(params, |_| vec![1, 2, 3]);
         s.step();
         let (_, _rx2, _, _, queued) = s.submit_with_params(params, |_| vec![4, 5]);
-        s.swap_model("other", cpu_exec(never_eos_model()));
+        s.swap_model("other", cpu_exec(SHORT));
         assert!(finish_outcome(&running).is_err() && finish_outcome(&queued).is_err());
     }
 
@@ -1832,14 +1602,6 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].state, SequenceState::Waiting);
         assert_eq!(w[0].prefilled_tokens, 0);
-    }
-
-    /// GraphLm whose tokenizer marks no id special, so generation can only stop on `max_new_tokens`.
-    fn never_eos_model() -> GraphLm {
-        let mut model = GraphLm::new(GraphLmConfig::smollm_1m());
-        model.tokenizer.special_tokens.clear();
-        model.tokenizer.inv_vocab.clear();
-        model
     }
 
     fn run_to_completion(
@@ -1867,7 +1629,7 @@ mod tests {
             let scheduler = ContinuousBatchScheduler::new(
                 "",
                 Arc::new(PagedKVPool::new(512)),
-                Some(cpu_exec(never_eos_model())),
+                Some(cpu_exec(SHORT)),
             );
             let params = SamplingParams {
                 temperature: Some(0.0),
@@ -1892,13 +1654,11 @@ mod tests {
     /// Generation ends at the model's context length (its KV cache capacity), not past it.
     #[test]
     fn test_generation_stops_at_model_context_length() {
-        let model = never_eos_model();
-        let ctx = model.config.max_seq_len;
-        let scheduler = ContinuousBatchScheduler::new(
-            "",
-            Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(model)),
-        );
+        let model = cpu_exec(SHORT);
+        let ctx = model.context_len().unwrap();
+        assert_eq!(ctx, SHORT);
+        let scheduler =
+            ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(model));
         // Unclamped submit path: only the step's context check can stop this sequence.
         let (_, rx) = scheduler.submit_request_stream(vec![7u32; ctx - 12]);
         assert_eq!(run_to_completion(&scheduler, rx).len(), 12);
@@ -1906,38 +1666,13 @@ mod tests {
 
     #[test]
     fn test_temperature_zero_picks_argmax() {
-        let model = never_eos_model();
         let prompt = [5u32, 9, 13];
-        let mut cache: Vec<crate::model::graph_lm::LayerKVCache> = (0..model.layers.len())
-            .map(|_| {
-                crate::model::graph_lm::LayerKVCache::new(
-                    model.config.max_seq_len,
-                    model.config.hidden_dim,
-                )
-            })
-            .collect();
-        let mut logits = Vec::new();
-        for (p, &t) in prompt.iter().enumerate() {
-            logits = model.forward_token_with_kv(t, p, &mut cache);
-        }
-        // The sampler only considers ids the tokenizer can decode.
-        let vocab = match model.tokenizer.vocab_size() {
-            0 => logits.len(),
-            v => v.min(logits.len()),
-        };
-        let argmax = logits[..vocab]
-            .iter()
-            .enumerate()
-            .fold(
-                (0, f32::NEG_INFINITY),
-                |b, (i, &v)| if v > b.1 { (i, v) } else { b },
-            )
-            .0 as u32;
-
+        // Every load of the synthetic id has the same weights: the reference is a second one.
+        let want = argmax(&cpu_exec(SHORT).prompt_logits(prompt.to_vec()).unwrap()[..256]);
         let scheduler = ContinuousBatchScheduler::new(
             "",
             Arc::new(PagedKVPool::new(512)),
-            Some(cpu_exec(model)),
+            Some(cpu_exec(SHORT)),
         );
         let params = SamplingParams {
             temperature: Some(0.0),
@@ -1946,16 +1681,16 @@ mod tests {
             top_logprobs: None,
         };
         let (_, rx, _, _, _) = scheduler.submit_with_params(params, |_| prompt.to_vec());
-        assert_eq!(run_to_completion(&scheduler, rx), vec![argmax]);
+        assert_eq!(run_to_completion(&scheduler, rx), vec![want]);
     }
 
-    /// Synthetic weights tie the top-2 logits to within one f32 ulp (margin 0..4.8e-7 at |logit|
-    /// 5.64), so greedy token streams may legitimately diverge between backends. Compare
-    /// teacher-forced logits instead; 80 positions cross the GPU KV cache's 64-row growth.
     #[cfg(target_os = "macos")]
     #[test]
     fn test_metal_scheduler_serves_max_new_tokens() {
-        let model = ExecutableModel::load_graph_lm(never_eos_model(), Device::Metal).unwrap();
+        if !crate::hardware::available_devices().contains(&Device::Metal) {
+            return;
+        }
+        let model = spec_model(SHORT, Device::Metal);
         assert_eq!(model.llm_backend(), Device::Metal);
         let scheduler =
             ContinuousBatchScheduler::new("", Arc::new(PagedKVPool::new(512)), Some(model));
@@ -1968,266 +1703,56 @@ mod tests {
         let (_, rx, _, _, _) = scheduler.submit_with_params(params, |_| vec![5, 9, 13, 2, 77]);
         let out = run_to_completion(&scheduler, rx);
         assert_eq!(out.len(), 12);
-        assert!(out.iter().all(|&t| (t as usize) < 2048));
+        assert!(out.iter().all(|&t| t < 256));
     }
+
+    /// Chunked prefill, the one-call prefill + greedy step and a decode step agree with whole-prompt
+    /// logits on `dev`; on Metal the logits also match the CPU model's (a 20-row prefill takes the
+    /// batched path).
+    fn prefill_and_decode_parity(dev: Device) {
+        let m = spec_model(SHORT, dev);
+        let cpu = cpu_exec(SHORT);
+        let prompt = vec![5u32, 9, 13, 2];
+        let close = |what: &str, got: &[f32], want: &[f32]| {
+            let d = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(d < 1e-3, "{what}: max logit difference {d}");
+        };
+        let want = cpu.prompt_logits(prompt.clone()).unwrap();
+        close("prompt logits vs CPU", &m.prompt_logits(prompt.clone()).unwrap(), &want);
+        // A picked token is right when its reference logit ties the argmax's (synthetic weights
+        // can tie the top logits within an ulp).
+        let tied = |what: &str, tok: u32, logits: &[f32]| {
+            let best = logits[argmax(&logits[..256]) as usize];
+            assert!((logits[tok as usize] - best).abs() < 1e-4, "{what}: token {tok}");
+        };
+        let (mut st, mut st2) = (
+            m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap().1,
+            m.prepare(prompt.clone(), &[], &PrepareCtx::default()).unwrap().1,
+        );
+        assert_eq!(m.step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, &mut st).unwrap(), None);
+        let t = m.step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut st).unwrap().unwrap();
+        tied("chunked prefill", t, &want);
+        // Prefill all but the last token, then the greedy step on it.
+        m.prefill_logits(&prompt[..3], 0, &mut st2).unwrap();
+        let (next, _) = m.step_token_with_kv(&prompt, prompt[3], prompt.len(), 0.0, 1.0, None, &mut st2).unwrap();
+        tied("greedy step", next, &want);
+        let full = [&prompt[..], &[next]].concat();
+        let (dec, _) = m.step_token_with_kv(&full, next, full.len(), 0.0, 1.0, None, &mut st2).unwrap();
+        tied("decode step", dec, &cpu.prompt_logits(full.clone()).unwrap());
+        let long: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % 256).collect();
+        close("20-row prefill vs CPU", &m.prompt_logits(long.clone()).unwrap(), &cpu.prompt_logits(long).unwrap());
+    }
+
     #[test]
     fn test_program_scheduler_prefill_and_decode_parity() {
-        let raw_model = never_eos_model();
-        let vocab = raw_model.config.vocab_size;
-        let prompt = vec![5u32, 9, 13, 2];
-
-        // 1. Reference: GraphLm forward
-        let exp_next = raw_model.forward(&prompt);
-        let exp_tok =
-            raw_model.sample_next_token_with_penalty(&exp_next, &prompt, 0.0, 50, 1.0, 1.0);
-
-        // 2. Load as ExecutableModel::Program via CPU load_graph_lm
-        let exec_model = ExecutableModel::load_graph_lm(raw_model.clone(), Device::Cpu).unwrap();
-        assert!(
-            matches!(exec_model, ExecutableModel::Program(..)),
-            "expected ExecutableModel::Program variant on CPU load_graph_lm"
-        );
-        assert_eq!(exec_model.llm_backend(), Device::Cpu);
-
-        // 2a. Verify chunked prefill path
-        let mut chunk_kv = None;
-        let chunk1_tok = exec_model
-            .step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, &mut chunk_kv)
-            .expect("chunk 1 prefill succeeds");
-        assert_eq!(chunk1_tok, None);
-
-        let chunk2_tok = exec_model
-            .step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut chunk_kv)
-            .expect("chunk 2 prefill succeeds");
-        assert_eq!(
-            chunk2_tok,
-            Some(exp_tok),
-            "chunked prefill greedy token must match reference"
-        );
-
-        // 2b. Verify step_token_with_kv single-call prefill + decode
-        let mut kv = None;
-        let next_tok = exec_model
-            .step_token_with_kv(
-                &prompt,
-                *prompt.last().unwrap(),
-                prompt.len(),
-                0.0,
-                1.0,
-                None,
-                &mut kv,
-            )
-            .map(|(t, _)| t)
-            .expect("step_token_with_kv succeeds");
-
-        assert!(
-            (next_tok as usize) < vocab,
-            "token must be < vocab: {next_tok} vs {vocab}"
-        );
-        assert_eq!(
-            next_tok, exp_tok,
-            "Program greedy token must match GraphLm forward"
-        );
-
-        // Step decode
-        let mut full_prompt = prompt.clone();
-        full_prompt.push(next_tok);
-        let dec_tok = exec_model
-            .step_token_with_kv(
-                &full_prompt,
-                next_tok,
-                full_prompt.len(),
-                0.0,
-                1.0,
-                None,
-                &mut kv,
-            )
-            .map(|(t, _)| t)
-            .expect("decode step succeeds");
-        assert!((dec_tok as usize) < vocab, "decode token must be < vocab");
-        // Compare next token generated by Program against forward_token_with_kv
-        let mut ref_kv = new_cpu_kv(&raw_model);
-        for (p, &t) in prompt.iter().enumerate() {
-            let _ = raw_model.forward_token_with_kv(t, p, &mut ref_kv);
-        }
-        let ref_logits = raw_model.forward_token_with_kv(next_tok, prompt.len(), &mut ref_kv);
-        let exp_dec_tok =
-            raw_model.sample_next_token_with_penalty(&ref_logits, &full_prompt, 0.0, 50, 1.0, 1.0);
-        // Note: As noted in line 1833, synthetic weights tie top-2 logits to within 1 ULP (margin ~0),
-        // so compare logit margin / logit tolerance:
-        let prog_val = ref_logits[dec_tok as usize];
-        let exp_val = ref_logits[exp_dec_tok as usize];
-        assert!(
-            (prog_val - exp_val).abs() < 1e-4,
-            "Program picked token {dec_tok} (logit {prog_val}) vs reference {exp_dec_tok} (logit {exp_val})"
-        );
+        prefill_and_decode_parity(Device::Cpu);
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn test_program_scheduler_metal_parity() {
-        let raw_model = never_eos_model();
-        let vocab = raw_model.config.vocab_size;
-        let prompt = vec![5u32, 9, 13, 2];
-
-        // 1. Reference: GraphLm CPU forward
-        let exp_next = raw_model.forward(&prompt);
-        let exp_tok =
-            raw_model.sample_next_token_with_penalty(&exp_next, &prompt, 0.0, 50, 1.0, 1.0);
-
-        // 2. Load as ExecutableModel::Program on Metal
-        let exec_model = ExecutableModel::load_graph_lm(raw_model.clone(), Device::Metal).unwrap();
-        assert!(
-            matches!(exec_model, ExecutableModel::Program(..)),
-            "expected ExecutableModel::Program variant on Metal load_graph_lm"
-        );
-        assert_eq!(exec_model.llm_backend(), Device::Metal);
-        assert!(exec_model.backend_label().starts_with("Metal ("));
-
-        // 2a. Chunked prefill on Metal
-        let mut chunk_kv = None;
-        let chunk1_tok = exec_model
-            .step_prefill_chunk(&prompt[..2], 0, false, &prompt, 0.0, 1.0, &mut chunk_kv)
-            .expect("Metal chunk 1 prefill succeeds");
-        assert_eq!(chunk1_tok, None);
-
-        let chunk2_tok = exec_model
-            .step_prefill_chunk(&prompt[2..], 2, true, &prompt, 0.0, 1.0, &mut chunk_kv)
-            .expect("Metal chunk 2 prefill succeeds");
-        // Synthetic weights tie the top logits to within an ulp, so compare the picked token's reference
-        // logit, not its id (as the sibling test does).
-        let tied = |tok: u32, what: &str| {
-            let (got, want) = (exp_next[tok as usize], exp_next[exp_tok as usize]);
-            assert!(
-                (got - want).abs() < 1e-4,
-                "{what}: picked token {tok} (reference logit {got}) vs reference {exp_tok} (logit {want})"
-            );
-        };
-        tied(
-            chunk2_tok.expect("last chunk samples a token"),
-            "Metal chunked prefill greedy token must match CPU reference",
-        );
-
-        // 2b. Single-call prefill + decode on Metal
-        let mut kv = None;
-        let next_tok = exec_model
-            .step_token_with_kv(
-                &prompt,
-                *prompt.last().unwrap(),
-                prompt.len(),
-                0.0,
-                1.0,
-                None,
-                &mut kv,
-            )
-            .map(|(t, _)| t)
-            .expect("Metal step_token_with_kv succeeds");
-        tied(
-            next_tok,
-            "Metal Program greedy token must match GraphLm forward",
-        );
-
-        // 2c. Sequential decode step on Metal
-        let mut full_prompt = prompt.clone();
-        full_prompt.push(next_tok);
-        let dec_tok = exec_model
-            .step_token_with_kv(
-                &full_prompt,
-                next_tok,
-                full_prompt.len(),
-                0.0,
-                1.0,
-                None,
-                &mut kv,
-            )
-            .map(|(t, _)| t)
-            .expect("Metal decode step succeeds");
-        assert!((dec_tok as usize) < vocab);
-
-        let mut ref_kv = new_cpu_kv(&raw_model);
-        for (p, &t) in prompt.iter().enumerate() {
-            let _ = raw_model.forward_token_with_kv(t, p, &mut ref_kv);
+        if crate::hardware::available_devices().contains(&Device::Metal) {
+            prefill_and_decode_parity(Device::Metal);
         }
-        let ref_logits = raw_model.forward_token_with_kv(next_tok, prompt.len(), &mut ref_kv);
-        let prog_logits = match &exec_model {
-            ExecutableModel::Program(p, _) => {
-                let mut prog = p.write();
-                let inps = vec![
-                    crate::graph::Tensor::U32(vec![next_tok]),
-                    crate::graph::Tensor::U32(vec![prompt.len() as u32]),
-                ];
-                match prog.run(inps).unwrap().remove(0) {
-                    crate::graph::Tensor::F32(v) => v,
-                    _ => panic!("expected f32 logits"),
-                }
-            }
-            _ => unreachable!(),
-        };
-        let max_diff = prog_logits
-            .iter()
-            .zip(&ref_logits)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_diff < 1e-3,
-            "Max logits difference {max_diff} exceeds 1e-3 tolerance"
-        );
-        let exp_dec_tok =
-            raw_model.sample_next_token_with_penalty(&ref_logits, &full_prompt, 0.0, 50, 1.0, 1.0);
-        let prog_val = ref_logits[dec_tok as usize];
-        let exp_val = ref_logits[exp_dec_tok as usize];
-        assert!(
-            (prog_val - exp_val).abs() < 1e-3,
-            "Metal Program picked token {dec_tok} (logit {prog_val}) vs reference {exp_dec_tok} (logit {exp_val})"
-        );
-
-        // 2d. Batched prefill with m >= 16 (chunk of 20 tokens) on Metal
-        let long_prompt: Vec<u32> = (0..20).map(|i| (i * 7 + 3) % vocab as u32).collect();
-        let mut batched_kv = None;
-        let batched_tok = exec_model
-            .step_prefill_chunk(
-                &long_prompt,
-                0,
-                true,
-                &long_prompt,
-                0.0,
-                1.0,
-                &mut batched_kv,
-            )
-            .expect("Batched 20-token prefill succeeds");
-
-        let ref_batched_logits = raw_model.forward(&long_prompt);
-        let exp_batched_tok = raw_model.sample_next_token_with_penalty(
-            &ref_batched_logits,
-            &long_prompt,
-            0.0,
-            50,
-            1.0,
-            1.0,
-        );
-        let prog_batched_val = ref_batched_logits[batched_tok.unwrap() as usize];
-        let exp_batched_val = ref_batched_logits[exp_batched_tok as usize];
-        assert!(
-            (prog_batched_val - exp_batched_val).abs() < 1e-3,
-            "Batched prefill token logit {prog_batched_val} vs reference {exp_batched_val}"
-        );
-
-        // Decode 1 step after batched prefill
-        let next_b_tok = batched_tok.unwrap();
-        let mut full_long = long_prompt.clone();
-        full_long.push(next_b_tok);
-        let dec_b_tok = exec_model
-            .step_token_with_kv(
-                &full_long,
-                next_b_tok,
-                full_long.len(),
-                0.0,
-                1.0,
-                None,
-                &mut batched_kv,
-            )
-            .map(|(t, _)| t)
-            .expect("Decode step after batched prefill succeeds");
-        assert!((dec_b_tok as usize) < vocab);
     }
 }

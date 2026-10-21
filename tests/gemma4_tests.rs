@@ -8,9 +8,9 @@ use gibbs_engine::model::hub::ModelArtifacts;
 use gibbs_engine::model::native::{MediaInput, NativeLm};
 
 /// The checkpoint under its family spec (`runtime::lm`).
-fn load_native(a: &ModelArtifacts, d: Device) -> Option<Result<Arc<dyn NativeLm>, String>> {
+fn load_spec(a: &ModelArtifacts, d: Device) -> Result<Arc<dyn NativeLm>, String> {
     let reg = gibbs_engine::arch::registry().expect("registry");
-    Some(gibbs_engine::runtime::lm::load(a, reg, None, gibbs_engine::hardware::PlacementMode::Pin(d)))
+    gibbs_engine::runtime::lm::load(a, reg, None, gibbs_engine::hardware::PlacementMode::Pin(d))
 }
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -35,8 +35,7 @@ static MODEL: LazyLock<Option<Arc<dyn NativeLm>>> = LazyLock::new(|| {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, Device::Cpu)
-            .expect("gemma4 is native")
+        load_spec(&artifacts, Device::Cpu)
             .expect("gemma4 loads"),
     )
 });
@@ -227,8 +226,7 @@ fn load_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, device)
-            .expect("gemma4 GGUF is native")
+        load_spec(&artifacts, device)
             .expect("gemma4 GGUF loads"),
     )
 }
@@ -309,8 +307,7 @@ fn load_moe_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, device)
-            .expect("gemma4 MoE GGUF is native")
+        load_spec(&artifacts, device)
             .expect("gemma4 MoE GGUF loads"),
     )
 }
@@ -426,8 +423,7 @@ fn load_mm_gguf(device: Device) -> Option<Arc<dyn NativeLm>> {
         ..Default::default()
     };
     Some(
-        load_native(&artifacts, device)
-            .expect("gemma4 GGUF is native")
+        load_spec(&artifacts, device)
             .expect("gemma4 GGUF loads"),
     )
 }

@@ -109,42 +109,23 @@ fn median(v: &mut [f64]) -> Option<f64> {
 pub struct BenchLoad {
     pub exec: crate::scheduler::ExecutableModel,
     /// The re-encode policy whose formats the model's projections ended up in: what the KL
-    /// fallback chain applied (GraphLm loads and, via the same chain, native loads).
+    /// fallback chain applied.
     pub policy: crate::model::weight_format::ReencodePolicy,
-    /// Bytes per token that native loaders saved against the source blocks under `policy`
-    /// (those are counted from the header with [`ReencodePolicy::BitExact`]); 0 for GraphLm loads.
+    /// Bytes per token the loader saved against the source blocks under `policy` (those are
+    /// counted from the header with [`ReencodePolicy::BitExact`]).
     pub saved_bytes: u64,
 }
 
 /// `(policy, saved bytes per token)` a finished load applied: the roofline basis of
-/// [`roofline_bytes`]. `choice` is a GraphLm load's weight-format choice (`requested` when it
-/// names no policy); `None` reads the native loader's record, where tensors keep their source
-/// formats (bit-exact) unless it saved bytes.
-pub fn applied_policy(
-    choice: Option<&crate::model::weight_format::Choice>,
-    requested: crate::model::weight_format::ReencodePolicy,
-) -> (crate::model::weight_format::ReencodePolicy, u64) {
+/// [`roofline_bytes`], from the loader's record: tensors keep their source formats (bit-exact)
+/// minus the bytes it saved, which are counted from the header with [`ReencodePolicy::BitExact`].
+///
+/// [`ReencodePolicy::BitExact`]: crate::model::weight_format::ReencodePolicy::BitExact
+pub fn applied_policy() -> (crate::model::weight_format::ReencodePolicy, u64) {
     use crate::model::weight_format::ReencodePolicy;
-    let Some(choice) = choice else {
-        let (policy, saved) =
-            crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0));
-        return (
-            if saved > 0 {
-                ReencodePolicy::BitExact
-            } else {
-                policy
-            },
-            saved,
-        );
-    };
-    // `applied` reads `max-speed`, `max-speed (FFN only)`, `low-bit-native` or `bit-exact`.
-    // ponytail: the FFN-only attempt is costed as full max-speed; exact bytes need per-tensor records.
-    let policy = choice
-        .reencode
-        .as_ref()
-        .and_then(|r| r.applied.split(" (").next()?.parse::<ReencodePolicy>().ok())
-        .unwrap_or(requested);
-    (policy, 0)
+    let (policy, saved) =
+        crate::model::reencode::native_applied().unwrap_or((ReencodePolicy::BitExact, 0));
+    (if saved > 0 { ReencodePolicy::BitExact } else { policy }, saved)
 }
 
 /// Loads `artifacts` on Metal under the `reencode` policy name (the effective policy of every
@@ -157,13 +138,11 @@ pub fn load_for_bench(
         policy: reencode.parse()?,
         ..Default::default()
     };
-    let policy = cfg.policy;
-    let (exec, choice) = crate::arch::dispatch::load_lm(
+    let exec = crate::arch::dispatch::load_lm(
         artifacts,
         &crate::arch::LoadOpts {
             placement: crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
             token: None,
-            quant: None,
             quant_name: None,
             hw: &crate::hardware::HardwareCapability::probe_system(),
             reencode: cfg,
@@ -173,10 +152,7 @@ pub fn load_for_bench(
             admit: &|_| Ok(()),
         },
     )?;
-    let (policy, saved_bytes) = match &choice {
-        None => applied_policy(None, policy),
-        Some(c) => (applied_policy(Some(c), policy).0, 0),
-    };
+    let (policy, saved_bytes) = applied_policy();
     Ok(BenchLoad {
         exec,
         policy,
@@ -489,7 +465,6 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
             let opts = crate::arch::LoadOpts {
                 placement: crate::hardware::PlacementMode::Pin(dev),
                 token: None,
-                quant: None,
                 quant_name: None,
                 hw: &hw,
                 reencode: crate::model::weight_format::ReencodeConfig::effective(),
@@ -498,39 +473,14 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 system1_first: false,
                 admit: &|_| Ok(()),
             };
-            crate::arch::dispatch::load_lm(&artifacts, &opts).map(|(e, _)| match e {
-                crate::scheduler::ExecutableModel::Native(m) => Some(m),
-                crate::scheduler::ExecutableModel::Program(..) => None,
-            })
+            crate::arch::dispatch::load_lm(&artifacts, &opts).map(|e| e.0)
         };
-        let loaded = load(crate::hardware::Device::Metal).and_then(|m| match m {
-            Some(m) => {
-                let _cpu = crate::hardware::cpu_compute::allow();
-                let c = load(crate::hardware::Device::Cpu)?;
-                Ok(c.map(|c| (m, c)))
-            }
-            None => Ok(None),
+        let loaded = load(crate::hardware::Device::Metal).and_then(|m| {
+            let _cpu = crate::hardware::cpu_compute::allow();
+            Ok((m, load(crate::hardware::Device::Cpu)?))
         });
         let (metal_exec, cpu_exec) = match loaded {
-            Ok(Some(pair)) => pair,
-            Ok(None) => {
-                // GraphLm checkpoint: no separate native forward, so compare the Metal decode
-                // program with the CPU graph executor on the very same graph and weights.
-                match graph_lm_parity(&artifacts, &suite, model_cfg) {
-                    Ok(min_cos) => {
-                        eprintln!(
-                            "parity: {} ok (graph executor vs Metal, 16 steps, min cos {min_cos:.5})",
-                            model_cfg.id
-                        );
-                        compared += 1;
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("parity: {} FAILED: {e}", model_cfg.id);
-                        return Ok(4);
-                    }
-                }
-            }
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("parity: load error for {}: {e}", model_cfg.id);
                 return Ok(4);
@@ -606,89 +556,6 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
         return Ok(4);
     }
     Ok(0)
-}
-
-/// Greedy 16-step comparison of the Metal decode program against the CPU graph executor for a
-/// GraphLm checkpoint (same graph, same weights). Returns the minimum logits cosine.
-fn graph_lm_parity(
-    artifacts: &crate::model::hub::ModelArtifacts,
-    suite: &BenchSuite,
-    model_cfg: &BenchModel,
-) -> Result<f32, String> {
-    use crate::graph::{program::GraphProgram, Tensor};
-    let hw = crate::hardware::HardwareCapability::probe_system();
-    let default_reencode = suite
-        .defaults
-        .as_ref()
-        .map_or_else(default_reencode, |d| d.reencode.clone());
-    let cfg = model_cfg
-        .reencode
-        .as_ref()
-        .unwrap_or(&default_reencode)
-        .parse()
-        .map(|policy| crate::model::weight_format::ReencodeConfig {
-            policy,
-            ..Default::default()
-        })?;
-    let (lm, _) = crate::model::weight_format::load_causal_lm_with(
-        artifacts,
-        crate::hardware::Device::Metal,
-        None,
-        &hw,
-        &cfg,
-    )?;
-    let (g, w) = lm.to_decode_graph();
-    let mut metal = GraphProgram::compile(
-        g.clone(),
-        w.clone(),
-        crate::hardware::PlacementMode::Pin(crate::hardware::Device::Metal),
-    )?;
-    let _allow = crate::hardware::cpu_compute::allow();
-    let mut cpu = GraphProgram::compile(
-        g,
-        w,
-        crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
-    )?;
-    let logits = |p: &mut GraphProgram, tok: u32, pos: usize| -> Result<Vec<f32>, String> {
-        match p
-            .run(vec![Tensor::U32(vec![tok]), Tensor::U32(vec![pos as u32])])?
-            .into_iter()
-            .next()
-        {
-            Some(Tensor::F32(v)) => Ok(v),
-            _ => Err("program did not return f32 logits".into()),
-        }
-    };
-    // Fixed small token ids (valid in every vocabulary), then greedy continuation.
-    let prompt = [1u32, 450, 3250, 1129, 29, 94, 311, 20];
-    let mut min_cos = 1.0f32;
-    let mut tok = 0u32;
-    for pos in 0..prompt.len() + 8 {
-        if pos < prompt.len() {
-            tok = prompt[pos];
-        }
-        let (m, c) = (logits(&mut metal, tok, pos)?, logits(&mut cpu, tok, pos)?);
-        let dot: f32 = m.iter().zip(&c).map(|(a, b)| a * b).sum();
-        let nm = m.iter().map(|a| a * a).sum::<f32>().sqrt();
-        let nc = c.iter().map(|a| a * a).sum::<f32>().sqrt();
-        let cos = dot / (nm * nc).max(1e-9);
-        let top = |v: &[f32]| {
-            v.iter()
-                .enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map_or(0, |(i, _)| i)
-        };
-        min_cos = min_cos.min(cos);
-        if cos < 0.999 {
-            return Err(format!(
-                "step {pos}: cos {cos:.5} (metal top {}, cpu top {})",
-                top(&m),
-                top(&c)
-            ));
-        }
-        tok = top(&c) as u32;
-    }
-    Ok(min_cos)
 }
 
 /// `--probe-top5`: raw (no chat template) prompt logits of `model_id` on Metal, as one JSON line

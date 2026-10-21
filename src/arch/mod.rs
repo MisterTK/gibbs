@@ -28,8 +28,6 @@ mod tests_encoders_modernbert;
 mod tests_encoders_bert_gguf;
 #[cfg(test)]
 mod tests_encoders_deberta;
-#[cfg(test)]
-mod tests_idefics3;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -999,7 +997,7 @@ mod tests {
         assert!(!glob("org/?", "org/ab"));
     }
 
-    // ---- LM family specs vs GraphLm / LnDecoder (fixtures as in `tests/golden/lm.rs`, `enc.rs`) ----
+    // ---- LM family specs vs the deleted GraphLm / LnDecoder (frozen outputs) (fixtures as in `tests/golden/lm.rs`, `enc.rs`) ----
 
     use super::testing::{compare, Runner, Weights};
     use crate::hardware::Device;
@@ -1145,7 +1143,7 @@ mod tests {
     }
 
     /// GPT-Neo (`transformer.h.{l}.attn.attention.*`, Linear MLP, learned positions), which GraphLm
-    /// loads. GraphLm scales scores by 1/sqrt(head_dim); `attention_multiplier: 1.0` makes it use
+    /// loaded. GraphLm scaled scores by 1/sqrt(head_dim); `attention_multiplier: 1.0` made it use
     /// GPT-Neo's unscaled scores, and the local layer's window (256) covers the 9 tokens.
     fn neo_fixture() -> (J, Weights) {
         let (h, inter) = (32, 64);
@@ -1283,14 +1281,13 @@ mod tests {
         assert_eq!(r.unconsumed(), Vec::<String>::new(), "{case}: unconsumed checkpoint tensors");
     }
 
-    /// Each GraphLm fixture family against GraphLm (`hf_loader::load_causal_lm` +
-    /// `ExecutableModel::load_graph_lm`) on the same device; GPT-2 / OPT (which GraphLm does not
+    /// Each GraphLm fixture family against the deleted GraphLm's frozen CPU logits
+    /// (`tests/golden/lm_graph_lm_logits.json`); GPT-2 / OPT (which GraphLm did not
     /// load) against the frozen `LnDecoder` hidden states (`tests/golden/lm_ln_decoder_hidden.json`);
     /// BitNet against `tests/golden/lm_bitnet.json`
     /// (GraphLm's BitNet graph is wrong). Prefill 6 rows, then 3 cached decode steps.
     #[test]
     fn llama_family_matches_graph_lm() {
-        use crate::hardware::QuantMode;
         let tmp = tempfile::tempdir().unwrap();
         let mut bad = Vec::new();
         let seq: Vec<u32> = PROMPT.iter().chain(&DECODE).copied().collect();
@@ -1314,17 +1311,25 @@ mod tests {
             ("gpt_neox", "gpt_neox", neox_fixture().0, neox_fixture().1),
             ("gpt_neo", "gpt2", neo_fixture().0, neo_fixture().1),
         ];
+        // The deleted GraphLm's CPU logits on these fixtures (`tests/golden/lm_graph_lm_logits.json`,
+        // written by it at c96457c).
+        let gl_ref: J = serde_json::from_slice(
+            &std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lm_graph_lm_logits.json")).unwrap(),
+        )
+        .unwrap();
         for (case, family, cfg, w) in &graph_lm {
             let dir = tmp.path().join(case);
             w.write_checkpoint(&dir, cfg, V);
             for dev in devices() {
-                let llm = crate::model::hf_loader::load_causal_lm(&super::testing::artifacts(&dir), QuantMode::Uncompressed)
-                    .unwrap_or_else(|e| panic!("{case}: GraphLm: {e}"));
-                let m = crate::scheduler::ExecutableModel::load_graph_lm(llm, dev).unwrap();
                 let (got, r) = spec_steps(&dir, family, dev, &PROMPT, &DECODE, "last", "logits");
                 all_read(&r, case);
                 for (i, g) in got.iter().enumerate() {
-                    let want = m.prompt_logits(seq[..PROMPT.len() + i].to_vec()).unwrap();
+                    let want: Vec<f32> = gl_ref["f32"][format!("{case}.step{i}")]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_f64().unwrap() as f32)
+                        .collect();
                     close(&mut bad, &format!("{case} {dev:?} step {i}"), g, &want);
                 }
             }

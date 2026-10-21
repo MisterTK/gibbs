@@ -91,7 +91,7 @@ fn run(m: &Arc<dyn NativeLm>, spec: bool, prompts: &[&str], max: usize) -> (Vec<
     let sched = ContinuousBatchScheduler::new(
         REPO,
         Arc::new(PagedKVPool::new(4096)),
-        Some(ExecutableModel::Native(m.clone())),
+        Some(ExecutableModel::new(m.clone())),
     );
     if !spec {
         sched.set_drafter(None);
@@ -190,7 +190,7 @@ fn mtp_sampling_keeps_target_distribution() {
         let sched = ContinuousBatchScheduler::new(
             REPO,
             Arc::new(PagedKVPool::new(64)),
-            Some(ExecutableModel::Native(m.clone())),
+            Some(ExecutableModel::new(m.clone())),
         );
         let mut rx = sched.submit_with_params(params, |_| ids.clone()).1;
         while sched.step().active_sequences_count > 0 {}

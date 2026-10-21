@@ -274,11 +274,9 @@ pub fn hub_verdict(m: &Value) -> Option<Result<(), String>> {
             return Some(Ok(()));
         }
         if is_generator(a) {
-            // The LLM loaders: causal-LM family specs, plus the native models.
-            let runs = model_type.is_some_and(|t| {
-                crate::arch::registry().is_ok_and(|r| r.runs_model_type(t))
-                    || crate::model::native::NATIVE_MODEL_TYPES.contains(&t)
-            });
+            // The LLM loaders: causal-LM family specs.
+            let runs = model_type
+                .is_some_and(|t| crate::arch::registry().is_ok_and(|r| r.runs_model_type(t)));
             return (runs && !cfg["auto_map"].is_object()).then_some(Ok(()));
         }
         if !classifier_task {

@@ -339,7 +339,6 @@ async fn http_classify_rerank_and_chat_refusal() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use gibbs_engine::kv::PagedKVPool;
-    use gibbs_engine::model::graph_lm::{GraphLm, GraphLmConfig};
     use gibbs_engine::scheduler::{ContinuousBatchScheduler, ExecutableModel};
     use gibbs_engine::server::{create_router, AppState};
     use gibbs_engine::telemetry::EngineTelemetry;
@@ -349,12 +348,18 @@ async fn http_classify_rerank_and_chat_refusal() {
     let Some(c) = cached("cross-encoder/ms-marco-MiniLM-L-6-v2", "model.safetensors") else {
         return;
     };
-    let llm = GraphLm::new(GraphLmConfig::smollm_1m());
     let state = AppState {
         scheduler: Arc::new(ContinuousBatchScheduler::new(
             "gibbs/smollm-1m",
             Arc::new(PagedKVPool::new(64)),
-            Some(ExecutableModel::load_graph_lm(llm, gibbs_engine::hardware::Device::Cpu).unwrap()),
+            Some({
+                let a = gibbs_engine::model::hub::HuggingFaceHub::new()
+                    .resolve_or_synthesize_tiny("gibbs/smollm-1m")
+                    .unwrap();
+                let reg = gibbs_engine::arch::registry().unwrap();
+                let cpu = gibbs_engine::hardware::Device::Cpu.into();
+                ExecutableModel::new(gibbs_engine::runtime::lm::load(&a, reg, None, cpu).unwrap())
+            }),
         )),
         telemetry: EngineTelemetry::new(),
         jev_model: Default::default(),

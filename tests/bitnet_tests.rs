@@ -71,7 +71,7 @@ fn complete(repo: &str, prompt: impl Fn(&Tokenizer) -> String) -> Option<String>
     };
     let reg = gibbs_engine::arch::registry().unwrap();
     let lm = gibbs_engine::runtime::lm::load(&artifacts, reg, None, PlacementMode::Auto).unwrap();
-    let m = ExecutableModel::Native(lm);
+    let m = ExecutableModel::new(lm);
     let (out, _, _) = m
         .generate_text_measured_plain(&prompt(&m.tokenizer()), 12, 0.0)
         .unwrap();

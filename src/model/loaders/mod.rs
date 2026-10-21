@@ -126,7 +126,7 @@ pub fn load_with_format(
 }
 
 /// Tensors gathered from a non-safetensors checkpoint into the single buffer + manifest
-/// [`crate::model::graph_lm::GraphLm::from_manifest`] reads (safetensors dtype names, native bytes kept).
+/// [`crate::arch::load`] reads (safetensors dtype names, native bytes kept).
 #[derive(Default)]
 pub struct Checkpoint {
     pub manifest: crate::model::ModelManifest,

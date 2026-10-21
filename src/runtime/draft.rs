@@ -810,10 +810,7 @@ fn load_plain(
     target: &ModelArtifacts,
     mode: PlacementMode,
 ) -> Result<Arc<dyn Drafter>, String> {
-    let lm = match crate::model::native::load_native(draft, mode) {
-        Some(m) => m?,
-        None => crate::runtime::lm::load(draft, reg, None, mode)?,
-    };
+    let lm = crate::runtime::lm::load(draft, reg, None, mode)?;
     let ttok = crate::model::hf_loader::load_json_tokenizer(
         target
             .tokenizer_path

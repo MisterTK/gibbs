@@ -59,7 +59,7 @@ pub fn parse_ggml(data: &[u8]) -> Result<ModelManifest, String> {
     metadata.insert("n_rot".into(), n_rot.to_string());
     metadata.insert("ftype".into(), ftype.to_string());
 
-    // Map to universal architecture keys for GraphLm compatibility
+    // Map to the GGUF architecture keys the family specs read
     metadata.insert("llama.embedding_length".into(), n_embd.to_string());
     metadata.insert("llama.block_count".into(), n_layer.to_string());
     metadata.insert("llama.attention.head_count".into(), n_head.to_string());

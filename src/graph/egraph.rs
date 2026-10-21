@@ -1478,6 +1478,20 @@ mod tests {
         assert_eq!(digest(&got), 0x60b562d4ff6d6669, "qkv slices attn: golden");
     }
 
+    /// The llama spec's decode instance (one row, last-row head) on the synthetic checkpoint of
+    /// [`crate::arch::testing::synthetic_llama`].
+    fn llama_decode() -> Gw {
+        use crate::arch::expr::Val;
+        let dir = tempfile::tempdir().unwrap();
+        let a = crate::arch::testing::synthetic_llama(dir.path(), serde_json::json!({}));
+        let mut r =
+            crate::arch::testing::Runner::from_artifacts(&a, Some("llama"), crate::hardware::Device::Cpu, 512)
+                .unwrap();
+        let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
+        let i = r.instance("text", &vars).unwrap();
+        (i.graph, r.model.store.materialize(&i.weights).unwrap())
+    }
+
     #[test]
     fn synthetic_models_match_goldens() {
         let models: Vec<(&str, Gw)> = vec![
@@ -1485,17 +1499,11 @@ mod tests {
                 "dense decoder (4 layers)",
                 crate::graph::synth_decoder::synthetic_decoder(4, 64, 128, 4, 2, 16),
             ),
-            (
-                "GraphLm 1M",
-                crate::model::graph_lm::GraphLm::new(
-                    crate::model::graph_lm::GraphLmConfig::smollm_1m(),
-                )
-                .to_decode_graph(),
-            ),
+            ("llama spec (synthetic, 2 layers)", llama_decode()),
         ];
         let want = [
             ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
-            ([0; 4], 0x927782df5841c11f),
+            ([2, 0, 2, 0], 0x31f3e827bbf3b7ee),
 
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
@@ -1524,33 +1532,24 @@ mod tests {
                 continue;
             }
             let arch = crate::model::loaders::gguf::architecture(&p).unwrap_or_default();
-            let gw: Gw = match arch.as_str() {
-                // Spec families: the decode instance (one row, last-row head).
-                "gemma4" |
-                "qwen3" | "qwen3moe" | "hunyuan-dense" | "qwen35" | "qwen35moe" | "qwen4exp" => {
-                    use crate::arch::expr::Val;
-                    let a = crate::model::hub::ModelArtifacts {
-                        model_id: "egraph/real".into(),
-                        weights_path: Some(p.clone()),
-                        ..Default::default()
-                    };
-                    let mut r = crate::arch::testing::Runner::from_artifacts(
-                        &a,
-                        None,
-                        crate::hardware::Device::Cpu,
-                        4096,
-                    )
-                    .unwrap();
-                    let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
-                    let i = r.instance("text", &vars).unwrap();
-                    (i.graph, r.model.store.materialize(&i.weights).unwrap())
-                }
-                _ => crate::model::graph_lm::GraphLm::from_gguf_data(
-                    crate::model::graph_lm::GraphLmConfig::default(),
-                    &std::fs::read(&p).unwrap(),
+            // The detected family spec's decode instance (one row, last-row head).
+            let gw: Gw = {
+                use crate::arch::expr::Val;
+                let a = crate::model::hub::ModelArtifacts {
+                    model_id: "egraph/real".into(),
+                    weights_path: Some(p.clone()),
+                    ..Default::default()
+                };
+                let mut r = crate::arch::testing::Runner::from_artifacts(
+                    &a,
+                    None,
+                    crate::hardware::Device::Cpu,
+                    4096,
                 )
-                .unwrap()
-                .to_decode_graph(),
+                .unwrap();
+                let vars = [("rows", Val::Num(1.0)), ("head", Val::Str("last".into()))];
+                let i = r.instance("text", &vars).unwrap();
+                (i.graph, r.model.store.materialize(&i.weights).unwrap())
             };
             let nodes = gw.0.nodes.len();
             // The shipped configuration: rates from the tune cache when present.

@@ -6,7 +6,6 @@ use super::mascot::MascotState;
 use super::theme::{Theme, Token};
 use super::widgets::{gauge, instrument, orbit, spark, stacked_bar, text_width, trunc};
 use super::{Load, TuiApp};
-use crate::model::weight_format::MAX_MEAN_KL;
 use crate::scheduler::SequenceState;
 use crate::telemetry::{gpu_share, KernelSort, TelemetrySnapshot};
 use ratatui::{
@@ -83,17 +82,6 @@ pub(super) fn load_stage(l: &Load) -> (usize, u64, u64, f32) {
         0.0
     };
     (idx, done, total, pct)
-}
-
-fn codec_token(name: &str) -> Token {
-    const T: [Token; 5] = [
-        Token::Brass,
-        Token::Cyanotype,
-        Token::Jade,
-        Token::Ember,
-        Token::Gold,
-    ];
-    T[name.bytes().map(usize::from).sum::<usize>() % T.len()]
 }
 
 /// The codec micro-benchmark as the Device panel shows it: `(state, done, total)` with state 1
@@ -194,12 +182,6 @@ impl TuiApp {
         State::Equilibrium
     }
 
-    fn weights_bpw(&self) -> Option<f32> {
-        self.weights
-            .as_ref()
-            .map(|w| w.mode.effective_bits_per_weight())
-    }
-
     fn focused(&self, c: Comp) -> bool {
         self.detail == Some(c)
     }
@@ -273,16 +255,6 @@ impl TuiApp {
                 segs.push(("device", seg(d, th.fg(Token::Parchment)), false));
             }
             if classifier.is_none() {
-                if let (Some(w), Some(bpw)) = (&self.weights, self.weights_bpw()) {
-                    segs.push((
-                        "format",
-                        seg(
-                            format!("{:?} {bpw:.1} bpw", w.mode),
-                            th.fg(Token::Parchment),
-                        ),
-                        false,
-                    ));
-                }
                 segs.push((
                     "tps",
                     seg(
@@ -406,10 +378,11 @@ impl TuiApp {
         ));
 
         // Decode streams every weight once and spends 2 flops on it: AI = 2 / (bpw / 8) F/B.
-        // ponytail: estimate from the weight format; exact value needs PreparedPlan::flops_per_run
-        // plumbed into telemetry (graph/scheduler are outside the TUI).
+        // ponytail: estimated from the `--quant` format only; exact value needs
+        // PreparedPlan::flops_per_run plumbed into telemetry (graph/scheduler are outside the TUI).
         let ai = self
-            .weights_bpw()
+            .quant_override
+            .map(|f| f.bits_per_weight())
             .filter(|b| *b > 0.0)
             .map(|b| 16.0 / b as f64);
         let peak = self.gemm_peak_gflops;
@@ -809,104 +782,29 @@ impl TuiApp {
 
     pub(super) fn render_weights(&self, f: &mut Frame, area: Rect, th: &Theme) {
         let dim = th.fg(Token::Dim);
-        let Some(w) = &self.weights else {
-            let block = instrument("Weights", None, false, th);
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            // Native models and classifiers keep their stored weights; only GraphLm loads choose.
-            let serving = self.classifier.read().is_some()
-                || self.scheduler.as_ref().is_some_and(|s| s.has_model());
-            let text = if serving {
-                "weights run as stored (no format pick)"
-            } else {
-                "no LLM loaded"
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(trunc(text, inner.width as usize), dim)),
-                inner,
-            );
-            return;
-        };
-        let name = format!("{:?}", w.mode);
-        let bpw = w.mode.effective_bits_per_weight();
-        let block = instrument(
-            "Weights",
-            Some(Line::from(format!("{name} {bpw:.2} bpw"))),
-            false,
-            th,
-        );
+        let block = instrument("Weights", None, false, th);
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
         let iw = inner.width as usize;
-        let tok = codec_token(&name);
-        // The engine serves one weight format per model, so the bar is a single codec.
-        let mut lines = vec![
-            Line::from(stacked_bar(&[(tok, 1.0)], iw, th)),
-            Line::from(vec![
-                Span::styled("■ ", th.fg(tok)),
-                Span::styled(
-                    trunc(&format!("{name} 100%"), iw.saturating_sub(2)),
-                    th.fg(Token::Parchment),
-                ),
-            ]),
-            Line::from(Span::styled(
-                trunc(
-                    &format!(
-                        "reencode {:?} · variant {:?}",
-                        self.reencode_policy, self.variant_policy
-                    ),
-                    iw,
-                ),
-                dim,
-            )),
-        ];
-        let chosen = w.trials.iter().find(|t| t.mode == w.mode);
-        let gate = match (chosen.and_then(|t| t.mean_kl), chosen.and_then(|t| t.top1)) {
-            (Some(kl), top1) => format!(
-                "KL {kl:.3} nats · top-1 {}",
-                top1.map_or("—".to_string(), |t| format!("{:.0}%", t * 100.0))
+        let serving = self.classifier.read().is_some()
+            || self.scheduler.as_ref().is_some_and(|s| s.has_model());
+        // Spec loads store weights as the checkpoint has them, or re-encoded per the policy (its
+        // KL gate may fall back to bit-exact), or as `--quant`.
+        let mut lines = vec![Line::from(Span::styled(
+            trunc(if serving { "weights as stored or re-encoded" } else { "no LLM loaded" }, iw),
+            dim,
+        ))];
+        let policy = match &self.quant_override {
+            Some(f) => format!("--quant {}", f.name()),
+            None => format!(
+                "reencode {:?} · variant {:?}",
+                self.reencode_policy, self.variant_policy
             ),
-            _ => "bit-exact".to_string(),
         };
-        lines.push(Line::from(Span::styled(trunc(&gate, iw), dim)));
-        if self.focused(Comp::Weights) || inner.height as usize > lines.len() + 1 {
-            if w.trials.len() > 1 {
-                let base = w.trials[0].layer_gemv_us.max(1e-9);
-                lines.push(Line::from(Span::styled(
-                    trunc(
-                        &format!("{:<13}{:>8}{:>8}{:>9}", "format", "GEMV µs", "vs f32", "KL"),
-                        iw,
-                    ),
-                    dim,
-                )));
-                for t in &w.trials {
-                    let on = t.mode == w.mode;
-                    let kl = t.mean_kl.map_or("-".to_string(), |k| format!("{k:.4}"));
-                    let st = match t.mean_kl {
-                        Some(k) if !(k <= MAX_MEAN_KL) => th.fg(Token::Crimson),
-                        _ if on => th.fg(Token::Jade),
-                        _ => th.fg(Token::Parchment),
-                    };
-                    lines.push(Line::from(Span::styled(
-                        trunc(
-                            &format!(
-                                "{}{:<12}{:>8.0}{:>7.2}x{:>9}",
-                                if on { "●" } else { " " },
-                                format!("{:?}", t.mode),
-                                t.layer_gemv_us,
-                                t.layer_gemv_us / base,
-                                kl
-                            ),
-                            iw,
-                        ),
-                        st,
-                    )));
-                }
-            }
-        }
+        lines.push(Line::from(Span::styled(trunc(&policy, iw), dim)));
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1304,12 +1202,6 @@ impl TuiApp {
         {
             a.push(seg(
                 format!("H {:.1} bits", t.entropy / LN2),
-                th.fg(Token::Parchment),
-            ));
-        }
-        if let (Some(w), Some(bpw)) = (&self.weights, self.weights_bpw()) {
-            a.push(seg(
-                format!("{:?} {bpw:.1} bpw", w.mode),
                 th.fg(Token::Parchment),
             ));
         }

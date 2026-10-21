@@ -1313,9 +1313,13 @@ mod tests {
             weights_path: Some(path),
             ..Default::default()
         };
-        let lm = crate::model::native::load_native(&artifacts, crate::hardware::Device::Cpu)
-            .expect("a .ninfer file is a native model")
-            .unwrap();
+        let lm = crate::runtime::lm::load(
+            &artifacts,
+            crate::arch::registry().unwrap(),
+            None,
+            crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
+        )
+        .expect("a .ninfer file loads as a spec LM");
         println!("{ninfer}: {}", lm.summary());
         let msgs = [crate::model::hf_loader::ChatMessage::new(
             "user",
@@ -1379,9 +1383,13 @@ mod tests {
                 weights_path: Some(p),
                 ..Default::default()
             };
-            crate::model::native::load_native(&a, crate::hardware::Device::Cpu)
-                .unwrap()
-                .unwrap()
+            crate::runtime::lm::load(
+                &a,
+                crate::arch::registry().unwrap(),
+                None,
+                crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
+            )
+            .unwrap()
         };
         let (a, b) = (load(nin), load(gg));
         let msgs = [crate::model::hf_loader::ChatMessage::new(

@@ -226,19 +226,6 @@ pub(super) fn fixture_app() -> TuiApp {
     for (i, v) in app.spark.iter_mut().enumerate().skip(80) {
         *v = 150 + ((i * 37) % 60) as u64;
     }
-    app.weights = Some(
-        serde_json::from_value(serde_json::json!({
-            "key": "fixture",
-            "mode": "Q8_0",
-            "trials": [
-                {"mode": "Uncompressed", "layer_gemv_us": 412.0, "ms_per_token": 31.0,
-                 "mean_kl": 0.0, "top1": 1.0, "verdict": "reference"},
-                {"mode": "Q8_0", "layer_gemv_us": 118.0, "ms_per_token": 9.1,
-                 "mean_kl": 0.0021, "top1": 0.99, "verdict": "chosen"}
-            ]
-        }))
-        .expect("fixture weights"),
-    );
     app.push_entry(
         "/chat Explain Gibbs free energy".into(),
         Kind::Text,

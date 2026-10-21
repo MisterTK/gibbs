@@ -135,6 +135,19 @@ impl QuantizedLinearLayer {
                     out_features,
                 }
             }
+            QuantFormat::GGUF_NVFP4 => {
+                if in_features % 64 != 0 {
+                    return Err(format!(
+                        "{format:?} needs in_features % 64 == 0, layer '{name}' has {in_features}"
+                    ));
+                }
+                QuantizedWeight::GgufQuantized {
+                    format,
+                    raw_data: Bytes::from(quantize_f32_to_gguf_nvfp4(weights)),
+                    in_features,
+                    out_features,
+                }
+            }
             QuantFormat::GGUF_Q8_0 => {
                 let raw = quantize_f32_to_q8_0(weights);
                 QuantizedWeight::GgufQuantized {
@@ -1341,6 +1354,51 @@ fn fused_gemv_gguf_blocks(
 /// `quantize_row_q4_0_ref`: `d = max/-8` for the signed element of largest magnitude, so
 /// re-encoding a dequantized block made by that reference quantizer reproduces it (imatrix-tuned
 /// blocks may differ; loaders carry raw blocks where they can).
+/// The UE4M3 scale byte's value as [`dequantize_nvfp4_block`] reads it (`0` and `0x7F`: 0).
+fn nvfp4_scale(x: u32) -> f32 {
+    let (e, m) = ((x >> 3) & 0xF, x & 7);
+    match x {
+        0 | 0x7F => 0.0,
+        _ if e == 0 => m as f32 / 1024.0,
+        _ => f32::from_bits(((e + 119) << 23) | (m << 20)),
+    }
+}
+
+/// llama.cpp `GGUF_NVFP4` blocks of 64 values ([`dequantize_nvfp4_block`] layout): per 16-value
+/// sub-block the smallest UE4M3 scale `d` with `12·d >= amax` (no value clips), then each value's
+/// nearest entry of the doubled E2M1 table. `weights.len()` is a multiple of 64.
+pub fn quantize_f32_to_gguf_nvfp4(weights: &[f32]) -> Vec<u8> {
+    // Scale codes 1..=0x7E decode to increasing values.
+    let scales: Vec<f32> = (1..0x7Fu32).map(nvfp4_scale).collect();
+    let mut out = Vec::with_capacity(weights.len() / 64 * 36);
+    for block in weights.chunks(64) {
+        let mut head = [0u8; 4];
+        let mut q = [0u8; 32];
+        for (s, sub) in block.chunks(16).enumerate() {
+            let amax = sub.iter().fold(0.0f32, |m, w| m.max(w.abs()));
+            if amax == 0.0 {
+                continue;
+            }
+            let i = scales.partition_point(|&d| d * 12.0 < amax).min(scales.len() - 1);
+            head[s] = i as u8 + 1;
+            let id = 1.0 / scales[i];
+            for (j, &w) in sub.iter().enumerate() {
+                let x = w * id;
+                let k = (0..16)
+                    .min_by(|&a, &b| {
+                        (KVALUES_FP4[a] as f32 - x).abs().total_cmp(&(KVALUES_FP4[b] as f32 - x).abs())
+                    })
+                    .unwrap() as u8;
+                // Values 0..8 in the low nibbles of bytes 4+8s.., 8..16 in the high nibbles.
+                q[8 * s + j % 8] |= if j < 8 { k } else { k << 4 };
+            }
+        }
+        out.extend_from_slice(&head);
+        out.extend_from_slice(&q);
+    }
+    out
+}
+
 pub fn quantize_f32_to_q4_0(weights: &[f32]) -> Vec<u8> {
     let num_blocks = (weights.len() + 31) / 32;
     let mut out = Vec::with_capacity(num_blocks * 18);
@@ -2119,6 +2177,28 @@ pub fn dot_product_4rows_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `GGUF_NVFP4` encoding round-trips through the decoder within half an E2M1 step of each
+    /// sub-block's scale, keeps zeros and the sign, and never clips the sub-block maximum.
+    #[test]
+    fn gguf_nvfp4_encode_round_trips() {
+        let w: Vec<f32> = (0..256).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013 * (1 + i / 64) as f32).collect();
+        let raw = quantize_f32_to_gguf_nvfp4(&w);
+        assert_eq!(raw.len(), 4 * 36);
+        let mut y = vec![0.0f32; 256];
+        for (b, out) in raw.chunks(36).zip(y.chunks_mut(64)) {
+            dequantize_nvfp4_block(b, out);
+        }
+        for (sub, (a, b)) in w.chunks(16).zip(y.chunks(16)).enumerate() {
+            let amax = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            // d <= amax/12 * 1.125 (the next UE4M3 step); the widest E2M1 gap is 4 (8..12).
+            let tol = amax / 12.0 * 1.125 * 2.0 + 1e-6;
+            for (x, z) in a.iter().zip(b) {
+                assert!((x - z).abs() <= tol, "sub {sub}: {x} -> {z} (tol {tol})");
+                assert!(*x == 0.0 || z.signum() == x.signum() || *z == 0.0, "sub {sub}: sign of {x} -> {z}");
+            }
+        }
+    }
     use crate::hardware::QuantFormat;
 
     /// Deterministic bell-shaped weights with per-block scale and an outlier every fourth block;

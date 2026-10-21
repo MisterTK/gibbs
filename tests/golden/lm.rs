@@ -1,11 +1,12 @@
-//! GraphLm decoders (llama, granite, LFM2, q/k-norm, wide GQA), BitNet and Nano.
+//! The deleted GraphLm's decoders (llama, granite, LFM2, q/k-norm, wide GQA), BitNet and Nano, run
+//! through their family specs (`runtime::lm::SpecLm`) against goldens frozen from the old code.
 
 use crate::util::*;
 use gibbs_engine::arch::LoadOpts;
 use gibbs_engine::graph::Tensor;
-use gibbs_engine::hardware::{Device, HardwareCapability, QuantMode};
-use gibbs_engine::model::native::{load_native, logits_of};
-use gibbs_engine::model::weight_format::{load_causal_lm_with, ReencodeConfig, ReencodePolicy};
+use gibbs_engine::hardware::{Device, HardwareCapability};
+use gibbs_engine::model::native::logits_of;
+use gibbs_engine::model::weight_format::{ReencodeConfig, ReencodePolicy};
 use gibbs_engine::scheduler::ExecutableModel;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -127,51 +128,27 @@ fn fixture(case: &str, cfg: &Value, w: &Weights) -> PathBuf {
     dir
 }
 
-/// runner: the CLI load dispatch (`main.rs`): `load_native` declines GraphLm families, then
-/// `load_causal_lm_with` (`--quant` f32: no host-dependent format pick or re-encode) and
-/// `ExecutableModel::load_graph_lm` on `dev`. `GIBBS_SPEC_LM=1`: `arch::dispatch::load_lm`
-/// (bit-exact weights) routes the family spec through `runtime::lm::SpecLm` instead.
-fn load_lm(dir: &Path, dev: Device) -> ExecutableModel {
-    let spec = std::env::var("GIBBS_SPEC_LM").is_ok_and(|v| v == "1");
-    load_lm_as(dir, dev, spec, None)
-}
-
-/// [`load_lm`]; `spec` forces `runtime::lm::SpecLm` (family `family` when given).
-fn load_lm_as(dir: &Path, dev: Device, spec: bool, family: Option<&str>) -> ExecutableModel {
+/// runner: the CLI load dispatch (`arch::dispatch::load_lm`, bit-exact weights) on `dev`: the
+/// family spec through `runtime::lm::SpecLm` (`family` forces one).
+fn load_lm(dir: &Path, dev: Device, family: Option<&str>) -> ExecutableModel {
     let a = artifacts(dir, "golden/lm", "model.safetensors");
-    assert!(load_native(&a, dev).is_none(), "routed to a native loader");
-    let m = if spec {
-        let reencode = ReencodeConfig {
-            policy: ReencodePolicy::BitExact,
-            cache_dir: None,
-            ..Default::default()
-        };
-        let opts = LoadOpts {
-            placement: dev.into(),
-            token: None,
-            quant: None,
-            quant_name: None,
-            hw: &HardwareCapability::default(),
-            reencode,
-            family,
-            stage: &|_| {},
-            system1_first: false,
-            admit: &|_| Ok(()),
-        };
-        let (m, _) = gibbs_engine::arch::dispatch::load_lm(&a, &opts).unwrap();
-        assert!(matches!(m, ExecutableModel::Native(_)), "not a spec LM");
-        m
-    } else {
-        let (llm, _) = load_causal_lm_with(
-            &a,
-            dev,
-            Some(QuantMode::Uncompressed),
-            &HardwareCapability::default(),
-            &ReencodeConfig::default(),
-        )
-        .unwrap();
-        ExecutableModel::load_graph_lm(llm, dev).unwrap()
+    let reencode = ReencodeConfig {
+        policy: ReencodePolicy::BitExact,
+        cache_dir: None,
+        ..Default::default()
     };
+    let opts = LoadOpts {
+        placement: dev.into(),
+        token: None,
+        quant_name: None,
+        hw: &HardwareCapability::default(),
+        reencode,
+        family,
+        stage: &|_| {},
+        system1_first: false,
+        admit: &|_| Ok(()),
+    };
+    let m = gibbs_engine::arch::dispatch::load_lm(&a, &opts).unwrap();
     assert_eq!(m.llm_backend(), dev, "{}", m.backend_label());
     m
 }
@@ -197,31 +174,17 @@ fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
         o.f(format!("decode{i}"), &l);
     }
     let mut ids = PROMPT.to_vec();
-    match m {
-        // A native model prefills through its sequence state, then steps greedily.
-        ExecutableModel::Native(lm) => {
-            let (_, mut st) = lm.prepare(ids.clone(), &[]).unwrap();
-            lm.forward(&ids[..ids.len() - 1], 0, &mut st).unwrap();
-            for _ in 0..8 {
-                let n = ids.len();
-                let t = match lm.forward_greedy(&ids[n - 1..], n - 1, &mut st).unwrap() {
-                    Tensor::U32(t) => t[0],
-                    t => argmax(&logits_of(t).unwrap()[..V]),
-                };
-                ids.push(t);
-            }
-        }
-        _ => {
-            let mut kv = None;
-            for _ in 0..8 {
-                let n = ids.len();
-                let t = m
-                    .step_token_with_kv(&ids, ids[n - 1], n, 0.0, 1.0, None, &mut kv)
-                    .map(|(t, _)| t)
-                    .unwrap();
-                ids.push(t);
-            }
-        }
+    // Prefill through the sequence state, then step greedily.
+    let lm = m.lm();
+    let (_, mut st) = lm.prepare(ids.clone(), &[]).unwrap();
+    lm.forward(&ids[..ids.len() - 1], 0, &mut st).unwrap();
+    for _ in 0..8 {
+        let n = ids.len();
+        let t = match lm.forward_greedy(&ids[n - 1..], n - 1, &mut st).unwrap() {
+            Tensor::U32(t) => t[0],
+            t => argmax(&logits_of(t).unwrap()[..V]),
+        };
+        ids.push(t);
     }
     // The greedy path (device argmax after the first token) agrees with the logits' argmax.
     for k in 0..8 {
@@ -243,7 +206,11 @@ fn run_lm(m: &ExecutableModel, dev: Device) -> Out {
 
 fn graph_lm_case(case: &str, cfg: Value, w: Weights) {
     let dir = fixture(case, &cfg, &w);
-    golden(case, TOL, |dev| run_lm(&load_lm(&dir, dev), dev));
+    // The reference (GraphLm) is deleted: the golden is frozen.
+    if writing() {
+        return;
+    }
+    golden(case, TOL, |dev| run_lm(&load_lm(&dir, dev, None), dev));
 }
 
 /// SmolLM-style llama: GQA (4 heads, 2 kv), tied head.
@@ -386,8 +353,7 @@ fn graphlm_gqa_wide() {
 }
 
 /// transformers BitNet (`quant_method: bitnet`, online ternarization, int8 BitLinear activations),
-/// relu² MLP, attention/MLP sub-norms. CPU only: the reference is GraphLm's host forward
-/// (`final_hidden`); its graph (CPU program and Metal) is known wrong for BitNet.
+/// relu² MLP, attention/MLP sub-norms. The golden was GraphLm's host forward (`final_hidden`).
 #[test]
 fn bitnet() {
     let case = "lm_bitnet";
@@ -420,7 +386,7 @@ fn bitnet() {
     }
     // runner: `bitnet.json5` through `runtime::lm::SpecLm` (prefill, cached decode, greedy).
     golden(case, TOL, |dev| {
-        let mut o = run_lm(&load_lm_as(&dir, dev, true, Some("bitnet")), dev);
+        let mut o = run_lm(&load_lm(&dir, dev, Some("bitnet")), dev);
         o.floats.retain(|(k, _)| k != "prefill20");
         o
     });
@@ -474,7 +440,7 @@ fn nano() {
     // runner: `nano.json5` (forced family) through `runtime::lm::SpecLm`; position-independent,
     // so each step is a 1-token prompt.
     golden(case, TOL, |dev| {
-        let m = load_lm_as(&dir, dev, true, Some("nano"));
+        let m = load_lm(&dir, dev, Some("nano"));
         let logits = |t: u32| m.prompt_logits(vec![t]).unwrap();
         let mut t = 42u32;
         let ids: Vec<u32> = (0..10)

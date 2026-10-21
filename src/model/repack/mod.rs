@@ -37,7 +37,7 @@ pub fn block_codec(format: QuantFormat) -> Option<(usize, usize, GgufBlockFn)> {
         .or_else(|| affine::block_codec(format))
 }
 
-/// Repacks the checkpoint weight `weight` (the `X.weight` name `GraphLm::from_manifest` reads) when it
+/// Repacks the checkpoint weight `weight` (the `X.weight` name the family specs read) when it
 /// is stored in one of the encodings above; `data` is the buffer the manifest's offsets index.
 pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Repacked>, String> {
     if let Some(r) = bnb::repack(m, data, weight)? {

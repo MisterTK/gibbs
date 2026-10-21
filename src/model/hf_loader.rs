@@ -1,238 +1,6 @@
-use crate::model::graph_lm::{GraphLm, GraphLmConfig};
 use crate::model::tokenizer::Tokenizer;
-use crate::model::UniversalModelLoader;
-use serde::Deserialize;
 use std::fs;
 use std::path::Path;
-
-#[derive(Debug, Deserialize)]
-pub struct HfConfigJson {
-    #[serde(alias = "hidden_size", alias = "d_model", default = "default_hidden")]
-    pub hidden_dim: usize,
-    #[serde(
-        alias = "num_hidden_layers",
-        alias = "n_layers",
-        default = "default_layers"
-    )]
-    pub num_layers: usize,
-    // Separate fields (not aliases): LFM2 configs carry both `num_attention_heads` and `num_heads`.
-    #[serde(default)]
-    num_attention_heads: Option<usize>,
-    #[serde(default)]
-    num_heads: Option<usize>,
-    #[serde(default)]
-    n_heads: Option<usize>,
-    #[serde(alias = "intermediate_size", default)]
-    pub intermediate_dim: Option<usize>,
-    #[serde(alias = "vocab_size", default = "default_vocab")]
-    pub vocab_size: usize,
-    #[serde(default)]
-    pub model_type: Option<String>,
-    // GPT-NeoX configs may carry both spellings; separate fields so they still parse.
-    #[serde(default)]
-    pub rotary_pct: Option<f32>,
-    #[serde(default)]
-    pub partial_rotary_factor: Option<f32>,
-    #[serde(default)]
-    pub use_parallel_residual: Option<bool>,
-    #[serde(alias = "num_key_value_heads", alias = "n_kv_heads", default)]
-    pub num_key_value_heads: Option<usize>,
-    /// Explicit per-head width (Qwen3, ERNIE-4.5, Gemma): `num_heads * head_dim` need not equal `hidden_size`.
-    #[serde(default)]
-    pub head_dim: Option<usize>,
-    /// Granite-4 hybrids: `"nope"` means no rotary embedding.
-    #[serde(default)]
-    pub position_embedding_type: Option<String>,
-    #[serde(default)]
-    pub architectures: Vec<String>,
-    #[serde(alias = "hidden_act", alias = "activation_function", default)]
-    pub hidden_act: Option<String>,
-    #[serde(default)]
-    pub rope_theta: Option<f32>,
-    /// transformers v5 nests `rope_theta` here (no top-level key).
-    #[serde(default)]
-    pub rope_parameters: Option<serde_json::Value>,
-    // Separate fields (not aliases): a config carrying two spellings must not fail to parse.
-    #[serde(default)]
-    pub rms_norm_eps: Option<f32>,
-    #[serde(default)]
-    pub layer_norm_eps: Option<f32>,
-    #[serde(default)]
-    pub layer_norm_epsilon: Option<f32>,
-    /// LFM2 spells its RMSNorm epsilon `norm_eps`.
-    #[serde(default)]
-    pub norm_eps: Option<f32>,
-    /// LFM2 MLP width rule (`Lfm2MLP`): `intermediate_size` is shrunk to 2/3 and rounded up to `block_multiple_of`.
-    #[serde(default)]
-    pub block_auto_adjust_ff_dim: Option<bool>,
-    #[serde(default)]
-    pub block_ffn_dim_multiplier: Option<f32>,
-    #[serde(default)]
-    pub block_multiple_of: Option<usize>,
-    #[serde(default)]
-    pub quantization_config: Option<serde_json::Value>,
-    /// 1bitLLM BitNet b1.58 checkpoints (`model_type: llama`): `weight_bits: 1`, `input_bits: 8`.
-    #[serde(default)]
-    pub weight_bits: Option<u32>,
-    #[serde(default)]
-    pub input_bits: Option<u32>,
-    /// Granite (`model_type: granite`): attention scale, embedding / residual multipliers, logit divisor.
-    #[serde(default)]
-    pub attention_multiplier: Option<f32>,
-    #[serde(default)]
-    pub embedding_multiplier: Option<f32>,
-    #[serde(default)]
-    pub residual_multiplier: Option<f32>,
-    #[serde(default)]
-    pub logits_scaling: Option<f32>,
-}
-
-impl HfConfigJson {
-    pub fn resolved_intermediate_dim(&self) -> usize {
-        let ff = self.intermediate_dim.unwrap_or(self.hidden_dim * 4);
-        if self.block_auto_adjust_ff_dim != Some(true) {
-            return ff;
-        }
-        let ff = ff * 2 / 3;
-        match self.block_ffn_dim_multiplier {
-            Some(m) => {
-                let multiple = self.block_multiple_of.unwrap_or(256);
-                multiple * ((m * ff as f32) as usize).div_ceil(multiple)
-            }
-            None => ff,
-        }
-    }
-
-    pub fn resolved_rope_theta(&self) -> f32 {
-        self.rope_theta
-            .or_else(|| Some(self.rope_parameters.as_ref()?["rope_theta"].as_f64()? as f32))
-            .unwrap_or(10000.0)
-    }
-
-    /// RMSNorm / LayerNorm epsilon (`rms_norm_eps`, `layer_norm_eps`, `layer_norm_epsilon`).
-    pub fn resolved_norm_eps(&self) -> f32 {
-        self.rms_norm_eps
-            .or(self.layer_norm_eps)
-            .or(self.layer_norm_epsilon)
-            .or(self.norm_eps)
-            .unwrap_or(1e-5)
-    }
-
-    /// BitNet b1.58 BitLinear projections as (activation bits, ternarize weights at load):
-    /// transformers `quant_method: "bitnet"` (int8 activations; `quantization_mode: "online"` holds
-    /// master weights), or 1bitLLM's `weight_bits: 1` master weights with `input_bits` activations.
-    pub fn bitnet(&self) -> Option<(u32, bool)> {
-        if let Some(q) = self
-            .quantization_config
-            .as_ref()
-            .filter(|q| q["quant_method"] == "bitnet")
-        {
-            return Some((8, q["quantization_mode"] == "online"));
-        }
-        (self.weight_bits == Some(1)).then(|| (self.input_bits.unwrap_or(8), true))
-    }
-    pub fn is_llama_or_swiglu(&self) -> bool {
-        if let Some(m_type) = &self.model_type {
-            if m_type == "llama" || m_type == "qwen2" || m_type == "mistral" {
-                return true;
-            }
-        }
-        for arch in &self.architectures {
-            if arch.contains("Llama") || arch.contains("Qwen") || arch.contains("Mistral") {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Attention head count: `num_attention_heads`, else `num_heads`, else `n_heads`.
-    pub fn resolved_num_heads(&self) -> usize {
-        self.num_attention_heads
-            .or(self.num_heads)
-            .or(self.n_heads)
-            .unwrap_or_else(default_heads)
-    }
-
-    pub fn resolved_num_kv_heads(&self) -> usize {
-        self.num_key_value_heads.unwrap_or_else(|| self.resolved_num_heads())
-    }
-
-    pub fn resolved_rotary_pct(&self) -> f32 {
-        if let Some(pct) = self.rotary_pct.or(self.partial_rotary_factor) {
-            pct
-        } else if let Some(m_type) = &self.model_type {
-            if m_type == "gpt_neox" {
-                0.25
-            } else if m_type == "glm" {
-                0.5 // HF GlmConfig default partial_rotary_factor
-            } else if m_type == "gpt_neo" || m_type == "gpt2" || m_type == "bert" {
-                0.0
-            } else {
-                1.0
-            }
-        } else if self.architectures.iter().any(|a| a.contains("GPTNeoX")) {
-            0.25
-        } else if self
-            .architectures
-            .iter()
-            .any(|a| a.contains("GPTNeo") || a.contains("GPT2") || a.contains("Bert"))
-        {
-            0.0
-        } else {
-            1.0
-        }
-    }
-
-    pub fn resolved_parallel_residual(&self) -> bool {
-        if let Some(par) = self.use_parallel_residual {
-            par
-        } else if let Some(m_type) = &self.model_type {
-            m_type == "gpt_neox"
-        } else {
-            self.architectures.iter().any(|a| a.contains("GPTNeoX"))
-        }
-    }
-
-    pub fn resolved_use_standard_layernorm(&self) -> bool {
-        if self.is_llama_or_swiglu() {
-            return false;
-        }
-        if let Some(m_type) = &self.model_type {
-            m_type == "gpt_neo" || m_type == "gpt2" || m_type == "gpt_neox" || m_type == "bert"
-        } else {
-            self.architectures.iter().any(|a| {
-                a.contains("GPTNeo")
-                    || a.contains("GPT2")
-                    || a.contains("GPTNeoX")
-                    || a.contains("Bert")
-            })
-        }
-    }
-
-    pub fn resolved_use_gelu_mlp(&self) -> bool {
-        if self.is_llama_or_swiglu() {
-            return false;
-        }
-        if let Some(act) = &self.hidden_act {
-            if act == "silu" {
-                return false;
-            }
-            if act.starts_with("gelu") {
-                return true;
-            }
-        }
-        if let Some(m_type) = &self.model_type {
-            m_type == "gpt_neo" || m_type == "gpt2" || m_type == "gpt_neox" || m_type == "bert"
-        } else {
-            self.architectures.iter().any(|a| {
-                a.contains("GPTNeo")
-                    || a.contains("GPT2")
-                    || a.contains("GPTNeoX")
-                    || a.contains("Bert")
-            })
-        }
-    }
-}
 
 /// Reads `tokenizer.json` with the chat template and bos/eos strings beside it
 /// (`tokenizer_config.json`, `chat_template.jinja`; both optional). With no template in either,
@@ -302,236 +70,6 @@ fn apply_generation_json(tok: &mut Tokenizer, json: &[u8]) {
     };
 }
 
-/// A checkpoint opened once so several [`GraphLm`]s (the source format and re-encoded variants) can
-/// be built from the same bytes.
-pub struct LmSource {
-    cfg: GraphLmConfig,
-    tokenizer: Tokenizer,
-    label: String,
-    body: LmBody,
-}
-
-enum LmBody {
-    Checkpoint {
-        manifest: crate::model::ModelManifest,
-        data: crate::model::loaders::gguf::GgufData,
-        gguf: bool,
-    },
-    /// Synthetic and ONNX models arrive built; there are no checkpoint tensors to carry.
-    Built(GraphLm),
-}
-
-impl LmSource {
-    /// The checkpoint's tensor index, `None` for synthetic and ONNX models.
-    pub fn manifest(&self) -> Option<&crate::model::ModelManifest> {
-        match &self.body {
-            LmBody::Checkpoint { manifest, .. } => Some(manifest),
-            LmBody::Built(_) => None,
-        }
-    }
-
-    /// The manifest and the bytes its offsets index, `None` for synthetic and ONNX models.
-    pub fn checkpoint(&self) -> Option<(&crate::model::ModelManifest, &[u8])> {
-        match &self.body {
-            LmBody::Checkpoint { manifest, data, .. } => Some((manifest, data)),
-            LmBody::Built(_) => None,
-        }
-    }
-
-    /// How many projections (4 per layer plus the LM head) a build passes to its encoder.
-    pub fn projection_count(&self) -> usize {
-        let layers = match &self.body {
-            LmBody::Checkpoint { manifest, gguf: true, .. } => {
-                GraphLmConfig::from_gguf(manifest, self.cfg.clone()).num_layers
-            }
-            LmBody::Checkpoint { .. } => self.cfg.num_layers,
-            LmBody::Built(m) => m.layers.len(),
-        };
-        4 * layers + 1
-    }
-
-    /// Builds a model, passing every projection through `enc` when given.
-    pub fn build(
-        &self,
-        enc: Option<&dyn crate::model::graph_lm::ProjectionEncoder>,
-    ) -> Result<GraphLm, String> {
-        let mut llm = match &self.body {
-            LmBody::Checkpoint { manifest, data, gguf } => {
-                let cfg = if *gguf {
-                    GraphLmConfig::from_gguf(manifest, self.cfg.clone())
-                } else {
-                    self.cfg.clone()
-                };
-                GraphLm::from_manifest_with(cfg, manifest, data, enc)
-                    .map_err(|e| format!("Failed to load {}: {e}", self.label))?
-            }
-            LmBody::Built(m) => {
-                let mut m = m.clone();
-                if let Some(e) = enc {
-                    m.encode_projections(e);
-                }
-                m
-            }
-        };
-        llm.set_tokenizer(self.tokenizer.clone());
-        // Constructors already encode the weights in `cfg.quant_mode`; re-encoding would compound error.
-        if llm.current_quant_mode() != self.cfg.quant_mode {
-            llm.quantize(self.cfg.quant_mode);
-        }
-        Ok(llm)
-    }
-}
-
-/// Loads an autoregressive LM from resolved artifacts, with the tokenizer that belongs to its weights.
-/// Real repositories must provide weights and a tokenizer; only synthetic ids
-/// (see [`crate::model::hub::is_synthetic_model_id`]) may run random-initialized weights.
-pub fn load_causal_lm(
-    artifacts: &crate::model::hub::ModelArtifacts,
-    quant_mode: crate::hardware::QuantMode,
-) -> Result<GraphLm, String> {
-    open_causal_lm(artifacts, quant_mode)?.build(None)
-}
-
-/// Opens the checkpoint of `artifacts` without building a model.
-pub fn open_causal_lm(
-    artifacts: &crate::model::hub::ModelArtifacts,
-    quant_mode: crate::hardware::QuantMode,
-) -> Result<LmSource, String> {
-    let id = artifacts.model_id.as_str();
-    let preset = ["gibbs/", "foundry/"]
-        .iter()
-        .find_map(|p| id.strip_prefix(p))
-        .unwrap_or("");
-    let mut cfg = match preset {
-        "smollm-1m" => GraphLmConfig::smollm_1m(),
-        "tiny-5m" => GraphLmConfig::tiny_5m(),
-        "tiny-10m" => GraphLmConfig::tiny_10m(),
-        // GGUF without config.json: `from_gguf_data` derives dims from GGUF metadata.
-        _ => match artifacts.config_path.as_deref() {
-            Some(p) => {
-                let bytes = fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
-                let hf: HfConfigJson =
-                    serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", p.display()))?;
-                GraphLmConfig::from_hf(&hf, quant_mode)
-            }
-            None => GraphLmConfig::default(),
-        },
-    };
-    cfg.quant_mode = quant_mode;
-
-    let json_tokenizer = artifacts
-        .tokenizer_path
-        .as_deref()
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .map(load_json_tokenizer)
-        .transpose()?;
-
-    use crate::model::loaders::gguf::GgufData;
-    let (body, tokenizer, label) = match artifacts.weights_path.as_deref() {
-        Some(p) => {
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-            // Sniff magic bytes before extension matching (legacy GGML models are often *.bin).
-            let mut magic = [0u8; 8];
-            let is_ggml = if let Ok(mut f) = fs::File::open(p) {
-                use std::io::Read;
-                if let Ok(n) = f.read(&mut magic) {
-                    if n >= 4 {
-                        let m = u32::from_le_bytes(magic[0..4].try_into().unwrap());
-                        m == 0x67676d6c
-                            || m == 0x67676d66
-                            || m == 0x67676a74
-                            || magic.starts_with(b"ggml")
-                            || magic.starts_with(b"ggmf")
-                            || magic.starts_with(b"ggjt")
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            let is_gguf = magic.starts_with(b"GGUF");
-            let fail = |e: String| format!("Failed to load {}: {e}", p.display());
-
-            // (checkpoint body, bytes the GGUF tokenizer lives in)
-            let (body, gguf_tok) = if is_gguf || ext == "gguf" {
-                let (manifest, data) = crate::model::loaders::gguf::open(p).map_err(fail)?;
-                (LmBody::Checkpoint { manifest, data, gguf: true }, true)
-            } else if is_ggml || matches!(ext, "ggml" | "ggmf" | "ggjt") {
-                let (manifest, data) = crate::model::loaders::ggml::open(p).map_err(fail)?;
-                (LmBody::Checkpoint { manifest, data: GgufData::Buf(data), gguf: true }, true)
-            } else {
-                match ext {
-                    // safetensors / PyTorch / Flax / NumPy file or a sharded `<file>.index.json`; quant scheme vetted first.
-                    "safetensors" | "json" | "bin" | "pt" | "pth" | "ckpt" | "msgpack" | "npz"
-                    | "npy" => {
-                        crate::model::prequant::check(
-                            artifacts.config_path.as_deref(),
-                            p.parent().unwrap_or(Path::new(".")),
-                        )
-                        .map_err(fail)?;
-                        let (mut manifest, data) =
-                            crate::model::loaders::read_checkpoint(p).map_err(fail)?;
-                        crate::model::prequant::annotate(
-                            &mut manifest,
-                            artifacts.config_path.as_deref(),
-                        )
-                        .map_err(fail)?;
-                        (LmBody::Checkpoint { manifest, data: GgufData::Buf(data), gguf: false }, false)
-                    }
-                    "onnx" => (
-                        LmBody::Built(
-                            crate::model::loaders::onnx::load_causal_lm(cfg.clone(), p).map_err(fail)?,
-                        ),
-                        false,
-                    ),
-                    other => return Err(fail(format!("unsupported weight format '.{other}'"))),
-                }
-            };
-            let tok = match (json_tokenizer, &body) {
-                (Some(t), _) => t,
-                (None, LmBody::Checkpoint { data, .. }) if gguf_tok => {
-                    UniversalModelLoader::extract_gguf_tokenizer(data).map_err(|e| {
-                        format!(
-                            "{}: no tokenizer.json and GGUF tokenizer unreadable: {e}",
-                            p.display()
-                        )
-                    })?
-                }
-                (None, _) => return Err(format!("Model '{id}': weights found but no tokenizer.json")),
-            };
-            (body, tok, p.display().to_string())
-        }
-        None if crate::model::hub::is_synthetic_model_id(id) => {
-            let llm = GraphLm::new(cfg.clone());
-            let tok = json_tokenizer.unwrap_or_else(|| llm.tokenizer.clone());
-            (LmBody::Built(llm), tok, id.to_string())
-        }
-        None => {
-            return Err(format!(
-                "Model '{id}' has no weight file; refusing to run random-initialized weights"
-            ))
-        }
-    };
-    Ok(LmSource { cfg, tokenizer, label, body })
-}
-
-fn default_hidden() -> usize {
-    128
-}
-fn default_layers() -> usize {
-    2
-}
-fn default_heads() -> usize {
-    4
-}
-fn default_vocab() -> usize {
-    512
-}
-
 /// One chat message as HF chat templates read it (`apply_chat_template` message dicts).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
@@ -578,6 +116,27 @@ impl ChatMessage {
 mod tests {
     use super::*;
 
+    /// Greedy text of `prompt` from `weights` (config/tokenizer beside it when present) through
+    /// the family-spec loader.
+    fn complete(id: &str, weights: std::path::PathBuf, prompt: &str, n: usize) -> String {
+        let dir = weights.parent().unwrap().to_path_buf();
+        let file = |n: &str| Some(dir.join(n)).filter(|p| p.exists());
+        let artifacts = crate::model::hub::ModelArtifacts {
+            model_id: id.into(),
+            local_dir: Some(dir.clone()),
+            config_path: file("config.json"),
+            tokenizer_path: file("tokenizer.json"),
+            weights_path: Some(weights),
+            ..Default::default()
+        };
+        let reg = crate::arch::registry().unwrap();
+        let lm = crate::runtime::lm::load(&artifacts, reg, None, crate::hardware::PlacementMode::Auto).unwrap();
+        crate::scheduler::ExecutableModel::new(lm)
+            .generate_text_measured_plain(prompt, n, 0.0)
+            .unwrap()
+            .0
+    }
+
     /// A sharded checkpoint (`model.safetensors.index.json` + 2 bf16 shards) loads and answers greedily.
     #[test]
     fn sharded_safetensors_index_loads_and_generates() {
@@ -587,15 +146,8 @@ mod tests {
             println!("SKIP: Qwen/Qwen2.5-3B-Instruct not in disk/");
             return;
         }
-        let artifacts = crate::model::hub::ModelArtifacts {
-            model_id: "Qwen/Qwen2.5-3B-Instruct".into(),
-            config_path: Some(dir.join("config.json")),
-            tokenizer_path: Some(dir.join("tokenizer.json")),
-            weights_path: Some(dir.join("model.safetensors.index.json")),
-            ..Default::default()
-        };
-        let llm = load_causal_lm(&artifacts, crate::hardware::QuantMode::Uncompressed).unwrap();
-        let out = llm.generate_text("The capital of France is", 8, 0.0);
+        let w = dir.join("model.safetensors.index.json");
+        let out = complete("Qwen/Qwen2.5-3B-Instruct", w, "The capital of France is", 8);
         println!("Qwen2.5-3B-Instruct (sharded): {out:?}");
         assert!(out.contains("Paris"), "{out:?}");
     }
@@ -614,22 +166,14 @@ mod tests {
             println!("SKIP: owalsh/SmolLM2-135M-Instruct-GGUF-Split not in disk/");
             return;
         }
-        let load = |p: std::path::PathBuf| {
-            let artifacts = crate::model::hub::ModelArtifacts {
-                model_id: "split".into(),
-                weights_path: Some(p),
-                ..Default::default()
-            };
-            load_causal_lm(&artifacts, crate::hardware::QuantMode::Uncompressed).unwrap()
-        };
-        let split = load(first.clone()).generate_text("The capital of France is", 12, 0.0);
+        let split = complete("split", first.clone(), "The capital of France is", 12);
         println!("split: {split:?}");
         assert!(!split.trim().is_empty());
         let (m, _) = crate::model::loaders::gguf::open(&first).unwrap();
         assert_eq!((m.shard_count, m.tensors.len()), (3, 272));
         // GIBBS_TEST_MERGED_GGUF: the same shards merged into one file (`gguf-split --merge`).
         if let Some(merged) = std::env::var_os("GIBBS_TEST_MERGED_GGUF") {
-            let merged = load(merged.into()).generate_text("The capital of France is", 12, 0.0);
+            let merged = complete("merged", merged.into(), "The capital of France is", 12);
             assert_eq!(split, merged);
         }
     }

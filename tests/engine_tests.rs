@@ -148,49 +148,23 @@ fn test_codec_benchmark_efficiency() {
 #[test]
 fn test_real_smollm2_135m_decode_throughput_on_disk() {
     use foundry_engine::hardware::Device;
-    use foundry_engine::model::graph_lm::{GraphLm, GraphLmConfig};
-    use foundry_engine::model::hf_loader::HfConfigJson;
-    use foundry_engine::model::tokenizer::Tokenizer;
+    use foundry_engine::hardware::PlacementMode;
+    use foundry_engine::model::hub::HuggingFaceHub;
     use foundry_engine::scheduler::ExecutableModel;
-    use std::path::Path;
     use std::time::Instant;
 
-    let model_dir = Path::new("disk/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/main");
-    if !model_dir.exists() {
+    let repo = "HuggingFaceTB/SmolLM2-135M-Instruct";
+    let art = HuggingFaceHub::with_cache_dir("disk".into()).locate_model(repo);
+    if art.weights_path.is_none() {
         println!("SKIP: SmolLM2-135M not found in disk/");
         return;
     }
-
-    let tok_path = model_dir.join("tokenizer.json");
-    let tok_str = std::fs::read_to_string(&tok_path).expect("Failed to read tokenizer.json");
-    let tokenizer = Tokenizer::from_json_str(&tok_str).expect("Failed to parse tokenizer.json");
-    let cfg_path = model_dir.join("config.json");
-    let cfg_bytes = std::fs::read(&cfg_path).expect("Failed to read config.json");
-    let hf_cfg: HfConfigJson =
-        serde_json::from_slice(&cfg_bytes).expect("Failed to parse config.json");
-    let cfg = GraphLmConfig {
-        vocab_size: hf_cfg.vocab_size,
-        hidden_dim: hf_cfg.hidden_dim,
-        intermediate_dim: hf_cfg.resolved_intermediate_dim(),
-        num_layers: hf_cfg.num_layers,
-        num_heads: hf_cfg.resolved_num_heads(),
-        head_dim: hf_cfg.hidden_dim / hf_cfg.resolved_num_heads().max(1),
-        max_seq_len: 2048,
-        rotary_pct: hf_cfg.resolved_rotary_pct(),
-        use_parallel_residual: hf_cfg.resolved_parallel_residual(),
-        use_standard_layernorm: hf_cfg.resolved_use_standard_layernorm(),
-        use_gelu_mlp: hf_cfg.resolved_use_gelu_mlp(),
-        rope_theta: hf_cfg.resolved_rope_theta(),
-        ..Default::default()
-    };
-
-    let st_path = model_dir.join("model.safetensors");
-    let st_bytes = std::fs::read(&st_path).expect("Failed to read model.safetensors");
-    let mut raw_model = GraphLm::from_safetensors_data(cfg, &st_bytes).expect("loads safetensors");
-    raw_model.set_tokenizer(tokenizer.clone());
-
-    let exec_model =
-        ExecutableModel::load_graph_lm(raw_model, Device::Metal).expect("loads Program");
+    let reg = foundry_engine::arch::registry().expect("registry");
+    let exec_model = ExecutableModel::new(
+        foundry_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Metal))
+            .expect("loads SmolLM2"),
+    );
+    let tokenizer = exec_model.tokenizer();
     let prompt = "The capital of France is";
     let prompt_tokens = tokenizer.encode(prompt);
     let mut kv = None;

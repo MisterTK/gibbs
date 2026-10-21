@@ -624,7 +624,7 @@
       outputs: ["embeds"],
     },
   },
-  runtime: {cutover: true, prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+  runtime: {prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
     // gevva cross-encoders (`tokenize_nli_pair_safe`): `<bos>Premise: {text}\nHypothesis: {pair}\nPrediction:`.
     seqcls: {head: "score", pooling: "last_nonpad",
       pair: {bos: "tc.bos_token_id", parts: ["Premise: ", "{text}", "\nHypothesis: ", "{pair}", "\nPrediction:"],

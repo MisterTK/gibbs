@@ -1063,8 +1063,6 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
             let system1 = cfg
                 .as_ref()
                 .is_some_and(crate::runtime::encoder::system1::is_sentence_encoder_config);
-            // Same test as hub rows ([`native_type`]): native models keep bf16 weights.
-            let bf16 = cfg.is_some_and(|c| native_type(&serde_json::json!({ "config": c })));
             let runnable =
                 super::is_chat_model(&id) || classifier || system1 || draft_for.is_some();
             if !runnable || art.weights_path.is_none() {
@@ -1114,7 +1112,7 @@ fn scan_local_static(hub: &HuggingFaceHub, total_memory: Option<u64>) -> Vec<Ent
                             .map(|m| m.len()),
                         total_memory,
                     ),
-                    false => memory_blocker(params, total_memory, bf16),
+                    false => memory_blocker(params, total_memory),
                 },
                 draft_for,
                 via,
@@ -1648,9 +1646,6 @@ fn parse_hub_rows(
             // GGUF draft sidecars attach like safetensors drafters; llama.cpp forks' own
             // architectures (another tensor layout) are refused by name.
             let gguf_draft = gguf_arch.and_then(crate::runtime::draft::refused_draft_gguf);
-            let dit = m["config"]["diffusers"]["_class_name"]
-                .as_str()
-                .is_some_and(|c| crate::model::dit::PIPELINES.contains(&c));
             // llama.cpp `mmproj` repos (arch `clip`): projectors of a language-model repo.
             let gguf_projector = (m["gguf"]["architecture"] == "clip")
                 .then(|| crate::model::hub::MMPROJ_ONLY.to_string());
@@ -1659,12 +1654,11 @@ fn parse_hub_rows(
                 .or_else(|| gemma4_moe_blocker(m, &id, &tags))
                 .or_else(|| pipeline_blocker(m).filter(|_| draft_for.is_none()))
                 .or_else(|| quant_blocker(m))
-                .or_else(|| native_gguf_blocker(m, &selection))
                 .or_else(|| split_gguf_blocker(m, &selection))
                 .or_else(|| selection.err().filter(|_| !own_files))
                 .or_else(|| match PACKED_MOE_GGUF.contains(&gguf_arch.unwrap_or("")) {
                     true => packed_memory_blocker(size, total_memory),
-                    false => memory_blocker(params, total_memory, native_type(m) || native_gguf_arch(m) || dit || ninfer || image_supported(m)),
+                    false => memory_blocker(params, total_memory),
                 });
             let gguf_total = m["gguf"]["total"].as_u64();
             let mut variants: Vec<Entry> = files
@@ -1905,7 +1899,7 @@ fn pipeline_blocker(m: &Value) -> Option<String> {
             None => "text-to-image repo without a diffusers pipeline (model_index.json) or base model tag".into(),
         });
     }
-    if native_type(m) {
+    if spec_lm_type(m) {
         return None;
     }
     let decoder_task = matches!(
@@ -1975,17 +1969,6 @@ fn gemma4_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
     })
 }
 
-/// Native `model_type`s whose loader reads safetensors only (all but
-/// [`crate::model::native::NATIVE_GGUF_TYPES`]) when the hub's file selection picked a GGUF.
-fn native_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
-    let t = m["config"]["model_type"]
-        .as_str()
-        .filter(|t| crate::model::native::NATIVE_MODEL_TYPES.contains(t))?;
-    let gguf = selection.as_ref().ok()?.first()?.ends_with(".gguf");
-    (gguf && !crate::model::native::NATIVE_GGUF_TYPES.contains(&t))
-        .then(|| format!("'{t}' loads from safetensors only; this repo's weights are GGUF"))
-}
-
 /// Split GGUF sets (`-00001-of-00003.gguf`, read as one weight set by every GGUF loader) of an
 /// architecture no loader runs: the reason names it (typically huge MoE / DSA models).
 fn split_gguf_blocker(m: &Value, selection: &Result<Vec<String>, String>) -> Option<String> {
@@ -2009,12 +1992,11 @@ fn quant_blocker(m: &Value) -> Option<String> {
     crate::model::prequant::scheme_blocker(&m["config"], None)
 }
 
-/// `model_type` runs natively ([`crate::model::native`]) or from its family spec
-/// ([`crate::arch::dispatch::runs_spec_lm`]): weights mapped as stored, not expanded.
-fn native_type(m: &Value) -> bool {
-    m["config"]["model_type"].as_str().is_some_and(|t| {
-        crate::model::native::NATIVE_MODEL_TYPES.contains(&t) || crate::arch::dispatch::runs_spec_lm(t)
-    })
+/// `model_type` is a causal-LM family spec's own match ([`crate::arch::dispatch::runs_spec_lm`]).
+fn spec_lm_type(m: &Value) -> bool {
+    m["config"]["model_type"]
+        .as_str()
+        .is_some_and(crate::arch::dispatch::runs_spec_lm)
 }
 
 /// GGUF architectures whose expert banks stay packed in the file data (never expanded).
@@ -2037,35 +2019,16 @@ fn packed_memory_blocker(file_bytes: Option<u64>, total_memory: Option<u64>) -> 
     })
 }
 
-/// Config-less GGUF repos whose native loader dequantizes to bf16 (not GraphLm's f32).
-fn native_gguf_arch(m: &Value) -> bool {
-    m["gguf"]["architecture"]
-        .as_str()
-        .is_some_and(|a| matches!(a, "gemma4" | "qwen3" | "qwen35" | "hunyuan-dense"))
-}
-
-/// Native models and image pipelines keep 16-bit weights (2 bytes per parameter). GraphLm holds
-/// f32 when it fits and otherwise encodes straight into the format
-/// [`crate::model::weight_format::fitting_mode`] picks, so it is refused only when even that
-/// smallest format does not fit.
-fn memory_blocker(params: Option<u64>, total_memory: Option<u64>, bf16: bool) -> Option<String> {
+/// Spec-loaded models map their weights as stored (16-bit floats, or packed blocks no larger):
+/// 2 bytes per parameter bounds them.
+fn memory_blocker(params: Option<u64>, total_memory: Option<u64>) -> Option<String> {
     let (params, total) = (params?, total_memory?);
     let gb = |b: f64| b / (1u64 << 30) as f64;
-    if bf16 {
-        let need = params.saturating_mul(2);
-        return (need > total).then(|| {
-            format!(
-                "needs ~{:.0} GB as bf16; host has {:.0} GB",
-                gb(need as f64),
-                gb(total as f64)
-            )
-        });
-    }
-    use crate::model::weight_format::{f32_fits, fitting_mode};
-    (!f32_fits(params, total) && fitting_mode(params, total).is_none()).then(|| {
+    let need = params.saturating_mul(2);
+    (need > total).then(|| {
         format!(
-            "needs ~{:.0} GB even at 3.1 bits per weight; host has {:.0} GB",
-            gb(params as f64 * 3.125 / 8.0),
+            "needs ~{:.0} GB as bf16; host has {:.0} GB",
+            gb(need as f64),
             gb(total as f64)
         )
     })
@@ -2318,13 +2281,12 @@ mod tests {
         // GGUF estimate follows the file the selection picks (Q4_K_M, 4.5 bpw).
         assert_eq!(by_id("c/gguf").size, Some(562_500_000));
         assert!(
-            blocker("e/big")
-                .starts_with("needs ~25 GB even at 3.1 bits per weight; host has 16 GB"),
+            blocker("e/big").starts_with("needs ~130 GB as bf16; host has 16 GB"),
             "{}",
             blocker("e/big")
         );
-        // 25B parameters are 93 GB as f32, but encode into a quantized format that fits 48 GB.
-        assert!(memory_blocker(Some(25_000_000_000), Some(48 << 30), false).is_none());
+        // 25B parameters are 47 GB as bf16: they fit 48 GB.
+        assert!(memory_blocker(Some(25_000_000_000), Some(48 << 30)).is_none());
         assert!(blocker("r/qwen3-big").starts_with("needs ~26 GB as bf16; host has 16 GB"));
         // Native GGUF loaders expand to bf16 whatever the file's quantization.
         assert!(blocker("e/q35-27b-gguf").starts_with("needs ~50 GB as bf16; host has 16 GB"));

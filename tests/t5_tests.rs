@@ -123,7 +123,7 @@ fn t5_small_cli_generation_loop_on_metal() {
         let Some(m) = load_on("google-t5/t5-small", "model.safetensors", device) else {
             return;
         };
-        let exec = ExecutableModel::Native(m);
+        let exec = ExecutableModel::new(m);
         let (out, _, _) = exec
             .generate_text_measured("translate English to German: The house is wonderful.", 32, 0.0, None)
             .expect("generation");

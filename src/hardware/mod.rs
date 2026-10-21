@@ -403,44 +403,6 @@ impl QuantFormat {
         }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[allow(non_camel_case_types)]
-pub enum QuantMode {
-    Uncompressed,
-    F16,
-    BF16,
-    Q8_0, // GGUF Q8_0: int8 values + f16 scale per 32
-    NVFP4Ultra,
-}
-
-impl QuantMode {
-    pub fn primary_weight_format(&self) -> QuantFormat {
-        match self {
-            Self::Uncompressed => QuantFormat::FP32,
-            Self::F16 => QuantFormat::FP16,
-            Self::BF16 => QuantFormat::BF16,
-            Self::Q8_0 => QuantFormat::GGUF_Q8_0,
-            Self::NVFP4Ultra => QuantFormat::NVFP4_E2M1,
-        }
-    }
-
-    pub fn effective_bits_per_weight(&self) -> f32 {
-        match self {
-            Self::Uncompressed => 32.0, // weights are held as f32
-            Self::F16 | Self::BF16 => 16.0,
-            Self::Q8_0 => 8.5,
-            Self::NVFP4Ultra => 4.25, // 4-bit values + 16-elem block scale
-        }
-    }
-
-    pub fn bits_per_weight(&self) -> f32 {
-        self.effective_bits_per_weight()
-    }
-
-    pub fn is_smaller_than(&self, other: &QuantFormat) -> bool {
-        self.bits_per_weight() < other.bits_per_weight()
-    }
-}
 
 /// Hardware facts detected at runtime. Anything the platform cannot report is `None`/`false`, never guessed.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

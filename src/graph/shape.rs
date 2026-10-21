@@ -622,13 +622,6 @@ impl Drop for CheckCompiled {
     }
 }
 
-/// [`CheckCompiled`] around `f`.
-#[cfg(test)]
-pub(crate) fn assert_compiled_shapes<R>(f: impl FnOnce() -> R) -> R {
-    let _check = CheckCompiled::new();
-    f()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::{DType, Graph, Op};

@@ -380,7 +380,7 @@ fn model_entry(state: &AppState) -> Value {
     };
     json!({"name": id, "model": id, "modified_at": now(), "size": 0, "digest": digest,
            "details": {"parent_model": "", "format": "gibbs", "family": family, "families": [family],
-                       "parameter_size": "", "quantization_level": state.scheduler.quant_mode().map(|q| format!("{q:?}")).unwrap_or_default()}})
+                       "parameter_size": "", "quantization_level": ""}})
 }
 
 fn loaded(state: &AppState) -> Vec<Value> {
