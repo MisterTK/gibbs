@@ -1,0 +1,259 @@
+// FLUX.1 text-to-image (diffusers `FluxPipeline`: schnell, dev and finetunes): CLIP-L pooled + T5-XXL
+// text, the FLUX MMDiT (double-stream blocks with joint [text; image] attention, then single-stream
+// parallel attention/MLP blocks, 3-axis RoPE, AdaLN-Zero modulations), flow-matching Euler over
+// 2x2-packed latents and the 16-channel AutoencoderKL. The `denoiser` network is shared by `chroma`
+// and `flux2` (which extend this family) and branches on the checkpoint:
+// - FLUX.1: per-block modulation linears on SiLU(time + pooled-text (+ guidance) embedding);
+// - Chroma: every modulation row from the `distilled_guidance_layer` approximator table;
+// - FLUX.2: one modulation per stream kind shared by all blocks, SwiGLU feed-forwards, 4-axis RoPE.
+// Reads diffusers names (`transformer_blocks.*`) or BFL single-file names (`double_blocks.*`, via
+// `arch/names/bfl.json5`; fused q/k/v and `linear1` stay fused).
+{
+  family: "flux",
+  match: {
+    diffusers_class: ["FluxPipeline", "FluxTransformer2DModel"],
+  },
+  pipeline: "diffusion",
+  use_lib: ["transformer", "diffusion"],
+  config: {
+    flux2: "has('double_stream_modulation_img.linear.weight')",
+    chroma: "has('distilled_guidance_layer.in_proj.weight')",
+    hidden: "shape('x_embedder.weight')[0]",
+    in_ch: "shape('x_embedder.weight')[1]",
+    joint: "shape('context_embedder.weight')[1]",
+    head_dim: "first(cfg.attention_head_dim, 128)",
+    heads: "hidden // head_dim",
+    nd: "count('transformer_blocks.{k}.attn.norm_q.weight')",
+    ns: "count('single_transformer_blocks.{k}.attn.norm_q.weight')",
+    t_dim: "shape('time_text_embed.timestep_embedder.linear_1.weight')[1]",
+    pooled_w: "has('time_text_embed.text_embedder.linear_1.weight') ? shape('time_text_embed.text_embedder.linear_1.weight')[1] : 0",
+    guidance_embeds: "has('time_text_embed.guidance_embedder.linear_1.weight')",
+    // Chroma: one approximator row per modulation chunk (single 3, double 2 x 6, final 2).
+    table_rows: "3 * ns + 12 * nd + 2",
+    approx_w: "shape('distilled_guidance_layer.in_proj.weight')[1]",
+    // RoPE axes (FLUX.1/Chroma (unused, row, col); FLUX.2 (t, h, w, l) with t identity and folded
+    // into h's MRope section) and base.
+    axes: "first(cfg.axes_dims_rope, flux2 ? [32, 32, 32, 32] : [16, 56, 56])",
+    theta: "first(cfg.rope_theta, flux2 ? 2000 : 10000)",
+    sections: "len(axes) == 4 ? [(axes[0] + axes[1]) // 2, axes[2] // 2, axes[3] // 2] : [axes[0] // 2, axes[1] // 2, axes[2] // 2]",
+    eps: "1e-6",
+  },
+  checks: [
+    {expr: "has('x_embedder.weight') && (nd == 0 || ns == 0)", error: "FLUX: found {nd} double and {ns} single blocks"},
+    {expr: "has('x_embedder.weight') && hidden % head_dim != 0", error: "FLUX: hidden size {hidden} is not a multiple of head dim {head_dim}"},
+  ],
+  names: {
+    use: ["bfl"],
+    // diffusers FLUX.2 -> the FLUX.1 diffusers names the network reads.
+    rules: [
+      ["time_guidance_embed.{s:*}", "time_text_embed.{s}"],
+      ["transformer_blocks.{i}.{f:*}.linear_in.{s:*}", "transformer_blocks.{i}.{f}.net.0.proj.{s}"],
+      ["transformer_blocks.{i}.{f:*}.linear_out.{s:*}", "transformer_blocks.{i}.{f}.net.2.{s}"],
+      ["single_transformer_blocks.{i}.attn.to_out.{s:*}", "single_transformer_blocks.{i}.proj_out.{s}"],
+    ],
+  },
+  constants: {
+    "ln.ones": {gen: "ones", when: "has('x_embedder.weight')", args: {shape: ["hidden"]}},
+    "rope.inv_freq": {gen: "axis_freqs", when: "has('x_embedder.weight')",
+      args: {dims: "axes", theta: "theta", identity_axes: "len(axes) == 4 ? [0] : []"}},
+  },
+  macros: {
+    // Modulation vector [1, k*hidden]: Linear `{w}` of src ([1, hidden] SiLU embedding), or (no `{w}`:
+    // Chroma) rows row..row+k of the approximator table src [rows, hidden], flattened.
+    flux_mod: {params: ["src"], body: [
+      {op: "Linear", in: ["src", "w:{w}.weight", "w?:{w}.bias"], out: "out", name: "lin", when: "has(fmt('{w}.weight'))"},
+      {block: [
+        {op: "Slice", args: {axis: 0, start: "row", end: "row + k"}, in: ["src"], out: "r", name: "rows"},
+        {op: "Reshape", args: {shape: [1, "k * hidden"]}, in: ["r"], out: "out", name: "flat"},
+      ], when: "!has(fmt('{w}.weight'))"},
+    ]},
+    // Chunk c of a modulation vector m [1, k*hidden].
+    flux_chunk: {params: ["m"], body: [
+      {op: "Slice", args: {axis: -1, start: "c * hidden", end: "(c + 1) * hidden"}, in: ["m"], out: "out", name: "c{c}"},
+    ]},
+    // A double-block stream's attention input: ln_modulate(x, m0, m1) -> q/k/v (fused `{fused}` or
+    // `parts`) -> per-head RMSNorm `{qn}` / `{kn}`.
+    flux_stream_in: {params: ["x", "m"], returns: ["q", "k", "v"], body: [
+      {use: "flux_chunk", args: {c: 0}, in: ["m"], out: "sh", name: "shift"},
+      {use: "flux_chunk", args: {c: 1}, in: ["m"], out: "sc", name: "scale"},
+      {use: "ln_modulate", in: ["x", "sh", "sc"], out: "h", name: "norm"},
+      {use: "linear_parts", args: {w: "fused", parts: "parts"}, in: ["h"], out: "f", name: "qkv"},
+      {op: "Slice", args: {axis: -1, start: 0, end: "hidden"}, in: ["f"], out: "q", name: "q"},
+      {op: "Slice", args: {axis: -1, start: "hidden", end: "2 * hidden"}, in: ["f"], out: "k", name: "k"},
+      {op: "Slice", args: {axis: -1, start: "2 * hidden", end: "3 * hidden"}, in: ["f"], out: "v", name: "v"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{qn}.weight"], out: "q", name: "q_norm"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{kn}.weight"], out: "k", name: "k_norm"},
+    ]},
+    // A double-block stream after attention a: x += m2 * proj(a); x += m5 * ff(ln_modulate(x, m3, m4)),
+    // ff = `{ff}.net.2`(SwiGLU of halves (FLUX.2) | tanh-GELU of `{ff}.net.0.proj`(h)).
+    flux_stream_out: {params: ["x", "a", "m"], body: [
+      {op: "Linear", in: ["a", "w:{proj}.weight", "w?:{proj}.bias"], out: "o", name: "proj"},
+      {use: "flux_chunk", args: {c: 2}, in: ["m"], out: "g1", name: "gate1"},
+      {use: "gated_add", in: ["x", "o", "g1"], out: "x", name: "res1"},
+      {use: "flux_chunk", args: {c: 3}, in: ["m"], out: "sh", name: "shift2"},
+      {use: "flux_chunk", args: {c: 4}, in: ["m"], out: "sc", name: "scale2"},
+      {use: "flux_chunk", args: {c: 5}, in: ["m"], out: "g2", name: "gate2"},
+      {use: "ln_modulate", in: ["x", "sh", "sc"], out: "h", name: "norm2"},
+      {op: "Linear", in: ["h", "w:{ff}.net.0.proj.weight", "w?:{ff}.net.0.proj.bias"], out: "h", name: "ff_in"},
+      {block: [
+        {let: {half: "shape('h')[1] // 2"}},
+        {op: "Slice", args: {axis: -1, start: 0, end: "half"}, in: ["h"], out: "hg", name: "ff_gate"},
+        {op: "Slice", args: {axis: -1, start: "half", end: "2 * half"}, in: ["h"], out: "hu", name: "ff_up"},
+        {op: "SwiGlu", in: ["hg", "hu"], out: "h", name: "swiglu"},
+      ], when: "flux2"},
+      {op: "Unary", args: {kind: "GeluTanh"}, in: ["h"], out: "h", name: "gelu", when: "!flux2"},
+      {op: "Linear", in: ["h", "w:{ff}.net.2.weight", "w?:{ff}.net.2.bias"], out: "o", name: "ff_out"},
+      {use: "gated_add", in: ["x", "o", "g2"], out: "out", name: "res2"},
+    ]},
+    // Double block `{p}`: both streams' q/k/v, joint attention over [txt; img] with RoPE, split back.
+    flux_double: {params: ["img", "txt", "im", "tm"], returns: ["img", "txt"], body: [
+      {use: "flux_stream_in", in: ["img", "im"], out: ["iq", "ik", "iv"], name: "img_in", args: {
+        fused: "fmt('{p}.attn.to_qkv')", parts: "[fmt('{p}.attn.to_q'), fmt('{p}.attn.to_k'), fmt('{p}.attn.to_v')]",
+        qn: "fmt('{p}.attn.norm_q')", kn: "fmt('{p}.attn.norm_k')"}},
+      {use: "flux_stream_in", in: ["txt", "tm"], out: ["tq", "tk", "tv"], name: "txt_in", args: {
+        fused: "fmt('{p}.attn.to_added_qkv')",
+        parts: "[fmt('{p}.attn.add_q_proj'), fmt('{p}.attn.add_k_proj'), fmt('{p}.attn.add_v_proj')]",
+        qn: "fmt('{p}.attn.norm_added_q')", kn: "fmt('{p}.attn.norm_added_k')"}},
+      {op: "Concat", args: {axis: 0}, in: ["tq", "iq"], out: "q", name: "q"},
+      {op: "Concat", args: {axis: 0}, in: ["tk", "ik"], out: "k", name: "k"},
+      {op: "Concat", args: {axis: 0}, in: ["tv", "iv"], out: "v", name: "v"},
+      {use: "mrope_attention", in: ["q", "k", "v"], out: "a", name: "attn"},
+      {let: {n_t: "shape('txt')[0]", n_all: "shape('a')[0]"}},
+      {op: "Slice", args: {axis: 0, start: 0, end: "n_t"}, in: ["a"], out: "ta", name: "ta"},
+      {op: "Slice", args: {axis: 0, start: "n_t", end: "n_all"}, in: ["a"], out: "ia", name: "ia"},
+      {use: "flux_stream_out", in: ["img", "ia", "im"], out: "img", name: "img_out",
+       args: {proj: "fmt('{p}.attn.to_out.0')", ff: "fmt('{p}.ff')"}},
+      {use: "flux_stream_out", in: ["txt", "ta", "tm"], out: "txt", name: "txt_out",
+       args: {proj: "fmt('{p}.attn.to_add_out')", ff: "fmt('{p}.ff_context')"}},
+    ]},
+  },
+  components: {
+    text_encoder: {family: "clip_text", dir: "text_encoder"},
+    text_encoder_2: {family: "t5", dir: "text_encoder_2"},
+    transformer: {family: "flux", dir: "transformer"},
+    vae: {family: "sd_vae", dir: "vae"},
+    // Velocity for 2x2-packed latents x [(h/2)*(w/2), in_ch] (h, w: unpacked latent grid) given the
+    // raw text-encoder states context [nt, joint] (txt_in runs here) and, for FLUX.1, the raw CLIP
+    // pooled vector (vector_in runs here). Timestep features from the step's sigma (BFL
+    // timestep_embedding(sigma * 1000, 256)); guidance features from the request's guidance when the
+    // model embeds it (instance var `guided: false` drops them).
+    denoiser: {
+      vars: ["h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["(h // 2) * (w // 2)", "in_ch"]},
+        {name: "context", dtype: "f32", shape: ["nt", "joint"]},
+        {name: "pooled", dtype: "f32", shape: [1, "pooled_w"], when: "pooled_w > 0"},
+        {name: "t_feat", dtype: "f32", shape: [1, "t_dim"], when: "!chroma", gen: "timestep_embedding",
+         args: {t: "step:sigma * 1000", dim: "t_dim"}},
+        {name: "g_feat", dtype: "f32", shape: [1, "t_dim"], when: "guidance_embeds && first(guided, true)",
+         gen: "timestep_embedding", args: {t: "step:guidance * 1000", dim: "t_dim"}},
+        {name: "approx_in", dtype: "f32", shape: ["table_rows", "approx_w"], when: "chroma",
+         gen: "modulation_index_rows", args: {t: "step:sigma", rows: "table_rows", dims: [16, 16, 32], scale: 1000}},
+        {name: "positions", dtype: "u32", shape: ["(nt + (h // 2) * (w // 2)) * 3"], gen: "text_zero_grid3",
+         args: {text_len: "nt", grid_h: "h // 2", grid_w: "w // 2", text_axis: "len(axes) == 4"}},
+      ],
+      body: [
+        {let: {ni: "(h // 2) * (w // 2)", guided_on: "guidance_embeds && first(guided, true)"}},
+        {op: "Linear", in: ["i:x", "w:x_embedder.weight", "w?:x_embedder.bias"], out: "img", name: "img_in"},
+        {op: "Linear", in: ["i:context", "w:context_embedder.weight", "w?:context_embedder.bias"], out: "txt", name: "txt_in"},
+        // Modulation source `src`: SiLU(time (+ pooled text) (+ guidance) embedding) [1, hidden] ...
+        {block: [
+          {use: "timestep_mlp", args: {w: "'time_text_embed.timestep_embedder'"}, in: ["i:t_feat"], out: "vec", name: "time_in"},
+          {block: [
+            {use: "timestep_mlp", args: {w: "'time_text_embed.text_embedder'"}, in: ["i:pooled"], out: "y", name: "vector_in"},
+            {op: "Binary", args: {kind: "Add"}, in: ["vec", "y"], out: "vec", name: "vec_y"},
+          ], when: "pooled_w > 0"},
+          {block: [
+            {use: "timestep_mlp", args: {w: "'time_text_embed.guidance_embedder'"}, in: ["i:g_feat"], out: "gv", name: "guidance_in"},
+            {op: "Binary", args: {kind: "Add"}, in: ["vec", "gv"], out: "vec", name: "vec_g"},
+          ], when: "guided_on"},
+          {op: "Unary", args: {kind: "Silu"}, in: ["vec"], out: "src", name: "vec_silu"},
+        ], when: "!chroma"},
+        // ... or Chroma's approximator table [table_rows, hidden] (RMSNorm eps: torch's bf16 2^-7).
+        {block: [
+          {op: "Linear", in: ["i:approx_in", "w:distilled_guidance_layer.in_proj.weight", "w?:distilled_guidance_layer.in_proj.bias"],
+           out: "src", name: "approx.in_proj"},
+          {repeat: "j", count: "count('distilled_guidance_layer.norms.{k}.weight')", body: [
+            {op: "RmsNorm", args: {eps: 0.0078125}, in: ["src", "w:distilled_guidance_layer.norms.{j}.weight"], out: "ah", name: "approx.{j}.norm"},
+            {use: "timestep_mlp", args: {w: "fmt('distilled_guidance_layer.layers.{j}')"}, in: ["ah"], out: "ah", name: "approx.{j}.mlp"},
+            {op: "Binary", args: {kind: "Add"}, in: ["src", "ah"], out: "src", name: "approx.{j}.res"},
+          ]},
+          {op: "Linear", in: ["src", "w:distilled_guidance_layer.out_proj.weight", "w?:distilled_guidance_layer.out_proj.bias"],
+           out: "src", name: "approx.out_proj"},
+        ], when: "chroma"},
+        // FLUX.2: one modulation per stream kind, shared by every block.
+        {block: [
+          {op: "Linear", in: ["src", "w:double_stream_modulation_img.linear.weight", "w?:double_stream_modulation_img.linear.bias"],
+           out: "mod_img", name: "mod_img"},
+          {op: "Linear", in: ["src", "w:double_stream_modulation_txt.linear.weight", "w?:double_stream_modulation_txt.linear.bias"],
+           out: "mod_txt", name: "mod_txt"},
+          {op: "Linear", in: ["src", "w:single_stream_modulation.linear.weight", "w?:single_stream_modulation.linear.bias"],
+           out: "mod_single", name: "mod_single"},
+        ], when: "flux2"},
+        {repeat: "i", count: "nd", body: [
+          {let: {p: "fmt('transformer_blocks.{i}')"}},
+          {block: [
+            {use: "flux_mod", args: {w: "fmt('{p}.norm1.linear')", row: "3 * ns + 6 * i", k: 6}, in: ["src"], out: "mod_img", name: "d{i}.img_mod"},
+            {use: "flux_mod", args: {w: "fmt('{p}.norm1_context.linear')", row: "3 * ns + 6 * nd + 6 * i", k: 6}, in: ["src"], out: "mod_txt", name: "d{i}.txt_mod"},
+          ], when: "!flux2"},
+          {use: "flux_double", args: {p: "p"}, in: ["img", "txt", "mod_img", "mod_txt"], out: ["img", "txt"], name: "d{i}"},
+        ]},
+        {op: "Concat", args: {axis: 0}, in: ["txt", "img"], out: "x", name: "stream_cat"},
+        {repeat: "i", count: "ns", body: [
+          {let: {p: "fmt('single_transformer_blocks.{i}')"}},
+          {use: "flux_mod", args: {w: "fmt('{p}.norm.linear')", row: "3 * i", k: 3}, in: ["src"], out: "mod_single", name: "s{i}.mod", when: "!flux2"},
+          {use: "flux_chunk", args: {c: 0}, in: ["mod_single"], out: "sh", name: "s{i}.shift"},
+          {use: "flux_chunk", args: {c: 1}, in: ["mod_single"], out: "sc", name: "s{i}.scale"},
+          {use: "flux_chunk", args: {c: 2}, in: ["mod_single"], out: "sg", name: "s{i}.gate"},
+          {use: "single_stream_fused", in: ["x", "sh", "sc", "sg"], out: "x", name: "s{i}", args: {
+            w: "fmt('{p}.attn.to_qkv_mlp_proj')",
+            parts: "[fmt('{p}.attn.to_q'), fmt('{p}.attn.to_k'), fmt('{p}.attn.to_v'), fmt('{p}.proj_mlp')]",
+            q_norm: "fmt('{p}.attn.norm_q')", k_norm: "fmt('{p}.attn.norm_k')", out_w: "fmt('{p}.proj_out')", glu: "flux2"}},
+        ]},
+        // Final AdaLN on the image rows: diffusers `norm_out.linear` chunks are (scale, shift), BFL's
+        // `final_layer.adaLN_modulation.1` and Chroma's table rows (shift, scale).
+        {let: {fswap: "has('norm_out.linear.weight')"}},
+        {use: "flux_mod", args: {w: "fswap ? 'norm_out.linear' : 'final_layer.adaLN_modulation.1'", row: "3 * ns + 12 * nd", k: 2},
+         in: ["src"], out: "fm", name: "final.mod"},
+        {use: "flux_chunk", args: {c: 0}, in: ["fm"], out: "m0", name: "final.c0"},
+        {use: "flux_chunk", args: {c: 1}, in: ["fm"], out: "m1", name: "final.c1"},
+        {op: "Slice", args: {axis: 0, start: "nt", end: "nt + ni"}, in: ["x"], out: "x", name: "final.img"},
+        {use: "ln_modulate", in: ["x", "{fswap ? 'm1' : 'm0'}", "{fswap ? 'm0' : 'm1'}"], out: "x", name: "final.norm"},
+        {op: "Linear", in: ["x", "w:proj_out.weight", "w?:proj_out.bias"], out: "velocity", name: "proj_out"},
+      ],
+      outputs: ["velocity"],
+    },
+  },
+  runtime: {
+    text_encoders: [
+      // CLIP-L pooled (final-normed EOS row); the CLIP BPE is the shared openai vocabulary.
+      {name: "clip", component: "text_encoder", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77, pad_id: "clip.pad_id",
+       outputs: {pooled: "pooled"}},
+      // T5-XXL: ids + `</s>` (1) padded with `<pad>` (0) to 512 (dev, guidance-distilled) / 256
+      // (schnell, its model card), every token attended (no key mask).
+      {name: "t5", component: "text_encoder_2", net: "encoder", tokenizer: "tokenizer_2", add_special: false,
+       eos: 1, max_len: "denoiser.guidance_embeds ? 512 : 256", pad_to: "denoiser.guidance_embeds ? 512 : 256",
+       pad_id: 0, outputs: {hidden: "hidden"}},
+    ],
+    context: [{features: ["t5.hidden"]}],
+    pooled: ["clip.pooled"],
+    negative: {default: "", zeros_for_empty: false},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // FluxPipeline: linspace(1, 1/steps) sigmas; the scheduler config's `use_dynamic_shifting` picks
+    // mu = calculate_shift(image tokens) over its base/max seq/shift, else its static shift.
+    scheduler: {kind: "flow_euler", sigmas: "linspace", shift: "first(json.scheduler_config.shift, 1)",
+                mu: "'config'", seq: "(h // 2) * (w // 2)"},
+    timestep: "sigma * 1000",
+    // Guidance is embedded (`g_feat`), never CFG.
+    guidance: {kind: "none"},
+    latent: {channels: "vae.cfg.latent_channels", factor: 8, pack: "pack2x2", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "1 / first(vae.cfg.scaling_factor, 0.3611)", add: "first(vae.cfg.shift_factor, 0.1159)"},
+          output: "clamp_pm1"},
+    // schnell: its model card's 4 steps, no guidance; dev: diffusers' 28 / 3.5.
+    defaults: {width: 512, height: 512, steps: "denoiser.guidance_embeds ? 28 : 4",
+               guidance: "denoiser.guidance_embeds ? 3.5 : 0", multiple: 16},
+    summary: "fmt(denoiser.guidance_embeds ? 'FLUX.1 dev ({denoiser.nd} double + {denoiser.ns} single blocks), CLIP-L + T5-XXL + VAE' : 'FLUX.1 schnell ({denoiser.nd} double + {denoiser.ns} single blocks), CLIP-L + T5-XXL + VAE')",
+  },
+}

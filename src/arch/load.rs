@@ -1743,7 +1743,7 @@ fn load_from(
     for set in &spec.names.use_sets {
         pairs.extend(reg.name_set(set)?);
     }
-    let ren = Renamer::from_pairs(&pairs).map_err(fam)?;
+    let ren = Renamer::from_pairs(&pairs).map_err(fam)?.with_strip(spec.names.strip.clone());
     let table: Table = Arc::new(RwLock::new(BTreeMap::new()));
     {
         let mut t = table.write();

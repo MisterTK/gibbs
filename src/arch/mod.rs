@@ -30,6 +30,10 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("lib/unet.json5", include_str!("../../arch/lib/unet.json5")),
     ("lib/vae.json5", include_str!("../../arch/lib/vae.json5")),
     ("names/llamacpp.json5", include_str!("../../arch/names/llamacpp.json5")),
+    ("names/ldm_vae.json5", include_str!("../../arch/names/ldm_vae.json5")),
+    ("names/bfl.json5", include_str!("../../arch/names/bfl.json5")),
+    ("names/openclip.json5", include_str!("../../arch/names/openclip.json5")),
+    ("names/ldm.json5", include_str!("../../arch/names/ldm.json5")),
     ("families/llama.json5", include_str!("../../arch/families/llama.json5")),
     ("families/glm.json5", include_str!("../../arch/families/glm.json5")),
     ("families/granite.json5", include_str!("../../arch/families/granite.json5")),
@@ -47,6 +51,19 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/qwen_vae21.json5", include_str!("../../arch/families/qwen_vae21.json5")),
     ("families/qwen2_5_vl_text.json5", include_str!("../../arch/families/qwen2_5_vl_text.json5")),
     ("families/zimage.json5", include_str!("../../arch/families/zimage.json5")),
+    ("families/sd3.json5", include_str!("../../arch/families/sd3.json5")),
+    ("families/gemma2.json5", include_str!("../../arch/families/gemma2.json5")),
+    ("families/sana.json5", include_str!("../../arch/families/sana.json5")),
+    ("families/sd_vae.json5", include_str!("../../arch/families/sd_vae.json5")),
+    ("families/dcae.json5", include_str!("../../arch/families/dcae.json5")),
+    ("families/flux.json5", include_str!("../../arch/families/flux.json5")),
+    ("families/chroma.json5", include_str!("../../arch/families/chroma.json5")),
+    ("families/flux2.json5", include_str!("../../arch/families/flux2.json5")),
+    ("families/clip_text.json5", include_str!("../../arch/families/clip_text.json5")),
+    ("families/sd.json5", include_str!("../../arch/families/sd.json5")),
+    ("families/sdxl.json5", include_str!("../../arch/families/sdxl.json5")),
+    ("overrides/sd_turbo.json5", include_str!("../../arch/overrides/sd_turbo.json5")),
+    ("overrides/sdxl_turbo.json5", include_str!("../../arch/overrides/sdxl_turbo.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 
@@ -86,6 +103,19 @@ pub struct Match {
     /// Claims causal LMs no other family matches; tried after every non-fallback family.
     #[serde(default)]
     pub fallback: bool,
+    /// Tensor-name groups: a weights file holding every name of any group (names may carry a
+    /// `model.diffusion_model.` prefix) is a derived checkpoint of this family's denoiser (a
+    /// transformer-only finetune or quantization whose model card names the base pipeline).
+    #[serde(default)]
+    pub denoiser_tensors: Vec<Vec<String>>,
+    /// Tensor-name groups of a single-file pipeline checkpoint (every component's weights in one
+    /// file, e.g. LDM / ComfyUI checkpoints): its configs come from the spec's
+    /// `runtime.reference` repo.
+    #[serde(default)]
+    pub single_file_tensors: Vec<Vec<String>>,
+    /// File extensions `single_file_tensors` applies to (empty: any).
+    #[serde(default)]
+    pub single_file_ext: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -117,6 +147,9 @@ pub struct Names {
     pub use_sets: Vec<String>,
     #[serde(default)]
     pub rules: Vec<(String, String)>,
+    /// Checkpoint-name prefixes removed before any rule (e.g. `model.diffusion_model.`).
+    #[serde(default)]
+    pub strip: Vec<String>,
 }
 
 /// A load-time value transform on a canonical tensor (`tensor` may hold `{i}` captures).
@@ -559,6 +592,43 @@ impl Registry {
             .map(|(n, _)| n.to_string())
     }
 
+    /// The family whose `match.denoiser_tensors` claims a weights file with tensor `names`.
+    pub fn detect_denoiser(&self, names: &[String]) -> Option<String> {
+        self.detect_tensors(names, |m| &m.denoiser_tensors, true)
+    }
+
+    /// The family whose `match.single_file_tensors` (and `single_file_ext`) claim a weights file
+    /// with extension `ext` and tensor `names`.
+    pub fn detect_single_file(&self, names: &[String], ext: &str) -> Option<String> {
+        self.detect_tensors(names, |m| {
+            if m.single_file_ext.is_empty() || m.single_file_ext.iter().any(|e| e == ext) {
+                &m.single_file_tensors
+            } else {
+                &m.denoiser_tensors[..0]
+            }
+        }, false)
+    }
+
+    fn detect_tensors(
+        &self,
+        names: &[String],
+        groups: impl Fn(&Match) -> &[Vec<String>],
+        unprefixed: bool,
+    ) -> Option<String> {
+        let has = |n: &str| {
+            names.iter().any(|x| {
+                x == n || (unprefixed && x.strip_prefix("model.diffusion_model.") == Some(n))
+            })
+        };
+        self.families.iter().find_map(|(f, j)| {
+            let m: Match = serde_json::from_value(j.get("match")?.clone()).ok()?;
+            groups(&m)
+                .iter()
+                .any(|g| !g.is_empty() && g.iter().all(|n| has(n)))
+                .then(|| f.clone())
+        })
+    }
+
     /// Every family's matcher, for listings (hub picker, README).
     pub fn matchers(&self) -> Vec<(String, Match, Pipeline)> {
         self.families
@@ -649,6 +719,75 @@ mod tests {
     const CHILD: &str = r#"{family: "child", extends: "base", match: {hf_model_type: ["child"]},
         config: {b: "3", c: "4"}, runtime: {list: [9]}}"#;
     const FALLBACK: &str = r#"{family: "fb", match: {fallback: true}, pipeline: "causal_lm"}"#;
+
+    #[test]
+    fn denoiser_tensor_groups_claim_weight_files() {
+        let toy = r#"{family: "toy", pipeline: "diffusion",
+            match: {denoiser_tensors: [["img_in.weight"], ["x.weight", "y.weight"]]}}"#;
+        let r = Registry::from_files(&files(&[("families/toy.json5", toy), ("families/base.json5", BASE)]), &[]).unwrap();
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(r.detect_denoiser(&n(&["model.diffusion_model.img_in.weight"])).as_deref(), Some("toy"));
+        assert_eq!(r.detect_denoiser(&n(&["x.weight", "y.weight", "z"])).as_deref(), Some("toy"));
+        assert_eq!(r.detect_denoiser(&n(&["x.weight"])), None);
+        let single = r#"{family: "one", pipeline: "diffusion", match: {single_file_tensors: [["a.w", "b.w"]], single_file_ext: ["gguf"]}}"#;
+        let r = Registry::from_files(&files(&[("families/one.json5", single)]), &[]).unwrap();
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "gguf").as_deref(), Some("one"));
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "safetensors"), None);
+        assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"]), "gguf"), None);
+    }
+
+    #[test]
+    fn ldm_vae_names_map_to_diffusers() {
+        let r = names::Renamer::from_pairs(&registry().unwrap().name_set("ldm_vae").unwrap()).unwrap();
+        let d = |n: &str| r.canonical(&format!("first_stage_model.{n}"));
+        assert_eq!(d("decoder.up.3.block.0.conv1.weight"), "decoder.up_ldm.3.resnets.0.conv1.weight");
+        assert_eq!(d("decoder.up.0.block.0.nin_shortcut.bias"), "decoder.up_ldm.0.resnets.0.conv_shortcut.bias");
+        assert_eq!(d("decoder.up.2.upsample.conv.weight"), "decoder.up_ldm.2.upsamplers.0.conv.weight");
+        assert_eq!(d("decoder.mid.block_2.norm1.weight"), "decoder.mid_block.resnets.1.norm1.weight");
+        assert_eq!(d("decoder.mid.attn_1.norm.bias"), "decoder.mid_block.attentions.0.group_norm.bias");
+        assert_eq!(d("encoder.mid.attn_1.proj_out.weight"), "encoder.mid_block.attentions.0.to_out.0.weight");
+        assert_eq!(d("decoder.mid.attn_1.q.weight"), "decoder.mid_block.attentions.0.to_q.weight");
+        assert_eq!(d("decoder.norm_out.weight"), "decoder.conv_norm_out.weight");
+        assert_eq!(d("encoder.down.1.downsample.conv.bias"), "encoder.down_blocks.1.downsamplers.0.conv.bias");
+        assert_eq!(d("encoder.down.0.block.1.nin_shortcut.weight"), "encoder.down_blocks.0.resnets.1.conv_shortcut.weight");
+        assert_eq!(d("post_quant_conv.weight"), "post_quant_conv.weight");
+        assert_eq!(d("decoder.conv_in.bias"), "decoder.conv_in.bias");
+    }
+
+    #[test]
+    fn sana_runtime_keys_and_gemma2_encoder_claim() {
+        let r = registry().unwrap();
+        let s = r.spec("sana", &Signals::default()).unwrap();
+        let rt: crate::runtime::diffusion::Runtime = s.runtime_as().unwrap();
+        assert!(rt.other.is_empty(), "unknown runtime keys {:?}", rt.other.keys());
+        // A Gemma 2 causal LM detects as the encoder family: LM dispatch keeps it off the spec LM path.
+        let sig = Signals {
+            hf_model_type: Some("gemma2".into()),
+            causal_lm: true,
+            ..Default::default()
+        };
+        assert_eq!(r.detect(&sig).as_deref(), Some("gemma2"));
+        assert_eq!(r.spec("gemma2", &sig).unwrap().pipeline, Pipeline::Encoder);
+    }
+
+    #[test]
+    fn flux_families_runtime_keys_and_pipeline_claims() {
+        let r = registry().unwrap();
+        for (fam, class) in [("flux", "FluxPipeline"), ("chroma", "ChromaPipeline"), ("flux2", "Flux2KleinPipeline")] {
+            let s = r.spec(fam, &Signals::default()).unwrap();
+            let rt: crate::runtime::diffusion::Runtime = s.runtime_as().unwrap();
+            assert!(rt.other.is_empty(), "{fam}: unknown runtime keys {:?}", rt.other.keys());
+            assert!(s.components.get("text_encoder_2").is_none() == (fam != "flux"), "{fam}");
+            let sig = Signals {
+                diffusers_class: Some(class.into()),
+                ..Default::default()
+            };
+            assert_eq!(r.detect(&sig).as_deref(), Some(fam));
+        }
+        let names = names::Renamer::from_pairs(&r.name_set("bfl").unwrap()).unwrap();
+        assert_eq!(names.canonical("double_blocks.3.txt_attn.qkv.bias"), "transformer_blocks.3.attn.to_added_qkv.bias");
+        assert_eq!(names.canonical("single_blocks.0.norm.key_norm.scale"), "single_transformer_blocks.0.attn.norm_k.weight");
+    }
 
     #[test]
     fn extends_overrides_and_user_dir_merge_in_order() {
