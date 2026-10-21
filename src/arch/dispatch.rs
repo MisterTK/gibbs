@@ -135,14 +135,6 @@ pub fn load_lm(
     r
 }
 
-/// Causal-LM families whose old loaders still serve default (non-`GIBBS_SPEC_LM`) loads; every
-/// other `causal_lm` family loads from its spec.
-// legacy: until Phase 4 (GraphLm: llama … bitnet) and Phase 5 (native qwen loaders).
-const LEGACY_LM: &[&str] = &[
-    "llama", "glm", "granite", "gpt_neox", "gpt2", "opt", "lfm2", "bitnet", "qwen3", "hunyuan",
-    "qwen3_5", "qwen3_vl", "qwen4_exp",
-];
-
 fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choice>), String> {
     let spec = |family: Option<&str>| -> Result<(ExecutableModel, Option<Choice>), String> {
         let m = crate::runtime::lm::load(a, super::registry()?, family, o.placement)?;
@@ -151,13 +143,16 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
     // Checkpoints the arch reader cannot open, and registry errors, leave the legacy paths as
     // they were (a spec problem fails only spec loads).
     let ck = super::load::open(a).ok();
+    // `runtime.cutover: true` (legacy: until every causal-LM phase lands): the family's old
+    // loader is gone, so its spec serves default loads, not only `GIBBS_SPEC_LM=1` ones.
     let family = ck.as_ref().and_then(|ck| {
         let reg = super::registry().map_err(|e| tracing::warn!("{e}")).ok()?;
         let f = o.family.map(String::from).or_else(|| reg.detect(&ck.sig))?;
-        let p = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?.pipeline;
-        Some((f, p))
+        let s = reg.spec(&f, &ck.sig).map_err(|e| tracing::warn!("{e}")).ok()?;
+        let cut = s.runtime["cutover"].as_bool() == Some(true);
+        Some((f, s.pipeline, cut))
     });
-    if let Some((f, Pipeline::Encdec)) = &family {
+    if let Some((f, Pipeline::Encdec, _)) = &family {
         let m = crate::runtime::encdec::load(a, super::registry()?, Some(f), o.placement)?;
         return Ok((ExecutableModel::Native(m), None));
     }
@@ -165,8 +160,8 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<(ExecutableModel, Option<Choic
         return spec(o.family);
     }
     match family {
-        Some((f, Pipeline::Unsupported)) => return spec(Some(&f)),
-        Some((f, Pipeline::CausalLm)) if spec_lm_enabled() || !LEGACY_LM.contains(&f.as_str()) => {
+        Some((f, Pipeline::Unsupported, _)) => return spec(Some(&f)),
+        Some((f, Pipeline::CausalLm, cut)) if cut || spec_lm_enabled() => {
             return spec(Some(&f))
         }
         _ => {}

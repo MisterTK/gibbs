@@ -441,7 +441,7 @@ fn index_buf(ck: &mut Checkpoint, m: ModelManifest, data: GgufData, sidecar: boo
     }
 }
 
-/// llama.cpp's multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
+/// The multimodal projector GGUF beside a GGUF's weights (`mmproj*.gguf`): its tensors
 /// join the raw tensors, seen only by specs with `runtime.media`, and its metadata keys the
 /// `gguf` scope (the weights file's own keys win, `general.architecture` among them).
 fn index_sidecar(ck: &mut Checkpoint, p: &Path) -> Result<(), String> {

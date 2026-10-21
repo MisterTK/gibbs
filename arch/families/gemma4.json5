@@ -619,7 +619,7 @@
       outputs: ["embeds"],
     },
   },
-  runtime: {prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
+  runtime: {cutover: true, prefill_rows: 64, bidir_media_blocks: true, ffn_weights: ["model.language_model.layers.*.mlp.*"],
     seqcls: {head: "score", pooling: "last_nonpad"},
     media: {
       image: {
