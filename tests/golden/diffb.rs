@@ -1006,3 +1006,45 @@ fn unet3d() {
         o
     });
 }
+
+/// The `qwen_image21` spec on the real Qwen-Image 2.1 Q4_0 GGUF (one denoiser step, 4x4 latent
+/// grid, 12 text rows) against the old `Dit21::forward_gpu` output captured before its deletion
+/// (`diffb_qwen_image21_real.json`, from `real_gguf_step_matches_cpu`). Needs the ~4 GB file.
+#[test]
+#[ignore]
+fn qwen_image21_real_gguf_spec() {
+    // `dit_graph::fixture::rand`, the old test's inputs.
+    fn rand(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+            })
+            .collect()
+    }
+    let path = std::path::PathBuf::from(std::env::var("GIBBS_QWEN21_TRANSFORMER").unwrap_or_else(|_| {
+        "/Users/keas/code/rust-inference-server/disk/models--abenzerps--Qwen-Image-2.1-Uncensored-GGUF/snapshots/main/qwen-image-2.1-UC-Q4_0.gguf".into()
+    }));
+    let want: Vec<f32> = serde_json::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/diffb_qwen_image21_real.json")).unwrap(),
+    )
+    .unwrap();
+    let mut r = spec_runner(path.parent().unwrap(), path.file_name().unwrap().to_str().unwrap(), Some("qwen_image21"), Device::Metal);
+    let var = |r: &Runner, k: &str| r.model.env.var(k).unwrap().usize().unwrap();
+    let (in_ch, tw) = (var(&r, "in_ch"), var(&r, "text_width"));
+    let (h, w, nt) = (4usize, 4usize, 12usize);
+    r.step = vec![("sigma".into(), Val::Num(0.7f32 as f64))];
+    let got = run1(
+        &mut r,
+        "denoiser",
+        &[("h", num(h)), ("w", num(w)), ("nt", num(nt))],
+        vec![F32(rand(h * w * in_ch, 21, 1.0)), F32(rand(nt * tw, 22, 1.0))],
+        "out",
+    );
+    let (e, c) = gibbs_engine::arch::testing::compare(&got, &want);
+    eprintln!("qwen_image21 real GGUF spec vs old Metal: rel {e:.3e} cos {c:.7}");
+    assert!(e < 1e-3 && c > 0.9999, "rel {e} cos {c}");
+}
