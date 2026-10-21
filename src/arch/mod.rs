@@ -14,7 +14,7 @@ pub mod gen;
 pub mod load;
 pub mod names;
 pub mod templates;
-#[cfg(test)]
+#[doc(hidden)]
 pub mod testing;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
@@ -35,6 +35,7 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/gpt2.json5", include_str!("../../arch/families/gpt2.json5")),
     ("families/opt.json5", include_str!("../../arch/families/opt.json5")),
     ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
+    ("families/zimage.json5", include_str!("../../arch/families/zimage.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
 ];
 

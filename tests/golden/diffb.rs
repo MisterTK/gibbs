@@ -79,19 +79,94 @@ fn denorm(x: &[f32], plane: usize, mean: &[f32], std: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+// ---- spec-path helpers ------------------------------------------------------------------------
+
+use gibbs_engine::arch::expr::Val;
+use gibbs_engine::arch::testing::Runner;
+use gibbs_engine::graph::Tensor::{self, F32, U32};
+
+fn num(n: usize) -> Val {
+    Val::Num(n as f64)
+}
+
+/// A spec runner over a fixture directory whose weights are `weights`.
+fn spec_runner(dir: &std::path::Path, weights: &str, dev: Device) -> Runner {
+    let a = gibbs_engine::model::hub::ModelArtifacts {
+        model_id: "test/diffb".into(),
+        local_dir: Some(dir.to_path_buf()),
+        config_path: Some(dir.join("config.json")).filter(|p| p.is_file()),
+        weights_path: Some(dir.join(weights)),
+        is_cached: true,
+        ..Default::default()
+    };
+    Runner::from_artifacts(&a, None, dev, 0).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn gen_f32(name: &str, args: Value) -> Vec<f32> {
+    match gibbs_engine::arch::gen::generate(name, &args).unwrap().data {
+        gibbs_engine::arch::gen::GenData::F32(v) => v,
+        _ => panic!("{name}: not f32"),
+    }
+}
+
+/// Output `out` of `component` (f32).
+fn run1(r: &mut Runner, component: &str, vars: &[(&str, Val)], ins: Vec<Tensor>, out: &str) -> Vec<f32> {
+    let mut o = r.run(component, vars, ins).unwrap_or_else(|e| panic!("{e}"));
+    match o.remove(out) {
+        Some(F32(v)) => v,
+        other => panic!("output `{out}`: {other:?}"),
+    }
+}
+
+/// Latents [c, h, w] -> `[(h/p)*(w/p), p*p*c]` patch rows in (py, px, c) order.
+fn patchify(lat: &[f32], c: usize, h: usize, w: usize, p: usize) -> Vec<f32> {
+    let (hp, wp) = (h / p, w / p);
+    let mut out = Vec::with_capacity(lat.len());
+    for i in 0..hp {
+        for j in 0..wp {
+            for py in 0..p {
+                for px in 0..p {
+                    for ch in 0..c {
+                        out.push(lat[(ch * h + i * p + py) * w + j * p + px]);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn unpatchify(y: &[f32], c: usize, h: usize, w: usize, p: usize) -> Vec<f32> {
+    let (hp, wp) = (h / p, w / p);
+    let mut out = vec![0.0f32; c * h * w];
+    let mut it = y.iter();
+    for i in 0..hp {
+        for j in 0..wp {
+            for py in 0..p {
+                for px in 0..p {
+                    for ch in 0..c {
+                        out[(ch * h + i * p + py) * w + j * p + px] = *it.next().unwrap();
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Z-Image S3-DiT (`ZImageTransformer2DModel`): 2 noise refiners, 2 context refiners, 2 layers,
 /// dim 64 / 2 heads, axes [8, 12, 12]; one forward with caption/image padding (21 -> 32 caption,
 /// 36 -> 64 patches) and one without.
-#[test]
-fn zimage() {
-    use gibbs_engine::model::zimage::ZDit;
+const ZIMAGE_CASES: [(usize, usize, usize, f32); 2] = [(12, 12, 21, 0.7), (16, 16, 32, 0.25)];
+
+fn zimage_fixture(case: &str) -> std::path::PathBuf {
     const DIM: usize = 64;
     const HD: usize = 32;
     const CAP: usize = 48;
     const IN: usize = 4;
     const ADA: usize = 64;
     const FF: usize = 128;
-    let dir = fixture_dir("diffb_zimage");
+    let dir = fixture_dir(case);
     let mut s = Spec::new();
     for (fam, modulated) in [
         ("noise_refiner", true),
@@ -141,14 +216,19 @@ fn zimage() {
             "rope_theta": 256.0
         }),
     );
-    let dit = ZDit::load(&dir).expect("Z-Image fixture");
+    dir
+}
+
+#[test]
+fn zimage() {
+    use gibbs_engine::model::zimage::ZDit;
+    const CAP: usize = 48;
+    const IN: usize = 4;
+    let dit = ZDit::load(&zimage_fixture("diffb_zimage")).expect("Z-Image fixture");
     // runner: internal gibbs_engine::model::zimage::ZDit::{forward, forward_gpu}
     golden("diffb_zimage", TOL, |dev| {
         let mut o = Out::default();
-        for (k, (h, w, n_cap, sigma)) in [(12usize, 12usize, 21usize, 0.7f32), (16, 16, 32, 0.25)]
-            .into_iter()
-            .enumerate()
-        {
+        for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
             let lat = rnd(10 + k as u64, IN * h * w, 1.0);
             let cap = rnd(20 + k as u64, n_cap * CAP, 1.0);
             let y = if metal(dev) {
@@ -157,6 +237,29 @@ fn zimage() {
                 dit.forward(&lat, h, w, sigma, &cap, n_cap)
             };
             o.f(format!("out_{h}x{w}_cap{n_cap}_s{sigma}"), &y);
+        }
+        o
+    });
+}
+
+/// The `zimage` spec's `denoiser` on the same fixture (host patchify as the old runner).
+#[test]
+fn zimage_spec() {
+    const CAP: usize = 48;
+    const IN: usize = 4;
+    let dir = zimage_fixture("diffb_zimage_spec");
+    golden("diffb_zimage", TOL, |dev| {
+        let mut r = spec_runner(&dir, "diffusion_pytorch_model.safetensors", dev);
+        let mut o = Out::default();
+        for (k, (h, w, n_cap, sigma)) in ZIMAGE_CASES.into_iter().enumerate() {
+            let lat = rnd(10 + k as u64, IN * h * w, 1.0);
+            let cap = rnd(20 + k as u64, n_cap * CAP, 1.0);
+            let t = ((1.0 - sigma) * 1000.0) as f64;
+            let tf = gen_f32("timestep_embedding", json!({"t": t, "dim": 256, "precision": "f32"}));
+            let vars = [("n_img", num((h / 2) * (w / 2))), ("n_cap", num(n_cap)), ("grid_w", num(w / 2))];
+            let ins = vec![F32(patchify(&lat, IN, h, w, 2)), F32(cap), F32(tf)];
+            let y = run1(&mut r, "denoiser", &vars, ins, "out");
+            o.f(format!("out_{h}x{w}_cap{n_cap}_s{sigma}"), &unpatchify(&y, IN, h, w, 2));
         }
         o
     });

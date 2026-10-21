@@ -1,0 +1,143 @@
+// Z-Image S3-DiT (diffusers `ZImageTransformer2DModel`): noise refiners over the padded image
+// tokens, context refiners over the padded caption, then joint layers over [image; caption]; 3-axis
+// RoPE on adjacent pairs, sandwich RMSNorm, tanh-gated adaLN. Sequences pad to a multiple of 32 with
+// learned pad rows. Linear weights run in bf16 (the F32 checkpoint is rounded, as the reference).
+// The runner supplies patch rows ((py, px, c) order), raw caption features and the timestep
+// features `timestep_embedding(t = (1 - sigma) * t_scale, 256, f32)`.
+{
+  family: "zimage",
+  match: {diffusers_class: ["ZImageTransformer2DModel"]},
+  pipeline: "diffusion",
+  config: {
+    dim: "cfg.dim",
+    heads: "cfg.n_heads",
+    head_dim: "dim // heads",
+    in_ch: "cfg.in_channels",
+    patch: "at(cfg.all_patch_size, 0)",
+    axes: "cfg.axes_dims",
+    eps: "first(cfg.norm_eps, 1e-5)",
+    t_scale: "first(cfg.t_scale, 1000)",
+    theta: "first(cfg.rope_theta, 256)",
+    cap_dim: "cfg.cap_feat_dim",
+    refiners: "cfg.n_refiner_layers",
+    layers: "cfg.n_layers",
+    seq_multi: "32",
+  },
+  checks: [
+    {expr: "first(cfg.n_kv_heads, heads) != heads", error: "Z-Image: n_kv_heads != n_heads is not supported"},
+    {expr: "patch != 2 || at(cfg.all_f_patch_size, 0) != 1", error: "Z-Image: only patch size [2] / f_patch [1] is supported"},
+    {expr: "cfg.qk_norm != true || has('siglip_embedder.0.weight') || first(cfg.siglip_feat_dim, 0) > 0",
+     error: "Z-Image: only qk_norm=true without SigLIP (Omni) inputs is supported"},
+    {expr: "len(axes) != 3 || at(axes, 0) + at(axes, 1) + at(axes, 2) != head_dim", error: "Z-Image: axes_dims must be 3 dims summing to head_dim"},
+  ],
+  transforms: [
+    {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "axis_freqs", args: {dims: "axes", theta: "theta"}},
+    one: {gen: "fill", args: {shape: [1], value: 1}},
+    "ones.dim": {gen: "ones", args: {shape: ["dim"]}},
+  },
+  macros: {
+    // One S3-DiT block over `x`; `adaln` drives the modulation when `modulated`; `pos` names the
+    // position input.
+    zblock: {params: ["x", "adaln"], body: [
+      {block: [
+        {op: "Linear", in: ["adaln", "w:{p}.adaLN_modulation.0.weight", "w?:{p}.adaLN_modulation.0.bias"], out: "m", name: "ada"},
+        {op: "Slice", args: {axis: 1, start: 0, end: "dim"}, in: ["m"], out: "m0"},
+        {op: "Binary", args: {kind: "Add"}, in: ["m0", "c:one"], out: "m0", name: "m0.1p"},
+        {op: "Slice", args: {axis: 1, start: "dim", end: "2 * dim"}, in: ["m"], out: "m1"},
+        {op: "Unary", args: {kind: "Tanh"}, in: ["m1"], out: "m1", name: "m1.tanh"},
+        {op: "Slice", args: {axis: 1, start: "2 * dim", end: "3 * dim"}, in: ["m"], out: "m2"},
+        {op: "Binary", args: {kind: "Add"}, in: ["m2", "c:one"], out: "m2", name: "m2.1p"},
+        {op: "Slice", args: {axis: 1, start: "3 * dim", end: "4 * dim"}, in: ["m"], out: "m3"},
+        {op: "Unary", args: {kind: "Tanh"}, in: ["m3"], out: "m3", name: "m3.tanh"},
+      ], when: "modulated"},
+      {let: {rope: {MRope: {sections: ["at(axes, 0) // 2", "at(axes, 1) // 2", "at(axes, 2) // 2"], interleaved: false, pairs: "'Adjacent'"}}}},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{p}.attention_norm1.weight"], out: "h", name: "attn_in"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["h", "m0"], out: "h", name: "attn_mod", when: "modulated"},
+      {op: "Linear", in: ["h", "w:{p}.attention.to_q.weight", "w?:{p}.attention.to_q.bias"], out: "q"},
+      {op: "Linear", in: ["h", "w:{p}.attention.to_k.weight", "w?:{p}.attention.to_k.bias"], out: "k"},
+      {op: "Linear", in: ["h", "w:{p}.attention.to_v.weight", "w?:{p}.attention.to_v.bias"], out: "v"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{p}.attention.norm_q.weight"], out: "q", name: "qnorm"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{p}.attention.norm_k.weight"], out: "k", name: "knorm"},
+      {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "head_dim", variant: "rope", mscale: 1}, in: ["q", "i:{pos}", "c:rope.inv_freq"], out: "q", name: "rq"},
+      {op: "Rope", args: {head_dim: "head_dim", rotary_dim: "head_dim", variant: "rope", mscale: 1}, in: ["k", "i:{pos}", "c:rope.inv_freq"], out: "k", name: "rk"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{p}.attention.to_out.0.weight", "w?:{p}.attention.to_out.0.bias"], out: "a", name: "o"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["a", "w:{p}.attention_norm2.weight"], out: "a", name: "attn_out"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["a", "m1"], out: "a", name: "res1.gate", when: "modulated"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "res1"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{p}.ffn_norm1.weight"], out: "h", name: "ffn_in"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["h", "m2"], out: "h", name: "ffn_mod", when: "modulated"},
+      {op: "Linear", in: ["h", "w:{p}.feed_forward.w1.weight"], out: "g", name: "w1"},
+      {op: "Linear", in: ["h", "w:{p}.feed_forward.w3.weight"], out: "u", name: "w3"},
+      {op: "SwiGlu", in: ["g", "u"], out: "f", name: "swiglu"},
+      {op: "Linear", in: ["f", "w:{p}.feed_forward.w2.weight"], out: "f", name: "w2"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["f", "w:{p}.ffn_norm2.weight"], out: "f", name: "ffn_out"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["f", "m3"], out: "f", name: "res2.gate", when: "modulated"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "f"], out: "out", name: "res2"},
+    ]},
+    // `x` [n, dim] with `total - n` copies of the learned row `{pad}` appended (index input `{idx}`).
+    pad_rows: {params: ["x", "idx"], body: [
+      {op: "Embedding", in: ["w:{pad}", "idx"], out: "rows"},
+      {op: "Concat", args: {axis: 0}, in: ["x", "rows"], out: "out", name: "cat"},
+    ]},
+  },
+  components: {
+    // Model output rows [n_img, patch*patch*in_ch] for `n_img` patches on a grid `grid_w` wide and
+    // `n_cap` caption rows.
+    denoiser: {
+      vars: ["n_img", "n_cap", "grid_w"],
+      inputs: [
+        {name: "patches", dtype: "f32", shape: ["n_img", "patch * patch * in_ch"]},
+        {name: "cap", dtype: "f32", shape: ["n_cap", "cap_dim"]},
+        {name: "t_feat", dtype: "f32", shape: [1, 256]},
+        {name: "pos_img", dtype: "u32", shape: ["(n_img + (32 - n_img % 32) % 32) * 3"], gen: "caption_then_grid_padded",
+         args: {grid_w: "grid_w", grid_len: "n_img", grid_total: "n_img + (32 - n_img % 32) % 32", text_total: "n_cap + (32 - n_cap % 32) % 32", part: "'grid'"}},
+        {name: "pos_cap", dtype: "u32", shape: ["(n_cap + (32 - n_cap % 32) % 32) * 3"], gen: "caption_then_grid_padded",
+         args: {grid_w: "grid_w", grid_len: "n_img", grid_total: "n_img + (32 - n_img % 32) % 32", text_total: "n_cap + (32 - n_cap % 32) % 32", part: "'text'"}},
+        {name: "pos_all", dtype: "u32", shape: ["(n_img + (32 - n_img % 32) % 32 + n_cap + (32 - n_cap % 32) % 32) * 3"], gen: "caption_then_grid_padded",
+         args: {grid_w: "grid_w", grid_len: "n_img", grid_total: "n_img + (32 - n_img % 32) % 32", text_total: "n_cap + (32 - n_cap % 32) % 32", part: "'all'"}},
+        {name: "img_pad_idx", dtype: "u32", shape: ["(32 - n_img % 32) % 32"], gen: "iota", args: {n: "(32 - n_img % 32) % 32", step: 0},
+         when: "n_img % 32 != 0"},
+        {name: "cap_pad_idx", dtype: "u32", shape: ["(32 - n_cap % 32) % 32"], gen: "iota", args: {n: "(32 - n_cap % 32) % 32", step: 0},
+         when: "n_cap % 32 != 0"},
+      ],
+      body: [
+        {op: "Linear", in: ["i:t_feat", "w:t_embedder.mlp.0.weight", "w?:t_embedder.mlp.0.bias"], out: "t", name: "t_mlp0"},
+        {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "t_silu"},
+        {op: "Linear", in: ["t", "w:t_embedder.mlp.2.weight", "w?:t_embedder.mlp.2.bias"], out: "adaln", name: "t_mlp2"},
+
+        {op: "Linear", in: ["i:patches", "w:all_x_embedder.2-1.weight", "w?:all_x_embedder.2-1.bias"], out: "x", name: "x_embedder"},
+        {use: "pad_rows", args: {pad: "'x_pad_token'"}, in: ["x", "i:img_pad_idx"], out: "x", name: "x_pad", when: "n_img % 32 != 0"},
+        {repeat: "i", count: "refiners", body: [
+          {use: "zblock", args: {p: "fmt('noise_refiner.{i}')", modulated: true, pos: "'pos_img'"}, in: ["x", "adaln"], out: "x", name: "nr.{i}"},
+        ]},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["i:cap", "w:cap_embedder.0.weight"], out: "c", name: "cap_normed"},
+        {op: "Linear", in: ["c", "w:cap_embedder.1.weight", "w?:cap_embedder.1.bias"], out: "c", name: "cap_lin"},
+        {use: "pad_rows", args: {pad: "'cap_pad_token'"}, in: ["c", "i:cap_pad_idx"], out: "c", name: "cap_pad", when: "n_cap % 32 != 0"},
+        {repeat: "i", count: "refiners", body: [
+          {use: "zblock", args: {p: "fmt('context_refiner.{i}')", modulated: false, pos: "'pos_cap'"}, in: ["c", "adaln"], out: "c", name: "cr.{i}"},
+        ]},
+        {op: "Concat", args: {axis: 0}, in: ["x", "c"], out: "u", name: "unified"},
+        {repeat: "i", count: "layers", body: [
+          {use: "zblock", args: {p: "fmt('layers.{i}')", modulated: true, pos: "'pos_all'"}, in: ["u", "adaln"], out: "u", name: "layer.{i}"},
+        ]},
+        {op: "Unary", args: {kind: "Silu"}, in: ["adaln"], out: "s", name: "final.silu"},
+        {op: "Linear", in: ["s", "w:all_final_layer.2-1.adaLN_modulation.1.weight", "w?:all_final_layer.2-1.adaLN_modulation.1.bias"], out: "s", name: "final_ada"},
+        {op: "Binary", args: {kind: "Add"}, in: ["s", "c:one"], out: "s", name: "final.1p"},
+        {op: "Slice", args: {axis: 0, start: 0, end: "n_img"}, in: ["u"], out: "h", name: "final.img"},
+        {op: "LayerNorm", args: {eps: 1e-6}, in: ["h", "c:ones.dim"], out: "h", name: "final.ln"},
+        {op: "Binary", args: {kind: "Mul"}, in: ["h", "s"], out: "h", name: "final.mod"},
+        {op: "Linear", in: ["h", "w:all_final_layer.2-1.linear.weight", "w?:all_final_layer.2-1.linear.bias"], out: "out", name: "final_lin"},
+      ],
+      outputs: ["out"],
+    },
+  },
+  runtime: {
+    // ponytail: runtime keys are provisional until the diffusion runtime contract lands.
+    patch: 2,
+    timestep: {kind: "one_minus_sigma_scaled", scale: "t_scale", dim: 256, precision: "f32"},
+  },
+}

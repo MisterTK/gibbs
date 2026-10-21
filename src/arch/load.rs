@@ -283,7 +283,9 @@ pub fn open(artifacts: &ModelArtifacts) -> Result<Checkpoint, String> {
         .map(|d| d.join("model_index.json"))
         .filter(|p| p.is_file())
         .and_then(|p| read_json(&p).ok())
-        .and_then(|j| j["_class_name"].as_str().map(String::from));
+        .and_then(|j| j["_class_name"].as_str().map(String::from))
+        // A component folder (`transformer/`, `vae/`) names its class in `config.json`.
+        .or_else(|| cfg["_class_name"].as_str().map(String::from));
     ck.sig = Signals {
         hub_id: artifacts.model_id.clone(),
         file_name: weights
@@ -1182,7 +1184,7 @@ fn xf_shapes(
     let numel: usize = s.iter().product();
     let same = || Ok(vec![(None, s.to_vec())]);
     match op {
-        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16"
+        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16" | "to_bf16"
         | "ternarize" => same(),
         "untile_packed_rows" => {
             let u = Untile::from(a)?;
@@ -1296,6 +1298,7 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
     let k = ins[0].kind;
     match op {
         "to_f32" => Kind::F32,
+        "to_bf16" => Kind::Bf16,
         "untile_packed_rows" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
@@ -1333,7 +1336,7 @@ fn xf_dense(
         }),
         "neg_exp" => map(&mut v, &|x| -x.exp()),
         "to_f32" | "reshape" => {}
-        "round_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
+        "round_bf16" | "to_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
         "ternarize" => match ins[0].kind {
             Kind::Bf16 | Kind::Packed(_) => ternarize(&mut v, |x| bf16_to_f32(f32_to_bf16(x))),
             Kind::F16 => ternarize(&mut v, |x| f16_to_f32(f32_to_f16(x))),
@@ -1541,6 +1544,10 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
         }
         let args = eval_args(env, &caps, &t.args)?;
         let mut ins = vec![table.read()[&name].clone()];
+        // Already bf16 (or packed, kept as stored): nothing to round, stays zero-copy.
+        if t.op == "to_bf16" && !matches!(ins[0].kind, Kind::F32 | Kind::F16) {
+            continue;
+        }
         if t.op == "lora_merge" {
             for k in ["a", "b"] {
                 let n = args[k].as_str().ok_or_else(|| format!("needs `{k}`"))?;
