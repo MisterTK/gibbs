@@ -1,5 +1,87 @@
-// unet building blocks (see arch/lib/transformer.json5 for the macro conventions).
+// unet building blocks (see arch/lib/transformer.json5 for the macro conventions). Images are
+// `[c, h, w]`, token streams `[rows, c]`; weight stems `p` / `w` are diffusers names.
 {
   macros: {
+    // GroupNorm (`groups`, default 32) of an image with gain/bias `{w}.weight` / `{w}.bias`.
+    group_norm: {params: ["x"], body: [
+      {let: {xs: "shape('x')"}},
+      {op: "Reshape", args: {shape: ["xs[0]", "xs[1] * xs[2]"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "GroupNorm", args: {groups: "first(groups, 32)", eps: "eps"}, in: ["t", "w:{w}.weight", "w:{w}.bias"], out: "t", name: "gn"},
+      {op: "Reshape", args: {shape: "xs"}, in: ["t"], out: "out", name: "unflat"},
+    ]},
+    // Square-kernel conv `{w}` with "same" padding (k // 2) and `stride` (default 1).
+    conv2d: {params: ["x"], body: [
+      {let: {kk: "shape(fmt('{w}.weight'))[2]", st: "first(stride, 1)"}},
+      {op: "Conv2d", args: {stride: ["st", "st"], padding: ["kk // 2", "kk // 2", "kk // 2", "kk // 2"], dilation: [1, 1], groups: 1},
+       in: ["x", "w:{w}.weight", "w?:{w}.bias"], out: "out", name: "conv"},
+    ]},
+    // diffusers `ResnetBlock2D` / LDM `ResBlock` at stem `p`; `emb` is SiLU(time embedding) [1, e].
+    resnet2d: {params: ["x", "emb"], body: [
+      {use: "group_norm", args: {w: "fmt('{p}.norm1')", eps: "first(eps, 1e-5)"}, in: ["x"], out: "t", name: "norm1"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "act1"},
+      {use: "conv2d", args: {w: "fmt('{p}.conv1')"}, in: ["t"], out: "t", name: "conv1"},
+      {op: "Linear", in: ["emb", "w:{p}.time_emb_proj.weight", "w?:{p}.time_emb_proj.bias"], out: "e", name: "emb_proj"},
+      {op: "Reshape", args: {shape: ["shape('e')[1]", 1, 1]}, in: ["e"], out: "e", name: "emb_col"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "e"], out: "t", name: "add_emb"},
+      {use: "group_norm", args: {w: "fmt('{p}.norm2')", eps: "first(eps, 1e-5)"}, in: ["t"], out: "t", name: "norm2"},
+      {op: "Unary", args: {kind: "Silu"}, in: ["t"], out: "t", name: "act2"},
+      {use: "conv2d", args: {w: "fmt('{p}.conv2')"}, in: ["t"], out: "t", name: "conv2"},
+      {use: "conv2d", args: {w: "fmt('{p}.conv_shortcut')"}, in: ["x"], out: "x", name: "shortcut",
+       when: "has(fmt('{p}.conv_shortcut.weight'))"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "x"], out: "out", name: "res"},
+    ]},
+    // diffusers `Attention` at stem `w` (`to_q`, `to_k`, `to_v`, `to_out.0`): `x` attends to `ctx`
+    // (pass `x` twice for self-attention), `heads` heads, non-causal.
+    attention: {params: ["x", "ctx"], body: [
+      {op: "Linear", in: ["x", "w:{w}.to_q.weight", "w?:{w}.to_q.bias"], out: "q", name: "q"},
+      {op: "Linear", in: ["ctx", "w:{w}.to_k.weight", "w?:{w}.to_k.bias"], out: "k", name: "k"},
+      {op: "Linear", in: ["ctx", "w:{w}.to_v.weight", "w?:{w}.to_v.bias"], out: "v", name: "v"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "heads", causal: false}, in: ["q", "k", "v"], out: "a", name: "attn"},
+      {op: "Linear", in: ["a", "w:{w}.to_out.0.weight", "w?:{w}.to_out.0.bias"], out: "out", name: "out"},
+    ]},
+    // diffusers `BasicTransformerBlock` at stem `p`: self-attention, cross-attention over `ctx`,
+    // GEGLU feed-forward (value half first, exact GELU on the gate half); LayerNorm eps 1e-5.
+    basic_transformer_block: {params: ["x", "ctx"], body: [
+      {op: "LayerNorm", args: {eps: 1e-5}, in: ["x", "w:{p}.norm1.weight", "w?:{p}.norm1.bias"], out: "h", name: "norm1"},
+      {use: "attention", args: {w: "fmt('{p}.attn1')"}, in: ["h", "h"], out: "a", name: "attn1"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "res1"},
+      {op: "LayerNorm", args: {eps: 1e-5}, in: ["x", "w:{p}.norm2.weight", "w?:{p}.norm2.bias"], out: "h", name: "norm2"},
+      {use: "attention", args: {w: "fmt('{p}.attn2')"}, in: ["h", "ctx"], out: "a", name: "attn2"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "res2"},
+      {op: "LayerNorm", args: {eps: 1e-5}, in: ["x", "w:{p}.norm3.weight", "w?:{p}.norm3.bias"], out: "h", name: "norm3"},
+      {op: "Linear", in: ["h", "w:{p}.ff.net.0.proj.weight", "w?:{p}.ff.net.0.proj.bias"], out: "g", name: "ff_in"},
+      {let: {inner: "shape('g')[1] // 2"}},
+      {op: "Slice", args: {axis: -1, start: 0, end: "inner"}, in: ["g"], out: "a", name: "ff_value"},
+      {op: "Slice", args: {axis: -1, start: "inner", end: "2 * inner"}, in: ["g"], out: "g", name: "ff_gate"},
+      {op: "Unary", args: {kind: "GeluErf"}, in: ["g"], out: "g", name: "ff_gelu"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["a", "g"], out: "g", name: "geglu"},
+      {op: "Linear", in: ["g", "w:{p}.ff.net.2.weight", "w?:{p}.ff.net.2.bias"], out: "f", name: "ff_out"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "f"], out: "out", name: "res3"},
+    ]},
+    // diffusers `Transformer2DModel` / LDM `SpatialTransformer` at stem `p` on image `x` with context
+    // `ctx`: GroupNorm (eps 1e-6), proj_in (linear; 1x1 convs are reshaped at load), every
+    // `transformer_blocks.N`, proj_out, residual. Heads: `head_count` when > 0, else width / `head_dim`.
+    spatial_transformer: {params: ["x", "ctx"], body: [
+      {let: {xs: "shape('x')", inner: "shape(fmt('{p}.proj_in.weight'))[0]"}},
+      {let: {heads: "head_count > 0 ? head_count : inner // head_dim"}},
+      {op: "Reshape", args: {shape: ["xs[0]", "xs[1] * xs[2]"]}, in: ["x"], out: "t", name: "flat"},
+      {op: "GroupNorm", args: {groups: 32, eps: 1e-6}, in: ["t", "w:{p}.norm.weight", "w:{p}.norm.bias"], out: "t", name: "norm"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "to_tokens"},
+      {op: "Linear", in: ["t", "w:{p}.proj_in.weight", "w?:{p}.proj_in.bias"], out: "t", name: "proj_in"},
+      {repeat: "b", count: "count(fmt('{p}.transformer_blocks.{{k}}.norm1.weight'))", body: [
+        {use: "basic_transformer_block", args: {p: "fmt('{p}.transformer_blocks.{b}')"}, in: ["t", "ctx"], out: "t", name: "block{b}"},
+      ]},
+      {op: "Linear", in: ["t", "w:{p}.proj_out.weight", "w?:{p}.proj_out.bias"], out: "t", name: "proj_out"},
+      {op: "Transpose", args: {perm: [1, 0]}, in: ["t"], out: "t", name: "to_image"},
+      {op: "Reshape", args: {shape: "xs"}, in: ["t"], out: "t", name: "unflat"},
+      {op: "Binary", args: {kind: "Add"}, in: ["t", "x"], out: "out", name: "res"},
+    ]},
+    // A resnet followed by its spatial transformer when the checkpoint has one: down/up block
+    // module `j` of block stem `p` (`{p}.resnets.{j}`, `{p}.attentions.{j}`).
+    res_attn: {params: ["x", "emb", "ctx"], body: [
+      {use: "resnet2d", args: {p: "fmt('{p}.resnets.{j}')"}, in: ["x", "emb"], out: "out", name: "res"},
+      {use: "spatial_transformer", args: {p: "fmt('{p}.attentions.{j}')"}, in: ["out", "ctx"], out: "out", name: "attn",
+       when: "has(fmt('{p}.attentions.{j}.proj_in.weight'))"},
+    ]},
   },
 }

@@ -197,4 +197,53 @@ mod tests {
         let rn = r(&[("conv{i}1.w", "c.{i}.w")]);
         assert_eq!(rn.canonical("conv121.w"), "c.12.w");
     }
+
+    fn set(name: &str) -> Renamer {
+        let reg = crate::arch::Registry::load(None).unwrap();
+        Renamer::from_pairs(&reg.name_set(name).unwrap()).unwrap()
+    }
+
+    /// `ldm` inverts `model::unet::ldm_unet_name` (layers_per_block 2, SD 1.x up_blocks.0 without
+    /// attentions and SDXL-style attention up blocks).
+    #[test]
+    fn ldm_set_inverts_unet_aliases() {
+        let rn = set("ldm");
+        for d in [
+            "conv_in.weight",
+            "time_embedding.linear_1.bias",
+            "time_embedding.cond_proj.weight",
+            "add_embedding.linear_2.weight",
+            "down_blocks.0.resnets.1.conv1.weight",
+            "down_blocks.1.resnets.0.conv_shortcut.bias",
+            "down_blocks.1.attentions.1.proj_in.weight",
+            "down_blocks.2.downsamplers.0.conv.weight",
+            "mid_block.resnets.0.norm1.weight",
+            "mid_block.resnets.1.time_emb_proj.weight",
+            "mid_block.attentions.0.transformer_blocks.0.attn2.to_k.weight",
+            "up_blocks.0.resnets.2.norm2.bias",
+            "up_blocks.0.upsamplers.0.conv.weight",
+            "up_blocks.1.upsamplers.0.conv.bias",
+            "up_blocks.3.attentions.2.proj_out.weight",
+            "up_blocks.3.resnets.2.conv2.weight",
+            "conv_norm_out.weight",
+            "conv_out.bias",
+        ] {
+            let ldm = crate::model::unet::ldm_unet_name(d, 2, &|i| i > 0).unwrap();
+            assert_eq!(rn.canonical(&format!("model.diffusion_model.{ldm}")), d, "{ldm}");
+        }
+    }
+
+    #[test]
+    fn openclip_set_maps_to_hf_clip() {
+        let rn = set("openclip");
+        for (o, h) in [
+            ("positional_embedding", "text_model.embeddings.position_embedding.weight"),
+            ("ln_final.bias", "text_model.final_layer_norm.bias"),
+            ("text_projection", "text_projection.weight"),
+            ("transformer.resblocks.11.attn.in_proj_weight", "text_model.encoder.layers.11.self_attn.in_proj.weight"),
+            ("transformer.resblocks.3.mlp.c_proj.bias", "text_model.encoder.layers.3.mlp.fc2.bias"),
+        ] {
+            assert_eq!(rn.canonical(o), h);
+        }
+    }
 }

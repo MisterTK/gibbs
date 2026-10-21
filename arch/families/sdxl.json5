@@ -1,0 +1,31 @@
+// SDXL (diffusers `StableDiffusionXLPipeline`, incl. LCM-distilled UNets): the `sd` UNet with the
+// text_time `add_embedding`; context = CLIP-L and OpenCLIP-G penultimate hidden states side by side,
+// pooled = OpenCLIP-G's projected EOS row; an empty negative prompt is all-zero conditioning unless
+// `force_zeros_for_empty_prompt` is false. Source: `model/sd.rs`.
+{
+  family: "sdxl",
+  extends: "sd",
+  match: {
+    diffusers_class: ["StableDiffusionXLPipeline"],
+  },
+  components: {
+    text_encoder_2: {family: "clip_text", dir: "text_encoder_2"},
+  },
+  runtime: {
+    text_encoders: [
+      {name: "clip", component: "text_encoder", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
+       tokenizer_config: "tokenizer", pad_token: "config",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
+       outputs: {penult: "penult"}},
+      {name: "clip_g", component: "text_encoder_2", net: "text", tokenizer: "hub:openai/clip-vit-large-patch14",
+       tokenizer_config: "tokenizer_2", pad_token: "config",
+       add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
+       outputs: {penult: "penult", pooled: "pooled"}},
+    ],
+    context: [{features: ["clip.penult", "clip_g.penult"]}],
+    pooled: ["clip_g.pooled"],
+    negative: {default: "", zeros_for_empty: "first(json.model_index.force_zeros_for_empty_prompt, true)"},
+    defaults: {guidance: "(denoiser.cond_dim > 0 || json.scheduler_config._class_name == 'LCMScheduler') ? 8.5 : 5.0"},
+    summary: "fmt('{json.model_index._class_name} (CLIP-L + OpenCLIP-G, UNet + VAE), {json.scheduler_config._class_name}')",
+  },
+}

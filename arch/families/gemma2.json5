@@ -1,0 +1,79 @@
+// Gemma 2 as a text encoder (`Gemma2Model`, e.g. Sana's `text_encoder/`): last hidden state with
+// the final norm applied. Gemma RMSNorm gains are stored as `w` in `x * (1 + w)` (+1 at load),
+// embeddings scale by bf16(sqrt(hidden)), sandwich norms around attention and MLP, soft-capped
+// GQA attention scaled by `query_pre_attn_scalar`, GeGLU (tanh) MLP; even layers slide.
+// Matches `model_type: gemma2` as an `encoder`: LM dispatch only diverts `causal_lm` families, so
+// Gemma 2 causal LMs stay on their legacy path instead of falling to the llama fallback.
+{
+  family: "gemma2",
+  match: {hf_model_type: ["gemma2"], hf_architectures: ["Gemma2Model"]},
+  pipeline: "encoder",
+  use_lib: ["transformer"],
+  config: {
+    hidden: "cfg.hidden_size",
+    layers: "cfg.num_hidden_layers",
+    heads: "cfg.num_attention_heads",
+    kv_heads: "first(cfg.num_key_value_heads, heads)",
+    head_dim: "first(cfg.head_dim, hidden // heads)",
+    eps: "first(cfg.rms_norm_eps, 1e-6)",
+    theta: "first(cfg.rope_theta, 10000)",
+    rotary_dim: "head_dim",
+    rope_variant: "'HalfSplit'",
+    qk_norm: "'none'",
+    attn_scale: "1 / sqrt(first(cfg.query_pre_attn_scalar, head_dim))",
+    soft_cap: "cfg.attn_logit_softcapping",
+    act: "'GeluTanh'",
+    // HF casts the normalizer to the (bf16) activation dtype.
+    embed_scale: "bf16(sqrt(hidden))",
+  },
+  checks: [
+    {expr: "first(cfg.hidden_activation, cfg.hidden_act, 'gelu_pytorch_tanh') != 'gelu_pytorch_tanh'",
+     error: "Gemma 2 activation {first(cfg.hidden_activation, cfg.hidden_act)} is not implemented (gelu_pytorch_tanh only)"},
+  ],
+  // Some exports drop the `model.` prefix.
+  names: {rules: [
+    ["layers.{i}.{r:*}", "model.layers.{i}.{r}"],
+    ["embed_tokens.weight", "model.embed_tokens.weight"],
+    ["norm.weight", "model.norm.weight"],
+  ]},
+  transforms: [
+    {tensor: "model.layers.{i}.{n:*}layernorm.weight", op: "to_f32"},
+    {tensor: "model.layers.{i}.{n:*}layernorm.weight", op: "add", args: {value: 1}},
+    {tensor: "model.norm.weight", op: "to_f32"},
+    {tensor: "model.norm.weight", op: "add", args: {value: 1}},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "rope_inv_freq", args: {dim: "head_dim", theta: "theta"}},
+  },
+  ignore: ["model.layers.*.self_attn.rotary_emb.inv_freq"],
+  components: {
+    text: {
+      vars: ["rows"],
+      inputs: [
+        {name: "token_ids", dtype: "u32", shape: ["rows"]},
+        {name: "positions", dtype: "u32", shape: ["rows"]},
+      ],
+      body: [
+        {op: "Embedding", in: ["w:model.embed_tokens.weight", "i:token_ids"], out: "x", name: "embed"},
+        {op: "Unary", args: {kind: {Scale: "embed_scale"}}, in: ["x"], out: "x", name: "embed_scale"},
+        {repeat: "i", count: "layers", body: [
+          {let: {p: "fmt('model.layers.{i}')",
+                 win: "i % 2 == 0 && rows > first(cfg.sliding_window, rows) ? cfg.sliding_window : null"}},
+          {use: "rms_norm", args: {w: "fmt('{p}.input_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln1"},
+          {use: "attn_full", in: ["h"], out: "a", name: "l{i}.attn", args: {
+            wq: "fmt('{p}.self_attn.q_proj')", wk: "fmt('{p}.self_attn.k_proj')",
+            wv: "fmt('{p}.self_attn.v_proj')", wo: "fmt('{p}.self_attn.o_proj')",
+            scale: "attn_scale", soft_cap: "soft_cap", window: "win"}},
+          {use: "sandwich", args: {w: "fmt('{p}.post_attention_layernorm')"}, in: ["x", "a"], out: "x", name: "l{i}.res1"},
+          {use: "rms_norm", args: {w: "fmt('{p}.pre_feedforward_layernorm')"}, in: ["x"], out: "h", name: "l{i}.ln2"},
+          {use: "mlp_glu", in: ["h"], out: "m", name: "l{i}.mlp", args: {
+            gate: "fmt('{p}.mlp.gate_proj')", up: "fmt('{p}.mlp.up_proj')", down: "fmt('{p}.mlp.down_proj')"}},
+          {use: "sandwich", args: {w: "fmt('{p}.post_feedforward_layernorm')"}, in: ["x", "m"], out: "x", name: "l{i}.res2"},
+          {tap: "layer.{i}", in: "x"},
+        ]},
+        {use: "rms_norm", args: {w: "'model.norm'"}, in: ["x"], out: "hidden", name: "final_norm"},
+      ],
+      outputs: ["hidden"],
+    },
+  },
+}
