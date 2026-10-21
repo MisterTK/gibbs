@@ -858,11 +858,16 @@ fn spec_net(dir: &std::path::Path, weights: &str, family: &str, net: &str, dev: 
 /// ModelScope text-to-video through the public video pipeline (`SpecDiffusion::generate_video`): a
 /// tiny `TextToVideoSDPipeline` snapshot (2-layer CLIP, the `diffb_unet3d` UNet3D with cross width
 /// 64, a 4-level SD VAE decoding every frame), 16 frames of 64x64, 2 DDIM steps; the frames rule
-/// refuses 8 frames. Shape/sanity checks only (no recorded golden).
+/// refuses 8 frames. Detected and loaded through `model::video_repo` from the hub cache.
+/// Shape/sanity checks only (no recorded golden).
 #[test]
 fn modelscope_pipeline() {
-    use gibbs_engine::runtime::diffusion::{Extras, SpecDiffusion, VideoRequest};
-    let dir = fixture_dir("diffb_modelscope_pipeline");
+    use gibbs_engine::model::video_repo;
+    use gibbs_engine::runtime::diffusion::VideoRequest;
+    let root = fixture_dir("diffb_modelscope_pipeline");
+    let hub = crate::diffa::clip_hub(&root);
+    // The snapshot sits in the hub cache, so detection and fetches resolve offline.
+    let dir = root.join("hub/models--golden--tiny-t2v/snapshots/main");
     write_json(
         &dir.join("model_index.json"),
         &json!({"_class_name": "TextToVideoSDPipeline", "text_encoder": ["transformers", "CLIPTextModel"],
@@ -878,27 +883,25 @@ fn modelscope_pipeline() {
     crate::diffa::write_clip(&dir, "text_encoder", "tokenizer", true, false, 21);
     write_unet3d(&dir.join("unet"), 64);
     crate::diffa::write_sd_vae(&dir, &[32, 32, 32, 32]);
-    let hub = crate::diffa::clip_hub(&dir);
-    let art = artifacts(&dir, "golden/tiny-t2v", "none");
+    let plan = video_repo::detect(&hub, "golden/tiny-t2v", None).expect("a video repo").unwrap();
+    assert_eq!(plan.family, "modelscope_t2v");
+    let req = VideoRequest {
+        prompt: "t5 t17 t200".into(),
+        frames: Some(16),
+        width: Some(64),
+        height: Some(64),
+        steps: Some(2),
+        guidance: Some(5.0),
+        seed: 3,
+        ..Default::default()
+    };
     for dev in devices() {
         let mode = gibbs_engine::hardware::PlacementMode::Pin(dev);
-        let p = SpecDiffusion::load(&art, &hub, mode, Some("modelscope_t2v"), &Extras::default()).expect("tiny ModelScope");
-        let d = p.video_defaults().expect("video pipeline").unwrap();
-        assert_eq!((d.frames, d.fps), (16, 8));
-        let req = VideoRequest {
-            prompt: "t5 t17 t200".into(),
-            frames: Some(16),
-            width: Some(64),
-            height: Some(64),
-            steps: Some(2),
-            guidance: Some(5.0),
-            seed: 3,
-            ..Default::default()
-        };
-        let frames = p.generate_video(&req, None, &|_| {}).unwrap();
-        assert_eq!(frames.len(), 16);
+        let (frames, fps, _) = video_repo::generate(&hub, &plan, mode, None, &req, None, &|_| {}).unwrap();
+        assert_eq!((frames.len(), fps), (16, 8));
         assert!(frames.iter().all(|f| (f.width, f.height, f.data.len()) == (64, 64, 64 * 64 * 3)));
         assert!(frames[0].data.iter().any(|&v| v != frames[0].data[0]), "{dev:?}: flat frame");
+        let p = video_repo::load(&hub, &plan, mode, None).unwrap();
         let e = p.generate_video(&VideoRequest { frames: Some(8), ..req.clone() }, None, &|_| {}).unwrap_err();
         assert!(e.contains("16..=24"), "{e}");
         let e = p.generate_video(&req, Some(&frames[0]), &|_| {}).unwrap_err();

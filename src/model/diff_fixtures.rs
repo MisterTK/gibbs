@@ -422,7 +422,7 @@ fn values(specs: &Specs, seed: u64) -> Vec<(String, Vec<usize>, Vec<f32>)> {
         .collect()
 }
 
-/// Tiny LTX-Video transformer (1 block, d 64) and ModelScope UNet3D (widths [32, 32]) checkpoints,
+/// Tiny LTX-Video transformer (1 block, d 64), LTX VAE (decoder + encoder) and ModelScope UNet3D (widths [32, 32]) checkpoints,
 /// each run once through its family spec's `denoiser` as a Metal program (two frames, a clean
 /// first-frame span for LTX); the caller arms the CPU tripwire.
 pub fn tiny_video_on_gpu() -> Result<(), String> {
@@ -462,6 +462,59 @@ pub fn tiny_video_on_gpu() -> Result<(), String> {
     let v = net.run_one(&vars, &given, &[("t", 500.0)], None)?;
     if v.iter().any(|x| !x.is_finite()) {
         return Err("non-finite LTX output".into());
+    }
+
+    // LTX causal-3D VAE: widths [8, 8, 8, 8], one up/down stage, patch 2, 8 latents; decode a
+    // 2-frame clip, encode one image.
+    let (ch, lat, p) = (8, 8, 2);
+    let mut s = Specs::new();
+    let c3 = |s: &mut Specs, n: &str, ci: usize, co: usize, k: usize| {
+        s.push((format!("{n}.weight"), vec![co, ci, k, k, k]));
+        s.push((format!("{n}.bias"), vec![co]));
+    };
+    let res = |s: &mut Specs, b: &str| {
+        c3(s, &format!("{b}.conv1.conv"), ch, ch, 3);
+        c3(s, &format!("{b}.conv2.conv"), ch, ch, 3);
+    };
+    c3(&mut s, "decoder.conv_in.conv", lat, ch, 3);
+    res(&mut s, "decoder.mid_block.resnets.0");
+    for i in 0..4 {
+        if i == 3 {
+            c3(&mut s, "decoder.up_blocks.3.upsamplers.0.conv.conv", ch, 8 * ch, 3);
+        }
+        res(&mut s, &format!("decoder.up_blocks.{i}.resnets.0"));
+    }
+    c3(&mut s, "decoder.conv_out.conv", ch, 3 * p * p, 3);
+    c3(&mut s, "encoder.conv_in.conv", 3 * p * p, ch, 3);
+    for i in 0..4 {
+        res(&mut s, &format!("encoder.down_blocks.{i}.resnets.0"));
+        if i == 0 {
+            c3(&mut s, "encoder.down_blocks.0.downsamplers.0.conv", ch, ch, 3);
+        }
+    }
+    res(&mut s, "encoder.mid_block.resnets.0");
+    c3(&mut s, "encoder.conv_out.conv", ch, lat + 1, 3);
+    s.push(("latents_mean".into(), vec![lat]));
+    s.push(("latents_std".into(), vec![lat]));
+    let dir = tmp.path().join("ltx_vae");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    write_f32_safetensors(&dir.join("diffusion_pytorch_model.safetensors"), &values(&s, 9))?;
+    let cfg = serde_json::json!({"_class_name": "AutoencoderKLLTXVideo", "block_out_channels": [ch, ch, ch, ch],
+        "layers_per_block": [1, 1, 1, 1, 1], "spatio_temporal_scaling": [true, false, false, false], "patch_size": p, "latent_channels": lat});
+    std::fs::write(dir.join("config.json"), cfg.to_string()).map_err(|e| e.to_string())?;
+    let mode = PlacementMode::Pin(Device::Metal);
+    let dec = Net::open(&dir, "ltx_vae", "decoder", mode)?;
+    let (f, h, w) = (2, 2, 3);
+    let vars = [("frames", num(f)), ("h", num(h)), ("w", num(w))];
+    let rgb = dec.run_one(&vars, &[("z", Tensor::F32(Lcg(10).vec(f * lat * h * w, 1.0)))], &[], None)?;
+    if rgb.len() != 3 * 3 * (2 * p * h) * (2 * p * w) || rgb.iter().any(|x| !x.is_finite()) {
+        return Err(format!("LTX VAE decode: {} values", rgb.len()));
+    }
+    let enc = Net::open(&dir, "ltx_vae", "encoder", mode)?;
+    let img = Lcg(11).vec(3 * (2 * p * h) * (2 * p * w), 1.0);
+    let z = enc.run_one(&[("h", num(h)), ("w", num(w))], &[("image", Tensor::F32(img))], &[], None)?;
+    if z.len() != lat * h * w || z.iter().any(|x| !x.is_finite()) {
+        return Err(format!("LTX VAE encode: {} values", z.len()));
     }
 
     // UNet3D: CrossAttnDownBlock3D, DownBlock3D, mid, UpBlock3D, CrossAttnUpBlock3D.
