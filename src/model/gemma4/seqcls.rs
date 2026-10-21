@@ -200,7 +200,7 @@ impl DecoderBackbone for Gemma4Seq {
 mod tests {
     use super::super::text::{Attn, Layer, Ple, PleTable};
     use super::*;
-    use crate::model::classifier::decoder_gpu::{fill, tests::parity};
+    use crate::model::gemma3_text::tests::{fill, parity};
 
     /// Three layers (sliding window 3 with GQA 4/2 heads, global, then a sliding layer sharing
     /// layer 0's KV), per-layer embeddings, layer scalars: the cross-encoder head on Metal vs the host forward.

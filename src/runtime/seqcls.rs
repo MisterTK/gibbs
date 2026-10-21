@@ -29,9 +29,10 @@ impl SpecBackbone {
             ..ReencodeConfig::effective()
         };
         let m = crate::arch::load::load_with(artifacts, crate::arch::registry()?, None, exact)?;
-        let hidden = m.env.var("hidden")?.usize()?;
         let head = m.spec.runtime["seqcls"]["head"].as_str().map(String::from);
         let lm = SpecLm::new(m, PlacementMode::Pin(dev))?;
+        // The score head's input width (OPT: after project_out, not the block width).
+        let hidden = lm.output_width("hidden", "hidden")?;
         Ok(Self { lm, hidden, head, score: Vec::new() })
     }
 }

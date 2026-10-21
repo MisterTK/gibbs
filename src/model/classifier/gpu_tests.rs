@@ -60,6 +60,18 @@ fn parity(name: &str, cfg: Value, ts: Ts) {
 }
 
 #[test]
+fn llama_decoder_seqcls_on_metal() {
+    let (cfg, ts) = llama_seqcls();
+    parity("llama-seqcls", cfg, ts);
+}
+
+#[test]
+fn gpt_neox_decoder_seqcls_on_metal() {
+    let (cfg, ts) = gpt_neox_seqcls();
+    parity("gpt-neox-seqcls", cfg, ts);
+}
+
+#[test]
 fn bert_softmax_head_on_metal() {
     let (cfg, ts) = bert(None);
     parity("bert", cfg, ts);
@@ -181,6 +193,35 @@ fn peft_seq_cls_adapter_on_bare_base_matches_merged_repo() {
                 assert_eq!(x.label, y.label, "{dev:?}");
                 assert!((x.score - y.score).abs() < 1e-5, "{dev:?}: {a:?} vs {b:?}");
             }
+        }
+    }
+}
+
+/// Decoder seq-cls on the spec (`runtime::seqcls`) against the softmax scores of `TEXT` the
+/// deleted GraphLm path gave (`GraphLmSeq`: host `final_hidden` · `score.weight`, commit
+/// b73c897), CPU and Metal. GPT-NeoX differs by ~1e-4: GraphLm ran HF `gelu` as the tanh
+/// approximation, the spec as exact erf GELU (transformers' `gelu`).
+#[test]
+fn decoder_seqcls_matches_old_graph_lm() {
+    const OLD: [(&str, [f32; 3]); 2] = [
+        ("llama", [0.8506544, 0.0595768, 0.08976873]),
+        ("gpt-neox", [0.39762998, 0.3666832, 0.23568688]),
+    ];
+    let mut devs = vec![Device::Cpu];
+    if available_devices().contains(&Device::Metal) {
+        devs.push(Device::Metal);
+    }
+    for ((name, want), (cfg, ts)) in OLD.into_iter().zip([llama_seqcls(), gpt_neox_seqcls()]) {
+        let name = format!("{name}-seqcls-old");
+        let hub = repo(&name, cfg, &ts);
+        for &dev in &devs {
+            let _g = cpu_compute::allow();
+            let c = SequenceClassifier::load(&hub, &format!("t/{name}"), dev).unwrap();
+            let (got, _) = c.classify(TEXT, None).unwrap();
+            let g: Vec<f32> = ["A", "B", "C"].iter().map(|l| got.iter().find(|s| &s.label == l).unwrap().score).collect();
+            let (rel, cos) = crate::arch::testing::compare(&g, &want);
+            eprintln!("{name} {dev:?}: rel {rel:.2e} cos {cos:.8}");
+            assert!(rel < 1e-3 && cos > 0.9999, "{name} {dev:?}: {g:?} vs {want:?}");
         }
     }
 }

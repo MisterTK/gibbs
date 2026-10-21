@@ -1,31 +1,26 @@
 //! Hugging Face sequence classifiers (`text-classification` / `text-ranking` repos), one type for
 //! the server and the TUI. Encoders (every family whose spec has `pipeline: encoder`, SetFit and
 //! GGUF classifier exports) run on `runtime::encoder`; fastText models on `runtime::bag`;
-//! decoder `*ForSequenceClassification` bodies (legacy: until Phases 4-6) are scored on their last
-//! non-pad token.
+//! decoder `*ForSequenceClassification` bodies are scored on their last non-pad token
+//! (`runtime::seqcls` over the family spec; Gemma 3/4 legacy: until Phase 6).
 
 #[cfg(test)]
 mod gpu_tests;
 #[cfg(test)]
 pub(crate) mod synth;
-pub mod ln_decoder;
-pub(crate) mod decoder_gpu;
-pub use decoder_gpu::gpu_fixture;
 
-use crate::hardware::{Device, QuantFormat, QuantMode};
+use crate::hardware::Device;
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{is_synthetic_model_id, split_weight_file, HuggingFaceHub};
-use crate::model::layers::QuantizedLinearLayer;
 use crate::model::loaders::{read_checkpoint, SafetensorsWeightReader, WeightReader};
 use crate::model::nn;
-use crate::model::graph_lm::GraphLm;
-use crate::model::{ModelManifest, UniversalModelLoader};
+use crate::model::UniversalModelLoader;
 use crate::runtime::encoder::{self, is_generator, read_json, Activation, LabelScore};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Decoder `architectures[0]` values the legacy decoder bodies run (legacy: until Phases 4-6).
+/// Decoder `architectures[0]` values loaded as seq-cls bodies.
 const DECODER_ARCHITECTURES: &[&str] = &[
     "LlamaForSequenceClassification",
     "Qwen2ForSequenceClassification",
@@ -145,22 +140,6 @@ pub(crate) fn encode_pair(
         .render(&conv, None, false, &Value::Null)
         .map_err(|e| format!("chat template: {e}"))?;
     Ok(tok.encode(&rendered))
-}
-
-impl DecoderBackbone for GraphLm {
-    fn tokenizer(&self) -> &crate::model::tokenizer::Tokenizer {
-        &self.tokenizer
-    }
-    fn context_len(&self) -> usize {
-        self.config.max_seq_len
-    }
-    fn hidden(&self) -> usize {
-        self.config.hidden_dim
-    }
-    fn last_hidden(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
-        crate::hardware::cpu_compute::enter("decoder::last_hidden");
-        Ok(self.final_hidden(ids))
-    }
 }
 
 /// `architecture` of a fastText hierarchical-softmax re-export (`config.json` + `weights.pt`).
@@ -450,8 +429,7 @@ impl SequenceClassifier {
         let pad_id = cfg["pad_token_id"].as_u64().map(|v| v as u32);
 
         let body = {
-            // Decoders read their own checkpoint formats; no `cpu_only` gate: Metal gets the GPU
-            // seq-cls program (`decoder_gpu`).
+            // No `cpu_only` gate: Metal runs the spec's score instance.
             if peft.is_some() {
                 // ponytail: LoRA merges into the f32 encoder checkpoints only; decoder bodies load
                 // through their own readers (merge there when a decoder SEQ_CLS adapter matters).
@@ -467,30 +445,13 @@ impl SequenceClassifier {
                 .as_deref()
                 .ok_or_else(|| format!("{repo_id}: no weight file"))?;
             let llm: Box<dyn DecoderBackbone> = match arch.as_str() {
-                "GPT2ForSequenceClassification" | "OPTForSequenceClassification" => {
-                    Box::new(ln_decoder::LnDecoder::load(hub, repo_id, &cfg)?)
-                }
                 "Gemma4ForSequenceClassification" => Box::new(
                     crate::model::gemma4::seqcls::Gemma4Seq::load(&artifacts, &cfg)?,
                 ),
                 "Gemma3TextForSequenceClassification" => Box::new(
                     crate::model::gemma3_text::Gemma3Text::load(&artifacts, &cfg)?,
                 ),
-                "Qwen3ForSequenceClassification"
-                | "Qwen3_5ForSequenceClassification"
-                | "Qwen3_5TextForSequenceClassification" => {
-                    Box::new(crate::runtime::seqcls::SpecBackbone::load(&artifacts, device)?)
-                }
-                _ => {
-                    let mut llm = crate::model::hf_loader::load_causal_lm(
-                        &artifacts,
-                        QuantMode::Uncompressed,
-                    )?;
-                    // The causal LM head is never used: free it.
-                    llm.lm_head =
-                        QuantizedLinearLayer::from_f32("unused", 1, 1, &[0.0], QuantFormat::FP32)?;
-                    Box::new(decoder_gpu::GraphLmSeq::new(llm))
-                }
+                _ => Box::new(crate::runtime::seqcls::SpecBackbone::load(&artifacts, device)?),
             };
             let h = llm.hidden();
             let score = load_score(weights)?;
@@ -693,66 +654,6 @@ fn load_score(weights: &Path) -> Result<Vec<f32>, String> {
     SafetensorsWeightReader::new(&shard)
         .and_then(|r| r.load_tensor("score.weight"))
         .map_err(|e| format!("{}: {e}", shard.display()))
-}
-
-/// The repo's weights (`model.safetensors`, else `pytorch_model.bin`) read whole as f32: the
-/// `ln_decoder` seq-cls bodies (legacy: until Phase 4).
-struct Checkpoint {
-    manifest: ModelManifest,
-    data: Vec<u8>,
-}
-
-impl Checkpoint {
-    fn open(hub: &HuggingFaceHub, repo_id: &str) -> Result<Self, String> {
-        let path = hub.fetch_file(repo_id, "model.safetensors").or_else(|st| {
-            hub.fetch_file(repo_id, "pytorch_model.bin").map_err(|bin| {
-                format!("{repo_id}: no model.safetensors ({st}) or pytorch_model.bin ({bin})")
-            })
-        })?;
-        let (manifest, data) = read_checkpoint(&path)?;
-        Ok(Self { manifest, data })
-    }
-
-    fn shape(&self, name: &str) -> Option<&[usize]> {
-        self.manifest.tensors.get(name).map(|t| t.shape.as_slice())
-    }
-
-    fn has(&self, name: &str) -> bool {
-        self.manifest.tensors.contains_key(name)
-    }
-
-    /// Tensor `name`, which must have `shape`.
-    fn get(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
-        let got = self.shape(name).ok_or_else(|| format!("missing tensor {name}"))?;
-        if got != shape {
-            return Err(format!("tensor {name} has shape {got:?}, expected {shape:?}"));
-        }
-        UniversalModelLoader::extract_tensor_from_manifest(&self.manifest, &self.data, name)
-    }
-
-    /// `name.weight` `[out, in_f]` and `name.bias` (when present) as a linear layer.
-    fn linear(&self, name: &str, in_f: usize) -> Result<Lin, String> {
-        let w = format!("{name}.weight");
-        let out_f = match self.shape(&w) {
-            Some(&[o, i]) if i == in_f => o,
-            other => return Err(format!("tensor {w} has shape {other:?}, expected [_, {in_f}]")),
-        };
-        let b = format!("{name}.bias");
-        Ok(Lin {
-            w: self.get(&w, &[out_f, in_f])?,
-            b: if self.has(&b) { Some(self.get(&b, &[out_f])?) } else { None },
-            in_f,
-            out_f,
-        })
-    }
-
-    /// `name.weight` and `name.bias` of a LayerNorm over `d`.
-    fn layer_norm(&self, name: &str, d: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
-        Ok((
-            self.get(&format!("{name}.weight"), &[d])?,
-            self.get(&format!("{name}.bias"), &[d])?,
-        ))
-    }
 }
 
 /// A linear layer in PyTorch layout `[out_f, in_f]`.

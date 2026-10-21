@@ -1265,7 +1265,7 @@ mod tests {
 
     /// Each GraphLm fixture family against GraphLm (`hf_loader::load_causal_lm` +
     /// `ExecutableModel::load_graph_lm`) on the same device; GPT-2 / OPT (which GraphLm does not
-    /// load) against their `LnDecoder` host forward; BitNet against `tests/golden/lm_bitnet.json`
+    /// load) Metal against CPU and score head against `score · hidden`; BitNet against `tests/golden/lm_bitnet.json`
     /// (GraphLm's BitNet graph is wrong). Prefill 6 rows, then 3 cached decode steps.
     #[test]
     fn llama_family_matches_graph_lm() {
@@ -1309,8 +1309,9 @@ mod tests {
             }
         }
 
-        // GPT-2 / OPT: last-row final hidden (after ln_f / project_out) and the score head.
-        use crate::model::classifier::DecoderBackbone;
+        // GPT-2 / OPT (the old `LnDecoder` host forward is deleted; `tests/golden/enc.rs` pins
+        // their seq-cls scores): Metal hidden states against the CPU instance, and the score
+        // instance against `score · hidden` on each device.
         let dec_seq: Vec<u32> = seq.iter().map(|t| t % DEC_VOCAB as u32).collect();
         let (dp, dd) = dec_seq.split_at(PROMPT.len());
         let decoders: Vec<(&str, &str, (J, Weights))> = vec![
@@ -1319,24 +1320,26 @@ mod tests {
             ("opt_pre_ln", "opt", opt_fixture(true, "gelu", 0xED)),
         ];
         for (case, family, (cfg, w)) in &decoders {
-            let root = tmp.path().join(case);
-            let dir = root.join(format!("models--gibbs-test--{case}/snapshots/main"));
+            let dir = tmp.path().join(case);
             w.write_checkpoint(&dir, cfg, DEC_VOCAB);
-            let hub = crate::model::hub::HuggingFaceHub::with_cache_dir(root.clone());
-            let host = crate::model::classifier::ln_decoder::LnDecoder::load(&hub, &format!("gibbs-test/{case}"), cfg)
-                .unwrap_or_else(|e| panic!("{case}: LnDecoder: {e}"));
             let score = &w.tensors.iter().find(|t| t.0 == "score.weight").unwrap().2;
+            let mut cpu: Option<Vec<Vec<f32>>> = None;
             for dev in devices() {
                 let (got, mut r) = spec_steps(&dir, family, dev, dp, dd, "hidden", "hidden");
-                for (i, g) in got.iter().enumerate() {
-                    let want = host.last_hidden(&dec_seq[..PROMPT.len() + i]).unwrap();
-                    close(&mut bad, &format!("{case} {dev:?} step {i}"), &g[g.len() - want.len()..], &want);
+                let last: Vec<Vec<f32>> = got.iter().map(|g| g[g.len() - score.len() / 3..].to_vec()).collect();
+                match &cpu {
+                    None => cpu = Some(last.clone()),
+                    Some(want) => {
+                        for (i, (g, w)) in last.iter().zip(want).enumerate() {
+                            close(&mut bad, &format!("{case} {dev:?} step {i} vs CPU"), g, w);
+                        }
+                    }
                 }
                 // Seq-cls: row `last_index` of the 6-row prompt (rewrites the same KV rows).
-                let last = crate::graph::Tensor::U32(vec![PROMPT.len() as u32 - 1]);
-                let logits = r.lm(dp, 0, "score", "logits", vec![last]);
-                let h = host.last_hidden(dp).unwrap();
-                let want: Vec<f32> = score.chunks(h.len()).map(|row| row.iter().zip(&h).map(|(a, b)| a * b).sum()).collect();
+                let idx = crate::graph::Tensor::U32(vec![PROMPT.len() as u32 - 1]);
+                let logits = r.lm(dp, 0, "score", "logits", vec![idx]);
+                let h = &last[0];
+                let want: Vec<f32> = score.chunks(h.len()).map(|row| row.iter().zip(h).map(|(a, b)| a * b).sum()).collect();
                 close(&mut bad, &format!("{case} {dev:?} score"), &logits, &want);
                 all_read(&r, case);
             }

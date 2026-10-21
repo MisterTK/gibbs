@@ -5,7 +5,6 @@
 //! (default / linear / yarn), final norm. One uncached causal pass over bf16 (memory-mapped) or
 //! f32 weights; the classifier scores the last token's final-norm hidden state.
 
-use crate::model::classifier::decoder_gpu::GpuScore;
 use crate::model::classifier::{encode_pair, DecoderBackbone};
 use crate::model::gemma4::ops::{gelu_mul, linear, rms_norm, rope, rope_table};
 use crate::model::hub::ModelArtifacts;
@@ -601,16 +600,127 @@ impl DecoderBackbone for Gemma3Text {
     }
 }
 
+/// A Metal session holding one seq-cls backbone's weights and score head (legacy: until Phase 6).
+pub(crate) struct GpuScore {
+    #[cfg(target_os = "macos")]
+    session: crate::graph::metal::Session,
+}
+
+impl GpuScore {
+    pub(crate) fn new(weights: &crate::graph::Weights) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let rt = crate::graph::metal::Runtime::shared()?;
+            Ok(Self {
+                session: crate::graph::metal::Session::new(rt, weights)?,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = weights;
+            Err("gpu-only: no Metal runtime on this platform; run with --backend cpu".into())
+        }
+    }
+
+    /// Runs `graph` (inputs `token_ids`, `positions`; one `[1, labels]` output) and returns the logits.
+    pub(crate) fn run(
+        &self,
+        graph: &crate::graph::Graph,
+        ids: &[u32],
+        positions: Vec<u32>,
+    ) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            let inputs = vec![crate::graph::Tensor::U32(ids.to_vec()), crate::graph::Tensor::U32(positions)];
+            self.session
+                .run(graph, inputs)?
+                .pop()
+                .ok_or_else(|| "seq-cls graph produced no output".to_string())?
+                .into_f32()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (graph, ids, positions, crate::graph::Tensor::U32(Vec::new()));
+            Err("gpu-only: no Metal runtime on this platform".into())
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::hardware::{available_devices, Device};
+
+    /// Deterministic pseudo-random values in `[-amp, amp]`.
+    pub(crate) fn fill(len: usize, seed: usize, amp: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| (((i * 7 + seed * 131) as f32) * 0.37 + (i % 13) as f32).sin() * amp)
+            .collect()
+    }
+
+    /// Compares `score · last_hidden` (host forward, the parity reference) with `score_gpu` on
+    /// each of `seqs`; returns the worst absolute logit difference (asserted <= 1e-3, the
+    /// contract's bar: same f32 math on both sides, only GPU transcendentals and summation order
+    /// differ), or `None` (loudly) without a Metal device. Reference logits must be non-trivial.
+    pub(crate) fn parity(
+        llm: &mut dyn DecoderBackbone,
+        score: &[f32],
+        labels: usize,
+        seqs: &[&[u32]],
+    ) -> Option<f32> {
+        if !available_devices().contains(&Device::Metal) {
+            eprintln!("SKIPPED: no Metal device, seq-cls GPU parity not run");
+            return None;
+        }
+        let h = llm.hidden();
+        llm.attach_score_gpu(score, labels).unwrap();
+        let mut worst = 0.0f32;
+        for ids in seqs {
+            let want: Vec<f32> = {
+                let _g = crate::hardware::cpu_compute::allow();
+                let hid = llm.last_hidden(ids).unwrap();
+                (0..labels)
+                    .map(|l| {
+                        score[l * h..(l + 1) * h]
+                            .iter()
+                            .zip(&hid)
+                            .map(|(a, b)| a * b)
+                            .sum()
+                    })
+                    .collect()
+            };
+            let before = crate::hardware::cpu_compute::entered();
+            let got = llm.score_gpu(ids).unwrap();
+            assert_eq!(
+                crate::hardware::cpu_compute::entered(),
+                before,
+                "{ids:?}: the GPU score program entered a CPU compute site"
+            );
+            assert_eq!(got.len(), labels);
+            assert!(
+                want.iter().any(|v| v.abs() > 1e-2),
+                "{ids:?}: trivial reference {want:?}"
+            );
+            let err = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(
+                err <= 1e-3,
+                "{ids:?}: want {want:?} got {got:?} (abs {err})"
+            );
+            worst = worst.max(err);
+        }
+        Some(worst)
+    }
+
 
     /// 3 layers (two sliding with window 3, one global), GQA 4/2, `query_pre_attn_scalar` 24 (not
     /// head_dim, so the folded q scale is exercised), attention softcap, a yarn-style cos/sin
     /// scale on the global rope, bf16 projections and an f32 embedding: Metal vs the host forward.
     #[test]
     fn seqcls_gpu_matches_host() {
-        use crate::model::classifier::decoder_gpu::{fill, tests::parity};
         let (h, v, nh, kvh, hd, inter) = (64, 96, 4, 2, 16, 96);
         let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
         for l in 0..3 {

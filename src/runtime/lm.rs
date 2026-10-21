@@ -301,6 +301,20 @@ impl SpecLm {
         let towers = Towers::new(mode);
         let mut used: HashSet<String> = decode.weights.iter().cloned().collect();
         used.extend(crate::runtime::draft::drafter_weights(&model)?);
+        // `runtime.seqcls.head`: a checkpoint with the score head's weights (a
+        // `*ForSequenceClassification` export) reads them through that instance, which runs on
+        // this program (`run_head`), so they load with it; plain LM exports do not build it.
+        let mut program_weights = decode.weights.clone();
+        if let Some(head) = model.spec.runtime["seqcls"]["head"].as_str() {
+            let hv = vars(1, head, &[], 0);
+            if let Ok(i) = build(&model.spec, TEXT, &model.env, &model.store, &hv) {
+                for w in i.weights {
+                    if used.insert(w.clone()) {
+                        program_weights.push(w);
+                    }
+                }
+            }
+        }
         let mut off = HashMap::new();
         for (name, s) in &media {
             let probe = media::measure(&s.preprocess, &media::probe_item(&s.preprocess))
@@ -323,7 +337,7 @@ impl SpecLm {
                 if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) }
             ));
         }
-        let weights = model.store.materialize(&decode.weights)?;
+        let weights = model.store.materialize(&program_weights)?;
         let program = GraphProgram::compile_reshapable(decode.graph.clone(), weights, mode)?;
         let recurrent = program.recurrent_states();
         let streams = recurrent.is_empty()
@@ -647,6 +661,16 @@ impl SpecLm {
         let r = run();
         p.state = saved;
         r
+    }
+
+    /// Row width of output `out` of the one-row `head` instance.
+    pub fn output_width(&self, head: &str, out: &str) -> Result<usize, String> {
+        let inst = self.instance(1, head, &[], 0)?;
+        let i = inst
+            .output_index(out)
+            .ok_or_else(|| format!("the `{head}` instance has no output `{out}`"))?;
+        let v = &inst.graph.values[inst.graph.outputs[i].0 as usize];
+        v.shape.last().copied().ok_or_else(|| format!("output `{out}` has no shape"))
     }
 
     /// Start position of the last pass [`Self::run_head`] makes over `n` ids.

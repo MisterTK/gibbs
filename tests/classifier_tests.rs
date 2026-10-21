@@ -213,15 +213,18 @@ fn gpt2_polish_sentiment_matches_card() {
 /// `last_hidden_state[0, :3, :3]`. Causal, so row t is the last hidden state of ids[..=t].
 #[test]
 fn opt_350m_hidden_states_match_transformers() {
-    use gibbs_engine::model::classifier::{ln_decoder::LnDecoder, DecoderBackbone};
+    use gibbs_engine::model::classifier::DecoderBackbone;
     let repo = "facebook/opt-350m";
     let dir = Path::new("disk/models--facebook--opt-350m/snapshots/main");
     if !dir.join("pytorch_model.bin").exists() {
         eprintln!("SKIP: {repo} not cached in disk/");
         return;
     }
-    let cfg = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let m = LnDecoder::load(&HuggingFaceHub::with_cache_dir("disk".into()), repo, &cfg).unwrap();
+    let a = HuggingFaceHub::with_cache_dir("disk".into())
+        .auto_download_and_cache(repo, None)
+        .unwrap();
+    let m = gibbs_engine::runtime::seqcls::SpecBackbone::load(&a, gibbs_engine::hardware::Device::Cpu)
+        .unwrap();
     assert_eq!(m.hidden(), 512);
     let ids = [0, 31414, 232];
     let want = [
