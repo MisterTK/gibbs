@@ -18,16 +18,17 @@ mod widgets;
 use crate::arch::dispatch::Loaded;
 use crate::hardware::{HardwareCapability, PlacementMode, QuantMode};
 use crate::kv::PagedKVPool;
-use crate::model::classifier::{self, Activation, ClassifierSlot, LabelScore};
+use crate::model::classifier::{self, ClassifierSlot};
+use crate::runtime::encoder::{Activation, LabelScore};
 use crate::model::hf_loader::ChatMessage;
 use crate::model::hub::{
     split_revision, split_weight_file, DownloadProgress, HuggingFaceHub, StorageBackend,
 };
 use crate::model::image::ImageBuffer;
-use crate::model::jev::{ChoiceOption, JevSystem1Model};
+use crate::runtime::encoder::system1::{ChoiceOption, JevSystem1Model};
 use crate::model::native::MediaInput;
 use crate::model::reencode::ReencodeProgress;
-use crate::model::text_to_image::{ImageRequest, ImageSlot};
+use crate::runtime::diffusion::{ImageRequest, ImageSlot};
 use crate::model::tokenizer::Tokenizer;
 use crate::model::weight_format::{
     reencode_override, set_reencode_override, Choice, ReencodeConfig, ReencodePolicy, VariantPolicy,
@@ -384,7 +385,7 @@ pub struct TuiApp {
     pub scheduler: Option<Arc<ContinuousBatchScheduler>>,
     pub hub: HuggingFaceHub,
     pub hf_token: Option<String>,
-    pub jev_model: crate::model::jev::System1Slot,
+    pub jev_model: crate::runtime::encoder::system1::System1Slot,
     /// Shared with the HTTP server; `Some` makes `/image` and bare prompts generate images.
     pub image_model: ImageSlot,
     /// Set by loading an LTX-Video repo; `/video` and `/i2v` generate clips with it.
@@ -499,7 +500,7 @@ impl TuiApp {
             scheduler: None,
             hub,
             hf_token,
-            jev_model: crate::model::jev::System1Slot::default(),
+            jev_model: crate::runtime::encoder::system1::System1Slot::default(),
             image_model: ImageSlot::default(),
             video: crate::model::video_repo::VideoSlot::default(),
             classifier: ClassifierSlot::default(),

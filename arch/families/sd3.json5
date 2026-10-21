@@ -140,9 +140,10 @@
        tokenizer_config: "tokenizer_2", pad_token: "config",
        add_special: false, bos: 49406, eos: 49407, max_len: 77, pad_to: 77,
        outputs: {penult: "penult", pooled: "pooled"}},
-      // T5 framing: ids truncated to 255, `</s>` (1), padded with `<pad>` (0) to 256.
+      // T5 framing: ids truncated to 255, `</s>` (1), padded with `<pad>` (0) to 256; diffusers passes
+      // no attention mask, so every row is a key.
       {name: "t5", component: "text_encoder_3", net: "encoder", tokenizer: "tokenizer_3", optional: true,
-       add_special: false, eos: 1, max_len: 256, pad_to: 256, pad_id: 0, outputs: {hidden: "hidden"}},
+       add_special: false, eos: 1, max_len: 256, pad_to: 256, pad_id: 0, mask: false, outputs: {hidden: "hidden"}},
     ],
     context: [
       {features: ["l.penult", "g.penult"], width: "denoiser.joint"},
@@ -157,7 +158,7 @@
     // diffusers runs CFG only when guidance_scale > 1.
     guidance: {kind: "cfg", gate: "guidance > 1", scale: "guidance"},
     latent: {channels: "denoiser.in_ch", factor: 8, pack: "none", noise_scale: 1},
-    vae: {component: "vae", decode: "decoder", encode: null,
+    vae: {component: "vae", decode: "decoder", encode: "encoder",
           decode_affine: {mul: "1 / vae.cfg.scaling_factor", add: "first(vae.cfg.shift_factor, 0)"},
           output: "clamp_pm1"},
     // ponytail: CPU-sized 512 default (the checkpoints' native size is 1024; pass width/height for it).

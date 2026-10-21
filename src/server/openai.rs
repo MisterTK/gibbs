@@ -6,7 +6,7 @@ use super::core::{
 };
 use super::{api_error_body, AppState};
 use crate::model::hf_loader::ChatMessage;
-use crate::model::jev::{ChoiceOption, JevDecision};
+use crate::runtime::encoder::system1::{ChoiceOption, JevDecision};
 use crate::scheduler::SamplingParams;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
@@ -255,7 +255,7 @@ impl Wire for ChatWire {
 
 /// Zero-shot tool routing with the System 1 encoder (no LLM): picks the tool only.
 fn system1_tool_route(
-    jev: &crate::model::jev::JevSystem1Model,
+    jev: &crate::runtime::encoder::system1::JevSystem1Model,
     req: &ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
     let options: Vec<ChoiceOption> = req

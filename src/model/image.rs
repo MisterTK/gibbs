@@ -2,7 +2,7 @@
 //! Decoding matches PIL `Image.open(..).convert("RGB")`: PNG (all color types, bit depths,
 //! Adam7; alpha dropped, 16-bit -> high byte) and JPEG (baseline/extended/progressive Huffman,
 //! 1 or 3 components, libjpeg-turbo islow IDCT + fancy upsampling, bit-exact with `djpeg`).
-//! Real diffusion lives in `crate::model::sd::SdPipeline`.
+//! Diffusion pipelines live in `crate::runtime::diffusion`.
 
 use std::fs;
 use std::io::Write as _;

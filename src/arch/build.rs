@@ -7,7 +7,7 @@
 //! - repeat: `{repeat: var, count | over, body}` (shares the enclosing value scope).
 //! - block:  `{block: [...], when}` conditional group (shares the enclosing value scope).
 //! - let:    `{let: {var: expr, ...}}` binds expression variables in the current frame.
-//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it.
+//! - tap:    `{tap: name, in}` an extra output when the instance's `taps` list names it (`"*"`: all).
 //!
 //! Operand refs: `x` (scope value), `v?:x` (scope value, dropped when unbound), `w:name` (weight),
 //! `w?:name` (weight, dropped when absent), `s:name` (state), `c:name` (constant), `i:name` (input).
@@ -171,6 +171,12 @@ pub fn build_network(
     }
     let want: Vec<String> = match b.var("taps") {
         Some(Val::List(l)) => l.iter().map(|t| t.to_string()).collect(),
+        // Every emitted tap, by name (the `precompute` component's weights).
+        Some(Val::Str(s)) if s == "*" => {
+            let mut t: Vec<String> = b.taps.keys().cloned().collect();
+            t.sort();
+            t
+        }
         _ => Vec::new(),
     };
     for t in want {

@@ -7,12 +7,13 @@ use super::Pipeline;
 use crate::hardware::{Device, HardwareCapability, PlacementMode, QuantMode};
 use crate::model::classifier::{self, SequenceClassifier};
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
-use crate::model::jev::JevSystem1Model;
-use crate::model::text_to_image::{load_image_model, ImageGenerator};
+use crate::runtime::encoder::system1::JevSystem1Model;
+use crate::model::text_to_image::load_image_model;
 use crate::model::weight_format::{
     load_causal_lm_with, reencode_override, set_reencode_override, Choice, ReencodeConfig,
     ReencodePolicy,
 };
+use crate::runtime::diffusion::{Extras, ImageGenerator, SpecDiffusion};
 use crate::scheduler::ExecutableModel;
 use serde_json::{json, Map, Value as J};
 use std::collections::HashSet;
@@ -49,7 +50,7 @@ pub struct LoadOpts<'a> {
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
     /// adapter (merged into a snapshot of its base): an error refuses the load.
     pub admit: &'a dyn Fn(bool) -> Result<(), String>,
-    /// The CLI's legacy order (legacy: until Phase 7): System 1 encoders are detected before
+    /// The CLI's order: System 1 encoders are detected before
     /// classifiers and run on Metal wherever it exists; the TUI tries classifiers first and keeps
     /// System 1 on its own backend.
     pub system1_first: bool,
@@ -72,7 +73,7 @@ fn device(p: PlacementMode) -> Device {
 pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded, String> {
     (o.stage)("resolving");
     if o.family.is_none() {
-        // legacy: until Phase 7 (encoder specs)
+        // Encoders: System 1 and sequence classifiers run their family specs (`runtime::encoder`).
         let system1 = || {
             let dev = match device(o.placement) {
                 // The CLI runs the System 1 encoder on Metal wherever it exists.
@@ -86,13 +87,13 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
             };
             JevSystem1Model::load(hub, id, dev).map(Loaded::System1)
         };
-        if o.system1_first && crate::model::jev::detect(hub, id) {
+        if o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
         if classifier::detect(hub, id).is_some() {
             return SequenceClassifier::load(hub, id, device(o.placement)).map(Loaded::Classifier);
         }
-        if !o.system1_first && crate::model::jev::detect(hub, id) {
+        if !o.system1_first && crate::runtime::encoder::system1::detect(hub, id) {
             return system1();
         }
         if let Some(v) = crate::model::video_repo::detect(hub, id, o.quant_name) {
@@ -109,10 +110,20 @@ pub fn load_model(hub: &HuggingFaceHub, id: &str, o: &LoadOpts) -> Result<Loaded
     (o.admit)(adapter)?;
     let artifacts = hub.auto_download_and_cache(id, o.token)?;
     (o.stage)("reading weights, choosing weight format");
-    // legacy: until Phase 9 (diffusion specs). Image repos are recognised by their files.
-    if o.family.is_none() {
-        if let Some(img) = load_image_model(&artifacts, hub) {
-            return img.map(Loaded::Image);
+    // Image repos are recognised by their files; `--arch` of a diffusion family loads as that one.
+    match o.family {
+        Some(f) if super::registry()?.spec(f, &Default::default()).is_ok_and(|s| s.pipeline == Pipeline::Diffusion) => {
+            let p = SpecDiffusion::load(&artifacts, hub, o.placement, Some(f), &Extras::default())?;
+            return Ok(Loaded::Image(Arc::new(p)));
+        }
+        Some(_) => {}
+        None => {
+            // legacy: until the remaining image families' phases (`load_image_model`).
+            let img = crate::runtime::diffusion::load_image(&artifacts, hub, o.placement)
+                .or_else(|| load_image_model(&artifacts, hub));
+            if let Some(img) = img {
+                return img.map(Loaded::Image);
+            }
         }
     }
     let (model, choice) = load_lm(&artifacts, o)?;

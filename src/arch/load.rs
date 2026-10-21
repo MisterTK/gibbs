@@ -480,6 +480,11 @@ enum Src {
         ins: Vec<Arc<Node>>,
         part: usize,
     },
+    /// An output of the spec's `precompute` component, and the tensors that component read.
+    Pre {
+        data: Vec<f32>,
+        ins: Vec<Arc<Node>>,
+    },
 }
 
 type Table = Arc<RwLock<BTreeMap<String, Arc<Node>>>>;
@@ -490,7 +495,7 @@ fn leaves(n: &Node, out: &mut HashSet<String>) {
         Src::Raw(r) => {
             out.insert(r.clone());
         }
-        Src::Xf { ins, .. } => ins.iter().for_each(|i| leaves(i, out)),
+        Src::Xf { ins, .. } | Src::Pre { ins, .. } => ins.iter().for_each(|i| leaves(i, out)),
         _ => {}
     }
 }
@@ -939,6 +944,7 @@ impl WeightStore {
                 GenData::U32(v) => v.iter().map(|&x| x as f32).collect(),
             }),
             Src::Synth(seed) => Ok(synth_values(n.shape.iter().product(), *seed)),
+            Src::Pre { data, .. } => Ok(data.clone()),
             Src::Xf {
                 op,
                 args,
@@ -1250,7 +1256,7 @@ fn xf_shapes(
     let numel: usize = s.iter().product();
     let same = || Ok(vec![(None, s.to_vec())]);
     match op {
-        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16"
+        "add" | "scale" | "softplus" | "inv_softplus" | "neg_exp" | "to_f32" | "round_bf16" | "to_bf16"
         | "ternarize" => same(),
         "untile_packed_rows" => {
             let u = Untile::from(a)?;
@@ -1373,6 +1379,7 @@ fn xf_kind(op: &str, ins: &[Arc<Node>]) -> Kind {
     let k = ins[0].kind;
     match op {
         "to_f32" => Kind::F32,
+        "to_bf16" => Kind::Bf16,
         "untile_packed_rows" => k,
         "stack_experts" if matches!(k, Kind::Packed(_)) && ins.iter().all(|i| i.kind == k) => k,
         _ => k.dense(),
@@ -1410,7 +1417,7 @@ fn xf_dense(
         }),
         "neg_exp" => map(&mut v, &|x| -x.exp()),
         "to_f32" | "reshape" => {}
-        "round_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
+        "round_bf16" | "to_bf16" => map(&mut v, &|x| bf16_to_f32(f32_to_bf16(x))),
         "ternarize" => match ins[0].kind {
             Kind::Bf16 | Kind::Packed(_) => ternarize(&mut v, |x| bf16_to_f32(f32_to_bf16(x))),
             Kind::F16 => ternarize(&mut v, |x| f16_to_f32(f32_to_f16(x))),
@@ -1618,6 +1625,10 @@ fn apply_transform(t: &Transform, env: &ModelEnv, table: &Table) -> Result<(), S
         }
         let args = eval_args(env, &caps, &t.args)?;
         let mut ins = vec![table.read()[&name].clone()];
+        // Already bf16 (or packed, kept as stored): nothing to round, stays zero-copy.
+        if t.op == "to_bf16" && !matches!(ins[0].kind, Kind::F32 | Kind::F16) {
+            continue;
+        }
         if t.op == "lora_merge" {
             for k in ["a", "b"] {
                 let n = args[k].as_str().ok_or_else(|| format!("needs `{k}`"))?;
@@ -1742,7 +1753,7 @@ fn load_from(
     for set in &spec.names.use_sets {
         pairs.extend(reg.name_set(set)?);
     }
-    let ren = Renamer::from_pairs(&pairs).map_err(fam)?;
+    let ren = Renamer::from_pairs(&pairs).map_err(fam)?.with_strip(spec.names.strip.clone());
     let table: Table = Arc::new(RwLock::new(BTreeMap::new()));
     {
         let mut t = table.write();
@@ -1817,12 +1828,15 @@ fn load_from(
     }
     let store = WeightStore {
         ckpt: ckpt.clone(),
-        table,
+        table: table.clone(),
         lora,
         adapter,
         reencode,
         cache: Mutex::new(HashMap::new()),
     };
+    if spec.components.contains_key("precompute") {
+        precompute(&spec, &env, &store, &table).map_err(|e| fam(format!("precompute: {e}")))?;
+    }
     let renames = ckpt
         .raw
         .keys()
@@ -1836,6 +1850,42 @@ fn load_from(
         ckpt,
         renames,
     })
+}
+
+/// Runs the spec's `precompute` component once on the CPU (no instance vars, no inputs): its
+/// declared outputs and every tap it emits become F32 weights under their names.
+fn precompute(spec: &Spec, env: &ModelEnv, store: &WeightStore, table: &Table) -> Result<(), String> {
+    let inst = super::build::build(spec, "precompute", env, store, &[("taps", Val::Str("*".into()))])?;
+    if !inst.inputs.is_empty() {
+        return Err("`precompute` takes no inputs".into());
+    }
+    let g = &inst.graph;
+    let shapes: Vec<Vec<usize>> = g.outputs.iter().map(|&v| g.value(v).shape.clone()).collect();
+    let ins: Vec<Arc<Node>> = {
+        let t = table.read();
+        inst.weights.iter().filter_map(|w| t.get(w).cloned()).collect()
+    };
+    let w = store.materialize(&inst.weights)?;
+    // A load-time weight transform like `transforms`, not inference: allowed under the GPU-only
+    // tripwire.
+    let _load_time = crate::hardware::cpu_compute::allow();
+    let mut p = crate::graph::program::GraphProgram::compile(
+        inst.graph,
+        w,
+        crate::hardware::PlacementMode::Pin(crate::hardware::Device::Cpu),
+    )?;
+    let outs = p.run(Vec::new())?;
+    for ((name, shape), t) in inst.outputs.into_iter().zip(shapes).zip(outs) {
+        let Tensor::F32(data) = t else {
+            return Err(format!("output `{name}` is not f32"));
+        };
+        let src = Src::Pre {
+            data,
+            ins: ins.clone(),
+        };
+        insert_new(table, name, Node { shape, kind: Kind::F32, conv: false, src })?;
+    }
+    Ok(())
 }
 
 /// Random-initialized `spec.synthetic` weights (deterministic per name).
@@ -2327,6 +2377,29 @@ mod tests {
         for n in s.names() {
             assert_eq!(dtype_of(&get(&m, &n)), s.tensor(&n).unwrap().1, "{n}");
         }
+    }
+
+    #[test]
+    fn precompute_outputs_become_weights() {
+        let d = tempfile::tempdir().unwrap();
+        let m = toy(
+            d.path(),
+            &[("w32", "F32", &[2, 3], f32b(&iota(6))), ("x", "F32", &[2], f32b(&[5.0, 6.0]))],
+            r#"components: {precompute: {body: [
+                {repeat: "i", count: 2, body: [
+                  {op: "Unary", args: {kind: {Scale: "i + 1"}}, in: ["w:w32"], out: "y"},
+                  {tap: "scaled.{i}", in: "y"}]},
+                {op: "Transpose", args: {perm: [1, 0]}, in: ["w:w32"], out: "t"}],
+              outputs: ["t"]}}"#,
+        )
+        .unwrap();
+        assert!(m.env.has("scaled.0") && m.env.has("scaled.1"));
+        assert_eq!(m.env.shape("t"), Some(vec![3, 2]));
+        assert_eq!(m.store.tensor("scaled.1"), Some((vec![2, 3], DType::F32)));
+        assert!(matches!(get(&m, "scaled.1"), Tensor::F32(v) if v == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]));
+        assert!(matches!(get(&m, "t"), Tensor::F32(v) if v == [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]));
+        // A precomputed weight consumes the checkpoint tensors precompute read.
+        assert_eq!(m.store.unconsumed(&HashSet::from(["t".to_string()]), &[]), ["x"]);
     }
 
     fn kv_str(k: &str, v: &str) -> (String, u32, Vec<u8>) {

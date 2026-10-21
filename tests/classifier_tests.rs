@@ -2,7 +2,8 @@
 //! `SKIP: <reason>` and passes when its weights are not cached in `disk/`.
 
 use gibbs_engine::hardware::Device;
-use gibbs_engine::model::classifier::{Activation, SequenceClassifier};
+use gibbs_engine::model::classifier::SequenceClassifier;
+use gibbs_engine::runtime::encoder::Activation;
 use gibbs_engine::model::hub::HuggingFaceHub;
 use std::path::Path;
 

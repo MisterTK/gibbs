@@ -1,13 +1,8 @@
-//! BERT-family sequence classifiers and rerankers exported to GGUF by llama.cpp
-//! (`convert_hf_to_gguf.py` BertModel / XLMRobertaModel): the encoder under llama.cpp tensor
-//! names, the head as `cls.*` / `cls.output.*`, and the tokenizer as `tokenizer.ggml.*`.
+//! GGUF key-value metadata read with arrays (the shared header reader skips them): the
+//! architecture, string lists (a classifier's `<arch>.classifier.output_labels`) and the HF
+//! tokenizer rebuilt from `tokenizer.ggml.*`.
 
-use super::head::{HeadPool, HeadPost};
-use super::{encode, Act, Head, Lin};
-use crate::hardware::Device;
 use crate::model::hub::HuggingFaceHub;
-use crate::model::jev::{BertDims, BertEncoder};
-use crate::model::loaders::{GgufWeightReader, WeightReader};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
@@ -103,159 +98,38 @@ fn read_kv(d: &[u8]) -> Result<HashMap<String, Kv>, String> {
     Ok(kv)
 }
 
-/// A llama.cpp BERT-architecture GGUF with a classification head.
-pub struct GgufClassifier {
-    pub labels: Vec<String>,
-    enc: BertEncoder,
-    tok: tokenizers::Tokenizer,
-    head: Head,
-}
+/// A GGUF file's metadata.
+pub struct GgufMeta(HashMap<String, Kv>);
 
-impl GgufClassifier {
-    pub fn load(path: &Path, device: Device) -> Result<Self, String> {
-        let reader = GgufWeightReader::open(path)?;
-        let kv = read_kv(reader.bytes())?;
-        let arch = kv
-            .get("general.architecture")
-            .and_then(Kv::str)
-            .unwrap_or("")
-            .to_string();
-        if !reader.tensor_names().any(|n| n == "cls.output.weight") {
-            return Err("GGUF has no classification head".into());
-        }
-        if arch != "bert" {
-            return Err(format!(
-                "GGUF classifier architecture {arch} is not supported (only bert)"
-            ));
-        }
-        let meta = |k: &str| {
-            kv.get(&format!("{arch}.{k}"))
-                .and_then(Kv::num)
-                .ok_or_else(|| format!("GGUF has no {arch}.{k}"))
-        };
-        let h = meta("embedding_length")? as usize;
-        // GGUF drops trailing unit dims ([h] for a 1-row table), so count rows from elements.
-        let rows = |n: &str| {
-            reader
-                .get_tensor_shape(n)
-                .map(|s| s.iter().product::<usize>() / h)
-                .ok_or_else(|| format!("GGUF has no tensor {n}"))
-        };
-        let dims = BertDims {
-            hidden_size: h,
-            num_layers: meta("block_count")? as usize,
-            num_heads: meta("attention.head_count")? as usize,
-            intermediate_size: meta("feed_forward_length")? as usize,
-            max_positions: rows("position_embd.weight")?,
-            vocab_size: rows("token_embd.weight")?,
-            type_vocab_size: rows("token_types.weight")?,
-            layer_norm_eps: meta("attention.layer_norm_epsilon")? as f32,
-        };
-        let get = |n: &str| reader.load_tensor(n);
-        let lin = |n: &str, in_f: usize| -> Result<Lin, String> {
-            let w = get(&format!("{n}.weight"))?;
-            Ok(Lin {
-                out_f: w.len() / in_f,
-                w,
-                b: reader
-                    .tensor_names()
-                    .any(|t| *t == format!("{n}.bias"))
-                    .then(|| get(&format!("{n}.bias")))
-                    .transpose()?,
-                in_f,
-            })
-        };
-        // llama.cpp LLAMA_POOLING_TYPE_RANK: token 0 → [cls + tanh] → cls.output. BERT exports
-        // drop the pooler, so their head is cls.output alone.
-        let dense = reader
-            .tensor_names()
-            .any(|n| n == "cls.weight")
-            .then(|| Ok::<_, String>((lin("cls", h)?, Act::Tanh)))
-            .transpose()?;
-        let in_out = dense.as_ref().map_or(h, |(l, _)| l.out_f);
-        let head = Head {
-            dense,
-            out: lin("cls.output", in_out)?,
-        };
-        let n = head.out.out_f;
-        // Metal runs the head (and the softmax over more than one logit) inside the encoder graph.
-        let graph_head = (device != Device::Cpu)
-            .then(|| head.graph(HeadPool::First, if n == 1 { HeadPost::Logits } else { HeadPost::Softmax }));
-        let enc = BertEncoder::load_with_head(dims, device, |name, _| get(&gguf_name(name)?), graph_head)?;
-        let labels = match kv
-            .get(&format!("{arch}.classifier.output_labels"))
-            .and_then(Kv::arr)
-        {
-            Some(l) if l.len() == n => l
+impl GgufMeta {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // SAFETY: read-only mapping of a cache file; only the header is read.
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("{}: {e}", path.display()))?;
+        read_kv(&map).map(Self)
+    }
+
+    /// `general.architecture`.
+    pub fn arch(&self) -> Option<String> {
+        self.0.get("general.architecture").and_then(Kv::str).map(str::to_string)
+    }
+
+    /// The string array under `key`.
+    pub fn strings(&self, key: &str) -> Option<Vec<String>> {
+        Some(
+            self.0
+                .get(key)
+                .and_then(Kv::arr)?
                 .iter()
                 .map(|v| v.str().unwrap_or("").to_string())
                 .collect(),
-            _ => (0..n).map(|i| format!("LABEL_{i}")).collect(),
-        };
-        let tok = tokenizer(&kv, dims.max_positions)?;
-        Ok(Self {
-            labels,
-            enc,
-            tok,
-            head,
-        })
+        )
     }
 
-    /// Head logits for `text` (and `pair` as the second segment), plus the token count; on Metal
-    /// they are already softmaxed (a single logit stays raw).
-    pub fn logits(&self, text: &str, pair: Option<&str>) -> Result<(Vec<f32>, usize), String> {
-        let e = encode(&self.tok, text, pair)?;
-        let ids = e.get_ids();
-        // The converter drops RoBERTa's first pad + 1 position rows, so positions count from 0.
-        let positions: Vec<u32> = (0..ids.len() as u32).collect();
-        let types = if self.enc.dims.type_vocab_size == 1 {
-            vec![0; ids.len()]
-        } else {
-            e.get_type_ids().to_vec()
-        };
-        if self.enc.device() != Device::Cpu {
-            return Ok((self.enc.run_head(ids, &positions, &types)?, ids.len()));
-        }
-        let hidden = self.enc.run(ids, &positions, &types, false)?;
-        Ok((
-            self.head.apply(&hidden[..self.enc.dims.hidden_size]),
-            ids.len(),
-        ))
+    /// The HF tokenizer of `tokenizer.ggml.*`, truncating at `max_len`.
+    pub fn tokenizer(&self, max_len: usize) -> Result<tokenizers::Tokenizer, String> {
+        tokenizer(&self.0, max_len)
     }
-
-    pub fn device(&self) -> Device {
-        self.enc.device()
-    }
-}
-
-/// llama.cpp tensor name of a BERT encoder tensor.
-fn gguf_name(bert: &str) -> Result<String, String> {
-    Ok(match bert {
-        "embeddings.word_embeddings.weight" => "token_embd.weight".into(),
-        "embeddings.position_embeddings.weight" => "position_embd.weight".into(),
-        "embeddings.token_type_embeddings.weight" => "token_types.weight".into(),
-        "embeddings.LayerNorm.weight" => "token_embd_norm.weight".into(),
-        "embeddings.LayerNorm.bias" => "token_embd_norm.bias".into(),
-        _ => {
-            let rest = bert
-                .strip_prefix("encoder.layer.")
-                .ok_or_else(|| format!("no GGUF name for {bert}"))?;
-            let (l, t) = rest.split_once('.').unwrap_or((rest, ""));
-            let (m, p) = t.rsplit_once('.').unwrap_or((t, ""));
-            let g = match m {
-                "attention.self.query" => "attn_q",
-                "attention.self.key" => "attn_k",
-                "attention.self.value" => "attn_v",
-                "attention.output.dense" => "attn_output",
-                "attention.output.LayerNorm" => "attn_output_norm",
-                "intermediate.dense" => "ffn_up",
-                "output.dense" => "ffn_down",
-                "output.LayerNorm" => "layer_output_norm",
-                _ => return Err(format!("no GGUF name for {bert}")),
-            };
-            format!("blk.{l}.{g}.{p}")
-        }
-    })
 }
 
 /// Rebuilds the HF tokenizer from `tokenizer.ggml.*`: `bert` → WordPiece (llama.cpp's WPM
@@ -388,7 +262,7 @@ fn tokenizer(kv: &HashMap<String, Kv>, max_len: usize) -> Result<tokenizers::Tok
 
 /// `general.architecture` of `repo_id`'s GGUF weights: the cached file's header, else the Hub's
 /// `gguf` metadata. `None` when the repo has no GGUF.
-pub(super) fn hub_gguf_arch(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
+pub fn hub_arch(hub: &HuggingFaceHub, repo_id: &str) -> Option<String> {
     if let Some(p) = hub
         .locate_model(repo_id)
         .weights_path

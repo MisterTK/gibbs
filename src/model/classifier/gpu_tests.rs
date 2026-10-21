@@ -1,8 +1,9 @@
 //! Metal vs CPU parity of the encoder classifiers, end to end through `SequenceClassifier::load` /
-//! `classify` on tiny synthetic repos (random f32 weights, a word-level tokenizer): the CPU body is
-//! the native host forward (the reference), the Metal body is the graph program. f32 vs f32, so the
-//! bound is a relative 1e-3 of the largest score; per-architecture errors are printed.
+//! `classify` on tiny synthetic repos (random f32 weights, a word-level tokenizer): the same family
+//! spec instance compiled for each device. f32 vs f32, so the bound is a relative 1e-3 of the
+//! largest score; per-architecture errors are printed.
 
+use serde_json::json;
 use super::*;
 use crate::hardware::{available_devices, cpu_compute};
 
@@ -107,66 +108,79 @@ fn deberta_v1_absolute_positions_on_metal() {
     parity("deberta-v1", cfg, ts);
 }
 
-/// SetFit pooling (mean/cls/max, optional normalise) and sklearn `predict_proba` forms on the
-/// BERT encoder graph vs the host `pool` + `Logistic::proba`.
+/// A PEFT LoRA SEQ_CLS adapter (q/v LoRA under the task prefix `bert.`, a `modules_to_save`
+/// classifier) on a bare `BertModel` base, merged by `peft::prepare_seq_cls`, scores like a plain
+/// classifier repo holding the merged weights. CPU, and Metal when present.
 #[test]
-fn setfit_pool_and_logistic_head_on_metal() {
-    use super::setfit::{pool, Logistic, Pool};
-    if !available_devices().contains(&Device::Metal) {
-        return;
+fn peft_seq_cls_adapter_on_bare_base_matches_merged_repo() {
+    let (_, full) = bert(None);
+    let bare = |n: &str| n.strip_prefix("bert.").map(str::to_string);
+    let mut base = Ts::new(0);
+    base.t = full.t.iter().filter_map(|(n, s, v)| Some((bare(n)?, s.clone(), v.clone()))).collect();
+    let mut ad = Ts::new(9);
+    let (r, alpha, h) = (2usize, 4.0f32, 16usize);
+    let mut merged = full.t.clone();
+    for l in 0..2 {
+        for m in ["query", "value"] {
+            let p = format!("bert.encoder.layer.{l}.attention.self.{m}");
+            ad.w(&format!("base_model.model.{p}.lora_A.weight"), &[r, h]);
+            ad.w(&format!("base_model.model.{p}.lora_B.weight"), &[h, r]);
+            let (a, b) = (&ad.t[ad.t.len() - 2].2, &ad.t[ad.t.len() - 1].2);
+            let w = &mut merged.iter_mut().find(|t| t.0 == format!("{p}.weight")).unwrap().2;
+            for o in 0..h {
+                for i in 0..h {
+                    w[o * h + i] += alpha / r as f32 * (0..r).map(|k| b[o * r + k] * a[k * h + i]).sum::<f32>();
+                }
+            }
+        }
     }
-    // Every graph run here reproduces `graph::shape::infer`.
-    let _shapes = crate::graph::shape::CheckCompiled::new();
-    let dims = BertDims {
-        hidden_size: 16,
-        num_layers: 2,
-        num_heads: 2,
-        intermediate_size: 24,
-        max_positions: 32,
-        vocab_size: VOCAB,
-        type_vocab_size: 2,
-        layer_norm_eps: 1e-12,
-    };
-    let ts = bert(None).1;
-    let get = |name: &str, _: &[usize]| -> Result<Vec<f32>, String> {
-        let key = format!("bert.{name}");
-        Ok(ts.t.iter().find(|t| t.0 == key).unwrap().2.clone())
-    };
+    ad.lin("base_model.model.classifier", 3, h);
+    for (n, s, v) in &ad.t[ad.t.len() - 2..] {
+        let n = n.strip_prefix("base_model.model.").unwrap().to_string();
+        match merged.iter_mut().find(|t| t.0 == n) {
+            Some(t) => t.2 = v.clone(),
+            None => merged.push((n, s.clone(), v.clone())),
+        }
+    }
+    let mut reference = Ts::new(0);
+    reference.t = merged;
+
+    let base_cfg = json!({"architectures": ["BertModel"], "hidden_size": 16, "num_hidden_layers": 2,
+        "num_attention_heads": 2, "intermediate_size": 24, "max_position_embeddings": 32, "type_vocab_size": 2});
+    let cache = write_repo("peft-base", base_cfg.clone(), &base);
+    let mut ref_cfg = base_cfg.clone();
+    ref_cfg["architectures"] = json!(["BertForSequenceClassification"]);
+    let ref_hub = repo("peft-ref", ref_cfg, &reference);
+    // The adapter repo: its config names no architecture (labels only), so the base resolves it.
+    let tmp = write_repo("peft-ad", json!({}), &ad);
+    let (from, to) = (tmp.join("models--t--peft-ad"), cache.join("models--t--peft-ad"));
+    let _ = std::fs::remove_dir_all(&to);
+    std::fs::rename(&from, &to).unwrap();
+    let snap = to.join("snapshots/main");
+    std::fs::rename(snap.join("model.safetensors"), snap.join("adapter_model.safetensors")).unwrap();
+    std::fs::write(
+        snap.join("adapter_config.json"),
+        json!({"peft_type": "LORA", "task_type": "SEQ_CLS", "r": r, "lora_alpha": alpha,
+            "base_model_name_or_path": "t/peft-base"}).to_string(),
+    )
+    .unwrap();
+    let hub = HuggingFaceHub::with_cache_dir(cache);
     let _g = cpu_compute::allow();
-    let cpu = BertEncoder::load(dims, Device::Cpu, get).unwrap();
-    let (ids, pos, types) = (
-        [3u32, 7, 1, 9, 2, 5, 11, 4, 6],
-        (0..9).collect::<Vec<u32>>(),
-        [0u32; 9],
-    );
-    let hidden = cpu.run(&ids, &pos, &types, false).unwrap();
-    for (p, normalize, rows, ovr) in [
-        (Pool::Mean, true, 1, true),
-        (Pool::Max, false, 3, false),
-        (Pool::Cls, false, 3, true),
-        (Pool::Mean, false, 1, false),
-    ] {
-        let mut rng = Ts::new(rows as u64 + 7);
-        let head = Logistic {
-            coef: (0..rows * 16).map(|_| rng.rnd() as f64).collect(),
-            intercept: (0..rows).map(|_| rng.rnd() as f64).collect(),
-            features: 16,
-            ovr,
-        };
-        let want = head.proba(&pool(&hidden, 16, p, normalize));
-        let gpu =
-            BertEncoder::load_with_head(dims, Device::Metal, get, Some(head.graph(p, normalize)))
-                .unwrap();
-        let got = gpu.run_head(&ids, &pos, &types).unwrap();
-        assert_eq!(got.len(), want.len());
-        let err = want
-            .iter()
-            .zip(&got)
-            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-        eprintln!("setfit {p:?} norm={normalize} rows={rows} ovr={ovr}: max abs err {err:.2e}  {want:?} vs {got:?}");
-        assert!(
-            err < 1e-3,
-            "{p:?} {normalize} {rows} {ovr}: {want:?} vs {got:?}"
-        );
+    let mut devs = vec![Device::Cpu];
+    if available_devices().contains(&Device::Metal) {
+        devs.push(Device::Metal);
+    }
+    for dev in devs {
+        let want = SequenceClassifier::load(&ref_hub, "t/peft-ref", dev).unwrap();
+        let got = SequenceClassifier::load(&hub, "t/peft-ad", dev).unwrap_or_else(|e| panic!("{dev:?}: {e}"));
+        assert_eq!(got.architecture, "BertForSequenceClassification");
+        for pair in [None, Some(PAIR)] {
+            let (a, _) = want.classify(TEXT, pair).unwrap();
+            let (b, _) = got.classify(TEXT, pair).unwrap();
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.label, y.label, "{dev:?}");
+                assert!((x.score - y.score).abs() < 1e-5, "{dev:?}: {a:?} vs {b:?}");
+            }
+        }
     }
 }

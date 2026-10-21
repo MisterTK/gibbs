@@ -1,0 +1,225 @@
+// Krea 2 (diffusers `Krea2Transformer2DModel`; original / ComfyUI names via `comfy`): a text-fusion
+// net over the 12 tapped encoder layers (layerwise blocks attending inside each token's 12 layer
+// rows, a Linear(12 -> 1) over layers, refiner blocks, RMSNorm + GELU-tanh MLP) and a single-stream
+// DiT over [text; image] with sigmoid-gated GQA attention, per-head QK-norm, 3-axis RoPE on
+// adjacent pairs, SwiGLU MLPs and per-block adaLN tables added to one shared timestep projection.
+// RMSNorm scales are stored zero-centred. Sizes come from the tensors. Linear weights run in bf16
+// (F32 checkpoints are rounded, as the reference).
+{
+  family: "krea2",
+  // ponytail: pipeline-class / GGUF matchers are off (legacy pipeline routes) until the Qwen
+  // text-encoder specs land and this family is cut over.
+  match: {diffusers_class: ["Krea2Transformer2DModel"]},
+  pipeline: "diffusion",
+  use_lib: ["diffusion"],
+  names: {use: ["comfy"]},
+  config: {
+    dim: "shape('img_in.weight')[0]",
+    in_ch: "shape('img_in.weight')[1]",
+    chan: "in_ch // 4",
+    hd: "shape('transformer_blocks.0.attn.norm_q.weight')[0]",
+    layers: "count('transformer_blocks.{k}.scale_shift_table')",
+    tdim: "shape('time_embed.linear_1.weight')[1]",
+    td: "shape('text_fusion.layerwise_blocks.0.norm1.weight')[0]",
+    nl: "shape('text_fusion.projector.weight')[1]",
+    layerwise: "count('text_fusion.layerwise_blocks.{k}.norm1.weight')",
+    refiners: "count('text_fusion.refiner_blocks.{k}.norm1.weight')",
+    theta: "first(cfg.rope_theta, 1000)",
+    // ComfyUI: [hd - 12 * (hd / 16), 6 * (hd / 16), 6 * (hd / 16)]; diffusers configs list them.
+    axes: "len(first(cfg.axes_dims_rope, [])) == 3 ? cfg.axes_dims_rope : [hd - 12 * (hd // 16), 6 * (hd // 16), 6 * (hd // 16)]",
+    eps: "1e-5",
+  },
+  checks: [
+    {expr: "layers == 0 || shape('text_fusion.projector.weight')[0] != 1 || shape('final_layer.linear.weight')[0] != in_ch || in_ch % 4 != 0",
+     error: "tensor shapes do not form a Krea 2 transformer"},
+    {expr: "at(axes, 0) + at(axes, 1) + at(axes, 2) != hd", error: "Krea 2: RoPE axes {axes} do not split head_dim {hd}"},
+  ],
+  transforms: [
+    {tensor: "{n:*}.norm1.weight", op: "add", args: {value: 1}},
+    {tensor: "{n:*}.norm2.weight", op: "add", args: {value: 1}},
+    {tensor: "{n:*}.attn.norm_q.weight", op: "add", args: {value: 1}},
+    {tensor: "{n:*}.attn.norm_k.weight", op: "add", args: {value: 1}},
+    {tensor: "txt_in.norm.weight", op: "add", args: {value: 1}},
+    {tensor: "final_layer.norm.weight", op: "add", args: {value: 1}},
+    {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
+  ],
+  constants: {
+    "rope.inv_freq": {gen: "axis_freqs", args: {dims: "axes", theta: "theta"}},
+    one: {gen: "fill", args: {shape: [1], value: 1}},
+  },
+  macros: {
+    // `x` [rows, heads * hd] -> [n, kv, g * per, hd]: the rows of each kv head within each group of
+    // `g` consecutive rows.
+    group_heads: {params: ["x"], body: [
+      {op: "Reshape", args: {shape: ["n", "g", "kv", "per * hd"]}, in: ["x"], out: "r", name: "r"},
+      {op: "Transpose", args: {perm: [0, 2, 1, 3]}, in: ["r"], out: "t", name: "t"},
+      {op: "Reshape", args: {shape: ["n", "kv", "g * per", "hd"]}, in: ["t"], out: "out", name: "j"},
+    ]},
+    // Sigmoid-gated GQA self-attention of block `p`: over all rows (`group` 0) or inside each group
+    // of `group` consecutive rows; RoPE when `rope`.
+    kattn: {params: ["x"], body: [
+      {let: {rows: "shape('x')[0]", heads: "shape(fmt('{p}.attn.to_q.weight'))[0] // hd", kv: "shape(fmt('{p}.attn.to_k.weight'))[0] // hd"}},
+      {op: "Linear", in: ["x", "w:{p}.attn.to_q.weight", "w?:{p}.attn.to_q.bias"], out: "q", name: "wq"},
+      {op: "Linear", in: ["x", "w:{p}.attn.to_k.weight", "w?:{p}.attn.to_k.bias"], out: "k", name: "wk"},
+      {op: "Linear", in: ["x", "w:{p}.attn.to_v.weight", "w?:{p}.attn.to_v.bias"], out: "v", name: "wv"},
+      {op: "Linear", in: ["x", "w:{p}.attn.to_gate.weight", "w?:{p}.attn.to_gate.bias"], out: "gate", name: "gate"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["q", "w:{p}.attn.norm_q.weight"], out: "q", name: "qnorm"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["k", "w:{p}.attn.norm_k.weight"], out: "k", name: "knorm"},
+      {block: [
+        {let: {mr: {MRope: {sections: ["at(axes, 0) // 2", "at(axes, 1) // 2", "at(axes, 2) // 2"], interleaved: false, pairs: "'Adjacent'"}}}},
+        {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "mr", mscale: 1}, in: ["q", "i:pos", "c:rope.inv_freq"], out: "q", name: "rq"},
+        {op: "Rope", args: {head_dim: "hd", rotary_dim: "hd", variant: "mr", mscale: 1}, in: ["k", "i:pos", "c:rope.inv_freq"], out: "k", name: "rk"},
+      ], when: "rope"},
+      {op: "Attention", args: {heads: "heads", kv_heads: "kv", causal: false}, in: ["q", "k", "v"], out: "a", name: "attn", when: "group == 0"},
+      {block: [
+        // Query rows of one kv head are (pos, rep) pairs that all see the same g keys (no mask).
+        {let: {g: "group", n: "rows // group", rep: "heads // kv"}},
+        {use: "group_heads", args: {per: "rep"}, in: ["q"], out: "q", name: "gq"},
+        {use: "group_heads", args: {per: 1}, in: ["k"], out: "k", name: "gk"},
+        {use: "group_heads", args: {per: 1}, in: ["v"], out: "v", name: "gv"},
+        {op: "Unary", args: {kind: {Scale: "1 / sqrt(hd)"}}, in: ["q"], out: "q", name: "gqs"},
+        {op: "MatMul", args: {transpose_a: false, transpose_b: true}, in: ["q", "k"], out: "s", name: "gs"},
+        {op: "Softmax", args: {axis: -1}, in: ["s"], out: "s", name: "gp"},
+        {op: "MatMul", args: {transpose_a: false, transpose_b: false}, in: ["s", "v"], out: "a", name: "go"},
+        {op: "Reshape", args: {shape: ["n", "kv", "g", "rep * hd"]}, in: ["a"], out: "a", name: "go.r"},
+        {op: "Transpose", args: {perm: [0, 2, 1, 3]}, in: ["a"], out: "a", name: "go.t"},
+        {op: "Reshape", args: {shape: ["rows", "heads * hd"]}, in: ["a"], out: "a", name: "go.j"},
+      ], when: "group > 0"},
+      {op: "Unary", args: {kind: "Sigmoid"}, in: ["gate"], out: "gate", name: "sig"},
+      {op: "Binary", args: {kind: "Mul"}, in: ["a", "gate"], out: "a", name: "gated"},
+      {op: "Linear", in: ["a", "w:{p}.attn.to_out.0.weight", "w?:{p}.attn.to_out.0.bias"], out: "out", name: "wo"},
+    ]},
+    // Block `p` over `x`; `tvec` ([1, 6d] shared timestep projection) drives the adaLN of
+    // `modulated` blocks: [prescale, preshift, pregate, postscale, postshift, postgate].
+    kblock: {params: ["x", "tvec"], body: [
+      {let: {d: "shape('x')[1]"}},
+      {op: "Binary", args: {kind: "Add"}, in: ["w:{p}.scale_shift_table", "tvec"], out: "m", name: "mod.sum", when: "modulated"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{p}.norm1.weight"], out: "h", name: "prenorm"},
+      {block: [
+        {op: "Slice", args: {axis: 1, start: 0, end: "d"}, in: ["m"], out: "sc", name: "m0"},
+        {op: "Slice", args: {axis: 1, start: "d", end: "2 * d"}, in: ["m"], out: "sh", name: "m1"},
+        {use: "scale_shift", in: ["h", "sh", "sc"], out: "h", name: "premod"},
+      ], when: "modulated"},
+      {use: "kattn", in: ["h"], out: "a", name: "attn"},
+      {block: [
+        {op: "Slice", args: {axis: 1, start: "2 * d", end: "3 * d"}, in: ["m"], out: "g", name: "m2"},
+        {use: "gated_add", in: ["x", "a", "g"], out: "x", name: "res1"},
+      ], when: "modulated"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "a"], out: "x", name: "res1", when: "!modulated"},
+      {op: "RmsNorm", args: {eps: "eps"}, in: ["x", "w:{p}.norm2.weight"], out: "h", name: "postnorm"},
+      {block: [
+        {op: "Slice", args: {axis: 1, start: "3 * d", end: "4 * d"}, in: ["m"], out: "sc", name: "m3"},
+        {op: "Slice", args: {axis: 1, start: "4 * d", end: "5 * d"}, in: ["m"], out: "sh", name: "m4"},
+        {use: "scale_shift", in: ["h", "sh", "sc"], out: "h", name: "postmod"},
+      ], when: "modulated"},
+      {op: "Linear", in: ["h", "w:{p}.ff.gate.weight", "w?:{p}.ff.gate.bias"], out: "fg", name: "mlp.gate"},
+      {op: "Linear", in: ["h", "w:{p}.ff.up.weight", "w?:{p}.ff.up.bias"], out: "fu", name: "mlp.up"},
+      {op: "SwiGlu", in: ["fg", "fu"], out: "f", name: "mlp.act"},
+      {op: "Linear", in: ["f", "w:{p}.ff.down.weight", "w?:{p}.ff.down.bias"], out: "f", name: "mlp.down"},
+      {block: [
+        {op: "Slice", args: {axis: 1, start: "5 * d", end: "6 * d"}, in: ["m"], out: "g", name: "m5"},
+        {use: "gated_add", in: ["x", "f", "g"], out: "out", name: "res2"},
+      ], when: "modulated"},
+      {op: "Binary", args: {kind: "Add"}, in: ["x", "f"], out: "out", name: "res2", when: "!modulated"},
+    ]},
+  },
+  components: {
+    // The Qwen3-VL-4B text encoder is the `qwen3_vl` family (Phase 5).
+    text_encoder: {family: "qwen3_vl", dir: "text_encoder"},
+    transformer: {family: "krea2", dir: "transformer"},
+    vae: {family: "qwen_vae", dir: "vae"},
+    // Text features [nt, dim] from the `nl` tapped encoder layers stacked per token
+    // (`context` [nt, nl * td], layer-minor). Run once per prompt.
+    fuse: {
+      vars: ["nt"],
+      inputs: [{name: "context", dtype: "f32", shape: ["nt", "nl * td"]}],
+      body: [
+        {op: "Reshape", args: {shape: ["nt * nl", "td"]}, in: ["i:context"], out: "x", name: "taps.x"},
+        {repeat: "i", count: "layerwise", body: [
+          {use: "kblock", args: {p: "fmt('text_fusion.layerwise_blocks.{i}')", modulated: false, group: "nl", rope: false},
+           in: ["x", "x"], out: "x", name: "layerwise.{i}"},
+        ]},
+        // Linear(nl -> 1) over the layer axis: one row of nl per (token, channel).
+        {op: "Reshape", args: {shape: ["nt", "nl", "td"]}, in: ["x"], out: "y", name: "proj.r"},
+        {op: "Transpose", args: {perm: [0, 2, 1]}, in: ["y"], out: "y", name: "proj.t"},
+        {op: "Reshape", args: {shape: ["nt * td", "nl"]}, in: ["y"], out: "y", name: "proj.cols"},
+        {op: "Linear", in: ["y", "w:text_fusion.projector.weight", "w?:text_fusion.projector.bias"], out: "y", name: "projector"},
+        {op: "Reshape", args: {shape: ["nt", "td"]}, in: ["y"], out: "y", name: "proj.y"},
+        {repeat: "i", count: "refiners", body: [
+          {use: "kblock", args: {p: "fmt('text_fusion.refiner_blocks.{i}')", modulated: false, group: 0, rope: false},
+           in: ["y", "y"], out: "y", name: "refiner.{i}"},
+        ]},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["y", "w:txt_in.norm.weight"], out: "y", name: "txt_norm.out"},
+        {op: "Linear", in: ["y", "w:txt_in.linear_1.weight", "w?:txt_in.linear_1.bias"], out: "y", name: "txt1"},
+        {op: "Unary", args: {kind: "GeluTanh"}, in: ["y"], out: "y", name: "txt1.gelu"},
+        {op: "Linear", in: ["y", "w:txt_in.linear_2.weight", "w?:txt_in.linear_2.bias"], out: "out", name: "txt3"},
+      ],
+      outputs: ["out"],
+    },
+    // Velocity [h/2 * w/2, in_ch] for a 2x2-packed latent grid h x w and fused text `context`.
+    denoiser: {
+      vars: ["h", "w", "nt"],
+      inputs: [
+        {name: "x", dtype: "f32", shape: ["(h // 2) * (w // 2)", "in_ch"]},
+        {name: "context", dtype: "f32", shape: ["nt", "dim"]},
+        {name: "pos", dtype: "u32", shape: ["(nt + (h // 2) * (w // 2)) * 3"], gen: "text_zero_grid3",
+         args: {text_len: "nt", grid_h: "h // 2", grid_w: "w // 2"}},
+        {name: "t_feat", dtype: "f32", shape: [1, "tdim"], gen: "timestep_embedding",
+         args: {t: "'step:1000 * sigma'", dim: "tdim", precision: "'f32'"}},
+      ],
+      body: [
+        {let: {n: "nt + (h // 2) * (w // 2)"}},
+        {op: "Linear", in: ["i:t_feat", "w:time_embed.linear_1.weight", "w?:time_embed.linear_1.bias"], out: "t", name: "tmlp0"},
+        {op: "Unary", args: {kind: "GeluTanh"}, in: ["t"], out: "t", name: "tmlp0.gelu"},
+        {op: "Linear", in: ["t", "w:time_embed.linear_2.weight", "w?:time_embed.linear_2.bias"], out: "t", name: "tmlp2"},
+        {op: "Unary", args: {kind: "GeluTanh"}, in: ["t"], out: "tg", name: "tproj.gelu"},
+        {op: "Linear", in: ["tg", "w:time_mod_proj.weight", "w?:time_mod_proj.bias"], out: "tvec", name: "tproj"},
+        {op: "Linear", in: ["i:x", "w:img_in.weight", "w?:img_in.bias"], out: "img", name: "first"},
+        {op: "Concat", args: {axis: 0}, in: ["i:context", "img"], out: "x", name: "stream.cat"},
+        {repeat: "i", count: "layers", body: [
+          {use: "kblock", args: {p: "fmt('transformer_blocks.{i}')", modulated: true, group: 0, rope: true},
+           in: ["x", "tvec"], out: "x", name: "blocks.{i}"},
+        ]},
+        {op: "Slice", args: {axis: 0, start: "nt", end: "n"}, in: ["x"], out: "y", name: "final.img"},
+        {op: "RmsNorm", args: {eps: "eps"}, in: ["y", "w:final_layer.norm.weight"], out: "y", name: "final.norm"},
+        {op: "Slice", args: {axis: 0, start: 0, end: 1}, in: ["w:final_layer.scale_shift_table"], out: "sc", name: "last_mod.scale"},
+        {op: "Slice", args: {axis: 0, start: 1, end: 2}, in: ["w:final_layer.scale_shift_table"], out: "sh", name: "last_mod.shift"},
+        {op: "Binary", args: {kind: "Add"}, in: ["t", "sc"], out: "sc", name: "final.scale"},
+        {op: "Binary", args: {kind: "Add"}, in: ["t", "sh"], out: "sh", name: "final.shift"},
+        {use: "scale_shift", in: ["y", "sh", "sc"], out: "y", name: "final.mod"},
+        {op: "Linear", in: ["y", "w:final_layer.linear.weight", "w?:final_layer.linear.bias"], out: "out", name: "last"},
+      ],
+      outputs: ["out"],
+    },
+  },
+  runtime: {
+    // hidden_states[2, 5, ..., 35] of the prompt template minus its 34 prefix tokens, stacked per token
+    // and fused by `fuse`. ponytail: the reference cuts the prompt before the suffix (512 + 29
+    // tokens); here the whole rendering is capped at prefix + 512.
+    text_encoders: [{name: "te", component: "text_encoder", net: "text", tokenizer: "tokenizer",
+      prefix: "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n",
+      template: "{prefix}{prompt}<|im_end|>\n<|im_start|>assistant\n", max_len: "prefix_len + 512",
+      drop: {from: 0, to: "prefix_len"},
+      vars: {head: "'hidden'", taps: ["layer.1", "layer.4", "layer.7", "layer.10", "layer.13", "layer.16", "layer.19", "layer.22", "layer.25", "layer.28", "layer.31", "layer.34"]},
+      outputs: {l2: "layer.1", l5: "layer.4", l8: "layer.7", l11: "layer.10", l14: "layer.13", l17: "layer.16",
+                l20: "layer.19", l23: "layer.22", l26: "layer.25", l29: "layer.28", l32: "layer.31", l35: "layer.34"}}],
+    context: [{features: ["te.l2", "te.l5", "te.l8", "te.l11", "te.l14", "te.l17", "te.l20", "te.l23", "te.l26", "te.l29", "te.l32", "te.l35"]}],
+    context_net: {component: "transformer", net: "fuse"},
+    negative: {default: ""},
+    denoiser: {component: "transformer", net: "denoiser"},
+    // Turbo (`is_distilled`): mu 1.15; Raw: mu from the image tokens (256..6400 -> 0.5..1.15).
+    scheduler: {kind: "flow_euler", sigmas: "linspace", mu: "json.model_index.is_distilled == true ? 1.15 : 'dynamic'",
+                base_seq: 256, max_seq: 6400, base_shift: 0.5, max_shift: 1.15, seq: "(h // 2) * (w // 2)"},
+    timestep: "sigma",
+    // pred = cond + g (cond - uncond) whenever g > 0.
+    guidance: {kind: "cfg", gate: "guidance > 0", scale: "guidance + 1"},
+    latent: {channels: "denoiser.chan", factor: 8, pack: "pack2x2", noise_scale: 1},
+    vae: {component: "vae", decode: "decoder", encode: null,
+          decode_affine: {mul: "first(vae.cfg.latents_std, vae.wan_std)", add: "first(vae.cfg.latents_mean, vae.wan_mean)"},
+          output: "clamp_pm1"},
+    // The diffusers examples: Raw 28 steps with guidance 4.5, Turbo 8 without.
+    defaults: {width: 512, height: 512, steps: "json.model_index.is_distilled == true ? 8 : 28",
+               guidance: "json.model_index.is_distilled == true ? 0 : 4.5", multiple: 16, max_side: 8192, max_steps: 200},
+    summary: "fmt('Krea 2 ({denoiser.layers} layers, dim {denoiser.dim}), Qwen3-VL-4B text encoder + Qwen-Image VAE')",
+  },
+}

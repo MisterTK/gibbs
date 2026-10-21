@@ -6,7 +6,7 @@ use gibbs_engine::model::classifier::{self, ClassifierSlot};
 use gibbs_engine::model::hub::{is_synthetic_model_id, HuggingFaceHub, StorageBackend};
 use gibbs_engine::model::image::ImageBuffer;
 use gibbs_engine::model::load_log;
-use gibbs_engine::model::text_to_image::{ImageGenerator, ImageRequest, ImageSlot};
+use gibbs_engine::runtime::diffusion::{ImageGenerator, ImageRequest, ImageSlot};
 use gibbs_engine::model::weight_format::ReencodeConfig;
 use gibbs_engine::scheduler::{cpu_backend_label, ContinuousBatchScheduler, ExecutableModel};
 use gibbs_engine::server::{create_router, AppState};
@@ -387,7 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut weights = None;
     let mut drafter = None;
     let classifier_slot = ClassifierSlot::default();
-    let jev_slot = gibbs_engine::model::jev::System1Slot::default();
+    let jev_slot = gibbs_engine::runtime::encoder::system1::System1Slot::default();
     let model_exec = match loaded {
         Loaded::Video(plan) => return run_video(&cli, &hub, &plan, backend).map_err(Into::into),
         Loaded::Image(g) => {
@@ -453,19 +453,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
         Loaded::System1(jev) => {
-            if let Some(enc) = jev.bert() {
-                if let Some(report) = enc.executor_report() {
-                    telemetry.log_info(&format!("Metal: {report}"));
-                }
+            if jev.encoder().is_some() {
                 telemetry.log_info(&format!(
-                    "System 1 encoder '{}' ready on {}: {} layers, hidden {}, {} heads, {:.1}M params, loaded in {:.2}s (zero-shot cosine decisions)",
+                    "System 1 encoder '{}' ready, loaded in {:.2}s (zero-shot cosine decisions): {}",
                     jev.repo_id,
-                    enc.device(),
-                    enc.dims.num_layers,
-                    enc.dims.hidden_size,
-                    enc.dims.num_heads,
-                    enc.parameter_count() as f64 / 1e6,
-                    t0.elapsed().as_secs_f64()
+                    t0.elapsed().as_secs_f64(),
+                    jev.summary()
                 ));
             }
             if let Some(prompt) = &cli.prompt {
@@ -474,11 +467,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .split_once('|')
                         .map(|(q, o)| (q.trim(), o))
                         .unwrap_or((prompt.as_str(), ""));
-                    let options: Vec<gibbs_engine::model::jev::ChoiceOption> = opts
+                    let options: Vec<gibbs_engine::runtime::encoder::system1::ChoiceOption> = opts
                         .split(',')
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|s| gibbs_engine::model::jev::ChoiceOption::new(s, None::<String>))
+                        .map(|s| gibbs_engine::runtime::encoder::system1::ChoiceOption::new(s, None::<String>))
                         .collect();
                     let decision = jev
                         .embed(query)

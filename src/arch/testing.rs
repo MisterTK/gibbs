@@ -114,6 +114,8 @@ pub struct Runner {
     progs: HashMap<String, GraphProgram>,
     state: StateStore,
     used: HashSet<String>,
+    /// Step variables (`sigma`, `t`, ...) for generated inputs whose args say `"step:<expr>"`.
+    pub step: Vec<(String, Val)>,
 }
 
 impl Runner {
@@ -139,6 +141,7 @@ impl Runner {
             progs: HashMap::new(),
             state: StateStore::new(),
             used: HashSet::new(),
+            step: Vec::new(),
         })
     }
 
@@ -164,7 +167,7 @@ impl Runner {
         let mut ins = Vec::new();
         for p in &inst.inputs {
             ins.push(match &p.gen {
-                Some((g, args)) => match super::gen::generate(g, args)?.data {
+                Some((g, args)) => match super::gen::generate(g, &self.step_args(args)?)?.data {
                     super::gen::GenData::F32(v) => Tensor::F32(v),
                     super::gen::GenData::U32(v) => Tensor::U32(v),
                 },
@@ -210,6 +213,23 @@ impl Runner {
     /// Checkpoint tensors no instance built so far reads (and `ignore` does not list).
     pub fn unconsumed(&self) -> Vec<String> {
         self.model.store.unconsumed(&self.used, &self.model.spec.ignore)
+    }
+
+    /// `args` with every `"step:<expr>"` string evaluated over [`Self::step`].
+    fn step_args(&self, args: &J) -> Result<J, String> {
+        Ok(match args {
+            J::String(s) => match s.strip_prefix("step:") {
+                Some(e) => self.model.env.eval_with(&self.step, &J::String(e.into()))?.to_json(),
+                None => args.clone(),
+            },
+            J::Array(a) => J::Array(a.iter().map(|v| self.step_args(v)).collect::<Result<_, _>>()?),
+            J::Object(o) => J::Object(
+                o.iter()
+                    .map(|(k, v)| Ok((k.clone(), self.step_args(v)?)))
+                    .collect::<Result<_, String>>()?,
+            ),
+            _ => args.clone(),
+        })
     }
 }
 

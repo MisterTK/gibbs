@@ -14,8 +14,20 @@ pub mod gen;
 pub mod load;
 pub mod names;
 pub mod templates;
-#[cfg(test)]
+#[doc(hidden)]
 pub mod testing;
+#[cfg(test)]
+mod tests_encoders_bert;
+#[cfg(test)]
+mod tests_encoders_bert_variants;
+#[cfg(test)]
+mod tests_encoders_factorized;
+#[cfg(test)]
+mod tests_encoders_modernbert;
+#[cfg(test)]
+mod tests_encoders_bert_gguf;
+#[cfg(test)]
+mod tests_encoders_deberta;
 
 pub use dispatch::{load_model, LoadOpts, Loaded};
 
@@ -42,6 +54,14 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/gpt2.json5", include_str!("../../arch/families/gpt2.json5")),
     ("families/opt.json5", include_str!("../../arch/families/opt.json5")),
     ("families/lfm2.json5", include_str!("../../arch/families/lfm2.json5")),
+    ("names/comfy.json5", include_str!("../../arch/names/comfy.json5")),
+    ("families/krea2.json5", include_str!("../../arch/families/krea2.json5")),
+    ("families/qwen_image.json5", include_str!("../../arch/families/qwen_image.json5")),
+    ("families/qwen_image21.json5", include_str!("../../arch/families/qwen_image21.json5")),
+    ("families/qwen_vae.json5", include_str!("../../arch/families/qwen_vae.json5")),
+    ("families/qwen_vae21.json5", include_str!("../../arch/families/qwen_vae21.json5")),
+    ("families/qwen2_5_vl_text.json5", include_str!("../../arch/families/qwen2_5_vl_text.json5")),
+    ("families/zimage.json5", include_str!("../../arch/families/zimage.json5")),
     ("families/sd3.json5", include_str!("../../arch/families/sd3.json5")),
     ("families/gemma2.json5", include_str!("../../arch/families/gemma2.json5")),
     ("families/sana.json5", include_str!("../../arch/families/sana.json5")),
@@ -55,11 +75,31 @@ pub const EMBEDDED: &[(&str, &str)] = &[
     ("families/sdxl.json5", include_str!("../../arch/families/sdxl.json5")),
     ("overrides/sd_turbo.json5", include_str!("../../arch/overrides/sd_turbo.json5")),
     ("overrides/sdxl_turbo.json5", include_str!("../../arch/overrides/sdxl_turbo.json5")),
+    ("families/ldm_clip.json5", include_str!("../../arch/families/ldm_clip.json5")),
+    ("families/ldm_openclip.json5", include_str!("../../arch/families/ldm_openclip.json5")),
+    ("families/sdxl_clip_l.json5", include_str!("../../arch/families/sdxl_clip_l.json5")),
+    ("families/sdxl_clip_g.json5", include_str!("../../arch/families/sdxl_clip_g.json5")),
+    ("families/ldm_unet.json5", include_str!("../../arch/families/ldm_unet.json5")),
+    ("families/ldm_vae.json5", include_str!("../../arch/families/ldm_vae.json5")),
+    ("families/sd1_file.json5", include_str!("../../arch/families/sd1_file.json5")),
+    ("families/sd2_file.json5", include_str!("../../arch/families/sd2_file.json5")),
+    ("families/sdxl_file.json5", include_str!("../../arch/families/sdxl_file.json5")),
+    ("families/sd2_gguf.json5", include_str!("../../arch/families/sd2_gguf.json5")),
+    ("overrides/sd1_file_turbo.json5", include_str!("../../arch/overrides/sd1_file_turbo.json5")),
+    ("overrides/sd2_file_turbo.json5", include_str!("../../arch/overrides/sd2_file_turbo.json5")),
+    ("overrides/sdxl_file_turbo.json5", include_str!("../../arch/overrides/sdxl_file_turbo.json5")),
     ("families/t5.json5", include_str!("../../arch/families/t5.json5")),
     ("families/bart.json5", include_str!("../../arch/families/bart.json5")),
     ("families/marian.json5", include_str!("../../arch/families/marian.json5")),
     ("families/m2m100.json5", include_str!("../../arch/families/m2m100.json5")),
     ("families/fsmt.json5", include_str!("../../arch/families/fsmt.json5")),
+    ("families/electra.json5", include_str!("../../arch/families/electra.json5")),
+    ("families/albert.json5", include_str!("../../arch/families/albert.json5")),
+    ("families/bert.json5", include_str!("../../arch/families/bert.json5")),
+    ("families/modernbert.json5", include_str!("../../arch/families/modernbert.json5")),
+    ("families/bert_gguf.json5", include_str!("../../arch/families/bert_gguf.json5")),
+    ("families/fasttext.json5", include_str!("../../arch/families/fasttext.json5")),
+    ("families/deberta.json5", include_str!("../../arch/families/deberta.json5")),
     ("families/unsupported.json5", include_str!("../../arch/families/unsupported.json5")),
     ("lib/video.json5", include_str!("../../arch/lib/video.json5")),
     ("families/ltx.json5", include_str!("../../arch/families/ltx.json5")),
@@ -108,6 +148,14 @@ pub struct Match {
     /// transformer-only finetune or quantization whose model card names the base pipeline).
     #[serde(default)]
     pub denoiser_tensors: Vec<Vec<String>>,
+    /// Tensor-name groups of a single-file pipeline checkpoint (every component's weights in one
+    /// file, e.g. LDM / ComfyUI checkpoints): its configs come from the spec's
+    /// `runtime.reference` repo.
+    #[serde(default)]
+    pub single_file_tensors: Vec<Vec<String>>,
+    /// File extensions `single_file_tensors` applies to (empty: any).
+    #[serde(default)]
+    pub single_file_ext: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -139,6 +187,9 @@ pub struct Names {
     pub use_sets: Vec<String>,
     #[serde(default)]
     pub rules: Vec<(String, String)>,
+    /// Checkpoint-name prefixes removed before any rule (e.g. `model.diffusion_model.`).
+    #[serde(default)]
+    pub strip: Vec<String>,
 }
 
 /// A load-time value transform on a canonical tensor (`tensor` may hold `{i}` captures).
@@ -583,14 +634,35 @@ impl Registry {
 
     /// The family whose `match.denoiser_tensors` claims a weights file with tensor `names`.
     pub fn detect_denoiser(&self, names: &[String]) -> Option<String> {
+        self.detect_tensors(names, |m| &m.denoiser_tensors, true)
+    }
+
+    /// The family whose `match.single_file_tensors` (and `single_file_ext`) claim a weights file
+    /// with extension `ext` and tensor `names`.
+    pub fn detect_single_file(&self, names: &[String], ext: &str) -> Option<String> {
+        self.detect_tensors(names, |m| {
+            if m.single_file_ext.is_empty() || m.single_file_ext.iter().any(|e| e == ext) {
+                &m.single_file_tensors
+            } else {
+                &m.denoiser_tensors[..0]
+            }
+        }, false)
+    }
+
+    fn detect_tensors(
+        &self,
+        names: &[String],
+        groups: impl Fn(&Match) -> &[Vec<String>],
+        unprefixed: bool,
+    ) -> Option<String> {
         let has = |n: &str| {
-            names
-                .iter()
-                .any(|x| x == n || x.strip_prefix("model.diffusion_model.") == Some(n))
+            names.iter().any(|x| {
+                x == n || (unprefixed && x.strip_prefix("model.diffusion_model.") == Some(n))
+            })
         };
         self.families.iter().find_map(|(f, j)| {
             let m: Match = serde_json::from_value(j.get("match")?.clone()).ok()?;
-            m.denoiser_tensors
+            groups(&m)
                 .iter()
                 .any(|g| !g.is_empty() && g.iter().all(|n| has(n)))
                 .then(|| f.clone())
@@ -697,15 +769,45 @@ mod tests {
         assert_eq!(r.detect_denoiser(&n(&["model.diffusion_model.img_in.weight"])).as_deref(), Some("toy"));
         assert_eq!(r.detect_denoiser(&n(&["x.weight", "y.weight", "z"])).as_deref(), Some("toy"));
         assert_eq!(r.detect_denoiser(&n(&["x.weight"])), None);
+        let single = r#"{family: "one", pipeline: "diffusion", match: {single_file_tensors: [["a.w", "b.w"]], single_file_ext: ["gguf"]}}"#;
+        let r = Registry::from_files(&files(&[("families/one.json5", single)]), &[]).unwrap();
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "gguf").as_deref(), Some("one"));
+        assert_eq!(r.detect_single_file(&n(&["a.w", "b.w"]), "safetensors"), None);
+        assert_eq!(r.detect_single_file(&n(&["model.diffusion_model.a.w", "b.w"]), "gguf"), None);
+    }
+
+    /// SD single-file checkpoints claim their pipeline family by tensor names and extension; every
+    /// SD pipeline / component family merges; turbo repo ids get 1-step defaults.
+    #[test]
+    fn sd_single_file_families() {
+        let r = Registry::load(None).unwrap();
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let unet = "model.diffusion_model.input_blocks.0.0.weight";
+        let sd1 = n(&["cond_stage_model.transformer.text_model.final_layer_norm.weight", unet]);
+        assert_eq!(r.detect_single_file(&sd1, "safetensors").as_deref(), Some("sd1_file"));
+        assert_eq!(r.detect_single_file(&sd1, "gguf").as_deref(), Some("sd2_gguf"));
+        let sd2 = n(&["cond_stage_model.model.ln_final.weight", unet]);
+        assert_eq!(r.detect_single_file(&sd2, "safetensors").as_deref(), Some("sd2_file"));
+        let xl = n(&["conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
+                     "conditioner.embedders.1.model.ln_final.weight", unet]);
+        assert_eq!(r.detect_single_file(&xl, "safetensors").as_deref(), Some("sdxl_file"));
+        for f in ["sd", "sdxl", "sd1_file", "sd2_file", "sdxl_file", "sd2_gguf", "ldm_clip", "ldm_openclip",
+                  "sdxl_clip_l", "sdxl_clip_g", "ldm_unet", "ldm_vae"] {
+            r.spec(f, &Signals::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+        }
+        let turbo = Signals { hub_id: "stabilityai/sdxl-turbo".into(), ..Default::default() };
+        let s = r.spec("sdxl_file", &turbo).unwrap();
+        assert_eq!((s.runtime["defaults"]["steps"].as_u64(), s.runtime["defaults"]["guidance"].as_u64()), (Some(1), Some(0)));
+        assert_eq!(s.runtime["reference"], "'stabilityai/stable-diffusion-xl-base-1.0'");
     }
 
     #[test]
     fn ldm_vae_names_map_to_diffusers() {
         let r = names::Renamer::from_pairs(&registry().unwrap().name_set("ldm_vae").unwrap()).unwrap();
         let d = |n: &str| r.canonical(&format!("first_stage_model.{n}"));
-        assert_eq!(d("decoder.up.3.block.0.conv1.weight"), "decoder.up_blocks.0.resnets.0.conv1.weight");
-        assert_eq!(d("decoder.up.0.block.0.nin_shortcut.bias"), "decoder.up_blocks.3.resnets.0.conv_shortcut.bias");
-        assert_eq!(d("decoder.up.2.upsample.conv.weight"), "decoder.up_blocks.1.upsamplers.0.conv.weight");
+        assert_eq!(d("decoder.up.3.block.0.conv1.weight"), "decoder.up_ldm.3.resnets.0.conv1.weight");
+        assert_eq!(d("decoder.up.0.block.0.nin_shortcut.bias"), "decoder.up_ldm.0.resnets.0.conv_shortcut.bias");
+        assert_eq!(d("decoder.up.2.upsample.conv.weight"), "decoder.up_ldm.2.upsamplers.0.conv.weight");
         assert_eq!(d("decoder.mid.block_2.norm1.weight"), "decoder.mid_block.resnets.1.norm1.weight");
         assert_eq!(d("decoder.mid.attn_1.norm.bias"), "decoder.mid_block.attentions.0.group_norm.bias");
         assert_eq!(d("encoder.mid.attn_1.proj_out.weight"), "encoder.mid_block.attentions.0.to_out.0.weight");
@@ -736,7 +838,7 @@ mod tests {
     #[test]
     fn flux_families_runtime_keys_and_pipeline_claims() {
         let r = registry().unwrap();
-        for (fam, class) in [("flux", "FluxPipeline"), ("chroma", "ChromaPipeline"), ("flux2", "Flux2KleinPipeline")] {
+        for (fam, class) in [("flux", "FluxPipeline"), ("chroma", "ChromaPipeline"), ("flux2", "Flux2Transformer2DModel")] {
             let s = r.spec(fam, &Signals::default()).unwrap();
             let rt: crate::runtime::diffusion::Runtime = s.runtime_as().unwrap();
             assert!(rt.other.is_empty(), "{fam}: unknown runtime keys {:?}", rt.other.keys());

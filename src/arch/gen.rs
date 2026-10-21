@@ -346,9 +346,8 @@ fn timestep_vec(t: f64, dim: usize, flip: bool, shift: f64, scale: f64, max_peri
 /// embeddings concatenated, `[n * dim]` (SDXL `add_time_ids`).
 /// Args: `t`, `dim`, `flip_sin_to_cos` (true: cos half first), `downscale_freq_shift` (0),
 /// `scale` (1), `max_period` (10000), `precision` (`f64` default; `f32` for sources computing in f32).
-/// Reproduces `unet.rs` `timestep_embedding` and `dit.rs` `timestep_features` with
-/// `precision: "f32"`, `flux.rs` `sinusoid` with the defaults, `sd.rs` `guidance_embedding` with
-/// `flip_sin_to_cos: false, downscale_freq_shift: 1`.
+/// diffusers `get_timestep_embedding` (`precision: "f32"` for f32 sources; a guidance embedding
+/// with `flip_sin_to_cos: false, downscale_freq_shift: 1`).
 fn timestep_embedding(a: &Args) -> Result<Gen, String> {
     let dim = a.u("dim")?;
     let f32p = match a.s_or("precision", "f64")? {
@@ -678,7 +677,10 @@ fn validity_mask(a: &Args) -> Result<Gen, String> {
 /// `log_bucket_rel_index`: U32 `[rows, cols]` index into `2*span` relative embeddings for query
 /// `i`, key `j` (transformers `make_log_bucket_position` in f32 when `buckets > 0`, then `+span`
 /// clamped to `[0, 2*span)`). Args: `rows`, `cols` (default rows), `buckets`, `max_relative`,
-/// `span`. Source: `classifier.rs` DeBERTa `rel_index`.
+/// `span`. With `heads`: U32 `[heads, rows, cols]` flat gather index into a `[heads, rows | cols,
+/// 2*span]` score table instead, pair `(i, j)` of head h reading `(h*rows + i)*2*span + r`
+/// (`by: "query"`, default: DeBERTa c2p) or `(h*cols + j)*2*span + r` (`by: "key"`: p2c).
+/// Source: `classifier.rs` DeBERTa `rel_index` / `graph`.
 fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
     let (rows, buckets, span) = (a.u("rows")?, a.u("buckets")?, a.u("span")? as i64);
     let cols = a.u_or("cols", rows)?;
@@ -701,7 +703,23 @@ fn log_bucket_rel_index(a: &Args) -> Result<Gen, String> {
             v.push((bucket + span).clamp(0, 2 * span - 1) as u32);
         }
     }
-    u32s(vec![rows, cols], v)
+    let Some(heads) = a.get("heads").map(|_| a.u("heads")).transpose()? else {
+        return u32s(vec![rows, cols], v);
+    };
+    let by_key = match a.s_or("by", "query")? {
+        "query" => false,
+        "key" => true,
+        b => return Err(bad("by", b)),
+    };
+    let span2 = 2 * span as u32;
+    let mut idx = Vec::with_capacity(heads * v.len());
+    for h in 0..heads {
+        for (t, &r) in v.iter().enumerate() {
+            let row = if by_key { h * cols + t % cols } else { h * rows + t / cols };
+            idx.push(row as u32 * span2 + r);
+        }
+    }
+    u32s(vec![heads, rows, cols], idx)
 }
 
 /// `causal_key_mask`: F32 `[cap]`, 0 for keys `j <= pos`, else `masked` (default -inf).
@@ -876,6 +894,9 @@ mod tests {
             u("log_bucket_rel_index", json!({"rows": 6, "cols": 1, "buckets": 4, "max_relative": 8, "span": 8})),
             [8, 9, 10, 11, 11, 11]
         );
+        let rel = |by| u("log_bucket_rel_index", json!({"rows": 2, "buckets": 0, "span": 2, "heads": 2, "by": by}));
+        assert_eq!(rel("query"), [2, 1, 7, 6, 10, 9, 15, 14]);
+        assert_eq!(rel("key"), [2, 5, 3, 6, 10, 13, 11, 14]);
         assert_eq!(f("causal_key_mask", json!({"cap": 3, "pos": 1})), [0.0, 0.0, f32::NEG_INFINITY]);
         assert_eq!(u("channel_dup_index", json!({"channels": 2, "repeats": 2, "frames": 1})), [0, 0, 1, 1, 2, 2, 3, 3]);
         assert_eq!(f("ones", json!({"shape": [2]})), [1.0, 1.0]);
@@ -910,26 +931,6 @@ mod tests {
                 assert_eq!(bits(&f("rope_inv_freq", args.clone())), bits(&want), "{p}");
                 if kind == "yarn" {
                     assert_eq!(f("yarn_attention_factor", args)[0].to_bits(), attn.to_bits());
-                }
-            }
-            // ModernBERT (f32): default and yarn.
-            for (cfg, d) in [
-                (json!({"global_rope_theta": 160000.0}), 64),
-                (json!({"max_position_embeddings": 8192, "rope_scaling": {"rope_type": "yarn", "rope_theta": 160000.0,
-                        "original_max_position_embeddings": 1024.0, "mscale": 1.0, "mscale_all_dim": 0.5}}), 64),
-            ] {
-                let (want, attn) = model::classifier::modernbert::rope_inv_freq(&cfg, "full_attention", d).unwrap();
-                let yarn = !cfg["rope_scaling"].is_null();
-                let args = if yarn {
-                    json!({"dim": d, "theta": 160000.0, "kind": "yarn", "precision": "f32", "factor": 8.0,
-                           "original_max_position_embeddings": 1024.0})
-                } else {
-                    json!({"dim": d, "theta": 160000.0, "precision": "f32"})
-                };
-                assert_eq!(bits(&f("rope_inv_freq", args)), bits(&want), "{cfg}");
-                if yarn {
-                    let a = f("yarn_attention_factor", json!({"factor": 8.0, "mscale": 1.0, "mscale_all_dim": 0.5}));
-                    assert_eq!(a[0].to_bits(), attn.to_bits());
                 }
             }
             // gemma4: default (with factor) and proportional.
@@ -1007,6 +1008,49 @@ mod tests {
                 .flat_map(|i| [s(t as f64 * 1000.0, 16), s(0.0, 16), s(i as f64 * 1000.0, 32)].concat())
                 .collect();
             let got = f("modulation_index_rows", json!({"t": t as f64, "rows": 3, "dims": [16, 16, 32], "scale": 1000.0}));
+            assert_eq!(bits(&got), bits(&want));
+        }
+
+        /// The `sd` spec's generated inputs: the LCM guidance embedding (`sd.rs`
+        /// `guidance_embedding`) and SDXL's 6 time-id embeddings (`unet.rs` `timestep_embedding`
+        /// per id), old formulas inlined.
+        #[test]
+        fn sd_embeddings_match_sources() {
+            // `sd.rs` `guidance_embedding`, verbatim; `black_box` keeps LLVM from folding the
+            // sin/cos of constants at compile time (an ulp off the runtime libm).
+            #[inline(never)]
+            fn guidance_embedding(w: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let w = w * 1000.0;
+                let f = |i: usize| (-(10000f32.ln()) * i as f32 / (half as f32 - 1.0)).exp();
+                let mut e: Vec<f32> = (0..half).map(|i| (w * f(i)).sin()).collect();
+                e.extend((0..half).map(|i| (w * f(i)).cos()));
+                e.resize(dim, 0.0);
+                e
+            }
+            let (w, dim) = (6.5f32, 16usize);
+            let want = guidance_embedding(std::hint::black_box(w), dim);
+            let got = f("timestep_embedding", json!({"t": w as f64 * 1000.0, "dim": dim,
+                "flip_sin_to_cos": false, "downscale_freq_shift": 1, "precision": "f32"}));
+            assert_eq!(bits(&got), bits(&want));
+
+            let ids = [1024.0f32, 768.0, 0.0, 0.0, 1024.0, 768.0];
+            // `unet.rs` `timestep_embedding`, verbatim.
+            #[inline(never)]
+            fn timestep_embedding(t: f32, dim: usize) -> Vec<f32> {
+                let half = dim / 2;
+                let mut emb = vec![0.0f32; dim];
+                for i in 0..half {
+                    let freq = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+                    let arg = t * freq;
+                    emb[i] = arg.cos();
+                    emb[half + i] = arg.sin();
+                }
+                emb
+            }
+            let want: Vec<f32> =
+                std::hint::black_box(ids).iter().flat_map(|&t| timestep_embedding(t, 256)).collect();
+            let got = f("timestep_embedding", json!({"t": ids, "dim": 256, "precision": "f32"}));
             assert_eq!(bits(&got), bits(&want));
         }
 

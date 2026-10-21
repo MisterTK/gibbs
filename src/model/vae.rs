@@ -650,4 +650,39 @@ mod tests {
         let e = rel_err(&gpu, &cpu);
         assert!(e < 1e-3, "encode rel err {e}");
     }
+
+    /// The `sd_vae` spec on a config-less LDM checkpoint (`first_stage_model.*`, 2 levels, 1x1-conv
+    /// attention) matches the native CPU decoder/encoder, with the latent affine on the host.
+    #[test]
+    fn ldm_spec_matches_native() {
+        use crate::arch::expr::Val;
+        use crate::graph::Tensor;
+        use crate::hardware::{Device, PlacementMode};
+        use crate::model::diff_graph::testutil::{rel_err, synth, write_st, Lcg};
+        use crate::runtime::diffusion::{unconsumed, Net};
+        let r = synth(&crate::model::diff_fixtures::vae_specs(4), 7);
+        let d = tempfile::tempdir().unwrap();
+        write_st(&d.path().join("diffusion_pytorch_model.safetensors"), &r);
+        let vae = SdVae::from_ldm(&Tensors::from_reader(&r).unwrap()).unwrap();
+        let cpu = PlacementMode::Pin(Device::Cpu);
+        let de = Net::open(d.path(), "sd_vae", "decoder", cpu).unwrap();
+        let en = Net::new(de.model.clone(), "encoder", cpu);
+        let var = |n: &str| de.model.env.var(n).unwrap().num().unwrap() as f32;
+        let (scale, shift) = (var("scaling"), var("shift"));
+        assert_eq!((scale, shift, var("factor")), (SCALE, 0.0, 2.0));
+        let hw = |h: usize, w: usize| [("h", Val::Num(h as f64)), ("w", Val::Num(w as f64))];
+
+        let z = Lcg(3).vec(4 * 6 * 5, 1.0);
+        let zs = z.iter().map(|v| v / scale + shift).collect();
+        let got = de.run_one(&hw(6, 5), &[("z", Tensor::F32(zs))], &[], None).unwrap();
+        let e = rel_err(&got, &vae.decode_cpu(&z, 6, 5).unwrap().0);
+        assert!(e < 1e-4, "decode rel err {e}");
+
+        let img = Lcg(5).vec(3 * 16 * 24, 1.0);
+        let m = en.run_one(&hw(8, 12), &[("image", Tensor::F32(img.clone()))], &[], None).unwrap();
+        let got: Vec<f32> = m.iter().map(|v| (v - shift) * scale).collect();
+        let e = rel_err(&got, &vae.encode_cpu(img, 16, 24).unwrap().0);
+        assert!(e < 1e-4, "encode rel err {e}");
+        assert_eq!(unconsumed(&de.model, &[&de, &en], &[]), Vec::<String>::new());
+    }
 }
