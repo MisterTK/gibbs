@@ -148,8 +148,8 @@ kernel void conv_igemm(device const float* x [[buffer(0)]],
     threadgroup int4 ktab[BK];      // (channel, tap offset d/h/w) of each k in the step; channel -1 = past K
 #if defined(GIBBS_MPP)
     constexpr uint AS = BK, BS = BK;
-    threadgroup half as[T * AS];    // [m][k]
-    threadgroup half bs[T * BS];    // [s][k]
+    threadgroup float as[T * AS];   // [m][k]
+    threadgroup float bs[T * BS];   // [s][k]
     auto tA_proto = tensor(as, dextents<int32_t, 2>(int(BK), int(T)), array<int, 2>({1, int(AS)}));
     auto tB_proto = tensor(bs, dextents<int32_t, 2>(int(BK), int(T)), array<int, 2>({1, int(BS)}));
     constexpr auto desc = matmul2d_descriptor(
@@ -176,14 +176,14 @@ kernel void conv_igemm(device const float* x [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = tid; e < T * BK; e += 128) {
             uint r = e / BK, kk = e % BK;
-            as[r * AS + kk] = (m0 + r < p.out_c && k0 + kk < p.K) ? half(w[(ulong)(m0 + r) * p.K + k0 + kk]) : half(0.0h);
+            as[r * AS + kk] = (m0 + r < p.out_c && k0 + kk < p.K) ? w[(ulong)(m0 + r) * p.K + k0 + kk] : 0.0f;
             uint kb = e / T;
             int4 t = ktab[kb];
-            half v = half(0.0h);
+            float v = 0.0f;
             if (pv && t.x >= 0) {
                 int id = id0 + t.y, ih = ih0 + t.z, iw = iw0 + t.w;
                 if (uint(id) < p.in_d && uint(ih) < p.in_h && uint(iw) < p.in_w)
-                    v = half(xb[(((ulong)t.x * p.in_d + uint(id)) * p.in_h + uint(ih)) * p.in_w + uint(iw)]);
+                    v = xb[(((ulong)t.x * p.in_d + uint(id)) * p.in_h + uint(ih)) * p.in_w + uint(iw)];
             }
             bs[cb * BS + kb] = v;
         }
