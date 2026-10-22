@@ -250,6 +250,17 @@ pub fn load(
     family: Option<&str>,
     mode: PlacementMode,
 ) -> Result<Arc<dyn NativeLm>, String> {
+    load_with_ctx(artifacts, reg, family, mode, None)
+}
+
+/// [`load`] with an explicit `--ctx` override (`runtime.ctx`).
+pub fn load_with_ctx(
+    artifacts: &ModelArtifacts,
+    reg: &Registry,
+    family: Option<&str>,
+    mode: PlacementMode,
+    ctx: Option<usize>,
+) -> Result<Arc<dyn NativeLm>, String> {
     let on_metal = match mode {
         PlacementMode::Pin(d) => d == Device::Metal,
         PlacementMode::Auto => crate::hardware::default_device() == Device::Metal,
@@ -259,7 +270,12 @@ pub fn load(
         || {
             Some(
                 crate::arch::load::load(artifacts, reg, family)
-                    .and_then(|m| SpecLm::new(m, mode))
+                    .and_then(|m| {
+                        if let Some(c) = ctx {
+                            m.env.set_ctx(c.into());
+                        }
+                        SpecLm::new(m, mode)
+                    })
                     .map(|m| Arc::new(m) as Arc<dyn NativeLm>),
             )
         },

@@ -41,7 +41,7 @@
     residual_mult: "1",
     logit_scale: "1",
     head_w: "has('lm_head.weight') ? 'lm_head' : 'model.embed_tokens'",
-    // Context the KV states hold: the runner's, else the model's capped at 4096.
+    // Context the KV states hold: `--ctx` (`runtime.ctx`), else the model's capped at 4096.
     ctx: "first(runtime.ctx, min(first(cfg.max_position_embeddings, gguf.context_length, 2048), 4096))",
     // BitNet b1.58 BitLinear (hf_loader `HfConfigJson::bitnet`): int8 activations; online masters
     // ternarize at load.
@@ -146,7 +146,7 @@
     },
   },
   runtime: {
-    prefill_rows: 64, ffn_weights: ["model.layers.*.mlp.*"], seqcls: {head: "score", pooling: "last_nonpad"},
+    ffn_weights: ["model.layers.*.mlp.*"], seqcls: {head: "score", pooling: "last_nonpad"},
     synthetic_architecture: "LlamaForCausalLM",
     untied_default_types: ["llama", "qwen2", "mistral"],
     synthetic_presets: [

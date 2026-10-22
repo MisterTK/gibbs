@@ -1,0 +1,20 @@
+// Shared Qwen-Image 1 / 2.1 DiT config, ComfyUI/GGUF prefix rule, and constants.
+{
+  names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
+  config: {
+    // The transformer component (the pipeline root, which loads this spec too, has no tensors).
+    is_denoiser: "has('img_in.weight')",
+    dim: "shape('img_in.weight')[0]",
+    in_ch: "shape('img_in.weight')[1]",
+    head_dim: "shape('transformer_blocks.0.attn.norm_q.weight')[0]",
+    heads: "dim // head_dim",
+    layers: "count('transformer_blocks.{k}.attn.to_q.weight')",
+    axes: "first(cfg.axes_dims_rope, [16, 56, 56])",
+    eps: "1e-6",
+  },
+  constants: {
+    "rope.inv_freq": {when: "is_denoiser", gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
+    one: {when: "is_denoiser", gen: "fill", args: {shape: [1], value: 1}},
+    "ones.dim": {when: "is_denoiser", gen: "ones", args: {shape: ["dim"]}},
+  },
+}

@@ -143,6 +143,7 @@ fn load_lm(dir: &Path, dev: Device, family: Option<&str>) -> ExecutableModel {
         hw: &HardwareCapability::default(),
         reencode,
         family,
+        ctx: None,
         stage: &|_| {},
         system1_first: false,
         admit: &|_| Ok(()),

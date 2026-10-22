@@ -318,21 +318,13 @@ impl Picker {
             }
             KeyCode::Char('r') if !ctrl && self.query.is_empty() => {
                 let mut s = crate::tui::settings::load_settings();
-                s.reencode = match s.reencode.as_str() {
-                    "max-speed" => "low-bit-native".into(),
-                    "low-bit-native" => "bit-exact".into(),
-                    _ => "max-speed".into(),
-                };
+                s.reencode = s.reencode.next();
                 let _ = crate::tui::settings::save_settings(&s);
                 return PickerAction::Reload("reencode");
             }
             KeyCode::Char('f') if !ctrl && self.query.is_empty() => {
                 let mut s = crate::tui::settings::load_settings();
-                s.variant = match s.variant.as_str() {
-                    "fastest" => "fastest-4bit".into(),
-                    "fastest-4bit" => "best-quality".into(),
-                    _ => "fastest".into(),
-                };
+                s.variant = s.variant.next();
                 let _ = crate::tui::settings::save_settings(&s);
                 self.refilter();
                 return PickerAction::Reload("variant");
@@ -1651,7 +1643,6 @@ fn parse_hub_rows(
                 .then(|| crate::model::hub::MMPROJ_ONLY.to_string());
             let blocker = gguf_draft
                 .or(gguf_projector)
-                .or_else(|| gguf_moe_blocker(m, &id, &tags))
                 .or_else(|| pipeline_blocker(m).filter(|_| draft_for.is_none()))
                 .or_else(|| quant_blocker(m))
                 .or_else(|| split_gguf_blocker(m, &selection))
@@ -1941,20 +1932,6 @@ fn gguf_lm_archs() -> Vec<String> {
     crate::arch::registry().map_or_else(|_| Vec::new(), |r| r.causal_lm_gguf_archs())
 }
 
-/// Sparse MoE GGUFs whose family spec declares `runtime.gguf_moe_blocker`.
-fn gguf_moe_blocker(m: &Value, id: &str, tags: &[&str]) -> Option<String> {
-    // ponytail: a naming convention; the hub's metadata carries no expert count.
-    let a = m["gguf"]["architecture"].as_str()?;
-    let msg = crate::arch::registry().ok()?.gguf_moe_blocker(a)?;
-    let active = |s: &str| {
-        s.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
-            w.strip_prefix(['A', 'a'])
-                .and_then(|d| d.strip_suffix(['B', 'b']))
-                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-        })
-    };
-    (active(id) || tags.iter().any(|t| t.starts_with("base_model:") && active(t))).then_some(msg)
-}
 
 /// Split GGUF sets (`-00001-of-00003.gguf`, read as one weight set by every GGUF loader) of an
 /// architecture no loader runs: the reason names it (typically huge MoE / DSA models).
@@ -2315,11 +2292,10 @@ mod tests {
                 gguf_lm_archs().join(", ")
             )
         );
-        // Gemma 4 GGUFs load (text + mmproj), tagged image-text-to-text or any-to-any; the sparse
-        // 26B-A4B and projector-only repos say why not.
+        // Gemma 4 GGUFs load (text + mmproj), tagged image-text-to-text or any-to-any; projector-only
+        // repos say why not.
         assert_eq!(blocker("c/gemma4-gguf"), "");
         assert_eq!(blocker("g/gemma-4-E2B-any-GGUF"), "");
-        assert!(blocker("g/gemma-4-26B-A4B-it-GGUF").starts_with("Gemma 4 MoE GGUF"));
         assert_eq!(
             blocker("g/gemma-4-E2B-mmproj"),
             crate::model::hub::MMPROJ_ONLY

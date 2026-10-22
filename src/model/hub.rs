@@ -751,7 +751,8 @@ pub fn select_weight_files(
     let mut sets: Vec<WeightSet> = Vec::new();
     let mut problem = None;
     let size_of = |p: &str| files.iter().find(|f| f.path == p).and_then(|f| f.size);
-    let policy = crate::model::variant::reencode_policy();
+    let policy = crate::model::weight_format::ReencodeConfig::effective().policy;
+    let variant = crate::model::variant::variant_policy();
     // ponytail: ComfyUI packaging (`comfyui/` workflows or `text_encoders/` beside root GGUFs) ships
     // the same diffusion transformer again as root fp8 / int8 / NVFP4 / MLX / LoRA safetensors, in
     // forms no loader reads; those never compete with the GGUFs. Upgrade: read the Hub's GGUF arch.
@@ -792,7 +793,7 @@ pub fn select_weight_files(
                 continue;
             };
             let bytes: Option<u64> = members.iter().map(|m| size_of(m)).sum();
-            let rank = hub_rank(q, bytes, policy);
+            let rank = hub_rank(q, bytes, policy, variant);
             sets.push(WeightSet {
                 files: members,
                 tier: 0,
@@ -832,7 +833,7 @@ pub fn select_weight_files(
                 files: vec![p],
                 tier: 0,
                 // SD repos ship `*-inpainting.safetensors` beside the text-to-image checkpoint.
-                rank: hub_rank(q, bytes, policy)
+                rank: hub_rank(q, bytes, policy, variant)
                     + if lower.contains("inpaint") { 1e6 } else { 0.0 },
                 matches: Box::new(move |eq| quant_matches(eq, q, p)),
             });
@@ -875,7 +876,7 @@ pub fn select_weight_files(
                 files: members,
                 tier,
                 rank: if tier == 0 {
-                    hub_rank(q, bytes, policy)
+                    hub_rank(q, bytes, policy, variant)
                 } else {
                     bytes.unwrap_or(0) as f64
                 },
@@ -1369,9 +1370,7 @@ impl HuggingFaceHub {
             PathBuf::from(".cache/huggingface/hub")
         };
 
-        let explicit_quant = std::env::var("GIBBS_QUANT")
-            .or_else(|_| std::env::var("FOUNDRY_QUANT"))
-            .ok();
+        let explicit_quant = std::env::var("GIBBS_QUANT").ok();
 
         Self {
             cache_root: cache_root.clone(),
@@ -1390,9 +1389,7 @@ impl HuggingFaceHub {
 
     /// Creates a hub instance with an explicit cache directory.
     pub fn with_cache_dir(dir: PathBuf) -> Self {
-        let explicit_quant = std::env::var("GIBBS_QUANT")
-            .or_else(|_| std::env::var("FOUNDRY_QUANT"))
-            .ok();
+        let explicit_quant = std::env::var("GIBBS_QUANT").ok();
         Self {
             cache_root: dir.clone(),
             max_param_budget: DEFAULT_MAX_PARAM_BUDGET,
@@ -2796,6 +2793,16 @@ mod tests {
             select_weight_files(&names(&["mmproj-a-F16.gguf"]), None).unwrap_err(),
             MMPROJ_ONLY
         );
+        let mixed = names(&["m-Q2_K.gguf", "m-Q4_K_M.gguf", "m-Q8_0.gguf"]);
+        crate::model::variant::set_policy_override(Some(
+            crate::model::weight_format::VariantPolicy::Fastest4Bit,
+        ));
+        assert_ne!(select_weight_files(&mixed, None).unwrap(), ["m-Q2_K.gguf"]);
+        crate::model::variant::set_policy_override(Some(
+            crate::model::weight_format::VariantPolicy::BestQuality,
+        ));
+        assert_eq!(select_weight_files(&mixed, None).unwrap(), ["m-Q8_0.gguf"]);
+        crate::model::variant::set_policy_override(None);
 
         // Size variants share a tensor format; an explicit size never yields a sibling size.
         let iq = names(&["m-IQ3_M.gguf", "m-IQ3_XS.gguf"]);

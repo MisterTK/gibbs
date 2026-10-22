@@ -829,30 +829,20 @@ impl TuiApp {
     /// `/reencode [policy]`: the named policy, else the next one in the cycle. It is saved to the
     /// settings file and the loaded model is reloaded under it.
     fn set_reencode(&mut self, policy: Option<ReencodePolicy>) -> Result<String, String> {
-        use ReencodePolicy as R;
-        let next = policy.unwrap_or(match self.reencode_policy {
-            R::MaxSpeed => R::LowBitNative,
-            R::LowBitNative => R::BitExact,
-            R::BitExact => R::MaxSpeed,
-        });
+        let next = policy.unwrap_or_else(|| self.reencode_policy.next());
         self.reencode_policy = next;
         let mut s = settings::load_settings();
-        s.reencode = next.name().to_string();
+        s.reencode = next;
         settings::save_settings(&s)?;
         Ok(self.reload_for("reencode", next.name()))
     }
 
     /// `/variant [policy]`: as [`Self::set_reencode`], for the variant policy.
     fn set_variant(&mut self, policy: Option<VariantPolicy>) -> Result<String, String> {
-        use VariantPolicy as V;
-        let next = policy.unwrap_or(match self.variant_policy {
-            V::Fastest => V::Fastest4Bit,
-            V::Fastest4Bit => V::BestQuality,
-            V::BestQuality => V::Fastest,
-        });
+        let next = policy.unwrap_or_else(|| self.variant_policy.next());
         self.variant_policy = next;
         let mut s = settings::load_settings();
-        s.variant = next.name().to_string();
+        s.variant = next;
         settings::save_settings(&s)?;
         Ok(self.reload_for("variant", next.name()))
     }
@@ -1414,6 +1404,7 @@ impl TuiApp {
                     hw: &hw,
                     reencode: reencode_cfg.clone(),
                     family: None,
+                    ctx: None,
                     stage: &|s| *stage.lock() = s,
                     // Only text generators (and PEFT adapters of them) and image models hot-swap.
                     system1_first: false,
@@ -1927,30 +1918,10 @@ impl TuiApp {
             match key.code {
                 KeyCode::Esc | KeyCode::F(4) => self.show_settings_modal = false,
                 KeyCode::Char('1') => {
-                    self.reencode_policy = match self.reencode_policy {
-                        crate::model::weight_format::ReencodePolicy::MaxSpeed => {
-                            crate::model::weight_format::ReencodePolicy::LowBitNative
-                        }
-                        crate::model::weight_format::ReencodePolicy::LowBitNative => {
-                            crate::model::weight_format::ReencodePolicy::BitExact
-                        }
-                        crate::model::weight_format::ReencodePolicy::BitExact => {
-                            crate::model::weight_format::ReencodePolicy::MaxSpeed
-                        }
-                    };
+                    self.reencode_policy = self.reencode_policy.next();
                 }
                 KeyCode::Char('2') => {
-                    self.variant_policy = match self.variant_policy {
-                        crate::model::weight_format::VariantPolicy::Fastest => {
-                            crate::model::weight_format::VariantPolicy::Fastest4Bit
-                        }
-                        crate::model::weight_format::VariantPolicy::Fastest4Bit => {
-                            crate::model::weight_format::VariantPolicy::BestQuality
-                        }
-                        crate::model::weight_format::VariantPolicy::BestQuality => {
-                            crate::model::weight_format::VariantPolicy::Fastest
-                        }
-                    };
+                    self.variant_policy = self.variant_policy.next();
                 }
                 KeyCode::Char('3') => {
                     self.show_roofline_hud = !self.show_roofline_hud;
@@ -1972,18 +1943,14 @@ impl TuiApp {
                 PickerAction::Reload(what) => {
                     // The picker saved the setting; follow it and reload the loaded model under it.
                     let s = settings::load_settings();
-                    if let Ok(p) = s.reencode.parse() {
-                        self.reencode_policy = p;
-                    }
-                    if let Ok(p) = s.variant.parse() {
-                        self.variant_policy = p;
-                    }
+                    self.reencode_policy = s.reencode;
+                    self.variant_policy = s.variant;
                     let value = if what == "reencode" {
-                        s.reencode
+                        s.reencode.name()
                     } else {
-                        s.variant
+                        s.variant.name()
                     };
-                    let note = self.reload_for(what, &value);
+                    let note = self.reload_for(what, value);
                     self.picker.set_note(note, theme::Token::Jade);
                 }
                 PickerAction::AttachDraft(id) => {
@@ -2925,7 +2892,7 @@ mod tests {
             .output
             .contains("reencode -> low-bit-native; applies to the next load"));
         let s = crate::tui::settings::load_settings();
-        assert_eq!(s.reencode, "low-bit-native");
+        assert_eq!(s.reencode.name(), "low-bit-native");
 
         // 2. /variant slash command
         app.input = "/variant fastest-4bit".into();
@@ -2941,20 +2908,20 @@ mod tests {
             .output
             .contains("variant -> fastest-4bit; applies to the next load"));
         let s = crate::tui::settings::load_settings();
-        assert_eq!(s.variant, "fastest-4bit");
+        assert_eq!(s.variant.name(), "fastest-4bit");
 
         // 3. Picker 'r' and 'f' keys
         app.handle_key(key(KeyCode::Char('m')));
         app.handle_key(key(KeyCode::Char('r')));
         let s = crate::tui::settings::load_settings();
         // From the low-bit-native set above: one step on is bit-exact, saved and followed by the app.
-        assert_eq!(s.reencode, "bit-exact");
-        assert_eq!(app.reencode_policy.name(), s.reencode);
+        assert_eq!(s.reencode.name(), "bit-exact");
+        assert_eq!(app.reencode_policy, s.reencode);
 
         app.handle_key(key(KeyCode::Char('f')));
         let s = crate::tui::settings::load_settings();
-        assert_eq!(s.variant, "best-quality");
-        assert_eq!(app.variant_policy.name(), s.variant);
+        assert_eq!(s.variant.name(), "best-quality");
+        assert_eq!(app.variant_policy, s.variant);
     }
 
     /// A tiny synthetic model loaded offline into a fresh app.

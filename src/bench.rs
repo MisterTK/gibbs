@@ -173,6 +173,7 @@ pub fn load_for_bench(
             hw: &crate::hardware::HardwareCapability::probe_system(),
             reencode: cfg,
             family: None,
+            ctx: None,
             stage: &|_| {},
             system1_first: false,
             admit: &|_| Ok(()),
@@ -490,6 +491,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                         ..Default::default()
                     },
                     family: None,
+                    ctx: None,
                     stage: &|_| {},
                     admit: &|_| Ok(()),
                     system1_first: true,
@@ -592,6 +594,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                         ..Default::default()
                     },
                     family: None,
+                    ctx: None,
                     stage: &|_| {},
                     admit: &|_| Ok(()),
                     system1_first: true,
@@ -722,6 +725,7 @@ pub fn run_bench_parity(path: &str) -> Result<i32, String> {
                 hw: &hw,
                 reencode: crate::model::weight_format::ReencodeConfig::effective(),
                 family: None,
+                ctx: None,
                 stage: &|_| {},
                 system1_first: false,
                 admit: &|_| Ok(()),

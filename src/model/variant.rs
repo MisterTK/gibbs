@@ -413,37 +413,58 @@ pub fn rank_variants(policy: VariantPolicy, ram: u64, v: &mut [Variant]) -> usiz
 /// Sort key for a default download plan (ascending = preferred) from a file's format and size alone:
 /// predicted speed in 5% steps, then smaller bytes first. A size under 1 MiB is a placeholder, not a
 /// checkpoint, and counts as unknown.
-pub fn hub_rank(fmt: Q, bytes: Option<u64>, policy: ReencodePolicy) -> f64 {
+pub fn hub_rank(
+    fmt: Q,
+    bytes: Option<u64>,
+    reencode: ReencodePolicy,
+    variant: VariantPolicy,
+) -> f64 {
     let bytes = bytes.filter(|&b| b >= 1 << 20);
-    let v = Variant::from_size("", fmt, bytes, policy, 1.0);
+    let v = Variant::from_size("", fmt, bytes, reencode, 1.0);
     let step = (v.tok_s.ln() / 1.05f64.ln()).round();
-    -step + bytes.unwrap_or_else(|| fmt.tensor_bytes(NOMINAL_PARAMS as usize) as u64) as f64 / 1e13
+    let base = -step
+        + bytes.unwrap_or_else(|| fmt.tensor_bytes(NOMINAL_PARAMS as usize) as u64) as f64 / 1e13;
+    match variant {
+        VariantPolicy::Fastest => base,
+        VariantPolicy::Fastest4Bit => base + if v.bpw < 4.0 { 1e6 } else { 0.0 },
+        VariantPolicy::BestQuality => -v.bpw * 1e6 + base,
+    }
 }
 
+#[cfg(not(test))]
 static POLICY_OVERRIDE: RwLock<Option<VariantPolicy>> = RwLock::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_POLICY_OVERRIDE: std::cell::Cell<Option<VariantPolicy>> = const { std::cell::Cell::new(None) };
+}
 
 /// Pins the variant policy (`--variant`) over the settings file; `None` returns to it.
 pub fn set_policy_override(p: Option<VariantPolicy>) {
-    *POLICY_OVERRIDE.write() = p;
+    #[cfg(test)]
+    TEST_POLICY_OVERRIDE.with(|t| t.set(p));
+    #[cfg(not(test))]
+    {
+        *POLICY_OVERRIDE.write() = p;
+    }
 }
 
 /// The `--variant` override, else `variant` of `~/.cache/gibbs/settings.json`.
 pub fn variant_policy() -> VariantPolicy {
+    #[cfg(test)]
+    if let Some(p) = TEST_POLICY_OVERRIDE.with(|t| t.get()) {
+        return p;
+    }
+    #[cfg(not(test))]
     if let Some(p) = *POLICY_OVERRIDE.read() {
         return p;
     }
-    crate::tui::settings::load_settings()
-        .variant
-        .parse()
-        .unwrap_or_default()
+    crate::tui::settings::load_settings().variant
 }
 
-/// `reencode` of `~/.cache/gibbs/settings.json`.
+/// The `--reencode` override, else `reencode` of `~/.cache/gibbs/settings.json`.
 pub fn reencode_policy() -> ReencodePolicy {
-    crate::tui::settings::load_settings()
-        .reencode
-        .parse()
-        .unwrap_or_default()
+    crate::model::weight_format::ReencodeConfig::effective().policy
 }
 
 const FIRST_FETCH: u64 = 16 << 20;
@@ -730,12 +751,21 @@ mod tests {
     fn size_fallback_orders_by_format_and_bytes() {
         with_unmeasured_host(|| {
             let p = ReencodePolicy::MaxSpeed;
-            let rank = |f, b| hub_rank(f, b, p);
+            let vp = VariantPolicy::Fastest;
+            let rank = |f, b| hub_rank(f, b, p, vp);
             assert!(rank(Q::GGUF_Q2_K, None) < rank(Q::GGUF_Q4_K_M, None));
             // Q8_0 re-encodes to Q4_K under max-speed: a tie broken by download size.
             // 8e9 params: Q4_K_M 4.5e9 B, Q8_0 8.5e9 B (4.5e9 B once re-encoded).
             assert!(
                 rank(Q::GGUF_Q4_K_M, Some(4_500_000_000)) < rank(Q::GGUF_Q8_0, Some(8_500_000_000))
+            );
+            assert!(
+                hub_rank(Q::GGUF_Q4_K_M, None, p, VariantPolicy::Fastest4Bit)
+                    < hub_rank(Q::GGUF_Q2_K, None, p, VariantPolicy::Fastest4Bit)
+            );
+            assert!(
+                hub_rank(Q::GGUF_Q8_0, None, p, VariantPolicy::BestQuality)
+                    < hub_rank(Q::GGUF_Q4_K_M, None, p, VariantPolicy::BestQuality)
             );
             let a = Variant::from_size("a", Q::GGUF_Q4_0, Some(1 << 30), p, 300.0);
             assert!(a.tok_s > 0.0 && a.resident_bytes <= 1 << 30);

@@ -4,10 +4,9 @@
 {
   family: "ldm_openclip",
   extends: "clip_text",
+  use_lib: ["transformer", "ldm"],
   config: {layers: "count('text_model.encoder.layers.{k}.layer_norm1.weight') - 1"},
   names: {strip: ["cond_stage_model.model."]},
-  ignore: ["text_model.embeddings.position_ids", "logit_scale", "attn_mask",
-           "cond_stage_model.model.transformer.resblocks.23.*",
-           "model.diffusion_model.*", "first_stage_model.*", "model_ema.*",
-           "alphas_cumprod*", "betas", "log_one_minus_alphas_cumprod", "posterior_*", "sqrt_*", "logvar"],
+  "ignore+": ["cond_stage_model.model.transformer.resblocks.23.*",
+              "model.diffusion_model.*", "first_stage_model.*"],
 }

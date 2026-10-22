@@ -39,6 +39,7 @@ pub struct LoadOpts<'a> {
     pub reencode: ReencodeConfig,
     /// `--arch`: load this family spec, skipping detection.
     pub family: Option<&'a str>,
+    pub ctx: Option<usize>,
     /// Receives the stage the load is in, for progress text and failure records.
     pub stage: &'a dyn Fn(&'static str),
     /// Runs before any download of a repo no hub-level route took, with whether it is a PEFT
@@ -157,7 +158,7 @@ fn lm(a: &ModelArtifacts, o: &LoadOpts) -> Result<ExecutableModel, String> {
     (o.stage)("compiling + tuning kernels");
     let m = match reg.spec(&family, &ck.sig)?.pipeline {
         Pipeline::Encdec => crate::runtime::encdec::load(a, reg, Some(&family), o.placement)?,
-        _ => crate::runtime::lm::load(a, reg, Some(&family), o.placement)?,
+        _ => crate::runtime::lm::load_with_ctx(a, reg, Some(&family), o.placement, o.ctx)?,
     };
     Ok(ExecutableModel::new(m))
 }

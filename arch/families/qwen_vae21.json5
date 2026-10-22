@@ -6,25 +6,15 @@
 // diffusers class is shared with `qwen_vae`).
 {
   family: "qwen_vae21",
-  pipeline: "diffusion",
-  use_lib: ["vae"],
+  extends: "qwen_vae",
   config: {
-    z: "shape('post_quant_conv.weight')[0]",
-    levels: "count('decoder.up_blocks.{k}.resnets.0.conv1.weight')",
-    blocks: "count('decoder.up_blocks.0.resnets.{k}.conv1.weight')",
     temporal: "cfg.temperal_downsample",
   },
   checks: [
     {expr: "cfg.is_residual != true || cfg.patch_size != null", error: "Qwen-Image 2.1 VAE: only the residual, unpatched variant is supported"},
     {expr: "len(temporal) + 1 != levels", error: "vae config: temperal_downsample does not match the decoder levels"},
   ],
-  transforms: [
-    {tensor: "{n:*}.weight", op: "last_temporal_tap", when: "len(shape(fmt('{n}.weight'))) == 5"},
-    {tensor: "{n:*}.weight", op: "to_f32", when: "len(shape(fmt('{n}.weight'))) == 4"},
-    {tensor: "{n:*}.to_qkv.weight", op: "conv_to_linear"},
-    {tensor: "{n:*}.proj.weight", op: "conv_to_linear"},
-  ],
-  ignore: ["encoder.*", "quant_conv.*", "decoder.up_blocks.*.upsampler.time_conv.*"],
+  "ignore+": ["decoder.up_blocks.*.upsampler.time_conv.*"],
   macros: {
     // DupUp3D(first_chunk) of `x` [c_in, h, w] to [c_out, 2h, 2w] with temporal factor `ft`.
     wan_dup_up: {params: ["x"], body: [

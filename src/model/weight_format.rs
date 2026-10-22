@@ -10,9 +10,13 @@ use std::sync::Arc;
 /// Quality floor: largest mean KL divergence (nats) of a format's next-token distribution from
 /// the f32 one over the probe. Roughly where 6-bit block formats land; 4-bit ones exceed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReencodePolicy {
+    #[serde(alias = "maxspeed", alias = "speed", alias = "MaxSpeed")]
     MaxSpeed,
+    #[serde(alias = "lowbitnative", alias = "lowbit", alias = "LowBitNative")]
     LowBitNative,
+    #[serde(alias = "bitexact", alias = "exact", alias = "BitExact")]
     BitExact,
 }
 
@@ -24,6 +28,20 @@ impl ReencodePolicy {
             Self::LowBitNative => "low-bit-native",
             Self::BitExact => "bit-exact",
         }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::MaxSpeed => Self::LowBitNative,
+            Self::LowBitNative => Self::BitExact,
+            Self::BitExact => Self::MaxSpeed,
+        }
+    }
+}
+
+impl std::fmt::Display for ReencodePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -46,9 +64,13 @@ impl std::str::FromStr for ReencodePolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum VariantPolicy {
+    #[serde(alias = "fast", alias = "Fastest")]
     Fastest,
+    #[serde(rename = "fastest-4bit", alias = "fastest4bit", alias = "Fastest4Bit")]
     Fastest4Bit,
+    #[serde(alias = "bestquality", alias = "quality", alias = "BestQuality")]
     BestQuality,
 }
 
@@ -60,6 +82,20 @@ impl VariantPolicy {
             Self::Fastest4Bit => "fastest-4bit",
             Self::BestQuality => "best-quality",
         }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Fastest => Self::Fastest4Bit,
+            Self::Fastest4Bit => Self::BestQuality,
+            Self::BestQuality => Self::Fastest,
+        }
+    }
+}
+
+impl std::fmt::Display for VariantPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -130,7 +166,7 @@ impl ReencodeConfig {
     pub fn from_settings() -> Self {
         let s = crate::tui::settings::load_settings();
         Self {
-            policy: s.reencode.parse().unwrap_or_default(),
+            policy: s.reencode,
             max_kl: s.reencode_max_kl.map(f64::from),
             ..Self::default()
         }
