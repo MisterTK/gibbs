@@ -30,7 +30,6 @@ pub fn supports_op(op: &Op, _dtype: crate::graph::DType) -> bool {
         | Op::Binary { .. }
         | Op::Rope { .. }
         | Op::CachedAttention { .. }
-        | Op::PagedCachedAttention { .. }
         | Op::CausalConv1dCached { .. }
         | Op::DeltaRule { .. }
         | Op::Gather { .. }
@@ -936,103 +935,6 @@ pub fn run(
                                 {
                                     slots[j] = Some(Tensor::F32(buf.clone()));
                                 }
-                            }
-                        }
-                    }
-                }
-                out
-            }
-            Op::PagedCachedAttention {
-                heads,
-                kv_heads,
-                head_dim,
-                v_head_dim,
-                scale,
-                causal,
-                window,
-                soft_cap,
-                tokens_per_block,
-                max_blocks_per_seq,
-            } => {
-                let q = operand(&bound, &slots, ins, name, 0)?;
-                let k_pool = operand(&bound, &slots, ins, name, 1)?;
-                let v_pool = operand(&bound, &slots, ins, name, 2)?;
-                let block_table = operand_u32(&bound, &slots, ins, name, 3)?;
-                let pos_offset = if ins.len() >= 5 {
-                    operand_u32(&bound, &slots, ins, name, 4)
-                        .map(|p| p.first().copied().unwrap_or(0) as usize)
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                let hd = *head_dim;
-                let vhd = *v_head_dim;
-                let h = *heads;
-                let kvh = *kv_heads;
-                let rep = h / kvh.max(1);
-                let nq = q.len() / (h * hd).max(1);
-                let tpb = *tokens_per_block;
-                let max_blk = *max_blocks_per_seq;
-                let kv_dim = kvh * hd;
-
-                let mut out = vec![0.0f32; nq * h * vhd];
-                for qi in 0..nq {
-                    let current_pos = pos_offset + qi;
-                    let nk = current_pos + 1;
-                    for head in 0..h {
-                        let kv_head = head / rep;
-                        let q_vec = &q[qi * h * hd + head * hd..][..hd];
-                        let mut scores = Vec::with_capacity(nk);
-                        for ki in 0..nk {
-                            if *causal && ki > current_pos {
-                                scores.push(f32::NEG_INFINITY);
-                                continue;
-                            }
-                            if let Some(w) = window {
-                                if ki + *w <= current_pos {
-                                    scores.push(f32::NEG_INFINITY);
-                                    continue;
-                                }
-                            }
-                            let blk_idx = block_table[qi * max_blk + ki / tpb] as usize;
-                            let blk_offset = ki % tpb;
-                            let phys_idx = blk_idx * tpb + blk_offset;
-                            let k_vec = &k_pool[phys_idx * kv_dim + kv_head * hd..][..hd];
-                            let dot: f32 = q_vec.iter().zip(k_vec).map(|(&a, &b)| a * b).sum();
-                            let mut s = dot * scale;
-                            if let Some(cap) = soft_cap {
-                                s = cap * (s / cap).tanh();
-                            }
-                            scores.push(s);
-                        }
-                        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                        let mut sum_exp = 0.0f32;
-                        let mut weights = Vec::with_capacity(nk);
-                        for &s in &scores {
-                            if s == f32::NEG_INFINITY {
-                                weights.push(0.0f32);
-                            } else {
-                                let exp_val = (s - max_score).exp();
-                                sum_exp += exp_val;
-                                weights.push(exp_val);
-                            }
-                        }
-                        if sum_exp > 0.0 {
-                            for w in &mut weights {
-                                *w /= sum_exp;
-                            }
-                        }
-                        let out_slice = &mut out[qi * h * vhd + head * vhd..][..vhd];
-                        for (ki, &w) in weights.iter().enumerate() {
-                            if w == 0.0 {
-                                continue;
-                            }
-                            let blk_idx = block_table[qi * max_blk + ki / tpb] as usize;
-                            let blk_offset = ki % tpb;
-                            let phys_idx = blk_idx * tpb + blk_offset;
-                            let v_vec = &v_pool[phys_idx * kv_dim + kv_head * vhd..][..vhd];
-                            for (o, &val) in out_slice.iter_mut().zip(v_vec) {
-                                *o += w * val;
                             }
                         }
                     }

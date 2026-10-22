@@ -389,7 +389,6 @@ pub fn supports_op(op: &Op, dtype: DType) -> bool {
         | Op::GeGlu
         | Op::Attention { .. }
         | Op::CachedAttention { .. }
-        | Op::PagedCachedAttention { .. }
         | Op::Rope { .. }
         | Op::Slice { .. }
         | Op::CausalConv1dCached { .. }
@@ -470,7 +469,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 80] = [
+const BASE_KERNELS: [&str; 79] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -547,7 +546,6 @@ const BASE_KERNELS: [&str; 80] = [
     "attn_cached_gqa_split_f16_8",
     "attn_cached_gqa_split_f16_16",
     "attn_cached_merge_f32",
-    "paged_attn_cached_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
     "gemv_nvfp4",
@@ -3588,71 +3586,6 @@ impl Session {
                     );
                 }
             }
-            Step::PagedCachedAttention {
-                q,
-                k_pool,
-                v_pool,
-                block_table,
-                pos,
-                heads,
-                kv_heads,
-                head_dim,
-                v_head_dim: _,
-                scale,
-                window,
-                soft_cap,
-                tokens_per_block,
-                max_blocks_per_seq,
-                m,
-            } => {
-                let start_pos = if let Some(p_val) = pos {
-                    let (p_buf, p_off) = loc(p_val);
-                    unsafe { *((p_buf.contents() as *const u8).add(p_off) as *const u32) }
-                } else {
-                    0
-                };
-                let group = (heads / kv_heads.max(1)).max(1);
-                let stride = kv_heads * head_dim;
-
-                enc.set_compute_pipeline_state(rt.pso("paged_attn_cached_f32")?);
-                bind(0, q);
-                bind(1, k_pool);
-                bind(2, v_pool);
-                bind(3, block_table);
-                bind(4, s.out);
-                #[repr(C)]
-                struct PagedAttnCachedParams {
-                    n_heads: u32,
-                    head_dim: u32,
-                    stride: u32,
-                    group: u32,
-                    scale: f32,
-                    window: u32,
-                    softcap: f32,
-                    start_pos: u32,
-                    m: u32,
-                    tokens_per_block: u32,
-                    max_blocks_per_seq: u32,
-                }
-                let p = PagedAttnCachedParams {
-                    n_heads: heads as u32,
-                    head_dim: head_dim as u32,
-                    stride: stride as u32,
-                    group: group as u32,
-                    scale,
-                    window: window.unwrap_or(0) as u32,
-                    softcap: soft_cap.unwrap_or(0.0),
-                    start_pos,
-                    m: m as u32,
-                    tokens_per_block: tokens_per_block as u32,
-                    max_blocks_per_seq: max_blocks_per_seq as u32,
-                };
-                set_bytes(enc, 5, &p);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(heads as u64, m as u64, 1),
-                    MTLSize::new(TG4, 1, 1),
-                );
-            }
             Step::CausalConv1dCached {
                 x,
                 w,
@@ -4084,23 +4017,6 @@ pub enum Step {
         m: usize,
         /// The k/v state buffers hold f16 (set by `assign_kv_dtypes`).
         kv_f16: bool,
-    },
-    PagedCachedAttention {
-        q: ValueId,
-        k_pool: ValueId,
-        v_pool: ValueId,
-        block_table: ValueId,
-        pos: Option<ValueId>,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        v_head_dim: usize,
-        scale: f32,
-        window: Option<usize>,
-        soft_cap: Option<f32>,
-        tokens_per_block: usize,
-        max_blocks_per_seq: usize,
-        m: usize,
     },
     CausalConv1dCached {
         x: ValueId,
@@ -5074,56 +4990,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     m * *heads * *v_head_dim,
                 )
             }
-            Op::PagedCachedAttention {
-                heads,
-                kv_heads,
-                head_dim,
-                v_head_dim,
-                scale,
-                causal: _,
-                window,
-                soft_cap,
-                tokens_per_block,
-                max_blocks_per_seq,
-            } => {
-                let q = arg(0)?;
-                let k_pool = arg(1)?;
-                let v_pool = arg(2)?;
-                let block_table = arg(3)?;
-                let pos = if node.inputs.len() >= 5 {
-                    Some(arg(4)?)
-                } else {
-                    None
-                };
-                if (*head_dim).max(*v_head_dim) > ATTN_MAX_HEAD_DIM {
-                    return Err(format!(
-                        "node '{name}': head_dim {} exceeds the Metal kernel's {ATTN_MAX_HEAD_DIM}",
-                        (*head_dim).max(*v_head_dim)
-                    ));
-                }
-                let ql = n_of(q)?;
-                let m = ql / (*heads * *head_dim).max(1);
-                (
-                    Step::PagedCachedAttention {
-                        q,
-                        k_pool,
-                        v_pool,
-                        block_table,
-                        pos,
-                        heads: *heads,
-                        kv_heads: *kv_heads,
-                        head_dim: *head_dim,
-                        v_head_dim: *v_head_dim,
-                        scale: *scale,
-                        window: *window,
-                        soft_cap: *soft_cap,
-                        tokens_per_block: *tokens_per_block,
-                        max_blocks_per_seq: *max_blocks_per_seq,
-                        m,
-                    },
-                    m * *heads * *v_head_dim,
-                )
-            }
             Op::CausalConv1dCached { kernel, dilation } => {
                 let x = arg(0)?;
                 let w = arg(1)?;
@@ -5312,17 +5178,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .into_iter()
             .flatten()
             .collect(),
-            Step::PagedCachedAttention {
-                q,
-                k_pool,
-                v_pool,
-                block_table,
-                pos,
-                ..
-            } => [Some(q), Some(k_pool), Some(v_pool), Some(block_table), pos]
-                .into_iter()
-                .flatten()
-                .collect(),
             Step::CausalConv1dCached { x, w, state, .. } => {
                 [Some(x), Some(w), state].into_iter().flatten().collect()
             }
@@ -5379,9 +5234,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 Step::Rope { pos, .. } => v == *pos,
                 Step::RmsNorm { rope: Some(r), .. } => v == r.pos,
                 Step::CachedAttention { pos, vis, .. } => Some(v) == *pos || Some(v) == *vis,
-                Step::PagedCachedAttention {
-                    block_table, pos, ..
-                } => v == *block_table || Some(v) == *pos,
                 Step::MegakernelMlp {
                     gate_w,
                     up_w,
@@ -8510,47 +8362,6 @@ mod tests {
             assert!(rel_err(&want, &got) < 1e-4, "CachedAttention mismatch");
         }
 
-        // 3b. PagedCachedAttention
-        {
-            let mut g = Graph::new();
-            let q = g.input("q", vec![1, 4], DType::F32);
-            let k_pool = g.input("k_pool", vec![16, 4], DType::F32);
-            let v_pool = g.input("v_pool", vec![16, 4], DType::F32);
-            let block_table = g.input("block_table", vec![4], DType::U32);
-            let pos = g.input("pos", vec![1], DType::U32);
-            let y = g.add(
-                "paged_attn",
-                Op::PagedCachedAttention {
-                    heads: 1,
-                    kv_heads: 1,
-                    head_dim: 4,
-                    v_head_dim: 4,
-                    scale: 0.5,
-                    causal: true,
-                    window: None,
-                    soft_cap: None,
-                    tokens_per_block: 16,
-                    max_blocks_per_seq: 4,
-                },
-                &[q, k_pool, v_pool, block_table, pos],
-                vec![1, 4],
-                DType::F32,
-            );
-            g.output(y);
-            let mut k_data = vec![0.0f32; 16 * 4];
-            let mut v_data = vec![0.0f32; 16 * 4];
-            k_data[0..4].copy_from_slice(&[1.0, 0.0, 0.0, 0.0]);
-            v_data[0..4].copy_from_slice(&[0.5, 1.5, 2.5, 3.5]);
-            let inp = vec![
-                Tensor::F32(vec![1.0, 0.0, 0.0, 0.0]),
-                Tensor::F32(k_data),
-                Tensor::F32(v_data),
-                Tensor::U32(vec![0, 0, 0, 0]),
-                Tensor::U32(vec![0]),
-            ];
-            let (want, got) = both(&g, &Weights::new(), inp, None);
-            assert!(rel_err(&want, &got) < 1e-4, "PagedCachedAttention mismatch");
-        }
 
         // 4. CausalConv1dCached
         {

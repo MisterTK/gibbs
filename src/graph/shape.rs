@@ -164,12 +164,6 @@ pub fn infer(op: &Op, inputs: &[Operand]) -> Result<(Vec<usize>, DType), String>
             head_dim,
             v_head_dim,
             ..
-        }
-        | Op::PagedCachedAttention {
-            heads,
-            head_dim,
-            v_head_dim,
-            ..
         } => {
             need(3)?;
             if last(0) != heads * head_dim {

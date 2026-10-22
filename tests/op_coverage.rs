@@ -29,7 +29,6 @@ fn ordinal(op: &Op) -> usize {
         Op::Unary { .. } => 11,
         Op::Binary { .. } => 12,
         Op::CachedAttention { .. } => 13,
-        Op::PagedCachedAttention { .. } => 14,
         Op::CausalConv1dCached { .. } => 15,
         Op::DeltaRule { .. } => 16,
         Op::Gather { .. } => 17,
@@ -59,10 +58,10 @@ fn ordinal(op: &Op) -> usize {
         Op::Megakernel(_) => 40,
         Op::StateWrite => 42,
         Op::QsaSelect { .. } => 43,
-        Op::QsaBias { .. } => 44,
+        Op::QsaBias { .. } => 14,
     }
 }
-const VARIANTS: usize = 45;
+const VARIANTS: usize = 44;
 
 /// Key used in `KNOWN_UNLOWERED`: the op name, plus the kind for ops whose support varies by kind.
 fn key(op: &Op) -> String {
@@ -100,10 +99,6 @@ fn all_ops() -> Vec<Op> {
         Op::CachedAttention {
             heads: 2, kv_heads: 1, head_dim: 16, v_head_dim: 16, scale: 1.0,
             causal: true, window: Some(4), soft_cap: Some(30.0), write: true,
-        },
-        Op::PagedCachedAttention {
-            heads: 2, kv_heads: 1, head_dim: 16, v_head_dim: 16, scale: 1.0, causal: true,
-            window: None, soft_cap: None, tokens_per_block: 16, max_blocks_per_seq: 4,
         },
         Op::CausalConv1dCached { kernel: 4, dilation: 1 },
         Op::DeltaRule { key_heads: 2, val_heads: 2, key_dim: 16, val_dim: 16 },

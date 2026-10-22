@@ -264,21 +264,6 @@ pub enum Op {
         soft_cap: Option<f32>,
         write: bool,
     },
-    /// `[q, k_pool, v_pool, block_table, positions]` evaluating causal attention over paged KV memory.
-    PagedCachedAttention {
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        v_head_dim: usize,
-        scale: f32,
-        causal: bool,
-        #[serde(default)]
-        window: Option<usize>,
-        #[serde(default)]
-        soft_cap: Option<f32>,
-        tokens_per_block: usize,
-        max_blocks_per_seq: usize,
-    },
     /// `[x, weight, bias?, conv_state]` 1D causal convolution updating state.
     CausalConv1dCached {
         kernel: usize,
@@ -457,7 +442,6 @@ impl Op {
             Op::Binary { .. } => "Binary",
             Op::CachedAttention { .. } => "CachedAttention",
             Op::CausalConv1dCached { .. } => "CausalConv1dCached",
-            Op::PagedCachedAttention { .. } => "PagedCachedAttention",
             Op::DeltaRule { .. } => "DeltaRule",
             Op::Gather { .. } => "Gather",
             Op::Scatter { .. } => "Scatter",
