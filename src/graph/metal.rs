@@ -737,7 +737,10 @@ impl Runtime {
         }
         let pso_ms = t1.elapsed().as_secs_f64() * 1e3;
         for (name, pso) in &psos {
-            let min_tg = if name.starts_with("flash_attn_") || name.starts_with("gemm_mpp_") {
+            let min_tg = if name.starts_with("flash_attn_")
+                || name.starts_with("gemm_mpp_")
+                || name.starts_with("conv_igemm_")
+            {
                 TG4
             } else {
                 TG

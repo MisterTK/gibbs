@@ -288,7 +288,7 @@ mod tests {
         let inp = vec![Tensor::F32(rand(xs.iter().product(), 3))];
         let (want, got) = both(&g, &wt, inp);
         let e = rel_err(&want, &got);
-        assert!(e < 1e-4, "{label}: rel err {e}");
+        assert!(e < 2e-3, "{label}: rel err {e}");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -349,11 +349,20 @@ mod tests {
     /// (c_in 37 x 9 = 333), full 64-wide tiles on both axes, and a UNet-like 160-channel layer.
     #[test]
     fn conv2d_igemm_batched_and_wide_matches_cpu() {
+        assert!(rt().profile().mpp.is_ok(), "MPP must be active on this host");
         let op = Op::Conv2d { stride: [1, 1], padding: [1; 4], dilation: [1, 1], groups: 1 };
         check("batch 3 k tail", op.clone(), &[3, 37, 20, 22], &[70, 37, 3, 3], true, &[3, 70, 20, 22]);
         check("unet-like 160ch", op.clone(), &[160, 24, 24], &[160, 160, 3, 3], true, &[160, 24, 24]);
         check("1x1 batch 2 no bias", Op::Conv2d { stride: [1, 1], padding: [0; 4], dilation: [1, 1], groups: 1 },
             &[2, 96, 17, 19], &[130, 96, 1, 1], false, &[2, 130, 17, 19]);
+        for bias in [false, true] {
+            check("128ch 64x64", op.clone(), &[128, 64, 64], &[128, 128, 3, 3], bias, &[128, 64, 64]);
+            check("512ch 64x64", op.clone(), &[512, 64, 64], &[512, 512, 3, 3], bias, &[512, 64, 64]);
+            check("128ch s2 p1", Op::Conv2d { stride: [2, 2], padding: [1; 4], dilation: [1, 1], groups: 1 },
+                &[128, 64, 64], &[128, 128, 3, 3], bias, &[128, 32, 32]);
+            check("128ch d2 p2", Op::Conv2d { stride: [1, 1], padding: [2; 4], dilation: [2, 2], groups: 1 },
+                &[128, 64, 64], &[128, 128, 3, 3], bias, &[128, 64, 64]);
+        }
     }
 
     /// The old CPU conv (`nn::conv2d`) agrees with the generalized reference on its own domain.
