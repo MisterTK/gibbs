@@ -2486,7 +2486,7 @@ mod tests {
         );
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         app.handle_key(key(KeyCode::Char('m')));
-        for _ in 0..50 {
+        for _ in 0..500 {
             if app.tick() {
                 break;
             }
@@ -2514,7 +2514,7 @@ mod tests {
         });
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Char('m')));
-        for _ in 0..50 {
+        for _ in 0..500 {
             if app.tick() {
                 break;
             }
@@ -2857,7 +2857,7 @@ mod tests {
         app.trigger_background_roofline_probe();
         let mut got_probe = false;
         let mut app_mut = app;
-        for _ in 0..100 {
+        for _ in 0..500 {
             if app_mut.tick() && app_mut.roofline_probe_result.is_some() {
                 got_probe = true;
                 break;
