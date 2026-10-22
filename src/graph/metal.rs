@@ -270,11 +270,8 @@ pub enum WeightFormat {
     Q8_0,
     BF16,
     F16,
-    IQ2_M,
-    IQ4_XS,
     Q4_K,
     Q2_K,
-    IQ3_S,
     /// A format with no hand kernel: read through its [`codec::Codec`] by a generated GEMV.
     Gen(QuantFormat),
 }
@@ -285,11 +282,8 @@ impl WeightFormat {
         match f {
             QuantFormat::GGUF_Q4_0 => WeightFormat::Q4_0,
             QuantFormat::GGUF_Q8_0 => WeightFormat::Q8_0,
-            QuantFormat::GGUF_IQ4_XS => WeightFormat::IQ4_XS,
-            QuantFormat::GGUF_IQ2_M | QuantFormat::GGUF_IQ2_S => WeightFormat::IQ2_M,
             QuantFormat::GGUF_Q4_K_M => WeightFormat::Q4_K,
             QuantFormat::GGUF_Q2_K => WeightFormat::Q2_K,
-            QuantFormat::GGUF_IQ3_S => WeightFormat::IQ3_S,
             QuantFormat::BF16 => WeightFormat::BF16,
             QuantFormat::FP16 => WeightFormat::F16,
             f if codec::codec(f).is_some() => WeightFormat::Gen(f),
@@ -303,11 +297,8 @@ impl WeightFormat {
         Some(match self {
             WeightFormat::Q4_0 => QuantFormat::GGUF_Q4_0,
             WeightFormat::Q8_0 => QuantFormat::GGUF_Q8_0,
-            WeightFormat::IQ4_XS => QuantFormat::GGUF_IQ4_XS,
-            WeightFormat::IQ2_M => QuantFormat::GGUF_IQ2_M,
             WeightFormat::Q4_K => QuantFormat::GGUF_Q4_K_M,
             WeightFormat::Q2_K => QuantFormat::GGUF_Q2_K,
-            WeightFormat::IQ3_S => QuantFormat::GGUF_IQ3_S,
             WeightFormat::Gen(f) => f,
             _ => return None,
         })
@@ -318,26 +309,17 @@ impl WeightFormat {
         Some(match self {
             WeightFormat::Q4_0 => "gemv_q4_0",
             WeightFormat::Q8_0 => "gemv_q8_0",
-            WeightFormat::IQ4_XS => "gemv_iq4_xs",
-            WeightFormat::IQ2_M => "gemv_iq2_m",
             WeightFormat::Q4_K => "gemv_q4_k",
             WeightFormat::Q2_K => "gemv_q2_k",
-            WeightFormat::IQ3_S => "gemv_iq3_s",
             WeightFormat::BF16 => "gemv_bf16",
             WeightFormat::F16 => "gemv_f16",
             _ => return None,
         })
     }
 
-    /// Today's kernel for this format: the hand one where it exists (except `IQ4_XS`, `IQ2_M`, and
-    /// `IQ3_S`, whose `Wide` codecs are faster at 2 rows), else generated at 2 rows.
+    /// Today's kernel for this format: the hand one where it exists, else generated at 2 rows.
     fn default_variant(self) -> GemvVariant {
-        if self.hand_kernel().is_some()
-            && !matches!(
-                self,
-                WeightFormat::IQ4_XS | WeightFormat::IQ2_M | WeightFormat::IQ3_S
-            )
-        {
+        if self.hand_kernel().is_some() {
             GemvVariant::HAND
         } else {
             GemvVariant::generated(2)
@@ -469,7 +451,7 @@ const ATTN_MAX_SPLITS: usize = 32;
 const ATTN_TARGET_TGS: usize = 64;
 /// Query heads a split-attention threadgroup owns (`ATTN_HPT` in the kernel source).
 const ATTN_HPT: usize = 4;
-const BASE_KERNELS: [&str; 79] = [
+const BASE_KERNELS: [&str; 75] = [
     "embedding_f32",
     "layer_norm_f32",
     "mean_pool_f32",
@@ -500,11 +482,8 @@ const BASE_KERNELS: [&str; 79] = [
     "gemv_bf16",
     "gemv_f16",
     "gemv_tq2_0",
-    "gemv_iq4_xs",
-    "gemv_iq2_m",
     "gemv_q4_k",
     "gemv_q2_k",
-    "gemv_iq3_s",
     "gemv_q4_0_half_pair",
     "gemv_q8_0_pair",
     "gemv_q4_k_pair",
@@ -548,7 +527,6 @@ const BASE_KERNELS: [&str; 79] = [
     "attn_cached_merge_f32",
     "causal_conv1d_f32",
     "delta_rule_f32",
-    "gemv_nvfp4",
 ];
 const MPP_KERNELS: [&str; 3] = ["gemm_mpp_none", "gemm_mpp_gelu", "gemm_mpp_residual"];
 
@@ -1926,18 +1904,7 @@ impl Session {
                         DType::U32 => WeightFormat::U32,
                         DType::BF16 => WeightFormat::BF16,
                         DType::F16 => WeightFormat::F16,
-                        DType::Quant(QuantFormat::GGUF_Q4_0) => WeightFormat::Q4_0,
-                        DType::Quant(QuantFormat::GGUF_Q8_0) => WeightFormat::Q8_0,
-                        DType::Quant(QuantFormat::GGUF_IQ4_XS) => WeightFormat::IQ4_XS,
-                        DType::Quant(QuantFormat::GGUF_IQ2_M)
-                        | DType::Quant(QuantFormat::GGUF_IQ2_S) => WeightFormat::IQ2_M,
-                        DType::Quant(QuantFormat::GGUF_Q4_K_M) => WeightFormat::Q4_K,
-                        DType::Quant(QuantFormat::GGUF_Q2_K) => WeightFormat::Q2_K,
-                        DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
-                        DType::Quant(f) if crate::graph::codec::codec(f).is_some() => {
-                            WeightFormat::Gen(f)
-                        }
-                        _ => WeightFormat::F32,
+                        DType::Quant(f) => WeightFormat::of_quant(f),
                     };
                     if *len != numel(graph, v)? || *fmt != expected_fmt {
                         return Err(format!(
@@ -2740,11 +2707,8 @@ impl Session {
             | WeightFormat::F16
             | WeightFormat::Q8_0
             | WeightFormat::Q4_0
-            | WeightFormat::IQ4_XS
-            | WeightFormat::IQ2_M
             | WeightFormat::Q4_K
             | WeightFormat::Q2_K
-            | WeightFormat::IQ3_S
             | WeightFormat::Gen(_) => {
                 let (pso, rows_per_tg, threads) = self.gemv_pipeline(format, variant, cols)?;
                 enc.set_compute_pipeline_state(&pso);
@@ -4600,16 +4564,10 @@ fn linear_format(g: &Graph, w: ValueId) -> Option<WeightFormat> {
         return None;
     };
     let format = match g.value(w).dtype {
-        DType::Quant(QuantFormat::GGUF_Q8_0) => WeightFormat::Q8_0,
-        DType::Quant(QuantFormat::GGUF_Q4_0) => WeightFormat::Q4_0,
-        DType::Quant(QuantFormat::GGUF_IQ4_XS) => WeightFormat::IQ4_XS,
-        DType::Quant(QuantFormat::GGUF_IQ2_M) | DType::Quant(QuantFormat::GGUF_IQ2_S) => {
-            WeightFormat::IQ2_M
-        }
-        DType::Quant(QuantFormat::GGUF_Q4_K_M) => WeightFormat::Q4_K,
-        DType::Quant(QuantFormat::GGUF_Q2_K) => WeightFormat::Q2_K,
-        DType::Quant(QuantFormat::GGUF_IQ3_S) => WeightFormat::IQ3_S,
-        DType::Quant(f) if crate::graph::codec::codec(f).is_some() => WeightFormat::Gen(f),
+        DType::Quant(f) => match WeightFormat::of_quant(f) {
+            WeightFormat::F32 => return None,
+            w => w,
+        },
         DType::BF16 => WeightFormat::BF16,
         DType::F16 => WeightFormat::F16,
         _ => return None,
@@ -5445,14 +5403,11 @@ fn weight_format_bytes(fmt: WeightFormat, n: usize) -> usize {
     match fmt {
         WeightFormat::F32 | WeightFormat::U32 => n * 4,
         WeightFormat::BF16 | WeightFormat::F16 => n * 2,
-        WeightFormat::Q4_0
-        | WeightFormat::Q8_0
-        | WeightFormat::IQ4_XS
-        | WeightFormat::IQ2_M
-        | WeightFormat::Q4_K
-        | WeightFormat::Q2_K
-        | WeightFormat::IQ3_S
-        | WeightFormat::Gen(_) => fmt.codec_format().expect("codec format").tensor_bytes(n),
+        WeightFormat::Q4_0 | WeightFormat::Q8_0 | WeightFormat::Q4_K | WeightFormat::Q2_K | WeightFormat::Gen(_) => {
+            let (elems, bytes) =
+                codec::block_geometry(fmt.codec_format().expect("codec format")).expect("block geometry");
+            (n / elems) * bytes
+        }
     }
 }
 
@@ -7590,225 +7545,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gemv_iq4_xs_matches_cpu() {
-        let (m, n, k) = (1, 16, 256 * 2);
-        let mut g = Graph::new();
-        let x = g.input("x", vec![m, k], DType::F32);
-        let w_val = g.weight("w", vec![n, k], DType::Quant(QuantFormat::GGUF_IQ4_XS));
-        let b_val = g.weight("b", vec![n], DType::F32);
-        let y = g.add(
-            "lin",
-            Op::Linear,
-            &[x, w_val, b_val],
-            vec![m, n],
-            DType::F32,
-        );
-        g.output(y);
-
-        let n_blocks = n * (k / 256);
-        let mut raw = Vec::with_capacity(n_blocks * 136);
-        for b in 0..n_blocks {
-            let d = crate::model::f32_to_f16(0.0625 * ((b % 5) as f32 + 1.0));
-            raw.extend_from_slice(&d.to_le_bytes());
-            let scales_h = (b as u16 * 17) & 0xFFFF;
-            raw.extend_from_slice(&scales_h.to_le_bytes());
-            for j in 0..4 {
-                raw.push(((j * 7 + b) % 256) as u8);
-            }
-            for j in 0..128 {
-                let low = (j * 3 + b) % 16;
-                let high = (j * 5 + b * 2) % 16;
-                raw.push((low | (high << 4)) as u8);
-            }
-        }
-        let mut w = Weights::new();
-        w.insert(
-            "w",
-            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
-                QuantFormat::GGUF_IQ4_XS,
-                raw,
-                n,
-                k,
-            )),
-        );
-        w.insert("b", Tensor::F32(rand(n, 19)));
-        let inputs = vec![Tensor::F32(rand(m * k, 43))];
-        let (want, got) = both(&g, &w, inputs, None);
-        assert!(
-            rel_err(&want, &got) < 1e-4,
-            "want {:?} vs got {:?}",
-            &want[..4],
-            &got[..4]
-        );
-    }
-
-    #[test]
-    fn gemv_iq2_m_matches_cpu() {
-        let (m, n, k) = (1, 16, 256 * 2);
-        let mut g = Graph::new();
-        let x = g.input("x", vec![m, k], DType::F32);
-        let w_val = g.weight("w", vec![n, k], DType::Quant(QuantFormat::GGUF_IQ2_M));
-        let b_val = g.weight("b", vec![n], DType::F32);
-        let y = g.add(
-            "lin",
-            Op::Linear,
-            &[x, w_val, b_val],
-            vec![m, n],
-            DType::F32,
-        );
-        g.output(y);
-
-        let n_blocks = n * (k / 256);
-        let mut raw = Vec::with_capacity(n_blocks * 82);
-        for b in 0..n_blocks {
-            let d = crate::model::f32_to_f16(0.0625 * ((b % 5) as f32 + 1.0));
-            raw.extend_from_slice(&d.to_le_bytes());
-            for j in 0..32 {
-                raw.push(((j * 3 + b) % 256) as u8);
-            }
-            for j in 0..32 {
-                raw.push(((j * 5 + b) % 256) as u8);
-            }
-            for j in 0..8 {
-                raw.push(((j * 7 + b) % 256) as u8);
-            }
-            for j in 0..8 {
-                raw.push(((j * 11 + b) % 256) as u8);
-            }
-        }
-        let mut w = Weights::new();
-        w.insert(
-            "w",
-            Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(
-                QuantFormat::GGUF_IQ2_M,
-                raw,
-                n,
-                k,
-            )),
-        );
-        w.insert("b", Tensor::F32(rand(n, 23)));
-        let inputs = vec![Tensor::F32(rand(m * k, 45))];
-        let (want, got) = both(&g, &w, inputs, None);
-        assert!(
-            rel_err(&want, &got) < 1e-4,
-            "want {:?} vs got {:?}",
-            &want[..4],
-            &got[..4]
-        );
-    }
-
-    #[test]
-    fn gemv_nvfp4_matches_cpu() {
-        if metal::Device::system_default().is_none() {
-            return;
-        }
-        let rt = rt();
-        let (rows, cols) = (16usize, 64usize);
-        let n_blocks = rows * (cols / 16);
-        let byte_stride = cols / 2;
-
-        let mut wq = vec![0u8; rows * byte_stride];
-        for (i, b) in wq.iter_mut().enumerate() {
-            let low = (i * 3 + 1) % 16;
-            let high = (i * 5 + 2) % 16;
-            *b = (low | (high << 4)) as u8;
-        }
-
-        let mut scales = vec![0u8; n_blocks];
-        for (i, s) in scales.iter_mut().enumerate() {
-            *s = ((i * 7 + 0x30) % 0x7E) as u8;
-        }
-        let global_scale = 1.5f32;
-        let x_data = rand(cols, 42);
-
-        let lut = crate::model::layers::NVFP4_E2M1_LUT;
-        let mut expected = vec![0.0f32; rows];
-        for r in 0..rows {
-            let mut acc = 0.0f32;
-            for blk in 0..(cols / 16) {
-                let s = crate::model::f8_e4m3_to_f32(scales[r * (cols / 16) + blk]) * global_scale;
-                for i in 0..8 {
-                    let byte_val = wq[r * byte_stride + blk * 8 + i];
-                    let v0 = lut[(byte_val & 0x0F) as usize] * s;
-                    let v1 = lut[(byte_val >> 4) as usize] * s;
-                    let c0 = blk * 16 + 2 * i;
-                    let c1 = blk * 16 + 2 * i + 1;
-                    acc += v0 * x_data[c0] + v1 * x_data[c1];
-                }
-            }
-            expected[r] = acc;
-        }
-
-        let wq_buf = new_shared_buffer(&rt.device, wq.len()).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(wq.as_ptr(), wq_buf.contents() as *mut u8, wq.len())
-        };
-
-        let scales_buf = new_shared_buffer(&rt.device, scales.len()).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                scales.as_ptr(),
-                scales_buf.contents() as *mut u8,
-                scales.len(),
-            )
-        };
-
-        let x_buf = new_shared_buffer(&rt.device, cols * 4).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(x_data.as_ptr(), x_buf.contents() as *mut f32, cols)
-        };
-
-        let y_buf = new_shared_buffer(&rt.device, rows * 4).unwrap();
-
-        metal::objc::rc::autoreleasepool(|| {
-            let cb = rt.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(rt.pso("gemv_nvfp4").unwrap());
-            enc.set_buffer(0, Some(&wq_buf), 0);
-            enc.set_buffer(1, Some(&x_buf), 0);
-            enc.set_buffer(2, Some(&y_buf), 0);
-            #[repr(C)]
-            struct PackedGemvParams {
-                rows: u32,
-                cols: u32,
-                batch_size: u32,
-                has_bias: u32,
-                epi: u32,
-            }
-            let p = PackedGemvParams {
-                rows: rows as u32,
-                cols: cols as u32,
-                batch_size: 1,
-                has_bias: 0,
-                epi: 0,
-            };
-            set_bytes(enc, 3, &p);
-            enc.set_buffer(4, Some(&y_buf), 0);
-            enc.set_buffer(5, Some(&y_buf), 0);
-            enc.set_buffer(6, Some(&scales_buf), 0);
-            set_bytes(enc, 7, &global_scale);
-
-            enc.dispatch_thread_groups(
-                MTLSize::new((rows as u64).div_ceil(16), 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            enc.end_encoding();
-            commit_and_wait(cb).unwrap();
-        });
-
-        let mut got = vec![0.0f32; rows];
-        unsafe {
-            std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, got.as_mut_ptr(), rows)
-        };
-
-        for (r, (&e, &g)) in expected.iter().zip(&got).enumerate() {
-            assert!(
-                (e - g).abs() < 1e-4 || (e - g).abs() / (e.abs().max(g.abs())) < 1e-4,
-                "row {r}: expected {e}, got {g}"
-            );
-        }
-    }
 
     #[test]
     fn gemv_bf16_matches_cpu() {
