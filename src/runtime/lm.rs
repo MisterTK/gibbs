@@ -29,13 +29,13 @@ use crate::arch::expr::{Env, Val};
 use crate::arch::gen::{generate, GenData};
 use crate::arch::load::Model;
 use crate::arch::Registry;
-use crate::runtime::media::{self, Expanded, Grid, Media, Towers};
 use crate::graph::program::GraphProgram;
 use crate::graph::{StateStore, Tensor};
 use crate::hardware::{Device, PlacementMode};
 use crate::model::hub::ModelArtifacts;
 use crate::model::native::{logits_of, MediaInput, NativeLm, SeqState};
 use crate::model::tokenizer::Tokenizer;
+use crate::runtime::media::{self, Expanded, Grid, Media, Towers};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -326,7 +326,9 @@ impl SpecLm {
         if let Some(h) = model.spec.runtime["seqcls"]["head"].as_str() {
             for head in [h, "hidden"] {
                 let hv = vars(1, head, &[], 0);
-                match shapes.get(&hv, || build(&model.spec, TEXT, &model.env, &model.store, &hv)) {
+                match shapes.get(&hv, || {
+                    build(&model.spec, TEXT, &model.env, &model.store, &hv)
+                }) {
                     Ok(i) => {
                         for w in &i.weights {
                             if model.env.has(w) && used.insert(w.clone()) {
@@ -396,7 +398,13 @@ impl SpecLm {
             .ok_or_else(|| "sequence state was not built by this model".into())
     }
 
-    fn instance(&self, rows: usize, head: &str, taps: &[usize], media: usize) -> Result<Arc<Instance>, String> {
+    fn instance(
+        &self,
+        rows: usize,
+        head: &str,
+        taps: &[usize],
+        media: usize,
+    ) -> Result<Arc<Instance>, String> {
         let v = vars(rows, head, taps, media);
         let m = &self.model;
         self.shapes
@@ -447,24 +455,41 @@ impl SpecLm {
         if encode {
             for (kind, g, bytes) in &grids {
                 let s = &self.media[*kind];
-                let item = media::preprocess(&s.preprocess, bytes).map_err(|e| format!("{kind}: {e}"))?;
+                let item =
+                    media::preprocess(&s.preprocess, bytes).map_err(|e| format!("{kind}: {e}"))?;
                 let out = self.towers.run(&self.model, &s.component, &item)?;
                 for (i, (name, v)) in out.into_iter().enumerate() {
-                    let name = if i == 0 { "media_rows".to_string() } else { name };
+                    let name = if i == 0 {
+                        "media_rows".to_string()
+                    } else {
+                        name
+                    };
                     if v.len() % g.tokens != 0 {
-                        return Err(format!("{kind}: tower output `{name}` of {} values is not {} rows", v.len(), g.tokens));
+                        return Err(format!(
+                            "{kind}: tower output `{name}` of {} values is not {} rows",
+                            v.len(),
+                            g.tokens
+                        ));
                     }
                     let w = v.len() / g.tokens;
                     match rows.iter_mut().find(|(n, _, _)| *n == name) {
                         Some((_, rw, r)) if *rw == w => r.extend(v),
-                        Some((_, rw, _)) => return Err(format!("tower output `{name}` is {w} wide, earlier items {rw}")),
+                        Some((_, rw, _)) => {
+                            return Err(format!(
+                                "tower output `{name}` is {w} wide, earlier items {rw}"
+                            ))
+                        }
                         None => rows.push((name, w, v)),
                     }
                 }
             }
             if let Some((_, w, r)) = rows.first() {
                 if r.len() / w != e.media_index.len() {
-                    return Err(format!("towers returned {} media rows for {}", r.len() / w, e.media_index.len()));
+                    return Err(format!(
+                        "towers returned {} media rows for {}",
+                        r.len() / w,
+                        e.media_index.len()
+                    ));
                 }
             }
         }
@@ -599,7 +624,12 @@ impl SpecLm {
             let li = inst
                 .output_index("logits")
                 .ok_or("the text component has no `logits` output")?;
-            let pass = Pass { hist: &seq.ids[..e], pos0: at, blocks, seq };
+            let pass = Pass {
+                hist: &seq.ids[..e],
+                pos0: at,
+                blocks,
+                seq,
+            };
             let inputs = inst
                 .inputs
                 .iter()
@@ -612,7 +642,10 @@ impl SpecLm {
                 p.run_reshaped(&inst.graph, inputs)?
             };
             // Moved out, not copied: a vocabulary row per decode token.
-            match out.get_mut(li).map(|t| std::mem::replace(t, Tensor::U32(Vec::new()))) {
+            match out
+                .get_mut(li)
+                .map(|t| std::mem::replace(t, Tensor::U32(Vec::new())))
+            {
                 Some(Tensor::F32(v)) if mode == Mode::All => logits.extend_from_slice(&v),
                 Some(Tensor::F32(v)) => logits = v,
                 _ => return Err("the text component returned no f32 logits".into()),
@@ -666,7 +699,11 @@ impl SpecLm {
         extra: &[(&str, Tensor)],
     ) -> Result<Vec<f32>, String> {
         if ids.is_empty() || ids.len() > self.ctx {
-            return Err(format!("{} tokens: the context holds 1..={}", ids.len(), self.ctx));
+            return Err(format!(
+                "{} tokens: the context holds 1..={}",
+                ids.len(),
+                self.ctx
+            ));
         }
         let cap = self.rt.prefill_rows.max(1);
         let mut p = self.program.lock();
@@ -683,7 +720,15 @@ impl SpecLm {
                     .iter()
                     .map(|d| match extra.iter().find(|x| x.0 == d.name) {
                         Some((_, t)) if last => Ok(t.clone()),
-                        _ => input(d, &Pass { hist: &ids[..e], pos0: at, blocks: &[], seq: &seq }),
+                        _ => input(
+                            d,
+                            &Pass {
+                                hist: &ids[..e],
+                                pos0: at,
+                                blocks: &[],
+                                seq: &seq,
+                            },
+                        ),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let res = p.run_reshaped(&inst.graph, inputs)?;
@@ -708,7 +753,10 @@ impl SpecLm {
             .output_index(out)
             .ok_or_else(|| format!("the `{head}` instance has no output `{out}`"))?;
         let v = &inst.graph.values[inst.graph.outputs[i].0 as usize];
-        v.shape.last().copied().ok_or_else(|| format!("output `{out}` has no shape"))
+        v.shape
+            .last()
+            .copied()
+            .ok_or_else(|| format!("output `{out}` has no shape"))
     }
 
     /// Start position of the last pass [`Self::run_head`] makes over `n` ids.
@@ -755,7 +803,10 @@ impl NativeLm for SpecLm {
 
     fn prepare(&self, ids: Vec<u32>, media: &[MediaInput]) -> Result<(Vec<u32>, SeqState), String> {
         if media.is_empty() && self.media.is_empty() {
-            return Ok((ids.clone(), Box::new(Seq::new(ids, Expanded::default(), Vec::new()))));
+            return Ok((
+                ids.clone(),
+                Box::new(Seq::new(ids, Expanded::default(), Vec::new())),
+            ));
         }
         if self.media.is_empty() {
             return Err("this model takes text only (no image or audio input)".into());
@@ -946,8 +997,14 @@ pub fn sample_logits(
         return penalized_best_idx as u32;
     }
 
-    let (active_candidates, active_probs, n) =
-        nucleus(slice, recent_tokens, temperature, top_k, top_p, repetition_penalty);
+    let (active_candidates, active_probs, n) = nucleus(
+        slice,
+        recent_tokens,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+    );
     let active_candidates = &active_candidates[..n];
     let active_probs = &active_probs[..n];
     let active_sum: f32 = active_probs.iter().sum();
@@ -1157,8 +1214,8 @@ mod tests {
             indexed.truncate(cutoff_idx);
             probs.truncate(cutoff_idx);
             let active_sum: f32 = probs.iter().sum();
-            let mut hash = 0x811c9dc5u32
-                .wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
+            let mut hash =
+                0x811c9dc5u32.wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
             for (pos, &tok) in recent_tokens.iter().enumerate() {
                 hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
                 hash = hash.rotate_left(13).wrapping_mul(0x01000193);
@@ -1442,12 +1499,16 @@ mod tests {
         lm.stream_end(&mut s2).unwrap();
         let err = lm.forward(&[t0], 1, &mut s2).unwrap_err();
         assert!(
-            err.contains("recurrent state ran past position 1 in a decode stream; start a new sequence"),
+            err.contains(
+                "recurrent state ran past position 1 in a decode stream; start a new sequence"
+            ),
             "{err}"
         );
         let err = lm.truncate(&mut s2, 1).unwrap_err();
         assert!(
-            err.contains("recurrent state ran past position 1 in a decode stream; start a new sequence"),
+            err.contains(
+                "recurrent state ran past position 1 in a decode stream; start a new sequence"
+            ),
             "{err}"
         );
     }
@@ -1585,15 +1646,23 @@ mod tests {
     fn toy_media(dev: Device, rows: usize) -> SpecLm {
         let spec = MEDIA_SPEC.replace("$ROWS", &rows.to_string());
         let reg = Registry::from_files(&[("families/toym.json5".into(), spec)], &[]).unwrap();
-        let a = ModelArtifacts { model_id: "gibbs/toym".into(), ..Default::default() };
-        let exact = ReencodeConfig { policy: ReencodePolicy::BitExact, ..Default::default() };
+        let a = ModelArtifacts {
+            model_id: "gibbs/toym".into(),
+            ..Default::default()
+        };
+        let exact = ReencodeConfig {
+            policy: ReencodePolicy::BitExact,
+            ..Default::default()
+        };
         let m = crate::arch::load::load_with(&a, &reg, Some("toym"), exact).unwrap();
         SpecLm::new(m, PlacementMode::Pin(dev)).unwrap()
     }
 
     /// 16 kHz mono 16-bit WAV of `n` loud (near full-scale) samples.
     fn wav(n: usize) -> Vec<u8> {
-        let pcm: Vec<u8> = (0..n).flat_map(|i| (((i * 7919) % 60000) as i32 - 30000).to_le_bytes()[..2].to_vec()).collect();
+        let pcm: Vec<u8> = (0..n)
+            .flat_map(|i| (((i * 7919) % 60000) as i32 - 30000).to_le_bytes()[..2].to_vec())
+            .collect();
         let mut b = b"RIFF".to_vec();
         b.extend((36 + pcm.len() as u32).to_le_bytes());
         b.extend(b"WAVEfmt ");
@@ -1616,10 +1685,18 @@ mod tests {
             let (chunked, oneshot) = (toy_media(dev, 3), toy_media(dev, 64));
             let prompt = [3u32, 17, 31, 5, 9];
             let clip = [MediaInput::Audio(wav(22))]; // 6 frames of 4 (the last zero-padded)
-            assert!(chunked.prepare(prompt.to_vec(), &[MediaInput::Image(vec![1])]).is_err(), "image is off");
+            assert!(
+                chunked
+                    .prepare(prompt.to_vec(), &[MediaInput::Image(vec![1])])
+                    .is_err(),
+                "image is off"
+            );
             let (ids, mut a) = chunked.prepare(prompt.to_vec(), &clip).unwrap();
             assert_eq!(ids, vec![3, 17, 29, 31, 31, 31, 31, 31, 31, 30, 5, 9]);
-            assert_eq!(chunked.prompt_len(prompt.to_vec(), &clip).unwrap(), ids.len());
+            assert_eq!(
+                chunked.prompt_len(prompt.to_vec(), &clip).unwrap(),
+                ids.len()
+            );
             assert_eq!(SpecLm::seq(&mut a).unwrap().blocks, vec![3..9]);
             // 0..4 ends inside the block 3..9: the pass runs to 9.
             let ahead = chunked.forward(&ids[..4], 0, &mut a).unwrap();
@@ -1629,20 +1706,94 @@ mod tests {
             let lb = oneshot.forward(&ids, 0, &mut b).unwrap();
             close(&la, &lb, tol(dev));
             let da = chunked.forward(&[7], ids.len(), &mut a).unwrap();
-            close(&da, &oneshot.forward(&[7], ids.len(), &mut b).unwrap(), tol(dev));
+            close(
+                &da,
+                &oneshot.forward(&[7], ids.len(), &mut b).unwrap(),
+                tol(dev),
+            );
             if dev == Device::Cpu {
-                let mut t: SeqState = Box::new(Seq::new(ids.clone(), Expanded::default(), Vec::new()));
+                let mut t: SeqState =
+                    Box::new(Seq::new(ids.clone(), Expanded::default(), Vec::new()));
                 SpecLm::seq(&mut t).unwrap().blocks = vec![3..9];
                 let plain = oneshot.forward(&ids, 0, &mut t).unwrap();
-                assert!(plain.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "media rows must matter");
+                assert!(
+                    plain.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3),
+                    "media rows must matter"
+                );
                 // The tower's second output reaches the logits through its rows.
                 let (_, mut z) = oneshot.prepare(prompt.to_vec(), &clip).unwrap();
                 let s = SpecLm::seq(&mut z).unwrap();
-                let extra = s.rows.iter_mut().find(|(n, _, _)| n == "extra").expect("extra rows");
+                let extra = s
+                    .rows
+                    .iter_mut()
+                    .find(|(n, _, _)| n == "extra")
+                    .expect("extra rows");
                 extra.2.fill(0.0);
                 let lz = oneshot.forward(&ids, 0, &mut z).unwrap();
-                assert!(lz.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3), "the extra output must matter");
+                assert!(
+                    lz.iter().zip(&lb).any(|(x, y)| (x - y).abs() > 1e-3),
+                    "the extra output must matter"
+                );
             }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn forward_all_rows_scaling() {
+        let _ = crate::graph::metal::Runtime::shared();
+        let hub = crate::model::hub::HuggingFaceHub::new();
+        let reg = crate::arch::registry().unwrap();
+        let models = [
+            "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
+            "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf",
+        ];
+        let mut failures = Vec::new();
+        for id in models {
+            let artifacts = hub.auto_download_and_cache(id, None).unwrap();
+            let lm = super::load(&artifacts, reg, None, PlacementMode::Pin(Device::Metal)).unwrap();
+            let prompt: Vec<u32> = (0..32).map(|i| 10 + (i as u32 % 50)).collect();
+            let (ids, mut state) = lm.prepare(prompt.clone(), &[]).unwrap();
+            let prefill_len = 16;
+            lm.forward(&ids[..prefill_len], 0, &mut state).unwrap();
+            let mut times = Vec::new();
+            for m in [1usize, 2, 4, 8] {
+                let step_ids = &ids[prefill_len..prefill_len + m];
+                for _ in 0..2 {
+                    lm.forward_all(step_ids, prefill_len, &mut state).unwrap();
+                    lm.truncate(&mut state, prefill_len).unwrap();
+                }
+                let mut samples = Vec::new();
+                for _ in 0..8 {
+                    let t0 = std::time::Instant::now();
+                    let out = lm.forward_all(step_ids, prefill_len, &mut state).unwrap();
+                    std::hint::black_box(&out);
+                    samples.push(t0.elapsed().as_secs_f64() * 1e3);
+                    lm.truncate(&mut state, prefill_len).unwrap();
+                }
+                samples.sort_by(|a, b| a.total_cmp(b));
+                times.push((m, samples[samples.len() / 2]));
+            }
+            let t1 = times[0].1;
+            let t8 = times[3].1;
+            println!(
+                "{id}: m=1 {:.2}ms, m=2 {:.2}ms ({:.2}x), m=4 {:.2}ms ({:.2}x), m=8 {:.2}ms ({:.2}x)",
+                times[0].1,
+                times[1].1,
+                times[1].1 / t1,
+                times[2].1,
+                times[2].1 / t1,
+                t8,
+                t8 / t1
+            );
+            if t8 > 3.0 * t1 {
+                failures.push(format!("{id}: m=8 ({t8:.2}ms) > 3.0 * m=1 ({t1:.2}ms)"));
+            }
+        }
+        if failures.is_empty() {
+            println!("P10.0 verdict: GO (all models <= 3.0x at m=8)");
+        } else {
+            println!("P10.0 verdict: NO-GO ({})", failures.join("; "));
         }
     }
 }
