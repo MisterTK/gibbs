@@ -1,17 +1,16 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use foundry_engine::hardware::{Device, PlacementMode, QuantFormat};
-use foundry_engine::kv::PagedKVPool;
-use foundry_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
-use foundry_engine::model::native::NativeLm;
-use foundry_engine::model::tokenizer::Tokenizer;
-use foundry_engine::model::weight_format::{reencode_override, set_reencode_override, ReencodeConfig};
-use foundry_engine::scheduler::{
+use gibbs_engine::hardware::{Device, PlacementMode, QuantFormat};
+use gibbs_engine::kv::PagedKVPool;
+use gibbs_engine::model::hub::{HuggingFaceHub, ModelArtifacts};
+use gibbs_engine::model::native::NativeLm;
+use gibbs_engine::model::tokenizer::Tokenizer;
+use gibbs_engine::model::weight_format::{reencode_override, set_reencode_override, ReencodeConfig};
+use gibbs_engine::scheduler::{
     ContinuousBatchScheduler, ExecutableModel, SamplingParams, DEFAULT_MAX_NEW_TOKENS,
 };
-use foundry_engine::server::{create_router, AppState};
-use foundry_engine::telemetry::EngineTelemetry;
-use gibbs_engine::foundry_engine;
+use gibbs_engine::server::{create_router, AppState};
+use gibbs_engine::telemetry::EngineTelemetry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
@@ -20,9 +19,9 @@ use tower::ServiceExt;
 static LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn load_unlocked(art: &ModelArtifacts) -> Result<Arc<dyn NativeLm>, String> {
-    foundry_engine::runtime::lm::load(
+    gibbs_engine::runtime::lm::load(
         art,
-        foundry_engine::arch::registry()?,
+        gibbs_engine::arch::registry()?,
         None,
         PlacementMode::Pin(Device::Cpu),
     )
@@ -74,9 +73,9 @@ fn tiny_lm(force: Option<QuantFormat>, dev: Device) -> Arc<dyn NativeLm> {
         force: Some(f),
         ..ReencodeConfig::from_settings()
     }));
-    let lm = foundry_engine::runtime::lm::load(
+    let lm = gibbs_engine::runtime::lm::load(
         &art,
-        foundry_engine::arch::registry().unwrap(),
+        gibbs_engine::arch::registry().unwrap(),
         None,
         PlacementMode::Pin(dev),
     );
@@ -329,7 +328,7 @@ fn test_smollm2_program_scheduler_inference() {
 #[test]
 fn test_decode_throughput_benchmark_300_tok_s() {
     // The shipping backend: the CPU executor is the opt-in fallback, not a throughput target.
-    let model = ExecutableModel::new(tiny_lm(None, foundry_engine::hardware::default_device()));
+    let model = ExecutableModel::new(tiny_lm(None, gibbs_engine::hardware::default_device()));
     let prompt = "In a quiet valley surrounded by mountains";
     let num_tokens = 50;
     let _ = model.generate_text_measured_plain(prompt, 5, 0.0).unwrap(); // warm-up
@@ -372,7 +371,7 @@ fn test_all_readme_models_inference_and_zero_gibberish() {
         std::path::Path::new("disk/models--ggml-org--tiny-llamas/snapshots/main/stories15M.gguf");
     if gguf_path.exists() {
         let bytes = std::fs::read(gguf_path).expect("Failed to read stories15M.gguf");
-        let manifest = foundry_engine::model::UniversalModelLoader::parse_gguf_bytes(&bytes)
+        let manifest = gibbs_engine::model::UniversalModelLoader::parse_gguf_bytes(&bytes)
             .expect("Failed to parse stories15M.gguf");
         assert!(manifest.tensors.len() >= 50);
         assert!(manifest.tensors.contains_key("blk.0.attn_q.weight"));
@@ -549,7 +548,7 @@ fn gguf_file(tensors: &[(&str, [u64; 2], u32, Vec<u8>)]) -> Vec<u8> {
 /// bytes); GGML types it cannot decode are a load error naming the tensor, not misread bytes.
 #[test]
 fn test_gguf_block_formats_decode_like_ggml() {
-    use foundry_engine::model::UniversalModelLoader;
+    use gibbs_engine::model::UniversalModelLoader;
     // (name, ggml type, block elems, block bytes, W at [0,17,31,32,100,255,256+77], W·x)
     let cases: [(&str, u32, usize, usize, [f32; 7], [f32; 2]); 8] = [
         (
@@ -671,7 +670,7 @@ fn test_gguf_block_formats_decode_like_ggml() {
         let format = manifest.tensors[name].quant_format;
         let raw_data = &tensors.iter().find(|t| t.0 == name).unwrap().3;
         let mut y = [0.0f32; 2];
-        foundry_engine::model::weights::Mat::from_packed_bytes(format, raw_data.clone(), 2, 256)
+        gibbs_engine::model::weights::Mat::from_packed_bytes(format, raw_data.clone(), 2, 256)
             .gemv_f32(&x, &mut y);
         for (got, want) in y.iter().zip(want_y) {
             assert!(
@@ -696,7 +695,7 @@ fn test_gguf_block_formats_decode_like_ggml() {
 /// chat template (SmolLM2).
 #[test]
 fn test_gguf_tokenizers_match_llama_tokenize() {
-    use foundry_engine::model::UniversalModelLoader;
+    use gibbs_engine::model::UniversalModelLoader;
     let dir = |repo: &str| std::path::PathBuf::from(format!("disk/models--{repo}/snapshots/main"));
     let stories = dir("ggml-org--tiny-llamas").join("stories15M.gguf");
     if stories.exists() {
@@ -753,7 +752,7 @@ fn test_gguf_tokenizers_match_llama_tokenize() {
 /// through `ContinuousBatchScheduler` equal to transformers' greedy `generate` (f32 weights).
 #[test]
 fn test_chat_template_and_scheduler_greedy_match_hf() {
-    use foundry_engine::model::hub::ModelArtifacts;
+    use gibbs_engine::model::hub::ModelArtifacts;
     use tokio::sync::mpsc::error::TryRecvError;
     if cfg!(debug_assertions) {
         return;

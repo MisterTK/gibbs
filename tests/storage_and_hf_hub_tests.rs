@@ -1,5 +1,4 @@
-use gibbs_engine::foundry_engine;
-use foundry_engine::model::hub::{HuggingFaceDownloader, HuggingFaceHub, StorageBackend};
+use gibbs_engine::model::hub::{HuggingFaceDownloader, HuggingFaceHub, StorageBackend};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::tempdir;

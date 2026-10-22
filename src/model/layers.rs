@@ -836,6 +836,12 @@ pub fn dequantize_mxfp4_block(b: &[u8], y: &mut [f32]) {
     }
 }
 
+
+/// NVFP4 (E2M1) lookup table representing 16 values for nibbles 0x0..=0xF.
+pub const NVFP4_E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
 /// ggml NVFP4 (36 B / 64; `block_nvfp4`, `dequantize_row_nvfp4`): four UE4M3 scale bytes, one per
 /// 16-element sub-block, then 32 nibble bytes; within a sub-block's 8 bytes the low nibbles are
 /// elements 0..8 and the high nibbles 8..16. `d = ue4m3 * 0.5` (0 and 0x7F give 0) against the

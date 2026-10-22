@@ -786,25 +786,6 @@ pub fn attention(
     out
 }
 
-/// [c, h, w] -> [c, 2h, 2w] nearest neighbour.
-pub fn upsample_nearest2x(x: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
-    assert_eq!(x.len(), c * h * w, "upsample_nearest2x: x is not c*h*w");
-    let (oh, ow) = (2 * h, 2 * w);
-    let mut out = vec![0.0; c * oh * ow];
-    if out.is_empty() {
-        return out;
-    }
-    for (src, dst) in x.chunks_exact(h * w).zip(out.chunks_exact_mut(oh * ow)) {
-        for y in 0..h {
-            for (xx, &v) in src[y * w..][..w].iter().enumerate() {
-                dst[2 * y * ow + 2 * xx] = v;
-                dst[2 * y * ow + 2 * xx + 1] = v;
-            }
-            dst.copy_within(2 * y * ow..(2 * y + 1) * ow, (2 * y + 1) * ow);
-        }
-    }
-    out
-}
 
 /// [rows, cols] -> [cols, rows], 32x32 cache blocks.
 pub fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -853,127 +834,6 @@ pub fn l2_normalize(v: &mut [f32]) {
     v.iter_mut().for_each(|x| *x /= n);
 }
 
-/// A weight tensor kept in its checkpoint precision: half-precision bits stay 2 bytes resident.
-/// Linears decode rows inside the GEMM's B packing ([`matmul_rows`]); convs (the GEMM's A side)
-/// widen to f32 for the call.
-pub enum Wt {
-    F32(Vec<f32>),
-    F16(Vec<u16>),
-    BF16(Vec<u16>),
-}
-
-static F16_LUT: LazyLock<Vec<f32>> =
-    LazyLock::new(|| (0..=u16::MAX).map(crate::model::f16_to_f32).collect());
-
-impl Wt {
-    pub fn len(&self) -> usize {
-        match self {
-            Wt::F32(v) => v.len(),
-            Wt::F16(v) | Wt::BF16(v) => v.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// `x [rows, in_f]` -> `[rows, out_f]` for a PyTorch `[out_f, in_f]` weight, without an f32 copy.
-    pub fn linear(
-        &self,
-        x: &[f32],
-        rows: usize,
-        bias: Option<&[f32]>,
-        in_f: usize,
-        out_f: usize,
-    ) -> Vec<f32> {
-        let mut out = vec![0.0; rows * out_f];
-        match self {
-            Wt::F32(w) => matmul_nt(x, w, bias, rows, in_f, out_f, &mut out),
-            Wt::BF16(w) => matmul_bf16(x, w, bias, rows, in_f, out_f, &mut out),
-            Wt::F16(w) => {
-                assert_eq!(
-                    w.len(),
-                    out_f * in_f,
-                    "Wt::linear: weight is not out_f*in_f"
-                );
-                let lut = &*F16_LUT;
-                matmul_rows(x, rows, in_f, out_f, bias, &mut out, &|j, p0, d| {
-                    d.iter_mut()
-                        .zip(&w[j * in_f + p0..])
-                        .for_each(|(d, &h)| *d = lut[h as usize]);
-                });
-            }
-        }
-        out
-    }
-
-    // ponytail: convs widen the whole kernel per call (GEMM A side); an A-side row decoder if conv time shows.
-    /// The values as f32 (borrowed when already f32).
-    pub fn f32(&self) -> std::borrow::Cow<'_, [f32]> {
-        let (src, lut) = match self {
-            Wt::F32(v) => return std::borrow::Cow::Borrowed(v),
-            Wt::F16(v) => (v, Some(&*F16_LUT)),
-            Wt::BF16(v) => (v, None),
-        };
-        let mut out = vec![0.0f32; src.len()];
-        par_chunks(&mut out, ELEM_CHUNK * 8, |t, c| {
-            let s = &src[t * ELEM_CHUNK * 8..][..c.len()];
-            match lut {
-                Some(l) => c.iter_mut().zip(s).for_each(|(o, &h)| *o = l[h as usize]),
-                None => c
-                    .iter_mut()
-                    .zip(s)
-                    .for_each(|(o, &h)| *o = f32::from_bits((h as u32) << 16)),
-            }
-        });
-        std::borrow::Cow::Owned(out)
-    }
-
-    /// Re-encodes f32 `v` in this tensor's precision (used after merging a LoRA delta).
-    pub fn like(&self, v: Vec<f32>) -> Wt {
-        match self {
-            Wt::F32(_) => Wt::F32(v),
-            Wt::F16(_) => Wt::F16(v.iter().map(|&x| crate::model::f32_to_f16(x)).collect()),
-            Wt::BF16(_) => Wt::BF16(v.iter().map(|&x| crate::model::f32_to_bf16(x)).collect()),
-        }
-    }
-}
-
-/// x `[rows, w.cols]` . w^T -> `[rows, w.rows]` (PyTorch `nn.Linear` layout, no bias) over a
-/// mapped bf16 / packed [`crate::model::weights::Mat`]: below 8 rows each row streams the bf16
-/// weight (memory-bound decode); at 8 or more the direct bf16 GEMM runs.
-pub fn linear_mat(x: &[f32], rows: usize, w: &crate::model::weights::Mat) -> Vec<f32> {
-    use crate::model::par::{dot_bf16, par_for, threads, OutPtr};
-    let (k, n) = (w.cols, w.rows);
-    assert_eq!(x.len(), rows * k, "linear: input is not rows x {k}");
-    let mut out = vec![0.0f32; rows * n];
-    if rows == 1 && w.packed().is_some() {
-        w.gemv_f32(x, &mut out);
-        return out;
-    }
-    if w.packed().is_some() {
-        matmul_nt(x, &w.to_f32(), None, rows, k, n, &mut out);
-        return out;
-    }
-    if rows >= 8 {
-        linear_bf16_direct(x, w.data(), rows, k, n, &mut out);
-        return out;
-    }
-    let per = n.div_ceil(threads() * 4).max(16);
-    let o = OutPtr::new(&mut out);
-    par_for(n.div_ceil(per), &|t| {
-        let (j0, j1) = (t * per, ((t + 1) * per).min(n));
-        for r in 0..rows {
-            let xr = &x[r * k..(r + 1) * k];
-            // SAFETY: columns j0..j1 of row r belong to task t.
-            let dst = unsafe { o.slice(r * n + j0, j1 - j0) };
-            for (d, j) in dst.iter_mut().zip(j0..j1) {
-                *d = dot_bf16(w.row(j), xr);
-            }
-        }
-    });
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -1249,21 +1109,8 @@ mod tests {
     }
 
     #[test]
-    fn upsample_and_transpose_match_naive() {
+    fn transpose_matches_naive() {
         let mut r = Lcg(5);
-        let (c, h, w) = (3, 4, 5);
-        let x = r.vec(c * h * w);
-        let up = upsample_nearest2x(&x, c, h, w);
-        for ch in 0..c {
-            for y in 0..2 * h {
-                for xx in 0..2 * w {
-                    assert_eq!(
-                        up[(ch * 2 * h + y) * 2 * w + xx],
-                        x[(ch * h + y / 2) * w + xx / 2]
-                    );
-                }
-            }
-        }
         let (rows, cols) = (37, 53);
         let m = r.vec(rows * cols);
         let t = transpose(&m, rows, cols);

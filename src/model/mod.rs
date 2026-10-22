@@ -184,15 +184,6 @@ impl UniversalModelLoader {
         })
     }
 
-    /// Ingests a model from zero-copy shared bytes, automatically detecting format.
-    pub fn from_shared_bytes(data: Bytes) -> Result<Self, String> {
-        let manifest = Self::auto_detect_and_parse(&data)?;
-        Ok(Self {
-            manifest,
-            primary_data: Some(data),
-            shards: Vec::new(),
-        })
-    }
 
     /// Ingests multi-part model shards (Safetensors or GGUF shards).
     pub fn from_shards(shards_data: &[&[u8]]) -> Result<Self, String> {
@@ -208,34 +199,6 @@ impl UniversalModelLoader {
         })
     }
 
-    /// Ingests multi-part model shards with shared zero-copy byte buffers.
-    pub fn from_shared_shards(shards: Vec<Bytes>) -> Result<Self, String> {
-        let shard_refs: Vec<&[u8]> = shards.iter().map(|b| b.as_ref()).collect();
-        let manifest = Self::parse_shards(&shard_refs)?;
-        Ok(Self {
-            manifest,
-            primary_data: None,
-            shards,
-        })
-    }
-
-    /// Creates a loader instance from an existing manifest and backing byte slice.
-    pub fn from_manifest_and_data(manifest: ModelManifest, data: &[u8]) -> Self {
-        Self {
-            manifest,
-            primary_data: Some(Bytes::copy_from_slice(data)),
-            shards: Vec::new(),
-        }
-    }
-
-    /// Creates a loader instance from an existing manifest and shared zero-copy bytes.
-    pub fn from_manifest_and_shared_bytes(manifest: ModelManifest, data: Bytes) -> Self {
-        Self {
-            manifest,
-            primary_data: Some(data),
-            shards: Vec::new(),
-        }
-    }
 
     /// Automatically detects container format by inspecting magic bytes and headers.
     pub fn detect_format(data: &[u8]) -> Result<SourceFormat, String> {
@@ -1219,10 +1182,6 @@ fn gguf_tokenizer_json(
     }))
 }
 
-#[allow(dead_code)]
-fn read_gguf_string(data: &[u8], offset: &mut usize) -> Result<String, String> {
-    read_gguf_string_v(data, offset, 2)
-}
 
 fn read_gguf_string_v(data: &[u8], offset: &mut usize, version: u32) -> Result<String, String> {
     let len = if version == 1 {
@@ -1329,34 +1288,6 @@ pub fn f8_e4m3_to_f32(x: u8) -> f32 {
     } else {
         mag
     }
-}
-/// Convert f32 to FP8 E4M3FN (OCP).
-pub fn f32_to_f8_e4m3(val: f32) -> u8 {
-    if val.is_nan() {
-        return 0x7F;
-    }
-    let sign = if val.is_sign_negative() { 0x80 } else { 0 };
-    let abs = val.abs();
-    if abs < 1.0 / 1024.0 {
-        return sign;
-    }
-    if abs >= 448.0 {
-        return sign | 0x7E;
-    }
-    let mut best_code = 0u8;
-    let mut best_diff = f32::INFINITY;
-    for code in 0..127u8 {
-        let candidate = f8_e4m3_to_f32(code);
-        let diff = (candidate - abs).abs();
-        if diff < best_diff {
-            best_diff = diff;
-            best_code = code;
-            if diff == 0.0 {
-                break;
-            }
-        }
-    }
-    sign | best_code
 }
 
 /// Convert bfloat16 (stored in u16) to f32.

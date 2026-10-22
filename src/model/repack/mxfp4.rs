@@ -115,9 +115,8 @@ pub fn repack(m: &ModelManifest, data: &[u8], weight: &str) -> Result<Option<Rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::layers::dequantize_gguf_blocks;
+    use crate::model::layers::{dequantize_gguf_blocks, NVFP4_E2M1_LUT};
     use crate::model::prequant;
-    use crate::quant::nvfp4::NVFP4_E2M1_LUT;
 
     #[derive(Default)]
     struct Fx {

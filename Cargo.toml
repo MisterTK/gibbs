@@ -10,10 +10,6 @@ license = "MIT OR Apache-2.0"
 name = "gibbs"
 path = "src/main.rs"
 
-[[bin]]
-name = "foundry-engine"
-path = "src/bin/foundry-engine.rs"
-
 [dependencies]
 # Async Runtime & Networking
 tokio = { version = "1.40", features = ["full"] }

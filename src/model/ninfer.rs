@@ -15,7 +15,7 @@ use crate::hardware::QuantFormat;
 use crate::model::par::par_rows;
 use crate::model::weights::Weights;
 use crate::model::{bf16_to_f32, f16_to_f32, f8_e4m3_to_f32};
-use crate::quant::nvfp4::NVFP4_E2M1_LUT;
+use crate::model::layers::NVFP4_E2M1_LUT;
 use memmap2::Mmap;
 use serde_json::{json, Value};
 use std::borrow::Cow;

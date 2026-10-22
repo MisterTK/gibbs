@@ -5,7 +5,7 @@
 
 use crate::model::par::par_rows;
 use crate::model::{decode_dtype, f32_to_bf16, f8_e4m3_to_f32, ModelManifest, VirtualTensor};
-use crate::quant::nvfp4::NVFP4_E2M1_LUT;
+use crate::model::layers::NVFP4_E2M1_LUT;
 use serde_json::Value;
 use std::path::Path;
 

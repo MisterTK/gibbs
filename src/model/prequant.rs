@@ -10,7 +10,7 @@ use crate::hardware::QuantFormat;
 use crate::model::weights::Weights;
 use crate::model::repack::mxfp4;
 use crate::model::{decode_dtype, ModelManifest, VirtualTensor};
-use crate::quant::nvfp4::NVFP4_E2M1_LUT;
+use crate::model::layers::NVFP4_E2M1_LUT;
 use serde_json::Value;
 use std::path::Path;
 

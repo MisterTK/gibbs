@@ -7722,7 +7722,7 @@ mod tests {
         let global_scale = 1.5f32;
         let x_data = rand(cols, 42);
 
-        let lut = crate::quant::nvfp4::NVFP4_E2M1_LUT;
+        let lut = crate::model::layers::NVFP4_E2M1_LUT;
         let mut expected = vec![0.0f32; rows];
         for r in 0..rows {
             let mut acc = 0.0f32;

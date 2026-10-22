@@ -1,7 +1,5 @@
-use foundry_engine::hardware::HardwareCapability;
-use foundry_engine::kv::{BlockId, RadixPrefixCache};
-use foundry_engine::quant::QuantEngine;
-use gibbs_engine::foundry_engine;
+use gibbs_engine::hardware::HardwareCapability;
+use gibbs_engine::kv::{BlockId, RadixPrefixCache};
 
 #[test]
 fn test_hardware_probe_reports_detected_facts() {
@@ -14,24 +12,6 @@ fn test_hardware_probe_reports_detected_facts() {
             "hw.memsize not read"
         );
     }
-}
-
-#[test]
-fn test_fast_walsh_hadamard_transform() {
-    let mut data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-    QuantEngine::fast_walsh_hadamard_transform_f32(&mut data);
-    // Length preserved and values transformed
-    assert_eq!(data.len(), 8);
-    assert!(data.iter().all(|x| x.is_finite()));
-}
-
-#[test]
-fn test_kivi_2bit_quantization() {
-    let raw_data = vec![0.1, 0.4, 0.8, 1.2, -0.5, 0.2, 0.9, 2.1];
-    let mut packed = vec![0u8; 2];
-    let (min_val, scale) = QuantEngine::quantize_kivi_2bit(&raw_data, &mut packed);
-    assert!(scale > 0.0);
-    assert!(min_val < 0.0);
 }
 
 #[test]
@@ -55,8 +35,8 @@ fn test_radix_prefix_cache_matching() {
 fn test_codec_benchmark_efficiency() {
     #[cfg(target_os = "macos")]
     {
-        let rt = foundry_engine::graph::metal::Runtime::new(
-            &foundry_engine::model::hub::HuggingFaceHub::cache_dir(),
+        let rt = gibbs_engine::graph::metal::Runtime::new(
+            &gibbs_engine::model::hub::HuggingFaceHub::cache_dir(),
         )
         .unwrap();
         let e = rt.benchmark_codecs().unwrap();
@@ -80,10 +60,10 @@ fn test_codec_benchmark_efficiency() {
 
 #[test]
 fn test_real_smollm2_135m_decode_throughput_on_disk() {
-    use foundry_engine::hardware::Device;
-    use foundry_engine::hardware::PlacementMode;
-    use foundry_engine::model::hub::HuggingFaceHub;
-    use foundry_engine::scheduler::ExecutableModel;
+    use gibbs_engine::hardware::Device;
+    use gibbs_engine::hardware::PlacementMode;
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    use gibbs_engine::scheduler::ExecutableModel;
     use std::time::Instant;
 
     let repo = "HuggingFaceTB/SmolLM2-135M-Instruct";
@@ -92,9 +72,9 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
         println!("SKIP: SmolLM2-135M not found in disk/");
         return;
     }
-    let reg = foundry_engine::arch::registry().expect("registry");
+    let reg = gibbs_engine::arch::registry().expect("registry");
     let exec_model = ExecutableModel::new(
-        foundry_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Metal))
+        gibbs_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Metal))
             .expect("loads SmolLM2"),
     );
     let tokenizer = exec_model.tokenizer();
@@ -148,11 +128,11 @@ fn test_real_smollm2_135m_decode_throughput_on_disk() {
 
 #[test]
 fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
-    use foundry_engine::hardware::Device;
-    use foundry_engine::model::hub::HuggingFaceHub;
-    let load_native = |a: &foundry_engine::model::hub::ModelArtifacts, d: Device| {
-        let reg = foundry_engine::arch::registry().expect("registry");
-        Some(foundry_engine::runtime::lm::load(a, reg, None, foundry_engine::hardware::PlacementMode::Pin(d)))
+    use gibbs_engine::hardware::Device;
+    use gibbs_engine::model::hub::HuggingFaceHub;
+    let load_native = |a: &gibbs_engine::model::hub::ModelArtifacts, d: Device| {
+        let reg = gibbs_engine::arch::registry().expect("registry");
+        Some(gibbs_engine::runtime::lm::load(a, reg, None, gibbs_engine::hardware::PlacementMode::Pin(d)))
     };
     use std::time::Instant;
 
@@ -232,8 +212,8 @@ fn test_real_gemma4_e2b_decode_and_bandwidth_on_disk() {
 
 #[test]
 fn test_real_qwen35_9b_decode_and_roofline_on_disk() {
-    use foundry_engine::hardware::{Device, PlacementMode};
-    use foundry_engine::model::hub::HuggingFaceHub;
+    use gibbs_engine::hardware::{Device, PlacementMode};
+    use gibbs_engine::model::hub::HuggingFaceHub;
     use std::time::Instant;
 
     let repo = "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF";
@@ -243,8 +223,8 @@ fn test_real_qwen35_9b_decode_and_roofline_on_disk() {
         return;
     }
 
-    let reg = foundry_engine::arch::registry().unwrap();
-    let lm = foundry_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Metal))
+    let reg = gibbs_engine::arch::registry().unwrap();
+    let lm = gibbs_engine::runtime::lm::load(&art, reg, None, PlacementMode::Pin(Device::Metal))
         .unwrap_or_else(|e| panic!("Failed to load {repo}: {e}"));
 
     let tok = lm.tokenizer();

@@ -1,8 +1,7 @@
-use foundry_engine::model::hub::HuggingFaceHub;
-use foundry_engine::model::tokenizer::Tokenizer;
-use foundry_engine::model::UniversalModelLoader;
-use foundry_engine::telemetry::EngineTelemetry;
-use gibbs_engine::foundry_engine;
+use gibbs_engine::model::hub::HuggingFaceHub;
+use gibbs_engine::model::tokenizer::Tokenizer;
+use gibbs_engine::model::UniversalModelLoader;
+use gibbs_engine::telemetry::EngineTelemetry;
 use std::time::Duration;
 
 #[test]
@@ -111,7 +110,7 @@ fn test_gguf_stories15m_and_smollm2_tensor_execution() {
 
         let input_vec = vec![0.1f32; 288];
         let row_0 = &q_weights[0..288];
-        let dot_product = foundry_engine::model::vector_dot_product(&input_vec, row_0);
+        let dot_product = gibbs_engine::model::vector_dot_product(&input_vec, row_0);
         assert!(!dot_product.is_nan(), "GEMV dot product produced NaN");
         println!(
             "stories15M.gguf blk.0.attn_q.weight GEMV dot product: {}",
