@@ -319,7 +319,8 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
 /// Horizontal batching over the step list, as [`batches`] extracts it.
 #[derive(Debug, Default)]
 pub(super) struct Batches {
-    /// First member → the members (ascending, 2..=4) of one batched dispatch.
+    /// First member → the members (ascending, 2..=4) of one batched dispatch. Steps between members
+    /// are independent GEMVs that run ahead of the batch.
     pub runs: HashMap<usize, Vec<usize>>,
     /// An RmsNorm with a residual or scale whose next step, a plain RmsNorm of its output, chains in.
     pub chain: HashSet<usize>,
@@ -332,11 +333,13 @@ pub(super) struct Batches {
 /// `RopeKey p rk` (the RoPE fused into that norm, 0: none), `Indep a b` (step `b` reads no output of
 /// `a`, `b - a < 8`). `R{L}` is a run of `L` members from `s` whose next candidate is at `c` and
 /// whose RoPE is `rk`; it grows by the next step when that is of the run's kind, independent of
-/// every member and RoPE-compatible.
+/// every member and RoPE-compatible, or — for norm runs — by the step after an independent
+/// `Movable` GEMV.
 const BATCH_PROGRAM: &str = r#"
 (relation BKind (i64 i64))
 (relation RopeKey (i64 i64))
 (relation Solo (i64))
+(relation Movable (i64))
 (relation Indep (i64 i64))
 (relation NormRS (i64 i64 i64 i64))
 (relation NormPlain0 (i64 i64 i64 i64))
@@ -370,8 +373,17 @@ static BATCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
                 .collect()
         };
         let state = format!("(R{l} s {} c rk)", ms.join(" "));
-        let (pre, at) = ("(BKind s k)", "c");
-        {
+        let grow = [
+            ("(BKind s k)".to_string(), "c"),
+            (
+                format!(
+                    "(BKind s k) (= k 1) (Movable c) {}(= at (+ c 1))",
+                    indep("c")
+                ),
+                "at",
+            ),
+        ];
+        for (pre, at) in &grow {
             for (compat, rk) in [
                 (format!("(RopeKey {at} 0)"), "rk"),
                 (format!("(RopeKey {at} nk) (> nk 0) (= rk 0)"), "nk"),
@@ -481,6 +493,16 @@ pub(super) fn batches(
                 }
                 _ => None,
             };
+            let gemv = matches!(s.op, Step::GemvPacked { .. });
+            let writes_state = matches!(
+                s.op,
+                Step::Ext(super::ext::ExtStep::Movement(
+                    super::ext::movement::Step::StateWrite { .. }
+                ))
+            );
+            if kind.is_none() && solo && !writes_state && gemv {
+                fs.add("Movable", pi)?;
+            }
             if let Some(k) = kind {
                 fs.add("BKind", (pi, k))?;
                 let out = root(s.out);
@@ -831,7 +853,7 @@ pub(super) fn moe(
 
 #[cfg(test)]
 mod tests {
-    use super::super::plan;
+    use super::super::{batch_horizontal, plan};
     use super::*;
     use crate::graph::{ReduceKind, Weights};
 
@@ -922,6 +944,36 @@ mod tests {
         assert_eq!(d.norm[&0].res, Some((1, x)));
     }
 
+    /// Norms around an independent elementwise step do not batch; norms around a GEMV batch.
+    #[test]
+    fn batches_commute_gemvs() {
+        let mut g = Graph::new();
+        let x = g.input("x", vec![1, 64], F);
+        let y = g.input("y", vec![1, 64], F);
+        let gw = g.weight("g", vec![64], F);
+        let w = g.weight("w", vec![64, 64], DType::F16);
+        let a = g.add("a", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
+        let neg = Op::Unary {
+            kind: crate::graph::UnaryKind::Neg,
+        };
+        let m = g.add("m", neg, &[y], vec![1, 64], F);
+        let b = g.add("b", Op::RmsNorm { eps: 1e-5 }, &[y, gw], vec![1, 64], F);
+        let l = g.add("l", Op::Linear, &[x, w], vec![1, 64], F);
+        let c = g.add("c", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
+        for o in [a, m, b, l, c] {
+            g.output(o);
+        }
+        let (steps, aliases) = plan(&g).unwrap();
+        assert_eq!(steps.len(), 5);
+        let off = batches(&steps, &aliases).unwrap();
+        assert_eq!(off.runs, HashMap::from([(2, vec![2, 4])]));
+        let kinds: Vec<String> = batch_horizontal(steps, &aliases)
+            .unwrap()
+            .iter()
+            .map(|s| super::super::kernel_kind(&format!("{:?}", s.op)).to_string())
+            .collect();
+        assert_eq!(kinds, ["RmsNorm", "Unary", "GemvPacked", "RmsNormBatch"]);
+    }
 
     /// Router TopK + GatherCols + Softmax (+ scale), the gate/up half-split GLU and the
     /// expert-weighted Sum each plan as one step.
