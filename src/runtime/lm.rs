@@ -18,7 +18,7 @@
 //! media rows) and `rope_positions` (`[t, h, w]` per row from `positions: mrope_grid`; text rows
 //! `p` repeated, rows past the prompt shifted by its delta).
 //!
-//! `runtime` keys: `prefill_rows` (64) rows per prefill pass; `bidir_media_blocks`: a pass that
+//! `runtime` keys: `prefill_rows` (512) rows per prefill pass; `bidir_media_blocks`: a pass that
 //! would end inside a bidirectional block runs to the block's end (at most 512 rows), and the
 //! block end's logits answer the positions it ran ahead; `media` ([`crate::runtime::media`]):
 //! each attached item is preprocessed, run through its modality's tower component once at
@@ -59,7 +59,7 @@ struct Runtime {
 }
 
 fn prefill_rows() -> usize {
-    64
+    512
 }
 
 /// One sequence's state.
