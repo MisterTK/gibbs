@@ -1246,8 +1246,8 @@ impl Runtime {
             "#define GIBBS_MPP 1\n#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace metal;\n",
         );
         src.push_str(crate::graph::codegen::gemm_common(&KERNELS_MSL));
-        src.push_str(&crate::graph::codegen::gemm_packed(c, epi_u32));
-        let name = crate::graph::codegen::gemm_packed_name(c, epi_u32);
+        src.push_str(&crate::graph::codegen::gemm_packed(c, epi_u32, false));
+        let name = crate::graph::codegen::gemm_packed_name(c, epi_u32, false);
         let pso = self.compile_generated(&src, &name)?;
         self.gemm_psos.lock().insert(key, pso.clone());
         Ok(pso)

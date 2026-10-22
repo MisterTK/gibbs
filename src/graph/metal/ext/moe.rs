@@ -12,7 +12,8 @@ use super::super::{new_shared_buffer, numel, set_bytes, u32_of, Planned, Session
 use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
-    block_ref, device_msl, gemv_indexed, gemv_indexed_name, gemv_rows_per_tg, GemvParams,
+    block_ref, device_msl, gemm_common, gemm_packed, gemm_packed_name, gemv_indexed,
+    gemv_indexed_name, gemv_rows_per_tg, GemvParams,
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
@@ -33,12 +34,15 @@ pub(super) const KERNELS: &[&str] = &[
     "moe_embed_bf16",
     "moe_qsa_select_f32",
     "moe_qsa_bias_f32",
+    "moe_map_rows",
 ];
 
 /// A single-row `TopK { k: 1 }` at least this wide runs the two-pass argmax (one threadgroup per
 /// `ARGMAX_SPAN` columns, then one reducing threadgroup) instead of one threadgroup over the row.
 const ARGMAX_WIDE: usize = 8192;
 const ARGMAX_SPAN: usize = 4096;
+/// Minimum routed slot count (`m * top_k`) at which `Step::ExpertLinear` uses grouped expert GEMM.
+const MOE_GEMM_MIN_SLOTS: usize = 32;
 
 /// Source encoding of an embedding table.
 #[derive(Debug, Clone, Copy)]
@@ -485,6 +489,27 @@ fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineSt
     Ok(pso)
 }
 
+/// Per (device, codec, epi) pipelines of indexed [`gemm_packed`], compiled on first use.
+static MOE_GEMM: LazyLock<Mutex<HashMap<(u64, QuantFormat, u32), ComputePipelineState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn moe_gemm_pso(sess: &Session, c: &Codec, epi: u32) -> Result<ComputePipelineState, String> {
+    let device = &sess.rt.device;
+    let key = (device.registry_id(), c.format, epi);
+    if let Some(p) = MOE_GEMM.lock().get(&key) {
+        return Ok(p.clone());
+    }
+    let mut src = String::from(
+        "#define GIBBS_MPP 1\n#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace metal;\n",
+    );
+    src.push_str(gemm_common(&super::super::KERNELS_MSL));
+    src.push_str(&gemm_packed(c, epi, true));
+    let name = gemm_packed_name(c, epi, true);
+    let pso = sess.rt.compile_generated(&src, &name)?;
+    MOE_GEMM.lock().insert(key, pso.clone());
+    Ok(pso)
+}
+
 pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<(), String> {
     let (enc, rt) = (e.enc, &sess.rt);
     match st {
@@ -586,37 +611,91 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
         } => {
             let c = bank_codec(*dtype)
                 .ok_or_else(|| format!("node '{}': no GEMV codec for {dtype:?}", s.name))?;
-            let r = moe_rows_per_sg(c);
-            let pso = moe_gemv_pso(sess, c, r)?;
-            enc.set_compute_pipeline_state(&pso);
-            e.bind(0, *bank);
-            e.bind(1, *x);
-            e.bind(2, s.out);
-            set_bytes(
-                enc,
-                3,
-                &[
-                    u32_of(*rows)?,
-                    u32_of(*cols)?,
-                    u32_of(*slots)?,
-                    u32_of(*top_k)?,
-                    u32_of(*experts)?,
-                    *x_per_slot as u32,
-                ],
-            );
-            e.bind(4, *ids);
-            let rows_per_tg = gemv_rows_per_tg(GemvParams {
-                rows_per_sg: r,
-                ..Default::default()
-            });
-            enc.dispatch_thread_groups(
-                MTLSize::new(
-                    (*rows as u64).div_ceil(rows_per_tg as u64),
-                    *slots as u64,
-                    1,
-                ),
-                MTLSize::new(256, 1, 1),
-            );
+            if *slots >= MOE_GEMM_MIN_SLOTS && rt.profile.mpp.is_ok() {
+                let need = (*experts + *experts * *slots) * 4;
+                let mut guard = sess.argmax_scratch.lock();
+                if guard
+                    .as_ref()
+                    .is_none_or(|b| (b.length() as usize) < need)
+                {
+                    *guard = Some(new_shared_buffer(&rt.device, need)?);
+                }
+                let scratch = guard.as_ref().expect("allocated above");
+                let list_off = (*experts * 4) as u64;
+                enc.set_compute_pipeline_state(rt.pso("moe_map_rows")?);
+                e.bind(0, *ids);
+                enc.set_buffer(1, Some(scratch), 0);
+                enc.set_buffer(2, Some(scratch), list_off);
+                e.bind(3, s.out);
+                set_bytes(
+                    enc,
+                    4,
+                    &[u32_of(*slots)?, u32_of(*experts)?, u32_of(*rows)?],
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+
+                let pso = moe_gemm_pso(sess, c, 0)?;
+                enc.set_compute_pipeline_state(&pso);
+                e.bind(0, *x);
+                e.bind(1, *bank);
+                enc.set_buffer(2, Some(scratch), 0);
+                enc.set_buffer(3, Some(scratch), list_off);
+                e.bind(4, s.out);
+                set_bytes(
+                    enc,
+                    5,
+                    &[
+                        u32_of(*rows)?,
+                        u32_of(*cols)?,
+                        u32_of(*slots)?,
+                        u32_of(*top_k)?,
+                        u32_of(*experts)?,
+                        *x_per_slot as u32,
+                    ],
+                );
+                let shmem = if c.format == QuantFormat::FP32 { 24576 } else { 20480 };
+                enc.set_threadgroup_memory_length(0, shmem);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        (*slots as u64).div_ceil(128),
+                        (*rows as u64).div_ceil(64),
+                        *experts as u64,
+                    ),
+                    MTLSize::new(super::super::TG4, 1, 1),
+                );
+            } else {
+                let r = moe_rows_per_sg(c);
+                let pso = moe_gemv_pso(sess, c, r)?;
+                enc.set_compute_pipeline_state(&pso);
+                e.bind(0, *bank);
+                e.bind(1, *x);
+                e.bind(2, s.out);
+                set_bytes(
+                    enc,
+                    3,
+                    &[
+                        u32_of(*rows)?,
+                        u32_of(*cols)?,
+                        u32_of(*slots)?,
+                        u32_of(*top_k)?,
+                        u32_of(*experts)?,
+                        *x_per_slot as u32,
+                    ],
+                );
+                e.bind(4, *ids);
+                let rows_per_tg = gemv_rows_per_tg(GemvParams {
+                    rows_per_sg: r,
+                    ..Default::default()
+                });
+                enc.dispatch_thread_groups(
+                    MTLSize::new(
+                        (*rows as u64).div_ceil(rows_per_tg as u64),
+                        *slots as u64,
+                        1,
+                    ),
+                    MTLSize::new(256, 1, 1),
+                );
+            }
         }
         Step::Embed {
             table,
@@ -1279,6 +1358,63 @@ mod tests {
                     rel_err(&want, &got) < 1e-4,
                     "m={m} top_k={top_k} E={experts} {rows}x{cols} x_rows={x_rows}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn moe_linear_grouped_gemm_matches_cpu() {
+        let (experts, top_k, rows) = (16usize, 8usize, 65usize);
+        let mut s = 123u64;
+        let mut route = |n: usize| -> Vec<u32> {
+            (0..n)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((s >> 33) % experts as u64) as u32
+                })
+                .collect()
+        };
+        for (i, fmt) in [
+            Fmt::F32,
+            Fmt::F16,
+            Fmt::BF16,
+            Fmt::Q(Q::GGUF_IQ2_XXS),
+            Fmt::Q(Q::GGUF_IQ4_NL),
+            Fmt::Q(Q::GGUF_Q4_0),
+            Fmt::Q(Q::GGUF_Q8_0),
+            Fmt::Q(Q::GGUF_Q4_K_M),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cols = match fmt {
+                Fmt::Q(f) => {
+                    let be = crate::graph::codec::codec(f).expect("codec").block_elems as usize;
+                    (256 / be).max(1) * be
+                }
+                _ => 64,
+            };
+            for m in [4usize, 64usize] {
+                let ids = route(m * top_k);
+                for x_rows in [m, m * top_k] {
+                    let (want, got) = moe_both(
+                        fmt,
+                        x_rows,
+                        cols,
+                        rows,
+                        experts,
+                        top_k,
+                        ids.clone(),
+                        100 + i as u64,
+                    );
+                    let err = rel_err(&want, &got);
+                    assert!(
+                        err < 2e-3,
+                        "grouped gemm {fmt:?} m={m} x_rows={x_rows}: rel_err={err}"
+                    );
+                }
             }
         }
     }

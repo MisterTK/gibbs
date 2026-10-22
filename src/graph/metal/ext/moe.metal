@@ -304,3 +304,29 @@ kernel void moe_qsa_bias_f32(device const uint* pos [[buffer(0)]],
     const uint cnt = nb <= p.top ? v : p.top * p.ratio + (v - nb * p.ratio);
     out[i] = i % p.k < cnt ? 0.0f : -INFINITY;
 }
+
+// Groups `ids[slots]` (expert per slot) into per-expert counts and `slot_list[experts][slots]`.
+// Slots whose expert id is >= `experts` have their output row zeroed so `gemmgen_id_<fmt>` can skip them.
+struct MoeMapParams { uint slots; uint experts; uint rows; };
+
+kernel void moe_map_rows(device const uint* ids [[buffer(0)]],
+                         device atomic_uint* counts [[buffer(1)]],
+                         device uint* slot_list [[buffer(2)]],
+                         device float* out [[buffer(3)]],
+                         constant MoeMapParams& p [[buffer(4)]],
+                         uint tid [[thread_position_in_threadgroup]]) {
+    for (uint e = tid; e < p.experts; e += 256) {
+        atomic_store_explicit(&counts[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint s = tid; s < p.slots; s += 256) {
+        const uint e = ids[s];
+        if (e < p.experts) {
+            const uint idx = atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
+            slot_list[(ulong)e * p.slots + idx] = s;
+        } else {
+            device float* y = out + (ulong)s * p.rows;
+            for (uint r = 0; r < p.rows; ++r) y[r] = 0.0f;
+        }
+    }
+}

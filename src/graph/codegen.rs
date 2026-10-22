@@ -201,24 +201,165 @@ pub fn gemm_codec(f: crate::hardware::QuantFormat) -> Option<&'static Codec> {
     }
 }
 
-/// Name of the kernel [`gemm_packed`] emits for `codec` with `epi`.
-pub fn gemm_packed_name(codec: &Codec, epi: u32) -> String {
-    format!("gemmgen_{:?}_e{epi}", codec.format)
+/// Name of the kernel [`gemm_packed`] emits for `codec` with `epi` (and `indexed` for MoE banks).
+pub fn gemm_packed_name(codec: &Codec, epi: u32, indexed: bool) -> String {
+    if indexed {
+        let suffix = match epi {
+            0 => "none",
+            1 => "gelu",
+            2 => "residual",
+            3 => "silu",
+            _ => "none",
+        };
+        format!("gemmgen_id_{:?}_{suffix}", codec.format)
+    } else {
+        format!("gemmgen_{:?}_e{epi}", codec.format)
+    }
 }
 
 /// In-tile dequantization GEMM on the GPU's matrix units (`matmul2d` over a 128×64 output tile,
 /// K step 32, 4 KiB threadgroup weight tile, 128 threads / 4 simdgroups).
-/// Reference: ggml-metal tensor-API `kernel_mul_mm`.
-pub fn gemm_packed(codec: &Codec, epi: u32) -> String {
-    let name = gemm_packed_name(codec, epi);
+/// When `indexed` is true, runs grouped expert GEMM (`grid = (ceil(slots/128), ceil(n/64), experts)`)
+/// using `counts[experts]` and `slot_list[experts][slots]` produced by `moe_map_rows`.
+/// Reference: ggml-metal tensor-API `kernel_mul_mm` / `kernel_mul_mm_id`.
+pub fn gemm_packed(codec: &Codec, epi: u32, indexed: bool) -> String {
+    let name = gemm_packed_name(codec, epi, indexed);
     let dec = format!("decode8_{:?}", codec.format);
     let codec_msl = device_msl(codec).replace("decode8", &dec);
     let (sa_ty, relaxed) = match codec.format {
+        crate::hardware::QuantFormat::FP32 => ("float", false),
         crate::hardware::QuantFormat::BF16 => ("bfloat", false),
         crate::hardware::QuantFormat::FP16 => ("half", false),
         _ => ("half", true),
     };
     let (be, subs) = (codec.block_elems, codec.block_elems / 8);
+    if indexed {
+        let br = block_ref(
+            codec,
+            "w",
+            &format!("((ulong)e * p.rows + col) * (p.cols / {be}) + s / {subs}"),
+        );
+        let (decl, sub) = (&br.decl, &br.sub);
+        let epi_expr = match epi {
+            1 => "gelu_erf(val)",
+            3 => "val / (1.0f + exp(-val))",
+            _ => "val",
+        };
+        return format!(
+            r#"
+#if defined(GIBBS_MPP)
+using namespace mpp::tensor_ops;
+{codec_msl}
+
+struct MoeGemmParams {{
+    uint rows;
+    uint cols;
+    uint slots;
+    uint top_k;
+    uint experts;
+    uint x_per_slot;
+}};
+
+kernel void {name}(
+    device const float* x [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const uint* counts [[buffer(2)]],
+    device const uint* slot_list [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant MoeGemmParams& p [[buffer(5)]],
+    threadgroup uchar* shmem [[threadgroup(0)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {{
+    const uint e = tg.z;
+    if (e >= p.experts) return;
+    const uint cnt = counts[e];
+    const uint m0 = tg.x * 128;
+    const uint n0 = tg.y * 64;
+    if (m0 >= cnt || n0 >= p.rows) return;
+    const uint tile_m = min(128u, cnt - m0);
+    threadgroup {sa_ty}* sa = (threadgroup {sa_ty}*)shmem;
+    threadgroup float* sb = (threadgroup float*)(shmem + 64 * 32 * sizeof({sa_ty}));
+    device const uint* elist = slot_list + (ulong)e * p.slots + m0;
+
+    auto tA = tensor(sa, dextents<int32_t, 2>(32, 64), array<int, 2>({{1, 32}}));
+    auto tB = tensor(sb, dextents<int32_t, 2>(32, 128), array<int, 2>({{1, 32}}));
+    constexpr auto desc = matmul2d_descriptor(
+        128, 64, static_cast<int>(dynamic_extent), false, true, {relaxed},
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> mm;
+    auto c = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+        if (c.is_valid_element(i)) c[i] = 0.0f;
+    }}
+
+    for (uint k0 = 0; k0 < p.cols; k0 += 32) {{
+        for (uint work = tid; work < 256; work += 128) {{
+            const uint feat = work / 4;
+            const uint chunk = work % 4;
+            const uint col = n0 + feat;
+            const uint gk = k0 + chunk * 8;
+            threadgroup {sa_ty}* dst = sa + feat * 32 + chunk * 8;
+            if (col < p.rows && gk < p.cols) {{
+                const uint s = gk / 8;
+                {decl}
+                float v[8];
+                {dec}(b, {sub}s % {subs}, v);
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) {{
+                    dst[i] = (gk + i < p.cols) ? {sa_ty}(v[i]) : {sa_ty}(0);
+                }}
+            }} else {{
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) dst[i] = {sa_ty}(0);
+            }}
+        }}
+        for (uint work = tid; work < 512; work += 128) {{
+            const uint r = work / 4;
+            const uint chunk = work % 4;
+            const uint gk = k0 + chunk * 8;
+            threadgroup float* dst = sb + r * 32 + chunk * 8;
+            if (r < tile_m && gk < p.cols) {{
+                const uint slot = elist[r];
+                const uint x_row = p.x_per_slot != 0 ? slot : (slot / p.top_k);
+                device const float* xr = x + (ulong)x_row * p.cols + gk;
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) {{
+                    dst[i] = (gk + i < p.cols) ? xr[i] : 0.0f;
+                }}
+            }} else {{
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) dst[i] = 0.0f;
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int kExt = int(min(32u, p.cols - k0));
+        auto xv = tensor(sb, dextents<int32_t, 2>(kExt, int(tile_m)), array<int, 2>({{1, 32}}));
+        auto sav = tensor(sa, dextents<int32_t, 2>(kExt, 64), array<int, 2>({{1, 32}}));
+        mm.run(xv, sav, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    #pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+        if (c.is_valid_element(i)) {{
+            auto idx = c.get_multidimensional_index(i);
+            const uint col = n0 + uint(idx[0]);
+            const uint r = uint(idx[1]);
+            if (r < tile_m && col < p.rows) {{
+                const uint slot = elist[r];
+                const float val = c[i];
+                out[(ulong)slot * p.rows + col] = {epi_expr};
+            }}
+        }}
+    }}
+}}
+#endif
+"#
+        );
+    }
     let br = block_ref(
         codec,
         "w",

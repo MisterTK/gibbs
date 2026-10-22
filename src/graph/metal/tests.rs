@@ -1137,16 +1137,28 @@ fn every_kernel_source_compiles() {
         }
         for epi in [0, 1, 2] {
             build(
-                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi)),
-                &codegen::gemm_packed_name(c, epi),
+                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, false)),
+                &codegen::gemm_packed_name(c, epi, false),
+            );
+        }
+        for epi in [0, 1, 3] {
+            build(
+                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, true)),
+                &codegen::gemm_packed_name(c, epi, true),
             );
         }
     }
     for c in [&codegen::CODEC_F16, &codegen::CODEC_BF16] {
         for epi in [0, 1, 2] {
             build(
-                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi)),
-                &codegen::gemm_packed_name(c, epi),
+                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, false)),
+                &codegen::gemm_packed_name(c, epi, false),
+            );
+        }
+        for epi in [0, 1, 3] {
+            build(
+                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi, true)),
+                &codegen::gemm_packed_name(c, epi, true),
             );
         }
     }
