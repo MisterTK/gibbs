@@ -442,17 +442,14 @@ pub(crate) fn kv_f16_default() -> bool {
 const TG: u64 = 256;
 const TG4: u64 = 128;
 /// Linear shapes `[m, n, k]` timed by the host profile: few and many rows, square, wide, and tall.
-const GEMM_BENCH_SHAPES: [[usize; 3]; 10] = [
+// ponytail: shapes are System 1's (hidden 384, FFN 1536); add the LLM/SD shape classes with P3/P5.
+const GEMM_BENCH_SHAPES: [[usize; 3]; 6] = [
     [16, 384, 384],
     [16, 1536, 384],
     [16, 384, 1536],
     [256, 384, 384],
     [256, 1536, 384],
     [256, 384, 1536],
-    [512, 2048, 2048],
-    [512, 8192, 2048],
-    [512, 2048, 8192],
-    [4096, 3072, 3072],
 ];
 const ATTN_MAX_HEAD_DIM: usize = 512;
 /// Decode attention splits its keys across threadgroups from this many visible keys, about
@@ -1474,9 +1471,8 @@ impl Runtime {
             let kinds = GemmKernel::ALL
                 .into_iter()
                 .filter(|&k| k != GemmKernel::Mpp || mpp.is_ok());
-            let reps = if m * n * k >= 1_000_000_000 { 5 } else { 50 };
             let us = kinds
-                .map(|kind| Ok((kind, gemm_time(shape, kind, reps)?)))
+                .map(|kind| Ok((kind, gemm_time(shape, kind, 50)?)))
                 .collect::<Result<_, String>>()?;
             gemm.push(GemmTiming { m, n, k, us });
         }
