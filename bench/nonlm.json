@@ -15,7 +15,8 @@
     {
       "id": "sentence-transformers/all-MiniLM-L6-v2",
       "kind": "embed",
-      "items": 64,
+      "items": 1024,
+      "runs": 3,
       "prompt": "The quick brown fox jumps over the lazy dog while the farmer counts his sheep in the early morning light, and the river keeps flowing past the old mill toward the sea where fishing boats wait for the tide to turn again tonight."
     },
     {
