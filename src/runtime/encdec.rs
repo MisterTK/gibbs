@@ -29,6 +29,7 @@ use crate::model::hub::ModelArtifacts;
 use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::seq2seq::EncDecText;
 use crate::model::tokenizer::Tokenizer;
+use crate::model::weight_format::{ReencodeConfig, ReencodePolicy};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::Value;
@@ -162,7 +163,12 @@ pub fn load(
     family: Option<&str>,
     mode: PlacementMode,
 ) -> Result<Arc<dyn NativeLm>, String> {
-    let m = crate::arch::load::load(artifacts, reg, family)?;
+    let reencode = ReencodeConfig {
+        policy: ReencodePolicy::BitExact,
+        force: ReencodeConfig::effective().force,
+        ..Default::default()
+    };
+    let m = crate::arch::load::load_with(artifacts, reg, family, reencode)?;
     Ok(Arc::new(SpecEncDec::new(m, mode)?))
 }
 

@@ -11,6 +11,7 @@ use crate::hardware::PlacementMode;
 use crate::model::hub::{HuggingFaceHub, ModelArtifacts};
 use crate::model::image::ImageBuffer;
 use crate::model::lora::Part as LoraPart;
+use crate::model::weight_format::{ReencodeConfig, ReencodePolicy};
 use crate::runtime::sched::{
     card_sigmas, default_sigmas, dpm_flow_sigmas, euler_step, linspace_sigmas, DpmSolver2, Mu, Rng,
     Schedule, Scheduler, SchedulerConfig, TRAIN_STEPS,
@@ -161,8 +162,17 @@ impl Net {
 
     /// Loads component directory `dir` as `family` and runs its network `net` on `mode`.
     pub fn open(dir: &Path, family: &str, net: &str, mode: PlacementMode) -> Result<Self, String> {
-        let m =
-            crate::arch::load::load(&dir_artifacts(dir), crate::arch::registry()?, Some(family))?;
+        let reencode = ReencodeConfig {
+            policy: ReencodePolicy::BitExact,
+            force: ReencodeConfig::effective().force,
+            ..Default::default()
+        };
+        let m = crate::arch::load::load_with(
+            &dir_artifacts(dir),
+            crate::arch::registry()?,
+            Some(family),
+            reencode,
+        )?;
         crate::arch::load::check(&m)?;
         Ok(Self::new(Arc::new(m), net, mode))
     }
@@ -727,7 +737,12 @@ impl SpecDiffusion {
         };
         // The spec's `checks` run on the root and on every component load (a family may
         // reference itself for its networks): checks reading tensors or `cfg` guard on them.
-        let root = crate::arch::load::load(&root_art, reg, family)?;
+        let reencode = ReencodeConfig {
+            policy: ReencodePolicy::BitExact,
+            force: ReencodeConfig::effective().force,
+            ..Default::default()
+        };
+        let root = crate::arch::load::load_with(&root_art, reg, family, reencode.clone())?;
         crate::arch::load::check(&root)?;
         let fam = root.spec.family.clone();
         let rt: Runtime = root.spec.runtime_as()?;
@@ -760,7 +775,7 @@ impl SpecDiffusion {
                     let mut a = dir_artifacts(&dir.join(&d));
                     a.weights_path = Some(w.clone());
                     a.model_id = w.display().to_string();
-                    crate::arch::load::load(&a, reg, Some(&family))?
+                    crate::arch::load::load_with(&a, reg, Some(&family), reencode.clone())?
                 }
                 _ => root.component(reg, name)?,
             };
