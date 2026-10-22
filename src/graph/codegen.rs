@@ -789,12 +789,7 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
 
 /// Name of the kernel [`gemv_indexed`] emits for `codec` with `p`.
 pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
-    let sg = if p.simdgroups == 8 {
-        String::new()
-    } else {
-        format!("_sg{}", p.simdgroups)
-    };
-    format!("gemvgen_{:?}_r{}{sg}_ix", codec.format, p.rows_per_sg)
+    format!("gemvgen_{:?}_r{}_ix", codec.format, p.rows_per_sg)
 }
 
 /// [`gemv_packed`] over an expert bank: the weight is `experts` stacked `[rows, cols]` matrices and
