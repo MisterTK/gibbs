@@ -99,7 +99,6 @@ mod tests {
         let d = GemvParams::default();
         assert_eq!(gemv_packed_name(c, d), "gemvgen_GGUF_Q4_K_M_r2");
     }
-
 }
 
 /// Rows one threadgroup of [`gemv_packed`] covers: `simdgroups` × `rows_per_sg`.
@@ -214,10 +213,10 @@ pub fn gemm_packed(codec: &Codec, epi: u32) -> String {
     let name = gemm_packed_name(codec, epi);
     let dec = format!("decode8_{:?}", codec.format);
     let codec_msl = device_msl(codec).replace("decode8", &dec);
-    let sa_ty = if codec.format == crate::hardware::QuantFormat::BF16 {
-        "bfloat"
-    } else {
-        "half"
+    let (sa_ty, relaxed) = match codec.format {
+        crate::hardware::QuantFormat::BF16 => ("bfloat", false),
+        crate::hardware::QuantFormat::FP16 => ("half", false),
+        _ => ("half", true),
     };
     let (be, subs) = (codec.block_elems, codec.block_elems / 8);
     let br = block_ref(
@@ -252,7 +251,7 @@ kernel void {name}(
     auto tA = tensor(sa, dextents<int32_t, 2>(32, 64), array<int, 2>({{1, 32}}));
     auto tB = tensor(x, dextents<int32_t, 2>(int(p.k), int(p.m)), array<int, 2>({{1, int(p.k)}}));
     constexpr auto desc = matmul2d_descriptor(
-        128, 64, static_cast<int>(dynamic_extent), false, true, true,
+        128, 64, static_cast<int>(dynamic_extent), false, true, {relaxed},
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroups<4>> mm;
     auto c = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
@@ -288,7 +287,6 @@ kernel void {name}(
         auto xv = tensor(x + (ulong)m0 * p.k + k0, dextents<int32_t, 2>(kExt, tile_m), array<int, 2>({{1, int(p.k)}}));
         auto sav = tensor(sa, dextents<int32_t, 2>(kExt, 64), array<int, 2>({{1, 32}}));
         mm.run(xv, sav, c);
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
@@ -638,7 +636,6 @@ fn tile_loop(codec: &Codec, t: &Tile, p: GemvParams, dec: &str) -> String {
 pub fn gemv_indexed_name(codec: &Codec, p: GemvParams) -> String {
     format!("gemvgen_{:?}_r{}_ix", codec.format, p.rows_per_sg)
 }
-
 
 /// [`gemv_packed`] over an expert bank: the weight is `experts` stacked `[rows, cols]` matrices and
 /// slot `s` (grid y) multiplies row `s` of `x` (`x_per_slot != 0`) or row `s / top_k` by the matrix
