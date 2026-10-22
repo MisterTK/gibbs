@@ -14,14 +14,18 @@
 //! rows) the f32 values are encoded in the source format when an encoder exists (exact for Q4_0 and
 //! Q8_0, one more quantization step for the K-quants, recorded as `lossy`).
 
-use crate::graph::codec::codec;
+use crate::graph::codec::{codec, CODEC_VERSION};
 use crate::hardware::QuantFormat as Q;
 use crate::model::layers::{dequantize_gguf_blocks, encode_rows, gguf_block_codec};
+use crate::model::loaders::gguf::GgufData;
 use crate::model::weight_format::ReencodePolicy;
 use crate::model::VirtualTensor;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-
+use std::sync::Arc;
 /// Re-encode formats from smallest to largest.
 pub const LADDER: [Q; 4] = [Q::GGUF_Q4_K_M, Q::GGUF_Q5_K_M, Q::GGUF_Q6_K, Q::GGUF_Q8_0];
 /// Per-tensor gate: relative RMSE of the re-encoded weights against the source values.
@@ -271,6 +275,14 @@ pub(crate) fn encode_weight(
 // ---- native loaders -------------------------------------------------------------------------
 
 /// What the native loaders did to their tensors since [`reset_native_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChoiceRecord {
+    pub policy: ReencodePolicy,
+    pub ffn_only: bool,
+    pub mean_kl: f64,
+    pub top1: f64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NativeStats {
     /// Projection matrices considered.
@@ -279,6 +291,12 @@ pub struct NativeStats {
     pub reencoded: usize,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// Matrices mapped directly from a persisted `.blocks` cache.
+    pub cache_hits: usize,
+    /// Whether any entry in the `.index.json` cache mismatched the checkpoint tensor's size or format.
+    pub cache_mismatch: bool,
+    /// Accepted rung loaded from `<choice_key>.json`, if any.
+    pub cached_choice: Option<ChoiceRecord>,
 }
 
 static NATIVE_STATS: Mutex<NativeStats> = Mutex::new(NativeStats {
@@ -286,16 +304,23 @@ static NATIVE_STATS: Mutex<NativeStats> = Mutex::new(NativeStats {
     reencoded: 0,
     bytes_before: 0,
     bytes_after: 0,
+    cache_hits: 0,
+    cache_mismatch: false,
+    cached_choice: None,
 });
 
 pub fn reset_native_stats() {
     *NATIVE_STATS.lock() = NativeStats::default();
+    *PENDING_REENCODE.lock() = None;
 }
 
 pub fn native_stats() -> NativeStats {
     *NATIVE_STATS.lock()
 }
 
+pub fn set_cached_choice(c: ChoiceRecord) {
+    NATIVE_STATS.lock().cached_choice = Some(c);
+}
 /// Test hook: pretend the current load re-encoded `n` tensors.
 #[cfg(test)]
 pub(crate) fn fake_native_reencoded(n: usize) {
@@ -514,6 +539,264 @@ fn encode_blocks(
     Some((f, blocks))
 }
 
+
+// ---- persisted block cache ------------------------------------------------------------------
+
+const TENSOR_ALIGN: usize = 64;
+const PAGE_ALIGN: usize = 16384;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedTensor {
+    pub format: Q,
+    pub offset: usize,
+    pub bytes: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+pub struct ReencodeCache {
+    pub key: String,
+    pub map: Arc<GgufData>,
+    pub index: BTreeMap<String, CachedTensor>,
+}
+
+#[derive(Clone)]
+pub struct PendingTensor {
+    pub format: Q,
+    pub map: Arc<GgufData>,
+    pub off: usize,
+    pub bytes: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+pub type PendingReencode = (String, BTreeMap<String, PendingTensor>);
+
+static PENDING_REENCODE: Mutex<Option<PendingReencode>> = Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_DIR: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_cache_dir<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+    let prev = TEST_CACHE_DIR.with(|c| c.replace(Some(dir.to_path_buf())));
+    let r = f();
+    TEST_CACHE_DIR.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+pub fn reencode_cache_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    return TEST_CACHE_DIR.with(|c| c.borrow().as_ref().map(|d| d.join("reencoded")));
+    #[cfg(not(test))]
+    crate::hardware::default_cache_dir()
+        .ok()
+        .map(|d| d.join("reencoded"))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GateContext {
+    pub requested_policy: ReencodePolicy,
+    pub max_kl: Option<f64>,
+    pub allow_redirect: bool,
+}
+
+static GATE_CONTEXT: Mutex<Option<GateContext>> = Mutex::new(None);
+
+pub fn set_gate_context(ctx: Option<GateContext>) {
+    *GATE_CONTEXT.lock() = ctx;
+}
+
+pub fn gate_context() -> Option<GateContext> {
+    *GATE_CONTEXT.lock()
+}
+
+pub fn choice_key(
+    weights: &Path,
+    policy: ReencodePolicy,
+    max_kl: Option<f64>,
+    force: Option<Q>,
+) -> Option<String> {
+    let m = weights.metadata().ok()?;
+    let mtime = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let kl_bits = max_kl.map(f64::to_bits);
+    let s = format!(
+        "{}|{}|{mtime}|{}|{kl_bits:?}|{force:?}|{CODEC_VERSION}",
+        weights.display(),
+        m.len(),
+        policy.name(),
+    );
+    let h = s.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    });
+    Some(format!("{h:016x}"))
+}
+
+pub fn read_choice_record(key: &str) -> Option<ChoiceRecord> {
+    let dir = reencode_cache_dir()?;
+    let bytes = std::fs::read(dir.join(format!("{key}.json"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+impl ReencodeCache {
+    pub fn open(key: &str) -> Option<Arc<Self>> {
+        let dir = reencode_cache_dir()?;
+        let blocks_path = dir.join(format!("{key}.blocks"));
+        let index_path = dir.join(format!("{key}.index.json"));
+        let index_bytes = std::fs::read(&index_path).ok()?;
+        let index: BTreeMap<String, CachedTensor> = serde_json::from_slice(&index_bytes).ok()?;
+        let file = std::fs::File::open(&blocks_path).ok()?;
+        // SAFETY: read-only mapping of a cache file replaced only by atomic rename.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        #[cfg(unix)]
+        unsafe {
+            libc::madvise(
+                mmap.as_ptr() as *mut libc::c_void,
+                mmap.len(),
+                libc::MADV_WILLNEED,
+            );
+        }
+        Some(Arc::new(Self {
+            key: key.to_string(),
+            map: Arc::new(GgufData::Map(mmap)),
+            index,
+        }))
+    }
+}
+
+/// Records a cache hit for `name` in `NATIVE_STATS` and `PENDING_REENCODE`.
+
+pub fn record_cache_hit(
+    key: &str,
+    name: &str,
+    src: Q,
+    format: Q,
+    map: Arc<GgufData>,
+    off: usize,
+    bytes: usize,
+    rows: usize,
+    cols: usize,
+) {
+    let mut stats = NATIVE_STATS.lock();
+    stats.tensors += 1;
+    stats.reencoded += 1;
+    stats.cache_hits += 1;
+    stats.bytes_before += (rows * src.tensor_bytes(cols)) as u64;
+    stats.bytes_after += bytes as u64;
+    drop(stats);
+    record_pending_tensor(key, name, format, map, off, bytes, rows, cols);
+}
+
+pub fn record_cache_mismatch() {
+    NATIVE_STATS.lock().cache_mismatch = true;
+}
+
+pub fn has_cache_mismatch() -> bool {
+    NATIVE_STATS.lock().cache_mismatch
+}
+
+pub fn record_pending_tensor(
+    key: &str,
+    name: &str,
+    format: Q,
+    map: Arc<GgufData>,
+    off: usize,
+    bytes: usize,
+    rows: usize,
+    cols: usize,
+) {
+    let mut guard = PENDING_REENCODE.lock();
+    let entry = guard.get_or_insert_with(|| (key.to_string(), BTreeMap::new()));
+    if entry.0 != key {
+        *entry = (key.to_string(), BTreeMap::new());
+    }
+    entry.1.insert(
+        name.to_string(),
+        PendingTensor {
+            format,
+            map,
+            off,
+            bytes,
+            rows,
+            cols,
+        },
+    );
+}
+
+pub fn take_pending_reencode() -> Option<PendingReencode> {
+    PENDING_REENCODE.lock().take()
+}
+
+pub fn save_reencode_cache(
+    (key, tensors): PendingReencode,
+    choice: ChoiceRecord,
+) -> Result<(), String> {
+    if tensors.is_empty() {
+        return Ok(());
+    }
+    let Some(dir) = reencode_cache_dir() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let blocks_path = dir.join(format!("{key}.blocks"));
+    let index_path = dir.join(format!("{key}.index.json"));
+    let choice_path = dir.join(format!("{key}.json"));
+    let pid = std::process::id();
+    let blocks_tmp = dir.join(format!("{key}.blocks.tmp.{pid}"));
+    let index_tmp = dir.join(format!("{key}.index.json.tmp.{pid}"));
+    let choice_tmp = dir.join(format!("{key}.json.tmp.{pid}"));
+    let io_err = |e: std::io::Error| e.to_string();
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&blocks_tmp).map_err(io_err)?);
+    let mut index = BTreeMap::new();
+    let mut offset = 0usize;
+    {
+        use std::io::Write;
+        for (name, t) in tensors {
+            let pad = (TENSOR_ALIGN - (offset % TENSOR_ALIGN)) % TENSOR_ALIGN;
+            if pad > 0 {
+                file.write_all(&[0u8; TENSOR_ALIGN][..pad]).map_err(io_err)?;
+                offset += pad;
+            }
+            let slice = t
+                .map
+                .get(t.off..t.off + t.bytes)
+                .ok_or_else(|| format!("tensor `{name}` slice out of bounds"))?;
+            file.write_all(slice).map_err(io_err)?;
+            index.insert(
+                name,
+                CachedTensor {
+                    format: t.format,
+                    offset,
+                    bytes: t.bytes,
+                    rows: t.rows,
+                    cols: t.cols,
+                },
+            );
+            offset += t.bytes;
+        }
+        let tail_pad = (PAGE_ALIGN - (offset % PAGE_ALIGN)) % PAGE_ALIGN;
+        if tail_pad > 0 {
+            file.write_all(&vec![0u8; tail_pad]).map_err(io_err)?;
+        }
+        file.flush().map_err(io_err)?;
+    }
+    drop(file);
+    let json_bytes = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
+    let choice_bytes = serde_json::to_vec_pretty(&choice).map_err(|e| e.to_string())?;
+    std::fs::write(&index_tmp, json_bytes).map_err(io_err)?;
+    std::fs::write(&choice_tmp, choice_bytes).map_err(io_err)?;
+    std::fs::rename(&blocks_tmp, &blocks_path).map_err(io_err)?;
+    std::fs::rename(&index_tmp, &index_path).map_err(io_err)?;
+    std::fs::rename(&choice_tmp, &choice_path).map_err(io_err)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

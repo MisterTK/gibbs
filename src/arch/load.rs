@@ -123,6 +123,7 @@ pub struct Checkpoint {
     /// `json.<file>` documents the source supplies itself; others are read lazily from `dir`.
     pub json: Map<String, J>,
     pub dir: Option<PathBuf>,
+    pub weights_path: Option<PathBuf>,
     /// A synthetic id without weights: the spec's `synthetic` table supplies random weights.
     pub synthetic: bool,
     raw: BTreeMap<String, RawTensor>,
@@ -256,6 +257,7 @@ pub fn open(artifacts: &ModelArtifacts) -> Result<Checkpoint, String> {
         gguf: None,
         json: Map::new(),
         dir,
+        weights_path: weights.clone(),
         synthetic: false,
         raw: BTreeMap::new(),
         container: None,
@@ -875,6 +877,8 @@ pub struct WeightStore {
     lora: HashMap<String, Lora>,
     adapter: Option<Arc<(ModelManifest, Vec<u8>)>>,
     reencode: ReencodeConfig,
+    reencode_key: Option<String>,
+    reencode_cache: Option<Arc<crate::model::reencode::ReencodeCache>>,
     /// Derived tensors (transforms, constants, re-encodes), computed once.
     // ponytail: a derived F32 tensor is held here and copied into each `materialize` result; hold
     // `Arc` data in `graph::Tensor` if large derived f32 tensors appear.
@@ -957,6 +961,54 @@ impl WeightStore {
             }
     }
 
+    fn cached_reencode(
+        &self,
+        name: &str,
+        src: Q,
+        rows: usize,
+        cols: usize,
+        shape: &[usize],
+    ) -> Option<Packed> {
+        let cache = self.reencode_cache.as_ref()?;
+        let ct = cache.index.get(name)?;
+        let valid_fmt = !crate::model::reencode::is_float(ct.format)
+            && crate::graph::codec::codec(ct.format).is_some()
+            && cols
+                % crate::graph::codec::block_geometry(ct.format)
+                    .map_or(1, |g| g.0)
+                == 0;
+        let valid = valid_fmt
+            && ct.rows == rows
+            && ct.cols == cols
+            && ct.bytes == rows * ct.format.tensor_bytes(cols)
+            && ct.offset % 64 == 0
+            && ct
+                .offset
+                .checked_add(ct.bytes)
+                .is_some_and(|end| end <= cache.map.len());
+        if valid {
+            crate::model::reencode::record_cache_hit(
+                &cache.key,
+                name,
+                src,
+                ct.format,
+                cache.map.clone(),
+                ct.offset,
+                ct.bytes,
+                rows,
+                cols,
+            );
+            return Some(Packed {
+                map: cache.map.clone(),
+                off: ct.offset,
+                format: ct.format,
+                shape: shape.to_vec(),
+            });
+        }
+        crate::model::reencode::record_cache_mismatch();
+        None
+    }
+
     fn build(&self, name: &str, n: &Node, k: Kind) -> Result<Tensor, String> {
         let (rows, cols) = rows_cols(&n.shape);
         let float = match k {
@@ -968,6 +1020,9 @@ impl WeightStore {
         // Bit-exact keeps float matrices as stored (its rule would block-encode codec-less sources).
         let lossy = self.reencode.policy != ReencodePolicy::BitExact;
         if let (Some(src), true) = (float, lossy && self.reencodable(n, k)) {
+            if let Some(p) = self.cached_reencode(name, src, rows, cols, &n.shape) {
+                return Ok(Tensor::Mat(Mat::from_packed(p, rows, cols)));
+            }
             let r = crate::model::reencode::reencode_values(
                 &self.reencode,
                 name,
@@ -977,8 +1032,22 @@ impl WeightStore {
                 || self.dense(n).ok(),
             );
             if let Some((f, blocks)) = r {
+                let len = blocks.len();
+                let map = Arc::new(GgufData::Buf(blocks));
+                if let Some(key) = &self.reencode_key {
+                    crate::model::reencode::record_pending_tensor(
+                        key,
+                        name,
+                        f,
+                        map.clone(),
+                        0,
+                        len,
+                        rows,
+                        cols,
+                    );
+                }
                 let p = Packed {
-                    map: Arc::new(GgufData::Buf(blocks)),
+                    map,
                     off: 0,
                     format: f,
                     shape: n.shape.clone(),
@@ -1012,24 +1081,45 @@ impl WeightStore {
                     if let Some(pr) = &self.reencode.progress {
                         pr.total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let raw = p
-                        .map
-                        .get(p.off..p.off + rows * f.tensor_bytes(cols))
-                        .ok_or("packed blocks lie outside their buffer")?;
-                    if let Some((f2, blocks)) = crate::model::reencode::reencode_native(
-                        &self.reencode,
-                        name,
-                        f,
-                        rows,
-                        cols,
-                        raw,
-                    ) {
-                        p = Packed {
-                            map: Arc::new(GgufData::Buf(blocks)),
-                            off: 0,
-                            format: f2,
-                            shape: p.shape,
-                        };
+                    if let Some(cp) = lossy
+                        .then(|| self.cached_reencode(name, f, rows, cols, &p.shape))
+                        .flatten()
+                    {
+                        p = cp;
+                    } else {
+                        let raw = p
+                            .map
+                            .get(p.off..p.off + rows * f.tensor_bytes(cols))
+                            .ok_or("packed blocks lie outside their buffer")?;
+                        if let Some((f2, blocks)) = crate::model::reencode::reencode_native(
+                            &self.reencode,
+                            name,
+                            f,
+                            rows,
+                            cols,
+                            raw,
+                        ) {
+                            let len = blocks.len();
+                            let map = Arc::new(GgufData::Buf(blocks));
+                            if let Some(key) = &self.reencode_key {
+                                crate::model::reencode::record_pending_tensor(
+                                    key,
+                                    name,
+                                    f2,
+                                    map.clone(),
+                                    0,
+                                    len,
+                                    rows,
+                                    cols,
+                                );
+                            }
+                            p = Packed {
+                                map,
+                                off: 0,
+                                format: f2,
+                                shape: p.shape,
+                            };
+                        }
                     }
                     if let Some(pr) = &self.reencode.progress {
                         pr.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2057,12 +2147,48 @@ fn load_from(
             ));
         }
     }
+    let gate_ctx = crate::model::reencode::gate_context();
+    let (req_policy, req_max_kl) = gate_ctx
+        .map(|g| (g.requested_policy, g.max_kl))
+        .unwrap_or((reencode.policy, reencode.max_kl));
+    let reencode_key = ckpt
+        .weights_path
+        .as_deref()
+        .filter(|_| !ckpt.synthetic && req_policy != ReencodePolicy::BitExact && reencode.force.is_none())
+        .and_then(|p| {
+            crate::model::reencode::choice_key(p, req_policy, req_max_kl, reencode.force)
+        });
+    let mut reencode_cache = None;
+    if let Some(key) = &reencode_key {
+        if gate_ctx.is_none_or(|g| g.allow_redirect) {
+            if let Some(choice) = crate::model::reencode::read_choice_record(key) {
+                let report = GateReport {
+                    mean_kl: choice.mean_kl,
+                    top1: choice.top1,
+                    tokens: 48,
+                };
+                if crate::model::weight_format::gate_passes(choice.policy, req_max_kl, &report) {
+                    if let Some(cache) = crate::model::reencode::ReencodeCache::open(key) {
+                        reencode.policy = choice.policy;
+                        reencode.ffn_only = choice.ffn_only;
+                        crate::model::reencode::set_cached_choice(choice);
+                        reencode_cache = Some(cache);
+                    }
+                }
+            } else if !reencode.ffn_only {
+                reencode_cache = crate::model::reencode::ReencodeCache::open(key);
+            }
+        }
+    }
+    let reencode_key = reencode_key.filter(|_| reencode.policy != ReencodePolicy::BitExact);
     let store = WeightStore {
         ckpt: ckpt.clone(),
         table: table.clone(),
         lora,
         adapter,
         reencode,
+        reencode_key,
+        reencode_cache,
         cache: Mutex::new(HashMap::new()),
     };
     if spec.components.contains_key("precompute") {
@@ -2365,6 +2491,9 @@ pub fn check(model: &Model) -> Result<(), String> {
 
 // ---- re-encode gate ---------------------------------------------------------------------------
 
+#[cfg(test)]
+static TEST_GATED_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+
 /// The KL-gated re-encode ladder: loads with `load_once` under each policy the user's effective
 /// configuration allows (on Metal: max-speed -> max-speed (FFN only) -> low-bit-native ->
 /// bit-exact; elsewhere bit-exact only), keeping the first candidate that re-encoded nothing or
@@ -2375,7 +2504,12 @@ pub fn gated<T>(
     load_once: impl Fn() -> Option<Result<T, String>>,
     kl: impl Fn(&T, &T) -> Result<GateReport, String>,
 ) -> Option<Result<T, String>> {
-    use crate::model::reencode::{native_stats, reset_native_stats, set_native_applied};
+    #[cfg(test)]
+    let _test_guard = TEST_GATED_LOCK.lock();
+    use crate::model::reencode::{
+        native_stats, reset_native_stats, save_reencode_cache, set_gate_context,
+        set_native_applied, take_pending_reencode, ChoiceRecord, GateContext,
+    };
     use crate::model::weight_format::{
         gate_passes, reencode_override, set_reencode_override,
         ReencodePolicy::{BitExact, LowBitNative, MaxSpeed, MinSize},
@@ -2409,7 +2543,7 @@ pub fn gated<T>(
         }
     };
     let previous = reencode_override();
-    let load_as = |policy: ReencodePolicy, ffn_only: bool| {
+    let load_as = |policy: ReencodePolicy, ffn_only: bool, allow_redirect: bool| {
         if let Some(p) = &user.progress {
             // Every attempt counts its own tensors.
             p.done.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2420,13 +2554,21 @@ pub fn gated<T>(
             ffn_only,
             ..user.clone()
         }));
+        set_gate_context(Some(GateContext {
+            requested_policy: user.policy,
+            max_kl: user.max_kl,
+            allow_redirect,
+        }));
         reset_native_stats();
         load_once()
     };
     let mut reference: Option<T> = None;
     let mut result = None;
-    for &(label, policy, ffn_only) in attempts {
-        let Some(loaded) = load_as(policy, ffn_only) else {
+    let mut i = 0usize;
+    let mut allow_redirect = true;
+    while i < attempts.len() {
+        let (mut label, mut policy, ffn_only) = attempts[i];
+        let Some(loaded) = load_as(policy, ffn_only, allow_redirect && i == 0) else {
             result = None; // not this loader's architecture: the caller's fallback applies its own policy
             break;
         };
@@ -2438,7 +2580,32 @@ pub fn gated<T>(
             }
         };
         let stats = native_stats();
+        let pending = take_pending_reencode();
         let saved = stats.bytes_before.saturating_sub(stats.bytes_after);
+        if let Some(choice) = stats.cached_choice {
+            if stats.cache_mismatch || stats.cache_hits != stats.reencoded || stats.reencoded == 0
+            {
+                // Cached rung was stale or mismatched; retry from rung 0 without redirecting.
+                allow_redirect = false;
+                continue;
+            }
+            policy = choice.policy;
+            label = attempts
+                .iter()
+                .find(|&&(_, p, f)| p == choice.policy && f == choice.ffn_only)
+                .map_or(policy.name(), |&(l, _, _)| l);
+            log(format!(
+                "reencode: {label} accepted (cached; mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
+                choice.mean_kl,
+                choice.top1 * 100.0,
+                stats.reencoded,
+                saved as f64 / 1e6
+            ));
+            set_native_applied(policy, saved, user.force);
+            result = Some(Ok(cand));
+            break;
+        }
+        i += 1;
         if policy == BitExact || stats.reencoded == 0 {
             set_native_applied(
                 if stats.reencoded == 0 {
@@ -2459,7 +2626,7 @@ pub fn gated<T>(
             break;
         }
         if reference.is_none() {
-            match load_as(BitExact, false) {
+            match load_as(BitExact, false, false) {
                 Some(Ok(r)) => {
                     reference = Some(r);
                     set_reencode_override(Some(ReencodeConfig {
@@ -2482,6 +2649,17 @@ pub fn gated<T>(
         let gate = kl(reference.as_ref().expect("loaded above"), &cand);
         match gate {
             Ok(r) if gate_passes(policy, user.max_kl, &r) => {
+                if let Some(p) = pending {
+                    let choice = ChoiceRecord {
+                        policy,
+                        ffn_only,
+                        mean_kl: r.mean_kl,
+                        top1: r.top1,
+                    };
+                    if let Err(e) = save_reencode_cache(p, choice) {
+                        tracing::warn!("reencode cache: {e}");
+                    }
+                }
                 log(format!(
                     "reencode: {label} accepted (mean KL {:.4} nats, top-1 {:.1}%; {} tensors, {:.0} MB saved)",
                     r.mean_kl, r.top1 * 100.0, stats.reencoded, saved as f64 / 1e6
@@ -2502,16 +2680,17 @@ pub fn gated<T>(
             }
         }
     }
+    set_gate_context(None);
     set_reencode_override(previous);
     result
 }
 
 /// The bit-exact load (still under `--quant`'s `force`), as the last resort when the gate cannot run.
 fn other_exact<T>(
-    load_as: &dyn Fn(ReencodePolicy, bool) -> Option<Result<T, String>>,
+    load_as: &dyn Fn(ReencodePolicy, bool, bool) -> Option<Result<T, String>>,
     force: Option<crate::hardware::QuantFormat>,
 ) -> Option<Result<T, String>> {
-    let r = load_as(ReencodePolicy::BitExact, false);
+    let r = load_as(ReencodePolicy::BitExact, false, false);
     crate::model::reencode::set_native_applied(ReencodePolicy::BitExact, 0, force);
     r
 }
@@ -2650,6 +2829,159 @@ mod tests {
         assert!(crate::model::reencode::relative_rmse(&ref_v, &got) < 0.1);
         // The gather table itself keeps its encoding.
         assert!(matches!(get(&m, "embed"), Tensor::Mat(m) if m.packed().is_none()));
+    }
+
+    #[test]
+    fn reencoded_blocks_persist_and_mmap_zero_copy_on_second_load() {
+        use crate::model::weight_format::{reencode_override, set_reencode_override};
+        let _test_guard = TEST_GATED_LOCK.lock();
+        let d = tempfile::tempdir().unwrap();
+        let (rows, cols) = (64, 256);
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 40.0)
+            .collect();
+        let weights_file = d.path().join("model.safetensors");
+        write_st(
+            &weights_file,
+            None,
+            &[
+                ("attn.w", "BF16", &[rows, cols], bf16b(&v)),
+                ("mlp.w", "BF16", &[rows, cols], bf16b(&v)),
+            ],
+        );
+        let a = artifacts(
+            d.path(),
+            Some("model.safetensors"),
+            Some(json!({"model_type": "toy"})),
+        );
+        let spec = r#"{family: "toy", match: {hf_model_type: ["toy"]}, pipeline: "causal_lm"}"#;
+        let reg = registry(&[spec]);
+        let prev = reencode_override();
+        crate::model::reencode::with_test_cache_dir(d.path(), || {
+            set_reencode_override(Some(ReencodeConfig {
+                policy: ReencodePolicy::MaxSpeed,
+                ..exact()
+            }));
+            let load_model = || {
+                let m = load(&a, &reg, None)?;
+                let _ = m.store.tensor("attn.w");
+                let _ = m.store.tensor("mlp.w");
+                Ok(m)
+            };
+            // Pass 1: reject rung 0 (max-speed, ffn_only=false), accept rung 1 (max-speed, ffn_only=true).
+            let kl_calls = std::cell::Cell::new(0usize);
+            let m1 = gated(
+                true,
+                || Some(load_model()),
+                |_, _| {
+                    let c = kl_calls.get();
+                    kl_calls.set(c + 1);
+                    Ok(GateReport {
+                        mean_kl: if c == 0 { 0.50 } else { 0.02 },
+                        top1: 0.99,
+                        tokens: 48,
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(kl_calls.get(), 2, "rung 0 rejected, rung 1 accepted");
+            let key = crate::model::reencode::choice_key(
+                &weights_file,
+                ReencodePolicy::MaxSpeed,
+                None,
+                None,
+            )
+            .unwrap();
+            let cache_dir = d.path().join("reencoded");
+            let blocks_path = cache_dir.join(format!("{key}.blocks"));
+            let index_path = cache_dir.join(format!("{key}.index.json"));
+            let choice_path = cache_dir.join(format!("{key}.json"));
+            assert!(blocks_path.is_file(), ".blocks file must be written");
+            assert!(index_path.is_file(), ".index.json file must be written");
+            assert!(choice_path.is_file(), ".json choice file must be written");
+
+            // Pass 2: jumps directly to accepted rung 1 in ONE load_once call, 0 kl calls, and mmaps .blocks.
+            let load_calls = std::cell::Cell::new(0usize);
+            let m2 = gated(
+                true,
+                || {
+                    load_calls.set(load_calls.get() + 1);
+                    Some(load_model())
+                },
+                |_, _| panic!("second load must hit reencode cache without running KL gate"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(load_calls.get(), 1, "warm load must make exactly one load_once call");
+            assert_eq!(crate::model::reencode::native_stats().cache_hits, 1);
+            let Tensor::Mat(mat1) = get(&m1, "mlp.w") else {
+                panic!("expected Mat")
+            };
+            let Tensor::Mat(mat2) = get(&m2, "mlp.w") else {
+                panic!("expected Mat")
+            };
+            let p1 = mat1.packed().unwrap();
+            let p2 = mat2.packed().unwrap();
+            assert!(matches!(&*p2.map, GgufData::Map(_)), "second load must mmap .blocks");
+            assert_eq!(p1.format, p2.format);
+            let len = rows * p1.format.tensor_bytes(cols);
+            assert_eq!(
+                &p1.map[p1.off..p1.off + len],
+                &p2.map[p2.off..p2.off + len],
+                "mapped blocks must be bit-identical"
+            );
+            // Non-FFN tensor stayed in its native BF16 representation.
+            let Tensor::Mat(attn2) = get(&m2, "attn.w") else {
+                panic!("expected Mat")
+            };
+            assert!(attn2.packed().is_none());
+
+            // Tighter max_kl (0.005 < 0.02) does not blindly accept the 0.02 cached rung.
+            set_reencode_override(Some(ReencodeConfig {
+                policy: ReencodePolicy::MaxSpeed,
+                max_kl: Some(0.005),
+                ..exact()
+            }));
+            let tight_kl_calls = std::cell::Cell::new(0usize);
+            let _ = gated(
+                true,
+                || Some(load_model()),
+                |_, _| {
+                    tight_kl_calls.set(tight_kl_calls.get() + 1);
+                    Ok(GateReport {
+                        mean_kl: 0.001,
+                        top1: 1.0,
+                        tokens: 48,
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(tight_kl_calls.get(), 1, "new max_kl must run the KL gate");
+
+            // Size mismatch in .index.json ignores the cache entry and re-encodes.
+            set_reencode_override(Some(ReencodeConfig {
+                policy: ReencodePolicy::MaxSpeed,
+                ..exact()
+            }));
+            let _ = std::fs::remove_file(&choice_path);
+            let mut idx: BTreeMap<String, crate::model::reencode::CachedTensor> =
+                serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+            idx.get_mut("mlp.w").unwrap().rows = rows + 1;
+            std::fs::write(&index_path, serde_json::to_vec(&idx).unwrap()).unwrap();
+            let m3 = load_model().unwrap();
+            let stats = crate::model::reencode::native_stats();
+            assert!(stats.cache_mismatch);
+            assert_eq!(stats.cache_hits, 0);
+            assert_eq!(stats.reencoded, 2);
+            let Tensor::Mat(mat3) = get(&m3, "mlp.w") else {
+                panic!("expected Mat")
+            };
+            let p3 = mat3.packed().unwrap();
+            assert_eq!(&p1.map[p1.off..p1.off + len], &p3.map[p3.off..p3.off + len]);
+        });
+        set_reencode_override(prev);
     }
 
     fn get(m: &Model, n: &str) -> Tensor {
