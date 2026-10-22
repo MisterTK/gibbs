@@ -1125,9 +1125,10 @@ fn every_kernel_source_compiles() {
             &format!("{head}{}", codegen::dequant_packed(c)),
             &codegen::dequant_packed_name(c),
         );
-        for r in [2, 4] {
+        for (r, sg) in [(2, 8), (4, 8), (4, 2)] {
             let p = GemvParams {
                 rows_per_sg: r,
+                simdgroups: sg,
                 ..Default::default()
             };
             build(

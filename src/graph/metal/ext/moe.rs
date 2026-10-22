@@ -13,7 +13,7 @@ use super::{Enc, PlanOut};
 use crate::graph::codec::{codec, Codec};
 use crate::graph::codegen::{
     block_ref, device_msl, gemm_common, gemm_packed, gemm_packed_name, gemv_indexed,
-    gemv_indexed_name, gemv_rows_per_tg, GemvParams,
+    gemv_indexed_name, gemv_rows_per_tg, gemv_threads, GemvParams,
 };
 use crate::graph::{DType, Graph, Node, Op, ValueId};
 use crate::hardware::QuantFormat;
@@ -434,10 +434,10 @@ fn quant_embed_pso(sess: &Session, f: QuantFormat) -> Result<ComputePipelineStat
 #[cfg(test)]
 thread_local! {
     static TEST_ROWS_PER_SG: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_SIMDGROUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TEST_PSO_OVERRIDE: std::cell::RefCell<Option<ComputePipelineState>> =
         const { std::cell::RefCell::new(None) };
 }
-
 
 fn moe_rows_per_sg(_c: &Codec) -> usize {
     #[cfg(test)]
@@ -447,31 +447,43 @@ fn moe_rows_per_sg(_c: &Codec) -> usize {
             return ov;
         }
     }
-    // Conservative default 2 until a format wins >= 6/7 ABBA rounds with worst_ratio > 1.0:
-    // match c.format {
-    //     QuantFormat::GGUF_IQ4_NL | QuantFormat::GGUF_Q4_0 | QuantFormat::GGUF_IQ2_M => 4,
-    //     _ => 2,
-    // }
     2
 }
-/// Per (device, codec, rows_per_sg) pipelines of [`gemv_indexed`], compiled on first use.
-static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize), ComputePipelineState>>> =
+
+fn moe_simdgroups(_c: &Codec) -> usize {
+    #[cfg(test)]
+    {
+        let ov = TEST_SIMDGROUPS.get();
+        if ov != 0 {
+            return ov;
+        }
+    }
+    8
+}
+
+/// Per (device, codec, rows_per_sg, simdgroups) pipelines of [`gemv_indexed`], compiled on first use.
+static MOE_GEMV: LazyLock<Mutex<HashMap<(u64, QuantFormat, usize, usize), ComputePipelineState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn moe_gemv_pso(sess: &Session, c: &Codec, r: usize) -> Result<ComputePipelineState, String> {
+fn moe_gemv_pso(
+    sess: &Session,
+    c: &Codec,
+    params: GemvParams,
+) -> Result<ComputePipelineState, String> {
     #[cfg(test)]
     if let Some(pso) = TEST_PSO_OVERRIDE.with(|cell| cell.borrow().clone()) {
         return Ok(pso);
     }
     let device = &sess.rt.device;
-    let key = (device.registry_id(), c.format, r);
+    let key = (
+        device.registry_id(),
+        c.format,
+        params.rows_per_sg,
+        params.simdgroups,
+    );
     if let Some(p) = MOE_GEMV.lock().get(&key) {
         return Ok(p.clone());
     }
-    let params = GemvParams {
-        rows_per_sg: r,
-        ..Default::default()
-    };
     let src = format!(
         "#include <metal_stdlib>\nusing namespace metal;\n{}",
         gemv_indexed(c, params)
@@ -664,8 +676,12 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                     MTLSize::new(super::super::TG4, 1, 1),
                 );
             } else {
-                let r = moe_rows_per_sg(c);
-                let pso = moe_gemv_pso(sess, c, r)?;
+                let params = GemvParams {
+                    rows_per_sg: moe_rows_per_sg(c),
+                    simdgroups: moe_simdgroups(c),
+                    ..Default::default()
+                };
+                let pso = moe_gemv_pso(sess, c, params)?;
                 enc.set_compute_pipeline_state(&pso);
                 e.bind(0, *bank);
                 e.bind(1, *x);
@@ -683,17 +699,15 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
                     ],
                 );
                 e.bind(4, *ids);
-                let rows_per_tg = gemv_rows_per_tg(GemvParams {
-                    rows_per_sg: r,
-                    ..Default::default()
-                });
+                let rows_per_tg = gemv_rows_per_tg(params);
+                let threads = gemv_threads(params);
                 enc.dispatch_thread_groups(
                     MTLSize::new(
                         (*rows as u64).div_ceil(rows_per_tg as u64),
                         *slots as u64,
                         1,
                     ),
-                    MTLSize::new(256, 1, 1),
+                    MTLSize::new(threads as u64, 1, 1),
                 );
             }
         }
@@ -1287,8 +1301,9 @@ mod tests {
             let want_r = 2;
             assert_eq!(super::moe_rows_per_sg(c), want_r, "{f:?}");
         }
-        for r in [2usize, 4usize] {
+        for (r, sg) in [(2usize, 8usize), (4, 8), (4, 2)] {
             super::TEST_ROWS_PER_SG.set(r);
+            super::TEST_SIMDGROUPS.set(sg);
             for (i, fmt) in fmts.iter().enumerate() {
                 let cols = match fmt {
                     Fmt::Q(f) => {
@@ -1311,11 +1326,12 @@ mod tests {
                         10 + i as u64,
                     );
                     let err = rel_err(&want, &got);
-                    assert!(err < 1e-4, "r={r} {fmt:?} x_rows={x_rows}: {err}");
+                    assert!(err < 1e-4, "r={r} sg={sg} {fmt:?} x_rows={x_rows}: {err}");
                 }
             }
         }
         super::TEST_ROWS_PER_SG.set(0);
+        super::TEST_SIMDGROUPS.set(0);
     }
 
 
@@ -1742,33 +1758,44 @@ mod tests {
     #[test]
     fn moe_gemv_pipeline_max_threads_and_occupancy() {
         let s = Session::new(rt(), &Weights::new()).unwrap();
-        for (fmt, r) in [
-            (Q::GGUF_IQ2_XXS, 1),
-            (Q::GGUF_IQ2_XXS, 2),
-            (Q::GGUF_IQ2_XXS, 4),
-            (Q::GGUF_IQ2_M, 2),
-            (Q::GGUF_IQ2_M, 4),
-            (Q::GGUF_IQ4_NL, 2),
-            (Q::GGUF_IQ4_NL, 4),
-            (Q::GGUF_Q4_0, 1),
-            (Q::GGUF_Q4_0, 2),
-            (Q::GGUF_Q4_0, 4),
-            (Q::GGUF_Q4_K_M, 1),
-            (Q::GGUF_Q4_K_M, 2),
-            (Q::GGUF_Q6_K, 1),
-            (Q::GGUF_Q6_K, 2),
+        for (fmt, r, sg) in [
+            (Q::GGUF_IQ2_XXS, 1, 8),
+            (Q::GGUF_IQ2_XXS, 2, 8),
+            (Q::GGUF_IQ2_XXS, 4, 8),
+            (Q::GGUF_IQ2_XXS, 4, 2),
+            (Q::GGUF_IQ2_M, 2, 8),
+            (Q::GGUF_IQ2_M, 4, 8),
+            (Q::GGUF_IQ2_M, 4, 2),
+            (Q::GGUF_IQ4_NL, 2, 8),
+            (Q::GGUF_IQ4_NL, 4, 8),
+            (Q::GGUF_IQ4_NL, 4, 2),
+            (Q::GGUF_Q4_0, 1, 8),
+            (Q::GGUF_Q4_0, 2, 8),
+            (Q::GGUF_Q4_0, 4, 8),
+            (Q::GGUF_Q4_0, 4, 2),
+            (Q::GGUF_Q4_K_M, 1, 8),
+            (Q::GGUF_Q4_K_M, 2, 8),
+            (Q::GGUF_Q4_K_M, 4, 2),
+            (Q::GGUF_Q6_K, 1, 8),
+            (Q::GGUF_Q6_K, 2, 8),
+            (Q::GGUF_Q6_K, 4, 2),
         ] {
             let c = super::codec(fmt).unwrap();
-            let pso = super::moe_gemv_pso(&s, c, r).unwrap();
+            let p = super::GemvParams {
+                rows_per_sg: r,
+                simdgroups: sg,
+                ..Default::default()
+            };
+            let pso = super::moe_gemv_pso(&s, c, p).unwrap();
             eprintln!(
-                "{fmt:?} r={r}: max_total_threads_per_threadgroup={} thread_execution_width={}",
+                "{fmt:?} r={r} sg={sg}: max_total_threads_per_threadgroup={} thread_execution_width={}",
                 pso.max_total_threads_per_threadgroup(),
                 pso.thread_execution_width()
             );
             assert_eq!(
                 pso.max_total_threads_per_threadgroup(),
                 1024,
-                "{fmt:?} r={r}"
+                "{fmt:?} r={r} sg={sg}"
             );
         }
     }
@@ -1780,14 +1807,19 @@ mod tests {
     #[test]
     #[ignore = "bandwidth measurement"]
     fn moe_gemv_bandwidth() {
-        let (experts, top_k, steps) = (16usize, 8usize, 8usize);
-        let ids = Tensor::U32(vec![0, 2, 5, 7, 9, 11, 13, 15]);
-        for (f, rows, cols, x_rows) in [
-            (Q::GGUF_IQ2_XXS, 1408usize, 2816usize, 1usize),
-            (Q::GGUF_IQ2_M, 1408, 2816, 1),
-            (Q::GGUF_IQ4_NL, 2816, 704, 8),
-            (Q::GGUF_Q4_0, 2816, 704, 8),
+        let (top_k, steps) = (8usize, 8usize);
+        for (f, experts, rows, cols, x_rows) in [
+            (Q::GGUF_IQ2_XXS, 128usize, 704usize, 2816usize, 1usize),
+            (Q::GGUF_IQ2_XXS, 16, 1408, 2816, 1),
+            (Q::GGUF_IQ2_M, 16, 1408, 2816, 1),
+            (Q::GGUF_IQ4_NL, 16, 2816, 704, 8),
+            (Q::GGUF_Q4_0, 16, 2816, 704, 8),
         ] {
+            let ids = Tensor::U32(
+                (0..top_k)
+                    .map(|i| ((i * (experts / top_k)) % experts) as u32)
+                    .collect(),
+            );
             let c = crate::graph::codec::codec(f).unwrap();
             let (dt, bank) = weight(Fmt::Q(f), experts * rows, cols, 1);
             let routed_bytes =
@@ -1812,9 +1844,10 @@ mod tests {
             let s = Session::new(rt(), &w).unwrap();
             let plan = s.prepare_plan(&g).unwrap();
             let xs = Tensor::F32(vec![0.25; x_rows * cols]);
-            let legs = [("r2", 2usize), ("r4", 4)];
-            let run_leg = |&(_, r): &(&str, usize), n: usize| -> f64 {
+            let legs = [("r2_sg8", 2usize, 8usize), ("r4_sg8", 4, 8), ("r4_sg2", 4, 2)];
+            let run_leg = |&(_, r, sg): &(&str, usize, usize), n: usize| -> f64 {
                 super::TEST_ROWS_PER_SG.set(r);
+                super::TEST_SIMDGROUPS.set(sg);
                 let mut leg_s = 0.0;
                 for _ in 0..n {
                     s.run_prepared(&g, &plan, None, vec![xs.clone(), ids.clone()])
@@ -1837,6 +1870,7 @@ mod tests {
                 }
             }
             super::TEST_ROWS_PER_SG.set(0);
+            super::TEST_SIMDGROUPS.set(0);
             let median = |t: &[f64]| {
                 let mut v = t.to_vec();
                 v.sort_by(|a, b| a.total_cmp(b));
@@ -1846,7 +1880,7 @@ mod tests {
             let report: Vec<String> = legs
                 .iter()
                 .zip(&rounds)
-                .map(|(&(label, _), t)| {
+                .map(|(&(label, _, _), t)| {
                     let wins = t.iter().zip(base).filter(|(a, b)| a < b).count();
                     let worst = t
                         .iter()
@@ -1898,7 +1932,7 @@ mod tests {
             rows_per_sg: 2,
             ..Default::default()
         };
-        let real_pso = super::moe_gemv_pso(&s, c, 2).unwrap();
+        let real_pso = super::moe_gemv_pso(&s, c, params).unwrap();
         let real_msl = super::gemv_indexed(c, params);
         let stub_msl = real_msl.replace(
             "IQ2XXS_GRID[(q4 >> (8 * k)) & 0xFFu]",
