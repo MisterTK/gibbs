@@ -353,13 +353,8 @@ impl WeightFormat {
         if self.hand_kernel().is_some() {
             v.push(GemvVariant::HAND);
         }
-        if let Some(f) = self.codec_format().filter(|_| generated) {
+        if generated {
             v.extend(tune::GEN_ROWS.map(GemvVariant::generated));
-            v.extend(
-                tune::gen64_rows(f)
-                    .iter()
-                    .map(|&r| GemvVariant::generated64(r)),
-            );
         }
         v
     }
@@ -1830,7 +1825,7 @@ impl Session {
                     "Metal executor: unsupported packed GEMV format {format:?}"
                 )),
             },
-            (_, GemvKernel::Gen | GemvKernel::Gen64) => match format.codec_format() {
+            (_, GemvKernel::Gen) => match format.codec_format() {
                 Some(q) => generated(q, variant),
                 None => Err(format!("no generated GEMV for {format:?}")),
             },
@@ -7148,14 +7143,7 @@ mod tests {
             }
         }
         for &c in &codecs {
-            let variants = tune::GEN_ROWS
-                .iter()
-                .map(|&r| tune::GemvVariant::generated(r))
-                .chain(
-                    tune::gen64_rows(c.format)
-                        .iter()
-                        .map(|&r| tune::GemvVariant::generated64(r)),
-                );
+            let variants = tune::GEN_ROWS.map(tune::GemvVariant::generated);
             for v in variants {
                 let p = v.gen_params();
                 build(

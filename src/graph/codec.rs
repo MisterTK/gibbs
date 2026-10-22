@@ -1180,16 +1180,13 @@ pub fn formats() -> Vec<QuantFormat> {
 /// the key of the measured codec efficiencies.
 pub fn source_hash() -> u64 {
     use crate::graph::codegen::gemv_packed;
-    use crate::graph::tune::{gen64_rows, GemvVariant, GEN_ROWS};
+    use crate::graph::tune::{GemvVariant, GEN_ROWS};
     let mut h = 0xcbf29ce484222325u64 ^ u64::from(CODEC_VERSION);
     for f in formats() {
         let c = codec(f).expect("listed formats are registered");
-        let generated: Vec<String> = GEN_ROWS
+        let generated = GEN_ROWS
             .map(GemvVariant::generated)
-            .into_iter()
-            .chain(gen64_rows(f).iter().map(|&r| GemvVariant::generated64(r)))
-            .map(|v| gemv_packed(c, v.gen_params()))
-            .collect();
+            .map(|v| gemv_packed(c, v.gen_params()));
         for b in format!("{f:?}")
             .bytes()
             .chain(c.msl.bytes())
