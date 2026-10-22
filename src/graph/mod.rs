@@ -24,9 +24,9 @@ use crate::hardware::{Device, QuantFormat};
 use std::collections::HashMap;
 
 /// Whether `item` is in `GIBBS_DISABLE` (comma list, read once): per-item kill switch next to
-/// `metal::fusion_policy` (here because the e-graph and loaders build without Metal). Items:
-/// `deltanet`, `pipeline` (greedy decode streams, `program::GraphProgram::stream_next`) and loader
-/// items (README). Tests set [`TEST_DISABLE`] per thread.
+/// `metal::fusion_enabled` (here because the e-graph builds without Metal). Items: `deltanet` and
+/// `pipeline` (greedy decode streams, `program::GraphProgram::stream_next`). Tests set
+/// [`TEST_DISABLE`] per thread.
 pub(crate) fn disabled(item: &str) -> bool {
     #[cfg(test)]
     let list = TEST_DISABLE.with(|d| d.get());

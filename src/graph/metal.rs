@@ -2435,13 +2435,6 @@ impl Session {
                 });
                 self.last_gpu_s
                     .store(span.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                if std::env::var_os("GIBBS_TRACE_ENCODE").is_some() && plan.is_decode {
-                    let enc_us = encode_dur.as_micros();
-                    eprintln!(
-                        "[ICB profile] CPU encode: {enc_us} µs, GPU time: {:.2} ms",
-                        span * 1e3
-                    );
-                }
             }
             Ok(())
         })?;
@@ -2666,11 +2659,10 @@ impl Session {
         // The GPU runs the first `CB_FIRST_STEPS` steps while the host encodes the rest (encoding costs
         // ~0.4 us per dispatch, a step on the GPU ~10 us). Buffers on one queue run in order and
         // the arena is hazard-tracked. luminal: luminal_metal/src/command_buffer.rs:21-202.
-        // `GIBBS_CB_CHUNK=0` keeps a single buffer.
         // Plans under `CB_CHUNK_MIN_STEPS` steps stay one buffer: measured on a 147-dispatch 1B-parameter
         // decode, splitting added ~0.14 ms of GPU span (buffer boundaries) for ~0.06 ms of encoding to hide.
         let (first, chunk) = if steps.len() >= CB_CHUNK_MIN_STEPS {
-            cb_chunking()
+            CB_CHUNKING
         } else {
             (usize::MAX, usize::MAX)
         };
@@ -5967,24 +5959,8 @@ fn print_kernel_profile(
 
 const CB_CHUNK_MIN_STEPS: usize = 220;
 
-/// Steps in the first command buffer and in each later one (`GIBBS_CB_CHUNK=<first>,<chunk>`; `0`: one buffer).
-fn cb_chunking() -> (usize, usize) {
-    static C: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *C.get_or_init(|| {
-        let v = std::env::var("GIBBS_CB_CHUNK").ok();
-        match v.as_deref() {
-            Some("0") => (usize::MAX, usize::MAX),
-            Some(s) => {
-                let mut it = s.split(',').filter_map(|p| p.trim().parse::<usize>().ok());
-                match (it.next(), it.next()) {
-                    (Some(a), Some(b)) if a > 0 && b > 0 => (a, b),
-                    _ => (32, usize::MAX),
-                }
-            }
-            None => (32, usize::MAX),
-        }
-    })
-}
+/// Steps in the first command buffer and in each later one.
+const CB_CHUNKING: (usize, usize) = (32, usize::MAX);
 
 /// GPU time from the start of the first to the end of the last of consecutive command buffers.
 fn gpu_span_seconds(first: &CommandBufferRef, last: &CommandBufferRef) -> f64 {
@@ -10091,12 +10067,6 @@ kernel void persist(device const half* w [[buffer(0)]], device float* xa [[buffe
         }
     }
 
-    #[test]
-    fn cb_chunking_default_is_two_chunk_starter() {
-        if std::env::var_os("GIBBS_CB_CHUNK").is_none() {
-            assert_eq!(cb_chunking(), (32, usize::MAX));
-        }
-    }
 
     /// CPU only: `plan_dump` groups steps by layer and describes a materialized strided slice.
     #[test]
