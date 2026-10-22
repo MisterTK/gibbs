@@ -3,7 +3,7 @@
 //! unioned into the e-class of the value it computes, so the unfused forms stay available, and one
 //! extraction picks a consistent set of fusions with a cost model. The chosen fusions are then
 //! materialized by the rewriters in [`crate::graph::passes`] (`fuse_mlp_blocks`, `rewrite_gate_up`,
-//! `rewrite_qkv`, `fuse_qkv_slices_and_attn_pass`), restricted to the extracted members.
+//! `rewrite_qkv`), restricted to the extracted members.
 //!
 //! * **Encoding.** Every value is an e-class named `(V value-id)` (no global `let`s: they
 //!   dominate parse time on model graphs); a node's class also holds `(Node node-id args)`.
@@ -17,8 +17,7 @@
 //!   then `mlp-add[-swapped]` / `mlp-post-norm-add[-swapped]`
 //!   union the residual Add with `Mlp`/`MlpPn`; `gate-up` unions gate and up with `Slice`s of
 //!   one `Lin` over `(Cat2 wg wu)`; `qkv` unions three Linears sharing a node input with
-//!   `Slice`s of a `Lin` over `Cat3`; `qkv-slices-attn` (off by default, like its pass) unions
-//!   a CachedAttention with a `Rewired` copy reading the fused projection directly.
+//!   `Slice`s of a `Lin` over `Cat3`.
 //! * **Budget.** [`Budget::match_limit`] caps the matches each rule may fire in total (luminal's
 //!   `AlgebraBudget`), [`Budget::max_iters`] the scheduler steps.
 //! * **Extraction.** DAG cost with sharing: every e-class reachable from the outputs (or from a
@@ -52,7 +51,6 @@ const SCHEMA: &str = r#"
 (datatype*
   (E (V i64)
      (Node i64 L)
-     (Rewired i64 L)
      (Lin i64 E W)
      (Slice E i64 i64)
      (Mlp i64 i64 E E E E E)
@@ -97,8 +95,6 @@ pub enum Rule {
     GateUp,
     /// Q, K, V Linears of one input → one Linear (all three of one format).
     Qkv,
-    /// QKV slices and RoPE folded into CachedAttention (not in [`DEFAULT_RULES`]).
-    QkvSlicesAttn,
 }
 
 /// The rules of the default pass pipeline.
@@ -172,18 +168,6 @@ impl Rule {
        (union k (Slice f rq (+ rq rk)))
        (union v (Slice f (+ rq rk) (+ rq (+ rk rv)))))
       :ruleset fuse :name "qkv")
-"#
-            }
-            Rule::QkvSlicesAttn => {
-                r#"
-(rule ((= a (Node aid (Cons q (Cons k (Cons v rest))))) (K aid "CachedAttention")
-       (= q (Node qr (Cons qs qrr))) (K qr "Rope")
-       (= k (Node kr (Cons ks krr))) (K kr "Rope")
-       (= qs (Node qsi (Cons x qsr))) (K qsi "Slice")
-       (= ks (Node ksi (Cons x ksr))) (K ksi "Slice")
-       (= v (Node vsi (Cons x vsr))) (K vsi "Slice"))
-      ((union a (Rewired aid (Cons x (Cons x (Cons x rest))))))
-      :ruleset fuse :name "qkv-slices-attn")
 "#
             }
         }
@@ -316,8 +300,8 @@ pub struct Report {
     pub decode_ms: f64,
     pub enodes: usize,
     pub groups: usize,
-    /// Fusions applied: megakernel MLP, gate/up, QKV, QKV-slices→attention.
-    pub applied: [usize; 4],
+    /// Fusions applied: megakernel MLP, gate/up, QKV.
+    pub applied: [usize; 3],
 }
 
 impl Report {
@@ -438,7 +422,6 @@ enum Kind {
     Mlp = 0,
     GateUp = 1,
     Qkv = 2,
-    AttnSlices = 3,
 }
 
 /// One e-node as extraction sees it.
@@ -461,7 +444,7 @@ struct Group {
     members: Vec<(Value, usize)>,
     /// Member keys, for the deterministic tie-break.
     keys: Vec<i64>,
-    /// Anchor node id (`Mlp` / `Rewired`: the Add / attention node).
+    /// Anchor node id (`Mlp`: the Add node).
     anchor: i64,
     /// Class of the fused `Lin` whose slices the members are (gate/up, QKV).
     fused: Option<Value>,
@@ -542,7 +525,7 @@ impl Extract<'_> {
 struct Pick {
     on: bool,
     kind: Kind,
-    /// Add / attention output (`Mlp` / `Rewired`).
+    /// Add output (`Mlp`).
     anchor: Option<ValueId>,
     /// Gate/up and QKV members; `Err(glu)`: a fused gate/up Linear.
     members: Vec<Result<ValueId, ValueId>>,
@@ -591,20 +574,6 @@ fn mlp_cover(g: &Graph, add: ValueId) -> Vec<ValueId> {
     out
 }
 
-/// Node outputs the QKV-slices→attention rewrite at attention output `a` removes.
-fn attn_cover(g: &Graph, a: ValueId) -> Vec<ValueId> {
-    let mut out = vec![a];
-    if let ValueKind::Node(n) = g.value(a).kind {
-        let att = &g.nodes[n.0 as usize];
-        for (i, &v) in att.inputs.iter().take(3).enumerate() {
-            out.push(v);
-            if let (true, ValueKind::Node(r)) = (i < 2, &g.value(v).kind) {
-                out.push(g.nodes[r.0 as usize].inputs[0]);
-            }
-        }
-    }
-    out
-}
 
 /// A saturated and extracted e-graph of one graph: its fusion choices, and the materialization of
 /// the cost model's set ([`Fusion::apply`] with no flips) or of any other consistent set.
@@ -850,15 +819,10 @@ impl Fusion {
                         .get_mut(&c)
                         .ok_or("egraph: fused e-node outside a known class")?;
                     let anchor = class.key;
-                    let cost_us = match kind {
-                        Kind::AttnSlices => op_cost(anchor as usize, &a),
-                        _ => {
-                            let out = g.value(g.nodes[anchor as usize].outputs[0]);
-                            cost.dispatch_us
-                                + reads_us(&a)
-                                + cost.act_us(out.shape.iter().product::<usize>() as f64 * 4.0)
-                        }
-                    };
+                    let out = g.value(g.nodes[anchor as usize].outputs[0]);
+                    let cost_us = cost.dispatch_us
+                        + reads_us(&a)
+                        + cost.act_us(out.shape.iter().product::<usize>() as f64 * 4.0);
                     class.nodes.push(ENode {
                         cost: cost_us,
                         kids: kids_of(&a),
@@ -875,7 +839,6 @@ impl Fusion {
             };
         singles("Mlp", Kind::Mlp, &|ch| ch[2..7].to_vec())?;
         singles("MlpPn", Kind::Mlp, &|ch| [&ch[2..7], &ch[8..9]].concat())?;
-        singles("Rewired", Kind::AttnSlices, &|ch| flatten(ch[1]))?;
         report.groups = groups.len();
         report.enodes = classes.values().map(|c| c.nodes.len()).sum();
 
@@ -956,13 +919,11 @@ impl Fusion {
                         None => Err(orig_out(classes[c].key - FUSED_KEY_BASE)),
                     })
                     .collect(),
-                Kind::Mlp | Kind::AttnSlices => Vec::new(),
+                Kind::Mlp => Vec::new(),
             };
-            let anchor =
-                matches!(gr.kind, Kind::Mlp | Kind::AttnSlices).then(|| orig_out(gr.anchor));
+            let anchor = matches!(gr.kind, Kind::Mlp).then(|| orig_out(gr.anchor));
             let covers: Vec<ValueId> = match (gr.kind, anchor) {
                 (Kind::Mlp, Some(a)) => mlp_cover(g, a),
-                (Kind::AttnSlices, Some(a)) => attn_cover(g, a),
                 _ => members.iter().filter_map(|m| m.ok()).collect(),
             };
             picks.push(Pick {
@@ -1039,7 +1000,6 @@ impl Fusion {
                 .map(|(p, _)| p)
         };
         let mlp_adds: Vec<ValueId> = chosen(Kind::Mlp).filter_map(|p| p.anchor).collect();
-        let attn: Vec<ValueId> = chosen(Kind::AttnSlices).filter_map(|p| p.anchor).collect();
         let gate_up: Vec<&[Result<ValueId, ValueId>]> =
             chosen(Kind::GateUp).map(|p| &p.members[..]).collect();
         let qkv: Vec<&[Result<ValueId, ValueId>]> =
@@ -1085,8 +1045,8 @@ impl Fusion {
         let only = |g: &Graph, vs: &[ValueId]| -> HashSet<NodeId> {
             vs.iter().map(|v| node_of(g, *v)).collect()
         };
-        let want = [mlp_adds.len(), gate_up.len(), qkv.len(), attn.len()];
-        report.applied = [0; 4];
+        let want = [mlp_adds.len(), gate_up.len(), qkv.len()];
+        report.applied = [0; 3];
         if !mlp_adds.is_empty() {
             let s = only(graph, &mlp_adds);
             report.applied[0] = megakernel::fuse_mlp_blocks(graph, &s);
@@ -1095,10 +1055,6 @@ impl Fusion {
         report.applied[1] = fusion::rewrite_gate_up(graph, &ms, weights.as_deref_mut());
         let ms = contexts(graph, &qkv, &["q", "k", "v"]);
         report.applied[2] = fusion::rewrite_qkv(graph, &ms, weights.as_deref_mut());
-        if !attn.is_empty() {
-            let s = only(graph, &attn);
-            report.applied[3] = fusion::fuse_qkv_slices_and_attn_pass(graph, &s);
-        }
         report.decode_ms = t.elapsed().as_secs_f64() * 1e3;
         if report.applied != want {
             return Err(format!(
@@ -1260,15 +1216,15 @@ mod tests {
     #[test]
     fn megakernel_mlp_and_qkv_fuse() {
         let r = check("layer", &layer(1, false, false, false), 0x8704a1b9129c7244);
-        assert_eq!(r.applied, [1, 0, 1, 0]);
+        assert_eq!(r.applied, [1, 0, 1]);
         let r = check(
             "post-norm, swapped",
             &layer(1, true, true, false),
             0x23b98b5d9122b1c6,
         );
-        assert_eq!(r.applied, [1, 0, 1, 0]);
+        assert_eq!(r.applied, [1, 0, 1]);
         let r = check("geglu", &layer(1, false, true, true), 0xac127d60b16a6a85);
-        assert_eq!(r.applied, [1, 0, 1, 0]);
+        assert_eq!(r.applied, [1, 0, 1]);
     }
 
     #[test]
@@ -1279,7 +1235,7 @@ mod tests {
             &layer(2, false, false, false),
             0x5d6a683c206fcc55,
         );
-        assert_eq!(r.applied, [0, 1, 1, 0]);
+        assert_eq!(r.applied, [0, 1, 1]);
     }
 
     #[test]
@@ -1298,7 +1254,7 @@ mod tests {
             b.g.output(o);
         }
         let r = check("four linears", &b.done(), 0x566dfadfc7c6bb6d);
-        assert_eq!(r.applied, [0, 0, 1, 0]);
+        assert_eq!(r.applied, [0, 0, 1]);
 
         // Five same-dtype linears: the lowest triple wins.
         let mut b = B::new();
@@ -1309,7 +1265,7 @@ mod tests {
             b.g.output(o);
         }
         let r = check("five linears", &b.done(), 0x951cf9bcebed410d);
-        assert_eq!(r.applied, [0, 0, 1, 0]);
+        assert_eq!(r.applied, [0, 0, 1]);
     }
 
     #[test]
@@ -1328,53 +1284,9 @@ mod tests {
             b.g.output(o);
         }
         let r = check("parallel", &b.done(), 0xff392cdb64415b10);
-        assert_eq!(r.applied, [0, 1, 1, 0]);
+        assert_eq!(r.applied, [0, 1, 1]);
     }
 
-    #[test]
-    fn qkv_slices_attn_fuses() {
-        let mut b = B::new();
-        let x = b.g.input("x", vec![1, 64], DType::F32);
-        let pos = b.g.input("pos", vec![1], DType::U32);
-        let n = b.norm("n", x);
-        let f = b.lin("qkv", n, 128);
-        let slice = |s: i64, e: i64| Op::Slice {
-            axis: -1,
-            start: s,
-            end: e,
-        };
-        let qs = b.op("qs", slice(0, 64), &[f], vec![1, 64]);
-        let ks = b.op("ks", slice(64, 96), &[f], vec![1, 32]);
-        let vs = b.op("vs", slice(96, 128), &[f], vec![1, 32]);
-        let rope = Op::Rope {
-            head_dim: 32,
-            rotary_dim: 32,
-            variant: crate::graph::RopeVariant::HalfSplit,
-            mscale: 1.0,
-        };
-        let qr = b.op("qr", rope.clone(), &[qs, pos], vec![1, 64]);
-        let kr = b.op("kr", rope, &[ks, pos], vec![1, 32]);
-        let kst = b.g.state("k_cache", vec![16, 32], DType::F32, false);
-        let vst = b.g.state("v_cache", vec![16, 32], DType::F32, false);
-        let attn = Op::CachedAttention {
-            heads: 2,
-            kv_heads: 1,
-            head_dim: 32,
-            v_head_dim: 32,
-            scale: 0.17,
-            causal: true,
-            window: None,
-            soft_cap: None,
-            write: true,
-        };
-        let a = b.op("attn", attn, &[qr, kr, vs, kst, vst, pos], vec![1, 64]);
-        b.g.output(a);
-        let gw = b.done();
-
-        let (got, r) = by_egraph(gw, &[Rule::QkvSlicesAttn], &CostModel::constants());
-        assert_eq!(r.applied, [0, 0, 0, 1]);
-        assert_eq!(digest(&got), 0x60b562d4ff6d6669, "qkv slices attn: golden");
-    }
 
     /// The llama spec's decode instance (one row, last-row head) on the synthetic checkpoint of
     /// [`crate::arch::testing::synthetic_llama`].
@@ -1404,8 +1316,8 @@ mod tests {
             ("llama spec (synthetic, 2 layers)", llama_decode()),
         ];
         let want = [
-            ([4, 0, 4, 0], 0x4f2daf5f8f6489de),
-            ([2, 0, 2, 0], 2219546655677575810),
+            ([4, 0, 4], 0x4f2daf5f8f6489de),
+            ([2, 0, 2], 2219546655677575810),
         ];
         for ((what, gw), (want, golden)) in models.iter().zip(want) {
             let r = check(what, gw, golden);
