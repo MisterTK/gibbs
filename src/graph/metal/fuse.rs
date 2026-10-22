@@ -38,6 +38,8 @@ const PROGRAM: &str = r#"
 (relation NormScale (i64 i64 i64))
 (relation NormRope (i64 i64))
 (relation AttnRope (i64 i64 i64))
+(relation GNorm (i64 i64))
+(relation GNormSilu (i64 i64))
 (ruleset plan)
 
 ; Linear `li` (output `l` of m*n elements, one reader `j`) → GEMV epilogue (Epi li j kind side|-1).
@@ -73,6 +75,7 @@ const PROGRAM: &str = r#"
 (rule ((Norm ni n d xl) (Single n) (Rope j r n pos inv) (RopeP j d rot var ms) (<= rot d)
        (Val pos pp ns) (< pp ni) (Val inv pv ni_) (< pv ni) (> ns 0) (= 0 (% (/ xl d) ns)))
       ((NormRope ni j)) :ruleset plan)
+(rule ((GNorm gi g) (Single g) (Rd1 j "Silu" g)) ((GNormSilu gi j)) :ruleset plan)
 
 ; Cached attention `ai` writing its KV state: q and k each the single-reader RoPE of a non-norm.
 (rule ((Attn ai h kvh hd q k pos) (Single q) (Single k)
@@ -103,6 +106,8 @@ pub(super) struct Decisions {
     pub norm: HashMap<usize, NormFusion>,
     /// CachedAttention → its q and k RoPE nodes.
     pub attn_rope: HashMap<usize, (usize, usize)>,
+    /// GroupNorm → its fused SiLU reader node.
+    pub group_silu: HashMap<usize, usize>,
 }
 
 impl Decisions {
@@ -115,7 +120,8 @@ impl Decisions {
                 .flatten()
         });
         let attn = self.attn_rope.values().flat_map(|&(q, k)| [q, k]);
-        epi.chain(norm).chain(attn)
+        let gnorm = self.group_silu.values().copied();
+        epi.chain(norm).chain(attn).chain(gnorm)
     }
 }
 
@@ -243,6 +249,9 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                         }
                     }
                 }
+                Op::GroupNorm { .. } if fused => {
+                    fs.add("GNorm", (id, o))?;
+                }
                 Op::Rope {
                     head_dim,
                     rotary_dim,
@@ -312,6 +321,9 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
     for r in rows(&eg, "AttnRope")? {
         d.attn_rope
             .insert(r[0] as usize, (r[1] as usize, r[2] as usize));
+    }
+    for r in rows(&eg, "GNormSilu")? {
+        d.group_silu.insert(r[0] as usize, r[1] as usize);
     }
     Ok(d)
 }

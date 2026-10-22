@@ -4752,7 +4752,17 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                     fused[i] = true;
                     continue;
                 }
-                ext::PlanOut::Step(st, n) => (Step::Ext(st), n),
+                ext::PlanOut::Step(mut st, n) => {
+                    if let Some(&j) = decided.group_silu.get(&i) {
+                        let ext::ExtStep::Norm(ext::norm::Step::Group { ref mut silu, .. }) = st
+                        else {
+                            unreachable!("GNormSilu only claims GroupNorm steps");
+                        };
+                        *silu = true;
+                        out = g.nodes[j].outputs[0];
+                    }
+                    (Step::Ext(st), n)
+                }
             },
             Op::Embedding => {
                 let (table, ids) = (arg(0)?, arg(1)?);
