@@ -21,8 +21,7 @@ pub(super) const KERNELS: &[&str] = &[
     "norm_reduce_f32",
     "norm_softmax_f32",
     "norm_layernorm_nobeta_f32",
-    "norm_group_stats_f32",
-    "norm_group_apply_f32",
+    "norm_group_f32",
     "norm_rmsnorm_nogamma_f32",
 ];
 
@@ -77,7 +76,6 @@ pub enum Step {
         cg: usize,
         hw: usize,
         eps: f32,
-        silu: bool,
     },
 }
 
@@ -290,7 +288,6 @@ pub(super) fn plan(
                     cg: c / groups,
                     hw,
                     eps,
-                    silu: false,
                 },
                 xl,
             ))
@@ -375,56 +372,20 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             cg,
             hw,
             eps,
-            silu,
         } => {
-            let cnt = cg * hw;
-            let splits = cnt.div_ceil(4096).max(1);
-            let bytes = tgs * splits * 8;
-            let mut guard = sess.argmax_scratch.lock();
-            if guard
-                .as_ref()
-                .is_none_or(|buf| (buf.length() as usize) < bytes)
-            {
-                *guard = Some(super::super::new_shared_buffer(&sess.rt.device, bytes)?);
-            }
-            let stats = guard.as_ref().expect("allocated above");
-            #[repr(C)]
-            struct NormGroupParams {
-                n_groups: u32,
-                groups: u32,
-                cg: u32,
-                hw: u32,
-                splits: u32,
-                silu: u32,
-                eps: f32,
-            }
-            let p = NormGroupParams {
-                n_groups: u32_of(tgs)?,
-                groups: u32_of(groups)?,
-                cg: u32_of(cg)?,
-                hw: u32_of(hw)?,
-                splits: u32_of(splits)?,
-                silu: silu as u32,
-                eps,
-            };
             e.enc
-                .set_compute_pipeline_state(sess.rt.pso("norm_group_stats_f32")?);
-            e.bind(0, x);
-            e.enc.set_buffer(1, Some(stats), 0);
-            set_bytes(e.enc, 2, &p);
-            e.enc.dispatch_thread_groups(
-                MTLSize::new(splits as u64, tgs as u64, 1),
-                tg,
-            );
-            e.enc
-                .set_compute_pipeline_state(sess.rt.pso("norm_group_apply_f32")?);
+                .set_compute_pipeline_state(sess.rt.pso("norm_group_f32")?);
             e.bind(0, x);
             e.bind(1, g);
             e.bind(2, b);
-            e.enc.set_buffer(3, Some(stats), 0);
-            e.bind(4, s.out);
-            set_bytes(e.enc, 5, &p);
-            e.grid1((tgs * cnt).div_ceil(4));
+            e.bind(3, s.out);
+            set_bytes(
+                e.enc,
+                4,
+                &[u32_of(groups)?, u32_of(cg)?, u32_of(hw)?, eps.to_bits()],
+            );
+            e.enc
+                .dispatch_thread_groups(MTLSize::new(tgs as u64, 1, 1), tg);
         }
     }
     Ok(())
@@ -686,72 +647,6 @@ mod tests {
             assert!(rel_err(&want, &got) < 1e-4, "metal groups {groups}");
             assert!(rel_err(&want, &cpu) < 1e-4, "cpu groups {groups}");
         }
-    }
-
-    #[test]
-    fn group_norm_split_and_fused_silu_match_cpu() {
-        for c in [128usize, 320, 512] {
-            for s in [64usize, 128] {
-                for silu in [false, true] {
-                    let shape = vec![1, c, s, s];
-                    let mut g = Graph::new();
-                    let x = g.input("x", shape.clone(), F);
-                    let gm = g.weight("g", vec![c], F);
-                    let b = g.weight("b", vec![c], F);
-                    let gn = g.add(
-                        "gn",
-                        Op::GroupNorm { groups: 32, eps: 1e-5 },
-                        &[x, gm, b],
-                        shape.clone(),
-                        F,
-                    );
-                    let out = if silu {
-                        g.add(
-                            "silu",
-                            Op::Unary {
-                                kind: crate::graph::UnaryKind::Silu,
-                            },
-                            &[gn],
-                            shape.clone(),
-                            F,
-                        )
-                    } else {
-                        gn
-                    };
-                    g.output(out);
-                    let (steps, _) = super::super::super::plan(&g).unwrap();
-                    assert_eq!(steps.len(), 1);
-                    let mut w = Weights::new();
-                    w.insert("g", Tensor::F32(rand(c, 1).iter().map(|v| v + 1.1).collect()));
-                    w.insert("b", Tensor::F32(rand(c, 2)));
-                    let xs = rand(c * s * s, 3);
-                    let (want, got) = run1(&g, &w, &xs);
-                    let e = rel_err(&want, &got);
-                    assert!(e < 1e-4, "c={c} s={s} silu={silu}: {e}");
-                }
-            }
-        }
-        // Large DC offset with multi-threadgroup split (> 4096 elements per group) to verify shifted-sum stability.
-        let (c, s) = (128usize, 64usize);
-        let shape = vec![1, c, s, s];
-        let mut g = Graph::new();
-        let x = g.input("x", shape.clone(), F);
-        let gm = g.weight("g", vec![c], F);
-        let b = g.weight("b", vec![c], F);
-        let y = g.add(
-            "gn",
-            Op::GroupNorm { groups: 32, eps: 1e-5 },
-            &[x, gm, b],
-            shape,
-            F,
-        );
-        g.output(y);
-        let mut w = Weights::new();
-        w.insert("g", Tensor::F32(rand(c, 1).iter().map(|v| v + 1.1).collect()));
-        w.insert("b", Tensor::F32(rand(c, 2)));
-        let xs: Vec<f32> = rand(c * s * s, 9).into_iter().map(|v| v + 1000.0).collect();
-        let (want, got) = run1(&g, &w, &xs);
-        assert!(rel_err(&want, &got) < 1e-4);
     }
 
     #[test]

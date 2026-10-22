@@ -110,76 +110,38 @@ kernel void norm_layernorm_nobeta_f32(device const float* x [[buffer(0)]],
 }
 
 // GroupNorm over x [n, c, hw] (InstanceNorm: groups == c); biased variance per (sample, group),
-// per-channel affine (+ optional fused SiLU). Two dispatches: `norm_group_stats_f32` writes
-// per-slice (sum, sum_sq) partials with `ceil(cg * hw / 4096)` threadgroups per (sample, group),
-// then `norm_group_apply_f32` reduces those partials per group and writes 4 elements per thread.
-struct NormGroupParams { uint n_groups; uint groups; uint cg; uint hw; uint splits; uint silu; float eps; };
-kernel void norm_group_stats_f32(device const float* x [[buffer(0)]],
-                                 device float2* stats [[buffer(1)]],
-                                 constant NormGroupParams& p [[buffer(2)]],
-                                 uint2 tg [[threadgroup_position_in_grid]],
-                                 uint sg [[simdgroup_index_in_threadgroup]],
-                                 uint lane [[thread_index_in_simdgroup]],
-                                 uint nsg [[simdgroups_per_threadgroup]],
-                                 uint tid [[thread_index_in_threadgroup]]) {
-    constexpr uint tpg = 256;
+// per-channel affine. One threadgroup per (sample, group).
+struct NormGroupParams { uint groups; uint cg; uint hw; float eps; };
+kernel void norm_group_f32(device const float* x [[buffer(0)]],
+                           device const float* g [[buffer(1)]],
+                           device const float* b [[buffer(2)]],
+                           device float* out [[buffer(3)]],
+                           constant NormGroupParams& p [[buffer(4)]],
+                           uint tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint nsg [[simdgroups_per_threadgroup]],
+                           uint tid [[thread_position_in_threadgroup]],
+                           uint tpg [[threads_per_threadgroup]]) {
     threadgroup float scratch[32];
+    const uint grp = tg % p.groups;
     const uint cnt = p.cg * p.hw;
-    const ulong base = (ulong)tg.y * cnt;
-    const uint start = tg.x * 4096u;
-    const uint end = min(cnt, start + 4096u);
-    const float pivot = cnt > 0 ? x[base] : 0.0f;
+    // A group's channels are contiguous: [sample, grp * cg .. (grp + 1) * cg, hw].
+    ulong base = (ulong)tg * cnt;
     float s = 0.0f;
+    for (uint e = tid; e < cnt; e += tpg) s += x[base + e];
+    float mean = block_sum(s, scratch, sg, lane, nsg) / float(cnt);
     float sq = 0.0f;
-    for (uint e = start + tid; e < end; e += tpg) {
-        float v = x[base + e] - pivot;
-        s += v;
-        sq += v * v;
+    for (uint e = tid; e < cnt; e += tpg) {
+        float t = x[base + e] - mean;
+        sq += t * t;
     }
-    s = block_sum(s, scratch, sg, lane, nsg);
-    sq = block_sum(sq, scratch, sg, lane, nsg);
-    if (tid == 0) stats[(ulong)tg.y * p.splits + tg.x] = float2(s, sq);
-}
-
-kernel void norm_group_apply_f32(device const float* x [[buffer(0)]],
-                                 device const float* g [[buffer(1)]],
-                                 device const float* b [[buffer(2)]],
-                                 device const float2* stats [[buffer(3)]],
-                                 device float* out [[buffer(4)]],
-                                 constant NormGroupParams& p [[buffer(5)]],
-                                 uint gid [[thread_position_in_grid]]) {
-    const uint cnt = p.cg * p.hw;
-    const ulong total = (ulong)p.n_groups * cnt;
-    const ulong idx0 = (ulong)gid * 4;
-    if (idx0 >= total) return;
-    uint prev_sg = UINT_MAX;
-    float mean = 0.0f, inv = 0.0f;
-    #pragma unroll
-    for (uint u = 0; u < 4; ++u) {
-        const ulong idx = idx0 + u;
-        if (idx >= total) break;
-        const uint sg_idx = uint(idx / cnt);
-        if (sg_idx != prev_sg) {
-            prev_sg = sg_idx;
-            device const float2* st = stats + (ulong)sg_idx * p.splits;
-            float s = 0.0f, sq = 0.0f;
-            for (uint k = 0; k < p.splits; ++k) {
-                float2 pair = st[k];
-                s += pair.x;
-                sq += pair.y;
-            }
-            const float pivot = cnt > 0 ? x[(ulong)sg_idx * cnt] : 0.0f;
-            float d_mean = s / float(cnt);
-            mean = pivot + d_mean;
-            float var = max(sq / float(cnt) - d_mean * d_mean, 0.0f);
-            inv = rsqrt(var + p.eps);
-        }
-        const uint rem = uint(idx - (ulong)sg_idx * cnt);
-        const uint ci = rem / p.hw;
-        const uint ch = (sg_idx % p.groups) * p.cg + ci;
-        float v = (x[idx] - mean) * (g[ch] * inv) + b[ch];
-        if (p.silu != 0) v = v / (1.0f + exp(-v));
-        out[idx] = v;
+    float inv = 1.0f / sqrt(block_sum(sq, scratch, sg, lane, nsg) / float(cnt) + p.eps);
+    for (uint ci = 0; ci < p.cg; ++ci) {
+        float ga = g[grp * p.cg + ci] * inv;
+        float be = b[grp * p.cg + ci];
+        ulong cb = base + (ulong)ci * p.hw;
+        for (uint j = tid; j < p.hw; j += tpg) out[cb + j] = (x[cb + j] - mean) * ga + be;
     }
 }
 
