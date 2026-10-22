@@ -7,10 +7,7 @@
 //! Every rule claims a node read by exactly one other node, and the operands it captures must exist
 //! before the claiming node, so at most one rule claims any node: extraction takes every match.
 
-use super::{
-    fusion_enabled, linear_format, numel, Epi, Planned, Step,
-    ATTN_MAX_HEAD_DIM,
-};
+use super::{fusion_enabled, linear_format, numel, Epi, Planned, Step, ATTN_MAX_HEAD_DIM};
 use crate::graph::{DType, Graph, Op, RopeVariant, ValueId, ValueKind};
 use egglog::{EGraph, Write as _};
 use std::collections::{HashMap, HashSet};
@@ -30,6 +27,8 @@ const PROGRAM: &str = r#"
 (relation Lin (i64 i64 i64))
 (relation PackedEpi (i64))
 (relation Norm (i64 i64 i64 i64))
+(relation NormNoGamma (i64 i64 i64 i64))
+(relation NormGamma (i64 i64 i64))
 (relation Rope (i64 i64 i64 i64 i64))
 (relation RopeP (i64 i64 i64 i64 i64))
 (relation Attn (i64 i64 i64 i64 i64 i64 i64))
@@ -58,6 +57,10 @@ const PROGRAM: &str = r#"
 
 ; RmsNorm `ni` (output `n`, gamma width d, x of xl elements): `+ r`, then `* s` (scalar f32), or a
 ; RoPE.
+(rule ((NormNoGamma ni n d xl) (Single n) (Rd2 j "Mul" n g) (Val g pg d) (F32 g) (< pg ni))
+      ((NormGamma ni j g)) :ruleset plan)
+(rule ((NormNoGamma ni n d xl) (Single n) (Rd2 j "Mul" g n) (Val g pg d) (F32 g) (< pg ni))
+      ((NormGamma ni j g)) :ruleset plan)
 (rule ((Norm ni n d xl) (Single n) (Rd2 j "Add" n o) (Val o po xl) (< po ni))
       ((NormRes ni j o)) :ruleset plan)
 (rule ((Norm ni n d xl) (Single n) (Rd2 j "Add" o n) (Val o po xl) (< po ni))
@@ -90,6 +93,7 @@ const PROGRAM: &str = r#"
 /// and its scale, the RoPE node.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct NormFusion {
+    pub gamma: Option<(usize, ValueId)>,
     pub res: Option<(usize, ValueId)>,
     pub scale: Option<(usize, ValueId)>,
     pub rope: Option<usize>,
@@ -110,9 +114,14 @@ impl Decisions {
     pub fn absorbed(&self) -> impl Iterator<Item = usize> + '_ {
         let epi = self.epi.values().map(|e| e.0);
         let norm = self.norm.values().flat_map(|n| {
-            [n.res.map(|r| r.0), n.scale.map(|s| s.0), n.rope]
-                .into_iter()
-                .flatten()
+            [
+                n.gamma.map(|g| g.0),
+                n.res.map(|r| r.0),
+                n.scale.map(|s| s.0),
+                n.rope,
+            ]
+            .into_iter()
+            .flatten()
         });
         let attn = self.attn_rope.values().flat_map(|&(q, k)| [q, k]);
         epi.chain(norm).chain(attn)
@@ -202,12 +211,20 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
             }
             let arg = |k: usize| n.inputs.get(k).map(|v| v.0 as i64);
             let tag = match &n.op {
-                Op::Unary { kind: crate::graph::UnaryKind::GeluErf } => Some("GeluErf"),
-                Op::Unary { kind: crate::graph::UnaryKind::Silu } => Some("Silu"),
+                Op::Unary {
+                    kind: crate::graph::UnaryKind::GeluErf,
+                } => Some("GeluErf"),
+                Op::Unary {
+                    kind: crate::graph::UnaryKind::Silu,
+                } => Some("Silu"),
                 Op::SwiGlu => Some("SwiGlu"),
                 Op::GeGlu => Some("GeGlu"),
-                Op::Binary { kind: crate::graph::BinaryKind::Add } => Some("Add"),
-                Op::Binary { kind: crate::graph::BinaryKind::Mul } => Some("Mul"),
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Add,
+                } => Some("Add"),
+                Op::Binary {
+                    kind: crate::graph::BinaryKind::Mul,
+                } => Some("Mul"),
                 _ => None,
             };
             if let (Some(t), Some(a)) = (tag, arg(0)) {
@@ -240,6 +257,14 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                     if let Ok(xl) = numel(g, n.inputs[0]) {
                         if d > 0 && xl % d == 0 {
                             fs.add("Norm", (id, o, d as i64, xl as i64))?;
+                        }
+                    }
+                }
+                Op::RmsNorm { .. } if fused && n.inputs.len() == 1 => {
+                    let d = g.value(n.inputs[0]).shape.last().copied().unwrap_or(0);
+                    if let Ok(xl) = numel(g, n.inputs[0]) {
+                        if d > 0 && xl % d == 0 {
+                            fs.add("NormNoGamma", (id, o, d as i64, xl as i64))?;
                         }
                     }
                 }
@@ -299,6 +324,10 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
         };
         d.epi.insert(r[0] as usize, (r[1] as usize, epi, val(r[3])));
     }
+    for r in rows(&eg, "NormGamma")? {
+        d.norm.entry(r[0] as usize).or_default().gamma =
+            Some((r[1] as usize, ValueId(r[2] as u32)));
+    }
     for r in rows(&eg, "NormRes")? {
         d.norm.entry(r[0] as usize).or_default().res = Some((r[1] as usize, ValueId(r[2] as u32)));
     }
@@ -356,7 +385,6 @@ const BATCH_PROGRAM: &str = r#"
 (rule ((NormRS s rows d o) (= n (+ s 1)) (NormPlain0 n rows d o)) ((Chain s)) :ruleset batch)
 (rule ((NormRS1 s d o) (= n (+ s 1)) (MlpIn n o d)) ((Absorb s)) :ruleset batch)
 "#;
-
 
 /// [`BATCH_PROGRAM`] with its run-growing rules for runs of 1..=3 members.
 static BATCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -879,10 +907,34 @@ mod tests {
         );
         let n0 = g.add("n0", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, h], F);
         let o = g.add("o", Op::Linear, &[n0, wo], vec![1, h], F);
-        let r = g.add("r", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[o, x], vec![1, h], F);
+        let r = g.add(
+            "r",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[o, x],
+            vec![1, h],
+            F,
+        );
         let n1 = g.add("n1", Op::RmsNorm { eps: 1e-5 }, &[r, gw], vec![1, h], F);
-        let r1 = g.add("r1", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[r, n1], vec![1, h], F);
-        let sc = g.add("sc", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[r1, s], vec![1, h], F);
+        let r1 = g.add(
+            "r1",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[r, n1],
+            vec![1, h],
+            F,
+        );
+        let sc = g.add(
+            "sc",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Mul,
+            },
+            &[r1, s],
+            vec![1, h],
+            F,
+        );
         let rope = Op::Rope {
             head_dim: hd,
             rotary_dim: hd,
@@ -936,8 +988,24 @@ mod tests {
         let x = g.input("x", vec![1, 64], F);
         let gw = g.weight("g", vec![64], F);
         let n = g.add("n", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
-        let r = g.add("r", Op::Binary { kind: crate::graph::BinaryKind::Add }, &[n, x], vec![1, 64], F);
-        g.add("dead", Op::Unary { kind: crate::graph::UnaryKind::Silu }, &[r], vec![1, 64], F);
+        let r = g.add(
+            "r",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Add,
+            },
+            &[n, x],
+            vec![1, 64],
+            F,
+        );
+        g.add(
+            "dead",
+            Op::Unary {
+                kind: crate::graph::UnaryKind::Silu,
+            },
+            &[r],
+            vec![1, 64],
+            F,
+        );
         g.nodes.pop();
         g.output(r);
         let d = decide(&g).unwrap();
@@ -1002,7 +1070,15 @@ mod tests {
             F,
         );
         let sc = g.add("sc", Op::GatherCols, &[scale_w, ids], vec![m, top_k], F);
-        let wv = g.add("weights", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[probs, sc], vec![m, top_k], F);
+        let wv = g.add(
+            "weights",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Mul,
+            },
+            &[probs, sc],
+            vec![m, top_k],
+            F,
+        );
         let moe = Op::MoeLinear { experts, top_k };
         let gu = g.add(
             "gu",
@@ -1026,7 +1102,15 @@ mod tests {
             shape: Some(vec![m * top_k, 1]),
         };
         let w_col = g.add("w_col", col, &[wv], vec![m * top_k, 1], F);
-        let weighted = g.add("weighted", Op::Binary { kind: crate::graph::BinaryKind::Mul }, &[down, w_col], vec![m * top_k, h], F);
+        let weighted = g.add(
+            "weighted",
+            Op::Binary {
+                kind: crate::graph::BinaryKind::Mul,
+            },
+            &[down, w_col],
+            vec![m * top_k, h],
+            F,
+        );
         let slots = Op::Reshape {
             shape: Some(vec![m, top_k, h]),
         };

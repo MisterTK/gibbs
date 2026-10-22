@@ -4777,7 +4777,12 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
             .outputs
             .first()
             .ok_or_else(|| format!("node '{name}' has no output"))?;
-        let ext_plan = ext::plan(g, node, &mut aliases);
+        let fz_norm = decided.norm.get(&i).copied().unwrap_or_default();
+        let ext_plan = if fz_norm.gamma.is_some() {
+            None
+        } else {
+            ext::plan(g, node, &mut aliases)
+        };
         let (op, out_len) = match &node.op {
             _ if ext_plan.is_some() => match ext_plan.expect("checked")? {
                 ext::PlanOut::Alias => {
@@ -4931,7 +4936,16 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 (Step::L2Normalize { x, n: n_of(x)? }, n_of(x)?)
             }
             Op::RmsNorm { eps } => {
-                let (x, g_val) = (arg(0)?, arg(1)?);
+                let fz = fz_norm;
+                let mut absorb = |j: usize| out = g.nodes[j].outputs[0];
+                let x = arg(0)?;
+                let g_val = match fz.gamma {
+                    Some((j, g_id)) => {
+                        absorb(j);
+                        g_id
+                    }
+                    None => arg(1)?,
+                };
                 let d = g.value(g_val).shape.last().copied().unwrap_or(0);
                 let xl = n_of(x)?;
                 if d == 0 || xl % d != 0 {
@@ -4939,8 +4953,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
                 }
                 // Absorbed `+ r` (`rmsnorm_residual_f32`), then `* s` (scalar output scale), or a
                 // RoPE over the same head_dim (per-head norm + rotary embedding).
-                let fz = decided.norm.get(&i).copied().unwrap_or_default();
-                let mut absorb = |j: usize| out = g.nodes[j].outputs[0];
                 let res = fz.res.map(|(j, r)| {
                     absorb(j);
                     r
