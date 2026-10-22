@@ -973,10 +973,7 @@ impl WeightStore {
         let ct = cache.index.get(name)?;
         let valid_fmt = !crate::model::reencode::is_float(ct.format)
             && crate::graph::codec::codec(ct.format).is_some()
-            && cols
-                % crate::graph::codec::block_geometry(ct.format)
-                    .map_or(1, |g| g.0)
-                == 0;
+            && cols % crate::graph::codec::block_geometry(ct.format).map_or(1, |g| g.0) == 0;
         let valid = valid_fmt
             && ct.rows == rows
             && ct.cols == cols
@@ -2133,6 +2130,9 @@ fn load_from(
         )
         .map_err(cx)?;
     }
+    if spec.pipeline != super::Pipeline::CausalLm {
+        reencode.policy = ReencodePolicy::BitExact;
+    }
     if let Some(pats) = spec.runtime.get("ffn_weights").and_then(J::as_array) {
         reencode.ffn_weights = Some(Arc::new(
             pats.iter()
@@ -2154,7 +2154,9 @@ fn load_from(
     let reencode_key = ckpt
         .weights_path
         .as_deref()
-        .filter(|_| !ckpt.synthetic && req_policy != ReencodePolicy::BitExact && reencode.force.is_none())
+        .filter(|_| {
+            !ckpt.synthetic && req_policy != ReencodePolicy::BitExact && reencode.force.is_none()
+        })
         .and_then(|p| {
             crate::model::reencode::choice_key(p, req_policy, req_max_kl, reencode.force)
         });
@@ -2583,8 +2585,7 @@ pub fn gated<T>(
         let pending = take_pending_reencode();
         let saved = stats.bytes_before.saturating_sub(stats.bytes_after);
         if let Some(choice) = stats.cached_choice {
-            if stats.cache_mismatch || stats.cache_hits != stats.reencoded || stats.reencoded == 0
-            {
+            if stats.cache_mismatch || stats.cache_hits != stats.reencoded || stats.reencoded == 0 {
                 // Cached rung was stale or mismatched; retry from rung 0 without redirecting.
                 allow_redirect = false;
                 continue;
@@ -2913,7 +2914,11 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            assert_eq!(load_calls.get(), 1, "warm load must make exactly one load_once call");
+            assert_eq!(
+                load_calls.get(),
+                1,
+                "warm load must make exactly one load_once call"
+            );
             assert_eq!(crate::model::reencode::native_stats().cache_hits, 1);
             let Tensor::Mat(mat1) = get(&m1, "mlp.w") else {
                 panic!("expected Mat")
@@ -2923,7 +2928,10 @@ mod tests {
             };
             let p1 = mat1.packed().unwrap();
             let p2 = mat2.packed().unwrap();
-            assert!(matches!(&*p2.map, GgufData::Map(_)), "second load must mmap .blocks");
+            assert!(
+                matches!(&*p2.map, GgufData::Map(_)),
+                "second load must mmap .blocks"
+            );
             assert_eq!(p1.format, p2.format);
             let len = rows * p1.format.tensor_bytes(cols);
             assert_eq!(
@@ -3687,10 +3695,7 @@ mod tests {
             ..Default::default()
         }));
         let r = gated(true, load, |_, _| {
-            assert!(matches!(
-                ReencodeConfig::effective().policy,
-                MZ | MS | LB
-            ));
+            assert!(matches!(ReencodeConfig::effective().policy, MZ | MS | LB));
             Ok(report(1e9))
         });
         assert_eq!(r, Some(Ok(6)));
