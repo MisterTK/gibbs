@@ -447,7 +447,23 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             kernel,
             ref params,
         } => {
-            e.enc.set_compute_pipeline_state(rt.pso(kernel)?);
+            let (k_name, qb, threads) = if rt.profile.mpp.is_ok()
+                && params.nq >= 8
+                && (params.nq >= 64 || params.head_dim >= 64)
+                && params.head_dim % 8 == 0
+                && params.head_dim <= 512
+            {
+                match params.head_dim {
+                    0..=32 => ("flash_attn_mm_32", 32u64, 128u64),
+                    33..=64 => ("flash_attn_mm_64", 32, 128),
+                    65..=128 => ("flash_attn_mm_128", 32, 128),
+                    129..=256 => ("flash_attn_mm_256", 32, 128),
+                    _ => ("flash_attn_mm_512", 16, 128),
+                }
+            } else {
+                (kernel, QB as u64, QB as u64 * 32)
+            };
+            e.enc.set_compute_pipeline_state(rt.pso(k_name)?);
             e.bind(0, q);
             e.bind(1, k);
             e.bind(2, v);
@@ -456,12 +472,8 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &Step) -> Result<
             e.bind(4, s.out);
             set_bytes(e.enc, 5, params);
             e.enc.dispatch_thread_groups(
-                MTLSize::new(
-                    (params.nq as u64).div_ceil(QB as u64),
-                    params.heads as u64,
-                    1,
-                ),
-                MTLSize::new(QB as u64 * 32, 1, 1),
+                MTLSize::new((params.nq as u64).div_ceil(qb), params.heads as u64, 1),
+                MTLSize::new(threads, 1, 1),
             );
         }
         Step::RelPosBias {
@@ -624,8 +636,13 @@ mod tests {
             want.iter().chain(&got).all(|v| v.is_finite()),
             "{c:?}: non-finite output"
         );
+        let tol = if c.nq >= 8 && c.hd > 64 && c.hd % 8 == 0 && c.hd <= 512 {
+            2e-3
+        } else {
+            1e-4
+        };
         let e = rel_err(&want, &got);
-        assert!(e < 1e-4, "{c:?}: rel err {e:e}");
+        assert!(e <= tol, "{c:?}: rel err {e:e} (tol {tol:e})");
         (want, got)
     }
 
@@ -746,7 +763,13 @@ mod tests {
                     ..Case::new(19, 19, 4, 2, 32)
                 };
                 let (scaled, _) = check_with(&c, None);
-                let (plain, _) = run(&Case { scale: None, ..c.clone() }, None);
+                let (plain, _) = run(
+                    &Case {
+                        scale: None,
+                        ..c.clone()
+                    },
+                    None,
+                );
                 let diff = scaled
                     .iter()
                     .zip(&plain)
@@ -1021,6 +1044,45 @@ mod tests {
         }
     }
 
+    /// Tiled MPP flash attention (`flash_attn_mm`) across query lengths {8, 33, 512}, head dims
+    /// {64, 128, 256, 512}, GQA 8:1 and 1:1, causal, window 128, soft-cap 50, mask and bias.
+    #[test]
+    fn flash_attn_mm_matrix() {
+        for nq in [8usize, 33, 512] {
+            for hd in [64usize, 128, 256, 512] {
+                for (heads, kv) in [(8usize, 1usize), (2, 2)] {
+                    for (causal, window, cap, bias, masked) in [
+                        (true, None, None, Bias::None, false),
+                        (true, Some(128), None, Bias::None, false),
+                        (false, Some(128), None, Bias::None, false),
+                        (true, None, Some(50.0), Bias::None, false),
+                        (false, None, None, Bias::Rows, false),
+                        (false, None, None, Bias::Keys, true),
+                    ] {
+                        let c = Case {
+                            causal,
+                            window,
+                            cap,
+                            bias,
+                            ..Case::new(nq, nq, heads, kv, hd)
+                        };
+                        let mask_vec = masked.then(|| {
+                            let mut b = vec![0.0f32; nq];
+                            b[nq / 2..].fill(f32::NEG_INFINITY);
+                            b
+                        });
+                        let (want, got) = run(&c, mask_vec);
+                        let e = rel_err(&want, &got);
+                        assert!(
+                            e <= 2e-3,
+                            "nq {nq} hd {hd} {heads}:{kv} causal {causal} win {window:?} cap {cap:?} bias {bias:?} mask {masked}: {e:e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// `table[i] = i`, so the output is `bucket * heads + head`, compared exactly.
     fn rel_pos_case(
         buckets: usize,
@@ -1154,7 +1216,14 @@ mod tests {
     fn mrope_matches_cpu() {
         let cases = [
             // (head_dim, rotary_dim, sections, interleaved, pairs, mscale)
-            (16usize, 16usize, [3u32, 3, 2], false, PairLayout::Half, 1.0f32),
+            (
+                16usize,
+                16usize,
+                [3u32, 3, 2],
+                false,
+                PairLayout::Half,
+                1.0f32,
+            ),
             (16, 16, [3, 3, 2], false, PairLayout::Adjacent, 1.0),
             (16, 8, [2, 1, 1], false, PairLayout::Half, 1.0),
             (16, 8, [2, 1, 1], true, PairLayout::Half, 1.0),
@@ -1195,7 +1264,10 @@ mod tests {
             ];
             let (want, got) = both(&g, &Weights::new(), data);
             let e = rel_err(&want, &got);
-            assert!(e < 1e-4, "hd {hd} rot {rot} {sections:?} il {interleaved} {pairs:?}: {e}");
+            assert!(
+                e < 1e-4,
+                "hd {hd} rot {rot} {sections:?} il {interleaved} {pairs:?}: {e}"
+            );
         }
     }
 

@@ -537,7 +537,26 @@ const BASE_KERNELS: [&str; 75] = [
     "causal_conv1d_f32",
     "delta_rule_f32",
 ];
-const MPP_KERNELS: [&str; 3] = ["gemm_mpp_none", "gemm_mpp_gelu", "gemm_mpp_residual"];
+const MPP_KERNELS: [&str; 18] = [
+    "gemm_mpp_none",
+    "gemm_mpp_gelu",
+    "gemm_mpp_residual",
+    "flash_attn_mm_32",
+    "flash_attn_mm_64",
+    "flash_attn_mm_128",
+    "flash_attn_mm_256",
+    "flash_attn_mm_512",
+    "flash_attn_cached_mm_f32_32",
+    "flash_attn_cached_mm_f32_64",
+    "flash_attn_cached_mm_f32_128",
+    "flash_attn_cached_mm_f32_256",
+    "flash_attn_cached_mm_f32_512",
+    "flash_attn_cached_mm_f16_32",
+    "flash_attn_cached_mm_f16_64",
+    "flash_attn_cached_mm_f16_128",
+    "flash_attn_cached_mm_f16_256",
+    "flash_attn_cached_mm_f16_512",
+];
 
 /// GEMM implementation for `Op::Linear`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -718,9 +737,16 @@ impl Runtime {
         }
         let pso_ms = t1.elapsed().as_secs_f64() * 1e3;
         for (name, pso) in &psos {
-            if pso.thread_execution_width() != 32 || pso.max_total_threads_per_threadgroup() < TG {
+            let min_tg = if name.starts_with("flash_attn_") || name.starts_with("gemm_mpp_") {
+                TG4
+            } else {
+                TG
+            };
+            if pso.thread_execution_width() != 32
+                || pso.max_total_threads_per_threadgroup() < min_tg
+            {
                 return Err(format!(
-                    "Metal pipeline '{name}' needs SIMD width 32 and >= {TG} threads per threadgroup (got {} / {})",
+                    "Metal pipeline '{name}' needs SIMD width 32 and >= {min_tg} threads per threadgroup (got {} / {})",
                     pso.thread_execution_width(),
                     pso.max_total_threads_per_threadgroup()
                 ));
@@ -3406,7 +3432,7 @@ impl Session {
                 heads,
                 head_dim,
                 kv_heads,
-                v_head_dim: _,
+                v_head_dim,
                 scale,
                 window,
                 soft_cap,
@@ -3523,6 +3549,23 @@ impl Session {
                         "flash_attn_cached_f16",
                     ],
                 ];
+                let mm_spec = (m >= 8
+                    && v_head_dim == head_dim
+                    && head_dim % 8 == 0
+                    && head_dim <= 512
+                    && rt.profile.mpp.is_ok())
+                .then(|| match (kv_f16, head_dim) {
+                    (false, 0..=32) => ("flash_attn_cached_mm_f32_32", 32usize),
+                    (false, 33..=64) => ("flash_attn_cached_mm_f32_64", 32),
+                    (false, 65..=128) => ("flash_attn_cached_mm_f32_128", 32),
+                    (false, 129..=256) => ("flash_attn_cached_mm_f32_256", 32),
+                    (false, _) => ("flash_attn_cached_mm_f32_512", 16),
+                    (true, 0..=32) => ("flash_attn_cached_mm_f16_32", 32),
+                    (true, 33..=64) => ("flash_attn_cached_mm_f16_64", 32),
+                    (true, 65..=128) => ("flash_attn_cached_mm_f16_128", 32),
+                    (true, 129..=256) => ("flash_attn_cached_mm_f16_256", 16),
+                    (true, _) => ("flash_attn_cached_mm_f16_512", 8),
+                });
                 let nj = match head_dim.div_ceil(32) {
                     0..=1 => 0,
                     2 => 1,
@@ -3530,7 +3573,9 @@ impl Session {
                     5..=8 => 3,
                     _ => 4,
                 };
-                enc.set_compute_pipeline_state(if gqa_decode {
+                enc.set_compute_pipeline_state(if let Some((k_name, _)) = mm_spec {
+                    rt.pso(k_name)?
+                } else if gqa_decode {
                     rt.pso(GQA[kv_f16 as usize][nj])?
                 } else if kv_f16 {
                     rt.pso(FLASH[1][nj])?
@@ -3593,15 +3638,18 @@ impl Session {
                     mscale: rope.map_or(1.0, |r| r.mscale),
                 };
                 set_bytes(enc, 4, &p);
-                let tgs_x = if gqa_decode {
-                    kv_heads * group.div_ceil(ATTN_HPT)
+                let tgs = if let Some((_, qb)) = mm_spec {
+                    MTLSize::new(m.div_ceil(qb) as u64, heads as u64, 1)
+                } else if gqa_decode {
+                    MTLSize::new(
+                        (kv_heads * group.div_ceil(ATTN_HPT)) as u64,
+                        m as u64,
+                        n_splits as u64,
+                    )
                 } else {
-                    heads
+                    MTLSize::new(heads as u64, m as u64, n_splits as u64)
                 };
-                enc.dispatch_thread_groups(
-                    MTLSize::new(tgs_x as u64, m as u64, n_splits as u64),
-                    MTLSize::new(TG4, 1, 1),
-                );
+                enc.dispatch_thread_groups(tgs, MTLSize::new(TG4, 1, 1));
                 if let Some(part) = scratch_guard.as_ref().filter(|_| n_splits > 1) {
                     enc.set_compute_pipeline_state(rt.pso("attn_cached_merge_f32")?);
                     enc.set_buffer(0, Some(part), 0);

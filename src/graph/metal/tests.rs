@@ -1030,7 +1030,10 @@ fn every_kernel_source_compiles() {
     let need = |name: &str| -> u64 {
         if name.starts_with("deltanet_step_") {
             ext::deltanet::THREADS as u64
-        } else if name.starts_with("gemmgen_") {
+        } else if name.starts_with("gemmgen_")
+            || name.starts_with("flash_attn_")
+            || name.starts_with("gemm_mpp_")
+        {
             TG4
         } else {
             TG
@@ -2998,7 +3001,8 @@ fn split_decode_attention_matches_cpu_for(kv_f16: bool, tol: f32) {
                     &mut cpu_state,
                     &mut metal_state,
                 );
-                assert!(e < tol, "f16 KV {kv_f16} prefill {window:?}: {e}");
+                let prefill_tol = if hd > 32 { tol.max(2e-3) } else { tol };
+                assert!(e <= prefill_tol, "f16 KV {kv_f16} prefill {window:?}: {e}");
                 let (kbuf, n) = &metal_state.metal_buffers["k_state"];
                 assert_eq!(metal_state.metal_f16.contains("k_state"), kv_f16);
                 assert_eq!(
@@ -3249,50 +3253,134 @@ fn attention_decode_rates() {
 /// window still starting at the row's own position. Metal against the CPU executor.
 #[test]
 fn cached_attention_visible_end_matches_cpu() {
-    let (heads, kv_heads, hd, m) = (4, 2, 8, 6);
-    let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
-    let mut g = Graph::new();
-    let q = g.input("q", vec![m, q_dim], DType::F32);
-    let k = g.input("k", vec![m, kv_dim], DType::F32);
-    let v = g.input("v", vec![m, kv_dim], DType::F32);
-    let ks = g.state("k_state", vec![16, kv_dim], DType::F32, false);
-    let vs = g.state("v_state", vec![16, kv_dim], DType::F32, false);
-    let pos = g.input("pos", vec![m], DType::U32);
-    let vis = g.input("vis", vec![m], DType::U32);
-    let out = g.add(
-        "attn",
-        Op::CachedAttention {
-            heads,
-            kv_heads,
-            head_dim: hd,
-            v_head_dim: hd,
-            scale: 1.0 / (hd as f32).sqrt(),
-            causal: true,
-            window: Some(4),
-            soft_cap: None,
-            write: true,
-        },
-        &[q, k, v, ks, vs, pos, vis],
-        vec![m, q_dim],
-        DType::F32,
-    );
-    g.output(out);
-    let inputs = vec![
-        Tensor::F32(rand(m * q_dim, 11)),
-        Tensor::F32(rand(m * kv_dim, 22)),
-        Tensor::F32(rand(m * kv_dim, 33)),
-        Tensor::U32((0..m as u32).collect()),
-        Tensor::U32(vec![1, 2, 3, 6, 6, 6]),
-    ];
-    let want = cpu::run(&g, &Weights::new(), &mut StateStore::new(), inputs.clone()).unwrap();
-    for (kv_f16, tol) in KV_DTYPES {
-        let mut session = Session::new(rt(), &Weights::new()).unwrap();
-        session.set_kv_f16(kv_f16);
-        let got = session
-            .run_with_state(&g, Some(&mut StateStore::new()), inputs.clone())
-            .unwrap();
-        let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
-        assert!(err < tol, "visible_end mismatch (f16 KV {kv_f16}): {err}");
+    for (heads, kv_heads, hd, m, win) in [
+        (4, 2, 8, 6, Some(4)),
+        (8, 1, 64, 8, Some(128)),
+        (8, 1, 128, 33, Some(128)),
+        (2, 2, 256, 33, None),
+        (8, 1, 512, 8, None),
+    ] {
+        let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+        let mut g = Graph::new();
+        let q = g.input("q", vec![m, q_dim], DType::F32);
+        let k = g.input("k", vec![m, kv_dim], DType::F32);
+        let v = g.input("v", vec![m, kv_dim], DType::F32);
+        let ks = g.state("k_state", vec![m + 8, kv_dim], DType::F32, false);
+        let vs = g.state("v_state", vec![m + 8, kv_dim], DType::F32, false);
+        let pos = g.input("pos", vec![m], DType::U32);
+        let vis = g.input("vis", vec![m], DType::U32);
+        let out = g.add(
+            "attn",
+            Op::CachedAttention {
+                heads,
+                kv_heads,
+                head_dim: hd,
+                v_head_dim: hd,
+                scale: 1.0 / (hd as f32).sqrt(),
+                causal: true,
+                window: win,
+                soft_cap: Some(50.0),
+                write: true,
+            },
+            &[q, k, v, ks, vs, pos, vis],
+            vec![m, q_dim],
+            DType::F32,
+        );
+        g.output(out);
+        let vis_vec: Vec<u32> = (0..m)
+            .map(|i| if i >= m / 2 { m as u32 } else { (i + 1) as u32 })
+            .collect();
+        let inputs = vec![
+            Tensor::F32(rand(m * q_dim, 11)),
+            Tensor::F32(rand(m * kv_dim, 22)),
+            Tensor::F32(rand(m * kv_dim, 33)),
+            Tensor::U32((0..m as u32).collect()),
+            Tensor::U32(vis_vec),
+        ];
+        let want = cpu::run(&g, &Weights::new(), &mut StateStore::new(), inputs.clone()).unwrap();
+        for (kv_f16, tol) in KV_DTYPES {
+            let mut session = Session::new(rt(), &Weights::new()).unwrap();
+            session.set_kv_f16(kv_f16);
+            let got = session
+                .run_with_state(&g, Some(&mut StateStore::new()), inputs.clone())
+                .unwrap();
+            let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+            let max_tol = if m >= 8 && hd > 64 { tol.max(2e-3) } else { tol };
+            assert!(
+                err <= max_tol,
+                "visible_end mismatch m={m} hd={hd} (f16 KV {kv_f16}): {err}"
+            );
+        }
+    }
+
+    // Full prefill matrix over m in {8, 33, 512} x hd in {64, 128, 256, 512}, GQA 8:1 and 1:1,
+    // causal, window 128, soft-cap 50 and vis block.
+    for m in [8usize, 33, 512] {
+        for hd in [64usize, 128, 256, 512] {
+            for (heads, kv_heads) in [(8usize, 1usize), (2, 2)] {
+                for (window, soft_cap, has_vis) in [
+                    (None, None, false),
+                    (Some(128), None, false),
+                    (None, Some(50.0), false),
+                    (Some(128), Some(50.0), true),
+                ] {
+                    let (q_dim, kv_dim) = (heads * hd, kv_heads * hd);
+                    let mut g = Graph::new();
+                    let q = g.input("q", vec![m, q_dim], DType::F32);
+                    let k = g.input("k", vec![m, kv_dim], DType::F32);
+                    let v = g.input("v", vec![m, kv_dim], DType::F32);
+                    let ks = g.state("k_state", vec![m + 8, kv_dim], DType::F32, false);
+                    let vs = g.state("v_state", vec![m + 8, kv_dim], DType::F32, false);
+                    let pos = g.input("pos", vec![m], DType::U32);
+                    let mut ins = vec![q, k, v, ks, vs, pos];
+                    if has_vis {
+                        ins.push(g.input("vis", vec![m], DType::U32));
+                    }
+                    let out = g.add(
+                        "attn",
+                        Op::CachedAttention {
+                            heads,
+                            kv_heads,
+                            head_dim: hd,
+                            v_head_dim: hd,
+                            scale: 1.0 / (hd as f32).sqrt(),
+                            causal: true,
+                            window,
+                            soft_cap,
+                            write: true,
+                        },
+                        &ins,
+                        vec![m, q_dim],
+                        DType::F32,
+                    );
+                    g.output(out);
+                    let mut inputs = vec![
+                        Tensor::F32(rand(m * q_dim, 41)),
+                        Tensor::F32(rand(m * kv_dim, 42)),
+                        Tensor::F32(rand(m * kv_dim, 43)),
+                        Tensor::U32((0..m as u32).collect()),
+                    ];
+                    if has_vis {
+                        let vis_vec: Vec<u32> = (0..m)
+                            .map(|i| if i >= m / 2 { m as u32 } else { (i + 1) as u32 })
+                            .collect();
+                        inputs.push(Tensor::U32(vis_vec));
+                    }
+                    let want =
+                        cpu::run(&g, &Weights::new(), &mut StateStore::new(), inputs.clone())
+                            .unwrap();
+                    let session = Session::new(rt(), &Weights::new()).unwrap();
+                    let got = session
+                        .run_with_state(&g, Some(&mut StateStore::new()), inputs)
+                        .unwrap();
+                    let err = rel_err(want[0].as_f32().unwrap(), got[0].as_f32().unwrap());
+                    assert!(
+                        err <= 2e-3,
+                        "cached_attn_mm m={m} hd={hd} {heads}:{kv_heads} win={window:?} cap={soft_cap:?} vis={has_vis}: {err:e}"
+                    );
+                }
+            }
+        }
     }
 }
 
