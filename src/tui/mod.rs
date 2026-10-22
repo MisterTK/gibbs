@@ -2487,7 +2487,8 @@ mod tests {
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         app.handle_key(key(KeyCode::Char('m')));
         for _ in 0..500 {
-            if app.picker.tick() {
+            app.picker.tick();
+            if !app.picker.scanning_local {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2515,7 +2516,8 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Char('m')));
         for _ in 0..500 {
-            if app.picker.tick() {
+            app.picker.tick();
+            if !app.picker.scanning_local {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
