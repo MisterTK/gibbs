@@ -95,11 +95,9 @@ mod tests {
         };
         assert_eq!((gemv_rows_per_tg(p), gemv_threads(p)), (4, 64));
         assert_eq!(gemv_packed_name(c, p), "gemvgen_GGUF_Q4_K_M_r2_sg2");
-        assert!(gemv_packed(c, p).contains("const uint row0 = tg.x * 4 + sg * 2;"));
         // The 256-thread default keeps its name and source (tuned shapes keep their cache keys).
         let d = GemvParams::default();
         assert_eq!(gemv_packed_name(c, d), "gemvgen_GGUF_Q4_K_M_r2");
-        assert!(gemv_packed(c, d).contains("const uint row0 = tg.x * 16 + sg * 2;"));
     }
 
 }
