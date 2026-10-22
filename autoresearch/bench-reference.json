@@ -3,33 +3,73 @@
     "engine": "llama.cpp",
     "build": "Homebrew llama.cpp 0.6.0_1 (ggml 0.26.0)",
     "tool": "llama-bench tg128, Metal",
-    "date": "2026-10-19",
+    "date": "2026-10-22",
     "source": "autoresearch/sprint3-probes.md",
-    "source_note": "P0.3",
+    "source_note": "ib-P0.4",
     "rows": [
       {
+        "row": 0,
         "key": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
-        "tok_s": 145.11
+        "engine": "llama.cpp",
+        "tok_s": 140.79,
+        "pp512_tok_s": 3615.77
       },
       {
+        "row": 1,
         "key": "unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf",
-        "tok_s": 115.69
+        "engine": "llama.cpp",
+        "tok_s": 112.39,
+        "pp512_tok_s": 3459.65
       },
       {
+        "row": 2,
         "key": "unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf",
-        "tok_s": 143.78
+        "engine": "llama.cpp",
+        "tok_s": 142.36,
+        "pp512_tok_s": 4284.42
       },
       {
+        "row": 3,
         "key": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf",
-        "tok_s": 42.6
+        "engine": "llama.cpp",
+        "tok_s": 41.09,
+        "pp512_tok_s": 984.67
       },
       {
+        "row": 4,
         "key": "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf",
-        "tok_s": 260.23
+        "engine": "llama.cpp",
+        "tok_s": 261.13,
+        "pp512_tok_s": 8119.16
       },
       {
+        "row": 7,
         "key": "unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf",
-        "tok_s": 80.86
+        "engine": "llama.cpp",
+        "tok_s": 78.38,
+        "pp512_tok_s": 1569.09
+      },
+      {
+        "row": 8,
+        "key": "e2b-qat-ctx4k",
+        "engine": "llama.cpp",
+        "tok_s": 119.46,
+        "pp512_tok_s": 3158.71,
+        "pp4096_tok_s": 3158.71
+      },
+      {
+        "row": 5,
+        "key": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "engine": "mlx",
+        "tok_s": 498.07,
+        "pp512_tok_s": 9273.34
+      },
+      {
+        "key": "stabilityai/sd-turbo",
+        "engine": "sd.cpp",
+        "tok_s": null,
+        "pp512_tok_s": null,
+        "s_per_step": 0.2513
       }
     ]
   },
