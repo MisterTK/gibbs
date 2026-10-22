@@ -5546,9 +5546,6 @@ fn plan(g: &Graph) -> Result<(Vec<Planned>, HashMap<ValueId, (ValueId, usize)>),
         });
     }
     fuse_moe_subgraphs(g, &mut steps, &aliases)?;
-    if ext::ple::enabled() {
-        ext::ple::fuse(g, &mut steps, &aliases)?;
-    }
     ext::deltanet::fuse(g, &mut steps)?;
     Ok((steps, aliases))
 }
@@ -7309,25 +7306,6 @@ mod tests {
                     build(&format!("{head}{src}"), &codegen::gemv_indexed_name(c, p));
                 }
             }
-            build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
-        }
-        let (q4_0, q4_k) = (
-            codec::codec(QuantFormat::GGUF_Q4_0).unwrap(),
-            codec::codec(QuantFormat::GGUF_Q4_K_M).unwrap(),
-        );
-        build(
-            &ext::ple::kernel_src(q4_0, q4_k),
-            &ext::ple::kernel_name(q4_0, q4_k),
-        );
-        // TQ2_0's device source is the planar layout, the one codec outside `codec.msl`.
-        let tq2 = codec::codec(QuantFormat::GGUF_TQ2_0).unwrap();
-        build(
-            &ext::ple::kernel_src(tq2, q4_k),
-            &ext::ple::kernel_name(tq2, q4_k),
-        );
-        for f in [QuantFormat::BF16, QuantFormat::FP16] {
-            let c = ext::ple::codec_of(f).expect("pseudo-codec");
-            build(&ext::ple::kernel_src(c, c), &ext::ple::kernel_name(c, c));
         }
     }
 

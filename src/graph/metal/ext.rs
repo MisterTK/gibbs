@@ -16,7 +16,6 @@ pub(super) mod matmul;
 pub(super) mod moe;
 pub(super) mod movement;
 pub(super) mod norm;
-pub(super) mod ple;
 
 /// All group kernel sources, appended to `metal_kernels.metal`.
 pub(super) fn msl() -> String {
@@ -61,7 +60,6 @@ pub enum ExtStep {
     Conv(conv::Step),
     Attn(attn::Step),
     Experts(moe::Step),
-    Ple(ple::Step),
     /// Built only by the [`deltanet::fuse`] post-pass.
     DeltaNet(deltanet::DeltaNetStep),
 }
@@ -137,7 +135,6 @@ pub(super) fn reads(st: &ExtStep) -> Vec<ValueId> {
         ExtStep::Conv(e) => conv::reads(e),
         ExtStep::Attn(e) => attn::reads(e),
         ExtStep::Experts(e) => moe::reads(e),
-        ExtStep::Ple(e) => ple::reads(e),
         ExtStep::DeltaNet(e) => deltanet::reads(e),
     }
 }
@@ -151,7 +148,6 @@ pub(super) fn allows_non_f32(st: &ExtStep, v: ValueId) -> bool {
         ExtStep::Conv(e) => conv::allows_non_f32(e, v),
         ExtStep::Attn(e) => attn::allows_non_f32(e, v),
         ExtStep::Experts(e) => moe::allows_non_f32(e, v),
-        ExtStep::Ple(e) => ple::allows_non_f32(e, v),
         ExtStep::DeltaNet(e) => deltanet::allows_non_f32(e, v),
     }
 }
@@ -165,7 +161,6 @@ pub(super) fn encode(sess: &Session, e: &Enc, s: &Planned, st: &ExtStep) -> Resu
         ExtStep::Conv(e_) => conv::encode(sess, e, s, e_),
         ExtStep::Attn(e_) => attn::encode(sess, e, s, e_),
         ExtStep::Experts(e_) => moe::encode(sess, e, s, e_),
-        ExtStep::Ple(e_) => ple::encode(sess, e, s, e_),
         ExtStep::DeltaNet(e_) => deltanet::encode(sess, e, s, e_),
     }
 }
