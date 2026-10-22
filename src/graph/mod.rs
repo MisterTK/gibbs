@@ -16,7 +16,6 @@ pub mod passes;
 pub mod pattern;
 pub mod placement;
 pub mod program;
-pub mod search;
 pub mod shape;
 #[cfg(test)]
 pub(crate) mod synth_decoder;

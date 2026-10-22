@@ -41,7 +41,6 @@ use crate::graph::{DType, Graph, NodeId, Op, Tensor, ValueId, ValueKind, Weights
 use egglog::scheduler::{Matches, Scheduler};
 use egglog::{EGraph, Value, Write as _};
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 use std::time::Instant;
 
 /// Key offset of a fused gate/up `Lin` (`+ glu node id`): after every original node, like the
@@ -538,24 +537,10 @@ impl Extract<'_> {
     }
 }
 
-/// One fusion the extraction chose or rejected: the unit of Phase-4 plan search.
-#[derive(Debug, Clone)]
-pub struct Choice {
-    /// Index into [`Fusion::choices`]; what [`Fusion::apply`] flips.
-    pub id: usize,
-    /// `"megakernel-mlp"`, `"gate-up"`, `"qkv"` or `"qkv-slices-attn"`.
-    pub kind: &'static str,
-    /// Structural key (FNV-1a over kind, op kinds, shapes and dtypes of the fused values and their
-    /// weights; no ids or names): repeated layers share it, stable across processes.
-    pub pattern: u64,
-    /// Whether the cost model applies it.
-    pub on: bool,
-    /// Modelled cost change of applying it alone to the unfused graph (µs; negative = faster).
-    pub delta_us: f64,
-}
 
 /// How to materialize one choice.
 struct Pick {
+    on: bool,
     kind: Kind,
     /// Add / attention output (`Mlp` / `Rewired`).
     anchor: Option<ValueId>,
@@ -624,7 +609,6 @@ fn attn_cover(g: &Graph, a: ValueId) -> Vec<ValueId> {
 /// A saturated and extracted e-graph of one graph: its fusion choices, and the materialization of
 /// the cost model's set ([`Fusion::apply`] with no flips) or of any other consistent set.
 pub struct Fusion {
-    choices: Vec<Choice>,
     picks: Vec<Pick>,
     report: Report,
 }
@@ -664,10 +648,6 @@ impl Fusion {
         budget: Budget,
     ) -> Result<Self, String> {
         Self::build(g, weights, rules, cost, budget)
-    }
-
-    pub fn choices(&self) -> &[Choice] {
-        &self.choices
     }
 
     /// Timings of [`Fusion::new`] (encode, saturate, extract) and counts.
@@ -923,7 +903,6 @@ impl Fusion {
                 .all(|&(c, _)| ex.live(c) && ex.choice.get(&c).copied().unwrap_or(0) == 0)
         };
         let mut order: Vec<(i64, usize)> = Vec::with_capacity(groups.len());
-        let mut deltas = vec![0.0; groups.len()];
         for (i, gr) in groups.iter().enumerate() {
             let d = if usable(&ex, gr) {
                 let d = ex.apply(gr, false);
@@ -932,7 +911,6 @@ impl Fusion {
             } else {
                 0.0
             };
-            deltas[i] = d;
             order.push(((d * 1e3).round() as i64, i));
         }
         order.sort_by(|a, b| {
@@ -967,20 +945,6 @@ impl Fusion {
             .enumerate()
             .filter_map(|(i, gr)| Some((gr.fused?, i)))
             .collect();
-        let describe = |v: ValueId| -> String {
-            let val = g.value(v);
-            let mut s = format!("{:?}{:?}", val.shape, val.dtype);
-            if let ValueKind::Node(n) = val.kind {
-                let n = &g.nodes[n.0 as usize];
-                s.push_str(rule_key(g, n));
-                for &i in &n.inputs {
-                    let iv = g.value(i);
-                    let _ = write!(s, "<{:?}{:?}>", iv.shape, iv.dtype);
-                }
-            }
-            s
-        };
-        let mut choices = Vec::with_capacity(groups.len());
         let mut picks = Vec::with_capacity(groups.len());
         for (i, gr) in groups.iter().enumerate() {
             let members: Vec<Result<ValueId, ValueId>> = match gr.kind {
@@ -996,28 +960,13 @@ impl Fusion {
             };
             let anchor =
                 matches!(gr.kind, Kind::Mlp | Kind::AttnSlices).then(|| orig_out(gr.anchor));
-            let kind = ["megakernel-mlp", "gate-up", "qkv", "qkv-slices-attn"][gr.kind as usize];
-            let mut key = kind.to_string();
-            for v in anchor
-                .iter()
-                .chain(members.iter().map(|m| m.as_ref().unwrap_or_else(|e| e)))
-            {
-                key.push('|');
-                key.push_str(&describe(*v));
-            }
-            choices.push(Choice {
-                id: i,
-                kind,
-                pattern: fnv1a(key.as_bytes()),
-                on: committed[i],
-                delta_us: deltas[i],
-            });
             let covers: Vec<ValueId> = match (gr.kind, anchor) {
                 (Kind::Mlp, Some(a)) => mlp_cover(g, a),
                 (Kind::AttnSlices, Some(a)) => attn_cover(g, a),
                 _ => members.iter().filter_map(|m| m.ok()).collect(),
             };
             picks.push(Pick {
+                on: committed[i],
                 kind: gr.kind,
                 anchor,
                 members,
@@ -1030,7 +979,6 @@ impl Fusion {
             });
         }
         Ok(Self {
-            choices,
             picks,
             report,
         })
@@ -1048,7 +996,7 @@ impl Fusion {
         flip: &[usize],
     ) -> Result<Report, String> {
         let mut report = self.report.clone();
-        let mut on: Vec<bool> = self.choices.iter().map(|c| c.on).collect();
+        let mut on: Vec<bool> = self.picks.iter().map(|p| p.on).collect();
         let mut forced = vec![false; on.len()];
         for &i in flip {
             let o = on
@@ -1162,6 +1110,7 @@ impl Fusion {
     }
 }
 
+#[cfg(test)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
@@ -1380,59 +1329,6 @@ mod tests {
         }
         let r = check("parallel", &b.done(), 0xff392cdb64415b10);
         assert_eq!(r.applied, [0, 1, 1, 0]);
-    }
-
-    #[test]
-    fn choices_share_patterns_across_layers_and_flips_resolve() {
-        let (g, w) = crate::graph::synth_decoder::synthetic_decoder(4, 64, 128, 4, 2, 16);
-        let mut g = g;
-        prep(&mut g);
-        let f = Fusion::new(
-            &g,
-            Some(&w),
-            DEFAULT_RULES,
-            &CostModel::constants(),
-            Budget::default(),
-        )
-        .unwrap();
-        let by_kind =
-            |k: &str| -> Vec<&Choice> { f.choices().iter().filter(|c| c.kind == k).collect() };
-        // Per kind: how many the cost model applies; those (one per layer) share a pattern.
-        for (k, n_on) in [("megakernel-mlp", 4), ("gate-up", 0), ("qkv", 4)] {
-            let on: Vec<&Choice> = by_kind(k).into_iter().filter(|c| c.on).collect();
-            assert_eq!(on.len(), n_on, "{k}");
-            assert!(on.iter().all(|c| c.pattern == on[0].pattern), "{k}");
-        }
-        assert_eq!(by_kind("gate-up").len(), 4);
-        // No flips: the cost model's set, as `fuse` applies it.
-        let (mut a, mut aw) = (g.clone(), w.clone());
-        assert_eq!(
-            f.apply(&mut a, Some(&mut aw), &[]).unwrap().applied,
-            [4, 0, 4, 0]
-        );
-        // Gate/up on in one layer switches that layer's megakernel off.
-        let gu = by_kind("gate-up")[0].id;
-        let (mut b, mut bw) = (g.clone(), w.clone());
-        let r = f.apply(&mut b, Some(&mut bw), &[gu]).unwrap();
-        assert_eq!(r.applied, [3, 1, 4, 0]);
-        crate::graph::pattern::validate_ssa(&b).unwrap();
-        // Turning the conflicting megakernel off as well gives the same set.
-        let mlp = by_kind("megakernel-mlp")
-            .into_iter()
-            .find(|c| f.picks[c.id].conflicts(&f.picks[gu]))
-            .unwrap()
-            .id;
-        let (mut c, mut cw) = (g.clone(), w.clone());
-        assert_eq!(
-            f.apply(&mut c, Some(&mut cw), &[gu, mlp]).unwrap().applied,
-            [3, 1, 4, 0]
-        );
-        // A cost-model choice switched off.
-        let (mut d, mut dw) = (g.clone(), w.clone());
-        assert_eq!(
-            f.apply(&mut d, Some(&mut dw), &[mlp]).unwrap().applied,
-            [3, 0, 4, 0]
-        );
     }
 
     #[test]
