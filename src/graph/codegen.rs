@@ -7,8 +7,6 @@ pub struct GemvParams {
     /// Simdgroups per threadgroup of [`gemv_packed`]: 8 (256 threads), or 2 (64 threads, ggml-metal's
     /// K-quant launch shape).
     pub simdgroups: usize,
-    /// Activation rows accumulated per weight decode in [`gemv_packed`] (`1` for single-row decode).
-    pub batch: usize,
 }
 
 impl Default for GemvParams {
@@ -17,7 +15,6 @@ impl Default for GemvParams {
             rows_per_sg: 2,
             k_unroll: 1,
             simdgroups: 8,
-            batch: 1,
         }
     }
 }
@@ -107,11 +104,7 @@ mod tests {
 
 /// Rows one threadgroup of [`gemv_packed`] covers: `simdgroups` × `rows_per_sg`.
 pub const fn gemv_rows_per_tg(p: GemvParams) -> usize {
-    if p.batch > 1 {
-        8 * p.rows_per_sg
-    } else {
-        p.simdgroups * p.rows_per_sg
-    }
+    p.simdgroups * p.rows_per_sg
 }
 
 /// Threads per threadgroup of [`gemv_packed`]: 32 per simdgroup.
@@ -322,12 +315,7 @@ pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
     } else {
         format!("_sg{}", p.simdgroups)
     };
-    let b = if p.batch <= 1 {
-        String::new()
-    } else {
-        format!("_b{}", p.batch)
-    };
-    format!("gemvgen_{:?}_r{}{sg}{b}", codec.format, p.rows_per_sg)
+    format!("gemvgen_{:?}_r{}{sg}", codec.format, p.rows_per_sg)
 }
 
 /// Name of the kernel [`dequant_packed`] emits for `codec`.
@@ -382,131 +370,6 @@ pub fn gemv_packed(codec: &Codec, p: GemvParams) -> String {
     let codec_msl = device_msl(codec).replace("decode8", &dec);
     let r = p.rows_per_sg;
     let be = codec.block_elems;
-    if p.batch > 1 {
-        assert!(
-            codec.block_elems >= 16,
-            "{:?} block_elems < 16",
-            codec.format
-        );
-        let b_sz = p.batch;
-        let pairs = codec.block_elems / 16;
-        let mc_decl = (0..r)
-            .map(|t| {
-                format!("    simdgroup_float8x8 mc{t} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);\n")
-            })
-            .collect::<String>();
-        let mut tile_body = String::new();
-        for t in 0..r {
-            let br = block_ref(
-                codec,
-                "w",
-                &format!("(ulong)min(i01 + {t_off}u + fm, p.rows - 1) * blocks_per_row + blk", t_off = 8 * t),
-            );
-            tile_body += &format!(
-                r#"        {{
-            float v0[8] = {{0.0f}}, v1[8] = {{0.0f}};
-            if (pair < pairs_total) {{
-                const uint blk = pair / {pairs};
-                const uint sub = (pair % {pairs}) * 2;
-                {decl}
-                {dec}(b, {sub_prefix}sub, v0);
-                {dec}(b, {sub_prefix}(sub | 1u), v1);
-            }}
-            #pragma unroll
-            for (uint s = 0; s < 4; ++s) {{
-                simdgroup_float8x8 ma, mb;
-                ma.thread_elements()[0] = v0[s];
-                ma.thread_elements()[1] = v1[s];
-                mb.thread_elements()[0] = a0[s];
-                mb.thread_elements()[1] = b0[s];
-                simdgroup_multiply_accumulate(mc{t}, ma, mb, mc{t});
-            }}
-            #pragma unroll
-            for (uint s = 0; s < 4; ++s) {{
-                simdgroup_float8x8 ma, mb;
-                ma.thread_elements()[0] = v0[s + 4];
-                ma.thread_elements()[1] = v1[s + 4];
-                mb.thread_elements()[0] = a1[s];
-                mb.thread_elements()[1] = b1[s];
-                simdgroup_multiply_accumulate(mc{t}, ma, mb, mc{t});
-            }}
-        }}
-"#,
-                decl = br.decl,
-                sub_prefix = br.sub,
-            );
-        }
-        let red_write = (0..r)
-            .map(|t| {
-                format!(
-                    "    red[(sg * {r} + {t}) * 64 + 2 * lane + 0] = mc{t}.thread_elements()[0];\n    red[(sg * {r} + {t}) * 64 + 2 * lane + 1] = mc{t}.thread_elements()[1];\n"
-                )
-            })
-            .collect::<String>();
-        return format!(
-            r#"
-{codec_msl}
-// ggml-metal: kernel_mul_mv_mma_gen (8*NT × 8 MMA tile, K split across simdgroups, barrier-free loop).
-kernel void {name}(
-    device const uchar* w [[buffer(0)]],
-    device const float* x [[buffer(1)]],
-    device float* y [[buffer(2)]],
-    constant PackedGemvParams& p [[buffer(3)]],
-    device const float* bias [[buffer(4)]],
-    device const float* res [[buffer(5)]],
-    uint2 tg [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
-) {{
-    const uint i01 = tg.x * {rows_per_tg};
-    const uint batch0 = tg.y * {b_sz};
-    if (i01 >= p.rows || batch0 >= p.batch_size) return;
-    const uint fm = ((lane / 4) & 4) + ((lane / 2) % 4);
-    const uint fn2 = ((lane / 4) & 2) + (lane % 2);
-    const uint fn = fn2 * 2;
-    const uint blocks_per_row = p.cols / {be};
-    const uint pairs_total = p.cols / 16;
-    const uint nch = (p.cols + 63) / 64;
-    const uint r1_0 = min(batch0 + min(fn, {b_sz}u - 1), p.batch_size - 1);
-    const uint r1_1 = min(batch0 + min(fn + 1, {b_sz}u - 1), p.batch_size - 1);
-    device const float4* y0 = (device const float4*)(x + (ulong)r1_0 * p.cols) + 2 * fm;
-    device const float4* y1 = (device const float4*)(x + (ulong)r1_1 * p.cols) + 2 * fm;
-{mc_decl}
-    for (uint g = sg; g < nch; g += {nsg}) {{
-        const uint k_off = g * 64 + fm * 8;
-        const float4 a0 = (k_off < p.cols) ? y0[16 * g + 0] : float4(0.0f);
-        const float4 a1 = (k_off < p.cols) ? y0[16 * g + 1] : float4(0.0f);
-        const float4 b0 = (k_off < p.cols) ? y1[16 * g + 0] : float4(0.0f);
-        const float4 b1 = (k_off < p.cols) ? y1[16 * g + 1] : float4(0.0f);
-        const uint pair = g * 4 + fn2;
-{tile_body}    }}
-    threadgroup float red[{nsg} * {r} * 64];
-{red_write}    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint idx = sg * 32 + lane; idx < {r} * 64; idx += {nsg} * 32) {{
-        float sum = 0.0f;
-        #pragma unroll
-        for (uint sgi = 0; sgi < {nsg}; ++sgi) {{
-            sum += red[sgi * ({r} * 64) + idx];
-        }}
-        const uint t = idx / 64;
-        const uint l = (idx % 64) / 2;
-        const uint e = idx % 2;
-        const uint r0 = i01 + 8 * t + (((l / 4) & 4) + ((l / 2) % 4));
-        const uint r1_local = (((l / 4) & 2) * 2 + (l % 2) * 2) + e;
-        const uint r1 = batch0 + r1_local;
-        if (r0 < p.rows && r1_local < {b_sz} && r1 < p.batch_size) {{
-            float a = sum;
-            if (p.has_bias != 0) a += bias[r0];
-            ulong o = (ulong)r1 * p.rows + r0;
-            y[o] = apply_gemv_epi(a, o, p, res);
-        }}
-    }}
-}}
-"#,
-            rows_per_tg = gemv_rows_per_tg(p),
-            nsg = p.simdgroups,
-        );
-    }
     let loop_src = gemv_loop(codec, p, &dec, "(ulong)(row0", true);
     let store_row = |acc: &str, row: &str, ind: &str| {
         format!(
