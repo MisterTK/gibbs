@@ -24,7 +24,7 @@ pub struct Codec {
 }
 
 /// Bumped whenever an encoder or codec layout changes: it keys the re-encode cache.
-pub const CODEC_VERSION: u32 = 4;
+pub const CODEC_VERSION: u32 = 5;
 
 pub fn codec(format: QuantFormat) -> Option<&'static Codec> {
     match format {

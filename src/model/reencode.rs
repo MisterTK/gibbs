@@ -47,7 +47,7 @@ pub fn has_gpu_codec(f: Q) -> bool {
 /// Formats [`encode_rows`] can produce.
 pub fn encodable(f: Q) -> bool {
     is_float(f)
-        || matches!(f, Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4)
+        || matches!(f, Q::GGUF_Q3_K | Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4)
         || LADDER[..3].contains(&f)
 }
 
@@ -616,6 +616,85 @@ mod tests {
                 for (a, w) in got.iter().zip(&want[i * 32..]) {
                     assert_eq!(a, w, "block {i}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn q3_k_encode_decode_matches_gpu_codec() {
+        let (rows, cols) = (64, 1024);
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut u = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as u32) as f32 / 2147483648.0
+        };
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|_| (u() + u() + u() + u() - 2.0) * 0.1)
+            .collect();
+        let raw = encode_rows(&w, cols, Q::GGUF_Q3_K).unwrap();
+        let cpu = dequantize_gguf_blocks(Q::GGUF_Q3_K, &raw).unwrap();
+        let rmse = relative_rmse(&w, &cpu);
+        assert!(rmse <= 0.20, "Q3_K relative RMSE {rmse} > 0.20");
+
+        #[cfg(target_os = "macos")]
+        {
+            use crate::graph::codec::{codec, msl_prelude};
+            use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
+
+            let c = codec(Q::GGUF_Q3_K).unwrap();
+            let (block_elems, block_bytes) = (c.block_elems as usize, c.block_bytes as usize);
+            let subs = block_elems / 8;
+            let msl = format!("{}{}", msl_prelude(), c.msl);
+            let src = format!(
+                "#include <metal_stdlib>\nusing namespace metal;\n{msl}\n\
+                 kernel void decode_all(device const uchar* blocks [[buffer(0)]], device float* out [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{\n\
+                     uint b = gid / {subs}u, sub = gid % {subs}u;\n\
+                     float o[8];\n\
+                     decode8(blocks + (ulong)b * {block_bytes}ul, sub, o);\n\
+                     for (uint i = 0; i < 8; i++) out[gid * 8 + i] = o[i];\n\
+                 }}\n"
+            );
+            let device = Device::system_default().expect("no Metal device");
+            let opts = CompileOptions::new();
+            opts.set_fast_math_enabled(false);
+            let lib = device.new_library_with_source(&src, &opts).unwrap();
+            let pso = device
+                .new_compute_pipeline_state_with_function(
+                    &lib.get_function("decode_all", None).unwrap(),
+                )
+                .unwrap();
+            let threads = raw.len() / block_bytes * subs;
+            let inb = device.new_buffer_with_data(
+                raw.as_ptr().cast(),
+                raw.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let outb = device.new_buffer(
+                (threads * 8 * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let q = device.new_command_queue();
+            let cb = q.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pso);
+            enc.set_buffer(0, Some(&inb), 0);
+            enc.set_buffer(1, Some(&outb), 0);
+            let tg = pso.max_total_threads_per_threadgroup().min(64);
+            enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let gpu = unsafe {
+                std::slice::from_raw_parts(outb.contents() as *const f32, threads * 8)
+            };
+            for (i, (&g, &w)) in gpu.iter().zip(&cpu).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "elem {i}: gpu {g:e} != cpu {w:e}"
+                );
             }
         }
     }

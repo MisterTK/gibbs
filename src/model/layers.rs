@@ -24,13 +24,17 @@ pub fn encode_rows(
             Ok(quantize_f32_to_gguf_nvfp4(weights))
         }
         QuantFormat::GGUF_Q8_0 => Ok(quantize_f32_to_q8_0(weights)),
-        QuantFormat::GGUF_Q4_K_M | QuantFormat::GGUF_Q5_K_M | QuantFormat::GGUF_Q6_K => {
+        QuantFormat::GGUF_Q3_K
+        | QuantFormat::GGUF_Q4_K_M
+        | QuantFormat::GGUF_Q5_K_M
+        | QuantFormat::GGUF_Q6_K => {
             if in_features % 256 != 0 {
                 return Err(format!(
                     "{format:?} needs in_features % 256 == 0, got {in_features}"
                 ));
             }
             let (bytes, row): (usize, fn(&[f32], &mut [u8])) = match format {
+                QuantFormat::GGUF_Q3_K => (110, quantize_row_q3_k_ref),
                 QuantFormat::GGUF_Q4_K_M => (144, quantize_row_q4_k_ref),
                 QuantFormat::GGUF_Q5_K_M => (176, quantize_row_q5_k_ref),
                 _ => (210, quantize_row_q6_k_ref),
@@ -365,6 +369,134 @@ fn k_quant_affine(
         }
     }
     (packed, d16, dmin16)
+}
+
+/// ggml `make_q3_quants` (`do_rmse = true`) for one 16-element sub-block (`nmax = 4`).
+fn make_q3_quants(nmax: i32, x: &[f32], l: &mut [i8]) -> f32 {
+    let n = x.len();
+    let (mut max, mut amax) = (0.0f32, 0.0f32);
+    for &v in x {
+        let ax = v.abs();
+        if ax > amax {
+            amax = ax;
+            max = v;
+        }
+    }
+    if amax < 1e-15 {
+        l[..n].fill(0);
+        return 0.0;
+    }
+    let iscale = -(nmax as f32) / max;
+    let (mut sumlx, mut suml2) = (0.0f32, 0.0f32);
+    for i in 0..n {
+        let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+        l[i] = q as i8;
+        let w = x[i] * x[i];
+        sumlx += w * x[i] * q as f32;
+        suml2 += w * q as f32 * q as f32;
+    }
+    for _ in 0..5 {
+        let mut n_changed = 0;
+        for i in 0..n {
+            let w = x[i] * x[i];
+            let li = l[i] as i32;
+            let mut slx = sumlx - w * x[i] * li as f32;
+            if slx > 0.0 {
+                let mut sl2 = suml2 - w * li as f32 * li as f32;
+                let new_l = nearest_int(x[i] * sl2 / slx).clamp(-nmax, nmax - 1);
+                if new_l != li {
+                    slx += w * x[i] * new_l as f32;
+                    sl2 += w * new_l as f32 * new_l as f32;
+                    if sl2 > 0.0 && slx * slx * suml2 > sumlx * sumlx * sl2 {
+                        l[i] = new_l as i8;
+                        sumlx = slx;
+                        suml2 = sl2;
+                        n_changed += 1;
+                    }
+                }
+            }
+        }
+        if n_changed == 0 {
+            break;
+        }
+    }
+    for v in &mut l[..n] {
+        *v += nmax as i8;
+    }
+    if suml2 > 0.0 {
+        sumlx / suml2
+    } else {
+        0.0
+    }
+}
+
+/// ggml `quantize_row_q3_K_ref` for one 256-element row: 110-byte block `hmask[32], qs[64], scales[12], d`.
+pub fn quantize_row_q3_k_ref(x: &[f32], out: &mut [u8]) {
+    assert_eq!((x.len(), out.len()), (256, 110));
+    let mut l = [0i8; 256];
+    let mut scales = [0.0f32; 16];
+    let (mut max_scale, mut amax) = (0.0f32, 0.0f32);
+    for j in 0..16 {
+        scales[j] = make_q3_quants(4, &x[16 * j..16 * j + 16], &mut l[16 * j..16 * j + 16]);
+        let s = scales[j].abs();
+        if s > amax {
+            amax = s;
+            max_scale = scales[j];
+        }
+    }
+    out.fill(0);
+    let d16 = if max_scale != 0.0 {
+        let iscale = -32.0 / max_scale;
+        for j in 0..16 {
+            let q = (nearest_int(iscale * scales[j]).clamp(-32, 31) + 32) as u8;
+            if j < 8 {
+                out[96 + j] = q & 0xF;
+            } else {
+                out[96 + j - 8] |= (q & 0xF) << 4;
+            }
+            out[96 + j % 4 + 8] |= (q >> 4) << (2 * (j / 4));
+        }
+        f32_to_f16(1.0 / iscale)
+    } else {
+        f32_to_f16(0.0)
+    };
+    out[108..110].copy_from_slice(&d16.to_le_bytes());
+    let d_all = f16_to_f32(d16);
+    for j in 0..16 {
+        let sc = if j < 8 {
+            out[96 + j] & 0xF
+        } else {
+            out[96 + j - 8] >> 4
+        };
+        let sc = (sc | (((out[96 + 8 + j % 4] >> (2 * (j / 4))) & 3) << 4)) as i8 - 32;
+        let d = d_all * sc as f32;
+        if d == 0.0 {
+            continue;
+        }
+        for ii in 0..16 {
+            l[16 * j + ii] = (nearest_int(x[16 * j + ii] / d).clamp(-4, 3) + 4) as i8;
+        }
+    }
+    let (mut m, mut hm) = (0usize, 1u8);
+    for j in 0..256 {
+        if l[j] > 3 {
+            out[m] |= hm;
+            l[j] -= 4;
+        }
+        m += 1;
+        if m == 32 {
+            m = 0;
+            hm <<= 1;
+        }
+    }
+    for j in (0..256).step_by(128) {
+        for k in 0..32 {
+            out[32 + j / 4 + k] = (l[j + k] as u8)
+                | ((l[j + k + 32] as u8) << 2)
+                | ((l[j + k + 64] as u8) << 4)
+                | ((l[j + k + 96] as u8) << 6);
+        }
+    }
 }
 
 /// ggml `quantize_row_q4_K_ref` for one 256-element row: 144-byte block `d, dmin, scales[12], qs[128]`.
