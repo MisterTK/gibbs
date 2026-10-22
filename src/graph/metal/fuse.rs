@@ -8,7 +8,7 @@
 //! before the claiming node, so at most one rule claims any node: extraction takes every match.
 
 use super::{
-    fusion_policy, linear_format, numel, Epi, FusionClass, Planned, Step,
+    fusion_enabled, linear_format, numel, Epi, Planned, Step,
     ATTN_MAX_HEAD_DIM,
 };
 use crate::graph::{DType, Graph, Op, RopeVariant, ValueId, ValueKind};
@@ -161,8 +161,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
             uses[v.0 as usize] += 1;
         }
     }
-    let epilogues = fusion_policy().allows(FusionClass::DotEpilogue);
-    let reduce_input = fusion_policy().allows(FusionClass::ReduceInput);
+    let fused = fusion_enabled();
     let produced_by_norm = |v: ValueId| {
         matches!(g.value(v).kind,
             ValueKind::Node(n) if matches!(g.nodes[n.0 as usize].op, Op::RmsNorm { .. }))
@@ -218,7 +217,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                 }
             }
             match &n.op {
-                Op::Linear if epilogues => {
+                Op::Linear if fused => {
                     let (Some(&x), Some(&w)) = (n.inputs.first(), n.inputs.get(1)) else {
                         continue;
                     };
@@ -236,7 +235,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                         fs.add("PackedEpi", id)?;
                     }
                 }
-                Op::RmsNorm { .. } if reduce_input && n.inputs.len() >= 2 => {
+                Op::RmsNorm { .. } if fused && n.inputs.len() >= 2 => {
                     let d = g.value(n.inputs[1]).shape.last().copied().unwrap_or(0);
                     if let Ok(xl) = numel(g, n.inputs[0]) {
                         if d > 0 && xl % d == 0 {
@@ -268,7 +267,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
                     v_head_dim,
                     write: true,
                     ..
-                } if reduce_input
+                } if fused
                     && head_dim == v_head_dim
                     && *head_dim <= ATTN_MAX_HEAD_DIM
                     && n.inputs.len() == 6 =>
@@ -320,8 +319,7 @@ pub(super) fn decide(g: &Graph) -> Result<Decisions, String> {
 /// Horizontal batching over the step list, as [`batches`] extracts it.
 #[derive(Debug, Default)]
 pub(super) struct Batches {
-    /// First member → the members (ascending, 2..=4) of one batched dispatch. Steps between members
-    /// are independent steps that run ahead of the batch (GEMVs; any with `GIBBS_BATCH_COMMUTE`).
+    /// First member → the members (ascending, 2..=4) of one batched dispatch.
     pub runs: HashMap<usize, Vec<usize>>,
     /// An RmsNorm with a residual or scale whose next step, a plain RmsNorm of its output, chains in.
     pub chain: HashSet<usize>,
@@ -334,13 +332,11 @@ pub(super) struct Batches {
 /// `RopeKey p rk` (the RoPE fused into that norm, 0: none), `Indep a b` (step `b` reads no output of
 /// `a`, `b - a < 8`). `R{L}` is a run of `L` members from `s` whose next candidate is at `c` and
 /// whose RoPE is `rk`; it grows by the next step when that is of the run's kind, independent of
-/// every member and RoPE-compatible, or — for norm runs — by the step after an independent
-/// `Movable` one (a GEMV; with [`COMMUTE`], any single-output step that is no batch candidate).
+/// every member and RoPE-compatible.
 const BATCH_PROGRAM: &str = r#"
 (relation BKind (i64 i64))
 (relation RopeKey (i64 i64))
 (relation Solo (i64))
-(relation Movable (i64))
 (relation Indep (i64 i64))
 (relation NormRS (i64 i64 i64 i64))
 (relation NormPlain0 (i64 i64 i64 i64))
@@ -358,12 +354,6 @@ const BATCH_PROGRAM: &str = r#"
 (rule ((NormRS1 s d o) (= n (+ s 1)) (MlpIn n o d)) ((Absorb s)) :ruleset batch)
 "#;
 
-/// `GIBBS_BATCH_COMMUTE=1`: a norm batch may move any independent single-output step ahead of it,
-/// not only a GEMV (read once).
-// ponytail: measurement-gated new rule (changes plans); default off until an ABBA shows a gain.
-pub(super) static COMMUTE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("GIBBS_BATCH_COMMUTE").is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
-});
 
 /// [`BATCH_PROGRAM`] with its run-growing rules for runs of 1..=3 members.
 static BATCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -380,17 +370,8 @@ static BATCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
                 .collect()
         };
         let state = format!("(R{l} s {} c rk)", ms.join(" "));
-        let grow = [
-            ("(BKind s k)".to_string(), "c"),
-            (
-                format!(
-                    "(BKind s k) (= k 1) (Movable c) {}(= at (+ c 1))",
-                    indep("c")
-                ),
-                "at",
-            ),
-        ];
-        for (pre, at) in &grow {
+        let (pre, at) = ("(BKind s k)", "c");
+        {
             for (compat, rk) in [
                 (format!("(RopeKey {at} 0)"), "rk"),
                 (format!("(RopeKey {at} nk) (> nk 0) (= rk 0)"), "nk"),
@@ -416,12 +397,10 @@ fn intern<K: std::hash::Hash + Eq>(m: &mut HashMap<K, i64>, k: K) -> i64 {
 }
 
 /// Saturates the batching rules over `steps` and extracts what the greedy in-order walk takes:
-/// at each step, the longest run starting there, else its chain, else its absorption. `commute`
-/// enables the any-step commutation ([`COMMUTE`]).
+/// at each step, the longest run starting there, else its chain, else its absorption.
 pub(super) fn batches(
     steps: &[Planned],
     aliases: &HashMap<ValueId, (ValueId, usize)>,
-    commute: bool,
 ) -> Result<Batches, String> {
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
     let mut eg = loaded(&BATCH)?;
@@ -502,17 +481,6 @@ pub(super) fn batches(
                 }
                 _ => None,
             };
-            let gemv = matches!(s.op, Step::GemvPacked { .. });
-            // A state write orders later readers of that state, which share no value id with it.
-            let writes_state = matches!(
-                s.op,
-                Step::Ext(super::ext::ExtStep::Movement(
-                    super::ext::movement::Step::StateWrite { .. }
-                ))
-            );
-            if kind.is_none() && solo && !writes_state && (gemv || commute) {
-                fs.add("Movable", pi)?;
-            }
             if let Some(k) = kind {
                 fs.add("BKind", (pi, k))?;
                 let out = root(s.out);
@@ -863,7 +831,7 @@ pub(super) fn moe(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{batch_horizontal, plan};
+    use super::super::plan;
     use super::*;
     use crate::graph::{ReduceKind, Weights};
 
@@ -954,41 +922,6 @@ mod tests {
         assert_eq!(d.norm[&0].res, Some((1, x)));
     }
 
-    /// Norms around an independent elementwise step: no batch, unless commutation of any step is
-    /// on; norms around a GEMV batch either way.
-    #[test]
-    fn batches_commute_gemvs_and_with_the_knob_any_step() {
-        let mut g = Graph::new();
-        let x = g.input("x", vec![1, 64], F);
-        let y = g.input("y", vec![1, 64], F);
-        let gw = g.weight("g", vec![64], F);
-        let w = g.weight("w", vec![64, 64], DType::F16);
-        let a = g.add("a", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
-        let neg = Op::Unary {
-            kind: crate::graph::UnaryKind::Neg,
-        };
-        let m = g.add("m", neg, &[y], vec![1, 64], F);
-        let b = g.add("b", Op::RmsNorm { eps: 1e-5 }, &[y, gw], vec![1, 64], F);
-        let l = g.add("l", Op::Linear, &[x, w], vec![1, 64], F);
-        let c = g.add("c", Op::RmsNorm { eps: 1e-5 }, &[x, gw], vec![1, 64], F);
-        for o in [a, m, b, l, c] {
-            g.output(o);
-        }
-        let (steps, aliases) = plan(&g).unwrap();
-        assert_eq!(steps.len(), 5);
-        // b, then the GEMV l moved ahead, then c.
-        let off = batches(&steps, &aliases, false).unwrap();
-        assert_eq!(off.runs, HashMap::from([(2, vec![2, 4])]));
-        let on = batches(&steps, &aliases, true).unwrap();
-        // Every start's run is derived; the walk takes the one at its cursor (0): a, b, c.
-        assert_eq!(on.runs[&0], [0, 2, 4]);
-        let kinds: Vec<String> = batch_horizontal(steps, &aliases)
-            .unwrap()
-            .iter()
-            .map(|s| super::super::kernel_kind(&format!("{:?}", s.op)).to_string())
-            .collect();
-        assert_eq!(kinds, ["RmsNorm", "Unary", "GemvPacked", "RmsNormBatch"]);
-    }
 
     /// Router TopK + GatherCols + Softmax (+ scale), the gate/up half-split GLU and the
     /// expert-weighted Sum each plan as one step.

@@ -8,7 +8,7 @@
 //! epilogue) stay inputs. Exact up to fp reassociation, so on by default; `GIBBS_DELTANET_STATE=f16|bf16`
 //! stores the recurrent state in half / bfloat (f32 arithmetic).
 
-use super::super::{fusion_policy, numel, set_bytes, FusionPolicy, Planned, Session};
+use super::super::{fusion_enabled, numel, set_bytes, Planned, Session};
 use super::{Enc, ExtStep};
 use crate::graph::{BinaryKind, Graph, Op, UnaryKind, ValueId, ValueKind};
 use metal::MTLSize;
@@ -114,7 +114,7 @@ fn is_add(op: &Op) -> bool {
 
 /// Replaces every matched decode (`n == 1`) chain by one fused step at the chain's last step.
 pub(in super::super) fn fuse(g: &Graph, steps: &mut Vec<Planned>) -> Result<(), String> {
-    if fusion_policy() != FusionPolicy::Full || crate::graph::disabled("deltanet") {
+    if !fusion_enabled() || crate::graph::disabled("deltanet") {
         return check_state_dtype(steps, *STATE_DTYPE);
     }
     let mut readers: HashMap<ValueId, Vec<usize>> = HashMap::new();

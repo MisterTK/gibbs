@@ -4296,43 +4296,15 @@ fn u32_of(n: usize) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("dimension {n} exceeds the Metal kernels' u32 range"))
 }
 
-/// Fusion classes `plan()` may form. `GIBBS_FUSION=xla` restricts planning to what XLA's GPU fusion
-/// pipeline forms (loop, input, dot-epilogue, same-shape sibling fusion: `autoresearch/xla-catalog.md`)
-/// so `scripts/fusion_vs_xla.py` has an in-repo comparator; every other value allows all classes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FusionPolicy {
-    Full,
-    XlaClass,
-    None,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FusionClass {
-    ReduceInput,
-    DotEpilogue,
-    /// Several independent steps of one kind with different shapes in one dispatch. XLA's GPU
-    /// pipeline in the catalogued revision has no horizontal-fusion pass, so this is Full-only.
-    HorizontalBatch,
-}
-
-impl FusionPolicy {
-    pub(crate) fn allows(self, k: FusionClass) -> bool {
-        use FusionClass::*;
-        match self {
-            FusionPolicy::Full => true,
-            FusionPolicy::XlaClass => matches!(k, ReduceInput | DotEpilogue),
-            FusionPolicy::None => false,
-        }
-    }
-}
-
-pub(crate) fn fusion_policy() -> FusionPolicy {
-    static P: std::sync::OnceLock<FusionPolicy> = std::sync::OnceLock::new();
-    *P.get_or_init(|| match std::env::var("GIBBS_FUSION").as_deref() {
-        Ok("xla") => FusionPolicy::XlaClass,
-        Ok("none" | "off" | "0") => FusionPolicy::None,
-        _ => FusionPolicy::Full,
-    })
+/// Whether planner fusions are enabled (`false` when `GIBBS_FUSION=off|none|0`).
+pub(crate) fn fusion_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(
+            std::env::var("GIBBS_FUSION").as_deref(),
+            Ok("none" | "off" | "0")
+        )
+    });
+    *ON
 }
 
 /// RoPE parameters fused into [`Step::RmsNorm`] / [`Step::RmsNormBatch`].
@@ -4381,7 +4353,7 @@ fn pair_small_hand_gemvs(
     offsets: &HashMap<ValueId, usize>,
     allow_quant_pair: bool,
 ) {
-    if !fusion_policy().allows(FusionClass::HorizontalBatch) {
+    if !fusion_enabled() {
         return;
     }
     let root = |v: ValueId| aliases.get(&v).map_or(v, |a| a.0);
@@ -4568,10 +4540,10 @@ fn batch_horizontal(
     steps: Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
 ) -> Result<Vec<Planned>, String> {
-    if !fusion_policy().allows(FusionClass::HorizontalBatch) {
+    if !fusion_enabled() {
         return Ok(steps);
     }
-    let b = fuse::batches(&steps, aliases, *fuse::COMMUTE)?;
+    let b = fuse::batches(&steps, aliases)?;
     let n = steps.len();
     let mut out: Vec<Planned> = Vec::with_capacity(n);
     let mut steps: Vec<Option<Planned>> = steps.into_iter().map(Some).collect();
@@ -5462,7 +5434,7 @@ fn fuse_moe_subgraphs(
     steps: &mut Vec<Planned>,
     aliases: &HashMap<ValueId, (ValueId, usize)>,
 ) -> Result<(), String> {
-    if !fusion_policy().allows(FusionClass::ReduceInput) {
+    if !fusion_enabled() {
         return Ok(());
     }
     let decided = fuse::moe(g, steps, aliases)?;
