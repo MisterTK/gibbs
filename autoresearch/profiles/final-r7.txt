@@ -1,0 +1,500 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ExpertLinear             60    896182    12.1    4.2%
+  GemmBatchedPacked       235    154929    24.4    8.5%
+  CachedAttention          30     35591  3341.6 1166.6%
+  RmsNorm                 172     16249   158.6   55.4%
+  MoeWeightedSum           30      6823   228.3   79.7%
+  SplitGlu                 30      4805   216.0   75.4%
+  RmsNormBatch             35      2838   190.7   66.6%
+  GemvPacked                1      1781   233.8   81.6%
+layers.28.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23892.0 | 159694848 |      6.7 |     2.3%
+layers.26.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23054.4 | 159694848 |      6.9 |     2.4%
+layers.14.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  22636.4 | 159694848 |      7.1 |     2.5%
+layers.27.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  22590.1 | 159694848 |      7.1 |     2.5%
+layers.23.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  22069.7 | 159694848 |      7.2 |     2.5%
+layers.20.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21857.8 | 159694848 |      7.3 |     2.6%
+layers.25.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21553.8 | 159694848 |      7.4 |     2.6%
+layers.21.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21142.2 | 159694848 |      7.6 |     2.6%
+layers.17.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21107.5 | 159694848 |      7.6 |     2.6%
+layers.15.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20796.3 | 159694848 |      7.7 |     2.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ExpertLinear             60    860365    12.6    4.4%
+  GemmBatchedPacked       235    149387    25.4    8.9%
+  CachedAttention          30     34360  3461.3 1208.4%
+  RmsNorm                 172     12370   208.3   72.7%
+  MoeWeightedSum           30      5596   278.3   97.2%
+  SplitGlu                 30      3247   319.7  111.6%
+  RmsNormBatch             35      2521   214.6   74.9%
+  GemvPacked                1      1786   233.0   81.4%
+layers.28.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23889.9 | 159694848 |      6.7 |     2.3%
+layers.26.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23252.9 | 159694848 |      6.9 |     2.4%
+layers.27.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23158.4 | 159694848 |      6.9 |     2.4%
+layers.14.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21693.3 | 159694848 |      7.4 |     2.6%
+layers.25.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21429.9 | 159694848 |      7.5 |     2.6%
+layers.23.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21276.0 | 159694848 |      7.5 |     2.6%
+layers.20.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20825.3 | 159694848 |      7.7 |     2.7%
+layers.24.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20742.4 | 159694848 |      7.7 |     2.7%
+layers.17.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20033.1 | 159694848 |      8.0 |     2.8%
+layers.15.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20005.8 | 159694848 |      8.0 |     2.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ExpertLinear             60    859793    12.6    4.4%
+  GemmBatchedPacked       235    149522    25.3    8.8%
+  CachedAttention          30     34532  3444.1 1202.4%
+  RmsNorm                 172     12416   207.6   72.5%
+  MoeWeightedSum           30      5740   271.3   94.7%
+  SplitGlu                 30      3367   308.3  107.6%
+  RmsNormBatch             35      2572   210.4   73.5%
+  GemvPacked                1      1808   230.3   80.4%
+layers.28.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23337.6 | 159694848 |      6.8 |     2.4%
+layers.26.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  23043.1 | 159694848 |      6.9 |     2.4%
+layers.27.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  22432.5 | 159694848 |      7.1 |     2.5%
+layers.23.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21696.3 | 159694848 |      7.4 |     2.6%
+layers.14.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21397.8 | 159694848 |      7.5 |     2.6%
+layers.25.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21320.0 | 159694848 |      7.5 |     2.6%
+layers.20.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  21319.9 | 159694848 |      7.5 |     2.6%
+layers.24.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20617.0 | 159694848 |      7.7 |     2.7%
+layers.29.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20087.5 | 191414272 |      9.5 |     3.3%
+layers.17.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  20078.2 | 159694848 |      8.0 |     2.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ExpertLinear             60    506711    16.5    5.8%
+  GemmBatchedPacked       235     49522    27.2    9.5%
+  GemvPacked                1      1816   229.2   80.0%
+  RmsNorm                 172      1530    80.1   28.0%
+  CachedAttention          30       959 123211.7 43016.5%
+  TopK                     30       271     1.5    0.5%
+  RmsNormBatch             35       252   104.8   36.6%
+  MoeWeightedSum           30       235   311.0  108.6%
+layers.1.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  14077.5 | 132195072 |      9.4 |     3.3%
+layers.0.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13981.4 | 132195072 |      9.5 |     3.3%
+layers.28.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13600.2 | 132195072 |      9.7 |     3.4%
+layers.27.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13541.7 | 132195072 |      9.8 |     3.4%
+layers.25.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13323.2 | 132195072 |      9.9 |     3.5%
+layers.29.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12859.1 | 163914496 |     12.7 |     4.5%
+layers.22.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12831.3 | 132195072 |     10.3 |     3.6%
+layers.23.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12619.4 | 132195072 |     10.5 |     3.7%
+layers.24.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12430.6 | 132195072 |     10.6 |     3.7%
+layers.2.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12269.7 | 132195072 |     10.8 |     3.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6799   242.5   84.7%
+  ExpertLinear             60      3182  2591.0  904.6%
+  RmsNorm                  91       930     5.1    1.8%
+  CachedAttention          30       513 230053.4 80317.8%
+  RmsNormBatch             60       369    10.1    3.5%
+  TopK                     30       281     0.1    0.0%
+  MoeWeightedSum           30       116    26.1    9.1%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1781.6 | 416295936 |    233.7 |    81.6%
+layers.5.attn.q      | GemvPacked { x: ValueId(3 |     65.7 | 15903744 |    241.9 |    84.4%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.8.attn.q.fused_qkv | GemvPacked { x: ValueId(5 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     64.9 | 15903744 |    245.1 |    85.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6822   241.7   84.4%
+  ExpertLinear             60      3175  2596.4  906.5%
+  RmsNorm                  91       932     5.1    1.8%
+  CachedAttention          30       514 229978.8 80291.8%
+  RmsNormBatch             60       370    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       117    26.1    9.1%
+  SplitGlu                 30        94    21.5    7.5%
+lm_head              | GemvPacked { x: ValueId(1 |   1798.0 | 416295936 |    231.5 |    80.8%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.3 | 15903744 |    243.6 |    85.0%
+layers.25.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.10.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6832   241.3   84.3%
+  ExpertLinear             60      3172  2598.7  907.3%
+  RmsNorm                  91       929     5.1    1.8%
+  CachedAttention          30       514 229773.8 80220.2%
+  RmsNormBatch             60       367    10.2    3.5%
+  TopK                     30       281     0.1    0.0%
+  MoeWeightedSum           30       115    26.5    9.3%
+  SplitGlu                 30        93    21.7    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1811.6 | 416295936 |    229.8 |    80.2%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.6 | 15903744 |    242.5 |    84.7%
+layers.13.attn.q.fused_qkv | GemvPacked { x: ValueId(8 |     65.5 | 15903744 |    242.8 |    84.8%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.5 | 15903744 |    242.8 |    84.8%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.16.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.25.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     65.0 | 15903744 |    244.7 |    85.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6818   241.8   84.4%
+  ExpertLinear             60      3171  2599.8  907.6%
+  RmsNorm                  91       928     5.1    1.8%
+  CachedAttention          30       514 229941.4 80278.7%
+  RmsNormBatch             60       367    10.2    3.5%
+  TopK                     30       280     0.1    0.0%
+  MoeWeightedSum           30       114    26.6    9.3%
+  SplitGlu                 30        92    22.0    7.7%
+lm_head              | GemvPacked { x: ValueId(1 |   1798.5 | 416295936 |    231.5 |    80.8%
+layers.20.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     66.0 | 15903744 |    241.0 |    84.1%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.8 | 15903744 |    241.6 |    84.3%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.4 | 15903744 |    243.3 |    84.9%
+layers.21.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.25.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.9.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.7 |    85.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6816   241.9   84.5%
+  ExpertLinear             60      3173  2598.2  907.1%
+  RmsNorm                  91       927     5.1    1.8%
+  CachedAttention          30       543 217486.2 75930.2%
+  RmsNormBatch             60       366    10.2    3.6%
+  TopK                     30       279     0.1    0.0%
+  MoeWeightedSum           30       119    25.6    8.9%
+  SplitGlu                 30        92    22.0    7.7%
+lm_head              | GemvPacked { x: ValueId(1 |   1798.0 | 416295936 |    231.5 |    80.8%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.4 | 15903744 |    243.3 |    84.9%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.10.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.0 | 15903744 |    244.7 |    85.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6837   241.2   84.2%
+  ExpertLinear             60      3171  2599.6  907.6%
+  RmsNorm                  91       928     5.1    1.8%
+  CachedAttention          30       543 217553.3 75953.7%
+  RmsNormBatch             60       367    10.2    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       115    26.5    9.2%
+  SplitGlu                 30        92    22.0    7.7%
+lm_head              | GemvPacked { x: ValueId(1 |   1814.8 | 416295936 |    229.4 |    80.1%
+layers.5.attn.q      | GemvPacked { x: ValueId(3 |     65.5 | 15903744 |    242.8 |    84.8%
+layers.7.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.20.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.9.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6801   242.4   84.6%
+  ExpertLinear             60      3175  2596.4  906.5%
+  RmsNorm                  91       928     5.1    1.8%
+  CachedAttention          30       543 217386.3 75895.4%
+  RmsNormBatch             60       368    10.1    3.5%
+  TopK                     30       281     0.1    0.0%
+  MoeWeightedSum           30       115    26.4    9.2%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1787.2 | 416295936 |    232.9 |    81.3%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.6 | 15903744 |    242.3 |    84.6%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.4 | 15903744 |    243.3 |    84.9%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.3 | 15903744 |    243.4 |    85.0%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.13.attn.q.fused_qkv | GemvPacked { x: ValueId(8 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.8.attn.q.fused_qkv | GemvPacked { x: ValueId(5 |     65.0 | 15903744 |    244.7 |    85.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6822   241.7   84.4%
+  ExpertLinear             60      3170  2601.0  908.1%
+  RmsNorm                  91       928     5.1    1.8%
+  CachedAttention          30       475 248441.2 86737.5%
+  RmsNormBatch             60       367    10.2    3.6%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       116    26.3    9.2%
+  SplitGlu                 30        92    22.1    7.7%
+lm_head              | GemvPacked { x: ValueId(1 |   1809.2 | 416295936 |    230.1 |    80.3%
+layers.3.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.25.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.12.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     64.9 | 15903744 |    245.0 |    85.5%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.11.attn.q     | GemvPacked { x: ValueId(7 |     64.9 | 15903744 |    245.1 |    85.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6833   241.3   84.2%
+  ExpertLinear             60      3172  2599.3  907.5%
+  RmsNorm                  91       931     5.1    1.8%
+  CachedAttention          30       477 247638.7 86457.3%
+  RmsNormBatch             60       369    10.1    3.5%
+  TopK                     30       281     0.1    0.0%
+  MoeWeightedSum           30       116    26.3    9.2%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1790.5 | 416295936 |    232.5 |    81.2%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.4 | 15903744 |    243.3 |    84.9%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.3 | 15903744 |    243.6 |    85.0%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.8.attn.q.fused_qkv | GemvPacked { x: ValueId(5 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.11.attn.q     | GemvPacked { x: ValueId(7 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.10.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.21.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.9.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.8 |    85.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6800   242.5   84.7%
+  ExpertLinear             60      3172  2599.3  907.5%
+  RmsNorm                  91       930     5.1    1.8%
+  CachedAttention          30       504 234236.0 81778.1%
+  RmsNormBatch             60       368    10.1    3.5%
+  TopK                     30       280     0.1    0.0%
+  MoeWeightedSum           30       115    26.5    9.3%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1781.1 | 416295936 |    233.7 |    81.6%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.8 | 15903744 |    241.7 |    84.4%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.6 | 15903744 |    242.3 |    84.6%
+layers.3.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.3 | 15903744 |    243.4 |    85.0%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.20.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.19.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.9.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     64.9 | 15903744 |    245.0 |    85.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6802   242.4   84.6%
+  ExpertLinear             60      3174  2597.4  906.8%
+  RmsNorm                  91       929     5.1    1.8%
+  CachedAttention          30       504 234196.7 81764.4%
+  RmsNormBatch             60       368    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       116    26.3    9.2%
+  SplitGlu                 30        94    21.7    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1787.3 | 416295936 |    232.9 |    81.3%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.4 | 15903744 |    243.1 |    84.9%
+layers.19.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.20.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.3.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.5.attn.q      | GemvPacked { x: ValueId(3 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.9.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     64.9 | 15903744 |    245.1 |    85.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6794   242.7   84.7%
+  ExpertLinear             60      3170  2600.6  907.9%
+  RmsNorm                  91       930     5.1    1.8%
+  CachedAttention          30       505 233849.2 81643.0%
+  RmsNormBatch             60       371    10.1    3.5%
+  TopK                     30       283     0.1    0.0%
+  MoeWeightedSum           30       117    26.1    9.1%
+  SplitGlu                 30        94    21.6    7.5%
+lm_head              | GemvPacked { x: ValueId(1 |   1781.3 | 416295936 |    233.7 |    81.6%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.21.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.8 |    85.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6789   242.9   84.8%
+  ExpertLinear             60      3175  2596.9  906.6%
+  RmsNorm                  91       931     5.1    1.8%
+  CachedAttention          30       505 233868.8 81649.9%
+  RmsNormBatch             60       371    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       117    26.1    9.1%
+  SplitGlu                 30        94    21.7    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1782.2 | 416295936 |    233.6 |    81.6%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.9 | 15903744 |    245.0 |    85.5%
+layers.16.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.8 | 15903744 |    245.5 |    85.7%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     64.7 | 15903744 |    245.6 |    85.8%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.7 | 15903744 |    245.6 |    85.8%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     64.7 | 15903744 |    245.8 |    85.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6819   241.8   84.4%
+  ExpertLinear             60      3173  2598.5  907.2%
+  RmsNorm                  91       933     5.1    1.8%
+  CachedAttention          30       504 234467.3 81858.8%
+  RmsNormBatch             60       370    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       116    26.2    9.2%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1792.5 | 416295936 |    232.2 |    81.1%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.5 | 15903744 |    242.8 |    84.8%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.3 | 15903744 |    243.4 |    85.0%
+layers.19.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.3.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.7.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     64.9 | 15903744 |    245.1 |    85.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6820   241.8   84.4%
+  ExpertLinear             60      3171  2600.2  907.8%
+  RmsNorm                  91       930     5.1    1.8%
+  CachedAttention          30       504 234332.2 81811.6%
+  RmsNormBatch             60       369    10.1    3.5%
+  TopK                     30       281     0.1    0.0%
+  MoeWeightedSum           30       116    26.1    9.1%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1804.7 | 416295936 |    230.7 |    80.5%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.4 | 15903744 |    243.3 |    84.9%
+layers.0.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.25.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.10.attn.q.fused_qkv | GemvPacked { x: ValueId(6 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.28.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.8 | 15903744 |    245.3 |    85.6%
+⚡ Prefill: 24 tokens in 1382.02ms (17.4 tok/s)
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ExpertLinear             60    505891    16.5    5.8%
+  GemmBatchedPacked       235     49473    27.2    9.5%
+  GemvPacked                1      1787   232.9   81.3%
+  RmsNorm                 172      1533    79.9   27.9%
+  CachedAttention          30       960 123115.7 42983.0%
+  TopK                     30       271     1.5    0.5%
+  RmsNormBatch             35       252   104.7   36.6%
+  MoeWeightedSum           30       236   309.6  108.1%
+layers.0.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13988.9 | 132195072 |      9.4 |     3.3%
+layers.1.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13951.1 | 132195072 |      9.5 |     3.3%
+layers.28.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13601.9 | 132195072 |      9.7 |     3.4%
+layers.27.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13524.7 | 132195072 |      9.8 |     3.4%
+layers.25.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  13462.9 | 132195072 |      9.8 |     3.4%
+layers.23.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12796.5 | 132195072 |     10.3 |     3.6%
+layers.29.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12755.9 | 163914496 |     12.9 |     4.5%
+layers.22.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12672.0 | 132195072 |     10.4 |     3.6%
+layers.2.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12374.7 | 132195072 |     10.7 |     3.7%
+layers.24.moe.expert_gate_up | Ext(Experts(ExpertLinear  |  12233.6 | 132195072 |     10.8 |     3.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6806   242.3   84.6%
+  ExpertLinear             60      3173  2598.4  907.2%
+  RmsNorm                  91       930     5.1    1.8%
+  CachedAttention          30       515 229457.3 80109.7%
+  RmsNormBatch             60       369    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       116    26.2    9.2%
+  SplitGlu                 30        94    21.6    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1780.3 | 416295936 |    233.8 |    81.6%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.4 | 15903744 |    243.3 |    84.9%
+layers.14.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     65.2 | 15903744 |    243.7 |    85.1%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.17.attn.q     | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.7.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     65.0 | 15903744 |    244.5 |    85.4%
+layers.13.attn.q.fused_qkv | GemvPacked { x: ValueId(8 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.3.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     64.8 | 15903744 |    245.3 |    85.6%
+layers.12.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     64.8 | 15903744 |    245.5 |    85.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6806   242.3   84.6%
+  ExpertLinear             60      3174  2597.4  906.8%
+  RmsNorm                  91       929     5.1    1.8%
+  CachedAttention          30       515 229457.1 80109.6%
+  RmsNormBatch             60       370    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       116    26.2    9.2%
+  SplitGlu                 30        94    21.5    7.5%
+lm_head              | GemvPacked { x: ValueId(1 |   1786.1 | 416295936 |    233.1 |    81.4%
+layers.23.attn.q     | GemvPacked { x: ValueId(1 |     65.6 | 15903744 |    242.5 |    84.7%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.3 | 15903744 |    243.7 |    85.1%
+layers.16.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.20.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    243.9 |    85.1%
+layers.27.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.8.attn.q.fused_qkv | GemvPacked { x: ValueId(5 |     64.9 | 15903744 |    245.0 |    85.5%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.9 | 15903744 |    245.0 |    85.5%
+layers.22.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     64.8 | 15903744 |    245.5 |    85.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6813   242.0   84.5%
+  ExpertLinear             60      3174  2597.4  906.8%
+  RmsNorm                  91       929     5.1    1.8%
+  CachedAttention          30       514 229904.1 80265.7%
+  RmsNormBatch             60       370    10.1    3.5%
+  TopK                     30       283     0.1    0.0%
+  MoeWeightedSum           30       116    26.2    9.1%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1796.5 | 416295936 |    231.7 |    80.9%
+layers.20.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.2 | 15903744 |    244.0 |    85.2%
+layers.26.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.2 |    85.3%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.1 | 15903744 |    244.4 |    85.3%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.0 | 15903744 |    244.7 |    85.4%
+layers.24.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     65.0 | 15903744 |    244.8 |    85.5%
+layers.25.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     64.9 | 15903744 |    245.0 |    85.5%
+layers.1.attn.q.fused_qkv | GemvPacked { x: ValueId(7 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.4.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     64.9 | 15903744 |    245.1 |    85.6%
+layers.6.attn.q.fused_qkv | GemvPacked { x: ValueId(4 |     64.9 | 15903744 |    245.1 |    85.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              186      6848   240.8   84.1%
+  ExpertLinear             60      3178  2594.2  905.7%
+  RmsNorm                  91       928     5.1    1.8%
+  CachedAttention          30       515 229438.8 80103.2%
+  RmsNormBatch             60       369    10.1    3.5%
+  TopK                     30       282     0.1    0.0%
+  MoeWeightedSum           30       116    26.3    9.2%
+  SplitGlu                 30        93    21.8    7.6%
+lm_head              | GemvPacked { x: ValueId(1 |   1825.5 | 416295936 |    228.0 |    79.6%
+layers.2.attn.q.fused_qkv | GemvPacked { x: ValueId(1 |     67.5 | 15903744 |    235.6 |    82.3%
+layers.3.attn.q.fused_qkv | GemvPacked { x: ValueId(2 |     65.7 | 15903744 |    241.9 |    84.4%
+layers.15.attn.q.fused_qkv | GemvPacked { x: ValueId(9 |     65.3 | 15903744 |    243.4 |    85.0%

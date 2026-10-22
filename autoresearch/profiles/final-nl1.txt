@@ -1,0 +1,500 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1517    28.8   10.0%
+  LayerNorm                13        99     2.8    1.0%
+  L2Normalize               1        93     0.0    0.0%
+  Attention                 6        55     4.0    1.4%
+  Embedding                 3        10  4769.9 1665.3%
+  Binary                    2         7     7.9    2.8%
+  MeanPool                  1         4     2.5    0.9%
+encoder.layer.0.down | Linear { x: ValueId(35),  |    876.3 |  2416128 |      2.8 |     1.0%
+l2_normalize         | L2Normalize { x: ValueId( |     92.6 |     3072 |      0.0 |     0.0%
+encoder.layer.3.down | Linear { x: ValueId(119), |     78.4 |  2416128 |     30.8 |    10.8%
+encoder.layer.0.up   | Linear { x: ValueId(31),  |     56.0 |  2411520 |     43.0 |    15.0%
+encoder.layer.5.up   | Linear { x: ValueId(171), |     44.5 |  2411520 |     54.2 |    18.9%
+encoder.layer.1.ln1  | LayerNorm { x: ValueId(56 |     34.8 |    21504 |      0.6 |     0.2%
+encoder.layer.5.down | Linear { x: ValueId(175), |     28.7 |  2416128 |     84.2 |    29.4%
+encoder.layer.0.v    | Linear { x: ValueId(14),  |     27.8 |   609792 |     21.9 |     7.7%
+encoder.layer.2.up   | Linear { x: ValueId(87),  |     27.7 |  2411520 |     87.0 |    30.4%
+encoder.layer.1.up   | Linear { x: ValueId(59),  |     26.9 |  2411520 |     89.7 |    31.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      2410    18.4    6.4%
+  LayerNorm                13       185     2.4    0.8%
+  Attention                 6        58     6.4    2.2%
+  Embedding                 3        10  4771.6 1665.9%
+  Binary                    2         6    14.2    5.0%
+  MeanPool                  1         5     3.1    1.1%
+  L2Normalize               1         3     0.9    0.3%
+encoder.layer.5.o    | Linear { x: ValueId(164), |    892.2 |   637440 |      0.7 |     0.2%
+encoder.layer.5.q    | Linear { x: ValueId(154), |    559.9 |   622080 |      1.1 |     0.4%
+encoder.layer.4.down | Linear { x: ValueId(147), |    167.9 |  2452992 |     14.6 |     5.1%
+encoder.layer.1.ln1  | LayerNorm { x: ValueId(56 |     79.0 |    33792 |      0.4 |     0.1%
+encoder.layer.1.up   | Linear { x: ValueId(59),  |     55.3 |  2442240 |     44.2 |    15.4%
+encoder.layer.1.q    | Linear { x: ValueId(42),  |     51.3 |   622080 |     12.1 |     4.2%
+encoder.layer.5.down | Linear { x: ValueId(175), |     42.4 |  2452992 |     57.8 |    20.2%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     42.3 |  2452992 |     58.1 |    20.3%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     41.9 |  2452992 |     58.6 |    20.5%
+encoder.layer.3.down | Linear { x: ValueId(119), |     40.9 |  2452992 |     60.0 |    21.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1387    32.5   11.4%
+  LayerNorm                13       651     0.9    0.3%
+  Attention                 6        70     7.4    2.6%
+  Embedding                 3        10  5002.9 1746.7%
+  MeanPool                  1         8     2.8    1.0%
+  Binary                    2         7    19.6    6.8%
+  L2Normalize               1         5     0.6    0.2%
+encoder.layer.0.ln1  | LayerNorm { x: ValueId(28 |    319.3 |    46080 |      0.1 |     0.1%
+encoder.layer.5.down | Linear { x: ValueId(175), |    200.9 |  2489856 |     12.4 |     4.3%
+encoder.layer.5.ln1  | LayerNorm { x: ValueId(16 |    179.7 |    46080 |      0.3 |     0.1%
+encoder.layer.5.o    | Linear { x: ValueId(164), |    178.9 |   655872 |      3.7 |     1.3%
+encoder.layer.1.ln2  | LayerNorm { x: ValueId(67 |     96.1 |    46080 |      0.5 |     0.2%
+encoder.layer.4.down | Linear { x: ValueId(147), |     84.6 |  2489856 |     29.4 |    10.3%
+encoder.layer.0.up   | Linear { x: ValueId(31),  |     62.1 |  2472960 |     39.8 |    13.9%
+encoder.layer.3.down | Linear { x: ValueId(119), |     59.9 |  2489856 |     41.6 |    14.5%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     57.6 |  2489856 |     43.2 |    15.1%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     57.3 |  2489856 |     43.5 |    15.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      6463     7.1    2.5%
+  LayerNorm                13        82     9.3    3.2%
+  Attention                 6        79     8.4    2.9%
+  Embedding                 3        11  4308.7 1504.3%
+  Binary                    2         9    17.5    6.1%
+  MeanPool                  1         9     3.3    1.1%
+  L2Normalize               1         4     0.8    0.3%
+encoder.layer.4.up   | Linear { x: ValueId(143), |   2474.3 |  2503680 |      1.0 |     0.4%
+encoder.layer.2.down | Linear { x: ValueId(91),  |   2106.2 |  2526720 |      1.2 |     0.4%
+encoder.layer.0.q    | Linear { x: ValueId(14),  |    432.0 |   646656 |      1.5 |     0.5%
+encoder.layer.0.k    | Linear { x: ValueId(14),  |    233.6 |   646656 |      2.8 |     1.0%
+encoder.layer.3.q    | Linear { x: ValueId(98),  |    121.6 |   646656 |      5.3 |     1.9%
+encoder.layer.4.down | Linear { x: ValueId(147), |     82.9 |  2526720 |     30.5 |    10.6%
+encoder.layer.3.down | Linear { x: ValueId(119), |     82.2 |  2526720 |     30.7 |    10.7%
+encoder.layer.5.down | Linear { x: ValueId(175), |     81.7 |  2526720 |     30.9 |    10.8%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     80.2 |  2526720 |     31.5 |    11.0%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     75.5 |  2526720 |     33.5 |    11.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      6142     7.6    2.7%
+  L2Normalize               1      2830     0.0    0.0%
+  LayerNorm                13       245     3.9    1.4%
+  Attention                 6       142     6.0    2.1%
+  MeanPool                  1        11     3.3    1.1%
+  Embedding                 3        10  4680.2 1634.0%
+  Binary                    2         7    29.9   10.4%
+l2_normalize         | L2Normalize { x: ValueId( |   2830.2 |     3072 |      0.0 |     0.0%
+encoder.layer.1.v    | Linear { x: ValueId(42),  |   2553.6 |   662016 |      0.3 |     0.1%
+encoder.layer.0.down | Linear { x: ValueId(35),  |   1080.8 |  2572800 |      2.4 |     0.8%
+encoder.layer.5.v    | Linear { x: ValueId(154), |    527.8 |   662016 |      1.3 |     0.4%
+encoder.layer.3.v    | Linear { x: ValueId(98),  |    265.8 |   662016 |      2.5 |     0.9%
+encoder.layer.3.up   | Linear { x: ValueId(115), |    212.3 |  2542080 |     12.0 |     4.2%
+encoder.layer.4.ln2  | LayerNorm { x: ValueId(15 |    155.0 |    73728 |      0.5 |     0.2%
+encoder.layer.5.down | Linear { x: ValueId(175), |    123.8 |  2572800 |     20.8 |     7.3%
+encoder.layer.4.down | Linear { x: ValueId(147), |    110.8 |  2572800 |     23.2 |     8.1%
+encoder.layer.1.down | Linear { x: ValueId(63),  |    100.8 |  2572800 |     25.5 |     8.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      3410    13.9    4.9%
+  Attention                 6      3248     0.3    0.1%
+  LayerNorm                13       322     3.5    1.2%
+  L2Normalize               1       196     0.0    0.0%
+  MeanPool                  1        25     1.8    0.6%
+  Embedding                 3        19  2543.5  888.0%
+  Binary                    2        13    19.8    6.9%
+encoder.layer.5.attention | Ext(Attn(Attention { q: V |   3133.1 |   165888 |      0.1 |     0.0%
+encoder.layer.2.q    | Linear { x: ValueId(70),  |   1175.0 |   674304 |      0.6 |     0.2%
+l2_normalize         | L2Normalize { x: ValueId( |    195.8 |     3072 |      0.0 |     0.0%
+encoder.layer.1.o    | Linear { x: ValueId(52),  |    188.8 |   715776 |      3.8 |     1.3%
+encoder.layer.1.down | Linear { x: ValueId(63),  |    187.7 |  2609664 |     13.9 |     4.9%
+encoder.layer.5.down | Linear { x: ValueId(175), |    184.4 |  2609664 |     14.2 |     4.9%
+encoder.layer.5.ln2  | LayerNorm { x: ValueId(17 |    182.4 |    86016 |      0.5 |     0.2%
+encoder.layer.3.down | Linear { x: ValueId(119), |    139.4 |  2609664 |     18.7 |     6.5%
+encoder.layer.0.down | Linear { x: ValueId(35),  |    129.7 |  2609664 |     20.1 |     7.0%
+encoder.layer.4.down | Linear { x: ValueId(147), |    129.3 |  2609664 |     20.2 |     7.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1957    24.7    8.6%
+  Attention                 6       133     8.6    3.0%
+  LayerNorm                13       122    10.4    3.6%
+  Embedding                 3        18  2608.0  910.5%
+  MeanPool                  1        13     3.7    1.3%
+  Binary                    2        13    22.2    7.7%
+  L2Normalize               1         9     0.3    0.1%
+encoder.layer.1.down | Linear { x: ValueId(63),  |    134.8 |  2646528 |     19.6 |     6.9%
+encoder.layer.3.down | Linear { x: ValueId(119), |    134.5 |  2646528 |     19.7 |     6.9%
+encoder.layer.5.down | Linear { x: ValueId(175), |    134.1 |  2646528 |     19.7 |     6.9%
+encoder.layer.2.down | Linear { x: ValueId(91),  |    134.1 |  2646528 |     19.7 |     6.9%
+encoder.layer.4.down | Linear { x: ValueId(147), |    133.5 |  2646528 |     19.8 |     6.9%
+encoder.layer.0.down | Linear { x: ValueId(35),  |    133.0 |  2646528 |     19.9 |     6.9%
+emb.ln               | LayerNorm { x: ValueId(11 |     49.1 |    98304 |      2.0 |     0.7%
+encoder.layer.1.o    | Linear { x: ValueId(52),  |     45.4 |   734208 |     16.2 |     5.6%
+encoder.layer.5.o    | Linear { x: ValueId(164), |     45.1 |   734208 |     16.3 |     5.7%
+encoder.layer.0.o    | Linear { x: ValueId(24),  |     44.9 |   734208 |     16.3 |     5.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      5434     9.0    3.1%
+  L2Normalize               1      2304     0.0    0.0%
+  LayerNorm                13      1081     1.3    0.5%
+  Attention                 6       392     3.3    1.1%
+  Embedding                 3        16  3037.0 1060.3%
+  MeanPool                  1        13     4.3    1.5%
+  Binary                    2         9    37.8   13.2%
+encoder.layer.2.v    | Linear { x: ValueId(70),  |   2452.7 |   698880 |      0.3 |     0.1%
+l2_normalize         | L2Normalize { x: ValueId( |   2304.3 |     3072 |      0.0 |     0.0%
+encoder.layer.5.ln1  | LayerNorm { x: ValueId(16 |    877.0 |   110592 |      0.1 |     0.0%
+encoder.layer.1.v    | Linear { x: ValueId(42),  |    581.6 |   698880 |      1.2 |     0.4%
+encoder.layer.5.v    | Linear { x: ValueId(154), |    448.5 |   698880 |      1.6 |     0.5%
+encoder.layer.1.attention | Ext(Attn(Attention { q: V |    155.1 |   215040 |      1.4 |     0.5%
+encoder.layer.1.down | Linear { x: ValueId(63),  |    152.0 |  2683392 |     17.7 |     6.2%
+encoder.layer.0.down | Linear { x: ValueId(35),  |    142.0 |  2683392 |     18.9 |     6.6%
+encoder.layer.2.down | Linear { x: ValueId(91),  |    141.3 |  2683392 |     19.0 |     6.6%
+encoder.layer.4.ln2  | LayerNorm { x: ValueId(15 |    135.9 |   110592 |      0.8 |     0.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1434    30.4   10.6%
+  Attention                 6       107     2.1    0.7%
+  LayerNorm                13        62     4.5    1.6%
+  Embedding                 3         8  5611.7 1959.2%
+  Binary                    2         6     9.5    3.3%
+  MeanPool                  1         5     2.2    0.8%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.2.o    | Linear { x: ValueId(80),  |    781.6 |   619008 |      0.8 |     0.3%
+encoder.layer.5.o    | Linear { x: ValueId(164), |    148.3 |   619008 |      4.2 |     1.5%
+encoder.layer.2.attention | Ext(Attn(Attention { q: V |     69.3 |    36864 |      0.5 |     0.2%
+encoder.layer.1.v    | Linear { x: ValueId(42),  |     35.1 |   609792 |     17.4 |     6.1%
+encoder.layer.0.up   | Linear { x: ValueId(31),  |     25.6 |  2411520 |     94.1 |    32.9%
+encoder.layer.1.up   | Linear { x: ValueId(59),  |     24.0 |  2411520 |    100.5 |    35.1%
+encoder.layer.3.up   | Linear { x: ValueId(115), |     23.4 |  2411520 |    103.2 |    36.0%
+encoder.layer.2.up   | Linear { x: ValueId(87),  |     23.3 |  2411520 |    103.4 |    36.1%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     23.2 |  2416128 |    104.3 |    36.4%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     22.8 |  2416128 |    106.0 |    37.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      5497     8.1    2.8%
+  LayerNorm                13       201     2.2    0.8%
+  Attention                 6        52     7.2    2.5%
+  Embedding                 3         8  5697.5 1989.2%
+  Binary                    2         5    17.0    5.9%
+  MeanPool                  1         4     3.9    1.4%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.0.o    | Linear { x: ValueId(24),  |   1936.9 |   637440 |      0.3 |     0.1%
+encoder.layer.5.q    | Linear { x: ValueId(154), |   1739.8 |   622080 |      0.4 |     0.1%
+encoder.layer.1.o    | Linear { x: ValueId(52),  |    713.5 |   637440 |      0.9 |     0.3%
+encoder.layer.1.k    | Linear { x: ValueId(42),  |    368.0 |   622080 |      1.7 |     0.6%
+encoder.layer.0.ln2  | LayerNorm { x: ValueId(39 |    148.2 |    33792 |      0.2 |     0.1%
+encoder.layer.1.v    | Linear { x: ValueId(42),  |    106.6 |   622080 |      5.8 |     2.0%
+encoder.layer.1.q    | Linear { x: ValueId(42),  |     84.6 |   622080 |      7.4 |     2.6%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     35.2 |  2452992 |     69.7 |    24.3%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     34.0 |  2452992 |     72.1 |    25.2%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     34.0 |  2452992 |     72.1 |    25.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  LayerNorm                13      2044     0.3    0.1%
+  Linear                   36      1463    30.8   10.8%
+  Attention                 6        84     6.2    2.1%
+  Binary                    2        28     4.6    1.6%
+  Embedding                 3         7  6436.6 2247.2%
+  MeanPool                  1         5     4.6    1.6%
+  L2Normalize               1         3     1.2    0.4%
+encoder.layer.2.ln1  | LayerNorm { x: ValueId(84 |   1734.0 |    46080 |      0.0 |     0.0%
+encoder.layer.3.q    | Linear { x: ValueId(98),  |    702.7 |   634368 |      0.9 |     0.3%
+encoder.layer.2.ln2  | LayerNorm { x: ValueId(95 |    267.0 |    46080 |      0.2 |     0.1%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     68.0 |  2489856 |     36.6 |    12.8%
+encoder.layer.4.down | Linear { x: ValueId(147), |     50.2 |  2489856 |     49.6 |    17.3%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     44.4 |  2489856 |     56.1 |    19.6%
+encoder.layer.5.down | Linear { x: ValueId(175), |     44.4 |  2489856 |     56.1 |    19.6%
+encoder.layer.3.down | Linear { x: ValueId(119), |     44.1 |  2489856 |     56.4 |    19.7%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     43.9 |  2489856 |     56.7 |    19.8%
+encoder.layer.0.attention | Ext(Attn(Attention { q: V |     40.0 |    86016 |      2.1 |     0.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  LayerNorm                13      1822     0.4    0.1%
+  Binary                    2      1777     0.1    0.0%
+  Linear                   36      1389    33.0   11.5%
+  Attention                 6        77     8.6    3.0%
+  Embedding                 3         7  6549.3 2286.5%
+  MeanPool                  1         6     4.8    1.7%
+  L2Normalize               1         3     1.2    0.4%
+emb.add_type         | Ext(Elementwise(Binary {  |   1774.6 |    82944 |      0.0 |     0.0%
+encoder.layer.4.ln1  | LayerNorm { x: ValueId(14 |   1762.7 |    58368 |      0.0 |     0.0%
+encoder.layer.0.q    | Linear { x: ValueId(14),  |    473.6 |   646656 |      1.4 |     0.5%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     57.8 |  2526720 |     43.7 |    15.3%
+encoder.layer.4.down | Linear { x: ValueId(147), |     57.5 |  2526720 |     43.9 |    15.3%
+encoder.layer.5.down | Linear { x: ValueId(175), |     57.3 |  2526720 |     44.1 |    15.4%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     57.3 |  2526720 |     44.1 |    15.4%
+encoder.layer.3.down | Linear { x: ValueId(119), |     56.7 |  2526720 |     44.6 |    15.6%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     56.2 |  2526720 |     45.0 |    15.7%
+encoder.layer.0.k    | Linear { x: ValueId(14),  |     48.7 |   646656 |     13.3 |     4.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1110    42.1   14.7%
+  Binary                    2       462     0.5    0.2%
+  LayerNorm                13        91    10.6    3.7%
+  Embedding                 3        79   602.2  210.3%
+  Attention                 6        69    12.3    4.3%
+  MeanPool                  1         7     5.2    1.8%
+  L2Normalize               1         3     1.2    0.4%
+emb.add_type         | Ext(Elementwise(Binary {  |    455.7 |   105984 |      0.2 |     0.1%
+encoder.layer.4.v    | Linear { x: ValueId(126), |     79.1 |   662016 |      8.4 |     2.9%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     70.3 |  2572800 |     36.6 |    12.8%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     70.1 |  2572800 |     36.7 |    12.8%
+encoder.layer.5.down | Linear { x: ValueId(175), |     70.0 |  2572800 |     36.8 |    12.8%
+encoder.layer.4.down | Linear { x: ValueId(147), |     69.8 |  2572800 |     36.9 |    12.9%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     69.4 |  2572800 |     37.1 |    12.9%
+encoder.layer.3.down | Linear { x: ValueId(119), |     68.3 |  2572800 |     37.7 |    13.1%
+emb.word             | Embedding { table: ValueI |     66.0 | 46917212 |    710.9 |   248.2%
+encoder.layer.1.ln1  | LayerNorm { x: ValueId(56 |     25.3 |    73728 |      2.9 |     1.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1305    36.4   12.7%
+  LayerNorm                13       792     1.4    0.5%
+  Attention                 6        85    11.7    4.1%
+  Embedding                 3        12  3983.0 1390.6%
+  MeanPool                  1         8     5.3    1.9%
+  Binary                    2         6    44.6   15.6%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.2.ln2  | LayerNorm { x: ValueId(95 |    736.5 |    86016 |      0.1 |     0.0%
+encoder.layer.2.v    | Linear { x: ValueId(70),  |    107.9 |   674304 |      6.3 |     2.2%
+encoder.layer.3.down | Linear { x: ValueId(119), |     83.0 |  2609664 |     31.4 |    11.0%
+encoder.layer.5.down | Linear { x: ValueId(175), |     82.9 |  2609664 |     31.5 |    11.0%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     82.2 |  2609664 |     31.7 |    11.1%
+encoder.layer.4.down | Linear { x: ValueId(147), |     82.0 |  2609664 |     31.8 |    11.1%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     80.8 |  2609664 |     32.3 |    11.3%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     80.5 |  2609664 |     32.4 |    11.3%
+encoder.layer.2.o    | Linear { x: ValueId(80),  |     30.7 |   715776 |     23.3 |     8.1%
+encoder.layer.4.q    | Linear { x: ValueId(126), |     29.5 |   674304 |     22.9 |     8.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  LayerNorm                13      1807     0.7    0.2%
+  Linear                   36      1350    35.8   12.5%
+  Attention                 6        99    11.6    4.0%
+  Embedding                 3        29  1675.3  584.9%
+  MeanPool                  1         9     5.5    1.9%
+  Binary                    2         6    47.9   16.7%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.1.ln1  | LayerNorm { x: ValueId(56 |   1757.5 |    98304 |      0.1 |     0.0%
+encoder.layer.3.down | Linear { x: ValueId(119), |    105.0 |  2646528 |     25.2 |     8.8%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     93.4 |  2646528 |     28.3 |     9.9%
+encoder.layer.5.down | Linear { x: ValueId(175), |     93.3 |  2646528 |     28.4 |     9.9%
+encoder.layer.4.down | Linear { x: ValueId(147), |     92.7 |  2646528 |     28.5 |    10.0%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     92.6 |  2646528 |     28.6 |    10.0%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     92.3 |  2646528 |     28.7 |    10.0%
+encoder.layer.0.o    | Linear { x: ValueId(24),  |     30.4 |   734208 |     24.1 |     8.4%
+encoder.layer.4.o    | Linear { x: ValueId(136), |     30.3 |   734208 |     24.2 |     8.5%
+encoder.layer.3.o    | Linear { x: ValueId(108), |     30.3 |   734208 |     24.2 |     8.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1760    27.8    9.7%
+  Embedding                 3       644    74.3   25.9%
+  LayerNorm                13       361     4.0    1.4%
+  Attention                 6       107    12.0    4.2%
+  Binary                    2        18    17.8    6.2%
+  MeanPool                  1        10     5.5    1.9%
+  L2Normalize               1         3     1.1    0.4%
+emb.word             | Embedding { table: ValueI |    633.1 | 46935692 |     74.1 |    25.9%
+encoder.layer.3.ln2  | LayerNorm { x: ValueId(12 |    280.0 |   110592 |      0.4 |     0.1%
+encoder.layer.1.v    | Linear { x: ValueId(42),  |    216.8 |   698880 |      3.2 |     1.1%
+encoder.layer.4.down | Linear { x: ValueId(147), |    106.5 |  2683392 |     25.2 |     8.8%
+encoder.layer.2.down | Linear { x: ValueId(91),  |    106.2 |  2683392 |     25.3 |     8.8%
+encoder.layer.0.down | Linear { x: ValueId(35),  |    106.2 |  2683392 |     25.3 |     8.8%
+encoder.layer.1.down | Linear { x: ValueId(63),  |    104.5 |  2683392 |     25.7 |     9.0%
+encoder.layer.5.down | Linear { x: ValueId(175), |    101.6 |  2683392 |     26.4 |     9.2%
+encoder.layer.3.down | Linear { x: ValueId(119), |    100.9 |  2683392 |     26.6 |     9.3%
+encoder.layer.1.up   | Linear { x: ValueId(59),  |     93.0 |  2634240 |     28.3 |     9.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      3234    13.5    4.7%
+  Attention                 6        74     3.0    1.0%
+  LayerNorm                13        55     5.0    1.8%
+  Embedding                 3         7  6504.3 2270.8%
+  Binary                    2         5    10.2    3.6%
+  MeanPool                  1         3     3.2    1.1%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.1.k    | Linear { x: ValueId(42),  |   1753.1 |   609792 |      0.3 |     0.1%
+encoder.layer.1.up   | Linear { x: ValueId(59),  |    710.5 |  2411520 |      3.4 |     1.2%
+encoder.layer.1.v    | Linear { x: ValueId(42),  |    336.3 |   609792 |      1.8 |     0.6%
+encoder.layer.1.o    | Linear { x: ValueId(52),  |     45.5 |   619008 |     13.6 |     4.7%
+encoder.layer.3.attention | Ext(Attn(Attention { q: V |     39.0 |    36864 |      0.9 |     0.3%
+encoder.layer.3.down | Linear { x: ValueId(119), |     25.6 |  2416128 |     94.3 |    32.9%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     20.9 |  2416128 |    115.7 |    40.4%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     20.8 |  2416128 |    116.4 |    40.7%
+encoder.layer.5.down | Linear { x: ValueId(175), |     20.4 |  2416128 |    118.3 |    41.3%
+encoder.layer.4.down | Linear { x: ValueId(147), |     20.4 |  2416128 |    118.6 |    41.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      2791    15.9    5.6%
+  LayerNorm                13       195     2.2    0.8%
+  Attention                 6        49     7.6    2.6%
+  Embedding                 3        36  1320.9  461.2%
+  Binary                    2         5    18.0    6.3%
+  MeanPool                  1         4     4.0    1.4%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.4.o    | Linear { x: ValueId(136), |   1787.5 |   637440 |      0.4 |     0.1%
+encoder.layer.2.o    | Linear { x: ValueId(80),  |    355.9 |   637440 |      1.8 |     0.6%
+encoder.layer.2.ln1  | LayerNorm { x: ValueId(84 |    118.3 |    33792 |      0.3 |     0.1%
+encoder.layer.2.k    | Linear { x: ValueId(70),  |     74.2 |   622080 |      8.4 |     2.9%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     34.3 |  2452992 |     71.5 |    25.0%
+encoder.layer.1.ln2  | LayerNorm { x: ValueId(67 |     33.1 |    33792 |      1.0 |     0.4%
+encoder.layer.4.down | Linear { x: ValueId(147), |     33.1 |  2452992 |     74.1 |    25.9%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     33.0 |  2452992 |     74.4 |    26.0%
+encoder.layer.5.down | Linear { x: ValueId(175), |     32.9 |  2452992 |     74.6 |    26.1%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     32.6 |  2452992 |     75.2 |    26.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36       845    53.4   18.6%
+  LayerNorm                13       402     1.5    0.5%
+  Attention                 6        57     9.1    3.2%
+  Embedding                 3        37  1296.0  452.5%
+  Binary                    2        12    11.1    3.9%
+  MeanPool                  1         5     4.4    1.5%
+  L2Normalize               1         3     1.2    0.4%
+encoder.layer.4.ln1  | LayerNorm { x: ValueId(14 |    351.8 |    46080 |      0.1 |     0.0%
+encoder.layer.4.up   | Linear { x: ValueId(143), |    112.5 |  2472960 |     22.0 |     7.7%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     44.6 |  2489856 |     55.8 |    19.5%
+encoder.layer.3.down | Linear { x: ValueId(119), |     44.4 |  2489856 |     56.1 |    19.6%
+encoder.layer.5.down | Linear { x: ValueId(175), |     44.1 |  2489856 |     56.5 |    19.7%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     44.0 |  2489856 |     56.6 |    19.8%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     43.9 |  2489856 |     56.7 |    19.8%
+encoder.layer.4.down | Linear { x: ValueId(147), |     43.6 |  2489856 |     57.1 |    19.9%
+emb.position         | Embedding { table: ValueI |     32.1 |   807992 |     25.2 |     8.8%
+encoder.layer.2.v    | Linear { x: ValueId(70),  |     29.5 |   634368 |     21.5 |     7.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      3382    13.6    4.7%
+  Binary                    2      1706     0.1    0.0%
+  LayerNorm                13        76     9.9    3.5%
+  Attention                 6        61    10.9    3.8%
+  Embedding                 3        14  3504.9 1223.7%
+  MeanPool                  1         6     4.7    1.6%
+  L2Normalize               1         3     1.2    0.4%
+encoder.layer.4.up   | Linear { x: ValueId(143), |   1808.7 |  2503680 |      1.4 |     0.5%
+emb.add_position     | Ext(Elementwise(Binary {  |   1703.1 |    82944 |      0.0 |     0.0%
+encoder.layer.2.k    | Linear { x: ValueId(70),  |    682.0 |   646656 |      0.9 |     0.3%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     59.0 |  2526720 |     42.8 |    15.0%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     58.3 |  2526720 |     43.4 |    15.1%
+encoder.layer.5.down | Linear { x: ValueId(175), |     57.4 |  2526720 |     44.0 |    15.4%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     57.2 |  2526720 |     44.2 |    15.4%
+encoder.layer.3.down | Linear { x: ValueId(119), |     57.0 |  2526720 |     44.3 |    15.5%
+encoder.layer.4.down | Linear { x: ValueId(147), |     54.1 |  2526720 |     46.7 |    16.3%
+encoder.layer.2.up   | Linear { x: ValueId(87),  |     45.0 |  2503680 |     55.6 |    19.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      2850    16.4    5.7%
+  Attention                 6        79    10.8    3.8%
+  LayerNorm                13        56    17.2    6.0%
+  Binary                    2        42     5.1    1.8%
+  Embedding                 3        40  1183.3  413.1%
+  MeanPool                  1         7     5.2    1.8%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.2.v    | Linear { x: ValueId(70),  |   1807.8 |   662016 |      0.4 |     0.1%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     72.4 |  2572800 |     35.5 |    12.4%
+encoder.layer.3.down | Linear { x: ValueId(119), |     71.5 |  2572800 |     36.0 |    12.6%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     70.6 |  2572800 |     36.4 |    12.7%
+encoder.layer.5.down | Linear { x: ValueId(175), |     70.5 |  2572800 |     36.5 |    12.7%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     70.3 |  2572800 |     36.6 |    12.8%
+encoder.layer.4.down | Linear { x: ValueId(147), |     67.7 |  2572800 |     38.0 |    13.3%
+emb.add_position     | Ext(Elementwise(Binary {  |     39.3 |   105984 |      2.7 |     0.9%
+emb.position         | Embedding { table: ValueI |     35.0 |   821852 |     23.5 |     8.2%
+encoder.layer.4.v    | Linear { x: ValueId(126), |     29.4 |   662016 |     22.5 |     7.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      3869    12.3    4.3%
+  Embedding                 3      1825    26.2    9.1%
+  LayerNorm                13       792     1.4    0.5%
+  Attention                 6       223     4.5    1.6%
+  Binary                    2        21    11.7    4.1%
+  MeanPool                  1         8     5.4    1.9%
+  L2Normalize               1         3     1.0    0.3%
+emb.position         | Embedding { table: ValueI |   1816.8 |   828012 |      0.5 |     0.2%
+encoder.layer.4.q    | Linear { x: ValueId(126), |   1804.6 |   674304 |      0.4 |     0.1%
+emb.ln               | LayerNorm { x: ValueId(11 |    738.9 |    86016 |      0.1 |     0.0%
+encoder.layer.4.down | Linear { x: ValueId(147), |    737.4 |  2609664 |      3.5 |     1.2%
+encoder.layer.4.k    | Linear { x: ValueId(126), |    207.4 |   674304 |      3.3 |     1.1%
+encoder.layer.1.attention | Ext(Attn(Attention { q: V |    156.0 |   165888 |      1.1 |     0.4%
+encoder.layer.3.down | Linear { x: ValueId(119), |    116.0 |  2609664 |     22.5 |     7.9%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     84.0 |  2609664 |     31.1 |    10.9%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     83.1 |  2609664 |     31.4 |    11.0%
+encoder.layer.5.down | Linear { x: ValueId(175), |     83.0 |  2609664 |     31.4 |    11.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      1358    35.5   12.4%
+  Attention                 6        89    12.8    4.5%
+  LayerNorm                13        57    22.4    7.8%
+  MeanPool                  1         9     5.5    1.9%
+  Embedding                 3         8  5709.3 1993.3%
+  Binary                    2         6    49.0   17.1%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.4.down | Linear { x: ValueId(147), |     94.0 |  2646528 |     28.2 |     9.8%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     93.7 |  2646528 |     28.2 |     9.9%
+encoder.layer.3.down | Linear { x: ValueId(119), |     93.5 |  2646528 |     28.3 |     9.9%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     93.3 |  2646528 |     28.4 |     9.9%
+encoder.layer.1.down | Linear { x: ValueId(63),  |     92.5 |  2646528 |     28.6 |    10.0%
+encoder.layer.5.down | Linear { x: ValueId(175), |     90.4 |  2646528 |     29.3 |    10.2%
+encoder.layer.3.up   | Linear { x: ValueId(115), |     45.9 |  2603520 |     56.8 |    19.8%
+encoder.layer.2.o    | Linear { x: ValueId(80),  |     30.8 |   734208 |     23.8 |     8.3%
+encoder.layer.3.o    | Linear { x: ValueId(108), |     30.7 |   734208 |     23.9 |     8.3%
+encoder.layer.1.o    | Linear { x: ValueId(52),  |     30.6 |   734208 |     24.0 |     8.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   36      2176    22.5    7.9%
+  Attention                 6       129    10.0    3.5%
+  LayerNorm                13        77    18.8    6.6%
+  MeanPool                  1        10     5.5    1.9%
+  Embedding                 3         9  5079.5 1773.4%
+  Binary                    2         6    53.0   18.5%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.1.q    | Linear { x: ValueId(42),  |    406.8 |   698880 |      1.7 |     0.6%
+encoder.layer.1.k    | Linear { x: ValueId(42),  |    278.8 |   698880 |      2.5 |     0.9%
+encoder.layer.0.down | Linear { x: ValueId(35),  |    106.9 |  2683392 |     25.1 |     8.8%
+encoder.layer.3.down | Linear { x: ValueId(119), |    106.8 |  2683392 |     25.1 |     8.8%
+encoder.layer.4.down | Linear { x: ValueId(147), |    105.6 |  2683392 |     25.4 |     8.9%
+encoder.layer.1.down | Linear { x: ValueId(63),  |    105.1 |  2683392 |     25.5 |     8.9%
+encoder.layer.2.down | Linear { x: ValueId(91),  |    103.0 |  2683392 |     26.0 |     9.1%
+encoder.layer.5.down | Linear { x: ValueId(175), |    102.3 |  2683392 |     26.2 |     9.2%
+encoder.layer.0.up   | Linear { x: ValueId(31),  |     78.2 |  2634240 |     33.7 |    11.8%
+encoder.layer.5.attention | Ext(Attn(Attention { q: V |     38.8 |   215040 |      5.5 |     1.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                 6      1795     0.1    0.0%
+  Linear                   36      1222    35.7   12.5%
+  LayerNorm                13       108     2.6    0.9%
+  Embedding                 3         8  6359.7 2220.3%
+  Binary                    2         5    11.2    3.9%
+  MeanPool                  1         4     2.5    0.9%
+  L2Normalize               1         3     1.1    0.4%
+encoder.layer.0.attention | Ext(Attn(Attention { q: V |   1755.6 |    36864 |      0.0 |     0.0%
+encoder.layer.5.up   | Linear { x: ValueId(171), |    715.8 |  2411520 |      3.4 |     1.2%
+encoder.layer.3.q    | Linear { x: ValueId(98),  |     77.4 |   609792 |      7.9 |     2.8%
+encoder.layer.5.ln1  | LayerNorm { x: ValueId(16 |     43.8 |    21504 |      0.5 |     0.2%
+encoder.layer.3.o    | Linear { x: ValueId(108), |     34.8 |   619008 |     17.8 |     6.2%
+encoder.layer.2.down | Linear { x: ValueId(91),  |     20.8 |  2416128 |    116.0 |    40.5%
+encoder.layer.5.down | Linear { x: ValueId(175), |     20.5 |  2416128 |    117.6 |    41.1%
+encoder.layer.0.down | Linear { x: ValueId(35),  |     20.5 |  2416128 |    118.1 |    41.2%
+encoder.layer.4.down | Linear { x: ValueId(147), |     20.4 |  2416128 |    118.3 |    41.3%

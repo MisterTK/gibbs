@@ -5,71 +5,71 @@
     "tool": "llama-bench tg128, Metal",
     "date": "2026-10-22",
     "source": "autoresearch/sprint3-probes.md",
-    "source_note": "ib-P0.4",
+    "source_note": "ib-P11",
     "rows": [
       {
         "row": 0,
         "key": "unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf",
         "engine": "llama.cpp",
-        "tok_s": 140.79,
-        "pp512_tok_s": 3615.77
+        "tok_s": 121.13,
+        "pp512_tok_s": 3128.9
       },
       {
         "row": 1,
         "key": "unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf",
         "engine": "llama.cpp",
-        "tok_s": 112.39,
-        "pp512_tok_s": 3459.65
+        "tok_s": 92.61,
+        "pp512_tok_s": 2932.32
       },
       {
         "row": 2,
         "key": "unsloth/Qwen3.5-2B-GGUF/Qwen3.5-2B-UD-Q4_K_XL.gguf",
         "engine": "llama.cpp",
-        "tok_s": 142.36,
-        "pp512_tok_s": 4284.42
+        "tok_s": 120.56,
+        "pp512_tok_s": 3713.48
       },
       {
         "row": 3,
         "key": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-IQ2_M.gguf",
         "engine": "llama.cpp",
-        "tok_s": 41.09,
-        "pp512_tok_s": 984.67
+        "tok_s": 35.36,
+        "pp512_tok_s": 856.36
       },
       {
         "row": 4,
         "key": "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_0.gguf",
         "engine": "llama.cpp",
-        "tok_s": 261.13,
-        "pp512_tok_s": 8119.16
+        "tok_s": 215.78,
+        "pp512_tok_s": 6792.9
       },
       {
         "row": 7,
         "key": "unsloth/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-IQ2_XXS.gguf",
         "engine": "llama.cpp",
-        "tok_s": 78.38,
-        "pp512_tok_s": 1569.09
+        "tok_s": 64.95,
+        "pp512_tok_s": 1346.36
       },
       {
         "row": 8,
         "key": "e2b-qat-ctx4k",
         "engine": "llama.cpp",
-        "tok_s": 119.46,
-        "pp512_tok_s": 3158.71,
-        "pp4096_tok_s": 3158.71
+        "tok_s": 99.2,
+        "pp512_tok_s": 2610.27,
+        "pp4096_tok_s": 2610.27
       },
       {
         "row": 5,
         "key": "HuggingFaceTB/SmolLM2-135M-Instruct",
         "engine": "mlx",
-        "tok_s": 498.07,
-        "pp512_tok_s": 9273.34
+        "tok_s": 410.48,
+        "pp512_tok_s": 8811.75
       },
       {
         "key": "stabilityai/sd-turbo",
         "engine": "sd.cpp",
         "tok_s": null,
         "pp512_tok_s": null,
-        "s_per_step": 0.2513
+        "s_per_step": 0.2817
       }
     ]
   },

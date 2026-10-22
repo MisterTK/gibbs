@@ -1,0 +1,500 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   28      6013    17.4    6.1%
+  Copy                     30      5192     3.0    1.1%
+  Attention                 6       195    20.2    7.0%
+  Binary                    1       122     2.2    0.8%
+  RmsNorm                  13        92    37.3   13.0%
+  Unary                     6        63   100.5   35.1%
+  Embedding                 1        10  6791.0 2370.9%
+  RelPosBias                1         7    19.4    6.8%
+enc1.attn.o          | Linear { x: ValueId(36),  |   2555.4 |  1441792 |      0.6 |     0.2%
+xv.4.q_slice         | Ext(Movement(Copy { fill: |   2474.1 |   524288 |      0.2 |     0.1%
+enc4.attn.v.v_slice  | Ext(Movement(Copy { fill: |   2464.8 |   524288 |      0.2 |     0.1%
+enc1.ffn.mlp.down    | Linear { x: ValueId(44),  |    522.2 |  4980736 |      9.5 |     3.3%
+enc0.ffn.mlp.down    | Linear { x: ValueId(24),  |    354.4 |  4980736 |     14.1 |     4.9%
+enc4.ffn.mlp.down    | Linear { x: ValueId(104), |    350.2 |  4980736 |     14.2 |     5.0%
+enc5.ffn.mlp.down    | Linear { x: ValueId(124), |    349.5 |  4980736 |     14.3 |     5.0%
+enc3.ffn.mlp.down    | Linear { x: ValueId(84),  |    348.2 |  4980736 |     14.3 |     5.0%
+enc2.ffn.mlp.down    | Linear { x: ValueId(64),  |    347.1 |  4980736 |     14.4 |     5.0%
+enc0.relmask         | Ext(Elementwise(Binary {  |    121.6 |   262400 |      2.2 |     0.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      2142    72.0   25.1%
+  Attention                12      1391    18.2    6.4%
+  CachedAttention           6      1005    12.6    4.4%
+  RmsNorm                  19       314     0.4    0.1%
+  Unary                     7        23     4.4    1.5%
+  RelPosBias                1         4     4.3    1.5%
+  Binary                    1         4     9.4    3.3%
+  Embedding                 1         3 19739.4 6891.6%
+dec5.kv_write        | CachedAttention { q: Valu |    968.2 |  2105348 |      2.2 |     0.8%
+lm_head              | Linear { x: ValueId(210), |    544.7 | 65928704 |    121.0 |    42.3%
+dec5.q.fused_qkv     | Linear { x: ValueId(176), |    461.5 |  3153920 |      6.8 |     2.4%
+dec3.cross           | Ext(Attn(Attention { q: V |    428.7 |  2103296 |      4.9 |     1.7%
+dec1.xq              | Linear { x: ValueId(59),  |    250.6 |  1052672 |      4.2 |     1.5%
+dec1.xln.out         | RmsNorm { x: ValueId(57), |    220.3 |     6144 |      0.0 |     0.0%
+dec3.self            | Ext(Attn(Attention { q: V |    109.8 |  2117632 |     19.3 |     6.7%
+dec5.ffn.mlp.up      | Linear { x: ValueId(201), |    105.5 |  4204544 |     39.9 |    13.9%
+dec4.cross           | Ext(Attn(Attention { q: V |     91.7 |  2103296 |     22.9 |     8.0%
+dec1.self            | Ext(Attn(Attention { q: V |     89.3 |  2117632 |     23.7 |     8.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      4500    34.3   12.0%
+  RmsNorm                  19      2567     0.0    0.0%
+  Attention                12      2383    10.6    3.7%
+  CachedAttention           6        87   145.2   50.7%
+  Unary                     7        27     3.8    1.3%
+  RelPosBias                1         5     4.3    1.5%
+  Binary                    1         4     9.3    3.2%
+  Embedding                 1         3 19739.4 6891.6%
+dec0.ffn.norm.out    | RmsNorm { x: ValueId(34), |   2460.9 |     6144 |      0.0 |     0.0%
+dec3.xo              | Linear { x: ValueId(130), |   1982.9 |  1054720 |      0.5 |     0.2%
+dec5.self            | Ext(Attn(Attention { q: V |   1048.6 |  2117632 |      2.0 |     0.7%
+dec1.xo              | Linear { x: ValueId(64),  |   1045.8 |  1054720 |      1.0 |     0.4%
+lm_head              | Linear { x: ValueId(210), |    539.3 | 65928704 |    122.2 |    42.7%
+dec1.self            | Ext(Attn(Attention { q: V |    458.9 |  2117632 |      4.6 |     1.6%
+dec3.o               | Linear { x: ValueId(120), |    113.3 |  1054720 |      9.3 |     3.3%
+dec3.cross           | Ext(Attn(Attention { q: V |     93.0 |  2103296 |     22.6 |     7.9%
+dec2.self            | Ext(Attn(Attention { q: V |     92.7 |  2117632 |     22.8 |     8.0%
+dec4.cross           | Ext(Attn(Attention { q: V |     91.2 |  2103296 |     23.1 |     8.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      2947     8.6    3.0%
+  Linear                   37      2678    57.6   20.1%
+  RmsNorm                  19        97     1.2    0.4%
+  CachedAttention           6        49   255.4   89.2%
+  Unary                     7        27     3.7    1.3%
+  RelPosBias                1         5     4.2    1.5%
+  Binary                    1         4     9.4    3.3%
+  Embedding                 1         3 20245.7 7068.3%
+dec2.cross           | Ext(Attn(Attention { q: V |   1129.8 |  2103296 |      1.9 |     0.6%
+dec3.xo              | Linear { x: ValueId(130), |    989.4 |  1054720 |      1.1 |     0.4%
+dec3.cross           | Ext(Attn(Attention { q: V |    579.2 |  2103296 |      3.6 |     1.3%
+lm_head              | Linear { x: ValueId(210), |    558.7 | 65928704 |    118.0 |    41.2%
+dec2.self            | Ext(Attn(Attention { q: V |    482.1 |  2117632 |      4.4 |     1.5%
+dec2.o               | Linear { x: ValueId(87),  |    169.0 |  1054720 |      6.2 |     2.2%
+dec3.xq              | Linear { x: ValueId(125), |    127.0 |  1052672 |      8.3 |     2.9%
+dec1.self            | Ext(Attn(Attention { q: V |     85.3 |  2117632 |     24.8 |     8.7%
+dec0.self            | Ext(Attn(Attention { q: V |     85.1 |  2117632 |     24.9 |     8.7%
+dec4.self            | Ext(Attn(Attention { q: V |     84.3 |  2117632 |     25.1 |     8.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      5559     4.6    1.6%
+  CachedAttention           6      2068     6.1    2.1%
+  Linear                   37      1473   104.8   36.6%
+  RmsNorm                  19        88     1.3    0.5%
+  Embedding                 1        39  1689.0  589.7%
+  Binary                    1        37     0.9    0.3%
+  Unary                     7        36     2.8    1.0%
+  RelPosBias                1         8     2.4    0.8%
+dec1.self            | Ext(Attn(Attention { q: V |   2527.8 |  2117632 |      0.8 |     0.3%
+dec4.self            | Ext(Attn(Attention { q: V |   2260.7 |  2117632 |      0.9 |     0.3%
+dec0.kv_write        | CachedAttention { q: Valu |   1042.6 |  2105348 |      2.0 |     0.7%
+dec2.kv_write        | CachedAttention { q: Valu |    877.2 |  2105348 |      2.4 |     0.8%
+lm_head              | Linear { x: ValueId(210), |    413.5 | 65928704 |    159.4 |    55.7%
+dec4.xq              | Linear { x: ValueId(158), |    298.4 |  1052672 |      3.5 |     1.2%
+dec4.kv_write        | CachedAttention { q: Valu |    129.9 |  2105348 |     16.2 |     5.7%
+dec0.self            | Ext(Attn(Attention { q: V |     88.2 |  2117632 |     24.0 |     8.4%
+dec0.cross           | Ext(Attn(Attention { q: V |     83.2 |  2103296 |     25.3 |     8.8%
+dec3.self            | Ext(Attn(Attention { q: V |     78.5 |  2117632 |     27.0 |     9.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      2463    10.3    3.6%
+  Linear                   37      2257    68.4   23.9%
+  RmsNorm                  19      1124     0.1    0.0%
+  CachedAttention           6        33   384.7  134.3%
+  Unary                     7        18     5.7    2.0%
+  Binary                    1        18     1.9    0.7%
+  RelPosBias                1         4     4.9    1.7%
+  Embedding                 1         3 25067.4 8751.7%
+dec3.cross           | Ext(Attn(Attention { q: V |   1752.5 |  2103296 |      1.2 |     0.4%
+dec5.o               | Linear { x: ValueId(186), |    734.2 |  1054720 |      1.4 |     0.5%
+dec5.xln.out         | RmsNorm { x: ValueId(189) |    682.4 |     6144 |      0.0 |     0.0%
+lm_head              | Linear { x: ValueId(210), |    351.9 | 65928704 |    187.3 |    65.4%
+dec0.o               | Linear { x: ValueId(21),  |    307.5 |  1054720 |      3.4 |     1.2%
+dec2.xo              | Linear { x: ValueId(97),  |    242.6 |  1054720 |      4.3 |     1.5%
+dec0.xln.out         | RmsNorm { x: ValueId(24), |    198.0 |     6144 |      0.0 |     0.0%
+dec2.ffn.norm.out    | RmsNorm { x: ValueId(100) |    186.3 |     6144 |      0.0 |     0.0%
+dec0.self            | Ext(Attn(Attention { q: V |     78.0 |  2117632 |     27.1 |     9.5%
+dec5.q.fused_qkv     | Linear { x: ValueId(176), |     74.8 |  3153920 |     42.2 |    14.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      2531    61.0   21.3%
+  Attention                12      1054    24.0    8.4%
+  RmsNorm                  19        68     1.7    0.6%
+  CachedAttention           6        37   341.0  119.1%
+  Unary                     7        18     5.7    2.0%
+  RelPosBias                1         6     3.5    1.2%
+  Binary                    1         3    12.1    4.2%
+  Embedding                 1         2 27706.8 9673.2%
+dec3.xq              | Linear { x: ValueId(125), |    784.8 |  1052672 |      1.3 |     0.5%
+dec3.ffn.mlp.up      | Linear { x: ValueId(135), |    690.1 |  4204544 |      6.1 |     2.1%
+dec1.self            | Ext(Attn(Attention { q: V |    374.8 |  2117632 |      5.7 |     2.0%
+lm_head              | Linear { x: ValueId(210), |    349.7 | 65928704 |    188.5 |    65.8%
+dec1.o               | Linear { x: ValueId(54),  |    189.1 |  1054720 |      5.6 |     1.9%
+dec3.cross           | Ext(Attn(Attention { q: V |     71.1 |  2103296 |     29.6 |    10.3%
+dec1.ffn.mlp.up      | Linear { x: ValueId(69),  |     64.3 |  4204544 |     65.4 |    22.8%
+dec1.cross           | Ext(Attn(Attention { q: V |     62.4 |  2103296 |     33.7 |    11.8%
+dec0.self            | Ext(Attn(Attention { q: V |     61.5 |  2117632 |     34.4 |    12.0%
+dec4.self            | Ext(Attn(Attention { q: V |     61.4 |  2117632 |     34.5 |    12.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      2556     9.9    3.5%
+  Linear                   37       992   155.5   54.3%
+  CachedAttention           6       735    17.2    6.0%
+  Unary                     7       353     0.3    0.1%
+  RelPosBias                1       148     0.1    0.0%
+  RmsNorm                  19        69     1.7    0.6%
+  Binary                    1         8     4.2    1.5%
+  Embedding                 1         8  8098.6 2827.4%
+dec3.self            | Ext(Attn(Attention { q: V |   1875.4 |  2117632 |      1.1 |     0.4%
+dec3.kv_write        | CachedAttention { q: Valu |    707.4 |  2105348 |      3.0 |     1.0%
+lm_head              | Linear { x: ValueId(210), |    356.0 | 65928704 |    185.2 |    64.6%
+dec4.ffn.mlp.act     | Ext(Elementwise(Unary { x |    296.7 |    16384 |      0.1 |     0.0%
+dec0.relbias         | Ext(Attn(RelPosBias { tab |    147.5 |    19460 |      0.1 |     0.0%
+dec4.cross           | Ext(Attn(Attention { q: V |     69.3 |  2103296 |     30.4 |    10.6%
+dec1.cross           | Ext(Attn(Attention { q: V |     64.8 |  2103296 |     32.4 |    11.3%
+dec0.self            | Ext(Attn(Attention { q: V |     64.2 |  2117632 |     33.0 |    11.5%
+dec2.ffn.mlp.down    | Linear { x: ValueId(105), |     61.6 |  4206592 |     68.3 |    23.8%
+dec2.self            | Ext(Attn(Attention { q: V |     61.4 |  2117632 |     34.5 |    12.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      5283    29.2   10.2%
+  Attention                12       745    34.0   11.9%
+  RmsNorm                  19       431     0.3    0.1%
+  CachedAttention           6        36   348.9  121.8%
+  Unary                     7        19     5.4    1.9%
+  RelPosBias                1         3     6.0    2.1%
+  Binary                    1         3    12.7    4.4%
+  Embedding                 1         2 26764.8 9344.3%
+dec3.xo              | Linear { x: ValueId(130), |   1718.3 |  1054720 |      0.6 |     0.2%
+dec0.o               | Linear { x: ValueId(21),  |   1699.0 |  1054720 |      0.6 |     0.2%
+dec4.q.fused_qkv     | Linear { x: ValueId(143), |    685.0 |  3153920 |      4.6 |     1.6%
+lm_head              | Linear { x: ValueId(210), |    594.4 | 65928704 |    110.9 |    38.7%
+dec1.ffn.norm.out    | RmsNorm { x: ValueId(67), |    351.0 |     6144 |      0.0 |     0.0%
+dec4.xo              | Linear { x: ValueId(163), |     97.6 |  1054720 |     10.8 |     3.8%
+dec1.self            | Ext(Attn(Attention { q: V |     79.2 |  2117632 |     26.7 |     9.3%
+dec4.cross           | Ext(Attn(Attention { q: V |     63.4 |  2103296 |     33.2 |    11.6%
+dec4.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+dec0.self            | Ext(Attn(Attention { q: V |     61.2 |  2117632 |     34.6 |    12.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      1354    18.7    6.5%
+  Linear                   37      1342   115.0   40.2%
+  RmsNorm                  19       925     0.1    0.0%
+  CachedAttention           6        53   239.3   83.5%
+  Unary                     7        19     5.3    1.9%
+  RelPosBias                1         8     2.4    0.8%
+  Binary                    1         3    11.9    4.2%
+  Embedding                 1         3 25471.8 8892.9%
+dec5.ffn.norm.out    | RmsNorm { x: ValueId(199) |    680.6 |     6144 |      0.0 |     0.0%
+dec3.self            | Ext(Attn(Attention { q: V |    666.7 |  2117632 |      3.2 |     1.1%
+lm_head              | Linear { x: ValueId(210), |    353.9 | 65928704 |    186.3 |    65.0%
+dec0.xo              | Linear { x: ValueId(31),  |    284.1 |  1054720 |      3.7 |     1.3%
+dec0.ffn.norm.out    | RmsNorm { x: ValueId(34), |    175.4 |     6144 |      0.0 |     0.0%
+dec1.xq              | Linear { x: ValueId(59),  |     97.3 |  1052672 |     10.8 |     3.8%
+dec4.xq              | Linear { x: ValueId(158), |     82.4 |  1052672 |     12.8 |     4.5%
+dec5.cross           | Ext(Attn(Attention { q: V |     68.9 |  2103296 |     30.5 |    10.7%
+dec5.self            | Ext(Attn(Attention { q: V |     66.5 |  2117632 |     31.8 |    11.1%
+dec4.cross           | Ext(Attn(Attention { q: V |     64.3 |  2103296 |     32.7 |    11.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      3928    39.3   13.7%
+  Attention                12       737    34.3   12.0%
+  RmsNorm                  19       238     0.5    0.2%
+  CachedAttention           6        38   332.4  116.1%
+  Unary                     7        18     5.8    2.0%
+  Binary                    1         7     5.2    1.8%
+  RelPosBias                1         3     5.8    2.0%
+  Embedding                 1         2 26321.1 9189.4%
+dec3.ffn.mlp.up      | Linear { x: ValueId(135), |   1776.5 |  4204544 |      2.4 |     0.8%
+dec4.ffn.mlp.down    | Linear { x: ValueId(171), |   1070.4 |  4206592 |      3.9 |     1.4%
+lm_head              | Linear { x: ValueId(210), |    350.4 | 65928704 |    188.2 |    65.7%
+dec2.o               | Linear { x: ValueId(87),  |    242.5 |  1054720 |      4.4 |     1.5%
+dec2.xln.out         | RmsNorm { x: ValueId(90), |    170.2 |     6144 |      0.0 |     0.0%
+dec0.self            | Ext(Attn(Attention { q: V |     67.7 |  2117632 |     31.3 |    10.9%
+dec4.cross           | Ext(Attn(Attention { q: V |     66.5 |  2103296 |     31.6 |    11.0%
+dec1.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+dec3.self            | Ext(Attn(Attention { q: V |     60.7 |  2117632 |     34.9 |    12.2%
+dec2.self            | Ext(Attn(Attention { q: V |     60.7 |  2117632 |     34.9 |    12.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      4781    32.3   11.3%
+  Attention                12      1366    18.5    6.5%
+  CachedAttention           6       322    39.2   13.7%
+  RmsNorm                  19       245     0.5    0.2%
+  Unary                     7        17     6.0    2.1%
+  Binary                    1         8     4.2    1.5%
+  RelPosBias                1         3     5.8    2.0%
+  Embedding                 1         2 28201.7 9846.0%
+dec3.ffn.mlp.down    | Linear { x: ValueId(138), |   1758.6 |  4206592 |      2.4 |     0.8%
+dec0.xq              | Linear { x: ValueId(26),  |   1756.0 |  1052672 |      0.6 |     0.2%
+dec4.self            | Ext(Attn(Attention { q: V |    677.3 |  2117632 |      3.1 |     1.1%
+lm_head              | Linear { x: ValueId(210), |    383.9 | 65928704 |    171.7 |    60.0%
+dec4.kv_write        | CachedAttention { q: Valu |    294.0 |  2105348 |      7.2 |     2.5%
+dec1.o               | Linear { x: ValueId(54),  |    241.2 |  1054720 |      4.4 |     1.5%
+dec1.xln.out         | RmsNorm { x: ValueId(57), |    180.8 |     6144 |      0.0 |     0.0%
+dec3.self            | Ext(Attn(Attention { q: V |     81.4 |  2117632 |     26.0 |     9.1%
+dec1.xq              | Linear { x: ValueId(59),  |     76.2 |  1052672 |     13.8 |     4.8%
+dec1.cross           | Ext(Attn(Attention { q: V |     65.1 |  2103296 |     32.3 |    11.3%
+⚡ Prefill: 1 tokens in 41.82ms (23.9 tok/s)
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   28      4631    22.5    7.9%
+  RmsNorm                  13       746     4.6    1.6%
+  Unary                     6       732     8.6    3.0%
+  Copy                     30       320    49.1   17.1%
+  Embedding                 1       181   363.3  126.8%
+  Attention                 6       132    29.9   10.4%
+  RelPosBias                1        19     7.1    2.5%
+  Binary                    1         5    52.5   18.3%
+enc0.ffn.mlp.up      | Linear { x: ValueId(21),  |   1761.3 |  4849664 |      2.8 |     1.0%
+enc2.ffn.mlp.act     | Ext(Elementwise(Unary { x |    690.8 |  1048576 |      1.5 |     0.5%
+enc5.ffn.norm.out    | RmsNorm { x: ValueId(119) |    677.5 |   264192 |      0.4 |     0.1%
+enc5.attn.o          | Linear { x: ValueId(116), |    296.8 |  1441792 |      4.9 |     1.7%
+enc2.ffn.mlp.up      | Linear { x: ValueId(61),  |    273.3 |  4849664 |     17.7 |     6.2%
+enc3.ffn.mlp.down    | Linear { x: ValueId(84),  |    265.5 |  4980736 |     18.8 |     6.5%
+enc4.ffn.mlp.down    | Linear { x: ValueId(104), |    265.2 |  4980736 |     18.8 |     6.6%
+enc0.ffn.mlp.down    | Linear { x: ValueId(24),  |    263.1 |  4980736 |     18.9 |     6.6%
+enc2.ffn.mlp.down    | Linear { x: ValueId(64),  |    259.1 |  4980736 |     19.2 |     6.7%
+enc5.ffn.mlp.down    | Linear { x: ValueId(124), |    258.4 |  4980736 |     19.3 |     6.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      3890    39.7   13.8%
+  RmsNorm                  19       767     0.2    0.1%
+  Attention                12       756    33.5   11.7%
+  Unary                     7        35     2.9    1.0%
+  CachedAttention           6        32   393.7  137.5%
+  Embedding                 1        11  6027.5 2104.3%
+  RelPosBias                1         3     6.0    2.1%
+  Binary                    1         3    12.9    4.5%
+dec5.ffn.mlp.up      | Linear { x: ValueId(201), |   1778.6 |  4204544 |      2.4 |     0.8%
+lm_head              | Linear { x: ValueId(210), |    970.5 | 65928704 |     67.9 |    23.7%
+dec0.ln1.out         | RmsNorm { x: ValueId(5),  |    683.5 |     6144 |      0.0 |     0.0%
+dec3.q.fused_qkv     | Linear { x: ValueId(110), |    681.6 |  3153920 |      4.6 |     1.6%
+dec2.cross           | Ext(Attn(Attention { q: V |     71.5 |  2103296 |     29.4 |    10.3%
+dec0.self            | Ext(Attn(Attention { q: V |     66.2 |  2117632 |     32.0 |    11.2%
+dec2.self            | Ext(Attn(Attention { q: V |     64.8 |  2117632 |     32.7 |    11.4%
+dec3.cross           | Ext(Attn(Attention { q: V |     64.0 |  2103296 |     32.9 |    11.5%
+dec5.cross           | Ext(Attn(Attention { q: V |     63.5 |  2103296 |     33.1 |    11.6%
+dec4.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      1987    77.6   27.1%
+  Attention                12      1005    25.2    8.8%
+  RmsNorm                  19        72     1.6    0.6%
+  CachedAttention           6        31   402.1  140.4%
+  Unary                     7        18     5.8    2.0%
+  RelPosBias                1         4     4.7    1.6%
+  Binary                    1         3    12.3    4.3%
+  Embedding                 1         2 26321.1 9189.4%
+dec5.o               | Linear { x: ValueId(186), |    695.9 |  1054720 |      1.5 |     0.5%
+lm_head              | Linear { x: ValueId(210), |    349.1 | 65928704 |    188.8 |    65.9%
+dec1.xq              | Linear { x: ValueId(59),  |    293.5 |  1052672 |      3.6 |     1.3%
+dec5.self            | Ext(Attn(Attention { q: V |    248.4 |  2117632 |      8.5 |     3.0%
+dec1.cross           | Ext(Attn(Attention { q: V |    143.0 |  2103296 |     14.7 |     5.1%
+dec4.ffn.mlp.down    | Linear { x: ValueId(171), |    115.6 |  4206592 |     36.4 |    12.7%
+dec0.self            | Ext(Attn(Attention { q: V |     65.3 |  2117632 |     32.5 |    11.3%
+dec5.cross           | Ext(Attn(Attention { q: V |     62.6 |  2103296 |     33.6 |    11.7%
+dec1.self            | Ext(Attn(Attention { q: V |     62.1 |  2117632 |     34.1 |    11.9%
+dec2.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  RmsNorm                  19      1986     0.1    0.0%
+  Linear                   37      1602    96.3   33.6%
+  Attention                12       741    34.2   11.9%
+  CachedAttention           6        30   418.7  146.2%
+  Unary                     7        18     5.8    2.0%
+  Binary                    1         5     6.3    2.2%
+  RelPosBias                1         3     5.6    1.9%
+  Embedding                 1         2 27706.8 9673.2%
+dec2.xln.out         | RmsNorm { x: ValueId(90), |   1758.3 |     6144 |      0.0 |     0.0%
+lm_head              | Linear { x: ValueId(210), |    442.0 | 65928704 |    149.2 |    52.1%
+dec2.xo              | Linear { x: ValueId(97),  |    311.3 |  1054720 |      3.4 |     1.2%
+dec1.q.fused_qkv     | Linear { x: ValueId(44),  |    290.3 |  3153920 |     10.9 |     3.8%
+dec2.ffn.norm.out    | RmsNorm { x: ValueId(100) |    170.4 |     6144 |      0.0 |     0.0%
+dec0.self            | Ext(Attn(Attention { q: V |     65.8 |  2117632 |     32.2 |    11.2%
+dec3.cross           | Ext(Attn(Attention { q: V |     65.6 |  2103296 |     32.1 |    11.2%
+dec5.cross           | Ext(Attn(Attention { q: V |     64.5 |  2103296 |     32.6 |    11.4%
+dec4.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+dec5.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Attention                12      2514    10.1    3.5%
+  Linear                   37      1102   140.0   48.9%
+  RmsNorm                  19      1027     0.1    0.0%
+  CachedAttention           6       262    48.2   16.8%
+  Unary                     7        83     1.2    0.4%
+  RelPosBias                1         4     4.4    1.5%
+  Binary                    1         3    12.3    4.3%
+  Embedding                 1         2 27706.8 9673.2%
+dec2.cross           | Ext(Attn(Attention { q: V |   1755.2 |  2103296 |      1.2 |     0.4%
+dec3.ln1.out         | RmsNorm { x: ValueId(108) |    727.4 |     6144 |      0.0 |     0.0%
+lm_head              | Linear { x: ValueId(210), |    347.6 | 65928704 |    189.7 |    66.2%
+dec2.ffn.norm.out    | RmsNorm { x: ValueId(100) |    242.2 |     6144 |      0.0 |     0.0%
+dec4.kv_write        | CachedAttention { q: Valu |    236.8 |  2105348 |      8.9 |     3.1%
+dec2.ffn.mlp.up      | Linear { x: ValueId(102), |    163.8 |  4204544 |     25.7 |     9.0%
+dec4.self            | Ext(Attn(Attention { q: V |    137.8 |  2117632 |     15.4 |     5.4%
+dec2.xo              | Linear { x: ValueId(97),  |    114.5 |  1054720 |      9.2 |     3.2%
+dec2.self            | Ext(Attn(Attention { q: V |     67.5 |  2117632 |     31.4 |    11.0%
+dec2.ffn.mlp.act     | Ext(Elementwise(Unary { x |     65.7 |    16384 |      0.2 |     0.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      1644    93.8   32.8%
+  Attention                12       953    26.6    9.3%
+  RmsNorm                  19        68     1.7    0.6%
+  CachedAttention           6        35   356.7  124.5%
+  Unary                     7        19     5.5    1.9%
+  RelPosBias                1         3     5.6    1.9%
+  Binary                    1         3    13.3    4.6%
+  Embedding                 1         2 27704.1 9672.2%
+dec1.o               | Linear { x: ValueId(54),  |    679.2 |  1054720 |      1.6 |     0.5%
+lm_head              | Linear { x: ValueId(210), |    348.0 | 65928704 |    189.5 |    66.1%
+dec1.self            | Ext(Attn(Attention { q: V |    283.2 |  2117632 |      7.5 |     2.6%
+dec3.ffn.mlp.up      | Linear { x: ValueId(135), |    120.8 |  4204544 |     34.8 |    12.1%
+dec2.self            | Ext(Attn(Attention { q: V |     62.1 |  2117632 |     34.1 |    11.9%
+dec0.self            | Ext(Attn(Attention { q: V |     61.6 |  2117632 |     34.4 |    12.0%
+dec5.self            | Ext(Attn(Attention { q: V |     61.4 |  2117632 |     34.5 |    12.0%
+dec3.self            | Ext(Attn(Attention { q: V |     61.3 |  2117632 |     34.6 |    12.1%
+dec4.self            | Ext(Attn(Attention { q: V |     61.2 |  2117632 |     34.6 |    12.1%
+dec2.cross           | Ext(Attn(Attention { q: V |     60.5 |  2103296 |     34.8 |    12.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      3211    48.0   16.8%
+  Attention                12      1434    17.7    6.2%
+  RmsNorm                  19       378     0.3    0.1%
+  CachedAttention           6        39   324.9  113.4%
+  Unary                     7        23     4.5    1.6%
+  RelPosBias                1         3     5.6    2.0%
+  Binary                    1         3    12.1    4.2%
+  Embedding                 1         2 26321.1 9189.4%
+dec2.ffn.mlp.down    | Linear { x: ValueId(105), |   1764.0 |  4206592 |      2.4 |     0.8%
+dec1.cross           | Ext(Attn(Attention { q: V |    764.4 |  2103296 |      2.8 |     1.0%
+lm_head              | Linear { x: ValueId(210), |    353.9 | 65928704 |    186.3 |    65.0%
+dec1.xln.out         | RmsNorm { x: ValueId(57), |    313.2 |     6144 |      0.0 |     0.0%
+dec5.q.fused_qkv     | Linear { x: ValueId(176), |    265.9 |  3153920 |     11.9 |     4.1%
+dec1.o               | Linear { x: ValueId(54),  |    193.7 |  1054720 |      5.4 |     1.9%
+dec0.ffn.mlp.up      | Linear { x: ValueId(36),  |    168.8 |  4204544 |     24.9 |     8.7%
+dec1.self            | Ext(Attn(Attention { q: V |     63.9 |  2117632 |     33.2 |    11.6%
+dec2.cross           | Ext(Attn(Attention { q: V |     63.0 |  2103296 |     33.4 |    11.6%
+dec0.self            | Ext(Attn(Attention { q: V |     61.5 |  2117632 |     34.4 |    12.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      1866    82.7   28.9%
+  RmsNorm                  19      1830     0.1    0.0%
+  Attention                12       736    34.4   12.0%
+  CachedAttention           6        34   375.7  131.2%
+  Unary                     7        18     5.9    2.0%
+  RelPosBias                1         3     5.8    2.0%
+  Binary                    1         3    12.7    4.4%
+  Embedding                 1         3 26318.7 9188.5%
+dec3.xln.out         | RmsNorm { x: ValueId(123) |   1765.9 |     6144 |      0.0 |     0.0%
+dec3.xo              | Linear { x: ValueId(130), |    874.2 |  1054720 |      1.2 |     0.4%
+lm_head              | Linear { x: ValueId(210), |    411.6 | 65928704 |    160.2 |    55.9%
+dec3.cross           | Ext(Attn(Attention { q: V |     69.1 |  2103296 |     30.4 |    10.6%
+dec4.self            | Ext(Attn(Attention { q: V |     62.7 |  2117632 |     33.7 |    11.8%
+dec1.self            | Ext(Attn(Attention { q: V |     62.2 |  2117632 |     34.0 |    11.9%
+dec5.self            | Ext(Attn(Attention { q: V |     61.4 |  2117632 |     34.5 |    12.0%
+dec2.self            | Ext(Attn(Attention { q: V |     60.6 |  2117632 |     34.9 |    12.2%
+dec0.self            | Ext(Attn(Attention { q: V |     60.6 |  2117632 |     35.0 |    12.2%
+dec3.self            | Ext(Attn(Attention { q: V |     60.5 |  2117632 |     35.0 |    12.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Binary                    1      1742     0.0    0.0%
+  Linear                   37      1325   116.4   40.6%
+  Attention                12       741    34.2   11.9%
+  Unary                     7       283     0.4    0.1%
+  RmsNorm                  19       245     0.5    0.2%
+  CachedAttention           6        39   325.3  113.6%
+  RelPosBias                1         7     2.9    1.0%
+  Embedding                 1         3 26318.7 9188.5%
+dec0.relmask         | Ext(Elementwise(Binary {  |   1742.4 |    34816 |      0.0 |     0.0%
+lm_head              | Linear { x: ValueId(210), |    350.1 | 65928704 |    188.3 |    65.7%
+dec3.ffn.mlp.act     | Ext(Elementwise(Unary { x |    267.2 |    16384 |      0.1 |     0.0%
+dec0.o               | Linear { x: ValueId(21),  |    252.9 |  1054720 |      4.2 |     1.5%
+dec3.ffn.mlp.down    | Linear { x: ValueId(138), |    187.8 |  4206592 |     22.4 |     7.8%
+dec0.xln.out         | RmsNorm { x: ValueId(24), |    181.9 |     6144 |      0.0 |     0.0%
+dec3.self            | Ext(Attn(Attention { q: V |     68.0 |  2117632 |     31.1 |    10.9%
+dec1.self            | Ext(Attn(Attention { q: V |     64.8 |  2117632 |     32.7 |    11.4%
+dec2.self            | Ext(Attn(Attention { q: V |     61.5 |  2117632 |     34.4 |    12.0%
+dec4.self            | Ext(Attn(Attention { q: V |     61.4 |  2117632 |     34.5 |    12.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  Linear                   37      2122    72.7   25.4%
+  Attention                12       761    33.3   11.6%
+  RmsNorm                  19       189     0.6    0.2%
+  Unary                     7        38     2.7    0.9%
+  CachedAttention           6        35   361.3  126.2%
+  RelPosBias                1         8     2.3    0.8%
+  Binary                    1         3    11.8    4.1%
+  Embedding                 1         2 28201.7 9846.0%
+dec5.ffn.mlp.down    | Linear { x: ValueId(204), |    708.4 |  4206592 |      5.9 |     2.1%
+lm_head              | Linear { x: ValueId(210), |    347.8 | 65928704 |    189.6 |    66.2%
+dec2.ffn.mlp.up      | Linear { x: ValueId(102), |    291.4 |  4204544 |     14.4 |     5.0%
+dec1.ffn.mlp.up      | Linear { x: ValueId(69),  |    124.7 |  4204544 |     33.7 |    11.8%
+dec2.ffn.norm.out    | RmsNorm { x: ValueId(100) |    123.6 |     6144 |      0.0 |     0.0%
+dec2.xq              | Linear { x: ValueId(92),  |    102.7 |  1052672 |     10.2 |     3.6%
+dec4.ffn.mlp.down    | Linear { x: ValueId(171), |    101.0 |  4206592 |     41.6 |    14.5%
+dec2.self            | Ext(Attn(Attention { q: V |     84.3 |  2117632 |     25.1 |     8.8%
+dec5.cross           | Ext(Attn(Attention { q: V |     66.5 |  2103296 |     31.6 |    11.0%
+dec3.cross           | Ext(Attn(Attention { q: V |     63.4 |  2103296 |     33.2 |    11.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  RmsNorm                  19      1805     0.1    0.0%
+  Linear                   37       900   171.4   59.8%
+  Attention                12       724    35.0   12.2%
+  CachedAttention           6        36   352.9  123.2%
+  Unary                     7        19     5.3    1.9%
+  RelPosBias                1         3     5.9    2.1%
+  Binary                    1         3    12.1    4.2%
+  Embedding                 1         2 27704.1 9672.2%
+dec4.xln.out         | RmsNorm { x: ValueId(156) |   1740.6 |     6144 |      0.0 |     0.0%
+lm_head              | Linear { x: ValueId(210), |    348.6 | 65928704 |    189.1 |    66.0%
+dec4.self            | Ext(Attn(Attention { q: V |     64.1 |  2117632 |     33.0 |    11.5%
+dec5.ffn.mlp.up      | Linear { x: ValueId(201), |     63.2 |  4204544 |     66.6 |    23.2%
+dec3.self            | Ext(Attn(Attention { q: V |     60.7 |  2117632 |     34.9 |    12.2%
+dec1.self            | Ext(Attn(Attention { q: V |     60.6 |  2117632 |     34.9 |    12.2%
+dec0.self            | Ext(Attn(Attention { q: V |     60.6 |  2117632 |     34.9 |    12.2%
+dec2.self            | Ext(Attn(Attention { q: V |     60.6 |  2117632 |     35.0 |    12.2%
+dec5.self            | Ext(Attn(Attention { q: V |     60.5 |  2117632 |     35.0 |    12.2%
+dec4.cross           | Ext(Attn(Attention { q: V |     60.1 |  2103296 |     35.0 |    12.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  RmsNorm                  19      1846     0.1    0.0%
+  Linear                   37      1679    91.9   32.1%
+  Attention                12      1277    19.8    6.9%
+  CachedAttention           6        44   288.5  100.7%
+  Unary                     7        29     3.6    1.2%
+  RelPosBias                1         3     6.0    2.1%
+  Binary                    1         3    12.7    4.4%
+  Embedding                 1         3 25469.5 8892.1%
+dec5.ln1.out         | RmsNorm { x: ValueId(174) |   1769.9 |     6144 |      0.0 |     0.0%
+dec5.o               | Linear { x: ValueId(186), |    709.2 |  1054720 |      1.5 |     0.5%
+dec3.self            | Ext(Attn(Attention { q: V |    395.6 |  2117632 |      5.4 |     1.9%

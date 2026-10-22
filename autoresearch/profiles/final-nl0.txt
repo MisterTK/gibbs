@@ -1,0 +1,436 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     41882    17.3    6.0%
+  Binary                    1      2642     0.4    0.1%
+  Attention                23      2474    11.7    4.1%
+  LayerNorm                47       337    89.1   31.1%
+  Embed                     2        21  4770.8 1665.6%
+  Gather                    1         3   111.1   38.8%
+l0.fc2               | GemmBatchedPacked { x: Va |   3015.7 | 10285056 |      3.4 |     1.2%
+embed                | Ext(Elementwise(Binary {  |   2642.4 |   946176 |      0.4 |     0.1%
+l4.fc2               | GemmBatchedPacked { x: Va |   2270.6 | 10285056 |      4.5 |     1.6%
+l22.fc2              | GemmBatchedPacked { x: Va |   1881.8 | 10285056 |      5.5 |     1.9%
+l17.fc1              | GemmBatchedPacked { x: Va |   1842.4 |  9981952 |      5.4 |     1.9%
+l12.attn.k           | GemmBatchedPacked { x: Va |   1823.3 |  2732032 |      1.5 |     0.5%
+l6.fc2               | GemmBatchedPacked { x: Va |   1304.8 | 10285056 |      7.9 |     2.8%
+l4.attn.attn         | Ext(Attn(Attention { q: V |    977.5 |  1261568 |      1.3 |     0.5%
+l12.attn.attn        | Ext(Attn(Attention { q: V |    915.7 |  1261568 |      1.4 |     0.5%
+l9.fc2               | GemmBatchedPacked { x: Va |    885.5 | 10285056 |     11.6 |     4.1%
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    219449    12.0    4.2%
+  GemmBatchedPacked       160     77594    25.7    9.0%
+  Attention                32     53894     5.3    1.8%
+  Copy                    124     17552   112.5   39.3%
+  Binary                   76      7733   120.8   42.2%
+  Group                    61      6528    55.3   19.3%
+  Unary                    61      5013   127.2   44.4%
+  LayerNorm                48      2592   107.0   37.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15224.5 | 35719680 |      2.3 |     0.8%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15052.8 | 69473280 |      4.6 |     1.6%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  11384.0 | 20971520 |      1.8 |     0.6%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  10751.6 | 32032000 |      3.0 |     1.0%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9620.4 | 54725120 |      5.7 |     2.0%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9409.7 | 37358080 |      4.0 |     1.4%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9409.2 | 20971520 |      2.2 |     0.8%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8792.5 | 20971520 |      2.4 |     0.8%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7755.6 | 121902080 |     15.7 |     5.5%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7739.0 | 20971520 |      2.7 |     0.9%
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   1046940     4.8    1.7%
+  Group                    30     64219    57.2   20.0%
+  Binary                   15     28881    78.4   27.4%
+  Unary                    29     22671   161.3   56.3%
+  Upsample                  3     16508    33.0   11.5%
+  Attention                 1      9254     3.6    1.3%
+  Copy                      2      2732    12.3    4.3%
+  GemmBatchedPacked         4      1659    41.7   14.6%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 135581.1 | 277874688 |      2.0 |     0.7%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 126545.6 | 539231232 |      4.3 |     1.5%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  65436.2 | 206046208 |      3.1 |     1.1%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  64585.2 | 403833344 |      6.3 |     2.2%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  39140.0 | 76548096 |      2.0 |     0.7%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  37870.8 | 76548096 |      2.0 |     0.7%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  36751.7 | 76548096 |      2.1 |     0.7%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  35388.5 | 76548096 |      2.2 |     0.8%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33197.8 | 76548096 |      2.3 |     0.8%
+up3.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32479.5 | 269025792 |      8.3 |     2.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     34554    21.0    7.3%
+  LayerNorm                47      3091     9.7    3.4%
+  Attention                23       560    51.8   18.1%
+  Embed                     2         6 17735.1 6191.8%
+  Binary                    1         4   222.6   77.7%
+  Gather                    1         3   116.2   40.6%
+l20.attn.v           | GemmBatchedPacked { x: Va |   1900.9 |  2732032 |      1.4 |     0.5%
+l7.attn.k            | GemmBatchedPacked { x: Va |   1862.4 |  2732032 |      1.5 |     0.5%
+l2.attn.o            | GemmBatchedPacked { x: Va |   1850.8 |  3047424 |      1.6 |     0.6%
+l15.ln1.out          | LayerNorm { x: ValueId(42 |   1695.8 |   638976 |      0.4 |     0.1%
+l20.fc1              | GemmBatchedPacked { x: Va |   1177.3 |  9981952 |      8.5 |     3.0%
+l3.attn.k            | GemmBatchedPacked { x: Va |   1110.2 |  2732032 |      2.5 |     0.9%
+l0.fc2               | GemmBatchedPacked { x: Va |    963.9 | 10285056 |     10.7 |     3.7%
+l18.ln1.out          | LayerNorm { x: ValueId(51 |    806.4 |   638976 |      0.8 |     0.3%
+l3.attn.v            | GemmBatchedPacked { x: Va |    772.5 |  2732032 |      3.5 |     1.2%
+l18.attn.k           | GemmBatchedPacked { x: Va |    704.5 |  2732032 |      3.9 |     1.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    231563    11.4    4.0%
+  GemmBatchedPacked       160     74509    26.8    9.4%
+  Attention                32     49875     5.7    2.0%
+  Copy                    124     15572   126.8   44.3%
+  Unary                    61      9477    67.3   23.5%
+  Binary                   76      7774   120.1   41.9%
+  Group                    61      4553    79.3   27.7%
+  LayerNorm                48      4535    61.2   21.4%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  18267.4 | 69473280 |      3.8 |     1.3%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  13923.1 | 35719680 |      2.6 |     0.9%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  11870.2 | 32032000 |      2.7 |     0.9%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  10925.8 | 54725120 |      5.0 |     1.7%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9800.5 | 20971520 |      2.1 |     0.7%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9232.4 | 20971520 |      2.3 |     0.8%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8587.7 | 37358080 |      4.4 |     1.5%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8276.0 | 20971520 |      2.5 |     0.9%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7849.8 | 23102720 |      2.9 |     1.0%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7794.8 | 20971520 |      2.7 |     0.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   1031534     4.9    1.7%
+  Group                    30     69382    53.0   18.5%
+  Unary                    29     22686   161.2   56.3%
+  Binary                   15     16421   137.9   48.2%
+  Upsample                  3     11966    45.6   15.9%
+  Attention                 1      9361     3.6    1.3%
+  GemmBatchedPacked         4      2476    28.0    9.8%
+  Copy                      2       354    94.7   33.0%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 127098.5 | 277874688 |      2.2 |     0.8%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 126154.9 | 539231232 |      4.3 |     1.5%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  65510.6 | 206046208 |      3.1 |     1.1%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  64125.5 | 403833344 |      6.3 |     2.2%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  35837.0 | 76548096 |      2.1 |     0.7%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  35682.2 | 76548096 |      2.1 |     0.7%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  35428.4 | 76548096 |      2.2 |     0.8%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va |  35372.9 | 76548096 |      2.2 |     0.8%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34421.2 | 76548096 |      2.2 |     0.8%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32598.9 | 76548096 |      2.3 |     0.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     34734    20.9    7.3%
+  LayerNorm                47      1015    29.6   10.3%
+  Attention                23       552    52.6   18.4%
+  Embed                     2         6 17357.7 6060.0%
+  Binary                    1         4   227.1   79.3%
+  Gather                    1         3   116.2   40.6%
+l14.fc2              | GemmBatchedPacked { x: Va |   2202.7 | 10285056 |      4.7 |     1.6%
+l17.attn.o           | GemmBatchedPacked { x: Va |   1907.5 |  3047424 |      1.6 |     0.6%
+l4.attn.o            | GemmBatchedPacked { x: Va |   1861.3 |  3047424 |      1.6 |     0.6%
+l12.attn.v           | GemmBatchedPacked { x: Va |   1757.8 |  2732032 |      1.6 |     0.5%
+l10.fc1              | GemmBatchedPacked { x: Va |   1191.1 |  9981952 |      8.4 |     2.9%
+l1.fc2               | GemmBatchedPacked { x: Va |   1075.1 | 10285056 |      9.6 |     3.3%
+l13.ln2.out          | LayerNorm { x: ValueId(38 |    743.4 |   638976 |      0.9 |     0.3%
+l8.attn.v            | GemmBatchedPacked { x: Va |    683.1 |  2732032 |      4.0 |     1.4%
+l22.fc2              | GemmBatchedPacked { x: Va |    482.0 | 10285056 |     21.3 |     7.4%
+l16.fc2              | GemmBatchedPacked { x: Va |    465.1 | 10285056 |     22.1 |     7.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    215716    12.2    4.3%
+  GemmBatchedPacked       160     81356    24.6    8.6%
+  Attention                32     46478     6.1    2.1%
+  Copy                    124     16280   121.3   42.3%
+  Group                    61      7163    50.4   17.6%
+  Binary                   76      6634   140.8   49.2%
+  LayerNorm                48      6438    43.1   15.0%
+  Unary                    61      5776   110.4   38.5%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  17304.0 | 69473280 |      4.0 |     1.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  13427.3 | 35719680 |      2.7 |     0.9%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  12868.9 | 32032000 |      2.5 |     0.9%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9778.6 | 54725120 |      5.6 |     2.0%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8300.0 | 20971520 |      2.5 |     0.9%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8164.0 | 20971520 |      2.6 |     0.9%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7832.4 | 121902080 |     15.6 |     5.4%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7784.1 | 20971520 |      2.7 |     0.9%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7569.0 | 20971520 |      2.8 |     1.0%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7446.9 | 20971520 |      2.8 |     1.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    220472    12.0    4.2%
+  GemmBatchedPacked       160     73305    27.2    9.5%
+  Attention                32     51752     5.5    1.9%
+  Copy                    124     16735   118.0   41.2%
+  Group                    61      8594    42.0   14.7%
+  Binary                   76      5979   156.2   54.5%
+  Unary                    61      4116   154.9   54.1%
+  LayerNorm                48      2089   132.8   46.4%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  18871.4 | 69473280 |      3.7 |     1.3%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  13013.1 | 35719680 |      2.7 |     1.0%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  12955.4 | 54725120 |      4.2 |     1.5%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  11430.0 | 32032000 |      2.8 |     1.0%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9774.8 | 20971520 |      2.1 |     0.7%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9210.6 | 20971520 |      2.3 |     0.8%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8855.5 | 20971520 |      2.4 |     0.8%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8459.5 | 20971520 |      2.5 |     0.9%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8240.3 | 20971520 |      2.5 |     0.9%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7566.2 | 121902080 |     16.1 |     5.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    214965    12.3    4.3%
+  GemmBatchedPacked       160     72512    27.5    9.6%
+  Attention                32     60851     4.7    1.6%
+  Copy                    124     15247   129.5   45.2%
+  Binary                   76     11541    80.9   28.3%
+  LayerNorm                48      7385    37.6   13.1%
+  Group                    61      7231    49.9   17.4%
+  Unary                    61      5352   119.1   41.6%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  16529.6 | 69473280 |      4.2 |     1.5%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  14977.5 | 35719680 |      2.4 |     0.8%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  13007.5 | 54725120 |      4.2 |     1.5%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  10594.6 | 20971520 |      2.0 |     0.7%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  10286.2 | 20971520 |      2.0 |     0.7%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9829.0 | 20971520 |      2.1 |     0.7%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9588.5 | 32032000 |      3.3 |     1.2%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8662.8 | 121902080 |     14.1 |     4.9%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8653.7 | 20971520 |      2.4 |     0.8%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7862.8 | 20971520 |      2.7 |     0.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    213884    12.3    4.3%
+  GemmBatchedPacked       160     75235    26.5    9.3%
+  Attention                32     53364     5.3    1.9%
+  Copy                    124     23155    85.2   29.8%
+  Unary                    61      6759    94.3   32.9%
+  Group                    61      5946    60.7   21.2%
+  Binary                   76      5079   183.9   64.2%
+  GemvPacked               24      3621    15.5    5.4%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  18501.2 | 69473280 |      3.8 |     1.3%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  12218.0 | 35719680 |      2.9 |     1.0%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  12114.5 | 54725120 |      4.5 |     1.6%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9957.1 | 32032000 |      3.2 |     1.1%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9777.6 | 20971520 |      2.1 |     0.7%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9522.0 | 20971520 |      2.2 |     0.8%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8982.1 | 20971520 |      2.3 |     0.8%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8677.1 | 20971520 |      2.4 |     0.8%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8546.6 | 121902080 |     14.3 |     5.0%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7673.0 | 20971520 |      2.7 |     1.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   1043113     4.8    1.7%
+  Group                    30     68098    54.0   18.8%
+  Binary                   15     17950   126.2   44.1%
+  Unary                    29     17635   207.4   72.4%
+  Upsample                  3     16364    33.3   11.6%
+  Attention                 1     10057     3.3    1.2%
+  GemmBatchedPacked         4      2356    29.4   10.3%
+  Copy                      2       272   123.2   43.0%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 131297.3 | 277874688 |      2.1 |     0.7%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 121085.0 | 539231232 |      4.5 |     1.6%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  69743.9 | 206046208 |      3.0 |     1.0%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  63411.7 | 403833344 |      6.4 |     2.2%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  39219.3 | 76548096 |      2.0 |     0.7%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  37914.1 | 76548096 |      2.0 |     0.7%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33387.3 | 76548096 |      2.3 |     0.8%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  32863.8 | 76548096 |      2.3 |     0.8%
+up3.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  32793.6 | 269025792 |      8.2 |     2.9%
+up0.upconv.out       | Ext(Conv(ConvGemm { x: Va |  32437.9 | 76548096 |      2.4 |     0.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     28634    25.3    8.8%
+  Attention                23      1239    23.4    8.2%
+  LayerNorm                47       764    39.3   13.7%
+  Embed                     2        12  8803.9 3073.7%
+  Binary                    1         4   222.6   77.7%
+  Gather                    1         3   116.2   40.6%
+l2.attn.k            | GemmBatchedPacked { x: Va |   1894.9 |  2732032 |      1.4 |     0.5%
+l20.fc2              | GemmBatchedPacked { x: Va |   1080.8 | 10285056 |      9.5 |     3.3%
+l18.attn.attn        | Ext(Attn(Attention { q: V |    717.2 |  1261568 |      1.8 |     0.6%
+l15.attn.v           | GemmBatchedPacked { x: Va |    706.4 |  2732032 |      3.9 |     1.4%
+l2.fc2               | GemmBatchedPacked { x: Va |    592.8 | 10285056 |     17.4 |     6.1%
+l8.fc2               | GemmBatchedPacked { x: Va |    481.5 | 10285056 |     21.4 |     7.5%
+l17.fc2              | GemmBatchedPacked { x: Va |    470.8 | 10285056 |     21.8 |     7.6%
+l9.fc2               | GemmBatchedPacked { x: Va |    448.0 | 10285056 |     23.0 |     8.0%
+l18.attn.k           | GemmBatchedPacked { x: Va |    447.2 |  2732032 |      6.1 |     2.1%
+l21.fc2              | GemmBatchedPacked { x: Va |    440.3 | 10285056 |     23.4 |     8.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    219376    12.0    4.2%
+  GemmBatchedPacked       160     73839    27.1    9.4%
+  Attention                32     53944     5.3    1.8%
+  Copy                    124     17885   110.4   38.5%
+  Group                    61      8573    42.1   14.7%
+  Binary                   76      4071   229.4   80.1%
+  LayerNorm                48      3040    91.3   31.9%
+  Unary                    61      2200   289.8  101.2%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  17774.8 | 69473280 |      3.9 |     1.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  15138.3 | 35719680 |      2.4 |     0.8%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  11638.6 | 32032000 |      2.8 |     1.0%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  10943.7 | 54725120 |      5.0 |     1.7%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  10608.0 | 121902080 |     11.5 |     4.0%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9935.4 | 20971520 |      2.1 |     0.7%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9778.5 | 20971520 |      2.1 |     0.7%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8913.5 | 121902080 |     13.7 |     4.8%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7893.4 | 20971520 |      2.7 |     0.9%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7791.1 | 20971520 |      2.7 |     0.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   1035029     4.8    1.7%
+  Group                    30     71541    51.4   17.9%
+  Binary                   15     26311    86.1   30.1%
+  Unary                    29     17669   207.0   72.3%
+  Upsample                  3     13142    41.5   14.5%
+  Attention                 1     10232     3.3    1.1%
+  GemmBatchedPacked         4      3260    21.2    7.4%
+  Copy                      2       300   111.7   39.0%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 135480.4 | 277874688 |      2.1 |     0.7%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 125095.3 | 539231232 |      4.3 |     1.5%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  63371.0 | 403833344 |      6.4 |     2.2%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  62861.6 | 206046208 |      3.3 |     1.1%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  35679.7 | 76548096 |      2.1 |     0.7%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33892.1 | 136578048 |      4.0 |     1.4%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33349.5 | 76548096 |      2.3 |     0.8%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  32909.4 | 76548096 |      2.3 |     0.8%
+up1.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32537.5 | 76548096 |      2.4 |     0.8%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  32354.7 | 76548096 |      2.4 |     0.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       138     28384    25.5    8.9%
+  LayerNorm                47      2663    11.3    3.9%
+  Attention                23      2560    11.3    4.0%
+  Embed                     2        18  5678.5 1982.5%
+  Binary                    1         4   220.5   77.0%
+  Gather                    1         3   116.2   40.6%
+l3.fc2               | GemmBatchedPacked { x: Va |   1952.1 | 10285056 |      5.3 |     1.8%
+l22.attn.attn        | Ext(Attn(Attention { q: V |   1782.3 |  1261568 |      0.7 |     0.2%
+l6.ln2.out           | LayerNorm { x: ValueId(19 |   1677.8 |   638976 |      0.4 |     0.1%
+l9.fc2               | GemmBatchedPacked { x: Va |    822.3 | 10285056 |     12.5 |     4.4%
+l3.attn.o            | GemmBatchedPacked { x: Va |    710.8 |  3047424 |      4.3 |     1.5%
+l16.ln2.out          | LayerNorm { x: ValueId(47 |    701.4 |   638976 |      0.9 |     0.3%
+l11.fc2              | GemmBatchedPacked { x: Va |    684.0 | 10285056 |     15.0 |     5.2%
+l21.fc1              | GemmBatchedPacked { x: Va |    654.1 |  9981952 |     15.3 |     5.3%
+l21.fc2              | GemmBatchedPacked { x: Va |    467.4 | 10285056 |     22.0 |     7.7%
+l16.attn.o           | GemmBatchedPacked { x: Va |    456.5 |  3047424 |      6.7 |     2.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    215367    12.2    4.3%
+  GemmBatchedPacked       160     67736    29.5   10.3%
+  Attention                32     51006     5.6    2.0%
+  Copy                    124     21037    93.8   32.8%
+  LayerNorm                48      9769    28.4    9.9%
+  Unary                    61      8833    72.2   25.2%
+  Group                    61      7588    47.6   16.6%
+  Binary                   76      4870   191.8   67.0%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  17515.2 | 69473280 |      4.0 |     1.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  14837.1 | 35719680 |      2.4 |     0.8%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9876.1 | 32032000 |      3.2 |     1.1%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9664.3 | 121902080 |     12.6 |     4.4%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   9497.1 | 54725120 |      5.8 |     2.0%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9434.7 | 20971520 |      2.2 |     0.8%
+up2.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8788.4 | 37358080 |      4.3 |     1.5%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8221.9 | 20971520 |      2.6 |     0.9%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8203.2 | 20971520 |      2.6 |     0.9%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7993.0 | 121902080 |     15.3 |     5.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    217831    12.1    4.2%
+  GemmBatchedPacked       160     75543    26.4    9.2%
+  Attention                32     50937     5.6    2.0%
+  Copy                    124     15767   125.2   43.7%
+  Group                    61      6315    57.2   20.0%
+  LayerNorm                48      4964    55.9   19.5%
+  Unary                    61      4013   158.9   55.5%
+  Binary                   76      3588   260.3   90.9%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  16895.4 | 69473280 |      4.1 |     1.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  13933.8 | 35719680 |      2.6 |     0.9%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  12204.5 | 54725120 |      4.5 |     1.6%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  10991.5 | 32032000 |      2.9 |     1.0%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9242.9 | 20971520 |      2.3 |     0.8%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9219.6 | 20971520 |      2.3 |     0.8%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9207.0 | 20971520 |      2.3 |     0.8%
+up1.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8271.4 | 121902080 |     14.7 |     5.1%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8214.5 | 20971520 |      2.6 |     0.9%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   7709.5 | 20971520 |      2.7 |     0.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    220195    12.0    4.2%
+  GemmBatchedPacked       160     74229    26.9    9.4%
+  Attention                32     52273     5.5    1.9%
+  Copy                    124     19061   103.6   36.2%
+  Group                    61      8617    41.9   14.6%
+  Binary                   76      4047   230.8   80.6%
+  LayerNorm                48      3609    76.9   26.8%
+  Unary                    61      2906   219.4   76.6%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  17780.0 | 69473280 |      3.9 |     1.4%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  14752.3 | 35719680 |      2.4 |     0.8%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  12406.2 | 54725120 |      4.4 |     1.5%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  10422.7 | 20971520 |      2.0 |     0.7%
+down0.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  10421.3 | 20971520 |      2.0 |     0.7%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8649.7 | 32032000 |      3.7 |     1.3%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8479.2 | 20971520 |      2.5 |     0.9%
+up1.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8218.6 | 121902080 |     14.8 |     5.2%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8086.4 | 20971520 |      2.6 |     0.9%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7909.9 | 23102720 |      2.9 |     1.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 66    212840    12.4    4.3%
+  GemmBatchedPacked       160     65357    30.6   10.7%
+  Attention                32     55356     5.1    1.8%
+  Copy                    124     20018    98.6   34.4%
+  Binary                   76      7519   124.2   43.4%
+  Group                    61      5920    61.0   21.3%
+  Unary                    61      4530   140.8   49.1%
+  LayerNorm                48      3826    72.5   25.3%
+up1.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  14956.3 | 69473280 |      4.6 |     1.6%
+up2.upsample_conv.conv | Ext(Conv(ConvGemm { x: Va |  12074.5 | 35719680 |      3.0 |     1.0%
+up3.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  11928.4 | 32032000 |      2.7 |     0.9%
+up3.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  10709.4 | 20971520 |      2.0 |     0.7%
+up2.0.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |  10286.2 | 54725120 |      5.3 |     1.9%
+down0.0.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |  10097.5 | 20971520 |      2.1 |     0.7%
+up3.1.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   9848.9 | 20971520 |      2.1 |     0.7%
+up3.1.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   8633.6 | 23102720 |      2.7 |     0.9%
+up3.2.attn.block0.attn1.attn | Ext(Attn(Attention { q: V |   8297.8 | 20971520 |      2.5 |     0.9%
+up3.2.res.conv1.conv | Ext(Conv(ConvGemm { x: Va |   7594.6 | 23102720 |      3.0 |     1.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  ConvGemm                 36   1054111     4.7    1.7%
+  Group                    30     71088    51.7   18.0%
+  Unary                    29     19169   190.8   66.6%
+  Binary                   15     16458   137.6   48.0%
+  Upsample                  3     15856    34.4   12.0%
+  Attention                 1     10679     3.1    1.1%
+  GemmBatchedPacked         4      1712    40.4   14.1%
+  Copy                      2       367    91.4   31.9%
+up1.upconv.out       | Ext(Conv(ConvGemm { x: Va | 139584.4 | 277874688 |      2.0 |     0.7%
+up2.upconv.out       | Ext(Conv(ConvGemm { x: Va | 120233.5 | 539231232 |      4.5 |     1.6%
+up2.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  64677.3 | 206046208 |      3.2 |     1.1%
+up3.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  63636.5 | 403833344 |      6.3 |     2.2%
+up1.res1.conv1.out   | Ext(Conv(ConvGemm { x: Va |  39116.0 | 76548096 |      2.0 |     0.7%
+up1.res2.conv2.out   | Ext(Conv(ConvGemm { x: Va |  37257.0 | 76548096 |      2.1 |     0.7%
+up1.res1.conv2.out   | Ext(Conv(ConvGemm { x: Va |  35977.9 | 76548096 |      2.1 |     0.7%
+up1.res0.conv1.out   | Ext(Conv(ConvGemm { x: Va |  34237.6 | 76548096 |      2.2 |     0.8%
+up1.res2.conv1.out   | Ext(Conv(ConvGemm { x: Va |  33797.6 | 76548096 |      2.3 |     0.8%
+up2.res0.conv2.out   | Ext(Conv(ConvGemm { x: Va |  33303.1 | 136578048 |      4.1 |     1.4%
+{"model":"stabilityai/sd-turbo","kind":"image","width":512,"height":512,"steps":4,"s_per_step":0.9838046526666666,"fixed_s":2.606974222333333,"rss_gb":14.817869824}
+METRIC sd-turbo_s_per_step=0.9838

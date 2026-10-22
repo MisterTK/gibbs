@@ -1,0 +1,500 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    178935    22.9    8.0%
+  CachedAttention          35     23770   498.4  174.0%
+  GeGlu                    70      8878   240.1   83.8%
+  RmsNorm                 173      7945   179.4   62.6%
+  GemvPacked                1      1359    77.1   26.9%
+  Binary                    3      1199   107.1   37.4%
+  Copy                     35      1076   614.1  214.4%
+  Unary                     3       183   245.9   85.8%
+layers.15.mlp.gate   | GemmBatchedPacked { x: Va |   3720.8 | 33177600 |      8.9 |     3.1%
+layers.20.mlp.gate   | GemmBatchedPacked { x: Va |   3644.5 | 33177600 |      9.1 |     3.2%
+layers.24.mlp.down   | GemmBatchedPacked { x: Va |   3586.3 | 33177600 |      9.3 |     3.2%
+layers.18.mlp.down   | GemmBatchedPacked { x: Va |   3093.8 | 33177600 |     10.7 |     3.7%
+layers.12.mlp.up     | GemmBatchedPacked { x: Va |   2807.5 | 21037056 |      7.5 |     2.6%
+layers.10.mlp.gate   | GemmBatchedPacked { x: Va |   2567.3 | 21037056 |      8.2 |     2.9%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   2563.4 | 49020928 |     19.1 |     6.7%
+layers.2.mlp.up      | GemmBatchedPacked { x: Va |   2548.5 | 21037056 |      8.3 |     2.9%
+layers.11.mlp.gate   | GemmBatchedPacked { x: Va |   2530.2 | 21037056 |      8.3 |     2.9%
+layers.1.mlp.up      | GemmBatchedPacked { x: Va |   2496.8 | 21037056 |      8.4 |     2.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    171372    24.0    8.4%
+  CachedAttention          35     46753   253.4   88.5%
+  RmsNorm                 173     16648    85.6   29.9%
+  GeGlu                    70     14082   151.3   52.8%
+  Copy                     35      1382   477.9  166.9%
+  Unary                     3       896    50.3   17.6%
+  GemvPacked                1       523   200.5   70.0%
+  Binary                    3       496   259.0   90.4%
+layers.14.attn       | CachedAttention { q: Valu |   3455.1 | 555747328 |    160.8 |    56.2%
+layers.16.mlp.down   | GemmBatchedPacked { x: Va |   3413.1 | 33177600 |      9.7 |     3.4%
+layers.12.attn       | CachedAttention { q: Valu |   2815.2 | 277876736 |     98.7 |    34.5%
+layers.24.mlp.gate   | GemmBatchedPacked { x: Va |   2672.3 | 33177600 |     12.4 |     4.3%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   2538.0 | 49020928 |     19.3 |     6.7%
+layers.14.attn.k_norm | RmsNorm { x: ValueId(674) |   2365.8 |  2102272 |      0.9 |     0.3%
+layers.30.mlp.up     | GemmBatchedPacked { x: Va |   2301.0 | 33177600 |     14.4 |     5.0%
+layers.24.mlp.up     | GemmBatchedPacked { x: Va |   2277.5 | 33177600 |     14.6 |     5.1%
+layers.25.mlp.gate   | GemmBatchedPacked { x: Va |   2220.2 | 33177600 |     14.9 |     5.2%
+layers.26.mlp.gate   | GemmBatchedPacked { x: Va |   2207.0 | 33177600 |     15.0 |     5.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    168285    24.4    8.5%
+  CachedAttention          35     49907   237.4   82.9%
+  RmsNorm                 173     11567   123.2   43.0%
+  GeGlu                    70     11344   187.9   65.6%
+  Copy                     35      1907   346.4  121.0%
+  GemvPacked                1       882   118.9   41.5%
+  Binary                    3       609   211.0   73.7%
+  Unary                     3       151   298.9  104.4%
+layers.29.attn       | CachedAttention { q: Valu |   4151.0 | 570427392 |    137.4 |    48.0%
+layers.34.attn       | CachedAttention { q: Valu |   3605.5 | 570427392 |    158.2 |    55.2%
+layers.14.attn       | CachedAttention { q: Valu |   3052.4 | 555747328 |    182.1 |    63.6%
+layers.27.mlp.down   | GemmBatchedPacked { x: Va |   2894.2 | 33177600 |     11.5 |     4.0%
+layers.9.attn        | CachedAttention { q: Valu |   2870.9 | 555747328 |    193.6 |    67.6%
+layers.4.attn        | CachedAttention { q: Valu |   2847.4 | 555747328 |    195.2 |    68.1%
+layers.24.attn       | CachedAttention { q: Valu |   2811.9 | 570427392 |    202.9 |    70.8%
+layers.22.mlp.up     | GemmBatchedPacked { x: Va |   2792.3 | 33177600 |     11.9 |     4.1%
+layers.19.attn       | CachedAttention { q: Valu |   2779.9 | 570427392 |    205.2 |    71.6%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   2621.2 | 49020928 |     18.7 |     6.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    171281    24.0    8.4%
+  CachedAttention          35     58736   201.7   70.4%
+  RmsNorm                 173     13317   107.0   37.4%
+  GeGlu                    70     10976   194.2   67.8%
+  GemvPacked                1       513   204.5   71.4%
+  Copy                     35       507  1303.5  455.1%
+  Binary                    3       501   256.2   89.5%
+  Unary                     3       196   230.6   80.5%
+layers.34.attn       | CachedAttention { q: Valu |   4689.3 | 570427392 |    121.6 |    42.5%
+layers.24.attn       | CachedAttention { q: Valu |   4353.9 | 570427392 |    131.0 |    45.7%
+layers.29.attn       | CachedAttention { q: Valu |   4054.0 | 570427392 |    140.7 |    49.1%
+layers.14.attn       | CachedAttention { q: Valu |   3979.2 | 555747328 |    139.7 |    48.8%
+layers.9.attn        | CachedAttention { q: Valu |   3966.9 | 555747328 |    140.1 |    48.9%
+layers.19.attn       | CachedAttention { q: Valu |   3963.0 | 570427392 |    143.9 |    50.3%
+layers.4.attn        | CachedAttention { q: Valu |   3862.5 | 555747328 |    143.9 |    50.2%
+layers.32.mlp.up     | GemmBatchedPacked { x: Va |   3753.3 | 33177600 |      8.8 |     3.1%
+layers.26.mlp.up     | GemmBatchedPacked { x: Va |   3003.5 | 33177600 |     11.0 |     3.9%
+layers.29.mlp.gate   | GemmBatchedPacked { x: Va |   2970.3 | 33177600 |     11.2 |     3.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    184989    22.2    7.7%
+  CachedAttention          35     71257   166.3   58.0%
+  GeGlu                    70     12413   171.7   59.9%
+  RmsNorm                 173     10168   140.2   48.9%
+  Copy                     35      3197   206.7   72.1%
+  GemvPacked                1       520   201.8   70.5%
+  Binary                    3       507   253.1   88.4%
+  Unary                     3       150   301.0  105.1%
+layers.19.attn       | CachedAttention { q: Valu |   7287.2 | 570427392 |     78.3 |    27.3%
+layers.9.attn        | CachedAttention { q: Valu |   6450.6 | 555747328 |     86.2 |    30.1%
+layers.34.attn       | CachedAttention { q: Valu |   5973.6 | 570427392 |     95.5 |    33.3%
+layers.4.attn        | CachedAttention { q: Valu |   5765.5 | 555747328 |     96.4 |    33.7%
+layers.14.attn       | CachedAttention { q: Valu |   5291.7 | 555747328 |    105.0 |    36.7%
+layers.29.attn       | CachedAttention { q: Valu |   5257.4 | 570427392 |    108.5 |    37.9%
+layers.24.attn       | CachedAttention { q: Valu |   5062.6 | 570427392 |    112.7 |    39.3%
+layers.25.mlp.down   | GemmBatchedPacked { x: Va |   4265.0 | 33177600 |      7.8 |     2.7%
+layers.27.mlp.up     | GemmBatchedPacked { x: Va |   3703.9 | 33177600 |      9.0 |     3.1%
+layers.25.mlp.gate   | GemmBatchedPacked { x: Va |   3034.0 | 33177600 |     10.9 |     3.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    193365    21.2    7.4%
+  CachedAttention          35     88814   133.4   46.6%
+  RmsNorm                 173     13669   104.3   36.4%
+  GeGlu                    70     11332   188.1   65.7%
+  Binary                    3      2041    62.9   22.0%
+  Copy                     35      1529   432.1  150.9%
+  GemvPacked                1       521   201.3   70.3%
+  Unary                     3       189   238.6   83.3%
+layers.24.attn       | CachedAttention { q: Valu |  10558.5 | 570427392 |     54.0 |    18.9%
+layers.9.attn        | CachedAttention { q: Valu |  10542.5 | 555747328 |     52.7 |    18.4%
+layers.14.attn       | CachedAttention { q: Valu |   9338.1 | 555747328 |     59.5 |    20.8%
+layers.29.attn       | CachedAttention { q: Valu |   8381.0 | 570427392 |     68.1 |    23.8%
+layers.19.attn       | CachedAttention { q: Valu |   7621.7 | 570427392 |     74.8 |    26.1%
+layers.34.attn       | CachedAttention { q: Valu |   7273.3 | 570427392 |     78.4 |    27.4%
+layers.4.attn        | CachedAttention { q: Valu |   6717.7 | 555747328 |     82.7 |    28.9%
+layers.24.mlp.down   | GemmBatchedPacked { x: Va |   4339.8 | 33177600 |      7.6 |     2.7%
+layers.21.mlp.up     | GemmBatchedPacked { x: Va |   3603.7 | 33177600 |      9.2 |     3.2%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   3599.1 | 49020928 |     13.6 |     4.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    174498    23.5    8.2%
+  CachedAttention          35     84207   140.7   49.1%
+  GeGlu                    70     11577   184.1   64.3%
+  RmsNorm                 173      9563   149.0   52.0%
+  Copy                     35      2149   307.4  107.3%
+  GemvPacked                1       530   198.0   69.1%
+  Binary                    3       512   250.7   87.5%
+  Unary                     3       210   214.9   75.0%
+layers.9.attn        | CachedAttention { q: Valu |   9708.7 | 555747328 |     57.2 |    20.0%
+layers.34.attn       | CachedAttention { q: Valu |   8004.0 | 570427392 |     71.3 |    24.9%
+layers.14.attn       | CachedAttention { q: Valu |   7686.0 | 555747328 |     72.3 |    25.2%
+layers.24.attn       | CachedAttention { q: Valu |   7553.0 | 570427392 |     75.5 |    26.4%
+layers.4.attn        | CachedAttention { q: Valu |   7486.1 | 555747328 |     74.2 |    25.9%
+layers.19.attn       | CachedAttention { q: Valu |   7309.1 | 570427392 |     78.0 |    27.2%
+layers.29.attn       | CachedAttention { q: Valu |   7270.6 | 570427392 |     78.5 |    27.4%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   5821.0 | 49020928 |      8.4 |     2.9%
+layers.11.mlp.down   | GemmBatchedPacked { x: Va |   3234.7 | 21037056 |      6.5 |     2.3%
+layers.6.mlp.act     | GeGlu { gate: ValueId(324 |   2820.3 | 37748736 |     13.4 |     4.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    162911    25.2    8.8%
+  CachedAttention          35     92633   127.9   44.7%
+  GeGlu                    70      9782   217.9   76.1%
+  RmsNorm                 173      8893   160.3   56.0%
+  Binary                    3       536   239.5   83.6%
+  GemvPacked                1       514   203.9   71.2%
+  Copy                     35       409  1615.0  563.8%
+  Unary                     3       146   308.4  107.7%
+layers.9.attn        | CachedAttention { q: Valu |  11897.7 | 555747328 |     46.7 |    16.3%
+layers.29.attn       | CachedAttention { q: Valu |   9473.4 | 570427392 |     60.2 |    21.0%
+layers.24.attn       | CachedAttention { q: Valu |   9124.8 | 570427392 |     62.5 |    21.8%
+layers.4.attn        | CachedAttention { q: Valu |   8674.3 | 555747328 |     64.1 |    22.4%
+layers.19.attn       | CachedAttention { q: Valu |   8393.7 | 570427392 |     68.0 |    23.7%
+layers.14.attn       | CachedAttention { q: Valu |   8362.5 | 555747328 |     66.5 |    23.2%
+layers.34.attn       | CachedAttention { q: Valu |   8347.1 | 570427392 |     68.3 |    23.9%
+layers.34.mlp.down   | GemmBatchedPacked { x: Va |   3732.5 | 33177600 |      8.9 |     3.1%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   3005.8 | 49020928 |     16.3 |     5.7%
+layers.24.mlp.down   | GemmBatchedPacked { x: Va |   2109.0 | 33177600 |     15.7 |     5.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    197930    20.7    7.2%
+  CachedAttention          35     24158   490.4  171.2%
+  RmsNorm                 173     13090   108.9   38.0%
+  GeGlu                    70     12982   164.2   57.3%
+  Copy                     35      1129   585.0  204.2%
+  GemvPacked                1       819   128.1   44.7%
+  Binary                    3       490   261.9   91.5%
+  Unary                     3       207   218.3   76.2%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   4525.6 | 49020928 |     10.8 |     3.8%
+layers.32.mlp.up     | GemmBatchedPacked { x: Va |   4017.5 | 33177600 |      8.3 |     2.9%
+layers.27.mlp.up     | GemmBatchedPacked { x: Va |   3920.7 | 33177600 |      8.5 |     3.0%
+layers.23.mlp.down   | GemmBatchedPacked { x: Va |   3823.0 | 33177600 |      8.7 |     3.0%
+layers.15.mlp.up     | GemmBatchedPacked { x: Va |   3815.0 | 33177600 |      8.7 |     3.0%
+layers.33.mlp.gate   | GemmBatchedPacked { x: Va |   3585.1 | 33177600 |      9.3 |     3.2%
+layers.19.mlp.down   | GemmBatchedPacked { x: Va |   3407.5 | 33177600 |      9.7 |     3.4%
+layers.18.mlp.down   | GemmBatchedPacked { x: Va |   3384.2 | 33177600 |      9.8 |     3.4%
+layers.18.mlp.up     | GemmBatchedPacked { x: Va |   3334.0 | 33177600 |     10.0 |     3.5%
+layers.21.mlp.gate   | GemmBatchedPacked { x: Va |   3278.0 | 33177600 |     10.1 |     3.5%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    211257    19.4    6.8%
+  CachedAttention          35     56267   210.6   73.5%
+  RmsNorm                 173     11888   119.9   41.9%
+  GeGlu                    70      9818   217.1   75.8%
+  Copy                     35      2508   263.4   91.9%
+  Binary                    3       579   221.7   77.4%
+  GemvPacked                1       519   202.2   70.6%
+  Unary                     3       161   280.5   97.9%
+layers.30.mlp.down   | GemmBatchedPacked { x: Va |   4611.7 | 33177600 |      7.2 |     2.5%
+layers.4.attn        | CachedAttention { q: Valu |   4015.7 | 555747328 |    138.4 |    48.3%
+layers.24.attn       | CachedAttention { q: Valu |   3954.4 | 570427392 |    144.3 |    50.4%
+layers.28.mlp.down   | GemmBatchedPacked { x: Va |   3792.4 | 33177600 |      8.7 |     3.1%
+layers.14.attn       | CachedAttention { q: Valu |   3728.4 | 555747328 |    149.1 |    52.0%
+layers.17.mlp.gate   | GemmBatchedPacked { x: Va |   3715.5 | 33177600 |      8.9 |     3.1%
+layers.26.mlp.gate   | GemmBatchedPacked { x: Va |   3660.2 | 33177600 |      9.1 |     3.2%
+layers.22.mlp.up     | GemmBatchedPacked { x: Va |   3650.2 | 33177600 |      9.1 |     3.2%
+layers.31.mlp.up     | GemmBatchedPacked { x: Va |   3430.5 | 33177600 |      9.7 |     3.4%
+layers.34.mlp.up     | GemmBatchedPacked { x: Va |   3371.8 | 33177600 |      9.8 |     3.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    182230    22.5    7.9%
+  CachedAttention          35     49384   239.9   83.8%
+  GeGlu                    70     12114   175.9   61.4%
+  RmsNorm                 173      9959   143.1   50.0%
+  Copy                     35       631  1047.7  365.8%
+  GemvPacked                1       543   192.9   67.4%
+  Binary                    3       508   253.0   88.3%
+  Unary                     3       169   267.3   93.3%
+layers.30.mlp.down   | GemmBatchedPacked { x: Va |   3549.0 | 33177600 |      9.3 |     3.3%
+layers.15.mlp.up     | GemmBatchedPacked { x: Va |   3545.7 | 33177600 |      9.4 |     3.3%
+layers.29.attn       | CachedAttention { q: Valu |   3349.2 | 570427392 |    170.3 |    59.5%
+layers.34.mlp.up     | GemmBatchedPacked { x: Va |   3298.2 | 33177600 |     10.1 |     3.5%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   3202.7 | 49020928 |     15.3 |     5.3%
+layers.31.mlp.up     | GemmBatchedPacked { x: Va |   3200.7 | 33177600 |     10.4 |     3.6%
+layers.32.mlp.gate   | GemmBatchedPacked { x: Va |   3177.3 | 33177600 |     10.4 |     3.6%
+layers.16.mlp.up     | GemmBatchedPacked { x: Va |   3073.0 | 33177600 |     10.8 |     3.8%
+layers.9.attn        | CachedAttention { q: Valu |   2881.5 | 555747328 |    192.9 |    67.3%
+layers.14.attn       | CachedAttention { q: Valu |   2880.7 | 555747328 |    192.9 |    67.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    186629    22.0    7.7%
+  CachedAttention          35     63443   186.7   65.2%
+  RmsNorm                 173     14360    99.3   34.7%
+  GeGlu                    70     12804   166.4   58.1%
+  GemvPacked                1      2018    52.0   18.1%
+  Copy                     35       776   850.9  297.1%
+  Binary                    3       459   280.1   97.8%
+  Unary                     3       158   285.1   99.6%
+layers.4.attn        | CachedAttention { q: Valu |   5135.9 | 555747328 |    108.2 |    37.8%
+layers.7.attn        | CachedAttention { q: Valu |   4661.9 | 277876736 |     59.6 |    20.8%
+layers.14.attn       | CachedAttention { q: Valu |   4232.5 | 555747328 |    131.3 |    45.8%
+layers.9.attn        | CachedAttention { q: Valu |   4039.9 | 555747328 |    137.6 |    48.0%
+layers.34.attn       | CachedAttention { q: Valu |   3955.9 | 570427392 |    144.2 |    50.3%
+layers.19.attn       | CachedAttention { q: Valu |   3938.0 | 570427392 |    144.9 |    50.6%
+layers.24.attn       | CachedAttention { q: Valu |   3886.7 | 570427392 |    146.8 |    51.2%
+layers.29.attn       | CachedAttention { q: Valu |   3871.9 | 570427392 |    147.3 |    51.4%
+layers.31.mlp.gate   | GemmBatchedPacked { x: Va |   3807.1 | 33177600 |      8.7 |     3.0%
+layers.13.attn       | CachedAttention { q: Valu |   3751.7 | 277876736 |     74.1 |    25.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    189332    21.7    7.6%
+  CachedAttention          35     74228   159.6   55.7%
+  GeGlu                    70     14035   151.8   53.0%
+  RmsNorm                 173     11742   121.4   42.4%
+  Copy                     35      1151   573.8  200.3%
+  Binary                    3       591   217.5   75.9%
+  GemvPacked                1       526   199.4   69.6%
+  Unary                     3       160   282.7   98.7%
+layers.24.attn       | CachedAttention { q: Valu |   7380.5 | 570427392 |     77.3 |    27.0%
+layers.9.attn        | CachedAttention { q: Valu |   6967.0 | 555747328 |     79.8 |    27.8%
+layers.34.attn       | CachedAttention { q: Valu |   6137.4 | 570427392 |     92.9 |    32.4%
+layers.29.attn       | CachedAttention { q: Valu |   5687.7 | 570427392 |    100.3 |    35.0%
+layers.4.attn        | CachedAttention { q: Valu |   5452.6 | 555747328 |    101.9 |    35.6%
+layers.14.attn       | CachedAttention { q: Valu |   5023.2 | 555747328 |    110.6 |    38.6%
+layers.19.attn       | CachedAttention { q: Valu |   5018.8 | 570427392 |    113.7 |    39.7%
+layers.31.mlp.down   | GemmBatchedPacked { x: Va |   4179.2 | 33177600 |      7.9 |     2.8%
+layers.29.mlp.up     | GemmBatchedPacked { x: Va |   3930.4 | 33177600 |      8.4 |     2.9%
+layers.32.mlp.up     | GemmBatchedPacked { x: Va |   3205.0 | 33177600 |     10.4 |     3.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    188036    21.8    7.6%
+  CachedAttention          35     81431   145.5   50.8%
+  GeGlu                    70     15364   138.7   48.4%
+  RmsNorm                 173     11611   122.8   42.9%
+  Copy                     35      3200   206.4   72.1%
+  GemvPacked                1       578   181.5   63.4%
+  Binary                    3       522   246.1   85.9%
+  Unary                     3       338   133.4   46.6%
+layers.24.attn       | CachedAttention { q: Valu |   7797.2 | 570427392 |     73.2 |    25.5%
+layers.9.attn        | CachedAttention { q: Valu |   7112.8 | 555747328 |     78.1 |    27.3%
+layers.14.attn       | CachedAttention { q: Valu |   7086.9 | 555747328 |     78.4 |    27.4%
+layers.4.attn        | CachedAttention { q: Valu |   6925.2 | 555747328 |     80.2 |    28.0%
+layers.19.attn       | CachedAttention { q: Valu |   6751.4 | 570427392 |     84.5 |    29.5%
+layers.34.attn       | CachedAttention { q: Valu |   6656.6 | 570427392 |     85.7 |    29.9%
+layers.29.attn       | CachedAttention { q: Valu |   6293.6 | 570427392 |     90.6 |    31.6%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   4495.6 | 49020928 |     10.9 |     3.8%
+layers.15.mlp.gate   | GemmBatchedPacked { x: Va |   4189.2 | 33177600 |      7.9 |     2.8%
+layers.29.mlp.up     | GemmBatchedPacked { x: Va |   3631.0 | 33177600 |      9.1 |     3.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    189652    21.6    7.6%
+  CachedAttention          35     97026   122.1   42.6%
+  RmsNorm                 173     20768    68.6   24.0%
+  GeGlu                    70     12766   166.9   58.3%
+  Copy                     35      2424   272.6   95.2%
+  Binary                    3       580   221.3   77.3%
+  GemvPacked                1       541   193.7   67.6%
+  Unary                     3       188   240.5   84.0%
+layers.4.attn        | CachedAttention { q: Valu |  11024.9 | 555747328 |     50.4 |    17.6%
+layers.9.attn        | CachedAttention { q: Valu |   9815.2 | 555747328 |     56.6 |    19.8%
+layers.29.attn       | CachedAttention { q: Valu |   9782.4 | 570427392 |     58.3 |    20.4%
+layers.34.attn       | CachedAttention { q: Valu |   8915.3 | 570427392 |     64.0 |    22.3%
+layers.24.attn       | CachedAttention { q: Valu |   7803.1 | 570427392 |     73.1 |    25.5%
+layers.14.attn       | CachedAttention { q: Valu |   7705.5 | 555747328 |     72.1 |    25.2%
+layers.19.attn       | CachedAttention { q: Valu |   7441.2 | 570427392 |     76.7 |    26.8%
+layers.16.mlp.down   | GemmBatchedPacked { x: Va |   4010.6 | 33177600 |      8.3 |     2.9%
+layers.30.mlp.up     | GemmBatchedPacked { x: Va |   3387.6 | 33177600 |      9.8 |     3.4%
+layers.33.attn       | CachedAttention { q: Valu |   3288.9 | 285216768 |     86.7 |    30.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    208107    19.7    6.9%
+  CachedAttention          35    116149   102.0   35.6%
+  RmsNorm                 173     18292    77.9   27.2%
+  GeGlu                    70     15575   136.8   47.8%
+  Copy                     35      3304   199.9   69.8%
+  Binary                    3       780   164.7   57.5%
+  GemvPacked                1       537   195.3   68.2%
+  Unary                     3       156   288.2  100.6%
+layers.34.attn       | CachedAttention { q: Valu |  15912.8 | 570427392 |     35.8 |    12.5%
+layers.9.attn        | CachedAttention { q: Valu |  12539.1 | 555747328 |     44.3 |    15.5%
+layers.24.attn       | CachedAttention { q: Valu |  11949.2 | 570427392 |     47.7 |    16.7%
+layers.14.attn       | CachedAttention { q: Valu |  11812.5 | 555747328 |     47.0 |    16.4%
+layers.29.attn       | CachedAttention { q: Valu |  11125.7 | 570427392 |     51.3 |    17.9%
+layers.4.attn        | CachedAttention { q: Valu |  10200.5 | 555747328 |     54.5 |    19.0%
+layers.19.attn       | CachedAttention { q: Valu |  10038.0 | 570427392 |     56.8 |    19.8%
+layers.16.mlp.up     | GemmBatchedPacked { x: Va |   3778.7 | 33177600 |      8.8 |     3.1%
+layers.14.attn.o     | GemmBatchedPacked { x: Va |   3382.6 | 15073280 |      4.5 |     1.6%
+layers.28.mlp.gate   | GemmBatchedPacked { x: Va |   3381.8 | 33177600 |      9.8 |     3.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    196787    20.9    7.3%
+  CachedAttention          35     21070   562.3  196.3%
+  GeGlu                    70     13532   157.5   55.0%
+  RmsNorm                 173     11839   120.4   42.0%
+  Binary                    3      4234    30.3   10.6%
+  Copy                     35      1735   380.7  132.9%
+  GemvPacked                1       528   198.6   69.3%
+  Unary                     3       197   228.7   79.8%
+model.ple.add        | Ext(Elementwise(Binary {  |   3778.8 | 55050240 |     14.6 |     5.1%
+layers.0.mlp.down    | GemmBatchedPacked { x: Va |   3431.8 | 21037056 |      6.1 |     2.1%
+layers.9.mlp.gate    | GemmBatchedPacked { x: Va |   3429.4 | 21037056 |      6.1 |     2.1%
+layers.15.mlp.gate   | GemmBatchedPacked { x: Va |   3419.7 | 33177600 |      9.7 |     3.4%
+layers.30.mlp.gate   | GemmBatchedPacked { x: Va |   3381.1 | 33177600 |      9.8 |     3.4%
+layers.28.mlp.down   | GemmBatchedPacked { x: Va |   3346.0 | 33177600 |      9.9 |     3.5%
+layers.24.mlp.up     | GemmBatchedPacked { x: Va |   3273.5 | 33177600 |     10.1 |     3.5%
+layers.25.mlp.gate   | GemmBatchedPacked { x: Va |   3240.8 | 33177600 |     10.2 |     3.6%
+layers.34.mlp.up     | GemmBatchedPacked { x: Va |   3134.7 | 33177600 |     10.6 |     3.7%
+layers.19.mlp.up     | GemmBatchedPacked { x: Va |   3098.9 | 33177600 |     10.7 |     3.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    189820    21.6    7.5%
+  CachedAttention          35     49254   240.5   84.0%
+  RmsNorm                 173     15728    90.6   31.6%
+  GeGlu                    70     14084   151.3   52.8%
+  Embed                     2      1536   941.5  328.7%
+  Copy                     35      1244   531.2  185.4%
+  Binary                    3       520   247.2   86.3%
+  GemvPacked                1       516   203.4   71.0%
+model.ple.model_proj | GemmBatchedPacked { x: Va |   4790.5 | 49020928 |     10.2 |     3.6%
+layers.15.mlp.gate   | GemmBatchedPacked { x: Va |   4264.4 | 33177600 |      7.8 |     2.7%
+layers.19.mlp.gate   | GemmBatchedPacked { x: Va |   3535.4 | 33177600 |      9.4 |     3.3%
+layers.21.mlp.down   | GemmBatchedPacked { x: Va |   3509.0 | 33177600 |      9.5 |     3.3%
+layers.18.mlp.up     | GemmBatchedPacked { x: Va |   3284.8 | 33177600 |     10.1 |     3.5%
+layers.22.mlp.up     | GemmBatchedPacked { x: Va |   3268.8 | 33177600 |     10.1 |     3.5%
+layers.17.mlp.down   | GemmBatchedPacked { x: Va |   3244.6 | 33177600 |     10.2 |     3.6%
+layers.29.mlp.up     | GemmBatchedPacked { x: Va |   3214.1 | 33177600 |     10.3 |     3.6%
+layers.4.attn        | CachedAttention { q: Valu |   3186.3 | 555747328 |    174.4 |    60.9%
+layers.20.attn       | CachedAttention { q: Valu |   3093.7 | 285216768 |     92.2 |    32.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    186275    22.0    7.7%
+  CachedAttention          35     63078   187.8   65.6%
+  GeGlu                    70     16656   128.0   44.7%
+  RmsNorm                 173     12162   117.2   40.9%
+  Copy                     35      3111   212.3   74.1%
+  Binary                    3       541   237.5   82.9%
+  GemvPacked                1       535   196.0   68.4%
+  Unary                     3       222   203.1   70.9%
+layers.19.attn       | CachedAttention { q: Valu |   5359.5 | 570427392 |    106.4 |    37.2%
+layers.8.attn        | CachedAttention { q: Valu |   5183.1 | 277876736 |     53.6 |    18.7%
+layers.9.attn        | CachedAttention { q: Valu |   5014.8 | 555747328 |    110.8 |    38.7%
+layers.24.attn       | CachedAttention { q: Valu |   4862.7 | 570427392 |    117.3 |    41.0%
+layers.14.attn       | CachedAttention { q: Valu |   4694.1 | 555747328 |    118.4 |    41.3%
+layers.30.mlp.down   | GemmBatchedPacked { x: Va |   3882.0 | 33177600 |      8.5 |     3.0%
+layers.26.mlp.gate   | GemmBatchedPacked { x: Va |   3722.5 | 33177600 |      8.9 |     3.1%
+layers.11.mlp.gate   | GemmBatchedPacked { x: Va |   3536.0 | 21037056 |      5.9 |     2.1%
+layers.15.mlp.act    | GeGlu { gate: ValueId(728 |   3291.4 | 75497472 |     22.9 |     8.0%
+layers.17.mlp.down   | GemmBatchedPacked { x: Va |   3235.1 | 33177600 |     10.3 |     3.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    209061    19.6    6.9%
+  CachedAttention          35     63596   186.3   65.0%
+  RmsNorm                 173     12792   111.4   38.9%
+  GeGlu                    70      9677   220.2   76.9%
+  Copy                     35      1095   603.2  210.6%
+  Binary                    3       607   211.5   73.8%
+  GemvPacked                1       511   205.1   71.6%
+  Unary                     3       154   292.5  102.1%
+layers.34.attn       | CachedAttention { q: Valu |   6030.4 | 570427392 |     94.6 |    33.0%
+layers.4.attn        | CachedAttention { q: Valu |   5955.2 | 555747328 |     93.3 |    32.6%
+layers.14.attn       | CachedAttention { q: Valu |   4639.4 | 555747328 |    119.8 |    41.8%
+layers.9.mlp.gate    | GemmBatchedPacked { x: Va |   4371.5 | 21037056 |      4.8 |     1.7%
+layers.19.attn       | CachedAttention { q: Valu |   4262.5 | 570427392 |    133.8 |    46.7%
+layers.24.attn       | CachedAttention { q: Valu |   4235.3 | 570427392 |    134.7 |    47.0%
+layers.16.mlp.down   | GemmBatchedPacked { x: Va |   4193.2 | 33177600 |      7.9 |     2.8%
+layers.29.attn       | CachedAttention { q: Valu |   4096.9 | 570427392 |    139.2 |    48.6%
+layers.9.attn        | CachedAttention { q: Valu |   3950.7 | 555747328 |    140.7 |    49.1%
+layers.17.mlp.up     | GemmBatchedPacked { x: Va |   3950.5 | 33177600 |      8.4 |     2.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    180590    22.7    7.9%
+  CachedAttention          35     67899   174.5   60.9%
+  GeGlu                    70     14109   151.1   52.7%
+  RmsNorm                 173      9809   145.3   50.7%
+  Copy                     35       633  1044.2  364.6%
+  GemvPacked                1       569   184.2   64.3%
+  Binary                    3       470   273.2   95.4%
+  Unary                     3       214   210.7   73.6%
+layers.9.attn        | CachedAttention { q: Valu |   7364.4 | 555747328 |     75.5 |    26.3%
+layers.29.attn       | CachedAttention { q: Valu |   6869.3 | 570427392 |     83.0 |    29.0%
+layers.14.attn       | CachedAttention { q: Valu |   5818.2 | 555747328 |     95.5 |    33.3%
+layers.4.attn        | CachedAttention { q: Valu |   5080.3 | 555747328 |    109.4 |    38.2%
+layers.34.attn       | CachedAttention { q: Valu |   5072.4 | 570427392 |    112.5 |    39.3%
+layers.19.attn       | CachedAttention { q: Valu |   5070.9 | 570427392 |    112.5 |    39.3%
+layers.24.attn       | CachedAttention { q: Valu |   5021.0 | 570427392 |    113.6 |    39.7%
+layers.18.mlp.up     | GemmBatchedPacked { x: Va |   4132.9 | 33177600 |      8.0 |     2.8%
+layers.28.mlp.down   | GemmBatchedPacked { x: Va |   3984.8 | 33177600 |      8.3 |     2.9%
+layers.19.mlp.up     | GemmBatchedPacked { x: Va |   3076.5 | 33177600 |     10.8 |     3.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    193984    21.2    7.4%
+  CachedAttention          35     84246   140.6   49.1%
+  RmsNorm                 173     14501    98.3   34.3%
+  GeGlu                    70     14260   149.5   52.2%
+  Copy                     35      1893   349.0  121.8%
+  GemvPacked                1       679   154.5   54.0%
+  Binary                    3       552   232.5   81.2%
+  Embed                     2       272  5319.7 1857.2%
+layers.29.attn       | CachedAttention { q: Valu |  10074.2 | 570427392 |     56.6 |    19.8%
+layers.24.attn       | CachedAttention { q: Valu |   8071.4 | 570427392 |     70.7 |    24.7%
+layers.14.attn       | CachedAttention { q: Valu |   7357.5 | 555747328 |     75.5 |    26.4%
+layers.19.attn       | CachedAttention { q: Valu |   7185.5 | 570427392 |     79.4 |    27.7%
+layers.4.attn        | CachedAttention { q: Valu |   6383.8 | 555747328 |     87.1 |    30.4%
+layers.9.attn        | CachedAttention { q: Valu |   6222.5 | 555747328 |     89.3 |    31.2%
+layers.34.attn       | CachedAttention { q: Valu |   6010.7 | 570427392 |     94.9 |    33.1%
+layers.18.mlp.up     | GemmBatchedPacked { x: Va |   3912.5 | 33177600 |      8.5 |     3.0%
+layers.30.mlp.gate   | GemmBatchedPacked { x: Va |   3870.7 | 33177600 |      8.6 |     3.0%
+layers.20.mlp.gate   | GemmBatchedPacked { x: Va |   3736.1 | 33177600 |      8.9 |     3.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    171796    23.9    8.3%
+  CachedAttention          35     96097   123.3   43.0%
+  GeGlu                    70     11998   177.6   62.0%
+  RmsNorm                 173      8622   165.3   57.7%
+  Copy                     35      2273   290.7  101.5%
+  Binary                    3       606   212.1   74.0%
+  GemvPacked                1       516   203.4   71.0%
+  Unary                     3       155   291.8  101.9%
+layers.9.attn        | CachedAttention { q: Valu |  10541.3 | 555747328 |     52.7 |    18.4%
+layers.14.attn       | CachedAttention { q: Valu |  10235.0 | 555747328 |     54.3 |    19.0%
+layers.29.attn       | CachedAttention { q: Valu |   8473.9 | 570427392 |     67.3 |    23.5%
+layers.19.attn       | CachedAttention { q: Valu |   8322.0 | 570427392 |     68.5 |    23.9%
+layers.4.attn        | CachedAttention { q: Valu |   8239.2 | 555747328 |     67.5 |    23.5%
+layers.34.attn       | CachedAttention { q: Valu |   8231.1 | 570427392 |     69.3 |    24.2%
+layers.24.attn       | CachedAttention { q: Valu |   7530.5 | 570427392 |     75.7 |    26.4%
+layers.19.mlp.up     | GemmBatchedPacked { x: Va |   3906.0 | 33177600 |      8.5 |     3.0%
+layers.25.mlp.down   | GemmBatchedPacked { x: Va |   3458.9 | 33177600 |      9.6 |     3.3%
+layers.34.mlp.up     | GemmBatchedPacked { x: Va |   3232.5 | 33177600 |     10.3 |     3.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       276    186898    22.0    7.7%
+  CachedAttention          35     98122   120.7   42.2%
+  RmsNorm                 173     14850    96.0   33.5%
+  GeGlu                    70     11857   179.7   62.8%
+  Copy                     35      3212   205.7   71.8%
+  GemvPacked                1       566   185.4   64.7%
+  Binary                    3       496   259.2   90.5%
+  Unary                     3       195   231.1   80.7%
+layers.29.attn       | CachedAttention { q: Valu |  11771.7 | 570427392 |     48.5 |    16.9%
+layers.9.attn        | CachedAttention { q: Valu |  10904.7 | 555747328 |     51.0 |    17.8%
+layers.24.attn       | CachedAttention { q: Valu |  10628.8 | 570427392 |     53.7 |    18.7%
+layers.4.attn        | CachedAttention { q: Valu |   9700.2 | 555747328 |     57.3 |    20.0%
+layers.34.attn       | CachedAttention { q: Valu |   9240.3 | 570427392 |     61.7 |    21.6%

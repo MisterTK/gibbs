@@ -1,0 +1,500 @@
+Compiled GraphProgram: 1 segments, primary device: Metal
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       186    140881    23.0    8.0%
+  DeltaRule                18     42804     7.5    2.6%
+  CausalConv1dCached       18      7027    64.9   22.7%
+  RmsNorm                  67      6185    89.6   31.3%
+  SwiGlu                   24      6105   148.4   51.8%
+  Binary                   60      5186    58.7   20.5%
+  Copy                     66      5041   209.7   73.2%
+  Unary                    78      4383   149.8   52.3%
+layers.0.mixer.delta | DeltaRule { q: ValueId(18 |   4335.6 | 17891328 |      4.1 |     1.4%
+layers.0.mixer.proj_qkv | GemmBatchedPacked { x: Va |   2870.9 | 25427968 |      8.9 |     3.1%
+layers.6.mixer.delta | DeltaRule { q: ValueId(26 |   2602.8 | 17891328 |      6.9 |     2.4%
+layers.21.mixer.delta | DeltaRule { q: ValueId(88 |   2489.7 | 17891328 |      7.2 |     2.5%
+layers.2.mixer.delta | DeltaRule { q: ValueId(10 |   2448.8 | 17891328 |      7.3 |     2.6%
+layers.18.mixer.delta | DeltaRule { q: ValueId(76 |   2394.8 | 17891328 |      7.5 |     2.6%
+layers.16.mixer.delta | DeltaRule { q: ValueId(67 |   2384.6 | 17891328 |      7.5 |     2.6%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   2320.1 | 418179072 |    180.2 |    62.9%
+layers.12.mixer.delta | DeltaRule { q: ValueId(51 |   2245.0 | 17891328 |      8.0 |     2.8%
+layers.5.mixer.delta | DeltaRule { q: ValueId(22 |   2229.6 | 17891328 |      8.0 |     2.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       186    130444    24.8    8.7%
+  DeltaRule                18     39473     8.2    2.8%
+  CausalConv1dCached       18      6017    75.8   26.5%
+  RmsNorm                  67      5522   100.3   35.0%
+  Copy                     66      4479   236.0   82.4%
+  CachedAttention           6      3346    48.9   17.1%
+  SwiGlu                   24      3344   270.9   94.6%
+  Binary                   60      2427   125.4   43.8%
+layers.17.mixer.delta | DeltaRule { q: ValueId(72 |   2390.3 | 17891328 |      7.5 |     2.6%
+layers.4.mixer.delta | DeltaRule { q: ValueId(18 |   2338.2 | 17891328 |      7.7 |     2.7%
+layers.10.mixer.delta | DeltaRule { q: ValueId(43 |   2245.9 | 17891328 |      8.0 |     2.8%
+layers.18.mixer.delta | DeltaRule { q: ValueId(76 |   2234.6 | 17891328 |      8.0 |     2.8%
+layers.13.mixer.delta | DeltaRule { q: ValueId(55 |   2234.0 | 17891328 |      8.0 |     2.8%
+layers.1.mixer.delta | DeltaRule { q: ValueId(60 |   2231.9 | 17891328 |      8.0 |     2.8%
+layers.16.mixer.delta | DeltaRule { q: ValueId(67 |   2222.2 | 17891328 |      8.1 |     2.8%
+layers.0.mixer.delta | DeltaRule { q: ValueId(18 |   2211.6 | 17891328 |      8.1 |     2.8%
+layers.2.mixer.delta | DeltaRule { q: ValueId(10 |   2157.9 | 17891328 |      8.3 |     2.9%
+layers.20.mixer.delta | DeltaRule { q: ValueId(84 |   2155.2 | 17891328 |      8.3 |     2.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       186    122819    26.3    9.2%
+  DeltaRule                18     40729     7.9    2.8%
+  Copy                     66      5565   189.9   66.3%
+  CausalConv1dCached       18      5194    87.8   30.7%
+  RmsNorm                  67      4129   134.2   46.9%
+  SwiGlu                   24      4055   223.4   78.0%
+  CachedAttention           6      3931    41.6   14.5%
+  RmsNormBatch              6      2274    24.9    8.7%
+layers.6.mixer.delta | DeltaRule { q: ValueId(26 |   2883.9 | 17891328 |      6.2 |     2.2%
+layers.8.mixer.delta | DeltaRule { q: ValueId(34 |   2597.0 | 17891328 |      6.9 |     2.4%
+layers.2.mixer.delta | DeltaRule { q: ValueId(10 |   2481.2 | 17891328 |      7.2 |     2.5%
+layers.21.mixer.delta | DeltaRule { q: ValueId(88 |   2337.0 | 17891328 |      7.7 |     2.7%
+layers.14.mixer.delta | DeltaRule { q: ValueId(59 |   2260.8 | 17891328 |      7.9 |     2.8%
+layers.16.mixer.delta | DeltaRule { q: ValueId(67 |   2234.7 | 17891328 |      8.0 |     2.8%
+layers.18.mixer.delta | DeltaRule { q: ValueId(76 |   2200.4 | 17891328 |      8.1 |     2.8%
+layers.10.mixer.delta | DeltaRule { q: ValueId(43 |   2199.0 | 17891328 |      8.1 |     2.8%
+layers.0.mixer.delta | DeltaRule { q: ValueId(18 |   2197.4 | 17891328 |      8.1 |     2.8%
+layers.13.mixer.delta | DeltaRule { q: ValueId(55 |   2185.2 | 17891328 |      8.2 |     2.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       186     49083    20.3    7.1%
+  Copy                     66      3443    15.0    5.2%
+  DeltaRule                18      2718    12.4    4.3%
+  SwiGlu                   24      2597    17.0    5.9%
+  GemvPacked                1      1443   289.8  101.2%
+  RmsNorm                  67      1125    24.4    8.5%
+  Unary                    78       444    72.2   25.2%
+  Binary                   60       389    38.3   13.4%
+layers.4.mixer.proj_qkv | GemmBatchedPacked { x: Va |   1647.0 |  9469952 |      5.7 |     2.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1442.7 | 418179072 |    289.8 |   101.2%
+layers.19.mlp.up     | GemmBatchedPacked { x: Va |   1262.0 |  7503872 |      5.9 |     2.1%
+layers.10.mixer.proj_qkv | GemmBatchedPacked { x: Va |   1138.0 |  9469952 |      8.3 |     2.9%
+layers.3.self_attn.v | GemmBatchedPacked { x: Va |   1121.5 |  1116160 |      1.0 |     0.3%
+layers.7.mlp.act     | SwiGlu { gate: ValueId(32 |   1119.2 |  1843200 |      1.6 |     0.6%
+layers.11.mlp.down   | GemmBatchedPacked { x: Va |   1080.0 | 11345920 |     10.5 |     3.7%
+layers.22.mlp.gate   | GemmBatchedPacked { x: Va |   1019.0 |  7897088 |      7.7 |     2.7%
+layers.13.mixer.q    | Ext(Movement(Copy { fill: |    866.5 |   819200 |      0.9 |     0.3%
+layers.10.mixer.delta | DeltaRule { q: ValueId(43 |    817.7 |  1870976 |      2.3 |     0.8%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      6896   164.4   57.4%
+  RmsNorm                  41       965     1.0    0.4%
+  MegakernelMlp             8       936   181.7   63.4%
+  Copy                     12       830     0.4    0.1%
+  DeltaNetStep             18       474    47.9   16.7%
+  CachedAttention           6       118   851.4  297.3%
+  RmsNormBatch              6        30     2.9    1.0%
+  Unary                     6        17     5.8    2.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1450.8 | 418179072 |    288.2 |   100.6%
+layers.7.self_attn.q | GemvPacked { x: ValueId(2 |    934.2 |  4743168 |      5.1 |     1.8%
+layers.15.self_attn.gate_slice | Ext(Movement(Copy { fill: |    763.3 |    24576 |      0.0 |     0.0%
+layers.3.mlp.gate    | GemvPacked { x: ValueId(1 |    739.4 |  8683520 |     11.7 |     4.1%
+layers.0.input_layernorm.out | RmsNorm { x: ValueId(3),  |    705.2 |    24576 |      0.0 |     0.0%
+layers.9.mlp.gate    | GemvPacked { x: ValueId(4 |    211.8 |  6717440 |     31.7 |    11.1%
+layers.18.mixer.out  | GemvPacked { x: ValueId(7 |    182.4 |  2908160 |     15.9 |     5.6%
+layers.9.mixer.delta | Ext(DeltaNet(DeltaNetStep |    180.8 |  1262272 |      7.0 |     2.4%
+layers.18.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    145.5 | 21258240 |    146.1 |    51.0%
+layers.13.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    128.7 | 21258240 |    165.1 |    57.6%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7323   154.8   54.0%
+  RmsNorm                  41      1017     1.0    0.3%
+  MegakernelMlp             8       938   181.3   63.3%
+  RmsNormBatch              6       705     0.1    0.0%
+  Copy                     12       503     0.6    0.2%
+  DeltaNetStep             18       317    71.6   25.0%
+  CachedAttention           6       117   857.8  299.5%
+  Binary                    6        60     2.5    0.9%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1436.7 | 418179072 |    291.1 |   101.6%
+layers.21.mixer.proj_a | GemvPacked { x: ValueId(8 |    785.1 |    73856 |      0.1 |     0.0%
+layers.3.input_layernorm.out | RmsNorm { x: ValueId(129) |    767.5 |    24576 |      0.0 |     0.0%
+layers.23.mlp.gate   | GemvPacked { x: ValueId(9 |    743.1 |  8683520 |     11.7 |     4.1%
+layers.7.self_attn.o | GemvPacked { x: ValueId(3 |    715.8 |  2383872 |      3.3 |     1.2%
+layers.19.self_attn.k_norm+layers.19.self_attn.q_norm | RmsNormBatch { segs: [Nor |    677.1 |    14468 |      0.0 |     0.0%
+layers.19.self_attn.gate_slice | Ext(Movement(Copy { fill: |    271.4 |    24576 |      0.1 |     0.0%
+layers.3.self_attn.v | GemvPacked { x: ValueId(1 |    246.3 |   870400 |      3.5 |     1.2%
+layers.3.self_attn.q_slice | Ext(Movement(Copy { fill: |    182.0 |    24576 |      0.1 |     0.0%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    153.3 | 21258240 |    138.6 |    48.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      8138   139.3   48.6%
+  MegakernelMlp             8       925   183.8   64.2%
+  DeltaNetStep             18       303    75.0   26.2%
+  RmsNorm                  41       237     4.3    1.5%
+  Copy                     12       149     2.0    0.7%
+  CachedAttention           6       120   842.2  294.0%
+  RmsNormBatch              6        30     2.9    1.0%
+  Binary                    6        18     8.3    2.9%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1520.8 | 418179072 |    275.0 |    96.0%
+layers.5.mixer.proj_z | GemvPacked { x: ValueId(2 |    789.5 |  2899968 |      3.7 |     1.3%
+layers.18.mixer.proj_qkv | GemvPacked { x: ValueId(7 |    743.0 |  8683520 |     11.7 |     4.1%
+layers.2.mlp.up      | GemvPacked { x: ValueId(1 |    722.4 |  8708096 |     12.1 |     4.2%
+layers.10.mixer.proj_qkv | GemvPacked { x: ValueId(4 |    721.3 |  8683520 |     12.0 |     4.2%
+layers.23.self_attn.o | GemvPacked { x: ValueId(9 |    285.5 |  2383872 |      8.3 |     2.9%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    168.1 | 21258240 |    126.4 |    44.1%
+layers.9.mixer.proj_qkv | GemvPacked { x: ValueId(3 |    128.7 |  8683520 |     67.5 |    23.6%
+layers.23.self_attn.q_slice | Ext(Movement(Copy { fill: |    112.0 |    24576 |      0.2 |     0.1%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    109.6 | 21258240 |    193.9 |    67.7%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      5672   199.8   69.8%
+  MegakernelMlp             8      1827    93.1   32.5%
+  DeltaNetStep             18       500    45.5   15.9%
+  RmsNorm                  41       267     3.8    1.3%
+  CachedAttention           6       126   797.5  278.4%
+  Copy                     12        38     7.8    2.7%
+  RmsNormBatch              6        30     2.9    1.0%
+  Binary                    6        24     6.2    2.2%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1498.4 | 418179072 |    279.1 |    97.4%
+layers.7.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |   1035.4 | 21258240 |     20.5 |     7.2%
+layers.22.mixer.out  | GemvPacked { x: ValueId(9 |    718.0 |  2908160 |      4.1 |     1.4%
+layers.12.mixer.delta | Ext(DeltaNet(DeltaNetStep |    191.6 |  1262272 |      6.6 |     2.3%
+layers.12.mixer.proj_a | GemvPacked { x: ValueId(5 |    137.0 |    73856 |      0.5 |     0.2%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    124.1 | 21258240 |    171.3 |    59.8%
+layers.21.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    116.7 | 21258240 |    182.1 |    63.6%
+layers.18.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    114.1 | 21258240 |    186.3 |    65.0%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    110.1 | 21258240 |    193.0 |    67.4%
+layers.13.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    109.2 | 21258240 |    194.6 |    67.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      6237   181.8   63.5%
+  MegakernelMlp             8       916   185.8   64.9%
+  RmsNorm                  41       546     1.8    0.6%
+  DeltaNetStep             18       331    68.6   23.9%
+  CachedAttention           6       298   338.5  118.2%
+  Unary                     6       262     0.4    0.1%
+  Copy                     12        40     7.3    2.5%
+  RmsNormBatch              6        30     2.9    1.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1502.8 | 418179072 |    278.3 |    97.1%
+layers.2.mixer.out   | GemvPacked { x: ValueId(1 |    708.8 |  2908160 |      4.1 |     1.4%
+layers.13.input_layernorm.out | RmsNorm { x: ValueId(1001 |    313.3 |    24576 |      0.1 |     0.0%
+layers.23.self_attn.k | GemvPacked { x: ValueId(9 |    254.9 |   731136 |      2.9 |     1.0%
+layers.7.self_attn.gate_act | Ext(Elementwise(Unary { x |    248.3 |    16384 |      0.1 |     0.0%
+layers.7.self_attn.core | CachedAttention { q: Valu |    194.1 | 16797700 |     86.5 |    30.2%
+layers.23.self_attn.v | GemvPacked { x: ValueId(9 |    185.7 |   870400 |      4.7 |     1.6%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    133.5 | 21258240 |    159.2 |    55.6%
+layers.2.mixer.proj_a | GemvPacked { x: ValueId(8 |    121.9 |    73856 |      0.6 |     0.2%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    121.2 | 21258240 |    175.3 |    61.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      4833   234.5   81.9%
+  DeltaNetStep             18      1319    17.2    6.0%
+  Copy                     12      1096     0.3    0.1%
+  MegakernelMlp             8       910   187.0   65.3%
+  RmsNorm                  41       267     3.8    1.3%
+  CachedAttention           6       129   783.8  273.7%
+  RmsNormBatch              6        30     2.9    1.0%
+  Unary                     6        20     5.0    1.8%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1428.7 | 418179072 |    292.7 |   102.2%
+layers.7.self_attn.q_slice | Ext(Movement(Copy { fill: |   1057.9 |    24576 |      0.0 |     0.0%
+layers.17.mixer.delta | Ext(DeltaNet(DeltaNetStep |    683.8 |  1262272 |      1.8 |     0.6%
+layers.21.mixer.delta | Ext(DeltaNet(DeltaNetStep |    377.9 |  1262272 |      3.3 |     1.2%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    148.7 | 21258240 |    142.9 |    49.9%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    110.2 | 21258240 |    192.8 |    67.3%
+layers.7.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    109.1 | 21258240 |    194.9 |    68.0%
+layers.21.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.7 | 21258240 |    195.5 |    68.2%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.6 | 21258240 |    195.7 |    68.3%
+layers.13.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.5 | 21258240 |    195.9 |    68.4%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7279   155.7   54.4%
+  MegakernelMlp             8       926   183.7   64.1%
+  DeltaNetStep             18       891    25.5    8.9%
+  RmsNorm                  41       245     4.1    1.4%
+  CachedAttention           6       135   748.4  261.3%
+  RmsNormBatch              6        49     1.8    0.6%
+  Copy                     12        41     7.1    2.5%
+  Unary                     6        23     4.2    1.5%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1425.8 | 418179072 |    293.3 |   102.4%
+layers.12.mixer.proj_qkv | GemvPacked { x: ValueId(5 |    735.4 |  8683520 |     11.8 |     4.1%
+layers.17.mixer.out  | GemvPacked { x: ValueId(7 |    716.4 |  2908160 |      4.1 |     1.4%
+layers.2.mixer.out   | GemvPacked { x: ValueId(1 |    714.6 |  2908160 |      4.1 |     1.4%
+layers.17.mixer.delta | Ext(DeltaNet(DeltaNetStep |    288.2 |  1262272 |      4.4 |     1.5%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    168.0 | 21258240 |    126.5 |    44.2%
+layers.18.mixer.delta | Ext(DeltaNet(DeltaNetStep |    153.4 |  1262272 |      8.2 |     2.9%
+layers.13.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    109.6 | 21258240 |    193.9 |    67.7%
+layers.21.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    109.0 | 21258240 |    195.1 |    68.1%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.7 | 21258240 |    195.6 |    68.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163     10476   108.2   37.8%
+  MegakernelMlp             8      1683   101.1   35.3%
+  CachedAttention           6       895   112.6   39.3%
+  DeltaNetStep             18       380    59.7   20.8%
+  RmsNorm                  41       263     3.8    1.3%
+  RmsNormBatch              6        43     2.0    0.7%
+  Copy                     12        40     7.3    2.5%
+  Unary                     6        20     4.9    1.7%
+layers.17.mlp.up     | GemvPacked { x: ValueId(7 |   1552.3 |  6742016 |      4.3 |     1.5%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1509.7 | 418179072 |    277.0 |    96.7%
+layers.5.mixer.proj_qkv | GemvPacked { x: ValueId(2 |    868.5 |  8683520 |     10.0 |     3.5%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    847.4 | 21258240 |     25.1 |     8.8%
+layers.0.mlp.down    | GemvPacked { x: ValueId(4 |    810.1 | 10362880 |     12.8 |     4.5%
+layers.23.self_attn.core | CachedAttention { q: Valu |    796.5 | 16797700 |     21.1 |     7.4%
+layers.19.self_attn.v | GemvPacked { x: ValueId(7 |    773.5 |   731136 |      0.9 |     0.3%
+layers.2.mixer.out   | GemvPacked { x: ValueId(1 |    700.3 |  2908160 |      4.2 |     1.4%
+layers.11.mlp.up     | GemvPacked { x: ValueId(4 |    219.3 |  7135232 |     32.5 |    11.4%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    135.3 | 21258240 |    157.1 |    54.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      6515   174.0   60.7%
+  MegakernelMlp             8       889   191.4   66.8%
+  RmsNormBatch              6       774     0.1    0.0%
+  DeltaNetStep             18       527    43.1   15.0%
+  Binary                    6       334     0.4    0.2%
+  RmsNorm                  41       278     3.6    1.3%
+  Copy                     12       245     1.2    0.4%
+  CachedAttention           6       129   784.3  273.8%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1436.3 | 418179072 |    291.2 |   101.6%
+layers.15.self_attn.k_norm+layers.15.self_attn.q_norm | RmsNormBatch { segs: [Nor |    749.4 |    14468 |      0.0 |     0.0%
+layers.11.self_attn.o | GemvPacked { x: ValueId(4 |    706.4 |  2383872 |      3.4 |     1.2%
+layers.11.self_attn.gated_core | Ext(Elementwise(Binary {  |    311.8 |    24576 |      0.1 |     0.0%
+layers.7.self_attn.v | GemvPacked { x: ValueId(2 |    267.5 |   870400 |      3.3 |     1.1%
+layers.7.self_attn.q_slice | Ext(Movement(Copy { fill: |    186.0 |    24576 |      0.1 |     0.0%
+layers.8.mlp.up      | GemvPacked { x: ValueId(3 |    169.4 |  6742016 |     39.8 |    13.9%
+layers.22.mixer.delta | Ext(DeltaNet(DeltaNetStep |    155.7 |  1262272 |      8.1 |     2.8%
+layers.22.mixer.proj_z | GemvPacked { x: ValueId(9 |    127.3 |  2899968 |     22.8 |     8.0%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    121.1 | 21258240 |    175.5 |    61.3%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      8330   136.1   47.5%
+  MegakernelMlp             8      2376    71.6   25.0%
+  CachedAttention           6       938   107.5   37.5%
+  Copy                     12       856     0.3    0.1%
+  DeltaNetStep             18       570    39.9   13.9%
+  RmsNorm                  41       413     2.4    0.9%
+  RmsNormBatch              6        49     1.8    0.6%
+  Unary                     6        19     5.2    1.8%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |   1611.7 | 21258240 |     13.2 |     4.6%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1487.5 | 418179072 |    281.1 |    98.1%
+layers.3.self_attn.core | CachedAttention { q: Valu |    839.3 | 16797700 |     20.0 |     7.0%
+layers.12.mixer.proj_a | GemvPacked { x: ValueId(5 |    821.8 |    73856 |      0.1 |     0.0%
+layers.7.self_attn.gate_slice | Ext(Movement(Copy { fill: |    820.6 |    24576 |      0.0 |     0.0%
+layers.20.mlp.up     | GemvPacked { x: ValueId(8 |    739.0 |  7135232 |      9.7 |     3.4%
+layers.20.mlp.gate   | GemvPacked { x: ValueId(8 |    414.7 |  7110656 |     17.1 |     6.0%
+layers.15.self_attn.o | GemvPacked { x: ValueId(6 |    359.7 |  2383872 |      6.6 |     2.3%
+layers.6.mixer.proj_qkv | GemvPacked { x: ValueId(2 |    246.9 |  8683520 |     35.2 |    12.3%
+layers.6.mixer.proj_z | GemvPacked { x: ValueId(2 |    239.1 |  2899968 |     12.1 |     4.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      6508   174.2   60.8%
+  DeltaNetStep             18       979    23.2    8.1%
+  MegakernelMlp             8       864   196.9   68.7%
+  Copy                     12       805     0.4    0.1%
+  RmsNorm                  41       233     4.3    1.5%
+  CachedAttention           6       117   860.5  300.4%
+  RmsNormBatch              6        30     2.9    1.0%
+  Binary                    6        17     8.8    3.1%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1444.7 | 418179072 |    289.5 |   101.1%
+layers.15.self_attn.q_slice | Ext(Movement(Copy { fill: |    768.9 |    24576 |      0.0 |     0.0%
+layers.4.mlp.down    | GemvPacked { x: ValueId(2 |    752.2 | 10362880 |     13.8 |     4.8%
+layers.9.mixer.delta | Ext(DeltaNet(DeltaNetStep |    706.8 |  1262272 |      1.8 |     0.6%
+layers.4.mlp.up      | GemvPacked { x: ValueId(2 |    413.5 |  7135232 |     17.3 |     6.0%
+layers.15.self_attn.v | GemvPacked { x: ValueId(6 |    204.7 |   870400 |      4.3 |     1.5%
+layers.19.self_attn.k | GemvPacked { x: ValueId(7 |    173.5 |   567296 |      3.3 |     1.1%
+layers.7.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    111.2 | 21258240 |    191.2 |    66.8%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.5 | 21258240 |    196.0 |    68.4%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    107.8 | 21258240 |    197.3 |    68.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7173   158.0   55.2%
+  DeltaNetStep             18      1073    21.2    7.4%
+  MegakernelMlp             8       946   179.8   62.8%
+  Copy                     12       726     0.4    0.1%
+  RmsNorm                  41       273     3.7    1.3%
+  CachedAttention           6       117   861.4  300.7%
+  RmsNormBatch              6        30     2.9    1.0%
+  Unary                     6        17     5.8    2.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1855.6 | 418179072 |    225.4 |    78.7%
+layers.14.mixer.proj_qkv | GemvPacked { x: ValueId(5 |    951.9 |  8683520 |      9.1 |     3.2%
+layers.18.mixer.delta | Ext(DeltaNet(DeltaNetStep |    783.7 |  1262272 |      1.6 |     0.6%
+layers.3.self_attn.gate_slice | Ext(Movement(Copy { fill: |    677.6 |    24576 |      0.0 |     0.0%
+layers.9.mlp.gate    | GemvPacked { x: ValueId(4 |    269.8 |  6717440 |     24.9 |     8.7%
+layers.19.self_attn.q | GemvPacked { x: ValueId(7 |    211.8 |  4481024 |     21.2 |     7.4%
+layers.23.self_attn.q | GemvPacked { x: ValueId(9 |    204.2 |  5791744 |     28.4 |     9.9%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    177.6 | 21258240 |    119.7 |    41.8%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    116.5 | 21258240 |    182.4 |    63.7%
+layers.9.mixer.proj_qkv | GemvPacked { x: ValueId(3 |    112.6 |  8683520 |     77.1 |    26.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7555   150.0   52.4%
+  MegakernelMlp             8      1096   155.2   54.2%
+  RmsNorm                  41       998     1.0    0.4%
+  CachedAttention           6       451   223.4   78.0%
+  DeltaNetStep             18       328    69.2   24.2%
+  RmsNormBatch              6       266     0.3    0.1%
+  Binary                    6       204     0.7    0.3%
+  Unary                     6       182     0.5    0.2%
+layers.11.mlp.down   | GemvPacked { x: ValueId(4 |   1583.3 | 10362880 |      6.5 |     2.3%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1498.2 | 418179072 |    279.1 |    97.4%
+layers.14.post_attention_layernorm.out | RmsNorm { x: ValueId(615) |    772.1 |    24576 |      0.0 |     0.0%
+layers.18.mixer.proj_z | GemvPacked { x: ValueId(7 |    358.2 |  2899968 |      8.1 |     2.8%
+layers.3.self_attn.core | CachedAttention { q: Valu |    356.7 | 16797700 |     47.1 |    16.4%
+layers.8.mixer.proj_z | GemvPacked { x: ValueId(3 |    305.6 |  2899968 |      9.5 |     3.3%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    294.5 | 21258240 |     72.2 |    25.2%
+layers.23.self_attn.k_norm+layers.23.self_attn.q_norm | RmsNormBatch { segs: [Nor |    239.7 |    14468 |      0.1 |     0.0%
+layers.18.mixer.proj_b | GemvPacked { x: ValueId(7 |    201.2 |    73792 |      0.4 |     0.1%
+layers.3.self_attn.gated_core | Ext(Elementwise(Binary {  |    189.5 |    24576 |      0.1 |     0.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      6375   177.8   62.1%
+  MegakernelMlp             8      1109   153.3   53.5%
+  DeltaNetStep             18       342    66.4   23.2%
+  RmsNorm                  41       235     4.3    1.5%
+  CachedAttention           6       114   883.8  308.5%
+  Copy                     12        40     7.4    2.6%
+  RmsNormBatch              6        29     3.0    1.0%
+  Unary                     6        17     5.9    2.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1428.7 | 418179072 |    292.7 |   102.2%
+layers.8.mixer.proj_qkv | GemvPacked { x: ValueId(3 |    720.8 |  8683520 |     12.0 |     4.2%
+layers.17.mixer.proj_z | GemvPacked { x: ValueId(7 |    357.1 |  2899968 |      8.1 |     2.8%
+layers.12.mixer.proj_z | GemvPacked { x: ValueId(5 |    278.7 |  2899968 |     10.4 |     3.6%
+layers.21.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    272.0 | 21258240 |     78.2 |    27.3%
+layers.17.mixer.proj_b | GemvPacked { x: ValueId(7 |    195.5 |    73792 |      0.4 |     0.1%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    166.5 | 21258240 |    127.6 |    44.6%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    120.3 | 21258240 |    176.8 |    61.7%
+layers.7.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    118.7 | 21258240 |    179.1 |    62.5%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    109.0 | 21258240 |    195.0 |    68.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      8009   141.5   49.4%
+  MegakernelMlp             8       864   196.7   68.7%
+  DeltaNetStep             18       465    48.9   17.1%
+  RmsNorm                  41       233     4.3    1.5%
+  CachedAttention           6       128   787.1  274.8%
+  RmsNormBatch              6        72     1.2    0.4%
+  Copy                     12        37     7.9    2.8%
+  Unary                     6        18     5.6    2.0%
+layers.19.mlp.gate   | GemvPacked { x: ValueId(8 |   1632.9 |  6717440 |      4.1 |     1.4%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1430.4 | 418179072 |    292.4 |   102.1%
+layers.2.mlp.gate    | GemvPacked { x: ValueId(1 |    725.5 |  8683520 |     12.0 |     4.2%
+layers.11.self_attn.o | GemvPacked { x: ValueId(4 |    206.1 |  2383872 |     11.6 |     4.0%
+layers.9.mixer.delta | Ext(DeltaNet(DeltaNetStep |    189.3 |  1262272 |      6.7 |     2.3%
+layers.12.mixer.proj_qkv | GemvPacked { x: ValueId(5 |    161.4 |  8683520 |     53.8 |    18.8%
+layers.10.mixer.proj_qkv | GemvPacked { x: ValueId(4 |    150.9 |  8683520 |     57.5 |    20.1%
+layers.23.self_attn.o | GemvPacked { x: ValueId(9 |    147.8 |  2383872 |     16.1 |     5.6%
+layers.5.mixer.out   | GemvPacked { x: ValueId(2 |    135.1 |  2908160 |     21.5 |     7.5%
+layers.9.mixer.proj_qkv | GemvPacked { x: ValueId(3 |    115.6 |  8683520 |     75.1 |    26.2%
+⚡ Prefill: 25 tokens in 289.47ms (86.4 tok/s)
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemmBatchedPacked       186     42102    23.7    8.3%
+  DeltaRule                18      1985    17.0    5.9%
+  Copy                     66      1506    34.3   12.0%
+  GemvPacked                1      1471   284.3   99.3%
+  RmsNorm                  67      1410    19.5    6.8%
+  CausalConv1dCached       18       999    25.2    8.8%
+  Unary                    78       753    42.6   14.9%
+  Binary                   60       494    30.1   10.5%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1470.7 | 418179072 |    284.3 |    99.3%
+layers.15.mlp.up     | GemmBatchedPacked { x: Va |    968.6 |  9469952 |      9.8 |     3.4%
+layers.19.self_attn.q | GemmBatchedPacked { x: Va |    813.6 |  5070848 |      6.2 |     2.2%
+layers.17.mixer.k    | Ext(Movement(Copy { fill: |    770.3 |   819200 |      1.1 |     0.4%
+layers.22.mixer.conv | CausalConv1dCached { x: V |    717.2 |  1400832 |      2.0 |     0.7%
+layers.12.post_attention_layernorm.out | RmsNorm { x: ValueId(531) |    690.9 |   417792 |      0.6 |     0.2%
+layers.8.mlp.down    | GemmBatchedPacked { x: Va |    534.3 |  9674752 |     18.1 |     6.3%
+layers.22.mlp.down   | GemmBatchedPacked { x: Va |    389.0 |  8101888 |     20.8 |     7.3%
+layers.15.mlp.down   | GemmBatchedPacked { x: Va |    373.4 | 11345920 |     30.4 |    10.6%
+layers.20.mlp.down   | GemmBatchedPacked { x: Va |    355.3 | 11345920 |     31.9 |    11.1%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7197   157.5   55.0%
+  DeltaNetStep             18       989    23.0    8.0%
+  MegakernelMlp             8       906   187.6   65.5%
+  RmsNorm                  41       264     3.8    1.3%
+  CachedAttention           6       118   856.5  299.0%
+  Copy                     12        37     7.9    2.8%
+  RmsNormBatch              6        30     2.9    1.0%
+  Unary                     6        18     5.4    1.9%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1716.0 | 418179072 |    243.7 |    85.1%
+layers.14.mixer.proj_z | GemvPacked { x: ValueId(5 |   1048.9 |  2899968 |      2.8 |     1.0%
+layers.5.mlp.gate    | GemvPacked { x: ValueId(2 |    957.2 |  7110656 |      7.4 |     2.6%
+layers.22.mixer.delta | Ext(DeltaNet(DeltaNetStep |    695.8 |  1262272 |      1.8 |     0.6%
+layers.13.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    133.0 | 21258240 |    159.8 |    55.8%
+layers.18.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    126.7 | 21258240 |    167.7 |    58.6%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.5 | 21258240 |    195.9 |    68.4%
+layers.21.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.3 | 21258240 |    196.2 |    68.5%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    108.0 | 21258240 |    196.8 |    68.7%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    107.8 | 21258240 |    197.3 |    68.9%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7336   154.5   54.0%
+  MegakernelMlp             8       870   195.4   68.2%
+  RmsNormBatch              6       330     0.3    0.1%
+  DeltaNetStep             18       287    79.2   27.6%
+  RmsNorm                  41       233     4.3    1.5%
+  CachedAttention           6       128   789.4  275.6%
+  Copy                     12        41     7.2    2.5%
+  Unary                     6        18     5.5    1.9%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1479.1 | 418179072 |    282.7 |    98.7%
+layers.5.mixer.proj_b | GemvPacked { x: ValueId(2 |    831.3 |    73792 |      0.1 |     0.0%
+layers.19.mlp.up     | GemvPacked { x: ValueId(8 |    714.5 |  6742016 |      9.4 |     3.3%
+layers.11.self_attn.k_norm+layers.11.self_attn.q_norm | RmsNormBatch { segs: [Nor |    250.3 |    14468 |      0.1 |     0.0%
+layers.19.mlp.gate   | GemvPacked { x: ValueId(8 |    249.5 |  6717440 |     26.9 |     9.4%
+layers.9.mixer.proj_z | GemvPacked { x: ValueId(3 |    204.9 |  2899968 |     14.2 |     4.9%
+layers.4.mixer.out   | GemvPacked { x: ValueId(1 |    203.2 |  2908160 |     14.3 |     5.0%
+layers.9.mlp.gate    | GemvPacked { x: ValueId(4 |    178.6 |  6717440 |     37.6 |    13.1%
+layers.16.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    110.7 | 21258240 |    191.9 |    67.0%
+layers.21.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    110.4 | 21258240 |    192.6 |    67.2%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      8159   138.9   48.5%
+  MegakernelMlp             8       987   172.2   60.1%
+  DeltaNetStep             18       432    52.6   18.4%
+  RmsNorm                  41       367     2.7    1.0%
+  Copy                     12       290     1.0    0.4%
+  CachedAttention           6       119   845.5  295.2%
+  Unary                     6        32     3.1    1.1%
+  RmsNormBatch              6        30     2.9    1.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1816.0 | 418179072 |    230.3 |    80.4%
+layers.16.mixer.proj_z | GemvPacked { x: ValueId(6 |   1144.0 |  2899968 |      2.5 |     0.9%
+layers.14.mlp.down   | GemvPacked { x: ValueId(6 |    781.1 | 10362880 |     13.3 |     4.6%
+layers.23.mlp.gate   | GemvPacked { x: ValueId(9 |    723.4 |  8683520 |     12.0 |     4.2%
+layers.3.self_attn.gate_slice | Ext(Movement(Copy { fill: |    195.8 |    24576 |      0.1 |     0.0%
+layers.18.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    163.3 | 21258240 |    130.2 |    45.5%
+layers.22.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    152.4 | 21258240 |    139.5 |    48.7%
+layers.23.post_attention_layernorm.out | RmsNorm { x: ValueId(984) |    137.5 |    24576 |      0.2 |     0.1%
+layers.6.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    128.7 | 21258240 |    165.1 |    57.6%
+layers.13.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |    112.5 | 21258240 |    189.0 |    66.0%
+profiler: per-command-buffer timing (bytes = operands read + output written)
+step                 | kernel                    |       µs |    bytes |     GB/s | % ceiling
+by kernel kind: kind | steps | total µs | GB/s | % ceiling
+  GemvPacked              163      7611   148.9   52.0%
+  MegakernelMlp             8      2280    74.6   26.0%
+  RmsNorm                  41       476     2.1    0.7%
+  DeltaNetStep             18       290    78.3   27.3%
+  CachedAttention           6       125   804.1  280.7%
+  Copy                     12        41     7.1    2.5%
+  RmsNormBatch              6        33     2.7    0.9%
+  Binary                    6        18     8.1    2.8%
+layers.12.post_attention_layernorm.out.fused_mlp | MegakernelMlp { x: ValueI |   1484.8 | 21258240 |     14.3 |     5.0%
+lm_head.linear       | GemvPacked { x: ValueId(9 |   1461.3 | 418179072 |    286.2 |    99.9%
+layers.8.mixer.out   | GemvPacked { x: ValueId(3 |    933.6 |  2908160 |      3.1 |     1.1%
+layers.23.self_attn.q | GemvPacked { x: ValueId(9 |    718.0 |  5791744 |      8.1 |     2.8%
