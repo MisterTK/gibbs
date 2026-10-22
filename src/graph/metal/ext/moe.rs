@@ -110,25 +110,13 @@ static CODEC_F32: Codec = Codec {
     block_bytes: 32,
     msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const float* f = (device const float*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = f[i];\n}\n",
 };
-static CODEC_F16: Codec = Codec {
-    format: QuantFormat::FP16,
-    block_elems: 8,
-    block_bytes: 16,
-    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const half* h = (device const half*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = float(h[i]);\n}\n",
-};
-static CODEC_BF16: Codec = Codec {
-    format: QuantFormat::BF16,
-    block_elems: 8,
-    block_bytes: 16,
-    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const ushort* h = (device const ushort*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = as_type<float>(uint(h[i]) << 16);\n}\n",
-};
 
 /// How the expert GEMV reads a bank stored as `dtype`: every codec format, plus f32/f16/bf16.
 pub(super) fn bank_codec(dtype: DType) -> Option<&'static Codec> {
     match dtype {
         DType::F32 => Some(&CODEC_F32),
-        DType::F16 => Some(&CODEC_F16),
-        DType::BF16 => Some(&CODEC_BF16),
+        DType::F16 => Some(&crate::graph::codegen::CODEC_F16),
+        DType::BF16 => Some(&crate::graph::codegen::CODEC_BF16),
         DType::Quant(f) => codec(f),
         DType::U32 => None,
     }

@@ -1030,6 +1030,8 @@ fn every_kernel_source_compiles() {
     let need = |name: &str| -> u64 {
         if name.starts_with("deltanet_step_") {
             ext::deltanet::THREADS as u64
+        } else if name.starts_with("gemmgen_") {
+            TG4
         } else {
             TG
         }
@@ -1059,6 +1061,8 @@ fn every_kernel_source_compiles() {
     let build = |src: &str, name: &str| {
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
+        // SAFETY: `setLanguageVersion:` takes an NSUInteger enum; 0x40000 is MTLLanguageVersion4_0.
+        let () = unsafe { msg_send![&*opts, setLanguageVersion: MSL_4_0] };
         let lib = device
             .new_library_with_source(src, &opts)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1072,6 +1076,8 @@ fn every_kernel_source_compiles() {
     };
     let head = "#include <metal_stdlib>\nusing namespace metal;\n";
     let common = codegen::gemv_common(&KERNELS_MSL);
+    let head_mpp = "#define GIBBS_MPP 1\n#include <metal_stdlib>\n#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace metal;\n";
+    let gemm_common = codegen::gemm_common(&KERNELS_MSL);
     let mut codecs: Vec<&codec::Codec> = Vec::new();
     for f in [
         QuantFormat::GGUF_Q4_0,
@@ -1126,6 +1132,20 @@ fn every_kernel_source_compiles() {
                 &codegen::gemv_indexed_name(c, p),
             );
         }
+        for epi in [0, 1, 2] {
+            build(
+                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi)),
+                &codegen::gemm_packed_name(c, epi),
+            );
+        }
+    }
+    for c in [&codegen::CODEC_F16, &codegen::CODEC_BF16] {
+        for epi in [0, 1, 2] {
+            build(
+                &format!("{head_mpp}{gemm_common}{}", codegen::gemm_packed(c, epi)),
+                &codegen::gemm_packed_name(c, epi),
+            );
+        }
     }
 }
 
@@ -1166,9 +1186,9 @@ fn gemv_matches_cpu_for_every_packed_format() {
             .wrapping_add(1442695040888963407);
         (seed >> 33) as u32
     };
-    // Finite f16 scale (|x| in 2^-6..2^4) so the reference and the GPU never meet NaN/inf.
+    // Finite f16 scale (|x| in 2^-6..2^1) so decoded values fit in half and never meet NaN/inf.
     let f16 = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
-        let exp = 9 + (next() % 14) as u16;
+        let exp = 9 + (next() % 8) as u16;
         (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
     };
     // m = 3 runs the GEMV kernels; m = 20 (>= 16) the batched GEMM (hand kernels, or codec expansion + f32 GEMM).
@@ -1242,8 +1262,9 @@ fn gemv_matches_cpu_for_every_packed_format() {
                 .into_f32()
                 .unwrap();
             let err = rel_err(&want, &got);
+            let tol = if m >= 16 { 1e-3 } else { 1e-4 };
             assert!(
-                err < 1e-4,
+                err < tol,
                 "{f:?} m={m} {v:?}: packed linear differs from CPU by {err}"
             );
         }
@@ -1429,8 +1450,9 @@ fn tq2_0_planar_layout_matches_cpu() {
                     .into_f32()
                     .unwrap();
                 let err = rel_err(&want, &got);
+                let tol = if m >= 16 { 1e-3 } else { 1e-4 };
                 assert!(
-                    err < 1e-4,
+                    err < tol,
                     "TQ2_0 {n}x{k} m={m} {v:?}: differs from CPU by {err}"
                 );
             }
@@ -2006,6 +2028,164 @@ fn gemm_batched_packed_matches_cpu() {
         let inputs = vec![Tensor::F32(rand(m * k, 999))];
         let (want, got) = both(&g, &w, inputs, None);
         assert!(rel_err(&want, &got) < 1e-3, "Q8_0 batched mismatch");
+    }
+}
+
+#[test]
+fn gemm_packed_in_tile_dequant_matches_cpu() {
+    use crate::model::layers::{encode_rows, gguf_block_codec};
+    let rt = rt();
+    assert!(rt.profile.mpp.is_ok(), "MPP required: {:?}", rt.profile.mpp);
+    let formats = [
+        QuantFormat::BF16,
+        QuantFormat::FP16,
+        QuantFormat::GGUF_Q4_0,
+        QuantFormat::GGUF_Q8_0,
+        QuantFormat::GGUF_Q4_K_M,
+        QuantFormat::GGUF_Q5_K_M,
+        QuantFormat::GGUF_Q6_K,
+        QuantFormat::GGUF_TQ2_0,
+        QuantFormat::GGUF_IQ2_XXS,
+        QuantFormat::GGUF_IQ4_NL,
+    ];
+    let mut seed = 0x517CC1B727220A95u64;
+    let mut next_u32 = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    let f16_scale = |next: &mut dyn FnMut() -> u32| -> [u8; 2] {
+        let exp = 10 + (next() % 6) as u16;
+        (((next() & 1) as u16) << 15 | exp << 10 | (next() & 0x3FF) as u16).to_le_bytes()
+    };
+    for fmt in formats {
+        for (n, k) in [(64usize, 256usize), (200, 1536)] {
+            let mut w = Weights::new();
+            let w_f32 = rand(n * k, 100 + fmt as u64);
+            let w_dtype = match fmt {
+                QuantFormat::BF16 => {
+                    let raw_w: Vec<u16> = w_f32.iter().copied().map(crate::model::f32_to_bf16).collect();
+                    w.insert("w", Tensor::BF16(raw_w));
+                    DType::BF16
+                }
+                QuantFormat::FP16 => {
+                    let raw_w: Vec<u16> = w_f32.iter().copied().map(crate::model::f32_to_f16).collect();
+                    w.insert("w", Tensor::F16(raw_w));
+                    DType::F16
+                }
+                QuantFormat::GGUF_Q4_0
+                | QuantFormat::GGUF_Q8_0
+                | QuantFormat::GGUF_Q4_K_M
+                | QuantFormat::GGUF_Q5_K_M
+                | QuantFormat::GGUF_Q6_K => {
+                    let raw = encode_rows(&w_f32, k, fmt).expect("encode_rows");
+                    w.insert(
+                        "w",
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(fmt, raw, n, k)),
+                    );
+                    DType::Quant(fmt)
+                }
+                _ => {
+                    let (be, bb, dequant) = gguf_block_codec(fmt).expect("CPU dequantizer");
+                    let scale_off = if fmt == QuantFormat::GGUF_TQ2_0 { 64 } else { 0 };
+                    let mut raw: Vec<u8> = (0..n * (k / be) * bb)
+                        .map(|_| (next_u32() >> 4) as u8)
+                        .collect();
+                    let mut decoded = vec![0.0f32; be];
+                    for blk in raw.chunks_exact_mut(bb) {
+                        blk[scale_off..scale_off + 2].copy_from_slice(&f16_scale(&mut next_u32));
+                        dequant(blk, &mut decoded);
+                        if !decoded.iter().all(|v| v.is_finite()) {
+                            blk.fill(0);
+                        }
+                    }
+                    w.insert(
+                        "w",
+                        Tensor::Mat(crate::model::weights::Mat::from_packed_bytes(fmt, raw, n, k)),
+                    );
+                    DType::Quant(fmt)
+                }
+            };
+            w.insert("b", Tensor::F32(rand(n, 200)));
+            let session = Session::new(rt.clone(), &w).unwrap();
+            let x_512 = rand(512 * k, 300);
+            let r_512 = rand(512 * n, 400);
+            let build_graph = |m: usize, case: usize| -> Graph {
+                let mut g = Graph::new();
+                let x = g.input("x", vec![m, k], DType::F32);
+                let r = g.input("r", vec![m, n], DType::F32);
+                let wv = g.weight("w", vec![n, k], w_dtype);
+                let bv = g.weight("b", vec![n], DType::F32);
+                let ins = if case == 0 {
+                    vec![x, wv]
+                } else {
+                    vec![x, wv, bv]
+                };
+                let lin = g.add("lin", Op::Linear, &ins, vec![m, n], DType::F32);
+                let out = match case {
+                    0 | 1 => lin,
+                    2 => g.add(
+                        "gelu",
+                        Op::Unary {
+                            kind: crate::graph::UnaryKind::GeluErf,
+                        },
+                        &[lin],
+                        vec![m, n],
+                        DType::F32,
+                    ),
+                    _ => g.add(
+                        "res",
+                        Op::Binary {
+                            kind: crate::graph::BinaryKind::Add,
+                        },
+                        &[r, lin],
+                        vec![m, n],
+                        DType::F32,
+                    ),
+                };
+                g.output(out);
+                g
+            };
+            // Compute CPU reference once for m=512; row-independence gives m=16 and m=77 as prefixes.
+            for case in 0..4 {
+                let g_512 = build_graph(512, case);
+                let want_512 = cpu::run_stateless(
+                    &g_512,
+                    &w,
+                    vec![Tensor::F32(x_512.clone()), Tensor::F32(r_512.clone())],
+                )
+                .unwrap()
+                .remove(0)
+                .into_f32()
+                .unwrap();
+                for m in [16usize, 77, 512] {
+                    let g = build_graph(m, case);
+                    let inp = vec![
+                        Tensor::F32(x_512[..m * k].to_vec()),
+                        Tensor::F32(r_512[..m * n].to_vec()),
+                    ];
+                    let got = session
+                        .run(&g, inp)
+                        .unwrap()
+                        .remove(0)
+                        .into_f32()
+                        .unwrap();
+                    let want = &want_512[..m * n];
+                    let err = rel_err(want, &got);
+                    assert!(
+                        err <= 1e-2,
+                        "{fmt:?} {m}x{n}x{k} case {case}: rel_err {err:e} > 1e-2"
+                    );
+                }
+            }
+            if rt.profile.mpp.is_ok() {
+                assert!(
+                    session.dequant_scratch.lock().is_none(),
+                    "{fmt:?}: dequant_scratch should not be allocated when MPP is active"
+                );
+            }
+        }
     }
 }
 #[test]

@@ -167,6 +167,147 @@ pub fn gemv_common(kernels_msl: &str) -> &str {
     &kernels_msl[begin..end]
 }
 
+/// MSL common to the hand kernels and generated GEMMs: `gelu_erf`, `GemmParams` and `epilogue<EPI>`,
+/// taken from `metal_kernels.metal` between its `GEMM-COMMON` markers.
+pub fn gemm_common(kernels_msl: &str) -> &str {
+    let begin = kernels_msl
+        .find("// GEMM-COMMON-BEGIN")
+        .expect("GEMM-COMMON-BEGIN marker in metal_kernels.metal");
+    let end = kernels_msl
+        .find("// GEMM-COMMON-END")
+        .expect("GEMM-COMMON-END marker in metal_kernels.metal");
+    &kernels_msl[begin..end]
+}
+
+pub static CODEC_F16: Codec = Codec {
+    format: crate::hardware::QuantFormat::FP16,
+    block_elems: 8,
+    block_bytes: 16,
+    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const half* h = (device const half*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = float(h[i]);\n}\n",
+};
+
+pub static CODEC_BF16: Codec = Codec {
+    format: crate::hardware::QuantFormat::BF16,
+    block_elems: 8,
+    block_bytes: 16,
+    msl: "inline void decode8(device const uchar* blk, uint sub, thread float* out8) {\n    device const ushort* h = (device const ushort*)blk;\n    for (uint i = 0; i < 8; ++i) out8[i] = as_type<float>(uint(h[i]) << 16);\n}\n",
+};
+
+/// Codec for [`gemm_packed`], including the trivial 8-element `decode8` for F16 and BF16 weights.
+pub fn gemm_codec(f: crate::hardware::QuantFormat) -> Option<&'static Codec> {
+    match f {
+        crate::hardware::QuantFormat::FP16 => Some(&CODEC_F16),
+        crate::hardware::QuantFormat::BF16 => Some(&CODEC_BF16),
+        other => crate::graph::codec::codec(other),
+    }
+}
+
+/// Name of the kernel [`gemm_packed`] emits for `codec` with `epi`.
+pub fn gemm_packed_name(codec: &Codec, epi: u32) -> String {
+    format!("gemmgen_{:?}_e{epi}", codec.format)
+}
+
+/// In-tile dequantization GEMM on the GPU's matrix units (`matmul2d` over a 128×64 output tile,
+/// K step 32, 4 KiB threadgroup weight tile, 128 threads / 4 simdgroups).
+/// Reference: ggml-metal tensor-API `kernel_mul_mm`.
+pub fn gemm_packed(codec: &Codec, epi: u32) -> String {
+    let name = gemm_packed_name(codec, epi);
+    let dec = format!("decode8_{:?}", codec.format);
+    let codec_msl = device_msl(codec).replace("decode8", &dec);
+    let sa_ty = if codec.format == crate::hardware::QuantFormat::BF16 {
+        "bfloat"
+    } else {
+        "half"
+    };
+    let (be, subs) = (codec.block_elems, codec.block_elems / 8);
+    let br = block_ref(
+        codec,
+        "w",
+        &format!("(ulong)col * (p.k / {be}) + s / {subs}"),
+    );
+    let (decl, sub) = (&br.decl, &br.sub);
+    format!(
+        r#"
+#if defined(GIBBS_MPP)
+using namespace mpp::tensor_ops;
+{codec_msl}
+
+kernel void {name}(
+    device float* x [[buffer(0)]],
+    device const uchar* w [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device const float* res [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant GemmParams& p [[buffer(5)]],
+    threadgroup {sa_ty}* sa [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {{
+    const uint m0 = tg.x * 128;
+    const uint n0 = tg.y * 64;
+    if (m0 >= p.m || n0 >= p.n) return;
+    const int tile_m = int(min(128u, p.m - m0));
+    const int tile_n = int(min(64u, p.n - n0));
+
+    auto tA = tensor(sa, dextents<int32_t, 2>(32, 64), array<int, 2>({{1, 32}}));
+    auto tB = tensor(x, dextents<int32_t, 2>(int(p.k), int(p.m)), array<int, 2>({{1, int(p.k)}}));
+    constexpr auto desc = matmul2d_descriptor(
+        128, 64, static_cast<int>(dynamic_extent), false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> mm;
+    auto c = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    #pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+        if (c.is_valid_element(i)) c[i] = 0.0f;
+    }}
+
+    for (uint k0 = 0; k0 < p.k; k0 += 32) {{
+        for (uint work = tid; work < 256; work += 128) {{
+            const uint feat = work / 4;
+            const uint chunk = work % 4;
+            const uint col = n0 + feat;
+            const uint gk = k0 + chunk * 8;
+            threadgroup {sa_ty}* dst = sa + feat * 32 + chunk * 8;
+            if (col < p.n && gk < p.k) {{
+                const uint s = gk / 8;
+                {decl}
+                float v[8];
+                {dec}(b, {sub}s % {subs}, v);
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) {{
+                    dst[i] = (gk + i < p.k) ? {sa_ty}(v[i]) : {sa_ty}(0);
+                }}
+            }} else {{
+                #pragma unroll
+                for (uint i = 0; i < 8; ++i) dst[i] = {sa_ty}(0);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int kExt = int(min(32u, p.k - k0));
+        auto xv = tensor(x + (ulong)m0 * p.k + k0, dextents<int32_t, 2>(kExt, tile_m), array<int, 2>({{1, int(p.k)}}));
+        auto sav = tensor(sa, dextents<int32_t, 2>(kExt, 64), array<int, 2>({{1, 32}}));
+        mm.run(xv, sav, c);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    #pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i) {{
+        if (c.is_valid_element(i)) {{
+            auto idx = c.get_multidimensional_index(i);
+            uint col = n0 + uint(idx[0]), row = m0 + uint(idx[1]);
+            if (row < p.m && col < p.n) c[i] = epilogue<{epi}>(c[i], row, col, p, bias, res);
+        }}
+    }}
+    auto mo = tensor(out + (ulong)m0 * p.n + n0, dextents<int32_t, 2>(tile_n, tile_m), array<int, 2>({{1, int(p.n)}}));
+    c.store(mo);
+}}
+#endif
+"#
+    )
+}
+
 /// Name of the kernel [`gemv_packed`] emits for `codec` with `p` (`_sg2` suffix off the 8-simdgroup default).
 pub fn gemv_packed_name(codec: &Codec, p: GemvParams) -> String {
     let sg = if p.simdgroups == 8 {

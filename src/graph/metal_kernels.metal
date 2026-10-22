@@ -12,12 +12,12 @@ using namespace metal;
 constant uint ATTN_MAX_PER_LANE = 16;
 constant uint ATTN_MAX_SG = 8;
 
-struct GemmParams { uint m; uint n; uint k; uint has_bias; };
 struct EmbedParams { uint n; uint d; uint rows; };
 struct NormParams { uint d; float eps; };
 struct AttnParams { uint nq; uint nk; uint heads; uint head_dim; uint causal; float scale; };
 struct PoolParams { uint n; uint d; };
 
+// GEMM-COMMON-BEGIN
 // GEMV-COMMON-BEGIN (also prepended to generated GEMV kernels by `codegen::gemv_packed`)
 // Tanh-approximated GELU (`gelu_pytorch_tanh`), the activation of GeGlu.
 static inline float gelu_tanh(float x) {
@@ -66,16 +66,7 @@ static inline float apply_gemv_epi(float acc, ulong out_idx, constant PackedGemv
 }
 // GEMV-COMMON-END
 
-// Sum across the whole threadgroup; every thread gets the total. Safe to call repeatedly.
-static inline float block_sum(float v, threadgroup float* scratch, uint sg, uint lane, uint nsg) {
-    v = simd_sum(v);
-    if (lane == 0) scratch[sg] = v;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total = 0.0f;
-    for (uint i = 0; i < nsg; ++i) total += scratch[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return total;
-}
+struct GemmParams { uint m; uint n; uint k; uint has_bias; };
 
 // GEMM epilogues, applied to x·Wᵀ (+ bias) before the store.
 enum : int { EPI_NONE = 0, EPI_GELU = 1, EPI_RESIDUAL = 2 };
@@ -87,6 +78,18 @@ static inline float epilogue(float acc, uint row, uint col, constant GemmParams&
     if (EPI == EPI_GELU) v = gelu_erf(v);
     if (EPI == EPI_RESIDUAL) v += res[(ulong)row * p.n + col];
     return v;
+}
+// GEMM-COMMON-END
+
+// Sum across the whole threadgroup; every thread gets the total. Safe to call repeatedly.
+static inline float block_sum(float v, threadgroup float* scratch, uint sg, uint lane, uint nsg) {
+    v = simd_sum(v);
+    if (lane == 0) scratch[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    for (uint i = 0; i < nsg; ++i) total += scratch[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
 }
 
 // out[m, n] = epilogue(x[m, k] · w[n, k]ᵀ): a 32×32 output tile per threadgroup of 4 simdgroups,
