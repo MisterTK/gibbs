@@ -59,7 +59,10 @@ pub fn has_gpu_codec(f: Q) -> bool {
 /// Formats [`encode_rows`] can produce.
 pub fn encodable(f: Q) -> bool {
     is_float(f)
-        || matches!(f, Q::GGUF_Q3_K | Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4)
+        || matches!(
+            f,
+            Q::GGUF_Q3_K | Q::GGUF_Q4_0 | Q::GGUF_Q8_0 | Q::GGUF_NVFP4
+        )
         || LADDER[..3].contains(&f)
 }
 
@@ -236,13 +239,7 @@ fn rmse_of((num, den): (f64, f64)) -> f64 {
 
 /// Encodes row-major `w` as `f` (a float or an encodable block format whose blocks tile `in_f`),
 /// splitting rows over `threads` workers at utility QoS; row chunks concatenate.
-pub(crate) fn encode_weight(
-    w: &[f32],
-    in_f: usize,
-    out_f: usize,
-    f: Q,
-    threads: usize,
-) -> Vec<u8> {
+pub(crate) fn encode_weight(w: &[f32], in_f: usize, out_f: usize, f: Q, threads: usize) -> Vec<u8> {
     let workers = if w.len() < 1 << 16 {
         1
     } else {
@@ -390,7 +387,16 @@ pub fn reencode_native(
 ) -> Option<(Q, Vec<u8>)> {
     let f = target(cfg, name, src, cols, false)?;
     // The source's own decoder, so the values are exactly what the GPU would have read.
-    encode_blocks(cfg.policy, name, src, f, rows, cols, raw, gguf_block_codec(src)?)
+    encode_blocks(
+        cfg.policy,
+        name,
+        src,
+        f,
+        rows,
+        cols,
+        raw,
+        gguf_block_codec(src)?,
+    )
 }
 
 /// [`reencode_native`] for a projection stored as `src` (any format, floats included) whose
@@ -410,7 +416,16 @@ pub fn reencode_values(
             *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
         }
     }
-    encode_blocks(cfg.policy, name, src, f, rows, cols, &raw, (32, 128, f32_block))
+    encode_blocks(
+        cfg.policy,
+        name,
+        src,
+        f,
+        rows,
+        cols,
+        &raw,
+        (32, 128, f32_block),
+    )
 }
 
 /// The format the policy re-stores `name` (stored as `src`, `cols` wide) in, if any.
@@ -539,7 +554,6 @@ fn encode_blocks(
     Some((f, blocks))
 }
 
-
 // ---- persisted block cache ------------------------------------------------------------------
 
 const TENSOR_ALIGN: usize = 64;
@@ -634,9 +648,20 @@ pub fn choice_key(
         m.len(),
         policy.name(),
     );
-    let h = s.bytes().fold(0xcbf29ce484222325u64, |h, b| {
+    let mut h = s.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     });
+    if force.is_none()
+        && matches!(
+            policy,
+            ReencodePolicy::MaxSpeed | ReencodePolicy::LowBitNative
+        )
+    {
+        for f in LADDER {
+            let bits = crate::model::variant::host_gbps(f).map_or(0, f64::to_bits);
+            h = (h ^ bits).wrapping_mul(0x100000001b3);
+        }
+    }
     Some(format!("{h:016x}"))
 }
 
@@ -762,7 +787,8 @@ pub fn save_reencode_cache(
         for (name, t) in tensors {
             let pad = (TENSOR_ALIGN - (offset % TENSOR_ALIGN)) % TENSOR_ALIGN;
             if pad > 0 {
-                file.write_all(&[0u8; TENSOR_ALIGN][..pad]).map_err(io_err)?;
+                file.write_all(&[0u8; TENSOR_ALIGN][..pad])
+                    .map_err(io_err)?;
                 offset += pad;
             }
             let slice = t
@@ -1021,15 +1047,10 @@ mod tests {
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
-            let gpu = unsafe {
-                std::slice::from_raw_parts(outb.contents() as *const f32, threads * 8)
-            };
+            let gpu =
+                unsafe { std::slice::from_raw_parts(outb.contents() as *const f32, threads * 8) };
             for (i, (&g, &w)) in gpu.iter().zip(&cpu).enumerate() {
-                assert_eq!(
-                    g.to_bits(),
-                    w.to_bits(),
-                    "elem {i}: gpu {g:e} != cpu {w:e}"
-                );
+                assert_eq!(g.to_bits(), w.to_bits(), "elem {i}: gpu {g:e} != cpu {w:e}");
             }
         }
     }
@@ -1096,7 +1117,11 @@ mod tests {
                 Q::GGUF_Q4_K_M,
                 Q::GGUF_Q4_0,
             ] {
-                assert_eq!(rule_with(MinSize, src, &rates), Target::Encode(Q::GGUF_Q3_K), "{src:?}");
+                assert_eq!(
+                    rule_with(MinSize, src, &rates),
+                    Target::Encode(Q::GGUF_Q3_K),
+                    "{src:?}"
+                );
             }
             for src in [Q::GGUF_Q3_K, Q::GGUF_Q2_K, Q::GGUF_IQ2_M, Q::GGUF_TQ2_0] {
                 assert_eq!(rule_with(MinSize, src, &rates), Target::Native, "{src:?}");
@@ -1106,19 +1131,43 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                target(&min_cfg, "model.layers.0.mlp.up_proj.weight", Q::BF16, 256, true),
+                target(
+                    &min_cfg,
+                    "model.layers.0.mlp.up_proj.weight",
+                    Q::BF16,
+                    256,
+                    true
+                ),
                 Some(Q::GGUF_Q3_K)
             );
             assert_eq!(
-                target(&min_cfg, "model.layers.0.mlp.up_proj.weight", Q::BF16, 576, true),
+                target(
+                    &min_cfg,
+                    "model.layers.0.mlp.up_proj.weight",
+                    Q::BF16,
+                    576,
+                    true
+                ),
                 Some(Q::GGUF_Q4_0)
             );
             assert_eq!(
-                target(&min_cfg, "model.layers.0.self_attn.q_proj.weight", Q::BF16, 256, true),
+                target(
+                    &min_cfg,
+                    "model.layers.0.self_attn.q_proj.weight",
+                    Q::BF16,
+                    256,
+                    true
+                ),
                 Some(Q::GGUF_Q4_K_M)
             );
             assert_eq!(
-                target(&min_cfg, "model.layers.0.self_attn.q_proj.weight", Q::BF16, 576, true),
+                target(
+                    &min_cfg,
+                    "model.layers.0.self_attn.q_proj.weight",
+                    Q::BF16,
+                    576,
+                    true
+                ),
                 Some(Q::GGUF_Q4_0)
             );
             assert_eq!(
@@ -1126,7 +1175,13 @@ mod tests {
                 Some(Q::GGUF_Q6_K)
             );
             assert_eq!(
-                target(&min_cfg, "model.embed_tokens.weight#linear", Q::BF16, 256, true),
+                target(
+                    &min_cfg,
+                    "model.embed_tokens.weight#linear",
+                    Q::BF16,
+                    256,
+                    true
+                ),
                 Some(Q::GGUF_Q6_K)
             );
             assert_eq!(
@@ -1135,7 +1190,13 @@ mod tests {
                 "MinSize never adds bits"
             );
             assert_eq!(
-                target(&min_cfg, "model.layers.0.self_attn.q_proj.weight", Q::GGUF_Q3_K, 256, false),
+                target(
+                    &min_cfg,
+                    "model.layers.0.self_attn.q_proj.weight",
+                    Q::GGUF_Q3_K,
+                    256,
+                    false
+                ),
                 None,
                 "MinSize never adds bits"
             );
@@ -1209,7 +1270,8 @@ mod tests {
             let mut f = f;
             let mut q = encode_weight(&data, cols, rows, f, 4);
             while !is_float(f)
-                && relative_rmse(&data, &dequantize_gguf_blocks(f, &q).unwrap()) > rmse_limit(cfg.policy)
+                && relative_rmse(&data, &dequantize_gguf_blocks(f, &q).unwrap())
+                    > rmse_limit(cfg.policy)
             {
                 let Some(next) = bump(f).map(|n| fit(n, cols, Q::FP32)) else {
                     break;
