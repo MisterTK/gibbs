@@ -104,8 +104,8 @@ struct Cli {
     #[arg(long)]
     max_tokens: Option<usize>,
 
-    #[arg(long, default_value_t = 8192)]
-    ctx: usize,
+    #[arg(long)]
+    ctx: Option<usize>,
 
     /// GPU weight re-encode policy: max-speed | low-bit-native | bit-exact (default: settings.json, else max-speed).
     #[arg(long)]
@@ -372,6 +372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hw: &hw,
             reencode,
             family: cli.arch.as_deref(),
+            ctx: cli.ctx,
             stage: &|s| *stage.lock() = s,
             system1_first: true,
             admit: &|_| Ok(()),
@@ -565,7 +566,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let model_size = artifacts.weights_path.as_ref().map_or(0, |p| {
                 gibbs_engine::model::variant::decode_bytes_per_token(
                     p,
-                    gibbs_engine::model::variant::reencode_policy(),
+                    gibbs_engine::model::weight_format::ReencodeConfig::effective().policy,
                 )
             });
             telemetry.set_model_size_bytes(model_size);

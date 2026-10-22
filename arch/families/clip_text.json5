@@ -39,7 +39,7 @@
       ["text_model.encoder.layers.{i}.self_attn.v_proj.bias", "hidden"]]}},
   ],
   // Buffers, not weights: HF position ids, OpenCLIP's contrastive temperature and causal mask.
-  ignore: ["text_model.embeddings.position_ids", "logit_scale", "attn_mask"],
+  "ignore+": ["text_model.embeddings.position_ids", "logit_scale", "attn_mask"],
   macros: {
     // Encoder layer `i`: pre-LN causal self-attention, pre-LN MLP (fc1, act, fc2).
     clip_layer: {params: ["x"], body: [

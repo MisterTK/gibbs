@@ -4,7 +4,6 @@
 {
   family: "qwen3_vl_text",
   extends: "qwen3_vl",
-  match: {hf_model_type: [], hf_architectures: [], gguf_arch: []},
   config: {
     has_vision: "false",
   },

@@ -13,20 +13,10 @@
           denoiser_tensors: [["modulation.1.weight", "txt_in.in_layer.weight"]],
           bases: ["Qwen/Qwen-Image-2.1"]},
   pipeline: "diffusion",
-  use_lib: ["diffusion"],
-  names: {rules: [["model.diffusion_model.{rest:*}", "{rest}"]]},
+  use_lib: ["diffusion", "qwen_dit"],
   config: {
-    // The transformer component (the pipeline root, which loads this spec too, has no tensors).
-    is_denoiser: "has('img_in.weight')",
-    dim: "shape('img_in.weight')[0]",
-    in_ch: "shape('img_in.weight')[1]",
-    head_dim: "shape('transformer_blocks.0.attn.norm_q.weight')[0]",
-    heads: "dim // head_dim",
     text_width: "shape('txt_in.text_norm.weight')[0]",
-    layers: "count('transformer_blocks.{k}.attn.to_q.weight')",
-    axes: "first(cfg.axes_dims_rope, [16, 56, 56])",
     fused: "has('transformer_blocks.0.img_mlp.gate_up.weight')",
-    eps: "1e-6",
   },
   checks: [
     {expr: "is_denoiser && (cfg.causal_condition == false || first(cfg.patch_size, 1) != 1)",
@@ -40,9 +30,6 @@
     {tensor: "{n:*}.weight", op: "to_bf16", when: "len(shape(fmt('{n}.weight'))) == 2"},
   ],
   constants: {
-    "rope.inv_freq": {when: "is_denoiser", gen: "axis_freqs", args: {dims: "axes", theta: 10000}},
-    one: {when: "is_denoiser", gen: "fill", args: {shape: [1], value: 1}},
-    "ones.dim": {when: "is_denoiser", gen: "ones", args: {shape: ["dim"]}},
     t0_feat: {when: "is_denoiser", gen: "timestep_embedding", args: {t: 0, dim: 256, precision: "'f32'"}},
   },
   macros: {

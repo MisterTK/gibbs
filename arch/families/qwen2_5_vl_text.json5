@@ -5,7 +5,6 @@
 {
   family: "qwen2_5_vl_text",
   extends: "llama",
-  match: {hf_model_type: [], hf_architectures: [], gguf_arch: [], fallback: false},
   names: {rules: [["model.language_model.{r:*}", "model.{r}"]]},
   config: {
     tc: "first(cfg.text_config, cfg)",

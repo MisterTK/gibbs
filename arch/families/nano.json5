@@ -51,5 +51,4 @@
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", when: "head == 'hidden'"}],
     },
   },
-  runtime: {prefill_rows: 64},
 }

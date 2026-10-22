@@ -1,0 +1,12 @@
+// Shared LDM single-file / GGUF training and scheduler buffers ignored by component specs.
+{
+  ignore: [
+    "model_ema.*",
+    "alphas_cumprod*",
+    "betas",
+    "log_one_minus_alphas_cumprod",
+    "posterior_*",
+    "sqrt_*",
+    "logvar",
+  ],
+}

@@ -309,14 +309,27 @@ pub struct Override {
 pub struct AppliesTo {
     #[serde(default)]
     pub hub_id: Vec<String>,
-    #[serde(default)]
-    pub family: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub family: Vec<String>,
     #[serde(default)]
     pub model_type: Option<String>,
     #[serde(default)]
     pub gguf_arch: Option<String>,
     #[serde(default)]
     pub file_name: Vec<String>,
+}
+
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) => Ok(v),
+    }
 }
 
 /// What a checkpoint says about itself, for matching.
@@ -395,7 +408,7 @@ pub struct Registry {
 impl Registry {
     /// The embedded specs plus the user's `<dir>/{families,overrides}/*.json5` (when `dir` exists).
     pub fn load(user_dir: Option<&Path>) -> Result<Self, String> {
-        let mut files: Vec<(String, String)> = EMBEDDED
+        let files: Vec<(String, String)> = EMBEDDED
             .iter()
             .map(|(p, t)| (p.to_string(), t.to_string()))
             .collect();
@@ -411,16 +424,15 @@ impl Registry {
                     .into_iter()
                     .filter(|p| p.extension().is_some_and(|e| e == "json5"))
                 {
-                    let text =
-                        std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-                    user.push((
-                        format!("{sub}/{}", p.file_name().unwrap().to_string_lossy()),
-                        text,
-                    ));
+                    let rel = format!("{sub}/{}", p.file_name().unwrap().to_string_lossy());
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) => user.push((rel, text)),
+                        Err(err) => tracing::warn!("arch: skipping {}: {err}", p.display()),
+                    }
                 }
             }
         }
-        Self::from_files(&files.drain(..).collect::<Vec<_>>(), &user)
+        Self::from_files(&files, &user)
     }
 
     /// Registry from (path, text) lists: `embedded` then `user` (user families replace embedded
@@ -431,35 +443,83 @@ impl Registry {
     ) -> Result<Self, String> {
         let mut r = Registry::default();
         for (is_user, list) in [(false, embedded), (true, user)] {
-            let mut ovs: Vec<(String, Override)> = Vec::new();
+            let mut raw_ovs: Vec<(String, String, Override)> = Vec::new();
+            let mut user_fams: Vec<(String, String, Option<J>)> = Vec::new();
             for (path, text) in list {
-                let j = parse_json5(path, text)?;
+                let j = match json5::from_str::<J>(text) {
+                    Ok(j) => j,
+                    Err(err) if is_user => {
+                        tracing::warn!("arch: skipping {path}: {err}");
+                        continue;
+                    }
+                    Err(err) => return Err(format!("{path}: {err}")),
+                };
                 let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
                 match dir {
                     "families" => {
-                        let name = j["family"]
-                            .as_str()
-                            .ok_or_else(|| format!("{path}: missing `family`"))?
-                            .to_string();
+                        let Some(name) = j["family"].as_str().map(String::from) else {
+                            if is_user {
+                                tracing::warn!("arch: skipping {path}: missing `family`");
+                                continue;
+                            }
+                            return Err(format!("{path}: missing `family`"));
+                        };
                         if let Some(slot) = r.families.iter_mut().find(|(n, _)| *n == name) {
                             if !is_user {
                                 return Err(format!("{path}: family `{name}` defined twice"));
                             }
-                            slot.1 = j;
+                            let prev = std::mem::replace(&mut slot.1, j);
+                            user_fams.push((path.clone(), name, Some(prev)));
                         } else {
-                            r.families.push((name, j));
+                            r.families.push((name.clone(), j));
+                            if is_user {
+                                user_fams.push((path.clone(), name, None));
+                            }
                         }
                     }
-                    "overrides" => ovs.push((
-                        file.to_string(),
-                        serde_json::from_value(j).map_err(|e| format!("{path}: {e}"))?,
-                    )),
+                    "overrides" => match serde_json::from_value::<Override>(j) {
+                        Ok(ov) => raw_ovs.push((path.clone(), file.to_string(), ov)),
+                        Err(err) if is_user => tracing::warn!("arch: skipping {path}: {err}"),
+                        Err(err) => return Err(format!("{path}: {err}")),
+                    },
                     "lib" => r.lib.push((file.trim_end_matches(".json5").to_string(), j)),
                     "names" => r
                         .names
                         .push((file.trim_end_matches(".json5").to_string(), j)),
                     _ => {}
                 }
+            }
+            for (path, name, prev) in user_fams {
+                if let Err(err) = r
+                    .base(&name)
+                    .and_then(|b| serde_json::from_value::<Spec>(b).map_err(|e| e.to_string()))
+                {
+                    tracing::warn!("arch: skipping {path}: {err}");
+                    if let Some(old) = prev {
+                        if let Some(slot) = r.families.iter_mut().find(|(n, _)| *n == name) {
+                            slot.1 = old;
+                        }
+                    } else {
+                        r.families.retain(|(n, _)| *n != name);
+                    }
+                }
+            }
+            let mut ovs: Vec<(String, Override)> = Vec::new();
+            for (path, file, ov) in raw_ovs {
+                if is_user {
+                    let bad = ov.applies_to.family.iter().find_map(|f| match r.base(f) {
+                        Ok(mut b) => {
+                            merge_patch(&mut b, &ov.patch);
+                            serde_json::from_value::<Spec>(b).err().map(|e| e.to_string())
+                        }
+                        Err(e) => Some(e),
+                    });
+                    if let Some(err) = bad {
+                        tracing::warn!("arch: skipping {path}: {err}");
+                        continue;
+                    }
+                }
+                ovs.push((file, ov));
             }
             ovs.sort_by(|a, b| a.0.cmp(&b.0));
             r.overrides.extend(ovs);
@@ -488,7 +548,25 @@ impl Registry {
             }
             chain.push(self.raw(parent)?.clone());
         }
+        let mut pre = J::Object(Map::new());
+        for layer in chain.iter().rev() {
+            merge_patch(&mut pre, layer);
+        }
         let mut merged = J::Object(Map::new());
+        for lib in pre["use_lib"].as_array().cloned().unwrap_or_default() {
+            let lib = lib.as_str().ok_or("use_lib: expected names")?;
+            let mut l = self
+                .lib
+                .iter()
+                .find(|(n, _)| n == lib)
+                .ok_or_else(|| format!("{name}: unknown lib `{lib}`"))?
+                .1
+                .clone();
+            if let Some(o) = l.as_object_mut() {
+                o.remove("macros");
+            }
+            merge_patch(&mut merged, &l);
+        }
         for layer in chain.iter().rev() {
             merge_patch(&mut merged, layer);
         }
@@ -723,17 +801,6 @@ impl Registry {
         })
     }
 
-    /// `runtime.gguf_moe_blocker` of the family claiming `gguf_arch == arch`.
-    pub fn gguf_moe_blocker(&self, arch: &str) -> Option<String> {
-        self.matchers().into_iter().find_map(|(f, m, _)| {
-            m.gguf_arch
-                .iter()
-                .any(|g| glob(g, arch))
-                .then(|| self.base(&f).ok()?["runtime"]["gguf_moe_blocker"].as_str().map(String::from))
-                .flatten()
-        })
-    }
-
     /// Whether an encoder family with `runtime.system1` claims `model_type`.
     pub fn runs_system1(&self, model_type: &str) -> bool {
         self.matchers().into_iter().any(|(f, m, p)| {
@@ -797,15 +864,16 @@ impl Registry {
 }
 
 fn applies(a: &AppliesTo, family: &str, sig: &Signals) -> bool {
-    (a.hub_id.is_empty() || a.hub_id.iter().any(|g| glob(g, &sig.hub_id)))
-        && a.family.as_deref().is_none_or(|f| f == family)
+    let ci = |g: &str, s: &str| glob(&g.to_lowercase(), &s.to_lowercase());
+    (a.hub_id.is_empty() || a.hub_id.iter().any(|g| ci(g, &sig.hub_id)))
+        && (a.family.is_empty() || a.family.iter().any(|f| f == family))
         && a.model_type
             .as_deref()
             .is_none_or(|t| sig.hf_model_type.as_deref() == Some(t))
         && a.gguf_arch
             .as_deref()
             .is_none_or(|t| sig.gguf_arch.as_deref() == Some(t))
-        && (a.file_name.is_empty() || a.file_name.iter().any(|g| glob(g, &sig.file_name)))
+        && (a.file_name.is_empty() || a.file_name.iter().any(|g| ci(g, &sig.file_name)))
 }
 
 /// The embedded specs plus the user's `<cache>/arch/{families,overrides}`, read once per process.
@@ -1054,6 +1122,77 @@ mod tests {
         assert!(glob("org/*-GGUF", "org/model-GGUF"));
         assert!(glob("*.gguf", "a.Q4_0.gguf"));
         assert!(!glob("org/?", "org/ab"));
+    }
+
+    #[test]
+    fn lib_blocks_multi_family_and_robust_user_files() {
+        let lib = r#"{config: {a: "0", from_lib: "1"}, ignore: ["ema.*"], macros: {m: {body: []}}}"#;
+        let base = r#"{family: "base", match: {hf_model_type: ["base"]}, pipeline: "causal_lm",
+            use_lib: ["shared"], config: {a: "1"}, "ignore+": ["extra.*"]}"#;
+        let embedded = files(&[
+            ("lib/shared.json5", lib),
+            ("families/base.json5", base),
+            ("families/child.json5", CHILD),
+            (
+                "overrides/multi.json5",
+                r#"{applies_to: {family: ["base", "child"], hub_id: ["*TURBO*"], file_name: ["*.GGUF"]},
+                    patch: {config: {turbo: "1"}}}"#,
+            ),
+            (
+                "overrides/base_only.json5",
+                r#"{applies_to: {family: "base"}, patch: {config: {only_base: "1"}}}"#,
+            ),
+        ]);
+        let user = files(&[
+            ("families/broken.json5", "{not json5"),
+            ("families/bad_spec.json5", r#"{family: "bad", not_a_field: 1}"#),
+            ("families/base.json5", r#"{family: "base", not_a_field: 1}"#),
+            ("overrides/broken.json5", "{not json5"),
+            (
+                "overrides/bad_patch.json5",
+                r#"{applies_to: {family: ["base"]}, patch: {not_a_spec_field: 1}}"#,
+            ),
+            (
+                "overrides/good.json5",
+                r#"{applies_to: {family: "child"}, patch: {config: {u: "ok"}}}"#,
+            ),
+        ]);
+        let r = Registry::from_files(&embedded, &user).unwrap();
+        let sig = Signals {
+            hub_id: "Org/My-Turbo-Model".into(),
+            file_name: "weights.gguf".into(),
+            ..Default::default()
+        };
+        let b = r.spec("base", &sig).unwrap();
+        assert!(r.family_names().all(|f| f != "bad"));
+        assert_eq!(b.config["from_lib"], "1");
+        assert_eq!(b.config["a"], "1", "family overrides lib");
+        assert_eq!(b.config["turbo"], "1", "case-insensitive hub_id/file_name + multi-family");
+        assert_eq!(b.config["only_base"], "1");
+        assert_eq!(b.ignore.len(), 2, "ignore+ appends to lib ignore");
+        assert!(b.macros.contains_key("m"));
+        let c = r.spec("child", &sig).unwrap();
+        assert_eq!(c.config["from_lib"], "1", "child inherits parent use_lib blocks");
+        assert_eq!(c.config["turbo"], "1");
+        assert_eq!(c.config.get("only_base"), None, "applies_to.family does not follow extends");
+        assert_eq!(c.config["u"], "ok");
+    }
+
+    #[test]
+    fn all_arch_json5_files_are_embedded() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("arch");
+        for dir in ["families", "lib", "names", "overrides"] {
+            for e in std::fs::read_dir(root.join(dir)).unwrap() {
+                let p = e.unwrap().path();
+                if p.extension().is_some_and(|x| x == "json5") {
+                    let key = format!("{dir}/{}", p.file_name().unwrap().to_string_lossy());
+                    assert!(
+                        EMBEDDED.iter().any(|(k, _)| *k == key),
+                        "{key} is missing from arch/index.rs"
+                    );
+                }
+            }
+        }
     }
 
     // ---- LM family specs vs the deleted GraphLm / LnDecoder (frozen outputs) (fixtures as in `tests/golden/lm.rs`, `enc.rs`) ----
@@ -1477,6 +1616,27 @@ mod tests {
             assert_eq!(l.len(), 512);
             assert!(l.iter().all(|x| x.is_finite()) && l.iter().any(|&x| x != 0.0));
         }
+        let hw = crate::hardware::HardwareCapability::probe_system();
+        let exec = super::dispatch::load_lm(
+            &a,
+            &super::LoadOpts {
+                placement: crate::hardware::PlacementMode::Pin(Device::Cpu),
+                token: None,
+                quant_name: None,
+                hw: &hw,
+                reencode: crate::model::weight_format::ReencodeConfig {
+                    policy: crate::model::weight_format::ReencodePolicy::BitExact,
+                    ..Default::default()
+                },
+                family: Some("llama"),
+                ctx: Some(64),
+                stage: &|_| {},
+                admit: &|_| Ok(()),
+                system1_first: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(exec.lm().context_len(), 64);
     }
 
     /// `match.bases` / `gguf_arch` listings by pipeline.

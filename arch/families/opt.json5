@@ -85,5 +85,5 @@
       outputs: [{name: "logits", when: "head != 'hidden'"}, {name: "hidden", value: "x", when: "head == 'hidden'"}],
     },
   },
-  runtime: {prefill_rows: 64, ffn_weights: ["model.decoder.layers.*.fc*"], seqcls: {head: "score", pooling: "last_nonpad"}},
+  runtime: {ffn_weights: ["model.decoder.layers.*.fc*"], seqcls: {head: "score", pooling: "last_nonpad"}},
 }

@@ -3,6 +3,6 @@
 {
   family: "ldm_vae",
   extends: "sd_vae",
-  ignore: ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "model_ema.*",
-           "alphas_cumprod*", "betas", "log_one_minus_alphas_cumprod", "posterior_*", "sqrt_*", "logvar", "denoiser.*"],
+  use_lib: ["vae", "ldm"],
+  "ignore+": ["model.diffusion_model.*", "cond_stage_model.*", "conditioner.*", "denoiser.*"],
 }

@@ -1,0 +1,6 @@
+// Distilled SD checkpoints (turbo / lightning / Hyper-SD) look like base models in their configs:
+// recognised by repo id, 1 step without CFG (`model/sd.rs` `defaults`).
+{
+  applies_to: {family: ["sd", "sdxl", "sd1_file", "sd2_file", "sdxl_file"], hub_id: ["*turbo*", "*lightning*", "*hyper-sd*"]},
+  patch: {runtime: {defaults: {steps: 1, guidance: 0}}},
+}

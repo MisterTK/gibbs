@@ -1,35 +1,19 @@
+use crate::model::weight_format::{ReencodePolicy, VariantPolicy};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct GibbsSettings {
-    #[serde(default = "default_reencode")]
-    pub reencode: String,
-    #[serde(default = "default_variant")]
-    pub variant: String,
+    pub reencode: ReencodePolicy,
+    pub variant: VariantPolicy,
     /// Mean-KL limit of the GPU re-encode gate (nats); `None` keeps the policy's own.
-    #[serde(default)]
     pub reencode_max_kl: Option<f32>,
 }
 
-fn default_reencode() -> String {
-    "max-speed".to_string()
-}
-
-fn default_variant() -> String {
-    "fastest".to_string()
-}
-
-impl Default for GibbsSettings {
-    fn default() -> Self {
-        Self {
-            reencode: default_reencode(),
-            variant: default_variant(),
-            reencode_max_kl: None,
-        }
-    }
-}
-
+#[cfg(not(test))]
 pub fn settings_path() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".cache/gibbs/settings.json")
@@ -38,14 +22,40 @@ pub fn settings_path() -> PathBuf {
     }
 }
 
+#[cfg(test)]
+pub fn settings_path() -> PathBuf {
+    thread_local! {
+        static DIR: tempfile::TempDir = tempfile::tempdir().unwrap();
+    }
+    DIR.with(|d| d.path().join("settings.json"))
+}
+
+static CACHE: Mutex<Option<(SystemTime, GibbsSettings)>> = Mutex::new(None);
+
 pub fn load_settings() -> GibbsSettings {
     let path = settings_path();
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(s) = serde_json::from_str::<GibbsSettings>(&data) {
-            return s;
+    let Some(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()).ok() else {
+        *CACHE.lock() = None;
+        return GibbsSettings::default();
+    };
+    if let Some((ct, s)) = CACHE.lock().as_ref() {
+        if *ct == mtime {
+            return s.clone();
         }
     }
-    GibbsSettings::default()
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return GibbsSettings::default();
+    };
+    match serde_json::from_str::<GibbsSettings>(&data) {
+        Ok(s) => {
+            *CACHE.lock() = Some((mtime, s.clone()));
+            s
+        }
+        Err(err) => {
+            tracing::warn!("settings: {}: {err}; using defaults", path.display());
+            GibbsSettings::default()
+        }
+    }
 }
 
 pub fn save_settings(s: &GibbsSettings) -> Result<(), String> {
@@ -54,7 +64,12 @@ pub fn save_settings(s: &GibbsSettings) -> Result<(), String> {
         let _ = std::fs::create_dir_all(parent);
     }
     let data = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
-    std::fs::write(&path, data).map_err(|e| e.to_string())
+    std::fs::write(&path, data).map_err(|e| e.to_string())?;
+    *CACHE.lock() = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| (t, s.clone()));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -63,17 +78,33 @@ mod tests {
 
     #[test]
     fn test_settings_load_save() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
+        for p in [
+            ReencodePolicy::MaxSpeed,
+            ReencodePolicy::LowBitNative,
+            ReencodePolicy::BitExact,
+        ] {
+            assert_eq!(serde_json::to_string(&p).unwrap(), format!("\"{}\"", p.name()));
+        }
+        for v in [
+            VariantPolicy::Fastest,
+            VariantPolicy::Fastest4Bit,
+            VariantPolicy::BestQuality,
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), format!("\"{}\"", v.name()));
+        }
         let s = GibbsSettings {
-            reencode: "low-bit-native".into(),
-            variant: "fastest-4bit".into(),
+            reencode: ReencodePolicy::LowBitNative,
+            variant: VariantPolicy::Fastest4Bit,
             reencode_max_kl: Some(0.05),
         };
-        let data = serde_json::to_string(&s).unwrap();
-        std::fs::write(&path, data).unwrap();
-        let loaded: GibbsSettings =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(loaded, s);
+        save_settings(&s).unwrap();
+        assert_eq!(load_settings(), s);
+        let _ = std::fs::remove_file(settings_path());
+        assert_eq!(load_settings(), GibbsSettings::default());
+        // Aliases accepted by FromStr also deserialize.
+        let alias: GibbsSettings =
+            serde_json::from_str(r#"{"reencode":"lowbit","variant":"quality"}"#).unwrap();
+        assert_eq!(alias.reencode, ReencodePolicy::LowBitNative);
+        assert_eq!(alias.variant, VariantPolicy::BestQuality);
     }
 }
