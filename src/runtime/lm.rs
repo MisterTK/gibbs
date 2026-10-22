@@ -946,22 +946,10 @@ pub fn sample_logits(
         return penalized_best_idx as u32;
     }
 
-    let mut working_logits = slice.to_vec();
-    if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
-        for &tok in recent_tokens {
-            let idx = tok as usize;
-            if idx < working_logits.len() {
-                if working_logits[idx] > 0.0 {
-                    working_logits[idx] /= repetition_penalty;
-                } else {
-                    working_logits[idx] *= repetition_penalty;
-                }
-                working_logits[idx] -= 1.5;
-            }
-        }
-    }
-
-    let (active_candidates, active_probs) = nucleus(&working_logits, temperature, top_k, top_p);
+    let (active_candidates, active_probs, n) =
+        nucleus(slice, recent_tokens, temperature, top_k, top_p, repetition_penalty);
+    let active_candidates = &active_candidates[..n];
+    let active_probs = &active_probs[..n];
     let active_sum: f32 = active_probs.iter().sum();
 
     // 3. Step-varying seeded PRNG mixing token history and active distribution
@@ -971,7 +959,7 @@ pub fn sample_logits(
         hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
         hash = hash.rotate_left(13).wrapping_mul(0x01000193);
     }
-    for &(idx, val) in &active_candidates {
+    for &(idx, val) in active_candidates {
         hash ^= (idx as u32).wrapping_mul(0x27d4eb2d);
         hash ^= val.to_bits();
         hash = hash.rotate_left(7).wrapping_mul(0x01000193);
@@ -989,54 +977,91 @@ pub fn sample_logits(
     active_candidates[0].0 as u32
 }
 
-/// The candidates [`sample_logits`] draws from at `temperature > 1e-4` (after any penalty):
-/// top-k by logit, softmax at `temperature`, cut at cumulative `top_p`. Returns the kept
-/// `(token, logit)` pairs and their probabilities, which sum to the kept mass.
+/// The candidates [`sample_logits`] draws from at `temperature > 1e-4` (applying `repetition_penalty`
+/// on the fly for `recent_tokens`): top-k (`<= 64`) by `(logit desc, id asc)`, softmax at
+/// `temperature`, cut at cumulative `top_p`. Returns `(candidates, probs, count)`.
 pub(crate) fn nucleus(
     logits: &[f32],
+    recent_tokens: &[u32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
-) -> (Vec<(usize, f32)>, Vec<f32>) {
+    repetition_penalty: f32,
+) -> ([(usize, f32); 64], [f32; 64], usize) {
+    assert!(top_k <= 64, "top_k ({top_k}) must be <= 64");
     let k = top_k.max(1).min(logits.len());
-    let mut indexed_logits: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    // Highest logit first, ties by token id: a stable full sort's order, in O(vocab).
-    let order = |a: &(usize, f32), b: &(usize, f32)| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
+    let counts = if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
+        let mut m = HashMap::with_capacity(recent_tokens.len());
+        for &tok in recent_tokens {
+            *m.entry(tok).or_insert(0u32) += 1;
+        }
+        Some(m)
+    } else {
+        None
     };
-    if k < indexed_logits.len() {
-        indexed_logits.select_nth_unstable_by(k - 1, order);
-    }
-    indexed_logits.truncate(k);
-    indexed_logits.sort_by(order);
 
-    let max_val = indexed_logits
+    let mut cands = [(0usize, f32::NEG_INFINITY); 64];
+    let mut len = 0usize;
+    for (i, &raw) in logits.iter().enumerate() {
+        let mut val = raw;
+        if let Some(m) = &counts {
+            if let Some(&c) = m.get(&(i as u32)) {
+                for _ in 0..c {
+                    if val > 0.0 {
+                        val /= repetition_penalty;
+                    } else {
+                        val *= repetition_penalty;
+                    }
+                    val -= 1.5;
+                }
+            }
+        }
+        if len == k && val <= cands[k - 1].1 {
+            continue;
+        }
+        let mut pos = len;
+        if len < k {
+            len += 1;
+        }
+        while pos > 0 && val > cands[pos - 1].1 {
+            if pos < k {
+                cands[pos] = cands[pos - 1];
+            }
+            pos -= 1;
+        }
+        if pos < k {
+            cands[pos] = (i, val);
+        }
+    }
+
+    let max_val = cands[..len]
         .iter()
         .map(|&(_, val)| val / temperature)
         .fold(f32::NEG_INFINITY, f32::max);
-    let exp_vals: Vec<f32> = indexed_logits
-        .iter()
-        .map(|&(_, val)| ((val / temperature) - max_val).exp())
-        .collect();
-    let sum_exp: f32 = exp_vals.iter().sum();
-    let mut probs: Vec<f32> = exp_vals.iter().map(|&e| e / sum_exp.max(1e-12)).collect();
+    let mut probs = [0.0f32; 64];
+    let mut sum_exp = 0.0f32;
+    for (p, &(_, val)) in probs[..len].iter_mut().zip(&cands[..len]) {
+        let e = ((val / temperature) - max_val).exp();
+        *p = e;
+        sum_exp += e;
+    }
+    let denom = sum_exp.max(1e-12);
+    for p in &mut probs[..len] {
+        *p /= denom;
+    }
 
     // Nucleus (top-p) cutoff.
     let p_thresh = top_p.clamp(0.01, 1.0);
     let mut cum_p = 0.0f32;
-    let mut cutoff_idx = indexed_logits.len();
-    for (i, &p) in probs.iter().enumerate() {
+    let mut cutoff_idx = len;
+    for (i, &p) in probs[..len].iter().enumerate() {
         cum_p += p;
         if cum_p >= p_thresh {
             cutoff_idx = i + 1;
             break;
         }
     }
-    indexed_logits.truncate(cutoff_idx);
-    probs.truncate(cutoff_idx);
-    (indexed_logits, probs)
+    (cands, probs, cutoff_idx)
 }
 
 #[cfg(test)]
@@ -1070,6 +1095,137 @@ mod tests {
                 }
                 assert_eq!(argmax_first(&v), idx, "{v:?}");
             }
+        }
+    }
+
+    /// Allocation-free `sample_logits` / `nucleus` matches the brute-force full-sort reference
+    /// across 200 seeded logit vectors (vocab 1,000 and 262,144; temperatures 0.3/0.7/1.2;
+    /// top-p 0.5/0.9/1.0; with and without repetition penalty, including exact tie-breaking).
+    #[test]
+    fn sample_logits_matches_brute_force_reference() {
+        fn brute_force(
+            slice: &[f32],
+            recent_tokens: &[u32],
+            temperature: f32,
+            top_k: usize,
+            top_p: f32,
+            repetition_penalty: f32,
+        ) -> u32 {
+            let mut working_logits = slice.to_vec();
+            if repetition_penalty > 1.0 && !recent_tokens.is_empty() {
+                for &tok in recent_tokens {
+                    let idx = tok as usize;
+                    if idx < working_logits.len() {
+                        if working_logits[idx] > 0.0 {
+                            working_logits[idx] /= repetition_penalty;
+                        } else {
+                            working_logits[idx] *= repetition_penalty;
+                        }
+                        working_logits[idx] -= 1.5;
+                    }
+                }
+            }
+            let k = top_k.max(1).min(working_logits.len());
+            let mut indexed: Vec<(usize, f32)> =
+                working_logits.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
+            indexed.truncate(k);
+            let max_val = indexed
+                .iter()
+                .map(|&(_, val)| val / temperature)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exp_vals: Vec<f32> = indexed
+                .iter()
+                .map(|&(_, val)| ((val / temperature) - max_val).exp())
+                .collect();
+            let sum_exp: f32 = exp_vals.iter().sum();
+            let mut probs: Vec<f32> = exp_vals.iter().map(|&e| e / sum_exp.max(1e-12)).collect();
+            let p_thresh = top_p.clamp(0.01, 1.0);
+            let mut cum_p = 0.0f32;
+            let mut cutoff_idx = indexed.len();
+            for (i, &p) in probs.iter().enumerate() {
+                cum_p += p;
+                if cum_p >= p_thresh {
+                    cutoff_idx = i + 1;
+                    break;
+                }
+            }
+            indexed.truncate(cutoff_idx);
+            probs.truncate(cutoff_idx);
+            let active_sum: f32 = probs.iter().sum();
+            let mut hash = 0x811c9dc5u32
+                .wrapping_add((recent_tokens.len() as u32).wrapping_mul(0x9e3779b9));
+            for (pos, &tok) in recent_tokens.iter().enumerate() {
+                hash ^= tok.wrapping_mul(0x5bd1e995).wrapping_add(pos as u32);
+                hash = hash.rotate_left(13).wrapping_mul(0x01000193);
+            }
+            for &(idx, val) in &indexed {
+                hash ^= (idx as u32).wrapping_mul(0x27d4eb2d);
+                hash ^= val.to_bits();
+                hash = hash.rotate_left(7).wrapping_mul(0x01000193);
+            }
+            let r = (((hash & 0x007f_ffff) as f32) / 8_388_608.0) * active_sum;
+            let mut cum_prob = 0.0f32;
+            for (i, &p) in probs.iter().enumerate() {
+                cum_prob += p;
+                if cum_prob >= r || i == probs.len() - 1 {
+                    return indexed[i].0 as u32;
+                }
+            }
+            indexed[0].0 as u32
+        }
+
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        let temps = [0.3f32, 0.7, 1.2];
+        let top_ps = [0.5f32, 0.9, 1.0];
+        let penalties = [1.0f32, 1.15];
+        for i in 0..200 {
+            let vocab = if i >= 192 { 262_144 } else { 1_000 };
+            let ties = i % 5 == 0;
+            let logits: Vec<f32> = (0..vocab)
+                .map(|_| {
+                    let u = next();
+                    if ties {
+                        ((u >> 28) as f32 - 8.0) * 0.5
+                    } else {
+                        ((u >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 8.0
+                    }
+                })
+                .collect();
+            let top_id = argmax_first(&logits) as u32;
+            let recent: Vec<u32> = if i % 7 == 0 {
+                Vec::new()
+            } else {
+                (0..32)
+                    .map(|j| {
+                        if j < 4 {
+                            top_id
+                        } else if j < 16 {
+                            next() % 16
+                        } else {
+                            next() % (vocab as u32)
+                        }
+                    })
+                    .collect()
+            };
+            let temp = temps[i % temps.len()];
+            let top_p = top_ps[(i / 3) % top_ps.len()];
+            let top_k = [1usize, 10, 50, 64][i % 4];
+            let pen = penalties[(i / 2) % penalties.len()];
+            let got = sample_logits(&logits, &recent, temp, top_k, top_p, pen);
+            let want = brute_force(&logits, &recent, temp, top_k, top_p, pen);
+            assert_eq!(
+                got, want,
+                "case {i} (vocab={vocab}, temp={temp}, top_p={top_p}, top_k={top_k}, pen={pen})"
+            );
         }
     }
 

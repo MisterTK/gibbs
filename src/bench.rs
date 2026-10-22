@@ -64,6 +64,8 @@ pub struct BenchModel {
     pub height: Option<usize>,
     #[serde(default)]
     pub items: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +223,29 @@ pub fn measure_loaded(
     ceiling_gbps: f64,
     prefill_tokens: usize,
 ) -> Result<ModelBenchResult, String> {
+    measure_loaded_with(
+        exec,
+        prompt,
+        decode_tokens,
+        runs,
+        bytes_per_token,
+        ceiling_gbps,
+        prefill_tokens,
+        0.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn measure_loaded_with(
+    exec: &crate::scheduler::ExecutableModel,
+    prompt: &str,
+    decode_tokens: usize,
+    runs: usize,
+    bytes_per_token: u64,
+    ceiling_gbps: f64,
+    prefill_tokens: usize,
+    temperature: f32,
+) -> Result<ModelBenchResult, String> {
     if bytes_per_token == 0 || ceiling_gbps <= 0.0 {
         return Err("no weight bytes found, cannot compute a roofline".into());
     }
@@ -244,12 +269,13 @@ pub fn measure_loaded(
     } else {
         None
     };
-    exec.generate_text_measured_plain(prompt, 16, 0.0)?;
+    exec.generate_text_measured_plain(prompt, 16, temperature)?;
     let (mut speeds, mut walls) = (Vec::new(), Vec::new());
     let (mut gpu, mut run, mut enc, mut disp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..runs {
         crate::graph::metal::take_run_samples();
-        let (_, passes, dur) = exec.generate_text_measured_plain(prompt, decode_tokens, 0.0)?;
+        let (_, passes, dur) =
+            exec.generate_text_measured_plain(prompt, decode_tokens, temperature)?;
         let s = dur.as_secs_f64();
         if s > 0.0 && passes > 0 {
             speeds.push(passes as f64 / s);
@@ -427,7 +453,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                 };
                 let model_exec = load.exec;
                 let (bytes_per_token, bytes_basis) = roofline_bytes(&artifacts, &load.applied);
-                let mut res = match measure_loaded(
+                let mut res = match measure_loaded_with(
                     &model_exec,
                     &prompt,
                     decode_tokens,
@@ -435,6 +461,7 @@ pub fn run_bench_suite(path: &str) -> Result<i32, String> {
                     bytes_per_token,
                     ceiling_gbps,
                     prefill_tokens,
+                    model_cfg.temperature.unwrap_or(0.0),
                 ) {
                     Ok(r) => r,
                     Err(e) => {

@@ -238,12 +238,12 @@ pub(super) fn decode(
 
 /// The scheduler's sampling distribution over `logits` (sparse, normalized).
 fn dist(logits: &[f32], temp: f32, top_p: f32) -> Vec<(u32, f32)> {
-    let (cands, probs) = nucleus(logits, temp, TOP_K, top_p);
-    let sum: f32 = probs.iter().sum();
-    cands
+    let (cands, probs, n) = nucleus(logits, &[], temp, TOP_K, top_p, 1.0);
+    let sum: f32 = probs[..n].iter().sum();
+    cands[..n]
         .iter()
-        .zip(probs)
-        .map(|(&(t, _), p)| (t as u32, p / sum))
+        .zip(&probs[..n])
+        .map(|(&(t, _), &p)| (t as u32, p / sum))
         .collect()
 }
 
