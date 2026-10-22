@@ -282,16 +282,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let telemetry = EngineTelemetry::new();
     #[cfg(target_os = "macos")]
-    if let Ok(rt) = gibbs_engine::graph::metal::Runtime::shared() {
-        let prof = rt.profile();
-        telemetry.set_hardware_profile(&prof.device, prof.memory_bandwidth_gbps as f32);
-        // S3.6: measured codec efficiencies for the variant predictor; background, never blocks the load.
-        // Only in the long-lived TUI: a one-shot `--prompt` run would share the GPU with it and exit
-        // before it finishes (the result is saved only on completion).
-        if cli.prompt.is_none() {
-            rt.spawn_codec_bench();
+    let rt_warmup = {
+        let warm = gibbs_engine::hardware::default_cache_dir()
+            .ok()
+            .and_then(|d| gibbs_engine::graph::metal::Runtime::publish_cached_rates(&d))
+            .is_some();
+        let telemetry = telemetry.clone();
+        let spawn_bench = cli.prompt.is_none();
+        let init = move || {
+            if let Ok(rt) = gibbs_engine::graph::metal::Runtime::shared() {
+                let prof = rt.profile();
+                telemetry.set_hardware_profile(&prof.device, prof.memory_bandwidth_gbps as f32);
+                // S3.6: measured codec efficiencies for the variant predictor; background, never blocks the load.
+                // Only in the long-lived TUI: a one-shot `--prompt` run would share the GPU with it and exit
+                // before it finishes (the result is saved only on completion).
+                if spawn_bench {
+                    rt.spawn_codec_bench();
+                }
+            }
+        };
+        if warm {
+            Some(std::thread::spawn(init))
+        } else {
+            init();
+            None
         }
-    }
+    };
 
     // 1. Probe Hardware
     let hw = HardwareCapability::probe_system();
@@ -386,6 +402,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             load_log::record(&hub, &cli.model, stage, &e)
         )
     })?;
+    #[cfg(target_os = "macos")]
+    if let Some(h) = rt_warmup {
+        let _ = h.join();
+    }
     let is_image = matches!(loaded, Loaded::Image(_));
     if !matches!(loaded, Loaded::Video(_)) {
         if cli.image.is_some() && !is_image {

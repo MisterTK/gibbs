@@ -700,13 +700,11 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Compiles the kernels (MSL 4.0 + MPP when available), restores or records the binary
-    /// archive, and loads or measures the host profile, all under `cache`.
-    pub fn new(cache: &Path) -> Result<Arc<Self>, String> {
-        let t0 = Instant::now();
-        let device = system_device()?;
-        let (lib, msl4) = compile(&device)?;
-        let compile_ms = t0.elapsed().as_secs_f64() * 1e3;
+    /// Reads the persisted [`HostProfile`] under `cache` (if valid for this OS, device and kernel
+    /// source hash) and publishes its streaming ceiling and codec efficiencies into
+    /// [`crate::model::variant`].
+    pub fn publish_cached_rates(cache: &Path) -> Option<HostProfile> {
+        let device = system_device().ok()?;
         let os_build = sysctl::string(c"kern.osversion").unwrap_or_else(|| "unknown-os".into());
         let tag: String = format!("{}-{os_build}", device.name())
             .chars()
@@ -718,12 +716,60 @@ impl Runtime {
                 }
             })
             .collect();
+        let src_hash = fnv1a(KERNELS_MSL.as_bytes());
+        let profile_hash = src_hash ^ codec::source_hash().rotate_left(13);
+        let profile_path = cache
+            .join("host")
+            .join(format!("{tag}-{profile_hash:016x}.json"));
+        let p = std::fs::read(&profile_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
+            .filter(|p| {
+                p.os_build == os_build
+                    && p.kernels == src_hash
+                    && p.device == device.name()
+                    && p.memory_bandwidth_gbps > 0.0
+                    && p.gemm.iter().map(|t| [t.m, t.n, t.k]).eq(GEMM_BENCH_SHAPES)
+            })?;
+        let codec_eff = p
+            .codec
+            .clone()
+            .filter(|c| c.codec_hash == codec::source_hash());
+        if codec_eff.is_some() || crate::model::variant::host_ceiling_gbps() == 0.0 {
+            crate::model::variant::set_host_rates(p.ceiling_gbps.max(p.stream_gbps), codec_eff);
+        }
+        Some(p)
+    }
+
+    /// Compiles the kernels (MSL 4.0 + MPP when available), restores or records the binary
+    /// archive, and loads or measures the host profile, all under `cache`.
+    pub fn new(cache: &Path) -> Result<Arc<Self>, String> {
+        let device = system_device()?;
+        let os_build = sysctl::string(c"kern.osversion").unwrap_or_else(|| "unknown-os".into());
+        let tag: String = format!("{}-{os_build}", device.name())
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let src_hash = fnv1a(KERNELS_MSL.as_bytes());
+        let profile_hash = src_hash ^ codec::source_hash().rotate_left(13);
+        let profile_path = cache
+            .join("host")
+            .join(format!("{tag}-{profile_hash:016x}.json"));
+        let cached = Self::publish_cached_rates(cache);
+        let t0 = Instant::now();
+        let (lib, msl4) = compile(&device)?;
+        let compile_ms = t0.elapsed().as_secs_f64() * 1e3;
         let mut names = BASE_KERNELS.to_vec();
         names.extend(ext::kernel_names());
         if msl4.is_ok() {
             names.extend(MPP_KERNELS);
         }
-        let src_hash = fnv1a(KERNELS_MSL.as_bytes());
         let archive = cache.join("metal").join(format!(
             "{tag}-{}-{src_hash:016x}.bin",
             if msl4.is_ok() { "mpp" } else { "base" },
@@ -779,21 +825,7 @@ impl Runtime {
             tune: Mutex::new(tune::TuneCache::default()),
             tune_path: std::path::PathBuf::new(),
         };
-        let profile_hash = src_hash ^ codec::source_hash().rotate_left(13);
-        let profile_path = cache
-            .join("host")
-            .join(format!("{tag}-{profile_hash:016x}.json"));
         prune_cache(&cache.join("host"), &tag, &profile_path, 8);
-        let cached = std::fs::read(&profile_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<HostProfile>(&b).ok())
-            .filter(|p| {
-                p.os_build == os_build
-                    && p.kernels == src_hash
-                    && p.device == rt.device.name()
-                    && p.memory_bandwidth_gbps > 0.0
-                    && p.gemm.iter().map(|t| [t.m, t.n, t.k]).eq(GEMM_BENCH_SHAPES)
-            });
         let profile_note = match cached {
             Some(p) => {
                 rt.profile = p;
