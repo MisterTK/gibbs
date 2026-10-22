@@ -653,7 +653,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::spawn(move || loop {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sched_clone.step())) {
             Ok(out) if out.active_sequences_count == 0 => {
-                std::thread::sleep(Duration::from_millis(5))
+                sched_clone.wait_for_work(Duration::from_millis(50));
             }
             Ok(_) => {}
             Err(p) => {

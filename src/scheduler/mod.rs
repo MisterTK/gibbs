@@ -6,7 +6,7 @@ use crate::model::native::{MediaInput, NativeLm, PrepareCtx, SeqState};
 use crate::model::tokenizer::Tokenizer;
 use crate::runtime::lm::sample_logits;
 use crate::telemetry::{EngineTelemetry, GapSample};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use spec::{Drafter, KTuner, SpecSeq};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -554,6 +554,7 @@ pub struct ContinuousBatchScheduler {
     drafter: RwLock<Option<Arc<dyn Drafter>>>,
     k_tuner: Mutex<KTuner>,
     pub logprob_tx: Arc<RwLock<Option<UnboundedSender<TokenLogprobInfo>>>>,
+    work_signal: (Mutex<bool>, Condvar),
 }
 
 /// The drafter `model` ships, unless `GIBBS_SPEC=off`.
@@ -607,6 +608,7 @@ impl ContinuousBatchScheduler {
             view: Mutex::new(SchedulerView::default()),
             k_tuner: Mutex::new(KTuner::default()),
             logprob_tx: Arc::new(RwLock::new(None)),
+            work_signal: (Mutex::new(false), Condvar::new()),
         };
         if has_model {
             s.log_drafter();
@@ -853,7 +855,9 @@ impl ContinuousBatchScheduler {
         seq.kv_cache = kv_cache;
         let finish = seq.finish.clone();
         waiting.push_back(seq);
+        *self.work_signal.0.lock() = true;
         drop(waiting);
+        self.work_signal.1.notify_one();
         Ok((id, rx, tokenizer, n, finish))
     }
 
@@ -938,8 +942,19 @@ impl ContinuousBatchScheduler {
         seq.state = SequenceState::Waiting;
         let mut waiting = self.waiting_queue.write();
         waiting.push_back(seq);
+        *self.work_signal.0.lock() = true;
         drop(waiting);
+        self.work_signal.1.notify_one();
         (id, rx)
+    }
+
+    /// Waits up to `timeout` for a request to be admitted into `waiting_queue`.
+    pub fn wait_for_work(&self, timeout: Duration) {
+        let mut ready = self.work_signal.0.lock();
+        if !*ready {
+            self.work_signal.1.wait_for(&mut ready, timeout);
+        }
+        *ready = false;
     }
 
     /// Runs one request to completion on this thread (CLI `--prompt`, bench): the prompt goes
@@ -1049,6 +1064,7 @@ impl ContinuousBatchScheduler {
 
         // Release waiting queue lock cleanly so concurrent ingestion is not blocked during forward compute
         let waiting_len = waiting.len();
+        *self.work_signal.0.lock() = false;
         drop(waiting);
         // Show admitted sequences now: on CPU one prefill step can take seconds.
         self.publish(&active, waiting_len, prefill_budget, None);
@@ -1593,6 +1609,42 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(w[0].state, SequenceState::Waiting);
         assert_eq!(w[0].prefilled_tokens, 0);
+    }
+
+    /// Submitting a request while the server loop is idle wakes `wait_for_work` immediately and
+    /// the next `step` admits it active.
+    #[test]
+    fn test_idle_wait_wakes_immediately_on_submission() {
+        let s = Arc::new(ContinuousBatchScheduler::new(
+            "",
+            Arc::new(PagedKVPool::new(512)),
+            Some(cpu_exec(SHORT)),
+        ));
+        assert_eq!(s.step().active_sequences_count, 0);
+        let s2 = s.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b2 = barrier.clone();
+        let waiter = std::thread::spawn(move || {
+            b2.wait();
+            let t0 = Instant::now();
+            s2.wait_for_work(Duration::from_secs(5));
+            let waited = t0.elapsed();
+            let out = s2.step();
+            (waited, out.active_sequences_count)
+        });
+        barrier.wait();
+        std::thread::sleep(Duration::from_millis(5));
+        let params = SamplingParams {
+            temperature: Some(0.0),
+            top_p: None,
+            max_new_tokens: 4,
+            top_logprobs: None,
+        };
+        let (_, mut rx, ..) = s.submit_with_params(params, |_| vec![1, 2, 3]);
+        let (waited, active) = waiter.join().unwrap();
+        assert!(waited < Duration::from_millis(200), "waited {waited:?}");
+        assert_eq!(active, 1);
+        assert!(rx.try_recv().is_ok());
     }
 
     fn run_to_completion(
